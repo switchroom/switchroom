@@ -28,8 +28,10 @@
  * Parameterized over the two kill-switch postures so a future eager-read
  * introduced on either the router-v2 or turn-end-funnel-v2 path is also
  * caught:
- *   - both flags unset (production default today)
+ *   - both flags unset (production default — now BOTH v2 ON after the flip)
  *   - SWITCHROOM_INBOUND_ROUTER_V2=1 + SWITCHROOM_TURN_END_FUNNEL_V2=1
+ *   - both flags =0 (the escape-hatch legacy v1 posture — kept so the legacy
+ *     module-eval paths stay boot-smoked until the legacy delete)
  *
  * Bun is the prod + CI gateway runtime (`bun test` is a required check), so
  * spawning it here is CI-native, not CI-hostile.
@@ -125,10 +127,18 @@ function bootGateway(extraEnv: Record<string, string>): Promise<BootResult> {
 }
 
 const POSTURES: Array<{ name: string; env: Record<string, string> }> = [
-  { name: 'both kill switches unset (prod default)', env: {} },
+  // Flags unset is now the DEFAULT-ON posture (both `!== '0'`) after the
+  // v0.18.33 canary flip — the v2 router + v2 turn-end funnel are live.
+  { name: 'both kill switches unset (prod default — now BOTH v2 ON)', env: {} },
   {
-    name: 'router-v2 + turn-end-funnel-v2 enabled',
+    name: 'router-v2 + turn-end-funnel-v2 explicitly enabled',
     env: { SWITCHROOM_INBOUND_ROUTER_V2: '1', SWITCHROOM_TURN_END_FUNNEL_V2: '1' },
+  },
+  {
+    // Explicit legacy posture: with both flags defaulting ON, the only way to
+    // boot-smoke the legacy (v1) module-eval paths is the `=0` escape hatch.
+    name: 'both kill switches disabled (=0 escape hatch — legacy v1 paths)',
+    env: { SWITCHROOM_INBOUND_ROUTER_V2: '0', SWITCHROOM_TURN_END_FUNNEL_V2: '0' },
   },
 ]
 
