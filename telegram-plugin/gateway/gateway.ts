@@ -123,6 +123,7 @@ import {
   interceptAuthAdd,
   interceptLoopbackRelay,
   interceptReauth,
+  interceptVault,
   type InboundInterceptorDeps,
 } from './inbound-interceptors.js'
 import {
@@ -14544,6 +14545,18 @@ const inboundInterceptorDeps: InboundInterceptorDeps = {
   preBlock,
   formatSwitchroomOutput,
   formatAuthOutputForTelegram,
+  pendingVaultOps,
+  vaultInputTtlMs: VAULT_INPUT_TTL_MS,
+  vaultPassphraseTtlMs: VAULT_PASSPHRASE_TTL_MS,
+  vaultPassphraseCache,
+  deleteSensitiveMessage,
+  executeVaultOp,
+  unlockViaBroker,
+  callbackQueryHandlers: () => callbackQueryHandlers,
+  pendingVaultRequestAccesses,
+  pendingVaultRequestSaves,
+  vaultKeyRegex: VAULT_KEY_REGEX,
+  vaultKeyRegexLabel: VAULT_KEY_REGEX_LABEL,
 }
 
 export async function handleInbound(
@@ -14875,146 +14888,10 @@ export async function handleInbound(
     if (reauthOutcome.handled) return
   }
 
-  // Vault intercept
-  const pendingVault = pendingVaultOps.get(chat_id)
-  if (pendingVault) {
-    const elapsed = Date.now() - pendingVault.startedAt
-    if (elapsed > VAULT_INPUT_TTL_MS) {
-      pendingVaultOps.delete(chat_id)
-    } else {
-      pendingVaultOps.delete(chat_id)
-      if (pendingVault.kind === 'passphrase') {
-        const passphrase = text.trim()
-        if (!passphrase) {
-          await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault again.', { html: true })
-          return
-        }
-        vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
-        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault passphrase')
-        await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
-      } else if (pendingVault.kind === 'unlock') {
-        // Issue #158: passphrase for /vault unlock — sent directly to the
-        // broker unlock socket, never cached or logged.
-        const passphrase = text.trim()
-        if (!passphrase) {
-          await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault unlock again.', { html: true })
-          return
-        }
-        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault unlock passphrase')
-        const result = await unlockViaBroker(passphrase)
-        if (result.ok) {
-          await switchroomReply(ctx, '🔓 Vault broker unlocked.', { html: true })
-        } else {
-          await switchroomReply(ctx, `**vault unlock failed:** ${escapeHtmlForTg(result.msg ?? 'unknown error')}`, { html: true })
-        }
-      } else if (pendingVault.kind === 'passphrase-for-deferred') {
-        // Issue #44: passphrase entered after tapping "🔓 Unlock vault &
-        // save" on the deferred-secret card. Cache the passphrase then
-        // auto-write the held secret directly — no re-paste required.
-        // The passphrase message itself is deleted so it doesn't linger
-        // in chat history (same protection as the original secret got).
-        const passphrase = text.trim()
-        if (!passphrase) {
-          await switchroomReply(ctx, 'Passphrase cannot be empty. Tap the unlock button again.', { html: true })
-          return
-        }
-        vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
-        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault passphrase')
-        await callbackQueryHandlers.executeDeferredSecretSave(ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
-      } else if (pendingVault.kind === 'passphrase-for-access-approve') {
-        // #1012 Phase 2 follow-up + #1051: operator tapped Approve on
-        // one or more vault_request_access cards without first
-        // unlocking. We captured the next message as the passphrase,
-        // cache it, delete the chat copy, and resume the approve
-        // flow for EVERY queued stage (#1051 — without the queue, a
-        // concurrent second tap orphaned the first stage). Wrong
-        // passphrase surfaces via the broker's
-        // DENIED:passphrase-mismatch path and edits each card to the
-        // mint_grant-failed message (see performVaultAccessApproval).
-        const passphrase = text.trim()
-        if (!passphrase) {
-          await switchroomReply(ctx, 'Passphrase cannot be empty. Ask the agent to re-issue the request card.', { html: true })
-          return
-        }
-        vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
-        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault passphrase')
-        // Drain the queued items SEQUENTIALLY. The grant-union step
-        // inside performVaultAccessApproval lists existing grants
-        // before minting; sequential processing means the union
-        // grows monotonically (item 1 mints grant for [keyA]; item 2
-        // lists, finds [keyA], unions with keyB → mints [keyA, keyB]).
-        // Parallel processing would race on the list-and-merge.
-        for (const item of pendingVault.items) {
-          const stagedAccess = pendingVaultRequestAccesses.get(item.stageId)
-          if (!stagedAccess) {
-            // Stage expired or denied between tap and passphrase reply.
-            // Edit its card to a clean explanation; don't break the
-            // loop (sibling cards may still be valid).
-            await ctx.api
-              .editMessageText(
-                item.cardChatId,
-                item.cardMessageId,
-                richMessage(`⌛ _Vault unlocked, but this access-request card expired or was denied before you replied. Ask the agent to re-issue if still needed._`),
-                { reply_markup: { inline_keyboard: [] } },
-              )
-              .catch(() => {})
-            continue
-          }
-          await callbackQueryHandlers.performVaultAccessApproval(ctx, stagedAccess, item.stageId, item.senderId, { kind: 'passphrase', passphrase })
-        }
-      } else if (pendingVault.kind === 'grant-wizard' && pendingVault.awaitingCustomDuration) {
-        // Issue #227: custom duration text reply for grant wizard
-        const input = text.trim()
-        const ttlSeconds = callbackQueryHandlers.parseGrantDuration(input)
-        if (ttlSeconds === null) {
-          // Re-set state so user can try again
-          pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
-          await switchroomReply(ctx, '⚠️ Invalid duration. Use \`Nd\` (days) or \`Nh\` (hours), e.g. \`30d\` or \`12h\`.', { html: true })
-          return
-        }
-        const newState = { ...pendingVault, ttlSeconds, awaitingCustomDuration: false }
-        await callbackQueryHandlers.grantWizardConfirm(ctx, chat_id, newState)
-      } else if (pendingVault.kind === 'grant-wizard') {
-        // Text received mid-wizard but not awaiting custom duration — ignore and re-set
-        pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
-      } else if (pendingVault.kind === 'value') {
-        let value = text
-        const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
-        if (codeBlockMatch) value = codeBlockMatch[1]!
-        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault secret value')
-        await executeVaultOp(ctx, chat_id, 'set', pendingVault.key, pendingVault.passphrase, value.trim())
-      } else if (pendingVault.kind === 'rename-vault-save') {
-        // Issue #969 P1a: user tapped Rename on a vault_request_save
-        // card and is now telling us the new key name. Validate the
-        // slug, update the staged entry, refresh the card.
-        const newKey = text.trim()
-        const staged = pendingVaultRequestSaves.get(pendingVault.stageId)
-        if (!staged) {
-          await switchroomReply(ctx, '⌛ That save card expired before you renamed. Ask the agent to re-issue.', { html: true })
-          return
-        }
-        if (!VAULT_KEY_REGEX.test(newKey)) {
-          // Re-arm the pending state so the user can try again.
-          pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
-          await switchroomReply(ctx, `⚠️ Key must match \`${VAULT_KEY_REGEX_LABEL}\`. Send a different name.`, { html: true })
-          return
-        }
-        staged.key = newKey
-        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault rename input')
-        // Edit the card in place with the new suggested key + same buttons.
-        if (staged.card_message_id != null) {
-          await ctx.api
-            .editMessageText(
-              staged.chat_id,
-              staged.card_message_id,
-              richMessage(renderVaultRequestSaveCard(staged, staged.agent)),
-              { reply_markup: buildVaultRequestSaveKeyboard(pendingVault.stageId) },
-            )
-            .catch(() => {})
-        }
-      }
-      return
-    }
+  // Vault intercept — moved to interceptVault (#2996 P7 PR-8).
+  {
+    const vaultOutcome = await interceptVault({ ctx, text, chat_id, msgId }, inboundInterceptorDeps)
+    if (vaultOutcome.handled) return
   }
 
   // --- Secret-detect follow-up command intercept ---

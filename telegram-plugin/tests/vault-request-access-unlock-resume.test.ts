@@ -29,7 +29,10 @@ import { resolve } from 'node:path'
 const gatewaySrc =
   readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
   '\n' +
-  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8')
+  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8') +
+  '\n' +
+  // P7 PR-8 (#2996): vault pending-op intercept moved to inbound-interceptors.ts.
+  readFileSync(resolve(__dirname, '..', 'gateway', 'inbound-interceptors.ts'), 'utf-8')
 
 describe('vault_request_access — tap-to-unlock-and-approve UX', () => {
   it('declares the passphrase-for-access-approve PendingVaultOp variant', () => {
