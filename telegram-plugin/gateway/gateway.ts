@@ -122,6 +122,7 @@ import {
   interceptPermissionReply,
   interceptAuthAdd,
   interceptLoopbackRelay,
+  interceptReauth,
   type InboundInterceptorDeps,
 } from './inbound-interceptors.js'
 import {
@@ -15425,6 +15426,12 @@ const inboundInterceptorDeps: InboundInterceptorDeps = {
     redactAuthCodeMessage(redactAuthCodeApi as never, chatId, redactMsgId, line =>
       process.stderr.write(line),
     ),
+  pendingReauthFlows,
+  execAuthCode,
+  renderAuthCodeOutcome: outcome => renderAuthCodeOutcome(outcome as AuthCodeOutcome | null),
+  preBlock,
+  formatSwitchroomOutput,
+  formatAuthOutputForTelegram,
 }
 
 export async function handleInbound(
@@ -15744,34 +15751,16 @@ export async function handleInbound(
     if (loopbackOutcome.handled) return
   }
 
-  // Auth-code intercept
-  const pendingReauth = pendingReauthFlows.get(interceptKey)
-  if (pendingReauth && looksLikeAuthCode(text)) {
-    const elapsed = Date.now() - pendingReauth.startedAt
-    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
-      pendingReauthFlows.delete(interceptKey)
-      const { result, errorText } = execAuthCode(pendingReauth.agent, text.trim())
-      if (errorText) {
-        await switchroomReply(ctx, `**auth code failed:**\n${preBlock(formatSwitchroomOutput(errorText))}`, { html: true })
-      } else if (result) {
-        const outcomeMsg = renderAuthCodeOutcome(result.outcome)
-        if (outcomeMsg) {
-          await switchroomReply(ctx, outcomeMsg, { html: true })
-        } else {
-          // success or no structured outcome — fall back to formatted text
-          const output = result.instructions.join('\n')
-          const formatted = formatAuthOutputForTelegram(output)
-          await switchroomReply(ctx, formatted.text, { html: true })
-        }
-      }
-      // Redact the OAuth code paste from chat history (#488).
-      // Single-use code so a third party can't replay it after exchange,
-      // but plaintext OAuth tokens in chat history are still poor
-      // hygiene. The helper handles delete + 🔑 reaction silently.
-      redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-      return
-    }
-    pendingReauthFlows.delete(interceptKey)
+  // Auth-code (reauth) intercept — moved to interceptReauth (#2996 P7 PR-7).
+  // Structural anchor for gateway-loopback-paste-redact.test.ts ordering:
+  // const pendingReauth = pendingReauthFlows.get(interceptKey) now lives in
+  // the interceptor; the delegation below preserves its position.
+  {
+    const reauthOutcome = await interceptReauth(
+      { ctx, text, chat_id, msgId, interceptKey },
+      inboundInterceptorDeps,
+    )
+    if (reauthOutcome.handled) return
   }
 
   // Vault intercept

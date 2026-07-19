@@ -104,6 +104,21 @@ export interface InboundInterceptorDeps {
   escapeHtmlForTg: (text: string) => string
   /** Closure over redactAuthCodeMessage + the gateway's redactAuthCodeApi (#488). */
   redactAuthCode: (chatId: string, msgId: number | null) => void
+  // --- reauth paste-back (P7 PR-7) collaborators ---
+  pendingReauthFlows: {
+    get: (key: string) => { agent: string; startedAt: number } | undefined
+    delete: (key: string) => boolean
+  }
+  execAuthCode: (
+    agent: string,
+    code: string,
+  ) =>
+    | { result: { outcome: unknown; instructions: string[] }; errorText: null }
+    | { result: null; errorText: string }
+  renderAuthCodeOutcome: (outcome: unknown) => string | null
+  preBlock: (text: string) => string
+  formatSwitchroomOutput: (output: string) => string
+  formatAuthOutputForTelegram: (output: string) => { text: string; url: string | null }
 }
 
 /**
@@ -530,5 +545,51 @@ export async function interceptLoopbackRelay(
     )
     return { handled: true }
   }
+  return { handled: false }
+}
+
+/**
+ * /reauth OAuth-code paste-back intercept — the elder sibling of auth-add
+ * (mutates an existing agent's slot via `switchroom auth code`, vs /auth add
+ * which creates fresh credentials at the broker). Runs AFTER auth-add /
+ * loopback (load-bearing order). Same chatKey-scoped isolation + TTL window;
+ * the code paste is redacted from history either way (#488). A stale entry is
+ * dropped and the message falls through (`handled: false`).
+ */
+export async function interceptReauth(
+  p: AuthAddParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterceptOutcome> {
+  const pendingReauth = deps.pendingReauthFlows.get(p.interceptKey)
+  if (!(pendingReauth && deps.looksLikeAuthCode(p.text))) return { handled: false }
+  const elapsed = Date.now() - pendingReauth.startedAt
+  if (elapsed < deps.reauthInterceptTtlMs) {
+    deps.pendingReauthFlows.delete(p.interceptKey)
+    const { result, errorText } = deps.execAuthCode(pendingReauth.agent, p.text.trim())
+    if (errorText) {
+      await deps.switchroomReply(
+        p.ctx,
+        `**auth code failed:**\n${deps.preBlock(deps.formatSwitchroomOutput(errorText))}`,
+        { html: true },
+      )
+    } else if (result) {
+      const outcomeMsg = deps.renderAuthCodeOutcome(result.outcome)
+      if (outcomeMsg) {
+        await deps.switchroomReply(p.ctx, outcomeMsg, { html: true })
+      } else {
+        // success or no structured outcome — fall back to formatted text
+        const output = result.instructions.join('\n')
+        const formatted = deps.formatAuthOutputForTelegram(output)
+        await deps.switchroomReply(p.ctx, formatted.text, { html: true })
+      }
+    }
+    // Redact the OAuth code paste from chat history (#488).
+    // Single-use code so a third party can't replay it after exchange,
+    // but plaintext OAuth tokens in chat history are still poor
+    // hygiene. The helper handles delete + 🔑 reaction silently.
+    deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+    return { handled: true }
+  }
+  deps.pendingReauthFlows.delete(p.interceptKey)
   return { handled: false }
 }

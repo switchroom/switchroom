@@ -72,7 +72,9 @@ describe('gateway loopback-paste fail-safe redaction — structural wiring', () 
     expect(failSafeIdx).toBeGreaterThan(pendingLoopIdx)
 
     const loopbackCallIdx = gatewaySrc.indexOf('interceptLoopbackRelay(')
-    const reauthIdx = gatewaySrc.indexOf('const pendingReauth = pendingReauthFlows.get')
+    // P7 PR-7: the reauth intercept body also moved; its gateway call site is
+    // the ordering anchor.
+    const reauthIdx = gatewaySrc.indexOf('interceptReauth(')
     expect(loopbackCallIdx).toBeGreaterThan(-1)
     expect(reauthIdx).toBeGreaterThan(loopbackCallIdx)
   })
