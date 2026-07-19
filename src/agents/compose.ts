@@ -777,7 +777,10 @@ interface AgentServiceData {
    * rather than the legacy PTY supervisor. Cascade-resolved from
    * `experimental.legacy_pty`: `true` unless the operator opted out with
    * `experimental.legacy_pty: true`. Surfaces in the container
-   * `environment:` block as `SWITCHROOM_TMUX_SUPERVISOR="1"` when true.
+   * `environment:` block as `SWITCHROOM_TMUX_SUPERVISOR="1"` when true and
+   * `"0"` when false — emitted in BOTH cases (never omitted) so the value is
+   * always system-authoritative and an operator `env:` override can't smuggle
+   * it in on a legacy-PTY agent.
    *
    * This env var is the ENABLER for the gateway's deterministic in-chat
    * `/auth add` flow: `startAccountAuthSession` (telegram-plugin/gateway/
@@ -788,8 +791,10 @@ interface AgentServiceData {
    * only docs/tmux-supervisor-fanout.md mentioned it as a systemd line for
    * a unit shape this docker deployment doesn't use). Gated on the SAME
    * `legacy_pty !== true` predicate the rest of the tmux-supervisor surface
-   * uses (src/cli/agent.ts:1606, src/agents/lifecycle.ts:397) so the flag
-   * and the runtime it guards can never disagree.
+   * uses (src/cli/agent.ts:1606, src/agents/lifecycle.ts:397). Because the
+   * env value is emitted in both branches ("1"/"0") ahead of the userEnv
+   * merge, the flag and the runtime it guards can never disagree — not even
+   * when an operator adds a conflicting `env:` override.
    */
   tmuxSupervisor: boolean;
 }
@@ -2370,16 +2375,22 @@ function emitAgentService(
   // (verified: nothing in the compose render, start.sh, or the container
   // env ever set it; only docs/tmux-supervisor-fanout.md mentioned it as a
   // systemd `Environment=` line for a unit shape this docker deployment
-  // doesn't use). Provisioned here, config-derived, whenever the agent runs
-  // under the tmux supervisor — i.e. unless the operator opted out with
-  // `experimental.legacy_pty: true`. Under legacy_pty there is no tmux
-  // supervisor, so the flag is deliberately omitted (the flow correctly
-  // stays refused). Emitted BEFORE the userEnv merge so on a
-  // tmux-supervisor agent (the default) the "1" is system-authoritative and
-  // the operator can't clobber the runtime contract from yaml.
-  if (a.tmuxSupervisor) {
-    env.SWITCHROOM_TMUX_SUPERVISOR = "1";
-  }
+  // doesn't use). Provisioned here, config-derived: "1" whenever the agent
+  // runs under the tmux supervisor (the default), "0" when the operator opted
+  // out with `experimental.legacy_pty: true`. The value is emitted in BOTH
+  // branches (never left unset) so it is ALWAYS system-authoritative: the
+  // userEnv merge below only fills keys that are `undefined`, so a system key
+  // must actually be set for the merge to protect it. If the legacy_pty case
+  // left the key unset, an operator `env: { SWITCHROOM_TMUX_SUPERVISOR: "1" }`
+  // override (exactly the interim workaround the design doc suggested) would
+  // pass straight through and wrongly launch the tmux auth-add flow on a
+  // legacy-PTY agent with no tmux supervisor backing it. Writing "0" here lets
+  // the merge protect the legacy case too, and the gateway guard (`!== "1"`)
+  // correctly stays refused on "0". Emitted BEFORE the userEnv merge so the
+  // system value always wins — the operator can't clobber the runtime contract
+  // from yaml in EITHER direction, which is what makes the flag and the
+  // runtime it guards genuinely unable to disagree.
+  env.SWITCHROOM_TMUX_SUPERVISOR = a.tmuxSupervisor ? "1" : "0";
   // Merge operator-declared env vars from the agent's `env:` block.
   // System-managed keys (HOME, NPM_*, SWITCHROOM_*) win on collision —
   // an operator can't override the runtime contract from yaml. A

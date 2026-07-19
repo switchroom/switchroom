@@ -2735,8 +2735,10 @@ describe("SWITCHROOM_TMUX_SUPERVISOR env provisioning (#725 enabler)", () => {
   // v0.19.2 with NO provisioning — nothing in the compose render, start.sh,
   // or the container env ever set it — so the flow was unreachable on every
   // agent. These tests assert the OUTCOME the bug was: the var is present
-  // (=="1") on a default (tmux-supervisor) agent and absent on a legacy_pty
-  // agent, not merely that some code path ran.
+  // (=="1") on a default (tmux-supervisor) agent and "0" on a legacy_pty
+  // agent, not merely that some code path ran. The value is emitted in BOTH
+  // branches (never omitted) so it is always system-authoritative — an
+  // operator env: override can never smuggle "1" onto a legacy_pty agent.
   function envBlockFor(yml: string, agent: string): string {
     const re = new RegExp(
       `  agent-${agent}:[\\s\\S]*?    environment:([\\s\\S]*?)\\n    volumes:`,
@@ -2758,12 +2760,33 @@ describe("SWITCHROOM_TMUX_SUPERVISOR env provisioning (#725 enabler)", () => {
     expect(env).toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"1"/);
   });
 
-  it("OMITS it when the operator opted into experimental.legacy_pty=true", () => {
+  it("emits SWITCHROOM_TMUX_SUPERVISOR=\"0\" when the operator opted into experimental.legacy_pty=true", () => {
     const out = generateCompose({
       config: makeConfig({ klanker: { experimental: { legacy_pty: true } } }),
     });
     const env = envBlockFor(out, "klanker");
-    expect(env).not.toMatch(/SWITCHROOM_TMUX_SUPERVISOR/);
+    expect(env).toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"0"/);
+    expect(env).not.toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"1"/);
+  });
+
+  it("is system-authoritative under legacy_pty — an operator env: override can't smuggle \"1\" onto a non-tmux agent", () => {
+    // Finding A1: before the fix the key was left UNSET under legacy_pty, so
+    // the userEnv merge (which only fills undefined keys) let an operator
+    // `env: { SWITCHROOM_TMUX_SUPERVISOR: "1" }` (the interim workaround)
+    // pass straight through and wrongly launch the tmux auth-add flow on a
+    // legacy-PTY agent with no tmux supervisor. Emitting "0" here makes the
+    // system value win and the override is rejected.
+    const out = generateCompose({
+      config: makeConfig({
+        klanker: {
+          experimental: { legacy_pty: true },
+          env: { SWITCHROOM_TMUX_SUPERVISOR: "1" },
+        },
+      }),
+    });
+    const env = envBlockFor(out, "klanker");
+    expect(env).toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"0"/);
+    expect(env).not.toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"1"/);
   });
 
   it("is system-authoritative — an operator env: block can't clobber it on a supervisor agent", () => {
