@@ -768,3 +768,26 @@ if [ -f "$marker" ]; then echo claude-opus-4-8; else touch "$marker"; echo "mang
     expect(idxLkg).toBeLessThan(idxRecord);
   });
 });
+
+describe("carrier name consistency: gateway SESSION_MODEL_FILE ↔ start.sh.hbs", () => {
+  it("pins gateway SESSION_MODEL_FILE basename into hbs apply path + legacy shim", async () => {
+    const { SESSION_MODEL_FILE } = await import("../telegram-plugin/gateway/session-model-file.js");
+    const hbs = readFileSync(
+      join(process.cwd(), "profiles/_base/start.sh.hbs"),
+      "utf-8",
+    );
+    expect(SESSION_MODEL_FILE).toBe(".session-model");
+    // Real file-test on the rev5 carrier path (not -override/-alert siblings).
+    const bare = new RegExp(
+      String.raw`\[\s*-f\s+[^\n\]]*` +
+        SESSION_MODEL_FILE.replace(".", "\\.") +
+        String.raw`(?!-(?:override|alert|boot-attempts|kept))"?\s*\]`,
+    );
+    expect(hbs).toMatch(bare);
+    expect(hbs).toContain(`{{agentDir}}/${SESSION_MODEL_FILE}`);
+    expect(hbs).toContain("configuredDefaultAtWrite");
+    // Migration shim for leftover one-shot carriers.
+    expect(hbs).toContain(".session-model-override");
+    expect(hbs).toMatch(/migrated legacy one-shot carrier/);
+  });
+});
