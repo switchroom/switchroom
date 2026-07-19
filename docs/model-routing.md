@@ -9,7 +9,10 @@ optional metering gateway sits in the path. Related reading:
 [`docs/architecture.md`](architecture.md) (process model),
 [`docs/vault-broker.md`](vault-broker.md) (per-consumer virtual keys),
 [`docs/operators/hindsight-memory.md`](operators/hindsight-memory.md) (the
-`hindsight.llm` operator surface), and
+`hindsight.llm` operator surface),
+[`docs/operators/hindsight-model-change.md`](operators/hindsight-model-change.md)
+(runbook for swapping hindsight per-op models — routing lanes, recreate,
+verification, rollback), and
 [`reference/invariants.md`](../reference/invariants.md) §"Operator-controlled
 gateway carve-out".
 
