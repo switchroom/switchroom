@@ -12,7 +12,7 @@ description: >
   knowlege models". ALSO owns the directive merge/retire pass — triggers like
   "audit my directives", "merge my directives", "retire stale directives", "my
   directives are overlapping", "too many active directives", "clean up my
-  guardrails", and when fleet doctor FLAGs a bank over the directive WARN/FAIL
+  guardrails", and when switchroom doctor FLAGs a bank over the directive WARN/FAIL
   threshold. Do NOT use for storing a single fact/preference/decision —
   that is retain, not a mental model. Do NOT use for identity or "who is the
   user" — that lives in profile banks, so never propose an identity model here
@@ -171,7 +171,7 @@ outputs a plan; it does not enact retirements itself.
 ### When to run it
 
 - The operator asks (see the directive triggers in the description), OR
-- fleet doctor flags a bank at/over the directive WARN/FAIL threshold, OR
+- switchroom doctor flags a bank at/over the directive WARN/FAIL threshold, OR
 - you're already curating the bank and notice the directive set is bloated.
 
 ### Workflow
