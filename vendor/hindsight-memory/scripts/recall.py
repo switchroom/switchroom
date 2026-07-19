@@ -664,35 +664,72 @@ def _write_recall_log(entry: dict) -> None:
         pass
 
 
-def read_transcript_messages(transcript_path: str) -> list:
+def _read_transcript_lines(transcript_path: str, tail_bytes: int):
+    """Yield the transcript's trailing lines, byte-bounded.
+
+    Switchroom hindsight-leverage A2 (PR2): the latency bound for multi-turn
+    recall. When ``tail_bytes > 0`` we seek to ``EOF - tail_bytes`` and read
+    forward, discarding the first (possibly partial) line so every yielded line
+    is complete JSON. This caps the read+parse cost at O(tail_bytes) regardless
+    of how large the session ``.jsonl`` has grown — the last few human turns we
+    slice for context always live at the very tail. ``tail_bytes <= 0`` reads
+    the whole file (pre-A2 behaviour / rollback lever).
+
+    Reads bytes (not text) so the seek offset is exact; decodes with
+    ``errors="ignore"`` so a multi-byte character split by the tail boundary
+    can't crash the read (that byte lands in the discarded partial first line
+    anyway when the file exceeds the bound).
+    """
+    if tail_bytes and tail_bytes > 0:
+        size = os.path.getsize(transcript_path)
+        if size > tail_bytes:
+            with open(transcript_path, "rb") as f:
+                f.seek(size - tail_bytes)
+                chunk = f.read()
+            text = chunk.decode("utf-8", errors="ignore")
+            # Drop the first line — it may be a partial record from mid-file.
+            newline = text.find("\n")
+            if newline != -1:
+                text = text[newline + 1 :]
+            yield from text.splitlines()
+            return
+    with open(transcript_path, encoding="utf-8") as f:
+        yield from f
+
+
+def read_transcript_messages(transcript_path: str, tail_bytes: int = 0) -> list:
     """Read messages from a JSONL transcript file for multi-turn context.
 
     Claude Code transcript format nests messages:
       {type: "user", message: {role: "user", content: "..."}, uuid: "...", ...}
     Also supports flat format for testing:
       {role: "user", content: "..."}
+
+    ``tail_bytes`` (Switchroom A2) byte-bounds the read: when > 0 and the file
+    is larger, only the trailing ``tail_bytes`` (complete lines) are parsed, so
+    the added per-recall transcript read stays cheap on long sessions. 0 reads
+    the whole file.
     """
     if not transcript_path or not os.path.isfile(transcript_path):
         return []
     messages = []
     try:
-        with open(transcript_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    # Claude Code nested format: {type: "user", message: {role, content}}
-                    if entry.get("type") in ("user", "assistant"):
-                        msg = entry.get("message", {})
-                        if isinstance(msg, dict) and msg.get("role"):
-                            messages.append(msg)
-                    # Flat format (testing / future compatibility)
-                    elif "role" in entry and "content" in entry:
-                        messages.append(entry)
-                except json.JSONDecodeError:
-                    continue
+        for line in _read_transcript_lines(transcript_path, tail_bytes):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                # Claude Code nested format: {type: "user", message: {role, content}}
+                if entry.get("type") in ("user", "assistant"):
+                    msg = entry.get("message", {})
+                    if isinstance(msg, dict) and msg.get("role"):
+                        messages.append(msg)
+                # Flat format (testing / future compatibility)
+                elif "role" in entry and "content" in entry:
+                    messages.append(entry)
+            except json.JSONDecodeError:
+                continue
     except OSError:
         pass
     return messages
@@ -1128,7 +1165,10 @@ def main():
 
     if recall_context_turns > 1:
         transcript_path = hook_input.get("transcript_path", "")
-        messages = read_transcript_messages(transcript_path)
+        # A2 latency bound: only parse the transcript tail (last N bytes) —
+        # the human turns we slice for context live at the end.
+        recall_transcript_tail_bytes = config.get("recallTranscriptTailBytes", 262144)
+        messages = read_transcript_messages(transcript_path, recall_transcript_tail_bytes)
         debug_log(config, f"Multi-turn context: {recall_context_turns} turns, {len(messages)} messages from transcript")
         query = compose_recall_query(recall_query_text, messages, recall_context_turns, recall_roles)
     else:

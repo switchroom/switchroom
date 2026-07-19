@@ -77,8 +77,22 @@ DEFAULTS = {
     # directive writes invalidate the cache immediately via directive_verify.py.
     # 0 disables the cache (live fetch every turn — the A4 rollback lever).
     "directivesCacheTtlSeconds": 120,
-    "recallContextTurns": 1,
+    # Switchroom hindsight-leverage A2 (PR2): default 2 so a bare follow-up
+    # user message ("and the port?", "what about staging?") embeds together
+    # with its antecedent turn, instead of recalling on the pronoun alone.
+    # Bounded by recallMaxQueryChars (truncate_recall_query preserves the
+    # latest turn and drops oldest context first) so the composition can never
+    # blow the recall query budget; the transcript read is byte-tail-bounded
+    # by recallTranscriptTailBytes so the added per-turn read stays O(1).
+    "recallContextTurns": 2,
     "recallMaxQueryChars": 800,
+    # Switchroom hindsight-leverage A2 (PR2) — latency bound for the multi-turn
+    # composition. With recallContextTurns>1 now the default, EVERY recall reads
+    # the transcript to slice the last N human turns. A long session's .jsonl can
+    # grow to many MB, so read only the last N bytes (complete trailing lines);
+    # the last 2-3 human turns always live at the tail. 0 disables the bound
+    # (read the whole file — the pre-A2 behaviour / rollback lever).
+    "recallTranscriptTailBytes": 262144,
     "recallRoles": ["user", "assistant"],
     # Upstream 962140eef — optional recall tag filters passed through to the
     # recall API, plus per-additional-bank overrides keyed by bank ID.
@@ -195,6 +209,9 @@ ENV_OVERRIDES = {
     "HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS": ("directivesCacheTtlSeconds", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
+    # Switchroom hindsight-leverage A2 — byte-tail bound for the multi-turn
+    # transcript read (0 = read whole file / rollback lever).
+    "HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES": ("recallTranscriptTailBytes", int),
     # Upstream 962140eef — recall tag filters. The tags env var accepts JSON
     # or a comma-separated list; the others must be JSON.
     "HINDSIGHT_RECALL_TAGS": ("recallTags", list),
