@@ -21515,12 +21515,17 @@ bot.command('usage', async ctx => {
         // segment, just relative instead of absolute — no info lost; the
         // recommendation + cached/live footer the table used to carry are
         // preserved by renderUsageCard.
+        // External OpenRouter/$ block (layout B) — best-effort; omitted when
+        // LiteLLM admin key is unavailable or the spend endpoint fails.
+        const { fetchExternalSpendSummary } = await import('../external-spend.js')
+        const externalSpend = await fetchExternalSpendSummary(renderNow).catch(() => null)
         const exhaustedByLabel = new Map<string, boolean>(
           state.accounts.map((a) => [a.label, a.exhausted]),
         )
         const text = renderUsageCard(snapshots, exhaustedByLabel, {
           now: renderNow,
           demo,
+          externalSpend,
           // #2495 Change 2 — a TTL-hit / failed-probe fallback is tagged
           // served:"cache"; surface it as `⚠ cached Nm ago` instead of a
           // false live stamp. Otherwise stamp the live refresh time.

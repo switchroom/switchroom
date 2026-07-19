@@ -42,6 +42,7 @@ import type { AccountState, ListStateData } from '../src/auth/broker/client.js';
 import { reviveLastQuota, recommendation, type AccountSnapshot } from './auth-snapshot-format.js';
 import { escapeMarkdown } from './card-format.js';
 import { maskEmail } from './demo-mask.js';
+import { formatExternalSpendBlock } from './external-spend.js';
 
 // ── dot thresholds ───────────────────────────────────────────────────
 
@@ -257,6 +258,17 @@ export interface UsageCardRenderOpts extends QuotaBarRenderOpts {
    * because in that case there IS real data, just stale.
    */
   probeFailed?: boolean;
+  /**
+   * Optional External (OpenRouter / non-Claude cash) spend block — layout B
+   * (operator-locked 2026-07-19). When null/undefined the block is omitted
+   * entirely (no error rows). When present (including $0.00), bullets land
+   * after the recommendation and before the freshness footer.
+   */
+  externalSpend?: {
+    day24hUsd: number;
+    day7dUsd: number;
+    top: Array<{ label: string; usd: number }>;
+  } | null;
 }
 
 /**
@@ -342,6 +354,11 @@ export function renderUsageCard(
   const lines = [bar];
   // Actionable cross-account verdict — restored from renderAuthSnapshotFormat2.
   lines.push(`_${recommendation(snapshots, now, demo)}_`);
+  // External cash spend (OpenRouter / non-Claude) — layout B. Omitted when
+  // the caller could not fetch a summary (no admin key, timeout, etc.).
+  if (opts.externalSpend) {
+    lines.push(...formatExternalSpendBlock(opts.externalSpend));
+  }
   // Freshness signal: stale-cache warning takes precedence over a live stamp,
   // which takes precedence over an explicit probe-failed marker (no live data
   // AND no cache — the card is showing "⚠️ no data" rows, so "Live" would be
