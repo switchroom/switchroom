@@ -335,18 +335,18 @@ export function buildInboundEnvelope(p: EnvelopeBuildParams): InboundMessage {
 /**
  * THE deterministic cutover switch (#2996 P7 PR-11, design §2). Read ONCE at
  * module load (F2: flags are const-captured — flipping requires an agent
- * restart, same as every other `_ENABLED` flag). Default OFF: the legacy
- * inline delegation sequence in gateway.ts `handleInbound` remains the
- * production control flow until the canary (flag `=1`) bakes clean. The v2
- * chain and the legacy sequence call the SAME extracted intercept functions
- * in the SAME order — the characterization harness is the parity oracle (F6;
- * the #3316-removed gate-parity probe is not relied on), and
- * tests/inbound-router-v2-chain.test.ts pins the v2 path with the flag set
- * env-before-import.
+ * restart, same as every other `_ENABLED` flag). Default ON (canary-validated
+ * on v0.18.33 — 5/5 UAT, DM + supergroup): the v2 consolidated intercept chain
+ * is the production control flow. The v2 chain and the legacy sequence call the
+ * SAME extracted intercept functions in the SAME order — the characterization
+ * harness is the parity oracle (F6; the #3316-removed gate-parity probe is not
+ * relied on), and tests/inbound-router-v2-chain.test.ts pins the v2 path with
+ * the flag set env-before-import.
  *
- * Rollback: unset / `=0` + agent restart. No model involvement.
+ * Rollback (escape hatch): `SWITCHROOM_INBOUND_ROUTER_V2=0` + agent restart.
+ * No model involvement.
  */
-export const INBOUND_ROUTER_V2 = process.env.SWITCHROOM_INBOUND_ROUTER_V2 === '1'
+export const INBOUND_ROUTER_V2 = process.env.SWITCHROOM_INBOUND_ROUTER_V2 !== '0'
 
 /** Outcome of the pre-turn chain: stop-keyword then interrupt-marker. */
 export type PreTurnChainOutcome = InterruptMarkerOutcome
