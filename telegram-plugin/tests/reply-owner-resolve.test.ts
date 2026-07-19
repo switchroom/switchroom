@@ -563,3 +563,51 @@ describe('#3426 — async sub-agent handback after an interim-ack turn', () => {
     expect(handback).toBeNull()
   })
 })
+
+/**
+ * #3429 — content evidence in the answer-delivered latch.
+ *
+ * A flush-armed latch used to suppress ANY late substantive reply resolving
+ * the flush-delivered ended turn. With the supersede path now declining
+ * new-content handbacks (they must send FRESH, not edit the flushed message in
+ * place), those handbacks fall through to this latch — which would have
+ * converted the #3429 silent edit into a #3426-style silent drop. The
+ * `replyMatchesFlushedAnswer` evidence closes that: positive FALSE (the reply
+ * is NOT the flushed answer) never suppresses; TRUE or unknown (null/omitted)
+ * preserves the #2996 Part 2 flush-race backstop exactly as before.
+ */
+describe('#3429 — flush-armed latch with content evidence', () => {
+  const base = {
+    superseded: false,
+    replySubstantive: true,
+    isLateReply: true,
+    ownerAnswerDelivered: 'flush' as const,
+  }
+
+  it('CORE: positive new-content evidence (matches === false) is NEVER suppressed ' +
+    '— the handback after a flush-delivered turn delivers fresh', () => {
+    expect(decideAnswerLatchSuppression({ ...base, replyMatchesFlushedAnswer: false })).toBe(false)
+  })
+
+  it('the flushed answer landing again (matches === true) is still suppressed ' +
+    '(the flush race the latch exists for)', () => {
+    expect(decideAnswerLatchSuppression({ ...base, replyMatchesFlushedAnswer: true })).toBe(true)
+  })
+
+  it('unknown evidence (null) keeps the conservative pre-#3429 suppression', () => {
+    expect(decideAnswerLatchSuppression({ ...base, replyMatchesFlushedAnswer: null })).toBe(true)
+  })
+
+  it('omitted evidence keeps the conservative pre-#3429 suppression (back-compat)', () => {
+    expect(decideAnswerLatchSuppression(base)).toBe(true)
+  })
+
+  it('evidence never overrides the reply-armed/unarmed rules (still no suppression)', () => {
+    expect(
+      decideAnswerLatchSuppression({ ...base, ownerAnswerDelivered: 'reply', replyMatchesFlushedAnswer: true }),
+    ).toBe(false)
+    expect(
+      decideAnswerLatchSuppression({ ...base, ownerAnswerDelivered: false, replyMatchesFlushedAnswer: true }),
+    ).toBe(false)
+  })
+})

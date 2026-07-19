@@ -569,3 +569,157 @@ describe('structural wiring — the singleton + the gateway entry point (#2996 P
     expect(win.match(/getCurrentTurn\(\)/g)!.length).toBeGreaterThanOrEqual(5)
   })
 })
+
+/**
+ * #3429 — GATEWAY-LEVEL regression: an async handback landing after a
+ * flush-delivered turn ENDED must produce a FRESH, notifying message — never a
+ * silent edit-in-place of the prior turn's flushed message.
+ *
+ * This drives the REAL `sendReply` body (the exact gateway send path: the
+ * supersede consumption at outbound-send-path.ts ~874-905 and the deferred
+ * `decideSupersedeCorrection` edit-in-place lane at ~1462-1477) against the
+ * fake bot API, with a REAL `FlushedTurnSupersedeRegistry` seeded exactly the
+ * way the turn-flush backstop seeds it (record + 'flush'-armed ended owner
+ * turn). The incident (msgs 10482/10486, 2026-07-20): the handback resolved
+ * the flush-delivered ENDED turn as owner via the latest-ended tier (inside
+ * the 60 s TTL), consumed the supersede record, and EDITED the flushed message
+ * in place — Telegram edits never push-notify, so genuinely new content failed
+ * to surface client-side. Red on pre-fix code: these first asserts see an
+ * `editMessageText` call and no fresh send.
+ *
+ * The turn-end-funnel flag (SWITCHROOM_TURN_END_FUNNEL_V2, default ON) does
+ * not fork this path — the flush branch records into the SAME registry and the
+ * reply path consumes it identically under both settings — so this covers the
+ * v2 funnel default.
+ */
+describe('#3429 — post-turn-end handback vs flush-delivered supersede (real send path)', () => {
+  const OWNER_TURN_ID = `${CHAT}:_#ended-40`
+  const FLUSH_MSG_ID = 4242
+  const FLUSHED_TEXT =
+    'Checking the fleet status now.\n\n' +
+    'All twelve agents are healthy: the gateway, the vault broker, and the approval kernel ' +
+    'all report green health checks, and no container has restarted in the last twenty-four hours. ' +
+    'Nothing needs attention right now.'
+  const CANONICAL_REPLY =
+    'All twelve agents are healthy: the gateway, the vault broker, and the approval kernel ' +
+    'all report green health checks, and no container has restarted in the last twenty-four hours. ' +
+    'Nothing needs attention right now.'
+  const HANDBACK =
+    'Worker handback: the researcher sub-agent finished the migration audit. It found three ' +
+    'schema drifts in the staging database, wrote the full report to the shared drive, and ' +
+    'opened PR #3430 with the corrective migration. Tests are green and it is ready for review.'
+
+  /** An ENDED, flush-delivered owner turn — exactly the atom state the
+   *  turn-flush fire site leaves in `recentTurnsById` (latch 'flush', flushed
+   *  text stamped, endedAt within the supersede TTL). */
+  function makeFlushDeliveredEndedTurn(): CurrentTurn {
+    return {
+      turnId: OWNER_TURN_ID,
+      sessionChatId: CHAT,
+      answerDelivered: 'flush',
+      flushedAnswerText: FLUSHED_TEXT,
+      endedAt: Date.now() - 30_000,
+      replyCalled: false,
+      finalAnswerDelivered: true,
+      finalAnswerSubstantive: true,
+    } as unknown as CurrentTurn
+  }
+
+  function seedFlushRecord(h: ReturnType<typeof makeHarness>, owner: CurrentTurn): void {
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      { turnId: owner.turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now(),
+    )
+    // The late reply resolves the ENDED flush-delivered turn as its owner
+    // (latest-ended tier — no live turn, no origin echo, no quote in a DM).
+    h.deps.resolveReplyOwnerTurn = () => owner
+  }
+
+  it('CORE REGRESSION (red pre-fix): a handback with genuinely NEW content sends a ' +
+    'FRESH message — no silent edit-in-place of the flushed message', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedFlushRecord(h, owner)
+
+    // The handback lands LATE: req.turn = null (no live gateway turn — a
+    // sub-agent completion is not a new inbound).
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    // A NEW client-visible message shipped (fresh send ⇒ Telegram push
+    // notifies)…
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    // …and the flushed message was NEITHER edited nor deleted (edits never
+    // re-notify — the pre-fix silent path).
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+
+    // The supersede record was NOT consumed: the turn's own canonical replay
+    // could still correct the flushed message afterwards.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  it('PRESERVED: the turn\'s OWN canonical late replay (same answer, contained in ' +
+    'the flushed blob) still supersedes via edit-in-place — no duplicate bubble', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedFlushRecord(h, owner)
+
+    const res = await sendReply(h.deps, req(CANONICAL_REPLY))
+
+    // The single flushed message was edited into the canonical reply…
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(edits[0]!.text).toContain('All twelve agents are healthy')
+    // …and NO second bubble shipped (the #3236/#2996 duplicate class stays closed).
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+    // Record consumed — a retry cannot re-target the now-corrected message.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        now: Date.now(),
+      }).reason,
+    ).toBe('no-record')
+  })
+
+  it('PRE-RECORD RACE, new content: flush fired (latch armed + text stamped) but ' +
+    'record not yet written — the handback still delivers FRESH, not suppressed', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    // NO registry record (the post-fire pre-record window); owner resolution
+    // still recovers the ended flush-armed turn.
+    h.deps.resolveReplyOwnerTurn = () => owner
+
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+
+  it('PRE-RECORD RACE, same answer: the flushed answer landing again in the race ' +
+    'window is still suppressed (the #2996 Part 2 backstop holds)', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    h.deps.resolveReplyOwnerTurn = () => owner
+
+    const res = await sendReply(h.deps, req(FLUSHED_TEXT))
+
+    expect(h.calls).toHaveLength(0) // nothing sent, nothing edited
+    expect(res.content[0]!.text).toContain('deduped')
+  })
+})
