@@ -17,6 +17,8 @@
 
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { parseStopKeyword, buildStopReply } from './stop-command.js'
+import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-defer.js'
+import type { parseInterruptMarker } from '../interrupt-marker.js'
 import type { RetryCallOpts } from '../retry-api-call.js'
 import type { AttachmentMeta } from './gateway.js'
 
@@ -57,6 +59,10 @@ export interface InboundInterceptorDeps {
     ) => Promise<unknown>
   }
   log: (line: string) => void
+  // --- interrupt-marker (P7 PR-3) collaborators ---
+  loadAccess: () => { interruptSafeBoundary?: boolean }
+  toolFlightTracker: { isMidToolCall: () => boolean; inFlightCount: () => number }
+  cancelInterruptedObligation: () => void
 }
 
 /**
@@ -128,4 +134,122 @@ export async function interceptStopKeyword(
     },
   )
   return { handled: true }
+}
+
+/** Per-message facts for the interrupt-marker intercept (P7 PR-3). */
+export interface InterruptMarkerParams {
+  /** The parse result — the caller keeps `parseInterruptMarker(text)` inline
+   * because `interrupt.isInterrupt` also feeds the downstream envelope/delivery
+   * path; the same value object crosses here so parse happens exactly once. */
+  interrupt: ReturnType<typeof parseInterruptMarker>
+  chat_id: string
+  msgId: number | undefined
+  messageThreadId: number | undefined
+}
+
+/**
+ * Outcome of the interrupt-marker intercept. `handled: true` — empty `!` fully
+ * serviced (halt fired + follow-up sent), caller returns. Otherwise the caller
+ * continues the pipeline with `replacedText` (the `!` body for an interrupt,
+ * the original text untouched for a non-interrupt) and `deferInterrupt` — an
+ * AT-RECEIPT captured VALUE the delivery site consumes (Problem B: when true,
+ * the synchronous SIGINT was skipped and the built inbound is stashed at the
+ * delivery site to fire at a safe boundary).
+ */
+export type InterruptMarkerOutcome =
+  | { handled: true }
+  | { handled: false; deferInterrupt: boolean; replacedText: string | null }
+
+/**
+ * `!`-prefix interrupt (#575): SIGINT the in-flight turn and replace the
+ * inbound with the marker body. Empty `!` is a pure halt (#3020) — same shared
+ * `executeHaltNow` sequence as /stop. Safe-boundary deferral (Problem B): a
+ * non-empty `!` mid-tool-call defers the SIGINT to the delivery site instead
+ * of firing synchronously.
+ *
+ * The tmux SIGINT keeps its dynamic `import('../../src/agents/tmux.js')`
+ * exactly as inline — the gateway runs INSIDE the agent container in docker
+ * mode, so `sendAgentInterrupt` (tmux send-keys, local socket) is used instead
+ * of the docker-inspect PID probe (UAT 2026-05-13 discovery).
+ */
+export async function interceptInterruptMarker(
+  p: InterruptMarkerParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterruptMarkerOutcome> {
+  const { interrupt } = p
+  if (!interrupt.isInterrupt) {
+    return { handled: false, deferInterrupt: false, replacedText: null }
+  }
+
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  const access = deps.loadAccess()
+  const deferInterrupt =
+    !interrupt.emptyBody &&
+    decideInterruptTiming({
+      safeBoundaryEnabled: resolveSafeBoundaryEnabled(access.interruptSafeBoundary),
+      midToolCall: deps.toolFlightTracker.isMidToolCall(),
+    }) === 'defer'
+  deps.log(
+    `telegram gateway: interrupt-marker received chat_id=${p.chat_id} agent=${agentName ?? '-'} ` +
+      `body_len=${interrupt.body.length} empty=${interrupt.emptyBody} defer=${deferInterrupt} ` +
+      `in_flight=${deps.toolFlightTracker.inFlightCount()}\n`,
+  )
+  if (p.msgId != null) {
+    void deps.sendReaction(p.chat_id, p.msgId, '⚡' as ReactionTypeEmoji['emoji']).catch(() => {})
+  }
+  if (interrupt.emptyBody) {
+    // #3020: empty `!` is a pure halt (no replacement body) — same shared
+    // sequence as /stop: safe-boundary deferral, tmux C-c, obligation
+    // cancel, deterministic busy release.
+    await deps.executeHaltNow('bang-empty')
+    // #1075: thread-id-bearing — route through swallowingApiCall so
+    // a deleted topic doesn't crash the gateway; the reaction
+    // already acked the user so a missing follow-up is tolerable.
+    await deps.swallowingApiCall(
+      () =>
+        deps.botApi().sendMessage(
+          p.chat_id,
+          '⚡ Interrupted. Send your replacement instruction now.',
+          p.messageThreadId != null ? { message_thread_id: p.messageThreadId } : {},
+        ),
+      {
+        chat_id: p.chat_id,
+        verb: 'interrupt-empty-body',
+        ...(p.messageThreadId != null ? { threadId: p.messageThreadId } : {}),
+      },
+    )
+    return { handled: true }
+  }
+  if (agentName && !deferInterrupt) {
+    try {
+      // The gateway runs INSIDE the agent container in docker mode,
+      // so calling `interruptAgent` (which probes `docker inspect`
+      // for the PID) always returns "no running PID" — the host's
+      // docker socket isn't visible to us. Skip the PID round-trip
+      // entirely and use tmux send-keys directly: the tmux socket
+      // is local to our container. Discovered during UAT overnight
+      // 2026-05-13 — pre-fix every `!` interrupt produced an
+      // "Agent has no running PID" stderr line and the user got
+      // ghosted because the SIGINT never fired.
+      const { sendAgentInterrupt } = await import('../../src/agents/tmux.js')
+      const r = sendAgentInterrupt({ agentName })
+      if ('ok' in r) {
+        deps.log(
+          `telegram gateway: interrupt-marker SIGINT delivered via tmux send-keys agent=${agentName}\n`,
+        )
+      } else {
+        deps.log(
+          `telegram gateway: interrupt-marker SIGINT via tmux failed agent=${agentName}: ${r.error}\n`,
+        )
+      }
+    } catch (err) {
+      deps.log(`telegram gateway: interrupt-marker SIGINT failed: ${(err as Error).message}\n`)
+    }
+    // The SIGINT just killed the in-flight turn — cancel its obligation so the
+    // interrupted (user-redirected) question isn't re-presented/escalated later.
+    deps.cancelInterruptedObligation()
+  }
+  // Replace the inbound text with the body and continue normal
+  // processing. The agent receives a fresh turn with no `!` prefix.
+  return { handled: false, deferInterrupt, replacedText: interrupt.body }
 }
