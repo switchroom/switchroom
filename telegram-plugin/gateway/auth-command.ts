@@ -886,6 +886,36 @@ export function readdPrecheckError(
 }
 
 /**
+ * Broker-backed precheck for the `/auth add` / `/auth readd` chat verb.
+ * Resolves a broker client (via the caller-supplied getter), queries live
+ * account state, and returns the {@link readdPrecheckError} message (or null
+ * when the request is valid) so the gateway can fail fast before spinning up
+ * a tmux/OAuth flow.
+ *
+ * Best-effort by design: if the broker is unreachable (getter returns null or
+ * `listState` throws) this returns null and lets `addAccountViaBroker` enforce
+ * existence at add time. Kept here — beside `readdPrecheckError` — so the
+ * gateway carries only a thin call site (switchroom#2996 line-ratchet: no new
+ * inline bodies in gateway.ts).
+ */
+export async function runReaddPrecheck(
+  getClient: () => Promise<AuthBrokerClient | null>,
+  label: string,
+  replace: boolean,
+): Promise<string | null> {
+  try {
+    const client = await getClient()
+    if (!client) return null
+    const state = await client.listState()
+    const exists = state.accounts.some((a) => a.label === label)
+    return readdPrecheckError(label, replace, exists)
+  } catch {
+    // broker unreachable — skip precheck; addAccountViaBroker enforces.
+    return null
+  }
+}
+
+/**
  * Render the "granted scopes" tail for a successful `/auth add`/`readd`.
  * Reads the scopes STRUCTURALLY from `credentials.claudeAiOauth.scopes`
  * (never scraped from the pane). Returns the text plus a `warn` flag set

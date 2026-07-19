@@ -61,6 +61,7 @@ import {
   isAuthAdmin,
   validateAuthAddLabel,
   readdPrecheckError,
+  runReaddPrecheck,
   formatGrantedScopesReply,
   REQUIRED_USAGE_SCOPE,
 } from '../gateway/auth-command.js'
@@ -745,6 +746,53 @@ describe('readdPrecheckError — exists gate', () => {
 
   it('plain add of a NEW label passes (null)', () => {
     expect(readdPrecheckError('fresh@example.com', false, false)).toBeNull()
+  })
+})
+
+describe('runReaddPrecheck — broker-backed wrapper (extracted from gateway.ts)', () => {
+  const clientWith = (labels: string[]) => ({
+    listState: async () => ({ accounts: labels.map((label) => ({ label })) }) as any,
+  })
+
+  it('readd of an EXISTING label queries the broker and passes (null)', async () => {
+    const err = await runReaddPrecheck(
+      async () => clientWith(['pooled@example.com']) as any,
+      'pooled@example.com',
+      true,
+    )
+    expect(err).toBeNull()
+  })
+
+  it('readd of a NONEXISTENT label surfaces the precheck error', async () => {
+    const err = await runReaddPrecheck(
+      async () => clientWith([]) as any,
+      'ghost@example.com',
+      true,
+    )
+    expect(err).toMatch(/no account named/i)
+  })
+
+  it('plain add of an EXISTING label surfaces the precheck error', async () => {
+    const err = await runReaddPrecheck(
+      async () => clientWith(['pooled@example.com']) as any,
+      'pooled@example.com',
+      false,
+    )
+    expect(err).toMatch(/already exists/i)
+  })
+
+  it('best-effort: null client (broker unreachable) skips the precheck (null)', async () => {
+    const err = await runReaddPrecheck(async () => null, 'x@example.com', true)
+    expect(err).toBeNull()
+  })
+
+  it('best-effort: a throwing broker is swallowed and skips the precheck (null)', async () => {
+    const err = await runReaddPrecheck(
+      async () => ({ listState: async () => { throw new Error('broker down') } }) as any,
+      'x@example.com',
+      false,
+    )
+    expect(err).toBeNull()
   })
 })
 

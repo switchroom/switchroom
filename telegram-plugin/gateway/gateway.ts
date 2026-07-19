@@ -347,7 +347,7 @@ import {
   handleAuthCommand,
   isAuthAdmin,
   pendingAuthRmFlows,
-  readdPrecheckError,
+  runReaddPrecheck,
 } from './auth-command.js'
 import type { AuthBrokerClient } from './auth-command.js'
 import type { ListStateData } from './auth-line.js'
@@ -20902,23 +20902,18 @@ bot.command("auth", async ctx => {
       )
       return
     }
-    // Precheck against broker state: readd (replace) requires the label to
-    // exist; a fresh add requires it NOT to exist. Fail fast with a clear
-    // message before spinning up a tmux/OAuth flow. Best-effort — if the
-    // broker is unreachable we skip the precheck and let addAccount enforce.
-    try {
-      const brokerClient = await getAuthBrokerClient(currentAgent)
-      if (brokerClient) {
-        const state = await brokerClient.listState()
-        const exists = state.accounts.some((a) => a.label === parsed.label)
-        const precheckErr = readdPrecheckError(parsed.label, parsed.replace, exists)
-        if (precheckErr) {
-          await switchroomReply(ctx, precheckErr, { html: true })
-          return
-        }
-      }
-    } catch {
-      // broker unreachable — skip precheck; addAccountViaBroker enforces.
+    // Precheck against broker state (readd requires the label to exist; a
+    // fresh add requires it NOT to): fail fast before spinning up a tmux/OAuth
+    // flow. Extracted to auth-command.ts (runReaddPrecheck) — best-effort, so a
+    // broker-unreachable case returns null and addAccountViaBroker enforces.
+    const precheckErr = await runReaddPrecheck(
+      () => getAuthBrokerClient(currentAgent),
+      parsed.label,
+      parsed.replace,
+    )
+    if (precheckErr) {
+      await switchroomReply(ctx, precheckErr, { html: true })
+      return
     }
     try {
       const { loginUrl, scratchDir, tmuxSocket, tmuxSession } = await startAccountAuthSession(parsed.label)
