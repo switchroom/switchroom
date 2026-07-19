@@ -45,6 +45,15 @@ DIRECTIVES_TIMEOUT_SECONDS = 2
 #   * Cross-process writes (another session, operator CLI) have no invalidation
 #     channel and rely on TTL alone → at most TTL seconds stale.
 #
+# Invalidation blind spots (both fall back to TTL, ≤ TTL stale — acceptable):
+#   * Sub-agent / sidechain directive writes: the create_directive tool_use is
+#     in the SIDECHAIN transcript, not the parent's, so the parent's Stop hook
+#     (which reads the parent transcript) never sees it. PR 5 (SubagentStop)
+#     is where sidechain awareness lands.
+#   * Bash / operator-CLI directive writes (`switchroom` or a curl) produce no
+#     tool_use in any transcript, so there is nothing for the Stop hook to
+#     detect.
+#
 # Rollback: set the TTL to 0 (HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS=0) to
 # disable the cache entirely — every turn fetches live, as before A4.
 DIRECTIVES_CACHE_TTL_SECONDS = 120
@@ -120,9 +129,16 @@ def _read_cache(bank_id: str) -> Optional[dict]:
     additionally reject a non-dict envelope, a non-numeric timestamp, or a
     non-list directive payload) is treated as a MISS so the caller falls back to
     a live fetch rather than injecting garbage.
+
+    Also rejects an envelope whose stored ``bank_id`` does not match the
+    requested one: ``_safe_filename`` can collapse two distinct bank ids onto a
+    single cache file, and serving bank A's directives for bank B would leak
+    rules across banks. The embedded ``bank_id`` is the authoritative key.
     """
     raw = read_state(_cache_name(bank_id), None)
     if not isinstance(raw, dict):
+        return None
+    if raw.get("bank_id") != bank_id:
         return None
     ts = raw.get("ts")
     directives = raw.get("directives")
@@ -160,8 +176,14 @@ def fetch_active_directives_cached(
 
     if caching:
         cached = _read_cache(bank_id)
-        if cached is not None and (now - cached["ts"]) < ttl_seconds:
-            return cached["directives"]
+        if cached is not None:
+            age = now - cached["ts"]
+            # A negative age means the stored timestamp is in the FUTURE
+            # (wall-clock step-back / a doctored envelope) — treat it as
+            # expired rather than "fresh forever", so a clock correction can't
+            # pin a stale cache.
+            if 0 <= age < ttl_seconds:
+                return cached["directives"]
 
     ok, directives = _fetch_directives_with_status(client, bank_id, timeout)
 

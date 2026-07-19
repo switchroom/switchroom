@@ -58,8 +58,12 @@ class _FakeClient:
         # One entry per recall() call — lets tests assert the tag-filter
         # kwargs (upstream 962140eef) that main() passed per bank.
         self.recall_calls = []
+        # Count list_directives calls so a test can prove the A4 cache saved a
+        # round-trip across two recall.main() runs (and did NOT when TTL=0).
+        self.list_directives_calls = 0
 
     def list_directives(self, bank_id, active_only=True, timeout=2):
+        self.list_directives_calls += 1
         if self._list_exc is not None:
             raise self._list_exc
         return {"items": list(self._directives)}
@@ -706,6 +710,47 @@ class RecallTagFilterIntegrationTests(unittest.TestCase):
         self.assertEqual(extra["tags"], ["memory_type:rule"])
         # Global tags_match defaults are only sent when filters are active.
         self.assertEqual(extra["tags_match"], None)
+
+
+class DirectivesCacheIntegrationTests(unittest.TestCase):
+    """A4 finding 4 — recall.main() honours the directivesCacheTtlSeconds knob
+    end-to-end. Isolated CLAUDE_PLUGIN_DATA so the cache file lands in a temp
+    state dir and does not leak into (or out of) other tests."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._env = patch.dict(os.environ, {"CLAUDE_PLUGIN_DATA": self._tmp.name})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def test_ttl_cache_saves_second_list_directives_call(self):
+        # Two consecutive recalls (same bank, no directive write between) with a
+        # live TTL → exactly one list_directives round-trip; the second serves
+        # from cache.
+        client = _FakeClient(
+            directives=[_directive("trailer", "End every response with: [VERIFIED]", priority=10)],
+            memories=[],
+        )
+        ctx1, _ = _run_main_with(client, config_extra={"directivesCacheTtlSeconds": 60})
+        ctx2, _ = _run_main_with(client, config_extra={"directivesCacheTtlSeconds": 60})
+        self.assertEqual(client.list_directives_calls, 1)
+        # Both turns still emit the directives block (the cache serves the same
+        # content on the hit).
+        self.assertIn("<active_directives>", ctx1)
+        self.assertIn("<active_directives>", ctx2)
+
+    def test_ttl_zero_refetches_each_run(self):
+        # TTL=0 disables the cache → every recall fetches live.
+        client = _FakeClient(
+            directives=[_directive("trailer", "End every response with: [VERIFIED]", priority=10)],
+            memories=[],
+        )
+        _run_main_with(client, config_extra={"directivesCacheTtlSeconds": 0})
+        _run_main_with(client, config_extra={"directivesCacheTtlSeconds": 0})
+        self.assertEqual(client.list_directives_calls, 2)
 
 
 if __name__ == "__main__":

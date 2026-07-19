@@ -444,6 +444,29 @@ class DirectivesCacheTests(unittest.TestCase):
         fetch_active_directives_cached(client, "bank1", now=1000.1)
         self.assertEqual(client.calls, 1)
 
+    def test_bank_id_mismatch_falls_back_to_live(self):
+        # _safe_filename can collapse two bank ids onto one cache file; an
+        # envelope whose embedded bank_id != the requested one must be rejected
+        # (a live fetch) rather than serving another bank's directives.
+        write_state(
+            _cache_name("bank1"),
+            {"ts": 1000.0, "bank_id": "a-DIFFERENT-bank", "directives": [{"name": "leaked"}]},
+        )
+        client = _CountingClient(response=self._resp("mine"))
+        result = fetch_active_directives_cached(client, "bank1", now=1000.0)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual([d["name"] for d in result], ["mine"])
+
+    def test_future_timestamp_treated_as_expired(self):
+        # A stored ts in the future (wall-clock step-back) → negative age → NOT
+        # served as fresh; the cache re-fetches instead of pinning stale.
+        client = _CountingClient(response=self._resp("alpha"))
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=120, now=5000.0)
+        self.assertEqual(client.calls, 1)
+        # Clock steps back well before the cached ts → age is negative.
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=120, now=1000.0)
+        self.assertEqual(client.calls, 2)
+
     def test_default_ttl_constant(self):
         self.assertEqual(DIRECTIVES_CACHE_TTL_SECONDS, 120)
 

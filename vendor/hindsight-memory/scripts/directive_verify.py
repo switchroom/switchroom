@@ -59,6 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.config import debug_log, load_config  # noqa: E402
 from lib.directives import (  # noqa: E402
+    DIRECTIVES_CACHE_TTL_SECONDS,
     invalidate_directives_cache,
     parse_active_directives_block,
     rule_already_captured,
@@ -359,15 +360,18 @@ def turn_contains_directive_write(messages: list, start_index: int) -> bool:
     return False
 
 
-def invalidate_cache_on_directive_write(hook_input: dict, config: dict) -> None:
+def invalidate_cache_on_directive_write(messages: list, config: dict) -> None:
     """Delete the directives cache if this turn wrote a directive.
 
-    Runs independently of the capture-verify decision (and of the
-    directiveCaptureNudge knob) — the cache is a separate feature. Best-effort;
-    never raises, so a bug here can never wedge Stop.
+    Takes the ALREADY-READ transcript ``messages`` (main() reads the transcript
+    exactly once and shares it with the capture verifier — a Stop hook must not
+    parse a multi-MB session twice). Only the tail after the last human turn is
+    scanned, since only writes issued THIS turn matter. Runs independently of
+    the capture-verify decision (and of the directiveCaptureNudge knob) — the
+    cache is a separate feature. Best-effort; never raises, so a bug here can
+    never wedge Stop.
     """
     try:
-        messages = read_transcript(hook_input.get("transcript_path", ""))
         if not messages:
             return
         idx, _text = find_last_human_turn(messages)
@@ -410,11 +414,15 @@ def read_transcript(transcript_path: str) -> list:
     return messages
 
 
-def evaluate(hook_input: dict, config: dict) -> str | None:
+def evaluate(hook_input: dict, config: dict, messages: list | None = None) -> str | None:
     """Core decision. Returns a block reason string, or None to allow stop.
 
     None → the turn is allowed to end (no-op). A non-empty string → block the
     stop once and feed the string back to the model.
+
+    ``messages`` is the pre-read transcript when the caller already parsed it
+    (main() reads once and shares it); when None, the transcript is read here so
+    direct callers/tests keep the old single-arg contract.
     """
     # Same knob as Stage B — disabling the nudge disables this verification.
     if not config.get("directiveCaptureNudge", True):
@@ -433,7 +441,8 @@ def evaluate(hook_input: dict, config: dict) -> str | None:
         debug_log(config, "Directive-capture verify: stop_hook_active, not re-blocking")
         return None
 
-    messages = read_transcript(hook_input.get("transcript_path", ""))
+    if messages is None:
+        messages = read_transcript(hook_input.get("transcript_path", ""))
     if not messages:
         return None
 
@@ -485,13 +494,34 @@ def main():
         config = load_config()
     except Exception:
         return
+
+    # Read the transcript AT MOST ONCE and share it with both consumers below
+    # (a Stop hook must not parse a multi-MB session twice, nor at all when
+    # nothing here needs it). Two features want the transcript:
+    #   * A4 directives-cache invalidation — only when the cache is enabled
+    #     (TTL > 0); with the cache off there is nothing to invalidate.
+    #   * capture-verify (evaluate) — only when the nudge+verify knobs are on
+    #     and this is not an already-blocked re-fire.
+    ttl = config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS)
+    cache_on = isinstance(ttl, (int, float)) and ttl > 0
+    verify_maybe = (
+        config.get("directiveCaptureNudge", True)
+        and config.get("directiveCaptureVerify", True)
+        and not hook_input.get("stop_hook_active")
+    )
+
+    messages: list = []
+    if cache_on or verify_maybe:
+        messages = read_transcript(hook_input.get("transcript_path", ""))
+
     # A4: invalidate the directives cache when this turn wrote a directive, so
     # the change is visible on the very next recall. Independent of the
     # capture-verify decision below and self-guarded — runs on every Stop.
-    invalidate_cache_on_directive_write(hook_input, config)
+    if cache_on:
+        invalidate_cache_on_directive_write(messages, config)
 
     try:
-        reason = evaluate(hook_input, config)
+        reason = evaluate(hook_input, config, messages=messages)
     except Exception as e:  # never wedge a turn on a verify bug
         debug_log(config, f"Directive-capture verify error (allowing stop): {e}")
         return
