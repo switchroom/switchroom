@@ -413,6 +413,16 @@ interface Listener {
   server: net.Server;
   identity: Identity;
   socketPath: string;
+  /**
+   * Live client sockets on this listener. Tracked so a hot-reload (or stop)
+   * can forcibly tear down connections whose bound identity was REMOVED or
+   * RE-CLASSIFIED — otherwise a demoted/removed agent could keep riding its
+   * old connection's bound identity (privilege retention). Retained agents
+   * whose identity is unchanged are left alone: client.ts has no auto-
+   * reconnect (it lazily reconnects on the next send), so a spurious destroy
+   * would cost a still-valid agent a failed in-flight request.
+   */
+  sockets: Set<net.Socket>;
 }
 
 export interface AuthBrokerOptions {
@@ -816,6 +826,9 @@ export class AuthBroker {
     }
     for (const [sock, lis] of this.listeners) {
       try { lis.server.close(); } catch { /* ignore */ }
+      for (const s of lis.sockets) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
       try { if (existsSync(sock)) unlinkSync(sock); } catch { /* ignore */ }
     }
     this.listeners.clear();
@@ -847,12 +860,31 @@ export class AuthBroker {
       wanted.add(this.operatorSocketPath());
     }
 
-    // Close listeners we no longer want.
+    // Close listeners we no longer want, and forcibly tear down live sockets
+    // whose identity was REMOVED or RE-CLASSIFIED across the reload. Compare
+    // classify(prev) vs classify(next): a removed agent (null after) or a
+    // demoted one (admin flip) must not keep riding its open connection's
+    // bound identity. Retained listeners whose identity is unchanged keep
+    // their sockets — client.ts lazily reconnects, so a spurious destroy
+    // would cost a still-valid agent a failed in-flight request.
+    const prevShape = configToShape(prev);
+    const nextShape = configToShape(config);
     for (const [sock, lis] of [...this.listeners]) {
+      const before = classify(lis.socketPath, prevShape, this.socketRoot);
+      const after = classify(lis.socketPath, nextShape, this.socketRoot);
+      const identityChanged =
+        JSON.stringify(before ?? null) !== JSON.stringify(after ?? null);
       if (!wanted.has(sock)) {
         try { lis.server.close(); } catch { /* ignore */ }
         try { if (existsSync(sock)) unlinkSync(sock); } catch { /* ignore */ }
+        for (const s of lis.sockets) {
+          try { s.destroy(); } catch { /* ignore */ }
+        }
         this.listeners.delete(sock);
+      } else if (identityChanged) {
+        for (const s of lis.sockets) {
+          try { s.destroy(); } catch { /* ignore */ }
+        }
       }
     }
 
@@ -872,8 +904,6 @@ export class AuthBroker {
     if (this.operatorUid !== undefined && !this.listeners.has(this.operatorSocketPath())) {
       await this.bindOperatorListener(this.operatorUid);
     }
-
-    void prev; // currently unused — placeholder for future diff metrics.
   }
 
   /* ─── Path helpers ──────────────────────────────────────────── */
@@ -961,7 +991,12 @@ export class AuthBroker {
         try { chmodSync(sockPath, sockMode); } catch { /* tolerate */ }
         try { chownSync(sockPath, targetUid, targetUid); } catch { /* dev */ }
         try { chownSync(dir, targetUid, targetUid); } catch { /* dev */ }
-        this.listeners.set(sockPath, { server, identity, socketPath: sockPath });
+        this.listeners.set(sockPath, {
+          server,
+          identity,
+          socketPath: sockPath,
+          sockets: new Set(),
+        });
         resolveP();
       });
     });
@@ -974,6 +1009,16 @@ export class AuthBroker {
     sockPath: string,
     boundIdentity: Identity,
   ): void {
+    // Track this socket on its listener so a hot-reload/stop can tear down
+    // connections whose identity was removed or re-classified.
+    const listener = this.listeners.get(sockPath);
+    if (listener) {
+      listener.sockets.add(socket);
+      socket.on("close", () => {
+        listener.sockets.delete(socket);
+      });
+    }
+
     let buf = "";
     socket.on("data", (chunk: Buffer) => {
       buf += chunk.toString("utf-8");
@@ -1018,8 +1063,30 @@ export class AuthBroker {
 
     // Re-classify by socket path against the CURRENT config so a hot-reload
     // takes effect immediately for new requests on existing connections.
-    const identity =
-      classify(sockPath, configToShape(this.config)) ?? boundIdentity;
+    // A null classification means the bound identity is no longer configured
+    // (agent/consumer removed via reload). We MUST NOT fall back to the
+    // bind-time `boundIdentity` here — it may carry admin:true, so serving it
+    // would let a removed/demoted agent retain privilege on a still-open
+    // connection. Reject the request and close the socket instead.
+    const identity = classify(
+      sockPath,
+      configToShape(this.config),
+      this.socketRoot,
+    );
+    if (!identity) {
+      this.audit({
+        op: "stale-identity-rejected",
+        identity: boundIdentity,
+        ok: false,
+        error: "FORBIDDEN",
+      });
+      // end() (not destroy()) so the FORBIDDEN frame flushes before the FIN —
+      // an immediate destroy() can truncate the reply.
+      socket.end(
+        encodeError(reqId, "FORBIDDEN", "identity no longer configured"),
+      );
+      return;
+    }
 
     try {
       switch (req.op) {
