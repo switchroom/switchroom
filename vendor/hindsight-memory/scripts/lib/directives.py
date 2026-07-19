@@ -18,7 +18,10 @@ recall path; a directive-fetch failure must not kill the recall block.
 
 import re
 import sys
+import time
 from typing import Optional
+
+from .state import list_state_names, read_state, remove_state, write_state
 
 # Sanity cap on how many directives we ever inject into the prompt. Banks
 # with more active directives than this are pathological; truncate with a
@@ -28,6 +31,78 @@ MAX_DIRECTIVES = 15
 # Hard timeout for the list_directives call. The recall hook is on the
 # UserPromptSubmit critical path — we cannot block it for long.
 DIRECTIVES_TIMEOUT_SECONDS = 2
+
+# --- Directives-list cache (switchroom hindsight-leverage A4) -----------------
+#
+# `list_directives` runs on the recall (UserPromptSubmit) critical path every
+# non-skipped turn — a fresh 2s-timeout HTTP round-trip whose result changes
+# only when a directive is created/updated/deleted (rare). We cache the fetched
+# list in the plugin state dir with a short TTL so the common no-write turn
+# skips the round-trip, while bounding staleness:
+#   * In-session writes: directive_verify.py (Stop hook) deletes the cache when
+#     the just-ended turn contains a create/update/delete_directive tool_use, so
+#     the very next recall re-fetches — the new state is visible in turn N+1.
+#   * Cross-process writes (another session, operator CLI) have no invalidation
+#     channel and rely on TTL alone → at most TTL seconds stale.
+#
+# Invalidation blind spots (both fall back to TTL, ≤ TTL stale — acceptable):
+#   * Sub-agent / sidechain directive writes: the create_directive tool_use is
+#     in the SIDECHAIN transcript, not the parent's, so the parent's Stop hook
+#     (which reads the parent transcript) never sees it. PR 5 (SubagentStop)
+#     is where sidechain awareness lands.
+#   * Bash / operator-CLI directive writes (`switchroom` or a curl) produce no
+#     tool_use in any transcript, so there is nothing for the Stop hook to
+#     detect.
+#
+# Rollback: set the TTL to 0 (HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS=0) to
+# disable the cache entirely — every turn fetches live, as before A4.
+DIRECTIVES_CACHE_TTL_SECONDS = 120
+
+# All directive cache files share this basename prefix so they can be
+# enumerated for bulk (bank-agnostic) invalidation.
+_CACHE_PREFIX = "directives_cache."
+
+
+def _cache_name(bank_id: str) -> str:
+    """State-file name for a bank's cached directive list."""
+    return f"{_CACHE_PREFIX}{bank_id}.json"
+
+
+def _fetch_directives_with_status(client, bank_id: str, timeout: int) -> tuple:
+    """Fetch + normalize active directives, reporting fetch success.
+
+    Returns ``(ok, directives)``. ``ok`` is False only on a genuine fetch
+    FAILURE (HTTP error, non-dict response) — a bank that simply has no
+    directives returns ``(True, [])``. Callers use ``ok`` to avoid caching a
+    transient failure's empty result (which would mask real directives for a
+    whole TTL window). Never raises; logs a single warn line on failure.
+    """
+    try:
+        response = client.list_directives(bank_id=bank_id, active_only=True, timeout=timeout)
+    except Exception as e:
+        print(f"[Hindsight] list_directives failed for bank '{bank_id}': {e}", file=sys.stderr)
+        return False, []
+
+    if not isinstance(response, dict):
+        print(
+            f"[Hindsight] list_directives returned non-dict for bank '{bank_id}': "
+            f"{type(response).__name__}",
+            file=sys.stderr,
+        )
+        return False, []
+
+    items = response.get("items")
+    if not isinstance(items, list):
+        # Empty / malformed response — quiet success, no warn (banks with
+        # no directives are normal). Cacheable.
+        return True, []
+
+    # Filter to dicts only, then sort by priority descending. Treat missing
+    # priority as 0 so malformed entries sink to the bottom rather than
+    # crashing.
+    valid = [d for d in items if isinstance(d, dict)]
+    valid.sort(key=lambda d: d.get("priority", 0), reverse=True)
+    return True, valid
 
 
 def fetch_active_directives(client, bank_id: str, timeout: int = DIRECTIVES_TIMEOUT_SECONDS) -> list:
@@ -43,32 +118,94 @@ def fetch_active_directives(client, bank_id: str, timeout: int = DIRECTIVES_TIME
         tags, ...), sorted by priority descending. On any failure returns
         an empty list and logs a single warn line to stderr — never raises.
     """
-    try:
-        response = client.list_directives(bank_id=bank_id, active_only=True, timeout=timeout)
-    except Exception as e:
-        print(f"[Hindsight] list_directives failed for bank '{bank_id}': {e}", file=sys.stderr)
-        return []
+    _ok, directives = _fetch_directives_with_status(client, bank_id, timeout)
+    return directives
 
-    if not isinstance(response, dict):
-        print(
-            f"[Hindsight] list_directives returned non-dict for bank '{bank_id}': "
-            f"{type(response).__name__}",
-            file=sys.stderr,
-        )
-        return []
 
-    items = response.get("items")
-    if not isinstance(items, list):
-        # Empty / malformed response — quiet success, no warn (banks with
-        # no directives are normal).
-        return []
+def _read_cache(bank_id: str) -> Optional[dict]:
+    """Read + validate a bank's cache envelope. Returns None on miss/corruption.
 
-    # Filter to dicts only, then sort by priority descending. Treat missing
-    # priority as 0 so malformed entries sink to the bottom rather than
-    # crashing.
-    valid = [d for d in items if isinstance(d, dict)]
-    valid.sort(key=lambda d: d.get("priority", 0), reverse=True)
-    return valid
+    A corrupted or wrong-shaped cache (bad JSON handled by read_state; here we
+    additionally reject a non-dict envelope, a non-numeric timestamp, or a
+    non-list directive payload) is treated as a MISS so the caller falls back to
+    a live fetch rather than injecting garbage.
+
+    Also rejects an envelope whose stored ``bank_id`` does not match the
+    requested one: ``_safe_filename`` can collapse two distinct bank ids onto a
+    single cache file, and serving bank A's directives for bank B would leak
+    rules across banks. The embedded ``bank_id`` is the authoritative key.
+    """
+    raw = read_state(_cache_name(bank_id), None)
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("bank_id") != bank_id:
+        return None
+    ts = raw.get("ts")
+    directives = raw.get("directives")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    if not isinstance(directives, list):
+        return None
+    return raw
+
+
+def fetch_active_directives_cached(
+    client,
+    bank_id: str,
+    ttl_seconds: int = DIRECTIVES_CACHE_TTL_SECONDS,
+    timeout: int = DIRECTIVES_TIMEOUT_SECONDS,
+    now: Optional[float] = None,
+) -> list:
+    """Cached wrapper around :func:`fetch_active_directives`.
+
+    On a fresh cache hit (age < ``ttl_seconds``) returns the cached list WITHOUT
+    an HTTP call. On a miss / expiry / corrupted cache, fetches live and, when
+    the fetch SUCCEEDED, writes the cache. A failed fetch is never cached, so a
+    transient error can't mask real directives for a TTL window.
+
+    ``ttl_seconds <= 0`` disables the cache (always live-fetch, never write) —
+    the A4 rollback lever.
+
+    Args:
+        now: Injectable current epoch seconds, for deterministic tests.
+    """
+    if now is None:
+        now = time.time()
+
+    caching = isinstance(ttl_seconds, (int, float)) and ttl_seconds > 0
+
+    if caching:
+        cached = _read_cache(bank_id)
+        if cached is not None:
+            age = now - cached["ts"]
+            # A negative age means the stored timestamp is in the FUTURE
+            # (wall-clock step-back / a doctored envelope) — treat it as
+            # expired rather than "fresh forever", so a clock correction can't
+            # pin a stale cache.
+            if 0 <= age < ttl_seconds:
+                return cached["directives"]
+
+    ok, directives = _fetch_directives_with_status(client, bank_id, timeout)
+
+    if caching and ok:
+        write_state(_cache_name(bank_id), {"ts": now, "bank_id": bank_id, "directives": directives})
+
+    return directives
+
+
+def invalidate_directives_cache(bank_id: Optional[str] = None) -> None:
+    """Delete the directives cache so the next recall re-fetches live.
+
+    With ``bank_id`` set, removes just that bank's cache file. With no argument
+    (the Stop-hook invalidation path, which does not resolve the bank), removes
+    EVERY directive cache file — directive writes are rare, so a bank-agnostic
+    sweep is cheap and robust. Best-effort; never raises.
+    """
+    if bank_id is not None:
+        remove_state(_cache_name(bank_id))
+        return
+    for name in list_state_names(_CACHE_PREFIX):
+        remove_state(name)
 
 
 def format_active_directives_block(directives: list, max_directives: int = MAX_DIRECTIVES) -> Optional[str]:

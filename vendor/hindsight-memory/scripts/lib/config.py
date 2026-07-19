@@ -71,8 +71,28 @@ DEFAULTS = {
     # per-agent via memory.directive_capture_verify=false →
     # HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY.
     "directiveCaptureVerify": True,
-    "recallContextTurns": 1,
+    # Switchroom hindsight-leverage A4 — TTL (seconds) for the directives-list
+    # cache on the recall critical path (see lib/directives.py). The list is
+    # re-fetched at most once per TTL window for no-write turns; in-session
+    # directive writes invalidate the cache immediately via directive_verify.py.
+    # 0 disables the cache (live fetch every turn — the A4 rollback lever).
+    "directivesCacheTtlSeconds": 120,
+    # Switchroom hindsight-leverage A2 (PR2): default 2 so a bare follow-up
+    # user message ("and the port?", "what about staging?") embeds together
+    # with its antecedent turn, instead of recalling on the pronoun alone.
+    # Bounded by recallMaxQueryChars (truncate_recall_query preserves the
+    # latest turn and drops oldest context first) so the composition can never
+    # blow the recall query budget; the transcript read is byte-tail-bounded
+    # by recallTranscriptTailBytes so the added per-turn read stays O(1).
+    "recallContextTurns": 2,
     "recallMaxQueryChars": 800,
+    # Switchroom hindsight-leverage A2 (PR2) — latency bound for the multi-turn
+    # composition. With recallContextTurns>1 now the default, EVERY recall reads
+    # the transcript to slice the last N human turns. A long session's .jsonl can
+    # grow to many MB, so read only the last N bytes (complete trailing lines);
+    # the last 2-3 human turns always live at the tail. 0 disables the bound
+    # (read the whole file — the pre-A2 behaviour / rollback lever).
+    "recallTranscriptTailBytes": 262144,
     "recallRoles": ["user", "assistant"],
     # Upstream 962140eef — optional recall tag filters passed through to the
     # recall API, plus per-additional-bank overrides keyed by bank ID.
@@ -80,6 +100,19 @@ DEFAULTS = {
     "recallTagsMatch": "any",
     "recallTagGroups": None,
     "recallAdditionalBankFilters": {},
+    # Switchroom (hindsight-leverage PR5) — per-tag recall score weights. A map
+    # of ``{tag: multiplier}`` applied to each result's ``scores.final`` just
+    # before the final relevance sort/cap in recall.py. A weight < 1.0 DEMOTES
+    # (down-ranks) memories carrying that tag without DROPPING them — distinct
+    # from the hard demote-tag drop filter (`_is_demoted_memory`), which removes
+    # a memory from recall entirely. This is the "reduced weight" the drop
+    # filter cannot express: a demoted memory still surfaces when it is the only
+    # relevant hit, just below equal-scoring untagged memories. Default {} =
+    # no-op (identity weighting). Switchroom's scaffold seeds
+    # ``{"sidechain": 0.8}`` so delegated sub-agent process-memories rank just
+    # under first-party session memories. Env: HINDSIGHT_RECALL_TAG_WEIGHTS
+    # (JSON object).
+    "recallTagWeights": {},
     "recallPromptPreamble": (
         "Relevant memories from past conversations (prioritize recent when "
         "conflicting). Only use memories that are directly useful to continue "
@@ -171,13 +204,20 @@ ENV_OVERRIDES = {
     # agents.<name>.memory.directive_capture_verify only when the operator
     # overrode it; the switchroom default is on.
     "HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY": ("directiveCaptureVerify", bool),
+    # Switchroom hindsight-leverage A4 — directives-list cache TTL (seconds).
+    # 0 disables the cache (rollback lever).
+    "HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS": ("directivesCacheTtlSeconds", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
+    # Switchroom hindsight-leverage A2 — byte-tail bound for the multi-turn
+    # transcript read (0 = read whole file / rollback lever).
+    "HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES": ("recallTranscriptTailBytes", int),
     # Upstream 962140eef — recall tag filters. The tags env var accepts JSON
     # or a comma-separated list; the others must be JSON.
     "HINDSIGHT_RECALL_TAGS": ("recallTags", list),
     "HINDSIGHT_RECALL_TAGS_MATCH": ("recallTagsMatch", str),
     "HINDSIGHT_RECALL_TAG_GROUPS": ("recallTagGroups", dict),
+    "HINDSIGHT_RECALL_TAG_WEIGHTS": ("recallTagWeights", dict),
     "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS": ("recallAdditionalBankFilters", dict),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),

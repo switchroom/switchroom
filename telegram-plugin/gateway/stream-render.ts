@@ -307,6 +307,9 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race
           // latch, reset at turn start alongside the other answer flags.
           answerDelivered: false,
+          // #3429 — flushed-answer text for the content-vs-flush latch
+          // discrimination; stamped at flush arm, reset at turn start.
+          flushedAnswerText: null,
           // 2026-07 double-reply-on-DM fix (F2) — stamped at turn end.
           endedAt: null,
           firstPingAt: null,
@@ -1636,6 +1639,12 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         //       arbitrate the late reply (that is (a)); it is redundant-but-
         //       cheap with the `currentTurn == null` bail below.
         turn.answerDelivered = 'flush'
+        // #3429 — stamp WHAT the flush is delivering alongside the arm, so the
+        // late-reply suppression can discriminate by content: a late reply
+        // carrying this same answer is the flush race (suppress/supersede); a
+        // late reply carrying DIFFERENT content is a genuinely new async
+        // handback attributed to this ended turn and must send fresh.
+        turn.flushedAnswerText = capturedText
         const backstopLatchClaimed = backstopDeliveryLedger.claim(turn.turnId)
 
         // #654 deterministic double-message fix. Hand off the pinned
@@ -1833,6 +1842,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               if (backstopCtrl) backstopCtrl.finalize('error')
               backstopDeliveryLedger.release(turn.turnId)
               turn.answerDelivered = false
+              turn.flushedAnswerText = null // #3429 — cleared with the latch
             } else if (backstopCtrl) {
               backstopCtrl.finalize('done')
             }
@@ -1857,6 +1867,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
             process.stderr.write(`telegram gateway: turn-flush post-delivery bookkeeping failed: ${(err as Error).message}\n`)
             if (!delivered) {
               turn.answerDelivered = false
+              turn.flushedAnswerText = null // #3429 — cleared with the latch
               backstopDeliveryLedger.release(turn.turnId)
               if (backstopCtrl) backstopCtrl.finalize('error')
             }

@@ -21,8 +21,10 @@ import { describe, it, expect } from 'vitest'
 import {
   decideSupersede,
   decideSupersedeCorrection,
+  flushedAnswerMatchesReply,
   FlushedTurnSupersedeRegistry,
   DEFAULT_SUPERSEDE_TTL_MS,
+  SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS,
   type FlushedTurnRecord,
 } from '../flushed-turn-supersede.js'
 
@@ -262,5 +264,120 @@ describe('FlushedTurnSupersedeRegistry — record / peek / take lifecycle', () =
     // Only the fresh record remains; the orphan was swept, not left to leak.
     expect(reg.size(5000)).toBe(1)
     expect(reg.peek('chat1', undefined, { liveTurnId: 'turn-A', now: 5000 }).reason).toBe('no-record')
+  })
+})
+
+/**
+ * #3429 — async handback edit-in-place supersede of a flush-delivered message
+ * can fail to surface client-side.
+ *
+ * The flush ends its turn synchronously BEFORE recording, so EVERY superseding
+ * reply is a late reply — and an async sub-agent handback landing within the
+ * 60 s TTL with no live gateway turn resolves the flush-delivered ENDED turn
+ * as its owner via the latest-ended tier, the SAME identity as the turn's own
+ * canonical late replay. Identity-only supersede then consumed the record and
+ * EDITED the flushed message in place with the handback's unrelated content
+ * (msgs 10482/10486, 2026-07-20) — Telegram edits never push-notify, so the
+ * handback silently failed to surface AND the flushed answer was destroyed.
+ *
+ * The content gate: `replyText` is compared against the record's flushed text
+ * (`flushedAnswerMatchesReply` — whitespace-normalized equality, or containment
+ * with a minimum-length guard on the contained side). Same answer → supersede
+ * (the wanted correction); different content → 'new-content', send fresh,
+ * record NOT consumed.
+ */
+describe('#3429 — flushedAnswerMatchesReply (content discriminator)', () => {
+  const ANSWER = 'The deploy is green: all 12 services rolled out and health checks pass.'
+  const FLUSH_BLOB = `Let me check the rollout status.\n\n${ANSWER}`
+
+  it('matches whitespace-normalized equality', () => {
+    expect(flushedAnswerMatchesReply(ANSWER, ANSWER)).toBe(true)
+    expect(flushedAnswerMatchesReply(`${ANSWER}\n`, ANSWER.replace(': ', ':  '))).toBe(true)
+  })
+
+  it('matches the classic containment class: flush = narration+answer ⊇ clean reply', () => {
+    expect(flushedAnswerMatchesReply(FLUSH_BLOB, ANSWER)).toBe(true)
+  })
+
+  it('matches reverse containment: reply ⊇ partially-delivered flush text', () => {
+    expect(flushedAnswerMatchesReply(ANSWER, FLUSH_BLOB)).toBe(true)
+  })
+
+  it('does NOT match genuinely different content (the handback)', () => {
+    const handback =
+      'Worker finished: PR #3430 is up with the fix for the vault broker timeout, ' +
+      'tests are green, ready for your review.'
+    expect(flushedAnswerMatchesReply(FLUSH_BLOB, handback)).toBe(false)
+  })
+
+  it('short containment below the minimum-length guard does NOT match ' +
+    '(a coincidental substring must never claim a handback)', () => {
+    const shortReply = 'rolled out'
+    expect(shortReply.length).toBeLessThan(SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS)
+    expect(FLUSH_BLOB.includes(shortReply)).toBe(true)
+    expect(flushedAnswerMatchesReply(FLUSH_BLOB, shortReply)).toBe(false)
+  })
+
+  it('short EQUAL texts still match (equality has no length floor)', () => {
+    expect(flushedAnswerMatchesReply('yes, done', 'yes, done')).toBe(true)
+  })
+})
+
+describe('#3429 — decideSupersede new-content gate', () => {
+  const FLUSHED = 'Narration first.\n\nHere is the finished summary of the incident you asked about.'
+  const HANDBACK =
+    'Sub-agent handback: the researcher finished and found three root causes, ' +
+    'written up in the report at /tmp/report.md — want the highlights?'
+
+  it('same-turn same-answer late reply still supersedes (the wanted correction)', () => {
+    const d = decideSupersede(rec({ text: FLUSHED }), {
+      liveTurnId: 'turn-A',
+      replyText: 'Here is the finished summary of the incident you asked about.',
+      now: 1_000_010,
+    })
+    expect(d.supersede).toBe(true)
+    expect(d.reason).toBe('supersede')
+    expect(d.recordText).toBe(FLUSHED)
+  })
+
+  it('CORE #3429: same turn identity + DIFFERENT content → new-content, NO supersede', () => {
+    const d = decideSupersede(rec({ text: FLUSHED }), {
+      liveTurnId: 'turn-A',
+      replyText: HANDBACK,
+      now: 1_000_010,
+    })
+    expect(d.supersede).toBe(false)
+    expect(d.reason).toBe('new-content')
+    expect(d.deleteMessageIds).toEqual([])
+    expect(d.recordText).toBe(FLUSHED)
+  })
+
+  it('legacy identity-only callers (no replyText) keep the pre-#3429 behaviour', () => {
+    const d = decideSupersede(rec({ text: FLUSHED }), { liveTurnId: 'turn-A', now: 1_000_010 })
+    expect(d.supersede).toBe(true)
+  })
+
+  it('take() does NOT consume the record on new-content — the genuine replay ' +
+    'can still correct the flushed message afterwards', () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    const now = 1_000_000
+    reg.record('chat9', undefined, { turnId: 'turn-F', messageIds: [7001], text: FLUSHED }, now)
+
+    // The handback lands first: new-content, nothing consumed, nothing deleted.
+    const d1 = reg.take('chat9', undefined, { liveTurnId: 'turn-F', replyText: HANDBACK, now: now + 10_000 })
+    expect(d1.supersede).toBe(false)
+    expect(d1.reason).toBe('new-content')
+
+    // The turn's own canonical replay lands later: record still there, supersede
+    // fires and consumes it.
+    const d2 = reg.take('chat9', undefined, {
+      liveTurnId: 'turn-F',
+      replyText: 'Here is the finished summary of the incident you asked about.',
+      now: now + 20_000,
+    })
+    expect(d2.supersede).toBe(true)
+    expect(d2.deleteMessageIds).toEqual([7001])
+    // Now consumed.
+    expect(reg.peek('chat9', undefined, { liveTurnId: 'turn-F', now: now + 21_000 }).reason).toBe('no-record')
   })
 })

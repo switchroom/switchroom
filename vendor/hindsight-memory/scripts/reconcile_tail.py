@@ -42,7 +42,11 @@ from lib import watermark
 from lib.bank import derive_bank_id
 from lib.client import HindsightClient
 from lib.config import debug_log, load_config
-from lib.content import _is_tool_result_only_user_message, slice_last_turns_by_user_boundary
+from lib.content import (
+    _is_tool_result_only_user_message,
+    slice_last_turns_by_user_boundary,
+    transcript_first_line_is_sidechain,
+)
 from lib.daemon import get_api_url
 from lib.pacing import inflight_lock
 from lib.pending import enqueue as pending_enqueue
@@ -135,6 +139,7 @@ def reconcile(config: dict | None = None, hook_input: dict | None = None) -> dic
         "posts_ok": 0,
         "enqueued": 0,        # slices deferred to pending-retains (bounds/failure)
         "skipped_clean": 0,
+        "skipped_sidechain": 0,  # sub-agent transcripts (owned by subagent_retain.py)
         "disabled": False,
     }
     if not config.get("autoRetain"):
@@ -184,6 +189,22 @@ def reconcile(config: dict | None = None, hook_input: dict | None = None) -> dic
     for path in transcripts:
         summary["scanned"] += 1
         session_id = _session_id_from_path(path)
+
+        # Sub-agent (sidechain) transcripts are NOT sessions. The recursive glob
+        # above matches <session>/subagents/agent-<id>.jsonl, each of which has a
+        # human turn, no watermark, and (fresh) an in-lookback mtime — so without
+        # this guard reconcile would treat every worker fork as a pseudo-session
+        # and retain it here at boot: an UNTAGGED document
+        # (agent-<id>-r{u}-{u}, disjoint namespace from subagent_retain.py's
+        # {parent}-sub-{agent} ids ⇒ permanent duplicate), at FULL recall weight
+        # (defeating the recallTagWeights sidechain:0.8 demotion), bypassing the
+        # volume gate (trivial 10s forks get LLM-extracted at boot). Sidechains
+        # are owned SOLELY by subagent_retain.py (SubagentStop) — skip them here.
+        if transcript_first_line_is_sidechain(path):
+            summary["skipped_sidechain"] += 1
+            debug_log(config, f"reconcile_tail: skipping sidechain transcript {path}")
+            continue
+
         try:
             mtime = os.path.getmtime(path)
         except OSError:

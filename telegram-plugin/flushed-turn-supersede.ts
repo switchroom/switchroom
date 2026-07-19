@@ -31,7 +31,16 @@
  * `record()` (a much smaller window), `take` finds no record and the duplicate
  * can still slip through. We deliberately trade that residual window for the
  * safety guarantee that we NEVER delete a message we cannot positively attribute
- * to the reply's own turn (identity-only supersede — see `decideSupersede`).
+ * to the reply's own turn (identity-scoped supersede — see `decideSupersede`).
+ *
+ * #3429 content gate: identity is NECESSARY but not sufficient. Because the
+ * flush ends its turn before recording, an async sub-agent handback landing
+ * within the TTL resolves the flush-delivered ENDED turn as its owner too —
+ * same identity as the turn's own late replay. When the caller supplies the
+ * landing reply's text, `decideSupersede` additionally requires it to BE the
+ * flushed answer (`flushedAnswerMatchesReply`); otherwise the decision is
+ * 'new-content' and the gateway sends fresh (a notifying new message) with the
+ * record left intact.
  *
  * Pure module: no I/O, no globals, no clock reads beyond the caller-supplied
  * `now`. Fully unit-testable; the gateway wires the actual delete/send.
@@ -51,9 +60,11 @@ export interface FlushedTurnRecord {
   /** The Telegram message id(s) the flush posted (edit target + any extra
    *  chunk messages). Superseding deletes all of them. */
   messageIds: number[]
-  /** The text the flush delivered — retained for diagnostics/logging only. The
-   *  supersede decision NEVER compares text (that is the whole point: it fires
-   *  even when the flushed text differs from the reply text). */
+  /** The text the flush delivered. Originally diagnostics-only; since #3429 it
+   *  also feeds the new-content gate (`flushedAnswerMatchesReply`): an
+   *  identity-matched reply that is NOT the same answer (neither equal nor a
+   *  bounded containment) is an async handback and must send fresh instead of
+   *  editing/deleting the flushed message. */
   text: string
   /** Wall-clock ms when recorded. */
   ts: number
@@ -71,8 +82,67 @@ export interface SupersedeDecision {
   /** Message ids the gateway must delete before/instead of the fresh send.
    *  Empty when `supersede` is false. */
   deleteMessageIds: number[]
-  /** Machine-readable reason (for logs / tests). */
-  reason: 'supersede' | 'no-record' | 'expired' | 'different-turn'
+  /** Machine-readable reason (for logs / tests). `'new-content'` (#3429): the
+   *  record matched by identity + TTL but the landing reply carries genuinely
+   *  DIFFERENT content than the flushed answer — an async handback attributed
+   *  to the flush-delivered ended turn, NOT that turn's own answer landing
+   *  late. The gateway must send FRESH (a notifying new message), never
+   *  edit/delete the flushed message; the record is NOT consumed. */
+  reason: 'supersede' | 'no-record' | 'expired' | 'different-turn' | 'new-content'
+  /** The matched record's flushed text — populated whenever a fresh record for
+   *  the reply's turn identity was found (`reason` 'supersede' or
+   *  'new-content'). The gateway stashes it on the owner turn atom so the
+   *  answer-delivered latch can make the same content-vs-flush discrimination
+   *  on the no-record retry/race paths (#3429). */
+  recordText?: string
+}
+
+/**
+ * #3429 — minimum length a CONTAINED text must have for a containment match.
+ * The legitimate containment class is a flush that delivered
+ * `narration\n\nanswer` being corrected by the clean `answer`-only reply — the
+ * contained side is a full answer, comfortably long. A trivially short
+ * contained string (e.g. a reply "Done." that happens to appear inside the
+ * flushed blob) is NOT positive evidence of the same answer, and a false match
+ * here silently edits/suppresses genuinely new content — the exact #3429
+ * failure. Below this floor only whitespace-normalized EQUALITY matches; the
+ * worst case of declining is a rare duplicate message, which beats a silent
+ * drop (the #3426/#3428 precedent).
+ */
+export const SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS = 32
+
+/** Collapse whitespace runs so flush-pipeline vs reply-pipeline spacing
+ *  (paragraph spacers, hard-break promotion) never defeats the comparison. */
+function normalizeForMatch(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * #3429 — is the landing reply the SAME ANSWER the flush already delivered
+ * (a late canonical correction), as opposed to genuinely new content (an async
+ * handback that merely resolved the flush-delivered ended turn as its owner)?
+ *
+ * Deterministic string decision, no timing:
+ *   - whitespace-normalized equality → same answer;
+ *   - containment either direction (flush = `narration\n\nanswer` ⊇ reply, or
+ *     reply ⊇ a partially-delivered flush), guarded by
+ *     `SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS` on the CONTAINED side so a short
+ *     coincidental substring can never claim a match.
+ *
+ * A model-REGENERATED paraphrase of the same answer is indistinguishable from
+ * new content and therefore sends fresh — a rare duplicate message, the same
+ * conscious trade #3428 shipped for the reply-armed latch. A silent
+ * drop/edit-in-place of a genuinely new handback is the strictly worse
+ * failure.
+ */
+export function flushedAnswerMatchesReply(flushedText: string, replyText: string): boolean {
+  const flushed = normalizeForMatch(flushedText)
+  const reply = normalizeForMatch(replyText)
+  if (flushed.length === 0 || reply.length === 0) return false
+  if (flushed === reply) return true
+  if (reply.length >= SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS && flushed.includes(reply)) return true
+  if (flushed.length >= SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS && reply.includes(flushed)) return true
+  return false
 }
 
 /**
@@ -93,10 +163,25 @@ export interface SupersedeDecision {
  * now resolves a last-known turnId for the reply before calling in, so the
  * common late-replay case still matches by identity rather than relying on the
  * promiscuous null branch.)
+ *
+ * #3429 content gate: identity alone is NOT sufficient. The flush ends its
+ * turn synchronously BEFORE recording (stream-render `endCurrentTurnAtomic` →
+ * `record`), so EVERY superseding reply is a late reply, and an async
+ * sub-agent handback landing within the TTL with no live gateway turn resolves
+ * the flush-delivered ENDED turn as its owner via the latest-ended tier —
+ * exactly the same identity as the turn's own canonical late replay. The
+ * observed failure (msgs 10482/10486, 2026-07-20): the handback consumed the
+ * record and EDITED the flushed message in place with unrelated new content —
+ * Telegram edits do not re-notify, so the handback never surfaced client-side
+ * AND the flushed answer was destroyed. When the caller supplies `replyText`
+ * and it is NOT the same answer (`flushedAnswerMatchesReply`), the decision is
+ * `'new-content'`: no supersede, record left intact for the genuine replay,
+ * and the gateway sends the reply FRESH. Callers that omit `replyText`
+ * (identity-only legacy shape) keep the pre-#3429 behaviour.
  */
 export function decideSupersede(
   record: FlushedTurnRecord | undefined,
-  args: { liveTurnId: string | null; now: number; ttlMs?: number },
+  args: { liveTurnId: string | null; replyText?: string | null; now: number; ttlMs?: number },
 ): SupersedeDecision {
   const ttlMs = args.ttlMs ?? DEFAULT_SUPERSEDE_TTL_MS
   if (record == null) return { supersede: false, deleteMessageIds: [], reason: 'no-record' }
@@ -110,7 +195,18 @@ export function decideSupersede(
   if (!sameTurn) {
     return { supersede: false, deleteMessageIds: [], reason: 'different-turn' }
   }
-  return { supersede: true, deleteMessageIds: [...record.messageIds], reason: 'supersede' }
+  // #3429 — same turn identity, but genuinely different content: an async
+  // handback attributed to the flush-delivered ended turn, not the turn's own
+  // answer landing late. Never edit/delete the flushed message for it.
+  if (args.replyText != null && !flushedAnswerMatchesReply(record.text, args.replyText)) {
+    return { supersede: false, deleteMessageIds: [], reason: 'new-content', recordText: record.text }
+  }
+  return {
+    supersede: true,
+    deleteMessageIds: [...record.messageIds],
+    reason: 'supersede',
+    recordText: record.text,
+  }
 }
 
 /**
@@ -225,23 +321,31 @@ export class FlushedTurnSupersedeRegistry {
 
   /** Decide supersede for a landing reply WITHOUT consuming the record. Selects
    *  the record whose turnId matches the reply's resolved `liveTurnId` (or the
-   *  null-turnId record when `liveTurnId == null`). */
+   *  null-turnId record when `liveTurnId == null`). `replyText` (#3429) enables
+   *  the new-content gate; omitting it keeps the identity-only legacy shape. */
   peek(
     chatId: string,
     threadId: number | undefined,
-    args: { liveTurnId: string | null; now: number },
+    args: { liveTurnId: string | null; replyText?: string | null; now: number },
   ): SupersedeDecision {
     const rec = this.entries.get(makeKey(chatId, threadId))?.get(turnKey(args.liveTurnId))
-    return decideSupersede(rec, { liveTurnId: args.liveTurnId, now: args.now, ttlMs: this.ttlMs })
+    return decideSupersede(rec, {
+      liveTurnId: args.liveTurnId,
+      replyText: args.replyText,
+      now: args.now,
+      ttlMs: this.ttlMs,
+    })
   }
 
   /** Decide supersede AND, on a supersede, consume the matched record (so a
    *  second replay of the same reply doesn't try to delete the same — now gone —
-   *  messages again). Returns the same decision `peek` would. */
+   *  messages again). A `'new-content'` decision (#3429) does NOT consume: the
+   *  record stays live for the turn's own canonical replay until the TTL.
+   *  Returns the same decision `peek` would. */
   take(
     chatId: string,
     threadId: number | undefined,
-    args: { liveTurnId: string | null; now: number },
+    args: { liveTurnId: string | null; replyText?: string | null; now: number },
   ): SupersedeDecision {
     const lane = makeKey(chatId, threadId)
     const decision = this.peek(chatId, threadId, args)

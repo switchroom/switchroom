@@ -250,6 +250,43 @@ def slice_last_turns_by_user_boundary(messages: list, turns: int) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Sidechain (sub-agent transcript) detection
+# ---------------------------------------------------------------------------
+
+
+def transcript_first_line_is_sidechain(path: str) -> bool:
+    """True when the first JSON line of ``path`` carries ``isSidechain: true``.
+
+    Switchroom hindsight-leverage PR5. Claude Code writes sub-agent (Task-tool)
+    transcripts as separate ``.jsonl`` files under
+    ``<project>/<session>/subagents/agent-<agent_id>.jsonl`` whose every line
+    carries ``isSidechain: true``. This shared predicate lets BOTH the
+    SubagentStop retain (which resolves + retains these deliberately, tagged
+    ``sidechain`` + volume-gated) AND the boot reconciler / any transcript
+    sweeper (which must NOT treat a sidechain as a pseudo-session and re-retain
+    it untagged, at full recall weight, bypassing the volume gate) recognise a
+    sidechain file from its first line alone — a cheap single-line read. Any
+    read/parse error is treated as "not a sidechain" (fail-open: a
+    genuinely-unreadable file is skipped elsewhere by its empty transcript).
+    """
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line).get("isSidechain") is True
+                except json.JSONDecodeError:
+                    return False
+    except OSError:
+        return False
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Memory formatting (recall results → context string)
 # ---------------------------------------------------------------------------
 

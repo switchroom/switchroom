@@ -4,6 +4,61 @@
 
 ### Changed (switchroom divergence)
 
+- **`recallContextTurns` default `1` → `2`** (switchroom hindsight-leverage
+  PR2, workstream A2). A bare follow-up user message ("and the port?", "what
+  about staging?") now embeds together with its antecedent human turn in the
+  recall query, instead of recalling on the pronoun alone. Depends on PR1's
+  (#3435) `<channel>` envelope strip so the composed 2-turn query stays
+  envelope-free (both the trailing latest segment and the `Prior context:`
+  lines). The composition is bounded by `recallMaxQueryChars` (800) —
+  `truncate_recall_query` preserves the latest turn and drops oldest context
+  first, so a large antecedent can never blow the recall query budget.
+- **New `recallTranscriptTailBytes` (default `262144`)** — latency bound for
+  multi-turn recall. With `recallContextTurns > 1` now the default, every
+  recall reads the transcript to slice prior turns; `read_transcript_messages`
+  now byte-tail-bounds that read (seek to `EOF - tail_bytes`, discard the
+  partial first line, parse only complete trailing lines) so the added
+  per-recall read stays O(1) regardless of session `.jsonl` size. `0` reads the
+  whole file (rollback lever). Env: `HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES`.
+
+### Added (switchroom divergence)
+
+- **SubagentStop sidechain retain** (switchroom hindsight-leverage PR5). New
+  `scripts/subagent_retain.py`, registered on the `SubagentStop` event in
+  `hooks/hooks.json` (async, 15s). Delegated (Task-tool / sub-agent) work was
+  the biggest systematic memory hole — the main-session Stop retain only reads
+  the parent `transcript_path`, so a worker's process facts reached memory only
+  as its terse final report. This hook retains a bounded window (last 40 human
+  turns) of the *sidechain* transcript, tagged `sidechain` +
+  `parent_session:<id>`, with a deterministic content-derived `document_id` in a
+  distinct namespace (`{session}-sub-{agent}-r{start}-{end}`) so re-fires upsert.
+  Failures enqueue to the same `pending-retains` durability queue the Stop retain
+  uses. A **volume gate** (< 6 human turns OR < 2,000 chars of non-tool-result
+  text) skips trivial forks (every Task fires SubagentStop, including
+  10-second ones). Empirically probed on Claude Code 2.1.215: the hook input
+  carries a first-class `agent_transcript_path` pointing at
+  `<project>/<session>/subagents/agent-<agent_id>.jsonl` (used as the primary
+  path), with a directory-scan of the newest `isSidechain:true` jsonl as the
+  fallback for CLIs that omit the field. `reconcile_tail.py` and any transcript
+  sweeper now **skip** sidechain transcripts (shared
+  `content.transcript_first_line_is_sidechain` predicate) so the boot reconciler
+  cannot re-retain a sub-agent fork as a pseudo-session — untagged, at full
+  recall weight, bypassing the volume gate — which its recursive `**/*.jsonl`
+  glob would otherwise do one restart after any worker.
+
+- **recall.py: `recallTagWeights` per-tag score penalty** (switchroom
+  hindsight-leverage PR5). A `{tag: multiplier}` config map (default `{}`,
+  env `HINDSIGHT_RECALL_TAG_WEIGHTS`) applied to each result's `scores.final`
+  immediately before the relevance sort. Unlike the demote-tag DROP filter
+  (`_is_demoted_memory`), which removes a tagged memory from recall entirely,
+  this DEMOTES (down-ranks) a memory while keeping it recallable when it is the
+  only relevant hit — the "reduced weight" the drop filter cannot express.
+  Switchroom's scaffold seeds `{"sidechain": 0.8}` so delegated-worker
+  process-memories rank just below first-party session memory. **Candidate to
+  upstream** — a general recall-shaping primitive, not switchroom-specific.
+
+### Changed (switchroom divergence)
+
 - **retain.py: decouple chunked window-slicing from the `retainEveryNTurns > 1`
   throttle** (switchroom Phase 6b). Previously the chunked sliding-window only
   applied when `retainEveryNTurns > 1`; with `retainEveryNTurns=1` (switchroom

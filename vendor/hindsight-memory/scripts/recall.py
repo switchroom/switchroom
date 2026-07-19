@@ -61,7 +61,11 @@ from lib.content import (
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
-from lib.directives import fetch_active_directives, format_active_directives_block
+from lib.directives import (
+    DIRECTIVES_CACHE_TTL_SECONDS,
+    fetch_active_directives_cached,
+    format_active_directives_block,
+)
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.state import read_state, write_state
 
@@ -562,6 +566,59 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return "timed out" in str(exc).lower()
 
 
+def _apply_tag_weights(results, tag_weights) -> int:
+    """Multiply each result's ``scores.final`` by a per-tag weight in place.
+
+    Switchroom hindsight-leverage PR5 — the recall-side counterpart to the
+    ``sidechain`` retain tag. A NEW mechanism, deliberately distinct from the
+    demote-tag DROP filter (`_is_demoted_memory`): that path removes a tagged
+    memory from recall entirely, which cannot express "keep it, but rank it
+    lower". This step DOWN-WEIGHTS a memory's engine relevance score so a
+    penalised memory sorts below an equal-scoring un-penalised one at the sort
+    below, yet is still returned when it is the only relevant hit (the cap sees
+    the full penalised set, not a filtered one).
+
+    ``tag_weights`` is a ``{tag: multiplier}`` map. For each result, the
+    multipliers of ALL its tags that appear in the map are multiplied together
+    and applied to ``scores.final`` (so a memory carrying two penalised tags is
+    penalised compoundly — intended). Tags are matched case-sensitively after
+    ``strip()`` (consistent with ``_is_demoted_memory``). Results whose
+    ``scores.final`` is absent or non-numeric are left untouched — a score-less
+    entry already sorts last and there is nothing to scale. A weight of exactly
+    1.0 (or a non-positive / non-numeric weight) is a no-op for that tag.
+
+    Returns the number of results whose score was actually changed (for the
+    debug log). Mutation is intentional: the effective (post-weight) score is
+    what the sort, the cap, and the recall-log ranking should all reflect.
+    """
+    if not isinstance(tag_weights, dict) or not tag_weights:
+        return 0
+    changed = 0
+    for m in results:
+        if not isinstance(m, dict):
+            continue
+        tags = m.get("tags")
+        if not isinstance(tags, list):
+            continue
+        factor = 1.0
+        for tag in tags:
+            if not isinstance(tag, str):
+                continue
+            w = tag_weights.get(tag.strip())
+            if isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0:
+                factor *= float(w)
+        if factor == 1.0:
+            continue
+        scores = m.get("scores")
+        if not isinstance(scores, dict):
+            continue
+        val = scores.get("final")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            scores["final"] = float(val) * factor
+            changed += 1
+    return changed
+
+
 def _write_recall_log(entry: dict) -> None:
     """Append a JSONL line to recall_log.jsonl. Bounded by line count.
 
@@ -607,35 +664,72 @@ def _write_recall_log(entry: dict) -> None:
         pass
 
 
-def read_transcript_messages(transcript_path: str) -> list:
+def _read_transcript_lines(transcript_path: str, tail_bytes: int):
+    """Yield the transcript's trailing lines, byte-bounded.
+
+    Switchroom hindsight-leverage A2 (PR2): the latency bound for multi-turn
+    recall. When ``tail_bytes > 0`` we seek to ``EOF - tail_bytes`` and read
+    forward, discarding the first (possibly partial) line so every yielded line
+    is complete JSON. This caps the read+parse cost at O(tail_bytes) regardless
+    of how large the session ``.jsonl`` has grown — the last few human turns we
+    slice for context always live at the very tail. ``tail_bytes <= 0`` reads
+    the whole file (pre-A2 behaviour / rollback lever).
+
+    Reads bytes (not text) so the seek offset is exact; decodes with
+    ``errors="ignore"`` so a multi-byte character split by the tail boundary
+    can't crash the read (that byte lands in the discarded partial first line
+    anyway when the file exceeds the bound).
+    """
+    if tail_bytes and tail_bytes > 0:
+        size = os.path.getsize(transcript_path)
+        if size > tail_bytes:
+            with open(transcript_path, "rb") as f:
+                f.seek(size - tail_bytes)
+                chunk = f.read()
+            text = chunk.decode("utf-8", errors="ignore")
+            # Drop the first line — it may be a partial record from mid-file.
+            newline = text.find("\n")
+            if newline != -1:
+                text = text[newline + 1 :]
+            yield from text.splitlines()
+            return
+    with open(transcript_path, encoding="utf-8") as f:
+        yield from f
+
+
+def read_transcript_messages(transcript_path: str, tail_bytes: int = 0) -> list:
     """Read messages from a JSONL transcript file for multi-turn context.
 
     Claude Code transcript format nests messages:
       {type: "user", message: {role: "user", content: "..."}, uuid: "...", ...}
     Also supports flat format for testing:
       {role: "user", content: "..."}
+
+    ``tail_bytes`` (Switchroom A2) byte-bounds the read: when > 0 and the file
+    is larger, only the trailing ``tail_bytes`` (complete lines) are parsed, so
+    the added per-recall transcript read stays cheap on long sessions. 0 reads
+    the whole file.
     """
     if not transcript_path or not os.path.isfile(transcript_path):
         return []
     messages = []
     try:
-        with open(transcript_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    # Claude Code nested format: {type: "user", message: {role, content}}
-                    if entry.get("type") in ("user", "assistant"):
-                        msg = entry.get("message", {})
-                        if isinstance(msg, dict) and msg.get("role"):
-                            messages.append(msg)
-                    # Flat format (testing / future compatibility)
-                    elif "role" in entry and "content" in entry:
-                        messages.append(entry)
-                except json.JSONDecodeError:
-                    continue
+        for line in _read_transcript_lines(transcript_path, tail_bytes):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                # Claude Code nested format: {type: "user", message: {role, content}}
+                if entry.get("type") in ("user", "assistant"):
+                    msg = entry.get("message", {})
+                    if isinstance(msg, dict) and msg.get("role"):
+                        messages.append(msg)
+                # Flat format (testing / future compatibility)
+                elif "role" in entry and "content" in entry:
+                    messages.append(entry)
+            except json.JSONDecodeError:
+                continue
     except OSError:
         pass
     return messages
@@ -1071,7 +1165,10 @@ def main():
 
     if recall_context_turns > 1:
         transcript_path = hook_input.get("transcript_path", "")
-        messages = read_transcript_messages(transcript_path)
+        # A2 latency bound: only parse the transcript tail (last N bytes) —
+        # the human turns we slice for context live at the end.
+        recall_transcript_tail_bytes = config.get("recallTranscriptTailBytes", 262144)
+        messages = read_transcript_messages(transcript_path, recall_transcript_tail_bytes)
         debug_log(config, f"Multi-turn context: {recall_context_turns} turns, {len(messages)} messages from transcript")
         query = compose_recall_query(recall_query_text, messages, recall_context_turns, recall_roles)
     else:
@@ -1090,10 +1187,21 @@ def main():
     # surfaced every turn). Workaround for upstream bug
     # vectorize-io/hindsight#1269 (tagged directives silently dropped from
     # `reflect`); `list_directives` itself works correctly upstream, so this
-    # is a pure client-side surface. fetch_active_directives is failure-safe
-    # and returns [] on any error.
+    # is a pure client-side surface. fetch_active_directives_cached is
+    # failure-safe and returns [] on any error.
+    #
+    # A4: cache the list with a short TTL (invalidated in-session by
+    # directive_verify.py on a directive write) so the common no-write turn
+    # skips the HTTP round-trip. TTL=0 disables the cache (live every turn).
+    # The A3 timing wrapper below measures the fetch either way — on a cache
+    # HIT directives_elapsed_ms reads ~0 (that is the A4 latency win, not a
+    # telemetry regression).
     _directives_start = time.monotonic()
-    directives = fetch_active_directives(client, bank_id)
+    directives = fetch_active_directives_cached(
+        client,
+        bank_id,
+        ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
+    )
     directives_elapsed_ms = int((time.monotonic() - _directives_start) * 1000)
     directives_block = format_active_directives_block(directives) if directives else None
     if directives_block:
@@ -1256,6 +1364,17 @@ def main():
             )
     else:
         overlap_dropped = 0
+
+    # Switchroom hindsight-leverage PR5 — per-tag score penalty. Applied
+    # IMMEDIATELY before the relevance sort so a down-weighted tag (e.g.
+    # `sidechain: 0.8`) reorders the merged set without dropping anything. This
+    # is the "reduced weight" the demote-tag DROP filter above cannot express:
+    # a penalised memory ranks below equal-scoring untagged memories yet still
+    # survives the cap when it is the only relevant hit. See _apply_tag_weights.
+    tag_weights = config.get("recallTagWeights")
+    weighted = _apply_tag_weights(results, tag_weights)
+    if weighted > 0:
+        debug_log(config, f"Applied recallTagWeights to {weighted} memories: {tag_weights}")
 
     # Switchroom Phase-1 precision — sort the merged primary + additional-bank
     # result set by the engine's relevance score (`scores.final`) descending

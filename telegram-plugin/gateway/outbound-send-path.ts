@@ -53,7 +53,11 @@ import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
 import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
-import { decideSupersedeCorrection, type FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import {
+  decideSupersedeCorrection,
+  flushedAnswerMatchesReply,
+  type FlushedTurnSupersedeRegistry,
+} from '../flushed-turn-supersede.js'
 import { decideAnswerLatchSuppression } from '../reply-owner-resolve.js'
 import { deriveTelegraphTitle } from '../telegraph.js'
 import {
@@ -872,10 +876,16 @@ export async function sendReply(
     // resolvers agree and the late-reply supersede fires by identity.
     const ownerTurn = resolveReplyOwnerTurn(turn, chat_id, args)
     const resolvedTurnId = ownerTurn?.turnId ?? null
+    // #3429 — pass the (normalized) reply text so the registry can apply the
+    // new-content gate: identity match + TTL alone also fits an async handback
+    // that merely resolved this flush-delivered ENDED turn as its owner via
+    // the latest-ended tier. Editing the flushed message in place with that
+    // handback's text does not re-notify client-side (Telegram edits never
+    // push) — the observed silent non-surfacing of msgs 10482/10486.
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
-      { liveTurnId: resolvedTurnId, now: Date.now() },
+      { liveTurnId: resolvedTurnId, replyText: text, now: Date.now() },
     )
     if (decision.supersede) {
       process.stderr.write(
@@ -901,8 +911,14 @@ export async function sendReply(
       // (no-throw) path is unaffected: the correction below still ships B once.
       // Tagged 'flush' (#3426): a flush record existed for this turn (take()
       // just consumed it), so the flushed message A is what the suppression
-      // protects against duplicating.
-      if (ownerTurn != null) ownerTurn.answerDelivered = 'flush'
+      // protects against duplicating. #3429: stash the record's flushed text
+      // alongside, so the retry's latch check can discriminate by content —
+      // the retry of THIS superseding reply matches and stays suppressed, while
+      // a later genuinely-new handback does not and delivers.
+      if (ownerTurn != null) {
+        ownerTurn.answerDelivered = 'flush'
+        if (decision.recordText != null) ownerTurn.flushedAnswerText = decision.recordText
+      }
     } else {
       // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race latch.
       // Supersede found no record. Either there was no flush (normal reply), or
@@ -925,12 +941,33 @@ export async function sendReply(
         text: rawText,
         disableNotification: args.disable_notification === true,
       })
+      // #3429 — content evidence for the latch. `'new-content'` is the
+      // registry's POSITIVE determination that this reply differs from the
+      // flushed answer (record present, identity matched, text did not);
+      // otherwise compare against the owner turn's stashed `flushedAnswerText`
+      // (covers the post-fire pre-record race window, where no record exists
+      // yet but the fire site already stamped what it is delivering). Null —
+      // no flushed text to compare — keeps the conservative pre-#3429
+      // flush-armed suppression.
+      const replyMatchesFlushedAnswer: boolean | null =
+        decision.reason === 'new-content'
+          ? false
+          : ownerTurn?.flushedAnswerText != null
+            ? flushedAnswerMatchesReply(ownerTurn.flushedAnswerText, text)
+            : null
       const suppressByLatch = decideAnswerLatchSuppression({
         superseded: false,
         replySubstantive,
         isLateReply: turn == null,
         ownerAnswerDelivered: ownerTurn?.answerDelivered ?? false,
+        replyMatchesFlushedAnswer,
       })
+      if (decision.reason === 'new-content') {
+        process.stderr.write(
+          `telegram gateway: reply: flush supersede declined — new content (#3429) ` +
+          `chatId=${chat_id} ownerTurnId=${JSON.stringify(resolvedTurnId)}; sending fresh\n`,
+        )
+      }
       if (suppressByLatch) {
         process.stderr.write(
           `telegram gateway: reply: suppressed by answer-delivered latch ` +

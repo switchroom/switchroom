@@ -178,6 +178,19 @@ export interface AnswerLatchSuppressInput {
   isLateReply: boolean
   /** The resolved owner turn's source-tagged `answerDelivered` latch. */
   ownerAnswerDelivered: AnswerDeliveredLatch
+  /** #3429 — content evidence: does the landing reply carry the SAME answer
+   *  the flush delivered (`flushedAnswerMatchesReply` against the supersede
+   *  record's text or the owner turn's stashed `flushedAnswerText`)?
+   *    - `false`  → POSITIVE evidence of genuinely new content (an async
+   *                 handback attributed to the flush-delivered ended turn).
+   *                 Suppressing it would silently drop the user's answer —
+   *                 never suppress.
+   *    - `true`   → the reply is the flushed answer landing again — suppress
+   *                 (the flush race the latch exists for).
+   *    - `null` / omitted → no flushed text available to compare (legacy atom,
+   *                 pre-#3429 caller). Conservative: keep the pre-#3429
+   *                 flush-armed suppression. */
+  replyMatchesFlushedAnswer?: boolean | null
 }
 
 /**
@@ -195,10 +208,18 @@ export interface AnswerLatchSuppressInput {
  * (typically) an async sub-agent handback carrying genuinely new content, and
  * suppressing it silently drops the user's answer. Byte-identical replays of
  * the delivered reply are still deduped by the content-keyed #546 cache.
+ *
+ * #3429 refinement: even a FLUSH-armed latch does not suppress when there is
+ * POSITIVE content evidence (`replyMatchesFlushedAnswer === false`) that the
+ * landing reply is NOT the flushed answer — an async handback attributed to a
+ * flush-delivered ended turn must send fresh, not vanish. Absent evidence
+ * (`null`/omitted) the flush-armed suppression holds, preserving the #2996
+ * Part 2 race backstop.
  */
 export function decideAnswerLatchSuppression(input: AnswerLatchSuppressInput): boolean {
   if (input.superseded) return false
   if (!input.replySubstantive) return false
   if (!input.isLateReply) return false
+  if (input.replyMatchesFlushedAnswer === false) return false
   return input.ownerAnswerDelivered === 'flush'
 }
