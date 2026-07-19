@@ -79,7 +79,14 @@ def compose_recall_query(
 
         <latest query>
     """
-    latest = latest_query.strip()
+    # Switchroom A1 (hindsight-leverage PR 1) — strip the <channel> envelope
+    # from the latest query INSIDE the helper as well, so any caller (present
+    # or future) gets an envelope-free composed query. The recall.py caller
+    # already strips before calling, but keeping the strip here is defence in
+    # depth: it guarantees the trailing latest-query segment appended below
+    # (and returned on the turns<=1 short-circuit) never carries the raw
+    # chat_id/ts/user XML noise into the embedding or the char cap.
+    latest = strip_channel_envelope(latest_query).strip()
     if recall_context_turns <= 1 or not isinstance(messages, list) or not messages:
         return latest
 
