@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+## v0.19.2 — Hindsight recovery, External spend on /usage, auth-broker hardening, /model carrier doctor
+
+Closes dual-writer and silent-LLM footguns in Hindsight, puts short-window OpenRouter
+cash spend on `/usage` without giving agents the master key, hardens the auth-broker
+and LiteLLM pacer against OAuth-leak / unpaced-router classes, and makes stale
+`start.sh` vs rev5 `.session-model` drift fail doctor (and log NOT-APPLIED) so
+Telegram `/model` stops looking successful when the carrier is unread.
+
+### Hindsight recovery
+
+- **Close dual-writer + silent-LLM recovery footguns** (#3421) — `stopHindsight`
+  now stops/removes every container mounting `switchroom-hindsight-data` (not just
+  the live name); LiteLLM-mode docker health requires API `/health` **and** TCP to
+  the LiteLLM base; the stale-claim reaper uses plain UPDATE + SELECT plus a
+  boot-deferred one-shot (no more aborted `RETURNING | grep -c`); `HINDSIGHT_API_WORKER_ID`
+  is pinned on docker-run and compose paths. Doctor fails multi-mount and network-mode
+  / LiteLLM-reachability drift. Live signatures from 2026-07-19 park-and-wait recovery
+  (canary dual-writer checkpoint corruption, bridge retain deaths, orphaned
+  `processing` consolidations).
+- **Compose LiteLLM parity + reaper/doctor follow-ups** (#3422) — compose no longer
+  stays bridge + plain `/health` while emitting loopback LLM base URLs; when any
+  Hindsight LLM base is host-loopback / LiteLLM is explicit, compose mirrors live
+  fleet (`network_mode: host`, port pins, LiteLLM-aware health). Reaper counts via
+  psql `UPDATE N`; doctor gates litellm on per-op base URLs (bare `ANTHROPIC_BASE_URL`
+  only when it looks like LiteLLM).
+- **Doctor surfaces Hindsight boot LLM-verification failure** (#3409 / #3408) —
+  MemoryEngine boot WARNING
+  (`LLM connection verification failed for '<config>'`) is now a first-class doctor
+  failure instead of log-only drift.
+- **Retain mission excludes in-flight process narration** (#3418) —
+  `DEFAULT_RETAIN_MISSION` explicitly skips workflow/process narration so new agents
+  don't fill banks with ephemeral worker-state noise (existing missions stay
+  operator-owned).
+
+### External spend on `/usage`
+
+- **External 24h/7d OpenRouter spend on the `/usage` card** (#3420) — after Claude
+  quota bars, layout B shows short-window External $ burn (24h / 7d + top models)
+  so cash spend is visible without a separate LiteLLM dig.
+- **External spend via the auth-broker** (#3423) — broker owns the LiteLLM master
+  key, caches sanitized `external-spend.json`, and exposes `get-external-spend`
+  (ACL = `list-state`). Gateway soft-fails closed (omits the External block) —
+  **no agent needs `litellm/master-key`**.
+- **`/usage` honesty + info-exposure hardening** (#3412 / #3411) — live stamp keys
+  off any successful probe row (not `results.length`); false "Live" on empty-cache
+  probe failure is gone.
+
+### Auth-broker + LiteLLM pacer
+
+- **Symlink-safe unified mirror write (H1 + M1)** (#3416) — shared `safeMirrorWrite`
+  for consumer and agent credential fanout under `CAP_DAC_OVERRIDE`.
+- **Reject stale identities + tear down sockets on unbind (H2)** (#3414) —
+  classify-null no longer falls back to a bind-time identity; unbind tears sockets
+  down.
+- **Pacer gates the `/v1/messages` router path (H3)** (#3413) — paces
+  `anthropic_messages` (not only passthrough) with explicit
+  `PACE_MODEL_GROUPS` / exclude lists so `sonnet` / `fable` aren't unpaced on
+  litellm v1.91.0 router traffic.
+- **I2 OAuth-leak config guard + long-mark corroboration** (#3417) — lint +
+  fleet-health sensor for `forward_client_headers_to_llm_api` scoped only to
+  subscription-Claude groups (`claude-*` / `sonnet` / `fable`; `*-openrouter`
+  excluded); keeps the subscription honest against one-line third-party token
+  leaks.
+- **Config-time LiteLLM model-reference validation** (#3410 / #3407) —
+  `switchroom doctor` checks switchroom model refs against the live proxy
+  `model_list` so a deleted group can't silently 400 Hindsight for hours.
+
+### Model switching + progress cards
+
+- **Doctor + logs for rev5 `.session-model` carrier drift** (#3424) —
+  `checkStartShSessionModelCarrier` fails readable `start.sh` that still only reads
+  legacy `.session-model-override` while gateway writes rev5 `.session-model` JSON.
+  Gateway logs explicit NOT-APPLIED / relaunch outcome. Fix path: `switchroom apply`
+  (start.sh rewrite) then restart — applies on this release bounce.
+- **Progress-card durability** (#3415) — status-pin clear preserves live claims;
+  same-key reconcile is serialized; fork cards no longer seed a wrong model from
+  `tool_input.model`.
+
+### Docs
+
+- **Hindsight per-op model-change runbook** (#3419) — operator runbook + skill
+  pointer for `hindsight.llm.{retain,reflect,consolidation}` swaps; documents the
+  hostd single-file bind-mount inode pitfall.
+- **Agent-home lifecycle RFC** (#3350) — durable/ephemeral split + deterministic
+  reaper design (follow-up implementation PRs not in this cut).
+
 ## v0.19.1 — Bundled Claude Code CLI bumped to 2.1.215
 
 - **Bundled Claude Code CLI bumped 2.1.205 → 2.1.215** (#3405) —
