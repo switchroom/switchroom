@@ -67,6 +67,7 @@ import {
   parseSetupTokenUrl,
   readTokenFromCredentialsFile,
 } from '../../src/auth/manager.js'
+import { PRE_PASTE_RULES } from '../../src/auth/via-claude.js'
 import type {
   AddAccountCredentials,
   AnthropicAddAccountCredentials,
@@ -103,6 +104,19 @@ export interface AuthAddTmuxOps {
    * the session has ended.
    */
   send(socket: string, session: string, text: string): void
+  /**
+   * `tmux -L <socket> send-keys -t <session> <key>` — a SINGLE key-name
+   * dispatch (e.g. `Enter`), with NO `-l` literal prefix and NO pane
+   * capture. Used for:
+   *   - pre-paste picker choreography (theme / login-method Enters) during
+   *     the URL-poll phase, before any secret is on the pane; and
+   *   - blind post-paste Enter dispatches to advance past Enter-gated
+   *     "Logged in / Security notes" screens in the via-claude picker flow.
+   * It reads nothing from the pane, so it can never leak the echoed code —
+   * this is the deterministic replacement for via-claude's capture-driven
+   * post-paste dispatch (see prb-safety.md).
+   */
+  sendKey(socket: string, session: string, key: string): void
   /** `tmux -L <socket> has-session -t <session>` — returns true if alive. */
   hasSession(socket: string, session: string): boolean
   /** `tmux -L <socket> kill-session -t <session>` — best-effort. */
@@ -151,6 +165,12 @@ export function makeAuthAddTmuxOps(tmuxBin = 'tmux'): AuthAddTmuxOps {
         stdio: ['pipe', 'pipe', 'pipe'],
       })
     },
+    sendKey(socket, session, key) {
+      // Single key-name dispatch, no -l literal prefix, no capture.
+      execFileSync(tmuxBin, ['-L', socket, 'send-keys', '-t', session, key], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    },
     hasSession(socket, session) {
       try {
         execFileSync(tmuxBin, ['-L', socket, 'has-session', '-t', session], {
@@ -184,6 +204,20 @@ export function makeAuthAddTmuxOps(tmuxBin = 'tmux'): AuthAddTmuxOps {
  * TTL matches `REAUTH_INTERCEPT_TTL_MS` (10 minutes); the reaper sweep
  * in gateway.ts walks both maps each minute.
  */
+/**
+ * Which credential minter drives the flow.
+ *
+ *   - `'via-claude'` (DEFAULT): spawn the bare `claude` login picker, which
+ *     mints the broad scope set (`org:create_api_key user:profile
+ *     user:inference user:sessions:claude_code user:mcp_servers
+ *     user:file_upload`) that `server:` mode agents require at boot. This is
+ *     the default because `claude setup-token` tokens carry only
+ *     `user:inference` and are REFUSED by server: agents (via-claude.ts:9-17).
+ *   - `'setup-token'`: spawn `claude setup-token` (narrow `user:inference`).
+ *     Kept for completeness / legacy narrow-scope adds.
+ */
+export type AuthAddMode = 'via-claude' | 'setup-token'
+
 export interface PendingAuthAddFlow {
   label: string
   scratchDir: string
@@ -192,6 +226,14 @@ export interface PendingAuthAddFlow {
   /** tmux session name (`auth-add-<label>-<hex>`). */
   tmuxSession: string
   startedAt: number
+  /**
+   * Minter mode this flow was started in. `submitAccountAuthCode` reads it to
+   * decide whether to dispatch blind post-paste Enter key-presses (via-claude
+   * picker screens) — setup-token exits after the code so needs none.
+   * Optional for back-compat with callers/tests that construct flows directly;
+   * absent is treated as `'via-claude'` (the default minter).
+   */
+  mode?: AuthAddMode
 }
 export const pendingAuthAddFlows = new Map<string, PendingAuthAddFlow>()
 
@@ -299,6 +341,8 @@ export interface StartAccountAuthSessionResult {
   scratchDir: string
   tmuxSocket: string
   tmuxSession: string
+  /** The minter mode the session was started in. */
+  mode: AuthAddMode
 }
 
 /**
@@ -343,6 +387,11 @@ export async function startAccountAuthSession(
     agentName?: string
     /** Override the claude binary name (tests). */
     claudeBinary?: string
+    /**
+     * Credential minter. Defaults to `'via-claude'` (broad scope) — see
+     * {@link AuthAddMode}. Pass `'setup-token'` for the narrow-scope minter.
+     */
+    mode?: AuthAddMode
   } = {},
 ): Promise<StartAccountAuthSessionResult> {
   if (process.env.SWITCHROOM_TMUX_SUPERVISOR !== '1' && !opts.tmuxOps) {
@@ -353,10 +402,14 @@ export async function startAccountAuthSession(
   }
 
   const home = opts.home ?? homedir()
-  const urlTimeoutMs = opts.urlTimeoutMs ?? 12_000
+  // 30s (was 12s): the via-claude login picker adds keystroke-choreography
+  // latency (theme + login-method Enters) before the URL renders, and an
+  // unloaded VM can be slow. via-claude's own default is 20s; 30s is generous.
+  const urlTimeoutMs = opts.urlTimeoutMs ?? 30_000
   const agentName = opts.agentName ?? process.env.SWITCHROOM_AGENT_NAME ?? 'gateway'
   const tmux = opts.tmuxOps ?? makeAuthAddTmuxOps(opts.tmuxBin)
   const binary = opts.claudeBinary ?? 'claude'
+  const mode: AuthAddMode = opts.mode ?? 'via-claude'
 
   const scratchDir = pickScratchDir(label, home)
   mkdirSync(scratchDir, { recursive: true, mode: 0o700 })
@@ -391,20 +444,31 @@ export async function startAccountAuthSession(
   if (process.env.CLAUDE_CONFIG_DIR) sessionEnv['CLAUDE_CONFIG_DIR'] = scratchDir // always override
   if (process.env.XDG_CONFIG_HOME) sessionEnv['XDG_CONFIG_HOME'] = process.env.XDG_CONFIG_HOME
 
+  // Command: bare `claude` for the broad-scope login picker (via-claude), or
+  // `claude setup-token` for the narrow-scope minter.
+  const sessionCmd = mode === 'via-claude' ? binary : binary + ' setup-token'
+  const minterLabel = mode === 'via-claude' ? 'claude login' : 'claude setup-token'
   try {
-    tmux.newSession(tmuxSocket, tmuxSession, sessionEnv, binary + ' setup-token')
+    tmux.newSession(tmuxSocket, tmuxSession, sessionEnv, sessionCmd)
   } catch (err) {
     cleanScratchDir(scratchDir)
-    throw new Error(`Failed to start tmux session for claude setup-token: ${(err as Error).message}`)
+    throw new Error(`Failed to start tmux session for ${minterLabel}: ${(err as Error).message}`)
   }
 
   // Poll capture-pane every 500ms up to the URL timeout.
+  //
+  // In via-claude mode we ALSO dispatch the pre-paste picker choreography
+  // (theme picker → Enter, login-method picker → Enter) each tick, at most
+  // once per rule. This runs BEFORE any secret is on the pane, so capturing
+  // here is safe. parseSetupTokenUrl matches both the claude.ai/oauth and
+  // claude.com/cai/oauth shapes, which is exactly the URL the picker renders.
+  const preFired = new Set<string>()
   const loginUrl = await new Promise<string>((resolve, reject) => {
     const deadline = setTimeout(() => {
       clearInterval(ticker)
       tmux.killSession(tmuxSocket, tmuxSession)
       cleanScratchDir(scratchDir)
-      reject(new Error(`claude setup-token did not print an OAuth URL within ${urlTimeoutMs}ms`))
+      reject(new Error(`${minterLabel} did not print an OAuth URL within ${urlTimeoutMs}ms`))
     }, urlTimeoutMs)
 
     const ticker = setInterval(() => {
@@ -414,8 +478,19 @@ export async function startAccountAuthSession(
         clearTimeout(deadline)
         clearInterval(ticker)
         cleanScratchDir(scratchDir)
-        reject(new Error('claude setup-token exited before printing OAuth URL'))
+        reject(new Error(`${minterLabel} exited before printing OAuth URL`))
         return
+      }
+      if (mode === 'via-claude') {
+        for (const rule of PRE_PASTE_RULES) {
+          if (preFired.has(rule.name)) continue
+          if (rule.match.test(pane)) {
+            preFired.add(rule.name)
+            // The pre-paste rules dispatch bare key-names (Enter); use the
+            // single-key primitive, not the literal-code `send`.
+            for (const key of rule.keys) tmux.sendKey(tmuxSocket, tmuxSession, key)
+          }
+        }
       }
       const url = parseSetupTokenUrl(pane)
       if (url) {
@@ -427,7 +502,7 @@ export async function startAccountAuthSession(
     }, 500)
   })
 
-  return { loginUrl, scratchDir, tmuxSocket, tmuxSession }
+  return { loginUrl, scratchDir, tmuxSocket, tmuxSession, mode }
 }
 
 /**
@@ -456,11 +531,24 @@ export async function submitAccountAuthCode(
     pollIntervalMs?: number
     pollTimeoutMs?: number
     tmuxOps?: AuthAddTmuxOps
+    /**
+     * Blind post-paste Enter schedule (ms after the code paste) for the
+     * via-claude picker flow: advances past the Enter-gated "Logged in /
+     * Security notes" screens WITHOUT ever capturing the pane (the echoed
+     * code is a secret — see prb-safety.md). Defaults derive from
+     * `flow.mode`: via-claude → `[1500, 3000, 5000]`, setup-token → `[]`
+     * (setup-token exits after the code, so no screens to dismiss). Pass an
+     * explicit array to override (tests use tight schedules).
+     */
+    blindEnterDelaysMs?: number[]
   } = {},
 ): Promise<AddAccountCredentials> {
   const pollIntervalMs = opts.pollIntervalMs ?? 250
   const pollTimeoutMs = opts.pollTimeoutMs ?? 300_000
   const tmux = opts.tmuxOps ?? makeAuthAddTmuxOps()
+  const mode: AuthAddMode = flow.mode ?? 'via-claude'
+  const blindEnterDelaysMs =
+    opts.blindEnterDelaysMs ?? (mode === 'via-claude' ? [1500, 3000, 5000] : [])
 
   const credentialsPath = join(flow.scratchDir, '.credentials.json')
 
@@ -475,10 +563,28 @@ export async function submitAccountAuthCode(
     )
   }
 
+  // Blind post-paste Enter schedule (via-claude picker). Absolute deadlines;
+  // each fires at most once. NEVER reads the pane — sendKey only writes.
+  const pasteAt = Date.now()
+  const blindEnters = blindEnterDelaysMs.map((d) => ({ at: pasteAt + d, fired: false }))
+
   // Poll filesystem + session liveness only — no capture-pane.
   const deadline = Date.now() + pollTimeoutMs
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, pollIntervalMs))
+
+    // Dispatch any due blind Enters (best-effort; a dead session just throws
+    // and we swallow it — the fs poll below is the real success signal).
+    for (const be of blindEnters) {
+      if (!be.fired && Date.now() >= be.at) {
+        be.fired = true
+        try {
+          tmux.sendKey(flow.tmuxSocket, flow.tmuxSession, 'Enter')
+        } catch {
+          // best-effort — session may have already exited on success
+        }
+      }
+    }
 
     if (existsSync(credentialsPath)) {
       const token = readTokenFromCredentialsFile(credentialsPath)

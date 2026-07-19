@@ -111,6 +111,7 @@ function makeMockTmuxOps(opts: {
 } = {}): AuthAddTmuxOps & {
   newSessionCalls: Array<{ socket: string; session: string; env: Record<string, string>; cmd: string }>
   sendCalls: Array<{ socket: string; session: string; text: string }>
+  sendKeyCalls: Array<{ socket: string; session: string; key: string }>
   killCalls: Array<{ socket: string; session: string }>
   captureCallCount: number
   sessionAlive: boolean
@@ -123,12 +124,14 @@ function makeMockTmuxOps(opts: {
   let sessionAlive = opts.initialSessionAlive ?? true
   const newSessionCalls: Array<{ socket: string; session: string; env: Record<string, string>; cmd: string }> = []
   const sendCalls: Array<{ socket: string; session: string; text: string }> = []
+  const sendKeyCalls: Array<{ socket: string; session: string; key: string }> = []
   const killCalls: Array<{ socket: string; session: string }> = []
   let captureCallCount = 0
 
   const mock = {
     get newSessionCalls() { return newSessionCalls },
     get sendCalls() { return sendCalls },
+    get sendKeyCalls() { return sendKeyCalls },
     get killCalls() { return killCalls },
     get captureCallCount() { return captureCallCount },
     get sessionAlive() { return sessionAlive },
@@ -148,6 +151,9 @@ function makeMockTmuxOps(opts: {
     send(socket: string, session: string, text: string) {
       sendCalls.push({ socket, session, text })
       mock.onSend?.(socket, session, text)
+    },
+    sendKey(socket: string, session: string, key: string) {
+      sendKeyCalls.push({ socket, session, key })
     },
     hasSession(socket: string, session: string): boolean {
       void socket; void session
@@ -773,6 +779,9 @@ printf '{\\n  "claudeAiOauth": {\\n    "accessToken": "${fakeAccessToken}",\\n  
       send(_socket, session, text) {
         return realOps.send(tmuxSocket, session, text)
       },
+      sendKey(_socket, session, key) {
+        return realOps.sendKey(tmuxSocket, session, key)
+      },
       hasSession(_socket, session) {
         return realOps.hasSession(tmuxSocket, session)
       },
@@ -814,6 +823,200 @@ printf '{\\n  "claudeAiOauth": {\\n    "accessToken": "${fakeAccessToken}",\\n  
     expect(creds.claudeAiOauth.scopes).toContain('user:inference')
     cleanScratchDir(result.scratchDir)
   }, 30_000)
+})
+
+/* ── 12. via-claude broad-scope minter (PR B) ─────────────────────────── */
+
+describe('startAccountAuthSession — via-claude mode (broad scope)', () => {
+  // The picker-rendered broad-scope authorize URL (org:create_api_key +
+  // user:profile + user:inference …). This is what `claude` (not setup-token)
+  // emits after "Claude account with subscription".
+  const BROAD_URL =
+    'https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code' +
+    '&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code' +
+    '&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-z&state=s'
+
+  it('defaults to via-claude mode: spawns bare `claude` (NOT `claude setup-token`) and reports mode', async () => {
+    const mock = makeMockTmuxOps({ captureResponses: [BROAD_URL] })
+    const result = await startAccountAuthSession('broad@example.com', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 3_000,
+    })
+    expect(result.mode).toBe('via-claude')
+    // cmd must be the bare login picker, not setup-token (setup-token mints
+    // only user:inference, which server: agents refuse).
+    expect(mock.newSessionCalls[0].cmd).toBe('claude')
+    expect(mock.newSessionCalls[0].cmd).not.toMatch(/setup-token/)
+    cleanScratchDir(result.scratchDir)
+  })
+
+  it('dispatches the pre-paste picker choreography (theme + login-method Enter) via sendKey before the URL', async () => {
+    // Pane walks: theme picker → login-method picker → URL. Each fires one
+    // Enter via sendKey (bare key, never the literal-code `send`).
+    const mock = makeMockTmuxOps({
+      captureResponses: [
+        'Choose the text style that looks best with your terminal',
+        'Select login method:\n  1. Claude account with subscription',
+        BROAD_URL,
+      ],
+    })
+    const result = await startAccountAuthSession('picker@example.com', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 5_000,
+    })
+    // Two pre-paste Enters dispatched via sendKey, both bare "Enter".
+    expect(mock.sendKeyCalls.map((c) => c.key)).toEqual(['Enter', 'Enter'])
+    // The literal-code `send` (which would echo a secret) is NOT used pre-paste.
+    expect(mock.sendCalls).toHaveLength(0)
+    expect(result.loginUrl).toMatch(/^https:\/\/claude\.com\/cai\/oauth\/authorize\?/)
+    cleanScratchDir(result.scratchDir)
+  })
+
+  it('surfaces both URL shapes the picker can render (claude.ai/ and claude.com/cai/)', async () => {
+    for (const url of [
+      'https://claude.ai/oauth/authorize?client_id=x&code=true&scope=user%3Aprofile',
+      BROAD_URL,
+    ]) {
+      const mock = makeMockTmuxOps({ captureResponses: [`\x1b[0m${url}\nPaste code here:\n`] })
+      const result = await startAccountAuthSession('urlshape', {
+        home: workspace,
+        tmuxOps: mock,
+        urlTimeoutMs: 3_000,
+      })
+      expect(result.loginUrl).toContain('/oauth/authorize?')
+      expect(result.loginUrl).not.toMatch(/\s/) // line-wrap collapsed
+      cleanScratchDir(result.scratchDir)
+    }
+  })
+
+  it('setup-token mode is still available and uses `claude setup-token` with no picker dispatch', async () => {
+    const url =
+      'https://claude.com/cai/oauth/authorize?code=true&client_id=y&response_type=code&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-z'
+    const mock = makeMockTmuxOps({ captureResponses: [url] })
+    const result = await startAccountAuthSession('narrow@example.com', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 3_000,
+      mode: 'setup-token',
+    })
+    expect(result.mode).toBe('setup-token')
+    expect(mock.newSessionCalls[0].cmd).toBe('claude setup-token')
+    expect(mock.sendKeyCalls).toHaveLength(0) // no picker choreography
+    cleanScratchDir(result.scratchDir)
+  })
+})
+
+describe('submitAccountAuthCode — via-claude broad-scope + blind post-paste Enter (PR B)', () => {
+  function makeFlow(scratchDir: string, mode: 'via-claude' | 'setup-token'): PendingAuthAddFlow {
+    return {
+      label: 'broad@example.com',
+      scratchDir,
+      tmuxSocket: 'switchroom-test',
+      tmuxSession: 'auth-add-broad-abc123',
+      startedAt: Date.now(),
+      mode,
+    }
+  }
+
+  it('returns the minted broad scopes (user:profile present) and NEVER captures after the code', async () => {
+    const scratchDir = mkdtempSync(join(workspace, 'broad-'))
+    const credPath = join(scratchDir, '.credentials.json')
+    const broadCreds = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'sk-ant-oat01-test-' + 'e'.repeat(40),
+        refreshToken: 'sk-ant-ort01-test',
+        expiresAt: Date.now() + 8 * 3600_000,
+        scopes: [
+          'org:create_api_key',
+          'user:profile',
+          'user:inference',
+          'user:sessions:claude_code',
+          'user:mcp_servers',
+          'user:file_upload',
+        ],
+        subscriptionType: 'max',
+      },
+    })
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    let sendCalled = false
+    let captureAfterSend = false
+    mock.onSend = () => {
+      sendCalled = true
+      writeFileSync(credPath, broadCreds, 'utf8')
+    }
+    mock.onCapture = () => { if (sendCalled) captureAfterSend = true }
+
+    const creds = await submitAccountAuthCode(makeFlow(scratchDir, 'via-claude'), 'browser-code-xyz', {
+      pollIntervalMs: 20,
+      pollTimeoutMs: 3_000,
+      tmuxOps: mock,
+    })
+
+    // The actual mission outcome: user:profile made it through.
+    expect(creds.claudeAiOauth.scopes).toContain('user:profile')
+    expect(creds.claudeAiOauth.scopes).toEqual(
+      expect.arrayContaining(['org:create_api_key', 'user:profile', 'user:inference']),
+    )
+    // Invariant preserved: no capture-pane after the code paste.
+    expect(captureAfterSend).toBe(false)
+    expect(mock.captureCallCount).toBe(0)
+  })
+
+  it('dispatches BLIND Enter key-presses after the code (no capture) to clear picker screens', async () => {
+    const scratchDir = mkdtempSync(join(workspace, 'blind-'))
+    const credPath = join(scratchDir, '.credentials.json')
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    // Materialise creds only AFTER the blind Enters have had a chance to fire
+    // (mimics a picker screen Enter-gating the credentials flush).
+    let ticks = 0
+    mock.onSend = () => {
+      // schedule cred write a few polls later via the poll loop below
+      ticks = 0
+    }
+    // Use a tight blind-enter schedule so the test is fast.
+    const submitP = submitAccountAuthCode(makeFlow(scratchDir, 'via-claude'), 'code-abc', {
+      pollIntervalMs: 10,
+      pollTimeoutMs: 3_000,
+      tmuxOps: mock,
+      blindEnterDelaysMs: [15, 30],
+    })
+    // Write creds after the blind Enters would have fired.
+    const timer = setInterval(() => {
+      ticks++
+      if (ticks >= 6) {
+        writeFileSync(credPath, JSON.stringify({
+          claudeAiOauth: { accessToken: 'sk-ant-oat01-test-' + 'f'.repeat(40), scopes: ['user:profile'] },
+        }), 'utf8')
+        clearInterval(timer)
+      }
+    }, 10)
+    const creds = await submitP
+    clearInterval(timer)
+    // Blind Enters were dispatched via sendKey, and capture-pane never was.
+    expect(mock.sendKeyCalls.every((c) => c.key === 'Enter')).toBe(true)
+    expect(mock.sendKeyCalls.length).toBeGreaterThanOrEqual(1)
+    expect(mock.captureCallCount).toBe(0)
+    expect(creds.claudeAiOauth.scopes).toContain('user:profile')
+  })
+
+  it('setup-token mode dispatches NO blind Enters (session exits on its own)', async () => {
+    const scratchDir = mkdtempSync(join(workspace, 'st-'))
+    const credPath = join(scratchDir, '.credentials.json')
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    mock.onSend = () => {
+      writeFileSync(credPath, JSON.stringify({
+        claudeAiOauth: { accessToken: 'sk-ant-oat01-test-' + 'g'.repeat(40), scopes: ['user:inference'] },
+      }), 'utf8')
+    }
+    await submitAccountAuthCode(makeFlow(scratchDir, 'setup-token'), 'code', {
+      pollIntervalMs: 20,
+      pollTimeoutMs: 2_000,
+      tmuxOps: mock,
+    })
+    expect(mock.sendKeyCalls).toHaveLength(0)
+  })
 })
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
