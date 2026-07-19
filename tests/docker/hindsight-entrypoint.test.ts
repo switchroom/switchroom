@@ -446,11 +446,20 @@ describe("hindsight-entrypoint.sh (#1245)", () => {
     expect(raw).toMatch(/status='processing'/);
     // Keyed on claim AGE (lease timeout), not the ephemeral worker_id.
     expect(raw).toMatch(/claimed_at < now\(\) - make_interval\(secs => \$\{REAP_STALE_S\}\)/);
-    // Mirrors upstream recover_own_tasks(): never reset in-flight batch ops.
-    expect(raw).toMatch(/result_metadata->>'batch_id' IS NULL/);
+    // Batch-ops guard — coalesce(...)='' form. RETURNING was removed after
+    // the 2026-07-19 dual-writer recovery: the RETURNING variant aborted
+    // under concurrent activity with a spurious pk_async_operations
+    // violation and the reaper silently stopped working.
+    expect(raw).toMatch(/coalesce\(result_metadata->>'batch_id',''\) = ''/);
+    // Concrete anti-pattern: RETURNING piped into grep -c (the form that
+    // aborted under concurrent activity). A mention of RETURNING in a
+    // comment is fine — ban the pipeline shape only.
+    expect(raw).not.toMatch(/RETURNING[\s\S]{0,80}grep -c/);
     // Gated + best-effort: 0 disables, and it rides the existing loop.
     expect(raw).toMatch(/REAP_STALE_S.*-gt 0.*\|\| return 0/);
     expect(raw).toMatch(/reap_stale_processing \|\| true/);
+    // Boot-deferred single shot so recreate doesn't wait REAP_STALE_S (30m).
+    expect(raw).toMatch(/reap_stale_processing_when_ready/);
   });
 
   it("the reaper no-ops cleanly when the embedded pg descriptor is absent (host/test)", async () => {

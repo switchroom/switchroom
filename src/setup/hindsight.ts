@@ -74,6 +74,19 @@ export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
 export const HINDSIGHT_CONSUMER_NAME = "hindsight";
 
 /**
+ * Stable hindsight worker identity pinned into the container env so
+ * every recreate reclaims stranded `processing` async ops via
+ * upstream `recover_own_tasks()` (keyed on worker_id). Without this the
+ * worker falls back to the container hostname (ephemeral), and a
+ * crash-orphaned consolidation can block a bank forever. Mirrors the
+ * entrypoint-side default; docker-run must set it too so recover fires
+ * *before* the deferred reaper.
+ */
+export const HINDSIGHT_DEFAULT_WORKER_ID = "switchroom-hindsight";
+/** Named volume holding embedded pg — dual mounts = dual writers. */
+export const HINDSIGHT_DATA_VOLUME = "switchroom-hindsight-data";
+
+/**
  * Default UID for the hindsight container's broker socket. The container
  * runs as the upstream `hindsight` user; we pick a fixed UID in the
  * consumer range (>10000, not colliding with switchroom agent UIDs at
@@ -752,6 +765,35 @@ export function resolveHindsightLlm(
  *   preserved via `HINDSIGHT_API_PORT` (the only port knob the upstream
  *   config.py recognizes; the CP service has no env var override).
  */
+
+/**
+ * Build a docker `--health-cmd` that requires BOTH the hindsight /health
+ * endpoint and TCP reachability of the LiteLLM base URL. /health alone is
+ * DB-backed — a container mis-created on the bridge network still answers
+ * 200 while every retain dies with "Connection error" to 127.0.0.1:4010
+ * (2026-07-19 recovery regression). Pairing catches that class of silent
+ * outage in `docker ps` health.
+ */
+export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: string): string {
+  let host = "127.0.0.1";
+  let port = "80";
+  try {
+    const u = new URL(litellmBaseUrl.includes("://") ? litellmBaseUrl : `http://${litellmBaseUrl}`);
+    host = u.hostname || host;
+    port = u.port || (u.protocol === "https:" ? "443" : "80");
+  } catch {
+    // fall through with defaults; better a weak probe than a throw in start
+  }
+  // One-liner python (docker health-cmd is shell-eval'd; keep it single-line).
+  // Exit 0 only when BOTH /health is 200 AND the LiteLLM host:port accepts TCP.
+  return (
+    `python3 -c "import socket,urllib.request,sys;` +
+    `r=urllib.request.urlopen('http://localhost:${apiPort}/health',timeout=4);` +
+    `(r.getcode()==200) or sys.exit(1);` +
+    `s=socket.create_connection(('${host}',${Number(port)}),2);s.close()"`
+  );
+}
+
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
@@ -813,6 +855,12 @@ export function startHindsight(
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
+    // Stable worker identity (see HINDSIGHT_DEFAULT_WORKER_ID). Must be on
+    // the docker-run path — the entrypoint only fills the var with `:=` when
+    // unset, which is fine, but an explicit pin makes the intent legible in
+    // `docker inspect` and survives operators who wrap start without the
+    // entrypoint default.
+    "-e", `HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
   ];
 
   // The `claude-code` provider drives an underlying claude subprocess; pin
@@ -886,8 +934,13 @@ export function startHindsight(
     // status through the docker-socket-proxy and issues `docker restart` with
     // a sliding-window cap + backoff. python3 is always present in the image;
     // curl/wget are not.
+    // Liveness: API /health alone is necessary but NOT sufficient when the
+    // container is on host network for LiteLLM — a bridge mis-create still
+    // answers /health (DB-backed) while every retain/LLM op dies with
+    // Connection error. Pair the health endpoint with a TCP probe to the
+    // LiteLLM base URL so docker health reflects LLM reachability too.
     "--health-cmd", litellm
-      ? `python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://localhost:${apiPort}/health",timeout=4).getcode()==200 else 1)'`
+      ? buildLiteLlmAwareHealthCmd(apiPort, litellm.baseUrl)
       : HINDSIGHT_HEALTHCHECK_CMD,
     "--health-interval", "30s",
     "--health-timeout", "5s",
@@ -960,15 +1013,55 @@ export function startHindsight(
 }
 
 /**
- * Stop and remove the Hindsight Docker container.
+ * List container names that currently mount the live hindsight data volume.
+ * Dual mounts with restart=always corrupt the embedded PG checkpoint
+ * (2026-07-19 dual-writer outage: `switchroom-hindsight` +
+ * `switchroom-hindsight-old-v01833`). Used by {@link stopHindsight} and doctor.
+ *
+ * Returns [] when docker is unavailable. Names only — no IDs.
  */
-export function stopHindsight(): void {
+export function listHindsightDataVolumeMounts(
+  exec: (cmd: string, args: string[]) => string = (cmd, args) =>
+    execFileSync(cmd, args, { stdio: "pipe", encoding: "utf-8" }),
+): string[] {
   try {
-    execFileSync("docker", ["stop", "switchroom-hindsight"], { stdio: "pipe" });
-  } catch { /* container may already be stopped */ }
-  try {
-    execFileSync("docker", ["rm", "switchroom-hindsight"], { stdio: "pipe" });
-  } catch { /* container may already be removed */ }
+    // docker ps -a --filter volume=… is the garbage-collector gate. Format
+    // since docker 1.13; fall back to empty on older hosts/agents without docker.
+    const out = exec("docker", [
+      "ps", "-a",
+      "--filter", `volume=${HINDSIGHT_DATA_VOLUME}`,
+      "--format", "{{.Names}}",
+    ]);
+    return out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((n) => n.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Stop and remove the Hindsight Docker container — and any stale twin
+ * (canary holdback/`-old-*` rename) that still mounts the live data volume
+ * with restart=always. Leaving a second postmaster on the same volume is
+ * how the 2026-07-19 checkpoint corruption happened.
+ *
+ * Order: disable restart on twins → stop → rm. The live name is always
+ * removed too so `startHindsight` can recreate cleanly.
+ */
+export function stopHindsight(
+  exec: (cmd: string, args: string[]) => void = (cmd, args) => {
+    execFileSync(cmd, args, { stdio: "pipe" });
+  },
+  listMounts: () => string[] = () => listHindsightDataVolumeMounts(),
+): void {
+  const names = new Set<string>([HINDSIGHT_DEFAULT_WORKER_ID, ...listMounts()]);
+  for (const name of names) {
+    try { exec("docker", ["update", "--restart=no", name]); } catch { /* gone */ }
+    try { exec("docker", ["stop", name]); } catch { /* gone */ }
+    try { exec("docker", ["rm", "-f", name]); } catch { /* gone */ }
+  }
 }
 
 /**
@@ -1196,6 +1289,7 @@ export function generateHindsightComposeSnippet(
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     `      - HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
+    `      - HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,

@@ -11,6 +11,9 @@ import {
   classifyConsolidationBacklog,
   classifyAutohealStatus,
   classifyLlmVerification,
+  classifyHindsightDataVolumeMounts,
+  classifyHindsightNetworkMode,
+  classifyLiteLlmReachability,
   CONSOLIDATION_BACKLOG_WARN,
   CONSOLIDATION_BACKLOG_FAIL,
   type AdvertisedTool,
@@ -274,29 +277,69 @@ describe("checkHindsightContainerHealth (docker wrapper)", () => {
 
   it("classifies shm + logs + autoheal when docker is available", () => {
     const exec = (_cmd: string, args: string[]) => {
+      if (args.includes("inspect") && args.some((a) => String(a).includes("ShmSize"))) {
+        return "2147483648\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("StartedAt"))) {
+        return "2020-01-01T00:00:00Z\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("NetworkMode"))) {
+        return "host\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("Config.Env"))) {
+        return "HINDSIGHT_API_RETAIN_LLM_BASE_URL=http://127.0.0.1:4010/v1\n";
+      }
       if (args.includes("inspect")) return "2147483648\n";
-      if (args.includes("switchroom-hindsight-autoheal")) return "hindsight-autoheal event=started target=switchroom-hindsight";
+      if (args.includes("ps")) return "switchroom-hindsight\n";
+      if (_cmd === "bash") return ""; // LiteLLM /dev/tcp probe succeeds
+      if (args.includes("switchroom-hindsight-autoheal")) {
+        return "hindsight-autoheal event=started target=switchroom-hindsight";
+      }
       if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
       return "";
     };
     const results = checkHindsightContainerHealth({ exec });
-    expect(results.map((r) => r.name)).toEqual([
+    const names = results.map((r) => r.name);
+    expect(names).toEqual(expect.arrayContaining([
       "hindsight shm-size",
       "hindsight extraction",
       "hindsight autoheal",
-    ]);
+    ]));
+    expect(names).toEqual(expect.arrayContaining([
+      "hindsight data-volume exclusive",
+      "hindsight network mode",
+      "hindsight LiteLLM reachability",
+    ]));
     expect(results.every((r) => r.status === "ok")).toBe(true);
   });
 
   it("skips the autoheal line when the sidecar container isn't present", () => {
     const exec = (_cmd: string, args: string[]) => {
       if (args.includes("switchroom-hindsight-autoheal")) throw new Error("No such container");
+      if (args.includes("inspect") && args.some((a) => String(a).includes("ShmSize"))) {
+        return "2147483648\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("StartedAt"))) {
+        return "2020-01-01T00:00:00Z\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("NetworkMode"))) {
+        return "bridge\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("Config.Env"))) {
+        return "HINDSIGHT_API_LLM_PROVIDER=claude-code\n";
+      }
       if (args.includes("inspect")) return "2147483648\n";
+      if (args.includes("ps")) return "switchroom-hindsight\n";
       if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
       return "";
     };
     const results = checkHindsightContainerHealth({ exec });
-    expect(results.map((r) => r.name)).toEqual(["hindsight shm-size", "hindsight extraction"]);
+    const names = results.map((r) => r.name);
+    expect(names).not.toContain("hindsight autoheal");
+    expect(names).toEqual(expect.arrayContaining([
+      "hindsight shm-size",
+      "hindsight extraction",
+    ]));
   });
 
   it("surfaces an autoheal give-up as a FAIL line", () => {
@@ -373,5 +416,48 @@ describe("checkHindsightHealthEndpoint — async probe wrapper", () => {
     }) as unknown as typeof fetch;
     const r = await checkHindsightHealthEndpoint("http://127.0.0.1:18888/mcp/", { fetchImpl });
     expect(r.status).toBe("fail");
+  });
+});
+
+describe("hindsight dual-writer + LiteLLM silent-outage classifiers (2026-07-19)", () => {
+  it("fails when a canary twin also mounts the live data volume", () => {
+    const r = classifyHindsightDataVolumeMounts([
+      "switchroom-hindsight",
+      "switchroom-hindsight-old-v01833",
+    ]);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toMatch(/multiple containers/);
+    expect(r.fix).toBeDefined();
+  });
+
+  it("ok when only the canonical hindsight container mounts the volume", () => {
+    const r = classifyHindsightDataVolumeMounts(["switchroom-hindsight"]);
+    expect(r.status).toBe("ok");
+  });
+
+  it("fails NetworkMode=bridge when LiteLLM is configured", () => {
+    const r = classifyHindsightNetworkMode("bridge", true);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toMatch(/bridge/);
+    expect(r.fix).toMatch(/memory --restart/);
+  });
+
+  it("ok NetworkMode=host when LiteLLM is configured", () => {
+    expect(classifyHindsightNetworkMode("host", true).status).toBe("ok");
+  });
+
+  it("ok non-host network when LiteLLM is NOT configured", () => {
+    expect(classifyHindsightNetworkMode("bridge", false).status).toBe("ok");
+  });
+
+  it("fails LiteLLM reachability when TCP probe misses", () => {
+    const r = classifyLiteLlmReachability(false, "127.0.0.1:4010");
+    expect(r?.status).toBe("fail");
+    expect(r?.detail).toMatch(/127\.0\.0\.1:4010/);
+  });
+
+  it("ok when TCP probe hits; null when skipped", () => {
+    expect(classifyLiteLlmReachability(true, "127.0.0.1:4010")?.status).toBe("ok");
+    expect(classifyLiteLlmReachability(null, "x")).toBeNull();
   });
 });
