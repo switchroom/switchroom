@@ -119,6 +119,7 @@ import { routeInbound, type InboundRouterDeps } from './inbound-router.js'
 import {
   interceptStopKeyword,
   interceptInterruptMarker,
+  interceptPermissionReply,
   type InboundInterceptorDeps,
 } from './inbound-interceptors.js'
 import {
@@ -6481,7 +6482,7 @@ function logOutbound(
 const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 
 // ─── Permission handling ──────────────────────────────────────────────────
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+// PERMISSION_REPLY_RE moved to inbound-interceptors.ts (#2996 P7 PR-4).
 // `undeliverable` (#3084 follow-up): set when the card send failed against a
 // known-open Telegram flood window. While it is set the entry is HELD — the TTL
 // sweep skips it (never auto-deny an ask no human ever saw) and the reaper
@@ -15405,6 +15406,10 @@ const inboundInterceptorDeps: InboundInterceptorDeps = {
   loadAccess,
   toolFlightTracker,
   cancelInterruptedObligation,
+  dispatchPermissionVerdict,
+  resumeReactionAfterVerdict,
+  pendingPermissions,
+  postPermissionResumeMessage,
 }
 
 export async function handleInbound(
@@ -15676,28 +15681,11 @@ export async function handleInbound(
     }
   }
 
-  // Permission-reply intercept
-  const permMatch = PERMISSION_REPLY_RE.exec(text)
-  if (permMatch) {
-    // Forward permission reply to connected bridge
-    const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
-    const request_id = permMatch[2]!.toLowerCase()
-    dispatchPermissionVerdict({
-      type: 'permission',
-      requestId: request_id,
-      behavior,
-    })
-    resumeReactionAfterVerdict()
-    const ftDetails = pendingPermissions.get(request_id)
-    postPermissionResumeMessage({
-      behavior,
-      action: ftDetails ? naturalAction(ftDetails.tool_name, ftDetails.input_preview) : '',
-    })
-    if (msgId != null) {
-      const emoji = behavior === 'allow' ? '✅' : '❌'
-      void sendReaction(chat_id, msgId, emoji as ReactionTypeEmoji['emoji']).catch(() => {})
-    }
-    return
+  // Permission-reply intercept (moved to interceptPermissionReply, #2996 P7
+  // PR-4; PERMISSION_REPLY_RE lives in inbound-interceptors.ts now).
+  {
+    const permOutcome = interceptPermissionReply({ text, chat_id, msgId }, inboundInterceptorDeps)
+    if (permOutcome.handled) return
   }
 
   // `/auth add` paste-back intercept — sibling to pendingReauthFlows.

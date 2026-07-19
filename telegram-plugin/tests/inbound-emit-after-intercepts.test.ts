@@ -50,7 +50,9 @@ describe('gateway: inbound machine-emit is deferred past the intercepts', () => 
     const emitIdx = inboundEmitOffset()
     // The permission-reply intercept is one of the early-return paths that
     // must NOT drive the machine into a turn.
-    const permIdx = GATEWAY_SRC.indexOf('const permMatch = PERMISSION_REPLY_RE.exec(text)')
+    // P7 PR-4: the intercept body moved to inbound-interceptors.ts; the
+    // gateway call site is the ordering anchor now.
+    const permIdx = GATEWAY_SRC.indexOf('interceptPermissionReply({ text, chat_id, msgId }')
     expect(permIdx).toBeGreaterThan(0)
     expect(emitIdx).toBeGreaterThan(permIdx)
   })
