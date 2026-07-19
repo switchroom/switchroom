@@ -35,7 +35,10 @@
   `claude-*` ids, and the first LIVE assistant line after an apply-boot is
   verified against the requested token — a mismatch logs `gw /model
   served-model DIVERGENCE` and warns the initiating chat, naming both
-  candidate causes (invalid id or transient unavailability). Verification
+  candidate causes (invalid id or transient unavailability). The override is
+  KEPT on divergence (M2): a transient substitution self-corrects and /status
+  freshness already surfaces the served model, so the card only advises
+  re-issuing `/model <valid id>` (or `/model default`) if it persists. Verification
   arms only at the boot-rehydration site and skips first-attach replay lines
   from the pre-relaunch session, so a valid mid-turn switch can never be
   false-accused. The
