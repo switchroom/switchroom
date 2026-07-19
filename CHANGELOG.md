@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Bundled Claude Code CLI bumped 2.1.205 → 2.1.215** (#3405) —
+  `CLAUDE_CODE_VERSION` in `docker/Dockerfile.base` and
+  `docker/Dockerfile.hindsight` (lockstep per #1978). Pulls in upstream
+  security hardening from 2.1.214 (bash permission bypass fixes, docker
+  daemon-redirect prompts), the scheduled-task untrusted-input fix,
+  gateway prompt caching, and MCP auto-backgrounding.
+
 ## v0.19.0 — Re-architected inbound routing and turn-lifecycle paths are now ON by default
 
 The two gateway-decomposition kill switches that shipped default-OFF in
