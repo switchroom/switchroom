@@ -53,6 +53,12 @@ process.env.SWITCHROOM_SERIALIZE_NOREPLY_DRAIN_MS = '2500'
 // which the child_process mock intercepts (case 8). A docker path would
 // `process.kill(1, 'SIGTERM')` — never do that in a test runner.
 delete process.env.SWITCHROOM_RUNTIME
+// This harness pins the LEGACY turn-END funnel arm. Now that
+// SWITCHROOM_TURN_END_FUNNEL_V2 defaults ON (`!== '0'`), pin it to '0' here so
+// a standalone run exercises the legacy path. Use `??=` so the PR-E v2 wrapper
+// (turn-lifecycle-characterization-v2.test.ts sets `='1'` then re-imports THIS
+// file) is NOT clobbered — only a standalone run defaults to '0'.
+process.env.SWITCHROOM_TURN_END_FUNNEL_V2 ??= '0'
 
 // ─── Deps-boundary spies ────────────────────────────────────────────────
 // The turnEnd shadow-event SEQUENCE oracle (L1). Each entry mirrors the exact

@@ -4816,7 +4816,7 @@ export type TurnEndDeps = ReturnType<typeof gatewayTurnEndDeps>
 // paths verbatim. =1 routes every wrapper (and the two ghost-clear callsites)
 // through the single `endTurn` dispatcher — same code, one auditable entry
 // point. Module-load const: flipping requires an agent restart (P7 F2).
-const TURN_END_FUNNEL_V2 = process.env.SWITCHROOM_TURN_END_FUNNEL_V2 === '1'  // default OFF during bake
+const TURN_END_FUNNEL_V2 = process.env.SWITCHROOM_TURN_END_FUNNEL_V2 !== '0'  // default ON (canary-validated v0.18.33); escape hatch =0
 
 let _turnEndFunnel: ReturnType<typeof createTurnEndFunnel> | undefined
 function turnEndFunnel(): ReturnType<typeof createTurnEndFunnel> {
