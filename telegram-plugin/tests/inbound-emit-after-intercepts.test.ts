@@ -28,6 +28,10 @@ import { dirname, resolve } from 'node:path'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const GATEWAY_SRC = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf8')
+// P8 PR-D: the isSteering classification body moved verbatim to
+// turn-start-surfaces.ts; the gateway call site (armTurnStartSurfaces) is the
+// ordering anchor now.
+const TURN_START_SRC = readFileSync(resolve(__dirname, '..', 'gateway', 'turn-start-surfaces.ts'), 'utf8')
 
 /** Byte offset of the sole `shadowEmit({ kind: 'inbound' ... })` call. */
 function inboundEmitOffset(): number {
@@ -68,7 +72,10 @@ describe('gateway: inbound machine-emit is deferred past the intercepts', () => 
 
   it('emits AFTER isSteering is classified, and passes the real value (not a hardcoded false)', () => {
     const emitIdx = inboundEmitOffset()
-    const steerIdx = GATEWAY_SRC.indexOf('isSteering = priorTurnInFlight && isSteerPrefix')
+    // P8 PR-D: classification lives in turn-start-surfaces.ts; the gateway
+    // ordering anchor is the armTurnStartSurfaces call that computes it.
+    expect(TURN_START_SRC).toContain('isSteering = priorTurnInFlight && isSteerPrefix')
+    const steerIdx = GATEWAY_SRC.indexOf('turnStartSurfaces().armTurnStartSurfaces({')
     expect(steerIdx).toBeGreaterThan(0)
     expect(emitIdx).toBeGreaterThan(steerIdx)
     // The emit's msg object must forward the live `isSteering` binding, so a
