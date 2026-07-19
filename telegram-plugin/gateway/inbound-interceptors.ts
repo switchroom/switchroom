@@ -15,10 +15,13 @@
  * (tests/inbound-router-characterization.test.ts) is the parity oracle.
  */
 
+import type { Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { parseStopKeyword, buildStopReply } from './stop-command.js'
 import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-defer.js'
 import { naturalAction } from '../permission-title.js'
+import type { PendingAuthAddFlow } from './auth-add-flow.js'
+import type { AddAccountCredentials } from '../../src/auth/broker/client.js'
 import type { parseInterruptMarker } from '../interrupt-marker.js'
 import type { RetryCallOpts } from '../retry-api-call.js'
 import type { AttachmentMeta } from './gateway.js'
@@ -75,6 +78,26 @@ export interface InboundInterceptorDeps {
     get: (requestId: string) => { tool_name: string; input_preview: string } | undefined
   }
   postPermissionResumeMessage: (opts: { behavior: 'allow' | 'deny'; action: string }) => void
+  // --- auth-add paste-back (P7 PR-5) collaborators ---
+  pendingAuthAddFlows: {
+    get: (key: string) => PendingAuthAddFlow | undefined
+    delete: (key: string) => boolean
+  }
+  looksLikeAuthCode: (text: string) => boolean
+  /** REAUTH_INTERCEPT_TTL_MS — a fixed constant, safe to cross as a value. */
+  reauthInterceptTtlMs: number
+  submitAccountAuthCode: (flow: PendingAuthAddFlow, code: string) => Promise<AddAccountCredentials>
+  addAccountViaBroker: (
+    label: string,
+    credentials: AddAccountCredentials,
+    opts: { replace?: boolean },
+  ) => Promise<unknown>
+  cleanAuthAddScratchDir: (scratchDir: string) => void
+  cancelAccountAuthSession: (flow: PendingAuthAddFlow) => void
+  switchroomReply: (ctx: Context, text: string, options?: { html?: boolean }) => Promise<unknown>
+  escapeHtmlForTg: (text: string) => string
+  /** Closure over redactAuthCodeMessage + the gateway's redactAuthCodeApi (#488). */
+  redactAuthCode: (chatId: string, msgId: number | null) => void
 }
 
 /**
@@ -311,4 +334,83 @@ export function interceptPermissionReply(
     void deps.sendReaction(p.chat_id, p.msgId, emoji as ReactionTypeEmoji['emoji']).catch(() => {})
   }
   return { handled: true }
+}
+
+/** Per-message facts for the auth-add paste-back intercept (P7 PR-5). */
+export interface AuthAddParams {
+  ctx: Context
+  text: string
+  chat_id: string
+  msgId: number | undefined
+  /** chatKey(chat, thread) — computed once in handleInbound and shared by the
+   * auth-add / loopback / reauth / vault intercepts (cross-topic isolation). */
+  interceptKey: string
+}
+
+/**
+ * `/auth add` paste-back intercept — sibling to pendingReauthFlows. Both
+ * intercepts are deliberate so the LLM never sees the OAuth code (it doesn't
+ * need to + plaintext OAuth in chat history is bad hygiene). The add-flow
+ * intercept comes first because /auth add creates fresh credentials at the
+ * broker layer, vs /reauth which mutates an existing agent's slot — different
+ * success paths.
+ *
+ * PR3 supergroup-mode: keyed by chatKey(chat, thread) so an OAuth code pasted
+ * into topic A isn't intercepted when topic B has a separate /auth add flow
+ * pending (security: prevents cross-topic credential mis-attribution).
+ *
+ * A stale (TTL-expired) pending entry is dropped but the message falls through
+ * to the later intercepts (`handled: false`), exactly as inline.
+ */
+export async function interceptAuthAdd(
+  p: AuthAddParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterceptOutcome> {
+  const pendingAdd = deps.pendingAuthAddFlows.get(p.interceptKey)
+  if (!(pendingAdd && deps.looksLikeAuthCode(p.text))) return { handled: false }
+  const elapsed = Date.now() - pendingAdd.startedAt
+  if (elapsed < deps.reauthInterceptTtlMs) {
+    deps.pendingAuthAddFlows.delete(p.interceptKey)
+    try {
+      const credentials = await deps.submitAccountAuthCode(pendingAdd, p.text.trim())
+      try {
+        await deps.addAccountViaBroker(pendingAdd.label, credentials, { replace: false })
+        // success — wipe scratch dir now that the broker owns the creds
+        deps.cleanAuthAddScratchDir(pendingAdd.scratchDir)
+        await deps.switchroomReply(
+          p.ctx,
+          `✓ Account \`${pendingAdd.label}\` added.\n` +
+            `The fleet's active account hasn't changed. Send ` +
+            `\`/auth use ${deps.escapeHtmlForTg(pendingAdd.label)}\` to switch to it.`,
+          { html: true },
+        )
+      } catch (brokerErr) {
+        // Broker rejected (e.g. label already exists). Wipe scratch
+        // either way — the credentials are useless without broker
+        // bookkeeping.
+        deps.cleanAuthAddScratchDir(pendingAdd.scratchDir)
+        await deps.switchroomReply(
+          p.ctx,
+          `**/auth add failed at broker:** ${deps.escapeHtmlForTg((brokerErr as Error)?.message ?? String(brokerErr))}`,
+          { html: true },
+        )
+      }
+    } catch (err) {
+      // submitAccountAuthCode wiped the scratch dir on its own
+      // failure paths (timeout, child exit, stdin broken).
+      await deps.switchroomReply(
+        p.ctx,
+        `**/auth add code failed:** ${deps.escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+        { html: true },
+      )
+    }
+    // Redact the OAuth code paste from chat history (#488).
+    deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+    return { handled: true }
+  }
+  // Stale — drop the pending entry but let the message fall through
+  // to other intercepts (defensively wipe scratch).
+  deps.cancelAccountAuthSession(pendingAdd)
+  deps.pendingAuthAddFlows.delete(p.interceptKey)
+  return { handled: false }
 }
