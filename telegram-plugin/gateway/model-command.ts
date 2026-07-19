@@ -293,6 +293,187 @@ export function formatModelRelaunchSuppressNotAppliedLog(input: {
   )
 }
 
+/**
+ * The single boot-time notification decision for a classified /model switch
+ * (#3427 item 2): either the ONE confirmation card (green applied/default or
+ * the ⚠️ not-applied warn), or — LOW-2 dedup — a suppress log when start.sh
+ * wrote a TAILORED `.session-model-alert` for this boot that already explains
+ * why the switch didn't apply (the alert relay is the more specific message,
+ * so the generic not-applied card would double-warn). Pure so the decision is
+ * unit-testable end-to-end (classify → notice) without booting the gateway;
+ * gateway.ts only sends `card` bodies / writes `suppress` logs.
+ */
+export type ModelSwitchBootNotice =
+  | { kind: 'card'; body: string }
+  | { kind: 'suppress'; log: string }
+
+export function resolveModelSwitchBootNotice(input: {
+  agent: string
+  confirmation: ModelSwitchConfirmation
+  hasSessionModelAlert: boolean
+}): ModelSwitchBootNotice {
+  const { agent, confirmation, hasSessionModelAlert } = input
+  if (confirmation.kind === 'not-applied' && hasSessionModelAlert) {
+    return {
+      kind: 'suppress',
+      log: formatModelRelaunchSuppressNotAppliedLog({ agent, target: confirmation.target }),
+    }
+  }
+  return { kind: 'card', body: formatModelSwitchConfirmationBody(confirmation) }
+}
+
+/**
+ * Requested-vs-served divergence gate (#3427 item 4). `--fallback-model` masks
+ * a shape-valid but UNKNOWN requested Claude id: claude silently serves the
+ * fallback while `.active-session-model` (and the boot confirmation) carry the
+ * requested token, until the first assistant transcript line reclaims /status.
+ * That window used to self-heal SILENTLY — the operator was never told their
+ * requested id was bogus. This comparator lets the session-model source flag
+ * the divergence deterministically at the FIRST possible post-launch signal
+ * (the first assistant line's `message.model`).
+ *
+ * Deliberately conservative — return true ("matches") whenever the pair is not
+ * DETERMINISTICALLY comparable, so a false accusation is impossible:
+ *   - served non-`claude-*` ids (sr-* / LiteLLM-mapped names) are skipped: the
+ *     proxy may echo an alias, a mapped id, or the raw route name;
+ *   - a requested alias (opus/sonnet/haiku/fable) family-matches its resolved
+ *     full id (`sonnet` ≡ `claude-sonnet-5-…`) via modelFamilyToken;
+ *   - a requested full `claude-*` id must be served exactly, or as a
+ *     date-stamped descendant (`claude-sonnet-5` ≡ `claude-sonnet-5-20260203`);
+ *   - anything else (sr-* requests, legacy friendly labels like "Opus 4.8")
+ *     is not comparable → true.
+ */
+export function servedModelMatchesRequested(requested: string, served: string): boolean {
+  const req = requested.trim().toLowerCase()
+  const srv = served.trim().toLowerCase()
+  if (!srv.startsWith('claude-')) return true
+  if ((MODEL_ALIASES as readonly string[]).includes(req)) {
+    if (req === 'default') return true
+    if (modelFamilyToken(srv) === req) return true
+    // L3 (#3437 review): legacy id shapes put the family AFTER the version
+    // (`claude-3-opus-20240229` → first segment "3", not "opus"). Accept any
+    // dash-segment equal to the alias — widens toward "match" only, so it can
+    // suppress a real accusation in weird shapes but never create a false one.
+    return srv.slice('claude-'.length).split('-').includes(req)
+  }
+  if (req.startsWith('claude-')) {
+    return srv === req || srv.startsWith(req + '-')
+  }
+  return true
+}
+
+/**
+ * Greppable stderr line for a requested-vs-served divergence (#3427 item 4).
+ * Names BOTH candidate causes (M2): `--fallback-model` substitutes for an
+ * invalid/unknown id AND for a transiently-unavailable one — the signal alone
+ * cannot distinguish them, so the log must not assert "invalid".
+ */
+export function formatServedModelDivergenceLog(input: {
+  agent: string
+  requested: string
+  served: string
+}): string {
+  return (
+    'telegram gateway: gw /model served-model DIVERGENCE agent=' +
+    input.agent +
+    ' requested=' +
+    input.requested +
+    ' served=' +
+    input.served +
+    ' (--fallback-model substituted: requested id invalid/unknown OR model transiently unavailable)\n'
+  )
+}
+
+/** Operator card for a requested-vs-served divergence (#3427 item 4, M2-softened). */
+export function formatServedModelDivergenceCard(input: {
+  requested: string
+  served: string
+}): string {
+  return (
+    '⚠️ The first reply was served by `' +
+    input.served +
+    '`, not the requested `' +
+    input.requested +
+    '` — claude substituted the fallback model. Either the requested id is invalid/unknown, or the model was temporarily unavailable for that call (a transient substitution self-corrects on later replies). If it persists, re-issue `/model <valid id>` or `/model default`. `/status` always shows the model actually serving calls.'
+  )
+}
+
+/** The boot marker chat that initiated a /model switch (thread-aware). */
+export interface ModelBootCardTarget {
+  chatId: string
+  threadId: number | null
+}
+
+/**
+ * Injected side-effect surface for the boot-time /model cards (#3427): the
+ * served-model divergence warn and the switch confirmation share ONE raw
+ * Markdown send closure plus a stderr log sink. Lives here (not inline in
+ * gateway.ts's boot IIFE) so gateway.ts does not inflate (#2996 ratchet).
+ */
+export interface ModelBootCardDeps {
+  agent: string
+  /** null → no initiating chat known; cards are skipped, logs still write. */
+  chat: ModelBootCardTarget | null
+  log: (line: string) => void
+  sendCard: (
+    chatId: string,
+    body: string,
+    opts: { parse_mode: 'Markdown'; message_thread_id?: number },
+  ) => Promise<unknown>
+}
+
+/** One-shot fire-and-forget card to the marker chat; send failures log, never throw. */
+function sendModelBootCard(deps: ModelBootCardDeps, chat: ModelBootCardTarget, body: string, failLabel: string): void {
+  void deps
+    .sendCard(chat.chatId, body, {
+      parse_mode: 'Markdown',
+      ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
+    })
+    .catch((err: unknown) =>
+      deps.log(`telegram gateway: ${failLabel} send failed: ${(err as Error)?.message ?? String(err)}\n`),
+    )
+}
+
+/**
+ * Build the divergence-tripwire handler gateway.ts registers at the boot
+ * rehydration site (#3427 item 4): the first LIVE assistant line serving a
+ * different model (invalid id OR transient unavailability — --fallback-model
+ * substituted) logs + warns the operator. The override is KEPT (M2): freshness
+ * rules already make /status show the served model, and a transient
+ * substitution self-corrects without destroying the switch record.
+ */
+export function buildServedModelDivergenceHandler(
+  deps: ModelBootCardDeps,
+): (d: { requested: string; served: string }) => void {
+  return (d) => {
+    deps.log(formatServedModelDivergenceLog({ agent: deps.agent, requested: d.requested, served: d.served }))
+    if (deps.chat == null) return
+    sendModelBootCard(deps, deps.chat, formatServedModelDivergenceCard(d), 'served-model divergence')
+  }
+}
+
+/**
+ * Deliver the boot-time model-switch confirmation (#3427 item 2): resolve the
+ * card-vs-suppress decision (pure — resolveModelSwitchBootNotice) and either
+ * log the suppress line or send the card. No-op when no initiating chat is
+ * known — matching the pre-extraction inline gateway.ts behavior (the
+ * suppress log only ever wrote when a marker chat existed).
+ */
+export function deliverModelSwitchBootNotice(
+  deps: ModelBootCardDeps & { confirmation: ModelSwitchConfirmation; hasSessionModelAlert: boolean },
+): void {
+  if (deps.chat == null) return
+  const notice = resolveModelSwitchBootNotice({
+    agent: deps.agent,
+    confirmation: deps.confirmation,
+    hasSessionModelAlert: deps.hasSessionModelAlert,
+  })
+  if (notice.kind === 'suppress') {
+    deps.log(notice.log)
+    return
+  }
+  sendModelBootCard(deps, deps.chat, notice.body, 'model-switch confirmation')
+}
 
 export type ParsedModelCommand =
   | { kind: 'show' }
@@ -634,6 +815,23 @@ function relaunchErrorReply(
   return { text: `❌ Could not schedule model switch: ${deps.escapeHtml(msg)}`, html: true }
 }
 
+/**
+ * Fail-fast caveat (#3427 item 4) for a free-text full `claude-*` id: the
+ * gateway cannot pre-validate an arbitrary id against the API (Claude-native
+ * constraint — no raw API probes), so if the id is bogus `--fallback-model`
+ * silently serves the fallback. Say so IMMEDIATELY in the switch ack, and
+ * point at the first-reply tripwire that will catch it. Aliases and sr-* ids
+ * are vouched by their own gates (MODEL_ALIASES / the LiteLLM route probe),
+ * so only typed `claude-*` ids carry the caveat. Exported for tests.
+ */
+export function unvalidatedIdCaveat(
+  deps: Pick<ModelCommandDeps, 'escapeHtml'>,
+  model: string,
+): string | null {
+  if (!model.trim().toLowerCase().startsWith('claude-')) return null
+  return `_\`${deps.escapeHtml(model)}\` can't be validated before launch — if it isn't a real Claude model id, claude will silently serve the configured fallback model instead. I check the first reply and will warn if that happens._`
+}
+
 /** Schedule a carrier relaunch onto `model`, returning the deterministic ack. */
 async function scheduleRelaunchReply(
   deps: ModelCommandDeps,
@@ -645,7 +843,11 @@ async function scheduleRelaunchReply(
   } catch (err) {
     return relaunchErrorReply(deps, model, err)
   }
-  return { text: [switchingLine(deps, model), PERSIST_NOTE].join('\n'), html: true }
+  const caveat = unvalidatedIdCaveat(deps, model)
+  return {
+    text: [switchingLine(deps, model), ...(caveat ? [caveat] : []), PERSIST_NOTE].join('\n'),
+    html: true,
+  }
 }
 
 /** Schedule the `/model default` clear + revert relaunch, returning its ack. */

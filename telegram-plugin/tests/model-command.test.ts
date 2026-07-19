@@ -32,6 +32,13 @@ import {
   parseModelSwitchTarget,
   modelFamilyToken,
   MODEL_ALIASES,
+  servedModelMatchesRequested,
+  formatServedModelDivergenceLog,
+  formatServedModelDivergenceCard,
+  buildServedModelDivergenceHandler,
+  deliverModelSwitchBootNotice,
+  unvalidatedIdCaveat,
+  type ModelBootCardDeps,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
 
@@ -689,5 +696,218 @@ describe("modelFamilyToken", () => {
   it("keeps sr-* routing ids verbatim (no claude- prefix)", () => {
     expect(modelFamilyToken("sr-glm-5")).toBe("sr-glm-5");
     expect(modelFamilyToken("sr-gemini-2.5-flash")).toBe("sr-gemini-2.5-flash");
+  });
+});
+
+// ── #3427 item 4: requested-vs-served divergence (fallback-model masking) ────
+
+describe("servedModelMatchesRequested", () => {
+  it("matches a requested alias against its resolved full id (family)", () => {
+    expect(servedModelMatchesRequested("sonnet", "claude-sonnet-5")).toBe(true);
+    expect(servedModelMatchesRequested("opus", "claude-opus-4-8")).toBe(true);
+    expect(servedModelMatchesRequested("fable", "claude-fable-5")).toBe(true);
+  });
+
+  it("flags a requested alias served by a DIFFERENT family (fallback substituted)", () => {
+    expect(servedModelMatchesRequested("sonnet", "claude-opus-4-8")).toBe(false);
+    expect(servedModelMatchesRequested("haiku", "claude-sonnet-5")).toBe(false);
+  });
+
+  it("matches a full id exactly and as a date-stamped descendant", () => {
+    expect(servedModelMatchesRequested("claude-sonnet-5", "claude-sonnet-5")).toBe(true);
+    expect(servedModelMatchesRequested("claude-sonnet-5", "claude-sonnet-5-20260203")).toBe(true);
+    expect(servedModelMatchesRequested("Claude-Sonnet-5", "claude-sonnet-5")).toBe(true);
+  });
+
+  it("flags an invalid/unknown full id served by the fallback — the masking case", () => {
+    // THE #3427 item-4 case: `/model claude-sonnet-9` (nonexistent) launches,
+    // --fallback-model silently serves opus. A test that wouldn't fail on the
+    // masking is not a test: this must be a MISMATCH.
+    expect(servedModelMatchesRequested("claude-sonnet-9", "claude-opus-4-8")).toBe(false);
+    // Same-family but wrong version is still a mismatch (sonnet-9 ≠ sonnet-5).
+    expect(servedModelMatchesRequested("claude-sonnet-9", "claude-sonnet-5")).toBe(false);
+  });
+
+  it("is conservative: non-claude served ids and non-comparable requests never accuse", () => {
+    // LiteLLM/sr-* served names are not deterministically comparable.
+    expect(servedModelMatchesRequested("sr-glm-5", "glm-5")).toBe(true);
+    expect(servedModelMatchesRequested("claude-sonnet-5", "sr-glm-5")).toBe(true);
+    // Legacy friendly-label overrides ("Opus 4.8") are not comparable either.
+    expect(servedModelMatchesRequested("Opus 4.8", "claude-opus-4-8")).toBe(true);
+    // The default sentinel never diverges.
+    expect(servedModelMatchesRequested("default", "claude-opus-4-8")).toBe(true);
+  });
+
+  it("L3 (#3437): legacy id shapes (family after version) never false-accuse an alias request", () => {
+    // `claude-3-opus-20240229` → modelFamilyToken yields "3", not "opus"; the
+    // segment fallback must still match the alias.
+    expect(servedModelMatchesRequested("opus", "claude-3-opus-20240229")).toBe(true);
+    expect(servedModelMatchesRequested("haiku", "claude-3-5-haiku-20241022")).toBe(true);
+    // …while a genuinely different family still fires.
+    expect(servedModelMatchesRequested("sonnet", "claude-3-opus-20240229")).toBe(false);
+  });
+});
+
+describe("served-model divergence formatters (#3427 item 4)", () => {
+  it("log line is greppable and names requested + served", () => {
+    const log = formatServedModelDivergenceLog({
+      agent: "klanker",
+      requested: "claude-sonnet-9",
+      served: "claude-opus-4-8",
+    });
+    expect(log).toContain("gw /model served-model DIVERGENCE agent=klanker");
+    expect(log).toContain("requested=claude-sonnet-9");
+    expect(log).toContain("served=claude-opus-4-8");
+    expect(log.endsWith("\n")).toBe(true);
+  });
+
+  it("card warns, names both models in backticks, and says how to recover", () => {
+    const card = formatServedModelDivergenceCard({
+      requested: "claude-sonnet-9",
+      served: "claude-opus-4-8",
+    });
+    expect(card).toContain("⚠️");
+    expect(card).toContain("`claude-opus-4-8`");
+    expect(card).toContain("`claude-sonnet-9`");
+    expect(card).toContain("/model");
+    expect(card).not.toContain("✅");
+  });
+
+  it("M2 (#3437): the card and log name BOTH causes — never a flat 'invalid' accusation", () => {
+    // --fallback-model also substitutes on transient overload/unavailability;
+    // the signal cannot distinguish that from a bogus id, so neither surface
+    // may assert invalidity as fact.
+    const card = formatServedModelDivergenceCard({
+      requested: "claude-sonnet-9",
+      served: "claude-opus-4-8",
+    });
+    expect(card).toContain("temporarily unavailable");
+    expect(card).toContain("invalid");
+    expect(card).toContain("If it persists");
+    expect(card).toContain("Either"); // hedged alternatives, not an assertion of invalidity
+    const log = formatServedModelDivergenceLog({
+      agent: "a", requested: "claude-sonnet-9", served: "claude-opus-4-8",
+    });
+    expect(log).toContain("invalid/unknown OR model transiently unavailable");
+  });
+});
+
+describe("boot /model cards — buildServedModelDivergenceHandler / deliverModelSwitchBootNotice (#2996 extraction)", () => {
+  function makeCardDeps(overrides: Partial<ModelBootCardDeps> = {}) {
+    const logs: string[] = [];
+    const sends: Array<{ chatId: string; body: string; opts: Record<string, unknown> }> = [];
+    const deps: ModelBootCardDeps = {
+      agent: "klanker",
+      chat: { chatId: "-100123", threadId: 42 },
+      log: (line) => { logs.push(line); },
+      sendCard: (chatId, body, opts) => {
+        sends.push({ chatId, body, opts });
+        return Promise.resolve();
+      },
+      ...overrides,
+    };
+    return { deps, logs, sends };
+  }
+
+  it("divergence handler logs the DIVERGENCE line and sends the card to the marker chat + thread", () => {
+    const { deps, logs, sends } = makeCardDeps();
+    buildServedModelDivergenceHandler(deps)({ requested: "claude-sonnet-9", served: "claude-opus-4-8" });
+    expect(logs.some((l) => l.includes("gw /model served-model DIVERGENCE agent=klanker"))).toBe(true);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].chatId).toBe("-100123");
+    expect(sends[0].body).toContain("`claude-opus-4-8`");
+    expect(sends[0].opts).toEqual({ parse_mode: "Markdown", message_thread_id: 42 });
+  });
+
+  it("divergence handler with NO marker chat still logs but never sends", () => {
+    const { deps, logs, sends } = makeCardDeps({ chat: null });
+    buildServedModelDivergenceHandler(deps)({ requested: "sonnet", served: "claude-opus-4-8" });
+    expect(logs.some((l) => l.includes("DIVERGENCE"))).toBe(true);
+    expect(sends).toHaveLength(0);
+  });
+
+  it("divergence card send rejection is swallowed and logged — never throws", async () => {
+    const { deps, logs } = makeCardDeps({
+      sendCard: () => Promise.reject(new Error("THREAD_NOT_FOUND")),
+    });
+    expect(() =>
+      buildServedModelDivergenceHandler(deps)({ requested: "claude-sonnet-9", served: "claude-opus-4-8" }),
+    ).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(logs.some((l) => l.includes("served-model divergence send failed: THREAD_NOT_FOUND"))).toBe(true);
+  });
+
+  it("boot notice: applied confirmation sends the ✅ card (thread-aware), no suppress log", () => {
+    const { deps, logs, sends } = makeCardDeps();
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "applied", launched: "claude-opus-4-8" },
+      hasSessionModelAlert: false,
+    });
+    expect(sends).toHaveLength(1);
+    expect(sends[0].body).toContain("✅ Now running `claude-opus-4-8`");
+    expect(sends[0].opts).toEqual({ parse_mode: "Markdown", message_thread_id: 42 });
+    expect(logs).toHaveLength(0);
+  });
+
+  it("boot notice: not-applied + .session-model-alert suppresses the card and writes the suppress log", () => {
+    const { deps, logs, sends } = makeCardDeps({ chat: { chatId: "-100123", threadId: null } });
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "not-applied", target: "fable", revertedTo: "claude-sonnet-5" },
+      hasSessionModelAlert: true,
+    });
+    expect(sends).toHaveLength(0);
+    expect(logs.some((l) => l.includes("suppressing not-applied confirmation") && l.includes("target=fable"))).toBe(true);
+  });
+
+  it("boot notice: no marker chat is a full no-op (matches pre-extraction inline behavior)", () => {
+    const { deps, logs, sends } = makeCardDeps({ chat: null });
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "not-applied", target: "fable", revertedTo: "claude-sonnet-5" },
+      hasSessionModelAlert: true,
+    });
+    expect(sends).toHaveLength(0);
+    expect(logs).toHaveLength(0);
+  });
+
+  it("boot notice: threadId null omits message_thread_id from send opts", () => {
+    const { deps, sends } = makeCardDeps({ chat: { chatId: "777", threadId: null } });
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "default", launched: "claude-sonnet-5" },
+      hasSessionModelAlert: false,
+    });
+    expect(sends).toHaveLength(1);
+    expect(sends[0].chatId).toBe("777");
+    expect(sends[0].opts).toEqual({ parse_mode: "Markdown" });
+  });
+});
+
+describe("unvalidatedIdCaveat — immediate fail-fast warn on free-text claude-* ids (#3427 item 4)", () => {
+  const esc = { escapeHtml: (s: string) => s };
+
+  it("warns for a full claude-* id (cannot be pre-validated)", () => {
+    const caveat = unvalidatedIdCaveat(esc, "claude-sonnet-9");
+    expect(caveat).not.toBeNull();
+    expect(caveat).toContain("claude-sonnet-9");
+    expect(caveat).toContain("fallback");
+  });
+
+  it("stays silent for aliases, sr-* ids and the default sentinel", () => {
+    expect(unvalidatedIdCaveat(esc, "opus")).toBeNull();
+    expect(unvalidatedIdCaveat(esc, "sonnet")).toBeNull();
+    expect(unvalidatedIdCaveat(esc, "sr-glm-5")).toBeNull();
+    expect(unvalidatedIdCaveat(esc, "default")).toBeNull();
+  });
+
+  it("the /model set ACK carries the caveat for a typed full id — and not for an alias", async () => {
+    const { deps } = makeDeps();
+    const full = await handleModelCommand({ kind: "set", model: "claude-sonnet-9" }, deps);
+    expect(full.text).toContain("can't be validated before launch");
+    expect(full.text).toContain("fallback");
+    const alias = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(alias.text).not.toContain("can't be validated before launch");
   });
 });

@@ -24,6 +24,7 @@ import { resolveStatePath, LEGACY_STATE_DIR } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import { readQuarantineMarkerForAgent } from "../agents/quarantine.js";
+import { reconcileAgent } from "../agents/scaffold.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
@@ -56,6 +57,7 @@ import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
 import { runTimezoneChecks } from "./doctor-timezone.js";
+import { fixSessionModelCarrierDrift } from "./doctor-fix-session-model.js";
 
 /**
  * Result of a single doctor check.
@@ -1846,7 +1848,7 @@ export function checkStartShSessionModelCarrier(
       name: label,
       status: "warn",
       detail: `${startShPath} not found`,
-      fix: `Run \`switchroom apply\` to scaffold start.sh (rev5 \`.session-model\` carrier).`,
+      fix: `Run \`switchroom doctor --fix\` (or \`switchroom apply\`) to scaffold start.sh (rev5 \`.session-model\` carrier).`,
     };
   }
   let content: string;
@@ -1886,7 +1888,7 @@ export function checkStartShSessionModelCarrier(
       detail:
         "start.sh tests `.session-model` but lacks rev5 JSON apply (`configuredDefaultAtWrite` / boot-attempts) — /model switches may not stick",
       fix:
-        "Run `switchroom apply` to regenerate start.sh from profiles/_base/start.sh.hbs (rev5 carrier). Takes effect on the next agent restart (no need to bounce until release).",
+        "Run `switchroom doctor --fix` (or `switchroom apply`) to regenerate start.sh from profiles/_base/start.sh.hbs (rev5 carrier). Takes effect on the next agent restart (no need to bounce until release).",
     };
   }
   const legacyOnly =
@@ -1898,7 +1900,7 @@ export function checkStartShSessionModelCarrier(
       ? "start.sh only reads legacy `.session-model-override`; gateway writes rev5 `.session-model` — Telegram /model relaunches boot the yaml pin (silent miss)"
       : "start.sh missing rev5 `.session-model` carrier file test — Telegram /model cannot apply session overrides across relaunch",
     fix:
-      "Run `switchroom apply` to regenerate start.sh from the latest template (rev5 `.session-model` carrier). The rewrite is on disk immediately; session switches apply on the next agent restart/release bounce.",
+      "Run `switchroom doctor --fix` (or `switchroom apply`) to regenerate start.sh from the latest template (rev5 `.session-model` carrier). The rewrite is on disk immediately; session switches apply on the next agent restart/release bounce.",
   };
 }
 
@@ -3005,8 +3007,12 @@ export function registerDoctorCommand(program: Command): void {
       "--fast",
       "Skip in-agent (hostd) liveness probes — offline/quick; the host-unverifiable rows stay `skip`",
     )
+    .option(
+      "--fix",
+      "Auto-remediate rev5 /model `.session-model` carrier drift by running the FULL per-agent reconcile for each drifted agent (start.sh + all switchroom-managed files, same as `switchroom apply` for that agent; staged switchroom.yaml edits land too — files rewritten are listed in the result row). Takes effect on the agent's next restart",
+    )
     .action(
-      withConfigError(async (opts: { json?: boolean; skill?: string; fast?: boolean }) => {
+      withConfigError(async (opts: { json?: boolean; skill?: string; fast?: boolean; fix?: boolean }) => {
         // Pre-config-load short-circuit: if no switchroom.yaml exists yet
         // (e.g. fresh install before `switchroom setup`), running doctor
         // should still be useful — that's exactly when an operator wants
@@ -3117,7 +3123,40 @@ export function registerDoctorCommand(program: Command): void {
           }
         };
 
+        // --fix (#3427): heal rev5 /model carrier drift BEFORE the standard
+        // sections run, so the Agents section below reports the POST-fix
+        // state. Each row is the outcome of a re-run check after the write
+        // (fixSessionModelCarrierDrift), never an assumed success. Healthy
+        // agents are not touched (idempotent — see doctor-fix-session-model.ts).
+        const fixSections: Array<{ title: string; results: CheckResult[] }> = opts.fix
+          ? [
+              {
+                title: "Auto-remediation (--fix)",
+                results: fixSessionModelCarrierDrift(config, {
+                  check: checkStartShSessionModelCarrier,
+                  reconcile: (name) => {
+                    const agentConfig = config.agents?.[name];
+                    if (!agentConfig) throw new Error(`agent ${name} not in config`);
+                    const result = reconcileAgent(
+                      name,
+                      agentConfig,
+                      resolveAgentsDir(config),
+                      config.telegram,
+                      config,
+                      configPath,
+                      { preserveClaudeMd: true },
+                    );
+                    // M1: pass the FULL change list through so the fix row
+                    // discloses every managed file the reconcile rewrote.
+                    return { changes: result.changes };
+                  },
+                }),
+              },
+            ]
+          : [];
+
         const sections: Array<{ title: string; results: CheckResult[] }> = [
+          ...fixSections,
           { title: "Dependencies", results: checkDependencies() },
           { title: "Skills Prerequisites", results: checkSkillsPrerequisites() },
           { title: "Manifest Drift", results: await checkManifestDrift() },
