@@ -641,8 +641,11 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
   });
 
   afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
+    // Guard both: a beforeEach that throws mid-way leaves one (or both)
+    // unassigned, and an unguarded rmSync(undefined) would mask the real
+    // failure with a TypeError in afterEach.
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    if (fakeBin) rmSync(fakeBin, { recursive: true, force: true });
   });
 
   // THE regression test the fable launch bug was missing: yaml edited to

@@ -23928,16 +23928,20 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // real post-boot signal (`.active-session-model`), never from a
                 // scraped pane or an optimistic record.
                 const isApplyBoot = launched.length > 0 && launched !== configured
-                sessionModelSource.setOverride(isApplyBoot ? launched : null)
-                // #3427 item 4: arm the requested-vs-served tripwire — if the
-                // FIRST assistant line after this apply-boot serves a different
-                // model (invalid requested id, --fallback-model substituted),
-                // log, drop the bogus override, warn the operator (no silent heal).
+                // { verify: true } (#3427 item 4 / H1): ONLY this site arms the
+                // requested-vs-served tripwire — `launched` IS the token of the
+                // session now serving. Command-time setOverride never arms.
+                sessionModelSource.setOverride(isApplyBoot ? launched : null, { verify: true })
+                // Tripwire handler: the first LIVE assistant line serving a
+                // different model (invalid id OR transient unavailability —
+                // --fallback-model substituted) logs + warns the operator. The
+                // override is KEPT (M2): freshness rules already make /status
+                // show the served model, and a transient substitution
+                // self-corrects without us destroying the switch record.
                 if (isApplyBoot) {
                   const dChat = modelSwitchMarkerChat
                   sessionModelSource.setDivergenceHandler((d) => {
                     process.stderr.write(formatServedModelDivergenceLog({ agent: getMyAgentName(), ...d }))
-                    sessionModelSource.setOverride(null)
                     if (!dChat) return
                     // allow-raw-bot-api: one-shot divergence warn, same shape as the switch confirmation below
                     void lockedBot.api

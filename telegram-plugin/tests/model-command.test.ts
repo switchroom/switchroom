@@ -734,6 +734,15 @@ describe("servedModelMatchesRequested", () => {
     // The default sentinel never diverges.
     expect(servedModelMatchesRequested("default", "claude-opus-4-8")).toBe(true);
   });
+
+  it("L3 (#3437): legacy id shapes (family after version) never false-accuse an alias request", () => {
+    // `claude-3-opus-20240229` → modelFamilyToken yields "3", not "opus"; the
+    // segment fallback must still match the alias.
+    expect(servedModelMatchesRequested("opus", "claude-3-opus-20240229")).toBe(true);
+    expect(servedModelMatchesRequested("haiku", "claude-3-5-haiku-20241022")).toBe(true);
+    // …while a genuinely different family still fires.
+    expect(servedModelMatchesRequested("sonnet", "claude-3-opus-20240229")).toBe(false);
+  });
 });
 
 describe("served-model divergence formatters (#3427 item 4)", () => {
@@ -759,6 +768,24 @@ describe("served-model divergence formatters (#3427 item 4)", () => {
     expect(card).toContain("`claude-sonnet-9`");
     expect(card).toContain("/model");
     expect(card).not.toContain("✅");
+  });
+
+  it("M2 (#3437): the card and log name BOTH causes — never a flat 'invalid' accusation", () => {
+    // --fallback-model also substitutes on transient overload/unavailability;
+    // the signal cannot distinguish that from a bogus id, so neither surface
+    // may assert invalidity as fact.
+    const card = formatServedModelDivergenceCard({
+      requested: "claude-sonnet-9",
+      served: "claude-opus-4-8",
+    });
+    expect(card).toContain("temporarily unavailable");
+    expect(card).toContain("invalid");
+    expect(card).toContain("If it persists");
+    expect(card).toContain("Either"); // hedged alternatives, not an assertion of invalidity
+    const log = formatServedModelDivergenceLog({
+      agent: "a", requested: "claude-sonnet-9", served: "claude-opus-4-8",
+    });
+    expect(log).toContain("invalid/unknown OR model transiently unavailable");
   });
 });
 

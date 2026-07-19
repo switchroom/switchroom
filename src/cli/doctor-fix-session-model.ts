@@ -53,11 +53,34 @@ export interface SessionModelCarrierFixDeps {
   /** The #3424 tripwire — checkStartShSessionModelCarrier from doctor.ts. */
   check: (agentName: string, startShPath: string) => FixCheckResult;
   /**
-   * Regenerate the agent's switchroom-managed files (start.sh included) from
-   * the current templates — reconcileAgent(name, …, { preserveClaudeMd: true }).
-   * Throws on failure.
+   * Regenerate the agent's switchroom-managed files from the current
+   * templates — reconcileAgent(name, …, { preserveClaudeMd: true }). NB this
+   * is the FULL per-agent reconcile (start.sh, .mcp.json, settings.json,
+   * plugins, skills — everything `switchroom apply` manages for that agent
+   * except CLAUDE.md), not a start.sh-only rewrite; the returned `changes`
+   * (every file the reconcile actually rewrote) are disclosed verbatim in
+   * the result row so an operator with staged switchroom.yaml edits sees
+   * exactly what was applied (#3437 review M1). Throws on failure.
    */
-  reconcile: (agentName: string) => void;
+  reconcile: (agentName: string) => { changes: string[] };
+}
+
+
+/**
+ * Honest disclosure of what the heal's FULL reconcile actually rewrote
+ * (#3437 review M1): the fix regenerates every switchroom-managed file for
+ * the agent, not just start.sh, and any staged switchroom.yaml edits land
+ * with it — so the row must name the files, not claim a start.sh-only write.
+ */
+function describeReconcileChanges(changes: string[]): string {
+  if (changes.length === 0) return "Reconcile rewrote no other files.";
+  const MAX_LISTED = 6;
+  const listed = changes.slice(0, MAX_LISTED).join(", ");
+  const more = changes.length > MAX_LISTED ? ` (+${changes.length - MAX_LISTED} more)` : "";
+  return (
+    `Full per-agent reconcile applied — rewrote ${changes.length} managed file(s): ` +
+    listed + more
+  );
 }
 
 /**
@@ -94,8 +117,9 @@ export function fixSessionModelCarrierDrift(
 
     // fail (drifted / legacy-only) or warn (start.sh missing): regenerate via
     // the reconcile path, then RE-CHECK — the heal claim is the re-run check.
+    let reconcileChanges: string[];
     try {
-      deps.reconcile(name);
+      reconcileChanges = deps.reconcile(name).changes;
     } catch (err) {
       results.push({
         name: label,
@@ -112,7 +136,8 @@ export function fixSessionModelCarrierDrift(
         name: label,
         status: "ok",
         detail:
-          "healed: start.sh regenerated with the rev5 `.session-model` carrier — takes effect on the agent's next restart",
+          "healed: start.sh regenerated with the rev5 `.session-model` carrier — takes effect on the agent's next restart. " +
+          describeReconcileChanges(reconcileChanges),
       });
     } else {
       results.push({

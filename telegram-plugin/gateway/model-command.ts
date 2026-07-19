@@ -349,7 +349,12 @@ export function servedModelMatchesRequested(requested: string, served: string): 
   if (!srv.startsWith('claude-')) return true
   if ((MODEL_ALIASES as readonly string[]).includes(req)) {
     if (req === 'default') return true
-    return modelFamilyToken(srv) === req
+    if (modelFamilyToken(srv) === req) return true
+    // L3 (#3437 review): legacy id shapes put the family AFTER the version
+    // (`claude-3-opus-20240229` → first segment "3", not "opus"). Accept any
+    // dash-segment equal to the alias — widens toward "match" only, so it can
+    // suppress a real accusation in weird shapes but never create a false one.
+    return srv.slice('claude-'.length).split('-').includes(req)
   }
   if (req.startsWith('claude-')) {
     return srv === req || srv.startsWith(req + '-')
@@ -357,7 +362,12 @@ export function servedModelMatchesRequested(requested: string, served: string): 
   return true
 }
 
-/** Greppable stderr line for a requested-vs-served divergence (#3427 item 4). */
+/**
+ * Greppable stderr line for a requested-vs-served divergence (#3427 item 4).
+ * Names BOTH candidate causes (M2): `--fallback-model` substitutes for an
+ * invalid/unknown id AND for a transiently-unavailable one — the signal alone
+ * cannot distinguish them, so the log must not assert "invalid".
+ */
 export function formatServedModelDivergenceLog(input: {
   agent: string
   requested: string
@@ -370,21 +380,21 @@ export function formatServedModelDivergenceLog(input: {
     input.requested +
     ' served=' +
     input.served +
-    ' (requested id likely invalid/unknown — --fallback-model substituted)\n'
+    ' (--fallback-model substituted: requested id invalid/unknown OR model transiently unavailable)\n'
   )
 }
 
-/** Operator card for a requested-vs-served divergence (#3427 item 4). */
+/** Operator card for a requested-vs-served divergence (#3427 item 4, M2-softened). */
 export function formatServedModelDivergenceCard(input: {
   requested: string
   served: string
 }): string {
   return (
-    '⚠️ The session is serving `' +
+    '⚠️ The first reply was served by `' +
     input.served +
     '`, not the requested `' +
     input.requested +
-    '` — the requested id is likely invalid or unknown, so claude silently substituted the fallback model. Re-issue `/model <valid id>` (or `/model default`); `/status` now reflects the model actually serving calls.'
+    '` — claude substituted the fallback model. Either the requested id is invalid/unknown, or the model was temporarily unavailable for that call (a transient substitution self-corrects on later replies). If it persists, re-issue `/model <valid id>` or `/model default`. `/status` always shows the model actually serving calls.'
   )
 }
 

@@ -32,9 +32,13 @@
   (idempotent; healthy agents untouched; takes effect on the agent's next
   restart). The requested-vs-served `--fallback-model` masking window is now
   loud: the `/model` ack warns immediately for unvalidatable free-text
-  `claude-*` ids, and the first assistant line after an apply-boot is verified
-  against the requested token — a mismatch logs `gw /model served-model
-  DIVERGENCE`, drops the bogus override, and warns the initiating chat. The
+  `claude-*` ids, and the first LIVE assistant line after an apply-boot is
+  verified against the requested token — a mismatch logs `gw /model
+  served-model DIVERGENCE` and warns the initiating chat, naming both
+  candidate causes (invalid id or transient unavailability). Verification
+  arms only at the boot-rehydration site and skips first-attach replay lines
+  from the pre-relaunch session, so a valid mid-turn switch can never be
+  false-accused. The
   #3424 source-string (`toContain`) tests are converted to behavioral tests of
   the classify → log/card pipeline, and the `scaffold.session-model.test.ts`
   live-resolution subset red on `main` is fixed (the fake `switchroom` CLI now

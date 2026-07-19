@@ -538,7 +538,10 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       if (turn != null) {
         turn.currentModel = ev.model
       }
-      sessionModelSource.noteTranscriptModel(ev.model)
+      // `replayed` (#3427 H2): a first-attach replay line carries the
+      // PRE-restart session's model — record it for freshness (unchanged
+      // behavior) but exclude it from divergence verification.
+      sessionModelSource.noteTranscriptModel(ev.model, { replayed: ev.replayed === true })
       return
     }
     case 'usage': {

@@ -153,7 +153,7 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     const win = GATEWAY_SRC.slice(idx - 200, idx + 3200)
     // F1: `launched !== configured` is the deterministic apply-boot signal.
     expect(win).toContain('const isApplyBoot = launched.length > 0 && launched !== configured')
-    expect(win).toContain('sessionModelSource.setOverride(isApplyBoot ? launched : null)')
+    expect(win).toContain('sessionModelSource.setOverride(isApplyBoot ? launched : null, { verify: true })')
     expect(win).toContain('resolveMainModel(raw ?? undefined)')
   })
 
@@ -311,14 +311,31 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
   it('arms the #3427 requested-vs-served tripwire on an apply-boot (comparator + handler)', () => {
     // The source is constructed with the conservative comparator…
     expect(GATEWAY_SRC).toContain('createSessionModelSource({ servedMatchesRequested: servedModelMatchesRequested })')
-    // …and the apply-boot rehydration registers the handler that logs, drops
-    // the bogus override, and warns the initiating chat.
+    // …and the apply-boot rehydration verify-ARMS the override (H1: the ONLY
+    // arming site) and registers the handler that logs + warns.
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
-    const win = GATEWAY_SRC.slice(idx, idx + 4200)
+    const win = GATEWAY_SRC.slice(idx, idx + 4500)
+    expect(win).toContain('sessionModelSource.setOverride(isApplyBoot ? launched : null, { verify: true })')
     expect(win).toContain('sessionModelSource.setDivergenceHandler((d) =>')
     expect(win).toContain('formatServedModelDivergenceLog')
-    expect(win).toContain('sessionModelSource.setOverride(null)')
     expect(win).toContain('formatServedModelDivergenceCard(d)')
+    // M2: the handler must NOT destroy the override record — a transient
+    // fallback substitution self-corrects; freshness already fixes /status.
+    const handlerStart = win.indexOf('setDivergenceHandler((d) =>')
+    const handlerWin = win.slice(handlerStart, handlerStart + 900)
+    expect(handlerWin).not.toContain('setOverride(null)')
+  })
+
+  it('H1 (#3437): the command-time relaunch record does NOT verify-arm the tripwire', () => {
+    // scheduleModelRelaunch sets the pre-restart status-honesty override with a
+    // BARE setOverride — arming it would let an OLD-model assistant line in the
+    // pre-restart window false-accuse a valid NEW token. The behavioral guard
+    // lives in session-model-source.test.ts; this pins the gateway call sites.
+    const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async (model: string, reason: string)')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 2600)
+    expect(win).toContain('sessionModelSource.setOverride(model)')
+    expect(win).not.toContain('verify')
   })
 
   it('N4/reason: the /model switch reason is captured from the clean-shutdown marker', () => {

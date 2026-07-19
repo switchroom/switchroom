@@ -100,7 +100,12 @@ export type SessionEvent =
   // same batch already reflects the current model. Sentinels (`<synthetic>` on
   // compaction lines, fixture junk) are filtered at projection — see
   // isModelSentinel — so this only ever carries a real resolved model id.
-  | { kind: 'model'; model: string }
+  // `replayed: true` marks a model observation delivered by the FIRST-ATTACH
+  // replay of a prior session's in-flight turn (computeFirstAttachCursor) —
+  // it reflects the PRE-restart session's model, not the live one. Consumers
+  // that verify the live model (#3427 divergence tripwire, H2) must skip
+  // replayed observations; freshness consumers may still record them.
+  | { kind: 'model'; model: string; replayed?: boolean }
   | { kind: 'tool_use'; toolName: string; toolUseId?: string | null; input?: Record<string, unknown>; precomputedLabel?: string }
   // Real-time tool label from the PreToolUse-hook sidecar — fires when the
   // hook writes the label (synchronous at tool-call time), independent of
@@ -1217,6 +1222,17 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
   // re-attach.
   const fileCursors = new Map<string, { cursor: number; pendingPartial: string }>()
 
+  // First-attach REPLAY window per file (#3427 H2): when attachToFile replays
+  // a prior session's in-flight turn (computeFirstAttachCursor returned an
+  // offset below the size-at-attach), every byte below that size is HISTORY
+  // written by the pre-restart session. Model observations projected from it
+  // must be marked `replayed` so the divergence tripwire ignores them.
+  // Granularity is the read CHUNK (a batch whose read started inside the
+  // window is marked wholesale) — deliberately conservative: over-marking a
+  // boundary batch can only delay verification to the next live line, never
+  // false-accuse.
+  const replayUntilByFile = new Map<string, number>()
+
   function readNew(): void {
     if (stopped || !currentFile) return
     try {
@@ -1226,9 +1242,14 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
         // stored per-file state for this path.
         cursor = 0
         pendingPartial = ''
-        if (currentFile != null) fileCursors.delete(currentFile)
+        if (currentFile != null) {
+          fileCursors.delete(currentFile)
+          replayUntilByFile.delete(currentFile)
+        }
       }
       if (stat.size === cursor) return
+      const chunkStart = cursor
+      const isReplayChunk = chunkStart < (replayUntilByFile.get(currentFile) ?? 0)
       const buf = Buffer.alloc(stat.size - cursor)
       const fd = openSync(currentFile, 'r')
       try {
@@ -1247,7 +1268,7 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
         const sid = sessionIdForFile(currentFile)
         for (const ev of events) {
           try {
-            onEvent(decorate(ev, sid))
+            onEvent(decorate(isReplayChunk && ev.kind === 'model' ? { ...ev, replayed: true } : ev, sid))
           } catch (err) {
             log?.(`session-tail: onEvent threw: ${(err as Error).message}`)
           }
@@ -1322,6 +1343,9 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
         const size = statSync(file).size
         cursor = computeFirstAttachCursor(file, size)
         if (cursor < size) {
+          // #3427 H2: everything below size-at-attach is pre-restart history;
+          // model events projected from it are marked `replayed` in readNew.
+          replayUntilByFile.set(file, size)
           log?.(`session-tail: attached to ${file} (cursor=${cursor}, replaying in-flight turn from offset; size=${size})`)
         } else {
           log?.(`session-tail: attached to ${file} (cursor=${cursor})`)

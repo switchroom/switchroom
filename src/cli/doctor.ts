@@ -3009,7 +3009,7 @@ export function registerDoctorCommand(program: Command): void {
     )
     .option(
       "--fix",
-      "Auto-remediate rev5 /model `.session-model` carrier drift: regenerate each drifted agent's start.sh from the current template (same path as `switchroom apply`; takes effect on the agent's next restart)",
+      "Auto-remediate rev5 /model `.session-model` carrier drift by running the FULL per-agent reconcile for each drifted agent (start.sh + all switchroom-managed files, same as `switchroom apply` for that agent; staged switchroom.yaml edits land too — files rewritten are listed in the result row). Takes effect on the agent's next restart",
     )
     .action(
       withConfigError(async (opts: { json?: boolean; skill?: string; fast?: boolean; fix?: boolean }) => {
@@ -3137,7 +3137,7 @@ export function registerDoctorCommand(program: Command): void {
                   reconcile: (name) => {
                     const agentConfig = config.agents?.[name];
                     if (!agentConfig) throw new Error(`agent ${name} not in config`);
-                    reconcileAgent(
+                    const result = reconcileAgent(
                       name,
                       agentConfig,
                       resolveAgentsDir(config),
@@ -3146,6 +3146,9 @@ export function registerDoctorCommand(program: Command): void {
                       configPath,
                       { preserveClaudeMd: true },
                     );
+                    // M1: pass the FULL change list through so the fix row
+                    // discloses every managed file the reconcile rewrote.
+                    return { changes: result.changes };
                   },
                 }),
               },

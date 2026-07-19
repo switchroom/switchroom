@@ -23,11 +23,25 @@
  *
  * Divergence tripwire (#3427 item 4): `--fallback-model` masks an invalid
  * requested model id — claude silently serves the fallback while the override
- * carries the requested token. The FIRST transcript observation after an
- * override is set is therefore the earliest deterministic verification point:
- * when the injected comparator says the served id does NOT satisfy the
- * requested token, the registered divergence handler fires (once per override)
- * so the gateway can log + warn instead of self-healing silently.
+ * carries the requested token. The FIRST live transcript observation of the
+ * post-relaunch session is therefore the earliest deterministic verification
+ * point: when the injected comparator says the served id does NOT satisfy the
+ * requested token, the registered divergence handler fires (once per armed
+ * override) so the gateway can log + warn instead of self-healing silently.
+ *
+ * Two false-positive guards (#3437 review H1/H2 — "a false accusation must be
+ * impossible" is the contract, enforced HERE, not by caller discipline):
+ *   - H1: verification arms ONLY on an explicit `setOverride(model,
+ *     { verify: true })` — the boot-rehydration site, where the override IS
+ *     the launched token of the session now serving. A command-time
+ *     `setOverride(model)` (the pre-restart status-honesty record in
+ *     scheduleModelRelaunch) must NOT arm: an assistant line landing in the
+ *     pre-restart window is served by the OLD model and would false-mismatch
+ *     the NEW requested token.
+ *   - H2: observations flagged `replayed: true` (the session-tail's
+ *     first-attach replay of a prior session's in-flight turn — OLD-model
+ *     lines delivered AFTER boot) neither consume nor fire verification;
+ *     the tripwire waits for the first LIVE observation.
  */
 
 export interface SessionModelResolution {
@@ -38,7 +52,7 @@ export interface SessionModelResolution {
   source: 'transcript' | 'override'
 }
 
-/** The first post-override assistant line served a different model (#3427). */
+/** The first live post-override assistant line served a different model (#3427). */
 export interface SessionModelDivergence {
   /** The override token the operator requested (`/model <token>`). */
   requested: string
@@ -58,13 +72,25 @@ export interface SessionModelSourceOptions {
 }
 
 export interface SessionModelSource {
-  /** Record a transcript observation (an assistant line's `message.model`,
-   *  already sentinel-filtered by the session-tail projection). */
-  noteTranscriptModel(model: string): void
-  /** Record an override set (a positively-confirmed /model switch), or clear
-   *  it with null. Setting stamps a fresh sequence, so the override wins over
-   *  every EARLIER transcript observation until a new assistant line lands. */
-  setOverride(model: string | null): void
+  /**
+   * Record a transcript observation (an assistant line's `message.model`,
+   * already sentinel-filtered by the session-tail projection). Pass
+   * `replayed: true` for lines delivered by the session-tail's first-attach
+   * replay (a PRIOR session's in-flight turn): they still update /status
+   * freshness exactly as before, but are excluded from divergence
+   * verification (H2 — they carry the pre-relaunch model).
+   */
+  noteTranscriptModel(model: string, opts?: { replayed?: boolean }): void
+  /**
+   * Record an override set (a positively-confirmed /model switch), or clear
+   * it with null. Setting stamps a fresh sequence, so the override wins over
+   * every EARLIER transcript observation until a new assistant line lands.
+   * `verify: true` additionally ARMS divergence verification for this
+   * override — pass it ONLY when the override is the launched token of the
+   * session currently serving (the boot-rehydration site). Default: not
+   * armed (H1 — command-time/rollback sets must never arm).
+   */
+  setOverride(model: string | null, opts?: { verify?: boolean }): void
   /** Current override value (the #2982 in-memory record), independent of
    *  freshness — for callers that need the override itself (e.g. the model
    *  menu's "session" marker), not the /status resolution. */
@@ -72,9 +98,9 @@ export interface SessionModelSource {
   /** The freshest observation across both sources, or null when neither has
    *  reported yet. */
   resolve(): SessionModelResolution | null
-  /** Register the handler fired when the FIRST transcript observation after a
-   *  set override fails the comparator (#3427 item 4). At most once per
-   *  override set; null unregisters. Replaces any prior handler. */
+  /** Register the handler fired when the first LIVE transcript observation
+   *  after an ARMED override fails the comparator (#3427 item 4). At most
+   *  once per armed override; null unregisters. Replaces any prior handler. */
   setDivergenceHandler(handler: ((d: SessionModelDivergence) => void) | null): void
 }
 
@@ -84,14 +110,16 @@ export function createSessionModelSource(
   let seq = 0
   let transcript: { model: string; seq: number } | null = null
   let override: { model: string; seq: number } | null = null
-  // True while a non-null override awaits its first transcript observation.
-  // Consumed (set false) on that observation whether or not it diverges, so
-  // the handler fires at most once per override set.
+  // True while an ARMED ({ verify: true }) non-null override awaits its first
+  // LIVE transcript observation. Consumed (set false) on that observation
+  // whether or not it diverges, so the handler fires at most once per armed
+  // override. Replayed observations neither consume nor fire (H2).
   let overrideUnverified = false
   let onDivergence: ((d: SessionModelDivergence) => void) | null = null
   return {
-    noteTranscriptModel(model: string): void {
+    noteTranscriptModel(model: string, opts?: { replayed?: boolean }): void {
       transcript = { model, seq: ++seq }
+      if (opts?.replayed === true) return // H2: pre-relaunch line — no verification
       if (override != null && overrideUnverified) {
         overrideUnverified = false
         const matches = options.servedMatchesRequested
@@ -100,9 +128,12 @@ export function createSessionModelSource(
         }
       }
     },
-    setOverride(model: string | null): void {
+    setOverride(model: string | null, opts?: { verify?: boolean }): void {
       override = model == null ? null : { model, seq: ++seq }
-      overrideUnverified = model != null
+      // H1: only an explicit verify-arm (the boot-rehydration site) starts
+      // verification; a plain set (command-time record, rollback restore)
+      // clears any pending arm — its token is NOT what is serving right now.
+      overrideUnverified = model != null && opts?.verify === true
     },
     getOverride(): string | null {
       return override?.model ?? null

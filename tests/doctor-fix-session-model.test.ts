@@ -13,8 +13,9 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from "node
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+import { Command } from "commander";
 import { scaffoldAgent, reconcileAgent } from "../src/agents/scaffold.js";
-import { checkStartShSessionModelCarrier } from "../src/cli/doctor.js";
+import { checkStartShSessionModelCarrier, registerDoctorCommand } from "../src/cli/doctor.js";
 import {
   fixSessionModelCarrierDrift,
   type SessionModelCarrierFixDeps,
@@ -76,9 +77,10 @@ describe("fixSessionModelCarrierDrift — integration (real scaffold + real reco
       check: checkStartShSessionModelCarrier,
       reconcile: (agent) => {
         reconcileCalls.push(agent);
-        reconcileAgent(agent, config.agents![agent]!, agentsDir, telegramConfig, config, undefined, {
+        const result = reconcileAgent(agent, config.agents![agent]!, agentsDir, telegramConfig, config, undefined, {
           preserveClaudeMd: true,
         });
+        return { changes: result.changes };
       },
     };
   });
@@ -98,6 +100,10 @@ describe("fixSessionModelCarrierDrift — integration (real scaffold + real reco
     expect(results[0].status).toBe("ok");
     expect(results[0].detail).toContain("healed");
     expect(results[0].detail).toContain("next restart");
+    // M1 (#3437): the row discloses the FULL reconcile scope — the actual
+    // rewritten file list (start.sh among them), not a start.sh-only claim.
+    expect(results[0].detail).toContain("Full per-agent reconcile applied");
+    expect(results[0].detail).toContain("start.sh");
     expect(reconcileCalls).toEqual([name]);
 
     // The heal claim is grounded: the file on disk now passes the tripwire
@@ -162,7 +168,7 @@ describe("fixSessionModelCarrierDrift — failure honesty (stubbed seams)", () =
         calls += 1;
         return { name: "x", status: "fail", detail: "still legacy" };
       },
-      reconcile: () => {},
+      reconcile: () => ({ changes: ["/a/start.sh"] }),
     });
     expect(calls).toBe(2); // pre + post
     expect(results[0].status).toBe("fail");
@@ -175,9 +181,24 @@ describe("fixSessionModelCarrierDrift — failure honesty (stubbed seams)", () =
       check: () => ({ name: "x", status: "skip", detail: "unreadable from host" }),
       reconcile: () => {
         reconciled = true;
+        return { changes: [] };
       },
     });
     expect(results[0].status).toBe("skip");
     expect(reconciled).toBe(false);
+  });
+});
+
+describe("doctor --fix commander wiring (L2)", () => {
+  it("registers --fix on the doctor command with the full-reconcile disclosure", () => {
+    const program = new Command();
+    registerDoctorCommand(program);
+    const doctor = program.commands.find((c) => c.name() === "doctor");
+    expect(doctor).toBeDefined();
+    const fixOpt = doctor!.options.find((o) => o.long === "--fix");
+    expect(fixOpt).toBeDefined();
+    // The help text must disclose that --fix is a FULL per-agent reconcile
+    // (M1), not a start.sh-only rewrite.
+    expect(fixOpt!.description).toContain("FULL per-agent reconcile");
   });
 });

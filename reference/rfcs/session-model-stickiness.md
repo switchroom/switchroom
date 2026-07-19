@@ -99,12 +99,18 @@ Everything else in §0.1 (session-scoped revert on the next restart, consume-onc
   #3427 item 4 the correction is LOUD, not silent: (a) the `/model` ack for a
   free-text `claude-*` full id carries an immediate caveat that the id cannot
   be pre-validated (Claude-native constraint — no raw API probe) and that the
-  fallback may substitute; (b) the session-model source verifies the FIRST
-  post-override transcript line against the requested token
+  fallback may substitute; (b) the session-model source verifies the first
+  LIVE post-boot transcript line against the requested token
   (`servedModelMatchesRequested`, conservative — never accuses a
-  non-comparable pair) and on mismatch the gateway logs
-  `gw /model served-model DIVERGENCE`, drops the bogus override, and sends a
-  one-shot ⚠️ card to the initiating chat. The honest-FAILURE surface at boot
+  non-comparable pair; verification arms ONLY at the boot-rehydration
+  `setOverride(…, { verify: true })` site, and first-attach REPLAY lines from
+  the pre-relaunch session are flagged and skipped — the #3437 H1/H2
+  false-positive guards) and on mismatch the gateway logs
+  `gw /model served-model DIVERGENCE` and sends a one-shot ⚠️ card to the
+  initiating chat naming BOTH candidate causes (invalid id, or transient
+  unavailability — `--fallback-model` substitutes for either). The override
+  record is kept: a transient substitution self-corrects on later replies,
+  and freshness rules already point /status at the served model. The honest-FAILURE surface at boot
   remains the three `.session-model-alert` modes (corrupt carrier /
   configured-default changed / proxy-only + LiteLLM-down).
 
