@@ -16,9 +16,14 @@ vi.mock("node:child_process", () => ({
 import { execFileSync } from "node:child_process";
 import {
   startHindsight,
+  stopHindsight,
   ensureHindsightConsumer,
+  buildLiteLlmAwareHealthCmd,
+  listHindsightDataVolumeMounts,
   HINDSIGHT_CONSUMER_NAME,
   HINDSIGHT_DEFAULT_UID,
+  HINDSIGHT_DEFAULT_WORKER_ID,
+  HINDSIGHT_DATA_VOLUME,
   HINDSIGHT_BROKER_SOCK_VOLUME,
   HINDSIGHT_IMAGE,
   HINDSIGHT_DEFAULT_SHM_SIZE,
@@ -748,3 +753,77 @@ describe("ensureHindsightConsumer (#1245)", () => {
     expect(HINDSIGHT_CONSUMER_NAME).toBe("hindsight");
   });
 });
+
+describe("hindsight recovery footguns (2026-07-19 dual-writer + silent LLM)", () => {
+  beforeEach(() => {
+    mockedExec.mockReset();
+    mockedExec.mockReturnValue("");
+  });
+
+  it("pins HINDSIGHT_API_WORKER_ID on both docker-run and compose emit paths", async () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const env: string[] = [];
+    const args = findRunArgs();
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-e") env.push(args[i + 1] as string);
+    }
+    expect(env).toContain(`HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`);
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    expect(generateHindsightComposeSnippet()).toContain(
+      `HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
+    );
+  });
+
+  it("pairs /health with LiteLLM TCP in litellm-mode health-cmd", () => {
+    startHindsight(
+      { apiPort: 18888, uiPort: 19999 },
+      { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test" },
+    );
+    const args = findRunArgs();
+    const i = args.indexOf("--health-cmd");
+    expect(i).toBeGreaterThan(-1);
+    const cmd = args[i + 1] as string;
+    expect(cmd).toContain("localhost:18888/health");
+    expect(cmd).toContain("create_connection(('127.0.0.1',4010)");
+    const built = buildLiteLlmAwareHealthCmd(18888, "http://10.0.0.5:9/v1");
+    expect(built).toContain("10.0.0.5");
+    expect(built).toContain(",9)");
+  });
+
+  it("stopHindsight disables restart and removes every data-volume twin, not just the live name", () => {
+    const calls: string[][] = [];
+    const exec = (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+    };
+    stopHindsight(exec, () => [
+      HINDSIGHT_DEFAULT_WORKER_ID,
+      "switchroom-hindsight-old-v01833",
+    ]);
+    const twin = "switchroom-hindsight-old-v01833";
+    const lines = calls.map((c) => c.join(" "));
+    expect(lines).toContain(`docker update --restart=no ${twin}`);
+    expect(lines).toContain(`docker stop ${twin}`);
+    expect(lines).toContain(`docker rm -f ${twin}`);
+    expect(lines).toContain(`docker update --restart=no ${HINDSIGHT_DEFAULT_WORKER_ID}`);
+    expect(lines).toContain(`docker rm -f ${HINDSIGHT_DEFAULT_WORKER_ID}`);
+  });
+
+  it("listHindsightDataVolumeMounts uses docker ps filter on the data volume", () => {
+    const exec = vi.fn((..._args: unknown[]) =>
+      ["switchroom-hindsight", "switchroom-hindsight-old-v01833"].join("\n") + "\n",
+    );
+    const names = listHindsightDataVolumeMounts(
+      exec as unknown as (cmd: string, args: string[]) => string,
+    );
+    expect(exec).toHaveBeenCalledWith("docker", [
+      "ps", "-a",
+      "--filter", `volume=${HINDSIGHT_DATA_VOLUME}`,
+      "--format", "{{.Names}}",
+    ]);
+    expect(names).toEqual([
+      "switchroom-hindsight",
+      "switchroom-hindsight-old-v01833",
+    ]);
+  });
+});
+

@@ -26,6 +26,11 @@
  */
 import { execFileSync } from "node:child_process";
 import { EXPECTED_HINDSIGHT_TOOLS } from "../memory/hindsight-tools.js";
+import {
+  HINDSIGHT_DATA_VOLUME,
+  HINDSIGHT_DEFAULT_WORKER_ID,
+  listHindsightDataVolumeMounts,
+} from "../setup/hindsight.js";
 
 export interface CheckResult {
   name: string;
@@ -342,6 +347,114 @@ export function classifyLlmVerification(logs: string): CheckResult | null {
  * logs. Returns [] (silently skipped) when hindsight isn't a local container —
  * a remote `memory.config.url`, no docker, or running inside an agent container.
  */
+
+/**
+ * Pure: classify containers mounting the live hindsight data volume.
+ * More than one mount with anything besides the canonical name is the
+ * 2026-07-19 dual-writer class (canary holdback left `restart=always` on
+ * the renamed twin → corrupt PG checkpoint).
+ */
+export function classifyHindsightDataVolumeMounts(names: string[]): CheckResult {
+  const uniq = [...new Set(names.filter(Boolean))];
+  if (uniq.length === 0) {
+    return {
+      name: "hindsight data-volume exclusive",
+      status: "ok",
+      detail: "no container currently mounts the live data volume",
+    };
+  }
+  const twins = uniq.filter((n) => n !== HINDSIGHT_DEFAULT_WORKER_ID);
+  if (uniq.length === 1 && uniq[0] === HINDSIGHT_DEFAULT_WORKER_ID) {
+    return {
+      name: "hindsight data-volume exclusive",
+      status: "ok",
+      detail: `only ${HINDSIGHT_DEFAULT_WORKER_ID} mounts ${HINDSIGHT_DATA_VOLUME}`,
+    };
+  }
+  if (twins.length > 0) {
+    return {
+      name: "hindsight data-volume exclusive",
+      status: "fail",
+      detail:
+        `multiple containers mount ${HINDSIGHT_DATA_VOLUME}: [${uniq.join(", ")}] — ` +
+        `dual postmasters corrupt the embedded PG checkpoint`,
+      fix:
+        "`switchroom memory --restart` (stopHindsight now disables restart + removes " +
+        "every volume twin), or manually `docker update --restart=no <twin> && " +
+        "docker rm -f <twin>` before starting the live container.",
+    };
+  }
+  // >1 names but all equal canonical? weird but ok-ish
+  return {
+    name: "hindsight data-volume exclusive",
+    status: "warn",
+    detail: `unexpected volume mount set: [${uniq.join(", ")}]`,
+  };
+}
+
+/**
+ * Pure: classify NetworkMode when LiteLLM routing is configured.
+ * LiteLLM publishes on the host's 127.0.0.1:4010; a bridge-networked
+ * hindsight answering /health is a silent retain outage.
+ */
+export function classifyHindsightNetworkMode(
+  networkMode: string | null | undefined,
+  litellmConfigured: boolean,
+): CheckResult {
+  if (!litellmConfigured) {
+    return {
+      name: "hindsight network mode",
+      status: "ok",
+      detail: networkMode ? `${networkMode} (LiteLLM not configured)` : "unknown (LiteLLM not configured)",
+    };
+  }
+  const mode = (networkMode ?? "").trim() || "unknown";
+  if (mode === "host") {
+    return {
+      name: "hindsight network mode",
+      status: "ok",
+      detail: "host — LiteLLM 127.0.0.1 reachable",
+    };
+  }
+  return {
+    name: "hindsight network mode",
+    status: "fail",
+    detail:
+      `NetworkMode=${mode} while LiteLLM routing is configured — retains will die with ` +
+      `"Connection error" to 127.0.0.1:4010 while /health stays green`,
+    fix:
+      "`switchroom memory --restart` so startHindsight recreates with --network host. " +
+      "Do not `docker start` a bridge/mis-networked container.",
+  };
+}
+
+/**
+ * Pure: classify a Ronnie TCP probe of the LiteLLM base URL from the host.
+ * `reachable=true` when connect succeeded; `false` when refused/timeout;
+ * `null` when the probe was skipped.
+ */
+export function classifyLiteLlmReachability(
+  reachable: boolean | null,
+  endpoint: string,
+): CheckResult | null {
+  if (reachable === null) return null;
+  if (reachable) {
+    return {
+      name: "hindsight LiteLLM reachability",
+      status: "ok",
+      detail: `TCP ok to ${endpoint}`,
+    };
+  }
+  return {
+    name: "hindsight LiteLLM reachability",
+    status: "fail",
+    detail: `cannot TCP-connect to ${endpoint} — hindsight LLM ops will fail`,
+    fix:
+      "Start/fix the LiteLLM proxy (host :4010), then `switchroom memory --restart` " +
+      "if hindsight was started while it was down.",
+  };
+}
+
 export function checkHindsightContainerHealth(
   opts?: { exec?: (cmd: string, args: string[]) => string; containerName?: string },
 ): CheckResult[] {
@@ -416,6 +529,60 @@ export function checkHindsightContainerHealth(
     results.push(classifyAutohealStatus(autohealLogs));
   } catch {
     // no autoheal sidecar (no hostd project / not deployed) — nothing to report
+  }
+
+  // Dual-writer footgun (2026-07-19): any second container mounting the live
+  // data volume. Uses the same docker filter stopHindsight relies on.
+  try {
+    const mounts = listHindsightDataVolumeMounts(exec);
+    results.push(classifyHindsightDataVolumeMounts(mounts));
+  } catch {
+    // docker unavailable mid-check — skip
+  }
+
+  // Network mode + LiteLLM reachability when hindsight is configured for it.
+  try {
+    const netMode = exec("docker", [
+      "inspect", name, "--format", "{{.HostConfig.NetworkMode}}",
+    ]).trim();
+    // Detect LiteLLM routing via the retained per-op/base URL env on the
+    // container (set by startHindsight when litellm is configured).
+    const envBlob = exec("docker", [
+      "inspect", name, "--format", "{{range .Config.Env}}{{println .}}{{end}}",
+    ]);
+    const litellmConfigured =
+      /HINDSIGHT_API_(RETAIN|REFLECT|CONSOLIDATION)_LLM_BASE_URL=/.test(envBlob) ||
+      /ANTHROPIC_BASE_URL=/.test(envBlob);
+    results.push(classifyHindsightNetworkMode(netMode, litellmConfigured));
+
+    if (litellmConfigured) {
+      // Prefer the retained base URL; default to host LiteLLM.
+      const m = envBlob.match(/HINDSIGHT_API_RETAIN_LLM_BASE_URL=(\S+)/)
+        ?? envBlob.match(/HINDSIGHT_API_REFLECT_LLM_BASE_URL=(\S+)/)
+        ?? envBlob.match(/ANTHROPIC_BASE_URL=(\S+)/);
+      let endpoint = "127.0.0.1:4010";
+      if (m) {
+        try {
+          const u = new URL(m[1].includes("://") ? m[1] : `http://${m[1]}`);
+          endpoint = `${u.hostname || "127.0.0.1"}:${u.port || "80"}`;
+        } catch { /* keep default */ }
+      }
+      const [host, portStr] = endpoint.split(":");
+      const port = Number(portStr) || 80;
+      let reachable: boolean | null = null;
+      try {
+        // bash /dev/tcp is available in this fleet's environments; keep the
+        // probe short. Nonzero exit → unreachable.
+        exec("bash", ["-c", `echo > /dev/tcp/${host}/${port}`]);
+        reachable = true;
+      } catch {
+        reachable = false;
+      }
+      const row = classifyLiteLlmReachability(reachable, endpoint);
+      if (row) results.push(row);
+    }
+  } catch {
+    // inspect failed — secondary to the shm probe's empty return above
   }
 
   return results;
