@@ -27,7 +27,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fsyncSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fchownSync, fsyncSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
 
 /**
  * Tempfile open flags — sec #1410 (follow-up to CRITICAL #1393).
@@ -60,17 +60,63 @@ const TMP_OPEN_FLAGS =
   constants.O_EXCL |
   (constants.O_NOFOLLOW ?? 0);
 
+/**
+ * Options form of `atomicWriteFileSync` — lets a caller flip file
+ * ownership on the tempfile **fd** (never a path) before the rename.
+ *
+ * `uid`/`gid`: when set, the primitive `fchownSync`s the open tempfile
+ * fd to that owner *before* `rename(2)`. Doing the chown on the fd (not
+ * the destination path) is the M1 fix (#1393 follow-up): a path-based
+ * `chownSync(dest, …)` after the write would follow a symlink an
+ * attacker raced into place at the destination and hand them a
+ * root-owned chown of an arbitrary inode. The fd already points at the
+ * O_NOFOLLOW|O_EXCL-created tempfile inode, so `fchownSync` cannot be
+ * redirected.
+ *
+ * `onChownError`: dev hosts without CAP_CHOWN return EPERM on the
+ * `fchownSync`. That must NOT abort the write (the mirror still lands,
+ * just owned by whoever the broker runs as). When provided, an
+ * `fchownSync` error is passed here and swallowed; otherwise it throws.
+ * A chmod/write/fsync/rename error is always fatal (tempfile cleaned,
+ * rethrown) regardless.
+ */
+export interface AtomicWriteOptions {
+  mode?: number;
+  uid?: number;
+  gid?: number;
+  onChownError?: (err: unknown) => void;
+}
+
 export function atomicWriteFileSync(
   destPath: string,
   contents: string | Buffer,
-  mode = 0o600,
+  modeOrOpts: number | AtomicWriteOptions = 0o600,
 ): void {
+  const opts: AtomicWriteOptions =
+    typeof modeOrOpts === "number" ? { mode: modeOrOpts } : modeOrOpts;
+  const mode = opts.mode ?? 0o600;
   const tmp = `${destPath}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   const buf = typeof contents === "string" ? Buffer.from(contents, "utf-8") : contents;
   let fd: number | null = null;
   try {
     fd = openSync(tmp, TMP_OPEN_FLAGS, mode);
     writeSync(fd, buf, 0, buf.length, 0);
+    // Pin the mode on the fd explicitly: the O_CREAT `mode` above is
+    // masked by the process umask, but the callers here write secrets
+    // and need an exact 0600 regardless of umask.
+    fchmodSync(fd, mode);
+    // fd-based ownership flip BEFORE rename — never a path-based chown
+    // (which would follow a raced symlink at the destination). EPERM on
+    // a CAP_CHOWN-less host is swallowed via onChownError so the write
+    // still lands.
+    if (opts.uid !== undefined) {
+      try {
+        fchownSync(fd, opts.uid, opts.gid ?? opts.uid);
+      } catch (chownErr) {
+        if (opts.onChownError) opts.onChownError(chownErr);
+        else throw chownErr;
+      }
+    }
     fsyncSync(fd);
     closeSync(fd);
     fd = null;
