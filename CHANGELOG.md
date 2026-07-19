@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.1 — Bundled Claude Code CLI bumped to 2.1.215
+
 - **Bundled Claude Code CLI bumped 2.1.205 → 2.1.215** (#3405) —
   `CLAUDE_CODE_VERSION` in `docker/Dockerfile.base` and
   `docker/Dockerfile.hindsight` (lockstep per #1978). Pulls in upstream
