@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -102,14 +103,56 @@ class ResolveSidechainTranscript(unittest.TestCase):
             newer = os.path.join(sub_dir, "agent-new.jsonl")
             _write_sidechain(older, 2)
             _write_sidechain(newer, 2)
-            # Make `newer` genuinely newer by mtime.
-            os.utime(older, (1000, 1000))
-            os.utime(newer, (2000, 2000))
+            # Both FRESH (within SIDECHAIN_SCAN_FRESH_WINDOW_S of now), `newer`
+            # genuinely newer by mtime.
+            now = time.time()
+            os.utime(older, (now - 30, now - 30))
+            os.utime(newer, (now - 5, now - 5))
             # No agent_id → must scan and pick newest.
             got = subagent_retain.resolve_sidechain_transcript(
                 {"transcript_path": parent, "session_id": "sess1"}
             )
             self.assertEqual(got, newer)
+
+    def test_scan_ignores_stale_sidechain_outside_fresh_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = os.path.join(d, "sess1.jsonl")
+            open(parent, "w").close()
+            sub_dir = os.path.join(d, "sess1", "subagents")
+            os.makedirs(sub_dir)
+            stale = os.path.join(sub_dir, "agent-stale.jsonl")
+            _write_sidechain(stale, 2)
+            # Older than the freshness window → NOT picked (finding 3).
+            old = time.time() - subagent_retain.SIDECHAIN_SCAN_FRESH_WINDOW_S - 60
+            os.utime(stale, (old, old))
+            got = subagent_retain.resolve_sidechain_transcript(
+                {"transcript_path": parent, "session_id": "sess1"}
+            )
+            self.assertEqual(got, "")
+
+    def test_rejects_agent_transcript_path_equal_to_parent(self):
+        # finding 2: a CLI that sets agent_transcript_path == transcript_path
+        # must NOT cause the parent (main-session) transcript to be retained
+        # under the sub namespace.
+        with tempfile.TemporaryDirectory() as d:
+            parent = os.path.join(d, "sess1.jsonl")
+            _write_sidechain(parent, 3)  # even if it looked like a sidechain
+            got = subagent_retain.resolve_sidechain_transcript(
+                {"agent_transcript_path": parent, "transcript_path": parent, "session_id": "sess1"}
+            )
+            self.assertEqual(got, "")
+
+    def test_rejects_non_sidechain_agent_transcript_path(self):
+        # finding 2: agent_transcript_path pointing at a NON-sidechain file
+        # (e.g. the parent under a different name) is rejected.
+        with tempfile.TemporaryDirectory() as d:
+            notsc = os.path.join(d, "agent-notsc.jsonl")
+            with open(notsc, "w") as f:
+                f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n")
+            got = subagent_retain.resolve_sidechain_transcript(
+                {"agent_transcript_path": notsc, "transcript_path": "/nope", "session_id": "s"}
+            )
+            self.assertEqual(got, "")
 
     def test_ignores_non_sidechain_jsonl_in_scan(self):
         with tempfile.TemporaryDirectory() as d:
@@ -131,6 +174,18 @@ class ResolveSidechainTranscript(unittest.TestCase):
             {"transcript_path": "/does/not/exist.jsonl", "session_id": "x"}
         )
         self.assertEqual(got, "")
+
+    def test_malformed_transcript_path_does_not_walk_filesystem(self):
+        # Regression: a transcript_path whose dirname is "/" must NOT trigger a
+        # recursive filesystem walk. The bounded listdir of a non-existent
+        # <root>/<session>/subagents returns "" immediately (mock listdir to
+        # assert it is never called on "/").
+        with mock.patch("subagent_retain.os.walk") as walk:
+            got = subagent_retain.resolve_sidechain_transcript(
+                {"agent_transcript_path": "/x", "transcript_path": "/nope", "session_id": "s"}
+            )
+            self.assertEqual(got, "")
+            walk.assert_not_called()
 
 
 class VolumeGate(unittest.TestCase):
@@ -192,6 +247,45 @@ class VolumeGate(unittest.TestCase):
             msgs.append({"role": "assistant", "content": "y" * 400})
         passed, turns, chars = subagent_retain.passes_volume_gate(msgs, CONFIG)
         self.assertTrue(passed)
+
+    def test_char_count_short_circuits_at_floor(self):
+        # finding 4: once the floor is met the walk stops — the returned count is
+        # a lower bound (>= stop_at), not the full sum, and later messages are
+        # not visited.
+        msgs = []
+        for i in range(20):
+            msgs.append({"role": "assistant", "content": "z" * 500})
+        total = subagent_retain.non_tool_result_char_count(
+            msgs, stop_at=subagent_retain.MIN_NON_TOOL_RESULT_CHARS
+        )
+        self.assertGreaterEqual(total, subagent_retain.MIN_NON_TOOL_RESULT_CHARS)
+        # Full sum would be 20*500=10000; short-circuit stops well before.
+        self.assertLess(total, 10000)
+
+
+class BoundedRead(unittest.TestCase):
+    def test_read_transcript_max_bytes_reads_only_tail(self):
+        from retain import read_transcript
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.jsonl")
+            _write_sidechain(p, 60, chars_per_msg=400)  # large file
+            full = read_transcript(p)
+            tail = read_transcript(p, max_bytes=8000)
+            # Bounded read returns fewer messages, and they are the LAST ones
+            # (order preserved) — the final turn is present in both.
+            self.assertLess(len(tail), len(full))
+            self.assertGreater(len(tail), 0)
+            last_uuid_full = full[-1].get("uuid")
+            self.assertEqual(tail[-1].get("uuid"), last_uuid_full)
+
+    def test_max_bytes_none_reads_whole_file(self):
+        from retain import read_transcript
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.jsonl")
+            _write_sidechain(p, 5)
+            self.assertEqual(len(read_transcript(p, max_bytes=None)), len(read_transcript(p)))
 
 
 class RunSubagentRetain(unittest.TestCase):

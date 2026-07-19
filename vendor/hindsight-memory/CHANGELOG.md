@@ -20,7 +20,12 @@
   carries a first-class `agent_transcript_path` pointing at
   `<project>/<session>/subagents/agent-<agent_id>.jsonl` (used as the primary
   path), with a directory-scan of the newest `isSidechain:true` jsonl as the
-  fallback for CLIs that omit the field.
+  fallback for CLIs that omit the field. `reconcile_tail.py` and any transcript
+  sweeper now **skip** sidechain transcripts (shared
+  `content.transcript_first_line_is_sidechain` predicate) so the boot reconciler
+  cannot re-retain a sub-agent fork as a pseudo-session — untagged, at full
+  recall weight, bypassing the volume gate — which its recursive `**/*.jsonl`
+  glob would otherwise do one restart after any worker.
 
 - **recall.py: `recallTagWeights` per-tag score penalty** (switchroom
   hindsight-leverage PR5). A `{tag: multiplier}` config map (default `{}`,

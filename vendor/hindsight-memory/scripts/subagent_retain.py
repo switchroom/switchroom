@@ -41,6 +41,7 @@ Exit codes:
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,6 +52,7 @@ from lib.content import (
     _extract_message_blocks,
     _is_tool_result_only_user_message,
     slice_last_turns_by_user_boundary,
+    transcript_first_line_is_sidechain,
 )
 from lib.daemon import get_api_url
 from lib.pacing import inflight_lock
@@ -67,6 +69,25 @@ SIDECHAIN_WINDOW_TURNS = 40
 # Volume gate floors — SubagentStop fires for every Task, so skip trivial forks.
 MIN_HUMAN_TURNS = 6
 MIN_NON_TOOL_RESULT_CHARS = 2000
+
+# Bounded read (review finding 4): cap the sidechain transcript read so a
+# multi-hour worker's arbitrarily-large jsonl can't eat the 15s hook budget on
+# the read before the POST/enqueue. 8 MB comfortably holds >> the 40-turn retain
+# window and the gate floors even with truncated tool_results; the tail is read
+# in order, so the window slice and PASS/skip are unaffected in practice.
+SIDECHAIN_MAX_READ_BYTES = 8 * 1024 * 1024
+
+# Fallback scan freshness window (review finding 3): when we have to SCAN for the
+# sidechain (older CLIs with no ``agent_transcript_path``), only accept a file
+# whose mtime is within this many seconds of the hook fire, so a stale sidechain
+# from an earlier turn in the same session dir is never mis-picked. Residual race
+# (documented, unavoidable without the first-class field): two old-CLI workers
+# that BOTH stop inside this window pick the newest by mtime, so the other's
+# sidechain is skipped this fire — it is recovered on no path (old CLIs predate
+# agent_transcript_path); this is strictly better than the pre-field behaviour of
+# no sidechain retain at all, and does not affect any CLI that populates the
+# first-class field (the common path, which never scans).
+SIDECHAIN_SCAN_FRESH_WINDOW_S = 300
 
 # Extraction-framing header prepended to the retained content. The retain API
 # has no per-call mission (mission is bank-level), so we bias the consolidation
@@ -90,45 +111,45 @@ def _agent_id_from_path(path: str) -> str:
     return ""
 
 
-def _first_line_is_sidechain(path: str) -> bool:
-    """True when the first JSON line of ``path`` carries ``isSidechain: true``."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    return json.loads(line).get("isSidechain") is True
-                except json.JSONDecodeError:
-                    return False
-    except OSError:
-        return False
-    return False
-
-
 def resolve_sidechain_transcript(hook_input: dict) -> str:
     """Resolve the sidechain transcript path from the SubagentStop hook input.
 
     Layered, most-authoritative first:
 
     1. ``agent_transcript_path`` — the first-class field the CLI provides
-       (probe-confirmed on 2.1.215). Used verbatim when it points at a file.
+       (probe-confirmed on 2.1.215). Accepted only after VALIDATION (review
+       finding 2): it must exist, actually be a sidechain
+       (``transcript_first_line_is_sidechain``), and NOT equal the parent
+       ``transcript_path`` — so a CLI that populates the field differently can
+       never make us retain the parent's main-session content under the
+       sub-agent namespace (systematic double-retain).
     2. Derived ``<projectdir>/<session_id>/subagents/agent-<agent_id>.jsonl``
        from ``transcript_path`` + ``session_id`` + ``agent_id`` — for CLIs that
        omit ``agent_transcript_path`` but still write the standard layout.
-    3. Newest ``isSidechain:true`` ``.jsonl`` in that ``subagents/`` dir, then
-       (last resort) anywhere under the project dir, whose mtime is the most
-       recent — the design's documented directory-scan fallback.
+    3. Newest ``isSidechain:true`` ``.jsonl`` in that exact ``subagents/`` dir
+       whose mtime is the most recent AND within ``SIDECHAIN_SCAN_FRESH_WINDOW_S``
+       of the hook fire — the design's documented directory-scan fallback (see
+       that constant for the residual old-CLI race bound). The scan is
+       deliberately confined to the derived ``<session_id>/subagents/`` dir
+       (a single, bounded ``listdir``) — NOT a recursive walk of the project
+       dir, which for a malformed ``transcript_path`` could resolve to ``/`` and
+       walk the whole filesystem.
 
     Returns "" when nothing plausible is found.
     """
-    # 1. First-class field.
+    parent_transcript = hook_input.get("transcript_path", "") or ""
+
+    # 1. First-class field — validated (finding 2).
     p = hook_input.get("agent_transcript_path")
-    if isinstance(p, str) and p and os.path.isfile(p):
+    if (
+        isinstance(p, str)
+        and p
+        and p != parent_transcript
+        and os.path.isfile(p)
+        and transcript_first_line_is_sidechain(p)
+    ):
         return p
 
-    parent_transcript = hook_input.get("transcript_path", "") or ""
     session_id = hook_input.get("session_id", "") or ""
     agent_id = hook_input.get("agent_id", "") or ""
 
@@ -139,45 +160,55 @@ def resolve_sidechain_transcript(hook_input: dict) -> str:
     if project_dir and session_id:
         subagents_dir = os.path.join(project_dir, session_id, "subagents")
 
-    # 2. Derived exact path from agent_id.
+    # 2. Derived exact path from agent_id — still validated as a sidechain and
+    # not the parent (defensive symmetry with path 1).
     if subagents_dir and agent_id:
         cand = os.path.join(subagents_dir, f"agent-{agent_id}.jsonl")
-        if os.path.isfile(cand):
+        if (
+            os.path.isfile(cand)
+            and cand != parent_transcript
+            and transcript_first_line_is_sidechain(cand)
+        ):
             return cand
 
-    # 3a. Newest isSidechain jsonl in the subagents dir.
-    newest = _newest_sidechain_jsonl(subagents_dir) if subagents_dir else ""
-    if newest:
-        return newest
-
-    # 3b. Last resort — newest isSidechain jsonl anywhere under the project dir.
-    return _newest_sidechain_jsonl(project_dir, recursive=True) if project_dir else ""
+    # 3. Newest fresh isSidechain jsonl in the bounded subagents dir (never a
+    # recursive project-dir walk — see the docstring).
+    return _newest_sidechain_jsonl(subagents_dir, exclude=parent_transcript) if subagents_dir else ""
 
 
-def _newest_sidechain_jsonl(root: str, recursive: bool = False) -> str:
-    """Newest (by mtime) ``.jsonl`` under ``root`` whose first line is a
-    sidechain entry. Returns "" if none / dir missing."""
+def _newest_sidechain_jsonl(root: str, exclude: str = "") -> str:
+    """Newest (by mtime) ``.jsonl`` directly in ``root`` whose first line is a
+    sidechain entry AND whose mtime is within ``SIDECHAIN_SCAN_FRESH_WINDOW_S``
+    of now. Non-recursive: a single bounded ``listdir`` of the derived
+    ``<session_id>/subagents/`` dir.
+
+    ``exclude`` skips a specific path (the parent transcript). Returns "" if none
+    / dir missing. The freshness window (finding 3) keeps a stale sidechain from
+    a prior turn out of contention; see the constant for the residual race bound.
+    """
     if not root or not os.path.isdir(root):
         return ""
+    cutoff = time.time() - SIDECHAIN_SCAN_FRESH_WINDOW_S
     best_path = ""
     best_mtime = -1.0
-    walker = os.walk(root) if recursive else [(root, [], os.listdir(root))]
     try:
-        for dirpath, _dirs, files in walker:
-            for name in files:
-                if not name.endswith(".jsonl"):
-                    continue
-                full = os.path.join(dirpath, name)
-                try:
-                    mtime = os.path.getmtime(full)
-                except OSError:
-                    continue
-                if mtime <= best_mtime:
-                    continue
-                if _first_line_is_sidechain(full):
-                    best_path, best_mtime = full, mtime
+        names = os.listdir(root)
     except OSError:
-        return best_path
+        return ""
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        full = os.path.join(root, name)
+        if exclude and os.path.abspath(full) == os.path.abspath(exclude):
+            continue
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        if mtime < cutoff or mtime <= best_mtime:
+            continue
+        if transcript_first_line_is_sidechain(full):
+            best_path, best_mtime = full, mtime
     return best_path
 
 
@@ -192,7 +223,7 @@ def count_human_turns(messages: list) -> int:
     return n
 
 
-def non_tool_result_char_count(messages: list) -> int:
+def non_tool_result_char_count(messages: list, stop_at: int | None = None) -> int:
     """Total chars of non-tool-result content across the transcript.
 
     Sums the extracted text + tool_use (command/input) blocks and EXCLUDES
@@ -201,6 +232,13 @@ def non_tool_result_char_count(messages: list) -> int:
     gate wants: a 10-second fork with almost no narration/commands falls under
     the floor even if it emitted a large tool_result, while a real worker's
     commands and decisions count.
+
+    ``stop_at`` (review finding 4 — early short-circuit): return as soon as the
+    running total reaches this many chars. The gate only needs to know whether
+    the floor is CLEARED, not the exact size — so on a large worker transcript
+    we stop the block walk the moment the floor is met (the returned value is
+    then a floor, ``>= stop_at``, sufficient for the ``>=`` comparison and the
+    skip log's "chars>=N" read).
     """
     total = 0
     for m in messages:
@@ -215,6 +253,8 @@ def non_tool_result_char_count(messages: list) -> int:
             elif b.get("type") == "tool_use":
                 # Command / input is a process fact; count its serialized size.
                 total += len(b.get("name", "")) + len(json.dumps(b.get("input", {}), ensure_ascii=False))
+        if stop_at is not None and total >= stop_at:
+            return total
     return total
 
 
@@ -222,10 +262,12 @@ def passes_volume_gate(messages: list, config: dict) -> tuple:
     """Return ``(passed, human_turns, char_count)`` for the volume gate.
 
     Skip sub-agents below EITHER floor: < ``MIN_HUMAN_TURNS`` human turns OR
-    < ``MIN_NON_TOOL_RESULT_CHARS`` chars of non-tool-result text.
+    < ``MIN_NON_TOOL_RESULT_CHARS`` chars of non-tool-result text. The char walk
+    short-circuits at the floor (finding 4) — ``char_count`` is exact when below
+    the floor and a lower bound (``>= floor``) once cleared.
     """
     turns = count_human_turns(messages)
-    chars = non_tool_result_char_count(messages)
+    chars = non_tool_result_char_count(messages, stop_at=MIN_NON_TOOL_RESULT_CHARS)
     passed = turns >= MIN_HUMAN_TURNS and chars >= MIN_NON_TOOL_RESULT_CHARS
     return passed, turns, chars
 
@@ -247,6 +289,16 @@ def run_subagent_retain(hook_input: dict) -> dict:
 
     # Blocked-Stop-style re-fire guard: harmless here (deterministic id upserts),
     # but skip a re-fire to avoid a redundant LLM extraction.
+    #
+    # KNOWN LIMITATION (review finding 5): if another SubagentStop hook BLOCKS
+    # the stop, the sub-agent continues and SubagentStop re-fires carrying
+    # ``stop_hook_active: true``; we skip that fire, so any turns the sub-agent
+    # ADDED after the block are not retained on the re-fire. Accepted, because
+    # (a) the deterministic ``{session}-sub-{agent}-r{start}-{end}`` id means the
+    # eventual non-blocked fire (or a later re-dispatch) upserts the fuller
+    # window, and (b) skipping avoids a duplicate LLM extraction on every blocked
+    # continuation. No sidechain currently registers a blocking SubagentStop, so
+    # this is latent; revisit if one is added.
     if hook_input.get("stop_hook_active"):
         debug_log(config, "SubagentStop re-fire (stop_hook_active) — skipping")
         return {"status": "skipped", "reason": "stop_hook_active"}
@@ -267,7 +319,10 @@ def run_subagent_retain(hook_input: dict) -> dict:
     if not agent_id:
         agent_id = _agent_id_from_path(transcript_path) or "unknown"
 
-    all_messages = read_transcript(transcript_path)
+    # Bounded read (finding 4): cap the read so an arbitrarily-large worker
+    # transcript can't eat the hook budget before the gate/POST. The tail is read
+    # in order and covers >> the retain window + gate floors.
+    all_messages = read_transcript(transcript_path, max_bytes=SIDECHAIN_MAX_READ_BYTES)
     if not all_messages:
         debug_log(config, f"SubagentStop: empty sidechain transcript {transcript_path}")
         return {"status": "skipped", "reason": "empty transcript"}
