@@ -3429,6 +3429,17 @@ export type CurrentTurn = {
   // not silently drop. Scoped to the substantive floor so an interim sub-floor
   // ack NEITHER sets nor trips it. Reset false at turn start.
   answerDelivered: AnswerDeliveredLatch
+  // #3429 — the text the turn-flush backstop delivered (or is mid-delivering)
+  // as this turn's answer. Stamped SYNCHRONOUSLY alongside the 'flush' latch
+  // arm (stream-render fire site; outbound-send-path supersede-consumption
+  // resurrection site) and cleared wherever that latch is reset. Lets the
+  // late-reply suppression discriminate BY CONTENT between the flushed answer
+  // landing again (suppress — the flush race) and a genuinely new async
+  // handback attributed to this flush-delivered ended turn (deliver fresh —
+  // suppressing/editing it is the #3429 silent client-side drop), including in
+  // the post-fire pre-record window where no supersede record exists yet.
+  // Null when no flush armed this turn. Reset null at turn start.
+  flushedAnswerText: string | null
   // 2026-07 double-reply-on-DM fix (F2 — recency bound). Wall-clock ms the turn
   // ENDED (stamped once by `endCurrentTurnAtomic`), or null while still live.
   // The `findLatestEndedTurnForChat` supersede tier carries DESTRUCTIVE
