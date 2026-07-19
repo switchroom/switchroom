@@ -1293,6 +1293,11 @@ def main():
                 "transcript_fallback_bytes_read": 0,
                 "transcript_fallback_elapsed_ms": 0,
                 "transcript_fallback_truncated": False,
+                # PR8 (#3369) — no banks ran on a cache hit, so no bank raised a
+                # hard error. None (NOT False) so a cache-hit row is never
+                # miscounted as an observed no-error recall — matching the
+                # deadline_hit / directives_timed_out convention above.
+                "bank_errored": None,
             })
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")

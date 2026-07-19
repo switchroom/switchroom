@@ -376,6 +376,12 @@ class CacheHitRowSchema(_LogTestBase):
         self.assertIsNone(e["total_elapsed_ms"])
         self.assertIsNone(e["directives_elapsed_ms"])
         self.assertIsNone(e["query"])
+        # PR8 (#3369) — the bank_errored field is present on cache-hit rows
+        # for a uniform schema, and is None (NOT False) since no banks ran, so
+        # a reader can do row["bank_errored"] without a KeyError and the row is
+        # never miscounted as an observed no-error recall.
+        self.assertIn("bank_errored", e)
+        self.assertIsNone(e["bank_errored"])
 
 
 class MultiEnvelopeStrip(unittest.TestCase):
