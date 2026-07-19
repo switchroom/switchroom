@@ -316,6 +316,33 @@ describe('turn-lifecycle characterization — fallback purge (silence-poke frame
   })
 })
 
+describe('turn-lifecycle characterization — PR-E ghost-clears (M1: atom-clear ONLY)', () => {
+  for (const reason of ['phantom-ttl-clear', 'bridge-died-clear'] as const) {
+    it(`case 9 — '${reason}' clears the turn atom and does NOTHING else (no shadow turnEnd, no obligation close, no drain)`, () => {
+      const turn = makeTurn({ replyCalled: true, finalAnswerDelivered: true })
+      const key = goLive(turn)
+      seam.obligationLedger.openIfAbsent({
+        originTurnId: turn.turnId, chatId: DM_CHAT, messageId: 1, text: 'q', openedAt: Date.now(),
+      })
+      seam.pendingInboundBuffer.push(SELF_AGENT, bufferedInbound(2))
+
+      seam.endTurn(reason)
+
+      // The atom is cleared…
+      expect(seam.getCurrentTurn()).toBeNull()
+      // …and NOTHING else happened: the ghost-clear must not run the funnel.
+      expect(turnEnds()).toEqual([])                                // no shadow turnEnd
+      expect(seam.obligationLedger.isOpen(turn.turnId)).toBe(true)  // no obligation close
+      expect(ipcSends.length).toBe(0)                               // no drain
+      expect(seam.activeStatusReactions.has(key)).toBe(true)        // no map purge
+      expect(seam.activeTurnStartedAt.has(key)).toBe(true)
+      // Clean up for the next case.
+      seam.pendingInboundBuffer.drain(SELF_AGENT)
+      seam.obligationLedger.close(turn.turnId)
+    })
+  }
+})
+
 describe('turn-lifecycle characterization — idle-only sweeps (P0c gate: tick body only)', () => {
   it('case 4 — delivery-confirm sweep is a no-op mid-turn (currentTurn != null)', () => {
     const turn = makeTurn({ replyCalled: true, finalAnswerDelivered: true })

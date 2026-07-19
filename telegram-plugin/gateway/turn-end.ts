@@ -46,6 +46,7 @@ export function createTurnEndFunnel(deps: TurnEndDeps) {
     turnInFlightForGate,
     turnLiveForItsTopic,
     endCurrentTurnForKey,
+    clearAllCurrentTurns,
     statusKey,
     reapQueuedStatus,
     stopTurnTypingLoop,
@@ -536,6 +537,55 @@ function endCurrentTurnAtomic(
   return turnEndedAt
 }
 
+  /**
+   * PR-E (#2996 P8, amendment M1) — the single auditable turn-end entry point,
+   * reached by production callsites ONLY when SWITCHROOM_TURN_END_FUNNEL_V2=1
+   * (the gateway wrappers gate on the flag; default OFF runs the PR-B paths
+   * verbatim). Dispatches to the EXACT legacy shape per reason — goal:
+   * byte-identical effects, verified by the PR-A shadowEmit sequence oracle
+   * run under both flag settings.
+   *
+   * FIVE end shapes (M1), not three:
+   *   1. 'turn-end'           — the canonical funnel (endCurrentTurnAtomic).
+   *   2. 'fallback-purge'     — purge without/with a turn handle (disconnect
+   *                             flush, silence-poke framework fallback).
+   *   3. 'reply-gate-release' — first-reply buffer-gate release (executeReply).
+   *   4. 'phantom-ttl-clear'  — the /model|/effort busy-check hard-TTL clear.
+   *   5. 'bridge-died-clear'  — the onDanglingTurnsSwept disconnect clear.
+   * Shapes 4-5 are GHOST-clears: the turns are dead (a stale atom / a dead
+   * bridge), so their effect set is EXACTLY the atom clear and nothing else —
+   * no purge, no obligation close, no drain, no shadow turnEnd. Routing them
+   * through the full funnel would close obligations and drain buffers against
+   * a dead bridge.
+   */
+  function endTurn(
+    reason: TurnEndReason,
+    args: {
+      turn?: CurrentTurn
+      opts?: { deferRecord?: boolean; deferObligationClose?: boolean }
+      key?: string
+      endingTurn?: CurrentTurn
+    } = {},
+  ): number | null | undefined {
+    switch (reason) {
+      case 'turn-end':
+        return endCurrentTurnAtomic(args.turn as CurrentTurn, args.opts)
+      case 'fallback-purge':
+        purgeReactionTracking(args.key as string, args.endingTurn)
+        return undefined
+      case 'reply-gate-release':
+        releaseTurnBufferGate(args.key as string, args.endingTurn)
+        return undefined
+      case 'phantom-ttl-clear':
+      case 'bridge-died-clear':
+        // M1 — atom-clear ONLY. See the docblock above; harness case 9 pins
+        // that a ghost-clear emits NO shadow turnEnd, closes NO obligation,
+        // drains NO buffer.
+        clearAllCurrentTurns()
+        return undefined
+    }
+  }
+
   return {
     performBufferDrain,
     drainBufferedIfAllowed,
@@ -543,5 +593,14 @@ function endCurrentTurnAtomic(
     purgeReactionTracking,
     releaseTurnBufferGate,
     endCurrentTurnAtomic,
+    endTurn,
   }
 }
+
+/** PR-E — the five named end shapes (amendment M1). */
+export type TurnEndReason =
+  | 'turn-end'
+  | 'fallback-purge'
+  | 'reply-gate-release'
+  | 'phantom-ttl-clear'
+  | 'bridge-died-clear'
