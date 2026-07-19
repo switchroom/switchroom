@@ -483,6 +483,7 @@ import {
 } from '../turn-flush-safety.js'
 import {
   resolveReplyOwnerTurnId,
+  type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import {
@@ -3412,18 +3413,22 @@ export type CurrentTurn = {
   // false ONLY at turn start, mirroring `activityEverOpened`'s sticky-true
   // contract.
   finalAnswerEverDelivered: boolean
-  // 2026-07 double-reply-on-DM fix (Part 2 — race backstop). Set true
-  // SYNCHRONOUSLY at turn-flush FIRE time (before the ~500 ms async send and
-  // before `flushedTurnSupersede.record`) when the flush delivers a SUBSTANTIVE
-  // (≥`FLUSH_SUBSTANTIVE_MIN_CHARS`) terminal answer, and also set when a
-  // substantive `reply` sends. It persists on the ended turn in
+  // 2026-07 double-reply-on-DM fix (Part 2 — race backstop), SOURCE-TAGGED
+  // since #3426. Set to 'flush' SYNCHRONOUSLY at turn-flush FIRE time (before
+  // the ~500 ms async send and before `flushedTurnSupersede.record`) and at
+  // supersede-record consumption (the resurrection window); set to 'reply'
+  // when a substantive `reply` sends. It persists on the ended turn in
   // `recentTurnsById`, so a LATE reply landing in the flush's post-fire
   // pre-record race window (where `flushedTurnSupersede` finds no record to
   // delete yet) resolves this turn via the unified owner resolver, sees the
-  // latch already set, and suppresses itself — closing the residual window Part
-  // 1's supersede cannot reach. Scoped to the substantive floor so an interim
-  // sub-floor ack NEITHER sets nor trips it. Reset false at turn start.
-  answerDelivered: boolean
+  // 'flush' latch already set, and suppresses itself — closing the residual
+  // window Part 1's supersede cannot reach. The 'reply' tag deliberately does
+  // NOT suppress a late reply (#3426): a substantive interim ack followed by
+  // an async sub-agent handback (which lands with NO live gateway turn and
+  // resolves this ended turn as owner via the latest-ended tier) must deliver,
+  // not silently drop. Scoped to the substantive floor so an interim sub-floor
+  // ack NEITHER sets nor trips it. Reset false at turn start.
+  answerDelivered: AnswerDeliveredLatch
   // 2026-07 double-reply-on-DM fix (F2 — recency bound). Wall-clock ms the turn
   // ENDED (stamped once by `endCurrentTurnAtomic`), or null while still live.
   // The `findLatestEndedTurnForChat` supersede tier carries DESTRUCTIVE

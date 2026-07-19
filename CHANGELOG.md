@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Async sub-agent handback no longer dropped by a stale answer-delivered latch**
+  (#3426) — the gateway's answer-delivered latch is now source-tagged
+  (`'flush'` / `'reply'`), and the late-reply suppression fires only for a
+  FLUSH-armed latch. Previously the dispatch → interim-ack → turn_end →
+  handback pattern silently dropped the handback: the substantive ack armed the
+  boolean latch, the sub-agent completion reply landed with no live gateway
+  turn, resolved the ended ack turn as owner (latest-ended tier, ≤60 s), and
+  was suppressed with a false "deduped" success. Flush-race dedup (post-fire
+  pre-record window, supersede resurrection window) and byte-identical replay
+  dedup (#546 content cache) are unchanged. Conscious trade: the weak
+  "reworded/bridge-replayed duplicate" suppression the reply-armed latch used
+  to provide is dropped — un-acked tool_call replays are byte-identical (the
+  #546 content dedup's case), and a model-regenerated paraphrase is
+  indistinguishable from a genuine handback, so delivering is correct. A rare
+  duplicate message beats a silent drop.
+
 ## v0.19.2 — Hindsight recovery, External spend on /usage, auth-broker hardening, /model carrier doctor
 
 Closes dual-writer and silent-LLM footguns in Hindsight, puts short-window OpenRouter
