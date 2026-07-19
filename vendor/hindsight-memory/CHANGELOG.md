@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Changed (switchroom divergence)
+
+- **`recallContextTurns` default `1` → `2`** (switchroom hindsight-leverage
+  PR2, workstream A2). A bare follow-up user message ("and the port?", "what
+  about staging?") now embeds together with its antecedent human turn in the
+  recall query, instead of recalling on the pronoun alone. Depends on PR1's
+  (#3435) `<channel>` envelope strip so the composed 2-turn query stays
+  envelope-free (both the trailing latest segment and the `Prior context:`
+  lines). The composition is bounded by `recallMaxQueryChars` (800) —
+  `truncate_recall_query` preserves the latest turn and drops oldest context
+  first, so a large antecedent can never blow the recall query budget.
+- **New `recallTranscriptTailBytes` (default `262144`)** — latency bound for
+  multi-turn recall. With `recallContextTurns > 1` now the default, every
+  recall reads the transcript to slice prior turns; `read_transcript_messages`
+  now byte-tail-bounds that read (seek to `EOF - tail_bytes`, discard the
+  partial first line, parse only complete trailing lines) so the added
+  per-recall read stays O(1) regardless of session `.jsonl` size. `0` reads the
+  whole file (rollback lever). Env: `HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES`.
+
 ### Added (switchroom divergence)
 
 - **SubagentStop sidechain retain** (switchroom hindsight-leverage PR5). New
