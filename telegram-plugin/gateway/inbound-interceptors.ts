@@ -18,6 +18,7 @@
 import type { Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { parseStopKeyword, buildStopReply } from './stop-command.js'
+import { formatGrantedScopesReply } from './auth-command.js'
 import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-defer.js'
 import { naturalAction } from '../permission-title.js'
 import { richMessage } from '../rich-send.js'
@@ -463,15 +464,24 @@ export async function interceptAuthAdd(
     deps.pendingAuthAddFlows.delete(p.interceptKey)
     try {
       const credentials = await deps.submitAccountAuthCode(pendingAdd, p.text.trim())
+      const replace = pendingAdd.replace === true
       try {
-        await deps.addAccountViaBroker(pendingAdd.label, credentials, { replace: false })
+        await deps.addAccountViaBroker(pendingAdd.label, credentials, { replace })
         // success — wipe scratch dir now that the broker owns the creds
         deps.cleanAuthAddScratchDir(pendingAdd.scratchDir)
+        // Read the minted scopes STRUCTURALLY (never scraped) and surface
+        // them so a scope regression (missing user:profile) is caught at add
+        // time, not at /usage time.
+        const scopeReply = formatGrantedScopesReply(
+          (credentials as { claudeAiOauth?: { scopes?: string[] } }).claudeAiOauth?.scopes,
+        )
+        const verb = replace ? 're-authenticated' : 'added'
         await deps.switchroomReply(
           p.ctx,
-          `✓ Account \`${pendingAdd.label}\` added.\n` +
+          `✓ Account \`${pendingAdd.label}\` ${verb}.\n` +
             `The fleet's active account hasn't changed. Send ` +
-            `\`/auth use ${deps.escapeHtmlForTg(pendingAdd.label)}\` to switch to it.`,
+            `\`/auth use ${deps.escapeHtmlForTg(pendingAdd.label)}\` to switch to it.` +
+            scopeReply.text,
           { html: true },
         )
       } catch (brokerErr) {

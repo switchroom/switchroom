@@ -366,10 +366,10 @@ import { createFleetFallbackResumeGate } from '../fleet-fallback-resume.js'
 import { resolveExhaustUntil } from './exhaust-until.js'
 import {
   pendingAuthAddFlows,
-  startAccountAuthSession,
   submitAccountAuthCode,
   cancelAccountAuthSession,
   cleanScratchDir as cleanAuthAddScratchDir,
+  handleAuthAddOrCancel,
 } from './auth-add-flow.js'
 import {
   pendingLoopbackFlows,
@@ -20878,69 +20878,17 @@ bot.command("auth", async ctx => {
   // handleAuthCommand which only needs the narrow broker surface.
   const chatId = String(ctx.chat?.id ?? '')
   if (parsed.kind === 'add' || parsed.kind === 'cancel') {
-    if (!isAuthAdmin({ isAdmin })) {
-      await switchroomReply(
-        ctx,
-        `**Not authorized.** \`/auth ${parsed.kind}\` is admin-only.\n` +
-          `Set \`admin: true\` on this agent in switchroom.yaml to unlock ` +
-          `(the same flag that gates \`/agents\`, \`/restart\`, ` +
-          `\`/update\` etc.).`,
-        { html: true },
-      )
-      return
-    }
-    // PR3 supergroup-mode: key auth-add flows by (chat, thread) so
-    // separate flows in two topics of one supergroup can't collide.
-    // In DM chats message_thread_id is undefined → key collapses to
-    // `chatId:_`, identical to today's behavior.
-    const authAddKey = chatKey(chatId, ctx.message?.message_thread_id ?? null) as string
-    if (parsed.kind === 'cancel') {
-      const existing = pendingAuthAddFlows.get(authAddKey)
-      if (!existing) {
-        await switchroomReply(ctx, "_No pending \`/auth add\` flow in this chat._", { html: true })
-        return
-      }
-      cancelAccountAuthSession(existing)
-      pendingAuthAddFlows.delete(authAddKey)
-      await switchroomReply(ctx, "Cancelled.", { html: true })
-      return
-    }
-    // parsed.kind === 'add'
-    if (pendingAuthAddFlows.has(authAddKey)) {
-      await switchroomReply(
-        ctx,
-        "_An \`/auth add\` flow is already in progress for this chat. " +
-          "Finish the paste, or send \`/auth cancel\` to abort._",
-        { html: true },
-      )
-      return
-    }
-    try {
-      const { loginUrl, scratchDir, tmuxSocket, tmuxSession, mode } = await startAccountAuthSession(parsed.label)
-      pendingAuthAddFlows.set(authAddKey, {
-        label: parsed.label,
-        scratchDir,
-        tmuxSocket,
-        tmuxSession,
-        startedAt: Date.now(),
-        mode,
-      })
-      await switchroomReply(
-        ctx,
-        `**Adding account** \`${parsed.label}\`\n\n` +
-          `1. Open this URL on your phone:\n${loginUrl}\n\n` +
-          `2. Log into Anthropic, copy the code Claude shows.\n` +
-          `3. Paste it back here.\n\n` +
-          `Send \`/auth cancel\` to abort.`,
-        { html: true },
-      )
-    } catch (err) {
-      await switchroomReply(
-        ctx,
-        `**/auth add failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
-        { html: true },
-      )
-    }
+    // Gateway-routed `/auth add|readd|cancel` — extracted to
+    // handleAuthAddOrCancel in auth-add-flow.ts (switchroom#2996 ratchet).
+    await handleAuthAddOrCancel({
+      parsed,
+      isAdmin,
+      currentAgent,
+      chatId,
+      threadId: ctx.message?.message_thread_id ?? null,
+      reply: (text: string) => switchroomReply(ctx, text, { html: true }),
+      escapeHtml: escapeHtmlForTg,
+    })
     return
   }
 

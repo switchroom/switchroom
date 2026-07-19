@@ -72,6 +72,10 @@ import type {
   AddAccountCredentials,
   AnthropicAddAccountCredentials,
 } from '../../src/auth/broker/client.js'
+import { isAuthAdmin, runReaddPrecheck } from './auth-command.js'
+import type { ParsedAuthCommand } from './auth-command.js'
+import { getAuthBrokerClient } from './auth-broker-client.js'
+import { chatKey } from './chat-key.js'
 
 /* ── Injectable tmux ops (mirrors makeTmuxRunner in src/agents/inject.ts) ─── */
 
@@ -226,6 +230,13 @@ export interface PendingAuthAddFlow {
   /** tmux session name (`auth-add-<label>-<hex>`). */
   tmuxSession: string
   startedAt: number
+  /**
+   * True when this flow re-authenticates an EXISTING account label in place
+   * (`/auth readd`) — threaded to `addAccountViaBroker(..., { replace: true })`
+   * so the broker overwrites the stored credentials instead of rejecting the
+   * duplicate. Absent/false is a fresh add. Set by the gateway dispatch.
+   */
+  replace?: boolean
   /**
    * Minter mode this flow was started in. `submitAccountAuthCode` reads it to
    * decide whether to dispatch blind post-paste Enter key-presses (via-claude
@@ -634,4 +645,96 @@ export function cancelAccountAuthSession(
   const tmux = tmuxOps ?? makeAuthAddTmuxOps()
   tmux.killSession(flow.tmuxSocket, flow.tmuxSession)
   cleanScratchDir(flow.scratchDir)
+}
+
+/**
+ * `/auth add`, `/auth readd`, `/auth add --replace`, and `/auth cancel`
+ * dispatch. Extracted verbatim from gateway.ts (switchroom#2996 ratchet) —
+ * behavior identical. Gateway-routed because it drives a scratch-dir-backed
+ * `claude setup-token` tmux/OAuth lifecycle the broker client can't model.
+ *
+ * `reply` sends an HTML message to the originating chat; `escapeHtml` is the
+ * gateway's Telegram-HTML escaper. Admin authority is passed through as
+ * `isAdmin` (the gateway sources it from the agent's own `admin`/`root` flag).
+ */
+export async function handleAuthAddOrCancel(opts: {
+  parsed: Extract<ParsedAuthCommand, { kind: 'add' | 'cancel' }>
+  isAdmin: boolean
+  currentAgent: string
+  chatId: string
+  threadId: number | null
+  reply: (text: string) => Promise<unknown>
+  escapeHtml: (text: string) => string
+}): Promise<void> {
+  const { parsed, isAdmin, currentAgent, chatId, threadId, reply, escapeHtml } = opts
+  if (!isAuthAdmin({ isAdmin })) {
+    await reply(
+      `**Not authorized.** \`/auth ${parsed.kind}\` is admin-only.\n` +
+        `Set \`admin: true\` on this agent in switchroom.yaml to unlock ` +
+        `(the same flag that gates \`/agents\`, \`/restart\`, ` +
+        `\`/update\` etc.).`,
+    )
+    return
+  }
+  // PR3 supergroup-mode: key auth-add flows by (chat, thread) so
+  // separate flows in two topics of one supergroup can't collide.
+  // In DM chats message_thread_id is undefined → key collapses to
+  // `chatId:_`, identical to today's behavior.
+  const authAddKey = chatKey(chatId, threadId) as string
+  if (parsed.kind === 'cancel') {
+    const existing = pendingAuthAddFlows.get(authAddKey)
+    if (!existing) {
+      await reply("_No pending \`/auth add\` flow in this chat._")
+      return
+    }
+    cancelAccountAuthSession(existing)
+    pendingAuthAddFlows.delete(authAddKey)
+    await reply("Cancelled.")
+    return
+  }
+  // parsed.kind === 'add'
+  if (pendingAuthAddFlows.has(authAddKey)) {
+    await reply(
+      "_An \`/auth add\` flow is already in progress for this chat. " +
+        "Finish the paste, or send \`/auth cancel\` to abort._",
+    )
+    return
+  }
+  // Precheck against broker state (readd requires the label to exist; a
+  // fresh add requires it NOT to): fail fast before spinning up a tmux/OAuth
+  // flow. Best-effort — a broker-unreachable case returns null and
+  // addAccountViaBroker enforces.
+  const precheckErr = await runReaddPrecheck(
+    () => getAuthBrokerClient(currentAgent),
+    parsed.label,
+    parsed.replace,
+  )
+  if (precheckErr) {
+    await reply(precheckErr)
+    return
+  }
+  try {
+    const { loginUrl, scratchDir, tmuxSocket, tmuxSession, mode } = await startAccountAuthSession(parsed.label)
+    pendingAuthAddFlows.set(authAddKey, {
+      label: parsed.label,
+      scratchDir,
+      tmuxSocket,
+      tmuxSession,
+      startedAt: Date.now(),
+      replace: parsed.replace,
+      mode,
+    })
+    const verbNoun = parsed.replace ? 'Re-authenticating account' : 'Adding account'
+    await reply(
+      `**${verbNoun}** \`${parsed.label}\`\n\n` +
+        `1. Open this URL on your phone:\n${loginUrl}\n\n` +
+        `2. Log into Anthropic, copy the code Claude shows.\n` +
+        `3. Paste it back here.\n\n` +
+        `Send \`/auth cancel\` to abort.`,
+    )
+  } catch (err) {
+    await reply(
+      `**/auth ${parsed.replace ? 'readd' : 'add'} failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+    )
+  }
 }
