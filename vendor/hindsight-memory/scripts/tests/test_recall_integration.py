@@ -114,6 +114,12 @@ def _run_main_with(client, prompt="What is the meaning of life?", config_extra=N
         "recallContextTurns": 1,
         "recallMaxQueryChars": 800,
         "recallPromptPreamble": "",
+        # Disable the A4 directives cache for these integration tests: they all
+        # share bank "test-bank" under a real wall clock, so a live cache would
+        # leak one test's directive set into the next within the TTL window.
+        # Cache hit/miss/TTL/invalidation behaviour is covered hermetically in
+        # test_directives.py (isolated CLAUDE_PLUGIN_DATA + injected clock).
+        "directivesCacheTtlSeconds": 0,
     }
     if config_extra:
         config.update(config_extra)

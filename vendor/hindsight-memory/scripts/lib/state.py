@@ -82,6 +82,37 @@ def write_state(name: str, data):
             pass
 
 
+def remove_state(name: str) -> None:
+    """Delete a state file if it exists. Best-effort; never raises.
+
+    Name is sanitized through the same path-traversal guard as read/write, so
+    callers cannot escape the state directory.
+    """
+    try:
+        path = _state_file(name)
+    except ValueError:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def list_state_names(prefix: str = "") -> list:
+    """List state-file basenames in the state dir, optionally by prefix.
+
+    Returns [] on any error. Used to enumerate a family of cache files (e.g.
+    per-bank directive caches) for bulk invalidation.
+    """
+    try:
+        names = os.listdir(_state_dir())
+    except OSError:
+        return []
+    if prefix:
+        return [n for n in names if n.startswith(prefix)]
+    return names
+
+
 def get_turn_count(session_id: str) -> int:
     """Get the current turn count for a session."""
     turns = read_state("turns.json", {})

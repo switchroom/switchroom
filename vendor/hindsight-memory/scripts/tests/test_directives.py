@@ -10,6 +10,7 @@ Run from the repo root:
 
 import os
 import sys
+import tempfile
 import unittest
 from io import StringIO
 from unittest.mock import patch
@@ -20,12 +21,17 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from lib.directives import (  # noqa: E402
+    DIRECTIVES_CACHE_TTL_SECONDS,
     MAX_DIRECTIVES,
+    _cache_name,
     fetch_active_directives,
+    fetch_active_directives_cached,
     format_active_directives_block,
+    invalidate_directives_cache,
     parse_active_directives_block,
     rule_already_captured,
 )
+from lib.state import read_state, write_state  # noqa: E402
 
 
 class _StubClient:
@@ -292,6 +298,154 @@ class TestDirectiveDedup(unittest.TestCase):
                 "capital python quarterly monthly weekly", [directive]
             )
         )
+
+
+class _CountingClient:
+    """List-directives stub that can vary its behaviour per call.
+
+    ``responses`` / ``excs`` are per-call sequences (last value repeats). Counts
+    total calls so a test can assert cache hits saved the HTTP round-trip.
+    """
+
+    def __init__(self, response=None, exc=None):
+        self._response = response
+        self._exc = exc
+        self.calls = 0
+
+    def list_directives(self, bank_id, active_only=True, timeout=2):
+        self.calls += 1
+        if self._exc is not None:
+            raise self._exc
+        return self._response
+
+
+class DirectivesCacheTests(unittest.TestCase):
+    """A4 — directives-list cache: hit/miss, TTL expiry, invalidation on write,
+    corrupted-cache fallback. State is isolated to a temp CLAUDE_PLUGIN_DATA."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env = patch.dict(os.environ, {"CLAUDE_PLUGIN_DATA": self._tmp.name})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        self._tmp.cleanup()
+
+    def _resp(self, *names):
+        return {"items": [_directive(n, f"content {n}", priority=5) for n in names]}
+
+    def test_cache_hit_skips_second_http_call(self):
+        # Acceptance (a): two consecutive recalls with no write → exactly one
+        # list_directives call; both return the same content.
+        client = _CountingClient(response=self._resp("alpha"))
+        first = fetch_active_directives_cached(client, "bank1", now=1000.0)
+        second = fetch_active_directives_cached(client, "bank1", now=1000.5)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual([d["name"] for d in first], ["alpha"])
+        self.assertEqual([d["name"] for d in second], ["alpha"])
+
+    def test_cache_miss_when_no_prior_entry(self):
+        client = _CountingClient(response=self._resp("alpha"))
+        result = fetch_active_directives_cached(client, "bank1", now=1000.0)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual([d["name"] for d in result], ["alpha"])
+        # Cache file was written.
+        cached = read_state(_cache_name("bank1"), None)
+        self.assertIsInstance(cached, dict)
+        self.assertEqual(cached["ts"], 1000.0)
+
+    def test_ttl_expiry_refetches(self):
+        client = _CountingClient(response=self._resp("alpha"))
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=120, now=1000.0)
+        # Just inside TTL → hit.
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=120, now=1000.0 + 119)
+        self.assertEqual(client.calls, 1)
+        # Just past TTL → miss → refetch.
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=120, now=1000.0 + 121)
+        self.assertEqual(client.calls, 2)
+
+    def test_ttl_zero_disables_cache(self):
+        # Rollback lever: TTL=0 → live fetch every time, nothing written.
+        client = _CountingClient(response=self._resp("alpha"))
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=0, now=1000.0)
+        fetch_active_directives_cached(client, "bank1", ttl_seconds=0, now=1000.1)
+        self.assertEqual(client.calls, 2)
+        self.assertIsNone(read_state(_cache_name("bank1"), None))
+
+    def test_invalidation_forces_refetch(self):
+        # Acceptance (a) in-session: a directive write invalidates the cache, so
+        # the next recall re-fetches (fresh directive becomes visible).
+        client = _CountingClient(response=self._resp("alpha"))
+        fetch_active_directives_cached(client, "bank1", now=1000.0)
+        self.assertEqual(client.calls, 1)
+        invalidate_directives_cache()  # bank-agnostic sweep (Stop-hook path)
+        fetch_active_directives_cached(client, "bank1", now=1000.1)
+        self.assertEqual(client.calls, 2)
+
+    def test_invalidation_specific_bank_only(self):
+        client = _CountingClient(response=self._resp("alpha"))
+        fetch_active_directives_cached(client, "bankA", now=1000.0)
+        fetch_active_directives_cached(client, "bankB", now=1000.0)
+        self.assertEqual(client.calls, 2)
+        invalidate_directives_cache("bankA")
+        # bankA re-fetches, bankB still served from cache.
+        fetch_active_directives_cached(client, "bankA", now=1000.1)
+        self.assertEqual(client.calls, 3)
+        fetch_active_directives_cached(client, "bankB", now=1000.1)
+        self.assertEqual(client.calls, 3)
+
+    def test_corrupted_cache_falls_back_to_live(self):
+        # A non-JSON cache file → read_state returns default → live fetch.
+        from lib.state import _state_file  # noqa: PLC0415
+
+        path = _state_file(_cache_name("bank1"))
+        with open(path, "w") as f:
+            f.write("{ this is not valid json ]")
+        client = _CountingClient(response=self._resp("alpha"))
+        result = fetch_active_directives_cached(client, "bank1", now=1000.0)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual([d["name"] for d in result], ["alpha"])
+
+    def test_wrong_shape_cache_falls_back_to_live(self):
+        # Valid JSON but missing the ts/directives envelope → treated as a miss.
+        write_state(_cache_name("bank1"), {"directives": [{"name": "stale"}]})
+        client = _CountingClient(response=self._resp("fresh"))
+        result = fetch_active_directives_cached(client, "bank1", now=1000.0)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual([d["name"] for d in result], ["fresh"])
+
+    def test_bool_timestamp_rejected_as_corrupt(self):
+        # bool is an int subclass — guard must not accept True as a timestamp.
+        write_state(_cache_name("bank1"), {"ts": True, "directives": []})
+        client = _CountingClient(response=self._resp("fresh"))
+        fetch_active_directives_cached(client, "bank1", now=1000.0)
+        self.assertEqual(client.calls, 1)
+
+    def test_failed_fetch_not_cached(self):
+        # A transient fetch FAILURE must not poison the cache with [] — the next
+        # call must retry live rather than serving a cached empty list.
+        failing = _CountingClient(exc=RuntimeError("HTTP 503"))
+        with patch("sys.stderr", new=StringIO()):
+            first = fetch_active_directives_cached(failing, "bank1", now=1000.0)
+        self.assertEqual(first, [])
+        self.assertIsNone(read_state(_cache_name("bank1"), None))
+        # A subsequent successful fetch is served live and then cached.
+        ok = _CountingClient(response=self._resp("alpha"))
+        result = fetch_active_directives_cached(ok, "bank1", now=1000.1)
+        self.assertEqual(ok.calls, 1)
+        self.assertEqual([d["name"] for d in result], ["alpha"])
+
+    def test_empty_bank_is_cached(self):
+        # A genuinely empty bank (items: []) is a successful fetch → cacheable,
+        # so a directive-free agent also saves the round-trip.
+        client = _CountingClient(response={"items": []})
+        fetch_active_directives_cached(client, "bank1", now=1000.0)
+        fetch_active_directives_cached(client, "bank1", now=1000.1)
+        self.assertEqual(client.calls, 1)
+
+    def test_default_ttl_constant(self):
+        self.assertEqual(DIRECTIVES_CACHE_TTL_SECONDS, 120)
 
 
 if __name__ == "__main__":
