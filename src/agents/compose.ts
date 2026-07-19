@@ -1686,10 +1686,6 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      - "FOWNER"`);
   lines.push(`      - "DAC_READ_SEARCH"`);
   lines.push(`      - "DAC_OVERRIDE"`);
-  // Reach host-published LiteLLM (and any other host-gateway service)
-  // when base_url is rewritten off loopback for get-external-spend.
-  lines.push(`    extra_hosts:`);
-  lines.push(`      - "host.docker.internal:host-gateway"`);
   // Operator UID — when set, pass `--operator-uid <N>` so the broker
   // entry binds the operator listener at
   // /run/switchroom/auth-broker/operator/sock and chowns it to <N>.
@@ -1717,6 +1713,10 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // base_url is almost always loopback (socat on the host) — rewrite
   // 127.0.0.1/localhost → host.docker.internal so the broker can reach
   // the host-published proxy. Non-loopback URLs pass through unchanged.
+  // extra_hosts is only emitted when we configure a base — keeps the
+  // zero-litellm fleet compose free of host-gateway (network_isolation
+  // regression receive).
+  let authBrokerNeedsHostGateway = false;
   {
     const llBase =
       (config as { litellm?: { base_url?: string } }).litellm?.base_url;
@@ -1728,6 +1728,9 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
         .replace(/^https:\/\/127\.0\.0\.1(?=[:/]|$)/i, "https://host.docker.internal")
         .replace(/^https:\/\/localhost(?=[:/]|$)/i, "https://host.docker.internal");
       lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(bridged)}`);
+      // Always pair with host-gateway when base is set: loopback rewrite
+      // needs it; non-loopback? harmless + covers mixed host socat names.
+      authBrokerNeedsHostGateway = true;
     }
   }
   lines.push(`      SWITCHROOM_ACCOUNTS_DIR: /state/accounts`);
@@ -1740,6 +1743,10 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // below is unused dead weight.
   if (opts.operatorUid !== undefined) {
     lines.push(`      SWITCHROOM_AUTH_BROKER_OPERATOR_UID: "${opts.operatorUid}"`);
+  }
+  if (authBrokerNeedsHostGateway) {
+    lines.push(`    extra_hosts:`);
+    lines.push(`      - "host.docker.internal:host-gateway"`);
   }
   lines.push(`    volumes:`);
   // Per-agent socket dir (named volume; agent side mounts the parent).

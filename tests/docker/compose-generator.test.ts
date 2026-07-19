@@ -3410,13 +3410,14 @@ describe("generateCompose — auth-broker LiteLLM base for external spend", () =
     );
   });
 
-  it("omits SWITCHROOM_LITELLM_BASE on auth-broker when litellm base_url unset", () => {
+  it("omits SWITCHROOM_LITELLM_BASE + extra_hosts on auth-broker when litellm base_url unset", () => {
     const out = generateCompose({
       config: makeConfig({ router: {} }),
     });
     const block =
       /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
     expect(block).not.toMatch(/SWITCHROOM_LITELLM_BASE:/);
+    expect(block).not.toContain("host.docker.internal:host-gateway");
   });
 });
 
