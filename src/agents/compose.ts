@@ -1686,6 +1686,10 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      - "FOWNER"`);
   lines.push(`      - "DAC_READ_SEARCH"`);
   lines.push(`      - "DAC_OVERRIDE"`);
+  // Reach host-published LiteLLM (and any other host-gateway service)
+  // when base_url is rewritten off loopback for get-external-spend.
+  lines.push(`    extra_hosts:`);
+  lines.push(`      - "host.docker.internal:host-gateway"`);
   // Operator UID — when set, pass `--operator-uid <N>` so the broker
   // entry binds the operator listener at
   // /run/switchroom/auth-broker/operator/sock and chowns it to <N>.
@@ -1707,13 +1711,23 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   //   /state/agents    → ~/.switchroom/agents/
   //   /state/auth-broker → ~/.switchroom/state/auth-broker/
   lines.push(`      SWITCHROOM_AUTH_BROKER_STATE_DIR: /state/auth-broker`);
+  // LiteLLM root for get-external-spend (OpenRouter cash on /usage).
+  // Broker holds the master key in state-dir; agents never see it.
+  // Auth-broker runs on the compose bridge (not host net). Operator
+  // base_url is almost always loopback (socat on the host) — rewrite
+  // 127.0.0.1/localhost → host.docker.internal so the broker can reach
+  // the host-published proxy. Non-loopback URLs pass through unchanged.
   {
-    // LiteLLM root URL for get-external-spend (OpenRouter cash on /usage).
-    // Broker holds master key in state-dir; agents never see it.
     const llBase =
       (config as { litellm?: { base_url?: string } }).litellm?.base_url;
     if (typeof llBase === "string" && llBase.trim()) {
-      lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(llBase.trim())}`);
+      const raw = llBase.trim().replace(/\/+$/, "");
+      const bridged = raw
+        .replace(/^http:\/\/127\.0\.0\.1(?=[:/]|$)/i, "http://host.docker.internal")
+        .replace(/^http:\/\/localhost(?=[:/]|$)/i, "http://host.docker.internal")
+        .replace(/^https:\/\/127\.0\.0\.1(?=[:/]|$)/i, "https://host.docker.internal")
+        .replace(/^https:\/\/localhost(?=[:/]|$)/i, "https://host.docker.internal");
+      lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(bridged)}`);
     }
   }
   lines.push(`      SWITCHROOM_ACCOUNTS_DIR: /state/accounts`);

@@ -227,4 +227,86 @@ describe("get-external-spend", () => {
       broker.stop();
     }
   });
+
+  it("reads master key from state-dir file when env/test override absent", async () => {
+    const h = makeHarness();
+    seedAccount(h, "default");
+    writeFileSync(join(h.stateDir, "litellm-master-key"), "sk-from-file\n", {
+      mode: 0o600,
+    });
+    let sawKey: string | undefined;
+    const config = makeConfig(h);
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      // undefined ⇒ fall through to file
+      _testFetchExternalSpend: async ({ adminKey }) => {
+        sawKey = adminKey;
+        return {
+          day24hUsd: 0,
+          day7dUsd: 0,
+          top: [],
+        };
+      },
+    });
+    await broker.start();
+    try {
+      const sock = join(h.socketRoot, "alice", "sock");
+      const resp = (await rpc(sock, {
+        v: PROTOCOL_VERSION,
+        id: "4",
+        op: "get-external-spend",
+        forceLive: true,
+      })) as { ok: boolean; data?: { available?: boolean; day24hUsd?: number } };
+      expect(resp.ok).toBe(true);
+      expect(resp.data?.available).toBe(true);
+      expect(resp.data?.day24hUsd).toBe(0);
+      expect(sawKey).toBe("sk-from-file");
+      expect(JSON.stringify(resp)).not.toContain("sk-from-file");
+    } finally {
+      broker.stop();
+    }
+  });
+
+  it("rejects malformed durable cache (dot not poison available totals)", async () => {
+    const h = makeHarness();
+    seedAccount(h, "default");
+    writeFileSync(
+      join(h.stateDir, "external-spend.json"),
+      JSON.stringify({
+        summary: {
+          day24hUsd: "nope",
+          day7dUsd: 2,
+          top: [{ label: "x", usd: 1 }],
+        },
+        capturedAtMs: Date.now() - 1_000,
+      }),
+      { mode: 0o600 },
+    );
+    const config = makeConfig(h);
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      _testLitellmMasterKey: null,
+    });
+    await broker.start();
+    try {
+      const sock = join(h.socketRoot, "alice", "sock");
+      const resp = (await rpc(sock, {
+        v: PROTOCOL_VERSION,
+        id: "5",
+        op: "get-external-spend",
+      })) as { ok: boolean; data?: { available?: boolean; reason?: string } };
+      expect(resp.ok).toBe(true);
+      expect(resp.data?.available).toBe(false);
+      expect(resp.data?.reason).toBe("master_key_unavailable");
+    } finally {
+      broker.stop();
+    }
+  });
+
 });

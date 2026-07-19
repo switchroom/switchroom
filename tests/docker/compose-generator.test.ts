@@ -3356,9 +3356,67 @@ describe("generateCompose — LiteLLM ANTHROPIC_BASE_URL model-class routing", (
 
   it("no virtual key confirmed → NO routing env injected at all (fail-safe)", () => {
     const out = composeFor("sr-glm-5", false);
-    // keyConfirmed false ⇒ the whole routing block is skipped, so the proxy URL
-    // never appears for this agent (no unauthenticated proxy calls).
-    expect(out).not.toContain(ROOT);
+    // keyConfirmed false ⇒ agent routing env is skipped (no unauthenticated
+    // proxy calls from the *agent*). The auth-broker still gets a
+    // SWITCHROOM_LITELLM_BASE for get-external-spend (fleet /usage card) —
+    // that is intentional and authenticated with the master key inside
+    // the broker, not with a missing agent VK. Scope the assert to the
+    // agent service block, not the whole compose document.
+    const agentBlock =
+      /agent-router:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|\nnetworks:|$)/.exec(out)?.[0] ?? "";
+    expect(agentBlock).not.toContain(ROOT);
+    expect(agentBlock).not.toMatch(/ANTHROPIC_BASE_URL:/);
+    expect(agentBlock).not.toMatch(/SWITCHROOM_LITELLM:/);
+    // Broker still receives the base (loopback rewritten to host-gateway).
+    const ab =
+      /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
+    expect(ab).toMatch(/SWITCHROOM_LITELLM_BASE:/);
+  });
+});
+
+
+describe("generateCompose — auth-broker LiteLLM base for external spend", () => {
+  it("rewrites loopback base_url to host.docker.internal + set extra_hosts", () => {
+    const out = generateCompose({
+      config: makeConfig(
+        { router: {} },
+        { litellm: { enabled: true, base_url: "http://127.0.0.1:4010" } },
+      ),
+    });
+    const block =
+      /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
+    expect(block).toContain(
+      'SWITCHROOM_LITELLM_BASE: "http://host.docker.internal:4010"',
+    );
+    expect(block).not.toContain(
+      'SWITCHROOM_LITELLM_BASE: "http://127.0.0.1:4010"',
+    );
+    expect(block).toMatch(
+      /extra_hosts:\n {6}- "host\.docker\.internal:host-gateway"/,
+    );
+  });
+
+  it("passes non-loopback base_url through unchanged", () => {
+    const out = generateCompose({
+      config: makeConfig(
+        { router: {} },
+        { litellm: { enabled: true, base_url: "http://litellm.internal:4010" } },
+      ),
+    });
+    const block =
+      /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
+    expect(block).toContain(
+      'SWITCHROOM_LITELLM_BASE: "http://litellm.internal:4010"',
+    );
+  });
+
+  it("omits SWITCHROOM_LITELLM_BASE on auth-broker when litellm base_url unset", () => {
+    const out = generateCompose({
+      config: makeConfig({ router: {} }),
+    });
+    const block =
+      /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
+    expect(block).not.toMatch(/SWITCHROOM_LITELLM_BASE:/);
   });
 });
 

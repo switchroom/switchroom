@@ -3163,18 +3163,6 @@ export class AuthBroker {
   }
 
   /**
-   * Fleet notification-dedup claim. Grants the FIRST caller of a given
-   * `key` inside `windowMs`; everyone else is denied. The check-and-set
-   * is fully synchronous (no awaits), so two agents racing the same key
-   * serialize on the event loop — exactly one grant per window, by
-   * construction.
-   *
-   * Audit: granted claims only. Denials are the designed common case
-   * (N-1 of N agents per event) — auditing them would re-create the
-   * very log spam this op exists to remove.
-   */
-  
-  /**
    * `get-external-spend` — fleet OpenRouter/cash spend for `/usage`.
    * ACL: same as list-state (any bound identity). Never puts the master
    * key on the wire. Soft-fails with `available:false` when the key is
@@ -3271,9 +3259,20 @@ export class AuthBroker {
    * leaves any existing durable cache in place.
    */
   private async refreshExternalSpend(forceLive: boolean): Promise<void> {
-    if (this.externalSpendInFlight) {
+    // Wait for any in-flight refresh, then re-evaluate. A concurrent
+    // forceLive must not be starved by a non-force flight that no-ops
+    // on a still-within-TTL (but operator-stale) cache.
+    while (this.externalSpendInFlight) {
       await this.externalSpendInFlight;
-      return;
+      if (!forceLive) return;
+      const justNow = this.now();
+      if (
+        this.externalSpendCache &&
+        justNow - this.externalSpendCache.capturedAtMs < 5_000
+      ) {
+        return;
+      }
+      // lost the race to start another force — loop and try again
     }
     const run = (async () => {
       const nowMs = this.now();
@@ -3314,7 +3313,18 @@ export class AuthBroker {
     await this.externalSpendInFlight;
   }
 
-private opClaimNotification(
+  /**
+   * Fleet notification-dedup claim. Grants the FIRST caller of a given
+   * `key` inside `windowMs`; everyone else is denied. The check-and-set
+   * is fully synchronous (no awaits), so two agents racing the same key
+   * serialize on the event loop — exactly one grant per window, by
+   * construction.
+   *
+   * Audit: granted claims only. Denials are the designed common case
+   * (N-1 of N agents per event) — auditing them would re-create the
+   * very log spam this op exists to remove.
+   */
+  private opClaimNotification(
     socket: net.Socket,
     id: string,
     identity: Identity,
@@ -4662,12 +4672,26 @@ private opClaimNotification(
         es &&
         es.summary &&
         typeof es.capturedAtMs === "number" &&
-        typeof es.summary.day24hUsd === "number" &&
-        typeof es.summary.day7dUsd === "number" &&
-        Array.isArray(es.summary.top)
+        Number.isFinite(es.summary.day24hUsd) &&
+        Number.isFinite(es.summary.day7dUsd) &&
+        Array.isArray(es.summary.top) &&
+        es.summary.top.every(
+          (t) =>
+            t &&
+            typeof t.label === "string" &&
+            typeof t.usd === "number" &&
+            Number.isFinite(t.usd),
+        )
       ) {
         this.externalSpendCache = {
-          summary: es.summary,
+          summary: {
+            day24hUsd: es.summary.day24hUsd,
+            day7dUsd: es.summary.day7dUsd,
+            top: es.summary.top.map((t) => ({
+              label: t.label,
+              usd: t.usd,
+            })),
+          },
           capturedAtMs: es.capturedAtMs,
         };
       }

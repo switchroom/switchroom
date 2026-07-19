@@ -76,6 +76,7 @@ import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
 import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { allocateAgentUid } from "../agents/compose.js";
+import { LITELLM_MASTER_KEY_STATE_BASENAME } from "../litellm/external-spend.js";
 import { writeComposeFile, computeComposeContent, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
 import { getProfilePath } from "../agents/profiles.js";
 import { detectInstallType } from "./install-detect.js";
@@ -285,7 +286,7 @@ export function materializeLitellmMasterKeyForBroker(
   try {
     const stateDir = join(home, ".switchroom", "state", "auth-broker");
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-    const path = join(stateDir, "litellm-master-key");
+    const path = join(stateDir, LITELLM_MASTER_KEY_STATE_BASENAME);
     writeFileSync(path, masterKey.trim() + "\n", { mode: 0o600 });
     try {
       chmodSync(path, 0o600);
