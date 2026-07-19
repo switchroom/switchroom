@@ -121,6 +121,7 @@ import {
   interceptInterruptMarker,
   interceptPermissionReply,
   interceptAuthAdd,
+  interceptLoopbackRelay,
   type InboundInterceptorDeps,
 } from './inbound-interceptors.js'
 import {
@@ -15733,90 +15734,14 @@ export async function handleInbound(
   // message that actually parses as a loopback redirect — carrying a code,
   // or a provider `error` param — is consumed and deleted. Unrelated chatter
   // that merely mentions localhost/127.0.0.1 flows through untouched.
-  const pendingLoop = pendingLoopbackFlows.get(interceptKey)
-  if (pendingLoop && shouldConsumeLoopbackPaste(text)) {
-    const elapsed = Date.now() - pendingLoop.startedAt
-    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
-      if (pendingLoop.submitting) {
-        // A submit is already in flight (double-paste race). Don't call
-        // submitLoopbackRedirect — it would answer a non-retryable "already
-        // completed" and we'd delete the entry out from under the first
-        // submit. Benign ack; still redact (the paste carries a live code).
-        await switchroomReply(
-          ctx,
-          '_Still finishing the previous paste — one moment._',
-          { html: true },
-        )
-        redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-        return
-      }
-      const result = await submitLoopbackRedirect(pendingLoop, text.trim())
-      if (result.ok) {
-        pendingLoopbackFlows.delete(interceptKey)
-        await switchroomReply(
-          ctx,
-          `✓ ${pendingLoop.provider === 'google' ? 'Google' : 'Microsoft'} account ` +
-            `\`${escapeHtmlForTg(pendingLoop.email)}\` registered with the auth-broker.`,
-          { html: true },
-        )
-        // Redact the pasted redirect (carries the OAuth code) from history.
-        redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-        return
-      }
-      if (result.retryable) {
-        // Keep the flow pending so the operator can paste again.
-        await switchroomReply(
-          ctx,
-          `**Paste not accepted:** ${escapeHtmlForTg(result.reason)}\n` +
-            `Re-open the consent URL, approve, and paste the full ` +
-            `\`127.0.0.1\` URL from your address bar. \`/auth ${pendingLoop.provider} cancel\` to abort.`,
-          { html: true },
-        )
-        // Redact even a rejected paste — it may still carry a live code.
-        redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-        return
-      }
-      // Non-retryable — the flow is spent. Kill the CLI child before
-      // dropping the entry (re-review finding, PR #3100): on the attempts-
-      // exhausted path the child is still alive with a bound 127.0.0.1
-      // listener and nothing else would ever reap it. cancelLoopbackFlow is
-      // idempotent — safe on the already-exited / timed-out paths too.
-      cancelLoopbackFlow(pendingLoop)
-      pendingLoopbackFlows.delete(interceptKey)
-      await switchroomReply(
-        ctx,
-        `**/auth ${pendingLoop.provider} add failed:** ${escapeHtmlForTg(result.reason)}`,
-        { html: true },
-      )
-      redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-      return
-    }
-    // Stale — the intercept window has closed. Kill the child and drop the
-    // entry, then fall through to the fail-safe below. We deliberately do NOT
-    // let the paste reach the agent: the pasted `code` may still be live
-    // (security audit #3084, F3), so the fail-safe redacts it.
-    cancelLoopbackFlow(pendingLoop)
-    pendingLoopbackFlows.delete(interceptKey)
-  }
-
-  // Fail-safe redaction (security audit #3084, F2/F3). A message that looks
-  // like a loopback OAuth redirect/code — even one too malformed to parse
-  // cleanly, or one that arrived just after the intercept TTL closed, or one
-  // with no active flow at all — must NEVER reach the (prompt-injectable)
-  // agent session or linger unredacted in chat while carrying a possibly-live
-  // credential. shouldConsumeLoopbackPaste is narrow (requires a loopback host
-  // reference AND a code/error param), so ordinary chatter mentioning
-  // localhost flows through untouched. Redact and drop rather than forward.
-  if (shouldConsumeLoopbackPaste(text)) {
-    redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-    await switchroomReply(
-      ctx,
-      '_That looked like an OAuth redirect/code, so I removed it from chat and did not forward it. ' +
-        'If a Google/Microsoft account add is in progress, re-run the add command and paste the fresh ' +
-        '`127.0.0.1` URL — the previous code may have expired._',
-      { html: true },
+  // (moved to interceptLoopbackRelay incl. the #3084 fail-safe redaction tail,
+  // #2996 P7 PR-6)
+  {
+    const loopbackOutcome = await interceptLoopbackRelay(
+      { ctx, text, chat_id, msgId, interceptKey },
+      inboundInterceptorDeps,
     )
-    return
+    if (loopbackOutcome.handled) return
   }
 
   // Auth-code intercept

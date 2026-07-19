@@ -21,6 +21,12 @@ import { parseStopKeyword, buildStopReply } from './stop-command.js'
 import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-defer.js'
 import { naturalAction } from '../permission-title.js'
 import type { PendingAuthAddFlow } from './auth-add-flow.js'
+import {
+  pendingLoopbackFlows,
+  submitLoopbackRedirect,
+  cancelLoopbackFlow,
+  shouldConsumeLoopbackPaste,
+} from './auth-loopback-relay.js'
 import type { AddAccountCredentials } from '../../src/auth/broker/client.js'
 import type { parseInterruptMarker } from '../interrupt-marker.js'
 import type { RetryCallOpts } from '../retry-api-call.js'
@@ -412,5 +418,117 @@ export async function interceptAuthAdd(
   // to other intercepts (defensively wipe scratch).
   deps.cancelAccountAuthSession(pendingAdd)
   deps.pendingAuthAddFlows.delete(p.interceptKey)
+  return { handled: false }
+}
+
+/**
+ * Loopback OAuth relay paste-back intercept (issue #2582) — sibling to the
+ * /auth add intercept above. When a Google/Microsoft loopback relay is pending
+ * for this chat and the operator pastes their `127.0.0.1:<port>` redirect URL,
+ * validate `state` and hand the code to the waiting CLI listener. The LLM
+ * never sees the code (same hygiene rationale as auth-add). Consume-gate is
+ * deliberately narrow (PR #3100 review finding 1): only a message that
+ * actually parses as a loopback redirect — carrying a code, or a provider
+ * `error` param — is consumed and deleted; unrelated chatter that merely
+ * mentions localhost/127.0.0.1 flows through untouched.
+ *
+ * Includes the fail-safe redaction tail (security audit #3084, F2/F3): a
+ * loopback-looking paste with no live flow (stale TTL, malformed, no flow at
+ * all) is redacted and dropped — it must NEVER reach the (prompt-injectable)
+ * agent session while carrying a possibly-live credential.
+ *
+ * The loopback state/functions are imported directly from
+ * auth-loopback-relay.ts (they already own their state module — same live Map
+ * instance the gateway uses).
+ */
+export async function interceptLoopbackRelay(
+  p: AuthAddParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterceptOutcome> {
+  const pendingLoop = pendingLoopbackFlows.get(p.interceptKey)
+  if (pendingLoop && shouldConsumeLoopbackPaste(p.text)) {
+    const elapsed = Date.now() - pendingLoop.startedAt
+    if (elapsed < deps.reauthInterceptTtlMs) {
+      if (pendingLoop.submitting) {
+        // A submit is already in flight (double-paste race). Don't call
+        // submitLoopbackRedirect — it would answer a non-retryable "already
+        // completed" and we'd delete the entry out from under the first
+        // submit. Benign ack; still redact (the paste carries a live code).
+        await deps.switchroomReply(
+          p.ctx,
+          '_Still finishing the previous paste — one moment._',
+          { html: true },
+        )
+        deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+        return { handled: true }
+      }
+      const result = await submitLoopbackRedirect(pendingLoop, p.text.trim())
+      if (result.ok) {
+        pendingLoopbackFlows.delete(p.interceptKey)
+        await deps.switchroomReply(
+          p.ctx,
+          `✓ ${pendingLoop.provider === 'google' ? 'Google' : 'Microsoft'} account ` +
+            `\`${deps.escapeHtmlForTg(pendingLoop.email)}\` registered with the auth-broker.`,
+          { html: true },
+        )
+        // Redact the pasted redirect (carries the OAuth code) from history.
+        deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+        return { handled: true }
+      }
+      if (result.retryable) {
+        // Keep the flow pending so the operator can paste again.
+        await deps.switchroomReply(
+          p.ctx,
+          `**Paste not accepted:** ${deps.escapeHtmlForTg(result.reason)}\n` +
+            `Re-open the consent URL, approve, and paste the full ` +
+            `\`127.0.0.1\` URL from your address bar. \`/auth ${pendingLoop.provider} cancel\` to abort.`,
+          { html: true },
+        )
+        // Redact even a rejected paste — it may still carry a live code.
+        deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+        return { handled: true }
+      }
+      // Non-retryable — the flow is spent. Kill the CLI child before
+      // dropping the entry (re-review finding, PR #3100): on the attempts-
+      // exhausted path the child is still alive with a bound 127.0.0.1
+      // listener and nothing else would ever reap it. cancelLoopbackFlow is
+      // idempotent — safe on the already-exited / timed-out paths too.
+      cancelLoopbackFlow(pendingLoop)
+      pendingLoopbackFlows.delete(p.interceptKey)
+      await deps.switchroomReply(
+        p.ctx,
+        `**/auth ${pendingLoop.provider} add failed:** ${deps.escapeHtmlForTg(result.reason)}`,
+        { html: true },
+      )
+      deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+      return { handled: true }
+    }
+    // Stale — the intercept window has closed. Kill the child and drop the
+    // entry, then fall through to the fail-safe below. We deliberately do NOT
+    // let the paste reach the agent: the pasted `code` may still be live
+    // (security audit #3084, F3), so the fail-safe redacts it.
+    cancelLoopbackFlow(pendingLoop)
+    pendingLoopbackFlows.delete(p.interceptKey)
+  }
+
+  // Fail-safe redaction (security audit #3084, F2/F3). A message that looks
+  // like a loopback OAuth redirect/code — even one too malformed to parse
+  // cleanly, or one that arrived just after the intercept TTL closed, or one
+  // with no active flow at all — must NEVER reach the (prompt-injectable)
+  // agent session or linger unredacted in chat while carrying a possibly-live
+  // credential. shouldConsumeLoopbackPaste is narrow (requires a loopback host
+  // reference AND a code/error param), so ordinary chatter mentioning
+  // localhost flows through untouched. Redact and drop rather than forward.
+  if (shouldConsumeLoopbackPaste(p.text)) {
+    deps.redactAuthCode(p.chat_id, p.msgId ?? null)
+    await deps.switchroomReply(
+      p.ctx,
+      '_That looked like an OAuth redirect/code, so I removed it from chat and did not forward it. ' +
+        'If a Google/Microsoft account add is in progress, re-run the add command and paste the fresh ' +
+        '`127.0.0.1` URL — the previous code may have expired._',
+      { html: true },
+    )
+    return { handled: true }
+  }
   return { handled: false }
 }
