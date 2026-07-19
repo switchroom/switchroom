@@ -20,6 +20,14 @@
  * whichever was observed last. A fresh assistant line always reclaims the
  * transcript as the source; a confirmed switch always beats an older
  * transcript line. Pinned by tests/session-model-source.test.ts.
+ *
+ * Divergence tripwire (#3427 item 4): `--fallback-model` masks an invalid
+ * requested model id — claude silently serves the fallback while the override
+ * carries the requested token. The FIRST transcript observation after an
+ * override is set is therefore the earliest deterministic verification point:
+ * when the injected comparator says the served id does NOT satisfy the
+ * requested token, the registered divergence handler fires (once per override)
+ * so the gateway can log + warn instead of self-healing silently.
  */
 
 export interface SessionModelResolution {
@@ -28,6 +36,25 @@ export interface SessionModelResolution {
    *  ("Opus 4.8") or sr-* ids depending on the /model path that set them. */
   model: string
   source: 'transcript' | 'override'
+}
+
+/** The first post-override assistant line served a different model (#3427). */
+export interface SessionModelDivergence {
+  /** The override token the operator requested (`/model <token>`). */
+  requested: string
+  /** The transcript's `message.model` — the model actually serving calls. */
+  served: string
+}
+
+export interface SessionModelSourceOptions {
+  /**
+   * Comparator for the divergence tripwire: does `served` (a resolved
+   * transcript id) satisfy `requested` (the override token)? Must be
+   * CONSERVATIVE — return true when the pair is not deterministically
+   * comparable (see servedModelMatchesRequested in model-command.ts).
+   * Absent → the tripwire never fires (verification is skipped).
+   */
+  servedMatchesRequested?: (requested: string, served: string) => boolean
 }
 
 export interface SessionModelSource {
@@ -45,18 +72,37 @@ export interface SessionModelSource {
   /** The freshest observation across both sources, or null when neither has
    *  reported yet. */
   resolve(): SessionModelResolution | null
+  /** Register the handler fired when the FIRST transcript observation after a
+   *  set override fails the comparator (#3427 item 4). At most once per
+   *  override set; null unregisters. Replaces any prior handler. */
+  setDivergenceHandler(handler: ((d: SessionModelDivergence) => void) | null): void
 }
 
-export function createSessionModelSource(): SessionModelSource {
+export function createSessionModelSource(
+  options: SessionModelSourceOptions = {},
+): SessionModelSource {
   let seq = 0
   let transcript: { model: string; seq: number } | null = null
   let override: { model: string; seq: number } | null = null
+  // True while a non-null override awaits its first transcript observation.
+  // Consumed (set false) on that observation whether or not it diverges, so
+  // the handler fires at most once per override set.
+  let overrideUnverified = false
+  let onDivergence: ((d: SessionModelDivergence) => void) | null = null
   return {
     noteTranscriptModel(model: string): void {
       transcript = { model, seq: ++seq }
+      if (override != null && overrideUnverified) {
+        overrideUnverified = false
+        const matches = options.servedMatchesRequested
+        if (matches != null && !matches(override.model, model)) {
+          onDivergence?.({ requested: override.model, served: model })
+        }
+      }
     },
     setOverride(model: string | null): void {
       override = model == null ? null : { model, seq: ++seq }
+      overrideUnverified = model != null
     },
     getOverride(): string | null {
       return override?.model ?? null
@@ -68,6 +114,9 @@ export function createSessionModelSource(): SessionModelSource {
         return { model: override.model, source: 'override' }
       }
       return { model: transcript.model, source: 'transcript' }
+    },
+    setDivergenceHandler(handler: ((d: SessionModelDivergence) => void) | null): void {
+      onDivergence = handler
     },
   }
 }

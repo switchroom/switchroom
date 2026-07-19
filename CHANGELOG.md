@@ -25,6 +25,20 @@
   process writes (and sub-agent / Bash-CLI writes with no main-transcript
   tool_use) are at most TTL stale. Saves the 2s-timeout `list_directives`
   round-trip on cache-hit turns. (hindsight-leverage A4)
+- **`/model` rev5 carrier: auto-remediation + test hardening** (#3427, follow-up
+  to #3424) — `switchroom doctor --fix` now HEALS rev5 `.session-model` carrier
+  drift instead of only detecting it: each drifted/missing `start.sh` is
+  regenerated from the current template via the standard per-agent reconcile
+  (idempotent; healthy agents untouched; takes effect on the agent's next
+  restart). The requested-vs-served `--fallback-model` masking window is now
+  loud: the `/model` ack warns immediately for unvalidatable free-text
+  `claude-*` ids, and the first assistant line after an apply-boot is verified
+  against the requested token — a mismatch logs `gw /model served-model
+  DIVERGENCE`, drops the bogus override, and warns the initiating chat. The
+  #3424 source-string (`toContain`) tests are converted to behavioral tests of
+  the classify → log/card pipeline, and the `scaffold.session-model.test.ts`
+  live-resolution subset red on `main` is fixed (the fake `switchroom` CLI now
+  lives on an exec-capable filesystem — `/tmp` is noexec in the dev container).
 
 ## v0.19.2 — Hindsight recovery, External spend on /usage, auth-broker hardening, /model carrier doctor
 

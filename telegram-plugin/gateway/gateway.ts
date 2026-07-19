@@ -540,8 +540,10 @@ import {
   handleModelCommand,
   classifyModelSwitchConfirmation,
   formatModelRelaunchDiagLog,
-  formatModelSwitchConfirmationBody,
-  formatModelRelaunchSuppressNotAppliedLog,
+  resolveModelSwitchBootNotice,
+  servedModelMatchesRequested,
+  formatServedModelDivergenceLog,
+  formatServedModelDivergenceCard,
   buildModelMenu,
   handleModelMenuCallback,
   isValidModelArg,
@@ -3689,8 +3691,9 @@ const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
 // is seq-stamped and `resolve()` prefers the NEWER observation, so neither
 // source can go stale behind the other (session-model-source.ts, pinned by
 // tests/session-model-source.test.ts). buildAgentMetadata reads resolve();
-// the /model command paths write via setOverride.
-const sessionModelSource = createSessionModelSource()
+// the /model command paths write via setOverride. The comparator arms the
+// #3427 requested-vs-served tripwire (handler registered at boot rehydration).
+const sessionModelSource = createSessionModelSource({ servedMatchesRequested: servedModelMatchesRequested })
 // Captures the most-recently-started turn's sessionChatId. Unlike currentTurn,
 // this is NOT cleared by the silence poke (firePoke/clearTurnStarted). It lets
 // the Bug B fallback in executeReply route to the correct chat even when the
@@ -23926,6 +23929,27 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // scraped pane or an optimistic record.
                 const isApplyBoot = launched.length > 0 && launched !== configured
                 sessionModelSource.setOverride(isApplyBoot ? launched : null)
+                // #3427 item 4: arm the requested-vs-served tripwire — if the
+                // FIRST assistant line after this apply-boot serves a different
+                // model (invalid requested id, --fallback-model substituted),
+                // log, drop the bogus override, warn the operator (no silent heal).
+                if (isApplyBoot) {
+                  const dChat = modelSwitchMarkerChat
+                  sessionModelSource.setDivergenceHandler((d) => {
+                    process.stderr.write(formatServedModelDivergenceLog({ agent: getMyAgentName(), ...d }))
+                    sessionModelSource.setOverride(null)
+                    if (!dChat) return
+                    // allow-raw-bot-api: one-shot divergence warn, same shape as the switch confirmation below
+                    void lockedBot.api
+                      .sendMessage(dChat.chatId, formatServedModelDivergenceCard(d), {
+                        parse_mode: 'Markdown',
+                        ...(dChat.threadId != null ? { message_thread_id: dChat.threadId } : {}),
+                      })
+                      .catch((err: unknown) =>
+                        process.stderr.write(`telegram gateway: served-model divergence send failed: ${(err as Error)?.message ?? String(err)}\n`),
+                      )
+                  })
+                }
                 // F1/N4: classify + log + one confirmation card. Formatters live
                 // in model-command.ts so this file does not inflate (#2996 ratchet).
                 const confirmation = modelSwitchReason != null
@@ -23946,19 +23970,18 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 )
                 if (confirmation != null && modelSwitchMarkerChat) {
                   const chat = modelSwitchMarkerChat
-                  const hasSessionModelAlert = existsSync(join(smAgentDir, '.session-model-alert'))
-                  if (confirmation.kind === 'not-applied' && hasSessionModelAlert) {
-                    process.stderr.write(
-                      formatModelRelaunchSuppressNotAppliedLog({
-                        agent: getMyAgentName(),
-                        target: confirmation.target,
-                      }),
-                    )
+                  // #3427 item 2: card-vs-suppress decision is pure + behaviorally tested.
+                  const notice = resolveModelSwitchBootNotice({
+                    agent: getMyAgentName(),
+                    confirmation,
+                    hasSessionModelAlert: existsSync(join(smAgentDir, '.session-model-alert')),
+                  })
+                  if (notice.kind === 'suppress') {
+                    process.stderr.write(notice.log)
                   } else {
-                    const body = formatModelSwitchConfirmationBody(confirmation)
                     // allow-raw-bot-api: one-shot boot confirmation, same shape as the session-model alert relay below
                     void lockedBot.api
-                      .sendMessage(chat.chatId, body, {
+                      .sendMessage(chat.chatId, notice.body, {
                         parse_mode: 'Markdown',
                         ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
                       })

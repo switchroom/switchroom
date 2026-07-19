@@ -10,7 +10,7 @@ runtime (including `deps`, `issues`, `migrate`).
 
 ```bash
 switchroom setup                              # Interactive wizard
-switchroom doctor                             # Health check
+switchroom doctor [--fix]                     # Health check; --fix auto-heals rev5 /model carrier drift (regenerates drifted start.sh)
 switchroom apply                              # Reconcile + regenerate docker-compose.yml (self-elevates via sudo for scaffolds). Does NOT run docker; prints the `up` command
 switchroom update [--check|--status|--rebuild] # Operator catch-up: pull images + apply + recreate fleet + doctor
 switchroom restart [agent] [--force]          # Bounce agent(s); drains in-flight turn by default

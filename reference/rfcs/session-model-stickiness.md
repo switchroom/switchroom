@@ -95,12 +95,18 @@ Everything else in §0.1 (session-scoped revert on the next restart, consume-onc
   `.active-session-model` holds the requested token. This is NOT a persistent
   lie: the transcript's `message.model` reclaims the source on the first
   assistant line, correcting `/status` to the model actually serving calls. The
-  pre-first-assistant window is the only optimistic window (bounded,
-  self-healing); it is documented here, not silently asserted as success. The
-  honest-FAILURE surface is scoped to the three modes start.sh's
-  `.session-model-alert` can report (corrupt carrier / configured-default changed
-  / proxy-only + LiteLLM-down); other divergence is corrected by the transcript,
-  not announced.
+  pre-first-assistant window is the only optimistic window (bounded). Since
+  #3427 item 4 the correction is LOUD, not silent: (a) the `/model` ack for a
+  free-text `claude-*` full id carries an immediate caveat that the id cannot
+  be pre-validated (Claude-native constraint — no raw API probe) and that the
+  fallback may substitute; (b) the session-model source verifies the FIRST
+  post-override transcript line against the requested token
+  (`servedModelMatchesRequested`, conservative — never accuses a
+  non-comparable pair) and on mismatch the gateway logs
+  `gw /model served-model DIVERGENCE`, drops the bogus override, and sends a
+  one-shot ⚠️ card to the initiating chat. The honest-FAILURE surface at boot
+  remains the three `.session-model-alert` modes (corrupt carrier /
+  configured-default changed / proxy-only + LiteLLM-down).
 
 - **`default` reverts via relaunch.** With inject retired, `/model default`
   clears the carrier + in-memory override and RELAUNCHES so the live session

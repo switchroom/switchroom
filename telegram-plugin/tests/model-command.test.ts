@@ -32,6 +32,10 @@ import {
   parseModelSwitchTarget,
   modelFamilyToken,
   MODEL_ALIASES,
+  servedModelMatchesRequested,
+  formatServedModelDivergenceLog,
+  formatServedModelDivergenceCard,
+  unvalidatedIdCaveat,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
 
@@ -689,5 +693,98 @@ describe("modelFamilyToken", () => {
   it("keeps sr-* routing ids verbatim (no claude- prefix)", () => {
     expect(modelFamilyToken("sr-glm-5")).toBe("sr-glm-5");
     expect(modelFamilyToken("sr-gemini-2.5-flash")).toBe("sr-gemini-2.5-flash");
+  });
+});
+
+// ── #3427 item 4: requested-vs-served divergence (fallback-model masking) ────
+
+describe("servedModelMatchesRequested", () => {
+  it("matches a requested alias against its resolved full id (family)", () => {
+    expect(servedModelMatchesRequested("sonnet", "claude-sonnet-5")).toBe(true);
+    expect(servedModelMatchesRequested("opus", "claude-opus-4-8")).toBe(true);
+    expect(servedModelMatchesRequested("fable", "claude-fable-5")).toBe(true);
+  });
+
+  it("flags a requested alias served by a DIFFERENT family (fallback substituted)", () => {
+    expect(servedModelMatchesRequested("sonnet", "claude-opus-4-8")).toBe(false);
+    expect(servedModelMatchesRequested("haiku", "claude-sonnet-5")).toBe(false);
+  });
+
+  it("matches a full id exactly and as a date-stamped descendant", () => {
+    expect(servedModelMatchesRequested("claude-sonnet-5", "claude-sonnet-5")).toBe(true);
+    expect(servedModelMatchesRequested("claude-sonnet-5", "claude-sonnet-5-20260203")).toBe(true);
+    expect(servedModelMatchesRequested("Claude-Sonnet-5", "claude-sonnet-5")).toBe(true);
+  });
+
+  it("flags an invalid/unknown full id served by the fallback — the masking case", () => {
+    // THE #3427 item-4 case: `/model claude-sonnet-9` (nonexistent) launches,
+    // --fallback-model silently serves opus. A test that wouldn't fail on the
+    // masking is not a test: this must be a MISMATCH.
+    expect(servedModelMatchesRequested("claude-sonnet-9", "claude-opus-4-8")).toBe(false);
+    // Same-family but wrong version is still a mismatch (sonnet-9 ≠ sonnet-5).
+    expect(servedModelMatchesRequested("claude-sonnet-9", "claude-sonnet-5")).toBe(false);
+  });
+
+  it("is conservative: non-claude served ids and non-comparable requests never accuse", () => {
+    // LiteLLM/sr-* served names are not deterministically comparable.
+    expect(servedModelMatchesRequested("sr-glm-5", "glm-5")).toBe(true);
+    expect(servedModelMatchesRequested("claude-sonnet-5", "sr-glm-5")).toBe(true);
+    // Legacy friendly-label overrides ("Opus 4.8") are not comparable either.
+    expect(servedModelMatchesRequested("Opus 4.8", "claude-opus-4-8")).toBe(true);
+    // The default sentinel never diverges.
+    expect(servedModelMatchesRequested("default", "claude-opus-4-8")).toBe(true);
+  });
+});
+
+describe("served-model divergence formatters (#3427 item 4)", () => {
+  it("log line is greppable and names requested + served", () => {
+    const log = formatServedModelDivergenceLog({
+      agent: "klanker",
+      requested: "claude-sonnet-9",
+      served: "claude-opus-4-8",
+    });
+    expect(log).toContain("gw /model served-model DIVERGENCE agent=klanker");
+    expect(log).toContain("requested=claude-sonnet-9");
+    expect(log).toContain("served=claude-opus-4-8");
+    expect(log.endsWith("\n")).toBe(true);
+  });
+
+  it("card warns, names both models in backticks, and says how to recover", () => {
+    const card = formatServedModelDivergenceCard({
+      requested: "claude-sonnet-9",
+      served: "claude-opus-4-8",
+    });
+    expect(card).toContain("⚠️");
+    expect(card).toContain("`claude-opus-4-8`");
+    expect(card).toContain("`claude-sonnet-9`");
+    expect(card).toContain("/model");
+    expect(card).not.toContain("✅");
+  });
+});
+
+describe("unvalidatedIdCaveat — immediate fail-fast warn on free-text claude-* ids (#3427 item 4)", () => {
+  const esc = { escapeHtml: (s: string) => s };
+
+  it("warns for a full claude-* id (cannot be pre-validated)", () => {
+    const caveat = unvalidatedIdCaveat(esc, "claude-sonnet-9");
+    expect(caveat).not.toBeNull();
+    expect(caveat).toContain("claude-sonnet-9");
+    expect(caveat).toContain("fallback");
+  });
+
+  it("stays silent for aliases, sr-* ids and the default sentinel", () => {
+    expect(unvalidatedIdCaveat(esc, "opus")).toBeNull();
+    expect(unvalidatedIdCaveat(esc, "sonnet")).toBeNull();
+    expect(unvalidatedIdCaveat(esc, "sr-glm-5")).toBeNull();
+    expect(unvalidatedIdCaveat(esc, "default")).toBeNull();
+  });
+
+  it("the /model set ACK carries the caveat for a typed full id — and not for an alias", async () => {
+    const { deps } = makeDeps();
+    const full = await handleModelCommand({ kind: "set", model: "claude-sonnet-9" }, deps);
+    expect(full.text).toContain("can't be validated before launch");
+    expect(full.text).toContain("fallback");
+    const alias = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(alias.text).not.toContain("can't be validated before launch");
   });
 });

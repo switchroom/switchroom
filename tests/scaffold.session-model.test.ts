@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, chmodSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, chmodSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -628,8 +628,13 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "switchroom-live-model-"));
-    fakeBin = join(tmpDir, "fakebin");
-    mkdirSync(fakeBin, { recursive: true });
+    // The fake `switchroom` CLI must live on a filesystem that allows exec —
+    // os.tmpdir() (/tmp) is mounted noexec in the dev container, which made
+    // every live read silently fail (exit 126, stderr suppressed) and fall
+    // back to the bake, failing the live-resolution subset on main (#3427
+    // item 3). /var/tmp is exec-capable here and on CI; same convention as
+    // turn-pacing-hook.test.ts and host-control/server.test.ts.
+    fakeBin = mkdtempSync(join("/var/tmp", "switchroom-live-model-bin-"));
     cfgPath = join(tmpDir, "switchroom.yaml");
     writeFileSync(cfgPath, "agents: {}\n");
     scaffold();
@@ -637,6 +642,7 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
   });
 
   // THE regression test the fable launch bug was missing: yaml edited to

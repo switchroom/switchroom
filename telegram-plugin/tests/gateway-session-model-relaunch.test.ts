@@ -17,6 +17,11 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { SESSION_MODEL_FILE } from '../gateway/session-model-file.js'
+import {
+  classifyModelSwitchConfirmation,
+  formatModelRelaunchDiagLog,
+  resolveModelSwitchBootNotice,
+} from '../gateway/model-command.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const MODEL_COMMAND_SRC = readFileSync(
@@ -158,42 +163,162 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     expect(MODEL_COMMAND_SRC).toContain('gw /model relaunch applied agent=')
   })
 
-  it('logs outcome KIND explicitly on /model switch rehydration (NOT-APPLIED vs applied vs default)', () => {
-    // Formatters live in model-command.ts (gateway line-ratchet); gateway only calls them.
-    expect(GATEWAY_SRC).toContain('formatModelRelaunchDiagLog')
-    expect(GATEWAY_SRC).toContain('formatModelSwitchConfirmationBody')
-    expect(GATEWAY_SRC).toContain('formatModelRelaunchSuppressNotAppliedLog')
-    expect(MODEL_COMMAND_SRC).toContain('gw /model relaunch NOT-APPLIED agent=')
-    expect(MODEL_COMMAND_SRC).toContain('override=set outcome=applied')
-    expect(MODEL_COMMAND_SRC).toContain('override=cleared outcome=default')
-    expect(MODEL_COMMAND_SRC).toContain('gw /model relaunch NOT-APPLIED — suppressing not-applied confirmation')
+  // #3427 item 2: the following are BEHAVIORAL tests — they run the real
+  // classifier → formatter/notice pipeline and assert the EMITTED outcome
+  // (log line / card body), not that a string merely exists in the source.
+  // The thin `wires …` test at the end pins that gateway.ts actually calls
+  // this pipeline (the gateway boot IIFE cannot be unit-booted).
+
+  it('emits the NOT-APPLIED log for a silent revert (classify → formatModelRelaunchDiagLog)', () => {
+    const confirmation = classifyModelSwitchConfirmation({
+      reason: 'user: /model fable (session-only relaunch, menu)',
+      launched: 'claude-opus-4-8',
+      configured: 'claude-opus-4-8',
+    })
+    expect(confirmation.kind).toBe('not-applied')
+    const log = formatModelRelaunchDiagLog({
+      agent: 'klanker',
+      launched: 'claude-opus-4-8',
+      configured: 'claude-opus-4-8',
+      confirmation,
+      isApplyBoot: false,
+    })
+    expect(log).toContain('gw /model relaunch NOT-APPLIED agent=klanker')
+    expect(log).toContain('target=fable')
+    expect(log).toContain('revertedTo=claude-opus-4-8')
   })
 
-  it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the /model reason (F1/N4)', () => {
+  it('emits outcome=applied for a landed switch and outcome=default for a revert', () => {
+    const applied = classifyModelSwitchConfirmation({
+      reason: 'user: /model claude-haiku-4-5 (session-only relaunch)',
+      launched: 'claude-haiku-4-5',
+      configured: 'claude-opus-4-8',
+    })
+    expect(
+      formatModelRelaunchDiagLog({
+        agent: 'a', launched: 'claude-haiku-4-5', configured: 'claude-opus-4-8',
+        confirmation: applied, isApplyBoot: true,
+      }),
+    ).toContain('override=set outcome=applied')
+    const dflt = classifyModelSwitchConfirmation({
+      reason: 'user: /model default (revert relaunch)',
+      launched: 'claude-opus-4-8',
+      configured: 'claude-opus-4-8',
+    })
+    expect(
+      formatModelRelaunchDiagLog({
+        agent: 'a', launched: 'claude-opus-4-8', configured: 'claude-opus-4-8',
+        confirmation: dflt, isApplyBoot: false,
+      }),
+    ).toContain('override=cleared outcome=default')
+  })
+
+  it('sends the green applied card for a landed switch, the default card for an intended revert (F1/N4)', () => {
+    const applied = resolveModelSwitchBootNotice({
+      agent: 'a',
+      confirmation: classifyModelSwitchConfirmation({
+        reason: 'user: /model fable (session-only relaunch)',
+        launched: 'fable',
+        configured: 'claude-opus-4-8',
+      }),
+      hasSessionModelAlert: false,
+    })
+    expect(applied.kind).toBe('card')
+    if (applied.kind === 'card') {
+      expect(applied.body).toContain('✅ Now running `fable`')
+      expect(applied.body).toContain('session-only')
+    }
+    // N4: launched===configured on a /model default reason still confirms.
+    const dflt = resolveModelSwitchBootNotice({
+      agent: 'a',
+      confirmation: classifyModelSwitchConfirmation({
+        reason: 'user: /model default (revert relaunch)',
+        launched: 'claude-opus-4-8',
+        configured: 'claude-opus-4-8',
+      }),
+      hasSessionModelAlert: false,
+    })
+    expect(dflt.kind).toBe('card')
+    if (dflt.kind === 'card') {
+      expect(dflt.body).toContain('✅ Now running `claude-opus-4-8` (the configured default)')
+    }
+  })
+
+  it('warns (⚠️, not a green ✅) when a non-default switch silently reverted to the default (silent-revert fix)', () => {
+    const notice = resolveModelSwitchBootNotice({
+      agent: 'a',
+      confirmation: classifyModelSwitchConfirmation({
+        reason: 'user: /model fable (session-only relaunch, menu)',
+        launched: 'claude-opus-4-8',
+        configured: 'claude-opus-4-8',
+      }),
+      hasSessionModelAlert: false,
+    })
+    expect(notice.kind).toBe('card')
+    if (notice.kind === 'card') {
+      expect(notice.body).toContain("⚠️ Your switch to `fable` didn't apply")
+      expect(notice.body).toContain('reverted to `claude-opus-4-8`')
+      // LOW-3: the re-issue hint keeps the target inside backticks.
+      expect(notice.body).toContain('Re-issue `/model fable`')
+      expect(notice.body).not.toContain('✅')
+    }
+  })
+
+  it('suppresses ONLY the not-applied card when a tailored .session-model-alert is present (LOW-2)', () => {
+    const reverted = classifyModelSwitchConfirmation({
+      reason: 'user: /model fable (session-only relaunch)',
+      launched: 'claude-opus-4-8',
+      configured: 'claude-opus-4-8',
+    })
+    const suppressed = resolveModelSwitchBootNotice({
+      agent: 'klanker',
+      confirmation: reverted,
+      hasSessionModelAlert: true,
+    })
+    expect(suppressed.kind).toBe('suppress')
+    if (suppressed.kind === 'suppress') {
+      expect(suppressed.log).toContain('suppressing not-applied confirmation')
+      expect(suppressed.log).toContain('agent=klanker')
+      expect(suppressed.log).toContain('target=fable')
+    }
+    // An APPLIED switch still confirms even when an (unrelated) alert exists.
+    const applied = resolveModelSwitchBootNotice({
+      agent: 'klanker',
+      confirmation: classifyModelSwitchConfirmation({
+        reason: 'user: /model fable (session-only relaunch)',
+        launched: 'fable',
+        configured: 'claude-opus-4-8',
+      }),
+      hasSessionModelAlert: true,
+    })
+    expect(applied.kind).toBe('card')
+  })
+
+  it('wires the pipeline into the boot rehydration (gateway calls classify → diag log → notice)', () => {
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 2500)
+    const win = GATEWAY_SRC.slice(idx, idx + 4200)
+    expect(win).toContain('classifyModelSwitchConfirmation({')
+    expect(win).toContain('formatModelRelaunchDiagLog')
     expect(win).toContain('if (confirmation != null && modelSwitchMarkerChat)')
-    expect(win).toContain('formatModelSwitchConfirmationBody')
-    expect(MODEL_COMMAND_SRC).toContain('✅ Now running')
-    expect(MODEL_COMMAND_SRC).toContain('(the configured default)')
-  })
-
-  it('warns instead of a green ✅ when a non-default switch silently reverted to the default (silent-revert fix)', () => {
-    expect(GATEWAY_SRC).toContain('classifyModelSwitchConfirmation({')
-    expect(GATEWAY_SRC).toContain('formatModelSwitchConfirmationBody')
-    expect(MODEL_COMMAND_SRC).toContain('⚠️ Your switch to')
-    expect(MODEL_COMMAND_SRC).toContain("didn't apply")
-    // LOW-3: re-issue hint keeps target in backticks
-    expect(MODEL_COMMAND_SRC).toContain('Re-issue `/model ')
-  })
-
-  it('dedups the not-applied card against a tailored .session-model-alert (LOW-2)', () => {
-    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
-    const win = GATEWAY_SRC.slice(idx, idx + 2500)
+    expect(win).toContain('resolveModelSwitchBootNotice({')
     expect(win).toContain("existsSync(join(smAgentDir, '.session-model-alert'))")
-    expect(win).toContain("confirmation.kind === 'not-applied' && hasSessionModelAlert")
-    expect(win).toContain('formatModelRelaunchSuppressNotAppliedLog')
+    // Both notice arms are consumed: suppress → stderr, card → sendMessage.
+    expect(win).toContain('process.stderr.write(notice.log)')
+    expect(win).toContain('.sendMessage(chat.chatId, notice.body')
+  })
+
+  it('arms the #3427 requested-vs-served tripwire on an apply-boot (comparator + handler)', () => {
+    // The source is constructed with the conservative comparator…
+    expect(GATEWAY_SRC).toContain('createSessionModelSource({ servedMatchesRequested: servedModelMatchesRequested })')
+    // …and the apply-boot rehydration registers the handler that logs, drops
+    // the bogus override, and warns the initiating chat.
+    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
+    const win = GATEWAY_SRC.slice(idx, idx + 4200)
+    expect(win).toContain('sessionModelSource.setDivergenceHandler((d) =>')
+    expect(win).toContain('formatServedModelDivergenceLog')
+    expect(win).toContain('sessionModelSource.setOverride(null)')
+    expect(win).toContain('formatServedModelDivergenceCard(d)')
   })
 
   it('N4/reason: the /model switch reason is captured from the clean-shutdown marker', () => {
