@@ -191,8 +191,12 @@ describe('anthropic_oauth_code pattern — URL false-positive regression', () =>
 // Test 2: Blocker 1 sequencing — structural check that deleteMessage is called
 // inside the pendingReauthFlows intercept path, before setMessageReaction.
 describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)', () => {
+  // P7 PR-7 (#2996): the reauth intercept body moved verbatim into
+  // gateway/inbound-interceptors.ts (interceptReauth); the redaction is the
+  // injected deps.redactAuthCode closure over redactAuthCodeMessage +
+  // redactAuthCodeApi (bound in gateway.ts). Same pins, new file owner.
   const src = readFileSync(
-    new URL('../gateway/gateway.ts', import.meta.url),
+    new URL('../gateway/inbound-interceptors.ts', import.meta.url),
     'utf8',
   )
 
@@ -202,7 +206,7 @@ describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)'
     // `setMessageReaction(...)` literals, but #488 consolidated all 6
     // auth-code paste paths through `redactAuthCodeMessage`. The pin
     // is now: the intercept block must call the helper.
-    const interceptIdx = src.indexOf('// Auth-code intercept')
+    const interceptIdx = src.indexOf('export async function interceptReauth(')
     expect(interceptIdx).toBeGreaterThan(0)
 
     // Find the end of this intercept block — the next blank line after
@@ -215,7 +219,7 @@ describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)'
     // (optionally cast, #623), now the gated `redactAuthCodeApi` adapter whose
     // reaction routes through the send gate + flood breaker (#3155). `msgId`
     // may be narrowed (`msgId ?? null`).
-    expect(window).toMatch(/redactAuthCodeMessage\((?:bot\.api|redactAuthCodeApi)(?:\s+as\s+\w+)?,\s*chat_id,\s*msgId(?:\s*\?\?\s*null)?(?:,\s*[^)]+)?\)/)
+    expect(window).toMatch(/deps\.redactAuthCode\(p\.chat_id,\s*p\.msgId(?:\s*\?\?\s*null)?\)/)
   })
 
   it('redaction lands AFTER the success/error reply renders', () => {
@@ -224,10 +228,10 @@ describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)'
     // even if their original message disappears mid-render. Same
     // ordering the helper preserves — fire-and-forget redaction
     // happens after `await switchroomReply(...)`.
-    const interceptIdx = src.indexOf('// Auth-code intercept')
+    const interceptIdx = src.indexOf('export async function interceptReauth(')
     const window = src.slice(interceptIdx, interceptIdx + 2000)
-    const replyIdx = window.indexOf('switchroomReply(ctx,')
-    const redactIdx = window.indexOf('redactAuthCodeMessage(')
+    const replyIdx = window.indexOf('deps.switchroomReply(')
+    const redactIdx = window.indexOf('deps.redactAuthCode(')
     expect(replyIdx).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(0)
     expect(replyIdx).toBeLessThan(redactIdx)
