@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.19.6 — No more duplicate near-identical Telegram replies in a single turn
+
+### Fixes
+
+- **Duplicate near-identical Telegram replies in a single turn are eliminated**
+  (#3475) — a reworded late reply now supersedes the provisional turn-flush
+  draft, so users no longer see the same answer twice (lightly reworded). This
+  was a regression from #3429 (shipped in v0.19.5): after that change a
+  reworded late reply no longer superseded the flushed draft, so the flush
+  draft and the model's regenerated reply both went out. Observed on the
+  `marko` agent ~39 times on 2026-07-20
+  (fingerprint `agent:marko::duplicate_reply_backstop_flush`). The fix is
+  deterministic, keyed on a subagent-handback in-flight marker: the model's
+  own reworded late reply now supersedes the flushed draft (collapse to one
+  message), while a genuine background sub-agent handback still shows as two
+  messages — so the #3429 data-loss regression it originally guarded against
+  does not return. Adversarial review of the fix found and closed two
+  silent-data-loss edge paths: a model-steerable positive-tier bypass and a
+  boot-replay marker gap.
+
 ## v0.19.5 — Model-switch stickiness, /usage spend, hang self-heal, no duplicate replies
 
 ### Fixes
