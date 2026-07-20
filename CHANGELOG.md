@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+## v0.19.5 — Model-switch stickiness, /usage spend, hang self-heal, no duplicate replies
+
+### Fixes
+
+- **`/model` (and `/effort`) overrides actually stick for the session**
+  (#3459) — a Telegram `/model <x>` was silently dropped at boot: the
+  gateway consumed the session-model carrier before `start.sh` read it, so
+  the relaunched agent came up on its configured default instead of the
+  requested model (the "switched overlord to fable but it didn't take"
+  symptom). The boot race is closed — the carrier survives the single
+  relaunch that applies it — while still reverting to the `switchroom.yaml`
+  default on the next restart (session-scoped, per the standing invariant).
+- **Duplicate Telegram replies eliminated** (#3469) — a turn that finished
+  without calling the reply tool could deliver the SAME answer twice (the
+  silent-end safety net flushed a buffered answer while the re-prompted
+  turn also sent). A deterministic single-writer election now makes exactly
+  one path own delivery, and it holds even when the re-prompt reworded the
+  answer (which defeated the earlier exact-hash/supersede guards). Capstone
+  on the outbound-dedup line (#3236/#3240/#3241/#3276/#3282).
+- **Agents self-heal from hung turns** (#3473) — an agent wedged waiting
+  inside an in-flight tool call was classified as "healthy work," so nothing
+  killed or restarted it and it required a manual `agent restart` (the carrie
+  wedge). A progress-based watchdog now keys on turn-active-marker mtime
+  staleness (a genuinely busy turn keeps advancing the marker via tool_use
+  and sub-agent JSONL growth; a true hang lets it go stale), restarts the
+  stuck child via the SIGTERM-PID1 path, and recovers through the ask-first
+  `resume_watchdog_timeout` boot path — never an assertive auto-resume.
+  Long single-tool turns (build/test `Bash`, large `WebFetch`/crawl,
+  research) are explicitly protected from a false-positive kill; the residual
+  (a genuine hang *inside* such a protected long tool) is documented and
+  falls to that tool's own timeout.
+- **`/usage` External spend row populates** (#3470) — on a fleet whose
+  LiteLLM proxy binds host loopback, the auth-broker couldn't reach it over
+  the container bridge, so the `/usage` card's External (OpenRouter) spend
+  row rendered blank. The broker now joins host networking when the LiteLLM
+  base is loopback, reaching the 127.0.0.1-published proxy; the master key
+  still crosses only the UDS summary channel, never the wire. Broker→LiteLLM
+  spend failures now log (were silently swallowed to a blank row).
+- **Accidental line-leading `#` no longer renders as a heading** (#3463) —
+  a message whose line happens to start with `#` (e.g. an issue reference)
+  is escaped at the universal send seam instead of being promoted to a
+  Telegram heading.
+
+### Internal
+
+- Gateway pure-helper extractions and render-corpus characterization tests
+  (#3458, #3460, #3461, #3464, #3465) — internal hardening / test coverage,
+  no user-visible behavior change.
+
 ## v0.19.4 — Entitlement-403 account detection + eligibility block
 
 Completes the retired-account work from v0.19.3 (which stopped disabled
