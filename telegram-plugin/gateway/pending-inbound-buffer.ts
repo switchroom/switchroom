@@ -31,6 +31,7 @@
 
 import type { InboundMessage } from './ipc-protocol.js'
 import type { InboundSpool } from './inbound-spool.js'
+import { stampsHandbackMarker } from './subagent-handback-marker.js'
 
 /** Default cap per agent. Tuned for `should fit a reasonable backlog of
  *  approval cards stacked while bridge is offline` but no more. */
@@ -82,13 +83,17 @@ export interface PendingInboundBufferOptions {
   /**
    * fix/backstop-duplicate-reply MUST-FIX 2 — called on every push of a
    * `subagent_handback` envelope (live synthesis AND boot-replay re-push),
-   * carrying the envelope's `chatId` and its own `ts` (ms). The gateway wires
-   * this to the per-chat subagent-handback marker so the supersede path can tell
-   * a flushed turn's own late reply from a background handback attributed to it
-   * — INCLUDING after a restart, where the only handback push is the replay.
-   * Best-effort: a throw here never breaks the push hot path.
+   * carrying the envelope's `chatId`, its `threadId` (the originating forum
+   * topic, or undefined for a DM), and its own `ts` (ms). The gateway wires this
+   * to the per-chat/thread subagent-handback marker so the supersede path can
+   * tell a flushed turn's own late reply from a background handback attributed to
+   * it — INCLUDING after a restart, where the only handback push is the replay.
+   * The `threadId` is passed so the marker keys on the SAME `chatId|threadId`
+   * lane the supersede registry uses (dup-audit F2): a handback in one topic must
+   * not hold the content gate open in another. Best-effort: a throw here never
+   * breaks the push hot path.
    */
-  onHandbackEnqueue?: (chatId: string, ts: number) => void
+  onHandbackEnqueue?: (chatId: string, threadId: number | undefined, ts: number) => void
 }
 
 /**
@@ -362,9 +367,17 @@ export function createPendingInboundBuffer(
       // content gate → silent edit-over-answer. Uses the envelope's own `ts`
       // (ms, `Date.now()`-derived at synthesis) so the marker reflects when the
       // handback actually happened, not the replay moment. Best-effort.
-      if (msg.meta?.source === 'subagent_handback' && opts.onHandbackEnqueue != null) {
+      // F1 (dup-audit) — the ONE chokepoint that decides which sources stamp the
+      // decoupled-completion marker, delegated to the single `stampsHandbackMarker`
+      // predicate (its membership is the invariant's only extension point). Every
+      // inbound — live synthesis AND boot-replay — funnels through this push(), so
+      // routing the decision here makes "a decoupled late-reply source stamps the
+      // marker" true BY CONSTRUCTION rather than by per-feature discipline.
+      if (stampsHandbackMarker(msg.meta?.source) && opts.onHandbackEnqueue != null) {
         try {
-          opts.onHandbackEnqueue(msg.chatId, msg.ts)
+          // F2 (dup-audit): pass the envelope's originating topic so the marker
+          // keys on the same `chatId|threadId` lane as the supersede registry.
+          opts.onHandbackEnqueue(msg.chatId, msg.threadId, msg.ts)
         } catch {
           /* marker stamp is best-effort; never break the push hot path */
         }

@@ -46,7 +46,7 @@ import {
 } from '../gateway/outbound-send-path.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
-import { SubagentHandbackMarker } from '../gateway/subagent-handback-marker.js'
+import { SubagentHandbackMarker, stampsHandbackMarker } from '../gateway/subagent-handback-marker.js'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, Access } from '../gateway/gateway.js'
@@ -887,7 +887,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const marker = new SubagentHandbackMarker()
     const buffer = createPendingInboundBuffer({
       log: () => {},
-      onHandbackEnqueue: (chatId, ts) => marker.record(chatId, ts),
+      onHandbackEnqueue: (chatId, threadId, ts) => marker.record(chatId, threadId, ts),
     })
 
     // Simulate the boot-replay re-push of an un-acked spooled handback envelope.
@@ -905,14 +905,14 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
       meta: { source: 'subagent_handback' },
     })
     // The chokepoint stamped the marker from the replay push (pre-fix: empty).
-    expect(marker.lastAt(CHAT)).toBe(handbackTs)
+    expect(marker.lastAt(CHAT, undefined)).toBe(handbackTs)
 
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
     h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
     // The gateway reads the marker the boot-replay stamped.
-    h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAt(chatId)
+    h.deps.getLastSubagentHandbackAt = (chatId, threadId) => marker.lastAt(chatId, threadId)
 
     const res = await sendReply(h.deps, req(HANDBACK))
 
@@ -929,12 +929,130 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const marker = new SubagentHandbackMarker()
     const buffer = createPendingInboundBuffer({
       log: () => {},
-      onHandbackEnqueue: (chatId, ts) => marker.record(chatId, ts),
+      onHandbackEnqueue: (chatId, threadId, ts) => marker.record(chatId, threadId, ts),
     })
     buffer.push('marko', {
       type: 'inbound', chatId: CHAT, messageId: 5, user: 'ken', userId: 1,
       ts: Date.now(), text: 'hi', meta: {},
     })
-    expect(marker.lastAt(CHAT)).toBe(null)
+    expect(marker.lastAt(CHAT, undefined)).toBe(null)
+  })
+
+  // ─── F2 (dup-audit): thread-keyed marker — no cross-topic gate leak ───
+  //
+  // The supersede registry is keyed on `chatId|threadId`; the marker used to key
+  // on `chatId` alone. In a forum supergroup a background handback in topic A
+  // stamped the chat-wide marker, so a genuine CASE-A reworded own-reply in topic
+  // B within 60 s kept the content gate and shipped a SECOND visible bubble
+  // instead of collapsing. Thread-keying confines the gate-hold to the topic the
+  // handback landed in. This drives the REAL buffer chokepoint (which now passes
+  // the envelope's threadId) + the REAL send path, and asserts topic B's
+  // delivered-message outcome is UNCHANGED by topic A's handback.
+  it('F2: a handback in forum topic A does NOT change topic B\'s CASE-A collapse ' +
+    '(delivered-count unchanged) — thread-keyed marker', async () => {
+    const TOPIC_A = 111
+    const TOPIC_B = 222
+    const marker = new SubagentHandbackMarker()
+    const buffer = createPendingInboundBuffer({
+      log: () => {},
+      onHandbackEnqueue: (chatId, threadId, ts) => marker.record(chatId, threadId, ts),
+    })
+    // A background handback lands in TOPIC A (its envelope carries threadId=A).
+    const handbackTs = Date.now() - 15_000
+    buffer.push('marko', {
+      type: 'inbound', chatId: CHAT, threadId: TOPIC_A, messageId: handbackTs,
+      user: 'subagent-watcher', userId: 0, ts: handbackTs, text: 'handback',
+      meta: { source: 'subagent_handback' },
+    })
+    // Topic A is marked; topic B is NOT (the fix — pre-fix both were marked).
+    expect(marker.lastAt(CHAT, TOPIC_A)).toBe(handbackTs)
+    expect(marker.lastAt(CHAT, TOPIC_B)).toBe(null)
+
+    // A genuine CASE-A reworded own-reply now lands late in TOPIC B: latest-ended
+    // tier, and — because the marker is thread-keyed — NO handback is in flight
+    // for topic B, so it collapses the flushed draft to ONE message.
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    // Seed the flush record on topic B's lane.
+    h.deps.flushedTurnSupersede.record(
+      CHAT, TOPIC_B,
+      { turnId: owner.turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now(),
+    )
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.getLastSubagentHandbackAt = (chatId, threadId) => marker.lastAt(chatId, threadId)
+
+    const res = await sendReply(
+      h.deps,
+      req(REWORDED_SAME_TURN_ANSWER, { message_thread_id: TOPIC_B }),
+    )
+
+    // Topic B collapses to ONE message (edit-in-place) — topic A's handback did
+    // not leak its gate-hold into topic B.
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+
+  // ─── F1 (dup-audit): negative outcome guard — no silent edit-over ───
+  //
+  // The content-gate bypass must NEVER silently edit over a flush-delivered
+  // answer with FOREIGN content on a non-live tier. A decoupled completion (the
+  // handback class the marker covers) landing with genuinely different content,
+  // resolving an ended flushed turn via the latest-ended tier, must SEND FRESH —
+  // the flushed answer left untouched (Telegram edits do not re-notify, so an
+  // edit-over is a silent double-loss: the handback never surfaces AND the answer
+  // is destroyed — the #3429 incident). This pins the invariant's OUTCOME: the
+  // stamp (driven by the single chokepoint predicate) keeps the gate, and the
+  // foreign reply never touches the delivered answer.
+  it('F1: a decoupled foreign-content reply on a non-live tier resolving a ' +
+    'DIFFERENT ended turn sends FRESH — the flushed answer is never edited/deleted', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // The reply resolves the flush-delivered ENDED turn via the ambiguous
+    // latest-ended tier (no live turn, no positive attribution) and carries
+    // FOREIGN content (a worker report, not this turn's answer nor a rewording).
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    // A decoupled completion IS in the window (the marker stamped it) — so this
+    // late reply might BE it. The invariant keeps the content gate.
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    // FRESH notifying send; the flushed answer is NEITHER edited nor deleted.
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // The flush record is NOT consumed — the flushed answer stands, and the
+    // turn's OWN canonical replay can still correct it.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  // Structural: the stamp membership lives in exactly ONE predicate, consulted
+  // at the ONE buffer chokepoint. If a future refactor inlines a bare
+  // `=== 'subagent_handback'` check at the chokepoint (bypassing the predicate),
+  // the invariant's single-extension-point guarantee is lost — fail loudly.
+  it('F1: the buffer chokepoint stamps via the stampsHandbackMarker predicate, ' +
+    'not an inlined source literal', () => {
+    const bufferSrc = readFileSync(new URL('../gateway/pending-inbound-buffer.ts', import.meta.url), 'utf8')
+    expect(bufferSrc).toContain('stampsHandbackMarker(msg.meta?.source)')
+    // The predicate itself is the single membership definition.
+    expect(stampsHandbackMarker('subagent_handback')).toBe(true)
+    expect(stampsHandbackMarker('cron')).toBe(false)
+    expect(stampsHandbackMarker('resume_interrupted')).toBe(false)
+    expect(stampsHandbackMarker(undefined)).toBe(false)
   })
 })

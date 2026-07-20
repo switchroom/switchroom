@@ -672,7 +672,7 @@ export interface SendReplyGatewayDeps {
   ): number | undefined
   resolveThreadId(chatId: string, explicit?: string | number | null): number | undefined
   getLatestInboundMessageId(chatId: string, threadId: number | null): number | null | undefined
-  getLastSubagentHandbackAt(chatId: string): number | null
+  getLastSubagentHandbackAt(chatId: string, threadId: number | undefined): number | null
   recordOutbound(rec: {
     chat_id: string
     thread_id: number | null
@@ -914,7 +914,10 @@ export async function sendReply(
     // background handback in the same ≤TTL window degrades to today's behaviour
     // (two messages) — safe (never a silent drop/edit), just not collapsed.
     const ownerEndedAt = ownerTurn?.endedAt ?? null
-    const handbackAt = getLastSubagentHandbackAt(chat_id)
+    // F2 (dup-audit): read the marker on the SAME `chatId|threadId` lane the
+    // supersede acts on. A handback in another forum topic must not hold this
+    // topic's content gate open (the visible-dup regression F2 closed).
+    const handbackAt = getLastSubagentHandbackAt(chat_id, replyThreadId)
     const now = Date.now()
     const handbackCouldOwnReply =
       handbackAt != null &&

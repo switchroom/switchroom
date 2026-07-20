@@ -3889,12 +3889,15 @@ const recentTurnsById = new Map<string, CurrentTurn>()
 // Evicted in lock-step with recentTurnsById so it can't outgrow it.
 const recentTurnIdBySourceMessageId = new Map<number, string>()
 
-// fix/backstop-duplicate-reply — per-chat marker of the most recent
+// fix/backstop-duplicate-reply — per-chat/thread marker of the most recent
 // gateway-synthesized `subagent_handback` enqueue (logic in
 // subagent-handback-marker.ts; extracted per the gateway anti-inflation ratchet).
+// Thread-keyed (dup-audit F2) so it gates exactly the `chatId|threadId` lane the
+// supersede registry acts on — a handback in one forum topic never holds the
+// content gate open in another.
 const subagentHandbackMarker = new SubagentHandbackMarker()
-const getLastSubagentHandbackAt = (chatId: string): number | null =>
-  subagentHandbackMarker.lastAt(chatId)
+const getLastSubagentHandbackAt = (chatId: string, threadId: number | undefined): number | null =>
+  subagentHandbackMarker.lastAt(chatId, threadId)
 
 function rememberRecentTurn(turn: CurrentTurn): void {
   recentTurnsById.set(turn.turnId, turn)
@@ -9984,7 +9987,7 @@ const pendingInboundBuffer = createPendingInboundBuffer({
   // fix/backstop-duplicate-reply MUST-FIX 2 — stamp the handback marker at the
   // enqueue chokepoint so a boot-replayed handback (not just the live synthesis
   // push) populates it. Every `subagent_handback` push funnels through here.
-  onHandbackEnqueue: (chatId, ts) => subagentHandbackMarker.record(chatId, ts),
+  onHandbackEnqueue: (chatId, threadId, ts) => subagentHandbackMarker.record(chatId, threadId, ts),
 })
 
 // PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a

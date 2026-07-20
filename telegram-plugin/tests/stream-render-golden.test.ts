@@ -56,7 +56,12 @@ function makeFakeBot() {
   const api = {
     sendRichMessage: async (c: string, b: { markdown: string }, o: Record<string, unknown> = {}) => rec('sendRichMessage', c, b.markdown, o),
     sendMessage: async (c: string, t: string, o: Record<string, unknown> = {}) => rec('sendMessage', c, t, o),
-    editMessageText: async (c: string, m: number, b: unknown, o: Record<string, unknown> = {}) => { rec('editMessageText', c, typeof b === 'string' ? b : (b as { markdown: string }).markdown, o); return {} },
+    editMessageText: async (c: string, m: number, b: unknown, o: Record<string, unknown> = {}) => {
+      // Preserve the REAL edit target id (m) so tests can assert an edit-in-place
+      // hit the flushed message, not a synthetic fresh id.
+      calls.push({ method: 'editMessageText', chat_id: c, text: typeof b === 'string' ? b : (b as { markdown: string }).markdown, opts: o, reply_markup: o.reply_markup ?? null, message_id: m })
+      return {}
+    },
     deleteMessage: async (c: string, m: number) => { rec('deleteMessage', c, null); return true },
   }
   return { api, calls }
@@ -100,6 +105,7 @@ function makeStreamDeps(opts?: {
   dedup?: OutboundDedupCache
   turn?: CurrentTurn | null
   deliverResult?: { sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean }
+  flushedTurnSupersede?: FlushedTurnSupersedeRegistry
 }): StreamHarness {
   const { api, calls } = makeFakeBot()
   const dedup = opts?.dedup ?? new OutboundDedupCache()
@@ -135,7 +141,7 @@ function makeStreamDeps(opts?: {
     activeTurnStartedAt: new Map(),
     backstopDeliveryLedger: ledger,
     bot: { api },
-    flushedTurnSupersede: new FlushedTurnSupersedeRegistry(),
+    flushedTurnSupersede: opts?.flushedTurnSupersede ?? new FlushedTurnSupersedeRegistry(),
     idleTracker: { noteEvent: noop },
     lastPtyPreviewByChat: new Map(),
     obligationLedger: { close: noop, noteTurnEnded: noop },
@@ -206,12 +212,12 @@ function makeStreamDeps(opts?: {
 }
 
 // ── the P2 sendReply harness (same content, sharing the ONE cache) ─────────
-function makeSendReplyDeps(dedup: OutboundDedupCache) {
+function makeSendReplyDeps(dedup: OutboundDedupCache, sharedSupersede?: FlushedTurnSupersedeRegistry) {
   const { api, calls } = makeFakeBot()
   const key = (c: string, t?: number | null) => `${c}:${t ?? 'main'}`
   const deps = {
     outboundDedup: dedup,
-    flushedTurnSupersede: new FlushedTurnSupersedeRegistry(),
+    flushedTurnSupersede: sharedSupersede ?? new FlushedTurnSupersedeRegistry(),
     firstTextReplyLogged: new Set<string>(),
     suppressPtyPreview: new Set<string>(),
     activeDraftStreams: new Map(),
@@ -383,6 +389,136 @@ describe('cross-surface dedup — ONE OutboundDedupCache across P4 stream + P2 r
     const s = makeSendReplyDeps(new OutboundDedupCache())
     await sendReply(s.deps, req(answer))
     expect(s.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(1)
+  })
+})
+
+// ── F3 (dup-audit 2026-07-21): the flush RECORD wiring is load-bearing ──────
+//
+// The entire flush→reply dedup depends on stream-render.ts recording the
+// flush's delivered ids into the shared FlushedTurnSupersedeRegistry
+// (`flushedTurnSupersede.record(...)`). Every OTHER outcome test seeds that
+// record by hand (send-reply-golden's seedRecord/seedFlushRecord), so DELETING
+// the record call would reintroduce the dominant flush→reply duplicate with all
+// those tests still green. This drives the REAL flush record() end-to-end (no
+// pre-seed) across ONE shared registry and asserts the reworded same-turn reply
+// collapses to EXACTLY ONE message — so it goes RED if the record() call is
+// removed. This is the guard the audit flagged as missing.
+describe('F3 — flush record() → same-turn reworded reply collapse (end-to-end, no pre-seed)', () => {
+  const settleFlush = () => new Promise((r) => setTimeout(r, 650))
+  const FLUSHED_ANSWER =
+    'All twelve agents are healthy right now. The gateway, the vault broker and the ' +
+    'approval kernel all report green health checks, and no container has restarted in ' +
+    'the last twenty four hours, so there is nothing that needs your attention at the moment.'
+  const REWORDED =
+    'Good news on the fleet. Every one of the twelve agents is running fine at the moment. ' +
+    'Gateway, vault broker and approval kernel are all green, and nothing has restarted in ' +
+    'the past day, so you do not need to do anything right now.'
+
+  it('flush → record → late reworded reply collapses to ONE message ' +
+    '(RED if stream-render flushedTurnSupersede.record is removed)', async () => {
+    // ONE shared supersede registry across BOTH surfaces — exactly the gateway
+    // singleton wiring. The flush RECORDS (the real stream-render.ts:1828 call);
+    // the reply CONSUMES. Nothing is pre-seeded.
+    const supersede = new FlushedTurnSupersedeRegistry()
+    const turn = makeTurn({ capturedText: [FLUSHED_ANSWER], capturedBlockMeta: [true] })
+    const sh = makeStreamDeps({ turn, flushedTurnSupersede: supersede })
+
+    // Drive the REAL turn-flush path: it delivers message A (deliverAnswer → id
+    // 4242) AND records {turnId, [4242]} into the shared registry.
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: 1200 })
+    await settleFlush()
+    expect(sh.delivered).toContain(FLUSHED_ANSWER)
+    // The record actually landed (this is what a removal breaks first).
+    expect(
+      supersede.peek(CHAT, undefined, { liveTurnId: turn.turnId, now: Date.now() }).reason,
+    ).toBe('supersede')
+
+    // The model's REAL reply lands late with a REWORDED version of the same
+    // answer: no live turn, latest-ended tier, NO handback in flight (CASE A).
+    const s = makeSendReplyDeps(new OutboundDedupCache(), supersede)
+    s.deps.resolveReplyOwnerTurn = () => ({ turn, tier: 'latest-ended' as const })
+    // (getLastSubagentHandbackAt returns null in the base deps → own answer.)
+
+    const res = await sendReply(s.deps, req(REWORDED))
+
+    // EXACTLY ONE client-visible message: the flushed message (4242) edited in
+    // place into the reworded reply — NO fresh second bubble. Without the
+    // record(), the reply finds no record, falls to the latch branch, sees
+    // reworded ≠ flushed content, does NOT suppress, and ships a DUPLICATE
+    // sendRichMessage (edits=0, sends=1) → these assertions fail.
+    const edits = s.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(4242)
+    expect(s.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+})
+
+// ── F5 (dup-audit): true take()-before-record() interleaving ────────────────
+//
+// The residual race the supersede registry cannot reach: a reply whose
+// supersede take() runs in the window AFTER the flush FIRED but BEFORE it
+// recorded its message ids. The flush arms `turn.answerDelivered='flush'` (+
+// flushedAnswerText) SYNCHRONOUSLY at fire time — before its async deliver and
+// before record — so a same-answer reply landing in that window is suppressed by
+// the latch, not shipped as a duplicate. This drives a genuine two-emitter
+// interleave (inverted ordering: reply take() strictly before flush record())
+// and asserts exactly one delivered message.
+describe('F5 — take()-before-record() interleaving delivers exactly one message', () => {
+  const settleFlush = () => new Promise((r) => setTimeout(r, 650))
+  // ≥200 chars so the late reply is a substantive final answer (the floor the
+  // flush latch is scoped to) — else it would never trip the suppression.
+  const ANSWER =
+    'Yes, that is all done and confirmed. The migration ran cleanly against the staging ' +
+    'database, every integration check passed on the first attempt, the rollback plan is ' +
+    'staged in case it is ever needed, and I have written the full run log to the shared ' +
+    'drive so the team can review exactly what changed and when it happened.'
+
+  it('a reply whose take() runs BEFORE the flush record() is suppressed by the ' +
+    'flush-armed latch — one delivered message, not two', async () => {
+    const supersede = new FlushedTurnSupersedeRegistry()
+    const turn = makeTurn({ capturedText: [ANSWER], capturedBlockMeta: [true] })
+    const sh = makeStreamDeps({ turn, flushedTurnSupersede: supersede })
+
+    // Fire the flush. Its latch is set SYNCHRONOUSLY here; deliverAnswer + record
+    // run in the async IIFE that has NOT completed — the pre-record window.
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: 1200 })
+    // INVERTED ORDERING: the reply's take() runs now, before the flush record().
+    expect(
+      supersede.peek(CHAT, undefined, { liveTurnId: turn.turnId, now: Date.now() }).reason,
+    ).toBe('no-record') // record genuinely not written yet
+
+    const s = makeSendReplyDeps(new OutboundDedupCache(), supersede)
+    s.deps.resolveReplyOwnerTurn = () => ({ turn, tier: 'latest-ended' as const })
+    // The same answer landing again in the race window → latch backstop suppresses.
+    const res = await sendReply(s.deps, req(ANSWER))
+
+    expect(s.calls).toHaveLength(0) // the reply shipped nothing
+    expect(res.content[0]!.text).toContain('deduped')
+
+    await settleFlush() // let the flush's async deliver + record complete
+    // Exactly one message reached the user: the flush's message A.
+    expect(sh.delivered).toHaveLength(1)
+    expect(sh.delivered[0]).toContain('done and confirmed')
+  })
+})
+
+// ── Double-flush idempotency at the delivery primitive (audit §3.5) ─────────
+//
+// The E2-vs-E3 double flush (answer-ready quiescence THEN turn-end backstop for
+// the SAME turn) is guarded by backstopDeliveryLedger.claim. The ledger is
+// unit-tested, but the audit wanted it pinned at the SEND-COUNT level in the
+// flush integration. Two turn_end dispatches for one turn must deliver once.
+describe('double-flush idempotency — deliverAnswer fires once (send-count level)', () => {
+  const settleFlush = () => new Promise((r) => setTimeout(r, 650))
+  it('two turn_end dispatches for the same turn deliver the answer EXACTLY once', async () => {
+    const turn = makeTurn()
+    const answer = turn.capturedText.join('')
+    const sh = makeStreamDeps({ turn })
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: 1200 }) // claims the latch
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: 1200 }) // claim fails → no-op
+    await settleFlush()
+    expect(sh.delivered).toEqual([answer])
   })
 })
 
