@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## v0.19.8 — Full Telegram formatting palette, on-demand, and no accidental headings anywhere
+
+### Features
+
+- **The full rich Telegram formatting vocabulary is now discoverable and usable
+  on demand** (#3482) — ships the palette as an on-demand bundled skill
+  (`telegram-formatting`) plus a one-line pointer in the boot floor card. The
+  skill's `description` (~146 tok) is always in the prompt via Claude Code skill
+  discovery, so the model knows the palette exists, while the ~2,080-tok body
+  loads only on invoke — a genuine on-demand affordance rather than an always-on
+  ~2,300-tok floor cost. Closes the vision-adoption gap where the formatting
+  palette was built and live-verified but underused because no agent was told
+  the full vocabulary existed.
+
+### Fixes
+
+- **Accidental Markdown formatting is now guarded at the universal send seam, on
+  every surface** (#3479) — the line-leading `#`-heading escape and the other
+  `guardAccidentalFormatting` guards previously ran only inside `richMessage()`,
+  so ~6 sites that build a raw `{ markdown }` and call
+  `sendRichMessage`/`editMessageText` directly (the `/doctor`/`/grant`/error
+  reply path, OAuth slot banners, folder-picker/approval/inline-keyboard edits)
+  bypassed them — a reply containing `#3460` still rendered as a Telegram
+  heading. A grammy API transformer installed on the single production Bot at
+  gateway boot now covers every send/edit as the real universal seam.
+
+### Internal
+
+- **Heading-cap and boot-wiring assumptions are now pinned by tests** (#3480) —
+  the intentional `#{1,6}` heading-escape cap (mirrors CommonMark's 6-`#` cap)
+  and an AST assertion that the universal guard transformer is imported and
+  installed exactly once in gateway boot, so the universal seam can't be
+  silently dropped in a later refactor.
+- **Truth pass on the formatting guide** (#3481) — removed three
+  falsely-advertised constructs (inline math `$…$`, details/collapsible,
+  footnotes) that are deliberately neutralised or unsupported on this path, and
+  rescoped the underline entry to match the parser's actual `__…__` support.
+- Trimmed `profiles/default/CLAUDE.md.hbs` to bring the worst-case generated
+  `CLAUDE.md` under the 40000-byte ceiling (39746 bytes), also greening a
+  pre-existing failure on `main` from #3446.
+
 ## v0.19.7 — No more duplicate replies, and no silently-dropped real reply
 
 ### Fixes
