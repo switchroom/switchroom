@@ -20,7 +20,7 @@
 import { GrammyError } from 'grammy'
 import { guardDollarMath } from './render/dollar-math-guard.js'
 import { guardAccidentalEmphasis } from './render/emphasis-guard.js'
-import { guardAccidentalBlockConstructs } from './render/line-start-guard.js'
+import { guardAccidentalBlockConstructs, guardAccidentalHeading } from './render/line-start-guard.js'
 import { guardAccidentalInlinePairs } from './render/inline-pairs-guard.js'
 
 /** The `InputRichMessage` shape grammy 1.44 accepts on send AND edit. */
@@ -36,6 +36,12 @@ export interface InputRichMessageMarkdown {
  * idempotent and safe to apply once per send.
  *
  * ── Ordering (deliberate, not arbitrary) ──────────────────────────────────
+ * `guardAccidentalHeading` runs right after emphasis and before block-constructs.
+ * It only ever inserts `\` before a line-leading `#{1,6}` run; `#` is inspected
+ * and inserted by no other guard (disjoint char set), so its position among the
+ * siblings is order-independent — it neither creates nor destroys a signal for
+ * any of them.
+ *
  * `guardDollarMath` runs LAST. It backslash-escapes `$` → `\$`, and the
  * inline-pairs guard's approximation-tilde signal is `~(?=\$?\.?\d)` — a `~`
  * glued to a `$digit`. If the dollar guard ran first, a body like
@@ -51,6 +57,7 @@ export interface InputRichMessageMarkdown {
 export function guardAccidentalFormatting(markdown: string): string {
   let out = markdown
   out = guardAccidentalEmphasis(out)
+  out = guardAccidentalHeading(out)
   out = guardAccidentalBlockConstructs(out)
   out = guardAccidentalInlinePairs(out)
   out = guardDollarMath(out)

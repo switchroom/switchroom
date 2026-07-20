@@ -43,11 +43,20 @@
 // punctuation may be backslash-escaped" rule; Telegram's rich parser strips
 // the backslash the same way `escapeMarkdown` relies on for `~ = | * _`.
 //
+// ── Accidental heading (`#3460`, `#foo`) — guarded by guardAccidentalHeading ─
+//   Telegram's Bot API rich-markdown parser is NON-spec: it promotes ANY
+//   line-leading `#{1,6}` run to a heading even WITHOUT the CommonMark-required
+//   trailing space (`#3460 done` renders as a huge heading). This is
+//   deterministically disambiguable: a `#{1,6}` run followed by a space,
+//   another `#`, or end-of-line is an INTENDED heading (or ambiguous) and is
+//   LEFT ALONE; a run glued to a non-space, non-`#` char (`#3460`, `#foo`,
+//   `###x`) is the accidental Telegram-only heading and IS escaped. See
+//   `guardAccidentalHeading` below — it mirrors the render.ts:escapeLineLeadingHash
+//   fix (#3306) but runs at the universal wire seam, independent of the
+//   SWITCHROOM_RICH_RENDER kill-switch, so cards/banners/status/approval sends
+//   (which bypass the rich renderer) are also covered.
+//
 // ── What is DEFERRED (left to the rich-formatting workstream) ────────────
-//   • Heading `# ` (with the required space): indistinguishable from an
-//     INTENDED heading. `#1` / `#foo` (NO space) is not a GFM heading at all
-//     (ATX headings require `#`+space) → Telegram renders it literally → no
-//     guard needed. So there is no safely-guardable heading sub-case.
 //   • Bullet lists `-`/`+`/`*` + space (`- 5 degrees`): genuinely ambiguous
 //     with the heavily-used bullet construct; the glued form `-5` (no space)
 //     is not a list item → already literal → no guard needed. Escaping the
@@ -157,6 +166,69 @@ export function guardAccidentalBlockConstructs(text: string): string {
       // so its first line is a real line start only if the running flag says so.
       const lineIsAtStart = k === 0 ? atLineStart : true;
       const processed = lineIsAtStart ? escapeAccidentalLineStart(lines[k]) : lines[k];
+      out += processed;
+      if (k < lines.length - 1) out += "\n";
+    }
+    atLineStart = seg.text.endsWith("\n");
+  }
+
+  return out;
+}
+
+/** Line-start `#{1,6}` run glued DIRECTLY to a non-space, non-`#` char — the
+ *  Telegram-non-spec accidental heading (`#3460`, `#foo`, `###x`). The negative
+ *  lookahead `(?=[^\s#])` requires a following char that is neither whitespace,
+ *  a `#`, nor end-of-line, so an intended `# Title` / `## Sub` (space-delimited)
+ *  and a bare `#` / `##` (end-of-line) are NEVER matched. Up to 3 leading spaces
+ *  are permitted (4+ is indented code, and the `{0,3}` bound then leaves a space
+ *  before the `#`, so it correctly does not match). Only the first `#` of the run
+ *  is backslash-escaped, which is sufficient to stop Telegram promoting the line
+ *  to a heading. Idempotent: an already-escaped `\#3460` starts with `\`, so the
+ *  `#{1,6}` no longer sits at the (post-indent) line start. */
+const ACCIDENTAL_HEADING = /^([ \t]{0,3})(#{1,6})(?=[^\s#])/;
+
+/**
+ * Escape the accidental heading trigger at the start of ONE line (the string
+ * must NOT contain a newline; the caller guarantees a true line start). A no-op
+ * unless the line begins with a `#{1,6}` run glued to a non-space, non-`#` char.
+ */
+function escapeAccidentalHeadingLine(line: string): string {
+  return line.replace(ACCIDENTAL_HEADING, "$1\\$2");
+}
+
+/**
+ * Neutralise accidental line-start HEADING promotion (`#3460 done` → giant
+ * heading) on the FINAL rendered rich-markdown string. Telegram's Bot API
+ * parser promotes a line-leading `#{1,6}` run to a heading even without the
+ * CommonMark-required trailing space; this escapes ONLY the space-less,
+ * non-`#`-adjacent form and leaves genuine `# Title` / `## Sub` headings
+ * untouched. Code spans / fenced blocks / link destinations / table rows are
+ * never touched (shared `splitProtectedSegments`). Idempotent and a strict
+ * no-op absent a real signal. Mirrors render.ts:escapeLineLeadingHash (#3306)
+ * but runs at the universal wire seam, so it also covers the card / banner /
+ * status / approval sends that bypass the rich renderer.
+ */
+export function guardAccidentalHeading(text: string): string {
+  // Cheap short-circuit: no `#` at all => no-op.
+  if (!text.includes("#")) return text;
+
+  const segments = splitProtectedSegments(text);
+  let out = "";
+  // True at text start and immediately after any emitted `\n`.
+  let atLineStart = true;
+
+  for (const seg of segments) {
+    if (seg.code) {
+      out += seg.text;
+      atLineStart = seg.text.endsWith("\n");
+      continue;
+    }
+    const lines = seg.text.split("\n");
+    for (let k = 0; k < lines.length; k++) {
+      // A prose segment can begin MID-LINE (right after an inline code span),
+      // so its first line is a real line start only if the running flag says so.
+      const lineIsAtStart = k === 0 ? atLineStart : true;
+      const processed = lineIsAtStart ? escapeAccidentalHeadingLine(lines[k]) : lines[k];
       out += processed;
       if (k < lines.length - 1) out += "\n";
     }
