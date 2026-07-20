@@ -73,6 +73,13 @@ function overageReasonBlocks(reason: string | null | undefined): boolean {
 }
 
 export type AccountWindowState =
+  // #org-disable — Anthropic reports the account disabled at the org level
+  // (entitlement block). Outranks every other state. Populated by PR2.
+  | "org-disabled"
+  // #retired — the config no longer routes to this account (removed from
+  // `fallback_order` and every agent / consumer pin). Out of service, NOT a
+  // quota problem — but must never read as available/healthy. Outranks quota.
+  | "retired"
   // #2494 Bug C — recoverable quota exhaustion: a util window is maxed but the
   // account comes back when that window rolls. Carries a reset countdown.
   | "quota-exhausted"
@@ -90,6 +97,11 @@ export interface ScheduleRow {
   isActive: boolean;
   /** 1-based position in fallback_order, or null when not listed. */
   fallbackRank: number | null;
+  /** Fleet in-service classification (from broker `in_service`). false →
+   *  RETIRED: the config no longer routes to this account. */
+  inService: boolean;
+  /** Org / entitlement-level block (from broker `entitlement_blocked`, PR2). */
+  entitlementBlocked: boolean;
   window: WindowSnapshot;
   exhausted: boolean;
   exhaustedUntil: Date | null;
@@ -167,8 +179,19 @@ export function classifyState(args: {
   exhaustedUntil: Date | null;
   window: WindowSnapshot;
   now: Date;
+  /** Fleet in-service flag. false → RETIRED (out of rotation). Defaults true
+   *  so a caller that omits it (pre-field data) never falsely retires. */
+  inService?: boolean;
+  /** Org-level entitlement block. true → DISABLED (org). Defaults false. */
+  entitlementBlocked?: boolean;
 }): AccountWindowState {
   const { exhausted, exhaustedUntil, window, now } = args;
+  // Precedence: DISABLED (org) > RETIRED > every quota/window state. An
+  // org-disabled or retired account is out of service regardless of its cached
+  // quota windows, and must never render as healthy/available. Only an explicit
+  // retirement (`inService === false`) retires — an omitted flag stays in-service.
+  if (args.entitlementBlocked === true) return "org-disabled";
+  if (args.inService === false) return "retired";
   // #2494 Bug C — a thin/headerless probe carries no real utilization; it must
   // not pose as a confident reading. Treat as unprobed (renders "unknown").
   if (window.probeThin) return "unprobed";
@@ -246,18 +269,37 @@ export function buildScheduleRows(
       typeof a.exhausted_until === "number" ? new Date(a.exhausted_until) : null;
     const exhausted = a.exhausted && (exhaustedUntil?.getTime() ?? 0) > now.getTime();
     const rank = state.fallback_order.indexOf(a.label);
+    const isActive = a.label === state.active;
+    // Only an explicit `in_service === false` retires (a pre-field broker omits
+    // the flag → treat as in-service). The active account is always in service
+    // and never org-disabled in the view (precedence: active outranks both).
+    const inService = isActive ? true : a.in_service !== false;
+    const entitlementBlocked = isActive ? false : a.entitlement_blocked === true;
     return {
       label: a.label,
-      isActive: a.label === state.active,
+      isActive,
       fallbackRank: rank === -1 ? null : rank + 1,
+      inService,
+      entitlementBlocked,
       window,
       exhausted,
       exhaustedUntil,
-      state: classifyState({ exhausted, exhaustedUntil, window, now }),
+      state: classifyState({
+        exhausted,
+        exhaustedUntil,
+        window,
+        now,
+        inService,
+        entitlementBlocked,
+      }),
     };
   });
-  // Pool priority: active first, then fallback_order rank, then excluded.
-  const key = (r: ScheduleRow) => (r.isActive ? -1 : (r.fallbackRank ?? 9999));
+  // Pool priority: active first, then fallback_order rank, then in-service
+  // "excluded" accounts, and RETIRED / org-disabled (out-of-service) rows LAST —
+  // they no longer carry pool priority at all.
+  const outOfService = (r: ScheduleRow) => !r.inService || r.entitlementBlocked;
+  const key = (r: ScheduleRow) =>
+    outOfService(r) ? 100_000 : r.isActive ? -1 : (r.fallbackRank ?? 9999);
   return rows.sort((a, b) => key(a) - key(b) || a.label.localeCompare(b.label));
 }
 
@@ -322,6 +364,11 @@ export function formatWeeklyCell(w: WindowSnapshot, now: Date, tz?: string): str
 }
 
 function poolLabel(row: ScheduleRow): string {
+  // Out-of-service accounts have no pool position — surface WHY (retired vs
+  // org-disabled) instead of the misleading "excluded", which reads like a
+  // deliberate-but-live exclusion rather than "removed from the fleet".
+  if (row.entitlementBlocked) return "disabled";
+  if (!row.inService) return "retired";
   if (row.isActive) return row.fallbackRank ? `active #${row.fallbackRank}` : "active";
   if (row.fallbackRank) return `#${row.fallbackRank}`;
   return "excluded";
@@ -351,6 +398,14 @@ export function formatStateCell(row: ScheduleRow, now: Date): string {
         ? " (overage off)"
         : "";
   switch (row.state) {
+    case "org-disabled":
+      // Disabled by Anthropic at the org level — no reset horizon, no overage
+      // note; the account is simply not serviceable until re-entitled.
+      return "DISABLED (org)";
+    case "retired":
+      // Out of fleet rotation (removed from config). Not a quota state — no
+      // reset countdown; the operator re-adds it to a pool to bring it back.
+      return "retired";
     case "quota-exhausted":
       // Recoverable: comes back when the 5h window rolls. Carries the reset
       // countdown. No overage annotation — quota exhaustion is the binding cause.
@@ -377,13 +432,24 @@ function pad(s: string, n: number): string {
 }
 
 function glyphFor(row: ScheduleRow, color: boolean): string {
-  const g = row.isActive ? "●" : row.exhausted ? "!" : row.state === "unprobed" ? "·" : "✓";
+  // Out-of-service glyphs never use the healthy "✓" — an org-disabled or retired
+  // account must not read as fine at a glance.
+  const g = row.isActive
+    ? "●"
+    : row.state === "org-disabled"
+      ? "⊘"
+      : row.state === "retired"
+        ? "∅"
+        : row.exhausted
+          ? "!"
+          : row.state === "unprobed"
+            ? "·"
+            : "✓";
   if (!color) return g;
-  return row.isActive
-    ? chalk.green(g)
-    : row.exhausted
-      ? chalk.red(g)
-      : chalk.gray(g);
+  if (row.isActive) return chalk.green(g);
+  if (row.state === "org-disabled") return chalk.red(g);
+  if (row.state === "retired") return chalk.gray(g);
+  return row.exhausted ? chalk.red(g) : chalk.gray(g);
 }
 
 function colorState(text: string, state: AccountWindowState, color: boolean): string {
@@ -391,12 +457,15 @@ function colorState(text: string, state: AccountWindowState, color: boolean): st
   switch (state) {
     case "healthy":
       return chalk.green(text);
+    case "org-disabled":
     case "weekly-walled":
       return chalk.red(text);
     case "quota-exhausted":
       return chalk.yellow(text);
     case "5h-walled":
       return chalk.yellow(text);
+    // "retired" and everything else → gray (out of service / unknown, not an
+    // active problem to action).
     default:
       return chalk.gray(text);
   }

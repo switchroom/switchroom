@@ -252,6 +252,8 @@ describe("#2494 — formatStateCell: out_of_credits informational annotation, no
     label: "x",
     isActive: false,
     fallbackRank: 2,
+    inService: true,
+    entitlementBlocked: false,
     window,
     exhausted: false,
     exhaustedUntil: null,
@@ -446,6 +448,8 @@ describe("formatStateCell horizon", () => {
       label: "x",
       isActive: false,
       fallbackRank: 2,
+      inService: true,
+      entitlementBlocked: false,
       window: {
         fiveHourPct: 0,
         fiveHourResetAt: new Date("2026-06-07T06:27:00Z"),
@@ -473,6 +477,8 @@ describe("formatStateCell horizon", () => {
       label: "x",
       isActive: false,
       fallbackRank: 2,
+      inService: true,
+      entitlementBlocked: false,
       window: {
         ...NONE,
         fiveHourPct: 0,
@@ -584,5 +590,116 @@ describe("#2500 — formatFooter does not stamp 'probed live' on a cache-served 
     const footer = formatFooter(emptyRows, { liveRequested: false, probedLive: false }, NOW);
     expect(footer[0]).toContain("cached snapshot");
     expect(footer[0]).not.toContain("probed live");
+  });
+});
+
+// ── retired / org-disabled account display (PR1) ──────────────────────────
+describe("classifyState — retired / org-disabled precedence", () => {
+  const healthyWin = (): WindowSnapshot => ({
+    ...NONE,
+    fiveHourPct: 0,
+    weeklyPct: 0,
+    fiveHourResetAt: FIVE_RESET,
+    weeklyResetAt: WEEKLY_RESET,
+    source: "live",
+  });
+
+  it("inService=false → 'retired' even with a fully-healthy window (never available)", () => {
+    const state = classifyState({
+      exhausted: false,
+      exhaustedUntil: null,
+      window: healthyWin(),
+      now: NOW,
+      inService: false,
+    });
+    expect(state).toBe("retired");
+    expect(state).not.toBe("healthy");
+  });
+
+  it("entitlementBlocked=true → 'org-disabled', outranking retirement AND healthy", () => {
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: healthyWin(),
+        now: NOW,
+        inService: false,
+        entitlementBlocked: true,
+      }),
+    ).toBe("org-disabled");
+  });
+
+  it("omitted inService (pre-field data) does NOT retire — classifies off the window", () => {
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: healthyWin(),
+        now: NOW,
+      }),
+    ).toBe("healthy");
+  });
+});
+
+describe("formatStateCell — retired / org-disabled labels", () => {
+  const mk = (state: ScheduleRow["state"], over: Partial<ScheduleRow> = {}): ScheduleRow => ({
+    label: "retired@example.com",
+    isActive: false,
+    fallbackRank: null,
+    inService: state !== "retired",
+    entitlementBlocked: state === "org-disabled",
+    window: NONE,
+    exhausted: false,
+    exhaustedUntil: null,
+    state,
+    ...over,
+  });
+
+  it("retired → plain 'retired' with no reset countdown", () => {
+    const cell = formatStateCell(mk("retired"), NOW);
+    expect(cell).toBe("retired");
+    expect(cell).not.toMatch(/\d+[dhm]/);
+  });
+
+  it("org-disabled → 'DISABLED (org)'", () => {
+    expect(formatStateCell(mk("org-disabled"), NOW)).toBe("DISABLED (org)");
+  });
+});
+
+describe("buildScheduleRows — retired classification, pool label, and last-sort", () => {
+  function stateWithRetired(): ListStateData {
+    return {
+      active: "active-acct",
+      fallback_order: ["active-acct"],
+      accounts: [
+        // A retired account seeded FIRST to prove it is sorted LAST, not by input order.
+        { label: "retired-acct", exhausted: false, in_service: false },
+        { label: "active-acct", exhausted: false, in_service: true },
+      ],
+      agents: [],
+      consumers: [],
+    } as ListStateData;
+  }
+
+  const rows = buildScheduleRows(stateWithRetired(), undefined, NOW);
+
+  it("classifies the out-of-service account as 'retired'", () => {
+    const retired = rows.find((r) => r.label === "retired-acct")!;
+    expect(retired.state).toBe("retired");
+    expect(retired.inService).toBe(false);
+  });
+
+  it("sorts the retired account LAST (after the active account)", () => {
+    expect(rows[0].label).toBe("active-acct");
+    expect(rows[rows.length - 1].label).toBe("retired-acct");
+  });
+
+  it("labels the retired row 'retired' in the rendered pool column, never 'excluded'/'available'", () => {
+    const lines = formatScheduleRows(rows, NOW, { color: false, tz: "UTC" });
+    const retiredLine = lines.find((l) => l.includes("retired-acct"))!;
+    expect(retiredLine).toContain("retired");
+    expect(retiredLine).not.toContain("excluded");
+    expect(retiredLine).not.toContain("available");
+    expect(retiredLine).not.toContain("healthy");
   });
 });

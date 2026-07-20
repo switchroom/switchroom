@@ -26,8 +26,24 @@ import { escapeMarkdown, codeSpanSafe } from './card-format.js';
 
 // ── shared types ─────────────────────────────────────────────────────
 
-/** Tri-state health verdict per account, derived from live quota. */
-export type AccountHealth = 'healthy' | 'throttling' | 'blocked' | 'unknown';
+/**
+ * Health verdict per account. The first three are derived from live quota;
+ * `retired` and `org-blocked` are config/entitlement classifications that
+ * OUTRANK quota (an out-of-service account has no meaningful "health"):
+ *   - `org-blocked` — Anthropic disabled the account at the org level
+ *     (entitlement_blocked); renders "DISABLED (org)". Populated by PR2.
+ *   - `retired` — the config no longer routes to the account (`in_service`
+ *     false: removed from fallback_order + every agent/consumer pin). It must
+ *     never read as available/healthy, is sorted LAST, and is excluded from
+ *     the switch keyboard + the recommendation.
+ */
+export type AccountHealth =
+  | 'healthy'
+  | 'throttling'
+  | 'blocked'
+  | 'unknown'
+  | 'retired'
+  | 'org-blocked';
 
 /**
  * Combined per-account view used by every formatter in this module.
@@ -51,6 +67,19 @@ export interface AccountSnapshot {
    *  stale data as current; undefined for live-probe snapshots (fresh
    *  by construction). */
   capturedAtMs?: number;
+  /**
+   * Fleet in-service classification (broker `in_service`). TRUE when the config
+   * still routes to this account; `false` → RETIRED. Absent → treated as
+   * in-service (only an explicit `false` retires, so a pre-field broker never
+   * falsely retires the fleet). Drives the `retired` health verdict.
+   */
+  inService?: boolean;
+  /**
+   * Org / entitlement-level block (broker `entitlement_blocked`, populated by
+   * PR2). TRUE → `org-blocked` health verdict ("DISABLED (org)"), which OUTRANKS
+   * retirement. Absent / false on a pre-PR2 broker.
+   */
+  entitlementBlocked?: boolean;
 }
 
 // ── health classification ────────────────────────────────────────────
@@ -98,6 +127,18 @@ const OVERAGE_EXHAUSTED_REASONS = new Set<string>(['out_of_credits']);
  * Failover safety against a real 429 is preserved via the mark-exhausted path.
  */
 export function classifyHealth(snap: AccountSnapshot, now: Date = new Date()): AccountHealth {
+  // Precedence (config/entitlement outranks quota): active > DISABLED (org) >
+  // RETIRED > quota-derived health. The active account always keeps its
+  // quota-derived verdict (it is by definition in-service and never org-blocked
+  // in the view). For every non-active account, an org-level entitlement block
+  // wins over retirement, and either wins over the quota windows — an
+  // out-of-service account has no meaningful quota "health". Only an explicit
+  // `inService === false` retires (absent → in-service), so a pre-field broker
+  // never falsely retires the fleet.
+  if (!snap.isActive) {
+    if (snap.entitlementBlocked === true) return 'org-blocked';
+    if (snap.inService === false) return 'retired';
+  }
   if (!snap.quota) return 'unknown';
   const q = snap.quota;
   // #2494 Bug C — a thin/headerless probe (no real utilization signal on
@@ -308,6 +349,8 @@ const HEALTH_EMOJI: Record<AccountHealth, string> = {
   throttling: '🟡',
   blocked: '🔴',
   unknown: '⚪',
+  'org-blocked': '⛔',
+  retired: '⚫',
 };
 
 /**
@@ -331,6 +374,19 @@ function renderAccountRow(
   const lines: string[] = [];
   const marker = snap.isActive ? '● ' : '';
   const label = displayLabel(snap.label, opts);
+
+  // Out-of-service accounts (org-disabled / retired) outrank quota: their live
+  // windows are irrelevant and misleading (a retired account at 0%/0% reads as
+  // "available"), so render a single status note instead of a quota bar.
+  const health = classifyHealth(snap, now);
+  if (health === 'org-blocked' || health === 'retired') {
+    const note =
+      health === 'org-blocked'
+        ? 'DISABLED (org) — no fleet routing'
+        : 'retired — removed from fleet rotation';
+    lines.push(`${marker}\`${codeSpanSafe(label)}\`  _${note}_`);
+    return lines;
+  }
 
   if (!snap.quota) {
     lines.push(
@@ -360,7 +416,6 @@ function renderAccountRow(
     `${marker}\`${codeSpanSafe(label)}\`  ${fiveStr} / ${sevenStr}`,
   );
 
-  const health = classifyHealth(snap, now);
   if (health === 'blocked') {
     // quota-exhausted (recoverable): surface only the recovery countdown — the
     // binding window's reset is the only thing that matters until then.
@@ -432,10 +487,14 @@ function formatAgeStamp(atMs: number, now: Date = new Date()): string {
  * blocked → throttling → unknown → healthy.
  */
 const TABLE_HEALTH_RANK: Record<AccountHealth, number> = {
-  blocked: 0,
-  throttling: 1,
-  unknown: 2,
-  healthy: 3,
+  // org-disabled is a hard, actionable problem → first. RETIRED is out of
+  // service (informational, not actionable) → LAST, after healthy.
+  'org-blocked': 0,
+  blocked: 1,
+  throttling: 2,
+  unknown: 3,
+  healthy: 4,
+  retired: 5,
 };
 
 /** Escape a cell value for a GFM table cell: pipes break the column grid, and
@@ -565,7 +624,15 @@ export function recommendation(
   const active = snapshots.find((s) => s.isActive);
   if (!active) return 'No active account set.';
   const activeHealth = classifyHealth(active, now);
-  const others = snapshots.filter((s) => !s.isActive);
+  // EXCLUDE out-of-service accounts (retired / org-disabled) from the
+  // recommendation entirely: a retired account is not a switch target and must
+  // not inflate an "all accounts blocked" verdict. Only in-service accounts are
+  // candidate alternatives or count toward the fleet-blocked summary.
+  const inServiceFleet = snapshots.filter((s) => {
+    const h = classifyHealth(s, now);
+    return h !== 'retired' && h !== 'org-blocked';
+  });
+  const others = inServiceFleet.filter((s) => !s.isActive);
   const healthyAlt = others.find((s) => classifyHealth(s, now) === 'healthy');
   // Demo mode masks the email labels that appear in the recommendation
   // sentence, in lockstep with the per-account rows above.
@@ -590,7 +657,8 @@ export function recommendation(
     // #2494 Bug B — no healthy alternative. Do NOT collapse to "All accounts
     // blocked": that's only honest when EVERY account is truly walled with no
     // usable or imminently-refilling slot. Distinguish the buckets first.
-    return summarizeNoHealthyAlt(snapshots, now, demo);
+    // Only in-service accounts count — a retired account is not "blocked".
+    return summarizeNoHealthyAlt(inServiceFleet, now, demo);
   }
 
   // unknown
@@ -770,7 +838,15 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       // Blocked-first ordering mirrors renderAuthSnapshotFormat2 — the user
       // scans the walled accounts (and their recovery times) at the top, with
       // the active account floating first within its group.
-      const healthOrder: AccountHealth[] = ['blocked', 'throttling', 'healthy', 'unknown'];
+      const healthOrder: AccountHealth[] = [
+        'org-blocked',
+        'blocked',
+        'throttling',
+        'healthy',
+        'unknown',
+        // RETIRED last — out of service, informational only.
+        'retired',
+      ];
       const rank = (s: AccountSnapshot): number => healthOrder.indexOf(classifyHealth(s, now));
       const ordered = [...fleet].sort(
         (a, b) => rank(a) - rank(b) || Number(b.isActive) - Number(a.isActive),
@@ -937,7 +1013,18 @@ export function buildSnapshotKeyboard(
   const switchTargets = snapshots
     .filter((s) => !s.isActive)
     .sort((a, b) => switchPriority(a, now) - switchPriority(b, now))
-    .filter((s) => classifyHealth(s, now) !== 'blocked' && classifyHealth(s, now) !== 'unknown')
+    .filter((s) => {
+      const h = classifyHealth(s, now);
+      // Never offer a switch into a target we can't (or shouldn't) serve on:
+      // blocked / unknown (existing), and now RETIRED / org-disabled — an
+      // out-of-service account is not a valid fleet target.
+      return (
+        h !== 'blocked' &&
+        h !== 'unknown' &&
+        h !== 'retired' &&
+        h !== 'org-blocked'
+      );
+    })
     .slice(0, max);
 
   for (const t of switchTargets) {
@@ -964,7 +1051,8 @@ function switchPriority(s: AccountSnapshot, now: Date = new Date()): number {
   if (h === 'healthy') return 0;
   if (h === 'throttling') return 1;
   if (h === 'unknown') return 2;
-  return 3; // blocked
+  if (h === 'blocked') return 3;
+  return 4; // retired / org-blocked — out of service, always last (and filtered)
 }
 
 // ── shared HTML escape ───────────────────────────────────────────────
@@ -1073,6 +1161,8 @@ export function buildSnapshotsFromState(
       quota: q && q.ok ? q.data : null,
       quotaError: q && !q.ok ? q.reason : undefined,
       expiresAtMs: acc.expiresAt,
+      inService: acc.in_service,
+      entitlementBlocked: acc.entitlement_blocked,
     });
   }
   return out;
@@ -1128,6 +1218,8 @@ export function buildSnapshotsFromCachedState(
       // stale data (the 2026-06-09 incident: a recovery latched days
       // earlier only surfaced — and notified — at the next fleet bounce).
       capturedAtMs: lq?.capturedAt,
+      inService: acc.in_service,
+      entitlementBlocked: acc.entitlement_blocked,
     };
   });
 }

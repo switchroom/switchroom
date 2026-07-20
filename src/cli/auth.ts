@@ -298,18 +298,32 @@ function printAccountsTable(state: ListStateData): void {
     chalk.bold("  ACCOUNT                           STATUS       EXPIRES    QUOTA 5h·7d          QUOTA-RESET"),
   );
   for (const a of state.accounts) {
-    const marker =
-      a.label === state.active
-        ? chalk.green("●")
-        : a.exhausted
-          ? chalk.red("!")
-          : chalk.gray("✓");
-    const status =
-      a.label === state.active
-        ? chalk.green("active   ")
-        : a.exhausted
-          ? chalk.red("exhausted")
-          : "available";
+    // Status precedence: active > DISABLED (org) > RETIRED > exhausted >
+    // available. A retired account (removed from every config list — `!in_service`)
+    // and an org-disabled account both linger on disk but must never read
+    // "available". `in_service === false` (not `!in_service`) so a pre-field
+    // broker, which omits the flag, never falsely retires the fleet.
+    const isActive = a.label === state.active;
+    const orgBlocked = a.entitlement_blocked === true;
+    const retired = a.in_service === false;
+    const marker = isActive
+      ? chalk.green("●")
+      : orgBlocked
+        ? chalk.red("⊘")
+        : retired
+          ? chalk.gray("∅")
+          : a.exhausted
+            ? chalk.red("!")
+            : chalk.gray("✓");
+    const status = isActive
+      ? chalk.green("active   ")
+      : orgBlocked
+        ? chalk.red("DISABLED ")
+        : retired
+          ? chalk.gray("retired  ")
+          : a.exhausted
+            ? chalk.red("exhausted")
+            : "available";
     const label = a.label.padEnd(32);
     const exp = formatExpiry(a.expiresAt).padEnd(10);
     const util = formatQuotaUtilCell(a).padEnd(20);
@@ -386,8 +400,27 @@ function printUsageTable(state: ListStateData): void {
   );
   const WIDTH = 44;
   for (const a of state.accounts) {
-    const marker = a.label === state.active ? chalk.green("*") : " ";
+    const isActive = a.label === state.active;
+    const orgBlocked = a.entitlement_blocked === true;
+    const retired = a.in_service === false;
+    const marker = isActive
+      ? chalk.green("*")
+      : orgBlocked
+        ? chalk.red("⊘")
+        : retired
+          ? chalk.gray("∅")
+          : " ";
     const label = a.label.padEnd(32);
+    // Precedence DISABLED (org) > RETIRED: an out-of-service account's live
+    // headroom is meaningless (and misleading — it reads as available), so
+    // replace both cells with a single status note rather than a quota bar.
+    if (orgBlocked || retired) {
+      const note = orgBlocked
+        ? chalk.red("DISABLED (org) — no fleet routing")
+        : chalk.gray("retired — removed from fleet rotation");
+      console.log(`  ${marker} ${label} ${note}`);
+      continue;
+    }
     const premium = usageHeadroomCell(a.usage_ledger?.premium ?? null);
     const standard = usageHeadroomCell(a.usage_ledger?.standard ?? null);
     // Pad the PLAIN text to a fixed column, THEN color — ANSI escapes can never

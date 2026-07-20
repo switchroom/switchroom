@@ -1199,3 +1199,44 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
     expect(out).not.toContain('All accounts blocked');
   });
 });
+
+// ── retired / org-blocked (in-service classification, PR1) ────────────
+describe('classifyHealth — retired / org-blocked precedence', () => {
+  // A retired/org-disabled account must NEVER read as available: config and
+  // entitlement outrank the quota windows for any non-active account.
+  const healthyQ = quota({ fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10 });
+
+  it('non-active account with inService:false → retired, even on healthy quota', () => {
+    expect(classifyHealth(snap({ inService: false, quota: healthyQ }))).toBe('retired');
+  });
+  it('non-active account with entitlementBlocked → org-blocked', () => {
+    expect(classifyHealth(snap({ entitlementBlocked: true, quota: healthyQ }))).toBe('org-blocked');
+  });
+  it('entitlement block outranks retirement', () => {
+    expect(
+      classifyHealth(snap({ inService: false, entitlementBlocked: true, quota: healthyQ })),
+    ).toBe('org-blocked');
+  });
+  it('absent inService defaults to in-service (a pre-field broker is never falsely retired)', () => {
+    expect(classifyHealth(snap({ quota: healthyQ }))).toBe('healthy');
+  });
+  it('the active account keeps its quota-derived health even if inService is false', () => {
+    // active is in-service by definition; the guard skips retirement for it.
+    expect(classifyHealth(snap({ isActive: true, inService: false, quota: healthyQ }))).toBe('healthy');
+  });
+});
+
+describe('recommendation — excludes retired/org-blocked accounts', () => {
+  it('a retired account (even with healthy quota) is never offered as a switch target', () => {
+    // active is throttling; the only OTHER account is retired but at 0% util.
+    // Without the exclusion it would be recommended as a healthy switch target;
+    // with it, the retired account is invisible → "no healthy alternative".
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 90 }) }),
+      snap({ label: 'retired@x', inService: false, quota: quota({ fiveHourUtilizationPct: 0 }) }),
+    ];
+    const out = recommendation(snaps, NOW);
+    expect(out).not.toContain('retired@x');
+    expect(out).toContain('no healthy alternative');
+  });
+});
