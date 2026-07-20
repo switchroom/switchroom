@@ -373,9 +373,18 @@ describe("#2471 runWedgeWatchdog — manifest-stall escalation", () => {
     expect(restarts[0].reason).toMatch(/Manifesting/);
   });
 
-  it("does NOT escalate when Manifesting WITHOUT a stop-hook error (healthy long turn)", async () => {
+  it("does NOT escalate a healthy long Manifesting turn whose pane ADVANCES (no stop-hook)", async () => {
+    // A genuinely-working turn's pane changes every poll — the spinner glyph
+    // animates and the elapsed timer / token count climbs. The byte-stability
+    // discriminator (which replaced the mandatory stop-hook AND) resets the
+    // stall counter on every change, so it is never killed.
     const restarts: string[] = [];
-    const healthy = "✶ Manifesting… (200k tokens · 4s)\nrunning stop hooks 2/6";
+    const advancing = [
+      "✶ Manifesting… (200k tokens · 4s)\nrunning stop hooks 2/6",
+      "✷ Manifesting… (201k tokens · 5s)\nrunning stop hooks 2/6",
+      "✸ Manifesting… (203k tokens · 6s)\nrunning stop hooks 2/6",
+      "✹ Manifesting… (204k tokens · 7s)\nrunning stop hooks 2/6",
+    ];
     const res = await runWedgeWatchdog({
       agentName: "a",
       manifestStallPolls: 3,
@@ -384,13 +393,41 @@ describe("#2471 runWedgeWatchdog — manifest-stall escalation", () => {
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
-      maxPolls: 6,
-      capture: captureFlicker([healthy]),
+      maxPolls: 8,
+      capture: captureFlicker(advancing),
       send: () => true,
       requestRestart: (a) => restarts.push(a),
     });
     expect(res.restartEscalations).toBe(0);
     expect(restarts).toEqual([]);
+  });
+
+  it("escalates a FULLY FROZEN render: Manifesting pane byte-identical across polls, NO stop-hook", async () => {
+    // The gap this fix closes: a fully frozen "Manifesting…" pane (a hard TUI /
+    // render-loop deadlock — even the elapsed timer stopped repainting) with no
+    // stop-hook error matched nothing under the old `Manifesting AND stop-hook`
+    // rule and was never caught. A byte-identical pane across the full streak is
+    // now a stall in its own right. (A live-but-hung pane whose timer keeps
+    // ticking is NOT byte-stable and is caught by the gateway Stage B marker-
+    // staleness restart, not this tmux layer — see the branch comment.)
+    const restarts: Array<{ agent: string; reason: string }> = [];
+    const frozen = "✶ Manifesting… (112k tokens · 30s)\nrunning stop hooks 3/6";
+    const res = await runWedgeWatchdog({
+      agentName: "overlord",
+      manifestStallPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 4,
+      capture: captureFlicker([frozen]),
+      send: () => true,
+      requestRestart: (agent, reason) => restarts.push({ agent, reason }),
+    });
+    expect(res.restartEscalations).toBe(1);
+    expect(restarts).toHaveLength(1);
+    expect(restarts[0].reason).toMatch(/byte-stable/);
   });
 
   it("does NOT escalate before the stall threshold", async () => {

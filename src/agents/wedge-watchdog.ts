@@ -628,6 +628,11 @@ export async function runWedgeWatchdog(
   let confirmModalPresent = 0;
   let permissionPromptPresent = 0;
   let manifestStallPresent = 0;
+  // Byte-stability of the Manifesting pane across polls — the progress
+  // discriminator that replaced the old mandatory stop-hook-error AND (see the
+  // manifest-stall branch). A streaming/progressing turn changes this key every
+  // poll and resets the stall counter; a frozen spinner keeps it identical.
+  let lastManifestKey: string | null = null;
   let confirmCooldownUntil = 0;
   let permissionCooldownUntil = 0;
 
@@ -691,21 +696,48 @@ export async function runWedgeWatchdog(
       // want Enter, not Esc.
       !deferToPrompts.some((p) => p.match.test(text));
 
-    // #2471 — semantic no-progress tracker, INDEPENDENT of the modal
-    // chain: a "Manifesting"/spinning turn with a Stop-hook error present
-    // is wedged despite terminal activity. Tracked every poll (a modal
-    // poll naturally won't match Manifesting, so the two counters don't
-    // collide).
-    const isManifestStall =
+    // #2471 — semantic no-progress tracker, INDEPENDENT of the modal chain: a
+    // "Manifesting"/spinning turn that is NOT advancing is wedged despite the
+    // terminal showing the spinner. Previously this required BOTH the
+    // Manifesting signature AND a Stop-hook error — so a hang with no stop-hook
+    // line matched nothing and was never caught. The stop-hook AND is dropped;
+    // the false-positive it used to guard against (killing a healthy long
+    // "Manifesting" turn) is now prevented by a PROGRESS discriminator instead:
+    // the stall counter only climbs while the pane is BYTE-STABLE across polls
+    // (a streaming/progressing turn changes the key and resets it). A present
+    // Stop-hook error is kept as a fast path — it means wedged regardless of
+    // byte movement. Tracked every poll (a modal poll won't match Manifesting,
+    // so the counters don't collide).
+    //
+    // SCOPE (do not overclaim): byte-stability catches a FULLY FROZEN render —
+    // a hard TUI/render-loop deadlock where even the elapsed-timer stops
+    // repainting. It does NOT catch a live-but-hung pane whose elapsed timer
+    // keeps ticking (a tool blocked but the spinner still animating) — that pane
+    // is never byte-stable. That "carrie" class (tool hung mid-call, terminal
+    // still alive) is caught by the gateway's Stage B marker-staleness restart
+    // (`hang-restart-decision.ts`), NOT here. We deliberately do not normalize
+    // the spinner glyph + elapsed timer out of the key: a silent long foreground
+    // tool (no output, only a ticking clock) would then normalize to "stable"
+    // and be false-killed by this tmux layer — the exact harm the discriminator
+    // exists to avoid. This branch stays the narrow frozen-render net.
+    const manifestSignatureHit =
       !!text &&
       manifestStallSignature !== null &&
-      manifestStallSignature.test(text) &&
-      STOP_HOOK_ERROR_SIGNATURE.test(text);
+      manifestStallSignature.test(text);
+    const manifestKey = manifestSignatureHit ? stabilityKey(text) : null;
+    const stopHookPresent = !!text && STOP_HOOK_ERROR_SIGNATURE.test(text);
+    // No progress ⇔ the Manifesting pane is byte-identical to the last poll, OR
+    // a Stop-hook error is present (a hard wedge signal independent of movement).
+    const manifestNoProgress =
+      manifestSignatureHit && (stopHookPresent || manifestKey === lastManifestKey);
+    lastManifestKey = manifestKey;
+    const isManifestStall = manifestNoProgress;
     if (isManifestStall) {
       manifestStallPresent++;
       if (manifestStallPresent >= manifestStallPolls) {
         const detail =
-          `Manifesting + stop-hook-error present ${manifestStallPresent} polls ` +
+          `Manifesting ${stopHookPresent ? "+ stop-hook-error " : "pane byte-stable "}` +
+          `present ${manifestStallPresent} polls ` +
           `(~${Math.round((manifestStallPresent * pollIntervalMs) / 1000)}s) with no progress`;
         console.error(
           `[wedge-watchdog] ${opts.agentName}: manifest-stall wedge — ${detail}; ` +

@@ -243,6 +243,7 @@ import {
   distinctRequestIds,
 } from './permission-rearm.js'
 import { sweepPermissionTtl } from './permission-ttl-sweep.js'
+import { hangStalenessMs } from './hang-restart-decision.js'
 import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
 import {
   createAlwaysAllowPersistQueue,
@@ -9698,6 +9699,15 @@ function gatewayLivenessWiringDeps() {
     trackRedeliveredInbound,
     closeActivityLane,
     closeProgressLane,
+    // Stage B: escalate a mid-tool + marker-stale fallback to a real restart.
+    // No cooldown (see hang-restart-decision.ts § STORM GUARD): the ask-first
+    // resume_watchdog_timeout path is the sole, sufficient storm guard.
+    hangRestart: {
+      stalenessThresholdMs: hangStalenessMs(),
+      request: (reason: string, idleMs: number) => {
+        triggerSelfRestart(getMyAgentName(), `hang-watchdog:${reason} idle=${Math.round(idleMs)}ms`)
+      },
+    },
   }
 }
 export type LivenessWiringDeps = ReturnType<typeof gatewayLivenessWiringDeps>

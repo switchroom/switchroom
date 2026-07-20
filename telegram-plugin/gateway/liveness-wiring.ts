@@ -24,7 +24,8 @@ import { emitRuntimeMetric } from '../runtime-metrics.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { clearSilentEndState } from '../silent-end.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
-import { removeTurnActiveMarker } from './turn-active-marker.js'
+import { removeTurnActiveMarker, readTurnActiveMarkerAgeMs } from './turn-active-marker.js'
+import { decideHangRestart } from './hang-restart-decision.js'
 import { recordTurnEnd } from '../registry/turns-schema.js'
 import { hostdGetStatusOnce } from './hostd-dispatch.js'
 import { formatUpdateStatusLine } from './update-status-line.js'
@@ -60,6 +61,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     trackRedeliveredInbound,
     closeActivityLane,
     closeProgressLane,
+    hangRestart,
   } = deps
 
   return {
@@ -158,6 +160,38 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       // arming doesn't carry stale state.
       silencePoke.endTurn(ctx.key)
       return
+    }
+
+    // Stage B: escalate a mid-tool hang to a REAL restart. The fallback fires
+    // here with a tool still in flight only after silence crossed the 15-min
+    // defer ceiling (isLegitimatelyWorking held it that long). The honest
+    // hang/health discriminator is the turn-active marker's mtime age: a healthy
+    // turn keeps advancing it (tool_use + sub-agent JSONL growth), a true hang
+    // lets it go stale. A known-long-running tool in flight (Task/Agent/Bash/
+    // WebFetch/research) is protected regardless of marker age — a single long
+    // foreground tool legitimately can't advance the marker (Finding A). Only a
+    // stale (or absent) marker with no protected long tool triggers the
+    // SIGTERM-PID1 restart; the boot classifier then routes recovery through the
+    // ask-first resume_watchdog_timeout inbound. We return BEFORE the state-
+    // teardown so the turn-active marker survives for the boot reclassification.
+    if (hangRestart != null && ctx.inFlightTools.length > 0) {
+      const markerAgeMs = readTurnActiveMarkerAgeMs(STATE_DIR)
+      const inFlightToolNames = ctx.inFlightTools.map((t) => t.name)
+      const decision = decideHangRestart({
+        inFlightToolNames,
+        markerAgeMs,
+        stalenessThresholdMs: hangRestart.stalenessThresholdMs,
+      })
+      process.stderr.write(
+        `telegram gateway: [hang-watchdog] fallback mid-tool chat=${ctx.chatId} ` +
+        `thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
+        `tools=${inFlightToolNames.join(',')} marker_age_ms=${markerAgeMs ?? 'null'} ` +
+        `restart=${decision.restart} reason=${decision.reason}\n`,
+      )
+      if (decision.restart) {
+        hangRestart.request(decision.reason, markerAgeMs ?? ctx.silenceMs)
+        return
+      }
     }
 
     // Deterministic in-flight update status (klanker incident). If this
