@@ -137,6 +137,21 @@ export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion
   missed_approval_retry: { decoupledCompletion: false },
   skill_proposal_apply: { decoupledCompletion: false },
   warmup: { decoupledCompletion: false },
+  // dup-audit pass-2 (Fable) — sources the widened exhaustiveness scanner now
+  // sees. Each lands as its OWN live inbound turn (not a decoupled completion
+  // resolving a DIFFERENT ended turn), so it must NOT stamp — else its fail-safe
+  // stamp would hold the content gate chat-wide for 60 s and re-open the
+  // reworded-own-answer visible dup in that window.
+  //   - mental_model_proposal_{applied,denied,failed}: resume-synthetic inbounds
+  //     injected via `deliverResumeSyntheticOrBuffer` as their own live turn.
+  //   - webhook / linear: built in `src/web/webhook-dispatch.ts`, delivered via
+  //     the gateway's `webhookInject` (`sendToAgent`, buffer on miss) as their
+  //     own live turn.
+  mental_model_proposal_applied: { decoupledCompletion: false },
+  mental_model_proposal_denied: { decoupledCompletion: false },
+  mental_model_proposal_failed: { decoupledCompletion: false },
+  webhook: { decoupledCompletion: false },
+  linear: { decoupledCompletion: false },
 }
 
 /**

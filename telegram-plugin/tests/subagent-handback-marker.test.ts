@@ -114,19 +114,39 @@ describe('inbound source classification (F1 durability)', () => {
   // The real tripwire: scan the gateway for meta.source literals and FAIL when a
   // new one is added without a registry classification. The grep-the-predicate
   // structural test could not catch rot; this does.
-  it('exhaustiveness: every gateway meta.source literal is classified in the registry', () => {
+  it('exhaustiveness: every gateway-inbound meta.source literal is classified in the registry', () => {
     const gatewayDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'gateway')
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
     // `source:` fields that are NOT inbound meta.source tags (config cascade, the
     // model-source selector, doc comments, typeof guards). Allowlisted so a
     // genuinely new INBOUND source still trips this guard.
     const NON_INBOUND_SOURCE_LITERALS = new Set([
       'env', 'config', 'default', 'transcript', 'override', 'gateway', 'cli', 'string', 'github',
     ])
-    const files = readdirSync(gatewayDir).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+    // The scan surface = every gateway module PLUS the out-of-gateway inbound
+    // builders whose synthesized inbounds are delivered THROUGH the gateway
+    // (dup-audit pass-2 / Fable): `src/web/webhook-dispatch.ts` builds the
+    // `webhook` / `linear` inbounds injected via `webhookInject` → the same
+    // buffer chokepoint. Grep for other `meta:`+`source:` inbound builders if new
+    // dirs appear.
+    const files: string[] = [
+      ...readdirSync(gatewayDir)
+        .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+        .map((f) => join(gatewayDir, f)),
+      join(repoRoot, 'src', 'web', 'webhook-dispatch.ts'),
+    ]
     const found = new Set<string>()
-    const patterns = [/source:\s*'([a-z_]+)'/g, /meta\??\.source\s*===\s*'([a-z_]+)'/g]
+    // Catch BOTH quote styles and full source spellings (digits / underscores /
+    // any case) — a single-quote-only, `[a-z_]+`-only regex silently missed the
+    // double-quoted `mental_model_proposal_*` and the out-of-gateway webhook
+    // sources (pass-2 porosity). Variable-valued `source: expr` stays structurally
+    // invisible; the fail-safe stamp default is the safety boundary, not this scan.
+    const patterns = [
+      /source:\s*['"]([A-Za-z0-9_]+)['"]/g,
+      /meta\??\.source\s*===\s*['"]([A-Za-z0-9_]+)['"]/g,
+    ]
     for (const f of files) {
-      const src = readFileSync(join(gatewayDir, f), 'utf8')
+      const src = readFileSync(f, 'utf8')
       for (const re of patterns) {
         let m: RegExpExecArray | null
         while ((m = re.exec(src)) != null) found.add(m[1]!)
