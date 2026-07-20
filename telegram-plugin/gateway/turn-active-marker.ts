@@ -1,26 +1,38 @@
 /**
  * Turn-active liveness marker (#412).
  *
- * Writes `<STATE_DIR>/turn-active.json` on turn_start, touches its mtime
- * on every tool_use, removes it on turn_complete. The watchdog
- * (bin/bridge-watchdog.sh) reads the mtime: if the file exists AND its
- * mtime is older than TURN_HANG_SECS (default 300s = 5min), the agent
- * is wedged mid-turn and the watchdog restarts.
+ * Writes `<STATE_DIR>/turn-active.json` on turn_start, touches its mtime on
+ * every tool_use AND (via the subagent-watcher, #501) on foreground sub-agent
+ * JSONL growth, removes it on turn_complete. The mtime is therefore "ms since
+ * last observable progress": it advances while a turn — even a long one running
+ * one big tool or a sub-agent — is genuinely working, and goes stale only when
+ * work stops (a wedge).
  *
- * Why this exists: PR #410 raised the journal-silence detector to 4000s
- * to kill false positives on chat-cadence agents that legitimately
- * idle for hours between turns. That left a gap — Stop-hook deadlocks
- * (the original failure mode #116 tracked) are no longer caught under
- * default thresholds.
+ * Why this exists: PR #410 raised the journal-silence detector to 4000s to kill
+ * false positives on chat-cadence agents that legitimately idle for hours
+ * between turns. That left a gap — Stop-hook deadlocks (the original failure
+ * mode #116 tracked) are no longer caught under default thresholds. The
+ * distinguisher is "in-turn-and-silent" vs "between-turns-and-silent": the
+ * former is a wedge, the latter is healthy idle. This marker exists exactly
+ * during in-turn windows, so its staleness uniquely indicates the wedge.
  *
- * The distinguisher is "in-turn-and-silent" vs "between-turns-and-silent":
- * the former is a wedge, the latter is healthy idle. This marker exists
- * exactly during in-turn windows, so its staleness uniquely indicates
- * the wedge.
+ * WHO CONSUMES THE STALENESS (contract corrected — the historical
+ * `bin/bridge-watchdog.sh` bash watchdog this header once named was never
+ * committed to the repo; do not reintroduce a reference to it):
  *
- * Pure file I/O. The actual hang-detection-and-restart loop lives in the
- * bash watchdog, where it composes with the existing
- * Restart=on-failure / journal-silence / bridge-disconnect detectors.
+ *   - The gateway BOOT classifier (`markOrphanedWithTimeoutClassification` in
+ *     gateway.ts): on restart, a marker whose mtime is older than TURN_HANG_SECS
+ *     (default 300s) reclassifies the orphaned turn as `timeout`, routing the
+ *     next session to the ask-first `resume_watchdog_timeout` inbound.
+ *   - The LIVE Stage B hang-restart (`hang-restart-decision.ts`, consulted from
+ *     the silence-poke framework fallback): a mid-tool fallback with a stale
+ *     marker escalates to a real SIGTERM-PID1 restart. `readTurnActiveMarkerAgeMs`
+ *     below is the shared read.
+ *   - The obligation / phantom-turn sweeps (`readTurnActiveMarkerAgeMs`,
+ *     `effectiveTurnAgeMs`): a small age means work is still in flight, so a
+ *     "did I miss this?" re-send is suppressed.
+ *
+ * Pure file I/O; the mtime is the honest cross-process progress signal.
  */
 
 import {
