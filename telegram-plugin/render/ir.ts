@@ -1,38 +1,44 @@
-// Typed intermediate representation (IR) for the Telegram HTML render engine.
+// Typed intermediate representation (IR) for the Telegram rich-markdown render
+// engine. (Historical note: this file and render.ts were named for an "HTML
+// render engine" during Increment 1, before the Bot API 10.1 migration (#2669)
+// made GFM `{ markdown }` the live send path. There is NO HTML anywhere on the
+// outbound path today — the renderer in render.ts emits raw GFM markdown for
+// the `markdown` field of `InputRichMessageMarkdown`.)
 //
 // This is the parser <-> renderer contract. `parse()` (parse.ts) folds an
-// mdast tree into this shape; a later increment's renderer walks it and emits
-// Telegram Bot API HTML. Increment 1 lands ONLY the parser + this IR — there
-// is no renderer yet.
+// mdast tree into this shape; `render.ts` walks it and emits Telegram
+// rich-message GFM markdown.
 //
 // Every node carries `{ start, end }` UTF-16 source offsets copied verbatim
 // from mdast `position.start.offset` / `position.end.offset`. They are UTF-16
 // code-unit indices into the original markdown string, so
 // `source.slice(node.start, node.end)` round-trips to the node's source text.
 //
-// Telegram HTML tag mapping (for the next increment — NOT implemented here):
+// IR node -> emitted GFM markdown (see render.ts `renderInline`/block render):
 //
 //   Inline
-//     plain     -> (raw text, HTML-escaped)
-//     bold      -> <b>…</b>                 (markdown `**…**`)
-//     italic    -> <i>…</i>                 (markdown `*…*`)
-//     underline -> <u>…</u>                 (markdown `__…__`, Bot API 10.1)
-//     strike    -> <s>…</s>                 (markdown `~~…~~`)
-//     spoiler   -> <tg-spoiler>…</tg-spoiler> (markdown `||…||`)
-//     highlight -> <mark>…</mark>           (markdown `==…==`, Bot API 10.1)
-//     code      -> <code>…</code>
-//     link      -> <a href="…">…</a>
+//     plain     -> raw text (escapeMarkdown'd)
+//     bold      -> `**…**`
+//     italic    -> `*…*`
+//     underline -> `__…__`  — NOTE: the wire renders `__…__` as BOLD, not
+//                  underline. Telegram's rich-message markdown has no underline
+//                  token (live-verified, see reference/telegram-formatting-guide.md).
+//                  The node preserves the author's `__` bytes faithfully; it is
+//                  a distinct IR node but NOT a distinct wire style.
+//     strike    -> `~~…~~`
+//     spoiler   -> `||…||`
+//     highlight -> `==…==`  (Bot API 10.1 marked entity)
+//     code      -> `` `…` ``
+//     link      -> `[…](…)`
 //
 //   Block
 //     paragraph      -> children joined; blocks separated by "\n\n"
-//     heading        -> <b>…</b> (Telegram HTML has no <h1>…<h6>; bold + newlines)
-//     blockquote     -> <blockquote>…</blockquote>
-//                       (expandable === true -> <blockquote expandable>)
-//     code-block     -> <pre><code class="language-…">…</code></pre>
-//     list           -> rendered line-per-item with "•"/"1." bullets
-//                       (Telegram HTML has no <ul>/<ol>)
-//     thematic-break -> a horizontal-rule text line (e.g. "───")
-//     table          -> monospaced <pre> table (Telegram HTML has no <table>)
+//     heading        -> `#`…`######` line
+//     blockquote     -> `> …` (expandable === true -> `**> …` expandable blockquote)
+//     code-block     -> ```` ```lang … ``` ````
+//     list           -> line-per-item with `-`/`1.` markers
+//     thematic-break -> `---` thematic break
+//     table          -> GFM pipe table
 
 export interface Pos {
   /** UTF-16 code-unit offset of the node's first char (mdast position.start.offset). */
@@ -60,10 +66,12 @@ export interface ItalicNode extends Pos {
   children: Inline[];
 }
 
-/** Telegram underline (<u>…</u>). In Bot API 10.1 rich markdown the `__…__`
- *  double-underscore run is UNDERLINE — distinct from `**…**` bold, even though
- *  GFM/micromark folds both into a single `strong` mdast node. `parse.ts`
- *  disambiguates the two by looking at the run's source delimiter. */
+/** A `__…__` double-underscore run. `parse.ts` keeps it as a distinct node
+ *  (separate from `**…**` bold) by looking at the source delimiter, even though
+ *  GFM/micromark folds both into a single `strong` mdast node. NOTE: on the
+ *  Telegram wire this renders as BOLD, not a distinct underline style — Bot API
+ *  10.1 rich markdown has no underline entity here, so the round-trip is faithful
+ *  but the delivered text is bold. Kept distinct only to preserve authoring intent. */
 export interface UnderlineNode extends Pos {
   type: "underline";
   children: Inline[];
