@@ -887,27 +887,32 @@ export async function sendReply(
     // late reply (model narrated → flushed → fired `reply` with a paraphrase),
     // which is the dominant real duplicate (agent:marko 2026-07-20: 11/11
     // declines were own-replies, turns #1177/#1182/#1201 double-sent). So we
-    // BYPASS the content gate whenever the reply is confidently the flushed
-    // turn's OWN answer, established by EITHER of two deterministic signals:
+    // BYPASS the content gate ONLY when the reply is confidently the flushed
+    // turn's OWN answer. The primary, deterministic signal is the absence of a
+    // background sub-agent handback that could own this reply: the gateway
+    // records when it synthesizes a `subagent_handback` inbound per chat, and if
+    // NONE was enqueued for this chat AFTER the flushed turn ended within the
+    // supersede TTL, the reply is that turn's own answer → supersede regardless
+    // of a model rewording (closes the DM default-reply duplicate, where every
+    // own-reply resolves via the latest-ended tier).
     //
-    //   (a) POSITIVE owner-resolution tier (live / origin-echo / quoted) — the
-    //       reply is provably attributed to this turn (chiefly the supergroup
-    //       explicit-quote / echo path); OR
-    //   (b) NO background sub-agent handback could own it — the gateway records
-    //       when it synthesizes a `subagent_handback` inbound per chat, and NONE
-    //       was enqueued for this chat AFTER the flushed turn ended within the
-    //       supersede TTL. This is the signal that closes the DM default-reply
-    //       duplicate, where every own-reply resolves via the latest-ended tier
-    //       (no live/origin/quote) and (a) never fires.
+    // MUST-FIX 1 (silent-data-loss): the owner-resolution `quoted` / `origin`
+    // tiers are derived from MODEL-SUPPLIED args (`args.reply_to` /
+    // `args.origin_turn_id`), so a background handback turn can STEER them —
+    // pass `reply_to = <the user's original msg id>` and it resolves the PRIOR
+    // flushed turn via `quoted`, which used to force the bypass and silently
+    // edit-over that turn's delivered answer (#3429-class, model-steerable). So
+    // a positive tier NEVER overrides an in-window handback; only the
+    // FRAMEWORK-owned `live` tier (the live `currentTurn`, not model-derived,
+    // and structurally unable to collide with an ended turn's flush record —
+    // `decideSupersede` requires same turnId) may bypass a handback window.
     //
-    // The content gate is kept ONLY for the residual ambiguous case: latest-ended
-    // tier AND a handback WAS enqueued in the window — there the late reply might
-    // BE that handback, so genuinely-new content must send fresh (two messages,
-    // #3429 preserved). Concurrency note: a case-A own reply that happens to
-    // coincide with an unrelated background handback completing in the same ≤TTL
-    // window falls into this residual and degrades to today's behaviour (two
-    // messages) — safe (never a silent drop/edit), just not collapsed.
-    const positiveAttribution = ownerTier !== 'latest-ended'
+    // The content gate is therefore kept whenever a handback WAS enqueued in the
+    // window (any non-live tier): the late reply might BE that handback, so
+    // genuinely-new content sends fresh (two messages, #3429 preserved).
+    // Concurrency note: a case-A own reply coinciding with an unrelated
+    // background handback in the same ≤TTL window degrades to today's behaviour
+    // (two messages) — safe (never a silent drop/edit), just not collapsed.
     const ownerEndedAt = ownerTurn?.endedAt ?? null
     const handbackAt = getLastSubagentHandbackAt(chat_id)
     const now = Date.now()
@@ -916,7 +921,7 @@ export async function sendReply(
       ownerEndedAt != null &&
       handbackAt > ownerEndedAt &&
       now - handbackAt <= DEFAULT_SUPERSEDE_TTL_MS
-    const replyIsOwnAnswer = positiveAttribution || !handbackCouldOwnReply
+    const replyIsOwnAnswer = ownerTier === 'live' || !handbackCouldOwnReply
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
