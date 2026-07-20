@@ -372,6 +372,7 @@ function makeSendReplyDeps(dedup: OutboundDedupCache) {
     statusKey: key,
     streamKey: key,
     resolveReplyOwnerTurn: () => ({ turn: null, tier: 'none' as const }),
+    getLastSubagentHandbackAt: () => null,
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
     resolveAnswerThreadWithLog: (_c: string, explicit: number | undefined) => explicit,

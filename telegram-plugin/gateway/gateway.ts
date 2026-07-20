@@ -489,6 +489,7 @@ import {
   type ReplyOwnerTier,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
+import { SubagentHandbackMarker } from './subagent-handback-marker.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import {
   AnswerReadyFlushController,
@@ -3887,6 +3888,14 @@ const recentTurnsById = new Map<string, CurrentTurn>()
 // real message_id the framework stamped, never a model-asserted thread.
 // Evicted in lock-step with recentTurnsById so it can't outgrow it.
 const recentTurnIdBySourceMessageId = new Map<number, string>()
+
+// fix/backstop-duplicate-reply — per-chat marker of the most recent
+// gateway-synthesized `subagent_handback` enqueue (logic in
+// subagent-handback-marker.ts; extracted per the gateway anti-inflation ratchet).
+const subagentHandbackMarker = new SubagentHandbackMarker()
+const getLastSubagentHandbackAt = (chatId: string): number | null =>
+  subagentHandbackMarker.lastAt(chatId)
+
 function rememberRecentTurn(turn: CurrentTurn): void {
   recentTurnsById.set(turn.turnId, turn)
   if (turn.sourceMessageId != null) {
@@ -12577,6 +12586,7 @@ function gatewaySendReplyDeps(): SendReplyGatewayDeps {
     resolveAnswerThreadWithLog,
     resolveThreadId,
     getLatestInboundMessageId,
+    getLastSubagentHandbackAt,
     recordOutbound,
     emissionAuthorityFor,
     clearActivitySummary,
@@ -24469,6 +24479,9 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // turn), so the handback always lands as a clean fresh
                 // turn and never races a turn-in-flight composer (#1556).
                 pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', decision.inbound)
+                // fix/backstop-duplicate-reply — stamp the per-chat handback
+                // marker at enqueue (see subagent-handback-marker.ts).
+                subagentHandbackMarker.record(decision.chatId, Date.now())
                 process.stderr.write(
                   `telegram gateway: subagent-handback queued agent=${agentId} outcome=${outcome} chat=${decision.chatId} resultChars=${resultText.length}\n`,
                 )

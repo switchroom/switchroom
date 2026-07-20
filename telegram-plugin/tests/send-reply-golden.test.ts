@@ -210,6 +210,7 @@ function makeHarness(opts?: {
     statusKey: key,
     streamKey: key,
     resolveReplyOwnerTurn: () => ({ turn: null, tier: 'none' as const }),
+    getLastSubagentHandbackAt: () => null,
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
     resolveAnswerThreadWithLog: (_c, explicit) => explicit,
@@ -645,6 +646,11 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedFlushRecord(h, owner)
+    // A background sub-agent handback WAS enqueued for this chat after the
+    // flushed turn ended and within the supersede TTL — so this late reply might
+    // BE that handback. The marker keeps the #3429 content gate. (owner.endedAt
+    // = now-30s; handback at now-15s is after it and within the 60s TTL.)
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
 
     // The handback lands LATE: req.turn = null (no live gateway turn — a
     // sub-agent completion is not a new inbound).
@@ -726,47 +732,60 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     expect(res.content[0]!.text).toContain('deduped')
   })
 
-  // The tier discriminator (fix/backstop-duplicate-reply). A model that narrates
-  // its answer as prose (flushed as message A) then fires the `reply` tool with a
-  // genuinely RE-WORDED version of the same answer is the dominant real-world
-  // duplicate (agent:marko 39/54 flushes on 2026-07-20; turns #1177/#1182/#1201
-  // double-sent). The reworded reply is NOT contained in the flushed blob, so
-  // the #3429 content gate alone declines the supersede → fresh second bubble =
-  // the visible duplicate. The fix: when the owner turn was resolved by POSITIVE
-  // attribution (live / origin echo / quoted message id — NOT the ambiguous
-  // latest-ended fallback), the reply IS this turn's own answer and supersedes
-  // its flushed provisional draft REGARDLESS of the rewording. A genuine handback
-  // (latest-ended tier) with the same divergent content must still send fresh.
+  // ─── The REAL marko DM incident (fix/backstop-duplicate-reply) ───
+  //
+  // The dominant real duplicate: the model narrates its answer as prose (flushed
+  // as message A), then fires the `reply` tool with a RE-WORDED version of the
+  // same answer. On a DM this late reply has NO live turn, NO `origin_turn_id`
+  // echo, and NO explicit `reply_to`, so it resolves its owner via the ambiguous
+  // `latest-ended` tier — the #3429 content gate then declines (reworded text ⊄
+  // flushed blob) and a fresh SECOND bubble ships = the visible duplicate
+  // (agent:marko 2026-07-20: turns #1177/#1182/#1201 double-sent; 11/11 declines
+  // were own-replies with NO handback in flight).
+  //
+  // The two cases are indistinguishable by tier (both latest-ended) and by
+  // content (rewording). The deterministic discriminator is the gateway-
+  // synthesized `subagent_handback` marker: case A has NONE enqueued after the
+  // flushed turn ended; a genuine background handback (case B) does. These two
+  // tests drive the REAL send path with the REAL supersede registry over the
+  // SAME reworded text and the SAME latest-ended tier, differing ONLY in the
+  // handback marker — proving it is the marker that flips the outcome.
   const REWORDED_SAME_TURN_ANSWER =
     'Good news on the fleet: every one of the twelve agents is running fine right now. ' +
     'The gateway, the vault broker and the approval kernel are all green, and nothing has ' +
     'restarted in the past day — so there is nothing you need to do.'
 
-  it('CASE A (dup regression): a RE-WORDED reply resolved by a POSITIVE tier (quoted) ' +
-    'supersedes the flushed draft — collapses to ONE message despite the rewording', async () => {
-    const h = makeHarness()
-    const owner = makeFlushDeliveredEndedTurn()
+  function seedRecord(h: ReturnType<typeof makeHarness>, owner: CurrentTurn): void {
     h.deps.flushedTurnSupersede.record(
       CHAT,
       undefined,
       { turnId: owner.turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
       Date.now(),
     )
-    // Positive attribution: the model's own reply quotes the user's inbound, so
-    // owner resolution wins at the `quoted` tier — this reply IS turn's answer.
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+  }
+
+  it('CASE A — REAL marko DM incident: reworded own reply, latest-ended tier, ' +
+    'NO handback in flight → supersedes the flushed draft, collapses to ONE message', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // Late DM reply: latest-ended tier (the path the tier discriminator MISSES),
+    // and crucially NO subagent_handback was enqueued for this chat after the
+    // turn ended — so the reply is the flushed turn's OWN answer.
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.getLastSubagentHandbackAt = () => null
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
 
-    // The single flushed message was edited into the reworded reply (edit-in-
-    // place correction) — exactly ONE client-visible message, no fresh bubble.
+    // Exactly ONE client-visible message: the flushed message edited in place
+    // into the reworded reply — NO fresh second bubble (duplicate closed).
     const edits = h.calls.filter((c) => c.method === 'editMessageText')
     expect(edits).toHaveLength(1)
     expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
     expect(edits[0]!.text).toContain('every one of the twelve agents')
     expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
     expect(res.content[0]!.text).toMatch(/^sent/)
-    // Record consumed — no second correction can re-fire.
+    // Record consumed.
     expect(
       h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
         liveTurnId: OWNER_TURN_ID,
@@ -775,32 +794,27 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     ).toBe('no-record')
   })
 
-  it('CASE B (no #3429 regression): the SAME divergent content resolved by the ' +
-    'ambiguous latest-ended tier is treated as a handback — sends FRESH (TWO messages), ' +
-    'flushed message preserved', async () => {
+  it('CASE B — genuine background handback: SAME reworded text, SAME latest-ended tier, ' +
+    'but a handback WAS enqueued in-window → keeps the gate, sends FRESH (TWO messages)', async () => {
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
-    h.deps.flushedTurnSupersede.record(
-      CHAT,
-      undefined,
-      { turnId: owner.turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
-      Date.now(),
-    )
-    // Ambiguous fallback: no live turn, no echo, no quote → latest-ended tier.
+    seedRecord(h, owner)
     h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    // A background sub-agent handback was enqueued for this chat AFTER the turn
+    // ended (now-30s) and within the 60s TTL (now-15s) — this reply might BE it.
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
 
-    // A fresh, notifying bubble ships and the flushed message is NEITHER edited
-    // nor deleted — the flush (A) plus the fresh send (B) = two surfaced
-    // messages, the correct behaviour for a genuine async handback (#3429).
+    // A fresh notifying bubble ships; the flushed message is NEITHER edited nor
+    // deleted — flush (A) + fresh (B) = two surfaced messages (#3429 preserved).
     const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
     expect(fresh).toHaveLength(1)
     expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
     expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
     expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
     expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
-    // Record NOT consumed (the turn's own canonical replay could still correct).
+    // Record NOT consumed.
     expect(
       h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
         liveTurnId: OWNER_TURN_ID,
@@ -808,5 +822,25 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
         now: Date.now(),
       }).supersede,
     ).toBe(true)
+  })
+
+  it('SECONDARY (tier path): a reworded reply POSITIVELY attributed (quoted tier) ' +
+    'supersedes regardless of text EVEN with a handback in flight (positive tier wins)', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // Positive attribution (supergroup explicit-quote/echo path): the reply is
+    // provably this turn's own answer, so a coincident background handback does
+    // NOT downgrade it — the tier signal alone bypasses the content gate.
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
   })
 })

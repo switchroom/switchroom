@@ -56,6 +56,7 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import {
   decideSupersedeCorrection,
   flushedAnswerMatchesReply,
+  DEFAULT_SUPERSEDE_TTL_MS,
   type FlushedTurnSupersedeRegistry,
 } from '../flushed-turn-supersede.js'
 import { decideAnswerLatchSuppression, type ReplyOwnerTier } from '../reply-owner-resolve.js'
@@ -671,6 +672,7 @@ export interface SendReplyGatewayDeps {
   ): number | undefined
   resolveThreadId(chatId: string, explicit?: string | number | null): number | undefined
   getLatestInboundMessageId(chatId: string, threadId: number | null): number | null | undefined
+  getLastSubagentHandbackAt(chatId: string): number | null
   recordOutbound(rec: {
     chat_id: string
     thread_id: number | null
@@ -735,7 +737,7 @@ export async function sendReply(
     statusKey, streamKey,
     resolveReplyOwnerTurn, findTurnByOriginId, findTurnByQuotedMessageId,
     resolveAnswerThreadWithLog, resolveThreadId,
-    getLatestInboundMessageId, recordOutbound,
+    getLatestInboundMessageId, getLastSubagentHandbackAt, recordOutbound,
     emissionAuthorityFor, clearActivitySummary,
     startTypingLoop, stopTypingLoop, logOutbound,
     closeObligationOnSubstantiveReply, finalizeStatusReaction,
@@ -876,26 +878,49 @@ export async function sendReply(
     // resolvers agree and the late-reply supersede fires by identity.
     const { turn: ownerTurn, tier: ownerTier } = resolveReplyOwnerTurn(turn, chat_id, args)
     const resolvedTurnId = ownerTurn?.turnId ?? null
-    // #3429 — pass the (normalized) reply text so the registry can apply the
-    // new-content gate: identity match + TTL alone also fits an async handback
-    // that merely resolved this flush-delivered ENDED turn as its owner via
-    // the latest-ended tier. Editing the flushed message in place with that
-    // handback's text does not re-notify client-side (Telegram edits never
-    // push) — the observed silent non-surfacing of msgs 10482/10486.
+    // #3429 — pass the (normalized) reply text so the registry CAN apply the
+    // new-content gate: identity match + TTL alone also fits a background
+    // sub-agent handback that merely resolved this flush-delivered ENDED turn as
+    // its owner via the latest-ended tier. Editing/deleting the flushed message
+    // for that handback's unrelated text is the #3429 silent client-side drop
+    // (msgs 10482/10486). But that gate ALSO declines the turn's OWN reworded
+    // late reply (model narrated → flushed → fired `reply` with a paraphrase),
+    // which is the dominant real duplicate (agent:marko 2026-07-20: 11/11
+    // declines were own-replies, turns #1177/#1182/#1201 double-sent). So we
+    // BYPASS the content gate whenever the reply is confidently the flushed
+    // turn's OWN answer, established by EITHER of two deterministic signals:
     //
-    // But the content gate must NOT fire when the owner turn was resolved by
-    // POSITIVE attribution (live / origin-echo / quoted): there the reply is
-    // this turn's OWN answer landing late, so it supersedes its flushed
-    // provisional draft REGARDLESS of a model rewording between the narration
-    // that flushed and the `reply` tool call — collapsing the reworded
-    // same-turn duplicate (#3429 regression) to one message. The content gate
-    // stays for the ambiguous `latest-ended` fallback tier, which cannot
-    // distinguish the turn's own late reply from an async sub-agent handback.
+    //   (a) POSITIVE owner-resolution tier (live / origin-echo / quoted) — the
+    //       reply is provably attributed to this turn (chiefly the supergroup
+    //       explicit-quote / echo path); OR
+    //   (b) NO background sub-agent handback could own it — the gateway records
+    //       when it synthesizes a `subagent_handback` inbound per chat, and NONE
+    //       was enqueued for this chat AFTER the flushed turn ended within the
+    //       supersede TTL. This is the signal that closes the DM default-reply
+    //       duplicate, where every own-reply resolves via the latest-ended tier
+    //       (no live/origin/quote) and (a) never fires.
+    //
+    // The content gate is kept ONLY for the residual ambiguous case: latest-ended
+    // tier AND a handback WAS enqueued in the window — there the late reply might
+    // BE that handback, so genuinely-new content must send fresh (two messages,
+    // #3429 preserved). Concurrency note: a case-A own reply that happens to
+    // coincide with an unrelated background handback completing in the same ≤TTL
+    // window falls into this residual and degrades to today's behaviour (two
+    // messages) — safe (never a silent drop/edit), just not collapsed.
     const positiveAttribution = ownerTier !== 'latest-ended'
+    const ownerEndedAt = ownerTurn?.endedAt ?? null
+    const handbackAt = getLastSubagentHandbackAt(chat_id)
+    const now = Date.now()
+    const handbackCouldOwnReply =
+      handbackAt != null &&
+      ownerEndedAt != null &&
+      handbackAt > ownerEndedAt &&
+      now - handbackAt <= DEFAULT_SUPERSEDE_TTL_MS
+    const replyIsOwnAnswer = positiveAttribution || !handbackCouldOwnReply
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
-      { liveTurnId: resolvedTurnId, replyText: text, positiveAttribution, now: Date.now() },
+      { liveTurnId: resolvedTurnId, replyText: text, positiveAttribution: replyIsOwnAnswer, now },
     )
     if (decision.supersede) {
       process.stderr.write(
