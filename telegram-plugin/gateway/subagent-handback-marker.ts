@@ -79,31 +79,128 @@
  * cannot reach the bypass unnoticed: the negative outcome guard
  * (`send-reply-golden.test.ts`) pins that a decoupled foreign-content reply on a
  * non-live tier never silently edits over the flushed answer.
+ *
+ * ## Inbound meta.source classification registry (F1 durability — dup-audit
+ * MUST-FIX 3, Fable 2026-07-21)
+ *
+ * The old predicate was a bare `=== 'subagent_handback'` with NO tripwire and an
+ * UNSAFE default: adding a new decoupled-completion source tripped nothing — no
+ * stamp → content-gate bypass eligible → silent edit-over of a delivered answer.
+ * This registry makes the classification EXPLICIT, EXHAUSTIVE and FAIL-SAFE:
+ *
+ *   - Every known `meta.source` is listed with `decoupledCompletion`. Today ONLY
+ *     `subagent_handback` is true; every other synthesized source lands as its
+ *     OWN live inbound turn (live tier → cannot supersede a different ended
+ *     turn's record), so it must NOT stamp.
+ *   - An UNKNOWN / unclassified source FAILS SAFE: `stampsHandbackMarker` returns
+ *     `true`, so it STAMPS → the content gate is KEPT → the worst case is a
+ *     visible duplicate, NEVER a silent edit-over (inverted from the old
+ *     deny-default, which failed toward silent loss).
+ *   - The exhaustiveness test (`subagent-handback-marker.test.ts`) scans the
+ *     gateway for `source:` / `meta.source ===` literals and FAILS when a new one
+ *     is added without a registry entry — forcing a conscious classification.
+ *
+ * Defense-in-depth with the tier restriction (`outbound-send-path.ts`): the
+ * content-gate bypass is now limited to the `live` + `latest-ended` tiers, so
+ * model-steerable `quoted`/`origin` attributions can never bypass regardless of
+ * the marker. This registry closes the residual `latest-ended` vector for a
+ * FUTURE decoupled source, fail-safe.
  */
-export function stampsHandbackMarker(source: string | null | undefined): boolean {
-  return source === 'subagent_handback'
+export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion: boolean }> = {
+  // The ONE decoupled-completion source today: a background worker termination
+  // wakes the agent with no live turn of its own → its reply resolves a
+  // different, already-ended turn via the latest-ended tier. THE F1 vector.
+  subagent_handback: { decoupledCompletion: true },
+  // Everything below lands as its OWN live inbound turn (live tier), so its reply
+  // resolves the live tier for its own turnId and structurally cannot supersede a
+  // different ended turn's record → not a decoupled-completion vector, must not stamp.
+  cron: { decoupledCompletion: false },
+  reaction: { decoupledCompletion: false },
+  subagent_progress: { decoupledCompletion: false },
+  resume_interrupted: { decoupledCompletion: false },
+  resume_deferred: { decoupledCompletion: false },
+  resume_watchdog_timeout: { decoupledCompletion: false },
+  vault_grant_approved: { decoupledCompletion: false },
+  vault_grant_denied: { decoupledCompletion: false },
+  vault_grant_timeout: { decoupledCompletion: false },
+  vault_save_completed: { decoupledCompletion: false },
+  vault_save_discarded: { decoupledCompletion: false },
+  vault_save_failed: { decoupledCompletion: false },
+  vault_save_timeout: { decoupledCompletion: false },
+  secret_provided: { decoupledCompletion: false },
+  secret_declined: { decoupledCompletion: false },
+  secret_provide_failed: { decoupledCompletion: false },
+  secret_request_timeout: { decoupledCompletion: false },
+  mental_model_propose_timeout: { decoupledCompletion: false },
+  bridge_dead_restart: { decoupledCompletion: false },
+  obligation_represent: { decoupledCompletion: false },
+  missed_approval_retry: { decoupledCompletion: false },
+  skill_proposal_apply: { decoupledCompletion: false },
+  warmup: { decoupledCompletion: false },
 }
 
-export class SubagentHandbackMarker {
-  private readonly lastAtByLane = new Map<string, number>()
+/**
+ * Whether an inbound of this `meta.source` must stamp the decoupled-completion
+ * marker. Null/undefined (a normal user inbound — not synthesized) → false.
+ * A known source → its registry classification. An UNKNOWN source → true
+ * (fail-safe: stamp, so an unclassified future decoupled source can only cause a
+ * visible dup, never a silent edit-over).
+ */
+export function stampsHandbackMarker(source: string | null | undefined): boolean {
+  if (source == null) return false
+  const known = INBOUND_SOURCE_CLASSIFICATION[source]
+  if (known == null) return true // fail-safe: unknown synthesized source stamps
+  return known.decoupledCompletion
+}
 
-  /** Compose the lane key consistently with the supersede registry's
-   *  `makeKey(chatId, threadId)`: a bare chat id for the no-thread (DM) case,
-   *  `chatId|threadId` for a forum topic. Keeping these two keyings identical is
-   *  what makes the marker gate exactly the lane the supersede acts on. */
-  private lane(chatId: string, threadId: number | undefined): string {
-    return threadId == null ? chatId : `${chatId}|${threadId}`
+/** Sentinel thread key for the no-thread (DM / bare-chat) lane. */
+const MAIN_THREAD_KEY = '<main>'
+
+export class SubagentHandbackMarker {
+  // chatId → (threadKey → last enqueue ms). Nested so the CONTENT-GATE read can
+  // query chat-wide (`lastAtInChat`) while the record stays thread-resolved.
+  private readonly byChat = new Map<string, Map<string, number>>()
+
+  private threadKey(threadId: number | undefined): string {
+    return threadId == null ? MAIN_THREAD_KEY : String(threadId)
   }
 
   /** Record that a `subagent_handback` was enqueued for `chatId`/`threadId` at
-   *  `now` (ms). */
+   *  `now` (ms). Thread-resolved so the record retains the originating topic. */
   record(chatId: string, threadId: number | undefined, now: number): void {
-    this.lastAtByLane.set(this.lane(chatId, threadId), now)
+    let inner = this.byChat.get(chatId)
+    if (inner == null) {
+      inner = new Map<string, number>()
+      this.byChat.set(chatId, inner)
+    }
+    inner.set(this.threadKey(threadId), now)
   }
 
-  /** Wall-clock ms of the most recent handback enqueue for `chatId`/`threadId`,
-   *  or null. */
+  /** Wall-clock ms of the most recent handback enqueue for a SPECIFIC
+   *  `chatId`/`threadId` lane, or null. (Diagnostics / unit tests.) */
   lastAt(chatId: string, threadId: number | undefined): number | null {
-    return this.lastAtByLane.get(this.lane(chatId, threadId)) ?? null
+    return this.byChat.get(chatId)?.get(this.threadKey(threadId)) ?? null
+  }
+
+  /**
+   * Wall-clock ms of the most recent handback enqueue ANYWHERE in `chatId`
+   * (across every topic lane), or null. This is what the content-gate read uses
+   * (dup-audit MUST-FIX 2, Fable 2026-07-21): the owner-resolution latest-ended
+   * tier is CHAT-WIDE (`findLatestEndedTurnForChat` ignores thread), so a
+   * background handback in topic A can resolve — and supersede — topic B's
+   * ended turn. A thread-SPECIFIC gate read (the F2 regression) let a reply
+   * dodge that handback by carrying a different `message_thread_id`, silently
+   * editing over the answer. Querying chat-wide makes the gate un-steerable by
+   * the reply's own thread arg: any in-window handback in the chat keeps the
+   * content gate. The cost is the F2 visible-dup (a handback in one topic keeps
+   * the gate for a coinciding own-reply in another for ≤TTL) — a self-healing
+   * visible duplicate, which is strictly better than a silent edit-over.
+   */
+  lastAtInChat(chatId: string): number | null {
+    const inner = this.byChat.get(chatId)
+    if (inner == null || inner.size === 0) return null
+    let max = -Infinity
+    for (const ts of inner.values()) if (ts > max) max = ts
+    return max === -Infinity ? null : max
   }
 }

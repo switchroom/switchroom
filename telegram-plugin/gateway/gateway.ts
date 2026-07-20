@@ -3892,12 +3892,14 @@ const recentTurnIdBySourceMessageId = new Map<number, string>()
 // fix/backstop-duplicate-reply — per-chat/thread marker of the most recent
 // gateway-synthesized `subagent_handback` enqueue (logic in
 // subagent-handback-marker.ts; extracted per the gateway anti-inflation ratchet).
-// Thread-keyed (dup-audit F2) so it gates exactly the `chatId|threadId` lane the
-// supersede registry acts on — a handback in one forum topic never holds the
-// content gate open in another.
+// The record is thread-resolved (retains the originating topic), but the
+// content-gate READ is CHAT-WIDE (dup-audit MUST-FIX 2): the latest-ended owner
+// tier is chat-wide, so a thread-specific gate read was steerable by the reply's
+// own `message_thread_id` → silent edit-over. `lastAtInChat` makes the gate
+// un-steerable (any in-window handback in the chat keeps the content gate).
 const subagentHandbackMarker = new SubagentHandbackMarker()
-const getLastSubagentHandbackAt = (chatId: string, threadId: number | undefined): number | null =>
-  subagentHandbackMarker.lastAt(chatId, threadId)
+const getLastSubagentHandbackAt = (chatId: string): number | null =>
+  subagentHandbackMarker.lastAtInChat(chatId)
 
 function rememberRecentTurn(turn: CurrentTurn): void {
   recentTurnsById.set(turn.turnId, turn)
