@@ -184,13 +184,20 @@ describe('scanTurnForFinalReply — final-reply detection', () => {
     expect(r.pendingText).toBe(trailing)
   })
 
-  it('Option A: a SHORT trailing/only fragment does NOT set pendingText (substance floor)', () => {
-    // A genuinely empty-ish turn: a short plain-text closer under the 200-char
-    // floor must not be re-delivered as if it were the answer.
-    const text = jsonl(ENQUEUE, assistantText('ok done, let me know if you need anything else'))
+  it('Option A: a SHORT single trailing fragment (zero-reply) IS persisted for the lowered-floor corner', () => {
+    // Post duplicate-message fix: a single short plain-text block in the
+    // ZERO-reply case is the real short-answer shape, so the scan persists it
+    // as pendingText for the capture-divergence corner (gateway captured empty →
+    // the bridge delivers with a lowered floor). Under the gateway's DEFAULT
+    // 200-char floor it is still NOT delivered, so the substance guard holds at
+    // the delivery layer.
+    const short = 'ok done, let me know if you need anything else'
+    const text = jsonl(ENQUEUE, assistantText(short))
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
-    expect(r.pendingText).toBeUndefined()
+    expect(r.reason).toBe('no-final-reply')
+    expect(r.pendingText).toBe(short)
+    expect(r.hasTrailingProse).toBe(true)
   })
 
   it('notification-bearing reply → allow', () => {
@@ -388,14 +395,19 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
   // "Let me check…" / "Still querying…" narration crossed 200 and was delivered
   // as if it were the answer. Post-fix only a single block that clears the floor
   // ON ITS OWN becomes pendingText.
-  const NARRATION_A = 'Let me check the first data source now — pulling the records and scanning for the relevant rows.' // ~95
-  const NARRATION_B = 'Still querying; the second source is slower than expected, so hang tight while it finishes loading.' // ~98
-  const NARRATION_C = 'Almost there, cross-referencing the last set of figures against the ledger before I summarise it.' // ~96
+  // Genuinely-narration blocks: each matches the opener/trailer heuristic
+  // (`isNarrationBlock`) the flush's `selectFlushDeliveryText` uses, so a pure
+  // run of them is delivered as NOTHING by the flush — and the scan must agree
+  // (no pendingText) so the capture-divergence bridge never masquerades a
+  // narration run as an answer (#3228 Finding 2).
+  const NARRATION_A = 'Let me check the first data source now, pulling the records and scanning the rows…' // opener + …
+  const NARRATION_B = "Now let me query the second source; it is slower than expected, hang tight…" // opener + …
+  const NARRATION_C = "I'll cross-reference the last set of figures against the ledger before I summarise…" // opener + …
 
-  it('zero-delivery turn of only short narration blocks → block WITHOUT pendingText (fails on the old joined-floor code)', () => {
-    // Combined length of the three blocks is ≥ 200, so the OLD code would join
-    // them and set pendingText (masquerade). The NEW code sets nothing because
-    // no single block clears the floor.
+  it('zero-delivery turn of only NARRATION blocks → block WITHOUT pendingText (#3228 Finding 2 / flush parity)', () => {
+    // Combined length of the three blocks is ≥ 200, so the OLD joined-floor code
+    // would join them and set pendingText (masquerade). The NEW code mirrors the
+    // flush's narration strip: every block is narration → nothing to deliver.
     expect((NARRATION_A + '\n\n' + NARRATION_B + '\n\n' + NARRATION_C).length)
       .toBeGreaterThanOrEqual(200)
     const text = jsonl(
@@ -411,6 +423,35 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
     expect(r.reason).toBe('no-final-reply')
     // The masquerade must NOT happen — no answer to deliver, take the re-prompt.
     expect(r.pendingText).toBeUndefined()
+  })
+
+  it('zero-delivery turn of MULTIPLE sub-200 REAL-CONTENT blocks → JOINED pendingText (review item 3 drop fix)', () => {
+    // A real answer split as two ~150-char paragraphs, each individually under
+    // the 200-char substance floor. Pre-fix the scan set NO pendingText — and in
+    // the capture-divergence-empty corner (gateway captured nothing → flush
+    // skips 'empty-text') the bridge then had nothing to deliver and the hook
+    // had already allowed the stop → DROPPED ANSWER. Post-fix the scan mirrors
+    // the flush's join so the bridge delivers the joined prose.
+    const PARA_1 = 'The root cause is a stale cache entry that survives the reload because the invalidation key is derived from the wrong field.' // ~150, real content
+    const PARA_2 = 'The fix is to key invalidation off the canonical id so the entry is dropped on every write; I have verified it against the repro.' // ~150, real content
+    expect(PARA_1.length).toBeLessThan(200)
+    expect(PARA_2.length).toBeLessThan(200)
+    const text = jsonl(ENQUEUE, assistantText(PARA_1), assistantText(PARA_2))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('no-final-reply')
+    // Joined prose, mirroring the flush's selectFlushDeliveryText.
+    expect(r.pendingText).toBe(`${PARA_1}\n\n${PARA_2}`)
+    expect(r.hasTrailingProse).toBe(true)
+  })
+
+  it('leading narration + a real sub-200 answer block → only the answer is delivered (narration stripped)', () => {
+    const NARR = 'Let me pull the numbers first…' // narration opener + …
+    const ANSWER = 'Revenue was up 12% quarter-over-quarter, driven mostly by the new enterprise tier.' // ~85, real
+    const text = jsonl(ENQUEUE, assistantText(NARR), assistantText(ANSWER))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.pendingText).toBe(ANSWER)
   })
 
   it('trailing narration after a delivered reply, all sub-floor → block only if a real ≥floor block exists; here → allow, no pendingText', () => {
@@ -447,9 +488,12 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
       const text = jsonl(ENQUEUE, assistantText('X'.repeat(n)))
       return scanTurnForFinalReply(text)
     }
-    // 199 → under floor, no pendingText (block still fires for the zero-delivery
-    // turn, but there is nothing substantive to deliver).
-    expect(at(199).pendingText).toBeUndefined()
+    // 199 → under the 200-char SUBSTANCE floor, but a SINGLE trailing block is
+    // the real short-answer shape: post duplicate-message fix the scan persists
+    // it as pendingText so the capture-divergence corner can deliver it with a
+    // lowered floor. The gateway's default-floor decide still won't deliver it,
+    // so the #3228 masquerade guard is unchanged at the delivery layer.
+    expect(at(199).pendingText).toBe('X'.repeat(199))
     // 200 → exactly the floor, delivered.
     expect(at(200).pendingText).toBe('X'.repeat(200))
     // 201 → over floor, delivered.

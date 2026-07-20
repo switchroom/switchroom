@@ -736,10 +736,15 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
       expect(decision.reason).toBe('no-state')
     })
 
-    it('a genuinely empty turn (no substantive prose) → hook blocks WITHOUT pendingText → decide falls through', () => {
-      // Short closer under the substance floor: not a dropped answer. The hook
-      // still blocks (re-prompt), but writes NO pendingText, so the gateway
-      // takes the existing recordUndeliveredTurnEnd / represent path unchanged.
+    it('a short single-block answer → hook persists pendingText but default-floor decide falls through', () => {
+      // Single short trailing block under the 200-char substance floor. Post
+      // duplicate-message fix the hook persists it as pendingText (so the
+      // capture-divergence corner can deliver it with a lowered floor when the
+      // gateway captured nothing), but under the DEFAULT floor the gateway's
+      // decide returns no-substantive-prose — the normal recordUndeliveredTurnEnd
+      // / represent path is unchanged. (No gateway heartbeat file exists in this
+      // test's state dir, so the single-writer election also BLOCKS on the
+      // liveness gate rather than allowing the stop.)
       const transcript = writeTranscript([
         ENQUEUE,
         { type: 'assistant', message: { content: [{ type: 'text', text: 'ok done' }] } },
@@ -747,10 +752,60 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
       const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
       expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
       const state = readSilentEndState()!
-      expect(state.pendingText).toBeUndefined()
+      expect(state.pendingText).toBe('ok done')
+      // Default floor (200) → short prose is not delivered on the normal path.
       const decision = decideCapturedProseDelivery({ turnKey: 'c:_' })
       expect(decision.deliver).toBe(false)
       expect(decision.reason).toBe('no-substantive-prose')
+      // Lowered floor (capture-divergence corner) → the short answer IS delivered.
+      const lowered = decideCapturedProseDelivery({ turnKey: 'c:_', minChars: 1 })
+      expect(lowered.deliver).toBe(true)
+      expect(lowered.text).toBe('ok done')
+    })
+
+    it('review item 3: multi sub-200 REAL blocks + capture-empty corner → bridge delivers JOINED prose (no drop)', () => {
+      // A real answer split as two ~150-char paragraphs, each under the 200-char
+      // floor. Pre-fix: scan set NO pendingText → in the capture-divergence-empty
+      // corner (gateway captured nothing → flush skips 'empty-text') the bridge
+      // had nothing → hook already allowed the stop → DROPPED ANSWER. Post-fix
+      // the hook persists the JOINED prose so the lowered-floor bridge delivers
+      // exactly one message.
+      // Each block short enough that the JOINED prose is still under the 200-char
+      // default floor — so this also exercises the lowered-floor plumbing.
+      const PARA_1 = 'The root cause is a stale cache entry surviving reload.'
+      const PARA_2 = 'The fix keys invalidation off the canonical id; verified.'
+      const joined = `${PARA_1}\n\n${PARA_2}`
+      expect(joined.length).toBeLessThan(200)
+      const transcript = writeTranscript([
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: PARA_1 }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: PARA_2 }] } },
+      ])
+      const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+      expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
+      const state = readSilentEndState()!
+      expect(state.pendingText).toBe(joined)
+      // Default floor → not delivered on the normal path (no duplicate risk).
+      expect(decideCapturedProseDelivery({ turnKey: 'c:_' }).deliver).toBe(false)
+      // Capture-divergence corner (gateway captured empty → lowered floor) →
+      // exactly one delivery of the joined answer, instead of a silent drop.
+      const lowered = decideCapturedProseDelivery({ turnKey: 'c:_', minChars: 1 })
+      expect(lowered.deliver).toBe(true)
+      expect(lowered.text).toBe(joined)
+    })
+
+    it('review item 3: NARRATION-only multi-block → still NO pendingText (no masquerade, #3228 Finding 2)', () => {
+      const transcript = writeTranscript([
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Let me check the first source now, scanning the rows…' }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: "Now let me query the second source; hang tight…" }] } },
+      ])
+      const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+      expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
+      const state = readSilentEndState()!
+      expect(state.pendingText).toBeUndefined()
+      // Even at the lowered floor there is nothing to deliver.
+      expect(decideCapturedProseDelivery({ turnKey: 'c:_', minChars: 1 }).deliver).toBe(false)
     })
 
     it('a stale pendingText for a DIFFERENT turn is never delivered (turnKey guard)', () => {

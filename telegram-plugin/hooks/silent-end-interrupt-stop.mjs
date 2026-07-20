@@ -58,7 +58,13 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { scanTurnForFinalReply } from './silent-end-scan.mjs'
+import {
+  scanTurnForFinalReply,
+  decideStopHookDisposition,
+  isTurnFlushSafetyEnabledEnv,
+  isCapturedProseDeliveryEnabledEnv,
+  isGatewayHeartbeatFresh,
+} from './silent-end-scan.mjs'
 
 // MUST stay in sync with SILENT_END_MAX_RETRIES in telegram-plugin/silent-end.ts
 // (this hook is a standalone .mjs and can't import the TS module).
@@ -75,6 +81,54 @@ function readStdin() {
 
 function getStateDir() {
   return process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+}
+
+/**
+ * Build the state-file payload the gateway reads back: carries `turnKey` /
+ * `chatId` / `threadId` / per-turn `turnId` nonce and the Option-A
+ * `pendingText` bridge, with the given `retryCount`. Stale carryover values
+ * from the prior on-disk state (`base`) are explicitly dropped when THIS turn
+ * has no derivable nonce / no deliverable prose.
+ *
+ * @param {object} base   Prior on-disk state (spread as a starting point).
+ * @param {ReturnType<import('./silent-end-scan.mjs').scanTurnForFinalReply>} decision
+ * @param {number} retryCount
+ */
+function buildNextState(base, decision, retryCount) {
+  const next = { ...base, retryCount, timestamp: Date.now() }
+  if (decision.turnKey) {
+    next.turnKey = decision.turnKey
+    next.chatId = decision.chatId
+    if (decision.threadId != null) next.threadId = decision.threadId
+    if (decision.turnId) next.turnId = decision.turnId
+    else delete next.turnId
+  } else {
+    delete next.turnId
+  }
+  if (typeof decision.pendingText === 'string' && decision.pendingText.length > 0) {
+    next.pendingText = decision.pendingText
+  } else {
+    delete next.pendingText
+  }
+  return next
+}
+
+/**
+ * Persist the elected state file (single-writer election allow path).
+ * retryCount is left UNCHANGED (this is a hand-off to the gateway's delivery
+ * machine, not a re-prompt). Fail-open on write error — an allow never loops.
+ *
+ * @param {string} statePath
+ * @param {object} base
+ * @param {ReturnType<import('./silent-end-scan.mjs').scanTurnForFinalReply>} decision
+ */
+function writeElectedState(statePath, base, decision) {
+  const retryCount = typeof base.retryCount === 'number' ? base.retryCount : 0
+  try {
+    writeFileSync(statePath, JSON.stringify(buildNextState(base, decision, retryCount)), 'utf8')
+  } catch (err) {
+    process.stderr.write(`[silent-end-interrupt] failed to write elected state file: ${err.message}\n`)
+  }
 }
 
 function main() {
@@ -136,6 +190,34 @@ function main() {
 
   const retryCount = typeof state.retryCount === 'number' ? state.retryCount : 0
 
+  // ── Single-writer election (duplicate-message fix) ────────────────
+  // On a would-BLOCK scan, ALLOW the stop (while still writing the state
+  // file so the gateway's delivery machines have their input) IFF a
+  // gateway delivery machine is PROVABLY going to deliver the trailing
+  // prose. Otherwise BLOCK exactly as today. See
+  // `decideStopHookDisposition` in silent-end-scan.mjs for the four
+  // never-drop gates. This eliminates the double-send: the gateway flush
+  // / captured-prose bridge is the single writer; the hook no longer
+  // re-prompts a reworded reply that defeats the exact-match dedup.
+  const disposition = decideStopHookDisposition({
+    scan: decision,
+    retryCount,
+    turnFlushSafetyEnabled: isTurnFlushSafetyEnabledEnv(process.env),
+    capturedProseDeliveryEnabled: isCapturedProseDeliveryEnabledEnv(process.env),
+    gatewayLive: isGatewayHeartbeatFresh(stateDir),
+  })
+  if (disposition.action === 'allow-elected') {
+    // Persist the state file (turnKey / turnId / pendingText) so the
+    // gateway's turn-end path delivers the answer — retryCount stays at 0
+    // (this is NOT a re-prompt, it's a hand-off to the single writer).
+    writeElectedState(statePath, state, decision)
+    process.stderr.write(
+      `[silent-end-interrupt] single-writer election ALLOWED stop ` +
+        `(scan=${decision.reason} elect=${disposition.reason}) — gateway will deliver\n`,
+    )
+    process.exit(0)
+  }
+
   if (retryCount >= MAX_RETRIES) {
     // Budget spent. Let the session end so the gateway's
     // `silent-end.ts:recordUndeliveredTurnEnd` path delivers the
@@ -161,41 +243,10 @@ function main() {
   // doubles the effective re-prompt budget vs. the design. With turnKey
   // present (same chatKey shape the gateway uses), the match succeeds
   // and the budget is honored.
-  const nextState = {
-    ...state,
-    retryCount: retryCount + 1,
-    timestamp: Date.now(),
-  }
-  if (decision.turnKey) {
-    nextState.turnKey = decision.turnKey
-    nextState.chatId = decision.chatId
-    if (decision.threadId != null) {
-      nextState.threadId = decision.threadId
-    }
-    // Per-turn nonce (Finding 3, #3228). The gateway requires this to match
-    // the live turn's `turnId` before delivering `pendingText`, so a stale
-    // record left over from a prior turn on the same chat/thread can never
-    // deliver a previous turn's answer on a later one. Explicitly drop a
-    // carried-over `turnId` from the spread `...state` when THIS turn has no
-    // derivable nonce, so an old value never lingers.
-    if (decision.turnId) nextState.turnId = decision.turnId
-    else delete nextState.turnId
-  } else {
-    delete nextState.turnId
-  }
-  // Option A transcript-prose bridge: when the scan isolated a substantive
-  // final answer the model wrote as plain text but never sent through the
-  // reply tool, persist it so the gateway's turn-end path can deliver it
-  // directly on the first silent-end (instead of relying on this hook's
-  // re-prompt / the obligation represent to eventually recover it). The
-  // gateway reads this field back out of the same state file. Explicitly
-  // clear a stale carryover value from a prior turn's spread `...state` when
-  // THIS turn has no deliverable prose, so an old answer is never re-sent.
-  if (typeof decision.pendingText === 'string' && decision.pendingText.length > 0) {
-    nextState.pendingText = decision.pendingText
-  } else {
-    delete nextState.pendingText
-  }
+  //
+  // Per-turn nonce (Finding 3, #3228) and the Option-A `pendingText` bridge
+  // are plumbed by `buildNextState`.
+  const nextState = buildNextState(state, decision, retryCount + 1)
   try {
     writeFileSync(statePath, JSON.stringify(nextState), 'utf8')
   } catch (err) {

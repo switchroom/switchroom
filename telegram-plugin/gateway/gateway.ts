@@ -899,6 +899,7 @@ import {
   TURN_ACTIVE_HARD_TTL_MS,
   TURN_ACTIVE_IDLE_SWEEP_MS,
 } from './turn-active-marker.js'
+import { startGatewayHeartbeat } from './gateway-heartbeat.js'
 import {
   VERSION,
   COMMIT_SHA,
@@ -2327,6 +2328,13 @@ function checkApprovals(): void {
   }
 }
 if (isGatewayMain && !STATIC) setInterval(checkApprovals, 5000).unref()
+// Gateway liveness heartbeat — touches `<STATE_DIR>/gateway-heartbeat` while
+// the gateway lives so the silent-end Stop hook's single-writer election can
+// confirm the gateway is alive (and WILL run its turn_end delivery) before
+// electing to allow a turn to end without re-prompting. Allowing into a dead
+// gateway would drop the answer — the one outcome worse than a duplicate. See
+// gateway/gateway-heartbeat.ts + hooks/silent-end-scan.mjs.
+if (isGatewayMain && !STATIC) startGatewayHeartbeat(STATE_DIR)
 // Idle auto-clear: check wall-clock idle every minute; maybeIdleClear no-ops
 // when disabled ('0s'), mid-turn, or already cleared this idle period. The
 // `let` state + maybeIdleClear are hoisted/initialized before this fires.
