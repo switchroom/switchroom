@@ -2,30 +2,130 @@
 
 ## Unreleased
 
-- **Async sub-agent handback no longer dropped by a stale answer-delivered latch**
-  (#3426) — the gateway's answer-delivered latch is now source-tagged
-  (`'flush'` / `'reply'`), and the late-reply suppression fires only for a
-  FLUSH-armed latch. Previously the dispatch → interim-ack → turn_end →
-  handback pattern silently dropped the handback: the substantive ack armed the
-  boolean latch, the sub-agent completion reply landed with no live gateway
-  turn, resolved the ended ack turn as owner (latest-ended tier, ≤60 s), and
-  was suppressed with a false "deduped" success. Flush-race dedup (post-fire
-  pre-record window, supersede resurrection window) and byte-identical replay
-  dedup (#546 content cache) are unchanged. Conscious trade: the weak
-  "reworded/bridge-replayed duplicate" suppression the reply-armed latch used
-  to provide is dropped — un-acked tool_call replays are byte-identical (the
-  #546 content dedup's case), and a model-regenerated paraphrase is
-  indistinguishable from a genuine handback, so delivering is correct. A rare
-  duplicate message beats a silent drop.
-- Hindsight recall: cache the active-directives list on the recall critical path
-  with a short TTL (default 120s, `directivesCacheTtlSeconds` /
-  `HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS`; 0 disables). `directive_verify.py`
+## v0.19.3 — Hindsight leverage programme (recall/retain/synthesis), Telegram `/auth add` + readd flow, rev5 carrier auto-remediation
+
+Lands the hindsight leverage programme epic (#3430): recall stops silently
+dropping on heavy multi-bank agents, follow-up user turns recall on their
+antecedent instead of a bare pronoun, an abrupt-death gap is covered by a
+transcript-grep fallback, lesson / anti-pattern transcripts are demoted (not
+dropped) at recall, and `switchroom doctor` plus template/skill triggers push
+agents toward synthesis before directives silently truncate. Alongside it, the
+Telegram `/auth` flow becomes actually reachable and broad-scope (tmux-supervisor
+provisioning, via-claude minter, `readd`), `/model` rev5 carrier drift now
+self-heals under `doctor --fix`, retired accounts stop rendering as available,
+and two async sub-agent handback delivery footguns are closed.
+
+### Hindsight leverage programme (epic #3430)
+
+- **Recall query hygiene + breach telemetry (A1)** (#3435) — recall stripped the
+  `<channel …>` transport envelope on neither the single-turn nor multi-turn
+  path, so ~100–200 chars of `chat_id`/`ts`/`user`/`message_id` XML entered the
+  embedding and ate the `recallMaxQueryChars` (800) budget. `strip_channel_envelope`
+  now runs once before both branches, and `compose_recall_query` strips
+  `latest_query` internally (defence in depth). Adds per-bank latency / timeout
+  fields to `recall_log.jsonl` so a fresh pre-parallelism breach baseline can
+  accrue (the oft-quoted 17–26% figure was the stale 2026-05-24 pre-fix audit,
+  not a valid before-number).
+- **contextTurns default 1→2 + bounded transcript tail-read (A2)** (#3443) —
+  `recallContextTurns` defaults to 2 so a bare follow-up ("and the port?")
+  embeds with its antecedent human turn instead of recalling on the pronoun
+  alone. Because turns>1 now reads the transcript on every recall, the new
+  `recallTranscriptTailBytes` (default `262144`, `HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES`;
+  `0` reads the whole file — rollback lever) byte-tail-bounds that read (seek to
+  `EOF − tail_bytes`, discard the partial first line) so the added per-recall
+  read stays O(1) regardless of session size. `truncate_recall_query` preserves
+  the latest turn and drops oldest context first, so a large antecedent can
+  never blow the 800-char query budget.
+- **Parallel multi-bank recall under one shared deadline (A3)** (#3445) — recall
+  serially summed round-trips across the own bank, every additional bank
+  (profile / shared / sender) and the directives list, so a heavy multi-bank
+  agent could serialise four 2–8s calls and breach the 12s `UserPromptSubmit`
+  hook ceiling, dropping recall for that turn. New `lib/parallel_recall.py`
+  runs each labelled slot in a daemon thread under one shared
+  `recallParallelDeadlineSeconds` (default 10 = 12s ceiling − 2s headroom);
+  total wait is bounded by the deadline no matter how many slots are slow, and
+  daemon threads + a final `os._exit(0)` mean a straggler blocked on a socket
+  can never hold the hook open. Result-merge stays own-bank-first, config-order
+  (deterministic telemetry). `HINDSIGHT_RECALL_PARALLEL=false` / `recallParallel: false`
+  restores the byte-for-byte serial path; `recall_log.jsonl` gains `recall_mode`,
+  `deadline_budget_ms`, `directives_timed_out` and finalised `deadline_hit`
+  semantics (true when any slot raised a hard timeout OR was abandoned at the
+  shared deadline).
+- **Directives-list TTL cache with in-session invalidation (A4)** (#3436) —
+  `list_directives` ran a fresh 2s-timeout round-trip on every non-skipped
+  recall even though the active-directives block changes only on a rare
+  directive write. `fetch_active_directives_cached()` reads a per-bank cache
+  envelope with a short TTL (`directivesCacheTtlSeconds` default 120,
+  `HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS`; `0` disables — rollback lever); a
+  genuine fetch failure is never cached, and a corrupt / bank-id-mismatched /
+  future-timestamp cache falls back to a live fetch. `directive_verify.py`
   (Stop hook) invalidates the cache when the just-ended turn wrote a directive,
   so in-session create/update/delete is visible on the very next turn; cross-
-  process writes (and sub-agent / Bash-CLI writes with no main-transcript
-  tool_use) are at most TTL stale. Saves the 2s-timeout `list_directives`
-  round-trip on cache-hit turns. (hindsight-leverage A4)
-- **`/model` rev5 carrier: auto-remediation + test hardening** (#3427, follow-up
+  process writes are at most TTL stale.
+- **Sub-agent (sidechain) retain coverage + tag-weight demotion (workstream B)**
+  (#3438) — delegated Task-tool work was the biggest systematic memory hole: the
+  main-session `Stop` retain read only the parent transcript, so a worker's
+  hours of process work reached memory only as its terse final report, and no
+  `SubagentStop` handling existed anywhere in the plugin. A live probe on Claude
+  Code 2.1.215 confirmed `SubagentStop` input carries a first-class
+  `agent_transcript_path` pointing straight at the sidechain jsonl (with a
+  directory-scan fallback for older CLIs). New `subagent_retain.py` (registered
+  `SubagentStop`, async 15s) resolves the sidechain transcript, applies a volume
+  gate (skip forks under 6 human turns / 2,000 non-tool-result chars), and
+  retains a bounded last-40-turn window tagged `sidechain` (+ `parent_session:` /
+  `agent_type:`) with a deterministic dedup id; failures enqueue to the existing
+  `pending-retains` durability queue. Adds `recallTagWeights` — a per-tag
+  score-penalty map (a NEW mechanism distinct from the hard demote-tag DROP
+  filter) so a penalised memory sorts below equal-score untagged memories yet
+  still surfaces when it is the only relevant hit; scaffold seeds
+  `recallTagWeights: { sidechain: 0.8 }`.
+- **Bounded transcript-grep fallback for an empty fact layer (E1)** (#3447,
+  closes #3369) — between an abrupt session death (SIGKILL / OOM / watchdog) and
+  the next boot, `reconcile_tail.py` has not re-committed the lost transcript
+  tail, so live recall returns nothing for those turns even though the
+  conversation happened. When all banks return zero results AND `deadline_hit`
+  is false (a timed-out bank must not masquerade as a genuinely empty fact
+  layer), recall now greps the current session's transcript tail for query-
+  overlapping turns and injects a clearly-labelled lower-confidence
+  `<hindsight_transcript_fallback>` block. All bounds are config-gated
+  (`recallTranscriptFallbackMaxBytes` 256 KiB, `…MaxTurns` 6, `…MaxChars` 2000,
+  `…DeadlineMs` 1500; `recallTranscriptFallback` default on,
+  `HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK=false` is the rollback lever), with
+  per-turn `transcript_fallback*` telemetry.
+- **Lesson / anti-pattern tagging + recall demotion (E2)** (#3449) — retained
+  transcripts that capture a lesson or a failure mode are tagged at retain time
+  via deterministic case-insensitive marker matching (`detect_lesson_tags`
+  against the configurable `lessonTagMarkers`; never model-dependent), emitting
+  `lesson` / `anti-pattern`. Recall merges built-in `lessonDemotionWeights`
+  (`lesson: 0.85`, `anti-pattern: 0.5`) under `recallTagWeights` so a failure-
+  mode-adjacent transcript ranks below a clean equal-score memory yet is never
+  hard-dropped and still surfaces as the only relevant hit. Tagging fires on new
+  retains only (no historical re-tagging — a deliberate epic non-goal); the
+  reflect-side lesson-promotion half of #398 stays open in follow-up #3451.
+- **Doctor directive-count WARN/FAIL + `MAX_DIRECTIVES` truncation surfacing (C2)**
+  (#3444) — the recall hook injects a bank's active directives into every turn
+  but `lib/directives.py` hard-caps the block at `MAX_DIRECTIVES = 15`, silently
+  dropping a bank's lowest-priority directives with no surface going red.
+  `switchroom doctor` now counts active directives per bank via the same REST
+  surface recall uses and classifies: no row at ≤12 / unknown, WARN at 13–15
+  (approaching the cap), FAIL at 16+ naming the exact number of lowest-priority
+  directives silently truncated. A fetch failure leaves the count `null`
+  (unknown, not a misleading `0`) and never fails the whole bank inspection.
+- **Synthesis triggers + curator directive merge/retire pass (C1, C3)** (#3446,
+  #3448) — the default profile template
+  (`profiles/default/CLAUDE.md.hbs`) gains a concrete "when to synthesize" block
+  (reflect instead of hand-assembling 2+ recalls; propose a model when
+  re-deriving the same answer across sessions; merge/retire directives when they
+  pile up), each paired to its deterministic backstop. The
+  `mental-model-curator` skill gains a second, proposal-only job: list active
+  directives, cluster overlap into merge candidates, flag stale/contradicting
+  ones as retire candidates, and present a ranked text plan — it never enacts
+  (`delete_directive` stays operator-approved). #3448 corrects a "fleet doctor"
+  → `switchroom doctor` terminology slip from the #3446 review.
+
+### Model switching
+
+- **`/model` rev5 carrier: auto-remediation + test hardening** (#3437, follow-up
   to #3424) — `switchroom doctor --fix` now HEALS rev5 `.session-model` carrier
   drift instead of only detecting it: each drifted/missing `start.sh` is
   regenerated from the current template via the standard per-agent reconcile
@@ -46,6 +146,76 @@
   the classify → log/card pipeline, and the `scaffold.session-model.test.ts`
   live-resolution subset red on `main` is fixed (the fake `switchroom` CLI now
   lives on an exec-capable filesystem — `/tmp` is noexec in the dev container).
+
+### Telegram `/auth` flow
+
+- **Provision `SWITCHROOM_TMUX_SUPERVISOR` from config** (#3440) — the gateway's
+  in-chat `/auth add` OAuth flow HARD-REFUSES to launch unless
+  `SWITCHROOM_TMUX_SUPERVISOR === "1"`, but v0.19.2 shipped that guard with no
+  provisioning — nothing set the var, so the flow was unreachable on every
+  agent. `describeAgents` now resolves a `tmuxSupervisor` field via the same
+  `experimental.legacy_pty !== true` predicate the rest of the supervisor
+  surface uses, and compose emits the var (`="1"`) before the `userEnv` merge so
+  it is system-authoritative, omitted under `legacy_pty`.
+- **Broad-scope via-claude minter for `/auth add`** (#3441) — the flow drove
+  `claude setup-token`, which mints `user:inference` only; every `server:`-mode
+  switchroom agent refuses that scope at boot, and the operator's 7-day usage
+  reporting needs `user:profile` that setup-token can never deliver. The flow
+  now defaults to a `via-claude` mode that spawns the bare `claude` login picker
+  and drives the pre-paste choreography (theme + login-method) via a new
+  single-key `sendKey` tmux primitive, importing the shared `PRE_PASTE_RULES`
+  driver seam rather than duplicating it.
+- **`/auth readd` (re-auth an existing label) + granted-scope in the reply**
+  (#3442) — the paste-back intercept hardcoded `replace: false`, so re-adding a
+  pooled account to widen its scope was rejected at the broker. A `readd` verb
+  (and `add --replace`) threads a `replace` flag through the flow; the gateway
+  prechecks broker `list-state` so `readd` of a nonexistent label and plain
+  `add` of an existing one both error clearly (best-effort — skipped if the
+  broker is unreachable), and the success reply now states the granted scope.
+- **Show retired accounts as RETIRED, not "available"** (#3455) — accounts
+  removed from every selection list (`fallback_order` + per-agent `accounts:` +
+  consumer pins) still rendered as "available" in `auth list` / `auth usage` /
+  `auth schedule` and the `/usage` card, because every view enumerated the
+  broker credential-store directory without cross-checking config (this is what
+  let the disabled `me@…` account keep showing as available). An `inServiceSet()`
+  classification now renders RETIRED across all four views (sorted last, excluded
+  from the switch keyboard and the "all blocked" recommendation). Precedence:
+  `active` > `DISABLED (org)` > `RETIRED` > quota-derived health; only an
+  explicit `in_service=false` retires, so a pre-field broker never falsely
+  retires the fleet. PR1 (display) of a two-PR change; #3454 is the backend
+  probe-hardening.
+
+### Gateway async handback delivery
+
+- **Async sub-agent handback no longer dropped by a stale answer-delivered latch**
+  (#3428, fixes #3426) — the gateway's answer-delivered latch is now source-tagged
+  (`'flush'` / `'reply'`), and the late-reply suppression fires only for a
+  FLUSH-armed latch. Previously the dispatch → interim-ack → turn_end →
+  handback pattern silently dropped the handback: the substantive ack armed the
+  boolean latch, the sub-agent completion reply landed with no live gateway
+  turn, resolved the ended ack turn as owner (latest-ended tier, ≤60 s), and
+  was suppressed with a false "deduped" success. Flush-race dedup (post-fire
+  pre-record window, supersede resurrection window) and byte-identical replay
+  dedup (#546 content cache) are unchanged. Conscious trade: the weak
+  "reworded/bridge-replayed duplicate" suppression the reply-armed latch used
+  to provide is dropped — un-acked tool_call replays are byte-identical (the
+  #546 content dedup's case), and a model-regenerated paraphrase is
+  indistinguishable from a genuine handback, so delivering is correct. A rare
+  duplicate message beats a silent drop.
+- **Content-gate flush supersede so async handbacks send fresh instead of a
+  silent edit-in-place** (#3439, fixes #3429) — `decideSupersede` matched by turn
+  identity + TTL only, so an async handback resolving a flush-delivered ended
+  turn applied a deferred edit-in-place: the prior flushed message was edited to
+  the handback text, and because Telegram edits do not push-notify, the handback
+  "delivered" server-side but never surfaced client-side (and the flushed answer
+  text was destroyed). A live-turn gate cannot work — the flush ends its turn
+  before recording, so every superseding reply is a late reply. The discriminator
+  is content: `flushedAnswerMatchesReply` (whitespace-normalized equality or
+  containment with a 32-char floor) keeps the same-answer correction path
+  unchanged, while a different-content handback takes a new `'new-content'` path
+  that does NOT supersede and sends a FRESH push-notifying message. The
+  answer-delivered latch accepts the match evidence so a declined supersede can
+  never fall through into a #3426-style silent drop.
 
 ## v0.19.2 — Hindsight recovery, External spend on /usage, auth-broker hardening, /model carrier doctor
 
