@@ -104,6 +104,19 @@ export function writeSessionModelFile(
   if (!isValidModelArg(model)) {
     throw new Error(`refusing to persist non-canonical session model token: ${JSON.stringify(model)}`)
   }
+  // A FRESH carrier gets a FRESH retry budget: clear any bounded-retry counter
+  // left over from a prior carrier's boots. Without this, an orphan counter
+  // survives the whole session on a healthy snapshot-apply boot (the apply
+  // branch re-writes the live counter AFTER the gateway's healthy-boot consume
+  // already deleted it), gets snapshotted alongside the NEW carrier at the next
+  // boot, and burns the new override's retry budget from a stale count — three
+  // such sessions in a row and a perfectly healthy /model is refused with a
+  // false "did not reach a healthy boot after 3 attempts" revert.
+  try {
+    rmSync(join(agentDir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), { force: true })
+  } catch {
+    /* best-effort — worst case is a stale count, bounded and non-fatal */
+  }
   atomicWrite(
     join(agentDir, SESSION_MODEL_FILE),
     serializeSessionModel({ model, configuredDefaultAtWrite, ts: Date.now() }),

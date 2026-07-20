@@ -353,6 +353,35 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(existsSync(join(agentDir, ATTEMPTS_SNAPSHOT))).toBe(false);
   });
 
+  it("orphan attempt counter from a prior healthy snapshot-apply does NOT burn a NEW carrier's retry budget (fresh carrier = fresh budget)", async () => {
+    const { writeSessionModelFile } = await import(
+      "../telegram-plugin/gateway/session-model-file.js"
+    );
+    // Boot A (healthy, snapshot apply): gateway already consumed the live
+    // carrier; resolution applies from the snapshot and re-writes the LIVE
+    // counter AFTER the consume — leaving an orphan attempts=1 all session.
+    writeFileSync(join(agentDir, SNAPSHOT), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(attemptCount()).toBe("1"); // the orphan
+    // In-session `/model sr-glm-5`: the gateway writes a FRESH carrier. This
+    // must also clear the orphan counter (the blocker fix) — otherwise the
+    // stale count is snapshotted with the new carrier and after three such
+    // sessions a healthy /model is falsely refused as "3 failed attempts".
+    writeSessionModelFile(agentDir, "sr-glm-5", DEFAULT_MODEL);
+    expect(attemptCount()).toBe(""); // fresh carrier = fresh retry budget
+    // Boot B outer pass: snapshot the live carrier (+ counter if any)…
+    execFileSync("bash", ["-c", [
+      `cd ${JSON.stringify(agentDir)}`,
+      `cp -f .session-model ${JSON.stringify(SNAPSHOT)}`,
+      `[ -f .session-model-boot-attempts ] && cp -f .session-model-boot-attempts ${JSON.stringify(ATTEMPTS_SNAPSHOT)} || true`,
+    ].join("\n")]);
+    // …then the gateway's healthy-boot consume eats the live files…
+    healthyBootConsume();
+    // …and resolution applies the NEW override as attempt 1, not 2.
+    expect(runBlock("1")).toBe("sr-glm-5");
+    expect(attemptCount()).toBe("1");
+  });
+
   it("rendered start.sh takes the pre-fork snapshot BEFORE the gateway fork (ordering is the whole fix)", () => {
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
     const snapIdx = startSh.indexOf(".session-model.boot-snapshot");
