@@ -3454,7 +3454,7 @@ describe("generateCompose — LiteLLM ANTHROPIC_BASE_URL model-class routing", (
     expect(agentBlock).not.toContain(ROOT);
     expect(agentBlock).not.toMatch(/ANTHROPIC_BASE_URL:/);
     expect(agentBlock).not.toMatch(/SWITCHROOM_LITELLM:/);
-    // Broker still receives the base (loopback rewritten to host-gateway).
+    // Broker still receives the base (non-loopback ROOT → passed through).
     const ab =
       /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
     expect(ab).toMatch(/SWITCHROOM_LITELLM_BASE:/);
@@ -3463,7 +3463,11 @@ describe("generateCompose — LiteLLM ANTHROPIC_BASE_URL model-class routing", (
 
 
 describe("generateCompose — auth-broker LiteLLM base for external spend", () => {
-  it("rewrites loopback base_url to host.docker.internal + set extra_hosts", () => {
+  it("loopback base_url → host network + verbatim URL (not host.docker.internal)", () => {
+    // host.docker.internal/host-gateway routes to the host BRIDGE IP, not to
+    // a 127.0.0.1-bound host port — so a loopback-published proxy is only
+    // reachable when the broker joins the host network. See the dedicated
+    // compose-auth-broker-litellm.test.ts for the full matrix.
     const out = generateCompose({
       config: makeConfig(
         { router: {} },
@@ -3473,14 +3477,11 @@ describe("generateCompose — auth-broker LiteLLM base for external spend", () =
     const block =
       /switchroom-auth-broker:[\s\S]*?(?=\n  [a-zA-Z]|\nvolumes:|$)/.exec(out)?.[0] ?? "";
     expect(block).toContain(
-      'SWITCHROOM_LITELLM_BASE: "http://host.docker.internal:4010"',
-    );
-    expect(block).not.toContain(
       'SWITCHROOM_LITELLM_BASE: "http://127.0.0.1:4010"',
     );
-    expect(block).toMatch(
-      /extra_hosts:\n {6}- "host\.docker\.internal:host-gateway"/,
-    );
+    expect(block).not.toContain("host.docker.internal");
+    expect(block).not.toContain("extra_hosts");
+    expect(block).toContain("network_mode: host");
   });
 
   it("passes non-loopback base_url through unchanged", () => {

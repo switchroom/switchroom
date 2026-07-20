@@ -182,6 +182,81 @@ describe("get-external-spend", () => {
     }
   });
 
+  it("returns available:true with per-model summary from a healthy /spend/logs body (real fetch path, openrouter rows)", async () => {
+    // End-to-end handoff guard: drive the REAL fetchAndSummarizeExternalSpend
+    // (no _testFetchExternalSpend seam) against a stubbed global fetch that
+    // returns a healthy `/spend/logs` body with openrouter/* rows. Locks that
+    // a live, reachable proxy yields available:true + the per-model top block —
+    // the state the /usage External row needs (and rendered blank in the bug).
+    const h = makeHarness();
+    seedAccount(h, "default");
+    const today = new Date().toISOString().slice(0, 10);
+    const realFetch = globalThis.fetch;
+    let calledUrl = "";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calledUrl = String(input);
+      const body = {
+        data: [
+          {
+            startTime: `${today}T00:00:00Z`,
+            spend: 12.5,
+            models: {
+              "openrouter/openai/gpt-oss-120b": 6.1,
+              "openrouter/x-ai/grok-4": 3.4,
+              "claude-sonnet-4": 99.0, // subscription passthrough — excluded
+            },
+          },
+        ],
+      };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const config = makeConfig(h);
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      _testLitellmMasterKey: "sk-secret-master-do-not-leak",
+    });
+    await broker.start();
+    try {
+      const sock = join(h.socketRoot, "alice", "sock");
+      const resp = (await rpc(sock, {
+        v: PROTOCOL_VERSION,
+        id: "e2e",
+        op: "get-external-spend",
+        forceLive: true,
+      })) as {
+        ok: boolean;
+        data?: {
+          available?: boolean;
+          day24hUsd?: number;
+          day7dUsd?: number;
+          top?: Array<{ label: string; usd: number }>;
+        };
+      };
+      expect(resp.ok).toBe(true);
+      expect(resp.data?.available).toBe(true);
+      // openrouter/* rows summed; Claude passthrough excluded.
+      expect(resp.data?.day24hUsd).toBeCloseTo(9.5, 5);
+      expect(resp.data?.day7dUsd).toBeCloseTo(9.5, 5);
+      const top = resp.data?.top ?? [];
+      expect(top.map((t) => t.label)).toEqual(["gpt-oss-120b", "grok-4"]);
+      expect(top[0]?.usd).toBeCloseTo(6.1, 5);
+      // Went through the real /spend/logs endpoint, not the enterprise report.
+      expect(calledUrl).toContain("/spend/logs");
+      // Master key never crosses the wire.
+      expect(JSON.stringify(resp)).not.toContain("sk-secret-master");
+    } finally {
+      broker.stop();
+      globalThis.fetch = realFetch;
+    }
+  });
+
   it("serves durable cache when live refresh fails", async () => {
     const h = makeHarness();
     seedAccount(h, "default");

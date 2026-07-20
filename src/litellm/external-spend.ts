@@ -214,15 +214,33 @@ export async function fetchAndSummarizeExternalSpend(opts: {
       },
       signal: ac.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // Operator-observable signal (broker log): a 401 here is the classic
+      // stale/wrong master key; a 5xx is proxy trouble. Without this the
+      // /usage External row just silently vanishes with no breadcrumb.
+      console.warn(
+        `external-spend: LiteLLM /spend/logs returned HTTP ${res.status} — ` +
+          `External /usage row will be blank (check master key / proxy)`,
+      );
+      return null;
+    }
     let body: unknown;
     try {
       body = await res.json();
-    } catch {
+    } catch (err) {
+      console.warn(
+        `external-spend: failed to parse /spend/logs JSON: ${(err as Error)?.message ?? err}`,
+      );
       return null;
     }
     return summarizeExternalSpend(normalizeSpendLogRows(body), now);
-  } catch {
+  } catch (err) {
+    // Transport failure (unreachable / DNS / timeout-abort). This is the
+    // exact branch the bridge-vs-loopback outage hit: the broker could not
+    // reach a loopback-published proxy and the error was swallowed to null.
+    console.warn(
+      `external-spend: LiteLLM /spend/logs fetch failed: ${(err as Error)?.message ?? err}`,
+    );
     return null;
   } finally {
     clearTimeout(timer);
