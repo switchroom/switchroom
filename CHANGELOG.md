@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.19.7 — No more duplicate replies, and no silently-dropped real reply
+
+### Fixes
+
+- **A whole class of duplicate and near-duplicate Telegram replies is now
+  eliminated, and a rare case where your real reply could be silently
+  overwritten is prevented** (#3477) — hardens the duplicate-reply defense so
+  it is self-enforcing rather than relying on the model behaving. You no
+  longer see the same answer arrive twice (even lightly reworded) across
+  single-turn replies, group/forum threads, and answers that land after a
+  background task finishes; and a genuine reply can no longer be quietly
+  clobbered by a stale draft. The guarantee is enforced by outcome-level
+  regression guards and a source registry with a fail-safe default, so the
+  two remaining edge paths that could be steered into silent data loss are
+  closed and cannot regress unnoticed.
+
 ## v0.19.6 — No more duplicate near-identical Telegram replies in a single turn
 
 ### Fixes
