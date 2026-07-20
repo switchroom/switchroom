@@ -172,6 +172,15 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // here even though the health-coach test would still pass. This test is
     // what surfaced that PR #3232's delegation fragment breached the old 37500
     // ceiling for this stack (37464 → 38658), prompting the bump to 40000.
+    // Later, #3446's "When to synthesize" synthesis-triggers fragment
+    // silently pushed this stack to 40626 — over the 40000 ceiling without a
+    // bump — which surfaced as a required-check failure on the next PR (#3482)
+    // even though #3482 adds ZERO bytes to CLAUDE.md (its formatting floor
+    // card goes into --append-system-prompt, not CLAUDE.md). Fixed durably by
+    // TIGHTENING that fragment's prose (rules + backstops kept, wordiness cut)
+    // rather than bumping the ceiling — restoring the stack to ~39746
+    // (~254B headroom). Do NOT paper over a future breach with a ceiling bump
+    // unless the added prose is genuinely load-bearing and irreducible.
     const config = makeAgentConfig({ root: true } as Partial<AgentConfig>);
     const result = scaffoldAgent("overlord", config, tmpDir, telegramConfig);
     const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");

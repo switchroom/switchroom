@@ -51,7 +51,7 @@ their bold stripped at send time — so bold sparingly and deliberately.
 | Bold | `**text**` | The one key fact or answer, not decoration. |
 | Italic | `*text*` or `_text_` | Light emphasis, labels, asides. |
 | Strikethrough | `~~text~~` | Retractions, "was X now Y". |
-| Spoiler | `\|\|text\|\|` | Hidden until tapped — surprises, a long answer's punchline. Surfaces as a `spoiler` entity on the wire (live-verified 2026-07). |
+| Spoiler | `\|\|text\|\|` | Only for an opt-in surprise or a reveal the reader chose to wait for (a punchline they want suspended) — NEVER to hide an answer someone is asking for or anxious about; when in doubt, show it plainly. Surfaces as a `spoiler` entity on the wire (live-verified 2026-07). |
 | Highlight / marked | `==text==` | Surfaces as a `marked` entity on the wire (live-verified 2026-07). `=` is an `escapeMarkdown` special, so dynamic text won't trigger it by accident. |
 | Inline code | `` `text` `` | Identifiers, tap-to-copy. Content is literal — no escaping inside. |
 | Link | `[label](https://…)` | Standard GFM link. |
