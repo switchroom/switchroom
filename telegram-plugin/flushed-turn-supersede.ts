@@ -181,7 +181,13 @@ export function flushedAnswerMatchesReply(flushedText: string, replyText: string
  */
 export function decideSupersede(
   record: FlushedTurnRecord | undefined,
-  args: { liveTurnId: string | null; replyText?: string | null; now: number; ttlMs?: number },
+  args: {
+    liveTurnId: string | null
+    replyText?: string | null
+    positiveAttribution?: boolean
+    now: number
+    ttlMs?: number
+  },
 ): SupersedeDecision {
   const ttlMs = args.ttlMs ?? DEFAULT_SUPERSEDE_TTL_MS
   if (record == null) return { supersede: false, deleteMessageIds: [], reason: 'no-record' }
@@ -195,10 +201,29 @@ export function decideSupersede(
   if (!sameTurn) {
     return { supersede: false, deleteMessageIds: [], reason: 'different-turn' }
   }
-  // #3429 — same turn identity, but genuinely different content: an async
-  // handback attributed to the flush-delivered ended turn, not the turn's own
-  // answer landing late. Never edit/delete the flushed message for it.
-  if (args.replyText != null && !flushedAnswerMatchesReply(record.text, args.replyText)) {
+  // #3429 content gate — but ONLY when the caller is UNSURE the reply is this
+  // turn's own answer. `positiveAttribution === true` means the gateway
+  // established the reply IS this turn's OWN late answer — either by a positive
+  // owner-resolution tier (live atom / `origin_turn_id` echo / quoted message
+  // id) OR because no background `subagent_handback` could own it (none enqueued
+  // for the chat after the flushed turn ended within the supersede TTL; see
+  // outbound-send-path). Then supersede the flushed provisional draft REGARDLESS
+  // of text, so a model that RE-WORDED the answer between the narration that
+  // flushed and the `reply` tool call still collapses to ONE message (the
+  // duplicate-reply regression #3429 introduced on the reworded same-turn path).
+  //
+  // The content gate remains when `positiveAttribution` is falsey — the
+  // ambiguous residual (latest-ended tier AND a handback in flight) where
+  // identity alone cannot tell the turn's own late reply from a background
+  // sub-agent handback that resolved this flush-delivered ended turn as its
+  // owner. There, genuinely different content is a handback and must send FRESH
+  // (both messages surface), never edit/delete the flushed answer. Legacy
+  // identity-only callers (no `replyText`) keep the pre-#3429 behaviour.
+  if (
+    !args.positiveAttribution &&
+    args.replyText != null &&
+    !flushedAnswerMatchesReply(record.text, args.replyText)
+  ) {
     return { supersede: false, deleteMessageIds: [], reason: 'new-content', recordText: record.text }
   }
   return {
@@ -326,12 +351,18 @@ export class FlushedTurnSupersedeRegistry {
   peek(
     chatId: string,
     threadId: number | undefined,
-    args: { liveTurnId: string | null; replyText?: string | null; now: number },
+    args: {
+      liveTurnId: string | null
+      replyText?: string | null
+      positiveAttribution?: boolean
+      now: number
+    },
   ): SupersedeDecision {
     const rec = this.entries.get(makeKey(chatId, threadId))?.get(turnKey(args.liveTurnId))
     return decideSupersede(rec, {
       liveTurnId: args.liveTurnId,
       replyText: args.replyText,
+      positiveAttribution: args.positiveAttribution,
       now: args.now,
       ttlMs: this.ttlMs,
     })
@@ -345,7 +376,12 @@ export class FlushedTurnSupersedeRegistry {
   take(
     chatId: string,
     threadId: number | undefined,
-    args: { liveTurnId: string | null; replyText?: string | null; now: number },
+    args: {
+      liveTurnId: string | null
+      replyText?: string | null
+      positiveAttribution?: boolean
+      now: number
+    },
   ): SupersedeDecision {
     const lane = makeKey(chatId, threadId)
     const decision = this.peek(chatId, threadId, args)

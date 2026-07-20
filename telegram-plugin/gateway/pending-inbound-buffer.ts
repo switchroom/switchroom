@@ -79,6 +79,16 @@ export interface PendingInboundBufferOptions {
    * never breaks the push hot path.
    */
   onEvict?: (agent: string, evicted: InboundMessage) => void
+  /**
+   * fix/backstop-duplicate-reply MUST-FIX 2 — called on every push of a
+   * `subagent_handback` envelope (live synthesis AND boot-replay re-push),
+   * carrying the envelope's `chatId` and its own `ts` (ms). The gateway wires
+   * this to the per-chat subagent-handback marker so the supersede path can tell
+   * a flushed turn's own late reply from a background handback attributed to it
+   * — INCLUDING after a restart, where the only handback push is the replay.
+   * Best-effort: a throw here never breaks the push hot path.
+   */
+  onHandbackEnqueue?: (chatId: string, ts: number) => void
 }
 
 /**
@@ -342,6 +352,23 @@ export function createPendingInboundBuffer(
         }
       }
       q.push(msg)
+      // fix/backstop-duplicate-reply MUST-FIX 2 — stamp the subagent-handback
+      // marker at THIS chokepoint, not at the live onFinish enqueue site alone.
+      // Every handback enqueue funnels through here — the live synthesis push
+      // AND the boot-replay re-push of un-acked spooled inbounds — so stamping
+      // here (rather than only at the live site) means a handback replayed after
+      // a restart still populates the marker. Otherwise the Map is empty
+      // post-boot and a replayed handback's late reply bypasses the #3429
+      // content gate → silent edit-over-answer. Uses the envelope's own `ts`
+      // (ms, `Date.now()`-derived at synthesis) so the marker reflects when the
+      // handback actually happened, not the replay moment. Best-effort.
+      if (msg.meta?.source === 'subagent_handback' && opts.onHandbackEnqueue != null) {
+        try {
+          opts.onHandbackEnqueue(msg.chatId, msg.ts)
+        } catch {
+          /* marker stamp is best-effort; never break the push hot path */
+        }
+      }
       // Durable record FIRST-class to the in-memory queue: spool BEFORE
       // returning, regardless of the cap eviction above — an entry the
       // in-memory cap drops still survives in the spool (boot-replayed /

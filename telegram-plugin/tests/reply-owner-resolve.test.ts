@@ -32,6 +32,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   resolveReplyOwnerTurnId,
+  resolveReplyOwnerTier,
   decideAnswerLatchSuppression,
   type ReplyOwnerCandidates,
   type AnswerDeliveredLatch,
@@ -609,5 +610,78 @@ describe('#3429 — flush-armed latch with content evidence', () => {
     expect(
       decideAnswerLatchSuppression({ ...base, ownerAnswerDelivered: false, replyMatchesFlushedAnswer: true }),
     ).toBe(false)
+  })
+})
+
+/**
+ * `resolveReplyOwnerTier` (fix/backstop-duplicate-reply) exposes WHICH precedence
+ * tier won, so the gateway can apply the #3429 content gate ONLY on the ambiguous
+ * `latest-ended` fallback. It shares one precedence with `resolveReplyOwnerTurnId`
+ * (asserted equivalent below), so the winning id and the winning tier can never
+ * disagree.
+ */
+describe('resolveReplyOwnerTier — precedence + latest-ended TTL bound', () => {
+  const base: ReplyOwnerCandidates = {
+    liveTurnId: null,
+    originTurnId: null,
+    quotedTurnId: null,
+    latestEndedTurnId: null,
+  }
+
+  it('live wins over every lower tier', () => {
+    expect(
+      resolveReplyOwnerTier({ ...base, liveTurnId: 'L', originTurnId: 'O', quotedTurnId: 'Q', latestEndedTurnId: 'E' }),
+    ).toBe('live')
+  })
+
+  it('origin wins when no live turn', () => {
+    expect(resolveReplyOwnerTier({ ...base, originTurnId: 'O', quotedTurnId: 'Q', latestEndedTurnId: 'E' })).toBe('origin')
+  })
+
+  it('quoted wins when no live/origin turn (the positive DM recovery tier)', () => {
+    expect(resolveReplyOwnerTier({ ...base, quotedTurnId: 'Q', latestEndedTurnId: 'E' })).toBe('quoted')
+  })
+
+  it('latest-ended is the ambiguous FALLBACK when only it resolves', () => {
+    expect(resolveReplyOwnerTier({ ...base, latestEndedTurnId: 'E' })).toBe('latest-ended')
+  })
+
+  it('none when every lookup missed', () => {
+    expect(resolveReplyOwnerTier(base)).toBe('none')
+  })
+
+  it('a STALE latest-ended (age > TTL) is NOT accepted → none, never latest-ended', () => {
+    const stale: ReplyOwnerCandidates = {
+      ...base,
+      latestEndedTurnId: 'E',
+      latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 1,
+      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    }
+    expect(resolveReplyOwnerTier(stale)).toBe('none')
+    // And the id resolver agrees (no destructive authority granted to a stale turn).
+    expect(resolveReplyOwnerTurnId(stale)).toBe(null)
+  })
+
+  it('tier and id resolver share one precedence for every candidate shape', () => {
+    const shapes: ReplyOwnerCandidates[] = [
+      base,
+      { ...base, liveTurnId: 'L', quotedTurnId: 'Q', latestEndedTurnId: 'E' },
+      { ...base, originTurnId: 'O', latestEndedTurnId: 'E' },
+      { ...base, quotedTurnId: 'Q' },
+      { ...base, latestEndedTurnId: 'E' },
+    ]
+    const idForTier = (s: ReplyOwnerCandidates): string | null => {
+      switch (resolveReplyOwnerTier(s)) {
+        case 'live': return s.liveTurnId
+        case 'origin': return s.originTurnId
+        case 'quoted': return s.quotedTurnId
+        case 'latest-ended': return s.latestEndedTurnId
+        case 'none': return null
+      }
+    }
+    for (const s of shapes) {
+      // The id the winning tier points at equals what the id resolver returns.
+      expect(resolveReplyOwnerTurnId(s)).toBe(idForTier(s))
+    }
   })
 })

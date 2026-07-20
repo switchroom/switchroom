@@ -485,8 +485,11 @@ import {
 } from '../turn-flush-safety.js'
 import {
   resolveReplyOwnerTurnId,
+  resolveReplyOwnerTier,
+  type ReplyOwnerTier,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
+import { SubagentHandbackMarker } from './subagent-handback-marker.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import {
   AnswerReadyFlushController,
@@ -3885,6 +3888,14 @@ const recentTurnsById = new Map<string, CurrentTurn>()
 // real message_id the framework stamped, never a model-asserted thread.
 // Evicted in lock-step with recentTurnsById so it can't outgrow it.
 const recentTurnIdBySourceMessageId = new Map<number, string>()
+
+// fix/backstop-duplicate-reply — per-chat marker of the most recent
+// gateway-synthesized `subagent_handback` enqueue (logic in
+// subagent-handback-marker.ts; extracted per the gateway anti-inflation ratchet).
+const subagentHandbackMarker = new SubagentHandbackMarker()
+const getLastSubagentHandbackAt = (chatId: string): number | null =>
+  subagentHandbackMarker.lastAt(chatId)
+
 function rememberRecentTurn(turn: CurrentTurn): void {
   recentTurnsById.set(turn.turnId, turn)
   if (turn.sourceMessageId != null) {
@@ -4009,7 +4020,7 @@ function resolveReplyOwnerTurn(
   liveTurn: CurrentTurn | null,
   chatId: string,
   args: Record<string, unknown>,
-): CurrentTurn | null {
+): { turn: CurrentTurn | null; tier: ReplyOwnerTier } {
   const origin = findTurnByOriginId(args.origin_turn_id as string | undefined)
   const quoted = findTurnByQuotedMessageId(chatId, args.reply_to)
   const latestEnded = findLatestEndedTurnForChat(chatId)
@@ -4026,15 +4037,23 @@ function resolveReplyOwnerTurn(
   // fabricate one.
   const latestEndedAgeMs =
     latestEnded?.endedAt != null ? Date.now() - latestEnded.endedAt : null
-  const winnerId = resolveReplyOwnerTurnId({
+  const candidates = {
     liveTurnId: liveTurn?.turnId ?? null,
     originTurnId: origin?.turnId ?? null,
     quotedTurnId: quoted?.turnId ?? null,
     latestEndedTurnId: latestEnded?.turnId ?? null,
     latestEndedAgeMs,
     latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
-  })
-  return winnerId != null ? (byId.get(winnerId) ?? null) : null
+  }
+  // #3429 — the WINNING tier travels with the turn. A positive tier
+  // (live/origin/quoted) means the reply is this turn's own answer and the
+  // supersede fires regardless of text; the ambiguous `latest-ended` fallback
+  // keeps the content gate (it cannot tell a late own-reply from an async
+  // sub-agent handback). Both derive from the SAME candidates, so the id and the
+  // tier can never disagree.
+  const tier = resolveReplyOwnerTier(candidates)
+  const winnerId = resolveReplyOwnerTurnId(candidates)
+  return { turn: winnerId != null ? (byId.get(winnerId) ?? null) : null, tier }
 }
 
 /**
@@ -9962,6 +9981,10 @@ const pendingInboundBuffer = createPendingInboundBuffer({
       { chat_id: chat, verb: 'inbound-buffer-eviction' },
     )
   },
+  // fix/backstop-duplicate-reply MUST-FIX 2 — stamp the handback marker at the
+  // enqueue chokepoint so a boot-replayed handback (not just the live synthesis
+  // push) populates it. Every `subagent_handback` push funnels through here.
+  onHandbackEnqueue: (chatId, ts) => subagentHandbackMarker.record(chatId, ts),
 })
 
 // PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a
@@ -12567,6 +12590,7 @@ function gatewaySendReplyDeps(): SendReplyGatewayDeps {
     resolveAnswerThreadWithLog,
     resolveThreadId,
     getLatestInboundMessageId,
+    getLastSubagentHandbackAt,
     recordOutbound,
     emissionAuthorityFor,
     clearActivitySummary,
@@ -24458,6 +24482,9 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // The drain only releases at an idle prompt (no active
                 // turn), so the handback always lands as a clean fresh
                 // turn and never races a turn-in-flight composer (#1556).
+                // The handback marker is stamped inside pendingInboundBuffer.push
+                // (the enqueue chokepoint) so BOTH this live synthesis push and
+                // the boot-replay re-push populate it — see MUST-FIX 2.
                 pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', decision.inbound)
                 process.stderr.write(
                   `telegram gateway: subagent-handback queued agent=${agentId} outcome=${outcome} chat=${decision.chatId} resultChars=${resultText.length}\n`,

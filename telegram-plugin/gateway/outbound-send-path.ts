@@ -56,9 +56,10 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import {
   decideSupersedeCorrection,
   flushedAnswerMatchesReply,
+  DEFAULT_SUPERSEDE_TTL_MS,
   type FlushedTurnSupersedeRegistry,
 } from '../flushed-turn-supersede.js'
-import { decideAnswerLatchSuppression } from '../reply-owner-resolve.js'
+import { decideAnswerLatchSuppression, type ReplyOwnerTier } from '../reply-owner-resolve.js'
 import { deriveTelegraphTitle } from '../telegraph.js'
 import {
   mintVoiceOnDemandToken,
@@ -658,7 +659,7 @@ export interface SendReplyGatewayDeps {
   assertSendable(f: string): void
   statusKey(chatId: string, threadId?: number | null): string
   streamKey(chatId: string, threadId?: number | null): string
-  resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): CurrentTurn | null
+  resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): { turn: CurrentTurn | null; tier: ReplyOwnerTier }
   findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null
   findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTurn | null
   resolveAnswerThreadWithLog(
@@ -671,6 +672,7 @@ export interface SendReplyGatewayDeps {
   ): number | undefined
   resolveThreadId(chatId: string, explicit?: string | number | null): number | undefined
   getLatestInboundMessageId(chatId: string, threadId: number | null): number | null | undefined
+  getLastSubagentHandbackAt(chatId: string): number | null
   recordOutbound(rec: {
     chat_id: string
     thread_id: number | null
@@ -735,7 +737,7 @@ export async function sendReply(
     statusKey, streamKey,
     resolveReplyOwnerTurn, findTurnByOriginId, findTurnByQuotedMessageId,
     resolveAnswerThreadWithLog, resolveThreadId,
-    getLatestInboundMessageId, recordOutbound,
+    getLatestInboundMessageId, getLastSubagentHandbackAt, recordOutbound,
     emissionAuthorityFor, clearActivitySummary,
     startTypingLoop, stopTypingLoop, logOutbound,
     closeObligationOnSubstantiveReply, finalizeStatusReaction,
@@ -874,18 +876,56 @@ export async function sendReply(
     // double-send). The quoted / latest-ended recoveries are precisely what the
     // router already did for the same reply, so unifying here makes the two
     // resolvers agree and the late-reply supersede fires by identity.
-    const ownerTurn = resolveReplyOwnerTurn(turn, chat_id, args)
+    const { turn: ownerTurn, tier: ownerTier } = resolveReplyOwnerTurn(turn, chat_id, args)
     const resolvedTurnId = ownerTurn?.turnId ?? null
-    // #3429 — pass the (normalized) reply text so the registry can apply the
-    // new-content gate: identity match + TTL alone also fits an async handback
-    // that merely resolved this flush-delivered ENDED turn as its owner via
-    // the latest-ended tier. Editing the flushed message in place with that
-    // handback's text does not re-notify client-side (Telegram edits never
-    // push) — the observed silent non-surfacing of msgs 10482/10486.
+    // #3429 — pass the (normalized) reply text so the registry CAN apply the
+    // new-content gate: identity match + TTL alone also fits a background
+    // sub-agent handback that merely resolved this flush-delivered ENDED turn as
+    // its owner via the latest-ended tier. Editing/deleting the flushed message
+    // for that handback's unrelated text is the #3429 silent client-side drop
+    // (msgs 10482/10486). But that gate ALSO declines the turn's OWN reworded
+    // late reply (model narrated → flushed → fired `reply` with a paraphrase),
+    // which is the dominant real duplicate (agent:marko 2026-07-20: 11/11
+    // declines were own-replies, turns #1177/#1182/#1201 double-sent). So we
+    // BYPASS the content gate ONLY when the reply is confidently the flushed
+    // turn's OWN answer. The primary, deterministic signal is the absence of a
+    // background sub-agent handback that could own this reply: the gateway
+    // records when it synthesizes a `subagent_handback` inbound per chat, and if
+    // NONE was enqueued for this chat AFTER the flushed turn ended within the
+    // supersede TTL, the reply is that turn's own answer → supersede regardless
+    // of a model rewording (closes the DM default-reply duplicate, where every
+    // own-reply resolves via the latest-ended tier).
+    //
+    // MUST-FIX 1 (silent-data-loss): the owner-resolution `quoted` / `origin`
+    // tiers are derived from MODEL-SUPPLIED args (`args.reply_to` /
+    // `args.origin_turn_id`), so a background handback turn can STEER them —
+    // pass `reply_to = <the user's original msg id>` and it resolves the PRIOR
+    // flushed turn via `quoted`, which used to force the bypass and silently
+    // edit-over that turn's delivered answer (#3429-class, model-steerable). So
+    // a positive tier NEVER overrides an in-window handback; only the
+    // FRAMEWORK-owned `live` tier (the live `currentTurn`, not model-derived,
+    // and structurally unable to collide with an ended turn's flush record —
+    // `decideSupersede` requires same turnId) may bypass a handback window.
+    //
+    // The content gate is therefore kept whenever a handback WAS enqueued in the
+    // window (any non-live tier): the late reply might BE that handback, so
+    // genuinely-new content sends fresh (two messages, #3429 preserved).
+    // Concurrency note: a case-A own reply coinciding with an unrelated
+    // background handback in the same ≤TTL window degrades to today's behaviour
+    // (two messages) — safe (never a silent drop/edit), just not collapsed.
+    const ownerEndedAt = ownerTurn?.endedAt ?? null
+    const handbackAt = getLastSubagentHandbackAt(chat_id)
+    const now = Date.now()
+    const handbackCouldOwnReply =
+      handbackAt != null &&
+      ownerEndedAt != null &&
+      handbackAt > ownerEndedAt &&
+      now - handbackAt <= DEFAULT_SUPERSEDE_TTL_MS
+    const replyIsOwnAnswer = ownerTier === 'live' || !handbackCouldOwnReply
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
-      { liveTurnId: resolvedTurnId, replyText: text, now: Date.now() },
+      { liveTurnId: resolvedTurnId, replyText: text, positiveAttribution: replyIsOwnAnswer, now },
     )
     if (decision.supersede) {
       process.stderr.write(

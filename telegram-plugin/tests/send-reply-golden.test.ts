@@ -46,6 +46,8 @@ import {
 } from '../gateway/outbound-send-path.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import { SubagentHandbackMarker } from '../gateway/subagent-handback-marker.js'
+import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, Access } from '../gateway/gateway.js'
 
@@ -209,7 +211,8 @@ function makeHarness(opts?: {
     assertSendable: () => {},
     statusKey: key,
     streamKey: key,
-    resolveReplyOwnerTurn: () => null,
+    resolveReplyOwnerTurn: () => ({ turn: null, tier: 'none' as const }),
+    getLastSubagentHandbackAt: () => null,
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
     resolveAnswerThreadWithLog: (_c, explicit) => explicit,
@@ -633,8 +636,11 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
       Date.now(),
     )
     // The late reply resolves the ENDED flush-delivered turn as its owner
-    // (latest-ended tier — no live turn, no origin echo, no quote in a DM).
-    h.deps.resolveReplyOwnerTurn = () => owner
+    // (latest-ended tier — no live turn, no origin echo, no quote in a DM). This
+    // is the AMBIGUOUS fallback tier: the content gate applies here, so a
+    // genuinely-new handback sends fresh while the turn's own contained answer
+    // still supersedes.
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
   }
 
   it('CORE REGRESSION (red pre-fix): a handback with genuinely NEW content sends a ' +
@@ -642,6 +648,11 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedFlushRecord(h, owner)
+    // A background sub-agent handback WAS enqueued for this chat after the
+    // flushed turn ended and within the supersede TTL — so this late reply might
+    // BE that handback. The marker keeps the #3429 content gate. (owner.endedAt
+    // = now-30s; handback at now-15s is after it and within the 60s TTL.)
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
 
     // The handback lands LATE: req.turn = null (no live gateway turn — a
     // sub-agent completion is not a new inbound).
@@ -700,8 +711,8 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     // NO registry record (the post-fire pre-record window); owner resolution
-    // still recovers the ended flush-armed turn.
-    h.deps.resolveReplyOwnerTurn = () => owner
+    // still recovers the ended flush-armed turn via the latest-ended tier.
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
 
     const res = await sendReply(h.deps, req(HANDBACK))
 
@@ -715,11 +726,215 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     'window is still suppressed (the #2996 Part 2 backstop holds)', async () => {
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
-    h.deps.resolveReplyOwnerTurn = () => owner
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
 
     const res = await sendReply(h.deps, req(FLUSHED_TEXT))
 
     expect(h.calls).toHaveLength(0) // nothing sent, nothing edited
     expect(res.content[0]!.text).toContain('deduped')
+  })
+
+  // ─── The REAL marko DM incident (fix/backstop-duplicate-reply) ───
+  //
+  // The dominant real duplicate: the model narrates its answer as prose (flushed
+  // as message A), then fires the `reply` tool with a RE-WORDED version of the
+  // same answer. On a DM this late reply has NO live turn, NO `origin_turn_id`
+  // echo, and NO explicit `reply_to`, so it resolves its owner via the ambiguous
+  // `latest-ended` tier — the #3429 content gate then declines (reworded text ⊄
+  // flushed blob) and a fresh SECOND bubble ships = the visible duplicate
+  // (agent:marko 2026-07-20: turns #1177/#1182/#1201 double-sent; 11/11 declines
+  // were own-replies with NO handback in flight).
+  //
+  // The two cases are indistinguishable by tier (both latest-ended) and by
+  // content (rewording). The deterministic discriminator is the gateway-
+  // synthesized `subagent_handback` marker: case A has NONE enqueued after the
+  // flushed turn ended; a genuine background handback (case B) does. These two
+  // tests drive the REAL send path with the REAL supersede registry over the
+  // SAME reworded text and the SAME latest-ended tier, differing ONLY in the
+  // handback marker — proving it is the marker that flips the outcome.
+  const REWORDED_SAME_TURN_ANSWER =
+    'Good news on the fleet: every one of the twelve agents is running fine right now. ' +
+    'The gateway, the vault broker and the approval kernel are all green, and nothing has ' +
+    'restarted in the past day — so there is nothing you need to do.'
+
+  function seedRecord(h: ReturnType<typeof makeHarness>, owner: CurrentTurn): void {
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      { turnId: owner.turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now(),
+    )
+  }
+
+  it('CASE A — REAL marko DM incident: reworded own reply, latest-ended tier, ' +
+    'NO handback in flight → supersedes the flushed draft, collapses to ONE message', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // Late DM reply: latest-ended tier (the path the tier discriminator MISSES),
+    // and crucially NO subagent_handback was enqueued for this chat after the
+    // turn ended — so the reply is the flushed turn's OWN answer.
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    // Exactly ONE client-visible message: the flushed message edited in place
+    // into the reworded reply — NO fresh second bubble (duplicate closed).
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(edits[0]!.text).toContain('every one of the twelve agents')
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+    // Record consumed.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        now: Date.now(),
+      }).reason,
+    ).toBe('no-record')
+  })
+
+  it('CASE B — genuine background handback: SAME reworded text, SAME latest-ended tier, ' +
+    'but a handback WAS enqueued in-window → keeps the gate, sends FRESH (TWO messages)', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    // A background sub-agent handback was enqueued for this chat AFTER the turn
+    // ended (now-30s) and within the 60s TTL (now-15s) — this reply might BE it.
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    // A fresh notifying bubble ships; the flushed message is NEITHER edited nor
+    // deleted — flush (A) + fresh (B) = two surfaced messages (#3429 preserved).
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // Record NOT consumed.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  it('MUST-FIX 1 (silent-data-loss): a handback reply model-STEERED to the quoted ' +
+    'tier (reply_to = the flushed turn\'s source msg) must NOT edit/delete the flushed ' +
+    'answer while a handback is in flight — sends FRESH (two messages)', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // The `quoted` tier is derived from the MODEL-SUPPLIED `args.reply_to`, so a
+    // background handback turn can point reply_to at the user's original message
+    // (which the prior turn's flush is recorded against) to resolve THAT turn via
+    // `quoted`. A handback IS in flight, so a positive tier must NOT override the
+    // #3429 content gate — else the reworded handback text silently edits over
+    // the flushed turn's DELIVERED answer (Telegram edits don't re-notify).
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    // Fresh notifying send; the flushed answer is NEITHER edited nor deleted.
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // Flush record NOT consumed — the flushed answer stands.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  it('the framework-owned `live` tier MAY still bypass a handback window (a live ' +
+    'currentTurn is not model-derived and cannot collide with an ended turn\'s record)', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'live' })
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    // Live tier bypasses → supersede via edit-in-place (one message).
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+
+  it('MUST-FIX 2 (boot-replay): a handback re-pushed through the buffer chokepoint ' +
+    'stamps the marker (with the envelope ts) → gate preserved → FRESH send, no silent edit', async () => {
+    // Real marker + real buffer wired exactly as the gateway wires them. The
+    // boot-replay loop re-pushes un-acked spooled inbounds — including handback
+    // envelopes — through this SAME push(); the chokepoint stamp is what makes a
+    // replayed handback populate the (post-restart empty) marker.
+    const marker = new SubagentHandbackMarker()
+    const buffer = createPendingInboundBuffer({
+      log: () => {},
+      onHandbackEnqueue: (chatId, ts) => marker.record(chatId, ts),
+    })
+
+    // Simulate the boot-replay re-push of an un-acked spooled handback envelope.
+    // The envelope carries its own ms `ts` (after the flushed turn ended, within
+    // TTL) — owner.endedAt below is now-30s, this handback is now-15s.
+    const handbackTs = Date.now() - 15_000
+    buffer.push('marko', {
+      type: 'inbound',
+      chatId: CHAT,
+      messageId: handbackTs,
+      user: 'subagent-watcher',
+      userId: 0,
+      ts: handbackTs,
+      text: 'handback result',
+      meta: { source: 'subagent_handback' },
+    })
+    // The chokepoint stamped the marker from the replay push (pre-fix: empty).
+    expect(marker.lastAt(CHAT)).toBe(handbackTs)
+
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    // The gateway reads the marker the boot-replay stamped.
+    h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAt(chatId)
+
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    // Gate preserved → the replayed handback delivers FRESH; the post-boot
+    // flushed answer is NEITHER edited nor deleted (no silent #3429 on restart).
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+
+  it('the buffer chokepoint stamps ONLY handback envelopes (a normal inbound does not)', () => {
+    const marker = new SubagentHandbackMarker()
+    const buffer = createPendingInboundBuffer({
+      log: () => {},
+      onHandbackEnqueue: (chatId, ts) => marker.record(chatId, ts),
+    })
+    buffer.push('marko', {
+      type: 'inbound', chatId: CHAT, messageId: 5, user: 'ken', userId: 1,
+      ts: Date.now(), text: 'hi', meta: {},
+    })
+    expect(marker.lastAt(CHAT)).toBe(null)
   })
 })
