@@ -953,7 +953,7 @@ import {
 import { findAgentProcessInContainer } from './boot-probes.js'
 import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
 import type { InterruptedSubagent } from './resume-inbound-builder.js'
-import { resolveWorkerFeedDispatch, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
+import { resolveWorkerFeedDispatch, decideWorkerFeedOriginDefer, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
   resolveSubagentStatusSurface,
   isOrphanSubagentStatusEnabled,
@@ -2180,6 +2180,15 @@ const WORKER_FEED_GROUP_MESSAGE_LIFETIME_CAP_MS = (() => {
 })()
 const workerFeedOwnerDmFallbackLogged = new Set<string>()
 
+// Per-agent consecutive origin-race deferrals (rationale in
+// `decideWorkerFeedOriginDefer`, worker-feed-dispatch.ts). Bounds the wait for
+// the `jsonl_agent_id` backfill; deleted on link, card-exists, and finish/drop
+// so the map stays bounded.
+const workerFeedOriginDeferrals = new Map<string, number>()
+// Watcher ticks ~1/s and the backfill retries ~every 3s, so ~10 ticks is a
+// comfortable ceiling on the race window before painting anyway.
+const WORKER_FEED_ORIGIN_DEFER_MAX = 10
+
 /**
  * Resolve a worker-feed destination chat with a guaranteed last resort.
  *
@@ -2202,10 +2211,14 @@ const workerFeedOwnerDmFallbackLogged = new Set<string>()
 function resolveWorkerFeedChat(
   agentId: string,
   fleetChatId: string,
+  // Origin sources threadId; when origin is null the caller can pass the
+  // fallback chat's sibling forum-topic id so a misrouted card still lands
+  // in the origin topic instead of General (#3458 exhausted-defer paint).
+  fallbackThreadId?: number,
 ): { chatId: string; threadId?: number } {
   const origin = resolveSubagentOriginChat(agentId)
   if (origin != null && origin.chatId.length > 0) return origin
-  if (fleetChatId.length > 0) return { chatId: fleetChatId }
+  if (fleetChatId.length > 0) return { chatId: fleetChatId, threadId: fallbackThreadId }
   const ownerDm = loadAccess().allowFrom[0] ?? ''
   if (origin == null && fleetChatId.length === 0 && ownerDm.length > 0) {
     // Routing decision, not a warning: origin resolution failed and no
@@ -2223,7 +2236,7 @@ function resolveWorkerFeedChat(
       )
     }
   }
-  return { chatId: ownerDm, threadId: origin?.threadId }
+  return { chatId: ownerDm, threadId: origin?.threadId ?? fallbackThreadId }
 }
 
 // ─── Periodic history reaper (#1073) ──────────────────────────────────────
@@ -24397,6 +24410,9 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
               // live worker, collapses the shared card to its terminal summary
               // and unpins it — closing the immortal/unpinned/buried-card leak.
               onTerminalCleanup: (agentId) => {
+                // A worker that terminated while still unlinked never links —
+                // clear its origin-race defer state so the map can't leak.
+                workerFeedOriginDeferrals.delete(agentId)
                 try {
                   void workerActivityFeed?.terminate(agentId)
                 } catch (err) {
@@ -24406,6 +24422,8 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 }
               },
               onFinish: ({ agentId, outcome, description, resultText, toolCount, totalTokens, durationMs, background: entryBackground }) => {
+                // Clear origin-race defer state — the worker is terminal.
+                workerFeedOriginDeferrals.delete(agentId)
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was
                 // deferred (held on ✍️/⚡). Now that a worker finished,
@@ -24890,7 +24908,49 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // resolved (the pinned-card fleet that used to carry the chat
                 // is gone — see resolveSubagentOriginChat).
                 if (workerFeedEnabled) {
-                  const wk = resolveWorkerFeedChat(agentId, fleetChatId)
+                  // Origin-race defer (decideWorkerFeedOriginDefer): the first
+                  // tick of a fresh sub-agent can beat the async jsonl_agent_id
+                  // backfill that links its row to the origin turn — resolving
+                  // origin to null and CREATING the card in the owner DM, which
+                  // then stays visible even after the origin (supergroup + forum
+                  // topic) resolves ~3s later. Defer CARD CREATION until linked;
+                  // the watcher re-fires and paints in the correct chat+topic.
+                  const originResolved = resolveSubagentOriginChat(agentId) != null
+                  const cardExists = workerActivityFeed?.has(agentId) === true
+                  const { defer, deferrals } = decideWorkerFeedOriginDefer({
+                    originResolved,
+                    cardExists,
+                    priorDeferrals: workerFeedOriginDeferrals.get(agentId) ?? 0,
+                    maxDeferrals: WORKER_FEED_ORIGIN_DEFER_MAX,
+                  })
+                  if (defer) {
+                    workerFeedOriginDeferrals.set(agentId, deferrals)
+                    // Defer this tick: no card created, no owner-DM fallback.
+                    // The watcher re-fires once the jsonl_agent_id backfill links
+                    // the row to its origin turn, and the card is then created in
+                    // the correct chat+topic.
+                    return
+                  }
+                  if (!originResolved && !cardExists) {
+                    // Bounded-defer exhausted — backfill never linked (history
+                    // disabled / row reaped / ancestor never stamped). Stop
+                    // deferring and let the card paint so active work stays
+                    // visible (universal-liveness contract).
+                    process.stderr.write(
+                      `telegram gateway: worker-feed origin backfill never linked agent=${agentId} after ${deferrals} deferrals — painting card\n`,
+                    )
+                  }
+                  // Linked (or a card already exists, or defer exhausted): clear
+                  // any defer state so the map can't leak.
+                  workerFeedOriginDeferrals.delete(agentId)
+                  // Prefer the live turn's chat/topic over the owner DM if we do
+                  // have to fall back — a misroute at least lands near the work.
+                  const usingStampFallback = fleetChatId.length === 0
+                  const workerFleetChatId = usingStampFallback
+                    ? stampTurn?.sessionChatId ?? fleetChatId
+                    : fleetChatId
+                  // Carry the fallback chat's forum topic id (#3458) so the card lands in the origin topic, not General.
+                  const wk = resolveWorkerFeedChat(agentId, workerFleetChatId, usingStampFallback ? stampTurn?.sessionThreadId : undefined)
                   const wkChat = wk.chatId
                   void workerActivityFeed?.update(
                     agentId,
