@@ -1,18 +1,18 @@
 /**
- * Per-chat marker of the most recent gateway-synthesized `subagent_handback`
- * enqueue (fix/backstop-duplicate-reply).
+ * Per-chat-and-thread marker of the most recent gateway-synthesized
+ * `subagent_handback` enqueue (fix/backstop-duplicate-reply).
  *
  * A BACKGROUND sub-agent completion is a GATEWAY-SYNTHESIZED event, not model
  * output: when a background worker terminates the gateway wakes the agent with a
- * `subagent_handback` inbound. Recording WHEN one was enqueued, per chat, is the
- * ONE deterministic signal that distinguishes the two late-reply cases that both
- * resolve a flush-delivered ENDED turn via the latest-ended tier — the case the
- * owner-resolution tier alone cannot separate (a DM late reply has no
+ * `subagent_handback` inbound. Recording WHEN one was enqueued, per chat/thread,
+ * is the ONE deterministic signal that distinguishes the two late-reply cases
+ * that both resolve a flush-delivered ENDED turn via the latest-ended tier — the
+ * case the owner-resolution tier alone cannot separate (a DM late reply has no
  * live/origin/quoted attribution, so both land on latest-ended):
  *
  *   - CASE A — the flushed turn's OWN reworded reply landing late. NO
- *     `subagent_handback` was enqueued for this chat after the turn ended, so the
- *     reply is that turn's own answer → the supersede path collapses the
+ *     `subagent_handback` was enqueued for this chat/thread after the turn ended,
+ *     so the reply is that turn's own answer → the supersede path collapses the
  *     provisional flush REGARDLESS of the model's rewording (closes the #3429
  *     reworded-duplicate regression: agent:marko 2026-07-20, turns
  *     #1177/#1182/#1201 double-sent).
@@ -22,21 +22,200 @@
  *     and send fresh (two messages), never silently edit/delete the flushed
  *     answer.
  *
- * One entry per chat (overwritten on each enqueue), so bounded by chat count. No
- * clock reads beyond the caller-supplied `now`; the gateway wires the actual
- * enqueue site and the supersede-path read. Deterministic — keyed on a
- * gateway-emitted event, never on model discipline (Ken's controls-in-code rule).
+ * ## Why thread-keyed (F2, dup-audit 2026-07-21)
+ *
+ * The supersede registry this marker gates is keyed on `chatId|threadId`
+ * (`flushed-turn-supersede.ts` `makeKey`). Keying the marker on `chatId` ALONE
+ * was inconsistent: in a forum supergroup a background handback in topic A
+ * stamped the chat-wide marker, and a genuine CASE-A reworded own-reply in ANY
+ * other topic within the 60 s TTL then computed `handbackCouldOwnReply = true` →
+ * kept the content gate → shipped a second visible bubble instead of collapsing.
+ * The blast radius was every topic in the chat for 60 s per handback. Keying on
+ * `chatId + threadId` — the SAME lane the supersede registry uses — confines a
+ * handback's gate-hold to the topic it actually landed in, so an unrelated
+ * topic's CASE-A collapse is untouched. A DM (no thread) collapses to the
+ * chat-only key, so single-lane behaviour is unchanged.
+ *
+ * One entry per chat/thread (overwritten on each enqueue), so bounded by
+ * chat×topic count. No clock reads beyond the caller-supplied `now`; the gateway
+ * wires the actual enqueue site and the supersede-path read. Deterministic —
+ * keyed on a gateway-emitted event, never on model discipline (Ken's
+ * controls-in-code rule).
  */
-export class SubagentHandbackMarker {
-  private readonly lastAtByChat = new Map<string, number>()
+/**
+ * ## The enforced invariant (F1, dup-audit 2026-07-21)
+ *
+ * The whole content-gate bypass rests on this premise: *a decoupled late reply
+ * (turn == null) carrying content that is NOT the flushed turn's own answer,
+ * resolving an ENDED flushed turn as its owner, can ONLY be a gateway-synthesized
+ * completion — and every such completion stamps this marker.* If that premise
+ * holds, then marker-ABSENCE in the window proves the late reply IS the flushed
+ * turn's own (possibly reworded) answer, so bypassing the content gate is safe
+ * (closes the marko duplicate). If a NEW synthesized-inbound source were ever
+ * able to land as a decoupled late reply with foreign content WITHOUT stamping,
+ * it would silently edit over a delivered answer (the #3429 failure).
+ *
+ * We make the premise an ENFORCED invariant rather than an architectural
+ * coincidence by routing the stamp decision through this ONE predicate at the ONE
+ * chokepoint every inbound funnels through (`pendingInboundBuffer.push` — live
+ * synthesis, boot-replay, and every future source alike). The membership of the
+ * decoupled-completion class is defined HERE and nowhere else:
+ *
+ *   - `subagent_handback` — the only source today that wakes the agent to emit a
+ *     reply with NO live gateway turn of its own (a background worker completion),
+ *     so its reply resolves a DIFFERENT, already-ended turn via the latest-ended
+ *     tier. It is the F1 vector.
+ *   - Every OTHER synthesized source (cron, resume_*, reaction, vault_*, …) lands
+ *     as its OWN live inbound turn, so its reply resolves the `live` tier for its
+ *     own turnId and structurally cannot supersede a different ended turn's flush
+ *     record (`decideSupersede` requires `record.turnId === liveTurnId`). Those
+ *     must NOT stamp — stamping them would needlessly hold the content gate open
+ *     for an unrelated own-reply in the window (a safe but avoidable visible dup).
+ *
+ * This predicate is therefore the SINGLE point of extension: any future feature
+ * that synthesizes an inbound which can land as a DECOUPLED late reply (no live
+ * turn) MUST add its `meta.source` here — and because the chokepoint consults
+ * this predicate, doing so is the whole wiring. A source that forgets to opt in
+ * cannot reach the bypass unnoticed: the negative outcome guard
+ * (`send-reply-golden.test.ts`) pins that a decoupled foreign-content reply on a
+ * non-live tier never silently edits over the flushed answer.
+ *
+ * ## Inbound meta.source classification registry (F1 durability — dup-audit
+ * MUST-FIX 3, Fable 2026-07-21)
+ *
+ * The old predicate was a bare `=== 'subagent_handback'` with NO tripwire and an
+ * UNSAFE default: adding a new decoupled-completion source tripped nothing — no
+ * stamp → content-gate bypass eligible → silent edit-over of a delivered answer.
+ * This registry makes the classification EXPLICIT, EXHAUSTIVE and FAIL-SAFE:
+ *
+ *   - Every known `meta.source` is listed with `decoupledCompletion`. Today ONLY
+ *     `subagent_handback` is true; every other synthesized source lands as its
+ *     OWN live inbound turn (live tier → cannot supersede a different ended
+ *     turn's record), so it must NOT stamp.
+ *   - An UNKNOWN / unclassified source FAILS SAFE: `stampsHandbackMarker` returns
+ *     `true`, so it STAMPS → the content gate is KEPT → the worst case is a
+ *     visible duplicate, NEVER a silent edit-over (inverted from the old
+ *     deny-default, which failed toward silent loss).
+ *   - The exhaustiveness test (`subagent-handback-marker.test.ts`) scans the
+ *     gateway for `source:` / `meta.source ===` literals and FAILS when a new one
+ *     is added without a registry entry — forcing a conscious classification.
+ *
+ * Defense-in-depth with the tier restriction (`outbound-send-path.ts`): the
+ * content-gate bypass is now limited to the `live` + `latest-ended` tiers, so
+ * model-steerable `quoted`/`origin` attributions can never bypass regardless of
+ * the marker. This registry closes the residual `latest-ended` vector for a
+ * FUTURE decoupled source, fail-safe.
+ */
+export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion: boolean }> = {
+  // The ONE decoupled-completion source today: a background worker termination
+  // wakes the agent with no live turn of its own → its reply resolves a
+  // different, already-ended turn via the latest-ended tier. THE F1 vector.
+  subagent_handback: { decoupledCompletion: true },
+  // Everything below lands as its OWN live inbound turn (live tier), so its reply
+  // resolves the live tier for its own turnId and structurally cannot supersede a
+  // different ended turn's record → not a decoupled-completion vector, must not stamp.
+  cron: { decoupledCompletion: false },
+  reaction: { decoupledCompletion: false },
+  subagent_progress: { decoupledCompletion: false },
+  resume_interrupted: { decoupledCompletion: false },
+  resume_deferred: { decoupledCompletion: false },
+  resume_watchdog_timeout: { decoupledCompletion: false },
+  vault_grant_approved: { decoupledCompletion: false },
+  vault_grant_denied: { decoupledCompletion: false },
+  vault_grant_timeout: { decoupledCompletion: false },
+  vault_save_completed: { decoupledCompletion: false },
+  vault_save_discarded: { decoupledCompletion: false },
+  vault_save_failed: { decoupledCompletion: false },
+  vault_save_timeout: { decoupledCompletion: false },
+  secret_provided: { decoupledCompletion: false },
+  secret_declined: { decoupledCompletion: false },
+  secret_provide_failed: { decoupledCompletion: false },
+  secret_request_timeout: { decoupledCompletion: false },
+  mental_model_propose_timeout: { decoupledCompletion: false },
+  bridge_dead_restart: { decoupledCompletion: false },
+  obligation_represent: { decoupledCompletion: false },
+  missed_approval_retry: { decoupledCompletion: false },
+  skill_proposal_apply: { decoupledCompletion: false },
+  warmup: { decoupledCompletion: false },
+  // dup-audit pass-2 (Fable) — sources the widened exhaustiveness scanner now
+  // sees. Each lands as its OWN live inbound turn (not a decoupled completion
+  // resolving a DIFFERENT ended turn), so it must NOT stamp — else its fail-safe
+  // stamp would hold the content gate chat-wide for 60 s and re-open the
+  // reworded-own-answer visible dup in that window.
+  //   - mental_model_proposal_{applied,denied,failed}: resume-synthetic inbounds
+  //     injected via `deliverResumeSyntheticOrBuffer` as their own live turn.
+  //   - webhook / linear: built in `src/web/webhook-dispatch.ts`, delivered via
+  //     the gateway's `webhookInject` (`sendToAgent`, buffer on miss) as their
+  //     own live turn.
+  mental_model_proposal_applied: { decoupledCompletion: false },
+  mental_model_proposal_denied: { decoupledCompletion: false },
+  mental_model_proposal_failed: { decoupledCompletion: false },
+  webhook: { decoupledCompletion: false },
+  linear: { decoupledCompletion: false },
+}
 
-  /** Record that a `subagent_handback` was enqueued for `chatId` at `now` (ms). */
-  record(chatId: string, now: number): void {
-    this.lastAtByChat.set(chatId, now)
+/**
+ * Whether an inbound of this `meta.source` must stamp the decoupled-completion
+ * marker. Null/undefined (a normal user inbound — not synthesized) → false.
+ * A known source → its registry classification. An UNKNOWN source → true
+ * (fail-safe: stamp, so an unclassified future decoupled source can only cause a
+ * visible dup, never a silent edit-over).
+ */
+export function stampsHandbackMarker(source: string | null | undefined): boolean {
+  if (source == null) return false
+  const known = INBOUND_SOURCE_CLASSIFICATION[source]
+  if (known == null) return true // fail-safe: unknown synthesized source stamps
+  return known.decoupledCompletion
+}
+
+/** Sentinel thread key for the no-thread (DM / bare-chat) lane. */
+const MAIN_THREAD_KEY = '<main>'
+
+export class SubagentHandbackMarker {
+  // chatId → (threadKey → last enqueue ms). Nested so the CONTENT-GATE read can
+  // query chat-wide (`lastAtInChat`) while the record stays thread-resolved.
+  private readonly byChat = new Map<string, Map<string, number>>()
+
+  private threadKey(threadId: number | undefined): string {
+    return threadId == null ? MAIN_THREAD_KEY : String(threadId)
   }
 
-  /** Wall-clock ms of the most recent handback enqueue for `chatId`, or null. */
-  lastAt(chatId: string): number | null {
-    return this.lastAtByChat.get(chatId) ?? null
+  /** Record that a `subagent_handback` was enqueued for `chatId`/`threadId` at
+   *  `now` (ms). Thread-resolved so the record retains the originating topic. */
+  record(chatId: string, threadId: number | undefined, now: number): void {
+    let inner = this.byChat.get(chatId)
+    if (inner == null) {
+      inner = new Map<string, number>()
+      this.byChat.set(chatId, inner)
+    }
+    inner.set(this.threadKey(threadId), now)
+  }
+
+  /** Wall-clock ms of the most recent handback enqueue for a SPECIFIC
+   *  `chatId`/`threadId` lane, or null. (Diagnostics / unit tests.) */
+  lastAt(chatId: string, threadId: number | undefined): number | null {
+    return this.byChat.get(chatId)?.get(this.threadKey(threadId)) ?? null
+  }
+
+  /**
+   * Wall-clock ms of the most recent handback enqueue ANYWHERE in `chatId`
+   * (across every topic lane), or null. This is what the content-gate read uses
+   * (dup-audit MUST-FIX 2, Fable 2026-07-21): the owner-resolution latest-ended
+   * tier is CHAT-WIDE (`findLatestEndedTurnForChat` ignores thread), so a
+   * background handback in topic A can resolve — and supersede — topic B's
+   * ended turn. A thread-SPECIFIC gate read (the F2 regression) let a reply
+   * dodge that handback by carrying a different `message_thread_id`, silently
+   * editing over the answer. Querying chat-wide makes the gate un-steerable by
+   * the reply's own thread arg: any in-window handback in the chat keeps the
+   * content gate. The cost is the F2 visible-dup (a handback in one topic keeps
+   * the gate for a coinciding own-reply in another for ≤TTL) — a self-healing
+   * visible duplicate, which is strictly better than a silent edit-over.
+   */
+  lastAtInChat(chatId: string): number | null {
+    const inner = this.byChat.get(chatId)
+    if (inner == null || inner.size === 0) return null
+    let max = -Infinity
+    for (const ts of inner.values()) if (ts > max) max = ts
+    return max === -Infinity ? null : max
   }
 }

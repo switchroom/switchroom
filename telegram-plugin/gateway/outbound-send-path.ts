@@ -898,22 +898,45 @@ export async function sendReply(
     //
     // MUST-FIX 1 (silent-data-loss): the owner-resolution `quoted` / `origin`
     // tiers are derived from MODEL-SUPPLIED args (`args.reply_to` /
-    // `args.origin_turn_id`), so a background handback turn can STEER them —
-    // pass `reply_to = <the user's original msg id>` and it resolves the PRIOR
-    // flushed turn via `quoted`, which used to force the bypass and silently
-    // edit-over that turn's delivered answer (#3429-class, model-steerable). So
-    // a positive tier NEVER overrides an in-window handback; only the
-    // FRAMEWORK-owned `live` tier (the live `currentTurn`, not model-derived,
-    // and structurally unable to collide with an ended turn's flush record —
-    // `decideSupersede` requires same turnId) may bypass a handback window.
+    // `args.origin_turn_id`), so a reply can STEER itself — pass
+    // `reply_to = <another ended turn's source msg>` and it resolves THAT turn via
+    // `quoted`. Marker-absence proves "own answer" ONLY for the framework-derived
+    // `latest-ended` tier; a model-steered `quoted`/`origin` attribution with no
+    // marker is NOT evidence of ownership, so bypassing the content gate there
+    // silently edits over a different ended turn's delivered answer (the #3429
+    // double-loss, executed by Fable 2026-07-21). The `replyIsOwnAnswer`
+    // computation below therefore restricts the bypass to `live` + `latest-ended`;
+    // `quoted`/`origin` ALWAYS traverse the content gate. See that comment.
     //
-    // The content gate is therefore kept whenever a handback WAS enqueued in the
-    // window (any non-live tier): the late reply might BE that handback, so
-    // genuinely-new content sends fresh (two messages, #3429 preserved).
-    // Concurrency note: a case-A own reply coinciding with an unrelated
-    // background handback in the same ≤TTL window degrades to today's behaviour
-    // (two messages) — safe (never a silent drop/edit), just not collapsed.
+    // The content gate is therefore kept whenever a decoupled completion WAS
+    // enqueued in the window (on the latest-ended tier) OR the reply resolved via
+    // a model-steerable tier: the late reply might carry foreign content, so it
+    // sends fresh (two messages, #3429 preserved). Concurrency note: a case-A own
+    // reply coinciding with an unrelated background handback in the same ≤TTL
+    // window degrades to two messages — safe (never a silent drop/edit).
     const ownerEndedAt = ownerTurn?.endedAt ?? null
+    // MUST-FIX 2 (dup-audit / Fable 2026-07-21) — key BOTH the supersede lane and
+    // the marker-gate read on the FRAMEWORK-resolved thread (the owner turn's
+    // `sessionThreadId` — the lane the flush recorded on), NOT the raw model arg
+    // `args.message_thread_id` (`replyThreadId`). The flush records on
+    // `turn.sessionThreadId`; the owner turn resolved here IS that turn, so its
+    // thread is where its record and its handback marker live. Reading the gate on
+    // the raw arg let a reply carry `message_thread_id=<other topic>` to dodge a
+    // handback marker stamped on the real topic → silent edit-over (the regression
+    // F2's raw-arg keying introduced). The owner turn's thread is not model-
+    // derived, so it cannot be steered. Falls back to the raw arg only when no
+    // owner turn resolved (no record to clobber on the collapse path).
+    const gateThreadId = ownerTurn?.sessionThreadId ?? replyThreadId
+    // MUST-FIX 2 (dup-audit / Fable) — the content-gate READ is CHAT-WIDE, not
+    // lane-specific: `findLatestEndedTurnForChat` resolves owners chat-wide, so a
+    // handback in topic A can supersede topic B's ended turn; a thread-keyed gate
+    // read (the F2 regression) let a reply dodge that handback by carrying a
+    // different `message_thread_id`. Chat-wide makes the gate un-steerable — any
+    // in-window handback in the chat keeps the content gate (accepting the F2
+    // visible-dup in the overlap window; a self-healing dup beats a silent loss).
+    // The supersede `take()` LANE below stays thread-resolved (`gateThreadId` =
+    // the owner turn's framework thread, not the raw arg), so a handback's
+    // correction only ever touches ITS OWN topic's record.
     const handbackAt = getLastSubagentHandbackAt(chat_id)
     const now = Date.now()
     const handbackCouldOwnReply =
@@ -921,10 +944,26 @@ export async function sendReply(
       ownerEndedAt != null &&
       handbackAt > ownerEndedAt &&
       now - handbackAt <= DEFAULT_SUPERSEDE_TTL_MS
-    const replyIsOwnAnswer = ownerTier === 'live' || !handbackCouldOwnReply
+    // MUST-FIX 1 (silent-data-loss, PROVEN by Fable 2026-07-21) — restrict the
+    // content-gate BYPASS to the tiers whose attribution is NOT model-steerable:
+    //   - `live`   — the framework-owned live `currentTurn` (not model-derived,
+    //                and `decideSupersede`'s same-turnId check bars it from an
+    //                ended turn's record). Bypasses even a handback window.
+    //   - `latest-ended` — the ambiguous DM/late-reply fallback the marko fix
+    //                actually needs; bypass ONLY when no decoupled completion is
+    //                in the window (marker-absence ⇒ own answer).
+    // The `quoted` / `origin` tiers resolve from MODEL-SUPPLIED args
+    // (`args.reply_to` / `args.origin_turn_id`), so a reply can steer ITSELF onto
+    // a DIFFERENT ended turn's record — with marker-absence they used to bypass
+    // the content gate and silently edit-over that turn's delivered answer (the
+    // #3429 double-loss, executed by Fable). Those tiers therefore NEVER bypass:
+    // they always go through the content gate, so foreign content sends fresh and
+    // only a genuine same-answer reply collapses.
+    const replyIsOwnAnswer =
+      ownerTier === 'live' || (ownerTier === 'latest-ended' && !handbackCouldOwnReply)
     const decision = flushedTurnSupersede.take(
       chat_id,
-      replyThreadId,
+      gateThreadId,
       { liveTurnId: resolvedTurnId, replyText: text, positiveAttribution: replyIsOwnAnswer, now },
     )
     if (decision.supersede) {

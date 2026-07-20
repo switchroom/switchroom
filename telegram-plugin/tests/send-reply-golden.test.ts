@@ -46,7 +46,7 @@ import {
 } from '../gateway/outbound-send-path.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
-import { SubagentHandbackMarker } from '../gateway/subagent-handback-marker.js'
+import { SubagentHandbackMarker, stampsHandbackMarker } from '../gateway/subagent-handback-marker.js'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, Access } from '../gateway/gateway.js'
@@ -887,7 +887,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const marker = new SubagentHandbackMarker()
     const buffer = createPendingInboundBuffer({
       log: () => {},
-      onHandbackEnqueue: (chatId, ts) => marker.record(chatId, ts),
+      onHandbackEnqueue: (chatId, threadId, ts) => marker.record(chatId, threadId, ts),
     })
 
     // Simulate the boot-replay re-push of an un-acked spooled handback envelope.
@@ -905,14 +905,14 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
       meta: { source: 'subagent_handback' },
     })
     // The chokepoint stamped the marker from the replay push (pre-fix: empty).
-    expect(marker.lastAt(CHAT)).toBe(handbackTs)
+    expect(marker.lastAt(CHAT, undefined)).toBe(handbackTs)
 
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
     h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
-    // The gateway reads the marker the boot-replay stamped.
-    h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAt(chatId)
+    // The gateway reads the marker the boot-replay stamped (chat-wide gate).
+    h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAtInChat(chatId)
 
     const res = await sendReply(h.deps, req(HANDBACK))
 
@@ -929,12 +929,226 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const marker = new SubagentHandbackMarker()
     const buffer = createPendingInboundBuffer({
       log: () => {},
-      onHandbackEnqueue: (chatId, ts) => marker.record(chatId, ts),
+      onHandbackEnqueue: (chatId, threadId, ts) => marker.record(chatId, threadId, ts),
     })
     buffer.push('marko', {
       type: 'inbound', chatId: CHAT, messageId: 5, user: 'ken', userId: 1,
       ts: Date.now(), text: 'hi', meta: {},
     })
-    expect(marker.lastAt(CHAT)).toBe(null)
+    expect(marker.lastAt(CHAT, undefined)).toBe(null)
+  })
+
+  // ─── MUST-FIX 2 (dup-audit / Fable): the gate is un-steerable by a model
+  //     thread arg — a cross-topic handback still keeps the content gate ───
+  //
+  // Fable's PROVEN regression: F2's thread-keyed gate read let a foreign-content
+  // reply carrying `message_thread_id=<other topic>` dodge a handback marker
+  // stamped on the real topic → silent edit-over (the #3429 double-loss). Because
+  // `findLatestEndedTurnForChat` resolves owners CHAT-WIDE, a topic-A handback can
+  // resolve — and supersede — topic B's ended turn. The gate read is therefore
+  // chat-wide (`lastAtInChat`): any in-window handback in the chat keeps the gate,
+  // so the reply's own thread arg cannot bypass it. Drives the REAL buffer
+  // chokepoint + REAL send path.
+  it('MUST-FIX 2: a handback stamped in topic A keeps the content gate for a ' +
+    'foreign reply steered to topic B (message_thread_id) — FRESH send, no silent edit-over', async () => {
+    const TOPIC_A = 111
+    const TOPIC_B = 222
+    const marker = new SubagentHandbackMarker()
+    const buffer = createPendingInboundBuffer({
+      log: () => {},
+      onHandbackEnqueue: (chatId, threadId, ts) => marker.record(chatId, threadId, ts),
+    })
+    // A background handback lands in TOPIC A (envelope threadId=A) via the real
+    // chokepoint — after topic B's turn ended (now-30s), within the 60s TTL.
+    const handbackTs = Date.now() - 15_000
+    buffer.push('marko', {
+      type: 'inbound', chatId: CHAT, threadId: TOPIC_A, messageId: handbackTs,
+      user: 'subagent-watcher', userId: 0, ts: handbackTs, text: 'handback',
+      meta: { source: 'subagent_handback' },
+    })
+
+    // Topic B has its OWN flush-delivered ended turn with a real answer.
+    const h = makeHarness()
+    const owner = { ...makeFlushDeliveredEndedTurn(), sessionThreadId: TOPIC_B } as unknown as CurrentTurn
+    h.deps.flushedTurnSupersede.record(
+      CHAT, TOPIC_B,
+      { turnId: (owner as CurrentTurn).turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now(),
+    )
+    // The topic-A handback's reply is STEERED to topic B (message_thread_id=222)
+    // and resolves topic B's ended turn chat-wide (latest-ended), carrying FOREIGN
+    // content. The gate read is chat-wide, so the topic-A stamp is seen.
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner as CurrentTurn, tier: 'latest-ended' })
+    h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAtInChat(chatId)
+
+    const res = await sendReply(
+      h.deps,
+      req(HANDBACK, { message_thread_id: TOPIC_B }),
+    )
+
+    // Gate kept → FRESH notifying send; topic B's flushed answer is NEITHER
+    // edited nor deleted. (Under the F2 thread-keyed gate this was editMessageText
+    // ×1 over msg 4242 — the silent-loss regression this closes.)
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // Topic B's flush record NOT consumed — the delivered answer stands.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, TOPIC_B, {
+        liveTurnId: (owner as CurrentTurn).turnId,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  // Thread-keyed COLLAPSE still routes per-topic: a topic reply supersedes its
+  // OWN topic's flush record (via the framework-resolved owner thread, not the
+  // raw arg), so a genuine own-reply in a forum topic collapses to one message.
+  it('F2 positive: a topic own-reply (no handback) supersedes its own topic\'s ' +
+    'flush record — one message, on the framework-resolved thread lane', async () => {
+    const TOPIC = 222
+    const h = makeHarness()
+    const owner = { ...makeFlushDeliveredEndedTurn(), sessionThreadId: TOPIC } as unknown as CurrentTurn
+    // Flush recorded on the owner turn's OWN topic lane (what the flush does).
+    h.deps.flushedTurnSupersede.record(
+      CHAT, TOPIC,
+      { turnId: (owner as CurrentTurn).turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now(),
+    )
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner as CurrentTurn, tier: 'latest-ended' })
+    h.deps.getLastSubagentHandbackAt = () => null // no handback anywhere
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER, { message_thread_id: TOPIC }))
+
+    // Collapses to ONE message: the topic's flushed message edited in place.
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+
+  // ─── F1 (dup-audit): negative outcome guard — no silent edit-over ───
+  //
+  // The content-gate bypass must NEVER silently edit over a flush-delivered
+  // answer with FOREIGN content on a non-live tier. A decoupled completion (the
+  // handback class the marker covers) landing with genuinely different content,
+  // resolving an ended flushed turn via the latest-ended tier, must SEND FRESH —
+  // the flushed answer left untouched (Telegram edits do not re-notify, so an
+  // edit-over is a silent double-loss: the handback never surfaces AND the answer
+  // is destroyed — the #3429 incident). This pins the invariant's OUTCOME: the
+  // stamp (driven by the single chokepoint predicate) keeps the gate, and the
+  // foreign reply never touches the delivered answer.
+  it('F1: a decoupled foreign-content reply on a non-live tier resolving a ' +
+    'DIFFERENT ended turn sends FRESH — the flushed answer is never edited/deleted', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // The reply resolves the flush-delivered ENDED turn via the ambiguous
+    // latest-ended tier (no live turn, no positive attribution) and carries
+    // FOREIGN content (a worker report, not this turn's answer nor a rewording).
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    // A decoupled completion IS in the window (the marker stamped it) — so this
+    // late reply might BE it. The invariant keeps the content gate.
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    // FRESH notifying send; the flushed answer is NEITHER edited nor deleted.
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // The flush record is NOT consumed — the flushed answer stands, and the
+    // turn's OWN canonical replay can still correct it.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  // Structural: the stamp membership lives in exactly ONE predicate, consulted
+  // at the ONE buffer chokepoint. If a future refactor inlines a bare
+  // `=== 'subagent_handback'` check at the chokepoint (bypassing the predicate),
+  // the invariant's single-extension-point guarantee is lost — fail loudly.
+  it('F1: the buffer chokepoint stamps via the stampsHandbackMarker predicate, ' +
+    'not an inlined source literal', () => {
+    const bufferSrc = readFileSync(new URL('../gateway/pending-inbound-buffer.ts', import.meta.url), 'utf8')
+    expect(bufferSrc).toContain('stampsHandbackMarker(msg.meta?.source)')
+    // The predicate itself is the single membership definition.
+    expect(stampsHandbackMarker('subagent_handback')).toBe(true)
+    expect(stampsHandbackMarker('cron')).toBe(false)
+    expect(stampsHandbackMarker('resume_interrupted')).toBe(false)
+    expect(stampsHandbackMarker(undefined)).toBe(false)
+  })
+
+  // ─── MUST-FIX 1 (dup-audit / Fable): model-steerable tiers NEVER bypass ───
+  //
+  // The `quoted`/`origin` tiers resolve from MODEL-supplied args (reply_to /
+  // origin_turn_id), so a reply can steer ITSELF onto a different ended turn's
+  // record. Marker-absence proves "own answer" only for the framework-derived
+  // latest-ended tier — a quoted/origin resolution with no marker is NOT
+  // ownership evidence. Fable executed this exact path (quoted tier, no marker,
+  // foreign content → editMessageText ×1 over the flushed answer). With the tier
+  // restriction, quoted/origin ALWAYS traverse the content gate → foreign content
+  // sends FRESH, the flushed answer untouched. RED on pre-fix code
+  // (replyIsOwnAnswer = tier==='live' || !handbackCouldOwnReply → quoted bypassed).
+  it('MUST-FIX 1: a quoted-tier reply with NO marker and FOREIGN content does NOT ' +
+    'bypass the content gate — FRESH send, flushed answer never edited/deleted', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // Model-steered `quoted` attribution to a DIFFERENT ended flushed turn, with
+    // NO decoupled completion anywhere in the chat (the residual F1 vector).
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    // FRESH notifying send; the flushed answer is NEITHER edited nor deleted.
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // Flush record NOT consumed — the delivered answer stands.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  // Sibling positive: a quoted-tier reply carrying the turn's OWN answer (same
+  // content, contained in the flushed blob) still collapses through the content
+  // gate — the tier restriction only blocks FOREIGN content, not genuine replays.
+  it('MUST-FIX 1 sibling: a quoted-tier reply with the SAME answer still collapses ' +
+    '(content gate passes) — one message', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, req(CANONICAL_REPLY))
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
   })
 })

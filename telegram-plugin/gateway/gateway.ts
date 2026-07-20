@@ -3889,12 +3889,17 @@ const recentTurnsById = new Map<string, CurrentTurn>()
 // Evicted in lock-step with recentTurnsById so it can't outgrow it.
 const recentTurnIdBySourceMessageId = new Map<number, string>()
 
-// fix/backstop-duplicate-reply — per-chat marker of the most recent
+// fix/backstop-duplicate-reply — per-chat/thread marker of the most recent
 // gateway-synthesized `subagent_handback` enqueue (logic in
 // subagent-handback-marker.ts; extracted per the gateway anti-inflation ratchet).
+// The record is thread-resolved (retains the originating topic), but the
+// content-gate READ is CHAT-WIDE (dup-audit MUST-FIX 2): the latest-ended owner
+// tier is chat-wide, so a thread-specific gate read was steerable by the reply's
+// own `message_thread_id` → silent edit-over. `lastAtInChat` makes the gate
+// un-steerable (any in-window handback in the chat keeps the content gate).
 const subagentHandbackMarker = new SubagentHandbackMarker()
 const getLastSubagentHandbackAt = (chatId: string): number | null =>
-  subagentHandbackMarker.lastAt(chatId)
+  subagentHandbackMarker.lastAtInChat(chatId)
 
 function rememberRecentTurn(turn: CurrentTurn): void {
   recentTurnsById.set(turn.turnId, turn)
@@ -9984,7 +9989,7 @@ const pendingInboundBuffer = createPendingInboundBuffer({
   // fix/backstop-duplicate-reply MUST-FIX 2 — stamp the handback marker at the
   // enqueue chokepoint so a boot-replayed handback (not just the live synthesis
   // push) populates it. Every `subagent_handback` push funnels through here.
-  onHandbackEnqueue: (chatId, ts) => subagentHandbackMarker.record(chatId, ts),
+  onHandbackEnqueue: (chatId, threadId, ts) => subagentHandbackMarker.record(chatId, threadId, ts),
 })
 
 // PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a
