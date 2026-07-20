@@ -295,7 +295,7 @@ import {
 } from '../retry-api-call.js'
 import { createSendGate, sendGateConfigFromEnv, isSendGateShed } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
-import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
+import { installTgPostLogger, installRichMarkdownGuard, withTgPostTags } from '../shared/bot-runtime.js'
 import {
   floodStatePath,
   floodWindowsPath,
@@ -22970,7 +22970,7 @@ async function initGatewayBot(): Promise<void> {
   }
 
   bot = new Bot(TOKEN)
-  installTgPostLogger(bot)
+  installTgPostLogger(bot); installRichMarkdownGuard(bot) // #3252/#3463: universal fmt guard installed after logger (composes outermost); see installRichMarkdownGuard docblock
 
   // Diagnostic update tap (#3300): one compact line per received update, logged
   // BEFORE any specific handler runs, so a routing-layer drop is diagnosable
