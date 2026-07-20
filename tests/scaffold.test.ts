@@ -3259,6 +3259,11 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("## Formatting for Telegram");
     expect(startSh).toContain("Hard cap is 32768 characters.");
     expect(startSh).toContain("Every reply renders as rich Markdown");
+    // PR4: the card carries a one-line pointer to the on-demand full-palette
+    // skill. This is the adoption seam — dropping it silently disconnects the
+    // telegram-formatting skill from every agent's discovery path, so pin it.
+    expect(startSh).toContain("load the");
+    expect(startSh).toContain("telegram-formatting");
     // It rides the same --append-system-prompt var the operator passthrough uses.
     expect(startSh).toContain('--append-system-prompt "$APPEND_PROMPT"');
   });
