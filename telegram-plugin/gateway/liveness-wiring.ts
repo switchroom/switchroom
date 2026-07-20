@@ -164,26 +164,29 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
 
     // Stage B: escalate a mid-tool hang to a REAL restart. The fallback fires
     // here with a tool still in flight only after silence crossed the 15-min
-    // defer ceiling (isLegitimatelyWorking held it that long). At that point the
-    // honest hang/health discriminator is the turn-active marker's mtime age:
-    // a healthy long tool / sub-agent keeps advancing it (tool_use + sub-agent
-    // JSONL growth), a true hang lets it go stale. Only a stale (or absent)
-    // marker + a live cooldown-free window triggers the SIGTERM-PID1 restart;
-    // the boot classifier then routes recovery through the ask-first
-    // resume_watchdog_timeout inbound. We return BEFORE the state-teardown so
-    // the turn-active marker survives for the boot reclassification.
+    // defer ceiling (isLegitimatelyWorking held it that long). The honest
+    // hang/health discriminator is the turn-active marker's mtime age: a healthy
+    // turn keeps advancing it (tool_use + sub-agent JSONL growth), a true hang
+    // lets it go stale. A known-long-running tool in flight (Task/Agent/Bash/
+    // WebFetch/research) is protected regardless of marker age — a single long
+    // foreground tool legitimately can't advance the marker (Finding A). Only a
+    // stale (or absent) marker with no protected long tool triggers the
+    // SIGTERM-PID1 restart; the boot classifier then routes recovery through the
+    // ask-first resume_watchdog_timeout inbound. We return BEFORE the state-
+    // teardown so the turn-active marker survives for the boot reclassification.
     if (hangRestart != null && ctx.inFlightTools.length > 0) {
       const markerAgeMs = readTurnActiveMarkerAgeMs(STATE_DIR)
+      const inFlightToolNames = ctx.inFlightTools.map((t) => t.name)
       const decision = decideHangRestart({
-        midToolCall: true,
+        inFlightToolNames,
         markerAgeMs,
         stalenessThresholdMs: hangRestart.stalenessThresholdMs,
-        cooldownActive: hangRestart.isCooldownActive(),
       })
       process.stderr.write(
         `telegram gateway: [hang-watchdog] fallback mid-tool chat=${ctx.chatId} ` +
         `thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
-        `marker_age_ms=${markerAgeMs ?? 'null'} restart=${decision.restart} reason=${decision.reason}\n`,
+        `tools=${inFlightToolNames.join(',')} marker_age_ms=${markerAgeMs ?? 'null'} ` +
+        `restart=${decision.restart} reason=${decision.reason}\n`,
       )
       if (decision.restart) {
         hangRestart.request(decision.reason, markerAgeMs ?? ctx.silenceMs)

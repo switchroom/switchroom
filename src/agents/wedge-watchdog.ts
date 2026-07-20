@@ -699,15 +699,27 @@ export async function runWedgeWatchdog(
     // #2471 — semantic no-progress tracker, INDEPENDENT of the modal chain: a
     // "Manifesting"/spinning turn that is NOT advancing is wedged despite the
     // terminal showing the spinner. Previously this required BOTH the
-    // Manifesting signature AND a Stop-hook error — so a PLAIN-SPINNER hang (no
-    // stop-hook line) matched nothing and was never caught (the carrie class).
-    // The stop-hook AND is dropped; the false-positive it used to guard against
-    // (killing a healthy long "Manifesting" turn) is now prevented by a PROGRESS
-    // discriminator instead: the stall counter only climbs while the pane is
-    // BYTE-STABLE across polls (a streaming/progressing turn changes the key and
-    // resets it). A present Stop-hook error is kept as a fast path — it means
-    // wedged regardless of byte movement. Tracked every poll (a modal poll
-    // won't match Manifesting, so the counters don't collide).
+    // Manifesting signature AND a Stop-hook error — so a hang with no stop-hook
+    // line matched nothing and was never caught. The stop-hook AND is dropped;
+    // the false-positive it used to guard against (killing a healthy long
+    // "Manifesting" turn) is now prevented by a PROGRESS discriminator instead:
+    // the stall counter only climbs while the pane is BYTE-STABLE across polls
+    // (a streaming/progressing turn changes the key and resets it). A present
+    // Stop-hook error is kept as a fast path — it means wedged regardless of
+    // byte movement. Tracked every poll (a modal poll won't match Manifesting,
+    // so the counters don't collide).
+    //
+    // SCOPE (do not overclaim): byte-stability catches a FULLY FROZEN render —
+    // a hard TUI/render-loop deadlock where even the elapsed-timer stops
+    // repainting. It does NOT catch a live-but-hung pane whose elapsed timer
+    // keeps ticking (a tool blocked but the spinner still animating) — that pane
+    // is never byte-stable. That "carrie" class (tool hung mid-call, terminal
+    // still alive) is caught by the gateway's Stage B marker-staleness restart
+    // (`hang-restart-decision.ts`), NOT here. We deliberately do not normalize
+    // the spinner glyph + elapsed timer out of the key: a silent long foreground
+    // tool (no output, only a ticking clock) would then normalize to "stable"
+    // and be false-killed by this tmux layer — the exact harm the discriminator
+    // exists to avoid. This branch stays the narrow frozen-render net.
     const manifestSignatureHit =
       !!text &&
       manifestStallSignature !== null &&

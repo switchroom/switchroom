@@ -402,11 +402,14 @@ describe("#2471 runWedgeWatchdog — manifest-stall escalation", () => {
     expect(restarts).toEqual([]);
   });
 
-  it("escalates a PLAIN-SPINNER hang: Manifesting pane byte-stable, NO stop-hook (carrie class)", async () => {
-    // The gap this fix closes: a frozen "Manifesting…" pane with no stop-hook
-    // error matched nothing under the old `Manifesting AND stop-hook` rule and
-    // was never caught. A byte-identical pane across the full streak is now a
-    // stall in its own right.
+  it("escalates a FULLY FROZEN render: Manifesting pane byte-identical across polls, NO stop-hook", async () => {
+    // The gap this fix closes: a fully frozen "Manifesting…" pane (a hard TUI /
+    // render-loop deadlock — even the elapsed timer stopped repainting) with no
+    // stop-hook error matched nothing under the old `Manifesting AND stop-hook`
+    // rule and was never caught. A byte-identical pane across the full streak is
+    // now a stall in its own right. (A live-but-hung pane whose timer keeps
+    // ticking is NOT byte-stable and is caught by the gateway Stage B marker-
+    // staleness restart, not this tmux layer — see the branch comment.)
     const restarts: Array<{ agent: string; reason: string }> = [];
     const frozen = "✶ Manifesting… (112k tokens · 30s)\nrunning stop hooks 3/6";
     const res = await runWedgeWatchdog({

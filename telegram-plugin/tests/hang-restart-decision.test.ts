@@ -3,20 +3,20 @@
  *
  * The crux: a mid-tool framework fallback with a STALE turn-active marker
  * escalates to a real restart, but a fallback whose marker mtime keeps
- * advancing (a healthy long tool / sub-agent) must NOT be restarted.
+ * advancing (a healthy long turn), OR whose in-flight tool is a known-long
+ * class (Bash/WebFetch/Task/research — Finding A), must NOT be restarted.
  *
  * FAILS on current head: `../gateway/hang-restart-decision.js` does not exist
- * there — the discriminator + cooldown are the contribution under test.
+ * there — the discriminator is the contribution under test.
  */
 
 import { describe, it, expect } from 'vitest'
 import {
   decideHangRestart,
+  isHangRestartProtectedTool,
+  classifyToolClass,
   hangStalenessMs,
-  hangRestartCooldownMs,
-  isHangRestartCooldownActive,
   DEFAULT_HANG_STALENESS_MS,
-  DEFAULT_HANG_RESTART_COOLDOWN_MS,
 } from '../gateway/hang-restart-decision.js'
 
 const STALE = 300_000
@@ -24,10 +24,9 @@ const STALE = 300_000
 describe('decideHangRestart — the crux discriminator', () => {
   it('(1) tool mid-call + zero marker progress past the ceiling ⇒ restart requested', () => {
     const d = decideHangRestart({
-      midToolCall: true,
+      inFlightToolNames: ['some_mcp_tool'], // a standard, non-long tool
       markerAgeMs: 600_000, // 10 min since last observable progress
       stalenessThresholdMs: STALE,
-      cooldownActive: false,
     })
     expect(d.restart).toBe(true)
     expect(d.reason).toBe('mid-tool-marker-stale')
@@ -35,10 +34,9 @@ describe('decideHangRestart — the crux discriminator', () => {
 
   it('(2) a turn whose marker mtime keeps advancing is NOT restarted', () => {
     const d = decideHangRestart({
-      midToolCall: true,
-      markerAgeMs: 4_000, // marker touched 4s ago — a long tool / sub-agent is working
+      inFlightToolNames: ['some_mcp_tool'],
+      markerAgeMs: 4_000, // marker touched 4s ago — the turn is working
       stalenessThresholdMs: STALE,
-      cooldownActive: false,
     })
     expect(d.restart).toBe(false)
     expect(d.reason).toBe('marker-advancing')
@@ -46,64 +44,103 @@ describe('decideHangRestart — the crux discriminator', () => {
 
   it('a marker exactly at the staleness ceiling is stale ⇒ restart', () => {
     const d = decideHangRestart({
-      midToolCall: true,
+      inFlightToolNames: ['some_mcp_tool'],
       markerAgeMs: STALE,
       stalenessThresholdMs: STALE,
-      cooldownActive: false,
     })
     expect(d.restart).toBe(true)
   })
 
   it('an absent marker (no progress signal at all) is treated as stale ⇒ restart', () => {
     const d = decideHangRestart({
-      midToolCall: true,
+      inFlightToolNames: ['some_mcp_tool'],
       markerAgeMs: null,
       stalenessThresholdMs: STALE,
-      cooldownActive: false,
     })
     expect(d.restart).toBe(true)
   })
 
   it('a fallback that is NOT mid-tool never restarts (ordinary teardown owns it)', () => {
     const d = decideHangRestart({
-      midToolCall: false,
+      inFlightToolNames: [],
       markerAgeMs: null,
       stalenessThresholdMs: STALE,
-      cooldownActive: false,
     })
     expect(d.restart).toBe(false)
     expect(d.reason).toBe('not-mid-tool')
   })
+})
 
-  it('cooldown suppresses a restart even when stale (storm guard)', () => {
+describe('decideHangRestart — Finding A: protect known-long foreground tools', () => {
+  it('a healthy long foreground Bash + stale marker is NOT restarted', () => {
+    // The exact false-positive the review flagged: a 15-min foreground `Bash`
+    // build/test never touches the marker, so at the ceiling it looks stale —
+    // but it is genuinely working. It must be protected.
     const d = decideHangRestart({
-      midToolCall: true,
-      markerAgeMs: 900_000,
+      inFlightToolNames: ['Bash'],
+      markerAgeMs: 900_000, // 15 min stale
       stalenessThresholdMs: STALE,
-      cooldownActive: true,
     })
     expect(d.restart).toBe(false)
-    expect(d.reason).toBe('cooldown-active')
+    expect(d.reason).toBe('protected-long-tool:Bash')
+  })
+
+  it('WebFetch / Task / a research MCP tool + stale marker are NOT restarted', () => {
+    for (const name of ['WebFetch', 'Task', 'Agent', 'perplexity_research', 'mcp__webkite__crawl']) {
+      const d = decideHangRestart({
+        inFlightToolNames: [name],
+        markerAgeMs: 900_000,
+        stalenessThresholdMs: STALE,
+      })
+      expect(d.restart, `${name} should be protected`).toBe(false)
+      expect(d.reason).toContain('protected-long-tool')
+    }
+  })
+
+  it('a protected long tool ALONGSIDE a standard tool still protects (conservative)', () => {
+    const d = decideHangRestart({
+      inFlightToolNames: ['quick_tool', 'Bash'],
+      markerAgeMs: 900_000,
+      stalenessThresholdMs: STALE,
+    })
+    expect(d.restart).toBe(false)
+  })
+
+  it('a genuinely-standard hung tool (no long class in flight) + stale ⇒ restart', () => {
+    const d = decideHangRestart({
+      inFlightToolNames: ['Read', 'some_mcp_query'],
+      markerAgeMs: 900_000,
+      stalenessThresholdMs: STALE,
+    })
+    expect(d.restart).toBe(true)
   })
 })
 
-describe('config + cooldown helpers', () => {
+describe('isHangRestartProtectedTool + classifyToolClass', () => {
+  it('protects background / long-fetch / research / human classes', () => {
+    for (const n of ['Task', 'Agent', 'Bash', 'WebFetch', 'WebSearch', 'ask_user',
+      'perplexity_research', 'deep_research', 'mcp__webkite__crawl']) {
+      expect(isHangRestartProtectedTool(n), n).toBe(true)
+    }
+  })
+  it('does NOT protect ordinary quick tools', () => {
+    for (const n of ['Read', 'Grep', 'Edit', 'Write', 'some_mcp_query']) {
+      expect(isHangRestartProtectedTool(n), n).toBe(false)
+    }
+  })
+  it('classifyToolClass taxonomy (ported from Stage A)', () => {
+    expect(classifyToolClass('ask_user')).toBe('human')
+    expect(classifyToolClass('Task')).toBe('background')
+    expect(classifyToolClass('Bash', { backgroundBash: true })).toBe('background')
+    expect(classifyToolClass('Read')).toBe('standard')
+  })
+})
+
+describe('config helpers', () => {
   it('hangStalenessMs keys off TURN_HANG_SECS (seconds → ms), default 300s', () => {
     expect(hangStalenessMs({})).toBe(DEFAULT_HANG_STALENESS_MS)
     expect(hangStalenessMs({ TURN_HANG_SECS: '120' })).toBe(120_000)
     expect(hangStalenessMs({ TURN_HANG_SECS: 'nope' })).toBe(DEFAULT_HANG_STALENESS_MS)
     expect(hangStalenessMs({ TURN_HANG_SECS: '0' })).toBe(DEFAULT_HANG_STALENESS_MS)
-  })
-
-  it('hangRestartCooldownMs defaults to 10 min, honours a valid override', () => {
-    expect(hangRestartCooldownMs({})).toBe(DEFAULT_HANG_RESTART_COOLDOWN_MS)
-    expect(hangRestartCooldownMs({ SWITCHROOM_HANG_RESTART_COOLDOWN_MS: '60000' })).toBe(60_000)
-    expect(hangRestartCooldownMs({ SWITCHROOM_HANG_RESTART_COOLDOWN_MS: '-1' })).toBe(DEFAULT_HANG_RESTART_COOLDOWN_MS)
-  })
-
-  it('isHangRestartCooldownActive: null last-fire = inactive; within window = active', () => {
-    expect(isHangRestartCooldownActive(null, 1_000_000, 600_000)).toBe(false)
-    expect(isHangRestartCooldownActive(1_000_000, 1_300_000, 600_000)).toBe(true) // 5 min ago < 10 min
-    expect(isHangRestartCooldownActive(1_000_000, 1_700_000, 600_000)).toBe(false) // 11.6 min ago
   })
 })

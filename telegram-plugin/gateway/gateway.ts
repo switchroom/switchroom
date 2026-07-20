@@ -243,11 +243,7 @@ import {
   distinctRequestIds,
 } from './permission-rearm.js'
 import { sweepPermissionTtl } from './permission-ttl-sweep.js'
-import {
-  hangStalenessMs,
-  hangRestartCooldownMs,
-  isHangRestartCooldownActive,
-} from './hang-restart-decision.js'
+import { hangStalenessMs } from './hang-restart-decision.js'
 import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
 import {
   createAlwaysAllowPersistQueue,
@@ -9696,12 +9692,11 @@ function gatewayLivenessWiringDeps() {
     closeActivityLane,
     closeProgressLane,
     // Stage B: escalate a mid-tool + marker-stale fallback to a real restart.
+    // No cooldown (see hang-restart-decision.ts § STORM GUARD): the ask-first
+    // resume_watchdog_timeout path is the sole, sufficient storm guard.
     hangRestart: {
       stalenessThresholdMs: hangStalenessMs(),
-      isCooldownActive: () => isHangRestartCooldownActive(
-        readHangRestartCooldownAt(), Date.now(), hangRestartCooldownMs()),
       request: (reason: string, idleMs: number) => {
-        writeHangRestartCooldown(Date.now())
         triggerSelfRestart(getMyAgentName(), `hang-watchdog:${reason} idle=${Math.round(idleMs)}ms`)
       },
     },
@@ -15875,26 +15870,6 @@ function clearRestartMarker(): void {
     rmSync(p, { force: true })
     process.stderr.write(`telegram gateway: restart-marker: cleared path=${p}\n`)
   } catch {}
-}
-
-// Stage B hang-restart cooldown: a persisted last-fire timestamp so a restart
-// storm can't spin the container (survives the restart the way an in-memory
-// guard cannot). Recovery itself routes through the ask-first
-// resume_watchdog_timeout inbound, so this is a belt-and-braces storm cap.
-function hangRestartCooldownPath(): string | null {
-  const agentDir = resolveAgentDirFromEnv()
-  return agentDir ? join(agentDir, 'hang-restart-cooldown.json') : null
-}
-function readHangRestartCooldownAt(): number | null {
-  const p = hangRestartCooldownPath(); if (!p) return null
-  try {
-    const ts = (JSON.parse(readFileSync(p, 'utf8')) as { ts?: unknown }).ts
-    return typeof ts === 'number' && Number.isFinite(ts) ? ts : null
-  } catch { return null }
-}
-function writeHangRestartCooldown(now: number): void {
-  const p = hangRestartCooldownPath(); if (!p) return
-  try { writeFileSync(p, JSON.stringify({ ts: now })) } catch { /* best-effort */ }
 }
 
 /**
