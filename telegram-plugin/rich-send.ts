@@ -67,16 +67,22 @@ export function guardAccidentalFormatting(markdown: string): string {
 /**
  * Wrap raw GFM markdown into the rich-message input object.
  *
- * This is the ONE adapter every `{ markdown }` wire send funnels through
- * (`sendRichMessage` / `editMessageText({ markdown })`) — the reply-tool final
- * answer, draft-stream previews, cards, approvals, banners. It is therefore the
- * single deterministic seam for the #3252 accidental-formatting guards (F1):
- * applying `guardAccidentalFormatting` here guards EVERY markdown-parsed
- * outbound exactly once, without touching `plain`-mode degradations (which
- * bypass this wrapper and go straight to `sendMessage`, where no markdown
- * parsing happens). The composed guard is a strict no-op for any body without
- * an accidental-formatting signal and is idempotent, so callers that already
- * ran it (or the streaming path that renders then re-wraps) stay byte-identical.
+ * This is a CONVENIENCE adapter — NOT the universal seam. It applies
+ * `guardAccidentalFormatting` for the many callers that build a body through
+ * it (the reply-tool final answer, draft-stream previews, cards), but it is
+ * NOT the one place every `{ markdown }` wire send funnels through: several
+ * sites build a raw `{ markdown }` and call `sendRichMessage` /
+ * `editMessageText` directly, bypassing this wrapper (see the correctness
+ * audit's F1 list — banners, switchroomReply html, approval/folder-picker
+ * edits). The REAL universal seam for the #3252 accidental-formatting guards
+ * is the grammy API transformer `installRichMarkdownGuard`
+ * (`shared/bot-runtime.ts`), installed on the production Bot in gateway boot,
+ * which guards EVERY sendRichMessage/editMessageText payload regardless of the
+ * call site. This wrapper is kept belt-and-braces: the composed guard is a
+ * strict no-op for any body without an accidental-formatting signal and is
+ * idempotent, so a body guarded here and re-guarded by the transformer stays
+ * byte-identical. `plain`-mode degradations bypass both (they go straight to
+ * `sendMessage`, where no markdown parsing happens).
  */
 export function richMessage(markdown: string): InputRichMessageMarkdown {
   return { markdown: guardAccidentalFormatting(markdown) }

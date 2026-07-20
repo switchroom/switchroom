@@ -32,6 +32,7 @@ import { createRetryApiCall } from '../retry-api-call.js'
 import { makeFloodWaitRecorder, makeFloodWaitProbe } from '../flood-circuit-breaker.js'
 import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { shouldEmitTgPost } from './gw-trace-gate.js'
+import { guardAccidentalFormatting } from '../rich-send.js'
 
 // ─── tg-post tag plumbing ─────────────────────────────────────────────────
 
@@ -144,6 +145,62 @@ export function installTgPostLogger(bot: Bot): void {
       )
       throw err
     }
+  })
+}
+
+/**
+ * Universal accidental-formatting guard, installed as a grammy API transformer
+ * on the single production Bot (#3252/#3463 follow-up). This is the REAL
+ * universal seam — not `richMessage()`. `richMessage()` only guards bodies its
+ * callers remember to wrap; the correctness audit found ~6 sites that build a
+ * raw `{ markdown }` and call `sendRichMessage` / `editMessageText` directly,
+ * bypassing it (`shared/bot-runtime.ts` switchroomReply html path,
+ * `slot-banner-driver.ts` OAuth banners, and edits in `folder-picker-handler`,
+ * `approval-callback`, `inline-keyboard-callbacks`). A transformer at the
+ * grammy `bot.api.config.use` layer sees every rich send regardless of the
+ * call site, `ctx.*` sugar, `lockedBot`, or `bot.api.raw`, so it closes the
+ * whole bypass class deterministically.
+ *
+ * Payload shape (verified against grammy 1.44.0 `out/core/api.js`, the pinned
+ * lockfile version):
+ *   - `sendRichMessage(chat_id, rich_message, ...)` → raw payload
+ *     `{ chat_id, rich_message: { markdown }, ... }`
+ *   - `editMessageText(chat_id, message_id, arg, ...)` → raw payload
+ *     `{ ..., rich_message: { markdown } }` when `arg` is an object, or
+ *     `{ ..., text }` when `arg` is a plain string.
+ * The markdown therefore lives at `payload.rich_message.markdown`, NOT
+ * `payload.markdown` (gating on the latter matches nothing — a silent no-op).
+ * Gating on `rich_message?.markdown` also structurally skips every literal /
+ * plain-string edit (they carry `text`, not `rich_message`), so those pass
+ * through byte-identical. `sendRichMessageDraft` is not wired in the repo
+ * (draft streaming uses sendMessage+editMessageText); extend the method gate
+ * here if a future draft adopter starts using it.
+ *
+ * The composed `guardAccidentalFormatting` is idempotent, so double-guarding a
+ * `richMessage()`-wrapped body that also passes through here is byte-identical
+ * (the internal guard in `richMessage()` is kept belt-and-braces).
+ *
+ * We clone `rich_message` before mutating: callers can share the object by
+ * reference (e.g. `richMessage()` output reused across a retry), and a
+ * transformer must not mutate the caller's input.
+ */
+export function installRichMarkdownGuard(bot: Bot): void {
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    if (
+      (method === 'sendRichMessage' || method === 'editMessageText') &&
+      payload != null
+    ) {
+      const p = payload as Record<string, unknown>
+      const rich = p.rich_message as { markdown?: unknown } | undefined
+      if (rich != null && typeof rich.markdown === 'string') {
+        const guarded = guardAccidentalFormatting(rich.markdown)
+        if (guarded !== rich.markdown) {
+          // Clone rather than mutate the caller's shared object.
+          p.rich_message = { ...rich, markdown: guarded }
+        }
+      }
+    }
+    return prev(method, payload, signal)
   })
 }
 
