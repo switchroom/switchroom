@@ -128,6 +128,56 @@ DEFAULTS = {
     "retainContext": "claude-code",
     "retainTags": [],
     "retainMetadata": {},
+    # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson & anti-pattern
+    # tagging at retain time. When on (default), build_retain_payload scans the
+    # formatted transcript slice for explicit lesson / anti-pattern markers and
+    # attaches the matching tag(s) to the retain. This is the retain-side half of
+    # #398: a transcript that captures a failure mode ("anti-pattern:", "what not
+    # to do") or a self-recognised lesson ("lesson learned", "note to self:") is
+    # tagged so the recall-side score-penalty weight map (recallTagWeights, PR5)
+    # can DEMOTE it below clean first-party session memories — without ever hard-
+    # dropping it. NON-GOAL (epic-recorded): historical corpus is NOT re-tagged;
+    # this fires on NEW retains only. Detection is deterministic substring match
+    # (case-insensitive), never model-dependent. Disable via
+    # HINDSIGHT_LESSON_TAGGING=false (rollback lever).
+    "lessonTagging": True,
+    # Marker map {tag: [substrings]}. A slice whose lower-cased text contains ANY
+    # of a tag's substrings gets that tag. Deliberately explicit prefixes to keep
+    # false positives low — a passing mention of the word "lesson" should not tag
+    # a whole transcript; an explicit "lesson learned" / "anti-pattern:" should.
+    # Operators can extend/replace via HINDSIGHT_LESSON_TAG_MARKERS (JSON object).
+    "lessonTagMarkers": {
+        "lesson": [
+            "lesson learned",
+            "lessons learned",
+            "lesson:",
+            "note to self:",
+            "for next time:",
+            "takeaway:",
+            "key takeaway",
+        ],
+        "anti-pattern": [
+            "anti-pattern:",
+            "anti pattern:",
+            "antipattern:",
+            "what not to do",
+            "do not do this again",
+            "don't do this again",
+            "failure mode:",
+        ],
+    },
+    # Switchroom hindsight-leverage E2 / PR9 (#398) — recall-side demotion weights
+    # for the lesson/anti-pattern tags above. Merged UNDER recallTagWeights at
+    # recall time (an explicit recallTagWeights entry for the same tag WINS), so
+    # lesson/anti-pattern transcripts are down-ranked out of the box while the
+    # PR5 sidechain seed and any operator override still compose cleanly. A raw
+    # transcript that merely discusses a failure mode should rank below a clean
+    # session memory of equal engine score, yet still surface when it is the only
+    # relevant hit (re-rank, never drop). Set HINDSIGHT_LESSON_DEMOTION=false to
+    # disable the built-in weights (rollback lever); override individual weights
+    # via recallTagWeights / HINDSIGHT_RECALL_TAG_WEIGHTS.
+    "lessonDemotion": True,
+    "lessonDemotionWeights": {"lesson": 0.85, "anti-pattern": 0.5},
     # Switchroom #3244 — boot reconciliation of un-committed transcript tails.
     # On by default; the load-bearing recovery for work an abrupt session death
     # (SIGKILL/OOM/watchdog) skipped. Disable per-agent via
@@ -213,6 +263,12 @@ ENV_OVERRIDES = {
     "HINDSIGHT_AUTO_RECALL": ("autoRecall", bool),
     "HINDSIGHT_AUTO_RETAIN": ("autoRetain", bool),
     "HINDSIGHT_RETAIN_MODE": ("retainMode", str),
+    # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson/anti-pattern tagging
+    # + recall demotion toggles and overrides.
+    "HINDSIGHT_LESSON_TAGGING": ("lessonTagging", bool),
+    "HINDSIGHT_LESSON_TAG_MARKERS": ("lessonTagMarkers", dict),
+    "HINDSIGHT_LESSON_DEMOTION": ("lessonDemotion", bool),
+    "HINDSIGHT_LESSON_DEMOTION_WEIGHTS": ("lessonDemotionWeights", dict),
     # Switchroom #3244 — boot reconciliation on/off (default on).
     "HINDSIGHT_RECONCILE_ON_START": ("reconcileOnStart", bool),
     "HINDSIGHT_RECALL_BUDGET": ("recallBudget", str),

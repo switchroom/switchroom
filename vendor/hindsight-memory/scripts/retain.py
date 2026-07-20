@@ -201,6 +201,45 @@ def slice_document_id(session_id: str, messages_slice: list, transcript_text: st
     return f"{session_id}-r{digest}"
 
 
+def detect_lesson_tags(transcript: str, config: dict) -> list:
+    """Deterministic lesson / anti-pattern tag detection (switchroom E2 / #398).
+
+    Scans the formatted transcript slice for explicit lesson / anti-pattern
+    markers and returns the sorted, de-duplicated list of tags to attach. This
+    is the retain-side half of #398: a transcript that captures a self-recognised
+    lesson ("lesson learned", "note to self:") or a failure mode ("anti-pattern:",
+    "what not to do") is tagged so recall's per-tag score-penalty weight map
+    (recallTagWeights, PR5) can DEMOTE it below clean first-party memories without
+    ever hard-dropping it.
+
+    Detection is a deterministic case-insensitive substring match against the
+    configurable ``lessonTagMarkers`` map — NOT model-dependent, so the behaviour
+    is reproducible and testable. Returns ``[]`` when tagging is disabled
+    (``lessonTagging`` false), the transcript is empty, the marker map is malformed,
+    or nothing matches. NON-GOAL (epic-recorded): this fires on NEW retains only;
+    the historical corpus is never re-tagged.
+    """
+    if not config.get("lessonTagging", True):
+        return []
+    if not isinstance(transcript, str) or not transcript:
+        return []
+    markers = config.get("lessonTagMarkers")
+    if not isinstance(markers, dict) or not markers:
+        return []
+    hay = transcript.lower()
+    tags = set()
+    for tag, needles in markers.items():
+        if not isinstance(tag, str) or not tag.strip():
+            continue
+        if not isinstance(needles, list):
+            continue
+        for needle in needles:
+            if isinstance(needle, str) and needle and needle.lower() in hay:
+                tags.add(tag.strip())
+                break
+    return sorted(tags)
+
+
 def build_retain_payload(
     config: dict,
     session_id: str,
@@ -260,6 +299,18 @@ def build_retain_payload(
             tags = None
     else:
         tags = None
+
+    # Switchroom E2 / PR9 (#398) — attach lesson / anti-pattern tags detected in
+    # the transcript slice so recall can demote failure-mode-adjacent memories via
+    # the PR5 score-penalty weight map. Deterministic, best-effort, never fails a
+    # build; applies to both Stop-hook and sidechain retains (shared code path).
+    lesson_tags = detect_lesson_tags(transcript, config)
+    if lesson_tags:
+        merged = list(tags) if tags else []
+        for lt in lesson_tags:
+            if lt not in merged:
+                merged.append(lt)
+        tags = merged
 
     metadata = {
         "retained_at": template_vars["timestamp"],
