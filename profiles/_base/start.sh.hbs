@@ -325,6 +325,32 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   #    retrying — it recovers on its own the moment the broker
   #    unlocks (no human, no container recreate); bot token invalid
   #    → 401 → gateway exits 78 → quarantined (operator action).
+  # --- Session-model carrier PRE-FORK SNAPSHOT (gateway-consume boot race) ---
+  # The gateway forked just below consumes `.session-model` (+ the bounded-retry
+  # attempt counter) the moment it acquires the boot lock (#3284 healthy-boot
+  # consume, gateway.ts). But the session-model RESOLUTION block runs much later
+  # in the INNER pass — behind the LiteLLM probe's up-to-120s wait — so the
+  # gateway reliably won the race and the carrier vanished before resolution
+  # ever read it: a `/model <target>` differing from the configured default was
+  # silently dropped and the boot reverted (the overlord `/model fable`
+  # NOT-APPLIED incident, 2026-07). Snapshot the carrier + counter HERE, before
+  # the fork, into `.boot-snapshot` siblings the gateway never touches; the
+  # resolution block prefers the snapshot and deletes it after use (per-boot
+  # ephemeral). Refresh-or-remove every boot so a stale snapshot can never
+  # re-apply a consumed override on a later restart.
+  rm -f "{{agentDir}}/.session-model.boot-snapshot" "{{agentDir}}/.session-model-boot-attempts.boot-snapshot"
+  if [ -f "{{agentDir}}/.session-model" ]; then
+    # A failed copy (ENOSPC, perms) must not be a SILENT drop — the resolution
+    # block still falls back to the live carrier, but the gateway may consume
+    # that first, so warn loudly enough to diagnose a reverted override.
+    cp -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model.boot-snapshot" 2>/dev/null \
+      || echo "session-model: WARNING — failed to snapshot .session-model before the gateway fork; if the gateway consumes the carrier first, this boot's /model override may silently revert to the configured default" >&2
+    if [ -f "{{agentDir}}/.session-model-boot-attempts" ]; then
+      cp -f "{{agentDir}}/.session-model-boot-attempts" "{{agentDir}}/.session-model-boot-attempts.boot-snapshot" 2>/dev/null \
+        || echo "session-model: WARNING — failed to snapshot .session-model-boot-attempts before the gateway fork (retry-budget count may be lost this boot)" >&2
+    fi
+  fi
+
   _gateway_bundle=/opt/switchroom/telegram-plugin/dist/gateway/gateway.js
   _telegram_enabled={{#if telegramEnabledFlag}}{{telegramEnabledFlag}}{{else}}true{{/if}}
   if [ "$_telegram_enabled" = "true" ] && [ -f "$_gateway_bundle" ] && command -v bun >/dev/null 2>&1; then
@@ -1333,7 +1359,11 @@ rm -f "{{agentDir}}/.relaunch-model-intent" "{{agentDir}}/.session-model-kept-no
 # meaningless without a carrier to belong to, so sweep it as stale ONLY when no
 # `.session-model` carrier is present (rollout leftover / completed apply / a
 # prior giveup that didn't get to delete it).
-[ -f "{{agentDir}}/.session-model" ] || rm -f "{{agentDir}}/.session-model-boot-attempts"
+# (Gateway-consume race fix: the outer pass snapshotted the carrier BEFORE the
+# gateway fork — the gateway may already have consumed the live carrier by now
+# on a healthy boot, so the snapshot is an equally valid "a carrier existed
+# this boot" signal.)
+{ [ -f "{{agentDir}}/.session-model" ] || [ -f "{{agentDir}}/.session-model.boot-snapshot" ]; } || rm -f "{{agentDir}}/.session-model-boot-attempts"
 
 # Migration shim (one release): a leftover one-shot `.session-model-override`
 # carrier from a pre-consume-once gateway means an OLD gateway wrote it
@@ -1344,6 +1374,18 @@ if [ -f "{{agentDir}}/.session-model-override" ]; then
   rm -f "{{agentDir}}/.session-model-override"
   if printf '%s' "$_mig" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
     printf '{"model":"%s","configuredDefaultAtWrite":"%s","ts":%s}\n' "$_mig" "$_EFFECTIVE_MODEL" "$(( $(date +%s) * 1000 ))" > "{{agentDir}}/.session-model" 2>/dev/null || true
+    # Also refresh the pre-fork snapshot: this write happened AFTER the outer
+    # pass's snapshot point, and the resolution below prefers the snapshot. A
+    # newer legacy intent must win over any stale pre-fork copy (and survive
+    # an early gateway consume of the live file).
+    #
+    # KNOWN one-release quirk (accepted): this live write also lands AFTER the
+    # gateway's boot-lock consume already fired, so on a healthy boot nothing
+    # deletes it until the NEXT boot's gateway consume — the migrated legacy
+    # override therefore applies for up to TWO boots instead of one. Shim-only
+    # (the mainline gateway writes `.session-model` directly, pre-restart, so
+    # it is snapshotted and consumed normally); the shim dies next release.
+    cp -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model.boot-snapshot" 2>/dev/null || true
     echo "session-model: migrated legacy one-shot carrier '$_mig' to .session-model (applying + consuming this boot)" >&2
   else
     echo "session-model: ignoring malformed legacy .session-model-override (failed shape gate)" >&2
@@ -1351,8 +1393,19 @@ if [ -f "{{agentDir}}/.session-model-override" ]; then
   unset _mig
 fi
 
-if [ -f "{{agentDir}}/.session-model" ]; then
-  _smf="$(cat "{{agentDir}}/.session-model" 2>/dev/null || true)"
+# Prefer the PRE-FORK SNAPSHOT over the live carrier: on a healthy boot the
+# gateway (forked long before this block runs) has typically ALREADY consumed
+# the live `.session-model` by now — reading only the live file silently
+# reverted every `/model <target>` that differed from the configured default
+# (the overlord `/model fable` NOT-APPLIED incident). The snapshot was taken
+# before the gateway fork so it is race-free; fall back to the live file when
+# no snapshot exists (non-docker runtimes / block run standalone in tests).
+if [ -f "{{agentDir}}/.session-model.boot-snapshot" ] || [ -f "{{agentDir}}/.session-model" ]; then
+  if [ -f "{{agentDir}}/.session-model.boot-snapshot" ]; then
+    _smf="$(cat "{{agentDir}}/.session-model.boot-snapshot" 2>/dev/null || true)"
+  else
+    _smf="$(cat "{{agentDir}}/.session-model" 2>/dev/null || true)"
+  fi
   _sm_model="$(printf '%s' "$_smf" | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   _sm_cfg="$(printf '%s' "$_smf" | sed -n 's/.*"configuredDefaultAtWrite"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   # BOUNDED-RETRY CONSUME (#3284) — the carrier is NO LONGER deleted here before
@@ -1380,7 +1433,13 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   # and persists the incremented counter. The delete-before-apply that used to
   # sit here is GONE by design.
   _SM_MAX_ATTEMPTS=3
-  _sm_attempts="$(cat "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null | tr -dc '0-9' || true)"
+  # Counter read prefers the pre-fork snapshot for the same race reason (the
+  # gateway deletes the live counter alongside the carrier on healthy consume).
+  if [ -f "{{agentDir}}/.session-model-boot-attempts.boot-snapshot" ]; then
+    _sm_attempts="$(cat "{{agentDir}}/.session-model-boot-attempts.boot-snapshot" 2>/dev/null | tr -dc '0-9' || true)"
+  else
+    _sm_attempts="$(cat "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null | tr -dc '0-9' || true)"
+  fi
   [ -z "$_sm_attempts" ] && _sm_attempts=0
   _sm_attempts=$(( _sm_attempts + 1 ))
   # Shape gate — kept BYTE-IDENTICAL with MODEL_ARG_RE in
@@ -1444,6 +1503,10 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   fi
   unset _smf _sm_model _sm_cfg _sm_attempts _SM_MAX_ATTEMPTS
 fi
+# The snapshot is strictly per-boot: consumed here regardless of which branch
+# fired, so it can never re-apply an already-consumed override on a later boot
+# (the outer pass also refresh-or-removes it, belt and braces).
+rm -f "{{agentDir}}/.session-model.boot-snapshot" "{{agentDir}}/.session-model-boot-attempts.boot-snapshot"
 
 # Configured-default LiteLLM guard, SPLIT BY CAUSE (2026-07-17 boot-race
 # incident: a slow LiteLLM co-boot demoted a configured-fable agent to opus on

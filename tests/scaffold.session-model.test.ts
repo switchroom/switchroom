@@ -300,6 +300,100 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(runBlock("1")).toBe(DEFAULT_MODEL);
   });
 
+  // ── gateway-consume boot race (overlord `/model fable` NOT-APPLIED) ──────
+  // The gateway sidecar forks near the TOP of start.sh and consumes the live
+  // carrier at boot.lock_acquired (#3284) — normally LONG before the resolution
+  // block runs (it sits behind the LiteLLM probe's up-to-120s wait). Pre-fix,
+  // resolution read only the live file, found nothing, and silently booted the
+  // configured default: a `/model <target>` differing from the default NEVER
+  // reached the claude spawn. The fix snapshots the carrier before the gateway
+  // fork; resolution prefers the snapshot. These tests assert the OUTCOME.
+  const SNAPSHOT = ".session-model.boot-snapshot";
+  const ATTEMPTS_SNAPSHOT = ".session-model-boot-attempts.boot-snapshot";
+
+  it("gateway consumed the live carrier before resolution → the PRE-FORK SNAPSHOT still applies the override (the /model≠default bug)", () => {
+    // Simulate the real sequence: outer pass snapshotted the carrier, then the
+    // gateway's healthy-boot consume deleted the live carrier + counter BEFORE
+    // resolution ran. The override differs from the configured default.
+    writeFileSync(join(agentDir, SNAPSHOT), sessionModelJson("claude-opus-4-8"));
+    // live .session-model absent — the gateway already ate it.
+    expect(carrierExists()).toBe(false);
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    // The launched model is recorded for the gateway's NOT-APPLIED check.
+    expect(readFileSync(join(agentDir, ".active-session-model"), "utf-8").trim()).toBe("claude-opus-4-8");
+    // No alert — this is a clean apply.
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
+    // The snapshot is consumed by the block (per-boot ephemeral)…
+    expect(existsSync(join(agentDir, SNAPSHOT))).toBe(false);
+    // …so the NEXT restart (no carrier, no snapshot) reverts to the configured
+    // default — the session-scoped invariant holds.
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(readFileSync(join(agentDir, ".active-session-model"), "utf-8").trim()).toBe(DEFAULT_MODEL);
+  });
+
+  it("snapshot WINS over the live carrier when both exist (snapshot is this boot's pre-fork truth)", () => {
+    writeFileSync(join(agentDir, SNAPSHOT), sessionModelJson("claude-opus-4-8"));
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+  });
+
+  it("proxy-only snapshot (fable) + LiteLLM up → applies AND repoints to the router root (routing preserved through the snapshot path)", () => {
+    writeFileSync(join(agentDir, SNAPSHOT), sessionModelJson("fable"));
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe("fable");
+    expect(baseUrl).toBe(ROUTER_ROOT);
+  });
+
+  it("attempt counter read from its snapshot when the gateway deleted the live counter (crashloop bound survives the race)", () => {
+    writeFileSync(join(agentDir, SNAPSHOT), sessionModelJson("claude-opus-4-8"));
+    writeFileSync(join(agentDir, ATTEMPTS_SNAPSHOT), "3\n");
+    // 3 prior attempts + this one = 4 > _SM_MAX_ATTEMPTS(3) → give up + alert.
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(alertText()).toContain("after 3 attempts");
+    expect(existsSync(join(agentDir, ATTEMPTS_SNAPSHOT))).toBe(false);
+  });
+
+  it("orphan attempt counter from a prior healthy snapshot-apply does NOT burn a NEW carrier's retry budget (fresh carrier = fresh budget)", async () => {
+    const { writeSessionModelFile } = await import(
+      "../telegram-plugin/gateway/session-model-file.js"
+    );
+    // Boot A (healthy, snapshot apply): gateway already consumed the live
+    // carrier; resolution applies from the snapshot and re-writes the LIVE
+    // counter AFTER the consume — leaving an orphan attempts=1 all session.
+    writeFileSync(join(agentDir, SNAPSHOT), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(attemptCount()).toBe("1"); // the orphan
+    // In-session `/model sr-glm-5`: the gateway writes a FRESH carrier. This
+    // must also clear the orphan counter (the blocker fix) — otherwise the
+    // stale count is snapshotted with the new carrier and after three such
+    // sessions a healthy /model is falsely refused as "3 failed attempts".
+    writeSessionModelFile(agentDir, "sr-glm-5", DEFAULT_MODEL);
+    expect(attemptCount()).toBe(""); // fresh carrier = fresh retry budget
+    // Boot B outer pass: snapshot the live carrier (+ counter if any)…
+    execFileSync("bash", ["-c", [
+      `cd ${JSON.stringify(agentDir)}`,
+      `cp -f .session-model ${JSON.stringify(SNAPSHOT)}`,
+      `[ -f .session-model-boot-attempts ] && cp -f .session-model-boot-attempts ${JSON.stringify(ATTEMPTS_SNAPSHOT)} || true`,
+    ].join("\n")]);
+    // …then the gateway's healthy-boot consume eats the live files…
+    healthyBootConsume();
+    // …and resolution applies the NEW override as attempt 1, not 2.
+    expect(runBlock("1")).toBe("sr-glm-5");
+    expect(attemptCount()).toBe("1");
+  });
+
+  it("rendered start.sh takes the pre-fork snapshot BEFORE the gateway fork (ordering is the whole fix)", () => {
+    const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
+    const snapIdx = startSh.indexOf(".session-model.boot-snapshot");
+    const forkIdx = startSh.indexOf("_switchroom_supervise gateway");
+    const resolveIdx = startSh.indexOf(BLOCK_HEADER);
+    expect(snapIdx).toBeGreaterThan(-1);
+    expect(forkIdx).toBeGreaterThan(-1);
+    expect(resolveIdx).toBeGreaterThan(-1);
+    expect(snapIdx).toBeLessThan(forkIdx);
+    expect(forkIdx).toBeLessThan(resolveIdx);
+  });
+
   // ── invalidation branches (all consume + alert) ──────────────────────────
   it("corrupt .session-model → deletes it, boots default, notifies (never a silent drop)", () => {
     writeFileSync(join(agentDir, ".session-model"), "{broken\n");
@@ -759,7 +853,12 @@ if [ -f "$marker" ]; then echo claude-opus-4-8; else touch "$marker"; echo "mang
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
     const idxLive = startSh.indexOf("# --- Live configured-default resolution");
     const idxRecord = startSh.indexOf('.configured-default-model" 2>/dev/null || true');
-    const idxCarrier = startSh.indexOf('if [ -f "' + agentDir + '/.session-model" ]');
+    // The carrier apply condition (snapshot-preferred since the gateway-consume
+    // race fix — the pre-fork snapshot block earlier also tests .session-model,
+    // so anchor on the snapshot-OR-live compound condition).
+    const idxCarrier = startSh.indexOf(
+      '.session-model.boot-snapshot" ] || [ -f "' + agentDir + '/.session-model" ]',
+    );
     const idxGuard = startSh.indexOf("# Configured-default LiteLLM guard");
     const idxRepoint = startSh.indexOf("sr-* passthrough→router repoint");
     const idxActive = startSh.indexOf('.active-session-model"');
