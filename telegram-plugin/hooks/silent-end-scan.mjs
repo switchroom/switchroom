@@ -100,6 +100,68 @@ export function endsWithSilentMarker(text) {
   return SILENT_MARKER_RE.test(lines[lines.length - 1])
 }
 
+// ── Narration heuristics — ported from `turn-flush-safety.ts:198-274` ──
+//
+// Kept byte-parallel with `selectFlushDeliveryText` / `isNarrationBlock` so
+// the JOINED multi-block prose the scan persists as `pendingText` (for the
+// capture-divergence corner) matches what the gateway flush would itself have
+// delivered. The scan has no structural `followedByToolUse` provenance, so it
+// uses the opener/trailer heuristic fallback (the same branch the TS side
+// takes when the flag is absent). MUST stay in sync with the TS source; a
+// drift only affects the rare capture-empty corner, never the primary flush.
+const NARRATION_OPENER =
+  /^(let me\b|lemme\b|i'?ll\b|i will\b|i am going to\b|i'?m going to\b|i'?m about to\b|going to\b|first,?\s+(?:let me|i'?ll|i will)\b|now,?\s+(?:let me|i'?ll|i will)\b|next,?\s+(?:let me|i'?ll|i will)\b|let'?s\b)/i
+const NARRATION_TRAILER = /(?:\.{3}|…|:)\s*$/
+
+function isTrailingNarrationLine(block) {
+  const t = block.trim()
+  if (t.length === 0 || t.length >= FINAL_ANSWER_MIN_CHARS) return false
+  if (t.includes('\n')) return false
+  return NARRATION_TRAILER.test(t)
+}
+
+function isNarrationBlock(block) {
+  return NARRATION_OPENER.test(block.trimStart()) || isTrailingNarrationLine(block)
+}
+
+/**
+ * Choose the prose the captured-prose bridge should deliver from the trailing
+ * text blocks in the ZERO-reply case, mirroring `selectFlushDeliveryText`
+ * (`turn-flush-safety.ts:198-232`). `texts` are already trimmed non-empty.
+ *
+ *   - 0 blocks   → undefined (nothing to deliver).
+ *   - 1 block    → that block (the real single-block short-answer shape;
+ *                  persisted even below the substance floor so the lowered-
+ *                  floor capture-divergence corner can deliver it).
+ *   - ≥2 blocks  → strip leading narration exactly as the flush does: if EVERY
+ *                  preceding block is narration, deliver only the terminal
+ *                  block; otherwise JOIN all blocks with a paragraph break (a
+ *                  genuine multi-paragraph answer split across blocks). When
+ *                  the result is narration-only (terminal block is itself
+ *                  narration AND all preceding are narration) → undefined, so a
+ *                  pure narration run never masquerades as an answer (#3228
+ *                  Finding 2 parity).
+ *
+ * @param {string[]} texts
+ * @returns {string | undefined}
+ */
+export function selectBridgePendingText(texts) {
+  const candidates = texts.map((t) => t.trim()).filter((t) => t.length > 0)
+  if (candidates.length === 0) return undefined
+  if (candidates.length === 1) return candidates[0]
+  const answer = candidates[candidates.length - 1]
+  const preceding = candidates.slice(0, -1)
+  const allPrecedingNarration = preceding.every((b) => isNarrationBlock(b))
+  if (allPrecedingNarration) {
+    // Deliver only the terminal block — unless it too is pure narration, in
+    // which case the whole run is narration and there is no answer to bridge.
+    return isNarrationBlock(answer) ? undefined : answer
+  }
+  // A preceding block carries real content → keep the whole answer joined so a
+  // multi-block answer is never truncated to its last paragraph.
+  return candidates.join('\n\n')
+}
+
 /**
  * Predicate ported from `telegram-plugin/final-answer-detect.ts:78-83`.
  * Kept in this .mjs so the hook is fully self-contained (no TS import).
@@ -458,14 +520,17 @@ export function scanTurnForFinalReply(jsonl) {
   // floor unchanged — a short closer after a real reply is not a dropped
   // answer.
   //
-  // Scoped to the SINGLE-trailing-block shape so the #3228 Finding 2 guard is
-  // preserved: a RUN of short narration blocks ("Let me check…", "Still
-  // querying…") must still yield NO pendingText (never masquerade a joined
-  // narration run as an answer). A single trailing block IS the real
-  // short-answer shape the model produces when it writes one plain-text reply.
+  // Multi-block corner (review item 3): a real answer split across ≥2
+  // individually-sub-200 blocks (e.g. two ~150-char paragraphs) would
+  // otherwise yield NO pendingText — and in the capture-divergence-empty
+  // corner (gateway `capturedText` empty → flush skips 'empty-text') the
+  // bridge would then have nothing to deliver and the hook already allowed the
+  // stop: a DROPPED ANSWER. `selectBridgePendingText` mirrors the flush's own
+  // `selectFlushDeliveryText` narration-strip/join, so the bridge delivers the
+  // joined prose (with the lowered `minChars`) instead of dropping. The #3228
+  // Finding 2 guard is preserved: a pure narration run still yields undefined.
   const zeroReplyPendingText =
-    pendingText ??
-    (trailingTextBlocks.length === 1 ? trailingTextBlocks[0].text : undefined)
+    pendingText ?? selectBridgePendingText(trailingTextBlocks.map((b) => b.text))
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
