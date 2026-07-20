@@ -1001,6 +1001,24 @@ export function normalizeBindMountPath(p: string): string {
   return out;
 }
 
+/**
+ * True when a LiteLLM base URL points at the HOST's loopback interface
+ * (localhost / 127.0.0.1 / ::1). Such a proxy is only reachable via the host
+ * loopback, NOT through host.docker.internal/host-gateway (which routes to the
+ * host's bridge IP) — so a consumer container must join the host network to
+ * reach it. Mirrors `isLoopbackHttpUrl` in src/setup/hindsight.ts; kept local
+ * to avoid pulling the heavy hindsight module into the compose generator.
+ */
+export function isLoopbackHttpBase(url: string): boolean {
+  try {
+    const u = new URL(url.includes("://") ? url : `http://${url}`);
+    const h = (u.hostname || "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+  } catch {
+    return false;
+  }
+}
+
 /** The in-container path the config is mounted AT (also the SWITCHROOM_CONFIG
  *  value for containerised services). Never a valid host bind SOURCE. */
 export const CONTAINER_CONFIG_PATH = "/state/config/switchroom.yaml";
@@ -1740,28 +1758,36 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      SWITCHROOM_AUTH_BROKER_STATE_DIR: /state/auth-broker`);
   // LiteLLM root for get-external-spend (OpenRouter cash on /usage).
   // Broker holds the master key in state-dir; agents never see it.
-  // Auth-broker runs on the compose bridge (not host net). Operator
-  // base_url is almost always loopback (socat on the host) — rewrite
-  // 127.0.0.1/localhost → host.docker.internal so the broker can reach
-  // the host-published proxy. Non-loopback URLs pass through unchanged.
-  // extra_hosts is only emitted when we configure a base — keeps the
-  // zero-litellm fleet compose free of host-gateway (network_isolation
-  // regression receive).
+  //
+  // Reachability: the broker must connect out to the LiteLLM proxy the
+  // same way the hindsight consumer does (see generateHindsightComposeSnippet).
+  //   - Loopback base (127.0.0.1/localhost:4010): the proxy is published on
+  //     the HOST's loopback interface only (Coolify/socat bind 127.0.0.1).
+  //     A bridge container CANNOT reach a 127.0.0.1-bound host port —
+  //     host.docker.internal/host-gateway routes to the host's *bridge* IP
+  //     (e.g. 10.0.0.1), not to host loopback, so the connection is refused
+  //     and get-external-spend silently returns available:false (blank
+  //     /usage External row). Join the host network so 127.0.0.1:4010 is
+  //     directly reachable, and keep the loopback base URL verbatim.
+  //   - Non-loopback base (a real bridge-reachable host/socat name): stay on
+  //     the compose bridge and pair host-gateway so a mixed host-socat name
+  //     written as host.docker.internal still resolves.
+  // extra_hosts / network_mode are only emitted when a base is configured —
+  // keeps the zero-litellm fleet compose free of both (network_isolation
+  // regression guard).
   let authBrokerNeedsHostGateway = false;
+  let authBrokerNeedsHostNetwork = false;
   {
     const llBase =
       (config as { litellm?: { base_url?: string } }).litellm?.base_url;
     if (typeof llBase === "string" && llBase.trim()) {
       const raw = llBase.trim().replace(/\/+$/, "");
-      const bridged = raw
-        .replace(/^http:\/\/127\.0\.0\.1(?=[:/]|$)/i, "http://host.docker.internal")
-        .replace(/^http:\/\/localhost(?=[:/]|$)/i, "http://host.docker.internal")
-        .replace(/^https:\/\/127\.0\.0\.1(?=[:/]|$)/i, "https://host.docker.internal")
-        .replace(/^https:\/\/localhost(?=[:/]|$)/i, "https://host.docker.internal");
-      lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(bridged)}`);
-      // Always pair with host-gateway when base is set: loopback rewrite
-      // needs it; non-loopback? harmless + covers mixed host socat names.
-      authBrokerNeedsHostGateway = true;
+      lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(raw)}`);
+      if (isLoopbackHttpBase(raw)) {
+        authBrokerNeedsHostNetwork = true;
+      } else {
+        authBrokerNeedsHostGateway = true;
+      }
     }
   }
   lines.push(`      SWITCHROOM_ACCOUNTS_DIR: /state/accounts`);
@@ -1775,7 +1801,13 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   if (opts.operatorUid !== undefined) {
     lines.push(`      SWITCHROOM_AUTH_BROKER_OPERATOR_UID: "${opts.operatorUid}"`);
   }
-  if (authBrokerNeedsHostGateway) {
+  if (authBrokerNeedsHostNetwork) {
+    // Host network stack: 127.0.0.1:4010 (loopback-published LiteLLM) is
+    // directly reachable, mirroring the hindsight consumer's proven path.
+    // The broker's agent-facing IPC is unix-domain sockets in bind-mounted
+    // named volumes, so host networking does not affect how agents reach it.
+    lines.push(`    network_mode: host`);
+  } else if (authBrokerNeedsHostGateway) {
     lines.push(`    extra_hosts:`);
     lines.push(`      - "host.docker.internal:host-gateway"`);
   }
