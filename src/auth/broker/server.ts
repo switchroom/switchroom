@@ -2174,11 +2174,6 @@ export class AuthBroker {
         // this account. false → RETIRED (removed from rotation); the views
         // render it as such instead of "available".
         in_service: inService.has(label),
-        // #org-disable — populated by PR2 (the entitlement/org-level block
-        // probe). Left false here; a pre-PR2 broker reports every account
-        // un-blocked, and RETIRED classification works standalone off
-        // `in_service` regardless.
-        entitlement_blocked: false,
         exhausted_until: q?.exhausted_until,
         // 429 throttle tier — raw ledger value for transparency (consumers
         // compare against their own clock). Never feeds `exhausted`.

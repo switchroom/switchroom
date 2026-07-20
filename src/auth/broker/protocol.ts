@@ -482,18 +482,6 @@ export const AccountStateSchema = z.object({
   throttled_until: z.number().optional(),
   threshold_violations: z.number().int().nonnegative().optional(),
   last_refreshed_at: z.number().optional(),
-  /**
-   * Entitlement-403 hard block: the org/subscription has DISABLED Claude Code
-   * access ("Your organization has disabled Claude subscription access for
-   * Claude Code"). A hard account-level block (never serves) until a later
-   * successful probe clears it. Optional/back-compat: absent on pre-entitlement
-   * brokers (read as false).
-   *
-   * NOTE (PR2): this is a MINIMAL local definition so the entitlement-403
-   * backend branch compiles standalone. PR1 owns the fuller AccountStateSchema
-   * field + renderers; on rebase this reconciles with PR1's definition.
-   */
-  entitlement_blocked: z.boolean().optional(),
 });
 
 export const AgentStateSchema = z.object({

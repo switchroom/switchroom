@@ -391,13 +391,18 @@ export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> 
     }
     return { ok: false, reason: `quota probe network error: ${msg}` };
   }
-  clearTimeout(timeout);
+  // NOTE: do NOT clearTimeout yet — the abort signal must keep covering the
+  // body read below (a stalled 4xx body would otherwise hang the probe slot).
+  // Each return path clears the timer after it is done consuming the response.
 
   // Read headers regardless of HTTP status — the rate-limit headers
   // are populated on 200 AND on auth-failure 4xx responses. A 429 tier-wall
   // carries the 7d_oi headers and parses ok:true here (kept as-is).
   const parsed = parseQuotaHeaders(resp.headers);
-  if (parsed.ok) return parsed;
+  if (parsed.ok) {
+    clearTimeout(timeout);
+    return parsed;
+  }
 
   if (!resp.ok) {
     // The probe FAILED at the HTTP layer. Read the body to classify the
@@ -409,8 +414,9 @@ export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> 
     try {
       bodyText = await resp.text();
     } catch {
-      // Body unreadable — leave empty; classification degrades to "other".
+      // Body unreadable / timed out — leave empty; classification degrades to "other".
     }
+    clearTimeout(timeout);
     const apiErrorMessage = extractApiErrorMessage(bodyText);
     const entitlement =
       resp.status === 403 && isEntitlementDisabledMessage(apiErrorMessage);
@@ -422,5 +428,6 @@ export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> 
       failureKind: entitlement ? "entitlement_blocked" : "other",
     };
   }
+  clearTimeout(timeout);
   return parsed;
 }
