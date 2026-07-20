@@ -296,4 +296,67 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(r.status).toBe(0)
     expect(r.stdout.trim()).toBe('')
   })
+
+  // ── Single-writer election (duplicate-message fix) ─────────────────
+  describe('single-writer election end-to-end', () => {
+    function writeFreshHeartbeat() {
+      writeFileSync(join(stateDir, 'gateway-heartbeat'), String(Date.now()), 'utf8')
+    }
+
+    it('zero-reply ≥200 + FRESH gateway heartbeat → ALLOW (no block re-prompt), state file still written for the flush', () => {
+      // The duplicate repro: today this BLOCKS *and* the gateway flush fires →
+      // two messages. With a fresh heartbeat the election ALLOWS the stop so
+      // the gateway flush is the single writer.
+      writeFreshHeartbeat()
+      const transcript = writeTranscript(tmp, [
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'A'.repeat(300) }] } },
+      ])
+      const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
+      expect(r.status).toBe(0)
+      // ALLOW → no block JSON on stdout.
+      expect(r.stdout.trim()).toBe('')
+      expect(r.stderr).toMatch(/single-writer election ALLOWED/)
+      // State file IS written so the gateway's captured-prose bridge has its
+      // input (turnKey/turnId/pendingText); retryCount stays 0 (not a re-prompt).
+      const statePath = join(stateDir, 'silent-end-pending.json')
+      expect(existsSync(statePath)).toBe(true)
+      const state = JSON.parse(readFileSync(statePath, 'utf8'))
+      expect(state.retryCount).toBe(0)
+      expect(state.turnKey).toBe('111:_')
+      expect(state.pendingText).toBe('A'.repeat(300))
+    })
+
+    it('zero-reply ≥200 + STALE/missing heartbeat → BLOCK (never allow into a possibly-dead gateway)', () => {
+      // No heartbeat file → the liveness gate forces today's BLOCK behaviour.
+      const transcript = writeTranscript(tmp, [
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'A'.repeat(300) }] } },
+      ])
+      const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
+      expect(r.status).toBe(0)
+      expect(JSON.parse(r.stdout).decision).toBe('block')
+      const state = JSON.parse(readFileSync(join(stateDir, 'silent-end-pending.json'), 'utf8'))
+      expect(state.retryCount).toBe(1)
+    })
+
+    it('retryCount>0 (prior failed delivery) + fresh heartbeat → BLOCK (preserve #3228 send-failure net)', () => {
+      writeFreshHeartbeat()
+      // Seed a prior state file with retryCount=1 (a delivery already failed).
+      writeFileSync(
+        join(stateDir, 'silent-end-pending.json'),
+        JSON.stringify({ chatId: '111', threadId: null, turnKey: '111:_', retryCount: 1, timestamp: Date.now() }),
+        'utf8',
+      )
+      const transcript = writeTranscript(tmp, [
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'A'.repeat(300) }] } },
+      ])
+      const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
+      expect(r.status).toBe(0)
+      // retryCount was 1 → not the exhaustion boundary (MAX=2) → still blocks,
+      // and the election does NOT allow (retry-ladder-in-flight).
+      expect(JSON.parse(r.stdout).decision).toBe('block')
+    })
+  })
 })

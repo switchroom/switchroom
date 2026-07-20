@@ -55,6 +55,9 @@
 // (`done:true`) call as the qualifying one regardless of how many
 // intermediate non-final `stream_reply` calls preceded it. No gap found;
 // re-verify only if a new outbound-delivery tool is added to bridge.ts.
+import { statSync } from 'node:fs'
+import { join } from 'node:path'
+
 const REPLY_TOOLS = new Set([
   'mcp__switchroom-telegram__reply',
   'mcp__switchroom-telegram__stream_reply',
@@ -193,8 +196,16 @@ function buildTurnId(chatId, threadId, messageId) {
  *   clears the substance floor, so the gateway never re-delivers a short
  *   trailing pleasantry. Omitted entirely otherwise.
  */
-function buildBlockResult(envelope, reason, pendingText) {
+function buildBlockResult(envelope, reason, pendingText, hasTrailingProse) {
   const block = { decided: 'block', reason }
+  // Single-writer election input (#duplicate-message fix): does ANY
+  // non-empty, non-silent trailing text block exist after the last
+  // delivery event? The zero-reply election allows only when this is
+  // true — `decideTurnFlush` has no length floor, so any non-empty
+  // non-silent captured text WILL flush; but a turn with NO trailing
+  // prose at all (tool calls only) has nothing for any delivery
+  // machine to send and must keep blocking.
+  if (hasTrailingProse === true) block.hasTrailingProse = true
   if (envelope.chatId) {
     block.chatId = envelope.chatId
     block.threadId = envelope.threadId
@@ -432,6 +443,29 @@ export function scanTurnForFinalReply(jsonl) {
     substantiveBlocks.length > 0
       ? substantiveBlocks[substantiveBlocks.length - 1].text
       : undefined
+  const trailingTextBlocks = undeliveredSlice.filter(
+    (b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0,
+  )
+  const hasTrailingProse = trailingTextBlocks.length > 0
+  // Capture-divergence bridge (#duplicate-message fix): in the ZERO-reply
+  // case, persist the last trailing block even when no single block clears
+  // the 200-char substance floor. The gateway's flush normally delivers any
+  // non-empty captured text, but when the gateway's own capture diverged
+  // (captured empty) the captured-prose bridge is the only delivery machine
+  // left, and it reads `pendingText` — the gateway lowers `minChars` for
+  // exactly this corner (`capturedProseMinCharsFor`, silent-end.ts). The
+  // interim-ack case (`trailing-text-after-reply`) keeps the substantive
+  // floor unchanged — a short closer after a real reply is not a dropped
+  // answer.
+  //
+  // Scoped to the SINGLE-trailing-block shape so the #3228 Finding 2 guard is
+  // preserved: a RUN of short narration blocks ("Let me check…", "Still
+  // querying…") must still yield NO pendingText (never masquerade a joined
+  // narration run as an answer). A single trailing block IS the real
+  // short-answer shape the model produces when it writes one plain-text reply.
+  const zeroReplyPendingText =
+    pendingText ??
+    (trailingTextBlocks.length === 1 ? trailingTextBlocks[0].text : undefined)
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
@@ -444,7 +478,7 @@ export function scanTurnForFinalReply(jsonl) {
     if (envelope.source === 'cron') {
       return { decided: 'allow', reason: 'cron-source' }
     }
-    return buildBlockResult(envelope, 'no-final-reply', pendingText)
+    return buildBlockResult(envelope, 'no-final-reply', zeroReplyPendingText, hasTrailingProse)
   }
 
   if (sawUndeliveredTextAfterAllow) {
@@ -453,8 +487,169 @@ export function scanTurnForFinalReply(jsonl) {
     // sent through a delivery tool. This is the "at least once" bug:
     // an early ack (or any qualifying reply) must not amnesty
     // everything written afterward.
-    return buildBlockResult(envelope, 'trailing-text-after-reply', pendingText)
+    return buildBlockResult(envelope, 'trailing-text-after-reply', pendingText, hasTrailingProse)
   }
 
   return { decided: 'allow', reason: lastAllowReason }
+}
+
+// ── Single-writer election (duplicate-message fix) ───────────────────
+//
+// RCA: when a turn ends with its final answer as plain transcript text,
+// TWO uncoordinated recovery paths both fire — (A) the gateway's
+// deterministic turn-end flush (`decideTurnFlush` /
+// `answer-ready-flush.ts`) delivers the captured transcript prose, AND
+// (B) this Stop hook blocks and re-prompts the model, which regenerates
+// a REWORDED reply that defeats the exact-match dedup
+// (`flushed-turn-supersede.ts` `flushedAnswerMatchesReply`). The user
+// gets two near-identical messages.
+//
+// Fix: the Stop hook is the single elector. On a would-BLOCK scan it
+// ALLOWS the stop (still persisting the state file so the gateway's
+// delivery machines have their input) IFF it can PROVE a gateway
+// delivery machine will handle the trailing prose. Every gate below
+// exists to prevent a DROP (worse than a duplicate):
+//
+//   1. deliverable trailing prose exists AND the right machine covers it
+//      - zero-reply (`no-final-reply`): ANY non-empty non-silent
+//        trailing prose — `decideTurnFlush` has no length floor and
+//        flushes any non-empty non-silent captured text. (No 200-char
+//        floor here.)
+//      - interim-ack (`trailing-text-after-reply`, replyCalled=true):
+//        ONLY the captured-prose bridge delivers there (the flush skips
+//        on reply-called), and its floor is 200 — so short trailing
+//        text after a real reply keeps BLOCKING (no duplicate exists in
+//        that case today).
+//   2. the governing delivery flag is enabled (read by the hook from
+//      its own env): zero-reply needs the turn-flush-safety flag AND
+//      the captured-prose flag (the bridge is the capture-divergence
+//      backstop when the gateway captured empty); interim-ack needs the
+//      captured-prose flag. Flag off → the machine won't fire → BLOCK.
+//   3. retryCount === 0 — a prior failed delivery must fall back to
+//      today's BLOCK, preserving the #3228 send-failure recovery net.
+//   4. gateway liveness — the gateway heartbeat file must be FRESH.
+//      Allowing into a dead gateway is the one drop worse than a
+//      duplicate; when liveness can't be established, BLOCK.
+//
+// Pure and deterministic: the hook wrapper does the IO (env read, stat,
+// state-file write) and maps this verdict to exit-0-allow vs
+// decision:block.
+
+/**
+ * @param {{
+ *   scan: ReturnType<typeof scanTurnForFinalReply>,
+ *   retryCount: number,
+ *   turnFlushSafetyEnabled: boolean,
+ *   capturedProseDeliveryEnabled: boolean,
+ *   gatewayLive: boolean,
+ * }} input
+ * @returns {{ action: 'allow-scan' | 'allow-elected' | 'block', reason: string }}
+ */
+export function decideStopHookDisposition(input) {
+  const {
+    scan,
+    retryCount,
+    turnFlushSafetyEnabled,
+    capturedProseDeliveryEnabled,
+    gatewayLive,
+  } = input
+  if (scan == null || scan.decided !== 'block') {
+    return { action: 'allow-scan', reason: `scan-${scan?.decided ?? 'unknown'}` }
+  }
+  // Gate 4 — never allow into a possibly-dead gateway.
+  if (gatewayLive !== true) {
+    return { action: 'block', reason: 'gateway-liveness-not-fresh' }
+  }
+  // Gate 3 — a retry ladder already in flight means a prior delivery
+  // attempt failed; today's BLOCK is the recovery net (#3228).
+  if (retryCount !== 0) {
+    return { action: 'block', reason: 'retry-ladder-in-flight' }
+  }
+  if (scan.reason === 'no-final-reply') {
+    // Gate 2 (zero-reply): the turn-end flush is the delivery machine;
+    // the captured-prose bridge is the capture-divergence backstop.
+    if (!turnFlushSafetyEnabled) {
+      return { action: 'block', reason: 'turn-flush-flag-disabled' }
+    }
+    if (!capturedProseDeliveryEnabled) {
+      return { action: 'block', reason: 'captured-prose-flag-disabled' }
+    }
+    // Gate 1 (zero-reply): any non-empty non-silent trailing prose.
+    if (scan.hasTrailingProse !== true) {
+      return { action: 'block', reason: 'no-trailing-prose' }
+    }
+    return { action: 'allow-elected', reason: 'flush-will-deliver' }
+  }
+  if (scan.reason === 'trailing-text-after-reply') {
+    // Gate 2 (interim-ack): only the captured-prose bridge delivers here.
+    if (!capturedProseDeliveryEnabled) {
+      return { action: 'block', reason: 'captured-prose-flag-disabled' }
+    }
+    // Gate 1 (interim-ack): the bridge's substance floor is 200 chars
+    // (CAPTURED_PROSE_MIN_CHARS, silent-end.ts). Below it the bridge
+    // will NOT deliver — keep blocking (matches today: no duplicate
+    // exists for short trailing text after a real reply).
+    if (
+      typeof scan.pendingText !== 'string' ||
+      scan.pendingText.trim().length < FINAL_ANSWER_MIN_CHARS
+    ) {
+      return { action: 'block', reason: 'short-trailing-after-reply' }
+    }
+    return { action: 'allow-elected', reason: 'bridge-will-deliver' }
+  }
+  // Unknown block reason — conservatively keep today's behaviour.
+  return { action: 'block', reason: `unrecognized-scan-reason-${scan.reason}` }
+}
+
+/**
+ * Mirror of `isTurnFlushSafetyEnabled` (`turn-flush-safety.ts:392-400`).
+ * Kept in this .mjs so the hook is self-contained (no TS import); MUST
+ * stay in sync — default ON, disabled by `0` / `false` / `off` / `no`.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {boolean}
+ */
+export function isTurnFlushSafetyEnabledEnv(env) {
+  const raw = env.SWITCHROOM_TG_TURN_FLUSH_SAFETY
+  if (raw == null) return true
+  const v = raw.trim().toLowerCase()
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no')
+}
+
+/**
+ * Mirror of `CAPTURED_PROSE_DELIVERY_ENABLED` (`gateway/gateway.ts` —
+ * `SWITCHROOM_TG_CAPTURED_PROSE_DELIVERY !== '0'`). MUST stay in sync.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {boolean}
+ */
+export function isCapturedProseDeliveryEnabledEnv(env) {
+  return env.SWITCHROOM_TG_CAPTURED_PROSE_DELIVERY !== '0'
+}
+
+// MUST stay in sync with gateway/gateway-heartbeat.ts (the hook is a
+// standalone .mjs and can't import the TS module). The gateway touches
+// the file every GATEWAY_HEARTBEAT_INTERVAL_MS (15s); freshness bound is
+// 4 intervals — conservative against scheduler jitter, small enough that
+// a dead gateway is detected before its stale heartbeat can swallow more
+// than one turn's election.
+export const GATEWAY_HEARTBEAT_FILE = 'gateway-heartbeat'
+export const GATEWAY_HEARTBEAT_FRESH_MS = 60_000
+
+/**
+ * Gate 4 IO helper: is the gateway heartbeat file fresh? Missing,
+ * unstattable, or stale ⇒ false (BLOCK — never allow into a possibly-
+ * dead gateway).
+ *
+ * @param {string} stateDir
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+export function isGatewayHeartbeatFresh(stateDir, now = Date.now()) {
+  try {
+    const st = statSync(join(stateDir, GATEWAY_HEARTBEAT_FILE))
+    return now - st.mtimeMs <= GATEWAY_HEARTBEAT_FRESH_MS
+  } catch {
+    return false
+  }
 }

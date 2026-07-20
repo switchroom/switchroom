@@ -184,13 +184,20 @@ describe('scanTurnForFinalReply — final-reply detection', () => {
     expect(r.pendingText).toBe(trailing)
   })
 
-  it('Option A: a SHORT trailing/only fragment does NOT set pendingText (substance floor)', () => {
-    // A genuinely empty-ish turn: a short plain-text closer under the 200-char
-    // floor must not be re-delivered as if it were the answer.
-    const text = jsonl(ENQUEUE, assistantText('ok done, let me know if you need anything else'))
+  it('Option A: a SHORT single trailing fragment (zero-reply) IS persisted for the lowered-floor corner', () => {
+    // Post duplicate-message fix: a single short plain-text block in the
+    // ZERO-reply case is the real short-answer shape, so the scan persists it
+    // as pendingText for the capture-divergence corner (gateway captured empty →
+    // the bridge delivers with a lowered floor). Under the gateway's DEFAULT
+    // 200-char floor it is still NOT delivered, so the substance guard holds at
+    // the delivery layer.
+    const short = 'ok done, let me know if you need anything else'
+    const text = jsonl(ENQUEUE, assistantText(short))
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
-    expect(r.pendingText).toBeUndefined()
+    expect(r.reason).toBe('no-final-reply')
+    expect(r.pendingText).toBe(short)
+    expect(r.hasTrailingProse).toBe(true)
   })
 
   it('notification-bearing reply → allow', () => {
@@ -447,9 +454,12 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
       const text = jsonl(ENQUEUE, assistantText('X'.repeat(n)))
       return scanTurnForFinalReply(text)
     }
-    // 199 → under floor, no pendingText (block still fires for the zero-delivery
-    // turn, but there is nothing substantive to deliver).
-    expect(at(199).pendingText).toBeUndefined()
+    // 199 → under the 200-char SUBSTANCE floor, but a SINGLE trailing block is
+    // the real short-answer shape: post duplicate-message fix the scan persists
+    // it as pendingText so the capture-divergence corner can deliver it with a
+    // lowered floor. The gateway's default-floor decide still won't deliver it,
+    // so the #3228 masquerade guard is unchanged at the delivery layer.
+    expect(at(199).pendingText).toBe('X'.repeat(199))
     // 200 → exactly the floor, delivered.
     expect(at(200).pendingText).toBe('X'.repeat(200))
     // 201 → over floor, delivered.

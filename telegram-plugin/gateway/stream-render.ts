@@ -2018,6 +2018,23 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           // represent. The delivery closes the obligation + records dedup, so
           // the represent and a late reply-tool retry are both suppressed —
           // captured-prose delivery and represent are mutually exclusive.
+          // Capture-divergence corner (duplicate-message fix): when this is a
+          // ZERO-reply silent-end AND the gateway's OWN capture came up empty
+          // (so `decideTurnFlush` had nothing to flush — its 'empty-text'
+          // skip), the captured-prose bridge is the ONLY delivery machine
+          // left. The Stop hook scanned the transcript and DID find the
+          // model's short trailing answer, persisting it as `pendingText`. In
+          // that corner the 200-char substance floor would wrongly drop a
+          // legitimately-short answer that no other machine can deliver, so
+          // lower the floor to 1. This is scoped tightly: only when the model
+          // never called reply (`replyCalled === false`) AND the gateway
+          // captured nothing — the interim-ack case (replyCalled) keeps the
+          // full 200 floor (a short closer after a real reply is not a dropped
+          // answer, and the hook already refuses to persist <200 there).
+          const gatewayCapturedEmpty =
+            turn.capturedText.join('\n\n').trim().length === 0
+          const proseMinChars =
+            !turn.replyCalled && gatewayCapturedEmpty ? 1 : CAPTURED_PROSE_MIN_CHARS
           const proseDecision = CAPTURED_PROSE_DELIVERY_ENABLED
             ? decideCapturedProseDelivery({
                 turnKey: tKey,
@@ -2025,7 +2042,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
                 // belong to THIS turn, not a stale carryover from a prior turn
                 // on the same chat/thread (tKey is not per-turn unique).
                 turnId: turn.turnId,
-                minChars: CAPTURED_PROSE_MIN_CHARS,
+                minChars: proseMinChars,
               })
             : { deliver: false as const, reason: 'no-state' as const }
           if (proseDecision.deliver && proseDecision.text != null) {
