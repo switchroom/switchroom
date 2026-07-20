@@ -78,7 +78,6 @@ Bot API 10.1 rich messages.
 | Subscript | `~text~` (single tilde) | **Falls back to literal text** in rich messages (Bot API 10.1) — the only GFM construct that doesn't render. Avoid. |
 | Superscript | `^text^` | **Falls back to literal text** in rich messages — avoid (use words, e.g. "squared"). |
 | Custom emoji | Telegram premium custom-emoji entity | Premium-only; renders as a normal emoji for non-premium viewers. Don't rely on it conveying meaning. |
-| Inline math | `$ … $` | LaTeX-style inline math (Bot API 10.1). |
 | Link | `[label](https://…)` | Standard GFM link. |
 
 **Block types**
@@ -99,15 +98,12 @@ Bot API 10.1 rich messages.
 - **Section heading** — `#` … `######`. Only in a genuinely long, multi-section answer.
 - **Preformatted block** — a code fence with no language, for fixed-width non-code
   (ASCII tables, aligned columns).
-- **Details / collapsible** — Bot API 10.1 collapsible section. For optional depth the
-  reader can expand (full logs under a one-line summary).
 - **Collage / slideshow** — multiple images grouped in one message (album / media
   group). Send via the attachment path, not markdown.
 - **Divider** — `---` (thematic break). Heavy horizontal rule between genuinely
   separate sections. Use sparingly.
-- **Footnotes** — GFM `[^1]` reference + `[^1]: …` definition.
 
-> Reach for the exotic spans (spoiler, highlight, math, custom emoji) only when they
+> Reach for the exotic spans (spoiler, highlight, custom emoji) only when they
 > genuinely serve the reader. The floor card's "why" applies: structure for the reader,
 > not the writer. Two constructs do NOT render as intended and should be avoided:
 > **sub/superscript** falls back to literal text, and **underline (`__text__`) renders

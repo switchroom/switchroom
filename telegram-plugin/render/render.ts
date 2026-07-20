@@ -1,6 +1,7 @@
-// IR -> Telegram rich-markdown renderer for the Telegram HTML render engine
-// (name kept for continuity with render/ir.ts + render/parse.ts; the actual
-// wire format is GFM markdown, NOT HTML — see the note below).
+// IR -> Telegram rich-markdown renderer. (The render/ir.ts + render/parse.ts
+// files were originally named for an "HTML render engine"; that name is
+// historical — the actual wire format is GFM markdown, NOT HTML. See the note
+// below and the refreshed header in render/ir.ts.)
 //
 // Increment 2 of the render pipeline: takes the typed IR produced by
 // `parse.ts` (per `ir.ts`) and emits a string suitable for the `markdown`
@@ -67,6 +68,11 @@ function renderInline(node: Inline, ctx: InlineCtx = {}): string {
     case "italic":
       return `*${renderInlineChildren(node.children, ctx)}*`;
     case "underline":
+      // The wire renders `__…__` as BOLD, not underline — Telegram's
+      // rich-message markdown has no underline token (live-verified; see
+      // reference/telegram-formatting-guide.md). We preserve the author's `__`
+      // bytes faithfully rather than rewriting them to `**`; the IR keeps
+      // underline as a distinct node, but it is NOT a distinct wire style.
       return `__${renderInlineChildren(node.children, ctx)}__`;
     case "strike":
       return `~~${renderInlineChildren(node.children, ctx)}~~`;
@@ -284,6 +290,9 @@ export const SUPPORTED_INLINE = [
   "plain",
   "bold",
   "italic",
+  // "underline" parses `__…__` into a distinct node and round-trips it, but the
+  // wire renders it as BOLD (no underline token on this path). Kept for faithful
+  // `__` byte round-trip, NOT because it is a distinct rendered style.
   "underline",
   "strike",
   "spoiler",
