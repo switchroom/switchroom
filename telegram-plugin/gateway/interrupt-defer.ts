@@ -67,6 +67,18 @@ export class ToolFlightTracker {
     return this.inFlight.size
   }
 
+  /**
+   * Drop a single in-flight tool by id. Used when the per-tool-call deadline
+   * force-fails a wedged tool: the gateway injects a synthetic tool_result and
+   * must clear THIS tool's masked flight entry so `isMidToolCall()` stops
+   * classifying the hang as healthy work (which otherwise defers the
+   * silence-poke fallback to its 15-min ceiling). Idempotent — dropping an
+   * absent id is a no-op. Returns true when an entry was removed.
+   */
+  drop(toolUseId: string): boolean {
+    return this.inFlight.delete(toolUseId)
+  }
+
   clear(): void {
     this.inFlight.clear()
   }

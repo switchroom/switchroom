@@ -243,6 +243,14 @@ import {
   distinctRequestIds,
 } from './permission-rearm.js'
 import { sweepPermissionTtl } from './permission-ttl-sweep.js'
+import {
+  ToolCallDeadlineTracker,
+  resolveDeadlineConfig,
+  observeToolUse,
+  toolCallDeadlineEnabled,
+  toolCallDeadlineEnforced,
+  sweepToolCallDeadlines,
+} from './tool-call-deadline.js'
 import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
 import {
   createAlwaysAllowPersistQueue,
@@ -4429,6 +4437,13 @@ function postBusyAck(chatId: string, threadId: number | undefined, text: string)
 // stashed inbound, the original deadline is preserved (bounded wait).
 const toolFlightTracker = new ToolFlightTracker()
 
+// Per-tool-call wall-clock deadline (Stage A prevention) — see
+// tool-call-deadline.ts. `standard` tools get a ~120s ceiling; `human` waits
+// (owned by the #2724 permission-TTL sweep) and `background` tools (Task/Agent/
+// long Bash) are excluded. Enforcement is opt-in (SWITCHROOM_TOOL_DEADLINE_ENFORCE=1).
+const toolCallDeadline = new ToolCallDeadlineTracker()
+const TOOL_DEADLINE_CONFIG = resolveDeadlineConfig()
+
 interface PendingDeferredInterrupt {
   agentName: string
   inboundMsg: InboundMessage
@@ -7736,6 +7751,30 @@ const pendingStateReaper = isGatewayMain ? setInterval(() => {  // #2996 P0c gat
 }, 60_000) : undefined
 pendingStateReaper?.unref()
 
+// Stage A: dedicated 5s per-tool-call deadline sweep (the 60s reaper above is
+// too coarse to catch a 120s breach near its ceiling). Decision + logging live
+// in sweepToolCallDeadlines; the gateway owns the timer + the force-fail IO.
+const toolCallDeadlineSweep = isGatewayMain ? setInterval(() => {
+  if (!toolCallDeadlineEnabled()) return
+  try {
+    sweepToolCallDeadlines(toolCallDeadline, Date.now(), TOOL_DEADLINE_CONFIG, {
+      enforce: toolCallDeadlineEnforced(),
+      log: (l) => process.stderr.write(`telegram gateway: ${l}\n`),
+      onForceFail: (b) => {
+        toolFlightTracker.drop(b.toolUseId)
+        if (currentTurn != null) {
+          silencePoke.noteToolEnd(
+            statusKey(currentTurn.sessionChatId, currentTurn.sessionThreadId),
+            b.toolUseId, Date.now())
+        }
+      },
+    })
+  } catch (err) {
+    process.stderr.write(`telegram gateway: [tool-deadline] sweep failed: ${(err as Error).message}\n`)
+  }
+}, 5_000) : undefined
+toolCallDeadlineSweep?.unref()
+
 /**
  * Does a message look like a Claude setup-token browser code?
  *
@@ -10814,6 +10853,10 @@ if (isGatewayMain) ipcServer = createIpcServer({
     // interrupt is parked waiting for a clean boundary and this event drains
     // the last in-flight tool, fire it now rather than waiting out the timer.
     toolFlightTracker.onEvent(ev)
+    // Stage A: a new turn starts clean; a killed turn may never emit trailing
+    // tool_results — mirror ToolFlightTracker's clear so stale deadlines don't
+    // leak across turns.
+    if (ev.kind === 'turn_end' || ev.kind === 'enqueue') toolCallDeadline.clear()
     if (pendingDeferredInterrupt != null && !toolFlightTracker.isMidToolCall()) {
       void fireDeferredInterrupt('boundary')
     }
@@ -10856,6 +10899,8 @@ if (isGatewayMain) ipcServer = createIpcServer({
             label.length > 0 ? label : null,
             Date.now(),
           )
+          // Stage A: track this tool against its per-call deadline.
+          observeToolUse(toolCallDeadline, ev.toolUseId, ev.toolName, ev.input, Date.now())
           // #1445 cross-turn pending-async ambient. Mark the chat as
           // having dispatched background work this turn so a turn_end
           // that follows activates the edit-in-place ambient line.
@@ -10878,6 +10923,10 @@ if (isGatewayMain) ipcServer = createIpcServer({
         // (covers Telegram-surface tools we skipped at start time).
         if (ev.toolUseId != null && ev.toolUseId.length > 0) {
           silencePoke.noteToolEnd(key, ev.toolUseId, Date.now())
+          // Stage A per-toolUseId guard: a real result arriving after a
+          // force-fail returns false (already stood in for) — drop, don't
+          // double-process. Bookkeeping-only here (silence-poke already drained).
+          if (toolCallDeadlineEnabled()) toolCallDeadline.noteResult(ev.toolUseId)
         }
       }
     }

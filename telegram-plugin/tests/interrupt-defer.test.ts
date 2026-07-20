@@ -62,6 +62,20 @@ describe('ToolFlightTracker', () => {
     expect(t.isMidToolCall()).toBe(false)
   })
 
+  it('drop(id) clears a single masked entry (used by the deadline force-fail)', () => {
+    const t = new ToolFlightTracker()
+    t.onEvent({ kind: 'tool_use', toolUseId: 'tu_1' })
+    t.onEvent({ kind: 'tool_use', toolUseId: 'tu_2' })
+    expect(t.drop('tu_1')).toBe(true)
+    // tu_2 still open — the boundary is still unsafe.
+    expect(t.isMidToolCall()).toBe(true)
+    expect(t.inFlightCount()).toBe(1)
+    // Dropping the last one clears the boundary; dropping an absent id is a no-op.
+    expect(t.drop('tu_2')).toBe(true)
+    expect(t.isMidToolCall()).toBe(false)
+    expect(t.drop('tu_1')).toBe(false)
+  })
+
   it('ignores sub-agent and non-tool events', () => {
     const t = new ToolFlightTracker()
     t.onEvent({ kind: 'sub_agent_tool_use', toolUseId: 'sub_1' })
