@@ -40,6 +40,47 @@ export function handleWorkerResume(
   log(`telegram gateway: worker ${agentId} card RE-SURFACED — resumed via SendMessage after a genuine terminal (issue #3373)`)
 }
 
+/**
+ * Worker-feed origin-race defer decision (issue: DM-misrouted worker card).
+ *
+ * The gateway picks a worker card's destination on the FIRST progress tick of
+ * a new sub-agent. That tick can beat the async `jsonl_agent_id` backfill that
+ * links the sub-agent's registry row to its origin turn (retried ~every 3s).
+ * Until the link lands, origin resolution returns null and the gateway's
+ * `resolveWorkerFeedChat` hard-falls back to the owner DM — CREATING the card
+ * there. The origin (supergroup + forum topic) resolves ~3s later, but the DM
+ * card already exists and stays the visible one.
+ *
+ * Decision: DEFER card creation while the agent is not yet linked to its
+ * origin AND no card exists yet for it. The subagent-watcher re-fires within
+ * seconds; once the backfill completes the origin resolves and the card is
+ * created in the correct chat+topic. Only CARD CREATION is deferred — if a
+ * card already exists, updates always proceed (`defer:false`). A bounded
+ * counter caps the wait: after `maxDeferrals` unlinked ticks (pathological
+ * backfill failure) it stops deferring so active work always gets a card.
+ *
+ * Pure so the seam is unit-testable — see worker-feed-dispatch.test.ts. The
+ * gateway must never inline this decision again.
+ */
+export function decideWorkerFeedOriginDefer(input: {
+  /** True once `resolveSubagentOriginChat` returns a chat (row linked). */
+  originResolved: boolean
+  /** True if the feed already has a posted message for this worker. */
+  cardExists: boolean
+  /** Consecutive prior deferrals for this agent (0 on the first tick). */
+  priorDeferrals: number
+  /** Max consecutive deferrals before painting anyway. */
+  maxDeferrals: number
+}): { defer: boolean; deferrals: number } {
+  const { originResolved, cardExists, priorDeferrals, maxDeferrals } = input
+  // A card already exists, or the origin has resolved: never defer.
+  if (originResolved || cardExists) return { defer: false, deferrals: 0 }
+  const deferrals = priorDeferrals + 1
+  // Bounded: stop deferring once we've waited long enough for the backfill.
+  if (deferrals >= maxDeferrals) return { defer: false, deferrals }
+  return { defer: true, deferrals }
+}
+
 export interface WorkerFeedDispatch {
   /** True when the sub-agent was dispatched with `run_in_background: true`. */
   isBackground: boolean
