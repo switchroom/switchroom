@@ -251,6 +251,17 @@ interface QuotaEntry {
   premium_wall_bucket?: string;
   /** Unix ms when the tier-wall mark was written (most-recent-signal-wins). */
   premium_wall_marked_at?: number;
+  /** Entitlement-403 hard block: Anthropic returned a 403 whose body says the
+   *  org/subscription has DISABLED Claude Code access ("Your organization has
+   *  disabled Claude subscription access for Claude Code"). Unlike a util wall
+   *  this is a hard account-level block — the account can NEVER serve until the
+   *  org re-enables Code access. Set on an entitlement-403 probe; cleared by ANY
+   *  later successful probe. */
+  entitlement_blocked?: boolean;
+  /** Unix ms when the entitlement block was marked. */
+  entitlement_blocked_at?: number;
+  /** The API error message that triggered the mark, for operator messaging. */
+  entitlement_blocked_reason?: string;
 }
 interface QuotaState {
   [label: string]: QuotaEntry;
@@ -1512,7 +1523,69 @@ export class AuthBroker {
       snapshot: this.lastQuotaCache[account],
       now: this.now(),
       allowOverage: this.isOverageAllowed(account),
+      entitlementBlocked: this.isAccountEntitlementBlocked(account),
     });
+  }
+
+  /* ─── Entitlement-403 hard block (Claude Code access disabled) ─── */
+
+  /** True when the account carries an entitlement-403 mark (org/subscription
+   *  disabled Claude Code access). A hard account-level block — never serves. */
+  private isAccountEntitlementBlocked(account: string): boolean {
+    return this.quota[account]?.entitlement_blocked === true;
+  }
+
+  /**
+   * Persist an entitlement-403 mark from a FAILED probe. No-op unless the
+   * failure is classified `entitlement_blocked` (a bad-scope 403 / transient
+   * failure stays a no-op — the legacy behaviour). Idempotent: a label already
+   * marked doesn't re-persist or re-audit. The mark is cleared by any later
+   * successful probe (see {@link cacheQuotaSnapshot} → {@link clearEntitlementBlocked}).
+   */
+  private markEntitlementBlocked(label: string, result: QuotaResult): void {
+    if (result.ok || result.failureKind !== "entitlement_blocked") return;
+    if (this.quota[label]?.entitlement_blocked === true) return;
+    this.quota[label] = {
+      ...this.quota[label],
+      entitlement_blocked: true,
+      entitlement_blocked_at: this.now(),
+      ...(result.apiErrorMessage
+        ? { entitlement_blocked_reason: result.apiErrorMessage }
+        : {}),
+    };
+    this.persistQuota();
+    this.audit({
+      op: "mark-exhausted",
+      identity: { kind: "operator" },
+      account: label,
+      accountKind: "claude",
+      ok: true,
+      reason: "entitlement-403",
+    });
+    process.stdout.write(
+      `auth-broker: ${label} returned entitlement-403 (Claude Code access disabled) — marked entitlement_blocked${result.apiErrorMessage ? ` (${result.apiErrorMessage})` : ""}\n`,
+    );
+  }
+
+  /** Clear an entitlement-403 mark. Called on ANY successful probe (the org
+   *  re-enabled Code access, or the 403 was transient). No-op when unmarked. */
+  private clearEntitlementBlocked(label: string): void {
+    const entry = this.quota[label];
+    if (!entry?.entitlement_blocked) return;
+    const {
+      entitlement_blocked,
+      entitlement_blocked_at,
+      entitlement_blocked_reason,
+      ...rest
+    } = entry;
+    void entitlement_blocked;
+    void entitlement_blocked_at;
+    void entitlement_blocked_reason;
+    this.quota[label] = rest;
+    this.persistQuota();
+    process.stdout.write(
+      `auth-broker: live probe of ${label} succeeded — cleared entitlement_blocked mark\n`,
+    );
   }
 
   /* ─── Model-tier (7d_oi / seven_day_overage_included) wall (#3176) ─── */
@@ -1812,6 +1885,7 @@ export class AuthBroker {
         snapshot,
         now,
         allowOverage: true,
+        entitlementBlocked: this.isAccountEntitlementBlocked(account),
       }) === "eligible"
     );
   }
@@ -1832,6 +1906,7 @@ export class AuthBroker {
       snapshot,
       now: this.now(),
       allowOverage,
+      entitlementBlocked: this.isAccountEntitlementBlocked(account),
     });
     // Observability: when an account is being served past the utilization wall
     // because overage lifted it, emit a log so the operator can see that
@@ -1867,6 +1942,10 @@ export class AuthBroker {
       if (!token) return;
       const result = await this.probeQuotaSingleFlight(account, token);
       if (result.ok) this.cacheQuotaSnapshot(account, result);
+      // An entitlement-403 (Claude Code access disabled) is a hard block — mark
+      // it so this force-probe of an `unknown` candidate can never route onto a
+      // disabled account. Any other failure stays the legacy no-op.
+      else this.markEntitlementBlocked(account, result);
     } catch {
       // Probe failures stay no-ops — the candidate remains `unknown` and is
       // handled as a last-resort by the selector, never a hard block.
@@ -2095,11 +2174,6 @@ export class AuthBroker {
         // this account. false → RETIRED (removed from rotation); the views
         // render it as such instead of "available".
         in_service: inService.has(label),
-        // #org-disable — populated by PR2 (the entitlement/org-level block
-        // probe). Left false here; a pre-PR2 broker reports every account
-        // un-blocked, and RETIRED classification works standalone off
-        // `in_service` regardless.
-        entitlement_blocked: false,
         exhausted_until: q?.exhausted_until,
         // 429 throttle tier — raw ledger value for transparency (consumers
         // compare against their own clock). Never feeds `exhausted`.
@@ -2115,6 +2189,9 @@ export class AuthBroker {
         premium_walled_until: q?.premium_walled_until,
         premium_wall_bucket: q?.premium_wall_bucket,
         last_tier_quota: this.lastTierQuotaCache[label] ?? null,
+        // Entitlement-403 hard block: org/subscription disabled Claude Code
+        // access. Renderers (PR1) show DISABLED off this flag.
+        entitlement_blocked: q?.entitlement_blocked ?? false,
         // #3185 — rolling per-tier usage summary (refill-normalized) so the
         // operator/dashboard can answer "how much Fable is left" instantly.
         usage_ledger: summarizeAccountUsage(this.usageLedger, label, this.now()),
@@ -2274,6 +2351,12 @@ export class AuthBroker {
           this.cacheQuotaSnapshot(label, result);
           return { label, result, served: "live" };
         }
+        // An entitlement-403 (org disabled Claude Code access) is a real,
+        // durable account-level block — persist it so a failed probe is NOT the
+        // silent no-op that serves the stale cache. Eligibility + list-state
+        // then surface DISABLED instead of decaying to "unknown". Any other
+        // failure stays a no-op (legacy behaviour).
+        this.markEntitlementBlocked(label, result);
         // #2495 Change 2 — probe FAILED. If we have a prior snapshot, serve it
         // age-stamped (served:"cache") so the card renders an explicit
         // "⚠ cached Nm ago" warning instead of a false live stamp.
@@ -2314,6 +2397,10 @@ export class AuthBroker {
    *  periodic fleet tick so the snapshot shape stays in one place. */
   private cacheQuotaSnapshot(label: string, result: QuotaResult): void {
     if (!result.ok) return;
+    // A successful probe is proof the account is reachable again — clear any
+    // entitlement-403 hard block (the org re-enabled Code access, or the 403 was
+    // transient). Done before caching so list-state/eligibility see it lifted.
+    this.clearEntitlementBlocked(label);
     const snapshot = {
       fiveHourUtilizationPct: result.data.fiveHourUtilizationPct,
       sevenDayUtilizationPct: result.data.sevenDayUtilizationPct,
@@ -2390,6 +2477,12 @@ export class AuthBroker {
     const canarySet = this.premiumCanarySet();
     const canaryEnabled = process.env.SWITCHROOM_DISABLE_MODEL_TIER_PROBE !== "1";
     for (const label of listAccounts(this.home)) {
+      // Skip a hard entitlement-blocked account: its 403 (org disabled Claude
+      // Code access) won't clear by re-probing — the org must re-enable access —
+      // so each tick probe is a wasted billable call against a dead account. An
+      // explicit manual re-probe (opProbeQuota) still runs and clears the mark
+      // on success.
+      if (this.isAccountEntitlementBlocked(label)) continue;
       const creds = readAccountCredentials(label, this.home);
       const token = creds?.claudeAiOauth?.accessToken;
       if (!token) continue;
@@ -2401,6 +2494,9 @@ export class AuthBroker {
         continue;
       }
       this.cacheQuotaSnapshot(label, result);
+      // An entitlement-403 from the tick probe is a hard block — mark it (and
+      // skip this account on subsequent ticks). Any other failure is a no-op.
+      this.markEntitlementBlocked(label, result);
       probed.push({ label, result });
       // #3176 — flagship-tier canary. The default haiku probe above CANNOT see
       // the per-tier 7d_oi wall (haiku is `allowed` while flagship is
@@ -4897,9 +4993,11 @@ export class AuthBroker {
      *                           probe (429 throttle tier escalation guard)
      *   "model-tier-wall"     — flagship-tier (7d_oi) canary saw the account
      *                           walled on the premium tier (#3176)
+     *   "entitlement-403"     — a 403 whose body says the org/subscription has
+     *                           disabled Claude Code access (hard block)
      * Omitted for every other op.
      */
-    reason?: "soft-avoid" | "hard-exhaustion" | "throttle-escalation" | "model-tier-wall";
+    reason?: "soft-avoid" | "hard-exhaustion" | "throttle-escalation" | "model-tier-wall" | "entitlement-403";
   }): void {
     const peer =
       entry.identity.kind === "operator"

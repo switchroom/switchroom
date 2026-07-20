@@ -256,8 +256,23 @@ export function accountEligibility(opts: {
   now: number;
   /** True when this account is in `auth.allow_overage_accounts`. Default false. */
   allowOverage?: boolean;
+  /**
+   * Entitlement-403 hard block (org/subscription disabled Claude Code access).
+   * When true this account is UNCONDITIONALLY `blocked` — evaluated FIRST, ahead
+   * of any snapshot/mark/overage logic, so a 403 account can never be selected
+   * even off a stale healthy cache or an overage opt-in. Cleared only when a
+   * later successful probe drops the mark (the broker deletes it, so this arg
+   * goes false). Default false. Defense-in-depth: the fleet tick also benches
+   * the account, but this guarantees it at the decision layer too.
+   */
+  entitlementBlocked?: boolean;
 }): AccountEligibility {
-  const { mark, snapshot, now, allowOverage = false } = opts;
+  const { mark, snapshot, now, allowOverage = false, entitlementBlocked = false } = opts;
+
+  // Entitlement-403 is a HARD account-level block: the account is disabled for
+  // Claude Code at the org/subscription level and cannot serve regardless of how
+  // healthy a (necessarily stale) quota snapshot reads. Decide it first.
+  if (entitlementBlocked) return "blocked";
 
   // F4b — a FRESH snapshot that POSITIVELY shows a hard wall (and is not
   // overage-lifted) is the strongest live truth there is. It must NOT be
@@ -323,6 +338,8 @@ export function isAccountBlocked(opts: {
   now: number;
   /** True when this account is in `auth.allow_overage_accounts`. Default false. */
   allowOverage?: boolean;
+  /** Entitlement-403 hard block — see {@link accountEligibility}. Default false. */
+  entitlementBlocked?: boolean;
 }): boolean {
   return accountEligibility(opts) === "blocked";
 }
