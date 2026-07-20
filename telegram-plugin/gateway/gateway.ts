@@ -953,7 +953,7 @@ import {
 import { findAgentProcessInContainer } from './boot-probes.js'
 import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
 import type { InterruptedSubagent } from './resume-inbound-builder.js'
-import { resolveWorkerFeedDispatch, decideWorkerFeedOriginDefer, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
+import { resolveWorkerFeedDispatch, decideWorkerFeedDestination, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
   resolveSubagentStatusSurface,
   isOrphanSubagentStatusEnabled,
@@ -2180,6 +2180,20 @@ const WORKER_FEED_GROUP_MESSAGE_LIFETIME_CAP_MS = (() => {
 })()
 const workerFeedOwnerDmFallbackLogged = new Set<string>()
 
+// Once-per-agent owner-DM-fallback routing line (bounded FIFO set). Shared by
+// `resolveWorkerFeedChat` and the origin-defer paint path so both log alike.
+function noteWorkerFeedOwnerDmFallback(agentId: string): void {
+  if (workerFeedOwnerDmFallbackLogged.has(agentId)) return
+  workerFeedOwnerDmFallbackLogged.add(agentId)
+  if (workerFeedOwnerDmFallbackLogged.size > WORKER_FEED_FALLBACK_LOG_CAP) {
+    const oldest = workerFeedOwnerDmFallbackLogged.values().next().value
+    if (oldest != null) workerFeedOwnerDmFallbackLogged.delete(oldest)
+  }
+  process.stderr.write(
+    `telegram gateway: worker-feed origin unresolved agent=${agentId} — routing card to owner DM\n`,
+  )
+}
+
 // Per-agent consecutive origin-race deferrals (rationale in
 // `decideWorkerFeedOriginDefer`, worker-feed-dispatch.ts). Bounds the wait for
 // the `jsonl_agent_id` backfill; deleted on link, card-exists, and finish/drop
@@ -2221,20 +2235,8 @@ function resolveWorkerFeedChat(
   if (fleetChatId.length > 0) return { chatId: fleetChatId, threadId: fallbackThreadId }
   const ownerDm = loadAccess().allowFrom[0] ?? ''
   if (origin == null && fleetChatId.length === 0 && ownerDm.length > 0) {
-    // Routing decision, not a warning: origin resolution failed and no
-    // fleet chat is configured, so the nested worker's card lands in the
-    // owner DM. Logged ONCE per agent so the misroute is auditable
-    // without spamming every tick (the watcher drives onProgress ~1/s).
-    if (!workerFeedOwnerDmFallbackLogged.has(agentId)) {
-      workerFeedOwnerDmFallbackLogged.add(agentId)
-      if (workerFeedOwnerDmFallbackLogged.size > WORKER_FEED_FALLBACK_LOG_CAP) {
-        const oldest = workerFeedOwnerDmFallbackLogged.values().next().value
-        if (oldest != null) workerFeedOwnerDmFallbackLogged.delete(oldest)
-      }
-      process.stderr.write(
-        `telegram gateway: worker-feed origin unresolved agent=${agentId} — routing card to owner DM\n`,
-      )
-    }
+    // Origin unresolved and no fleet chat — the card lands in the owner DM.
+    noteWorkerFeedOwnerDmFallback(agentId)
   }
   return { chatId: ownerDm, threadId: origin?.threadId ?? fallbackThreadId }
 }
@@ -24908,53 +24910,48 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // resolved (the pinned-card fleet that used to carry the chat
                 // is gone — see resolveSubagentOriginChat).
                 if (workerFeedEnabled) {
-                  // Origin-race defer (decideWorkerFeedOriginDefer): the first
-                  // tick of a fresh sub-agent can beat the async jsonl_agent_id
-                  // backfill that links its row to the origin turn — resolving
-                  // origin to null and CREATING the card in the owner DM, which
-                  // then stays visible even after the origin (supergroup + forum
-                  // topic) resolves ~3s later. Defer CARD CREATION until linked;
-                  // the watcher re-fires and paints in the correct chat+topic.
-                  const originResolved = resolveSubagentOriginChat(agentId) != null
-                  const cardExists = workerActivityFeed?.has(agentId) === true
-                  const { defer, deferrals } = decideWorkerFeedOriginDefer({
-                    originResolved,
-                    cardExists,
+                  // Origin-race defer + destination (decideWorkerFeedDestination,
+                  // worker-feed-dispatch.ts): the first tick of a fresh sub-agent
+                  // can beat the async jsonl_agent_id backfill that links its row
+                  // to the origin turn — origin resolves null and the card would be
+                  // CREATED in the owner DM, staying visible even after the origin
+                  // (supergroup + forum topic) resolves ~3s later. Defer CARD
+                  // CREATION until linked; the watcher re-fires and paints in the
+                  // right chat+topic. The FULL decision (defer-or-paint AND the
+                  // chat/thread resolution `resolveWorkerFeedChat` did) is now one
+                  // pure, unit-tested function; the gateway keeps only the defer-map
+                  // bookkeeping, the two audit logs, and the feed.update.
+                  const dest = decideWorkerFeedDestination({
+                    origin: resolveSubagentOriginChat(agentId),
+                    cardExists: workerActivityFeed?.has(agentId) === true,
                     priorDeferrals: workerFeedOriginDeferrals.get(agentId) ?? 0,
                     maxDeferrals: WORKER_FEED_ORIGIN_DEFER_MAX,
+                    fleetChatId,
+                    stampChatId: stampTurn?.sessionChatId,
+                    stampThreadId: stampTurn?.sessionThreadId,
+                    ownerDm: loadAccess().allowFrom[0] ?? '',
                   })
-                  if (defer) {
-                    workerFeedOriginDeferrals.set(agentId, deferrals)
-                    // Defer this tick: no card created, no owner-DM fallback.
-                    // The watcher re-fires once the jsonl_agent_id backfill links
-                    // the row to its origin turn, and the card is then created in
-                    // the correct chat+topic.
+                  if (dest.action === 'defer') {
+                    // No card created this tick; the watcher re-fires and paints
+                    // once the jsonl_agent_id backfill links the row to its origin.
+                    workerFeedOriginDeferrals.set(agentId, dest.deferrals)
                     return
                   }
-                  if (!originResolved && !cardExists) {
+                  // Painting: clear defer state so the map can't leak.
+                  workerFeedOriginDeferrals.delete(agentId)
+                  if (dest.exhausted) {
                     // Bounded-defer exhausted — backfill never linked (history
-                    // disabled / row reaped / ancestor never stamped). Stop
-                    // deferring and let the card paint so active work stays
-                    // visible (universal-liveness contract).
+                    // disabled / row reaped / ancestor never stamped). Paint anyway
+                    // so active work stays visible (universal-liveness contract).
                     process.stderr.write(
-                      `telegram gateway: worker-feed origin backfill never linked agent=${agentId} after ${deferrals} deferrals — painting card\n`,
+                      `telegram gateway: worker-feed origin backfill never linked agent=${agentId} after ${dest.deferrals} deferrals — painting card\n`,
                     )
                   }
-                  // Linked (or a card already exists, or defer exhausted): clear
-                  // any defer state so the map can't leak.
-                  workerFeedOriginDeferrals.delete(agentId)
-                  // Prefer the live turn's chat/topic over the owner DM if we do
-                  // have to fall back — a misroute at least lands near the work.
-                  const usingStampFallback = fleetChatId.length === 0
-                  const workerFleetChatId = usingStampFallback
-                    ? stampTurn?.sessionChatId ?? fleetChatId
-                    : fleetChatId
-                  // Carry the fallback chat's forum topic id (#3458) so the card lands in the origin topic, not General.
-                  const wk = resolveWorkerFeedChat(agentId, workerFleetChatId, usingStampFallback ? stampTurn?.sessionThreadId : undefined)
-                  const wkChat = wk.chatId
+                  // Card fell to the owner DM — log the misroute once per agent.
+                  if (dest.ownerDmFallback) noteWorkerFeedOwnerDmFallback(agentId)
                   void workerActivityFeed?.update(
                     agentId,
-                    wkChat,
+                    dest.chatId,
                     {
                       description: dispatch.feedDescription,
                       lastTool,
@@ -24968,7 +24965,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                       model: feedModel,
                       totalTokens,
                     },
-                    wk.threadId,
+                    dest.threadId,
                   )
                   // #3207: the feed pins the group's shared message itself when
                   // it first paints (reconcilePin → `wk:group:<feedKey>`); no

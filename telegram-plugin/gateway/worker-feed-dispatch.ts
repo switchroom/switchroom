@@ -81,6 +81,104 @@ export function decideWorkerFeedOriginDefer(input: {
   return { defer: true, deferrals }
 }
 
+/**
+ * The FULL worker-feed destination decision for a single onProgress tick,
+ * extracted verbatim from the gateway's inline `onProgress` block (issue
+ * #3460). It folds two concerns that the gateway used to run inline:
+ *
+ *  1. the origin-race defer choice (`decideWorkerFeedOriginDefer`), and
+ *  2. the chat/thread RESOLUTION the gateway's `resolveWorkerFeedChat`
+ *     performed (origin chat → fleet chat / stamp-turn fallback → owner DM),
+ *     including the exhausted-defer stamp-turn forum-thread carry (#3458).
+ *
+ * Returning a plain decision object lets the gateway keep only a thin
+ * delegation (defer-map bookkeeping + the two audit logs + the feed.update)
+ * and gives this whole path REAL regression coverage — the test drives THIS
+ * function, the same code the gateway runs, instead of a hand-rolled replica.
+ *
+ * Pure and side-effect-free: the two audit-log side effects the gateway used
+ * to emit inline (`exhausted`, `ownerDmFallback`) are returned as flags so the
+ * caller performs them against its module-level state. Behavior — routing — is
+ * identical to the prior inline path; only the seam moved.
+ *
+ * Precedence for a PAINT (mirrors `resolveWorkerFeedChat`):
+ *   origin chat (when resolved, non-empty) → fleet chat, else stamp-turn chat
+ *   when no fleet chat is configured (carrying the stamp-turn forum topic) →
+ *   owner DM (durable floor). Never returns an empty chat for a paint unless
+ *   every source is empty.
+ */
+export type WorkerFeedDestination =
+  | { action: 'defer'; deferrals: number }
+  | {
+      action: 'paint'
+      chatId: string
+      threadId: number | undefined
+      /** New consecutive-deferral count to persist (0 once painting resumes). */
+      deferrals: number
+      /** True when painting only because the bounded defer cap was hit and the
+       *  origin never linked — the gateway logs the "never linked" audit line. */
+      exhausted: boolean
+      /** True when the paint fell all the way to the owner DM (origin unresolved
+       *  AND no fleet/stamp chat) — the gateway logs the once-per-agent misroute. */
+      ownerDmFallback: boolean
+    }
+
+export function decideWorkerFeedDestination(input: {
+  /** Resolved origin chat/topic (`resolveSubagentOriginChat`), or null if the
+   *  `jsonl_agent_id` backfill hasn't linked the row to its origin turn yet. */
+  origin: { chatId: string; threadId?: number } | null
+  /** True if the feed already has a posted message for this worker. */
+  cardExists: boolean
+  /** Consecutive prior deferrals for this agent (0 on the first tick). */
+  priorDeferrals: number
+  /** Max consecutive deferrals before painting anyway. */
+  maxDeferrals: number
+  /** The gateway's outer `fleetChatId` (may be empty). */
+  fleetChatId: string
+  /** Live turn's chat (`stampTurn.sessionChatId`) — the stamp-turn fallback
+   *  used only when no fleet chat is configured. */
+  stampChatId?: string
+  /** Live turn's forum topic (`stampTurn.sessionThreadId`), carried on the
+   *  stamp-turn fallback so an exhausted-defer paint lands in the origin
+   *  topic, not General (#3458). */
+  stampThreadId?: number
+  /** Owner DM chat id (`loadAccess().allowFrom[0]`) — the durable floor. */
+  ownerDm: string
+}): WorkerFeedDestination {
+  const { origin, cardExists, priorDeferrals, maxDeferrals, fleetChatId, stampChatId, stampThreadId, ownerDm } = input
+  const originResolved = origin != null
+  const { defer, deferrals } = decideWorkerFeedOriginDefer({
+    originResolved,
+    cardExists,
+    priorDeferrals,
+    maxDeferrals,
+  })
+  if (defer) return { action: 'defer', deferrals }
+  // Painting: exhausted-defer iff we're painting despite no origin and no card.
+  const exhausted = !originResolved && !cardExists
+  // Prefer the live turn's chat/topic over the owner DM when we must fall back
+  // (a misroute at least lands near the work) — only when NO fleet chat is set.
+  const usingStampFallback = fleetChatId.length === 0
+  const workerFleetChatId = usingStampFallback ? stampChatId ?? fleetChatId : fleetChatId
+  const fallbackThreadId = usingStampFallback ? stampThreadId : undefined
+  // resolveWorkerFeedChat precedence:
+  if (origin != null && origin.chatId.length > 0) {
+    return { action: 'paint', chatId: origin.chatId, threadId: origin.threadId, deferrals, exhausted, ownerDmFallback: false }
+  }
+  if (workerFleetChatId.length > 0) {
+    return { action: 'paint', chatId: workerFleetChatId, threadId: fallbackThreadId, deferrals, exhausted, ownerDmFallback: false }
+  }
+  const ownerDmFallback = origin == null && workerFleetChatId.length === 0 && ownerDm.length > 0
+  return {
+    action: 'paint',
+    chatId: ownerDm,
+    threadId: origin?.threadId ?? fallbackThreadId,
+    deferrals,
+    exhausted,
+    ownerDmFallback,
+  }
+}
+
 export interface WorkerFeedDispatch {
   /** True when the sub-agent was dispatched with `run_in_background: true`. */
   isBackground: boolean
