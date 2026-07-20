@@ -113,6 +113,10 @@ function workerFeedTick(
   agentId: string,
   resolveOrigin: () => { chatId: string; threadId?: number } | null,
   view: WorkerActivityView,
+  // The fallback used when origin is unresolved. Mirrors the gateway's
+  // exhausted-defer paint: the live turn's chat + its sibling forum-topic id
+  // (stampTurn.sessionChatId / .sessionThreadId), else the owner DM.
+  fallback: { chatId: string; threadId?: number } = { chatId: OWNER_DM, threadId: undefined },
 ): void {
   const origin = resolveOrigin()
   const originResolved = origin != null
@@ -128,8 +132,9 @@ function workerFeedTick(
     return
   }
   deferrals.delete(agentId)
-  // resolveWorkerFeedChat: origin chat when resolved, else owner DM.
-  const chat = originResolved ? origin! : { chatId: OWNER_DM, threadId: undefined }
+  // resolveWorkerFeedChat: origin chat when resolved, else the fallback
+  // chat AND its forum-topic id (#3458) — never dropping the thread.
+  const chat = originResolved ? origin! : fallback
   void feed.update(agentId, chat.chatId, view, chat.threadId)
 }
 
@@ -214,5 +219,39 @@ describe('worker-feed origin race — outcome: no owner-DM card', () => {
     // here to the owner DM (the only resort when origin never resolves).
     expect(sent.length).toBeGreaterThanOrEqual(1)
     expect(sent.every((s) => s.chatId === OWNER_DM)).toBe(true)
+  })
+
+  it('exhausted-defer (never-backfill) fallback lands in the origin FORUM THREAD, not General (#3458)', async () => {
+    // The backfill never links, so origin stays null through the bounded cap.
+    // In a forum supergroup the gateway paints using the live turn's chat AND
+    // its forum-topic id (stampTurn.sessionChatId / .sessionThreadId). Before
+    // the fix the thread was dropped and the card landed in General (thread
+    // undefined). Assert the thread id is carried to the painted card.
+    let now = 0
+    const sent: SentRecord[] = []
+    const feed = createWorkerActivityFeed({
+      bot: makeRecordingBot(sent),
+      now: () => now,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+    })
+    const deferrals = new Map<string, number>()
+    const agentId = 'neverlinks-forum'
+    const resolveOrigin = () => null // backfill permanently broken
+    // Live turn's chat + forum topic — the exhausted-defer fallback source.
+    const liveFallback = { chatId: ORIGIN_CHAT, threadId: ORIGIN_THREAD }
+
+    for (let i = 0; i < MAX; i++) {
+      now = i * 1000
+      workerFeedTick(feed, deferrals, agentId, resolveOrigin, runningView(now), liveFallback)
+      await Promise.resolve()
+    }
+    await Promise.resolve()
+
+    // OUTCOME: a card painted, in the origin supergroup AND its forum topic —
+    // the thread id survived the never-backfill fallback (not General).
+    expect(sent.length).toBeGreaterThanOrEqual(1)
+    expect(sent.every((s) => s.chatId === ORIGIN_CHAT)).toBe(true)
+    expect(sent.every((s) => s.threadId === ORIGIN_THREAD)).toBe(true)
   })
 })

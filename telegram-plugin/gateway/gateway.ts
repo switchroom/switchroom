@@ -2211,10 +2211,14 @@ const WORKER_FEED_ORIGIN_DEFER_MAX = 10
 function resolveWorkerFeedChat(
   agentId: string,
   fleetChatId: string,
+  // Origin sources threadId; when origin is null the caller can pass the
+  // fallback chat's sibling forum-topic id so a misrouted card still lands
+  // in the origin topic instead of General (#3458 exhausted-defer paint).
+  fallbackThreadId?: number,
 ): { chatId: string; threadId?: number } {
   const origin = resolveSubagentOriginChat(agentId)
   if (origin != null && origin.chatId.length > 0) return origin
-  if (fleetChatId.length > 0) return { chatId: fleetChatId }
+  if (fleetChatId.length > 0) return { chatId: fleetChatId, threadId: fallbackThreadId }
   const ownerDm = loadAccess().allowFrom[0] ?? ''
   if (origin == null && fleetChatId.length === 0 && ownerDm.length > 0) {
     // Routing decision, not a warning: origin resolution failed and no
@@ -2232,7 +2236,7 @@ function resolveWorkerFeedChat(
       )
     }
   }
-  return { chatId: ownerDm, threadId: origin?.threadId }
+  return { chatId: ownerDm, threadId: origin?.threadId ?? fallbackThreadId }
 }
 
 // ─── Periodic history reaper (#1073) ──────────────────────────────────────
@@ -24941,11 +24945,12 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   workerFeedOriginDeferrals.delete(agentId)
                   // Prefer the live turn's chat/topic over the owner DM if we do
                   // have to fall back — a misroute at least lands near the work.
-                  const workerFleetChatId =
-                    fleetChatId.length > 0
-                      ? fleetChatId
-                      : stampTurn?.sessionChatId ?? fleetChatId
-                  const wk = resolveWorkerFeedChat(agentId, workerFleetChatId)
+                  const usingStampFallback = fleetChatId.length === 0
+                  const workerFleetChatId = usingStampFallback
+                    ? stampTurn?.sessionChatId ?? fleetChatId
+                    : fleetChatId
+                  // Carry the fallback chat's forum topic id (#3458) so the card lands in the origin topic, not General.
+                  const wk = resolveWorkerFeedChat(agentId, workerFleetChatId, usingStampFallback ? stampTurn?.sessionThreadId : undefined)
                   const wkChat = wk.chatId
                   void workerActivityFeed?.update(
                     agentId,
