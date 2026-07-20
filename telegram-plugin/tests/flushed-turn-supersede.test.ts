@@ -381,3 +381,92 @@ describe('#3429 — decideSupersede new-content gate', () => {
     expect(reg.peek('chat9', undefined, { liveTurnId: 'turn-F', now: now + 21_000 }).reason).toBe('no-record')
   })
 })
+
+/**
+ * The tier discriminator (fix/backstop-duplicate-reply). `positiveAttribution`
+ * lets the gateway bypass the #3429 content gate when the reply's owner turn was
+ * resolved by POSITIVE attribution (live / origin echo / quoted) rather than the
+ * ambiguous latest-ended fallback. On a positive tier a genuinely-DIFFERENT
+ * (reworded) reply for the same turn still supersedes — closing the reworded
+ * same-turn duplicate — while the latest-ended path keeps the content gate so a
+ * true async handback still sends fresh.
+ */
+describe('positiveAttribution — tier-gated content check', () => {
+  const FLUSHED = 'Narration first.\n\nHere is the finished summary of the incident you asked about.'
+  const REWORDED =
+    'So, to wrap up: the incident boiled down to a stale cache entry, and it is fully resolved now.'
+
+  it('positiveAttribution=true: same turn + DIFFERENT (reworded) content STILL supersedes', () => {
+    // Guard: the reworded text is genuinely new vs the flushed blob (would be
+    // declined new-content without the tier bypass).
+    expect(flushedAnswerMatchesReply(FLUSHED, REWORDED)).toBe(false)
+
+    const d = decideSupersede(rec({ text: FLUSHED }), {
+      liveTurnId: 'turn-A',
+      replyText: REWORDED,
+      positiveAttribution: true,
+      now: 1_000_010,
+    })
+    expect(d.supersede).toBe(true)
+    expect(d.reason).toBe('supersede')
+    expect(d.deleteMessageIds).toEqual([101, 102])
+  })
+
+  it('positiveAttribution=false (latest-ended): the SAME reworded content declines as new-content', () => {
+    const d = decideSupersede(rec({ text: FLUSHED }), {
+      liveTurnId: 'turn-A',
+      replyText: REWORDED,
+      positiveAttribution: false,
+      now: 1_000_010,
+    })
+    expect(d.supersede).toBe(false)
+    expect(d.reason).toBe('new-content')
+  })
+
+  it('positiveAttribution=true still requires turn IDENTITY (different turn never supersedes)', () => {
+    const d = decideSupersede(rec({ turnId: 'turn-A', text: FLUSHED }), {
+      liveTurnId: 'turn-B',
+      replyText: REWORDED,
+      positiveAttribution: true,
+      now: 1_000_010,
+    })
+    expect(d.supersede).toBe(false)
+    expect(d.reason).toBe('different-turn')
+  })
+
+  it('positiveAttribution=true still respects the TTL (expired record never supersedes)', () => {
+    const d = decideSupersede(rec({ text: FLUSHED }), {
+      liveTurnId: 'turn-A',
+      replyText: REWORDED,
+      positiveAttribution: true,
+      now: 1_000_000 + DEFAULT_SUPERSEDE_TTL_MS + 1,
+    })
+    expect(d.supersede).toBe(false)
+    expect(d.reason).toBe('expired')
+  })
+
+  it('registry take() threads positiveAttribution through to the decision', () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    const now = 1_000_000
+    reg.record('chatT', undefined, { turnId: 'turn-Q', messageIds: [8001], text: FLUSHED }, now)
+
+    // latest-ended (positiveAttribution falsey): reworded → new-content, kept.
+    const ambiguous = reg.peek('chatT', undefined, {
+      liveTurnId: 'turn-Q',
+      replyText: REWORDED,
+      now: now + 5_000,
+    })
+    expect(ambiguous.reason).toBe('new-content')
+
+    // positive tier: same reworded reply supersedes and consumes the record.
+    const positive = reg.take('chatT', undefined, {
+      liveTurnId: 'turn-Q',
+      replyText: REWORDED,
+      positiveAttribution: true,
+      now: now + 6_000,
+    })
+    expect(positive.supersede).toBe(true)
+    expect(positive.deleteMessageIds).toEqual([8001])
+    expect(reg.peek('chatT', undefined, { liveTurnId: 'turn-Q', now: now + 7_000 }).reason).toBe('no-record')
+  })
+})

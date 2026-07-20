@@ -485,6 +485,8 @@ import {
 } from '../turn-flush-safety.js'
 import {
   resolveReplyOwnerTurnId,
+  resolveReplyOwnerTier,
+  type ReplyOwnerTier,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
@@ -4009,7 +4011,7 @@ function resolveReplyOwnerTurn(
   liveTurn: CurrentTurn | null,
   chatId: string,
   args: Record<string, unknown>,
-): CurrentTurn | null {
+): { turn: CurrentTurn | null; tier: ReplyOwnerTier } {
   const origin = findTurnByOriginId(args.origin_turn_id as string | undefined)
   const quoted = findTurnByQuotedMessageId(chatId, args.reply_to)
   const latestEnded = findLatestEndedTurnForChat(chatId)
@@ -4026,15 +4028,23 @@ function resolveReplyOwnerTurn(
   // fabricate one.
   const latestEndedAgeMs =
     latestEnded?.endedAt != null ? Date.now() - latestEnded.endedAt : null
-  const winnerId = resolveReplyOwnerTurnId({
+  const candidates = {
     liveTurnId: liveTurn?.turnId ?? null,
     originTurnId: origin?.turnId ?? null,
     quotedTurnId: quoted?.turnId ?? null,
     latestEndedTurnId: latestEnded?.turnId ?? null,
     latestEndedAgeMs,
     latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
-  })
-  return winnerId != null ? (byId.get(winnerId) ?? null) : null
+  }
+  // #3429 — the WINNING tier travels with the turn. A positive tier
+  // (live/origin/quoted) means the reply is this turn's own answer and the
+  // supersede fires regardless of text; the ambiguous `latest-ended` fallback
+  // keeps the content gate (it cannot tell a late own-reply from an async
+  // sub-agent handback). Both derive from the SAME candidates, so the id and the
+  // tier can never disagree.
+  const tier = resolveReplyOwnerTier(candidates)
+  const winnerId = resolveReplyOwnerTurnId(candidates)
+  return { turn: winnerId != null ? (byId.get(winnerId) ?? null) : null, tier }
 }
 
 /**

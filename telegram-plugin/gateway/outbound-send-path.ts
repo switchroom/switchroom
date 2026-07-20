@@ -58,7 +58,7 @@ import {
   flushedAnswerMatchesReply,
   type FlushedTurnSupersedeRegistry,
 } from '../flushed-turn-supersede.js'
-import { decideAnswerLatchSuppression } from '../reply-owner-resolve.js'
+import { decideAnswerLatchSuppression, type ReplyOwnerTier } from '../reply-owner-resolve.js'
 import { deriveTelegraphTitle } from '../telegraph.js'
 import {
   mintVoiceOnDemandToken,
@@ -658,7 +658,7 @@ export interface SendReplyGatewayDeps {
   assertSendable(f: string): void
   statusKey(chatId: string, threadId?: number | null): string
   streamKey(chatId: string, threadId?: number | null): string
-  resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): CurrentTurn | null
+  resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): { turn: CurrentTurn | null; tier: ReplyOwnerTier }
   findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null
   findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTurn | null
   resolveAnswerThreadWithLog(
@@ -874,7 +874,7 @@ export async function sendReply(
     // double-send). The quoted / latest-ended recoveries are precisely what the
     // router already did for the same reply, so unifying here makes the two
     // resolvers agree and the late-reply supersede fires by identity.
-    const ownerTurn = resolveReplyOwnerTurn(turn, chat_id, args)
+    const { turn: ownerTurn, tier: ownerTier } = resolveReplyOwnerTurn(turn, chat_id, args)
     const resolvedTurnId = ownerTurn?.turnId ?? null
     // #3429 — pass the (normalized) reply text so the registry can apply the
     // new-content gate: identity match + TTL alone also fits an async handback
@@ -882,10 +882,20 @@ export async function sendReply(
     // the latest-ended tier. Editing the flushed message in place with that
     // handback's text does not re-notify client-side (Telegram edits never
     // push) — the observed silent non-surfacing of msgs 10482/10486.
+    //
+    // But the content gate must NOT fire when the owner turn was resolved by
+    // POSITIVE attribution (live / origin-echo / quoted): there the reply is
+    // this turn's OWN answer landing late, so it supersedes its flushed
+    // provisional draft REGARDLESS of a model rewording between the narration
+    // that flushed and the `reply` tool call — collapsing the reworded
+    // same-turn duplicate (#3429 regression) to one message. The content gate
+    // stays for the ambiguous `latest-ended` fallback tier, which cannot
+    // distinguish the turn's own late reply from an async sub-agent handback.
+    const positiveAttribution = ownerTier !== 'latest-ended'
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
-      { liveTurnId: resolvedTurnId, replyText: text, now: Date.now() },
+      { liveTurnId: resolvedTurnId, replyText: text, positiveAttribution, now: Date.now() },
     )
     if (decision.supersede) {
       process.stderr.write(

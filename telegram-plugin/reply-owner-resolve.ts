@@ -85,6 +85,37 @@ function latestEndedAccepted(candidates: ReplyOwnerCandidates): boolean {
 }
 
 /**
+ * Which precedence tier resolved a reply's owner turn.
+ *
+ *   - `'live'` / `'origin'` / `'quoted'` are POSITIVE attributions: the reply
+ *     is tied to a specific turn by a live atom, the model's own echo, or the
+ *     framework-owned quoted message id — it IS that turn's answer.
+ *   - `'latest-ended'` is the ambiguous FALLBACK: no positive link exists, so
+ *     the reply is merely attributed to the chat's most-recently-ended turn.
+ *     This tier cannot tell the turn's OWN late reply from an async sub-agent
+ *     handback that has no live turn and no quote linkage — both land here with
+ *     the same resolved turnId (#3429). The supersede content gate
+ *     (`flushedAnswerMatchesReply`) is therefore applied ONLY on this tier.
+ *   - `'none'` — every lookup missed (a genuinely unattributable reply).
+ */
+export type ReplyOwnerTier = 'live' | 'origin' | 'quoted' | 'latest-ended' | 'none'
+
+/**
+ * The tier that WINS owner resolution for these candidates — the single source
+ * of the precedence order, consumed by both `resolveReplyOwnerTurnId` (which id)
+ * and the gateway (which discrimination the supersede applies). Same precedence,
+ * first non-null wins; the destructive latest-ended tier is honoured only when
+ * fresh (`latestEndedAccepted`).
+ */
+export function resolveReplyOwnerTier(candidates: ReplyOwnerCandidates): ReplyOwnerTier {
+  if (candidates.liveTurnId != null) return 'live'
+  if (candidates.originTurnId != null) return 'origin'
+  if (candidates.quotedTurnId != null) return 'quoted'
+  if (latestEndedAccepted(candidates)) return 'latest-ended'
+  return 'none'
+}
+
+/**
  * Resolve the turnId that OWNS a landing reply, using the SAME full chain the
  * thread-router uses. Precedence, first non-null wins:
  *
@@ -98,13 +129,18 @@ function latestEndedAccepted(candidates: ReplyOwnerCandidates): boolean {
  * to delete any turnId-bearing flush record.
  */
 export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): string | null {
-  return (
-    candidates.liveTurnId ??
-    candidates.originTurnId ??
-    candidates.quotedTurnId ??
-    (latestEndedAccepted(candidates) ? candidates.latestEndedTurnId : null) ??
-    null
-  )
+  switch (resolveReplyOwnerTier(candidates)) {
+    case 'live':
+      return candidates.liveTurnId
+    case 'origin':
+      return candidates.originTurnId
+    case 'quoted':
+      return candidates.quotedTurnId
+    case 'latest-ended':
+      return candidates.latestEndedTurnId
+    case 'none':
+      return null
+  }
 }
 
 /**
