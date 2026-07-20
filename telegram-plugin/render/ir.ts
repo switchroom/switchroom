@@ -66,10 +66,12 @@ export interface ItalicNode extends Pos {
   children: Inline[];
 }
 
-/** Telegram underline (<u>…</u>). In Bot API 10.1 rich markdown the `__…__`
- *  double-underscore run is UNDERLINE — distinct from `**…**` bold, even though
- *  GFM/micromark folds both into a single `strong` mdast node. `parse.ts`
- *  disambiguates the two by looking at the run's source delimiter. */
+/** A `__…__` double-underscore run. `parse.ts` keeps it as a distinct node
+ *  (separate from `**…**` bold) by looking at the source delimiter, even though
+ *  GFM/micromark folds both into a single `strong` mdast node. NOTE: on the
+ *  Telegram wire this renders as BOLD, not a distinct underline style — Bot API
+ *  10.1 rich markdown has no underline entity here, so the round-trip is faithful
+ *  but the delivered text is bold. Kept distinct only to preserve authoring intent. */
 export interface UnderlineNode extends Pos {
   type: "underline";
   children: Inline[];
