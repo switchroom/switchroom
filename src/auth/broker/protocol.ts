@@ -464,13 +464,17 @@ export const AccountStateSchema = z.object({
    *  account (it is the active, a `fallback_order` candidate, or an agent /
    *  consumer pin). FALSE → RETIRED: credentials linger on disk but the fleet no
    *  longer routes to it, so the account views render it "retired", never
-   *  "available". Optional (default false) for pre-field brokers. */
-  in_service: z.boolean().optional().default(false),
+   *  "available". Optional: ABSENT means in-service — only an explicit `false`
+   *  retires, so a pre-field broker (no field) never retires the fleet. Do NOT
+   *  add `.default(false)`: if a decode path ever parses this schema, a default
+   *  would silently coerce absent→false and retire every account. */
+  in_service: z.boolean().optional(),
   /** Org / entitlement-level block: TRUE when Anthropic reports the account
    *  disabled at the organization level (the entitlement probe, populated by
-   *  PR2). Renders as "DISABLED (org)" and outranks RETIRED. Optional
-   *  (default false); a pre-PR2 broker reports every account un-blocked. */
-  entitlement_blocked: z.boolean().optional().default(false),
+   *  PR2). Renders as "DISABLED (org)" and outranks RETIRED. Optional: absent /
+   *  a pre-PR2 broker reports every account un-blocked (only explicit `true`
+   *  blocks). No `.default(false)` — same decode-path safety as `in_service`. */
+  entitlement_blocked: z.boolean().optional(),
   exhausted_until: z.number().optional(),
   /** 429 throttle tier — unix ms until which the account is transiently
    *  rate-limited (`mark-throttled`). Informational: never gates serving
