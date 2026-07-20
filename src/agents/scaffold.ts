@@ -427,6 +427,11 @@ right answer at all. Structure exists for the reader, not the writer: a two-item
 bullet list is worse than a sentence, a heading on a three-line reply is noise. When
 in doubt, shorter and plainer wins.
 
+Full palette when a rich or long message earns it — expandable blockquotes, spoilers,
+highlight, code-fence language hints, tables, escaping and chunking rules: load the
+\`telegram-formatting\` skill. Reach for it only when you're actually composing that
+message, never for everyday replies.
+
 Every turn that answers a user message ends with a user-visible \`reply\`
 — Telegram is all the user sees; your terminal output
 never reaches them.`;
