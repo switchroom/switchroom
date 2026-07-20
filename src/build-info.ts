@@ -3,7 +3,7 @@
 // Values are refreshed every time `npm run build` runs.
 
 export const VERSION: string = "0.18.0";
-export const COMMIT_SHA: string | null = "5584bf20";
-export const COMMIT_DATE: string | null = "2026-07-11T19:02:16+10:00";
-export const LATEST_PR: number | null = 3097;
-export const COMMITS_AHEAD_OF_TAG: number | null = 42;
+export const COMMIT_SHA: string | null = "037ba5ab";
+export const COMMIT_DATE: string | null = "2026-07-20T10:16:08+10:00";
+export const LATEST_PR: number | null = null;
+export const COMMITS_AHEAD_OF_TAG: number | null = 13;

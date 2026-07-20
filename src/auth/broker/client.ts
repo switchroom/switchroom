@@ -168,6 +168,23 @@ export interface AccountState {
   label: string;
   expiresAt?: number;
   exhausted: boolean;
+  /**
+   * Fleet in-service classification: TRUE when the config still routes to this
+   * account (it is the active, a `fallback_order` candidate, or an agent /
+   * consumer pin). FALSE → RETIRED — the credentials still sit on disk but the
+   * fleet no longer routes to it, so every account view must render it "retired"
+   * rather than "available". Absent on a pre-field broker (treat absent as
+   * in-service — only an explicit `false` retires an account, so a broker that
+   * predates this field never falsely retires the whole fleet).
+   */
+  in_service?: boolean;
+  /**
+   * Org / entitlement-level block: TRUE when Anthropic reports the account
+   * disabled at the organization level (populated by the entitlement probe in
+   * PR2). Renders as "DISABLED (org)" and OUTRANKS `in_service` retirement.
+   * Absent / false on a pre-PR2 broker (treat as not-blocked).
+   */
+  entitlement_blocked?: boolean;
   exhausted_until?: number;
   /**
    * 429 throttle tier — unix ms until which the account is transiently

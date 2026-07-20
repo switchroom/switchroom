@@ -147,18 +147,41 @@ export function buildBar(pct: number, elapsedFrac: number): string {
 
 // ── account status (title-line suffix) ───────────────────────────────
 
-export type QuotaBarAccountStatus = 'active' | 'exhausted' | 'idle';
+export type QuotaBarAccountStatus =
+  | 'active'
+  | 'org-disabled'
+  | 'retired'
+  | 'exhausted'
+  | 'idle';
+
+/** Title-line display word for each status (some differ from the enum key). */
+const STATUS_LABEL: Record<QuotaBarAccountStatus, string> = {
+  active: 'active',
+  'org-disabled': 'DISABLED (org)',
+  retired: 'retired',
+  exhausted: 'exhausted',
+  idle: 'idle',
+};
 
 /**
- * Title-line status word. `active` wins over `exhausted` (the fleet's
- * pinned account is reported as active even if the broker also flags it
- * exhausted — matches the locked example where the operator wants to know
- * WHICH account is live first, and its health second, from the two window
- * rows underneath). Otherwise: `exhausted` if the broker's own flag says
- * so, else `idle` (present, healthy, just not the current pick).
+ * Title-line status word. Precedence: `active` > `DISABLED (org)` > `retired` >
+ * `exhausted` > `idle`.
+ *   - `active` wins over everything (the fleet's pinned account is reported
+ *     active even if also flagged exhausted — the operator wants WHICH account
+ *     is live first, health second, from the window rows underneath).
+ *   - `org-disabled` (entitlement block, PR2) and `retired` (`in_service` false:
+ *     removed from every config list) are OUT OF SERVICE — never "idle", which
+ *     reads as an available-but-unused account.
+ *   - else `exhausted` if the broker flags it, else `idle`.
  */
-export function accountStatus(isActive: boolean, exhausted: boolean): QuotaBarAccountStatus {
+export function accountStatus(
+  isActive: boolean,
+  exhausted: boolean,
+  opts: { inService?: boolean; entitlementBlocked?: boolean } = {},
+): QuotaBarAccountStatus {
   if (isActive) return 'active';
+  if (opts.entitlementBlocked === true) return 'org-disabled';
+  if (opts.inService === false) return 'retired';
   if (exhausted) return 'exhausted';
   return 'idle';
 }
@@ -188,8 +211,9 @@ export function renderQuotaBarAccount(
   quota: QuotaUtilization | null,
   now: Date = new Date(),
   demo = false,
+  service: { inService?: boolean; entitlementBlocked?: boolean } = {},
 ): string[] {
-  const status = accountStatus(isActive, exhausted);
+  const status = accountStatus(isActive, exhausted, service);
   // Title line wraps `label` in GFM `**bold**`, NOT a code span — so this
   // needs `escapeMarkdown` (backslash-escapes *, _, [, ], etc.), not
   // `codeSpanSafe` (which only defuses backticks and is only correct
@@ -197,7 +221,18 @@ export function renderQuotaBarAccount(
   // was a bug: a label containing e.g. `**` or `[x](url)` would break the
   // bold run or inject a markdown link into the card.
   const displayLabel = demo ? maskEmail(label) : label;
-  const lines: string[] = [`- **${escapeMarkdown(displayLabel)}** (${status})`];
+  const lines: string[] = [`- **${escapeMarkdown(displayLabel)}** (${STATUS_LABEL[status]})`];
+  // Out-of-service accounts (retired / org-disabled) have no meaningful live
+  // windows — a 0%/0% bar would read as "available", the exact bug this fixes.
+  // Replace the two window rows with a single status note (shape stays a list).
+  if (status === 'retired' || status === 'org-disabled') {
+    const note =
+      status === 'org-disabled'
+        ? 'disabled by org — no fleet routing'
+        : 'retired — removed from fleet rotation';
+    lines.push(`- ⚫ \`${note}\``);
+    return lines;
+  }
   if (!quota || isProbeThin(quota)) {
     // Data-quality gap. A failed / thin probe carries NO real utilization
     // signal, so it must NOT render as a healthy 🟢 0% bar — that's
@@ -288,10 +323,21 @@ export function renderQuotaBarBlock(
   const now = opts.now ?? new Date();
   const demo = opts.demo ?? false;
   const lines: string[] = [];
-  for (const snap of snapshots) {
+  // Out-of-service accounts (retired / org-disabled) sort LAST — stable
+  // partition preserves the caller's active-first ordering among the rest.
+  const outOfService = (s: AccountSnapshot) =>
+    !s.isActive && (s.entitlementBlocked === true || s.inService === false);
+  const ordered = [
+    ...snapshots.filter((s) => !outOfService(s)),
+    ...snapshots.filter(outOfService),
+  ];
+  for (const snap of ordered) {
     const exhausted = exhaustedByLabel.get(snap.label) ?? false;
     lines.push(
-      ...renderQuotaBarAccount(snap.label, snap.isActive, exhausted, snap.quota, now, demo),
+      ...renderQuotaBarAccount(snap.label, snap.isActive, exhausted, snap.quota, now, demo, {
+        inService: snap.inService,
+        entitlementBlocked: snap.entitlementBlocked,
+      }),
     );
   }
   return lines.join('\n');
@@ -319,6 +365,8 @@ export function renderQuotaBarBlockFromListState(
     quotaError: acc.last_quota ? undefined : 'no cached quota (no probe since broker start)',
     expiresAtMs: acc.expiresAt,
     capturedAtMs: acc.last_quota?.capturedAt,
+    inService: acc.in_service,
+    entitlementBlocked: acc.entitlement_blocked,
   }));
   return renderQuotaBarBlock(snapshots, exhaustedByLabel, { now });
 }

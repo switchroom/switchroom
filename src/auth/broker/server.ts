@@ -2072,6 +2072,11 @@ export class AuthBroker {
     identity: Identity,
   ): Promise<void> {
     const auth = this.config.auth ?? {};
+    // The config's in-service account set (active ∪ fallback_order ∪ agent
+    // overrides ∪ consumer pins). An account absent from this set is RETIRED —
+    // its credentials linger on disk but the fleet no longer routes to it, so
+    // the views must not render it as "available". Computed once per call.
+    const inService = this.inServiceSet();
     const accounts = listAccounts(this.home).map((label) => {
       const creds = readAccountCredentials(label, this.home);
       const meta = readAccountMeta(label, this.home);
@@ -2086,6 +2091,15 @@ export class AuthBroker {
         label,
         expiresAt: creds?.claudeAiOauth?.expiresAt,
         exhausted,
+        // Fleet in-service classification: true when the config still routes to
+        // this account. false → RETIRED (removed from rotation); the views
+        // render it as such instead of "available".
+        in_service: inService.has(label),
+        // #org-disable — populated by PR2 (the entitlement/org-level block
+        // probe). Left false here; a pre-PR2 broker reports every account
+        // un-blocked, and RETIRED classification works standalone off
+        // `in_service` regardless.
+        entitlement_blocked: false,
         exhausted_until: q?.exhausted_until,
         // 429 throttle tier — raw ledger value for transparency (consumers
         // compare against their own clock). Never feeds `exhausted`.
@@ -2567,6 +2581,27 @@ export class AuthBroker {
     if (active) set.add(active);
     for (const cand of this.config.auth?.fallback_order ?? []) set.add(cand);
     for (const acct of this.pinnedAgentAccounts()) set.add(acct);
+    return set;
+  }
+
+  /**
+   * The fleet's IN-SERVICE account set — every account the config still routes
+   * traffic to: the fleet active, every `fallback_order` candidate, every
+   * per-agent `auth.override` pin, and every consumer pin
+   * (`auth.consumers[].account`). An account NOT in this set has been fully
+   * removed from rotation (dropped from `fallback_order` and every agent /
+   * consumer pin) — it is RETIRED, and the account views must render it as such
+   * rather than "available", even though its credentials still sit on disk.
+   *
+   * Superset of {@link premiumCanarySet} (adds consumer pins). Built ON TOP of
+   * it deliberately: the flagship-canary probe scope (bounded by
+   * `premiumCanarySet`) is unchanged by this display-only classifier.
+   */
+  private inServiceSet(): Set<string> {
+    const set = this.premiumCanarySet();
+    for (const c of this.config.auth?.consumers ?? []) {
+      if (c.account) set.add(c.account);
+    }
     return set;
   }
 
