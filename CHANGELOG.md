@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## v0.19.4 — Entitlement-403 account detection + eligibility block
+
+Completes the retired-account work from v0.19.3 (which stopped disabled
+accounts rendering as "available") with the backend half: the quota probe now
+detects an org-level Claude Code entitlement cut and turns it into a real
+DISABLED signal that blocks selection, so a dead account can never be served —
+even off a stale-healthy cache.
+
+- **Detect and block entitlement-403 accounts** (#3454) — the quota probe folded
+  every non-200 into a bare string and never read the response body, so an
+  entitlement-403 ("Your organization has disabled Claude subscription access
+  for Claude Code") was indistinguishable from a flaky probe and decayed to
+  "unknown" on the last cached snapshot. `fetchQuota` now reads the body on
+  `!resp.ok` and returns a structured failure (`httpStatus`, `apiErrorMessage`,
+  `failureKind`); `isEntitlementDisabledMessage` classifies an entitlement cut
+  vs a bad-scope 403 (the latter is left untouched). The broker persists an
+  `entitlement_blocked` mark (cleared by any later successful probe, skipped by
+  the fleet probe tick), `account-eligibility` returns `blocked` FIRST — ahead
+  of every snapshot/overage path — so a marked account is unselectable even
+  when it sits in `fallback_order` with a fresh-looking cache, and `opListState`
+  surfaces the flag so the account views render `DISABLED (org)`. The abort
+  timeout now also bounds the body read (a stalled 4xx body can't hang the probe
+  slot). Deliberately does NOT key off the benign `overageDisabledReason:
+  org_level_disabled` field (present only on successful probes).
+
+### Dependencies
+
+- Bump `actions/setup-node` 6.4.0 → 7.0.0 (#3453).
+- Bump the `node:22-trixie-slim` base-image digest (#3452).
+
 ## v0.19.3 — Hindsight leverage programme (recall/retain/synthesis), Telegram `/auth add` + readd flow, rev5 carrier auto-remediation
 
 Lands the hindsight leverage programme epic (#3430): recall stops silently
