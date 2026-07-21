@@ -436,6 +436,41 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
     expect(lstatSync(join(skillsDir, "operator-dir")).isDirectory()).toBe(true);
   });
 
+  it("RETIRED-DEFAULT SWEEP: spares the role-scoped operator trio (switchroom-*) even though they are NOT in defaults (cecd05d5 CI regression)", () => {
+    // The exact case CI caught: the foreman-only operator skills
+    // (switchroom-install / -manage / -architecture) are owned _bundled links
+    // installed by installSwitchroomSkills for foreman-role agents, but are NOT
+    // in the universal `defaults` set. A sweep predicate of "owned AND not in
+    // defaults" wrongly DELETES them. They must survive: the sweep defers to
+    // installSwitchroomSkills for role-scoped skills.
+    const operatorTrio = ["switchroom-install", "switchroom-manage", "switchroom-architecture"];
+    for (const name of operatorTrio) {
+      const dir = join(poolDir, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), `# ${name}\n`, "utf-8");
+      // Link the way installSwitchroomSkills does — a relative link into _bundled.
+      const dest = join(skillsDir, name);
+      symlinkSync(relative(dirname(dest), dir), dest);
+    }
+    // A genuinely retired default alongside them must STILL be swept.
+    const retiredPool = join(poolDir, "retired-skill");
+    mkdirSync(retiredPool, { recursive: true });
+    symlinkSync(retiredPool, join(skillsDir, "retired-skill"));
+    rmSync(retiredPool, { recursive: true, force: true });
+
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+
+    // OUTCOME assertions on disk: the operator trio links SURVIVE.
+    for (const name of operatorTrio) {
+      expect(r.pruned).not.toContain(name);
+      expect(lstatSync(join(skillsDir, name)).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(skillsDir, name))).toBe(true);
+    }
+    // The genuinely retired default is still gone.
+    expect(r.pruned).toContain("retired-skill");
+    expect(() => lstatSync(join(skillsDir, "retired-skill"))).toThrow();
+  });
+
   it("does not touch a relative owned _bundled link that is still current (no over-prune)", () => {
     // Relative link (post-footgun-A form) that correctly resolves into the pool.
     const rel = relative(dirname(join(skillsDir, "skill-a")), join(poolDir, "skill-a"));

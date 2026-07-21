@@ -342,18 +342,54 @@ export function reconcileAgentDefaultSkills(
   // and its owned `.claude/skills/<name>` link dangles forever — the exact
   // ghost-reference doctor keeps flagging. Sweep the skills dir for links this
   // reconciler OWNS (target resolves under the bundled pool, via the strict
-  // `isOwnedBundledLink`) whose name is no longer a current default, and remove
-  // them. Strictly scoped: a personal-pool link (`skills/<name>`), an operator
+  // `isOwnedBundledLink`) whose name is no longer LEGITIMATE for this agent from
+  // ANY source the reconciler's siblings manage, and remove them.
+  //
+  // The removal predicate is "owned AND not in the full legitimate set", NOT
+  // merely "owned AND not in `defaults`" — the latter is the cecd05d5 CI
+  // regression. Beyond the universal `defaults`, the role-scoped operator trio
+  // (`switchroom-install` / `switchroom-manage` / `switchroom-architecture`)
+  // are ALSO owned `_bundled` links: they are installed for foreman-role agents
+  // by `installSwitchroomSkills` (scaffold.ts) — which runs BEFORE this
+  // reconciler on both the scaffold and reconcile paths — and retracted by that
+  // same function on a foreman → assistant role flip. If the sweep deleted them
+  // it would clobber a foreman's legitimate operator skills. So the sweep DEFERS
+  // to `installSwitchroomSkills` for role-scoped skills: it treats every
+  // `switchroom-*` pool skill that isn't itself a universal default as
+  // legitimate and leaves it alone (role add/retract stays owned by
+  // installSwitchroomSkills — the sweep composes with it instead of fighting
+  // it). A genuinely retired default (name gone from `defaults`, NOT a
+  // `switchroom-*` operator skill — e.g. telegram-formatting) is still swept.
+  //
+  // Strictly scoped: a personal-pool link (`skills/<name>`), an operator
   // hand-link (foreign target), and a real dir/file are all structurally out of
-  // scope, so operator/personal skills are never touched. A still-current
-  // default link never matches because its name IS in `defaultKeys`.
+  // scope (isOwnedBundledLink is false for them), so operator/personal skills
+  // are never touched. A still-current default link never matches because its
+  // name IS in `defaultKeys`.
   const defaultKeys = new Set(defaults.map((d) => d.key));
+  // Role-scoped operator skills owned by installSwitchroomSkills: a
+  // `switchroom-*` pool skill (dir with a SKILL.md) that is not itself a
+  // universal default. Derived from the pool exactly as installSwitchroomSkills
+  // discovers them, so the two stay in lockstep without hardcoding the trio.
+  const legitimate = new Set<string>(defaultKeys);
+  try {
+    for (const poolName of readdirSync(poolDir)) {
+      if (!poolName.startsWith("switchroom-")) continue;
+      if (defaultKeys.has(poolName)) continue;
+      try {
+        const st = lstatSync(join(poolDir, poolName));
+        if (st.isDirectory() && existsSync(join(poolDir, poolName, "SKILL.md"))) {
+          legitimate.add(poolName);
+        }
+      } catch { /* unreadable pool entry — not legitimate */ }
+    }
+  } catch { /* pool unreadable — fall back to defaults-only legitimate set */ }
   let dirEntries: string[] = [];
   try {
     dirEntries = readdirSync(targetDir);
   } catch { /* dir vanished — nothing to sweep */ }
   for (const linkName of dirEntries) {
-    if (defaultKeys.has(linkName)) continue;
+    if (legitimate.has(linkName)) continue;
     const dest = join(targetDir, linkName);
     if (!isOwnedBundledLink(dest, poolDir)) continue;
     try {
