@@ -462,3 +462,23 @@ describe("Dockerfile.hostd bakes the autoheal script (#2910)", () => {
     expect(df).toMatch(/chmod 0755 \/opt\/switchroom\/docker\/hindsight-autoheal\.sh/);
   });
 });
+
+describe("Dockerfile.hostd bakes the package-relative asset trees (ghost-skills)", () => {
+  it("COPYs profiles/, vendor/hindsight-memory/, AND skills/ into the image", () => {
+    const df = readFileSync(
+      resolve(__dirname, "..", "..", "docker", "Dockerfile.hostd"),
+      "utf-8",
+    );
+    // Every asset the apply/update path resolves via
+    // resolve(import.meta.dirname,"../../<asset>") must be baked into the
+    // hostd image, or the corresponding step silently skips / strands the
+    // fleet. skills/ is the one that was missing (ghost-skills incident):
+    // sync-bundled-skills sourced /opt/switchroom/skills, which never
+    // existed, so builtin default skills never reached the host pool.
+    expect(df).toMatch(/COPY profiles\/ \/opt\/switchroom\/profiles\//);
+    expect(df).toMatch(
+      /COPY vendor\/hindsight-memory\/ \/opt\/switchroom\/vendor\/hindsight-memory\//,
+    );
+    expect(df).toMatch(/COPY skills\/ \/opt\/switchroom\/skills\//);
+  });
+});

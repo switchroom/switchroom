@@ -1520,12 +1520,20 @@ export class HostdServer {
    * hindsight plugin RELATIVE TO ITSELF (no path arg):
    *   profiles.ts:  resolve(import.meta.dirname,"../../profiles")
    *   scaffold.ts:  resolve(import.meta.dirname,"../../vendor/hindsight-memory")
-   * If the hostd image was built without those (the klanker incident),
-   * `update_apply` pulls images then dies at apply-config, stranding
-   * the fleet on the old image. We refuse BEFORE anything is pulled
-   * or changed — same fail-fast principle as the `--rebuild` guard.
+   * The `update` flow ALSO resolves a package-relative asset the same
+   * way — `sync-bundled-skills` mirrors the shipped `skills/` payload
+   * into the host pool:
+   *   update.ts:  resolve(import.meta.dirname,"../../skills")
+   * If the hostd image was built without those (the klanker incident
+   * for profiles/vendor; the ghost-skills incident #3492-follow-up for
+   * skills/), `update_apply` pulls images then either dies at
+   * apply-config or silently skips the skills sync and later throws at
+   * verify-bundled-skills — stranding the fleet on the old image, or
+   * leaving every agent's CLAUDE.md referencing default skills that
+   * never reach the pool. We refuse BEFORE anything is pulled or
+   * changed — same fail-fast principle as the `--rebuild` guard.
    * Future-proofs the per-asset fragility: any new package-relative
-   * apply asset added here can't silently strand a fleet again.
+   * apply/update asset added here can't silently strand a fleet again.
    */
   private missingApplyAssets(): string[] {
     const root =
@@ -1534,6 +1542,11 @@ export class HostdServer {
       join(root, "profiles"),
       join(root, "profiles", "default"),
       join(root, "vendor", "hindsight-memory"),
+      // sync-bundled-skills (update.ts) mirrors this tree into the host
+      // pool; a hostd image without it silently skips the sync and then
+      // fails verify-bundled-skills. Guard it here so update_apply is
+      // refused up front instead of stranding the fleet mid-roll.
+      join(root, "skills"),
     ].filter((p) => !existsSync(p));
   }
 

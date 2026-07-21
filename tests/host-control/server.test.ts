@@ -1699,6 +1699,7 @@ describe("hostd server — apply-asset preflight (klanker incident)", () => {
     const ok = join(tmp, "assets-ok");
     mkdirSync(join(ok, "profiles", "default"), { recursive: true });
     mkdirSync(join(ok, "vendor", "hindsight-memory"), { recursive: true });
+    mkdirSync(join(ok, "skills"), { recursive: true });
     await freshServer(ok);
     const resp = await hostdRequest(
       { socketPath: adminSock() },
@@ -2111,6 +2112,7 @@ describe("hostd server — update_apply hostd-context deferral (#2458)", () => {
     const assets = join(tmp, `assets-deferral-${Date.now()}`);
     mkdirSync(join(assets, "profiles", "default"), { recursive: true });
     mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+    mkdirSync(join(assets, "skills"), { recursive: true });
 
     // The stub SCRIPT and its recording file must live on a filesystem that
     // allows exec — /tmp is noexec in this container, but /var/tmp is exec.
@@ -2283,6 +2285,7 @@ describe("hostd server — rollout got-field gap fix (BONUS #2458)", () => {
     const assets = join(tmp, `assets-rollout-got-${Date.now()}`);
     mkdirSync(join(assets, "profiles", "default"), { recursive: true });
     mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+    mkdirSync(join(assets, "skills"), { recursive: true });
 
     if (server) await server.stop();
     server = new (await import("../../src/host-control/server.js")).HostdServer({
@@ -2347,6 +2350,7 @@ describe("hostd server — rollout phase observability (#2726)", () => {
     const assets = join(tmp, `assets-phase-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     mkdirSync(join(assets, "profiles", "default"), { recursive: true });
     mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+    mkdirSync(join(assets, "skills"), { recursive: true });
     return assets;
   }
 
@@ -2582,6 +2586,7 @@ describe("hostd server — rollout narrator feed (#2726 Part 2)", () => {
     const assets = join(tmp, `assets-narrator-${Date.now()}`);
     mkdirSync(join(assets, "profiles", "default"), { recursive: true });
     mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+    mkdirSync(join(assets, "skills"), { recursive: true });
 
     const seenPhases: string[] = [];
     let terminalResult: string | null = null;
@@ -2632,6 +2637,7 @@ describe("hostd server — rollout narrator feed (#2726 Part 2)", () => {
     const assets = join(tmp, `assets-narrator-throw-${Date.now()}`);
     mkdirSync(join(assets, "profiles", "default"), { recursive: true });
     mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+    mkdirSync(join(assets, "skills"), { recursive: true });
 
     if (server) await server.stop();
     server = new HostdServer({
