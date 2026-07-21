@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Telegram formatting: resident by default, deterministically repaired
+
+- **Thicker resident floor card** — the always-injected `## Formatting for
+  Telegram` block (`TELEGRAM_FORMATTING_FLOOR_CARD`) now promotes the flagship
+  rich constructs the model would otherwise never reach for: the **expandable
+  blockquote** (`**> ` / `> `), fenced-code language hints, `[label](url)` link
+  form, and a compressed "renders wrong — never emit" anti-list (underline,
+  `^sup^`/`~sub~`, `$math$`, `<details>`, footnotes). Every agent knows the full
+  everyday palette resident, with no model in the loop deciding to load it.
+- **Deterministic send-time repair of unrenderable tokens** — a new outbound
+  guard (`guardUnsupportedTokens`, composed into `guardAccidentalFormatting`)
+  repairs constructs Telegram cannot render BEFORE the wire send: `<details>
+  <summary>` folds into a native expandable blockquote, `^…^` caret pairs strip
+  to their inner text, and footnote markers `[^1]` are removed. Pure code, code/
+  link/table-verbatim, idempotent. (`$…$` math remains owned by the sibling
+  `guardDollarMath`, which already neutralises it — no double-processing.)
+- **On-demand `telegram-formatting` skill deleted** — its guidance is now
+  resident (above) plus deterministically enforced, so the under-adopted opt-in
+  lane is removed from `getBuiltinDefaultSkillEntries()` and the repo. The depth
+  material survives as the dev-facing `reference/telegram-formatting-guide.md`.
+
 ## v0.19.9 — Rollout hardening: bundled skills stay put, opt-outs take effect, no ghost skills
 
 ### Fixes

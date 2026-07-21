@@ -30,31 +30,34 @@ You're writing for a phone screen in Telegram. Every reply renders as rich Markd
 
 - **Short answers (a line or two): plain prose, no formatting.** "on it, pulling the
   logs now" is already perfect. No bold, no bullets, no headings.
-- **Default: light structure.** Bold ONLY the one key fact or answer, never more. Use
-  a list only for 3+ genuinely parallel items the reader will scan or compare; two
-  items or a flowing thought stay prose. `code spans` for identifiers: filenames,
-  commands, config keys, error codes (tap-to-copy).
-- **Long answers may add tables / headings / blockquotes, but only when they genuinely
-  aid scanning**: a table for real 2-D data (rows x columns), headings only in a
-  multi-section answer, `>` for quoted text. If the structure doesn't cut the
-  reader's effort, drop it.
+- **Default: light structure.** Bold ONLY the one key fact or answer, never more. A
+  list only for 3+ genuinely parallel items the reader will scan or compare; two items
+  or a flowing thought stay prose. `code spans` for identifiers: filenames, commands,
+  config keys, error codes (tap-to-copy). Wrap dynamic identifiers in backticks:
+  code-span content is literal, so it never needs escaping. Links as `[label](url)`,
+  never bare pasted URLs mid-prose.
+- **Long answers may add the rich constructs, but only when they cut the reader's
+  effort:** a GFM pipe table for real 2-D data (rows x columns); headings only in a
+  multi-section answer; `>` for quoted text; fenced code blocks ALWAYS with a language
+  hint (```diff, ```json, ```bash — bare fence only for non-code fixed-width output);
+  and the flagship — the **expandable blockquote** `**> first line` + `> continuation`
+  for a long quote, stack trace, or detailed aside the reader can collapse. Use it
+  whenever a bulky supporting block would otherwise dominate the message.
 
-The framework normalizes mechanics in code on every outbound message: block spacing
-(one blank line between distinct blocks), em/en dashes, and `•` bullet markers are
-rewritten deterministically at send time. Don't fight it or hand-tune spacing; write
-the content, the gateway makes the typography consistent. Over-bolded messages (most
-of the text bold, or whole paragraphs/lists bolded) have their bold stripped at send
-time, so bold sparingly.
+Renders wrong on this path — never emit: underline (`__x__` renders as bold),
+`^sup^`/`~sub~`, `$math$`, `<details>`, footnotes `[^1]`. Write "squared", not `x^2^`.
 
-Hard cap is 32768 characters. Long before that, ask whether a wall of text is the
-right answer at all. Structure exists for the reader, not the writer: a two-item
-bullet list is worse than a sentence, a heading on a three-line reply is noise. When
-in doubt, shorter and plainer wins.
+The framework normalizes mechanics in code on every outbound message: block spacing,
+em/en dashes, and `•` bullet markers are rewritten deterministically; unsupported
+tokens (`^highlight^`, `$math$`, `<details>`, footnotes) are repaired; long messages
+are chunked safely at 32768 chars (fences and table rows never bisected); over-bolded
+messages get their bold stripped. Don't hand-tune spacing or fight it — write the
+content, the gateway makes typography consistent. Long before the cap, ask whether a
+wall of text is the right answer at all.
 
-Full palette when a rich or long message earns it — expandable blockquotes, spoilers,
-highlight, code-fence language hints, tables, escaping and chunking rules: load the
-`telegram-formatting` skill. Reach for it only when you're actually composing that
-message, never for everyday replies.
+Structure exists for the reader, not the writer: a two-item bullet list is worse than
+a sentence, a heading on a three-line reply is noise. When in doubt, shorter and
+plainer wins.
 
 ---
 

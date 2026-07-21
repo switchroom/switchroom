@@ -376,6 +376,101 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
     expect(existsSync(join(skillsDir, "skill-c"))).toBe(false);
   });
 
+  it("RETIRED-DEFAULT SWEEP: removes an owned _bundled link whose name is no longer a default, while sparing a current default link, a personal link, and an operator dir", () => {
+    // Repro of the review MED: a skill dropped from getBuiltinDefaultSkillEntries
+    // (e.g. telegram-formatting) is never visited by the per-entry loop, so its
+    // owned _bundled link dangles forever. The sweep must remove it.
+    //
+    // Set up the "retired" skill: it once shipped in the pool AND was linked,
+    // but is NOT in FIXTURE_DEFAULTS. Even after the pool drops it, the stored
+    // link target string still resolves under _bundled → owned → must be swept.
+    const retiredPool = join(poolDir, "retired-skill");
+    mkdirSync(retiredPool, { recursive: true });
+    symlinkSync(retiredPool, join(skillsDir, "retired-skill"));
+    rmSync(retiredPool, { recursive: true, force: true }); // pool dropped it → dangling
+
+    // A CURRENT default owned link — must survive (name IS in defaults).
+    symlinkSync(join(poolDir, "skill-a"), join(skillsDir, "skill-a"));
+    // A personal-pool link at a NON-default name — must survive (not owned).
+    const personalPool = join(tmpRoot, ".switchroom", "skills");
+    const personalTarget = join(personalPool, "my-personal");
+    mkdirSync(personalTarget, { recursive: true });
+    symlinkSync(personalTarget, join(skillsDir, "my-personal"));
+    // An operator hand-rolled real dir at a NON-default name — must survive.
+    mkdirSync(join(skillsDir, "operator-dir"), { recursive: true });
+    writeFileSync(join(skillsDir, "operator-dir", "SKILL.md"), "hand-rolled\n", "utf-8");
+
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+
+    // OUTCOME assertions (on disk), not just code-path.
+    expect(r.pruned).toContain("retired-skill");
+    expect(existsSync(join(skillsDir, "retired-skill"))).toBe(false);
+    // And it is truly gone from disk (lstat throws for a removed path).
+    expect(() => lstatSync(join(skillsDir, "retired-skill"))).toThrow();
+  });
+
+  it("RETIRED-DEFAULT SWEEP: spares operator/personal skills and current defaults (on-disk survival)", () => {
+    // Companion to the sweep test above — isolate the SURVIVAL assertions so a
+    // regression that over-prunes fails loudly on the exact victim.
+    const retiredPool = join(poolDir, "retired-skill");
+    mkdirSync(retiredPool, { recursive: true });
+    symlinkSync(retiredPool, join(skillsDir, "retired-skill"));
+    rmSync(retiredPool, { recursive: true, force: true });
+
+    symlinkSync(join(poolDir, "skill-a"), join(skillsDir, "skill-a"));
+    const personalPool = join(tmpRoot, ".switchroom", "skills");
+    const personalTarget = join(personalPool, "my-personal");
+    mkdirSync(personalTarget, { recursive: true });
+    symlinkSync(personalTarget, join(skillsDir, "my-personal"));
+    mkdirSync(join(skillsDir, "operator-dir"), { recursive: true });
+    writeFileSync(join(skillsDir, "operator-dir", "SKILL.md"), "hand-rolled\n", "utf-8");
+
+    reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+
+    // Current default link survives.
+    expect(existsSync(join(skillsDir, "skill-a"))).toBe(true);
+    // Personal-pool link (non-default name) survives — NOT owned by the pool.
+    expect(lstatSync(join(skillsDir, "my-personal")).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(skillsDir, "my-personal"))).toBe(personalTarget);
+    // Operator hand-rolled dir survives.
+    expect(lstatSync(join(skillsDir, "operator-dir")).isDirectory()).toBe(true);
+  });
+
+  it("RETIRED-DEFAULT SWEEP: spares the role-scoped operator trio (switchroom-*) even though they are NOT in defaults (cecd05d5 CI regression)", () => {
+    // The exact case CI caught: the foreman-only operator skills
+    // (switchroom-install / -manage / -architecture) are owned _bundled links
+    // installed by installSwitchroomSkills for foreman-role agents, but are NOT
+    // in the universal `defaults` set. A sweep predicate of "owned AND not in
+    // defaults" wrongly DELETES them. They must survive: the sweep defers to
+    // installSwitchroomSkills for role-scoped skills.
+    const operatorTrio = ["switchroom-install", "switchroom-manage", "switchroom-architecture"];
+    for (const name of operatorTrio) {
+      const dir = join(poolDir, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), `# ${name}\n`, "utf-8");
+      // Link the way installSwitchroomSkills does — a relative link into _bundled.
+      const dest = join(skillsDir, name);
+      symlinkSync(relative(dirname(dest), dir), dest);
+    }
+    // A genuinely retired default alongside them must STILL be swept.
+    const retiredPool = join(poolDir, "retired-skill");
+    mkdirSync(retiredPool, { recursive: true });
+    symlinkSync(retiredPool, join(skillsDir, "retired-skill"));
+    rmSync(retiredPool, { recursive: true, force: true });
+
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+
+    // OUTCOME assertions on disk: the operator trio links SURVIVE.
+    for (const name of operatorTrio) {
+      expect(r.pruned).not.toContain(name);
+      expect(lstatSync(join(skillsDir, name)).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(skillsDir, name))).toBe(true);
+    }
+    // The genuinely retired default is still gone.
+    expect(r.pruned).toContain("retired-skill");
+    expect(() => lstatSync(join(skillsDir, "retired-skill"))).toThrow();
+  });
+
   it("does not touch a relative owned _bundled link that is still current (no over-prune)", () => {
     // Relative link (post-footgun-A form) that correctly resolves into the pool.
     const rel = relative(dirname(join(skillsDir, "skill-a")), join(poolDir, "skill-a"));
@@ -553,7 +648,6 @@ describe("getBuiltinDefaultSkillEntries", () => {
       "switchroom-health",
       "switchroom-runtime",
       "switchroom-status",
-      "telegram-formatting",
       "webapp-testing",
       "xlsx",
     ]);
@@ -570,7 +664,6 @@ describe("getBuiltinDefaultSkillEntries", () => {
       "switchroom-health",
       "switchroom-runtime",
       "switchroom-status",
-      "telegram-formatting",
     ]);
   });
 });

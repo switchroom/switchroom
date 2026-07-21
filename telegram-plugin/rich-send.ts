@@ -22,6 +22,7 @@ import { guardDollarMath } from './render/dollar-math-guard.js'
 import { guardAccidentalEmphasis } from './render/emphasis-guard.js'
 import { guardAccidentalBlockConstructs, guardAccidentalHeading } from './render/line-start-guard.js'
 import { guardAccidentalInlinePairs } from './render/inline-pairs-guard.js'
+import { guardUnsupportedTokens } from './render/unsupported-token-guard.js'
 
 /** The `InputRichMessage` shape grammy 1.44 accepts on send AND edit. */
 export interface InputRichMessageMarkdown {
@@ -56,6 +57,14 @@ export interface InputRichMessageMarkdown {
  */
 export function guardAccidentalFormatting(markdown: string): string {
   let out = markdown
+  // Repair Telegram-unrenderable tokens FIRST: `<details>` folds into a `**> `
+  // expandable blockquote whose `> `-with-space lines are invisible to the
+  // block-construct guard (which only escapes space-LESS `>digit`/`>=`), and
+  // `**> ` is the exact marker switchroom's own render path emits — so the
+  // downstream emphasis/block guards treat it identically to a native
+  // expandable quote. Caret/footnote removal inserts no trigger char for any
+  // sibling guard, so this pass neither creates nor destroys their signals.
+  out = guardUnsupportedTokens(out)
   out = guardAccidentalEmphasis(out)
   out = guardAccidentalHeading(out)
   out = guardAccidentalBlockConstructs(out)
