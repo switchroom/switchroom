@@ -45,12 +45,19 @@
 import { splitProtectedSegments } from "./code-segments.js";
 
 /** Paired caret highlight / superscript: `^text^` (no newline, non-empty, no
- *  nested caret). Non-greedy inner run. Replaced by the inner text. */
-const CARET_PAIR = /\^([^\^\n]+)\^/g;
+ *  nested caret, no interior whitespace). Non-greedy inner run. Replaced by the
+ *  inner text. The no-whitespace constraint is deliberate: it distinguishes a
+ *  genuine adjacent highlight/superscript (`x^2^`, `^highlighted^`) from two
+ *  unpaired literal carets scattered across prose (`a^n plus b^m`), which must
+ *  survive intact rather than have both carets stripped and the words joined. */
+const CARET_PAIR = /\^([^\^\n\s]+)\^/g;
 
-/** Footnote reference marker `[^id]` NOT immediately followed by `:` (which
- *  would make it a footnote DEFINITION line we leave intact). Removed entirely. */
-const FOOTNOTE_MARKER = /\[\^[^\]\n]+\](?!:)/g;
+/** Footnote reference marker `[^N]` (digits only) NOT immediately followed by
+ *  `:` (which would make it a footnote DEFINITION line we leave intact). Removed
+ *  entirely. Restricting the id to digits keeps this off in-prose bracket
+ *  literals like `array[^index]` and regex-ish `[^/]`, which are NOT footnotes
+ *  and would otherwise be silently eaten. */
+const FOOTNOTE_MARKER = /\[\^\d+\](?!:)/g;
 
 /** `<details>…</details>` with an optional leading `<summary>…</summary>`.
  *  Dot-all via `[\s\S]`; non-greedy so adjacent blocks don't merge. */

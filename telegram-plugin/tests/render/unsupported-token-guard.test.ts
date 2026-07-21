@@ -43,6 +43,35 @@ describe("guardUnsupportedTokens — deterministic send-time repair", () => {
     );
   });
 
+  it("leaves unpaired carets scattered across prose intact (no interior space)", () => {
+    // Two separate literal carets across words are NOT a highlight pair —
+    // stripping both and joining the words would corrupt the prose.
+    expect(guardUnsupportedTokens("the exponent a^n plus b^m here")).toBe(
+      "the exponent a^n plus b^m here",
+    );
+    expect(guardUnsupportedTokens("score^total and rank^final done")).toBe(
+      "score^total and rank^final done",
+    );
+    // But a genuine adjacent highlight/superscript is still repaired.
+    expect(guardUnsupportedTokens("value ^highlight^ here")).toBe(
+      "value highlight here",
+    );
+  });
+
+  it("leaves in-prose bracket literals intact, repairs real numeric footnotes", () => {
+    // `array[^index]` is a negated-char-class / index literal, not a footnote.
+    expect(guardUnsupportedTokens("array[^index] lookup")).toBe(
+      "array[^index] lookup",
+    );
+    expect(guardUnsupportedTokens("use [^/] to match")).toBe(
+      "use [^/] to match",
+    );
+    // A real numeric footnote marker is still stripped.
+    expect(guardUnsupportedTokens("see the note[^1] here")).toBe(
+      "see the note here",
+    );
+  });
+
   it("is a strict no-op for clean markdown (no target tokens)", () => {
     const clean =
       "**Answer:** the `config.yaml` file. See [docs](https://example.com/x).";
