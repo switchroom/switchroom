@@ -44,13 +44,20 @@
 
 import { splitProtectedSegments } from "./code-segments.js";
 
-/** Paired caret highlight / superscript: `^text^` (no newline, non-empty, no
- *  nested caret, no interior whitespace). Non-greedy inner run. Replaced by the
- *  inner text. The no-whitespace constraint is deliberate: it distinguishes a
- *  genuine adjacent highlight/superscript (`x^2^`, `^highlighted^`) from two
- *  unpaired literal carets scattered across prose (`a^n plus b^m`), which must
- *  survive intact rather than have both carets stripped and the words joined. */
-const CARET_PAIR = /\^([^\^\n\s]+)\^/g;
+/** Paired caret highlight / superscript: `^text^` where the inner run is a
+ *  single ALPHANUMERIC token (no newline, no whitespace, no nested caret, and
+ *  crucially no expression punctuation like `+ = -`). Non-greedy inner run.
+ *  Replaced by the inner text.
+ *
+ *  The alphanumeric-only constraint is deliberate and NARROWER than a plain
+ *  "non-caret non-space" run: it distinguishes a genuine single superscript /
+ *  highlight token (`x^2^`, `^highlighted^`) from a whitespace-free math
+ *  expression whose carets are INDEPENDENT exponents (`a^2+b^2=c^2`). With a
+ *  permissive inner run the first two carets of `a^2+b^2=c^2` pair up (`^2+b^`)
+ *  and get stripped, mangling the math; requiring the inner run to be pure
+ *  alphanumerics means `^2+b^` never matches (the `+` breaks the run), so
+ *  `a^2+b^2=c^2`, `2^8`, and `x^n` all pass through untouched. */
+const CARET_PAIR = /\^([A-Za-z0-9]+)\^/g;
 
 /** Footnote reference marker `[^N]` (digits only) NOT immediately followed by
  *  `:` (which would make it a footnote DEFINITION line we leave intact). Removed

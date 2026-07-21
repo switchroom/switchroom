@@ -58,6 +58,19 @@ describe("guardUnsupportedTokens — deterministic send-time repair", () => {
     );
   });
 
+  it("leaves whitespace-free multi-caret math expressions intact (no false superscript pairing)", () => {
+    // Review MED-LOW: the caret pair must NOT span two independent exponents.
+    // A permissive inner run would pair `^2+b^` in `a^2+b^2=c^2` and strip the
+    // carets, mangling the math. The alphanumeric-only inner run breaks the run
+    // at `+`/`=`/`-`, so each is left as a literal caret expression.
+    expect(guardUnsupportedTokens("a^2+b^2=c^2")).toBe("a^2+b^2=c^2");
+    expect(guardUnsupportedTokens("2^8")).toBe("2^8");
+    expect(guardUnsupportedTokens("x^n")).toBe("x^n");
+    expect(guardUnsupportedTokens("compute a^2-b^2 now")).toBe("compute a^2-b^2 now");
+    // And a real single superscript token is still repaired.
+    expect(guardUnsupportedTokens("x^2^ metres")).toBe("x2 metres");
+  });
+
   it("leaves in-prose bracket literals intact, repairs real numeric footnotes", () => {
     // `array[^index]` is a negated-char-class / index literal, not a footnote.
     expect(guardUnsupportedTokens("array[^index] lookup")).toBe(

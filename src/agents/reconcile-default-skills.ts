@@ -335,6 +335,34 @@ export function reconcileAgentDefaultSkills(
     }
   }
 
+  // Retired-default sweep (footgun E, review MED): the per-entry prune above
+  // only visits keys STILL in `defaults`, so a skill REMOVED from the defaults
+  // list entirely (e.g. telegram-formatting once it is dropped from
+  // getBuiltinDefaultSkillEntries and deleted from the pool) is never revisited
+  // and its owned `.claude/skills/<name>` link dangles forever — the exact
+  // ghost-reference doctor keeps flagging. Sweep the skills dir for links this
+  // reconciler OWNS (target resolves under the bundled pool, via the strict
+  // `isOwnedBundledLink`) whose name is no longer a current default, and remove
+  // them. Strictly scoped: a personal-pool link (`skills/<name>`), an operator
+  // hand-link (foreign target), and a real dir/file are all structurally out of
+  // scope, so operator/personal skills are never touched. A still-current
+  // default link never matches because its name IS in `defaultKeys`.
+  const defaultKeys = new Set(defaults.map((d) => d.key));
+  let dirEntries: string[] = [];
+  try {
+    dirEntries = readdirSync(targetDir);
+  } catch { /* dir vanished — nothing to sweep */ }
+  for (const linkName of dirEntries) {
+    if (defaultKeys.has(linkName)) continue;
+    const dest = join(targetDir, linkName);
+    if (!isOwnedBundledLink(dest, poolDir)) continue;
+    try {
+      rmSync(dest, { force: true });
+      result.pruned.push(linkName);
+      result.changed = true;
+    } catch { /* best effort */ }
+  }
+
   return result;
 }
 
