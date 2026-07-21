@@ -100,6 +100,24 @@ COPY dist/host-control/main.js /opt/switchroom/dist/host-control/main.js
 COPY profiles/ /opt/switchroom/profiles/
 COPY vendor/hindsight-memory/ /opt/switchroom/vendor/hindsight-memory/
 
+# The `update` flow's sync-bundled-skills step resolves the shipped
+# skills/ payload the same package-relative way and mirrors it into the
+# host-stable pool `~/.switchroom/skills/_bundled/`:
+#   src/cli/update.ts:  resolve(import.meta.dirname,"../../skills")
+# Without this, /opt/switchroom/skills is absent, sync-bundled-skills
+# hits its `!existsSync(source)` guard and SILENTLY SKIPS — so builtin
+# default skills (dev-protocol, mental-model-curator, telegram-
+# formatting, …) never reach the pool and never symlink into agents —
+# and the subsequent verify-bundled-skills step then throws, stranding
+# the fleet on the old image (the ghost-skills incident). Same failure
+# class as the profiles/vendor omission above, one asset over. hostd is
+# the ONE container that runs update, so it alone needs this tree; agent
+# images read the already-synced host pool via bind mount and do NOT
+# bake it. Keep in sync with missingApplyAssets() in
+# src/host-control/server.ts (the up-front preflight that now refuses an
+# update_apply when this tree is missing rather than stranding a fleet).
+COPY skills/ /opt/switchroom/skills/
+
 # hindsight autoheal loop (#2910). The hostd compose adds a tiny
 # `switchroom-hindsight-autoheal` sidecar that runs THIS script on the hostd
 # image (chosen because it already carries the docker CLI + routes through the
