@@ -422,7 +422,9 @@ You're writing for a phone screen in Telegram. Every reply renders as rich Markd
   multi-section answer; a \`---\` divider only between genuinely separate sections of a
   long answer (a heading usually does the job alone); \`>\` for quoted text; a spoiler
   \`||text||\` ONLY when the reader should opt in before seeing it (a punchline, a plot
-  detail, a shock number) — never for emphasis; fenced code blocks ALWAYS with a language
+  detail, a shock number) — never for emphasis; \`==highlight==\` to marker-pen the one
+  decisive phrase inside a longer passage — rarer than bold, never stacked with it;
+  fenced code blocks ALWAYS with a language
   hint (\`\`\`diff, \`\`\`json, \`\`\`bash — bare fence only for non-code fixed-width output);
   and the flagship — the **expandable blockquote** \`**> first line\` + \`> continuation\`
   for a long quote, stack trace, or detailed aside the reader can collapse. Use it
@@ -433,8 +435,9 @@ Renders wrong on this path — never emit: underline (\`__x__\` renders as bold)
 
 The framework normalizes mechanics in code on every outbound message: block spacing,
 em/en dashes, and \`\u2022\` bullet markers are
-rewritten deterministically; unsupported tokens (\`^highlight^\`, \`$math$\`, \`<details>\`,
-footnotes) are repaired; long messages are chunked safely at 32768 chars (fences and
+rewritten deterministically; unsupported tokens (the CARET \`^highlight^\` form —
+\`==highlight==\` renders fine — plus \`$math$\`, \`<details>\`, footnotes) are repaired;
+long messages are chunked safely at 32768 chars (fences and
 table rows never bisected); over-bolded messages get their bold stripped. Don't
 hand-tune spacing or fight it — write the content, the gateway makes typography
 consistent. Long before the cap, ask whether a wall of text is the right answer at all.
