@@ -183,12 +183,38 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  /** Create a personal-pool skill dir OUTSIDE _bundled and link the agent to it. */
+  /**
+   * Create a personal-pool skill dir at a PRODUCTION-FAITHFUL path and link the
+   * agent to it. Real personal/shared-pool skills live at
+   * `~/.switchroom/skills/<name>` (verified on the live host: klanker's coolify
+   * link → `/home/kenthompson/.switchroom/skills/coolify`). Note the leading
+   * dot: `.switchroom` means the path does NOT contain the substring
+   * `/switchroom/skills/`, so `isOwnedStaleLink` returns FALSE for it — the
+   * refresh path treats it as foreign and spares it. This fixture reproduces
+   * that exact shape (a `.switchroom/skills/` root), so the test exercises the
+   * real production classification, not an accidental tmp path.
+   */
   function makePersonalLink(name: string): string {
-    const personalPool = join(tmpRoot, "personal");
+    const personalPool = join(tmpRoot, "home", "op", ".switchroom", "skills");
     const target = join(personalPool, name);
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, "SKILL.md"), `# personal ${name}\n`, "utf-8");
+    symlinkSync(target, join(skillsDir, name));
+    return target;
+  }
+
+  /**
+   * Create a link whose target sits under a DEV-CHECKOUT-shaped path
+   * (`.../switchroom/skills/<name>`, NO leading dot) — the one shape that DOES
+   * contain `/switchroom/skills/`, so `isOwnedStaleLink` returns TRUE. This is
+   * the legacy dev-checkout / cross-repo migration case (#1164) the refresh
+   * path is meant to heal, distinct from a `.switchroom` personal-pool link.
+   */
+  function makeDevCheckoutLink(name: string): string {
+    const devPool = join(tmpRoot, "home", "op", "switchroom", "skills");
+    const target = join(devPool, name);
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "SKILL.md"), `# devcheckout ${name}\n`, "utf-8");
     symlinkSync(target, join(skillsDir, name));
     return target;
   }
@@ -218,15 +244,45 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
   });
 
   it("CRITICAL: a personal-pool link SURVIVES a converge where its target is transiently missing", () => {
-    // Personal link whose target dir has vanished mid-sync (dangling), name
-    // NOT opted out. The broad isOwnedStaleLink would delete it; the strict
-    // _bundled-scoped prune must not — its target is not under the pool.
+    // Production-shaped personal link (target under `.switchroom/skills/`) at a
+    // default-key name, NOT opted out, whose target dir has vanished mid-sync.
+    // src (poolDir/skill-a) exists, so this hits the refresh path, not the
+    // prune. isOwnedStaleLink is FALSE for a `.switchroom/skills/` target (the
+    // dot breaks the `/switchroom/skills/` substring — verified on the live
+    // host), so the link is classified foreign and spared.
     const target = makePersonalLink("skill-a");
     rmSync(target, { recursive: true, force: true }); // transiently missing
     const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
     expect(r.pruned).not.toContain("skill-a");
-    // Still a symlink (not deleted), even though it currently dangles.
+    // Still a symlink (not deleted / not reclaimed), even though it dangles.
     expect(lstatSync(join(skillsDir, "skill-a")).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(target);
+  });
+
+  it("REFRESH PATH: a production `.switchroom/skills/` personal link at a default-key name is SPARED (not reclaimed)", () => {
+    // The refresh path (review #5): src present, non-opt-out, dest is a
+    // personal link named like a default key. On the live host the target is
+    // `~/.switchroom/skills/<name>` which does NOT match isOwnedStaleLink, so
+    // production spares it (conflict). This fixture reproduces that shape and
+    // asserts the real outcome — no ownership clobber.
+    const target = makePersonalLink("skill-a");
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(r.conflicts).toContain("skill-a");
+    expect(r.added).not.toContain("skill-a");
+    // Still points at the operator's personal skill, NOT the bundled pool.
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(target);
+  });
+
+  it("REFRESH PATH: a legacy DEV-CHECKOUT `/switchroom/skills/` link at a default-key name IS reclaimed to the pool (#1164 heal)", () => {
+    // The one shape that DOES contain `/switchroom/skills/` (no leading dot) —
+    // a legacy dev-checkout link. isOwnedStaleLink returns TRUE, so the refresh
+    // path heals it to the bundled link. This documents the deliberate migration
+    // reclaim and distinguishes it from the `.switchroom` personal-pool case.
+    makeDevCheckoutLink("skill-a");
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(r.added).toContain("skill-a");
+    // Now points into the bundled pool (reclaimed).
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
   });
 
   it("opt-out NEVER removes a real dir/file at the skill path", () => {
