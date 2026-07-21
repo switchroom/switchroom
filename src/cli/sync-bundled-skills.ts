@@ -60,6 +60,13 @@ export interface SyncBundledSkillsResult {
   /** Pool dirs left untouched because they are not switchroom-owned
    *  (never appeared in a manifest) — hand-added skills survive. */
   preserved: string[];
+  /** Shipped skill names that COLLIDED with a pre-existing, switchroom-unowned
+   *  pool dir (a hand-added skill of the same name). Rather than silently wipe
+   *  the operator's content (which would violate the footgun-B guarantee), the
+   *  existing dir is preserved as a timestamped `<name>.operator-backup-<ts>`
+   *  sibling, a loud stderr warning is emitted, and the shipped skill takes
+   *  over the canonical name (a deliberate, visible ownership transfer). */
+  ownershipTransferred: string[];
   /** True when there was no prior manifest (bootstrap: delete nothing). */
   firstRun: boolean;
   /** True when a prior manifest existed but could not be parsed
@@ -143,6 +150,7 @@ export function syncBundledSkills(opts: {
     updated: [],
     removed: [],
     preserved: [],
+    ownershipTransferred: [],
     firstRun: false,
     manifestCorrupt: false,
   };
@@ -161,9 +169,49 @@ export function syncBundledSkills(opts: {
 
   // 1. Copy every shipped skill (add or update), atomically per skill.
   for (const name of shipped) {
-    const existed = existsSync(join(dest, name));
-    stageAndSwap(join(source, name), join(dest, name), dest, name);
-    if (priorSkills.has(name) || existed) result.updated.push(name);
+    const destSkill = join(dest, name);
+    const existed = existsSync(destSkill);
+
+    // Ownership-collision guard (footgun-B guarantee: NEVER silently wipe a
+    // hand-added skill). A shipped name colliding with a pre-existing pool dir
+    // that switchroom does NOT own — i.e. it exists, is absent from the prior
+    // manifest, and we are NOT on the first-run bootstrap (where every
+    // pre-manifest dir is legitimately adopted) — is an operator hand-add of
+    // the same name. Preserve its content as a timestamped backup, warn
+    // loudly, and record the transfer, rather than overwriting silently. A
+    // corrupt manifest (priorSkills empty, but not firstRun) also lands here:
+    // we cannot prove ownership, so we fail safe and back up before overwrite.
+    let transferred = false;
+    if (existed && !priorSkills.has(name) && !result.firstRun) {
+      const backup = join(dest, `${name}.operator-backup-${process.pid}-${Date.now()}`);
+      try {
+        renameSync(destSkill, backup);
+        transferred = true;
+        result.ownershipTransferred.push(name);
+        process.stderr.write(
+          `switchroom: WARNING — a shipped skill "${name}" collides with an ` +
+            `operator-added pool dir of the same name. Preserved the existing ` +
+            `content as "${backup}" and installed the shipped skill under "${name}". ` +
+            `If you meant to keep your version, rename it to a distinct skill name.\n`,
+        );
+      } catch {
+        // Backup failed — do NOT overwrite blindly; skip this name so operator
+        // content survives, and record the unresolved collision.
+        result.ownershipTransferred.push(name);
+        process.stderr.write(
+          `switchroom: WARNING — shipped skill "${name}" collides with an ` +
+            `operator-added pool dir and the preservation backup failed; left the ` +
+            `existing dir in place and did NOT install the shipped skill. Resolve ` +
+            `the name collision manually.\n`,
+        );
+        continue;
+      }
+    }
+
+    stageAndSwap(join(source, name), destSkill, dest, name);
+    // After a transfer the old content was moved aside, so the shipped skill
+    // is a fresh install under that name (added), not an update of an owned one.
+    if (!transferred && (priorSkills.has(name) || existed)) result.updated.push(name);
     else result.added.push(name);
   }
 

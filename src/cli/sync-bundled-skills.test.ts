@@ -177,4 +177,64 @@ describe("syncBundledSkills", () => {
       : [];
     expect(leftovers).toEqual([]);
   });
+
+  it("COLLISION: a shipped skill NEVER silently wipes a hand-added skill of the SAME name (footgun-B, review #4)", () => {
+    // Round 1: establish the manifest with alpha.
+    makeSkill(source, "alpha");
+    syncBundledSkills({ source, dest, version: "1" });
+    // Operator hand-adds a pool skill named `foo` (NOT in the manifest).
+    makeSkill(dest, "foo", "PRECIOUS-OPERATOR-CONTENT");
+
+    // Round 2: a later release now ALSO ships a skill named `foo`.
+    makeSkill(source, "foo", "SHIPPED-FOO");
+    const r = syncBundledSkills({ source, dest, version: "2" });
+
+    // The collision is recorded and surfaced as a deliberate ownership transfer.
+    expect(r.ownershipTransferred).toContain("foo");
+    // The shipped skill takes the canonical name...
+    expect(skillBody(dest, "foo")).toContain("SHIPPED-FOO");
+    // ...but the operator's content is PRESERVED (never wiped) in a backup dir.
+    const backups = require("node:fs")
+      .readdirSync(dest)
+      .filter((n: string) => n.startsWith("foo.operator-backup-"));
+    expect(backups.length).toBe(1);
+    expect(
+      readFileSync(join(dest, backups[0], "SKILL.md"), "utf8"),
+    ).toContain("PRECIOUS-OPERATOR-CONTENT");
+    // The manifest now owns foo.
+    expect(readManifest(dest).skills.sort()).toEqual(["alpha", "foo"]);
+  });
+
+  it("COLLISION: an already-owned skill of the same name is a normal update, NOT a collision", () => {
+    makeSkill(source, "alpha", "V1");
+    syncBundledSkills({ source, dest, version: "1" }); // alpha now owned
+    makeSkill(source, "alpha", "V2");
+    const r = syncBundledSkills({ source, dest, version: "2" });
+    // alpha was switchroom-owned, so refreshing it is not an ownership transfer.
+    expect(r.ownershipTransferred).not.toContain("alpha");
+    expect(r.updated).toContain("alpha");
+    const backups = require("node:fs")
+      .readdirSync(dest)
+      .filter((n: string) => n.includes(".operator-backup-"));
+    expect(backups).toEqual([]);
+  });
+
+  it("corrupt manifest ADOPTS previously-owned retired skills as un-owned (review #6 — documents orphan behavior)", () => {
+    // Round 1: ship alpha + gamma (both owned).
+    makeSkill(source, "alpha");
+    makeSkill(source, "gamma");
+    syncBundledSkills({ source, dest, version: "1" });
+    // Corrupt the manifest, then a round that drops gamma.
+    writeFileSync(join(dest, BUNDLED_SKILL_MANIFEST_NAME), "{ broken", "utf8");
+    rmSync(join(source, "gamma"), { recursive: true, force: true });
+    const r = syncBundledSkills({ source, dest, version: "2" });
+
+    // Fail-closed: gamma is NOT deleted (safe direction). It is now treated as
+    // un-owned (preserved), which the review flags as orphan accumulation —
+    // pinned here so the behavior is deliberate and visible, not silent.
+    expect(r.manifestCorrupt).toBe(true);
+    expect(r.removed).toEqual([]);
+    expect(r.preserved).toContain("gamma");
+    expect(existsSync(join(dest, "gamma"))).toBe(true);
+  });
 });
