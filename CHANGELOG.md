@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v0.19.11 — Telegram formatting: full Bot API 10.1 surface folded into the resident floor card
+
+### Telegram formatting (#3496)
+
+- **Full rich-message surface now resident in the floor card** — the v0.19.10
+  cut (#3494) made the system-prompt floor card the primary formatting guidance
+  and deleted the on-demand `telegram-formatting` skill. With no skill left to
+  load, the card itself must cover the FULL surface. The
+  `TELEGRAM_FORMATTING_FLOOR_CARD` now folds in the constructs that were still
+  skill-only (or nowhere): italic, strikethrough, spoiler `||text||`, ordered
+  lists, nested lists, the `---` divider, and `==highlight==` — each with
+  when-to-use guidance and its misuse warning, inside the existing three-tier
+  structure.
+- **Guide mirror re-synced in lockstep** — `reference/telegram-formatting-guide.md`'s
+  verbatim FLOOR CARD section is updated to match the constant exactly
+  (hand-synced by design; the constant's doc comment documents this).
+- **Normalizer anti-list clarified** — only the caret `^highlight^` form is
+  repaired away; the `==...==` form renders fine and is now recommended.
+- Tests assert the new substrings survive into every generated `start.sh` on
+  both scaffold and reconcile paths.
+
 ## v0.19.10 — Telegram formatting goes resident + deterministic; hostd ships bundled skills
 
 ### Fixes
