@@ -36,7 +36,7 @@ function fakeRunner() {
 }
 
 describe("planUpdate", () => {
-  it("produces 9 steps in default mode (no --rebuild)", () => {
+  it("produces 10 steps in default mode (no --rebuild)", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-plan-"));
     try {
       const composePath = join(tmp, "docker-compose.yml");
@@ -54,6 +54,7 @@ describe("planUpdate", () => {
         "refresh-web",
         "refresh-hindsight",
         "sync-bundled-skills",
+        "verify-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
         "doctor",
@@ -269,6 +270,7 @@ describe("planUpdate", () => {
         "refresh-web",
         "refresh-hindsight",
         "sync-bundled-skills",
+        "verify-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
         "doctor",

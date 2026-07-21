@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { execSync, execFileSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
@@ -1720,7 +1720,12 @@ function migrateLegacySkillsDir(agentDir: string, skillsPool: string): void {
     } catch {
       continue; // not a symlink — leave it
     }
-    if (target && target.startsWith(skillsPool)) {
+    // Resolve relative targets against the link dir so both the current
+    // RELATIVE link form and the legacy ABSOLUTE form are recognized (footgun A).
+    const resolved = target
+      ? (isAbsolute(target) ? target : resolve(dirname(entryPath), target))
+      : null;
+    if (resolved && resolved.startsWith(skillsPool)) {
       try {
         rmSync(entryPath, { force: true });
       } catch { /* best effort */ }
@@ -1772,6 +1777,11 @@ function syncGlobalSkills(
       );
       continue;
     }
+    // Relative link target (footgun A): a path relative to the link's own
+    // directory, so it resolves identically across container mount contexts
+    // (hostd's /host-home view vs the agent's /home view share one
+    // ~/.switchroom root). Depth is computed, never hardcoded.
+    const relTarget = relative(dirname(dest), src);
     // If dest exists and is a symlink to the right target, leave it.
     // If dest exists as a real file/dir (e.g. from profile copySkills),
     // also leave it — profile-bundled skills take priority over the
@@ -1785,14 +1795,23 @@ function syncGlobalSkills(
       linkStat = null;
     }
     if (linkStat) {
-      // Broken symlink into the pool: replace it (the old target is
-      // gone, so we can safely recreate). Anything else: leave alone.
       if (linkStat.isSymbolicLink()) {
         let target: string | null = null;
         try {
           target = readlinkSync(dest);
         } catch { /* unreadable; leave alone */ }
-        if (target && target.startsWith(skillsPool)) {
+        // Already the correct RELATIVE link — idempotent no-op.
+        if (target === relTarget) {
+          continue;
+        }
+        // A link pointing into the pool (resolved against the link dir so
+        // a legacy ABSOLUTE target is handled too): replace it — this both
+        // heals a stale/broken pool link and migrates an absolute link to
+        // the relative form. Anything foreign: leave alone.
+        const resolved = target
+          ? (isAbsolute(target) ? target : resolve(dirname(dest), target))
+          : null;
+        if (resolved && resolved.startsWith(skillsPool)) {
           try {
             rmSync(dest, { force: true });
           } catch { /* best effort */ }
@@ -1804,7 +1823,7 @@ function syncGlobalSkills(
       }
     }
     try {
-      symlinkSync(src, dest);
+      symlinkSync(relTarget, dest);
     } catch (err) {
       console.warn(
         `  WARNING: failed to symlink skill "${name}": ${(err as Error).message}`,
@@ -1828,10 +1847,16 @@ function syncGlobalSkills(
     } catch {
       continue; // not a symlink
     }
-    if (linkTarget && linkTarget.includes("/.switchroom/skills/_bundled/")) {
+    // Resolve relative targets against the link dir before classifying, so
+    // the current RELATIVE link form is recognized as well as the legacy
+    // ABSOLUTE form (footgun A).
+    const resolved = linkTarget
+      ? (isAbsolute(linkTarget) ? linkTarget : resolve(dirname(entryPath), linkTarget))
+      : null;
+    if (resolved && resolved.includes("/.switchroom/skills/_bundled/")) {
       continue; // owned by reconcile-default-skills
     }
-    if (linkTarget && linkTarget.startsWith(skillsPool)) {
+    if (resolved && resolved.startsWith(skillsPool)) {
       rmSync(entryPath, { force: true });
     }
   }
@@ -1921,7 +1946,14 @@ export function installSwitchroomSkills(
       try {
         currentTarget = readlinkSync(dest);
       } catch { /* unreadable — assume foreign, leave alone */ }
-      if (currentTarget !== join(builtinSkillsDir, name)) continue;
+      // Retract a link we plausibly installed — in either the RELATIVE
+      // form (current) or the legacy ABSOLUTE form (pre-footgun-A). Resolve
+      // relative targets against the link dir before comparing.
+      if (!currentTarget) continue;
+      const resolvedTarget = isAbsolute(currentTarget)
+        ? currentTarget
+        : resolve(dirname(dest), currentTarget);
+      if (resolvedTarget !== join(builtinSkillsDir, name)) continue;
       try {
         rmSync(dest, { force: true });
       } catch { /* best effort */ }
@@ -1933,10 +1965,13 @@ export function installSwitchroomSkills(
   for (const name of switchroomSkillNames) {
     const src = join(builtinSkillsDir, name);
     const dest = join(targetDir, name);
+    // Relative link target (footgun A) — mount-context-invariant, computed
+    // depth (never a hardcoded `../` literal).
+    const relTarget = relative(dirname(dest), src);
     // Idempotent: leave correctly-pointing symlinks and real dirs alone.
     // But refresh stale symlinks whose target is a different switchroom-
     // lookalike path (e.g. old clerk/skills/ after the clerk→switchroom
-    // rename). Otherwise reconcile can't heal a botched cross-repo state.
+    // rename), AND migrate a correct-but-absolute legacy link to relative.
     let existing;
     try {
       existing = lstatSync(dest);
@@ -1949,7 +1984,7 @@ export function installSwitchroomSkills(
         try {
           currentTarget = readlinkSync(dest);
         } catch { /* unreadable */ }
-        if (currentTarget === src) continue; // already correct
+        if (currentTarget === relTarget) continue; // already correct (relative)
         try {
           rmSync(dest, { force: true });
         } catch { /* best effort; symlinkSync below will error cleanly */ }
@@ -1958,7 +1993,7 @@ export function installSwitchroomSkills(
       }
     }
     try {
-      symlinkSync(src, dest);
+      symlinkSync(relTarget, dest);
     } catch (err) {
       console.warn(
         `  WARNING: failed to symlink switchroom skill "${name}": ${(err as Error).message}`,
@@ -2351,7 +2386,7 @@ export function dirContentEquals(
  * Seed the agent's `workspace/` directory from the profile's `workspace/`
  * subdirectory (if any). `.hbs` files are rendered with the handlebars
  * context; everything else is copied verbatim. Existing files are preserved
- * so user edits survive `switchroom reconcile` runs.
+ * so user edits survive `switchroom apply` runs.
  *
  * Profiles should put OpenClaw-style bootstrap files (AGENTS.md, USER.md,
  * IDENTITY.md, TOOLS.md, MEMORY.md, ...) under their `workspace/` dir. At
@@ -3931,6 +3966,72 @@ export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
   },
 ];
 
+/**
+ * Compute the effective `permissions.allow` list for an agent's
+ * settings.json from its resolved config (footgun G — one converge engine).
+ *
+ * This is the SINGLE SOURCE OF TRUTH for the allow-list, called by BOTH the
+ * create path (`scaffoldAgent`) and the reconcile path (`reconcileAgentInner`).
+ * The two used to inline byte-identical copies with a comment demanding they
+ * "stay in lockstep" — the exact drift footgun. Extracting it makes the
+ * lockstep a compile-time fact, not a discipline, and the scaffold↔reconcile
+ * parity test pins that no caller diverges.
+ *
+ * IMPORTANT: this reads `agentConfig.tools.allow` as-is. The reconcile path's
+ * separate legacy-token strip (which mutates the persisted `tools.allow`) must
+ * run AFTER this is called, so the computed allow-list matches the historical
+ * pre-strip `baseAllow` behaviour exactly. Do not reorder.
+ *
+ * @param agentConfig      Cascade-resolved agent config.
+ * @param hindsightEnabled Result of `isHindsightEnabled(switchroomConfig)`
+ *                         (passed in so both callers share the one probe).
+ */
+export function computeDesiredPermissionAllow(
+  agentConfig: AgentConfig,
+  hindsightEnabled: boolean,
+): string[] {
+  const tools = agentConfig.tools ?? { allow: [], deny: [] };
+  const rawAllow = tools.allow ?? [];
+  const hasAllWildcard = rawAllow.includes("all");
+  const baseAllow = hasAllWildcard
+    // `[all]` means "all built-ins" — but it must ALSO keep any explicit tools
+    // the operator listed alongside it. A 🔁 "Always allow" tap persists a
+    // privileged hostd / Skill / 3rd-party-MCP rule into tools.allow as
+    // `[all, mcp__hostd__agent_logs]` (those are deliberately NOT in
+    // ALL_BUILTIN_TOOLS — the leash: even an [all] admin approves them once).
+    // Dropping the explicit entries here is why such grants never reached
+    // settings.json and the agent re-asked forever (klanker, 2026-06-15).
+    ? [...ALL_BUILTIN_TOOLS, ...rawAllow.filter((t) => t !== "all")]
+    : rawAllow.filter((t) => t !== "all");
+  // If the user didn't specify any allowed tools AND dangerous_mode is off,
+  // seed a safe read-only default set so routine tool calls don't spam the
+  // approval UI. Risky tools still prompt and hit the Telegram button flow.
+  const dangerousMode = agentConfig.dangerous_mode === true;
+  const hadExplicitAllow = rawAllow.length > 0;
+  const readOnlyDefaults =
+    !dangerousMode && !hadExplicitAllow ? DEFAULT_READ_ONLY_PREAPPROVED_TOOLS : [];
+  return dedupe([
+    ...baseAllow,
+    ...readOnlyDefaults,
+    ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
+    ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
+    // agent-config + hostd are always wired into .mcp.json so the
+    // prompt fragment can claim "you have these tools available" —
+    // but Claude Code blocks the first call on a permission prompt
+    // unless the tool is on the allow list. Pre-approve unconditionally
+    // (daemon-side gates remain the real security boundary).
+    ...AGENT_CONFIG_MCP_TOOLS,
+    ...HOSTD_MCP_TOOLS,
+    // Webkite is fleet-default (resolveWebkiteMcpEntry) unless the agent
+    // opts out. Pre-approve its tools so the first web fetch doesn't
+    // wedge on a permission prompt — webkite IS the web-fetch path now
+    // (native WebFetch/WebSearch are denied). Gated on the same opt-out
+    // as the MCP entry emission, so a webkite-disabled agent doesn't
+    // carry dangling pre-approvals.
+    ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
+  ]);
+}
+
 export function scaffoldAgent(
   name: string,
   agentConfigRaw: AgentConfig,
@@ -3994,46 +4095,12 @@ export function scaffoldAgent(
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
   const rawAllow = tools.allow ?? [];
   const hasAllWildcard = rawAllow.includes("all");
-  const baseAllow = hasAllWildcard
-    // `[all]` means "all built-ins" — but it must ALSO keep any explicit tools
-    // the operator listed alongside it. A 🔁 "Always allow" tap persists a
-    // privileged hostd / Skill / 3rd-party-MCP rule into tools.allow as
-    // `[all, mcp__hostd__agent_logs]` (those are deliberately NOT in
-    // ALL_BUILTIN_TOOLS — the leash: even an [all] admin approves them once).
-    // Dropping the explicit entries here is why such grants never reached
-    // settings.json and the agent re-asked forever (klanker, 2026-06-15).
-    ? [...ALL_BUILTIN_TOOLS, ...rawAllow.filter((t) => t !== "all")]
-    : rawAllow.filter((t) => t !== "all");
-  // If the user didn't specify any allowed tools AND dangerous_mode is off,
-  // seed a safe read-only default set so routine tool calls don't spam the
-  // approval UI. Risky tools still prompt and hit the Telegram button flow.
-  const dangerousMode = agentConfig.dangerous_mode === true;
-  const hadExplicitAllow = rawAllow.length > 0;
-  const readOnlyDefaults =
-    !dangerousMode && !hadExplicitAllow ? DEFAULT_READ_ONLY_PREAPPROVED_TOOLS : [];
   // Single source of truth — honors SWITCHROOM_MEMORY_BACKEND=none
   // (install-validation 2026-05-17, R2 / prior #25).
   const hindsightEnabled = isHindsightEnabled(switchroomConfig);
-  const permissionAllow = dedupe([
-    ...baseAllow,
-    ...readOnlyDefaults,
-    ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
-    ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
-    // agent-config + hostd are always wired into .mcp.json so the
-    // prompt fragment can claim "you have these tools available" —
-    // but Claude Code blocks the first call on a permission prompt
-    // unless the tool is on the allow list. Pre-approve unconditionally
-    // (daemon-side gates remain the real security boundary).
-    ...AGENT_CONFIG_MCP_TOOLS,
-    ...HOSTD_MCP_TOOLS,
-    // Webkite is fleet-default (resolveWebkiteMcpEntry) unless the agent
-    // opts out. Pre-approve its tools so the first web fetch doesn't
-    // wedge on a permission prompt — webkite IS the web-fetch path now
-    // (native WebFetch/WebSearch are denied). Gated on the same opt-out
-    // as the MCP entry emission, so a webkite-disabled agent doesn't
-    // carry dangling pre-approvals.
-    ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
-  ]);
+  // The allow-list computation is shared with reconcileAgentInner via
+  // computeDesiredPermissionAllow (footgun G — one source of truth, no drift).
+  const permissionAllow = computeDesiredPermissionAllow(agentConfig, hindsightEnabled);
 
   // Compute Hindsight plugin context for the start.sh + settings.json
   // templates. Mirrors installHindsightPlugin's gating logic so the
@@ -6317,35 +6384,25 @@ function reconcileAgentInner(
   }
 
   // Compute the desired permissions.allow list from current config.
-  // IMPORTANT: this must stay in lockstep with scaffoldAgent's permissionAllow
-  // computation — including the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection
-  // when tools.allow is empty and dangerous_mode is off. Without this, the
-  // first `switchroom reconcile` after scaffold wipes the read-only defaults
-  // and every Read/Grep/Glob starts triggering approval cards.
+  // Lockstep with scaffoldAgent is now STRUCTURAL, not a discipline: both call
+  // the one shared computeDesiredPermissionAllow (footgun G), which includes
+  // the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection when tools.allow is empty
+  // and dangerous_mode is off. (Before the extraction, a divergence here made
+  // the first `switchroom apply` after scaffold wipe the read-only defaults and
+  // storm the approval UI — the scaffold↔reconcile parity test guards it now.)
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
   const rawAllow = tools.allow ?? [];
   const hasAllWildcard = rawAllow.includes("all");
-  const baseAllow = hasAllWildcard
-    // `[all]` means "all built-ins" — but it must ALSO keep any explicit tools
-    // the operator listed alongside it. A 🔁 "Always allow" tap persists a
-    // privileged hostd / Skill / 3rd-party-MCP rule into tools.allow as
-    // `[all, mcp__hostd__agent_logs]` (those are deliberately NOT in
-    // ALL_BUILTIN_TOOLS — the leash: even an [all] admin approves them once).
-    // Dropping the explicit entries here is why such grants never reached
-    // settings.json and the agent re-asked forever (klanker, 2026-06-15).
-    ? [...ALL_BUILTIN_TOOLS, ...rawAllow.filter((t) => t !== "all")]
-    : rawAllow.filter((t) => t !== "all");
-  const reconcileDangerousMode = agentConfig.dangerous_mode === true;
-  const reconcileHadExplicitAllow = rawAllow.length > 0;
-  const reconcileReadOnlyDefaults =
-    !reconcileDangerousMode && !reconcileHadExplicitAllow
-      ? DEFAULT_READ_ONLY_PREAPPROVED_TOOLS
-      : [];
   // Single source of truth — must honor SWITCHROOM_MEMORY_BACKEND=none
   // here too: `switchroom agent restart` always reconciles first, so a
   // config-only check would re-wire Hindsight on every restart of a
   // `none` install (install-validation 2026-05-17, R2 review round 2).
   const hindsightEnabled = isHindsightEnabled(switchroomConfig);
+  // Allow-list shared with scaffoldAgent via computeDesiredPermissionAllow
+  // (footgun G — one source of truth, no lockstep drift). Computed BEFORE the
+  // legacy-token strip below, so it matches the historical pre-strip baseAllow
+  // behaviour byte-for-byte (the scaffold↔reconcile parity test pins this).
+  const desiredAllow = computeDesiredPermissionAllow(agentConfig, hindsightEnabled);
   // #235: drop legacy mcp__switchroom__* tokens from any pre-existing
   // allowlist on every reconcile so existing agents converge on the
   // same shape new ones get. #1400 link 1: same treatment for the
@@ -6359,17 +6416,6 @@ function reconcileAgentInner(
         !LEGACY_HOSTD_BLANKET_TOKENS.includes(p),
     );
   }
-  const desiredAllow = dedupe([
-    ...baseAllow,
-    ...reconcileReadOnlyDefaults,
-    ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
-    ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
-    // See scaffoldAgent for the rationale — pre-approve every-agent
-    // MCP servers so first-use doesn't wedge on a permission prompt.
-    ...AGENT_CONFIG_MCP_TOOLS,
-    ...HOSTD_MCP_TOOLS,
-    ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
-  ]);
   const desiredDeny = dedupe([
     ...(tools.deny ?? []),
     ...webkiteDenyForAgent(agentConfig),

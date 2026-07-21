@@ -37,7 +37,7 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, chownSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, chownSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -49,6 +49,9 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { validateBindSources, formatPreflightError } from "./preflight-mounts.js";
 import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
+import { getBuiltinDefaultSkillEntries } from "../memory/scaffold-integration.js";
+import { syncBundledSkills } from "./sync-bundled-skills.js";
+import { SWITCHROOM_VERSION } from "./resolve-version.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -707,14 +710,71 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         return;
       }
       try {
-        if (existsSync(dest)) {
-          rmSync(dest, { recursive: true, force: true });
-        }
         mkdirSync(dirname(dest), { recursive: true });
-        cpSync(source, dest, { recursive: true, dereference: false });
+        // Manifest-owned ADDITIVE sync (footgun B): copies/updates every
+        // shipped skill and deletes ONLY names switchroom previously shipped
+        // and no longer ships. Hand-added pool skills — and every dir that
+        // predates the manifest — are preserved, never `rm -rf`'d.
+        const r = syncBundledSkills({
+          source,
+          dest,
+          version: SWITCHROOM_VERSION,
+        });
+        if (r.manifestCorrupt) {
+          process.stderr.write(
+            `switchroom update: sync-bundled-skills — pool manifest was unreadable; ` +
+              `deleted nothing (fail-closed) and rewrote a clean manifest.\n`,
+          );
+        }
+        if (r.removed.length > 0) {
+          process.stderr.write(
+            `switchroom update: sync-bundled-skills — removed ${r.removed.length} retired ` +
+              `bundled skill(s): ${r.removed.join(", ")}.\n`,
+          );
+        }
       } catch (err) {
         throw new Error(
           `sync-bundled-skills failed: ${(err as Error).message}`,
+        );
+      }
+    },
+  });
+
+  // Loud guard (footgun C/D): every builtin default skill ships in the CLI
+  // package `skills/` dir, so after sync-bundled-skills the pool MUST contain
+  // all of them. A missing one is never an operator opt-out — it is a broken
+  // sync or a packaging regression, and silently skipping it (the historical
+  // behaviour) leaves every agent's CLAUDE.md referencing a skill that does
+  // not exist. Fail the update step loudly instead. The packaging test
+  // (reconcile-default-skills.test.ts) guarantees the source list ⊆ package
+  // skills/ at build time; this catches a corrupt/partial runtime sync.
+  steps.push({
+    name: "verify-bundled-skills",
+    description:
+      "Assert every builtin default skill is present in ~/.switchroom/skills/_bundled/ after sync.",
+    run: () => {
+      // Only verify the pool the REAL sync produces. When a test (or an
+      // embedder) overrides the sync via `syncBundledSkillsFn`, the runtime
+      // pool at ~/.switchroom was never populated by this run — verifying it
+      // would assert against unrelated host state. The unit-level guarantee
+      // (declared defaults ⊆ shipped skills/) is covered structurally by the
+      // packaging test; this step only guards the real cpSync path.
+      if (opts.syncBundledSkillsFn) return;
+      const dest = join(homedir(), ".switchroom", "skills", "_bundled");
+      if (!existsSync(dest)) {
+        // sync-bundled-skills legitimately skipped (CLI bundle without an
+        // adjacent skills/ payload, e.g. an unusual dev layout). Nothing to
+        // verify — don't manufacture a failure the sync itself declined to.
+        return;
+      }
+      const missing = getBuiltinDefaultSkillEntries()
+        .map((e) => e.key)
+        .filter((key) => !existsSync(join(dest, key)));
+      if (missing.length > 0) {
+        throw new Error(
+          `verify-bundled-skills: builtin default skill(s) missing from the pool after sync: ` +
+            `${missing.join(", ")}. These ship in the CLI package and must exist in ${dest}. ` +
+            `This is a broken sync or a packaging regression — the pool is not converged.`,
         );
       }
     },
