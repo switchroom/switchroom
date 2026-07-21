@@ -24,7 +24,7 @@
 
 import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { getBuiltinDefaultSkillEntries, type BuiltinSkillEntry } from "../memory/scaffold-integration.js";
 
 /** Track which missing-pool-dir warnings we've already emitted so the
@@ -52,6 +52,13 @@ export interface AgentSkillReconcileResult {
   optedOut: string[];
   /** Which skill keys were skipped because a real file/dir is in the way */
   conflicts: string[];
+  /** Which owned _bundled links were REMOVED by the ownership-scoped prune
+   *  (footgun E): a default that is now opted-out, or an owned link whose
+   *  pool target has gone missing (dangling). Strictly scoped — a prune here
+   *  can only ever touch a link at `<key>` (a current builtin-default key)
+   *  whose target resolves under `.../skills/_bundled/`. Personal-pool links
+   *  and operator hand-links are structurally out of scope. */
+  pruned: string[];
   /** True when at least one symlink was added or refreshed */
   changed: boolean;
 }
@@ -88,6 +95,37 @@ function isOwnedStaleLink(target: string, poolDir: string): boolean {
 }
 
 /**
+ * STRICT ownership test for the prune (footgun E, review CRITICAL).
+ *
+ * Returns true ONLY when `dest` is a symlink whose target resolves into the
+ * bundled pool dir `<poolDir>` (`.../skills/_bundled/`). This is deliberately
+ * NARROWER than `isOwnedStaleLink` (which matches any `/switchroom/skills/`
+ * target, INCLUDING personal-pool links `skills/<name>` — reusing it for the
+ * prune would delete operator/personal skills). A prune must never remove a
+ * personal-pool link (target `skills/<name>`) or an operator hand-link, so the
+ * prune scope is: name ∈ current builtin-default keys AND this predicate.
+ *
+ * Relative targets (the form switchroom writes post-footgun-A) are resolved
+ * against the link's own directory, exactly as the kernel does on traversal,
+ * so this works for both relative and legacy-absolute owned links.
+ */
+function isOwnedBundledLink(dest: string, poolDir: string): boolean {
+  let stored: string | null = null;
+  try {
+    if (!lstatSync(dest).isSymbolicLink()) return false;
+    stored = readlinkSync(dest);
+  } catch {
+    return false;
+  }
+  if (!stored) return false;
+  const resolved = isAbsolute(stored) ? stored : resolve(dirname(dest), stored);
+  // Normalize both to a trailing-slash boundary so `_bundled` can't match a
+  // sibling like `_bundledX`.
+  const poolPrefix = poolDir.endsWith("/") ? poolDir : poolDir + "/";
+  return resolved === poolDir || resolved.startsWith(poolPrefix);
+}
+
+/**
  * Reconcile the bundled-default skill set into a single agent.
  *
  * Rules:
@@ -117,6 +155,7 @@ export function reconcileAgentDefaultSkills(
     alreadyPresent: [],
     optedOut: [],
     conflicts: [],
+    pruned: [],
     changed: false,
   };
 
@@ -136,19 +175,43 @@ export function reconcileAgentDefaultSkills(
   }
 
   for (const entry of defaults) {
+    const dest = join(targetDir, entry.key);
+
     if (optOuts[entry.optOutKey] === false) {
       result.optedOut.push(entry.key);
+      // Ownership-scoped prune (footgun E): an opted-out default must not
+      // leave a stale owned link behind. Remove the link ONLY when it is an
+      // owned _bundled link (target resolves under the pool). A real dir, a
+      // personal-pool link, or an operator hand-link at this path is left
+      // untouched — the strict `isOwnedBundledLink` scope is what makes this
+      // safe (the review CRITICAL: never reuse the broad isOwnedStaleLink).
+      if (isOwnedBundledLink(dest, poolDir)) {
+        try {
+          rmSync(dest, { force: true });
+          result.pruned.push(entry.key);
+          result.changed = true;
+        } catch { /* best effort */ }
+      }
       continue;
     }
 
     const src = join(poolDir, entry.key);
     if (!existsSync(src)) {
-      // Pool missing this skill (e.g. trimmed install). Don't fail the
-      // whole reconcile — just skip silently.
+      // Pool missing this skill (e.g. trimmed install). Don't fail the whole
+      // reconcile. But if we're holding a now-DANGLING owned _bundled link
+      // for this default (target vanished), prune it — a dangling owned link
+      // is dead weight and confuses doctor. Same strict ownership scope: only
+      // an owned _bundled link, never a personal/real entry.
+      if (isOwnedBundledLink(dest, poolDir)) {
+        try {
+          rmSync(dest, { force: true });
+          result.pruned.push(entry.key);
+          result.changed = true;
+        } catch { /* best effort */ }
+      }
       continue;
     }
 
-    const dest = join(targetDir, entry.key);
     let existing;
     try {
       existing = lstatSync(dest);

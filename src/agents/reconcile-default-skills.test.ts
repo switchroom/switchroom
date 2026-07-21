@@ -25,7 +25,7 @@ import {
   lstatSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, relative } from "node:path";
 import { homedir } from "node:os";
 import {
   reconcileAgentDefaultSkills,
@@ -163,6 +163,96 @@ describe("reconcileAgentDefaultSkills", () => {
     const result = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
     expect(result.added.sort()).toEqual(["skill-a", "skill-b"]);
     expect(result.added).not.toContain("skill-c");
+  });
+});
+
+describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", () => {
+  let tmpRoot: string;
+  let poolDir: string;
+  let agentDir: string;
+  let skillsDir: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "sr-prune-"));
+    poolDir = makePool(tmpRoot, ["skill-a", "skill-b", "skill-c"]);
+    agentDir = makeAgentDir(tmpRoot, "ag1");
+    skillsDir = join(agentDir, ".claude", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  /** Create a personal-pool skill dir OUTSIDE _bundled and link the agent to it. */
+  function makePersonalLink(name: string): string {
+    const personalPool = join(tmpRoot, "personal");
+    const target = join(personalPool, name);
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "SKILL.md"), `# personal ${name}\n`, "utf-8");
+    symlinkSync(target, join(skillsDir, name));
+    return target;
+  }
+
+  it("opt-out REMOVES an existing owned _bundled link", () => {
+    // Install the owned link first.
+    symlinkSync(join(poolDir, "skill-a"), join(skillsDir, "skill-a"));
+    const r = reconcileAgentDefaultSkills(agentDir, { "skill-a": false }, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).toContain("skill-a");
+    expect(r.optedOut).toContain("skill-a");
+    expect(existsSync(join(skillsDir, "skill-a"))).toBe(false);
+  });
+
+  it("opt-out with no existing link prunes nothing (no phantom removal)", () => {
+    const r = reconcileAgentDefaultSkills(agentDir, { "skill-a": false }, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).not.toContain("skill-a");
+    expect(r.optedOut).toContain("skill-a");
+  });
+
+  it("CRITICAL: opt-out NEVER removes a personal-pool link at the same name", () => {
+    // A personal skill link named like a default key, target OUTSIDE _bundled.
+    makePersonalLink("skill-a");
+    const r = reconcileAgentDefaultSkills(agentDir, { "skill-a": false }, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).not.toContain("skill-a");
+    // The personal link survives.
+    expect(lstatSync(join(skillsDir, "skill-a")).isSymbolicLink()).toBe(true);
+  });
+
+  it("CRITICAL: a personal-pool link SURVIVES a converge where its target is transiently missing", () => {
+    // Personal link whose target dir has vanished mid-sync (dangling), name
+    // NOT opted out. The broad isOwnedStaleLink would delete it; the strict
+    // _bundled-scoped prune must not — its target is not under the pool.
+    const target = makePersonalLink("skill-a");
+    rmSync(target, { recursive: true, force: true }); // transiently missing
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).not.toContain("skill-a");
+    // Still a symlink (not deleted), even though it currently dangles.
+    expect(lstatSync(join(skillsDir, "skill-a")).isSymbolicLink()).toBe(true);
+  });
+
+  it("opt-out NEVER removes a real dir/file at the skill path", () => {
+    mkdirSync(join(skillsDir, "skill-a"), { recursive: true });
+    writeFileSync(join(skillsDir, "skill-a", "SKILL.md"), "operator content\n", "utf-8");
+    const r = reconcileAgentDefaultSkills(agentDir, { "skill-a": false }, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).not.toContain("skill-a");
+    expect(lstatSync(join(skillsDir, "skill-a")).isDirectory()).toBe(true);
+  });
+
+  it("prunes a DANGLING owned _bundled link when the pool drops the skill", () => {
+    // Owned link into the pool, then the pool loses skill-c.
+    symlinkSync(join(poolDir, "skill-c"), join(skillsDir, "skill-c"));
+    rmSync(join(poolDir, "skill-c"), { recursive: true, force: true });
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).toContain("skill-c");
+    expect(existsSync(join(skillsDir, "skill-c"))).toBe(false);
+  });
+
+  it("does not touch a relative owned _bundled link that is still current (no over-prune)", () => {
+    // Relative link (post-footgun-A form) that correctly resolves into the pool.
+    const rel = relative(dirname(join(skillsDir, "skill-a")), join(poolDir, "skill-a"));
+    symlinkSync(rel, join(skillsDir, "skill-a"));
+    const r = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(r.pruned).not.toContain("skill-a");
+    expect(existsSync(join(skillsDir, "skill-a"))).toBe(true);
   });
 });
 
