@@ -553,7 +553,6 @@ describe("getBuiltinDefaultSkillEntries", () => {
       "switchroom-health",
       "switchroom-runtime",
       "switchroom-status",
-      "telegram-formatting",
       "webapp-testing",
       "xlsx",
     ]);
@@ -570,7 +569,6 @@ describe("getBuiltinDefaultSkillEntries", () => {
       "switchroom-health",
       "switchroom-runtime",
       "switchroom-status",
-      "telegram-formatting",
     ]);
   });
 });

@@ -3271,13 +3271,19 @@ describe("scaffoldAgent with global defaults cascade", () => {
     // Stable distinctive substrings pulled verbatim from the floor card (none
     // contain single quotes, so POSIX single-quote wrapping leaves them intact).
     expect(startSh).toContain("## Formatting for Telegram");
-    expect(startSh).toContain("Hard cap is 32768 characters.");
+    expect(startSh).toContain("chunked safely at 32768 chars");
     expect(startSh).toContain("Every reply renders as rich Markdown");
-    // PR4: the card carries a one-line pointer to the on-demand full-palette
-    // skill. This is the adoption seam — dropping it silently disconnects the
-    // telegram-formatting skill from every agent's discovery path, so pin it.
-    expect(startSh).toContain("load the");
-    expect(startSh).toContain("telegram-formatting");
+    // The thickened card promotes the flagship rich constructs resident so the
+    // model reaches for them without loading anything: expandable blockquotes,
+    // fenced-code language hints, and the "renders wrong — never emit" anti-list.
+    expect(startSh).toContain("expandable blockquote");
+    expect(startSh).toContain("fenced code blocks ALWAYS with a language");
+    expect(startSh).toContain("never emit: underline");
+    // The on-demand telegram-formatting skill was deleted (its guidance is now
+    // resident + deterministically repaired at send time). The card must carry
+    // NO dangling pointer to it — a reference to a skill that no longer exists
+    // is the exact ghost-reference defect this change eliminates.
+    expect(startSh).not.toContain("telegram-formatting");
     // It rides the same --append-system-prompt var the operator passthrough uses.
     expect(startSh).toContain('--append-system-prompt "$APPEND_PROMPT"');
   });
@@ -3296,7 +3302,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     // Both present.
-    expect(startSh).toContain("Hard cap is 32768 characters.");
+    expect(startSh).toContain("chunked safely at 32768 chars");
     expect(startSh).toContain(operatorText);
     // Order: the floor card's marker precedes the operator's marker (prepended).
     const floorIdx = startSh.indexOf("## Formatting for Telegram");
@@ -3323,7 +3329,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
       "utf-8",
     );
     expect(startSh).toContain("## Formatting for Telegram");
-    expect(startSh).toContain("Hard cap is 32768 characters.");
+    expect(startSh).toContain("chunked safely at 32768 chars");
     // Operator passthrough still survives the reconcile path, prepended-after.
     expect(startSh).toContain(operatorText);
     const floorIdx = startSh.indexOf("## Formatting for Telegram");
