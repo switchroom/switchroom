@@ -25,8 +25,23 @@ import {
   lstatSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
+
+/**
+ * Assert `dest` is a switchroom-written skill link (footgun A):
+ *   - the stored target is RELATIVE (never absolute — an absolute link
+ *     baked with `homedir()` dangles across container mount contexts), and
+ *   - it RESOLVES to `expectedPoolTarget` from the link's own directory
+ *     (readlink + resolve lands on the pool file — the real invariant).
+ * Reading the raw target and resolving it is the only test that would have
+ * caught the absolute-link regression.
+ */
+function expectRelativeLinkResolvingTo(dest: string, expectedPoolTarget: string): void {
+  const stored = readlinkSync(dest);
+  expect(isAbsolute(stored)).toBe(false);
+  expect(resolve(dirname(dest), stored)).toBe(resolve(expectedPoolTarget));
+}
 import {
   reconcileAgentDefaultSkills,
   reconcileAllAgentDefaultSkills,
@@ -80,7 +95,7 @@ describe("reconcileAgentDefaultSkills", () => {
     for (const name of ["skill-a", "skill-b", "skill-c"]) {
       const dest = join(agentDir, ".claude", "skills", name);
       expect(lstatSync(dest).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(dest)).toBe(join(poolDir, name));
+      expectRelativeLinkResolvingTo(dest, join(poolDir, name));
     }
   });
 
@@ -91,6 +106,31 @@ describe("reconcileAgentDefaultSkills", () => {
     expect(second.added).toEqual([]);
     expect(second.alreadyPresent.sort()).toEqual(["skill-a", "skill-b", "skill-c"]);
     expect(second.changed).toBe(false);
+  });
+
+  it("migrates an existing ABSOLUTE owned link to a relative link (footgun A one-time heal)", () => {
+    const agentDir = makeAgentDir(tmpRoot, "ag1");
+    const skillsDir = join(agentDir, ".claude", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    // Simulate a link baked by the old absolute-target code: it points at
+    // the correct pool file but via an ABSOLUTE path — the class that
+    // dangles across container mount contexts.
+    const dest = join(skillsDir, "skill-a");
+    symlinkSync(join(poolDir, "skill-a"), dest);
+    expect(isAbsolute(readlinkSync(dest))).toBe(true); // precondition
+
+    const result = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    // The migration rewrites it; it is reported as changed (added), and the
+    // stored target is now relative but still resolves to the pool file.
+    expect(result.added).toContain("skill-a");
+    expect(result.changed).toBe(true);
+    expectRelativeLinkResolvingTo(dest, join(poolDir, "skill-a"));
+
+    // And it is idempotent afterwards — a second pass sees the relative link
+    // as already-correct and does not rewrite it.
+    const second = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(second.added).not.toContain("skill-a");
+    expect(second.alreadyPresent).toContain("skill-a");
   });
 
   it("refreshes a stale symlink whose target is inside the pool dir", () => {
@@ -105,7 +145,7 @@ describe("reconcileAgentDefaultSkills", () => {
 
     const result = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
     expect(result.added).toContain("skill-a");
-    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
+    expectRelativeLinkResolvingTo(join(skillsDir, "skill-a"), join(poolDir, "skill-a"));
   });
 
   it("leaves a foreign symlink alone and marks it as a conflict", () => {
@@ -264,7 +304,7 @@ describe("reconcileAgentDefaultSkills — legacy-prefix migration (#1164)", () =
       poolDir,
     );
     expect(result.added).toContain("skill-a");
-    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
+    expectRelativeLinkResolvingTo(join(skillsDir, "skill-a"), join(poolDir, "skill-a"));
   });
 
   it("repoints a symlink whose target was a legacy */switchroom/skills/* dev-checkout path", () => {
@@ -280,7 +320,7 @@ describe("reconcileAgentDefaultSkills — legacy-prefix migration (#1164)", () =
       poolDir,
     );
     expect(result.added).toContain("skill-a");
-    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
+    expectRelativeLinkResolvingTo(join(skillsDir, "skill-a"), join(poolDir, "skill-a"));
   });
 
   it("repoints a symlink whose target was the retired bun-global switchroom-ai/skills path (carrie RCA)", () => {
@@ -304,7 +344,7 @@ describe("reconcileAgentDefaultSkills — legacy-prefix migration (#1164)", () =
     // Owned-stale: link is deleted and recreated pointing into the current pool.
     expect(result.added).toContain("skill-a");
     expect(result.conflicts).not.toContain("skill-a");
-    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
+    expectRelativeLinkResolvingTo(join(skillsDir, "skill-a"), join(poolDir, "skill-a"));
   });
 
   it("leaves a genuinely foreign switchroom-ai-like path alone (no over-match)", () => {

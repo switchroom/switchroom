@@ -123,6 +123,34 @@ describe("chownScopedTree — call shape (#3333 stage 2)", () => {
     }
   });
 
+  it("re-owns bundled-skill symlinks under .claude/skills/ (footgun A migration is UID-safe)", () => {
+    // The relative-symlink migration (footgun A) rm+re-creates links under
+    // .claude/skills/ from a root reconcile writer. Those links must be
+    // re-owned to the agent UID, or the agent can't traverse them and the
+    // permission allowlist wedges (#3168). The guarantee is that .claude is a
+    // recursion root of the scoped sweep — chown -h -R re-owns the link
+    // itself (via -h, WITHOUT dereferencing into the shared pool). This test
+    // fails loudly if skills are ever moved out of the .claude subtree.
+    const dir = makeTree();
+    try {
+      const skillsDir = join(dir, ".claude", "skills");
+      mkdirSync(skillsDir, { recursive: true });
+      symlinkSync("../../../../skills/_bundled/dev-protocol", join(skillsDir, "dev-protocol"));
+
+      const recursed: string[] = [];
+      ownershipRuntime.chownShallow = () => {};
+      ownershipRuntime.chownTree = (_u, _g, root) => recursed.push(root);
+
+      const uid = allocateAgentUid(AGENT);
+      chownScopedTree(uid, uid, dir);
+
+      // .claude is a recursion root, so `chown -h -R` covers the skill link.
+      expect(recursed).toContain(join(dir, ".claude"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("skips a scoped subdir that does not exist", () => {
     const dir = mkdtempSync(join(tmpdir(), "switchroom-scoped-"));
     try {

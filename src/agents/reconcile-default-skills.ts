@@ -24,7 +24,7 @@
 
 import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { getBuiltinDefaultSkillEntries, type BuiltinSkillEntry } from "../memory/scaffold-integration.js";
 
 /** Track which missing-pool-dir warnings we've already emitted so the
@@ -110,6 +110,34 @@ function isOwnedStaleLink(target: string, poolDir: string): boolean {
 }
 
 /**
+ * Resolve a symlink's stored target to an absolute path. Relative link
+ * targets (the format switchroom now writes — see `linkTargetFor`) are
+ * resolved against the link's own directory, exactly as the kernel does
+ * on traversal. Absolute targets (legacy links baked with `homedir()`)
+ * pass through unchanged. Used for the owned/stale/foreign classification
+ * so it works identically for relative and absolute links.
+ */
+function absoluteLinkTarget(linkPath: string, storedTarget: string): string {
+  return isAbsolute(storedTarget)
+    ? storedTarget
+    : resolve(dirname(linkPath), storedTarget);
+}
+
+/**
+ * The symlink target switchroom writes for `dest` → `src`: a path RELATIVE
+ * to the link's own directory (footgun A). Relative links are invariant
+ * under the mount-prefix, so a link written from hostd's `/host-home/...`
+ * view resolves correctly in an agent's `/home/<op>/...` view — both share
+ * one `~/.switchroom` root. Depth is computed via `path.relative`, never a
+ * hardcoded `../` literal, so the correct prefix follows the layout
+ * automatically (agents/<name>/.claude/skills → pool is 4 up; a personal
+ * pool link would be 3 — a single constant would be wrong for both).
+ */
+function linkTargetFor(dest: string, src: string): string {
+  return relative(dirname(dest), src);
+}
+
+/**
  * Reconcile the bundled-default skill set into a single agent.
  *
  * Rules:
@@ -179,6 +207,7 @@ export function reconcileAgentDefaultSkills(
     }
 
     const dest = join(targetDir, entry.key);
+    const relTarget = linkTargetFor(dest, src);
     let existing;
     try {
       existing = lstatSync(dest);
@@ -191,18 +220,26 @@ export function reconcileAgentDefaultSkills(
         try {
           currentTarget = readlinkSync(dest);
         } catch { /* unreadable */ }
-        if (currentTarget === src) {
+        if (currentTarget === relTarget) {
+          // Already the correct RELATIVE link — nothing to do (idempotent).
           result.alreadyPresent.push(entry.key);
           continue;
         }
-        // Stale symlink — refresh if it points inside the current pool
-        // OR matches a legacy switchroom-owned prefix (dev-checkout
-        // `*/switchroom/skills/*` or packaged `/opt/skills/*`). This
-        // is the migration path that heals broken symlinks on user
-        // machines after the pool-dir relocation (RCA: #1164). A
-        // foreign symlink (operator pointed to a custom location)
-        // is left alone.
-        if (currentTarget && isOwnedStaleLink(currentTarget, poolDir)) {
+        // Any other switchroom-owned link is refreshed to the relative
+        // form. This covers three cases with one rule:
+        //   1. A correct-but-ABSOLUTE link (currentTarget === src) — the
+        //      one-time footgun-A migration: rewrite absolute → relative.
+        //   2. A stale link inside the current pool after a pool-dir move.
+        //   3. A legacy switchroom-owned prefix (dev-checkout
+        //      `*/switchroom/skills/*`, packaged `/opt/skills/*`, retired
+        //      bun-global — RCA #1164).
+        // A FOREIGN link (operator pointed at a custom location) is left
+        // alone. Classification resolves relative targets against the
+        // link dir first so it is identical for relative and absolute links.
+        const resolvedTarget = currentTarget
+          ? absoluteLinkTarget(dest, currentTarget)
+          : null;
+        if (resolvedTarget && isOwnedStaleLink(resolvedTarget, poolDir)) {
           try { rmSync(dest, { force: true }); } catch { /* best effort */ }
         } else {
           result.conflicts.push(entry.key);
@@ -216,7 +253,7 @@ export function reconcileAgentDefaultSkills(
     }
 
     try {
-      symlinkSync(src, dest);
+      symlinkSync(relTarget, dest);
       result.added.push(entry.key);
       result.changed = true;
     } catch (err) {
