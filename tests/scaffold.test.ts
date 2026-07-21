@@ -5356,26 +5356,38 @@ describe("footgun G — scaffold↔reconcile permission-allow parity", () => {
     return { afterScaffold, afterReconcile, afterSecondReconcile };
   }
 
-  const cases: Array<{ label: string; config: AgentConfig; memoryNone?: boolean }> = [
-    { label: "default (no tools)", config: makeAgentConfig({}) },
-    { label: "dangerous_mode: true", config: makeAgentConfig({ dangerous_mode: true } as Partial<AgentConfig>) },
-    { label: "tools.allow: [all]", config: makeAgentConfig({ tools: { allow: ["all"], deny: [] } } as Partial<AgentConfig>) },
+  // `hindsight` toggles the memory backend so isHindsightEnabled() flips —
+  // exercising BOTH the enabled and disabled paths of the shared helper
+  // (review #8: the disabled path was never run before).
+  const cases: Array<{ label: string; config: AgentConfig; hindsight: boolean }> = [
+    { label: "default (no tools)", config: makeAgentConfig({}), hindsight: true },
+    { label: "dangerous_mode: true", config: makeAgentConfig({ dangerous_mode: true } as Partial<AgentConfig>), hindsight: true },
+    { label: "tools.allow: [all]", config: makeAgentConfig({ tools: { allow: ["all"], deny: [] } } as Partial<AgentConfig>), hindsight: true },
     {
       label: "explicit tools.allow",
       config: makeAgentConfig({ tools: { allow: ["Read", "Grep", "custom-tool"], deny: [] } } as Partial<AgentConfig>),
+      hindsight: true,
     },
     {
       label: "webkite opted out",
       config: makeAgentConfig({ mcp_servers: { webkite: false } } as Partial<AgentConfig>),
+      hindsight: true,
     },
+    // review #8 — hindsight DISABLED (memory backend none): the helper must
+    // omit the hindsight MCP tools, and scaffold≡reconcile must still hold.
+    { label: "hindsight disabled (memory backend none)", config: makeAgentConfig({}), hindsight: false },
   ];
 
-  for (const { label, config } of cases) {
+  for (const { label, config, hindsight } of cases) {
     it(`reconcile preserves scaffold's allow-list for: ${label}`, () => {
       const name = `parity-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
       const switchroomConfig: SwitchroomConfig = {
         switchroom: { version: 1, agents_dir: tmpDir },
         telegram: telegramConfig,
+        // memory.backend drives isHindsightEnabled(), which BOTH engines and
+        // the helper read identically. "hindsight" enables it; anything else
+        // (here: absent) disables it.
+        ...(hindsight ? { memory: { backend: "hindsight" } } : {}),
         agents: { [name]: config },
       } as SwitchroomConfig;
 
@@ -5384,20 +5396,22 @@ describe("footgun G — scaffold↔reconcile permission-allow parity", () => {
 
       // The load-bearing footgun-G guarantee PR4 delivers: the create engine
       // (scaffold) and the reconcile engine converge to the IDENTICAL final
-      // settings.allow SET. Both feed the ONE shared helper
-      // computeDesiredPermissionAllow into an identical downstream write (which
-      // symmetrically strips the enumerated hindsight tools the plugin owns —
-      // see report; that is why the written set is a strict subset of the raw
-      // helper output, in BOTH engines equally). A regression that re-inlines a
-      // divergent allow computation in either engine breaks this equality.
+      // settings.allow SET, driven by the ONE shared helper
+      // computeDesiredPermissionAllow. A regression that re-inlines a divergent
+      // allow computation in either engine breaks this equality.
       const set = (a: string[]) => [...new Set(a)].sort();
       expect(set(afterReconcile)).toEqual(set(afterScaffold));
       // Idempotent across a second reconcile.
       expect(set(afterSecondReconcile)).toEqual(set(afterReconcile));
-      // Every tool the engines actually write comes from the shared helper —
-      // pins the helper as the single source that feeds both write paths.
-      const helper = new Set(computeDesiredPermissionAllow(config, /*hindsightEnabled*/ true));
+      // Every tool the engines write is present in the shared helper computed
+      // with the SAME hindsight state — pins the helper as the single source
+      // and, on the disabled case, that no hindsight tool leaks in.
+      const helper = new Set(computeDesiredPermissionAllow(config, hindsight));
       for (const tool of set(afterReconcile)) expect(helper.has(tool)).toBe(true);
+      // On the disabled case, assert no hindsight MCP tool was written at all.
+      if (!hindsight) {
+        expect(set(afterReconcile).some((t) => t.startsWith("mcp__hindsight"))).toBe(false);
+      }
     });
   }
 
