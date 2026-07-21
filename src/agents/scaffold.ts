@@ -6384,11 +6384,12 @@ function reconcileAgentInner(
   }
 
   // Compute the desired permissions.allow list from current config.
-  // IMPORTANT: this must stay in lockstep with scaffoldAgent's permissionAllow
-  // computation — including the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection
-  // when tools.allow is empty and dangerous_mode is off. Without this, the
-  // first `switchroom apply` after scaffold wipes the read-only defaults
-  // and every Read/Grep/Glob starts triggering approval cards.
+  // Lockstep with scaffoldAgent is now STRUCTURAL, not a discipline: both call
+  // the one shared computeDesiredPermissionAllow (footgun G), which includes
+  // the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection when tools.allow is empty
+  // and dangerous_mode is off. (Before the extraction, a divergence here made
+  // the first `switchroom apply` after scaffold wipe the read-only defaults and
+  // storm the approval UI — the scaffold↔reconcile parity test guards it now.)
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
   const rawAllow = tools.allow ?? [];
   const hasAllWildcard = rawAllow.includes("all");
