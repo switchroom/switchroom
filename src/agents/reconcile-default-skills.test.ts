@@ -186,8 +186,8 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
   /**
    * Create a personal-pool skill dir at a PRODUCTION-FAITHFUL path and link the
    * agent to it. Real personal/shared-pool skills live at
-   * `~/.switchroom/skills/<name>` (verified on the live host: klanker's coolify
-   * link → `/home/kenthompson/.switchroom/skills/coolify`). Note the leading
+   * `~/.switchroom/skills/<name>` (verified on the live host: an agent's
+   * coolify link → `~/.switchroom/skills/coolify`). Note the leading
    * dot: `.switchroom` means the path does NOT contain the substring
    * `/switchroom/skills/`, so `isOwnedStaleLink` returns FALSE for it — the
    * refresh path treats it as foreign and spares it. This fixture reproduces
@@ -195,7 +195,7 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
    * real production classification, not an accidental tmp path.
    */
   function makePersonalLink(name: string): string {
-    const personalPool = join(tmpRoot, "home", "op", ".switchroom", "skills");
+    const personalPool = join(tmpRoot, ".switchroom", "skills");
     const target = join(personalPool, name);
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, "SKILL.md"), `# personal ${name}\n`, "utf-8");
@@ -211,7 +211,7 @@ describe("reconcileAgentDefaultSkills — ownership-scoped prune (footgun E)", (
    * path is meant to heal, distinct from a `.switchroom` personal-pool link.
    */
   function makeDevCheckoutLink(name: string): string {
-    const devPool = join(tmpRoot, "home", "op", "switchroom", "skills");
+    const devPool = join(tmpRoot, "switchroom", "skills");
     const target = join(devPool, name);
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, "SKILL.md"), `# devcheckout ${name}\n`, "utf-8");
