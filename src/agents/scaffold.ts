@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { execSync, execFileSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
@@ -1720,7 +1720,12 @@ function migrateLegacySkillsDir(agentDir: string, skillsPool: string): void {
     } catch {
       continue; // not a symlink — leave it
     }
-    if (target && target.startsWith(skillsPool)) {
+    // Resolve relative targets against the link dir so both the current
+    // RELATIVE link form and the legacy ABSOLUTE form are recognized (footgun A).
+    const resolved = target
+      ? (isAbsolute(target) ? target : resolve(dirname(entryPath), target))
+      : null;
+    if (resolved && resolved.startsWith(skillsPool)) {
       try {
         rmSync(entryPath, { force: true });
       } catch { /* best effort */ }
@@ -1772,6 +1777,11 @@ function syncGlobalSkills(
       );
       continue;
     }
+    // Relative link target (footgun A): a path relative to the link's own
+    // directory, so it resolves identically across container mount contexts
+    // (hostd's /host-home view vs the agent's /home view share one
+    // ~/.switchroom root). Depth is computed, never hardcoded.
+    const relTarget = relative(dirname(dest), src);
     // If dest exists and is a symlink to the right target, leave it.
     // If dest exists as a real file/dir (e.g. from profile copySkills),
     // also leave it — profile-bundled skills take priority over the
@@ -1785,14 +1795,23 @@ function syncGlobalSkills(
       linkStat = null;
     }
     if (linkStat) {
-      // Broken symlink into the pool: replace it (the old target is
-      // gone, so we can safely recreate). Anything else: leave alone.
       if (linkStat.isSymbolicLink()) {
         let target: string | null = null;
         try {
           target = readlinkSync(dest);
         } catch { /* unreadable; leave alone */ }
-        if (target && target.startsWith(skillsPool)) {
+        // Already the correct RELATIVE link — idempotent no-op.
+        if (target === relTarget) {
+          continue;
+        }
+        // A link pointing into the pool (resolved against the link dir so
+        // a legacy ABSOLUTE target is handled too): replace it — this both
+        // heals a stale/broken pool link and migrates an absolute link to
+        // the relative form. Anything foreign: leave alone.
+        const resolved = target
+          ? (isAbsolute(target) ? target : resolve(dirname(dest), target))
+          : null;
+        if (resolved && resolved.startsWith(skillsPool)) {
           try {
             rmSync(dest, { force: true });
           } catch { /* best effort */ }
@@ -1804,7 +1823,7 @@ function syncGlobalSkills(
       }
     }
     try {
-      symlinkSync(src, dest);
+      symlinkSync(relTarget, dest);
     } catch (err) {
       console.warn(
         `  WARNING: failed to symlink skill "${name}": ${(err as Error).message}`,
@@ -1828,10 +1847,16 @@ function syncGlobalSkills(
     } catch {
       continue; // not a symlink
     }
-    if (linkTarget && linkTarget.includes("/.switchroom/skills/_bundled/")) {
+    // Resolve relative targets against the link dir before classifying, so
+    // the current RELATIVE link form is recognized as well as the legacy
+    // ABSOLUTE form (footgun A).
+    const resolved = linkTarget
+      ? (isAbsolute(linkTarget) ? linkTarget : resolve(dirname(entryPath), linkTarget))
+      : null;
+    if (resolved && resolved.includes("/.switchroom/skills/_bundled/")) {
       continue; // owned by reconcile-default-skills
     }
-    if (linkTarget && linkTarget.startsWith(skillsPool)) {
+    if (resolved && resolved.startsWith(skillsPool)) {
       rmSync(entryPath, { force: true });
     }
   }
@@ -1921,7 +1946,14 @@ export function installSwitchroomSkills(
       try {
         currentTarget = readlinkSync(dest);
       } catch { /* unreadable — assume foreign, leave alone */ }
-      if (currentTarget !== join(builtinSkillsDir, name)) continue;
+      // Retract a link we plausibly installed — in either the RELATIVE
+      // form (current) or the legacy ABSOLUTE form (pre-footgun-A). Resolve
+      // relative targets against the link dir before comparing.
+      if (!currentTarget) continue;
+      const resolvedTarget = isAbsolute(currentTarget)
+        ? currentTarget
+        : resolve(dirname(dest), currentTarget);
+      if (resolvedTarget !== join(builtinSkillsDir, name)) continue;
       try {
         rmSync(dest, { force: true });
       } catch { /* best effort */ }
@@ -1933,10 +1965,13 @@ export function installSwitchroomSkills(
   for (const name of switchroomSkillNames) {
     const src = join(builtinSkillsDir, name);
     const dest = join(targetDir, name);
+    // Relative link target (footgun A) — mount-context-invariant, computed
+    // depth (never a hardcoded `../` literal).
+    const relTarget = relative(dirname(dest), src);
     // Idempotent: leave correctly-pointing symlinks and real dirs alone.
     // But refresh stale symlinks whose target is a different switchroom-
     // lookalike path (e.g. old clerk/skills/ after the clerk→switchroom
-    // rename). Otherwise reconcile can't heal a botched cross-repo state.
+    // rename), AND migrate a correct-but-absolute legacy link to relative.
     let existing;
     try {
       existing = lstatSync(dest);
@@ -1949,7 +1984,7 @@ export function installSwitchroomSkills(
         try {
           currentTarget = readlinkSync(dest);
         } catch { /* unreadable */ }
-        if (currentTarget === src) continue; // already correct
+        if (currentTarget === relTarget) continue; // already correct (relative)
         try {
           rmSync(dest, { force: true });
         } catch { /* best effort; symlinkSync below will error cleanly */ }
@@ -1958,7 +1993,7 @@ export function installSwitchroomSkills(
       }
     }
     try {
-      symlinkSync(src, dest);
+      symlinkSync(relTarget, dest);
     } catch (err) {
       console.warn(
         `  WARNING: failed to symlink switchroom skill "${name}": ${(err as Error).message}`,

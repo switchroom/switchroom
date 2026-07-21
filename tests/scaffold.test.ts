@@ -1,6 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync, readdirSync, cpSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
+/**
+ * Assert `linkPath` is a switchroom-written pool skill link (footgun A):
+ * the stored target is RELATIVE (never absolute — absolute links baked with
+ * homedir() dangle across container mount contexts) and resolves, from the
+ * link's own directory, to `expectedPoolTarget`.
+ */
+function expectRelativePoolLink(linkPath: string, expectedPoolTarget: string): void {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { readlinkSync: rl } = require("node:fs");
+  const stored: string = rl(linkPath);
+  expect(isAbsolute(stored)).toBe(false);
+  expect(resolve(dirname(linkPath), stored)).toBe(resolve(expectedPoolTarget));
+}
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants } from "../src/agents/scaffold.js";
 import { createVault, setStringSecret } from "../src/vault/vault.js";
@@ -3774,7 +3788,7 @@ describe("scaffoldAgent global skills pool", () => {
     expect(existsSync(retainPath)).toBe(true);
     // Verify they're symlinks pointing into the pool
     const { readlinkSync } = require("node:fs");
-    expect(readlinkSync(checkinPath)).toBe(join(skillsPool, "checkin"));
+    expectRelativePoolLink(checkinPath, join(skillsPool, "checkin"));
   });
 
   it("unions defaults.skills with agent.skills in the symlink pass", () => {
@@ -4989,7 +5003,10 @@ describe("installSwitchroomSkills", () => {
       if (!existsSync(join(src, "SKILL.md"))) continue;
       const dest = join(targetSkillsDir, name);
       try { lstatSync(dest); continue; } catch { /* not found — create */ }
-      try { require("node:fs").symlinkSync(src, dest); } catch { /* ignore */ }
+      // Mirror production installSwitchroomSkills: write a RELATIVE link
+      // (footgun A), computed via path.relative, not an absolute src.
+      const relTarget = require("node:path").relative(dirname(dest), src);
+      try { require("node:fs").symlinkSync(relTarget, dest); } catch { /* ignore */ }
     }
   }
 
@@ -5000,8 +5017,8 @@ describe("installSwitchroomSkills", () => {
     expect(existsSync(join(skillsDir, "switchroom-manage"))).toBe(true);
     expect(existsSync(join(skillsDir, "switchroom-health"))).toBe(true);
     // Verify they are symlinks pointing into fakeSkillsDir
-    expect(readlinkSync(join(skillsDir, "switchroom-manage"))).toBe(join(fakeSkillsDir, "switchroom-manage"));
-    expect(readlinkSync(join(skillsDir, "switchroom-health"))).toBe(join(fakeSkillsDir, "switchroom-health"));
+    expectRelativePoolLink(join(skillsDir, "switchroom-manage"), join(fakeSkillsDir, "switchroom-manage"));
+    expectRelativePoolLink(join(skillsDir, "switchroom-health"), join(fakeSkillsDir, "switchroom-health"));
   });
 
   it("skips switchroom-* directories that have no SKILL.md", () => {
@@ -5022,7 +5039,7 @@ describe("installSwitchroomSkills", () => {
     expect(() => runWithFakeSkills(agentDir)).not.toThrow();
     const skillsDir = join(agentDir, ".claude", "skills");
     expect(existsSync(join(skillsDir, "switchroom-manage"))).toBe(true);
-    expect(readlinkSync(join(skillsDir, "switchroom-manage"))).toBe(join(fakeSkillsDir, "switchroom-manage"));
+    expectRelativePoolLink(join(skillsDir, "switchroom-manage"), join(fakeSkillsDir, "switchroom-manage"));
   });
 
   it("does not disturb pre-existing non-switchroom skills in .claude/skills/", () => {
