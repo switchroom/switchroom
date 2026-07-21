@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.19.12 — Claude Code CLI 2.1.215 → 2.1.216
+
+### Runtime (#3498)
+
+- **Pinned Claude Code CLI bumped `2.1.215` → `2.1.216`** across the base and
+  hindsight images (kept in lockstep). Brings the fleet-relevant upstream fixes
+  below. No breaking changes.
+- **Long-session slowdown fixed** — message normalization went quadratic with
+  turn count, causing multi-second stalls in long sessions and slow resumes.
+- **Auto-mode HTTP-401 misclassification fixed** — auto-mode no longer wrongly
+  denies commands with 401 classifier errors after the OAuth token
+  expired/rotated mid-session.
+- **Resumed background-agent restrictions restored** — the agent prompt and tool
+  restrictions are now correctly reapplied on resumed background-agent sessions.
+- **Background subagent cancellation fixed** — background subagents are no longer
+  cancelled when a high-priority message arrives during startup.
+
 ## v0.19.11 — Telegram formatting: full Bot API 10.1 surface folded into the resident floor card
 
 ### Telegram formatting (#3496)
