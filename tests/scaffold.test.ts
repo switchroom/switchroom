@@ -3279,6 +3279,22 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("expandable blockquote");
     expect(startSh).toContain("fenced code blocks ALWAYS with a language");
     expect(startSh).toContain("never emit: underline");
+    // Full Bot API 10.1 surface folded resident (the on-demand skill is gone,
+    // so the card must carry EVERY construct with its when-to-use guidance):
+    // italic, strikethrough, spoiler, ordered/nested lists, divider.
+    expect(startSh).toContain("*Italic* for a light aside");
+    expect(startSh).toContain("~~Strikethrough~~ only for a genuine retraction");
+    expect(startSh).toContain("||text||");
+    expect(startSh).toContain("A numbered list ONLY when order carries meaning");
+    expect(startSh).toContain("nested sub-list only for a real hierarchy");
+    expect(startSh).toContain("divider only between genuinely separate sections");
+    // ==highlight== IS pipeline-supported (SUPPORTED_INLINE in render.ts, with
+    // a round-trip test) — the card must recommend it AND make the anti-list
+    // unambiguous that only the CARET ^...^ form is repaired away, so no agent
+    // misreads "^highlight^ is repaired" as "highlighting never works".
+    expect(startSh).toContain("`==highlight==` to marker-pen the one");
+    expect(startSh).toContain("the CARET `^highlight^` form");
+    expect(startSh).toContain("`==highlight==` renders fine");
     // The on-demand telegram-formatting skill was deleted (its guidance is now
     // resident + deterministically repaired at send time). The card must carry
     // NO dangling pointer to it — a reference to a skill that no longer exists
