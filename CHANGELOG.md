@@ -2,7 +2,24 @@
 
 ## Unreleased
 
-### Telegram formatting: resident by default, deterministically repaired
+## v0.19.10 — Telegram formatting goes resident + deterministic; hostd ships bundled skills
+
+### Fixes
+
+- **hostd image now bakes the `skills/` payload so `switchroom update` syncs
+  bundled defaults** (#3493) — the `switchroom-hostd` image COPYd `profiles/`
+  and `vendor/` but never the shipped `skills/`, so inside the hostd container
+  `switchroom update`'s sync-bundled-skills step resolved
+  `source=/opt/switchroom/skills`, found it absent, hit its `!existsSync`
+  early-return and silently skipped — leaving `~/.switchroom/skills/_bundled/`
+  un-refreshed and builtin defaults (`dev-protocol`, `mental-model-curator`)
+  never reaching the pool or agents. Fix: `docker/Dockerfile.hostd` now
+  `COPY skills/ /opt/switchroom/skills/`, and `missingApplyAssets()` adds
+  `skills` so a hostd image dropping the payload is **refused up front at
+  `update_apply`/`apply`** (nothing pulled) instead of stranding mid-roll on
+  the next verify-bundled-skills throw.
+
+### Telegram formatting: resident by default, deterministically repaired (#3494)
 
 - **Thicker resident floor card** — the always-injected `## Formatting for
   Telegram` block (`TELEGRAM_FORMATTING_FLOOR_CARD`) now promotes the flagship
