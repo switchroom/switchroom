@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.9 — Rollout hardening: bundled skills stay put, opt-outs take effect, no ghost skills
+
 ### Fixes
 
 - **Bundled skills no longer silently vanish in some containers** (#3485) —
