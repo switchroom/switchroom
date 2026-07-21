@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Fixes
+
+- **Bundled skills no longer silently vanish in some containers** (#3485) —
+  skill symlinks were baked with *absolute* pool paths computed from `homedir()`
+  in whichever container ran the scaffold, so a link written from hostd
+  (`/host-home/...`) dangled inside an agent's `/home/<op>/...` mount view.
+  All pool→agent skill links are now written **relative** (`path.relative`,
+  never a hardcoded `../` literal), which is invariant under the mount prefix;
+  existing absolute owned links are migrated to relative on converge. UID-safety
+  rides the existing `chown -h -R .claude` sweep.
+- **`switchroom update` no longer wipes hand-added pool skills** (#3487) — the
+  old `rm -rf` + `cp` pool rebuild is replaced by a manifest-owned **additive**
+  sync (`_bundled/.switchroom-manifest.json`): per-skill stage+atomic-rename,
+  delete only previously-shipped-now-retired names, first run adopts everything,
+  corrupt manifest fails closed. A shipped skill colliding with a hand-added dir
+  of the same name is a **loud, non-destructive ownership transfer** (operator
+  content preserved as a timestamped backup), never a silent overwrite.
+- **A missing builtin default skill is now a loud error, not a silent skip**
+  (#3484) — a declared default absent from the pool is recorded and warned, the
+  `switchroom update` verify step fails loudly, and a packaging test asserts
+  every `getBuiltinDefaultSkillEntries()` key ships in the package `skills/` dir
+  (closes the `dev-protocol` / `mental-model-curator` "ghost skill" class).
+- **Opting a bundled default out finally takes effect** (#3489) — an
+  ownership-scoped prune removes an opted-out or now-dangling **owned `_bundled`
+  link**, strictly scoped so it can never touch a personal-pool link, an
+  operator hand-link, or a real directory.
+- **Doctor no longer tells operators to run a nonexistent `switchroom
+  reconcile` verb** (#3490) — the doctor `fix:` strings, the generated
+  docker-compose header, and internal comments now cite the real `switchroom
+  apply`; a guard test prevents the bad verb from recurring.
+
+### Internal
+
+- **One source of truth for the agent `permissions.allow` computation** (#3488)
+  — the create (`scaffoldAgent`) and reconcile (`reconcileAgentInner`) engines
+  no longer inline byte-identical copies of the allow-list computation (a
+  "must stay in lockstep" drift hazard); both call one shared
+  `computeDesiredPermissionAllow`, pinned by a scaffold↔reconcile golden parity
+  test.
+
 ## v0.19.8 — Full Telegram formatting palette, on-demand, and no accidental headings anywhere
 
 ### Features
