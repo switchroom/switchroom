@@ -152,7 +152,7 @@ export function checkAgentSocketMounts(composeYaml: string): CheckResult {
     name: "agent socket-volume isolation",
     status: "fail",
     detail: `Cross-mounted socket volumes: ${violations.join("; ")}`,
-    fix: "Re-run `switchroom reconcile` to regenerate the compose from cascade. Hand-edits violating per-agent socket isolation are the load-bearing security invariant.",
+    fix: "Re-run `switchroom apply` to regenerate the compose from cascade. Hand-edits violating per-agent socket isolation are the load-bearing security invariant.",
   };
 }
 
@@ -481,7 +481,7 @@ export function runDockerChecks(args: {
       name: "compose file present",
       status: "warn",
       detail: "Docker mode active but no docker-compose.yml found at ~/.switchroom/compose/docker-compose.yml",
-      fix: "Run `switchroom reconcile` to generate it.",
+      fix: "Run `switchroom apply` to generate it.",
     });
   }
   // Runtime container health (2026-06-23 incident class) — always runs in

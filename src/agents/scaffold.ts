@@ -2386,7 +2386,7 @@ export function dirContentEquals(
  * Seed the agent's `workspace/` directory from the profile's `workspace/`
  * subdirectory (if any). `.hbs` files are rendered with the handlebars
  * context; everything else is copied verbatim. Existing files are preserved
- * so user edits survive `switchroom reconcile` runs.
+ * so user edits survive `switchroom apply` runs.
  *
  * Profiles should put OpenClaw-style bootstrap files (AGENTS.md, USER.md,
  * IDENTITY.md, TOOLS.md, MEMORY.md, ...) under their `workspace/` dir. At
@@ -6387,7 +6387,7 @@ function reconcileAgentInner(
   // IMPORTANT: this must stay in lockstep with scaffoldAgent's permissionAllow
   // computation — including the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection
   // when tools.allow is empty and dangerous_mode is off. Without this, the
-  // first `switchroom reconcile` after scaffold wipes the read-only defaults
+  // first `switchroom apply` after scaffold wipes the read-only defaults
   // and every Read/Grep/Glob starts triggering approval cards.
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
   const rawAllow = tools.allow ?? [];
