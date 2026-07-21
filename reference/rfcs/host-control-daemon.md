@@ -303,7 +303,7 @@ Verb set (v1, closed):
 | `update_apply` | `skip_images?`, `rebuild?`, `reason?` | `switchroom update --apply [flags]` | admin + operator-attest (see §5.4) |
 | `apply` | `non_interactive: true` (forced) | `switchroom apply --non-interactive` | admin + operator-attest |
 | `upgrade_status` | (none) | `switchroom update --status` | any |
-| `reconcile` | `agent?` | `switchroom reconcile [<agent>]` | admin |
+| `reconcile` | `agent?` | `switchroom apply [--only <agent>]` | admin |
 | `get_status` | `request_id` | look up an in-flight or recently-completed mutation by id; returns the same response shape as the original call | matches the gate of the *original* call |
 
 Anything not in this table is rejected with `result: "denied",

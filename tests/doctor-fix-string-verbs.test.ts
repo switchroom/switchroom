@@ -18,18 +18,35 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const CLI_DIR = join(fileURLToPath(import.meta.url), "..", "..", "src", "cli");
+const SRC_DIR = join(fileURLToPath(import.meta.url), "..", "..", "src");
+const CLI_DIR = join(SRC_DIR, "cli");
 
-/** Matches a `fix:` string literal that contains the bare nonexistent verb
- *  `switchroom reconcile` (i.e. NOT the real `switchroom agent reconcile`). */
+/** True for a line citing the bare nonexistent verb `switchroom reconcile`
+ *  (i.e. NOT the real `switchroom agent reconcile`). */
+function citesBareReconcileVerb(line: string): boolean {
+  return /switchroom reconcile\b/.test(line) && !/switchroom agent reconcile\b/.test(line);
+}
+
+/** Matches a `fix:` string literal that cites the bare nonexistent verb. */
 function badFixLines(source: string): string[] {
+  return source
+    .split("\n")
+    .filter((line) => /\bfix:/.test(line) && citesBareReconcileVerb(line))
+    .map((line) => line.trim());
+}
+
+/** Any OPERATOR-VISIBLE occurrence of the bare nonexistent verb: a string
+ *  literal `push`ed into generated output, or a comment. Excludes the ONE
+ *  legitimate pattern — text that documents the verb does NOT exist ("no
+ *  ... switchroom reconcile CLI verb"), which is accurate (protocol.ts:24). */
+function badVerbLines(source: string): string[] {
   const bad: string[] = [];
   for (const line of source.split("\n")) {
-    if (!/\bfix:/.test(line)) continue;
-    // `switchroom reconcile` that is NOT `switchroom agent reconcile`.
-    if (/switchroom reconcile\b/.test(line) && !/switchroom agent reconcile\b/.test(line)) {
-      bad.push(line.trim());
+    if (!citesBareReconcileVerb(line)) continue;
+    if (/no\b.*switchroom reconcile|switchroom reconcile.*(does ?n.?t|never) exist/i.test(line)) {
+      continue; // accurate absence documentation
     }
+    bad.push(line.trim());
   }
   return bad;
 }
@@ -48,6 +65,24 @@ describe("footgun F — doctor fix strings cite only real CLI verbs", () => {
     it(`no fix: string in ${file} references the nonexistent \`switchroom reconcile\` verb`, () => {
       const source = readFileSync(join(CLI_DIR, file), "utf8");
       expect(badFixLines(source)).toEqual([]);
+    });
+  }
+});
+
+describe("footgun F — generated output / comments cite only real CLI verbs", () => {
+  // The files PR6 also fixed beyond doctor `fix:` strings: compose.ts emits the
+  // bad verb into the generated docker-compose.yml header (operator-VISIBLE),
+  // and scaffold.ts had comments citing it. Guard those too so a regression
+  // there is caught, not just the doctor strings.
+  const files = [
+    join(SRC_DIR, "agents", "compose.ts"),
+    join(SRC_DIR, "agents", "scaffold.ts"),
+  ];
+
+  for (const path of files) {
+    it(`no operator-visible line in ${path.split("/").slice(-2).join("/")} cites the nonexistent \`switchroom reconcile\` verb`, () => {
+      const source = readFileSync(path, "utf8");
+      expect(badVerbLines(source)).toEqual([]);
     });
   }
 });
