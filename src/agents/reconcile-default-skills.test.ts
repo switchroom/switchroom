@@ -155,14 +155,29 @@ describe("reconcileAgentDefaultSkills", () => {
     expect(result.changed).toBe(false);
   });
 
-  it("skips silently when the pool is missing a skill (trimmed install)", () => {
+  it("records a builtin default missing from the pool loudly (footgun C/D), not silently", () => {
     const agentDir = makeAgentDir(tmpRoot, "ag1");
     // Re-create the pool without skill-c.
     rmSync(poolDir, { recursive: true, force: true });
     poolDir = makePool(tmpRoot, ["skill-a", "skill-b"]);
     const result = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    // The present skills still install...
     expect(result.added.sort()).toEqual(["skill-a", "skill-b"]);
     expect(result.added).not.toContain("skill-c");
+    // ...but the missing builtin default is surfaced, not swallowed. This is
+    // the assertion that would FAIL under the old silent `continue`.
+    expect(result.missingFromPool).toEqual(["skill-c"]);
+  });
+
+  it("treats a dangling pool symlink as missing-from-pool, not usable (footgun review #5)", () => {
+    const agentDir = makeAgentDir(tmpRoot, "ag1");
+    // Replace skill-c's real dir with a symlink to a nonexistent target so
+    // `ls` shows it present but it does not resolve.
+    rmSync(join(poolDir, "skill-c"), { recursive: true, force: true });
+    symlinkSync(join(tmpRoot, "does-not-exist"), join(poolDir, "skill-c"));
+    const result = reconcileAgentDefaultSkills(agentDir, {}, FIXTURE_DEFAULTS, poolDir);
+    expect(result.added).not.toContain("skill-c");
+    expect(result.missingFromPool).toEqual(["skill-c"]);
   });
 });
 
@@ -352,5 +367,39 @@ describe("getBuiltinDefaultSkillEntries", () => {
       "switchroom-status",
       "telegram-formatting",
     ]);
+  });
+});
+
+/**
+ * Packaging guard (footgun C/D) — the deterministic build-time backstop.
+ *
+ * Every entry in `getBuiltinDefaultSkillEntries()` is symlinked into every
+ * agent's `.claude/skills/` and referenced from the generated CLAUDE.md.
+ * `switchroom update` copies the repo `skills/` dir into the runtime pool
+ * (`~/.switchroom/skills/_bundled/`), so a declared default that has no
+ * `skills/<key>/` dir in the package becomes a "ghost skill": referenced
+ * everywhere, shipped nowhere (the live dev-protocol / mental-model-curator
+ * incident). This test fails the moment the declared-defaults list and the
+ * shipped `skills/` dir diverge — the class cannot recur silently.
+ *
+ * It reads the list at RUNTIME (never a hardcoded copy) so editing the
+ * defaults list without shipping the skill trips this immediately.
+ */
+describe("packaging: every builtin default skill ships in the repo skills/ dir", () => {
+  it("has a skills/<key>/SKILL.md for every getBuiltinDefaultSkillEntries() key", async () => {
+    const { fileURLToPath } = await import("node:url");
+    const { getBuiltinDefaultSkillEntries } = await import(
+      "../memory/scaffold-integration.js"
+    );
+    // src/agents/<thisfile> → repo root is two levels up; skills/ sits beside src/.
+    const repoRoot = join(fileURLToPath(import.meta.url), "..", "..", "..");
+    const skillsDir = join(repoRoot, "skills");
+    // Sanity: the skills/ dir itself must exist, or the guard is vacuous.
+    expect(existsSync(skillsDir)).toBe(true);
+
+    const missing = getBuiltinDefaultSkillEntries()
+      .map((e) => e.key)
+      .filter((key) => !existsSync(join(skillsDir, key, "SKILL.md")));
+    expect(missing).toEqual([]);
   });
 });
