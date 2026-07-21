@@ -37,7 +37,7 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, chownSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, chownSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -49,6 +49,8 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { validateBindSources, formatPreflightError } from "./preflight-mounts.js";
 import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
+import { syncBundledSkills } from "./sync-bundled-skills.js";
+import { SWITCHROOM_VERSION } from "./resolve-version.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -707,11 +709,28 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         return;
       }
       try {
-        if (existsSync(dest)) {
-          rmSync(dest, { recursive: true, force: true });
-        }
         mkdirSync(dirname(dest), { recursive: true });
-        cpSync(source, dest, { recursive: true, dereference: false });
+        // Manifest-owned ADDITIVE sync (footgun B): copies/updates every
+        // shipped skill and deletes ONLY names switchroom previously shipped
+        // and no longer ships. Hand-added pool skills — and every dir that
+        // predates the manifest — are preserved, never `rm -rf`'d.
+        const r = syncBundledSkills({
+          source,
+          dest,
+          version: SWITCHROOM_VERSION,
+        });
+        if (r.manifestCorrupt) {
+          process.stderr.write(
+            `switchroom update: sync-bundled-skills — pool manifest was unreadable; ` +
+              `deleted nothing (fail-closed) and rewrote a clean manifest.\n`,
+          );
+        }
+        if (r.removed.length > 0) {
+          process.stderr.write(
+            `switchroom update: sync-bundled-skills — removed ${r.removed.length} retired ` +
+              `bundled skill(s): ${r.removed.join(", ")}.\n`,
+          );
+        }
       } catch (err) {
         throw new Error(
           `sync-bundled-skills failed: ${(err as Error).message}`,
