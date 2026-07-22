@@ -81,6 +81,17 @@ FETCHER="${SWITCHROOM_HINDSIGHT_FETCHER:-/usr/local/lib/switchroom/hindsight-fet
 # header for the jobs + env knobs. Empty/unset path disables it.
 MAINTENANCE="${SWITCHROOM_HINDSIGHT_MAINTENANCE_SCRIPT:-/usr/local/lib/switchroom/hindsight-maintenance.sh}"
 REAP_STALE_S="${SWITCHROOM_HINDSIGHT_REAP_STALE_S:-1800}"
+# Bounded batch + concurrency guard for the reaper reset (incident
+# 2026-07-22): reset at most this many stale rows per pass, and skip any a
+# live worker currently row-locks (FOR UPDATE SKIP LOCKED) so we can never
+# steal a claim mid-flight.
+REAP_BATCH_LIMIT="${SWITCHROOM_HINDSIGHT_REAP_BATCH_LIMIT:-1000}"
+# Corrupt-index self-heal switch (incident 2026-07-22). When the reaper's
+# reset UPDATE fails with the pk_async_operations unique-violation signature
+# (a corrupt PK btree — the exact 3-day-freeze cause), REINDEX the index and
+# retry the reset. 1=on (default), 0=alarm-only (log the loud ERROR, skip the
+# automatic REINDEX DDL).
+REINDEX_SELFHEAL="${SWITCHROOM_HINDSIGHT_REINDEX_SELFHEAL:-1}"
 # pg0 instance descriptor (holds the embedded-postgres password); the
 # reaper reads it to connect. Overridable for host tests.
 PG0_INSTANCE="${SWITCHROOM_HINDSIGHT_PG0_INSTANCE:-/home/hindsight/.pg0/instances/hindsight/instance.json}"
@@ -94,18 +105,72 @@ log() { echo "switchroom-hindsight-entrypoint: $*" >&2; }
 : "${HINDSIGHT_API_WORKER_ID:=${SWITCHROOM_HINDSIGHT_WORKER_ID:-switchroom-hindsight}}"
 export HINDSIGHT_API_WORKER_ID
 
-# Lease-timeout reaper (fix B above). Resets async_operations stuck in
-# 'processing' past the threshold back to 'pending' so the live worker
-# re-claims them — mirroring upstream recover_own_tasks() but keyed on
-# claim age instead of the (ephemeral) worker_id. Best-effort: any
-# failure (pg not up yet, missing instance file, psql absent) is
-# swallowed so it can never wedge the loop or the container. No-ops
-# cleanly on hosts without the embedded pg (e.g. unit tests).
+# One reaper reset pass. Reads the (effectively global, sh has no locals)
+# connection vars set by reap_stale_processing; echoes psql's COMBINED
+# stdout+stderr and returns psql's exit status so the caller can both parse
+# the `UPDATE N` tag on success AND inspect the error text on failure.
+#
+# Bounded + concurrency-safe: the SKIP LOCKED subselect resets only stale,
+# unlocked, non-batch 'processing' rows — never a row a live worker currently
+# row-locks — at most REAP_BATCH_LIMIT per pass.
 #   - threshold (REAP_STALE_S, default 30 min) sits well above the
-#     consolidation LLM timeout + the 600s DB statement_timeout, so it
-#     only ever fires on genuinely-dead claims, never a long-but-live one.
+#     consolidation LLM timeout + the 600s DB statement_timeout, so it only
+#     ever fires on genuinely-dead claims, never a long-but-live one.
 #   - the batch_id guard mirrors upstream: batch-API ops have their own
 #     recovery path (_recover_batch_operations) and must not be reset here.
+_reap_reset_pass() {
+  PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -v ON_ERROR_STOP=1 -c \
+    "UPDATE async_operations SET status='pending', worker_id=NULL, claimed_at=NULL, updated_at=now() WHERE operation_id IN (SELECT operation_id FROM async_operations WHERE status='processing' AND claimed_at < now() - make_interval(secs => ${REAP_STALE_S}) AND coalesce(result_metadata->>'batch_id','') = '' ORDER BY claimed_at FOR UPDATE SKIP LOCKED LIMIT ${REAP_BATCH_LIMIT})" \
+    2>&1
+}
+
+# Log the reset count from psql's own `UPDATE N` tag (ROW_COUNT of THIS
+# statement) — NEVER a follow-up `SELECT count(*) … updated_at > now()-5s`,
+# which counted fresh enqueues and inflated the reaper log (#3421).
+_reap_log_count() {
+  _n="$(printf '%s\n' "$1" | awk '/^UPDATE[[:space:]]+[0-9]+/ { print $2; exit }')"
+  _n="$(echo "${_n}" | tr -d '[:space:]')"
+  if [ "${_n:-0}" -gt 0 ] 2>/dev/null; then
+    log "stale-claim reaper reset ${_n} stuck 'processing' op(s) older than ${REAP_STALE_S}s -> pending"
+  fi
+}
+
+# Rebuild the pk_async_operations PK btree from the (dup-free) heap. Echoes
+# combined output, returns status. CONCURRENTLY first (no table lock, but can
+# fail leaving an INVALID index); plain REINDEX as an atomic fallback (brief
+# ACCESS EXCLUSIVE lock — acceptable: the queue is already wedged).
+_reap_reindex_pk() {
+  if _rout="$(PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -v ON_ERROR_STOP=1 -c 'REINDEX INDEX CONCURRENTLY pk_async_operations' 2>&1)"; then
+    printf '%s' "${_rout}"; return 0
+  fi
+  log "hindsight-reaper reindex_selfheal=concurrent-failed falling-back-to-plain detail: $(printf '%s' "${_rout}" | tr '\n' ' ' | cut -c1-200)"
+  if _rout="$(PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -v ON_ERROR_STOP=1 -c 'REINDEX INDEX pk_async_operations' 2>&1)"; then
+    printf '%s' "${_rout}"; return 0
+  fi
+  printf '%s' "${_rout}"; return 1
+}
+
+# Lease-timeout reaper (fix B above) — HARDENED for corrupt-index self-heal
+# (incident 2026-07-22). Resets async_operations stuck in 'processing' past
+# the threshold back to 'pending' so the live worker re-claims them —
+# mirroring upstream recover_own_tasks() but keyed on claim age instead of the
+# (ephemeral) worker_id.
+#
+# CORRUPT-INDEX SELF-HEAL (the 3-day freeze this closes): when the
+# pk_async_operations btree is corrupt, the reset UPDATE itself throws
+# `duplicate key value violates unique constraint "pk_async_operations"`
+# (writing the updated rows' index tuples collides with a phantom entry) —
+# EXACTLY like upstream recover_own_tasks. The PRIOR reaper piped that failure
+# into `2>/dev/null) || return 0` and silently no-oped, so stuck ops were
+# never reset and NOTHING alarmed → per-bank consolidation deadlocked for
+# days. Now: on ANY reset failure we (1) log a LOUD structured ERROR (never
+# swallow again), and (2) if the failure carries the pk_async_operations
+# signature and REINDEX_SELFHEAL != 0, REINDEX the index and retry the reset
+# once — the same REINDEX that manually cleared the live incident, automated.
+#
+# Still best-effort on the benign no-op paths (pg not up yet, missing instance
+# file, psql absent) so it can never wedge the loop or the container. No-ops
+# cleanly on hosts without the embedded pg (e.g. unit tests).
 reap_stale_processing() {
   [ "${REAP_STALE_S}" -gt 0 ] || return 0
   [ -r "${PG0_INSTANCE}" ] || return 0
@@ -119,23 +184,36 @@ EOF
     return 0
   fi
   [ -n "${_pgpw}" ] || return 0
-  # NOTE (2026-07-19 dual-writer recovery): never count via an UPDATE that
-  # returns rows piped into a line-counter (the recovery-title form aborted
-  # under concurrent activity with a spurious unique-constraint error on
-  # pk_async_operations, so the reaper silently no-oped and crash-orphaned
-  # consolidations stayed processing, blocking every new claim for that bank).
-  #
-  # Count comes from psql's own `UPDATE N` tag (ROW_COUNT of THIS statement).
-  # A post-UPDATE `SELECT count(*) … updated_at > now()-5s` inflated the
-  # log with fresh enqueues that never matched the stale-processing WHERE.
-  _out="$(PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -v ON_ERROR_STOP=1 -c \
-    "UPDATE async_operations SET status='pending', worker_id=NULL, claimed_at=NULL, updated_at=now() WHERE status='processing' AND claimed_at < now() - make_interval(secs => ${REAP_STALE_S}) AND coalesce(result_metadata->>'batch_id','') = ''" \
-    2>/dev/null)" || return 0
-  _n="$(printf '%s\n' "${_out}" | awk '/^UPDATE[[:space:]]+[0-9]+/ { print $2; exit }')"
-  _n="$(echo "${_n}" | tr -d '[:space:]')"
-  if [ "${_n:-0}" -gt 0 ] 2>/dev/null; then
-    log "stale-claim reaper reset ${_n} stuck 'processing' op(s) older than ${REAP_STALE_S}s -> pending"
+
+  # First reset pass. `if var=$(...)` keeps this set -e-safe (a failing
+  # command substitution in an if-condition does NOT abort the shell) and,
+  # crucially, does NOT swallow the error — _out carries psql's stderr.
+  if _out="$(_reap_reset_pass)"; then
+    _reap_log_count "${_out}"
+    return 0
   fi
+
+  # Reset FAILED — never swallow (that silent no-op WAS the 3-day freeze).
+  # Loud structured ERROR the fleet log monitor / `switchroom doctor` can grep.
+  log "ERROR: hindsight-reaper reset_failed — stuck 'processing' ops NOT reset; consolidation may deadlock. detail: $(printf '%s' "${_out}" | tr '\n' ' ' | cut -c1-300)"
+
+  # Corrupt-index self-heal: the reset UPDATE hit the pk_async_operations
+  # unique-violation signature => the PK btree is corrupt. REINDEX + retry.
+  if printf '%s' "${_out}" | grep -q 'pk_async_operations' && [ "${REINDEX_SELFHEAL}" != "0" ]; then
+    log "ERROR: hindsight-reaper reindex_selfheal=attempting index=pk_async_operations reason=corrupt-index-blocks-reset"
+    if _rout="$(_reap_reindex_pk)"; then
+      log "hindsight-reaper reindex_selfheal=ok index=pk_async_operations — retrying reset"
+      if _out2="$(_reap_reset_pass)"; then
+        _reap_log_count "${_out2}"
+        log "hindsight-reaper reindex_selfheal=recovered reset retried successfully after REINDEX"
+      else
+        log "ERROR: hindsight-reaper reindex_selfheal=reset-still-failing after REINDEX — manual intervention needed. detail: $(printf '%s' "${_out2}" | tr '\n' ' ' | cut -c1-300)"
+      fi
+    else
+      log "ERROR: hindsight-reaper reindex_selfheal=failed index=pk_async_operations — manual 'REINDEX INDEX CONCURRENTLY pk_async_operations' needed. detail: $(printf '%s' "${_rout}" | tr '\n' ' ' | cut -c1-300)"
+    fi
+  fi
+  return 0
 }
 
 # Boot-deferred reaper (2026-07-19): the refresh-loop reaper only fires after

@@ -36,6 +36,11 @@
 #   SWITCHROOM_HINDSIGHT_RETENTION_DAYS       completed-op prune age. default 30
 #   SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S     warn if oldest pending/processing
 #                                             op older than this. default 7200 (2h). 0=off
+#   SWITCHROOM_HINDSIGHT_INDEX_HEALTH_CHECK   bt_index_check pk_async_operations
+#                                             + stuck-op alarm. default 1 (on). 0=off
+#   SWITCHROOM_HINDSIGHT_STUCK_OP_WARN_S      alarm if any 'processing' op is
+#                                             claimed older than this (the reaper
+#                                             should have reset it). default 3600 (1h)
 set -u
 
 MAINT_ENABLED="${SWITCHROOM_HINDSIGHT_MAINTENANCE:-1}"
@@ -49,9 +54,21 @@ RETENTION_DAYS="${SWITCHROOM_HINDSIGHT_RETENTION_DAYS:-30}"
 # wedged (the 26-day strand of 2026-05-23 went unseen because nothing
 # watched this). Default 2h — well above ~510s/op + the 30-min lease
 # reaper. 0 disables. Logs a loud WARNING (picked up by docker logs /
-# any log monitoring); the reaper still auto-heals stuck *processing*
-# ops, so this is visibility, not the heal.
+# any log monitoring). The reaper auto-heals stuck *processing* ops ONLY
+# when the pk_async_operations index is healthy — a corrupt index made its
+# reset UPDATE silently no-op for 3 days (2026-07-22). Job #5 below alarms on
+# that index-corruption / persistent-stuck-op condition directly.
 QUEUE_LAG_WARN_S="${SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S:-7200}"
+# Index-health + stuck-op alarm (incident 2026-07-22). The reaper's reset
+# UPDATE silently no-oped for 3 days when pk_async_operations was corrupt,
+# deadlocking consolidation per-bank with NO alarm. This probe surfaces BOTH
+# a corrupt index (bt_index_check) and a persistent stuck-op count LOUDLY so
+# neither can hide again. 1=on (default), 0=off.
+INDEX_HEALTH_CHECK="${SWITCHROOM_HINDSIGHT_INDEX_HEALTH_CHECK:-1}"
+# A healthy reaper keeps 'processing' ops younger than its 30-min window; a
+# 'processing' op still claimed past this threshold means the heal isn't
+# landing (corrupt index / disabled reaper) and the deadlock is ACTIVE.
+STUCK_OP_WARN_S="${SWITCHROOM_HINDSIGHT_STUCK_OP_WARN_S:-3600}"
 
 log() { echo "switchroom-hindsight-maintenance: $*" >&2; }
 
@@ -107,6 +124,37 @@ if [ "${QUEUE_LAG_WARN_S}" -gt 0 ] 2>/dev/null; then
   _qage="${_q##*|}"
   if [ "${_qage:-0}" -gt "${QUEUE_LAG_WARN_S}" ] 2>/dev/null; then
     log "WARNING: queue may be wedged — ${_qn} pending/processing async op(s), oldest $((_qage/60))m old (> $((QUEUE_LAG_WARN_S/60))m). Consolidation/retain pipeline not draining; inspect async_operations + 'docker logs switchroom-hindsight'."
+  fi
+fi
+
+# --- 5. Index-health + stuck-op alarm (incident 2026-07-22) ---
+# The reaper's reset UPDATE silently no-oped for 3 days when
+# pk_async_operations was corrupt, deadlocking consolidation per-bank with no
+# alarm. This probe surfaces BOTH conditions LOUDLY (structured ERROR the
+# fleet log monitor / `switchroom doctor` can grep) so neither can hide again.
+# Read-only: bt_index_check takes only an AccessShareLock (non-blocking); the
+# stuck-op metric is a SELECT. The reaper does the heal; this is the alarm.
+if [ "${INDEX_HEALTH_CHECK}" = "1" ]; then
+  # amcheck ships with pg but its extension may not be created yet; best-effort.
+  _sql "CREATE EXTENSION IF NOT EXISTS amcheck" >/dev/null 2>&1
+  # bt_index_check(..., true) = heapallindexed: detects a phantom index tuple
+  # pointing at the wrong heap ctid (the exact 2026-07-22 corruption). It
+  # RAISEs on corruption; ON_ERROR_STOP=1 => nonzero exit + the error text.
+  _ic="$(PGPASSWORD="${PGPW_}" "${PSQL}" -U "${PGUSER_}" -h /tmp -p "${PGPORT_}" -d "${PGDB_}" \
+    -v ON_ERROR_STOP=1 -tAc "SELECT bt_index_check('pk_async_operations'::regclass, true)" 2>&1)"
+  if [ $? -ne 0 ]; then
+    # A genuine corruption reports btree/heap/index-tuple/duplicate text; an
+    # amcheck-absent / index-missing environment reads as a skip, not an alarm.
+    if printf '%s' "${_ic}" | grep -qiE 'corrupt|not.*ordered|heap tuple|index tuple|duplicate|not equal'; then
+      log "ERROR: index health check FAILED for pk_async_operations — btree corruption; consolidation queue can deadlock. Heal: REINDEX INDEX CONCURRENTLY pk_async_operations (the reaper self-heals on its next reset). detail: $(printf '%s' "${_ic}" | tr '\n' ' ' | cut -c1-300)"
+    fi
+  fi
+  # Stuck-op count: 'processing' ops still claimed past the alarm window. A
+  # working reaper keeps this at 0; a persistent nonzero means the heal isn't
+  # landing (corrupt index / disabled reaper) — the deadlock is ACTIVE.
+  _stuck="$(_sql "SELECT count(*) FROM async_operations WHERE status='processing' AND claimed_at < now() - make_interval(secs => ${STUCK_OP_WARN_S})")"
+  if [ "${_stuck:-0}" -gt 0 ] 2>/dev/null; then
+    log "ERROR: ${_stuck} async op(s) stuck in 'processing' older than $((STUCK_OP_WARN_S/60))m — the stale-claim reaper is not clearing them (corrupt pk_async_operations index or reaper disabled); per-bank consolidation is deadlocked. Inspect async_operations + 'docker logs switchroom-hindsight'."
   fi
 fi
 
