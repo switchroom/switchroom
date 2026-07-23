@@ -894,7 +894,7 @@ function resolveSessionOriginChat(lines) {
  *
  * @param {string} jsonl
  * @param {number} [now]
- * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string }}
+ * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string, replyAlreadyDeliveredThisTurn: boolean, deliveredReplySha256: string|null }}
  */
 export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const lines = jsonl.split('\n')
@@ -948,16 +948,46 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
         disableNotification: input.disable_notification === true,
         done: input.done === true,
       })) {
-        blocks.push({ kind: 'deliver', reason: 'final-reply' })
+        // #3510: keep the delivered reply's text so the caller can log its
+        // sha256 next to the captured trailing prose's sha256 — a double-send
+        // becomes provable from logs alone, without transcript reconstruction.
+        blocks.push({ kind: 'deliver', reason: 'final-reply', text })
       }
       // interim ack — neither delivery nor undelivered prose.
     }
   }
 
   let lastDeliverIdx = -1
+  let lastFinalReplyBlock = null
   for (let i = 0; i < blocks.length; i++) {
-    if (blocks[i].kind === 'deliver') lastDeliverIdx = i
+    if (blocks[i].kind !== 'deliver') continue
+    lastDeliverIdx = i
+    if (blocks[i].reason === 'final-reply') lastFinalReplyBlock = blocks[i]
   }
+  // #3510: single source of truth for BOTH the fix's branching and the
+  // instrumentation. When true, a genuine FINAL-ANSWER reply/stream_reply
+  // already went through the gateway THIS turn — so a gateway anchor provably
+  // exists (`turn.finalAnswerDelivered` is set by the SAME `isFinalAnswerReply`
+  // classifier at outbound-send-path.ts ~2293) and the single-writer election
+  // in the Stop hook is reachable and safe. The caller
+  // (silent-end-interrupt-stop.mjs) MUST NOT self-exit a capture in that case;
+  // doing so creates a third, uncoordinated delivery path that re-sends a
+  // trailing recap of the reply as a second message (the #3510 double-send).
+  //
+  // #3511 review finding 1: ONLY a `'final-reply'` deliver block counts. A
+  // `'silent-marker'` block (reply-tool NO_REPLY / HEARTBEAT_OK) delivered
+  // NOTHING to the user, and the gateway routes such turns to sentinel
+  // suppression (`decideTurnEndGate` → 'silent_end') BEFORE the captured-prose
+  // bridge ever runs — deferring to the election there would orphan the
+  // trailing answer (a drop). A silent marker still advances `lastDeliverIdx`
+  // (the trailing-prose CURSOR — H6 semantics: NO_REPLY intentionally silences
+  // what came BEFORE it), but it must keep the shape on the durable
+  // outbox/sweep path, never route it to the election.
+  const replyAlreadyDeliveredThisTurn = lastFinalReplyBlock != null
+  const deliveredReplySha256 =
+    lastFinalReplyBlock != null && typeof lastFinalReplyBlock.text === 'string'
+      ? createHash('sha256').update(lastFinalReplyBlock.text, 'utf8').digest('hex')
+      : null
   const trailing = blocks
     .slice(lastDeliverIdx + 1)
     .filter((b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0)
@@ -995,5 +1025,7 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     anchorContent: anchor.anchorContent,
     originChatId: origin.chatId,
     originThreadId: origin.threadId,
+    replyAlreadyDeliveredThisTurn,
+    deliveredReplySha256,
   }
 }

@@ -182,6 +182,11 @@ function writeOutboxRecord(stateDir, capture) {
       // F2: per-session origin chat for envelope-less routing (fail-closed).
       originChatId: capture.chatId == null ? (capture.originChatId ?? null) : undefined,
       originThreadId: capture.chatId == null ? (capture.originThreadId ?? null) : undefined,
+      // #3510 instrumentation: carried into every delivered.jsonl entry the
+      // sweep writes for this record, so a double-send is provable from the
+      // journal alone. Driven by the SAME boolean that gates capture-vs-election
+      // in main() — fix and telemetry cannot drift.
+      replyAlreadyDeliveredThisTurn: capture.replyAlreadyDeliveredThisTurn === true,
     }
     const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
     writeFileSync(tmpPath, JSON.stringify(record), 'utf8')
@@ -242,13 +247,34 @@ function main() {
   if (process.env.SWITCHROOM_TG_OUTBOX_DELIVERY !== '0') try {
     const capture = scanForOutboxCapture(jsonl)
     if (capture.capture === true) {
-      writeOutboxRecord(stateDir, capture)
-      process.stderr.write(
-        `[silent-end-interrupt] captured undelivered final answer to outbox ` +
-          `(nonce=${capture.turnNonce} source=${capture.source} chars=${capture.text.length}) — ` +
-          `sweep will deliver; allowing stop\n`,
-      )
-      process.exit(0)
+      if (capture.replyAlreadyDeliveredThisTurn === true) {
+        // #3510: a qualifying reply ALREADY delivered through the gateway this
+        // turn, so a gateway anchor provably exists and the single-writer
+        // election below ('trailing-text-after-reply') is reachable. Writing an
+        // outbox record + self-exiting here would create a third, uncoordinated
+        // delivery path that bypasses the #3469 election and re-sends a
+        // trailing recap of the reply as a second (unformatted) message. Do NOT
+        // capture; fall through so the election is the actual single writer.
+        // The gateway-blind backstop (#3502) is untouched: it is the
+        // replyAlreadyDeliveredThisTurn === false branch below.
+        // Log both hashes so a double-send is provable from logs alone.
+        process.stderr.write(
+          `[silent-end-interrupt] capture found trailing prose after a delivered reply ` +
+            `(nonce=${capture.turnNonce} source=${capture.source} chars=${capture.text.length} ` +
+            `replyAlreadyDeliveredThisTurn=true ` +
+            `capturedTextSha256=${createHash('sha256').update(capture.text, 'utf8').digest('hex')} ` +
+            `deliveredReplySha256=${capture.deliveredReplySha256 ?? 'unknown'}) — ` +
+            `deferring to single-writer election (#3510)\n`,
+        )
+      } else {
+        writeOutboxRecord(stateDir, capture)
+        process.stderr.write(
+          `[silent-end-interrupt] captured undelivered final answer to outbox ` +
+            `(nonce=${capture.turnNonce} source=${capture.source} chars=${capture.text.length} ` +
+            `replyAlreadyDeliveredThisTurn=false) — sweep will deliver; allowing stop\n`,
+        )
+        process.exit(0)
+      }
     }
   } catch (err) {
     process.stderr.write(`[silent-end-interrupt] outbox capture error (fail-open): ${err.message}\n`)

@@ -133,7 +133,13 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
         // exactly-once, independent of cache lifetime and surviving a restart
         // (the record is gone from disk, the nonce is durably journaled).
         appendDelivered(
-          { turnNonce: record.turnNonce, textSha256: record.textSha256, ts: now },
+          {
+            turnNonce: record.turnNonce,
+            textSha256: record.textSha256,
+            ts: now,
+            deliverySource: 'sweep',
+            replyAlreadyDeliveredThisTurn: record.replyAlreadyDeliveredThisTurn === true,
+          },
           deps.stateDir,
         )
         clearOutboxRecord(record.turnNonce, deps.stateDir)
@@ -156,7 +162,18 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
         decision.text ?? record.text,
       )
       appendDelivered(
-        { turnNonce: record.turnNonce, textSha256: record.textSha256, tgMessageId: messageId, ts: now },
+        {
+          turnNonce: record.turnNonce,
+          textSha256: record.textSha256,
+          tgMessageId: messageId,
+          ts: now,
+          // #3510 instrumentation: a sweep delivery journals its machine and the
+          // record's capture-time reply-already-delivered flag, so a duplicate
+          // (deliverySource:'sweep' after a reply-tool delivery of the same
+          // turn) is provable from the journal alone.
+          deliverySource: 'sweep',
+          replyAlreadyDeliveredThisTurn: record.replyAlreadyDeliveredThisTurn === true,
+        },
         deps.stateDir,
       )
       removeClaimed(record.turnNonce, deps.stateDir)
@@ -266,14 +283,35 @@ export function startOutboxSweep(deps: {
  * Best-effort; never throws. A null/empty nonce is ignored (nothing to journal).
  */
 export function journalExternalDelivery(
-  args: { turnNonce: string | null; text: string; tgMessageId?: number },
+  args: {
+    turnNonce: string | null
+    text: string
+    tgMessageId?: number
+    /**
+     * #3510 instrumentation: whether a qualifying reply had already delivered
+     * this turn at the time of this delivery. Reply-send sites pass `true`
+     * (they ARE that delivery); the captured-prose bridge omits it (its turn
+     * shape is decided upstream). Journaled so a later sweep entry under the
+     * same nonce is provably a double-send from the journal alone.
+     */
+    replyAlreadyDeliveredThisTurn?: boolean
+  },
   stateDir?: string,
   now: number = Date.now(),
 ): void {
   const nonce = args.turnNonce
   if (nonce == null || nonce === '') return
   appendDelivered(
-    { turnNonce: nonce, textSha256: sha256Hex(args.text), tgMessageId: args.tgMessageId, ts: now },
+    {
+      turnNonce: nonce,
+      textSha256: sha256Hex(args.text),
+      tgMessageId: args.tgMessageId,
+      ts: now,
+      deliverySource: 'reply-tool',
+      ...(args.replyAlreadyDeliveredThisTurn == null
+        ? {}
+        : { replyAlreadyDeliveredThisTurn: args.replyAlreadyDeliveredThisTurn }),
+    },
     stateDir,
   )
   clearOutboxRecord(nonce, stateDir)
