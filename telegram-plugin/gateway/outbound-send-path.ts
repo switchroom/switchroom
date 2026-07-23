@@ -33,6 +33,8 @@ import {
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
 import { scrubVoice } from '../text-voice-scrub.js'
+import { normalizeTemporal } from '../temporal-normalize.js'
+import { resolveEnvTimezone } from '../shared/local-time.js'
 import { isMessageTooLongError, isHtmlParseRejectError } from '../retry-api-call.js'
 
 // ── send-orchestration façade imports (#2996 P2) ──
@@ -137,6 +139,18 @@ export interface NormalizeOutboundOptions {
   literalText?: boolean
   /** Fold `addParagraphSpacers` into the formatting step (edit_message path). */
   addSpacers?: boolean
+  /**
+   * Agent-configured IANA timezone for the temporal-normalization pass (#3501).
+   * When BOTH `tz` and `nowMs` are supplied (callers pass `resolveEnvTimezone()`
+   * and `Date.now()`), the seam rewrites UTC/Zulu datetimes to local wall clock
+   * and corrects relative-day words against the current date in `tz`. Omitted →
+   * the temporal pass is a no-op (keeps the module pure/clock-free by default).
+   * NEVER fires on a literal edit (`literalText`) — a literal edit lands
+   * byte-for-byte as authored.
+   */
+  tz?: string
+  /** Epoch-ms "now" for the temporal pass. Required alongside `tz` to fire. */
+  nowMs?: number
 }
 
 /**
@@ -167,7 +181,7 @@ export function normalizeOutboundBody(
   redact: RedactFn,
   opts: NormalizeOutboundOptions = {},
 ): NormalizeOutboundResult {
-  const { literalText = false, addSpacers = false } = opts
+  const { literalText = false, addSpacers = false, tz, nowMs } = opts
   let text = repairEscapedWhitespace(rawText)
   if (!literalText) text = normalizeParagraphBreaks(text)
   text = redact(text, site)
@@ -175,6 +189,14 @@ export function normalizeOutboundBody(
     let formatted = stripExcessBold(normalizePunctuation(text))
     if (addSpacers) formatted = addParagraphSpacers(formatted)
     text = formatted
+    // Temporal normalization (#3501): UTC/Zulu → local wall clock, then
+    // relative-day accuracy, resolved in the agent's configured tz. Runs AFTER
+    // punctuation/bold (so masking sees final markdown) and BEFORE the voice
+    // scrub (so a freshly-rewritten "Thu 23 Jul 7:15 pm AEST" is never mangled
+    // by the em/en-dash scrub). Never on a literal edit. Pure / never-throws.
+    if (tz != null && nowMs != null) {
+      text = normalizeTemporal(text, tz, nowMs)
+    }
   }
   let voiceReplaced = 0
   const scrub = scrubVoice(text)
@@ -832,7 +854,10 @@ export async function sendReply(
   // retries see the scrubbed dedup key). The metric side effect (fired on a
   // non-zero voice-scrub replacement) stays here — the pure module returns the
   // replacement count and the gateway emits.
-  const _normalized = normalizeOutboundBody(rawText, 'reply', redactOutboundText)
+  const _normalized = normalizeOutboundBody(rawText, 'reply', redactOutboundText, {
+    tz: resolveEnvTimezone(),
+    nowMs: Date.now(),
+  })
   let text = _normalized.text
   if (_normalized.voiceReplaced > 0) {
     emitRuntimeMetric({

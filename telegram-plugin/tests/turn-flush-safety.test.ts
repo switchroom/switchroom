@@ -287,7 +287,7 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
     // #2996 P2: the reply orchestration itself now lives in the module
     // (`sendReply`); the delegation line is pinned there.
     const replyDelegates = moduleSrc.indexOf(
-      `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`,
+      `normalizeOutboundBody(rawText, 'reply', redactOutboundText`,
       moduleSrc.indexOf('export async function sendReply('),
     )
     expect(replyDelegates).toBeGreaterThan(0)
