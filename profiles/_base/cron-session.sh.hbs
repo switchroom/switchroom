@@ -69,6 +69,11 @@ fi
 export SWITCHROOM_AGENT_NAME="$CRON_NAME"
 export CLAUDE_CONFIG_DIR="$CRON_CONFIG_DIR"
 
+# Preserve pre-2.1.217 nested sub-agent behaviour for cron-fired sessions too.
+# Normally inherited from start.sh's env; set here as a belt-and-braces default
+# (honouring any value already in the env). See start.sh.hbs for rationale.
+export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="${CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH:-2}"
+
 # Defer the (now full) MCP schema set via tool-search so the cron session keeps
 # its low-context cost — the heavy servers load on demand; switchroom-telegram
 # + hindsight stay alwaysLoad. Normally inherited from start.sh's env; set here
