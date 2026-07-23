@@ -532,6 +532,17 @@ export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
 # Claude reads .credentials.json directly; the broker is the sole writer
 # of that file and updates it before claude's own refresh window opens.
 unset CLAUDE_CODE_OAUTH_TOKEN
+# Claude Code 2.1.217 turned NESTED sub-agent spawning OFF by default: a
+# sub-agent can no longer spawn its own sub-agent unless this env is set.
+# The fleet relies on multi-level worker delegation (the main session
+# dispatches @worker/@researcher, and a dispatched worker may in turn fan
+# out its own sub-agents), so we restore the pre-2.1.217 behaviour. Depth 2
+# = main → sub-agent → grandchild, which covers the one extra level the
+# fleet actually uses; there is no evidence of deeper nesting, so we don't
+# raise it further. (The companion 2.1.217 change — CLAUDE_CODE_MAX_
+# CONCURRENT_SUBAGENTS defaulting to 20 — is already compatible: our fleet
+# self-caps at 15 parallel sub-agents, so the 20 default is left untouched.)
+export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="${CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH:-2}"
 export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 # SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identifier the
 # telegram-plugin reads to detect self-restart commands. We can't rely on
