@@ -56,7 +56,11 @@ jobs:
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Was 8 (single attempt). The hang-watchdog wrapper (scripts/bun-test-ci.sh)
+    # retries a wedged run up to BUN_TEST_MAX_ATTEMPTS times; a healthy run is
+    # ~50s on the 2-vCPU runner, so 15 min covers up to 3 attempts (each capped
+    # at BUN_TEST_ATTEMPT_TIMEOUT=180s) plus checkout/install overhead.
+    timeout-minutes: 15
     env:
       TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
     steps:
@@ -67,15 +71,15 @@ jobs:
         uses: ./.github/actions/setup-switchroom
 
       - name: Bun test (telegram-plugin)
-        # Same explicit dir list as Buildkite — running `bun test` with no
-        # args recurses into telegram-plugin/uat/scenarios/ which fail
-        # without TELEGRAM_API_ID/HASH. The dir list scopes to the unit
-        # surface only.
+        # Runs the same explicit dir list as Buildkite (bun test with no
+        # args recurses into uat/scenarios/, which need live creds) through
+        # a hang-watchdog wrapper. The wrapper kills + retries a run wedged
+        # by the pre-existing Bun fs.watch deadlock in the subagent-watcher
+        # tests, but passes REAL assertion failures straight through without
+        # retry. See scripts/bun-test-ci.sh for the full rationale. The test
+        # arg list lives in that script — keep the two in sync.
         working-directory: telegram-plugin
-        run: |
-          bun test \
-            admin-commands gateway registry secret-detect tests \
-            channel-envelope-safety.test.ts
+        run: ./scripts/bun-test-ci.sh
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context. ALWAYS runs so it always
