@@ -170,6 +170,43 @@ describe("LogTailRolloutNarrator", () => {
     expect(final).not.toContain("switchroom webd install");
   });
 
+  it("footer 'N/M rolled' tracks real completions while entry.rolled is still empty mid-roll", async () => {
+    // REGRESSION (#2726): hostd only parses the child's result sentinel into
+    // `entry.rolled` AFTER the whole subprocess exits, so every in-flight phase
+    // reads `entry.rolled === undefined/[]`. The footer used to read that empty
+    // list directly and froze at "0/M rolled" for the entire roll even as the
+    // per-agent checklist showed agents ✓ done. The count must instead derive
+    // from the accumulated checklist. entry.rolled is DELIBERATELY never set
+    // here — that mirrors the live hostd path during the roll.
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry(); // entry.rolled stays undefined the whole time.
+
+    n.onPhase(entry, phase("apply"));
+    await vi.runAllTimersAsync();
+
+    // Canary passes — one agent is now rolled.
+    n.onPhase(entry, phase("canary-start", { agent: "test-harness", n: 1, m: 3 }));
+    n.onPhase(entry, phase("canary-pass", { agent: "test-harness", n: 1, m: 3 }));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(entry.rolled).toBeUndefined(); // hostd hasn't parsed the sentinel yet.
+    expect(relay.edits.at(-1)!.text).toContain("1/3 rolled"); // was "0/3".
+
+    // Second agent completes — footer advances to 2/3.
+    n.onPhase(entry, phase("agent-start", { agent: "clerk", n: 2, m: 3 }));
+    n.onPhase(entry, phase("agent-done", { agent: "clerk", n: 2, m: 3 }));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain("2/3 rolled");
+
+    // A still-running agent does NOT count until its -done phase lands.
+    n.onPhase(entry, phase("agent-start", { agent: "marko", n: 3, m: 3 }));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain("2/3 rolled");
+    n.onPhase(entry, phase("agent-done", { agent: "marko", n: 3, m: 3 }));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain("3/3 rolled");
+  });
+
   it("marks the failed agent ✗ on a terminal error", async () => {
     const relay = makeRelay(100);
     const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });

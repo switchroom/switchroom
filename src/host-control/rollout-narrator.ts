@@ -269,6 +269,21 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       // Fold the phase into the per-agent checklist (✓/⏳/·/✗ + durations).
       this.trackAgentProgress(st, phase);
 
+      // #2726 fix — during the roll, `entry.rolled` is still empty: hostd only
+      // parses the child's result sentinel into `entry.rolled` AFTER the whole
+      // subprocess exits (server.ts spawnRollout `.then()`), so an in-flight
+      // phase always reads `[]` there and the footer froze at "0/M rolled".
+      // The per-agent checklist we already accumulate (`st.agents`) is the
+      // authoritative live source: an agent flips to "done" the moment its
+      // agent-done / canary-pass phase lands. Derive the rolled list from it so
+      // the footer count tracks real completions; fall back to the terminal
+      // `entry.rolled` only when it's actually populated.
+      const doneNames = st.agents
+        .filter((a) => a.status === "done")
+        .map((a) => a.name);
+      const rolledSoFar =
+        entry.rolled && entry.rolled.length > 0 ? entry.rolled : doneNames;
+
       // Rebuild the render state from this phase (pull-shaped: each phase is a
       // projection of the latest durable row hostd just wrote).
       st.render = {
@@ -278,7 +293,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         ...(phase.n !== undefined ? { n: phase.n } : {}),
         ...(phase.m !== undefined ? { m: phase.m } : {}),
         ...(phase.agent !== undefined ? { agent: phase.agent } : {}),
-        rolled: entry.rolled,
+        rolled: rolledSoFar,
         agents: st.agents,
         requestId: entry.request_id,
         ...(entry.prior_pin ? { fromVersion: entry.prior_pin } : {}),
