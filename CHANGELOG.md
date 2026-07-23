@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## v0.19.13 — Memory self-heal + guaranteed message delivery + temporal normalization + CLI 2.1.218
+
+### Memory / Hindsight (#3500)
+
+- **Consolidation queue self-heals from corrupt-index deadlocks** — a corrupt
+  consolidation index no longer wedges the queue indefinitely; the queue now
+  detects the bad state and recovers on its own instead of stalling memory
+  writes.
+
+### Telegram delivery (#3502, #3503, #3506)
+
+- **Guaranteed final-message delivery via a durable outbox (#3502)** — outbound
+  messages are persisted to a durable outbox so the final reply is delivered
+  deterministically even across restarts/crashes mid-send, instead of being
+  silently lost.
+- **Outbound normalize consolidated into one shared seam (#3503)** — all
+  outbound normalization now flows through a single shared path (part 1 of
+  #3501), removing duplicated/divergent normalize logic ahead of the temporal
+  work below.
+- **Outbound temporal normalization: UTC→local + relative-day (#3506)** — times
+  in outbound messages are normalized to the recipient's local timezone and
+  rendered with relative-day phrasing (part 2 of #3501), so timestamps read
+  naturally instead of as raw UTC.
+
+### CI resilience (#3505)
+
+- **Flaky Bun `fs.watch` hang self-recovers in `bun-test-run`** — the
+  intermittent `fs.watch` hang that stalled `bun-test-run` is now detected and
+  recovered automatically, so a transient watcher wedge no longer fails CI.
+
+### Runtime (#3507)
+
+- **Pinned Claude Code CLI bumped `2.1.216` → `2.1.218`** across the base and
+  hindsight images (kept in lockstep), preserving nested-subagent depth. No
+  breaking changes.
+
 ## v0.19.12 — Claude Code CLI 2.1.215 → 2.1.216
 
 ### Runtime (#3498)
