@@ -904,6 +904,7 @@ import {
   TURN_ACTIVE_IDLE_SWEEP_MS,
 } from './turn-active-marker.js'
 import { startGatewayHeartbeat } from './gateway-heartbeat.js'
+import { startOutboxSweep, writeLastInboundChat } from './outbox-sweep.js'
 import {
   VERSION,
   COMMIT_SHA,
@@ -9822,20 +9823,15 @@ function trackRedeliveredInbound(merged: InboundMessage): void {
 // `runDeliveryConfirmSweep` / `redeliverStrandedInbound` / `sweepSuspendedTargets`
 // moved VERBATIM; the gateway keeps the deps builder, thin wrappers, and the
 // `setInterval` registration below (P0c: modules export the tick body; the
-// gateway owns the timer). The idle gate crosses as `getCurrentTurnNull` ONLY
-// (the design's C1 deps shape — never the machine's eager in-turn state).
+// gateway owns the timer). Idle gate crosses as `getCurrentTurnNull` ONLY.
 
 /** Live gateway deps for the extracted delivery-confirm sweep wiring. */
 function gatewayDeliveryConfirmDeps() {
   return {
-    DELIVERY_CONFIRM_ENABLED,
-    DELIVERY_CONFIRM_TIMEOUT_MS,
+    DELIVERY_CONFIRM_ENABLED, DELIVERY_CONFIRM_TIMEOUT_MS,
     getCurrentTurnNull: (): boolean => currentTurn == null,
     sendToAgent: (agent: string, m: InboundMessage): boolean => ipcServer.sendToAgent(agent, m),
-    deliveryQueue,
-    pendingInboundBuffer,
-    pendingPermissions,
-    pendingAskUser,
+    deliveryQueue, pendingInboundBuffer, pendingPermissions, pendingAskUser,
   }
 }
 export type DeliveryConfirmWiringDeps = ReturnType<typeof gatewayDeliveryConfirmDeps>
@@ -9851,6 +9847,8 @@ function runDeliveryConfirmSweep(): void {
 
 const _deliveryConfirmSweep = isGatewayMain ? setInterval(runDeliveryConfirmSweep, DELIVERY_CONFIRM_SWEEP_MS) : undefined
 _deliveryConfirmSweep?.unref?.()
+
+startOutboxSweep({ isGatewayMain, stateDir: STATE_DIR, getBot: () => bot, getTurnsDb: () => turnsDb, dedupCheck: (c, t, x) => outboundDedup.check(c, t, x, Date.now()) != null, log: (l) => process.stderr.write(l) }) // outbox: single deliverer for Stop-hook-captured prose (../outbox.ts)
 
 // #1445 cross-turn pending-async ambient. When a turn ends after the
 // model dispatched background async work (Agent / Task / Bash run-in-
@@ -14795,6 +14793,8 @@ export async function handleInbound(
   {
     const inboundChatId = ctx.chat?.id
     if (inboundChatId != null) void dmPinSweeper.sweep(String(inboundChatId))
+    // Outbox H3 fallback: stamp the last real inbound chat for envelope-less handback routing.
+    if (inboundChatId != null) writeLastInboundChat({ chatId: String(inboundChatId), threadId: messageThreadId ?? null })
   }
 
   // Capture wall-clock receive time for inbound_ack metric (#203).
