@@ -114,16 +114,47 @@ export interface NormalizeOutboundResult {
 }
 
 /**
- * Stage 1 — the deterministic outbound text transform, byte-identical to the
- * inline pipeline at the entry of executeReply (and mirrored on the
- * answer-stream + turn-flush paths):
+ * Per-site shape knobs for {@link normalizeOutboundBody}. The reply path (the
+ * canonical caller) passes none — the defaults reproduce its exact pre-#3501
+ * byte output. The edit_message and turn-flush sites, which used to hand-mirror
+ * this pipeline inline, pass these to reproduce their two small deviations:
+ *
+ *   - `literalText` (edit_message `format:'text'`): a literal edit must land
+ *     byte-for-byte as authored, so it SKIPS paragraph-break promotion and the
+ *     punctuation/bold/spacer formatting entirely — only the whitespace repair,
+ *     the secret redact, and the voice scrub still run (they are safety
+ *     transforms that must apply even to literal edits, matching the former
+ *     inline `executeEditMessage` order).
+ *   - `addSpacers` (edit_message non-literal): the edit path folds the
+ *     idempotent U+00A0 paragraph spacer INTO this transform
+ *     (`addParagraphSpacers(stripExcessBold(normalizePunctuation(…)))`),
+ *     whereas the reply/turn-flush paths add spacers separately downstream (or
+ *     not at all). Setting this reproduces that inline behaviour exactly.
+ */
+export interface NormalizeOutboundOptions {
+  /** Literal edit: skip paragraph-break + punctuation/bold/spacer formatting. */
+  literalText?: boolean
+  /** Fold `addParagraphSpacers` into the formatting step (edit_message path). */
+  addSpacers?: boolean
+}
+
+/**
+ * Stage 1 — the deterministic outbound text transform. This is the SINGLE
+ * shared seam for every outbound prose send (#3501): the reply path, the
+ * edit_message path, and the turn-flush backstop all route through it instead
+ * of hand-mirroring the pipeline inline, so a new outbound transform is added
+ * in exactly one place.
  *
  *   1. repairEscapedWhitespace  — undo LLM JSON-escape bungles
  *   2. normalizeParagraphBreaks — promote lone prose breaks to GFM hard breaks
+ *                                 (skipped for a literal edit)
  *   3. redact (injected)        — outbound secret scrub (#2044), BEFORE the
  *                                 punctuation/bold normalizers so a secret with
  *                                 an em-dash or `**` is matched literally
  *   4. stripExcessBold∘normalizePunctuation — fleet-consistent formatting
+ *                                 (optionally wrapped in addParagraphSpacers for
+ *                                 the edit path; skipped entirely for a literal
+ *                                 edit)
  *   5. scrubVoice               — em/en dash → comma/period (#1683)
  *
  * The order is load-bearing and MUST NOT change (each step's comment in the
@@ -133,10 +164,17 @@ export function normalizeOutboundBody(
   rawText: string,
   site: string,
   redact: RedactFn,
+  opts: NormalizeOutboundOptions = {},
 ): NormalizeOutboundResult {
-  let text = normalizeParagraphBreaks(repairEscapedWhitespace(rawText))
+  const { literalText = false, addSpacers = false } = opts
+  let text = repairEscapedWhitespace(rawText)
+  if (!literalText) text = normalizeParagraphBreaks(text)
   text = redact(text, site)
-  text = stripExcessBold(normalizePunctuation(text))
+  if (!literalText) {
+    let formatted = stripExcessBold(normalizePunctuation(text))
+    if (addSpacers) formatted = addParagraphSpacers(formatted)
+    text = formatted
+  }
   let voiceReplaced = 0
   const scrub = scrubVoice(text)
   if (scrub.replaced > 0) {

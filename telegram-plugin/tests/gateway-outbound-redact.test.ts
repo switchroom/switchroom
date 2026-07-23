@@ -60,22 +60,32 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(previewIdx).toBeGreaterThan(redactIdx) // mask BEFORE the preview is logged
   })
 
-  it('edit_message: scrubs at entry, before the voice scrub + send', () => {
+  it('edit_message: scrubs via the shared seam at entry, before the send (#3501)', () => {
+    // #3501: edit_message routes through normalizeOutboundBody, passing the
+    // injected redactor with the 'edit_message' site. The seam runs redact
+    // internally (pinned in outbound-send-path.ts), so the mask still fires at
+    // entry — before the editMessageText send below.
     const start = src.indexOf('async function executeEditMessage(')
-    const redactIdx = src.indexOf(`redactOutboundText(editRawText, 'edit_message')`, start)
-    const scrubIdx = src.indexOf(`site: 'edit_message'`, start)
+    const seamIdx = src.indexOf(`'edit_message',`, start)
+    const redactArgIdx = src.indexOf('redactOutboundText,', seamIdx)
+    const sendIdx = src.indexOf('editMessageText(', start)
     expect(start).toBeGreaterThan(0)
-    expect(redactIdx).toBeGreaterThan(start)
-    expect(scrubIdx).toBeGreaterThan(redactIdx)
+    expect(seamIdx).toBeGreaterThan(start)
+    expect(redactArgIdx).toBeGreaterThan(seamIdx) // redactor passed into the seam
+    expect(sendIdx).toBeGreaterThan(redactArgIdx) // mask BEFORE the send
   })
 
-  it('turn-flush backstop: scrubs the model terminal prose before send', () => {
+  it('turn-flush backstop: scrubs the model terminal prose before send (#3501)', () => {
     // Turn-flush delivers the model's answer when it skipped reply/stream_reply
-    // — arbitrary agent free-text that hits the wire + stderr preview.
-    const redactIdx = streamSrc.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
-    const scrubSiteIdx = streamSrc.indexOf(`site: 'turn_flush'`)
-    expect(redactIdx).toBeGreaterThan(0)
-    expect(scrubSiteIdx).toBeGreaterThan(redactIdx) // mask BEFORE the voice scrub + send
+    // — arbitrary agent free-text that hits the wire + stderr preview. #3501:
+    // it routes through normalizeOutboundBody('turn_flush', redactOutboundText),
+    // which redacts internally before the voice-scrub + send.
+    const seamIdx = streamSrc.indexOf('normalizeOutboundBody(')
+    const siteIdx = streamSrc.indexOf(`'turn_flush',`, seamIdx)
+    const redactArgIdx = streamSrc.indexOf('redactOutboundText,', seamIdx)
+    expect(seamIdx).toBeGreaterThan(0)
+    expect(siteIdx).toBeGreaterThan(seamIdx) // seam invoked with the turn_flush site
+    expect(redactArgIdx).toBeGreaterThan(seamIdx) // redactor passed into the seam
   })
 
   it('progress_update: scrubs at entry, BEFORE the 300-char truncation', () => {
