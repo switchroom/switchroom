@@ -146,6 +146,67 @@ describe('E4 outbox sweep — a ledger-marked block is never re-delivered (corre
   })
 })
 
+describe('E4 outbox sweep × durable shown-ledger — end-to-end wiring (correction 1 + 4)', () => {
+  // Integration test: exercise the REAL ledger round-trip (append/markShown +
+  // isShownBlock/isBlockShown) keyed by turnNonce THROUGH the outbox-sweep
+  // decision, mirroring the production composition at
+  // gateway/outbox-sweep.ts:122 (`shownLedgerHit: isShownBlock(record.turnNonce,
+  // record.text, deps.stateDir)`). Unlike the unit tests above that pass a
+  // hand-set `shownLedgerHit` boolean, this drives the flag FROM the durable
+  // ledger file — so if the ledger wiring is removed (append becomes a no-op, or
+  // decideOutboxSweep stops consulting the hit), the skip assertion goes RED.
+  const base = {
+    now: 10_000_000,
+    deliveredNonces: new Set<string>(),
+    textAlreadyDelivered: false,
+    routable: true,
+    quietMs: 0,
+  }
+
+  it('a block marked shown for its turnNonce is skipped; a non-shown block delivers', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'outbox-ledger-'))
+    try {
+      const nonce = 'c:_#42'
+      // markShown: the mid-turn narrative paint appended this block to the
+      // durable ledger for THIS turn's nonce.
+      appendShownBlock(nonce, NARRATION, dir)
+
+      // Sweep the SAME (nonce, text): the production wiring derives the flag from
+      // the ledger, so the record must be skipped as ephemeral-shown.
+      const shown = decideOutboxSweep({
+        ...base,
+        record: { turnNonce: nonce, text: NARRATION, createdAt: 0 },
+        shownLedgerHit: isShownBlock(nonce, NARRATION, dir),
+      })
+      expect(isShownBlock(nonce, NARRATION, dir)).toBe(true)
+      expect(shown.action).toBe('skip-ephemeral-shown')
+      expect(shown.text).toBeUndefined()
+
+      // A NON-shown block (the genuine unsent answer, never appended) still
+      // delivers exactly once — the ledger miss falls through to send.
+      const notShown = decideOutboxSweep({
+        ...base,
+        record: { turnNonce: nonce, text: REAL_ANSWER, createdAt: base.now },
+        shownLedgerHit: isShownBlock(nonce, REAL_ANSWER, dir),
+      })
+      expect(isShownBlock(nonce, REAL_ANSWER, dir)).toBe(false)
+      expect(notShown.action).toBe('send')
+      expect(notShown.text).toContain(REAL_ANSWER)
+
+      // Cross-turn isolation: the SAME text under a DIFFERENT turnNonce is not a
+      // ledger hit, so it delivers (no cross-turn suppression through the sweep).
+      const otherTurn = decideOutboxSweep({
+        ...base,
+        record: { turnNonce: 'c:_#43', text: NARRATION, createdAt: base.now },
+        shownLedgerHit: isShownBlock('c:_#43', NARRATION, dir),
+      })
+      expect(otherTurn.action).toBe('send')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('E3 captured-prose bridge — a shown block is refused (correction 1)', () => {
   /** Write a real silent-end-pending.json into a temp stateDir. */
   function withState(text: string, run: (deps: { stateDir: string }) => void): void {

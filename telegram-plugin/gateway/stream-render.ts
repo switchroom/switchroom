@@ -827,6 +827,20 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // negation is the draft-then-send narration signal the turn-flush strip
         // uses (`selectFlushDeliveryText`) to keep a real answer intact instead
         // of truncating a paragraph that merely opens with "Let me explain…".
+        //
+        // NOTE (naming/approximation, #3515 review nit): downstream this value is
+        // consumed as `followedByToolUse`, but `!ev.lastInMessage` is a CONSERVATIVE
+        // APPROXIMATION of that predicate, not an exact match. It is true when the
+        // block is not the last block in its assistant message OR when a tool_use
+        // follows it in the same turn — i.e. it can over-flag: a block that is
+        // genuinely last-in-message may still be marked true. Over-approximation is
+        // SAFE here by construction: a `true` flag only ever makes a block a
+        // candidate for structural-narration suppression (selectFlushDeliveryText /
+        // isStructuralNarration), so the worst case is suppressing MORE narration —
+        // it can never promote an answer into the drop path. A real terminal answer
+        // is protected independently (it is never followed by a tool and survives
+        // the strip). Do not "tighten" this to the exact predicate expecting a
+        // behavioural change: the runtime value is deliberately conservative.
         turn.capturedBlockMeta.push(!ev.lastInMessage)
         // Narrative-dedup gate step 1 (JSONL-text-narrative primitive):
         // stage this text block for one lookahead step. If a previous block
