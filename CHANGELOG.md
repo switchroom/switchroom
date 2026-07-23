@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.19.14 — Telegram double-send fix + rollout-card counter fix
+
+### Telegram delivery (#3510, #3511)
+
+- **Fixed the double-send regression: one answer no longer posts twice (#3511)** —
+  reply-then-recap capture is now routed through a single-writer election, so a
+  single answer is delivered once instead of being posted twice (the formatted
+  reply plus a raw duplicate). The fix preserves the silent-drop backstop — the
+  guarantee that a final answer is never lost is not regressed. Adversarially
+  reviewed and re-reviewed with all findings fixed.
+
+### Fleet rollout (#3509)
+
+- **Rollout progress card counts real completions (#3509)** — the "N/M rolled"
+  footer on the rollout progress card now counts actual completed rollouts
+  instead of showing a stuck `0/12 rolled`.
+
 ## v0.19.13 — Memory self-heal + guaranteed message delivery + temporal normalization + CLI 2.1.218
 
 ### Memory / Hindsight (#3500)
