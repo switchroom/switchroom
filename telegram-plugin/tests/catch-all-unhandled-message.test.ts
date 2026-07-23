@@ -195,6 +195,20 @@ describe('planUnhandledMessage — service-noise classification', () => {
     })
   })
 
+  it('legacy forward_* wire keys are envelope metadata — the placeholder names the CONTENT, never "forward_from" (row-944 mislabel)', () => {
+    const plan = planUnhandledMessage({
+      message_id: 944, chat: {}, date: 0,
+      forward_from: { id: 1, is_bot: true, first_name: 'Klanker' },
+      forward_date: 1784830000,
+      mystery_future_content: {},
+    })
+    expect(plan).toMatchObject({
+      action: 'turn',
+      text: '(unhandled message content: mystery_future_content)',
+    })
+    expect(plan.contentKeys).toEqual(['mystery_future_content'])
+  })
+
   it('a message mixing noise with real content still becomes a turn', () => {
     const plan = planUnhandledMessage({
       message_id: 1, chat: {}, date: 0,

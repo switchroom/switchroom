@@ -107,6 +107,7 @@ const GOLDEN_REGISTRATIONS: readonly string[] = [
   'on:message:checklist_tasks_done',
   'on:message:checklist_tasks_added',
   'on:message:pinned_message',
+  'on:message:rich_message',
   'helper:installUnhandledMessageCatchAll',
   'on:message_reaction',
   'catch',

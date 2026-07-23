@@ -204,7 +204,8 @@ export function dedupeForwardOrigins(
 /**
  * Build the `forwarded_*` channel-meta fields. Fixed per-origin attribute
  * order (documented here, tested in forward-origin.test.ts):
- *   forwarded_from, forwarded_from_type, forwarded_from_id, forwarded_date
+ *   forwarded_from, forwarded_from_type, forwarded_from_id, forwarded_date,
+ *   forwarded_message_id (channel origins only)
  * The primary field is the human-readable NAME; the numeric id is
  * supplementary and follows it. The first origin gets the bare keys;
  * subsequent distinct origins get `_2`, `_3`, … suffixes — the same
@@ -232,6 +233,10 @@ export function buildForwardOriginMeta(
         resolveEnvTimezone(),
       )
     }
+    // Channel origins only: the message id inside the origin channel, so the
+    // agent can deep-link the source post (t.me/<channel>/<id>). Server-
+    // stamped numeric — no escaping surface.
+    if (o.messageId != null) out[`forwarded_message_id${suffix}`] = String(o.messageId)
   })
   return out
 }
