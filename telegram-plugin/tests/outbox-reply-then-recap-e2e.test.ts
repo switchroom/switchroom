@@ -48,7 +48,11 @@ import { createHash } from 'node:crypto'
 
 import { sweepOutbox, journalExternalDelivery } from '../gateway/outbox-sweep.js'
 import { OUTBOX_QUIET_MS, type OutboxRecord, type DeliveredEntry } from '../outbox.js'
-import { shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
+import { shouldJournalReplySiteDelivery, isFinalAnswerReply } from '../final-answer-detect.js'
+import { decideTurnEndGate } from '../gateway/turn-end-gate.js'
+import { deliverCapturedProse, type DeliverCapturedProseDeps } from '../gateway/outbound-send-path.js'
+import { OutboundDedupCache } from '../recent-outbound-dedup.js'
+import type { FlushDecision } from '../turn-flush-safety.js'
 
 const HOOK = resolve(__dirname, '..', 'hooks', 'silent-end-interrupt-stop.mjs')
 const REPLY_TOOL = 'mcp__switchroom-telegram__reply'
@@ -62,7 +66,7 @@ const DEDUP_TTL_MS = 60_000
 const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
 
 interface Delivered {
-  via: 'reply-tool' | 'sweep'
+  via: 'reply-tool' | 'sweep' | 'bridge'
   text: string
 }
 
@@ -149,6 +153,99 @@ async function runTurn(opts: {
     env: { ...process.env, TELEGRAM_STATE_DIR: dir },
   })
   expect(hook.status).toBe(0)
+
+  // 3.5 Gateway turn-end — the REAL gate + the REAL captured-prose bridge
+  //     (#3511 review finding 2). `finalAnswerDelivered` is computed with the
+  //     REAL `isFinalAnswerReply` classifier at the reply site — the exact code
+  //     the gateway runs at outbound-send-path.ts ~2293 — and the disposition
+  //     comes from the REAL `decideTurnEndGate`. When (and only when) the gate
+  //     says 'reprompt' and the hook persisted `pendingText`, the REAL
+  //     `deliverCapturedProse` runs against the same state dir/journal. This
+  //     makes the load-bearing `isFinalAnswerReply` ⇔ `finalAnswerDelivered`
+  //     agreement an asserted outcome: if the hook defers a shape the gateway
+  //     does not consider delivered (or vice versa), the bridge fires and the
+  //     exactly-one-message assertions go red.
+  //     Only simulated for reply-called turns — a gateway-blind turn (no
+  //     CurrentTurn) has no turn_end at all, which is the whole point of the
+  //     outbox path.
+  const replyInputs: Array<{ text: string; done: boolean; disableNotification: boolean }> = []
+  for (const line of lines) {
+    const content = (line as { message?: { content?: Array<Record<string, unknown>> } }).message?.content
+    if (!Array.isArray(content)) continue
+    for (const c of content) {
+      if (c.type !== 'tool_use' || c.name !== REPLY_TOOL) continue
+      const input = c.input as { text?: string; done?: boolean; disable_notification?: boolean }
+      replyInputs.push({
+        text: String(input.text ?? ''),
+        done: input.done === true,
+        disableNotification: input.disable_notification === true,
+      })
+    }
+  }
+  const isSentinel = (t: string) => /^(NO_REPLY|HEARTBEAT_OK)[\s.!?]*$/i.test(t.trim())
+  const nonSentinelReplies = replyInputs.filter((r) => !isSentinel(r.text))
+  if (replyInputs.length > 0) {
+    // Same classifier + same site semantics as outbound-send-path.ts ~2293.
+    const finalAnswerDelivered = nonSentinelReplies.some((r) =>
+      isFinalAnswerReply({ text: r.text, disableNotification: r.disableNotification, done: r.done }),
+    )
+    // Sentinel-only turns take the gateway's sentinel-suppression path and
+    // return before the bridge (stream-render.ts ~1977 comment; verified live
+    // in the #3511 review). Reply-called turns take the 'reply-called' skip.
+    const flushDecision: FlushDecision =
+      nonSentinelReplies.length === 0
+        ? { kind: 'skip', reason: 'silent-marker' }
+        : { kind: 'skip', reason: 'reply-called' }
+    const gate = decideTurnEndGate({ flushDecision, finalAnswerDelivered })
+    if (gate === 'reprompt') {
+      const statePath = join(dir, 'silent-end-pending.json')
+      const pendingText = existsSync(statePath)
+        ? (JSON.parse(readFileSync(statePath, 'utf8')) as { pendingText?: string }).pendingText
+        : undefined
+      if (typeof pendingText === 'string' && pendingText.length > 0) {
+        // The gateway's silent-end machinery hands pendingText to the REAL bridge.
+        const dedup = new OutboundDedupCache()
+        for (const r of nonSentinelReplies) dedup.record(CHAT, undefined, r.text, Date.now(), null)
+        const bridgeDeps: DeliverCapturedProseDeps = {
+          outboundDedup: dedup,
+          bot: {
+            api: {
+              sendRichMessage: async (_chatId: string, rich: { markdown?: string }, _opts: object) => {
+                delivered.push({ via: 'bridge', text: rich.markdown ?? '' })
+                return { message_id: 2000 }
+              },
+            },
+          } as unknown as DeliverCapturedProseDeps['bot'],
+          robustApiCall: (fn) => fn(),
+          redactOutboundText: (text) => text,
+          recordOutbound: () => {},
+          HISTORY_ENABLED: false,
+          OBLIGATION_LEDGER_ENABLED: false,
+          obligationLedger: { close: () => {} },
+          clearSilentEndState: () => {},
+          recordUndeliveredTurnEnd: () => ({ exhausted: false }),
+          hasOutboundDeliveredSince: () => false,
+        }
+        // deliverCapturedProse journals via TELEGRAM_STATE_DIR — point it at
+        // this test's isolated state dir for the duration of the call.
+        const prevStateDir = process.env.TELEGRAM_STATE_DIR
+        process.env.TELEGRAM_STATE_DIR = dir
+        try {
+          await deliverCapturedProse(bridgeDeps, {
+            chatId: CHAT,
+            threadId: undefined,
+            statusKeyStr: `${CHAT}:main`,
+            registryKey: null,
+            originTurnId: GATEWAY_NONCE,
+            text: pendingText,
+          })
+        } finally {
+          if (prevStateDir == null) delete process.env.TELEGRAM_STATE_DIR
+          else process.env.TELEGRAM_STATE_DIR = prevStateDir
+        }
+      }
+    }
+  }
 
   // 4. The REAL sweep, ticked aggressively across the quiet-window boundary.
   //    Tick times are anchored on the record's actual createdAt when one
@@ -332,6 +429,80 @@ describe('#3502 backstop e2e — gateway-blind turns yield EXACTLY ONE delivery,
     const r = await runTurn({ dir, lines: [enqueueChannel('ping'), prose('NO_REPLY')] })
     expect(r.delivered).toHaveLength(0)
   })
+
+  it('reply-tool NO_REPLY then a substantive prose answer: the answer is delivered exactly once (#3511 finding 1)', async () => {
+    // The silence regression the #3511 review caught: a `reply("NO_REPLY")`
+    // delivered NOTHING to the user, and the gateway suppresses sentinel turns
+    // BEFORE the bridge can run — so if the hook treats the sentinel as
+    // "reply already delivered" and defers to the election, the trailing
+    // answer is orphaned and DROPPED. The discriminator must count only
+    // genuine final-reply deliveries, keeping this shape on the durable
+    // outbox/sweep path.
+    const r = await runTurn({
+      dir,
+      lines: [enqueueChannel('question'), reply('NO_REPLY'), prose(REAL_ANSWER)],
+    })
+    expect(r.delivered).toEqual([{ via: 'sweep', text: REAL_ANSWER.trim() }])
+    // Durable path was used: the record existed and was consumed, not elected.
+    expect(r.journal.filter((e) => e.deliverySource === 'sweep')).toHaveLength(1)
+    expect(r.journal[r.journal.length - 1].replyAlreadyDeliveredThisTurn).toBe(false)
+  })
+
+  it('reply-tool NO_REPLY then prose survives a dead gateway (outbox is gateway-liveness-independent)', async () => {
+    // The old capture path's durability property must hold for this shape:
+    // no heartbeat, no election — the record is still written and swept.
+    const r = await runTurn({
+      dir,
+      lines: [enqueueChannel('question'), reply('NO_REPLY'), prose(REAL_ANSWER)],
+      gatewayAlive: false,
+    })
+    expect(r.delivered).toEqual([{ via: 'sweep', text: REAL_ANSWER.trim() }])
+  })
+})
+
+describe('#3511 finding 2 — the gateway BRIDGE path agrees with the hook (paraphrase safe end to end)', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'outbox-e2e-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  it('genuine reply + paraphrased recap: pendingText IS persisted for the bridge, yet the bridge never fires — exactly one message', async () => {
+    // The load-bearing invariant: the hook's fall-through classifier
+    // (isFinalAnswerReply on the deliver block) and the gateway's bridge gate
+    // (turn.finalAnswerDelivered, set by the SAME classifier) must agree. The
+    // harness computes finalAnswerDelivered with the real classifier and runs
+    // the real decideTurnEndGate + real deliverCapturedProse when it says
+    // 'reprompt' — so if either side of the agreement breaks, the paraphrased
+    // recap goes out via the bridge and this goes red with 2 messages.
+    const r = await runTurn({
+      dir,
+      lines: [enqueueChannel('deploy it'), reply(SHORT_REPLY), prose(RECAP_PARAPHRASE)],
+    })
+    // The election really did elect the bridge as the would-be single writer…
+    const state = JSON.parse(readFileSync(join(dir, 'silent-end-pending.json'), 'utf8'))
+    expect(state.pendingText).toBe(RECAP_PARAPHRASE.trim())
+    // …but the gateway's gate (finalAnswerDelivered=true, same classifier)
+    // keeps the bridge off: the user got exactly the formatted reply.
+    expect(r.delivered).toEqual([{ via: 'reply-tool', text: SHORT_REPLY }])
+    expect(r.delivered.filter((d) => d.via === 'bridge')).toHaveLength(0)
+  })
+
+  it('interim ack + real answer: the bridge-eligible turn still yields the answer exactly once', async () => {
+    // Counter-case proving the bridge stage in the harness is live, not inert:
+    // an ack-only turn has finalAnswerDelivered=false (real classifier), the
+    // gate says reprompt — but the hook put the answer on the OUTBOX path
+    // (no pendingText persisted), so the sweep delivers and the bridge stays
+    // quiet. One ack + one answer, no third copy from any machine.
+    const ack = 'On it.'
+    const r = await runTurn({
+      dir,
+      lines: [enqueueChannel('question'), reply(ack, { disable_notification: true }), prose(REAL_ANSWER)],
+    })
+    const answers = r.delivered.filter((d) => d.text.includes(REAL_ANSWER.trim()))
+    expect(answers).toHaveLength(1)
+    expect(answers[0].via).toBe('sweep')
+  })
 })
 
 describe('#3510 instrumentation — the journal alone proves who delivered what', () => {
@@ -363,6 +534,48 @@ describe('#3510 instrumentation — the journal alone proves who delivered what'
     expect(replyEntries[0].textSha256).toBe(sha256(LONG_REPLY))
     // And no sweep entry exists for the turn — one writer, one journal line.
     expect(r.journal.filter((e) => e.deliverySource === 'sweep')).toHaveLength(0)
+  })
+
+  it('a bridge delivery journals replyAlreadyDeliveredThisTurn=false (#3511 finding 3)', async () => {
+    // The bridge only runs when no genuine final answer was delivered
+    // (decideTurnEndGate 'reprompt' requires finalAnswerDelivered === false),
+    // so its journal line must stamp the flag false — making a bridge
+    // double-send after a reply provable from the journal alone.
+    const dedup = new OutboundDedupCache()
+    const deps: DeliverCapturedProseDeps = {
+      outboundDedup: dedup,
+      bot: {
+        api: { sendRichMessage: async () => ({ message_id: 3000 }) },
+      } as unknown as DeliverCapturedProseDeps['bot'],
+      robustApiCall: (fn) => fn(),
+      redactOutboundText: (text) => text,
+      recordOutbound: () => {},
+      HISTORY_ENABLED: false,
+      OBLIGATION_LEDGER_ENABLED: false,
+      obligationLedger: { close: () => {} },
+      clearSilentEndState: () => {},
+      recordUndeliveredTurnEnd: () => ({ exhausted: false }),
+      hasOutboundDeliveredSince: () => false,
+    }
+    const prevStateDir = process.env.TELEGRAM_STATE_DIR
+    process.env.TELEGRAM_STATE_DIR = dir
+    try {
+      await deliverCapturedProse(deps, {
+        chatId: CHAT,
+        threadId: undefined,
+        statusKeyStr: `${CHAT}:main`,
+        registryKey: null,
+        originTurnId: GATEWAY_NONCE,
+        text: REAL_ANSWER,
+      })
+    } finally {
+      if (prevStateDir == null) delete process.env.TELEGRAM_STATE_DIR
+      else process.env.TELEGRAM_STATE_DIR = prevStateDir
+    }
+    const journal = readJournal(dir)
+    expect(journal).toHaveLength(1)
+    expect(journal[0].deliverySource).toBe('reply-tool')
+    expect(journal[0].replyAlreadyDeliveredThisTurn).toBe(false)
   })
 
   it('a captured (gateway-blind) record carries replyAlreadyDeliveredThisTurn=false on disk', async () => {

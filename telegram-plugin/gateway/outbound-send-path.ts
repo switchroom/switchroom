@@ -2483,7 +2483,13 @@ export async function deliverCapturedProse(
       outboundDedup.record(chatId, threadId, text, now, registryKey)
       // F1: captured-prose delivery journals + clears under the shared nonce
       // (`originTurnId` === turn.turnId === deriveTurnId, the hook's nonce).
-      journalExternalDelivery({ turnNonce: originTurnId, text, tgMessageId: sentIds[sentIds.length - 1] })
+      // #3510/#3511: the bridge only runs when NO genuine final answer was
+      // delivered this turn (`decideTurnEndGate` → 'reprompt' requires
+      // `finalAnswerDelivered === false`), so stamp `false` explicitly. A
+      // journal line from this site following a reply-tool line under the same
+      // nonce (replyAlreadyDeliveredThisTurn:true) is direct, journal-only
+      // proof of a bridge double-send.
+      journalExternalDelivery({ turnNonce: originTurnId, text, tgMessageId: sentIds[sentIds.length - 1], replyAlreadyDeliveredThisTurn: false })
       process.stderr.write(
         `telegram gateway: captured-prose delivery — sent ${out.length} chars recovered from ` +
           `transcript scan (chat=${chatId} origin=${originTurnId})\n`,

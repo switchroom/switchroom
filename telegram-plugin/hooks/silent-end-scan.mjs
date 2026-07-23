@@ -958,21 +958,35 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
   }
 
   let lastDeliverIdx = -1
+  let lastFinalReplyBlock = null
   for (let i = 0; i < blocks.length; i++) {
-    if (blocks[i].kind === 'deliver') lastDeliverIdx = i
+    if (blocks[i].kind !== 'deliver') continue
+    lastDeliverIdx = i
+    if (blocks[i].reason === 'final-reply') lastFinalReplyBlock = blocks[i]
   }
   // #3510: single source of truth for BOTH the fix's branching and the
-  // instrumentation. When true, a qualifying reply/stream_reply already went
-  // through the gateway THIS turn — so a gateway anchor provably exists and the
-  // single-writer election in the Stop hook is reachable and safe. The caller
+  // instrumentation. When true, a genuine FINAL-ANSWER reply/stream_reply
+  // already went through the gateway THIS turn — so a gateway anchor provably
+  // exists (`turn.finalAnswerDelivered` is set by the SAME `isFinalAnswerReply`
+  // classifier at outbound-send-path.ts ~2293) and the single-writer election
+  // in the Stop hook is reachable and safe. The caller
   // (silent-end-interrupt-stop.mjs) MUST NOT self-exit a capture in that case;
   // doing so creates a third, uncoordinated delivery path that re-sends a
   // trailing recap of the reply as a second message (the #3510 double-send).
-  const replyAlreadyDeliveredThisTurn = lastDeliverIdx !== -1
-  const deliveredBlock = replyAlreadyDeliveredThisTurn ? blocks[lastDeliverIdx] : null
+  //
+  // #3511 review finding 1: ONLY a `'final-reply'` deliver block counts. A
+  // `'silent-marker'` block (reply-tool NO_REPLY / HEARTBEAT_OK) delivered
+  // NOTHING to the user, and the gateway routes such turns to sentinel
+  // suppression (`decideTurnEndGate` → 'silent_end') BEFORE the captured-prose
+  // bridge ever runs — deferring to the election there would orphan the
+  // trailing answer (a drop). A silent marker still advances `lastDeliverIdx`
+  // (the trailing-prose CURSOR — H6 semantics: NO_REPLY intentionally silences
+  // what came BEFORE it), but it must keep the shape on the durable
+  // outbox/sweep path, never route it to the election.
+  const replyAlreadyDeliveredThisTurn = lastFinalReplyBlock != null
   const deliveredReplySha256 =
-    deliveredBlock != null && typeof deliveredBlock.text === 'string'
-      ? createHash('sha256').update(deliveredBlock.text, 'utf8').digest('hex')
+    lastFinalReplyBlock != null && typeof lastFinalReplyBlock.text === 'string'
+      ? createHash('sha256').update(lastFinalReplyBlock.text, 'utf8').digest('hex')
       : null
   const trailing = blocks
     .slice(lastDeliverIdx + 1)
