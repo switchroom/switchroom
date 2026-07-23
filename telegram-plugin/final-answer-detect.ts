@@ -120,3 +120,26 @@ export function isSubstantiveFinalReply(input: FinalAnswerReplyInput): boolean {
   if (input.text.length >= FINAL_ANSWER_MIN_CHARS) return true
   return false
 }
+
+/**
+ * F3 gate: should the legacy reply-site (`outbound-send-path.ts` sendReply)
+ * journal THIS reply's delivery under the turn nonce for the outbox sweep?
+ *
+ * This is deliberately `isSubstantiveFinalReply`, NOT `isFinalAnswerReply`.
+ * At the reply site the journaled text is the REPLY text — a DIFFERENT string
+ * from the trailing prose the Stop hook may capture under the SAME turn nonce
+ * (unlike the silent-anchor flush / captured-prose bridge, where the journaled
+ * text IS the turn's trailing content and a loose gate is loss-safe).
+ *
+ * `isFinalAnswerReply`'s ping clause classifies a short pinging interim ack
+ * ("On it — digging in", `disable_notification` omitted) as final. If such an
+ * ack journaled the turn nonce, and the model then ended the turn with
+ * gateway-invisible trailing prose (the real answer) captured under that same
+ * nonce, the sweep would hit `skip-journaled` and delete the real answer —
+ * silent loss, the exact incident this outbox exists to prevent. Requiring a
+ * SUBSTANTIVE reply (`done` or ≥200 chars) to journal keeps the double-post
+ * guard for genuine answers while never letting a pinging ack poison the nonce.
+ */
+export function shouldJournalReplySiteDelivery(input: FinalAnswerReplyInput): boolean {
+  return isSubstantiveFinalReply(input)
+}

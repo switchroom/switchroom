@@ -28,7 +28,8 @@ import {
   OUTBOX_MAX_AGE_MS,
 } from '../outbox.js'
 import { deriveTurnNonce as deriveTurnNonceMjs } from '../hooks/silent-end-scan.mjs'
-import { sweepOutbox } from '../gateway/outbox-sweep.js'
+import { sweepOutbox, journalExternalDelivery } from '../gateway/outbox-sweep.js'
+import { shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
 
 function rec(over: Partial<OutboxRecord>): OutboxRecord {
   const text = over.text ?? 'x'.repeat(300)
@@ -173,6 +174,56 @@ describe('sweepOutbox — end to end (exactly-once, siblings, dedup)', () => {
     const s2 = sink()
     await sweepOutbox({ ...s2, textAlreadyDelivered: () => false, stateDir: dir, now: () => 65_000 })
     expect(s2.sent).toHaveLength(0) // journal (durable) suppresses — no double-post
+    expect(listPendingRecords(dir)).toHaveLength(0)
+  })
+
+  it('F3: a PINGING interim ack does NOT poison the turn nonce — the real answer is still delivered exactly once', async () => {
+    // The exact F3 loss scenario, end-to-end through the production reply-site
+    // journal gate (`shouldJournalReplySiteDelivery`) + the sweep:
+    //   1. DM inbound → turn nonce N.
+    //   2. Model calls reply("On it — digging in") WITHOUT disable_notification
+    //      (a PINGING interim ack — the tool's default; models routinely omit
+    //      the flag). `isFinalAnswerReply` would classify this "final" (ping
+    //      clause), so the pre-fix reply site journaled N here.
+    //   3. Model ends the turn with gateway-invisible trailing prose (the real
+    //      answer) → the Stop hook captures it as a pending outbox record under
+    //      the SAME nonce N.
+    //   4. The sweep must DELIVER the real answer.
+    // Pre-fix (gate === isFinalAnswerReply) the ack journaled N → the sweep hits
+    // skip-journaled → clearOutboxRecord → 0 sent → the real answer is silently
+    // destroyed (RED). Post-fix (gate === isSubstantiveFinalReply) the pinging
+    // ack does NOT journal → the sweep delivers the real answer exactly once.
+    const nonce = deriveTurnNonce({ chatId: '8', threadId: null, messageId: '5', anchorTimestampMs: 1, anchorContent: 'c' })
+    const pingingAck = { text: 'On it — digging in', disableNotification: false }
+    // Model the reply site EXACTLY: journal via journalExternalDelivery iff the
+    // production gate says to (same call shape as outbound-send-path.ts sendReply).
+    if (shouldJournalReplySiteDelivery(pingingAck)) {
+      journalExternalDelivery({ turnNonce: nonce, text: pingingAck.text }, dir)
+    }
+    // The Stop hook captured the real (undelivered) answer under the same nonce.
+    const realAnswer = 'The root cause is a race in the flush path — here is the full write-up. '.repeat(4)
+    writeOutboxRecordAtomic(rec({ turnNonce: nonce, chatId: '8', text: realAnswer, createdAt: 0 }), dir)
+    const s = sink()
+    await sweepOutbox({ ...s, textAlreadyDelivered: () => false, stateDir: dir, now: () => 10_000 })
+    expect(s.sent).toHaveLength(1)
+    expect(s.sent[0].text).toBe(realAnswer)
+    expect(listPendingRecords(dir)).toHaveLength(0)
+  })
+
+  it('F3: a SUBSTANTIVE final reply STILL journals so the sweep does not double-post the same answer', async () => {
+    // The counterpart guard — the fix must not reopen F1. A genuine substantive
+    // answer delivered at the reply site journals the nonce, so a captured
+    // record for the same turn is suppressed (no duplicate).
+    const nonce = deriveTurnNonce({ chatId: '8', threadId: null, messageId: '6', anchorTimestampMs: 1, anchorContent: 'c' })
+    const realReply = { text: 'x'.repeat(300), disableNotification: false }
+    expect(shouldJournalReplySiteDelivery(realReply)).toBe(true)
+    if (shouldJournalReplySiteDelivery(realReply)) {
+      journalExternalDelivery({ turnNonce: nonce, text: realReply.text }, dir)
+    }
+    writeOutboxRecordAtomic(rec({ turnNonce: nonce, chatId: '8', text: realReply.text, createdAt: 0 }), dir)
+    const s = sink()
+    await sweepOutbox({ ...s, textAlreadyDelivered: () => false, stateDir: dir, now: () => 10_000 })
+    expect(s.sent).toHaveLength(0) // journaled → sweep suppresses → no double-post
     expect(listPendingRecords(dir)).toHaveLength(0)
   })
 

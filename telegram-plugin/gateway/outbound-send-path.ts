@@ -51,7 +51,7 @@ import {
 import { richMessage } from '../rich-send.js'
 import { journalExternalDelivery } from './outbox-sweep.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
-import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
+import { isFinalAnswerReply, isSubstantiveFinalReply, shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
 import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
 import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import {
@@ -2288,13 +2288,27 @@ export async function sendReply(
   if (sentIds.length > 0) {
     const t = getCurrentTurn()
     outboundDedup.record(chat_id, threadId, text, Date.now(), t?.registryKey ?? null)
-    // F1: a FINAL-answer reply journals + clears under the shared nonce
+    // F1: a SUBSTANTIVE-final reply journals + clears under the shared nonce
     // (turn.turnId === deriveTurnId, the hook's deriveTurnNonce), so the sweep
-    // never re-posts this turn's answer. Gated on isFinalAnswerReply: an interim
-    // ack is NOT the turn's answer, so it must not journal the turn nonce (that
-    // would suppress a later genuinely-undelivered final answer for the same
-    // gateway turn).
-    if (isFinalAnswerReply({ text: rawText, disableNotification: modelDisableNotification })) {
+    // never re-posts this turn's answer.
+    //
+    // F3: gate on `isSubstantiveFinalReply`, NOT `isFinalAnswerReply`. Unlike
+    // the flush site (~1741) and the captured-prose bridge (~2407) — where the
+    // journaled text IS this turn's trailing content, so a loose gate is
+    // loss-safe — here the journaled text is the REPLY text, a DIFFERENT string
+    // from the trailing prose the hook captures under the same turn nonce.
+    // `isFinalAnswerReply`'s ping clause (`disableNotification` falsy — the
+    // tool's default, routinely omitted by models) classifies a short pinging
+    // interim ack ("On it — digging in") as final. Journaling on that ack would
+    // poison the turn nonce: the model then ends the turn with gateway-invisible
+    // trailing prose (the real answer), the Stop hook captures it under the SAME
+    // nonce, and the sweep hits `skip-journaled` → `clearOutboxRecord` → the
+    // real answer is silently destroyed — the exact incident class this outbox
+    // exists to prevent. `isSubstantiveFinalReply` (`done === true ||
+    // length ≥ 200`, no ping path) still journals a genuine answer (so the sweep
+    // won't double-post it) while an interim ack never journals (so a later
+    // genuinely-undelivered final answer is delivered by the sweep).
+    if (shouldJournalReplySiteDelivery({ text: rawText, disableNotification: modelDisableNotification })) {
       journalExternalDelivery({ turnNonce: t?.turnId ?? null, text, tgMessageId: sentIds[sentIds.length - 1] })
     }
   }
