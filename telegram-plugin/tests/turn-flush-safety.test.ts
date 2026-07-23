@@ -302,24 +302,29 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
     expect(scrubIdx).toBeGreaterThan(normIdx) // ...and BEFORE the voice scrub
   })
 
-  it('turn-flush backstop: applies the SAME normalization in the SAME slot (REDS if the line is removed)', () => {
-    const redactIdx = streamSrc.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
-    // The normalization call the reply path uses, verbatim, on the turn_flush
-    // variable. This indexOf is what returns -1 (→ assertion fails) if the
-    // `stripExcessBold(normalizePunctuation(capturedText))` line is deleted
-    // from the turn_flush branch.
-    const normIdx = streamSrc.indexOf('stripExcessBold(normalizePunctuation(capturedText))', redactIdx)
-    const scrubIdx = streamSrc.indexOf('scrubVoice(capturedText)', redactIdx)
-    expect(redactIdx).toBeGreaterThan(0)
-    expect(normIdx).toBeGreaterThan(redactIdx) // normalize AFTER the turn_flush redact
-    expect(scrubIdx).toBeGreaterThan(normIdx) // ...and BEFORE the voice scrub — mirrors reply
+  it('turn-flush backstop: routes through the shared normalizeOutboundBody seam (#3501)', () => {
+    // #3501 consolidation: the turn_flush branch no longer hand-mirrors the
+    // reply pipeline inline — it calls the SINGLE shared seam
+    // `normalizeOutboundBody(flushDecision.text, 'turn_flush', redactOutboundText)`.
+    // That call IS the redact→normalize→scrub pipeline (pinned above in the
+    // module source), so the same-slot ordering guarantee now lives in ONE
+    // place. This indexOf returns -1 (→ assertion fails) if the seam call is
+    // deleted from the turn_flush branch.
+    const seamIdx = streamSrc.indexOf(`normalizeOutboundBody(`)
+    const siteIdx = streamSrc.indexOf(`'turn_flush',`, seamIdx)
+    expect(seamIdx).toBeGreaterThan(0)
+    expect(siteIdx).toBeGreaterThan(seamIdx) // the seam is invoked with the turn_flush site
+    // The former inline mirror must be GONE — no hand-rolled copy left to drift.
+    expect(streamSrc).not.toContain('stripExcessBold(normalizePunctuation(capturedText))')
   })
 
-  it('both send sites share the identical `stripExcessBold(normalizePunctuation(` wrapper', () => {
-    // Parity, structurally: the exact normalization wrapper the reply path uses
-    // is the one the turn_flush branch uses — same call, not a lookalike.
+  it('both send sites share the identical normalizeOutboundBody seam (#3501)', () => {
+    // Parity, structurally: after consolidation the reply and turn_flush sites
+    // share ONE normalization implementation — the punctuation/bold wrapper
+    // lives only inside normalizeOutboundBody, and both sites invoke it.
     expect(replyModuleSrc).toContain('stripExcessBold(normalizePunctuation(text))')
-    expect(streamSrc).toContain('stripExcessBold(normalizePunctuation(capturedText))')
+    expect(streamSrc).toContain('normalizeOutboundBody(')
+    expect(streamSrc).toContain(`'turn_flush',`)
   })
 
   // Behavioural coverage (kept from the original suite): reconstruct the

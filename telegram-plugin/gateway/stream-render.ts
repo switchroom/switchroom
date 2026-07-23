@@ -55,7 +55,7 @@
 
 import { createAnswerStream } from '../answer-stream.js'
 import { LivenessTracker, isContextExhaustionText } from '../context-exhaustion.js'
-import { normalizeParagraphBreaks, normalizePunctuation, repairEscapedWhitespace, stripExcessBold } from '../format.js'
+import { normalizeOutboundBody } from './outbound-send-path.js'
 import { hasOutboundDeliveredSince, recordOutbound } from '../history.js'
 import { isReplyTool } from '../narrative-dedup.js'
 import { NarrativeFlushController } from '../narrative-flush.js'
@@ -65,7 +65,6 @@ import { richMessage } from '../rich-send.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
 import { CAPTURED_PROSE_MIN_CHARS, clearSilentEndState, decideCapturedProseDelivery, recordUndeliveredTurnEnd, silentEndFallbackText, writeSilentEndState } from '../silent-end.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
-import { scrubVoice } from '../text-voice-scrub.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { decideTurnFlush } from '../turn-flush-safety.js'
@@ -1523,19 +1522,6 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       }
 
       if (turnEndDecision === 'flush' && flushDecision.kind === 'flush') {
-        let capturedText = flushDecision.text
-        // #2798 — turn-flush delivers the model's terminal prose when it
-        // skipped reply/stream_reply, but historically bypassed the reply
-        // path's markdown normalization entirely. Mirror executeReply's front
-        // of pipeline here so the backstop renders identically: repair LLM
-        // JSON-escape bungles (literal `\n`), then promote lone prose paragraph
-        // breaks into GFM hard breaks so the Bot API 10.1 rich path doesn't
-        // collapse them (lists/tables/code left untouched). Runs BEFORE the
-        // redact/scrub below, exactly as reply orders it (repair → normalize →
-        // redact → scrub), so masking sees the repaired text. Paragraph gaps
-        // are the plain `\n\n` normalizeParagraphBreaks guarantees — no spacer
-        // pass runs on the send side any more (removed in the #2669 follow-up).
-        capturedText = normalizeParagraphBreaks(repairEscapedWhitespace(capturedText))
         // Component 3 — origin-thread backstop. `chatId`/`threadId` are
         // captured from the turn atom (turn.sessionChatId/sessionThreadId)
         // at the top of this turn_end handler, NOT from the live
@@ -1547,41 +1533,26 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         const backstopThreadId = threadId
         const backstopCtrl = ctrl
 
-        // Outbound secret scrub (#2044). Turn-flush delivers the model's
-        // terminal answer prose when it skipped reply/stream_reply — that
-        // is arbitrary agent free-text, sent via sendMessage/editMessageText
-        // and previewed to stderr below, so it needs the same mask as the
-        // three reply tools. Mirror the voice scrub: mask before the send,
-        // the preview, and recordOutbound.
-        capturedText = redactOutboundText(capturedText, 'turn_flush')
-
-        // #2798 reply-parity — normalize dashes/bullets and trip the over-bold
-        // guard deterministically, on code-masked text. This is the SAME chain
-        // the reply path applies (`stripExcessBold(normalizePunctuation(text))`)
-        // in the SAME order: after redact, before scrubVoice. Without it the
-        // turn-flush backstop rendered punctuation/bold differently from an
-        // identical reply. Kept inline to mirror reply exactly — a shared helper
-        // is a deliberate future refactor, not this change.
-        capturedText = stripExcessBold(normalizePunctuation(capturedText))
-
-        // Voice scrub (PR #1683 follow-up). Turn-flush is the path
-        // that fires when the model emits raw transcript text WITHOUT
-        // calling reply / stream_reply. That captured text bypasses
-        // PR #1683's executeReply scrub site entirely and is delivered
-        // via the rich-message path directly. Scrub the capturedText on the
-        // raw markdown so em-dashes never reach the wire. Kill switch:
-        // SWITCHROOM_DISABLE_VOICE_SCRUB.
-        {
-          const scrub = scrubVoice(capturedText)
-          if (scrub.replaced > 0) {
-            capturedText = scrub.scrubbed
-            emitRuntimeMetric({
-              kind: 'voice_scrub_applied',
-              chatKey: statusKey(backstopChatId, backstopThreadId),
-              replaced: scrub.replaced,
-              site: 'turn_flush',
-            })
-          }
+        // #3501: route through the single shared outbound seam. Turn-flush
+        // delivers the model's terminal prose when it skipped reply/stream_reply
+        // and used to hand-mirror the reply pipeline inline (repair → paragraph-
+        // break → redact → punctuation/bold → voice scrub). `normalizeOutboundBody`
+        // IS that pipeline with the same load-bearing order — the metric side
+        // effect (voice_scrub_applied on a non-zero replacement) is emitted here
+        // by the caller, exactly as the reply/edit sites do.
+        const _flushNorm = normalizeOutboundBody(
+          flushDecision.text,
+          'turn_flush',
+          redactOutboundText,
+        )
+        let capturedText = _flushNorm.text
+        if (_flushNorm.voiceReplaced > 0) {
+          emitRuntimeMetric({
+            kind: 'voice_scrub_applied',
+            chatKey: statusKey(backstopChatId, backstopThreadId),
+            replaced: _flushNorm.voiceReplaced,
+            site: 'turn_flush',
+          })
         }
 
         // #1664 — turn-flush only fires when !replyCalled (decideTurnFlush

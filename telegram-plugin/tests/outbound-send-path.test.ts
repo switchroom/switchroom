@@ -79,6 +79,46 @@ function referenceResplit(chunk: string): string[] {
 
 const injectedRedact = (text: string, _site: string): string => redact(text)
 
+// ── Verbatim inline reference for the FORMER edit_message pipeline ──────────
+// (executeEditMessage, pre-#3501): repair → [paragraph-break if !literal] →
+// redact → [addParagraphSpacers(stripExcessBold(normalizePunctuation)) if
+// !literal] → voice scrub. Consolidated into normalizeOutboundBody's
+// {literalText, addSpacers} options; this reference pins byte-equivalence.
+function referenceEditNormalize(
+  rawText: string,
+  literalText: boolean,
+): { text: string; voiceReplaced: number } {
+  let editRawText = repairEscapedWhitespace(rawText)
+  if (!literalText) editRawText = normalizeParagraphBreaks(editRawText)
+  editRawText = redact(editRawText)
+  if (!literalText) editRawText = addParagraphSpacers(stripExcessBold(normalizePunctuation(editRawText)))
+  let voiceReplaced = 0
+  const scrub = scrubVoice(editRawText)
+  if (scrub.replaced > 0) {
+    editRawText = scrub.scrubbed
+    voiceReplaced = scrub.replaced
+  }
+  return { text: editRawText, voiceReplaced }
+}
+
+// ── Verbatim inline reference for the FORMER turn-flush pipeline ────────────
+// (stream-render.ts turn-flush branch, pre-#3501): normalizeParagraphBreaks(
+// repairEscapedWhitespace) → redact('turn_flush') → stripExcessBold(
+// normalizePunctuation) → voice scrub. This is normalizeOutboundBody's DEFAULT
+// shape — identical to the reply pipeline. Consolidated to a single call.
+function referenceTurnFlushNormalize(rawText: string): { text: string; voiceReplaced: number } {
+  let text = normalizeParagraphBreaks(repairEscapedWhitespace(rawText))
+  text = redact(text)
+  text = stripExcessBold(normalizePunctuation(text))
+  let voiceReplaced = 0
+  const scrub = scrubVoice(text)
+  if (scrub.replaced > 0) {
+    text = scrub.scrubbed
+    voiceReplaced = scrub.replaced
+  }
+  return { text, voiceReplaced }
+}
+
 // ── Representative outbound fixtures ────────────────────────────────────────
 
 const FIXTURES: Record<string, string> = {
@@ -118,6 +158,73 @@ describe('outbound-send-path — normalizeOutboundBody parity with inline pipeli
     // prose; the exact stage that fires is an implementation detail, but no
     // raw em-dash survives the pipeline.
     expect(got.text).not.toContain('—')
+  })
+})
+
+// #3501 — the edit_message and turn-flush sites were hand-mirrored inline
+// pipelines that now route through normalizeOutboundBody. These pin that the
+// {literalText, addSpacers} options reproduce the former inline output
+// byte-for-byte, so the consolidation is provably behaviour-neutral.
+describe('outbound-send-path — edit_message option parity (#3501)', () => {
+  for (const [name, raw] of Object.entries(FIXTURES)) {
+    it(`rich edit (addSpacers) byte-identical: ${name}`, () => {
+      const ref = referenceEditNormalize(raw, false)
+      const got = normalizeOutboundBody(raw, 'edit_message', injectedRedact, {
+        literalText: false,
+        addSpacers: true,
+      })
+      expect(got.text).toBe(ref.text)
+      expect(got.voiceReplaced).toBe(ref.voiceReplaced)
+    })
+
+    it(`literal edit (literalText) byte-identical: ${name}`, () => {
+      const ref = referenceEditNormalize(raw, true)
+      const got = normalizeOutboundBody(raw, 'edit_message', injectedRedact, {
+        literalText: true,
+        addSpacers: false,
+      })
+      expect(got.text).toBe(ref.text)
+      expect(got.voiceReplaced).toBe(ref.voiceReplaced)
+    })
+  }
+
+  it('literal edit skips paragraph/punctuation/bold/spacer formatting', () => {
+    // A literal edit must NOT promote lone newlines, strip bold, or add
+    // spacers — only repair + redact + voice scrub run.
+    const raw = 'First line.\nSecond line with **bold** kept.'
+    const got = normalizeOutboundBody(raw, 'edit_message', injectedRedact, {
+      literalText: true,
+    })
+    expect(got.text).toBe(raw) // no transform touched it
+  })
+
+  it('rich edit DOES add the U+00A0 paragraph spacer that reply omits', () => {
+    const raw = FIXTURES.multiParagraph
+    const richEdit = normalizeOutboundBody(raw, 'edit_message', injectedRedact, {
+      addSpacers: true,
+    }).text
+    const reply = normalizeOutboundBody(raw, 'reply', injectedRedact).text
+    // The edit path folds addParagraphSpacers in; the reply path does not.
+    expect(richEdit).toBe(addParagraphSpacers(reply))
+    expect(richEdit).not.toBe(reply)
+  })
+})
+
+describe('outbound-send-path — turn_flush option parity (#3501)', () => {
+  for (const [name, raw] of Object.entries(FIXTURES)) {
+    it(`turn-flush default byte-identical: ${name}`, () => {
+      const ref = referenceTurnFlushNormalize(raw)
+      const got = normalizeOutboundBody(raw, 'turn_flush', injectedRedact)
+      expect(got.text).toBe(ref.text)
+      expect(got.voiceReplaced).toBe(ref.voiceReplaced)
+    })
+  }
+
+  it('turn-flush default equals the reply pipeline (same shape)', () => {
+    const raw = FIXTURES.emDashes
+    const flush = normalizeOutboundBody(raw, 'turn_flush', injectedRedact).text
+    const reply = normalizeOutboundBody(raw, 'reply', injectedRedact).text
+    expect(flush).toBe(reply)
   })
 })
 

@@ -443,6 +443,7 @@ import { richMessage } from '../rich-send.js'
 import { decideRedeliver, decideRedeliverCapture } from './redelivery-decision.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
+  normalizeOutboundBody,
   sendReplyChunks,
   sendReply,
   deliverCapturedProse as deliverCapturedProseCore,
@@ -13301,34 +13302,30 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // Single rich-markdown path (#2669): `format:'text'` edits as a literal
   // plain string; everything else edits via the rich-markdown path.
   const editLiteralText = editFormat === 'text'
-  // Match the reply path: repair JSON-escape bungles, then promote lone prose
-  // paragraph breaks for the rich path. A literal-text edit (`format:'text'`)
-  // skips paragraph normalization — it must edit byte-for-byte as given.
-  let editRawText = repairEscapedWhitespace(args.text as string)
-  if (!editLiteralText) editRawText = normalizeParagraphBreaks(editRawText)
-  // Outbound secret scrub (#2044): an edit must not re-introduce a raw
-  // secret into a live bubble or the history row. Mask before scrub/send.
-  editRawText = redactOutboundText(editRawText, 'edit_message')
-  // Fleet-wide consistent formatting (same order as the reply path: redact
-  // first so secrets are matched literally, then normalize, then spacers on
-  // the rich path only — the rich GFM renderer renders `\n\n` tight, so the
-  // idempotent U+00A0 spacer restores a visible gap without double-spacing).
-  if (!editLiteralText) editRawText = addParagraphSpacers(stripExcessBold(normalizePunctuation(editRawText)))
-  // Voice scrub (#1683): same em-dash scrub as the reply path. Edits
-  // are how silent-anchor and progress-update mutate already-sent
-  // bubbles, so without this an edit can re-introduce dashes the
-  // original send had scrubbed out.
-  {
-    const scrub = scrubVoice(editRawText)
-    if (scrub.replaced > 0) {
-      editRawText = scrub.scrubbed
-      emitRuntimeMetric({
-        kind: 'voice_scrub_applied',
-        chatKey: statusKey(String(args.chat_id ?? ''), undefined),
-        replaced: scrub.replaced,
-        site: 'edit_message',
-      })
-    }
+  // #3501: route through the single shared outbound seam instead of the former
+  // hand-mirrored inline pipeline. `normalizeOutboundBody` runs the same order
+  // as the reply path (repair → paragraph-break → redact → punctuation/bold →
+  // voice scrub); the edit path's two deviations are expressed as options:
+  //   - literalText: a `format:'text'` edit lands byte-for-byte, so it skips
+  //     paragraph normalization + punctuation/bold/spacers (only repair, the
+  //     secret redact, and the voice scrub still run).
+  //   - addSpacers: the rich edit path folds the idempotent U+00A0 paragraph
+  //     spacer INTO the formatting step (the rich GFM renderer renders `\n\n`
+  //     tight; the spacer restores a visible gap without double-spacing).
+  const _editNorm = normalizeOutboundBody(
+    args.text as string,
+    'edit_message',
+    redactOutboundText,
+    { literalText: editLiteralText, addSpacers: !editLiteralText },
+  )
+  let editRawText = _editNorm.text
+  if (_editNorm.voiceReplaced > 0) {
+    emitRuntimeMetric({
+      kind: 'voice_scrub_applied',
+      chatKey: statusKey(String(args.chat_id ?? ''), undefined),
+      replaced: _editNorm.voiceReplaced,
+      site: 'edit_message',
+    })
   }
   const edited = await robustApiCall(
     () => lockedBot.api.editMessageText(
