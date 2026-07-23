@@ -54,12 +54,16 @@
  * every session close.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
+import { createHash } from 'node:crypto'
+import { renameSync } from 'node:fs'
+
 import {
   scanTurnForFinalReply,
+  scanForOutboxCapture,
   decideStopHookDisposition,
   isTurnFlushSafetyEnabledEnv,
   isCapturedProseDeliveryEnabledEnv,
@@ -131,6 +135,64 @@ function writeElectedState(statePath, base, decision) {
   }
 }
 
+const JOURNAL_FILE = 'delivered.jsonl'
+
+/** Is `nonce` already in the outbox delivered-keys journal? (best-effort) */
+function outboxAlreadyDelivered(outboxDir, nonce) {
+  const path = join(outboxDir, JOURNAL_FILE)
+  if (!existsSync(path)) return false
+  try {
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      if (!line) continue
+      try {
+        if (JSON.parse(line)?.turnNonce === nonce) return true
+      } catch {
+        /* skip corrupt */
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  return false
+}
+
+/**
+ * Write the durable outbox record for a captured undelivered final answer
+ * (atomic tmp+rename), mirroring `writeOutboxRecordAtomic` in `../outbox.ts`.
+ * The gateway heartbeat sweep is the single deliverer. Best-effort; never
+ * throws. Returns true when a record exists on disk for the nonce afterward.
+ */
+function writeOutboxRecord(stateDir, capture) {
+  const outboxDir = join(stateDir, 'outbox')
+  try {
+    mkdirSync(outboxDir, { recursive: true })
+    const finalPath = join(outboxDir, `${capture.turnNonce}.json`)
+    if (existsSync(finalPath)) return true
+    // Already delivered by another machine (reply/flush) under this nonce.
+    if (outboxAlreadyDelivered(outboxDir, capture.turnNonce)) return true
+    const record = {
+      turnNonce: capture.turnNonce,
+      chatId: capture.chatId,
+      threadId: capture.threadId,
+      text: capture.text,
+      textSha256: createHash('sha256').update(capture.text, 'utf8').digest('hex'),
+      createdAt: Date.now(),
+      source: capture.source,
+      anchorContent: capture.chatId == null ? capture.anchorContent : undefined,
+      // F2: per-session origin chat for envelope-less routing (fail-closed).
+      originChatId: capture.chatId == null ? (capture.originChatId ?? null) : undefined,
+      originThreadId: capture.chatId == null ? (capture.originThreadId ?? null) : undefined,
+    }
+    const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
+    writeFileSync(tmpPath, JSON.stringify(record), 'utf8')
+    renameSync(tmpPath, finalPath)
+    return true
+  } catch (err) {
+    process.stderr.write(`[silent-end-interrupt] failed to write outbox record: ${err.message}\n`)
+    return false
+  }
+}
+
 function main() {
   const raw = readStdin().trim()
   if (!raw) process.exit(0)
@@ -161,6 +223,37 @@ function main() {
     process.exit(0)
   }
 
+  const stateDir = getStateDir()
+
+  // ── Outbox capture (guaranteed final-message delivery) ────────────────
+  // Class-agnostic: fires on EVERY main-session turn end. When the turn ended
+  // with substantive undelivered trailing prose (Telegram inbound,
+  // task-notification handback, cron, or a future/unknown wake shape), write a
+  // durable outbox record. The gateway heartbeat sweep is the single deliverer
+  // — no CurrentTurn, no election, no re-prompt needed. This is the deterministic
+  // guarantee: the model calling `reply` is no longer required. Fail-open on any
+  // error (never loop the session).
+  //
+  // Kill switch symmetry: `SWITCHROOM_TG_OUTBOX_DELIVERY=0` disables the gateway
+  // sweep (the deliverer). Capture MUST honour the SAME gate — otherwise, with
+  // the flag off, capture would write records that nothing delivers AND
+  // short-circuit the legacy re-prompt path below = silent loss. Flag off ⇒ skip
+  // capture entirely and fall through to the legacy block/re-prompt behaviour.
+  if (process.env.SWITCHROOM_TG_OUTBOX_DELIVERY !== '0') try {
+    const capture = scanForOutboxCapture(jsonl)
+    if (capture.capture === true) {
+      writeOutboxRecord(stateDir, capture)
+      process.stderr.write(
+        `[silent-end-interrupt] captured undelivered final answer to outbox ` +
+          `(nonce=${capture.turnNonce} source=${capture.source} chars=${capture.text.length}) — ` +
+          `sweep will deliver; allowing stop\n`,
+      )
+      process.exit(0)
+    }
+  } catch (err) {
+    process.stderr.write(`[silent-end-interrupt] outbox capture error (fail-open): ${err.message}\n`)
+  }
+
   const decision = scanTurnForFinalReply(jsonl)
 
   // 'allow' (qualifying reply or silent marker) and 'unknown' (no
@@ -175,7 +268,6 @@ function main() {
   // transcript above. If a state file exists from a prior turn that
   // never got cleared (clean shutdown not perfect), this read still
   // works; if absent, retryCount defaults to 0.
-  const stateDir = getStateDir()
   const statePath = join(stateDir, 'silent-end-pending.json')
 
   let state = {}

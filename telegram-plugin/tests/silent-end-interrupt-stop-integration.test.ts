@@ -24,11 +24,28 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   rmSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+
+/**
+ * Read the single outbox record the guaranteed-delivery capture writes for a
+ * turn that ended with substantive undelivered prose. Returns null when none.
+ */
+function readOutboxRecord(stateDir: string): { text: string; chatId: string | null; turnNonce: string } | null {
+  const dir = join(stateDir, 'outbox')
+  let files: string[]
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith('.json') && f !== 'delivered.jsonl')
+  } catch {
+    return null
+  }
+  if (files.length !== 1) return null
+  return JSON.parse(readFileSync(join(dir, files[0]), 'utf8'))
+}
 
 const HOOK_PATH = resolve(
   __dirname,
@@ -108,7 +125,12 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(existsSync(join(stateDir, 'silent-end-pending.json'))).toBe(false)
   })
 
-  it("blocks + writes retryCount=1 when transcript shows ack-only (Ken's repro)", () => {
+  it('captures the trailing answer to the outbox + allows when transcript shows ack-only + undelivered verdict (Ken\'s repro, collapsed design)', () => {
+    // Collapsed guaranteed-delivery design: an ack followed by a substantive
+    // plain-text verdict is now CAPTURED to the durable outbox and the stop is
+    // ALLOWED — the gateway sweep is the single deterministic deliverer. The old
+    // block/re-prompt (which depended on the model re-replying) is superseded
+    // for capturable prose.
     const transcript = writeTranscript(tmp, [
       ENQUEUE,
       reply('on it — checking now', { disable_notification: true }),
@@ -124,23 +146,12 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       stateDir,
     })
     expect(r.status).toBe(0)
-    const out = JSON.parse(r.stdout)
-    expect(out.decision).toBe('block')
-    expect(out.reason).toMatch(/Send your final answer/)
-    expect(out.reason).toMatch(/NO_REPLY/)
-    // Retry-count file was written.
-    const statePath = join(stateDir, 'silent-end-pending.json')
-    expect(existsSync(statePath)).toBe(true)
-    const state = JSON.parse(readFileSync(statePath, 'utf8'))
-    expect(state.retryCount).toBe(1)
-    // Reviewer-flagged regression: the hook's state-file write MUST
-    // include turnKey + chatId derived from the enqueue envelope. Without
-    // these, the gateway's later `recordSilentTurnEnd` write (~175ms after
-    // the hook) sees a turnKey mismatch and resets retryCount to 0,
-    // doubling the effective re-prompt budget. The shape here must match
-    // `chatKey(chatId, threadId)` at telegram-plugin/gateway/chat-key.ts:46.
-    expect(state.chatId).toBe('111')
-    expect(state.turnKey).toBe('111:_')
+    expect(r.stdout.trim()).toBe('') // ALLOW — no block re-prompt
+    const rec = readOutboxRecord(stateDir)
+    expect(rec).not.toBeNull()
+    expect(rec!.text).toBe('A'.repeat(2237))
+    expect(rec!.chatId).toBe('111')
+    expect(rec!.turnNonce).toBe('111:_#42') // shared deriveTurnId nonce (H1)
   })
 
   it('preserves retryCount across the hook→gateway write order (reviewer regression)', () => {
@@ -190,17 +201,12 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(state.retryCount).toBe(SILENT_END_MAX_RETRIES)
   })
 
-  it('blocks + writes retryCount=1 when an early qualifying reply is followed by an undelivered verdict (trailing-content bug repro)', () => {
-    // Confirmed-incident shape: (1) a background-task notification
-    // arrives, (2) the agent calls reply ONCE early with a stale,
-    // notification-bearing ack ("running now" — disable_notification
-    // unset, so it satisfies isFinalAnswerReply regardless of length),
-    // (3) the agent then does more work and writes a large substantive
-    // verdict as plain assistant text with NO second reply call. Pre-fix,
-    // the hook's "reply called at least once this turn" check allowed
-    // this to slip through silently — the trailing verdict never reached
-    // the user. Post-fix the hook must block on this shape exactly like
-    // the zero-reply case.
+  it('captures the trailing verdict to the outbox + allows when an early qualifying reply is followed by an undelivered verdict (trailing-content bug repro, collapsed design)', () => {
+    // Confirmed-incident shape: (1) a background-task notification arrives,
+    // (2) the agent calls reply ONCE early with a notification-bearing ack,
+    // (3) it then writes a large substantive verdict as plain assistant text
+    // with NO second reply call. The trailing verdict is now CAPTURED to the
+    // outbox and the stop is ALLOWED — the sweep delivers it deterministically.
     const transcript = writeTranscript(tmp, [
       ENQUEUE,
       reply('running now'),
@@ -216,15 +222,11 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       stateDir,
     })
     expect(r.status).toBe(0)
-    const out = JSON.parse(r.stdout)
-    expect(out.decision).toBe('block')
-    expect(out.reason).toMatch(/Send your final answer/)
-    const statePath = join(stateDir, 'silent-end-pending.json')
-    expect(existsSync(statePath)).toBe(true)
-    const state = JSON.parse(readFileSync(statePath, 'utf8'))
-    expect(state.retryCount).toBe(1)
-    expect(state.chatId).toBe('111')
-    expect(state.turnKey).toBe('111:_')
+    expect(r.stdout.trim()).toBe('')
+    const rec = readOutboxRecord(stateDir)
+    expect(rec).not.toBeNull()
+    expect(rec!.text).toBe('Here is the actual verdict: ' + 'X'.repeat(300))
+    expect(rec!.turnNonce).toBe('111:_#42')
   })
 
   it('does NOT false-positive on a normal single-reply turn ending on the reply tool_use', () => {
@@ -303,10 +305,10 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       writeFileSync(join(stateDir, 'gateway-heartbeat'), String(Date.now()), 'utf8')
     }
 
-    it('zero-reply ≥200 + FRESH gateway heartbeat → ALLOW (no block re-prompt), state file still written for the flush', () => {
-      // The duplicate repro: today this BLOCKS *and* the gateway flush fires →
-      // two messages. With a fresh heartbeat the election ALLOWS the stop so
-      // the gateway flush is the single writer.
+    it('zero-reply ≥200 + FRESH gateway heartbeat → CAPTURE + ALLOW (sweep is the single writer)', () => {
+      // Collapsed design: the duplicate repro is killed structurally — the
+      // trailing prose is captured to the outbox and the stop is allowed. The
+      // sweep is the single deterministic deliverer; no election, no re-prompt.
       writeFreshHeartbeat()
       const transcript = writeTranscript(tmp, [
         ENQUEUE,
@@ -314,35 +316,31 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       ])
       const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
       expect(r.status).toBe(0)
-      // ALLOW → no block JSON on stdout.
+      expect(r.stdout.trim()).toBe('') // ALLOW
+      const rec = readOutboxRecord(stateDir)
+      expect(rec).not.toBeNull()
+      expect(rec!.text).toBe('A'.repeat(300))
+      expect(rec!.turnNonce).toBe('111:_#42')
+    })
+
+    it('zero-reply ≥200 + STALE/missing heartbeat → STILL CAPTURE + ALLOW (record persists on disk; swept at next boot — strictly better than block-and-hope)', () => {
+      // Capture no longer depends on gateway liveness: even into a possibly-dead
+      // gateway the answer is durably captured and swept whenever the gateway is
+      // next alive — strictly stronger than the old block-and-hope re-prompt.
+      const transcript = writeTranscript(tmp, [
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'A'.repeat(300) }] } },
+      ])
+      const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
+      expect(r.status).toBe(0)
       expect(r.stdout.trim()).toBe('')
-      expect(r.stderr).toMatch(/single-writer election ALLOWED/)
-      // State file IS written so the gateway's captured-prose bridge has its
-      // input (turnKey/turnId/pendingText); retryCount stays 0 (not a re-prompt).
-      const statePath = join(stateDir, 'silent-end-pending.json')
-      expect(existsSync(statePath)).toBe(true)
-      const state = JSON.parse(readFileSync(statePath, 'utf8'))
-      expect(state.retryCount).toBe(0)
-      expect(state.turnKey).toBe('111:_')
-      expect(state.pendingText).toBe('A'.repeat(300))
+      expect(readOutboxRecord(stateDir)!.text).toBe('A'.repeat(300))
     })
 
-    it('zero-reply ≥200 + STALE/missing heartbeat → BLOCK (never allow into a possibly-dead gateway)', () => {
-      // No heartbeat file → the liveness gate forces today's BLOCK behaviour.
-      const transcript = writeTranscript(tmp, [
-        ENQUEUE,
-        { type: 'assistant', message: { content: [{ type: 'text', text: 'A'.repeat(300) }] } },
-      ])
-      const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
-      expect(r.status).toBe(0)
-      expect(JSON.parse(r.stdout).decision).toBe('block')
-      const state = JSON.parse(readFileSync(join(stateDir, 'silent-end-pending.json'), 'utf8'))
-      expect(state.retryCount).toBe(1)
-    })
-
-    it('retryCount>0 (prior failed delivery) + fresh heartbeat → BLOCK (preserve #3228 send-failure net)', () => {
+    it('retryCount>0 (prior state) + capturable prose → CAPTURE + ALLOW (nonce-scoped; the outbox journal handles redelivery, not the chat-global counter)', () => {
       writeFreshHeartbeat()
-      // Seed a prior state file with retryCount=1 (a delivery already failed).
+      // A stale chat-global silent-end record must NOT poison the capture of a
+      // genuine trailing answer (Defect B fix — retry state no longer gates it).
       writeFileSync(
         join(stateDir, 'silent-end-pending.json'),
         JSON.stringify({ chatId: '111', threadId: null, turnKey: '111:_', retryCount: 1, timestamp: Date.now() }),
@@ -354,9 +352,8 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       ])
       const r = runHook({ event: { session_id: 's1', transcript_path: transcript }, stateDir })
       expect(r.status).toBe(0)
-      // retryCount was 1 → not the exhaustion boundary (MAX=2) → still blocks,
-      // and the election does NOT allow (retry-ladder-in-flight).
-      expect(JSON.parse(r.stdout).decision).toBe('block')
+      expect(r.stdout.trim()).toBe('')
+      expect(readOutboxRecord(stateDir)!.text).toBe('A'.repeat(300))
     })
   })
 })

@@ -57,6 +57,7 @@
 // re-verify only if a new outbound-delivery tool is added to bridge.ts.
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 
 const REPLY_TOOLS = new Set([
   'mcp__switchroom-telegram__reply',
@@ -716,5 +717,283 @@ export function isGatewayHeartbeatFresh(stateDir, now = Date.now()) {
     return now - st.mtimeMs <= GATEWAY_HEARTBEAT_FRESH_MS
   } catch {
     return false
+  }
+}
+
+// ── Outbox capture (guaranteed final-message delivery) ───────────────────────
+//
+// The Stop hook fires on EVERY main-session turn end, regardless of what woke
+// the turn (Telegram inbound, `<task-notification>` handback, cron, or a future
+// harness wake type). `scanForOutboxCapture` decides — class-agnostically —
+// whether this turn ended with substantive undelivered trailing prose that must
+// be captured into the durable outbox for the gateway sweep to deliver.
+//
+// Fail CLOSED (H4): capture keys on "a turn ended with unsent trailing prose",
+// never on recognising the wake shape. An anchor-less transcript tail still
+// captures (source='unknown') rather than silently allowing a lost answer.
+//
+// Cron (H5): NOT exempted — a cron turn that ends with prose is captured and
+// guaranteed-delivered, same as any other class. Only NO_REPLY stays silent.
+//
+// H6: a turn ending with real prose followed by a stray bare `NO_REPLY` still
+// captures the prose (the marker doesn't suppress a genuine answer), while a
+// legitimately-silent turn (pure NO_REPLY / narration-only) writes no record.
+
+/** Mirror of `deriveTurnNonce` in `../outbox.ts` — MUST stay in sync (a .mjs
+ * can't import the .ts). Test `outbox-nonce-parity` pins the equality. */
+export function deriveTurnNonce({ chatId, threadId, messageId, anchorTimestampMs, anchorContent }) {
+  if (chatId != null && messageId != null && messageId !== '' && String(messageId) !== '0') {
+    const key = `${chatId}:${threadId == null || threadId === 0 ? '_' : threadId}`
+    return `${key}#${messageId}`
+  }
+  return createHash('sha256').update(`${anchorTimestampMs}\n${anchorContent}`, 'utf8').digest('hex')
+}
+
+/**
+ * Strip a trailing bare silent-marker line (NO_REPLY / HEARTBEAT_OK) from a text
+ * block, returning the prose that precedes it (H6). If the whole block is the
+ * marker, prose is ''. If there is no trailing marker, `hadMarker` is false and
+ * prose is the block unchanged.
+ *
+ * @param {string} text
+ * @returns {{ prose: string, hadMarker: boolean }}
+ */
+export function stripTrailingSilentMarker(text) {
+  if (typeof text !== 'string') return { prose: '', hadMarker: false }
+  const rawLines = text.split('\n')
+  // Find the last non-empty line.
+  let lastIdx = -1
+  for (let i = rawLines.length - 1; i >= 0; i--) {
+    if (rawLines[i].trim().length > 0) {
+      lastIdx = i
+      break
+    }
+  }
+  if (lastIdx === -1) return { prose: '', hadMarker: false }
+  if (!SILENT_MARKER_RE.test(rawLines[lastIdx].trim())) {
+    return { prose: text.trim(), hadMarker: false }
+  }
+  const prose = rawLines.slice(0, lastIdx).join('\n').trim()
+  return { prose, hadMarker: true }
+}
+
+/**
+ * Resolve the turn-start anchor for capture. Primary: the most-recent
+ * `queue-operation`/`enqueue` line. H4 fallbacks (fail closed) when none is
+ * found: the last non-sidechain `user`-type line, else the last
+ * `queue-operation` of any operation, else the whole scanned range (startIdx=-1
+ * → scan from the top). `degraded` marks a non-primary anchor (source unknown).
+ *
+ * @param {string[]} lines
+ * @returns {{ startIdx: number, envelope: ReturnType<typeof parseChannelEnvelope>, anchorTimestampMs: number, anchorContent: string, degraded: boolean }}
+ */
+function resolveCaptureAnchor(lines) {
+  let enqueueIdx = -1
+  let anyQueueIdx = -1
+  let userIdx = -1
+  const parsed = new Array(lines.length)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (!line || line[0] !== '{') continue
+    let obj
+    try { obj = JSON.parse(line) } catch { continue }
+    parsed[i] = obj
+    if (obj?.type === 'queue-operation') {
+      if (obj.operation === 'enqueue' && enqueueIdx === -1) enqueueIdx = i
+      if (anyQueueIdx === -1) anyQueueIdx = i
+    }
+    if (obj?.type === 'user' && obj?.isSidechain !== true && userIdx === -1) userIdx = i
+  }
+  const anchorTs = (obj) => {
+    const t = obj?.timestamp
+    if (typeof t === 'number' && Number.isFinite(t)) return t
+    if (typeof t === 'string') {
+      const ms = Date.parse(t)
+      if (Number.isFinite(ms)) return ms
+    }
+    return Date.now()
+  }
+  if (enqueueIdx !== -1) {
+    const obj = parsed[enqueueIdx]
+    const content = typeof obj.content === 'string' ? obj.content : ''
+    return {
+      startIdx: enqueueIdx,
+      envelope: parseChannelEnvelope(content),
+      anchorTimestampMs: anchorTs(obj),
+      anchorContent: content,
+      degraded: false,
+    }
+  }
+  if (userIdx !== -1) {
+    const obj = parsed[userIdx]
+    const content = typeof obj?.message?.content === 'string' ? obj.message.content : JSON.stringify(obj?.message?.content ?? '')
+    return {
+      startIdx: userIdx,
+      envelope: { chatId: null, threadId: null, messageId: null, source: 'unknown' },
+      anchorTimestampMs: anchorTs(obj),
+      anchorContent: content,
+      degraded: true,
+    }
+  }
+  if (anyQueueIdx !== -1) {
+    const obj = parsed[anyQueueIdx]
+    const content = typeof obj.content === 'string' ? obj.content : ''
+    return {
+      startIdx: anyQueueIdx,
+      envelope: parseChannelEnvelope(content),
+      anchorTimestampMs: anchorTs(obj),
+      anchorContent: content,
+      degraded: true,
+    }
+  }
+  // No anchor at all — scan the whole range (fail closed on unknown shape).
+  return {
+    startIdx: -1,
+    envelope: { chatId: null, threadId: null, messageId: null, source: 'unknown' },
+    anchorTimestampMs: Date.now(),
+    anchorContent: '',
+    degraded: true,
+  }
+}
+
+/**
+ * Resolve THIS session's origin chat — the most-recent non-sidechain enqueue
+ * line whose content carries a real Telegram `<channel>` envelope with a
+ * chatId. Scoped to the session's OWN transcript, this is the conversation of
+ * record for an envelope-less handback turn (F2): the sweep routes an
+ * unresolved-registry record here instead of a gateway-global "last chat anyone
+ * messaged" fallback, so a DM-origin handback can never leak into an unrelated
+ * chat. Null when the session has no prior channel inbound → the record fails
+ * CLOSED (held, never delivered to an arbitrary chat).
+ *
+ * @param {string[]} lines
+ * @returns {{ chatId: string | null, threadId: number | null }}
+ */
+function resolveSessionOriginChat(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (!line || line[0] !== '{') continue
+    let obj
+    try { obj = JSON.parse(line) } catch { continue }
+    if (obj?.isSidechain === true) continue
+    if (obj?.type !== 'queue-operation') continue
+    const content = typeof obj.content === 'string' ? obj.content : ''
+    const env = parseChannelEnvelope(content)
+    if (env.chatId != null && env.chatId !== '') {
+      return { chatId: env.chatId, threadId: env.threadId ?? null }
+    }
+  }
+  return { chatId: null, threadId: null }
+}
+
+/**
+ * Class-agnostic capture scan. Walks the turn from its anchor, tracking the last
+ * delivery event (qualifying reply / silent marker) and the substantive prose
+ * blocks that trail it. Returns a capture descriptor when the turn ended with
+ * undelivered final-answer prose, else `{ capture: false }`.
+ *
+ * @param {string} jsonl
+ * @param {number} [now]
+ * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string }}
+ */
+export function scanForOutboxCapture(jsonl, now = Date.now()) {
+  const lines = jsonl.split('\n')
+  const anchor = resolveCaptureAnchor(lines)
+  const { envelope } = anchor
+
+  const blocks = []
+  for (let i = anchor.startIdx + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (!line || line[0] !== '{') continue
+    let obj
+    try { obj = JSON.parse(line) } catch { continue }
+    if (obj?.isSidechain === true) continue
+    if (obj?.type !== 'assistant') continue
+    const content = obj?.message?.content
+    if (!Array.isArray(content)) continue
+    for (const c of content) {
+      if (c?.type === 'text') {
+        const raw = String(c.text ?? '')
+        // H6: strip a trailing bare marker; if substantive non-narration prose
+        // remains, it is a genuine (undelivered) answer — capture it. If nothing
+        // but the marker (or narration) remains, the block is a silence event.
+        const { prose, hadMarker } = stripTrailingSilentMarker(raw)
+        if (hadMarker) {
+          // H6: a block ending "…real answer…\nNO_REPLY" carries a genuine
+          // answer — capture the prose and do NOT treat the block as a silence
+          // event (which would mask the answer). When the prose is empty or pure
+          // narration the marker is an intentional silence, but it must NOT emit
+          // a 'deliver' event: a *separate* bare-`NO_REPLY` block arriving AFTER
+          // a real (undelivered) prose block would otherwise move the
+          // last-delivery cursor past that prose and mask it (multi-block H6).
+          // A bare/narration marker is simply not a delivery — push nothing.
+          if (prose.length > 0 && !isNarrationBlock(prose)) {
+            blocks.push({ kind: 'text', chars: prose.length, text: prose })
+          }
+        } else if (prose.length > 0) {
+          blocks.push({ kind: 'text', chars: prose.length, text: prose })
+        }
+        continue
+      }
+      if (c?.type !== 'tool_use') continue
+      if (!REPLY_TOOLS.has(c.name)) continue
+      const input = c.input ?? {}
+      const text = String(input.text ?? '')
+      if (SILENT_MARKER_RE.test(text.trim()) || endsWithSilentMarker(text)) {
+        blocks.push({ kind: 'deliver', reason: 'silent-marker' })
+        continue
+      }
+      if (isFinalAnswerReply({
+        text,
+        disableNotification: input.disable_notification === true,
+        done: input.done === true,
+      })) {
+        blocks.push({ kind: 'deliver', reason: 'final-reply' })
+      }
+      // interim ack — neither delivery nor undelivered prose.
+    }
+  }
+
+  let lastDeliverIdx = -1
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].kind === 'deliver') lastDeliverIdx = i
+  }
+  const trailing = blocks
+    .slice(lastDeliverIdx + 1)
+    .filter((b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0)
+    .map((b) => b.text)
+
+  const text = selectBridgePendingText(trailing)
+  if (text == null || text.trim().length < FINAL_ANSWER_MIN_CHARS) {
+    return { capture: false, reason: trailing.length === 0 ? 'no-trailing-prose' : 'below-floor' }
+  }
+
+  const turnNonce = deriveTurnNonce({
+    chatId: envelope.chatId,
+    threadId: envelope.threadId,
+    messageId: envelope.messageId,
+    anchorTimestampMs: anchor.anchorTimestampMs,
+    anchorContent: anchor.anchorContent,
+  })
+  let source = envelope.source
+  if (source == null) {
+    if (anchor.degraded) source = 'unknown'
+    else if (/task-notification|task-id/.test(anchor.anchorContent)) source = 'task-notification'
+    else source = 'channel'
+  }
+  // F2: for an envelope-less record, stamp THIS session's own origin chat so the
+  // sweep can route it without a gateway-global fallback. For an envelope-
+  // bearing record the anchor chatId already routes it (origin is redundant).
+  const origin = envelope.chatId != null ? { chatId: null, threadId: null } : resolveSessionOriginChat(lines)
+  return {
+    capture: true,
+    text: text.trim(),
+    turnNonce,
+    chatId: envelope.chatId,
+    threadId: envelope.threadId ?? null,
+    source,
+    anchorContent: anchor.anchorContent,
+    originChatId: origin.chatId,
+    originThreadId: origin.threadId,
   }
 }

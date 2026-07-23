@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, existsSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -570,7 +570,7 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
     expect(r.stdout.trim()).toBe('')
   })
 
-  it('blocks the stop when transcript shows ack-only (no final reply) — Ken-2026-05-25 repro', () => {
+  it('captures the trailing answer to the outbox + allows on ack-only (no final reply) — Ken-2026-05-25 repro, collapsed design', () => {
     const transcript = writeTranscript([
       ENQUEUE,
       replyToolUse('on it — checking now', { disable_notification: true }),
@@ -579,14 +579,14 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
     ])
     const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
     expect(r.exit).toBe(0)
-    const out = JSON.parse(r.stdout.trim())
-    expect(out.decision).toBe('block')
-    expect(out.reason).toContain('reply')
-    // #1664 — the re-prompt must offer the NO_REPLY escape hatch.
-    expect(out.reason).toContain('NO_REPLY')
-    // retryCount incremented to 1 (the budget bookkeeping still
-    // uses the state file).
-    expect(readSilentEndState()!.retryCount).toBe(1)
+    // Collapsed design: the substantive trailing answer is CAPTURED to the
+    // outbox and the stop is ALLOWED (the sweep is the single deliverer).
+    expect(r.stdout.trim()).toBe('')
+    const recs = readdirSync(join(stateDir, 'outbox')).filter((f) => f.endsWith('.json') && f !== 'delivered.jsonl')
+    expect(recs).toHaveLength(1)
+    const rec = JSON.parse(readFileSync(join(stateDir, 'outbox', recs[0]), 'utf8'))
+    expect(rec.text).toBe('A'.repeat(2237))
+    expect(rec.chatId).toBe('c')
   })
 
   it('allows the stop when retryCount >= MAX_RETRIES, even if transcript still shows no reply', () => {
@@ -694,10 +694,12 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
   describe('captured-prose delivery bridge (#3227)', () => {
     const ANSWER = 'That was actually your FY25 NOA, not Bloomfield. ' + 'A'.repeat(2200)
 
-    it('FIRST silent-end with a genuine plain-text answer → hook persists pendingText and decide → deliver', () => {
+    it('FIRST silent-end with a genuine plain-text answer → hook captures it to the outbox + allows (collapsed design supersedes the pendingText bridge)', () => {
       // A turn that ended with a substantive answer written as plain text
-      // (never sent via the reply tool). The Stop hook scans, blocks, and now
-      // persists the answer prose into silent-end-pending.json.
+      // (never sent via the reply tool). Under the collapsed guaranteed-delivery
+      // design the Stop hook captures the answer to the durable outbox and
+      // allows the stop — the sweep delivers it. This supersedes the legacy
+      // silent-end-pending.json pendingText bridge for capturable prose.
       const transcript = writeTranscript([
         ENQUEUE,
         replyToolUse('on it — checking now', { disable_notification: true }),
@@ -706,21 +708,12 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
       ])
       const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
       expect(r.exit).toBe(0)
-      expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
-
-      // The bridge: the hook wrote the answer prose into the state file...
-      const state = readSilentEndState()!
-      expect(state.pendingText).toBe(ANSWER)
-      expect(state.turnKey).toBe('c:_')
-
-      // ...and the gateway's pure decision core reads it back and decides to
-      // deliver directly on this FIRST silent-end (retryCount just went to 1).
-      const decision = decideCapturedProseDelivery({ turnKey: 'c:_' })
-      expect(decision.deliver).toBe(true)
-      expect(decision.text).toBe(ANSWER)
-      expect(decision.reason).toBe('captured-prose')
-      // FIRST silent-end: this is the retry-budget's first block, not exhaustion.
-      expect(state.retryCount).toBe(1)
+      expect(r.stdout.trim()).toBe('') // ALLOW
+      const recs = readdirSync(join(stateDir, 'outbox')).filter((f) => f.endsWith('.json') && f !== 'delivered.jsonl')
+      expect(recs).toHaveLength(1)
+      const rec = JSON.parse(readFileSync(join(stateDir, 'outbox', recs[0]), 'utf8'))
+      expect(rec.text).toBe(ANSWER)
+      expect(rec.chatId).toBe('c')
     })
 
     it('a turn that DID call a final reply → no state, no pendingText, decide → no synthetic send', () => {
