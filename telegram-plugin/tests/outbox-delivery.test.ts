@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import {
   decideOutboxSweep,
   deriveTurnNonce,
@@ -18,7 +19,10 @@ import {
   writeOutboxRecordAtomic,
   readDeliveredNonces,
   listPendingRecords,
-  writeLastInboundChat,
+  appendDelivered,
+  resolveOutboxDir,
+  JOURNAL_ROTATE_AT,
+  JOURNAL_KEEP,
   sha256Hex,
   type OutboxRecord,
   OUTBOX_MAX_AGE_MS,
@@ -79,27 +83,25 @@ describe('decideOutboxSweep', () => {
   })
 })
 
-describe('resolveOutboxChat (H3)', () => {
+describe('resolveOutboxChat (H3/F2)', () => {
   it('routes via the anchor envelope when chatId is present', () => {
     const r = resolveOutboxChat(rec({ chatId: '111', threadId: 5 }), {})
     expect(r).toEqual({ chatId: '111', threadId: 5, via: 'anchor' })
   })
-  it('routes an envelope-less record via the transitive registry chain', () => {
-    const r = resolveOutboxChat(rec({ chatId: null, anchorContent: '<task-id>T1</task-id>' }) as any, {
+  it('routes an envelope-less record via the transitive registry chain (preferred over origin)', () => {
+    const r = resolveOutboxChat({ chatId: null, threadId: null, anchorContent: '<task-id>T1</task-id>', originChatId: 'WRONG', originThreadId: null }, {
       registryChainLookup: (c) => (c.includes('T1') ? { chatId: '222', threadId: 9 } : null),
-      lastInboundChat: () => ({ chatId: 'WRONG', threadId: null }),
     })
     expect(r).toEqual({ chatId: '222', threadId: 9, via: 'registry' })
   })
-  it('falls back to last-inbound when the chain does not resolve', () => {
-    const r = resolveOutboxChat(rec({ chatId: null, anchorContent: 'no-task-id-here' }) as any, {
+  it('falls back to the record OWN per-session origin when the chain does not resolve', () => {
+    const r = resolveOutboxChat({ chatId: null, threadId: null, anchorContent: 'no-task-id-here', originChatId: '333', originThreadId: 4 }, {
       registryChainLookup: () => null,
-      lastInboundChat: () => ({ chatId: '333', threadId: null }),
     })
-    expect(r).toEqual({ chatId: '333', threadId: null, via: 'last-inbound' })
+    expect(r).toEqual({ chatId: '333', threadId: 4, via: 'origin' })
   })
-  it('returns null when nothing resolves', () => {
-    expect(resolveOutboxChat(rec({ chatId: null }) as any, {})).toBeNull()
+  it('FAILS CLOSED (null) when neither the chain nor a stamped origin resolves — never a global fallback', () => {
+    expect(resolveOutboxChat({ chatId: null, threadId: null, anchorContent: 'no-task', originChatId: null, originThreadId: null }, { registryChainLookup: () => null })).toBeNull()
   })
 })
 
@@ -146,16 +148,36 @@ describe('sweepOutbox — end to end (exactly-once, siblings, dedup)', () => {
     expect(new Set(s.sent.map((x) => x.text)).size).toBe(2)
   })
 
-  it('skips when the text was already delivered by the legacy flush (dedup)', async () => {
+  it('F1: on a text-dedup hit, journals the nonce AND deletes the record so it cannot re-fire', async () => {
+    // The legacy flush delivered this turn's text; the in-memory dedup reports a
+    // hit on the first eligible sweep. The record must be journaled + removed —
+    // NOT left pending (the pre-fix bug), which re-sent once the 60s TTL evicted.
     writeOutboxRecordAtomic(rec({ turnNonce: 'n1', text: 'dup', createdAt: 0 }), dir)
     const s = sink()
     await sweepOutbox({ ...s, textAlreadyDelivered: () => true, stateDir: dir, now: () => 10_000 })
     expect(s.sent).toHaveLength(0)
+    expect(readDeliveredNonces(dir).has('n1')).toBe(true)
+    expect(listPendingRecords(dir)).toHaveLength(0)
   })
 
-  it('routes an envelope-less record through last-inbound with a prefix', async () => {
-    writeLastInboundChat({ chatId: '888', threadId: null }, dir)
-    writeOutboxRecordAtomic(rec({ turnNonce: 'nx', chatId: null, text: 'z'.repeat(300), anchorContent: 'no-task' }), dir)
+  it('F1: NO second send after the in-memory dedup TTL evicts and the gateway restarts', async () => {
+    // Simulate the exact review failure: flush delivers (+0.5s), sweep at +5s
+    // hits the dedup and settles the record. Then the process "restarts" (fresh
+    // deps, in-memory dedup CLEARED → reports false) and the sweep runs again at
+    // +65s. With the pre-fix code the record was still pending and re-sent here.
+    writeOutboxRecordAtomic(rec({ turnNonce: 'n1', text: 'dup', createdAt: 0 }), dir)
+    const s1 = sink()
+    await sweepOutbox({ ...s1, textAlreadyDelivered: () => true, stateDir: dir, now: () => 5_000 })
+    expect(s1.sent).toHaveLength(0)
+    // Restart: brand-new sink + a dedup that no longer remembers the text.
+    const s2 = sink()
+    await sweepOutbox({ ...s2, textAlreadyDelivered: () => false, stateDir: dir, now: () => 65_000 })
+    expect(s2.sent).toHaveLength(0) // journal (durable) suppresses — no double-post
+    expect(listPendingRecords(dir)).toHaveLength(0)
+  })
+
+  it('routes an envelope-less record through its OWN per-session origin with a prefix', async () => {
+    writeOutboxRecordAtomic({ ...rec({ turnNonce: 'nx', chatId: null, text: 'z'.repeat(300), anchorContent: 'no-task' }), originChatId: '888', originThreadId: null }, dir)
     const s = sink()
     await sweepOutbox({ ...s, textAlreadyDelivered: () => false, stateDir: dir, now: () => 10_000 })
     expect(s.sent).toHaveLength(1)
@@ -163,11 +185,43 @@ describe('sweepOutbox — end to end (exactly-once, siblings, dedup)', () => {
     expect(s.sent[0].text.startsWith('(from background task) ')).toBe(true)
   })
 
-  it('holds (does not drop) an unroutable envelope-less record for a later tick', async () => {
+  it('F2: a DM-origin handback whose registry chain fails does NOT deliver to a different (group) chat', async () => {
+    // Record stamped with the DM origin (777). A group chat (999) is the most
+    // recent gateway inbound — but the sweep has NO global last-inbound fallback,
+    // so it must route to the DM origin, never the group.
+    writeOutboxRecordAtomic({ ...rec({ turnNonce: 'dm', chatId: null, text: 'private answer '.repeat(20), anchorContent: '<task-id>MISS</task-id>' }), originChatId: '777', originThreadId: null }, dir)
+    const s = sink()
+    await sweepOutbox({
+      ...s,
+      textAlreadyDelivered: () => false,
+      registryChainLookup: () => null, // chain fails
+      stateDir: dir,
+      now: () => 10_000,
+    })
+    expect(s.sent).toHaveLength(1)
+    expect(s.sent[0].chatId).toBe('777') // DM origin, NOT any group
+  })
+
+  it('F2: an envelope-less handback with NO stamped origin and a failed chain FAILS CLOSED (held, not misrouted)', async () => {
     writeOutboxRecordAtomic(rec({ turnNonce: 'held', chatId: null, anchorContent: 'no-task' }), dir)
     const s = sink()
-    await sweepOutbox({ ...s, textAlreadyDelivered: () => false, stateDir: dir, now: () => 10_000 })
+    await sweepOutbox({ ...s, textAlreadyDelivered: () => false, registryChainLookup: () => null, stateDir: dir, now: () => 10_000 })
     expect(s.sent).toHaveLength(0)
     expect(listPendingRecords(dir)).toContain('held.json')
+  })
+
+  it('S5: the delivered-keys journal is compacted once it exceeds the rotate threshold (bounded growth)', () => {
+    for (let i = 0; i < JOURNAL_ROTATE_AT + 5; i++) {
+      appendDelivered({ turnNonce: `k${i}`, textSha256: 'h', ts: i }, dir)
+    }
+    const lines = readFileSync(join(resolveOutboxDir(dir), 'delivered.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0)
+    // Bounded: compaction keeps the file under the rotate threshold rather than
+    // growing without limit (it drops to ~JOURNAL_KEEP each time it trips).
+    expect(lines.length).toBeLessThanOrEqual(JOURNAL_ROTATE_AT)
+    expect(lines.length).toBeLessThan(JOURNAL_KEEP + 100)
+    // The most-recent nonces survive compaction (still suppress a re-send).
+    expect(readDeliveredNonces(dir).has(`k${JOURNAL_ROTATE_AT + 4}`)).toBe(true)
   })
 })

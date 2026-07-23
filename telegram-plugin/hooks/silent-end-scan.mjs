@@ -857,6 +857,36 @@ function resolveCaptureAnchor(lines) {
 }
 
 /**
+ * Resolve THIS session's origin chat — the most-recent non-sidechain enqueue
+ * line whose content carries a real Telegram `<channel>` envelope with a
+ * chatId. Scoped to the session's OWN transcript, this is the conversation of
+ * record for an envelope-less handback turn (F2): the sweep routes an
+ * unresolved-registry record here instead of a gateway-global "last chat anyone
+ * messaged" fallback, so a DM-origin handback can never leak into an unrelated
+ * chat. Null when the session has no prior channel inbound → the record fails
+ * CLOSED (held, never delivered to an arbitrary chat).
+ *
+ * @param {string[]} lines
+ * @returns {{ chatId: string | null, threadId: number | null }}
+ */
+function resolveSessionOriginChat(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (!line || line[0] !== '{') continue
+    let obj
+    try { obj = JSON.parse(line) } catch { continue }
+    if (obj?.isSidechain === true) continue
+    if (obj?.type !== 'queue-operation') continue
+    const content = typeof obj.content === 'string' ? obj.content : ''
+    const env = parseChannelEnvelope(content)
+    if (env.chatId != null && env.chatId !== '') {
+      return { chatId: env.chatId, threadId: env.threadId ?? null }
+    }
+  }
+  return { chatId: null, threadId: null }
+}
+
+/**
  * Class-agnostic capture scan. Walks the turn from its anchor, tracking the last
  * delivery event (qualifying reply / silent marker) and the substantive prose
  * blocks that trail it. Returns a capture descriptor when the turn ended with
@@ -891,12 +921,14 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
         if (hadMarker) {
           // H6: a block ending "…real answer…\nNO_REPLY" carries a genuine
           // answer — capture the prose and do NOT treat the block as a silence
-          // event (which would mask the answer). Only when the prose is empty or
-          // pure narration does the trailing marker mean "intentionally silent".
+          // event (which would mask the answer). When the prose is empty or pure
+          // narration the marker is an intentional silence, but it must NOT emit
+          // a 'deliver' event: a *separate* bare-`NO_REPLY` block arriving AFTER
+          // a real (undelivered) prose block would otherwise move the
+          // last-delivery cursor past that prose and mask it (multi-block H6).
+          // A bare/narration marker is simply not a delivery — push nothing.
           if (prose.length > 0 && !isNarrationBlock(prose)) {
             blocks.push({ kind: 'text', chars: prose.length, text: prose })
-          } else {
-            blocks.push({ kind: 'deliver', reason: 'silent-marker-text' })
           }
         } else if (prose.length > 0) {
           blocks.push({ kind: 'text', chars: prose.length, text: prose })
@@ -949,6 +981,10 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     else if (/task-notification|task-id/.test(anchor.anchorContent)) source = 'task-notification'
     else source = 'channel'
   }
+  // F2: for an envelope-less record, stamp THIS session's own origin chat so the
+  // sweep can route it without a gateway-global fallback. For an envelope-
+  // bearing record the anchor chatId already routes it (origin is redundant).
+  const origin = envelope.chatId != null ? { chatId: null, threadId: null } : resolveSessionOriginChat(lines)
   return {
     capture: true,
     text: text.trim(),
@@ -957,5 +993,7 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     threadId: envelope.threadId ?? null,
     source,
     anchorContent: anchor.anchorContent,
+    originChatId: origin.chatId,
+    originThreadId: origin.threadId,
   }
 }

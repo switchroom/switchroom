@@ -49,6 +49,7 @@ import {
   escapeMarkdown,
 } from '../format.js'
 import { richMessage } from '../rich-send.js'
+import { journalExternalDelivery } from './outbox-sweep.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
@@ -1733,6 +1734,16 @@ export async function sendReply(
             Date.now(),
             turn?.registryKey ?? null,
           )
+          // F1: a FINAL-answer silent-anchor edit journals this legacy delivery
+          // under the shared nonce (turn.turnId === deriveTurnId === the hook's
+          // deriveTurnNonce `${chatKey}#${messageId}` for a gateway-visible turn)
+          // and drops any hook-captured record, so the sweep never re-sends after
+          // the in-memory dedup TTL evicts / a restart clears it / the captured
+          // text differs. Gated so an interim-ack edit never journals the turn
+          // nonce (which would suppress a later genuine answer for the turn).
+          if (isFinalAnswerReply({ text: decision.mergedText, disableNotification: modelDisableNotification })) {
+            journalExternalDelivery({ turnNonce: turn?.turnId ?? null, text: decision.mergedText, tgMessageId: decision.messageId })
+          }
 
           silentAnchorEditDone = true
         } catch (err) {
@@ -2275,7 +2286,17 @@ export async function sendReply(
   // calls with this same content within DEFAULT_DEDUP_TTL_MS will
   // be suppressed.
   if (sentIds.length > 0) {
-    outboundDedup.record(chat_id, threadId, text, Date.now(), getCurrentTurn()?.registryKey ?? null)
+    const t = getCurrentTurn()
+    outboundDedup.record(chat_id, threadId, text, Date.now(), t?.registryKey ?? null)
+    // F1: a FINAL-answer reply journals + clears under the shared nonce
+    // (turn.turnId === deriveTurnId, the hook's deriveTurnNonce), so the sweep
+    // never re-posts this turn's answer. Gated on isFinalAnswerReply: an interim
+    // ack is NOT the turn's answer, so it must not journal the turn nonce (that
+    // would suppress a later genuinely-undelivered final answer for the same
+    // gateway turn).
+    if (isFinalAnswerReply({ text: rawText, disableNotification: modelDisableNotification })) {
+      journalExternalDelivery({ turnNonce: t?.turnId ?? null, text, tgMessageId: sentIds[sentIds.length - 1] })
+    }
   }
   return { content: [{ type: 'text', text: result }] }
 }
@@ -2383,6 +2404,9 @@ export async function deliverCapturedProse(
       // Record what we just sent so a late reply / stream_reply retry with the
       // same content is deduped at its send site (the #546 dedup cache).
       outboundDedup.record(chatId, threadId, text, now, registryKey)
+      // F1: captured-prose delivery journals + clears under the shared nonce
+      // (`originTurnId` === turn.turnId === deriveTurnId, the hook's nonce).
+      journalExternalDelivery({ turnNonce: originTurnId, text, tgMessageId: sentIds[sentIds.length - 1] })
       process.stderr.write(
         `telegram gateway: captured-prose delivery — sent ${out.length} chars recovered from ` +
           `transcript scan (chat=${chatId} origin=${originTurnId})\n`,

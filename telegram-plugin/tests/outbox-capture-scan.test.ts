@@ -118,8 +118,21 @@ describe('H5 — cron turns are captured (no silent-loss carve-out)', () => {
 })
 
 describe('H6 — prose + trailing NO_REPLY must not suppress a real answer', () => {
-  it('captures the prose that precedes a stray trailing NO_REPLY', () => {
+  it('captures the prose that precedes a stray trailing NO_REPLY (same block)', () => {
     const cap = scanForOutboxCapture(jsonl([channel('1', '2'), assistantText(`${A_LONG}\nNO_REPLY`)]))
+    expect(cap.capture).toBe(true)
+    if (cap.capture) expect(cap.text).toBe(A_LONG)
+  })
+
+  it('captures a real answer in one block followed by a SEPARATE bare NO_REPLY block (multi-block)', () => {
+    // The multi-block masking case: a genuine undelivered answer, then a later
+    // standalone NO_REPLY block. The bare marker must NOT move the delivery
+    // cursor past the answer and suppress it.
+    const cap = scanForOutboxCapture(jsonl([
+      channel('1', '2'),
+      assistantText(A_LONG),
+      assistantText('NO_REPLY'),
+    ]))
     expect(cap.capture).toBe(true)
     if (cap.capture) expect(cap.text).toBe(A_LONG)
   })
@@ -140,6 +153,27 @@ describe('H6 — prose + trailing NO_REPLY must not suppress a real answer', () 
 
   it('does NOT capture narration-only trailing text', () => {
     expect(scanForOutboxCapture(jsonl([channel('1', '2'), assistantText('Let me check that…')])).capture).toBe(false)
+  })
+})
+
+describe('F2 — per-session origin chat stamped for envelope-less routing', () => {
+  it('stamps the session origin chat on a task-notification handback captured after a DM inbound', () => {
+    const cap = scanForOutboxCapture(jsonl([
+      channel('777', '5', 'do the thing'), // the DM the user spawned the task from
+      taskNotification('worker done'),      // envelope-less handback wake
+      assistantText(A_LONG),
+    ]))
+    expect(cap.capture).toBe(true)
+    if (cap.capture) {
+      expect(cap.chatId).toBeNull()        // envelope-less
+      expect((cap as { originChatId?: string | null }).originChatId).toBe('777')
+    }
+  })
+
+  it('leaves origin null when the session has no prior channel inbound (fail-closed)', () => {
+    const cap = scanForOutboxCapture(jsonl([taskNotification('worker done'), assistantText(A_LONG)]))
+    expect(cap.capture).toBe(true)
+    if (cap.capture) expect((cap as { originChatId?: string | null }).originChatId ?? null).toBeNull()
   })
 })
 

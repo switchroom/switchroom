@@ -38,10 +38,14 @@
  * `<task-notification>` content) collision-free, and serialized concurrent
  * sibling handbacks get distinct enqueue timestamps → distinct nonces.
  *
- * Routing (H3): a record captured off an envelope-less anchor (task-notification
+ * Routing (H3/F2): a record captured off an envelope-less anchor (task-notification
  * handback, chained/background-spawned dispatch) carries no chatId. `resolveOutboxChat`
- * resolves it via a transitive registry-chain lookup first, then a per-session
- * last-real-inbound chatKey fallback.
+ * resolves it via a transitive registry-chain lookup first, then the record's OWN
+ * stamped per-session origin chat (`originChatId`, captured at Stop from this
+ * session's most recent real `<channel>` inbound). It never consults a
+ * gateway-global "last chat anyone messaged" fallback (that could leak private
+ * content cross-chat), and FAILS CLOSED — holding the record — if neither
+ * resolves.
  *
  * Pure cores (`deriveTurnNonce`, `decideOutboxSweep`, `resolveOutboxChat`) are
  * side-effect-free and unit-tested; the IO helpers are thin and best-effort.
@@ -87,6 +91,19 @@ export interface OutboxRecord {
    * routing (H3). Absent for envelope-carrying anchors that already routed.
    */
   anchorContent?: string
+  /**
+   * Per-session ORIGIN chat, stamped at capture time from THIS session's own
+   * transcript (its most-recent real Telegram `<channel>` inbound) — the
+   * conversation of record for the session that produced this handback. Used as
+   * the scoped routing fallback for an envelope-less record whose registry chain
+   * fails (H3/F2), REPLACING the old gateway-global "last chat anyone messaged"
+   * fallback that could leak private content into an unrelated chat. Absent when
+   * the session has no prior channel inbound → the record fails CLOSED (held,
+   * never delivered to an arbitrary chat).
+   */
+  originChatId?: string | null
+  /** Forum thread of the per-session origin chat (see `originChatId`). */
+  originThreadId?: number | null
 }
 
 /** One line of the delivered-keys journal (`outbox/delivered.jsonl`). */
@@ -274,16 +291,47 @@ export function outboxAlreadyDelivered(nonce: string, stateDir?: string): boolea
 }
 
 /**
+ * Max delivered-keys kept in the journal. On exceeding `JOURNAL_ROTATE_AT` lines
+ * the journal is compacted down to the newest `JOURNAL_KEEP` entries — bounding
+ * on-disk growth and per-tick read cost. A duplicate arriving after its nonce
+ * has aged out of the kept window is still caught by the record having been
+ * deleted at delivery (the pending file is gone), so compaction never
+ * reintroduces a double-post for any live record.
+ */
+export const JOURNAL_KEEP = 2_000
+export const JOURNAL_ROTATE_AT = 4_000
+
+/**
  * Append a delivered entry to the journal (intent/outcome). Called by EVERY
  * delivering machine (sweep, legacy flush, captured-prose bridge, exhausted
  * fallback, final-answer reply send) under the SAME nonce — the shared
- * exactly-once namespace (H1). Best-effort; never throws.
+ * exactly-once namespace (H1). Best-effort; never throws. Compacts the journal
+ * in place once it grows past `JOURNAL_ROTATE_AT` lines.
  */
 export function appendDelivered(entry: DeliveredEntry, stateDir?: string): void {
   const dir = resolveOutboxDir(stateDir)
+  const path = join(dir, JOURNAL_FILE)
   try {
     mkdirSync(dir, { recursive: true })
-    appendFileSync(join(dir, JOURNAL_FILE), JSON.stringify(entry) + '\n', { mode: 0o600 })
+    appendFileSync(path, JSON.stringify(entry) + '\n', { mode: 0o600 })
+    compactJournalIfLarge(path)
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Rewrite the journal keeping only its newest `JOURNAL_KEEP` non-empty lines
+ * once it exceeds `JOURNAL_ROTATE_AT`. Atomic (tmp + rename); best-effort.
+ */
+function compactJournalIfLarge(path: string): void {
+  try {
+    const lines = readFileSync(path, 'utf8').split('\n').filter((l) => l.length > 0)
+    if (lines.length <= JOURNAL_ROTATE_AT) return
+    const kept = lines.slice(lines.length - JOURNAL_KEEP)
+    const tmp = `${path}.${process.pid}.compact`
+    writeFileSync(tmp, kept.join('\n') + '\n', { mode: 0o600 })
+    renameSync(tmp, path)
   } catch {
     /* best-effort */
   }
@@ -326,7 +374,10 @@ export interface OutboxSweepDecision {
  *
  *   skip-journaled  — nonce already delivered (exactly-once, H1).
  *   skip-quiet      — inside the quiet period; let a same-turn legacy flush land.
- *   skip-dedup      — identical text already delivered (outboundDedup / SQLite backstop).
+ *   skip-dedup      — identical text already delivered (the in-memory
+ *                     `outboundDedup` cache; NOT a persistent/SQLite store —
+ *                     the durable exactly-once guard is the delivered-keys
+ *                     journal keyed by turnNonce, checked above).
  *   skip-unroutable — no chat could be resolved (H3 exhausted) — keep the record.
  *   send            — deliver now.
  *   send-delayed    — older than max-age; deliver with a "(delayed)" prefix, never drop.
@@ -364,28 +415,34 @@ export function decideOutboxSweep(input: {
 export interface ResolvedChat {
   chatId: string
   threadId: number | null
-  /** How the chat was resolved — 'anchor' (envelope), 'registry' (H3 chain), 'last-inbound' (fallback). */
-  via: 'anchor' | 'registry' | 'last-inbound'
+  /** How the chat was resolved — 'anchor' (envelope), 'registry' (H3 chain), 'origin' (per-session fallback). */
+  via: 'anchor' | 'registry' | 'origin'
 }
 
 /**
- * Resolve the destination chat for a record (H3).
+ * Resolve the destination chat for a record (H3 / F2).
  *
- *   1. anchor      — the record already carries a chatId (envelope-bearing turn).
- *   2. registry    — transitive `<task-id>` → registry-row → originating chatKey
- *                    lookup, recursing up a chained/background-spawned dispatch.
- *   3. last-inbound— per-session last-real-inbound chatKey fallback (single-chat
- *                    correct always; forum-correct unless the user switched
- *                    topics mid-chain — the caller adds a "(from background
- *                    task)" prefix in that case).
+ *   1. anchor    — the record already carries a chatId (envelope-bearing turn).
+ *   2. registry  — transitive `<task-id>` → registry-row → originating chatKey
+ *                  lookup, recursing up a chained/background-spawned dispatch.
+ *   3. origin    — the record's OWN stamped per-session origin chat
+ *                  (`originChatId`), captured at Stop from this session's most
+ *                  recent real `<channel>` inbound. This is SCOPED to the record
+ *                  (F2): it can never route to "whatever chat messaged the
+ *                  gateway last" the way the retired global last-inbound file
+ *                  could, so a DM-origin handback can never leak into an
+ *                  unrelated group. The caller adds a "(from background task)"
+ *                  prefix for this route.
  *
- * Pure — the caller injects `registryChainLookup` and `lastInboundChat`.
+ * FAIL CLOSED: if none of the three resolves, returns null — the sweep HOLDS the
+ * record (skip-unroutable) rather than delivering to an arbitrary chat.
+ *
+ * Pure — the caller injects `registryChainLookup`.
  */
 export function resolveOutboxChat(
-  record: Pick<OutboxRecord, 'chatId' | 'threadId' | 'anchorContent'>,
+  record: Pick<OutboxRecord, 'chatId' | 'threadId' | 'anchorContent' | 'originChatId' | 'originThreadId'>,
   deps: {
     registryChainLookup?: (anchorContent: string) => { chatId: string; threadId: number | null } | null
-    lastInboundChat?: () => { chatId: string; threadId: number | null } | null
   },
 ): ResolvedChat | null {
   if (record.chatId != null && record.chatId !== '') {
@@ -395,51 +452,10 @@ export function resolveOutboxChat(
     const hit = deps.registryChainLookup(record.anchorContent)
     if (hit != null) return { chatId: hit.chatId, threadId: hit.threadId, via: 'registry' }
   }
-  if (deps.lastInboundChat) {
-    const hit = deps.lastInboundChat()
-    if (hit != null) return { chatId: hit.chatId, threadId: hit.threadId, via: 'last-inbound' }
+  if (record.originChatId != null && record.originChatId !== '') {
+    return { chatId: record.originChatId, threadId: record.originThreadId ?? null, via: 'origin' }
   }
   return null
-}
-
-// ── Last-real-inbound chat (H3 fallback) ─────────────────────────────────────
-// The gateway writes this on every real Telegram-inbound enqueue; the sweep
-// reads it to route an envelope-less handback to the conversation of record.
-
-const LAST_INBOUND_FILE = 'last-inbound-chat.json'
-
-export function writeLastInboundChat(
-  chat: { chatId: string; threadId: number | null },
-  stateDir?: string,
-): void {
-  const dir = resolveOutboxDir(stateDir)
-  try {
-    mkdirSync(dir, { recursive: true })
-    writeFileSync(
-      join(dir, LAST_INBOUND_FILE),
-      JSON.stringify({ ...chat, ts: Date.now() }),
-      { mode: 0o600 },
-    )
-  } catch {
-    /* best-effort */
-  }
-}
-
-export function readLastInboundChat(
-  stateDir?: string,
-): { chatId: string; threadId: number | null } | null {
-  const path = join(resolveOutboxDir(stateDir), LAST_INBOUND_FILE)
-  if (!existsSync(path)) return null
-  try {
-    const o = JSON.parse(readFileSync(path, 'utf8')) as {
-      chatId?: string
-      threadId?: number | null
-    }
-    if (o.chatId == null || o.chatId === '') return null
-    return { chatId: o.chatId, threadId: o.threadId ?? null }
-  } catch {
-    return null
-  }
 }
 
 /**

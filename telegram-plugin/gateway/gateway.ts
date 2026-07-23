@@ -904,7 +904,7 @@ import {
   TURN_ACTIVE_IDLE_SWEEP_MS,
 } from './turn-active-marker.js'
 import { startGatewayHeartbeat } from './gateway-heartbeat.js'
-import { startOutboxSweep, writeLastInboundChat } from './outbox-sweep.js'
+import { startOutboxSweep } from './outbox-sweep.js'
 import {
   VERSION,
   COMMIT_SHA,
@@ -14793,8 +14793,8 @@ export async function handleInbound(
   {
     const inboundChatId = ctx.chat?.id
     if (inboundChatId != null) void dmPinSweeper.sweep(String(inboundChatId))
-    // Outbox H3 fallback: stamp the last real inbound chat for envelope-less handback routing.
-    if (inboundChatId != null) writeLastInboundChat({ chatId: String(inboundChatId), threadId: messageThreadId ?? null })
+    // Outbox envelope-less routing (F2) is scoped to each record's OWN stamped
+    // per-session origin chat (captured at Stop), not a gateway-global stamp.
   }
 
   // Capture wall-clock receive time for inbound_ack metric (#203).

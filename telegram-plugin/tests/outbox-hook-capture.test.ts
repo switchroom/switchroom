@@ -19,12 +19,12 @@ import { join, resolve } from 'node:path'
 
 const HOOK = resolve(__dirname, '..', 'hooks', 'silent-end-interrupt-stop.mjs')
 
-function runHook(event: object, stateDir: string) {
+function runHook(event: object, stateDir: string, extraEnv: Record<string, string> = {}) {
   return spawnSync('node', [HOOK], {
     input: JSON.stringify(event),
     encoding: 'utf8',
     timeout: 5000,
-    env: { ...process.env, TELEGRAM_STATE_DIR: stateDir },
+    env: { ...process.env, TELEGRAM_STATE_DIR: stateDir, ...extraEnv },
   })
 }
 
@@ -81,6 +81,23 @@ describe('Stop hook — outbox capture (incident replay)', () => {
     const r = runHook({ session_id: 's', transcript_path: t }, dir)
     expect(r.status).toBe(0)
     expect(outboxRecords(dir)).toHaveLength(0)
+  })
+
+  it('kill-switch symmetry: SWITCHROOM_TG_OUTBOX_DELIVERY=0 disables capture too (no orphaned records)', () => {
+    // With delivery off, capture MUST also be off — otherwise the hook would
+    // write records that the (disabled) sweep never delivers = silent loss.
+    const t = transcript(dir, [
+      {
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<task-notification><task-id>a7cc7a0fa8f</task-id> worker done</task-notification>',
+        timestamp: 1000,
+      },
+      { type: 'assistant', message: { content: [{ type: 'text', text: answer }] } },
+    ])
+    const r = runHook({ session_id: 's', transcript_path: t }, dir, { SWITCHROOM_TG_OUTBOX_DELIVERY: '0' })
+    expect(r.status).toBe(0)
+    expect(outboxRecords(dir)).toHaveLength(0) // no capture ⇒ no orphaned record
   })
 
   it('capture is idempotent — a second hook run does not write a duplicate', () => {

@@ -7,12 +7,19 @@
  *
  * Exactly-once (H1): every record is claimed with a rename-mutex, guarded by the
  * shared delivered-keys journal (same turnNonce every delivering machine uses),
- * and by the existing text `outboundDedup`. Delivered nonce is journaled AFTER a
- * successful send; a crash between send and journal is caught next boot by the
- * text-dedup backstop (never a loss, at most one duplicate).
+ * and by the in-memory text `outboundDedup` cache. Delivered nonce is journaled
+ * AFTER a successful send. When a legacy machine (turn-flush / reply / captured
+ * prose) delivered the same turn's answer first, its journal write under the
+ * SAME nonce makes the sweep skip-journaled; and the sweep's own skip-dedup
+ * branch JOURNALS the nonce and DELETES the record (see below) so a text-dedup
+ * hit can never re-fire after the in-memory cache's TTL evicts. A crash between
+ * send and journal is caught next boot by the journal + text-dedup (never a
+ * loss, at most one duplicate).
  *
- * Routing (H3): `resolveOutboxChat` runs the injected transitive registry-chain
- * lookup then the last-real-inbound fallback for envelope-less records.
+ * Routing (H3/F2): `resolveOutboxChat` runs the injected transitive registry-chain
+ * lookup then the record's OWN stamped per-session origin chat for envelope-less
+ * records — never a gateway-global last-inbound fallback (cross-chat leak). It
+ * FAILS CLOSED (holds the record) when neither resolves.
  *
  * The orchestration takes injected IO deps so it is unit-testable without a live
  * gateway; `gateway.ts` wires the real send / dedup / registry lookups.
@@ -22,11 +29,11 @@ import {
   OUTBOX_QUIET_MS,
   appendDelivered,
   claimRecord,
+  clearOutboxRecord,
   decideOutboxSweep,
   extractTaskId,
   listPendingRecords,
   readDeliveredNonces,
-  readLastInboundChat,
   readOutboxRecord,
   reclaimStaleSending,
   releaseClaim,
@@ -87,17 +94,17 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
     if (record == null) continue
     summary.scanned++
 
-    // Resolve destination (anchor → registry chain → last-inbound fallback).
+    // Resolve destination (anchor → registry chain → per-session origin). Fails
+    // CLOSED (null → held) rather than routing to an arbitrary chat (F2).
     const resolved = resolveOutboxChat(record, {
       registryChainLookup: (anchorContent) => {
         const taskId = extractTaskId(anchorContent)
         if (taskId == null || deps.registryChainLookup == null) return null
         return deps.registryChainLookup(taskId)
       },
-      lastInboundChat: () => readLastInboundChat(deps.stateDir),
     })
 
-    const routePrefix = resolved?.via === 'last-inbound' ? '(from background task) ' : ''
+    const routePrefix = resolved?.via === 'origin' ? '(from background task) ' : ''
     const decision = decideOutboxSweep({
       record,
       now,
@@ -112,7 +119,25 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
 
     if (decision.action !== 'send' && decision.action !== 'send-delayed') {
       summary.skipped++
-      if (decision.action === 'skip-journaled') removeClaimed(record.turnNonce, deps.stateDir)
+      if (decision.action === 'skip-journaled') {
+        // Already delivered under this nonce by another machine → drop the
+        // pending record. clearOutboxRecord unlinks the `.json` (the pending
+        // file) AND any `.sending` — the pre-fix `removeClaimed` only unlinked
+        // `.sending`, leaking the `.json` to be rescanned forever (S4).
+        clearOutboxRecord(record.turnNonce, deps.stateDir)
+      } else if (decision.action === 'skip-dedup') {
+        // F1: the identical text was already delivered by the legacy flush/reply
+        // (in-memory `outboundDedup` hit). JOURNAL the nonce and DELETE the
+        // record NOW, so once that in-memory cache's TTL evicts (~60s) the sweep
+        // cannot resurrect and re-send this turn's answer. Deterministic
+        // exactly-once, independent of cache lifetime and surviving a restart
+        // (the record is gone from disk, the nonce is durably journaled).
+        appendDelivered(
+          { turnNonce: record.turnNonce, textSha256: record.textSha256, ts: now },
+          deps.stateDir,
+        )
+        clearOutboxRecord(record.turnNonce, deps.stateDir)
+      }
       continue
     }
 
@@ -230,20 +255,28 @@ export function startOutboxSweep(deps: {
 /**
  * Journal a delivery made by a NON-sweep machine (legacy turn-flush /
  * captured-prose bridge / exhausted fallback / final-answer reply send) under
- * the shared nonce, and drop any pending outbox record for it — the reply-path
- * clear-by-nonce (H1). Call this at every existing delivery site with the
- * gateway's own `deriveTurnId` nonce so the sweep never double-posts.
+ * the shared nonce, AND drop any pending outbox record for it — the reply-path
+ * clear-by-nonce (H1/F1). Wired at every legacy delivery site with the gateway's
+ * own `deriveTurnId` nonce (`turn.turnId`), which is byte-identical to the
+ * hook's `deriveTurnNonce` `${chatKey}#${messageId}` for a gateway-visible turn, so:
+ *   - the journal write makes a later sweep skip-journaled even after the
+ *     in-memory `outboundDedup` TTL has evicted or the gateway restarted, and
+ *   - `clearOutboxRecord` removes the hook's captured record immediately when
+ *     the flush text differs from the captured text (text-dedup would miss).
+ * Best-effort; never throws. A null/empty nonce is ignored (nothing to journal).
  */
 export function journalExternalDelivery(
-  args: { turnNonce: string; text: string; tgMessageId?: number },
+  args: { turnNonce: string | null; text: string; tgMessageId?: number },
   stateDir?: string,
   now: number = Date.now(),
 ): void {
+  const nonce = args.turnNonce
+  if (nonce == null || nonce === '') return
   appendDelivered(
-    { turnNonce: args.turnNonce, textSha256: sha256Hex(args.text), tgMessageId: args.tgMessageId, ts: now },
+    { turnNonce: nonce, textSha256: sha256Hex(args.text), tgMessageId: args.tgMessageId, ts: now },
     stateDir,
   )
+  clearOutboxRecord(nonce, stateDir)
 }
 
-export { writeLastInboundChat } from '../outbox.js'
 export type { OutboxRecord }

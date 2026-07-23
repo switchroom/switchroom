@@ -179,6 +179,9 @@ function writeOutboxRecord(stateDir, capture) {
       createdAt: Date.now(),
       source: capture.source,
       anchorContent: capture.chatId == null ? capture.anchorContent : undefined,
+      // F2: per-session origin chat for envelope-less routing (fail-closed).
+      originChatId: capture.chatId == null ? (capture.originChatId ?? null) : undefined,
+      originThreadId: capture.chatId == null ? (capture.originThreadId ?? null) : undefined,
     }
     const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
     writeFileSync(tmpPath, JSON.stringify(record), 'utf8')
@@ -230,7 +233,13 @@ function main() {
   // — no CurrentTurn, no election, no re-prompt needed. This is the deterministic
   // guarantee: the model calling `reply` is no longer required. Fail-open on any
   // error (never loop the session).
-  try {
+  //
+  // Kill switch symmetry: `SWITCHROOM_TG_OUTBOX_DELIVERY=0` disables the gateway
+  // sweep (the deliverer). Capture MUST honour the SAME gate — otherwise, with
+  // the flag off, capture would write records that nothing delivers AND
+  // short-circuit the legacy re-prompt path below = silent loss. Flag off ⇒ skip
+  // capture entirely and fall through to the legacy block/re-prompt behaviour.
+  if (process.env.SWITCHROOM_TG_OUTBOX_DELIVERY !== '0') try {
     const capture = scanForOutboxCapture(jsonl)
     if (capture.capture === true) {
       writeOutboxRecord(stateDir, capture)
