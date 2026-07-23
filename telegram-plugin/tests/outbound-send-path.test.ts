@@ -329,3 +329,87 @@ describe('outbound-send-path — cross-surface dedup suppression', () => {
     expect(dedup.check(chatId, undefined, text, t0 + 500, 'turn-2')).toBeNull()
   })
 })
+
+// ── #3501 temporal-normalization wiring into the shared seam ────────────────
+import { readFileSync } from 'node:fs'
+import { normalizeTemporal } from '../temporal-normalize.js'
+
+const TZ_MEL = 'Australia/Melbourne'
+const NOW_THU = Date.UTC(2026, 6, 23, 2, 0, 0) // Thu 2026-07-23 midday Melbourne
+
+describe('outbound-send-path — temporal pass wiring (#3501)', () => {
+  it('fires when tz+nowMs are supplied — fixes the cron/mail-watcher incident', () => {
+    const incident = 'Heads up: the office is closed tomorrow (Thu 23 Jul).'
+    const got = normalizeOutboundBody(incident, 'turn_flush', injectedRedact, {
+      tz: TZ_MEL,
+      nowMs: NOW_THU,
+    })
+    expect(got.text).toBe('Heads up: the office is closed today (Thu 23 Jul).')
+  })
+
+  it('is a NO-OP when tz is omitted (keeps the seam pure/clock-free by default)', () => {
+    const incident = 'closed tomorrow (Thu 23 Jul)'
+    // No tz → temporal must not fire; output is the plain formatted pipeline.
+    const got = normalizeOutboundBody(incident, 'reply', injectedRedact)
+    expect(got.text).toBe(incident)
+  })
+
+  it('REVIEW FIX 3 — a literal edit does NOT run the temporal pass', () => {
+    const incident = 'closed tomorrow (Thu 23 Jul)'
+    const got = normalizeOutboundBody(incident, 'edit_message', injectedRedact, {
+      literalText: true,
+      tz: TZ_MEL,
+      nowMs: NOW_THU,
+    })
+    // Literal edit lands byte-for-byte — the stale relative word is preserved.
+    expect(got.text).toBe(incident)
+  })
+
+  it('golden pipeline ORDER — temporal output is not mangled by the voice scrub', () => {
+    // A UTC datetime is rewritten to "Thu 23 Jul 7:15 pm AEST"; the voice scrub
+    // (em/en dash → comma) that runs AFTER must not touch it.
+    const raw = 'window 2026-07-23T09:15:00Z opens'
+    const got = normalizeOutboundBody(raw, 'reply', injectedRedact, {
+      tz: TZ_MEL,
+      nowMs: NOW_THU,
+    })
+    expect(got.text).toBe('window Thu 23 Jul 7:15 pm AEST opens')
+  })
+
+  it('temporal runs AFTER punctuation/bold and BEFORE scrubVoice (structural pin)', () => {
+    const src = readFileSync(new URL('../gateway/outbound-send-path.ts', import.meta.url), 'utf8')
+    const start = src.indexOf('export function normalizeOutboundBody(')
+    const boldIdx = src.indexOf('stripExcessBold(normalizePunctuation(text))', start)
+    const temporalIdx = src.indexOf('normalizeTemporal(text, tz, nowMs)', start)
+    const scrubIdx = src.indexOf('scrubVoice(text)', start)
+    expect(boldIdx).toBeGreaterThan(start)
+    expect(temporalIdx).toBeGreaterThan(boldIdx) // AFTER punctuation/bold
+    expect(scrubIdx).toBeGreaterThan(temporalIdx) // BEFORE the voice scrub
+  })
+
+  it('per-site wiring pin — all three prose sends pass tz+nowMs into the seam', () => {
+    const sendPath = readFileSync(new URL('../gateway/outbound-send-path.ts', import.meta.url), 'utf8')
+    const gateway = readFileSync(new URL('../gateway/gateway.ts', import.meta.url), 'utf8')
+    const streamRender = readFileSync(new URL('../gateway/stream-render.ts', import.meta.url), 'utf8')
+    // Reply site (sendReply) passes tz+nowMs.
+    const replyStart = sendPath.indexOf(`normalizeOutboundBody(rawText, 'reply', redactOutboundText`)
+    expect(replyStart).toBeGreaterThan(0)
+    expect(sendPath.indexOf('tz: resolveEnvTimezone()', replyStart)).toBeGreaterThan(replyStart)
+    // edit_message site passes tz+nowMs.
+    const editStart = gateway.indexOf(`'edit_message',`)
+    expect(gateway.indexOf('tz: resolveEnvTimezone()', editStart)).toBeGreaterThan(editStart)
+    // turn-flush site passes tz+nowMs.
+    const flushStart = streamRender.indexOf(`'turn_flush',`)
+    expect(streamRender.indexOf('tz: resolveEnvTimezone()', flushStart)).toBeGreaterThan(flushStart)
+  })
+
+  it('temporal wiring matches the standalone module output (no drift)', () => {
+    const raw = 'ships tomorrow (Thu 23 Jul), at 2026-07-23T09:15:00Z'
+    const viaSeam = normalizeOutboundBody(raw, 'reply', injectedRedact, {
+      tz: TZ_MEL,
+      nowMs: NOW_THU,
+    }).text
+    const viaModule = normalizeTemporal(raw, TZ_MEL, NOW_THU)
+    expect(viaSeam).toBe(viaModule)
+  })
+})
