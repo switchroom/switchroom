@@ -1805,7 +1805,7 @@ export async function sendReply(
           // text differs. Gated so an interim-ack edit never journals the turn
           // nonce (which would suppress a later genuine answer for the turn).
           if (isFinalAnswerReply({ text: decision.mergedText, disableNotification: modelDisableNotification })) {
-            journalExternalDelivery({ turnNonce: turn?.turnId ?? null, text: decision.mergedText, tgMessageId: decision.messageId })
+            journalExternalDelivery({ turnNonce: turn?.turnId ?? null, text: decision.mergedText, tgMessageId: decision.messageId, replyAlreadyDeliveredThisTurn: true })
           }
 
           silentAnchorEditDone = true
@@ -2372,7 +2372,7 @@ export async function sendReply(
     // won't double-post it) while an interim ack never journals (so a later
     // genuinely-undelivered final answer is delivered by the sweep).
     if (shouldJournalReplySiteDelivery({ text: rawText, disableNotification: modelDisableNotification })) {
-      journalExternalDelivery({ turnNonce: t?.turnId ?? null, text, tgMessageId: sentIds[sentIds.length - 1] })
+      journalExternalDelivery({ turnNonce: t?.turnId ?? null, text, tgMessageId: sentIds[sentIds.length - 1], replyAlreadyDeliveredThisTurn: true })
     }
   }
   return { content: [{ type: 'text', text: result }] }

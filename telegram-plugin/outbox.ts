@@ -104,6 +104,15 @@ export interface OutboxRecord {
   originChatId?: string | null
   /** Forum thread of the per-session origin chat (see `originChatId`). */
   originThreadId?: number | null
+  /**
+   * #3510 instrumentation: was a qualifying reply already delivered through
+   * the gateway in the turn that produced this record? Stamped by the Stop
+   * hook from the SAME boolean that gates its capture-vs-election branch.
+   * After #3510 this is always `false` for a written record (a `true` routes
+   * to the single-writer election instead of the outbox), so a `true` here —
+   * or in a sweep journal entry — is direct evidence of a regression.
+   */
+  replyAlreadyDeliveredThisTurn?: boolean
 }
 
 /** One line of the delivered-keys journal (`outbox/delivered.jsonl`). */
@@ -112,6 +121,14 @@ export interface DeliveredEntry {
   textSha256: string
   tgMessageId?: number
   ts: number
+  /**
+   * #3510 instrumentation: which machine delivered — the outbox sweep, or the
+   * gateway reply-path machinery (reply/stream_reply send, silent-anchor edit,
+   * captured-prose bridge). Absent on pre-#3510 journal lines.
+   */
+  deliverySource?: 'sweep' | 'reply-tool'
+  /** #3510 instrumentation: see `OutboxRecord.replyAlreadyDeliveredThisTurn`. */
+  replyAlreadyDeliveredThisTurn?: boolean
 }
 
 export function sha256Hex(s: string): string {

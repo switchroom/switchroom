@@ -201,12 +201,18 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(state.retryCount).toBe(SILENT_END_MAX_RETRIES)
   })
 
-  it('captures the trailing verdict to the outbox + allows when an early qualifying reply is followed by an undelivered verdict (trailing-content bug repro, collapsed design)', () => {
-    // Confirmed-incident shape: (1) a background-task notification arrives,
-    // (2) the agent calls reply ONCE early with a notification-bearing ack,
-    // (3) it then writes a large substantive verdict as plain assistant text
-    // with NO second reply call. The trailing verdict is now CAPTURED to the
-    // outbox and the stop is ALLOWED — the sweep delivers it deterministically.
+  it('routes the trailing verdict through the single-writer election (NOT the outbox) when an early qualifying reply already delivered (#3510)', () => {
+    // Pre-#3510 this shape — (1) inbound, (2) an early notification-bearing
+    // (ping-final) reply, (3) a large trailing verdict as plain text — was
+    // CAPTURED to the outbox and self-exited, bypassing the #3469 election.
+    // Because the ping-final reply is delivered by the gateway but sits under
+    // the reply-site journal floor, the sweep then flushed the trailing prose
+    // as a SECOND message (the #3510 double-send). Now: a reply already
+    // delivered this turn ⇒ NO outbox record; the trailing prose goes through
+    // `decideStopHookDisposition`'s 'trailing-text-after-reply' branch, whose
+    // captured-prose bridge is the single writer (fresh heartbeat ⇒ elected
+    // allow, pendingText persisted as the bridge's input).
+    writeFileSync(join(stateDir, 'gateway-heartbeat'), 'hb', 'utf8')
     const transcript = writeTranscript(tmp, [
       ENQUEUE,
       reply('running now'),
@@ -222,11 +228,13 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       stateDir,
     })
     expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('')
-    const rec = readOutboxRecord(stateDir)
-    expect(rec).not.toBeNull()
-    expect(rec!.text).toBe('Here is the actual verdict: ' + 'X'.repeat(300))
-    expect(rec!.turnNonce).toBe('111:_#42')
+    expect(r.stdout.trim()).toBe('') // elected allow — no re-prompt
+    expect(r.stderr).toMatch(/replyAlreadyDeliveredThisTurn=true/)
+    // No outbox record: the sweep must have nothing to flush as a second message.
+    expect(readOutboxRecord(stateDir)).toBeNull()
+    // The verdict is handed to the bridge (single writer) via the state file.
+    const state = JSON.parse(readFileSync(join(stateDir, 'silent-end-pending.json'), 'utf8'))
+    expect(state.pendingText).toBe('Here is the actual verdict: ' + 'X'.repeat(300))
   })
 
   it('does NOT false-positive on a normal single-reply turn ending on the reply tool_use', () => {

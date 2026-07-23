@@ -894,7 +894,7 @@ function resolveSessionOriginChat(lines) {
  *
  * @param {string} jsonl
  * @param {number} [now]
- * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string }}
+ * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string, replyAlreadyDeliveredThisTurn: boolean, deliveredReplySha256: string|null }}
  */
 export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const lines = jsonl.split('\n')
@@ -948,7 +948,10 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
         disableNotification: input.disable_notification === true,
         done: input.done === true,
       })) {
-        blocks.push({ kind: 'deliver', reason: 'final-reply' })
+        // #3510: keep the delivered reply's text so the caller can log its
+        // sha256 next to the captured trailing prose's sha256 — a double-send
+        // becomes provable from logs alone, without transcript reconstruction.
+        blocks.push({ kind: 'deliver', reason: 'final-reply', text })
       }
       // interim ack — neither delivery nor undelivered prose.
     }
@@ -958,6 +961,19 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
   for (let i = 0; i < blocks.length; i++) {
     if (blocks[i].kind === 'deliver') lastDeliverIdx = i
   }
+  // #3510: single source of truth for BOTH the fix's branching and the
+  // instrumentation. When true, a qualifying reply/stream_reply already went
+  // through the gateway THIS turn — so a gateway anchor provably exists and the
+  // single-writer election in the Stop hook is reachable and safe. The caller
+  // (silent-end-interrupt-stop.mjs) MUST NOT self-exit a capture in that case;
+  // doing so creates a third, uncoordinated delivery path that re-sends a
+  // trailing recap of the reply as a second message (the #3510 double-send).
+  const replyAlreadyDeliveredThisTurn = lastDeliverIdx !== -1
+  const deliveredBlock = replyAlreadyDeliveredThisTurn ? blocks[lastDeliverIdx] : null
+  const deliveredReplySha256 =
+    deliveredBlock != null && typeof deliveredBlock.text === 'string'
+      ? createHash('sha256').update(deliveredBlock.text, 'utf8').digest('hex')
+      : null
   const trailing = blocks
     .slice(lastDeliverIdx + 1)
     .filter((b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0)
@@ -995,5 +1011,7 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     anchorContent: anchor.anchorContent,
     originChatId: origin.chatId,
     originThreadId: origin.threadId,
+    replyAlreadyDeliveredThisTurn,
+    deliveredReplySha256,
   }
 }
