@@ -40,6 +40,7 @@
  */
 
 import { isReplyTool, isDraftOfReply } from './narrative-dedup.js'
+import { isStructuralNarration } from './hooks/narration-classify.mjs'
 
 /**
  * Time-box for the parked-narrative early-paint (the kernel's home for the
@@ -70,6 +71,18 @@ export interface NarrativeFlushEffects {
    * Caller removes it from the feed. No-op-safe if already gone.
    */
   retractShown(text: string): void
+  /**
+   * #3513 (correction 4): durably mark a block that has surfaced ONLY on the
+   * ephemeral card as structural narration, so the out-of-process turn-end
+   * backstops (E3 captured-prose bridge, E4 outbox sweep) refuse to re-emit it
+   * as a real chat message. Called ONLY from the mid-turn SHOW paths (`stage`,
+   * `resolveOnTool`), where the block is provably followed by more content
+   * (another text block / a tool_use) and is therefore structural narration —
+   * NEVER from `onTimerFire` (the timer paints the LAST/terminal block, which
+   * could still be the genuine unsent answer) nor from `flushAtTurnEnd`. The
+   * effect is optional; callers without a durable ledger omit it.
+   */
+  markDurableNarration?(text: string): void
 }
 
 /** Arms / disarms the real early-paint timer. Injected so tests can fake it. */
@@ -113,6 +126,10 @@ export class NarrativeFlushController {
     this.scheduler.disarm()
     if (this.pending != null) {
       this.effects.show(this.pending)
+      // The just-shown block is provably followed by MORE narration text (this
+      // new block is its lookahead) → structural narration. Mark it durably so
+      // the turn-end backstops never re-deliver it (#3513, correction 4).
+      this.markShown(this.pending)
     }
     this.pending = text
     this.scheduler.arm(() => this.onTimerFire(), this.flushMs)
@@ -146,6 +163,10 @@ export class NarrativeFlushController {
     this.pending = null
     if (replyText != null && isDraftOfReply(pending, replyText)) return // draft → SUPPRESS
     this.effects.show(pending)
+    // The just-shown block is provably followed by a tool_use (this lookahead) →
+    // structural narration. Mark it durably so the turn-end backstops never
+    // re-deliver it as a real chat message (#3513, correction 4).
+    this.markShown(pending)
   }
 
   /**
@@ -168,6 +189,20 @@ export class NarrativeFlushController {
     this.scheduler.disarm()
     this.pending = null
     this.timerShown = null
+  }
+
+  /**
+   * Durably mark a card-only block as narration — but ONLY when it is
+   * structurally narration under the shared classifier (substance-gated:
+   * `isNarrationBlock || < SUBSTANTIVE_MIN_CHARS`). This is the belt-and-braces
+   * guard: a substantive real message that happens to precede a non-delivering
+   * tool (react / pin / typing) is NOT marked, so it can still be delivered by a
+   * backstop if it was the genuine unsent answer (#3513, corrections 3 & 4).
+   */
+  private markShown(text: string): void {
+    if (this.effects.markDurableNarration == null) return
+    if (!isStructuralNarration(text, true)) return
+    this.effects.markDurableNarration(text)
   }
 
   /** Retract the timer-painted block iff this reply is its draft-then-send. */

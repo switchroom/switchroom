@@ -19,6 +19,12 @@
  * and can be set to `0` / `false` / `off` to disable without a rebuild.
  */
 
+import {
+  isNarrationBlock,
+  isStructuralNarration,
+  SUBSTANTIVE_MIN_CHARS,
+} from './hooks/narration-classify.mjs'
+
 const SILENT_MARKERS = new Set(['NO_REPLY', 'HEARTBEAT_OK'])
 // Small buffer so `NO_REPLY.` with a stray period still counts as silent.
 const SILENT_MARKER_MAX_LEN = Math.max(
@@ -134,7 +140,7 @@ export function endsWithSilentMarker(text: string | undefined): boolean {
  * `hooks/silent-end-scan.mjs` — the same bar the codebase uses everywhere to
  * recognise "this text block is a real answer, not a short narration/closer".
  */
-export const FLUSH_SUBSTANTIVE_MIN_CHARS = 200
+export const FLUSH_SUBSTANTIVE_MIN_CHARS = SUBSTANTIVE_MIN_CHARS
 
 /**
  * Pick the text a turn-flush should actually DELIVER from the captured
@@ -203,9 +209,33 @@ export function selectFlushDeliveryText(
     .map((b, i) => ({ text: b.trim(), followedByToolUse: followedByToolUse?.[i] }))
     .filter(c => c.text.length > 0)
   if (candidates.length === 0) return ''
-  if (candidates.length === 1) return candidates[0].text
-  const answer = candidates[candidates.length - 1].text
-  const preceding = candidates.slice(0, -1)
+
+  // #3513 — the STRUCTURAL rule now applies to the TERMINAL block too, not only
+  // preceding blocks. A lone trailing block that a `tool_use` FOLLOWED (the
+  // model kept acting after writing it) is intra-turn narration by construction,
+  // never the terminal answer — so it must not be delivered as one. This is the
+  // primary fix for the observed leak ("Now checking the gateway logs…"),
+  // wording-independent where the opener regex fails. It stays substance-gated
+  // (correction 3): only a SHORT or narration-shaped block that a tool followed
+  // is suppressed — a SUBSTANTIVE, non-narration block followed by a
+  // non-delivering tool (react / pin / typing / edit) is NOT structural
+  // narration and still delivers.
+  //
+  // Only the STRUCTURAL signal (`followedByToolUse === true`) may strip the
+  // terminal block; the opener/trailer heuristic remains a residual tie-breaker
+  // for PRECEDING blocks only, so a provenance-less single block still delivers
+  // verbatim (#3276 finding 7 — a colon-terminated line that IS the whole answer
+  // is never dropped).
+  let cs = candidates
+  while (cs.length > 1 && isStructuralNarration(cs[cs.length - 1].text, cs[cs.length - 1].followedByToolUse)) {
+    cs = cs.slice(0, -1)
+  }
+  if (cs.length === 1) {
+    return isStructuralNarration(cs[0].text, cs[0].followedByToolUse) ? '' : cs[0].text
+  }
+
+  const answer = cs[cs.length - 1].text
+  const preceding = cs.slice(0, -1)
   // Deliver only the terminal answer when every earlier block is
   // intent-narration. Per block:
   //   - structural flag TRUE ⇒ a tool_use followed this block, but that alone
@@ -228,50 +258,15 @@ export function selectFlushDeliveryText(
         ? false
         : isNarrationBlock(c.text),
   )
-  return allNarration ? answer : candidates.map(c => c.text).join('\n\n')
+  return allNarration ? answer : cs.map(c => c.text).join('\n\n')
 }
 
-/**
- * Narration heuristic: a block that opens with a first-person "about to do X"
- * phrase the model emits BEFORE composing its real answer ("Let me check…",
- * "I'll look it up…", "Now let me…"). Deliberately NOT length-based — the
- * narration that shadowed the real answer in the observed bug was a LONG
- * (≥200-char) "Let me pull the numbers…" block, and short blocks are frequently
- * legitimate multi-paragraph answer content — so gating on length either drops a
- * short real answer or keeps a long narration. When earlier blocks don't match
- * this opener we keep the full joined text (never drop content we can't
- * confidently attribute to narration).
- */
-const NARRATION_OPENER =
-  /^(let me\b|lemme\b|i'?ll\b|i will\b|i am going to\b|i'?m going to\b|i'?m about to\b|going to\b|first,?\s+(?:let me|i'?ll|i will)\b|now,?\s+(?:let me|i'?ll|i will)\b|next,?\s+(?:let me|i'?ll|i will)\b|let'?s\b)/i
-
-/**
- * #3276 guard 8 — the `NARRATION_OPENER` regex alone misses common progress
- * narration that opens with a gerund/present-continuous verb and trails off
- * into an ellipsis or colon: "Checking now…", "Pulling the numbers:",
- * "Looking into that…". Relying on the opener regex leaked those blocks into
- * the delivered answer. This recognises a NON-terminal narration line
- * deterministically, WITHOUT re-gating on a min-char floor (a short real
- * answer like "Yes, done." must still deliver): a single short line that ends
- * with an ellipsis or a colon is progress narration, not the terminal answer.
- *
- * Kept conservative on purpose — only a SINGLE-line block (no internal
- * paragraph) under the substantive floor, ending in `…` / `...` / `:`, so a
- * genuine multi-paragraph answer that happens to end a paragraph with a colon
- * is never mistaken for narration.
- */
-const NARRATION_TRAILER = /(?:\.{3}|…|:)\s*$/
-
-function isTrailingNarrationLine(block: string): boolean {
-  const t = block.trim()
-  if (t.length === 0 || t.length >= FLUSH_SUBSTANTIVE_MIN_CHARS) return false
-  if (t.includes('\n')) return false
-  return NARRATION_TRAILER.test(t)
-}
-
-function isNarrationBlock(block: string): boolean {
-  return NARRATION_OPENER.test(block.trimStart()) || isTrailingNarrationLine(block)
-}
+// The narration heuristic (`isNarrationBlock` / openers / trailer) and the
+// structural rule (`isStructuralNarration`) now live in the ONE shared
+// classifier `hooks/narration-classify.mjs`, imported at the top of this file
+// and by the unbundled Stop hook (`hooks/silent-end-scan.mjs`) alike — so the
+// TS gateway side and the `.mjs` side can never drift (switchroom#3513
+// correction 2; retires the old "MUST stay in sync" hand-synced copies).
 
 export type FlushDecision =
   | { kind: 'flush'; text: string }

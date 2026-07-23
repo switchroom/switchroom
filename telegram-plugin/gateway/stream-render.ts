@@ -64,6 +64,7 @@ import { recordTurnEnd, recordTurnStart } from '../registry/turns-schema.js'
 import { retryWithThreadFallback } from '../retry-api-call.js'
 import { richMessage } from '../rich-send.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
+import { isShownBlock } from '../shown-ledger.js'
 import { CAPTURED_PROSE_MIN_CHARS, clearSilentEndState, decideCapturedProseDelivery, recordUndeliveredTurnEnd, silentEndFallbackText, writeSilentEndState } from '../silent-end.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
@@ -2012,14 +2013,21 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           const proseMinChars =
             !turn.replyCalled && gatewayCapturedEmpty ? 1 : CAPTURED_PROSE_MIN_CHARS
           const proseDecision = CAPTURED_PROSE_DELIVERY_ENABLED
-            ? decideCapturedProseDelivery({
-                turnKey: tKey,
-                // Per-turn nonce (#3228 Finding 3) — the persisted record must
-                // belong to THIS turn, not a stale carryover from a prior turn
-                // on the same chat/thread (tKey is not per-turn unique).
-                turnId: turn.turnId,
-                minChars: proseMinChars,
-              })
+            ? decideCapturedProseDelivery(
+                {
+                  turnKey: tKey,
+                  // Per-turn nonce (#3228 Finding 3) — the persisted record must
+                  // belong to THIS turn, not a stale carryover from a prior turn
+                  // on the same chat/thread (tKey is not per-turn unique).
+                  turnId: turn.turnId,
+                  minChars: proseMinChars,
+                },
+                {
+                  // #3513 (correction 1): refuse to bridge a block already
+                  // surfaced on the ephemeral card for this turn (shown-ledger).
+                  isBlockShown: (nonce, text) => isShownBlock(nonce ?? null, text),
+                },
+              )
             : { deliver: false as const, reason: 'no-state' as const }
           if (proseDecision.deliver && proseDecision.text != null) {
             // Deliver the recovered answer directly. This runs async and owns

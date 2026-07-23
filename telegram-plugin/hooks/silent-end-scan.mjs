@@ -58,12 +58,17 @@
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
+import {
+  isNarrationBlock,
+  isStructuralNarration,
+  SUBSTANTIVE_MIN_CHARS,
+} from './narration-classify.mjs'
 
 const REPLY_TOOLS = new Set([
   'mcp__switchroom-telegram__reply',
   'mcp__switchroom-telegram__stream_reply',
 ])
-const FINAL_ANSWER_MIN_CHARS = 200
+const FINAL_ANSWER_MIN_CHARS = SUBSTANTIVE_MIN_CHARS
 // Match the gateway's silent-marker classifier (gateway.ts:6692 — the
 // `isSilentFlushMarker` helper accepts trailing punctuation + case
 // variants like "NO_REPLY." / "no_reply").
@@ -101,29 +106,13 @@ export function endsWithSilentMarker(text) {
   return SILENT_MARKER_RE.test(lines[lines.length - 1])
 }
 
-// ── Narration heuristics — ported from `turn-flush-safety.ts:198-274` ──
-//
-// Kept byte-parallel with `selectFlushDeliveryText` / `isNarrationBlock` so
-// the JOINED multi-block prose the scan persists as `pendingText` (for the
-// capture-divergence corner) matches what the gateway flush would itself have
-// delivered. The scan has no structural `followedByToolUse` provenance, so it
-// uses the opener/trailer heuristic fallback (the same branch the TS side
-// takes when the flag is absent). MUST stay in sync with the TS source; a
-// drift only affects the rare capture-empty corner, never the primary flush.
-const NARRATION_OPENER =
-  /^(let me\b|lemme\b|i'?ll\b|i will\b|i am going to\b|i'?m going to\b|i'?m about to\b|going to\b|first,?\s+(?:let me|i'?ll|i will)\b|now,?\s+(?:let me|i'?ll|i will)\b|next,?\s+(?:let me|i'?ll|i will)\b|let'?s\b)/i
-const NARRATION_TRAILER = /(?:\.{3}|…|:)\s*$/
-
-function isTrailingNarrationLine(block) {
-  const t = block.trim()
-  if (t.length === 0 || t.length >= FINAL_ANSWER_MIN_CHARS) return false
-  if (t.includes('\n')) return false
-  return NARRATION_TRAILER.test(t)
-}
-
-function isNarrationBlock(block) {
-  return NARRATION_OPENER.test(block.trimStart()) || isTrailingNarrationLine(block)
-}
+// The narration heuristic (`isNarrationBlock`) and the STRUCTURAL rule
+// (`isStructuralNarration`) live in the ONE shared classifier
+// `./narration-classify.mjs`, imported at the top. Before switchroom#3513 this
+// `.mjs` carried a byte-parallel COPY of the TS heuristic with a "MUST stay in
+// sync" comment — the exact hand-synced drift that let intent-narration leak.
+// Both the bundled gateway TS (`turn-flush-safety.ts`) and this unbundled hook
+// now import the same module, so a single edit governs every classifier.
 
 /**
  * Choose the prose the captured-prose bridge should deliver from the trailing
@@ -403,7 +392,8 @@ export function scanTurnForFinalReply(jsonl) {
     if (obj?.type !== 'assistant') continue
     const content = obj?.message?.content
     if (!Array.isArray(content)) continue
-    for (const c of content) {
+    for (let ci = 0; ci < content.length; ci++) {
+      const c = content[ci]
       if (c?.type === 'text') {
         // Plain assistant text carve-out (#2053): a turn that ends with
         // a trailing bare NO_REPLY / HEARTBEAT_OK line — emitted as
@@ -428,10 +418,19 @@ export function scanTurnForFinalReply(jsonl) {
           // bridge): when this turn ends up blocked, the joined undelivered
           // text becomes `pendingText` so the gateway can deliver the model's
           // real answer directly. Trimmed per-block; joined below.
+          //
+          // #3513: also carry the STRUCTURAL provenance `followedByToolUse`
+          // (mirrors the gateway's `capturedBlockMeta` / `!lastInMessage`): a
+          // `tool_use` later in this SAME assistant message means the model
+          // kept acting after writing this text → intra-turn narration, never
+          // the terminal answer. Computed here so the `.mjs` scans apply the
+          // same primary rule as the TS flush (no more provenance-less blind
+          // spot on the out-of-process bridge/sweep paths).
           blocks.push({
             kind: 'text',
             chars: String(c.text ?? '').trim().length,
             text: String(c.text ?? '').trim(),
+            followedByToolUse: content.slice(ci + 1).some((x) => x?.type === 'tool_use'),
           })
         }
         continue
@@ -478,8 +477,15 @@ export function scanTurnForFinalReply(jsonl) {
     }
   }
   const undeliveredSlice = blocks.slice(lastAllowBlockIdx + 1)
+  // #3513: a trailing text block that a `tool_use` FOLLOWED (in its message) is
+  // structural intra-turn narration, never the terminal answer — so it must not
+  // trigger the interim-ack re-prompt/bridge (`trailing-text-after-reply`) nor
+  // be selected as deliverable prose. Substance-gated (correction 3): a
+  // substantive, non-narration trailing block is NOT structural narration and
+  // still counts as an undelivered answer.
+  const isStructuralNarr = (b) => isStructuralNarration(b.text, b.followedByToolUse)
   const sawUndeliveredTextAfterAllow = undeliveredSlice
-    .some((b) => b.kind === 'text' && (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS)
+    .some((b) => b.kind === 'text' && (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS && !isStructuralNarr(b))
 
   // Option A transcript-prose bridge: isolate the undelivered final-answer
   // prose so the gateway can deliver it directly.
@@ -500,15 +506,24 @@ export function scanTurnForFinalReply(jsonl) {
     (b) =>
       b.kind === 'text' &&
       typeof b.text === 'string' &&
-      (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS,
+      (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS &&
+      !isStructuralNarr(b),
   )
   const pendingText =
     substantiveBlocks.length > 0
       ? substantiveBlocks[substantiveBlocks.length - 1].text
       : undefined
+  // #3513: the deliverable-prose selection drops structural-narration trailing
+  // blocks so the capture-divergence bridge never delivers a lone narration
+  // line. `hasTrailingProse` INTENTIONALLY still counts any non-empty trailing
+  // prose (narration included): in the zero-reply case it gates the single-writer
+  // election to ALLOW the stop (`flush-will-deliver`) rather than BLOCK+nag — the
+  // flush then suppresses the narration structurally, so the turn ends silently
+  // (no leak, no nag loop). Only the DELIVERED text is narrowed.
   const trailingTextBlocks = undeliveredSlice.filter(
     (b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0,
   )
+  const deliverableTrailingBlocks = trailingTextBlocks.filter((b) => !isStructuralNarr(b))
   const hasTrailingProse = trailingTextBlocks.length > 0
   // Capture-divergence bridge (#duplicate-message fix): in the ZERO-reply
   // case, persist the last trailing block even when no single block clears
@@ -531,7 +546,7 @@ export function scanTurnForFinalReply(jsonl) {
   // joined prose (with the lowered `minChars`) instead of dropping. The #3228
   // Finding 2 guard is preserved: a pure narration run still yields undefined.
   const zeroReplyPendingText =
-    pendingText ?? selectBridgePendingText(trailingTextBlocks.map((b) => b.text))
+    pendingText ?? selectBridgePendingText(deliverableTrailingBlocks.map((b) => b.text))
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
@@ -911,7 +926,11 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     if (obj?.type !== 'assistant') continue
     const content = obj?.message?.content
     if (!Array.isArray(content)) continue
-    for (const c of content) {
+    for (let ci = 0; ci < content.length; ci++) {
+      const c = content[ci]
+      // #3513: a `tool_use` later in this SAME assistant message means the model
+      // kept acting after this text → structural intra-turn narration.
+      const followedByToolUse = content.slice(ci + 1).some((x) => x?.type === 'tool_use')
       if (c?.type === 'text') {
         const raw = String(c.text ?? '')
         // H6: strip a trailing bare marker; if substantive non-narration prose
@@ -928,10 +947,10 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
           // last-delivery cursor past that prose and mask it (multi-block H6).
           // A bare/narration marker is simply not a delivery — push nothing.
           if (prose.length > 0 && !isNarrationBlock(prose)) {
-            blocks.push({ kind: 'text', chars: prose.length, text: prose })
+            blocks.push({ kind: 'text', chars: prose.length, text: prose, followedByToolUse })
           }
         } else if (prose.length > 0) {
-          blocks.push({ kind: 'text', chars: prose.length, text: prose })
+          blocks.push({ kind: 'text', chars: prose.length, text: prose, followedByToolUse })
         }
         continue
       }
@@ -991,6 +1010,11 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const trailing = blocks
     .slice(lastDeliverIdx + 1)
     .filter((b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0)
+    // #3513: drop structural-narration trailing blocks (a `tool_use` followed
+    // them → intra-turn narration, never the terminal answer) so the durable
+    // outbox never captures a lone narration line for the sweep to deliver.
+    // Substance-gated: a substantive non-narration block is kept.
+    .filter((b) => !isStructuralNarration(b.text, b.followedByToolUse))
     .map((b) => b.text)
 
   const text = selectBridgePendingText(trailing)

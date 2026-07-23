@@ -378,6 +378,7 @@ export type OutboxSweepAction =
   | 'skip-quiet'
   | 'skip-dedup'
   | 'skip-unroutable'
+  | 'skip-ephemeral-shown'
 
 export interface OutboxSweepDecision {
   action: OutboxSweepAction
@@ -408,6 +409,18 @@ export function decideOutboxSweep(input: {
   routePrefix?: string
   quietMs?: number
   maxAgeMs?: number
+  /**
+   * #3513 (correction 1): was this record's text marked ephemeral-shown on the
+   * progress card for its turnNonce (the durable shown-ledger)? A hit means the
+   * block was already assigned to the ephemeral surface — the single-surface
+   * invariant forbids ANY delivery machine, including this out-of-process late
+   * sweep, from ALSO delivering it to chat. The ledger only ever contains
+   * STRUCTURAL narration (correction 4: never a possibly-terminal answer), so
+   * this can never suppress a genuine answer. Checked here (in the backstop
+   * decision itself) rather than only at a send seam, because the sweep bypasses
+   * `normalizeOutboundBody` (it sends via `bot.api.sendMessage` directly).
+   */
+  shownLedgerHit?: boolean
 }): OutboxSweepDecision {
   const {
     record,
@@ -418,8 +431,10 @@ export function decideOutboxSweep(input: {
     routePrefix = '',
     quietMs = OUTBOX_QUIET_MS,
     maxAgeMs = OUTBOX_MAX_AGE_MS,
+    shownLedgerHit = false,
   } = input
   if (deliveredNonces.has(record.turnNonce)) return { action: 'skip-journaled' }
+  if (shownLedgerHit) return { action: 'skip-ephemeral-shown' }
   const age = now - record.createdAt
   if (age < quietMs) return { action: 'skip-quiet' }
   if (textAlreadyDelivered) return { action: 'skip-dedup' }

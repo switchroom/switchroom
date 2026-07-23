@@ -42,6 +42,7 @@ import {
   sha256Hex,
   type OutboxRecord,
 } from '../outbox.js'
+import { isShownBlock } from '../shown-ledger.js'
 import { resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { createRetryApiCall, retryWithThreadFallback } from '../retry-api-call.js'
 
@@ -115,11 +116,32 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
       routable: resolved != null,
       routePrefix,
       quietMs: deps.quietMs ?? OUTBOX_QUIET_MS,
+      // #3513: suppress a record whose text was already surfaced on the ephemeral
+      // progress card for this turn (durable shown-ledger). The invariant forbids
+      // a second, out-of-process delivery of an ephemeral-shown block.
+      shownLedgerHit: isShownBlock(record.turnNonce, record.text, deps.stateDir),
     })
 
     if (decision.action !== 'send' && decision.action !== 'send-delayed') {
       summary.skipped++
-      if (decision.action === 'skip-journaled') {
+      if (decision.action === 'skip-ephemeral-shown') {
+        // Ephemeral-shown (#3513): the block already lives on the progress card.
+        // Journal the nonce and drop the record so the sweep never re-scans it
+        // and a racing machine also skips — same terminal bookkeeping as a dedup
+        // hit, but the reason is "assigned to the ephemeral surface".
+        appendDelivered(
+          {
+            turnNonce: record.turnNonce,
+            textSha256: record.textSha256,
+            ts: now,
+            deliverySource: 'sweep',
+            replyAlreadyDeliveredThisTurn: record.replyAlreadyDeliveredThisTurn === true,
+          },
+          deps.stateDir,
+        )
+        clearOutboxRecord(record.turnNonce, deps.stateDir)
+        log(`outbox-sweep: suppressed ephemeral-shown nonce=${record.turnNonce}\n`)
+      } else if (decision.action === 'skip-journaled') {
         // Already delivered under this nonce by another machine → drop the
         // pending record. clearOutboxRecord unlinks the `.json` (the pending
         // file) AND any `.sending` — the pre-fix `removeClaimed` only unlinked

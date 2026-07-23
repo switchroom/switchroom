@@ -49,6 +49,7 @@
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrative-flush.js'
 import { richMessage } from '../rich-send.js'
+import { appendShownBlock } from '../shown-ledger.js'
 import {
   appendActivityLabel, clipNarrative, formatStepSuffix, renderActivityFeedWithNested,
 } from '../tool-activity-summary.js'
@@ -186,6 +187,16 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
       {
         show: (text) => showNarrativeStep(turn, text),
         retractShown: (text) => retractNarrativeLine(turn, text),
+        // #3513 (correction 4): persist the ephemeral-shown mark keyed by the
+        // per-turn nonce so the out-of-process backstops (E3/E4) refuse to
+        // re-deliver this card-only narration. Envelope-bearing turns only —
+        // `turnId` is null for handback/background/cron, where the structural
+        // rule in the shared classifier is the sole guard (should-fix noted in
+        // shown-ledger.ts). Skip when null.
+        markDurableNarration: (text) => {
+          if (turn.turnId == null) return
+          appendShownBlock(turn.turnId, text)
+        },
       },
       {
         arm: (fn, ms) => {
