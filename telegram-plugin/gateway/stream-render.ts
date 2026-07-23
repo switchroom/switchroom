@@ -56,6 +56,7 @@
 import { createAnswerStream } from '../answer-stream.js'
 import { LivenessTracker, isContextExhaustionText } from '../context-exhaustion.js'
 import { normalizeOutboundBody } from './outbound-send-path.js'
+import { resolveEnvTimezone } from '../shared/local-time.js'
 import { hasOutboundDeliveredSince, recordOutbound } from '../history.js'
 import { isReplyTool } from '../narrative-dedup.js'
 import { NarrativeFlushController } from '../narrative-flush.js'
@@ -1544,6 +1545,10 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           flushDecision.text,
           'turn_flush',
           redactOutboundText,
+          // #3501 temporal pass — a cron/mail-watcher notification that skipped
+          // reply is delivered here, so this is where "closed tomorrow (Thu 23
+          // Jul)" gets corrected against the agent's local date.
+          { tz: resolveEnvTimezone(), nowMs: Date.now() },
         )
         let capturedText = _flushNorm.text
         if (_flushNorm.voiceReplaced > 0) {

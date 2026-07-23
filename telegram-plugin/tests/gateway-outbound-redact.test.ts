@@ -53,7 +53,7 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     // delegates via `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`
     // — the injected redactor still runs at entry, before the stderr preview.
     const start = sendPathSrc.indexOf('export async function sendReply(')
-    const redactIdx = sendPathSrc.indexOf(`normalizeOutboundBody(rawText, 'reply', redactOutboundText)`, start)
+    const redactIdx = sendPathSrc.indexOf(`normalizeOutboundBody(rawText, 'reply', redactOutboundText`, start)
     const previewIdx = sendPathSrc.indexOf('reply: invoked chatId=', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)

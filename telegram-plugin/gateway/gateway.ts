@@ -13302,22 +13302,18 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // Single rich-markdown path (#2669): `format:'text'` edits as a literal
   // plain string; everything else edits via the rich-markdown path.
   const editLiteralText = editFormat === 'text'
-  // #3501: route through the single shared outbound seam instead of the former
-  // hand-mirrored inline pipeline. `normalizeOutboundBody` runs the same order
-  // as the reply path (repair → paragraph-break → redact → punctuation/bold →
-  // voice scrub); the edit path's two deviations are expressed as options:
-  //   - literalText: a `format:'text'` edit lands byte-for-byte, so it skips
-  //     paragraph normalization + punctuation/bold/spacers (only repair, the
-  //     secret redact, and the voice scrub still run).
-  //   - addSpacers: the rich edit path folds the idempotent U+00A0 paragraph
-  //     spacer INTO the formatting step (the rich GFM renderer renders `\n\n`
-  //     tight; the spacer restores a visible gap without double-spacing).
-  const _editNorm = normalizeOutboundBody(
-    args.text as string,
-    'edit_message',
-    redactOutboundText,
-    { literalText: editLiteralText, addSpacers: !editLiteralText },
-  )
+  // #3501: route through the single shared outbound seam (repair → paragraph-
+  // break → redact → punctuation/bold → temporal → voice scrub) instead of the
+  // former hand-mirrored inline pipeline. The edit path's deviations are options:
+  // literalText skips paragraph/punctuation/bold/spacers + temporal (a literal
+  // edit lands byte-for-byte); addSpacers folds the idempotent U+00A0 paragraph
+  // spacer into the rich formatting step. tz/nowMs drive the temporal pass.
+  const _editNorm = normalizeOutboundBody(args.text as string, 'edit_message', redactOutboundText, {
+    literalText: editLiteralText,
+    addSpacers: !editLiteralText,
+    tz: resolveEnvTimezone(),
+    nowMs: Date.now(),
+  })
   let editRawText = _editNorm.text
   if (_editNorm.voiceReplaced > 0) {
     emitRuntimeMetric({
