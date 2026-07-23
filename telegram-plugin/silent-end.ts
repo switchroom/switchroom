@@ -86,6 +86,17 @@ export interface SilentEndDeps {
   hasOutboundDeliveredSince?: (chatId: string, sinceMs: number, threadId?: number | null) => boolean
   /** Wall-clock now, ms. Defaults to `Date.now`; injectable for tests. */
   now?: () => number
+  /**
+   * #3513 (correction 1): was `text` marked ephemeral-shown on the progress card
+   * for `turnNonce` (the durable shown-ledger)? Injected so the captured-prose
+   * bridge (E3) — which sends via `bot.api.sendMessage` directly, bypassing
+   * `normalizeOutboundBody` — refuses to deliver a block that was already
+   * assigned to the ephemeral surface. The ledger only ever holds STRUCTURAL
+   * narration (correction 4: never a possibly-terminal answer), so this can
+   * never suppress a genuine answer. Omitted → the check is skipped (the
+   * structural classifier remains the guard).
+   */
+  isBlockShown?: (turnNonce: string | null | undefined, text: string) => boolean
 }
 
 /**
@@ -306,6 +317,7 @@ export interface CapturedProseDecision {
     | 'turnkey-mismatch'
     | 'turnid-mismatch'
     | 'no-substantive-prose'
+    | 'ephemeral-shown'
 }
 
 /**
@@ -352,6 +364,14 @@ export function decideCapturedProseDelivery(
   }
   const text = typeof state.pendingText === 'string' ? state.pendingText : ''
   if (text.trim().length < minChars) return { deliver: false, reason: 'no-substantive-prose' }
+  // #3513: the persisted prose was already surfaced on the ephemeral progress
+  // card for this turn (durable shown-ledger) — the single-surface invariant
+  // forbids the bridge from ALSO delivering it to chat. The ledger only holds
+  // structural narration (never a possibly-terminal answer), so this can never
+  // suppress a genuine answer.
+  if (deps?.isBlockShown?.(state.turnId, text) === true) {
+    return { deliver: false, reason: 'ephemeral-shown' }
+  }
   return { deliver: true, text, reason: 'captured-prose' }
 }
 

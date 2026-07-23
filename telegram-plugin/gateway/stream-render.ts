@@ -64,6 +64,7 @@ import { recordTurnEnd, recordTurnStart } from '../registry/turns-schema.js'
 import { retryWithThreadFallback } from '../retry-api-call.js'
 import { richMessage } from '../rich-send.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
+import { isShownBlock } from '../shown-ledger.js'
 import { CAPTURED_PROSE_MIN_CHARS, clearSilentEndState, decideCapturedProseDelivery, recordUndeliveredTurnEnd, silentEndFallbackText, writeSilentEndState } from '../silent-end.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
@@ -826,6 +827,20 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // negation is the draft-then-send narration signal the turn-flush strip
         // uses (`selectFlushDeliveryText`) to keep a real answer intact instead
         // of truncating a paragraph that merely opens with "Let me explain…".
+        //
+        // NOTE (naming/approximation, #3515 review nit): downstream this value is
+        // consumed as `followedByToolUse`, but `!ev.lastInMessage` is a CONSERVATIVE
+        // APPROXIMATION of that predicate, not an exact match. It is true when the
+        // block is not the last block in its assistant message OR when a tool_use
+        // follows it in the same turn — i.e. it can over-flag: a block that is
+        // genuinely last-in-message may still be marked true. Over-approximation is
+        // SAFE here by construction: a `true` flag only ever makes a block a
+        // candidate for structural-narration suppression (selectFlushDeliveryText /
+        // isStructuralNarration), so the worst case is suppressing MORE narration —
+        // it can never promote an answer into the drop path. A real terminal answer
+        // is protected independently (it is never followed by a tool and survives
+        // the strip). Do not "tighten" this to the exact predicate expecting a
+        // behavioural change: the runtime value is deliberately conservative.
         turn.capturedBlockMeta.push(!ev.lastInMessage)
         // Narrative-dedup gate step 1 (JSONL-text-narrative primitive):
         // stage this text block for one lookahead step. If a previous block
@@ -2012,14 +2027,21 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           const proseMinChars =
             !turn.replyCalled && gatewayCapturedEmpty ? 1 : CAPTURED_PROSE_MIN_CHARS
           const proseDecision = CAPTURED_PROSE_DELIVERY_ENABLED
-            ? decideCapturedProseDelivery({
-                turnKey: tKey,
-                // Per-turn nonce (#3228 Finding 3) — the persisted record must
-                // belong to THIS turn, not a stale carryover from a prior turn
-                // on the same chat/thread (tKey is not per-turn unique).
-                turnId: turn.turnId,
-                minChars: proseMinChars,
-              })
+            ? decideCapturedProseDelivery(
+                {
+                  turnKey: tKey,
+                  // Per-turn nonce (#3228 Finding 3) — the persisted record must
+                  // belong to THIS turn, not a stale carryover from a prior turn
+                  // on the same chat/thread (tKey is not per-turn unique).
+                  turnId: turn.turnId,
+                  minChars: proseMinChars,
+                },
+                {
+                  // #3513 (correction 1): refuse to bridge a block already
+                  // surfaced on the ephemeral card for this turn (shown-ledger).
+                  isBlockShown: (nonce, text) => isShownBlock(nonce ?? null, text),
+                },
+              )
             : { deliver: false as const, reason: 'no-state' as const }
           if (proseDecision.deliver && proseDecision.text != null) {
             // Deliver the recovered answer directly. This runs async and owns
