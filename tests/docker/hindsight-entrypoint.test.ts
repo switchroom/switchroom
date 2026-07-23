@@ -19,6 +19,9 @@ import {
   existsSync,
   chmodSync,
   writeFileSync,
+  mkdirSync,
+  accessSync,
+  constants as fsConstants,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -509,6 +512,208 @@ describe("hindsight-entrypoint.sh (#1245)", () => {
       try { child.kill("SIGKILL"); } catch { /* ignore */ }
     }
   }, 10_000);
+
+  // ── Corrupt-index self-heal (incident 2026-07-22) ──────────────────────
+  //
+  // The 3-day consolidation freeze: a corrupt pk_async_operations btree made
+  // the reaper's reset UPDATE throw `duplicate key ... pk_async_operations`,
+  // and the OLD reaper piped that into `2>/dev/null) || return 0` — silently
+  // no-oping with no alarm and no heal, so stuck 'processing' ops were never
+  // reset and every affected bank deadlocked. These tests drive the reaper
+  // with a FAKE psql that reproduces the corrupt-index scenario and assert
+  // the OUTCOME: a loud alarm + REINDEX self-heal + successful retry. They
+  // FAIL against the old swallow-and-return behavior (no alarm/heal ever
+  // emitted), so they actually pin the bug, not just the code path.
+
+  /**
+   * Return an EXEC-capable temp dir. Some sandboxes mount os.tmpdir() noexec,
+   * which would make `[ -x fake_psql ]` false and no-op the reaper; fall back
+   * to a repo-local cache dir. CI's tmpdir is exec, so it uses that.
+   */
+  function execTmpDir(prefix: string): string {
+    const bases = [
+      tmpdir(),
+      resolve(__dirname, "..", "..", "node_modules", ".cache"),
+    ];
+    for (const base of bases) {
+      try {
+        mkdirSync(base, { recursive: true });
+        const d = mkdtempSync(join(base, prefix));
+        const probe = join(d, "probe.sh");
+        writeFileSync(probe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        accessSync(probe, fsConstants.X_OK);
+        return d;
+      } catch {
+        /* try next base */
+      }
+    }
+    throw new Error("no exec-capable tmp base for fake-psql");
+  }
+
+  /** Write a fake `psql` into an exec-capable dir; return that bin dir. */
+  function installFakePsql(stateDir: string): string {
+    const binDir = execTmpDir("swr-fakebin-");
+    mkdirSync(stateDir, { recursive: true });
+    const psql = join(binDir, "psql");
+    writeFileSync(
+      psql,
+      `#!/bin/sh
+# Fake psql for hindsight reaper/maintenance outcome tests.
+sql=""; prev=""
+for a in "$@"; do
+  case "$prev" in -c|-tAc) sql="$a" ;; esac
+  prev="$a"
+done
+[ -n "\${FAKE_PSQL_LOG:-}" ] && printf '%s\\n' "$sql" >> "$FAKE_PSQL_LOG"
+mode="\${FAKE_PSQL_MODE:-healthy}"
+state="\${FAKE_PSQL_STATE:-/tmp}"
+case "$sql" in
+  "SELECT 1") echo 1; exit 0 ;;
+  "CREATE EXTENSION"*) exit 0 ;;
+  "REINDEX INDEX"*) echo REINDEX; touch "$state/reindexed" 2>/dev/null; exit 0 ;;
+  *bt_index_check*)
+    if [ "$mode" = corrupt ]; then
+      echo 'ERROR:  heap tuple (172,11) lacks matching index tuple within index "pk_async_operations"' >&2
+      exit 1
+    fi
+    exit 0 ;;
+  *"count(*)"*"status='processing'"*)
+    if [ "$mode" = corrupt ] || [ "$mode" = stuck ]; then echo 4; else echo 0; fi
+    exit 0 ;;
+  "UPDATE async_operations SET status='pending'"*)
+    if [ "$mode" = corrupt ] && [ ! -f "$state/reindexed" ]; then
+      echo 'ERROR:  duplicate key value violates unique constraint "pk_async_operations"' >&2
+      echo 'DETAIL:  Key (operation_id)=(6cade4c3) already exists.' >&2
+      exit 1
+    fi
+    echo 'UPDATE 3'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    return binDir;
+  }
+
+  function writePgInstance(path: string): void {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        username: "hindsight",
+        database: "hindsight",
+        port: 5432,
+        password: "testpw",
+      }),
+    );
+  }
+
+  it("reaper self-heals a corrupt pk_async_operations index: alarms LOUDLY, REINDEXes, and retries the reset (incident 2026-07-22)", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const stateDir = join(dir, "fakestate");
+    const sqlLog = join(dir, "psql-sql.log");
+    const pgInstance = join(dir, "instance.json");
+    const binDir = installFakePsql(stateDir);
+    writePgInstance(pgInstance);
+
+    const child = spawn("sh", [ENTRYPOINT, "sleep", "6"], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        SWITCHROOM_AUTH_BROKER_SOCKET: socketPath,
+        SWITCHROOM_HINDSIGHT_CRED_DIR: credDir,
+        SWITCHROOM_HINDSIGHT_WAIT_S: "5",
+        SWITCHROOM_HINDSIGHT_REFRESH_S: "1",
+        SWITCHROOM_HINDSIGHT_FETCHER: FETCHER,
+        SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+        SWITCHROOM_HINDSIGHT_REAP_STALE_S: "1800",
+        FAKE_PSQL_MODE: "corrupt",
+        FAKE_PSQL_STATE: stateDir,
+        FAKE_PSQL_LOG: sqlLog,
+      },
+    });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    try {
+      await new Promise((r) => setTimeout(r, 3000));
+      // 1. It ALARMED (never silently swallowed) on the failed reset.
+      expect(stderr).toMatch(/ERROR: hindsight-reaper reset_failed/);
+      // 2. It recognized the corrupt-index signature and self-healed.
+      expect(stderr).toMatch(/reindex_selfheal=attempting/);
+      expect(stderr).toMatch(/reindex_selfheal=ok/);
+      // 3. The retry after REINDEX actually reset the stuck ops.
+      expect(stderr).toMatch(/stale-claim reaper reset 3 stuck 'processing' op/);
+      expect(stderr).toMatch(/reindex_selfheal=recovered/);
+      // 4. The SQL trace proves the sequence: reset -> REINDEX -> reset.
+      const log = readFileSync(sqlLog, "utf-8").trim().split("\n");
+      const firstReset = log.findIndex((l) => /^UPDATE async_operations SET status='pending'/.test(l));
+      const reindex = log.findIndex((l) => /^REINDEX INDEX .*pk_async_operations/.test(l));
+      const retry = log.findIndex(
+        (l, i) => i > reindex && /^UPDATE async_operations SET status='pending'/.test(l),
+      );
+      expect(firstReset).toBeGreaterThanOrEqual(0);
+      expect(reindex).toBeGreaterThan(firstReset);
+      expect(retry).toBeGreaterThan(reindex);
+      // The reset is bounded + concurrency-safe (never steal a live claim).
+      expect(log.some((l) => /FOR UPDATE SKIP LOCKED LIMIT/.test(l))).toBe(true);
+    } finally {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  it("reaper does NOT alarm or REINDEX when the reset succeeds (no false positives)", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const stateDir = join(dir, "fakestate");
+    const sqlLog = join(dir, "psql-sql.log");
+    const pgInstance = join(dir, "instance.json");
+    const binDir = installFakePsql(stateDir);
+    writePgInstance(pgInstance);
+
+    const child = spawn("sh", [ENTRYPOINT, "sleep", "5"], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        SWITCHROOM_AUTH_BROKER_SOCKET: socketPath,
+        SWITCHROOM_HINDSIGHT_CRED_DIR: credDir,
+        SWITCHROOM_HINDSIGHT_WAIT_S: "5",
+        SWITCHROOM_HINDSIGHT_REFRESH_S: "1",
+        SWITCHROOM_HINDSIGHT_FETCHER: FETCHER,
+        SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+        FAKE_PSQL_MODE: "healthy",
+        FAKE_PSQL_STATE: stateDir,
+        FAKE_PSQL_LOG: sqlLog,
+      },
+    });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    try {
+      await new Promise((r) => setTimeout(r, 2500));
+      expect(stderr).toMatch(/stale-claim reaper reset 3 stuck/);
+      expect(stderr).not.toMatch(/reset_failed/);
+      expect(stderr).not.toMatch(/reindex_selfheal/);
+      const log = readFileSync(sqlLog, "utf-8");
+      expect(log).not.toMatch(/REINDEX INDEX/);
+    } finally {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it("reaper reset is bounded + concurrency-safe and never swallows the failure (static guard)", () => {
+    const raw = readFileSync(ENTRYPOINT, "utf-8");
+    // Bounded batch + skip rows a live worker holds (never steal a claim).
+    expect(raw).toMatch(/FOR UPDATE SKIP LOCKED LIMIT \$\{REAP_BATCH_LIMIT\}/);
+    // The old silent-swallow shape MUST be gone: no reset psql piped into
+    // `2>/dev/null) ... || return 0`. The reset now captures stderr (2>&1)
+    // and branches on failure with a loud ERROR.
+    expect(raw).not.toMatch(/UPDATE async_operations SET status='pending'[\s\S]{0,400}2>\/dev\/null\)"\s*\|\|\s*return 0/);
+    expect(raw).toMatch(/ERROR: hindsight-reaper reset_failed/);
+    // Self-heal is gated (alarm-only when disabled) and keyed on the exact
+    // corrupt-index signature, not any failure.
+    expect(raw).toMatch(/REINDEX_SELFHEAL/);
+    expect(raw).toMatch(/grep -q 'pk_async_operations'/);
+    expect(raw).toMatch(/REINDEX INDEX CONCURRENTLY pk_async_operations/);
+  });
 
   it("Dockerfile pins UID 11000 to match HINDSIGHT_DEFAULT_UID", () => {
     // The broker chowns the per-consumer socket to consumer.uid (mode 0600).
