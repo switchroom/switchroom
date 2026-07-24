@@ -30,19 +30,39 @@ import {
   handleRichMessageMessage,
   extractRichMessageText,
   RICH_MESSAGE_EMPTY_TEXT,
+  type RichMessageHandlerDeps,
 } from '../gateway/rich-message-handler.js'
-import type { MediaEnvelopeDeps } from '../gateway/media-message-handlers.js'
-import { parseForwardOrigin, buildForwardOriginMeta } from '../gateway/forward-origin.js'
+import { createInboundCoalescer, inboundCoalesceKey } from '../gateway/inbound-coalesce.js'
+import {
+  parseForwardOrigin,
+  dedupeForwardOrigins,
+  buildForwardOriginMeta,
+  type ForwardOriginInfo,
+} from '../gateway/forward-origin.js'
 
 const UNHANDLED_PLACEHOLDER_RE = /^\(unhandled message content: /
 
 interface Delivered {
   via: string
   text: string
+  /** Deduped forward origins of the (possibly coalesced) turn — mirrors the
+   * production merge (gateway.ts CoalescePayload.forwardOrigins). */
+  origins: ForwardOriginInfo[]
+}
+
+const COALESCE_GAP_MS = 10
+
+/** Wait past the coalesce window so any buffered burst flushes. */
+function settle(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, COALESCE_GAP_MS * 4))
 }
 
 /** Wire a real grammy Bot in the gateway's registration order: message:text,
- * message:rich_message (real production handler), terminal catch-all LAST. */
+ * message:rich_message (real production handler), terminal catch-all LAST.
+ * ALL body-content lanes dispatch through a REAL inbound coalescer wired the
+ * same way gateway.ts wires production (per-entry forward-origin parsed at
+ * enqueue, texts joined by '\n', origins deduped in merge) — so the tests
+ * assert the DELIVERED turn(s), coalescing included. */
 function buildHarness() {
   const delivered: Delivered[] = []
   const logLines: string[] = []
@@ -59,23 +79,44 @@ function buildHarness() {
     has_main_web_app: false,
   }
 
-  bot.on('message:text', async ctx => {
-    delivered.push({ via: 'text', text: ctx.message.text })
-  })
-  const richDeps: MediaEnvelopeDeps = {
-    handleInbound: async (_ctx, text) => {
-      delivered.push({ via: 'rich_message', text })
+  type Entry = { via: string; text: string; forwardOrigin?: ForwardOriginInfo }
+  const coalescer = createInboundCoalescer<Entry & { origins?: ForwardOriginInfo[] }>({
+    gapMs: COALESCE_GAP_MS,
+    merge: entries => ({
+      via: entries[entries.length - 1].via,
+      text: entries.map(e => e.text).filter(t => t.length > 0).join('\n'),
+      origins: dedupeForwardOrigins(entries.map(e => e.forwardOrigin)),
+    }),
+    onFlush: (_key, merged) => {
+      delivered.push({ via: merged.via, text: merged.text, origins: merged.origins ?? [] })
     },
-    handleAckOnly: async () => {},
-    handleRefusal: async () => {},
+  })
+  // Mirrors gateway.ts handleInboundCoalesced enqueue: key on
+  // (chat, thread, user); parse THIS entry's forward_origin at enqueue time.
+  const dispatchCoalesced = async (via: string, ctx: Context, text: string): Promise<void> => {
+    const key = inboundCoalesceKey(
+      String(ctx.chat!.id),
+      ctx.message?.message_thread_id,
+      String(ctx.from!.id),
+    )
+    coalescer.enqueue(key, {
+      via,
+      text,
+      forwardOrigin: parseForwardOrigin(ctx.message?.forward_origin),
+    })
+  }
+
+  bot.on('message:text', async ctx => {
+    await dispatchCoalesced('text', ctx, ctx.message.text)
+  })
+  const richDeps: RichMessageHandlerDeps = {
+    dispatchInbound: (ctx, text) => dispatchCoalesced('rich_message', ctx, text),
     log: line => logLines.push(line),
   }
   bot.on('message:rich_message', ctx => handleRichMessageMessage(ctx, richDeps))
   installUnhandledMessageCatchAll(
     bot,
-    async (_ctx: Context, text: string) => {
-      delivered.push({ via: 'catch-all', text })
-    },
+    (ctx: Context, text: string) => dispatchCoalesced('catch-all', ctx, text),
     line => logLines.push(line),
   )
   return { bot, delivered, logLines }
@@ -84,12 +125,17 @@ function buildHarness() {
 /** The forwarded-bot-message shape observed live (update_id=417526125):
  * forward_origin (modern) + legacy forward_from/forward_date siblings +
  * rich_message content, NO top-level text/caption. */
-function makeForwardedRichUpdate(update_id: number, blocks: unknown[]): Update {
-  const originUser = { id: 8500000001, is_bot: true, first_name: 'Klanker', username: 'meken_klanker_bot' }
+function makeForwardedRichUpdate(
+  update_id: number,
+  blocks: unknown[],
+  opts?: { message_id?: number; originUser?: { id: number; is_bot: boolean; first_name: string; username?: string } },
+): Update {
+  const originUser = opts?.originUser
+    ?? { id: 8500000001, is_bot: true, first_name: 'Klanker', username: 'meken_klanker_bot' }
   return {
     update_id,
     message: {
-      message_id: 944,
+      message_id: opts?.message_id ?? 944,
       chat: { id: -1004223464247, type: 'supergroup', title: 'ProductOS', is_forum: true },
       from: { id: 777, is_bot: false, first_name: 'Ken' },
       date: 1784837003,
@@ -118,6 +164,7 @@ describe('forwarded rich (bot) message — the row-944 regression oracle', () =>
   it('delivers the REAL forwarded body — not the unhandled placeholder, not empty', async () => {
     const { bot, delivered } = buildHarness()
     await bot.handleUpdate(makeForwardedRichUpdate(417526125, TOKEN_LIST_BLOCKS))
+    await settle()
 
     expect(delivered).toHaveLength(1)
     const turn = delivered[0]
@@ -135,6 +182,7 @@ describe('forwarded rich (bot) message — the row-944 regression oracle', () =>
     const { bot, delivered } = buildHarness()
     const update = makeForwardedRichUpdate(417526126, TOKEN_LIST_BLOCKS)
     await bot.handleUpdate(update)
+    await settle()
 
     // The same server-stamped forward_origin the enqueue path parses
     // (gateway.ts → parseForwardOrigin → buildForwardOriginMeta → meta attrs).
@@ -155,15 +203,19 @@ describe('forwarded rich (bot) message — the row-944 regression oracle', () =>
     await bot.handleUpdate(
       makeForwardedRichUpdate(417526127, [{ type: 'divider' }, { type: 'anchor', name: 'top' }]),
     )
+    await settle()
     expect(delivered).toHaveLength(1)
-    // Divider renders as ---; a fully empty tree gets the honest fallback.
+    // A divider/anchor-only tree has no readable content — the NAMED empty
+    // fallback, not a bare `---` body and not the mislabeled placeholder.
     expect(delivered[0].via).toBe('rich_message')
+    expect(delivered[0].text).toBe(RICH_MESSAGE_EMPTY_TEXT)
     expect(delivered[0].text).not.toMatch(UNHANDLED_PLACEHOLDER_RE)
   })
 
   it('a truly empty rich message delivers the named fallback, never the mislabeled placeholder', async () => {
     const { bot, delivered } = buildHarness()
     await bot.handleUpdate(makeForwardedRichUpdate(417526128, []))
+    await settle()
     expect(delivered).toHaveLength(1)
     expect(delivered[0].text).toBe(RICH_MESSAGE_EMPTY_TEXT)
   })
@@ -181,8 +233,81 @@ describe('forwarded rich (bot) message — the row-944 regression oracle', () =>
       },
     } as unknown as Update
     await bot.handleUpdate(update)
+    await settle()
+    expect(delivered).toHaveLength(1)
     expect(delivered[0].text).toContain('Release plan')
     expect(delivered[0].text).toContain('Ship Friday.')
+  })
+
+  it('a BURST of forwarded bot messages coalesces into ONE turn with all bodies + per-message origins', async () => {
+    // The primary fixed use case: the user forwards SEVERAL bot messages at
+    // once. Pre-N1 the rich handler dispatched each update as its own turn;
+    // through the coalesced lane the burst folds into ONE delivered turn.
+    const { bot, delivered } = buildHarness()
+    const otherBot = { id: 8500000002, is_bot: true, first_name: 'Carrie', username: 'carrie_bot' }
+    await bot.handleUpdate(makeForwardedRichUpdate(417526130, [{ type: 'paragraph', text: 'first forwarded body' }], { message_id: 960 }))
+    await bot.handleUpdate(makeForwardedRichUpdate(417526131, [{ type: 'paragraph', text: 'second forwarded body' }], { message_id: 961 }))
+    await bot.handleUpdate(makeForwardedRichUpdate(417526132, [{ type: 'paragraph', text: 'third forwarded body' }], { message_id: 962, originUser: otherBot }))
+    await settle()
+
+    // ONE coalesced turn — not three.
+    expect(delivered).toHaveLength(1)
+    const turn = delivered[0]
+    // All three bodies, arrival order.
+    expect(turn.text).toBe('first forwarded body\nsecond forwarded body\nthird forwarded body')
+    expect(turn.text).not.toMatch(UNHANDLED_PLACEHOLDER_RE)
+    // Per-message origins survive, deduped: two messages from Klanker
+    // collapse to one origin entry; Carrie keeps her own sibling.
+    const meta = buildForwardOriginMeta(turn.origins)
+    expect(meta.forwarded_from).toBe('Klanker (@meken_klanker_bot)')
+    expect(meta.forwarded_from_2).toBe('Carrie (@carrie_bot)')
+    expect(meta.forwarded_from_3).toBeUndefined()
+  })
+
+  it('a mixed burst (forwarded rich + plain text) also coalesces into one turn', async () => {
+    const { bot, delivered } = buildHarness()
+    await bot.handleUpdate(makeForwardedRichUpdate(417526133, [{ type: 'paragraph', text: 'the forwarded plan' }], { message_id: 970 }))
+    // Same (chat, user) as the forwarded update so the coalesce keys match.
+    const textUpdate = makeMessageUpdate({
+      text: 'thoughts on this?',
+      update_id: 417526134,
+      chat: { id: -1004223464247, type: 'supergroup', title: 'ProductOS' },
+      from: { id: 777, is_bot: false, first_name: 'Ken' },
+    })
+    await bot.handleUpdate(textUpdate)
+    await settle()
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0].text).toBe('the forwarded plan\nthoughts on this?')
+  })
+
+  it('a dispatch failure PROPAGATES to the gateway error funnel — never a silent local swallow', async () => {
+    // N2: the handler must not eat a dispatch throw with only a local log
+    // line. Same contract as message:text (no local catch): the error
+    // reaches grammy's bot.catch, the gateway's single handler-error funnel.
+    const bot = new Bot('12345:TEST_TOKEN_NOT_REAL')
+    bot.botInfo = {
+      id: 999, is_bot: true, first_name: 'TestBot', username: 'test_bot',
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business: false,
+      has_main_web_app: false,
+    }
+    const richDeps: RichMessageHandlerDeps = {
+      dispatchInbound: async () => { throw new Error('dispatch pipeline down') },
+      log: () => {},
+    }
+    bot.on('message:rich_message', ctx => handleRichMessageMessage(ctx, richDeps))
+    // grammy wraps a middleware throw in BotError and (under polling) routes
+    // it to bot.catch — the gateway's single handler-error funnel. From
+    // handleUpdate the same BotError surfaces as a rejection: assert the
+    // original error rides it out instead of dying in a local catch.
+    let caught: unknown
+    try {
+      await bot.handleUpdate(makeForwardedRichUpdate(417526135, TOKEN_LIST_BLOCKS))
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeDefined()
+    expect((caught as { error: Error }).error.message).toBe('dispatch pipeline down')
   })
 })
 
@@ -199,6 +324,7 @@ describe('working shapes stay unchanged (no regression on existing forwards)', (
       sender_user: { id: 424242, is_bot: false, first_name: 'Ken', last_name: 'Thompson' },
     }
     await bot.handleUpdate(update)
+    await settle()
 
     expect(delivered).toHaveLength(1)
     expect(delivered[0]).toMatchObject({ via: 'text', text: 'here is the brief I forwarded' })
@@ -213,6 +339,7 @@ describe('working shapes stay unchanged (no regression on existing forwards)', (
     const msg = (update as unknown as { message: Record<string, unknown> }).message
     msg.forward_origin = { type: 'hidden_user', date: 1_700_000_000, sender_user_name: 'Mystery Sender' }
     await bot.handleUpdate(update)
+    await settle()
 
     expect(delivered[0].text).toBe('anon tip: check the logs')
     const meta = buildForwardOriginMeta([parseForwardOrigin(msg.forward_origin as never)!])
@@ -251,7 +378,7 @@ describe('rich block rendering — deterministic text extraction', () => {
         },
         { type: 'pre', language: 'python', text: 'print(1)' },
         { type: 'blockquote', blocks: [{ type: 'paragraph', text: 'quoted line' }], credit: 'someone' },
-        { type: 'table', cells: [[{ text: 'A', align: 'left', valign: 'top' }, { text: 'B', align: 'left', valign: 'top' }]] },
+        { type: 'table', cells: [[{ text: 'A', align: 'left', valign: 'top' }, { text: 'B', align: 'left', valign: 'top' }]], caption: { text: 'quarterly numbers', credit: 'finance team' } },
         { type: 'photo', photo: [], caption: { text: 'the screenshot' } },
       ],
     })
@@ -262,6 +389,8 @@ describe('rich block rendering — deterministic text extraction', () => {
     expect(text).toContain('> quoted line')
     expect(text).toContain('> — someone')
     expect(text).toContain('A | B')
+    // N3: table caption goes through the caption renderer — credit survives.
+    expect(text).toContain('quarterly numbers — finance team')
     expect(text).toContain('[photo] the screenshot')
   })
 

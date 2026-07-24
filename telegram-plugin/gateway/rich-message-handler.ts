@@ -30,7 +30,25 @@
  */
 
 import type { Context, Filter } from 'grammy'
-import type { MediaEnvelopeDeps } from './media-message-handlers.js'
+
+/**
+ * Injected dispatch surface for the rich-message handler. Unlike the
+ * cluster-A media envelopes (which dispatch via `handleInbound` directly —
+ * they carry synthesized one-line envelopes, not user content bursts), a
+ * rich message is BODY content on the same lane as `message:text`, so it
+ * must flow through the same COALESCED chokepoint (`routeInbound` →
+ * `handleInboundCoalesced`). Forwarding several bot messages at once is the
+ * primary fixed use case: coalescing folds the burst into ONE agent turn
+ * with per-entry forward origins deduped downstream, exactly like a
+ * multi-forward of plain-text messages.
+ */
+export interface RichMessageHandlerDeps {
+  /** THE coalesced inbound dispatch — bind to the same `routeInbound(...)`
+   * call `message:text` and the terminal catch-all use. */
+  dispatchInbound: (ctx: Context, text: string) => Promise<void>
+  /** stderr log sink. */
+  log: (line: string) => void
+}
 
 /**
  * Delivered body when a rich message renders to nothing extractable (e.g. a
@@ -174,7 +192,9 @@ export function renderRichBlock(block: unknown, depth = 0): string {
         )
         .filter(s => s.length > 0)
         .join('\n')
-      const caption = renderRichText((b as { caption?: unknown }).caption, depth)
+      // Caption is a full RichBlockCaption ({text, credit}) — render via the
+      // caption renderer so a credited table keeps its credit line.
+      const caption = renderCaption(b.caption, depth)
       return [caption, rows].filter(s => s.length > 0).join('\n')
     }
     case 'map':
@@ -212,24 +232,41 @@ export function extractRichMessageText(rich: unknown): string | undefined {
   const rendered = renderBlocks(blocks, 0)
     .replace(/\n{3,}/g, '\n\n')
     .trim()
-  return rendered.length > 0 ? rendered : undefined
+  // Structural-only output (e.g. a divider-only composition rendering to
+  // bare `---`) carries no readable content — fall back to the NAMED empty
+  // placeholder (RICH_MESSAGE_EMPTY_TEXT at the caller) rather than
+  // delivering a lone horizontal rule as the message body.
+  const hasContent = rendered.split('\n').some(line => line.trim() !== '---' && line.trim().length > 0)
+  return hasContent ? rendered : undefined
 }
 
 /**
- * `message:rich_message` handler — same dispatch surface as the cluster-A
- * media-envelope handlers: renders the body and hands it to the normal
- * coalescing inbound pipeline (access gating + forward-origin parsing
- * downstream, identical to `message:text`).
+ * `message:rich_message` handler — renders the body and hands it to the
+ * COALESCED inbound pipeline (access gating + forward-origin parsing
+ * downstream), identical to `message:text`: a burst of N forwarded bot
+ * messages folds into ONE agent turn with deduped per-message origins.
+ *
+ * Error handling matches `message:text` (which has NO local catch): the
+ * render step is belt-and-braces guarded (it is already throw-proof by
+ * construction — see extractRichMessageText), but a DISPATCH failure
+ * propagates to grammy's `bot.catch` funnel like every other coalesced
+ * inbound, instead of being swallowed here with only a local log line.
+ * A throw therefore cannot silently vanish a forwarded message: it either
+ * delivers or surfaces through the gateway's single handler-error funnel.
  */
 export async function handleRichMessageMessage(
   ctx: Filter<Context, 'message:rich_message'>,
-  deps: MediaEnvelopeDeps,
+  deps: RichMessageHandlerDeps,
 ): Promise<void> {
+  let text: string
   try {
-    const text = extractRichMessageText(ctx.message.rich_message) ?? RICH_MESSAGE_EMPTY_TEXT
-    deps.log(`telegram gateway: inbound rich_message from chat=${ctx.chat?.id ?? '?'} chars=${text.length}\n`)
-    await deps.handleInbound(ctx, text, undefined)
+    text = extractRichMessageText(ctx.message.rich_message) ?? RICH_MESSAGE_EMPTY_TEXT
   } catch (err) {
-    deps.log(`telegram gateway: rich_message handler error: ${(err as Error).message}\n`)
+    // extractRichMessageText is designed never to throw; if a future edit
+    // breaks that, still deliver the named fallback rather than dropping.
+    deps.log(`telegram gateway: rich_message render error: ${(err as Error).message}\n`)
+    text = RICH_MESSAGE_EMPTY_TEXT
   }
+  deps.log(`telegram gateway: inbound rich_message from chat=${ctx.chat?.id ?? '?'} chars=${text.length}\n`)
+  await deps.dispatchInbound(ctx, text)
 }
