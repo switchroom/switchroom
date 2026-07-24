@@ -1,0 +1,141 @@
+# LiteLLM proxy config — repo-managed source of truth (KEN-125).
+#
+# Deploy path on the host (same Coolify service dir as the pacer,
+# see ../litellm-pacer/README.md):
+#
+#   host:      /data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml
+#   container: bind-mounted into the LiteLLM proxy container (Coolify compose)
+#
+# THE REPO COPY IS AUTHORITATIVE (same rule as docker/litellm-pacer):
+# change it here first (reviewed + tested + linted by
+# scripts/check-litellm-config-guard.mjs and src/litellm/repo-config.test.ts),
+# then the OPERATOR syncs it to the host and restarts the proxy service.
+# switchroom never mutates or restarts the live proxy.
+#
+# ── Invariants baked into this file ─────────────────────────────────────────
+#
+# I2 (OAuth-leak scoping): `forward_client_headers_to_llm_api: true` appears
+#   ONLY under Claude model groups in `model_group_settings`. NEVER set it
+#   globally under `litellm_settings` and NEVER on an `openrouter/*` or other
+#   non-Claude group — that forwards the subscription OAuth Authorization
+#   header to a third party. Enforced by scripts/check-litellm-config-guard.mjs
+#   (lint) and src/fleet-health/litellm-config-sensor.ts (on-host sensor).
+#
+# PASS-THROUGH IS SACRED (2026-07-05 incident): agent Claude traffic rides the
+#   URL-based /anthropic pass-through route (raw byte-forward), configured by
+#   `pass_through_endpoints`-free default behaviour of the proxy + the clients'
+#   ANTHROPIC_BASE_URL=<root>/anthropic. It is NOT part of model_list and no
+#   entry below may capture it. Do NOT point Claude agent traffic at the
+#   model-mapped /v1/messages route — LiteLLM re-chunks the stream there and
+#   long Opus responses stalled mid-stream ("Response stalled mid-stream").
+#   The Claude model groups below exist only for consumers that explicitly use
+#   the model-mapped route; agents keep pass-through.
+#
+# G8 (broker owns Claude failover): Claude groups use num_retries: 1 plus a
+#   fallbacks chain. The auth broker is the retry/failover authority for
+#   subscription accounts; LiteLLM-side retry churn (num_retries > 1 with no
+#   fallback) just re-hammers the same walled account.
+
+model_list:
+  # ── Claude (subscription, model-mapped route only — agents use /anthropic
+  #    pass-through and never hit these entries) ─────────────────────────────
+  # api_key is a placeholder: on the subscription path the client's OAuth
+  # Authorization header is forwarded (I1/I2); the proxy holds no Anthropic
+  # key of its own.
+  - model_name: claude-opus
+    litellm_params:
+      model: anthropic/claude-opus-4-1
+      api_key: "no-key-oauth-forwarded"
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: "no-key-oauth-forwarded"
+  - model_name: sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: "no-key-oauth-forwarded"
+
+  # ── Non-Claude models (OpenRouter cash account; metered per-consumer via
+  #    virtual keys). These are the Hindsight memory-op workhorses. ──────────
+  - model_name: gpt-oss-20b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-20b
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/openai/gpt-oss-20b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-20b
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/z-ai/glm-5.2
+    litellm_params:
+      model: openrouter/z-ai/glm-5.2
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/google/gemini-3.1-flash-lite
+    litellm_params:
+      model: openrouter/google/gemini-3.1-flash-lite
+      api_key: os.environ/OPENROUTER_API_KEY
+
+litellm_settings:
+  # Fleet-wide Anthropic pass-through pacer (docker/litellm-pacer — repo-managed).
+  callbacks: ["custom_pacing.pacer_instance"]
+  # NOTE: forward_client_headers_to_llm_api must NEVER appear here (global
+  # master switch = OAuth leak to every upstream). Scoped per-group below.
+
+router_settings:
+  # Non-Claude retries: transient OpenRouter 5xx/timeouts are worth one retry
+  # burst; anything worse falls through the chains below.
+  num_retries: 2
+  retry_after: 2 # seconds min backoff between retries
+  # Fallback chains. Non-Claude: G6 (OpenRouter credit exhaustion / model
+  # outage) degrades to a cheaper/alternate model instead of hard-failing the
+  # memory op. Claude: G8 recommended shape (broker owns account failover;
+  # this only reroutes on model-level errors).
+  fallbacks:
+    - gpt-oss-20b: ["openrouter/z-ai/glm-5.2", "openrouter/google/gemini-3.1-flash-lite"]
+    - openrouter/openai/gpt-oss-20b: ["openrouter/z-ai/glm-5.2", "openrouter/google/gemini-3.1-flash-lite"]
+    - openrouter/z-ai/glm-5.2: ["openrouter/google/gemini-3.1-flash-lite"]
+    - claude-opus: ["claude-sonnet"]
+
+model_group_settings:
+  # I2: the OAuth Authorization header is forwarded ONLY for these
+  # subscription-Claude groups. num_retries: 1 per G8 (broker owns failover).
+  claude-opus:
+    forward_client_headers_to_llm_api: true
+    num_retries: 1
+  claude-sonnet:
+    forward_client_headers_to_llm_api: true
+    num_retries: 1
+  sonnet:
+    forward_client_headers_to_llm_api: true
+    num_retries: 1
+  # Non-Claude groups: NO forward_client_headers_to_llm_api here, ever.
+  gpt-oss-20b:
+    num_retries: 2
+  openrouter/openai/gpt-oss-20b:
+    num_retries: 2
+  openrouter/z-ai/glm-5.2:
+    num_retries: 2
+  openrouter/google/gemini-3.1-flash-lite:
+    num_retries: 2
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  # Virtual keys / teams are provisioned by switchroom (src/litellm/provision.ts);
+  # keep proxy-side model storage off so this file stays the single source of
+  # model truth.
+  store_model_in_db: false
+
+# ── Caching (deliberately OFF) ────────────────────────────────────────────────
+# Response caching is intentionally not enabled: the dominant traffic is the
+# Anthropic pass-through (never cacheable here) and Hindsight memory ops,
+# where stale cached completions corrupt retain/reflect output. If enabled
+# later, use Redis and scope with `cache_params.supported_call_types` to
+# non-Claude completion only:
+#
+# litellm_settings:
+#   cache: true
+#   cache_params:
+#     type: redis
+#     host: os.environ/REDIS_HOST
+#     port: os.environ/REDIS_PORT
+#     supported_call_types: ["completion"]
