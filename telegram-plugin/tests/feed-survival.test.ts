@@ -191,12 +191,18 @@ describe('silence-poke — isLegitimatelyWorking callback (default-on defer)', (
     // When isLegitimatelyWorking is wired, it is consulted; the legacy flag
     // is not consulted for the new path. Verify by having callback=false and
     // inFlightTools non-empty — the fallback fires because the callback says "no".
+    // NOTE (#3519): the in-flight tool here must be a NON-Bash tool. A `Bash`
+    // arms the CLI-side background-bash defer (a foreground Bash the callback
+    // is blind to once it moves to the background), which intentionally holds
+    // the fallback back even when the callback returns false — so using Bash
+    // would exercise that new defer rather than the callback-supersedes-legacy
+    // path this test pins. `Grep` can never be a detached background process.
     const f = setupSilenceDeps({
       thresholds: { fallback: 300_000, fallbackHardCeiling: 900_000 },
       isLegitimatelyWorking: () => false,
     })
     startTurn('chat:0', 0)
-    noteToolStart('chat:0', 't1', 'Bash', 'audit', 10_000)
+    noteToolStart('chat:0', 't1', 'Grep', 'audit', 10_000)
     __tickForTests(300_000)
     // callback says false → no defer, fallback fires
     expect(f.fallbacks).toHaveLength(1)
