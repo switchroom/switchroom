@@ -156,6 +156,27 @@ describe("detectStampDrift", () => {
     expect(r.findings[0].detail).toContain("1.1.0");
   });
 
+  it("stamp with files:null (partial write) reads as no-stamp, never crashes", () => {
+    seedAgentDir();
+    writeFileSync(
+      join(dir, ".switchroom-generated.json"),
+      '{"version":1,"generatedAt":"2026-01-01T00:00:00Z","switchroomVersion":"1.0.0","configHash":"x","files":null}',
+    );
+    const r = detectStampDrift(dir, { currentVersion: "9.9.9" });
+    expect(r.hasStamp).toBe(false);
+    expect(r.findings).toEqual([]);
+    expect(readGenerationStamp(dir)).toBeNull();
+  });
+
+  it("stamp with files as an array reads as no-stamp", () => {
+    seedAgentDir();
+    writeFileSync(
+      join(dir, ".switchroom-generated.json"),
+      '{"version":1,"switchroomVersion":"1.0.0","configHash":"x","files":[]}',
+    );
+    expect(detectStampDrift(dir).hasStamp).toBe(false);
+  });
+
   it("corrupt stamp file reads as no-stamp, not drift", () => {
     seedAgentDir();
     writeFileSync(join(dir, ".switchroom-generated.json"), "not json");

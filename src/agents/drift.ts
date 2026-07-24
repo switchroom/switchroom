@@ -27,6 +27,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -46,11 +47,7 @@ import { isHindsightEnabled } from "../memory/hindsight.js";
 import { VERSION } from "../build-info.js";
 import { buildSettingsHooksBlock, detectHooksDrift } from "./scaffold.js";
 import { containerName } from "./lifecycle.js";
-import {
-  computeConfigHash,
-  detectStampDrift,
-  sha256Text,
-} from "./generation-stamp.js";
+import { computeConfigHash, detectStampDrift } from "./generation-stamp.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -91,6 +88,16 @@ export async function detectComposeDrift(opts: {
   }
   if (result.previous === null) return [];
   if (result.content === result.previous) return [];
+  // A deployed compose containing a `build:` block was rendered with
+  // `switchroom apply --build-local` (emitImageOrBuild emits `image:`
+  // in pull mode, `build:` in local mode — never both for the same
+  // service). A fresh default render here uses pull mode, so a byte
+  // compare would flag EVERY locally-built fleet as drifted forever.
+  // Not checkable from here → silently skip (false-positive avoidance
+  // beats coverage for a warn-only signal).
+  if (/^\s+build:\s*$/m.test(result.previous) || /^\s+build:\s+\S/m.test(result.previous)) {
+    return [];
+  }
   const imageNote =
     result.previousImageTag && result.previousImageTag !== result.imageTag
       ? ` (image ${result.previousImageTag} → ${result.imageTag})`
@@ -333,7 +340,13 @@ export function detectHookScriptDrift(
   }
   for (const f of names) {
     try {
-      expected.set(f, sha256Text(readFileSync(join(binDir, f), "utf-8")));
+      // Hash the RAW bytes — the container side is `sha256sum` (byte
+      // hash). A utf-8 decode/re-encode round-trip would corrupt any
+      // non-UTF8 byte and read as permanent phantom drift.
+      expected.set(
+        f,
+        createHash("sha256").update(readFileSync(join(binDir, f))).digest("hex"),
+      );
     } catch {
       /* unreadable local script — skip */
     }

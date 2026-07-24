@@ -5,6 +5,7 @@
  * none), matching the issue's acceptance criteria.
  */
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
@@ -67,6 +68,21 @@ describe("detectComposeDrift", () => {
   it("no deployed compose (apply never ran) → not drift", async () => {
     const r = await detectComposeDrift({
       compute: async () => ({ ...base, content: "x", previous: null, previousImageTag: null }),
+    });
+    expect(r).toEqual([]);
+  });
+
+  it("build-local deployed compose (contains build: blocks) → skipped, never drift", async () => {
+    // `switchroom apply --build-local` renders `build:` blocks instead of
+    // `image:` lines; the doctor-side fresh render is always pull-mode, so
+    // a byte compare would flag every locally-built fleet forever.
+    const r = await detectComposeDrift({
+      compute: async () => ({
+        ...base,
+        content: "services:\n  agent:\n    image: ghcr.io/x/switchroom-agent:v1\n",
+        previous:
+          "services:\n  agent:\n    build:\n      context: /home/op/switchroom\n      dockerfile: docker/Dockerfile.agent\n",
+      }),
     });
     expect(r).toEqual([]);
   });
@@ -227,6 +243,21 @@ describe("detectHookScriptDrift", () => {
     });
     expect(r).toHaveLength(1);
     expect(r[0].detail).toContain("timezone-hook.sh");
+  });
+
+  it("script with non-UTF8 bytes hashes raw (matches sha256sum) → no phantom drift", () => {
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir);
+    // 0xC3 alone is an invalid UTF-8 sequence — a utf-8 decode/re-encode
+    // round-trip would replace it and permanently mismatch sha256sum.
+    const bytes = Buffer.concat([Buffer.from("#!/bin/sh\n"), Buffer.from([0xc3, 0x28, 0x0a])]);
+    writeFileSync(join(binDir, "raw.sh"), bytes);
+    const byteHash = createHash("sha256").update(bytes).digest("hex");
+    const r = detectHookScriptDrift("bot", {
+      binDir,
+      execImpl: () => `${byteHash}  /opt/switchroom/bin/raw.sh\n`,
+    });
+    expect(r).toEqual([]);
   });
 
   it("container not running (docker exec throws) → not checkable, no findings", () => {

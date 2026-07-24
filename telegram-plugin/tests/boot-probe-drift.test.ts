@@ -73,6 +73,15 @@ describe('probeDrift', () => {
 
   it('host drift report findings surface on the row (with age when stale)', async () => {
     seedAndStamp()
+    // Backdate the stamp so the report post-dates the last apply (a
+    // report older than the stamp is legitimately suppressed — see the
+    // superseded-by-apply test below).
+    writeGenerationStamp(dir, {
+      generatedAt: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+      switchroomVersion: '1.0.0',
+      configHash: computeConfigHash({ model: 'opus' }),
+      files: computeStampFilesFromDisk(dir),
+    })
     const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString()
     writeFileSync(
       join(dir, '.switchroom-drift.json'),
@@ -90,6 +99,38 @@ describe('probeDrift', () => {
     expect(r.detail).toContain('compose')
     expect(r.detail).toContain('hook-scripts')
     expect(r.detail).toContain('ago') // stale-report age annotation
+  })
+
+  it('report older than the stamp (apply healed it) → ok, findings suppressed', async () => {
+    // Doctor found drift, then the operator ran `switchroom apply` — the
+    // reconcile rewrote the stamp but NOT the doctor report. A freshly
+    // applied fleet must be silent; the stale report is superseded.
+    writeFileSync(
+      join(dir, '.switchroom-drift.json'),
+      JSON.stringify({
+        version: 1,
+        generatedAt: new Date(Date.now() - 3_600_000).toISOString(),
+        findings: [{ surface: 'compose', detail: 'was drifted before apply' }],
+      }),
+    )
+    seedAndStamp() // stamp written AFTER the report
+    const r = await probeDrift(dir)
+    expect(r.status).toBe('ok')
+  })
+
+  it('report newer than the stamp still surfaces (drift found after apply)', async () => {
+    seedAndStamp()
+    writeFileSync(
+      join(dir, '.switchroom-drift.json'),
+      JSON.stringify({
+        version: 1,
+        generatedAt: new Date(Date.now() + 1000).toISOString(),
+        findings: [{ surface: 'hook-scripts', detail: 'image scripts stale' }],
+      }),
+    )
+    const r = await probeDrift(dir)
+    expect(r.status).toBe('degraded')
+    expect(r.detail).toContain('hook-scripts')
   })
 
   it('empty host report (doctor ran clean) → ok', async () => {

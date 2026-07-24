@@ -3287,9 +3287,20 @@ export function registerDoctorCommand(program: Command): void {
             // drift never changes doctor's exit code. Also persists the
             // per-agent .switchroom-drift.json the boot card reads.
             title: "Generated-surface drift (KEN-130)",
+            // Belt-and-braces: this warn-only advisory section must never
+            // crash the doctor run (that would change behavior for an
+            // otherwise-OK install) — degrade to a single skip row.
             results: await runGeneratedSurfaceDriftChecks(config, configPath, {
               fast: opts.fast,
-            }),
+            }).catch(
+              (err: unknown): CheckResult[] => [
+                {
+                  name: "generated surfaces",
+                  status: "skip",
+                  detail: `not checkable: ${(err as Error)?.message ?? String(err)}`,
+                },
+              ],
+            ),
           },
         ];
 

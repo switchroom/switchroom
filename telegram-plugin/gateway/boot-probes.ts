@@ -17,6 +17,16 @@ import { execFile as execFileCb } from 'child_process'
 import { promisify } from 'util'
 
 import { readQuotaCache, writeQuotaCache } from './quota-cache.js'
+// Static cross-boundary import (same pattern as model-command.ts /
+// auth-broker-client.ts — the plugin bundler resolves ../../src/*
+// statically). generation-stamp.ts is dependency-free by design, so
+// this drags nothing else in. A dynamic import here would silently
+// no-op if the bundler missed it, killing the probe in production
+// while unit tests (which run unbundled) stayed green.
+import {
+  detectStampDrift,
+  readGenerationStamp,
+} from '../../src/agents/generation-stamp.js'
 import { fetchQuota, formatQuotaLine, type QuotaResult } from '../quota-check.js'
 
 const execFile = promisify(execFileCb)
@@ -1523,16 +1533,18 @@ export async function probeDrift(
     const surfaces: string[] = []
 
     // 1. Stamp comparison (in-container checkable surfaces).
+    let stampGeneratedAtMs = NaN
     try {
-      const { detectStampDrift } = await import(
-        '../../src/agents/generation-stamp.js'
-      )
-      const stamp = detectStampDrift(agentDir)
-      for (const f of stamp.findings) {
+      const stampResult = detectStampDrift(agentDir)
+      for (const f of stampResult.findings) {
         surfaces.push(`${f.surface} (${f.detail})`)
       }
+      if (stampResult.hasStamp) {
+        const raw = readGenerationStamp(agentDir)
+        if (raw?.generatedAt) stampGeneratedAtMs = Date.parse(raw.generatedAt)
+      }
     } catch {
-      /* generation-stamp unavailable (unbundled build) — skip signal 1 */
+      /* unexpected fs failure — skip signal 1, never break the boot card */
     }
 
     // 2. Host-written doctor report.
@@ -1544,21 +1556,35 @@ export async function probeDrift(
         findings?: Array<{ surface?: string; detail?: string }>
       }
       if (report?.version === 1 && Array.isArray(report.findings)) {
-        const seen = new Set(surfaces.map((s) => s.split(' ')[0]))
-        let ageNote = ''
         const gen = report.generatedAt ? Date.parse(report.generatedAt) : NaN
-        if (Number.isFinite(gen)) {
-          const ageMs = (opts.nowMs?.() ?? Date.now()) - gen
-          if (ageMs > 3_600_000) {
-            const hours = Math.round(ageMs / 3_600_000)
-            const human = hours >= 48 ? `${Math.round(hours / 24)}d` : `${hours}h`
-            ageNote = ` — as of ${human} ago`
+        // A report OLDER than the generation stamp predates the last
+        // `switchroom apply` — that apply re-enforced every surface the
+        // report describes (compose rewrite + full reconcile), so its
+        // findings are stale. Without this guard a freshly-applied fleet
+        // keeps showing a degraded Drift row on every boot until the
+        // operator happens to rerun doctor (doctor rewrites the report;
+        // apply does not). Any still-real drift resurfaces on the next
+        // doctor run.
+        const supersededByApply =
+          Number.isFinite(stampGeneratedAtMs) &&
+          Number.isFinite(gen) &&
+          gen < stampGeneratedAtMs
+        if (!supersededByApply) {
+          const seen = new Set(surfaces.map((s) => s.split(' ')[0]))
+          let ageNote = ''
+          if (Number.isFinite(gen)) {
+            const ageMs = (opts.nowMs?.() ?? Date.now()) - gen
+            if (ageMs > 3_600_000) {
+              const hours = Math.round(ageMs / 3_600_000)
+              const human = hours >= 48 ? `${Math.round(hours / 24)}d` : `${hours}h`
+              ageNote = ` — as of ${human} ago`
+            }
           }
-        }
-        for (const f of report.findings) {
-          if (!f?.surface || seen.has(f.surface)) continue
-          seen.add(f.surface)
-          surfaces.push(`${f.surface}${ageNote}`)
+          for (const f of report.findings) {
+            if (!f?.surface || seen.has(f.surface)) continue
+            seen.add(f.surface)
+            surfaces.push(`${f.surface}${ageNote}`)
+          }
         }
       }
     } catch {

@@ -154,7 +154,16 @@ export function readGenerationStamp(agentDir: string): GenerationStamp | null {
   if (!existsSync(p)) return null;
   try {
     const parsed = JSON.parse(readFileSync(p, "utf-8")) as GenerationStamp;
-    if (parsed?.version !== 1 || typeof parsed.files !== "object") return null;
+    // `typeof null === "object"` — a stamp with `"files": null` (partial
+    // write / hand-edit) must read as no-stamp, not crash the comparer.
+    if (
+      parsed?.version !== 1 ||
+      typeof parsed.files !== "object" ||
+      parsed.files === null ||
+      Array.isArray(parsed.files)
+    ) {
+      return null;
+    }
     return parsed;
   } catch {
     return null;
