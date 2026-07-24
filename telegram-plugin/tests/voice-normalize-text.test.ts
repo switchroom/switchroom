@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'bun:test'
-import { normalizeForSpeech } from '../voice-normalize-text.js'
+import { normalizeForSpeech, decodeHtmlEntities } from '../voice-normalize-text.js'
 
 describe('normalizeForSpeech — reported markdown/symbol cases', () => {
   it('drops stray tildes (never spoken as "tilde")', () => {
@@ -252,5 +252,86 @@ describe('normalizeForSpeech — conservative, does not mangle real words', () =
   it('returns empty for empty/whitespace input', () => {
     expect(normalizeForSpeech('')).toBe('')
     expect(normalizeForSpeech('   \n  ')).toBe('')
+  })
+})
+
+describe('normalizeForSpeech — backslash escapes & HTML entities (voice trash)', () => {
+  it('strips a literal backslash-b (\\b) so it is never spoken as "backslash b"', () => {
+    // The exact operator report: the regex/escape "\b" was read as "slash b".
+    const out = normalizeForSpeech('the regex \\b word boundary')
+    expect(out).toBe('the regex b word boundary')
+    expect(out).not.toContain('\\')
+  })
+
+  it('unescapes MarkdownV2 punctuation escapes without leaving backslashes', () => {
+    expect(normalizeForSpeech('done\\. next\\! wait\\-')).toBe('done. next! wait-')
+    expect(normalizeForSpeech('a \\* b')).not.toContain('\\')
+  })
+
+  it('an escaped emphasis marker collapses to the inner word, not a backslash', () => {
+    expect(normalizeForSpeech('Use \\*literal\\* here')).toBe('Use literal here')
+  })
+
+  it('drops a Windows-path-style backslash run (C:\\build)', () => {
+    expect(normalizeForSpeech('path C:\\build\\out done')).toBe('path C:buildout done')
+  })
+
+  it('decodes HTML entities so &amp; / &lt; are not read as "amp" / "lt"', () => {
+    expect(normalizeForSpeech('Tom &amp; Jerry')).toBe('Tom and Jerry')
+    expect(normalizeForSpeech('5 &lt; 10 &gt; 3')).toBe('5 < 10 > 3')
+    expect(normalizeForSpeech('it&#39;s here')).toBe("it's here")
+  })
+
+  it('produces clean plain speech for a rich mixed reply (end-to-end)', () => {
+    const reply =
+      '**Bold** and `code\\b` and a [label](https://example.com/x) ' +
+      'with Tom &amp; Jerry and a regex \\b\\.'
+    const out = normalizeForSpeech(reply)
+    expect(out).not.toContain('\\')
+    expect(out).not.toContain('`')
+    expect(out).not.toContain('*')
+    expect(out).not.toContain('&amp;')
+    expect(out).not.toContain('example.com')
+    expect(out).toContain('label')
+    expect(out).toContain('Tom and Jerry')
+  })
+
+  it('is idempotent: a second pass finds no backslashes/entities to change', () => {
+    const reply = 'a \\b and Tom &amp; Jerry \\. end'
+    const once = normalizeForSpeech(reply)
+    expect(normalizeForSpeech(once)).toBe(once)
+  })
+})
+
+describe('normalizeForSpeech — review findings (fixpoint decode, metachar, nits)', () => {
+  it('L2 parity: a double-encoded entity decodes to a fixpoint (depth-independent)', () => {
+    // Single decode and double decode must land on the SAME spoken char so the
+    // immediate voice-out and the lazy Listen tap never diverge.
+    const single = normalizeForSpeech('&amp;amp;lt;')
+    const doubled = normalizeForSpeech(normalizeForSpeech('&amp;amp;lt;'))
+    expect(single).toBe('<')
+    expect(doubled).toBe('<')
+    expect(normalizeForSpeech('&amp;amp;amp;')).toBe('&')
+  })
+
+  it('L1: an entity that decodes to a line-leading metachar keeps a spoken form', () => {
+    // &#35; → '#'. Naively re-fed to the heading stripper it would vanish; the
+    // user escaped it on purpose, so it must survive as spoken "hash".
+    expect(normalizeForSpeech('&#35; Heading')).toBe('hash Heading')
+    expect(normalizeForSpeech('2 &#42; 3')).toBe('2 asterisk 3')
+  })
+
+  it('nit: a dangling trailing backslash is dropped, never spoken', () => {
+    expect(normalizeForSpeech('ends here\\')).toBe('ends here')
+    expect(normalizeForSpeech('ends here\\')).not.toContain('\\')
+  })
+
+  it('nit: &#92; decodes to a backslash which is then stripped (no trash)', () => {
+    expect(normalizeForSpeech('X&#92;Y')).toBe('XY')
+    expect(normalizeForSpeech('X&#92;Y')).not.toContain('\\')
+  })
+
+  it('fixpoint does not over-decode entity-less text (Q&A stays literal)', () => {
+    expect(decodeHtmlEntities('Q&A test')).toBe('Q&A test')
   })
 })

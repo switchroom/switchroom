@@ -38,6 +38,8 @@
  *     ~5 → "about 5", > blockquote markers dropped.
  */
 
+import { decodeHtmlEntities, stripBackslashEscapes } from './voice-normalize-text'
+
 const NULL = '\x00'
 const INLINE_PH = `${NULL}TN_INLINE`
 
@@ -196,6 +198,16 @@ export function normalizeForTts(text: string): string {
   if (!ttsNormalizeEnabled() || text.length === 0) return text
 
   let s = text.replace(/\r\n?/g, '\n')
+
+  // -- HTML entities → char, then backslash escapes → the escaped char. The
+  //    last line of defence at the /tts body build: the Listen lazy path and
+  //    the pre-synth queue can synthesize from cache entries that predate the
+  //    normalizeForSpeech coverage, so these must be stripped here too. Both
+  //    are idempotent — if normalizeForSpeech already ran there is nothing
+  //    left to decode/unescape. Without this the engine speaks `\b` as
+  //    "backslash b" and `&amp;` as "amp".
+  s = decodeHtmlEntities(s)
+  s = stripBackslashEscapes(s)
 
   // -- Code fences → spoken placeholder (before anything can see contents).
   s = s.replace(/(^|\n)[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, '$1code block omitted.')

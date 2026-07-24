@@ -53,6 +53,89 @@
 /** Replace a fenced code block with a spoken placeholder. */
 const CODE_BLOCK_PLACEHOLDER = 'code block omitted'
 
+/** Named HTML entities the reply text realistically carries. */
+const HTML_ENTITIES: Record<string, string> = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+}
+
+/**
+ * Markdown metacharacters that the block/emphasis/table stripper would
+ * silently consume at line-start or as a pair. When such a char arrives via
+ * an entity escape the user meant it LITERALLY (that is the whole point of
+ * escaping it), so instead of emitting the raw char — which the downstream
+ * stripper would then eat, losing the intent — we emit a neutral spoken form
+ * that survives every later pass. Deterministic; the spoken form contains no
+ * `&`/`;` so it can never re-enter the entity decoder.
+ */
+const METACHAR_SPOKEN: Record<string, string> = {
+  '#': ' hash ',
+  '*': ' asterisk ',
+  '_': ' underscore ',
+  '~': ' tilde ',
+  '`': ' backtick ',
+  '|': ' bar ',
+}
+
+/** One decode pass: named + numeric entities → char (or spoken metachar). */
+function decodeHtmlEntitiesOnce(input: string): string {
+  const toChar = (cp: number, raw: string): string => {
+    if (!(cp > 0 && cp <= 0x10ffff)) return raw
+    const ch = String.fromCodePoint(cp)
+    return METACHAR_SPOKEN[ch] ?? ch
+  }
+  return input
+    .replace(/&#x([0-9a-f]+);/gi, (m, hex: string) => toChar(parseInt(hex, 16), m))
+    .replace(/&#(\d+);/g, (m, dec: string) => toChar(Number(dec), m))
+    .replace(/&([a-z][a-z0-9]*);/gi, (m, name: string) => {
+      const ch = HTML_ENTITIES[name.toLowerCase()]
+      if (ch === undefined) return m
+      return METACHAR_SPOKEN[ch] ?? ch
+    })
+}
+
+/**
+ * Decode HTML entities (named + numeric) to their character so a TTS engine
+ * never reads `&amp;` as "amp". Unknown named entities are left untouched.
+ * Pure + deterministic.
+ *
+ * Iterates to a FIXPOINT: a double-encoded entity (`&amp;amp;lt;`) is decoded
+ * repeatedly until no entity remains, so this pass is depth-idempotent —
+ * applying it once yields the same result as applying it twice. That keeps
+ * every voice callsite in lockstep: the immediate voice-out path runs
+ * normalizeForSpeech THEN normalizeForTts, and the value the lazy Listen tap /
+ * pre-synth queue reads is itself already normalizeForSpeech'd before its own
+ * normalizeForTts — fixpoint decoding guarantees both speak an identical
+ * string regardless of how deep the original encoding was. The loop strictly
+ * shrinks the entity count each turn (and is capped) so it always terminates.
+ * Text WITHOUT a trailing `;` (e.g. `Q&A`) matches nothing and is returned
+ * untouched.
+ */
+export function decodeHtmlEntities(input: string): string {
+  let s = input
+  // A fully-decodable chain shrinks by at least one entity per pass; the cap
+  // is a belt-and-braces guard against any pathological crafted input.
+  for (let i = 0; i < 10; i++) {
+    const next = decodeHtmlEntitiesOnce(s)
+    if (next === s) break
+    s = next
+  }
+  return s
+}
+
+/**
+ * Remove markdown/MarkdownV2 backslash escapes so the spoken text carries no
+ * literal backslashes. A backslash before ANY single character is dropped,
+ * keeping the character (`\.` → ".", `\*` → "*", `\b` → "b"); a dangling
+ * trailing backslash is dropped. Pure + deterministic + idempotent (a second
+ * pass finds no backslashes). A real newline is preserved (only the escaping
+ * backslash is consumed).
+ */
+export function stripBackslashEscapes(input: string): string {
+  // `\X` → `X` for any following char (including an escaped `\\`), then drop
+  // any lone backslash the first pass left (an escaped backslash's survivor).
+  return input.replace(/\\([\s\S])/g, '$1').replace(/\\/g, '')
+}
+
 // ---------------------------------------------------------------------------
 // Number → words helpers (small, deterministic, English cardinal only).
 // Used by the numbers/units pass. Supports 0..999_999_999 which is far more
@@ -167,6 +250,23 @@ const ACRONYMS = new Set([
 export function normalizeForSpeech(input: string): string {
   if (!input) return ''
   let s = input.replace(/\r\n?/g, '\n')
+
+  // 0a. HTML entities → their character. The reply text can carry entity
+  //     escapes (`&amp;`, `&lt;`, `&#39;`) that a TTS engine would otherwise
+  //     read as "amp" / "lt" / a digit run. Decode BEFORE markdown/symbol
+  //     passes so the recovered char is then handled naturally (e.g. a
+  //     decoded `&` becomes "and" in the symbols pass).
+  s = decodeHtmlEntities(s)
+
+  // 0b. Backslash escapes → the escaped character. Telegram MarkdownV2 and
+  //     CommonMark escape literal punctuation with a leading backslash
+  //     (`\.`, `\-`, `\*`), and a backslash before a non-punctuation char
+  //     (`\b`) is a literal backslash. Left in place the engine speaks
+  //     "backslash b" / "slash b" — exactly the operator's "trash" report.
+  //     Unescaping here (before the emphasis pass) restores the literal text
+  //     so genuine `*emphasis*` markers are still stripped downstream while
+  //     an escaped `\*` collapses to nothing spoken. Runs once; idempotent.
+  s = stripBackslashEscapes(s)
 
   // 0. Emoji & pictographs → dropped entirely, then whitespace collapsed.
   //    TTS reads an emoji as its long CLDR name ("grinning face"), which is

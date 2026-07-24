@@ -4,6 +4,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { normalizeForTts, ttsNormalizeEnabled } from '../tts-normalize.js'
+import { normalizeForSpeech } from '../voice-normalize-text.js'
 
 const KILL = 'SWITCHROOM_DISABLE_TTS_NORMALIZE'
 
@@ -238,5 +239,70 @@ describe('conservatism', () => {
   test('deterministic: same input, same output', () => {
     const input = '## Hi\n**bold** $5.20 at 14:30 👍 https://github.com/a'
     expect(normalizeForTts(input)).toBe(normalizeForTts(input))
+  })
+})
+
+describe('normalizeForTts — backslash escapes & HTML entities (last-line defence)', () => {
+  test('strips a literal \\b so the engine never speaks "backslash b"', () => {
+    const out = normalizeForTts('the regex \\b boundary')
+    expect(out).toBe('the regex b boundary')
+    expect(out).not.toContain('\\')
+  })
+
+  test('unescapes MarkdownV2 punctuation escapes (\\. \\! \\-)', () => {
+    expect(normalizeForTts('done\\. next\\! wait\\-')).toBe('done. next! wait-')
+  })
+
+  test('decodes HTML entities (&amp; &lt; &#39;)', () => {
+    expect(normalizeForTts('Tom &amp; Jerry')).toBe('Tom and Jerry')
+    expect(normalizeForTts('5 &lt; 10')).toBe('5 < 10')
+    expect(normalizeForTts("it&#39;s here")).toBe("it's here")
+  })
+
+  test('rich mixed reply → clean spoken text (no backslash/backtick/entity)', () => {
+    const reply =
+      '**Bold** and `code\\b` and a [label](https://example.com/x) ' +
+      'with Tom &amp; Jerry and a regex \\b\\.'
+    const out = normalizeForTts(reply)
+    expect(out).not.toContain('\\')
+    expect(out).not.toContain('`')
+    expect(out).not.toContain('&amp;')
+    expect(out).toContain('label')
+    expect(out).toContain('Tom and Jerry')
+  })
+
+  test('kill switch still returns byte-identical input (escapes preserved)', () => {
+    process.env[KILL] = '1'
+    expect(normalizeForTts('a \\b &amp; b')).toBe('a \\b &amp; b')
+    delete process.env[KILL]
+  })
+
+  test('idempotent after normalizeForSpeech already unescaped', () => {
+    const reply = 'a \\b and Tom &amp; Jerry \\. end'
+    const once = normalizeForTts(reply)
+    expect(normalizeForTts(once)).toBe(once)
+  })
+})
+
+describe('normalizeForTts — review findings (fixpoint decode, metachar, nits)', () => {
+  test('L2 parity: immediate (speech+tts) and single-tts agree on a double-encoded entity', () => {
+    const x = '&amp;amp;lt;'
+    const immediate = normalizeForTts(normalizeForSpeech(x))
+    const singleTts = normalizeForTts(x)
+    expect(immediate).toBe('<')
+    expect(singleTts).toBe('<')
+    expect(immediate).toBe(singleTts)
+    expect(normalizeForTts('&amp;amp;amp;')).toBe('&')
+  })
+
+  test('L1: entity → line-leading metachar keeps a spoken form (hash/asterisk)', () => {
+    expect(normalizeForTts('&#35; Heading')).toBe('hash Heading')
+    expect(normalizeForTts('2 &#42; 3')).toBe('2 asterisk 3')
+  })
+
+  test('nit: dangling trailing backslash dropped; &#92; decodes then strips', () => {
+    expect(normalizeForTts('ends here\\')).toBe('ends here')
+    expect(normalizeForTts('X&#92;Y')).toBe('XY')
+    expect(normalizeForTts('X&#92;Y')).not.toContain('\\')
   })
 })
