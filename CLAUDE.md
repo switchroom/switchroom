@@ -143,13 +143,15 @@ Traps that bite repeatedly:
   `check-bot-api-wrapping` while tsc stays green. Run it locally and widen
   ranges in the same PR. New Telegram API calls go through
   `retryApiCall`/`robustApiCall`, not raw.
-- **`check-litellm-config-guard` SKIPS off-host** — the operator-maintained
-  LiteLLM config (default `/data/coolify/services/…/litellm-config.yaml`) is
-  absent in CI/dev, so the lint step is a near-vacuous belt. The load-bearing
-  I2 OAuth-leak enforcement is the fleet-health sensor
-  (`src/fleet-health/litellm-config-sensor.ts`), which runs where the file
-  lives and escalates a violation into the priority ledger. Point
-  `LITELLM_CONFIG_PATH` at a real config to exercise the lint locally.
+- **`check-litellm-config-guard` always checks the repo-managed config** —
+  `docker/litellm-proxy/litellm-config.yaml` is the source of truth (KEN-125)
+  and MUST exist, parse, and pass I2 scoping; editing it badly fails lint and
+  `src/litellm/repo-config.test.ts`. The LIVE host copy (default
+  `/data/coolify/services/…/litellm-config.yaml`, override with
+  `LITELLM_CONFIG_PATH`) is additionally checked where present and skipped in
+  CI/dev; on-host enforcement for the live file is the fleet-health sensor
+  (`src/fleet-health/litellm-config-sensor.ts`), which escalates a violation
+  into the priority ledger.
 
 ### Secrets in tests
 

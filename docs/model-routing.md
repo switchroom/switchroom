@@ -49,13 +49,15 @@ These must always hold.
   Claude models only. Non-Claude / OpenRouter model entries must never forward
   the `Authorization` header; the proxy holds no Anthropic key of its own for
   these models and must not substitute one.
-  **This scoping is enforced by convention in the operator-maintained LiteLLM
-  proxy config, not by any switchroom code.** That config is a Coolify-hosted
-  file at
-  `/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`;
-  switchroom emits **no** `litellm_settings` or `model_list` (grep the tree —
-  the only occurrences are documentation comments), so it neither writes nor
-  validates this flag. The operator places
+  **This scoping now has a repo-managed source of truth** (KEN-125):
+  `docker/litellm-proxy/litellm-config.yaml` is the reviewed, lint-guarded
+  (`scripts/check-litellm-config-guard.mjs` — always checks the repo copy) and
+  tested (`src/litellm/repo-config.test.ts`) config; the operator syncs it to
+  the Coolify-hosted live file at
+  `/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`
+  (procedure in `docker/litellm-proxy/README.md` — switchroom itself never
+  mutates or restarts the live proxy, and the live file must be reconciled
+  into the repo copy on first rollout). The config places
   `forward_client_headers_to_llm_api: true` under individual Claude entries in
   `model_group_settings` and leaves it off both globally (in `litellm_settings`,
   where it is a Boolean master switch) and on every `openrouter/*` /
