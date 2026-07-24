@@ -317,6 +317,14 @@ export function journalExternalDelivery(
      * same nonce is provably a double-send from the journal alone.
      */
     replyAlreadyDeliveredThisTurn?: boolean
+    /**
+     * #3513 follow-up: which backstop/machine delivered. Defaults to
+     * `'reply-tool'` (the E0/E3 reply-path callers). The turn-flush backstop
+     * (E1/E2) passes `'flush'` so `backstopAlreadyDelivered` recognises it as a
+     * prior backstop and E3/E4 skip a duplicate durably (across a crash between
+     * the flush send and its journal write), not just via the in-memory dedup.
+     */
+    deliverySource?: 'sweep' | 'reply-tool' | 'flush'
   },
   stateDir?: string,
   now: number = Date.now(),
@@ -329,7 +337,7 @@ export function journalExternalDelivery(
       textSha256: sha256Hex(args.text),
       tgMessageId: args.tgMessageId,
       ts: now,
-      deliverySource: 'reply-tool',
+      deliverySource: args.deliverySource ?? 'reply-tool',
       ...(args.replyAlreadyDeliveredThisTurn == null
         ? {}
         : { replyAlreadyDeliveredThisTurn: args.replyAlreadyDeliveredThisTurn }),

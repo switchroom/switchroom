@@ -97,6 +97,18 @@ export interface SilentEndDeps {
    * structural classifier remains the guard).
    */
   isBlockShown?: (turnNonce: string | null | undefined, text: string) => boolean
+  /**
+   * #3513 follow-up (MF2): has a prior BACKSTOP already delivered this turn's
+   * answer, per the durable delivered-keys journal? Injected so the captured-
+   * prose bridge (E3) enforces exactly-once-among-backstops DURABLY — if the
+   * turn-flush backstop (E1/E2, `deliverySource:'flush'`) or the outbox sweep
+   * (E4, `'sweep'`) already delivered this nonce, the bridge must NOT deliver a
+   * second copy, even across a process boundary the in-memory ledger can't see.
+   * This counts ONLY backstop deliveries (via `backstopAlreadyDelivered`), never
+   * an explicit E0 reply (#3510 recap), so a legitimate later explicit reply is
+   * unaffected. Omitted → the check is skipped (never suppress on doubt).
+   */
+  backstopDeliveredNonceHit?: (turnNonce: string | null | undefined) => boolean
 }
 
 /**
@@ -318,6 +330,7 @@ export interface CapturedProseDecision {
     | 'turnid-mismatch'
     | 'no-substantive-prose'
     | 'ephemeral-shown'
+    | 'already-delivered'
 }
 
 /**
@@ -371,6 +384,15 @@ export function decideCapturedProseDelivery(
   // suppress a genuine answer.
   if (deps?.isBlockShown?.(state.turnId, text) === true) {
     return { deliver: false, reason: 'ephemeral-shown' }
+  }
+  // #3513 follow-up (MF2): exactly-once-among-backstops. If a prior backstop
+  // (turn-flush E1/E2 or the outbox sweep E4) already delivered THIS turn's
+  // answer per the durable journal, the bridge must not deliver a duplicate —
+  // even across the process boundary the in-memory dedup can't see. Counts only
+  // backstop deliveries, never an explicit E0 reply, so a genuine later explicit
+  // reply is never blocked here.
+  if (deps?.backstopDeliveredNonceHit?.(state.turnId) === true) {
+    return { deliver: false, reason: 'already-delivered' }
   }
   return { deliver: true, text, reason: 'captured-prose' }
 }

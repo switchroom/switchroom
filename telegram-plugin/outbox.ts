@@ -122,11 +122,13 @@ export interface DeliveredEntry {
   tgMessageId?: number
   ts: number
   /**
-   * #3510 instrumentation: which machine delivered — the outbox sweep, or the
+   * #3510 instrumentation: which machine delivered — the outbox sweep, the
    * gateway reply-path machinery (reply/stream_reply send, silent-anchor edit,
-   * captured-prose bridge). Absent on pre-#3510 journal lines.
+   * captured-prose bridge), or the turn-end / answer-ready quiescence flush
+   * (`'flush'`, added in the #3513 exactly-once-among-backstops follow-up).
+   * Absent on pre-#3510 journal lines.
    */
-  deliverySource?: 'sweep' | 'reply-tool'
+  deliverySource?: 'sweep' | 'reply-tool' | 'flush'
   /** #3510 instrumentation: see `OutboxRecord.replyAlreadyDeliveredThisTurn`. */
   replyAlreadyDeliveredThisTurn?: boolean
 }
@@ -305,6 +307,59 @@ export function readDeliveredNonces(stateDir?: string): Set<string> {
 /** True iff `nonce` is already journaled as delivered. */
 export function outboxAlreadyDelivered(nonce: string, stateDir?: string): boolean {
   return readDeliveredNonces(stateDir).has(nonce)
+}
+
+/**
+ * True iff a journal entry is a prior BACKSTOP delivery (turn-flush E1/E2,
+ * captured-prose bridge E3, outbox sweep E4) — NOT an explicit E0 `reply` /
+ * `stream_reply` send (#3513 follow-up, MF2).
+ *
+ *   - `deliverySource === 'sweep'`  → E4 backstop.
+ *   - `deliverySource === 'flush'`  → E1/E2 backstop.
+ *   - `deliverySource === 'reply-tool'` AND `replyAlreadyDeliveredThisTurn ===
+ *     false` → E3 captured-prose bridge (a backstop; the bridge only fires when
+ *     NO genuine final answer was delivered this turn).
+ *   - `deliverySource === 'reply-tool'` AND `replyAlreadyDeliveredThisTurn ===
+ *     true` → an explicit E0 reply send — NOT a backstop. E0 replies are
+ *     ungated by design (a turn may send N of them), so they must NOT satisfy a
+ *     backstop's exactly-once guard (else the guard would eat a legitimate
+ *     #3510 trailing recap or a multi-reply turn's later bridge).
+ *
+ * A pre-#3510 line with no `deliverySource` is treated conservatively as NOT a
+ * backstop (fail open — never suppress a backstop on ambiguous provenance).
+ */
+export function isBackstopDeliveredEntry(e: DeliveredEntry): boolean {
+  if (e.deliverySource === 'sweep' || e.deliverySource === 'flush') return true
+  if (e.deliverySource === 'reply-tool' && e.replyAlreadyDeliveredThisTurn === false) return true
+  return false
+}
+
+/**
+ * True iff `nonce` already has a prior BACKSTOP delivery journaled (see
+ * `isBackstopDeliveredEntry`). This is the BACKSTOP-SCOPED exactly-once read the
+ * turn-flush (E1/E2) and captured-prose bridge (E3) consult before delivering —
+ * unlike `outboxAlreadyDelivered` (any journal line) it does NOT count an
+ * explicit E0 reply, so it can never suppress a legitimate second explicit
+ * message (#3513 follow-up, MF2).
+ */
+export function backstopAlreadyDelivered(nonce: string, stateDir?: string): boolean {
+  if (nonce == null || nonce === '') return false
+  const path = join(resolveOutboxDir(stateDir), JOURNAL_FILE)
+  if (!existsSync(path)) return false
+  try {
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      if (!line) continue
+      try {
+        const e = JSON.parse(line) as DeliveredEntry
+        if (e.turnNonce === nonce && isBackstopDeliveredEntry(e)) return true
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  return false
 }
 
 /**
