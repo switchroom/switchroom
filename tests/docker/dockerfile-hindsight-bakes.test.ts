@@ -220,6 +220,102 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the cross-encoder saturation fix (assert-guarded, fail-loud)", () => {
+    // apply_combined_scoring makes CE * recency * temporal * proof_count the
+    // ONLY final score (RRF is explicitly zeroed). Measured live on bank
+    // `overlord`: a 116-result recall had every CE score inside 0.9800-0.9999,
+    // so the ±5% proof_count boost decided the order and the single highest-CE
+    // memory ranked 7th behind older, more-proven ones. The patch extends
+    // upstream's own `is_passthrough_reranker` escape hatch with a variance
+    // gate: below a named spread threshold, min-max rescale the CE scores
+    // (monotone — no CE ordering changes, only the dynamic range is restored).
+    // Behaviour is proven in tests/docker/hindsight-search-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight CE-saturation patch: \{name\} anchor found \{n\}x/,
+    );
+    // Named module constant, not a magic number.
+    expect(dockerfile).toMatch(/_CE_SATURATION_SPREAD_THRESHOLD: float = 0\.05/);
+    // Extends the existing passthrough branch rather than adding a parallel one.
+    expect(dockerfile).toMatch(/    elif len\(scored_results\) > 1:/);
+    expect(dockerfile).toMatch(
+      /if 0\.0 < _ce_spread < _CE_SATURATION_SPREAD_THRESHOLD:/,
+    );
+    // The goal is a saturation guard, NOT a re-weighting: no patch may rewrite
+    // a boost alpha or the combined_score formula itself.
+    expect(dockerfile).not.toMatch(/_(RECENCY|TEMPORAL|PROOF_COUNT)_ALPHA[^\n]*=\s*\d/);
+    expect(dockerfile).not.toMatch(/sr\.combined_score\s*=/);
+    expect(dockerfile).not.toMatch(/(recency|temporal|proof_count)_boost\s*=\s*1/);
+    // Post-replace re-assertions (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert "_CE_SATURATION_SPREAD_THRESHOLD: float = 0\.05" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight CE-saturation patch: saturated cross-encoder scores are min-max rescaled/,
+    );
+  });
+
+  it("keeps the BM25 compound-token fix (assert-guarded, fail-loud)", () => {
+    // tokenize_query shredded `v0.19.17` into v0/19/17, but to_tsvector indexes
+    // it as ONE lexeme — zero overlap on the discriminating term, and the
+    // stripped `19` then matched clock timestamps like 19:33:13. The patch
+    // preserves the intact compound token and has the native-tsvector dialect
+    // emit `compound | (frag & frag & ...)`, dropping the standalone fragments.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight BM25 compound-token patch: anchor found \{n\}x/,
+    );
+    // Separators restricted to . / - so the token is always tsquery-safe unquoted.
+    expect(dockerfile).toMatch(
+      /_COMPOUND_TOKEN_RE = re\.compile\(r"\\\\w\+\(\?:\[\.\/-\]\\\\w\+\)\+"\)/,
+    );
+    // Both halves of the fix are present.
+    expect(dockerfile).toMatch(/if compound not in tokens:/);
+    expect(dockerfile).toMatch(/compound_fragments: set\[str\] = set\(\)/);
+    expect(dockerfile).toMatch(/groups\.append\(f"\(\{token\} \| \(/);
+    expect(dockerfile).toMatch(/join\(frags\)\}\)\)"\)/);
+    // `re` must be imported into the dialect module the patch adds usage to.
+    expect(dockerfile).toMatch(/"import re\\n"/);
+    // Post-replace re-assertions (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert "_COMPOUND_TOKEN_RE" in retrieval_new,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "compound_fragments: set\[str\] = set\(\)" in pg_new,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight BM25 compound-token patch: intact compound tokens preserved/,
+    );
+  });
+
+  it("keeps the LiteLLM empty-TimeoutError-message fix (assert-guarded, fail-loud)", () => {
+    // Both retry loops ended their timeout handler with a bare `raise`,
+    // re-raising an asyncio.TimeoutError with no args — so operators saw
+    // `chunk 0: TimeoutError: ` with no timeout, attempt count, or scope. The
+    // patch re-raises a message-carrying TimeoutError chained off the original
+    // (safe on 3.11, where asyncio.TimeoutError IS TimeoutError, so every
+    // upstack matcher still matches).
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight timeout-message patch: anchor found \{n\}x/,
+    );
+    // Message-carrying, chained re-raise.
+    expect(dockerfile).toMatch(/"                raise TimeoutError\(\\n"/);
+    expect(dockerfile).toMatch(/"                \) from e\\n"/);
+    // BOTH handlers (the standard `call` path and the tool-calling path).
+    expect(dockerfile).toMatch(/for label in \("call", "tool call"\):/);
+    // Post-replace re-assertions (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert t\.count\("raise TimeoutError\("\) == 2,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight timeout-message patch: LiteLLM timeout re-raises now carry/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
