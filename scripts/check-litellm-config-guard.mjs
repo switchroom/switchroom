@@ -10,16 +10,17 @@
  * `docs/model-routing.md` I2). Setting that flag GLOBALLY under
  * `litellm_settings`, or on any non-Claude / `*-openrouter` group, forwards
  * the subscription token to a third party (OpenRouter/OpenAI) — a one-line
- * OAuth leak. switchroom emits no LiteLLM config (it is operator-maintained in
- * Coolify), so this scoping had zero code enforcement.
+ * OAuth leak.
  *
- * IMPORTANT — this lint step is a cheap belt, NOT the load-bearing check. The
- * config file lives on the switchroom host (default
- * `/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`) and is
- * absent in CI/dev, where this guard SKIPS with a visible notice. The
- * load-bearing enforcement is the fleet-health sensor
- * (`src/fleet-health/litellm-config-sensor.ts`), which runs where the file
- * actually lives and escalates a violation into the priority ledger.
+ * KEN-125 — the config has a repo-managed source of truth
+ * (`docker/litellm-proxy/litellm-config.yaml`), which this guard ALWAYS
+ * checks (required: missing/unparseable/violating repo copy fails lint, so
+ * the guard is no longer vacuous in CI). The LIVE host copy (default
+ * `/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`, or
+ * `LITELLM_CONFIG_PATH`) is additionally checked where present and skipped
+ * in CI/dev; on-host enforcement for the live file is the fleet-health
+ * sensor (`src/fleet-health/litellm-config-sensor.ts`), which runs where the
+ * file actually lives and escalates a violation into the priority ledger.
  *
  * The rule (fails lint when the file is present AND violated):
  *   - `forward_client_headers_to_llm_api: true` under `litellm_settings`
@@ -37,6 +38,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 
 const DEFAULT_LITELLM_CONFIG_PATH =
@@ -46,10 +48,9 @@ const FLAG = "forward_client_headers_to_llm_api";
 // KEN-125: the config now has a repo-managed source of truth. That copy is
 // ALWAYS checked (so this guard is no longer vacuous off-host); the host/live
 // path (or LITELLM_CONFIG_PATH override) is additionally checked where present.
-const REPO_LITELLM_CONFIG_PATH = new URL(
-  "../docker/litellm-proxy/litellm-config.yaml",
-  import.meta.url,
-).pathname;
+const REPO_LITELLM_CONFIG_PATH = fileURLToPath(
+  new URL("../docker/litellm-proxy/litellm-config.yaml", import.meta.url),
+);
 
 const path = process.env.LITELLM_CONFIG_PATH ?? DEFAULT_LITELLM_CONFIG_PATH;
 
