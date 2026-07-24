@@ -29,9 +29,11 @@ describe('normalizeForSpeech — reported markdown/symbol cases', () => {
     expect(normalizeForSpeech('run `npm test` now')).toBe('run npm test now')
   })
 
-  it('strips headings markers', () => {
-    expect(normalizeForSpeech('# Summary\nAll good')).toBe('Summary All good')
-    expect(normalizeForSpeech('### Deep heading')).toBe('Deep heading')
+  it('strips headings markers and gives the heading a spoken full stop', () => {
+    // The heading is its own spoken sentence — without the terminator the
+    // newline-collapse ran the heading straight into the body text.
+    expect(normalizeForSpeech('# Summary\nAll good')).toBe('Summary. All good')
+    expect(normalizeForSpeech('### Deep heading')).toBe('Deep heading.')
   })
 
   it('speaks link text and drops the URL', () => {
@@ -333,5 +335,152 @@ describe('normalizeForSpeech — review findings (fixpoint decode, metachar, nit
 
   it('fixpoint does not over-decode entity-less text (Q&A stays literal)', () => {
     expect(decodeHtmlEntities('Q&A test')).toBe('Q&A test')
+  })
+})
+
+describe('normalizeForSpeech — list & heading pacing', () => {
+  it('speaks a 4-bullet list as 4 separate sentences', () => {
+    const out = normalizeForSpeech(
+      'Here are the steps:\n' +
+        '- Check the logs\n' +
+        '- Restart the container\n' +
+        '- Verify health\n' +
+        '- Report back',
+    )
+    expect(out).toBe(
+      'Here are the steps: Check the logs. Restart the container. ' +
+        'Verify health. Report back.',
+    )
+    // Four sentence-terminated spoken units after the lead-in.
+    const units = out
+      .split(/(?<=[.:])\s+/)
+      .filter((u) => u.trim().length > 0)
+    expect(units).toEqual([
+      'Here are the steps:',
+      'Check the logs.',
+      'Restart the container.',
+      'Verify health.',
+      'Report back.',
+    ])
+  })
+
+  it('separates ordered-list items into sentences', () => {
+    expect(normalizeForSpeech('1. first\n2. second\n3. third')).toBe(
+      'first. second. third.',
+    )
+  })
+
+  it('does not double punctuation when the item already ends in . ! or ?', () => {
+    const out = normalizeForSpeech('- Done.\n- Really?\n- Ship it!')
+    expect(out).toBe('Done. Really? Ship it!')
+    expect(out).not.toContain('..')
+    expect(out).not.toContain('. .')
+    expect(out).not.toContain('?.')
+    expect(out).not.toContain('!.')
+  })
+
+  it('terminates the line that introduces a list when it lacks punctuation', () => {
+    expect(normalizeForSpeech('Steps\n- one\n- two')).toBe('Steps. one. two.')
+  })
+
+  it('does not chop a wrapped list item mid-clause', () => {
+    expect(normalizeForSpeech('- a long item that\ncontinues here\n- second')).toBe(
+      'a long item that continues here. second.',
+    )
+  })
+
+  it('separates heading sections into sentences', () => {
+    expect(normalizeForSpeech('# One\nbody one\n\n# Two\nbody two')).toBe(
+      'One. body one. Two. body two',
+    )
+  })
+})
+
+describe('normalizeForSpeech — time guard (HH:MM:SS)', () => {
+  it('leaves a full HH:MM:SS timestamp as digits rather than half-reading it', () => {
+    expect(normalizeForSpeech('Done at 14:30:46 today')).toBe(
+      'Done at 14:30:46 today',
+    )
+  })
+
+  it('still speaks a plain HH:MM clock time', () => {
+    expect(normalizeForSpeech('Meeting at 14:30 today')).toBe(
+      'Meeting at fourteen thirty today',
+    )
+    expect(normalizeForSpeech('at 9:05')).toBe("at nine oh five")
+  })
+})
+
+describe('normalizeForSpeech — thousands separators', () => {
+  it('speaks $1,000 as one thousand dollars (not "one dollar,000")', () => {
+    expect(normalizeForSpeech('It costs $1,000 up front')).toBe(
+      'It costs one thousand dollars up front',
+    )
+  })
+
+  it('speaks a millions-scale amount', () => {
+    expect(normalizeForSpeech('Budget $1,234,567 total')).toBe(
+      'Budget one million two hundred thirty-four thousand five hundred ' +
+        'sixty-seven dollars total',
+    )
+  })
+
+  it('does not regress plain currency or ordinary comma prose', () => {
+    expect(normalizeForSpeech('It costs $500')).toBe('It costs five hundred dollars')
+    expect(normalizeForSpeech('$5.50 each')).toBe('five dollars fifty each')
+    expect(normalizeForSpeech('a, b, 3')).toBe('a, b, 3')
+    expect(normalizeForSpeech('We saw 12,500 requests')).toBe(
+      'We saw 12,500 requests',
+    )
+  })
+})
+
+describe('normalizeForSpeech — file paths', () => {
+  it('speaks an absolute path as its last segment', () => {
+    expect(normalizeForSpeech('Check /var/log/syslog now')).toBe(
+      'Check syslog now',
+    )
+  })
+
+  it('handles ~/ and relative multi-segment paths', () => {
+    expect(normalizeForSpeech('Edit ~/.config/nvim/init.lua please')).toBe(
+      'Edit init.lua please',
+    )
+    expect(normalizeForSpeech('See src/telegram-plugin/gateway.ts')).toBe(
+      'See gateway.ts',
+    )
+  })
+
+  it('says "a path" when the final segment is unspeakable noise', () => {
+    expect(normalizeForSpeech('Path /tmp/a1b2c3d4e5f6a7b8 there')).toBe(
+      'Path a path there',
+    )
+  })
+
+  it('leaves a single-slash word/word pair for the downstream slash pass', () => {
+    expect(normalizeForSpeech('and/or maybe')).toBe('and/or maybe')
+  })
+
+  it('does not treat an all-numeric date as a path', () => {
+    expect(normalizeForSpeech('the date 12/25/2026 works')).toBe(
+      'the date 12/25/2026 works',
+    )
+  })
+})
+
+describe('normalizeForSpeech — extended acronym set', () => {
+  it('spells the newly-added initialisms letter-by-letter', () => {
+    expect(normalizeForSpeech('use HTTPS not HTTP')).toBe('use H T T P S not H T T P')
+    expect(normalizeForSpeech('over SSH via DNS')).toBe('over S S H via D N S')
+    expect(normalizeForSpeech('the CLI on AWS at UTC')).toBe(
+      'the C L I on A W S at U T C',
+    )
+    expect(normalizeForSpeech('MCP PDF VM LLM YAML RAM USB ID OK')).toBe(
+      'M C P P D F V M L L M Y A M L R A M U S B I D O K',
+    )
+  })
+
+  it('still leaves word-style all-caps tokens alone', () => {
+    expect(normalizeForSpeech('NASA ALWAYS SHOUTING')).toBe('NASA ALWAYS SHOUTING')
   })
 })

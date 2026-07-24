@@ -306,3 +306,35 @@ describe('normalizeForTts — review findings (fixpoint decode, metachar, nits)'
     expect(normalizeForTts('X&#92;Y')).not.toContain('\\')
   })
 })
+
+describe('voice-out pipeline: normalizeForSpeech → normalizeForTts', () => {
+  const speak = (s: string) => normalizeForTts(normalizeForSpeech(s))
+
+  test('a mixed markdown list survives both passes as paced sentences', () => {
+    expect(
+      speak(
+        '- Check /var/log/syslog\n' +
+          '- Cost was $1,000\n' +
+          '- Ran at 14:30:46\n' +
+          '- Use HTTPS and/or SSH',
+      ),
+    ).toBe(
+      'Check syslog. Cost was one thousand dollars. Ran at 14:30:46. ' +
+        'Use H T T P S and slash or S S H.',
+    )
+  })
+
+  test('the HH:MM:SS guard holds in both normalizers', () => {
+    expect(normalizeForTts('Done at 14:30:46 today')).toBe('Done at 14:30:46 today')
+    expect(normalizeForSpeech('Done at 14:30:46 today')).toBe(
+      'Done at 14:30:46 today',
+    )
+  })
+
+  test('thousands separators are spoken identically by both normalizers', () => {
+    expect(normalizeForTts('It costs $1,000')).toBe('It costs one thousand dollars')
+    expect(normalizeForSpeech('It costs $1,000')).toBe(
+      'It costs one thousand dollars',
+    )
+  })
+})
