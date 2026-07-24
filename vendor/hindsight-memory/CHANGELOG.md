@@ -4,6 +4,41 @@
 
 ### Changed (switchroom divergence)
 
+- **`MAX_DIRECTIVES` 15 → 30, and truncation is no longer SILENT**
+  (`scripts/lib/directives.py`). Live fleet active-directive counts were 24
+  (assistant), 17 (klanker), 15 (carrie) against a client-side cap of 15, so the
+  busiest bank had 9 of its hard rules dropped from every turn's prompt with no
+  signal anywhere: the `(+N more, omitted)` footer only tells the AGENT. 30
+  clears the observed fleet maximum with headroom while staying bounded (the
+  block is injected on EVERY turn — this is a per-turn token cost, not a free
+  knob; the constant is commented as such). `format_active_directives_block`
+  now also prints a `[Hindsight] directive truncation: …` warn line to stderr
+  whenever it drops directives — the same stderr channel the module already
+  uses for fetch failures, so it lands in the agent's container log. Paired
+  switchroom-side: `src/cli/doctor-memory.ts` `MAX_DIRECTIVES` 15 → 30 and
+  `DIRECTIVE_WARN_THRESHOLD` 12 → 24 (a drift-guard test pins the TS constant
+  to the Python one). Acceptance: `scripts/tests/test_directives.py`
+  (`test_cap_is_30_and_clears_the_observed_fleet_maximum`,
+  `test_truncation_warns_on_stderr_not_silently`).
+
+- **`retainMission` rewritten with explicit, enumerated exclusions**
+  (`settings.json`). The extraction model is a small local `gpt-oss-20b`, and
+  the previous one-line "Ignore routine greetings and transient operational
+  details" did not hold: production banks contain pure transcript traces
+  ("The assistant used ToolSearch to query for hindsight bank statistics"),
+  hindsight's own batch failures with the UUID inline, restatements of the
+  then-current prompt, and undated transient state ("User has no unread mail",
+  which then recalls forever as a standing fact). The new mission enumerates
+  those noise classes as NEVER-extract bullets and adds a positive
+  counterweight ("a preference revealed by a request is durable") — without it,
+  an exclusion-only mission made the model return a degenerate/empty response
+  on chatty-but-real turns in a 6-window live sample. The text is pinned
+  byte-for-byte to switchroom's `DEFAULT_RETAIN_MISSION`
+  (`src/memory/hindsight.ts`) by a drift guard, because BOTH reach the same
+  extraction step: switchroom seeds the bank-side mission at scaffold, and the
+  plugin independently pushes this one via `lib/bank.py: ensure_bank_mission`
+  on a fresh state dir. Before this change the two texts differed.
+
 - **`recallContextTurns` default `1` → `2`** (switchroom hindsight-leverage
   PR2, workstream A2). A bare follow-up user message ("and the port?", "what
   about staging?") now embeds together with its antecedent human turn in the

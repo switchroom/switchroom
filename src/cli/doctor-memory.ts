@@ -46,30 +46,31 @@ export const MIN_HINDSIGHT_SHM_BYTES = 1024 * 1024 * 1024;
  * Hard cap on how many active directives the recall hook ever injects into the
  * prompt — MUST mirror `MAX_DIRECTIVES` in
  * `vendor/hindsight-memory/scripts/lib/directives.py`. A bank with MORE active
- * directives than this has its list SILENTLY truncated (`directives[:15]`) in the
+ * directives than this has its list truncated (`directives[:30]`) in the
  * `<active_directives>` recall block: the lowest-priority directives beyond the
- * cap never reach the agent. The doctor surfaces that truncation so it isn't
- * silent (workstream C2).
+ * cap never reach the agent. The plugin now also warns to stderr when it
+ * truncates; the doctor surfaces the same condition fleet-wide (workstream C2).
  */
-export const MAX_DIRECTIVES = 15;
+export const MAX_DIRECTIVES = 30;
 
 /**
  * Soft threshold: a bank with MORE active directives than this earns a WARN
  * before it hits the truncating hard cap. Directive count is a slow-moving
  * signal an operator should prune well before recall starts dropping rules.
+ * Kept at 80% of `MAX_DIRECTIVES` (the historical 12/15 ratio).
  */
-export const DIRECTIVE_WARN_THRESHOLD = 12;
+export const DIRECTIVE_WARN_THRESHOLD = 24;
 
 /**
  * Pure: classify a bank's ACTIVE-directive count into a health result.
  *
  * - `null` count (directive fetch failed / not attempted) → no row (returns null).
- * - `<= DIRECTIVE_WARN_THRESHOLD` (≤12) → healthy, no row (avoids one ok line per
+ * - `<= DIRECTIVE_WARN_THRESHOLD` (≤24) → healthy, no row (avoids one ok line per
  *   bank across the fleet; the issues card stays focused on problems).
- * - `> DIRECTIVE_WARN_THRESHOLD` and `<= MAX_DIRECTIVES` (13–15) → **warn**: pile-up
+ * - `> DIRECTIVE_WARN_THRESHOLD` and `<= MAX_DIRECTIVES` (25–30) → **warn**: pile-up
  *   approaching the truncating cap.
- * - `> MAX_DIRECTIVES` (16+) → **fail**: the recall block silently truncates the
- *   overflow; the lowest-priority directives never reach the agent.
+ * - `> MAX_DIRECTIVES` (31+) → **fail**: the recall block truncates the overflow;
+ *   the lowest-priority directives never reach the agent.
  */
 export function classifyDirectiveCount(
   count: number | null,
@@ -84,8 +85,9 @@ export function classifyDirectiveCount(
       status: "fail",
       detail:
         `${count} active directives — exceeds MAX_DIRECTIVES=${MAX_DIRECTIVES}, so the ` +
-        `${truncated} lowest-priority directive(s) are SILENTLY truncated from the ` +
-        `<active_directives> recall block and never reach the agent`,
+        `${truncated} lowest-priority directive(s) are truncated from the ` +
+        `<active_directives> recall block and never reach the agent (the recall ` +
+        `hook also warns to stderr on every such turn)`,
       fix:
         "Retire or merge stale directives so the active count is at or below " +
         `${MAX_DIRECTIVES} (deletes stay operator-approved). The mental-model-curator ` +
@@ -98,7 +100,7 @@ export function classifyDirectiveCount(
       status: "warn",
       detail:
         `${count} active directives — approaching the MAX_DIRECTIVES=${MAX_DIRECTIVES} cap ` +
-        `above which the recall block silently truncates the overflow`,
+        `above which the recall block truncates the overflow`,
       fix:
         "Prune or merge low-value directives before the count crosses " +
         `${MAX_DIRECTIVES}. Review with \`switchroom memory --directives <bank>\`.`,

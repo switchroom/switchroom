@@ -214,9 +214,19 @@ export function isHindsightEnabled(
 }
 
 /**
- * Recommended default `retain_mission` for new agents.
+ * Recommended default `retain_mission` for new agents, and the SINGLE source
+ * of truth for the retain mission across switchroom: the vendored plugin's
+ * `vendor/hindsight-memory/settings.json` `retainMission` is pinned to this
+ * exact string by a drift guard in `tests/memory.bank-missions.test.ts`.
  *
- * Sourced verbatim from upstream Hindsight's per-user-memory guide:
+ * Why the pin: BOTH values reach the same extraction step. Switchroom seeds
+ * the bank-side `retain_mission` here (via `updateBankMissions` at scaffold),
+ * while the plugin independently pushes `settings.json`'s `retainMission`
+ * through `lib/bank.py: ensure_bank_mission` the first time it sees a bank on
+ * a fresh state dir. Before 2026-07-25 the two texts differed, so which
+ * mission actually shaped extraction depended on scaffold-vs-plugin ordering.
+ *
+ * Historically sourced from upstream Hindsight's per-user-memory guide:
  *   https://github.com/vectorize-io/hindsight/blob/main/hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
  *   (lines 188–193)
  *
@@ -241,14 +251,43 @@ export function isHindsightEnabled(
  * `reconcileAgent` does not push a default. Operators can always
  * override per-agent via `agents.<name>.memory.retain_mission` in
  * `switchroom.yaml`.
+ *
+ * 2026-07-25 (retain-noise pass): the extraction model is `gpt-oss-20b` —
+ * small and local. A general principle ("ignore transient operational
+ * details") did not survive contact with it: production banks stored pure
+ * transcript traces ("The assistant used ToolSearch to query for hindsight
+ * bank statistics"), hindsight's own failures with the batch UUID inline,
+ * restatements of the then-current prompt, and undated transient state
+ * ("User has no unread mail" — which then recalls forever as a standing
+ * fact). Small models need concrete NEGATIVE examples, so the exclusions
+ * below are enumerated. The positive counterweight sentence ("a preference
+ * revealed by a request is durable") is load-bearing: without it, an
+ * exclusion-only mission made the model return an empty/degenerate response
+ * on chatty-but-real turns (measured against 6 live retain windows).
  */
 export const DEFAULT_RETAIN_MISSION =
-  "Extract user preferences, ongoing projects, recurring commitments, " +
-  "important context, and durable facts that should help across future " +
-  "conversations. Skip one-off chatter and temporary task noise, " +
-  "including in-flight workflow/process narration (a sub-task started, " +
-  "paused, or is still running) — only retain the outcome once a task " +
-  "actually completes or a decision is made.";
+  "Extract durable facts that will still be true and useful weeks from now: " +
+  "user preferences and standing rules, ongoing projects and recurring " +
+  "commitments, technical and architectural decisions with their rationale, " +
+  "and people/tool relationships. A preference revealed by a request is " +
+  "durable — record the preference (what the user likes, wants, or always " +
+  "does), not the request itself.\n\n" +
+  "NEVER extract:\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. " +
+  '"the assistant used X to query Y", "ran a search", "sent the message").\n' +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is " +
+  "still running) — retain the outcome only once the task completes or a " +
+  "decision is made.\n" +
+  "- Operation, request, batch or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the " +
+  "memory system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) " +
+  "unless the fact is explicitly dated, in which case record it as a dated " +
+  "observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording " +
+  "it. If nothing durable remains, return an empty facts list.";
 
 /**
  * Hindsight bank disposition traits (1-5 each). Mirrors the engine's flat

@@ -6,6 +6,8 @@ import {
   PROFILE_MEMORY_DEFAULTS,
 } from "../src/memory/hindsight.js";
 import { AgentMemorySchema } from "../src/config/schema.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 /** Drive updateBankMissions with a two-call mock and return the update_bank args. */
 async function captureUpdateBankArgs(
@@ -23,37 +25,59 @@ async function captureUpdateBankArgs(
 }
 
 describe("DEFAULT_RETAIN_MISSION", () => {
-  it("starts from the upstream Hindsight per-user-memory guide wording", () => {
-    // Base sourced verbatim from
-    // hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
-    // lines 188-193; extended 2026-07-19 (hindsight fleet review) with an
-    // explicit in-flight-process-narration carve-out — see block comment.
-    expect(DEFAULT_RETAIN_MISSION.startsWith(
-      "Extract user preferences, ongoing projects, recurring commitments, " +
-        "important context, and durable facts that should help across future " +
-        "conversations. Skip one-off chatter and temporary task noise,",
-    )).toBe(true);
-  });
-
-  it("explicitly tells extraction to skip conversational filler", () => {
-    expect(DEFAULT_RETAIN_MISSION).toContain("Skip one-off chatter");
-    expect(DEFAULT_RETAIN_MISSION).toContain("temporary task noise");
-  });
-
-  it("focuses on durable, cross-conversation signal", () => {
+  it("focuses extraction on durable, cross-conversation signal", () => {
     expect(DEFAULT_RETAIN_MISSION).toContain("durable facts");
-    expect(DEFAULT_RETAIN_MISSION).toContain("across future");
+    expect(DEFAULT_RETAIN_MISSION).toContain("user preferences and standing rules");
+    expect(DEFAULT_RETAIN_MISSION).toContain("ongoing projects and recurring commitments");
   });
 
   // Regression for the 2026-07-19 fleet review (REPORT.md finding B1):
   // live banks were dominated by transient in-flight task narration
-  // ("P6 worker paused waiting on its PR") rather than durable facts —
-  // that class of memory feeds the consolidation backlog for no lasting
-  // recall value. The mission must name it explicitly so extraction
-  // recognizes it, not just lump it under vague "task noise".
+  // ("P6 worker paused waiting on its PR") rather than durable facts.
   it("explicitly excludes in-flight workflow/process narration", () => {
-    expect(DEFAULT_RETAIN_MISSION).toContain("in-flight workflow/process narration");
-    expect(DEFAULT_RETAIN_MISSION).toContain("only retain the outcome once a task");
+    expect(DEFAULT_RETAIN_MISSION).toContain("In-flight workflow/process narration");
+    expect(DEFAULT_RETAIN_MISSION).toContain("retain the outcome only once the task completes");
+  });
+
+  // Regression for the 2026-07-25 retain-noise pass. The extraction model is a
+  // small local gpt-oss-20b: a general "ignore transient operational details"
+  // principle did NOT stop it storing transcript traces, hindsight's own batch
+  // failures (UUID inline), prompt restatements, or undated transient state.
+  // Each bullet below corresponds to a unit actually found in a production bank.
+  it("enumerates the concrete noise classes a small extraction model must drop", () => {
+    // "The assistant used ToolSearch to query for hindsight bank statistics"
+    expect(DEFAULT_RETAIN_MISSION).toContain("Agent tool-use traces");
+    // "Batch retain operation with ID fcf86589-… failed, processing 1 item."
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/UUIDs/);
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/Hindsight's own errors, retries, backlogs, or internal state/);
+    // "User wants to identify pending/failed consolidation…"
+    expect(DEFAULT_RETAIN_MISSION).toContain("Restatements of the user's current request");
+    // "User has no unread mail" — stored with no timestamp, recalls forever.
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/Transient state .* unless the fact is explicitly dated/);
+  });
+
+  // The exclusions above are load-bearing but dangerous alone: an
+  // exclusion-only mission made gpt-oss-20b return a degenerate/empty response
+  // on chatty-but-real turns in the 6-window live sample. The positive
+  // counterweight is what keeps genuine preferences flowing.
+  it("keeps a positive counterweight so exclusions cannot starve extraction", () => {
+    expect(DEFAULT_RETAIN_MISSION).toContain(
+      "A preference revealed by a request is durable",
+    );
+  });
+
+  // Drift guard: the vendored plugin pushes settings.json's `retainMission`
+  // through lib/bank.py ensure_bank_mission the first time it sees a bank, so
+  // a divergence here means which mission shapes extraction depends on
+  // scaffold-vs-plugin ordering. Same pattern as the MAX_DIRECTIVES guard.
+  it("is pinned byte-for-byte to the vendored plugin's settings.json retainMission", () => {
+    const settings = JSON.parse(
+      readFileSync(
+        resolve(__dirname, "..", "vendor", "hindsight-memory", "settings.json"),
+        "utf-8",
+      ),
+    );
+    expect(settings.retainMission).toBe(DEFAULT_RETAIN_MISSION);
   });
 });
 

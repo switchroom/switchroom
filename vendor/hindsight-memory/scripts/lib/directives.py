@@ -23,10 +23,21 @@ from typing import Optional
 
 from .state import list_state_names, read_state, remove_state, write_state
 
-# Sanity cap on how many directives we ever inject into the prompt. Banks
-# with more active directives than this are pathological; truncate with a
-# footer so the agent knows there are more.
-MAX_DIRECTIVES = 15
+# Sanity cap on how many directives we ever inject into the prompt.
+#
+# This number is a COST TRADEOFF, not an arbitrary limit: the
+# <active_directives> block is injected into EVERY turn's prompt, so each extra
+# directive is paid for on every turn of every session. 30 clears the observed
+# fleet maximum (24 active directives on the busiest bank as of 2026-07) with
+# headroom, while staying bounded enough that a runaway bank cannot quietly eat
+# the context window. Raising it further is a legitimate call, but make it
+# deliberately and with the per-turn token cost in mind.
+#
+# Banks with more active directives than this are pathological; we truncate
+# with an in-prompt footer AND a stderr warning (see
+# `format_active_directives_block`) so neither the agent nor the operator is
+# left guessing about dropped rules.
+MAX_DIRECTIVES = 30
 
 # Hard timeout for the list_directives call. The recall hook is on the
 # UserPromptSubmit critical path — we cannot block it for long.
@@ -252,6 +263,19 @@ def format_active_directives_block(directives: list, max_directives: int = MAX_D
     if omitted > 0:
         lines.append("")
         lines.append(f"(+{omitted} more, omitted)")
+        # Truncation must never be SILENT to the operator. The in-prompt footer
+        # above only tells the AGENT; this stderr warn (the same channel every
+        # other operational failure in this module uses — see
+        # `_fetch_directives_with_status`) puts it in the agent's container log
+        # so `docker logs` / `switchroom doctor` triage can see that real rules
+        # were dropped from the turn.
+        print(
+            f"[Hindsight] directive truncation: {total} active directives exceeds "
+            f"MAX_DIRECTIVES={max_directives} — {omitted} lowest-priority "
+            f"directive(s) were DROPPED from this turn's prompt. Merge or retire "
+            f"directives (mental-model-curator) or raise MAX_DIRECTIVES.",
+            file=sys.stderr,
+        )
 
     lines.append("</active_directives>")
     return "\n".join(lines)
