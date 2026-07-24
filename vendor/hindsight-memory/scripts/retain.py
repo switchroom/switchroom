@@ -117,8 +117,9 @@ def select_retain_window(
     SWITCHROOM DIVERGENCE (Phase 6b — candidate to upstream to
     vectorize-io/hindsight): the chunked sliding-window is decoupled from
     the ``retainEveryNTurns > 1`` throttle. Upstream only sliced a window
-    when ``retain_every_n > 1``; with ``retainEveryNTurns=1`` (switchroom's
-    every-turn crash-durability setting, applied in scaffold.ts) chunked
+    when ``retain_every_n > 1``; at ``retainEveryNTurns=1`` (switchroom's
+    historical every-turn crash-durability setting; the current scaffold.ts
+    default is 3) chunked
     mode fell through to full-session and re-consolidated the ENTIRE
     accumulated transcript on every Stop fire — an unbounded, per-turn cost.
 
@@ -127,9 +128,11 @@ def select_retain_window(
     (still owned by run_retain, unchanged); this function only decides *what*
     to retain once a fire happens. A chunked window of
     ``max(retain_every_n, 1) + overlap_turns`` turns is correct for any
-    ``retain_every_n >= 1``. With ``retain_every_n=1, overlap=2`` the window
-    is the 3 most-recent HUMAN turns (tool_result messages don't count as
-    turns — see slice_last_turns_by_user_boundary).
+    ``retain_every_n >= 1``. At the current switchroom defaults
+    (``retain_every_n=3, overlap=1``) the window is the 4 most-recent HUMAN
+    turns; at ``retain_every_n=1, overlap=2`` it is the 3 most-recent
+    (tool_result messages don't count as turns — see
+    slice_last_turns_by_user_boundary).
 
     ``force=True`` (SessionEnd final retain) widens chunked mode to a
     full-session sweep — belt-and-braces so a graceful shutdown always flushes
@@ -429,7 +432,10 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     debug_log(config, f"Read {len(all_messages)} messages from transcript")
 
     # Retention mode: full session (vendor default) or chunked. Switchroom
-    # runs chunked at retainEveryNTurns=1 (see select_retain_window / scaffold.ts).
+    # overrides to chunked in scaffold.ts, at the cascaded
+    # memory.retain.every_n_turns (default 3) / .overlap_turns (default 1) —
+    # a fire every 3rd turn over a ~4-turn window. See select_retain_window
+    # and scaffold.ts (HINDSIGHT_DEFAULT_RETAIN_*).
     retain_mode = config.get("retainMode", "full-session")
     retain_every_n = max(1, config.get("retainEveryNTurns", 1))
     retain_full_window = False
