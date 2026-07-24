@@ -123,6 +123,21 @@ describe("UpdateNotifier", () => {
     expect(h.cards).toHaveLength(1);
   });
 
+  it("re-checks the lock AFTER the plan probe: a mutation starting mid-probe suppresses the card", async () => {
+    let locked = false;
+    const h = makeHarness({
+      locked: () => locked,
+      plan: async () => {
+        // Simulate a fleet mutation starting while `update --check` runs.
+        locked = true;
+        return "plan text";
+      },
+    });
+    expect(await h.notifier.notifyIfNew("sha256:cafe11")).toBe("locked");
+    expect(h.cards).toHaveLength(0);
+    expect(existsSync(h.statePath)).toBe(false);
+  });
+
   it("dispatch failure does NOT mark notified — the next tick re-cards", async () => {
     const h = makeHarness({
       verdicts: [
@@ -131,10 +146,64 @@ describe("UpdateNotifier", () => {
       ],
     });
     expect(await h.notifier.notifyIfNew("sha256:ddd444")).toBe("dispatch_failed");
-    expect(existsSync(h.statePath)).toBe(false);
+    // Pending marker is cleared on a resolved dispatch failure so the
+    // retry is prompt — nothing marks the release notified.
+    const st = JSON.parse(readFileSync(h.statePath, "utf8"));
+    expect(st.last_notified_version).toBeUndefined();
+    expect(st.pending_version).toBeUndefined();
     expect(await h.notifier.notifyIfNew("sha256:ddd444")).toBe("apply_started");
     expect(h.cards).toHaveLength(2);
     expect(h.applies).toHaveLength(1);
+  });
+
+  it("restart-loop storm guard: a crash while the card is outstanding does NOT re-card within the suppress window", async () => {
+    // First instance posts a card that never resolves (hostd "crashes").
+    const statePath = join(dir, "state.json");
+    const cards: string[] = [];
+    const hung = new UpdateNotifier({
+      statePath,
+      isFleetMutationInFlight: () => false,
+      requestApproval: async ({ version }) => {
+        cards.push(version);
+        return new Promise(() => {}); // card never resolves
+      },
+      startApply: () => ({ result: "started" }),
+    });
+    void hung.notifyIfNew("sha256:feed99");
+    await new Promise((r) => setTimeout(r, 0)); // let the card post
+    expect(cards).toHaveLength(1);
+    // "Rebooted" instance, same state file: must suppress the re-post.
+    const h2 = makeHarness();
+    expect(await h2.notifier.notifyIfNew("sha256:feed99")).toBe(
+      "pending_recent",
+    );
+    expect(h2.cards).toHaveLength(0);
+    // …but a DIFFERENT release id is not suppressed.
+    expect(await h2.notifier.notifyIfNew("sha256:aab000")).toBe(
+      "apply_started",
+    );
+  });
+
+  it("restart-loop storm guard expires: after the suppress window a fresh card is posted", async () => {
+    const statePath = join(dir, "state.json");
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        pending_version: "sha256:feed99",
+        pending_posted_at: Date.now() - 2 * 60 * 60_000, // 2h ago
+      }),
+      "utf8",
+    );
+    const h = makeHarness(); // default suppress window = 1h
+    expect(await h.notifier.notifyIfNew("sha256:feed99")).toBe("apply_started");
+    expect(h.cards).toHaveLength(1);
+  });
+
+  it("skips (no card, no persist) when the watcher passes an empty release id", async () => {
+    const h = makeHarness();
+    expect(await h.notifier.notifyIfNew("")).toBe("skipped_no_version");
+    expect(h.cards).toHaveLength(0);
+    expect(existsSync(h.statePath)).toBe(false);
   });
 
   it("operator deny persists (one card per release) and never starts the apply", async () => {
@@ -200,8 +269,47 @@ describe("UpdateNotifier", () => {
       startApply: () => ({ result: "started" }),
     });
     expect(await notifier.notifyIfNew("sha256:boom")).toBe("dispatch_failed");
-    // A thrown approval must not mark the release notified.
-    expect(existsSync(statePath)).toBe(false);
+    // A thrown approval must not mark the release notified, and must
+    // clear the pending marker so the next tick retries.
+    const st = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(st.last_notified_version).toBeUndefined();
+    expect(st.pending_version).toBeUndefined();
+  });
+
+  it("clips an over-long refusal detail under the gateway's 500-char finalize cap", async () => {
+    const h = makeHarness({
+      startResult: { result: "denied", error: "x".repeat(600) },
+    });
+    expect(await h.notifier.notifyIfNew("sha256:b1gerr")).toBe("apply_refused");
+    expect(h.finalizes).toHaveLength(1);
+    const detail = h.finalizes[0].detail ?? "";
+    expect(detail.length).toBeLessThanOrEqual(450);
+    expect(detail.startsWith("update did not start: ")).toBe(true);
+  });
+
+  it("a THROWING startApply after approval still finalizes honestly (apply_refused)", async () => {
+    const statePath = join(dir, "state.json");
+    const finalizes: { outcome: string; detail?: string }[] = [];
+    const notifier = new UpdateNotifier({
+      statePath,
+      isFleetMutationInFlight: () => false,
+      requestApproval: async () => ({
+        verdict: "approve",
+        finalize: async (o) => {
+          finalizes.push({ outcome: o.outcome, ...(o.detail ? { detail: o.detail } : {}) });
+        },
+      }),
+      startApply: () => {
+        throw new Error("spawn exploded");
+      },
+    });
+    expect(await notifier.notifyIfNew("sha256:thr0w1")).toBe("apply_refused");
+    expect(finalizes).toEqual([
+      expect.objectContaining({
+        outcome: "reconcile_failed_rolled_back",
+        detail: expect.stringContaining("spawn exploded"),
+      }),
+    ]);
   });
 });
 

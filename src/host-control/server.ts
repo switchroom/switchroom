@@ -1598,7 +1598,18 @@ export class HostdServer {
       request_id: requestId,
       op: "update_apply" as const,
     };
-    return this.handleUpdateApply(req, { kind: "operator" }, Date.now());
+    const caller: SocketIdentity = { kind: "operator" };
+    const resp = this.handleUpdateApply(req, caller, Date.now());
+    // This path doesn't come through handleConnection, so it writes its
+    // own audit row — an operator-approved fleet mutation with no audit
+    // trail would be a forensic gap.
+    void this.writeAudit({ caller, req, resp }).catch((err) => {
+      process.stderr.write(
+        `hostd: audit write failed for operator-approved update_apply ` +
+          `(request_id=${requestId}): ${(err as Error).message}\n`,
+      );
+    });
+    return resp;
   }
 
   private handleUpdateApply(

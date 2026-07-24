@@ -268,8 +268,22 @@ async function main(): Promise<void> {
           return a.admin === true || a.root === true;
         })
         .sort();
-      notifier = new UpdateNotifier({
+      // Card timeout — shared with the notifier's re-post suppress
+      // window (a pre-restart pending card is honoured for exactly as
+      // long as it could still be live in the operator's chat).
+      const cardTimeoutMs = 60 * 60_000;
+      if (adminAgents.length === 0) {
+        // No admin agent → no gateway to carry the card. Every tick
+        // would run the (slow) plan probe and then dispatch-fail; skip
+        // wiring the notifier and say so once at startup instead.
+        process.stderr.write(
+          "hostd: notify_on_detect is enabled but no agent has " +
+            "admin/root — update approval cards have nowhere to go; " +
+            "notifier disabled\n",
+        );
+      } else notifier = new UpdateNotifier({
         statePath: join(homedir(), ".switchroom", "release-notify-state.json"),
+        repostSuppressMs: cardTimeoutMs,
         isFleetMutationInFlight: () => server.isFleetMutationLocked(),
         startApply: (requestId) => {
           const res = server.startOperatorApprovedUpdateApply(requestId);
@@ -300,7 +314,7 @@ async function main(): Promise<void> {
                   ? plan
                   : `switchroom update --check produced no plan output;\n` +
                     `remote digest: ${version}`,
-              timeoutMs: 60 * 60_000,
+              timeoutMs: cardTimeoutMs,
             });
             if (res.verdict === "deny" && res.denySource === "dispatch_failure") {
               last = res;

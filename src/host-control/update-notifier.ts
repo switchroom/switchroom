@@ -18,10 +18,19 @@
  *     operator deny, or timeout) marks the release notified; a
  *     dispatch failure (gateway unreachable / send failed) does NOT,
  *     so the next tick retries.
+ *   - Restart-loop storm guard: a `pending` marker is persisted just
+ *     BEFORE the card posts and cleared when the card resolves. If
+ *     hostd dies while the card is outstanding (crash loop, operator
+ *     restart), the next boot suppresses a re-post of the same
+ *     release until the original card's timeout window has elapsed —
+ *     so a restart loop cannot storm the operator with duplicate
+ *     cards. A resolved dispatch failure clears the marker so the
+ *     next tick retries promptly.
  *   - Respect the fleet-mutation lock: while an update_apply / apply
  *     / rollout is in flight we post nothing (the tick is skipped and
  *     retried on the next interval — the running mutation likely IS
- *     the catch-up).
+ *     the catch-up). Re-checked after the (slow) plan probe so a
+ *     mutation that started during the probe also suppresses the card.
  *   - No card when current: the watcher only calls us when a release
  *     is actually available, and dedup covers the steady "behind but
  *     already asked" state.
@@ -47,6 +56,8 @@ export interface StartApplyResult {
 /** Terminal outcome of one notify attempt — asserted by tests and logged. */
 export type NotifyOutcome =
   | "deduped" // already notified for this release id
+  | "pending_recent" // a card for this release was posted before a restart and may still be live
+  | "skipped_no_version" // watcher passed an empty release id — nothing to card
   | "locked" // fleet mutation in flight — skipped, retry next tick
   | "dispatch_failed" // card never reached the operator — retry next tick
   | "denied" // operator tapped Deny
@@ -54,8 +65,16 @@ export type NotifyOutcome =
   | "apply_started" // operator approved; update_apply started
   | "apply_refused"; // operator approved but the apply hook refused
 
+/**
+ * The gateway's `request_config_finalize` validator rejects `detail`
+ * over 500 chars (ipc-server.ts) — an over-long detail would silently
+ * drop the finalize and leave the card's buttons live forever. Clip
+ * with headroom.
+ */
+const FINALIZE_DETAIL_MAX = 450;
+
 export interface UpdateNotifierOptions {
-  /** JSON file persisting `{ last_notified_version }` across restarts. */
+  /** JSON file persisting notify/pending state across restarts. */
   statePath: string;
   /** Post the approval card; resolves with the operator's verdict.
    *  Production wiring iterates admin agents' gateway sockets. */
@@ -65,23 +84,33 @@ export interface UpdateNotifierOptions {
     plan: string;
   }) => Promise<ApprovalResult>;
   /** Start the hostd update_apply path (fleet-lock + preflight +
-   *  status rows included). Must NOT throw — refusals come back as
-   *  `result !== "started"`. */
+   *  status rows included). Refusals come back as
+   *  `result !== "started"`; a throw is treated as a refusal. */
   startApply: (requestId: string) => StartApplyResult;
   /** True while hostd's fleet-mutation lock is held. */
   isFleetMutationInFlight: () => boolean;
   /** Best-effort `switchroom update --check` plan text for the card
    *  body. Failures resolve to "" — the card still posts. */
   planFn?: () => Promise<string>;
+  /** How long a pre-restart pending card suppresses a re-post of the
+   *  same release (should match the card's timeoutMs). Default 1h. */
+  repostSuppressMs?: number;
   log?: (m: string) => void;
   /** Test seam — request-id mint. */
   mintRequestId?: () => string;
+  /** Test seam — wall clock. */
+  now?: () => number;
 }
 
 interface NotifierState {
-  last_notified_version: string;
-  notified_at: number;
+  last_notified_version?: string;
+  notified_at?: number;
+  /** Release id of a card posted but not yet resolved (crash guard). */
+  pending_version?: string;
+  pending_posted_at?: number;
 }
+
+const DEFAULT_REPOST_SUPPRESS_MS = 60 * 60_000;
 
 export class UpdateNotifier {
   constructor(private readonly opts: UpdateNotifierOptions) {}
@@ -101,9 +130,30 @@ export class UpdateNotifier {
   }
 
   private async run(version: string): Promise<NotifyOutcome> {
+    if (version === "") {
+      // The watcher's checkFn contract makes version optional; an
+      // empty id would render a blank card and dedup on "" forever.
+      this.log(
+        "release detected but no release id was provided — skipping card",
+      );
+      return "skipped_no_version";
+    }
     const state = this.readState();
     if (state?.last_notified_version === version) {
       return "deduped";
+    }
+    const suppressMs = this.opts.repostSuppressMs ?? DEFAULT_REPOST_SUPPRESS_MS;
+    if (
+      state?.pending_version === version &&
+      typeof state.pending_posted_at === "number" &&
+      this.now() - state.pending_posted_at < suppressMs
+    ) {
+      // A card for this release was posted before a restart and may
+      // still be live in the operator's chat — do not double-card.
+      this.log(
+        `release ${short(version)} has a possibly-live card from before a restart — suppressing re-post`,
+      );
+      return "pending_recent";
     }
     if (this.opts.isFleetMutationInFlight()) {
       this.log(
@@ -120,6 +170,14 @@ export class UpdateNotifier {
         this.log(`update --check plan probe failed: ${errMsg(err)}`);
       }
     }
+    // The plan probe shells out (up to minutes) — a mutation may have
+    // started meanwhile. Re-check so we never card mid-mutation.
+    if (this.opts.isFleetMutationInFlight()) {
+      this.log(
+        `fleet mutation started during the plan probe for ${short(version)} — not posting a card this tick`,
+      );
+      return "locked";
+    }
 
     const requestId = this.opts.mintRequestId
       ? this.opts.mintRequestId()
@@ -127,20 +185,44 @@ export class UpdateNotifier {
     this.log(
       `posting update approval card for release ${short(version)} (requestId=${requestId})`,
     );
-    const res = await this.opts.requestApproval({ requestId, version, plan });
+    // Crash guard: mark the card pending BEFORE posting so a hostd
+    // restart while the card is outstanding cannot re-card this
+    // release inside the suppress window.
+    this.writeState({
+      ...this.carryNotified(state),
+      pending_version: version,
+      pending_posted_at: this.now(),
+    });
+
+    let res: ApprovalResult;
+    try {
+      res = await this.opts.requestApproval({ requestId, version, plan });
+    } catch (err) {
+      res = {
+        verdict: "deny",
+        reason: `requestApproval threw: ${errMsg(err)}`,
+        denySource: "dispatch_failure",
+        finalize: async () => {},
+      };
+    }
 
     if (res.verdict === "deny" && res.denySource === "dispatch_failure") {
       // The card never reached the operator — do NOT mark notified;
-      // the next watcher tick retries.
+      // clear the pending marker so the next watcher tick retries.
       this.log(
         `update approval card dispatch failed (${res.reason ?? "unknown"}) — will retry next tick`,
       );
+      this.writeState(this.carryNotified(state));
       return "dispatch_failed";
     }
 
     // The card reached the operator: whatever the verdict, this
-    // release id is now "asked" — one card per release.
-    this.writeState({ last_notified_version: version, notified_at: Date.now() });
+    // release id is now "asked" — one card per release. (Also clears
+    // the pending marker.)
+    this.writeState({
+      last_notified_version: version,
+      notified_at: this.now(),
+    });
 
     if (res.verdict === "deny") {
       this.log(`operator denied update for release ${short(version)}`);
@@ -152,38 +234,68 @@ export class UpdateNotifier {
     }
 
     // Approved — start the real update_apply path.
-    const start = this.opts.startApply(requestId);
+    let start: StartApplyResult;
+    try {
+      start = this.opts.startApply(requestId);
+    } catch (err) {
+      start = { result: "error", error: errMsg(err) };
+    }
     if (start.result === "started") {
       this.log(`update_apply started (requestId=${requestId})`);
       await res.finalize({
         outcome: "applied",
-        detail: `switchroom update started (request_id ${requestId}) — track progress via get_status / the rollout narration message.`,
+        detail: clipDetail(
+          `switchroom update started (request_id ${requestId}) — track progress via get_status / the rollout narration message.`,
+        ),
       });
       return "apply_started";
     }
     const why = start.error ?? `unexpected result "${start.result}"`;
     this.log(`update_apply refused after approval: ${why}`);
-    // Closest available terminal card state — the detail carries the
-    // honest reason (nothing was rolled back; the apply never started).
+    // Closest available terminal card state — `reconcile_failed_rolled_back`
+    // is reused because old gateways reject unknown outcomes (mixed-version
+    // safety); the detail carries the honest reason (nothing was rolled
+    // back; the apply never started).
     await res.finalize({
       outcome: "reconcile_failed_rolled_back",
-      detail: `update did not start: ${why}`,
+      detail: clipDetail(`update did not start: ${why}`),
     });
     return "apply_refused";
+  }
+
+  /** Preserve any prior last-notified fields when rewriting state. */
+  private carryNotified(state: NotifierState | null): NotifierState {
+    return state?.last_notified_version !== undefined
+      ? {
+          last_notified_version: state.last_notified_version,
+          notified_at: state.notified_at ?? 0,
+        }
+      : {};
+  }
+
+  private now(): number {
+    return this.opts.now ? this.opts.now() : Date.now();
   }
 
   private readState(): NotifierState | null {
     try {
       const raw = readFileSync(this.opts.statePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<NotifierState>;
-      if (typeof parsed?.last_notified_version === "string") {
-        return {
-          last_notified_version: parsed.last_notified_version,
-          notified_at:
-            typeof parsed.notified_at === "number" ? parsed.notified_at : 0,
-        };
+      const parsed = JSON.parse(raw) as Partial<NotifierState> | null;
+      if (parsed === null || typeof parsed !== "object") return null;
+      const out: NotifierState = {};
+      if (typeof parsed.last_notified_version === "string") {
+        out.last_notified_version = parsed.last_notified_version;
+        out.notified_at =
+          typeof parsed.notified_at === "number" ? parsed.notified_at : 0;
       }
-      return null;
+      if (typeof parsed.pending_version === "string") {
+        out.pending_version = parsed.pending_version;
+        out.pending_posted_at =
+          typeof parsed.pending_posted_at === "number"
+            ? parsed.pending_posted_at
+            : 0;
+      }
+      return Object.keys(out).length > 0 ? out : null;
     } catch {
       // Missing or corrupt state → treat as never-notified. Worst case
       // is one duplicate card after a corrupt file, never a crash.
@@ -207,6 +319,13 @@ export class UpdateNotifier {
   private log(m: string): void {
     if (this.opts.log) this.opts.log(`update-notifier: ${m}`);
   }
+}
+
+/** Clip a finalize detail line under the gateway's 500-char validator cap. */
+function clipDetail(detail: string): string {
+  return detail.length > FINALIZE_DETAIL_MAX
+    ? detail.slice(0, FINALIZE_DETAIL_MAX - 1) + "…"
+    : detail;
 }
 
 /** Abbreviate a sha256 digest for logs/cards. */
