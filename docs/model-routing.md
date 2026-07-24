@@ -54,7 +54,7 @@ These must always hold.
   (`scripts/check-litellm-config-guard.mjs` — always checks the repo copy) and
   tested (`src/litellm/repo-config.test.ts`) config; the operator syncs it to
   the Coolify-hosted live file at
-  `/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`
+  `/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`
   (procedure in `docker/litellm-proxy/README.md` — switchroom itself never
   mutates or restarts the live proxy, and the live file must be reconciled
   into the repo copy on first rollout). The config places
@@ -278,7 +278,7 @@ inspected to confirm the routing env. That check verified non-Claude models
 OpenRouter through LiteLLM** — `api.anthropic.com` cannot serve
 `gpt-oss-120b`, so a successful response to that model is proof the request
 did not touch the Anthropic subscription endpoint. The live LiteLLM config
-(`/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`)
+(`/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`)
 and Hindsight's live container env (`ANTHROPIC_BASE_URL=http://127.0.0.1:4010`,
 global model `openrouter/z-ai/glm-5.2`) were also read directly for the I2 and
 Hindsight-credential claims above.

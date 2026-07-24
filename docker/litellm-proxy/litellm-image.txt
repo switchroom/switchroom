@@ -3,6 +3,6 @@
 # UNVERIFIED-AGAINST-LIVE: authored 2026-07-25 from inside a fleet container
 # with no read access to the live compose file. OPERATOR: replace with the
 # exact `image:` tag currently deployed (docker inspect / compose file at
-# /data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/docker-compose.yml), then
+# /data/coolify/services/<litellm-service-id>/docker-compose.yml), then
 # drop this notice. Never use a floating tag (`main-latest`, `main-stable`).
 ghcr.io/berriai/litellm-database:REPLACE-WITH-LIVE-PINNED-TAG

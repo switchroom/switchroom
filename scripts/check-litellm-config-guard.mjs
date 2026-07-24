@@ -15,10 +15,10 @@
  * KEN-125 — the config has a repo-managed source of truth
  * (`docker/litellm-proxy/litellm-config.yaml`), which this guard ALWAYS
  * checks (required: missing/unparseable/violating repo copy fails lint, so
- * the guard is no longer vacuous in CI). The LIVE host copy (default
- * `/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`, or
- * `LITELLM_CONFIG_PATH`) is additionally checked where present and skipped
- * in CI/dev; on-host enforcement for the live file is the fleet-health
+ * the guard is no longer vacuous in CI). The LIVE host copy (path via the
+ * `LITELLM_CONFIG_PATH` env var — deployment-specific, never hardcoded here)
+ * is additionally checked when that env var is set and the file is present,
+ * and skipped in CI/dev; on-host enforcement for the live file is the fleet-health
  * sensor (`src/fleet-health/litellm-config-sensor.ts`), which runs where the
  * file actually lives and escalates a violation into the priority ledger.
  *
@@ -32,7 +32,8 @@
  * with no `fallbacks` chain (the broker owns failover — see model-routing.md
  * Known Gaps).
  *
- * Override the path with `LITELLM_CONFIG_PATH`.
+ * Point `LITELLM_CONFIG_PATH` at the live config (e.g.
+ * `<litellm-service-dir>/litellm-config.yaml`) to also check the live copy.
  *
  * Run: `npm run lint:litellm-config-guard` (also part of `npm run lint`).
  */
@@ -41,18 +42,17 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 
-const DEFAULT_LITELLM_CONFIG_PATH =
-  "/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml";
 const FLAG = "forward_client_headers_to_llm_api";
 
 // KEN-125: the config now has a repo-managed source of truth. That copy is
 // ALWAYS checked (so this guard is no longer vacuous off-host); the host/live
-// path (or LITELLM_CONFIG_PATH override) is additionally checked where present.
+// path (LITELLM_CONFIG_PATH env var — deployment-specific, never hardcoded)
+// is additionally checked when set.
 const REPO_LITELLM_CONFIG_PATH = fileURLToPath(
   new URL("../docker/litellm-proxy/litellm-config.yaml", import.meta.url),
 );
 
-const path = process.env.LITELLM_CONFIG_PATH ?? DEFAULT_LITELLM_CONFIG_PATH;
+const path = process.env.LITELLM_CONFIG_PATH ?? null;
 
 function isClaudeAllowlistedGroup(name) {
   if (name.endsWith("-openrouter")) return false;
@@ -189,10 +189,10 @@ function checkConfig(path, { required }) {
 }
 
 // The repo-managed copy is ALWAYS checked (required — the guard is no longer
-// vacuous in CI). The live/host copy (or LITELLM_CONFIG_PATH override) is
-// additionally checked where present.
+// vacuous in CI). The live/host copy (LITELLM_CONFIG_PATH env var) is
+// additionally checked when the env var is set.
 let ok = checkConfig(REPO_LITELLM_CONFIG_PATH, { required: true });
-if (path !== REPO_LITELLM_CONFIG_PATH) {
+if (path && path !== REPO_LITELLM_CONFIG_PATH) {
   ok = checkConfig(path, { required: false }) && ok;
 }
 process.exit(ok ? 0 : 1);

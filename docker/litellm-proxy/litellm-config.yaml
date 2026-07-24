@@ -3,7 +3,7 @@
 # Deploy path on the host (same Coolify service dir as the pacer,
 # see ../litellm-pacer/README.md):
 #
-#   host:      /data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml
+#   host:      /data/coolify/services/<litellm-service-id>/litellm-config.yaml
 #   container: bind-mounted into the LiteLLM proxy container (Coolify compose)
 #
 # THE REPO COPY IS AUTHORITATIVE (same rule as docker/litellm-pacer):

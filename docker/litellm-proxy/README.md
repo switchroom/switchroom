@@ -43,7 +43,7 @@ on the host and back-ported.
 
 ```
 repo:  docker/litellm-proxy/litellm-config.yaml
-host:  /data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml
+host:  /data/coolify/services/<litellm-service-id>/litellm-config.yaml
        (from the root debugging agent: /host/data/coolify/services/…)
 ```
 
