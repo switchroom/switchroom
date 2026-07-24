@@ -311,3 +311,74 @@ export function mayInjectListenButton(
   if (rawKeyboard == null) return true
   return !rawKeyboard.some((row) => Array.isArray(row) && row.length > 0)
 }
+
+/** The voice-out plan fields the Listen-button decision depends on. A subset of
+ *  the gateway's full `VoiceOutPlan` so this pure helper carries no gateway
+ *  import. */
+export interface ListenButtonVoiceOutPlan {
+  engine: 'kokoro' | 'openai'
+  voice?: string
+  speed: number
+  replyMode: 'voice+text' | 'voice-only' | 'on-demand'
+  ttsChunks: string[]
+}
+
+/** The decision to inject a 🔊 Listen button on a message, plus the cache
+ *  payload the caller must persist so a tap can resynthesize. */
+export interface ListenButtonPlan {
+  /** The single-row Listen keyboard to attach as `reply_markup`. */
+  replyMarkup: {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
+  }
+  /** The freshly minted token keying the keyboard callback + cache entry. */
+  token: string
+  /** The payload the caller stores under `token` in the VoiceOnDemandCache
+   *  (and enqueues for eager pre-synth). */
+  payload: VoiceOnDemandPayload
+}
+
+/**
+ * The SINGLE source of truth for "should this delivered message carry a 🔊
+ * Listen button, and if so which token/keyboard/cache payload?" — shared by
+ * BOTH the normal reply path (`sendReply` in outbound-send-path.ts) and the
+ * durable-outbox safety-net delivery (`outbox-sweep.ts` wiring), so a
+ * net-delivered final answer is indistinguishable from a normally-delivered
+ * one (switchroom #3502 regression: the sweep dropped the button).
+ *
+ * Returns null — no button — when any gate fails:
+ *  - no voice-out plan, or the plan is not kokoro on-demand (openai on-demand
+ *    synthesizes immediately and its taps would dead-end on the local sidecar);
+ *  - the TTS text is empty (nothing to speak — the empty-TTS guard);
+ *  - the agent supplied its own inline keyboard (single_use collision gate —
+ *    see mayInjectListenButton).
+ *
+ * Pure: it mints a token and builds the keyboard/payload but performs NO side
+ * effects (no cache write, no eager enqueue). The caller owns those so the
+ * token is only persisted when it decides to actually attach the button.
+ */
+export function planListenButton(params: {
+  voiceOutPlan: ListenButtonVoiceOutPlan | null
+  rawKeyboard: unknown[][] | undefined | null
+}): ListenButtonPlan | null {
+  const plan = params.voiceOutPlan
+  // on-demand Listen button is a LOCAL-engine (kokoro) feature only.
+  const useOnDemandButton =
+    plan != null && plan.replyMode === 'on-demand' && plan.engine === 'kokoro'
+  if (!useOnDemandButton) return null
+  // Empty-TTS guard: nothing to speak → no button.
+  if (!(plan.ttsChunks.length > 0 && plan.ttsChunks[0]!.length > 0)) return null
+  // Collision gate: agent supplied its own keyboard → skip.
+  if (!mayInjectListenButton(params.rawKeyboard)) return null
+
+  const token = mintVoiceOnDemandToken()
+  return {
+    replyMarkup: buildListenKeyboard(token),
+    token,
+    payload: {
+      // ttsChunks[0] is already normalizeForSpeech(reply) (kokoro path).
+      text: plan.ttsChunks[0]!,
+      ...(plan.voice != null ? { voice: plan.voice } : {}),
+      speed: plan.speed,
+    },
+  }
+}
