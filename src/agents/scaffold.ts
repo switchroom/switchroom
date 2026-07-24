@@ -28,6 +28,13 @@ import {
   findAgentUnreadablePaths,
   scopedAssertCandidates,
 } from "./agent-owned-tree.js";
+import {
+  CLAUDE_MD_YOURS_MARKER,
+  computeConfigHash,
+  computeStampFilesFromDisk,
+  writeGenerationStamp,
+} from "./generation-stamp.js";
+import { VERSION as SWITCHROOM_VERSION } from "../build-info.js";
 
 // Repo root for referencing bin/ scripts in hooks
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -1546,8 +1553,12 @@ function composeWithSidecar(renderedBase: string, sidecarPath: string): string {
  * STRUCTURAL PROMISE — never change this text or its semantics again.
  * Operators edit below this line; the scaffold rewrites everything above it
  * on every reconcile and preserves everything below it verbatim. See #1857.
+ *
+ * Canonical definition lives in generation-stamp.ts (KEN-130) so the
+ * gateway-side drift probe can split CLAUDE.md without importing this
+ * module; re-exported above (import block) for existing importers.
  */
-export const CLAUDE_MD_YOURS_MARKER = "# --- Yours (preserved across apply) ---";
+export { CLAUDE_MD_YOURS_MARKER };
 
 /**
  * Placeholder written below the marker for a fresh agent that has neither an
@@ -5308,6 +5319,10 @@ export function scaffoldAgent(
       + `manually if needed.\n`,
     );
   }
+  // Generation stamp (KEN-130) — fresh agents are stamped at scaffold so
+  // drift detection is meaningful before the first reconcile too.
+  stampGeneratedSurfaces(agentDir, agentConfig);
+
   return { agentDir, created, skipped };
 }
 
@@ -6246,6 +6261,31 @@ export function detectHooksDrift(
 
   const summary = `DRIFTED (categories: ${driftedKeys.join(", ")})`;
   return { drifted: true, summary };
+}
+
+/**
+ * Record the generation stamp for drift detection (KEN-130). Called at
+ * the end of scaffold + host-side reconcile, AFTER every managed write,
+ * so the stamped hashes describe exactly what this run left on disk.
+ * The resolved (post-cascade) agent config is hashed so a later
+ * yaml-edit-without-apply reads as named drift. Best-effort — a stamp
+ * IO failure must never fail a scaffold/reconcile.
+ *
+ * Deliberately NOT written on the in-container cron-only reconcile
+ * (skipProfileTemplates): that path renders no templates and its
+ * in-image VERSION can differ from the host install, which would
+ * poison the version-staleness comparison.
+ */
+function stampGeneratedSurfaces(agentDir: string, resolvedAgentConfig: AgentConfig): void {
+  try {
+    writeGenerationStamp(agentDir, {
+      switchroomVersion: SWITCHROOM_VERSION,
+      configHash: computeConfigHash(resolvedAgentConfig),
+      files: computeStampFilesFromDisk(agentDir),
+    });
+  } catch {
+    /* best-effort — drift detection just reports "no stamp" */
+  }
 }
 
 /**
@@ -7402,6 +7442,13 @@ function reconcileAgentInner(
       symlinkSync("workspace/SOUL.md", agentSoulPath);
       changes.push(agentSoulPath);
     }
+  }
+
+  // --- Generation stamp (KEN-130): record what this reconcile left on disk ---
+  // Written BEFORE the ownership sweep below so a root-run reconcile
+  // sweeps the stamp back to the agent UID with everything else.
+  if (!options.skipProfileTemplates) {
+    stampGeneratedSurfaces(agentDir, agentConfig);
   }
 
   // --- Ownership invariant (#3168): root-written files must land agent-owned ---
