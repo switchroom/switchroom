@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'fs'
+import { join } from 'path'
+import { projectTranscriptLine } from '../session-tail.js'
 import {
   startTurn,
   noteOutbound,
@@ -7,6 +10,9 @@ import {
   noteToolStart,
   noteToolEnd,
   noteToolLabel,
+  noteBackgroundShellAlive,
+  noteBackgroundShellDead,
+  __bgMarkerParserConfirmedForTests,
   endTurn,
   silenceMsForKey,
   silencePokeEnabled,
@@ -733,6 +739,141 @@ describe('silence-poke — #3519 background-bash defer (stacked-cards regression
       noteToolEnd('c:0', 't1', 125_000)
       __tickForTests(306_000)
       expect(f.fallbacks).toHaveLength(1) // defer force-disabled → legacy fire
+    } finally {
+      if (prev != null) process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = prev
+      else delete process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    }
+  })
+})
+
+// ─── #3519 SHARPEN: PROVEN-alive defer, driven by REAL captured markers ───────
+// The coarse `sawBashThisTurn` guard above deferred EVERY bash-turn to the 900s
+// ceiling. This sharpens it: defer only while a background shell is PROVEN
+// alive (its structured `backgroundTaskId` launch marker seen, no completion
+// yet), and recover at ~300s the moment it finishes. The alive/dead facts here
+// are PARSED FROM REAL JSONL (tests/fixtures/bg-shell-liveness-3519.jsonl —
+// carrie session 1db49136-…, claude v2.1.185; line 35 auto-background launch,
+// line 68 `<task-notification>` completion) through the SAME projectTranscriptLine
+// path the gateway uses, then fed to silence-poke exactly as the gateway feeds
+// it (tool_result.backgroundTaskId → noteBackgroundShellAlive; task_notification
+// → noteBackgroundShellDead). So every fixture value is traceable to a real byte.
+describe('silence-poke — #3519 sharpen: proven-alive defer (real markers)', () => {
+  const PROD = {
+    thresholds: { fallbackHardCeiling: 900_000 }, // SILENCE_FALLBACK_HARD_MS
+    isLegitimatelyWorking: () => false,            // background bash invisible to it
+  }
+  const FIXTURE = join(__dirname, 'fixtures', 'bg-shell-liveness-3519.jsonl')
+  const fxLines = readFileSync(FIXTURE, 'utf8').split('\n').filter(l => l.length > 0)
+  // Derive the REAL ids straight from the fixtures via the production parser.
+  const aliveEv = projectTranscriptLine(fxLines[0]).find(e => e.kind === 'tool_result')
+  const deadEv = projectTranscriptLine(fxLines[1])[0]
+  const LIVE_ID = aliveEv?.kind === 'tool_result' ? aliveEv.backgroundTaskId! : ''
+  const DEAD_ID = deadEv.kind === 'task_notification' ? deadEv.taskId : ''
+
+  it('sanity: the fixtures really carry a matching background-shell id', () => {
+    expect(LIVE_ID).toBe('bweqqjn9r')
+    expect(DEAD_ID).toBe('bweqqjn9r')
+  })
+
+  // (a) A shell PROVEN alive across a > 300s gap must NOT tear down the card —
+  //     and exactly ONE card survives (positive assertion, not inferred).
+  it('(a) live shell across a > 300s gap → no teardown, exactly one card', () => {
+    const f = setupDeps(PROD)
+    const mintedCards: string[] = []
+    let pinnedCardId: string | null = null
+    const mintCard = (): void => {
+      mintedCards.push(`card-${mintedCards.length + 1}`)
+      pinnedCardId = mintedCards[mintedCards.length - 1]
+    }
+    const syncCardsAfterTick = (): void => {
+      while (mintedCards.length - 1 < f.fallbacks.length) { pinnedCardId = null; mintCard() }
+    }
+
+    startTurn('c:0', 0)
+    mintCard() // the turn's first pinned progress card
+    // Foreground Bash auto-moved to background at ~120s: its tool_result
+    // returns (drains inFlightTools) carrying the real backgroundTaskId.
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    noteBackgroundShellAlive('c:0', LIVE_ID) // gateway does this from the parsed event
+    __tickForTests(306_000)
+    syncCardsAfterTick()
+    __tickForTests(500_000) // still alive, still silent, still well past 300s
+    syncCardsAfterTick()
+    expect(f.fallbacks).toHaveLength(0)     // deferred — no teardown
+    expect(pinnedCardId).toBe('card-1')     // POSITIVE: original card still live
+    expect(mintedCards).toEqual(['card-1']) // and it is the ONLY card ever minted
+    expect(__bgMarkerParserConfirmedForTests()).toBe(true) // marker proven working
+  })
+
+  // (b) THE NEW capability: once the shell FINISHES (real completion marker),
+  //     a subsequent > 300s wedge recovers at ~300s — NOT held to 900s.
+  it('(b) shell went DEAD then a > 300s wedge → fallback fires at ~300s (fast recovery)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    noteBackgroundShellAlive('c:0', LIVE_ID)   // backgrounded at ~120s
+    noteBackgroundShellDead('c:0', DEAD_ID)    // real <task-notification> completed at ~200s
+    // Model then goes silent on a genuine wedge. Because the CLI marker PARSED
+    // (confirmed), the coarse sawBash degradation is OFF, so the empty
+    // alive-set means this is real silence → recover at the 300s base window,
+    // not the 900s ceiling.
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(1) // FAST recovery restored (would be 0 under the old coarse guard)
+  })
+
+  // (c) SAFE DEGRADATION: if a future CLI renames the markers so NOTHING parses
+  //     (backgroundTaskId never resolves → parser never confirmed), we must not
+  //     regress to stacking — fall back to the 900s-bounded coarse guard.
+  it('(c) unmatched/changed CLI marker → degrades to the 900s-bounded guard', () => {
+    const f = setupDeps(PROD)
+    // Mutate the REAL alive line so neither the structured field nor the string
+    // matches — exactly what a marker rename looks like. Parse it as the gateway
+    // would; it yields NO backgroundTaskId, so noteBackgroundShellAlive is never
+    // called and the parser stays unconfirmed.
+    const mutated = JSON.parse(fxLines[0])
+    delete mutated.toolUseResult.backgroundTaskId
+    mutated.message.content[0].content = 'Task moved to background (id withheld by a newer CLI).'
+    const ev = projectTranscriptLine(JSON.stringify(mutated)).find(e => e.kind === 'tool_result')
+    expect(ev?.kind === 'tool_result' ? ev.backgroundTaskId : 'X').toBeUndefined()
+
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000) // sawBashThisTurn armed
+    noteToolEnd('c:0', 't1', 125_000)
+    // No alive registration (marker unparseable) → parser NOT confirmed.
+    expect(__bgMarkerParserConfirmedForTests()).toBe(false)
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // still deferred by the coarse guard (no stacking)
+    __tickForTests(900_000)             // crosses the hard ceiling
+    expect(f.fallbacks).toHaveLength(1) // bounded unwedge — never hangs forever
+  })
+
+  // (d) Still bounded even while genuinely alive: a shell that never reports
+  //     dead still unwedges ONCE at the 900s ceiling (not indefinitely).
+  it('(d) a never-completing live shell still unwedges once at the 900s ceiling', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    noteBackgroundShellAlive('c:0', LIVE_ID) // alive, never dies
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // deferred while alive
+    __tickForTests(900_000)             // hard ceiling
+    expect(f.fallbacks).toHaveLength(1) // exactly one bounded unwedge
+  })
+
+  it('honours the SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 kill switch even with a live shell', () => {
+    const prev = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = '0'
+    try {
+      const f = setupDeps(PROD)
+      startTurn('c:0', 0)
+      noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+      noteToolEnd('c:0', 't1', 125_000)
+      noteBackgroundShellAlive('c:0', LIVE_ID)
+      __tickForTests(306_000)
+      expect(f.fallbacks).toHaveLength(1) // force-disabled → no defer at all
     } finally {
       if (prev != null) process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = prev
       else delete process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS

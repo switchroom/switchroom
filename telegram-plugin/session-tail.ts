@@ -134,7 +134,23 @@ export type SessionEvent =
   // (naive summing across lines over-counts). Null messageId → un-dedupable,
   // counted as-is. Mirrors `sub_agent_usage` but for the parent's OWN tokens.
   | { kind: 'usage'; messageId: string | null; totalTokens: number }
-  | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
+  | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string
+      /**
+       * #3519 sharpen: the claude-CLI background-task id when THIS tool_result
+       * is the launch acknowledgement of a shell moved to the background (a
+       * foreground Bash that exceeded the CLI foreground window, or an explicit
+       * run_in_background:true). Sourced PRIMARILY from the structured
+       * top-level `toolUseResult.backgroundTaskId` field (version-robust), with
+       * a regex on the `content` string as a secondary. Absent on ordinary
+       * (completed-in-foreground) tool_results. Marks the shell ALIVE. */
+      backgroundTaskId?: string }
+  /**
+   * #3519 sharpen: a claude-CLI `<task-notification>` — the proactive
+   * completion signal the CLI enqueues when a backgrounded shell finishes
+   * (`<status>completed</status>`) or errors. Marks the shell DEAD, restoring
+   * ~300s wedge recovery once the launching bash is no longer running.
+   */
+  | { kind: 'task_notification'; taskId: string; status: string }
   // `reason` is set ONLY by an internal gateway-synthesized turn_end (never by
   // the JSONL projection). `answer-ready-quiescence` (PR A) marks the positive
   // deterministic quiescence-flush signal, which — unlike the orphaned-reply
@@ -257,6 +273,60 @@ function extractToolResultErrorText(content: unknown): string {
     return parts.join('\n').slice(0, MAX_ERROR_TEXT_CHARS)
   }
   return ''
+}
+
+/**
+ * #3519 sharpen — ALIVE marker (primary): read the claude-CLI background-task
+ * id off the structured, sibling top-level `toolUseResult.backgroundTaskId`
+ * field of a `type:"user"` transcript line. This is the version-robust source
+ * (a named JSON field, not prose). Real shape (carrie session
+ * 1db49136-…, v2.1.185, line 35):
+ *   "toolUseResult":{…,"backgroundTaskId":"bweqqjn9r"}
+ * Returns the id, or null when the line carries no backgrounded shell.
+ */
+export function parseBackgroundTaskId(obj: Record<string, unknown>): string | null {
+  const tur = obj.toolUseResult
+  if (typeof tur === 'object' && tur != null) {
+    const id = (tur as Record<string, unknown>).backgroundTaskId
+    if (typeof id === 'string' && id.length > 0) return id
+  }
+  return null
+}
+
+/**
+ * #3519 sharpen — ALIVE marker (secondary): match the launch STRING in the
+ * tool_result `content` when the structured field is absent (older CLI, or a
+ * shape change that keeps the human string). Real bytes (same line 35):
+ *   "Command running in background with ID: bweqqjn9r. Output is being written…"
+ * DELIBERATELY the fallback, not the primary — if BOTH miss (CLI changed the
+ * string too) the caller degrades to the 900s-bounded sawBash guard. Accepts
+ * the same string|content-block shapes as extractToolResultErrorText.
+ */
+export function parseBackgroundLaunchString(content: unknown): string | null {
+  const text = typeof content === 'string'
+    ? content
+    : extractToolResultErrorText(content)
+  const m = text.match(/Command running in background with ID: (\w+)/)
+  return m != null ? m[1] : null
+}
+
+/**
+ * #3519 sharpen — DEAD marker: parse a claude-CLI `<task-notification>` block.
+ * The CLI enqueues this proactively when a backgrounded shell finishes. Real
+ * bytes (carrie session 1db49136-…, v2.1.185, line 68 queue-operation enqueue
+ * content, and mirrored line 75 attachment):
+ *   "<task-notification>\n<task-id>bweqqjn9r</task-id>\n…\n<status>completed</status>\n…"
+ * Returns {taskId,status} when both tags are present, else null (so an
+ * ordinary inbound enqueue falls through to the normal user-turn path).
+ */
+export function parseTaskNotification(
+  content: string,
+): { taskId: string; status: string } | null {
+  if (!content.includes('<task-notification>')) return null
+  const idM = content.match(/<task-id>([^<]+)<\/task-id>/)
+  const stM = content.match(/<status>([^<]+)<\/status>/)
+  if (idM == null || stM == null) return null
+  return { taskId: idM[1].trim(), status: stM[1].trim() }
 }
 
 /**
@@ -481,6 +551,15 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const op = obj.operation as string | undefined
     if (op === 'enqueue') {
       const content = (obj.content as string | undefined) ?? ''
+      // #3519 sharpen: a `<task-notification>` is NOT a real inbound user
+      // turn — it is the claude CLI's proactive background-shell completion
+      // signal, enqueued as a synthetic command. Project it as the DEAD
+      // marker so the liveness registry can drop the shell (restoring ~300s
+      // wedge recovery) rather than mis-reading it as a user message.
+      const notif = parseTaskNotification(content)
+      if (notif != null) {
+        return [{ kind: 'task_notification', taskId: notif.taskId, status: notif.status }]
+      }
       const { chatId, messageId, threadId } = parseChannelMeta(content)
       return [{ kind: 'enqueue', chatId, messageId, threadId, rawContent: content }]
     }
@@ -578,6 +657,11 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const message = obj.message as Record<string, unknown> | undefined
     const content = message?.content as Array<Record<string, unknown>> | undefined
     if (!Array.isArray(content)) return []
+    // #3519 sharpen: the background-launch id is a per-LINE fact carried on
+    // the sibling top-level `toolUseResult.backgroundTaskId` (version-robust
+    // structured field), with the launch STRING as a secondary. Parsed once
+    // and attached to this line's tool_result event to mark the shell ALIVE.
+    const backgroundTaskId = parseBackgroundTaskId(obj)
     const events: SessionEvent[] = []
     for (const c of content) {
       if (c.type === 'tool_result') {
@@ -588,6 +672,9 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
           toolName: null,
           isError,
           errorText: isError ? extractToolResultErrorText(c.content) : undefined,
+          backgroundTaskId: backgroundTaskId
+            ?? parseBackgroundLaunchString(c.content)
+            ?? undefined,
         })
       }
     }

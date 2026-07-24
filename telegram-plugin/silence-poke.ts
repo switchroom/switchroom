@@ -110,6 +110,17 @@ export interface SilencePokeState {
    * silence clock — a real reply / feed edit still does that; this only
    * gates the terminal teardown. */
   sawBashThisTurn: boolean
+  /**
+   * #3519 sharpen: claude-CLI background shells PROVEN alive right now. A
+   * shell is added on its launch marker (structured `backgroundTaskId`, via
+   * `noteBackgroundShellAlive`) and removed when the CLI proactively reports
+   * it done (`<task-notification>` completed/failed) or the model `KillShell`s
+   * it (via `noteBackgroundShellDead`). Non-empty ⇒ a process is running, so
+   * defer the 300s teardown. Empty ⇒ nothing running, so a FINISHED bash no
+   * longer defers — restoring ~300s wedge recovery that the coarse
+   * `sawBashThisTurn` guard held to 900s. Turn-scoped (cleared by startTurn),
+   * bounded by `fallbackHardCeiling` like every other defer. */
+  aliveShells: Set<string>
 }
 
 export interface ThresholdsMs {
@@ -235,6 +246,21 @@ let timer: ReturnType<typeof setInterval> | null = null
 let activeDeps: SilencePokeDeps | null = null
 
 /**
+ * #3519 sharpen — deterministic SAFE-DEGRADATION latch (process-scoped).
+ * Flipped true the first time `noteBackgroundShellAlive` fires, i.e. the
+ * moment the session-tail marker parser resolves a real `backgroundTaskId`
+ * against the live claude CLI. Its purpose is to distinguish two look-alike
+ * states that both present as "a Bash ran but no shell is registered alive":
+ *   • CLI markers work, the bash simply FINISHED  → trust the empty alive-set,
+ *     let the 300s fallback fire (fast wedge recovery restored); and
+ *   • CLI changed its markers so the parser never matches → we CANNOT tell a
+ *     live auto-backgrounded bash from a finished one, so fall back to the
+ *     coarse 900s-bounded `sawBashThisTurn` guard (never stack, never hang).
+ * Once ANY marker has parsed, the CLI is proven compatible and the alive-set
+ * is authoritative. Never seen ⇒ stay conservative. Reset by tests only. */
+let bgMarkerParserConfirmed = false
+
+/**
  * True iff the kill switch is OFF. Re-read every call so tests can
  * toggle process.env without reloading the module.
  */
@@ -256,7 +282,37 @@ export function startTurn(key: string, now: number): void {
     floorFired: false,
     inFlightTools: new Map(),
     sawBashThisTurn: false,
+    aliveShells: new Set(),
   })
+}
+
+/**
+ * #3519 sharpen: register a claude-CLI background shell as ALIVE for `key`.
+ * Called by the gateway when session-tail resolves a `backgroundTaskId` on a
+ * tool_result (a foreground Bash auto-moved to the background, or an explicit
+ * run_in_background:true). Flips the process-scoped parser-confirmed latch so
+ * the safe-degradation path knows the CLI markers are compatible. No-op when
+ * the key has no live turn (the launch outlived its turn — the cross-turn
+ * ambient owns that case, not the 300s teardown).
+ */
+export function noteBackgroundShellAlive(key: string, shellId: string): void {
+  bgMarkerParserConfirmed = true
+  const s = state.get(key)
+  if (s == null) return
+  s.aliveShells.add(shellId)
+}
+
+/**
+ * #3519 sharpen: mark a background shell DEAD for `key`. Called by the gateway
+ * on a `<task-notification>` (completed/failed) or a `KillShell`. Idempotent —
+ * removing an unknown id (already cleared, or launched in a prior turn) is a
+ * no-op. Once the set empties, a subsequent >300s silence is a real wedge and
+ * the fallback fires at ~300s.
+ */
+export function noteBackgroundShellDead(key: string, shellId: string): void {
+  const s = state.get(key)
+  if (s == null) return
+  s.aliveShells.delete(shellId)
 }
 
 /**
@@ -582,17 +638,30 @@ function tick(now: number): void {
         const forceDisable = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '0'
         if (!forceDisable && activeDeps.isLegitimatelyWorking != null) {
           if (activeDeps.isLegitimatelyWorking(key)) continue
-          // #3519: even when the callback reports "not working", a `Bash`
-          // seen earlier this turn may be running CLI-side in the background
-          // (foreground Bash auto-moved to background: its tool_result has
-          // returned so every foreground / async-dispatch signal is false,
-          // yet the process is alive and the model sits silent on it). That
-          // gap is invisible to `isLegitimatelyWorking` by construction, so
-          // defer here too — bounded by `fallbackHardCeiling` so a genuinely
-          // wedged bash-turn still unwedges at the ceiling. Scoped to the
-          // modern callback-wired path (production always wires it) so the
-          // legacy defer-off / defer-bool fixtures keep their exact semantics.
-          if (s.sawBashThisTurn) continue
+          // #3519 sharpen: even when the callback reports "not working", a
+          // `Bash` earlier this turn may have been auto-moved to the CLI-side
+          // background (its tool_result returned, so every foreground /
+          // async-dispatch signal is false, yet the process is alive and the
+          // model sits silent on it) — the gap `isLegitimatelyWorking` is
+          // blind to by construction. Two-layer defer, sharp then safe:
+          //
+          //   (1) PROVEN-alive — a background shell registered from its
+          //       structured `backgroundTaskId` launch marker and not yet
+          //       reported dead (`<task-notification>` completed / KillShell).
+          //       A process is running RIGHT NOW, so defer. When it finishes,
+          //       the alive-set empties and the fallback fires at ~300s —
+          //       restoring fast wedge recovery the coarse guard held to 900s.
+          if (s.aliveShells.size > 0) continue
+          //   (2) SAFE DEGRADATION — only while the CLI markers have NEVER
+          //       parsed (`!bgMarkerParserConfirmed`): we cannot then tell a
+          //       live auto-backgrounded bash from a finished one, so fall
+          //       back to the coarse turn-scoped `sawBashThisTurn` guard —
+          //       900s-bounded by `fallbackHardCeiling` (never stacks, never
+          //       hangs). Once ANY marker has parsed, the CLI is proven
+          //       compatible, this layer switches off, and layer (1) alone
+          //       governs. Scoped to the modern callback-wired path so the
+          //       legacy defer-off / defer-bool fixtures keep their semantics.
+          if (!bgMarkerParserConfirmed && s.sawBashThisTurn) continue
         } else if (!forceDisable && activeDeps.deferFallbackWhileToolInFlight === true && s.inFlightTools.size > 0) {
           continue
         }
@@ -699,4 +768,10 @@ export function __getStateForTests(key: string): SilencePokeState | undefined {
 export function __resetAllForTests(): void {
   state.clear()
   stopTimer()
+  bgMarkerParserConfirmed = false
+}
+
+/** Test-only: peek at the process-scoped #3519 safe-degradation latch. */
+export function __bgMarkerParserConfirmedForTests(): boolean {
+  return bgMarkerParserConfirmed
 }

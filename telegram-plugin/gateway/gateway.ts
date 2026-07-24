@@ -10918,12 +10918,36 @@ if (isGatewayMain) ipcServer = createIpcServer({
           ) {
             pendingProgress.noteAsyncDispatch(key)
           }
+          // #3519 sharpen: a `KillShell` explicitly terminates a background
+          // shell — drop it from the alive-set immediately so the model's next
+          // silent stretch recovers at ~300s rather than waiting the ceiling.
+          if (ev.toolName === 'KillShell') {
+            const killId = (ev.input as { shell_id?: string } | undefined)?.shell_id
+            if (typeof killId === 'string' && killId.length > 0) {
+              silencePoke.noteBackgroundShellDead(key, killId)
+            }
+          }
         }
       } else if (ev.kind === 'tool_result') {
         // #1292: drain the in-flight entry. Idempotent on unknown ids
         // (covers Telegram-surface tools we skipped at start time).
         if (ev.toolUseId != null && ev.toolUseId.length > 0) {
           silencePoke.noteToolEnd(key, ev.toolUseId, Date.now())
+        }
+        // #3519 sharpen: ALIVE marker. A resolved `backgroundTaskId` means the
+        // CLI moved this shell to the background and it is running now —
+        // register it so the 300s teardown defers while it lives (bounded by
+        // the 900s ceiling). Covers BOTH the auto-background gap (foreground
+        // Bash past the CLI window) and explicit run_in_background:true.
+        if (ev.backgroundTaskId != null && ev.backgroundTaskId.length > 0) {
+          silencePoke.noteBackgroundShellAlive(key, ev.backgroundTaskId)
+        }
+      } else if (ev.kind === 'task_notification') {
+        // #3519 sharpen: DEAD marker. The CLI proactively signals a background
+        // shell finished/failed — drop it from the alive-set so a subsequent
+        // >300s silence is treated as a real wedge and recovers at ~300s.
+        if (ev.taskId.length > 0) {
+          silencePoke.noteBackgroundShellDead(key, ev.taskId)
         }
       }
     }
