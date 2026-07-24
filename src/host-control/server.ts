@@ -609,6 +609,35 @@ export function isAutoRolloutRequestId(requestId: string): boolean {
   return requestId.startsWith(AUTO_ROLLOUT_REQUEST_PREFIX);
 }
 
+/**
+ * KEN-131 — durable failed/attempted latch for unattended auto-update
+ * rolls, persisted under the hostd state dir. An in-memory-only latch is
+ * structurally insufficient: hostd restarts are ROUTINE on this path (the
+ * self-bump recreates hostd's own container on essentially every auto
+ * roll, and crash-loops / host reboots clear process memory), so a broken
+ * release plus any restart would re-roll the same failed pin every
+ * watcher tick — bouncing the canary agent indefinitely with no operator
+ * in the loop. The latch is therefore written to disk AT LAUNCH
+ * (`outcome: "attempting"`) and cleared only on a confirmed green roll;
+ * a failure updates it to `"failed"`. Either state refuses an unattended
+ * retry of the SAME pin across restarts and crash windows (a roll that
+ * died mid-flight leaves `"attempting"` behind — exactly the case where
+ * an unattended retry is least safe). A NEWER published release
+ * supersedes the latch; the operator recovers by fixing the cause and
+ * rolling manually (`switchroom rollout --pin <target>`), which advances
+ * the durable pin and quiesces the check.
+ */
+export const AUTO_ROLLOUT_LATCH_FILENAME = "auto-rollout-latch.json";
+
+interface AutoRolloutLatch {
+  v: 1;
+  pin: string;
+  request_id: string;
+  outcome: "attempting" | "failed";
+  at: string;
+  reason?: string;
+}
+
 export class HostdServer {
   // One Server per bound socket path. `node:net.Server.listen` can
   // only be called once per instance — to bind N agent sockets we
@@ -660,11 +689,66 @@ export class HostdServer {
    * An unattended canary failure must NOT retry-loop every watcher tick
    * (each retry bounces the canary onto the same broken build); the
    * watcher's checkFn keeps reporting "available" until the durable pin
-   * advances, so this in-memory latch refuses re-rolls of the same
-   * target. Cleared implicitly by a hostd restart (one deliberate retry
-   * per daemon lifetime) or by a NEWER release superseding the target.
+   * advances, so this latch refuses re-rolls of the same target. This
+   * field is only the in-memory fast path / disk-write-failure fallback;
+   * the AUTHORITATIVE latch is the on-disk file
+   * ({@link AUTO_ROLLOUT_LATCH_FILENAME}) — see its doc comment for why
+   * an in-memory latch alone would retry-loop across the routine hostd
+   * restarts on this path (self-bump container recreate, crash-loops,
+   * host reboots). Superseded by a NEWER target pin.
    */
   private lastAutoRolloutFailedPin: string | null = null;
+
+  /** Path of the durable auto-rollout latch file. */
+  private autoRolloutLatchPath(): string {
+    return join(this.hostdDirPath(), AUTO_ROLLOUT_LATCH_FILENAME);
+  }
+
+  /** Read + validate the durable latch; null when absent/malformed. */
+  private readAutoRolloutLatch(): AutoRolloutLatch | null {
+    try {
+      const raw = readFileSync(this.autoRolloutLatchPath(), "utf-8");
+      const parsed = JSON.parse(raw) as AutoRolloutLatch;
+      if (
+        parsed &&
+        parsed.v === 1 &&
+        typeof parsed.pin === "string" &&
+        parsed.pin.length > 0 &&
+        (parsed.outcome === "attempting" || parsed.outcome === "failed")
+      ) {
+        return parsed;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Best-effort durable latch write — must NEVER throw into a roll path.
+   *  A write failure degrades to the in-memory latch (logged). */
+  private writeAutoRolloutLatch(latch: AutoRolloutLatch): void {
+    try {
+      mkdirSync(this.hostdDirPath(), { recursive: true });
+      writeFileSync(this.autoRolloutLatchPath(), JSON.stringify(latch, null, 2), {
+        mode: 0o600,
+      });
+    } catch (e) {
+      process.stderr.write(
+        `hostd: auto-rollout latch write failed (falling back to in-memory ` +
+          `latch for this process lifetime): ${(e as Error).message}\n`,
+      );
+    }
+  }
+
+  /** Best-effort durable latch clear (green roll / superseded target). */
+  private clearAutoRolloutLatch(): void {
+    try {
+      unlinkSync(this.autoRolloutLatchPath());
+    } catch {
+      // Absent or unremovable — absent is the common case; unremovable
+      // only ever over-blocks (fail-safe direction).
+    }
+  }
 
   /**
    * #2726 Part 2 — optional in-chat narration renderer. When wired (via
@@ -1844,14 +1928,20 @@ export class HostdServer {
   ): Promise<{ started: boolean; request_id?: string; reason?: string }> {
     const started = Date.now();
     const request_id = `${AUTO_ROLLOUT_REQUEST_PREFIX}${started}`;
-    if (this.lastAutoRolloutFailedPin === pin) {
+    const diskLatch = this.readAutoRolloutLatch();
+    if (this.lastAutoRolloutFailedPin === pin || diskLatch?.pin === pin) {
+      const why =
+        diskLatch?.pin === pin && diskLatch.outcome === "attempting"
+          ? `a previous unattended roll to ${pin} did not complete (hostd ` +
+            `restarted or crashed mid-roll — the fleet state is unverified)`
+          : `a previous unattended roll to ${pin} FAILED`;
       return {
         started: false,
         reason:
-          `a previous unattended roll to ${pin} FAILED — refusing to retry ` +
-          `unattended (fix the cause, then roll manually via \`switchroom ` +
-          `rollout --pin ${pin}\`; a newer release or a hostd restart also ` +
-          `clears this latch)`,
+          `${why} — refusing to retry unattended (the latch is durable ` +
+          `across hostd restarts; fix the cause, then roll manually via ` +
+          `\`switchroom rollout --pin ${pin}\`; a newer release supersedes ` +
+          `the latch)`,
       };
     }
     const inFlight = this.fleetMutationInFlight;
@@ -1863,6 +1953,11 @@ export class HostdServer {
           `"${inFlight.request_id}") — will re-check next tick`,
       };
     }
+    // A DIFFERENT (newer) target supersedes any stale latch. Ordered AFTER
+    // the fleet-lock check: while a roll is in flight its launch-time
+    // "attempting" latch must not be stripped by a superseding tick that
+    // the lock is about to refuse anyway.
+    if (diskLatch && diskLatch.pin !== pin) this.clearAutoRolloutLatch();
     const caller: SocketIdentity = { kind: "operator" };
     // hostd's baked-in CLI is older than EVERY fresh release, so the
     // self-bump branch is the COMMON path here: bump hostd's own compose,
@@ -1876,8 +1971,21 @@ export class HostdServer {
         op: "rollout",
         args: { pin },
       } as Extract<HostdRequest, { op: "rollout" }>;
+      // Latch BEFORE committing: the self-bump recreates hostd's own
+      // container, so only a durable marker written now can stop a fresh
+      // daemon from re-launching this same target if the bump/resume dies
+      // mid-flight. beginSelfBump's clean refusals ("nothing was changed")
+      // clear it again — those are safe to retry next tick.
+      this.writeAutoRolloutLatch({
+        v: 1,
+        pin,
+        request_id,
+        outcome: "attempting",
+        at: new Date().toISOString(),
+      });
       const resp = await this.beginSelfBump(req, caller, started);
       if (resp.result !== "started") {
+        this.clearAutoRolloutLatch();
         return {
           started: false,
           reason: resp.error ?? `self-bump refused (result=${resp.result})`,
@@ -1892,6 +2000,16 @@ export class HostdServer {
         reason: assetDenied.error ?? "apply-asset preflight refused",
       };
     }
+    // Durable "attempting" latch at launch: a roll that dies without a
+    // terminal row (hostd SIGKILLed mid-canary) must NOT be silently
+    // retried by the next daemon — cleared only on a confirmed green roll.
+    this.writeAutoRolloutLatch({
+      v: 1,
+      pin,
+      request_id,
+      outcome: "attempting",
+      at: new Date().toISOString(),
+    });
     this.launchRollout({ pin }, request_id, caller, started);
     return { started: true, request_id };
   }
@@ -2283,6 +2401,21 @@ export class HostdServer {
       };
       this.recordStatus(entry);
       process.stderr.write(`hostd: self-bump resume failed: ${why}\n`);
+      // KEN-131 — an UNATTENDED roll that died at the self-bump must latch
+      // durably too, or the watcher's next tick re-runs the whole
+      // bump-and-fail cycle forever (the pin never advanced, so the check
+      // keeps reporting "available").
+      if (isAutoRolloutRequestId(marker.request_id)) {
+        this.lastAutoRolloutFailedPin = marker.pin;
+        this.writeAutoRolloutLatch({
+          v: 1,
+          pin: marker.pin,
+          request_id: marker.request_id,
+          outcome: "failed",
+          at: new Date().toISOString(),
+          reason: "self-bump",
+        });
+      }
       await this.writeTerminalAudit(entry);
       this.pushRolloutTerminal(entry);
     };
@@ -3756,8 +3889,27 @@ export class HostdServer {
         // alert the operator and release the lock.
         if (isAutoRolloutRequestId(entry.request_id) && entry.result !== "completed") {
           this.lastAutoRolloutFailedPin = entry.pin ?? null;
+          if (entry.pin) {
+            // Upgrade the launch-time "attempting" latch to a durable
+            // "failed" — survives hostd restarts (self-bump recreate,
+            // crash-loops), so the same broken pin is never re-rolled
+            // unattended by a fresh daemon.
+            this.writeAutoRolloutLatch({
+              v: 1,
+              pin: entry.pin,
+              request_id: entry.request_id,
+              outcome: "failed",
+              at: new Date().toISOString(),
+              ...(entry.failed_step ? { reason: entry.failed_step } : {}),
+            });
+          }
           void this.finishFailedAutoRollout(entry, priorPinAtStart);
           return;
+        }
+        // Green unattended roll — release the durable launch latch so the
+        // NEXT release can auto-roll.
+        if (isAutoRolloutRequestId(entry.request_id)) {
+          this.clearAutoRolloutLatch();
         }
         // #2726 — terminal effects. All fire-and-forget and defensively
         // wrapped: a chat push / narrator finalize must NEVER block the lock
@@ -3850,10 +4002,17 @@ export class HostdServer {
       (entry.failed_step === "restart-agent" && rolledCount === 0);
     if (!beforeAnyAgent) {
       notes.push(
-        `No automatic rollback: ${rolledCount} agent(s) already confirmed on ` +
-          `${entry.pin ?? "the target"} past a green canary ` +
-          `(${(entry.rolled ?? []).join(", ") || "none"}). The fleet is mixed — ` +
-          `finish the roll or roll back manually.`,
+        rolledCount > 0
+          ? `No automatic rollback: ${rolledCount} agent(s) already confirmed on ` +
+              `${entry.pin ?? "the target"} past a green canary ` +
+              `(${(entry.rolled ?? []).join(", ")}). The fleet is mixed — ` +
+              `finish the roll or roll back manually.`
+          : // rolled=0 but failed_step isn't apply/restart-agent — the roll
+            // was refused BEFORE apply (e.g. preflight-stale-cli) or died
+            // without a step label: nothing was changed, nothing to revert.
+            `No automatic rollback: the roll stopped at ` +
+              `${entry.failed_step ?? "an unknown step"} before any change ` +
+              `landed — nothing to revert. Verify host-side if unsure.`,
       );
       return notes;
     }

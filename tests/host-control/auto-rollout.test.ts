@@ -52,9 +52,12 @@ interface Harness {
  * Bare server with a stubbed `runSwitchroom`. `onRun` maps the spawned
  * argv to a fake result; every invocation is recorded in `calls`.
  */
-function makeServer(onRun: (args: string[]) => RunResult): Harness {
+function makeServer(
+  onRun: (args: string[]) => RunResult,
+  homeDir?: string,
+): Harness {
   const posted: RolloutTerminalNotice[] = [];
-  const dir = mkdtempSync(join(tmpdir(), "auto-rollout-test-"));
+  const dir = homeDir ?? mkdtempSync(join(tmpdir(), "auto-rollout-test-"));
   const server = new HostdServer({
     homeDir: dir,
     agentUids: {},
@@ -233,6 +236,91 @@ describe("startAutoRollout — canary failure halts (hardened no-operator path)"
     // Only the rollout child ran — no apply / restart recovery spawns.
     expect(h.calls).toHaveLength(1);
     expect(h.posted[0]!.text).toMatch(/No automatic rollback/);
+  });
+});
+
+describe("startAutoRollout — latch durability across hostd restarts (KEN-131)", () => {
+  // hostd restarts are ROUTINE on the auto-update path (the self-bump
+  // recreates hostd's own container on essentially every roll; crash-loops
+  // and host reboots also clear process memory). These tests construct a
+  // SECOND HostdServer over the same home dir — the "restarted daemon" —
+  // and assert the failed-pin latch still refuses an unattended retry.
+  // With an in-memory-only latch each of these would retry the broken
+  // pin, bouncing the canary forever with no operator in the loop.
+
+  function failingRun(args: string[]): RunResult {
+    if (args[0] === "rollout") {
+      return {
+        exit_code: 1,
+        stdout:
+          encodeRolloutResultLine({
+            ok: false,
+            rolled: [],
+            failedStep: "restart-agent",
+            failedAgent: "test-harness",
+            got: null,
+            warnings: [],
+          }) + "\n",
+        stderr: "",
+      };
+    }
+    return { exit_code: 0, stdout: "", stderr: "" };
+  }
+
+  it("a FAILED pin is refused by a fresh daemon (restart does not clear the latch)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "auto-rollout-restart-"));
+    const h1 = makeServer(failingRun, dir);
+    await h1.startAutoRollout("v1.0.1");
+    await waitForTerminal(h1);
+    // "Restart": brand-new server instance, same home dir, empty memory.
+    const h2 = makeServer(failingRun, dir);
+    const retry = await h2.startAutoRollout("v1.0.1");
+    expect(retry.started).toBe(false);
+    expect(retry.reason).toMatch(/FAILED/);
+    expect(h2.calls.filter((c) => c[0] === "rollout")).toHaveLength(0);
+    // A NEWER release still supersedes the durable latch after restart.
+    const newer = await h2.startAutoRollout("v1.0.2");
+    expect(newer.started).toBe(true);
+  });
+
+  it("a roll interrupted WITHOUT a terminal row (hostd killed mid-roll) is not retried after restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "auto-rollout-crash-"));
+    // Roll child never resolves — simulates hostd dying mid-canary (no
+    // terminal handler ever runs, only the launch-time latch exists).
+    const h1 = makeServer(failingRun, dir);
+    (h1.server as unknown as { runSwitchroom: () => Promise<RunResult> }).runSwitchroom =
+      () => new Promise<RunResult>(() => {});
+    const first = await h1.startAutoRollout("v1.0.1");
+    expect(first.started).toBe(true);
+    const h2 = makeServer(failingRun, dir);
+    const retry = await h2.startAutoRollout("v1.0.1");
+    expect(retry.started).toBe(false);
+    expect(retry.reason).toMatch(/did not complete/);
+    expect(h2.calls).toHaveLength(0);
+  });
+
+  it("a GREEN roll clears the durable latch (next daemon can roll again)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "auto-rollout-green-"));
+    const green = (args: string[]): RunResult => ({
+      exit_code: 0,
+      stdout:
+        args[0] === "rollout"
+          ? encodeRolloutResultLine({
+              ok: true,
+              rolled: ["test-harness", "overlord", "clerk"],
+              warnings: [],
+            }) + "\n"
+          : "",
+      stderr: "",
+    });
+    const h1 = makeServer(green, dir);
+    await h1.startAutoRollout("v1.0.1");
+    await waitForTerminal(h1);
+    const h2 = makeServer(green, dir);
+    // Same pin again from a fresh daemon: no latch left behind, so the
+    // roll STARTS (the version-compare quiesce lives upstream in checkFn).
+    const again = await h2.startAutoRollout("v1.0.1");
+    expect(again.started).toBe(true);
   });
 });
 

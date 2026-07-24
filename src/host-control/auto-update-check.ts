@@ -115,8 +115,21 @@ export function makeAutoUpdateCheck(
   const fetchLatest = opts.fetchLatestVersion ?? fetchNpmLatestVersion;
   const imageExists =
     opts.imageExists ??
-    (async (ref: string) =>
-      (await probeRemoteDigest(ref)).digest !== null);
+    (async (ref: string) => {
+      const probe = await probeRemoteDigest(ref);
+      // A transient registry ERROR and a genuinely missing manifest both
+      // yield digest=null and are treated identically — fail-CLOSED (defer,
+      // never roll on ambiguity; the next tick retries). Log the probe
+      // error so an operator can tell the two apart in hostd's stderr.
+      if (probe.digest === null && probe.error) {
+        log(
+          `auto-update: manifest probe for ${ref} returned no digest ` +
+            `(missing image OR registry error — deferring either way): ` +
+            probe.error,
+        );
+      }
+      return probe.digest !== null;
+    });
   return async () => {
     const latest = `v${(await fetchLatest()).trim().replace(/^v/, "")}`;
     const pin = opts.getCurrentPin();
