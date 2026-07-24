@@ -60,6 +60,7 @@ import {
 import {
   VoiceOnDemandCache,
 } from '../voice-ondemand.js'
+import { makeOutboxListenMarkupResolver } from './outbox-listen-markup.js'
 import {
   PreSynthQueue,
   sweepVoiceCacheDir,
@@ -9851,7 +9852,7 @@ function runDeliveryConfirmSweep(): void {
 const _deliveryConfirmSweep = isGatewayMain ? setInterval(runDeliveryConfirmSweep, DELIVERY_CONFIRM_SWEEP_MS) : undefined
 _deliveryConfirmSweep?.unref?.()
 
-startOutboxSweep({ isGatewayMain, stateDir: STATE_DIR, getBot: () => bot, getTurnsDb: () => turnsDb, dedupCheck: (c, t, x) => outboundDedup.check(c, t, x, Date.now()) != null, log: (l) => process.stderr.write(l) }) // outbox: single deliverer for Stop-hook-captured prose (../outbox.ts)
+startOutboxSweep({ isGatewayMain, stateDir: STATE_DIR, getBot: () => bot, getTurnsDb: () => turnsDb, dedupCheck: (c, t, x) => outboundDedup.check(c, t, x, Date.now()) != null, resolveReplyMarkup: makeOutboxListenMarkupResolver({ resolveVoiceOutPlan: (t) => resolveVoiceOutPlan(loadAccess().voice_out, t), cachePut: (token, payload) => voiceOnDemandCache.put(token, payload), eagerVoiceEnabled, enqueuePreSynth: (j) => voicePreSynthQueue.enqueue(j) }), log: (l) => process.stderr.write(l) }) // outbox: single deliverer for Stop-hook prose; resolveReplyMarkup keeps the #3502 Listen button on net-delivered answers (../outbox.ts)
 
 // #1445 cross-turn pending-async ambient. When a turn ends after the
 // model dispatched background async work (Agent / Task / Bash run-in-
@@ -22501,7 +22502,9 @@ bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) =>
 bot.on('message:pinned_message', ctx => handlePinnedMessage(ctx, pinnedMessageHandlerDeps))
 // Bot API 10.1 rich messages (forwarded bot messages carry these with NO
 // text/caption — see rich-message-handler.ts; MUST precede the catch-all).
-bot.on('message:rich_message', ctx => handleRichMessageMessage(ctx, mediaEnvelopeDeps))
+// Pure forwarded body text, no attachment → coalesce like `message:text`:
+// bind `handleInbound` to `handleInboundCoalesced`, not the bare one (#3516).
+bot.on('message:rich_message', ctx => handleRichMessageMessage(ctx, { ...mediaEnvelopeDeps, handleInbound: handleInboundCoalesced }))
 installUnhandledMessageCatchAll(
   bot,
   (ctx, text) => routeInbound(ctx, text, undefined, undefined, inboundRouterDeps),

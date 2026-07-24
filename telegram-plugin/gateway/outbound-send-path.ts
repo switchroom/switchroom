@@ -65,9 +65,8 @@ import {
 import { decideAnswerLatchSuppression, type ReplyOwnerTier } from '../reply-owner-resolve.js'
 import { deriveTelegraphTitle } from '../telegraph.js'
 import {
-  mintVoiceOnDemandToken,
-  buildListenKeyboard,
   mayInjectListenButton,
+  planListenButton,
   type VoiceOnDemandCache,
 } from '../voice-ondemand.js'
 import { eagerVoiceEnabled, type PreSynthQueue } from '../voice-presynth.js'
@@ -1495,31 +1494,34 @@ export async function sendReply(
   // config never reaches here (it synthesized immediately above), so a Listen
   // button is never minted for an engine whose taps would dead-end on the
   // local sidecar.
-  if (
-    useOnDemandButton &&
-    voiceOutPlan!.ttsChunks.length > 0 &&
-    voiceOutPlan!.ttsChunks[0]!.length > 0
-  ) {
-    if (!mayInjectListenButton(rawKeyboard)) {
-      process.stderr.write(
-        'telegram gateway: voice-out on-demand: agent supplied inline_keyboard — skipping Listen button (single_use collision gate)\n',
-      )
+  if (useOnDemandButton) {
+    // planListenButton is the SHARED decision (also used by the durable-outbox
+    // safety net, outbox-sweep.ts) — it enforces the empty-TTS guard and the
+    // agent-keyboard collision gate. Null = don't inject.
+    const listenPlan = planListenButton({ voiceOutPlan, rawKeyboard })
+    if (listenPlan == null) {
+      // Log the collision gate ONLY when the agent keyboard is the ACTUAL
+      // reason we skipped — i.e. there IS speakable text. When ttsChunks is
+      // empty the empty-TTS guard is what returned null (there was nothing to
+      // speak), so a "skipping — agent supplied inline_keyboard" line would
+      // misattribute the reason.
+      const hasSpeakableText =
+        voiceOutPlan!.ttsChunks.length > 0 && voiceOutPlan!.ttsChunks[0]!.length > 0
+      if (hasSpeakableText && !mayInjectListenButton(rawKeyboard)) {
+        process.stderr.write(
+          'telegram gateway: voice-out on-demand: agent supplied inline_keyboard — skipping Listen button (single_use collision gate)\n',
+        )
+      }
     } else {
       // Token is intentionally GLOBAL (not chat-keyed): under the single-tenant
       // invariant the operator is the only authorized sender across all chats,
       // and the tap handler re-checks access.allowFrom before synthesizing, so
       // a token needs no per-chat scoping to be safe.
-      const token = mintVoiceOnDemandToken()
-      voiceOnDemandCache.put(token, {
-        // ttsChunks[0] is already normalizeForSpeech(reply) (kokoro path).
-        text: voiceOutPlan.ttsChunks[0]!,
-        ...(voiceOutPlan.voice != null ? { voice: voiceOutPlan.voice } : {}),
-        speed: voiceOutPlan.speed,
-      })
+      voiceOnDemandCache.put(listenPlan.token, listenPlan.payload)
       // The keyboard stays after the tap (never stripped) so it can be
       // replayed. The gate above guarantees this is the ONLY button on the
       // message, so keeping it is safe (no agent buttons to protect).
-      replyMarkup = buildListenKeyboard(token)
+      replyMarkup = listenPlan.replyMarkup
       // #2763 eager pre-synthesis: kick a background synth of the same
       // payload so the Listen tap attaches the pre-made file instantly.
       // Local-engine only (useOnDemandButton already gates engine==='kokoro'
@@ -1530,10 +1532,10 @@ export async function sendReply(
       // to the lazy path).
       if (eagerVoiceEnabled()) {
         voicePreSynthQueue.enqueue({
-          token,
-          text: voiceOutPlan.ttsChunks[0]!,
-          ...(voiceOutPlan.voice != null ? { voice: voiceOutPlan.voice } : {}),
-          speed: voiceOutPlan.speed,
+          token: listenPlan.token,
+          text: listenPlan.payload.text,
+          ...(listenPlan.payload.voice != null ? { voice: listenPlan.payload.voice } : {}),
+          speed: listenPlan.payload.speed,
         })
       }
     }
