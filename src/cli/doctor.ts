@@ -41,6 +41,7 @@ import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runWebkiteChecks } from "./doctor-webkite.js";
 import { runCronSessionChecks } from "./doctor-cron-session.js";
+import { runGeneratedSurfaceDriftChecks } from "./doctor-drift.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
 import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
@@ -3279,6 +3280,17 @@ export function registerDoctorCommand(program: Command): void {
           // the fleet today — only agents the value-gate routes to a cron
           // session produce a line.
           { title: "Cron Session", results: runCronSessionChecks(config) },
+          {
+            // KEN-130: every generated/synced surface (compose, hooks,
+            // start.sh/CLAUDE.md/.mcp.json stamp, skills, image hook
+            // scripts) compared against a current render. warn-only —
+            // drift never changes doctor's exit code. Also persists the
+            // per-agent .switchroom-drift.json the boot card reads.
+            title: "Generated-surface drift (KEN-130)",
+            results: await runGeneratedSurfaceDriftChecks(config, configPath, {
+              fast: opts.fast,
+            }),
+          },
         ];
 
         // Repo Hygiene (#1072): only when doctor runs from a switchroom

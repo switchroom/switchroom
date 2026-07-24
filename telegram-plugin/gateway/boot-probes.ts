@@ -1492,3 +1492,90 @@ const realSkillsFs: SkillsFsImpl = {
   readdir: (p) => readdirSync(p),
   exists: (p) => existsSync(p),
 }
+
+// ─── Probe: Generated-surface drift (KEN-130) ────────────────────────────────
+
+/**
+ * Surfaces two drift signals on the boot card:
+ *
+ *   1. Live stamp comparison — the generation stamp written by the last
+ *      host-side reconcile (`<agentDir>/.switchroom-generated.json`)
+ *      vs the deployed start.sh / managed CLAUDE.md section / .mcp.json.
+ *      Pure fs hash compare via src/agents/generation-stamp.ts (which is
+ *      dependency-free by design), so it runs at every boot without any
+ *      host involvement.
+ *   2. The host-side drift report (`<agentDir>/.switchroom-drift.json`)
+ *      written by `switchroom doctor` — covers the surfaces only the
+ *      host can render (compose, hooks re-render, skills pool, image
+ *      hook scripts). Rendered with its age so a stale report is
+ *      readable as such; doctor rewrites it (empty when clean) on every
+ *      run and reconcile refreshes the stamp, so staleness windows are
+ *      short.
+ *
+ * No stamp AND no report → ok (fresh agent / pre-KEN-130 host): the
+ * silent-when-healthy contract means clean fleets never grow a row.
+ */
+export async function probeDrift(
+  agentDir: string,
+  opts: { agentName?: string; nowMs?: () => number } = {},
+): Promise<ProbeResult> {
+  return withTimeout('Drift', (async (): Promise<ProbeResult> => {
+    const surfaces: string[] = []
+
+    // 1. Stamp comparison (in-container checkable surfaces).
+    try {
+      const { detectStampDrift } = await import(
+        '../../src/agents/generation-stamp.js'
+      )
+      const stamp = detectStampDrift(agentDir)
+      for (const f of stamp.findings) {
+        surfaces.push(`${f.surface} (${f.detail})`)
+      }
+    } catch {
+      /* generation-stamp unavailable (unbundled build) — skip signal 1 */
+    }
+
+    // 2. Host-written doctor report.
+    try {
+      const raw = readFileSync(join(agentDir, '.switchroom-drift.json'), 'utf8')
+      const report = JSON.parse(raw) as {
+        version?: number
+        generatedAt?: string
+        findings?: Array<{ surface?: string; detail?: string }>
+      }
+      if (report?.version === 1 && Array.isArray(report.findings)) {
+        const seen = new Set(surfaces.map((s) => s.split(' ')[0]))
+        let ageNote = ''
+        const gen = report.generatedAt ? Date.parse(report.generatedAt) : NaN
+        if (Number.isFinite(gen)) {
+          const ageMs = (opts.nowMs?.() ?? Date.now()) - gen
+          if (ageMs > 3_600_000) {
+            const hours = Math.round(ageMs / 3_600_000)
+            const human = hours >= 48 ? `${Math.round(hours / 24)}d` : `${hours}h`
+            ageNote = ` — as of ${human} ago`
+          }
+        }
+        for (const f of report.findings) {
+          if (!f?.surface || seen.has(f.surface)) continue
+          seen.add(f.surface)
+          surfaces.push(`${f.surface}${ageNote}`)
+        }
+      }
+    } catch {
+      /* no report / unreadable — fine, doctor hasn't run */
+    }
+
+    if (surfaces.length === 0) {
+      return { status: 'ok', label: 'Drift', detail: 'generated surfaces in sync' }
+    }
+    const shown = surfaces.slice(0, 4).join(', ')
+    const more = surfaces.length > 4 ? ` +${surfaces.length - 4} more` : ''
+    const target = opts.agentName ? ` ${opts.agentName}` : ''
+    return {
+      status: 'degraded',
+      label: 'Drift',
+      detail: `${surfaces.length} drifted surface(s): ${shown}${more}`,
+      nextStep: `Run \`switchroom apply\` (or \`switchroom agent reconcile${target} --restart\`); see \`switchroom doctor\` for detail`,
+    }
+  })())
+}
