@@ -131,6 +131,13 @@ describe('wiring: message:rich_message dispatches through the coalescing path', 
 
 // ---------------------------------------------------------------------------
 // Guard 2 — outcome: real handler + real coalescer
+//
+// NOTE: Guard 2 drives its OWN `richCoalesces` boolean toggle rather than
+// importing the gateway's dispatch wiring, so it validates the coalescer
+// CONTRACT (folding/ordering into one turn vs. the pre-fix split) — it is NOT
+// a wiring regression guard. Guard 1 (the AST/source-parse over gateway.ts) is
+// the SOLE guard that regresses if the rich_message registration stops routing
+// through `handleInboundCoalesced`.
 // ---------------------------------------------------------------------------
 
 const CHAT_ID = -1004223464247

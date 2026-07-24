@@ -219,8 +219,9 @@ export function extractRichMessageText(rich: unknown): string | undefined {
  * `message:rich_message` handler — renders the body and hands it to the
  * normal COALESCING inbound pipeline, identical to `message:text`. It shares
  * the cluster-A `MediaEnvelopeDeps` SHAPE, but gateway.ts binds this handler's
- * `deps.handleInbound` to `handleInboundCoalesced` (see `richMessageHandlerDeps`
- * there), NOT the bare `handleInbound` the media-envelope handlers use: a rich
+ * `deps.handleInbound` to `handleInboundCoalesced` via an inline spread at the
+ * registration site — `{ ...mediaEnvelopeDeps, handleInbound: handleInboundCoalesced }`
+ * — NOT the bare `handleInbound` the media-envelope handlers use: a rich
  * message is pure forwarded body text with no attachment, so a forwarded bot
  * message arriving in the same sliding window as another inbound folds into one
  * turn (same coalescing contract as `message:text`). Access gating +
