@@ -166,6 +166,23 @@ export function makeApply(switchroomBin: string) {
   };
 }
 
+/**
+ * Build a plan probe for the update-notifier card body (KEN-129):
+ * `switchroom update --check` — the read-only dry-run that prints
+ * what an update would do (versions behind, images to pull). Best-
+ * effort: a non-zero exit still returns whatever stdout was produced
+ * (the caller falls back to the raw digest when empty). Tail-clipped
+ * so a chatty plan can't blow the card body (the gateway truncates
+ * again anyway).
+ */
+export function makeUpdatePlan(switchroomBin: string) {
+  return async (): Promise<string> => {
+    const r = await run(switchroomBin, ["update", "--check"], 2 * 60_000);
+    const out = r.stdout.trim();
+    return out.length > 4000 ? out.slice(-4000) : out;
+  };
+}
+
 /** Build a `restartFn` that runs `switchroom restart all` (graceful). */
 export function makeRestart(switchroomBin: string) {
   return async () => {

@@ -87,6 +87,28 @@ afterEach(() => {
 // 32768-char wire limit (RENDERED_BODY_CAP=32000), not the old 4096.
 const RICH_LIMIT = 32768;
 describe("buildConfigApprovalCardBody", () => {
+  it("renders the default config-edit header when no title is passed", () => {
+    const { body } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "a_reason",
+      unifiedDiff: "diff",
+    });
+    expect(body.startsWith("🛠 **Config edit proposed**\n")).toBe(true);
+  });
+
+  it("KEN-129: an explicit title overrides the config-edit header", () => {
+    const { body } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "fleet is behind",
+      unifiedDiff: "update plan",
+      title: "⬆️ **Switchroom update available — fleet is behind**",
+    });
+    expect(
+      body.startsWith("⬆️ **Switchroom update available — fleet is behind**\n"),
+    ).toBe(true);
+    expect(body).not.toContain("Config edit proposed");
+  });
+
   it("ships the diff verbatim inside a fenced code block (< / & stay literal)", () => {
     const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
