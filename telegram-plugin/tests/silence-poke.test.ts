@@ -752,9 +752,9 @@ describe('silence-poke — #3519 background-bash defer (stacked-cards regression
 // alive (its structured `backgroundTaskId` launch marker seen, no completion
 // yet), and recover at ~300s the moment it finishes. The alive/dead facts here
 // are PARSED FROM REAL JSONL (tests/fixtures/bg-shell-liveness-3519.jsonl —
-// carrie session 1db49136-…, claude v2.1.185; line 35 auto-background launch,
-// line 68 `<task-notification>` completion — verbatim but for the operator home
-// path scrubbed to `~` per repo PII policy) through the SAME projectTranscriptLine
+// carrie session a6d2d33a-…, claude v2.1.197; line 109 auto-background launch,
+// line 175 `<task-notification>` completion — verbatim but for the operator username
+// scrubbed in both encodings per repo PII policy) through the SAME projectTranscriptLine
 // path the gateway uses, then fed to silence-poke exactly as the gateway feeds
 // it (tool_result.backgroundTaskId → noteBackgroundShellAlive; task_notification
 // → noteBackgroundShellDead). So every fixture value is traceable to a real byte.
@@ -772,8 +772,8 @@ describe('silence-poke — #3519 sharpen: proven-alive defer (real markers)', ()
   const DEAD_ID = deadEv.kind === 'task_notification' ? deadEv.taskId : ''
 
   it('sanity: the fixtures really carry a matching background-shell id', () => {
-    expect(LIVE_ID).toBe('bweqqjn9r')
-    expect(DEAD_ID).toBe('bweqqjn9r')
+    expect(LIVE_ID).toBe('bxa4sv3dq')
+    expect(DEAD_ID).toBe('bxa4sv3dq')
   })
 
   // (a) A shell PROVEN alive across a > 300s gap must NOT tear down the card —

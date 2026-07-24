@@ -7,7 +7,7 @@
 // finishes. Called once per session event from the gateway's event loop.
 //
 // The three real, deterministic markers (all proven from captured transcript
-// data — carrie session 1db49136-…, claude v2.1.185; see the fixture at
+// data — carrie session a6d2d33a-…, claude v2.1.197; see the fixture at
 // telegram-plugin/tests/fixtures/bg-shell-liveness-3519.jsonl):
 //   • ALIVE — a tool_result carrying `backgroundTaskId` (a foreground Bash the
 //     CLI auto-moved to the background past its ~120s window, or an explicit
@@ -26,6 +26,9 @@ export interface BackgroundShellRegistry {
   noteBackgroundShellDead(key: string, shellId: string): void
 }
 
+/** Terminal `<task-notification>` statuses that genuinely mean the shell ended. */
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'killed'])
+
 /**
  * Apply the background-shell liveness signal carried by `ev` (if any) to the
  * registry for `key`. A no-op for events that carry no marker, so the caller
@@ -43,7 +46,12 @@ export function applyBackgroundShellLiveness(
     return
   }
   if (ev.kind === 'task_notification') {
-    if (ev.taskId.length > 0) {
+    // Defensive terminal-status gate: real captured data proves every genuine
+    // parseable <task-notification> carries a terminal status, so today ANY
+    // parsed notification is safe to treat as DEAD. This guards a hypothetical
+    // FUTURE CLI that emits an interim (non-terminal) notification for a still-
+    // running shell — we must not drop such a shell from the alive-set early.
+    if (ev.taskId.length > 0 && TERMINAL_STATUSES.has(ev.status)) {
       registry.noteBackgroundShellDead(key, ev.taskId)
     }
     return

@@ -1021,25 +1021,29 @@ describe('projectAssistantTextBlocks (shared text→narrative kernel)', () => {
 
 // ─── #3519 sharpen: background-shell liveness markers, from REAL captured data ─
 // Fixtures are VERBATIM lines from a real agent transcript — no hand-written
-// approximations. Provenance (cited so a reviewer can independently verify):
-//   file:  /host/mnt/bulkdata/switchroom/agents/carrie/.claude/projects/
+// approximations. Provenance (cited so a reviewer can independently verify;
+// this is a SURVIVING, reachable session — the earlier 1db49136 session was
+// rotated off host, so the fixture was regenerated from this one):
+//   file:  /host-home/.switchroom/agents/carrie/.claude/projects/
 //          -home-kenthompson--switchroom-agents-carrie/
-//          1db49136-9d5a-41f9-a88a-1e4ddf843bc0.jsonl  (claude CLI v2.1.185)
-//   line 35 → ALIVE: a FOREGROUND Bash (tool_use input has NO run_in_background;
-//            spawned 04:16:01Z) that the CLI auto-moved to the background at its
-//            ~120s foreground window (tool_result at 04:18:01Z) — the exact
+//          a6d2d33a-a8a6-40ce-81d0-cb4bd867ac89.jsonl  (claude CLI v2.1.197)
+//   line 109 → ALIVE: a FOREGROUND Bash (tool_use input has NO
+//            run_in_background) that the CLI auto-moved to the background at its
+//            ~120s foreground window (tool_result at 00:35:56Z) — the exact
 //            #3519 auto-background case. Carries BOTH the structured
-//            `toolUseResult.backgroundTaskId:"bweqqjn9r"` and the launch string
-//            "Command running in background with ID: bweqqjn9r. …".
-//   line 68 → DEAD: the CLI's proactive `<task-notification>` for the SAME id
-//            (`<task-id>bweqqjn9r</task-id>`, `<status>completed</status>`),
+//            `toolUseResult.backgroundTaskId:"bxa4sv3dq"` and the launch string
+//            "Command running in background with ID: bxa4sv3dq. …".
+//   line 175 → DEAD: the CLI's proactive `<task-notification>` for the SAME id
+//            (`<task-id>bxa4sv3dq</task-id>`, `<status>completed</status>`),
 //            enqueued as a queue-operation.
-//   line 75 → the mirrored `type:"attachment"` copy of the same notification.
+//   line 180 → the mirrored `type:"attachment"` copy of the same notification.
 // The three lines are copied into tests/fixtures/bg-shell-liveness-3519.jsonl
-// byte-for-byte EXCEPT the operator home path (scrubbed to `~`)
-// (repo PII policy, scripts/check-no-pii-secrets.mjs). Every marker-bearing
-// field — backgroundTaskId, the launch string + id, the <task-notification>
-// tags — is untouched.
+// byte-for-byte EXCEPT the operator username, scrubbed in BOTH encodings — the
+// slash home path (`/home/<user>` → `~`) and the dashed tmp-path form
+// (`-home-<user>-` → `-home-user-`) — per repo PII policy
+// (scripts/check-no-pii-secrets.mjs). Every marker-bearing field —
+// backgroundTaskId, the launch string + id, the <task-notification> tags — is
+// untouched.
 describe('projectTranscriptLine — #3519 background-shell liveness (real fixtures)', () => {
   const FIXTURE = join(__dirname, 'fixtures', 'bg-shell-liveness-3519.jsonl')
   const lines = readFileSync(FIXTURE, 'utf8').split('\n').filter(l => l.length > 0)
@@ -1055,8 +1059,8 @@ describe('projectTranscriptLine — #3519 background-shell liveness (real fixtur
     expect(tr).toBeDefined()
     expect(tr).toMatchObject({
       kind: 'tool_result',
-      toolUseId: 'toolu_013ttdvqJDUsnJRh55RZPzai',
-      backgroundTaskId: 'bweqqjn9r',
+      toolUseId: 'toolu_01B7T3y1t95oHDEqYKwSmqaW',
+      backgroundTaskId: 'bxa4sv3dq',
     })
   })
 
@@ -1067,7 +1071,7 @@ describe('projectTranscriptLine — #3519 background-shell liveness (real fixtur
     // an inbound user turn (no `enqueue` event).
     const events = projectTranscriptLine(deadEnqueueLine)
     expect(events).toEqual([
-      { kind: 'task_notification', taskId: 'bweqqjn9r', status: 'completed' },
+      { kind: 'task_notification', taskId: 'bxa4sv3dq', status: 'completed' },
     ])
   })
 
@@ -1101,6 +1105,6 @@ describe('projectTranscriptLine — #3519 background-shell liveness (real fixtur
     delete obj.toolUseResult.backgroundTaskId
     const events = projectTranscriptLine(JSON.stringify(obj))
     const tr = events.find(e => e.kind === 'tool_result')
-    expect(tr?.kind === 'tool_result' ? tr.backgroundTaskId : null).toBe('bweqqjn9r')
+    expect(tr?.kind === 'tool_result' ? tr.backgroundTaskId : null).toBe('bxa4sv3dq')
   })
 })

@@ -280,8 +280,8 @@ function extractToolResultErrorText(content: unknown): string {
  * id off the structured, sibling top-level `toolUseResult.backgroundTaskId`
  * field of a `type:"user"` transcript line. This is the version-robust source
  * (a named JSON field, not prose). Real shape (carrie session
- * 1db49136-…, v2.1.185, line 35):
- *   "toolUseResult":{…,"backgroundTaskId":"bweqqjn9r"}
+ * a6d2d33a-…, v2.1.197, line 109):
+ *   "toolUseResult":{…,"backgroundTaskId":"bxa4sv3dq"}
  * Returns the id, or null when the line carries no backgrounded shell.
  */
 export function parseBackgroundTaskId(obj: Record<string, unknown>): string | null {
@@ -296,8 +296,8 @@ export function parseBackgroundTaskId(obj: Record<string, unknown>): string | nu
 /**
  * #3519 sharpen — ALIVE marker (secondary): match the launch STRING in the
  * tool_result `content` when the structured field is absent (older CLI, or a
- * shape change that keeps the human string). Real bytes (same line 35):
- *   "Command running in background with ID: bweqqjn9r. Output is being written…"
+ * shape change that keeps the human string). Real bytes (same line 109):
+ *   "Command running in background with ID: bxa4sv3dq. Output is being written…"
  * DELIBERATELY the fallback, not the primary — if BOTH miss (CLI changed the
  * string too) the caller degrades to the 900s-bounded sawBash guard. Accepts
  * the same string|content-block shapes as extractToolResultErrorText.
@@ -313,9 +313,9 @@ export function parseBackgroundLaunchString(content: unknown): string | null {
 /**
  * #3519 sharpen — DEAD marker: parse a claude-CLI `<task-notification>` block.
  * The CLI enqueues this proactively when a backgrounded shell finishes. Real
- * bytes (carrie session 1db49136-…, v2.1.185, line 68 queue-operation enqueue
- * content, and mirrored line 75 attachment):
- *   "<task-notification>\n<task-id>bweqqjn9r</task-id>\n…\n<status>completed</status>\n…"
+ * bytes (carrie session a6d2d33a-…, v2.1.197, line 175 queue-operation enqueue
+ * content, and mirrored line 180 attachment):
+ *   "<task-notification>\n<task-id>bxa4sv3dq</task-id>\n…\n<status>completed</status>\n…"
  * Returns {taskId,status} when both tags are present, else null (so an
  * ordinary inbound enqueue falls through to the normal user-turn path).
  */
