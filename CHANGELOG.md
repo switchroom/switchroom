@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## v0.19.16 — Telegram: forwarded-message coalescing, Listen button, quieter progress cards, cleaner voice
+
+### Telegram forwarding (#3523)
+
+- **Forwarded rich messages route through the coalescing pipeline (#3523)** —
+  a forwarded bot/rich message (Bot API `rich_message` content, no top-level
+  text) was wired to the metadata-only envelope path, bypassing the inbound
+  coalescing window that every other message type uses. A burst of forwards
+  could therefore fire multiple separate turns instead of one. The
+  `rich_message` handler now dispatches through `handleInboundCoalesced` like
+  `message:text`, so a multi-forward burst coalesces into a single turn with
+  numbered origin siblings. Guarded by an AST source-parse regression test on
+  the wiring plus a real-grammy coalescer-contract test.
+
+### Telegram delivery (#3520)
+
+- **The 🔊 Listen button survives outbox-sweep delivery (#3520)** — an answer
+  delivered via the durable outbox-sweep backstop (rather than the normal
+  send path) dropped its Listen button, so voice playback was unavailable on
+  exactly the answers most likely to matter after a restart. The button is now
+  attached on the sweep path too.
+
+### Telegram progress cards (#3521)
+
+- **No more stacked progress cards on CLI-side background bash (#3519, #3521)**
+  — the 300s silence-fallback fired even while a CLI-side background shell was
+  actively making progress, stacking redundant progress cards on top of each
+  other. The fallback is now deferred while background bash is live, so the
+  user sees one progress surface instead of a growing pile.
+
+### Telegram voice (#3522)
+
+- **Voice TTS strips escapes and decodes entities before synthesis (#3522)** —
+  backslash escapes and HTML entities (`&amp;`, `&lt;`, …) were read aloud
+  literally by the voice renderer. They are now stripped/decoded before TTS so
+  spoken answers match the written ones.
+
 ## v0.19.15 — Telegram: no narration leaks, no duplicate sends, forwarded bodies delivered
 
 ### Telegram delivery (#3515, #3517)
