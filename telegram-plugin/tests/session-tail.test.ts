@@ -1035,7 +1035,11 @@ describe('projectAssistantTextBlocks (shared text→narrative kernel)', () => {
 //            (`<task-id>bweqqjn9r</task-id>`, `<status>completed</status>`),
 //            enqueued as a queue-operation.
 //   line 75 → the mirrored `type:"attachment"` copy of the same notification.
-// The three lines are copied verbatim into tests/fixtures/bg-shell-liveness-3519.jsonl.
+// The three lines are copied into tests/fixtures/bg-shell-liveness-3519.jsonl
+// byte-for-byte EXCEPT the operator home path (scrubbed to `~`)
+// (repo PII policy, scripts/check-no-pii-secrets.mjs). Every marker-bearing
+// field — backgroundTaskId, the launch string + id, the <task-notification>
+// tags — is untouched.
 describe('projectTranscriptLine — #3519 background-shell liveness (real fixtures)', () => {
   const FIXTURE = join(__dirname, 'fixtures', 'bg-shell-liveness-3519.jsonl')
   const lines = readFileSync(FIXTURE, 'utf8').split('\n').filter(l => l.length > 0)
