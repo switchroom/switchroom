@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'fs'
+import { join } from 'path'
+import { projectTranscriptLine } from '../session-tail.js'
 import {
   startTurn,
   noteOutbound,
@@ -7,6 +10,9 @@ import {
   noteToolStart,
   noteToolEnd,
   noteToolLabel,
+  noteBackgroundShellAlive,
+  noteBackgroundShellDead,
+  __bgMarkerParserConfirmedForTests,
   endTurn,
   silenceMsForKey,
   silencePokeEnabled,
@@ -30,6 +36,7 @@ interface TestFixtures {
 function setupDeps(opts?: {
   thresholds?: Partial<typeof DEFAULT_THRESHOLDS> & { fallbackHardCeiling?: number }
   deferFallbackWhileToolInFlight?: boolean
+  isLegitimatelyWorking?: (key: string) => boolean
 }): TestFixtures {
   const fixtures: TestFixtures = { emitted: [], fallbacks: [] }
   __setDepsForTests({
@@ -41,6 +48,9 @@ function setupDeps(opts?: {
     },
     ...(opts?.deferFallbackWhileToolInFlight != null
       ? { deferFallbackWhileToolInFlight: opts.deferFallbackWhileToolInFlight }
+      : {}),
+    ...(opts?.isLegitimatelyWorking != null
+      ? { isLegitimatelyWorking: opts.isLegitimatelyWorking }
       : {}),
   })
   return fixtures
@@ -599,5 +609,275 @@ describe('silence-poke — Fix A: in-flight-tool defer', () => {
     __tickForTests(300_000)
     __tickForTests(3_600_000) // an hour in
     expect(f.fallbacks).toHaveLength(0)
+  })
+})
+
+// ─── #3519: CLI-side background-bash defer — the stacked-cards regression ─────
+// Root cause of the operator-visible bug: a single turn ran a foreground `Bash`
+// that the claude CLI auto-moved to the background at its foreground timeout.
+// The tool_result returned (draining `inFlightTools`), so every existing "still
+// working" signal — `isLegitimatelyWorking()`'s foreground/async-dispatch/
+// ask_user checks — went false while the process kept running and the model sat
+// silent waiting on it. At 300s the framework fallback fired: it nulled
+// `currentTurn` and tore down the pinned progress card (the `onFrameworkFallback`
+// callback → liveness-wiring.ts:427-441 `endCurrentTurnForKey`), and the next
+// tool burst minted a BRAND-NEW pinned card. Each > 300s gap repeated it →
+// 2..N stacked cards on ONE turn.
+//
+// These are OUTCOME assertions: `fixtures.fallbacks` counts every fallback fire,
+// and a fire is exactly a currentTurn-null + card teardown (the trigger for a
+// re-minted card). The production wiring is reproduced faithfully:
+// `isLegitimatelyWorking` IS wired (the gateway always wires it) and it returns
+// FALSE for the whole gap (the CLI-side background bash is invisible to it by
+// construction). Reverting the `sawBashThisTurn` defer turns these RED — the
+// fallback fires on every gap and multiple cards are minted.
+describe('silence-poke — #3519 background-bash defer (stacked-cards regression guard)', () => {
+  const PROD = {
+    thresholds: { fallbackHardCeiling: 900_000 }, // SILENCE_FALLBACK_HARD_MS
+    isLegitimatelyWorking: () => false,            // background bash is invisible
+  }
+
+  it('a foreground Bash moved to background does NOT tear down the card at 300s (mid-work)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    // Foreground bash starts, then auto-moves to background at ~120s: its
+    // tool_result returns so inFlightTools drains. isLegitimatelyWorking is
+    // false throughout — every existing signal says "idle".
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    // The silent gap the model spends waiting on the background process.
+    __tickForTests(300_000)
+    __tickForTests(306_000) // well past the 300s base threshold
+    // BUG behaviour: fallback fires here (currentTurn nulled, card torn down).
+    // FIXED: deferred — the pinned card stays live, no re-mint.
+    expect(f.fallbacks).toHaveLength(0)
+  })
+
+  it('exactly ONE card survives a whole turn with two > 300s background-bash gaps', () => {
+    const f = setupDeps(PROD)
+
+    // Model the gateway's pinned-card lifecycle so the surviving card is
+    // asserted POSITIVELY, not merely inferred from zero teardowns. In
+    // production a fallback fire IS a card teardown (currentTurn nulled +
+    // pinned card unpinned, liveness-wiring.ts:427-441), and the next tool
+    // burst mints a BRAND-NEW pinned card — that re-mint is exactly the
+    // stacking. Here: mint one card when the turn starts, and replay a
+    // teardown + fresh re-mint for every fallback the silence-poke tick
+    // records. `mintedCards.length` is then the true number of cards that
+    // ever existed for the turn, and `pinnedCardId` is the live one.
+    const mintedCards: string[] = []
+    let pinnedCardId: string | null = null
+    const mintCard = (): void => {
+      const id = `card-${mintedCards.length + 1}`
+      mintedCards.push(id)
+      pinnedCardId = id
+    }
+    const syncCardsAfterTick = (): void => {
+      // Each recorded fallback == one teardown of the live card + a fresh
+      // re-mint by the resuming burst (the stacked-cards mechanism). Replay
+      // any teardown not yet modelled.
+      while (mintedCards.length - 1 < f.fallbacks.length) {
+        pinnedCardId = null // teardown unpins the live card
+        mintCard() // next tool burst mints a brand-new pinned card (a stack)
+      }
+    }
+
+    startTurn('c:0', 0)
+    mintCard() // the turn's first pinned progress card ("card-1")
+    // Gap 1 — first backgrounded find.
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name a', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    __tickForTests(306_000)
+    syncCardsAfterTick()
+    expect(f.fallbacks).toHaveLength(0) // no Card B minted (zero teardowns)
+    // POSITIVE: the ORIGINAL pinned card is still the live one after gap 1,
+    // and it is the ONLY card that has ever existed.
+    expect(pinnedCardId).toBe('card-1')
+    expect(mintedCards).toHaveLength(1)
+    // Model resumes and updates the SAME pinned card (production resets the
+    // silence clock on that render), then launches a second backgrounded find.
+    noteProduction('c:0', 310_000)
+    noteToolStart('c:0', 't2', 'Bash', 'find / -name b', 315_000)
+    noteToolEnd('c:0', 't2', 435_000)
+    // Gap 2 — > 300s of silence since the last render (310_000).
+    __tickForTests(620_000)
+    syncCardsAfterTick()
+    expect(f.fallbacks).toHaveLength(0) // no Card C minted (zero teardowns)
+    // POSITIVE: still the same single original card, updated in place across
+    // BOTH gaps — no second/third card was ever minted (no stacking).
+    expect(pinnedCardId).toBe('card-1')
+    expect(mintedCards).toEqual(['card-1'])
+  })
+
+  it('still bounded: a genuinely wedged bash-turn unwedges ONCE at the hard ceiling (not 3×)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // deferred, not fired 3×
+    __tickForTests(900_000) // crosses SILENCE_FALLBACK_HARD_MS
+    expect(f.fallbacks).toHaveLength(1) // exactly one bounded unwedge
+  })
+
+  it('the defer is Bash-specific: a non-Bash idle turn still fires at 300s (fix is scoped)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Grep', 'foo', 5_000)
+    noteToolEnd('c:0', 't1', 60_000) // Grep can't be a background process
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(1) // genuine silence → unwedges normally
+  })
+
+  it('honours the SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 kill switch', () => {
+    const prev = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = '0'
+    try {
+      const f = setupDeps(PROD)
+      startTurn('c:0', 0)
+      noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+      noteToolEnd('c:0', 't1', 125_000)
+      __tickForTests(306_000)
+      expect(f.fallbacks).toHaveLength(1) // defer force-disabled → legacy fire
+    } finally {
+      if (prev != null) process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = prev
+      else delete process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    }
+  })
+})
+
+// ─── #3519 SHARPEN: PROVEN-alive defer, driven by REAL captured markers ───────
+// The coarse `sawBashThisTurn` guard above deferred EVERY bash-turn to the 900s
+// ceiling. This sharpens it: defer only while a background shell is PROVEN
+// alive (its structured `backgroundTaskId` launch marker seen, no completion
+// yet), and recover at ~300s the moment it finishes. The alive/dead facts here
+// are PARSED FROM REAL JSONL (tests/fixtures/bg-shell-liveness-3519.jsonl —
+// carrie session a6d2d33a-…, claude v2.1.197; line 109 auto-background launch,
+// line 175 `<task-notification>` completion — verbatim but for the operator username
+// scrubbed in both encodings per repo PII policy) through the SAME projectTranscriptLine
+// path the gateway uses, then fed to silence-poke exactly as the gateway feeds
+// it (tool_result.backgroundTaskId → noteBackgroundShellAlive; task_notification
+// → noteBackgroundShellDead). So every fixture value is traceable to a real byte.
+describe('silence-poke — #3519 sharpen: proven-alive defer (real markers)', () => {
+  const PROD = {
+    thresholds: { fallbackHardCeiling: 900_000 }, // SILENCE_FALLBACK_HARD_MS
+    isLegitimatelyWorking: () => false,            // background bash invisible to it
+  }
+  const FIXTURE = join(__dirname, 'fixtures', 'bg-shell-liveness-3519.jsonl')
+  const fxLines = readFileSync(FIXTURE, 'utf8').split('\n').filter(l => l.length > 0)
+  // Derive the REAL ids straight from the fixtures via the production parser.
+  const aliveEv = projectTranscriptLine(fxLines[0]).find(e => e.kind === 'tool_result')
+  const deadEv = projectTranscriptLine(fxLines[1])[0]
+  const LIVE_ID = aliveEv?.kind === 'tool_result' ? aliveEv.backgroundTaskId! : ''
+  const DEAD_ID = deadEv.kind === 'task_notification' ? deadEv.taskId : ''
+
+  it('sanity: the fixtures really carry a matching background-shell id', () => {
+    expect(LIVE_ID).toBe('bxa4sv3dq')
+    expect(DEAD_ID).toBe('bxa4sv3dq')
+  })
+
+  // (a) A shell PROVEN alive across a > 300s gap must NOT tear down the card —
+  //     and exactly ONE card survives (positive assertion, not inferred).
+  it('(a) live shell across a > 300s gap → no teardown, exactly one card', () => {
+    const f = setupDeps(PROD)
+    const mintedCards: string[] = []
+    let pinnedCardId: string | null = null
+    const mintCard = (): void => {
+      mintedCards.push(`card-${mintedCards.length + 1}`)
+      pinnedCardId = mintedCards[mintedCards.length - 1]
+    }
+    const syncCardsAfterTick = (): void => {
+      while (mintedCards.length - 1 < f.fallbacks.length) { pinnedCardId = null; mintCard() }
+    }
+
+    startTurn('c:0', 0)
+    mintCard() // the turn's first pinned progress card
+    // Foreground Bash auto-moved to background at ~120s: its tool_result
+    // returns (drains inFlightTools) carrying the real backgroundTaskId.
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    noteBackgroundShellAlive('c:0', LIVE_ID) // gateway does this from the parsed event
+    __tickForTests(306_000)
+    syncCardsAfterTick()
+    __tickForTests(500_000) // still alive, still silent, still well past 300s
+    syncCardsAfterTick()
+    expect(f.fallbacks).toHaveLength(0)     // deferred — no teardown
+    expect(pinnedCardId).toBe('card-1')     // POSITIVE: original card still live
+    expect(mintedCards).toEqual(['card-1']) // and it is the ONLY card ever minted
+    expect(__bgMarkerParserConfirmedForTests()).toBe(true) // marker proven working
+  })
+
+  // (b) THE NEW capability: once the shell FINISHES (real completion marker),
+  //     a subsequent > 300s wedge recovers at ~300s — NOT held to 900s.
+  it('(b) shell went DEAD then a > 300s wedge → fallback fires at ~300s (fast recovery)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    noteBackgroundShellAlive('c:0', LIVE_ID)   // backgrounded at ~120s
+    noteBackgroundShellDead('c:0', DEAD_ID)    // real <task-notification> completed at ~200s
+    // Model then goes silent on a genuine wedge. Because the CLI marker PARSED
+    // (confirmed), the coarse sawBash degradation is OFF, so the empty
+    // alive-set means this is real silence → recover at the 300s base window,
+    // not the 900s ceiling.
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(1) // FAST recovery restored (would be 0 under the old coarse guard)
+  })
+
+  // (c) SAFE DEGRADATION: if a future CLI renames the markers so NOTHING parses
+  //     (backgroundTaskId never resolves → parser never confirmed), we must not
+  //     regress to stacking — fall back to the 900s-bounded coarse guard.
+  it('(c) unmatched/changed CLI marker → degrades to the 900s-bounded guard', () => {
+    const f = setupDeps(PROD)
+    // Mutate the REAL alive line so neither the structured field nor the string
+    // matches — exactly what a marker rename looks like. Parse it as the gateway
+    // would; it yields NO backgroundTaskId, so noteBackgroundShellAlive is never
+    // called and the parser stays unconfirmed.
+    const mutated = JSON.parse(fxLines[0])
+    delete mutated.toolUseResult.backgroundTaskId
+    mutated.message.content[0].content = 'Task moved to background (id withheld by a newer CLI).'
+    const ev = projectTranscriptLine(JSON.stringify(mutated)).find(e => e.kind === 'tool_result')
+    expect(ev?.kind === 'tool_result' ? ev.backgroundTaskId : 'X').toBeUndefined()
+
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000) // sawBashThisTurn armed
+    noteToolEnd('c:0', 't1', 125_000)
+    // No alive registration (marker unparseable) → parser NOT confirmed.
+    expect(__bgMarkerParserConfirmedForTests()).toBe(false)
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // still deferred by the coarse guard (no stacking)
+    __tickForTests(900_000)             // crosses the hard ceiling
+    expect(f.fallbacks).toHaveLength(1) // bounded unwedge — never hangs forever
+  })
+
+  // (d) Still bounded even while genuinely alive: a shell that never reports
+  //     dead still unwedges ONCE at the 900s ceiling (not indefinitely).
+  it('(d) a never-completing live shell still unwedges once at the 900s ceiling', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    noteBackgroundShellAlive('c:0', LIVE_ID) // alive, never dies
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // deferred while alive
+    __tickForTests(900_000)             // hard ceiling
+    expect(f.fallbacks).toHaveLength(1) // exactly one bounded unwedge
+  })
+
+  it('honours the SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 kill switch even with a live shell', () => {
+    const prev = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = '0'
+    try {
+      const f = setupDeps(PROD)
+      startTurn('c:0', 0)
+      noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+      noteToolEnd('c:0', 't1', 125_000)
+      noteBackgroundShellAlive('c:0', LIVE_ID)
+      __tickForTests(306_000)
+      expect(f.fallbacks).toHaveLength(1) // force-disabled → no defer at all
+    } finally {
+      if (prev != null) process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = prev
+      else delete process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    }
   })
 })

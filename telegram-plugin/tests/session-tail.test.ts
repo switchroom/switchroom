@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, utimesSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, utimesSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -1016,5 +1016,95 @@ describe('projectAssistantTextBlocks (shared text→narrative kernel)', () => {
       blockIndex: 0,
       lastInMessage: true,
     })
+  })
+})
+
+// ─── #3519 sharpen: background-shell liveness markers, from REAL captured data ─
+// Fixtures are VERBATIM lines from a real agent transcript — no hand-written
+// approximations. Provenance (cited so a reviewer can independently verify;
+// this is a SURVIVING, reachable session — the earlier 1db49136 session was
+// rotated off host, so the fixture was regenerated from this one):
+//   file:  /host-home/.switchroom/agents/carrie/.claude/projects/
+//          -home-kenthompson--switchroom-agents-carrie/
+//          a6d2d33a-a8a6-40ce-81d0-cb4bd867ac89.jsonl  (claude CLI v2.1.197)
+//   line 109 → ALIVE: a FOREGROUND Bash (tool_use input has NO
+//            run_in_background) that the CLI auto-moved to the background at its
+//            ~120s foreground window (tool_result at 00:35:56Z) — the exact
+//            #3519 auto-background case. Carries BOTH the structured
+//            `toolUseResult.backgroundTaskId:"bxa4sv3dq"` and the launch string
+//            "Command running in background with ID: bxa4sv3dq. …".
+//   line 175 → DEAD: the CLI's proactive `<task-notification>` for the SAME id
+//            (`<task-id>bxa4sv3dq</task-id>`, `<status>completed</status>`),
+//            enqueued as a queue-operation.
+//   line 180 → the mirrored `type:"attachment"` copy of the same notification.
+// The three lines are copied into tests/fixtures/bg-shell-liveness-3519.jsonl
+// byte-for-byte EXCEPT the operator username, scrubbed in BOTH encodings — the
+// slash home path (`/home/<user>` → `~`) and the dashed tmp-path form
+// (`-home-<user>-` → `-home-user-`) — per repo PII policy
+// (scripts/check-no-pii-secrets.mjs). Every marker-bearing field —
+// backgroundTaskId, the launch string + id, the <task-notification> tags — is
+// untouched.
+describe('projectTranscriptLine — #3519 background-shell liveness (real fixtures)', () => {
+  const FIXTURE = join(__dirname, 'fixtures', 'bg-shell-liveness-3519.jsonl')
+  const lines = readFileSync(FIXTURE, 'utf8').split('\n').filter(l => l.length > 0)
+  const [aliveLine, deadEnqueueLine] = lines
+
+  it('ALIVE: emits backgroundTaskId from the real structured toolUseResult field', () => {
+    // The whole plumbing seam end-to-end: the raw captured bytes → the parsed
+    // tool_result event actually CARRIES backgroundTaskId, so the gateway can
+    // register the shell alive. If this field weren't in the real event, the
+    // signal would be unavailable — this proves it is.
+    const events = projectTranscriptLine(aliveLine)
+    const tr = events.find(e => e.kind === 'tool_result')
+    expect(tr).toBeDefined()
+    expect(tr).toMatchObject({
+      kind: 'tool_result',
+      toolUseId: 'toolu_01B7T3y1t95oHDEqYKwSmqaW',
+      backgroundTaskId: 'bxa4sv3dq',
+    })
+  })
+
+  it('DEAD: projects the real <task-notification> enqueue as a task_notification (completed)', () => {
+    // Proves the DEAD seam: the CLI's completion signal — which arrives as a
+    // queue-operation enqueue, NOT a tool_result — is parsed to the shell id +
+    // status the gateway drops from the alive-set. It must NOT be mis-read as
+    // an inbound user turn (no `enqueue` event).
+    const events = projectTranscriptLine(deadEnqueueLine)
+    expect(events).toEqual([
+      { kind: 'task_notification', taskId: 'bxa4sv3dq', status: 'completed' },
+    ])
+  })
+
+  it('the ALIVE and DEAD ids MATCH — a real launch pairs with its real completion', () => {
+    const alive = projectTranscriptLine(aliveLine).find(e => e.kind === 'tool_result')
+    const dead = projectTranscriptLine(deadEnqueueLine)[0]
+    expect(alive?.kind === 'tool_result' ? alive.backgroundTaskId : null)
+      .toBe(dead.kind === 'task_notification' ? dead.taskId : undefined)
+  })
+
+  it('SAFE DEGRADATION: a CLI that renamed the marker yields NO backgroundTaskId', () => {
+    // Simulate a future CLI that changed the launch shape: drop the structured
+    // field AND mutate the launch string. The parser must return NO id (so the
+    // gateway never registers a phantom-alive shell), which is what lets the
+    // silence-poke layer fall back to the 900s-bounded guard. Built by mutating
+    // the REAL line, so it stays traceable.
+    const obj = JSON.parse(aliveLine)
+    delete obj.toolUseResult.backgroundTaskId // structured field gone
+    obj.message.content[0].content =
+      'Task moved to the background (id withheld by a newer CLI).' // string changed
+    const events = projectTranscriptLine(JSON.stringify(obj))
+    const tr = events.find(e => e.kind === 'tool_result')
+    expect(tr).toBeDefined()
+    expect(tr?.kind === 'tool_result' ? tr.backgroundTaskId : 'X').toBeUndefined()
+  })
+
+  it('secondary path: the launch STRING alone still yields the id when the field is absent', () => {
+    // If a CLI keeps the human string but drops the structured field, the regex
+    // fallback still recovers the id — traceable, built from the real line.
+    const obj = JSON.parse(aliveLine)
+    delete obj.toolUseResult.backgroundTaskId
+    const events = projectTranscriptLine(JSON.stringify(obj))
+    const tr = events.find(e => e.kind === 'tool_result')
+    expect(tr?.kind === 'tool_result' ? tr.backgroundTaskId : null).toBe('bxa4sv3dq')
   })
 })

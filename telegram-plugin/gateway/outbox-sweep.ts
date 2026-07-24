@@ -244,39 +244,113 @@ export const OUTBOX_SWEEP_INTERVAL_MS = 5_000
  * (`resolveSubagentOriginTurnKey`) then the last-real-inbound fallback (H3).
  * Kill switch: `SWITCHROOM_TG_OUTBOX_DELIVERY=0`.
  */
+/** A Telegram inline keyboard the sweep attaches to the FINAL delivered chunk
+ *  (the 🔊 Listen button / voice-out keyboard — switchroom #3502 regression fix,
+ *  so a net-delivered answer keeps the same button a `sendReply` answer gets).
+ *  Shaped to match `planListenButton().replyMarkup`. */
+export type OutboxDeliveryMarkup = {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
+}
+
+/** Minimal bot-api surface the sweep needs to deliver text. */
+type OutboxSendBot = {
+  api: {
+    sendMessage: (
+      chatId: string,
+      text: string,
+      opts: object,
+    ) => Promise<{ message_id?: number }>
+  }
+}
+
+/**
+ * Build the chunked `send` the sweep hands to {@link sweepOutbox}. Extracted +
+ * exported so the reply-markup attachment (the #3502 fix) is unit-testable
+ * without a live gateway or timer.
+ *
+ * `resolveReplyMarkup` resolves the voice-out Listen button / keyboard for a
+ * delivery (null/undefined → no button). It is applied to the FINAL chunk ONLY
+ * so the button lands on the last visible message, exactly like the normal
+ * `sendReply` path (buttons attach to the last chunk there too). This makes a
+ * safety-net-delivered final answer indistinguishable from a normally-delivered
+ * one instead of silently dropping the button.
+ */
+export function createOutboxSend(deps: {
+  getBot: () => OutboxSendBot | undefined
+  retry: Parameters<typeof retryWithThreadFallback>[0]
+  resolveReplyMarkup?: (
+    chatId: string,
+    threadId: number | null,
+    text: string,
+  ) => OutboxDeliveryMarkup | undefined
+}): OutboxSweepDeps['send'] {
+  return async (chatId, threadId, text) => {
+    const bot = deps.getBot()
+    if (bot == null) throw new Error('outbox-sweep: bot unavailable')
+    // Empty text → nothing to deliver. Telegram rejects an empty message body,
+    // so sending one chunk of '' would throw every tick and wedge the sweep in
+    // a permanent retry (the record never journals → never clears). Return
+    // early, matching the pre-refactor loop's zero-chunk behaviour.
+    if (text.length === 0) return undefined
+    // Resolve the Listen button / keyboard ONCE from the full answer text; it
+    // rides only on the final chunk below.
+    const replyMarkup = deps.resolveReplyMarkup?.(chatId, threadId, text)
+    // Chunk to Telegram's 4096-char ceiling; each chunk goes through the
+    // standard retry / flood-wait / thread-fallback wrapper. A thrown send
+    // propagates so the sweep releases the claim and retries next tick (the
+    // record is never journaled → never lost).
+    let lastId: number | undefined
+    const chunkCount = Math.ceil(text.length / 4000)
+    for (let i = 0, idx = 0; i < text.length; i += 4000, idx++) {
+      const chunk = text.slice(i, i + 4000)
+      const isLast = idx === chunkCount - 1
+      const res = await retryWithThreadFallback(
+        deps.retry,
+        (tid) => {
+          const base = tid != null ? { message_thread_id: tid } : {}
+          // Button on the LAST chunk only (final visible message).
+          const opts =
+            isLast && replyMarkup != null ? { ...base, reply_markup: replyMarkup } : base
+          return bot.api.sendMessage(chatId, chunk, opts)
+        },
+        { threadId: threadId ?? undefined, chat_id: chatId, verb: 'outbox-sweep.sendMessage' },
+      )
+      lastId = res?.message_id
+    }
+    return lastId
+  }
+}
+
 export function startOutboxSweep(deps: {
   isGatewayMain: boolean
   stateDir: string
-  getBot: () => { api: { sendMessage: (chatId: string, text: string, opts: object) => Promise<{ message_id?: number }> } } | undefined
+  getBot: () => OutboxSendBot | undefined
   getTurnsDb: () => Parameters<typeof resolveSubagentOriginTurnKey>[0] | null
   dedupCheck: (chatId: string, threadId: number | undefined, text: string) => boolean
+  /** Resolve the voice-out Listen button / keyboard for a net delivery. Wired
+   *  by the gateway (loadAccess → resolveVoiceOutPlan → planListenButton +
+   *  cache put + eager pre-synth). Absent → deliver plain (legacy behaviour). */
+  resolveReplyMarkup?: (
+    chatId: string,
+    threadId: number | null,
+    text: string,
+  ) => OutboxDeliveryMarkup | undefined
   log?: (line: string) => void
 }): ReturnType<typeof setInterval> | undefined {
   if (!deps.isGatewayMain || process.env.SWITCHROOM_TG_OUTBOX_DELIVERY === '0') return undefined
   const retry = createRetryApiCall({ log: deps.log })
+  const send = createOutboxSend({
+    getBot: deps.getBot,
+    retry,
+    ...(deps.resolveReplyMarkup != null ? { resolveReplyMarkup: deps.resolveReplyMarkup } : {}),
+  })
   const tick = () => {
     const bot = deps.getBot()
     if (bot == null) return
     void sweepOutbox({
       stateDir: deps.stateDir,
       log: deps.log,
-      send: async (chatId, threadId, text) => {
-        // Chunk to Telegram's 4096-char ceiling; each chunk goes through the
-        // standard retry / flood-wait / thread-fallback wrapper. A thrown send
-        // propagates so the sweep releases the claim and retries next tick (the
-        // record is never journaled → never lost).
-        let lastId: number | undefined
-        for (let i = 0; i < text.length; i += 4000) {
-          const chunk = text.slice(i, i + 4000)
-          const res = await retryWithThreadFallback(
-            retry,
-            (tid) => bot.api.sendMessage(chatId, chunk, tid != null ? { message_thread_id: tid } : {}),
-            { threadId: threadId ?? undefined, chat_id: chatId, verb: 'outbox-sweep.sendMessage' },
-          )
-          lastId = res?.message_id
-        }
-        return lastId
-      },
+      send,
       textAlreadyDelivered: (chatId, threadId, text) => deps.dedupCheck(chatId, threadId ?? undefined, text),
       registryChainLookup: (taskId) => {
         const db = deps.getTurnsDb()
