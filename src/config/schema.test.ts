@@ -18,6 +18,8 @@ import {
   DriveConfigSchema,
   GoogleWorkspaceConfigSchema,
   GoogleWorkspaceTierSchema,
+  ReleaseBlock,
+  RootReleaseBlock,
   ScheduleEntrySchema,
   SwitchroomConfigSchema,
   TelegramChannelSchema,
@@ -1412,5 +1414,52 @@ describe("AgentSoulSchema — first-class persona fields + shape (#1856)", () =>
     };
     const r = SwitchroomConfigSchema.parse(cfg);
     expect(r.agents.bare.soul).toBeUndefined();
+  });
+});
+
+describe("release.auto_update (KEN-131) — root-only opt-in", () => {
+  it("root release block accepts auto_update: true alongside channel/pin rules", () => {
+    expect(RootReleaseBlock.parse({ auto_update: true })).toEqual({
+      auto_update: true,
+    });
+    expect(
+      RootReleaseBlock.parse({ pin: "v1.2.3", auto_update: true }),
+    ).toEqual({ pin: "v1.2.3", auto_update: true });
+  });
+
+  it("defaults OFF — an ordinary release block parses with auto_update undefined", () => {
+    const r = RootReleaseBlock.parse({ pin: "v1.2.3" });
+    expect(r.auto_update).toBeUndefined();
+  });
+
+  it("channel/pin mutual exclusion still holds on the root block", () => {
+    expect(() =>
+      RootReleaseBlock.parse({ channel: "latest", pin: "v1.2.3" }),
+    ).toThrow();
+  });
+
+  it("per-agent / profile release blocks REJECT auto_update (fleet-only knob)", () => {
+    expect(() => ReleaseBlock.parse({ auto_update: true })).toThrow();
+    expect(() =>
+      AgentSchema.parse({ release: { auto_update: true } }),
+    ).toThrow();
+  });
+
+  it("full config: root release.auto_update parses; omitted stays undefined", () => {
+    const base = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "1" },
+      agents: {},
+    };
+    const off = SwitchroomConfigSchema.parse({
+      ...base,
+      release: { pin: "v1.2.3" },
+    });
+    expect(off.release?.auto_update).toBeUndefined();
+    const on = SwitchroomConfigSchema.parse({
+      ...base,
+      release: { pin: "v1.2.3", auto_update: true },
+    });
+    expect(on.release?.auto_update).toBe(true);
   });
 });

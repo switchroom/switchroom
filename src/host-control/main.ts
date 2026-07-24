@@ -45,6 +45,10 @@ import {
 } from "./release-watcher-shellouts.js";
 import { UpdateNotifier, short } from "./update-notifier.js";
 import type { ApprovalResult } from "./approval-gateway.js";
+import {
+  makeAutoUpdateCheck,
+  resolveReleaseWatcherMode,
+} from "./auto-update-check.js";
 import { appendFile } from "node:fs/promises";
 
 /**
@@ -248,17 +252,76 @@ async function main(): Promise<void> {
   // (RFC C §5.1).
   let releaseWatcher: ReleaseWatcher | null = null;
   const autoRel = config.host_control?.auto_release_check;
-  if (autoRel?.enabled === true) {
+  const watcherMode = resolveReleaseWatcherMode(config);
+  if (watcherMode.mode !== "off") {
     const eventsLog = join(
       homedir(),
       ".switchroom",
       "release-watcher-events.jsonl",
     );
+    const log = (m: string): void => {
+      process.stderr.write(`hostd: ${m}\n`);
+    };
+    const onEvent = (e: object): void => {
+      // Telemetry sink — JSONL append. The
+      // `time_from_release_to_fleet_caught_up_seconds` AC counter
+      // is the `duration_ms` field of the `fleet_caught_up` row
+      // (delta from the matching `release_detected` row).
+      void appendFile(eventsLog, JSON.stringify(e) + "\n").catch(() => {});
+    };
+    const intervalMinutes = autoRel?.interval_minutes ?? 5;
+    const imageRef =
+      autoRel?.image_ref ?? "ghcr.io/switchroom/switchroom-agent:latest";
+    if (watcherMode.mode === "auto_update") {
+      // KEN-131 — `release.auto_update: true`: version-based check, and on
+      // detection the UNATTENDED staggered canary rollout via the server's
+      // own launch path (fleet-mutation lock, self-bump, audit, narration,
+      // rollback + alert hardening). NOT the legacy update+restart-all.
+      releaseWatcher = new ReleaseWatcher({
+        intervalMs: intervalMinutes * 60_000,
+        checkFn: makeAutoUpdateCheck({
+          imageRef,
+          // Live pin per tick — a green roll persists the pin, which is
+          // what quiesces the check. Throws on malformed config (tick
+          // dropped as check_failed, retried next interval).
+          getCurrentPin: () =>
+            (loadConfig() as { release?: { pin?: string } }).release?.pin,
+          log,
+        }),
+        applyFn: async (version) => {
+          if (!version) {
+            throw new Error("auto-update check reported no target version");
+          }
+          const r = await server.startAutoRollout(version);
+          if (!r.started) {
+            throw new Error(`auto rollout not started: ${r.reason}`);
+          }
+          log(
+            `auto-update: unattended rollout to ${version} started ` +
+              `(request_id ${r.request_id})`,
+          );
+        },
+        // The rollout restarts agents itself (staggered, canary-first) —
+        // a fleet-wide `restart all` here would double-bounce every agent.
+        restartFn: async () => {},
+        applyOnDetect: true,
+        log,
+        onEvent,
+      });
+      releaseWatcher.start();
+      process.stderr.write(
+        `hostd: auto-update watcher started (release.auto_update) — ` +
+          `checking the published release every ${intervalMinutes}m; new ` +
+          `releases roll via the staggered canary rollout\n`,
+      );
+    } else {
+    const applyOnDetect = autoRel?.apply_on_detect ?? true;
+    const notifyOnDetect = autoRel?.notify_on_detect ?? false;
     // KEN-129 — operator-in-the-loop drift card. Only wired when
     // auto-apply is OFF (apply_on_detect supersedes notify: a fleet
     // that self-applies has nothing to ask the operator).
     let notifier: UpdateNotifier | null = null;
-    if (!autoRel.apply_on_detect && autoRel.notify_on_detect) {
+    if (!applyOnDetect && notifyOnDetect) {
       // Card targets: admin (or root-tier) agents' gateways, in
       // stable order. The first gateway that actually accepts the
       // card wins; dispatch failures fall through to the next.
@@ -306,7 +369,7 @@ async function main(): Promise<void> {
               // the reason line, so backticks/bold here would render as
               // escaped literals.
               reason:
-                `New release detected for ${autoRel.image_ref} ` +
+                `New release detected for ${imageRef} ` +
                 `(digest ${short(version)}). Approve to run ` +
                 `switchroom update (the hostd update_apply path).`,
               unifiedDiff:
@@ -329,14 +392,14 @@ async function main(): Promise<void> {
     }
     const notifierRef = notifier;
     releaseWatcher = new ReleaseWatcher({
-      intervalMs: autoRel.interval_minutes * 60_000,
+      intervalMs: intervalMinutes * 60_000,
       checkFn: makeReleaseCheck({
-        imageRef: autoRel.image_ref,
-        log: (m) => process.stderr.write(`hostd: ${m}\n`),
+        imageRef,
+        log,
       }),
       applyFn: makeApply("switchroom"),
       restartFn: makeRestart("switchroom"),
-      applyOnDetect: autoRel.apply_on_detect,
+      applyOnDetect,
       ...(notifierRef
         ? {
             notifyFn: async (version: string) => {
@@ -344,22 +407,17 @@ async function main(): Promise<void> {
             },
           }
         : {}),
-      log: (m) => process.stderr.write(`hostd: ${m}\n`),
-      onEvent: (e) => {
-        // Telemetry sink — JSONL append. The
-        // `time_from_release_to_fleet_caught_up_seconds` AC counter
-        // is the `duration_ms` field of the `fleet_caught_up` row
-        // (delta from the matching `release_detected` row).
-        void appendFile(eventsLog, JSON.stringify(e) + "\n").catch(() => {});
-      },
+      log,
+      onEvent,
     });
     releaseWatcher.start();
     process.stderr.write(
-      `hostd: release-watcher started — polling ${autoRel.image_ref} ` +
-        `every ${autoRel.interval_minutes}m ` +
-        `(apply_on_detect=${autoRel.apply_on_detect}, ` +
-        `notify_on_detect=${autoRel.notify_on_detect})\n`,
+      `hostd: release-watcher started — polling ${imageRef} ` +
+        `every ${intervalMinutes}m ` +
+        `(apply_on_detect=${applyOnDetect}, ` +
+        `notify_on_detect=${notifyOnDetect})\n`,
     );
+    }
   }
 
   // Wait for SIGTERM / SIGINT. `docker stop` sends SIGTERM after

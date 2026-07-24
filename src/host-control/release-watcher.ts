@@ -53,8 +53,11 @@ export interface ReleaseWatcherOptions {
    *  remote tag's digest no longer matches the deployed digest. */
   checkFn: () => Promise<ReleaseCheckResult>;
   /** Run the equivalent of `switchroom update` end-to-end. Resolves
-   *  when the apply completes (or rejects on failure). */
-  applyFn: () => Promise<void>;
+   *  when the apply completes (or rejects on failure). Receives the
+   *  check's `version` identifier when one was reported (KEN-131 —
+   *  the auto-update path needs the concrete `vX.Y.Z` target to drive
+   *  `switchroom rollout --pin`; the legacy digest path ignores it). */
+  applyFn: (version?: string) => Promise<void>;
   /** Run the equivalent of `switchroom restart all` (graceful by
    *  default — drains in-flight turns). Resolves when scheduling
    *  completes; the per-agent drain happens asynchronously. */
@@ -161,7 +164,7 @@ export class ReleaseWatcher {
         ...(check.version ? { version: check.version } : {}),
       });
       try {
-        await this.opts.applyFn();
+        await this.opts.applyFn(check.version);
       } catch (err) {
         this.emit({
           at: this.now(),

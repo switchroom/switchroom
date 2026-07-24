@@ -594,6 +594,50 @@ const TAIL_BYTES = 4096;
  */
 export const ORPHAN_RECONCILE_AGE_MS = 15 * 60 * 1000;
 
+/**
+ * Request-id prefix for watcher-initiated unattended rollouts (KEN-131,
+ * `release.auto_update`). The prefix is the durable marker for "no
+ * operator/agent is driving this roll": it survives the self-bump
+ * resume marker (which round-trips only the request_id + args), so the
+ * hardened no-operator failure path (rollback + alert card, no silent
+ * retry) applies identically to a roll resumed after a hostd self-bump.
+ */
+export const AUTO_ROLLOUT_REQUEST_PREFIX = "auto-rollout-";
+
+/** True when a request_id names an unattended auto-update rollout. */
+export function isAutoRolloutRequestId(requestId: string): boolean {
+  return requestId.startsWith(AUTO_ROLLOUT_REQUEST_PREFIX);
+}
+
+/**
+ * KEN-131 — durable failed/attempted latch for unattended auto-update
+ * rolls, persisted under the hostd state dir. An in-memory-only latch is
+ * structurally insufficient: hostd restarts are ROUTINE on this path (the
+ * self-bump recreates hostd's own container on essentially every auto
+ * roll, and crash-loops / host reboots clear process memory), so a broken
+ * release plus any restart would re-roll the same failed pin every
+ * watcher tick — bouncing the canary agent indefinitely with no operator
+ * in the loop. The latch is therefore written to disk AT LAUNCH
+ * (`outcome: "attempting"`) and cleared only on a confirmed green roll;
+ * a failure updates it to `"failed"`. Either state refuses an unattended
+ * retry of the SAME pin across restarts and crash windows (a roll that
+ * died mid-flight leaves `"attempting"` behind — exactly the case where
+ * an unattended retry is least safe). A NEWER published release
+ * supersedes the latch; the operator recovers by fixing the cause and
+ * rolling manually (`switchroom rollout --pin <target>`), which advances
+ * the durable pin and quiesces the check.
+ */
+export const AUTO_ROLLOUT_LATCH_FILENAME = "auto-rollout-latch.json";
+
+interface AutoRolloutLatch {
+  v: 1;
+  pin: string;
+  request_id: string;
+  outcome: "attempting" | "failed";
+  at: string;
+  reason?: string;
+}
+
 export class HostdServer {
   // One Server per bound socket path. `node:net.Server.listen` can
   // only be called once per instance — to bind N agent sockets we
@@ -639,6 +683,72 @@ export class HostdServer {
         started_at: number;
       }
     | null = null;
+
+  /**
+   * KEN-131 — pin of the most recent FAILED unattended auto-update roll.
+   * An unattended canary failure must NOT retry-loop every watcher tick
+   * (each retry bounces the canary onto the same broken build); the
+   * watcher's checkFn keeps reporting "available" until the durable pin
+   * advances, so this latch refuses re-rolls of the same target. This
+   * field is only the in-memory fast path / disk-write-failure fallback;
+   * the AUTHORITATIVE latch is the on-disk file
+   * ({@link AUTO_ROLLOUT_LATCH_FILENAME}) — see its doc comment for why
+   * an in-memory latch alone would retry-loop across the routine hostd
+   * restarts on this path (self-bump container recreate, crash-loops,
+   * host reboots). Superseded by a NEWER target pin.
+   */
+  private lastAutoRolloutFailedPin: string | null = null;
+
+  /** Path of the durable auto-rollout latch file. */
+  private autoRolloutLatchPath(): string {
+    return join(this.hostdDirPath(), AUTO_ROLLOUT_LATCH_FILENAME);
+  }
+
+  /** Read + validate the durable latch; null when absent/malformed. */
+  private readAutoRolloutLatch(): AutoRolloutLatch | null {
+    try {
+      const raw = readFileSync(this.autoRolloutLatchPath(), "utf-8");
+      const parsed = JSON.parse(raw) as AutoRolloutLatch;
+      if (
+        parsed &&
+        parsed.v === 1 &&
+        typeof parsed.pin === "string" &&
+        parsed.pin.length > 0 &&
+        (parsed.outcome === "attempting" || parsed.outcome === "failed")
+      ) {
+        return parsed;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Best-effort durable latch write — must NEVER throw into a roll path.
+   *  A write failure degrades to the in-memory latch (logged). */
+  private writeAutoRolloutLatch(latch: AutoRolloutLatch): void {
+    try {
+      mkdirSync(this.hostdDirPath(), { recursive: true });
+      writeFileSync(this.autoRolloutLatchPath(), JSON.stringify(latch, null, 2), {
+        mode: 0o600,
+      });
+    } catch (e) {
+      process.stderr.write(
+        `hostd: auto-rollout latch write failed (falling back to in-memory ` +
+          `latch for this process lifetime): ${(e as Error).message}\n`,
+      );
+    }
+  }
+
+  /** Best-effort durable latch clear (green roll / superseded target). */
+  private clearAutoRolloutLatch(): void {
+    try {
+      unlinkSync(this.autoRolloutLatchPath());
+    } catch {
+      // Absent or unremovable — absent is the common case; unremovable
+      // only ever over-blocks (fail-safe direction).
+    }
+  }
 
   /**
    * #2726 Part 2 — optional in-chat narration renderer. When wired (via
@@ -1840,6 +1950,111 @@ export class HostdServer {
   }
 
   /**
+   * KEN-131 — entry point for the unattended auto-update path
+   * (`release.auto_update: true`). Called by hostd's release watcher when
+   * a new published release is detected; drives the SAME staggered canary
+   * rollout pipeline as an operator/agent `rollout` request (fleet-
+   * mutation lock, self-bump, apply-asset preflight, durable audit +
+   * narration, structured status), differing only in caller identity
+   * ({kind:"operator"} — the daemon acting host-side) and in the hardened
+   * no-operator failure handling (see finishFailedAutoRollout).
+   *
+   * Returns `{started:false, reason}` instead of a wire denial — the
+   * caller is the in-process watcher, which logs the reason and retries
+   * (or not) on its own schedule.
+   */
+  public async startAutoRollout(
+    pin: string,
+  ): Promise<{ started: boolean; request_id?: string; reason?: string }> {
+    const started = Date.now();
+    const request_id = `${AUTO_ROLLOUT_REQUEST_PREFIX}${started}`;
+    const diskLatch = this.readAutoRolloutLatch();
+    if (this.lastAutoRolloutFailedPin === pin || diskLatch?.pin === pin) {
+      const why =
+        diskLatch?.pin === pin && diskLatch.outcome === "attempting"
+          ? `a previous unattended roll to ${pin} did not complete (hostd ` +
+            `restarted or crashed mid-roll — the fleet state is unverified)`
+          : `a previous unattended roll to ${pin} FAILED`;
+      return {
+        started: false,
+        reason:
+          `${why} — refusing to retry unattended (the latch is durable ` +
+          `across hostd restarts; fix the cause, then roll manually via ` +
+          `\`switchroom rollout --pin ${pin}\`; a newer release supersedes ` +
+          `the latch)`,
+      };
+    }
+    const inFlight = this.fleetMutationInFlight;
+    if (inFlight) {
+      return {
+        started: false,
+        reason:
+          `fleet-mutation lock held by ${inFlight.op} (request_id ` +
+          `"${inFlight.request_id}") — will re-check next tick`,
+      };
+    }
+    // A DIFFERENT (newer) target supersedes any stale latch. Ordered AFTER
+    // the fleet-lock check: while a roll is in flight its launch-time
+    // "attempting" latch must not be stripped by a superseding tick that
+    // the lock is about to refuse anyway.
+    if (diskLatch && diskLatch.pin !== pin) this.clearAutoRolloutLatch();
+    const caller: SocketIdentity = { kind: "operator" };
+    // hostd's baked-in CLI is older than EVERY fresh release, so the
+    // self-bump branch is the COMMON path here: bump hostd's own compose,
+    // hand off to the helper, and let the new hostd resume this very
+    // request_id from the marker at boot (the auto- prefix survives the
+    // marker round-trip, keeping the hardened failure handling attached).
+    if (needsSelfBump(this.opts.selfVersion ?? SWITCHROOM_VERSION, pin)) {
+      const req = {
+        v: 1,
+        request_id,
+        op: "rollout",
+        args: { pin },
+      } as Extract<HostdRequest, { op: "rollout" }>;
+      // Latch BEFORE committing: the self-bump recreates hostd's own
+      // container, so only a durable marker written now can stop a fresh
+      // daemon from re-launching this same target if the bump/resume dies
+      // mid-flight. beginSelfBump's clean refusals ("nothing was changed")
+      // clear it again — those are safe to retry next tick.
+      this.writeAutoRolloutLatch({
+        v: 1,
+        pin,
+        request_id,
+        outcome: "attempting",
+        at: new Date().toISOString(),
+      });
+      const resp = await this.beginSelfBump(req, caller, started);
+      if (resp.result !== "started") {
+        this.clearAutoRolloutLatch();
+        return {
+          started: false,
+          reason: resp.error ?? `self-bump refused (result=${resp.result})`,
+        };
+      }
+      return { started: true, request_id };
+    }
+    const assetDenied = this.applyAssetPreflight(request_id, started);
+    if (assetDenied) {
+      return {
+        started: false,
+        reason: assetDenied.error ?? "apply-asset preflight refused",
+      };
+    }
+    // Durable "attempting" latch at launch: a roll that dies without a
+    // terminal row (hostd SIGKILLed mid-canary) must NOT be silently
+    // retried by the next daemon — cleared only on a confirmed green roll.
+    this.writeAutoRolloutLatch({
+      v: 1,
+      pin,
+      request_id,
+      outcome: "attempting",
+      at: new Date().toISOString(),
+    });
+    this.launchRollout({ pin }, request_id, caller, started);
+    return { started: true, request_id };
+  }
+
+  /**
    * Shared tail of the rollout launch: build the child argv, capture
    * prior-pin + install context, record the status entry, take the
    * fleet-mutation lock and spawn the child. Used by the direct
@@ -2226,6 +2441,21 @@ export class HostdServer {
       };
       this.recordStatus(entry);
       process.stderr.write(`hostd: self-bump resume failed: ${why}\n`);
+      // KEN-131 — an UNATTENDED roll that died at the self-bump must latch
+      // durably too, or the watcher's next tick re-runs the whole
+      // bump-and-fail cycle forever (the pin never advanced, so the check
+      // keeps reporting "available").
+      if (isAutoRolloutRequestId(marker.request_id)) {
+        this.lastAutoRolloutFailedPin = marker.pin;
+        this.writeAutoRolloutLatch({
+          v: 1,
+          pin: marker.pin,
+          request_id: marker.request_id,
+          outcome: "failed",
+          at: new Date().toISOString(),
+          reason: "self-bump",
+        });
+      }
       await this.writeTerminalAudit(entry);
       this.pushRolloutTerminal(entry);
     };
@@ -3635,6 +3865,11 @@ export class HostdServer {
    * tail. Releases the fleet-mutation lock on completion (success/fail).
    */
   private spawnRollout(args: string[], entry: StatusEntry): void {
+    // KEN-131 — capture the prior pin NOW: the terminal handler below
+    // deletes entry.prior_pin on failure (correct for --allow-downgrade
+    // defaulting), but the unattended-failure recovery still needs it as
+    // the rollback target.
+    const priorPinAtStart = entry.prior_pin;
     // #2726 — tap the child's stdout line-by-line so each rollout PHASE
     // sentinel becomes a durable, hash-chained audit row AS the roll runs
     // (the log is the single source of truth; the narration surface in Part 2
@@ -3685,6 +3920,37 @@ export class HostdServer {
       })
       .finally(() => {
         void this.writeTerminalAudit(entry);
+        // KEN-131 — unattended (auto-update) roll that FAILED: no operator
+        // is watching, so the hardened no-operator path runs instead of the
+        // plain terminal push: latch the failed pin (no unattended retry
+        // loop), attempt rollback of pre-canary damage WHILE STILL HOLDING
+        // the fleet-mutation lock (recovery runs `apply`/`agent restart` —
+        // racing another mutation would interleave compose writes), then
+        // alert the operator and release the lock.
+        if (isAutoRolloutRequestId(entry.request_id) && entry.result !== "completed") {
+          this.lastAutoRolloutFailedPin = entry.pin ?? null;
+          if (entry.pin) {
+            // Upgrade the launch-time "attempting" latch to a durable
+            // "failed" — survives hostd restarts (self-bump recreate,
+            // crash-loops), so the same broken pin is never re-rolled
+            // unattended by a fresh daemon.
+            this.writeAutoRolloutLatch({
+              v: 1,
+              pin: entry.pin,
+              request_id: entry.request_id,
+              outcome: "failed",
+              at: new Date().toISOString(),
+              ...(entry.failed_step ? { reason: entry.failed_step } : {}),
+            });
+          }
+          void this.finishFailedAutoRollout(entry, priorPinAtStart);
+          return;
+        }
+        // Green unattended roll — release the durable launch latch so the
+        // NEXT release can auto-roll.
+        if (isAutoRolloutRequestId(entry.request_id)) {
+          this.clearAutoRolloutLatch();
+        }
         // #2726 — terminal effects. All fire-and-forget and defensively
         // wrapped: a chat push / narrator finalize must NEVER block the lock
         // release or the roll's completion (a throwing narrator/relay can't
@@ -3707,15 +3973,157 @@ export class HostdServer {
   }
 
   /**
+   * KEN-131 — terminal handling for a FAILED unattended auto-update roll.
+   * Runs (and awaits) the rollback recovery while the fleet-mutation lock
+   * is STILL HELD, then alerts the operator via the existing rollout
+   * terminal relay (with the recovery outcome appended), and only then
+   * releases the lock. Every step is defensively wrapped — nothing here
+   * may strand the lock.
+   */
+  private async finishFailedAutoRollout(
+    entry: StatusEntry,
+    priorPin: string | undefined,
+  ): Promise<void> {
+    const notes: string[] = [
+      `Unattended auto-update roll to ${entry.pin ?? "?"} FAILED at ` +
+        `${entry.failed_step ?? "unknown step"}` +
+        `${entry.failed_agent ? ` (agent ${entry.failed_agent})` : ""}. ` +
+        `Unattended retries of this version are disabled; fix the cause, ` +
+        `then roll manually (\`switchroom rollout --pin ${entry.pin ?? "vX.Y.Z"}\`).`,
+    ];
+    try {
+      notes.push(...(await this.recoverFailedAutoRollout(entry, priorPin)));
+    } catch (e) {
+      notes.push(
+        `Automatic rollback THREW: ${(e as Error).message} — verify compose/` +
+          `canary state host-side.`,
+      );
+    } finally {
+      this.pushRolloutTerminal(entry, notes);
+      try {
+        this.rolloutNarrator?.onTerminal(entry);
+      } catch (e) {
+        process.stderr.write(
+          `hostd: rollout narrator onTerminal threw (non-fatal): ${(e as Error).message}\n`,
+        );
+      }
+      if (
+        this.fleetMutationInFlight &&
+        this.fleetMutationInFlight.request_id === entry.request_id
+      ) {
+        this.fleetMutationInFlight = null;
+      }
+    }
+  }
+
+  /**
+   * KEN-131 — rollback for an unattended roll that failed BEFORE any agent
+   * reached the target (failed `apply`, or a failed canary with nothing
+   * rolled). In that window the durable pin was never persisted (hostd-
+   * context rollouts persist AFTER the canary), so config still names the
+   * prior pin — but the one-shot `apply --pin <target>` DID rewrite the
+   * compose file, and a failed canary may have left the canary agent
+   * restarted onto (or wedged against) the broken target image. Recovery:
+   * regenerate compose on the prior pin, and restart the canary back onto
+   * it. Past-canary failures are NOT auto-rolled-back: the canary proved
+   * the build green, the fleet is mixed-but-functional, and an unattended
+   * mass rollback is riskier than alerting the operator.
+   *
+   * Returns human-readable outcome notes for the alert message.
+   */
+  private async recoverFailedAutoRollout(
+    entry: StatusEntry,
+    priorPin: string | undefined,
+  ): Promise<string[]> {
+    const notes: string[] = [];
+    const rolledCount = (entry.rolled ?? []).length;
+    const beforeAnyAgent =
+      entry.failed_step === "apply" ||
+      (entry.failed_step === "restart-agent" && rolledCount === 0);
+    if (!beforeAnyAgent) {
+      notes.push(
+        rolledCount > 0
+          ? `No automatic rollback: ${rolledCount} agent(s) already confirmed on ` +
+              `${entry.pin ?? "the target"} past a green canary ` +
+              `(${(entry.rolled ?? []).join(", ")}). The fleet is mixed — ` +
+              `finish the roll or roll back manually.`
+          : // rolled=0 but failed_step isn't apply/restart-agent — the roll
+            // was refused BEFORE apply (e.g. preflight-stale-cli) or died
+            // without a step label: nothing was changed, nothing to revert.
+            `No automatic rollback: the roll stopped at ` +
+              `${entry.failed_step ?? "an unknown step"} before any change ` +
+              `landed — nothing to revert. Verify host-side if unsure.`,
+      );
+      return notes;
+    }
+    if (!priorPin) {
+      notes.push(
+        `No automatic rollback: no prior version-assertable release.pin was ` +
+          `recorded before this roll. Verify compose host-side ` +
+          `(\`switchroom apply\`).`,
+      );
+      return notes;
+    }
+    // Compose restore: the failed roll's `apply --pin <target>` rewrote the
+    // compose file while the durable pin still names <prior>. Regenerating on
+    // the prior pin realigns compose with config so the next reconcile/restart
+    // cannot silently pull agents onto the broken target.
+    const applyRes = await this.runSwitchroom(
+      ["apply", "--pin", priorPin, "--compose-only", "--non-interactive"],
+      { SWITCHROOM_HOSTD_CONTEXT: "1" },
+    );
+    notes.push(
+      applyRes.exit_code === 0
+        ? `Rollback: compose restored to ${priorPin}.`
+        : `Rollback FAILED: compose restore to ${priorPin} exited ` +
+            `${applyRes.exit_code} — run \`switchroom apply\` host-side ` +
+            `(${tail(applyRes.stderr).trim().slice(-300) || "no stderr"}).`,
+    );
+    if (entry.failed_step === "restart-agent" && entry.failed_agent) {
+      const restartRes = await this.runSwitchroom(
+        [
+          "agent",
+          "restart",
+          entry.failed_agent,
+          "--wait",
+          "--force",
+          "--pin",
+          priorPin,
+        ],
+        { SWITCHROOM_HOSTD_CONTEXT: "1" },
+      );
+      notes.push(
+        restartRes.exit_code === 0
+          ? `Rollback: canary ${entry.failed_agent} restarted back on ${priorPin}.`
+          : `Rollback FAILED: canary ${entry.failed_agent} did not restart ` +
+              `cleanly on ${priorPin} (exit ${restartRes.exit_code}) — restart ` +
+              `it manually.`,
+      );
+    }
+    return notes;
+  }
+
+  /**
    * #2726 Part 1 — push ONE ordinary operator-DM message on the rollout
    * terminal row via the gateway relay. Fire-and-forget: `postTerminal` never
    * throws and never awaits a reply, so the roll can't stall on a slow/absent
    * gateway. No-op when no relay is wired or the caller isn't an agent (the
    * relay routes through the caller agent's gateway, like the approval card).
    */
-  private pushRolloutTerminal(entry: StatusEntry): void {
+  private pushRolloutTerminal(entry: StatusEntry, extraNotes?: string[]): void {
     if (!this.opts.rolloutRelay) return;
-    if (entry.caller.kind !== "agent") return;
+    // Relay routing: an agent-invoked roll pings through the CALLER agent's
+    // gateway (unchanged). An unattended auto-update roll (KEN-131) has no
+    // caller agent — route the alert through the FIRST admin agent's gateway
+    // (the same class of agent whose gateway carries approval cards); when
+    // no admin agent exists, drop (the durable audit row remains).
+    const relayAgent =
+      entry.caller.kind === "agent"
+        ? entry.caller.name
+        : isAutoRolloutRequestId(entry.request_id)
+          ? this.firstAdminAgentName()
+          : null;
+    if (relayAgent === null) return;
     try {
       const text = renderRolloutStatus({
         target: entry.pin ?? "",
@@ -3732,14 +4140,26 @@ export class HostdServer {
       });
       this.opts.rolloutRelay.postTerminal({
         requestId: entry.request_id,
-        agentName: entry.caller.name,
-        text,
+        agentName: relayAgent,
+        text:
+          extraNotes && extraNotes.length > 0
+            ? text + "\n\n" + extraNotes.map((n) => `- ${n}`).join("\n")
+            : text,
       });
     } catch (e) {
       process.stderr.write(
         `hostd: rollout terminal push failed (non-fatal): ${(e as Error).message}\n`,
       );
     }
+  }
+
+  /** First configured agent with `admin: true`, or null (KEN-131 — relay
+   *  target for unattended-rollout alerts, which have no caller agent). */
+  private firstAdminAgentName(): string | null {
+    for (const [name, a] of Object.entries(this.opts.config.agents ?? {})) {
+      if (a?.admin === true) return name;
+    }
+    return null;
   }
 
   private handleGetStatus(
