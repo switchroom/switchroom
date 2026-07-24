@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## v0.19.15 — Telegram: no narration leaks, no duplicate sends, forwarded bodies delivered
+
+### Telegram delivery (#3515, #3517)
+
+- **Agent intent-narration no longer leaks into the final reply (#3515)** —
+  interstitial "let me check the logs…"-style narration could surface in
+  Telegram as a real chat message. Every trailing plain-text block is now
+  assigned once, by a single shared classifier, to exactly one surface
+  (delivered answer / ephemeral progress card / suppressed), using a
+  wording-independent structural signal instead of two hand-synced regex
+  copies — so narration is dropped while the one genuine answer still delivers
+  exactly once.
+- **Exactly-once outbound delivery across the backstops (#3517)** — the
+  un-sent-prose backstops (turn-flush, captured-prose bridge, and the durable
+  outbox sweep) could each independently deliver a turn's trailing prose,
+  causing a duplicate bubble or a cross-message narration leak across a process
+  restart. Delivery is now decided by a hard, per-turn structural signal with a
+  backstop-scoped durable exactly-once guard, so a turn's answer is delivered
+  once — never doubled, never leaked, never dropped into silence.
+
+### Telegram forwarding (#3516)
+
+- **Forwarded rich-message bodies are delivered instead of a placeholder
+  (#3516)** — forwarding a bot message (Bot API `rich_message` content with no
+  top-level text) previously replaced the real body with a
+  `(unhandled message content: …)` placeholder. A dedicated rich-message
+  handler now renders the actual body (headings, lists, checkboxes, code,
+  quotes, tables, media captions) through the normal inbound pipeline, and
+  channel-origin forwards carry a deep-linkable source message id.
+
 ## v0.19.14 — Telegram double-send fix + rollout-card counter fix
 
 ### Telegram delivery (#3510, #3511)
