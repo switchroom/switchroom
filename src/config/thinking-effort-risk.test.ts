@@ -5,11 +5,14 @@ import {
 } from "./thinking-effort-risk.js";
 
 describe("isAdaptiveThinkingOpus", () => {
-  it("matches the opus alias and pinned opus-4.x ids", () => {
+  it("matches the opus alias and pinned opus-4.x / opus-5 ids", () => {
     expect(isAdaptiveThinkingOpus("opus")).toBe(true);
     expect(isAdaptiveThinkingOpus("claude-opus-4-8")).toBe(true);
     expect(isAdaptiveThinkingOpus("claude-opus-4-7")).toBe(true);
     expect(isAdaptiveThinkingOpus("CLAUDE-OPUS-4-8")).toBe(true); // case-insensitive
+    expect(isAdaptiveThinkingOpus("claude-opus-5")).toBe(true);
+    expect(isAdaptiveThinkingOpus("claude-opus-5-20260501")).toBe(true); // future date-stamped pin
+    expect(isAdaptiveThinkingOpus("CLAUDE-OPUS-5")).toBe(true); // case-insensitive
   });
 
   it("does not match sonnet/haiku or unset", () => {
@@ -29,6 +32,11 @@ describe("assessThinkingEffortRisk", () => {
       expect(r.reason).toContain("thinking");
     }
     expect(assessThinkingEffortRisk("opus", "medium").risky).toBe(true);
+  });
+
+  it("flags Opus 5 with effort above the low floor", () => {
+    expect(assessThinkingEffortRisk("claude-opus-5", "high").risky).toBe(true);
+    expect(assessThinkingEffortRisk("claude-opus-5-20260501", "max").risky).toBe(true);
   });
 
   it("is safe when effort is the floor or unset (scaffold defaults to low)", () => {

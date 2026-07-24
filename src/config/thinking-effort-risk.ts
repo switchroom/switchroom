@@ -40,12 +40,18 @@ const RISKY_EFFORTS = new Set(["medium", "high", "xhigh", "max"]);
  * True for models whose adaptive thinking + switchroom's concurrent
  * sub-agent dispatch is known to trigger the claude-CLI thinking-block
  * merge 400. Matches the `opus` alias (resolves to the latest Opus,
- * currently 4.8) and any pinned `claude-opus-4-*` id.
+ * currently Opus 5) and any pinned `claude-opus-4-*` / `claude-opus-5`
+ * id (including future `claude-opus-5-*` date-stamped pins).
  */
 export function isAdaptiveThinkingOpus(model: string | undefined): boolean {
   if (!model) return false;
   const m = model.trim().toLowerCase();
-  return m === "opus" || m.startsWith("claude-opus-4");
+  return (
+    m === "opus" ||
+    m.startsWith("claude-opus-4") ||
+    m === "claude-opus-5" ||
+    m.startsWith("claude-opus-5-")
+  );
 }
 
 export interface ThinkingEffortRisk {
