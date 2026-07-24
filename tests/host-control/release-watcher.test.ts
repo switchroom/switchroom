@@ -179,3 +179,31 @@ describe("ReleaseWatcher", () => {
     w.stop();
   });
 });
+
+describe("ReleaseWatcher — applyFn receives the check's version (KEN-131)", () => {
+  it("passes the detected version through so the auto-update path can pin the rollout", async () => {
+    const applyFn = vi.fn().mockResolvedValue(undefined);
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true, version: "v1.2.3" }),
+      applyFn,
+      restartFn: vi.fn().mockResolvedValue(undefined),
+      applyOnDetect: true,
+    });
+    await w.tick();
+    expect(applyFn).toHaveBeenCalledWith("v1.2.3");
+  });
+
+  it("passes undefined when the check reports no version (legacy digest path unchanged)", async () => {
+    const applyFn = vi.fn().mockResolvedValue(undefined);
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true }),
+      applyFn,
+      restartFn: vi.fn().mockResolvedValue(undefined),
+      applyOnDetect: true,
+    });
+    await w.tick();
+    expect(applyFn).toHaveBeenCalledWith(undefined);
+  });
+});

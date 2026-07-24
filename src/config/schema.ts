@@ -2572,13 +2572,46 @@ export const ReactionDispatchSchema = z
  * merged (a pinned agent should not silently inherit a channel from
  * the root, and vice versa).
  */
+const releaseBlockFields = {
+  channel: z.enum(["dev", "rc", "latest"]).optional(),
+  pin: z
+    .string()
+    .regex(/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/)
+    .optional(),
+};
+
 export const ReleaseBlock = z
+  .object(releaseBlockFields)
+  .strict()
+  .refine((r) => !(r.channel && r.pin), {
+    message: "release.channel and release.pin are mutually exclusive",
+  });
+
+/**
+ * Root-only release block (KEN-131, stage 3 of KEN-128): the shared
+ * channel/pin fields PLUS the opt-in `auto_update` flag. Root-only on
+ * purpose — auto-update is a FLEET property consumed by hostd's release
+ * watcher; a per-agent `auto_update` would be meaningless (the staggered
+ * canary rollout always rolls the fleet), so the per-agent / profile-level
+ * `release` blocks stay on the plain ReleaseBlock and reject the key via
+ * `.strict()`.
+ */
+export const RootReleaseBlock = z
   .object({
-    channel: z.enum(["dev", "rc", "latest"]).optional(),
-    pin: z
-      .string()
-      .regex(/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/)
-      .optional(),
+    ...releaseBlockFields,
+    auto_update: z
+      .boolean()
+      .optional()
+      .describe(
+        "Opt-in unattended fleet auto-update (KEN-131). When true, hostd's " +
+        "release watcher polls the published release version and, on a new " +
+        "release, drives the EXISTING staggered canary rollout " +
+        "(`switchroom rollout --pin vX.Y.Z`) unattended: canary-first, " +
+        "per-agent version assert, durable pin persisted only after the " +
+        "canary is green, abort + operator alert card on canary failure, " +
+        "and compose rollback on a failed apply. Default false — with it " +
+        "unset/false, behaviour is unchanged.",
+      ),
   })
   .strict()
   .refine((r) => !(r.channel && r.pin), {
@@ -4038,10 +4071,12 @@ export const SwitchroomConfigSchema = z.object({
       ),
   }),
   telegram: TelegramConfigSchema,
-  release: ReleaseBlock.optional().describe(
+  release: RootReleaseBlock.optional().describe(
     "Fleet-wide default release-channel pin / pointer for the update " +
     "flow. Either `channel` (dev|rc|latest) or `pin` (sha-<hex>|v<semver>) " +
-    "— mutually exclusive. Per-agent `release` REPLACES this entirely.",
+    "— mutually exclusive. Per-agent `release` REPLACES this entirely " +
+    "(except `auto_update`, which is root-only — a fleet property read by " +
+    "hostd's release watcher, never per-agent).",
   ),
   memory: MemoryBackendConfigSchema.optional(),
   hindsight: HindsightConfigSchema.optional().describe(
