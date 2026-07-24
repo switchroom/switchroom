@@ -1572,6 +1572,35 @@ export class HostdServer {
     );
   }
 
+  /**
+   * KEN-129 — read-only lock probe for the update-check drift
+   * notifier: it must not post a "tap to apply" card while a fleet
+   * mutation is already rolling (the running mutation likely IS the
+   * catch-up the card would ask for).
+   */
+  isFleetMutationLocked(): boolean {
+    return this.fleetMutationInFlight !== null;
+  }
+
+  /**
+   * KEN-129 — entry point for the update-check drift notifier's
+   * Approve tap. Reuses the EXACT `update_apply` verb path
+   * (fleet-mutation lock, apply-asset preflight, durable status
+   * rows, get_status pollability) with a synthetic operator caller:
+   * the authorization here is the operator's tap on the approval
+   * card, the same human-in-the-loop that gates the agent-invoked
+   * verb. Returns the verb's HostdResponse — `result: "started"` on
+   * success, `denied` with an operator-facing `error` otherwise.
+   */
+  startOperatorApprovedUpdateApply(requestId: string): HostdResponse {
+    const req = {
+      v: 1 as const,
+      request_id: requestId,
+      op: "update_apply" as const,
+    };
+    return this.handleUpdateApply(req, { kind: "operator" }, Date.now());
+  }
+
   private handleUpdateApply(
     req: Extract<HostdRequest, { op: "update_apply" }>,
     caller: SocketIdentity,

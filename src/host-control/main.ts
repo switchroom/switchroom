@@ -41,7 +41,10 @@ import {
   makeReleaseCheck,
   makeApply,
   makeRestart,
+  makeUpdatePlan,
 } from "./release-watcher-shellouts.js";
+import { UpdateNotifier, short } from "./update-notifier.js";
+import type { ApprovalResult } from "./approval-gateway.js";
 import { appendFile } from "node:fs/promises";
 
 /**
@@ -251,6 +254,66 @@ async function main(): Promise<void> {
       ".switchroom",
       "release-watcher-events.jsonl",
     );
+    // KEN-129 — operator-in-the-loop drift card. Only wired when
+    // auto-apply is OFF (apply_on_detect supersedes notify: a fleet
+    // that self-applies has nothing to ask the operator).
+    let notifier: UpdateNotifier | null = null;
+    if (!autoRel.apply_on_detect && autoRel.notify_on_detect) {
+      // Card targets: admin (or root-tier) agents' gateways, in
+      // stable order. The first gateway that actually accepts the
+      // card wins; dispatch failures fall through to the next.
+      const adminAgents = Object.keys(config.agents)
+        .filter((n) => {
+          const a = config.agents[n] as { admin?: boolean; root?: boolean };
+          return a.admin === true || a.root === true;
+        })
+        .sort();
+      notifier = new UpdateNotifier({
+        statePath: join(homedir(), ".switchroom", "release-notify-state.json"),
+        isFleetMutationInFlight: () => server.isFleetMutationLocked(),
+        startApply: (requestId) => {
+          const res = server.startOperatorApprovedUpdateApply(requestId);
+          return { result: res.result, ...(res.error ? { error: res.error } : {}) };
+        },
+        planFn: makeUpdatePlan("switchroom"),
+        requestApproval: async ({ requestId, version, plan }) => {
+          let last: ApprovalResult = {
+            verdict: "deny",
+            reason: "no admin agent with a reachable gateway socket",
+            denySource: "dispatch_failure",
+            finalize: async () => {},
+          };
+          for (const agent of adminAgents) {
+            const res = await approvalGateway.requestApproval({
+              requestId,
+              agentName: agent,
+              title: "⬆️ **Switchroom update available — fleet is behind**",
+              // NOTE: plain text — the card handler escapes markdown in
+              // the reason line, so backticks/bold here would render as
+              // escaped literals.
+              reason:
+                `New release detected for ${autoRel.image_ref} ` +
+                `(digest ${short(version)}). Approve to run ` +
+                `switchroom update (the hostd update_apply path).`,
+              unifiedDiff:
+                plan.length > 0
+                  ? plan
+                  : `switchroom update --check produced no plan output;\n` +
+                    `remote digest: ${version}`,
+              timeoutMs: 60 * 60_000,
+            });
+            if (res.verdict === "deny" && res.denySource === "dispatch_failure") {
+              last = res;
+              continue; // this agent's gateway is unreachable — try next
+            }
+            return res;
+          }
+          return last;
+        },
+        log: (m) => process.stderr.write(`hostd: ${m}\n`),
+      });
+    }
+    const notifierRef = notifier;
     releaseWatcher = new ReleaseWatcher({
       intervalMs: autoRel.interval_minutes * 60_000,
       checkFn: makeReleaseCheck({
@@ -260,6 +323,13 @@ async function main(): Promise<void> {
       applyFn: makeApply("switchroom"),
       restartFn: makeRestart("switchroom"),
       applyOnDetect: autoRel.apply_on_detect,
+      ...(notifierRef
+        ? {
+            notifyFn: async (version: string) => {
+              await notifierRef.notifyIfNew(version);
+            },
+          }
+        : {}),
       log: (m) => process.stderr.write(`hostd: ${m}\n`),
       onEvent: (e) => {
         // Telemetry sink — JSONL append. The
@@ -273,7 +343,8 @@ async function main(): Promise<void> {
     process.stderr.write(
       `hostd: release-watcher started — polling ${autoRel.image_ref} ` +
         `every ${autoRel.interval_minutes}m ` +
-        `(apply_on_detect=${autoRel.apply_on_detect})\n`,
+        `(apply_on_detect=${autoRel.apply_on_detect}, ` +
+        `notify_on_detect=${autoRel.notify_on_detect})\n`,
     );
   }
 

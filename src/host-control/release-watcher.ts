@@ -63,6 +63,14 @@ export interface ReleaseWatcherOptions {
    *  stop short of calling applyFn / restartFn. Use to dogfood the
    *  check loop without auto-rolling the fleet. */
   applyOnDetect: boolean;
+  /** KEN-129 — optional notify hook, consulted only when
+   *  `applyOnDetect` is false. Receives the detected release id so
+   *  the update notifier can post a "fleet is behind — tap to apply"
+   *  operator approval card. Awaited inside the tick (the in-flight
+   *  guard then naturally prevents a second card racing the first);
+   *  errors are logged and dropped — a notify failure never breaks
+   *  the watch loop. */
+  notifyFn?: (version: string) => Promise<void>;
   /** Receives one event per state transition for telemetry / audit. */
   onEvent?: (e: ReleaseWatcherEvent) => void;
   /** Diagnostic log sink. */
@@ -135,7 +143,16 @@ export class ReleaseWatcher {
             ? ", auto-applying"
             : " (apply_on_detect=false; not rolling)"),
       );
-      if (!this.opts.applyOnDetect) return;
+      if (!this.opts.applyOnDetect) {
+        if (this.opts.notifyFn) {
+          try {
+            await this.opts.notifyFn(check.version ?? "");
+          } catch (err) {
+            this.log(`notify_failed: ${errMsg(err)}`);
+          }
+        }
+        return;
+      }
 
       const applyStarted = this.now();
       this.emit({

@@ -206,10 +206,14 @@ export function buildConfigApprovalCardBody(args: {
   agentName: string;
   reason: string;
   unifiedDiff: string;
+  /** Optional header override (KEN-129 — e.g. the update-check drift
+   *  card). Rendered verbatim as the first line; absent → the default
+   *  config-edit header. */
+  title?: string;
 }): { body: string; truncated: boolean } {
   const safeReason = clipReason(args.reason);
   const render = (diff: string): string =>
-    `🛠 **Config edit proposed**\n` +
+    `${args.title ?? "🛠 **Config edit proposed**"}\n` +
     `Agent: \`${args.agentName}\`\n` +
     `Reason: ${escapeMarkdown(safeReason)}\n\n` +
     "```\n" + diff + "\n```";
@@ -297,6 +301,7 @@ export async function handleRequestConfigApproval(
     agentName: msg.agentName,
     reason: msg.reason,
     unifiedDiff: prelim,
+    ...(msg.title !== undefined ? { title: msg.title } : {}),
   });
   const body = built.body;
   // Oversize iff EITHER the cheap raw fast-path trimmed lines OR the

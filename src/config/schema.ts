@@ -3754,6 +3754,20 @@ export const AutoReleaseCheckSchema = z.object({
       "update_apply / restart all. Useful for dogfooding the detector " +
       "without rolling the fleet.",
     ),
+  notify_on_detect: z
+    .boolean()
+    .default(false)
+    .describe(
+      "KEN-129 — operator-in-the-loop update prompt. Only consulted " +
+      "when apply_on_detect is false (auto-apply supersedes notify): " +
+      "a newly detected release posts ONE operator approval card " +
+      "('fleet is behind — tap to apply') via an admin agent's " +
+      "gateway; Approve runs hostd's update_apply path (fleet-" +
+      "mutation-locked, durable status rows, get_status-pollable). " +
+      "Dedup on release id: the last-notified id persists in " +
+      "~/.switchroom/release-notify-state.json, so a card that " +
+      "reached the operator is never re-posted for the same release.",
+    ),
   image_ref: z
     .string()
     .default("ghcr.io/switchroom/switchroom-agent:latest")

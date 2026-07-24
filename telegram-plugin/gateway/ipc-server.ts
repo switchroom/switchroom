@@ -391,6 +391,12 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (typeof m.timeoutMs !== "number"
         || !Number.isFinite(m.timeoutMs)
         || (m.timeoutMs as number) <= 0) return false;
+      // Optional header override (KEN-129) — absent falls back to the
+      // default config-edit header.
+      if (m.title !== undefined
+        && (typeof m.title !== "string"
+          || (m.title as string).length === 0
+          || (m.title as string).length > 200)) return false;
       return true;
     }
     case "request_config_finalize": {
