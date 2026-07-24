@@ -59,24 +59,67 @@ const HTML_ENTITIES: Record<string, string> = {
 }
 
 /**
+ * Markdown metacharacters that the block/emphasis/table stripper would
+ * silently consume at line-start or as a pair. When such a char arrives via
+ * an entity escape the user meant it LITERALLY (that is the whole point of
+ * escaping it), so instead of emitting the raw char — which the downstream
+ * stripper would then eat, losing the intent — we emit a neutral spoken form
+ * that survives every later pass. Deterministic; the spoken form contains no
+ * `&`/`;` so it can never re-enter the entity decoder.
+ */
+const METACHAR_SPOKEN: Record<string, string> = {
+  '#': ' hash ',
+  '*': ' asterisk ',
+  '_': ' underscore ',
+  '~': ' tilde ',
+  '`': ' backtick ',
+  '|': ' bar ',
+}
+
+/** One decode pass: named + numeric entities → char (or spoken metachar). */
+function decodeHtmlEntitiesOnce(input: string): string {
+  const toChar = (cp: number, raw: string): string => {
+    if (!(cp > 0 && cp <= 0x10ffff)) return raw
+    const ch = String.fromCodePoint(cp)
+    return METACHAR_SPOKEN[ch] ?? ch
+  }
+  return input
+    .replace(/&#x([0-9a-f]+);/gi, (m, hex: string) => toChar(parseInt(hex, 16), m))
+    .replace(/&#(\d+);/g, (m, dec: string) => toChar(Number(dec), m))
+    .replace(/&([a-z][a-z0-9]*);/gi, (m, name: string) => {
+      const ch = HTML_ENTITIES[name.toLowerCase()]
+      if (ch === undefined) return m
+      return METACHAR_SPOKEN[ch] ?? ch
+    })
+}
+
+/**
  * Decode HTML entities (named + numeric) to their character so a TTS engine
  * never reads `&amp;` as "amp". Unknown named entities are left untouched.
  * Pure + deterministic.
+ *
+ * Iterates to a FIXPOINT: a double-encoded entity (`&amp;amp;lt;`) is decoded
+ * repeatedly until no entity remains, so this pass is depth-idempotent —
+ * applying it once yields the same result as applying it twice. That keeps
+ * every voice callsite in lockstep: the immediate voice-out path runs
+ * normalizeForSpeech THEN normalizeForTts, and the value the lazy Listen tap /
+ * pre-synth queue reads is itself already normalizeForSpeech'd before its own
+ * normalizeForTts — fixpoint decoding guarantees both speak an identical
+ * string regardless of how deep the original encoding was. The loop strictly
+ * shrinks the entity count each turn (and is capped) so it always terminates.
+ * Text WITHOUT a trailing `;` (e.g. `Q&A`) matches nothing and is returned
+ * untouched.
  */
 export function decodeHtmlEntities(input: string): string {
-  return input
-    .replace(/&#x([0-9a-f]+);/gi, (m, hex: string) => {
-      const cp = parseInt(hex, 16)
-      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
-    })
-    .replace(/&#(\d+);/g, (m, dec: string) => {
-      const cp = Number(dec)
-      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
-    })
-    .replace(/&([a-z][a-z0-9]*);/gi, (m, name: string) => {
-      const ch = HTML_ENTITIES[name.toLowerCase()]
-      return ch !== undefined ? ch : m
-    })
+  let s = input
+  // A fully-decodable chain shrinks by at least one entity per pass; the cap
+  // is a belt-and-braces guard against any pathological crafted input.
+  for (let i = 0; i < 10; i++) {
+    const next = decodeHtmlEntitiesOnce(s)
+    if (next === s) break
+    s = next
+  }
+  return s
 }
 
 /**

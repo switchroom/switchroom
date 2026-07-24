@@ -4,6 +4,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { normalizeForTts, ttsNormalizeEnabled } from '../tts-normalize.js'
+import { normalizeForSpeech } from '../voice-normalize-text.js'
 
 const KILL = 'SWITCHROOM_DISABLE_TTS_NORMALIZE'
 
@@ -280,5 +281,28 @@ describe('normalizeForTts — backslash escapes & HTML entities (last-line defen
     const reply = 'a \\b and Tom &amp; Jerry \\. end'
     const once = normalizeForTts(reply)
     expect(normalizeForTts(once)).toBe(once)
+  })
+})
+
+describe('normalizeForTts — review findings (fixpoint decode, metachar, nits)', () => {
+  test('L2 parity: immediate (speech+tts) and single-tts agree on a double-encoded entity', () => {
+    const x = '&amp;amp;lt;'
+    const immediate = normalizeForTts(normalizeForSpeech(x))
+    const singleTts = normalizeForTts(x)
+    expect(immediate).toBe('<')
+    expect(singleTts).toBe('<')
+    expect(immediate).toBe(singleTts)
+    expect(normalizeForTts('&amp;amp;amp;')).toBe('&')
+  })
+
+  test('L1: entity → line-leading metachar keeps a spoken form (hash/asterisk)', () => {
+    expect(normalizeForTts('&#35; Heading')).toBe('hash Heading')
+    expect(normalizeForTts('2 &#42; 3')).toBe('2 asterisk 3')
+  })
+
+  test('nit: dangling trailing backslash dropped; &#92; decodes then strips', () => {
+    expect(normalizeForTts('ends here\\')).toBe('ends here')
+    expect(normalizeForTts('X&#92;Y')).toBe('XY')
+    expect(normalizeForTts('X&#92;Y')).not.toContain('\\')
   })
 })

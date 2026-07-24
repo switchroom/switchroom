@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'bun:test'
-import { normalizeForSpeech } from '../voice-normalize-text.js'
+import { normalizeForSpeech, decodeHtmlEntities } from '../voice-normalize-text.js'
 
 describe('normalizeForSpeech — reported markdown/symbol cases', () => {
   it('drops stray tildes (never spoken as "tilde")', () => {
@@ -300,5 +300,38 @@ describe('normalizeForSpeech — backslash escapes & HTML entities (voice trash)
     const reply = 'a \\b and Tom &amp; Jerry \\. end'
     const once = normalizeForSpeech(reply)
     expect(normalizeForSpeech(once)).toBe(once)
+  })
+})
+
+describe('normalizeForSpeech — review findings (fixpoint decode, metachar, nits)', () => {
+  it('L2 parity: a double-encoded entity decodes to a fixpoint (depth-independent)', () => {
+    // Single decode and double decode must land on the SAME spoken char so the
+    // immediate voice-out and the lazy Listen tap never diverge.
+    const single = normalizeForSpeech('&amp;amp;lt;')
+    const doubled = normalizeForSpeech(normalizeForSpeech('&amp;amp;lt;'))
+    expect(single).toBe('<')
+    expect(doubled).toBe('<')
+    expect(normalizeForSpeech('&amp;amp;amp;')).toBe('&')
+  })
+
+  it('L1: an entity that decodes to a line-leading metachar keeps a spoken form', () => {
+    // &#35; → '#'. Naively re-fed to the heading stripper it would vanish; the
+    // user escaped it on purpose, so it must survive as spoken "hash".
+    expect(normalizeForSpeech('&#35; Heading')).toBe('hash Heading')
+    expect(normalizeForSpeech('2 &#42; 3')).toBe('2 asterisk 3')
+  })
+
+  it('nit: a dangling trailing backslash is dropped, never spoken', () => {
+    expect(normalizeForSpeech('ends here\\')).toBe('ends here')
+    expect(normalizeForSpeech('ends here\\')).not.toContain('\\')
+  })
+
+  it('nit: &#92; decodes to a backslash which is then stripped (no trash)', () => {
+    expect(normalizeForSpeech('X&#92;Y')).toBe('XY')
+    expect(normalizeForSpeech('X&#92;Y')).not.toContain('\\')
+  })
+
+  it('fixpoint does not over-decode entity-less text (Q&A stays literal)', () => {
+    expect(decodeHtmlEntities('Q&A test')).toBe('Q&A test')
   })
 })
