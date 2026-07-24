@@ -22,6 +22,7 @@
 import {
   isNarrationBlock,
   isStructuralNarration,
+  selectBackstopDelivery,
   SUBSTANTIVE_MIN_CHARS,
 } from './hooks/narration-classify.mjs'
 
@@ -278,6 +279,11 @@ export type FlushSkipReason =
   | 'no-inbound-chat'
   | 'empty-text'
   | 'silent-marker'
+  // A prior BACKSTOP (E2 answer-ready flush, or an out-of-process E3/E4 machine
+  // across a crash/restart) already delivered this turn's answer — the durable
+  // exactly-once-among-backstops guard (#3513 follow-up, MF2). Set by the
+  // caller, not `decideTurnFlush`.
+  | 'already-delivered'
 
 export interface FlushDecisionInput {
   /** Inbound chat the turn was servicing. `null` means system-initiated /
@@ -370,14 +376,26 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   // sentinel — treat the whole turn as intentionally silent rather than
   // flush the prose with the sentinel glued on.
   if (endsWithSilentMarker(joined)) return { kind: 'skip', reason: 'silent-marker' }
-  // Deliver only the substantive answer block, never the whole narration+answer
-  // blob (see `selectFlushDeliveryText`). The silent-marker / empty guards above
-  // still run on the full `joined` string so a partly-silent turn is classified
-  // correctly; only the DELIVERED text is narrowed to the answer.
-  return {
-    kind: 'flush',
-    text: selectFlushDeliveryText(input.capturedText, input.capturedBlockMeta),
+  // #3513 follow-up — deterministic, model-discipline-free coalescing. The
+  // DELIVERED text is the TERMINAL RUN (the suffix of blocks NOT followed by a
+  // turn-continuing tool_use); every tool-followed block is suppressed
+  // UNCONDITIONALLY (no length/wording gate), replacing #3515's substance-gated
+  // heuristic on this backstop path. `selectBackstopDelivery` returns null when
+  // nothing terminal survives (a short tool-followed fragment) — treat that as
+  // 'empty-text' so the turn routes to the Stop-hook re-prompt ladder rather
+  // than delivering an interim narration line. The silent-marker / empty guards
+  // above still run on the full `joined` string so a partly-silent turn is
+  // classified correctly.
+  const selected = selectBackstopDelivery(
+    input.capturedText.map((text, i) => ({
+      text,
+      followedByToolUse: input.capturedBlockMeta?.[i],
+    })),
+  )
+  if (selected == null || selected.text.trim().length === 0) {
+    return { kind: 'skip', reason: 'empty-text' }
   }
+  return { kind: 'flush', text: selected.text }
 }
 
 /**

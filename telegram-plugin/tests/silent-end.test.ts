@@ -787,11 +787,17 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
       expect(lowered.text).toBe(joined)
     })
 
-    it('review item 3: NARRATION-only multi-block → still NO pendingText (no masquerade, #3228 Finding 2)', () => {
+    it('review item 3: intra-turn narration blocks each FOLLOWED BY A TOOL → NO pendingText (structural suppression, #3513)', () => {
+      // #3513 follow-up — each narration block is followed by a turn-continuing
+      // tool_use, so the deterministic coalescer suppresses BOTH unconditionally.
+      // The terminal run is empty and the last (tool-followed) block is sub-200 →
+      // the empty-terminal corner returns null → no pendingText, no masquerade.
       const transcript = writeTranscript([
         ENQUEUE,
         { type: 'assistant', message: { content: [{ type: 'text', text: 'Let me check the first source now, scanning the rows…' }] } },
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } },
         { type: 'assistant', message: { content: [{ type: 'text', text: "Now let me query the second source; hang tight…" }] } },
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: '/tmp/x' } }] } },
       ])
       const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
       expect(JSON.parse(r.stdout.trim()).decision).toBe('block')

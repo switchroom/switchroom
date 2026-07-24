@@ -59,6 +59,9 @@ import { normalizeOutboundBody } from './outbound-send-path.js'
 import { resolveEnvTimezone } from '../shared/local-time.js'
 import { hasOutboundDeliveredSince, recordOutbound } from '../history.js'
 import { isReplyTool } from '../narrative-dedup.js'
+import { isEphemeralTool } from '../hooks/narration-classify.mjs'
+import { backstopAlreadyDelivered } from '../outbox.js'
+import { journalExternalDelivery } from './outbox-sweep.js'
 import { NarrativeFlushController } from '../narrative-flush.js'
 import { recordTurnEnd, recordTurnStart } from '../registry/turns-schema.js'
 import { retryWithThreadFallback } from '../retry-api-call.js'
@@ -584,11 +587,21 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
     case 'tool_use': {
       const turn = getCurrentTurn()
       if (turn == null) return
-      // PR A — the model resumed work (surface or otherwise). Cancel any pending
-      // answer-ready quiescence flush: the turn is no longer quiescent. (Fire-time
-      // re-verification would also catch this, but disarming here avoids a wasted
-      // wakeup and matches the design's disarm-on-tool requirement.)
-      clearAnswerReadyFlushTimeout(turn)
+      // #3513 follow-up (MF1 + MF4b) — a TURN-CONTINUING tool_use (any tool NOT
+      // in the ephemeral surface set) is the deterministic signal that every text
+      // block captured so far in this turn was intra-turn narration, not the
+      // terminal answer. Retro-mark ALL existing captured blocks
+      // (`capturedBlockMeta.fill(true)`) so the cross-message shape
+      // ([text-only message] → [tool_use in the NEXT message]) is actually seen
+      // by `selectBackstopDelivery` — the per-message `!ev.lastInMessage` push at
+      // the `text` case under-detects it. The SAME ephemeral gate protects the
+      // E2 answer-ready fast path: a trailing ephemeral tool (answer, then
+      // react / pin / typing / edit / delete) must neither mark the answer
+      // interim NOR disarm the quiescence flush.
+      if (!isEphemeralTool(ev.toolName)) {
+        turn.capturedBlockMeta.fill(true)
+        clearAnswerReadyFlushTimeout(turn)
+      }
       // Narrative-dedup gate step 2 (JSONL-text-narrative primitive): a
       // narrative block was pending; this tool_use is the lookahead event
       // that decides it. reply/stream_reply with near-identical text ⇒
@@ -679,8 +692,13 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // PR A — a tool_label (real-time, ~250 ms) means the model is producing
       // work right now: cancel any pending answer-ready quiescence flush (the
       // turn is not quiescent). Fires ahead of the JSONL tool_use, so it disarms
-      // the timer at the earliest deterministic point.
-      clearAnswerReadyFlushTimeout(turn)
+      // the timer at the earliest deterministic point. MF4b: an EPHEMERAL surface
+      // tool (react / pin / typing / edit / delete fired after a terminal answer)
+      // must NOT disarm the quiescence flush — gate on the same ephemeral check as
+      // the tool_use reducer so answer-then-react keeps the E2 fast path.
+      if (!isEphemeralTool(ev.toolName)) {
+        clearAnswerReadyFlushTimeout(turn)
+      }
       // SECONDARY FIX: an active tool_label means the model is producing work
       // right now — re-arm the orphaned-reply fuse so a multi-phase tool turn
       // (write → compile → test → fix) that regularly emits labels doesn't let
@@ -1754,6 +1772,24 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
             } catch {}
           }
 
+          // #3513 follow-up (MF2) — DURABLE exactly-once-among-backstops read.
+          // The in-memory `backstopDeliveryLedger` (guard 5, below) only sees
+          // fires within THIS process; it cannot see a prior backstop delivery
+          // that landed in an earlier process (e.g. the Stop-hook captured-prose
+          // bridge E3, or the outbox sweep E4, delivered this turn's answer, then
+          // the gateway restarted and re-ran turn-flush). `backstopAlreadyDelivered`
+          // scans the durable delivered-keys journal counting ONLY prior BACKSTOP
+          // deliveries (sweep / flush / non-E0 reply-tool) for this nonce — it does
+          // NOT count an explicit E0 reply (#3510 recap), so a legitimate later
+          // explicit reply is never blocked by this guard. If a backstop already
+          // delivered, this fire is a durable no-op.
+          if (backstopAlreadyDelivered(turn.turnId, STATE_DIR)) {
+            process.stderr.write(
+              `telegram gateway: turn-flush skipped — turn ${turn.turnId} already delivered by a prior backstop (durable journal)\n`,
+            )
+            return
+          }
+
           // #3276 guard 5 — double-fire guard. If this turn already claimed the
           // delivery latch (a prior backstop fire — e.g. answer-ready quiescence
           // followed by the turn-end backstop for the same turn), do NOT deliver
@@ -1884,6 +1920,33 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
                 chunkCount,
                 cardMessageId: backstopCardMessageId,
               })
+              // #3513 follow-up (MF2) — DURABLE exactly-once-among-backstops
+              // WRITE. Journal this backstop delivery to the delivered-keys
+              // journal with `deliverySource:'flush'` so a later backstop in a
+              // DIFFERENT process (the Stop-hook bridge E3 or the outbox sweep E4,
+              // which read `backstopAlreadyDelivered`) recognises this turn's
+              // answer as already delivered and skips a duplicate durably — not
+              // only via the in-memory ledger, which does not survive a crash
+              // between this send and the next process's backstop. Journal ONLY on
+              // a receipt-gated `delivered` success. Best-effort: a journal-write
+              // failure must never demote the successful delivery.
+              if (delivered) {
+                try {
+                  journalExternalDelivery(
+                    {
+                      turnNonce: turn.turnId,
+                      text: capturedText,
+                      tgMessageId: sentIds.length > 0 ? sentIds[0] : undefined,
+                      deliverySource: 'flush',
+                    },
+                    STATE_DIR,
+                  )
+                } catch (err) {
+                  process.stderr.write(
+                    `telegram gateway: turn-flush delivered but journal write failed (non-fatal): ${(err as Error).message}\n`,
+                  )
+                }
+              }
               if (OBLIGATION_LEDGER_ENABLED) {
                 if (delivered) {
                   obligationLedger.close(turn.turnId)
@@ -2040,6 +2103,13 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
                   // #3513 (correction 1): refuse to bridge a block already
                   // surfaced on the ephemeral card for this turn (shown-ledger).
                   isBlockShown: (nonce, text) => isShownBlock(nonce ?? null, text),
+                  // #3513 follow-up (MF2): refuse to bridge a turn a prior
+                  // backstop (turn-flush E1/E2 flush, or the outbox sweep E4)
+                  // already delivered — durable exactly-once-among-backstops,
+                  // scoped to backstop deliveries only (never an explicit E0
+                  // reply, so a genuine later reply is unaffected).
+                  backstopDeliveredNonceHit: (nonce) =>
+                    backstopAlreadyDelivered(nonce ?? '', STATE_DIR),
                 },
               )
             : { deliver: false as const, reason: 'no-state' as const }

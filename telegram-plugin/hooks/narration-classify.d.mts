@@ -15,4 +15,9 @@ export function isStructuralNarration(
   text: string,
   followedByToolUse: boolean | undefined,
 ): boolean
+export const EPHEMERAL_TOOLS: Set<string>
+export function isEphemeralTool(name: string | null | undefined): boolean
+export function selectBackstopDelivery(
+  blocks: ReadonlyArray<{ text: string; followedByToolUse?: boolean }>,
+): { text: string } | null
 export function ledgerHashHex(text: string): string

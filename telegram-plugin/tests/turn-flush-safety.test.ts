@@ -683,11 +683,34 @@ describe('selectFlushDeliveryText — deliver the terminal answer, strip only na
     expect(out).toBe('Here are the results:')
   })
 
-  it('decideTurnFlush delivers the narrowed answer, not the whole blob', () => {
+  // #3513 follow-up — decideTurnFlush now routes through the deterministic
+  // `selectBackstopDelivery` coalescer, NOT the wording heuristic. With NO
+  // structural provenance (no `capturedBlockMeta`, so no block was followed by a
+  // turn-continuing tool_use) EVERY block is part of the terminal run and is
+  // delivered joined — fail OPEN, never drop. The wording-based narration strip
+  // is gone on the backstop path (it was provably incomplete; #3513). When the
+  // structural signal IS present it, and only it, suppresses.
+  it('decideTurnFlush delivers the full terminal run when NO tool-follow provenance is present (fail-open)', () => {
     const decision = decideTurnFlush({
       chatId: 'chat1',
       replyCalled: false,
       capturedText: ['Let me check.', 'Now let me compose the reply.', answer],
+    })
+    expect(decision.kind).toBe('flush')
+    if (decision.kind === 'flush') {
+      expect(decision.text).toBe(`Let me check.\n\nNow let me compose the reply.\n\n${answer}`)
+    }
+  })
+
+  it('decideTurnFlush suppresses tool-followed blocks UNCONDITIONALLY (structural provenance drives the coalescer)', () => {
+    // The first two blocks were each followed by a turn-continuing tool_use →
+    // intra-turn narration → suppressed with NO length/wording gate. Only the
+    // terminal answer (not tool-followed) survives.
+    const decision = decideTurnFlush({
+      chatId: 'chat1',
+      replyCalled: false,
+      capturedText: ['Let me check.', 'Now let me compose the reply.', answer],
+      capturedBlockMeta: [true, true, false],
     })
     expect(decision.kind).toBe('flush')
     if (decision.kind === 'flush') {
@@ -832,11 +855,20 @@ describe('selectFlushDeliveryText — structural provenance (followedByToolUse) 
     // trailing ellipsis/colon — so only the structural flag could strip it.
     const wrapUp = 'Saved that to memory.'
     // meta[0]=true (a memory tool_use followed the real answer), [1]=false.
+    // The STANDALONE `selectFlushDeliveryText` (the old #3237 substance-gated
+    // function, unchanged and still exported) keeps the substantial block.
     const out = selectFlushDeliveryText([realAnswer, wrapUp], [true, false])
     expect(out).toBe(`${realAnswer}\n\n${wrapUp}`)
     expect(out).toContain('The migration completed cleanly')
 
-    // End-to-end through decideTurnFlush.
+    // #3513 follow-up — decideTurnFlush now routes through
+    // `selectBackstopDelivery`, which suppresses a tool-followed block
+    // UNCONDITIONALLY (no substantive-floor carve-out). This DELIBERATELY
+    // overturns #3237's substance-gate ON THE BACKSTOP PATH: a real answer the
+    // model followed with a turn-continuing tool_use is treated as intra-turn
+    // and excluded; only the terminal (non-tool-followed) block is delivered.
+    // The deterministic contract is "the terminal run wins" — the model keeps
+    // its answer by ending on it or calling the reply tool.
     const decision = decideTurnFlush({
       chatId: 'chat1',
       replyCalled: false,
@@ -845,7 +877,7 @@ describe('selectFlushDeliveryText — structural provenance (followedByToolUse) 
     })
     expect(decision.kind).toBe('flush')
     if (decision.kind === 'flush') {
-      expect(decision.text).toBe(`${realAnswer}\n\n${wrapUp}`)
+      expect(decision.text).toBe(wrapUp)
     }
   })
 

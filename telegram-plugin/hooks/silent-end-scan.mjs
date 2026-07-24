@@ -60,7 +60,8 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import {
   isNarrationBlock,
-  isStructuralNarration,
+  isEphemeralTool,
+  selectBackstopDelivery,
   SUBSTANTIVE_MIN_CHARS,
 } from './narration-classify.mjs'
 
@@ -419,24 +420,35 @@ export function scanTurnForFinalReply(jsonl) {
           // text becomes `pendingText` so the gateway can deliver the model's
           // real answer directly. Trimmed per-block; joined below.
           //
-          // #3513: also carry the STRUCTURAL provenance `followedByToolUse`
-          // (mirrors the gateway's `capturedBlockMeta` / `!lastInMessage`): a
-          // `tool_use` later in this SAME assistant message means the model
-          // kept acting after writing this text → intra-turn narration, never
-          // the terminal answer. Computed here so the `.mjs` scans apply the
-          // same primary rule as the TS flush (no more provenance-less blind
-          // spot on the out-of-process bridge/sweep paths).
+          // #3513 follow-up (MF1): carry the block's text/length; the STRUCTURAL
+          // provenance `followedByToolUse` is NOT computed per-message here (the
+          // old `content.slice(ci+1)` only saw a tool later in this SAME message,
+          // missing the cross-message shape [text-only message] → [tool_use in the
+          // NEXT message]). It is filled by the PER-TURN two-pass below, which
+          // sees a turn-continuing tool_use ANYWHERE later in the turn.
           blocks.push({
             kind: 'text',
             chars: String(c.text ?? '').trim().length,
             text: String(c.text ?? '').trim(),
-            followedByToolUse: content.slice(ci + 1).some((x) => x?.type === 'tool_use'),
+            followedByToolUse: false,
           })
         }
         continue
       }
       if (c?.type !== 'tool_use') continue
-      if (!REPLY_TOOLS.has(c.name)) continue
+      if (!REPLY_TOOLS.has(c.name)) {
+        // #3513 follow-up (MF1): a turn-CONTINUING tool_use (any tool NOT in the
+        // ephemeral surface set and NOT a reply tool) is the deterministic signal
+        // that every PRIOR text block — including ones in earlier messages — was
+        // intra-turn narration. Record it as an ordered provenance marker so the
+        // two-pass below can retro-mark those blocks. Ephemeral surface tools
+        // (react / pin / typing / edit / delete) are NOT turn-continuing: a text
+        // block followed only by them is still the terminal answer.
+        if (!isEphemeralTool(c.name)) {
+          blocks.push({ kind: 'work-tool' })
+        }
+        continue
+      }
       const input = c.input ?? {}
       const text = String(input.text ?? '')
       // Silent-marker carve-out: the operator explicitly signaled
@@ -463,6 +475,28 @@ export function scanTurnForFinalReply(jsonl) {
     }
   }
 
+  // 2b. #3513 follow-up (MF1) — PER-TURN two-pass structural provenance. Walk
+  //     the flattened blocks in REVERSE and mark each text block
+  //     `followedByToolUse` iff a turn-continuing tool_use (`kind:'work-tool'`,
+  //     recorded above for any non-ephemeral, non-reply tool) appears LATER
+  //     anywhere in the turn — not just later in its own message. This is the
+  //     root-cause fix: the per-message computation missed the cross-message
+  //     shape ([text-only message] → [tool_use in the NEXT message]), leaking
+  //     intra-turn narration to the bridge/sweep. A `deliver` (reply-tool) marker
+  //     does NOT reset the flag: reply provenance is handled by the deliver
+  //     cursor (lastAllowBlockIdx), not the structural mark.
+  {
+    let sawWorkToolLater = false
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i]
+      if (b.kind === 'work-tool') {
+        sawWorkToolLater = true
+        continue
+      }
+      if (b.kind === 'text') b.followedByToolUse = sawWorkToolLater
+    }
+  }
+
   // 3. Find the LAST delivery event's position, then check whether any
   //    plain-text block appears strictly after it. This is the fix for
   //    the "at least once" bug: a naive scan that stops at the FIRST
@@ -477,76 +511,50 @@ export function scanTurnForFinalReply(jsonl) {
     }
   }
   const undeliveredSlice = blocks.slice(lastAllowBlockIdx + 1)
-  // #3513: a trailing text block that a `tool_use` FOLLOWED (in its message) is
-  // structural intra-turn narration, never the terminal answer — so it must not
-  // trigger the interim-ack re-prompt/bridge (`trailing-text-after-reply`) nor
-  // be selected as deliverable prose. Substance-gated (correction 3): a
-  // substantive, non-narration trailing block is NOT structural narration and
-  // still counts as an undelivered answer.
-  const isStructuralNarr = (b) => isStructuralNarration(b.text, b.followedByToolUse)
-  const sawUndeliveredTextAfterAllow = undeliveredSlice
-    .some((b) => b.kind === 'text' && (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS && !isStructuralNarr(b))
-
-  // Option A transcript-prose bridge: isolate the undelivered final-answer
-  // prose so the gateway can deliver it directly.
-  //
-  // Finding 2 (#3228): a real dropped answer is a SINGLE substantive block —
-  // NOT concatenated inter-tool narration ("Let me check…", "Still querying…")
-  // that only crosses the floor once joined. The old code joined ALL post-
-  // delivery text blocks and surfaced the join whenever the COMBINED length
-  // hit the floor, so a run of short narration masqueraded as a final answer
-  // (and in the zero-delivery case that join was every text block in the
-  // turn). Instead, deliver only the LAST block that CLEARS the substance
-  // floor ON ITS OWN. This mirrors the block decision itself
-  // (`sawUndeliveredTextAfterAllow`, which requires a single ≥floor block) and
-  // handles the "big answer then short closer" shape by delivering the answer,
-  // not the closer. When no single block clears the floor, `pendingText` stays
-  // undefined and the gateway falls through to the re-prompt / represent nets.
-  const substantiveBlocks = undeliveredSlice.filter(
-    (b) =>
-      b.kind === 'text' &&
-      typeof b.text === 'string' &&
-      (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS &&
-      !isStructuralNarr(b),
-  )
-  const pendingText =
-    substantiveBlocks.length > 0
-      ? substantiveBlocks[substantiveBlocks.length - 1].text
+  // #3513 follow-up — the ONE shared backstop coalescer selects the terminal
+  // delivery from the trailing text blocks (in source order, carrying the
+  // per-TURN structural provenance filled by the two-pass above).
+  // `selectBackstopDelivery` UNCONDITIONALLY excludes any block a
+  // turn-continuing tool followed (no length/wording gate — the #3515 substance
+  // heuristic is gone on the backstop path) and joins the maximal terminal
+  // suffix run of non-tool-followed blocks. `null` ⇒ nothing deliverable
+  // (pure narration run, or an empty-terminal fragment below the floor).
+  const backstopBlocks = undeliveredSlice
+    .filter((b) => b.kind === 'text' && typeof b.text === 'string')
+    .map((b) => ({ text: b.text, followedByToolUse: b.followedByToolUse }))
+  const backstopSelected = selectBackstopDelivery(backstopBlocks)
+  const backstopText =
+    backstopSelected != null && typeof backstopSelected.text === 'string'
+      ? backstopSelected.text
       : undefined
-  // #3513: the deliverable-prose selection drops structural-narration trailing
-  // blocks so the capture-divergence bridge never delivers a lone narration
-  // line. `hasTrailingProse` INTENTIONALLY still counts any non-empty trailing
-  // prose (narration included): in the zero-reply case it gates the single-writer
-  // election to ALLOW the stop (`flush-will-deliver`) rather than BLOCK+nag — the
-  // flush then suppresses the narration structurally, so the turn ends silently
-  // (no leak, no nag loop). Only the DELIVERED text is narrowed.
+
+  // The interim-ack path (`trailing-text-after-reply`) keeps the 200-char
+  // substance floor: a short trailing closer after a real reply is not a
+  // dropped answer. A qualifying delivery already happened, so blocking here
+  // only re-nags for a genuine ≥floor dropped answer.
+  const sawUndeliveredTextAfterAllow =
+    backstopText != null && backstopText.trim().length >= FINAL_ANSWER_MIN_CHARS
+  const pendingText =
+    backstopText != null && backstopText.trim().length >= FINAL_ANSWER_MIN_CHARS
+      ? backstopText
+      : undefined
+  // `hasTrailingProse` INTENTIONALLY still counts ANY non-empty trailing prose
+  // (narration included): in the zero-reply case it gates the single-writer
+  // election to ALLOW the stop (`flush-will-deliver`) rather than BLOCK+nag —
+  // the gateway flush then suppresses the narration structurally (its own
+  // `selectBackstopDelivery` returns null), so the turn ends silently (no leak,
+  // no nag loop). Only the DELIVERED text is narrowed by the coalescer.
   const trailingTextBlocks = undeliveredSlice.filter(
     (b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0,
   )
-  const deliverableTrailingBlocks = trailingTextBlocks.filter((b) => !isStructuralNarr(b))
   const hasTrailingProse = trailingTextBlocks.length > 0
-  // Capture-divergence bridge (#duplicate-message fix): in the ZERO-reply
-  // case, persist the last trailing block even when no single block clears
-  // the 200-char substance floor. The gateway's flush normally delivers any
-  // non-empty captured text, but when the gateway's own capture diverged
-  // (captured empty) the captured-prose bridge is the only delivery machine
-  // left, and it reads `pendingText` — the gateway lowers `minChars` for
-  // exactly this corner (`capturedProseMinCharsFor`, silent-end.ts). The
-  // interim-ack case (`trailing-text-after-reply`) keeps the substantive
-  // floor unchanged — a short closer after a real reply is not a dropped
-  // answer.
-  //
-  // Multi-block corner (review item 3): a real answer split across ≥2
-  // individually-sub-200 blocks (e.g. two ~150-char paragraphs) would
-  // otherwise yield NO pendingText — and in the capture-divergence-empty
-  // corner (gateway `capturedText` empty → flush skips 'empty-text') the
-  // bridge would then have nothing to deliver and the hook already allowed the
-  // stop: a DROPPED ANSWER. `selectBridgePendingText` mirrors the flush's own
-  // `selectFlushDeliveryText` narration-strip/join, so the bridge delivers the
-  // joined prose (with the lowered `minChars`) instead of dropping. The #3228
-  // Finding 2 guard is preserved: a pure narration run still yields undefined.
-  const zeroReplyPendingText =
-    pendingText ?? selectBridgePendingText(deliverableTrailingBlocks.map((b) => b.text))
+  // Zero-reply / capture-divergence corner: the coalesced terminal run is the
+  // deliverable prose regardless of the 200-char interim-ack floor — a real
+  // answer split across ≥2 individually-sub-200 terminal blocks is joined by
+  // `selectBackstopDelivery` (its terminal-run join has no floor), so the bridge
+  // delivers the joined prose instead of dropping. A pure narration run still
+  // yields `undefined` (the #3228 Finding 2 guard, now structural).
+  const zeroReplyPendingText = backstopText
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
@@ -928,15 +936,15 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     if (!Array.isArray(content)) continue
     for (let ci = 0; ci < content.length; ci++) {
       const c = content[ci]
-      // #3513: a `tool_use` later in this SAME assistant message means the model
-      // kept acting after this text → structural intra-turn narration.
-      const followedByToolUse = content.slice(ci + 1).some((x) => x?.type === 'tool_use')
       if (c?.type === 'text') {
         const raw = String(c.text ?? '')
         // H6: strip a trailing bare marker; if substantive non-narration prose
         // remains, it is a genuine (undelivered) answer — capture it. If nothing
         // but the marker (or narration) remains, the block is a silence event.
         const { prose, hadMarker } = stripTrailingSilentMarker(raw)
+        // #3513 follow-up (MF1): `followedByToolUse` is filled by the PER-TURN
+        // two-pass below (a turn-continuing tool_use later ANYWHERE in the turn),
+        // not per-message — the cross-message shape needs the whole-turn view.
         if (hadMarker) {
           // H6: a block ending "…real answer…\nNO_REPLY" carries a genuine
           // answer — capture the prose and do NOT treat the block as a silence
@@ -947,15 +955,22 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
           // last-delivery cursor past that prose and mask it (multi-block H6).
           // A bare/narration marker is simply not a delivery — push nothing.
           if (prose.length > 0 && !isNarrationBlock(prose)) {
-            blocks.push({ kind: 'text', chars: prose.length, text: prose, followedByToolUse })
+            blocks.push({ kind: 'text', chars: prose.length, text: prose, followedByToolUse: false })
           }
         } else if (prose.length > 0) {
-          blocks.push({ kind: 'text', chars: prose.length, text: prose, followedByToolUse })
+          blocks.push({ kind: 'text', chars: prose.length, text: prose, followedByToolUse: false })
         }
         continue
       }
       if (c?.type !== 'tool_use') continue
-      if (!REPLY_TOOLS.has(c.name)) continue
+      if (!REPLY_TOOLS.has(c.name)) {
+        // #3513 follow-up (MF1): record a turn-continuing (non-ephemeral,
+        // non-reply) tool_use as an ordered provenance marker for the two-pass.
+        if (!isEphemeralTool(c.name)) {
+          blocks.push({ kind: 'work-tool' })
+        }
+        continue
+      }
       const input = c.input ?? {}
       const text = String(input.text ?? '')
       if (SILENT_MARKER_RE.test(text.trim()) || endsWithSilentMarker(text)) {
@@ -973,6 +988,21 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
         blocks.push({ kind: 'deliver', reason: 'final-reply', text })
       }
       // interim ack — neither delivery nor undelivered prose.
+    }
+  }
+
+  // #3513 follow-up (MF1) — PER-TURN two-pass structural provenance (same as
+  // scanTurnForFinalReply): mark each text block `followedByToolUse` iff a
+  // turn-continuing tool_use appears LATER anywhere in the turn.
+  {
+    let sawWorkToolLater = false
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i]
+      if (b.kind === 'work-tool') {
+        sawWorkToolLater = true
+        continue
+      }
+      if (b.kind === 'text') b.followedByToolUse = sawWorkToolLater
     }
   }
 
@@ -1007,19 +1037,19 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     lastFinalReplyBlock != null && typeof lastFinalReplyBlock.text === 'string'
       ? createHash('sha256').update(lastFinalReplyBlock.text, 'utf8').digest('hex')
       : null
-  const trailing = blocks
+  // #3513 follow-up — the ONE shared coalescer selects the terminal delivery,
+  // UNCONDITIONALLY excluding any block a turn-continuing tool followed (no
+  // length/wording gate) and joining the terminal suffix run. The durable outbox
+  // never captures intra-turn narration for the sweep to deliver.
+  const trailingTextBlocks = blocks
     .slice(lastDeliverIdx + 1)
     .filter((b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0)
-    // #3513: drop structural-narration trailing blocks (a `tool_use` followed
-    // them → intra-turn narration, never the terminal answer) so the durable
-    // outbox never captures a lone narration line for the sweep to deliver.
-    // Substance-gated: a substantive non-narration block is kept.
-    .filter((b) => !isStructuralNarration(b.text, b.followedByToolUse))
-    .map((b) => b.text)
-
-  const text = selectBridgePendingText(trailing)
+  const backstopSelected = selectBackstopDelivery(
+    trailingTextBlocks.map((b) => ({ text: b.text, followedByToolUse: b.followedByToolUse })),
+  )
+  const text = backstopSelected != null ? backstopSelected.text : null
   if (text == null || text.trim().length < FINAL_ANSWER_MIN_CHARS) {
-    return { capture: false, reason: trailing.length === 0 ? 'no-trailing-prose' : 'below-floor' }
+    return { capture: false, reason: trailingTextBlocks.length === 0 ? 'no-trailing-prose' : 'below-floor' }
   }
 
   const turnNonce = deriveTurnNonce({

@@ -404,10 +404,13 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
   const NARRATION_B = "Now let me query the second source; it is slower than expected, hang tight…" // opener + …
   const NARRATION_C = "I'll cross-reference the last set of figures against the ledger before I summarise…" // opener + …
 
-  it('zero-delivery turn of only NARRATION blocks → block WITHOUT pendingText (#3228 Finding 2 / flush parity)', () => {
-    // Combined length of the three blocks is ≥ 200, so the OLD joined-floor code
-    // would join them and set pendingText (masquerade). The NEW code mirrors the
-    // flush's narration strip: every block is narration → nothing to deliver.
+  it('narration interleaved with work-tools, ending on a terminal narration line → only the terminal block, never the join (#3513 structural coalescer)', () => {
+    // #3513 follow-up — A and B are each followed by a turn-continuing tool_use
+    // (Bash / Read) → structurally intra-turn → UNCONDITIONALLY suppressed.
+    // C is the terminal block (no tool after it), so the deterministic coalescer
+    // delivers C ALONE. The #3228 Finding-2 join-masquerade (concatenating short
+    // narration to cross the 200-char floor) is STILL prevented: the 200-floor
+    // `pendingText` stays undefined, and the delivered text is never the join.
     expect((NARRATION_A + '\n\n' + NARRATION_B + '\n\n' + NARRATION_C).length)
       .toBeGreaterThanOrEqual(200)
     const text = jsonl(
@@ -421,8 +424,12 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
     expect(r.reason).toBe('no-final-reply')
-    // The masquerade must NOT happen — no answer to deliver, take the re-prompt.
-    expect(r.pendingText).toBeUndefined()
+    // Never the join of the suppressed A/B blocks (masquerade guard preserved).
+    expect(r.pendingText).not.toContain(NARRATION_A)
+    expect(r.pendingText).not.toContain(NARRATION_B)
+    // The terminal block is the coalescer's selection (delivered via the
+    // zero-reply lowered floor); the 200-char masquerade path yields nothing.
+    expect(r.pendingText).toBe(NARRATION_C)
   })
 
   it('zero-delivery turn of MULTIPLE sub-200 REAL-CONTENT blocks → JOINED pendingText (review item 3 drop fix)', () => {
@@ -445,13 +452,32 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
     expect(r.hasTrailingProse).toBe(true)
   })
 
-  it('leading narration + a real sub-200 answer block → only the answer is delivered (narration stripped)', () => {
+  it('leading narration FOLLOWED BY A TOOL + a real sub-200 answer block → only the answer is delivered (structural strip)', () => {
+    // #3513 follow-up — the narration is stripped by the STRUCTURAL signal (a
+    // work-tool followed it), not by wording. The terminal answer block (no tool
+    // after it) is the coalescer's selection.
     const NARR = 'Let me pull the numbers first…' // narration opener + …
     const ANSWER = 'Revenue was up 12% quarter-over-quarter, driven mostly by the new enterprise tier.' // ~85, real
-    const text = jsonl(ENQUEUE, assistantText(NARR), assistantText(ANSWER))
+    const text = jsonl(
+      ENQUEUE,
+      assistantText(NARR),
+      assistantToolUse('Bash', { command: 'psql -c "select ..."' }),
+      assistantText(ANSWER),
+    )
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
     expect(r.pendingText).toBe(ANSWER)
+  })
+
+  it('leading narration with NO tool + a real answer → both delivered joined (fail-open; no wording strip on the backstop path, #3513)', () => {
+    // Without a structural continuation signal the coalescer delivers the full
+    // terminal run — the wording-based strip is gone (it was provably incomplete).
+    const NARR = 'Let me pull the numbers first…'
+    const ANSWER = 'Revenue was up 12% quarter-over-quarter, driven mostly by the new enterprise tier.'
+    const text = jsonl(ENQUEUE, assistantText(NARR), assistantText(ANSWER))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.pendingText).toBe(`${NARR}\n\n${ANSWER}`)
   })
 
   it('trailing narration after a delivered reply, all sub-floor → block only if a real ≥floor block exists; here → allow, no pendingText', () => {
@@ -469,18 +495,21 @@ describe('scanTurnForFinalReply — pendingText is a single substantive block, n
     expect(r.pendingText).toBeUndefined()
   })
 
-  it('a genuine ≥floor answer followed by a SHORT closer → pendingText is the answer, not the closer', () => {
-    // "big answer then short closer" — the LAST substantive (≥floor) block is
-    // the answer; the trailing short closer must not displace it.
+  it('a genuine ≥floor answer followed by a SHORT closer → both delivered as the terminal run (answer never dropped, #3513)', () => {
+    // #3513 follow-up — "big answer then short closer", NO tool after either
+    // block, so both are the terminal run and are delivered JOINED. The #3228
+    // concern (a short closer DISPLACING the answer) cannot happen: the coalescer
+    // never drops the answer — it delivers the whole terminal run.
     const answer = 'Here is the real answer you were waiting for: ' + 'A'.repeat(300)
+    const closer = 'Let me know if you need anything else.'
     const text = jsonl(
       ENQUEUE,
       assistantText(answer),
-      assistantText('Let me know if you need anything else.'),
+      assistantText(closer),
     )
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
-    expect(r.pendingText).toBe(answer)
+    expect(r.pendingText).toBe(`${answer}\n\n${closer}`)
   })
 
   it('substance-floor boundary: a single trailing block at 199/200/201 chars', () => {

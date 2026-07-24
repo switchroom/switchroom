@@ -104,6 +104,100 @@ export function isStructuralNarration(text, followedByToolUse) {
 }
 
 /**
+ * Ephemeral (non-turn-continuing) Telegram surface tools (switchroom#3513
+ * follow-up, MF4). A text block followed ONLY by tools in this set is still the
+ * TERMINAL answer for backstop-coalescing purposes — these tools carry no
+ * model-authored answer text and are the only ones plausibly fired AFTER a
+ * terminal answer (answer, then react / pin / typing / edit). Everything NOT in
+ * this set — work / deliverable tools (download_attachment, get_recent_messages,
+ * send_checklist, ask_user, …) and every non-telegram tool (retain / read /
+ * bash / web / …) — is turn-CONTINUING: a text block a real tool followed is
+ * intra-turn narration, never the terminal answer.
+ *
+ * Authoritative source: `bridge/bridge.ts` TOOL_SCHEMAS. `reply` / `stream_reply`
+ * are deliberately absent — they are handled by the `replyCalled` gate, not this
+ * list. `progress_update` is NOT a bridge tool (it is a runtime-metrics /
+ * sub-agent parent-card send site) and never appears as a turn `tool_use`, so it
+ * is intentionally excluded.
+ */
+export const EPHEMERAL_TOOLS = new Set([
+  'react',
+  'send_typing',
+  'pin_message',
+  'delete_message',
+  'edit_message',
+])
+
+/**
+ * True iff `name` is an ephemeral Telegram surface tool (see EPHEMERAL_TOOLS).
+ * Strips the host-chosen `mcp__<key>__` MCP prefix (matching `tool-names.ts`'s
+ * `stripPrefix`) so it works regardless of the registration key
+ * (`switchroom-telegram`, `clerk-telegram`, a fork's custom key).
+ *
+ * @param {string | null | undefined} name
+ * @returns {boolean}
+ */
+export function isEphemeralTool(name) {
+  if (typeof name !== 'string') return false
+  const suffix = name.replace(/^mcp__[^_].*?telegram__/, '')
+  return EPHEMERAL_TOOLS.has(suffix)
+}
+
+/**
+ * The deterministic, model-discipline-free backstop coalescer (switchroom#3513
+ * follow-up). Selects the ONE text a per-turn backstop (turn-flush E1/E2,
+ * captured-prose bridge E3, outbox sweep E4) should deliver from all captured /
+ * scanned assistant text blocks of a turn.
+ *
+ * `blocks` is in source order; each `{ text, followedByToolUse }` carries the
+ * per-TURN structural provenance (`followedByToolUse === true` ⇔ a
+ * turn-CONTINUING tool_use — a non-ephemeral, non-reply tool — arrived after
+ * this block, ANYWHERE later in the turn, not only later in its own message).
+ * `undefined` = provenance unknown → treated as NOT followed (fail OPEN: deliver,
+ * never drop).
+ *
+ * Rules:
+ *  1. TERMINAL RUN — the maximal SUFFIX of non-empty blocks with
+ *     `followedByToolUse !== true`. Non-empty → return its `\n\n` join. A
+ *     legitimate multi-paragraph answer written as several consecutive terminal
+ *     blocks stays whole (no truncation; #3237/#2798 parity).
+ *  2. UNCONDITIONAL structural suppression — every block with
+ *     `followedByToolUse === true` is excluded from the terminal run, with NO
+ *     length gate and NO opener/wording heuristic. "A real tool followed" is a
+ *     hard structural fact the turn continued past this block.
+ *  3. EMPTY-TERMINAL corner — if the terminal run is empty (the LAST non-empty
+ *     block was itself tool-followed), return that last block IFF its trimmed
+ *     length ≥ SUBSTANTIVE_MIN_CHARS, else null. A short tool-followed fragment
+ *     is narration/a closer → null routes to the re-prompt ladder, never silence.
+ *
+ * @param {ReadonlyArray<{ text: string, followedByToolUse?: boolean }>} blocks
+ * @returns {{ text: string } | null}  null = nothing to deliver.
+ */
+export function selectBackstopDelivery(blocks) {
+  const nonEmpty = (Array.isArray(blocks) ? blocks : [])
+    .map((b) => ({
+      text: typeof b?.text === 'string' ? b.text.trim() : '',
+      followedByToolUse: b?.followedByToolUse,
+    }))
+    .filter((b) => b.text.length > 0)
+  if (nonEmpty.length === 0) return null
+
+  // Rule 1 + 2: the terminal SUFFIX run of non-tool-followed blocks.
+  const run = []
+  for (let i = nonEmpty.length - 1; i >= 0; i--) {
+    if (nonEmpty[i].followedByToolUse === true) break
+    run.unshift(nonEmpty[i].text)
+  }
+  if (run.length > 0) return { text: run.join('\n\n') }
+
+  // Rule 3: empty terminal — the last block was tool-followed. Deliver it only
+  // if it clears the substantive floor; otherwise it is a narration fragment.
+  const last = nonEmpty[nonEmpty.length - 1]
+  if (last.text.length >= SUBSTANTIVE_MIN_CHARS) return { text: last.text }
+  return null
+}
+
+/**
  * The durable shown-ledger key for a block: sha256 of its trimmed text. Matches
  * the hash both the ephemeral-paint writer and the backstop-delivery readers
  * compute, so a marked block is recognised across processes (#3513 §4).
