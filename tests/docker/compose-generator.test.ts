@@ -1419,6 +1419,36 @@ describe("agent service env (Phase 2c F2 — IPC wiring)", () => {
     }
   });
 
+  // KEN-126: 1-hour extended prompt-cache TTL. Idle-heavy Telegram agents
+  // lose the default 5-minute prompt cache between messages; the claude
+  // CLI (verified on 2.1.219) honors ENABLE_PROMPT_CACHING_1H as a
+  // deterministic force-on for the extended-cache-ttl-2025-04-11 beta
+  // (its built-in default is a remote statsig gate). Emitted as an
+  // operator-overridable default: applied only when the agent's `env:`
+  // block doesn't set the key itself.
+  it("defaults ENABLE_PROMPT_CACHING_1H=1 on each agent container", () => {
+    const out = generateCompose({
+      config: makeConfig({ alice: {}, bob: {} }),
+    });
+    for (const a of ["alice", "bob"]) {
+      const env = envBlockFor(out, a);
+      expect(env).toMatch(/ENABLE_PROMPT_CACHING_1H:\s*"1"/);
+    }
+  });
+
+  it("operator env: ENABLE_PROMPT_CACHING_1H override wins over the default", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        alice: { env: { ENABLE_PROMPT_CACHING_1H: "0" } },
+        bob: {},
+      }),
+    });
+    expect(envBlockFor(out, "alice")).toMatch(
+      /ENABLE_PROMPT_CACHING_1H:\s*"0"/,
+    );
+    expect(envBlockFor(out, "bob")).toMatch(/ENABLE_PROMPT_CACHING_1H:\s*"1"/);
+  });
+
   it("sets TINI_KILL_PROCESS_GROUP=1 so SIGTERM reaches the gateway sidecar", () => {
     // Without this env, tini forwards SIGTERM only to its direct child
     // (tmux at PID 7); the gateway/scheduler/autoaccept sidecars share
