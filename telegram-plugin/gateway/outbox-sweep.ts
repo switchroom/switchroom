@@ -287,6 +287,11 @@ export function createOutboxSend(deps: {
   return async (chatId, threadId, text) => {
     const bot = deps.getBot()
     if (bot == null) throw new Error('outbox-sweep: bot unavailable')
+    // Empty text → nothing to deliver. Telegram rejects an empty message body,
+    // so sending one chunk of '' would throw every tick and wedge the sweep in
+    // a permanent retry (the record never journals → never clears). Return
+    // early, matching the pre-refactor loop's zero-chunk behaviour.
+    if (text.length === 0) return undefined
     // Resolve the Listen button / keyboard ONCE from the full answer text; it
     // rides only on the final chunk below.
     const replyMarkup = deps.resolveReplyMarkup?.(chatId, threadId, text)
@@ -295,8 +300,8 @@ export function createOutboxSend(deps: {
     // propagates so the sweep releases the claim and retries next tick (the
     // record is never journaled → never lost).
     let lastId: number | undefined
-    const chunkCount = Math.max(1, Math.ceil(text.length / 4000))
-    for (let i = 0, idx = 0; i < text.length || idx === 0; i += 4000, idx++) {
+    const chunkCount = Math.ceil(text.length / 4000)
+    for (let i = 0, idx = 0; i < text.length; i += 4000, idx++) {
       const chunk = text.slice(i, i + 4000)
       const isLast = idx === chunkCount - 1
       const res = await retryWithThreadFallback(

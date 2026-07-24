@@ -1500,7 +1500,14 @@ export async function sendReply(
     // agent-keyboard collision gate. Null = don't inject.
     const listenPlan = planListenButton({ voiceOutPlan, rawKeyboard })
     if (listenPlan == null) {
-      if (!mayInjectListenButton(rawKeyboard)) {
+      // Log the collision gate ONLY when the agent keyboard is the ACTUAL
+      // reason we skipped — i.e. there IS speakable text. When ttsChunks is
+      // empty the empty-TTS guard is what returned null (there was nothing to
+      // speak), so a "skipping — agent supplied inline_keyboard" line would
+      // misattribute the reason.
+      const hasSpeakableText =
+        voiceOutPlan!.ttsChunks.length > 0 && voiceOutPlan!.ttsChunks[0]!.length > 0
+      if (hasSpeakableText && !mayInjectListenButton(rawKeyboard)) {
         process.stderr.write(
           'telegram gateway: voice-out on-demand: agent supplied inline_keyboard — skipping Listen button (single_use collision gate)\n',
         )

@@ -161,6 +161,29 @@ describe('createOutboxSend — net-delivered answer carries the Listen button (#
     expect(bot.calls).toHaveLength(1)
     expect(bot.calls[0]!.opts.reply_markup).toBeUndefined()
   })
+
+  it('empty text sends NOTHING and returns undefined (no empty-message retry wedge)', async () => {
+    // Telegram rejects an empty message body; a stray '' chunk would throw
+    // every sweep tick and wedge the record in a permanent retry. The send
+    // must short-circuit instead of calling sendMessage.
+    const bot = fakeBot()
+    const resolverCalls: string[] = []
+    const send = createOutboxSend({
+      getBot: () => bot,
+      retry: passthroughRetry,
+      resolveReplyMarkup: (_c, _t, text) => {
+        resolverCalls.push(text)
+        return undefined
+      },
+    })
+
+    const result = await send('123', null, '')
+
+    expect(result).toBeUndefined()
+    expect(bot.calls).toHaveLength(0)
+    // No point resolving a Listen button for a body we never send.
+    expect(resolverCalls).toEqual([])
+  })
 })
 
 describe('gateway wiring — makeOutboxListenMarkupResolver end-to-end (#3502)', () => {
