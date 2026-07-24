@@ -240,3 +240,45 @@ describe('conservatism', () => {
     expect(normalizeForTts(input)).toBe(normalizeForTts(input))
   })
 })
+
+describe('normalizeForTts — backslash escapes & HTML entities (last-line defence)', () => {
+  test('strips a literal \\b so the engine never speaks "backslash b"', () => {
+    const out = normalizeForTts('the regex \\b boundary')
+    expect(out).toBe('the regex b boundary')
+    expect(out).not.toContain('\\')
+  })
+
+  test('unescapes MarkdownV2 punctuation escapes (\\. \\! \\-)', () => {
+    expect(normalizeForTts('done\\. next\\! wait\\-')).toBe('done. next! wait-')
+  })
+
+  test('decodes HTML entities (&amp; &lt; &#39;)', () => {
+    expect(normalizeForTts('Tom &amp; Jerry')).toBe('Tom and Jerry')
+    expect(normalizeForTts('5 &lt; 10')).toBe('5 < 10')
+    expect(normalizeForTts("it&#39;s here")).toBe("it's here")
+  })
+
+  test('rich mixed reply → clean spoken text (no backslash/backtick/entity)', () => {
+    const reply =
+      '**Bold** and `code\\b` and a [label](https://example.com/x) ' +
+      'with Tom &amp; Jerry and a regex \\b\\.'
+    const out = normalizeForTts(reply)
+    expect(out).not.toContain('\\')
+    expect(out).not.toContain('`')
+    expect(out).not.toContain('&amp;')
+    expect(out).toContain('label')
+    expect(out).toContain('Tom and Jerry')
+  })
+
+  test('kill switch still returns byte-identical input (escapes preserved)', () => {
+    process.env[KILL] = '1'
+    expect(normalizeForTts('a \\b &amp; b')).toBe('a \\b &amp; b')
+    delete process.env[KILL]
+  })
+
+  test('idempotent after normalizeForSpeech already unescaped', () => {
+    const reply = 'a \\b and Tom &amp; Jerry \\. end'
+    const once = normalizeForTts(reply)
+    expect(normalizeForTts(once)).toBe(once)
+  })
+})

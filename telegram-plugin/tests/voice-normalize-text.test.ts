@@ -254,3 +254,51 @@ describe('normalizeForSpeech — conservative, does not mangle real words', () =
     expect(normalizeForSpeech('   \n  ')).toBe('')
   })
 })
+
+describe('normalizeForSpeech — backslash escapes & HTML entities (voice trash)', () => {
+  it('strips a literal backslash-b (\\b) so it is never spoken as "backslash b"', () => {
+    // The exact operator report: the regex/escape "\b" was read as "slash b".
+    const out = normalizeForSpeech('the regex \\b word boundary')
+    expect(out).toBe('the regex b word boundary')
+    expect(out).not.toContain('\\')
+  })
+
+  it('unescapes MarkdownV2 punctuation escapes without leaving backslashes', () => {
+    expect(normalizeForSpeech('done\\. next\\! wait\\-')).toBe('done. next! wait-')
+    expect(normalizeForSpeech('a \\* b')).not.toContain('\\')
+  })
+
+  it('an escaped emphasis marker collapses to the inner word, not a backslash', () => {
+    expect(normalizeForSpeech('Use \\*literal\\* here')).toBe('Use literal here')
+  })
+
+  it('drops a Windows-path-style backslash run (C:\\build)', () => {
+    expect(normalizeForSpeech('path C:\\build\\out done')).toBe('path C:buildout done')
+  })
+
+  it('decodes HTML entities so &amp; / &lt; are not read as "amp" / "lt"', () => {
+    expect(normalizeForSpeech('Tom &amp; Jerry')).toBe('Tom and Jerry')
+    expect(normalizeForSpeech('5 &lt; 10 &gt; 3')).toBe('5 < 10 > 3')
+    expect(normalizeForSpeech('it&#39;s here')).toBe("it's here")
+  })
+
+  it('produces clean plain speech for a rich mixed reply (end-to-end)', () => {
+    const reply =
+      '**Bold** and `code\\b` and a [label](https://example.com/x) ' +
+      'with Tom &amp; Jerry and a regex \\b\\.'
+    const out = normalizeForSpeech(reply)
+    expect(out).not.toContain('\\')
+    expect(out).not.toContain('`')
+    expect(out).not.toContain('*')
+    expect(out).not.toContain('&amp;')
+    expect(out).not.toContain('example.com')
+    expect(out).toContain('label')
+    expect(out).toContain('Tom and Jerry')
+  })
+
+  it('is idempotent: a second pass finds no backslashes/entities to change', () => {
+    const reply = 'a \\b and Tom &amp; Jerry \\. end'
+    const once = normalizeForSpeech(reply)
+    expect(normalizeForSpeech(once)).toBe(once)
+  })
+})

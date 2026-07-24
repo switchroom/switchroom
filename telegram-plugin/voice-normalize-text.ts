@@ -53,6 +53,46 @@
 /** Replace a fenced code block with a spoken placeholder. */
 const CODE_BLOCK_PLACEHOLDER = 'code block omitted'
 
+/** Named HTML entities the reply text realistically carries. */
+const HTML_ENTITIES: Record<string, string> = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+}
+
+/**
+ * Decode HTML entities (named + numeric) to their character so a TTS engine
+ * never reads `&amp;` as "amp". Unknown named entities are left untouched.
+ * Pure + deterministic.
+ */
+export function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&#x([0-9a-f]+);/gi, (m, hex: string) => {
+      const cp = parseInt(hex, 16)
+      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
+    })
+    .replace(/&#(\d+);/g, (m, dec: string) => {
+      const cp = Number(dec)
+      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
+    })
+    .replace(/&([a-z][a-z0-9]*);/gi, (m, name: string) => {
+      const ch = HTML_ENTITIES[name.toLowerCase()]
+      return ch !== undefined ? ch : m
+    })
+}
+
+/**
+ * Remove markdown/MarkdownV2 backslash escapes so the spoken text carries no
+ * literal backslashes. A backslash before ANY single character is dropped,
+ * keeping the character (`\.` → ".", `\*` → "*", `\b` → "b"); a dangling
+ * trailing backslash is dropped. Pure + deterministic + idempotent (a second
+ * pass finds no backslashes). A real newline is preserved (only the escaping
+ * backslash is consumed).
+ */
+export function stripBackslashEscapes(input: string): string {
+  // `\X` → `X` for any following char (including an escaped `\\`), then drop
+  // any lone backslash the first pass left (an escaped backslash's survivor).
+  return input.replace(/\\([\s\S])/g, '$1').replace(/\\/g, '')
+}
+
 // ---------------------------------------------------------------------------
 // Number → words helpers (small, deterministic, English cardinal only).
 // Used by the numbers/units pass. Supports 0..999_999_999 which is far more
@@ -167,6 +207,23 @@ const ACRONYMS = new Set([
 export function normalizeForSpeech(input: string): string {
   if (!input) return ''
   let s = input.replace(/\r\n?/g, '\n')
+
+  // 0a. HTML entities → their character. The reply text can carry entity
+  //     escapes (`&amp;`, `&lt;`, `&#39;`) that a TTS engine would otherwise
+  //     read as "amp" / "lt" / a digit run. Decode BEFORE markdown/symbol
+  //     passes so the recovered char is then handled naturally (e.g. a
+  //     decoded `&` becomes "and" in the symbols pass).
+  s = decodeHtmlEntities(s)
+
+  // 0b. Backslash escapes → the escaped character. Telegram MarkdownV2 and
+  //     CommonMark escape literal punctuation with a leading backslash
+  //     (`\.`, `\-`, `\*`), and a backslash before a non-punctuation char
+  //     (`\b`) is a literal backslash. Left in place the engine speaks
+  //     "backslash b" / "slash b" — exactly the operator's "trash" report.
+  //     Unescaping here (before the emphasis pass) restores the literal text
+  //     so genuine `*emphasis*` markers are still stripped downstream while
+  //     an escaped `\*` collapses to nothing spoken. Runs once; idempotent.
+  s = stripBackslashEscapes(s)
 
   // 0. Emoji & pictographs → dropped entirely, then whitespace collapsed.
   //    TTS reads an emoji as its long CLDR name ("grinning face"), which is
