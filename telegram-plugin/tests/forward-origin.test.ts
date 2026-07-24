@@ -247,6 +247,25 @@ describe('buildForwardOriginMeta — channel-tag attrs', () => {
     expect(meta.forwarded_from).toHaveLength(FORWARDED_FROM_NAME_MAX)
   })
 
+  it('channel origin emits forwarded_message_id so the agent can deep-link the source post (G2)', () => {
+    const meta = buildForwardOriginMeta([
+      { name: 'Release Notes (@relnotes)', type: 'channel', id: -100400500, date: DATE, messageId: 555 },
+    ])
+    expect(Object.keys(meta)).toEqual([
+      'forwarded_from',
+      'forwarded_from_type',
+      'forwarded_from_id',
+      'forwarded_date',
+      'forwarded_message_id',
+    ])
+    expect(meta.forwarded_message_id).toBe('555')
+  })
+
+  it('non-channel origins (no messageId) omit forwarded_message_id entirely', () => {
+    const meta = buildForwardOriginMeta([parseForwardOrigin(userOrigin())!])
+    expect(meta.forwarded_message_id).toBeUndefined()
+  })
+
   it('no origins → empty record (no attrs on a normal message)', () => {
     expect(buildForwardOriginMeta([])).toEqual({})
   })
@@ -305,6 +324,7 @@ describe('coalesced bursts — dedupe + numbered siblings', () => {
       'forwarded_from_type_2',
       'forwarded_from_id_2',
       'forwarded_date_2',
+      'forwarded_message_id_2',
     ])
     expect(meta.forwarded_from_2).toBe('Release Notes (@relnotes)')
     expect(meta.forwarded_from_type_2).toBe('channel')

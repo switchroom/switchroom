@@ -116,6 +116,7 @@ import {
   handlePaidMediaMessage,
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
+import { handleRichMessageMessage } from './rich-message-handler.js'
 import {
   routeInbound,
   admitInbound,
@@ -22495,6 +22496,9 @@ bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) =>
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added', checklistHandlerDeps)
 })
 bot.on('message:pinned_message', ctx => handlePinnedMessage(ctx, pinnedMessageHandlerDeps))
+// Bot API 10.1 rich messages (forwarded bot messages carry these with NO
+// text/caption — see rich-message-handler.ts; MUST precede the catch-all).
+bot.on('message:rich_message', ctx => handleRichMessageMessage(ctx, mediaEnvelopeDeps))
 installUnhandledMessageCatchAll(
   bot,
   (ctx, text) => routeInbound(ctx, text, undefined, undefined, inboundRouterDeps),

@@ -22,6 +22,7 @@
  */
 
 import type { Bot, Context } from 'grammy'
+import { extractRichMessageText } from './rich-message-handler.js'
 
 /**
  * Top-level `message` envelope fields — identity/routing metadata, excluded
@@ -36,6 +37,14 @@ export const MESSAGE_ENVELOPE_KEYS: ReadonlySet<string> = new Set<string>([
   'business_connection_id', 'effect_id', 'has_protected_content',
   'is_from_offline', 'link_preview_options', 'show_caption_above_media',
   'entities', 'caption_entities', 'paid_star_count',
+  // Legacy (pre-Bot-API-7.0 spelling) forward metadata. Some wire payloads
+  // carry these ALONGSIDE `forward_origin` (observed live: carrie
+  // update_id=417526125, content_keys=[forward_from,forward_date,rich_message]).
+  // They are provenance metadata, not content — without this exclusion a
+  // forwarded unhandled message gets mislabeled `(unhandled message content:
+  // forward_from)` instead of naming its actual content type.
+  'forward_from', 'forward_from_chat', 'forward_from_message_id',
+  'forward_signature', 'forward_sender_name', 'forward_date',
 ])
 
 /**
@@ -88,6 +97,11 @@ export function planUnhandledMessage(msg: Record<string, unknown>): UnhandledMes
   const text =
     (typeof msg.text === 'string' ? msg.text : undefined) ??
     (typeof msg.caption === 'string' ? msg.caption : undefined) ??
+    // Belt-and-braces: `message:rich_message` has its own registered handler
+    // (rich-message-handler.ts), so a rich message normally never reaches the
+    // catch-all — but if one arrives ALONGSIDE unknown future content, its
+    // real body still beats a placeholder.
+    extractRichMessageText(msg.rich_message) ??
     `(unhandled message content: ${contentType})`
   return { action: 'turn', text, contentKeys }
 }

@@ -127,6 +127,9 @@ into the (sender-controlled) body:
 - `forwarded_from_id` — the numeric user/chat id when the origin shape
   exposes one (supplementary; absent for `hidden_user`).
 - `forwarded_date` — ISO timestamp of the original message.
+- `forwarded_message_id` — channel origins only: the message id inside
+  the origin channel, so a public channel post can be deep-linked as
+  `t.me/<channel>/<id>`.
 
 A multi-part forward from one origin (an album) emits the attributes
 once; a coalesced burst forwarded from several different origins gets
