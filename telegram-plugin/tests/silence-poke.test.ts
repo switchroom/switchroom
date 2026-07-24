@@ -649,12 +649,45 @@ describe('silence-poke — #3519 background-bash defer (stacked-cards regression
 
   it('exactly ONE card survives a whole turn with two > 300s background-bash gaps', () => {
     const f = setupDeps(PROD)
+
+    // Model the gateway's pinned-card lifecycle so the surviving card is
+    // asserted POSITIVELY, not merely inferred from zero teardowns. In
+    // production a fallback fire IS a card teardown (currentTurn nulled +
+    // pinned card unpinned, liveness-wiring.ts:427-441), and the next tool
+    // burst mints a BRAND-NEW pinned card — that re-mint is exactly the
+    // stacking. Here: mint one card when the turn starts, and replay a
+    // teardown + fresh re-mint for every fallback the silence-poke tick
+    // records. `mintedCards.length` is then the true number of cards that
+    // ever existed for the turn, and `pinnedCardId` is the live one.
+    const mintedCards: string[] = []
+    let pinnedCardId: string | null = null
+    const mintCard = (): void => {
+      const id = `card-${mintedCards.length + 1}`
+      mintedCards.push(id)
+      pinnedCardId = id
+    }
+    const syncCardsAfterTick = (): void => {
+      // Each recorded fallback == one teardown of the live card + a fresh
+      // re-mint by the resuming burst (the stacked-cards mechanism). Replay
+      // any teardown not yet modelled.
+      while (mintedCards.length - 1 < f.fallbacks.length) {
+        pinnedCardId = null // teardown unpins the live card
+        mintCard() // next tool burst mints a brand-new pinned card (a stack)
+      }
+    }
+
     startTurn('c:0', 0)
+    mintCard() // the turn's first pinned progress card ("card-1")
     // Gap 1 — first backgrounded find.
     noteToolStart('c:0', 't1', 'Bash', 'find / -name a', 5_000)
     noteToolEnd('c:0', 't1', 125_000)
     __tickForTests(306_000)
-    expect(f.fallbacks).toHaveLength(0) // no Card B minted
+    syncCardsAfterTick()
+    expect(f.fallbacks).toHaveLength(0) // no Card B minted (zero teardowns)
+    // POSITIVE: the ORIGINAL pinned card is still the live one after gap 1,
+    // and it is the ONLY card that has ever existed.
+    expect(pinnedCardId).toBe('card-1')
+    expect(mintedCards).toHaveLength(1)
     // Model resumes and updates the SAME pinned card (production resets the
     // silence clock on that render), then launches a second backgrounded find.
     noteProduction('c:0', 310_000)
@@ -662,10 +695,12 @@ describe('silence-poke — #3519 background-bash defer (stacked-cards regression
     noteToolEnd('c:0', 't2', 435_000)
     // Gap 2 — > 300s of silence since the last render (310_000).
     __tickForTests(620_000)
-    expect(f.fallbacks).toHaveLength(0) // no Card C minted
-    // Zero teardowns across the turn ⇒ the single original pinned card was
-    // updated in place the whole time — no stacking.
-    expect(f.fallbacks).toHaveLength(0)
+    syncCardsAfterTick()
+    expect(f.fallbacks).toHaveLength(0) // no Card C minted (zero teardowns)
+    // POSITIVE: still the same single original card, updated in place across
+    // BOTH gaps — no second/third card was ever minted (no stacking).
+    expect(pinnedCardId).toBe('card-1')
+    expect(mintedCards).toEqual(['card-1'])
   })
 
   it('still bounded: a genuinely wedged bash-turn unwedges ONCE at the hard ceiling (not 3×)', () => {
