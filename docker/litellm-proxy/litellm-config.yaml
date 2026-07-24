@@ -44,15 +44,15 @@ model_list:
   # key of its own.
   - model_name: claude-opus
     litellm_params:
-      model: anthropic/claude-opus-4-1
+      model: anthropic/claude-opus-5
       api_key: "no-key-oauth-forwarded"
   - model_name: claude-sonnet
     litellm_params:
-      model: anthropic/claude-sonnet-4-5
+      model: anthropic/claude-sonnet-5
       api_key: "no-key-oauth-forwarded"
   - model_name: sonnet
     litellm_params:
-      model: anthropic/claude-sonnet-4-5
+      model: anthropic/claude-sonnet-5
       api_key: "no-key-oauth-forwarded"
 
   # ── Non-Claude models (OpenRouter cash account; metered per-consumer via
