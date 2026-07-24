@@ -30,6 +30,7 @@ interface TestFixtures {
 function setupDeps(opts?: {
   thresholds?: Partial<typeof DEFAULT_THRESHOLDS> & { fallbackHardCeiling?: number }
   deferFallbackWhileToolInFlight?: boolean
+  isLegitimatelyWorking?: (key: string) => boolean
 }): TestFixtures {
   const fixtures: TestFixtures = { emitted: [], fallbacks: [] }
   __setDepsForTests({
@@ -41,6 +42,9 @@ function setupDeps(opts?: {
     },
     ...(opts?.deferFallbackWhileToolInFlight != null
       ? { deferFallbackWhileToolInFlight: opts.deferFallbackWhileToolInFlight }
+      : {}),
+    ...(opts?.isLegitimatelyWorking != null
+      ? { isLegitimatelyWorking: opts.isLegitimatelyWorking }
       : {}),
   })
   return fixtures
@@ -599,5 +603,104 @@ describe('silence-poke — Fix A: in-flight-tool defer', () => {
     __tickForTests(300_000)
     __tickForTests(3_600_000) // an hour in
     expect(f.fallbacks).toHaveLength(0)
+  })
+})
+
+// ─── #3519: CLI-side background-bash defer — the stacked-cards regression ─────
+// Root cause of the operator-visible bug: a single turn ran a foreground `Bash`
+// that the claude CLI auto-moved to the background at its foreground timeout.
+// The tool_result returned (draining `inFlightTools`), so every existing "still
+// working" signal — `isLegitimatelyWorking()`'s foreground/async-dispatch/
+// ask_user checks — went false while the process kept running and the model sat
+// silent waiting on it. At 300s the framework fallback fired: it nulled
+// `currentTurn` and tore down the pinned progress card (the `onFrameworkFallback`
+// callback → liveness-wiring.ts:427-441 `endCurrentTurnForKey`), and the next
+// tool burst minted a BRAND-NEW pinned card. Each > 300s gap repeated it →
+// 2..N stacked cards on ONE turn.
+//
+// These are OUTCOME assertions: `fixtures.fallbacks` counts every fallback fire,
+// and a fire is exactly a currentTurn-null + card teardown (the trigger for a
+// re-minted card). The production wiring is reproduced faithfully:
+// `isLegitimatelyWorking` IS wired (the gateway always wires it) and it returns
+// FALSE for the whole gap (the CLI-side background bash is invisible to it by
+// construction). Reverting the `sawBashThisTurn` defer turns these RED — the
+// fallback fires on every gap and multiple cards are minted.
+describe('silence-poke — #3519 background-bash defer (stacked-cards regression guard)', () => {
+  const PROD = {
+    thresholds: { fallbackHardCeiling: 900_000 }, // SILENCE_FALLBACK_HARD_MS
+    isLegitimatelyWorking: () => false,            // background bash is invisible
+  }
+
+  it('a foreground Bash moved to background does NOT tear down the card at 300s (mid-work)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    // Foreground bash starts, then auto-moves to background at ~120s: its
+    // tool_result returns so inFlightTools drains. isLegitimatelyWorking is
+    // false throughout — every existing signal says "idle".
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name x', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    // The silent gap the model spends waiting on the background process.
+    __tickForTests(300_000)
+    __tickForTests(306_000) // well past the 300s base threshold
+    // BUG behaviour: fallback fires here (currentTurn nulled, card torn down).
+    // FIXED: deferred — the pinned card stays live, no re-mint.
+    expect(f.fallbacks).toHaveLength(0)
+  })
+
+  it('exactly ONE card survives a whole turn with two > 300s background-bash gaps', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    // Gap 1 — first backgrounded find.
+    noteToolStart('c:0', 't1', 'Bash', 'find / -name a', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // no Card B minted
+    // Model resumes and updates the SAME pinned card (production resets the
+    // silence clock on that render), then launches a second backgrounded find.
+    noteProduction('c:0', 310_000)
+    noteToolStart('c:0', 't2', 'Bash', 'find / -name b', 315_000)
+    noteToolEnd('c:0', 't2', 435_000)
+    // Gap 2 — > 300s of silence since the last render (310_000).
+    __tickForTests(620_000)
+    expect(f.fallbacks).toHaveLength(0) // no Card C minted
+    // Zero teardowns across the turn ⇒ the single original pinned card was
+    // updated in place the whole time — no stacking.
+    expect(f.fallbacks).toHaveLength(0)
+  })
+
+  it('still bounded: a genuinely wedged bash-turn unwedges ONCE at the hard ceiling (not 3×)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+    noteToolEnd('c:0', 't1', 125_000)
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(0) // deferred, not fired 3×
+    __tickForTests(900_000) // crosses SILENCE_FALLBACK_HARD_MS
+    expect(f.fallbacks).toHaveLength(1) // exactly one bounded unwedge
+  })
+
+  it('the defer is Bash-specific: a non-Bash idle turn still fires at 300s (fix is scoped)', () => {
+    const f = setupDeps(PROD)
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Grep', 'foo', 5_000)
+    noteToolEnd('c:0', 't1', 60_000) // Grep can't be a background process
+    __tickForTests(306_000)
+    expect(f.fallbacks).toHaveLength(1) // genuine silence → unwedges normally
+  })
+
+  it('honours the SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 kill switch', () => {
+    const prev = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = '0'
+    try {
+      const f = setupDeps(PROD)
+      startTurn('c:0', 0)
+      noteToolStart('c:0', 't1', 'Bash', 'find /', 5_000)
+      noteToolEnd('c:0', 't1', 125_000)
+      __tickForTests(306_000)
+      expect(f.fallbacks).toHaveLength(1) // defer force-disabled → legacy fire
+    } finally {
+      if (prev != null) process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS = prev
+      else delete process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS
+    }
   })
 })

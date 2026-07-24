@@ -93,6 +93,23 @@ export interface SilencePokeState {
    * clock — the design choice in this module's header is preserved.
    * We only enrich the fallback TEXT, not the timing. */
   inFlightTools: Map<string, { name: string; startedAt: number; label: string | null }>
+  /**
+   * #3519: true once ANY `Bash` tool_use has been observed in this turn.
+   * A foreground `Bash` that exceeds the claude-CLI foreground window is
+   * auto-moved to the background: its `tool_result` returns to the model
+   * (so `inFlightTools` empties and `isLegitimatelyWorking()`'s foreground
+   * / async-dispatch checks all go false), yet the process keeps running
+   * and the model sits silent waiting on it. That silent gap is invisible
+   * to every existing "still working" signal, so the 300s fallback fired
+   * mid-work — nulling `currentTurn`, tearing down the pinned progress
+   * card, and letting the next tool burst mint a BRAND-NEW card (the
+   * stacked-cards bug). Arming this flag on the first Bash of the turn lets
+   * the fallback defer such gaps. Turn-scoped (set here, only cleared by a
+   * fresh `startTurn`); bounded by `fallbackHardCeiling` so a genuinely
+   * wedged bash-turn still unwedges at the ceiling. Does NOT reset the
+   * silence clock — a real reply / feed edit still does that; this only
+   * gates the terminal teardown. */
+  sawBashThisTurn: boolean
 }
 
 export interface ThresholdsMs {
@@ -238,6 +255,7 @@ export function startTurn(key: string, now: number): void {
     fallbackFired: false,
     floorFired: false,
     inFlightTools: new Map(),
+    sawBashThisTurn: false,
   })
 }
 
@@ -313,6 +331,14 @@ export function noteToolStart(
   const s = state.get(key)
   if (s == null) return
   s.inFlightTools.set(toolUseId, { name, startedAt: now, label })
+  // #3519: arm the background-bash defer on the first Bash of the turn.
+  // A foreground Bash can be auto-moved to the background by the claude CLI
+  // once it crosses the foreground window; its tool_result then returns
+  // (draining inFlightTools) while the process keeps running and the model
+  // goes silent waiting on it. That gap is invisible to every other "still
+  // working" signal, so without this the 300s fallback tore down the pinned
+  // card mid-work and the next burst minted a fresh one (stacked cards).
+  if (name === 'Bash') s.sawBashThisTurn = true
 }
 
 /**
@@ -541,8 +567,13 @@ function tick(now: number): void {
       //   2. Legacy `deferFallbackWhileToolInFlight` boolean — covers only
       //      `inFlightTools.size > 0`; kept for test fixtures that set it
       //      directly without wiring the callback.
+      //   3. #3519 `sawBashThisTurn` — covers the claude-CLI-side background
+      //      bash gap the two paths above are blind to (foreground Bash moved
+      //      to background: tool_result returned, process still running, model
+      //      silent). Independent of the callback so it holds even when
+      //      `isLegitimatelyWorking()` returns false.
       //
-      // In both cases: `continue` WITHOUT setting fallbackFired so the next
+      // In all cases: `continue` WITHOUT setting fallbackFired so the next
       // tick re-checks. Once the work signal clears and the turn stays silent
       // past the base threshold, or the ceiling is crossed, the fallback fires.
       const ceiling = thresholds.fallbackHardCeiling ?? Number.POSITIVE_INFINITY
@@ -551,6 +582,17 @@ function tick(now: number): void {
         const forceDisable = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '0'
         if (!forceDisable && activeDeps.isLegitimatelyWorking != null) {
           if (activeDeps.isLegitimatelyWorking(key)) continue
+          // #3519: even when the callback reports "not working", a `Bash`
+          // seen earlier this turn may be running CLI-side in the background
+          // (foreground Bash auto-moved to background: its tool_result has
+          // returned so every foreground / async-dispatch signal is false,
+          // yet the process is alive and the model sits silent on it). That
+          // gap is invisible to `isLegitimatelyWorking` by construction, so
+          // defer here too — bounded by `fallbackHardCeiling` so a genuinely
+          // wedged bash-turn still unwedges at the ceiling. Scoped to the
+          // modern callback-wired path (production always wires it) so the
+          // legacy defer-off / defer-bool fixtures keep their exact semantics.
+          if (s.sawBashThisTurn) continue
         } else if (!forceDisable && activeDeps.deferFallbackWhileToolInFlight === true && s.inFlightTools.size > 0) {
           continue
         }
