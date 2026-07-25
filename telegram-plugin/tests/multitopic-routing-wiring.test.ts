@@ -11,6 +11,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { MCP_INSTRUCTIONS } from '../bridge/mcp-instructions.js'
 
 // #2996 P2: executeReply's body moved VERBATIM to outbound-send-path.ts
 // (`sendReply`); the reply-path routing assertions read the window there.
@@ -39,6 +40,17 @@ const streamSrc = readFileSync(
   'utf-8',
 )
 const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
+// #3562 — the MCP `instructions` string was extracted out of bridge.ts into
+// its own module (it must fit the Claude Code client's 2048-char truncation
+// limit, so it is now length-guarded independently). bridge.ts still owns the
+// per-tool `description` strings.
+//
+// Deliberately NOT concatenated with the instructions module: an earlier
+// revision merged both files into one blob, which meant an assertion could no
+// longer tell WHICH file carried a phrase, and a matching COMMENT satisfied it
+// just as well as real agent-facing text. Instructions text is asserted
+// against the imported runtime constant instead (see below) — a comment cannot
+// satisfy that, by construction.
 const bridgeSrc = readFileSync(
   resolve(__dirname, '..', 'bridge', 'bridge.ts'),
   'utf-8',
@@ -151,8 +163,16 @@ describe('component 4 — per-turn topic framing', () => {
   })
 
   it('the bridge instructions frame each channel message as the current topic', () => {
-    expect(bridgeSrc).toMatch(/answer ONLY this message/)
-    expect(bridgeSrc).toMatch(/do not also answer a pending message from another topic/i)
+    // Asserted against the IMPORTED runtime constant, not file text: this is
+    // the exact string handed to the MCP client, so a comment (or the phrase
+    // living in some other file) cannot satisfy it. Wording was tightened in
+    // #3562 to fit the 2048-char budget; the invariant is unchanged — the
+    // instructions must scope the agent to the current message's topic and
+    // forbid answering a queued other-topic message in the same turn.
+    expect(MCP_INSTRUCTIONS).toMatch(/answer only the current message/i)
+    expect(MCP_INSTRUCTIONS).toMatch(
+      /do not also answer a pending message from another topic/i,
+    )
   })
 })
 
