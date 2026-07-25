@@ -166,6 +166,20 @@ interface RecallLogEntry {
   capped?: boolean;
   pre_cap_count?: number;
   memory_ids?: string[];
+  /**
+   * Recall QUALITY telemetry (#3541): min/median/max of the engine's
+   * `scores.final` across the memories actually INJECTED (post-head-slice).
+   * Every other field on this row measures VOLUME, and volume alone cannot
+   * distinguish "the reranker is working" from "the agent is being fed
+   * `max_memories` mediocre memories every turn" — a distinction that
+   * matters now that the overlap gate is a near-passthrough floor at 0.10
+   * and precision rests entirely on `scores.final` plus the head-slice.
+   * `null` on cache-hit rows (no result set) and when no result carried a
+   * usable score. Written by `_injected_score_stats` in recall.py.
+   */
+  injected_score_min?: number | null;
+  injected_score_median?: number | null;
+  injected_score_max?: number | null;
   cache_hit?: boolean;
 }
 
@@ -243,10 +257,22 @@ export function formatRecallLogView(
       ? Math.round((memCounts.reduce((s, n) => s + n, 0) / memCounts.length) * 10) / 10
       : null;
   const max = memCounts.length > 0 ? Math.max(...memCounts) : null;
+  // #3541 — mean of the per-turn MEDIAN injected relevance score. The volume
+  // stats above (`avg`/`max`) rise identically whether recall got better or
+  // just fuller, so a summary without a quality number is exactly the blind
+  // spot that let the overlap-gate regression read as healthy.
+  const medians = entries
+    .map((e) => e.injected_score_median)
+    .filter((n): n is number => typeof n === "number");
+  const avgScore =
+    medians.length > 0
+      ? Math.round((medians.reduce((s, n) => s + n, 0) / medians.length) * 100) / 100
+      : null;
   lines.push(
     chalk.gray(
       `  last ${total} turn${total === 1 ? "" : "s"}: ` +
       `avg=${avg ?? "—"} max=${max ?? "—"} ` +
+      `avg_score=${avgScore ?? "—"} ` +
       `cache_hits=${hits} capped=${cappedTurns}` +
       (omittedTurns > 0 ? ` directives_omitted_turns=${omittedTurns}` : ""),
     ),
@@ -268,10 +294,22 @@ export function formatRecallLogView(
     const ids = e.memory_ids && e.memory_ids.length > 0
       ? chalk.dim(` ids=${e.memory_ids.slice(0, 3).join(",")}${e.memory_ids.length > 3 ? `…+${e.memory_ids.length - 3}` : ""}`)
       : "";
+    // #3541 — the quality half of the row. Volume without score range reads
+    // as success whether the injected memories are relevant or not.
+    const score =
+      typeof e.injected_score_min === "number" &&
+      typeof e.injected_score_median === "number" &&
+      typeof e.injected_score_max === "number"
+        ? chalk.dim(
+            ` score=${e.injected_score_min.toFixed(2)}/` +
+            `${e.injected_score_median.toFixed(2)}/` +
+            `${e.injected_score_max.toFixed(2)}`,
+          )
+        : "";
     lines.push(
       `  ${chalk.gray(e.ts)} ${flag} ` +
       `n=${e.result_count ?? "—"}${e.pre_cap_count != null && e.pre_cap_count !== e.result_count ? `/${e.pre_cap_count}` : ""}` +
-      `${dem}${omitted}${ids}`,
+      `${dem}${omitted}${score}${ids}`,
     );
   }
 

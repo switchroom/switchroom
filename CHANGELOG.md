@@ -45,6 +45,75 @@
   `src/gateway/gateway.ts`) is spoken as just its last segment — or "a path"
   when that segment is a hex blob. A single `word/word` is still prose.
 
+### Hindsight recall (#3541)
+
+- **The lexical-overlap gate scored with the wrong metric, emptying about a
+  third of recalls (#3541)** — the `recallMinOverlap` gate in
+  `vendor/hindsight-memory/scripts/recall.py` used Jaccard similarity,
+  `|Q ∩ M| / |Q ∪ M|`, to compare a long recall query (production p50 778
+  chars of prior-context preamble) against a short memory. The union term is
+  dominated by the query, so the same memory with the same real overlap scored
+  lower purely because the prompt was longer — prompt length, not relevance,
+  decided whether memory was delivered. Measured on production
+  `recall_log.jsonl` (1548 rows, ts >= 2026-07-18): survival through the gate
+  fell monotonically from 7.3% at <200 query chars to 0.9% at 600-750 chars,
+  the zero-result rate rose from 23% to 93%, and 22447 of 23124 already-
+  reranked candidates (97.1%) were discarded. Where the gate actually ran it
+  was decisive — of the 526 turns with at least one bank returning
+  successfully, 440 (83.7%) still delivered zero memories. The metric is now
+  containment, `|Q ∩ M| / |M|` — "what fraction of this memory's terms appear
+  in the prompt", invariant to preamble length. Safe to run permissively
+  because the gate is a floor, not a ranker: `_sort_by_final_score` orders
+  survivors by the engine's reranked relevance immediately afterwards and only
+  then does `recallMaxMemories` head-slice, so admitting more candidates can
+  only give the score-sort a non-empty set to pick the top-N from. And because
+  `|Q ∪ M| >= |M|`, containment >= Jaccard for every pair, so at a fixed
+  threshold this admits a superset of what production keeps today — no memory
+  that survives now can be dropped by this change.
+
+- **Scope: this fixes the gate, NOT the 8s recall deadline.** Partitioning the
+  zero-result recalls in `recall_log.jsonl` by cause: 448 (~32%) had a bank
+  return successfully with `overlap_dropped > 0` (this gate), while 565 (~41%)
+  had *every* bank time out or error, where the gate never ran and the deadline
+  is the cause. `deadline_hit` is set on 991 of 18656 logged recalls and those
+  rows sit at the 8s ceiling. The latency half of #3541 — local cross-encoder
+  rerank at the 150-candidate cap dominating a p50 4.49s handler — remains open
+  and is deliberately untouched here.
+
+- **The 0.10 default is retained, and it is close to a passthrough — say so.**
+  Because the denominator is the memory's own token count, a memory of ≤10
+  content tokens clears 0.10 on a single shared word. The threshold was
+  re-derived rather than inherited from the Jaccard era: replaying 31 real
+  production queries against the live engine and rescoring the 202 returned
+  candidates gives 86.1% survival / 6.5% zero-result at 0.10, versus 65.8% /
+  41.9% at 0.20, 58.4% / 41.9% at 0.30 and 52.5% / 54.8% at 0.40 (Jaccard at
+  0.10 on the same candidates: 70.3% / 32.3%). Thresholds above 0.10
+  leave nearly half of turns with no memories at all — re-creating the exact
+  failure this fixes. Raising it would not buy precision either: on a
+  preamble-heavy prompt containment is *not* monotone in relevance (a
+  measured off-topic memory that merely reuses preamble words scores 0.857
+  against the genuinely relevant memory's 0.571), so a higher threshold drops
+  the good memory first. **The effective precision control after this change
+  is the engine rerank plus the `recallMaxMemories` head-slice; this gate is
+  now only a cheap floor removing candidates with near-zero lexical
+  relationship to the prompt.** Excluding low-signal top-N results — the
+  original #475 goal — would need a `scores.final` relevance floor, which is
+  out of scope here.
+
+- **Denominator is `|M|`, not the textbook `min(|Q|, |M|)`.** With `min()`, a
+  prompt shorter than the memory flips the denominator to the query and the
+  metric silently inverts into "what fraction of the prompt is in the memory"
+  — a one-word prompt then scores 1.0 against any memory containing that word,
+  re-introducing the query-length dependence this fix exists to remove. That
+  regime is not a corner case: `|Q| < |M|` held for 87 of 202 replayed
+  candidate pairs (43%). The `memory.recall.min_overlap` knob is unchanged.
+
+- Guarded by eight mutation-verified regression tests pinning length
+  invariance, survival at production prompt length, the `|Q| < |M|` regime,
+  the never-stricter-than-Jaccard safety property, and both what the floor
+  does drop (a long memory with only incidental overlap) and what it
+  knowingly does not (an off-topic memory reusing preamble words).
+
 ## v0.19.16 — Telegram: forwarded-message coalescing, Listen button, quieter progress cards, cleaner voice
 
 ### Telegram forwarding (#3523)

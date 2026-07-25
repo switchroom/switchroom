@@ -535,12 +535,18 @@ export const AgentMemorySchema = z
           .max(1)
           .optional()
           .describe(
-            "Minimum Jaccard token overlap [0.0–1.0] between the user " +
+            "Minimum containment token overlap [0.0–1.0] between the user " +
             "prompt and a memory's text for the memory to be injected. " +
-            "Drops low-relevance matches before the count cap so weak hits " +
-            "don't fill the slot on real queries. 0.0 disables (default — " +
-            "current behaviour). Try 0.10–0.20 to start; observe the " +
-            "`overlap_dropped` field via `switchroom memory recall-log`.",
+            "A cheap FLOOR that removes candidates with (near-)zero lexical " +
+            "relationship to the prompt — NOT a precision control: at the " +
+            "recommended 0.10 the gate is near-passthrough, and the " +
+            "effective precision control is the engine rerank plus the " +
+            "max_memories head-slice. 0.0 disables (default — current " +
+            "behaviour). Use 0.10; values at or above 0.20 measurably " +
+            "starve recall — on production replay 0.20 leaves ~41.9% of " +
+            "turns with NO memories at all, re-creating the bug #3541 " +
+            "fixed. Observe the `overlap_dropped` field via " +
+            "`switchroom memory recall-log`.",
           ),
         types: z
           .array(z.string())
