@@ -1213,6 +1213,81 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.warnings.join(" ")).toMatch(/REVERTED to the prior version/);
   });
 
+  it("REVERTS the pin when a non-canary restart TIMES OUT past a green canary", () => {
+    // The timed-out-restart branch (#3605) is a stop-the-roll failure that did
+    // not exist when the provisional-pin design was written, and it returned
+    // its own result literal rather than going through `fail()`. That made the
+    // pin guarantee false on exactly the path it matters most: a wedged
+    // container is the failure most likely to leave the durable pin naming a
+    // build that cannot boot, which every later reconcile then converges the
+    // rest of the fleet onto.
+    const h = pinHarness({
+      versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
+    });
+    const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
+    // Sanity: the pin really is persisted BEFORE nadia is restarted.
+    expect(steps.findIndex((s) => s.kind === "persist-pin")).toBeLessThan(
+      steps.findIndex((s) => s.kind === "restart-agent" && s.agent === "nadia"),
+    );
+    const deps: RolloutDeps = {
+      ...h.deps,
+      run: (args, opts) =>
+        args[0] === "agent" && args[1] === "restart" && args[2] === "nadia"
+          ? { status: 1, timedOut: true }
+          : h.deps.run(args, opts),
+    };
+
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    expect(r.ok).toBe(false);
+    expect(r.timedOut).toBe(true);
+    expect(r.failedAgent).toBe("nadia");
+    // THE outcome: the durable pin does NOT name the build that wedged.
+    expect(h.pin()).toBe("v0.19.3");
+    expect(r.pinReverted).toBe(true);
+    expect(h.journalled()).toBe(false);
+    expect(r.warnings.join(" ")).toMatch(/REVERTED to the prior version/);
+  });
+
+  it("createRolloutDeps' commitPin RETURNS the error, not just warns it", () => {
+    // The executor can only promote a failed commit into RolloutResult.warnings
+    // if the real deps factory hands the error back. The suite's own harness
+    // only MIRRORS that wiring, so without this the production line is covered
+    // by nothing and a rebase could drop the `return` in silence.
+    const dir = mkdtempSync(join(tmpdir(), "rollout-commitpin-"));
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(
+      join(tmpdir(), "rollout-commitpin-state-"),
+    );
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `telegram:\n  bot_token: x\nrelease:\n  pin: v0.19.3\nagents:\n  clerk:\n    extends: default\n`,
+      "utf8",
+    );
+    beginPinPersist(configPath, TARGET);
+    // A DIRECTORY at the journal path makes unlink fail for every uid, root
+    // included — deterministic rather than privilege-dependent.
+    rmSync(pinJournalPath(configPath));
+    mkdirSync(pinJournalPath(configPath));
+    const warned: string[] = [];
+    const deps = createRolloutDeps({
+      configPath,
+      scriptPath: "switchroom",
+      hostdCtx: true,
+      spawn: (() => ({ status: 0, stdout: "", stderr: "" })) as unknown as RolloutSpawnSync,
+      warn: (line) => {
+        warned.push(line);
+      },
+    });
+
+    const err = deps.commitPin?.();
+
+    expect(typeof err).toBe("string");
+    expect(err as string).toMatch(/FAILED to clear/);
+    // Still warned to stderr as well — the two surfaces are complementary.
+    expect(warned.join(" ")).toMatch(/FAILED to clear/);
+  });
+
   it("REVERTS the pin when the host-shell path (persist FIRST) fails at apply", () => {
     // Worst case called out in the bug report: persist-pin is step 1, so a
     // failed apply used to leave a broken pin with ZERO agents rolled.
