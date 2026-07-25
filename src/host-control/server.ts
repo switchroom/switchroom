@@ -68,6 +68,7 @@ import {
   recoverPinJournal,
   commitPinPersist,
   hasPinJournal,
+  readPinJournal,
 } from "../cli/rollout-pin-journal.js";
 import { restoreComposeBackup } from "../cli/write-compose.js";
 import { SWITCHROOM_VERSION } from "../cli/resolve-version.js";
@@ -680,19 +681,29 @@ export const HOSTD_FALLBACK_CONFIG_PATH = "/state/config/switchroom.yaml";
  *
  * Order:
  *   1. an explicit `opts.configPath` (tests, and any future embedder);
- *   2. `$SWITCHROOM_CONFIG` — what `hostd install` exports into the container
- *      and what the child's `findConfigFile` consults first;
- *   3. `findConfigFile()` — cwd / `~/.switchroom`, same as the child;
- *   4. {@link HOSTD_FALLBACK_CONFIG_PATH}, only when 2 and 3 both come up
- *      empty (a hostd whose config has been deleted out from under it —
+ *   2. {@link findConfigFile} — **the child's own resolver, called directly**.
+ *      It consults `$SWITCHROOM_CONFIG` first (what `hostd install` exports
+ *      into the container), then cwd, then `~/.switchroom`;
+ *   3. {@link HOSTD_FALLBACK_CONFIG_PATH}, only when 2 comes up empty (a
+ *      hostd whose config has been deleted out from under it —
  *      `findConfigFile` THROWS there, and a throw out of a boot path or a
  *      rollout `.finally()` would be worse than a wrong-but-conventional
  *      guess).
+ *
+ * Arm 2 deliberately DELEGATES rather than re-deriving. An earlier shape read
+ * `$SWITCHROOM_CONFIG` here itself and returned it unconditionally, one arm
+ * ahead of `findConfigFile`. That looked equivalent — `findConfigFile` checks
+ * the same variable first — but it is not: the child takes `$SWITCHROOM_CONFIG`
+ * only `if (existsSync(envPath))` and otherwise falls through to cwd /
+ * `~/.switchroom`. With the variable pointing at a path that does not exist,
+ * hostd returned the dangling path while the child resolved a real file, the
+ * two hashed to different journal names, and the divergence this function
+ * exists to prevent reappeared — invisibly. Calling the child's resolver makes
+ * the agreement structural instead of a claim two code paths have to keep
+ * honouring independently.
  */
 export function resolveHostdConfigPath(explicit?: string): string {
   if (explicit) return explicit;
-  const env = process.env.SWITCHROOM_CONFIG;
-  if (env && env.trim().length > 0) return resolve(env.trim());
   try {
     return findConfigFile();
   } catch {
@@ -906,19 +917,52 @@ export class HostdServer {
    * BOOT recovery (which has no sentinel to consult) will eventually revert
    * that proven pin.
    *
+   * **Only deletes a journal it can ATTRIBUTE to this roll.** "A journal
+   * exists and this roll succeeded" does not imply the journal is this roll's
+   * debris: the child journals only when it actually writes the pin, and it
+   * no-ops when the config already names the target (`createRolloutDeps`'
+   * `persistPin`). So a journal can equally be an ORPHAN a predecessor left
+   * behind — and on a subset roll (`--agents`, which hostd passes alongside
+   * `--pin`) that orphan is the only record that `release.pin` names a build
+   * still unproven for every agent this roll did not touch. Deleting it
+   * because some other roll went green destroys that record permanently.
+   *
+   * The discriminator is already in the record: the journal carries the `at`
+   * the child wrote it, and `entry.started_at` is when this roll's child was
+   * spawned. `journal.at < started_at` means the journal predates this roll,
+   * so this roll did not write it — leave it, and say so.
+   *
    * Never throws — same contract as the recovery path it replaces.
    */
-  private clearProvenRolloutPinJournal(context: string): string | null {
+  private clearProvenRolloutPinJournal(
+    context: string,
+    startedAt: number,
+  ): string | null {
     let note: string | null = null;
     try {
       const configPath = this.hostdConfigPath();
       if (!hasPinJournal(configPath)) return null;
-      const err = commitPinPersist(configPath);
-      note =
-        err ??
-        `rollout pin journal: cleared a journal that outlived a SUCCESSFUL ` +
-          `roll (the child's own commit did not remove it). release.pin is ` +
-          `correct and was NOT reverted.`;
+      const journal = readPinJournal(configPath, () => undefined);
+      const at = journal ? Date.parse(journal.at) : Number.NaN;
+      // An unreadable/malformed journal (readPinJournal returns null) or an
+      // unparseable timestamp cannot be attributed either — same verdict.
+      if (!Number.isFinite(at) || at < startedAt) {
+        note =
+          `rollout pin journal: LEFT IN PLACE a journal this roll did not ` +
+          `write (journal at=${journal?.at ?? "unreadable"}, this roll started ` +
+          `${new Date(startedAt).toISOString()}). It belongs to an earlier ` +
+          `roll whose provisional \`release.pin\` was never committed, and it ` +
+          `is the only record that the pin may name an unproven build — a ` +
+          `subset roll going green does not prove it for the rest of the ` +
+          `fleet. Verify \`release.pin\` host-side, then delete the journal.`;
+      } else {
+        const err = commitPinPersist(configPath);
+        note =
+          err ??
+          `rollout pin journal: cleared a journal that outlived a SUCCESSFUL ` +
+            `roll (the child's own commit did not remove it). release.pin is ` +
+            `correct and was NOT reverted.`;
+      }
     } catch (e) {
       note = `rollout pin journal: clearing a proven roll's journal threw: ${(e as Error).message}`;
     }
@@ -4141,14 +4185,20 @@ export class HostdServer {
         // priorPin while telling the operator the roll succeeded, and every
         // later reconcile would drag the fleet back to the prior version.
         //
-        // So: a sentinel that says ok:true means the pin is proven. The
-        // surviving journal is then debris to DELETE, never input to act on.
+        // So: a sentinel that says ok:true means the pin is proven, and the
+        // surviving journal is never input to REVERT. It is only debris to
+        // delete when it is also attributable to THIS roll — the child no-ops
+        // its journal write when the config already names the target, so a
+        // journal can equally be a predecessor's orphan, and on a subset roll
+        // that orphan is the only record the pin is unproven elsewhere.
+        // `clearProvenRolloutPinJournal` makes that call from `started_at`.
         // Everything else (ok:false, no sentinel at all, a rejected promise)
         // goes through the stale-gated revert. Both run before the lock is
         // released and before any other mutation can start.
         const pinNote = sentinelProvenOk
           ? this.clearProvenRolloutPinJournal(
               `rollout terminal ${entry.request_id}`,
+              entry.started_at,
             )
           : this.recoverRolloutPinJournal(
               `rollout terminal ${entry.request_id}`,

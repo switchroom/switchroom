@@ -411,8 +411,21 @@ export interface RolloutDeps {
    * prior config text first (see rollout-pin-journal.ts), so the write is
    * only durable once {@link RolloutDeps.commitPin} runs. The executor calls
    * {@link RolloutDeps.revertPin} on every failure path after this ran.
+   *
+   * **Returns whether it actually WROTE** — true when a provisional pin write
+   * was journalled, false when the call was a no-op because the config already
+   * carried this pin. The distinction is load-bearing and NOT cosmetic: the
+   * executor's `commitPin` unlinks the journal for this config path, and a
+   * journal it did not write belongs to an EARLIER roll that crashed
+   * mid-persist. Committing that destroys the only record that `release.pin`
+   * names an unproven build (every recovery site keys off the file's
+   * existence), so a no-op persist must leave `pinPersisted` false.
+   *
+   * The return type is deliberately `boolean`, not `boolean | void`: tsc then
+   * forces every implementation — production and test alike — to state which
+   * it did, instead of the executor remembering to guess.
    */
-  persistPin?(pin: string): void;
+  persistPin?(pin: string): boolean;
   /**
    * Mark the provisional pin write durable. Called EXACTLY ONCE, at the very
    * end of a fully successful roll. Optional (a caller with no persistPin
@@ -735,11 +748,16 @@ export function executeRollout(
           // subsequent reconciles read the same pin.
           deps.log(`ROLL_STEP persist-pin — release.pin=${step.pin} to switchroom.yaml`);
           if (deps.persistPin) {
-            deps.persistPin(step.pin);
             // Provisional from here on: `fail()` reverts it, and the success
-            // path below commits it. Set AFTER the call so a throwing
-            // persistPin doesn't leave us claiming a write that never landed.
-            pinPersisted = true;
+            // path below commits it — but ONLY if a write actually landed.
+            // Taken from the return value, not set as a side effect, so the
+            // flag cannot outrun the write in either direction: a THROWING
+            // persistPin never assigns (the catch below sees false), and a
+            // no-op persistPin (config already at this pin — see
+            // `createRolloutDeps`' idempotent early return) reports false, so
+            // the success path does not commit — i.e. does not unlink — a
+            // journal some earlier crashed roll left at this config path.
+            pinPersisted = deps.persistPin(step.pin);
           } else {
             warnings.push(`persist-pin requested but no persist hook wired; pin NOT durable`);
           }
@@ -1526,7 +1544,11 @@ export function createRolloutDeps(params: {
     persistPin: (pin) => {
       const before = readFileSync(configPath, "utf8");
       const after = setReleasePinInConfig(before, pin);
-      if (after === before) return; // idempotent no-op
+      // Idempotent no-op: the config already names this pin, so there is
+      // nothing to journal, nothing to revert, and — critically — nothing to
+      // COMMIT. Reporting false keeps the executor from unlinking a journal
+      // this roll never wrote (see RolloutDeps.persistPin).
+      if (after === before) return false;
       // PROVISIONAL WRITE. Journal the pin (and the pin it replaces) FIRST so
       // it can be reverted both on a clean failure (revertPin below) and after
       // a crash (recoverPinJournal at hostd boot / next rollout). Without
@@ -1539,6 +1561,7 @@ export function createRolloutDeps(params: {
         after,
         statSync(configPath).mode & 0o777,
       );
+      return true;
     },
     commitPin: () => {
       const err = commitPinPersist(configPath);

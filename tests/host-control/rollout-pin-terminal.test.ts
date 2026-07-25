@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -59,6 +59,8 @@ interface Harness {
   pin: () => string | undefined;
   journalExists: () => boolean;
   spawnRollout: (args: string[]) => void;
+  /** Run hostd's real boot path (registered for teardown). */
+  start: () => Promise<void>;
 }
 
 /**
@@ -85,6 +87,7 @@ function makeServer(child: { stdout: string; exit_code: number }): Harness {
       },
     },
   } as unknown as ServerOptions);
+  started.push(server);
   const s = server as unknown as {
     runSwitchroom: (
       args: string[],
@@ -110,11 +113,26 @@ function makeServer(child: { stdout: string; exit_code: number }): Harness {
     pin: () => getReleasePinFromConfig(readFileSync(configPath, "utf8")),
     journalExists: () => existsSync(pinJournalPath(configPath)),
     spawnRollout: (args) => s.spawnRollout(args, entry),
+    start: () => server.start(),
   };
 }
 
-/** Plant the journal a dead child left behind: pin written, never committed. */
-function plantOrphanJournal(configPath: string): void {
+/** Every server built in this file, stopped in afterEach. */
+const started: Array<{ stop(): Promise<void> }> = [];
+
+/**
+ * Plant the journal a dead child left behind: pin written, never committed.
+ *
+ * `at` is an EXPLICIT parameter because it is the attribution discriminator
+ * the terminal uses. A journal written AFTER this roll started is this roll's
+ * own child's — its `commitPin` failed to unlink it, so the terminal may clear
+ * it. A journal written BEFORE is a PREDECESSOR's orphan: this roll's child
+ * journalled nothing (production `persistPin` no-ops when the config already
+ * names the target), and clearing it destroys the only record that
+ * `release.pin` names a build this roll never proved for the agents it did not
+ * touch.
+ */
+function plantOrphanJournal(configPath: string, at: Date): void {
   writeFileSync(
     pinJournalPath(configPath),
     JSON.stringify({
@@ -123,10 +141,20 @@ function plantOrphanJournal(configPath: string): void {
       pin: TARGET,
       priorPin: PRIOR_PIN,
       pid: DEAD_PID,
-      at: new Date().toISOString(),
+      at: at.toISOString(),
     }),
     "utf8",
   );
+}
+
+/** A journal timestamp that unambiguously belongs to THIS roll's child. */
+function afterStart(h: Harness): Date {
+  return new Date((h.entry.started_at as number) + 1_000);
+}
+
+/** A journal timestamp that unambiguously predates this roll. */
+function beforeStart(h: Harness): Date {
+  return new Date((h.entry.started_at as number) - 60_000);
 }
 
 beforeEach(() => {
@@ -140,8 +168,11 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+  // Only servers that actually bound sockets need stopping; stop() is a no-op
+  // otherwise. Draining here keeps a boot test from leaking listeners.
+  while (started.length) await started.pop()!.stop().catch(() => undefined);
 });
 
 describe("rollout terminal — a PROVEN pin is never reverted", () => {
@@ -161,7 +192,7 @@ describe("rollout terminal — a PROVEN pin is never reverted", () => {
           warnings: ["rollout pin journal: FAILED to clear …"],
         }) + "\n",
     });
-    plantOrphanJournal(h.configPath);
+    plantOrphanJournal(h.configPath, afterStart(h));
 
     h.spawnRollout(["rollout", "--pin", TARGET]);
     await vi.waitFor(() => expect(h.posted.length).toBeGreaterThan(0));
@@ -172,9 +203,71 @@ describe("rollout terminal — a PROVEN pin is never reverted", () => {
     expect(h.pin()).toBe(TARGET);
     // …and the debris is gone, so hostd's next BOOT recovery — which has no
     // sentinel to consult and only the stale gate — can't revert it later.
+    // Deleting is correct HERE, and only here, because the journal is
+    // attributable to this roll: `afterStart` puts its `at` past the roll's
+    // `started_at`, which is the production shape (this roll's own child wrote
+    // it and then failed to unlink it). The sibling test below pins the
+    // opposite verdict for a journal that predates the roll.
     expect(h.journalExists()).toBe(false);
     expect(h.entry.result).toBe("completed");
     expect(String(h.entry.stderr_tail ?? "")).toMatch(/outlived a SUCCESSFUL roll/);
+  });
+
+  it("LEAVES a predecessor's orphan journal alone on a successful roll", async () => {
+    // The undiscriminated delete: `hasPinJournal` → `commitPinPersist` with no
+    // check that the journal belongs to this roll. A journal is NOT proof this
+    // roll wrote one — the child journals only when it actually writes the pin
+    // and no-ops when the config already names the target, which is precisely
+    // the state a repeat/subset roll of an already-pinned version is in.
+    //
+    // hostd always passes `--pin` and may pass `--agents`, so this is the
+    // subset roll: three of twelve agents proved, and the orphan journal is
+    // the only record that `release.pin` names a build still unproven for the
+    // other nine. Deleting it makes that permanently undetectable — the exact
+    // damage the guard exists to prevent, arrived at from the other side.
+    const h = makeServer({
+      exit_code: 0,
+      stdout:
+        encodeRolloutResultLine({
+          ok: true,
+          rolled: ["test-harness"],
+          warnings: [],
+        }) + "\n",
+    });
+    plantOrphanJournal(h.configPath, beforeStart(h));
+
+    h.spawnRollout(["rollout", "--pin", TARGET, "--agents", "test-harness"]);
+    await vi.waitFor(() => expect(h.posted.length).toBeGreaterThan(0));
+
+    // Never reverted — this roll succeeded, so the pin stands…
+    expect(h.pin()).toBe(TARGET);
+    // …but the evidence survives, and the operator is TOLD, through the same
+    // structured surface the clear-path uses.
+    expect(h.journalExists()).toBe(true);
+    expect(h.entry.result).toBe("completed");
+    expect(String(h.entry.stderr_tail ?? "")).toMatch(/LEFT IN PLACE/);
+    expect(String(h.entry.stderr_tail ?? "")).not.toMatch(/outlived a SUCCESSFUL roll/);
+  });
+
+  it("LEAVES an UNREADABLE journal alone on a successful roll", async () => {
+    // Attribution needs a parseable `at`. A journal that is corrupt (or whose
+    // timestamp is garbage) cannot be attributed to this roll either, and the
+    // safe verdict for "cannot attribute" must be LEAVE — deleting would turn
+    // a loud, recoverable corruption into silence.
+    const h = makeServer({
+      exit_code: 0,
+      stdout:
+        encodeRolloutResultLine({ ok: true, rolled: ["test-harness"], warnings: [] }) +
+        "\n",
+    });
+    writeFileSync(pinJournalPath(h.configPath), "{ not json", "utf8");
+
+    h.spawnRollout(["rollout", "--pin", TARGET]);
+    await vi.waitFor(() => expect(h.posted.length).toBeGreaterThan(0));
+
+    expect(h.pin()).toBe(TARGET);
+    expect(h.journalExists()).toBe(true);
+    expect(String(h.entry.stderr_tail ?? "")).toMatch(/LEFT IN PLACE/);
   });
 
   it("still REVERTS when the roll structurally failed", async () => {
@@ -190,7 +283,7 @@ describe("rollout terminal — a PROVEN pin is never reverted", () => {
           warnings: [],
         }) + "\n",
     });
-    plantOrphanJournal(h.configPath);
+    plantOrphanJournal(h.configPath, afterStart(h));
 
     h.spawnRollout(["rollout", "--pin", TARGET]);
     await vi.waitFor(() => expect(h.posted.length).toBeGreaterThan(0));
@@ -205,12 +298,33 @@ describe("rollout terminal — a PROVEN pin is never reverted", () => {
     // keyed on the SENTINEL, not on `entry.result`. Nothing proved this roll,
     // so the uncommitted pin must not stand.
     const h = makeServer({ exit_code: 0, stdout: "no sentinel here\n" });
-    plantOrphanJournal(h.configPath);
+    plantOrphanJournal(h.configPath, afterStart(h));
 
     h.spawnRollout(["rollout", "--pin", TARGET]);
     await vi.waitFor(() => expect(h.posted.length).toBeGreaterThan(0));
 
     expect(h.entry.result).toBe("completed");
+    expect(h.pin()).toBe(PRIOR_PIN);
+    expect(h.journalExists()).toBe(false);
+  });
+
+  it("recovers a stale journal at BOOT — the call site, not just the helper", async () => {
+    // `recoverPinJournal` itself is well covered in
+    // `src/cli/rollout-pin-journal.test.ts`, but nothing exercised hostd's
+    // BOOT call site: delete `this.recoverRolloutPinJournal("boot")` from
+    // `start()` and the whole scoped suite stayed green. That call is the
+    // crash net's only trigger after a SIGKILL/OOM/recreate killed the child
+    // between the provisional pin write and its commit — with it gone, the
+    // unproven pin stands and every later reconcile converges the fleet onto
+    // a build that never booted.
+    const h = makeServer({ exit_code: 0, stdout: "" });
+    // Aged well past PIN_JOURNAL_MAX_AGE_MS and owned by a dead pid, so the
+    // stale gate (which correctly protects a LIVE roll) opens.
+    plantOrphanJournal(h.configPath, new Date(Date.now() - 60 * 60 * 1000));
+    expect(h.pin()).toBe(TARGET);
+
+    await h.start();
+
     expect(h.pin()).toBe(PRIOR_PIN);
     expect(h.journalExists()).toBe(false);
   });
@@ -239,9 +353,88 @@ describe("rollout terminal — a PROVEN pin is never reverted", () => {
 
 describe("resolveHostdConfigPath — hostd and its rollout child must agree", () => {
   const saved = process.env.SWITCHROOM_CONFIG;
+  const savedHome = process.env.HOME;
   afterEach(() => {
     if (saved === undefined) delete process.env.SWITCHROOM_CONFIG;
     else process.env.SWITCHROOM_CONFIG = saved;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  });
+
+  /**
+   * The PRODUCTION wiring, not the helper.
+   *
+   * `main.ts` constructs `HostdServer` with **no** `configPath`, so every
+   * recovery site inside the daemon reaches the resolver through the private
+   * `hostdConfigPath()`. Testing the exported helper alone leaves that wire
+   * unpinned: restore the pre-fix body
+   * `return this.opts.configPath ?? "/state/config/switchroom.yaml";` and a
+   * helper-only suite stays green with the defect fully back.
+   */
+  function serverConfigPath(configPath?: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "hostd-wiring-"));
+    const server = new HostdServer({
+      homeDir: dir,
+      ...(configPath ? { configPath } : {}),
+      agentUids: {},
+      config: { agents: { "test-harness": {} } },
+      auditLogPath: join(dir, "audit.log"),
+      selfVersion: "v99.0.0",
+      allowNonLinux: true,
+    } as unknown as ServerOptions);
+    return (
+      server as unknown as { hostdConfigPath(): string }
+    ).hostdConfigPath();
+  }
+
+  it("routes a HostdServer with NO configPath through the resolver", () => {
+    // Constructed the way production constructs it (`src/cli/main.ts` — no
+    // `configPath`), which is the only shape where arms 2+ are reachable. The
+    // whole rest of this suite passes an explicit path, so without this the
+    // hardcoded container literal is restorable with a green suite.
+    const dir = mkdtempSync(join(tmpdir(), "hostd-configpath-env-"));
+    const cfg = join(dir, "switchroom.yaml");
+    writeFileSync(cfg, config(PRIOR_PIN), "utf8");
+    process.env.SWITCHROOM_CONFIG = cfg;
+
+    expect(serverConfigPath()).toBe(cfg);
+    expect(serverConfigPath()).toBe(findConfigFile());
+    expect(serverConfigPath()).not.toBe(HOSTD_FALLBACK_CONFIG_PATH);
+    // …and an explicit path still wins, so the arm order survives too.
+    expect(serverConfigPath("/explicit/switchroom.yaml")).toBe(
+      "/explicit/switchroom.yaml",
+    );
+  });
+
+  it("DELEGATES to findConfigFile rather than reading $SWITCHROOM_CONFIG itself", () => {
+    // The divergence a re-derived env arm reintroduces. `findConfigFile` takes
+    // `$SWITCHROOM_CONFIG` only `if (existsSync(envPath))` and otherwise falls
+    // through to cwd / `~/.switchroom`. An arm that returns `resolve(env)`
+    // unconditionally — one arm ahead of `findConfigFile`, which is what this
+    // function used to do — hands back a dangling path while the child
+    // resolves a real file. The two hash to different journal names and the
+    // recovery goes silently blind, which is the exact failure mode the
+    // docstring's "MUST agree, string-for-string" claim asserts cannot happen.
+    const home = mkdtempSync(join(tmpdir(), "hostd-configpath-home-"));
+    mkdirSync(join(home, ".switchroom"));
+    const real = join(home, ".switchroom", "switchroom.yaml");
+    writeFileSync(real, config(PRIOR_PIN), "utf8");
+    process.env.HOME = home;
+    const dangling = join(
+      mkdtempSync(join(tmpdir(), "hostd-configpath-gone-")),
+      "nope",
+      "switchroom.yaml",
+    );
+    expect(existsSync(dangling)).toBe(false);
+    process.env.SWITCHROOM_CONFIG = dangling;
+    // Guard the fixture: nothing in cwd may shadow the home config, or this
+    // would pass for the wrong reason.
+    expect(existsSync(join(process.cwd(), "switchroom.yaml"))).toBe(false);
+
+    expect(findConfigFile()).toBe(real);
+    expect(serverConfigPath()).toBe(real);
+    expect(serverConfigPath()).not.toBe(dangling);
+    expect(pinJournalPath(serverConfigPath())).toBe(pinJournalPath(findConfigFile()));
   });
 
   it("computes the SAME journal path the rollout child does", () => {

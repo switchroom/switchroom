@@ -16,10 +16,12 @@ import {
   rmSync,
   existsSync,
   statSync,
+  chmodSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, afterEach } from "vitest";
+import { Command } from "commander";
 import {
   normalizeVersion,
   isVersionAssertable,
@@ -46,6 +48,7 @@ import {
   ROLLOUT_RUN_TIMEOUT_MS,
   ROLLOUT_PROBE_TIMEOUT_MS,
   type RolloutSpawnSync,
+  registerRolloutCommand,
 } from "./rollout.js";
 import {
   beginPinPersist,
@@ -173,7 +176,10 @@ function harness(opts: {
     probeVersion: (agent) => opts.versions[agent] ?? null,
     log: (line) => logs.push(line),
     emitPhase: (p) => phases.push(p),
-    persistPin: (pin) => persisted.push(pin),
+    persistPin: (pin) => {
+      persisted.push(pin);
+      return true; // this fake ALWAYS writes — see RolloutDeps.persistPin
+    },
     hindsightExists: () => opts.hindsightExists ?? false,
     webImageTag: () => opts.webImageTag ?? null,
   };
@@ -1316,6 +1322,45 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
 
+  it("createRolloutDeps' persistPin PRESERVES the config's permission bits", () => {
+    // `writeConfigPreservingOwnership` takes the mode as an ARGUMENT, and both
+    // supply sites read it off the file being replaced — `persistPin` here
+    // (`statSync(configPath).mode & 0o777`) and `rollbackPinPersist`, which
+    // does its own stat before calling the injected writer. Hand either one a
+    // constant instead and a tmp+rename write silently re-modes
+    // switchroom.yaml — the same class of damage as the ownership rule in
+    // CLAUDE.md ("tmp+rename re-owns the file to the writer's euid"), and
+    // 0600-ing the config is exactly what strands the non-root verbs that read
+    // it. Nothing else in the suite looked at the mode at all.
+    const dir = mkdtempSync(join(tmpdir(), "rollout-mode-"));
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(join(tmpdir(), "rollout-mode-state-"));
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `telegram:\n  bot_token: x\nrelease:\n  pin: v0.19.3\nagents:\n  clerk:\n    extends: default\n`,
+      "utf8",
+    );
+    chmodSync(configPath, 0o640);
+    const deps = createRolloutDeps({
+      configPath,
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: (() => {
+        throw new Error("no subprocess expected");
+      }) as unknown as RolloutSpawnSync,
+      warn: () => undefined,
+    });
+
+    expect(deps.persistPin?.(TARGET)).toBe(true);
+
+    expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe(TARGET);
+    expect(statSync(configPath).mode & 0o777).toBe(0o640);
+    // …and the revert half must not re-mode it either.
+    expect(deps.revertPin?.()).toBe(true);
+    expect(statSync(configPath).mode & 0o777).toBe(0o640);
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+  });
+
   it("createRolloutDeps' revertPin restores the pin through the ownership-preserving writer", () => {
     const stateDir = mkdtempSync(join(tmpdir(), "rollout-revert-state-"));
     process.env.SWITCHROOM_PIN_JOURNAL_DIR = stateDir;
@@ -1343,14 +1388,22 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe("v0.19.3");
     expect(hasPinJournal(configPath)).toBe(false);
     expect(readFileSync(configPath, "utf8")).toContain("bot_token: x # keep me");
-    // Routed through `writeConfigPreservingOwnership` — NOT a bare
-    // `writeFileSync`. The observable signature is the atomic tmp+rename:
-    // it REPLACES the inode (which is precisely why that writer has to chown
-    // back afterwards — CLAUDE.md's "tmp+rename re-owns the file to the
-    // writer's euid" rule). A bare `writeFileSync` truncates in place and
-    // keeps the inode, so dropping
+    // Routed through an ATOMIC tmp+rename writer, not a bare `writeFileSync`.
+    // That — and only that — is what the inode proves: tmp+rename REPLACES the
+    // inode, an in-place `writeFileSync` truncates and keeps it. Dropping
     // `writeConfig: writeConfigPreservingOwnership` from production
-    // `revertPin` flips this.
+    // `revertPin` falls back to `rollbackPinPersist`'s default writer, which
+    // IS a bare in-place `writeFileSync` (rollout-pin-journal.ts), so this
+    // assertion flips.
+    //
+    // What it does NOT prove is the ownership half of that writer's name.
+    // Disabling the chown-back branch inside `writeConfigPreservingOwnership`
+    // leaves this green — any tmp+rename writer passes. Pinning the chown from
+    // a unit test is not available here: `resolveOperatorUid`
+    // (src/cli/operator-uid.ts) returns undefined for root-without-`SUDO_UID`,
+    // and non-root CI skips the chown outright, so the branch is unreachable
+    // in both environments the suite runs in. Accepted limitation, named
+    // rather than papered over.
     expect(statSync(configPath).ino).not.toBe(inodeAfterPersist);
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
@@ -1461,9 +1514,10 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const deps: RolloutDeps = {
       ...h.deps,
       persistPin: (p) => {
-        h.deps.persistPin?.(p);
+        const wrote = h.deps.persistPin?.(p) ?? false;
         rmSync(pinJournalPath(h.configPath));
         mkdirSync(pinJournalPath(h.configPath));
+        return wrote;
       },
     };
 
@@ -1542,12 +1596,47 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(readPinJournal(h.configPath)?.priorPin).toBe(TARGET);
   });
 
+  it("does NOT commit a journal it never wrote when persist-pin NO-OPS", () => {
+    // The narrower — and far likelier — shape of the same defect. Here the
+    // plan DOES carry a `persist-pin` step (`--pin` was passed, which hostd
+    // always does), but production `persistPin` returns early without
+    // journalling because the config already names that pin. The sibling test
+    // above only covers the shape where the step is ABSENT, so
+    // `pinPersisted = true` set as a side effect of "a persistPin hook exists"
+    // survived it: the roll commits, `commitPin` unlinks the journal path for
+    // this config, and an EARLIER crashed roll's journal — the only record
+    // that `release.pin` names an unproven build — is destroyed on success.
+    //
+    // Reachable straight through hostd: `spawnRollout` always passes `--pin`
+    // and may pass `--agents`, so a SUBSET roll proves three of twelve agents
+    // while wiping the evidence for the other nine.
+    const h = pinHarness({
+      versions: { clerk: "0.19.4" },
+      initialPin: TARGET, // config ALREADY at the target → persistPin no-ops
+    });
+    beginPinPersist(h.configPath, TARGET); // the crashed predecessor's journal
+    const steps = planRollout(["clerk"], { hostdContext: true, pinToPersist: TARGET });
+    // The step IS present — this is the distinguishing precondition.
+    expect(steps.some((s) => s.kind === "persist-pin")).toBe(true);
+    // …and production really does report the no-op.
+    expect(h.deps.persistPin?.(TARGET)).toBe(false);
+
+    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+
+    expect(r.ok).toBe(true);
+    expect(h.pin()).toBe(TARGET);
+    // The predecessor's journal SURVIVES: this roll wrote nothing, so it has
+    // nothing to commit.
+    expect(h.journalled()).toBe(true);
+    expect(readPinJournal(h.configPath)?.pin).toBe(TARGET);
+  });
+
   it("warns loudly when the pin was persisted but no revert hook is wired", () => {
     const deps: RolloutDeps = {
       run: () => ({ status: 0 }),
       probeVersion: () => "0.0.1",
       log: () => undefined,
-      persistPin: () => undefined,
+      persistPin: () => true,
     };
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
     const r = executeRollout(steps, TARGET, deps);
@@ -2104,5 +2193,75 @@ describe("executeRollout — a timed-out restart stops even when the probe PASSE
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("restart-agent");
     expect(r.timedOut).toBeUndefined();
+  });
+});
+
+describe("rollout CLI — --dry-run changes NOTHING, including the crash net", () => {
+  afterEach(() => {
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+    process.exitCode = 0;
+  });
+
+  it("does NOT run pin-journal recovery under --dry-run", async () => {
+    // The action's pre-roll `recoverPinJournal` is gated on `!opts.dryRun`,
+    // and `--dry-run`'s documented contract is "print the plan and exit
+    // without changing anything". Nothing exercised that gate: flip it to
+    // `if (true)` and the whole scoped suite stayed green while a dry run
+    // silently REVERTED `release.pin` on disk. The command action is also the
+    // only place this call site exists — testing `recoverPinJournal` directly
+    // (which the journal suite does thoroughly) cannot see it.
+    const dir = mkdtempSync(join(tmpdir(), "rollout-dryrun-"));
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(
+      join(tmpdir(), "rollout-dryrun-state-"),
+    );
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `switchroom:\n  version: 1\ntelegram:\n  bot_token: x\n  forum_chat_id: "1"\n` +
+        `release:\n  pin: v0.19.3\nagents:\n  clerk:\n    topic_name: clerk\n`,
+      "utf8",
+    );
+    // A STALE journal a crashed predecessor left: dead pid, aged well past
+    // PIN_JOURNAL_MAX_AGE_MS, so the liveness gate would NOT stop a revert.
+    writeFileSync(
+      pinJournalPath(configPath),
+      JSON.stringify({
+        v: 1,
+        configPath,
+        pin: "v0.19.3",
+        priorPin: "v0.0.9",
+        pid: 0x3fffffff,
+        at: new Date(Date.now() - PIN_JOURNAL_MAX_AGE_MS * 4).toISOString(),
+      }),
+      "utf8",
+    );
+
+    const program = new Command();
+    program.exitOverride();
+    program.option("-c, --config <path>", "Path to switchroom.yaml config file");
+    registerRolloutCommand(program);
+    const out: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((s: string) => {
+      out.push(String(s));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      // A target OLDER than this CLI, so neither the stale-CLI guard nor (on
+      // the host-shell path) the downgrade guard short-circuits before the
+      // dry-run print.
+      await program.parseAsync(
+        ["--config", configPath, "rollout", "--pin", "v0.0.1", "--dry-run"],
+        { from: "user" },
+      );
+    } finally {
+      process.stdout.write = write;
+    }
+
+    // It really did reach the plan print, so the gate above it ran.
+    expect(out.join("")).toMatch(/persist-pin|Plan|rollout/i);
+    // …and NOTHING on disk moved.
+    expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe("v0.19.3");
+    expect(hasPinJournal(configPath)).toBe(true);
   });
 });

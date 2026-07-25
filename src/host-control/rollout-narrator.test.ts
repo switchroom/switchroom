@@ -418,7 +418,10 @@ describe("LogTailRolloutNarrator", () => {
       log: () => {},
       // Bridge the executor's phase emissions into the real narrator.
       emitPhase: (p) => n.onPhase(entry, p),
-      persistPin: (pin) => persisted.push(pin),
+      persistPin: (pin) => {
+        persisted.push(pin);
+        return true;
+      },
     };
 
     const result = executeRollout(steps, TARGET, deps, { hostdContext: true });
