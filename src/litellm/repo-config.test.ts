@@ -26,6 +26,14 @@ const imagePinPath = join(repoRoot, "docker", "litellm-proxy", "litellm-image.tx
 const text = readFileSync(configPath, "utf-8");
 const parsed = parseLitellmConfig(text) as Record<string, unknown>;
 
+/** The stand-in tag the file ships with until the operator reconciles it. */
+const PLACEHOLDER_TAG = "REPLACE-WITH-LIVE-PINNED-TAG";
+const imagePinText = readFileSync(imagePinPath, "utf-8");
+const imagePinLines = imagePinText
+  .split("\n")
+  .map((l) => l.trim())
+  .filter((l) => l.length > 0 && !l.startsWith("#"));
+
 describe("repo-managed litellm-config.yaml (KEN-125)", () => {
   it("parses as a non-empty YAML object", () => {
     expect(parsed).toBeTruthy();
@@ -46,7 +54,8 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
       string,
       Record<string, unknown>
     >;
-    expect(mgs && typeof mgs).toBe("object");
+    expect(mgs).toBeTruthy();
+    expect(typeof mgs).toBe("object");
     const groups = Object.entries(mgs);
     expect(groups.length).toBeGreaterThan(0);
     let claudeGroups = 0;
@@ -125,16 +134,59 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
     expect(modelList.some((m) => m.model_name === "*")).toBe(false);
   });
 
-  it("pins the proxy image: exactly one non-comment line shaped <image>:<tag>", () => {
-    const lines = readFileSync(imagePinPath, "utf-8")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith("#"));
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/^[\w.\-\/]+:[\w.\-]+$/);
+  // KEN-125 scrub: these files are public. The Coolify service dir is named by
+  // a deployment-specific service id; it must appear only as a placeholder.
+  it("leaks no host identifier — service ids appear only as <litellm-service-id>", () => {
+    for (const [label, body] of [
+      ["litellm-config.yaml", text],
+      ["litellm-image.txt", imagePinText],
+    ] as const) {
+      const hostPaths = body.match(/\/data\/coolify\/services\/[^/\s]+/g) ?? [];
+      for (const p of hostPaths) {
+        expect(p, `${label} must placeholder the service id, got: ${p}`).toContain(
+          "<litellm-service-id>",
+        );
+      }
+    }
+  });
+
+  it("declares the proxy image on exactly one non-comment line shaped <image>:<tag>", () => {
+    expect(imagePinLines).toHaveLength(1);
+    expect(imagePinLines[0]).toMatch(/^[\w.\-/]+:[\w.\-]+$/);
     // Floating tags defeat the pin.
-    expect(lines[0].endsWith(":latest")).toBe(false);
-    expect(lines[0].endsWith(":main-latest")).toBe(false);
-    expect(lines[0].endsWith(":main-stable")).toBe(false);
+    expect(imagePinLines[0].endsWith(":latest")).toBe(false);
+    expect(imagePinLines[0].endsWith(":main-latest")).toBe(false);
+    expect(imagePinLines[0].endsWith(":main-stable")).toBe(false);
+  });
+
+  // The shape check above deliberately does NOT prove the pin is real: the
+  // placeholder tag this file ships with is shape-valid but names no existing
+  // image. So the two states are coupled here — a placeholder pin MUST carry
+  // the UNVERIFIED marker, and a pin without the marker MUST be a real tag.
+  // Without this, dropping the marker (or "fixing" the tag to a floating one)
+  // silently leaves a green test claiming a pin that would fail to pull.
+  it("couples the placeholder tag to its UNVERIFIED-AGAINST-LIVE marker", () => {
+    const isPlaceholder = imagePinLines[0].includes(PLACEHOLDER_TAG);
+    const hasMarker = imagePinText.includes("UNVERIFIED-AGAINST-LIVE");
+    if (isPlaceholder) {
+      expect(
+        hasMarker,
+        `${imagePinPath} still carries the ${PLACEHOLDER_TAG} placeholder, so it MUST keep ` +
+          `the UNVERIFIED-AGAINST-LIVE notice telling the operator to substitute the live tag`,
+      ).toBe(true);
+    } else {
+      expect(
+        hasMarker,
+        `${imagePinPath} names a real tag now — drop the UNVERIFIED-AGAINST-LIVE notice`,
+      ).toBe(false);
+      // A real pin must be immutable-ish: a digest, or a tag with a version.
+      expect(imagePinLines[0]).toMatch(/(@sha256:[0-9a-f]{64}|:\S*\d)/);
+    }
+  });
+
+  it("is not yet a verified pin (KEN-125 follow-up: operator must supply the live tag)", () => {
+    // Documents the KNOWN, disclosed gap rather than pretending it is closed.
+    // Delete this test in the PR that lands the real tag.
+    expect(imagePinLines[0]).toContain(PLACEHOLDER_TAG);
   });
 });

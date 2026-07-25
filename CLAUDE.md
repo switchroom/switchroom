@@ -146,10 +146,11 @@ Traps that bite repeatedly:
 - **`check-litellm-config-guard` always checks the repo-managed config** —
   `docker/litellm-proxy/litellm-config.yaml` is the source of truth (KEN-125)
   and MUST exist, parse, and pass I2 scoping; editing it badly fails lint and
-  `src/litellm/repo-config.test.ts`. The LIVE host copy (default
-  `/data/coolify/services/…/litellm-config.yaml`, override with
-  `LITELLM_CONFIG_PATH`) is additionally checked where present and skipped in
-  CI/dev; on-host enforcement for the live file is the fleet-health sensor
+  `src/litellm/repo-config.test.ts`. The LIVE host copy is additionally checked
+  where resolvable — `LITELLM_CONFIG_PATH`, else discovered by scanning
+  `/data/coolify/services/*/litellm-config.yaml` (no deployment service id is
+  hardcoded in this repo; ambiguous or absent → skip, so CI/dev skips the live
+  copy); on-host enforcement for the live file is the fleet-health sensor
   (`src/fleet-health/litellm-config-sensor.ts`), which escalates a violation
   into the priority ledger.
 

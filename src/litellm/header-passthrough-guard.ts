@@ -9,17 +9,24 @@
  * any non-Claude / `*-openrouter` group — forwards that OAuth token to a third
  * party (OpenRouter/OpenAI). That is an OAuth leak.
  *
- * switchroom emits no LiteLLM config (the file is operator-maintained in
- * Coolify), so this scoping was enforced by CONVENTION with zero code checks.
- * This module is the pure detection core shared by two enforcement points:
- *   1. the `scripts/check-litellm-config-guard.mjs` lint step (near-vacuous
- *      off-host — the file is absent in CI/dev — but a cheap belt), and
+ * Since KEN-125 the config has a repo-managed source of truth
+ * (`docker/litellm-proxy/litellm-config.yaml`), which the lint step ALWAYS
+ * checks. This module is the pure detection core shared by two enforcement
+ * points:
+ *   1. the `scripts/check-litellm-config-guard.mjs` lint step, which checks the
+ *      repo copy unconditionally (so it is no longer vacuous off-host) and the
+ *      LIVE host copy additionally, where one is discoverable, and
  *   2. the load-bearing fleet-health sensor (`src/fleet-health/
- *      litellm-config-sensor.ts`) that runs where the config actually lives.
+ *      litellm-config-sensor.ts`) that runs where the live config actually
+ *      lives and escalates a violation into the priority ledger.
  *
- * Everything here is a pure function over already-parsed YAML so it is
- * trivially unit-testable and never touches the filesystem or network.
+ * The detection functions are pure over already-parsed YAML so they are
+ * trivially unit-testable and never touch the filesystem or network. The one
+ * exception is `discoverLiveLitellmConfigPath` (filesystem lookup only, fully
+ * injectable).
  */
+
+import { existsSync, readdirSync } from "node:fs";
 
 import { parse as parseYaml } from "yaml";
 
@@ -27,16 +34,76 @@ import { parse as parseYaml } from "yaml";
 export const FORWARD_HEADERS_FLAG = "forward_client_headers_to_llm_api";
 
 /**
- * The host-correct default path to the operator-maintained LiteLLM config.
+ * Where the LIVE (host) LiteLLM config is discovered.
  *
- * NOTE (red-team item 2): `docs/model-routing.md` cites `/host/data/coolify/…`
- * — but that `/host` prefix is ONLY valid inside the root-agent debugging
- * container (which bind-mounts the host root at `/host`). The real switchroom
- * host path — where the fleet-health sensor actually runs — has no `/host`
- * prefix. Override with `LITELLM_CONFIG_PATH` when it moves.
+ * Deliberately NOT a hardcoded full path: the Coolify service directory is
+ * named by a deployment-specific service id, and embedding this deployment's
+ * id in a public repo is host-identifying. Instead the live copy is discovered
+ * by scanning the Coolify services dir for the one service that owns a
+ * `litellm-config.yaml` — so on-host enforcement keeps working with zero
+ * operator action, and no deployment identifier ships in the repo.
+ *
+ * NOTE: `docs/model-routing.md` cites `/host/data/coolify/…` — that `/host`
+ * prefix is ONLY valid inside the root-agent debugging container (which
+ * bind-mounts the host root at `/host`). The real switchroom host path — where
+ * the fleet-health sensor actually runs — has no `/host` prefix. Set
+ * `LITELLM_CONFIG_PATH` to override discovery entirely (required when the
+ * layout differs, or when discovery is ambiguous).
  */
-export const DEFAULT_LITELLM_CONFIG_PATH =
-  "/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml";
+export const COOLIFY_SERVICES_DIR = "/data/coolify/services";
+
+/** Basename of the live proxy config inside its Coolify service dir. */
+export const LIVE_LITELLM_CONFIG_BASENAME = "litellm-config.yaml";
+
+/** Outcome of a live-config discovery attempt. `path` is non-null only for
+ *  `"found"` — every other reason is a legitimate skip (hermetic CI/dev, or an
+ *  ambiguous host that needs `LITELLM_CONFIG_PATH`). */
+export interface LiveConfigDiscovery {
+  path: string | null;
+  reason: "found" | "no-services-dir" | "not-found" | "ambiguous";
+  /** Every candidate found — length > 1 is what makes a host `"ambiguous"`. */
+  candidates: string[];
+}
+
+/**
+ * Discover the live LiteLLM config by scanning the Coolify services dir for
+ * service dirs containing a `litellm-config.yaml`.
+ *
+ * Exactly one match → `found`. Zero → `not-found` (or `no-services-dir` when
+ * the services dir itself is absent/unreadable, the CI/dev case). More than one
+ * → `ambiguous` with `path: null`: guessing which proxy is authoritative would
+ * be worse than skipping and telling the operator to set `LITELLM_CONFIG_PATH`.
+ */
+export function discoverLiveLitellmConfigPath(opts?: {
+  servicesDir?: string;
+  readdirFn?: (p: string) => string[];
+  existsFn?: (p: string) => boolean;
+}): LiveConfigDiscovery {
+  const servicesDir = opts?.servicesDir ?? COOLIFY_SERVICES_DIR;
+  const readdir = opts?.readdirFn ?? ((p: string) => readdirSync(p));
+  const exists = opts?.existsFn ?? existsSync;
+
+  let entries: string[];
+  try {
+    entries = readdir(servicesDir);
+  } catch {
+    return { path: null, reason: "no-services-dir", candidates: [] };
+  }
+
+  const candidates: string[] = [];
+  for (const entry of [...entries].sort()) {
+    const candidate = `${servicesDir}/${entry}/${LIVE_LITELLM_CONFIG_BASENAME}`;
+    if (exists(candidate)) candidates.push(candidate);
+  }
+
+  if (candidates.length === 1) {
+    return { path: candidates[0], reason: "found", candidates };
+  }
+  if (candidates.length === 0) {
+    return { path: null, reason: "not-found", candidates };
+  }
+  return { path: null, reason: "ambiguous", candidates };
+}
 
 /**
  * A subscription-Claude group is allowed to forward the OAuth header. Mirrors

@@ -55,6 +55,9 @@ These must always hold.
   tested (`src/litellm/repo-config.test.ts`) config; the operator syncs it to
   the Coolify-hosted live file at
   `/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`
+  (the service id is deployment-specific and deliberately never committed —
+  the lint guard and fleet-health sensor discover the live file by scanning
+  `/data/coolify/services/*/litellm-config.yaml`, or take `LITELLM_CONFIG_PATH`)
   (procedure in `docker/litellm-proxy/README.md` — switchroom itself never
   mutates or restarts the live proxy, and the live file must be reconciled
   into the repo copy on first rollout). The config places

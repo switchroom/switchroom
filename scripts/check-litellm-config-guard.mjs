@@ -32,13 +32,16 @@
  * with no `fallbacks` chain (the broker owns failover — see model-routing.md
  * Known Gaps).
  *
- * Point `LITELLM_CONFIG_PATH` at the live config (e.g.
- * `<litellm-service-dir>/litellm-config.yaml`) to also check the live copy.
+ * The LIVE copy is resolved as: `LITELLM_CONFIG_PATH` env → discovery under the
+ * Coolify services dir (`/data/coolify/services/<service>/litellm-config.yaml`).
+ * Discovery keeps the on-host lint honest with zero operator setup WITHOUT
+ * baking this deployment's Coolify service id into a public repo. Off-host
+ * discovery finds nothing and the live check is skipped.
  *
  * Run: `npm run lint:litellm-config-guard` (also part of `npm run lint`).
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 
@@ -46,13 +49,39 @@ const FLAG = "forward_client_headers_to_llm_api";
 
 // KEN-125: the config now has a repo-managed source of truth. That copy is
 // ALWAYS checked (so this guard is no longer vacuous off-host); the host/live
-// path (LITELLM_CONFIG_PATH env var — deployment-specific, never hardcoded)
-// is additionally checked when set.
+// copy is additionally checked when resolvable.
 const REPO_LITELLM_CONFIG_PATH = fileURLToPath(
   new URL("../docker/litellm-proxy/litellm-config.yaml", import.meta.url),
 );
 
-const path = process.env.LITELLM_CONFIG_PATH ?? null;
+// Mirrors src/litellm/header-passthrough-guard.ts (discoverLiveLitellmConfigPath).
+// Duplicated because this is a plain .mjs lint script that cannot import the TS
+// core; keep the two in sync — the TS copy is the reference implementation.
+const COOLIFY_SERVICES_DIR = "/data/coolify/services";
+
+function discoverLiveConfigPath() {
+  let entries;
+  try {
+    entries = readdirSync(COOLIFY_SERVICES_DIR);
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const entry of [...entries].sort()) {
+    const candidate = `${COOLIFY_SERVICES_DIR}/${entry}/litellm-config.yaml`;
+    if (existsSync(candidate)) candidates.push(candidate);
+  }
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) {
+    console.log(
+      `check-litellm-config-guard: SKIP (live) — ${candidates.length} candidate live configs under ` +
+        `${COOLIFY_SERVICES_DIR}; set LITELLM_CONFIG_PATH to disambiguate.`,
+    );
+  }
+  return null;
+}
+
+const path = process.env.LITELLM_CONFIG_PATH ?? discoverLiveConfigPath();
 
 function isClaudeAllowlistedGroup(name) {
   if (name.endsWith("-openrouter")) return false;
