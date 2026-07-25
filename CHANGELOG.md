@@ -2,6 +2,173 @@
 
 ## Unreleased
 
+### Hindsight — the pending-retains backlog was a re-post loop, not lost memory (#3596)
+
+The queue on this fleet grew to 5,751 entries. The cause was **not** that
+memory was being lost — a full sweep on 2026-07-25 found **4,048 (70.4%)
+already existed as documents** in their bank, 3,815 of them with facts
+extracted. Only 1,703 (29.6%) were genuinely absent.
+
+- **Root cause: the SessionStart drain built the backlog it was supposed to
+  clear.** `drain_pending.py` runs inside the hook and clamps each entry's
+  HTTP timeout to the remaining hook budget (1-8s), while `_retry_one` posts
+  `async_processing=False` — a synchronous retain that takes 30-90s. So the
+  server committed the document and the client *always* gave up before the
+  ack. The entry was never deleted, was re-posted on every session start
+  forever, and aged toward `.dead` while the memory it carried was already
+  durable.
+- **`--backlog` is now a two-phase, out-of-hook replay.** Phase 1 (reconcile)
+  GETs the document and drops the entry if it already exists: no POST, no LLM
+  work, no cost, resumable at any point — on the measured fleet that is 70% of
+  the queue for free. Phase 2 posts only genuinely-absent entries with a
+  realistic timeout (`HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`, 180s) and then
+  **re-GETs to confirm the document before deleting the entry** —
+  commit-before-delete, because a 200 is an ack and not proof (#3244). It is
+  still `async_processing=False` for exactly that reason: deleting the queue
+  entry on an async ack is the #3244 silent-loss bug.
+- **Replay is paced, because the model pool is fleet-shared.**
+  `HINDSIGHT_DRAIN_CONCURRENCY` now defaults to **1**, not 4: the group
+  serving retain has 4 lanes shared with live retains, reflect and
+  consolidation, so 11 agents at width 4 is 44 lanes of demand against 4.
+  Phase 2 sleeps between entries (`HINDSIGHT_DRAIN_SLEEP_S`) and pauses
+  entirely while an operator-supplied probe (`HINDSIGHT_DRAIN_P95_CMD`,
+  threshold `HINDSIGHT_DRAIN_P95_BACKOFF_MS`) reports the upstream is already
+  slow, so the replay can never be what trips a latency alarm.
+- **A full queue now evicts the OLDEST entry instead of refusing the newest.**
+  `lib/pending.py` previously returned `None` at `MAX_ENTRIES`, throwing away
+  the turn that had just happened — the one most likely to still matter — and
+  three of six call sites discarded that return, so it was silent. It now
+  sheds oldest-first into a bounded `pending-evicted/` archive with an
+  append-only `pending-evictions.log`, and dedupes on
+  `(bank, document_id, sha256(content))` (`reconcile_tail` re-enqueues the same
+  slice every boot until its watermark is confirmed; 63% of one measured fleet
+  queue was duplicates). Both caps are env-driven
+  (`HINDSIGHT_PENDING_MAX_ENTRIES`, `HINDSIGHT_PENDING_MAX_BYTES`), because a
+  count cap alone bounds disk only to within ~1500x at the measured content
+  spread (499 B .. 744 KB). This ports the design already validated and running
+  out of band on the fleet — file patches to the vendored plugin do not survive
+  `switchroom apply`, which is why it belongs in-repo.
+- **Residual drops are still recorded.** With eviction in place, a *drop* now
+  means the entry could not be written at all (disk full, permissions). That
+  case gets a loud stderr line plus a durable `pending-drops.json` ledger — a
+  **sibling** of the queue dir, so it can never be listed as an entry, drained,
+  or counted against the caps.
+- **The reconcile runs in the automatic path too, not only in `--backlog`.**
+  `session_start.py` calls `drain()` on every boot, so fixing the re-post loop
+  only in the operator-invoked mode would have changed nothing operationally.
+  The sequential drain now GETs before it POSTs: for an already-durable entry
+  the sub-second GET *replaces* a doomed 30-90s server-side extraction, which
+  is where the latency and upstream-load win comes from. For an entry that
+  still needs POSTing the GET is an extra call, so the per-request timeout is
+  re-clamped against the budget **remaining at that moment** — computing the
+  clamp once per entry and spending it on both requests made the cost additive
+  (measured 16.0s against the fleet's own 9s budget with an 8s timeout).
+- **A presence GET only retires an entry whose `document_id` proves its own
+  content.** Post-#3244 the id is content-derived
+  (`retain.slice_document_id`: `{session}-r{start_uuid}-{end_uuid}`), so a 200
+  proves *that slice* was committed. A pre-#3244 entry carries a bare session
+  id, for which the bank answers 200 after ANY successful retain in that
+  session — reconciling on it would retire a turn that was never committed
+  (confirmed against a live 525 KB entry on this fleet whose `document_id` is a
+  bare uuid and whose GET returns 200). Those entries skip the free pass and go
+  to the POST, which is the only thing that can make them durable.
+- **The drain archives an entry instead of deleting it.** Every "stop queueing
+  this" decision on the drain path rests on an HTTP 200 — a presence GET or a
+  synchronous retain ack — and a 200 is evidence, not proof (#3244). Entries
+  now MOVE into a bounded `pending-reconciled/` sibling
+  (`HINDSIGHT_PENDING_RECONCILED_MAX_ENTRIES` / `_MAX_BYTES`, trimmed
+  oldest-first like `pending-evicted/`), which is what the out-of-band tooling
+  this design was ported from always did. One rule covers both paths: the
+  in-hook drain retires on the POST's own 200 because a 5s hook budget has no
+  room for a confirming GET, the backlog drain re-GETs first — and nothing on
+  the drain path irreversibly removes the last on-disk copy of a turn. That
+  in-hook 200 is not a bare ack: `_retry_one` posts `async_processing=False`,
+  so it is the daemon's commit-before-ack (#3244 §1.1). It is still the
+  daemon's word rather than an independent read, which is why that path
+  archives instead of deleting. When the archive itself cannot be written
+  (ENOSPC, EACCES, a read-only mount) the entry STAYS QUEUED and the failure
+  is logged; an earlier revision fell back to deleting it, which made this
+  claim false in exactly the disk-pressure case it was written for. The queue
+  module now exposes no delete primitive reachable from the drain, so that
+  invariant is structural rather than asserted. Retiring an unarchivable
+  entry is reported as `archive_failed` rather than counted as
+  `drained`/`reconciled`, so the summary can't claim a retire that did not
+  happen.
+- **"Stays queued" is bounded, and the bound is dropping the oldest turns.**
+  Said plainly because the paragraph above reads like an unconditional
+  promise and it is not one. Under *sustained* ENOSPC the chain is: the drain
+  keeps entries queued → the queue reaches `HINDSIGHT_PENDING_MAX_ENTRIES` /
+  `_MAX_BYTES` → `enqueue()` evicts oldest-first → those evictions' own
+  archive move fails for the same reason → the oldest live entries are
+  removed outright. So the queue never grows without limit, and what pays for
+  that is the oldest queued memory. It is deliberate (the newest turn is the
+  one most likely to still matter) and it is never quiet: stderr, a
+  `reason=...+archive-failed` line in `pending-evictions.log` marking exactly
+  the evictions whose payload was NOT kept, and a `switchroom doctor` row that
+  fails on any eviction in the window. Free the disk and the chain stops at
+  step one.
+- **The bounded archives are trimmed oldest-first, and the trim names what it
+  dropped.** Three of the four ways into `pending-reconciled/` are backed by a
+  GET that confirmed the document (in-hook reconcile, backlog phase 1, backlog
+  phase 2's re-GET). The fourth — the in-hook drain's success path, which runs
+  on every boot — is backed by the commit-before-ack POST alone, so for that
+  population the archived file is the last on-disk copy if the daemon ever
+  fails to honour `async=false`. The caps (500 / 64 MB, 4x smaller than the
+  queue's, to keep three full-queue copies off a container filesystem) are
+  therefore a recovery horizon, not a durability guarantee; the durability
+  guarantee is commit-before-ack. An earlier draft of this entry called the
+  trimmed files "redundant copies of documents already confirmed upstream",
+  which is true of three paths out of four and false for the commonest one.
+  The trim lists every file it drops on stderr, because "reversible" has a
+  horizon and the operator gets to see it pass.
+- **A partially rolled-out plugin tree now fails loudly.** The plugin ships as
+  loose files under `scripts/`, and this change removes a symbol
+  (`lib/pending.py`'s `delete_entry`) whose only importer was
+  `drain_pending.py`. A rollout landing one file without the other made
+  `session_start.py`'s import raise `ImportError` into a bare `except` that
+  logged to a debug channel which is off by default — the whole drain and boot
+  reconciliation would stop, on every boot, silently. Any import-level skew in
+  the tree now prints a stderr line naming the module, the missing symbol,
+  what it costs, and the fix (re-deploy `scripts/` whole, never file by file).
+- **A broken p95 probe is no longer silent.** `HINDSIGHT_DRAIN_P95_CMD`'s exit
+  status was ignored, so a typo'd or unauthorized command produced an
+  unparsable figure, fell into the bare `except`, and disabled backoff exactly
+  like an unset probe. It still degrades to "no backoff" (a replay that halts
+  because its probe broke is worse than one that runs unpaced), but it now says
+  so on stderr with the exit status and stderr tail.
+- **Dedupe is keyed on the filename, not on the serialized size.** The queued
+  copy is always post-`update_attempt` by the time `reconcile_tail` re-enqueues
+  (the SessionStart drain attempts every entry on every boot), so a
+  size-indexed pre-filter matched nothing in steady state and the queue grew by
+  one duplicate per boot; a differing error string defeated it too. The key now
+  lives in the name (`<unix-ms>-<key>-<uuid>.json`), so a lookup is a prefix
+  match over the directory listing with zero file reads. (The measured 63% /
+  84.7 MB collapse on the fleet came from `dedupe_queue.py`, a one-shot
+  out-of-band sweep — this is the preventive guard, a different mechanism.)
+- **An oversized entry no longer costs the whole queue.** If a payload exceeds
+  `HINDSIGHT_PENDING_MAX_BYTES` the eviction loop could never satisfy its
+  condition: it evicted every entry and wrote the incoming one anyway, and the
+  bounded archive then discarded most of what it had just shed. That single
+  entry is now refused and recorded as a drop.
+- **Corrupt entries are quarantined instead of skipped.** A malformed entry was
+  immortal — never reconciled, never drained, never aged to `.dead`, but still
+  holding a slot and still counted in the depth doctor reports. It now moves to
+  `pending-corrupt/`, matching the out-of-band drainer.
+- **`switchroom doctor` told the operator two false things.** It claimed a live
+  backlog "drains automatically on the agent's next SessionStart" (it cannot —
+  that drain is what built it), and it hardcoded the cap at 1000 while the live
+  cap is env-driven at 2000, so it reported "at cap, dropping new failures"
+  against containers that were happily accepting entries. The row now reads the
+  agent's **live** cap out of the container, describes a full queue accurately
+  (`warn`: at the eviction threshold — nothing lost yet, the next entry sheds
+  the oldest), and reserves `fail` for actual loss: `.dead` markers, residual
+  drops, or evictions **in the last 7 days** — windowed, because eviction is
+  deliberate policy under this design and a cumulative count over an
+  append-only ledger would pin the row red forever after one legitimate
+  eviction. The remediation names the reconcile phase first, spells out the
+  pacing, and ships the actual p95 query rather than telling the operator to
+  set `HINDSIGHT_DRAIN_P95_CMD` to something it never names.
+
 ## v0.19.18 — MCP instructions truncation (security), turn-liveness fixes, hindsight ranking & recall, CI hardening
 
 ### Telegram — the MCP `instructions` string was silently truncated, disabling a security guardrail (#3587)
