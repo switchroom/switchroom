@@ -39,7 +39,8 @@
  *      call, a concatenation, a template literal, an inline array or string —
  *      FAILS CLOSED. This is what makes step 2 sound: nothing can be bolted
  *      onto the value between the constant and the wire.
- *   2. That identifier's module is compiled and IMPORTED, and the real runtime
+ *   2. That identifier's module is IMPORTED (in a child Node, using Node's
+ *      built-in TypeScript stripping — no bundler dependency), and the real runtime
  *      `.length` is measured. Template interpolation, concatenation and
  *      computed content inside the module are therefore all counted correctly.
  *   3. Coverage is asserted: if fewer than EXPECTED_INSTRUCTION_SERVERS
@@ -50,9 +51,9 @@
  * Mirrors the other structural guards (check-stale-tool-descriptions, etc.)
  * wired into `npm run lint`.
  */
-import { readFileSync, readdirSync, statSync, mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 // Imposed by the Claude Code CLIENT (minified constant `LB`), verified in
@@ -99,24 +100,52 @@ const ALL_FILES = ROOTS.flatMap((r) => walk(r));
 const failures = [];
 const checked = [];
 
-/** Compile a TS module and import it, returning its real runtime exports. */
-async function importModule(file) {
-  const esbuild = await import("esbuild");
-  const tmp = mkdtempSync(join(tmpdir(), "mcp-instr-"));
-  try {
-    const out = join(tmp, "mod.mjs");
-    await esbuild.build({
-      entryPoints: [file],
-      bundle: true,
-      format: "esm",
-      platform: "node",
-      outfile: out,
-      logLevel: "silent",
-    });
-    return await import(pathToFileURL(out).href);
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
+/**
+ * Import a .ts module in a child Node and report the real runtime facts we
+ * need: the type and `.length` of the named export, plus the module's authored
+ * budget.
+ *
+ * Deliberately uses Node's BUILT-IN TypeScript stripping rather than a bundler.
+ * An earlier revision called `esbuild`, which is present locally only as a
+ * hoisted transitive dependency of vitest — it is not declared in package.json,
+ * so `npm run lint` failed in CI with "Cannot find package 'esbuild'". Lint
+ * must not depend on an undeclared package. (It failed CLOSED, which is the
+ * correct direction, but it still blocked the build.)
+ *
+ * Node >= 22.6 exposes this behind --experimental-strip-types; from Node 23.6
+ * it is on by default and the flag may be unrecognised. So: try with the flag,
+ * and on a flag-related startup failure retry without it.
+ */
+function measureModule(file, name) {
+  const url = pathToFileURL(resolve(file)).href;
+  const child =
+    `const m = await import(${JSON.stringify(url)});\n` +
+    `const v = m[${JSON.stringify(name)}];\n` +
+    `process.stdout.write(JSON.stringify({\n` +
+    `  type: typeof v,\n` +
+    `  len: typeof v === "string" ? v.length : null,\n` +
+    `  budget: m.MCP_INSTRUCTIONS_BUDGET ?? null,\n` +
+    `}));`;
+
+  const attempts = [
+    ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", child],
+    ["--no-warnings", "--input-type=module", "-e", child],
+  ];
+
+  let lastErr = "";
+  for (const args of attempts) {
+    const r = spawnSync(process.execPath, args, { encoding: "utf8" });
+    if (r.status === 0 && r.stdout) {
+      try {
+        return JSON.parse(r.stdout);
+      } catch {
+        lastErr = `unparseable measurement output: ${r.stdout.slice(0, 400)}`;
+        continue;
+      }
+    }
+    lastErr = (r.stderr || r.error?.message || `exit ${r.status}`).trim();
   }
+  throw new Error(lastErr || "unknown failure");
 }
 
 /** Locate the .ts module that exports `name`. */
@@ -178,22 +207,21 @@ for (const file of ALL_FILES) {
     continue;
   }
 
-  let mod;
+  let measured;
   try {
-    mod = await importModule(exporter);
+    measured = measureModule(exporter, rawValue);
   } catch (err) {
     failures.push(
-      `${file}: failed to compile/import ${exporter} to measure \`${rawValue}\`: ` +
+      `${file}: failed to import ${exporter} to measure \`${rawValue}\`: ` +
         `${err && err.message ? err.message : err}`,
     );
     continue;
   }
 
-  const value = mod[rawValue];
-  if (typeof value !== "string") {
+  if (measured.type !== "string") {
     failures.push(
       `${exporter}: \`${rawValue}\` must export a string (got ` +
-        `${typeof value}). The MCP client receives a string; anything else ` +
+        `${measured.type}). The MCP client receives a string; anything else ` +
         `cannot be budget-checked.`,
     );
     continue;
@@ -201,7 +229,7 @@ for (const file of ALL_FILES) {
 
   // The module owns its own authored budget; honour it, and require it to sit
   // under the client's hard limit.
-  const budget = mod.MCP_INSTRUCTIONS_BUDGET;
+  const budget = measured.budget;
   if (typeof budget === "number" && budget > CLIENT_HARD_LIMIT) {
     failures.push(
       `${exporter}: authored budget ${budget} exceeds the client's hard limit ` +
@@ -213,7 +241,7 @@ for (const file of ALL_FILES) {
   const effective =
     typeof budget === "number" && budget > 0 ? budget : CLIENT_HARD_LIMIT;
 
-  const len = value.length;
+  const len = measured.len;
   checked.push({ file: exporter, name: rawValue, len, budget: effective });
 
   if (len > effective) failures.push(fail(exporter, rawValue, len, effective));
