@@ -32,8 +32,31 @@ export type DockerRunner = (args: string[]) => {
   stderr: string;
 };
 
+/**
+ * Wall-clock budget for the `docker inspect` probe in {@link defaultRunner}.
+ *
+ * The docker CLI has NO client-side request timeout, so against an
+ * unresponsive dockerd an unbounded `spawnSync` blocks FOREVER. That is
+ * load-bearing on the rollout path: {@link deployedImageTag} is the
+ * `refresh-web` step's skew probe, called in-process by `executeRollout`, so
+ * a hang here strands hostd's `fleetMutationInFlight` latch — and does it
+ * AFTER every agent has already rolled. Kept in sync in spirit with
+ * `ROLLOUT_PROBE_TIMEOUT_MS` (`src/cli/rollout.ts`); a healthy daemon answers
+ * an inspect in milliseconds, and the rollout executor threads in its own
+ * bounded runner anyway (see `createRolloutDeps`). Duplicated rather than
+ * imported to keep this module free of a cycle back into rollout.ts.
+ *
+ * A timeout surfaces as a non-zero/`null` status → `ok: false` → the same
+ * "unknown tag" path an absent container already takes. Fails closed.
+ */
+export const DOCKER_INSPECT_TIMEOUT_MS = 60 * 1000;
+
 const defaultRunner: DockerRunner = (args) => {
-  const r = spawnSync("docker", args, { encoding: "utf8" });
+  const r = spawnSync("docker", args, {
+    encoding: "utf8",
+    timeout: DOCKER_INSPECT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
   return { ok: r.status === 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 };
 

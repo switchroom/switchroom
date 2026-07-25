@@ -579,47 +579,74 @@ export async function pickHindsightPorts(): Promise<{
 }
 
 /**
+ * Wall-clock budget for the one-shot `docker ps` / `docker --version` probes
+ * below.
+ *
+ * The docker CLI has NO client-side request timeout: against an unresponsive
+ * dockerd these calls block FOREVER, and an unbounded `execFileSync` here
+ * hangs whatever called it. That is load-bearing on the rollout path —
+ * {@link isHindsightContainerExists} is reached from `executeRollout`'s
+ * `refresh-hindsight` step, so a hang here strands hostd's
+ * `fleetMutationInFlight` latch exactly the way the unbounded subcommand
+ * spawns did (see `ROLLOUT_PROBE_TIMEOUT_MS` in `src/cli/rollout.ts`).
+ *
+ * A healthy daemon answers these in milliseconds, so anything past this
+ * budget IS the wedge. All three probes already fail closed on any throw, and
+ * a timeout throws — so bounding them changes nothing on a healthy host and
+ * converts an infinite hang into a clean `false` on a wedged one.
+ */
+export const DOCKER_PROBE_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Minimal one-shot docker runner: stdout on success, `null` on ANY failure
+ * (non-zero exit, docker absent, or a timeout kill against a wedged daemon).
+ *
+ * Injectable so the rollout executor can supply a runner bounded by its own
+ * budget, and so tests can exercise these probes without docker.
+ */
+export type DockerProbe = (args: string[]) => string | null;
+
+const defaultDockerProbe: DockerProbe = (args) => {
+  try {
+    return execFileSync("docker", args, {
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: DOCKER_PROBE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+  } catch {
+    return null;
+  }
+};
+
+/**
  * Check if Docker is available on the system.
  */
-export function isDockerAvailable(): boolean {
-  try {
-    execFileSync("docker", ["--version"], { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
-  }
+export function isDockerAvailable(probe: DockerProbe = defaultDockerProbe): boolean {
+  return probe(["--version"]) !== null;
 }
 
 /**
  * Check if the switchroom-hindsight container is currently running.
  */
-export function isHindsightRunning(): boolean {
-  try {
-    const output = execFileSync(
-      "docker",
-      ["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"],
-      { stdio: "pipe", encoding: "utf-8" },
-    );
-    return output.trim().length > 0;
-  } catch {
-    return false;
-  }
+export function isHindsightRunning(probe: DockerProbe = defaultDockerProbe): boolean {
+  const out = probe(["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"]);
+  return (out ?? "").trim().length > 0;
 }
 
 /**
  * Check if the switchroom-hindsight container exists (running or stopped).
  */
-export function isHindsightContainerExists(): boolean {
-  try {
-    const output = execFileSync(
-      "docker",
-      ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Names}}"],
-      { stdio: "pipe", encoding: "utf-8" },
-    );
-    return output.trim().length > 0;
-  } catch {
-    return false;
-  }
+export function isHindsightContainerExists(probe: DockerProbe = defaultDockerProbe): boolean {
+  const out = probe([
+    "ps",
+    "-a",
+    "--filter",
+    "name=switchroom-hindsight",
+    "--format",
+    "{{.Names}}",
+  ]);
+  return (out ?? "").trim().length > 0;
 }
 
 /**

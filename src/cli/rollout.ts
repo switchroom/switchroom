@@ -54,7 +54,7 @@ import { compareReleaseTags } from "../config/release-resolve.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
 import { readAndFilter, defaultAuditLogPath } from "../host-control/audit-reader.js";
 import { isHindsightContainerExists } from "../setup/hindsight.js";
-import { deployedImageTag } from "./deploy-version-guard.js";
+import { deployedImageTag, type DockerRunner } from "./deploy-version-guard.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
@@ -737,12 +737,64 @@ export function executeRollout(
           // A wedged container is precisely the case a roll exists to fix.
           // Report it as a bounded, structural failure instead of letting the
           // executor (and hostd's fleet-mutation latch) hang forever.
+          //
+          // STOP THE ROLL — do NOT fall through to the version probe. A
+          // timeout here means the `switchroom agent restart` CLI was
+          // SIGKILLed mid-flight, and a SIGKILL reaps only the direct child
+          // (see ROLLOUT_KILL_SIGNAL): its `docker compose up -d` grandchild
+          // can still be live, still rewriting the compose file. Two things
+          // follow, and both are silent if we continue:
+          //   1. the orphan may well have brought the container up on the
+          //      target tag, so the probe PASSES (`got === targetNorm`) and
+          //      the roll reports success — while everything the CLI does
+          //      AFTER the container starts (the post-start reconcile and the
+          //      #3333 scoped ownership sweep injected via SCOPED_SWEEP_ENV
+          //      on the canary) was killed and never ran. A half-applied
+          //      agent reported as fully rolled.
+          //   2. proceeding restarts the NEXT agent while that orphan is
+          //      still mutating containers and the shared compose file — the
+          //      exact race ROLLOUT_KILL_SIGNAL's note names.
+          // A passing probe is evidence the container came up; it is NOT
+          // evidence the restart COMPLETED. Fail closed: the operator is told
+          // to check for stray docker processes before re-running, which is
+          // only coherent if the roll actually stopped.
           warnings.push(
             `\`agent restart ${step.agent}\` exceeded its ` +
               `${ROLLOUT_RUN_TIMEOUT_MS}ms timeout and was killed — the ` +
               `container is likely wedged. The roll stopped cleanly rather ` +
               `than hanging.`,
           );
+          const gotAfterKill = deps.probeVersion(step.agent);
+          if (gotAfterKill !== null && normalizeVersion(gotAfterKill) === targetNorm) {
+            warnings.push(
+              `${step.agent} is reporting ${gotAfterKill} (the roll target) ` +
+                `despite the killed restart — its orphaned \`docker compose\` ` +
+                `grandchild most likely finished the container start. The ` +
+                `restart's POST-start work (reconcile / ownership sweep) was ` +
+                `killed with the CLI and did NOT run, so this agent is ` +
+                `HALF-APPLIED, not rolled. Check for stray docker processes ` +
+                `host-side, then re-run.`,
+            );
+          }
+          deps.log(
+            `  ✗ ${step.agent} → restart TIMED OUT (killed after ` +
+              `${ROLLOUT_RUN_TIMEOUT_MS}ms; probe says ` +
+              `${gotAfterKill ?? "<unreachable>"}) — STOPPING`,
+          );
+          emit(
+            isCanary
+              ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
+              : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+          );
+          return {
+            ok: false,
+            rolled,
+            failedStep: "restart-agent",
+            failedAgent: step.agent,
+            got: gotAfterKill,
+            timedOut: true,
+            warnings,
+          };
         }
         const got = deps.probeVersion(step.agent);
         if (got === null || normalizeVersion(got) !== targetNorm) {
@@ -760,7 +812,13 @@ export function executeRollout(
             failedStep: "restart-agent",
             failedAgent: step.agent,
             got,
-            ...(restartRes.timedOut ? { timedOut: true } : {}),
+            // No `timedOut` here by construction: the timeout branch above
+            // returns unconditionally, so reaching this point means the
+            // restart exited on its own and the VERSION ASSERT is what
+            // failed. Keeping the two failure shapes disjoint is what lets
+            // hostd (and `get_status`) distinguish "killed mid-flight,
+            // grandchildren may be live" from "ran to completion, wrong
+            // version" — they need different operator recovery.
             warnings,
           };
         }
@@ -923,6 +981,15 @@ export function resolveRollbackTarget(auditLogPath?: string): string | null {
  * Read a positive-integer millisecond budget from an env var, falling back to
  * `fallback` when unset/garbage. Escape hatch for a genuinely slow host —
  * never a way to reintroduce "no timeout" (0/negative/NaN are rejected).
+ *
+ * SCOPE OF THE OVERRIDE (do not over-read it): the two constants below are
+ * evaluated at MODULE LOAD, so `SWITCHROOM_ROLLOUT_*_TIMEOUT_MS` only takes
+ * effect when it is set BEFORE this module is imported. That is true of the
+ * production entrypoint — the CLI process inherits its environment, and the
+ * rollout is a fresh `switchroom rollout` process — so the override works
+ * where operators actually use it. It is NOT a general runtime knob: setting
+ * `process.env.*` from inside an already-loaded process (or between tests in
+ * one vitest worker) will NOT change these values.
  */
 function envMs(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -982,6 +1049,7 @@ export type RolloutSpawnSync = (
   status: number | null;
   signal?: NodeJS.Signals | null;
   stdout?: string | null;
+  stderr?: string | null;
   error?: (Error & { code?: string }) | undefined;
 };
 
@@ -1048,6 +1116,26 @@ export function isSpawnTimeout(
  *
  * Operationally: after a reported rollout timeout, check for stray `docker`
  * processes host-side before re-running the roll. The timeout warning says so.
+ *
+ * ## That operator instruction does NOT cover the unattended path
+ *
+ * "Check host-side before re-running" presumes a human between the timeout
+ * and the next mutation. On the auto-rollout path there isn't one:
+ * `finishFailedAutoRollout` → `recoverFailedAutoRollout` (`server.ts`) re-runs
+ * `apply --pin … --compose-only` and, when `failed_step === "restart-agent"`,
+ * `agent restart <agent> --wait --force --pin …` immediately — zero delay, no
+ * orphan check — possibly CONCURRENT with the SIGKILLed child's still-live
+ * `docker compose up -d` on the same compose file. So on the path that
+ * matters most (nobody watching), the grandchild-orphan race above is not
+ * merely unmitigated, it is actively raced into.
+ *
+ * Not fixed here — the honest scope of this change is bounding the
+ * subprocesses. The durable fix is for `finishFailedAutoRollout` to SKIP
+ * auto-recovery when the executor reported `timed_out` and alert instead of
+ * re-mutating; that is a hostd-side behaviour change with its own tests and
+ * its own blast radius, tracked as a follow-up. Stated here rather than left
+ * implicit so the deferral is not read as "the operator instruction covers
+ * it".
  */
 const ROLLOUT_KILL_SIGNAL: NodeJS.Signals = "SIGKILL";
 
@@ -1070,6 +1158,45 @@ export function createRolloutDeps(params: {
   const { configPath, scriptPath, hostdCtx } = params;
   const spawn = (params.spawn ?? (spawnSync as unknown as RolloutSpawnSync));
   const warn = params.warn ?? ((line: string) => process.stderr.write(line));
+
+  /**
+   * One-shot `docker …` bounded by {@link ROLLOUT_PROBE_TIMEOUT_MS}.
+   *
+   * `deps.run` and `deps.probeVersion` were not the only subprocesses inside
+   * `executeRollout`'s own path: the `refresh-web` step calls
+   * {@link deployedImageTag} and the `refresh-hindsight` step calls
+   * {@link isHindsightContainerExists}, both of which shell out to `docker`
+   * IN-PROCESS. The docker CLI has no client-side request timeout, so with an
+   * unresponsive dockerd either call blocked forever — `executeRollout` never
+   * returns, hostd's `runSwitchroom` promise never settles (it resolves only
+   * on the child's `close`), its `.finally()` never runs, and
+   * `fleetMutationInFlight` is stranded permanently. Same bug this whole
+   * change exists to close, and worse-shaped: it strands the latch AFTER
+   * every agent has already rolled.
+   *
+   * Both helpers take an injectable runner, so we thread this bounded one in
+   * rather than relying on their module defaults (which are also bounded now,
+   * belt-and-braces — see DOCKER_INSPECT_TIMEOUT_MS / DOCKER_PROBE_TIMEOUT_MS).
+   * Threading through the injected `spawn` is also what makes the bound
+   * unit-assertable without docker.
+   */
+  const dockerRun: DockerRunner = (args) => {
+    const r = spawn("docker", args, {
+      encoding: "utf8",
+      timeout: ROLLOUT_PROBE_TIMEOUT_MS,
+      killSignal: ROLLOUT_KILL_SIGNAL,
+    });
+    if (isSpawnTimeout(r, ROLLOUT_KILL_SIGNAL)) {
+      warn(
+        `⚠️  rollout: \`docker ${args.join(" ")}\` did not answer within ` +
+          `${ROLLOUT_PROBE_TIMEOUT_MS}ms and was killed — most likely an ` +
+          `unresponsive docker daemon (though an externally-killed probe is ` +
+          `indistinguishable here). Treating as unknown.\n`,
+      );
+      return { ok: false, stdout: "", stderr: "" };
+    }
+    return { ok: r.status === 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
 
   /**
    * Write `text` over the config, then chown back to the operator.
@@ -1136,7 +1263,17 @@ export function createRolloutDeps(params: {
       }
       // A killed child has status null; report a non-zero status so every
       // caller's `status !== 0` check trips.
-      return { status: r.status ?? 1, ...(timedOut ? { timedOut: true } : {}) };
+      //
+      // The `timedOut ? 1` arm is not redundant defensiveness — it ENFORCES
+      // the invariant isSpawnTimeout's contract asserts. isSpawnTimeout's
+      // ETIMEDOUT arm is checked BEFORE status, so a hypothetical
+      // `{status: 0, error: {code: "ETIMEDOUT"}}` shape would otherwise
+      // return `status: 0, timedOut: true` and every caller's
+      // `if (r.status !== 0)` gate would read the timeout as SUCCESS. We
+      // could not reproduce that shape on node v22.23.1, but "the runtime
+      // happens not to emit it" is not a guarantee — a timeout is never a
+      // success, so encode that in the code rather than only in the doc.
+      return { status: timedOut ? 1 : (r.status ?? 1), ...(timedOut ? { timedOut: true } : {}) };
     },
     probeVersion: (agent) => {
       const r = spawn(
@@ -1171,7 +1308,15 @@ export function createRolloutDeps(params: {
     emitPhase: (phase) => process.stdout.write(encodeRolloutPhaseLine(phase) + "\n"),
     // Belt-and-braces skew probe for the refresh-web step (webd install
     // exits 0 on a downgrade-guard skip — see deploy-version-guard.ts).
-    webImageTag: () => deployedImageTag("switchroom-web"),
+    // Bounded: this `docker inspect` runs IN-PROCESS inside executeRollout.
+    webImageTag: () => deployedImageTag("switchroom-web", dockerRun),
+    // Bounded for the same reason: the refresh-hindsight step's `docker ps`
+    // also runs in-process inside executeRollout.
+    hindsightExists: () =>
+      isHindsightContainerExists((args) => {
+        const r = dockerRun(args);
+        return r.ok ? r.stdout : null;
+      }),
     persistPin: (pin) => {
       const before = readFileSync(configPath, "utf8");
       const after = setReleasePinInConfig(before, pin);
