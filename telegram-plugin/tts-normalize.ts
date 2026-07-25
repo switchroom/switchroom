@@ -292,10 +292,12 @@ export function normalizeForTts(text: string): string {
     return words.join(' ')
   })
 
-  // -- Times HH:MM (24h) → spoken. The (?!:?\d) guard skips HH:MM:SS
-  //    entirely — a half-spoken time with a dangling ":46" reads worse
-  //    than leaving the digits as-is.
-  s = s.replace(/\b([01]?\d|2[0-3]):([0-5]\d)(?!:?\d)/g, (_m, hh: string, mm: string) => {
+  // -- Times HH:MM (24h) → spoken. The (?<![\d:]) / (?!:?\d) guards skip
+  //    HH:MM:SS entirely — a half-spoken time with a dangling ":46" reads
+  //    worse than leaving the digits as-is. The LOOKBEHIND is load-bearing:
+  //    without it the scan re-anchors INSIDE the timestamp (`09:00:00` →
+  //    "09:zero o'clock") because the trailing `00` is itself a legal HH:MM.
+  s = s.replace(/(?<![\d:])\b([01]?\d|2[0-3]):([0-5]\d)(?!:?\d)/g, (_m, hh: string, mm: string) => {
     const h = Number(hh)
     const min = Number(mm)
     const hw = belowThousand(h)

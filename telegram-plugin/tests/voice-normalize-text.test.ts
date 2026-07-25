@@ -120,6 +120,18 @@ describe('normalizeForSpeech — emoji & pictographs', () => {
     expect(normalizeForSpeech('nice :rocket: work')).toBe('nice work')
   })
 
+  // Digit-bodied shortcodes are real. A letter-only body left them in the
+  // text AND glued them to the previous word ("Nice:100: work").
+  it('drops a DIGIT-bodied :shortcode: without eating the space', () => {
+    expect(normalizeForSpeech('Nice :100: work')).toBe('Nice work')
+    expect(normalizeForSpeech('a :8ball: b')).toBe('a b')
+    expect(normalizeForSpeech('a :1st_place_medal: b')).toBe('a b')
+  })
+
+  it('the digit-bodied form still cannot eat a timestamp colon', () => {
+    expect(normalizeForSpeech('Ran at 14:30:46 ok')).toBe('Ran at 14:30:46 ok')
+  })
+
   it('leaves ordinary colon usage alone', () => {
     expect(normalizeForSpeech('note: this is fine')).toBe('note: this is fine')
   })
@@ -403,6 +415,15 @@ describe('normalizeForSpeech — time guard (HH:MM:SS)', () => {
     )
   })
 
+  // `14:30:46` survives even an unguarded scan because `30` is not a legal
+  // HH. These are the timestamps whose TAIL is itself a legal HH:MM — the
+  // ones a missing lookbehind half-reads ("09:zero o'clock").
+  it('leaves an on-the-hour timestamp alone (lookbehind guard)', () => {
+    expect(normalizeForSpeech('t 09:00:00 z')).toBe('t 09:00:00 z')
+    expect(normalizeForSpeech('t 12:00:15 z')).toBe('t 12:00:15 z')
+    expect(normalizeForSpeech('t 01:02:03 y')).toBe('t 01:02:03 y')
+  })
+
   it('still speaks a plain HH:MM clock time', () => {
     expect(normalizeForSpeech('Meeting at 14:30 today')).toBe(
       'Meeting at fourteen thirty today',
@@ -432,6 +453,22 @@ describe('normalizeForSpeech — thousands separators', () => {
     expect(normalizeForSpeech('We saw 12,500 requests')).toBe(
       'We saw 12,500 requests',
     )
+  })
+
+  // The thousands guard must not mistake an ordinary SENTENCE comma for a
+  // partial digit group — that left a raw "$" unspoken.
+  it('still speaks currency followed by a sentence comma', () => {
+    expect(normalizeForSpeech('It costs $500, plus tax')).toBe(
+      'It costs five hundred dollars, plus tax',
+    )
+    expect(normalizeForSpeech('We paid $1,000, then left')).toBe(
+      'We paid one thousand dollars, then left',
+    )
+  })
+
+  it('still bails on a genuinely malformed amount', () => {
+    expect(normalizeForSpeech('$1,00 partial')).toBe('$1,00 partial')
+    expect(normalizeForSpeech('$5.203 odd')).toBe('$5.203 odd')
   })
 })
 
@@ -464,6 +501,29 @@ describe('normalizeForSpeech — file paths', () => {
   it('does not treat an all-numeric date as a path', () => {
     expect(normalizeForSpeech('the date 12/25/2026 works')).toBe(
       'the date 12/25/2026 works',
+    )
+  })
+
+  // "Two or more slashes ⇒ path" is false in English. Without a path-ish
+  // anchor the pass DELETES words from ordinary prose ("yes/no/maybe" →
+  // "maybe"). Each of these must survive verbatim for the downstream
+  // "word slash word" pass to speak.
+  it('never swallows a multi-slash PROSE run (no path anchor)', () => {
+    expect(normalizeForSpeech('yes/no/maybe')).toBe('yes/no/maybe')
+    expect(normalizeForSpeech('read/write/exec perms')).toBe(
+      'read/write/exec perms',
+    )
+    expect(normalizeForSpeech('he/she/they pronouns')).toBe(
+      'he/she/they pronouns',
+    )
+    expect(normalizeForSpeech('a client/server/proxy split')).toBe(
+      'a client/server/proxy split',
+    )
+    expect(normalizeForSpeech('reading input/output/error')).toBe(
+      'reading input/output/error',
+    )
+    expect(normalizeForSpeech('tests in unit/integration/e2e are green')).toBe(
+      'tests in unit/integration/e2e are green',
     )
   })
 })

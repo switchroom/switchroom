@@ -331,6 +331,17 @@ describe('voice-out pipeline: normalizeForSpeech → normalizeForTts', () => {
     )
   })
 
+  // `14:30:46` survives even an unguarded scan because `30` is not a legal
+  // HH — so on its own it certifies nothing. These are the timestamps whose
+  // TAIL is itself a legal HH:MM, i.e. the ones a missing lookbehind
+  // actually half-reads ("09:zero o'clock").
+  test('an on-the-hour timestamp is not half-read (lookbehind guard)', () => {
+    for (const t of ['09:00:00', '12:00:15', '01:02:03']) {
+      expect(normalizeForTts(`ran at ${t} ok`)).toBe(`ran at ${t} ok`)
+      expect(normalizeForSpeech(`ran at ${t} ok`)).toBe(`ran at ${t} ok`)
+    }
+  })
+
   test('thousands separators are spoken identically by both normalizers', () => {
     expect(normalizeForTts('It costs $1,000')).toBe('It costs one thousand dollars')
     expect(normalizeForSpeech('It costs $1,000')).toBe(

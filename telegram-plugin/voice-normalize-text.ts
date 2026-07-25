@@ -274,6 +274,24 @@ const ACRONYM_MAX_LEN = Math.max(...[...ACRONYMS].map((a) => a.length))
 const PATH_TOKEN_RE =
   /(?<![\w~./-])(?:~|\.{1,2}|[A-Za-z0-9_.@-]+)?(?:\/[A-Za-z0-9_.@+-]+){2,}\/?(?![\w/-])/g
 
+/**
+ * A path-shaped token needs an ANCHOR before we may swallow it: a leading
+ * `/`, `./`, `../` or `~/`, or a final segment carrying a file extension.
+ * "Two or more slashes ⇒ path" is false in English — `yes/no/maybe`,
+ * `read/write/exec`, `he/she/they`, `client/server/proxy` and
+ * `unit/integration/e2e` are all prose, and swallowing them DELETES words
+ * from the reply. Anything that is only a run of ordinary lowercase
+ * word-shaped segments is left for the downstream "word slash word" pass.
+ */
+function looksLikePath(m: string, segs: string[]): boolean {
+  if (/^(?:\/|\.{1,2}\/|~\/)/.test(m)) return true
+  const last = segs[segs.length - 1]!
+  if (/\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(last)) return true
+  // Every segment an ordinary lowercase word (letters, then optional digits)
+  // ⇒ prose, not a path.
+  return !segs.every((sg) => /^[a-z][a-z0-9]*$/.test(sg))
+}
+
 /** True when a path segment is worth speaking (a real name, not a blob). */
 function isSpeakableSegment(seg: string): boolean {
   if (!/[A-Za-z]/.test(seg)) return false
@@ -295,6 +313,7 @@ function speakPaths(input: string): string {
     const segs = m.split('/').filter((sg) => sg.length > 0)
     if (segs.length < 2) return m
     if (segs.every((sg) => /^\d+$/.test(sg))) return m
+    if (!looksLikePath(m, segs)) return m
     const last = segs[segs.length - 1]!
     return isSpeakableSegment(last) ? last : 'a path'
   })
@@ -395,10 +414,12 @@ export function normalizeForSpeech(input: string): string {
     /[\u{1F000}-\u{1FAFF}\u{1F1E6}-\u{1F1FF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{200D}\u{2B50}\u{3030}\u{303D}\u{3297}\u{3299}\u{24C2}]/gu,
     '',
   )
-  //    The shortcode body must START WITH A LETTER: without that guard the
-  //    pass ate the colons out of a clock timestamp (`14:30:46` → "14 46"),
-  //    which no time pass could then recover.
-  s = s.replace(/:([a-z][a-z0-9_+-]*):/gi, ' ')
+  //    Digit-bodied shortcodes are real (`:100:`, `:8ball:`,
+  //    `:1st_place_medal:`), so the body may start with a digit — the
+  //    timestamp protection is positional instead: the opening colon may not
+  //    follow a digit/colon and the closing colon may not precede a digit, so
+  //    the pass can never eat the colons out of `14:30:46`.
+  s = s.replace(/(?<![\w:]):([a-z0-9][a-z0-9_+-]*):(?!\d)/gi, ' ')
 
   // 1. Fenced code blocks first (```lang … ``` or ~~~ … ~~~) — drop the
   //    whole block before any inline processing can see its contents.
@@ -484,10 +505,12 @@ export function normalizeForSpeech(input: string): string {
   })
   //     Clock time HH:MM (24h ok) → spoken. Guarded by word boundaries so a
   //     ratio like "3:2" or a bare number isn't caught (needs 2-digit MM).
-  //     The (?!:?\d) guard skips HH:MM:SS entirely (parity with
+  //     The (?<![\d:]) / (?!:?\d) guards skip HH:MM:SS entirely (parity with
   //     normalizeForTts) — a half-spoken time with a dangling ":46" reads
-  //     worse than leaving the digits as-is.
-  s = s.replace(/\b([01]?\d|2[0-3]):([0-5]\d)(?!:?\d)/g, (m, hh, mm) => {
+  //     worse than leaving the digits as-is. The LOOKBEHIND is load-bearing:
+  //     without it the scan re-anchors INSIDE the timestamp (`09:00:00` →
+  //     "09:zero o'clock") because the trailing `00` is itself a legal HH:MM.
+  s = s.replace(/(?<![\d:])\b([01]?\d|2[0-3]):([0-5]\d)(?!:?\d)/g, (m, hh, mm) => {
     const h = Number(hh)
     const min = Number(mm)
     const hw = belowThousand(h)
@@ -502,7 +525,9 @@ export function normalizeForSpeech(input: string): string {
   //     the old "one dollar,000" misreading is impossible). The trailing
   //     lookahead bails on odd cents ("$5.203") and partial thousands
   //     ("$1,00") — the whole token is left unchanged rather than half-read.
-  s = s.replace(/\$(\d{1,3}(?:,\d{3})+|\d{1,9})(?:\.(\d{2}))?(?![\d,]|\.\d)/g, (m, dollarsRaw, cents) => {
+  //     The guard must NOT fire on an ordinary sentence comma ("$500, plus
+  //     tax") — only on a comma/period that STARTS another digit group.
+  s = s.replace(/\$(\d{1,3}(?:,\d{3})+|\d{1,9})(?:\.(\d{2}))?(?!\d|[.,]\d)/g, (m, dollarsRaw, cents) => {
     const dollars = Number(String(dollarsRaw).replace(/,/g, ''))
     const dw = numberToWords(dollars)
     if (!dw) return m
