@@ -8,7 +8,7 @@
  * injected side-effects so this runs without docker.
  */
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
@@ -39,6 +39,15 @@ import {
   ROLLOUT_PROBE_TIMEOUT_MS,
   type RolloutSpawnSync,
 } from "./rollout.js";
+import {
+  beginPinPersist,
+  commitPinPersist,
+  rollbackPinPersist,
+  hasPinJournal,
+  recoverPinJournal,
+  PIN_JOURNAL_MAX_AGE_MS,
+} from "./rollout-pin-journal.js";
+import { setReleasePinInConfig, getReleasePinFromConfig } from "./release-yaml.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
 describe("normalizeVersion", () => {
@@ -1102,6 +1111,219 @@ describe("executeRollout — phase emission", () => {
   });
 });
 
+// ── The durable pin must not outlive a roll that failed ──────────────────
+//
+// Before this, `planRollout` ordered `persist-pin` right after the canary
+// (hostd path) / first (host-shell path) and NOTHING reverted it when the
+// roll then failed at agent 5 of 12. From that moment the durable pin WAS
+// the broken version, so every later restart / crash-loop recreate /
+// reconcile / `docker compose up -d` converged the remaining agents onto a
+// build that demonstrably failed to boot.
+//
+// These tests assert the OUTCOME on a real config file — what does
+// `release.pin` say after the roll? — not that a hook was invoked.
+
+/**
+ * Deps wired to the REAL pin-journal implementation against a tmpdir config,
+ * mirroring `createRolloutDeps`'s persist/commit/revert triple.
+ */
+function pinHarness(opts: {
+  versions: Record<string, string | null>;
+  runStatus?: (args: string[]) => number;
+  initialPin?: string;
+}): {
+  deps: RolloutDeps;
+  configPath: string;
+  pin: () => string | undefined;
+  journalled: () => boolean;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "rollout-pin-"));
+  const configPath = join(dir, "switchroom.yaml");
+  writeFileSync(
+    configPath,
+    `telegram:\n  bot_token: x\nrelease:\n  pin: ${opts.initialPin ?? "v0.19.3"}\nagents:\n  clerk:\n    extends: default\n`,
+    "utf8",
+  );
+  const deps: RolloutDeps = {
+    run: (args) => ({ status: opts.runStatus ? opts.runStatus(args) : 0 }),
+    probeVersion: (agent) => opts.versions[agent] ?? null,
+    log: () => undefined,
+    hindsightExists: () => false,
+    persistPin: (p) => {
+      const before = readFileSync(configPath, "utf8");
+      const after = setReleasePinInConfig(before, p);
+      if (after === before) return;
+      beginPinPersist(configPath, p);
+      writeFileSync(configPath, after, "utf8");
+    },
+    commitPin: () => {
+      commitPinPersist(configPath);
+    },
+    revertPin: () => rollbackPinPersist(configPath).reverted,
+  };
+  return {
+    deps,
+    configPath,
+    pin: () => getReleasePinFromConfig(readFileSync(configPath, "utf8")),
+    journalled: () => hasPinJournal(configPath),
+  };
+}
+
+describe("executeRollout — durable pin is provisional until the roll is proven", () => {
+  const TARGET = "v0.19.4";
+  const FLEET = ["test-harness", "clerk", "marko", "nadia", "opal"];
+
+  it("REVERTS the pin when a non-canary agent fails past a green canary (hostd path)", () => {
+    // Canary + 2 agents green, then agent 4 comes back on the OLD version.
+    const h = pinHarness({
+      versions: {
+        "test-harness": "0.19.4",
+        clerk: "0.19.4",
+        marko: "0.19.4",
+        nadia: "0.19.3", // failed to boot the new build
+        opal: "0.19.4",
+      },
+    });
+    const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
+    // Sanity: the plan really does persist the pin BEFORE nadia is restarted.
+    expect(steps.findIndex((s) => s.kind === "persist-pin")).toBeLessThan(
+      steps.findIndex((s) => s.kind === "restart-agent" && s.agent === "nadia"),
+    );
+
+    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+
+    expect(r.ok).toBe(false);
+    expect(r.failedAgent).toBe("nadia");
+    expect(r.rolled).toEqual(["test-harness", "clerk", "marko"]);
+    // THE outcome: the durable pin does NOT name the failed build, so a later
+    // reconcile cannot pull opal (and the rest) onto it.
+    expect(h.pin()).toBe("v0.19.3");
+    expect(r.pinReverted).toBe(true);
+    expect(h.journalled()).toBe(false);
+    expect(r.warnings.join(" ")).toMatch(/REVERTED to the prior version/);
+  });
+
+  it("REVERTS the pin when the host-shell path (persist FIRST) fails at apply", () => {
+    // Worst case called out in the bug report: persist-pin is step 1, so a
+    // failed apply used to leave a broken pin with ZERO agents rolled.
+    const h = pinHarness({
+      versions: {},
+      runStatus: (args) => (args[0] === "apply" ? 1 : 0),
+    });
+    const steps = planRollout(FLEET, { pinToPersist: TARGET });
+    expect(steps[0]).toEqual({ kind: "persist-pin", pin: TARGET });
+
+    const r = executeRollout(steps, TARGET, h.deps);
+
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("apply");
+    expect(r.rolled).toEqual([]);
+    expect(h.pin()).toBe("v0.19.3");
+    expect(r.pinReverted).toBe(true);
+  });
+
+  it("REVERTS the pin when the hindsight refresh fails after every agent rolled", () => {
+    const h = pinHarness({
+      versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
+      runStatus: (args) => (args[0] === "memory" ? 1 : 0),
+    });
+    const deps: RolloutDeps = { ...h.deps, hindsightExists: () => true };
+    const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
+
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("refresh-hindsight");
+    expect(h.pin()).toBe("v0.19.3");
+    expect(r.pinReverted).toBe(true);
+  });
+
+  it("COMMITS the pin (and clears the journal) only when the whole roll succeeds", () => {
+    const h = pinHarness({
+      versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
+    });
+    const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
+
+    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+
+    expect(r.ok).toBe(true);
+    expect(r.rolled).toEqual(FLEET);
+    expect(h.pin()).toBe(TARGET);
+    expect(r.pinReverted).toBeUndefined();
+    // No journal left behind — a later hostd boot must NOT revert a proven roll.
+    expect(h.journalled()).toBe(false);
+  });
+
+  it("leaves the journal in place when a crash beats both commit and revert", () => {
+    // Model the SIGKILL case: the pin was persisted, then the process died —
+    // executeRollout never returned, so neither commit nor revert ran.
+    const h = pinHarness({ versions: {} });
+    h.deps.persistPin?.(TARGET);
+    expect(h.pin()).toBe(TARGET);
+    expect(h.journalled()).toBe(true);
+
+    // The crash-recovery net (hostd boot / next rollout) is stale-gated, so
+    // while the writer still looks live it deliberately declines — that gate
+    // is what stops a hostd restart mid-roll from reverting a running roll.
+    expect(recoverPinJournal(h.configPath)).toMatch(/still looks live/);
+    expect(h.pin()).toBe(TARGET);
+
+    // Once the journal ages out (the writer is gone / the roll is long over),
+    // the same net reverts it.
+    const note = recoverPinJournal(h.configPath, {
+      now: Date.now() + PIN_JOURNAL_MAX_AGE_MS + 1,
+    });
+    expect(note).toMatch(/reverted an UNCOMMITTED/);
+    expect(h.pin()).toBe("v0.19.3");
+  });
+
+  it("does not touch the pin when the roll never persisted one", () => {
+    // Target came from config.release.pin — nothing to persist, nothing to
+    // revert. A failure must not spuriously rewrite the config.
+    const h = pinHarness({
+      versions: { "test-harness": "0.19.3" },
+      initialPin: TARGET,
+    });
+    const steps = planRollout(["test-harness"], { hostdContext: true });
+    expect(steps.some((s) => s.kind === "persist-pin")).toBe(false);
+
+    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+
+    expect(r.ok).toBe(false);
+    expect(r.pinReverted).toBeUndefined();
+    expect(h.pin()).toBe(TARGET);
+  });
+
+  it("warns loudly when the pin was persisted but no revert hook is wired", () => {
+    const deps: RolloutDeps = {
+      run: () => ({ status: 0 }),
+      probeVersion: () => "0.0.1",
+      log: () => undefined,
+      persistPin: () => undefined,
+    };
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    expect(r.warnings.join(" ")).toMatch(/no revert hook was wired/);
+  });
+
+  it("carries pinReverted + timedOut across the hostd result sentinel", () => {
+    const line = encodeRolloutResultLine({
+      ok: false,
+      rolled: ["clerk"],
+      failedStep: "restart-agent",
+      failedAgent: "marko",
+      got: null,
+      timedOut: true,
+      pinReverted: true,
+      warnings: [],
+    });
+    const parsed = parseRolloutResultLine(line);
+    expect(parsed?.timedOut).toBe(true);
+    expect(parsed?.pinReverted).toBe(true);
+  });
+});
+
 // ── Timeouts: a wedged container must not hang the executor ──────────────
 //
 // `deps.run` (spawnSync of `switchroom <subcommand>`) and `deps.probeVersion`
@@ -1214,9 +1436,12 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
     // The whole point: the executor RETURNS. A returned failure is what lets
     // hostd's `.finally()` run and release `fleetMutationInFlight` — the
     // latch that a hung spawnSync stranded forever.
-    const { deps: base } = harness({ versions: { "test-harness": null } });
+    const h = pinHarness({
+      versions: { "test-harness": null },
+      runStatus: () => 0,
+    });
     const deps: RolloutDeps = {
-      ...base,
+      ...h.deps,
       run: (args) =>
         args[0] === "agent" ? { status: 1, timedOut: true } : { status: 0 },
     };
@@ -1235,11 +1460,22 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
   });
 
   it("marks an apply timeout as timedOut and stops before any restart", () => {
-    const { deps: base } = harness({ versions: {} });
+    const h = pinHarness({ versions: {} });
     const deps: RolloutDeps = {
-      ...base,
+      ...h.deps,
       run: (args) => (args[0] === "apply" ? { status: 1, timedOut: true } : { status: 0 }),
     };
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("apply");
+    expect(r.timedOut).toBe(true);
+    // And the provisional pin still got reverted.
+    expect(h.pin()).toBe("v0.19.3");
+  });
+
+  it("a timed-out apply stops the roll BEFORE any agent is restarted", () => {
+    const { deps } = harness({ versions: {} });
     const runs: string[][] = [];
     const r = executeRollout(planRollout(["clerk"]), TARGET, {
       ...deps,

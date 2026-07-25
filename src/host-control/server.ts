@@ -64,6 +64,8 @@ import {
   isVersionAssertable,
   type RolloutPhase,
 } from "../cli/rollout.js";
+import { recoverPinJournal } from "../cli/rollout-pin-journal.js";
+import { restoreComposeBackup } from "../cli/write-compose.js";
 import { SWITCHROOM_VERSION } from "../cli/resolve-version.js";
 import {
   needsSelfBump,
@@ -787,6 +789,51 @@ export class HostdServer {
 
   constructor(private opts: ServerOptions) {}
 
+  /**
+   * The live `switchroom.yaml` this daemon reads/writes. Mirrors the default
+   * pinned by the config-edit wire schema.
+   */
+  private hostdConfigPath(): string {
+    return this.opts.configPath ?? "/state/config/switchroom.yaml";
+  }
+
+  /**
+   * The FLEET compose file (not hostd's own). Same resolution as
+   * {@link imageRefsForDigestCapture} uses.
+   */
+  private fleetComposePath(): string {
+    return join(
+      this.opts.bindRoot ?? this.opts.homeDir,
+      ".switchroom",
+      "compose",
+      "docker-compose.yml",
+    );
+  }
+
+  /**
+   * Revert an UNCOMMITTED provisional `release.pin` left behind by a rollout
+   * that died before it could commit or revert its own write.
+   *
+   * The rollout child normally handles both outcomes itself (commit on
+   * success, revert on a clean failure), so this is purely the crash net:
+   * SIGKILL / OOM / hostd recreate between the pin write and the terminal.
+   * It is a no-op when no journal exists, which is why it's safe to call
+   * unconditionally at boot and on every rollout terminal.
+   *
+   * Never throws — a stranded lock or a failed boot would be worse than the
+   * stale pin it's fixing, so failures are reported and swallowed.
+   */
+  private recoverRolloutPinJournal(context: string): string | null {
+    let note: string | null = null;
+    try {
+      note = recoverPinJournal(this.hostdConfigPath());
+    } catch (e) {
+      note = `rollout pin journal recovery threw: ${(e as Error).message}`;
+    }
+    if (note) process.stderr.write(`hostd (${context}): ${note}\n`);
+    return note;
+  }
+
   /** Start listening on every configured agent's socket. */
   async start(): Promise<void> {
     const hostdDir = join(this.opts.homeDir, ".switchroom", "hostd");
@@ -813,6 +860,39 @@ export class HostdServer {
         `hostd: self-bump resume failed (non-fatal): ${(e as Error).message}\n`,
       );
     });
+
+    // Rollout pin-journal crash recovery. A roll that was SIGKILLed between
+    // its provisional `release.pin` write and the commit leaves a journal on
+    // disk; without this, the durable pin names a build that was never proven
+    // and EVERY later restart / crash-loop recreate / reconcile / `compose up
+    // -d` converges the rest of the fleet onto it. No-op when nothing is
+    // journalled.
+    //
+    // ORDERING, precisely: awaiting `resumePendingSelfBumpRollout()` above does
+    // NOT mean a resumed roll has finished. That path ends at `launchRollout`,
+    // which takes the fleet-mutation latch, calls `spawnRollout`, and returns
+    // SYNCHRONOUSLY — the roll then runs for minutes in a child process. So a
+    // journal seen here may well belong to a roll that is still running, and
+    // reverting it would fight a live roll (and could revert the pin of one
+    // that is about to succeed).
+    //
+    // Two independent guards, deliberately belt-and-braces:
+    //   1. the latch check below — if a resume is in flight, boot recovery is
+    //      skipped outright and that roll's own terminal handler runs recovery
+    //      when it finishes (see the rollout terminal `.finally()`);
+    //   2. `recoverPinJournal` is stale-gated regardless: it reverts only when
+    //      the journal's recorded pid is gone OR the journal has aged past
+    //      PIN_JOURNAL_MAX_AGE_MS, so even a journal from a roll hostd doesn't
+    //      know about (a host-shell `switchroom rollout`) is left alone while
+    //      it is plausibly live.
+    if (this.fleetMutationInFlight) {
+      process.stderr.write(
+        `hostd (boot): a rollout resumed at boot is still in flight — ` +
+          `deferring pin-journal recovery to its terminal handler.\n`,
+      );
+    } else {
+      this.recoverRolloutPinJournal("boot");
+    }
 
     const agentNames = Object.keys(this.opts.agentUids).sort();
     if (agentNames.length === 0) {
@@ -3947,6 +4027,18 @@ export class HostdServer {
         delete entry.prior_pin;
       })
       .finally(() => {
+        // Crash net for the durable pin. The rollout child commits its own
+        // provisional `release.pin` on success and reverts it on a clean
+        // failure, so a journal surviving to the TERMINAL means the child
+        // died in between (SIGKILL / OOM — the `result: "error"` rows with no
+        // sentinel). Reverting here, before the lock is released and before
+        // any other mutation can run, stops the next reconcile from
+        // converging the fleet onto a pin that was never proven. No-op in the
+        // normal case.
+        const pinNote = this.recoverRolloutPinJournal(
+          `rollout terminal ${entry.request_id}`,
+        );
+        if (pinNote) entry.stderr_tail = `${entry.stderr_tail ?? ""}\n${pinNote}`.trim();
         void this.writeTerminalAudit(entry);
         // KEN-131 — unattended (auto-update) roll that FAILED: no operator
         // is watching, so the hardened no-operator path runs instead of the
@@ -4100,13 +4192,34 @@ export class HostdServer {
       ["apply", "--pin", priorPin, "--compose-only", "--non-interactive"],
       { SWITCHROOM_HOSTD_CONTEXT: "1" },
     );
-    notes.push(
-      applyRes.exit_code === 0
-        ? `Rollback: compose restored to ${priorPin}.`
-        : `Rollback FAILED: compose restore to ${priorPin} exited ` +
-            `${applyRes.exit_code} — run \`switchroom apply\` host-side ` +
-            `(${tail(applyRes.stderr).trim().slice(-300) || "no stderr"}).`,
-    );
+    if (applyRes.exit_code === 0) {
+      notes.push(`Rollback: compose restored to ${priorPin}.`);
+    } else {
+      // Regeneration failed — fall back to the pre-version-bump compose
+      // backup. This is the FIRST real consumer of `<compose>.bak`; the
+      // write-side comment used to claim src/cli/update.ts rolled back to it,
+      // but no such code existed. With the backup rule fixed
+      // (shouldBackupCompose — a roll's per-agent restarts can no longer
+      // clobber it), the file genuinely holds the pre-roll compose.
+      //
+      // Strictly a FALLBACK behind `apply --pin`, and not "known good": the
+      // backup means "the last compose on a different image tag", which can
+      // predate config changes or hold a previously-failed build. It is
+      // service-set gated inside restoreComposeBackup — a backup that would
+      // drop or resurrect an agent is refused rather than applied blind.
+      const restore = await restoreComposeBackup(this.fleetComposePath());
+      notes.push(
+        `Rollback: compose regeneration to ${priorPin} exited ` +
+          `${applyRes.exit_code} ` +
+          `(${tail(applyRes.stderr).trim().slice(-300) || "no stderr"}). ` +
+          (restore.restored
+            ? `Fell back to the pre-bump compose backup (image tag ` +
+              `${restore.imageTag ?? "unknown"}). Verify host-side with ` +
+              `\`switchroom apply\`.`
+            : `Backup fallback ALSO failed (${restore.reason ?? "unknown"}) — ` +
+              `run \`switchroom apply\` host-side.`),
+      );
+    }
     if (entry.failed_step === "restart-agent" && entry.failed_agent) {
       const restartRes = await this.runSwitchroom(
         [

@@ -18,7 +18,23 @@
  * would fail validation.
  */
 
-import { parseDocument, isScalar } from "yaml";
+import { parseDocument, isScalar, isMap } from "yaml";
+
+/**
+ * Read the current `release.pin` out of a config's raw text, or undefined
+ * when unpinned / unparseable. Read-only companion to
+ * {@link setReleasePinInConfig}; used by the rollout pin journal to record
+ * which pin a provisional write is replacing.
+ */
+export function getReleasePinFromConfig(yamlText: string): string | undefined {
+  let v: unknown;
+  try {
+    v = parseDocument(yamlText).getIn(["release", "pin"]);
+  } catch {
+    return undefined;
+  }
+  return typeof v === "string" ? v : undefined;
+}
 
 /**
  * Return `yamlText` with `release.pin` set to `pin` (creating the `release`
@@ -56,5 +72,33 @@ export function setReleasePinInConfig(
     node.comment = ` ${now}: rolled by switchroom rollout`;
   }
 
+  return String(doc);
+}
+
+/**
+ * Return `yamlText` with `release.pin` REMOVED — the inverse of
+ * {@link setReleasePinInConfig}, used by the rollout pin journal to revert a
+ * provisional pin that was written for a roll that never proved out.
+ *
+ * Why this exists rather than restoring a saved copy of the whole file: the
+ * revert can run minutes (or, after a crash, hours) after the provisional
+ * write, and anything else may legitimately have edited the config in between
+ * — an operator adding an agent, a `config_propose_edit` landing, a vault
+ * reference changing. Restoring a byte-exact snapshot would silently discard
+ * all of it. A targeted edit touches exactly the key the rollout wrote and
+ * leaves every other change intact.
+ *
+ * Deleting an absent pin is a no-op, and an empty `release` block left behind
+ * is removed too (an empty mapping fails the ReleaseBlock refine). Returns
+ * `yamlText` unchanged when there is nothing to delete, so callers can call it
+ * unconditionally without churning the file's mtime.
+ */
+export function deleteReleasePinInConfig(yamlText: string): string {
+  const doc = parseDocument(yamlText);
+  if (!doc.hasIn(["release", "pin"])) return yamlText;
+  doc.deleteIn(["release", "pin"]);
+  const rel = doc.getIn(["release"]);
+  // `release: {}` is invalid per the schema refine — drop the husk.
+  if (isMap(rel) && rel.items.length === 0) doc.delete("release");
   return String(doc);
 }

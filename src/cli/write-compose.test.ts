@@ -9,7 +9,14 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
-import { writeComposeFile, resolveHostSwitchroomConfigPath } from "./write-compose.js";
+import {
+  writeComposeFile,
+  resolveHostSwitchroomConfigPath,
+  shouldBackupCompose,
+  restoreComposeBackup,
+  composeImageTag,
+  composeServiceNames,
+} from "./write-compose.js";
 
 function mkConfig(pin?: string): SwitchroomConfig {
   return {
@@ -185,5 +192,197 @@ describe("resolveHostSwitchroomConfigPath", () => {
     expect(content).toContain("/home/testop/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:ro");
     // Must NOT have the container path as source — that's the bug.
     expect(content).not.toContain("/state/config/switchroom.yaml:/state/config/switchroom.yaml:ro");
+  });
+});
+
+// ── The compose backup must survive a roll ───────────────────────────────
+//
+// The old rule backed up on EVERY write. But `writeComposeFile` runs on every
+// `agent restart` too (src/cli/agent.ts — the restart reconcile regenerates
+// the WHOLE-fleet compose), so during a staggered roll the FIRST agent's
+// restart backed up the pre-roll compose and the SECOND agent's restart
+// immediately overwrote that backup with the post-bump file. Verified on the
+// production host: `cmp docker-compose.yml docker-compose.yml.bak` matched,
+// 58803 bytes each, same mtime — zero recovery value. The write-side comment
+// also claimed src/cli/update.ts could roll back to it; no such code existed
+// (`grep -n '\.bak\|rollback\|revert' src/cli/update.ts` → nothing).
+
+describe("shouldBackupCompose", () => {
+  const at = (tag: string) => `services:\n  x:\n    image: ghcr.io/o/switchroom-agent:${tag}\n`;
+
+  it("skips the first-ever write (nothing to back up)", () => {
+    expect(shouldBackupCompose(null, at("v1.0.0"), null)).toBe(false);
+  });
+
+  it("backs up when the image tag is genuinely moving", () => {
+    expect(shouldBackupCompose(at("v1.0.0"), at("v1.0.1"), null)).toBe(true);
+    expect(shouldBackupCompose(at("v1.0.0"), at("v1.0.1"), "v0.9.0")).toBe(true);
+  });
+
+  it("does NOT clobber the backup on a no-op regeneration", () => {
+    // Agents 2..N of a roll all rewrite the same already-bumped compose.
+    expect(shouldBackupCompose(at("v1.0.1"), at("v1.0.1"), "v1.0.0")).toBe(false);
+  });
+
+  it("does NOT clobber a pre-bump backup with a same-version write", () => {
+    const prev = at("v1.0.1") + "# unrelated edit\n";
+    expect(shouldBackupCompose(prev, at("v1.0.1"), "v1.0.0")).toBe(false);
+  });
+
+  it("still creates a first backup for a tag-neutral edit when none exists", () => {
+    const prev = at("v1.0.1") + "# unrelated edit\n";
+    expect(shouldBackupCompose(prev, at("v1.0.1"), null)).toBe(true);
+  });
+});
+
+describe("compose backup across a simulated staggered roll", () => {
+  it("keeps .bak on the PRE-ROLL version after every agent restarts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-bak-"));
+    const composePath = join(dir, "docker-compose.yml");
+    const bak = composePath + ".bak";
+
+    // Fleet settled on v0.19.3 (an apply, then some restarts).
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+
+    // The roll: `apply --pin v0.19.4`, then one whole-fleet compose
+    // regeneration per agent restart (12 agents).
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    for (let i = 0; i < 12; i++) {
+      await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    }
+
+    expect(readFileSync(composePath, "utf8")).toContain("switchroom-agent:v0.19.4");
+    // THE outcome the old code got wrong: the backup is the PRE-ROLL compose,
+    // not a copy of the live one.
+    const bakContent = readFileSync(bak, "utf8");
+    expect(bakContent).toContain("switchroom-agent:v0.19.3");
+    expect(bakContent).not.toContain("switchroom-agent:v0.19.4");
+    expect(bakContent).not.toBe(readFileSync(composePath, "utf8"));
+    expect(composeImageTag(bakContent)).toBe("v0.19.3");
+  });
+
+  it("restoreComposeBackup actually puts the fleet back on the prior compose", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-restore-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+
+    const res = await restoreComposeBackup(composePath);
+
+    expect(res.restored).toBe(true);
+    expect(res.imageTag).toBe("v0.19.3");
+    expect(readFileSync(composePath, "utf8")).toContain("switchroom-agent:v0.19.3");
+    expect(readFileSync(composePath, "utf8")).not.toContain("switchroom-agent:v0.19.4");
+  });
+
+  it("restoreComposeBackup reports (never throws) when there is no backup", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-nobak-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    const res = await restoreComposeBackup(composePath);
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/no usable compose backup/);
+    // The live compose is untouched.
+    expect(readFileSync(composePath, "utf8")).toContain("switchroom-agent:v0.19.3");
+  });
+
+  it("refuses to restore an empty/truncated backup over a good compose", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-emptybak-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    writeFileSync(composePath + ".bak", "   \n", "utf8");
+    const res = await restoreComposeBackup(composePath);
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/empty/);
+    expect(readFileSync(composePath, "utf8")).toContain("switchroom-agent:v0.19.3");
+  });
+
+  it("REFUSES a backup that predates an agent being added", async () => {
+    // The backup is deliberately preserved across many writes, so it can be
+    // arbitrarily old. Restoring one generated before `archivist` existed
+    // would silently delete a live agent's service — worse than the bad
+    // compose it is replacing.
+    const dir = mkdtempSync(join(tmpdir(), "wc-drift-add-"));
+    const composePath = join(dir, "docker-compose.yml");
+    const twoAgents = {
+      telegram: { bot_token: "x", forum_chat_id: "-100" },
+      release: { pin: "v0.19.4" },
+      agents: { clerk: { extends: "default" }, archivist: { extends: "default" } },
+    } as unknown as SwitchroomConfig;
+
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: twoAgents, composePath, switchroomConfigPath: undefined });
+
+    const live = readFileSync(composePath, "utf8");
+    expect(composeServiceNames(live)).toContain("agent-archivist");
+
+    const res = await restoreComposeBackup(composePath);
+
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/does not match the current fleet/);
+    expect(res.reason).toMatch(/missing: agent-archivist/);
+    // THE outcome: the live compose is untouched, so no agent is dropped.
+    expect(readFileSync(composePath, "utf8")).toBe(live);
+  });
+
+  it("refuses a backup carrying a service the fleet no longer has", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-drift-rm-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    // Backup names a retired agent.
+    writeFileSync(
+      composePath + ".bak",
+      readFileSync(composePath, "utf8").replace(/^services:$/m, "services:\n  retired:\n    image: x"),
+      "utf8",
+    );
+    const res = await restoreComposeBackup(composePath);
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/unknown: retired/);
+  });
+
+  it("force bypasses the coherence gate for a deliberate operator restore", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-force-"));
+    const composePath = join(dir, "docker-compose.yml");
+    const twoAgents = {
+      telegram: { bot_token: "x", forum_chat_id: "-100" },
+      release: { pin: "v0.19.4" },
+      agents: { clerk: { extends: "default" }, archivist: { extends: "default" } },
+    } as unknown as SwitchroomConfig;
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: twoAgents, composePath, switchroomConfigPath: undefined });
+
+    const res = await restoreComposeBackup(composePath, { force: true });
+
+    expect(res.restored).toBe(true);
+    expect(res.imageTag).toBe("v0.19.3");
+  });
+
+  it("still restores when the fleet is unchanged (the gate is not a blanket refusal)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-same-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    const res = await restoreComposeBackup(composePath);
+    expect(res.restored).toBe(true);
+    expect(res.imageTag).toBe("v0.19.3");
+  });
+
+  it("composeServiceNames reads only top-level service keys", () => {
+    const text = [
+      "version: '3'",
+      "services:",
+      "  clerk:",
+      "    image: x",
+      "    environment:",
+      "      foo: bar",
+      "  # a comment",
+      "  archivist:",
+      "    image: y",
+      "volumes:",
+      "  data:",
+    ].join("\n");
+    expect(composeServiceNames(text)).toEqual(["clerk", "archivist"]);
+    expect(composeServiceNames("garbage")).toEqual([]);
   });
 });

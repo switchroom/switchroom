@@ -48,6 +48,12 @@ import { homedir } from "node:os";
 import type { Command } from "commander";
 import { getConfig, getConfigPath } from "./helpers.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
+import {
+  beginPinPersist,
+  commitPinPersist,
+  rollbackPinPersist,
+  recoverPinJournal,
+} from "./rollout-pin-journal.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
@@ -400,8 +406,26 @@ export interface RolloutDeps {
    * preserving, atomic, ownership-restoring). Only invoked for a
    * `persist-pin` step. Optional so callers that never persist (and tests)
    * can omit it.
+   *
+   * PROVISIONAL by contract: the production implementation journals the
+   * prior config text first (see rollout-pin-journal.ts), so the write is
+   * only durable once {@link RolloutDeps.commitPin} runs. The executor calls
+   * {@link RolloutDeps.revertPin} on every failure path after this ran.
    */
   persistPin?(pin: string): void;
+  /**
+   * Mark the provisional pin write durable. Called EXACTLY ONCE, at the very
+   * end of a fully successful roll. Optional (a caller with no persistPin
+   * has nothing to commit).
+   */
+  commitPin?(): void;
+  /**
+   * Revert a provisional pin write. Called on every failure return after a
+   * `persist-pin` step ran, so a roll that fails at agent 5 of 12 cannot
+   * leave the durable pin naming a build that failed to boot. Returns true
+   * when a pin was actually reverted (for the operator-facing warning).
+   */
+  revertPin?(): boolean;
   /**
    * Probe whether the standalone `switchroom-hindsight` container exists on
    * this host (the `refresh-hindsight` step no-ops cleanly when it doesn't).
@@ -435,6 +459,12 @@ export interface RolloutResult {
    * was killed. Distinguishes "the build is bad" from "the fleet is wedged".
    */
   timedOut?: boolean;
+  /**
+   * True when a provisional `release.pin` write was rolled back because this
+   * roll failed. Surfaced so the operator knows the durable pin still names
+   * the PRIOR (working) version.
+   */
+  pinReverted?: boolean;
   /** Non-fatal warnings (e.g. web/hostd refresh failures). */
   warnings: string[];
 }
@@ -540,6 +570,7 @@ export function encodeRolloutResultLine(result: RolloutResult): string {
       ...(result.failedAgent ? { failedAgent: result.failedAgent } : {}),
       ...(result.got !== undefined ? { got: result.got } : {}),
       ...(result.timedOut ? { timedOut: true } : {}),
+      ...(result.pinReverted ? { pinReverted: true } : {}),
       warnings: result.warnings,
     })
   );
@@ -557,6 +588,7 @@ export function parseRolloutResultLine(
   failedAgent?: string;
   got?: string | null;
   timedOut?: boolean;
+  pinReverted?: boolean;
   warnings: string[];
 } | null {
   const lines = stdout.split("\n");
@@ -616,6 +648,59 @@ export function executeRollout(
   const totalAgents = steps.filter((s) => s.kind === "restart-agent").length;
   let agentIndex = 0;
 
+  // Set once the `persist-pin` step ran. Every failure return below goes
+  // through `fail()`, which reverts that provisional write — a roll that dies
+  // at agent 5 of 12 must NOT leave the durable pin naming the build that
+  // just failed to boot, because every later restart/reconcile/`compose up`
+  // reads that pin and converges the rest of the fleet onto it.
+  let pinPersisted = false;
+
+  /**
+   * Single exit point for every stop-the-roll failure. Reverting the pin
+   * here (rather than at each `return`) is what makes the guarantee
+   * structural: a future failure branch cannot forget to revert.
+   */
+  const fail = (partial: Omit<RolloutResult, "ok" | "rolled" | "warnings">): RolloutResult => {
+    let pinReverted = false;
+    if (pinPersisted && deps.revertPin) {
+      try {
+        pinReverted = deps.revertPin();
+      } catch (e) {
+        warnings.push(
+          `FAILED to revert the provisional release.pin after a failed roll: ` +
+            `${(e as Error).message}. Check \`release.pin\` in switchroom.yaml ` +
+            `host-side BEFORE the next reconcile — it may name a build that ` +
+            `failed to boot.`,
+        );
+      }
+      if (pinReverted) {
+        deps.log(
+          `  ↩ reverted the provisional release.pin — the durable pin still ` +
+            `names the prior version`,
+        );
+        warnings.push(
+          `The roll failed after the durable pin had been written, so the ` +
+            `provisional \`release.pin\` was REVERTED to the prior version. ` +
+            `Agents already rolled stay on the target until they next restart; ` +
+            `the rest of the fleet will not converge onto the failed build.`,
+        );
+      }
+    } else if (pinPersisted && !deps.revertPin) {
+      warnings.push(
+        `The roll failed after \`release.pin\` was persisted but no revert ` +
+          `hook was wired — the durable pin may still name the failed build. ` +
+          `Verify switchroom.yaml host-side.`,
+      );
+    }
+    return {
+      ok: false,
+      rolled,
+      warnings,
+      ...partial,
+      ...(pinReverted ? { pinReverted: true } : {}),
+    };
+  };
+
   for (const step of steps) {
     switch (step.kind) {
       case "persist-pin": {
@@ -625,6 +710,10 @@ export function executeRollout(
         deps.log(`ROLL_STEP persist-pin — release.pin=${step.pin} to switchroom.yaml`);
         if (deps.persistPin) {
           deps.persistPin(step.pin);
+          // Provisional from here on: `fail()` reverts it, and the success
+          // path below commits it. Set AFTER the call so a throwing
+          // persistPin doesn't leave us claiming a write that never landed.
+          pinPersisted = true;
         } else {
           warnings.push(`persist-pin requested but no persist hook wired; pin NOT durable`);
         }
@@ -662,13 +751,7 @@ export function executeRollout(
                 `killed. The roll stopped cleanly rather than hanging.`,
             );
           }
-          return {
-            ok: false,
-            rolled,
-            failedStep: "apply",
-            ...(r.timedOut ? { timedOut: true } : {}),
-            warnings,
-          };
+          return fail({ failedStep: "apply", ...(r.timedOut ? { timedOut: true } : {}) });
         }
         if (execOpts.hostdContext) {
           // SURFACED (not hidden): --compose-only skipped the host-side
@@ -786,15 +869,20 @@ export function executeRollout(
               ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
               : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
           );
-          return {
-            ok: false,
-            rolled,
+          // Through `fail()`, not a bare literal: this branch is a
+          // stop-the-roll failure like any other, and by the time a restart
+          // can time out the `persist-pin` step has already written the
+          // provisional durable pin. Returning directly would leave
+          // `release.pin` naming the build that just wedged a container —
+          // which every later restart/reconcile/`compose up` would then
+          // converge the rest of the fleet onto. The single exit point is
+          // what makes that guarantee structural rather than remembered.
+          return fail({
             failedStep: "restart-agent",
             failedAgent: step.agent,
             got: gotAfterKill,
             timedOut: true,
-            warnings,
-          };
+          });
         }
         const got = deps.probeVersion(step.agent);
         if (got === null || normalizeVersion(got) !== targetNorm) {
@@ -806,9 +894,7 @@ export function executeRollout(
               ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
               : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
           );
-          return {
-            ok: false,
-            rolled,
+          return fail({
             failedStep: "restart-agent",
             failedAgent: step.agent,
             got,
@@ -819,8 +905,7 @@ export function executeRollout(
             // hostd (and `get_status`) distinguish "killed mid-flight,
             // grandchildren may be live" from "ran to completion, wrong
             // version" — they need different operator recovery.
-            warnings,
-          };
+          });
         }
         rolled.push(step.agent);
         deps.log(`  ✓ ${step.agent} → ${got}`);
@@ -948,13 +1033,10 @@ export function executeRollout(
               `recreate stopped + removed the old container before the failed ` +
               `start). Run \`switchroom memory setup\` to bring it back. — STOPPING`,
           );
-          return {
-            ok: false,
-            rolled,
+          return fail({
             failedStep: "refresh-hindsight",
             ...(r.timedOut ? { timedOut: true } : {}),
-            warnings,
-          };
+          });
         }
         break;
       }
@@ -966,6 +1048,20 @@ export function executeRollout(
         }
         break;
       }
+    }
+  }
+  // The roll is PROVEN — every agent came back on the target and no fatal
+  // step failed. Only now does the provisional pin become durable: commit
+  // clears the crash-recovery journal, so a later hostd boot won't revert it.
+  if (pinPersisted && deps.commitPin) {
+    try {
+      deps.commitPin();
+    } catch (e) {
+      warnings.push(
+        `roll succeeded but committing the durable release.pin threw: ` +
+          `${(e as Error).message}. The pin IS written; a stale rollout ` +
+          `journal may cause a later boot to revert it — verify host-side.`,
+      );
     }
   }
   return { ok: true, rolled, warnings };
@@ -1364,11 +1460,39 @@ export function createRolloutDeps(params: {
       const before = readFileSync(configPath, "utf8");
       const after = setReleasePinInConfig(before, pin);
       if (after === before) return; // idempotent no-op
+      // PROVISIONAL WRITE. Journal the pin (and the pin it replaces) FIRST so
+      // it can be reverted both on a clean failure (revertPin below) and after
+      // a crash (recoverPinJournal at hostd boot / next rollout). Without
+      // this, a roll that fails at agent 5 of 12 leaves the durable pin naming
+      // the failed build and every later reconcile converges the rest of the
+      // fleet onto it.
+      beginPinPersist(configPath, pin);
       writeConfigPreservingOwnership(
         configPath,
         after,
         statSync(configPath).mode & 0o777,
       );
+    },
+    commitPin: () => {
+      const err = commitPinPersist(configPath);
+      if (err) warn(`\u26a0\ufe0f  ${err}\n`);
+    },
+    revertPin: () => {
+      // requireStale is deliberately FALSE here: this caller IS the process
+      // that wrote the provisional pin and it knows the roll has failed, so
+      // the liveness gate (which exists for concurrent recovery sites) would
+      // only ever refuse a revert we are certain about.
+      const outcome = rollbackPinPersist(configPath, {
+        writeConfig: writeConfigPreservingOwnership,
+        warn,
+      });
+      if (outcome.error) {
+        warn(
+          `⚠️  rollout: FAILED to revert the provisional release.pin=` +
+            `${outcome.pin}: ${outcome.error}\n`,
+        );
+      }
+      return outcome.reverted;
     },
   };
 }
@@ -1404,6 +1528,16 @@ export function registerRolloutCommand(program: Command): void {
     )
     .option("--dry-run", "Print the plan and exit without changing anything.")
     .action(async (opts: { pin?: string; agents?: string; skipWeb?: boolean; allowDowngrade?: boolean; dryRun?: boolean }) => {
+      // Crash recovery (host-shell path). A previous roll that was SIGKILLed
+      // between the provisional `release.pin` write and its commit leaves a
+      // journal on disk; revert it BEFORE reading the config, so this roll
+      // (and the downgrade guard's "current pin" comparison) sees the last
+      // PROVEN pin rather than an unproven one. No-op when no journal exists.
+      // Skipped under --dry-run, which changes nothing by contract.
+      if (!opts.dryRun) {
+        const note = recoverPinJournal(getConfigPath(program));
+        if (note) process.stderr.write(`⚠️  ${note}\n`);
+      }
       const config = getConfig(program);
       // #2492 — when --allow-downgrade is set but no --pin was given, default
       // the target to the last completed rollout's prior_pin (the version that

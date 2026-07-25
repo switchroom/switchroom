@@ -389,20 +389,246 @@ export async function computeComposeContent(
   return { content, imageTag, previous, previousImageTag };
 }
 
+/** Suffix of the compose backup file. */
+export const BACKUP_SUFFIX = ".bak";
+
+/** Absolute path of the compose backup for a given compose path. */
+export function composeBackupPath(composePath: string): string {
+  return composePath + BACKUP_SUFFIX;
+}
+
+/** Extract the agent image tag from compose text (null when absent). */
+export function composeImageTag(content: string | null): string | null {
+  if (!content) return null;
+  return AGENT_IMAGE_TAG_RE.exec(content)?.[1] ?? null;
+}
+
+/** Read the agent image tag currently recorded in the backup, or null. */
+async function readBackupImageTag(composePath: string): Promise<string | null> {
+  try {
+    return composeImageTag(await readFile(composeBackupPath(composePath), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Should this compose write refresh `<composePath>.bak`?
+ *
+ * ## Why this is not "always"
+ *
+ * The old rule was "copy the previous file every time", which produced a
+ * backup with ZERO recovery value:
+ *
+ *   - `writeComposeFile` runs on EVERY `agent restart`, not just `apply`
+ *     (`src/cli/agent.ts` — the restart reconcile regenerates the WHOLE-fleet
+ *     compose). A staggered roll restarts agents one at a time, so the FIRST
+ *     agent's restart backed up the pre-roll compose and the SECOND agent's
+ *     restart immediately overwrote that backup with the new (post-bump)
+ *     file. By agent 3 of 12 the "backup" was byte-identical to the live
+ *     compose — verified on the production host: `cmp docker-compose.yml
+ *     docker-compose.yml.bak` matched, same size, same mtime.
+ *   - Which is why the operator ended up hand-rolling 27 `docker-compose.yml
+ *     .bak-*` files: the built-in backup never held anything they could go
+ *     back to.
+ *
+ * ## The rule
+ *
+ * `.bak` is defined as *the last compose generated on a different agent image
+ * tag than the current one* — i.e. the pre-version-bump compose, which is the
+ * only thing worth rolling back to when a roll produces a bad compose.
+ *
+ * 1. No previous file (first-ever write) → nothing to back up.
+ * 2. Previous === next (a no-op regeneration, e.g. agents 2..N of a roll all
+ *    rewriting the same already-bumped whole-fleet compose) → keep the older
+ *    backup. This alone kills the mid-roll clobber.
+ * 3. Previous is ALREADY on the tag we're about to write, and a backup
+ *    already exists → the version bump happened on an earlier write; keep
+ *    that pre-bump backup rather than replacing it with a same-version one.
+ * 4. Otherwise (the tag is genuinely changing, or there is no backup yet) →
+ *    take the backup.
+ *
+ * ## What `.bak` is NOT
+ *
+ * It is **"the last compose on a different agent image tag"**, which is not
+ * the same claim as **"a compose known to work"**. Nothing here health-checks
+ * the previous file. Two cases where the distinction bites:
+ *
+ *   - roll v1 → v2 fails, leaving `.bak` = v1 (good). A second roll v2 → v3
+ *     then backs up the v2 compose, so `.bak` now holds the compose of the
+ *     build that just failed. The pre-bump copy from the FIRST roll is gone.
+ *   - an operator hand-edits a broken compose and applies; the tag moved, so
+ *     the broken file becomes the backup on the next bump.
+ *
+ * This is why {@link restoreComposeBackup} is a best-effort FALLBACK behind
+ * `apply --pin <priorPin>` (which regenerates from config and is authoritative)
+ * rather than a primary rollback, and why it refuses a backup whose service
+ * set no longer matches the fleet. Making `.bak` mean "known good" needs a
+ * post-roll health signal to gate the backup on — a separate change, filed
+ * rather than half-implemented here.
+ *
+ * Pure + exported so the clobber case is asserted in tests without docker.
+ */
+export function shouldBackupCompose(
+  previous: string | null,
+  next: string,
+  existingBackupTag: string | null,
+): boolean {
+  if (previous === null) return false; // (1)
+  if (previous === next) return false; // (2)
+  const prevTag = composeImageTag(previous);
+  const nextTag = composeImageTag(next);
+  // (3) — only skip when we actually HAVE a backup to protect and the tag
+  // isn't moving; otherwise a tag-neutral edit on a fresh host would never
+  // create a backup at all.
+  if (existingBackupTag !== null && prevTag !== null && prevTag === nextTag) return false;
+  return true; // (4)
+}
+
+/**
+ * Top-level service names declared in compose text, in file order.
+ *
+ * Deliberately a shallow scan rather than a YAML parse: this runs on recovery
+ * paths where a partially-corrupt file must degrade to "no services found"
+ * (→ refuse the restore) instead of throwing. Service keys are emitted by the
+ * generator at exactly one indent level under `services:`.
+ */
+export function composeServiceNames(content: string): string[] {
+  const names: string[] = [];
+  let inServices = false;
+  let indent: number | null = null;
+  for (const raw of content.split("\n")) {
+    if (/^\s*(#|$)/.test(raw)) continue;
+    const lead = raw.length - raw.trimStart().length;
+    if (!inServices) {
+      if (/^services:\s*$/.test(raw)) inServices = true;
+      continue;
+    }
+    if (lead === 0) break; // left the services block
+    if (indent === null) indent = lead;
+    if (lead !== indent) continue; // nested key, not a service
+    const m = /^([A-Za-z0-9_.-]+):\s*$/.exec(raw.trim());
+    if (m) names.push(m[1]!);
+  }
+  return names;
+}
+
+/** Outcome of a {@link restoreComposeBackup} attempt. */
+export interface ComposeRestoreResult {
+  restored: boolean;
+  /** The agent image tag the restored compose carries (when restored). */
+  imageTag?: string | null;
+  /** Why the restore did not happen / failed. */
+  reason?: string;
+}
+
+/**
+ * Restore `<composePath>.bak` over `<composePath>`.
+ *
+ * This is the consumer the backup existed for. Before this, the write-side
+ * comment claimed "the health-gated recreate (src/cli/update.ts) can roll
+ * back to" the `.bak` — but no such rollback existed anywhere in
+ * `src/cli/update.ts` (`grep -n '\.bak\|rollback\|revert'` → nothing). The
+ * comment described a mechanism that was never built; this function is that
+ * mechanism.
+ *
+ * ## Coherence gate
+ *
+ * A backup is only "last known good" for the fleet it was generated FOR. It
+ * can be arbitrarily old (rule 3 in {@link shouldBackupCompose} deliberately
+ * preserves the pre-bump copy across many writes), so the config may have
+ * gained or lost agents since. Restoring it then would silently remove a live
+ * agent's service — a far worse outcome than the bad compose it's replacing.
+ *
+ * So the restore refuses when the backup's service set differs from the
+ * service set in the compose currently on disk (which the last write generated
+ * from the live config). `opts.expectedServices` overrides that source when
+ * the caller has the config's own view; `opts.force` bypasses the gate for an
+ * operator who has looked at the diff and wants it anyway.
+ *
+ * Uses the same tmp+rename swap as the forward write so a crash mid-restore
+ * can't leave a truncated compose. Never throws — callers are recovery paths
+ * where a throw is worse than a reported failure.
+ */
+export async function restoreComposeBackup(
+  composePath: string,
+  opts: { expectedServices?: string[]; force?: boolean } = {},
+): Promise<ComposeRestoreResult> {
+  const bak = composeBackupPath(composePath);
+  let content: string;
+  try {
+    content = await readFile(bak, "utf8");
+  } catch (e) {
+    return { restored: false, reason: `no usable compose backup at ${bak} (${(e as Error).message})` };
+  }
+  if (content.trim() === "") {
+    return { restored: false, reason: `compose backup at ${bak} is empty` };
+  }
+
+  if (!opts.force) {
+    let expected = opts.expectedServices;
+    if (!expected) {
+      try {
+        expected = composeServiceNames(await readFile(composePath, "utf8"));
+      } catch {
+        expected = undefined; // nothing live to compare against
+      }
+    }
+    if (expected && expected.length > 0) {
+      const have = composeServiceNames(content);
+      const missing = expected.filter((s) => !have.includes(s));
+      const extra = have.filter((s) => !expected.includes(s));
+      if (missing.length > 0 || extra.length > 0) {
+        return {
+          restored: false,
+          reason:
+            `compose backup at ${bak} does not match the current fleet ` +
+            `(missing: ${missing.join(", ") || "none"}; ` +
+            `unknown: ${extra.join(", ") || "none"}). Refusing to restore — it ` +
+            `predates a config change and would drop or resurrect services. ` +
+            `Re-run \`switchroom apply\` against the intended release instead.`,
+        };
+      }
+    }
+  }
+
+  try {
+    const tmpPath = composePath + ".restore.tmp";
+    await writeFile(tmpPath, content, { encoding: "utf8", mode: 0o600 });
+    await rename(tmpPath, composePath);
+  } catch (e) {
+    return { restored: false, reason: `restore write failed: ${(e as Error).message}` };
+  }
+  const operatorUid = resolveOperatorUid();
+  if (operatorUid !== undefined && process.geteuid?.() === 0) {
+    try {
+      chownSync(composePath, operatorUid, operatorUid);
+    } catch {
+      /* best-effort — matches the forward write's tolerance */
+    }
+  }
+  return { restored: true, imageTag: composeImageTag(content) };
+}
+
 /** Generate the compose content and write it (mode 0600). Always writes — same as apply. */
 export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteComposeResult> {
   const { content, imageTag, previous, previousImageTag } = await computeComposeContent(opts);
   const operatorUid = resolveOperatorUid();
 
   await mkdir(dirname(opts.composePath), { recursive: true });
-  // Last-known-good backup + atomic write. If a deploy regenerates a bad
-  // compose, `<composePath>.bak` is the prior file the health-gated recreate
-  // (src/cli/update.ts) can roll back to. tmp+rename makes the swap atomic so a
-  // crash mid-write never leaves a truncated compose. Backup only when the
-  // prior content actually parsed as a real file (skip first-ever-write).
-  if (previous !== null) {
+  // Pre-version backup + atomic write. `<composePath>.bak` holds the last
+  // compose generated on a DIFFERENT agent image tag than the one being
+  // written — see {@link shouldBackupCompose} for why the previous
+  // "always copy" rule made the backup worthless. NOTE it means exactly
+  // "last compose on a different tag", NOT "known good" — see the caveats on
+  // {@link shouldBackupCompose}. Restored by {@link restoreComposeBackup}
+  // (hostd's failed-auto-roll recovery falls back to it, service-set gated,
+  // only when regenerating compose on the prior pin fails).
+  // tmp+rename makes the swap atomic so a crash mid-write never leaves a
+  // truncated compose.
+  if (shouldBackupCompose(previous, content, await readBackupImageTag(opts.composePath))) {
     try {
-      await copyFile(opts.composePath, opts.composePath + ".bak");
+      await copyFile(opts.composePath, composeBackupPath(opts.composePath));
     } catch {
       /* best-effort backup — never block the write */
     }
