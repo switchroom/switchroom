@@ -28,7 +28,7 @@ function killedUserTurn(over: Partial<FallbackTeardownNoticeInput> = {}): Fallba
     tearsDownLiveTurn: true,
     role: 'user',
     finalAnswerDelivered: false,
-    otherTextSent: false,
+    userAddressedTextDelivered: false,
     representWillFollow: true,
     silenceMs: 302_000,
     ...over,
@@ -51,7 +51,7 @@ describe('#3551 — a fire that ends a user turn is never silent', () => {
     // formatter yields nothing; before the fix, that meant the whole fire was
     // user-invisible.
     expect(formatFrameworkFallbackText('working', 302_000, [], false)).toBeNull()
-    expect(decideFallbackTeardownNotice(killedUserTurn({ otherTextSent: false })).send).toBe(true)
+    expect(decideFallbackTeardownNotice(killedUserTurn({ userAddressedTextDelivered: false })).send).toBe(true)
   })
 
   it('derives the minute count from the real silence, not the nominal threshold', () => {
@@ -72,9 +72,9 @@ describe('#3551 — a fire that ends a user turn is never silent', () => {
 })
 
 describe('#3551 — the gates that keep this from becoming the retired stall ping', () => {
-  it('stays quiet when the approval re-ping (or update-status line) already spoke', () => {
-    const d = decideFallbackTeardownNotice(killedUserTurn({ otherTextSent: true }))
-    expect(d).toEqual({ send: false, reason: 'other-text-sent' })
+  it('stays quiet when a delivered approval re-ping already addressed the user', () => {
+    const d = decideFallbackTeardownNotice(killedUserTurn({ userAddressedTextDelivered: true }))
+    expect(d).toEqual({ send: false, reason: 'user-addressed-text-delivered' })
   })
 
   it('stays quiet on a late fire that tore down nothing', () => {
@@ -121,5 +121,42 @@ describe('#3551 — wiring: the teardown path actually sends the notice', () => 
 
   it('sends the notice LOUD — a killed question is not a silent status surface', () => {
     expect(fallbackBody).toMatch(/sendSilenceText\(fbChatId, ctx\.threadId \?\? null, teardownNotice\.text, false\)/)
+  })
+})
+
+describe('#3551 L1/L2 — the suppression signal is narrow, and means DELIVERED', () => {
+  // L1. `text` in onFrameworkFallback has TWO sources. Treating them alike
+  // reproduced the very bug #3551 closes: user asks something during an
+  // `update_apply`, gets no answer, the fallback emits a SILENT status line
+  // about the update, the turn is torn down — and the notice was suppressed as
+  // "other text sent". Silent kill, again.
+  it('a silent, unrelated update-status line does NOT buy silence — that IS the #3551 case', () => {
+    const d = decideFallbackTeardownNotice(killedUserTurn({ userAddressedTextDelivered: false }))
+    expect(d.send).toBe(true)
+  })
+
+  const src = readFileSync(join(__dirname, '..', 'gateway', 'liveness-wiring.ts'), 'utf8')
+  const fallbackBody = src.slice(src.indexOf('onFrameworkFallback:'))
+
+  it('the wiring feeds the decider the DELIVERY flag, never `text != null`', () => {
+    // The regression this pins: reverting to `otherTextSent: text != null`
+    // silently re-couples the silent status line (L1) and the failed send (L2).
+    expect(fallbackBody).toMatch(/userAddressedTextDelivered,/)
+    expect(fallbackBody).not.toMatch(/otherTextSent:\s*text != null/)
+  })
+
+  it('L2 — the flag is set only AFTER a successful send, inside the try', () => {
+    // A throwing approval re-ping must not buy silence: the catch only logs, so
+    // assigning before/outside the await would leave the user with nothing at
+    // all while the turn was torn down.
+    expect(fallbackBody).toMatch(
+      /await sendSilenceText\(ctx\.chatId[^\n]*\n\s*userAddressedTextDelivered = blockedOnApproval/,
+    )
+    // and it is initialised false, so the catch path leaves it false
+    expect(fallbackBody).toMatch(/let userAddressedTextDelivered = false/)
+  })
+
+  it('L1 — the flag is gated on blockedOnApproval, which is what makes it user-addressed', () => {
+    expect(fallbackBody).toMatch(/userAddressedTextDelivered = blockedOnApproval/)
   })
 })

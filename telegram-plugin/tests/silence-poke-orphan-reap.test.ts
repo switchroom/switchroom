@@ -14,6 +14,8 @@
  * unaffected), not merely that the code path runs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 import {
   startTurn,
   noteOutbound,
@@ -92,15 +94,17 @@ describe('#3552 silence-poke orphan reap', () => {
     expect(f.emitted.some((e) => e.kind === 'silence_poke_orphan_reaped')).toBe(false)
   })
 
-  it('does NOT reap a live turn that merely released its buffer gate mid-turn', () => {
-    // `releaseTurnBufferGate` clears `activeTurnStartedAt` on every final-answer
-    // reply while the turn keeps running. The production predicate ANDs that
-    // with "no current turn", so the key stays live here — silence-poke must
-    // keep watching the post-answer housekeeping work.
+  it('the stubbed-live case: state survives while the predicate reports live (rule only, NOT the predicate)', () => {
+    // NAMING IS DELIBERATE. This test stubs `isTurnLive`, so it asserts the
+    // silence-poke RULE ("never reap a key the predicate calls live") and
+    // nothing about the production predicate itself — it would pass identically
+    // against a wrong predicate. The predicate is covered separately below, in
+    // '#3552 — the production isTurnLive predicate'; do not read this one as
+    // coverage of the buffer-gate near-miss.
     const f = setup()
     f.live.add(KEY)
     startTurn(KEY, 0)
-    noteOutbound(KEY, 1_000) // the final answer landed; gate released, turn alive
+    noteOutbound(KEY, 1_000)
     __tickForTests(60_000)
     expect(__getStateForTests(KEY)).toBeDefined()
     expect(f.emitted.some((e) => e.kind === 'silence_poke_orphan_reaped')).toBe(false)
@@ -128,5 +132,68 @@ describe('#3552 silence-poke orphan reap', () => {
     __tickForTests(10_000)
     expect(__getStateForTests(KEY)).toBeDefined()
     expect(f.emitted.some((e) => e.kind === 'silence_poke_orphan_reaped')).toBe(false)
+  })
+})
+
+describe('#3552 — the production isTurnLive predicate', () => {
+  // The highest-blast-radius line in this PR is the predicate wired at
+  // liveness-wiring.ts, and every behavioural test above STUBS it. A false reap
+  // is permanent and silent — nothing re-arms until the next `startTurn` — so
+  // the predicate gets its own coverage: a structural pin on the real source
+  // (the technique this repo already uses for gateway-resident callbacks that
+  // cannot be instantiated in a unit test), plus a behavioural model of the two
+  // gateway maps it reads.
+  const src = readFileSync(join(__dirname, '..', 'gateway', 'liveness-wiring.ts'), 'utf8')
+  const KEY = '-100999:11'
+
+  it('is wired with BOTH clauses ANDed — the near-miss this fix turns on', () => {
+    const line = src.split('\n').find((l) => l.includes('isTurnLive:'))
+    expect(line, 'isTurnLive must be wired in liveness-wiring.ts').toBeDefined()
+    // Both halves must be present, negated together. `activeTurnStartedAt`
+    // ALONE is the wrong predicate: `releaseTurnBufferGate` clears it mid-turn
+    // on every final-answer reply, so a predicate missing the `getCurrentTurn()`
+    // clause silently reaps live turns doing post-answer work.
+    expect(line!).toMatch(/activeTurnStartedAt\.get\(key\) == null/)
+    expect(line!).toMatch(/getCurrentTurn\(\) == null/)
+    expect(line!).toMatch(/&&/)
+    expect(line!).toMatch(/^\s*isTurnLive: \(key\) => !\(/)
+  })
+
+  it('matches the late-fire guard it was deliberately copied from', () => {
+    // Same condition, so a mid-turn buffer-gate release can never be reaped by
+    // one and treated as live by the other. If someone tightens/loosens one
+    // site only, the two drift and the reaper starts disagreeing with the guard.
+    const predicate = /activeTurnStartedAt\.get\([\w.]+\) == null && getCurrentTurn\(\) == null/g
+    expect((src.match(predicate) ?? []).length).toBeGreaterThanOrEqual(3)
+  })
+
+  // Behavioural model of the SAME expression over the two gateway maps, so the
+  // buffer-gate case is asserted as an outcome rather than by stubbing.
+  const productionPredicate = (
+    activeTurnStartedAt: Map<string, number>,
+    currentTurn: object | null,
+  ) => (key: string) => !(activeTurnStartedAt.get(key) == null && currentTurn == null)
+
+  it('calls a mid-turn buffer-gate release LIVE (the near-miss), where the naive predicate would not', () => {
+    const m = new Map<string, number>()
+    m.set(KEY, 0)
+    const liveTurn = { turnId: 'c:3#1' }
+    // `releaseTurnBufferGate` / `finalizeStatusReaction('done')` fire mid-turn
+    // on every final-answer reply and clear this entry while the turn runs on.
+    m.delete(KEY)
+    expect(productionPredicate(m, liveTurn)(KEY)).toBe(true)
+    // The predicate I nearly shipped — activeTurnStartedAt alone — would have
+    // reaped this live turn, permanently and silently.
+    const naive = (key: string) => m.get(key) != null
+    expect(naive(KEY)).toBe(false)
+  })
+
+  it('calls a genuinely finished turn DEAD (so the reap still happens)', () => {
+    expect(productionPredicate(new Map(), null)(KEY)).toBe(false)
+  })
+
+  it('calls a turn with its gate still set LIVE even when the singleton is null', () => {
+    const m = new Map<string, number>([[KEY, 0]])
+    expect(productionPredicate(m, null)(KEY)).toBe(true)
   })
 })

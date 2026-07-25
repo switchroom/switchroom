@@ -549,9 +549,19 @@ export interface FallbackTeardownNoticeInput {
   role: LoopRole | null
   /** A final answer already landed on this turn. */
   finalAnswerDelivered: boolean
-  /** This fire is ALREADY sending user-visible text (the approval re-ping, or
-   *  the deterministic update_apply status line). Never stack a second message. */
-  otherTextSent: boolean
+  /** This fire ALREADY DELIVERED a LOUD, user-addressed message about why
+   *  nothing is happening — in practice the approval re-ping ("waiting for your
+   *  approval — tap Approve or Deny"). Never stack a second message on that.
+   *
+   *  #3551 L1: deliberately NARROWER than "some text went out". The other text
+   *  this fire can emit is `formatUpdateStatusLine`, a SILENT status surface
+   *  about an unrelated in-flight `update_apply` that says nothing about this
+   *  turn ending — a user who asked a question during an update and got killed
+   *  anyway is exactly the case this notice exists for, so that line must NOT
+   *  suppress it.
+   *  #3551 L2: means DELIVERED, not "attempted". The caller's send is wrapped in
+   *  a log-only try/catch, so a throwing re-ping must not buy silence. */
+  userAddressedTextDelivered: boolean
   /** The obligation ledger is on, so the killed turn's unanswered inbound will
    *  be re-presented. Governs the tail sentence — never claim a re-ask that
    *  cannot happen. */
@@ -560,7 +570,14 @@ export interface FallbackTeardownNoticeInput {
 }
 
 export type FallbackTeardownNoticeDecision =
-  | { send: false; reason: 'other-text-sent' | 'no-live-turn-torn-down' | 'non-user-turn' | 'answer-already-delivered' }
+  | {
+      send: false
+      reason:
+        | 'user-addressed-text-delivered'
+        | 'no-live-turn-torn-down'
+        | 'non-user-turn'
+        | 'answer-already-delivered'
+    }
   | { send: true; text: string }
 
 /**
@@ -580,7 +597,10 @@ export type FallbackTeardownNoticeDecision =
  *
  * This is deliberately NOT a re-introduction of the retired stall notice, and
  * the gates below are what keep it that way:
- *   - `otherTextSent` — never stack on the approval re-ping / update-status line.
+ *   - `userAddressedTextDelivered` — never stack on a delivered approval
+ *     re-ping. Narrow by design: a SILENT, unrelated update-status line does
+ *     not buy silence here (#3551 L1), and an approval re-ping that threw on
+ *     send does not either (#3551 L2).
  *   - `tearsDownLiveTurn` — a late-fire against an already-dead key says nothing.
  *   - `role !== 'user'` — a cron/system turn's silence is legitimate; nobody is
  *     waiting, so its teardown is housekeeping, not news.
@@ -595,7 +615,8 @@ export type FallbackTeardownNoticeDecision =
 export function decideFallbackTeardownNotice(
   input: FallbackTeardownNoticeInput,
 ): FallbackTeardownNoticeDecision {
-  if (input.otherTextSent) return { send: false, reason: 'other-text-sent' }
+  if (input.userAddressedTextDelivered)
+    return { send: false, reason: 'user-addressed-text-delivered' }
   if (!input.tearsDownLiveTurn) return { send: false, reason: 'no-live-turn-torn-down' }
   if (input.role !== 'user') return { send: false, reason: 'non-user-turn' }
   if (input.finalAnswerDelivered) return { send: false, reason: 'answer-already-delivered' }

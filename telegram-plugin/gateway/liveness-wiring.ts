@@ -274,6 +274,21 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // stays null and we skip the send. The turn-teardown below (the unwedge —
     // the one job the live draft can't do, per the conversational-pacing RFC)
     // still runs unconditionally.
+    // #3551 L1/L2 — the teardown-notice suppression signal. It must be narrower
+    // than "some text went out", and it must mean DELIVERED.
+    //
+    // L1: `text` has two sources with opposite meanings. The approval re-ping is
+    // a LOUD, user-addressed message that explains why nothing is happening and
+    // asks the user to act — stacking a teardown notice on it is noise. The
+    // deterministic `formatUpdateStatusLine` is a SILENT status surface about an
+    // unrelated in-flight `update_apply`; it says nothing about this turn ending.
+    // A user who asked a question during an update and got killed anyway is
+    // EXACTLY the #3551 case, so that line must not suppress the notice.
+    //
+    // L2: computed from send SUCCESS, not from `text != null`. The send sits in a
+    // try/catch that only logs, so a throwing approval re-ping would otherwise
+    // suppress the notice while the user received nothing at all.
+    let userAddressedTextDelivered = false
     if (text != null) {
       try {
         // Conditional: when the turn is parked on an approval card, this
@@ -283,6 +298,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
         // line stays SILENT (a status surface). Gate on `blockedOnApproval`.
         // The send stays in gateway.ts behind the bot-api retry policy.
         await sendSilenceText(ctx.chatId, ctx.threadId ?? null, text, blockedOnApproval ? false : true)
+        userAddressedTextDelivered = blockedOnApproval
       } catch (err) {
         process.stderr.write(
           `silence-poke fallback sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
@@ -471,7 +487,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       tearsDownLiveTurn: turnMatchesFallback,
       role: wedgedTurn?.role ?? null,
       finalAnswerDelivered: wedgedTurn?.finalAnswerDelivered ?? false,
-      otherTextSent: text != null,
+      userAddressedTextDelivered,
       representWillFollow: OBLIGATION_LEDGER_ENABLED,
       silenceMs: ctx.silenceMs,
     })
