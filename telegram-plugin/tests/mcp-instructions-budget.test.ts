@@ -14,8 +14,9 @@
  * prompt-injection defence.
  *
  * These tests are the deterministic backstop. `scripts/check-mcp-instructions-budget.mjs`
- * (in `npm run lint`) is the static twin; this one measures the real runtime
- * value that the SDK will hand to the client.
+ * (in `npm run lint`) is the twin: it resolves the module the bridge actually
+ * imports and measures the same runtime value that the SDK will hand to the
+ * client.
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
@@ -36,6 +37,34 @@ describe("MCP instructions budget", () => {
 
   it("keeps the authored budget strictly below the client's hard limit", () => {
     expect(MCP_INSTRUCTIONS_BUDGET).toBeLessThan(MCP_INSTRUCTIONS_LIMIT);
+  });
+
+  it("leaves a real safety margin below the hard limit", () => {
+    // The budget exists to fail an edit BEFORE the client silently cuts it.
+    // Raising it to within a handful of chars of 2048 would leave no room to
+    // notice, so the margin is asserted rather than trusted to review.
+    const margin = MCP_INSTRUCTIONS_LIMIT - MCP_INSTRUCTIONS_BUDGET;
+    expect(
+      margin,
+      `budget ${MCP_INSTRUCTIONS_BUDGET} is only ${margin} chars below the ` +
+        `${MCP_INSTRUCTIONS_LIMIT} hard limit — too close to act as an early ` +
+        `warning. Lower the budget instead of raising it.`,
+    ).toBeGreaterThanOrEqual(50);
+  });
+
+  it("leaves usable authoring headroom under the budget", () => {
+    // The counterpart to the margin above: a budget pinned two chars above the
+    // current string is a nuisance rail, and nuisance rails get "fixed" by
+    // deleting content — which is precisely what caused #3562. If this fails,
+    // MOVE mechanical detail into a tool `description` (those are not capped)
+    // rather than raising the budget toward the limit.
+    const headroom = MCP_INSTRUCTIONS_BUDGET - MCP_INSTRUCTIONS.length;
+    expect(
+      headroom,
+      `only ${headroom} chars of headroom between the string ` +
+        `(${MCP_INSTRUCTIONS.length}) and the budget ` +
+        `(${MCP_INSTRUCTIONS_BUDGET}); a routine edit would trip lint.`,
+    ).toBeGreaterThanOrEqual(25);
   });
 
   it("fits under the authored budget", () => {

@@ -52,7 +52,7 @@
  * wired into `npm run lint`.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -68,6 +68,21 @@ const CLIENT_HARD_LIMIT = 2048;
  * SILENT drop to zero coverage can never masquerade as a pass.
  */
 const EXPECTED_INSTRUCTION_SERVERS = 1;
+
+/**
+ * Hard cap on a single measurement subprocess. Importing a module runs its
+ * top-level side effects; without a bound, one live timer or transport connect
+ * hangs `npm run lint` until the CI job timeout with no diagnostic.
+ */
+const MEASURE_TIMEOUT_MS = 30_000;
+
+/**
+ * Node's built-in TypeScript stripping landed in 22.6 (behind
+ * --experimental-strip-types) and became the default in 23.6. Used only to
+ * produce an actionable message on older runtimes, where importing a .ts file
+ * fails with an opaque ERR_UNKNOWN_FILE_EXTENSION.
+ */
+const MIN_NODE_FOR_TYPE_STRIPPING = "22.6.0";
 
 const ROOTS = ["src", "telegram-plugin"];
 const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "uat"]);
@@ -134,7 +149,18 @@ function measureModule(file, name) {
 
   let lastErr = "";
   for (const args of attempts) {
-    const r = spawnSync(process.execPath, args, { encoding: "utf8" });
+    // A bounded wait is mandatory: the module being imported is ordinary
+    // application code, and importing it RUNS its top-level side effects. If
+    // MCP_INSTRUCTIONS is ever moved back into bridge.ts, importing that file
+    // installs the plugin logger and connects the stdio transport, and an
+    // unbounded spawnSync would hang `npm run lint` until the CI job timeout
+    // with no diagnostic at all. Same for any module holding a live timer.
+    const r = spawnSync(process.execPath, args, {
+      encoding: "utf8",
+      timeout: MEASURE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+
     if (r.status === 0 && r.stdout) {
       try {
         return JSON.parse(r.stdout);
@@ -143,15 +169,95 @@ function measureModule(file, name) {
         continue;
       }
     }
+
+    if (r.error?.code === "ETIMEDOUT" || r.signal === "SIGKILL") {
+      throw new Error(
+        `timed out after ${MEASURE_TIMEOUT_MS}ms importing ${file} (killed with ` +
+          `SIGKILL).\n` +
+          `      Importing that module did not terminate, so its \`${name}\` ` +
+          `could not be measured.\n` +
+          `      This usually means the module has top-level side effects that ` +
+          `keep the event loop alive — a server/transport connect, a listener, ` +
+          `or a setInterval. The instructions constant must live in a module ` +
+          `that is INERT on import (see telegram-plugin/bridge/mcp-instructions.ts: ` +
+          `constants only, no imports, no side effects).`,
+      );
+    }
+
     lastErr = (r.stderr || r.error?.message || `exit ${r.status}`).trim();
+
+    // Node < 22.6 has no TypeScript stripping at all, so importing a .ts file
+    // fails with an opaque ERR_UNKNOWN_FILE_EXTENSION. Say what is actually
+    // wrong instead of making the next person decode that.
+    if (/ERR_UNKNOWN_FILE_EXTENSION|Unknown file extension/.test(lastErr)) {
+      throw new Error(
+        `this Node (${process.version}) cannot import TypeScript directly, so ` +
+          `\`${name}\` cannot be measured.\n` +
+          `      This guard needs Node >= ${MIN_NODE_FOR_TYPE_STRIPPING} ` +
+          `(built-in type stripping: --experimental-strip-types on 22.6-23.5, ` +
+          `on by default from 23.6). CI and every docker/Dockerfile.* image in ` +
+          `this repo run Node 22, so this only bites a local checkout on an ` +
+          `older runtime.\n` +
+          `      Upgrade Node to >= ${MIN_NODE_FOR_TYPE_STRIPPING} and re-run ` +
+          `\`npm run lint\`.`,
+      );
+    }
   }
   throw new Error(lastErr || "unknown failure");
 }
 
-/** Locate the .ts module that exports `name`. */
-function findExporter(name) {
+/** Every file under ROOTS that declares `export const <name>`. */
+function filesExporting(name) {
   const re = new RegExp(`export\\s+const\\s+${name}\\b`);
-  return ALL_FILES.find((f) => re.test(readFileSync(f, "utf8"))) ?? null;
+  return ALL_FILES.filter((f) => re.test(readFileSync(f, "utf8")));
+}
+
+/**
+ * The module specifier `serverSrc` actually imports `name` from, or null.
+ *
+ * Resolving the REAL import is what makes the measurement sound. An earlier
+ * revision looked the name up across the whole repo and took the first hit
+ * (ROOTS order: `src` before `telegram-plugin`), so a decoy or a stale
+ * duplicate got measured instead of the module the server actually ships:
+ *
+ *     src/zz-decoy.ts: export const MCP_INSTRUCTIONS = 'tiny'
+ *     -> OK (1 measured) MCP_INSTRUCTIONS=4/2048   // real module was 10899 chars
+ *
+ * Same failure shape as the round-1 hole: a confident OK while measuring the
+ * wrong thing.
+ */
+function importSpecifierFor(serverSrc, name) {
+  const re = /import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
+  let m;
+  while ((m = re.exec(serverSrc))) {
+    const bound = m[1]
+      .split(",")
+      .map((s) => s.trim().split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    if (bound.includes(name)) return m[2];
+  }
+  return null;
+}
+
+/** Map a relative import specifier to the .ts source file it refers to. */
+function specifierToFile(serverFile, spec) {
+  if (!spec.startsWith(".")) return null; // bare/package specifier — out of scope
+  const base = resolve(dirname(serverFile), spec);
+  const candidates = [
+    base.replace(/\.js$/, ".ts"),
+    `${base}.ts`,
+    join(base, "index.ts"),
+    base,
+  ];
+  for (const p of candidates) {
+    try {
+      // Report repo-relative paths so messages match the other lint guards.
+      if (statSync(p).isFile()) return relative(process.cwd(), p) || p;
+    } catch {
+      /* next candidate */
+    }
+  }
+  return null;
 }
 
 function fail(file, name, len, budget) {
@@ -195,14 +301,54 @@ for (const file of ALL_FILES) {
     continue;
   }
 
-  // ── Step 2: resolve, import, measure the real runtime value. ─────────────
-  const exporter = findExporter(rawValue);
-  if (!exporter) {
+  // ── Step 2: resolve the module the server ACTUALLY imports, then measure. ─
+  //
+  // Resolution is by import specifier, not by name lookup across the repo:
+  // measuring a same-named constant from some other file would be a false pass.
+  const declaresLocally = new RegExp(
+    `export\\s+const\\s+${rawValue}\\b`,
+  ).test(src);
+  const spec = importSpecifierFor(src, rawValue);
+
+  let exporter = null;
+  if (spec) {
+    exporter = specifierToFile(file, spec);
+    if (!exporter) {
+      failures.push(
+        `${file}: \`instructions: ${rawValue}\` is imported from '${spec}', ` +
+          `which does not resolve to a .ts source file under [${ROOTS.join(", ")}]. ` +
+          `This guard measures the module the server actually imports and refuses ` +
+          `to guess. Keep the constant in a relative .ts module (e.g. ` +
+          `'./mcp-instructions.js' -> mcp-instructions.ts).`,
+      );
+      continue;
+    }
+  } else if (declaresLocally) {
+    exporter = file; // declared in the server file itself
+  } else {
     failures.push(
-      `${file}: \`instructions: ${rawValue}\` — no module in [${ROOTS.join(", ")}] ` +
-        `exports \`${rawValue}\`. This guard cannot measure what it cannot ` +
-        `resolve, and refuses to pass silently. Keep the constant as an ` +
-        `\`export const ${rawValue} = ...\` in a .ts module under those roots.`,
+      `${file}: \`instructions: ${rawValue}\` — cannot resolve \`${rawValue}\`: ` +
+        `the file neither declares \`export const ${rawValue}\` nor imports it ` +
+        `by name from a relative module. This guard cannot measure what it ` +
+        `cannot resolve, and refuses to pass silently.`,
+    );
+    continue;
+  }
+
+  // Backstop for the resolution above: an ambiguous name anywhere under ROOTS
+  // is itself the bug (a stale duplicate left by a refactor, or a second MCP
+  // server whose constant shares the name). Fail rather than silently rely on
+  // having picked correctly.
+  const duplicates = filesExporting(rawValue);
+  if (duplicates.length > 1) {
+    failures.push(
+      `${file}: \`${rawValue}\` is exported by ${duplicates.length} files under ` +
+        `[${ROOTS.join(", ")}]:\n` +
+        duplicates.map((d) => `        ${d}`).join("\n") +
+        `\n      An ambiguous instructions constant is rejected: whichever one ` +
+        `this guard measured, a reader cannot tell which one ships, and a stale ` +
+        `duplicate can hide an over-budget string behind a green lint. Delete ` +
+        `the duplicate or rename it.`,
     );
     continue;
   }
@@ -269,6 +415,9 @@ if (failures.length) {
 console.error(
   `check-mcp-instructions-budget: OK (${checked.length} measured) ` +
     checked
-      .map((c) => `${c.name}=${c.len}/${c.budget} (limit ${CLIENT_HARD_LIMIT})`)
+      .map(
+        (c) =>
+          `${c.name}=${c.len}/${c.budget} (limit ${CLIENT_HARD_LIMIT}) [${c.file}]`,
+      )
       .join(" "),
 );

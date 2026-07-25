@@ -55,8 +55,17 @@ export const MCP_INSTRUCTIONS_LIMIT = 2048;
  * This is the value ACTUALLY ENFORCED by both `npm run lint` and the unit
  * test — not the 2048 limit. (An earlier revision documented this budget but
  * only enforced 2048, leaving 148 chars of drift that passed lint.)
+ *
+ * Sized so the rail warns without nagging. The string is 1898 chars, so this
+ * leaves ~50 chars of working room: a normal edit does not trip lint, while
+ * anything larger fails ~100 chars BEFORE the real 2048 cap — early enough to
+ * fix deliberately. An earlier revision set this to 1900, i.e. two chars of
+ * headroom, which turns the guard into a nuisance and creates exactly the
+ * pressure to trim safety content that caused the original truncation. If you
+ * need more room, MOVE mechanical detail into a tool `description` (those are
+ * not capped) rather than raising this number.
  */
-export const MCP_INSTRUCTIONS_BUDGET = 1900;
+export const MCP_INSTRUCTIONS_BUDGET = 1950;
 
 export const MCP_INSTRUCTIONS = [
   // ── Why any of this reaches the user at all (not derivable from a schema).
