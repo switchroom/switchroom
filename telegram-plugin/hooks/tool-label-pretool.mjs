@@ -97,6 +97,81 @@ function urlHostPath(u) {
 }
 
 /**
+ * ALLOWLIST-style summary of a Bash command, for when the model omitted the
+ * optional `description`.
+ *
+ * The failure this closes: `description` is optional, so a sub-agent that never
+ * writes one produced the constant label "Running a command" for EVERY Bash
+ * call. The worker feed's narrative dedup then dropped every repeat and the
+ * card froze on one line for the whole job — the user could not tell a running
+ * worker from a wedged one. The card must never depend on a model volunteering
+ * an optional field.
+ *
+ * SECURITY: a command line routinely carries tokens, passwords, URLs with
+ * credentials, and private paths, and this string is rendered into a Telegram
+ * message. So this is NOT a clip of the command — nothing is echoed unless it
+ * passes a strict allowlist:
+ *   - only the PROGRAM name (basename, no directory), and
+ *   - for a known multiplexer (git/docker/npm/…), at most one bare subcommand
+ *     of pure lowercase letters/hyphens.
+ * Anything with a slash, `=`, digit-mixed shape, quote, or any other character
+ * is refused and we fall back to the generic label. Arguments, flag VALUES,
+ * env assignments, redirections and heredocs are never considered at all.
+ *
+ * Returns '' when nothing safe can be derived (caller uses the generic label).
+ */
+export function summariseBashCommand(cmd) {
+  if (typeof cmd !== 'string') return ''
+  // First line only — a heredoc/multiline body must never be inspected.
+  const firstLine = cmd.split('\n', 1)[0]
+  if (!firstLine) return ''
+
+  // Split on shell separators and prefer the first segment that actually runs
+  // something (`cd /x && git status` should read as "git status", not "cd").
+  const NAV = new Set(['cd', 'pushd', 'popd', 'export', 'set', 'source', '.', 'unset'])
+  const PREFIXES = new Set(['sudo', 'env', 'nohup', 'time', 'exec', 'command', 'doas', 'runuser', 'nice', 'xargs'])
+  const segments = firstLine.split(/&&|\|\||[;|]/).map((s) => s.trim()).filter(Boolean)
+  if (segments.length === 0) return ''
+
+  const PROGRAM_RE = /^[A-Za-z][A-Za-z0-9._+-]{0,19}$/
+  const SUBCOMMAND_RE = /^[a-z][a-z-]{1,15}$/
+  const MULTIPLEXERS = new Set([
+    'git', 'docker', 'npm', 'npx', 'bun', 'yarn', 'pnpm', 'cargo', 'go', 'gh',
+    'kubectl', 'systemctl', 'apt', 'apt-get', 'brew', 'pip', 'pip3', 'poetry',
+    'uv', 'terraform', 'aws', 'gcloud', 'helm', 'switchroom', 'make', 'openssl',
+  ])
+
+  /** Program + optional subcommand for one segment, or null. */
+  function fromSegment(seg) {
+    let tokens = seg.split(/\s+/).filter(Boolean)
+    // Drop leading env assignments (FOO=bar) and wrapper prefixes.
+    while (tokens.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]) || PREFIXES.has(tokens[0]))) {
+      tokens = tokens.slice(1)
+    }
+    if (tokens.length === 0) return null
+    // Basename only: never surface a directory (paths leak layout, usernames).
+    const head = safeBasename(tokens[0])
+    if (!PROGRAM_RE.test(head)) return null
+    if (NAV.has(head)) return { program: head, nav: true }
+    if (!MULTIPLEXERS.has(head)) return { program: head, nav: false }
+    for (const t of tokens.slice(1)) {
+      if (t.startsWith('-')) continue
+      return SUBCOMMAND_RE.test(t) ? { program: `${head} ${t}`, nav: false } : { program: head, nav: false }
+    }
+    return { program: head, nav: false }
+  }
+
+  let firstAny = null
+  for (const seg of segments) {
+    const r = fromSegment(seg)
+    if (r == null) continue
+    if (firstAny == null) firstAny = r
+    if (!r.nav) return r.program
+  }
+  return firstAny != null ? firstAny.program : ''
+}
+
+/**
  * Compute a label for a (toolName, input) pair. Returns null when the
  * tool should NOT be labeled (suppress / fall through to existing
  * renderer precedence).
@@ -111,8 +186,15 @@ export function computeLabel(toolName, input) {
   // never reaches the live draft. Uses the model-authored `description`
   // for Bash/Task, matching the gateway's describeToolUse rendering.
   switch (toolName) {
-    case 'Bash':
-      return clip(asText(i.description), 70).trim() || 'Running a command'
+    case 'Bash': {
+      const described = clip(asText(i.description), 70).trim()
+      if (described) return described
+      // No model-authored description — derive a sanitised one from the
+      // command itself rather than emitting the constant "Running a command"
+      // that freezes the step feed. See summariseBashCommand.
+      const derived = summariseBashCommand(asText(i.command))
+      return derived ? `Running ${derived}` : 'Running a command'
+    }
     case 'Task':
     case 'Agent': {
       const d = clip(asText(i.description), 60).trim()
