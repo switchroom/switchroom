@@ -116,6 +116,11 @@ function patchBlocks(): string[] {
  * Deliberately asserts OUTCOMES rather than merely calling the code or
  * grepping its source. Concretely, this file asserts:
  *
+ *  - final rank order out of `apply_combined_scoring`, plus the scoring
+ *    safety properties that order depends on — noise subordination,
+ *    set-independence, an untouched `cross_encoder_score_normalized`, the
+ *    [0, 1] weight scale, and the operator gap knob including its
+ *    clamp-to-upstream rollback path;
  *  - the token list `tokenize_query` returns, and that it stays a strict
  *    superset of upstream's across 8 query shapes;
  *  - the exact tsquery string `prepare_bm25_text` emits — that the intact
@@ -126,9 +131,9 @@ function patchBlocks(): string[] {
  *    LiteLLM retry loops — checked for the timeout/scope facts in the message
  *    and for still being caught by an upstack `except asyncio.TimeoutError`.
  *
- * It asserts nothing about how results are finally ordered. The ranking patch
- * was split into its own PR and its ordering/scoring-safety probes went with
- * it. The test below enforces that this paragraph stays true.
+ * The test below enforces that the rank-order line above stays true in both
+ * directions — this header went stale once already when the ranking patch was
+ * split out and the claim outlived the assertions.
  */
 const PROBE = String.raw`
 import asyncio
