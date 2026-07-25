@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
@@ -761,6 +762,31 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(summary["unknown"], 2)
         self.assertEqual(pending.count(), 2, "unconfirmed entries stay queued")
 
+    def test_drain_never_retires_an_entry_on_an_unknown_result(self):
+        """Unknown != confirmed, on the PHASE-2 path too (#3599 review R3-B1).
+
+        The realistic shape: the POST returns 200, the confirming GET hits a
+        503 or times out, so ``_document_state`` is ``None``. Counting that
+        as durable archives the entry and it is never retried — a degraded
+        upstream is exactly the condition this PR exists for. Mirrors
+        ``test_reconcile_never_drops_an_entry_on_an_unknown_result``; its
+        absence left ``is True`` at the phase-2 site mutable to
+        ``is not False`` with both suites green.
+        """
+        self._queue(4)
+        with unittest.mock.patch.object(
+            drain_pending, "_retry_one", lambda e, timeout: None
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: None
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+
+        self.assertEqual(summary["drained"], 0, "unknown is not a drain")
+        self.assertEqual(summary["unknown"], 4)
+        self.assertEqual(pending.count(), 4, "unconfirmed entries stay queued")
+
     def test_drain_deletes_once_the_document_is_confirmed(self):
         self._queue(5)
         with unittest.mock.patch.object(drain_pending, "_retry_one", lambda e, timeout: None):
@@ -907,6 +933,122 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
                 )
         self.assertEqual(summary["reconciled"], 3)
         self.assertEqual(pending.count(), 3, "a dry run must not delete anything")
+
+
+class ArchiveFailureNeverDeletesTest(_QueueTempDirMixin, unittest.TestCase):
+    """A failure to ARCHIVE is not a licence to DELETE (#3599 review R3-M1).
+
+    The previous ``archive_reconciled`` fell back to ``delete_entry`` on
+    ``OSError``. Reproduced: ENOSPC from ``os.makedirs`` removed the entry,
+    left ``pending-reconciled/`` empty, and emitted nothing at all — silent,
+    unrecorded, irreversible loss of the last on-disk copy of a turn. That
+    falsified, verbatim, four separate claims (``drain_pending``'s module
+    docstring, ``switchroom doctor``'s backlog fix text, the CHANGELOG, and
+    the PR body). The claims are now true because the code is.
+    """
+
+    def _queue(self, n):
+        for i in range(n):
+            pending.enqueue(
+                _payload(content=f"turn-{i}", doc=_cd_doc(i)), RuntimeError("boom")
+            )
+        self.assertEqual(pending.count(), n)
+
+    @staticmethod
+    def _enospc(*_a, **_kw):
+        raise OSError(28, "No space left on device")
+
+    def test_archive_reconciled_keeps_the_entry_when_the_archive_is_unwritable(self):
+        self._queue(1)
+        path = os.path.join(self._dir, self._names()[0])
+        err = io.StringIO()
+        with unittest.mock.patch.object(pending.os, "makedirs", self._enospc):
+            with redirect_stderr(err):
+                dest = pending.archive_reconciled(path)
+
+        self.assertIsNone(dest, "a failed archive reports failure, not a dest")
+        self.assertTrue(
+            os.path.exists(path),
+            "the entry is the ONLY on-disk copy of the turn; a full disk "
+            "must not destroy it",
+        )
+        self.assertEqual(pending.count(), 1)
+        self.assertEqual(self._reconciled_names(), [])
+
+    def test_archive_failure_is_loud_on_stderr(self):
+        """Silent loss was the worst part of the old behaviour. Even now
+        that nothing is lost, an unwritable archive must be visible."""
+        self._queue(1)
+        path = os.path.join(self._dir, self._names()[0])
+        err = io.StringIO()
+        with unittest.mock.patch.object(pending.os, "makedirs", self._enospc):
+            with redirect_stderr(err):
+                pending.archive_reconciled(path)
+        msg = err.getvalue()
+        self.assertIn(os.path.basename(path), msg)
+        self.assertIn("No space left on device", msg)
+        self.assertRegex(msg, r"STAYS QUEUED")
+
+    def test_the_queue_module_exposes_no_delete_primitive(self):
+        """Structural, not aspirational: with no ``delete_entry`` there is
+        no branch by which the drain path can ``os.remove`` a live entry."""
+        self.assertFalse(
+            hasattr(pending, "delete_entry"),
+            "re-adding a delete primitive re-opens the silent-loss path",
+        )
+
+    def test_backlog_drain_counts_an_unarchivable_entry_as_not_retired(self):
+        """The summary must not claim a retire that did not happen: the
+        entry is still queued, so ``drained`` would be a lie."""
+        self._queue(3)
+        with unittest.mock.patch.object(
+            drain_pending, "_retry_one", lambda e, timeout: None
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: True
+            ):
+                with unittest.mock.patch.object(
+                    pending.os, "makedirs", self._enospc
+                ):
+                    with redirect_stderr(io.StringIO()):
+                        summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+
+        self.assertEqual(summary["drained"], 0)
+        self.assertEqual(summary["archive_failed"], 3)
+        self.assertEqual(pending.count(), 3, "every entry survives a full disk")
+
+    def test_reconcile_phase_counts_an_unarchivable_entry_as_not_retired(self):
+        self._queue(3)
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: True
+        ):
+            with unittest.mock.patch.object(pending.os, "makedirs", self._enospc):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain_backlog(CONFIG, phase="reconcile")
+
+        self.assertEqual(summary["reconciled"], 0)
+        self.assertEqual(summary["archive_failed"], 3)
+        self.assertEqual(pending.count(), 3)
+
+    def test_in_hook_drain_keeps_an_unarchivable_entry(self):
+        """The bounded SessionStart path retires on a bare 200 and is the
+        one most likely to run on a nearly-full container filesystem."""
+        self._queue(2)
+        with unittest.mock.patch.object(
+            drain_pending, "_retry_one", lambda e, timeout: None
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: False
+            ):
+                with unittest.mock.patch.object(
+                    pending.os, "makedirs", self._enospc
+                ):
+                    with redirect_stderr(io.StringIO()):
+                        summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["drained"], 0)
+        self.assertEqual(summary["archive_failed"], 2)
+        self.assertEqual(pending.count(), 2)
 
 
 class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
@@ -1066,8 +1208,17 @@ class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
         finally:
             pending.RECONCILED_MAX_ENTRIES = prev
 
-    def test_an_unwritable_archive_still_retires_the_entry(self):
-        """A queue that cannot retire entries re-POSTs them forever."""
+    def test_an_unwritable_archive_keeps_the_entry_rather_than_deleting_it(self):
+        """REVERSED from the original assertion, deliberately (#3599 R3-M1).
+
+        This case used to assert ``pending.count() == 0`` — i.e. that a
+        failed archive deleted the entry — on the reasoning that a queue
+        which cannot retire re-POSTs forever. That trade is backwards: the
+        re-POST loop costs duplicated LLM extraction on a disk-full box,
+        and the delete costs the last on-disk copy of the turn, silently.
+        Sheds the cheaper failure; ``archive_failed`` keeps the summary
+        honest about the entry still being queued.
+        """
         pending.enqueue(_payload(doc=_cd_doc(9)), RuntimeError("x"))
         with unittest.mock.patch.object(
             pending.shutil, "move", side_effect=OSError(28, "No space left")
@@ -1075,9 +1226,147 @@ class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
             with unittest.mock.patch.object(
                 drain_pending, "_document_state", lambda e, timeout=30: True
             ):
-                summary = drain_pending.drain(CONFIG)
-        self.assertEqual(summary["reconciled"], 1)
-        self.assertEqual(pending.count(), 0, "the entry must not stay queued")
+                with redirect_stderr(io.StringIO()) as err:
+                    summary = drain_pending.drain(CONFIG)
+        self.assertEqual(summary["reconciled"], 0, "nothing was retired")
+        self.assertEqual(summary["archive_failed"], 1)
+        self.assertEqual(pending.count(), 1, "the only copy of the turn survives")
+        self.assertIn("No space left", err.getvalue())
+
+
+class TrimDirBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
+    """``_trim_dir``'s caps, at the boundary (#3599 review R3-L2).
+
+    A separate site from the enqueue cap in ``_evict_to_fit`` (pinned by
+    ``EvictionTest``): ``>`` → ``>=`` here survived the whole sweep. Off by
+    one in this direction sheds one archived copy on every call forever,
+    including on a directory that is exactly at its cap.
+    """
+
+    def _archive(self, sizes):
+        """Write ``len(sizes)`` archive files of the given byte sizes."""
+        d = os.path.join(self._tmp, "arch")
+        os.makedirs(d, exist_ok=True)
+        for i, n in enumerate(sizes):
+            with open(os.path.join(d, f"{1000 + i:013d}-x.json"), "w") as f:
+                f.write("x" * n)
+        return d
+
+    def _names_in(self, d):
+        return sorted(n for n in os.listdir(d) if n.endswith(".json"))
+
+    def test_exactly_at_the_byte_cap_is_within_it(self):
+        d = self._archive([10, 10, 10])
+        with redirect_stderr(io.StringIO()) as err:
+            dropped = pending._trim_dir(d, max_entries=99, max_bytes=30)
+        self.assertEqual(dropped, 0, "30 bytes under a 30-byte cap fits")
+        self.assertEqual(len(self._names_in(d)), 3)
+        self.assertEqual(err.getvalue(), "", "nothing dropped, nothing logged")
+
+    def test_one_byte_over_the_cap_sheds_the_oldest_only(self):
+        d = self._archive([10, 10, 11])
+        with redirect_stderr(io.StringIO()):
+            dropped = pending._trim_dir(d, max_entries=99, max_bytes=30)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(
+            self._names_in(d),
+            [f"{1001:013d}-x.json", f"{1002:013d}-x.json"],
+            "oldest first — the newest archived copy is the one worth keeping",
+        )
+
+    def test_exactly_at_the_count_cap_is_within_it(self):
+        d = self._archive([1, 1, 1])
+        self.assertEqual(pending._trim_dir(d, max_entries=3, max_bytes=10**9), 0)
+        self.assertEqual(len(self._names_in(d)), 3)
+
+    def test_one_over_the_count_cap_sheds_exactly_one(self):
+        d = self._archive([1, 1, 1, 1])
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending._trim_dir(d, max_entries=3, max_bytes=10**9), 1)
+        self.assertEqual(len(self._names_in(d)), 3)
+
+    def test_a_trim_names_what_it_dropped_on_stderr(self):
+        """The archive caps are 4x smaller than the queue caps, so a
+        full-queue drain trims. Silent trimming makes "archived, never
+        deleted" a half-truth; the log line is the other half."""
+        d = self._archive([1] * 6)
+        with redirect_stderr(io.StringIO()) as err:
+            pending._trim_dir(d, max_entries=2, max_bytes=10**9)
+        msg = err.getvalue()
+        self.assertIn("trimmed 4 archived copies", msg)
+        self.assertIn(f"{1000:013d}-x.json", msg, "names the oldest dropped")
+        self.assertIn("arch", msg, "names the directory")
+
+    def test_a_large_trim_caps_the_name_list(self):
+        """A 1500-entry trim must not emit a 1500-name line."""
+        d = self._archive([1] * 20)
+        with redirect_stderr(io.StringIO()) as err:
+            pending._trim_dir(d, max_entries=2, max_bytes=10**9)
+        msg = err.getvalue()
+        self.assertIn("trimmed 18 archived copies", msg)
+        self.assertIn("+8 more", msg)
+        self.assertLessEqual(msg.count("-x.json"), 10)
+
+
+class ClampAndEnvKnobBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
+    """``_clamp``'s floor and ``_env_num``'s clamps (#3599 review R3-L4)."""
+
+    def test_clamp_floors_at_one_second_never_zero(self):
+        """A 0s timeout fails instantly, turning a near-exhausted budget
+        into a guaranteed failure rather than one last bounded shot."""
+        started = time.monotonic()
+        # Budget already fully spent: remaining <= 0.
+        self.assertEqual(drain_pending._clamp(8, budget=0.0, started=started), 1)
+        # Remaining just under the floor.
+        self.assertEqual(drain_pending._clamp(8, budget=0.9, started=started), 1)
+
+    def test_clamp_hands_out_the_remaining_budget_once_past_the_floor(self):
+        started = time.monotonic()
+        self.assertEqual(drain_pending._clamp(8, budget=3.9, started=started), 3)
+        self.assertEqual(
+            drain_pending._clamp(2, budget=100.0, started=started),
+            2,
+            "the caller's timeout still wins when the budget is ample",
+        )
+
+    def test_env_num_lo_clamp_raises_a_too_small_value(self):
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "0"
+        self.assertEqual(
+            drain_pending._backlog_timeout(), 1, "lo=1 must raise 0 to 1"
+        )
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "-5"
+        self.assertEqual(drain_pending._backlog_timeout(), 1)
+
+    def test_env_num_lo_is_inclusive_and_leaves_larger_values_alone(self):
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "1"
+        self.assertEqual(drain_pending._backlog_timeout(), 1)
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "45"
+        self.assertEqual(drain_pending._backlog_timeout(), 45)
+
+    def test_env_num_hi_clamp_lowers_a_too_large_value(self):
+        os.environ["HINDSIGHT_DRAIN_CONCURRENCY"] = "17"
+        self.assertEqual(drain_pending._backlog_concurrency(), 16)
+        os.environ["HINDSIGHT_DRAIN_CONCURRENCY"] = "16"
+        self.assertEqual(drain_pending._backlog_concurrency(), 16)
+
+    def test_env_num_falls_back_to_the_default_on_garbage(self):
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "not-a-number"
+        self.assertEqual(drain_pending._backlog_timeout(), 180)
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = ""
+        self.assertEqual(
+            drain_pending._backlog_timeout(), 180, "empty is unset, not 0"
+        )
+
+    def test_no_clamp_is_applied_when_lo_and_hi_are_absent(self):
+        """``lo``/``hi`` default to ``None``; that branch must be a no-op,
+        not an accidental floor at 0."""
+        os.environ["X_TEST_KNOB"] = "-42"
+        try:
+            self.assertEqual(
+                drain_pending._env_num("X_TEST_KNOB", 1, int), -42
+            )
+        finally:
+            os.environ.pop("X_TEST_KNOB", None)
 
 
 class P95ProbeTest(_QueueTempDirMixin, unittest.TestCase):
@@ -1140,6 +1429,245 @@ class CliTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             rc, _ = self._run(["--phase", "reconcile"])
         self.assertEqual(rc, 2)
+
+
+class StallGuardBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
+    """The stall guard counts CONSECUTIVE failures of the SAME class.
+
+    Every prior stall test drove a homogeneous error stream, which cannot
+    tell ``err_class == last_error_class`` from ``!=``: with one class the
+    mutant takes the increment branch every time and the reset branch is
+    never reached, so the drain stalls identically. Distinguishing them
+    needs an ALTERNATING stream, where the real guard resets and the
+    mutant stalls. Same false-green shape as Blocker 1 — the assertion
+    exercised the code without pinning the invariant.
+    """
+
+    def _queue(self, n):
+        for i in range(n):
+            pending.enqueue(
+                _payload(content=f"turn-{i}", doc=_cd_doc(i)), RuntimeError("boom")
+            )
+        self.assertEqual(pending.count(), n)
+
+    def _alternating(self):
+        """A failure stream whose error CLASS changes every entry."""
+        classes = [ConnectionError, TimeoutError]
+        n = {"i": 0}
+
+        def fail(entry, timeout):
+            cls = classes[n["i"] % 2]
+            n["i"] += 1
+            raise cls("upstream flapping")
+
+        return fail
+
+    def test_alternating_error_classes_never_stall_the_drain(self):
+        self._queue(6)
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: False
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_retry_one", self._alternating()
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain(CONFIG)
+
+        self.assertFalse(
+            summary["stalled"],
+            "a flapping upstream is not a stall — the counter must RESET "
+            "when the error class changes",
+        )
+        self.assertEqual(summary["retried"], 6, "every entry got its attempt")
+        self.assertEqual(pending.count(), 6, "failed entries stay queued")
+
+    def test_alternating_error_classes_never_stall_the_backlog_drain(self):
+        self._queue(6)
+        os.environ["HINDSIGHT_DRAIN_CONCURRENCY"] = "1"
+        with unittest.mock.patch.object(
+            drain_pending, "_retry_one", self._alternating()
+        ):
+            with redirect_stderr(io.StringIO()):
+                summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+
+        self.assertFalse(summary["stalled"])
+        self.assertEqual(summary["retried"], 6)
+        self.assertEqual(pending.count(), 6)
+
+    def test_the_drain_stalls_at_exactly_stall_threshold(self):
+        """AT the threshold, not one past it.
+
+        Queueing exactly ``STALL_THRESHOLD`` entries is what separates
+        ``>=`` from ``>``: with ``>`` the run ends by exhausting the queue
+        and reports no stall at all.
+        """
+        self._queue(drain_pending.STALL_THRESHOLD)
+
+        def always_fail(entry, timeout):
+            raise ConnectionError("upstream down")
+
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: False
+        ):
+            with unittest.mock.patch.object(drain_pending, "_retry_one", always_fail):
+                with redirect_stderr(io.StringIO()) as err:
+                    summary = drain_pending.drain(CONFIG)
+
+        self.assertTrue(summary["stalled"])
+        self.assertIn("stalling drain", err.getvalue())
+        self.assertEqual(pending.count(), drain_pending.STALL_THRESHOLD)
+
+
+class BudgetBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
+    """The budget is spent DOWN TO the tick, not one tick short.
+
+    ``elapsed > budget`` vs ``>=`` is invisible to every wall-clock test
+    (real elapsed never lands exactly on the budget), so both loops are
+    driven here on a virtual clock that lands on it exactly.
+    """
+
+    def _queue(self, n):
+        for i in range(n):
+            pending.enqueue(
+                _payload(content=f"turn-{i}", doc=_cd_doc(i)), RuntimeError("boom")
+            )
+
+    def test_the_sequential_drain_uses_the_last_tick_of_its_budget(self):
+        self._queue(2)
+        os.environ["HINDSIGHT_DRAIN_BUDGET_S"] = "10"
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = "10"
+        start = 1000.0
+        clock = {"t": start}
+        gets = []
+
+        def fake_get(entry, timeout=30):
+            gets.append(timeout)
+            clock["t"] = start + 10.0  # entry 1 consumes the budget EXACTLY
+            return True
+
+        with unittest.mock.patch.object(
+            drain_pending.time, "monotonic", lambda: clock["t"]
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", fake_get
+            ):
+                summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(len(gets), 2, "entry 2 is still inside the budget at t==B")
+        self.assertEqual(summary["reconciled"], 2)
+        self.assertFalse(summary["budget_exceeded"])
+        self.assertEqual(pending.count(), 0)
+
+    def test_the_backlog_wave_loop_uses_the_last_tick_of_its_budget(self):
+        self._queue(2)
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_BUDGET_S"] = "10"
+        os.environ["HINDSIGHT_DRAIN_CONCURRENCY"] = "1"
+        # Keep _wait_for_upstream off the clock; its own boundary is pinned
+        # by WaitForUpstreamBoundaryTest.
+        os.environ["HINDSIGHT_DRAIN_P95_BACKOFF_MS"] = "0"
+        start = 1000.0
+        clock = {"t": start}
+
+        def fake_post(entry, timeout):
+            clock["t"] = start + 10.0  # wave 1 consumes the budget EXACTLY
+
+        with unittest.mock.patch.object(
+            drain_pending.time, "monotonic", lambda: clock["t"]
+        ):
+            with unittest.mock.patch.object(drain_pending, "_retry_one", fake_post):
+                with unittest.mock.patch.object(
+                    drain_pending, "_document_state", lambda e, timeout=30: True
+                ):
+                    with redirect_stderr(io.StringIO()):
+                        summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+
+        self.assertEqual(summary["drained"], 2, "wave 2 starts at exactly t==B")
+        self.assertFalse(summary["budget_exceeded"])
+        self.assertEqual(pending.count(), 0)
+
+
+class WaitForUpstreamBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
+    """``_wait_for_upstream`` called directly — its three comparisons.
+
+    Driving it through ``drain_backlog`` only ever exercised the
+    disabled/slow/recovered cases; the boundaries below all survived a
+    mutation sweep because no test pinned them.
+    """
+
+    def _wait(self, backoff_ms, probes, now=1000.0, started=1000.0, budget=3600.0):
+        slept = []
+        seq = list(probes)
+        with unittest.mock.patch.object(
+            drain_pending.time, "monotonic", lambda: now
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_p95_probe_ms", lambda: seq.pop(0)
+            ):
+                with unittest.mock.patch.object(
+                    drain_pending.time, "sleep", slept.append
+                ):
+                    with redirect_stderr(io.StringIO()) as err:
+                        got = drain_pending._wait_for_upstream(
+                            backoff_ms, started, budget
+                        )
+        return got, slept, err.getvalue()
+
+    def test_backoff_disabled_never_pauses_even_when_the_probe_says_slow(self):
+        """``backoff_ms <= 0`` means OFF — the probe is not consulted.
+
+        With ``<`` instead of ``<=``, a 0 (explicitly disabled) falls into
+        the wait loop and a configured probe reporting 99s of p95 pauses
+        the drain for two minutes a wave. Disabled must mean disabled.
+        """
+        got, slept, _ = self._wait(0, [99000, 99000, 99000])
+        self.assertTrue(got)
+        self.assertEqual(slept, [], "a disabled backoff must never sleep")
+
+    def test_a_p95_exactly_at_the_threshold_is_not_slow(self):
+        """The knob is the tolerated ceiling, inclusive."""
+        got, slept, out = self._wait(38000, [38000])
+        self.assertTrue(got)
+        self.assertEqual(slept, [])
+        self.assertNotIn("BACKOFF", out)
+
+    def test_one_ms_over_the_threshold_is_slow(self):
+        got, slept, out = self._wait(38000, [38001, 38000])
+        self.assertTrue(got)
+        self.assertEqual(slept, [120], "paused once, then p95 came back in")
+        self.assertIn("BACKOFF", out)
+
+    def test_it_still_waits_when_the_pause_exactly_fits_the_budget(self):
+        """120s of pause with exactly 120s left is affordable, not a give-up.
+
+        ``elapsed + 120 > budget`` vs ``>=``: only a clock that lands
+        exactly on the budget separates them, so this one is virtual.
+        """
+        got, slept, out = self._wait(
+            38000, [99000, 1000], now=1120.0, started=1000.0, budget=240.0
+        )
+        self.assertTrue(got, "the wait fit the budget, so it must be taken")
+        self.assertEqual(slept, [120])
+        self.assertNotIn("budget is exhausted", out)
+
+    def test_it_gives_up_when_the_pause_would_overrun_the_budget(self):
+        got, slept, out = self._wait(
+            38000, [99000], now=1121.0, started=1000.0, budget=240.0
+        )
+        self.assertFalse(got)
+        self.assertEqual(slept, [])
+        self.assertIn("budget is exhausted", out)
+
+    def test_a_zero_p95_is_fast_not_unknown(self):
+        """``p95 < 0`` is the UNKNOWN sentinel; 0 is a real, fast reading.
+
+        (``< 0`` vs ``<= 0`` is an equivalent mutant here — a 0 reading
+        returns True down either branch, since it is also ``<= backoff_ms``
+        for any enabled backoff. Pinned anyway: the OUTCOME is what the
+        drain depends on, and it must not become a pause.)
+        """
+        got, slept, _ = self._wait(38000, [0])
+        self.assertTrue(got)
+        self.assertEqual(slept, [])
 
 
 if __name__ == "__main__":

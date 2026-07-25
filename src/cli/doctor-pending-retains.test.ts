@@ -14,10 +14,17 @@
  * vault-broker socket-pair test seam).
  */
 
-import { describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  buildPendingRetainsProbeScript,
   checkPendingRetainsQueues,
+  PENDING_RETAINS_EVICTION_WINDOW_DAYS,
   type PendingRetainsProbeResult,
 } from "./doctor.js";
 import type { SwitchroomConfig } from "../config/schema.js";
@@ -318,5 +325,177 @@ describe("checkPendingRetainsQueues (#1071/#1094)", () => {
     // alpha before zeta in the joined list.
     const detail = r.detail ?? "";
     expect(detail.indexOf("alpha")).toBeLessThan(detail.indexOf("zeta"));
+  });
+});
+
+/**
+ * The probe's SHELL ARITHMETIC, run for real.
+ *
+ * Before this block, `probePendingRetainsQueue` had no test at all: the
+ * suite injected a fake probe and exercised only aggregation. The one case
+ * that mentioned the window ("the eviction count is windowed, and says
+ * so") asserted the message wording, so deleting the `$1 >= c` filter from
+ * the awk clause — making the count cumulative for all time — kept all 21
+ * tests green while pinning the doctor row to `fail` forever after a
+ * single legitimate eviction (#3599 review R3-B3).
+ *
+ * These run the generated one-liner with `sh -c` against a tmpdir instead
+ * of a container, and assert the NUMBER.
+ */
+describe("buildPendingRetainsProbeScript — eviction window arithmetic", () => {
+  const NOW = Date.parse("2026-07-25T12:00:00Z");
+  const iso = (daysAgo: number) =>
+    new Date(NOW - daysAgo * 86400_000).toISOString().replace(/\.\d+Z$/, "Z");
+
+  let base: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "doctor-pending-probe-"));
+    mkdirSync(join(base, "pending-retains"), { recursive: true });
+  });
+  afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+  /** Run the real probe script and parse its counters out of it. */
+  function runProbe(env: Record<string, string> = {}): {
+    P: number;
+    D: number;
+    X: number;
+    E: number;
+    C: number;
+  } {
+    const script = buildPendingRetainsProbeScript(base, NOW);
+    const r = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+    expect(r.status, r.stderr).toBe(0);
+    const grab = (k: string) =>
+      parseInt(new RegExp(`${k}=(\\d+)`).exec(r.stdout)?.[1] ?? "-1", 10);
+    return {
+      P: grab("P"),
+      D: grab("D"),
+      X: grab("X"),
+      E: grab("E"),
+      C: grab("C"),
+    };
+  }
+
+  function writeEvictionLog(daysAgo: number[]) {
+    writeFileSync(
+      join(base, "pending-evictions.log"),
+      daysAgo
+        .map(
+          (d, i) =>
+            `${iso(d)} evicted=1000-${i}.json bytes=99 reason=count ` +
+            `queue_depth=2000 queue_bytes=1234`,
+        )
+        .join("\n") + "\n",
+    );
+  }
+
+  it("counts ONLY the evictions inside the window, not every one ever", () => {
+    // 3 inside 7d (0.5/3/6.9 days ago), 4 outside (7.1/30/90/400).
+    writeEvictionLog([0.5, 3, 6.9, 7.1, 30, 90, 400]);
+    expect(runProbe().E).toBe(3);
+  });
+
+  it("an all-historic ledger reads as zero, so the row can clear", () => {
+    // The whole point: eviction is designed behaviour, so a row that can
+    // never go back to ok trains the operator to ignore it.
+    writeEvictionLog([8, 9, 60, 365]);
+    expect(runProbe().E).toBe(0);
+  });
+
+  it("an entirely recent ledger counts every line", () => {
+    writeEvictionLog([0, 1, 2, 3, 4, 5, 6]);
+    expect(runProbe().E).toBe(7);
+  });
+
+  it("the boundary is the cutoff itself, and it is inclusive", () => {
+    const cutoff = iso(PENDING_RETAINS_EVICTION_WINDOW_DAYS);
+    writeFileSync(
+      join(base, "pending-evictions.log"),
+      `${cutoff} evicted=a.json bytes=1 reason=count queue_depth=1 queue_bytes=1\n`,
+    );
+    expect(runProbe().E).toBe(1);
+  });
+
+  it("non-eviction lines in the ledger are not counted", () => {
+    writeFileSync(
+      join(base, "pending-evictions.log"),
+      [
+        `${iso(1)} evicted=a.json bytes=1 reason=count queue_depth=1 queue_bytes=1`,
+        `${iso(1)} rotated log lines=500`,
+        `${iso(2)} evicted=b.json bytes=1 reason=bytes queue_depth=1 queue_bytes=1`,
+      ].join("\n") + "\n",
+    );
+    expect(runProbe().E).toBe(2);
+  });
+
+  it("a missing ledger is zero, not an error", () => {
+    expect(runProbe().E).toBe(0);
+  });
+
+  it("counts queued and dead entries without overlap", () => {
+    const dir = join(base, "pending-retains");
+    for (const n of ["1-a.json", "2-b.json", "3-c.json"])
+      writeFileSync(join(dir, n), "{}");
+    for (const n of ["4-d.json.dead", "5-e.json.dead"])
+      writeFileSync(join(dir, n), "{}");
+    const r = runProbe();
+    expect(r.P).toBe(3);
+    expect(r.D).toBe(2);
+  });
+
+  it("reads the residual-drop count from the sibling ledger", () => {
+    writeFileSync(
+      join(base, "pending-drops.json"),
+      JSON.stringify({ count: 37, last: "x" }),
+    );
+    expect(runProbe().X).toBe(37);
+  });
+
+  // DEFENSIVE, and labelled as such. `grep -o` emits every
+  // `"count"…<digits>` match and `head -n1` takes the first. A well-formed
+  // ledger has exactly one — `lib/pending.py:_record_drop` writes a single
+  // JSON object via tmp+os.replace, and a "count" quoted inside
+  // `last_error_message` is backslash-escaped, so it cannot match. This
+  // pins the behaviour for a ledger that is NOT well formed (a truncated
+  // or doubly-written legacy file): the first, i.e. current, record wins
+  // rather than whatever trailing garbage the file ends with.
+  it("takes the FIRST count when a malformed ledger carries several", () => {
+    writeFileSync(
+      join(base, "pending-drops.json"),
+      '{"schema": 1, "count": 12}\n{"schema": 1, "count": 999999}\n',
+    );
+    expect(runProbe().X).toBe(12);
+  });
+
+  // The sibling `pending-drops.json` is the current location; the
+  // in-directory `.drops.json` is only a fallback for agents still on an
+  // older plugin build. Reading the stale one in preference would report a
+  // frozen count forever.
+  it("prefers the sibling ledger over the legacy in-directory one", () => {
+    writeFileSync(join(base, "pending-drops.json"), JSON.stringify({ count: 3 }));
+    writeFileSync(
+      join(base, "pending-retains", ".drops.json"),
+      JSON.stringify({ count: 91 }),
+    );
+    expect(runProbe().X).toBe(3);
+  });
+
+  it("falls back to the legacy in-directory ledger when the sibling is absent", () => {
+    writeFileSync(
+      join(base, "pending-retains", ".drops.json"),
+      JSON.stringify({ count: 91 }),
+    );
+    expect(runProbe().X).toBe(91);
+  });
+
+  // The cap is read from the agent's LIVE env because it is retuned via
+  // switchroom.yaml; the compiled-in number is only the fallback, and it
+  // must match the plugin's own default (lib/pending.py MAX_ENTRIES).
+  it("reports the live cap, falling back to the plugin default", () => {
+    expect(runProbe().C).toBe(2000);
+    expect(runProbe({ HINDSIGHT_PENDING_MAX_ENTRIES: "500" }).C).toBe(500);
   });
 });

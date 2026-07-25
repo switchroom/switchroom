@@ -1404,8 +1404,11 @@ const PENDING_RETAINS_DEFAULT_MAX_ENTRIES = 2000;
  * the newest), and ``pending-evictions.log`` is append-only, so counting
  * it cumulatively would pin the row to `fail` forever after the first
  * legitimate eviction. Recent evictions are the actionable signal.
+ *
+ * @internal exported so the probe's window arithmetic can be tested
+ * against the same number the probe uses, not a duplicated literal.
  */
-const PENDING_RETAINS_EVICTION_WINDOW_DAYS = 7;
+export const PENDING_RETAINS_EVICTION_WINDOW_DAYS = 7;
 
 /**
  * Per-agent probe result for the pending-retains queue.
@@ -1475,8 +1478,38 @@ export function probePendingRetainsQueue(
 ): PendingRetainsProbeResult {
   // Container HOME per compose.ts (`HOME: "/state/agent/home"`). Same
   // default relative path as lib/pending.py: $HOME/.hindsight/pending-retains.
-  const dir = "/state/agent/home/.hindsight/pending-retains";
   const base = "/state/agent/home/.hindsight";
+  const script = buildPendingRetainsProbeScript(base);
+  const r = spawnSync(
+    "docker",
+    ["exec", `switchroom-${agentName}`, "sh", "-c", script],
+    { stdio: "pipe", timeout: 3000 },
+  );
+  return parsePendingRetainsProbeOutput(r);
+}
+
+/**
+ * Build the `sh -c` one-liner the probe runs inside an agent container.
+ *
+ * Split out from `probePendingRetainsQueue` so the SHELL ARITHMETIC is
+ * testable without a container (#3599 review R3-B3). It was not, and the
+ * test named "the eviction count is windowed, and says so" asserted only
+ * that the message says "in the last 7d" — deleting the `$1 >= c` awk
+ * filter, i.e. counting every eviction ever recorded, left all 21 doctor
+ * tests green. A cumulative count pins the row to `fail` permanently after
+ * one legitimate eviction, which is the exact failure the window exists to
+ * prevent.
+ *
+ * `base` is parameterised for that test; production passes the container
+ * path. `now` is injectable so the window boundary is deterministic.
+ *
+ * @internal exported for testing
+ */
+export function buildPendingRetainsProbeScript(
+  base: string,
+  now: number = Date.now(),
+): string {
+  const dir = `${base}/pending-retains`;
   // `.json$` matches queued entries but NOT `.json.dead` (which ends in
   // `.dead`), so the two counts don't overlap. grep -c on empty input
   // prints 0 and exits 1, so guard with the -d test and swallow status.
@@ -1492,11 +1525,11 @@ export function probePendingRetainsQueue(
   // Ledger lines start with an ISO-8601 UTC timestamp, which sorts
   // lexicographically, so awk can window them with a plain string compare.
   const cutoff = new Date(
-    Date.now() - PENDING_RETAINS_EVICTION_WINDOW_DAYS * 86400_000,
+    now - PENDING_RETAINS_EVICTION_WINDOW_DAYS * 86400_000,
   )
     .toISOString()
     .replace(/\.\d+Z$/, "Z");
-  const script =
+  return (
     `P=0; D=0; X=0; E=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
     `if [ -d '${dir}' ]; then ` +
     `P=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json$' || true); ` +
@@ -1513,12 +1546,20 @@ export function probePendingRetainsQueue(
     `'${base}/pending-evictions.log' 2>/dev/null || echo 0); ` +
     `[ -n "$E" ] || E=0; ` +
     `fi; ` +
-    `echo "P=$P D=$D X=$X E=$E C=$C"`;
-  const r = spawnSync(
-    "docker",
-    ["exec", `switchroom-${agentName}`, "sh", "-c", script],
-    { stdio: "pipe", timeout: 3000 },
+    `echo "P=$P D=$D X=$X E=$E C=$C"`
   );
+}
+
+/**
+ * Parse the probe one-liner's stdout into a verdict.
+ *
+ * @internal exported for testing
+ */
+function parsePendingRetainsProbeOutput(r: {
+  error?: Error;
+  status: number | null;
+  stdout: Buffer | string;
+}): PendingRetainsProbeResult {
   // docker/daemon failure, container absent (exit ≥125), or timeout
   // (status null) → skip this agent, don't false-alarm.
   const unreachable: PendingRetainsProbeResult = {
@@ -1668,7 +1709,9 @@ export function checkPendingRetainsQueues(
     `health rows above), or every retry just ages entries toward .dead. Entries the ` +
     `drain retires are MOVED to \`.hindsight/pending-reconciled/\` (bounded, so they ` +
     `expire), never deleted — every retire rests on an HTTP 200, which is an ack and ` +
-    `not proof, so the payload stays recoverable.`;
+    `not proof, so the payload stays recoverable. If that archive cannot be written ` +
+    `(disk full, permissions) the entry STAYS QUEUED and the drain says so on stderr; ` +
+    `a failure to archive is never a reason to delete.`;
 
   // fail: dead markers, residual drops, or recorded evictions. NOT depth:
   // a full queue evicts rather than refusing, so depth alone is a symptom.

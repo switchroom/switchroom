@@ -81,7 +81,19 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
   this design was ported from always did. One rule covers both paths: the
   in-hook drain retires on a bare 200 because the hook has no budget for a
   confirming GET, the backlog drain re-GETs first — and neither can
-  irreversibly remove the last on-disk copy of a turn.
+  irreversibly remove the last on-disk copy of a turn. When the archive
+  itself cannot be written (ENOSPC, EACCES, a read-only mount) the entry
+  STAYS QUEUED and the failure is logged; an earlier revision fell back to
+  deleting it, which made this claim false in exactly the disk-pressure
+  case it was written for. The queue module now exposes no delete
+  primitive at all, so the invariant is structural rather than asserted.
+  Retiring an unarchivable entry is reported as `archive_failed` rather
+  than counted as `drained`/`reconciled`, so the summary can't claim a
+  retire that did not happen. The bounded archives are trimmed
+  oldest-first as before, and the trim now names what it dropped on
+  stderr — those are redundant copies of documents already confirmed
+  upstream, but "reversible" has a horizon and the operator gets to see
+  it pass.
 - **A broken p95 probe is no longer silent.** `HINDSIGHT_DRAIN_P95_CMD`'s exit
   status was ignored, so a typo'd or unauthorized command produced an
   unparsable figure, fell into the bare `except`, and disabled backoff exactly

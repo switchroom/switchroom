@@ -5,9 +5,11 @@ memory is the just-closed transcript — and the agent thinks it was
 persisted. To prevent silent data loss (#1071), session_end.py
 serializes the *exact retain payload* it would have POSTed into
 ``~/.hindsight/pending-retains/<unix-ms>-<short-uuid>.json``. The next
-SessionStart drains the directory: oldest first, success deletes,
-failure bumps an attempt counter (up to MAX_ATTEMPTS) and leaves the
-entry for the run after that.
+SessionStart drains the directory: oldest first, success RETIRES the
+entry into the bounded ``pending-reconciled/`` archive (it is never
+deleted — see "Retiring an entry" below), failure bumps an attempt
+counter (up to MAX_ATTEMPTS) and leaves the entry for the run after
+that.
 
 Layout
 ------
@@ -321,18 +323,36 @@ def _dir_bytes(d: str, names) -> int:
     return total
 
 
-def _trim_dir(a: str, max_entries: int, max_bytes: int) -> None:
+def _trim_dir(a: str, max_entries: int, max_bytes: int) -> int:
     """Keep ``a`` under its count/byte caps, deleting OLDEST first.
+
+    Returns the number of archived copies dropped.
 
     Oldest-first is load-bearing: ``names[0]`` is the lexicographically
     smallest name, and names lead with a fixed-width millisecond stamp, so
     it is the oldest archived entry. Trimming from the other end would keep
     the stale tail and discard what was just shed.
+
+    Both caps are ``>`` — a directory sitting exactly ON a cap is within
+    it, and trimming there would shed one entry per call forever.
+
+    The archive caps are deliberately 4x SMALLER than the queue caps (500 /
+    64 MB vs 2000 / 256 MB) (#3599 review R3-L1). Sizing them to match
+    would put three full-queue copies on a container filesystem (queue +
+    ``pending-evicted/`` + ``pending-reconciled/`` = 768 MB), which is the
+    disk problem the caps exist to bound. What that costs is bounded and
+    NOT the "last on-disk copy of a turn": an entry only reaches
+    ``pending-reconciled/`` once its document was CONFIRMED present
+    upstream, and only reaches ``pending-evicted/`` through the ledgered
+    eviction path. So the trim sheds a redundant copy — but it must not do
+    so silently, hence the log line: "reversible" has a horizon and the
+    operator is entitled to know when it passed.
     """
     try:
         names = sorted(n for n in os.listdir(a) if n.endswith(".json"))
     except OSError:
-        return
+        return 0
+    dropped = []
     while names and (
         len(names) > max_entries or _dir_bytes(a, names) > max_bytes
     ):
@@ -340,7 +360,19 @@ def _trim_dir(a: str, max_entries: int, max_bytes: int) -> None:
             os.remove(os.path.join(a, names[0]))
         except OSError:
             pass
-        names.pop(0)
+        dropped.append(names.pop(0))
+    if dropped:
+        shown = ", ".join(dropped[:10])
+        if len(dropped) > 10:
+            shown += f", +{len(dropped) - 10} more"
+        print(
+            f"[Hindsight] pending: trimmed {len(dropped)} archived "
+            f"cop{'y' if len(dropped) == 1 else 'ies'} from "
+            f"{os.path.basename(a.rstrip('/'))} to stay under its caps "
+            f"({max_entries} entries / {max_bytes} bytes): {shown}",
+            file=sys.stderr,
+        )
+    return len(dropped)
 
 
 def _trim_archive() -> None:
@@ -362,17 +394,32 @@ def archive_reconciled(path: str) -> Optional[str]:
     ``RECONCILED_MAX_BYTES``), so it can never become an unbounded disk
     problem of its own.
 
-    Falls back to ``delete_entry`` when the archive cannot be written (disk
-    full, permissions): a queue that cannot retire entries would re-POST
-    them forever, which is the very loop this change exists to break.
+    Returns the destination path, or ``None`` when the entry could NOT be
+    retired — in which case the entry is still queued and untouched.
+
+    A failure to archive (ENOSPC, EACCES, a read-only mount) is NOT a
+    licence to delete (#3599 review R3-M1). An earlier revision fell back
+    to ``delete_entry`` on ``OSError``, reasoning that a queue which cannot
+    retire would re-POST forever; the cost of that loop is duplicated LLM
+    extraction, while the cost of the delete is the last on-disk copy of a
+    turn, silently and irreversibly. The cheaper failure wins, and the
+    caller is told so it can count the entry honestly rather than report a
+    retire that did not happen. The failure is also logged to stderr,
+    because the one thing worse than a full disk is a full disk nobody
+    hears about.
     """
     dest_dir = reconciled_dir()
     try:
         os.makedirs(dest_dir, mode=0o700, exist_ok=True)
         dest = os.path.join(dest_dir, os.path.basename(path))
         shutil.move(path, dest)
-    except OSError:
-        delete_entry(path)
+    except OSError as e:
+        print(
+            f"[Hindsight] pending: could not archive {os.path.basename(path)} "
+            f"into {dest_dir} ({e}) — entry STAYS QUEUED (never deleted); "
+            f"free disk space or fix permissions, then re-run the drain",
+            file=sys.stderr,
+        )
         return None
     _trim_dir(dest_dir, RECONCILED_MAX_ENTRIES, RECONCILED_MAX_BYTES)
     return dest
@@ -720,13 +767,19 @@ def iter_entries() -> list[tuple[str, dict]]:
     return out
 
 
-def delete_entry(path: str) -> bool:
-    """Remove a queue entry. Returns True on success, False otherwise."""
-    try:
-        os.remove(path)
-        return True
-    except OSError:
-        return False
+# There is deliberately NO ``delete_entry``/``os.remove`` primitive for a
+# live queue entry (#3599 review R3-M1). Its last caller was
+# ``archive_reconciled``'s OSError fallback, and while it existed the
+# "never irreversibly removed" claim in this module's docstring, in
+# ``drain_pending``'s, in ``switchroom doctor``'s backlog fix text and in
+# the CHANGELOG was one ``except OSError:`` away from being false. Making
+# the invariant structural — the function does not exist, so no branch can
+# reach it — is stronger than asserting it in prose. An entry leaves the
+# queue by MOVING: ``archive_reconciled`` (retired), ``_evict_to_fit``
+# (evicted, ledgered), ``quarantine_corrupt`` (unparsable), or the
+# ``.dead`` rename. Bounded archives are trimmed by ``_trim_dir``; that is
+# the only ``os.remove`` on this path and it acts on an already-retired
+# copy, never on a live entry.
 
 
 def update_attempt(path: str, entry: dict, error: BaseException) -> bool:

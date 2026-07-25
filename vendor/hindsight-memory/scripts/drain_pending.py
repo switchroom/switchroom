@@ -112,6 +112,20 @@ def _clamp(timeout: int, budget: float, started: float) -> int:
     Floor at 1s so a near-exhausted budget still gets one bounded shot
     rather than a 0s (instant-fail) request. That floor is the entire
     overshoot: at most ~1s per request, ~2s for a GET+POST entry.
+
+    The 1s floor is expressed TWICE and the two are mutually redundant:
+    the early ``remaining < 1`` return and the ``max(1, ...)`` below each
+    enforce it alone (``int(0.5)`` → 0 → 1; ``int(-5)`` → -5 → 1). That
+    redundancy — not a coverage hole — is why single mutations here
+    survive: ``<`` → ``<=``, ``max(1`` → ``max(0``, and deleting either
+    guard are all EQUIVALENT mutants, verified by exhaustive comparison
+    over the boundary plus 200k random remainders (#3599 review R3-L4,
+    which reported it as unpinned). What matters is the floor's OUTCOME,
+    and that IS pinned: removing both guards fails
+    ``ClampAndEnvKnobBoundaryTest.test_clamp_floors_at_one_second_never_zero``
+    and ``test_session_start_reconcile_respects_the_hook_budget``. Left as
+    two lines deliberately — the shortcut states the intent where a reader
+    looks for it, and no mutation of it can change behaviour.
     """
     remaining = budget - (time.monotonic() - started)
     if remaining < 1:
@@ -332,6 +346,12 @@ def _new_summary() -> dict:
         "dead": 0,
         "reconciled": 0,
         "unknown": 0,
+        # Presence WAS established, but the entry could not be moved into
+        # the archive (ENOSPC, EACCES, read-only mount). It is still queued
+        # — archiving never falls back to a delete (#3599 review R3-M1) —
+        # so it must not be counted as drained/reconciled, which would
+        # report a retire that did not happen.
+        "archive_failed": 0,
         "stalled": False,
         "budget_exceeded": False,
     }
@@ -365,6 +385,8 @@ def drain(
          "dead":    int,   # entries promoted to .dead this run
          "reconciled": int,# already durable, archived without a POST
          "unknown": int,   # presence unknown, left queued
+         "archive_failed": int,  # durable, but the archive was unwritable
+                                 # so the entry is STILL QUEUED
          "stalled": bool,  # stall guard tripped
          "budget_exceeded": bool}
     """
@@ -418,8 +440,12 @@ def drain(
         # them durable.
         if _reconcilable_on_presence(entry):
             if _document_state(entry, timeout=_clamp(timeout, budget, started)) is True:
-                archive_reconciled(path)
-                summary["reconciled"] += 1
+                if archive_reconciled(path):
+                    summary["reconciled"] += 1
+                else:
+                    # Archive unwritable: the entry is STILL QUEUED (it is
+                    # never deleted), so calling it reconciled would be a lie.
+                    summary["archive_failed"] += 1
                 consecutive_failures = 0
                 last_error_class = None
                 continue
@@ -454,8 +480,10 @@ def drain(
         # nothing on the drain path is ever irreversibly removed, so the
         # in-hook path's weaker evidence costs at most a recoverable file
         # in ``pending-reconciled/`` instead of a lost turn.
-        archive_reconciled(path)
-        summary["drained"] += 1
+        if archive_reconciled(path):
+            summary["drained"] += 1
+        else:
+            summary["archive_failed"] += 1
         consecutive_failures = 0
         last_error_class = None
 
@@ -492,9 +520,10 @@ def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
             continue
         state = _document_state(entry)
         if state is True:
-            summary["reconciled"] += 1
-            if not dry_run:
-                archive_reconciled(path)
+            if dry_run or archive_reconciled(path):
+                summary["reconciled"] += 1
+            else:
+                summary["archive_failed"] += 1
         elif state is None:
             summary["unknown"] += 1
     if skipped:
@@ -506,6 +535,12 @@ def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
     _blog(
         f"phase 1 done: {summary['reconciled']} already durable "
         f"(no POST issued), {summary['unknown']} unknown (left queued)"
+        + (
+            f", {summary['archive_failed']} confirmed durable but NOT retired "
+            f"(archive unwritable — still queued)"
+            if summary["archive_failed"]
+            else ""
+        )
     )
 
 
@@ -620,8 +655,10 @@ def _drain_backlog_impl(
                 # synchronous POST of THIS entry's content that just
                 # returned 200. And the entry is archived, not deleted.
                 if _document_state(entry) is True:
-                    archive_reconciled(path)
-                    summary["drained"] += 1
+                    if archive_reconciled(path):
+                        summary["drained"] += 1
+                    else:
+                        summary["archive_failed"] += 1
                 else:
                     summary["unknown"] += 1
                     _blog(
@@ -709,13 +746,22 @@ def main(argv: list[str] | None = None) -> int:
         config, backlog=args.backlog, phase=args.phase, dry_run=args.dry_run
     )
     if any(
-        summary[k] for k in ("drained", "retried", "dead", "reconciled", "unknown")
+        summary[k]
+        for k in (
+            "drained",
+            "retried",
+            "dead",
+            "reconciled",
+            "unknown",
+            "archive_failed",
+        )
     ):
         print(
             f"[Hindsight] drain_pending{'(backlog)' if args.backlog else ''}: "
             f"drained={summary['drained']} reconciled={summary['reconciled']} "
             f"retried={summary['retried']} dead={summary['dead']} "
             f"unknown={summary['unknown']} "
+            f"archive_failed={summary['archive_failed']} "
             f"stalled={summary['stalled']} budget_exceeded={summary['budget_exceeded']}",
             file=sys.stderr,
         )
