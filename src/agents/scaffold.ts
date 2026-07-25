@@ -4279,7 +4279,9 @@ export function scaffoldAgent(
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
   // Lexical-overlap relevance gate (#475). Same cascade. `undefined`
   // means "use the plugin's settings.json default of 0.0" (i.e. gate
-  // disabled, current behaviour). Set 0.10–0.20 to start filtering.
+  // disabled, current behaviour). Set 0.10 — a near-passthrough floor.
+  // Values at or above 0.20 measurably starve recall (~41.9% of turns
+  // end up with no memories at all on production replay, #3541).
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only

@@ -584,13 +584,13 @@ class OverlapFilterUnitTests(unittest.TestCase):
     def test_threshold_keeps_partial_match_at_or_above(self):
         results = [_memory("deploy production server")]
         kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.5)
-        # 2/min(3, 3) = 0.666… ≥ 0.5 → kept
+        # 2/|M| = 2/3 = 0.666… ≥ 0.5 → kept
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 0)
 
     def test_threshold_drops_partial_match_below(self):
         results = [_memory("deploy production server")]
-        # 2/min(3, 3) = 0.666… < 0.7 → dropped
+        # 2/|M| = 2/3 = 0.666… < 0.7 → dropped
         kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.7)
         self.assertEqual(len(kept), 0)
         self.assertEqual(dropped, 1)

@@ -595,6 +595,15 @@ def containment_overlap(query: str, memory_text: str) -> float:
     fraction of this memory's terms appear in the prompt. See the design
     note above `_OVERLAP_STOPWORDS` for the production measurement.
 
+    That invariance is specifically against growth of NON-OVERLAPPING
+    preamble in the query — the failure mode #3541 hit — and is not
+    unqualified: a short query still scores low against a long memory
+    (whenever `|Q| < threshold * |M|` the memory is dropped however
+    relevant it is), and where `Q ⊆ M` the metric degenerates to exactly
+    Jaccard. So `|M|` is a trade against `min(|Q|, |M|)`, not a strict
+    improvement over it; the paragraph below is the argument for which
+    side of that trade is safer here.
+
     Why ``|M|`` and not ``min(|Q|, |M|)`` (the textbook overlap coefficient):
     the two agree only where the memory is the shorter side, and that is NOT
     a safe assumption here. Replaying real production queries against the
