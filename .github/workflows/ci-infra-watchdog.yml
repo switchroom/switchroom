@@ -27,6 +27,30 @@
 # classification read degrades to a `::warning` + exit 0 instead of
 # reddening main — see the script header for the three 2026-07-20 runs
 # that motivated it.
+#
+# RESIDUAL RISK, stated plainly: a genuine infra force-fail that
+# COINCIDES with a REST API brownout now produces no issue, no red, and
+# no notification — only a `::warning` annotation on a workflow run
+# nobody is watching. That is a real hole. It is accepted because both
+# alternatives are worse: guessing a classification fabricates alerts,
+# and failing the job reports a GitHub outage as a red on the commit,
+# which is the false signal this workflow exists to eliminate. If the
+# correlated case ever bites, the fix is to make the alert path not
+# depend on the read (e.g. always open a low-confidence issue on any
+# unclassifiable main red) — not to re-enable the red.
+#
+# Scope of the hardening, honestly: only the CLASSIFICATION READ is
+# outage-tolerant. The job as a whole is not, and cannot be — it runs on
+# a GitHub-hosted runner, is triggered by a GitHub `workflow_run` event,
+# and checks out from github.com. If GitHub is down hard enough, this
+# workflow does not execute at all. Retry-wrapping the checkout below
+# was considered and rejected: `actions/checkout` already retries its
+# own git operations with backoff, reimplementing that around a
+# composite action adds failure surface rather than removing it, and it
+# would not move the floor set by the runner and the trigger both being
+# GitHub. The checkout is a new dependency this change introduced; it is
+# documented here rather than papered over with `continue-on-error`,
+# which would silently run the watchdog against a missing script.
 name: ci-infra-watchdog
 
 on:

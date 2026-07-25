@@ -50,18 +50,34 @@ WATCHDOG_BASE_DELAY="${WATCHDOG_BASE_DELAY:-2}"
 # failures land on page 2+ is still counted. Without this a large matrix
 # could undercount failures to 0 and mis-classify a genuine red as an
 # infra force-fail — the exact false-positive that defeats this watchdog.
+# NOTE on the stderr handling below — do NOT "simplify" it back to
+# `2>&1`. Capturing stderr into the same variable as stdout looks
+# harmless because we only read it on the failure path, but command
+# substitution merges the streams on the SUCCESS path too. Any benign
+# diagnostic `gh` writes to stderr while still exiting 0 — an OAuth
+# scope warning, a deprecation notice, pagination progress — would be
+# prepended to the JSON, and `jq` below would then die with
+# `parse error: Invalid numeric literal` under `set -euo pipefail`.
+# That is precisely the "watchdog reddens main for a non-reason" bug
+# this script exists to prevent, so keep the streams separate: stdout
+# is data, stderr is diagnostics, and only diagnostics reach the
+# warning message.
 jobs_json=""
+gh_err_file="$(mktemp)"
+gh_err=""
+trap 'rm -f "$gh_err_file"' EXIT
 attempt=1
 delay="$WATCHDOG_BASE_DELAY"
 while :; do
-  if jobs_json="$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" --paginate --slurp 2>&1)"; then
+  if jobs_json="$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" --paginate --slurp 2>"$gh_err_file")"; then
     break
   fi
+  gh_err="$(cat "$gh_err_file")"
   if [ "$attempt" -ge "$WATCHDOG_MAX_ATTEMPTS" ]; then
-    echo "::warning title=ci-infra-watchdog could not classify::Reading jobs for run $RUN_ID failed $WATCHDOG_MAX_ATTEMPTS times (GitHub REST API unavailable). Skipping classification for $WF_NAME @ $HEAD_SHA — no alert raised, and no red reported for a GitHub-side outage. Last error: ${jobs_json}"
+    echo "::warning title=ci-infra-watchdog could not classify::Reading jobs for run $RUN_ID failed $WATCHDOG_MAX_ATTEMPTS times (GitHub REST API unavailable). Skipping classification for $WF_NAME @ $HEAD_SHA — no alert raised, and no red reported for a GitHub-side outage. Last error: ${gh_err}"
     exit 0
   fi
-  echo "gh api attempt ${attempt}/${WATCHDOG_MAX_ATTEMPTS} failed; retrying in ${delay}s. Error: ${jobs_json}"
+  echo "gh api attempt ${attempt}/${WATCHDOG_MAX_ATTEMPTS} failed; retrying in ${delay}s. Error: ${gh_err}"
   sleep "$delay"
   attempt=$((attempt + 1))
   delay=$((delay * 2))

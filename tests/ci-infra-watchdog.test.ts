@@ -54,6 +54,8 @@ function installGhStub(opts: {
   apiFailures?: number
   apiJobsJson?: string
   issueListOut?: string
+  /** Benign diagnostic written to stderr while STILL exiting 0. */
+  apiStderrOnSuccess?: string
 }): { bin: string; calls: () => string[] } {
   const bin = join(sandbox, 'bin')
   const callLog = join(sandbox, 'gh-calls.log')
@@ -72,6 +74,9 @@ if [ "\$1" = "api" ]; then
   if [ "\$n" -le ${opts.apiFailures ?? 0} ]; then
     echo "gh: No server is currently available to service your request. (HTTP 503)" >&2
     exit 1
+  fi
+  if [ -n ${JSON.stringify(opts.apiStderrOnSuccess ?? '')} ]; then
+    printf '%s\n' ${JSON.stringify(opts.apiStderrOnSuccess ?? '')} >&2
   fi
   cat <<'JSONEOF'
 ${opts.apiJobsJson ?? '[{"jobs":[]}]'}
@@ -194,6 +199,27 @@ describe('scripts/ci/infra-watchdog.sh', () => {
     expect(out).toMatch(/genuine red/)
     // 3 api attempts: two 503s + the success.
     expect(stub.calls().filter((c) => c.startsWith('api ')).length).toBe(3)
+    expect(stub.calls().some((c) => c.startsWith('issue create'))).toBe(false)
+  })
+
+  it('benign stderr on a SUCCESSFUL read never reaches the JSON (no 2>&1 stream merge)', () => {
+    // Regression pin for the review finding on this PR's first cut: the
+    // retry loop captured `2>&1`, which merges stderr into stdout on the
+    // SUCCESS path too. `gh` can exit 0 while writing an OAuth-scope
+    // warning / deprecation notice / pagination progress to stderr; that
+    // text lands in front of the JSON, `jq` dies with `parse error:
+    // Invalid numeric literal`, and `set -euo pipefail` reddens main —
+    // reintroducing the exact bug this script exists to prevent.
+    const stub = installGhStub({
+      apiJobsJson: GENUINE_RED,
+      apiStderrOnSuccess:
+        'Warning: your authentication token is missing required scopes [read:org]',
+    })
+    const { code, out } = runWatchdog(stub.bin)
+    assertStubUsed(stub.calls())
+    expect(code).toBe(0)
+    expect(out).not.toMatch(/parse error|Invalid numeric literal/)
+    expect(out).toMatch(/genuine red/)
     expect(stub.calls().some((c) => c.startsWith('issue create'))).toBe(false)
   })
 
