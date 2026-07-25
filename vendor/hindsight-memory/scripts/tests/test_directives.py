@@ -24,6 +24,7 @@ from lib.directives import (  # noqa: E402
     DIRECTIVES_CACHE_TTL_SECONDS,
     MAX_DIRECTIVES,
     _cache_name,
+    count_omitted_directives,
     fetch_active_directives,
     fetch_active_directives_cached,
     format_active_directives_block,
@@ -215,13 +216,16 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
         self.assertNotIn("more, omitted", out)
         self.assertEqual(fake_err.getvalue(), "")
 
-    def test_truncation_warns_on_stderr_not_silently(self):
-        """Exceeding the cap must be VISIBLE to the operator, not silent.
+    def test_truncation_emits_a_stderr_breadcrumb_naming_the_dropped_count(self):
+        """Truncation writes a `[Hindsight]` line to stderr naming total, cap
+        and dropped count, alongside the in-prompt "(+N more, omitted)" footer.
 
-        The in-prompt "(+N more, omitted)" footer only tells the agent; the
-        operator's channel is the hook's stderr (same channel every other
-        operational failure in this module uses), which lands in the agent's
-        container log.
+        Scope note (2026-07-25 review finding 2): this asserts ONLY that the
+        line is written to stderr. It does NOT — and cannot — show that an
+        operator ever sees it; hook stderr is swallowed by Claude Code on a
+        zero exit (zero `[Hindsight]` lines across all 12 live containers).
+        The operator-visible signals are the `directives_omitted` recall_log
+        field and `switchroom doctor`'s directive-count row, tested elsewhere.
         """
         total = MAX_DIRECTIVES + 4
         directives = [
@@ -230,13 +234,31 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
         with patch("sys.stderr", new=StringIO()) as fake_err:
             out = format_active_directives_block(directives)
         err = fake_err.getvalue()
-        self.assertNotEqual(err, "", "truncation must not be silent on stderr")
+        self.assertNotEqual(err, "", "truncation must write a stderr breadcrumb")
         self.assertIn("[Hindsight]", err)
         self.assertIn(str(total), err)
         self.assertIn(f"MAX_DIRECTIVES={MAX_DIRECTIVES}", err)
         self.assertIn("4", err)  # the dropped count
         # The in-prompt footer is still emitted (agent-facing signal).
         self.assertIn("(+4 more, omitted)", out)
+
+    def test_count_omitted_directives_matches_the_rendered_footer(self):
+        """The recall_log's `directives_omitted` number must equal what the
+        block actually dropped — it is the operator-visible record of it."""
+        total = MAX_DIRECTIVES + 4
+        directives = [
+            _directive(f"d{i}", f"c{i}", priority=total - i) for i in range(total)
+        ]
+        with patch("sys.stderr", new=StringIO()):
+            out = format_active_directives_block(directives)
+        self.assertEqual(count_omitted_directives(directives), 4)
+        self.assertIn("(+4 more, omitted)", out)
+        # Under cap → nothing omitted, and no footer to disagree with.
+        under = directives[:2]
+        self.assertEqual(count_omitted_directives(under), 0)
+        self.assertNotIn("more, omitted", format_active_directives_block(under))
+        # Honours a custom cap the same way the formatter does.
+        self.assertEqual(count_omitted_directives(directives, max_directives=5), total - 5)
 
     def test_no_warning_when_nothing_is_truncated(self):
         directives = [_directive("only", "single", priority=5)]

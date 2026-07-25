@@ -264,12 +264,27 @@ export function isHindsightEnabled(
  * revealed by a request is durable") is load-bearing: without it, an
  * exclusion-only mission made the model return an empty/degenerate response
  * on chatty-but-real turns (measured against 6 live retain windows).
+ *
+ * 2026-07-25 (review finding 4 — fleet is not all coding agents): the first
+ * cut of the enumerated exclusions carried a seventh bullet, "Greetings,
+ * acknowledgements, and routine operational chatter". Over half the fleet is
+ * non-coding (health coach, family admin, client-relationship agents), and
+ * "routine operational chatter" is a vibe judgement — exactly the class a
+ * 20B model gets wrong. Combined with the sanctioned empty-list output it
+ * discarded soft taste preferences ("I loved that film") wholesale. Bullets
+ * 1-6 each name a MECHANICALLY recognizable artifact and are kept verbatim;
+ * bullet 7 is narrowed to content-free acknowledgements only, and the
+ * positive clause now names personal likes/dislikes/opinions explicitly so a
+ * casual conversation still yields its durable preference.
  */
 export const DEFAULT_RETAIN_MISSION =
   "Extract durable facts that will still be true and useful weeks from now: " +
   "user preferences and standing rules, ongoing projects and recurring " +
   "commitments, technical and architectural decisions with their rationale, " +
-  "and people/tool relationships. A preference revealed by a request is " +
+  "and people/tool relationships. Personal preferences count: what the user " +
+  "likes, dislikes, enjoys, avoids, or holds an opinion about — films, food, " +
+  "music, places, people, tools — is a durable preference even when the " +
+  "conversation around it is casual. A preference revealed by a request is " +
   "durable — record the preference (what the user likes, wants, or always " +
   "does), not the request itself.\n\n" +
   "NEVER extract:\n" +
@@ -285,9 +300,136 @@ export const DEFAULT_RETAIN_MISSION =
   "- Transient state (unread counts, build status, what is running right now) " +
   "unless the fact is explicitly dated, in which case record it as a dated " +
   "observation.\n" +
-  "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
+  "- Content-free acknowledgements on their own (\"hi\", \"thanks\", \"ok\", " +
+  "\"got it\") — but a casual message that also carries an opinion, a like or " +
+  "a dislike is NOT content-free: keep the preference.\n\n" +
   "If a candidate fact matches an exclusion, drop it rather than rewording " +
   "it. If nothing durable remains, return an empty facts list.";
+
+/**
+ * Ordered registry of every retain mission switchroom has ever shipped as a
+ * DEFAULT, oldest first. Purely historical — do not edit an entry, only
+ * append the outgoing text when `DEFAULT_RETAIN_MISSION` changes.
+ *
+ * Why it exists (2026-07-25 review finding 1): rewriting
+ * `DEFAULT_RETAIN_MISSION` used to reach NO existing agent. Three independent
+ * paths blocked it — the plugin's `ensure_bank_mission` short-circuits on the
+ * already-seeded flag in `bank_missions.json`, scaffold seeds the default only
+ * on the fresh-agent path, and `reconcileAgent` pushed `retain_mission` only
+ * when the operator had set one in yaml. So every live bank kept the mission
+ * it was born with (verified 2026-07-25: all 13 production banks carried the
+ * identical 2026-07-19 default).
+ *
+ * Reconcile now upgrades the mission on `switchroom apply` — the same
+ * rationale as the `reflect_mission` / `observations_mission` push it sits
+ * beside. The guard that made the old behaviour defensible ("an operator's
+ * customized mission is never clobbered") is preserved EXACTLY by this
+ * registry: the upgrade fires only when the bank's current mission
+ * byte-equals a known previous default (or is unset). Any customization —
+ * operator yaml, a hand-edit through the Hindsight API, even a whitespace
+ * difference — matches nothing here and is left untouched.
+ */
+export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
+  // 3e028eeb3 (2026-05) — the vendored plugin's original settings.json
+  // `retainMission`, pushed bank-side by lib/bank.py ensure_bank_mission.
+  "Extract technical decisions, architectural choices, user preferences, project context, and people/tool relationships. Ignore routine greetings and transient operational details.",
+  // d7c406994 (#458) — first switchroom-seeded DEFAULT_RETAIN_MISSION.
+  "Extract user preferences, ongoing projects, recurring commitments, " +
+    "important context, and durable facts that should help across future " +
+    "conversations. Skip one-off chatter and temporary task noise.",
+  // 9a9b7176c (#3418) — added the in-flight-narration carve-out. This is the
+  // text every live bank was carrying as of 2026-07-25.
+  "Extract user preferences, ongoing projects, recurring commitments, " +
+    "important context, and durable facts that should help across future " +
+    "conversations. Skip one-off chatter and temporary task noise, " +
+    "including in-flight workflow/process narration (a sub-task started, " +
+    "paused, or is still running) — only retain the outcome once a task " +
+    "actually completes or a decision is made.",
+];
+
+/**
+ * Should reconcile overwrite this bank's retain mission with the current
+ * `DEFAULT_RETAIN_MISSION`?
+ *
+ * True when the bank has no mission at all, or its mission byte-equals a
+ * superseded default. False for anything else — including the current
+ * default (nothing to do) and any operator customization (never clobbered).
+ */
+export function isUpgradableRetainMission(current: string | null | undefined): boolean {
+  if (current == null || current.trim() === "") return true;
+  return SUPERSEDED_RETAIN_MISSIONS.includes(current);
+}
+
+/**
+ * Reconcile-time retain-mission decision (pure).
+ *
+ * @param configured `agents.<name>.memory.retain_mission` from yaml, if any.
+ * @param current    The bank's live `retain_mission`; null ONLY when the read
+ *                   succeeded and the field is genuinely unset. A FAILED read
+ *                   must not be passed as null — the caller skips the retain
+ *                   push entirely in that case, because "unknown" must never
+ *                   be treated as "upgradable" (that would clobber a
+ *                   customized mission whenever Hindsight hiccups).
+ *
+ * Three outcomes:
+ *  - `"config"`   — the operator set a mission in yaml; push it verbatim
+ *                   (unchanged pre-existing behaviour, and it wins outright).
+ *  - `"upgrade"`  — no yaml mission and the bank is carrying an unset or
+ *                   superseded default; push `DEFAULT_RETAIN_MISSION`.
+ *  - `"none"`     — the bank is already current, or carries a mission that is
+ *                   NOT a known default (i.e. someone customized it). Leave
+ *                   it alone.
+ */
+export function decideRetainMissionUpgrade(
+  configured: string | undefined | null,
+  current: string | null,
+): { action: "config" | "upgrade" | "none"; mission?: string } {
+  if (configured) return { action: "config", mission: configured };
+  if (current === DEFAULT_RETAIN_MISSION) return { action: "none" };
+  if (isUpgradableRetainMission(current)) {
+    return { action: "upgrade", mission: DEFAULT_RETAIN_MISSION };
+  }
+  return { action: "none" };
+}
+
+/**
+ * Read a bank's current `retain_mission` from Hindsight.
+ *
+ * Uses the REST config surface, NOT MCP: `get_bank` returns only
+ * bank_id/name/disposition/mission (verified live 2026-07-25 against
+ * switchroom-hindsight) — the retain mission is a CONFIG field and is
+ * readable only at `GET /v1/default/banks/<id>/config`. Same asymmetry as
+ * the write path, where `retain_mission` must ride in `config_updates`.
+ *
+ * Best-effort with a short timeout; never throws. `{ ok: true, mission: null }`
+ * means the bank exists but has no retain mission set.
+ */
+export async function fetchBankRetainMission(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<{ ok: true; mission: string | null } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+  const base = apiUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  const url = `${base}/v1/default/banks/${encodeURIComponent(bankId)}/config`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchImpl(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
+    const body = (await resp.json()) as {
+      config?: { retain_mission?: string | null } | null;
+    };
+    const mission = body?.config?.retain_mission;
+    return { ok: true, mission: typeof mission === "string" ? mission : null };
+  } catch (err) {
+    clearTimeout(timeout);
+    if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
+    return { ok: false, reason: String((err as Error).message ?? err) };
+  }
+}
 
 /**
  * Hindsight bank disposition traits (1-5 each). Mirrors the engine's flat

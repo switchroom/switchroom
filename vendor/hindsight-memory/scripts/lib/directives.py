@@ -25,18 +25,30 @@ from .state import list_state_names, read_state, remove_state, write_state
 
 # Sanity cap on how many directives we ever inject into the prompt.
 #
-# This number is a COST TRADEOFF, not an arbitrary limit: the
-# <active_directives> block is injected into EVERY turn's prompt, so each extra
-# directive is paid for on every turn of every session. 30 clears the observed
-# fleet maximum (24 active directives on the busiest bank as of 2026-07) with
-# headroom, while staying bounded enough that a runaway bank cannot quietly eat
-# the context window. Raising it further is a legitimate call, but make it
-# deliberately and with the per-turn token cost in mind.
+# This number is a COST TRADEOFF, not an arbitrary limit, and the real cost is
+# larger than "one block": `recall.py` rebuilds the <active_directives> block
+# on EVERY UserPromptSubmit (the `format_active_directives_block` call there)
+# with no per-session dedupe and no "unchanged since last turn" suppression,
+# and `additionalContext` is APPENDED into the conversation. So the block is
+# re-paid every turn and accumulates — roughly (block size) x (turn count) over
+# a session, not once.
+#
+# Measured live 2026-07-25 (fleet REST `/directives`):
+#   overlord  12 active  ~9.8 KB   ~816 chars avg  (one 2,981-char outlier)
+#   klanker   17 active  ~9.9 KB   ~585 chars avg
+#   gymbro     9 active  ~9.3 KB  ~1038 chars avg
+# At the ~700-char fleet average, a bank sitting at this cap injects ~21 KB —
+# on the order of 5,000-6,000 tokens per injection, per turn, cumulative across
+# the session. 30 is chosen to clear the observed fleet maximum with headroom;
+# it is NOT a size at which a runaway bank becomes harmless. The actual defence
+# against pile-up is the doctor's WARN/FAIL on the active directive count
+# (src/cli/doctor-memory.ts), not this cap. Raising it further is a legitimate
+# call — make it deliberately, with the per-turn-times-turns cost in mind, and
+# move the doctor thresholds with it.
 #
 # Banks with more active directives than this are pathological; we truncate
-# with an in-prompt footer AND a stderr warning (see
-# `format_active_directives_block`) so neither the agent nor the operator is
-# left guessing about dropped rules.
+# with an in-prompt footer, a `directives_omitted` field on the recall_log row,
+# and a stderr warning (see `format_active_directives_block`).
 MAX_DIRECTIVES = 30
 
 # Hard timeout for the list_directives call. The recall hook is on the
@@ -219,6 +231,16 @@ def invalidate_directives_cache(bank_id: Optional[str] = None) -> None:
         remove_state(name)
 
 
+def count_omitted_directives(directives: list, max_directives: int = MAX_DIRECTIVES) -> int:
+    """How many directives `format_active_directives_block` would DROP.
+
+    Pure counterpart of the truncation branch below, so `recall.py` can put the
+    number on the recall_log row without re-deriving the cap. 0 when nothing is
+    dropped.
+    """
+    return max(0, len(directives) - max_directives)
+
+
 def format_active_directives_block(directives: list, max_directives: int = MAX_DIRECTIVES) -> Optional[str]:
     """Format directives into the <active_directives> block string.
 
@@ -263,12 +285,24 @@ def format_active_directives_block(directives: list, max_directives: int = MAX_D
     if omitted > 0:
         lines.append("")
         lines.append(f"(+{omitted} more, omitted)")
-        # Truncation must never be SILENT to the operator. The in-prompt footer
-        # above only tells the AGENT; this stderr warn (the same channel every
-        # other operational failure in this module uses — see
-        # `_fetch_directives_with_status`) puts it in the agent's container log
-        # so `docker logs` / `switchroom doctor` triage can see that real rules
-        # were dropped from the turn.
+        # The in-prompt footer above only tells the AGENT. This stderr warn is
+        # the same channel every other operational failure in this module uses
+        # (see `_fetch_directives_with_status`), and it is a LAST-RESORT
+        # breadcrumb only — do NOT rely on it reaching an operator.
+        #
+        # Measured 2026-07-25: `docker logs --tail 20000` across all 12 running
+        # agent containers returns ZERO `[Hindsight]` lines, and nothing under
+        # ~/.switchroom/logs/ contains them either, despite months of runtime
+        # and several long-standing stderr paths in recall.py. Claude Code
+        # appears to swallow hook stderr on a zero exit, so hook stderr is not
+        # an operator-visible channel.
+        #
+        # The channels that DO reach an operator:
+        #   * the `directives_omitted` field on the recall_log row
+        #     (state/recall_log.jsonl — see `count_omitted_directives`), and
+        #   * `switchroom doctor`'s WARN/FAIL on the bank's active directive
+        #     count (src/cli/doctor-memory.ts `classifyDirectiveCount`), which
+        #     reads the count from the same REST surface this module fetches.
         print(
             f"[Hindsight] directive truncation: {total} active directives exceeds "
             f"MAX_DIRECTIVES={max_directives} — {omitted} lowest-priority "

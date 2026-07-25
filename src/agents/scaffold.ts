@@ -663,7 +663,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -5226,11 +5226,13 @@ export function scaffoldAgent(
     // Update bank missions — gated on the bank actually existing.
     //
     // Mission selection: explicit user yaml wins. When the operator hasn't
-    // set a `retain_mission`, scaffold (NOT reconcile) seeds the upstream-
-    // recommended default — this lifts retained memory quality on fresh
-    // agents without touching agents that already have a customized
-    // mission. `reconcileAgent` deliberately does not push the default,
-    // so existing agents' Hindsight-side missions stay untouched.
+    // set a `retain_mission`, scaffold seeds DEFAULT_RETAIN_MISSION
+    // unconditionally — a brand-new bank has nothing to clobber.
+    //
+    // `reconcileAgent` handles the EXISTING-agent case separately (see the
+    // retain_mission block there): it upgrades the mission only when the
+    // bank's current text byte-equals a known superseded default, so a
+    // customized mission survives `switchroom apply`.
     bankOpsChain.then((bankReady) => {
       if (!bankReady) return;
 
@@ -7490,15 +7492,13 @@ function reconcileAgentInner(
         return false;
       });
 
-    bankOpsChain.then((bankReady) => {
+    bankOpsChain.then(async (bankReady) => {
       if (!bankReady) return;
 
-      // Reconcile still does NOT seed the DEFAULT_RETAIN_MISSION (that stays
-      // scaffold-only, so an operator's customized retain mission is never
-      // clobbered). But it DOES push reflect_mission / observations_mission /
-      // disposition — including the built-in profile defaults — so EXISTING
-      // banks pick up Phase 2 changes on `switchroom apply`, not only fresh
-      // ones. Config wins over profile defaults; disposition merges per-key.
+      // Reconcile pushes reflect_mission / observations_mission / disposition
+      // — including the built-in profile defaults — so EXISTING banks pick up
+      // Phase 2 changes on `switchroom apply`, not only fresh ones. Config
+      // wins over profile defaults; disposition merges per-key.
       const extras = resolveBankMissionExtras(
         agentConfig.memory,
         agentConfig.extends ?? DEFAULT_PROFILE,
@@ -7514,8 +7514,41 @@ function reconcileAgentInner(
       if (agentConfig.memory?.bank_mission) {
         missions.bank_mission = agentConfig.memory.bank_mission;
       }
-      if (agentConfig.memory?.retain_mission) {
+
+      // retain_mission on reconcile (2026-07-25 review finding 1). Until now
+      // this pushed ONLY when the operator had set it in yaml, which meant a
+      // rewrite of DEFAULT_RETAIN_MISSION reached NO existing agent: the
+      // plugin's ensure_bank_mission short-circuits on the already-seeded flag
+      // and scaffold seeds only fresh agents, so every live bank kept the
+      // mission it was born with. It now follows the same "push the default so
+      // existing banks pick up changes" rule as reflect/observations above —
+      // but ONLY when the bank's current mission byte-equals a known previous
+      // default (SUPERSEDED_RETAIN_MISSIONS) or is unset. A customized mission
+      // matches nothing in that registry and is still never clobbered.
+      //
+      // On a failed read we push nothing: "unknown" must not be treated as
+      // "upgradable".
+      const currentRetain = await fetchBankRetainMission(apiUrl, hindsightBankId, {
+        timeoutMs: 5000,
+      });
+      if (currentRetain.ok) {
+        const decision = decideRetainMissionUpgrade(
+          agentConfig.memory?.retain_mission,
+          currentRetain.mission,
+        );
+        if (decision.mission) missions.retain_mission = decision.mission;
+        if (decision.action === "upgrade") {
+          console.log(
+            `  ${chalk.green("✓")} Upgrading superseded default retain_mission for ${formatAgentBankLabel(name, hindsightBankId)}`,
+          );
+        }
+      } else if (agentConfig.memory?.retain_mission) {
+        // Config wins outright and needs no read — push it regardless.
         missions.retain_mission = agentConfig.memory.retain_mission;
+      } else {
+        console.warn(
+          `  ${chalk.yellow("⚠")} Could not read current retain_mission for ${formatAgentBankLabel(name, hindsightBankId)} (${currentRetain.reason}) — leaving it untouched`,
+        );
       }
 
       if (Object.keys(missions).length > 0) {

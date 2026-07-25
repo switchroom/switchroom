@@ -13,13 +13,26 @@
   block is injected on EVERY turn — this is a per-turn token cost, not a free
   knob; the constant is commented as such). `format_active_directives_block`
   now also prints a `[Hindsight] directive truncation: …` warn line to stderr
-  whenever it drops directives — the same stderr channel the module already
-  uses for fetch failures, so it lands in the agent's container log. Paired
-  switchroom-side: `src/cli/doctor-memory.ts` `MAX_DIRECTIVES` 15 → 30 and
+  whenever it drops directives, and `recall.py` records the dropped count as
+  `directives_omitted` on the recall_log row.
+
+  Visibility correction (2026-07-25 review): hook stderr is NOT an operator
+  channel. `docker logs --tail 20000` across all 12 live agent containers
+  returns ZERO `[Hindsight]` lines, and nothing under `~/.switchroom/logs/`
+  contains them either, despite months of runtime and several long-standing
+  stderr paths in `recall.py` — Claude Code swallows hook stderr on a zero
+  exit. The stderr line is kept as a last-resort breadcrumb; the channels that
+  actually reach an operator are the `directives_omitted` recall_log field and
+  `switchroom doctor`'s directive-count row. Paired switchroom-side:
+  `src/cli/doctor-memory.ts` `MAX_DIRECTIVES` 15 → 30 and
   `DIRECTIVE_WARN_THRESHOLD` 12 → 24 (a drift-guard test pins the TS constant
-  to the Python one). Acceptance: `scripts/tests/test_directives.py`
+  to the Python one). The `MAX_DIRECTIVES` cost comment now states the real
+  mechanism (rebuilt every `UserPromptSubmit`, appended into the conversation,
+  so cost is per-turn CUMULATIVE) with the measured live figures. Acceptance:
+  `scripts/tests/test_directives.py`
   (`test_cap_is_30_and_clears_the_observed_fleet_maximum`,
-  `test_truncation_warns_on_stderr_not_silently`).
+  `test_truncation_emits_a_stderr_breadcrumb_naming_the_dropped_count`,
+  `test_count_omitted_directives_matches_the_rendered_footer`).
 
 - **`retainMission` rewritten with explicit, enumerated exclusions**
   (`settings.json`). The extraction model is a small local `gpt-oss-20b`, and
@@ -38,6 +51,19 @@
   extraction step: switchroom seeds the bank-side mission at scaffold, and the
   plugin independently pushes this one via `lib/bank.py: ensure_bank_mission`
   on a fresh state dir. Before this change the two texts differed.
+
+  Two 2026-07-25 review corrections folded in. (1) The rewrite reached no
+  existing agent: `ensure_bank_mission` short-circuits on the already-seeded
+  flag in `bank_missions.json` and switchroom seeded the default only on the
+  fresh-agent path, so all 13 live banks kept the 2026-07-19 text. Switchroom's
+  `reconcileAgent` now upgrades the bank mission on `switchroom apply` when the
+  bank's current text byte-equals a known previous default
+  (`SUPERSEDED_RETAIN_MISSIONS`); a customized mission still matches nothing and
+  is never clobbered. (2) The exclusion bullet "Greetings, acknowledgements, and
+  routine operational chatter" was a vibe judgement that a 20B model applies
+  badly and that discarded soft taste preferences on the fleet's non-coding
+  agents; it is narrowed to content-free acknowledgements, and the positive
+  clause now names personal likes/dislikes/opinions explicitly.
 
 - **`recallContextTurns` default `1` → `2`** (switchroom hindsight-leverage
   PR2, workstream A2). A bare follow-up user message ("and the port?", "what

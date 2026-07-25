@@ -1,12 +1,19 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   updateBankMissions,
   DEFAULT_RETAIN_MISSION,
+  SUPERSEDED_RETAIN_MISSIONS,
+  isUpgradableRetainMission,
+  decideRetainMissionUpgrade,
+  fetchBankRetainMission,
   resolveBankMissionExtras,
   PROFILE_MEMORY_DEFAULTS,
 } from "../src/memory/hindsight.js";
+import { reconcileAgent, scaffoldAgent } from "../src/agents/scaffold.js";
+import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 import { AgentMemorySchema } from "../src/config/schema.js";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 /** Drive updateBankMissions with a two-call mock and return the update_bank args. */
@@ -82,23 +89,234 @@ describe("DEFAULT_RETAIN_MISSION", () => {
 });
 
 describe("scaffold seed wiring", () => {
-  // Source-structure assertion: scaffold imports the constant and uses
-  // it as the retain_mission default, while reconcile does NOT (existing
-  // agents' missions stay untouched).
-  it("scaffold imports DEFAULT_RETAIN_MISSION but reconcile path does not seed it", () => {
+  // Source-structure assertion: scaffold uses the constant as the
+  // retain_mission default on the FRESH-agent path.
+  it("scaffold seeds DEFAULT_RETAIN_MISSION exactly once, on the fresh-agent path", () => {
     const fs = require("fs");
     const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-    expect(scaffoldSource).toContain("DEFAULT_RETAIN_MISSION");
     expect(scaffoldSource).toContain("seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION");
     // The `?? DEFAULT_RETAIN_MISSION` seed-default fallback must appear
-    // EXACTLY ONCE (scaffold only). More than one occurrence means the
-    // seed-default behaviour was copied into reconcile, which would clobber
-    // an operator's customized retain mission on every `switchroom apply`.
+    // EXACTLY ONCE (scaffold only). Reconcile must NOT reach for the same
+    // unconditional fallback — it goes through decideRetainMissionUpgrade,
+    // which refuses to clobber a customized mission.
     const seedOccurrences = scaffoldSource.split("?? DEFAULT_RETAIN_MISSION").length - 1;
     expect(seedOccurrences).toBe(1);
-    // Reconcile still gates its retain push on explicit operator config.
-    expect(scaffoldSource).toContain("if (agentConfig.memory?.retain_mission) {");
   });
+});
+
+// --- 2026-07-25 review finding 1: the mission upgrade must reach live banks ---
+
+describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
+  it("never contains the current default (that would make every apply a no-op decision)", () => {
+    expect(SUPERSEDED_RETAIN_MISSIONS).not.toContain(DEFAULT_RETAIN_MISSION);
+  });
+
+  it("carries the 2026-07-19 text every live bank was found holding on 2026-07-25", () => {
+    // Read verbatim off the fleet REST config surface during the review.
+    const live =
+      "Extract user preferences, ongoing projects, recurring commitments, " +
+      "important context, and durable facts that should help across future " +
+      "conversations. Skip one-off chatter and temporary task noise, " +
+      "including in-flight workflow/process narration (a sub-task started, " +
+      "paused, or is still running) — only retain the outcome once a task " +
+      "actually completes or a decision is made.";
+    expect(SUPERSEDED_RETAIN_MISSIONS).toContain(live);
+    expect(isUpgradableRetainMission(live)).toBe(true);
+  });
+
+  it("treats an unset mission as upgradable and a customized one as not", () => {
+    expect(isUpgradableRetainMission(null)).toBe(true);
+    expect(isUpgradableRetainMission("")).toBe(true);
+    expect(isUpgradableRetainMission("   ")).toBe(true);
+    expect(isUpgradableRetainMission("Only remember what Ken says about cricket.")).toBe(false);
+    // A byte-level edit of a known default is a customization, not a default.
+    expect(isUpgradableRetainMission(SUPERSEDED_RETAIN_MISSIONS[0] + " ")).toBe(false);
+  });
+});
+
+describe("decideRetainMissionUpgrade", () => {
+  it("upgrades a superseded default to the current one", () => {
+    for (const old of SUPERSEDED_RETAIN_MISSIONS) {
+      expect(decideRetainMissionUpgrade(undefined, old)).toEqual({
+        action: "upgrade",
+        mission: DEFAULT_RETAIN_MISSION,
+      });
+    }
+  });
+
+  it("leaves a customized mission alone", () => {
+    expect(decideRetainMissionUpgrade(undefined, "hand-written mission")).toEqual({
+      action: "none",
+    });
+  });
+
+  it("does nothing when the bank already carries the current default", () => {
+    expect(decideRetainMissionUpgrade(undefined, DEFAULT_RETAIN_MISSION)).toEqual({
+      action: "none",
+    });
+  });
+
+  it("operator yaml wins outright, even over a customized bank mission", () => {
+    expect(decideRetainMissionUpgrade("from yaml", "hand-written mission")).toEqual({
+      action: "config",
+      mission: "from yaml",
+    });
+  });
+});
+
+describe("fetchBankRetainMission", () => {
+  it("reads config.retain_mission off the REST config surface (NOT MCP get_bank)", async () => {
+    let seen = "";
+    const fetchImpl = vi.fn(async (url: string) => {
+      seen = url;
+      return {
+        ok: true,
+        json: async () => ({ config: { retain_mission: "current text" } }),
+      } as any;
+    });
+    const r = await fetchBankRetainMission("http://h:18888/mcp/", "a b", {
+      fetchImpl: fetchImpl as any,
+    });
+    expect(seen).toBe("http://h:18888/v1/default/banks/a%20b/config");
+    expect(r).toEqual({ ok: true, mission: "current text" });
+  });
+
+  it("returns mission null when the field is absent", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ config: {} }) }) as any);
+    expect(await fetchBankRetainMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }))
+      .toEqual({ ok: true, mission: null });
+  });
+
+  it("reports failure rather than throwing on a non-2xx", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 503 }) as any);
+    expect(await fetchBankRetainMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }))
+      .toEqual({ ok: false, reason: "HTTP 503" });
+  });
+});
+
+/**
+ * End-to-end outcome test for review finding 1.
+ *
+ * The headline of the original PR — a rewritten DEFAULT_RETAIN_MISSION —
+ * reached NO existing agent, because `reconcileAgent` pushed `retain_mission`
+ * only when the operator had set one in yaml. These tests drive the real
+ * `reconcileAgent` against a stubbed Hindsight and assert what actually goes
+ * out on the wire.
+ *
+ * Verified to bite (2026-07-25):
+ *  - reverting `src/agents/scaffold.ts` to the pre-fix reconcile block fails
+ *    "PUSHES the current default…" (no retain_mission on the wire at all).
+ *  - making `decideRetainMissionUpgrade` push unconditionally — the naive
+ *    version of this fix — fails "does NOT clobber…". That test cannot fail
+ *    on the pre-fix code (which pushed nothing); its job is to pin the guard
+ *    that makes the new push safe.
+ */
+describe("reconcileAgent — retain_mission upgrade on existing banks", () => {
+  const telegramConfig: TelegramConfig = {
+    bot_token: "123456:ABC-DEF",
+    forum_chat_id: "-1001234567890",
+  };
+  const switchroomConfig: SwitchroomConfig = {
+    agents: {},
+    telegram: telegramConfig,
+    defaults: {},
+    memory: { backend: "hindsight", config: { url: "http://hindsight.test/mcp/" } },
+  } as unknown as SwitchroomConfig;
+
+  const realFetch = globalThis.fetch;
+  let tmpDir = "";
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = "";
+  });
+
+  /**
+   * Stub Hindsight: MCP create_bank/update_bank succeed, and the REST config
+   * endpoint reports `currentMission`. Resolves with the update_bank args once
+   * the fire-and-forget mission push lands (reconcile does not await it).
+   */
+  function stubHindsight(
+    currentMission: string | null,
+    config: AgentConfig,
+  ): Promise<Record<string, unknown>> {
+    // Scaffold FIRST, memory disabled, so the fresh-agent seed path issues no
+    // Hindsight traffic that could be mistaken for the reconcile push.
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-retain-mission-"));
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
+    let resolveArgs: (a: Record<string, unknown>) => void;
+    const seen = new Promise<Record<string, unknown>>((r) => (resolveArgs = r));
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith("/config")) {
+        return {
+          ok: true,
+          json: async () => ({ config: { retain_mission: currentMission } }),
+        } as any;
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (body?.params?.name === "update_bank") {
+        resolveArgs(body.params.arguments as Record<string, unknown>);
+      }
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+    return seen;
+  }
+
+  function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+    return {
+      extends: "default",
+      topic_name: "Test Topic",
+      schedule: [],
+      ...overrides,
+    } as AgentConfig;
+  }
+
+  /**
+   * Scaffold the agent dir with memory DISABLED (so the fresh-agent seed path
+   * issues no Hindsight traffic and cannot be mistaken for the reconcile
+   * push), then reconcile with the hindsight-enabled config.
+   */
+  function runReconcile(config: AgentConfig) {
+    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+  }
+
+  it("PUSHES the current default when the bank holds a superseded default", async () => {
+    const config = makeAgentConfig();
+    const seen = stubHindsight(
+      SUPERSEDED_RETAIN_MISSIONS[SUPERSEDED_RETAIN_MISSIONS.length - 1],
+      config,
+    );
+    runReconcile(config);
+    const args = await seen;
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe(
+      DEFAULT_RETAIN_MISSION,
+    );
+  }, 15_000);
+
+  it("does NOT clobber an operator-customized bank mission", async () => {
+    const config = makeAgentConfig({ memory: { reflect_mission: "persona" } } as Partial<AgentConfig>);
+    const seen = stubHindsight("Remember only what Ken says about cricket.", config);
+    runReconcile(config);
+    const args = await seen;
+    expect(args.config_updates).toBeDefined();
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBeUndefined();
+  }, 15_000);
+
+  it("pushes the operator's yaml retain_mission verbatim when set", async () => {
+    const config = makeAgentConfig({
+      memory: { retain_mission: "operator text" },
+    } as Partial<AgentConfig>);
+    const seen = stubHindsight(SUPERSEDED_RETAIN_MISSIONS[0], config);
+    runReconcile(config);
+    const args = await seen;
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe("operator text");
+  }, 15_000);
 });
 
 describe("updateBankMissions", () => {

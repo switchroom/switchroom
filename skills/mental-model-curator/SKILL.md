@@ -158,7 +158,8 @@ A second, independent job of this skill: keep the bank's **active directives**
 lean. Directives are hard rules applied on every `reflect` — but the bank caps
 active directives at **`MAX_DIRECTIVES=30`**. Past the cap, the lowest-priority
 directives are **truncated** from the `<active_directives>` recall block and never
-reach the agent (the recall hook warns to stderr when it happens) — so an
+reach the agent (recorded as `directives_omitted` on the recall_log row — the
+recall hook's stderr warning is swallowed by Claude Code, so don't look there) — so an
 overloaded, overlapping, or stale directive set doesn't just add noise, it drops
 your real guardrails. Fleet doctor WARNs at >24 active and FAILs at >30
 (workstream C2), and its fix text points

@@ -71,6 +71,13 @@ export const DIRECTIVE_WARN_THRESHOLD = 24;
  *   approaching the truncating cap.
  * - `> MAX_DIRECTIVES` (31+) → **fail**: the recall block truncates the overflow;
  *   the lowest-priority directives never reach the agent.
+ *
+ * This row is THE operator-visible truncation signal. The recall hook also
+ * prints a `[Hindsight]` stderr warning, but that is not a channel an operator
+ * actually reads: `docker logs --tail 20000` across all 12 running agent
+ * containers returned zero `[Hindsight]` lines on 2026-07-25 (Claude Code
+ * swallows hook stderr on a zero exit). The other durable record is the
+ * `directives_omitted` field on the recall_log row.
  */
 export function classifyDirectiveCount(
   count: number | null,
@@ -86,8 +93,9 @@ export function classifyDirectiveCount(
       detail:
         `${count} active directives — exceeds MAX_DIRECTIVES=${MAX_DIRECTIVES}, so the ` +
         `${truncated} lowest-priority directive(s) are truncated from the ` +
-        `<active_directives> recall block and never reach the agent (the recall ` +
-        `hook also warns to stderr on every such turn)`,
+        `<active_directives> recall block and never reach the agent (this row and ` +
+        `the recall_log's directives_omitted field are the operator-visible signal; ` +
+        `the recall hook's stderr warning is swallowed by Claude Code)`,
       fix:
         "Retire or merge stale directives so the active count is at or below " +
         `${MAX_DIRECTIVES} (deletes stay operator-approved). The mental-model-curator ` +
