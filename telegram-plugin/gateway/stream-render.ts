@@ -372,10 +372,6 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // `activityMessageId` + `activityEverOpened` so `renderActivityFeed`
         // EDITS the existing card instead of opening a second one, and so the
         // turn's own end-of-turn `clearActivitySummary` finalizes it (lever 3).
-        // The handback turn also gets the turn-long typing loop it never had —
-        // whether or not a card was painted (the debounce may not have fired) —
-        // stopped by the canonical turn-end (`purgeReactionTracking →
-        // stopTurnTypingLoop`).
         if (HANDBACK_PRETURN_ENABLED) {
           const handbackAdoption = handbackPreturnSignal.tryAdopt(turnId)
           if (handbackAdoption != null) {
@@ -383,9 +379,32 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               next.activityMessageId = handbackAdoption.activityMessageId
               next.activityEverOpened = true
             }
-            startTurnTypingLoop(ev.chatId, enqThreadIdNum ?? null)
+            // Observability (#3544): adoption is the rare, previously-silent
+            // branch — one line per adopted handback turn, not per turn.
+            process.stderr.write(
+              `telegram gateway: handback pre-turn adopted turnId=${turnId} ` +
+                `key=${handbackAdoption.statusKey} card=${handbackAdoption.activityMessageId ?? 'none'}\n`,
+            )
           }
         }
+        // #3544 — arm the turn-long `typing…` loop for EVERY minted turn,
+        // unconditionally. It used to hang off the handback ADOPTION above,
+        // which misses whenever the pre-turn entry was deduped (parallel
+        // workers on one topic), had no derivable turn id, or was already
+        // reaped — and the whole compose window went dark. Only the real-inbound
+        // path (`turn-start-surfaces.ts`) armed a loop, so a synthetic turn
+        // (handback / cron / wake) could have none at all. Unconditional is safe
+        // and costs nothing extra on the wire:
+        //   - `turnTypingLoop.start` is restart-safe (stops any prior loop on
+        //     the key first, so a real inbound's loop is replaced, not doubled);
+        //   - every send goes through the SHARED per-chat-key emitter floor
+        //     (`typing-emitter.ts`, TYPING_FLOOR_MS) so N arms on one chat still
+        //     cost at most one chat action per floor window — the 2026-07-11
+        //     flood-ban guard is what makes arming more loops free;
+        //   - `turn-end.ts` (`purgeReactionTracking → stopTurnTypingLoop`) is
+        //     already the single stop-owner for ALL turns, and a start is
+        //     self-healing anyway, so this cannot leak an interval.
+        startTurnTypingLoop(ev.chatId, enqThreadIdNum ?? null)
         // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
         // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
         // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is

@@ -32,6 +32,12 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
 import { BackstopDeliveryLedger } from '../gateway/backstop-delivery.js'
 import { redact } from '../secret-detect/redact.js'
+import { createTurnTypingLoop } from '../gateway/turn-typing-loop.js'
+import {
+  createTypingEmitter,
+  TYPING_FLOOR_MS,
+  TYPING_REFRESH_MS,
+} from '../typing-emitter.js'
 import type { CurrentTurn } from '../gateway/gateway.js'
 
 const CHAT = '1001'
@@ -190,7 +196,8 @@ function makeStreamDeps(opts?: {
     handlePtyPartial: noop,
     isDmChatId: () => true,
     isLegitimatelyWorking: () => false,
-    makeNarrativeGate: () => ({ show: noop, stage: noop, resolveOnTool: noop, flushAtTurnEnd: noop }),
+    // `teardown` is exercised when a SECOND enqueue supersedes a prior turn.
+    makeNarrativeGate: () => ({ show: noop, stage: noop, resolveOnTool: noop, flushAtTurnEnd: noop, teardown: noop }),
     promoteQueuedStatus: noop,
     purgeReactionTracking: noop,
     redactOutboundText: (t: string) => redact(t),
@@ -547,6 +554,18 @@ describe('structural — the singleton lives once in gateway, never in the modul
     expect(body).toContain('handleSessionEventCore(gatewayStreamRenderDeps(), ev)')
   })
 
+  it('#3544 — the handback seam\'s hasLiveTurn wiring verifies the live turn OWNS the key', () => {
+    // Under the emission-authority flag OFF (default) `currentTurnMap.get(key)`
+    // returns the most-recent singleton regardless of key. Without the
+    // statusKey ownership check, a live turn on ANOTHER chat would suppress the
+    // orphan reap's stop and leak a typing interval forever.
+    const after = gatewaySrc.split('hasLiveTurn: (key) => {')[1] ?? ''
+    const body = after.split('\n  },')[0] ?? after
+    expect(body).toContain('currentTurnMap.get(key)')
+    expect(body).toContain('live.endedAt != null')
+    expect(body).toMatch(/statusKey\(live\.sessionChatId, live\.sessionThreadId\) === key/)
+  })
+
   it('the module never reads the currentTurn global — only getCurrentTurn() (Amendment 9)', () => {
     const fnBody = streamSrc.split('export function handleSessionEvent(')[1] ?? ''
     // No bare `currentTurn` value reads survive outside comments; the live-read
@@ -557,5 +576,88 @@ describe('structural — the singleton lives once in gateway, never in the modul
       .join('\n')
     expect(codeOnly).not.toMatch(/[^.\w]currentTurn\b(?!\s*[:,)])/)
     expect(codeOnly).toMatch(/getCurrentTurn\(\)/)
+  })
+})
+
+// ── #3544: every minted turn is lit, not just an ADOPTING handback turn ─────
+// The defect: the turn-long `typing…` loop was armed only inside
+// `if (handbackAdoption != null)`. A handback whose pre-turn entry was deduped
+// (parallel workers on one topic), had no derivable turn id, or was already
+// reaped adopts NOTHING — and, being a synthetic turn, never went through the
+// real-inbound arm in turn-start-surfaces either. Result: zero typing for the
+// whole compose window. These drive the REAL `handleSessionEvent` enqueue seam
+// against a REAL `createTurnTypingLoop` over the REAL `createTypingEmitter`, so
+// the assertion is the OUTCOME the user sees — chat actions on the wire — not
+// the call.
+describe('#3544 — turn-start typing is unconditional at the enqueue seam', () => {
+  interface TypingRig {
+    h: StreamHarness
+    sent: Array<{ chatId: string; threadId: number | null }>
+    emitter: ReturnType<typeof createTypingEmitter>
+    loop: ReturnType<typeof createTurnTypingLoop>
+    clock: { t: number }
+  }
+  function makeTypingRig(opts?: { adopts?: boolean }): TypingRig {
+    const h = makeStreamDeps({ turn: null })
+    const sent: Array<{ chatId: string; threadId: number | null }> = []
+    const clock = { t: 1_000_000 }
+    const tKey = (c: string, t: number | null) => `${c}:${t ?? '_'}`
+    // The REAL shared floor — the 2026-07-11 flood-ban guard.
+    const emitter = createTypingEmitter({
+      chatKey: tKey,
+      now: () => clock.t,
+      send: (chatId, threadId) => { sent.push({ chatId, threadId }) },
+    })
+    const loop = createTurnTypingLoop({
+      sendChatAction: (c, t) => { emitter.emit(c, t, 'typing') },
+      chatKey: tKey,
+      refreshMs: TYPING_REFRESH_MS,
+    })
+    const d = h.deps as unknown as Record<string, unknown>
+    d.HANDBACK_PRETURN_ENABLED = true
+    // Adoption MISSES — the deduped-parallel-worker case from #3544.
+    d.handbackPreturnSignal = { tryAdopt: () => (opts?.adopts === true ? { statusKey: `${CHAT}:main`, chatId: CHAT, threadId: null, activityMessageId: null, startedAt: clock.t, pinned: false } : null) }
+    d.startTurnTypingLoop = (c: string, t: number | null) => loop.start(c, t)
+    return { h, sent, emitter, loop, clock }
+  }
+  const enqueue = (chatId = CHAT) => ({
+    kind: 'enqueue' as const,
+    chatId,
+    messageId: null,
+    threadId: null,
+    rawContent: '🤝 A background worker you dispatched has finished.',
+  })
+
+  it('a handback turn whose pre-turn entry was DEDUPED (adoption misses) still emits typing', () => {
+    const rig = makeTypingRig({ adopts: false })
+    handleSessionEvent(rig.h.deps, enqueue())
+    // Pre-fix this was []: no adoption ⇒ no loop ⇒ a dark compose window.
+    expect(rig.sent).toEqual([{ chatId: CHAT, threadId: null }])
+    expect(rig.loop.activeCount()).toBe(1)
+    rig.loop.stopAll()
+  })
+
+  it('an ADOPTING handback turn is unchanged — still exactly one arm, one action', () => {
+    const rig = makeTypingRig({ adopts: true })
+    handleSessionEvent(rig.h.deps, enqueue())
+    expect(rig.sent).toHaveLength(1)
+    expect(rig.loop.activeCount()).toBe(1)
+    rig.loop.stopAll()
+  })
+
+  it('FLOOD GUARD: N turns arming on ONE chat inside the floor cost at most ONE chat action', () => {
+    const rig = makeTypingRig({ adopts: false })
+    // 12 arms on one chat inside a single floor window: a real-inbound arm
+    // (turn-start-surfaces) plus repeated enqueue seams / restarts.
+    rig.loop.start(CHAT, null) // stand-in for the real-inbound path's arm
+    for (let i = 0; i < 11; i++) handleSessionEvent(rig.h.deps, enqueue())
+    expect(rig.sent).toHaveLength(1) // the floor coalesced all 12
+    expect(rig.loop.activeCount()).toBe(1) // restart-safe: no interval pile-up
+    // Crossing the floor lets exactly one more through, then the floor holds again.
+    rig.clock.t += TYPING_FLOOR_MS
+    for (let i = 0; i < 5; i++) handleSessionEvent(rig.h.deps, enqueue())
+    expect(rig.sent).toHaveLength(2)
+    rig.loop.stopAll()
+    rig.emitter.reset()
   })
 })
