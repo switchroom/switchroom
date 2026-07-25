@@ -95,6 +95,16 @@ function runSchedule(
   graceMs = 0,
   bgGraceMs = 0,
   bgAlwaysActive = false,
+  // #3550 — per-represent grace. Exercised so the determinism proof actually
+  // reaches `representGraceStillProtecting`; without this the fuzz never passes
+  // representGraceMs and the branch is unvisited.
+  representGraceMs = 0,
+  // #3550 discriminator knob. When FALSE, a re-present turn ends WITHOUT ever
+  // stamping noteTurnEnded — the "re-present still in flight" shape, in which
+  // the early-out provably cannot fire and the full represent window is held.
+  // Running the same seed both ways is what turns the represent-grace case from
+  // a code-path exercise into a test that FAILS if the early-out is removed.
+  stampTurnEndAfterRepresent = true,
 ): Sim {
   const PATH = "/state/agent/telegram/obligations.json";
   const store = memStore();
@@ -107,6 +117,7 @@ function runSchedule(
   // terminal (no livelock).
   let clock = 1_000_000;
   const SWEEP_TICK = 5_000;
+  const TURN_DURATION = 1_000; // virtual ms a turn occupies before it ends
   const r = rng(seed);
 
   const pending = [...msgs]; // not yet received
@@ -128,9 +139,20 @@ function runSchedule(
     const had = (turnsHad.get(id) ?? 0);
     const attemptIndex = had; // 0-based
     turnsHad.set(id, had + 1);
+    const isRepresentTurn = attemptIndex > 0;
     if (byId.get(id)!.answerOnAttempt === attemptIndex) {
       close(id, "answered");
-    } else if (graceMs > 0 && ledger.isOpen(id)) {
+    } else if (isRepresentTurn && !stampTurnEndAfterRepresent) {
+      // In-flight shape: the turn produced nothing observable, so nothing is
+      // stamped and the per-represent window is held for its full duration.
+      // (Deliberately NOT advancing the clock either — the two runs must differ
+      // only in whether the early-out can fire.)
+    } else if ((graceMs > 0 || representGraceMs > 0) && ledger.isOpen(id)) {
+      // A turn takes real time: its end is strictly LATER than the represent
+      // that triggered it. Without this the sim stamps lastTurnEndedAt equal to
+      // lastRepresentedAt and the #3550 early-out (which requires strictly
+      // greater) is never reached — the branch would go unproven.
+      clock += TURN_DURATION;
       ledger.noteTurnEnded(id, clock);
     }
   };
@@ -163,12 +185,13 @@ function runSchedule(
       deliverTurn(m.id); // original turn (attempt 0)
     } else if (open) {
       const decision =
-        graceMs > 0 || bgGraceMs > 0
+        graceMs > 0 || bgGraceMs > 0 || representGraceMs > 0
           ? ledger.decideAtIdle({
               now: clock,
               graceMs,
               backgroundWorkActive: bgGraceMs > 0 && bgAlwaysActive,
               backgroundGraceMs: bgGraceMs,
+              representGraceMs,
             })
           : ledger.decideAtIdle();
       if (decision.action === "none") {
@@ -181,7 +204,10 @@ function runSchedule(
       // INVARIANT (no double-ask): a terminated obligation must never resurface.
       expect(terminals.has(o.originTurnId)).toBe(false);
       if (decision.action === "represent") {
-        ledger.markRepresented(o.originTurnId);
+        // Stamp on the SAME virtual clock as noteTurnEnded, otherwise the
+        // per-represent window is measured against a wall-clock `Date.now()`
+        // default and never interacts with the grace under test.
+        ledger.markRepresented(o.originTurnId, clock);
         deliverTurn(o.originTurnId); // the re-present turn
       } else if (decision.action === "escalate") {
         if (ESC_IN_FLIGHT.has(o.originTurnId)) continue;
@@ -338,6 +364,91 @@ describe("obligation determinism — every inbound reaches a terminal, no silent
         }
       }
     }
+  });
+
+  it("holds across 3000 schedules WITH the per-represent grace on, and the #3550 early-out DISCRIMINATES (same terminals, strictly fewer sweeps)", () => {
+    // Honest framing of what this case is and is not.
+    //
+    // The terminal assertions below are NOT a discriminator for the #3550 diff:
+    // a terminal is a function of `answerOnAttempt` / `escalateFailsFor` alone,
+    // and the worst-case schedule settles in ~72 sweep steps against a CAP of
+    // 10_000. Revert the early-out and every terminal — and the step budget —
+    // still holds. Those assertions are a NO-LIVELOCK / NO-LOSS guard on the
+    // represent-grace path, nothing more, and are labelled as such.
+    //
+    // The discriminator is the paired run. The SAME seed is run twice, differing
+    // in exactly one thing: whether a re-present turn ends (stamping
+    // noteTurnEnded) or stays in flight. The early-out fires only in the first,
+    // so:
+    //   - terminals must be IDENTICAL — the early-out changes WHEN the ladder
+    //     advances, never WHERE it lands; and
+    //   - the ended-turn run must take STRICTLY FEWER sweep steps — which is
+    //     the early-out actually firing and shortening rungs. Delete the
+    //     early-out and both runs hold the full 120s window, the step counts
+    //     become equal, and this assertion fails.
+    const ANSWER = [0, 1, 2, 3, 99];
+    const ESCFAIL = [0, 1, 2, 3, 5];
+    const GRACE_MS = 45_000;       // trailing-answer grace, still armed
+    const REPR_GRACE_MS = 120_000; // mirrors OBLIGATION_REPRESENT_GRACE_MS default
+    let discriminated = 0; // schedules the early-out demonstrably shortened
+    let totalRetired = 0;
+    let totalInFlight = 0;
+    for (let seed = 1; seed <= 3000; seed++) {
+      const r = rng(seed * 7919);
+      const n = 1 + Math.floor(r() * 5);
+      const msgs: Msg[] = [];
+      for (let i = 0; i < n; i++) {
+        const msgId = seed * 100 + i;
+        msgs.push({
+          id: `c:3#${msgId}`,
+          msgId,
+          answerOnAttempt: pick(ANSWER, r),
+          escalateFailsFor: pick(ESCFAIL, r),
+        });
+      }
+      const retired = runSchedule(msgs, seed * 104729, GRACE_MS, 0, false, REPR_GRACE_MS, true);
+      const inFlight = runSchedule(msgs, seed * 104729, GRACE_MS, 0, false, REPR_GRACE_MS, false);
+
+      // No-livelock / no-loss guard (NOT the #3550 discriminator).
+      expect(retired.steps).toBeLessThan(10_000);
+      expect(inFlight.steps).toBeLessThan(10_000);
+      for (const m of msgs) {
+        const t = retired.terminals.get(m.id);
+        expect(t, `repr seed=${seed} msg=${m.id} answer=${m.answerOnAttempt} escFail=${m.escalateFailsFor}`).toBeDefined();
+        if (m.answerOnAttempt <= MAX_REPRESENTS) {
+          expect(t).toBe("answered");
+        } else if (m.escalateFailsFor < ESCALATE_MAX) {
+          expect(t).toBe("escalation-delivered");
+        } else {
+          expect(t).toBe("escalation-give-up");
+        }
+      }
+
+      // DISCRIMINATOR 1 — the early-out is terminal-neutral.
+      expect(
+        [...retired.terminals].sort(),
+        `terminals diverged at seed=${seed}`,
+      ).toEqual([...inFlight.terminals].sort());
+
+      // DISCRIMINATOR 2 — the early-out actually fires and shortens rungs.
+      // Directional per seed (retiring a grace can never ADD sweeps)…
+      expect(
+        retired.steps,
+        `early-out LENGTHENED seed=${seed} (retired=${retired.steps} inFlight=${inFlight.steps})`,
+      ).toBeLessThanOrEqual(inFlight.steps);
+      // …and strictly shorter on the schedules that actually sit out a rung.
+      // Not every schedule does: with several messages interleaved, other work
+      // can advance the virtual clock past the window with no waiting sweep, so
+      // the strict inequality is asserted in aggregate rather than per seed.
+      if (retired.steps < inFlight.steps) discriminated++;
+      totalRetired += retired.steps;
+      totalInFlight += inFlight.steps;
+    }
+    // Delete the early-out and BOTH runs hold the full 120s window: every seed
+    // becomes equal, `discriminated` drops to 0 and the totals converge. These
+    // two assertions are what make this case a real test of the #3550 diff.
+    expect(discriminated, "the #3550 early-out never shortened a single schedule").toBeGreaterThan(1_000);
+    expect(totalRetired).toBeLessThan(totalInFlight);
   });
 
   it("a delivered-but-unanswered obligation survives a restart and is escalated, not lost", () => {

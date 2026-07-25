@@ -242,6 +242,10 @@ export class ObligationLedger {
    * since `lastRepresentedAt`. Without this, the 5s sweep can fire again before
    * the re-presented turn even reaches the agent, burning the represent budget
    * immediately and producing back-to-back escalations on the same message.
+   * #3550: this window is retired early once a turn that started after the
+   * re-present has ENDED — at that point the trailing-answer grace above is the
+   * one covering the real risk, and holding the rest of the represent window is
+   * pure latency. See `representGraceStillProtecting`.
    */
   decideAtIdle(opts?: {
     now: number
@@ -267,6 +271,80 @@ export class ObligationLedger {
     return { action: 'represent', obligation: o }
   }
 
+  /**
+   * #3550 — is the per-represent grace still doing real work for this
+   * obligation? Pure so the rule is testable in isolation.
+   *
+   * The per-represent grace exists for ONE reason, stated at its definition:
+   * "the 5s sweep can fire again before the re-presented turn even reaches the
+   * agent". It is a proxy for "the re-present has not landed yet". Once a turn
+   * that started AFTER the re-present has ENDED, the proxy is spent — the
+   * re-present demonstrably reached the agent, the agent ran a whole turn on
+   * it, and that turn is over. Holding the remaining ~110s of a 120s window
+   * open at that point delays the next rung of a ladder that is already
+   * bounded by `maxRepresents`, for no protective benefit.
+   *
+   * The obligation is NOT released into the void when this returns false: the
+   * trailing-answer grace (`trailingGraceMs` from `lastTurnEndedAt`, 45s by
+   * default) is a separate, independently-evaluated window that covers exactly
+   * the risk that matters here — a slow answer still landing after its turn
+   * ended. So the early-out only applies when that grace is actually armed
+   * (`trailingGraceMs > 0`); with it disabled, the represent grace stays the
+   * full window rather than leaving the obligation ungated.
+   *
+   * A re-present with NO ended turn after it — the genuinely in-flight case
+   * the grace was written for — is untouched and keeps the full window.
+   *
+   * FLOOR (`MIN_REPRESENT_INTERVAL_MS`). Retiring the represent window makes the
+   * rung interval DERIVED — `trailingGraceMs + the represent-turn's duration`
+   * — where it used to be floored by the flat 120s window regardless of how the
+   * trailing grace was tuned. Without a floor,
+   * `SWITCHROOM_OBLIGATION_ESCALATE_GRACE_MS=1000` (a plausible "make it
+   * snappier" tune) collapses the whole ladder to ~1s+d per rung and escalates
+   * to the operator within ~15-20s of the original message. That is a config
+   * footgun the old code could not have, so it is closed by a MECHANISM, not a
+   * doc warning: the early-out is withheld until at least
+   * `min(representGraceMs, max(trailingGraceMs, MIN_REPRESENT_INTERVAL_MS))`
+   * has elapsed since the re-present. At the defaults (45s trailing / 120s
+   * represent) the floor is 45s and never binds — the trailing grace, measured
+   * from the strictly-later turn end, always expires after it — so this changes
+   * nothing in the shipped configuration.
+   */
+  static representGraceStillProtecting(
+    o: Pick<Obligation, 'lastRepresentedAt' | 'lastTurnEndedAt'>,
+    now: number,
+    representGraceMs: number,
+    trailingGraceMs: number,
+  ): boolean {
+    if (representGraceMs <= 0) return false
+    if (o.lastRepresentedAt == null) return false
+    const sinceRepresent = now - o.lastRepresentedAt
+    if (sinceRepresent >= representGraceMs) return false
+    // Inside the window. Is it still protecting anything?
+    const representTurnEnded =
+      o.lastTurnEndedAt != null && o.lastTurnEndedAt > o.lastRepresentedAt
+    if (representTurnEnded && trailingGraceMs > 0) {
+      // Spent — the trailing grace takes over, but never sooner than the floor
+      // (and never longer than the represent window the operator configured).
+      const floorMs = Math.min(
+        representGraceMs,
+        Math.max(trailingGraceMs, ObligationLedger.MIN_REPRESENT_INTERVAL_MS),
+      )
+      return sinceRepresent < floorMs
+    }
+    return true
+  }
+
+  /**
+   * The hard floor on the interval between two rungs of the represent ladder,
+   * used by `representGraceStillProtecting`. Independent of how the trailing
+   * grace is tuned, an obligation is never acted on again within this long of
+   * its own re-present. 30s comfortably exceeds the 5s sweep tick and the
+   * round-trip for a re-presented turn to reach the agent and answer, which is
+   * the only thing the represent window was ever debouncing.
+   */
+  static readonly MIN_REPRESENT_INTERVAL_MS = 30_000
+
   /** The oldest open obligation that is currently ELIGIBLE to act on — i.e. NOT
    *  within any grace window:
    *   - trailing-answer grace: its handling turn ended < `graceMs` ago (a queued
@@ -275,9 +353,11 @@ export class ObligationLedger {
    *   - background-work grace: when `backgroundWorkActive`, it was opened <
    *     `backgroundGraceMs` ago (genuine in-flight autonomous work — bounded by
    *     the ceiling so a stale/leaked worker can't suppress escalation forever);
-   *   - per-represent grace: it was re-presented < `representGraceMs` ago (prevents
-   *     a 5s sweep tick from immediately firing again on the same obligation before
-   *     the re-presented turn even reaches the agent). */
+   *   - per-represent grace: it was re-presented < `representGraceMs` ago AND that
+   *     re-present has not yet produced a completed turn (prevents a 5s sweep tick
+   *     from immediately firing again before the re-presented turn even reaches the
+   *     agent — see `representGraceStillProtecting` for why a turn that has already
+   *     ended retires this window early, #3550). */
   private oldestEligible(
     now: number,
     graceMs: number,
@@ -290,7 +370,7 @@ export class ObligationLedger {
       if (o.lastTurnEndedAt != null && now - o.lastTurnEndedAt < graceMs) continue // trailing-answer grace
       if (backgroundWorkActive && backgroundGraceMs > 0 && now - o.openedAt < backgroundGraceMs)
         continue // in-flight autonomous work, bounded by the ceiling
-      if (representGraceMs > 0 && o.lastRepresentedAt != null && now - o.lastRepresentedAt < representGraceMs)
+      if (ObligationLedger.representGraceStillProtecting(o, now, representGraceMs, graceMs))
         continue // per-represent grace: sweep fired before re-presented turn landed
       if (best === undefined || o.openedAt < best.openedAt) best = o
     }
