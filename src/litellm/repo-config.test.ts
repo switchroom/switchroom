@@ -150,7 +150,7 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
     }
   });
 
-  it("declares the proxy image on exactly one non-comment line shaped <image>:<tag>", () => {
+  it("declares the proxy image on exactly one non-comment line shaped <image>:<tag>[@sha256:<digest>]", () => {
     expect(imagePinLines).toHaveLength(1);
     // The shape permits `@sha256:<64 hex>` because a digest is the STRONGEST
     // pin, and the coupling test below explicitly blesses one. Three forms are
@@ -170,8 +170,9 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
   });
 
   // The shape check above deliberately does NOT prove the pin is real: the
-  // placeholder tag this file ships with is shape-valid but names no existing
-  // image. So the two states are coupled here — a placeholder pin MUST carry
+  // placeholder tag (which this file shipped with before the live pin landed,
+  // and could regress to) is shape-valid but names no existing image. So the
+  // two states are coupled here — a placeholder pin MUST carry
   // the UNVERIFIED marker, and a pin without the marker MUST be a real tag.
   // Without this, dropping the marker (or "fixing" the tag to a floating one)
   // silently leaves a green test claiming a pin that would fail to pull.
