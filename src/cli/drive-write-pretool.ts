@@ -469,10 +469,16 @@ async function main(): Promise<void> {
       //
       // COVERAGE BOUNDARY (measured, review 2026-07-25 F1): this branch is
       // defence-in-depth only, and mutation-testing confirms deleting it
-      // leaves the hook suite green — because a pre-existing bad grant is
-      // already refused by the fast path above, so an end-to-end test can
-      // never reach here. It fires only for a decision recorded AFTER the
-      // fast path ran (mid-poll). The rule it enforces is not untested:
+      // leaves the hook suite green (9 pass, 0 fail) — i.e. no test in this
+      // suite currently reaches it. A pre-existing bad grant is already
+      // refused by the fast path above, so reaching this branch would
+      // require a test that records an agent-origin decision AFTER the fast
+      // path ran (mid-poll); that is constructible, just not constructed
+      // here. Deleting the branch is not a security gap either: an
+      // unaccepted decision simply keeps polling and falls through to the
+      // `block("approval timed out")` at the bottom of this loop, so what
+      // the branch buys is a precise error message and lower latency, not
+      // the refusal itself. The rule it enforces is not untested:
       // `evaluateGatedWrite` is unit-tested in gated-write-policy.test.ts
       // (deleting its block branch fails BOTH suites), which is precisely
       // why the logic was hoisted out of the call sites.
