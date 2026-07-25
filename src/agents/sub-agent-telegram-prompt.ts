@@ -3,11 +3,19 @@
  *
  * Originally introduced in #32; disabled in #256 because each
  * `progress_update` call posted a fresh Telegram message and parallel
- * sub-agents spammed the chat. Re-enabled in #305 Option A (PR #413):
- * the gateway now routes sub-agent `progress_update` calls onto the
- * parent's pinned progress card row body instead of sending separate
- * messages, so the spam concern is gone and the JTBD (user sees what
- * the sub-agent is doing) is restored without attention cost.
+ * sub-agents spammed the chat. Re-enabled in #305 Option A (PR #413),
+ * which routed sub-agent calls onto the parent's PINNED PROGRESS CARD
+ * row body instead of sending messages.
+ *
+ * That card was deleted in #1122/#1126, and with it the card-injection
+ * path (`progressDriver` is permanently null; the dead inject block was
+ * removed from `executeProgressUpdate` in the truthful-telemetry pass).
+ * This text kept describing the #413 behaviour for ~14 months anyway —
+ * so every sub-agent was told its updates land on a card that no longer
+ * exists and cost the user nothing. It rewrites here to what the tool
+ * ACTUALLY does today: send a short, rate-limited plain message. The
+ * #256 spam concern is therefore live again, which is why the guidance
+ * now says "sparingly at real inflection points" rather than "freely".
  *
  * Cron guidance (originally issue #269) was REMOVED in #1798 along with
  * the `claude -p` cron-fold-in retirement. The cron-specific helpers
@@ -69,27 +77,31 @@ export function shouldAppendTelegramProgressGuidance(args: {
 
 /**
  * Markdown block appended to a sub-agent's prompt body when the parent
- * runs on Telegram. The sub-agent's `progress_update` calls land on the
- * parent's pinned progress card (PR #413, issue #305 Option A) — they
- * do NOT send separate Telegram messages, so this is cheap and safe to
- * call at every meaningful inflection point.
+ * runs on Telegram. A sub-agent's `progress_update` sends a real, plain
+ * Telegram message (the pinned-card injection path died with the card in
+ * #1122/#1126) — the gateway rate-limits it to one per 20s per chat+thread
+ * and 5 per turn, and the guidance below tells the sub-agent to spend those
+ * few sends on genuine inflection points rather than narrating.
  */
 export function buildTelegramProgressGuidance(args: {
   defaultChatId: string
 }): string {
   return `
 
-## Progress visibility on the parent's pinned card
+## Progress visibility for the user
 
-Your parent agent runs in a Telegram chat. The user reads on a phone, not in this terminal. Tool calls and intermediate output do not reach them — only what is posted to the parent's pinned progress card.
+Your parent agent runs in a Telegram chat. The user reads on a phone, not in this terminal — your tool calls and intermediate output never reach them. Two channels do:
 
-When you call \`mcp__switchroom-telegram__progress_update\` from inside this sub-agent, the gateway routes the text onto your row in the parent's pinned card (replace-on-write, capped at ~200 chars). It does NOT send a separate Telegram message, so call it freely at meaningful inflection points:
+1. **The worker activity card** (automatic, free). The parent's chat already shows a live \`🛠 Worker\` card with your task, elapsed time, and a running feed of the steps you take. You do not drive this and should not narrate it.
+2. **\`mcp__switchroom-telegram__progress_update\`** (manual, NOT free). This posts a **new plain Telegram message** into the chat — it pings the user's phone and costs their attention. It is not a card row and not an edit.
 
-- **Start of work** — "Analyzing 12 files in /src/auth"
-- **Blocker / pivot** — "First approach hit X, switching to Y"
-- **Major chunk done** — "Tests green, opening PR"
+So use \`progress_update\` **sparingly**, only when the user would genuinely want to know mid-task and could not infer it from the card:
 
-One short line per call. Skip for trivial one-shot tasks. Don't narrate every tool call — the parent card already shows your tool ring buffer.
+- **A blocker or pivot that changes the ETA** — "First approach hit X, switching to Y"
+- **A long silent stretch is starting** — "Running the full suite, ~10 min"
+- **A decision you are proceeding past** — "No staging creds, using the local fixture"
+
+Do NOT send one for starting work, for each file you read, or for "done" (your handback covers that). One short line per call. The gateway enforces at most one update per 20 seconds per chat and 5 per turn, and truncates at 300 chars — an over-limit call returns \`{ok:false, reason:"too_soon"|"turn_limit"}\` and sends nothing, which is not an error to retry around.
 
 Pass \`chat_id\` = \`${args.defaultChatId}\` unless the parent is handling a different chat in this turn, in which case use whatever chat_id the parent saw on its inbound message.
 
