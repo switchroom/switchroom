@@ -21,6 +21,14 @@ import {
   type ApprovalDecisionMode,
 } from "./schema.js";
 
+/**
+ * `revoke_reason` stamped on an `allow_once` decision when it is burned by
+ * its first (and only) successful match. Distinguishes a one-shot that did
+ * its job from an operator revoke or approver-set drift in `approval_list`
+ * / the audit log.
+ */
+export const ALLOW_ONCE_CONSUMED_REASON = "allow_once_consumed";
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ApprovalRequestInput {
@@ -402,6 +410,63 @@ function evaluateDecisionRow(
     return { state: "denied", decision };
   }
 
+  // allow_once is SINGLE-USE. Burn it here, on the one and only successful
+  // match, by revoking the row in the same statement that claims it. The
+  // conditional `WHERE ... revoked_at IS NULL` is the compare-and-swap: a
+  // single SQLite UPDATE is atomic and holds the write lock, so of two
+  // concurrent uses (same process, or two processes on the same DB file)
+  // exactly one observes changes === 1 and is granted; the loser observes
+  // changes === 0 and is denied. Fail closed on the loser.
+  //
+  // Revoking (rather than only stamping last_used_at) is deliberate:
+  // `lookupDecision` selects `... AND revoked_at IS NULL`, so a burned row
+  // becomes invisible to the scope-keyed fast path and the next attempt
+  // re-prompts with a fresh card. Marking it "used" but leaving it visible
+  // would instead make it the newest matching row and return `denied`
+  // forever, which would false-deny the re-prompt poll in the Drive/M365
+  // pretools (src/cli/drive-write-pretool.ts:349).
+  if (decision.decision === "allow_once") {
+    const burn = db.run(
+      `UPDATE approval_decisions
+       SET last_used_at = ?, revoked_at = ?, revoke_reason = ?
+       WHERE id = ? AND revoked_at IS NULL`,
+      [now, now, ALLOW_ONCE_CONSUMED_REASON, decision.id],
+    );
+    if ((burn.changes ?? 0) === 0) {
+      // Lost the race (or already burned) — this use gets nothing.
+      audit(db, "deny", {
+        agent_unit: decision.agent_unit,
+        scope: decision.scope,
+        action: decision.action,
+        decision_id: decision.id,
+        context: { reason: ALLOW_ONCE_CONSUMED_REASON },
+      });
+      return { state: "denied", decision };
+    }
+    // The returned row deliberately carries the POST-burn truth: this is the
+    // one and only `granted` verdict it will ever produce, and it is already
+    // revoked. `state` is the authority for "may I proceed" — callers MUST
+    // NOT re-gate a granted verdict on `revoked_at`. See the matching
+    // invariant note on kernel-server.ts's approval_lookup handler.
+    decision.last_used_at = now;
+    decision.revoked_at = now;
+    decision.revoke_reason = ALLOW_ONCE_CONSUMED_REASON;
+    audit(db, "match", {
+      agent_unit: decision.agent_unit,
+      scope: decision.scope,
+      action: decision.action,
+      decision_id: decision.id,
+    });
+    audit(db, "revoke", {
+      agent_unit: decision.agent_unit,
+      scope: decision.scope,
+      action: decision.action,
+      decision_id: decision.id,
+      context: { actor: "kernel", reason: ALLOW_ONCE_CONSUMED_REASON },
+    });
+    return { state: "granted", decision };
+  }
+
   // §7 sliding-window TTL renewal for allow_ttl. Each successful match
   // updates last_used_at and extends ttl_expires_at by the original TTL,
   // capped at granted_at + max_lifetime.
@@ -427,7 +492,8 @@ function evaluateDecisionRow(
     decision.last_used_at = now;
     decision.ttl_expires_at = newExpires;
   } else {
-    // allow_once / allow_always — just update last_used_at for staleness.
+    // allow_always — just update last_used_at for staleness. (allow_once is
+    // handled above and never reaches here.)
     db.run(
       `UPDATE approval_decisions SET last_used_at = ? WHERE id = ?`,
       [now, decision.id],
@@ -539,6 +605,11 @@ export interface RecordDecisionInput {
    * See RFC vault-approval-hard-boundary + approval_decisions.origin.
    */
   origin?: "agent" | "operator";
+  /**
+   * Hard cap applied to `ttl_ms` at write time. Defaults to
+   * DEFAULT_MAX_TTL_LIFETIME_MS. See the clamp note in recordDecision.
+   */
+  max_ttl_lifetime_ms?: number;
 }
 
 export function recordDecision(
@@ -547,8 +618,21 @@ export function recordDecision(
   now: number = Date.now(),
 ): string {
   const id = randomUUID();
+  // Clamp ttl_ms at WRITE time, not only at match time. `ttl_ms` arrives over
+  // the wire validated as nothing more than a positive int
+  // (src/vault/broker/protocol.ts:302,363,380), so an unclamped write persists
+  // an arbitrarily distant ttl_expires_at. evaluateDecisionRow's sliding-window
+  // renewal caps to granted_at + max_lifetime on the first match, but readers
+  // that never go through that path — isOperatorVerifiedDecision (kernel.ts,
+  // used by the broker mint gate at src/vault/broker/server.ts:2405) and
+  // listDecisions — compare ttl_expires_at to `now` directly, so a 100-year
+  // TTL would be honoured verbatim by them. Clamping here makes the stored
+  // value itself bounded and is the deterministic fix.
+  const maxLifetime = input.max_ttl_lifetime_ms ?? DEFAULT_MAX_TTL_LIFETIME_MS;
   const ttl_expires_at =
-    input.decision === "allow_ttl" && input.ttl_ms ? now + input.ttl_ms : null;
+    input.decision === "allow_ttl" && input.ttl_ms
+      ? now + Math.min(input.ttl_ms, maxLifetime)
+      : null;
   const canonical = canonicalizeApproverSet(input.approver_set);
 
   db.run(

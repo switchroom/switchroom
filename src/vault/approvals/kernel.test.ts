@@ -1,10 +1,15 @@
 /**
  * Tests for the approval kernel (RFC B §5–§7, §10).
  *
- * Uses an in-memory SQLite database for isolation — no disk I/O.
+ * Uses an in-memory SQLite database for isolation — no disk I/O, except the
+ * allow_once concurrency test, which needs a real file so several
+ * independent connections can race the same row (it cleans up its tmpdir).
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { migrateApprovalSchema, DEFAULT_MAX_TTL_LIFETIME_MS } from "./schema.js";
 import {
@@ -22,6 +27,8 @@ import {
   computeRetryAfterMs,
   MAX_PENDING_PER_AGENT,
   MAX_PENDING_GLOBAL,
+  ALLOW_ONCE_CONSUMED_REASON,
+  isOperatorVerifiedDecision,
 } from "./kernel.js";
 import { canonicalizeApproverSet } from "./canonical.js";
 
@@ -244,10 +251,13 @@ describe("approval kernel — lookupDecisionByRequestId (verdict correlation, W2
       agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
     });
 
-    // Operator approves ONLY request A.
+    // Operator approves ONLY request A. Deliberately allow_always, not
+    // allow_once: this test pins scope-keyed MIS-ATTRIBUTION, and a one-shot
+    // would be burned by the first lookup below (see the "allow_once is
+    // single-use" suite), hiding the very leak this asserts.
     const resA = consumeAndRecord(db, {
       request_id: reqA.request_id,
-      decision: "allow_once",
+      decision: "allow_always",
       approver_set: ["1"],
       granted_by_user_id: 1,
     });
@@ -601,5 +611,208 @@ describe("approval kernel — consumeAndRecord atomic op (PR-6)", () => {
     ).toBe(0);
     // And consumeAndRecord can still succeed afterward (proves reusable).
     expect(consumeAndRecord(db, { request_id: rid, decision: "allow_once", approver_set: ["123"], granted_by_user_id: 1 }).consumed).toBe(true);
+  });
+});
+
+describe("approval kernel — allow_once is single-use (burned on first grant)", () => {
+  const AGENT = "switchroom-klanker.service";
+  const SCOPE = "doc:gdrive:write:1AbCdEfGh";
+
+  let db: Database;
+  beforeEach(() => { db = newDb(); });
+
+  /** Operator taps "Allow once" on a card for (AGENT, SCOPE, write). */
+  function grantOnce(dbh: Database = db): string {
+    const r = requestApproval(dbh, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    const res = consumeAndRecord(dbh, {
+      request_id: r.request_id,
+      decision: "allow_once",
+      approver_set: ["1"],
+      granted_by_user_id: 1,
+    });
+    if (!res.consumed) throw new Error("setup: nonce not consumed");
+    return res.decision_id;
+  }
+
+  function scopeLookup(dbh: Database = db) {
+    return lookupDecision(dbh, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", current_approver_set: ["1"],
+    });
+  }
+
+  it("grants exactly once on the scope-keyed fast path, then stops granting", () => {
+    grantOnce();
+    // Use #1 — the write the operator actually approved.
+    expect(scopeLookup().state).toBe("granted");
+    // Use #2..#4 — the bug: these used to be silently auto-approved forever
+    // via src/cli/drive-write-pretool.ts:349.
+    expect(scopeLookup().state).toBe("no_decision");
+    expect(scopeLookup().state).toBe("no_decision");
+    expect(scopeLookup().state).toBe("no_decision");
+  });
+
+  it("grants exactly once on the request-id-keyed path too", () => {
+    const r = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    expect(
+      consumeAndRecord(db, {
+        request_id: r.request_id, decision: "allow_once",
+        approver_set: ["1"], granted_by_user_id: 1,
+      }).consumed,
+    ).toBe(true);
+    const byId = () =>
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: r.request_id, current_approver_set: ["1"],
+      }).state;
+    expect(byId()).toBe("granted");
+    // Burned → terminal-not-granted for this request. Fail closed.
+    expect(byId()).toBe("denied");
+    expect(byId()).toBe("denied");
+  });
+
+  it("burns by revoking, stamped with a distinguishable reason", () => {
+    const id = grantOnce();
+    expect(getDecision(db, id)!.revoked_at).toBeNull();
+    expect(scopeLookup().state).toBe("granted");
+    const after = getDecision(db, id)!;
+    expect(after.revoked_at).not.toBeNull();
+    expect(after.revoke_reason).toBe(ALLOW_ONCE_CONSUMED_REASON);
+    expect(after.last_used_at).not.toBeNull();
+    // A burned one-shot is no longer an active grant in the operator view.
+    expect(listDecisions(db, { agent_unit: AGENT }).map((d) => d.id)).not.toContain(id);
+  });
+
+  it("allow_always is NOT burned — the contrast that proves the fix is scoped", () => {
+    const r = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    consumeAndRecord(db, {
+      request_id: r.request_id, decision: "allow_always",
+      approver_set: ["1"], granted_by_user_id: 1,
+    });
+    expect(scopeLookup().state).toBe("granted");
+    expect(scopeLookup().state).toBe("granted");
+    expect(scopeLookup().state).toBe("granted");
+  });
+
+  it("a burned one-shot re-prompts cleanly — the next tap grants once again", () => {
+    grantOnce();
+    expect(scopeLookup().state).toBe("granted");
+    // no_decision (not 'denied') is what lets the pretool post a fresh card
+    // and poll without false-denying itself.
+    expect(scopeLookup().state).toBe("no_decision");
+    grantOnce();
+    expect(scopeLookup().state).toBe("granted");
+    expect(scopeLookup().state).toBe("no_decision");
+  });
+
+  it("a burned one-shot is not operator-verified proof for the broker mint gate", () => {
+    const r = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    const res = consumeAndRecord(db, {
+      request_id: r.request_id, decision: "allow_once",
+      approver_set: ["1"], granted_by_user_id: 1, origin: "operator",
+    });
+    if (!res.consumed) throw new Error("setup");
+    expect(isOperatorVerifiedDecision(getDecision(db, res.decision_id), AGENT)).toBe(true);
+    expect(scopeLookup().state).toBe("granted");
+    expect(isOperatorVerifiedDecision(getDecision(db, res.decision_id), AGENT)).toBe(false);
+  });
+
+  it("exactly one grant across independent connections to one allow_once row", () => {
+    // Honest about what this exercises: `conns.map(...)` below is a
+    // SEQUENTIAL synchronous map — this is not parallel execution. What it
+    // proves, and what the in-memory tests above cannot, is that the burn is
+    // durable in the FILE and immediately visible to other connections: eight
+    // separate hook processes each opening their own handle get exactly one
+    // grant between them. The atomicity of the losing claim is pinned
+    // separately by the compare-and-swap test below.
+    //
+    // NB if this is ever made genuinely parallel: these connections do NOT set
+    // `PRAGMA busy_timeout` (openKernelDb does — kernel-server.ts:91), and
+    // bun:sqlite defaults it to 0ms, so a contending writer would fail
+    // immediately with SQLITE_BUSY rather than wait, and this would flake.
+    // Production goes through openKernelDb and waits up to 5s.
+    const dir = mkdtempSync(join(tmpdir(), "kernel-once-race-"));
+    const path = join(dir, "kernel.sqlite");
+    const conns: Database[] = [];
+    try {
+      const writer = new Database(path);
+      writer.run("PRAGMA journal_mode=WAL");
+      migrateApprovalSchema(writer);
+      grantOnce(writer);
+      writer.close();
+
+      for (let i = 0; i < 8; i++) conns.push(new Database(path));
+      const states = conns.map((c) => scopeLookup(c).state);
+      expect(states.filter((s) => s === "granted").length).toBe(1);
+      expect(states.filter((s) => s !== "granted").length).toBe(7);
+    } finally {
+      for (const c of conns) { try { c.close(); } catch { /* ignore */ } }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the burn UPDATE is a compare-and-swap — a racing loser claims nothing", () => {
+    // Models the interleave where two callers both pass the SELECT before
+    // either writes: the second conditional UPDATE must report 0 changes,
+    // which is the branch that returns 'denied' rather than 'granted'.
+    const id = grantOnce();
+    expect(scopeLookup().state).toBe("granted");
+    const loser = db.run(
+      `UPDATE approval_decisions
+       SET last_used_at = ?, revoked_at = ?, revoke_reason = ?
+       WHERE id = ? AND revoked_at IS NULL`,
+      [Date.now(), Date.now(), ALLOW_ONCE_CONSUMED_REASON, id],
+    );
+    expect(loser.changes ?? 0).toBe(0);
+  });
+});
+
+describe("approval kernel — ttl_ms is clamped at write time", () => {
+  let db: Database;
+  beforeEach(() => { db = newDb(); });
+
+  function recordTtl(ttl_ms: number, max?: number): string {
+    const r = requestApproval(db, {
+      agent_unit: "u", scope: "s:ttl", action: "read", approver_set: ["1"],
+    });
+    const n = consumeNonce(db, r.request_id)!;
+    return recordDecision(db, {
+      nonce: n, decision: "allow_ttl", approver_set: ["1"],
+      granted_by_user_id: 1, ttl_ms,
+      ...(max !== undefined ? { max_ttl_lifetime_ms: max } : {}),
+    });
+  }
+
+  it("clamps an absurd wire ttl_ms to the max lifetime in the stored row", () => {
+    const hundredYears = 100 * 365 * 24 * 60 * 60 * 1000;
+    const dec = getDecision(db, recordTtl(hundredYears))!;
+    expect(dec.ttl_expires_at).not.toBeNull();
+    expect(dec.ttl_expires_at! - dec.granted_at).toBe(DEFAULT_MAX_TTL_LIFETIME_MS);
+    // Without the write-time clamp this row would satisfy the broker's
+    // mint gate (server.ts:2405) for a century — evaluateDecisionRow's
+    // match-time cap never runs on that path.
+    expect(
+      isOperatorVerifiedDecision(
+        { ...dec, origin: "operator", agent_unit: "u" },
+        "u",
+        dec.granted_at + DEFAULT_MAX_TTL_LIFETIME_MS + 1,
+      ),
+    ).toBe(false);
+  });
+
+  it("leaves a sane ttl_ms untouched", () => {
+    const dec = getDecision(db, recordTtl(60_000))!;
+    expect(dec.ttl_expires_at! - dec.granted_at).toBe(60_000);
+  });
+
+  it("honours an explicit max_ttl_lifetime_ms override", () => {
+    const dec = getDecision(db, recordTtl(60_000, 5_000))!;
+    expect(dec.ttl_expires_at! - dec.granted_at).toBe(5_000);
   });
 });

@@ -398,6 +398,18 @@ function handleRequest(
       action: req.action,
       current_approver_set: req.current_approver_set,
     });
+    // INVARIANT (allow_once): a `state: "granted"` response may carry a
+    // decision whose `revoked_at` is non-null with `revoke_reason =
+    // 'allow_once_consumed'`. That is not a contradiction — it is the defined
+    // shape of a one-shot's single grant. The burn happens in the same atomic
+    // step that authorizes this very use (kernel.ts, the allow_once branch),
+    // so the row is already spent by the time we project it. `state` is the
+    // authority for "may I proceed"; `revoked_at` reports the row's post-burn
+    // truth and is deliberately NOT rewritten to null, so an operator reading
+    // a lookup response sees exactly what approval_list and the audit log
+    // show. Consumers MUST NOT re-gate a granted verdict on `revoked_at`.
+    // Pinned by kernel-listener-acl.test.ts ("granted allow_once response
+    // carries the burn").
     const decision = r.state === "granted" || r.state === "denied"
       ? {
           id: r.decision.id,
@@ -427,6 +439,8 @@ function handleRequest(
       request_id: req.request_id,
       current_approver_set: req.current_approver_set,
     });
+    // Same allow_once invariant as approval_lookup above: `granted` may carry
+    // a burned (revoked_at != null, reason 'allow_once_consumed') row.
     const decision = r.state === "granted" || r.state === "denied"
       ? {
           id: r.decision.id,
@@ -561,7 +575,32 @@ function handleRequest(
     return;
   }
   if (req.op === "approval_list") {
-    const decisions = listDecisions(db, { agent_unit: req.agent_unit });
+    // Listener-identity ACL, same idiom as every sibling op (approval_request
+    // :354, approval_lookup :390, approval_lookup_by_request :420,
+    // approval_consume :458, approval_revoke :485, approval_record :509,
+    // approval_consume_record :535). Without it an agent could enumerate a
+    // peer's decisions on its own socket — scopes (which embed Google doc ids
+    // and M365 paths), granted_by_user_id (the operator's Telegram user id),
+    // grant timestamps and revoke reasons.
+    //
+    // `agent_unit` is optional on the wire; on an agent socket, omitting it
+    // previously meant "every agent". It is now pinned to the listener's
+    // bind-time identity, and an explicit cross-agent claim is DENIED.
+    //
+    // The operator socket is exempt on purpose: approval_list is the ONE op
+    // in OPERATOR_ALLOWED_OPS, and the dashboard's whole job is the fleet-wide
+    // read. It has no agent identity, so the by-agent ACL could never pass
+    // there; its authorization is the 0600 operator-UID socket bind.
+    let listFilter: { agent_unit?: string } = { agent_unit: req.agent_unit };
+    if (!isOperator) {
+      const acl = checkApprovalAclByAgent(agent, req.agent_unit ?? agent);
+      if (!acl.allow) {
+        socket.write(encodeResponse(errorResponse("DENIED", acl.reason)));
+        return;
+      }
+      listFilter = { agent_unit: agent };
+    }
+    const decisions = listDecisions(db, listFilter);
     const meta = decisions.map((d) => ({
       id: d.id,
       agent_unit: d.agent_unit,
