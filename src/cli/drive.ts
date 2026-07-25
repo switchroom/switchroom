@@ -735,7 +735,20 @@ async function runConnect(args: ConnectArgs, deps: DriveCliDeps): Promise<void> 
       deleter({ passphrase, vaultPath, agentUnit: args.agentName });
       return exit(EXIT_ERROR);
     case "error":
-      err(chalk.red(`Broker error: ${result.reason}`));
+      // `not_operator_verified` is NOT a broker fault: the grant exists and
+      // is live, but was not recorded with origin='operator', so it is not
+      // proof an operator tapped (it may be the agent's own self-recorded
+      // row — see src/vault/approvals/gated-write-policy.ts). Fail closed
+      // with an accurate message instead of blaming the broker.
+      err(
+        result.reason === "not_operator_verified"
+          ? chalk.red(
+              `Approval was not operator-verified (origin != 'operator' with ` +
+                `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE=1). ` +
+                `Cleaning up local credentials.`,
+            )
+          : chalk.red(`Broker error: ${result.reason}`),
+      );
       deleter({ passphrase, vaultPath, agentUnit: args.agentName });
       return exit(EXIT_ERROR);
   }

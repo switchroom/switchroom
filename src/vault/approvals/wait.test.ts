@@ -7,7 +7,7 @@
  * regardless of the production poll cadence (default 2s → 30s).
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { waitForApproval } from "./wait.js";
 import type {
   ApprovalLookupResult,
@@ -247,5 +247,60 @@ describe("waitForApproval", () => {
       _sleep: async () => {},
     });
     expect(result.kind).toBe("decided");
+  });
+});
+
+/**
+ * Provenance gate (#3598). `waitForApproval` is the shared approval wait
+ * used by `switchroom drive connect` (`src/cli/drive.ts:655`), so the
+ * self-approval bypass reaches it too: an agent-minted `granted` row is
+ * not proof a human tapped.
+ */
+describe("waitForApproval — operator-origin requirement", () => {
+  const ENV = "SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE";
+  afterEach(() => {
+    delete process.env[ENV];
+  });
+
+  async function waitWith(origin: "agent" | "operator" | undefined) {
+    return waitForApproval({
+      ...baseOpts,
+      _request: async () => ({
+        state: "pending",
+        request_id: "rid",
+        expires_at: 0,
+      }),
+      _lookup: async () => ({
+        state: "granted",
+        decision: fakeDecision(origin ? { origin } : {}),
+      }),
+      _sleep: async () => {},
+    });
+  }
+
+  it("SECURITY: flag ON rejects an agent-minted grant with not_operator_verified", async () => {
+    process.env[ENV] = "1";
+    expect(await waitWith("agent")).toEqual({
+      kind: "error",
+      reason: "not_operator_verified",
+    });
+    // A kernel too old to report origin is treated identically — fail closed.
+    expect(await waitWith(undefined)).toEqual({
+      kind: "error",
+      reason: "not_operator_verified",
+    });
+  });
+
+  it("flag ON still accepts a genuine operator-tapped grant", async () => {
+    process.env[ENV] = "1";
+    const r = await waitWith("operator");
+    expect(r.kind).toBe("decided");
+    expect(r.kind === "decided" && r.state).toBe("granted");
+  });
+
+  it("flag OFF is a no-op: an agent-origin grant is still accepted", async () => {
+    const r = await waitWith("agent");
+    expect(r.kind).toBe("decided");
+    expect(r.kind === "decided" && r.state).toBe("granted");
   });
 });

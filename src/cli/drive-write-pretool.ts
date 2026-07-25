@@ -49,6 +49,11 @@ import {
   buildWritePreview,
   stripPrefix,
 } from "../drive/write-preview.js";
+import {
+  evaluateGatedWrite,
+  requireOperatorApprovalForWrites,
+  type GatedWriteLookup,
+} from "../vault/approvals/gated-write-policy.js";
 
 // ─── Tunables ─────────────────────────────────────────────────────────────
 
@@ -171,10 +176,16 @@ async function rpcKernel(
   });
 }
 
+/**
+ * Look the scope up in the kernel. Returns BOTH the lifecycle state and
+ * the decision's server-stamped `origin` — `state` alone cannot
+ * distinguish an operator tap from a decision this agent recorded for
+ * itself on this same socket (see gated-write-policy.ts).
+ */
 async function approvalLookup(
   scope: string,
   approverSet: string[],
-): Promise<string | null> {
+): Promise<GatedWriteLookup> {
   const r = await rpcKernel({
     v: 1,
     op: "approval_lookup",
@@ -183,9 +194,20 @@ async function approvalLookup(
     action: "write",
     current_approver_set: approverSet,
   });
-  if (r === null || r.ok !== true) return null;
-  return typeof r.state === "string" ? r.state : null;
+  if (r === null || r.ok !== true) return { state: null };
+  const dec = r.decision as { origin?: unknown } | null | undefined;
+  const origin =
+    dec != null && (dec.origin === "operator" || dec.origin === "agent")
+      ? dec.origin
+      : undefined;
+  return {
+    state: typeof r.state === "string" ? r.state : null,
+    origin,
+  };
 }
+
+/** Read once at hook start — the gate must not change mid-poll. */
+const REQUIRE_OPERATOR_ORIGIN = requireOperatorApprovalForWrites();
 
 // ─── Operator allowFrom discovery ─────────────────────────────────────────
 
@@ -347,8 +369,19 @@ async function main(): Promise<void> {
     block("no operator paired — cannot post approval card");
   }
   const existing = await approvalLookup(scope, allowFrom);
-  if (existing === "granted") {
+  const existingAction = evaluateGatedWrite(existing, REQUIRE_OPERATOR_ORIGIN);
+  if (existingAction.kind === "allow") {
     allow();
+  }
+  if (existingAction.kind === "block") {
+    // A live grant that is NOT operator-verified. Refuse HERE — before
+    // the auth-broker call, the documents.get, and the card post below.
+    // The verdict already exists and can never become allowable, so
+    // carrying on would spend a live Google API call and show the
+    // operator a fresh approval card that the poll site would instantly
+    // self-refuse. (review 2026-07-25 F2: "fail closed immediately" was
+    // true of ms-365 but not of this hook. Now it is true of both.)
+    block(`Drive write refused: ${existingAction.reason}`);
   }
 
   // 3. Auth-broker access token.
@@ -419,9 +452,37 @@ async function main(): Promise<void> {
     if (!first) {
       await new Promise((r) => setTimeout(r, KERNEL_POLL_INTERVAL_MS));
     }
-    const state = await approvalLookup(scope, allowFrom);
-    if (state === "granted") {
+    const lookup = await approvalLookup(scope, allowFrom);
+    const state = lookup.state;
+    // Same shared classifier as the pre-card fast path above — the
+    // provenance rule lives in ONE unit-tested function so it cannot be
+    // present at one gate site and missing at the other.
+    const action = evaluateGatedWrite(lookup, REQUIRE_OPERATOR_ORIGIN);
+    if (action.kind === "allow") {
       allow();
+    }
+    if (action.kind === "block") {
+      // Granted but not operator-verified — the operator tapped and the
+      // kernel recorded an agent-origin row, which is not proof of a tap.
+      // Fail closed rather than spin to the deadline on a decision we
+      // will never accept.
+      //
+      // COVERAGE BOUNDARY (measured, review 2026-07-25 F1): this branch is
+      // defence-in-depth only, and mutation-testing confirms deleting it
+      // leaves the hook suite green (9 pass, 0 fail) — i.e. no test in this
+      // suite currently reaches it. A pre-existing bad grant is already
+      // refused by the fast path above, so reaching this branch would
+      // require a test that records an agent-origin decision AFTER the fast
+      // path ran (mid-poll); that is constructible, just not constructed
+      // here. Deleting the branch is not a security gap either: an
+      // unaccepted decision simply keeps polling and falls through to the
+      // `block("approval timed out")` at the bottom of this loop, so what
+      // the branch buys is a precise error message and lower latency, not
+      // the refusal itself. The rule it enforces is not untested:
+      // `evaluateGatedWrite` is unit-tested in gated-write-policy.test.ts
+      // (deleting its block branch fails BOTH suites), which is precisely
+      // why the logic was hoisted out of the call sites.
+      block(`Drive write refused: ${action.reason}`);
     }
     if (state === "denied" || state === "drift_revoked") {
       block(`user denied Drive write (kernel verdict: ${state})`);
