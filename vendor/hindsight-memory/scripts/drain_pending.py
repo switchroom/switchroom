@@ -58,6 +58,11 @@ documents**, 3,815 of them with facts extracted.
 "Retire" never means ``os.remove``: an entry leaves the queue by MOVING
 into the bounded ``pending-reconciled/`` archive (``pending.
 archive_reconciled``), because every retire decision here rests on a 200.
+That holds unconditionally for THIS module. It does not make the queue
+immortal: if the archive cannot be written the entry stays queued, and a
+disk that stays full eventually drives ``pending._evict_to_fit`` to shed the
+OLDEST live entries on the ENQUEUE path (ledgered, and a ``switchroom
+doctor`` failure). Nothing the drain does deletes a turn; a full disk does.
 
 Pacing is not optional. The local model group backing retain has a small,
 fixed number of lanes shared with live retains, reflect and consolidation,
@@ -126,6 +131,21 @@ def _clamp(timeout: int, budget: float, started: float) -> int:
     and ``test_session_start_reconcile_respects_the_hook_budget``. Left as
     two lines deliberately — the shortcut states the intent where a reader
     looks for it, and no mutation of it can change behaviour.
+
+    THE EQUIVALENCE HAS A PRECONDITION, and it is not this function's
+    (#3599 review R4-Lb — the paragraph above used to claim it
+    unconditionally). ``max(1, min(timeout, int(remaining)))`` collapses to
+    ``max(0, ...)`` only while ``timeout >= 1``. With ``timeout == 0`` a
+    healthy budget takes the ``max`` branch and the ``max(0`` mutant returns
+    **0** — the instant-fail request the floor exists to prevent, on every
+    entry. The only callsite invariant that rules this out is
+    ``_per_entry_timeout()``'s own ``max(1, v)``, which is what turns
+    ``HINDSIGHT_DRAIN_TIMEOUT=0`` into 1. Both callers below take their
+    ``timeout`` from it (``drain``'s local, line ~396). So the honest
+    statement is: equivalent FOR EVERY REACHABLE INPUT, because
+    ``_per_entry_timeout`` floors first — a fact pinned by
+    ``ClampAndEnvKnobBoundaryTest.test_the_per_entry_timeout_is_floored_at_one_second``,
+    not by anything here. Change that floor and this proof dies with it.
     """
     remaining = budget - (time.monotonic() - started)
     if remaining < 1:
@@ -473,13 +493,22 @@ def drain(
                 break
             continue
 
-        # Success — retire the entry. ARCHIVED, not deleted: this path
-        # retires on a bare 200 (the hook has no budget for a confirming
-        # GET, which the backlog drain does issue because a 200 is an ack
-        # and not proof — #3244). One durability rule covers both paths:
-        # nothing on the drain path is ever irreversibly removed, so the
-        # in-hook path's weaker evidence costs at most a recoverable file
-        # in ``pending-reconciled/`` instead of a lost turn.
+        # Success — retire the entry. ARCHIVED, not deleted.
+        #
+        # The evidence here is the POST's own 200 and nothing else: a 5s
+        # hook budget has no room for the confirming re-GET the backlog
+        # drain issues. Not a BARE 200 though (#3599 review R4-B3 corrects
+        # this comment, which used to say so): ``_retry_one`` posts
+        # ``async_processing=False``, so the 200 is a commit-before-ack
+        # (#3244 §1.1) — the daemon's statement that it durably committed,
+        # not merely that it received. Weaker than an independent read,
+        # much stronger than an async ack.
+        #
+        # The residual risk is a daemon that does not honour ``async=false``.
+        # Archiving rather than deleting keeps a recoverable copy for that
+        # case — bounded by ``pending-reconciled/``'s caps, so recoverable
+        # has a horizon; ``pending._trim_dir`` documents exactly what that
+        # horizon costs.
         if archive_reconciled(path):
             summary["drained"] += 1
         else:

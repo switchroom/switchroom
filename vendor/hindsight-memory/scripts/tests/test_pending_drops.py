@@ -172,6 +172,65 @@ class EvictionTest(_QueueTempDirMixin, unittest.TestCase):
             pending.enqueue(_payload(content="c", doc="d2"), RuntimeError("x"))
         self.assertEqual(len(self._archive_names()), 1)
 
+    def test_a_full_disk_evicts_the_oldest_live_entry_outright_and_says_so(self):
+        """The bound on "the entry is never deleted" (#3599 review R4-M1).
+
+        Three documents in this PR asserted a structural invariant the code
+        does not have — that no ``os.remove`` in ``pending.py`` can touch a
+        LIVE queue entry. ``_evict_to_fit``'s ``OSError`` fallback can, and
+        under sustained ENOSPC it does: ``archive_reconciled`` keeps entries
+        queued, the queue fills, this fires, its own archive move fails for
+        the same reason, and the oldest live entries are removed to keep
+        accepting the newest.
+
+        That behaviour is ACCEPTED — a queue must be bounded by something,
+        and the newest turn is the one most likely to still matter — but it
+        is loss, so what is pinned here is that it is loud and correctly
+        labelled, not that it doesn't happen. The ``+archive-failed`` reason
+        is the operator's only signal that the payload is GONE rather than
+        merely shed, so it is asserted, not just the eviction.
+        """
+        pending.MAX_ENTRIES = 3
+        for i in range(3):
+            pending.enqueue(_payload(content=f"c{i}", doc=f"d{i}"), RuntimeError("x"))
+        before = self._names()
+        self.assertEqual(len(before), 3)
+
+        with unittest.mock.patch.object(
+            pending.shutil, "move", side_effect=OSError(28, "No space left on device")
+        ):
+            with redirect_stderr(io.StringIO()) as err:
+                got = pending.enqueue(
+                    _payload(content="newest", doc="d-new"), RuntimeError("x")
+                )
+
+        self.assertIsNotNone(got, "the newest memory is still accepted")
+        names = self._names()
+        self.assertEqual(len(names), 3, "the queue stayed bounded")
+        self.assertNotIn(before[0], names, "the OLDEST live entry was removed")
+        # Set comparison, not slice: these are enqueued inside one
+        # millisecond, so their relative order tie-breaks on the dupe key
+        # (arbitrary but total — see enqueue()).
+        self.assertEqual(
+            set(names),
+            set(before[1:]) | {os.path.basename(got)},
+            "only the oldest went, and the newest arrived",
+        )
+        self.assertEqual(
+            self._archive_names(), [], "the archive move failed, so no copy was kept"
+        )
+        self.assertIn("evicted OLDEST entry", err.getvalue())
+
+        with open(pending.evictions_log_path(), encoding="utf-8") as f:
+            line = f.read().strip()
+        self.assertIn(f"evicted={before[0]}", line)
+        self.assertIn(
+            "+archive-failed",
+            line,
+            "the ledger must distinguish 'shed into the archive' from "
+            "'removed outright' — they are different categories of loss",
+        )
+
     def test_byte_cap_also_triggers_eviction(self):
         """Content spans 499 B .. 744 KB, so a count cap alone bounds disk
         only to within ~1500x. Both caps are load-bearing."""
@@ -504,6 +563,48 @@ class DropLedgerTest(_QueueTempDirMixin, unittest.TestCase):
 
         self.assertIsNone(got, "the oversized entry is refused")
         self.assertEqual(pending.count(), 20, "every other entry survived")
+        self.assertIn("larger than the whole", err.getvalue())
+        self.assertEqual(pending.read_drops()["count"], 1)
+
+    def test_an_entry_exactly_at_the_byte_cap_is_enqueued_not_dropped(self):
+        """``blob_bytes > MAX_BYTES``, not ``>=`` (#3599 review R4-La).
+
+        The boundary was pinned in ``_trim_dir``, ``_evict_to_fit``,
+        ``_clamp`` and ``_env_num`` and missed here, so ``>`` → ``>=``
+        survived the suite. It is not equivalent and it is not cosmetic: an
+        entry whose serialised size lands exactly ON the cap DOES fit —
+        ``_evict_to_fit``'s own condition is ``nbytes + incoming >
+        MAX_BYTES``, which an empty queue satisfies — so under the mutant a
+        writable, storable turn becomes a permanent RESIDUAL DROP. That is
+        the one outcome in this module that loses a memory outright, and it
+        would be reached by an entry the queue could have held.
+        """
+        payload = _payload(content="q" * 500, doc="exact-fit")
+        probe = pending.enqueue(payload, RuntimeError("x"))
+        exact = os.path.getsize(probe)
+        os.remove(probe)
+
+        pending.MAX_BYTES = exact
+        with redirect_stderr(io.StringIO()) as err:
+            got = pending.enqueue(payload, RuntimeError("x"))
+
+        self.assertIsNotNone(got, "an entry exactly at the cap fits within it")
+        self.assertEqual(os.path.getsize(got), exact)
+        self.assertEqual(pending.count(), 1)
+        self.assertNotIn("larger than the whole", err.getvalue())
+        self.assertEqual(pending.read_drops(), {}, "nothing was dropped")
+
+    def test_one_byte_over_the_byte_cap_is_refused(self):
+        """The other side of the same boundary, so no single comparison
+        satisfies both cases."""
+        payload = _payload(content="q" * 500, doc="one-over")
+        probe = pending.enqueue(payload, RuntimeError("x"))
+        exact = os.path.getsize(probe)
+        os.remove(probe)
+
+        pending.MAX_BYTES = exact - 1
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(pending.enqueue(payload, RuntimeError("x")))
         self.assertIn("larger than the whole", err.getvalue())
         self.assertEqual(pending.read_drops()["count"], 1)
 
@@ -1155,9 +1256,11 @@ class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
     def test_a_successful_in_hook_retain_also_archives_rather_than_deletes(self):
         """One durability rule on one path.
 
-        The in-hook success path retires on a bare 200 while the backlog
-        path insists a 200 is not proof. Archiving both makes the weaker
-        evidence cost a recoverable file rather than a lost turn.
+        The in-hook success path retires on its POST's own 200 (a
+        commit-before-ack, see the test below — NOT a bare async ack, as
+        this docstring used to say) while the backlog path additionally
+        re-GETs. Archiving both makes the weaker evidence cost a
+        recoverable file rather than a lost turn.
         """
         pending.enqueue(_payload(doc=self.BARE_SESSION_ID), RuntimeError("x"))
         name = self._names()[0]
@@ -1169,6 +1272,53 @@ class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(summary["drained"], 1)
         self.assertEqual(pending.count(), 0)
         self.assertEqual(self._reconciled_names(), [name])
+
+    def test_the_in_hook_success_path_commits_synchronously_and_never_re_gets(
+        self,
+    ):
+        """The evidence the in-hook retire ACTUALLY rests on (#3599 R4-B3).
+
+        ``pending._trim_dir``'s cap justification names this population by
+        hand — "retires on the POST's own 200 with no confirming GET, and
+        that 200 is a commit-before-ack" — so both halves are pinned here
+        rather than left as prose. Nothing else in the suite fails if the
+        in-hook path goes back to ``async_processing=True`` (making the 200
+        a bare ack, which is what the old comment claimed it already was)
+        or starts issuing a confirming re-GET it has no hook budget for.
+
+        The event log is ordered on purpose: ONE presence GET *before* the
+        POST is the reconcile free pass; the assertion is that nothing
+        follows the POST.
+        """
+        pending.enqueue(_payload(doc=_cd_doc(42)), RuntimeError("x"))
+        events = []
+
+        def fake_state(entry, timeout=30):
+            events.append("GET")
+            return False  # absent → fall through to the POST
+
+        class _Client:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def retain(self, **kw):
+                events.append(("POST", kw.get("async_processing")))
+                return {}
+
+        with unittest.mock.patch.object(drain_pending, "HindsightClient", _Client):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", fake_state
+            ):
+                summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["drained"], 1)
+        self.assertEqual(
+            events,
+            ["GET", ("POST", False)],
+            "one presence GET before the POST, a SYNCHRONOUS post, and no "
+            "confirming GET after it",
+        )
+        self.assertEqual(len(self._reconciled_names()), 1)
 
     def test_the_backlog_confirmed_drain_archives_too(self):
         pending.enqueue(_payload(doc=_cd_doc(3)), RuntimeError("x"))
@@ -1342,6 +1492,48 @@ class ClampAndEnvKnobBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(drain_pending._clamp(8, budget=0.0, started=started), 1)
         # Remaining just under the floor.
         self.assertEqual(drain_pending._clamp(8, budget=0.9, started=started), 1)
+
+    def test_the_per_entry_timeout_is_floored_at_one_second(self):
+        """The invariant ``_clamp``'s equivalence proof rests on (R4-Lb).
+
+        ``_clamp``'s docstring argues its own ``max(1, ...)`` mutants are
+        equivalent. They are — but only while ``timeout >= 1``: with
+        ``timeout == 0`` and a healthy budget, ``max(0, min(0, n))`` returns
+        0, an instant-fail request on every entry. Nothing in ``_clamp``
+        rules that input out; ``_per_entry_timeout``'s floor does, and it is
+        the ONLY thing that does, because ``drain`` takes its ``timeout``
+        from here and passes it to both ``_clamp`` callsites. So the proof
+        lives in one function and its precondition lives in another — pin
+        the precondition, or the proof rots the day someone "simplifies"
+        this ``max``.
+        """
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = "0"
+        self.assertEqual(drain_pending._per_entry_timeout(), 1)
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = "-30"
+        self.assertEqual(drain_pending._per_entry_timeout(), 1)
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = "garbage"
+        self.assertEqual(drain_pending._per_entry_timeout(), 5, "default on junk")
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = "9"
+        self.assertEqual(drain_pending._per_entry_timeout(), 9, "a real value passes")
+
+        # And the consequence the floor buys, stated at the clamp: the
+        # smallest timeout _clamp can ever be handed still yields a
+        # non-zero, bounded request.
+        started = time.monotonic()
+        self.assertEqual(
+            drain_pending._clamp(
+                drain_pending._per_entry_timeout(), budget=100.0, started=started
+            ),
+            9,
+        )
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = "0"
+        self.assertEqual(
+            drain_pending._clamp(
+                drain_pending._per_entry_timeout(), budget=100.0, started=started
+            ),
+            1,
+            "a 0s knob must not reach urlopen as a 0s timeout",
+        )
 
     def test_clamp_hands_out_the_remaining_budget_once_past_the_floor(self):
         started = time.monotonic()

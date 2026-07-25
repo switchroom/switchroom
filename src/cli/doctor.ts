@@ -1448,9 +1448,12 @@ export interface PendingRetainsProbeResult {
    * ignore it is worse than no check.
    *
    * Eviction is the deliberate policy (shed the oldest, never refuse the
-   * newest — see ``lib/pending.py``), and the evicted payload is kept in
-   * the bounded ``pending-evicted/`` archive, so this is not the same
-   * category of loss as ``dropped``. But it IS loss, and it must never
+   * newest — see ``lib/pending.py``), and the evicted payload is normally
+   * kept in the bounded ``pending-evicted/`` archive, so this is usually
+   * not the same category of loss as ``dropped``. Usually, not always: an
+   * eviction whose own archive move failed (ENOSPC — the ledger line reads
+   * ``reason=...+archive-failed``) removed the entry outright and IS the
+   * same category as ``dropped``. Either way it is loss, and it must never
    * be inferable only from a depth reading — hence a distinct counter.
    */
   evicted: number;
@@ -1553,15 +1556,26 @@ export function buildPendingRetainsProbeScript(
 /**
  * Parse the probe one-liner's stdout into a verdict.
  *
+ * The B3 split gave `buildPendingRetainsProbeScript` its own tests and left
+ * this half with none while still carrying "exported for testing" — and it
+ * was not even exported (#3599 review R4-B2). Four mutations survived the
+ * whole doctor suite: `r.status !== 0` → `=== 0` (every successful probe
+ * reads `unreachable`), `dead > 0` → `>= 0` (every reachable agent reports
+ * dead, the row pinned to `fail` forever), `pending > 0` → `>= 0` (no agent
+ * can ever read `ok`), and `cap > 0` → `>= 0` (a `C=0` read becomes a cap of
+ * 0 instead of the default). It takes a plain `{status, stdout}` record
+ * precisely so it can be driven from synthetic inputs with no container.
+ *
  * @internal exported for testing
  */
-function parsePendingRetainsProbeOutput(r: {
+export function parsePendingRetainsProbeOutput(r: {
   error?: Error;
   status: number | null;
   stdout: Buffer | string;
 }): PendingRetainsProbeResult {
   // docker/daemon failure, container absent (exit ≥125), or timeout
-  // (status null) → skip this agent, don't false-alarm.
+  // (`status` is null, which is `!== 0`) → skip this agent, don't
+  // false-alarm.
   const unreachable: PendingRetainsProbeResult = {
     state: "unreachable",
     pending: 0,
@@ -1570,7 +1584,7 @@ function parsePendingRetainsProbeOutput(r: {
     evicted: 0,
     cap: PENDING_RETAINS_DEFAULT_MAX_ENTRIES,
   };
-  if (r.error || r.status === null || r.status !== 0) return unreachable;
+  if (r.error || r.status !== 0) return unreachable;
   const out = r.stdout.toString();
   const pm = out.match(/P=(\d+)/);
   const dm = out.match(/D=(\d+)/);
@@ -1711,7 +1725,13 @@ export function checkPendingRetainsQueues(
     `expire), never deleted — every retire rests on an HTTP 200, which is an ack and ` +
     `not proof, so the payload stays recoverable. If that archive cannot be written ` +
     `(disk full, permissions) the entry STAYS QUEUED and the drain says so on stderr; ` +
-    `a failure to archive is never a reason to delete.`;
+    `a failure to archive is never a reason to delete. FIX THE DISK ANYWAY — "stays ` +
+    `queued" is bounded: entries pile up, the queue hits ` +
+    `HINDSIGHT_PENDING_MAX_ENTRIES/MAX_BYTES, and enqueue then sheds the OLDEST ` +
+    `entries to keep accepting the newest. While the disk is full their archive move ` +
+    `fails too, so those oldest turns are removed outright (the ledger line reads ` +
+    `\`reason=...+archive-failed\`). Under sustained ENOSPC "keep it queued" degrades ` +
+    `to "keep the newest, drop the oldest".`;
 
   // fail: dead markers, residual drops, or recorded evictions. NOT depth:
   // a full queue evicts rather than refusing, so depth alone is a symptom.
@@ -1752,7 +1772,10 @@ export function checkPendingRetainsQueues(
       fixParts.push(
         `Evicted entries were shed OLDEST-first so the newest memory could still be ` +
           `queued — the payloads are in \`.hindsight/pending-evicted/\` (itself bounded, ` +
-          `so they expire) and the ledger is \`.hindsight/pending-evictions.log\`. Drain ` +
+          `so they expire) and the ledger is \`.hindsight/pending-evictions.log\`. Check ` +
+          `that ledger for \`+archive-failed\`: those evictions could not be archived ` +
+          `either (disk full / permissions), so the payload is GONE, not shed — treat ` +
+          `them like drops and fix the disk first. Drain ` +
           `the backlog and raise HINDSIGHT_PENDING_MAX_ENTRIES / ` +
           `HINDSIGHT_PENDING_MAX_BYTES if this recurs. This count covers the last ` +
           `${PENDING_RETAINS_EVICTION_WINDOW_DAYS} days only, so the row clears on its ` +

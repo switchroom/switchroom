@@ -20,6 +20,48 @@ from lib.config import debug_log, load_config
 from lib.daemon import get_api_url, prestart_daemon_background
 
 
+#: Marker every version-skew warning carries, so log scrapers and tests
+#: match one stable string rather than the prose around it.
+SKEW_MARKER = "PARTIAL PLUGIN ROLLOUT"
+
+
+def _warn_version_skew(module: str, err: BaseException, config: dict, cost: str) -> None:
+    """Report an import-level version skew LOUDLY, on stderr (#3599 R4-Lc).
+
+    The plugin tree deploys as loose files under ``scripts/``, and this repo
+    removes symbols across versions — ``pending.delete_entry``, whose last
+    importer was ``drain_pending``, was removed in #3599 itself. A PARTIAL
+    rollout (new ``lib/pending.py`` beside an old ``drain_pending.py``)
+    therefore raises ``ImportError`` at the hook's import line.
+
+    Before this guard that landed in a bare ``except Exception`` and went to
+    ``debug_log``, which is off by default: the durability machinery would
+    stop and nothing would say so. A backlog then grows until ``switchroom
+    doctor`` notices it — and doctor names the QUEUE, not the cause. This
+    turns a silent deploy fault into an every-boot stderr line naming the
+    module, the missing symbol and the fix.
+
+    Deliberately not keyed to ``delete_entry`` or to a version number: any
+    import-level skew in this tree has the same cause and the same fix, so
+    the check generalises to removals that have not happened yet. A version
+    stamp would need bumping to stay true; this cannot go stale.
+
+    Never raises and never re-raises — a skew must not take SessionStart
+    down on top of everything else.
+    """
+    print(
+        f"[Hindsight] SessionStart: cannot import {module} ({err}). "
+        f"{SKEW_MARKER} — the files under the plugin's scripts/ are from "
+        f"different versions. {cost} until this is fixed. Re-deploy the "
+        f"plugin tree WHOLE (all of scripts/, never individual files).",
+        file=sys.stderr,
+    )
+    try:
+        debug_log(config, f"{module} import failed (version skew): {err}")
+    except Exception:
+        pass
+
+
 def main():
     config = load_config()
 
@@ -83,6 +125,8 @@ def main():
         from drain_pending import drain as drain_pending_retains
 
         drain_pending_retains(config)
+    except ImportError as e:
+        _warn_version_skew("drain_pending", e, config, "Queued retains will NOT be replayed")
     except Exception as e:
         # Never let the drain break session start. Issue sink picks
         # this up via run-hook.sh — see exit-code path in __main__.
@@ -99,6 +143,10 @@ def main():
         from reconcile_tail import reconcile as reconcile_tail
 
         reconcile_tail(config, hook_input=hook_input)
+    except ImportError as e:
+        _warn_version_skew(
+            "reconcile_tail", e, config, "Un-committed turns will NOT be recovered"
+        )
     except Exception as e:
         debug_log(config, f"reconcile_tail unexpected error (ignored): {e}")
 

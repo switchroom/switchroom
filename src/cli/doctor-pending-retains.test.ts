@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildPendingRetainsProbeScript,
   checkPendingRetainsQueues,
+  parsePendingRetainsProbeOutput,
   PENDING_RETAINS_EVICTION_WINDOW_DAYS,
   type PendingRetainsProbeResult,
 } from "./doctor.js";
@@ -497,5 +498,150 @@ describe("buildPendingRetainsProbeScript — eviction window arithmetic", () => 
   it("reports the live cap, falling back to the plugin default", () => {
     expect(runProbe().C).toBe(2000);
     expect(runProbe({ HINDSIGHT_PENDING_MAX_ENTRIES: "500" }).C).toBe(500);
+  });
+});
+
+/**
+ * The OTHER half of the probe (#3599 review R4-B2).
+ *
+ * The B3 split made the shell arithmetic testable and left the parser with
+ * zero tests while its comment still said "exported for testing" — it was
+ * not even exported. Four mutations survived the whole doctor suite, and
+ * each of them is a fleet-visible failure, not a nicety:
+ *
+ *   - `r.status !== 0` → `=== 0`: every SUCCESSFUL probe reads
+ *     `unreachable` and every failure gets parsed. doctor goes permanently
+ *     blind to the queue it exists to watch.
+ *   - `dead > 0` → `>= 0`: every reachable agent reports `dead`, so the row
+ *     is pinned to `fail` forever — the exact "trains operators to ignore
+ *     it" failure the eviction window was designed to avoid.
+ *   - `pending > 0` → `>= 0`: no agent can ever read `ok`.
+ *   - `cap > 0` → `>= 0`: a `C=0` read (older image, or a garbage env
+ *     value) becomes a cap of 0 instead of the 2000 default, and every
+ *     backlog is then reported as "at the eviction threshold".
+ *
+ * Driven from synthetic `{status, stdout}` records — the parser takes that
+ * shape rather than a `SpawnSyncReturns` precisely so no container is
+ * needed.
+ */
+describe("parsePendingRetainsProbeOutput — probe verdict", () => {
+  const out = (s: string, status: number | null = 0) =>
+    parsePendingRetainsProbeOutput({ status, stdout: s });
+
+  const full = (
+    p: number,
+    d: number,
+    x = 0,
+    e = 0,
+    c = 2000,
+  ) => `P=${p} D=${d} X=${x} E=${e} C=${c}\n`;
+
+  describe("exit status decides whether stdout is trusted at all", () => {
+    it("status 0 is parsed", () => {
+      expect(out(full(0, 0)).state).toBe("ok");
+    });
+
+    it("a NON-zero status is unreachable even when stdout parses", () => {
+      // Kills `r.status !== 0` → `=== 0`: under the mutant this record
+      // parses to `backlog` with 7 pending.
+      const r = out(full(7, 0), 125);
+      expect(r.state).toBe("unreachable");
+      expect(r.pending).toBe(0);
+    });
+
+    it("a null status (spawn timeout) is unreachable", () => {
+      expect(out(full(7, 0), null).state).toBe("unreachable");
+    });
+
+    it("a spawn error is unreachable even at status 0", () => {
+      expect(
+        parsePendingRetainsProbeOutput({
+          error: new Error("docker: not found"),
+          status: 0,
+          stdout: full(7, 0),
+        }).state,
+      ).toBe("unreachable");
+    });
+
+    it("unreachable carries zeroed counters and the default cap", () => {
+      const r = out(full(9, 9, 9, 9, 17), 1);
+      expect(r).toEqual({
+        state: "unreachable",
+        pending: 0,
+        dead: 0,
+        dropped: 0,
+        evicted: 0,
+        cap: 2000,
+      });
+    });
+
+    it("unparsable stdout at status 0 is unreachable, not ok", () => {
+      expect(out("sh: syntax error\n").state).toBe("unreachable");
+      expect(out("P=3\n").state).toBe("unreachable"); // D= missing
+    });
+  });
+
+  describe("state precedence", () => {
+    it("an empty queue is ok", () => {
+      expect(out(full(0, 0)).state).toBe("ok");
+    });
+
+    it("ONE dead marker is dead", () => {
+      // Kills `dead > 0` → `>= 0` from the other side: paired with the
+      // `ok` case above, no single comparison satisfies both.
+      expect(out(full(0, 1)).state).toBe("dead");
+    });
+
+    it("ONE queued entry with no dead markers is backlog", () => {
+      // Kills `pending > 0` → `>= 0` together with the `ok` case.
+      expect(out(full(1, 0)).state).toBe("backlog");
+    });
+
+    it("dead wins over a live backlog", () => {
+      expect(out(full(40, 2)).state).toBe("dead");
+    });
+
+    it("counters survive the classification", () => {
+      expect(out(full(12, 3, 4, 5, 750))).toEqual({
+        state: "dead",
+        pending: 12,
+        dead: 3,
+        dropped: 4,
+        evicted: 5,
+        cap: 750,
+      });
+    });
+  });
+
+  describe("cap fallback", () => {
+    it("a positive cap is taken verbatim", () => {
+      expect(out(full(0, 0, 0, 0, 500)).cap).toBe(500);
+    });
+
+    it("C=0 falls back to the default, it is not a cap of zero", () => {
+      // Kills `cap > 0` → `>= 0`. A cap of 0 makes every backlog read as
+      // "at the eviction threshold".
+      expect(out(full(3, 0, 0, 0, 0)).cap).toBe(2000);
+      expect(out(full(3, 0, 0, 0, 0)).state).toBe("backlog");
+    });
+
+    it("C=1 is honoured — the fallback is for 0, not for 'small'", () => {
+      expect(out(full(0, 0, 0, 0, 1)).cap).toBe(1);
+    });
+  });
+
+  describe("older agent images", () => {
+    // The forward-compat contract: an image emitting only P=/D= must read
+    // as a real verdict, not as unreachable and not as a crash.
+    it("absent X=/E=/C= read as zero and the default cap", () => {
+      expect(out("P=2 D=0\n")).toEqual({
+        state: "backlog",
+        pending: 2,
+        dead: 0,
+        dropped: 0,
+        evicted: 0,
+        cap: 2000,
+      });
+    });
   });
 });

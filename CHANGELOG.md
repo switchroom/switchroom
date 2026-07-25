@@ -79,21 +79,57 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
   (`HINDSIGHT_PENDING_RECONCILED_MAX_ENTRIES` / `_MAX_BYTES`, trimmed
   oldest-first like `pending-evicted/`), which is what the out-of-band tooling
   this design was ported from always did. One rule covers both paths: the
-  in-hook drain retires on a bare 200 because the hook has no budget for a
-  confirming GET, the backlog drain re-GETs first — and neither can
-  irreversibly remove the last on-disk copy of a turn. When the archive
-  itself cannot be written (ENOSPC, EACCES, a read-only mount) the entry
-  STAYS QUEUED and the failure is logged; an earlier revision fell back to
-  deleting it, which made this claim false in exactly the disk-pressure
-  case it was written for. The queue module now exposes no delete
-  primitive at all, so the invariant is structural rather than asserted.
-  Retiring an unarchivable entry is reported as `archive_failed` rather
-  than counted as `drained`/`reconciled`, so the summary can't claim a
-  retire that did not happen. The bounded archives are trimmed
-  oldest-first as before, and the trim now names what it dropped on
-  stderr — those are redundant copies of documents already confirmed
-  upstream, but "reversible" has a horizon and the operator gets to see
-  it pass.
+  in-hook drain retires on the POST's own 200 because a 5s hook budget has no
+  room for a confirming GET, the backlog drain re-GETs first — and nothing on
+  the drain path irreversibly removes the last on-disk copy of a turn. That
+  in-hook 200 is not a bare ack: `_retry_one` posts `async_processing=False`,
+  so it is the daemon's commit-before-ack (#3244 §1.1). It is still the
+  daemon's word rather than an independent read, which is why that path
+  archives instead of deleting. When the archive itself cannot be written
+  (ENOSPC, EACCES, a read-only mount) the entry STAYS QUEUED and the failure
+  is logged; an earlier revision fell back to deleting it, which made this
+  claim false in exactly the disk-pressure case it was written for. The queue
+  module now exposes no delete primitive reachable from the drain, so that
+  invariant is structural rather than asserted. Retiring an unarchivable
+  entry is reported as `archive_failed` rather than counted as
+  `drained`/`reconciled`, so the summary can't claim a retire that did not
+  happen.
+- **"Stays queued" is bounded, and the bound is dropping the oldest turns.**
+  Said plainly because the paragraph above reads like an unconditional
+  promise and it is not one. Under *sustained* ENOSPC the chain is: the drain
+  keeps entries queued → the queue reaches `HINDSIGHT_PENDING_MAX_ENTRIES` /
+  `_MAX_BYTES` → `enqueue()` evicts oldest-first → those evictions' own
+  archive move fails for the same reason → the oldest live entries are
+  removed outright. So the queue never grows without limit, and what pays for
+  that is the oldest queued memory. It is deliberate (the newest turn is the
+  one most likely to still matter) and it is never quiet: stderr, a
+  `reason=...+archive-failed` line in `pending-evictions.log` marking exactly
+  the evictions whose payload was NOT kept, and a `switchroom doctor` row that
+  fails on any eviction in the window. Free the disk and the chain stops at
+  step one.
+- **The bounded archives are trimmed oldest-first, and the trim names what it
+  dropped.** Three of the four ways into `pending-reconciled/` are backed by a
+  GET that confirmed the document (in-hook reconcile, backlog phase 1, backlog
+  phase 2's re-GET). The fourth — the in-hook drain's success path, which runs
+  on every boot — is backed by the commit-before-ack POST alone, so for that
+  population the archived file is the last on-disk copy if the daemon ever
+  fails to honour `async=false`. The caps (500 / 64 MB, 4x smaller than the
+  queue's, to keep three full-queue copies off a container filesystem) are
+  therefore a recovery horizon, not a durability guarantee; the durability
+  guarantee is commit-before-ack. An earlier draft of this entry called the
+  trimmed files "redundant copies of documents already confirmed upstream",
+  which is true of three paths out of four and false for the commonest one.
+  The trim lists every file it drops on stderr, because "reversible" has a
+  horizon and the operator gets to see it pass.
+- **A partially rolled-out plugin tree now fails loudly.** The plugin ships as
+  loose files under `scripts/`, and this change removes a symbol
+  (`lib/pending.py`'s `delete_entry`) whose only importer was
+  `drain_pending.py`. A rollout landing one file without the other made
+  `session_start.py`'s import raise `ImportError` into a bare `except` that
+  logged to a debug channel which is off by default — the whole drain and boot
+  reconciliation would stop, on every boot, silently. Any import-level skew in
+  the tree now prints a stderr line naming the module, the missing symbol,
+  what it costs, and the fix (re-deploy `scripts/` whole, never file by file).
 - **A broken p95 probe is no longer silent.** `HINDSIGHT_DRAIN_P95_CMD`'s exit
   status was ignored, so a typo'd or unauthorized command produced an
   unparsable figure, fell into the bare `except`, and disabled backoff exactly

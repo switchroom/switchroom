@@ -186,9 +186,47 @@ class DocumentStateWrapperTest(unittest.TestCase):
     recorded as a POST failure and age the entry toward ``.dead``.
     """
 
+    def setUp(self):
+        """Point the fixture at a LIVE server that answers 200 to anything.
+
+        The previous fixture used an unreachable ``http://127.0.0.1:1/none``,
+        which made ``test_missing_ids_are_unknown_not_absent`` unable to fail
+        (#3599 review R4-B1): with the ``if not did or not bank`` guard
+        deleted outright, control reached ``document_exists``, the connection
+        was refused, and the bare ``except`` returned ``None`` — exactly what
+        the test asserts. Both ``or`` → ``and`` AND deleting the guard
+        survived the whole suite.
+
+        A live 200-serving loopback models the real hazard. An entry with an
+        empty ``document_id`` quotes to ``""``, so the GET hits the
+        COLLECTION endpoint ``/v1/default/banks/<bank>/documents/`` — which a
+        real daemon answers **200** — and ``document_exists`` returns
+        ``True``. ``drain()`` would then retire a turn whose document was
+        never confirmed: the #3244 silent-loss path this PR exists to close.
+        """
+        self.requests: list[str] = []
+
+        def count(handler):
+            self.requests.append(handler.path)
+            body = b'{"id": "whatever"}'
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        srv = _Server(("127.0.0.1", 0), _Handler)
+        srv.behaviour = count
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.api_url = f"http://127.0.0.1:{srv.server_address[1]}"
+
     def _entry(self, **kw):
         e = {
-            "api_url": "http://127.0.0.1:1/none",
+            "api_url": self.api_url,
             "api_token": None,
             "bank_id": BANK,
             "document_id": DOC,
@@ -212,11 +250,44 @@ class DocumentStateWrapperTest(unittest.TestCase):
 
     def test_missing_ids_are_unknown_not_absent(self):
         """No document_id / bank_id means we cannot ask. That is unknown —
-        returning ``False`` would re-POST, ``True`` would retire blind."""
+        returning ``False`` would re-POST, ``True`` would retire blind.
+
+        Two assertions, and the SECOND is the one with teeth: the guard must
+        return ``None`` *without asking*. Against this test's live 200 server
+        an unguarded empty ``document_id`` GETs the collection endpoint and
+        reads back ``True``, so "answered None" alone cannot tell "guarded
+        early" from "asked and got a refusal".
+        """
         import drain_pending
 
-        self.assertIsNone(drain_pending._document_state(self._entry(document_id="")))
-        self.assertIsNone(drain_pending._document_state(self._entry(bank_id=None)))
+        for kw in ({"document_id": ""}, {"document_id": None}, {"bank_id": ""},
+                   {"bank_id": None}):
+            with self.subTest(**kw):
+                self.requests.clear()
+                self.assertIsNone(
+                    drain_pending._document_state(self._entry(**kw))
+                )
+                self.assertEqual(
+                    self.requests,
+                    [],
+                    "an entry with no usable ids must not reach the daemon at "
+                    "all: the collection endpoint answers 200 and would read "
+                    "back as a confirmed presence",
+                )
+
+    def test_an_empty_document_id_would_confirm_the_collection_endpoint(self):
+        """Why the guard exists, stated as an executable fact rather than a
+        comment: with the ids blank the URL degrades to the collection
+        endpoint, and that answers 200. This is the failure the guard
+        prevents, demonstrated one layer down at the client.
+        """
+        c = HindsightClient(self.api_url)
+        self.assertIs(c.document_exists(BANK, "", timeout=5), True)
+        self.assertEqual(
+            self.requests,
+            [f"/v1/default/banks/{BANK}/documents/"],
+            "an empty document_id quotes to '' and GETs the COLLECTION",
+        )
 
     def test_a_raising_client_is_unknown_not_a_crash(self):
         import drain_pending
@@ -373,6 +444,26 @@ class SessionDocumentIdsPagingTest(unittest.TestCase):
         c, seen = self._serve([["a", "b"]] * 10)
         c.list_session_document_ids(BANK, "sess-1", page=2, max_pages=3, timeout=5)
         self.assertEqual(len(seen), 3, "max_pages is a hard bound")
+
+    def test_max_pages_is_floored_at_one(self):
+        """``max(1, max_pages)`` — found by the R4-B1 sibling sweep, which
+        looked for guards whose only test reaches the same answer by a
+        second path. Every existing test passed ``max_pages >= 3``, so
+        ``max(1, ...)`` → ``max(0, ...)`` survived: nothing ever asked for
+        zero pages. It is not equivalent. ``max_pages=0`` under the mutant
+        makes ZERO requests and returns an empty set, and the #3244
+        recovery caller reads an empty set as "this session was never
+        retained" and restores the whole thing — duplicate restore from a
+        config value, with no error anywhere. One page is the floor for the
+        same reason ``retries`` is floored in ``health_check``: a bound of
+        zero is a typo, not a request to do nothing.
+        """
+        c, seen = self._serve([["a"], ["never-fetched"]])
+        got = c.list_session_document_ids(
+            BANK, "sess-1", page=2, max_pages=0, timeout=5
+        )
+        self.assertEqual(len(seen), 1, "0 pages still makes one request")
+        self.assertEqual(got, {"a"})
 
 
 if __name__ == "__main__":

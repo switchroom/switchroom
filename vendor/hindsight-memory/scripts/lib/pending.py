@@ -6,8 +6,9 @@ persisted. To prevent silent data loss (#1071), session_end.py
 serializes the *exact retain payload* it would have POSTed into
 ``~/.hindsight/pending-retains/<unix-ms>-<short-uuid>.json``. The next
 SessionStart drains the directory: oldest first, success RETIRES the
-entry into the bounded ``pending-reconciled/`` archive (it is never
-deleted — see "Retiring an entry" below), failure bumps an attempt
+entry into the bounded ``pending-reconciled/`` archive (the drain never
+deletes — see "Retiring an entry" below for that promise and its one
+bound, a full disk), failure bumps an attempt
 counter (up to MAX_ATTEMPTS) and leaves the entry for the run after
 that.
 
@@ -105,6 +106,18 @@ disappears. ``is_content_derived_document_id()`` is the second half of that
 guard: a *presence-only* reconcile is sound only for post-#3244
 content-derived ids, because a pre-#3244 bare session id answers 200 for any
 retain in that session.
+
+The heading says "never delete" about the DRAIN path, and that is exact. The
+ENQUEUE path is different and the difference is the bound on this promise
+(#3599 review R4-M1): if ``archive_reconciled`` cannot write (ENOSPC), it
+keeps the entry queued; entries then accumulate until the queue hits its cap;
+``_evict_to_fit`` fires; its own archive move fails for the same reason; and
+it removes the OLDEST live entries to keep accepting the newest. So under a
+sustained full disk "keep it queued" degrades to "keep the newest, drop the
+oldest". Bounded, deliberate and loud — stderr, a ``+archive-failed`` line in
+``pending-evictions.log``, and a ``switchroom doctor`` row that fails on any
+eviction in the window — but it is loss, so no document here may claim
+otherwise. Full statement in ``_evict_to_fit``'s docstring.
 
 Oversized entries
 -----------------
@@ -340,13 +353,43 @@ def _trim_dir(a: str, max_entries: int, max_bytes: int) -> int:
     64 MB vs 2000 / 256 MB) (#3599 review R3-L1). Sizing them to match
     would put three full-queue copies on a container filesystem (queue +
     ``pending-evicted/`` + ``pending-reconciled/`` = 768 MB), which is the
-    disk problem the caps exist to bound. What that costs is bounded and
-    NOT the "last on-disk copy of a turn": an entry only reaches
-    ``pending-reconciled/`` once its document was CONFIRMED present
-    upstream, and only reaches ``pending-evicted/`` through the ledgered
-    eviction path. So the trim sheds a redundant copy — but it must not do
-    so silently, hence the log line: "reversible" has a horizon and the
-    operator is entitled to know when it passed.
+    disk problem the caps exist to bound.
+
+    WHAT THE TRIM COSTS, honestly (#3599 review R4-B3). An earlier revision
+    of this docstring justified the small caps by claiming an entry "only
+    reaches ``pending-reconciled/`` once its document was CONFIRMED present
+    upstream", so the trim "sheds a redundant copy". That is false for the
+    commonest path. Three of the four ways in are corroborated by a GET:
+
+      * in-hook reconcile (``drain_pending.drain``'s presence pass) — a GET
+        answered 200 for this entry's content-derived id;
+      * backlog phase 1 (``_reconcile_phase``) — the same, out of hook;
+      * backlog phase 2 — synchronous POST, then a CONFIRMING re-GET.
+
+    The fourth is not:
+
+      * ``drain``'s in-hook SUCCESS path retires on the POST's own 200 with
+        no confirming GET, because a 5s hook budget has no room for one.
+        That 200 is NOT a bare async ack — ``_retry_one`` posts
+        ``async_processing=False``, so it is a commit-before-ack (#3244
+        §1.1) and real upstream evidence of persistence. But it is the
+        daemon's word about itself, not an independent read, and this is
+        the path that runs on every boot: the common case.
+
+    So for that population the archived copy CAN be the last on-disk copy
+    of a turn — precisely when the daemon did not honour ``async=false``.
+    Trimming it is a real, if narrow, loss, and the caps stay small anyway:
+    this archive is the horizon of a recovery CONVENIENCE, not a durability
+    guarantee. The durability guarantee is commit-before-ack. Raising these
+    caps 4x would only move the horizon while tripling the disk cost, and a
+    daemon that ignores ``async=false`` is a precondition violation to fix
+    upstream, not to paper over with 768 MB of container disk. Hence the
+    log line: "reversible" has a horizon and the operator is entitled to
+    know when it passed.
+
+    ``pending-evicted/`` is a different story again — see ``_evict_to_fit``:
+    an entry only reaches it through the ledgered eviction path, and under
+    sustained ENOSPC it may not reach it at all.
     """
     try:
         names = sorted(n for n in os.listdir(a) if n.endswith(".json"))
@@ -407,6 +450,15 @@ def archive_reconciled(path: str) -> Optional[str]:
     retire that did not happen. The failure is also logged to stderr,
     because the one thing worse than a full disk is a full disk nobody
     hears about.
+
+    "STAYS QUEUED" IS BOUNDED, and the bound is worth stating here because
+    this is where the promise is made (#3599 review R4-M1). If the disk
+    stays full, entries pile up, the queue hits its cap, and ``enqueue()``
+    calls ``_evict_to_fit``, whose own archive move fails for the same
+    reason and which then removes the OLDEST live entries outright. So the
+    honest full statement is: this function never deletes, and under
+    sustained ENOSPC "keep it queued" degrades to "keep the newest, drop
+    the oldest" — loudly, via the eviction ledger and a failing doctor row.
     """
     dest_dir = reconciled_dir()
     try:
@@ -464,6 +516,24 @@ def _evict_to_fit(d: str, incoming_bytes: int) -> int:
 
     Returns the number of entries evicted. FIFO: oldest filename first,
     which is oldest by wall-clock because names are ``<unix-ms>-<uuid>.json``.
+
+    THE ONE PLACE A LIVE QUEUE ENTRY CAN BE REMOVED (#3599 review R4-M1),
+    and it must be read together with ``archive_reconciled``'s "the entry
+    STAYS QUEUED" promise, because it is the bound on that promise. Normally
+    an eviction is a MOVE into ``pending-evicted/`` and the payload survives.
+    Under sustained ENOSPC it is not: ``archive_reconciled`` keeps entries
+    queued, the queue fills, this function fires, its own archive move fails
+    for the same reason, and the fallback below ``os.remove``s the oldest
+    live entries to make room for the newest.
+
+    That is deliberate and it is the accepted behaviour, not an oversight:
+    the queue has to be bounded by something, and shedding the OLDEST turns
+    to keep accepting new ones is the least-bad bound. It is never silent —
+    stderr, a ``+archive-failed`` line in ``pending-evictions.log``, and a
+    ``switchroom doctor`` row that fails on any eviction in the window. So
+    "keep it queued" degrades to "keep the newest, drop the oldest" when the
+    disk stays full, and every document that says "keep it queued" is
+    qualified by this paragraph.
     """
     names = _list_entries(d)
     nbytes = _dir_bytes(d, names)
@@ -484,7 +554,13 @@ def _evict_to_fit(d: str, incoming_bytes: int) -> int:
             shutil.move(vpath, os.path.join(archive, victim))
         except OSError:
             # Archiving failed (disk full / perms). Still evict — keeping the
-            # newest memory is the priority — but say so loudly.
+            # newest memory is the priority — but say so loudly. This is the
+            # ONE ``os.remove`` in this module that can touch a LIVE entry,
+            # and with the archive move already failed there is no copy left:
+            # this line is the bound on "an entry is never deleted". The
+            # ``+archive-failed`` reason is what tells the operator (via the
+            # ledger and the doctor row) that the payload is gone, not merely
+            # moved.
             try:
                 os.remove(vpath)
             except OSError:
@@ -767,19 +843,38 @@ def iter_entries() -> list[tuple[str, dict]]:
     return out
 
 
-# There is deliberately NO ``delete_entry``/``os.remove`` primitive for a
-# live queue entry (#3599 review R3-M1). Its last caller was
-# ``archive_reconciled``'s OSError fallback, and while it existed the
-# "never irreversibly removed" claim in this module's docstring, in
-# ``drain_pending``'s, in ``switchroom doctor``'s backlog fix text and in
-# the CHANGELOG was one ``except OSError:`` away from being false. Making
-# the invariant structural — the function does not exist, so no branch can
-# reach it — is stronger than asserting it in prose. An entry leaves the
-# queue by MOVING: ``archive_reconciled`` (retired), ``_evict_to_fit``
-# (evicted, ledgered), ``quarantine_corrupt`` (unparsable), or the
-# ``.dead`` rename. Bounded archives are trimmed by ``_trim_dir``; that is
-# the only ``os.remove`` on this path and it acts on an already-retired
-# copy, never on a live entry.
+# There is deliberately NO ``delete_entry`` primitive callable on the DRAIN
+# path (#3599 review R3-M1). Its last caller was ``archive_reconciled``'s
+# OSError fallback, and while it existed the "never irreversibly removed"
+# claim in this module's docstring, in ``drain_pending``'s, in ``switchroom
+# doctor``'s backlog fix text and in the CHANGELOG was one ``except
+# OSError:`` away from being false. Making that invariant structural — the
+# function does not exist, so no drain branch can reach it — is stronger
+# than asserting it in prose. On the drain path an entry leaves the queue
+# only by MOVING: ``archive_reconciled`` (retired), ``quarantine_corrupt``
+# (unparsable), or the ``.dead`` rename.
+#
+# ONE ``os.remove`` in this module CAN touch a live entry, and an earlier
+# revision of this comment wrongly said none could (#3599 review R4-M1):
+# ``_evict_to_fit``'s ``OSError`` fallback. It is on the ENQUEUE path, not
+# the drain path, and it fires only when the eviction archive move ALSO
+# failed — sustained ENOSPC. Read the whole degradation in one line:
+#
+#   archive_reconciled keeps the entry queued → the queue fills →
+#   _evict_to_fit runs → its archive move fails too → the OLDEST live
+#   entries are removed to keep accepting the newest.
+#
+# So the queue IS bounded under a full disk, and it is bounded by dropping
+# the oldest turns. That is accepted behaviour (a queue must be bounded by
+# something, and the newest turn is the one most likely to still matter),
+# and it is loud: stderr, a ``+archive-failed`` ledger line, and a doctor
+# row that fails on any eviction in the window. It is NOT invisible and it
+# is NOT the drain deleting anything. Every "the entry is never deleted"
+# sentence in this repo means "not by the drain, and not while there is
+# disk"; ``_evict_to_fit``'s docstring carries the full statement.
+#
+# ``_trim_dir``'s ``os.remove`` is the third and mildest: it acts on an
+# already-retired copy in a bounded archive, never on a live entry.
 
 
 def update_attempt(path: str, entry: dict, error: BaseException) -> bool:
