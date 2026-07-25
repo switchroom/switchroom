@@ -3119,8 +3119,11 @@ function renderHindsightSettingsOverrides(
   // the gate is already implemented (#475) and the export wiring exists
   // in profiles/_base/start.sh.hbs:226 — we just opt into a non-zero
   // floor so weak containment-overlap hits drop silently. The metric is
-  // the overlap coefficient, not Jaccard (#3541) — Jaccard made survival a
-  // function of prompt length and emptied ~88% of recalls. Operators can
+  // containment |Q n M| / |M|, not Jaccard (#3541) — Jaccard made survival
+  // a function of prompt length and emptied ~a third of recalls. Note 0.10
+  // is close to a passthrough by design: precision comes from the engine
+  // rerank plus the recallMaxMemories head-slice, and measured survival
+  // collapses (45-60% of turns get nothing) above 0.10. Operators can
   // override via memory.recall.min_overlap in switchroom.yaml.
   settings.recallMinOverlap = 0.10;
   // Phase 1 (RFC reference/rfcs/hindsight-synthesis-layers.md): consume

@@ -531,14 +531,14 @@ class ContainmentOverlapUnitTests(unittest.TestCase):
             "deploy production server",
         )
         # {deploy, staging, server} vs {deploy, production, server}
-        # → intersection 2, min(|Q|, |M|) = 3 → 0.666…
+        # → intersection 2, |M| = 3 → 0.666…
         self.assertAlmostEqual(score, 2 / 3, places=2)
 
     def test_stopwords_dont_inflate_overlap(self):
         # "the" / "is" / "a" present in both shouldn't count.
         score = recall.containment_overlap("the cat is a pet", "the dog is a pet")
         # Real tokens after stopword strip: {cat, pet} vs {dog, pet}
-        # → intersection 1, min(|Q|, |M|) = 2 → 0.5
+        # → intersection 1, |M| = 2 → 0.5
         self.assertAlmostEqual(score, 0.5, places=2)
 
     def test_empty_text_yields_zero(self):
@@ -680,6 +680,135 @@ class OverlapGateQueryLengthInvarianceTests(unittest.TestCase):
         )
         self.assertEqual(len(kept), 0, "gate no longer filters — floor is dead")
         self.assertEqual(dropped, 1)
+
+    # --- switchroom #3541 review F4: what the floor does and does NOT do ---
+    #
+    # `test_gate_still_drops_irrelevant_memories_on_a_long_prompt` above uses a
+    # memory with ZERO shared terms, so it scores 0.000 and would pass at a
+    # threshold of 0.001. It proves the gate is not a total no-op; it does not
+    # characterise the floor. These two do.
+
+    IRRELEVANT_BUT_OVERLAPPING = (
+        "The nightly digest schedule and the reaction dispatch wiring "
+        "were changed."
+    )
+
+    def test_partially_overlapping_irrelevant_memory_is_KEPT_at_the_default(self):
+        """Characterisation, not aspiration: at the 0.10 fleet default the gate
+        KEEPS an off-topic memory that merely reuses words from the prompt's
+        prior-context preamble.
+
+        This memory has nothing to do with the actual question (postgres pool
+        sizing) but shares most of its content tokens with the preamble, so it
+        scores ~0.857 — HIGHER than the genuinely relevant memory (~0.571).
+        Containment is therefore NOT monotone in relevance on a preamble-heavy
+        prompt, which is precisely why the threshold is not raised to try to
+        exclude this: any threshold that drops it drops the relevant memory
+        first. Precision here is the engine reranker's job, not the gate's.
+
+        If this test ever starts failing because the memory is now dropped,
+        the gate's selectivity changed — re-measure before accepting it.
+        """
+        query = self.PREAMBLE + self.CORE_QUERY
+        off_topic = recall.containment_overlap(query, self.IRRELEVANT_BUT_OVERLAPPING)
+        relevant = recall.containment_overlap(query, self.MEMORY)
+        self.assertGreater(
+            off_topic,
+            relevant,
+            "the relevance inversion this test documents is gone — "
+            "re-derive the threshold recommendation",
+        )
+        kept, dropped = recall._filter_by_overlap(
+            [_memory(self.IRRELEVANT_BUT_OVERLAPPING)], query, 0.10
+        )
+        self.assertEqual(len(kept), 1, "gate selectivity changed — re-measure")
+        self.assertEqual(dropped, 0)
+
+    def test_floor_drops_a_long_memory_with_only_incidental_overlap(self):
+        """Where the floor DOES bite: because the denominator is the memory's
+        own token count, a long memory sharing a single incidental term with
+        the prompt scores below 0.10 and is dropped.
+
+        This is the real content of the floor after #3541 — it removes
+        candidates with near-zero lexical relationship to the prompt, and
+        (deliberately) little else.
+        """
+        query = self.PREAMBLE + self.CORE_QUERY
+        # Exactly 1 shared content token ("docker") out of 17 -> 0.059 < 0.10
+        long_incidental = (
+            "docker buildx bake emits oci manifests whose provenance "
+            "attestations confuse older registries during garbage collection "
+            "sweeps"
+        )
+        score = recall.containment_overlap(query, long_incidental)
+        self.assertLess(score, 0.10, "fixture no longer scores below the floor")
+        self.assertGreater(score, 0.0, "sanity: there IS some incidental overlap")
+        kept, dropped = recall._filter_by_overlap(
+            [_memory(long_incidental)], query, 0.10
+        )
+        self.assertEqual(len(kept), 0, "floor is dead — nothing is being dropped")
+        self.assertEqual(dropped, 1)
+
+    # --- switchroom #3541 review F5: the |Q| < |M| regime ---
+
+    def test_short_prompt_uses_the_memory_as_denominator(self):
+        """A short prompt must NOT be scored against itself.
+
+        With the textbook overlap coefficient (`min(|Q|, |M|)`) a prompt
+        shorter than the memory flips the denominator to the QUERY, and the
+        metric silently becomes "what fraction of the prompt is in the
+        memory" — a one-word prompt then scores 1.0 against any memory
+        containing that word, re-introducing the query-length dependence
+        #3541 exists to remove. Dividing by `|M|` unconditionally has no such
+        discontinuity.
+        """
+        memory = "Postgres connection pool sizing was settled at min 5 max 100."
+        n_mem = len(recall._overlap_tokens(memory))
+        query = "docker"  # 1 content token, far shorter than the memory
+        self.assertLess(
+            len(recall._overlap_tokens(query)),
+            n_mem,
+            "sanity: this is the |Q| < |M| regime",
+        )
+        # A min()-denominator would score this 1.0 (1 shared token / |Q| = 1);
+        # dividing by the memory gives 1/2.
+        self.assertEqual(recall.containment_overlap(query, "docker image"), 0.5)
+
+        # And a short prompt overlapping the memory scores by the memory:
+        q2 = "postgres pool"
+        expected = len(
+            recall._overlap_tokens(q2) & recall._overlap_tokens(memory)
+        ) / n_mem
+        self.assertAlmostEqual(
+            recall.containment_overlap(q2, memory), expected, places=6
+        )
+
+    def test_never_stricter_than_the_jaccard_gate_it_replaces(self):
+        """Safety property vs what production runs today: because
+        `|Q u M| >= |M|`, containment >= Jaccard for every pair. At a fixed
+        threshold this gate admits a SUPERSET of what the deployed Jaccard
+        gate admits, so no memory that survives today can be dropped by this
+        change. Asserted over the fixtures rather than argued in prose.
+        """
+        query = self.PREAMBLE + self.CORE_QUERY
+        cases = [
+            self.MEMORY,
+            self.IRRELEVANT_BUT_OVERLAPPING,
+            "Ken prefers oat milk in his flat white.",
+            "docker",
+            "postgres pool sizing",
+            self.PREAMBLE,
+        ]
+        for mem in cases:
+            a = recall._overlap_tokens(query)
+            b = recall._overlap_tokens(mem)
+            jac = (len(a & b) / len(a | b)) if (a and b) else 0.0
+            self.assertGreaterEqual(
+                recall.containment_overlap(query, mem) + 1e-12,
+                jac,
+                f"containment scored BELOW jaccard for {mem[:40]!r} — "
+                f"this change could drop a memory production keeps",
+            )
 
     def test_survival_does_not_degrade_as_the_prompt_grows(self):
         """Sweep prompt length the way production does and assert the relevant

@@ -38,9 +38,11 @@ DEFAULTS = {
     # `.reranker`) — verified at runtime — and recall.py now reads and
     # sorts the merged set by `scores.final`. This lexical gate is a
     # separate quality filter layered on top — see #475. The metric is
-    # the overlap coefficient `|Q n M| / min(|Q|, |M|)`, not Jaccard:
-    # dividing by the union made the score a function of prompt length
-    # rather than relevance — see #3541 and recall.py's design note.
+    # containment, `|Q n M| / |M|`, not Jaccard: dividing by the union made
+    # the score a function of prompt length rather than relevance — see
+    # #3541 and recall.py's design note. At the 0.10 fleet default this is
+    # close to a passthrough (a <=10-token memory clears it on one shared
+    # word); precision is the engine rerank's job, not this gate's.
     "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
     # Switchroom-local: when True (default; Ken-approved ON) recall biases
