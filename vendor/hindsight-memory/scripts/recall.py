@@ -406,10 +406,52 @@ def _is_demoted_memory(memory) -> bool:
 # regardless of which bank they came from. This gate is a *complementary*,
 # opt-in absolute precision floor: `scores.final` is a relative rank that
 # still orders weakly-matching memories rather than excluding them, so on a
-# low-relevance prompt the top-N could still be low-signal. The Jaccard
+# low-relevance prompt the top-N could still be low-signal. The lexical
 # overlap between the user's query terms and each memory's text terms is a
-# query-independent absolute measure that drops memories below a
+# rank-independent absolute measure that drops memories below a
 # configurable threshold outright — something the relative sort does not do.
+#
+# --- switchroom #3541: the metric is CONTAINMENT, not Jaccard ---
+#
+# This gate originally scored with Jaccard similarity,
+# `|Q ∩ M| / |Q ∪ M|`. That is the wrong metric here, because the two
+# sides have wildly asymmetric lengths: the recall query is the whole
+# prior-context preamble (production p50 778 chars) while a memory is a
+# single fact (tens of tokens). The union term is dominated by |Q|, so the
+# SAME memory with the SAME real overlap scores lower purely because the
+# prompt was longer. Query length, not relevance, decided the outcome.
+#
+# Measured on production recall telemetry (1548 rows, 646 of which put
+# candidates through the gate, ts >= 2026-07-18, all fleet agents'
+# `recall_log.jsonl`), at the fleet default threshold of 0.10:
+#
+#   query_chars    rows   candidates   survived   survival%   zero-result%
+#      0- 200        30        1364          99       7.3%          23.3%
+#    200- 400       110        4199         238       5.7%          17.3%
+#    400- 600       143        5305         293       5.5%          72.7%
+#    600- 750       213        7288          67       0.9%          93.0%
+#    750-1000       150        4968          70       1.4%          90.0%
+#
+# 22447 of 23124 candidate memories (97.1%) were discarded, and the
+# discard rate rose monotonically with prompt length — the signature of
+# the union-term artifact, not of a relevance judgement. Fleet-wide this
+# produced an ~88% empty-recall rate: 440 of 526 turns that had at least
+# one bank return successfully still delivered zero memories.
+#
+# The correct metric for asymmetric-length comparison is the overlap
+# coefficient (containment): `|Q ∩ M| / min(|Q|, |M|)`. Since the memory
+# is essentially always the shorter side, this reads as "what fraction of
+# THIS MEMORY's terms are present in the prompt" — invariant to how much
+# unrelated preamble the prompt carries, which is exactly the
+# "query-independent absolute measure" the gate was always documented to
+# be. See `containment_overlap` below.
+#
+# This is safe to run permissively: the gate is a FLOOR, not a ranker.
+# `_sort_by_final_score` orders the survivors by the engine's reranked
+# relevance score immediately afterwards, and only then does
+# `recallMaxMemories` head-slice. So admitting more candidates cannot
+# lower the quality of what is injected — it can only give the
+# score-sort a non-empty set to choose the top-N from.
 #
 # Threshold default is 0.0 (disabled) so the gate is opt-in initially.
 # Operators tune via `memory.recall.min_overlap` in switchroom.yaml or
@@ -466,22 +508,34 @@ def _overlap_tokens(text) -> set:
     return out
 
 
-def jaccard_overlap(query: str, memory_text: str) -> float:
-    """Jaccard similarity between two texts, after stop-word + punctuation
-    stripping. Returns a float in [0.0, 1.0]. Empty/degenerate inputs
-    return 0.0 — it's safer to drop than retain when we can't compute.
+def containment_overlap(query: str, memory_text: str) -> float:
+    """Overlap coefficient (containment) between two texts, after stop-word
+    + punctuation stripping: ``|Q ∩ M| / min(|Q|, |M|)``.
+
+    Returns a float in [0.0, 1.0]. Empty/degenerate inputs return 0.0 —
+    it's safer to drop than retain when we can't compute.
+
+    Unlike Jaccard (`|Q ∩ M| / |Q ∪ M|`, used until switchroom #3541) this
+    is INVARIANT TO QUERY LENGTH. The recall query is a long prior-context
+    preamble and a memory is a short fact; dividing by the union made the
+    score collapse as the prompt grew, so the gate discarded 97.1% of
+    already-reranked candidates and did so monotonically in prompt length.
+    Dividing by the shorter side (in practice the memory) asks the question
+    the gate actually means: what fraction of this memory's terms appear in
+    the prompt. See the design note above `_OVERLAP_STOPWORDS` for the
+    production measurement that motivated the change.
     """
     a = _overlap_tokens(query)
     b = _overlap_tokens(memory_text)
     if not a or not b:
         return 0.0
     inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
+    denom = min(len(a), len(b))
+    return inter / denom if denom else 0.0
 
 
 def _filter_by_overlap(results, query: str, threshold: float):
-    """Drop memories whose Jaccard overlap with the query is below the
+    """Drop memories whose containment overlap with the query is below the
     threshold. Threshold <= 0 short-circuits to passthrough (no
     iteration cost).
 
@@ -493,7 +547,7 @@ def _filter_by_overlap(results, query: str, threshold: float):
     dropped = 0
     for m in results:
         text = m.get("text", "") if isinstance(m, dict) else ""
-        if jaccard_overlap(query, text) >= threshold:
+        if containment_overlap(query, text) >= threshold:
             kept.append(m)
         else:
             dropped += 1
@@ -1634,9 +1688,12 @@ def main():
             )
 
     # Switchroom #475 — lexical-overlap relevance gate. Drops memories
-    # whose Jaccard overlap with the query is below
+    # whose containment overlap with the query is below
     # `recallMinOverlap` (default 0.0 = disabled). Runs after the
     # demote filter so the threshold sees the operator-curated set.
+    # #3541: the metric is containment, NOT Jaccard — see the design
+    # note above `_OVERLAP_STOPWORDS`. Jaccard made the gate a function
+    # of prompt length and it discarded 97.1% of reranked candidates.
     overlap_threshold = config.get("recallMinOverlap", 0.0)
     if isinstance(overlap_threshold, (int, float)) and overlap_threshold > 0:
         pre_overlap_count = len(results)

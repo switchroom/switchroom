@@ -24,6 +24,34 @@
   `src/gateway/gateway.ts`) is spoken as just its last segment — or "a path"
   when that segment is a hex blob. A single `word/word` is still prose.
 
+### Hindsight recall (#3541)
+
+- **The lexical-overlap gate scored with the wrong metric and emptied ~88% of
+  recalls (#3541)** — the `recallMinOverlap` gate in
+  `vendor/hindsight-memory/scripts/recall.py` used Jaccard similarity,
+  `|Q ∩ M| / |Q ∪ M|`, to compare a long recall query (production p50 778
+  chars of prior-context preamble) against a short memory. The union term is
+  dominated by the query, so the same memory with the same real overlap scored
+  lower purely because the prompt was longer — prompt length, not relevance,
+  decided whether memory was delivered. Measured on production
+  `recall_log.jsonl` (1548 rows, ts >= 2026-07-18): survival through the gate
+  fell monotonically from 7.3% at <200 query chars to 0.9% at 600-750 chars,
+  the zero-result rate rose from 23% to 93%, and 22447 of 23124 already-
+  reranked candidates (97.1%) were discarded. 440 of the 526 turns that had a
+  bank return successfully still delivered zero memories. The metric is now
+  the overlap coefficient (containment), `|Q ∩ M| / min(|Q|, |M|)` — in
+  practice "what fraction of this memory's terms appear in the prompt",
+  invariant to preamble length, which is the query-independent absolute floor
+  the gate was always documented to be. Safe to run permissively because the
+  gate is a floor, not a ranker: `_sort_by_final_score` orders survivors by the
+  engine's reranked relevance immediately afterwards and only then does
+  `recallMaxMemories` head-slice, so admitting more candidates can only give
+  the score-sort a non-empty set to pick the top-N from. The default threshold
+  (0.10) and the `memory.recall.min_overlap` knob are unchanged. Guarded by
+  four mutation-verified regression tests pinning length-invariance, survival
+  at production prompt length, and that the floor still drops irrelevant
+  memories.
+
 ## v0.19.16 — Telegram: forwarded-message coalescing, Listen button, quieter progress cards, cleaner voice
 
 ### Telegram forwarding (#3523)

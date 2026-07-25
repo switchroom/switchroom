@@ -29,15 +29,18 @@ DEFAULTS = {
     # formatting. Set to 0 (or any non-positive value) to disable the cap
     # and inject everything Hindsight returns.
     "recallMaxMemories": 12,
-    # Switchroom-local: minimum lexical (Jaccard) overlap between the
+    # Switchroom-local: minimum lexical (containment) overlap between the
     # user's query terms and a memory's text terms. Memories below this
     # threshold are dropped before formatting. 0.0 disables the gate
     # (current behaviour: inject everything Hindsight returns up to the
     # count cap). NOTE: Hindsight's HTTP recall API DOES return per-result
     # relevance scores (`scores.final`, plus `.semantic`/`.keyword`/
     # `.reranker`) — verified at runtime — and recall.py now reads and
-    # sorts the merged set by `scores.final`. This Jaccard gate is a
-    # separate lexical-overlap quality filter layered on top — see #475.
+    # sorts the merged set by `scores.final`. This lexical gate is a
+    # separate quality filter layered on top — see #475. The metric is
+    # the overlap coefficient `|Q n M| / min(|Q|, |M|)`, not Jaccard:
+    # dividing by the union made the score a function of prompt length
+    # rather than relevance — see #3541 and recall.py's design note.
     "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
     # Switchroom-local: when True (default; Ken-approved ON) recall biases

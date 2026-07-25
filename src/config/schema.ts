@@ -535,7 +535,7 @@ export const AgentMemorySchema = z
           .max(1)
           .optional()
           .describe(
-            "Minimum Jaccard token overlap [0.0–1.0] between the user " +
+            "Minimum containment token overlap [0.0–1.0] between the user " +
             "prompt and a memory's text for the memory to be injected. " +
             "Drops low-relevance matches before the count cap so weak hits " +
             "don't fill the slot on real queries. 0.0 disables (default — " +

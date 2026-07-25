@@ -591,8 +591,9 @@ export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
 {{#if (isNumber hindsightRecallCacheTtlSecs)}}
 export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{/if}}
-# Lexical-overlap relevance gate (#475). Drops memories whose Jaccard
-# overlap with the user's query is below this threshold (range 0.0–1.0).
+# Lexical-overlap relevance gate (#475). Drops memories whose containment
+# overlap (|Q n M| / min(|Q|, |M|), see #3541) with the user's query is
+# below this threshold (range 0.0–1.0).
 # Plugin default is 0.0 (gate disabled); export only when the operator
 # overrode it via memory.recall.min_overlap in switchroom.yaml. Try
 # 0.10–0.20 to start; observe `overlap_dropped` via

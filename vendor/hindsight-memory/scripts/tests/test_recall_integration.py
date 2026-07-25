@@ -509,55 +509,55 @@ class AckShortCircuitTests(unittest.TestCase):
         self.assertIsNotNone(ctx)
 
 
-class JaccardOverlapUnitTests(unittest.TestCase):
-    """Switchroom #475: pure-function tests for the relevance helpers."""
+class ContainmentOverlapUnitTests(unittest.TestCase):
+    """Switchroom #475 / #3541: pure-function tests for the relevance helpers."""
 
     def test_identical_text_is_full_overlap(self):
         # Modulo stop-word stripping (`is`, `the`, `a`, `to` removed).
         self.assertEqual(
-            recall.jaccard_overlap("deploy the staging server", "deploy the staging server"),
+            recall.containment_overlap("deploy the staging server", "deploy the staging server"),
             1.0,
         )
 
     def test_disjoint_text_is_zero(self):
         self.assertEqual(
-            recall.jaccard_overlap("deploy staging server", "vegan dinner recipes"),
+            recall.containment_overlap("deploy staging server", "vegan dinner recipes"),
             0.0,
         )
 
     def test_partial_overlap_is_between(self):
-        score = recall.jaccard_overlap(
+        score = recall.containment_overlap(
             "deploy staging server",
             "deploy production server",
         )
         # {deploy, staging, server} vs {deploy, production, server}
-        # → intersection 2, union 4 → 0.5
-        self.assertAlmostEqual(score, 0.5, places=2)
+        # → intersection 2, min(|Q|, |M|) = 3 → 0.666…
+        self.assertAlmostEqual(score, 2 / 3, places=2)
 
     def test_stopwords_dont_inflate_overlap(self):
         # "the" / "is" / "a" present in both shouldn't count.
-        score = recall.jaccard_overlap("the cat is a pet", "the dog is a pet")
+        score = recall.containment_overlap("the cat is a pet", "the dog is a pet")
         # Real tokens after stopword strip: {cat, pet} vs {dog, pet}
-        # → intersection 1, union 3 → 0.333…
-        self.assertAlmostEqual(score, 1 / 3, places=2)
+        # → intersection 1, min(|Q|, |M|) = 2 → 0.5
+        self.assertAlmostEqual(score, 0.5, places=2)
 
     def test_empty_text_yields_zero(self):
-        self.assertEqual(recall.jaccard_overlap("", "anything at all"), 0.0)
-        self.assertEqual(recall.jaccard_overlap("query", ""), 0.0)
+        self.assertEqual(recall.containment_overlap("", "anything at all"), 0.0)
+        self.assertEqual(recall.containment_overlap("query", ""), 0.0)
 
     def test_non_string_inputs_yield_zero(self):
-        self.assertEqual(recall.jaccard_overlap(None, "x"), 0.0)
-        self.assertEqual(recall.jaccard_overlap("x", None), 0.0)
+        self.assertEqual(recall.containment_overlap(None, "x"), 0.0)
+        self.assertEqual(recall.containment_overlap("x", None), 0.0)
 
     def test_case_insensitive(self):
         self.assertEqual(
-            recall.jaccard_overlap("DEPLOY Server", "deploy server"),
+            recall.containment_overlap("DEPLOY Server", "deploy server"),
             1.0,
         )
 
     def test_punctuation_stripped(self):
         self.assertEqual(
-            recall.jaccard_overlap("deploy, server!", "deploy server"),
+            recall.containment_overlap("deploy, server!", "deploy server"),
             1.0,
         )
 
@@ -584,15 +584,117 @@ class OverlapFilterUnitTests(unittest.TestCase):
     def test_threshold_keeps_partial_match_at_or_above(self):
         results = [_memory("deploy production server")]
         kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.5)
-        # 2/4 = 0.5 ≥ 0.5 → kept
+        # 2/min(3, 3) = 0.666… ≥ 0.5 → kept
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 0)
 
     def test_threshold_drops_partial_match_below(self):
         results = [_memory("deploy production server")]
-        kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.51)
+        # 2/min(3, 3) = 0.666… < 0.7 → dropped
+        kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.7)
         self.assertEqual(len(kept), 0)
         self.assertEqual(dropped, 1)
+
+
+class OverlapGateQueryLengthInvarianceTests(unittest.TestCase):
+    """Switchroom #3541 regression: the gate must not be decided by prompt length.
+
+    Production telemetry (1548 recall_log.jsonl rows, ts >= 2026-07-18) showed
+    the survival rate through this gate collapsing monotonically as the prompt
+    grew — 7.3% at <200 query chars down to 0.9% at 600-750 chars — with a
+    93% zero-result rate at the long end. That is the Jaccard union term, not a
+    relevance judgement. These tests pin the containment metric that fixes it.
+    """
+
+    # A realistic recall query: the memory-bearing sentence plus the long
+    # unrelated prior-context preamble the UserPromptSubmit hook prepends.
+    CORE_QUERY = "where did we land on the postgres connection pool sizing"
+    PREAMBLE = (
+        "Prior context: the operator asked about telegram card rendering, then "
+        "about vault broker grants, then about the nightly digest schedule and "
+        "the reaction dispatch wiring, and separately about docker image "
+        "promotion, canary holdback, worktree hygiene, changelog discipline, "
+        "eval harness thresholds, skill authoring quotas and mental model "
+        "refresh cadence across the whole fleet of agents on this host. "
+    )
+    MEMORY = "Postgres connection pool sizing was settled at min 5 max 100."
+
+    @staticmethod
+    def _filler(n_words):
+        """Generate `n_words` DISTINCT unrelated content words.
+
+        Distinctness matters: the metrics operate on token *sets*, so
+        repeating the same paragraph would not grow ``|Q|`` and a
+        length-sensitivity test built on it would silently pass even under
+        the buggy Jaccard metric.
+
+        The words must also be purely alphabetic — ``_overlap_tokens``
+        splits on every non-alpha character, so a digit-suffixed word like
+        ``filler7word`` collapses to the two tokens ``filler``/``word`` no
+        matter how many are emitted.
+        """
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        return " ".join(
+            "zz" + letters[i // 26 % 26] + letters[i % 26] for i in range(n_words)
+        )
+
+    def test_extra_preamble_does_not_change_the_score(self):
+        """In the production regime (query longer than the memory — always
+        true for the UserPromptSubmit preamble), piling on more unrelated
+        preamble must NOT move the score. Under Jaccard these two differ,
+        because the union term grows with the prompt; under containment the
+        denominator is the memory, so they are identical."""
+        short = recall.containment_overlap(
+            self._filler(20) + " " + self.CORE_QUERY, self.MEMORY
+        )
+        long_ = recall.containment_overlap(
+            self._filler(200) + " " + self.CORE_QUERY, self.MEMORY
+        )
+        self.assertGreater(short, 0.0, "sanity: the memory does overlap the query")
+        self.assertAlmostEqual(
+            short,
+            long_,
+            places=6,
+            msg="prompt length changed the gate score — the union-term artifact is back",
+        )
+
+    def test_relevant_memory_survives_a_production_length_prompt(self):
+        """At the fleet default threshold (0.10, scaffold.ts), a clearly
+        relevant memory must survive a production-p50-length prompt."""
+        query = self.PREAMBLE + self.CORE_QUERY
+        self.assertGreater(
+            len(query), 400, "sanity: this is a production-shaped long prompt"
+        )
+        kept, dropped = recall._filter_by_overlap([_memory(self.MEMORY)], query, 0.10)
+        self.assertEqual(
+            len(kept), 1, "relevant memory was dropped from a long prompt"
+        )
+        self.assertEqual(dropped, 0)
+
+    def test_gate_still_drops_irrelevant_memories_on_a_long_prompt(self):
+        """The floor must still bite: a length-invariant metric must not
+        become a passthrough. An unrelated memory is still dropped."""
+        query = self.PREAMBLE + self.CORE_QUERY
+        kept, dropped = recall._filter_by_overlap(
+            [_memory("Ken prefers oat milk in his flat white.")], query, 0.10
+        )
+        self.assertEqual(len(kept), 0, "gate no longer filters — floor is dead")
+        self.assertEqual(dropped, 1)
+
+    def test_survival_does_not_degrade_as_the_prompt_grows(self):
+        """Sweep prompt length the way production does and assert the relevant
+        memory survives at every length — the monotonic collapse is the bug."""
+        for n_filler in (0, 20, 50, 100, 200, 400):
+            query = self._filler(n_filler) + " " + self.CORE_QUERY
+            kept, _ = recall._filter_by_overlap(
+                [_memory(self.MEMORY)], query, 0.10
+            )
+            self.assertEqual(
+                len(kept),
+                1,
+                f"relevant memory dropped at {n_filler} filler words "
+                f"({len(query)} query chars)",
+            )
 
 
 class OverlapGateIntegrationTests(unittest.TestCase):

@@ -3031,7 +3031,7 @@ function resolveHindsightRetainConfig(
  *     transcript, re-consolidated per fire; paired with the vendor
  *     retain.py divergence)
  *   - `recallMaxMemories`: 12 → 8 (tighter prompt, less model noise)
- *   - `recallMinOverlap`: 0.0 → 0.10 (drop weak Jaccard-overlap matches)
+ *   - `recallMinOverlap`: 0.0 → 0.10 (drop weak containment-overlap matches)
  *
  * Future overrides go here, NOT in the vendor file. The vendor is
  * third-party code and must remain untouched for clean upstream
@@ -3118,7 +3118,9 @@ function renderHindsightSettingsOverrides(
   // Lexical-overlap gate at 0.10. Vendor default 0.0 (gate disabled);
   // the gate is already implemented (#475) and the export wiring exists
   // in profiles/_base/start.sh.hbs:226 — we just opt into a non-zero
-  // floor so weak Jaccard-overlap hits drop silently. Operators can
+  // floor so weak containment-overlap hits drop silently. The metric is
+  // the overlap coefficient, not Jaccard (#3541) — Jaccard made survival a
+  // function of prompt length and emptied ~88% of recalls. Operators can
   // override via memory.recall.min_overlap in switchroom.yaml.
   settings.recallMinOverlap = 0.10;
   // Phase 1 (RFC reference/rfcs/hindsight-synthesis-layers.md): consume
