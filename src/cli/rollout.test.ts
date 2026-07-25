@@ -33,6 +33,11 @@ import {
   type RolloutPhase,
   type RolloutResult,
   type RolloutStep,
+  createRolloutDeps,
+  isSpawnTimeout,
+  ROLLOUT_RUN_TIMEOUT_MS,
+  ROLLOUT_PROBE_TIMEOUT_MS,
+  type RolloutSpawnSync,
 } from "./rollout.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
@@ -1094,5 +1099,460 @@ describe("executeRollout — phase emission", () => {
       // no emitPhase
     };
     expect(() => executeRollout(steps, TARGET, deps)).not.toThrow();
+  });
+});
+
+// ── Timeouts: a wedged container must not hang the executor ──────────────
+//
+// `deps.run` (spawnSync of `switchroom <subcommand>`) and `deps.probeVersion`
+// (`docker exec … switchroom --version`) had NO timeout. A wedged container —
+// precisely the case a roll exists to fix — blocks spawnSync forever, which
+// blocks executeRollout forever, which holds hostd's `fleetMutationInFlight`
+// latch forever (cleared in a `.finally()` that never runs because the child
+// never exits). No self-clearing path short of restarting hostd.
+
+describe("createRolloutDeps — every subprocess is bounded", () => {
+  function spy(): { calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }>; spawn: RolloutSpawnSync } {
+    const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
+    const spawn: RolloutSpawnSync = (cmd, args, opts) => {
+      calls.push({ cmd, args, opts: opts as unknown as Record<string, unknown> });
+      return { status: 0, stdout: "0.19.4\n" };
+    };
+    return { calls, spawn };
+  }
+
+  it("passes a positive timeout + SIGKILL to the subcommand spawn", () => {
+    const { calls, spawn } = spy();
+    const deps = createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn,
+      warn: () => undefined,
+    });
+    deps.run(["apply"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.opts.timeout).toBe(ROLLOUT_RUN_TIMEOUT_MS);
+    expect(ROLLOUT_RUN_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
+  });
+
+  it("passes a positive timeout + SIGKILL to the docker version probe", () => {
+    const { calls, spawn } = spy();
+    const deps = createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn,
+      warn: () => undefined,
+    });
+    expect(deps.probeVersion("clerk")).toBe("0.19.4");
+    expect(calls[0]!.cmd).toBe("docker");
+    expect(calls[0]!.opts.timeout).toBe(ROLLOUT_PROBE_TIMEOUT_MS);
+    expect(ROLLOUT_PROBE_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
+  });
+
+  it("reports a timed-out subcommand as a clean non-zero failure, not a hang", () => {
+    const warns: string[] = [];
+    const deps = createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      // Node reports a timeout kill as status:null + the killSignal.
+      spawn: () => ({ status: null, signal: "SIGKILL" }),
+      warn: (l) => warns.push(l),
+    });
+    const r = deps.run(["agent", "restart", "clerk", "--wait", "--force"]);
+    expect(r.timedOut).toBe(true);
+    expect(r.status).not.toBe(0); // trips every caller's `status !== 0` gate
+    const warned = warns.join(" ");
+    expect(warned).toMatch(/did not finish within \d+ms and was SIGKILLed/);
+    // The warning must be honest about BOTH known imprecisions, so an
+    // operator reading it host-side knows what to check.
+    expect(warned).toMatch(/OOM killer/);
+    expect(warned).toMatch(/grandchildren are NOT killed/);
+  });
+
+  it("treats an ETIMEDOUT-flavoured timeout the same way", () => {
+    const deps = createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: () =>
+        ({ status: null, error: Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }) }) as ReturnType<RolloutSpawnSync>,
+      warn: () => undefined,
+    });
+    expect(deps.run(["apply"]).timedOut).toBe(true);
+  });
+
+  it("a wedged container's version probe returns null instead of blocking", () => {
+    const warns: string[] = [];
+    const deps = createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: () => ({ status: null, signal: "SIGKILL", stdout: "" }),
+      warn: (l) => warns.push(l),
+    });
+    expect(deps.probeVersion("clerk")).toBeNull();
+    expect(warns.join(" ")).toMatch(/wedged/);
+  });
+
+  it("isSpawnTimeout does NOT misread an ordinary non-zero exit as a timeout", () => {
+    expect(isSpawnTimeout({ status: 1, signal: null }, "SIGKILL")).toBe(false);
+    expect(isSpawnTimeout({ status: 0, signal: null }, "SIGKILL")).toBe(false);
+    // A DIFFERENT signal (e.g. an operator's SIGTERM) is not our timeout kill.
+    expect(isSpawnTimeout({ status: null, signal: "SIGTERM" }, "SIGKILL")).toBe(false);
+  });
+});
+
+describe("executeRollout — a timed-out step stops the roll cleanly", () => {
+  const TARGET = "v0.19.4";
+
+  it("returns ok:false with timedOut set (the executor never blocks)", () => {
+    // The whole point: the executor RETURNS. A returned failure is what lets
+    // hostd's `.finally()` run and release `fleetMutationInFlight` — the
+    // latch that a hung spawnSync stranded forever.
+    const { deps: base } = harness({ versions: { "test-harness": null } });
+    const deps: RolloutDeps = {
+      ...base,
+      run: (args) =>
+        args[0] === "agent" ? { status: 1, timedOut: true } : { status: 0 },
+    };
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    expect(r.ok).toBe(false);
+    expect(r.timedOut).toBe(true);
+    expect(r.failedAgent).toBe("test-harness");
+    expect(r.warnings.join(" ")).toMatch(/timeout and was killed/);
+    expect(r.warnings.join(" ")).toMatch(/wedged/);
+  });
+
+  it("marks an apply timeout as timedOut and stops before any restart", () => {
+    const { deps: base } = harness({ versions: {} });
+    const deps: RolloutDeps = {
+      ...base,
+      run: (args) => (args[0] === "apply" ? { status: 1, timedOut: true } : { status: 0 }),
+    };
+    const runs: string[][] = [];
+    const r = executeRollout(planRollout(["clerk"]), TARGET, {
+      ...deps,
+      run: (args) => {
+        runs.push(args);
+        return args[0] === "apply" ? { status: 1, timedOut: true } : { status: 0 };
+      },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("apply");
+    expect(r.timedOut).toBe(true);
+    // Stopped BEFORE any restart — a timed-out apply must not roll agents.
+    expect(runs.map((a) => a[0])).toEqual(["apply"]);
+  });
+
+  it("carries timedOut across the hostd result sentinel", () => {
+    // The executor runs in a CHILD process on the hostd path; the only
+    // channel back to hostd is the stdout sentinel. If `timedOut` doesn't
+    // survive encode→parse, hostd records a bare "exit 1" and the operator
+    // never learns the step was killed mid-flight (with docker grandchildren
+    // possibly still running).
+    const { deps: base } = harness({ versions: { "test-harness": null } });
+    const deps: RolloutDeps = {
+      ...base,
+      run: (args) => (args[0] === "agent" ? { status: 1, timedOut: true } : { status: 0 }),
+    };
+    const steps = planRollout(["test-harness"], { pinToPersist: TARGET, hostdContext: true });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    const round = parseRolloutResultLine(
+      "some noise\n" + encodeRolloutResultLine(r) + "\nmore noise\n",
+    );
+    expect(round?.timedOut).toBe(true);
+    expect(round?.ok).toBe(false);
+    expect(round?.failedAgent).toBe("test-harness");
+  });
+
+  it("omits timedOut from the sentinel for an ordinary (non-timeout) failure", () => {
+    const { deps: base } = harness({ versions: {} });
+    const r = executeRollout(planRollout(["clerk"]), TARGET, {
+      ...base,
+      run: (args) => (args[0] === "apply" ? { status: 1 } : { status: 0 }),
+    });
+    const round = parseRolloutResultLine(encodeRolloutResultLine(r));
+    expect(round?.ok).toBe(false);
+    // Absent, not `false` — hostd treats absence as "not a timeout".
+    expect(round?.timedOut).toBeUndefined();
+  });
+});
+
+// ── Review follow-ups: the subprocesses that were STILL unbounded ─────────
+//
+// `deps.run` and `deps.probeVersion` were not the only children spawned from
+// inside `executeRollout`. The `refresh-web` step calls `deployedImageTag`
+// (`spawnSync("docker", …)`) and `refresh-hindsight` calls
+// `isHindsightContainerExists` (`execFileSync("docker", …)`), both IN-PROCESS.
+// The docker CLI has no client-side request timeout, so an unresponsive
+// dockerd blocked either one forever — executeRollout never returns, hostd's
+// runSwitchroom promise never settles, and `fleetMutationInFlight` is stranded
+// permanently. Worse-shaped than the original bug: it strands the latch AFTER
+// every agent has already rolled.
+
+describe("createRolloutDeps — the in-process docker probes are bounded too", () => {
+  function depsWith(spawn: RolloutSpawnSync, warn: (l: string) => void = () => undefined) {
+    return createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn,
+      warn,
+    });
+  }
+
+  it("webImageTag's docker inspect carries a positive timeout + SIGKILL", () => {
+    const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
+    const deps = depsWith((cmd, args, opts) => {
+      calls.push({ cmd, args, opts: opts as unknown as Record<string, unknown> });
+      return { status: 0, stdout: "ghcr.io/switchroom/switchroom-web:v0.19.4\n" };
+    });
+
+    expect(deps.webImageTag?.()).toBe("v0.19.4");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.cmd).toBe("docker");
+    expect(calls[0]!.args[0]).toBe("inspect");
+    // The regression this guards: `spawnSync("docker", args, {encoding})` with
+    // NO timeout key at all.
+    expect(typeof calls[0]!.opts.timeout).toBe("number");
+    expect(calls[0]!.opts.timeout as number).toBeGreaterThan(0);
+    expect(calls[0]!.opts.timeout).toBe(ROLLOUT_PROBE_TIMEOUT_MS);
+    expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
+  });
+
+  it("hindsightExists' docker ps carries a positive timeout + SIGKILL", () => {
+    const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
+    const deps = depsWith((cmd, args, opts) => {
+      calls.push({ cmd, args, opts: opts as unknown as Record<string, unknown> });
+      return { status: 0, stdout: "switchroom-hindsight\n" };
+    });
+
+    expect(deps.hindsightExists?.()).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.cmd).toBe("docker");
+    expect(calls[0]!.args.slice(0, 2)).toEqual(["ps", "-a"]);
+    expect(typeof calls[0]!.opts.timeout).toBe("number");
+    expect(calls[0]!.opts.timeout as number).toBeGreaterThan(0);
+    expect(calls[0]!.opts.timeout).toBe(ROLLOUT_PROBE_TIMEOUT_MS);
+    expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
+  });
+
+  it("a timed-out docker inspect yields an unknown tag (no throw, no hang)", () => {
+    const warns: string[] = [];
+    const deps = depsWith(() => ({ status: null, signal: "SIGKILL", stdout: "" }), (l) =>
+      warns.push(l),
+    );
+    // null == "unknown tag" — the refresh-web skew check already skips on
+    // null, so a wedged daemon degrades to "no skew assertion", not a hang.
+    expect(deps.webImageTag?.()).toBeNull();
+    expect(warns.join(" ")).toMatch(/did not answer within \d+ms and was killed/);
+  });
+
+  it("a timed-out docker ps reports hindsight as absent rather than hanging", () => {
+    const deps = depsWith(() => ({ status: null, signal: "SIGKILL", stdout: "" }));
+    // Fails closed: refresh-hindsight no-ops instead of blocking forever.
+    expect(deps.hindsightExists?.()).toBe(false);
+  });
+
+  // LOW-3 — fail-closed parity with the probe default this runner replaces.
+  //
+  // `isHindsightContainerExists`'s module default (`defaultDockerProbe`,
+  // src/setup/hindsight.ts) wraps its `execFileSync` in try/catch, so ANY
+  // throw became a clean `false`. The injected `dockerRun` had no try/catch,
+  // so a throw would escape `executeRollout` mid-roll — AFTER every agent has
+  // already restarted. spawnSync reports failures on `r.error` rather than
+  // throwing (ENOENT included), so this is parity insurance, not a live bug.
+  it("a THROWING docker spawn still fails closed for hindsightExists", () => {
+    const deps = depsWith(() => {
+      throw new Error("spawnSync exploded");
+    });
+    expect(() => deps.hindsightExists?.()).not.toThrow();
+    expect(deps.hindsightExists?.()).toBe(false);
+  });
+
+  it("a THROWING docker spawn yields an unknown web tag rather than escaping", () => {
+    const deps = depsWith(() => {
+      throw new Error("spawnSync exploded");
+    });
+    expect(() => deps.webImageTag?.()).not.toThrow();
+    expect(deps.webImageTag?.()).toBeNull();
+  });
+});
+
+// ── LOW-2: a TIMED-OUT web/hostd refresh must say so ──────────────────────
+//
+// Both steps gate only on `r.status !== 0`, and `deps.run` reports a SIGKILLed
+// child as `status: 1`. So a timed-out `webd install` / `hostd install`
+// produced the generic non-fatal warning that tells the operator to re-run the
+// command IMMEDIATELY — while the killed CLI's `docker` grandchildren may
+// still be live and mutating the same container. That's the same
+// "grandchildren are NOT killed with it" hazard the restart-agent timeout
+// branch already surfaces; these steps must surface it too.
+describe("executeRollout — a timed-out web/hostd refresh names the timeout", () => {
+  const TARGET = "v0.19.4";
+
+  /** Deps whose `webd`/`hostd` spawns report a timeout kill. */
+  function timedOutRefreshDeps(which: "webd" | "hostd"): RolloutDeps {
+    const { deps: base } = harness({ versions: { clerk: "0.19.4" } });
+    return {
+      ...base,
+      run: (args, o) => {
+        const r = base.run(args, o);
+        return args[0] === which ? { status: 1, timedOut: true } : r;
+      },
+    };
+  }
+
+  it("refresh-web: the warning says TIMED OUT and to sweep strays BEFORE re-running", () => {
+    const deps = timedOutRefreshDeps("webd");
+    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    // Still non-fatal — agents already rolled.
+    expect(r.ok).toBe(true);
+    const w = r.warnings.find((x) => /web refresh/.test(x));
+    expect(w).toBeTruthy();
+    expect(w).toMatch(/TIMED OUT/);
+    expect(w).toMatch(/grandchildren are NOT killed with it/);
+    expect(w).toMatch(/BEFORE re-running/);
+    expect(w).toContain(`switchroom webd install --tag ${TARGET}`);
+  });
+
+  it("refresh-hostd: the warning says TIMED OUT and to sweep strays BEFORE re-running", () => {
+    const deps = timedOutRefreshDeps("hostd");
+    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    expect(r.ok).toBe(true);
+    const w = r.warnings.find((x) => /hostd refresh/.test(x));
+    expect(w).toBeTruthy();
+    expect(w).toMatch(/TIMED OUT/);
+    expect(w).toMatch(/grandchildren are NOT killed with it/);
+    expect(w).toMatch(/BEFORE re-running/);
+    expect(w).toContain(`switchroom hostd install --tag ${TARGET}`);
+  });
+
+  it("an ordinary non-zero refresh exit keeps the plain wording (shapes stay disjoint)", () => {
+    const { deps } = harness({
+      versions: { clerk: "0.19.4" },
+      runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
+    });
+    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.join(" ")).not.toMatch(/TIMED OUT/);
+    expect(r.warnings.some((w) => /web refresh FAILED/.test(w))).toBe(true);
+    expect(r.warnings.some((w) => /hostd refresh failed \(non-fatal\)/.test(w))).toBe(true);
+  });
+});
+
+describe("createRolloutDeps — a timeout can never be reported as success", () => {
+  // F5: isSpawnTimeout checks its ETIMEDOUT arm BEFORE status, so a
+  // `{status: 0, error: {code: "ETIMEDOUT"}}` shape would have returned
+  // `{status: 0, timedOut: true}` — and EVERY caller gates on
+  // `if (r.status !== 0)`, so the timeout would have been read as SUCCESS and
+  // the roll would have marched on. We could not produce that shape on node
+  // v22.23.1, but the JSDoc asserted it as an invariant the code did not
+  // enforce. Now it does.
+  it("forces a non-zero status when a zero-status result is flagged as a timeout", () => {
+    const deps = createRolloutDeps({
+      configPath: "/nope/switchroom.yaml",
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: () =>
+        ({
+          status: 0,
+          error: Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }),
+        }) as ReturnType<RolloutSpawnSync>,
+      warn: () => undefined,
+    });
+    const r = deps.run(["agent", "restart", "clerk", "--wait", "--force"]);
+    expect(r.timedOut).toBe(true);
+    expect(r.status).not.toBe(0);
+    expect(r.status).toBe(1);
+  });
+});
+
+describe("executeRollout — a timed-out restart stops even when the probe PASSES", () => {
+  const TARGET = "v0.19.4";
+
+  // F2: the timeout branch used to push a warning and FALL THROUGH to the
+  // version probe. A SIGKILL reaps only the direct CLI, so its orphaned
+  // `docker compose up -d` grandchild can still bring the container up on the
+  // target tag — the probe then passes, `ok` stays true, `timedOut` is never
+  // set on the result, and the roll reports SUCCESS for an agent whose
+  // post-start reconcile + #3333 scoped ownership sweep were killed and never
+  // ran. The pre-existing timeout test could not catch this: it used
+  // `versions: { "test-harness": null }`, so the probe failed anyway and the
+  // stop was attributable to the null probe, not to the timeout.
+  function timedOutRestartDeps(probeVersionValue: string | null): {
+    deps: RolloutDeps;
+    runs: string[][];
+  } {
+    const { deps: base, runs } = harness({ versions: { "test-harness": probeVersionValue } });
+    return {
+      deps: {
+        ...base,
+        run: (args, o) => {
+          const r = base.run(args, o);
+          return args[0] === "agent" ? { status: 1, timedOut: true } : r;
+        },
+      },
+      runs,
+    };
+  }
+
+  it("returns ok:false + timedOut even though the agent reports the target version", () => {
+    const { deps, runs } = timedOutRestartDeps(TARGET);
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    // The probe agrees the container is on the target …
+    expect(deps.probeVersion("test-harness")).toBe(TARGET);
+    // … and the roll STILL stops, flagged as a timeout.
+    expect(r.ok).toBe(false);
+    expect(r.timedOut).toBe(true);
+    expect(r.failedStep).toBe("restart-agent");
+    expect(r.failedAgent).toBe("test-harness");
+    expect(r.got).toBe(TARGET);
+    // The second agent must never be restarted while the first roll's
+    // SIGKILLed grandchild may still be rewriting the compose file.
+    expect(runs.filter((a) => a[0] === "agent" && a[1] === "restart")).toHaveLength(1);
+    expect(r.rolled).not.toContain("test-harness");
+    // The operator is told the agent is half-applied, not rolled.
+    expect(r.warnings.join(" ")).toMatch(/timeout and was killed/);
+    expect(r.warnings.join(" ")).toMatch(/HALF-APPLIED/);
+  });
+
+  it("survives the hostd result sentinel so get_status shows the timeout", () => {
+    const { deps } = timedOutRestartDeps(TARGET);
+    const steps = planRollout(["test-harness"], { pinToPersist: TARGET, hostdContext: true });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const round = parseRolloutResultLine(encodeRolloutResultLine(r));
+    expect(round?.ok).toBe(false);
+    expect(round?.timedOut).toBe(true);
+    expect(round?.failedAgent).toBe("test-harness");
+  });
+
+  it("does NOT flag timedOut when the restart exits on its own with a bad version", () => {
+    // The disjointness that makes `timedOut` meaningful to hostd: a plain
+    // version-assert failure must not look like a killed-mid-flight restart.
+    const { deps: base } = harness({ versions: { "test-harness": "v0.19.3" } });
+    const steps = planRollout(["test-harness"], { pinToPersist: TARGET, hostdContext: true });
+    const r = executeRollout(steps, TARGET, base, { hostdContext: true });
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("restart-agent");
+    expect(r.timedOut).toBeUndefined();
   });
 });
