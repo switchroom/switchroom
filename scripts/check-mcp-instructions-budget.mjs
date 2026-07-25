@@ -16,21 +16,57 @@
  *
  * There is no env override for this limit (MAX_MCP_CONFIG_BYTES and
  * MAX_MCP_OUTPUT_TOKENS are unrelated paths), so the budget cannot be raised
- * by configuration. Writing a longer string just means the tail is thrown away.
+ * by configuration. Writing a longer string just means the tail is discarded.
  *
- * Scope: every `new Server(...)` construction in the repo that passes an
- * `instructions` field. Today that is only telegram-plugin/bridge, but the
- * check is written to catch a future MCP server that adds one.
+ * ─── DESIGN: MEASURE THE RUNTIME VALUE, DO NOT PARSE SOURCE ────────────────
+ *
+ * An earlier revision of this guard parsed the source of the instructions
+ * array and summed the string literals it recognised. Adversarial review broke
+ * it in three ways, all the same root cause — a static parser cannot see what
+ * JavaScript will actually produce:
+ *
+ *     instructions: MCP_INSTRUCTIONS + 'X'.repeat(9000)   // parser saw nothing
+ *     instructions: buildInstructions()                   // parser saw nothing
+ *     `${PAD}` inside a measured element                  // counted as 5 chars
+ *
+ * Worse, each of those fell through to a "no shapes matched" path that printed
+ * OK and exited 0 — the guard reported success on ZERO coverage.
+ *
+ * So this guard no longer parses the string at all. Instead:
+ *
+ *   1. Every MCP server construction must pass `instructions` as a BARE
+ *      IDENTIFIER (`instructions: MCP_INSTRUCTIONS,`). Any expression — a
+ *      call, a concatenation, a template literal, an inline array or string —
+ *      FAILS CLOSED. This is what makes step 2 sound: nothing can be bolted
+ *      onto the value between the constant and the wire.
+ *   2. That identifier's module is compiled and IMPORTED, and the real runtime
+ *      `.length` is measured. Template interpolation, concatenation and
+ *      computed content inside the module are therefore all counted correctly.
+ *   3. Coverage is asserted: if fewer than EXPECTED_INSTRUCTION_SERVERS
+ *      servers were actually measured, the guard FAILS rather than reporting
+ *      a vacuous OK. Deleting the module or dropping the field is a failure,
+ *      not a pass.
  *
  * Mirrors the other structural guards (check-stale-tool-descriptions, etc.)
  * wired into `npm run lint`.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 
 // Imposed by the Claude Code CLIENT (minified constant `LB`), verified in
-// @anthropic-ai/claude-code v2.1.219. Not ours to change.
+// @anthropic-ai/claude-code v2.1.219. Not ours to change: a longer string is
+// not rejected, it is silently cut.
 const CLIENT_HARD_LIMIT = 2048;
+
+/**
+ * How many MCP servers in this repo are expected to declare `instructions`.
+ * Today: telegram-plugin/bridge only. If a server legitimately gains or drops
+ * an instructions field, update this deliberately — the point is that a
+ * SILENT drop to zero coverage can never masquerade as a pass.
+ */
+const EXPECTED_INSTRUCTION_SERVERS = 1;
 
 const ROOTS = ["src", "telegram-plugin"];
 const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "uat"]);
@@ -45,108 +81,55 @@ function walk(dir, out = []) {
   for (const e of entries) {
     if (SKIP_DIRS.has(e)) continue;
     const p = join(dir, e);
-    const st = statSync(p);
+    let st;
+    // NIT (review): statSync must be inside the try — a broken symlink in the
+    // tree would otherwise crash lint with an unhelpful ENOENT stack.
+    try {
+      st = statSync(p);
+    } catch {
+      continue;
+    }
     if (st.isDirectory()) walk(p, out);
     else if (/\.ts$/.test(p) && !/\.(test|spec)\.ts$/.test(p)) out.push(p);
   }
   return out;
 }
 
+const ALL_FILES = ROOTS.flatMap((r) => walk(r));
 const failures = [];
 const checked = [];
 
-for (const root of ROOTS) {
-  for (const file of walk(root)) {
-    const src = readFileSync(file, "utf8");
-    if (!/^\s*instructions:/m.test(src)) continue;
-
-    // Case 1: instructions is a reference to an exported constant living in a
-    // dedicated module (the pattern we want). Resolve and measure it.
-    const ref = src.match(/^\s*instructions:\s*([A-Z][A-Z0-9_]*)\s*,/m);
-    if (ref) {
-      const name = ref[1];
-      // Find the module that defines it.
-      let defined = null;
-      for (const r2 of ROOTS) {
-        for (const f2 of walk(r2)) {
-          const s2 = readFileSync(f2, "utf8");
-          const re = new RegExp(
-            `export const ${name}\\s*=\\s*\\[([\\s\\S]*?)\\]\\.join\\(`,
-          );
-          const m2 = s2.match(re);
-          if (m2) {
-            defined = { file: f2, body: m2[1] };
-            break;
-          }
-        }
-        if (defined) break;
-      }
-      if (!defined) {
-        failures.push(
-          `${file}: instructions references ${name}, but this guard could not ` +
-            `locate its definition to measure it. Keep the constant as an ` +
-            `\`export const ${name} = [ ... ].join('\\n')\` array literal so the ` +
-            `budget stays checkable.`,
-        );
-        continue;
-      }
-      const len = measureJoinedArray(defined.body);
-      checked.push({ file: defined.file, name, len });
-      if (len > CLIENT_HARD_LIMIT) {
-        failures.push(fail(defined.file, name, len));
-      }
-      continue;
-    }
-
-    // Case 2: an inline array literal (the pre-#3562 shape). Measure in place.
-    const inline = src.match(/^\s*instructions:\s*\[([\s\S]*?)\]\.join\(/m);
-    if (inline) {
-      const len = measureJoinedArray(inline[1]);
-      checked.push({ file, name: "<inline>", len });
-      if (len > CLIENT_HARD_LIMIT) failures.push(fail(file, "<inline>", len));
-      continue;
-    }
-
-    // Case 3: something we do not recognise. Fail closed rather than silently
-    // letting an unmeasurable instructions string through.
-    if (/^\s*instructions:\s*['"`]/m.test(src)) {
-      failures.push(
-        `${file}: instructions is an inline string literal this guard cannot ` +
-          `measure reliably. Move it to an exported ` +
-          `\`[ ... ].join('\\n')\` constant (see ` +
-          `telegram-plugin/bridge/mcp-instructions.ts).`,
-      );
-    }
+/** Compile a TS module and import it, returning its real runtime exports. */
+async function importModule(file) {
+  const esbuild = await import("esbuild");
+  const tmp = mkdtempSync(join(tmpdir(), "mcp-instr-"));
+  try {
+    const out = join(tmp, "mod.mjs");
+    await esbuild.build({
+      entryPoints: [file],
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      outfile: out,
+      logLevel: "silent",
+    });
+    return await import(pathToFileURL(out).href);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
   }
 }
 
-/**
- * Measure the joined length of an array-of-string-literals source body.
- * We count the literal text of each element plus one '\n' per join seam —
- * matching `[...].join('\n')`. Comment-only lines are ignored.
- */
-function measureJoinedArray(body) {
-  const parts = [];
-  const re = /(['"`])((?:\\.|(?!\1)[\s\S])*?)\1\s*(?:,|$)/g;
-  // Strip // comments so a commented-out example string is not counted.
-  const cleaned = body
-    .split("\n")
-    .filter((l) => !/^\s*\/\//.test(l))
-    .join("\n");
-  let m;
-  while ((m = re.exec(cleaned))) {
-    // Unescape the common sequences so the measured length matches runtime.
-    const raw = m[2].replace(/\\(['"`\\])/g, "$1").replace(/\\n/g, "\n");
-    parts.push(raw);
-  }
-  return parts.join("\n").length;
+/** Locate the .ts module that exports `name`. */
+function findExporter(name) {
+  const re = new RegExp(`export\\s+const\\s+${name}\\b`);
+  return ALL_FILES.find((f) => re.test(readFileSync(f, "utf8"))) ?? null;
 }
 
-function fail(file, name, len) {
-  const over = len - CLIENT_HARD_LIMIT;
+function fail(file, name, len, budget) {
+  const over = len - budget;
   return (
     `${file}: MCP instructions ${name} is ${len} chars — ${over} over the ` +
-    `${CLIENT_HARD_LIMIT}-char budget.\n` +
+    `${budget}-char authored budget (client hard limit ${CLIENT_HARD_LIMIT}).\n` +
     `      The Claude Code CLIENT truncates MCP server instructions at ` +
     `${CLIENT_HARD_LIMIT} chars, silently and mid-word. There is no env ` +
     `override. Everything past char ${CLIENT_HARD_LIMIT} will NOT reach the ` +
@@ -157,6 +140,98 @@ function fail(file, name, len) {
   );
 }
 
+for (const file of ALL_FILES) {
+  const src = readFileSync(file, "utf8");
+  // Only MCP server constructions are in scope.
+  if (!/new Server\(/.test(src)) continue;
+
+  const m = src.match(/^[ \t]*instructions:[ \t]*(.*)$/m);
+  if (!m) continue; // server declares no instructions — nothing to measure
+
+  const rawValue = m[1].replace(/,\s*$/, "").trim();
+
+  // ── Step 1: fail closed unless the value is a bare identifier. ───────────
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rawValue)) {
+    failures.push(
+      `${file}: \`instructions\` must be a BARE IDENTIFIER referring to an ` +
+        `exported constant (e.g. \`instructions: MCP_INSTRUCTIONS,\`), but is:\n` +
+        `        instructions: ${rawValue}\n` +
+        `      An expression (concatenation, call, template literal, inline ` +
+        `array/string) is rejected because this guard measures the constant's ` +
+        `RUNTIME value — anything appended after that point would reach the ` +
+        `client unmeasured and be silently truncated at ${CLIENT_HARD_LIMIT} chars.\n` +
+        `      Move the whole string into an exported constant in its own module ` +
+        `(see telegram-plugin/bridge/mcp-instructions.ts).`,
+    );
+    continue;
+  }
+
+  // ── Step 2: resolve, import, measure the real runtime value. ─────────────
+  const exporter = findExporter(rawValue);
+  if (!exporter) {
+    failures.push(
+      `${file}: \`instructions: ${rawValue}\` — no module in [${ROOTS.join(", ")}] ` +
+        `exports \`${rawValue}\`. This guard cannot measure what it cannot ` +
+        `resolve, and refuses to pass silently. Keep the constant as an ` +
+        `\`export const ${rawValue} = ...\` in a .ts module under those roots.`,
+    );
+    continue;
+  }
+
+  let mod;
+  try {
+    mod = await importModule(exporter);
+  } catch (err) {
+    failures.push(
+      `${file}: failed to compile/import ${exporter} to measure \`${rawValue}\`: ` +
+        `${err && err.message ? err.message : err}`,
+    );
+    continue;
+  }
+
+  const value = mod[rawValue];
+  if (typeof value !== "string") {
+    failures.push(
+      `${exporter}: \`${rawValue}\` must export a string (got ` +
+        `${typeof value}). The MCP client receives a string; anything else ` +
+        `cannot be budget-checked.`,
+    );
+    continue;
+  }
+
+  // The module owns its own authored budget; honour it, and require it to sit
+  // under the client's hard limit.
+  const budget = mod.MCP_INSTRUCTIONS_BUDGET;
+  if (typeof budget === "number" && budget > CLIENT_HARD_LIMIT) {
+    failures.push(
+      `${exporter}: authored budget ${budget} exceeds the client's hard limit ` +
+        `${CLIENT_HARD_LIMIT}. The budget must be <= the limit; raising it ` +
+        `does not stop the client truncating.`,
+    );
+    continue;
+  }
+  const effective =
+    typeof budget === "number" && budget > 0 ? budget : CLIENT_HARD_LIMIT;
+
+  const len = value.length;
+  checked.push({ file: exporter, name: rawValue, len, budget: effective });
+
+  if (len > effective) failures.push(fail(exporter, rawValue, len, effective));
+}
+
+// ── Step 3: coverage. A guard that measured nothing has proven nothing. ────
+if (checked.length < EXPECTED_INSTRUCTION_SERVERS) {
+  failures.push(
+    `coverage: measured ${checked.length} MCP server instructions string(s), ` +
+      `expected at least ${EXPECTED_INSTRUCTION_SERVERS}.\n` +
+      `      Reporting OK here would be a FALSE PASS — the previous revision ` +
+      `of this guard did exactly that and shipped an unguarded string.\n` +
+      `      Either an instructions field was removed/renamed, its module was ` +
+      `deleted, or the detection above no longer matches. Investigate rather ` +
+      `than lowering EXPECTED_INSTRUCTION_SERVERS.`,
+  );
+}
+
 if (failures.length) {
   console.error("check-mcp-instructions-budget: FAIL\n");
   for (const f of failures) console.error("  - " + f + "\n");
@@ -164,6 +239,8 @@ if (failures.length) {
 }
 
 console.error(
-  `check-mcp-instructions-budget: OK (${checked.length} checked) ` +
-    checked.map((c) => `${c.name}=${c.len}/${CLIENT_HARD_LIMIT}`).join(" "),
+  `check-mcp-instructions-budget: OK (${checked.length} measured) ` +
+    checked
+      .map((c) => `${c.name}=${c.len}/${c.budget} (limit ${CLIENT_HARD_LIMIT})`)
+      .join(" "),
 );
