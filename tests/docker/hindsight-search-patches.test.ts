@@ -101,9 +101,23 @@ function patchBlocks(): string[] {
 /**
  * Python probe. Exits 0 only when both fixes are in effect AND every
  * safety property above holds; prints the offending assertions otherwise.
- * Deliberately asserts OUTCOMES — final rank order, the emitted tsquery
- * string, a real driven timeout — rather than merely calling the code or
- * grepping its source.
+ *
+ * Deliberately asserts OUTCOMES rather than merely calling the code or
+ * grepping its source. Concretely, this file asserts:
+ *
+ *  - the token list `tokenize_query` returns, and that it stays a strict
+ *    superset of upstream's across 8 query shapes;
+ *  - the exact tsquery string `prepare_bm25_text` emits — that the intact
+ *    compound is present, that every bare fragment upstream emitted survives
+ *    as a standalone OR arm, and that a non-compound query is byte-identical
+ *    to upstream;
+ *  - two REAL driven timeouts — a hanging completion forced through both
+ *    LiteLLM retry loops — checked for the timeout/scope facts in the message
+ *    and for still being caught by an upstack `except asyncio.TimeoutError`.
+ *
+ * It asserts nothing about how results are finally ordered. The ranking patch
+ * was split into its own PR and its ordering/scoring-safety probes went with
+ * it. The test below enforces that this paragraph stays true.
  */
 const PROBE = String.raw`
 import asyncio
@@ -305,6 +319,24 @@ function runProbe(patched: boolean): ProbeResult {
 }
 
 describe("Dockerfile.hindsight search-patch probe is real, not a silent skip", () => {
+  it("does not claim coverage in its header that the probe does not have", () => {
+    // This PR's whole purpose was correcting a false claim in a header, and
+    // the header of THIS file then went stale the same way: after the ranking
+    // patch was split out it still advertised "final rank order" while no
+    // rank-order assertion remained. A prose claim cannot be trusted to stay
+    // true by discipline, so tie it to the probe source mechanically.
+    const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const header = src.slice(0, src.indexOf("const PROBE ="));
+    const probeChecksRankOrder = /SATURATED_ORDER|combined_score/.test(PROBE);
+    if (!probeChecksRankOrder) {
+      expect(
+        header,
+        "the header advertises rank-order coverage but the probe asserts " +
+          "nothing about rank order — describe what this file actually checks",
+      ).not.toMatch(/rank\s+order/i);
+    }
+  });
+
   it("pins the upstream image by digest so the probe tests the exact shipping bytes", () => {
     expect(UPSTREAM_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
   });
