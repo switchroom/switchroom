@@ -543,8 +543,22 @@ export interface ComposeRestoreResult {
  * So the restore refuses when the backup's service set differs from the
  * service set in the compose currently on disk (which the last write generated
  * from the live config). `opts.expectedServices` overrides that source when
- * the caller has the config's own view; `opts.force` bypasses the gate for an
- * operator who has looked at the diff and wants it anyway.
+ * the caller has the config's own view.
+ *
+ * **The gate cannot disable itself.** An earlier draft only ran the comparison
+ * `if (expected && expected.length > 0)`, i.e. it silently skipped the check
+ * whenever the live compose was missing, empty, or too corrupt to yield a
+ * service name — which is precisely the "`apply --pin` failed and left a broken
+ * compose" state the only caller invokes this from. The gate switched itself
+ * off exactly when it mattered and restored blind. An indeterminate expectation
+ * is now a REFUSAL: without a service set to compare against there is no way to
+ * know the backup still describes this fleet, and `switchroom apply` host-side
+ * is a strictly better recovery than a blind overwrite.
+ *
+ * There is deliberately no `force` bypass: this function has one caller
+ * (hostd's failed-auto-roll recovery), which is unattended, so a bypass would
+ * be dead code — and the operator's override already exists and is better
+ * (`switchroom apply`, or copying the `.bak` by hand after reading the diff).
  *
  * Uses the same tmp+rename swap as the forward write so a crash mid-restore
  * can't leave a truncated compose. Never throws — callers are recovery paths
@@ -552,7 +566,7 @@ export interface ComposeRestoreResult {
  */
 export async function restoreComposeBackup(
   composePath: string,
-  opts: { expectedServices?: string[]; force?: boolean } = {},
+  opts: { expectedServices?: string[] } = {},
 ): Promise<ComposeRestoreResult> {
   const bak = composeBackupPath(composePath);
   let content: string;
@@ -565,30 +579,50 @@ export async function restoreComposeBackup(
     return { restored: false, reason: `compose backup at ${bak} is empty` };
   }
 
-  if (!opts.force) {
-    let expected = opts.expectedServices;
-    if (!expected) {
-      try {
-        expected = composeServiceNames(await readFile(composePath, "utf8"));
-      } catch {
-        expected = undefined; // nothing live to compare against
-      }
+  let expected = opts.expectedServices;
+  let expectationSource = "the caller's expected service set";
+  if (!expected) {
+    expectationSource = `the compose currently at ${composePath}`;
+    try {
+      expected = composeServiceNames(await readFile(composePath, "utf8"));
+    } catch (e) {
+      return {
+        restored: false,
+        reason:
+          `cannot verify the compose backup at ${bak}: ${composePath} is ` +
+          `unreadable (${(e as Error).message}), so there is no service set to ` +
+          `check it against. Refusing to restore — a backup can predate a ` +
+          `config change and would then drop or resurrect services. Run ` +
+          `\`switchroom apply\` host-side against the intended release.`,
+      };
     }
-    if (expected && expected.length > 0) {
-      const have = composeServiceNames(content);
-      const missing = expected.filter((s) => !have.includes(s));
-      const extra = have.filter((s) => !expected.includes(s));
-      if (missing.length > 0 || extra.length > 0) {
-        return {
-          restored: false,
-          reason:
-            `compose backup at ${bak} does not match the current fleet ` +
-            `(missing: ${missing.join(", ") || "none"}; ` +
-            `unknown: ${extra.join(", ") || "none"}). Refusing to restore — it ` +
-            `predates a config change and would drop or resurrect services. ` +
-            `Re-run \`switchroom apply\` against the intended release instead.`,
-        };
-      }
+  }
+  if (expected.length === 0) {
+    return {
+      restored: false,
+      reason:
+        `cannot verify the compose backup at ${bak}: ${expectationSource} ` +
+        `declares no services (empty, truncated, or unparseable), so there is ` +
+        `no service set to check it against. Refusing to restore — a backup ` +
+        `can predate a config change and would then drop or resurrect ` +
+        `services. Run \`switchroom apply\` host-side against the intended ` +
+        `release.`,
+    };
+  }
+  {
+    const have = composeServiceNames(content);
+    const missing = expected.filter((s) => !have.includes(s));
+    const extra = have.filter((s) => !expected.includes(s));
+    if (missing.length > 0 || extra.length > 0) {
+      return {
+        restored: false,
+        reason:
+          `compose backup at ${bak} does not match the current fleet ` +
+          `(missing: ${missing.join(", ") || "none"}; ` +
+          `unknown: ${extra.join(", ") || "none"}). Refusing to restore — it ` +
+          `predates a config change and would drop or resurrect services. ` +
+          `Re-run \`switchroom apply\` against the intended release instead.`,
+      };
     }
   }
 

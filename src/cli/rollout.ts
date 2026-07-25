@@ -417,8 +417,15 @@ export interface RolloutDeps {
    * Mark the provisional pin write durable. Called EXACTLY ONCE, at the very
    * end of a fully successful roll. Optional (a caller with no persistPin
    * has nothing to commit).
+   *
+   * Returns an operator-facing message when the commit did NOT clear the
+   * journal, null/void otherwise. A surviving journal is the exact input that
+   * makes a later boot revert a PROVEN pin, so the executor promotes it into
+   * {@link RolloutResult.warnings} — the same structured surface the revert
+   * failure uses. A stderr-only warning would be invisible on the hostd path,
+   * where the roll's outcome is consumed as a result object.
    */
-  commitPin?(): void;
+  commitPin?(): string | null | void;
   /**
    * Revert a provisional pin write. Called on every failure return after a
    * `persist-pin` step ran, so a roll that fails at agent 5 of 12 cannot
@@ -1055,7 +1062,13 @@ export function executeRollout(
   // clears the crash-recovery journal, so a later hostd boot won't revert it.
   if (pinPersisted && deps.commitPin) {
     try {
-      deps.commitPin();
+      const commitErr = deps.commitPin();
+      if (typeof commitErr === "string" && commitErr.length > 0) {
+        warnings.push(
+          `${commitErr} (The roll SUCCEEDED and release.pin is correct — the ` +
+            `risk is a later recovery pass reverting it.)`,
+        );
+      }
     } catch (e) {
       warnings.push(
         `roll succeeded but committing the durable release.pin threw: ` +
@@ -1475,7 +1488,10 @@ export function createRolloutDeps(params: {
     },
     commitPin: () => {
       const err = commitPinPersist(configPath);
+      // Returned (not just warned) so the executor lands it in
+      // RolloutResult.warnings \u2014 see RolloutDeps.commitPin.
       if (err) warn(`\u26a0\ufe0f  ${err}\n`);
+      return err;
     },
     revertPin: () => {
       // requireStale is deliberately FALSE here: this caller IS the process

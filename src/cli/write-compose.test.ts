@@ -5,7 +5,7 @@
  * are correct. Writes to an isolated tmpdir — never ~/.switchroom.
  */
 import { describe, expect, it, afterEach, beforeEach } from "vitest";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
@@ -341,18 +341,72 @@ describe("compose backup across a simulated staggered roll", () => {
     expect(res.reason).toMatch(/unknown: retired/);
   });
 
-  it("force bypasses the coherence gate for a deliberate operator restore", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "wc-force-"));
+  it("REFUSES when the live compose is unreadable — the gate must not disable itself", async () => {
+    // THE bug this asserts: the gate used to run only `if (expected &&
+    // expected.length > 0)`, so a missing live compose left `expected`
+    // undefined and the check was SKIPPED — restoring blind. A missing or
+    // broken live compose is exactly the state the sole caller (hostd's
+    // failed-auto-roll recovery, reached only after `apply --pin` exited
+    // non-zero) invokes this in, so the gate switched itself off precisely
+    // when it mattered.
+    const dir = mkdtempSync(join(tmpdir(), "wc-nolive-"));
     const composePath = join(dir, "docker-compose.yml");
-    const twoAgents = {
-      telegram: { bot_token: "x", forum_chat_id: "-100" },
-      release: { pin: "v0.19.4" },
-      agents: { clerk: { extends: "default" }, archivist: { extends: "default" } },
-    } as unknown as SwitchroomConfig;
     await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
-    await writeComposeFile({ config: twoAgents, composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    const backup = readFileSync(composePath + ".bak", "utf8");
+    rmSync(composePath);
 
-    const res = await restoreComposeBackup(composePath, { force: true });
+    const res = await restoreComposeBackup(composePath);
+
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/cannot verify the compose backup/);
+    expect(res.reason).toMatch(/no service set to check it against/);
+    // THE outcome: nothing was written, so an unverifiable backup cannot
+    // drop or resurrect services behind the operator's back…
+    expect(existsSync(composePath)).toBe(false);
+    // …and the backup is left intact for a deliberate host-side recovery.
+    expect(readFileSync(composePath + ".bak", "utf8")).toBe(backup);
+  });
+
+  it("REFUSES when the live compose declares no services (truncated/corrupt)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-emptylive-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    // A half-written compose: plausible prefix, no service keys at all.
+    const corrupt = "# switchroom\nversion: '3'\n";
+    writeFileSync(composePath, corrupt, "utf8");
+
+    const res = await restoreComposeBackup(composePath);
+
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/declares no services/);
+    expect(readFileSync(composePath, "utf8")).toBe(corrupt);
+  });
+
+  it("an empty caller-supplied expectation is a refusal too, not a bypass", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-emptyexp-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    const live = readFileSync(composePath, "utf8");
+
+    const res = await restoreComposeBackup(composePath, { expectedServices: [] });
+
+    expect(res.restored).toBe(false);
+    expect(res.reason).toMatch(/declares no services/);
+    expect(readFileSync(composePath, "utf8")).toBe(live);
+  });
+
+  it("a caller-supplied expectation is honoured over the live compose", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-exp-"));
+    const composePath = join(dir, "docker-compose.yml");
+    await writeComposeFile({ config: mkConfig("v0.19.3"), composePath, switchroomConfigPath: undefined });
+    await writeComposeFile({ config: mkConfig("v0.19.4"), composePath, switchroomConfigPath: undefined });
+    const expected = composeServiceNames(readFileSync(composePath + ".bak", "utf8"));
+    expect(expected.length).toBeGreaterThan(0);
+
+    const res = await restoreComposeBackup(composePath, { expectedServices: expected });
 
     expect(res.restored).toBe(true);
     expect(res.imageTag).toBe("v0.19.3");

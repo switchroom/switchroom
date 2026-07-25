@@ -8,10 +8,10 @@
  * injected side-effects so this runs without docker.
  */
 
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import {
   normalizeVersion,
   isVersionAssertable,
@@ -44,6 +44,7 @@ import {
   commitPinPersist,
   rollbackPinPersist,
   hasPinJournal,
+  pinJournalPath,
   recoverPinJournal,
   PIN_JOURNAL_MAX_AGE_MS,
 } from "./rollout-pin-journal.js";
@@ -1138,6 +1139,11 @@ function pinHarness(opts: {
   journalled: () => boolean;
 } {
   const dir = mkdtempSync(join(tmpdir(), "rollout-pin-"));
+  // The journal lives in the DURABLE switchroom state dir, NOT beside the
+  // config (rollout-pin-journal.ts — inside hostd the config's directory is a
+  // container-ephemeral overlay). Point it at a tmpdir so the suite never
+  // writes into a real `~/.switchroom`.
+  process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(join(tmpdir(), "rollout-pin-state-"));
   const configPath = join(dir, "switchroom.yaml");
   writeFileSync(
     configPath,
@@ -1156,9 +1162,9 @@ function pinHarness(opts: {
       beginPinPersist(configPath, p);
       writeFileSync(configPath, after, "utf8");
     },
-    commitPin: () => {
-      commitPinPersist(configPath);
-    },
+    // Mirrors createRolloutDeps: the error is RETURNED so the executor can
+    // put it in RolloutResult.warnings, not just written to stderr.
+    commitPin: () => commitPinPersist(configPath),
     revertPin: () => rollbackPinPersist(configPath).reverted,
   };
   return {
@@ -1172,6 +1178,10 @@ function pinHarness(opts: {
 describe("executeRollout — durable pin is provisional until the roll is proven", () => {
   const TARGET = "v0.19.4";
   const FLEET = ["test-harness", "clerk", "marko", "nadia", "opal"];
+
+  afterEach(() => {
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+  });
 
   it("REVERTS the pin when a non-canary agent fails past a green canary (hostd path)", () => {
     // Canary + 2 agents green, then agent 4 comes back on the OLD version.
@@ -1252,6 +1262,39 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.pinReverted).toBeUndefined();
     // No journal left behind — a later hostd boot must NOT revert a proven roll.
     expect(h.journalled()).toBe(false);
+  });
+
+  it("surfaces a commit that could NOT clear the journal in the structured warnings", () => {
+    // A journal surviving a SUCCESSFUL commit is the exact input that makes a
+    // later recovery pass revert a PROVEN pin. It used to go only to the
+    // `warn` sink (child stderr), which is invisible on the hostd path — the
+    // roll's outcome there is consumed as a result object, and the analogous
+    // revert failure already lands in `warnings`.
+    const h = pinHarness({
+      versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
+    });
+    const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
+    // A DIRECTORY at the journal path makes unlink fail for every uid,
+    // including the root the suite may run as — deterministic, not
+    // privilege-dependent. Created after persist so it replaces the journal.
+    const deps: RolloutDeps = {
+      ...h.deps,
+      persistPin: (p) => {
+        h.deps.persistPin?.(p);
+        rmSync(pinJournalPath(h.configPath));
+        mkdirSync(pinJournalPath(h.configPath));
+      },
+    };
+
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    // The roll itself SUCCEEDED and the pin is correct…
+    expect(r.ok).toBe(true);
+    expect(h.pin()).toBe(TARGET);
+    // …but the operator is told, through the structured surface.
+    expect(r.warnings.join(" ")).toMatch(/FAILED to clear/);
+    expect(r.warnings.join(" ")).toMatch(/may revert a proven/);
+    expect(r.warnings.join(" ")).toMatch(/The roll SUCCEEDED/);
   });
 
   it("leaves the journal in place when a crash beats both commit and revert", () => {

@@ -8,19 +8,23 @@
  * failed on the original bug.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   mkdtempSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   chmodSync,
   statSync,
   mkdirSync,
+  symlinkSync,
+  rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
+  pinJournalDir,
   pinJournalPath,
   hasPinJournal,
   readPinJournal,
@@ -29,6 +33,7 @@ import {
   rollbackPinPersist,
   recoverPinJournal,
   isPidAlive,
+  isJournalWriterAlive,
   isJournalFresh,
   PIN_JOURNAL_MAX_AGE_MS,
   type RolloutPinJournal,
@@ -36,13 +41,30 @@ import {
 import { setReleasePinInConfig, getReleasePinFromConfig } from "./release-yaml.js";
 
 const CONFIG = `telegram:
-  bot_token: x
+  bot_token: x # the fleet's bot credential
 release:
   pin: v0.19.3 # 2026-07-01: rolled by switchroom rollout
 agents:
   clerk:
     extends: default
 `;
+
+/**
+ * Stand-in for the DURABLE switchroom state dir (`~/.switchroom` on the host
+ * shell, the `/host-home/.switchroom` bind inside hostd). Every test points the
+ * journal at a tmpdir so the suite can never touch a real state dir — and so
+ * the "journal does NOT live beside the config" property is assertable.
+ */
+let stateDir: string;
+
+beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), "pin-journal-state-"));
+  process.env.SWITCHROOM_PIN_JOURNAL_DIR = stateDir;
+});
+
+afterEach(() => {
+  delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+});
 
 function mkConfig(text = CONFIG): string {
   const dir = mkdtempSync(join(tmpdir(), "pin-journal-"));
@@ -58,6 +80,11 @@ function provisionallyPersist(configPath: string, pin: string): void {
   writeFileSync(configPath, setReleasePinInConfig(before, pin), "utf8");
 }
 
+/** A start-time probe reporting a process that began AFTER `journal.at`. */
+function startedAfterJournal(journal: RolloutPinJournal): () => number {
+  return () => Date.parse(journal.at) + 60_000;
+}
+
 function pinOf(configPath: string): string | undefined {
   return getReleasePinFromConfig(readFileSync(configPath, "utf8"));
 }
@@ -66,6 +93,144 @@ function pinOf(configPath: string): string | undefined {
 function afterTimeout(): number {
   return Date.now() + PIN_JOURNAL_MAX_AGE_MS + 1;
 }
+
+describe("pin journal — the journal must outlive the container that wrote it", () => {
+  it("writes the journal into the DURABLE state dir, never beside the config", () => {
+    // THE production defect: the journal used to be `dirname(configPath)`.
+    // Inside hostd the config is a SINGLE-FILE bind mount
+    // (`~/.switchroom/switchroom.yaml` → `/state/config/switchroom.yaml`), so
+    // `/state/config` the directory is the container's writable overlay. The
+    // journal landed somewhere that exists nowhere on the host and dies with
+    // the container — making hostd-boot crash recovery dead code on exactly
+    // the path this module targets.
+    const cfg = mkConfig();
+    provisionallyPersist(cfg, "v0.19.4");
+
+    const p = pinJournalPath(cfg);
+    expect(dirname(p)).toBe(stateDir); // the durable, directory-bind-mounted dir
+    expect(dirname(p)).not.toBe(dirname(cfg)); // NOT the config's (ephemeral) dir
+    expect(existsSync(p)).toBe(true);
+    // Nothing at all was dropped next to the config.
+    expect(readdirSync(dirname(cfg))).toEqual(["switchroom.yaml"]);
+  });
+
+  it("recovery still finds the journal after a container recreate wipes the config's directory", () => {
+    // The failure end-to-end. Inside hostd the config is a SINGLE-FILE bind
+    // mount, so `/state/config/switchroom.yaml` survives a recreate but
+    // `/state/config` the DIRECTORY is a fresh overlay: the file is remounted,
+    // anything else written there is gone. Modelled with a symlink into a
+    // separate "container view" directory that gets emptied.
+    const real = mkConfig();
+    const viewDir = mkdtempSync(join(tmpdir(), "pin-journal-view-"));
+    const viewPath = join(viewDir, "switchroom.yaml");
+    symlinkSync(real, viewPath); // the bind-mounted file
+
+    provisionallyPersist(viewPath, "v0.19.4");
+    expect(pinOf(real)).toBe("v0.19.4");
+
+    // …the container is recreated: the overlay is discarded, only the
+    // bind-mounted file is remounted.
+    for (const entry of readdirSync(viewDir)) {
+      if (entry !== "switchroom.yaml") rmSync(join(viewDir, entry), { recursive: true });
+    }
+    expect(existsSync(viewPath)).toBe(true);
+
+    // A fresh hostd boots and runs recovery against the same config path.
+    const note = recoverPinJournal(viewPath, { now: afterTimeout() });
+
+    expect(note).toMatch(/reverted an UNCOMMITTED release.pin=v0\.19\.4/);
+    // THE outcome: the durable pin names the last PROVEN build, so no later
+    // reconcile can converge the fleet onto the one that never proved out.
+    expect(pinOf(real)).toBe("v0.19.3");
+  });
+
+  it("creates the state dir when it does not exist yet", () => {
+    const fresh = join(stateDir, "nested", "state");
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = fresh;
+    const cfg = mkConfig();
+    provisionallyPersist(cfg, "v0.19.4");
+    expect(existsSync(pinJournalPath(cfg))).toBe(true);
+  });
+
+  it("falls back to <home>/.switchroom when nothing overrides it", () => {
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+    // Not `dirname(configPath)` — the whole point. `homedir()` is the operator
+    // home on the host shell and `/host-home` inside hostd (whose compose pins
+    // HOME), so both resolve onto the same durable directory bind mount.
+    expect(pinJournalDir().endsWith("/.switchroom")).toBe(true);
+    expect(dirname(pinJournalPath("/state/config/switchroom.yaml"))).toBe(pinJournalDir());
+  });
+});
+
+describe("pin journal — two writers must not share one journal", () => {
+  it("keys the journal by config path, so hostd and a host shell stay separate", () => {
+    // Moving BOTH writers into one durable directory is what creates this
+    // hazard: hostd rolls against `/state/config/switchroom.yaml` while an
+    // operator's `sudo switchroom rollout` rolls against
+    // `~/.switchroom/switchroom.yaml`. Same file, different paths.
+    const hostd = pinJournalPath("/state/config/switchroom.yaml");
+    const shell = pinJournalPath("/home/op/.switchroom/switchroom.yaml");
+    expect(dirname(hostd)).toBe(dirname(shell)); // same durable directory…
+    expect(hostd).not.toBe(shell); // …different journals.
+  });
+
+  it("a failing roll does NOT revert to the other roll's priorPin", () => {
+    // THE damage a shared journal would do, asserted as an outcome. Roll A
+    // (hostd view) writes v2 over v1; roll B (host-shell view of the SAME
+    // file) then writes v3 over v2. With one shared journal, A's failure
+    // reverts to B's recorded priorPin (v2) and deletes B's journal, so B
+    // commits a no-op and reports success on a pin nobody proved.
+    const dir = mkdtempSync(join(tmpdir(), "pin-journal-two-"));
+    const real = join(dir, "switchroom.yaml");
+    writeFileSync(real, CONFIG.replace("v0.19.3", "v1"), "utf8");
+    // A second path onto the SAME file — the symlink stands in for hostd's
+    // single-file bind mount of `~/.switchroom/switchroom.yaml` onto
+    // `/state/config/switchroom.yaml`.
+    const asShell = real;
+    const asHostd = join(dir, "state-config.yaml");
+    symlinkSync(real, asHostd);
+
+    beginPinPersist(asHostd, "v2");
+    writeFileSync(real, setReleasePinInConfig(readFileSync(real, "utf8"), "v2"), "utf8");
+    beginPinPersist(asShell, "v3");
+    writeFileSync(real, setReleasePinInConfig(readFileSync(real, "utf8"), "v3"), "utf8");
+
+    // Roll A fails and reverts. It must restore ITS OWN prior pin (v1)…
+    expect(rollbackPinPersist(asHostd).priorPin).toBe("v1");
+    // …and must not have destroyed roll B's journal.
+    expect(hasPinJournal(asShell)).toBe(true);
+    expect(readPinJournal(asShell)?.priorPin).toBe("v2");
+  });
+
+  it("REFUSES to open a second journal while the first writer is alive", () => {
+    // Per-writer keying separates hostd from a host shell, but two rolls
+    // against the SAME config path would still collide. This is the exclusive
+    // gate: the second begin throws, so the caller never writes an
+    // unjournalled (or mis-journalled) provisional pin.
+    const cfg = mkConfig();
+    provisionallyPersist(cfg, "v0.19.4"); // journal pid = this live process
+
+    expect(() => beginPinPersist(cfg, "v0.19.5")).toThrow(/held by a LIVE roll/);
+    // The first roll's journal is intact, so ITS revert still works.
+    expect(readPinJournal(cfg)?.pin).toBe("v0.19.4");
+    expect(readPinJournal(cfg)?.priorPin).toBe("v0.19.3");
+  });
+
+  it("overwrites (with a warning) a journal whose writer is gone", () => {
+    // The other half: a crashed predecessor must not block every future roll.
+    const cfg = mkConfig();
+    provisionallyPersist(cfg, "v0.19.4");
+    const warnings: string[] = [];
+    // Journal aged past the cutoff = abandoned.
+    const j = beginPinPersist(cfg, "v0.19.5", {
+      warn: (m) => warnings.push(m),
+      now: afterTimeout(),
+    });
+    expect(j.pin).toBe("v0.19.5");
+    expect(warnings.join("")).toMatch(/overwriting an ABANDONED journal/);
+    expect(readPinJournal(cfg)?.pin).toBe("v0.19.5");
+  });
+});
 
 describe("pin journal — two-phase commit", () => {
   it("a provisional write changes the pin but leaves a journal", () => {
@@ -102,10 +267,17 @@ describe("pin journal — two-phase commit", () => {
     expect(out.pin).toBe("v0.19.4");
     expect(out.priorPin).toBe("v0.19.3");
     expect(pinOf(cfg)).toBe("v0.19.3");
-    // Every other key and its comments survive the targeted edit.
+    // Every other key AND its comments survive the targeted edit. Asserting
+    // the keys alone would pass under a comment-stripping rewrite
+    // (`yaml.stringify(obj)`), which is the failure mode this module bans, so
+    // the unrelated comment is asserted byte-for-byte…
     const text = readFileSync(cfg, "utf8");
-    expect(text).toContain("bot_token: x");
+    expect(text).toContain("bot_token: x # the fleet's bot credential");
     expect(text).toContain("clerk:");
+    // …and nothing outside the `release:` block moved at all.
+    const untouched = (s: string) =>
+      s.split("\n").filter((l) => !/^\s*pin:/.test(l)).join("\n");
+    expect(untouched(text)).toBe(untouched(CONFIG));
     expect(hasPinJournal(cfg)).toBe(false);
   });
 
@@ -139,8 +311,44 @@ describe("pin journal — two-phase commit", () => {
     expect(out.reverted).toBe(true);
     expect(out.priorPin).toBeUndefined();
     expect(pinOf(cfg)).toBeUndefined();
-    // No `release: {}` husk left behind — that fails the schema refine.
+    // The roll SYNTHESIZED the whole `release:` block, so the revert removes
+    // it again and the file is byte-identical to the pre-roll one.
     expect(readFileSync(cfg, "utf8")).not.toMatch(/release:/);
+    expect(readFileSync(cfg, "utf8")).toBe(unpinned);
+  });
+
+  it("does NOT destroy a documented `release:` block added during the roll", () => {
+    // The window this whole module exists for: the pin lands after the canary
+    // and the remaining agents take minutes. If an operator (or an approved
+    // config_propose_edit) adds a DOCUMENTED `release:` block in that window,
+    // the revert deletes the `pin` key it wrote — and must leave their
+    // documentation alone. Dropping the now-empty husk would take the
+    // `commentBefore` block with it.
+    const unpinned = `telegram:\n  bot_token: x\nagents:\n  clerk:\n    extends: default\n`;
+    const cfg = mkConfig(unpinned);
+    provisionallyPersist(cfg, "v0.19.4");
+    // …the operator documents the block mid-roll.
+    writeFileSync(
+      cfg,
+      readFileSync(cfg, "utf8").replace(
+        /^release:$/m,
+        "# Release channel / pin.\n# `channel` and `pin` are mutually exclusive.\n# Set by `switchroom rollout --pin`.\nrelease:",
+      ),
+      "utf8",
+    );
+    const commentLines = (s: string) => s.split("\n").filter((l) => l.trim().startsWith("#"));
+    expect(commentLines(readFileSync(cfg, "utf8"))).toHaveLength(3);
+
+    expect(rollbackPinPersist(cfg).reverted).toBe(true);
+
+    const text = readFileSync(cfg, "utf8");
+    expect(pinOf(cfg)).toBeUndefined(); // the pin IS reverted…
+    // …and every comment line survives, byte for byte.
+    expect(commentLines(text)).toEqual([
+      "# Release channel / pin.",
+      "# `channel` and `pin` are mutually exclusive.",
+      "# Set by `switchroom rollout --pin`.",
+    ]);
   });
 
   it("commit and rollback are both idempotent", () => {
@@ -180,12 +388,38 @@ describe("pin journal — liveness gate (a live roll must not be reverted)", () 
     expect(hasPinJournal(cfg)).toBe(true); // journal preserved for later
   });
 
-  it("reverts once the journal ages past the cutoff, even if the pid still resolves", () => {
-    // Pids are recycled and a recreated hostd can land on the recorded one,
-    // so age is the backstop that guarantees eventual recovery.
+  it("reverts a journal whose pid was REUSED by a container recreate", () => {
+    // THE systematic false-alive. Container PID namespaces restart at 1, so a
+    // roll inside hostd records a small pid (tens); when hostd is recreated —
+    // the primary recovery trigger — the new process tree occupies the same
+    // low range, `kill(pid, 0)` succeeds against an unrelated process, and a
+    // bare liveness probe declines recovery essentially always. The start-time
+    // discriminator is what tells the two apart: a process that started AFTER
+    // the journal was written cannot be the journal's writer.
     const cfg = mkConfig();
     provisionallyPersist(cfg, "v0.19.4");
-    const note = recoverPinJournal(cfg, { now: afterTimeout() });
+    const journal = readPinJournal(cfg)!;
+    // pid IS alive (it's this process) — only the start time says otherwise.
+    expect(isPidAlive(journal.pid)).toBe(true);
+
+    const note = recoverPinJournal(cfg, { startTimeMs: startedAfterJournal(journal) });
+
+    // Reverted WITHOUT waiting out the 15-minute age backstop.
+    expect(note).toMatch(/reverted an UNCOMMITTED release.pin=v0\.19\.4/);
+    expect(pinOf(cfg)).toBe("v0.19.3");
+    expect(hasPinJournal(cfg)).toBe(false);
+  });
+
+  it("reverts once the journal ages past the cutoff, even if the writer looks alive", () => {
+    // The residual backstop, for the cases start time cannot resolve
+    // (non-Linux, unreadable /proc) — both of which are treated conservatively
+    // as alive, so age is the only thing left.
+    const cfg = mkConfig();
+    provisionallyPersist(cfg, "v0.19.4");
+    const note = recoverPinJournal(cfg, {
+      now: afterTimeout(),
+      startTimeMs: () => null, // "cannot tell" → conservatively alive
+    });
     expect(note).toMatch(/reverted an UNCOMMITTED release.pin=v0\.19\.4/);
     expect(pinOf(cfg)).toBe("v0.19.3");
   });
@@ -197,6 +431,28 @@ describe("pin journal — liveness gate (a live roll must not be reverted)", () 
     provisionallyPersist(cfg, "v0.19.4");
     expect(rollbackPinPersist(cfg).reverted).toBe(true);
     expect(pinOf(cfg)).toBe("v0.19.3");
+  });
+
+  it("isJournalWriterAlive is conservative when it cannot decide", () => {
+    const j: RolloutPinJournal = {
+      v: 1,
+      configPath: "/c",
+      pin: "v1",
+      pid: process.pid,
+      at: new Date().toISOString(),
+    };
+    // Started before the journal → the writer.
+    expect(isJournalWriterAlive(j, () => Date.parse(j.at) - 1000)).toBe(true);
+    // Started after → pid reuse / a recreated container's tree.
+    expect(isJournalWriterAlive(j, () => Date.parse(j.at) + 1000)).toBe(false);
+    // Unknown start time → conservatively alive (age is the backstop).
+    expect(isJournalWriterAlive(j, () => null)).toBe(true);
+    // Undateable journal → conservatively alive.
+    expect(
+      isJournalWriterAlive({ ...j, at: "not-a-date" }, () => Date.now()),
+    ).toBe(true);
+    // A dead pid short-circuits before start time is consulted.
+    expect(isJournalWriterAlive({ ...j, pid: 0x3fffffff }, () => 0)).toBe(false);
   });
 
   it("isPidAlive / isJournalFresh behave at their edges", () => {

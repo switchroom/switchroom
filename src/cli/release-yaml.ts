@@ -18,7 +18,7 @@
  * would fail validation.
  */
 
-import { parseDocument, isScalar, isMap } from "yaml";
+import { parseDocument, isScalar, isMap, isPair, type Document } from "yaml";
 
 /**
  * Read the current `release.pin` out of a config's raw text, or undefined
@@ -88,17 +88,65 @@ export function setReleasePinInConfig(
  * all of it. A targeted edit touches exactly the key the rollout wrote and
  * leaves every other change intact.
  *
- * Deleting an absent pin is a no-op, and an empty `release` block left behind
- * is removed too (an empty mapping fails the ReleaseBlock refine). Returns
- * `yamlText` unchanged when there is nothing to delete, so callers can call it
- * unconditionally without churning the file's mtime.
+ * Deleting an absent pin is a no-op. Returns `yamlText` unchanged when there is
+ * nothing to delete, so callers can call it unconditionally without churning
+ * the file's mtime.
+ *
+ * ## The empty `release` husk
+ *
+ * When `pin` was the block's only key, deleting it leaves `release: {}`. That
+ * husk is dropped — but ONLY when nothing is commented onto it.
+ *
+ * The `yaml` Document attaches a key's preceding comment block to the key node
+ * as `commentBefore`, so `doc.delete("release")` takes the block's entire
+ * documentation with it. On the production config that is a 15-line header. The
+ * two cases the journal actually hits pull in opposite directions:
+ *
+ *   - the roll SYNTHESIZED the block (the config was unpinned and had no
+ *     `release:` key at all) — no comments exist, so dropping the husk makes
+ *     the revert byte-identical to the pre-roll file. That is the case the
+ *     husk removal was written for;
+ *   - the block PRE-EXISTED with operator documentation and the roll only wrote
+ *     `pin` into it (or an operator added a documented `release:` during the
+ *     roll window, which the targeted-edit contract above exists to respect) —
+ *     dropping the husk would silently delete that documentation.
+ *
+ * So a commented husk is kept as `release: {}`. That is schema-VALID: every
+ * field in `ReleaseBlock` is optional and the refine only rejects
+ * `channel` + `pin` together, so `{}` passes (an earlier comment here claimed
+ * the opposite — it was wrong). Keeping a tidy config is not worth destroying
+ * an operator's comments.
  */
 export function deleteReleasePinInConfig(yamlText: string): string {
   const doc = parseDocument(yamlText);
   if (!doc.hasIn(["release", "pin"])) return yamlText;
   doc.deleteIn(["release", "pin"]);
   const rel = doc.getIn(["release"]);
-  // `release: {}` is invalid per the schema refine — drop the husk.
-  if (isMap(rel) && rel.items.length === 0) doc.delete("release");
+  if (isMap(rel) && rel.items.length === 0 && !releaseBlockIsCommented(doc)) {
+    doc.delete("release");
+  }
   return String(doc);
+}
+
+/**
+ * Does the top-level `release` pair carry any comment that would be destroyed
+ * by deleting it? Checks the key node (where a preceding `# …` block lands)
+ * and the value node (trailing / inner comments).
+ */
+function releaseBlockIsCommented(doc: Document): boolean {
+  const contents = doc.contents;
+  if (!isMap(contents)) return false;
+  for (const item of contents.items) {
+    if (!isPair(item)) continue;
+    const key = item.key;
+    if (!isScalar(key) || key.value !== "release") continue;
+    const nodes = [key, item.value];
+    return nodes.some(
+      (n) =>
+        !!n &&
+        typeof n === "object" &&
+        (("commentBefore" in n && !!n.commentBefore) || ("comment" in n && !!n.comment)),
+    );
+  }
+  return false;
 }
