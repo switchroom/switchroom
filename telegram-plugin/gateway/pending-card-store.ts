@@ -44,7 +44,11 @@
 import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { atomicWriteFileSync } from '../../src/util/atomic.js'
-import { quarantineCorruptStoreFile, readStoreJsonSync } from './store-file.js'
+import {
+  preserveUnreadableStoreFile,
+  quarantineCorruptStoreFile,
+  readStoreJsonSync,
+} from './store-file.js'
 
 /** The four agent-initiated approval-card families we persist. */
 export type ApprovalCardFamily =
@@ -126,10 +130,15 @@ export function createPendingCardStore(
 ): PendingCardStore {
   const filePath = join(stateDir, 'pending-approval-cards.json')
 
+  /** Set when the last read failed for a non-ENOENT reason — the next write
+   * must preserve the file it could not read instead of clobbering it. */
+  let unreadable = false
+
   function read(): PersistedApprovalCard[] {
-    const parsed = readStoreJsonSync(filePath, 'pending-card-store', log)
-    if (parsed === undefined) return []
-    if (!Array.isArray(parsed)) {
+    const result = readStoreJsonSync(filePath, 'pending-card-store', log)
+    unreadable = result.status === 'unreadable'
+    if (result.status !== 'ok') return []
+    if (!Array.isArray(result.value)) {
       quarantineCorruptStoreFile(
         filePath,
         'pending-card-store',
@@ -138,11 +147,17 @@ export function createPendingCardStore(
       )
       return []
     }
-    return parsed as PersistedApprovalCard[]
+    return result.value as PersistedApprovalCard[]
   }
 
   function write(entries: PersistedApprovalCard[]): void {
     try {
+      // Fail closed: never let an overwrite be what destroys state we merely
+      // failed to READ (flaky mount, transient EACCES) — throws if it can't.
+      if (unreadable) {
+        preserveUnreadableStoreFile(filePath, 'pending-card-store', log)
+        unreadable = false
+      }
       // tmp + fsync + rename, mode pinned to 0600 on the tempfile fd (so an
       // existing file can't keep laxer perms, and a crash mid-write leaves
       // the previous good file untouched).

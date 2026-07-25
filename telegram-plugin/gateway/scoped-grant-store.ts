@@ -27,7 +27,11 @@
 
 import { join } from 'node:path'
 import { atomicWriteFileSync } from '../../src/util/atomic.js'
-import { quarantineCorruptStoreFile, readStoreJsonSync } from './store-file.js'
+import {
+  preserveUnreadableStoreFile,
+  quarantineCorruptStoreFile,
+  readStoreJsonSync,
+} from './store-file.js'
 import {
   serializeScopedGrants,
   deserializeScopedGrants,
@@ -59,9 +63,15 @@ export function createScopedGrantStore(
   const filePath = join(stateDir, 'scoped-grants.json')
   const enabled = scopedGrantPersistEnabled(env)
 
+  /** Set when the last read failed for a non-ENOENT reason — the next write
+   * must preserve the file it could not read instead of clobbering it. */
+  let unreadable = false
+
   function read(): unknown[] {
-    const parsed = readStoreJsonSync(filePath, 'scoped-grant-store', log)
-    if (parsed === undefined) return []
+    const result = readStoreJsonSync(filePath, 'scoped-grant-store', log)
+    unreadable = result.status === 'unreadable'
+    if (result.status !== 'ok') return []
+    const parsed = result.value
     if (!Array.isArray(parsed)) {
       quarantineCorruptStoreFile(
         filePath,
@@ -85,6 +95,12 @@ export function createScopedGrantStore(
     save(store) {
       if (!enabled) return
       try {
+        // Fail closed: never let an overwrite be what destroys grants we
+        // merely failed to READ (flaky mount, transient EACCES).
+        if (unreadable) {
+          preserveUnreadableStoreFile(filePath, 'scoped-grant-store', log)
+          unreadable = false
+        }
         // tmp + fsync + rename — a crash mid-persist leaves the previous
         // grant set intact rather than a torn file that reads as "no grants".
         atomicWriteFileSync(filePath, JSON.stringify(serializeScopedGrants(store)), 0o600)

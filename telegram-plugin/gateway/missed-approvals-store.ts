@@ -30,7 +30,11 @@
 import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { atomicWriteFileSync } from '../../src/util/atomic.js'
-import { quarantineCorruptStoreFile, readStoreJsonSync } from './store-file.js'
+import {
+  preserveUnreadableStoreFile,
+  quarantineCorruptStoreFile,
+  readStoreJsonSync,
+} from './store-file.js'
 
 export interface MissedApproval {
   /** The permission request_id that timed out (dedup key). */
@@ -92,11 +96,17 @@ export function createMissedApprovalsStore(
 ): MissedApprovalsStore {
   const filePath = join(stateDir, 'missed-approvals.json')
 
+  const EMPTY = (): FileShape => ({ pending: [], delivered: [] })
+
+  /** Set when the last read failed for a non-ENOENT reason — the next write
+   * must preserve the file it could not read instead of clobbering it. */
+  let unreadable = false
+
   function read(): FileShape {
-    const parsed = readStoreJsonSync(filePath, 'missed-approvals-store', log) as
-      | Partial<FileShape>
-      | undefined
-    if (parsed === undefined) return { pending: [], delivered: [] }
+    const result = readStoreJsonSync(filePath, 'missed-approvals-store', log)
+    unreadable = result.status === 'unreadable'
+    if (result.status !== 'ok') return EMPTY()
+    const parsed = result.value as Partial<FileShape>
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       quarantineCorruptStoreFile(
         filePath,
@@ -104,16 +114,38 @@ export function createMissedApprovalsStore(
         'parsed to a non-object — not a missed-approvals file',
         log,
       )
-      return { pending: [], delivered: [] }
+      return EMPTY()
+    }
+    // A PRESENT-but-non-array list is corruption, not "empty". Coercing it to
+    // [] would resurrect the exact bug this store was hardened against: a
+    // half-written `{"pending": null}` parses fine, so quarantine would never
+    // fire and the digest would silently come up empty. An ABSENT list is the
+    // legitimate cold-start/partial-shape case and stays silent.
+    for (const field of ['pending', 'delivered'] as const) {
+      if (parsed[field] !== undefined && !Array.isArray(parsed[field])) {
+        quarantineCorruptStoreFile(
+          filePath,
+          'missed-approvals-store',
+          `\`${field}\` is present but not an array — truncated or malformed write`,
+          log,
+        )
+        return EMPTY()
+      }
     }
     return {
-      pending: Array.isArray(parsed.pending) ? parsed.pending : [],
-      delivered: Array.isArray(parsed.delivered) ? parsed.delivered : [],
+      pending: parsed.pending ?? [],
+      delivered: parsed.delivered ?? [],
     }
   }
 
   function write(f: FileShape): void {
     try {
+      // Fail closed: never let an overwrite be what destroys state we merely
+      // failed to READ (flaky mount, transient EACCES).
+      if (unreadable) {
+        preserveUnreadableStoreFile(filePath, 'missed-approvals-store', log)
+        unreadable = false
+      }
       // tmp + fsync + rename — never truncate the destination in place.
       atomicWriteFileSync(filePath, JSON.stringify(f), 0o600)
     } catch (err) {
