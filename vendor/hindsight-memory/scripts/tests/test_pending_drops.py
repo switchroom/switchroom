@@ -1132,8 +1132,10 @@ class ArchiveFailureNeverDeletesTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(pending.count(), 3)
 
     def test_in_hook_drain_keeps_an_unarchivable_entry(self):
-        """The bounded SessionStart path retires on a bare 200 and is the
-        one most likely to run on a nearly-full container filesystem."""
+        """The bounded SessionStart path retires on its POST's own
+        commit-before-ack 200 (``async_processing=False``, no confirming
+        GET) and is the one most likely to run on a nearly-full container
+        filesystem."""
         self._queue(2)
         with unittest.mock.patch.object(
             drain_pending, "_retry_one", lambda e, timeout: None

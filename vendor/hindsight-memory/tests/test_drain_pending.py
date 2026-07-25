@@ -174,8 +174,10 @@ class DrainPendingTest(unittest.TestCase):
         """A genuinely absent document is POSTed and the entry RETIRED.
 
         Retired means moved into ``pending-reconciled/``, not ``os.remove``d:
-        this path retires on a bare 200, and a 200 is an ack, not proof
-        (#3244), so the removal must stay recoverable.
+        this in-hook path retires on the POST's own commit-before-ack 200
+        (``async_processing=False``, no confirming GET) — the daemon's word
+        about itself, not an independent read (#3244) — so the removal must
+        stay recoverable.
         """
         path = _seed_entry(self._pending)
         import drain_pending
