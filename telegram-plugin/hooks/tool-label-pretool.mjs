@@ -154,11 +154,15 @@ export function summariseBashCommand(cmd) {
     if (!PROGRAM_RE.test(head)) return null
     if (NAV.has(head)) return { program: head, nav: true }
     if (!MULTIPLEXERS.has(head)) return { program: head, nav: false }
-    for (const t of tokens.slice(1)) {
-      if (t.startsWith('-')) continue
-      return SUBCOMMAND_RE.test(t) ? { program: `${head} ${t}`, nav: false } : { program: head, nav: false }
-    }
-    return { program: head, nav: false }
+    // ONLY the immediately-following token may be a subcommand. Scanning past
+    // flags would surface a flag VALUE (`docker --context prod-internal ps` →
+    // "prod-internal"), which is exactly the kind of private name this
+    // function exists to keep out of a chat message. `git -C /x status` losing
+    // its "status" is the correct trade.
+    const next = tokens[1]
+    return next != null && SUBCOMMAND_RE.test(next)
+      ? { program: `${head} ${next}`, nav: false }
+      : { program: head, nav: false }
   }
 
   let firstAny = null

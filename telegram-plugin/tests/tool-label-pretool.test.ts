@@ -146,3 +146,19 @@ describe('computeLabel — Bash fallback when description is omitted', () => {
     expect(computeLabel('Bash', { command: '   ' })).toBe('Running a command')
   })
 })
+
+describe('computeLabel — Bash subcommand is never a flag value', () => {
+  it('only accepts the token IMMEDIATELY after a multiplexer', () => {
+    // A flag value (a private context/host/profile name) must never surface.
+    expect(computeLabel('Bash', { command: 'docker --context prod-internal ps' }))
+      .toBe('Running docker')
+    expect(computeLabel('Bash', { command: 'git -C /srv/private-app status' }))
+      .toBe('Running git')
+    expect(computeLabel('Bash', { command: 'aws --profile customer-acme s3 ls' }))
+      .toBe('Running aws')
+  })
+
+  it('still reads the plain subcommand form', () => {
+    expect(computeLabel('Bash', { command: 'git commit -m "wip"' })).toBe('Running git commit')
+  })
+})
