@@ -3,14 +3,21 @@
  * log this codebase owns.
  *
  * Extracted from `src/vault/broker/audit-log.ts` (issue #2792 item B /
- * #2953 / #2955), which had the only correct implementation. Three other
- * logs were appending without ANY bound:
+ * #2953 / #2955), which had the only correct implementation. Two other
+ * TypeScript logs were appending without ANY bound:
  *
  *   - `<agent>/telegram/webhook-events.jsonl` (src/web/webhook-gateway-record.ts)
  *   - `~/.switchroom/host-control-audit.log` (src/host-control/server.ts)
  *
- * Rather than grow a third and fourth copy of the copy/fsync/truncate
+ * Rather than grow a second and third copy of the copy/fsync/truncate
  * dance, both now call into here, and the vault broker delegates to it.
+ *
+ * The sidecar supervisor log is bounded as well, but NOT by this module:
+ * it is rotated in shell by the container entrypoint
+ * (`profiles/_base/start.sh.hbs`, the `cp` + `: >` copytruncate block),
+ * because no TypeScript runs on that path. It appears in the rename
+ * rationale below because it constrains the technique, not because it
+ * calls in here.
  *
  * ── Why copy-then-truncate rather than rename ────────────────────────
  * `rename` is wrong for every log this module serves — but for a
@@ -87,8 +94,12 @@ export interface RotateOptions {
    * a dead one, so a peer can legitimately reclaim a LIVE lock and enter
    * `fn()` alongside it — reproduced at two writers (#3600 round-4, H1).
    * What bounds the damage is the in-critical-section inode guard: a
-   * rotator whose lock was reclaimed aborts before it destroys anything
-   * (see {@link withRotateLock}'s residual for what remains).
+   * rotator whose lock was reclaimed aborts at the next checkpoint
+   * instead of running the rest of the rotation. It is a bound, not
+   * immunity — a reclaim landing between a checkpoint and the syscall it
+   * guards still gets that one syscall through, which is enough to lose
+   * a generation (see {@link withRotateLock}'s residual, which states
+   * the damage).
    *
    * Single-writer logs (vault audit, hostd audit — both serialized
    * in-process, see `audit-hashchain.ts` single-writer-process contract)
@@ -135,6 +146,13 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * own lock was reclaimed out from under us (we overran the threshold) we
  * cannot delete the new holder's lock on the way out.
  *
+ * That guard and `stillHeld()` both rest on a PREMISE the type system
+ * cannot state: the lock `fd` stays open from the `open(wx)` that took it
+ * until the `finally` below. An open fd pins the inode, which is the only
+ * reason "same inode number" means "same lock" — see the comment at the
+ * `ourIno` capture for the measurement and for the test that fails if a
+ * refactor closes it early.
+ *
  * ── Residual, stated honestly ────────────────────────────────────────
  * The breach is at the STALENESS TEST. Step 2 can prove the parked file
  * is the same inode we judged stale and is still past the threshold; it
@@ -154,22 +172,54 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  *
  * The close is therefore NOT to prevent the double entry — POSIX has no
  * identity-checked reclaim and Node exposes no `flock`/`fcntl` lease —
- * but to make the loser HARMLESS. `fn` receives a `stillHeld()`
- * predicate that re-asserts the same inode identity the release guard
- * uses, and {@link rotateLogFile} calls it at the head of each of its
- * three destructive phases. An overrun rotator that lost its lock
- * declines instead of clobbering, so H1 leaves the reclaimer's `.1` and
- * the shifted history intact.
+ * but to make the loser CHEAP rather than catastrophic. `fn` receives a
+ * `stillHeld()` predicate that re-asserts the same inode identity the
+ * release guard uses, and {@link rotateLogFile} calls it immediately
+ * before every destructive syscall (four call sites; the shift one fires
+ * once per loop iteration). An overrun rotator that lost its lock stops
+ * at the next checkpoint instead of running the rotation to completion,
+ * so it cannot produce the zero-byte `.1` above.
+ *
+ * What that does NOT buy is an untouched filesystem. Precisely what
+ * survives depends on where the reclaim lands, and the tests say so:
+ * when it lands before our first destructive syscall we touch nothing
+ * (`log-rotation-race.test.ts`, "declines outright when the peer rotated
+ * before we touched anything" — `.1` the peer's snapshot, `.2` the
+ * shifted history, active untouched). When it lands in a check→syscall
+ * gap, that one syscall goes through first and a generation is gone —
+ * the same file asserts exactly that in "does not copy over the peer's
+ * .1": `existsSync(<log>.1) === false` and `.2` holding the peer's
+ * snapshot, i.e. our unserialized shift `rename` moved the reclaimer's
+ * fresh `.1` onto `.2` and destroyed the shifted history that was there.
+ * Preserved in every interleaving are the rows written after the
+ * reclaimer's rotation — the truncate is the last checkpoint and it is
+ * never reached. Its snapshot survives every gap but the copy one; a
+ * generation of depth does not.
  *
  * What still remains, precisely — this is a narrowing, not a proof of
  * safety:
  *
  *   - `stillHeld()` is a `stat` and the destructive call after it is a
  *     separate syscall. A reclaim landing in that instruction-scale gap
- *     is not caught for the phase it guards — though the NEXT checkpoint
- *     does catch it, so at most one phase proceeds unserialized. The
- *     window shrinks from "the whole rotation" to "between two adjacent
- *     syscalls", but it is not zero.
+ *     is not caught for the syscall it guards — the NEXT checkpoint does
+ *     catch it, so at most ONE syscall proceeds unserialized, but one is
+ *     enough to destroy a full generation. Both gaps are reproduced in
+ *     `log-rotation-race.test.ts` at `maxFiles=2` (#3600 round-5, M2):
+ *       · check→`copyFileSync` ("loses a generation when the reclaim
+ *         lands in the copy gap"): `.1` becomes a byte-copy of the LIVE
+ *         file and `.2` is absent — the reclaimer's snapshot and the
+ *         prior generation are both gone. That is the outcome
+ *         {@link RotateOptions.lock} calls strictly worse than the
+ *         unlocked window.
+ *       · check→shift-`rename` ("does not copy over the peer's .1"):
+ *         `.1` absent, `.2` the reclaimer's snapshot — one generation
+ *         irrecoverably lost.
+ *     So the window shrinks from "the whole rotation" to "between two
+ *     adjacent syscalls" and the worst case shrinks from "all history"
+ *     to "one generation"; neither is zero. Reaching it needs a rotation
+ *     that overruns {@link ROTATE_LOCK_STALE_MS} AND a peer completing a
+ *     full reclaim-and-rotate inside a sub-microsecond inter-syscall
+ *     gap, which is why this is documented rather than closed.
  *   - If `fstat` on our own lock fd failed, `ourIno` is null and
  *     `stillHeld()` returns true — we cannot verify, and refusing to
  *     ever rotate is the worse failure.
@@ -272,6 +322,32 @@ function withRotateLock<T>(
   }
   // Identify the lock we hold, so release — and the critical section
   // itself — can prove it is still ours.
+  //
+  // LOAD-BEARING PREMISE: `fd` must stay OPEN for the whole critical
+  // section — from the `open(wx)` above through the `finally` below
+  // (#3600 round-5, M3). Inode numbers are only unique among LIVE inodes;
+  // a filesystem is free to hand our number straight back to the next
+  // create once nothing references it. An open fd is a reference, so
+  // holding `fd` is what makes `ino === ourIno` mean "the same lock"
+  // rather than "some file that got our number". Close it early and the
+  // reclaim sequence a peer actually performs — park (`rename`), unlink,
+  // `open(wx)` — hands the peer's brand-new lock our exact inode, at
+  // which point `stillHeld()` returns true against a lock we do not hold
+  // and the whole H1 guard silently inverts.
+  //
+  // Measured on Linux/Node 22, 200 park→unlink→recreate cycles per cell:
+  //
+  //     fd closed  ext4  200/200 collisions      fd closed  tmpfs  0/200
+  //     fd open    ext4    0/200 collisions      fd open    tmpfs  0/200
+  //
+  // Note the tmpfs column: the race suite runs under `os.tmpdir()`, which
+  // is tmpfs on these machines and never reuses — so no outcome-level
+  // race test can detect an early close. The real logs live on ext4
+  // (`~/.switchroom/**`), i.e. on the reusing side. The guard is
+  // therefore mechanical, not observational: `log-rotation-race.test.ts`,
+  // "holds the lock fd open through every destructive syscall", watches
+  // `closeSync` and fails if `fd` is closed before the last destructive
+  // syscall — on any filesystem.
   let ourIno: number | null = null;
   try {
     ourIno = fs.fstatSync(fd).ino;
@@ -314,10 +390,15 @@ function withRotateLock<T>(
  * taken. There is no "keep ours" exemption: the sole caller runs this
  * AFTER unlinking its own park and after taking the lock, so our park is
  * gone — and in the one case it is not (that unlink failed), it IS a leak
- * and reaping it is correct. A peer mid-reclaim can hold an eligible park
- * — reaping it makes that peer's step-2 stat fail, so it declines and
- * takes no lock. That is a missed rotation cycle at worst; it cannot
- * wedge the path or produce two rotators.
+ * and reaping it is correct. A peer mid-reclaim WILL hold an eligible
+ * park, not merely can: `rename(2)` does not touch the file's mtime (it
+ * modifies the directory, not the inode), so a park always carries the
+ * mtime of the ancient lock it was made from and is therefore always
+ * already past the cutoff. Reaping a concurrent reclaimer's park is the
+ * common case, not an edge — the consequences below are what make that
+ * acceptable, not its rarity. Reaping it makes that peer's step-2 stat
+ * fail, so it declines and takes no lock. That is a missed rotation cycle
+ * at worst; it cannot wedge the path or produce two rotators.
  *
  * Entirely best-effort: every failure is swallowed, so this can never
  * throw out of the reclaim it runs inside.
@@ -365,9 +446,15 @@ function sweepStaleParks(lockPath: string): void {
  * Per-syscall rather than once at the top because a reclaim can land at
  * any point inside the rotation, and each check is one `stat` against a
  * handful of syscalls. It is a narrowing, not a proof — a reclaim landing
- * between a check and the syscall it guards is still uncaught (the next
- * check catches it, so at most one syscall proceeds unserialized). See
- * {@link withRotateLock}'s residual.
+ * between a check and the syscall it guards is still uncaught, and while
+ * the next check catches it, so that at most ONE syscall proceeds
+ * unserialized, that one syscall is enough to destroy a full generation:
+ * an unserialized shift `rename` moves the reclaimer's fresh `.1` onto
+ * `.2` (history gone, asserted in `log-rotation-race.test.ts`, "does not
+ * copy over the peer's .1"), and an unserialized `copyFileSync` overwrites
+ * `.1` with a copy of the live file (reclaimer's snapshot AND the prior
+ * generation gone). "At most one syscall" bounds the count, not the cost.
+ * See {@link withRotateLock}'s residual for both reproductions.
  */
 export function rotateLogFile(
   logPath: string,

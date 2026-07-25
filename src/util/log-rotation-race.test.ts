@@ -11,7 +11,9 @@
  * INSIDE `withRotateLock`, at the precise syscall where the peer's action
  * must land. What the hook does is what a second process really does.
  *
- * Both tests fail against the pre-fix code:
+ * The file has grown past those two interleavings (H1 in round 4, the fd
+ * premise in round 5), but the first two describes are still the
+ * originals, and both fail against the pre-fix code:
  *  - drop the under-lock size re-check and the first one clobbers `.1`;
  *  - restore `unlink` + `open(wx)` as the stale reclaim and the second
  *    one enters the critical section while a peer holds the lock.
@@ -22,12 +24,22 @@ import * as realFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-/** Fires immediately before the named syscall inside log-rotation.ts. */
+/**
+ * Fires immediately before the named syscall inside log-rotation.ts.
+ * `afterOpen` fires just after, because it needs the resulting fd — that
+ * is how the M3 test learns which fd is the lock's.
+ */
 const hooks = vi.hoisted(() => ({
   beforeRename: undefined as ((from: string) => void) | undefined,
   beforeOpen: undefined as ((p: string, flags: string) => void) | undefined,
+  afterOpen: undefined as
+    | ((p: string, flags: string, fd: number) => void)
+    | undefined,
   beforeUnlink: undefined as ((p: string) => void) | undefined,
   beforeStat: undefined as ((p: string) => void) | undefined,
+  beforeCopy: undefined as ((from: string, to: string) => void) | undefined,
+  beforeTruncate: undefined as ((p: string) => void) | undefined,
+  beforeClose: undefined as ((fd: number) => void) | undefined,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -45,7 +57,21 @@ vi.mock("node:fs", async (importOriginal) => {
     },
     openSync: (p: realFs.PathLike, flags: string, mode?: number) => {
       hooks.beforeOpen?.(String(p), flags);
-      return actual.openSync(p, flags, mode);
+      const fd = actual.openSync(p, flags, mode);
+      hooks.afterOpen?.(String(p), flags, fd);
+      return fd;
+    },
+    copyFileSync: (from: realFs.PathLike, to: realFs.PathLike) => {
+      hooks.beforeCopy?.(String(from), String(to));
+      return actual.copyFileSync(from, to);
+    },
+    truncateSync: (p: realFs.PathLike, len?: number) => {
+      hooks.beforeTruncate?.(String(p));
+      return actual.truncateSync(p, len);
+    },
+    closeSync: (fd: number) => {
+      hooks.beforeClose?.(fd);
+      return actual.closeSync(fd);
     },
     statSync: ((p: realFs.PathLike, o?: realFs.StatSyncOptions) => {
       hooks.beforeStat?.(String(p));
@@ -63,21 +89,26 @@ let lock: string;
 const HISTORY = "REAL HISTORY — must survive\n";
 const CAP = 1024;
 
+function clearHooks(): void {
+  hooks.beforeRename = undefined;
+  hooks.beforeOpen = undefined;
+  hooks.afterOpen = undefined;
+  hooks.beforeUnlink = undefined;
+  hooks.beforeStat = undefined;
+  hooks.beforeCopy = undefined;
+  hooks.beforeTruncate = undefined;
+  hooks.beforeClose = undefined;
+}
+
 beforeEach(() => {
   dir = realFs.mkdtempSync(path.join(os.tmpdir(), "rotrace-"));
   log = path.join(dir, "events.jsonl");
   lock = `${log}.rotate.lock`;
-  hooks.beforeRename = undefined;
-  hooks.beforeOpen = undefined;
-  hooks.beforeUnlink = undefined;
-  hooks.beforeStat = undefined;
+  clearHooks();
 });
 
 afterEach(() => {
-  hooks.beforeRename = undefined;
-  hooks.beforeOpen = undefined;
-  hooks.beforeUnlink = undefined;
-  hooks.beforeStat = undefined;
+  clearHooks();
   realFs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -319,8 +350,26 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
  * destructive syscall in `rotateLogFile` re-asserts the lock inode.
  *
  * Each test lands the peer at a different point in the victim's rotation
- * and asserts the OUTCOME: the reclaimer's snapshot, the shifted history,
- * and the rows the reclaimer's writers appended all survive.
+ * and asserts the OUTCOME. What survives is NOT uniform, and these tests
+ * pin the difference (#3600 round-5, M1):
+ *
+ *   - reclaim before our first destructive syscall — nothing of ours ran,
+ *     so the reclaimer's `.1`, the shifted history at `.2` and the rows
+ *     its writers appended all survive ("declines outright…").
+ *   - reclaim inside a check→syscall gap — that one syscall goes through
+ *     before the next checkpoint stops us, and it costs a generation.
+ *     "does not copy over the peer's .1" asserts exactly that: `.1` is
+ *     ABSENT and `.2` holds the reclaimer's snapshot, i.e. our
+ *     unserialized shift `rename` moved its fresh `.1` to `.2` and the
+ *     shifted HISTORY that was there is gone.
+ *
+ * So what these tests pin is narrower than "all survive". The rows the
+ * reclaimer's writers appended after its rotation survive every
+ * interleaving here; the reclaimer's snapshot survives all but one; and a
+ * generation of DEPTH is lost whenever the reclaim lands in a gap. The
+ * worst case, the check→`copyFileSync` gap, loses the reclaimer's
+ * snapshot too, and is asserted below rather than only described, so the
+ * residual in `log-rotation.ts` cannot drift away from the behaviour.
  */
 describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
   const BODY = "x".repeat(CAP * 4);
@@ -442,6 +491,44 @@ describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
     expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
   });
 
+  it("loses a generation when the reclaim lands in the copy gap (residual)", () => {
+    // The documented worst case (#3600 round-5, M2), asserted so the
+    // residual cannot quietly become untrue. The peer lands between the
+    // pre-copy `held()` check and `copyFileSync` itself, so that ONE
+    // syscall proceeds unserialized: by then `.1` is the peer's fresh
+    // snapshot, and we overwrite it with a copy of the LIVE file.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    let fired = false;
+    hooks.beforeCopy = (from) => {
+      if (from !== log || fired) return;
+      fired = true;
+      hooks.beforeCopy = undefined;
+      peerReclaimsAndRotates(2, NEW);
+    };
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired).toBe(true);
+    // The NEXT checkpoint still stops us — the active file is not
+    // truncated, so the rows written after the peer's rotation survive.
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW);
+    // But the damage is real and this is what it looks like: `.1` is now
+    // a useless duplicate of the live file, and BOTH the peer's snapshot
+    // (which was at `.1`) and the shifted HISTORY (which our own earlier
+    // rename had put at `.2`, and the peer's rotation then dropped) are
+    // gone. One unguarded syscall costs a full generation.
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(NEW);
+    expect(realFs.existsSync(`${log}.2`)).toBe(false);
+  });
+
   it("a rotator that lost the lock touches nothing at all", () => {
     // Unit-level: the predicate is false from the first call, so every
     // generation and the active file must be byte-identical afterwards.
@@ -463,5 +550,87 @@ describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
     expect(rotateLogFile(log, 2, "t", () => true)).toBe(true);
     expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
     expect(realFs.statSync(log).size).toBe(0);
+  });
+});
+
+/**
+ * M3 (#3600 round-5). Everything above rests on inode identity:
+ * `stillHeld()` and the release guard both compare `statSync(lock).ino`
+ * against the number captured by `fstat` at `open(wx)`. That comparison
+ * only means "the same lock" because the lock `fd` stays OPEN for the
+ * whole critical section — an open fd is a reference, and a filesystem
+ * only recycles an inode number once nothing references it.
+ *
+ * This is not testable by outcome here. Measured over 200
+ * park→unlink→recreate cycles (the exact shape of a peer's reclaim):
+ *
+ *     fd closed  ext4  200/200 collisions      fd closed  tmpfs  0/200
+ *     fd open    ext4    0/200 collisions      fd open    tmpfs  0/200
+ *
+ * The suite's files live under `os.tmpdir()` — tmpfs, which never reuses
+ * — so a race test cannot see an early close, while the real logs live
+ * under `~/.switchroom/**` on ext4, which always does. Re-running the
+ * race suite with `TMPDIR` on ext4 does not help either (verified: still
+ * 14/14) — on the shipped code the fd is never closed early, so there is
+ * nothing for the reused inode number to collide with.
+ *
+ * So assert the MECHANISM, on any filesystem: the fd must still be open
+ * at each destructive syscall. Close it before `fn()` and this fails.
+ */
+describe("inode identity's premise: the lock fd stays open (M3)", () => {
+  it("holds the lock fd open through every destructive syscall", () => {
+    const BODY = "x".repeat(CAP * 4);
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+    realFs.writeFileSync(`${log}.2`, "OLDEST\n");
+
+    let lockFd = -1;
+    let lockFdClosed = false;
+    const seen: string[] = [];
+    const note = (what: string) =>
+      seen.push(`${what} [${lockFdClosed ? "FD CLOSED" : "fd open"}]`);
+    const gen = (p: string) => `<log>${p.slice(log.length)}`;
+
+    hooks.afterOpen = (p, flags, fd) => {
+      if (p === lock && flags === "wx" && lockFd === -1) lockFd = fd;
+    };
+    hooks.beforeClose = (fd) => {
+      if (lockFd !== -1 && fd === lockFd) lockFdClosed = true;
+    };
+    // Only the four log-data mutations; the lockfile's own unlink at
+    // release is deliberately not one of them.
+    const isGeneration = (p: string) => /^\.\d+$/.test(p.slice(log.length));
+    hooks.beforeUnlink = (p) => {
+      if (isGeneration(p)) note(`unlink ${gen(p)}`);
+    };
+    hooks.beforeRename = (from) => {
+      if (isGeneration(from)) note(`rename ${gen(from)}`);
+    };
+    hooks.beforeCopy = (from, to) => {
+      if (from === log) note(`copy <log> → ${gen(to)}`);
+    };
+    hooks.beforeTruncate = (p) => {
+      if (p === log) note("truncate <log>");
+    };
+
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(true);
+
+    expect(lockFd).not.toBe(-1); // we really did identify the lock fd
+    expect(seen).toEqual([
+      "unlink <log>.2 [fd open]",
+      "rename <log>.1 [fd open]",
+      "copy <log> → <log>.1 [fd open]",
+      "truncate <log> [fd open]",
+    ]);
+    // And it IS closed by the end — otherwise the tags above would be
+    // vacuously "fd open" and this test would prove nothing.
+    expect(lockFdClosed).toBe(true);
   });
 });
