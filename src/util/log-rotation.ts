@@ -160,10 +160,13 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  *      us parks as step 1 too — but what it parked is that racer's LIVE
  *      lock, which fails this check.
  *   3. on mismatch, put it back with `link(2)` (atomic create-if-absent, so
- *      it cannot clobber a lock taken meanwhile) and decline. Only on a
- *      match do we unlink the stale file and take the lock normally, which
- *      can still lose EEXIST to a fresh arrival — correct, that arrival
- *      holds it.
+ *      it cannot clobber a lock taken meanwhile) and decline — unlinking
+ *      the park only if that restore SUCCEEDED, for the reason spelled out
+ *      under the release's step 3 below (#3600 round-8, M1): a failed
+ *      restore leaves `parked` as the peer's only name for a LIVE lock.
+ *      Only on a match do we unlink the stale file and take the lock
+ *      normally, which can still lose EEXIST to a fresh arrival —
+ *      correct, that arrival holds it.
  *
  * Release is identity-guarded for the same reason, and by the SAME
  * primitive, for the same reason again: `statSync(lockPath).ino ===
@@ -176,33 +179,116 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * round-6 H3 ordering fix made the inode NUMBER meaningful, it did not
  * make stat+unlink atomic, and no ordering can.
  *
- * So release is park-verify-unlink:
+ * So release is filter-park-verify-unlink:
  *
+ *   0. `stat(lockPath).ino === ourIno`, and RETURN TOUCHING NOTHING if it
+ *      is not (#3600 round-8, H2). This stat cannot prove the lock is
+ *      ours — that is the entire reason steps 1-3 exist — but it can prove
+ *      it is NOT, and that direction has no race in it: `fd` is still open,
+ *      so our inode cannot be freed or reissued, and nothing ever puts our
+ *      inode back at `lockPath` once ANOTHER FILE is there (the only
+ *      restore in this file is `link(2)`, which fails EEXIST against it).
+ *      A different inode is therefore a final answer. ENOENT is not — our
+ *      lock may be parked mid-restore by a peer's release — and it is read
+ *      as "not ours" anyway; the cost of that reading is the MISSED
+ *      RELEASE in the residual below, and it is bounded. This is a filter,
+ *      not a guard, and it exists because the park below has a cost that
+ *      is NOT private to us — see the residual.
  *   1. `rename(lockPath -> lockPath.stale.<pid>.<rand>)` — atomic, and the
  *      park name is unique to us, so the file we are about to judge is
  *      unambiguously the one we took. This is the step that closes the
  *      gap: identity is decided about a file nobody else can name.
- *   2. compare the parked inode against `ourIno`; unlink it only on a
- *      match. A peer's lock, reclaimed at any instant before the rename,
- *      fails the comparison and is never unlinked.
+ *   2. compare the parked inode against `ourIno`. A match means the park
+ *      IS our lock and unlinking it is the release, so we unlink it and
+ *      stop. A peer's lock, reclaimed at any instant before the rename,
+ *      fails the comparison and is never unlinked as a release — step 3
+ *      restores it, and drops the park name only once the restore has put
+ *      the inode back at `lockPath`. If the stat itself fails, a peer's
+ *      sweep already reaped the park — which IS our release — and we touch
+ *      nothing further.
  *   3. on mismatch, `link(2)` it back (create-if-absent, so it cannot
- *      clobber a lock taken meanwhile) and touch nothing else.
+ *      clobber a lock taken meanwhile). The cleanup unlink then runs ONLY
+ *      if that restore SUCCEEDED, i.e. only while `parked` is a second
+ *      name for an inode that is also back at `lockPath`. The restore has
+ *      three failure modes, not one — EEXIST (a third arrival holds the
+ *      path), EPERM/ENOSYS (a filesystem without hardlinks), ENOENT (our
+ *      park reaped under us) — and after the first two `parked` is the
+ *      peer's ONLY remaining name for its LIVE lock. Unlinking there
+ *      destroys the lock of a process that believes it holds it, which is
+ *      not "conservative" and is strictly worse than the unconditional
+ *      delete this replaced; reproduced with `link` throwing EPERM (#3600
+ *      round-8, M1). So we leave the park and let `sweepStaleParks` reap
+ *      it: a named file of debris instead of a destroyed lock.
  *
- * Its residual is different in kind, and smaller: between the park
- * `rename` and the restoring `link` the lock path does not exist, so a
- * third arrival can take the lock there. The restore then fails EEXIST and
- * our cleanup unlink drops the reclaimer's inode — but that arrival really
- * does hold the lock, and the reclaimer's own `stillHeld()` reads the
- * arrival's inode and declines at its next checkpoint. Two syscalls of
- * exposure with a conservative outcome, in place of an unconditional
- * delete on every occurrence. Pinned by `log-rotation-race.test.ts`,
- * "release does not delete a peer's lock that arrived after our identity
- * check", which lands the peer in exactly the old gap.
+ *      Be exact about what that does and does not recover. It saves the
+ *      peer's INODE, not the peer's lock: `lockPath` stays absent, the
+ *      peer declines at its next checkpoint, and a later arrival may take
+ *      the lock. On a filesystem with no hardlinks there is no atomic
+ *      create-if-absent to restore with, and `rename`-ing the park back
+ *      would clobber whatever arrived meanwhile — deleting a live lock,
+ *      the one outcome every guard in this file exists to prevent — so it
+ *      is NOT done. Asserted, both halves, in "a restore that fails does
+ *      not destroy the peer's lock inode".
  *
- * Also note what park-verify does NOT need: a `stillHeld()`-style
- * re-check. The rename decides ownership, not a preceding stat.
+ * ── Release residual, stated honestly ────────────────────────────────
+ * Between the park `rename` and the restoring `link` the lock path does
+ * not exist. That absence is NOT private: `stillHeld()` reads a missing
+ * `lockPath` as "we lost the lock" (it cannot do otherwise — see below),
+ * so any legitimate holder that checkpoints inside it declines the rest of
+ * its rotation. Step 0 is what makes that window rare instead of routine.
+ * Without it, EVERY mismatched release opened one, and the damaging case
+ * needed no third party and no contention at all (#3600 round-8, H2,
+ * reproduced): A releases after its lock was reclaimed by V, parks V's
+ * LIVE lock, V's next `held()` reads ENOENT and aborts a rotation it was
+ * legitimately performing — after its oldest-generation unlink has already
+ * run. Cost: one full generation of history destroyed and zero rotation
+ * performed. That was a REGRESSION introduced with park-verify (round 7):
+ * before it, a mismatched release did nothing, so no peer's release ever
+ * made `lockPath` transiently absent.
  *
- * That guard and `stillHeld()` both rest on a PREMISE the type system
+ * What step 0 leaves is a one-syscall gap: we stat and see our own inode,
+ * a peer reclaims us as stale between that stat and our `rename`, and we
+ * park its brand-new live lock. Then the absence window is real and the
+ * cost above is real — but reaching it now requires the peer to have
+ * judged us stale and to land inside a single syscall, not merely to have
+ * reclaimed us at some point. The lock survives it (step 3), the peer
+ * declines at its next checkpoint, and nothing is deleted.
+ *
+ * The other new residual is a MISSED release: if a peer's release parked
+ * our live lock and is mid-restore when our step 0 stats, we read ENOENT,
+ * conclude "not ours" and leave without unlinking. The lockfile is then
+ * restored with nobody holding it, and rotations skip until it ages past
+ * {@link ROTATE_LOCK_STALE_MS} and is reclaimed. Bounded, non-destructive,
+ * and it trades a delayed rotation for the destroyed generation above.
+ *
+ * Teaching `stillHeld()` to tolerate the absence — ENOENT plus
+ * `fstat(fd).nlink > 0` means our inode still has SOME name, i.e. we are
+ * parked rather than deleted — was considered and NOT taken: the stale
+ * RECLAIM parks the same way and then unlinks, so that predicate returns
+ * true for a holder that is about to be legitimately displaced, and would
+ * let a destructive syscall through in exactly the H1 interleaving the
+ * checkpoints exist to stop. Trading a rare spurious decline for a rare
+ * spurious proceed is the wrong direction.
+ *
+ * Pinned by `log-rotation-race.test.ts`: "release does not delete a peer's
+ * lock that arrived after our identity check" (the step-0-to-rename gap),
+ * "a mismatched release does not park a peer's live lock" (#3600 round-8,
+ * H2), "release leaves the peer's lock alone even where the restore would
+ * fail" and "a restore that fails does not destroy the peer's lock inode"
+ * (#3600 round-8, M1) — plus its reclaim-side twin, "a RECLAIM whose
+ * restore fails does not destroy the peer's lock inode". Those names are
+ * checked mechanically, not by eye: "every test name this file cites
+ * exists" fails if a citation here names no test (#3600 round-8, L2).
+ *
+ * Note precisely what step 0 is and is not. It is NOT a `stillHeld()`-style
+ * re-check that the release then trusts: a stat saying "ours" is exactly
+ * the claim rounds 6 and 7 proved unusable, and nothing below relies on it.
+ * The rename still decides ownership. Step 0 is a one-directional filter —
+ * its only load-bearing verdict is "NOT ours", which is unfalsifiable while
+ * `fd` is open — and its only job is to keep us from parking at all in the
+ * case where we already know the answer.
+ *
+ * The release guard and `stillHeld()` both rest on a PREMISE the type system
  * cannot state: the lock `fd` is still open when the inode comparison
  * happens. An open fd pins the inode, which is the only reason "same
  * inode number" means "same lock" — see the comment at the `ourIno`
@@ -283,8 +369,11 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * per destructive syscall in {@link rotateLogFile}, where that syscall is
  * already committed. (The lockfile's own release unlink was a FIFTH site
  * of the same shape and is NOT in this list because it no longer has the
- * shape: park-verify-unlink decides identity with an atomic `rename`
- * rather than with a preceding stat — #3600 round-7, H2, above.) Those
+ * shape: the unlink now names a park nobody else can reach, and identity
+ * is decided by the atomic `rename` that produced that name, not by a
+ * stat of `lockPath`. Release does open with a stat, but a mismatch there
+ * only ever STOPS us — no destructive syscall runs on its say-so — so it
+ * is not a check→syscall gap. #3600 round-7 H2, round-8 H2, above.) Those
  * four are not equivalent; each destroys something different:
  *
  *   1. check→`unlinkSync(<log>.<keep>)` — the oldest-generation drop.
@@ -453,26 +542,41 @@ function withRotateLock<T>(
       return null; // a peer parked it first
     }
     let mine = false;
+    let vanished = false;
     try {
       const p = fs.statSync(parked);
       mine =
         p.ino === observed.ino &&
         Date.now() - p.mtimeMs >= ROTATE_LOCK_STALE_MS;
     } catch {
-      mine = false;
+      vanished = true; // a peer's sweep reaped our park — nothing to put back
     }
+    if (vanished) return null;
     if (!mine) {
       // We parked a LIVE lock (a peer reclaimed between our stat and our
-      // rename). Put it back without clobbering whatever is there now.
+      // rename). Put it back without clobbering whatever is there now —
+      // and unlink the park ONLY if that restore actually succeeded. The
+      // release below carries the identical branch for the identical
+      // reason (#3600 round-8, M1, swept here): `link` has three failure
+      // modes, not one — EEXIST, EPERM/ENOSYS (a filesystem with no
+      // hardlinks), ENOENT — and after the first two `parked` is the
+      // peer's ONLY remaining name for its LIVE lock, so unlinking it
+      // deletes a lock its holder still believes in. Leaving it is a named
+      // file `sweepStaleParks` reaps.
+      let restored = false;
       try {
         fs.linkSync(parked, lockPath);
+        restored = true;
       } catch {
-        /* a lock already exists at the path — the holder is covered */
+        /* EEXIST: a lock already exists at the path — that holder is
+           covered. EPERM/ENOSYS: no hardlinks here. ENOENT: reaped. */
       }
-      try {
-        fs.unlinkSync(parked);
-      } catch {
-        /* best-effort */
+      if (restored) {
+        try {
+          fs.unlinkSync(parked);
+        } catch {
+          /* best-effort */
+        }
       }
       return null;
     }
@@ -486,13 +590,22 @@ function withRotateLock<T>(
     } catch {
       return null; // a fresh arrival took the lock between our rename and this
     }
-    // Sweep only once the claim has SUCCEEDED (#3600 round-4, L1). Before
-    // the `open(wx)` above we hold nothing — `lockPath` does not exist —
-    // and a readdir plus N stat/unlink there would widen the rename→claim
-    // interval this comment names as the breach, from ~2 syscalls to
-    // 2 + O(parks). Here the path is locked and the sweep is free.
-    sweepStaleParks(lockPath);
   }
+  // Sweep only once the lock is HELD (#3600 round-4, L1) — but on EVERY
+  // path that holds it, not just the reclaim (#3600 round-8, L1). Before
+  // the reclaim's `open(wx)` we hold nothing — `lockPath` does not exist —
+  // and a readdir plus N stat/unlink there would widen the rename→claim
+  // interval the doc comment names as the breach, from ~2 syscalls to
+  // 2 + O(parks). Here the path is locked either way and the sweep is free.
+  //
+  // It sits AFTER the whole acquire, not inside the EEXIST branch, because
+  // the RELEASE park leaks a different shape: a crash between the release
+  // `rename` and its cleanup `unlink` leaves NOTHING at `lockPath`, so the
+  // next arrival's `open(wx)` SUCCEEDS and never enters the reclaim branch.
+  // With the sweep reachable only from that branch, a release park could
+  // survive every subsequent acquisition — an unbounded leak, which is
+  // exactly what this function exists to rule out.
+  sweepStaleParks(lockPath);
   // Identify the lock we hold, so release — and the critical section
   // itself — can prove it is still ours.
   //
@@ -532,7 +645,17 @@ function withRotateLock<T>(
     try {
       return fs.statSync(lockPath).ino === ourIno;
     } catch {
-      return false; // lock gone — we are certainly not holding it
+      // ENOENT. NOT the same as "our lock was destroyed": a park — ours,
+      // a reclaimer's, or a releaser's — makes `lockPath` absent for a
+      // syscall or two while our inode is alive and named elsewhere, so
+      // this can be a SPURIOUS loss (#3600 round-8, H2). It is reported as
+      // a loss anyway, deliberately: the alternative test (`fstat(fd).
+      // nlink > 0` ⇒ "parked, not deleted") returns true for a holder a
+      // stale reclaim is about to displace legitimately, which would let a
+      // destructive syscall through in exactly the H1 interleaving these
+      // checkpoints exist to stop. A spurious decline costs a rotation
+      // cycle; a spurious proceed costs a generation.
+      return false;
     }
   };
   try {
@@ -560,36 +683,83 @@ function withRotateLock<T>(
     // observable failure H3 was fixed for. Ordering could not close it;
     // only deciding identity about a file NOBODY ELSE CAN NAME does.
     // `rename` gives us that atomically, so we take the file first and
-    // judge it second, exactly as the stale reclaim above does.
+    // judge it second, exactly as the stale reclaim above does. (The stat
+    // in step 0 below does not walk that back: nothing destructive runs on
+    // a match there — a match only means we go on to park and judge.)
     if (ourIno !== null) {
-      const parked = `${lockPath}.stale.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
-      let took = false;
+      // STEP 0 — a stat that can only rule the release OUT (#3600 round-8,
+      // H2). A stat cannot prove the lock is still ours (that is the whole
+      // reason for the park), but it CAN prove it is not: our own `fd` is
+      // still open, so our inode cannot be freed and cannot be handed to
+      // anything else, and nothing puts our inode back at `lockPath` once
+      // something else is there. A mismatch here is therefore final, and we
+      // return having touched NOTHING — no rename, so no window in which
+      // `lockPath` is absent. That matters because the park's absence window
+      // is not private to us: a legitimate holder's `stillHeld()` reads
+      // ENOENT there and declines mid-rotation, and before this stat every
+      // mismatched release — the ordinary outcome after our lock was
+      // reclaimed, needing no third party at all — opened one under a peer
+      // that was doing nothing wrong.
+      let looksOurs = false;
       try {
-        fs.renameSync(lockPath, parked);
-        took = true;
+        looksOurs = fs.statSync(lockPath).ino === ourIno;
       } catch {
-        /* nothing at the path, or a peer parked it first — not ours */
+        /* nothing at the path — nothing of ours left to release */
       }
-      if (took) {
-        let mine = false;
+      if (looksOurs) {
+        const parked = `${lockPath}.stale.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+        let took = false;
         try {
-          mine = fs.statSync(parked).ino === ourIno;
+          fs.renameSync(lockPath, parked);
+          took = true;
         } catch {
-          /* a peer's sweep reaped our park — it is already gone */
+          /* nothing at the path, or a peer parked it first — not ours */
         }
-        if (!mine) {
-          // We parked someone ELSE's live lock. Put it back, without
-          // clobbering whatever may have been created at the path since.
+        if (took) {
+          let mine = false;
+          let vanished = false;
           try {
-            fs.linkSync(parked, lockPath);
+            mine = fs.statSync(parked).ino === ourIno;
           } catch {
-            /* a lock already exists there — that holder is covered */
+            vanished = true; // a peer's sweep reaped our park — already gone
           }
-        }
-        try {
-          fs.unlinkSync(parked);
-        } catch {
-          /* best-effort — the park name is unique to us */
+          if (vanished) {
+            // Nothing to restore and nothing to unlink: the sweep that
+            // reaped it performed exactly the release we came here to do.
+          } else if (mine) {
+            try {
+              fs.unlinkSync(parked);
+            } catch {
+              /* best-effort — the park name is unique to us */
+            }
+          } else {
+            // We parked someone ELSE's live lock (a peer reclaimed in the
+            // one-syscall gap above). Put it back without clobbering
+            // whatever may have been created at the path since.
+            let restored = false;
+            try {
+              fs.linkSync(parked, lockPath);
+              restored = true;
+            } catch {
+              /* EEXIST: a lock already exists there — that holder is
+                 covered. EPERM/ENOSYS: no hardlinks on this filesystem.
+                 ENOENT: our park was reaped under us. */
+            }
+            if (restored) {
+              // `parked` is now a second name for the peer's inode; drop it.
+              try {
+                fs.unlinkSync(parked);
+              } catch {
+                /* best-effort — the park name is unique to us */
+              }
+            }
+            // NOT restored: `parked` is the peer's ONLY remaining name for
+            // its live lock inode, so unlinking it here would destroy the
+            // lock of a process that believes it holds it — the exact
+            // damage park-verify exists to prevent, and worse than the
+            // unconditional delete it replaced (#3600 round-8, M1). We
+            // leave the park; `sweepStaleParks` reaps it.
+          }
         }
       }
     }
@@ -608,10 +778,10 @@ function withRotateLock<T>(
  * crash-in-window, forever, in the agent's telegram dir.
  *
  * Only parks whose mtime is already past {@link ROTATE_LOCK_STALE_MS} are
- * taken. There is no "keep ours" exemption: the sole caller runs this
- * AFTER unlinking its own park and after taking the lock, so our park is
- * gone — and in the one case it is not (that unlink failed), it IS a leak
- * and reaping it is correct. A peer mid-reclaim WILL hold an eligible
+ * taken. There is no "keep ours" exemption: the caller runs this AFTER
+ * unlinking its own park and after taking the lock, so our park is gone —
+ * and in the one case it is not (that unlink failed), it IS a leak and
+ * reaping it is correct. A peer mid-reclaim WILL hold an eligible
  * park, not merely can: `rename(2)` does not touch the file's mtime (it
  * modifies the directory, not the inode), so a park always carries the
  * mtime of the ancient lock it was made from and is therefore always
@@ -622,14 +792,26 @@ function withRotateLock<T>(
  * at worst; it cannot wedge the path or produce two rotators.
  *
  * The RELEASE park (#3600 round-7, H2) carries the same name shape on
- * purpose — it leaks the same way on a crash and must be reaped the same
- * way. Reaping a live one is harmless in a second way: that park IS the
- * releasing process's own lock inode, so unlinking it is precisely the
- * release that process was about to perform. It then finds its park gone,
- * declines to unlink, and both agree the lock is released.
+ * purpose and leaks the same way on a crash — but it is NOT reached by the
+ * same acquisition path, and for one round the reaping claim here was
+ * simply false (#3600 round-8, L1). A crash between the release `rename`
+ * and its cleanup `unlink` leaves NOTHING at `lockPath`, so the next
+ * arrival's `open(wx)` SUCCEEDS and never takes the EEXIST reclaim branch
+ * this sweep used to be nested in — the park survived every subsequent
+ * acquisition, unbounded. The call site is therefore after the whole
+ * acquire, on both paths, which is what makes "reaped the same way" true.
+ *
+ * Reaping a LIVE release park is harmless in a second way: that park IS
+ * the releasing process's own lock inode, so unlinking it is precisely the
+ * release that process was about to perform. Its `statSync(parked)` then
+ * throws, which it reads as "vanished" — a case distinct from a mismatch,
+ * so it attempts no restore and no unlink — and both agree the lock is
+ * released. (The release's OTHER park — a peer's live lock, mismatched —
+ * can also be reaped here, from the branch where its restore failed and it
+ * deliberately left the file. That is the leak this sweep is for.)
  *
  * Entirely best-effort: every failure is swallowed, so this can never
- * throw out of the reclaim it runs inside.
+ * throw out of the acquisition it runs inside.
  */
 function sweepStaleParks(lockPath: string): void {
   try {

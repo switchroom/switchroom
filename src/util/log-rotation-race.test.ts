@@ -12,9 +12,14 @@
  * must land. What the hook does is what a second process really does.
  *
  * The file has grown past those two interleavings (H1 in round 4, the fd
- * premise in round 5, the four check→syscall gaps in round 6). Describe 1
- * is still the original single test; describe 2 has kept its original
- * first test and accumulated four more (the reclaim/sweep/release cases).
+ * premise in round 5, the four check→syscall gaps in round 6, the release
+ * guard in round 7, the release PARK's own absence window in round 8).
+ * Describe 1 is still the original single test; describe 2 has kept its
+ * original first test and grown a family of reclaim, sweep and release
+ * cases around it. No count is stated here on purpose: round 7 added a
+ * test to that group and left the tally reading "four more", which is the
+ * whole failure mode this file exists to catch, one level up (#3600
+ * round-8, L2). Read the `it` titles, they are the record.
  * The two originals still fail against the pre-fix code:
  *  - drop the under-lock size re-check and "declines to rotate a file a
  *    peer rotated while we waited for the lock" clobbers `.1`;
@@ -42,6 +47,11 @@ const hooks = vi.hoisted(() => ({
     | ((p: string, flags: string, fd: number) => void)
     | undefined,
   beforeUnlink: undefined as ((p: string) => void) | undefined,
+  /** Fires before `link(2)`; `linkThrows` simulates a filesystem with no
+   *  hardlinks (EPERM/ENOSYS), which is one of the restore's three failure
+   *  modes and the one round 8 M1 was reproduced with. */
+  beforeLink: undefined as ((from: string, to: string) => void) | undefined,
+  linkThrows: false,
   beforeStat: undefined as ((p: string) => void) | undefined,
   afterStat: undefined as ((p: string) => void) | undefined,
   /** Throwing from here simulates an `fstat` failure on that fd (L1). */
@@ -63,6 +73,17 @@ vi.mock("node:fs", async (importOriginal) => {
     unlinkSync: (p: realFs.PathLike) => {
       hooks.beforeUnlink?.(String(p));
       return actual.unlinkSync(p);
+    },
+    linkSync: (from: realFs.PathLike, to: realFs.PathLike) => {
+      hooks.beforeLink?.(String(from), String(to));
+      if (hooks.linkThrows) {
+        const e: NodeJS.ErrnoException = new Error(
+          "EPERM: operation not permitted, link",
+        );
+        e.code = "EPERM";
+        throw e;
+      }
+      return actual.linkSync(from, to);
     },
     openSync: (p: realFs.PathLike, flags: string, mode?: number) => {
       hooks.beforeOpen?.(String(p), flags);
@@ -109,6 +130,8 @@ function clearHooks(): void {
   hooks.beforeOpen = undefined;
   hooks.afterOpen = undefined;
   hooks.beforeUnlink = undefined;
+  hooks.beforeLink = undefined;
+  hooks.linkThrows = false;
   hooks.beforeStat = undefined;
   hooks.afterStat = undefined;
   hooks.beforeFstat = undefined;
@@ -421,6 +444,203 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
     expect(
       realFs.readdirSync(dir).filter((f) => f.includes(".stale.")),
     ).toEqual([]);
+  });
+
+  it("a mismatched release does not park a peer's live lock (round-8 H2)", () => {
+    // The park's absence window is NOT private to the parking process: a
+    // legitimate holder that checkpoints while `lockPath` is renamed away
+    // reads ENOENT and aborts its rotation. Round 7 put that window on the
+    // MISMATCHED release path — the ordinary outcome after our lock was
+    // reclaimed — so a victim could lose a generation with no third party
+    // and no contention: our drop of `.2` runs, a peer's release parks our
+    // live lock, our next `held()` reads ENOENT, we abandon the rotation.
+    //
+    // This test is the victim's side, measured continuously: from the
+    // instant the peer's lock exists, EVERY syscall the releasing process
+    // makes is followed by the exact predicate `stillHeld()` would evaluate
+    // for that peer. It must never once report a loss.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    let peerIno = -1;
+    let victimSawLoss = false;
+    const victimStillHolds = (): boolean => {
+      try {
+        return realFs.statSync(lock).ino === peerIno;
+      } catch {
+        return false; // ENOENT — exactly what stillHeld() reports as a loss
+      }
+    };
+    // `realFs` is the MOCKED module here, so the probe's own stat would
+    // re-enter this hook; the flag keeps one probe per syscall.
+    let probing = false;
+    const probe = (): void => {
+      if (probing || peerIno === -1) return;
+      probing = true;
+      try {
+        if (!victimStillHolds()) victimSawLoss = true;
+      } finally {
+        probing = false;
+      }
+    };
+    // The peer reclaims mid-rotation, as in the test above; everything from
+    // there on — including our whole release — is watched.
+    hooks.beforeRename = (from) => {
+      if (from === `${log}.1` && peerIno === -1) {
+        realFs.unlinkSync(lock);
+        realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+        peerIno = realFs.statSync(lock).ino;
+      }
+      probe();
+    };
+    hooks.beforeUnlink = probe;
+    hooks.beforeLink = probe;
+    hooks.beforeStat = probe;
+    hooks.beforeClose = probe;
+
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(false);
+
+    expect(peerIno).not.toBe(-1); // the interleaving really happened
+    // The claim: the peer holding the lock is never told it lost it.
+    expect(victimSawLoss).toBe(false);
+    expect(realFs.statSync(lock).ino).toBe(peerIno);
+    expect(
+      realFs.readdirSync(dir).filter((f) => f.includes(".stale.")),
+    ).toEqual([]);
+  });
+
+  it("release leaves the peer's lock alone even where the restore would fail (round-8 M1)", () => {
+    // Same interleaving, on a filesystem with no hardlinks. Before round 8
+    // the release parked the peer's live lock, the restoring `link` threw
+    // EPERM, and the cleanup `unlink` — which ran unconditionally — deleted
+    // the peer's inode: `existsSync(lock) === false`, the log unlocked
+    // while the peer believed it held it, i.e. the failure park-verify
+    // exists to prevent, reached through park-verify itself.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+    hooks.linkThrows = true;
+
+    let peerIno = -1;
+    hooks.beforeRename = (from) => {
+      if (from !== `${log}.1` || peerIno !== -1) return;
+      realFs.unlinkSync(lock);
+      realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+      peerIno = realFs.statSync(lock).ino;
+    };
+
+    maybeRotateLogFile(log, { maxBytes: CAP, maxFiles: 2, tag: "t", lock: true });
+
+    expect(peerIno).not.toBe(-1);
+    expect(realFs.existsSync(lock)).toBe(true);
+    expect(realFs.statSync(lock).ino).toBe(peerIno);
+  });
+
+  it("a restore that fails does not destroy the peer's lock inode (round-8 M1, residual)", () => {
+    // The narrow case the filter cannot cover: the release's opening stat
+    // sees our OWN inode, and the peer reclaims in the one syscall between
+    // that stat and the `rename`. We then really do park the peer's live
+    // lock, and with `link` unavailable it cannot be put back.
+    //
+    // This test pins BOTH halves, the fix and its cost. The cost, asserted
+    // below and not papered over: `lockPath` is left absent, so the peer
+    // declines at its next checkpoint and a later arrival can take the lock
+    // — no atomic create-if-absent restore exists on a filesystem without
+    // hardlinks, and `rename`-ing it back would clobber whatever arrived
+    // meanwhile, which is the one thing this whole design refuses to do.
+    // What the fix buys is that the peer's lock INODE is not unlinked out
+    // from under its open fd: it survives as a named park the sweep reaps.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    hooks.linkThrows = true;
+
+    let peerIno = -1;
+    hooks.beforeRename = (from) => {
+      // The release park is the only rename whose source is `lockPath`.
+      if (from !== lock || peerIno !== -1) return;
+      realFs.rmSync(lock, { force: true });
+      realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+      peerIno = realFs.statSync(lock).ino;
+    };
+
+    maybeRotateLogFile(log, { maxBytes: CAP, maxFiles: 2, tag: "t", lock: true });
+
+    expect(peerIno).not.toBe(-1); // we parked the peer's live lock
+    // The residual, stated as an assertion: the path IS left unlocked.
+    expect(realFs.existsSync(lock)).toBe(false);
+    const debris = realFs
+      .readdirSync(dir)
+      .filter((f) => f.includes(".stale."));
+    expect(debris).toHaveLength(1);
+    expect(realFs.statSync(path.join(dir, debris[0])).ino).toBe(peerIno);
+  });
+
+  it("a RECLAIM whose restore fails does not destroy the peer's lock inode (round-8 M1, sibling)", () => {
+    // The reclaim's mismatch branch is the same code as the release's, one
+    // branch away, and carried the same defect: swallow the failed `link`,
+    // then unlink the park unconditionally. Here the park holds a peer's
+    // brand-new LIVE lock, so that unlink deletes it.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+    const old = Date.now() / 1000 - 300;
+    realFs.utimesSync(lock, old, old); // stale: we will try to reclaim it
+    hooks.linkThrows = true;
+
+    let peerIno = -1;
+    hooks.beforeRename = (from) => {
+      // Between our staleness stat and our park `rename`, a peer reclaims.
+      if (from !== lock || peerIno !== -1) return;
+      realFs.rmSync(lock, { force: true });
+      realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+      peerIno = realFs.statSync(lock).ino;
+    };
+
+    // We must DECLINE — the lock we parked was not the stale one we judged.
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(false);
+
+    expect(peerIno).not.toBe(-1);
+    const debris = realFs
+      .readdirSync(dir)
+      .filter((f) => f.includes(".stale."));
+    expect(debris).toHaveLength(1);
+    expect(realFs.statSync(path.join(dir, debris[0])).ino).toBe(peerIno);
+  });
+
+  it("reaps a release park stranded by a crash, from an UNCONTENDED acquisition (round-8 L1)", () => {
+    // A crash between the release `rename` and its cleanup `unlink` leaves
+    // NOTHING at `lockPath`. So the next arrival's `open(wx)` succeeds and
+    // it never enters the EEXIST reclaim branch — which is where the sweep
+    // used to live, making the "release parks are reaped the same way"
+    // claim false and the leak unbounded.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    const stranded = `${lock}.stale.999999.deadbeef`;
+    realFs.writeFileSync(stranded, "");
+    const old = Date.now() / 1000 - 300;
+    realFs.utimesSync(stranded, old, old);
+    expect(realFs.existsSync(lock)).toBe(false); // no lock: uncontended path
+
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(true);
+
+    expect(realFs.existsSync(stranded)).toBe(false);
   });
 });
 
@@ -1229,5 +1449,70 @@ describe("inode identity's premise: the lock fd stays open (M3)", () => {
     // And it IS closed by the end — otherwise the tags above would be
     // vacuously "fd open" and this test would prove nothing.
     expect(lockFdClosed).toBe(true);
+  });
+});
+
+/**
+ * Rounds 3 through 8 of the #3600 review each found a claim in
+ * `log-rotation.ts` that no longer matched the code, and twice the claim
+ * was a NAME: a doc citation pointing at a test that had been renamed, or
+ * a tally of tests that had gone stale. Prose cannot be type-checked, but
+ * a citation CAN be, so it is — mechanically, here, rather than by asking
+ * the next reviewer to grep (#3600 round-8, L2).
+ */
+describe("the doc block's citations are checkable", () => {
+  it("every test name this file cites exists", () => {
+    const here = path.dirname(new URL(import.meta.url).pathname);
+    const source = realFs.readFileSync(
+      path.join(here, "log-rotation.ts"),
+      "utf8",
+    );
+    const self = realFs.readFileSync(
+      path.join(here, "log-rotation-race.test.ts"),
+      "utf8",
+    );
+
+    const titles = [...self.matchAll(/^ {2}it\(\s*\n?\s*"([^"]+)"/gm)].map(
+      (m) => m[1],
+    );
+    expect(titles.length).toBeGreaterThan(20); // the extractor still works
+
+    // Comment lines only, flattened, so a citation wrapped across lines is
+    // still one string. A candidate is a quoted phrase in the shape of a
+    // test title: prose, lower-case, no code punctuation.
+    const comments = source
+      .split("\n")
+      .filter((l) => /^\s*(\*|\/\/|\/\*)/.test(l))
+      .map((l) => l.replace(/^\s*(\*|\/\/)\s?/, ""))
+      .join(" ")
+      .replace(/\s+/g, " ");
+    const candidates = [...comments.matchAll(/"([^"]{20,120})"/g)]
+      .map((m) => m[1])
+      .filter((s) => !/[`#{}—[\]]/.test(s) && /^[a-z]/.test(s));
+
+    // Quoted PROSE that is not a citation. Explicit, so that a new quote in
+    // title shape fails this test until someone decides which it is —
+    // that decision is the point, and it is cheap.
+    const notCitations = new Set([
+      "between two adjacent syscalls",
+      "our lock was destroyed",
+      "rename works fine on the host",
+      "rows another rotator wrote … are LOST",
+      "some file that got our number",
+      "someone else handled it",
+      "stale because the holder died",
+      "stale because the holder is slow",
+      "the rotation did not happen and the active file is exactly as it was",
+      "we cannot delete the new holder's lock on the way out",
+    ]);
+
+    const dangling = candidates.filter(
+      (c) =>
+        !notCitations.has(c) && !titles.some((t) => t === c || t.startsWith(c)),
+    );
+    expect(dangling).toEqual([]);
+    // And the allowlist itself must not rot: every entry has to still be
+    // present in the source, or it is a stale exemption hiding a real one.
+    expect([...notCitations].filter((c) => !comments.includes(c))).toEqual([]);
   });
 });
