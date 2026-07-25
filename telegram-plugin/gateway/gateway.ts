@@ -9705,6 +9705,11 @@ function gatewayLivenessWiringDeps() {
     STATE_DIR,
     isLegitimatelyWorking,
     getCurrentTurn: (): CurrentTurn | null => currentTurn,
+    // #3580 — the KEYED read the three liveness predicates in liveness-wiring.ts
+    // use. Flag-OFF this IS the singleton (byte-equivalent to getCurrentTurn());
+    // flag-ON it is THIS topic's own turn, not the most-recent-set mirror, which
+    // answers about whichever topic started a turn last and so false-reaps.
+    getCurrentTurnForKey: (key: string): CurrentTurn | null => currentTurnMap.get(key),
     getInFlightUpdate: () => inFlightUpdate,
     getTurnsDb: () => turnsDb,
     getInboundSpool: (): ReturnType<typeof createInboundSpool> | undefined => inboundSpool,

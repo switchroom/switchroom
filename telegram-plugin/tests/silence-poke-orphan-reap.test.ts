@@ -13,7 +13,7 @@
  * These tests assert the OUTCOME (state gone, no fallback delivered, real fires
  * unaffected), not merely that the code path runs.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import {
@@ -28,7 +28,7 @@ import {
   type FrameworkFallbackContext,
 } from '../silence-poke.js'
 import { buildSilencePokeOptions } from '../gateway/liveness-wiring.js'
-import { makeLivenessFixture } from './helpers/liveness-wiring-fixture.js'
+import { makeLivenessFixture, type TurnMapLike } from './helpers/liveness-wiring-fixture.js'
 
 const ORIGINAL_KILL_SWITCH = process.env.SWITCHROOM_DISABLE_SILENCE_POKE
 
@@ -148,8 +148,14 @@ describe('#3552 — the production isTurnLive predicate', () => {
   const src = readFileSync(join(__dirname, '..', 'gateway', 'liveness-wiring.ts'), 'utf8')
   const KEY = '-100999:11'
 
+  /** Source lines with comments stripped — a canonical string in a comment must never pay for a code site. */
+  const codeLines = src.split('\n').filter((l) => {
+    const t = l.trim()
+    return !(t.startsWith('//') || t.startsWith('*') || t.startsWith('/*'))
+  })
+
   it('is wired with BOTH clauses ANDed — the near-miss this fix turns on', () => {
-    const line = src.split('\n').find((l) => l.includes('isTurnLive:'))
+    const line = codeLines.find((l) => l.includes('isTurnLive:'))
     expect(line, 'isTurnLive must be wired in liveness-wiring.ts').toBeDefined()
     // EXACT text, not a bag of fragments. #3575 review: the previous form
     // asserted four independent regexes that each had to match SOMEWHERE on the
@@ -164,9 +170,33 @@ describe('#3552 — the production isTurnLive predicate', () => {
     // `releaseTurnBufferGate` clears it mid-turn on every final-answer reply,
     // so a predicate missing (or effectively cancelling) the `getCurrentTurn()`
     // clause silently reaps live turns doing post-answer work.
+    //
+    // #3580: the second clause is the KEYED read. `getCurrentTurn()` is the
+    // most-recent-set MIRROR under SWITCHROOM_EMISSION_AUTHORITY=1, so an
+    // unkeyed read answers about whichever topic started a turn LAST — not
+    // about `key` — and false-reaps a live turn whose buffer gate was released.
     expect(line!.trim()).toBe(
-      'isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurn() == null),',
+      'isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurnForKey(key) == null),',
     )
+    // Belt and braces on the mutation the exact-equality pin exists for: the
+    // reaper must not read the unkeyed singleton at all.
+    expect(line!).not.toMatch(/getCurrentTurn\(\)/)
+  })
+
+  it('the two late-fire guards read keyed too — exact lines, so no site can drift back', () => {
+    // #3580 M1: all three sites change TOGETHER. One keyed + two unkeyed leaves
+    // the reaper and the guards disagreeing about liveness, which is worse than
+    // the consistent-but-wrong state it replaces. Exact trimmed equality (not
+    // fragment regexes) is the only form that forbids an extra conjunct.
+    const guards = codeLines
+      .map((l) => l.trim())
+      .filter((t) => t.includes('activeTurnStartedAt.get(ctx.key)'))
+    expect(guards).toEqual([
+      // onMidTurnFloor
+      'if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurnForKey(ctx.key) == null) return',
+      // onFrameworkFallback
+      'if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurnForKey(ctx.key) == null) {',
+    ])
   })
 
   it('matches the late-fire guard it was deliberately copied from', () => {
@@ -177,15 +207,12 @@ describe('#3552 — the production isTurnLive predicate', () => {
     // #3575 review: scan CODE only. Counting occurrences across the raw file let
     // an OR-for-AND swap survive by leaving the canonical text behind in a stale
     // comment — the comment paid for the missing code site.
-    const code = src
-      .split('\n')
-      .filter((l) => {
-        const t = l.trim()
-        return !(t.startsWith('//') || t.startsWith('*') || t.startsWith('/*'))
-      })
-      .join('\n')
-    const predicate = /activeTurnStartedAt\.get\([\w.]+\) == null && getCurrentTurn\(\) == null/g
-    expect((code.match(predicate) ?? []).length).toBeGreaterThanOrEqual(3)
+    const code = codeLines.join('\n')
+    const predicate = /activeTurnStartedAt\.get\(([\w.]+)\) == null && getCurrentTurnForKey\(\1\) == null/g
+    expect((code.match(predicate) ?? []).length).toBe(3)
+    // ...and no site may drift BACK to the unkeyed singleton read (#3580).
+    const unkeyed = /activeTurnStartedAt\.get\([\w.]+\) == null && getCurrentTurn\(\) == null/g
+    expect(code.match(unkeyed) ?? []).toEqual([])
   })
 
   // #3575 review B3 — EXECUTE the real predicate. The previous version of this
@@ -226,27 +253,50 @@ describe('#3552 — the production isTurnLive predicate', () => {
     expect(realPredicate(m, null)(KEY)).toBe(true)
   })
 
-  // The dangerous case, end to end through silence-poke's own tick, with the
-  // REAL predicate wired as the reaper. `releaseTurnBufferGate` (turn-end.ts:371)
-  // deletes the `activeTurnStartedAt` entry on EVERY reply finalize — including
-  // a mid-turn interim ack — while the turn keeps running; `getCurrentTurn()` is
-  // the UNKEYED singleton mirror. So a still-running turn whose gate was
-  // released AND whose mirror has been nulled by another topic reads dead on
-  // BOTH clauses, and IS reaped. This test states that residual honestly rather
-  // than pretending the conjunction covers it: a false reap is permanent and
-  // silent (nothing re-arms until the next `startTurn`), costing the turn both
-  // its mid-turn beat and its 300s unwedge. The durable fix is a keyed liveness
-  // read (or a re-arm safety), NOT a wider predicate — see #3580.
-  it('documents the residual: with BOTH signals dead the tick reaps, even mid-turn', async () => {
+  // #3580 — the case #3575 could only DOCUMENT (as "with BOTH signals dead the
+  // tick reaps, even mid-turn") is now FIXED, so this asserts the opposite
+  // outcome. `releaseTurnBufferGate` (turn-end.ts) deletes the
+  // `activeTurnStartedAt` entry on EVERY reply finalize — including a mid-turn
+  // interim ack — while the turn keeps running. Under
+  // SWITCHROOM_EMISSION_AUTHORITY=1 the singleton is a most-recent-set MIRROR,
+  // so once topic B started and ended a turn the UNKEYED read said null for
+  // topic A too: A read dead on BOTH clauses and was false-reaped — permanent
+  // and silent (nothing re-arms until the next `startTurn`), costing A its
+  // mid-turn beat and its 300 s #1122 unwedge. The keyed read resolves A's OWN
+  // entry, so A stays armed.
+  //
+  // The `CurrentTurnMap` here is the REAL production class, re-imported with
+  // the flag ON through its read-once seam (mirroring per-topic-current-turn's
+  // `loadMap`) — not a hand-modelled stand-in of the mirror semantics.
+  async function loadFlagOnTurnMap(): Promise<TurnMapLike> {
+    const prev = process.env.SWITCHROOM_EMISSION_AUTHORITY
+    process.env.SWITCHROOM_EMISSION_AUTHORITY = '1'
+    try {
+      vi.resetModules()
+      const mod = await import('../gateway/current-turn-map.js')
+      expect(mod.EMISSION_AUTHORITY_ENABLED, 'the re-import seam must observe the flag').toBe(true)
+      return new mod.CurrentTurnMap<unknown>() as unknown as TurnMapLike
+    } finally {
+      if (prev == null) delete process.env.SWITCHROOM_EMISSION_AUTHORITY
+      else process.env.SWITCHROOM_EMISSION_AUTHORITY = prev
+    }
+  }
+
+  const KEY_B = '-100999:22'
+
+  it('flag-ON: a mid-turn topic A survives topic B starting AND ending a turn (the false reap #3580 closes)', async () => {
     const emitted: SilencePokeMetric[] = []
     const fallbacks: FrameworkFallbackContext[] = []
-    const fx = makeLivenessFixture()
-    // Turn A is live for THIS key...
+    const turnMap = await loadFlagOnTurnMap()
+    const fx = makeLivenessFixture({}, turnMap)
+    const turnA = { turnId: 'a#1', sessionChatId: '-100999', sessionThreadId: 11 }
+    const turnB = { turnId: 'b#1', sessionChatId: '-100999', sessionThreadId: 22 }
+
+    // Topic A is live for THIS key.
     fx.activeTurnStartedAt.set(KEY, 0)
-    fx.setCurrentTurn({ turnId: 'a#1' })
-    const opts = buildSilencePokeOptions(fx.deps)
+    fx.setCurrentTurnForKey(KEY, turnA)
     __setDepsForTests({
-      ...opts,
+      ...buildSilencePokeOptions(fx.deps),
       emitMetric: (e) => emitted.push(e),
       onFrameworkFallback: async (ctx) => { fallbacks.push(ctx) },
     })
@@ -254,22 +304,58 @@ describe('#3552 — the production isTurnLive predicate', () => {
     __tickForTests(5_000)
     expect(__getStateForTests(KEY)).toBeDefined()
 
-    // ...then the final answer lands: releaseTurnBufferGate drops the
-    // activeTurnStartedAt entry, and currentTurn is nulled — while the turn
-    // keeps doing post-answer work.
+    // A's final answer lands: releaseTurnBufferGate drops A's activeTurnStartedAt
+    // entry while A keeps doing post-answer work.
     fx.activeTurnStartedAt.delete(KEY)
-    fx.setCurrentTurn(null)
-    __tickForTests(10_000)
+    // Then topic B starts (flipping the most-recent-set mirror off A) and ends.
+    fx.setCurrentTurnForKey(KEY_B, turnB)
+    fx.deps.endCurrentTurnForKey(turnB as never, KEY_B)
 
-    // Ground truth of the near-miss: BOTH naive readings say "dead" here.
+    // Ground truth of the trap: BOTH signals a naive/unkeyed reader consults
+    // now say "dead" for A, even though A is running.
     expect(fx.activeTurnStartedAt.get(KEY) == null).toBe(true)
     expect(fx.deps.getCurrentTurn() == null).toBe(true)
-    // ...and the real wiring still reaps it, because the conjunction is what
-    // the predicate negates. (Documented outcome: this IS a reap. See the
-    // re-arm note in the test below.)
+    // ...but the keyed read still resolves A's own topic.
+    expect(fx.deps.getCurrentTurnForKey(KEY)).toBe(turnA)
+
+    __tickForTests(10_000)
+
+    // The outcome that matters: A is NOT reaped, so it keeps its mid-turn beat.
+    expect(__getStateForTests(KEY)).toBeDefined()
+    expect(emitted.some((e) => e.kind === 'silence_poke_orphan_reaped')).toBe(false)
+    // ...and its 300 s unwedge still fires — the #1122 protection survives.
+    __tickForTests(310_000)
+    expect(fallbacks.map((f) => f.key)).toEqual([KEY])
+  })
+
+  it('flag-ON: a topic whose OWN turn ended is still reaped (the keyed read did not disable the reaper)', async () => {
+    const emitted: SilencePokeMetric[] = []
+    const turnMap = await loadFlagOnTurnMap()
+    const fx = makeLivenessFixture({}, turnMap)
+    const turnA = { turnId: 'a#1', sessionChatId: '-100999', sessionThreadId: 11 }
+    const turnB = { turnId: 'b#1', sessionChatId: '-100999', sessionThreadId: 22 }
+
+    fx.activeTurnStartedAt.set(KEY, 0)
+    fx.setCurrentTurnForKey(KEY, turnA)
+    // A live sibling B exists the whole time — under an unkeyed read its
+    // presence would have kept the dead A armed forever.
+    fx.setCurrentTurnForKey(KEY_B, turnB)
+    __setDepsForTests({
+      ...buildSilencePokeOptions(fx.deps),
+      emitMetric: (e) => emitted.push(e),
+      onFrameworkFallback: async () => {},
+    })
+    startTurn(KEY, 0)
+    __tickForTests(5_000)
+    expect(__getStateForTests(KEY)).toBeDefined()
+
+    // A ends via a path that forgot endTurn(): gate cleared, keyed entry gone.
+    fx.activeTurnStartedAt.delete(KEY)
+    fx.deps.endCurrentTurnForKey(turnA as never, KEY)
+    __tickForTests(10_000)
+
     expect(__getStateForTests(KEY)).toBeUndefined()
-    expect(emitted.some((e) => e.kind === 'silence_poke_orphan_reaped')).toBe(true)
-    expect(fallbacks).toHaveLength(0)
+    expect(emitted.filter((e) => e.kind === 'silence_poke_orphan_reaped')).toHaveLength(1)
   })
 
   it('keeps a live turn armed whenever EITHER liveness signal survives (the conjunction is load-bearing)', () => {

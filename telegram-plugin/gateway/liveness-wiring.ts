@@ -43,6 +43,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     STATE_DIR,
     isLegitimatelyWorking,
     getCurrentTurn,
+    getCurrentTurnForKey,
     getInFlightUpdate,
     getTurnsDb,
     getInboundSpool,
@@ -75,7 +76,17 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
   // `activeTurnStartedAt` alone is NOT sufficient — `releaseTurnBufferGate`
   // clears it mid-turn on every final-answer reply while the turn keeps running
   // (post-answer housekeeping), and silence-poke must keep watching that turn.
-  isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurn() == null),
+  //
+  // #3580 — the second clause is read KEYED (`getCurrentTurnForKey(key)`, i.e.
+  // `currentTurnMap.get(key)`), never the bare `getCurrentTurn()` singleton.
+  // Under `SWITCHROOM_EMISSION_AUTHORITY=1` that singleton is a MOST-RECENT-SET
+  // MIRROR, so an unkeyed read answers about whichever topic started a turn last
+  // — not about `key`. Combined with the buffer-gate release above, topic A
+  // (live, gate cleared mid-turn) read DEAD as soon as topic B started and ended
+  // a turn, and the tick false-reaped A: permanent and silent, nothing re-arms
+  // until the next `startTurn`, so A loses both its mid-turn beat and its 300 s
+  // #1122 unwedge. Flag-OFF the keyed read IS the singleton, byte-for-byte.
+  isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurnForKey(key) == null),
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
@@ -104,8 +115,10 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
   // retired in #2667.
   onMidTurnFloor: async (ctx) => {
     // Late-fire guard, mirroring the fallback: a clean turn-end can race the
-    // tick. If the turn is gone, stay silent.
-    if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurn() == null) return
+    // tick. If the turn is gone, stay silent. #3580 — keyed read; an unkeyed
+    // `getCurrentTurn()` here answers about another topic's turn (see the
+    // `isTurnLive` note above) and silences a live turn's approval re-ping.
+    if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurnForKey(ctx.key) == null) return
     const blockedOnApproval = activeStatusReactions
       .get(statusKey(ctx.chatId, ctx.threadId))
       ?.isAwaiting() ?? false
@@ -157,7 +170,11 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // state armed for the full 300s against a turn that ended minutes earlier,
     // 504 events in 14 days vs 110 real fires — is reaped at the tick instead,
     // so this counter finally reads as the genuine race it names.
-    if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurn() == null) {
+    //
+    // #3580 — keyed read, same reason as `isTurnLive`: unkeyed, a sibling
+    // topic's turn flip made this guard skip the 300 s unwedge for a genuinely
+    // wedged turn (the #1122 permanent-wedge class) and log it as a clean race.
+    if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurnForKey(ctx.key) == null) {
       process.stderr.write(
         `telegram gateway: silence-poke framework-fallback late-fire skipped — ` +
         `turn ended cleanly during silence window ` +
@@ -330,6 +347,18 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       wedgedTurn != null &&
       wedgedTurn.sessionChatId === fbChatId &&
       wedgedTurn.sessionThreadId === fbThreadId
+    // #3580 L3 — the ONE liveness decision this fire makes about the wedged
+    // turn. It gates the teardown below AND is what `decideFallbackTeardownNotice`
+    // is told as `tearsDownLiveTurn`, so the notice can never claim a teardown
+    // the gate skipped (previously the notice got the looser bare
+    // `turnMatchesFallback`, and a user could be told "the framework ended that
+    // stalled turn" about a turn that never ended). Evaluated HERE — before the
+    // `purgeChatStale` self-heal and before `endCurrentTurnForKey`, both of
+    // which drop the very entry `turnLiveForItsTopic` reads — so it answers
+    // "was this turn live when the fallback fired", the question both the
+    // teardown and the notice actually mean.
+    const tearsDownLiveTurn =
+      turnMatchesFallback && wedgedTurn != null && turnLiveForItsTopic(wedgedTurn)
     const turnStartedAt = activeTurnStartedAt.get(fbKey)
     if (turnStartedAt != null) {
       const turnDurationMs = Date.now() - turnStartedAt
@@ -455,7 +484,14 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // Flag-ON: `byKey.get(fbKey) === wedgedTurn`, so the keyed delete still
     // fires when the LIVE mirror has already flipped to another topic B (a bare
     // `currentTurn === wedgedTurn` would falsely skip and leak A's byKey entry).
-    if (turnMatchesFallback && wedgedTurn != null && turnLiveForItsTopic(wedgedTurn)) {
+    //
+    // #3580 L3 — the gate is the `tearsDownLiveTurn` const computed above, the
+    // SAME value handed to `decideFallbackTeardownNotice`. Do not re-inline the
+    // condition here: it must be evaluated before the `purgeChatStale` sweep
+    // above (which can drop this key's entry and so flip
+    // `turnLiveForItsTopic`), and the notice must speak for exactly what this
+    // gate did.
+    if (tearsDownLiveTurn && wedgedTurn != null) {
       // Status-surface observability: emit the lifecycle CLEAR for the
       // silence-poke teardown so a fallback-nulled turn has a turn-lifecycle
       // line like every other clear path (the framework-fallback line below is
@@ -484,7 +520,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // fire actually killed — at most once, since `endTurn(fbKey)` above dropped
     // the key.
     const teardownNotice = silencePoke.decideFallbackTeardownNotice({
-      tearsDownLiveTurn: turnMatchesFallback,
+      tearsDownLiveTurn,
       role: wedgedTurn?.role ?? null,
       finalAnswerDelivered: wedgedTurn?.finalAnswerDelivered ?? false,
       userAddressedTextDelivered,
@@ -545,7 +581,10 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     process.stderr.write(
       `telegram gateway: silence-poke framework-fallback ended wedged turn ` +
       `chat=${fbChatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
-      `currentTurn_nulled=${turnMatchesFallback} ` +
+      // #3580 L3 — report the gate that actually ran, not the looser
+      // chat/thread match: `turnMatchesFallback` was true in cases where the
+      // keyed liveness check skipped the teardown, so the field lied.
+      `currentTurn_nulled=${tearsDownLiveTurn} ` +
       `drained_buffered=${fbRedeliver.redelivered}/${fbRedeliver.drained}` +
       `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}` +
       `${fbExtraPurge.purged.length > 0 ? ` extra_keys_purged=${fbExtraPurge.purged.length}` : ''}\n`,

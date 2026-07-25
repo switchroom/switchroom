@@ -170,6 +170,72 @@ describe('#3551 — the teardown notice actually reaches the user (integration)'
   })
 })
 
+/**
+ * #3580 L3 — `tearsDownLiveTurn` must be the SAME predicate as the teardown
+ * gate, not a looser restatement of it.
+ *
+ * The old wiring passed the bare `turnMatchesFallback` (chat + thread equality)
+ * while the teardown itself additionally required `turnLiveForItsTopic`. When
+ * those disagree the decider is told a live turn was torn down when it was not,
+ * and the user gets a terminal "the framework ended that stalled turn" notice
+ * about a turn that never ended.
+ */
+describe('#3580 L3 — the notice speaks for exactly the teardown that ran', () => {
+  const CHAT = '-100999'
+  const THREAD = 11
+  const KEY = `${CHAT}:${THREAD}`
+
+  afterEach(() => {
+    __resetAllForTests()
+    __setDepsForTests(null)
+  })
+
+  async function fire(turnLiveForItsTopic: () => boolean) {
+    const fx = makeLivenessFixture({ turnLiveForItsTopic })
+    const turn = makeTurn({ sessionChatId: CHAT, sessionThreadId: THREAD, turnId: `${KEY}#42` })
+    fx.activeTurnStartedAt.set(KEY, 0)
+    fx.setCurrentTurn(turn)
+    fx.openObligations.add(`${KEY}#42`)
+    __setDepsForTests(buildSilencePokeOptions(fx.deps))
+    startTurn(KEY, 0)
+    __tickForTests(301_000)
+    await new Promise((r) => setTimeout(r, 0))
+    return fx
+  }
+
+  it('stays quiet when the keyed liveness check SKIPPED the teardown', async () => {
+    // chat + thread match (so the loose `turnMatchesFallback` is true), but the
+    // keyed read says this turn is no longer live for its own topic — so no
+    // teardown happens. The user must not be told their turn was ended.
+    const fx = await fire(() => false)
+    expect(fx.endedKeys, 'no teardown must have run').toEqual([])
+    expect(fx.sent.filter((s) => s.text.includes('framework ended')), 'no teardown notice').toEqual([])
+  })
+
+  it('still speaks when the teardown DID run (the guard did not mute the honest case)', async () => {
+    const fx = await fire(() => true)
+    expect(fx.endedKeys).toContain(KEY)
+    expect(fx.sent.some((s) => s.text.includes('the framework ended that stalled turn'))).toBe(true)
+  })
+
+  it('the decider is fed the gate ITSELF — exactly one evaluation, no restatement', () => {
+    const code = readFileSync(join(__dirname, '..', 'gateway', 'liveness-wiring.ts'), 'utf8')
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim()
+        return !(t.startsWith('//') || t.startsWith('*') || t.startsWith('/*'))
+      })
+    // Declared once...
+    expect(code.filter((l) => l.trim().startsWith('const tearsDownLiveTurn')).length).toBe(1)
+    // ...passed by shorthand (a `tearsDownLiveTurn: <anything>` restatement is
+    // exactly the L3 divergence, and would re-admit `: turnMatchesFallback`)...
+    expect(code.map((l) => l.trim())).toContain('tearsDownLiveTurn,')
+    expect(code.join('\n')).not.toMatch(/tearsDownLiveTurn:/)
+    // ...and it is the gate on the teardown block, not a parallel condition.
+    expect(code.map((l) => l.trim())).toContain('if (tearsDownLiveTurn && wedgedTurn != null) {')
+  })
+})
+
 describe('#3551 — wiring: the teardown path actually sends the notice', () => {
   // buildSilencePokeOptions needs the whole gateway module's dep object, which
   // cannot be instantiated in a unit test (module-load side effects). Pin the
