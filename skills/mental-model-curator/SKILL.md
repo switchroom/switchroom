@@ -156,11 +156,13 @@ operator-present proposing as the only supported path for now.
 
 A second, independent job of this skill: keep the bank's **active directives**
 lean. Directives are hard rules applied on every `reflect` — but the bank caps
-active directives at **`MAX_DIRECTIVES=15`**. Past the cap, the lowest-priority
-directives are **silently truncated** from the `<active_directives>` recall block
-and never reach the agent — so an overloaded, overlapping, or stale directive set
-doesn't just add noise, it silently drops your real guardrails. Fleet doctor
-WARNs at >12 active and FAILs at >15 (workstream C2), and its fix text points
+active directives at **`MAX_DIRECTIVES=30`**. Past the cap, the lowest-priority
+directives are **truncated** from the `<active_directives>` recall block and never
+reach the agent (recorded as `directives_omitted` on the recall_log row — the
+recall hook's stderr warning is swallowed by Claude Code, so don't look there) — so an
+overloaded, overlapping, or stale directive set doesn't just add noise, it drops
+your real guardrails. Fleet doctor WARNs at >24 active and FAILs at >30
+(workstream C2), and its fix text points
 here — this pass is the durable path it names.
 
 **You PROPOSE; you never delete.** `delete_directive` is deliberately NOT
@@ -177,7 +179,7 @@ outputs a plan; it does not enact retirements itself.
 ### Workflow
 
 1. **List the active set.** `mcp__hindsight__list_directives` (active only). If
-   the count is comfortably under the WARN threshold (≤12) AND nothing reads
+   the count is comfortably under the WARN threshold (≤24) AND nothing reads
    stale/overlapping, STOP and report "directive set is healthy (N active) —
    nothing to merge or retire." Don't manufacture churn.
 2. **Cluster for overlap.** Group directives that encode substantially the same

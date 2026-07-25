@@ -4,6 +4,79 @@
 
 ### Changed (switchroom divergence)
 
+- **`MAX_DIRECTIVES` 15 → 30, and truncation is no longer SILENT**
+  (`scripts/lib/directives.py`). Live fleet active-directive counts were 24
+  (assistant), 17 (klanker), 15 (carrie) against a client-side cap of 15, so the
+  busiest bank had 9 of its hard rules dropped from every turn's prompt with no
+  signal anywhere: the `(+N more, omitted)` footer only tells the AGENT. 30
+  clears the observed fleet maximum with headroom while staying bounded (the
+  block is injected on EVERY turn — this is a per-turn token cost, not a free
+  knob; the constant is commented as such). `format_active_directives_block`
+  now also prints a `[Hindsight] directive truncation: …` warn line to stderr
+  whenever it drops directives, and `recall.py` records the dropped count as
+  `directives_omitted` on the recall_log row.
+
+  Visibility correction (2026-07-25 review): hook stderr is NOT an operator
+  channel. `docker logs --tail 20000` across all 12 live agent containers
+  returns ZERO `[Hindsight]` lines, and nothing under `~/.switchroom/logs/`
+  contains them either, despite months of runtime and several long-standing
+  stderr paths in `recall.py` — Claude Code swallows hook stderr on a zero
+  exit. The stderr line is kept as a last-resort breadcrumb; the channels that
+  actually reach an operator are the `directives_omitted` recall_log field and
+  `switchroom doctor`'s directive-count row. Paired switchroom-side:
+  `src/cli/doctor-memory.ts` `MAX_DIRECTIVES` 15 → 30 and
+  `DIRECTIVE_WARN_THRESHOLD` 12 → 24 (a drift-guard test pins the TS constant
+  to the Python one). The `MAX_DIRECTIVES` cost comment now states the real
+  mechanism (rebuilt every `UserPromptSubmit`, appended into the conversation,
+  so cost is per-turn CUMULATIVE) with the measured live figures. Acceptance:
+  `scripts/tests/test_directives.py`
+  (`test_cap_is_30_and_clears_the_observed_fleet_maximum`,
+  `test_truncation_emits_a_stderr_breadcrumb_naming_the_dropped_count`,
+  `test_count_omitted_directives_matches_the_rendered_footer`).
+
+- **`retainMission` rewritten with explicit, enumerated exclusions**
+  (`settings.json`). The extraction model is a small local `gpt-oss-20b`, and
+  the previous one-line "Ignore routine greetings and transient operational
+  details" did not hold: production banks contain pure transcript traces
+  ("The assistant used ToolSearch to query for hindsight bank statistics"),
+  hindsight's own batch failures with the UUID inline, restatements of the
+  then-current prompt, and undated transient state ("User has no unread mail",
+  which then recalls forever as a standing fact). The new mission enumerates
+  those noise classes as NEVER-extract bullets and adds a positive
+  counterweight ("a preference revealed by a request is durable") — without it,
+  an exclusion-only mission made the model return a degenerate/empty response
+  on chatty-but-real turns in a 6-window live sample. The text is pinned
+  byte-for-byte to switchroom's `DEFAULT_RETAIN_MISSION`
+  (`src/memory/hindsight.ts`) by a drift guard, because BOTH reach the same
+  extraction step: switchroom seeds the bank-side mission at scaffold, and the
+  plugin independently pushes this one via `lib/bank.py: ensure_bank_mission`
+  on a fresh state dir. Before this change the two texts differed.
+
+  One 2026-07-25 review correction folded in, itself corrected by the
+  re-review: the rewrite DID reach existing agents, but unsafely.
+  `ensure_bank_mission` short-circuits on the already-seeded flag in
+  `bank_missions.json`, so the plugin was never the propagation path — but
+  `switchroom apply` re-scaffolds every agent, and scaffold pushed
+  `retain_mission` unconditionally on every run. That is why all 24 live banks
+  carried the 2026-07-19 text even though no agent sets `retain_mission` in
+  yaml. The hazard was the unconditional overwrite, not a stuck mission.
+  Switchroom now routes BOTH of its bank-op sites (scaffold and
+  `reconcileAgent`) through `decideRetainMissionUpgrade`: the mission upgrades
+  only when the bank's current text byte-equals a known previous default
+  (`SUPERSEDED_RETAIN_MISSIONS`) or is unset, so a customized mission matches
+  nothing and is never clobbered.
+
+  A second proposed correction — narrowing the "Greetings, acknowledgements,
+  and routine operational chatter" bullet and adding a personal-preference
+  clause — was written and then REVERTED. Sampling did not reproduce the
+  preference loss it was meant to fix, and the narrowed mission extracted MORE
+  noise than both this text and the pre-PR default on a real operational
+  window (8 facts vs 0 vs 4, including in-flight worker narration its own
+  bullet forbids). The sampling method is also n=1-unreliable: identical input
+  under the identical narrowed mission gave 0, 6, 6. No extraction-quality
+  claim is made here in either direction; the mission-content question is
+  deferred to switchroom#3532 (profile-scoped retain missions).
+
 - **`recallContextTurns` default `1` → `2`** (switchroom hindsight-leverage
   PR2, workstream A2). A bare follow-up user message ("and the port?", "what
   about staging?") now embeds together with its antecedent human turn in the

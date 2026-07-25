@@ -115,36 +115,35 @@ describe("classifyDirectiveCount (workstream C2 — directive pile-up + truncati
     expect(classifyDirectiveCount(DIRECTIVE_WARN_THRESHOLD, "bank coach")).toBeNull();
   });
 
-  it("WARNs at 13 (one past the warn threshold, still under the cap)", () => {
+  it("WARNs at 25 (one past the warn threshold, still under the cap)", () => {
     const r = classifyDirectiveCount(DIRECTIVE_WARN_THRESHOLD + 1, "bank coach");
     expect(r).not.toBeNull();
     expect(r!.status).toBe("warn");
     expect(r!.name).toBe("bank coach directives");
-    expect(r!.detail).toContain("13 active directives");
+    expect(r!.detail).toContain(`${DIRECTIVE_WARN_THRESHOLD + 1} active directives`);
     expect(r!.detail).toContain(`MAX_DIRECTIVES=${MAX_DIRECTIVES}`);
   });
 
-  it("still WARNs (not FAILs) exactly at the cap of 15 — nothing is truncated yet", () => {
+  it("still WARNs (not FAILs) exactly at the cap — nothing is truncated yet", () => {
     const r = classifyDirectiveCount(MAX_DIRECTIVES, "bank coach");
     expect(r!.status).toBe("warn");
   });
 
-  it("FAILs at 16 and surfaces the SILENT MAX_DIRECTIVES truncation", () => {
+  it("FAILs one past the cap and surfaces the MAX_DIRECTIVES truncation", () => {
     const r = classifyDirectiveCount(MAX_DIRECTIVES + 1, "bank coach");
     expect(r).not.toBeNull();
     expect(r!.status).toBe("fail");
-    expect(r!.detail).toContain("16 active directives");
-    expect(r!.detail).toMatch(/silently truncated/i);
+    expect(r!.detail).toContain(`${MAX_DIRECTIVES + 1} active directives`);
+    expect(r!.detail).toMatch(/truncated/i);
     expect(r!.detail).toContain(`MAX_DIRECTIVES=${MAX_DIRECTIVES}`);
-    // 16 - 15 = 1 directive dropped from the recall block.
+    // one past the cap = 1 directive dropped from the recall block.
     expect(r!.detail).toContain("1 lowest-priority directive");
     expect(r!.fix).toBeDefined();
   });
 
   it("reports the correct truncated count as the overflow grows", () => {
-    const r = classifyDirectiveCount(20, "bank coach");
+    const r = classifyDirectiveCount(MAX_DIRECTIVES + 5, "bank coach");
     expect(r!.status).toBe("fail");
-    // 20 - 15 = 5 truncated.
     expect(r!.detail).toContain("5 lowest-priority directive");
   });
 

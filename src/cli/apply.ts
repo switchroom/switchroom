@@ -65,7 +65,7 @@ import {
   findConfigFile,
   ConfigError,
 } from "../config/loader.js";
-import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath } from "../agents/scaffold.js";
+import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath, flushPendingBankOps } from "../agents/scaffold.js";
 import {
   getGrantsDbDir,
   getGrantsDbPath,
@@ -1605,6 +1605,28 @@ export async function runApply(
         `  (--compose-only: skipped per-agent scaffold for ${agentNames.length} agent(s))\n`,
       ),
     );
+  }
+
+  // ── 1a. Flush in-flight Hindsight bank ops ───────────────────────
+  //
+  // scaffoldAgent starts its bank chain (create → read retain_mission → push
+  // missions → mental models) fire-and-forget, because scaffoldAgent itself is
+  // synchronous. Normally node drains those before exiting, but the vault
+  // phases below hard-`process.exit()` on codes 4/5/6 AFTER this point, which
+  // would truncate a push mid-flight — a window the retain-mission read (up to
+  // 5s per agent) widened. Draining here makes the ordering deterministic
+  // instead of dependent on how apply happens to terminate. Bounded: on
+  // timeout we carry on, because apply is idempotent and the next run
+  // re-pushes. (2026-07-25 re-review L2.)
+  if (!skipScaffold) {
+    const flushed = await flushPendingBankOps();
+    if (!flushed) {
+      writeOut(
+        chalk.yellow(
+          "  ⚠ Hindsight bank updates still in flight after 15s — continuing; re-run apply to retry.\n",
+        ),
+      );
+    }
   }
 
   // ── 1b. LiteLLM per-agent virtual-key provisioning (opt-in) ───────

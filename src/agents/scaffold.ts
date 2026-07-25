@@ -670,7 +670,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -1675,6 +1675,130 @@ export function renderSoulMd(
 function formatAgentBankLabel(agentName: string, bankId: string): string {
   if (agentName === bankId) return agentName;
   return `${agentName} (bank: ${bankId})`;
+}
+
+/**
+ * In-flight Hindsight bank-op chains (bank create → mission read → mission
+ * push → mental models). `scaffoldAgent` / `reconcileAgent` are synchronous
+ * and start these fire-and-forget, which is fine while the process exits by
+ * draining the event loop — a pending fetch keeps node alive. It is NOT fine
+ * on a hard `process.exit()`: `runApply` exits with codes 4/5/6 in its vault
+ * phases, which run AFTER the scaffold loop, and would truncate a push
+ * mid-flight. The 2026-07-25 re-review's retain-mission read (up to 5s)
+ * widened that window, so the fix is a real flush rather than a note (L2).
+ *
+ * Callers that hard-exit await `flushPendingBankOps()` after the scaffold
+ * loop. Everything else can ignore it and keep the old drain behaviour.
+ */
+const pendingBankOps = new Set<Promise<unknown>>();
+
+/**
+ * Register a bank-op chain so `flushPendingBankOps` can wait on it.
+ *
+ * Entries self-evict the moment they settle. `flushPendingBankOps` is only
+ * awaited by apply, but chains are also started from `switchroom setup`,
+ * `agent`, `create-orchestrator`, `doctor`, `rename-orchestrator` and the
+ * reconcile bridge — without eviction a long-lived process would accumulate
+ * one settled promise per scaffold forever (PR #3529 review, N2b).
+ */
+function trackBankOps(p: Promise<unknown>): void {
+  // Swallow here only for tracking purposes — each chain already has its own
+  // .catch for user-facing reporting.
+  const tracked: Promise<void> = p
+    .then(
+      () => undefined,
+      () => undefined,
+    )
+    .then(() => {
+      // `tracked` is assigned and added below before this microtask can run,
+      // so the delete always finds its own entry.
+      pendingBankOps.delete(tracked);
+    });
+  pendingBankOps.add(tracked);
+}
+
+/**
+ * Drop every registered chain without waiting on it. Test-hygiene hook only:
+ * the scaffold/reconcile suites start real chains that must not leak into a
+ * later test's flush (PR #3529 review, N2a). Product code uses
+ * `flushPendingBankOps`, which actually waits.
+ */
+export function __resetPendingBankOpsForTests(): void {
+  pendingBankOps.clear();
+}
+
+/** Number of chains still registered. Test-only observability for N2b. */
+export function __pendingBankOpsCountForTests(): number {
+  return pendingBankOps.size;
+}
+
+/**
+ * Wait for every in-flight bank-op chain, bounded by `timeoutMs`. Never
+ * throws; returns true if everything settled, false if the timeout won (in
+ * which case the caller is exiting anyway and apply is idempotent — the
+ * operator's next run re-pushes).
+ *
+ * Exported for tests and for `runApply`.
+ */
+export async function flushPendingBankOps(timeoutMs = 15_000): Promise<boolean> {
+  if (pendingBankOps.size === 0) return true;
+  const inFlight = [...pendingBankOps];
+  pendingBankOps.clear();
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    // Don't hold the event loop open just for the deadline.
+    timer.unref?.();
+  });
+  const settled = Promise.all(inFlight).then(() => true);
+  const result = await Promise.race([settled, timedOut]);
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+/**
+ * Decide what `retain_mission` (if anything) to push at this bank, and log the
+ * outcome. Shared by BOTH bank-op sites — `scaffoldAgent` and `reconcileAgent`
+ * — because `switchroom apply` re-scaffolds every existing agent and never
+ * calls reconcile (`src/cli/apply.ts`), so a guard living only in reconcile is
+ * unreachable on the path operators actually run (2026-07-25 re-review H1).
+ *
+ * One path, three outcomes, driven by `decideRetainMissionUpgrade`:
+ *  - operator yaml set          → push it verbatim (wins outright, no read needed)
+ *  - bank unset / superseded    → push DEFAULT_RETAIN_MISSION
+ *  - bank customized or current → push nothing
+ *
+ * A FAILED read pushes nothing (unless yaml set one): "unknown" must never be
+ * treated as "upgradable", or a transient Hindsight hiccup would clobber a
+ * customized mission. This also means a genuinely fresh bank is seeded via the
+ * normal "mission unset → upgrade" outcome rather than a separate fresh-agent
+ * branch — no created-vs-existed signal is needed from `createBank`, whose MCP
+ * envelope does not carry one.
+ */
+async function resolveRetainMissionPush(
+  apiUrl: string,
+  bankId: string,
+  configured: string | undefined,
+  label: string,
+): Promise<string | undefined> {
+  // Config wins outright and needs no read — push it regardless.
+  if (configured) return configured;
+
+  const current = await fetchBankRetainMission(apiUrl, bankId, { timeoutMs: 5000 });
+  if (!current.ok) {
+    console.warn(
+      `  ${chalk.yellow("⚠")} Could not read current retain_mission for ${label} (${current.reason}) — leaving it untouched`,
+    );
+    return undefined;
+  }
+
+  const decision = decideRetainMissionUpgrade(configured, current.mission);
+  if (decision.action === "upgrade") {
+    console.log(
+      `  ${chalk.green("✓")} Upgrading superseded default retain_mission for ${label}`,
+    );
+  }
+  return decision.mission;
 }
 
 /**
@@ -5236,18 +5360,24 @@ export function scaffoldAgent(
 
     // Update bank missions — gated on the bank actually existing.
     //
-    // Mission selection: explicit user yaml wins. When the operator hasn't
-    // set a `retain_mission`, scaffold (NOT reconcile) seeds the upstream-
-    // recommended default — this lifts retained memory quality on fresh
-    // agents without touching agents that already have a customized
-    // mission. `reconcileAgent` deliberately does not push the default,
-    // so existing agents' Hindsight-side missions stay untouched.
-    bankOpsChain.then((bankReady) => {
+    // Mission selection: explicit user yaml wins. Otherwise the retain mission
+    // goes through `resolveRetainMissionPush`, exactly as reconcile does.
+    // `switchroom apply` re-scaffolds EVERY existing agent (it never calls
+    // `reconcileAgent`), so this site sees established banks far more often
+    // than fresh ones — an unconditional seed here clobbered any customized
+    // mission on every apply (2026-07-25 re-review H1). A genuinely fresh bank
+    // still gets seeded: its mission reads back unset, which is upgradable.
+    trackBankOps(bankOpsChain.then(async (bankReady) => {
       if (!bankReady) return;
 
       const userBankMission = agentConfig.memory?.bank_mission;
       const userRetainMission = agentConfig.memory?.retain_mission;
-      const seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION;
+      const seededRetainMission = await resolveRetainMissionPush(
+        apiUrl,
+        hindsightBankId,
+        userRetainMission,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
 
       // reflect_mission / observations_mission / disposition, layering the
       // resolved config over the built-in profile defaults (Phase 2). Config
@@ -5263,31 +5393,42 @@ export function scaffoldAgent(
         reflect_mission?: string;
         observations_mission?: string;
         disposition?: { skepticism?: number; literalism?: number; empathy?: number };
-      } = {
-        retain_mission: seededRetainMission,
-        ...extras,
-      };
+      } = { ...extras };
+      if (seededRetainMission) {
+        missions.retain_mission = seededRetainMission;
+      }
       if (userBankMission) {
         missions.bank_mission = userBankMission;
       }
 
-      updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
-        .then((result) => {
-          if (result.ok) {
-            const note = userRetainMission ? "(custom retain_mission)" : "(default retain_mission)";
-            console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)} ${chalk.dim(note)}`);
-          } else {
-            console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-          }
-        })
-        .catch((err) => {
-          console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-        });
+      // Same emptiness guard as the reconcile site: in post-upgrade steady
+      // state the mission decision is "none" and `missions` is `{}`, so an
+      // unconditional call cost every agent two HTTP round-trips on every
+      // apply and printed a success line for a call that changed nothing
+      // (PR #3529 review, N1).
+      if (Object.keys(missions).length > 0) {
+        await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+          .then((result) => {
+            if (result.ok) {
+              const note = userRetainMission
+                ? "(custom retain_mission)"
+                : seededRetainMission
+                  ? "(default retain_mission)"
+                  : "(retain_mission left as-is)";
+              console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)} ${chalk.dim(note)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+            }
+          })
+          .catch((err) => {
+            console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+          });
+      }
 
       // Ensure operator-DECLARED per-specialist mental models (Phase 5). Only
       // models named in memory.mental_models are created — no blind seeding
       // (that is the #2447 regression this avoids). Best-effort; never blocks.
-      ensureDeclaredMentalModels(
+      await ensureDeclaredMentalModels(
         apiUrl,
         hindsightBankId,
         agentConfig.memory?.mental_models,
@@ -5305,7 +5446,7 @@ export function scaffoldAgent(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
-    });
+    }));
   }
 
   // Loud warning when CLAUDE.md (or any future fingerprint-tracked
@@ -7546,15 +7687,13 @@ function reconcileAgentInner(
         return false;
       });
 
-    bankOpsChain.then((bankReady) => {
+    trackBankOps(bankOpsChain.then(async (bankReady) => {
       if (!bankReady) return;
 
-      // Reconcile still does NOT seed the DEFAULT_RETAIN_MISSION (that stays
-      // scaffold-only, so an operator's customized retain mission is never
-      // clobbered). But it DOES push reflect_mission / observations_mission /
-      // disposition — including the built-in profile defaults — so EXISTING
-      // banks pick up Phase 2 changes on `switchroom apply`, not only fresh
-      // ones. Config wins over profile defaults; disposition merges per-key.
+      // Reconcile pushes reflect_mission / observations_mission / disposition
+      // — including the built-in profile defaults — so EXISTING banks pick up
+      // Phase 2 changes on `switchroom apply`, not only fresh ones. Config
+      // wins over profile defaults; disposition merges per-key.
       const extras = resolveBankMissionExtras(
         agentConfig.memory,
         agentConfig.extends ?? DEFAULT_PROFILE,
@@ -7570,12 +7709,25 @@ function reconcileAgentInner(
       if (agentConfig.memory?.bank_mission) {
         missions.bank_mission = agentConfig.memory.bank_mission;
       }
-      if (agentConfig.memory?.retain_mission) {
-        missions.retain_mission = agentConfig.memory.retain_mission;
-      }
+
+      // retain_mission on reconcile (2026-07-25 review finding 1). Until then
+      // this pushed ONLY when the operator had set it in yaml, so a rewrite of
+      // DEFAULT_RETAIN_MISSION never reached an existing bank through THIS
+      // path. It now follows the same "push the default so existing banks pick
+      // up changes" rule as reflect/observations above — via the shared
+      // `resolveRetainMissionPush`, which upgrades only when the bank's current
+      // mission byte-equals a known previous default (SUPERSEDED_RETAIN_MISSIONS)
+      // or is unset, and pushes nothing on a failed read.
+      const retainMission = await resolveRetainMissionPush(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.retain_mission,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
+      if (retainMission) missions.retain_mission = retainMission;
 
       if (Object.keys(missions).length > 0) {
-        updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+        await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
           .then((result) => {
             if (result.ok) {
               console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
@@ -7592,7 +7744,7 @@ function reconcileAgentInner(
       // reconcile too — declared models are the desired steady state, so a
       // newly-added declaration lands on the next apply/restart. Only named
       // models are created; nothing is auto-seeded. Best-effort; never blocks.
-      ensureDeclaredMentalModels(
+      await ensureDeclaredMentalModels(
         apiUrl,
         hindsightBankId,
         agentConfig.memory?.mental_models,
@@ -7610,7 +7762,7 @@ function reconcileAgentInner(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
-    });
+    }));
   }
 
   return {

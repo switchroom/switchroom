@@ -113,7 +113,7 @@ export interface BankHealth {
    * — the same REST surface `lib/directives.py` fetches on the recall hook). `null`
    * when the directives fetch failed / wasn't attempted (best-effort: a directive-
    * fetch error must not fail the whole bank inspection). Used by the doctor to
-   * WARN/FAIL on runaway directive counts and to surface silent MAX_DIRECTIVES
+   * WARN/FAIL on runaway directive counts and to surface MAX_DIRECTIVES
    * truncation of the recall block.
    */
   activeDirectiveCount: number | null;

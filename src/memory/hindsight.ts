@@ -214,9 +214,19 @@ export function isHindsightEnabled(
 }
 
 /**
- * Recommended default `retain_mission` for new agents.
+ * Recommended default `retain_mission` for new agents, and the SINGLE source
+ * of truth for the retain mission across switchroom: the vendored plugin's
+ * `vendor/hindsight-memory/settings.json` `retainMission` is pinned to this
+ * exact string by a drift guard in `tests/memory.bank-missions.test.ts`.
  *
- * Sourced verbatim from upstream Hindsight's per-user-memory guide:
+ * Why the pin: BOTH values reach the same extraction step. Switchroom seeds
+ * the bank-side `retain_mission` here (via `updateBankMissions` at scaffold),
+ * while the plugin independently pushes `settings.json`'s `retainMission`
+ * through `lib/bank.py: ensure_bank_mission` the first time it sees a bank on
+ * a fresh state dir. Before 2026-07-25 the two texts differed, so which
+ * mission actually shaped extraction depended on scaffold-vs-plugin ordering.
+ *
+ * Historically sourced from upstream Hindsight's per-user-memory guide:
  *   https://github.com/vectorize-io/hindsight/blob/main/hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
  *   (lines 188–193)
  *
@@ -241,14 +251,213 @@ export function isHindsightEnabled(
  * `reconcileAgent` does not push a default. Operators can always
  * override per-agent via `agents.<name>.memory.retain_mission` in
  * `switchroom.yaml`.
+ *
+ * 2026-07-25 (retain-noise pass): the extraction model is `gpt-oss-20b` —
+ * small and local. A general principle ("ignore transient operational
+ * details") did not survive contact with it: production banks stored pure
+ * transcript traces ("The assistant used ToolSearch to query for hindsight
+ * bank statistics"), hindsight's own failures with the batch UUID inline,
+ * restatements of the then-current prompt, and undated transient state
+ * ("User has no unread mail" — which then recalls forever as a standing
+ * fact). Small models need concrete NEGATIVE examples, so the exclusions
+ * below are enumerated. The positive counterweight sentence ("a preference
+ * revealed by a request is durable") is load-bearing: without it, an
+ * exclusion-only mission made the model return an empty/degenerate response
+ * on chatty-but-real turns (measured against 6 live retain windows).
+ *
+ * 2026-07-25 (review finding 4, PROPOSED AND THEN REVERTED — do not
+ * re-attempt without better evidence): a follow-up review argued bullet 7
+ * ("Greetings, acknowledgements, and routine operational chatter") was a
+ * vibe judgement that discarded soft taste preferences on the fleet's
+ * non-coding agents, and narrowed it to content-free acknowledgements plus a
+ * personal-likes clause. Sampling disproved the premise and showed the change
+ * was a regression:
+ *  - the claimed film-window loss did not reproduce — the mission as written
+ *    below already kept the horror-dislike and film preferences;
+ *  - on a real operational window the narrowed mission extracted 8 facts vs 0
+ *    for this text and 4 for the pre-PR default, including "Plugin PR worker
+ *    still running" — which the in-flight-narration bullet above explicitly
+ *    forbids. Looser than the baseline it was meant to improve on;
+ *  - the sampling method is unreliable at n=1: identical input under the
+ *    identical narrowed mission yielded 0, then 6, then 6 facts.
+ * So the text stays as-is and the mission-CONTENT question is deferred to
+ * #3532 (profile-scoped retain missions) — a coding agent and a health coach
+ * should not share one extraction mission, which is the durable fix that a
+ * single global reword cannot be.
  */
 export const DEFAULT_RETAIN_MISSION =
+  "Extract durable facts that will still be true and useful weeks from now: " +
+  "user preferences and standing rules, ongoing projects and recurring " +
+  "commitments, technical and architectural decisions with their rationale, " +
+  "and people/tool relationships. A preference revealed by a request is " +
+  "durable — record the preference (what the user likes, wants, or always " +
+  "does), not the request itself.\n\n" +
+  "NEVER extract:\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. " +
+  '"the assistant used X to query Y", "ran a search", "sent the message").\n' +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is " +
+  "still running) — retain the outcome only once the task completes or a " +
+  "decision is made.\n" +
+  "- Operation, request, batch or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the " +
+  "memory system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) " +
+  "unless the fact is explicitly dated, in which case record it as a dated " +
+  "observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording " +
+  "it. If nothing durable remains, return an empty facts list.";
+
+/**
+ * Ordered registry of every retain mission switchroom has ever shipped as a
+ * DEFAULT, oldest first. Purely historical — do not edit an entry, only
+ * append the outgoing text when `DEFAULT_RETAIN_MISSION` changes.
+ *
+ * Why it exists (2026-07-25 review finding 1, corrected by the re-review):
+ * a rewrite of `DEFAULT_RETAIN_MISSION` DID reach live banks — but only by
+ * accident, and unsafely. `switchroom apply` re-scaffolds every agent
+ * (`src/cli/apply.ts`; it never calls `reconcileAgent`), and scaffold pushed
+ * `retain_mission: configured ?? DEFAULT_RETAIN_MISSION` unconditionally on
+ * every run. That is the mechanism by which all 24 live banks came to carry
+ * `SUPERSEDED_RETAIN_MISSIONS[2]` despite no agent setting `retain_mission` in
+ * `switchroom.yaml` (verified live 2026-07-25). The `reconcileAgent` path —
+ * which pushed only an operator's yaml mission — and the plugin's
+ * `ensure_bank_mission` short-circuit were both dead ends, so the propagation
+ * nobody had designed was the one doing the work.
+ *
+ * The problem was the *unconditional* part: an operator who hand-edited a
+ * mission through the Hindsight API had it silently overwritten on the next
+ * apply. Both bank-op sites now route through `decideRetainMissionUpgrade`
+ * (`resolveRetainMissionPush` in scaffold.ts), and this registry is what makes
+ * the push safe: it fires only when the bank's current mission byte-equals a
+ * known previous default (or is unset). Any customization — a hand-edit
+ * through the API, even a whitespace difference — matches nothing here and is
+ * left untouched. Operator yaml still wins outright.
+ *
+ * The registry/REST read machinery is load-bearing on BOTH paths now; before
+ * the re-review fix it was reached only on `agent reconcile` / restart
+ * (`src/cli/agent.ts`).
+ */
+export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
+  // 3e028eeb3 (2026-05) — the vendored plugin's original settings.json
+  // `retainMission`, pushed bank-side by lib/bank.py ensure_bank_mission.
+  "Extract technical decisions, architectural choices, user preferences, project context, and people/tool relationships. Ignore routine greetings and transient operational details.",
+  // d7c406994 (#458) — first switchroom-seeded DEFAULT_RETAIN_MISSION.
   "Extract user preferences, ongoing projects, recurring commitments, " +
-  "important context, and durable facts that should help across future " +
-  "conversations. Skip one-off chatter and temporary task noise, " +
-  "including in-flight workflow/process narration (a sub-task started, " +
-  "paused, or is still running) — only retain the outcome once a task " +
-  "actually completes or a decision is made.";
+    "important context, and durable facts that should help across future " +
+    "conversations. Skip one-off chatter and temporary task noise.",
+  // 9a9b7176c (#3418) — added the in-flight-narration carve-out. This is the
+  // text every live bank was carrying as of 2026-07-25.
+  "Extract user preferences, ongoing projects, recurring commitments, " +
+    "important context, and durable facts that should help across future " +
+    "conversations. Skip one-off chatter and temporary task noise, " +
+    "including in-flight workflow/process narration (a sub-task started, " +
+    "paused, or is still running) — only retain the outcome once a task " +
+    "actually completes or a decision is made.",
+];
+
+/**
+ * Should reconcile overwrite this bank's retain mission with the current
+ * `DEFAULT_RETAIN_MISSION`?
+ *
+ * True when the bank has no mission at all, or its mission byte-equals a
+ * superseded default. False for anything else — including the current
+ * default (nothing to do) and any operator customization (never clobbered).
+ */
+export function isUpgradableRetainMission(current: string | null | undefined): boolean {
+  if (current == null || current.trim() === "") return true;
+  return SUPERSEDED_RETAIN_MISSIONS.includes(current);
+}
+
+/**
+ * Reconcile-time retain-mission decision (pure).
+ *
+ * @param configured `agents.<name>.memory.retain_mission` from yaml, if any.
+ * @param current    The bank's live `retain_mission`; null ONLY when the read
+ *                   succeeded and the field is genuinely unset. A FAILED read
+ *                   must not be passed as null — the caller skips the retain
+ *                   push entirely in that case, because "unknown" must never
+ *                   be treated as "upgradable" (that would clobber a
+ *                   customized mission whenever Hindsight hiccups).
+ *
+ * Three outcomes:
+ *  - `"config"`   — the operator set a mission in yaml; push it verbatim
+ *                   (unchanged pre-existing behaviour, and it wins outright).
+ *  - `"upgrade"`  — no yaml mission and the bank is carrying an unset or
+ *                   superseded default; push `DEFAULT_RETAIN_MISSION`.
+ *  - `"none"`     — the bank is already current, or carries a mission that is
+ *                   NOT a known default (i.e. someone customized it). Leave
+ *                   it alone.
+ */
+export function decideRetainMissionUpgrade(
+  configured: string | undefined | null,
+  current: string | null,
+): { action: "config" | "upgrade" | "none"; mission?: string } {
+  if (configured) return { action: "config", mission: configured };
+  if (current === DEFAULT_RETAIN_MISSION) return { action: "none" };
+  if (isUpgradableRetainMission(current)) {
+    return { action: "upgrade", mission: DEFAULT_RETAIN_MISSION };
+  }
+  return { action: "none" };
+}
+
+/**
+ * Read a bank's current `retain_mission` from Hindsight.
+ *
+ * Uses the REST config surface, NOT MCP: `get_bank` returns only
+ * bank_id/name/disposition/mission (verified live 2026-07-25 against
+ * switchroom-hindsight) — the retain mission is a CONFIG field and is
+ * readable only at `GET /v1/default/banks/<id>/config`. Same asymmetry as
+ * the write path, where `retain_mission` must ride in `config_updates`.
+ *
+ * Best-effort with a short timeout; never throws. `{ ok: true, mission: null }`
+ * means the bank exists and the `retain_mission` KEY is present but null —
+ * i.e. genuinely unset.
+ *
+ * A 200 whose body lacks `config`, or whose `config` lacks the
+ * `retain_mission` key at all, is reported as `{ ok: false }` — NOT as
+ * "unset". `isUpgradableRetainMission(null)` is true, so mapping an
+ * unrecognised shape to null would push the default over every customized
+ * mission fleet-wide the day Hindsight renests or renames the field
+ * (2026-07-25 re-review M1).
+ */
+export async function fetchBankRetainMission(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<{ ok: true; mission: string | null } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+  const base = apiUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  const url = `${base}/v1/default/banks/${encodeURIComponent(bankId)}/config`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchImpl(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
+    const body = (await resp.json()) as {
+      config?: { retain_mission?: string | null } | null;
+    };
+    const config = body?.config;
+    if (config == null || typeof config !== "object") {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    if (!("retain_mission" in config)) {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    const mission = config.retain_mission;
+    if (mission != null && typeof mission !== "string") {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    return { ok: true, mission: mission ?? null };
+  } catch (err) {
+    clearTimeout(timeout);
+    if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
+    return { ok: false, reason: String((err as Error).message ?? err) };
+  }
+}
 
 /**
  * Hindsight bank disposition traits (1-5 each). Mirrors the engine's flat

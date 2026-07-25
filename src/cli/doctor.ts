@@ -1175,7 +1175,7 @@ export async function checkBankIngestHealth(
     }
 
     // Active-directive count (workstream C2): WARN past DIRECTIVE_WARN_THRESHOLD,
-    // FAIL past MAX_DIRECTIVES (where the recall block silently truncates the
+    // FAIL past MAX_DIRECTIVES (where the recall block truncates the
     // overflow). Emitted as its OWN row, independent of the ingest-health branch
     // chain below (which `continue`s after the first match), so a directive
     // pile-up surfaces even on a bank that also has an ingest issue.

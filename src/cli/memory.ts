@@ -152,6 +152,16 @@ interface RecallLogEntry {
   query_chars?: number;
   result_count?: number | null;
   directive_count?: number | null;
+  /**
+   * Directives the cap silently dropped before the prompt was assembled
+   * (`count_omitted_directives`, vendor/hindsight-memory/scripts/lib/directives.py).
+   * recall.py writes it on every row; it is surfaced here and in the human
+   * view because a dropped directive is invisible to the agent by
+   * construction — this is how an operator learns a rule stopped being
+   * enforced (2026-07-25 re-review M2; `switchroom doctor` carries the same
+   * signal).
+   */
+  directives_omitted?: number | null;
   demoted_count?: number;
   capped?: boolean;
   pre_cap_count?: number;
@@ -199,6 +209,73 @@ export function readRecallLog(
     }
   }
   return out;
+}
+
+/**
+ * Render the human (non-`--json`) view of `switchroom memory recall-log` for
+ * one agent: a bold header, an aggregate summary line, then one line per turn.
+ *
+ * Extracted from the command action so the rendering is testable as an
+ * outcome. Assumes `entries` is non-empty (the caller handles the empty case).
+ */
+export function formatRecallLogView(
+  name: string,
+  entries: RecallLogEntry[],
+): string[] {
+  const lines: string[] = [chalk.bold(`\n${name}:`)];
+
+  // Aggregate at the top — one-line summary so scanning is fast.
+  const total = entries.length;
+  const hits = entries.filter((e) => e.cache_hit).length;
+  const cappedTurns = entries.filter((e) => e.capped).length;
+  // M2: a directive dropped by the cap never reaches the agent, so the recall
+  // log is the only place it is observable. Roll it into the summary AND flag
+  // it per-row — before this it was visible only under `--json`, while doctor
+  // and the vendored plugin both described it as operator-visible.
+  const omittedTurns = entries.filter(
+    (e) => typeof e.directives_omitted === "number" && e.directives_omitted > 0,
+  ).length;
+  const memCounts = entries
+    .map((e) => e.result_count)
+    .filter((n): n is number => typeof n === "number");
+  const avg =
+    memCounts.length > 0
+      ? Math.round((memCounts.reduce((s, n) => s + n, 0) / memCounts.length) * 10) / 10
+      : null;
+  const max = memCounts.length > 0 ? Math.max(...memCounts) : null;
+  lines.push(
+    chalk.gray(
+      `  last ${total} turn${total === 1 ? "" : "s"}: ` +
+      `avg=${avg ?? "—"} max=${max ?? "—"} ` +
+      `cache_hits=${hits} capped=${cappedTurns}` +
+      (omittedTurns > 0 ? ` directives_omitted_turns=${omittedTurns}` : ""),
+    ),
+  );
+
+  for (const e of entries) {
+    const flag = e.cache_hit
+      ? chalk.cyan("CACHE")
+      : e.capped
+        ? chalk.yellow("CAP")
+        : chalk.green("OK");
+    const dem = e.demoted_count && e.demoted_count > 0
+      ? chalk.dim(` -${e.demoted_count}d`)
+      : "";
+    const omitted =
+      typeof e.directives_omitted === "number" && e.directives_omitted > 0
+        ? chalk.yellow(` +${e.directives_omitted}omitted`)
+        : "";
+    const ids = e.memory_ids && e.memory_ids.length > 0
+      ? chalk.dim(` ids=${e.memory_ids.slice(0, 3).join(",")}${e.memory_ids.length > 3 ? `…+${e.memory_ids.length - 3}` : ""}`)
+      : "";
+    lines.push(
+      `  ${chalk.gray(e.ts)} ${flag} ` +
+      `n=${e.result_count ?? "—"}${e.pre_cap_count != null && e.pre_cap_count !== e.result_count ? `/${e.pre_cap_count}` : ""}` +
+      `${dem}${omitted}${ids}`,
+    );
+  }
+
+  return lines;
 }
 
 export function registerMemoryCommand(program: Command): void {
@@ -709,47 +786,7 @@ export function registerMemoryCommand(program: Command): void {
             continue;
           }
 
-          console.log(chalk.bold(`\n${name}:`));
-          // Aggregate at the top — one-line summary so scanning is fast.
-          const total = entries.length;
-          const hits = entries.filter((e) => e.cache_hit).length;
-          const cappedTurns = entries.filter((e) => e.capped).length;
-          const memCounts = entries
-            .map((e) => e.result_count)
-            .filter((n): n is number => typeof n === "number");
-          const avg =
-            memCounts.length > 0
-              ? Math.round(
-                  (memCounts.reduce((s, n) => s + n, 0) / memCounts.length) * 10,
-                ) / 10
-              : null;
-          const max = memCounts.length > 0 ? Math.max(...memCounts) : null;
-          console.log(
-            chalk.gray(
-              `  last ${total} turn${total === 1 ? "" : "s"}: ` +
-              `avg=${avg ?? "—"} max=${max ?? "—"} ` +
-              `cache_hits=${hits} capped=${cappedTurns}`,
-            ),
-          );
-
-          for (const e of entries) {
-            const flag = e.cache_hit
-              ? chalk.cyan("CACHE")
-              : e.capped
-                ? chalk.yellow("CAP")
-                : chalk.green("OK");
-            const dem = e.demoted_count && e.demoted_count > 0
-              ? chalk.dim(` -${e.demoted_count}d`)
-              : "";
-            const ids = e.memory_ids && e.memory_ids.length > 0
-              ? chalk.dim(` ids=${e.memory_ids.slice(0, 3).join(",")}${e.memory_ids.length > 3 ? `…+${e.memory_ids.length - 3}` : ""}`)
-              : "";
-            console.log(
-              `  ${chalk.gray(e.ts)} ${flag} ` +
-              `n=${e.result_count ?? "—"}${e.pre_cap_count != null && e.pre_cap_count !== e.result_count ? `/${e.pre_cap_count}` : ""}` +
-              `${dem}${ids}`,
-            );
-          }
+          for (const line of formatRecallLogView(name, entries)) console.log(line);
         }
         console.log();
       }),

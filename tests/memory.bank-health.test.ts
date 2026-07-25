@@ -393,7 +393,7 @@ describe("checkBankIngestHealth (doctor)", () => {
   it("emits a FAIL directives row surfacing MAX_DIRECTIVES truncation (workstream C2), alongside the ingest row", async () => {
     const OVER_CAP = {
       ...HEALTHY_BANK,
-      directives: { items: Array.from({ length: 16 }, (_, i) => ({ id: `dir-${i}` })) },
+      directives: { items: Array.from({ length: 31 }, (_, i) => ({ id: `dir-${i}` })) },
     };
     const results = await checkBankIngestHealth(
       minimalConfig({ marko: {} }),
@@ -403,21 +403,21 @@ describe("checkBankIngestHealth (doctor)", () => {
     const byName = Object.fromEntries(results.map((r) => [r.name, r]));
     // Healthy ingest row still present…
     expect(byName["bank marko"].status).toBe("ok");
-    // …plus a distinct FAIL directives row that names the silent truncation.
+    // …plus a distinct FAIL directives row that names the truncation.
     const dir = byName["bank marko directives"];
     expect(dir.status).toBe("fail");
-    expect(dir.detail).toMatch(/silently truncated/i);
-    expect(dir.detail).toContain("16 active directives");
+    expect(dir.detail).toMatch(/truncated/i);
+    expect(dir.detail).toContain("31 active directives");
   });
 
-  it("emits a WARN directives row at 13, and NO directives row at 12 or below", async () => {
+  it("emits a WARN directives row at 25, and NO directives row at 24 or below", async () => {
     const WARN_BANK = {
       ...HEALTHY_BANK,
-      directives: { items: Array.from({ length: 13 }, (_, i) => ({ id: `dir-${i}` })) },
+      directives: { items: Array.from({ length: 25 }, (_, i) => ({ id: `dir-${i}` })) },
     };
     const OK_BANK = {
       ...HEALTHY_BANK,
-      directives: { items: Array.from({ length: 12 }, (_, i) => ({ id: `dir-${i}` })) },
+      directives: { items: Array.from({ length: 24 }, (_, i) => ({ id: `dir-${i}` })) },
     };
     const warn = await checkBankIngestHealth(
       minimalConfig({ marko: {} }),

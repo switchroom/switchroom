@@ -1,11 +1,26 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
   updateBankMissions,
   DEFAULT_RETAIN_MISSION,
+  SUPERSEDED_RETAIN_MISSIONS,
+  isUpgradableRetainMission,
+  decideRetainMissionUpgrade,
+  fetchBankRetainMission,
   resolveBankMissionExtras,
   PROFILE_MEMORY_DEFAULTS,
 } from "../src/memory/hindsight.js";
+import {
+  reconcileAgent,
+  scaffoldAgent,
+  flushPendingBankOps,
+  __resetPendingBankOpsForTests,
+  __pendingBankOpsCountForTests,
+} from "../src/agents/scaffold.js";
+import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 import { AgentMemorySchema } from "../src/config/schema.js";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 
 /** Drive updateBankMissions with a two-call mock and return the update_bank args. */
 async function captureUpdateBankArgs(
@@ -22,59 +37,682 @@ async function captureUpdateBankArgs(
   return JSON.parse(mockFetch.mock.calls[1][1].body).params.arguments;
 }
 
+// N2a (PR #3529 review): the in-flight bank-op registry is a module global.
+// The scaffold/reconcile describes below start real chains, so without this
+// every later test — notably "resolves immediately when nothing is in flight"
+// — inherits the previous ones' entries.
+beforeEach(() => {
+  __resetPendingBankOpsForTests();
+});
+
 describe("DEFAULT_RETAIN_MISSION", () => {
-  it("starts from the upstream Hindsight per-user-memory guide wording", () => {
-    // Base sourced verbatim from
-    // hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
-    // lines 188-193; extended 2026-07-19 (hindsight fleet review) with an
-    // explicit in-flight-process-narration carve-out — see block comment.
-    expect(DEFAULT_RETAIN_MISSION.startsWith(
-      "Extract user preferences, ongoing projects, recurring commitments, " +
-        "important context, and durable facts that should help across future " +
-        "conversations. Skip one-off chatter and temporary task noise,",
-    )).toBe(true);
-  });
-
-  it("explicitly tells extraction to skip conversational filler", () => {
-    expect(DEFAULT_RETAIN_MISSION).toContain("Skip one-off chatter");
-    expect(DEFAULT_RETAIN_MISSION).toContain("temporary task noise");
-  });
-
-  it("focuses on durable, cross-conversation signal", () => {
+  it("focuses extraction on durable, cross-conversation signal", () => {
     expect(DEFAULT_RETAIN_MISSION).toContain("durable facts");
-    expect(DEFAULT_RETAIN_MISSION).toContain("across future");
+    expect(DEFAULT_RETAIN_MISSION).toContain("user preferences and standing rules");
+    expect(DEFAULT_RETAIN_MISSION).toContain("ongoing projects and recurring commitments");
   });
 
   // Regression for the 2026-07-19 fleet review (REPORT.md finding B1):
   // live banks were dominated by transient in-flight task narration
-  // ("P6 worker paused waiting on its PR") rather than durable facts —
-  // that class of memory feeds the consolidation backlog for no lasting
-  // recall value. The mission must name it explicitly so extraction
-  // recognizes it, not just lump it under vague "task noise".
+  // ("P6 worker paused waiting on its PR") rather than durable facts.
   it("explicitly excludes in-flight workflow/process narration", () => {
-    expect(DEFAULT_RETAIN_MISSION).toContain("in-flight workflow/process narration");
-    expect(DEFAULT_RETAIN_MISSION).toContain("only retain the outcome once a task");
+    expect(DEFAULT_RETAIN_MISSION).toContain("In-flight workflow/process narration");
+    expect(DEFAULT_RETAIN_MISSION).toContain("retain the outcome only once the task completes");
+  });
+
+  // Regression for the 2026-07-25 retain-noise pass. The extraction model is a
+  // small local gpt-oss-20b: a general "ignore transient operational details"
+  // principle did NOT stop it storing transcript traces, hindsight's own batch
+  // failures (UUID inline), prompt restatements, or undated transient state.
+  // Each bullet below corresponds to a unit actually found in a production bank.
+  it("enumerates the concrete noise classes a small extraction model must drop", () => {
+    // "The assistant used ToolSearch to query for hindsight bank statistics"
+    expect(DEFAULT_RETAIN_MISSION).toContain("Agent tool-use traces");
+    // "Batch retain operation with ID fcf86589-… failed, processing 1 item."
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/UUIDs/);
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/Hindsight's own errors, retries, backlogs, or internal state/);
+    // "User wants to identify pending/failed consolidation…"
+    expect(DEFAULT_RETAIN_MISSION).toContain("Restatements of the user's current request");
+    // "User has no unread mail" — stored with no timestamp, recalls forever.
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/Transient state .* unless the fact is explicitly dated/);
+  });
+
+  // The exclusions above are load-bearing but dangerous alone: an
+  // exclusion-only mission made gpt-oss-20b return a degenerate/empty response
+  // on chatty-but-real turns in the 6-window live sample. The positive
+  // counterweight is what keeps genuine preferences flowing.
+  it("keeps a positive counterweight so exclusions cannot starve extraction", () => {
+    expect(DEFAULT_RETAIN_MISSION).toContain(
+      "A preference revealed by a request is durable",
+    );
+  });
+
+  // Drift guard: the vendored plugin pushes settings.json's `retainMission`
+  // through lib/bank.py ensure_bank_mission the first time it sees a bank, so
+  // a divergence here means which mission shapes extraction depends on
+  // scaffold-vs-plugin ordering. Same pattern as the MAX_DIRECTIVES guard.
+  it("is pinned byte-for-byte to the vendored plugin's settings.json retainMission", () => {
+    const settings = JSON.parse(
+      readFileSync(
+        resolve(__dirname, "..", "vendor", "hindsight-memory", "settings.json"),
+        "utf-8",
+      ),
+    );
+    expect(settings.retainMission).toBe(DEFAULT_RETAIN_MISSION);
   });
 });
 
 describe("scaffold seed wiring", () => {
-  // Source-structure assertion: scaffold imports the constant and uses
-  // it as the retain_mission default, while reconcile does NOT (existing
-  // agents' missions stay untouched).
-  it("scaffold imports DEFAULT_RETAIN_MISSION but reconcile path does not seed it", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-    expect(scaffoldSource).toContain("DEFAULT_RETAIN_MISSION");
-    expect(scaffoldSource).toContain("seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION");
-    // The `?? DEFAULT_RETAIN_MISSION` seed-default fallback must appear
-    // EXACTLY ONCE (scaffold only). More than one occurrence means the
-    // seed-default behaviour was copied into reconcile, which would clobber
-    // an operator's customized retain mission on every `switchroom apply`.
-    const seedOccurrences = scaffoldSource.split("?? DEFAULT_RETAIN_MISSION").length - 1;
-    expect(seedOccurrences).toBe(1);
-    // Reconcile still gates its retain push on explicit operator config.
-    expect(scaffoldSource).toContain("if (agentConfig.memory?.retain_mission) {");
+  // Structural backstop for the 2026-07-25 re-review H1 fix. `switchroom
+  // apply` re-scaffolds EVERY existing agent and never calls reconcile, so
+  // NEITHER site may seed the default unconditionally: both must route through
+  // decideRetainMissionUpgrade (via resolveRetainMissionPush), which refuses to
+  // clobber a customized mission.
+  //
+  // N6 (PR #3529 review): the old form counted the literal
+  // "?? DEFAULT_RETAIN_MISSION" (expect 0) and "await resolveRetainMissionPush("
+  // (expect 2). That missed every other spelling of the same bug
+  // (`x || DEFAULT_RETAIN_MISSION`, a ternary, a local alias) and broke on
+  // benign refactors that merely move a call. The durable invariant is
+  // stronger and spelling-independent: scaffold.ts must not USE the constant
+  // at all — the only legitimate consumer is resolveRetainMissionPush, which
+  // lives in src/memory/hindsight.ts. The behavioural proof of the decision
+  // itself is the reconcileAgent and scaffoldAgent describes below, which
+  // exercise the unset / superseded / customized / yaml-override / read-failure
+  // branches at both real call sites; the fixed call count added nothing on top
+  // of that, so it is dropped rather than re-encoded.
+  it("never references DEFAULT_RETAIN_MISSION outside its import", () => {
+    const scaffoldSource = readFileSync(
+      resolve(__dirname, "..", "src", "agents", "scaffold.ts"),
+      "utf-8",
+    );
+    const offenders = scaffoldSource
+      .split("\n")
+      .map((line, i) => ({ line, n: i + 1 }))
+      // Drop the import statement and comments — only executable references
+      // to the constant can seed a mission.
+      .filter(({ line }) => line.includes("DEFAULT_RETAIN_MISSION"))
+      .filter(({ line }) => !/^\s*(?:\*|\/\/|\/\*)/.test(line))
+      .filter(({ line }) => !/^\s*import\b/.test(line) && !line.includes('from "../memory/'))
+      .map(({ line, n }) => `scaffold.ts:${n}: ${line.trim()}`);
+    expect(offenders).toEqual([]);
   });
+});
+
+// --- 2026-07-25 review finding 1: the mission upgrade must reach live banks ---
+
+describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
+  it("never contains the current default (that would make every apply a no-op decision)", () => {
+    expect(SUPERSEDED_RETAIN_MISSIONS).not.toContain(DEFAULT_RETAIN_MISSION);
+  });
+
+  // L1 (2026-07-25 re-review): the registry is append-only by convention only
+  // — pinning entry [2] alone let [0]/[1] be edited or reordered silently. An
+  // edit to a historical entry stops matching the bank text it was written for
+  // and silently downgrades that bank's mission to "customized, never upgrade".
+  // Pin length + every entry verbatim: appending is a one-line test change,
+  // editing or reordering is a deliberate, visible one.
+  it("pins every historical entry verbatim and in order (append-only)", () => {
+    expect(SUPERSEDED_RETAIN_MISSIONS).toEqual([
+      // 3e028eeb3 (2026-05) — the vendored plugin's original settings.json
+      // `retainMission`, pushed bank-side by lib/bank.py ensure_bank_mission.
+      "Extract technical decisions, architectural choices, user preferences, project context, and people/tool relationships. Ignore routine greetings and transient operational details.",
+      // d7c406994 (#458) — first switchroom-seeded DEFAULT_RETAIN_MISSION.
+      "Extract user preferences, ongoing projects, recurring commitments, " +
+        "important context, and durable facts that should help across future " +
+        "conversations. Skip one-off chatter and temporary task noise.",
+      // 9a9b7176c (#3418) — added the in-flight-narration carve-out. The text
+      // every live bank was carrying as of 2026-07-25.
+      "Extract user preferences, ongoing projects, recurring commitments, " +
+        "important context, and durable facts that should help across future " +
+        "conversations. Skip one-off chatter and temporary task noise, " +
+        "including in-flight workflow/process narration (a sub-task started, " +
+        "paused, or is still running) — only retain the outcome once a task " +
+        "actually completes or a decision is made.",
+    ]);
+    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(3);
+  });
+
+  it("carries the 2026-07-19 text every live bank was found holding on 2026-07-25", () => {
+    // Read verbatim off the fleet REST config surface during the review.
+    const live =
+      "Extract user preferences, ongoing projects, recurring commitments, " +
+      "important context, and durable facts that should help across future " +
+      "conversations. Skip one-off chatter and temporary task noise, " +
+      "including in-flight workflow/process narration (a sub-task started, " +
+      "paused, or is still running) — only retain the outcome once a task " +
+      "actually completes or a decision is made.";
+    expect(SUPERSEDED_RETAIN_MISSIONS).toContain(live);
+    expect(isUpgradableRetainMission(live)).toBe(true);
+  });
+
+  it("treats an unset mission as upgradable and a customized one as not", () => {
+    expect(isUpgradableRetainMission(null)).toBe(true);
+    expect(isUpgradableRetainMission("")).toBe(true);
+    expect(isUpgradableRetainMission("   ")).toBe(true);
+    expect(isUpgradableRetainMission("Only remember what Ken says about cricket.")).toBe(false);
+    // A byte-level edit of a known default is a customization, not a default.
+    expect(isUpgradableRetainMission(SUPERSEDED_RETAIN_MISSIONS[0] + " ")).toBe(false);
+  });
+});
+
+describe("decideRetainMissionUpgrade", () => {
+  it("upgrades a superseded default to the current one", () => {
+    for (const old of SUPERSEDED_RETAIN_MISSIONS) {
+      expect(decideRetainMissionUpgrade(undefined, old)).toEqual({
+        action: "upgrade",
+        mission: DEFAULT_RETAIN_MISSION,
+      });
+    }
+  });
+
+  it("leaves a customized mission alone", () => {
+    expect(decideRetainMissionUpgrade(undefined, "hand-written mission")).toEqual({
+      action: "none",
+    });
+  });
+
+  it("does nothing when the bank already carries the current default", () => {
+    expect(decideRetainMissionUpgrade(undefined, DEFAULT_RETAIN_MISSION)).toEqual({
+      action: "none",
+    });
+  });
+
+  it("operator yaml wins outright, even over a customized bank mission", () => {
+    expect(decideRetainMissionUpgrade("from yaml", "hand-written mission")).toEqual({
+      action: "config",
+      mission: "from yaml",
+    });
+  });
+});
+
+describe("fetchBankRetainMission", () => {
+  it("reads config.retain_mission off the REST config surface (NOT MCP get_bank)", async () => {
+    let seen = "";
+    const fetchImpl = vi.fn(async (url: string) => {
+      seen = url;
+      return {
+        ok: true,
+        json: async () => ({ config: { retain_mission: "current text" } }),
+      } as any;
+    });
+    const r = await fetchBankRetainMission("http://h:18888/mcp/", "a b", {
+      fetchImpl: fetchImpl as any,
+    });
+    expect(seen).toBe("http://h:18888/v1/default/banks/a%20b/config");
+    expect(r).toEqual({ ok: true, mission: "current text" });
+  });
+
+  it("returns mission null only when the key is present but null (genuinely unset)", async () => {
+    const fetchImpl = vi.fn(
+      async () => ({ ok: true, json: async () => ({ config: { retain_mission: null } }) }) as any,
+    );
+    expect(await fetchBankRetainMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }))
+      .toEqual({ ok: true, mission: null });
+  });
+
+  // M1 (2026-07-25 re-review): an unrecognised 200 body must NOT read as
+  // "unset". isUpgradableRetainMission(null) is true, so the loose behaviour
+  // would push the default over every customized mission fleet-wide the day
+  // Hindsight renests or renames the field.
+  it("reports failure — not 'unset' — when config is missing or the key is absent", async () => {
+    const shapes = [
+      {}, // no config at all
+      { config: null }, // config explicitly null
+      { config: {} }, // config present, retain_mission key absent
+      { config: { retain_mission: 42 } }, // key present, wrong type
+    ];
+    for (const body of shapes) {
+      const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => body }) as any);
+      expect(
+        await fetchBankRetainMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }),
+      ).toEqual({ ok: false, reason: "Unexpected shape" });
+    }
+  });
+
+  it("reports failure rather than throwing on a non-2xx", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 503 }) as any);
+    expect(await fetchBankRetainMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }))
+      .toEqual({ ok: false, reason: "HTTP 503" });
+  });
+});
+
+/**
+ * End-to-end outcome test for review finding 1.
+ *
+ * The headline of the original PR — a rewritten DEFAULT_RETAIN_MISSION —
+ * reached NO existing agent, because `reconcileAgent` pushed `retain_mission`
+ * only when the operator had set one in yaml. These tests drive the real
+ * `reconcileAgent` against a stubbed Hindsight and assert what actually goes
+ * out on the wire.
+ *
+ * Verified to bite (2026-07-25):
+ *  - reverting `src/agents/scaffold.ts` to the pre-fix reconcile block fails
+ *    "PUSHES the current default…" (no retain_mission on the wire at all).
+ *  - making `decideRetainMissionUpgrade` push unconditionally — the naive
+ *    version of this fix — fails "does NOT clobber…". That test cannot fail
+ *    on the pre-fix code (which pushed nothing); its job is to pin the guard
+ *    that makes the new push safe.
+ */
+describe("reconcileAgent — retain_mission upgrade on existing banks", () => {
+  const telegramConfig: TelegramConfig = {
+    bot_token: "123456:ABC-DEF",
+    forum_chat_id: "-1001234567890",
+  };
+  const switchroomConfig: SwitchroomConfig = {
+    agents: {},
+    telegram: telegramConfig,
+    defaults: {},
+    memory: { backend: "hindsight", config: { url: "http://hindsight.test/mcp/" } },
+  } as unknown as SwitchroomConfig;
+
+  const realFetch = globalThis.fetch;
+  let tmpDir = "";
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = "";
+  });
+
+  /**
+   * Stub Hindsight: MCP create_bank/update_bank succeed, and the REST config
+   * endpoint reports `currentMission`. Resolves with the update_bank args once
+   * the fire-and-forget mission push lands (reconcile does not await it).
+   */
+  function stubHindsight(
+    currentMission: string | null,
+    config: AgentConfig,
+  ): Promise<Record<string, unknown>> {
+    // Scaffold FIRST, memory disabled, so the fresh-agent seed path issues no
+    // Hindsight traffic that could be mistaken for the reconcile push.
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-retain-mission-"));
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
+    let resolveArgs: (a: Record<string, unknown>) => void;
+    const seen = new Promise<Record<string, unknown>>((r) => (resolveArgs = r));
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith("/config")) {
+        return {
+          ok: true,
+          json: async () => ({ config: { retain_mission: currentMission } }),
+        } as any;
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (body?.params?.name === "update_bank") {
+        resolveArgs(body.params.arguments as Record<string, unknown>);
+      }
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+    return seen;
+  }
+
+  function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+    return {
+      extends: "default",
+      topic_name: "Test Topic",
+      schedule: [],
+      ...overrides,
+    } as AgentConfig;
+  }
+
+  /**
+   * Scaffold the agent dir with memory DISABLED (so the fresh-agent seed path
+   * issues no Hindsight traffic and cannot be mistaken for the reconcile
+   * push), then reconcile with the hindsight-enabled config.
+   */
+  function runReconcile(config: AgentConfig) {
+    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+  }
+
+  it("PUSHES the current default when the bank holds a superseded default", async () => {
+    const config = makeAgentConfig();
+    const seen = stubHindsight(
+      SUPERSEDED_RETAIN_MISSIONS[SUPERSEDED_RETAIN_MISSIONS.length - 1],
+      config,
+    );
+    runReconcile(config);
+    const args = await seen;
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe(
+      DEFAULT_RETAIN_MISSION,
+    );
+  }, 15_000);
+
+  it("does NOT clobber an operator-customized bank mission", async () => {
+    const config = makeAgentConfig({ memory: { reflect_mission: "persona" } } as Partial<AgentConfig>);
+    const seen = stubHindsight("Remember only what Ken says about cricket.", config);
+    runReconcile(config);
+    const args = await seen;
+    expect(args.config_updates).toBeDefined();
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBeUndefined();
+  }, 15_000);
+
+  it("pushes the operator's yaml retain_mission verbatim when set", async () => {
+    const config = makeAgentConfig({
+      memory: { retain_mission: "operator text" },
+    } as Partial<AgentConfig>);
+    const seen = stubHindsight(SUPERSEDED_RETAIN_MISSIONS[0], config);
+    runReconcile(config);
+    const args = await seen;
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe("operator text");
+  }, 15_000);
+});
+
+/**
+ * End-to-end outcome test for the 2026-07-25 RE-review finding H1.
+ *
+ * `switchroom apply` calls `scaffoldAgent` for EVERY agent on every run — it
+ * never calls `reconcileAgent` (src/cli/apply.ts:1512). So the reconcile-side
+ * guard above was unreachable on the path operators actually run: scaffold
+ * pushed `retain_mission: userRetainMission ?? DEFAULT_RETAIN_MISSION`
+ * unconditionally, clobbering a customized mission on an existing bank.
+ *
+ * These tests drive the real `scaffoldAgent` with hindsight ENABLED against a
+ * stubbed Hindsight and assert what goes out on the wire.
+ *
+ * Verified to bite (2026-07-25): with scaffold's unconditional
+ * `?? DEFAULT_RETAIN_MISSION` seed restored, "does NOT clobber…" fails with
+ * the received value being DEFAULT_RETAIN_MISSION.
+ */
+describe("scaffoldAgent — retain_mission against an existing bank", () => {
+  const telegramConfig: TelegramConfig = {
+    bot_token: "123456:ABC-DEF",
+    forum_chat_id: "-1001234567890",
+  };
+  const switchroomConfig: SwitchroomConfig = {
+    agents: {},
+    telegram: telegramConfig,
+    defaults: {},
+    memory: { backend: "hindsight", config: { url: "http://hindsight.test/mcp/" } },
+  } as unknown as SwitchroomConfig;
+
+  const realFetch = globalThis.fetch;
+  let tmpDir = "";
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = "";
+  });
+
+  /**
+   * Stub Hindsight and run a scaffold of an ALREADY-SCAFFOLDED agent dir (the
+   * `switchroom apply` shape: apply re-scaffolds every existing agent). The
+   * first scaffold runs with memory disabled so it issues no Hindsight traffic
+   * that could be mistaken for the second one's push.
+   *
+   * `readOk: false` simulates the REST config read failing (a transient
+   * Hindsight hiccup) — the branch that must NOT clobber.
+   */
+  function runScaffoldOnExisting(
+    config: AgentConfig,
+    currentMission: string | null,
+    opts: { readOk?: boolean } = {},
+  ): Promise<Record<string, unknown>> {
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-scaffold-retain-"));
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
+    let resolveArgs: (a: Record<string, unknown>) => void;
+    const seen = new Promise<Record<string, unknown>>((r) => (resolveArgs = r));
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith("/config")) {
+        if (opts.readOk === false) return { ok: false, status: 503 } as any;
+        return {
+          ok: true,
+          json: async () => ({ config: { retain_mission: currentMission } }),
+        } as any;
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (body?.params?.name === "update_bank") {
+        resolveArgs(body.params.arguments as Record<string, unknown>);
+      }
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    return seen;
+  }
+
+  function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+    return {
+      extends: "default",
+      topic_name: "Test Topic",
+      schedule: [],
+      ...overrides,
+    } as AgentConfig;
+  }
+
+  it("does NOT clobber an operator-customized bank mission on re-scaffold", async () => {
+    const config = makeAgentConfig({
+      memory: { reflect_mission: "persona" },
+    } as Partial<AgentConfig>);
+    const args = await runScaffoldOnExisting(config, "CUSTOM operator mission");
+    expect(args.config_updates).toBeDefined();
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBeUndefined();
+  }, 15_000);
+
+  it("UPGRADES a bank still carrying a superseded default", async () => {
+    const config = makeAgentConfig();
+    const args = await runScaffoldOnExisting(
+      config,
+      SUPERSEDED_RETAIN_MISSIONS[SUPERSEDED_RETAIN_MISSIONS.length - 1],
+    );
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe(
+      DEFAULT_RETAIN_MISSION,
+    );
+  }, 15_000);
+
+  it("seeds the default into a genuinely fresh bank (mission unset)", async () => {
+    const config = makeAgentConfig();
+    const args = await runScaffoldOnExisting(config, null);
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe(
+      DEFAULT_RETAIN_MISSION,
+    );
+  }, 15_000);
+
+  it("pushes the operator's yaml retain_mission verbatim, over a customized bank", async () => {
+    const config = makeAgentConfig({
+      memory: { retain_mission: "operator text" },
+    } as Partial<AgentConfig>);
+    const args = await runScaffoldOnExisting(config, "CUSTOM operator mission");
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe("operator text");
+  }, 15_000);
+
+  // L3: the read-failure branches. A transient Hindsight hiccup must never be
+  // read as "unset" (which isUpgradableRetainMission treats as upgradable).
+  it("read fails + no yaml mission → pushes NO retain_mission", async () => {
+    const config = makeAgentConfig({
+      memory: { reflect_mission: "persona" },
+    } as Partial<AgentConfig>);
+    const args = await runScaffoldOnExisting(config, null, { readOk: false });
+    expect(args.config_updates).toBeDefined();
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBeUndefined();
+  }, 15_000);
+
+  it("read fails + yaml mission set → still pushes the config mission", async () => {
+    const config = makeAgentConfig({
+      memory: { retain_mission: "operator text" },
+    } as Partial<AgentConfig>);
+    const args = await runScaffoldOnExisting(config, null, { readOk: false });
+    expect((args.config_updates as Record<string, unknown>).retain_mission).toBe("operator text");
+  }, 15_000);
+
+  /**
+   * N1 (PR #3529 review): post-upgrade steady state is "nothing to update" —
+   * the `default` profile contributes no mission extras, the bank carries a
+   * customized retain_mission, and no bank_mission is configured. The scaffold
+   * site used to fire `update_bank` with `{}` anyway (two HTTP round-trips per
+   * agent per apply) and print a green success line for a call that changed
+   * nothing. Reconcile already guarded on emptiness; scaffold now does too.
+   */
+  function runScaffoldNoOp(config: AgentConfig): Promise<{
+    updateBankCalls: number;
+    logs: string[];
+  }> {
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-scaffold-noop-"));
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
+    let updateBankCalls = 0;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith("/config")) {
+        return {
+          ok: true,
+          json: async () => ({ config: { retain_mission: "CUSTOM operator mission" } }),
+        } as any;
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (body?.params?.name === "update_bank") updateBankCalls += 1;
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      logs.push(a.map(String).join(" "));
+    });
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    return flushPendingBankOps(10_000).then(() => {
+      logSpy.mockRestore();
+      return { updateBankCalls, logs };
+    });
+  }
+
+  it("sends NO update_bank when there is nothing to update", async () => {
+    const { updateBankCalls } = await runScaffoldNoOp(makeAgentConfig());
+    expect(updateBankCalls).toBe(0);
+  }, 15_000);
+
+  it("prints no 'Bank missions updated' line when nothing was updated", async () => {
+    const { logs } = await runScaffoldNoOp(makeAgentConfig());
+    expect(logs.some((l) => l.includes("Bank missions updated"))).toBe(false);
+  }, 15_000);
+
+  it("still updates (and says so) when the profile contributes mission extras", async () => {
+    const config = makeAgentConfig({
+      memory: { reflect_mission: "persona" },
+    } as Partial<AgentConfig>);
+    const { updateBankCalls, logs } = await runScaffoldNoOp(config);
+    expect(updateBankCalls).toBe(1);
+    expect(logs.some((l) => l.includes("Bank missions updated"))).toBe(true);
+  }, 15_000);
+});
+
+/**
+ * L2 (2026-07-25 re-review): scaffold/reconcile start their bank-op chain
+ * fire-and-forget because both functions are synchronous. Node normally drains
+ * it, but `runApply` hard-`process.exit()`s (codes 4/5/6) in vault phases that
+ * run AFTER the scaffold loop, which would truncate an in-flight push — and
+ * the new retain-mission read widened that window. `flushPendingBankOps` makes
+ * the drain deterministic; apply awaits it right after the scaffold loop.
+ */
+describe("flushPendingBankOps", () => {
+  const telegramConfig: TelegramConfig = {
+    bot_token: "123456:ABC-DEF",
+    forum_chat_id: "-1001234567890",
+  };
+  const switchroomConfig: SwitchroomConfig = {
+    agents: {},
+    telegram: telegramConfig,
+    defaults: {},
+    memory: { backend: "hindsight", config: { url: "http://hindsight.test/mcp/" } },
+  } as unknown as SwitchroomConfig;
+
+  const realFetch = globalThis.fetch;
+  let tmpDir = "";
+
+  afterEach(async () => {
+    await flushPendingBankOps(5_000);
+    globalThis.fetch = realFetch;
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = "";
+  });
+
+  it("resolves immediately when nothing is in flight", async () => {
+    // The beforeEach reset guarantees the registry really is empty, so a zero
+    // budget is a genuine discriminator: only the size===0 early return can
+    // return true here. With a leftover chain this would resolve false.
+    expect(__pendingBankOpsCountForTests()).toBe(0);
+    expect(await flushPendingBankOps(0)).toBe(true);
+  });
+
+  // N2b: entries must self-evict on settle, otherwise a long-lived process
+  // (setup / agent / doctor / rename / the reconcile bridge all push, none
+  // flush) grows the registry by one promise per scaffold, forever.
+  it("drops settled chains without anyone calling the flush", async () => {
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-evict-"));
+    globalThis.fetch = (async (url: any) => {
+      if (String(url).endsWith("/config")) {
+        return { ok: true, json: async () => ({ config: { retain_mission: null } }) } as any;
+      }
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+
+    const config = { extends: "default", topic_name: "T", schedule: [] } as unknown as AgentConfig;
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    expect(__pendingBankOpsCountForTests()).toBe(1);
+
+    const deadline = Date.now() + 10_000;
+    while (__pendingBankOpsCountForTests() > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(__pendingBankOpsCountForTests()).toBe(0);
+  }, 20_000);
+
+  it("waits for the mission push a synchronous scaffold left in flight", async () => {
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-flush-"));
+    let updatePushed = false;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      // A slow Hindsight: every call takes a beat, so the push is genuinely
+      // still in flight when scaffoldAgent returns.
+      await new Promise((r) => setTimeout(r, 20));
+      if (u.endsWith("/config")) {
+        return { ok: true, json: async () => ({ config: { retain_mission: null } }) } as any;
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (body?.params?.name === "update_bank") updatePushed = true;
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+
+    const config = { extends: "default", topic_name: "T", schedule: [] } as unknown as AgentConfig;
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    // scaffoldAgent is synchronous: the push has NOT landed on return.
+    expect(updatePushed).toBe(false);
+
+    expect(await flushPendingBankOps(10_000)).toBe(true);
+    // After the flush it has — this is exactly what apply's exit paths needed.
+    expect(updatePushed).toBe(true);
+  }, 20_000);
+
+  it("returns false rather than hanging when the chain outlives the deadline", async () => {
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-flush-slow-"));
+    globalThis.fetch = (async () => {
+      await new Promise((r) => setTimeout(r, 3_000));
+      return { ok: true, headers: new Map(), json: async () => ({ config: { retain_mission: null } }), text: async () => "{}" } as any;
+    }) as any;
+
+    const config = { extends: "default", topic_name: "T", schedule: [] } as unknown as AgentConfig;
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    expect(await flushPendingBankOps(50)).toBe(false);
+  }, 20_000);
 });
 
 describe("updateBankMissions", () => {

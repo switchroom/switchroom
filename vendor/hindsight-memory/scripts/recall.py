@@ -65,6 +65,7 @@ from lib.content import (
 from lib.daemon import get_api_url
 from lib.directives import (
     DIRECTIVES_CACHE_TTL_SECONDS,
+    count_omitted_directives,
     fetch_active_directives_cached,
     format_active_directives_block,
 )
@@ -1279,6 +1280,8 @@ def main():
                 "query": None,  # no recall query composed on a cache hit
                 "result_count": None,  # not known on cache hit
                 "directive_count": None,
+                # No directives block is built on a cache hit.
+                "directives_omitted": None,
                 "demoted_count": 0,
                 "capped": False,
                 "cache_hit": True,
@@ -1812,6 +1815,14 @@ def main():
         "query": query[:200],
         "result_count": len(results),
         "directive_count": len(directives),
+        # Switchroom 2026-07-25 review finding 2 — how many active directives
+        # MAX_DIRECTIVES dropped from this turn's <active_directives> block.
+        # The stderr warning in lib/directives.py is NOT operator-visible
+        # (Claude Code swallows hook stderr on a zero exit — verified fleet-wide),
+        # so this row is the durable, queryable record that real hard rules
+        # never reached the agent. >0 here means the bank is over cap and the
+        # doctor's directive-count check will be FAILing too.
+        "directives_omitted": count_omitted_directives(directives),
         "demoted_count": demoted_count,
         "overlap_dropped": overlap_dropped,
         "capped": capped,

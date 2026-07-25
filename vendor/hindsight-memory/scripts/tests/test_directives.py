@@ -24,6 +24,7 @@ from lib.directives import (  # noqa: E402
     DIRECTIVES_CACHE_TTL_SECONDS,
     MAX_DIRECTIVES,
     _cache_name,
+    count_omitted_directives,
     fetch_active_directives,
     fetch_active_directives_cached,
     format_active_directives_block,
@@ -181,20 +182,89 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
         self.assertIn("Line one.\nLine two.\nLine three.", out)
 
     def test_truncates_at_cap_with_footer(self):
-        # 20 synthetic directives — should truncate to MAX_DIRECTIVES with
-        # a "(+N more, omitted)" footer.
+        # MAX_DIRECTIVES + 5 synthetic directives — should truncate to
+        # MAX_DIRECTIVES with a "(+N more, omitted)" footer.
+        total = MAX_DIRECTIVES + 5
         directives = [
-            _directive(f"d{i}", f"content {i}", priority=20 - i) for i in range(20)
+            _directive(f"d{i}", f"content {i}", priority=total - i) for i in range(total)
         ]
         out = format_active_directives_block(directives)
-        # Cap should be 15 by default.
-        self.assertEqual(MAX_DIRECTIVES, 15)
-        self.assertIn("1. [P20] d0", out)
+        self.assertIn(f"1. [P{total}] d0", out)
         self.assertIn(f"{MAX_DIRECTIVES}. [P", out)
-        # 16th item should NOT appear.
+        # The first item past the cap must NOT appear.
         self.assertNotIn(f"{MAX_DIRECTIVES + 1}. [P", out)
         # Footer with the right omitted count.
-        self.assertIn(f"(+{20 - MAX_DIRECTIVES} more, omitted)", out)
+        self.assertIn("(+5 more, omitted)", out)
+
+    def test_cap_is_30_and_clears_the_observed_fleet_maximum(self):
+        """The cap must clear the busiest real bank (24 active directives).
+
+        Regression: at MAX_DIRECTIVES=15 a 24-directive bank had 9 of its
+        rules dropped from every turn's prompt. This asserts the OUTCOME —
+        all 24 directives are rendered, and no truncation footer/warning is
+        produced — not merely that the constant changed.
+        """
+        self.assertEqual(MAX_DIRECTIVES, 30)
+        directives = [
+            _directive(f"d{i}", f"content {i}", priority=24 - i) for i in range(24)
+        ]
+        with patch("sys.stderr", new=StringIO()) as fake_err:
+            out = format_active_directives_block(directives)
+        for i in range(24):
+            self.assertIn(f"d{i}: content {i}", out)
+        self.assertIn("24. [P", out)
+        self.assertNotIn("more, omitted", out)
+        self.assertEqual(fake_err.getvalue(), "")
+
+    def test_truncation_emits_a_stderr_breadcrumb_naming_the_dropped_count(self):
+        """Truncation writes a `[Hindsight]` line to stderr naming total, cap
+        and dropped count, alongside the in-prompt "(+N more, omitted)" footer.
+
+        Scope note (2026-07-25 review finding 2): this asserts ONLY that the
+        line is written to stderr. It does NOT — and cannot — show that an
+        operator ever sees it; hook stderr is swallowed by Claude Code on a
+        zero exit (zero `[Hindsight]` lines across all 12 live containers).
+        The operator-visible signals are the `directives_omitted` recall_log
+        field and `switchroom doctor`'s directive-count row, tested elsewhere.
+        """
+        total = MAX_DIRECTIVES + 4
+        directives = [
+            _directive(f"d{i}", f"c{i}", priority=total - i) for i in range(total)
+        ]
+        with patch("sys.stderr", new=StringIO()) as fake_err:
+            out = format_active_directives_block(directives)
+        err = fake_err.getvalue()
+        self.assertNotEqual(err, "", "truncation must write a stderr breadcrumb")
+        self.assertIn("[Hindsight]", err)
+        self.assertIn(str(total), err)
+        self.assertIn(f"MAX_DIRECTIVES={MAX_DIRECTIVES}", err)
+        self.assertIn("4", err)  # the dropped count
+        # The in-prompt footer is still emitted (agent-facing signal).
+        self.assertIn("(+4 more, omitted)", out)
+
+    def test_count_omitted_directives_matches_the_rendered_footer(self):
+        """The recall_log's `directives_omitted` number must equal what the
+        block actually dropped — it is the operator-visible record of it."""
+        total = MAX_DIRECTIVES + 4
+        directives = [
+            _directive(f"d{i}", f"c{i}", priority=total - i) for i in range(total)
+        ]
+        with patch("sys.stderr", new=StringIO()):
+            out = format_active_directives_block(directives)
+        self.assertEqual(count_omitted_directives(directives), 4)
+        self.assertIn("(+4 more, omitted)", out)
+        # Under cap → nothing omitted, and no footer to disagree with.
+        under = directives[:2]
+        self.assertEqual(count_omitted_directives(under), 0)
+        self.assertNotIn("more, omitted", format_active_directives_block(under))
+        # Honours a custom cap the same way the formatter does.
+        self.assertEqual(count_omitted_directives(directives, max_directives=5), total - 5)
+
+    def test_no_warning_when_nothing_is_truncated(self):
+        directives = [_directive("only", "single", priority=5)]
+        with patch("sys.stderr", new=StringIO()) as fake_err:
+            format_active_directives_block(directives)
+        self.assertEqual(fake_err.getvalue(), "")
 
     def test_no_footer_when_under_cap(self):
         directives = [_directive("only", "single", priority=5)]
@@ -208,7 +278,8 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
 
     def test_custom_cap_respected(self):
         directives = [_directive(f"d{i}", f"c{i}", priority=10) for i in range(5)]
-        out = format_active_directives_block(directives, max_directives=2)
+        with patch("sys.stderr", new=StringIO()):
+            out = format_active_directives_block(directives, max_directives=2)
         self.assertIn("1. [P10] d0", out)
         self.assertIn("2. [P10] d1", out)
         self.assertNotIn("3. [P10] d2", out)
