@@ -443,6 +443,203 @@ assert "entity_records=phase1.entities.entity_records" in (BASE / "retain/orches
 print("switchroom hindsight unit_entities FK-race patch: reassert_entities + entity_records threading applied (Phase-2 resurrects concurrently-pruned parent in same txn)")
 PYEOF
 
+# BM25 compound-token fix: `tokenize_query` in engine/search/retrieval.py did
+#   re.sub(r"[^\w\s]", " ", query_text.lower()).split()
+# which SHREDS every punctuated identifier. Postgres does not: verified against
+# postgres 16, `to_tsvector('english', 'rollout v0.19.17 at 19:33:13')` yields
+# `'v0.19.17':2 '19':4 '33':5 '13':6` — the version is ONE lexeme. So a query
+# for `v0.19.17` was sent to to_tsquery as `v0 | 19 | 17` and had ZERO overlap
+# with the discriminating lexeme, while the stripped digits became active
+# noise. Measured on postgres 16 with ts_rank_cd over a 3-doc corpus, query
+# `rollout | v0 | 19 | 17`:
+#   noise-generic  (repeats the word "rollout")          0.30
+#   noise-clock    (matches the bare `19` in `19:33:13`) 0.20
+#   target-version (actually names v0.19.17)             0.10   <- ranked LAST
+#
+# Fix: tokenize_query additionally emits the INTACT compound tokens alongside
+# the fragments it already emitted. Re-measured with `rollout | v0.19.17 | v0 |
+# 19 | 17`, target-version rises 0.10 -> 0.20 and the inversion against the
+# clock-timestamp record is gone.
+#
+# This is STRICTLY ADDITIVE: the token list is a superset of upstream's, every
+# dialect still ORs the tokens together, and therefore the emitted query can
+# only ever match MORE documents than upstream — never fewer. That property is
+# the whole safety argument for changing a shared BM25 arm under 12 live
+# agents, and it is asserted behaviourally in
+# tests/docker/hindsight-search-patches.test.ts.
+#
+# WITHDRAWN — a second half of this patch also rewrote the native tsquery in
+# sql/postgresql.py to `compound | (f1 & f2 & ...)`, dropping the standalone
+# fragments so they only scored when ALL co-occurred. That bought a little
+# noise suppression (the clock-timestamp record stopped matching at all) at the
+# cost of narrowing matching for EVERY `.`/`-`/`/` token, which is not a rare
+# path. Verified on postgres 16:
+#   * doc `shipped in 2026 during july` no longer matched a query containing
+#     `2026-07-25` — and every fact in these banks carries a `| When:` date
+#     stamp, so this is the common path, not a corner case.
+#   * doc `a report about art` no longer matched `state-of-the-art`.
+# The stated rationale was also wrong: to_tsvector does NOT index every
+# compound as one lexeme. Postgres expands `state-of-the-art` into the phrase
+# query `'state-of-the-art' <-> 'state' <3> 'art'` and `github.com/foo/bar`
+# into `'github.com/foo/bar' <-> 'github.com' <-> '/foo/bar'`; only semvers
+# like `v0.19.17` happen to be a single lexeme. Losing real matches on a
+# candidate-generation arm is strictly worse than ranking some noise highly —
+# a document that never enters the candidate set can never be reranked back in
+# — so sql/postgresql.py is left untouched.
+#
+# Scope guards:
+#   * The compound separators are limited to . / - (see _COMPOUND_TOKEN_RE).
+#     None is a tsquery operator, so the compound needs no quoting/escaping and
+#     a hostile query can never turn into a to_tsquery syntax error (which
+#     would take out the whole BM25 arm — strictly worse than the bug).
+#     Confirmed on postgres 16: to_tsquery parses `2026-07-25`,
+#     `state-of-the-art` and `github.com/foo/bar` without error.
+#   * Every dialect benefits identically and none changes shape: each simply
+#     receives one extra token. Oracle Text filters `-`-bearing tokens and
+#     keeps the fragments, so its behaviour is unchanged apart from also
+#     seeing the intact token.
+#
+# Live impact is not merely latent: BM25 feeds candidate generation and this
+# deployment sets HINDSIGHT_API_RERANKER_MAX_CANDIDATES=150 (below the code
+# default of 300), so noise inflating RRF pushes genuine hits past the cut on
+# large banks. Self-verifying; guarded by
+# tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+f = pathlib.Path("/app/api/hindsight_api/engine/search/retrieval.py")
+s = f.read_text()
+
+OLD = (
+    'def tokenize_query(query_text: str) -> list[str]:\n'
+    '    """Normalize query text and split into BM25 tokens.\n'
+    '\n'
+    '    Strips punctuation, lowercases, and splits on whitespace.\n'
+    '    Returns an empty list when the query contains no word characters.\n'
+    '    """\n'
+    '    return re.sub(r"[^\\w\\s]", " ", query_text.lower()).split()\n'
+)
+NEW = (
+    '# switchroom: a "compound" token is a word-char run joined by . / - — semvers\n'
+    '# (v0.19.17), paths (a/b.c), hyphenated names (foo-bar), issue/commit refs.\n'
+    "# Shredding these left zero overlap on the one discriminating term, so the\n"
+    '# intact token is emitted too. Separators are restricted to . / - precisely\n'
+    '# because none of them is a tsquery operator, so the intact token is always\n'
+    '# safe to embed in to_tsquery input unquoted.\n'
+    '_COMPOUND_TOKEN_RE = re.compile(r"\\w+(?:[./-]\\w+)+")\n'
+    '\n'
+    '\n'
+    'def tokenize_query(query_text: str) -> list[str]:\n'
+    '    """Normalize query text and split into BM25 tokens.\n'
+    '\n'
+    '    Strips punctuation, lowercases, and splits on whitespace, then APPENDS the\n'
+    '    intact compound tokens (semvers, paths, hyphenated identifiers) so the\n'
+    '    discriminating term survives alongside its fragments.\n'
+    '\n'
+    '    switchroom: strictly additive — the result is always a superset of the\n'
+    '    upstream token list, so every dialect\'s OR-joined query can only match more\n'
+    '    documents than upstream, never fewer.\n'
+    '\n'
+    '    Returns an empty list when the query contains no word characters.\n'
+    '    """\n'
+    '    lowered = query_text.lower()\n'
+    '    tokens = re.sub(r"[^\\w\\s]", " ", lowered).split()\n'
+    '    if not tokens:\n'
+    '        return []\n'
+    '    for match in _COMPOUND_TOKEN_RE.finditer(lowered):\n'
+    '        compound = match.group(0)\n'
+    '        if compound not in tokens:\n'
+    '            tokens.append(compound)\n'
+    '    return tokens\n'
+)
+
+n = s.count(OLD)
+assert n == 1, (
+    f"switchroom hindsight BM25 compound-token patch: anchor found {n}x (expected 1) "
+    "in search/retrieval.py — upstream reformatted tokenize_query; re-author this "
+    "patch in docker/Dockerfile.hindsight"
+)
+s = s.replace(OLD, NEW, 1)
+f.write_text(s)
+
+t = f.read_text()
+assert "_COMPOUND_TOKEN_RE" in t, "switchroom hindsight BM25 compound-token patch: _COMPOUND_TOKEN_RE missing after patch"
+assert "if compound not in tokens:" in t, "switchroom hindsight BM25 compound-token patch: compound append missing after patch"
+
+# The withdrawn tsquery-narrowing half must stay withdrawn: sql/postgresql.py is
+# untouched, so the native dialect still ORs every token (superset semantics).
+pg = pathlib.Path("/app/api/hindsight_api/engine/sql/postgresql.py").read_text()
+assert "compound_fragments" not in pg, "switchroom hindsight BM25 compound-token patch: the withdrawn tsquery-narrowing half is present again — it drops real matches (see the block comment)"
+assert '        return " | ".join(tokens)' in pg, "switchroom hindsight BM25 compound-token patch: native tsquery is no longer a plain OR join — superset guarantee lost"
+print("switchroom hindsight BM25 compound-token patch: intact compound tokens appended (strict superset of upstream tokens); native tsquery left as a plain OR join")
+PYEOF
+
+# Empty-TimeoutError-message fix: both retry loops in
+# engine/providers/litellm_llm.py end their timeout handler with a bare
+# `raise`, which re-raises the asyncio.TimeoutError produced by
+# `asyncio.wait_for`. That exception carries NO args, so `str(e)` is the empty
+# string and every operator-facing surface that formats it renders the useless
+#   `chunk 0: TimeoutError: `
+# with no timeout value, no attempt count, and no scope — the three facts the
+# handler had already logged one line earlier. Re-raise a message-carrying
+# TimeoutError chained (`from e`) off the original instead.
+#
+# Compatibility checked before applying: on Python 3.11 (this image runs
+# 3.11.15) `asyncio.TimeoutError is TimeoutError`, so every upstack matcher —
+# `except TimeoutError`, `except asyncio.TimeoutError`,
+# `except (TimeoutError, asyncio.TimeoutError, LiteLLMTimeout)`, and
+# db_utils.py's `isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError))`
+# — still matches. A matcher keyed specifically on litellm's `Timeout` class
+# would NOT; grepping engine/ found no such matcher (the only LiteLLMTimeout
+# references are the two handlers being patched here and its import).
+#
+# Both handlers are patched: the `call` path and the tool-calling path have the
+# identical defect. Self-verifying; guarded by
+# tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+f = pathlib.Path("/app/api/hindsight_api/engine/providers/litellm_llm.py")
+s = f.read_text()
+
+EDITS = []
+for label in ("call", "tool call"):
+    EDITS.append((
+        "                logger.error(\n"
+        f'                    f"LiteLLM {label} timed out after {{self.timeout}}s on {{attempt + 1}} attempts "\n'
+        '                    f"({exc_name}, scope={scope})"\n'
+        "                )\n"
+        "                raise\n",
+
+        "                logger.error(\n"
+        f'                    f"LiteLLM {label} timed out after {{self.timeout}}s on {{attempt + 1}} attempts "\n'
+        '                    f"({exc_name}, scope={scope})"\n'
+        "                )\n"
+        "                # switchroom: a bare `raise` re-raises the asyncio.TimeoutError from\n"
+        "                # wait_for, whose str() is empty — operators saw `TimeoutError: ` with\n"
+        "                # no cause. Carry the same facts the log line has.\n"
+        "                raise TimeoutError(\n"
+        f'                    f"LiteLLM {label} timed out after {{self.timeout}}s on {{attempt + 1}} attempts "\n'
+        '                    f"({exc_name}, scope={scope})"\n'
+        "                ) from e\n",
+    ))
+
+for anchor, repl in EDITS:
+    n = s.count(anchor)
+    assert n == 1, (
+        f"switchroom hindsight timeout-message patch: anchor found {n}x (expected 1) in "
+        "engine/providers/litellm_llm.py — upstream reformatted the timeout handler; "
+        f"re-author this patch in docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[1]!r}"
+    )
+    s = s.replace(anchor, repl, 1)
+
+f.write_text(s)
+t = f.read_text()
+assert t.count("raise TimeoutError(") == 2, "switchroom hindsight timeout-message patch: expected exactly 2 message-carrying raises after patch"
+assert t.count(") from e\n") >= 2, "switchroom hindsight timeout-message patch: exception chaining missing after patch"
+print("switchroom hindsight timeout-message patch: LiteLLM timeout re-raises now carry timeout/attempts/scope instead of an empty message")
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

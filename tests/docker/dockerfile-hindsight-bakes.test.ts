@@ -220,6 +220,105 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("never rewrites the caller-visible cross_encoder_score_normalized field", () => {
+    // engine/memory_engine.py applies the agent-supplied `min_scores.reranker`
+    // floor DIRECTLY to cross_encoder_score_normalized, and `min_scores` is a
+    // documented MCP recall parameter any agent may pass. The field is an
+    // ABSOLUTE, caller-visible quantity — no switchroom patch may rewrite it.
+    //
+    // A withdrawn revision min-max rescaled it onto [0.1, 1.0] whenever the
+    // spread fell under a threshold. Measured against the pinned upstream
+    // image, that dropped 78 of 100 results at `min_scores: {reranker: 0.8}`
+    // which upstream returned, was candidate-set-relative, and amplified 1e-7
+    // of float noise into a ranking decision. This guard keeps it out.
+    expect(dockerfile).not.toMatch(/_CE_SATURATION_SPREAD_THRESHOLD/);
+    expect(dockerfile).not.toMatch(/_ce_spread/);
+    expect(dockerfile).not.toMatch(/_ce_lo/);
+
+    // Structural rather than exact-string: ANY assignment to the field trips
+    // this, however it is reformatted or renamed around. The sole permitted
+    // writer is upstream's own is_passthrough_reranker reseed, which patches
+    // may quote verbatim as an anchor but must never alter.
+    const ceWrites = [
+      ...dockerfile.matchAll(/sr\.cross_encoder_score_normalized\s*=(?!=)[^\n]*/g),
+    ].map((m) => m[0]);
+    expect(
+      ceWrites.filter((w) => !w.includes("1.0 - (0.9 * new_rank / denom)")),
+      "only upstream's passthrough reseed may assign cross_encoder_score_normalized — " +
+        "it carries the absolute min_scores.reranker floor",
+    ).toEqual([]);
+
+    // No re-weighting of the alphas or the boost formulae themselves.
+    expect(dockerfile).not.toMatch(/_(RECENCY|TEMPORAL|PROOF_COUNT)_ALPHA[^\n]*=\s*\d/);
+    expect(dockerfile).not.toMatch(/(recency|temporal|proof_count)_boost\s*=\s*1\.0 \+ \d/);
+  });
+
+  it("keeps the BM25 compound-token fix (assert-guarded, fail-loud)", () => {
+    // tokenize_query shredded `v0.19.17` into v0/19/17, but to_tsvector indexes
+    // it as ONE lexeme — zero overlap on the discriminating term, and the
+    // stripped `19` then matched clock timestamps like 19:33:13. The patch
+    // APPENDS the intact compound token, keeping the fragments, so the emitted
+    // token list is a strict superset of upstream's.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight BM25 compound-token patch: anchor found \{n\}x/,
+    );
+    // Separators restricted to . / - so the token is always tsquery-safe unquoted.
+    expect(dockerfile).toMatch(
+      /_COMPOUND_TOKEN_RE = re\.compile\(r"\\\\w\+\(\?:\[\.\/-\]\\\\w\+\)\+"\)/,
+    );
+    expect(dockerfile).toMatch(/if compound not in tokens:/);
+    // Append, never substitute — the upstream fragments must survive.
+    expect(dockerfile).toMatch(/tokens\.append\(compound\)/);
+
+    // ---- Negative guards: the withdrawn tsquery-narrowing half must not
+    // return. Emitting `compound | (f1 & f2 & ...)` and dropping the standalone
+    // fragments narrowed matching for EVERY ./-// token — verified on postgres
+    // 16, a doc saying `shipped in 2026 during july` stopped matching a query
+    // containing `2026-07-25`, and `a report about art` stopped matching
+    // `state-of-the-art`. Every fact in these banks carries a date stamp.
+    expect(dockerfile).not.toMatch(/compound_fragments: set\[str\] = set\(\)/);
+    expect(dockerfile).not.toMatch(/compound_fragments\.update/);
+    expect(dockerfile).not.toMatch(/groups\.append/);
+    // sql/postgresql.py must not be touched at all by this patch.
+    expect(dockerfile).not.toMatch(/apply\("sql\/postgresql\.py"/);
+
+    // Post-replace re-assertions (verification-on-build), including the
+    // build-time guard that the native tsquery is still a plain OR join.
+    expect(dockerfile).toMatch(/assert "_COMPOUND_TOKEN_RE" in t,/);
+    expect(dockerfile).toMatch(/assert "compound_fragments" not in pg,/);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight BM25 compound-token patch: intact compound tokens appended/,
+    );
+  });
+
+  it("keeps the LiteLLM empty-TimeoutError-message fix (assert-guarded, fail-loud)", () => {
+    // Both retry loops ended their timeout handler with a bare `raise`,
+    // re-raising an asyncio.TimeoutError with no args — so operators saw
+    // `chunk 0: TimeoutError: ` with no timeout, attempt count, or scope. The
+    // patch re-raises a message-carrying TimeoutError chained off the original
+    // (safe on 3.11, where asyncio.TimeoutError IS TimeoutError, so every
+    // upstack matcher still matches).
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight timeout-message patch: anchor found \{n\}x/,
+    );
+    // Message-carrying, chained re-raise.
+    expect(dockerfile).toMatch(/"                raise TimeoutError\(\\n"/);
+    expect(dockerfile).toMatch(/"                \) from e\\n"/);
+    // BOTH handlers (the standard `call` path and the tool-calling path).
+    expect(dockerfile).toMatch(/for label in \("call", "tool call"\):/);
+    // Post-replace re-assertions (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert t\.count\("raise TimeoutError\("\) == 2,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight timeout-message patch: LiteLLM timeout re-raises now carry/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
