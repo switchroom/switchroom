@@ -433,6 +433,43 @@ class RecallTelemetryLogTests(unittest.TestCase):
         self.assertEqual(entries[0]["demoted_count"], 1)
         self.assertEqual(entries[0]["memory_ids"], ["k1"])
 
+    def test_logs_injected_score_aggregates_post_slice(self):
+        """#3541 recall-QUALITY telemetry: the row must carry min/median/max
+        of `scores.final` for the memories actually INJECTED — i.e. after the
+        head-slice, not the pre-gate candidate pool. Without this, a rollout
+        where the gate stops dropping and the cap fills every turn is
+        indistinguishable from one feeding 8 mediocre memories per turn.
+        """
+        def _scored(text, mem_id, final):
+            m = _memory(text, mem_id=mem_id)
+            m["scores"] = {"final": final}
+            return m
+
+        memories = [
+            _scored("low", "id-low", 0.10),
+            _scored("high", "id-high", 0.90),
+            _scored("mid", "id-mid", 0.80),
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        _run_main_with(client, config_extra={"recallMaxMemories": 2})
+        e = self._read_log()[0]
+        # Sorted desc then sliced → the 0.10 memory is NOT injected, and must
+        # not appear in the aggregates.
+        self.assertEqual(e["memory_ids"], ["id-high", "id-mid"])
+        self.assertAlmostEqual(e["injected_score_max"], 0.90, places=6)
+        self.assertAlmostEqual(e["injected_score_min"], 0.80, places=6)
+        self.assertAlmostEqual(e["injected_score_median"], 0.85, places=6)
+
+    def test_injected_score_aggregates_are_null_without_scores(self):
+        """Score-less results (or an empty set) must log nulls, never a
+        sentinel like -inf that would corrupt a dashboard average."""
+        client = _FakeClient(directives=[], memories=[_memory("x", mem_id="x1")])
+        _run_main_with(client)
+        e = self._read_log()[0]
+        self.assertIsNone(e["injected_score_min"])
+        self.assertIsNone(e["injected_score_median"])
+        self.assertIsNone(e["injected_score_max"])
+
     def test_no_log_when_plugin_data_unset(self):
         # If CLAUDE_PLUGIN_DATA isn't set, the writer no-ops silently —
         # we don't want a stray log file in the working directory.
@@ -559,6 +596,53 @@ class ContainmentOverlapUnitTests(unittest.TestCase):
         self.assertEqual(
             recall.containment_overlap("deploy, server!", "deploy server"),
             1.0,
+        )
+
+
+class InjectedScoreStatsUnitTests(unittest.TestCase):
+    """#3541 — aggregates for the injected set. Must be total and non-fatal:
+    telemetry can never take recall down."""
+
+    @staticmethod
+    def _m(final):
+        return {"text": "t", "scores": {"final": final}}
+
+    def test_odd_count_uses_middle_value(self):
+        s = recall._injected_score_stats([self._m(0.1), self._m(0.9), self._m(0.5)])
+        self.assertEqual(s["injected_score_min"], 0.1)
+        self.assertEqual(s["injected_score_median"], 0.5)
+        self.assertEqual(s["injected_score_max"], 0.9)
+
+    def test_even_count_averages_the_two_middles(self):
+        s = recall._injected_score_stats(
+            [self._m(0.2), self._m(0.4), self._m(0.6), self._m(0.8)]
+        )
+        self.assertEqual(s["injected_score_median"], 0.5)
+
+    def test_empty_set_is_all_none(self):
+        self.assertEqual(
+            recall._injected_score_stats([]),
+            {
+                "injected_score_min": None,
+                "injected_score_median": None,
+                "injected_score_max": None,
+            },
+        )
+
+    def test_scoreless_entries_are_excluded_not_treated_as_negative_infinity(self):
+        s = recall._injected_score_stats([self._m(0.6), {"text": "no scores"}])
+        self.assertEqual(s["injected_score_min"], 0.6)
+        self.assertEqual(s["injected_score_max"], 0.6)
+
+    def test_malformed_input_returns_nulls_instead_of_raising(self):
+        # A telemetry error must never propagate into the recall path.
+        self.assertEqual(
+            recall._injected_score_stats(object()),
+            {
+                "injected_score_min": None,
+                "injected_score_median": None,
+                "injected_score_max": None,
+            },
         )
 
 
@@ -803,12 +887,41 @@ class OverlapGateQueryLengthInvarianceTests(unittest.TestCase):
             a = recall._overlap_tokens(query)
             b = recall._overlap_tokens(mem)
             jac = (len(a & b) / len(a | b)) if (a and b) else 0.0
+            score = recall.containment_overlap(query, mem)
             self.assertGreaterEqual(
-                recall.containment_overlap(query, mem) + 1e-12,
+                score + 1e-12,
                 jac,
                 f"containment scored BELOW jaccard for {mem[:40]!r} — "
                 f"this change could drop a memory production keeps",
             )
+            # Upper bound + exact value. Review finding: the lower bound
+            # alone is unfalsifiable for ANY implementation dividing by |M|
+            # (a constant `return 1.0` satisfies it), so it survived every
+            # mutation and proved nothing. These two pin the metric.
+            self.assertLessEqual(score, 1.0, f"containment exceeded 1.0 for {mem[:40]!r}")
+            expected = (len(a & b) / len(b)) if b else 0.0
+            self.assertAlmostEqual(
+                score, expected, places=9,
+                msg=f"containment is not |Q n M| / |M| for {mem[:40]!r}",
+            )
+
+    def test_strict_subset_memory_scores_strictly_below_one(self):
+        """A memory carrying a term the query does NOT have must score < 1.0.
+
+        The companion upper bound to the superset property above: it is what
+        actually falsifies a degenerate `return 1.0` implementation.
+        """
+        query = self.PREAMBLE + self.CORE_QUERY
+        # Every token of this memory except `quokka` appears in the query.
+        mem = self.CORE_QUERY + " quokka"
+        score = recall.containment_overlap(query, mem)
+        self.assertLess(score, 1.0)
+        self.assertGreater(score, 0.0)
+        # And a fully-contained memory reaches exactly 1.0, so the < 1.0
+        # above is a property of the missing term, not a ceiling artefact.
+        self.assertAlmostEqual(
+            recall.containment_overlap(query, self.CORE_QUERY), 1.0, places=9
+        )
 
     def test_survival_does_not_degrade_as_the_prompt_grows(self):
         """Sweep prompt length the way production does and assert the relevant

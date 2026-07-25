@@ -669,6 +669,51 @@ def _result_final_score(m) -> float:
     return float("-inf")
 
 
+def _injected_score_stats(results) -> dict:
+    """Relevance-score aggregates for the INJECTED set (post-head-slice).
+
+    Switchroom #3541 review finding — recall-quality telemetry.
+    `recall_log.jsonl` records volume and plumbing only (`overlap_dropped`,
+    `capped`, `pre_cap_count`, `memory_ids`, `deadline_hit`). With the
+    overlap gate deliberately near-passthrough at 0.10, 100% of precision now
+    rests on the engine's `scores.final` plus the `recallMaxMemories`
+    head-slice — and no field observes that. Post-rollout, `overlap_dropped`
+    collapsing to 0 while `result_count` rises to the cap reads as
+    unambiguous success on every existing dashboard whether the reranker is
+    good OR whether every agent is being fed 8 mediocre memories per turn.
+    These three fields are what distinguishes those two worlds.
+
+    Returns ``{"injected_score_min", "injected_score_median",
+    "injected_score_max"}``. Values are floats rounded to 4dp, or None when
+    the set is empty or no result carried a usable score (results missing
+    `scores.final` are excluded rather than counted as a sentinel, so a
+    single malformed entry cannot drag the aggregate).
+
+    Aggregates ONLY — no query text and no memory text is recorded here.
+    """
+    empty = {
+        "injected_score_min": None,
+        "injected_score_median": None,
+        "injected_score_max": None,
+    }
+    try:
+        scores = [s for s in (_result_final_score(m) for m in results or []) if s != float("-inf")]
+        if not scores:
+            return empty
+        scores.sort()
+        n = len(scores)
+        mid = n // 2
+        median = scores[mid] if n % 2 else (scores[mid - 1] + scores[mid]) / 2.0
+        return {
+            "injected_score_min": round(scores[0], 4),
+            "injected_score_median": round(median, 4),
+            "injected_score_max": round(scores[-1], 4),
+        }
+    except Exception:
+        # Telemetry must never take recall down.
+        return empty
+
+
 def _sort_by_final_score(results):
     """Sort merged multi-bank results by `scores.final` descending, in place.
 
@@ -1435,6 +1480,12 @@ def main():
                 "directives_omitted": None,
                 "demoted_count": 0,
                 "capped": False,
+                # #3541 quality telemetry — present for a uniformly queryable
+                # schema. A cache hit replays a formatted context block, not a
+                # result set, so no per-memory scores exist to aggregate.
+                "injected_score_min": None,
+                "injected_score_median": None,
+                "injected_score_max": None,
                 "cache_hit": True,
                 # A3 stage-1 telemetry keys kept present for a uniformly
                 # queryable schema; a cache hit issues no bank HTTP, so there
@@ -1985,6 +2036,12 @@ def main():
             m.get("id") for m in results
             if isinstance(m, dict) and m.get("id")
         ],
+        # Switchroom #3541 — recall QUALITY telemetry, alongside the volume
+        # fields above. min/median/max of `scores.final` over the injected
+        # (post-head-slice) set. See `_injected_score_stats` for why volume
+        # alone can't distinguish "reranker is working" from "8 mediocre
+        # memories per turn" now that the overlap gate is near-passthrough.
+        **_injected_score_stats(results),
         "cache_hit": False,
         # Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1) — per-bank
         # latency + timeout breakdown, directives-fetch latency, total

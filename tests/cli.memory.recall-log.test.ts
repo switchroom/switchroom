@@ -139,3 +139,64 @@ describe("formatRecallLogView — directives_omitted", () => {
     expect(out.join("\n")).not.toContain("omitted");
   });
 });
+
+// Switchroom #3541 — recall QUALITY telemetry. Every pre-existing field on a
+// recall_log row measures VOLUME. Once the overlap gate became a
+// near-passthrough floor at 0.10, precision rested entirely on the engine's
+// `scores.final` plus the max_memories head-slice — so a rollout that fed each
+// agent `max_memories` mediocre memories per turn would raise `avg`/`max` and
+// zero out `overlap_dropped`, i.e. read as unambiguous success. These assert
+// the score range actually reaches the operator.
+describe("formatRecallLogView — injected relevance scores", () => {
+  const ANSI = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
+  const strip = (s: string) => s.replace(ANSI, "");
+
+  it("prints the per-row min/median/max and a mean-of-medians summary", () => {
+    const out = formatRecallLogView("clerk", [
+      {
+        ts: "2026-07-25T10:00:00Z",
+        result_count: 3,
+        injected_score_min: 0.8,
+        injected_score_median: 0.85,
+        injected_score_max: 0.9,
+      },
+      {
+        ts: "2026-07-25T10:01:00Z",
+        result_count: 3,
+        injected_score_min: 0.1,
+        injected_score_median: 0.15,
+        injected_score_max: 0.2,
+      },
+    ]).map(strip);
+
+    expect(out[2]).toContain("score=0.80/0.85/0.90");
+    expect(out[3]).toContain("score=0.10/0.15/0.20");
+    // Mean of the two medians: (0.85 + 0.15) / 2 = 0.5.
+    expect(out[1]).toContain("avg_score=0.5");
+  });
+
+  it("distinguishes a full-but-weak turn from a full-and-strong one", () => {
+    const weak = formatRecallLogView("clerk", [
+      { ts: "t", result_count: 8, injected_score_min: 0.02, injected_score_median: 0.05, injected_score_max: 0.09 },
+    ]).map(strip);
+    const strong = formatRecallLogView("clerk", [
+      { ts: "t", result_count: 8, injected_score_min: 0.70, injected_score_median: 0.80, injected_score_max: 0.95 },
+    ]).map(strip);
+
+    // Identical volume — the old summary line could not tell these apart.
+    expect(weak[1]).toContain("avg=8 max=8");
+    expect(strong[1]).toContain("avg=8 max=8");
+    // The quality number does.
+    expect(weak[1]).toContain("avg_score=0.05");
+    expect(strong[1]).toContain("avg_score=0.8");
+  });
+
+  it("renders an em dash rather than 0 when no row carries a score", () => {
+    const out = formatRecallLogView("clerk", [
+      { ts: "2026-07-25T10:00:00Z", result_count: 2 },
+      { ts: "2026-07-25T10:01:00Z", cache_hit: true, injected_score_median: null },
+    ]).map(strip);
+    expect(out[1]).toContain("avg_score=—");
+    expect(out.join("\n")).not.toContain("score=0.00");
+  });
+});
