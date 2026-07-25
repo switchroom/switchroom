@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
+
 ### Hindsight — bound retain content so oversized memories can persist at all (#3610)
 
 The sibling of #3599, not a duplicate of it. #3599 showed that 70.4% of the
@@ -60,7 +62,7 @@ persist when it is NOT.
   core's verdict; a part suffix on a pre-#3244 bare session id still proves
   nothing and is still refused.
 
-### Hindsight — the pending-retains backlog was a re-post loop, not lost memory (#3596)
+### Hindsight — the pending-retains backlog was a re-post loop, not lost memory (#3599)
 
 The queue on this fleet grew to 5,751 entries. The cause was **not** that
 memory was being lost — a full sweep on 2026-07-25 found **4,048 (70.4%)
@@ -227,6 +229,295 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
   eviction. The remediation names the reconcile phase first, spells out the
   pacing, and ships the actual p95 query rather than telling the operator to
   set `HINDSIGHT_DRAIN_P95_CMD` to something it never names.
+
+### Approval kernel — two fail-open holes and an unbounded TTL (#3597)
+
+- **`allow_once` was never burned — it behaved exactly like `allow_always`.**
+  `recordDecision` set `ttl_expires_at` only for `allow_ttl`, so an `allow_once`
+  row landed with `ttl_expires_at = NULL` and then fell into
+  `evaluateDecisionRow`'s catch-all branch, which stamped `last_used_at` and
+  returned `granted` — forever. The operator taps **Allow once** on a Drive-write
+  card and every later write to that doc is silently auto-approved through the
+  scope-keyed fast path. `allow_once` now gets its own branch that claims the row
+  with a conditional `UPDATE … WHERE id = ? AND revoked_at IS NULL` — an atomic
+  compare-and-swap, so of two concurrent uses exactly one is granted and the
+  loser fails closed. The row is **revoked** (reason `allow_once_consumed`)
+  rather than merely marked used, because a spent-but-visible row would become
+  the newest match and return `denied` forever, DoS-ing the pretools' own
+  re-prompt poll.
+- **`approval_list` was the one kernel op with no ACL.** It passed the
+  wire-supplied `agent_unit` straight to `listDecisions` while every sibling op
+  gates on `checkApprovalAclByAgent` first. Agent B could enumerate agent A's
+  decisions on B's own legitimate socket — scopes (which embed Google doc ids and
+  M365 paths), `granted_by_user_id` (the operator's Telegram user id), grant
+  timestamps, revoke reasons — and because `agent_unit` is `.optional()` on the
+  wire, omitting it dumped the **whole fleet**. Now gated like its siblings, with
+  the filter pinned to the listener's bind-time identity so an omitted
+  `agent_unit` means "me", not "everyone". The operator socket stays exempt on
+  purpose (the dashboard's fleet-wide read is its reason to exist; its
+  authorization is the 0600 operator-UID socket bind).
+- **`ttl_ms` is clamped at write time.** The wire validated nothing beyond
+  `positive().int()` and the stored `now + ttl_ms` was taken verbatim. The
+  read-time clamp in `evaluateDecisionRow` only fires *on a match*, so readers
+  that bypass it — `isOperatorVerifiedDecision`, used by the broker's hard
+  boundary mint gate, and `listDecisions` — honoured a century-long TTL. Clamped
+  to `DEFAULT_MAX_TTL_LIFETIME_MS` at insert.
+
+### Approvals — decision provenance is now visible; the self-approval bypass remains OPEN (#3598)
+
+  ⚠️ **This does NOT close the self-approval bypass.** The bypass is
+  instrumented, enforceable and regression-tested, and it **remains open by
+  design** pending host-side infrastructure. The enforcement switch ships
+  **default-off**, because turning it on today would refuse every legitimate
+  approval as well.
+
+- **The bypass:** an agent can self-approve its own approval-kernel decision on
+  its own legitimate socket — `approval_request` then `approval_consume_record`
+  with any `granted_by_user_id`. Both pass `checkApprovalAclByAgent`, which only
+  enforces `claim === listener`: that blocks **cross-agent** forgery, not
+  **self**-forgery. The Drive / M365 write hooks then read `state === "granted"`
+  and allow the write. No card was posted; no human tapped.
+- **The designed defence was inert.** The `origin` column and
+  `isOperatorVerifiedDecision` existed, but nothing ever wrote `origin='operator'`
+  and the lookup response shapes did not carry `origin` at all, so no consumer
+  could tell a real tap from a forgery. New `listenerOrigin(isOperator)` is the
+  single place provenance is decided — derived from the **bound listener**, never
+  from a wire field (a wire field would be settable by the exact process the
+  column exists to distrust). `approval_lookup` /
+  `approval_lookup_by_request` now return `decision.origin`, optional in the
+  schema so an old kernel on a mixed-version rollout omits it and consumers fail
+  closed.
+- **One predicate, every gate site.** `src/vault/approvals/gated-write-policy.ts`
+  (new) exports `isGatedWriteApproved()` and the three-way
+  `allow` / `block` / `wait` classifier `evaluateGatedWrite()`, which requires
+  `origin === "operator"` under
+  `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE=1`; `'agent'`, missing and
+  unexpected all fail closed. The rule lives in one unit-tested function
+  precisely because a per-site inline check was provably deletable at one site
+  with the whole suite green. The Drive hook now refuses on the **pre-card fast
+  path**, before the auth-broker call, the live `documents.get` and the card
+  post. The connect-time `approvalWait` flow gets the same flag-gated check, with
+  a new `not_operator_verified` reason reported as an *error* rather than a
+  *deny* so the CLI never claims a human refused you.
+- **What is still missing, stated precisely:** the genuine tap path is the
+  Telegram callback, and the gateway runs in the **same container, as the same
+  uid, over the same per-agent socket** as claude. `SO_PEERCRED` is already
+  captured at accept(2), but under same-uid co-residency any pid→identity mapping
+  is forgeable by the process it is meant to distrust. **Provenance needs a
+  channel boundary, not a better fingerprint.**
+
+### Telegram gateway — atomic writes + loud corruption handling for four approval-state stores (#3596)
+
+- **Four stores did a non-atomic read-modify-write straight over the destination
+  file and swallowed parse failures** — `pending-card-store`,
+  `scoped-grant-store`, `missed-approvals-store`,
+  `always-allow-persist-queue`. `writeFileSync` over an existing path is
+  `open(O_TRUNC)` + `write`, so a crash in that window leaves a torn file; on the
+  next boot the parse threw, `catch { return [] }` swallowed it, and every
+  pending approval card and live scoped grant was silently forgotten. The
+  operator just saw dead buttons.
+- All four now use the existing `atomicWriteFileSync` primitive (tempfile in the
+  same directory, `O_NOFOLLOW|O_EXCL`, `fchmod` 0600, `fsync`, `rename(2)`),
+  matching the sibling stores in the same directory. New
+  `telegram-plugin/gateway/store-file.ts` owns the read side: missing file →
+  silent (normal cold start); unparseable JSON or wrong shape → the bytes are
+  **preserved** by renaming to `<file>.corrupt-<epoch-ms>-<seq>-<rand>` and a
+  `CORRUPT — … Persisted state was LOST` line goes to the log sink; any other fs
+  error → logged loudly with **no** quarantine (renaming a file we merely failed
+  to read would destroy good state on a transient fault).
+- **Verified, not assumed:** `always-allow-persist-queue`'s `withLock` is a plain
+  promise chain, not a file lock, so it serializes callers within one gateway
+  process and nothing more.
+
+### Hindsight — the retain LLM timeout is derived from the token budget (#3611)
+
+- Two numbers govern how long a retain may take and **nothing tied them
+  together**: `RETAIN_MAX_COMPLETION_TOKENS` (upstream default 64000) and
+  `RETAIN_LLM_TIMEOUT`. At 64000 tokens and the measured local throughput floor
+  of 80.6 tok/s a single legitimate extraction needs ~13 minutes, so a runaway
+  generation blew the per-deployment deadline on both local Ollama boxes, tripped
+  the router cooldown, and dumped all fleet memory traffic onto OpenRouter —
+  where the runaway completed uncut and billed.
+- `HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 16384` (high enough for a
+  looping extraction, low enough that the worst case is ~2 min);
+  `hindsightRetainLlmTimeoutSeconds()` derives **204s** = `ceil(16384 / 80.6)`;
+  `assertHindsightRetainBudget()` fails loudly on `tokens <= chunk_size` or
+  `server >= client`. The live config violated the invariant in the other
+  direction too (`HINDSIGHT_API_RETAIN_LLM_TIMEOUT=300` exceeded the 280s
+  durability client deadline, so the server could outlive the client waiting on
+  it and orphan an upstream slot).
+- Wired into **both** env emit paths (`docker run` and compose), so the value
+  survives a deploy rather than living only in a hand-run container's baked env.
+
+### Hindsight — a model-free watchdog for the memory backend (#3617)
+
+- **`switchroom hindsight-watch`** — a model-free, zero-token watchdog on a host
+  cron. It exists because ~28% of retains once failed for weeks with nobody
+  noticing: the telemetry was already there (28 metric families on `/metrics`,
+  and `switchroom doctor` already counted the spool) but nothing *watched* it and
+  nothing *told a human*. One plain operator DM through the same gateway relay
+  hostd's degraded-boot notice uses. No session, no LLM call.
+- Signals: `probe` (metrics unreachable/unparseable, `docker inspect` fails,
+  agents dir unreadable), `retain-failure-rate` (≥10% of the rolling window),
+  `retain-queue-growth` (spool ≥440 deep **and** grew ≥max(88, 10%)),
+  `retain-loss` (any new `*.json.dead`, `pending-evicted/` entry, or
+  `pending-drops.json` count), `container` (unhealthy / restarted / recreated).
+  Level signals need two consecutive breaches; edge signals fire on the first.
+  `no-data` is inert — an idle backend neither fires nor silently resolves a live
+  alert. Exit `0` / `10` (firing) / `1` (could not complete), and an
+  **undelivered alert is never recorded as notified**.
+- Cost per tick: one `/metrics` GET, one `docker inspect`, and per agent two
+  `readdir`s plus one ~150 B read. No queue *entry* is ever opened (those carry
+  whole transcripts, p50 ~98 KB).
+- **This does not install a cron.** `docs/hindsight-watch.md` has the arming
+  steps; `--dry-run` evaluates and prints without sending or persisting.
+
+### Rollout — every subprocess on the executor's path is bounded (#3605)
+
+- **The staggered fleet rollout executor had zero timeouts** — `grep -c timeout
+  src/cli/rollout.ts` on the old `main` returned 0. Every step ran through a bare
+  `spawnSync`, so one wedged container (hung `docker restart`, unresponsive
+  `docker exec … switchroom --version`) blocked the rollout child forever. On the
+  hostd path that is worse than a slow roll: `launchRollout` takes
+  `fleetMutationInFlight` and the latch is released only inside `spawnRollout`'s
+  `.finally()`, which cannot run until the child exits — so a hung `spawnSync`
+  stranded the latch permanently and every subsequent fleet mutation was refused
+  with no self-clearing path short of restarting hostd.
+- `createRolloutDeps()` makes the spawn seam injectable and every spawn now
+  carries `timeout` + `killSignal: "SIGKILL"`, with two env-tunable budgets:
+  `SWITCHROOM_ROLLOUT_RUN_TIMEOUT_MS` (20 min) and
+  `SWITCHROOM_ROLLOUT_PROBE_TIMEOUT_MS` (60 s).
+  `isSpawnTimeout()` classifies the kill and turns it into a clean non-zero
+  return carrying `timedOut: true`, so the executor **always returns** and
+  hostd's `.finally()` always runs. `RolloutResult.timedOut` rides the stdout
+  result sentinel onto `StatusEntry.timed_out`, so `get_status` shows "killed on
+  timeout" rather than a bare `exit 1`.
+- **Honest boundary:** this bounds the CLI-side executor's own path. It does
+  **not** bound hostd's *recovery* spawns, so the hang class is not closed on the
+  unattended auto-rollout path.
+
+### Rollout — the durable pin is provisional; the compose backup is real (#3601)
+
+- **The durable pin was persisted before the roll was proven.** Once
+  `planRollout`'s `persist-pin` step ran, `release.pin` was the target version
+  permanently — even if the roll then failed, since `executeRollout` returned
+  `ok:false` and nothing reverted it and hostd declines past-canary auto-rollback
+  by design. From that moment every later `agent restart`, crash-loop recreate,
+  reconcile or `docker compose up -d` read the broken pin and converged the
+  **remaining** agents onto a build that had demonstrably failed to boot. The
+  fleet drifted toward broken instead of staying mixed-but-working.
+- New `src/cli/rollout-pin-journal.ts`: a two-phase commit journalled in the
+  durable state directory (begin → write `{pin, priorPin, pid, at}` 0600 via
+  tmp+rename, then write the pin; commit only on `ok:true`; rollback does a
+  **targeted** `release.pin` edit back to `priorPin`). It is a file and not a
+  try/finally because the crash case is the point — SIGKILL / OOM / hostd
+  recreate between the write and the terminal. Three recovery sites cover it:
+  hostd boot, hostd's rollout terminal handler, and the start of the next
+  `switchroom rollout`.
+- Recovery is **liveness- and staleness-gated** (`isJournalWriterAlive`, or a
+  journal older than the 15-minute `PIN_JOURNAL_MAX_AGE_MS` matching
+  `SELF_BUMP_MARKER_MAX_AGE_MS`), so a hostd restart mid-roll can no longer
+  revert the pin of a *successful* roll; the rollout's own failure path passes
+  `requireStale: false` because that caller **is** the writer. Boot recovery is
+  skipped outright while `fleetMutationInFlight` is held.
+- The revert is a targeted comment-preserving edit
+  (`deleteReleasePinInConfig`, same `parseDocument` Document API), not a
+  whole-file restore — a whole-file restore would silently discard any config
+  edit made in the (often minutes-long) window between the provisional write and
+  the rollback. A malformed journal is now a loud operator-facing warning naming
+  the config, and a journal that survives a successful commit is surfaced as an
+  error rather than swallowed.
+- **The journal died with the container it was meant to outlive** (round-2
+  HIGH): `pinJournalPath` derived its directory from `dirname(configPath)`, but
+  inside hostd the config is a **single-file** bind mount, so `/state/config` the
+  directory is the container's writable overlay — the journal existed nowhere on
+  the host and the hostd-boot recovery site was dead code on exactly the path the
+  module targets. Now written to the durable switchroom state directory.
+
+### Logs — three unbounded logs on the live host are bounded (#3600)
+
+- **`<agent>/telegram/webhook-events.jsonl`** had no rotation and no reaper:
+  `reggie` alone was **121,772,086 bytes** against `clerk`'s 328 KB, on shared
+  bind-mounted host disk. Rotates before each append at 8 MiB keeping 2
+  generations (~24 MiB per agent ceiling), env
+  `SWITCHROOM_WEBHOOK_LOG_MAX_BYTES` / `_MAX_FILES`. `readWebhookLog` reads
+  `.N … .1` then the active file, oldest-first, skipping a torn line rather than
+  throwing, so the documented "for the agent to read on demand" consumer is
+  preserved.
+- **`~/.switchroom/host-control-audit.log`** had no rotation at all and was at
+  **44,325,086 bytes** (rows ~4 KiB because they carry redacted terminal
+  output) — already past the 32 MiB threshold its sibling rotates at. The
+  check + rotate happens **inside** the existing serialized append section so it
+  can never interleave with an in-flight write; 32 MiB / 3 generations, env
+  `SWITCHROOM_HOSTD_AUDIT_MAX_BYTES` / `_MAX_FILES`.
+- The audit hash-chain is deliberately **not** re-seeded on rotation, so the
+  first row in the freshly-truncated file still links back to the last row now
+  living in `.1` and cross-file tamper-evidence continuity holds
+  (`verifyAuditLog(".1" + active).segments === 1`). New `readAuditRaw` back-fills
+  from rotated generations up to a bounded 4 MiB window so `switchroom hostd
+  audit`, the dashboard panel and `get_status` don't look like they lost history
+  after each rotation.
+- The rotated sidecar `.1` log is bounded on the same pass.
+
+### Webkite — the shared cloakbrowser Chromium mount was silently inert (#3608)
+
+- switchroom intends to share ONE ~700 MB cloakbrowser stealth Chromium across
+  the fleet via a read-only bind mount. **The mount never existed**: 5 agents
+  each held a byte-identical private 697 MB copy (~3.4 GB on the live host, ~2.8
+  GB reclaimable). `compose.ts` probed `${probeHome}/.cloakbrowser`, which sits
+  **outside** `~/.switchroom/` — the only host subtree hostd bind-mounts — so
+  every in-hostd compose generation evaluated the guard false and emitted no
+  mount line at all.
+- The old comment claimed "cloakbrowser hardcodes that path". **It does not** —
+  `get_cache_dir()` reads `CLOAKBROWSER_CACHE_DIR` and only falls back to
+  `~/.cloakbrowser`. That false belief is why the original design used fragile
+  HOME path-shadowing instead of the env var. doctor's fix hint relocated pipx,
+  not the Chromium cache, so it could never populate anything.
+- `docker/Dockerfile.agent` pins `CLOAKBROWSER_CACHE_DIR=/opt/switchroom/
+  cloakbrowser-cache` and pre-creates it root-owned and **empty**, so a missing
+  mount cannot silently self-heal into another private copy. `compose.ts` mounts
+  the switchroom-owned `~/.switchroom/cloakbrowser/` there, still `:ro` — a
+  shared *writable* browser cache would let one agent rewrite a binary another
+  agent executes as itself. doctor probes the shared dir and emits a hint that
+  actually works, plus a migration warning when Chromium is only at the legacy
+  path; `start.sh` warns non-fatally at boot when the shared cache is absent.
+
+### Telegram — sub-agent progress feed and Bash labelling (#3609)
+
+- Never take a flag VALUE as a Bash subcommand label; stop the sub-agent step
+  feed freezing on a repeated label; register `progress_update` on the bridge MCP
+  surface and tell sub-agents what it actually does; assemble token-shaped
+  fixtures at runtime for `check-no-pii-secrets`.
+
+### Tests — green main, and auth-broker hermeticity by construction (#3613, #3616)
+
+- **The auth-broker tests were latency-bound on `api.anthropic.com` (#3613,
+  #3616).** `mark-exhausted` awaits a **live** quota probe inside the request
+  path (`markExhaustedAndRoll` → `nextHealthyAccountLive` → `probeAndCacheOne` →
+  `fetchQuota`), and `fetchQuota`'s default abort is 10s — over 3× the 3s
+  deadline the harness's own `rpc()` helper enforces. So an unguarded broker
+  construction was a pure-latency coin flip: green when the runner's egress
+  failed fast, `Error: rpc timeout` when it didn't. It went red on main twice.
+- #3613 fixed `server.test.ts`'s 13 instances in-file and corrected a stale
+  `tests/tool-label-pretool.test.ts` expectation left behind by #3609 (the root
+  vitest copy still expected `"Running a command"` where the plugin-local copy
+  had already moved to the derived label; the assertion was tightened, not
+  loosened — the generic fallback keeps two dedicated cases).
+- #3616 closes the *class* rather than the instances:
+  `tests/vitest-setup/auth-net-guard.mjs` swaps `globalThis.fetch` for an
+  immediately-rejecting stub in **every** test file that can reach `fetchQuota`,
+  with no per-file opt-in to forget; the predicate lives in a deliberately
+  hook-free core module so importing it cannot install the guard, which is what
+  keeps the runtime proof honest. `src/auth/broker/net-hermeticity.test.ts` is
+  the runtime alarm (builds an `AuthBroker` **without** `_testFetchQuota`, drives
+  `mark-exhausted` over the UDS, asserts it rolls to `secondary` well inside the
+  3s deadline and that the guard tripped), and
+  `scripts/check-auth-test-hermeticity.mjs` is a `npm run lint` gate that catches
+  the two silent ways the protection can disappear — the `setupFiles` wiring
+  going away, and a reachable test sitting in vitest's `exclude` list where a
+  vitest setup file never loads. Reachability is computed by importing the
+  guard's own `shouldGuardSource`, so lint and runner share one implementation
+  and can never disagree.
 
 ## v0.19.18 — MCP instructions truncation (security), turn-liveness fixes, hindsight ranking & recall, CI hardening
 
