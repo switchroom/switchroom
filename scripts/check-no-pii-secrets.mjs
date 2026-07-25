@@ -79,6 +79,27 @@ const RULES = [
   { id: 'real Telegram id (user)', re: new RegExp('\\b' + '82487' + '03757\\b') },
   { id: 'real Telegram id (alt)', re: new RegExp('\\b' + '82881' + '44562\\b') },
   { id: 'real Telegram id (group)', re: new RegExp('\\b' + '38527' + '47971\\b') },
+  // Live Coolify service id for the LiteLLM proxy, scrubbed in #3527. It
+  // identifies a real deployment (and the exact host path of the
+  // operator-maintained proxy config). Docs use the `<litellm-service-id>`
+  // placeholder; on-host code discovers the real path at runtime
+  // (`discoverLiveLitellmConfigPath`) or takes `LITELLM_CONFIG_PATH`, so the
+  // id itself never needs to appear in the tree. Without this rule nothing
+  // stopped an agent pasting it back into a doc or a default and the scrub
+  // would silently un-do itself — exactly the failure mode this gate exists
+  // for.
+  {
+    id: 'live Coolify litellm service id (use <litellm-service-id>)',
+    re: new RegExp('vhz4' + 'jc1tzvk6' + 'gdql8jue' + 'iwq4', 'i'),
+  },
+  // Any other long Coolify service-dir slug is deployment-identifying for the
+  // same reason. The placeholder form `<litellm-service-id>` does not match
+  // (angle brackets and hyphens are outside the char class), and neither does
+  // the bare `COOLIFY_SERVICES_DIR` constant (no slug follows it).
+  {
+    id: 'deployment-identifying Coolify service dir (use <litellm-service-id>)',
+    re: new RegExp('coolify/' + 'services/' + '[a-z0-9]{20,}'),
+  },
   // Contiguous Anthropic-token-shaped literal. Real tokens were never
   // committed; this enforces the CLAUDE.md "Secrets in tests" rule —
   // token-shaped fixtures must be runtime-assembled, never a contiguous
