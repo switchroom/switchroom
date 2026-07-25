@@ -1665,7 +1665,10 @@ export function checkPendingRetainsQueues(
     `- interval '10 minutes' and metadata->>'user_api_key_alias' like 'hindsight-%' and ` +
     `status='success' and request_duration_ms is not null), -1)"\` (must print a ` +
     `millisecond integer on stdout; unset = no backoff). Fix the upstream first (bank ` +
-    `health rows above), or every retry just ages entries toward .dead.`;
+    `health rows above), or every retry just ages entries toward .dead. Entries the ` +
+    `drain retires are MOVED to \`.hindsight/pending-reconciled/\` (bounded, so they ` +
+    `expire), never deleted — every retire rests on an HTTP 200, which is an ack and ` +
+    `not proof, so the payload stays recoverable.`;
 
   // fail: dead markers, residual drops, or recorded evictions. NOT depth:
   // a full queue evicts rather than refusing, so depth alone is a symptom.

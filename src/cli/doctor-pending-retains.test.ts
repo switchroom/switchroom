@@ -148,6 +148,18 @@ describe("checkPendingRetainsQueues (#1071/#1094)", () => {
     expect(fix).toContain("HINDSIGHT_DRAIN_P95_CMD");
   });
 
+  // An operator who has just been told to run a drain needs to know where a
+  // retired entry went -- the drain moves it, it does not delete it, and that
+  // is the whole reason a wrong reconcile is recoverable.
+  it("warn: the remediation says retired entries are archived, not deleted", () => {
+    const r = checkPendingRetainsQueues(cfg(["ziggy"]), {
+      probe: probeFrom({ ziggy: backlog(400) }),
+    });
+    const fix = r.fix ?? "";
+    expect(fix).toContain(".hindsight/pending-reconciled/");
+    expect(fix).toMatch(/never deleted/i);
+  });
+
   it("fail: residual drops fail even with a healthy queue", () => {
     // The queue has since drained, but 37 turns could not be written at
     // all -- that memory is gone and must not read as "ok".

@@ -92,6 +92,18 @@ queued copy is ALWAYS post-``update_attempt`` by the time
 entry on every boot), so its size had already drifted, and a
 one-character difference in the error string defeated it too.
 
+Retiring an entry — archive, never delete
+-----------------------------------------
+The drain retires an entry through ``archive_reconciled()``, which MOVES it
+into a bounded ``pending-reconciled/`` sibling. It never ``os.remove``s one.
+Every retire decision on that path rests on an HTTP 200 — a presence GET or a
+synchronous retain ack — and a 200 is evidence, not proof (#3244); an
+irreversible delete on evidence is how the last on-disk copy of a turn
+disappears. ``is_content_derived_document_id()`` is the second half of that
+guard: a *presence-only* reconcile is sound only for post-#3244
+content-derived ids, because a pre-#3244 bare session id answers 200 for any
+retain in that session.
+
 Oversized entries
 -----------------
 An entry larger than ``MAX_BYTES`` can never fit, and the eviction loop
@@ -115,6 +127,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -136,6 +149,15 @@ ARCHIVE_MAX_ENTRIES = int(
 ARCHIVE_MAX_BYTES = int(
     os.environ.get("HINDSIGHT_PENDING_ARCHIVE_MAX_BYTES") or (64 * 1024 * 1024)
 )
+# The reconciled archive (see ``archive_reconciled``) is bounded on exactly the
+# same terms as ``pending-evicted/`` — an archive that grows without limit is
+# just a slower disk problem.
+RECONCILED_MAX_ENTRIES = int(
+    os.environ.get("HINDSIGHT_PENDING_RECONCILED_MAX_ENTRIES") or 500
+)
+RECONCILED_MAX_BYTES = int(
+    os.environ.get("HINDSIGHT_PENDING_RECONCILED_MAX_BYTES") or (64 * 1024 * 1024)
+)
 MAX_ATTEMPTS = 5
 
 #: Residual-drop ledger. A SIBLING of the queue directory (like the
@@ -152,6 +174,41 @@ MAX_ERROR_MESSAGE_CHARS = 500
 #: without limit on a queue that evicts steadily.
 EVICTIONS_LOG_MAX_BYTES = 1024 * 1024
 EVICTIONS_LOG_KEEP_LINES = 2000
+
+
+#: Post-#3244 ``document_id`` shape (``retain.slice_document_id``):
+#: ``{session_id}-r{start_uuid}-{end_uuid}``, or the legacy-transcript fallback
+#: ``{session_id}-r{sha256[:32]}``. ``subagent_retain.py`` uses the same recipe
+#: over a ``{session}-sub-{agent}`` composite key, so it matches too.
+_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_CONTENT_DERIVED_ID_RE = re.compile(
+    r"-r(?:%s-%s|[0-9a-fA-F]{32})$" % (_UUID_RE, _UUID_RE)
+)
+
+
+def is_content_derived_document_id(document_id) -> bool:
+    """True iff ``document_id`` is a post-#3244 CONTENT-derived id.
+
+    This is the gate on any *presence-only* reconcile (a GET that returns
+    200 ⇒ drop the queue entry). It is only sound when the id identifies
+    the entry's own content:
+
+    * **Post-#3244** the id is ``{session_id}-r{start_uuid}-{end_uuid}``
+      (``retain.slice_document_id``), a pure function of *which turns* the
+      entry carries. A 200 on that id proves *this* content was committed.
+    * **Pre-#3244** entries carry a BARE SESSION ID. The bank answers 200
+      for that id after ANY successful retain in that session, so a 200
+      proves nothing about the queued entry's own content. Reconciling on
+      it deletes a turn that was never committed — confirmed against a
+      live entry on this fleet (525 KB of content, ``document_id`` a bare
+      UUID, GET 200).
+
+    Anything unrecognised is False: the safe direction is to keep the
+    entry and let the POST path decide.
+    """
+    if not isinstance(document_id, str):
+        return False
+    return bool(_CONTENT_DERIVED_ID_RE.search(document_id))
 
 
 def _clip_error(e: BaseException) -> str:
@@ -191,8 +248,13 @@ def _ensure_dir() -> str:
 
 
 def _list_entries(d: str) -> list[str]:
-    """Return sorted filenames (oldest first by lexicographic order on
-    the ``<unix-ms>-<uuid>.json`` filename pattern).
+    """Return sorted filenames, oldest first.
+
+    Order is the lexicographic sort of ``<unix-ms>-[<key>-]<uuid>.json``.
+    The millisecond stamp is fixed-width and leading, so this is true
+    enqueue order down to the millisecond; entries sharing a millisecond
+    tie-break on the remaining segments (stable and total, but arbitrary —
+    the name carries no finer age information).
     """
     try:
         names = [n for n in os.listdir(d) if n.endswith(".json")]
@@ -217,6 +279,19 @@ def evicted_dir() -> str:
     """Archive directory for FIFO-evicted entries (sibling of the queue)."""
     return os.environ.get("HINDSIGHT_PENDING_EVICTED_DIR") or _sibling(
         "pending-evicted"
+    )
+
+
+def reconciled_dir() -> str:
+    """Archive directory for reconciled/drained entries (sibling of the queue).
+
+    The out-of-band drainer this design was ported from ARCHIVES an entry it
+    stops draining; it never ``os.remove``s one. That is the difference
+    between "we believe this is durable upstream" and "the last on-disk copy
+    of this turn is gone", and only the second is irreversible.
+    """
+    return os.environ.get("HINDSIGHT_PENDING_RECONCILED_DIR") or _sibling(
+        "pending-reconciled"
     )
 
 
@@ -246,21 +321,61 @@ def _dir_bytes(d: str, names) -> int:
     return total
 
 
-def _trim_archive() -> None:
-    """Keep the archive under its own count/byte caps, oldest-first."""
-    a = evicted_dir()
+def _trim_dir(a: str, max_entries: int, max_bytes: int) -> None:
+    """Keep ``a`` under its count/byte caps, deleting OLDEST first.
+
+    Oldest-first is load-bearing: ``names[0]`` is the lexicographically
+    smallest name, and names lead with a fixed-width millisecond stamp, so
+    it is the oldest archived entry. Trimming from the other end would keep
+    the stale tail and discard what was just shed.
+    """
     try:
         names = sorted(n for n in os.listdir(a) if n.endswith(".json"))
     except OSError:
         return
     while names and (
-        len(names) > ARCHIVE_MAX_ENTRIES or _dir_bytes(a, names) > ARCHIVE_MAX_BYTES
+        len(names) > max_entries or _dir_bytes(a, names) > max_bytes
     ):
         try:
             os.remove(os.path.join(a, names[0]))
         except OSError:
             pass
         names.pop(0)
+
+
+def _trim_archive() -> None:
+    """Keep the eviction archive under its own count/byte caps."""
+    _trim_dir(evicted_dir(), ARCHIVE_MAX_ENTRIES, ARCHIVE_MAX_BYTES)
+
+
+def archive_reconciled(path: str) -> Optional[str]:
+    """Retire a queue entry into ``pending-reconciled/``. Returns the dest.
+
+    THE ONLY WAY the drain retires an entry. Every "we no longer need to
+    keep this queued" decision on the drain path rests on an HTTP 200 —
+    either a presence GET or a synchronous retain ack — and a 200 is
+    evidence, not proof (switchroom #3244). ``os.remove`` on that evidence
+    is irreversible; a bounded archive is not, and the archive is what the
+    out-of-band tooling this design was ported from always did.
+
+    Bounded exactly like ``pending-evicted/`` (``RECONCILED_MAX_ENTRIES`` /
+    ``RECONCILED_MAX_BYTES``), so it can never become an unbounded disk
+    problem of its own.
+
+    Falls back to ``delete_entry`` when the archive cannot be written (disk
+    full, permissions): a queue that cannot retire entries would re-POST
+    them forever, which is the very loop this change exists to break.
+    """
+    dest_dir = reconciled_dir()
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(path))
+        shutil.move(path, dest)
+    except OSError:
+        delete_entry(path)
+        return None
+    _trim_dir(dest_dir, RECONCILED_MAX_ENTRIES, RECONCILED_MAX_BYTES)
+    return dest
 
 
 def _log_eviction(name: str, size: int, reason: str, depth: int, nbytes: int) -> None:
@@ -339,10 +454,17 @@ def _evict_to_fit(d: str, incoming_bytes: int) -> int:
 def _dupe_key(entry: dict) -> Optional[str]:
     """Stable 16-hex identity of a queued retain, or ``None``.
 
-    Derived from ``(bank_id, document_id, sha256(content))``.
-    ``document_id`` is already content-derived, so two entries sharing
-    this key are the same memory and the daemon would upsert them onto
-    the same document.
+    Derived from ``(bank_id, document_id, sha256(content))``. The CONTENT
+    hash is what makes the key an identity: two entries sharing it carry
+    byte-identical content for the same bank and document, so they are the
+    same memory and the daemon would upsert them onto the same document.
+
+    Do NOT read this as "``document_id`` is content-derived, therefore a
+    matching id means matching content" — that only holds post-#3244
+    (``retain.slice_document_id``); pre-#3244 entries carry a bare session
+    id shared by every retain in that session. Dedupe is safe on either
+    because it hashes the content itself; a *presence GET* is not, which is
+    why that path is gated on ``is_content_derived_document_id``.
 
     ``None`` when there is no ``document_id``: identity cannot be
     established, so the entry must always be kept rather than merged.
@@ -519,8 +641,12 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     ts_ms = int(time.time() * 1000)
     short_uuid = uuid.uuid4().hex[:12]
     # The key goes in the NAME so dedupe is a listing prefix match with no
-    # file reads. `_list_entries` still sorts oldest-first: the fixed-width
-    # millisecond timestamp remains the leading segment.
+    # file reads. The fixed-width millisecond timestamp remains the LEADING
+    # segment, so `_list_entries`' lexicographic sort orders entries by
+    # enqueue millisecond. Entries written inside the SAME millisecond tie-
+    # break on the dupe key (then the random uuid) — arbitrary, but stable
+    # and total; the filename carries no finer age information than the
+    # millisecond, so no ordering could do better.
     name = f"{ts_ms}-{key}-{short_uuid}.json" if key else f"{ts_ms}-{short_uuid}.json"
     final = os.path.join(d, name)
     tmp = final + ".tmp"

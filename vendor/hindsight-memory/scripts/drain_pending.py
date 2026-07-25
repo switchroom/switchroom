@@ -10,16 +10,19 @@ the queue no longer drains it but the operator can still inspect via
 Boundaries
 ----------
 * Per-entry HTTP timeout: ``HINDSIGHT_DRAIN_TIMEOUT`` (default 5s), but
-  clamped per entry to the budget still remaining (see below) so a
-  single slow entry can never overshoot the wall-clock cap. The default
-  timeout (5s) intentionally exceeds the default budget (4s): the clamp,
-  not the raw timeout, is what bounds a slow entry.
+  clamped to the budget still remaining (see below) so a single slow
+  entry can never overshoot the wall-clock cap. The default timeout (5s)
+  intentionally exceeds the default budget (4s): the clamp, not the raw
+  timeout, is what bounds a slow entry.
 * Total wall-clock cap: ``HINDSIGHT_DRAIN_BUDGET_S`` (default 4s) so
   drain never blocks SessionStart longer than the upstream hook timeout
-  permits. This is the authoritative bound; the per-entry timeout is
-  clamped down to ``max(1, remaining budget)`` before each request, so
-  even one slow upstream entry overshoots the budget by at most the
-  clamp floor (~1s), not by ``HINDSIGHT_DRAIN_TIMEOUT - budget``.
+  permits. This is the authoritative bound. The clamp is recomputed
+  **before every request** — the presence GET and, if it falls through,
+  the POST — against the budget remaining *at that moment*, not once per
+  entry. Clamping once per entry spends the same allowance twice (a 9s
+  budget with an 8s timeout measured 16.0s), so the overshoot is bounded
+  by the clamp floor (~1s) only if each request re-reads the remaining
+  budget.
 * Stall guard: if ``STALL_THRESHOLD`` (3) consecutive entries fail with
   the same error class, we stop draining for this session — that's a
   systemic outage, not a transient flake, and continuing would only
@@ -42,12 +45,19 @@ documents**, 3,815 of them with facts extracted.
 ``--backlog`` is therefore a two-phase, out-of-hook replay:
 
 * **Phase 1 — reconcile (free).** GET the document. If it exists, the
-  memory is already durable; drop the queue entry without a POST. No LLM
-  work, no cost, idempotent, resumable at any point.
+  memory is already durable; retire the queue entry without a POST. No
+  LLM work, no cost, idempotent, resumable at any point. Only for
+  post-#3244 CONTENT-derived ``document_id``s — a pre-#3244 bare session
+  id is answered 200 by any retain in that session, so its 200 says
+  nothing about this entry (see ``_reconcilable_on_presence``).
 * **Phase 2 — drain (real work).** Only for genuinely absent documents:
   POST with a realistic timeout, then **re-GET to confirm the document
-  exists before deleting the entry**. A 200 is an ack, not proof
+  exists before retiring the entry**. A 200 is an ack, not proof
   (switchroom #3244).
+
+"Retire" never means ``os.remove``: an entry leaves the queue by MOVING
+into the bounded ``pending-reconciled/`` archive (``pending.
+archive_reconciled``), because every retire decision here rests on a 200.
 
 Pacing is not optional. The local model group backing retain has a small,
 fixed number of lanes shared with live retains, reflect and consolidation,
@@ -78,7 +88,8 @@ from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.pending import (
     MAX_ATTEMPTS,
-    delete_entry,
+    archive_reconciled,
+    is_content_derived_document_id,
     iter_entries,
     mark_dead,
     update_attempt,
@@ -86,6 +97,36 @@ from lib.pending import (
 
 
 STALL_THRESHOLD = 3
+
+
+def _clamp(timeout: int, budget: float, started: float) -> int:
+    """Per-REQUEST HTTP timeout: ``timeout`` capped by the budget LEFT NOW.
+
+    Called immediately before each request — the presence GET and the POST
+    — not once per entry. Computing it once and spending it twice makes the
+    per-entry cost additive: with the fleet's own settings (budget 9s,
+    timeout 8s) a single slow entry measured 16.0s against a 9s budget,
+    while the module docstring promised an overshoot of at most the clamp
+    floor.
+
+    Floor at 1s so a near-exhausted budget still gets one bounded shot
+    rather than a 0s (instant-fail) request. That floor is the entire
+    overshoot: at most ~1s per request, ~2s for a GET+POST entry.
+    """
+    remaining = budget - (time.monotonic() - started)
+    if remaining < 1:
+        return 1
+    return max(1, min(timeout, int(remaining)))
+
+
+def _reconcilable_on_presence(entry: dict) -> bool:
+    """May a bare presence GET retire this entry? See ``pending.py``.
+
+    Only for post-#3244 content-derived ``document_id``s. A pre-#3244
+    entry's id is a bare session id, so a 200 reflects *some* retain in
+    that session, not this entry's content.
+    """
+    return is_content_derived_document_id(entry.get("document_id"))
 
 
 def _per_entry_timeout() -> int:
@@ -167,6 +208,15 @@ def _p95_probe_ms() -> int:
     log in postgres, which an agent container cannot reach — inventing a
     weaker in-container proxy for it would be a worse signal that looks
     like a better one. Unset ⇒ no backoff, and ``--backlog`` says so.
+
+    A CONFIGURED-BUT-BROKEN probe is not the same as an unset one, and
+    used to be indistinguishable: ``out.returncode`` was ignored, so a
+    typo'd or unauthorized command produced empty stdout, ``int()`` raised,
+    and the bare ``except`` returned ``-1`` — silently disabling the very
+    backoff the operator had asked for. It still returns ``-1`` (a replay
+    that halts because its probe is broken is worse than one that runs
+    unpaced), but it now says so loudly on stderr, naming the exit status
+    and stderr tail, so the gap is visible in the drain log.
     """
     cmd = os.environ.get("HINDSIGHT_DRAIN_P95_CMD")
     if not cmd:
@@ -175,8 +225,26 @@ def _p95_probe_ms() -> int:
         out = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=45
         )
+    except Exception as e:
+        _blog(
+            f"p95 probe FAILED to run ({type(e).__name__}: {e}) — backoff is "
+            f"DISABLED for this run. Fix HINDSIGHT_DRAIN_P95_CMD."
+        )
+        return -1
+    if out.returncode != 0:
+        _blog(
+            f"p95 probe exited {out.returncode} — backoff is DISABLED for this "
+            f"run. Fix HINDSIGHT_DRAIN_P95_CMD. stderr: "
+            f"{(out.stderr or '').strip()[:200]}"
+        )
+        return -1
+    try:
         return int(out.stdout.strip().splitlines()[-1])
-    except Exception:
+    except (ValueError, IndexError):
+        _blog(
+            f"p95 probe exited 0 but printed no millisecond figure — backoff is "
+            f"DISABLED for this run. stdout: {(out.stdout or '').strip()[:200]!r}"
+        )
         return -1
 
 
@@ -184,9 +252,9 @@ def _retry_one(entry: dict, timeout: int) -> None:
     """POST a single queued retain. Raises on failure.
 
     Posts ``async_processing=False`` (commit-before-ack, switchroom #3244 §1.1):
-    the drain is a DURABILITY path — it deletes the pending entry on a 200, so
+    the drain is a DURABILITY path — it retires the pending entry on a 200, so
     the 200 must prove durable persistence, not merely ack-of-receipt. A bare
-    async 200 followed by a dropped extraction would delete the queue entry
+    async 200 followed by a dropped extraction would retire the queue entry
     while the content never lands, and (for boot-reconcile remainders whose
     watermark already advanced) there is no reconcile backstop — silent loss
     (the #3244 bug). All drained entries — Stop-hook A2 failures, SessionEnd
@@ -292,10 +360,10 @@ def drain(
 
     Returns a summary dict::
 
-        {"drained": int,   # successful retries (entries deleted)
+        {"drained": int,   # successful retries (entries archived)
          "retried": int,   # failures kept for next session
          "dead":    int,   # entries promoted to .dead this run
-         "reconciled": int,# already durable, dropped without a POST
+         "reconciled": int,# already durable, archived without a POST
          "unknown": int,   # presence unknown, left queued
          "stalled": bool,  # stall guard tripped
          "budget_exceeded": bool}
@@ -326,36 +394,40 @@ def drain(
             debug_log(config, "drain_pending: total budget exceeded, stopping")
             break
 
-        # Clamp the per-entry HTTP timeout to the budget still remaining
-        # (#1094 item 2). Without this, a single slow entry using the full
-        # HINDSIGHT_DRAIN_TIMEOUT (default 5s) overshoots the total budget
-        # (default 4s). Floor at 1s so we still give a near-exhausted
-        # budget one bounded shot rather than a 0s (instant-fail) request.
-        remaining = budget - elapsed
-        effective_timeout = max(1, min(timeout, int(remaining) if remaining >= 1 else 1))
-
         # RECONCILE BEFORE RETRY — this is the fix for the re-post loop in
         # the path that actually runs on every boot, not just in --backlog.
         # 70.4% of the measured fleet backlog already existed as documents;
         # re-POSTing those inside the hook is a guaranteed client timeout
-        # (the clamp above is far below a 30-90s synchronous retain), 30-90s
-        # of wasted server-side extraction, and one more step toward .dead
-        # for a memory that was never actually lost.
+        # (the clamp is far below a 30-90s synchronous retain), 30-90s of
+        # wasted server-side extraction, and one more step toward .dead for
+        # a memory that was never actually lost.
         #
         # A GET is sub-second and it REPLACES that doomed POST, so this
         # strictly reduces both hook latency and upstream load. Only a
-        # definite True drops the entry: False and None (unknown) fall
-        # through to the retry, because guessing "present" would delete the
+        # definite True retires the entry: False and None (unknown) fall
+        # through to the retry, because guessing "present" would retire the
         # last on-disk copy of a turn.
-        if _document_state(entry, timeout=effective_timeout) is True:
-            delete_entry(path)
-            summary["reconciled"] += 1
-            consecutive_failures = 0
-            last_error_class = None
-            continue
+        #
+        # GATED ON THE ID SHAPE. A presence GET only proves *this* entry's
+        # content was committed when the document_id is content-derived
+        # (post-#3244 `retain.slice_document_id`). A pre-#3244 entry carries
+        # a bare session id, for which the bank answers 200 after ANY
+        # successful retain in that session — reconciling on that deletes a
+        # turn that was never committed. Such entries skip the free pass and
+        # go straight to the POST, which is the only thing that can make
+        # them durable.
+        if _reconcilable_on_presence(entry):
+            if _document_state(entry, timeout=_clamp(timeout, budget, started)) is True:
+                archive_reconciled(path)
+                summary["reconciled"] += 1
+                consecutive_failures = 0
+                last_error_class = None
+                continue
 
         try:
-            _retry_one(entry, timeout=effective_timeout)
+            # Re-clamp: the GET above spent part of the budget, and the same
+            # allowance must not be handed out twice (#3599 review F2).
+            _retry_one(entry, timeout=_clamp(timeout, budget, started))
         except Exception as e:
             err_class = _record_failure(config, path, entry, e, summary)
             if err_class == last_error_class:
@@ -375,8 +447,14 @@ def drain(
                 break
             continue
 
-        # Success — delete the entry.
-        delete_entry(path)
+        # Success — retire the entry. ARCHIVED, not deleted: this path
+        # retires on a bare 200 (the hook has no budget for a confirming
+        # GET, which the backlog drain does issue because a 200 is an ack
+        # and not proof — #3244). One durability rule covers both paths:
+        # nothing on the drain path is ever irreversibly removed, so the
+        # in-hook path's weaker evidence costs at most a recoverable file
+        # in ``pending-reconciled/`` instead of a lost turn.
+        archive_reconciled(path)
         summary["drained"] += 1
         consecutive_failures = 0
         last_error_class = None
@@ -396,21 +474,35 @@ def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
     is duplicated LLM extraction for zero new memory. A GET costs nothing
     on the model pool.
 
-    Only a definite ``True`` drops an entry. ``False`` leaves it for phase
-    2; ``None`` (unknown) leaves it queued and is counted — never guessed.
+    Only a definite ``True`` retires an entry, and only for a post-#3244
+    content-derived ``document_id`` (see ``_reconcilable_on_presence``) —
+    a bare session id's 200 says nothing about *this* entry's content.
+    ``False`` leaves it for phase 2; ``None`` (unknown) leaves it queued
+    and is counted — never guessed. Retiring MOVES the entry into
+    ``pending-reconciled/``; it is never ``os.remove``d.
     """
     entries = iter_entries()
     if not entries:
         return
     _blog(f"phase 1 reconcile: checking {len(entries)} entries (no LLM cost)")
+    skipped = 0
     for path, entry in entries:
+        if not _reconcilable_on_presence(entry):
+            skipped += 1
+            continue
         state = _document_state(entry)
         if state is True:
             summary["reconciled"] += 1
             if not dry_run:
-                delete_entry(path)
+                archive_reconciled(path)
         elif state is None:
             summary["unknown"] += 1
+    if skipped:
+        _blog(
+            f"phase 1: {skipped} entries have a pre-#3244 (bare session) "
+            f"document_id — a presence GET cannot prove THEIR content was "
+            f"committed, so they go to phase 2 rather than the free pass"
+        )
     _blog(
         f"phase 1 done: {summary['reconciled']} already durable "
         f"(no POST issued), {summary['unknown']} unknown (left queued)"
@@ -519,12 +611,16 @@ def _drain_backlog_impl(
 
         for (path, entry), err in zip(wave, outcomes):
             if err is None:
-                # COMMIT-BEFORE-DELETE. A 200 is an ack, not proof the
+                # COMMIT-BEFORE-RETIRE. A 200 is an ack, not proof the
                 # document is durable (switchroom #3244), so re-GET before
-                # dropping the last on-disk copy. Anything other than a
-                # definite True keeps the entry.
+                # retiring the last on-disk copy. Anything other than a
+                # definite True keeps the entry. This confirming GET is
+                # meaningful even for a pre-#3244 bare-session id: unlike
+                # the free reconcile pass, it is corroborated by the
+                # synchronous POST of THIS entry's content that just
+                # returned 200. And the entry is archived, not deleted.
                 if _document_state(entry) is True:
-                    delete_entry(path)
+                    archive_reconciled(path)
                     summary["drained"] += 1
                 else:
                     summary["unknown"] += 1

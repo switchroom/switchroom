@@ -36,8 +36,28 @@ import lib.pending as pending  # noqa: E402
 
 CONFIG = {"debug": False}
 
+#: A session id of the shape ``retain.py`` sees (a plain uuid).
+SESSION = "11111111-2222-4333-8444-555555555555"
 
-def _payload(bank="bank-a", content="hello", doc="doc-1"):
+
+def _uuid(n: int) -> str:
+    h = f"{n:032x}"
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
+def _cd_doc(i: int = 1) -> str:
+    """A POST-#3244 content-derived document_id.
+
+    ``retain.slice_document_id`` → ``{session}-r{start_uuid}-{end_uuid}``.
+    Presence-only reconcile is gated on this shape, so the drain tests must
+    use it rather than a stand-in like ``doc-1``.
+    """
+    return f"{SESSION}-r{_uuid(i)}-{_uuid(i + 1000)}"
+
+
+def _payload(bank="bank-a", content="hello", doc=None):
+    if doc is None:
+        doc = _cd_doc(1)
     return {
         "api_url": "http://127.0.0.1:9/none",
         "api_token": None,
@@ -55,6 +75,10 @@ class _QueueTempDirMixin:
     ENV_KEYS = (
         "HINDSIGHT_PENDING_DIR",
         "HINDSIGHT_PENDING_EVICTED_DIR",
+        "HINDSIGHT_PENDING_RECONCILED_DIR",
+        # Absent from this tuple the budget/clamp cases ran against whatever
+        # the ambient env said — vacuously green in CI, where nothing sets it.
+        "HINDSIGHT_DRAIN_TIMEOUT",
         "HINDSIGHT_DRAIN_BUDGET_S",
         "HINDSIGHT_DRAIN_BACKLOG_BUDGET_S",
         "HINDSIGHT_DRAIN_BACKLOG_TIMEOUT",
@@ -71,6 +95,10 @@ class _QueueTempDirMixin:
         os.environ["HINDSIGHT_PENDING_DIR"] = self._dir
         # Backlog replay paces itself by default; tests must not sleep.
         os.environ["HINDSIGHT_DRAIN_SLEEP_S"] = "0"
+        # Hermeticity: a case that cares about the clamp sets this itself;
+        # nothing may inherit an ambient value from the caller's shell.
+        os.environ.pop("HINDSIGHT_DRAIN_TIMEOUT", None)
+        os.environ.pop("HINDSIGHT_DRAIN_BUDGET_S", None)
         self._caps_prev = (pending.MAX_ENTRIES, pending.MAX_BYTES)
 
     def tearDown(self):
@@ -88,6 +116,12 @@ class _QueueTempDirMixin:
     def _archive_names(self):
         try:
             return sorted(os.listdir(pending.evicted_dir()))
+        except OSError:
+            return []
+
+    def _reconciled_names(self):
+        try:
+            return sorted(os.listdir(pending.reconciled_dir()))
         except OSError:
             return []
 
@@ -173,6 +207,98 @@ class EvictionTest(_QueueTempDirMixin, unittest.TestCase):
         finally:
             pending.ARCHIVE_MAX_ENTRIES = prev
 
+    def test_archive_trim_keeps_the_newest_evictions(self):
+        """Direction matters: trimming the wrong end keeps the stale tail.
+
+        ``test_archive_is_itself_bounded`` only pins the COUNT, so reversing
+        the trim direction leaves it green while the archive discards
+        exactly what was just shed.
+        """
+        pending.MAX_ENTRIES = 1
+        prev = pending.ARCHIVE_MAX_ENTRIES
+        pending.ARCHIVE_MAX_ENTRIES = 2
+        try:
+            clock = iter(1000.0 + i for i in range(20))
+            with unittest.mock.patch.object(pending.time, "time", lambda: next(clock)):
+                with redirect_stderr(io.StringIO()):
+                    paths = [
+                        pending.enqueue(_payload(doc=f"d{i}"), RuntimeError("x"))
+                        for i in range(5)
+                    ]
+            evicted_names = [os.path.basename(p) for p in paths[:-1]]
+            self.assertEqual(
+                self._archive_names(),
+                sorted(evicted_names[-2:]),
+                "the archive must keep the most recently evicted entries",
+            )
+        finally:
+            pending.ARCHIVE_MAX_ENTRIES = prev
+
+    def test_eviction_ledger_trim_keeps_the_NEWEST_lines(self):
+        """The ledger is the operator's record of what was shed.
+
+        Trimming the head off (keeping the oldest lines) would leave doctor
+        reading a frozen prefix while every recent eviction fell out — and
+        the existing ledger test only greps for one line, so it stays green
+        either way.
+        """
+        pending.MAX_ENTRIES = 1
+        log = pending.evictions_log_path()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "w", encoding="utf-8") as f:
+            for i in range(500):
+                f.write(f"ANCIENT-{i:03d} evicted=old bytes=0 reason=count\n")
+
+        prev = (pending.EVICTIONS_LOG_MAX_BYTES, pending.EVICTIONS_LOG_KEEP_LINES)
+        pending.EVICTIONS_LOG_MAX_BYTES, pending.EVICTIONS_LOG_KEEP_LINES = 1, 3
+        try:
+            pending.enqueue(_payload(doc="d0"), RuntimeError("x"))
+            with redirect_stderr(io.StringIO()):
+                pending.enqueue(_payload(doc="d1"), RuntimeError("x"))
+        finally:
+            pending.EVICTIONS_LOG_MAX_BYTES, pending.EVICTIONS_LOG_KEEP_LINES = prev
+
+        with open(log, encoding="utf-8") as f:
+            kept = [ln.rstrip("\n") for ln in f]
+        self.assertEqual(len(kept), 3, "trimmed to KEEP_LINES")
+        self.assertIn("evicted=", kept[-1], "the newest line is the real eviction")
+        self.assertEqual(
+            [ln for ln in kept if ln.startswith("ANCIENT-000")],
+            [],
+            "the OLDEST lines must be the ones dropped",
+        )
+        self.assertTrue(
+            kept[0].startswith("ANCIENT-498"),
+            f"kept the wrong end of the ledger: {kept[0]!r}",
+        )
+
+    def test_the_byte_cap_is_a_boundary_not_an_approximation(self):
+        """`nbytes + incoming > MAX_BYTES` evicts; `== MAX_BYTES` does not.
+
+        Off-by-one here is silent: it either sheds a memory that fit, or
+        overshoots the cap the operator set.
+        """
+        pending.MAX_ENTRIES = 1000
+        first = pending.enqueue(_payload(content="x" * 100, doc="d0"), RuntimeError("x"))
+        second = pending.enqueue(_payload(content="y" * 100, doc="d1"), RuntimeError("x"))
+        exact = os.path.getsize(first) + os.path.getsize(second)
+        os.remove(second)
+
+        # Exactly at the cap: the incoming entry fits, nothing may be evicted.
+        pending.MAX_BYTES = exact
+        with redirect_stderr(io.StringIO()):
+            pending.enqueue(_payload(content="y" * 100, doc="d1"), RuntimeError("x"))
+        self.assertEqual(len(self._names()), 2, "an entry that fits exactly must fit")
+        self.assertEqual(self._archive_names(), [], "nothing was over the cap")
+
+        # One byte tighter: the same pair no longer fits, so the oldest sheds.
+        os.remove(sorted(os.path.join(self._dir, n) for n in self._names())[-1])
+        pending.MAX_BYTES = exact - 1
+        with redirect_stderr(io.StringIO()):
+            pending.enqueue(_payload(content="y" * 100, doc="d1"), RuntimeError("x"))
+        self.assertEqual(len(self._archive_names()), 1, "one byte over must evict")
+        self.assertEqual(len(self._names()), 1)
+
     def test_ledgers_live_outside_the_queue_dir(self):
         """So they can never be listed as an entry, drained, or counted."""
         pending.MAX_ENTRIES = 1
@@ -182,6 +308,38 @@ class EvictionTest(_QueueTempDirMixin, unittest.TestCase):
         for p in (pending.evictions_log_path(), pending.drops_path()):
             self.assertNotEqual(os.path.dirname(p), self._dir.rstrip("/"))
         self.assertEqual(pending.count(), 1)
+
+
+class QueueOrderTest(_QueueTempDirMixin, unittest.TestCase):
+    """What the filename ordering does and does not promise.
+
+    FIFO is what eviction and the drain both rely on, and it is exact only
+    down to the millisecond: the name carries no finer age information, so
+    entries sharing a millisecond tie-break on the dupe key — stable and
+    total, but arbitrary. The comment used to claim plain oldest-first.
+    """
+
+    def _enqueue_at(self, ms, content):
+        with unittest.mock.patch.object(pending.time, "time", lambda: ms / 1000.0):
+            return pending.enqueue(_payload(content=content, doc=f"d-{content}"),
+                                   RuntimeError("x"))
+
+    def test_entries_are_ordered_by_enqueue_millisecond(self):
+        newest = self._enqueue_at(1_700_000_002_000, "third")
+        oldest = self._enqueue_at(1_700_000_000_000, "first")
+        middle = self._enqueue_at(1_700_000_001_000, "second")
+        self.assertEqual(
+            [p for p, _ in pending.iter_entries()],
+            [oldest, middle, newest],
+            "write order must not matter; the millisecond stamp orders them",
+        )
+
+    def test_same_millisecond_entries_are_ordered_stably_but_arbitrarily(self):
+        paths = [self._enqueue_at(1_700_000_000_000, f"c{i}") for i in range(4)]
+        got = [p for p, _ in pending.iter_entries()]
+        self.assertEqual(sorted(got), sorted(paths), "every entry is listed once")
+        self.assertEqual(got, sorted(got), "the order is the name sort, not enqueue order")
+        self.assertEqual(got, [p for p, _ in pending.iter_entries()], "and it is stable")
 
 
 class DedupeTest(_QueueTempDirMixin, unittest.TestCase):
@@ -390,9 +548,10 @@ class DropLedgerTest(_QueueTempDirMixin, unittest.TestCase):
 
 class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
     def _queue(self, n):
+        """Queue ``n`` entries with POST-#3244 content-derived document_ids."""
         for i in range(n):
             pending.enqueue(
-                _payload(content=f"turn-{i}", doc=f"doc-{i}"), RuntimeError("boom")
+                _payload(content=f"turn-{i}", doc=_cd_doc(i)), RuntimeError("boom")
             )
         self.assertEqual(pending.count(), n)
 
@@ -428,7 +587,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
     def test_session_start_drain_reconciles_before_re_posting(self):
         self._queue(6)
         posted = []
-        durable = {"doc-0", "doc-1", "doc-2", "doc-3"}
+        durable = {_cd_doc(i) for i in range(4)}
 
         def exists(entry, timeout=30):
             return entry["document_id"] in durable
@@ -442,7 +601,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(summary["reconciled"], 4)
         self.assertEqual(
             sorted(posted),
-            ["doc-4", "doc-5"],
+            sorted([_cd_doc(4), _cd_doc(5)]),
             "already-durable entries must not be re-POSTed inside the hook",
         )
         self.assertEqual(pending.count(), 0)
@@ -461,24 +620,96 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(summary["reconciled"], 0)
         self.assertEqual(len(posted), 3, "unknown falls through to the retry")
 
+    def _stalled_upstream(self, budget, timeout):
+        """Simulate an upstream that never answers, on a virtual clock.
+
+        Every request consumes exactly the timeout it was given — the shape
+        of a hung upstream, and the shape that made the fleet's 9s budget
+        take 16.0s. The clock is virtual so the assertion is about the
+        drain's arithmetic, not about how fast the test box happens to be.
+
+        Returns ``(seen_get, seen_post, elapsed_fn, patch_contexts)``.
+        """
+        os.environ["HINDSIGHT_DRAIN_BUDGET_S"] = str(budget)
+        os.environ["HINDSIGHT_DRAIN_TIMEOUT"] = str(timeout)
+        clock = {"t": 1000.0}
+        start = clock["t"]
+        seen_get, seen_post = [], []
+
+        def fake_get(entry, timeout=30):
+            seen_get.append(timeout)
+            clock["t"] += timeout
+            return False  # absent -> falls through to the POST
+
+        def fake_post(entry, timeout):
+            seen_post.append(timeout)
+            clock["t"] += timeout
+            raise TimeoutError("upstream never answered")
+
+        ctx = (
+            unittest.mock.patch.object(
+                drain_pending.time, "monotonic", lambda: clock["t"]
+            ),
+            unittest.mock.patch.object(drain_pending, "_document_state", fake_get),
+            unittest.mock.patch.object(drain_pending, "_retry_one", fake_post),
+        )
+        return seen_get, seen_post, (lambda: clock["t"] - start), ctx
+
+    def test_the_per_entry_timeout_is_not_spent_twice(self):
+        """One entry = one budget, not one per request.
+
+        The clamp used to be computed ONCE per entry and then spent on the
+        presence GET *and* the POST. With the fleet's own settings (budget
+        9s, timeout 8s) that is 8 + 8 = 16.0s against a 9s hook budget,
+        while the docstring promised an overshoot of at most the 1s clamp
+        floor. The POST's timeout must be recomputed against what is left.
+        """
+        self._queue(1)
+        seen_get, seen_post, elapsed, ctx = self._stalled_upstream(budget=9, timeout=8)
+        with ctx[0], ctx[1], ctx[2]:
+            drain_pending.drain(CONFIG)
+
+        self.assertEqual(seen_get, [8], "the GET gets the full budgeted clamp")
+        self.assertEqual(
+            seen_post, [1], "the POST must re-clamp against the budget LEFT"
+        )
+        self.assertLessEqual(
+            elapsed(),
+            9,
+            f"one entry outspent the whole 9s budget "
+            f"(gets={seen_get} posts={seen_post})",
+        )
+        self.assertEqual(pending.count(), 1, "the failed entry stays queued")
+
     def test_session_start_reconcile_respects_the_hook_budget(self):
-        """The GET replaces the POST; it must not be an extra unbounded call."""
+        """The GET must not be an extra call bolted onto an unchanged POST.
+
+        Asserts against the BUDGET, with ``HINDSIGHT_DRAIN_TIMEOUT`` set
+        explicitly high — the previous form asserted ``t <= 5`` while
+        ``_per_entry_timeout()`` defaults to 5, so it held whether or not
+        the clamp existed at all, and it never patched ``_retry_one``, so
+        the GET+POST path it is named for never ran.
+        """
         self._queue(10)
-        os.environ["HINDSIGHT_DRAIN_BUDGET_S"] = "2"
-        seen = []
-
-        def slow_get(entry, timeout=30):
-            import time as _t
-
-            seen.append(timeout)
-            _t.sleep(0.5)
-            return True
-
-        with unittest.mock.patch.object(drain_pending, "_document_state", slow_get):
+        budget = 9
+        seen_get, seen_post, elapsed, ctx = self._stalled_upstream(
+            budget=budget, timeout=300
+        )
+        with ctx[0], ctx[1], ctx[2]:
             summary = drain_pending.drain(CONFIG)
 
+        self.assertTrue(seen_get and seen_post, "the GET+POST path must run")
+        self.assertTrue(
+            all(t <= budget for t in seen_get + seen_post),
+            f"a single request outlived the whole budget: {seen_get} {seen_post}",
+        )
+        self.assertLessEqual(
+            elapsed(),
+            budget + 2,
+            f"drain overshot the {budget}s hook budget by more than one "
+            f"floored GET+POST (gets={seen_get} posts={seen_post})",
+        )
         self.assertTrue(summary["budget_exceeded"])
-        self.assertTrue(all(t <= 5 for t in seen), f"timeout not clamped: {seen}")
         self.assertGreater(pending.count(), 0)
 
     def test_reconcile_phase_skips_already_durable_entries_without_posting(self):
@@ -487,7 +718,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         memory; a GET costs nothing on the model pool."""
         self._queue(6)
         posted = []
-        durable = {"doc-0", "doc-1", "doc-2"}
+        durable = {_cd_doc(i) for i in range(3)}
 
         def exists(entry, timeout=30):
             return entry["document_id"] in durable
@@ -676,6 +907,201 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
                 )
         self.assertEqual(summary["reconciled"], 3)
         self.assertEqual(pending.count(), 3, "a dry run must not delete anything")
+
+
+class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
+    """A presence GET may only retire an entry whose id proves ITS content.
+
+    Post-#3244 (`retain.slice_document_id`) the id is
+    ``{session}-r{start_uuid}-{end_uuid}`` — a function of which turns the
+    entry carries, so a 200 proves this content was committed. A pre-#3244
+    entry carries a BARE SESSION ID, for which the bank answers 200 after
+    ANY successful retain in that session. Reconciling on that deletes a
+    turn that was never committed. Confirmed against a live 525 KB entry on
+    this fleet whose ``document_id`` is a bare uuid and whose GET returns
+    200.
+    """
+
+    BARE_SESSION_ID = "d52ae253-2d26-42e5-a86b-9a354cc0ace5"
+
+    def test_the_id_shape_predicate_separates_the_two_generations(self):
+        self.assertTrue(pending.is_content_derived_document_id(_cd_doc(1)))
+        # sha256 fallback for uuid-less legacy transcripts
+        self.assertTrue(
+            pending.is_content_derived_document_id(f"{SESSION}-r" + "a1" * 16)
+        )
+        # sub-agent namespace reuses the same recipe
+        self.assertTrue(
+            pending.is_content_derived_document_id(
+                f"{SESSION}-sub-worker7-r{_uuid(1)}-{_uuid(2)}"
+            )
+        )
+        for bad in (
+            self.BARE_SESSION_ID,
+            "conversation",
+            "",
+            None,
+            123,
+            f"{SESSION}-r{_uuid(1)}",  # only one uuid: not the slice shape
+        ):
+            self.assertFalse(
+                pending.is_content_derived_document_id(bad), f"must not accept {bad!r}"
+            )
+
+    def _queue_bare(self, n=2):
+        for i in range(n):
+            pending.enqueue(
+                _payload(content=f"turn-{i}", doc=self.BARE_SESSION_ID),
+                RuntimeError("boom"),
+            )
+
+    def test_a_bare_session_id_is_never_reconciled_on_presence_alone(self):
+        """The bug: a 200 for the session deletes an uncommitted turn."""
+        self._queue_bare(2)
+        posted = []
+
+        def post_fails(entry, timeout):
+            posted.append(entry)
+            raise TimeoutError("upstream slow")
+
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: True
+        ):
+            with unittest.mock.patch.object(drain_pending, "_retry_one", post_fails):
+                summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["reconciled"], 0, "presence alone proves nothing here")
+        self.assertEqual(len(posted), 2, "such entries must go to the POST instead")
+        self.assertEqual(pending.count(), 2, "and stay queued when the POST fails")
+        self.assertEqual(
+            self._reconciled_names(),
+            [],
+            "nothing may be retired by the reconcile path on a bare session id",
+        )
+
+    def test_backlog_reconcile_phase_also_refuses_a_bare_session_id(self):
+        self._queue_bare(2)
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: True
+        ):
+            with redirect_stderr(io.StringIO()) as err:
+                summary = drain_pending.drain_backlog(CONFIG, phase="reconcile")
+
+        self.assertEqual(summary["reconciled"], 0)
+        self.assertEqual(pending.count(), 2, "left for phase 2, which can make them durable")
+        self.assertIn("pre-#3244", err.getvalue())
+
+    def test_reconciled_entries_are_archived_not_deleted(self):
+        """The out-of-band tooling this design was ported from ARCHIVES.
+
+        Every retire decision rests on a 200, and a 200 is evidence, not
+        proof (#3244). An irreversible ``os.remove`` on evidence is how the
+        last on-disk copy of a turn disappears; ``pending-reconciled/`` is
+        recoverable and bounded.
+        """
+        pending.enqueue(_payload(doc=_cd_doc(7)), RuntimeError("x"))
+        name = self._names()[0]
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: True
+        ):
+            summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["reconciled"], 1)
+        self.assertEqual(pending.count(), 0, "no longer queued")
+        self.assertEqual(self._reconciled_names(), [name], "payload is recoverable")
+
+    def test_a_successful_in_hook_retain_also_archives_rather_than_deletes(self):
+        """One durability rule on one path.
+
+        The in-hook success path retires on a bare 200 while the backlog
+        path insists a 200 is not proof. Archiving both makes the weaker
+        evidence cost a recoverable file rather than a lost turn.
+        """
+        pending.enqueue(_payload(doc=self.BARE_SESSION_ID), RuntimeError("x"))
+        name = self._names()[0]
+        with unittest.mock.patch.object(
+            drain_pending, "_retry_one", lambda e, timeout: None
+        ):
+            summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["drained"], 1)
+        self.assertEqual(pending.count(), 0)
+        self.assertEqual(self._reconciled_names(), [name])
+
+    def test_the_backlog_confirmed_drain_archives_too(self):
+        pending.enqueue(_payload(doc=_cd_doc(3)), RuntimeError("x"))
+        name = self._names()[0]
+        with unittest.mock.patch.object(
+            drain_pending, "_retry_one", lambda e, timeout: None
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: True
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+        self.assertEqual(summary["drained"], 1)
+        self.assertEqual(self._reconciled_names(), [name])
+
+    def test_the_reconciled_archive_is_bounded_and_sheds_oldest_first(self):
+        """An unbounded archive is just a slower disk problem."""
+        prev = pending.RECONCILED_MAX_ENTRIES
+        pending.RECONCILED_MAX_ENTRIES = 2
+        try:
+            clock = iter(1000.0 + i for i in range(20))
+            with unittest.mock.patch.object(pending.time, "time", lambda: next(clock)):
+                for i in range(5):
+                    pending.enqueue(
+                        _payload(content=f"c{i}", doc=_cd_doc(i)), RuntimeError("x")
+                    )
+            queued = self._names()
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: True
+            ):
+                drain_pending.drain(CONFIG)
+            self.assertEqual(
+                self._reconciled_names(),
+                queued[-2:],
+                "the archive keeps the NEWEST retirements, trimming oldest-first",
+            )
+        finally:
+            pending.RECONCILED_MAX_ENTRIES = prev
+
+    def test_an_unwritable_archive_still_retires_the_entry(self):
+        """A queue that cannot retire entries re-POSTs them forever."""
+        pending.enqueue(_payload(doc=_cd_doc(9)), RuntimeError("x"))
+        with unittest.mock.patch.object(
+            pending.shutil, "move", side_effect=OSError(28, "No space left")
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: True
+            ):
+                summary = drain_pending.drain(CONFIG)
+        self.assertEqual(summary["reconciled"], 1)
+        self.assertEqual(pending.count(), 0, "the entry must not stay queued")
+
+
+class P95ProbeTest(_QueueTempDirMixin, unittest.TestCase):
+    """A configured-but-broken probe is not the same as an unset one."""
+
+    def test_a_failing_probe_is_not_read_as_a_latency_figure(self):
+        """Exit status was ignored, so a typo'd probe's stdout was trusted."""
+        os.environ["HINDSIGHT_DRAIN_P95_CMD"] = "echo 12345; exit 3"
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(drain_pending._p95_probe_ms(), -1)
+        self.assertIn("exited 3", err.getvalue())
+        self.assertIn("DISABLED", err.getvalue())
+
+    def test_a_probe_that_prints_nothing_says_so(self):
+        os.environ["HINDSIGHT_DRAIN_P95_CMD"] = "true"
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(drain_pending._p95_probe_ms(), -1)
+        self.assertIn("DISABLED", err.getvalue())
+
+    def test_a_healthy_probe_is_read_silently(self):
+        os.environ["HINDSIGHT_DRAIN_P95_CMD"] = "echo 41000"
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(drain_pending._p95_probe_ms(), 41000)
+        self.assertEqual(err.getvalue(), "")
 
 
 class CliTest(unittest.TestCase):

@@ -56,9 +56,38 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
 - **The reconcile runs in the automatic path too, not only in `--backlog`.**
   `session_start.py` calls `drain()` on every boot, so fixing the re-post loop
   only in the operator-invoked mode would have changed nothing operationally.
-  The sequential drain now GETs before it POSTs: a sub-second GET *replaces* a
-  doomed 30-90s server-side extraction, so this reduces both hook latency and
-  upstream load rather than adding to either.
+  The sequential drain now GETs before it POSTs: for an already-durable entry
+  the sub-second GET *replaces* a doomed 30-90s server-side extraction, which
+  is where the latency and upstream-load win comes from. For an entry that
+  still needs POSTing the GET is an extra call, so the per-request timeout is
+  re-clamped against the budget **remaining at that moment** — computing the
+  clamp once per entry and spending it on both requests made the cost additive
+  (measured 16.0s against the fleet's own 9s budget with an 8s timeout).
+- **A presence GET only retires an entry whose `document_id` proves its own
+  content.** Post-#3244 the id is content-derived
+  (`retain.slice_document_id`: `{session}-r{start_uuid}-{end_uuid}`), so a 200
+  proves *that slice* was committed. A pre-#3244 entry carries a bare session
+  id, for which the bank answers 200 after ANY successful retain in that
+  session — reconciling on it would retire a turn that was never committed
+  (confirmed against a live 525 KB entry on this fleet whose `document_id` is a
+  bare uuid and whose GET returns 200). Those entries skip the free pass and go
+  to the POST, which is the only thing that can make them durable.
+- **The drain archives an entry instead of deleting it.** Every "stop queueing
+  this" decision on the drain path rests on an HTTP 200 — a presence GET or a
+  synchronous retain ack — and a 200 is evidence, not proof (#3244). Entries
+  now MOVE into a bounded `pending-reconciled/` sibling
+  (`HINDSIGHT_PENDING_RECONCILED_MAX_ENTRIES` / `_MAX_BYTES`, trimmed
+  oldest-first like `pending-evicted/`), which is what the out-of-band tooling
+  this design was ported from always did. One rule covers both paths: the
+  in-hook drain retires on a bare 200 because the hook has no budget for a
+  confirming GET, the backlog drain re-GETs first — and neither can
+  irreversibly remove the last on-disk copy of a turn.
+- **A broken p95 probe is no longer silent.** `HINDSIGHT_DRAIN_P95_CMD`'s exit
+  status was ignored, so a typo'd or unauthorized command produced an
+  unparsable figure, fell into the bare `except`, and disabled backoff exactly
+  like an unset probe. It still degrades to "no backoff" (a replay that halts
+  because its probe broke is worse than one that runs unpaced), but it now says
+  so on stderr with the exit status and stderr tail.
 - **Dedupe is keyed on the filename, not on the serialized size.** The queued
   copy is always post-`update_attempt` by the time `reconcile_tail` re-enqueues
   (the SessionStart drain attempts every entry on every boot), so a
