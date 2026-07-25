@@ -57,9 +57,20 @@ jobs:
       matrix:
         image: [base, agent, broker, kernel, hostd, auth-broker, hindsight, voice]
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
-
+      # NO `docker/setup-buildx-action` here, deliberately. Every step in
+      # this job is manifest-only (`imagetools inspect` / `imagetools
+      # create`) — pure GHCR registry operations that never touch
+      # BuildKit. setup-buildx-action defaults to the `docker-container`
+      # driver, which boots BuildKit by pulling
+      # `moby/buildkit:buildx-stable-1` from DOCKER HUB, giving this job
+      # a hard docker.io dependency it never uses. The identical bug in
+      # docker-images.yml reddened main twice (runs 30138853707 and
+      # 29977369227) with `ERROR: ... registry-1.docker.io/v2/: ...
+      # Client.Timeout exceeded` while "booting buildkit" — and here the
+      # blast radius is worse, because this is the RELEASE promotion
+      # path: a docker.io blip breaks a release, not just a main push.
+      #
+      # Enforced by tests/docker/manifest-jobs-no-buildx.test.ts.
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
