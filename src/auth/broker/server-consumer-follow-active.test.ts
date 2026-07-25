@@ -21,6 +21,7 @@ import { AuthBroker } from "./server.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { writeAccountCredentials } from "../account-store.js";
+import type { fetchQuota } from "../quota.js";
 
 interface Harness {
   tmp: string;
@@ -120,6 +121,32 @@ function seedAccount(h: Harness, label: string): void {
   );
 }
 
+/**
+ * Offline quota-probe seam — MANDATORY for every broker in this file.
+ *
+ * `mark-exhausted` awaits a LIVE quota probe inside the request path:
+ * `markExhaustedAndRoll` → `nextHealthyAccountLive` → `probeAndCacheOne` →
+ * `fetchQuota`, which force-probes every fallback candidate whose eligibility
+ * is still `unknown`. `fetchQuota`'s default abort is 10s (src/auth/quota.ts),
+ * i.e. more than 3x the `rpc()` deadline above, so an un-injected broker makes
+ * these tests latency-bound on api.anthropic.com — they fail with
+ * `Error: rpc timeout` whenever the runner's egress is slow (observed on CI:
+ * PR #3609 run 30152401449, vitest-shard 2).
+ *
+ * Returning a probe FAILURE keeps the exact selection semantics these tests
+ * have always exercised: the seeded tokens are fakes, so a real probe could
+ * only ever fail too — the candidate stays `unknown` and the selector takes it
+ * as the last-resort roll target.
+ */
+function offlineQuotaProbe(): { impl: typeof fetchQuota; calls: () => number } {
+  let calls = 0;
+  const impl: typeof fetchQuota = async () => {
+    calls += 1;
+    return { ok: false, reason: "test: offline quota probe (never calls api.anthropic.com)" };
+  };
+  return { impl, calls: () => calls };
+}
+
 describe("AuthBroker — unpinned consumer follows the fleet active", () => {
   it("get-credentials serves the fleet active when the consumer has no pin", async () => {
     const h = makeHarness();
@@ -129,6 +156,7 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
       consumers: [{ name: "hindsight" }],
     }), {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: offlineQuotaProbe().impl,
     });
     await broker.start();
     const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
@@ -151,6 +179,7 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
       consumers: [{ name: "hindsight", mirror_dir: mirrorDir }],
     }), {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: offlineQuotaProbe().impl,
     });
     await broker.start();
     await rpc(join(h.socketRoot, "adm", "sock"), {
@@ -169,6 +198,7 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
     const h = makeHarness();
     seedAccount(h, "default");
     seedAccount(h, "secondary");
+    const probe = offlineQuotaProbe();
     const broker = new AuthBroker(makeConfig(h, {
       active: "default",
       fallback_order: ["default", "secondary"],
@@ -176,6 +206,7 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
       consumers: [{ name: "hindsight" }],
     }), {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: probe.impl,
     });
     mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
     await broker.start();
@@ -188,6 +219,10 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
       v: 1, id: "2", op: "get-credentials",
     }) as { ok: boolean; data: { account: string } };
     expect(resp.data.account).toBe("secondary");
+    // The roll's live candidate probe went through the injected seam, not the
+    // network. A zero here means someone dropped `_testFetchQuota` and this
+    // test is back to being latency-bound on api.anthropic.com.
+    expect(probe.calls()).toBeGreaterThan(0);
     broker.stop();
   });
 
@@ -195,12 +230,14 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
     const h = makeHarness();
     seedAccount(h, "default");
     seedAccount(h, "secondary");
+    const probe = offlineQuotaProbe();
     const broker = new AuthBroker(makeConfig(h, {
       active: "default",
       fallback_order: ["default", "secondary"],
       consumers: [{ name: "hindsight" }],
     }), {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: probe.impl,
     });
     await broker.start();
     const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
@@ -208,6 +245,8 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
     }) as { ok: boolean; data: { account: string } };
     expect(resp.ok).toBe(true);
     expect(resp.data.account).toBe("default");
+    // Same guard as above — the roll probed through the seam, never the wire.
+    expect(probe.calls()).toBeGreaterThan(0);
     broker.stop();
   });
 
@@ -219,6 +258,7 @@ describe("AuthBroker — unpinned consumer follows the fleet active", () => {
       consumers: [{ name: "hindsight" }],
     }), {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: offlineQuotaProbe().impl,
     });
     await broker.start();
     const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
