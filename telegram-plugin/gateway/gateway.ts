@@ -9689,8 +9689,18 @@ function gatewayLivenessWiringDeps() {
     SILENCE_FLOOR_MS,
     SILENCE_DEFER_INFLIGHT_TOOLS,
     // #3551 — governs the teardown notice's tail sentence: only promise a
-    // re-ask when the obligation ledger is actually on to deliver one.
-    OBLIGATION_LEDGER_ENABLED,
+    // re-ask when one will ACTUALLY follow. #3575 review B1: this used to be
+    // the static `OBLIGATION_LEDGER_ENABLED` env boolean, which is true for the
+    // whole process and so promised a re-ask for turns whose obligation was
+    // already closed (represent cap reached then escalated, or closed silently
+    // by an outbound-since-open — obligation-wiring.ts:230/:294) or never
+    // opened at all (synthetic / steering / interrupt inbound). It is now a
+    // live per-turn lookup keyed on the turn's own origin id: `turn.turnId` is
+    // `deriveTurnId(chat, thread, messageId)` for a real inbound
+    // (stream-render.ts:273), the SAME identity the ledger keys on
+    // (obligation-wiring.ts:118).
+    isObligationOpenForTurn: (originTurnId: string | null): boolean =>
+      OBLIGATION_LEDGER_ENABLED && originTurnId != null && obligationLedger.isOpen(originTurnId),
     TURN_PREVIEW_MAX,
     STATE_DIR,
     isLegitimatelyWorking,

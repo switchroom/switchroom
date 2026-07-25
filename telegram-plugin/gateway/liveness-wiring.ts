@@ -38,7 +38,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     SILENCE_FALLBACK_HARD_MS,
     SILENCE_FLOOR_MS,
     SILENCE_DEFER_INFLIGHT_TOOLS,
-    OBLIGATION_LEDGER_ENABLED,
+    isObligationOpenForTurn,
     TURN_PREVIEW_MAX,
     STATE_DIR,
     isLegitimatelyWorking,
@@ -488,7 +488,19 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       role: wedgedTurn?.role ?? null,
       finalAnswerDelivered: wedgedTurn?.finalAnswerDelivered ?? false,
       userAddressedTextDelivered,
-      representWillFollow: OBLIGATION_LEDGER_ENABLED,
+      // #3575 review B1 — this must be a question about THIS turn, not a static
+      // env flag. `OBLIGATION_LEDGER_ENABLED` is true for the whole process, so
+      // it promised "being re-asked now" in cases where no re-ask can ever
+      // happen: the obligation already hit OBLIGATION_REPRESENT_MAX (2) and
+      // escalated+closed, or it was closed silently by an outbound-since-open
+      // (obligation-wiring.ts:230/:294), or the inbound never opened one at all
+      // (synthetic / steering / interrupt). The user was then told to wait for a
+      // re-ask that never comes. Ask the ledger about this turn's own origin id
+      // instead, so the honest "please re-send it" branch fires when there is no
+      // open obligation. The lookup is deliberately made HERE, after the
+      // teardown above (which does not touch the ledger), so it reflects the
+      // ledger state at the moment we speak.
+      representWillFollow: isObligationOpenForTurn(wedgedTurn?.turnId ?? null),
       silenceMs: ctx.silenceMs,
     })
     if (teardownNotice.send) {

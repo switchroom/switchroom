@@ -13,14 +13,20 @@
  * OUTCOMES — which real situations speak and which stay quiet — plus the
  * structural guarantee that the wiring actually sends on a speaking decision.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   decideFallbackTeardownNotice,
   formatFrameworkFallbackText,
+  startTurn,
+  __setDepsForTests,
+  __tickForTests,
+  __resetAllForTests,
   type FallbackTeardownNoticeInput,
 } from '../silence-poke.js'
+import { buildSilencePokeOptions } from '../gateway/liveness-wiring.js'
+import { makeLivenessFixture, makeTurn } from './helpers/liveness-wiring-fixture.js'
 
 /** The situation the issue is about: a human asked, got nothing, turn killed. */
 function killedUserTurn(over: Partial<FallbackTeardownNoticeInput> = {}): FallbackTeardownNoticeInput {
@@ -94,6 +100,73 @@ describe('#3551 — the gates that keep this from becoming the retired stall pin
   it('stays quiet when the user already has their answer', () => {
     const d = decideFallbackTeardownNotice(killedUserTurn({ finalAnswerDelivered: true }))
     expect(d).toEqual({ send: false, reason: 'answer-already-delivered' })
+  })
+})
+
+/**
+ * #3575 review — BEHAVIOURAL wiring coverage.
+ *
+ * The three describe blocks below assert regexes against `liveness-wiring.ts`'s
+ * own SOURCE TEXT. They pass if `onFrameworkFallback` is never invoked, if the
+ * notice goes to the wrong chat, or if `sendSilenceText` throws. This block
+ * drives the REAL wiring through silence-poke's REAL tick: arm a turn, step the
+ * fake clock past the 300 s threshold, and assert on the send that happens.
+ */
+describe('#3551 — the teardown notice actually reaches the user (integration)', () => {
+  const CHAT = '-100999'
+  const THREAD = 11
+  const KEY = `${CHAT}:${THREAD}`
+  const TURN_ID = '-100999:11#42'
+
+  afterEach(() => {
+    __resetAllForTests()
+    __setDepsForTests(null)
+  })
+
+  async function fireFallback(opts: { obligationOpen: boolean }) {
+    const fx = makeLivenessFixture()
+    const turn = makeTurn({ sessionChatId: CHAT, sessionThreadId: THREAD, turnId: TURN_ID })
+    fx.activeTurnStartedAt.set(KEY, 0)
+    fx.setCurrentTurn(turn)
+    if (opts.obligationOpen) fx.openObligations.add(TURN_ID)
+    __setDepsForTests(buildSilencePokeOptions(fx.deps))
+    startTurn(KEY, 0)
+    __tickForTests(301_000)
+    // onFrameworkFallback is async; let its awaits settle.
+    await new Promise((r) => setTimeout(r, 0))
+    return fx
+  }
+
+  it('sends the notice — right chat, right thread, LOUD — after 300s of silence', async () => {
+    const fx = await fireFallback({ obligationOpen: true })
+    const notice = fx.sent.find((s) => s.text.includes('the framework ended that stalled turn'))
+    expect(notice, 'the teardown notice must actually be sent').toBeDefined()
+    expect(notice!.chatId).toBe(CHAT)
+    expect(notice!.threadId).toBe(THREAD)
+    // LOUD: a killed question is not a silent status surface.
+    expect(notice!.silent).toBe(false)
+    // ...and the load-bearing unwedge still ran.
+    expect(fx.endedKeys).toContain(KEY)
+  })
+
+  it('promises the re-ask only when THIS turn has an open obligation', async () => {
+    // #3575 review B2. `representWillFollow` used to be the STATIC
+    // `OBLIGATION_LEDGER_ENABLED` env boolean, so the notice promised "being
+    // re-asked now" even when no re-ask could ever happen — the obligation
+    // already hit OBLIGATION_REPRESENT_MAX and escalated+closed, or was closed
+    // by an outbound-since-open, or was never opened. The user was told to wait,
+    // and waited forever.
+    //
+    // These two runs differ ONLY in whether this turn's obligation is open. Any
+    // process-wide constant fails one of them, so restoring the static flag
+    // cannot pass.
+    const open = await fireFallback({ obligationOpen: true })
+    const closed = await fireFallback({ obligationOpen: false })
+    const openText = open.sent.find((s) => s.text.includes('framework ended'))!.text
+    const closedText = closed.sent.find((s) => s.text.includes('framework ended'))!.text
+    expect(openText).toContain('being re-asked now')
+    expect(closedText).toContain('please re-send it')
+    expect(closedText).not.toContain('re-asked')
   })
 })
 

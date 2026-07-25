@@ -27,6 +27,8 @@ import {
   type SilencePokeMetric,
   type FrameworkFallbackContext,
 } from '../silence-poke.js'
+import { buildSilencePokeOptions } from '../gateway/liveness-wiring.js'
+import { makeLivenessFixture } from './helpers/liveness-wiring-fixture.js'
 
 const ORIGINAL_KILL_SWITCH = process.env.SWITCHROOM_DISABLE_SILENCE_POKE
 
@@ -149,30 +151,57 @@ describe('#3552 — the production isTurnLive predicate', () => {
   it('is wired with BOTH clauses ANDed — the near-miss this fix turns on', () => {
     const line = src.split('\n').find((l) => l.includes('isTurnLive:'))
     expect(line, 'isTurnLive must be wired in liveness-wiring.ts').toBeDefined()
-    // Both halves must be present, negated together. `activeTurnStartedAt`
-    // ALONE is the wrong predicate: `releaseTurnBufferGate` clears it mid-turn
-    // on every final-answer reply, so a predicate missing the `getCurrentTurn()`
+    // EXACT text, not a bag of fragments. #3575 review: the previous form
+    // asserted four independent regexes that each had to match SOMEWHERE on the
+    // line, with nothing anchoring the end of the arrow body and nothing
+    // forbidding extra conjuncts — so mutants SURVIVED it, including
+    //   `!(A == null && B == null) && activeTurnStartedAt.get(key) != null`
+    // which boolean-reduces to exactly the naive `activeTurnStartedAt`-only
+    // predicate this test is NAMED after, plus `&& false` (reaper disabled for
+    // every key) and an inverted `=== false`. Both halves must be present,
+    // negated TOGETHER, and nothing else may be ANDed on:
+    // `activeTurnStartedAt` ALONE is the wrong predicate, because
+    // `releaseTurnBufferGate` clears it mid-turn on every final-answer reply,
+    // so a predicate missing (or effectively cancelling) the `getCurrentTurn()`
     // clause silently reaps live turns doing post-answer work.
-    expect(line!).toMatch(/activeTurnStartedAt\.get\(key\) == null/)
-    expect(line!).toMatch(/getCurrentTurn\(\) == null/)
-    expect(line!).toMatch(/&&/)
-    expect(line!).toMatch(/^\s*isTurnLive: \(key\) => !\(/)
+    expect(line!.trim()).toBe(
+      'isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurn() == null),',
+    )
   })
 
   it('matches the late-fire guard it was deliberately copied from', () => {
     // Same condition, so a mid-turn buffer-gate release can never be reaped by
     // one and treated as live by the other. If someone tightens/loosens one
     // site only, the two drift and the reaper starts disagreeing with the guard.
+    //
+    // #3575 review: scan CODE only. Counting occurrences across the raw file let
+    // an OR-for-AND swap survive by leaving the canonical text behind in a stale
+    // comment — the comment paid for the missing code site.
+    const code = src
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim()
+        return !(t.startsWith('//') || t.startsWith('*') || t.startsWith('/*'))
+      })
+      .join('\n')
     const predicate = /activeTurnStartedAt\.get\([\w.]+\) == null && getCurrentTurn\(\) == null/g
-    expect((src.match(predicate) ?? []).length).toBeGreaterThanOrEqual(3)
+    expect((code.match(predicate) ?? []).length).toBeGreaterThanOrEqual(3)
   })
 
-  // Behavioural model of the SAME expression over the two gateway maps, so the
-  // buffer-gate case is asserted as an outcome rather than by stubbing.
-  const productionPredicate = (
-    activeTurnStartedAt: Map<string, number>,
-    currentTurn: object | null,
-  ) => (key: string) => !(activeTurnStartedAt.get(key) == null && currentTurn == null)
+  // #3575 review B3 — EXECUTE the real predicate. The previous version of this
+  // block re-typed the expression by hand into a local `productionPredicate`,
+  // which by construction cannot detect divergence from the wiring it claims to
+  // cover. `buildSilencePokeOptions` is a pure function of its deps (its only
+  // gateway import is `import type`), so the real options object — including the
+  // real `isTurnLive` closure — can be built here.
+  function realPredicate(activeTurnStartedAt: Map<string, number>, currentTurn: object | null) {
+    const fx = makeLivenessFixture()
+    for (const [k, v] of activeTurnStartedAt) fx.activeTurnStartedAt.set(k, v)
+    fx.setCurrentTurn(currentTurn)
+    const isTurnLive = buildSilencePokeOptions(fx.deps).isTurnLive
+    expect(isTurnLive, 'the wiring must supply isTurnLive').toBeTypeOf('function')
+    return isTurnLive!
+  }
 
   it('calls a mid-turn buffer-gate release LIVE (the near-miss), where the naive predicate would not', () => {
     const m = new Map<string, number>()
@@ -181,7 +210,7 @@ describe('#3552 — the production isTurnLive predicate', () => {
     // `releaseTurnBufferGate` / `finalizeStatusReaction('done')` fire mid-turn
     // on every final-answer reply and clear this entry while the turn runs on.
     m.delete(KEY)
-    expect(productionPredicate(m, liveTurn)(KEY)).toBe(true)
+    expect(realPredicate(m, liveTurn)(KEY)).toBe(true)
     // The predicate I nearly shipped — activeTurnStartedAt alone — would have
     // reaped this live turn, permanently and silently.
     const naive = (key: string) => m.get(key) != null
@@ -189,11 +218,78 @@ describe('#3552 — the production isTurnLive predicate', () => {
   })
 
   it('calls a genuinely finished turn DEAD (so the reap still happens)', () => {
-    expect(productionPredicate(new Map(), null)(KEY)).toBe(false)
+    expect(realPredicate(new Map(), null)(KEY)).toBe(false)
   })
 
   it('calls a turn with its gate still set LIVE even when the singleton is null', () => {
     const m = new Map<string, number>([[KEY, 0]])
-    expect(productionPredicate(m, null)(KEY)).toBe(true)
+    expect(realPredicate(m, null)(KEY)).toBe(true)
+  })
+
+  // The dangerous case, end to end through silence-poke's own tick, with the
+  // REAL predicate wired as the reaper. `releaseTurnBufferGate` (turn-end.ts:371)
+  // deletes the `activeTurnStartedAt` entry on EVERY reply finalize — including
+  // a mid-turn interim ack — while the turn keeps running; `getCurrentTurn()` is
+  // the UNKEYED singleton mirror. So a still-running turn whose gate was
+  // released AND whose mirror has been nulled by another topic reads dead on
+  // BOTH clauses, and IS reaped. This test states that residual honestly rather
+  // than pretending the conjunction covers it: a false reap is permanent and
+  // silent (nothing re-arms until the next `startTurn`), costing the turn both
+  // its mid-turn beat and its 300s unwedge. The durable fix is a keyed liveness
+  // read (or a re-arm safety), NOT a wider predicate — see #3580.
+  it('documents the residual: with BOTH signals dead the tick reaps, even mid-turn', async () => {
+    const emitted: SilencePokeMetric[] = []
+    const fallbacks: FrameworkFallbackContext[] = []
+    const fx = makeLivenessFixture()
+    // Turn A is live for THIS key...
+    fx.activeTurnStartedAt.set(KEY, 0)
+    fx.setCurrentTurn({ turnId: 'a#1' })
+    const opts = buildSilencePokeOptions(fx.deps)
+    __setDepsForTests({
+      ...opts,
+      emitMetric: (e) => emitted.push(e),
+      onFrameworkFallback: async (ctx) => { fallbacks.push(ctx) },
+    })
+    startTurn(KEY, 0)
+    __tickForTests(5_000)
+    expect(__getStateForTests(KEY)).toBeDefined()
+
+    // ...then the final answer lands: releaseTurnBufferGate drops the
+    // activeTurnStartedAt entry, and currentTurn is nulled — while the turn
+    // keeps doing post-answer work.
+    fx.activeTurnStartedAt.delete(KEY)
+    fx.setCurrentTurn(null)
+    __tickForTests(10_000)
+
+    // Ground truth of the near-miss: BOTH naive readings say "dead" here.
+    expect(fx.activeTurnStartedAt.get(KEY) == null).toBe(true)
+    expect(fx.deps.getCurrentTurn() == null).toBe(true)
+    // ...and the real wiring still reaps it, because the conjunction is what
+    // the predicate negates. (Documented outcome: this IS a reap. See the
+    // re-arm note in the test below.)
+    expect(__getStateForTests(KEY)).toBeUndefined()
+    expect(emitted.some((e) => e.kind === 'silence_poke_orphan_reaped')).toBe(true)
+    expect(fallbacks).toHaveLength(0)
+  })
+
+  it('keeps a live turn armed whenever EITHER liveness signal survives (the conjunction is load-bearing)', () => {
+    // The two survivable shapes of the buffer-gate window, through the real
+    // predicate on the real tick. Either signal alone must hold the state.
+    for (const shape of ['gate-only', 'singleton-only'] as const) {
+      __resetAllForTests()
+      const emitted: SilencePokeMetric[] = []
+      const fx = makeLivenessFixture()
+      if (shape === 'gate-only') fx.activeTurnStartedAt.set(KEY, 0)
+      else fx.setCurrentTurn({ turnId: 'a#1' })
+      __setDepsForTests({
+        ...buildSilencePokeOptions(fx.deps),
+        emitMetric: (e) => emitted.push(e),
+        onFrameworkFallback: async () => {},
+      })
+      startTurn(KEY, 0)
+      __tickForTests(10_000)
+      expect(__getStateForTests(KEY), shape).toBeDefined()
+      expect(emitted.some((e) => e.kind === 'silence_poke_orphan_reaped'), shape).toBe(false)
+    }
   })
 })
