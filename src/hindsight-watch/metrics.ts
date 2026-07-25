@@ -12,8 +12,6 @@
  *   hindsight_operation_operations_total{budget="",max_tokens="",
  *     operation="retain",otel_scope_name="hindsight_api.metrics",...,
  *     source="api",success="true",tenant="public"} 13.0
- *   hindsight_operation_duration_seconds_bucket{...,le="60.0",
- *     operation="retain",...} 10.0
  *
  * Label order is NOT stable across exporters, so we parse labels into a map
  * and match on the subset we care about rather than string-matching a
@@ -26,9 +24,6 @@ export interface Series {
   labels: Record<string, string>;
   value: number;
 }
-
-/** `+Inf` bucket key, kept as a string so the record is JSON-stable. */
-export const INF_BUCKET = "+Inf";
 
 /**
  * Parse a Prometheus text exposition body. `#`-prefixed HELP/TYPE lines and
@@ -141,7 +136,6 @@ export function hasMatching(
 }
 
 export const OP_COUNTER = "hindsight_operation_operations_total";
-export const OP_BUCKET = "hindsight_operation_duration_seconds_bucket";
 
 /** The retain slice of one `/metrics` scrape, as the watchdog uses it. */
 export interface RetainSignals {
@@ -149,12 +143,6 @@ export interface RetainSignals {
   ok: number;
   /** cumulative failed retain operations (all sources) */
   fail: number;
-  /**
-   * Cumulative retain-duration histogram, `le` → cumulative count, summed
-   * over every retain series (api + worker, success true + false). Keys are
-   * the raw `le` strings so the record round-trips through JSON unchanged.
-   */
-  buckets: Record<string, number>;
 }
 
 /**
@@ -180,15 +168,7 @@ export function readRetainSignals(series: Series[]): RetainSignals {
     operation: "retain",
     success: "false",
   });
-  const buckets: Record<string, number> = {};
-  for (const s of series) {
-    if (s.name !== OP_BUCKET) continue;
-    if (s.labels.operation !== "retain") continue;
-    const le = s.labels.le;
-    if (le === undefined) continue;
-    buckets[le] = (buckets[le] ?? 0) + s.value;
-  }
-  return { ok, fail, buckets };
+  return { ok, fail };
 }
 
 /**
@@ -203,81 +183,4 @@ export function readRetainSignals(series: Series[]): RetainSignals {
 export function counterDelta(prev: number, next: number): number {
   if (!Number.isFinite(prev) || !Number.isFinite(next)) return 0;
   return next >= prev ? next - prev : Math.max(0, next);
-}
-
-/** Per-`le` delta of two cumulative histograms, with reset handling. */
-export function bucketDelta(
-  prev: Record<string, number>,
-  next: Record<string, number>,
-): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const [le, v] of Object.entries(next)) {
-    out[le] = counterDelta(prev[le] ?? 0, v);
-  }
-  return out;
-}
-
-/** Add `b` into `a` in place (bucket accumulation across a ring window). */
-export function addBuckets(
-  a: Record<string, number>,
-  b: Record<string, number>,
-): Record<string, number> {
-  for (const [le, v] of Object.entries(b)) a[le] = (a[le] ?? 0) + v;
-  return a;
-}
-
-/** Result of a quantile read over a cumulative histogram. */
-export interface QuantileResult {
-  /** Estimated seconds; `Infinity` when the quantile lands in `+Inf`. */
-  seconds: number;
-  /** Total observations in the histogram (the `+Inf` bucket). */
-  count: number;
-  /**
-   * True when the quantile fell in the `+Inf` bucket — the exposition's
-   * largest finite `le` is 120, so all we can honestly say is "> 120s".
-   */
-  saturated: boolean;
-}
-
-/**
- * Linear-interpolated quantile over a CUMULATIVE bucket map (`le` → count),
- * the same estimator Prometheus' `histogram_quantile` uses. Returns
- * `count: 0` when the histogram is empty; the caller must treat that as
- * insufficient data, never as a healthy zero.
- */
-export function histogramQuantile(
-  buckets: Record<string, number>,
-  q: number,
-): QuantileResult {
-  const finite = Object.entries(buckets)
-    .filter(([le]) => le !== INF_BUCKET)
-    .map(([le, count]) => ({ le: Number(le), count }))
-    .filter((b) => Number.isFinite(b.le))
-    .sort((a, b) => a.le - b.le);
-  const count = buckets[INF_BUCKET] ?? (finite.length > 0 ? finite[finite.length - 1].count : 0);
-  if (count <= 0) return { seconds: 0, count: 0, saturated: false };
-  const rank = q * count;
-  let prevLe = 0;
-  let prevCount = 0;
-  for (const b of finite) {
-    if (b.count >= rank) {
-      const span = b.count - prevCount;
-      if (span <= 0) return { seconds: b.le, count, saturated: false };
-      const frac = (rank - prevCount) / span;
-      return { seconds: prevLe + frac * (b.le - prevLe), count, saturated: false };
-    }
-    prevLe = b.le;
-    prevCount = b.count;
-  }
-  // Past the largest finite bucket: the observation is in `+Inf`.
-  return { seconds: Infinity, count, saturated: true };
-}
-
-/** The largest finite `le` in the retain histogram (exposition-derived). */
-export function largestFiniteBucket(buckets: Record<string, number>): number {
-  const les = Object.keys(buckets)
-    .filter((le) => le !== INF_BUCKET)
-    .map(Number)
-    .filter((n) => Number.isFinite(n));
-  return les.length === 0 ? 0 : Math.max(...les);
 }

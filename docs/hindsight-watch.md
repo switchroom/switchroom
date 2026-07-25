@@ -16,10 +16,12 @@ itself) in service of `reference/jobs/remember-across-sessions.md`.
 
 ## What it costs
 
-Per tick: one HTTP GET of `/metrics`, one `docker inspect`, and one `readdir`
-per agent. Zero model tokens — no session, no LLM call, ever. At the
-recommended 15-minute cadence that is 4 requests an hour against a backend
-whose own workers issue thousands.
+Per tick: one HTTP GET of `/metrics` (258 741 B today), one `docker inspect`,
+and per agent two `readdir`s plus one small `pending-drops.json` read. No
+queue **entry** is ever opened — those carry whole transcripts (p50 ~98 KB).
+Zero model tokens — no session, no LLM call, ever. At the recommended
+15-minute cadence that is 4 requests an hour against a backend whose own
+workers issue thousands.
 
 ## Signals
 
@@ -27,10 +29,9 @@ whose own workers issue thousands.
 |---|---|---|
 | `probe` | `/metrics` unreachable, unparseable, or missing the retain series; `docker inspect` fails; the agents dir is unreadable | level |
 | `retain-failure-rate` | ≥10 % of retains in the rolling window failed | level |
-| `retain-queue-growth` | spool ≥100 deep **and** grew by ≥max(20, 10 %) across the window | level |
-| `retain-dead` | any new `*.json.dead` marker (a permanently lost memory) | edge |
+| `retain-queue-growth` | spool ≥440 entries deep **and** grew by ≥max(88, 10 %) across the window | level |
+| `retain-loss` | any new `*.json.dead` marker, `pending-evicted/` entry, or `pending-drops.json` count — memory that left the queue without being persisted | edge |
 | `container` | `switchroom-hindsight` unhealthy, restarted, or recreated | edge |
-| `retain-latency-p95` | retain p95 ≥120 s (the largest bucket the histogram resolves) | level |
 
 A **level** signal needs two consecutive breaching evaluations to fire; an
 **edge** signal fires on the first, because it reports a discrete event that
@@ -47,15 +48,30 @@ measurement in the doc comment. Summary:
 - **10 % failure rate** — the storm ran at 66–100 % daily; the worst healthy
   hour measured 2.7 %. 10 % sits an order of magnitude above normal noise and
   an order of magnitude below the incident.
+  Re-checked live after #3611: 3 failures in 268 retains = 1.1 %.
 - **20-retain sample floor** — a "50 % failure rate" over two retains is
-  noise, and hindsight goes genuinely idle overnight.
-- **spool floor 100 + growth ≥max(20, 10 %)** — the spool is a *retry queue*:
+  noise, and hindsight goes genuinely idle overnight. Live throughput is
+  ~25 retains per 15-minute tick, so a healthy 2 h window carries ~200.
+- **spool floor 440 + growth ≥max(88, 10 %)** — the spool is a *retry queue*:
   non-zero is normal, draining is healthy. Growth is measured newest-versus-
   window-start so a drain (5 636 → 616, observed live) stays silent.
-- **p95 ≥120 s** — measured steady-state retain p95 is ~70 s and the client
-  timeout is 300 s (`HINDSIGHT_API_RETAIN_LLM_TIMEOUT`). 120 s is the top
-  finite histogram bucket, so it is both a real early warning and the largest
-  latency the exposition can resolve.
+
+  **Both numbers were re-derived for #3610.** A queue entry is no longer one
+  memory: an oversized retain is split at 45 000 chars into one entry *per
+  part*. Measured against the live queue — 174 entries, 171 of them over the
+  bound, expanding to 765 parts — that is `PARTS_PER_MEMORY = 4.4`. The
+  operator-meaningful thresholds are still "100 memories deep" and "20 new
+  memories", so both are written as `⌈memories × 4.4⌉` in `thresholds.ts`
+  (100 → 440, 20 → 88). Without this, five worst-case memories (17 parts
+  each = 85 entries) would have paged under the pre-#3610 numbers.
+- **no p95 latency signal** — deliberately removed rather than retuned.
+  Hindsight's exposition tops out at a finite `le` of 120 s, and a *healthy*
+  post-#3610 backend already runs 52 of 268 retains (19.4 %) past it, because
+  #3610 sizes content so a max-size part lands ~276 s inside the 280 s client
+  deadline. So the instrument is blind across exactly the 120–280 s band
+  where an early warning would live, and any threshold it *can* resolve fires
+  permanently on a healthy fleet. Restoring the signal needs new `le` edges
+  from hindsight — an instrument change, not a constant change.
 - **window: 8 samples, max 3 h old** — 2 h at a 15-minute cadence, with the
   age cap so a stopped cron re-baselines instead of paging about a stale era.
 - **re-notify quiet period: 6 h** — a firing signal DMs once, then at most

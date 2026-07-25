@@ -1,9 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  bucketDelta,
   counterDelta,
-  histogramQuantile,
-  largestFiniteBucket,
   parseExposition,
   readRetainSignals,
   sumMatching,
@@ -59,10 +56,13 @@ describe("readRetainSignals", () => {
     expect(s.fail).toBe(5);
   });
 
-  it("collects only the retain histogram buckets", () => {
+  it("ignores the duration histogram entirely", () => {
+    // The `retain-latency-p95` signal was removed (thresholds.ts documents
+    // why: 120s is the top finite `le` and a healthy backend already runs
+    // 19.4% of retains past it), so the reader must not carry buckets it
+    // has no consumer for.
     const s = readRetainSignals(parseExposition(LIVE));
-    expect(s.buckets["+Inf"]).toBe(13); // recall's +Inf=3 must NOT be folded in
-    expect(s.buckets["60.0"]).toBe(10);
+    expect(Object.keys(s).sort()).toEqual(["fail", "ok"]);
   });
 
   it("THROWS when the retain counter is absent — a renamed metric must not read as zero failures", () => {
@@ -94,46 +94,5 @@ describe("counterDelta", () => {
     // A naive next-prev is -896, which would evaluate as a healthy window
     // precisely when the container just crashed.
     expect(counterDelta(900, 4)).toBe(4);
-  });
-});
-
-describe("bucketDelta", () => {
-  it("diffs per-le and handles a reset", () => {
-    expect(bucketDelta({ "60.0": 10, "+Inf": 12 }, { "60.0": 14, "+Inf": 20 })).toEqual({
-      "60.0": 4,
-      "+Inf": 8,
-    });
-    expect(bucketDelta({ "60.0": 10, "+Inf": 12 }, { "60.0": 1, "+Inf": 2 })).toEqual({
-      "60.0": 1,
-      "+Inf": 2,
-    });
-  });
-});
-
-describe("histogramQuantile", () => {
-  it("interpolates inside a bucket", () => {
-    // 100 observations, all ≤60s, uniformly spread over 30..60.
-    const q = histogramQuantile({ "30.0": 0, "60.0": 100, "+Inf": 100 }, 0.95);
-    expect(q.count).toBe(100);
-    expect(q.saturated).toBe(false);
-    expect(q.seconds).toBeCloseTo(58.5, 1);
-  });
-
-  it("reports saturation when the quantile lands in +Inf", () => {
-    // 90 fast retains, 10 that blew past the largest finite bucket (120s).
-    const q = histogramQuantile({ "60.0": 90, "120.0": 90, "+Inf": 100 }, 0.95);
-    expect(q.saturated).toBe(true);
-    expect(q.seconds).toBe(Infinity);
-  });
-
-  it("returns count 0 for an empty histogram rather than a healthy-looking 0s", () => {
-    const q = histogramQuantile({ "60.0": 0, "+Inf": 0 }, 0.95);
-    expect(q.count).toBe(0);
-  });
-});
-
-describe("largestFiniteBucket", () => {
-  it("reports the exposition's top finite le", () => {
-    expect(largestFiniteBucket({ "30.0": 1, "120.0": 2, "+Inf": 3 })).toBe(120);
   });
 });

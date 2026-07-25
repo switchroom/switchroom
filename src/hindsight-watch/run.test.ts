@@ -41,9 +41,9 @@ describe("applyHysteresis — the anti-spam contract", () => {
     expect(second.next.firedAt).toBe(2000);
   });
 
-  it("fires an EDGE signal (container / dead retains) immediately", () => {
+  it("fires an EDGE signal (container / memory loss) immediately", () => {
     expect(applyHysteresis(FRESH, BREACH("container"), 1000).transition).toBe("fired");
-    expect(applyHysteresis(FRESH, BREACH("retain-dead"), 1000).transition).toBe("fired");
+    expect(applyHysteresis(FRESH, BREACH("retain-loss"), 1000).transition).toBe("fired");
   });
 
   it("does NOT re-notify on every subsequent breach", () => {
@@ -119,6 +119,22 @@ function spool(pending: number, dead = 0): void {
   mkdirSync(d, { recursive: true });
   for (let i = 0; i < pending; i++) writeFileSync(join(d, `p${i}.json`), "{}");
   for (let i = 0; i < dead; i++) writeFileSync(join(d, `d${i}.json.dead`), "{}");
+}
+
+/** #3599's `pending-evicted/` archive — a SIBLING of `pending-retains/`. */
+function evicted(n: number): void {
+  const d = join(agentsDir, "alpha", "home", ".hindsight", "pending-evicted");
+  rmSync(d, { recursive: true, force: true });
+  mkdirSync(d, { recursive: true });
+  for (let i = 0; i < n; i++) writeFileSync(join(d, `e${i}.json`), "{}");
+}
+
+/** #3599's `record_drop` ledger — retains that never reached the queue. */
+function drops(count: number): void {
+  writeFileSync(
+    join(agentsDir, "alpha", "home", ".hindsight", "pending-drops.json"),
+    JSON.stringify({ schema: 1, count, last_dropped_at: "2026-07-26T00:00:00Z" }),
+  );
 }
 
 function metricsBody(ok: number, fail: number): string {
@@ -298,8 +314,60 @@ describe("tick — end to end over a real state file", () => {
     spool(10, 3);
     const r = await tick({ ...base, nowFn: () => t0 + 900_000 });
     expect(r.exitCode).toBe(10);
-    expect(sent.texts.some((t) => t.includes("retain-dead"))).toBe(true);
-    expect(sent.texts.some((t) => t.includes("permanently lost"))).toBe(true);
+    expect(sent.texts.some((t) => t.includes("retain-loss"))).toBe(true);
+    expect(sent.texts.some((t) => t.includes("3 new .dead marker(s)"))).toBe(true);
+  });
+
+  // #3599 added two loss channels beside `.dead`, and the probe has to walk
+  // real sibling paths to see them — so they are asserted end to end here
+  // rather than only against a hand-built window.
+  it("fires when memory is EVICTED from a full queue (#3599), not just .dead", async () => {
+    const sent: Sent = { texts: [] };
+    spool(10, 0);
+    evicted(0);
+    const base = {
+      statePath,
+      agentsDir,
+      notify: makeNotify(sent),
+      run: dockerOk(),
+      fetchImpl: fakeFetch(metricsBody(100, 0)),
+    };
+    const t0 = Date.parse("2026-07-25T09:00:00Z");
+    await tick({ ...base, nowFn: () => t0 });
+    evicted(4);
+    const r = await tick({ ...base, nowFn: () => t0 + 900_000 });
+    expect(r.exitCode).toBe(10);
+    expect(sent.texts.some((t) => t.includes("4 new evicted entry(s)"))).toBe(true);
+    // The evicted archive must never be counted as live queue depth.
+    const loss = r.outcomes.find((o) => o.verdict.signal === "retain-loss");
+    expect(loss?.verdict.measured).toMatchObject({ evicted: 4, dead: 0, drops: 0 });
+    const growth = r.outcomes.find((o) => o.verdict.signal === "retain-queue-growth");
+    expect(growth?.verdict.measured?.pending).toBe(10);
+  });
+
+  it("fires when a retain never reached the queue at all (record_drop ledger)", async () => {
+    const sent: Sent = { texts: [] };
+    spool(10, 0);
+    drops(2);
+    const base = {
+      statePath,
+      agentsDir,
+      notify: makeNotify(sent),
+      run: dockerOk(),
+      fetchImpl: fakeFetch(metricsBody(100, 0)),
+    };
+    const t0 = Date.parse("2026-07-25T09:00:00Z");
+    // A pre-existing, non-zero drop count is NOT news — only a rise is.
+    const r0 = await tick({ ...base, nowFn: () => t0 });
+    const r1 = await tick({ ...base, nowFn: () => t0 + 900_000 });
+    expect(r0.exitCode).toBe(0);
+    expect(r1.exitCode).toBe(0);
+    expect(sent.texts).toEqual([]);
+
+    drops(5);
+    const r2 = await tick({ ...base, nowFn: () => t0 + 1_800_000 });
+    expect(r2.exitCode).toBe(10);
+    expect(sent.texts.some((t) => t.includes("3 new dropped retain(s)"))).toBe(true);
   });
 
   it("retries the alert next tick when delivery fails (undelivered ≠ notified)", async () => {

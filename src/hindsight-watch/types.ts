@@ -4,22 +4,28 @@
  * that has to survive an upgrade.
  */
 
-/** Every signal the watchdog can raise. Stable ids — they key the state file. */
+/**
+ * Every signal the watchdog can raise. Stable ids — they key the state file.
+ *
+ * `retain-latency-p95` was removed before this ever shipped: hindsight's
+ * exposition tops out at a 120 s `le` edge and a healthy post-#3610 backend
+ * already runs 19.4 % of retains past it, so no resolvable threshold
+ * distinguishes healthy from sick. The full derivation is in
+ * `thresholds.ts`, where the constant used to be.
+ */
 export type SignalId =
   | "probe" // the watchdog itself could not see hindsight
   | "retain-failure-rate" // the storm signal
   | "retain-queue-growth" // spool rising, not draining
-  | "retain-dead" // permanently-lost memories appeared
-  | "container" // unhealthy / restarted
-  | "retain-latency-p95"; // early warning ahead of timeouts
+  | "retain-loss" // memories left the queue without being persisted
+  | "container"; // unhealthy / restarted
 
 export const ALL_SIGNALS: SignalId[] = [
   "probe",
   "retain-failure-rate",
   "retain-queue-growth",
-  "retain-dead",
+  "retain-loss",
   "container",
-  "retain-latency-p95",
 ];
 
 /** One probe pass, as persisted in the rolling window. */
@@ -30,12 +36,28 @@ export interface Sample {
   retainOk: number;
   /** cumulative failed retain operations (`success="false"`) */
   retainFail: number;
-  /** cumulative retain-duration histogram, `le` → count */
-  retainBuckets: Record<string, number>;
-  /** live spooled retains across the fleet (`*.json`) */
+  /**
+   * Live spooled retains across the fleet (`*.json`).
+   *
+   * Post-#3610 this counts memory PARTS, not memories: one oversized
+   * transcript enqueues one entry per 45,000-char part. Every threshold
+   * compared against it is scaled by `PARTS_PER_MEMORY`.
+   */
   pending: number;
   /** permanently-failed spooled retains across the fleet (`*.json.dead`) */
   dead: number;
+  /**
+   * Entries in each agent's `pending-evicted/` archive — memory shed at the
+   * queue's `MAX_ENTRIES`/`MAX_BYTES` cap (#3599). Archived, not persisted.
+   */
+  evicted: number;
+  /**
+   * Sum of the `count` field of each agent's `pending-drops.json` ledger
+   * (#3599 `record_drop`) — retains that could not be written to the queue
+   * at all. Monotonic per agent by construction, and a floor rather than an
+   * exact tally (the ledger's own read-modify-write is unlocked).
+   */
+  drops: number;
   /** docker `RestartCount` */
   restartCount: number;
   /** docker `State.StartedAt` — a change means restart/recreate */

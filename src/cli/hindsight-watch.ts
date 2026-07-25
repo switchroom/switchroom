@@ -13,8 +13,10 @@ import { defaultStatePath } from "../hindsight-watch/state.js";
 import {
   DEFAULT_CONTAINER,
   DEFAULT_METRICS_URL,
+  QUEUE_FLOOR,
+  QUEUE_GROWTH_FRACTION,
+  QUEUE_GROWTH_MIN_ABS,
   RETAIN_FAILURE_RATE,
-  RETAIN_P95_SECONDS,
 } from "../hindsight-watch/thresholds.js";
 
 /**
@@ -45,7 +47,7 @@ export function registerHindsightWatchCommand(program: Command): void {
     .command("hindsight-watch")
     .description(
       "Model-free hindsight watchdog: retain failure rate, spool growth, " +
-        "container health, retain p95. Alerts the operator once, with hysteresis.",
+        "memory loss, container health. Alerts the operator once, with hysteresis.",
     )
     .option("--dry-run", "evaluate and print; send no DM and write no state", false)
     .option("--json", "emit machine-readable JSON", false)
@@ -81,7 +83,9 @@ export function registerHindsightWatchCommand(program: Command): void {
               exitCode: result.exitCode,
               thresholds: {
                 retainFailureRate: RETAIN_FAILURE_RATE,
-                retainP95Seconds: RETAIN_P95_SECONDS,
+                queueFloor: QUEUE_FLOOR,
+                queueGrowthFraction: QUEUE_GROWTH_FRACTION,
+                queueGrowthMinAbs: QUEUE_GROWTH_MIN_ABS,
               },
               signals: result.outcomes.map((o) => ({
                 signal: o.verdict.signal,

@@ -27,11 +27,11 @@ import {
 
 /**
  * Signals that fire on the FIRST breach because they are edges, not levels:
- * a new `.dead` marker and a container restart are discrete events that
- * already happened — waiting for a second observation would just delay the
- * news, and they cannot flap the way a rate can.
+ * a new memory loss and a container restart are discrete events that already
+ * happened — waiting for a second observation would just delay the news, and
+ * they cannot flap the way a rate can.
  */
-const EDGE_SIGNALS = new Set<SignalId>(["retain-dead", "container"]);
+const EDGE_SIGNALS = new Set<SignalId>(["retain-loss", "container"]);
 
 function breachesToFire(signal: SignalId): number {
   return EDGE_SIGNALS.has(signal) ? BREACHES_TO_FIRE_EDGE : BREACHES_TO_FIRE_LEVEL;

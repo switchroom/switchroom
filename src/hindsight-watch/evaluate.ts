@@ -6,20 +6,13 @@
  * 2026-07 retain-failure storm).
  */
 
-import {
-  addBuckets,
-  bucketDelta,
-  counterDelta,
-  histogramQuantile,
-  largestFiniteBucket,
-} from "./metrics.js";
+import { counterDelta } from "./metrics.js";
 import {
   MIN_RETAIN_SAMPLES,
   QUEUE_FLOOR,
   QUEUE_GROWTH_FRACTION,
   QUEUE_GROWTH_MIN_ABS,
   RETAIN_FAILURE_RATE,
-  RETAIN_P95_SECONDS,
 } from "./thresholds.js";
 import type { Sample, Verdict } from "./types.js";
 
@@ -47,14 +40,6 @@ function windowRetainCounts(ring: Sample[]): { ok: number; fail: number } {
     fail += counterDelta(ring[i - 1].retainFail, ring[i].retainFail);
   }
   return { ok, fail };
-}
-
-function windowRetainBuckets(ring: Sample[]): Record<string, number> {
-  const acc: Record<string, number> = {};
-  for (let i = 1; i < ring.length; i++) {
-    addBuckets(acc, bucketDelta(ring[i - 1].retainBuckets, ring[i].retainBuckets));
-  }
-  return acc;
 }
 
 /** S1 — retain failure rate over the rolling window. The storm signal. */
@@ -92,6 +77,11 @@ export function evaluateFailureRate(ring: Sample[]): Verdict {
  * The spool is a retry queue: non-zero is normal and draining is healthy.
  * We compare the newest depth against the window-start depth, so a drain is
  * silent and a turnaround is loud.
+ *
+ * Both thresholds are stated in the spool's post-#3610 unit — memory PARTS,
+ * not memories — because that is what a queue entry is once oversized
+ * retains are split. `QUEUE_FLOOR` and `QUEUE_GROWTH_MIN_ABS` carry the
+ * conversion and its measurement.
  */
 export function evaluateQueueGrowth(ring: Sample[]): Verdict {
   const signal = "retain-queue-growth" as const;
@@ -116,34 +106,79 @@ export function evaluateQueueGrowth(ring: Sample[]): Verdict {
 }
 
 /**
- * S2b — a `.dead` marker appeared: a retain retried to exhaustion, i.e. a
- * permanently lost memory. Edge-triggered on the newest interval; any
- * increase is worth one DM regardless of scale.
+ * S2b — a memory left the queue WITHOUT being persisted. Edge-triggered on
+ * the newest interval; any increase is worth one DM regardless of scale.
  *
- * A DECREASE is a re-baseline, not a breach — the operator draining/removing
- * `.dead` files by hand must not read as a fault.
+ * Three channels, because after #3599 `.dead` alone is no longer the whole
+ * story:
+ *
+ *  - `*.json.dead` — a retain retried to `MAX_ATTEMPTS` exhaustion. Still a
+ *    real signal (18 markers live on this fleet today), and #3610 made it
+ *    STRONGER by removing its dominant benign cause: 154 of the 629 entries
+ *    in the 2026-07-25 backlog were `.dead` only because they were too big
+ *    to complete inside any client deadline. Those now split and drain, so
+ *    a `.dead` marker today is much more likely to be a genuine fault than
+ *    it was when this signal was first written.
+ *  - `pending-evicted/` — memory shed at the queue's `MAX_ENTRIES` /
+ *    `MAX_BYTES` cap. Archived rather than persisted, and under a full disk
+ *    `_evict_to_fit` removes outright.
+ *  - `pending-drops.json` — `record_drop`: the retain could not be written
+ *    to the queue at all. The rarest and the most final.
+ *
+ * They are one signal because they are one operator question ("did we lose
+ * memory since the last check?") and one action. The detail line names which
+ * channel moved, so the DM is still specific.
+ *
+ * A DECREASE is a re-baseline, not a breach — the operator clearing `.dead`
+ * files by hand, or the evicted archive being trimmed by its own bound, must
+ * not read as a fault. The cost of that rule is a trim that exactly cancels
+ * an eviction inside one interval, which this signal cannot see; the
+ * append-only `pending-evictions.log` and the `switchroom doctor` row remain
+ * the authority for eviction history.
  */
-export function evaluateDeadRetains(ring: Sample[]): Verdict {
-  const signal = "retain-dead" as const;
+export function evaluateRetainLoss(ring: Sample[]): Verdict {
+  const signal = "retain-loss" as const;
   if (ring.length < 2) {
-    return { signal, state: "no-data", detail: "only one sample so far — need two to see new .dead markers" };
+    return { signal, state: "no-data", detail: "only one sample so far — need two to see new losses" };
   }
-  const prev = ring[ring.length - 2].dead;
-  const last = ring[ring.length - 1].dead;
-  const added = last - prev;
-  if (added > 0) {
+  const prev = ring[ring.length - 2];
+  const last = ring[ring.length - 1];
+  const channels: Array<[string, number]> = [
+    [".dead marker", last.dead - prev.dead],
+    ["evicted entry", last.evicted - prev.evicted],
+    ["dropped retain", last.drops - prev.drops],
+  ];
+  const risen = channels.filter(([, added]) => added > 0);
+  const totals = `totals: ${last.dead} dead, ${last.evicted} evicted, ${last.drops} dropped`;
+  if (risen.length > 0) {
     return {
       signal,
       state: "breach",
-      detail: `${added} new .dead retain marker(s) since the last check (total ${last}) — memories permanently lost`,
-      measured: { added, total: last },
+      detail:
+        `${risen.map(([name, added]) => `${added} new ${name}(s)`).join(", ")} ` +
+        `since the last check (${totals}) — memory left the queue unpersisted`,
+      measured: {
+        deadAdded: last.dead - prev.dead,
+        evictedAdded: last.evicted - prev.evicted,
+        dropsAdded: last.drops - prev.drops,
+        dead: last.dead,
+        evicted: last.evicted,
+        drops: last.drops,
+      },
     };
   }
   return {
     signal,
     state: "ok",
-    detail: `no new .dead retain markers (total ${last})`,
-    measured: { added: 0, total: last },
+    detail: `no new memory loss (${totals})`,
+    measured: {
+      deadAdded: 0,
+      evictedAdded: 0,
+      dropsAdded: 0,
+      dead: last.dead,
+      evicted: last.evicted,
+      drops: last.drops,
+    },
   };
 }
 
@@ -185,46 +220,12 @@ export function evaluateContainer(ring: Sample[]): Verdict {
   };
 }
 
-/** S4 — retain p95 trending toward the client retain timeout. */
-export function evaluateLatencyP95(ring: Sample[]): Verdict {
-  const signal = "retain-latency-p95" as const;
-  if (ring.length < 2) {
-    return { signal, state: "no-data", detail: "only one sample so far — need two to diff the histogram" };
-  }
-  const buckets = windowRetainBuckets(ring);
-  const q = histogramQuantile(buckets, 0.95);
-  const mins = windowMinutes(ring);
-  if (q.count < MIN_RETAIN_SAMPLES) {
-    return {
-      signal,
-      state: "no-data",
-      detail: `only ${q.count} retain(s) in the last ${mins}m — below the ${MIN_RETAIN_SAMPLES}-sample floor`,
-      measured: { count: q.count, windowMinutes: mins },
-    };
-  }
-  const cap = largestFiniteBucket(buckets);
-  const shown = q.saturated ? `>${cap}s` : `${q.seconds.toFixed(1)}s`;
-  return {
-    signal,
-    state: q.seconds >= RETAIN_P95_SECONDS ? "breach" : "ok",
-    detail:
-      `retain p95 ${shown} over ${mins}m (n=${q.count}) ` +
-      `— threshold ${RETAIN_P95_SECONDS}s`,
-    measured: {
-      p95Seconds: q.saturated ? `>${cap}` : Number(q.seconds.toFixed(2)),
-      count: q.count,
-      windowMinutes: mins,
-    },
-  };
-}
-
 /** Evaluate every level/edge signal over the window. Order is display order. */
 export function evaluateAll(ring: Sample[]): Verdict[] {
   return [
     evaluateContainer(ring),
     evaluateFailureRate(ring),
     evaluateQueueGrowth(ring),
-    evaluateDeadRetains(ring),
-    evaluateLatencyP95(ring),
+    evaluateRetainLoss(ring),
   ];
 }

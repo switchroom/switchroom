@@ -53,11 +53,11 @@ function isSample(x: unknown): x is Sample {
     typeof s.retainFail === "number" &&
     typeof s.pending === "number" &&
     typeof s.dead === "number" &&
+    typeof s.evicted === "number" &&
+    typeof s.drops === "number" &&
     typeof s.restartCount === "number" &&
     typeof s.startedAt === "string" &&
-    typeof s.health === "string" &&
-    typeof s.retainBuckets === "object" &&
-    s.retainBuckets !== null
+    typeof s.health === "string"
   );
 }
 

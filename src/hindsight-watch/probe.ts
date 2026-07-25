@@ -2,15 +2,17 @@
  * The three probes, and the rule that binds them: EVERY probe failure is a
  * signal, never a default.
  *
- * Cost per pass (measured against the live host, 2026-07-25): one HTTP GET
- * of a ~60 KB `/metrics` body, one `docker inspect`, and one `readdir` per
- * agent (11 today). At the recommended 15-minute cadence that is ~4 requests
- * an hour against a backend whose own workers issue thousands — the watchdog
- * cannot itself become the load.
+ * Cost per pass (measured against the live host, 2026-07-25 re-measured
+ * 2026-07-26): one HTTP GET of the `/metrics` body (258,741 B today), one
+ * `docker inspect`, and per agent (12 today) two readdirs plus one small
+ * `pending-drops.json` read. No queue ENTRY is ever opened — those carry
+ * whole transcripts, p50 ~98 KB. At the recommended 15-minute cadence that
+ * is 4 requests an hour against a backend whose own workers issue thousands
+ * — the watchdog cannot itself become the load.
  */
 
 import { spawnSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { parseExposition, readRetainSignals, type RetainSignals } from "./metrics.js";
@@ -118,12 +120,49 @@ export function probeContainer(
 export interface SpoolDepth {
   pending: number;
   dead: number;
+  /** entries in every agent's `pending-evicted/` archive (#3599) */
+  evicted: number;
+  /** summed `count` of every agent's `pending-drops.json` ledger (#3599) */
+  drops: number;
   /** agents whose spool dir was readable (for the operator-facing detail) */
   agents: number;
 }
 
+/** Sanity bound on `pending-drops.json`; the real ledger is ~150 B. */
+const DROPS_LEDGER_MAX_BYTES = 64 * 1024;
+
 /**
- * Count `*.json` / `*.json.dead` across every agent's spool.
+ * Read one agent's `pending-drops.json` `count`, or 0.
+ *
+ * The ledger is a small fixed-shape object (`{schema, count, last_*}`), so
+ * this is one tiny read per agent per tick — nothing like reading the queue
+ * entries themselves, which carry whole transcripts. A missing, torn or
+ * foreign-shaped ledger reads as 0: `record_drop` writes it tmp+rename so a
+ * torn read is a transient the next tick resolves, and inventing a loss out
+ * of an unparseable file would be a false alarm on the loudest signal here.
+ */
+function readDropCount(hindsightDir: string): number {
+  const path = resolve(hindsightDir, "pending-drops.json");
+  let parsed: unknown;
+  try {
+    // The real ledger is a few hundred bytes. Refusing anything larger keeps
+    // a corrupt or wrongly-named file from being slurped into memory on
+    // every tick — this runs unattended on a cron.
+    if (statSync(path).size > DROPS_LEDGER_MAX_BYTES) return 0;
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return 0;
+  }
+  if (typeof parsed !== "object" || parsed === null) return 0;
+  const n = Number((parsed as { count?: unknown }).count);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Count `*.json` / `*.json.dead` across every agent's spool, plus the two
+ * loss channels #3599 added beside it — `pending-evicted/` and
+ * `pending-drops.json`, both siblings of `pending-retains/`
+ * (`lib/pending.py:_sibling`), so neither can be mistaken for a live entry.
  *
  * Reads the HOST scaffold path (`~/.switchroom/agents/<a>/home/.hindsight/
  * pending-retains`), which is the same directory the agent container sees at
@@ -152,24 +191,42 @@ export function probeSpool(
   }
   let pending = 0;
   let dead = 0;
+  let evicted = 0;
+  let drops = 0;
   let agents = 0;
   for (const name of names) {
-    const dir = resolve(agentsDir, name, "home", ".hindsight", "pending-retains");
-    let entries: string[];
+    const hindsightDir = resolve(agentsDir, name, "home", ".hindsight");
+    let entries: string[] | null = null;
     try {
-      entries = readdirSync(dir);
+      entries = readdirSync(resolve(hindsightDir, "pending-retains"));
     } catch {
       // No spool dir for this agent (never spooled, or not an agent dir at
       // all). Absence is not a fault — a missing queue is an empty queue.
-      continue;
+      // NOTE we deliberately do NOT `continue` here: the two loss channels
+      // are SIBLINGS of the queue dir, not children of it, so an operator
+      // who deletes `pending-retains` must not thereby make this agent's
+      // eviction/drop history invisible (it would read as a decrease, and a
+      // decrease is a silent re-baseline).
     }
-    agents++;
-    for (const f of entries) {
-      if (f.endsWith(".json.dead")) dead++;
-      else if (f.endsWith(".json")) pending++;
+    if (entries !== null) {
+      agents++;
+      for (const f of entries) {
+        if (f.endsWith(".json.dead")) dead++;
+        else if (f.endsWith(".json")) pending++;
+        // Anything else (notably the `.tmp` files a torn tmp+rename leaves
+        // behind — 8 of them live on this fleet) is not a queue entry.
+      }
     }
+    try {
+      for (const f of readdirSync(resolve(hindsightDir, "pending-evicted"))) {
+        if (f.endsWith(".json")) evicted++;
+      }
+    } catch {
+      // Nothing has ever been evicted for this agent. Not a fault.
+    }
+    drops += readDropCount(hindsightDir);
   }
-  return { pending, dead, agents };
+  return { pending, dead, evicted, drops, agents };
 }
 
 export interface ProbeOptions {
@@ -192,9 +249,10 @@ export async function probeOnce(opts: ProbeOptions = {}): Promise<{ sample: Samp
       ts: now(),
       retainOk: retain.ok,
       retainFail: retain.fail,
-      retainBuckets: retain.buckets,
       pending: spool.pending,
       dead: spool.dead,
+      evicted: spool.evicted,
+      drops: spool.drops,
       restartCount: container.restartCount,
       startedAt: container.startedAt,
       health: container.health,

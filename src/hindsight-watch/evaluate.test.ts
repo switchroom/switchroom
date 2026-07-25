@@ -2,11 +2,15 @@ import { describe, it, expect } from "vitest";
 import {
   evaluateAll,
   evaluateContainer,
-  evaluateDeadRetains,
   evaluateFailureRate,
-  evaluateLatencyP95,
   evaluateQueueGrowth,
+  evaluateRetainLoss,
 } from "./evaluate.js";
+import {
+  PARTS_PER_MEMORY,
+  QUEUE_FLOOR,
+  QUEUE_GROWTH_MIN_ABS,
+} from "./thresholds.js";
 import type { Sample } from "./types.js";
 
 const T0 = Date.parse("2026-07-25T09:00:00Z");
@@ -17,9 +21,10 @@ function sample(i: number, over: Partial<Sample> = {}): Sample {
     ts: T0 + i * INTERVAL,
     retainOk: 0,
     retainFail: 0,
-    retainBuckets: {},
     pending: 0,
     dead: 0,
+    evicted: 0,
+    drops: 0,
     restartCount: 0,
     startedAt: "2026-07-25T09:06:18Z",
     health: "healthy",
@@ -104,7 +109,8 @@ describe("evaluateQueueGrowth — rising vs draining", () => {
   });
 
   it("ignores sub-threshold growth on a large base (retry churn, not a storm)", () => {
-    // 600 → 615 is +15 — below the 60-file (10%) growth requirement.
+    // 600 → 615 is +15 — below both the 88-part absolute floor and the
+    // 10% (60-part) fraction.
     expect(evaluateQueueGrowth([sample(0, { pending: 600 }), sample(4, { pending: 615 })]).state).toBe("ok");
   });
 
@@ -113,19 +119,98 @@ describe("evaluateQueueGrowth — rising vs draining", () => {
   });
 });
 
-describe("evaluateDeadRetains — permanently lost memories", () => {
-  it("FIRES on a single new .dead marker", () => {
-    const v = evaluateDeadRetains([sample(0, { dead: 135 }), sample(1, { dead: 136 })]);
+describe("evaluateQueueGrowth — recalibrated for #3610's split (parts, not memories)", () => {
+  it("does NOT fire on five worst-case memories splitting into 85 parts", () => {
+    // #3610 caps retain content at 45,000 chars; the largest entry measured
+    // on this fleet (744,546 chars) becomes 17 parts. Five such memories
+    // failing once is +85 entries with only five memories behind them, and
+    // must not read as "the spool turned around".
+    //
+    // The pre-#3610 thresholds WOULD have fired here: floor 100 (< 440) and
+    // growth need max(20, 10%×440 = 44) = 44, which +85 clears. That is
+    // exactly the false positive the rescale removes.
+    const ring = [sample(0, { pending: QUEUE_FLOOR }), sample(4, { pending: QUEUE_FLOOR + 5 * 17 })];
+    const v = evaluateQueueGrowth(ring);
+    expect(v.state).toBe("ok");
+    expect(85).toBeLessThan(QUEUE_GROWTH_MIN_ABS);
+  });
+
+  it("still fires for the twenty-failing-memories case the floor was written for", () => {
+    // The original intent of the absolute floor: ~20 distinct memories
+    // failed and stayed failed. In parts that is 20 × PARTS_PER_MEMORY.
+    const growth = Math.ceil(20 * PARTS_PER_MEMORY);
+    const ring = [sample(0, { pending: QUEUE_FLOOR }), sample(4, { pending: QUEUE_FLOOR + growth })];
+    expect(evaluateQueueGrowth(ring).state).toBe("breach");
+  });
+
+  it("is silent below the rescaled depth floor even on steep growth", () => {
+    // 100 → 300 parts is ~23 → 68 memories: real churn, not an incident,
+    // and beneath the depth this signal wakes anyone for. Under the
+    // pre-#3610 floor of 100 entries this fired.
+    const v = evaluateQueueGrowth([sample(0, { pending: 100 }), sample(4, { pending: 300 })]);
+    expect(v.state).toBe("ok");
+    expect(300).toBeLessThan(QUEUE_FLOOR);
+  });
+
+  it("FIRES once on the measured pre-split backlog migrating to parts (174 → 765)", () => {
+    // Documented, accepted behaviour rather than a bug: when this fleet's
+    // 174 pre-split entries are re-enqueued through the #3610 path they
+    // become 765 parts carrying not one new memory. A >4x jump in spool
+    // depth is worth telling the operator about once, and suppressing it
+    // would mean teaching a watchdog to ignore a quadrupling queue.
+    const v = evaluateQueueGrowth([sample(0, { pending: 174 }), sample(4, { pending: 765 })]);
     expect(v.state).toBe("breach");
-    expect(v.measured?.added).toBe(1);
+  });
+});
+
+describe("evaluateRetainLoss — memory that left the queue unpersisted", () => {
+  it("FIRES on a single new .dead marker", () => {
+    const v = evaluateRetainLoss([sample(0, { dead: 135 }), sample(1, { dead: 136 })]);
+    expect(v.state).toBe("breach");
+    expect(v.measured?.deadAdded).toBe(1);
+    expect(v.detail).toContain("1 new .dead marker(s)");
   });
 
-  it("does not fire on a steady non-zero dead count", () => {
-    expect(evaluateDeadRetains([sample(0, { dead: 135 }), sample(1, { dead: 135 })]).state).toBe("ok");
+  it("FIRES on a new #3599 eviction, which the .dead count alone cannot see", () => {
+    const v = evaluateRetainLoss([sample(0, { evicted: 0 }), sample(1, { evicted: 12 })]);
+    expect(v.state).toBe("breach");
+    expect(v.measured?.evictedAdded).toBe(12);
+    expect(v.detail).toContain("12 new evicted entry(s)");
   });
 
-  it("treats a DECREASE (operator cleaned the spool) as a re-baseline, not a fault", () => {
-    expect(evaluateDeadRetains([sample(0, { dead: 135 }), sample(1, { dead: 0 })]).state).toBe("ok");
+  it("FIRES on a new #3599 residual drop (record_drop ledger)", () => {
+    const v = evaluateRetainLoss([sample(0, { drops: 0 }), sample(1, { drops: 1 })]);
+    expect(v.state).toBe("breach");
+    expect(v.measured?.dropsAdded).toBe(1);
+    expect(v.detail).toContain("1 new dropped retain(s)");
+  });
+
+  it("names every channel that moved in one DM", () => {
+    const v = evaluateRetainLoss([
+      sample(0, { dead: 1, evicted: 1, drops: 1 }),
+      sample(1, { dead: 2, evicted: 4, drops: 3 }),
+    ]);
+    expect(v.state).toBe("breach");
+    expect(v.detail).toContain(".dead marker");
+    expect(v.detail).toContain("evicted entry");
+    expect(v.detail).toContain("dropped retain");
+  });
+
+  it("does not fire on steady non-zero counts", () => {
+    const v = evaluateRetainLoss([
+      sample(0, { dead: 18, evicted: 5, drops: 2 }),
+      sample(1, { dead: 18, evicted: 5, drops: 2 }),
+    ]);
+    expect(v.state).toBe("ok");
+    expect(v.detail).toContain("18 dead, 5 evicted, 2 dropped");
+  });
+
+  it("treats a DECREASE (operator cleaned .dead, archive trimmed) as a re-baseline", () => {
+    const v = evaluateRetainLoss([
+      sample(0, { dead: 135, evicted: 500 }),
+      sample(1, { dead: 0, evicted: 200 }),
+    ]);
+    expect(v.state).toBe("ok");
   });
 });
 
@@ -163,47 +248,25 @@ describe("evaluateContainer", () => {
   });
 });
 
-describe("evaluateLatencyP95 — early warning ahead of the 300s client timeout", () => {
-  function latencyRing(perInterval: Record<string, number>, n = 3): Sample[] {
-    const out: Sample[] = [];
-    for (let i = 0; i < n; i++) {
-      const buckets: Record<string, number> = {};
-      for (const [le, v] of Object.entries(perInterval)) buckets[le] = v * i;
-      out.push(sample(i, { retainBuckets: buckets }));
-    }
-    return out;
-  }
-
-  it("is quiet at the measured baseline (p95 ≈ 70s)", () => {
-    // Per interval: 14 retains ≤60s, 1 in the 60–120 band. p95 lands ~64s.
-    const v = evaluateLatencyP95(latencyRing({ "30.0": 10, "60.0": 14, "120.0": 15, "+Inf": 15 }, 4));
-    expect(v.state).toBe("ok");
-    expect(Number(v.measured?.p95Seconds)).toBeLessThan(120);
-  });
-
-  it("FIRES when p95 saturates the top bucket (retains past 120s)", () => {
-    // Per interval: 8 fast, 4 past +Inf ⇒ 33% over 120s ⇒ p95 saturated.
-    const v = evaluateLatencyP95(latencyRing({ "60.0": 8, "120.0": 8, "+Inf": 12 }, 4));
-    expect(v.state).toBe("breach");
-    expect(v.measured?.p95Seconds).toBe(">120");
-  });
-
-  it("reports no-data below the sample floor instead of a p95 from 2 retains", () => {
-    const v = evaluateLatencyP95(latencyRing({ "60.0": 1, "+Inf": 1 }, 3));
-    expect(v.state).toBe("no-data");
-  });
-});
-
 describe("evaluateAll", () => {
   it("returns one verdict per level/edge signal", () => {
     const verdicts = evaluateAll([sample(0), sample(1)]);
     expect(verdicts.map((v) => v.signal).sort()).toEqual([
       "container",
-      "retain-dead",
       "retain-failure-rate",
-      "retain-latency-p95",
+      "retain-loss",
       "retain-queue-growth",
     ]);
+  });
+
+  it("no longer emits a latency signal — hindsight's histogram cannot resolve one", () => {
+    // The exposition's largest finite `le` is 120s and a healthy post-#3610
+    // backend already runs 19.4% of retains past it (measured 2026-07-25:
+    // 52/268, with a 1.1% failure rate). Any threshold this instrument can
+    // express fires permanently, so the signal was removed rather than
+    // retuned. Restoring it needs `le` edges above the 280s client deadline.
+    const verdicts = evaluateAll([sample(0), sample(1)]);
+    expect(verdicts.some((v) => v.signal.includes("latency"))).toBe(false);
   });
 
   it("reports no-data everywhere on a single sample — never a false all-clear", () => {
