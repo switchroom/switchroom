@@ -2,12 +2,14 @@
  * Fleet Health — LiteLLM config sensor (I2 OAuth-leak guard, the load-bearing
  * enforcement point for PR4a).
  *
- * The `scripts/check-litellm-config-guard.mjs` lint step is near-vacuous:
- * off-host the operator-maintained config file is absent (CI/dev), so lint
- * skips. This sensor is where enforcement actually bites — it runs inside the
- * fleet-health scan, which executes where the config file lives and can read
- * `/data/coolify/services/…/litellm-config.yaml`. A violation escalates into
- * the priority ledger (→ GitHub issue) exactly like any other L0 finding.
+ * The `scripts/check-litellm-config-guard.mjs` lint step covers the
+ * repo-managed config (`docker/litellm-proxy/litellm-config.yaml`, KEN-125) but
+ * can only reach the LIVE host copy where that copy exists — off-host it is
+ * absent (CI/dev). This sensor is where enforcement bites for the LIVE file: it
+ * runs inside the fleet-health scan, which executes where the config actually
+ * lives and can read `/data/coolify/services/<service>/litellm-config.yaml`
+ * (discovered — see `discoverLiveLitellmConfigPath`). A violation escalates
+ * into the priority ledger (→ GitHub issue) exactly like any other L0 finding.
  *
  * STRICTLY MODEL-FREE: reads one YAML file, runs the pure detection core, emits
  * a structured finding. No LLM, no network.
@@ -17,8 +19,9 @@ import { readFileSync, existsSync } from "node:fs";
 
 import type { Finding } from "./detect.js";
 import {
-  DEFAULT_LITELLM_CONFIG_PATH,
+  COOLIFY_SERVICES_DIR,
   detectHeaderMisconfig,
+  discoverLiveLitellmConfigPath,
   parseLitellmConfig,
 } from "../litellm/header-passthrough-guard.js";
 
@@ -30,8 +33,8 @@ import {
 export const LITELLM_PROXY_PSEUDO_AGENT = "litellm-proxy";
 
 export interface LitellmSensorOptions {
-  /** Config path override. Defaults to `LITELLM_CONFIG_PATH` env → the
-   *  host-correct default. */
+  /** Config path override. Defaults to `LITELLM_CONFIG_PATH` env → discovery
+   *  under the Coolify services dir. */
   path?: string;
   /** Injectable for tests. */
   existsFn?: (p: string) => boolean;
@@ -43,14 +46,22 @@ export interface LitellmSensorOptions {
 
 export interface LitellmSensorResult {
   status: "ok" | "violation" | "skipped";
-  path: string;
+  /** The live config path that was scanned, or null when none was resolvable
+   *  (hermetic CI/dev, or an ambiguous host needing `LITELLM_CONFIG_PATH`). */
+  path: string | null;
   findings: Finding[];
 }
 
-/** Resolve the config path: explicit arg → `LITELLM_CONFIG_PATH` env → the
- *  host-correct default. */
-export function resolveLitellmConfigPath(explicit?: string): string {
-  return explicit ?? process.env.LITELLM_CONFIG_PATH ?? DEFAULT_LITELLM_CONFIG_PATH;
+/**
+ * Resolve the live config path: explicit arg → `LITELLM_CONFIG_PATH` env →
+ * discovery under the Coolify services dir. Returns null when the live copy is
+ * not resolvable, which the caller treats as a visible skip — never a pass.
+ */
+export function resolveLitellmConfigPath(explicit?: string): string | null {
+  if (explicit) return explicit;
+  const fromEnv = process.env.LITELLM_CONFIG_PATH;
+  if (fromEnv) return fromEnv;
+  return discoverLiveLitellmConfigPath().path;
 }
 
 /**
@@ -67,6 +78,15 @@ export function scanLitellmConfig(
   const read = opts.readFn ?? ((p: string) => readFileSync(p, "utf-8"));
   const log = opts.log ?? (() => {});
   const nowIso = opts.nowIso ?? new Date().toISOString();
+
+  if (path === null) {
+    log(
+      `fleet-health: litellm-config sensor SKIPPED — no live config discoverable under ` +
+        `${COOLIFY_SERVICES_DIR}/*/litellm-config.yaml (hermetic CI/dev expected to skip; ` +
+        `set LITELLM_CONFIG_PATH explicitly if the layout differs or several proxies exist)`,
+    );
+    return { status: "skipped", path: null, findings: [] };
+  }
 
   if (!exists(path)) {
     log(

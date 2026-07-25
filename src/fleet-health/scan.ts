@@ -144,9 +144,11 @@ export function runScan(opts: ScanOptions = {}): ScanResult {
   }
 
   // Standalone config sensor (I2 OAuth-leak guard). Runs where the scan runs —
-  // the load-bearing enforcement point (the lint step is near-vacuous off-host).
-  // Absent config file → skips with a visible notice; a scoping violation
-  // escalates into the ledger like any agent finding.
+  // the load-bearing enforcement point for the LIVE host config (since KEN-125
+  // the lint step covers the repo-managed copy unconditionally, but can only
+  // reach the live copy on-host). Unresolvable/absent live config → skips with a
+  // visible notice; a scoping violation escalates into the ledger like any
+  // agent finding.
   const litellm = scanLitellmConfig({ path: opts.litellmConfigPath, log });
   findings.push(...litellm.findings);
 

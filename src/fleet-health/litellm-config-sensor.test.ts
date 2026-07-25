@@ -11,7 +11,10 @@ import {
   resolveLitellmConfigPath,
   LITELLM_PROXY_PSEUDO_AGENT,
 } from "./litellm-config-sensor.js";
-import { DEFAULT_LITELLM_CONFIG_PATH } from "../litellm/header-passthrough-guard.js";
+import {
+  COOLIFY_SERVICES_DIR,
+  discoverLiveLitellmConfigPath,
+} from "../litellm/header-passthrough-guard.js";
 import { mapSignal } from "./mapping.js";
 
 const PATH = "/fake/litellm-config.yaml";
@@ -27,16 +30,89 @@ function withYaml(yaml: string, log?: (m: string) => void) {
 }
 
 describe("resolveLitellmConfigPath", () => {
-  it("falls back to the host-correct default (no /host prefix)", () => {
-    delete process.env.LITELLM_CONFIG_PATH;
-    expect(resolveLitellmConfigPath()).toBe(DEFAULT_LITELLM_CONFIG_PATH);
-    expect(DEFAULT_LITELLM_CONFIG_PATH.startsWith("/data/coolify/")).toBe(true);
-    expect(DEFAULT_LITELLM_CONFIG_PATH.startsWith("/host/")).toBe(false);
-  });
   it("honors an explicit override arg over the env", () => {
     process.env.LITELLM_CONFIG_PATH = "/env/path.yaml";
     expect(resolveLitellmConfigPath("/explicit.yaml")).toBe("/explicit.yaml");
     delete process.env.LITELLM_CONFIG_PATH;
+  });
+  it("honors the env var over discovery", () => {
+    process.env.LITELLM_CONFIG_PATH = "/env/path.yaml";
+    expect(resolveLitellmConfigPath()).toBe("/env/path.yaml");
+    delete process.env.LITELLM_CONFIG_PATH;
+  });
+  it("falls through to discovery, which returns null off-host (never a bogus path)", () => {
+    delete process.env.LITELLM_CONFIG_PATH;
+    // In CI/dev the Coolify services dir does not exist, so this must resolve
+    // to null (→ a visible skip) rather than a fabricated path.
+    expect(resolveLitellmConfigPath()).toBe(null);
+  });
+});
+
+describe("discoverLiveLitellmConfigPath (no hardcoded service id — KEN-125 scrub)", () => {
+  // The service dir is named by a deployment-specific Coolify service id.
+  // Hardcoding it would leak a host identifier into a public repo, so the
+  // exported constant must stop at the services dir itself.
+  it("exposes only the services dir, with no service-id segment baked in", () => {
+    expect(COOLIFY_SERVICES_DIR).toBe("/data/coolify/services");
+    expect(COOLIFY_SERVICES_DIR.startsWith("/host/")).toBe(false);
+    // Nothing that looks like a Coolify service id (long lowercase-alnum slug).
+    expect(COOLIFY_SERVICES_DIR).not.toMatch(/\/[a-z0-9]{16,}/);
+  });
+
+  it("finds the single service dir that owns a litellm-config.yaml", () => {
+    const res = discoverLiveLitellmConfigPath({
+      servicesDir: "/svc",
+      readdirFn: () => ["someotherservice", "theproxy"],
+      existsFn: (p) => p === "/svc/theproxy/litellm-config.yaml",
+    });
+    expect(res.reason).toBe("found");
+    expect(res.path).toBe("/svc/theproxy/litellm-config.yaml");
+  });
+
+  it("returns null + no-services-dir when the services dir is absent (CI/dev)", () => {
+    const res = discoverLiveLitellmConfigPath({
+      servicesDir: "/svc",
+      readdirFn: () => {
+        throw new Error("ENOENT");
+      },
+    });
+    expect(res.reason).toBe("no-services-dir");
+    expect(res.path).toBe(null);
+  });
+
+  it("returns null + not-found when no service dir owns the config", () => {
+    const res = discoverLiveLitellmConfigPath({
+      servicesDir: "/svc",
+      readdirFn: () => ["a", "b"],
+      existsFn: () => false,
+    });
+    expect(res.reason).toBe("not-found");
+    expect(res.path).toBe(null);
+  });
+
+  it("refuses to guess when several candidates exist → ambiguous, path null", () => {
+    const res = discoverLiveLitellmConfigPath({
+      servicesDir: "/svc",
+      readdirFn: () => ["one", "two"],
+      existsFn: (p) => p.endsWith("/litellm-config.yaml"),
+    });
+    expect(res.reason).toBe("ambiguous");
+    expect(res.path).toBe(null);
+    expect(res.candidates).toHaveLength(2);
+  });
+
+  it("is deterministic regardless of readdir ordering", () => {
+    const forward = discoverLiveLitellmConfigPath({
+      servicesDir: "/svc",
+      readdirFn: () => ["b", "a"],
+      existsFn: (p) => p.endsWith("/litellm-config.yaml"),
+    });
+    const reverse = discoverLiveLitellmConfigPath({
+      servicesDir: "/svc",
+      readdirFn: () => ["a", "b"],
+      existsFn: (p) => p.endsWith("/litellm-config.yaml"),
+    });
+    expect(forward.candidates).toEqual(reverse.candidates);
   });
 });
 
@@ -51,6 +127,20 @@ describe("scanLitellmConfig", () => {
     expect(res.status).toBe("skipped");
     expect(res.findings).toEqual([]);
     expect(logs.some((l) => /SKIPPED.*absent/.test(l))).toBe(true);
+  });
+
+  it("unresolvable live path → skipped with a VISIBLE notice, never a silent pass", () => {
+    delete process.env.LITELLM_CONFIG_PATH;
+    const logs: string[] = [];
+    const res = scanLitellmConfig({
+      existsFn: () => true, // would pass if the null path were not short-circuited
+      readFn: () => "litellm_settings:\n  forward_client_headers_to_llm_api: true\n",
+      log: (m) => logs.push(m),
+    });
+    expect(res.status).toBe("skipped");
+    expect(res.path).toBe(null);
+    expect(res.findings).toEqual([]);
+    expect(logs.some((l) => /SKIPPED.*no live config discoverable/.test(l))).toBe(true);
   });
 
   it("good config → ok, no findings", () => {

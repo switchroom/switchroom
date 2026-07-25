@@ -49,13 +49,18 @@ These must always hold.
   Claude models only. Non-Claude / OpenRouter model entries must never forward
   the `Authorization` header; the proxy holds no Anthropic key of its own for
   these models and must not substitute one.
-  **This scoping is enforced by convention in the operator-maintained LiteLLM
-  proxy config, not by any switchroom code.** That config is a Coolify-hosted
-  file at
-  `/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`;
-  switchroom emits **no** `litellm_settings` or `model_list` (grep the tree —
-  the only occurrences are documentation comments), so it neither writes nor
-  validates this flag. The operator places
+  **This scoping now has a repo-managed source of truth** (KEN-125):
+  `docker/litellm-proxy/litellm-config.yaml` is the reviewed, lint-guarded
+  (`scripts/check-litellm-config-guard.mjs` — always checks the repo copy) and
+  tested (`src/litellm/repo-config.test.ts`) config; the operator syncs it to
+  the Coolify-hosted live file at
+  `/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`
+  (the service id is deployment-specific and deliberately never committed —
+  the lint guard and fleet-health sensor discover the live file by scanning
+  `/data/coolify/services/*/litellm-config.yaml`, or take `LITELLM_CONFIG_PATH`)
+  (procedure in `docker/litellm-proxy/README.md` — switchroom itself never
+  mutates or restarts the live proxy, and the live file must be reconciled
+  into the repo copy on first rollout). The config places
   `forward_client_headers_to_llm_api: true` under individual Claude entries in
   `model_group_settings` and leaves it off both globally (in `litellm_settings`,
   where it is a Boolean master switch) and on every `openrouter/*` /
@@ -276,7 +281,7 @@ inspected to confirm the routing env. That check verified non-Claude models
 OpenRouter through LiteLLM** — `api.anthropic.com` cannot serve
 `gpt-oss-120b`, so a successful response to that model is proof the request
 did not touch the Anthropic subscription endpoint. The live LiteLLM config
-(`/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`)
+(`/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`)
 and Hindsight's live container env (`ANTHROPIC_BASE_URL=http://127.0.0.1:4010`,
 global model `openrouter/z-ai/glm-5.2`) were also read directly for the I2 and
 Hindsight-credential claims above.

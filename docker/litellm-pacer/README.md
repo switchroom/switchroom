@@ -28,7 +28,7 @@ back-ported.
 The live copy is bind-mounted into the LiteLLM proxy container:
 
 ```
-host:  /host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/custom_pacing.py
+host:  /host/data/coolify/services/<litellm-service-id>/custom_pacing.py
        (Coolify service dir; from inside this repo's root agent it is
         /host/data/... , on the raw host /data/coolify/services/...)
 container: /app/custom_pacing.py   (the config dir is on the proxy's sys.path)
@@ -45,7 +45,7 @@ Bind mount in the sibling `docker-compose.yml`:
 
 ```yaml
 volumes:
-  - '/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/custom_pacing.py:/app/custom_pacing.py'
+  - '/data/coolify/services/<litellm-service-id>/custom_pacing.py:/app/custom_pacing.py'
 ```
 
 ## Code defaults vs. live env overrides
@@ -120,7 +120,7 @@ After changing `custom_pacing.py` here (and getting it merged):
 1. Copy the vendored file to the host deploy path:
    ```
    cp docker/litellm-pacer/custom_pacing.py \
-      /data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/custom_pacing.py
+      /data/coolify/services/<litellm-service-id>/custom_pacing.py
    ```
    (Keep a timestamped `.bak` first, matching the existing host convention.)
 2. **Redeploy / restart the LiteLLM service** so the proxy re-imports the

@@ -2431,6 +2431,32 @@ function emitAgentService(
   for (const [k, v] of Object.entries(a.userEnv)) {
     if (env[k] === undefined) env[k] = v;
   }
+  // ENABLE_PROMPT_CACHING_1H: opt in to the 1-hour extended prompt-cache
+  // TTL (API beta `extended-cache-ttl-2025-04-11`) for every claude
+  // session in the container (KEN-126). Idle-heavy Telegram agents
+  // routinely go >5 min between messages, so the default 5-minute cache
+  // TTL expires between turns and the next turn re-writes the whole
+  // prompt prefix. The claude CLI (verified against the shipped 2.1.219
+  // binary) reads this env var as an explicit force-on for the 1h TTL
+  // (`FORCE_PROMPT_CACHING_5M` is the opposite override). Without the
+  // env, 2.1.219 decides via a remote statsig config
+  // (`tengu_prompt_cache_1h_config`, default allowlist
+  // `repl_main_thread*`/`sdk`/…) gated on subscription auth AND
+  // not-currently-in-overage — i.e. nondeterministic and remotely
+  // mutable. Pinning it here makes the behavior deterministic. Cost: on
+  // subscription (the switchroom hard constraint) 1h caching has no
+  // marginal cost; on API/overage billing 1h cache WRITES bill at 2x
+  // base input — which is why this default is applied AFTER the userEnv
+  // merge with an undefined-guard, so an operator CAN opt out via
+  // `env:` in switchroom.yaml (`ENABLE_PROMPT_CACHING_1H: "0"` or
+  // `FORCE_PROMPT_CACHING_5M: "1"` — the CLI checks the 5m force
+  // first). Container-wide on purpose: the Tier-1 cheap-cron session (a
+  // second interactive claude in the same container) inherits it too —
+  // frequent crons (≤60 min cadence) are exactly the sessions whose
+  // prompt prefix survives to the next fire only under a 1h TTL.
+  if (env.ENABLE_PROMPT_CACHING_1H === undefined) {
+    env.ENABLE_PROMPT_CACHING_1H = "1";
+  }
   for (const k of Object.keys(env).sort()) {
     lines.push(`      ${k}: ${JSON.stringify(env[k])}`);
   }
