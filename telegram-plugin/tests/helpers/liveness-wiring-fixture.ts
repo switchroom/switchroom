@@ -37,8 +37,30 @@ export interface LivenessFixture {
   activeTurnStartedAt: Map<string, number>
   /** Swap the "current turn" the wiring reads. */
   setCurrentTurn: (t: unknown) => void
+  /**
+   * Start a turn FOR A TOPIC KEY. With a `turnMap` supplied (the flag-ON
+   * `CurrentTurnMap`), this is the gateway's `setCurrentTurn(turn, key)`: it
+   * writes the per-topic entry AND flips the most-recent-set mirror. Without
+   * one, it degrades to the flag-OFF singleton assignment.
+   */
+  setCurrentTurnForKey: (key: string, t: unknown) => void
   /** Open obligation ids the per-turn `representWillFollow` lookup consults. */
   openObligations: Set<string>
+}
+
+/**
+ * The subset of the REAL `CurrentTurnMap` (gateway/current-turn-map.ts) the
+ * liveness wiring touches. #3580 tests pass a genuine instance, re-imported
+ * under `SWITCHROOM_EMISSION_AUTHORITY=1` via the module's read-once seam, so
+ * the flag-ON mirror-vs-keyed semantics under test are the production ones and
+ * not a hand-retyped model of them.
+ */
+export interface TurnMapLike {
+  get(key?: string): unknown
+  set(turn: never, key: string): void
+  isLiveForKey(turn: never, key: string): boolean
+  endTurnForKey(turn: never, key: string): boolean
+  purgeChatStale(chatId: string, isStale?: (key: string) => boolean): string[]
 }
 
 export function statusKeyForTests(chatId: string, threadId: number | null | undefined): string {
@@ -62,12 +84,48 @@ export function makeTurn(over: Record<string, unknown> = {}): Record<string, unk
   }
 }
 
-export function makeLivenessFixture(over: Partial<Record<string, unknown>> = {}): LivenessFixture {
+export function makeLivenessFixture(
+  over: Partial<Record<string, unknown>> = {},
+  turnMap?: TurnMapLike,
+): LivenessFixture {
   const sent: SentText[] = []
   const endedKeys: string[] = []
   const activeTurnStartedAt = new Map<string, number>()
   const openObligations = new Set<string>()
   let currentTurn: unknown = null
+
+  // Mirrors gateway.ts's `gatewayLivenessWiringDeps()` exactly. Without a
+  // `turnMap` the fixture models the flag-OFF gateway, where `currentTurnMap`
+  // holds only the singleton and the keyed read `currentTurnMap.get(key)`
+  // returns it — hence `getCurrentTurnForKey` ignoring the key here is the
+  // production flag-OFF behaviour, not a shortcut. With a `turnMap` it is the
+  // real keyed store and every accessor delegates to it.
+  const turnMapDeps = turnMap == null
+    ? {
+        getCurrentTurn: () => currentTurn,
+        getCurrentTurnForKey: (_key: string) => currentTurn,
+        currentTurnMap: { purgeChatStale: () => {} },
+        turnLiveForItsTopic: () => true,
+        endCurrentTurnForKey: (_turn: unknown, key: string) => {
+          endedKeys.push(key)
+          currentTurn = null
+          return true
+        },
+      }
+    : {
+        getCurrentTurn: () => turnMap.get() ?? null,
+        getCurrentTurnForKey: (key: string) => turnMap.get(key) ?? null,
+        currentTurnMap: turnMap,
+        turnLiveForItsTopic: (turn: { sessionChatId: string; sessionThreadId?: number | null }) =>
+          turnMap.isLiveForKey(
+            turn as never,
+            statusKeyForTests(turn.sessionChatId, turn.sessionThreadId),
+          ),
+        endCurrentTurnForKey: (turn: unknown, key: string) => {
+          endedKeys.push(key)
+          return turnMap.endTurnForKey(turn as never, key)
+        },
+      }
 
   const deps = {
     SILENCE_FALLBACK_MS: 300_000,
@@ -79,7 +137,7 @@ export function makeLivenessFixture(over: Partial<Record<string, unknown>> = {})
     TURN_PREVIEW_MAX: 200,
     STATE_DIR: mkdtempSync(join(tmpdir(), 'liveness-wiring-')),
     isLegitimatelyWorking: () => false,
-    getCurrentTurn: () => currentTurn,
+    ...turnMapDeps,
     getInFlightUpdate: () => null,
     getTurnsDb: () => null,
     getInboundSpool: () => undefined,
@@ -94,13 +152,6 @@ export function makeLivenessFixture(over: Partial<Record<string, unknown>> = {})
     lastPtyPreviewByChat: new Map(),
     preambleSuppressor: { dropNow: () => {} },
     purgeReactionTracking: () => {},
-    currentTurnMap: { purgeChatStale: () => {} },
-    turnLiveForItsTopic: () => true,
-    endCurrentTurnForKey: (_turn: unknown, key: string) => {
-      endedKeys.push(key)
-      currentTurn = null
-      return true
-    },
     getPendingInboundBuffer: () => ({ drain: () => [] }),
     trackRedeliveredInbound: () => {},
     closeActivityLane: () => {},
@@ -114,7 +165,14 @@ export function makeLivenessFixture(over: Partial<Record<string, unknown>> = {})
     sent,
     endedKeys,
     activeTurnStartedAt,
-    setCurrentTurn: (t: unknown) => { currentTurn = t },
+    setCurrentTurn: (t: unknown) => {
+      if (turnMap != null) throw new Error('use setCurrentTurnForKey with a keyed turnMap')
+      currentTurn = t
+    },
+    setCurrentTurnForKey: (key: string, t: unknown) => {
+      if (turnMap == null) { currentTurn = t; return }
+      turnMap.set(t as never, key)
+    },
     openObligations,
   }
 }
