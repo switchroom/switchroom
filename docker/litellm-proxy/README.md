@@ -69,7 +69,20 @@ must use. Bump procedure: update the pin here (with changelog notes in the
 PR), merge, then the operator edits the compose `image:` to match and
 redeploys. The file currently carries an `UNVERIFIED-AGAINST-LIVE` marker —
 the operator must replace the placeholder tag with the live deployed tag on
-first reconcile.
+first reconcile. Only the host can answer *which* tag that is (the public
+registry knows which tags exist, not which one this deployment runs), so read
+it there:
+
+```sh
+docker inspect --format '{{.Config.Image}}' <litellm-container-name>
+# or, for an immutable digest pin:
+docker inspect --format '{{index .RepoDigests 0}}' <litellm-container-name>
+```
+
+Paste the result into `litellm-image.txt` and delete its
+`UNVERIFIED-AGAINST-LIVE` notice — `src/litellm/repo-config.test.ts` couples
+the two, so a placeholder without the marker (or a real tag that kept the
+marker) fails the suite.
 
 ## What is deliberately NOT here
 

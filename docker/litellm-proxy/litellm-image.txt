@@ -1,8 +1,35 @@
 # LiteLLM proxy image pin — single line, `<image>:<tag>` (comments/# lines ignored).
 # The Coolify docker-compose.yml on the host must reference EXACTLY this tag.
-# UNVERIFIED-AGAINST-LIVE: authored 2026-07-25 from inside a fleet container
-# with no read access to the live compose file. OPERATOR: replace with the
-# exact `image:` tag currently deployed (docker inspect / compose file at
-# /data/coolify/services/<litellm-service-id>/docker-compose.yml), then
-# drop this notice. Never use a floating tag (`main-latest`, `main-stable`).
+#
+# UNVERIFIED-AGAINST-LIVE: authored 2026-07-25 from inside a fleet container.
+# This file records WHICH IMAGE IS DEPLOYED, so it can only be filled in from
+# the live host: the public registry can tell you which tags exist, but not
+# which one this deployment runs. Guessing a plausible upstream tag here would
+# make the file confidently wrong (worse than an obvious placeholder), so it
+# stays a placeholder until an operator reads the live value.
+#
+# OPERATOR — run ONE of these ON THE HOST (not inside an agent container) and
+# paste the result over the placeholder line at the bottom, then delete this
+# whole notice INCLUDING the UNVERIFIED-AGAINST-LIVE line above (a test asserts
+# the placeholder and the marker move together — src/litellm/repo-config.test.ts):
+#
+#   # 1. what the running container was actually started from (preferred):
+#   docker inspect --format '{{.Config.Image}}' <litellm-container-name>
+#   # ...and its immutable digest, if you want an @sha256 pin:
+#   docker inspect --format '{{index .RepoDigests 0}}' <litellm-container-name>
+#
+#   # 2. or read it straight out of the deployed compose file:
+#   grep -n 'image:' /data/coolify/services/<litellm-service-id>/docker-compose.yml
+#
+#   # 3. don't know the container name? list them:
+#   docker ps --format '{{.Names}} {{.Image}}' | grep -i litellm
+#
+# Never use a floating tag (`latest`, `main-latest`, `main-stable`): a floating
+# tag is not a pin and silently changes under you on the next redeploy. Prefer
+# `ghcr.io/berriai/litellm-database:main-vX.Y.Z` or an `@sha256:...` digest.
+#
+# Until then the gap is ASSERTED, not hidden: src/litellm/repo-config.test.ts
+# couples the placeholder to the marker above and carries a dedicated test
+# documenting the pin as unverified. Delete that test in the PR landing the
+# real tag.
 ghcr.io/berriai/litellm-database:REPLACE-WITH-LIVE-PINNED-TAG

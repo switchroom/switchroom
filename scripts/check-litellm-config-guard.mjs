@@ -15,10 +15,12 @@
  * KEN-125 — the config has a repo-managed source of truth
  * (`docker/litellm-proxy/litellm-config.yaml`), which this guard ALWAYS
  * checks (required: missing/unparseable/violating repo copy fails lint, so
- * the guard is no longer vacuous in CI). The LIVE host copy (path via the
- * `LITELLM_CONFIG_PATH` env var — deployment-specific, never hardcoded here)
- * is additionally checked when that env var is set and the file is present,
- * and skipped in CI/dev; on-host enforcement for the live file is the fleet-health
+ * the guard is no longer vacuous in CI). The LIVE host copy (path resolved by
+ * discovery, or the `LITELLM_CONFIG_PATH` env var — deployment-specific, never
+ * hardcoded here) is additionally checked when it resolves and the file is
+ * present, and skipped VISIBLY otherwise (never a silent pass — an unresolved
+ * live copy must be distinguishable from an approved one). CI/dev always skips;
+ * on-host enforcement for the live file is the fleet-health
  * sensor (`src/fleet-health/litellm-config-sensor.ts`), which runs where the
  * file actually lives and escalates a violation into the priority ledger.
  *
@@ -35,8 +37,9 @@
  * The LIVE copy is resolved as: `LITELLM_CONFIG_PATH` env → discovery under the
  * Coolify services dir (`/data/coolify/services/<service>/litellm-config.yaml`).
  * Discovery keeps the on-host lint honest with zero operator setup WITHOUT
- * baking this deployment's Coolify service id into a public repo. Off-host
- * discovery finds nothing and the live check is skipped.
+ * baking this deployment's Coolify service id into a public repo. Zero matches
+ * (off-host) and >1 match (ambiguous host) both resolve to null and print a
+ * SKIP notice naming the reason.
  *
  * Run: `npm run lint:litellm-config-guard` (also part of `npm run lint`).
  */
@@ -54,34 +57,67 @@ const REPO_LITELLM_CONFIG_PATH = fileURLToPath(
   new URL("../docker/litellm-proxy/litellm-config.yaml", import.meta.url),
 );
 
-// Mirrors src/litellm/header-passthrough-guard.ts (discoverLiveLitellmConfigPath).
-// Duplicated because this is a plain .mjs lint script that cannot import the TS
-// core; keep the two in sync — the TS copy is the reference implementation.
-const COOLIFY_SERVICES_DIR = "/data/coolify/services";
+// Mirrors src/litellm/header-passthrough-guard.ts (discoverLiveLitellmConfigPath),
+// including its `{ path, reason, candidates }` result shape. Duplicated because
+// this is a plain .mjs lint script that cannot import the TS core; keep the two
+// in sync — the TS copy is the reference implementation.
+//
+// `SWITCHROOM_COOLIFY_SERVICES_DIR` is the seam that stands in for the TS
+// copy's injectable `servicesDir` option (a .mjs script run as a subprocess has
+// no other injection point). It only redirects DISCOVERY of the live copy; the
+// repo-managed config is always checked from its fixed in-repo path.
+const COOLIFY_SERVICES_DIR =
+  process.env.SWITCHROOM_COOLIFY_SERVICES_DIR || "/data/coolify/services";
 
+/** @returns {{ path: string|null, reason: "found"|"no-services-dir"|"not-found"|"ambiguous", candidates: string[] }} */
 function discoverLiveConfigPath() {
   let entries;
   try {
     entries = readdirSync(COOLIFY_SERVICES_DIR);
   } catch {
-    return null;
+    return { path: null, reason: "no-services-dir", candidates: [] };
   }
   const candidates = [];
   for (const entry of [...entries].sort()) {
     const candidate = `${COOLIFY_SERVICES_DIR}/${entry}/litellm-config.yaml`;
     if (existsSync(candidate)) candidates.push(candidate);
   }
-  if (candidates.length === 1) return candidates[0];
-  if (candidates.length > 1) {
-    console.log(
-      `check-litellm-config-guard: SKIP (live) — ${candidates.length} candidate live configs under ` +
-        `${COOLIFY_SERVICES_DIR}; set LITELLM_CONFIG_PATH to disambiguate.`,
-    );
-  }
+  if (candidates.length === 1) return { path: candidates[0], reason: "found", candidates };
+  if (candidates.length === 0) return { path: null, reason: "not-found", candidates };
+  return { path: null, reason: "ambiguous", candidates };
+}
+
+/**
+ * Resolve the live config path, announcing EVERY unresolved outcome. An
+ * unresolvable live copy is a visible SKIP, never a silent pass: a lint run
+ * that quietly checked nothing live is indistinguishable from one that checked
+ * and approved, which is precisely the failure this guard exists to prevent.
+ *
+ * @returns {string|null}
+ */
+function resolveLivePath() {
+  const fromEnv = process.env.LITELLM_CONFIG_PATH;
+  if (fromEnv) return fromEnv;
+
+  const { path: discovered, reason, candidates } = discoverLiveConfigPath();
+  if (reason === "found") return discovered;
+
+  const why =
+    reason === "ambiguous"
+      ? `${candidates.length} candidate live configs under ${COOLIFY_SERVICES_DIR} ` +
+        `(${candidates.join(", ")}) — refusing to guess which proxy is authoritative`
+      : reason === "no-services-dir"
+        ? `no Coolify services dir at ${COOLIFY_SERVICES_DIR} (hermetic CI/dev expected to skip)`
+        : `no service under ${COOLIFY_SERVICES_DIR} owns a litellm-config.yaml`;
+  console.log(
+    `check-litellm-config-guard: SKIP (live) — ${why}.\n` +
+      `  The repo-managed copy was still checked. Set LITELLM_CONFIG_PATH to point at\n` +
+      `  the live config; on-host enforcement is the fleet-health litellm-config sensor.`,
+  );
   return null;
 }
 
-const path = process.env.LITELLM_CONFIG_PATH ?? discoverLiveConfigPath();
+const path = resolveLivePath();
 
 function isClaudeAllowlistedGroup(name) {
   if (name.endsWith("-openrouter")) return false;
@@ -218,8 +254,9 @@ function checkConfig(path, { required }) {
 }
 
 // The repo-managed copy is ALWAYS checked (required — the guard is no longer
-// vacuous in CI). The live/host copy (LITELLM_CONFIG_PATH env var) is
-// additionally checked when the env var is set.
+// vacuous in CI). The live/host copy is additionally checked when it resolves
+// (LITELLM_CONFIG_PATH env var → discovery); an unresolved live copy already
+// printed a visible SKIP in resolveLivePath().
 let ok = checkConfig(REPO_LITELLM_CONFIG_PATH, { required: true });
 if (path && path !== REPO_LITELLM_CONFIG_PATH) {
   ok = checkConfig(path, { required: false }) && ok;
