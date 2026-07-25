@@ -52,14 +52,19 @@
   plugin independently pushes this one via `lib/bank.py: ensure_bank_mission`
   on a fresh state dir. Before this change the two texts differed.
 
-  One 2026-07-25 review correction folded in: the rewrite reached no
-  existing agent. `ensure_bank_mission` short-circuits on the already-seeded
-  flag in `bank_missions.json` and switchroom seeded the default only on the
-  fresh-agent path, so all 13 live banks kept the 2026-07-19 text. Switchroom's
-  `reconcileAgent` now upgrades the bank mission on `switchroom apply` when the
-  bank's current text byte-equals a known previous default
-  (`SUPERSEDED_RETAIN_MISSIONS`); a customized mission still matches nothing and
-  is never clobbered.
+  One 2026-07-25 review correction folded in, itself corrected by the
+  re-review: the rewrite DID reach existing agents, but unsafely.
+  `ensure_bank_mission` short-circuits on the already-seeded flag in
+  `bank_missions.json`, so the plugin was never the propagation path — but
+  `switchroom apply` re-scaffolds every agent, and scaffold pushed
+  `retain_mission` unconditionally on every run. That is why all 24 live banks
+  carried the 2026-07-19 text even though no agent sets `retain_mission` in
+  yaml. The hazard was the unconditional overwrite, not a stuck mission.
+  Switchroom now routes BOTH of its bank-op sites (scaffold and
+  `reconcileAgent`) through `decideRetainMissionUpgrade`: the mission upgrades
+  only when the bank's current text byte-equals a known previous default
+  (`SUPERSEDED_RETAIN_MISSIONS`) or is unset, so a customized mission matches
+  nothing and is never clobbered.
 
   A second proposed correction — narrowing the "Greetings, acknowledgements,
   and routine operational chatter" bullet and adding a personal-preference

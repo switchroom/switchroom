@@ -76,7 +76,7 @@ Auto-recall and auto-retain feed the bank but never *synthesize* — that's on y
 
 - **Reflect instead of hand-assembling.** About to fire 2+ manual `recall`s for one answer ("summarize where Y stands")? Call `mcp__hindsight__reflect` instead. (Backstop: auto-recall injects the top hits every turn — reflect is the escalation.)
 - **Propose a model when you keep re-deriving.** Rebuilt the *same standing answer* across sessions? Propose a mental model via `mcp__switchroom-telegram__mental_model_propose(name, source_query)` (or run the `mental-model-curator` skill). Not for a one-off fact (`retain`) or identity (profile banks own that).
-- **Merge or retire directives when they pile up.** Directives cap at `MAX_DIRECTIVES=30` active per bank — past that the lowest-priority ones drop from recall (the hook logs a warning when it happens). When they overlap or read stale, run the `mental-model-curator` merge/retire pass (deletes stay operator-approved). (Backstop: `switchroom doctor` WARNs at >24, FAILs at >30.)
+- **Merge or retire directives when they pile up.** Directives cap at `MAX_DIRECTIVES=30` active per bank — past that the lowest-priority ones drop from recall (silently — the recall hook's stderr warning is swallowed by Claude Code; the visible signals are `directives_omitted` on the recall_log row and `switchroom doctor`). When they overlap or read stale, run the `mental-model-curator` merge/retire pass (deletes stay operator-approved). (Backstop: `switchroom doctor` WARNs at >24, FAILs at >30.)
 
 ## Sub-Agent Delegation
 

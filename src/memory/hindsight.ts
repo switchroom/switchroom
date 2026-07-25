@@ -314,23 +314,30 @@ export const DEFAULT_RETAIN_MISSION =
  * DEFAULT, oldest first. Purely historical — do not edit an entry, only
  * append the outgoing text when `DEFAULT_RETAIN_MISSION` changes.
  *
- * Why it exists (2026-07-25 review finding 1): rewriting
- * `DEFAULT_RETAIN_MISSION` used to reach NO existing agent. Three independent
- * paths blocked it — the plugin's `ensure_bank_mission` short-circuits on the
- * already-seeded flag in `bank_missions.json`, scaffold seeds the default only
- * on the fresh-agent path, and `reconcileAgent` pushed `retain_mission` only
- * when the operator had set one in yaml. So every live bank kept the mission
- * it was born with (verified 2026-07-25: all 13 production banks carried the
- * identical 2026-07-19 default).
+ * Why it exists (2026-07-25 review finding 1, corrected by the re-review):
+ * a rewrite of `DEFAULT_RETAIN_MISSION` DID reach live banks — but only by
+ * accident, and unsafely. `switchroom apply` re-scaffolds every agent
+ * (`src/cli/apply.ts`; it never calls `reconcileAgent`), and scaffold pushed
+ * `retain_mission: configured ?? DEFAULT_RETAIN_MISSION` unconditionally on
+ * every run. That is the mechanism by which all 24 live banks came to carry
+ * `SUPERSEDED_RETAIN_MISSIONS[2]` despite no agent setting `retain_mission` in
+ * `switchroom.yaml` (verified live 2026-07-25). The `reconcileAgent` path —
+ * which pushed only an operator's yaml mission — and the plugin's
+ * `ensure_bank_mission` short-circuit were both dead ends, so the propagation
+ * nobody had designed was the one doing the work.
  *
- * Reconcile now upgrades the mission on `switchroom apply` — the same
- * rationale as the `reflect_mission` / `observations_mission` push it sits
- * beside. The guard that made the old behaviour defensible ("an operator's
- * customized mission is never clobbered") is preserved EXACTLY by this
- * registry: the upgrade fires only when the bank's current mission
- * byte-equals a known previous default (or is unset). Any customization —
- * operator yaml, a hand-edit through the Hindsight API, even a whitespace
- * difference — matches nothing here and is left untouched.
+ * The problem was the *unconditional* part: an operator who hand-edited a
+ * mission through the Hindsight API had it silently overwritten on the next
+ * apply. Both bank-op sites now route through `decideRetainMissionUpgrade`
+ * (`resolveRetainMissionPush` in scaffold.ts), and this registry is what makes
+ * the push safe: it fires only when the bank's current mission byte-equals a
+ * known previous default (or is unset). Any customization — a hand-edit
+ * through the API, even a whitespace difference — matches nothing here and is
+ * left untouched. Operator yaml still wins outright.
+ *
+ * The registry/REST read machinery is load-bearing on BOTH paths now; before
+ * the re-review fix it was reached only on `agent reconcile` / restart
+ * (`src/cli/agent.ts`).
  */
 export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
   // 3e028eeb3 (2026-05) — the vendored plugin's original settings.json
@@ -405,7 +412,15 @@ export function decideRetainMissionUpgrade(
  * the write path, where `retain_mission` must ride in `config_updates`.
  *
  * Best-effort with a short timeout; never throws. `{ ok: true, mission: null }`
- * means the bank exists but has no retain mission set.
+ * means the bank exists and the `retain_mission` KEY is present but null —
+ * i.e. genuinely unset.
+ *
+ * A 200 whose body lacks `config`, or whose `config` lacks the
+ * `retain_mission` key at all, is reported as `{ ok: false }` — NOT as
+ * "unset". `isUpgradableRetainMission(null)` is true, so mapping an
+ * unrecognised shape to null would push the default over every customized
+ * mission fleet-wide the day Hindsight renests or renames the field
+ * (2026-07-25 re-review M1).
  */
 export async function fetchBankRetainMission(
   apiUrl: string,
@@ -425,8 +440,18 @@ export async function fetchBankRetainMission(
     const body = (await resp.json()) as {
       config?: { retain_mission?: string | null } | null;
     };
-    const mission = body?.config?.retain_mission;
-    return { ok: true, mission: typeof mission === "string" ? mission : null };
+    const config = body?.config;
+    if (config == null || typeof config !== "object") {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    if (!("retain_mission" in config)) {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    const mission = config.retain_mission;
+    if (mission != null && typeof mission !== "string") {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    return { ok: true, mission: mission ?? null };
   } catch (err) {
     clearTimeout(timeout);
     if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };

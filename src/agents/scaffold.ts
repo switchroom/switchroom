@@ -1667,6 +1667,96 @@ function formatAgentBankLabel(agentName: string, bankId: string): string {
 }
 
 /**
+ * In-flight Hindsight bank-op chains (bank create → mission read → mission
+ * push → mental models). `scaffoldAgent` / `reconcileAgent` are synchronous
+ * and start these fire-and-forget, which is fine while the process exits by
+ * draining the event loop — a pending fetch keeps node alive. It is NOT fine
+ * on a hard `process.exit()`: `runApply` exits with codes 4/5/6 in its vault
+ * phases, which run AFTER the scaffold loop, and would truncate a push
+ * mid-flight. The 2026-07-25 re-review's retain-mission read (up to 5s)
+ * widened that window, so the fix is a real flush rather than a note (L2).
+ *
+ * Callers that hard-exit await `flushPendingBankOps()` after the scaffold
+ * loop. Everything else can ignore it and keep the old drain behaviour.
+ */
+const pendingBankOps: Promise<unknown>[] = [];
+
+/** Register a bank-op chain so `flushPendingBankOps` can wait on it. */
+function trackBankOps(p: Promise<unknown>): void {
+  // Swallow here only for tracking purposes — each chain already has its own
+  // .catch for user-facing reporting.
+  pendingBankOps.push(p.catch(() => undefined));
+}
+
+/**
+ * Wait for every in-flight bank-op chain, bounded by `timeoutMs`. Never
+ * throws; returns true if everything settled, false if the timeout won (in
+ * which case the caller is exiting anyway and apply is idempotent — the
+ * operator's next run re-pushes).
+ *
+ * Exported for tests and for `runApply`.
+ */
+export async function flushPendingBankOps(timeoutMs = 15_000): Promise<boolean> {
+  if (pendingBankOps.length === 0) return true;
+  const inFlight = pendingBankOps.splice(0, pendingBankOps.length);
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    // Don't hold the event loop open just for the deadline.
+    timer.unref?.();
+  });
+  const settled = Promise.all(inFlight).then(() => true);
+  const result = await Promise.race([settled, timedOut]);
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+/**
+ * Decide what `retain_mission` (if anything) to push at this bank, and log the
+ * outcome. Shared by BOTH bank-op sites — `scaffoldAgent` and `reconcileAgent`
+ * — because `switchroom apply` re-scaffolds every existing agent and never
+ * calls reconcile (`src/cli/apply.ts`), so a guard living only in reconcile is
+ * unreachable on the path operators actually run (2026-07-25 re-review H1).
+ *
+ * One path, three outcomes, driven by `decideRetainMissionUpgrade`:
+ *  - operator yaml set          → push it verbatim (wins outright, no read needed)
+ *  - bank unset / superseded    → push DEFAULT_RETAIN_MISSION
+ *  - bank customized or current → push nothing
+ *
+ * A FAILED read pushes nothing (unless yaml set one): "unknown" must never be
+ * treated as "upgradable", or a transient Hindsight hiccup would clobber a
+ * customized mission. This also means a genuinely fresh bank is seeded via the
+ * normal "mission unset → upgrade" outcome rather than a separate fresh-agent
+ * branch — no created-vs-existed signal is needed from `createBank`, whose MCP
+ * envelope does not carry one.
+ */
+async function resolveRetainMissionPush(
+  apiUrl: string,
+  bankId: string,
+  configured: string | undefined,
+  label: string,
+): Promise<string | undefined> {
+  // Config wins outright and needs no read — push it regardless.
+  if (configured) return configured;
+
+  const current = await fetchBankRetainMission(apiUrl, bankId, { timeoutMs: 5000 });
+  if (!current.ok) {
+    console.warn(
+      `  ${chalk.yellow("⚠")} Could not read current retain_mission for ${label} (${current.reason}) — leaving it untouched`,
+    );
+    return undefined;
+  }
+
+  const decision = decideRetainMissionUpgrade(configured, current.mission);
+  if (decision.action === "upgrade") {
+    console.log(
+      `  ${chalk.green("✓")} Upgrading superseded default retain_mission for ${label}`,
+    );
+  }
+  return decision.mission;
+}
+
+/**
  * Parse a duration string like "2h", "30m", "7200s" into seconds.
  * Returns undefined for undefined input.
  */
@@ -5225,20 +5315,24 @@ export function scaffoldAgent(
 
     // Update bank missions — gated on the bank actually existing.
     //
-    // Mission selection: explicit user yaml wins. When the operator hasn't
-    // set a `retain_mission`, scaffold seeds DEFAULT_RETAIN_MISSION
-    // unconditionally — a brand-new bank has nothing to clobber.
-    //
-    // `reconcileAgent` handles the EXISTING-agent case separately (see the
-    // retain_mission block there): it upgrades the mission only when the
-    // bank's current text byte-equals a known superseded default, so a
-    // customized mission survives `switchroom apply`.
-    bankOpsChain.then((bankReady) => {
+    // Mission selection: explicit user yaml wins. Otherwise the retain mission
+    // goes through `resolveRetainMissionPush`, exactly as reconcile does.
+    // `switchroom apply` re-scaffolds EVERY existing agent (it never calls
+    // `reconcileAgent`), so this site sees established banks far more often
+    // than fresh ones — an unconditional seed here clobbered any customized
+    // mission on every apply (2026-07-25 re-review H1). A genuinely fresh bank
+    // still gets seeded: its mission reads back unset, which is upgradable.
+    trackBankOps(bankOpsChain.then(async (bankReady) => {
       if (!bankReady) return;
 
       const userBankMission = agentConfig.memory?.bank_mission;
       const userRetainMission = agentConfig.memory?.retain_mission;
-      const seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION;
+      const seededRetainMission = await resolveRetainMissionPush(
+        apiUrl,
+        hindsightBankId,
+        userRetainMission,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
 
       // reflect_mission / observations_mission / disposition, layering the
       // resolved config over the built-in profile defaults (Phase 2). Config
@@ -5254,18 +5348,22 @@ export function scaffoldAgent(
         reflect_mission?: string;
         observations_mission?: string;
         disposition?: { skepticism?: number; literalism?: number; empathy?: number };
-      } = {
-        retain_mission: seededRetainMission,
-        ...extras,
-      };
+      } = { ...extras };
+      if (seededRetainMission) {
+        missions.retain_mission = seededRetainMission;
+      }
       if (userBankMission) {
         missions.bank_mission = userBankMission;
       }
 
-      updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+      await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
         .then((result) => {
           if (result.ok) {
-            const note = userRetainMission ? "(custom retain_mission)" : "(default retain_mission)";
+            const note = userRetainMission
+              ? "(custom retain_mission)"
+              : seededRetainMission
+                ? "(default retain_mission)"
+                : "(retain_mission left as-is)";
             console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)} ${chalk.dim(note)}`);
           } else {
             console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
@@ -5278,7 +5376,7 @@ export function scaffoldAgent(
       // Ensure operator-DECLARED per-specialist mental models (Phase 5). Only
       // models named in memory.mental_models are created — no blind seeding
       // (that is the #2447 regression this avoids). Best-effort; never blocks.
-      ensureDeclaredMentalModels(
+      await ensureDeclaredMentalModels(
         apiUrl,
         hindsightBankId,
         agentConfig.memory?.mental_models,
@@ -5296,7 +5394,7 @@ export function scaffoldAgent(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
-    });
+    }));
   }
 
   // Loud warning when CLAUDE.md (or any future fingerprint-tracked
@@ -7492,7 +7590,7 @@ function reconcileAgentInner(
         return false;
       });
 
-    bankOpsChain.then(async (bankReady) => {
+    trackBankOps(bankOpsChain.then(async (bankReady) => {
       if (!bankReady) return;
 
       // Reconcile pushes reflect_mission / observations_mission / disposition
@@ -7515,44 +7613,24 @@ function reconcileAgentInner(
         missions.bank_mission = agentConfig.memory.bank_mission;
       }
 
-      // retain_mission on reconcile (2026-07-25 review finding 1). Until now
-      // this pushed ONLY when the operator had set it in yaml, which meant a
-      // rewrite of DEFAULT_RETAIN_MISSION reached NO existing agent: the
-      // plugin's ensure_bank_mission short-circuits on the already-seeded flag
-      // and scaffold seeds only fresh agents, so every live bank kept the
-      // mission it was born with. It now follows the same "push the default so
-      // existing banks pick up changes" rule as reflect/observations above —
-      // but ONLY when the bank's current mission byte-equals a known previous
-      // default (SUPERSEDED_RETAIN_MISSIONS) or is unset. A customized mission
-      // matches nothing in that registry and is still never clobbered.
-      //
-      // On a failed read we push nothing: "unknown" must not be treated as
-      // "upgradable".
-      const currentRetain = await fetchBankRetainMission(apiUrl, hindsightBankId, {
-        timeoutMs: 5000,
-      });
-      if (currentRetain.ok) {
-        const decision = decideRetainMissionUpgrade(
-          agentConfig.memory?.retain_mission,
-          currentRetain.mission,
-        );
-        if (decision.mission) missions.retain_mission = decision.mission;
-        if (decision.action === "upgrade") {
-          console.log(
-            `  ${chalk.green("✓")} Upgrading superseded default retain_mission for ${formatAgentBankLabel(name, hindsightBankId)}`,
-          );
-        }
-      } else if (agentConfig.memory?.retain_mission) {
-        // Config wins outright and needs no read — push it regardless.
-        missions.retain_mission = agentConfig.memory.retain_mission;
-      } else {
-        console.warn(
-          `  ${chalk.yellow("⚠")} Could not read current retain_mission for ${formatAgentBankLabel(name, hindsightBankId)} (${currentRetain.reason}) — leaving it untouched`,
-        );
-      }
+      // retain_mission on reconcile (2026-07-25 review finding 1). Until then
+      // this pushed ONLY when the operator had set it in yaml, so a rewrite of
+      // DEFAULT_RETAIN_MISSION never reached an existing bank through THIS
+      // path. It now follows the same "push the default so existing banks pick
+      // up changes" rule as reflect/observations above — via the shared
+      // `resolveRetainMissionPush`, which upgrades only when the bank's current
+      // mission byte-equals a known previous default (SUPERSEDED_RETAIN_MISSIONS)
+      // or is unset, and pushes nothing on a failed read.
+      const retainMission = await resolveRetainMissionPush(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.retain_mission,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
+      if (retainMission) missions.retain_mission = retainMission;
 
       if (Object.keys(missions).length > 0) {
-        updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+        await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
           .then((result) => {
             if (result.ok) {
               console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
@@ -7569,7 +7647,7 @@ function reconcileAgentInner(
       // reconcile too — declared models are the desired steady state, so a
       // newly-added declaration lands on the next apply/restart. Only named
       // models are created; nothing is auto-seeded. Best-effort; never blocks.
-      ensureDeclaredMentalModels(
+      await ensureDeclaredMentalModels(
         apiUrl,
         hindsightBankId,
         agentConfig.memory?.mental_models,
@@ -7587,7 +7665,7 @@ function reconcileAgentInner(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
-    });
+    }));
   }
 
   return {
