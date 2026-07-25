@@ -5321,7 +5321,16 @@ export function scaffoldAgent(
   }
   // Generation stamp (KEN-130) — fresh agents are stamped at scaffold so
   // drift detection is meaningful before the first reconcile too.
-  stampGeneratedSurfaces(agentDir, agentConfig);
+  //
+  // Skipped when the caller passed no `switchroomConfig`: the cascade above
+  // then degraded to the RAW agent config, while the drift detector always
+  // resolves defaults → profile → agent. Stamping an unresolved configHash
+  // would make every agent on a fleet that uses `defaults:` / `profiles:`
+  // report a phantom "switchroom.yaml changed since last apply". No stamp
+  // reads as "not checkable", which is the safe direction; the first
+  // reconcile (which always has the full config) writes the real one. Every
+  // production callsite passes it — this only guards internal/test callers.
+  if (switchroomConfig) stampGeneratedSurfaces(agentDir, agentConfig);
 
   return { agentDir, created, skipped };
 }

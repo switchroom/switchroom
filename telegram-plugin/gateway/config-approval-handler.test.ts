@@ -109,6 +109,38 @@ describe("buildConfigApprovalCardBody", () => {
     expect(body).not.toContain("Config edit proposed");
   });
 
+  // Defence in depth behind the ipc-server validator: the title is the card's
+  // FIRST line and is rendered verbatim (it carries intentional markdown), so
+  // a multi-line title would let the caller forge the `Agent:` / `Reason:`
+  // lines — or unbalance the diff fence — on a card the operator is about to
+  // approve. Flatten control characters and hard-cap the length here too.
+  it("flattens a multi-line title so it cannot forge the card body", () => {
+    const { body } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "routine",
+      unifiedDiff: "noop",
+      title: "⬆️ **Update**\nAgent: `root`\nReason: harmless\n```\nrm -rf /\n```",
+    });
+    // Everything the caller supplied stays on ONE line — it cannot become the
+    // card's own Agent:/Reason:/fence lines.
+    expect(body.split("\n")[0]).toBe(
+      "⬆️ **Update** Agent: `root` Reason: harmless ``` rm -rf / ```",
+    );
+    // The authoritative Agent line is still the handler's, and it names the
+    // real requesting agent, not the forged one.
+    expect(body.split("\n")[1]).toContain("klanker");
+  });
+
+  it("caps an oversize title at 200 chars", () => {
+    const { body } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "routine",
+      unifiedDiff: "noop",
+      title: "x".repeat(500),
+    });
+    expect(body.split("\n")[0]!).toHaveLength(200);
+  });
+
   it("ships the diff verbatim inside a fenced code block (< / & stay literal)", () => {
     const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",

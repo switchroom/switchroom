@@ -724,6 +724,20 @@ export class HostdServer {
     }
   }
 
+  /**
+   * KEN-131 — public read of the currently-latched auto-rollout target (the
+   * durable file first, the in-memory fallback second), or null when none.
+   *
+   * Wired into the auto-update `checkFn` so a latched version stops being
+   * reported as "available": without it, the pin never advances, so every
+   * watcher tick re-enters `applyFn`, gets refused by this same latch, and
+   * appends another `apply_failed` row to the telemetry log — forever, until
+   * an operator intervenes.
+   */
+  autoRolloutLatchedPin(): string | null {
+    return this.readAutoRolloutLatch()?.pin ?? this.lastAutoRolloutFailedPin;
+  }
+
   /** Best-effort durable latch write — must NEVER throw into a roll path.
    *  A write failure degrades to the in-memory latch (logged). */
   private writeAutoRolloutLatch(latch: AutoRolloutLatch): void {
@@ -4153,11 +4167,24 @@ export class HostdServer {
     }
   }
 
-  /** First configured agent with `admin: true`, or null (KEN-131 — relay
-   *  target for unattended-rollout alerts, which have no caller agent). */
+  /**
+   * First configured admin-tier agent, or null (KEN-131 — relay target for
+   * unattended-rollout alerts, which have no caller agent).
+   *
+   * Matches `admin: true` OR `root: true` and iterates in SORTED key order —
+   * the same rule and the same deterministic order the KEN-129 update-card
+   * dispatch uses in main.ts. Matching only `admin` would silently drop the
+   * alert on a fleet whose sole privileged agent is `root: true`, and object
+   * insertion order would make the target depend on yaml key order.
+   */
   private firstAdminAgentName(): string | null {
-    for (const [name, a] of Object.entries(this.opts.config.agents ?? {})) {
-      if (a?.admin === true) return name;
+    const agents = (this.opts.config.agents ?? {}) as Record<
+      string,
+      { admin?: boolean; root?: boolean } | undefined
+    >;
+    for (const name of Object.keys(agents).sort()) {
+      const a = agents[name];
+      if (a?.admin === true || a?.root === true) return name;
     }
     return null;
   }

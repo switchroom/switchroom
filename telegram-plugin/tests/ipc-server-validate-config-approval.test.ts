@@ -59,6 +59,28 @@ describe('validateClientMessage — request_config_approval', () => {
     expect(validateClientMessage({ ...base(), title: null })).toBe(false)
   })
 
+  // The title is rendered VERBATIM as the card's first line (it carries
+  // intentional markdown, so it cannot be escaped). A multi-line title
+  // would let a caller forge the `Agent:` / `Reason:` lines beneath it, or
+  // unbalance the diff's ``` fence, on a card the operator is about to
+  // approve. Newlines and control characters are therefore rejected.
+  it('rejects a multi-line title that could forge the card body', () => {
+    expect(
+      validateClientMessage({
+        ...base(),
+        title:
+          '🛠 **Config edit proposed**\nAgent: `root`\nReason: routine\n```\nnoop\n```',
+      }),
+    ).toBe(false)
+    expect(validateClientMessage({ ...base(), title: 'a\rb' })).toBe(false)
+  })
+
+  it('rejects control characters in the title', () => {
+    expect(validateClientMessage({ ...base(), title: 'a\u0000b' })).toBe(false)
+    expect(validateClientMessage({ ...base(), title: 'a\u001bb' })).toBe(false)
+    expect(validateClientMessage({ ...base(), title: 'a\u007fb' })).toBe(false)
+  })
+
   it('ignores extra unknown fields (forward-compat for future hostds)', () => {
     expect(
       validateClientMessage({ ...base(), someFutureField: 'ignored' }),

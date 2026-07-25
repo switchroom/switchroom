@@ -207,13 +207,23 @@ export function buildConfigApprovalCardBody(args: {
   reason: string;
   unifiedDiff: string;
   /** Optional header override (KEN-129 — e.g. the update-check drift
-   *  card). Rendered verbatim as the first line; absent → the default
+   *  card). Rendered verbatim as the FIRST LINE (it carries intentional
+   *  markdown, so it is not escaped) — hence single-line only, enforced
+   *  at the IPC validator and re-enforced here; absent → the default
    *  config-edit header. */
   title?: string;
 }): { body: string; truncated: boolean } {
   const safeReason = clipReason(args.reason);
+  // Defence in depth against a forged card: a multi-line title could fake
+  // the `Agent:` / `Reason:` lines below it, or unbalance the diff's ```
+  // fence. `validateClientMessage` already rejects those, so this only ever
+  // fires for a direct caller that skipped the validator.
+  const safeTitle = args.title
+    ? // eslint-disable-next-line no-control-regex
+      args.title.replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, 200)
+    : undefined;
   const render = (diff: string): string =>
-    `${args.title ?? "🛠 **Config edit proposed**"}\n` +
+    `${safeTitle ?? "🛠 **Config edit proposed**"}\n` +
     `Agent: \`${args.agentName}\`\n` +
     `Reason: ${escapeMarkdown(safeReason)}\n\n` +
     "```\n" + diff + "\n```";

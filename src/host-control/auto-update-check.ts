@@ -90,6 +90,27 @@ export interface AutoUpdateCheckOptions {
    * — surfaced as `check_failed`, tick dropped.
    */
   getCurrentPin: () => string | undefined;
+  /**
+   * Live view of the fleet's current `release.channel` (re-read per tick,
+   * like the pin). An operator on a NON-`latest` channel (`dev` / `rc`) has
+   * made an explicit release-policy choice that the auto-update path cannot
+   * honour: it tracks the npm `latest` dist-tag, and persisting a pin
+   * DELETES `release.channel` (schema mutual exclusion — see
+   * `setReleasePinInConfig`). Rolling anyway would silently yank a dev/rc
+   * fleet onto stable and erase the operator's channel. So a non-`latest`
+   * channel suppresses the unattended roll instead.
+   */
+  getCurrentChannel?: () => string | undefined;
+  /**
+   * Live view of hostd's durable auto-rollout latch pin, when one is set
+   * (a previous unattended roll to that version failed or died mid-flight).
+   * The pin never advanced, so `checkFn` would otherwise keep reporting
+   * "available" every tick forever — each tick re-entering `applyFn`, being
+   * refused by the latch, and appending an `apply_failed` telemetry row.
+   * Reporting NOT-available for a latched target quiesces that loop; a
+   * newer publish (or a manual roll) clears/supersedes the latch.
+   */
+  getLatchedPin?: () => string | null;
   /** Agent image ref whose `:vX.Y.Z` sibling must be pullable before a
    *  roll is attempted (tag portion, if any, is replaced). */
   imageRef: string;
@@ -130,8 +151,40 @@ export function makeAutoUpdateCheck(
       }
       return probe.digest !== null;
     });
+  // The watcher ticks every few minutes forever; a suppression reason that
+  // holds indefinitely (non-latest channel, latched failed pin) must not
+  // reprint on every tick. Log once per distinct reason instead.
+  let lastSuppressed = "";
+  const logOnce = (key: string, m: string): void => {
+    if (lastSuppressed === key) return;
+    lastSuppressed = key;
+    log(m);
+  };
   return async () => {
     const latest = `v${(await fetchLatest()).trim().replace(/^v/, "")}`;
+    const channel = opts.getCurrentChannel?.();
+    if (channel !== undefined && channel !== "latest") {
+      logOnce(
+        `channel:${channel}`,
+        `auto-update: release.channel is "${channel}" (not "latest") — the ` +
+          `auto-update path tracks the npm latest dist-tag and persisting a ` +
+          `pin would delete your channel, so no unattended roll will happen. ` +
+          `Remove release.channel (or set it to "latest") to enable it. ` +
+          `Latest published: ${latest}`,
+      );
+      return { available: false, version: latest };
+    }
+    const latched = opts.getLatchedPin?.() ?? null;
+    if (latched !== null && latched === latest) {
+      logOnce(
+        `latch:${latched}`,
+        `auto-update: ${latest} is latched from a previous unattended roll ` +
+          `that failed or died mid-flight — not re-reporting it as available. ` +
+          `Fix the cause and roll manually (\`switchroom rollout --pin ` +
+          `${latest}\`), or wait for a newer release.`,
+      );
+      return { available: false, version: latest };
+    }
     const pin = opts.getCurrentPin();
     if (pin !== undefined) {
       const cmp = compareReleaseTags(latest, pin);

@@ -324,6 +324,47 @@ describe("startAutoRollout — latch durability across hostd restarts (KEN-131)"
   });
 });
 
+// A watcher-initiated roll has no caller agent, so the failure alert can only
+// reach the operator through a privileged agent's gateway relay. If that
+// lookup returns null the alert is DROPPED — an unattended rollback with no
+// human notified. Two ways that used to happen: a fleet whose sole privileged
+// agent is declared `root: true` (the newer tier) rather than `admin: true`,
+// and yaml key order deciding the target non-deterministically.
+describe("privileged-agent alert target resolution", () => {
+  function target(agents: Record<string, unknown>): string | null {
+    const dir = mkdtempSync(join(tmpdir(), "auto-rollout-admin-"));
+    const server = new HostdServer({
+      homeDir: dir,
+      agentUids: {},
+      config: { agents },
+      auditLogPath: join(dir, "audit.log"),
+      selfVersion: "v99.0.0",
+      allowNonLinux: true,
+    } as unknown as ServerOptions);
+    return (
+      server as unknown as { firstAdminAgentName: () => string | null }
+    ).firstAdminAgentName();
+  }
+
+  it("resolves an admin agent", () => {
+    expect(target({ plain: {}, overlord: { admin: true } })).toBe("overlord");
+  });
+
+  it("also accepts a root-tier agent (alert is not dropped on a root-only fleet)", () => {
+    expect(target({ plain: {}, boss: { root: true } })).toBe("boss");
+  });
+
+  it("is deterministic — name order, not yaml key order", () => {
+    expect(target({ zeta: { admin: true }, alpha: { admin: true } })).toBe("alpha");
+    expect(target({ alpha: { admin: true }, zeta: { admin: true } })).toBe("alpha");
+  });
+
+  it("returns null when no agent is privileged", () => {
+    expect(target({ a: {}, b: { admin: false } })).toBeNull();
+    expect(target({})).toBeNull();
+  });
+});
+
 describe("startAutoRollout — fleet-mutation lock", () => {
   it("refuses while a roll is already in flight", async () => {
     let release!: (r: RunResult) => void;

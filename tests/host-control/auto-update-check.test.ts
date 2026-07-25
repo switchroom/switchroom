@@ -16,17 +16,22 @@ const IMAGE = "ghcr.io/switchroom/switchroom-agent:latest";
 function makeCheck(opts: {
   latest?: string;
   pin?: string | undefined;
+  channel?: string | undefined;
+  latchedPin?: string | null;
   imageExists?: boolean;
 }) {
   const imageExists = vi.fn(async () => opts.imageExists ?? true);
+  const logs: string[] = [];
   const check = makeAutoUpdateCheck({
     imageRef: IMAGE,
     getCurrentPin: () => opts.pin,
+    getCurrentChannel: () => opts.channel,
+    getLatchedPin: () => opts.latchedPin ?? null,
     fetchLatestVersion: async () => opts.latest ?? "1.2.3",
     imageExists,
-    log: () => {},
+    log: (m) => logs.push(m),
   });
-  return { check, imageExists };
+  return { check, imageExists, logs };
 }
 
 describe("versionedImageRef", () => {
@@ -87,6 +92,76 @@ describe("makeAutoUpdateCheck", () => {
     const { check, imageExists } = makeCheck({ latest: "1.2.3", pin: "v1.2.3" });
     await check();
     expect(imageExists).not.toHaveBeenCalled();
+  });
+
+  // Persisting a pin DELETES release.channel (schema mutual exclusion), so
+  // an unattended roll on a dev/rc fleet would silently move it to stable
+  // AND erase the operator's channel choice. Suppress instead.
+  it("never rolls unattended while a non-latest release.channel is set", async () => {
+    for (const channel of ["dev", "rc"]) {
+      const { check, imageExists } = makeCheck({
+        latest: "1.2.3",
+        pin: undefined,
+        channel,
+      });
+      await expect(check()).resolves.toEqual({
+        available: false,
+        version: "v1.2.3",
+      });
+      expect(imageExists).not.toHaveBeenCalled();
+    }
+  });
+
+  it("channel: latest does not suppress (it is what the auto-update path tracks)", async () => {
+    const { check } = makeCheck({
+      latest: "1.2.3",
+      pin: undefined,
+      channel: "latest",
+    });
+    await expect(check()).resolves.toEqual({
+      available: true,
+      version: "v1.2.3",
+    });
+  });
+
+  // Without this the pin never advances after a failed roll, so every tick
+  // re-reports "available", re-enters applyFn, is refused by the latch, and
+  // appends another apply_failed telemetry row — forever.
+  it("does not re-report a LATCHED failed version as available", async () => {
+    const { check, imageExists } = makeCheck({
+      latest: "1.2.3",
+      pin: "v1.2.2",
+      latchedPin: "v1.2.3",
+    });
+    await expect(check()).resolves.toEqual({
+      available: false,
+      version: "v1.2.3",
+    });
+    expect(imageExists).not.toHaveBeenCalled();
+  });
+
+  it("a latch on an OLDER version does not block a newer release", async () => {
+    const { check } = makeCheck({
+      latest: "1.2.4",
+      pin: "v1.2.2",
+      latchedPin: "v1.2.3",
+    });
+    await expect(check()).resolves.toEqual({
+      available: true,
+      version: "v1.2.4",
+    });
+  });
+
+  it("logs an indefinite suppression reason ONCE, not on every tick", async () => {
+    const { check, logs } = makeCheck({
+      latest: "1.2.3",
+      pin: undefined,
+      channel: "dev",
+    });
+    await check();
+    await check();
+    await check();
+    expect(logs.filter((m) => m.includes("release.channel"))).toHaveLength(1);
   });
 
   it("propagates a fetch failure (watcher surfaces it as check_failed)", async () => {

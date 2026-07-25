@@ -277,15 +277,30 @@ async function main(): Promise<void> {
       // detection the UNATTENDED staggered canary rollout via the server's
       // own launch path (fleet-mutation lock, self-bump, audit, narration,
       // rollback + alert hardening). NOT the legacy update+restart-all.
+      // A `notify_on_detect` the auto-update path can't honour must not fail
+      // silently — the operator asked for a card and would otherwise get
+      // neither a card nor an explanation.
+      if (autoRel?.notify_on_detect === true) {
+        process.stderr.write(
+          "hostd: release.auto_update is on, so notify_on_detect is " +
+            "ignored — new releases roll unattended via the canary path and " +
+            "only FAILURES post an operator alert. Turn off " +
+            "release.auto_update if you want the tap-to-apply card instead.\n",
+        );
+      }
+      // Live release block per tick — a green roll persists the pin, which
+      // is what quiesces the check. Throws on malformed config (tick
+      // dropped as check_failed, retried next interval).
+      const liveRelease = (): { pin?: string; channel?: string } =>
+        (loadConfig() as { release?: { pin?: string; channel?: string } })
+          .release ?? {};
       releaseWatcher = new ReleaseWatcher({
         intervalMs: intervalMinutes * 60_000,
         checkFn: makeAutoUpdateCheck({
           imageRef,
-          // Live pin per tick — a green roll persists the pin, which is
-          // what quiesces the check. Throws on malformed config (tick
-          // dropped as check_failed, retried next interval).
-          getCurrentPin: () =>
-            (loadConfig() as { release?: { pin?: string } }).release?.pin,
+          getCurrentPin: () => liveRelease().pin,
+          getCurrentChannel: () => liveRelease().channel,
+          getLatchedPin: () => server.autoRolloutLatchedPin(),
           log,
         }),
         applyFn: async (version) => {
@@ -315,108 +330,108 @@ async function main(): Promise<void> {
           `releases roll via the staggered canary rollout\n`,
       );
     } else {
-    const applyOnDetect = autoRel?.apply_on_detect ?? true;
-    const notifyOnDetect = autoRel?.notify_on_detect ?? false;
-    // KEN-129 — operator-in-the-loop drift card. Only wired when
-    // auto-apply is OFF (apply_on_detect supersedes notify: a fleet
-    // that self-applies has nothing to ask the operator).
-    let notifier: UpdateNotifier | null = null;
-    if (!applyOnDetect && notifyOnDetect) {
-      // Card targets: admin (or root-tier) agents' gateways, in
-      // stable order. The first gateway that actually accepts the
-      // card wins; dispatch failures fall through to the next.
-      const adminAgents = Object.keys(config.agents)
-        .filter((n) => {
-          const a = config.agents[n] as { admin?: boolean; root?: boolean };
-          return a.admin === true || a.root === true;
-        })
-        .sort();
-      // Card timeout — shared with the notifier's re-post suppress
-      // window (a pre-restart pending card is honoured for exactly as
-      // long as it could still be live in the operator's chat).
-      const cardTimeoutMs = 60 * 60_000;
-      if (adminAgents.length === 0) {
-        // No admin agent → no gateway to carry the card. Every tick
-        // would run the (slow) plan probe and then dispatch-fail; skip
-        // wiring the notifier and say so once at startup instead.
-        process.stderr.write(
-          "hostd: notify_on_detect is enabled but no agent has " +
-            "admin/root — update approval cards have nowhere to go; " +
-            "notifier disabled\n",
-        );
-      } else notifier = new UpdateNotifier({
-        statePath: join(homedir(), ".switchroom", "release-notify-state.json"),
-        repostSuppressMs: cardTimeoutMs,
-        isFleetMutationInFlight: () => server.isFleetMutationLocked(),
-        startApply: (requestId) => {
-          const res = server.startOperatorApprovedUpdateApply(requestId);
-          return { result: res.result, ...(res.error ? { error: res.error } : {}) };
-        },
-        planFn: makeUpdatePlan("switchroom"),
-        requestApproval: async ({ requestId, version, plan }) => {
-          let last: ApprovalResult = {
-            verdict: "deny",
-            reason: "no admin agent with a reachable gateway socket",
-            denySource: "dispatch_failure",
-            finalize: async () => {},
-          };
-          for (const agent of adminAgents) {
-            const res = await approvalGateway.requestApproval({
-              requestId,
-              agentName: agent,
-              title: "⬆️ **Switchroom update available — fleet is behind**",
-              // NOTE: plain text — the card handler escapes markdown in
-              // the reason line, so backticks/bold here would render as
-              // escaped literals.
-              reason:
-                `New release detected for ${imageRef} ` +
-                `(digest ${short(version)}). Approve to run ` +
-                `switchroom update (the hostd update_apply path).`,
-              unifiedDiff:
-                plan.length > 0
-                  ? plan
-                  : `switchroom update --check produced no plan output;\n` +
-                    `remote digest: ${version}`,
-              timeoutMs: cardTimeoutMs,
-            });
-            if (res.verdict === "deny" && res.denySource === "dispatch_failure") {
-              last = res;
-              continue; // this agent's gateway is unreachable — try next
+      const applyOnDetect = autoRel?.apply_on_detect ?? true;
+      const notifyOnDetect = autoRel?.notify_on_detect ?? false;
+      // KEN-129 — operator-in-the-loop drift card. Only wired when
+      // auto-apply is OFF (apply_on_detect supersedes notify: a fleet
+      // that self-applies has nothing to ask the operator).
+      let notifier: UpdateNotifier | null = null;
+      if (!applyOnDetect && notifyOnDetect) {
+        // Card targets: admin (or root-tier) agents' gateways, in
+        // stable order. The first gateway that actually accepts the
+        // card wins; dispatch failures fall through to the next.
+        const adminAgents = Object.keys(config.agents)
+          .filter((n) => {
+            const a = config.agents[n] as { admin?: boolean; root?: boolean };
+            return a.admin === true || a.root === true;
+          })
+          .sort();
+        // Card timeout — shared with the notifier's re-post suppress
+        // window (a pre-restart pending card is honoured for exactly as
+        // long as it could still be live in the operator's chat).
+        const cardTimeoutMs = 60 * 60_000;
+        if (adminAgents.length === 0) {
+          // No admin agent → no gateway to carry the card. Every tick
+          // would run the (slow) plan probe and then dispatch-fail; skip
+          // wiring the notifier and say so once at startup instead.
+          process.stderr.write(
+            "hostd: notify_on_detect is enabled but no agent has " +
+              "admin/root — update approval cards have nowhere to go; " +
+              "notifier disabled\n",
+          );
+        } else notifier = new UpdateNotifier({
+          statePath: join(homedir(), ".switchroom", "release-notify-state.json"),
+          repostSuppressMs: cardTimeoutMs,
+          isFleetMutationInFlight: () => server.isFleetMutationLocked(),
+          startApply: (requestId) => {
+            const res = server.startOperatorApprovedUpdateApply(requestId);
+            return { result: res.result, ...(res.error ? { error: res.error } : {}) };
+          },
+          planFn: makeUpdatePlan("switchroom"),
+          requestApproval: async ({ requestId, version, plan }) => {
+            let last: ApprovalResult = {
+              verdict: "deny",
+              reason: "no admin agent with a reachable gateway socket",
+              denySource: "dispatch_failure",
+              finalize: async () => {},
+            };
+            for (const agent of adminAgents) {
+              const res = await approvalGateway.requestApproval({
+                requestId,
+                agentName: agent,
+                title: "⬆️ **Switchroom update available — fleet is behind**",
+                // NOTE: plain text — the card handler escapes markdown in
+                // the reason line, so backticks/bold here would render as
+                // escaped literals.
+                reason:
+                  `New release detected for ${imageRef} ` +
+                  `(digest ${short(version)}). Approve to run ` +
+                  `switchroom update (the hostd update_apply path).`,
+                unifiedDiff:
+                  plan.length > 0
+                    ? plan
+                    : `switchroom update --check produced no plan output;\n` +
+                      `remote digest: ${version}`,
+                timeoutMs: cardTimeoutMs,
+              });
+              if (res.verdict === "deny" && res.denySource === "dispatch_failure") {
+                last = res;
+                continue; // this agent's gateway is unreachable — try next
+              }
+              return res;
             }
-            return res;
-          }
-          return last;
-        },
-        log: (m) => process.stderr.write(`hostd: ${m}\n`),
-      });
-    }
-    const notifierRef = notifier;
-    releaseWatcher = new ReleaseWatcher({
-      intervalMs: intervalMinutes * 60_000,
-      checkFn: makeReleaseCheck({
-        imageRef,
+            return last;
+          },
+          log: (m) => process.stderr.write(`hostd: ${m}\n`),
+        });
+      }
+      const notifierRef = notifier;
+      releaseWatcher = new ReleaseWatcher({
+        intervalMs: intervalMinutes * 60_000,
+        checkFn: makeReleaseCheck({
+          imageRef,
+          log,
+        }),
+        applyFn: makeApply("switchroom"),
+        restartFn: makeRestart("switchroom"),
+        applyOnDetect,
+        ...(notifierRef
+          ? {
+              notifyFn: async (version: string) => {
+                await notifierRef.notifyIfNew(version);
+              },
+            }
+          : {}),
         log,
-      }),
-      applyFn: makeApply("switchroom"),
-      restartFn: makeRestart("switchroom"),
-      applyOnDetect,
-      ...(notifierRef
-        ? {
-            notifyFn: async (version: string) => {
-              await notifierRef.notifyIfNew(version);
-            },
-          }
-        : {}),
-      log,
-      onEvent,
-    });
-    releaseWatcher.start();
-    process.stderr.write(
-      `hostd: release-watcher started — polling ${imageRef} ` +
-        `every ${intervalMinutes}m ` +
-        `(apply_on_detect=${applyOnDetect}, ` +
-        `notify_on_detect=${notifyOnDetect})\n`,
-    );
+        onEvent,
+      });
+      releaseWatcher.start();
+      process.stderr.write(
+        `hostd: release-watcher started — polling ${imageRef} ` +
+          `every ${intervalMinutes}m ` +
+          `(apply_on_detect=${applyOnDetect}, ` +
+          `notify_on_detect=${notifyOnDetect})\n`,
+      );
     }
   }
 
