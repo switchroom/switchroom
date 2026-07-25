@@ -297,7 +297,7 @@ def _probe_gap_knob():
             failures.append("decisive-gap override %r raised %s instead of falling back" % (v, type(e).__name__))
             bad_ok = False
             continue
-        if abs(got - 0.02) > 1e-12:
+        if got != got or abs(got - 0.02) > 1e-12:
             failures.append("decisive-gap override %r yielded %r instead of the 0.02 default" % (v, got))
             bad_ok = False
     print("GAP_BAD_VALUES_FALL_BACK", bad_ok)
