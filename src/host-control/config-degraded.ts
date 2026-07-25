@@ -245,6 +245,21 @@ export function postOperatorNoticeViaGateways(
   text: string,
   log: (msg: string) => void,
   connectTimeoutMs = 5_000,
+  /**
+   * Wire `requestId` and log prefix. Defaults to the degraded-boot caller so
+   * existing behaviour is byte-identical; other host-side notifiers (e.g.
+   * `switchroom hindsight-watch`) pass their own, so the gateway audit shows
+   * WHICH watchdog spoke. Must be <=64 chars — the gateway's
+   * `rollout_status_post` validator rejects longer ids.
+   */
+  label = "config-degraded",
+  /**
+   * Appended to the all-candidates-failed log line. The degraded-boot caller
+   * still falls back to a marker file and says so; a caller with no such
+   * fallback (hindsight-watch retries on its next tick) passes "" rather than
+   * logging a fallback that does not exist.
+   */
+  failureNote = "; relying on marker file",
 ): Promise<string | null> {
   const tryOne = (c: GatewayCandidate): Promise<boolean> =>
     new Promise<boolean>((resolve) => {
@@ -252,7 +267,7 @@ export function postOperatorNoticeViaGateways(
       const finish = (ok: boolean, why?: string): void => {
         if (done) return;
         done = true;
-        if (why) log(`config-degraded: gateway ${c.agent} — ${why}`);
+        if (why) log(`${label}: gateway ${c.agent} — ${why}`);
         try {
           client.destroy();
         } catch {
@@ -264,7 +279,7 @@ export function postOperatorNoticeViaGateways(
       try {
         client = connect({ path: c.sock });
       } catch (e) {
-        log(`config-degraded: gateway ${c.agent} — connect threw: ${(e as Error).message}`);
+        log(`${label}: gateway ${c.agent} — connect threw: ${(e as Error).message}`);
         resolve(false);
         return;
       }
@@ -274,7 +289,7 @@ export function postOperatorNoticeViaGateways(
           client.write(
             JSON.stringify({
               type: "rollout_status_post",
-              requestId: "config-degraded",
+              requestId: label,
               agentName: c.agent,
               text,
             }) + "\n",
@@ -297,7 +312,7 @@ export function postOperatorNoticeViaGateways(
       if (await tryOne(c)) return c.agent;
     }
     if (candidates.length > 0) {
-      log("config-degraded: every candidate gateway socket failed; relying on marker file");
+      log(`${label}: every candidate gateway socket failed${failureNote}`);
     }
     return null;
   })();
