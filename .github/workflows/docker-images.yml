@@ -252,9 +252,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
-
+      # NO `docker/setup-buildx-action` here, deliberately. This job is
+      # manifest-only: `docker buildx imagetools inspect|create` are pure
+      # registry operations that never touch BuildKit, and the buildx CLI
+      # is preinstalled on GitHub-hosted runners with a `default` builder
+      # on the `docker` driver. setup-buildx-action defaults to the
+      # `docker-container` driver, which boots a BuildKit container by
+      # pulling `moby/buildkit:buildx-stable-1` from DOCKER HUB — a hard
+      # docker.io dependency (unauthenticated, rate-limited, and outside
+      # GHCR) for a capability these jobs never use. That pull is what
+      # reddened main twice: run 30138853707 (retag-unchanged,
+      # 2026-07-25) and run 29977369227 (promote-to-dev, 2026-07-23),
+      # both `ERROR: ... registry-1.docker.io/v2/: ... Client.Timeout
+      # exceeded` while "booting buildkit". Dropping the step removes the
+      # dependency outright rather than retrying around it.
+      #
+      # NOTE: the real BUILD jobs (build-base / build-dependents /
+      # build-hindsight / build-voice) still set up buildx — they need
+      # the docker-container driver for multi-platform + cache export.
+      # Only the four manifest-only jobs (merge-base, merge-dependents,
+      # retag-unchanged, promote-to-dev) drop it.
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
@@ -419,9 +436,26 @@ jobs:
       matrix:
         image: [agent, broker, kernel, hostd, auth-broker, web]
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
-
+      # NO `docker/setup-buildx-action` here, deliberately. This job is
+      # manifest-only: `docker buildx imagetools inspect|create` are pure
+      # registry operations that never touch BuildKit, and the buildx CLI
+      # is preinstalled on GitHub-hosted runners with a `default` builder
+      # on the `docker` driver. setup-buildx-action defaults to the
+      # `docker-container` driver, which boots a BuildKit container by
+      # pulling `moby/buildkit:buildx-stable-1` from DOCKER HUB — a hard
+      # docker.io dependency (unauthenticated, rate-limited, and outside
+      # GHCR) for a capability these jobs never use. That pull is what
+      # reddened main twice: run 30138853707 (retag-unchanged,
+      # 2026-07-25) and run 29977369227 (promote-to-dev, 2026-07-23),
+      # both `ERROR: ... registry-1.docker.io/v2/: ... Client.Timeout
+      # exceeded` while "booting buildkit". Dropping the step removes the
+      # dependency outright rather than retrying around it.
+      #
+      # NOTE: the real BUILD jobs (build-base / build-dependents /
+      # build-hindsight / build-voice) still set up buildx — they need
+      # the docker-container driver for multi-platform + cache export.
+      # Only the four manifest-only jobs (merge-base, merge-dependents,
+      # retag-unchanged, promote-to-dev) drop it.
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
@@ -658,9 +692,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
-
+      # NO `docker/setup-buildx-action` here, deliberately. This job is
+      # manifest-only: `docker buildx imagetools inspect|create` are pure
+      # registry operations that never touch BuildKit, and the buildx CLI
+      # is preinstalled on GitHub-hosted runners with a `default` builder
+      # on the `docker` driver. setup-buildx-action defaults to the
+      # `docker-container` driver, which boots a BuildKit container by
+      # pulling `moby/buildkit:buildx-stable-1` from DOCKER HUB — a hard
+      # docker.io dependency (unauthenticated, rate-limited, and outside
+      # GHCR) for a capability these jobs never use. That pull is what
+      # reddened main twice: run 30138853707 (retag-unchanged,
+      # 2026-07-25) and run 29977369227 (promote-to-dev, 2026-07-23),
+      # both `ERROR: ... registry-1.docker.io/v2/: ... Client.Timeout
+      # exceeded` while "booting buildkit". Dropping the step removes the
+      # dependency outright rather than retrying around it.
+      #
+      # NOTE: the real BUILD jobs (build-base / build-dependents /
+      # build-hindsight / build-voice) still set up buildx — they need
+      # the docker-container driver for multi-platform + cache export.
+      # Only the four manifest-only jobs (merge-base, merge-dependents,
+      # retag-unchanged, promote-to-dev) drop it.
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
@@ -792,9 +843,26 @@ jobs:
         # advancing (web was missing until #2818's follow-up).
         image: [base, agent, broker, kernel, hostd, auth-broker, web, hindsight, voice]
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
-
+      # NO `docker/setup-buildx-action` here, deliberately. This job is
+      # manifest-only: `docker buildx imagetools inspect|create` are pure
+      # registry operations that never touch BuildKit, and the buildx CLI
+      # is preinstalled on GitHub-hosted runners with a `default` builder
+      # on the `docker` driver. setup-buildx-action defaults to the
+      # `docker-container` driver, which boots a BuildKit container by
+      # pulling `moby/buildkit:buildx-stable-1` from DOCKER HUB — a hard
+      # docker.io dependency (unauthenticated, rate-limited, and outside
+      # GHCR) for a capability these jobs never use. That pull is what
+      # reddened main twice: run 30138853707 (retag-unchanged,
+      # 2026-07-25) and run 29977369227 (promote-to-dev, 2026-07-23),
+      # both `ERROR: ... registry-1.docker.io/v2/: ... Client.Timeout
+      # exceeded` while "booting buildkit". Dropping the step removes the
+      # dependency outright rather than retrying around it.
+      #
+      # NOTE: the real BUILD jobs (build-base / build-dependents /
+      # build-hindsight / build-voice) still set up buildx — they need
+      # the docker-container driver for multi-platform + cache export.
+      # Only the four manifest-only jobs (merge-base, merge-dependents,
+      # retag-unchanged, promote-to-dev) drop it.
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
