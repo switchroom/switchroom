@@ -51,10 +51,21 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # ─── Path-change filter (skip-as-pass pattern, #1320 followup) ────
-  # Workflow ALWAYS runs so the required `e2e` check fires on every
-  # PR. Real job is if:-gated and reports `skipped` (= success for
-  # branch protection) on PRs that don't touch image-affecting paths.
+  # ─── Path-change filter (sentinel pattern; see ci-lint.yml header) ─
+  # This filter job always runs; the real work jobs (`e2e`,
+  # `hindsight-probe`) are `if:`-gated on its outputs and report
+  # `skipped` on PRs that don't touch the paths they cover.
+  #
+  # A `skipped` check is NOT success for branch protection — it BLOCKS
+  # (proven by #1343, a docs-only PR hard-blocked; same deadlock as
+  # #2237). So neither `e2e` nor `hindsight-probe` can be a required
+  # context, and in fact neither has ever been in ruleset 16470166.
+  # The `e2e-ok` sentinel at the bottom of this file exists for exactly
+  # that reason: it ALWAYS runs, so it is the one context here that can
+  # safely be marked required, and it converts "path-skipped" into pass
+  # while still failing on a real failure/cancellation — including a
+  # failure of this `changes` job itself, since a broken path filter
+  # would otherwise silently disable the whole gate.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -289,3 +300,42 @@ jobs:
         run: |
           ids=$(docker ps -aq --filter label=switchroom.test=hindsight-search-patches 2>/dev/null || true)
           if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
+
+  # ─── Sentinel ─────────────────────────────────────────────────────
+  # Branch-protection-required context (see ci-lint.yml header for the
+  # pattern). ALWAYS runs and aggregates the path-gated jobs above:
+  # pass when every one succeeded OR was legitimately path-skipped;
+  # fail when any failed/was cancelled, or when the `changes` filter
+  # job itself broke (can't trust a skip produced by broken infra).
+  # Ruleset 16470166 should require `e2e-ok` as THE single required
+  # context for this workflow — `e2e` and `hindsight-probe` themselves
+  # cannot be required (they legitimately skip, and a skipped required
+  # check hard-blocks: #1343 / #2237). hindsight-probe in particular
+  # exists so the behavioural patch probe can never silently skip; it
+  # only actually gates via this sentinel. Keep this `needs` list
+  # complete when adding jobs.
+  e2e-ok:
+    needs: [changes, e2e, hindsight-probe]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verdict
+        run: |
+          c='${{ needs.changes.result }}'
+          if [ "$c" = "failure" ] || [ "$c" = "cancelled" ]; then
+            echo "::error::changes=$c — path-filter infra failed; can't trust the skip"
+            exit 1
+          fi
+          fail=0
+          for pair in \
+            "e2e=${{ needs.e2e.result }}" \
+            "hindsight-probe=${{ needs.hindsight-probe.result }}"; do
+            job="${pair%%=*}"; r="${pair#*=}"
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::${job}=${r} — real e2e failure, blocking"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "changes=$c → pass (e2e jobs green or path-skipped)"
