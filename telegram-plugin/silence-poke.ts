@@ -193,6 +193,8 @@ export interface MidTurnFloorContext {
 export type SilencePokeMetric =
   | { kind: 'silence_fallback_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
   | { kind: 'mid_turn_floor'; key: string; silence_ms: number; forced: boolean; decision: 'fire' | string }
+  /** #3552 — per-turn state dropped because its turn is provably over. */
+  | { kind: 'silence_poke_orphan_reaped'; key: string; silence_ms: number }
 
 export interface SilencePokeDeps {
   /** Called when the 300s fallback fires. Caller sends the user-visible
@@ -239,6 +241,30 @@ export interface SilencePokeDeps {
    * combines both. Returns null when there is no live turn for `key`.
    */
   floorState?: (key: string) => { role: LoopRole; finalAnswerDelivered: boolean } | null
+  /**
+   * #3552 — orphan-state reaper predicate. Returns true while `key` still has a
+   * LIVE turn behind it, false once the turn is provably over.
+   *
+   * Why: `startTurn(key)` arms per-turn state that only `endTurn(key)` drops,
+   * and several turn-end paths never reach an `endTurn` call — a bridge death
+   * (`disconnect-flush`), a keyed teardown that bypasses the `turn_end` handler,
+   * or any future path that nulls the turn without the cleanup tail. The state
+   * then survives its turn and sits in the Map until the 300s fallback fires
+   * against a dead key, is recognised as a late fire, logs
+   * `turn_ended_cleanly_during_window` and only THEN calls `endTurn`. Measured:
+   * 504 such skips vs 110 real fires in 14 days (switchroom#3552).
+   *
+   * Wiring this callback moves that cleanup from "300s later, at fire time" to
+   * "the next poll tick", deterministically and independent of which path ended
+   * the turn. The predicate MUST be the same one the fallback's late-fire guard
+   * uses (`activeTurnStartedAt` empty AND no current turn) so a turn that has
+   * merely released its buffer gate mid-turn — the normal post-final-answer
+   * state, where silence-poke must keep watching — is never reaped.
+   *
+   * Optional: when absent (test harnesses) the reaper is off and behaviour is
+   * exactly as before.
+   */
+  isTurnLive?: (key: string) => boolean
 }
 
 const state = new Map<string, SilencePokeState>()
@@ -506,6 +532,105 @@ export function formatFrameworkFallbackText(
 }
 
 /**
+ * #3551 — inputs to the silence-fallback TEARDOWN NOTICE decision.
+ *
+ * Distinct from `formatFrameworkFallbackText`, which answers "is anything
+ * happening worth narrating?" (and, since the stall-notice was retired,
+ * answers `null` on every branch but `blockedOnApproval`). This one answers a
+ * different, terminal question: "the framework is about to END this live turn
+ * — does the user need to be told?"
+ */
+export interface FallbackTeardownNoticeInput {
+  /** This fire is genuinely tearing down a live turn for THIS chat/thread.
+   *  False on the multi-chat case where the current turn belongs elsewhere, or
+   *  when there was no turn left to end. */
+  tearsDownLiveTurn: boolean
+  /** Loop role of the turn being torn down; null when unknown. */
+  role: LoopRole | null
+  /** A final answer already landed on this turn. */
+  finalAnswerDelivered: boolean
+  /** This fire ALREADY DELIVERED a LOUD, user-addressed message about why
+   *  nothing is happening — in practice the approval re-ping ("waiting for your
+   *  approval — tap Approve or Deny"). Never stack a second message on that.
+   *
+   *  #3551 L1: deliberately NARROWER than "some text went out". The other text
+   *  this fire can emit is `formatUpdateStatusLine`, a SILENT status surface
+   *  about an unrelated in-flight `update_apply` that says nothing about this
+   *  turn ending — a user who asked a question during an update and got killed
+   *  anyway is exactly the case this notice exists for, so that line must NOT
+   *  suppress it.
+   *  #3551 L2: means DELIVERED, not "attempted". The caller's send is wrapped in
+   *  a log-only try/catch, so a throwing re-ping must not buy silence. */
+  userAddressedTextDelivered: boolean
+  /** The obligation ledger is on, so the killed turn's unanswered inbound will
+   *  be re-presented. Governs the tail sentence — never claim a re-ask that
+   *  cannot happen. */
+  representWillFollow: boolean
+  silenceMs: number
+}
+
+export type FallbackTeardownNoticeDecision =
+  | {
+      send: false
+      reason:
+        | 'user-addressed-text-delivered'
+        | 'no-live-turn-torn-down'
+        | 'non-user-turn'
+        | 'answer-already-delivered'
+    }
+  | { send: true; text: string }
+
+/**
+ * #3551 — decide whether a silence-poke fire that ENDS a live turn must say so.
+ *
+ * The bug this closes: on the non-approval branch the 300s fallback delivered
+ * NO text (`formatFrameworkFallbackText` returns null) while still tearing the
+ * turn down and redelivering buffered inbound. From the user's seat: five
+ * minutes of nothing, then the agent inexplicably restarting the same request,
+ * with no signal that the framework — not the agent — made that happen.
+ * Measured: 110 fires / 14 days, p50 silence 302s, ~9h of dead air.
+ *
+ * The fix is NOT to stop killing the turn. The teardown is the fallback's one
+ * genuinely load-bearing job (`#1122`: without it every later inbound queues
+ * behind a dead turn forever), and removing it would trade a silent turn for a
+ * permanently wedged conversation. The fix is to make the kill OBSERVABLE.
+ *
+ * This is deliberately NOT a re-introduction of the retired stall notice, and
+ * the gates below are what keep it that way:
+ *   - `userAddressedTextDelivered` — never stack on a delivered approval
+ *     re-ping. Narrow by design: a SILENT, unrelated update-status line does
+ *     not buy silence here (#3551 L1), and an approval re-ping that threw on
+ *     send does not either (#3551 L2).
+ *   - `tearsDownLiveTurn` — a late-fire against an already-dead key says nothing.
+ *   - `role !== 'user'` — a cron/system turn's silence is legitimate; nobody is
+ *     waiting, so its teardown is housekeeping, not news.
+ *   - `finalAnswerDelivered` — the user already has their answer; ending the
+ *     residual housekeeping turn is invisible to them and needs no notice.
+ * What remains is exactly one case: a HUMAN asked something, got nothing for
+ * N minutes, and the framework just ended that attempt. That is a terminal
+ * event, fired at most once per turn (the caller drops the key immediately
+ * after), not a cadence-based progress ping — the thing
+ * `reference/rfcs/conversational-pacing.md` § Anti-patterns bans.
+ */
+export function decideFallbackTeardownNotice(
+  input: FallbackTeardownNoticeInput,
+): FallbackTeardownNoticeDecision {
+  if (input.userAddressedTextDelivered)
+    return { send: false, reason: 'user-addressed-text-delivered' }
+  if (!input.tearsDownLiveTurn) return { send: false, reason: 'no-live-turn-torn-down' }
+  if (input.role !== 'user') return { send: false, reason: 'non-user-turn' }
+  if (input.finalAnswerDelivered) return { send: false, reason: 'answer-already-delivered' }
+  const minutes = Math.max(1, Math.round(input.silenceMs / 60_000))
+  const tail = input.representWillFollow
+    ? 'Your message is still tracked and is being re-asked now.'
+    : 'Your message was not answered — please re-send it.'
+  return {
+    send: true,
+    text: `⚠️ no output for ${minutes} min — the framework ended that stalled turn. ${tail}`,
+  }
+}
+
+/**
  * #2995 — the LONGEST-running in-flight tool for a turn key, or null when
  * none is tracked. Read-only accessor over `inFlightTools` for the
  * mid-flight busy-ack: the gateway needs the blocking step's name/label
@@ -602,6 +727,19 @@ function tick(now: number): void {
     const zeroAt = s.lastOutboundAt ?? s.turnStartedAt
     const silence = now - zeroAt
     if (silence < 0) continue
+
+    // #3552 — orphan reap. Drop per-turn state the moment its turn is provably
+    // over, instead of leaving it armed until the 300s fallback fires against a
+    // dead key and disarms it as a "late fire". Deterministic and path-agnostic:
+    // it does not matter WHICH turn-end path forgot to call `endTurn`, the state
+    // cannot outlive the turn by more than one poll interval. Same predicate as
+    // the fallback's late-fire guard, so a mid-turn buffer-gate release (the
+    // normal post-final-answer state, turn still live) is never reaped.
+    if (activeDeps.isTurnLive != null && !activeDeps.isTurnLive(key)) {
+      state.delete(key)
+      activeDeps.emitMetric({ kind: 'silence_poke_orphan_reaped', key, silence_ms: silence })
+      continue
+    }
 
     // #2527 — the early, quiet mid-turn liveness beat (below the fallback
     // window). Evaluated every tick; fires at most once per turn.

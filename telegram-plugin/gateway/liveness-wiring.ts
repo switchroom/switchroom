@@ -38,6 +38,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     SILENCE_FALLBACK_HARD_MS,
     SILENCE_FLOOR_MS,
     SILENCE_DEFER_INFLIGHT_TOOLS,
+    isObligationOpenForTurn,
     TURN_PREVIEW_MAX,
     STATE_DIR,
     isLegitimatelyWorking,
@@ -68,6 +69,13 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
   thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS, floor: SILENCE_FLOOR_MS },
   deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
   isLegitimatelyWorking: (key) => isLegitimatelyWorking(key),
+  // #3552 — orphan-state reaper predicate. Deliberately the SAME condition the
+  // `onFrameworkFallback` late-fire guard below uses: no `activeTurnStartedAt`
+  // entry AND no current turn ⇒ the turn this state belongs to is over. Note
+  // `activeTurnStartedAt` alone is NOT sufficient — `releaseTurnBufferGate`
+  // clears it mid-turn on every final-answer reply while the turn keeps running
+  // (post-answer housekeeping), and silence-poke must keep watching that turn.
+  isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurn() == null),
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
@@ -142,6 +150,13 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // events (124 of 138 `currentTurn_nulled=false` cases). Distinct
     // log line so observability still tracks the fact that the silence
     // crossed threshold; the wedge counter is no longer polluted.
+    //
+    // #3552: with the `isTurnLive` reaper wired above, this branch is now only
+    // the sub-poll-interval race (the turn ends between the tick's reap check
+    // and this handler running). The steady-state case it used to absorb —
+    // state armed for the full 300s against a turn that ended minutes earlier,
+    // 504 events in 14 days vs 110 real fires — is reaped at the tick instead,
+    // so this counter finally reads as the genuine race it names.
     if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurn() == null) {
       process.stderr.write(
         `telegram gateway: silence-poke framework-fallback late-fire skipped — ` +
@@ -259,6 +274,21 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // stays null and we skip the send. The turn-teardown below (the unwedge —
     // the one job the live draft can't do, per the conversational-pacing RFC)
     // still runs unconditionally.
+    // #3551 L1/L2 — the teardown-notice suppression signal. It must be narrower
+    // than "some text went out", and it must mean DELIVERED.
+    //
+    // L1: `text` has two sources with opposite meanings. The approval re-ping is
+    // a LOUD, user-addressed message that explains why nothing is happening and
+    // asks the user to act — stacking a teardown notice on it is noise. The
+    // deterministic `formatUpdateStatusLine` is a SILENT status surface about an
+    // unrelated in-flight `update_apply`; it says nothing about this turn ending.
+    // A user who asked a question during an update and got killed anyway is
+    // EXACTLY the #3551 case, so that line must not suppress the notice.
+    //
+    // L2: computed from send SUCCESS, not from `text != null`. The send sits in a
+    // try/catch that only logs, so a throwing approval re-ping would otherwise
+    // suppress the notice while the user received nothing at all.
+    let userAddressedTextDelivered = false
     if (text != null) {
       try {
         // Conditional: when the turn is parked on an approval card, this
@@ -268,6 +298,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
         // line stays SILENT (a status surface). Gate on `blockedOnApproval`.
         // The send stays in gateway.ts behind the bot-api retry policy.
         await sendSilenceText(ctx.chatId, ctx.threadId ?? null, text, blockedOnApproval ? false : true)
+        userAddressedTextDelivered = blockedOnApproval
       } catch (err) {
         process.stderr.write(
           `silence-poke fallback sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
@@ -438,6 +469,56 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       // singleton, verbatim; flag-ON deletes only this topic's entry and clears
       // the mirror iff it still points here — a live sibling topic is untouched.
       endCurrentTurnForKey(wedgedTurn, fbKey)
+    }
+    // #3551 — the teardown NOTICE. Everything above just ENDED a live turn. On
+    // the non-approval branch `text` is null (`formatFrameworkFallbackText`
+    // returns a string only when parked on an approval card), so before this
+    // the user saw literally nothing: N minutes of silence, then the agent
+    // apparently starting the same request over. Killing a user's turn with no
+    // user-visible signal is a correctness bug, not a tuning knob — 110 fires /
+    // 14 days, ~9h of dead air (#3551). The teardown itself is NOT removed (it
+    // is the #1122 unwedge, the fallback's one load-bearing job); it is made
+    // observable. Sent AFTER the teardown so the notice cannot itself be
+    // clobbered by the state purge, and gated by `decideFallbackTeardownNotice`
+    // so it can only ever speak for a human-waiting, undelivered turn that this
+    // fire actually killed — at most once, since `endTurn(fbKey)` above dropped
+    // the key.
+    const teardownNotice = silencePoke.decideFallbackTeardownNotice({
+      tearsDownLiveTurn: turnMatchesFallback,
+      role: wedgedTurn?.role ?? null,
+      finalAnswerDelivered: wedgedTurn?.finalAnswerDelivered ?? false,
+      userAddressedTextDelivered,
+      // #3575 review B1 — this must be a question about THIS turn, not a static
+      // env flag. `OBLIGATION_LEDGER_ENABLED` is true for the whole process, so
+      // it promised "being re-asked now" in cases where no re-ask can ever
+      // happen: the obligation already hit OBLIGATION_REPRESENT_MAX (2) and
+      // escalated+closed, or it was closed silently by an outbound-since-open
+      // (obligation-wiring.ts:230/:294), or the inbound never opened one at all
+      // (synthetic / steering / interrupt). The user was then told to wait for a
+      // re-ask that never comes. Ask the ledger about this turn's own origin id
+      // instead, so the honest "please re-send it" branch fires when there is no
+      // open obligation. The lookup is deliberately made HERE, after the
+      // teardown above (which does not touch the ledger), so it reflects the
+      // ledger state at the moment we speak.
+      representWillFollow: isObligationOpenForTurn(wedgedTurn?.turnId ?? null),
+      silenceMs: ctx.silenceMs,
+    })
+    if (teardownNotice.send) {
+      try {
+        // LOUD (disable_notification: false). The user asked a question and is
+        // being told their attempt was killed — that is exactly the case where
+        // silence would train them to distrust the channel.
+        await sendSilenceText(fbChatId, ctx.threadId ?? null, teardownNotice.text, false)
+      } catch (err) {
+        process.stderr.write(
+          `silence-poke teardown notice sendMessage failed chat=${fbChatId} thread=${ctx.threadId}: ${err}\n`,
+        )
+      }
+    } else {
+      process.stderr.write(
+        `telegram gateway: silence-poke teardown notice skipped reason=${teardownNotice.reason} ` +
+        `chat=${fbChatId} thread=${ctx.threadId ?? '-'}\n`,
+      )
     }
     // Best-effort: clear any pending silent-end marker so the Stop hook
     // doesn't double-block when claude eventually exits the wedged turn.

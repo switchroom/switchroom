@@ -78,6 +78,20 @@ export type RuntimeMetricEvent =
       silence_ms: number
     }
   /**
+   * #3552 — per-turn silence-poke state dropped by the orphan reaper: the turn
+   * behind `key` is provably over (no `activeTurnStartedAt` entry AND no
+   * current turn) yet its state was still armed, so it is disarmed on the poll
+   * tick rather than 300s later at fire time. A healthy fleet trends this
+   * toward zero; a persistent stream of it names a turn-end path that is
+   * failing to call `silencePoke.endTurn`. `silence_ms` is how long the state
+   * had already been orphaned when the reaper caught it.
+   */
+  | {
+      kind: 'silence_poke_orphan_reaped'
+      key: string
+      silence_ms: number
+    }
+  /**
    * #2527 — mid-turn liveness floor decision. `decision: 'fire'` when the
    * quiet "still on it" beat was sent; otherwise the machine-readable skip
    * reason for a declined forced ("Status?") poke. `forced` distinguishes

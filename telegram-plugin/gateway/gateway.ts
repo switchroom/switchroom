@@ -9688,6 +9688,19 @@ function gatewayLivenessWiringDeps() {
     SILENCE_FALLBACK_HARD_MS,
     SILENCE_FLOOR_MS,
     SILENCE_DEFER_INFLIGHT_TOOLS,
+    // #3551 — governs the teardown notice's tail sentence: only promise a
+    // re-ask when one will ACTUALLY follow. #3575 review B1: this used to be
+    // the static `OBLIGATION_LEDGER_ENABLED` env boolean, which is true for the
+    // whole process and so promised a re-ask for turns whose obligation was
+    // already closed (represent cap reached then escalated, or closed silently
+    // by an outbound-since-open — obligation-wiring.ts:230/:294) or never
+    // opened at all (synthetic / steering / interrupt inbound). It is now a
+    // live per-turn lookup keyed on the turn's own origin id: `turn.turnId` is
+    // `deriveTurnId(chat, thread, messageId)` for a real inbound
+    // (stream-render.ts:273), the SAME identity the ledger keys on
+    // (obligation-wiring.ts:118).
+    isObligationOpenForTurn: (originTurnId: string | null): boolean =>
+      OBLIGATION_LEDGER_ENABLED && originTurnId != null && obligationLedger.isOpen(originTurnId),
     TURN_PREVIEW_MAX,
     STATE_DIR,
     isLegitimatelyWorking,
@@ -10780,6 +10793,13 @@ if (isGatewayMain) ipcServer = createIpcServer({
         // fires after the gateway has stopped.
         typingEmitter.reset()
       },
+      // #3552 — the bridge died with turns in flight; disarm each dead turn's
+      // silence-poke state HERE. Before this, the armed 300s timer outlived the
+      // turn and was only dropped when the fallback eventually fired against the
+      // stale key and logged `turn_ended_cleanly_during_window` (504 events in
+      // 14 days vs 110 real fires). `endTurn` is idempotent, so being called for
+      // a key reported by both flush loops is safe.
+      onTurnKeyEnded: (key) => silencePoke.endTurn(key),
       // When dangling activeTurnStartedAt keys were swept (setDone raced
       // disconnect), the module-scope `currentTurn` may also point at the
       // dead bridge's turn. Null it so the next inbound starts a fresh
