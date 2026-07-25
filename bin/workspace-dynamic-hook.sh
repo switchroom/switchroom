@@ -66,24 +66,42 @@ mkdir -p "$CACHE_DIR" 2>/dev/null || true
 # Date-keyed cache filename: when the calendar day rolls over, the
 # `today's daily` file path the renderer reads changes (the template
 # embeds different filenames in its output), so we invalidate the cache
-# at midnight UTC by varying the filename. Yesterday's file lingers
+# at midnight by varying the filename. Yesterday's file lingers
 # harmlessly until the next sweep.
-CACHE_DATE="$(date -u +%Y-%m-%d)"
+#
+# LOCAL time, not UTC — this MUST match the renderer. See
+# `dailyMemoryRelativePath` in src/agents/workspace.ts, which derives
+# today's daily-memory path from getFullYear/getMonth/getDate (local)
+# on purpose: UTC would roll "today" over at early-morning for UTC+10
+# hosts. When the hook used `date -u` here, every day from 00:00 until
+# UTC midnight local the renderer's "today" file was absent from the
+# hook's watch set, so writes to it did not invalidate the cache and a
+# stale body was served.
+CACHE_DATE="$(date +%Y-%m-%d)"
 CACHE_FILE="$CACHE_DIR/workspace-dynamic.${CACHE_DATE}.hash"
 BODY_FILE="$CACHE_DIR/workspace-dynamic.${CACHE_DATE}.body"
+SIG_FILE="$CACHE_DIR/workspace-dynamic.${CACHE_DATE}.srcsig"
 
-# Mtime-fast-skip: if BODY_FILE exists AND is newer than every workspace
-# source the renderer reads, we can emit the cached body and skip the
+# Source-signature fast-skip: if BODY_FILE exists AND the signature of
+# the workspace source *set* is byte-identical to the signature recorded
+# when that body was produced, we can emit the cached body and skip the
 # ~800ms `switchroom workspace render` invocation entirely. The renderer
 # reads MEMORY.md, today's daily, yesterday's daily — see
 # `loadDynamicBootstrapFiles` in src/agents/workspace.ts.
 #
-# Skip semantics: a source file that doesn't exist contributes a "very
-# old" mtime (epoch-0 via stat fallback), which never invalidates the
-# cache. A source file that's been updated since BODY_FILE's mtime
-# triggers a fresh render. Forensics measured this fast-path saving
-# ~825ms on the common case (chat turns where MEMORY hasn't changed
-# since the last turn).
+# The signature covers each source's name + mtime + size, and records
+# missing files explicitly. A max-mtime comparison (the previous
+# approach) could not see a *deletion*: a missing source contributed
+# mtime 0, which never exceeded the body's mtime, so removing MEMORY.md
+# served the cached body forever. It also lost any source modified
+# between the render and the body write (the write-during-render race):
+# such a source ended up older than the body and became invisible
+# indefinitely. Capturing the signature *before* invoking the renderer
+# closes both: anything that changes during or after the render window
+# yields a different signature on the next turn.
+#
+# Forensics measured this fast-path saving ~825ms on the common case
+# (chat turns where no source has changed since the last turn).
 #
 # Resolve the agent's workspace dir. Switchroom uses
 # `~/.switchroom/agents/<name>/workspace/` by default. We avoid invoking
@@ -95,25 +113,35 @@ BODY_FILE="$CACHE_DIR/workspace-dynamic.${CACHE_DATE}.body"
 AGENT_DIR="${SWITCHROOM_AGENT_DIR:-$HOME/.switchroom/agents/$AGENT_NAME}"
 WS_DIR="$AGENT_DIR/workspace"
 TODAY_FILE="$WS_DIR/memory/${CACHE_DATE}.md"
-YESTERDAY_DATE="$(date -u -d 'yesterday' +%Y-%m-%d 2>/dev/null || echo "")"
+# Local-time "yesterday", matching addDays(now, -1) in workspace.ts.
+YESTERDAY_DATE="$(date -d 'yesterday' +%Y-%m-%d 2>/dev/null || echo "")"
 YESTERDAY_FILE="$WS_DIR/memory/${YESTERDAY_DATE}.md"
 
-if [ -f "$BODY_FILE" ]; then
-  # Compare BODY_FILE mtime against every source. If any source is newer
-  # the cache is stale; fall through. If all sources are older (or
-  # missing), emit the cache and exit.
-  body_mtime=$(stat -c '%Y' "$BODY_FILE" 2>/dev/null || echo 0)
-  newest_src_mtime=0
-  for src in "$WS_DIR/MEMORY.md" "$TODAY_FILE" "$YESTERDAY_FILE"; do
-    if [ -f "$src" ]; then
-      src_mtime=$(stat -c '%Y' "$src" 2>/dev/null || echo 0)
-      if [ "$src_mtime" -gt "$newest_src_mtime" ]; then
-        newest_src_mtime="$src_mtime"
+# Signature of the source set: name + mtime + size for each source the
+# renderer reads, with missing files recorded explicitly so a deletion
+# changes the signature.
+_ws_source_signature() {
+  local src meta
+  {
+    for src in "$WS_DIR/MEMORY.md" "$TODAY_FILE" "$YESTERDAY_FILE"; do
+      if [ -f "$src" ]; then
+        meta=$(stat -c '%Y:%s' "$src" 2>/dev/null || echo "stat-error")
+        printf '%s\t%s\n' "$src" "$meta"
+      else
+        printf '%s\tMISSING\n' "$src"
       fi
-    fi
-  done
-  if [ "$body_mtime" -gt "$newest_src_mtime" ]; then
-    # Fast path: every source is older than the cached body.
+    done
+  } | sha256sum 2>/dev/null | cut -d' ' -f1
+}
+
+# Captured BEFORE the renderer runs, so a source mutated during the
+# render window is not falsely credited to this body.
+SRC_SIG="$(_ws_source_signature)"
+
+if [ -f "$BODY_FILE" ] && [ -f "$SIG_FILE" ] && [ -n "$SRC_SIG" ]; then
+  RECORDED_SIG=$(head -1 "$SIG_FILE" 2>/dev/null || echo "")
+  if [ "$RECORDED_SIG" = "$SRC_SIG" ]; then
+    # Fast path: the source set is unchanged since this body was made.
     # In inject-on-change mode, also check the session-state file — if the
     # session_id matches the last-emitted session AND the hash matches, we
     # can suppress entirely (model already has this content in context).
@@ -155,11 +183,25 @@ fi
 # <50ms; 3s is generous headroom.
 WS_DYNAMIC=$(timeout 3 switchroom workspace render "$AGENT_NAME" --dynamic --warning-mode off 2>/dev/null || true)
 
-# Empty render → emit nothing AND do NOT cache the empty body. Caching an
-# empty body would re-emit empty forever even after MEMORY comes back online,
-# defeating the whole purpose of the hook.
-if [ -z "$WS_DYNAMIC" ]; then
-  exit 0
+# An empty render IS cached. It used to `exit 0` here without writing the
+# cache, on the theory that "caching an empty body would re-emit empty
+# forever even after MEMORY comes back online" — that justification is
+# obsolete: the fast-skip re-derives the source signature every turn, so a
+# MEMORY.md that later appears (or any daily-memory write) changes the
+# signature and forces a fresh render. Not caching it meant agents whose
+# render is empty never had a cached body, the fast-skip never engaged, and
+# they paid the full ~825ms-1.1s render on every single message to produce
+# nothing.
+#
+# BODY_OUT is the exact byte string emitted on both the fresh and the cached
+# path, so `cat "$BODY_FILE"` is byte-identical to a fresh emit (Anthropic's
+# prompt cache is keyed on byte equality). Empty render → empty body file →
+# empty stdout, not a bare newline.
+if [ -n "$WS_DYNAMIC" ]; then
+  BODY_OUT="$WS_DYNAMIC
+"
+else
+  BODY_OUT=""
 fi
 
 # Content-addressed dedupe sidecar. Anthropic's prompt cache is keyed on
@@ -197,7 +239,17 @@ _ws_record_session_state() {
   fi
 }
 
+# Record the pre-render source signature against the body we are about to
+# serve. Written only once a body file actually exists, so a failed body
+# write can never leave a "fresh" signature pointing at a stale body.
+_ws_record_sig() {
+  if [ -n "$SRC_SIG" ] && [ -f "$BODY_FILE" ]; then
+    printf '%s\n' "$SRC_SIG" > "$SIG_FILE" 2>/dev/null || true
+  fi
+}
+
 if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" = "$OLD_HASH" ] && [ -f "$BODY_FILE" ]; then
+  _ws_record_sig
   # Content unchanged since last render. In inject-on-change mode, check if
   # we already injected this content in the current session — if so, suppress.
   if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
@@ -215,17 +267,16 @@ if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" = "$OLD_HASH" ] && [ -f "$BODY_FILE" ]; t
   fi
   cat "$BODY_FILE"
 else
-  # Refresh sidecar: write hash + body, then echo body. Touch the body
-  # file last so the mtime fast-skip path next turn sees a fresh
-  # mtime (newer than every source we just consumed).
+  # Refresh sidecar: write hash + body, then echo body.
   if [ -n "$NEW_HASH" ]; then
     printf '%s\n' "$NEW_HASH" > "$CACHE_FILE" 2>/dev/null || true
-    printf '%s\n' "$WS_DYNAMIC" > "$BODY_FILE" 2>/dev/null || true
+    printf '%s' "$BODY_OUT" > "$BODY_FILE" 2>/dev/null || true
+    _ws_record_sig
     if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
       _ws_record_session_state "$NEW_HASH" "$SESSION_ID"
     fi
   fi
-  printf '%s\n' "$WS_DYNAMIC"
+  printf '%s' "$BODY_OUT"
 fi
 
 exit 0
