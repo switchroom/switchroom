@@ -319,22 +319,25 @@ function runProbe(patched: boolean): ProbeResult {
 }
 
 describe("Dockerfile.hindsight search-patch probe is real, not a silent skip", () => {
-  it("does not claim coverage in its header that the probe does not have", () => {
-    // This PR's whole purpose was correcting a false claim in a header, and
-    // the header of THIS file then went stale the same way: after the ranking
-    // patch was split out it still advertised "final rank order" while no
-    // rank-order assertion remained. A prose claim cannot be trusted to stay
-    // true by discipline, so tie it to the probe source mechanically.
+  it("header's rank-order claim matches what the probe actually checks", () => {
+    // This header went stale once already: after the ranking patch was split
+    // into its own PR it still advertised "final rank order" while no
+    // rank-order assertion remained anywhere in the file. Because this file
+    // moves between branches with and without that patch, the claim can drift
+    // in EITHER direction, so assert both. A prose claim cannot be trusted to
+    // stay true by discipline — tie it to the probe source mechanically.
     const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
     const header = src.slice(0, src.indexOf("const PROBE ="));
     const probeChecksRankOrder = /SATURATED_ORDER|combined_score/.test(PROBE);
-    if (!probeChecksRankOrder) {
-      expect(
-        header,
-        "the header advertises rank-order coverage but the probe asserts " +
+    const headerClaimsRankOrder = /rank\s+order/i.test(header);
+    expect(
+      headerClaimsRankOrder,
+      probeChecksRankOrder
+        ? "the probe asserts final rank order but the header does not say so — " +
+          "understated coverage hides the file's most important guarantee"
+        : "the header advertises rank-order coverage but the probe asserts " +
           "nothing about rank order — describe what this file actually checks",
-      ).not.toMatch(/rank\s+order/i);
-    }
+    ).toBe(probeChecksRankOrder);
   });
 
   it("pins the upstream image by digest so the probe tests the exact shipping bytes", () => {
