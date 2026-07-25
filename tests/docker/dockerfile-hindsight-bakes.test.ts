@@ -220,6 +220,83 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the cross-encoder saturation fix (assert-guarded, fail-loud)", () => {
+    // apply_combined_scoring makes CE * recency * temporal * proof_count the
+    // ONLY final score (RRF is explicitly zeroed). Measured live on bank
+    // `overlord`: a 116-result recall had every CE score inside 0.9800-0.9999,
+    // so the boosts — undamped worst-case ratio ~1.65 — decided the order and
+    // the single highest-CE memory ranked 7th behind older, more-proven ones.
+    // The patch DAMPS the boost product so it modulates the CE decision
+    // instead of replacing it. Behaviour is proven against the pinned upstream
+    // image in tests/docker/hindsight-search-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight CE-saturation patch: \{name\} anchor found \{n\}x/,
+    );
+    // `import math` is a load-bearing dependency of _boost_authority, so its
+    // presence is itself an anchor: if upstream drops or reorders it the build
+    // fails loudly rather than emitting a NameError at recall time.
+    expect(dockerfile).toMatch(
+      /OLD_IMPORTS = "import math\\nfrom datetime import datetime, timezone\\n"/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "\\nimport math\\n" in t, "switchroom hindsight CE-saturation patch: `import math` is gone/,
+    );
+
+    // Named module constant tied to the MEASURED saturation spread, and a
+    // derivation from the alphas — not a hand-tuned exponent.
+    expect(dockerfile).toMatch(/_CE_DECISIVE_RELATIVE_GAP_DEFAULT: float = 0\.02/);
+    expect(dockerfile).toMatch(/def _boost_authority\(/);
+    expect(dockerfile).toMatch(
+      /math\.log1p\(_CE_DECISIVE_RELATIVE_GAP\) \/ math\.log\(hi \/ lo\)/,
+    );
+
+    // The gap is an OPERATOR KNOB, not a baked constant. This damping is a
+    // calibration judgement whose failure mode is a silent recall-quality
+    // regression with no telemetry behind it, so backing it out must be a
+    // container restart (one env var) rather than an image rebuild. A wide
+    // gap clamps the exponent to 1.0 = exact upstream scoring.
+    expect(dockerfile).toMatch(
+      /_CE_DECISIVE_RELATIVE_GAP_ENV: str = .HINDSIGHT_CE_DECISIVE_RELATIVE_GAP./,
+    );
+    expect(dockerfile).toMatch(
+      /_CE_DECISIVE_RELATIVE_GAP: float = _decisive_relative_gap\(\)/,
+    );
+    // A bad value must degrade to the default, never raise out of the scoring
+    // path — an unparseable env var must not take recall down.
+    expect(dockerfile).toMatch(/except \(TypeError, ValueError\):/);
+    expect(dockerfile).toMatch(
+      /if not math\.isfinite\(value\) or value <= 0\.0:/,
+    );
+    expect(dockerfile).toMatch(
+      /HINDSIGHT_CE_DECISIVE_RELATIVE_GAP=<float>/,
+    );
+
+    // The exponent is derived ONCE PER CALL from the alphas alone. That is what
+    // makes a candidate's score a pure function of its own fields — no
+    // candidate-set-relative quantity may appear.
+    expect(dockerfile).toMatch(
+      /_boost_exponent = _boost_authority\(recency_alpha, temporal_alpha, proof_count_alpha\)/,
+    );
+    expect(dockerfile).toMatch(
+      /sr\.combined_score = sr\.cross_encoder_score_normalized \* \(_boost\*\*_boost_exponent\)/,
+    );
+
+    // Post-replace re-assertions (verification-on-build), including the
+    // STRUCTURAL guard that no reformatted reintroduction of the withdrawn
+    // min-max rescale can slip past an exact-string check.
+    expect(dockerfile).toMatch(
+      /assert "_CE_DECISIVE_RELATIVE_GAP_DEFAULT: float = 0\.02" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /_ce_writes = re\.findall\(r"\^\\s\*sr\\\.cross_encoder_score_normalized\\s\*=/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight CE-saturation patch: boost product damped/,
+    );
+  });
+
   it("never rewrites the caller-visible cross_encoder_score_normalized field", () => {
     // engine/memory_engine.py applies the agent-supplied `min_scores.reranker`
     // floor DIRECTLY to cross_encoder_score_normalized, and `min_scores` is a
