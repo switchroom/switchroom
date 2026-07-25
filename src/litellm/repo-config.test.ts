@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { describe, it, expect } from "vitest";
 
 import {
+  BARE_ANTHROPIC_FAMILY_ALIASES,
   FORWARD_HEADERS_FLAG,
   detectHeaderMisconfig,
   detectRetryFallbackGaps,
@@ -94,12 +95,92 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
 
   it("holds no literal secrets anywhere in model_list (env refs or placeholders only)", () => {
     const modelList = parsed.model_list as Array<{
-      litellm_params: { api_key?: string };
+      model_name: string;
+      litellm_params: { model: string; api_key?: string };
     }>;
     for (const m of modelList) {
-      const key = m.litellm_params.api_key ?? "";
+      const key = m.litellm_params.api_key;
+      if (key === undefined) {
+        // An ABSENT api_key is legal for exactly one case: the Anthropic
+        // subscription passthrough, where auth is the forwarded client OAuth
+        // Authorization header and the proxy holds no key of its own (I1/I2).
+        // Anywhere else a missing key is a misconfiguration, not a secret-free
+        // win, so it must not slip through this check.
+        expect(
+          m.litellm_params.model.startsWith("anthropic/"),
+          `${m.model_name} omits api_key but is not an anthropic/* OAuth-passthrough entry`,
+        ).toBe(true);
+        continue;
+      }
       const ok = key.startsWith("os.environ/") || key === "no-key-oauth-forwarded";
-      expect(ok, `suspicious api_key value: ${key}`).toBe(true);
+      expect(ok, `suspicious api_key value on ${m.model_name}: ${key}`).toBe(true);
+    }
+  });
+
+  // I2, stated as an outcome rather than a name check: it is not enough that
+  // the forwarding groups LOOK Claude-ish — every group carrying the flag must
+  // actually resolve, through model_list, to an Anthropic upstream. A group
+  // named `opus` pointed at openrouter/* would pass the allowlist and still
+  // leak the subscription OAuth token to a third party.
+  it("routes EVERY forward-flagged model group to an anthropic/* upstream", () => {
+    const mgs = parsed.model_group_settings as Record<string, Record<string, unknown>>;
+    const modelList = parsed.model_list as Array<{
+      model_name: string;
+      litellm_params: { model: string };
+    }>;
+    const flagged = Object.entries(mgs)
+      .filter(([, s]) => s[FORWARD_HEADERS_FLAG] === true)
+      .map(([name]) => name);
+    expect(flagged.length).toBeGreaterThan(0);
+    for (const group of flagged) {
+      const deployments = modelList.filter((m) => m.model_name === group);
+      expect(deployments.length, `group ${group} has no model_list deployment`).toBeGreaterThan(0);
+      for (const d of deployments) {
+        expect(
+          d.litellm_params.model.startsWith("anthropic/"),
+          `forward-flagged group ${group} routes to ${d.litellm_params.model}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  // A bare family alias (no `claude-` prefix) is only allowlisted by the I2
+  // guard if it is a member of BARE_ANTHROPIC_FAMILY_ALIASES. Registering one
+  // in this file without adding it there makes lint + the on-host fleet-health
+  // sensor report a false OAuth-leak violation (which is exactly what the live
+  // `opus` group did on 2026-07-25, #3537).
+  it("registers every bare (non claude-*) forwarding alias in BARE_ANTHROPIC_FAMILY_ALIASES", () => {
+    const mgs = parsed.model_group_settings as Record<string, Record<string, unknown>>;
+    const bare = Object.entries(mgs)
+      .filter(([name, s]) => s[FORWARD_HEADERS_FLAG] === true && !name.startsWith("claude-"))
+      .map(([name]) => name);
+    expect(bare.length).toBeGreaterThan(0);
+    for (const alias of bare) {
+      expect(
+        BARE_ANTHROPIC_FAMILY_ALIASES.has(alias),
+        `bare alias '${alias}' is in the config but not in BARE_ANTHROPIC_FAMILY_ALIASES`,
+      ).toBe(true);
+    }
+  });
+
+  // Regression guard for the 2026-07-25 reconciliation: this file had drifted
+  // to a hand-written subset missing the entire Opus family the live proxy
+  // serves, so syncing it to the host would have deleted routing in active use.
+  // Assert the families that must never silently vanish again.
+  it("registers the Claude families the live proxy actually serves", () => {
+    const names = new Set(
+      (parsed.model_list as Array<{ model_name: string }>).map((m) => m.model_name),
+    );
+    for (const required of [
+      "opus",
+      "claude-opus-5",
+      "sonnet",
+      "claude-sonnet-5",
+      "fable",
+      "claude-fable-5",
+      "claude-haiku-4-5-20251001",
+    ]) {
+      expect(names.has(required), `model_list must register ${required}`).toBe(true);
     }
   });
 

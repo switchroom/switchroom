@@ -50,12 +50,20 @@ host:  /data/coolify/services/<litellm-service-id>/litellm-config.yaml
 To roll out a change:
 
 1. Merge the change here (CI green — lint guard + `repo-config.test.ts`).
-2. On the host: `diff` the repo copy against the live file. **First
-   rollout only:** the live file predates this directory and was never
-   vendored byte-for-byte (the fleet container that authored KEN-125 had no
-   read access to it) — reconcile any live-only entries (extra model groups,
-   env names, `pass_through_endpoints` blocks) INTO the repo copy first, so
-   nothing silently regresses.
+2. On the host: **back up the live file**, then `diff` it against the repo
+   copy and read every hunk. The first-rollout reconciliation is DONE
+   (2026-07-25): the live file predated this directory and had never been
+   vendored, so the repo copy was missing the whole Opus family, fable, haiku,
+   most OpenRouter models, every `sr-*` name, the Voyage embeddings and the
+   Presidio guardrails — syncing it then would have deleted live routing.
+   Entry order now mirrors the live file so the diff stays readable. Two
+   deliberate deltas remain and will show up in that diff:
+   - repo-only: `openrouter/google/gemini-3.1-flash-lite` (the compiled-in
+     Hindsight default in `src/setup/hindsight.ts`; additive on sync);
+   - live-only: the disabled local-Ollama deployment blocks, not vendored
+     because they hard-code LAN/Tailscale addresses of the operator's
+     machines (host-specific detail, same rule as the Coolify service id).
+     They are inert (in no routing group) but a blind copy removes them.
 3. Copy the repo file over the host file.
 4. Restart the LiteLLM service via Coolify (or `docker compose restart` in
    the service dir).
@@ -89,9 +97,18 @@ silently.
 ## What is deliberately NOT here
 
 - **Secrets** — `os.environ/…` references only (`LITELLM_MASTER_KEY`,
-  `DATABASE_URL`, `OPENROUTER_API_KEY` come from the service's env, managed
-  in Coolify/vault).
-- **Caching** — off by design (pass-through dominates; stale cache corrupts
-  Hindsight memory ops). A scoped Redis recipe is commented in the yaml.
+  `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY` come from the
+  service's env, managed in Coolify/vault). `master_key` / `database_url` are
+  not declared at all: LiteLLM reads them from the environment, which is how
+  the live proxy runs.
+- **Host-specific detail** — the Coolify service id (placeholdered as
+  `<litellm-service-id>`) and the operator's LAN/Tailscale Ollama addresses.
 - **Virtual keys / teams** — provisioned at apply time by
-  `src/litellm/provision.ts`, never in this file (`store_model_in_db: false`).
+  `src/litellm/provision.ts`, never in this file.
+
+Caching used to be listed here as "off by design". It is not: the live proxy
+runs `cache: true` on Redis with a 600s TTL, and the reconciled file now says
+so. The Anthropic `/anthropic` pass-through never reaches that layer.
+`store_model_in_db` is likewise `true` live (UI model management), with the
+consequence that a model added through the LiteLLM UI is not captured here and
+will not survive a config-driven redeploy.

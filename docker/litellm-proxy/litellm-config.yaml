@@ -12,14 +12,30 @@
 # then the OPERATOR syncs it to the host and restarts the proxy service.
 # switchroom never mutates or restarts the live proxy.
 #
+# RECONCILED AGAINST THE LIVE HOST COPY 2026-07-25 (the "first rollout"
+# reconciliation the README calls for). Before that date this file was an
+# idealised hand-written config that had never been vendored from the running
+# proxy: it was missing the entire Opus family (`opus`, `claude-opus-5`, the
+# 4-8/4-7 drift aliases), fable, haiku, every OpenRouter model beyond three,
+# every `sr-*` /model name, the Voyage embeddings, and the Presidio guardrails.
+# Syncing it to the host would have deleted live routing in active use.
+# Section and entry ORDER now mirrors the live file deliberately, so
+# `diff <repo copy> <live copy>` stays a readable, near-empty diff. The
+# remaining intentional deltas are marked `REPO-ONLY` / `NOT VENDORED` inline.
+#
 # ── Invariants baked into this file ─────────────────────────────────────────
 #
 # I2 (OAuth-leak scoping): `forward_client_headers_to_llm_api: true` appears
 #   ONLY under Claude model groups in `model_group_settings`. NEVER set it
 #   globally under `litellm_settings` and NEVER on an `openrouter/*` or other
 #   non-Claude group — that forwards the subscription OAuth Authorization
-#   header to a third party. Enforced by scripts/check-litellm-config-guard.mjs
-#   (lint) and src/fleet-health/litellm-config-sensor.ts (on-host sensor).
+#   header to a third party. Every group carrying the flag must route to an
+#   `anthropic/*` upstream in `model_list` (asserted by
+#   src/litellm/repo-config.test.ts). Bare family aliases (`opus`, `sonnet`,
+#   `fable`) additionally have to be listed in BARE_ANTHROPIC_FAMILY_ALIASES
+#   in src/litellm/header-passthrough-guard.ts and its .mjs lint mirror.
+#   Enforced by scripts/check-litellm-config-guard.mjs (lint) and
+#   src/fleet-health/litellm-config-sensor.ts (on-host sensor).
 #
 # PASS-THROUGH IS SACRED (2026-07-05 incident): agent Claude traffic rides the
 #   URL-based /anthropic pass-through route (raw byte-forward), configured by
@@ -31,111 +47,685 @@
 #   The Claude model groups below exist only for consumers that explicitly use
 #   the model-mapped route; agents keep pass-through.
 #
-# G8 (broker owns Claude failover): Claude groups use num_retries: 1 plus a
-#   fallbacks chain. The auth broker is the retry/failover authority for
-#   subscription accounts; LiteLLM-side retry churn (num_retries > 1 with no
-#   fallback) just re-hammers the same walled account.
+# G8 (broker owns Claude failover): the auth broker is the retry/failover
+#   authority for subscription accounts; LiteLLM-side retry churn (num_retries
+#   > 1 with no fallback) just re-hammers the same walled account. The live
+#   config carries NO Claude-group num_retries and no Claude fallback chain, so
+#   nothing here overrides the broker.
+#
+# SECRETS: `os.environ/…` references only — never a literal key value.
+
+general_settings:
+  proxy_batch_write_at: 60
+  # Persist models/settings in the DB (also unlocks UI model management) and
+  # store full prompt/response bodies in spend logs so the UI request/response
+  # viewer works. Applies to new requests after this change.
+  #
+  # NOTE (reconciliation 2026-07-25): this file previously declared
+  # `store_model_in_db: false` on the theory that this yaml is the single source
+  # of model truth. The LIVE proxy has run with `true` (models managed from the
+  # UI as well). Live wins here because it is what is actually running — but
+  # note the consequence: a model added through the LiteLLM UI is NOT captured
+  # by this file and will not survive a config-driven redeploy.
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
+  # Bound SpendLogs growth + PII-at-rest: purge rows older than 14 days.
+  # Cleanup job runs on the interval below (default 1d). Added 2026-07-07.
+  maximum_spend_logs_retention_period: 14d
+  maximum_spend_logs_retention_interval: 1d
+  # NOTE: `master_key` / `database_url` are deliberately NOT declared here.
+  # LiteLLM reads LITELLM_MASTER_KEY and DATABASE_URL straight from the service
+  # environment (managed in Coolify/vault), which is how the live proxy runs.
+  # Virtual keys / teams are provisioned by switchroom (src/litellm/provision.ts),
+  # never in this file.
+
+router_settings:
+  redis_host: os.environ/REDIS_HOST
+  redis_port: os.environ/REDIS_PORT
+  redis_password: os.environ/REDIS_PASSWORD
+  enable_pre_call_check: true
+  # gpt-oss-20b topology (see model_list) — CORRECTED 2026-07-25 after audit;
+  # the previous text here described a local-Ollama-first group that has not
+  # existed since the 2026-07-18 bypass. ACTUAL state: the gpt-oss-20b group has
+  # a SINGLE deployment, and it is OPENROUTER (openrouter/openai/gpt-oss-20b),
+  # not local Ollama. Both local boxes are out of the group (see the NOT
+  # VENDORED note in model_list). simple-shuffle is therefore a no-op with one
+  # deployment. The earlier weight-1 OpenRouter in-group canary was removed
+  # 2026-07-09 (per Ken) because require_parameters made ~5% of steady
+  # structured retains 404 on OpenRouter even while local was healthy.
+  routing_strategy: simple-shuffle
+  # Down-fallback chain. HISTORICAL intent (per Ken 2026-07-14) was local Ollama
+  # FIRST, then OpenRouter, then Claude Sonnet as last resort, tried in list
+  # order. Neither of the other two tiers survives: claude-sonnet-5 was removed
+  # 2026-07-17 (see inline note) and the local tier is out of the group, so what
+  # remains below is a SINGLE hop.
+  # ⚠ NO-OP AS WRITTEN (audited 2026-07-25): gpt-oss-20b and gpt-oss-20b-openrouter
+  # now have functionally identical litellm_params — same model
+  # (openrouter/openai/gpt-oss-20b), same max_tokens (8192), same
+  # extra_body.provider.order (fireworks/together/deepinfra/novita). Failing over
+  # from OpenRouter to the same OpenRouter route with the same provider order
+  # buys no additional availability. Left in place deliberately (routing changes
+  # are Ken's call, not an audit's) — but if a genuine second tier is wanted,
+  # the fallback target needs to differ from the primary. See the note on the
+  # gpt-oss-20b-openrouter entry in model_list.
+  fallbacks:
+    # claude-sonnet-5 removed 2026-07-17: internal fallback re-dispatch cannot
+    # carry the client OAuth header (gpt-oss callers auth with a virtual key),
+    # so this hop always 401'd ("x-api-key header is required") and leaked bogus
+    # re-auth errors to users.
+    - gpt-oss-20b: ["gpt-oss-20b-openrouter"]
+
+litellm_settings:
+  # Do NOT set forward_client_headers_to_llm_api here — it is a Boolean in
+  # litellm_settings (global on/off). Per-model OAuth forwarding is done via
+  # model_group_settings below (I1/I2 invariant: only Anthropic OAuth models get
+  # the forwarded Authorization header; OpenRouter/OpenAI never do).
+  set_verbose: false
+  json_logs: true
+  log_raw_request_response: true
+  service_callback: ["prometheus_system"]
+  drop_params: true
+  num_retries: 3
+  request_timeout: 600
+  telemetry: false
+  # Response caching is ON in the live proxy (Redis, 600s TTL). The Anthropic
+  # /anthropic pass-through never reaches this layer, so the cache covers the
+  # model-mapped OpenRouter/OpenAI traffic. (This file previously documented
+  # caching as "deliberately OFF" — that described an intent, not the running
+  # proxy; reconciled to reality 2026-07-25.)
+  cache: true
+  cache_params:
+    type: redis
+    host: os.environ/REDIS_HOST
+    port: os.environ/REDIS_PORT
+    password: os.environ/REDIS_PASSWORD
+    namespace: "litellm_cache"
+    ttl: 600
+  success_callback:
+    - "prometheus"
+  failure_callback:
+    - "prometheus"
+  # Fleet-wide LLM request pacer (custom_pacing.py, bind-mounted to
+  # /app/custom_pacing.py — see docker-compose.yml; repo-managed source in
+  # ../litellm-pacer/). Enforces Ken's standing rule "never storm, always pace"
+  # (2026-07-12): when the auth-broker flips the fleet onto a new Anthropic
+  # OAuth account, this smooths the burst so a cold/low-burst-ceiling account
+  # QUEUES+PACES instead of 429-storming. Runs on the /anthropic passthrough
+  # pre_call_hook (call_type == pass_through_endpoint). Bounded global
+  # concurrency + rolling rate + adaptive Retry-After cooldown, all FAIL-OPEN (a
+  # pacer error degrades to today's behavior, never a fleet outage). Tunables
+  # live in the PACE_* env vars in docker-compose.yml.
+  callbacks: ["custom_pacing.pacer_instance"]
+
+model_group_settings:
+  # Per-model OAuth forwarding — MUST be scoped to Anthropic models only.
+  # litellm_settings.forward_client_headers_to_llm_api is a Boolean (global).
+  # Use model_group_settings for per-model control (invariant I1 + I2).
+  # When this is true, LiteLLM forwards the client's Authorization: Bearer
+  # <oauth-token> to Anthropic. Never set this on OpenRouter/OpenAI entries.
+  # Opus 5 (current flagship Opus, 1M context) — added 2026-07-25. Concrete id
+  # + unversioned `opus` family alias, both Anthropic OAuth passthrough (I1).
+  claude-opus-5:
+    forward_client_headers_to_llm_api: true
+  opus:
+    forward_client_headers_to_llm_api: true
+  claude-opus-4-8:
+    forward_client_headers_to_llm_api: true
+  # Retired/older opus version ids alias to current opus so a client that
+  # still sends an old id (e.g. hindsight's claude CLI default) doesn't 400
+  # on version drift.
+  claude-opus-4-7:
+    forward_client_headers_to_llm_api: true
+  claude-sonnet-4-6:
+    forward_client_headers_to_llm_api: true
+  # Current sonnet (Sonnet 5) — concrete id + family alias, added 2026-07-04
+  # (overlord via Ken) alongside the model_list entries. Same I1 scoping.
+  claude-sonnet-5:
+    forward_client_headers_to_llm_api: true
+  sonnet:
+    forward_client_headers_to_llm_api: true
+  claude-haiku-4-5-20251001:
+    forward_client_headers_to_llm_api: true
+  # Fable (flagship). The `fable` /model alias resolves in the CLI to a
+  # concrete codename before the request reaches this proxy; both the family
+  # alias and the concrete id are registered below so neither 400s. Added
+  # 2026-07-02 (overlord via Ken) for OAuth-Claude Fable support.
+  claude-fable-5:
+    forward_client_headers_to_llm_api: true
+  fable:
+    forward_client_headers_to_llm_api: true
 
 model_list:
-  # ── Claude (subscription, model-mapped route only — agents use /anthropic
-  #    pass-through and never hit these entries) ─────────────────────────────
-  # api_key is a placeholder: on the subscription path the client's OAuth
-  # Authorization header is forwarded (I1/I2); the proxy holds no Anthropic
-  # key of its own.
-  - model_name: claude-opus
+  # ── OpenAI (direct API) ─────────────────────────────────────────────
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+
+  # ── Anthropic — Max-subscription OAuth passthrough ──────────────────
+  # NO api_key: auth comes from the forwarded client Authorization header
+  # (I1/I2) — the proxy holds no Anthropic key of its own. Model names MUST
+  # match the IDs Claude Code sends exactly.
+  # Opus 5 (current flagship Opus, 1M context) — added 2026-07-25. Concrete
+  # versioned id (for logging/pinning) + unversioned `opus` family alias that
+  # always maps to latest Opus. Same OAuth passthrough pattern as sonnet-5.
+  - model_name: claude-opus-5
     litellm_params:
       model: anthropic/claude-opus-5
-      api_key: "no-key-oauth-forwarded"
-  - model_name: claude-sonnet
+  - model_name: opus
+    litellm_params:
+      model: anthropic/claude-opus-5
+  # Version-drift aliases: clients still sending the retired claude-opus-4-8 /
+  # claude-opus-4-7 ids (e.g. hindsight's claude CLI default) are routed to
+  # current Opus 5 instead of pinning to a stale version — same pattern as the
+  # claude-sonnet-4-6 -> claude-sonnet-5 drift alias below.
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: anthropic/claude-opus-5
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: anthropic/claude-opus-5
+  # Version-drift alias (2026-07-05, per Ken: "sonnet must be the latest"):
+  # clients still sending claude-sonnet-4-6 (older switchroom sub-agent /
+  # cron defaults) are routed to current Sonnet 5 — same pattern as the
+  # claude-opus-4-7 alias above.
+  - model_name: claude-sonnet-4-6
     litellm_params:
       model: anthropic/claude-sonnet-5
-      api_key: "no-key-oauth-forwarded"
+  # Current sonnet (Sonnet 5) — concrete id + family alias, same pattern as
+  # fable. The claude CLI resolves the `sonnet` alias to claude-sonnet-5.
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
   - model_name: sonnet
     litellm_params:
       model: anthropic/claude-sonnet-5
-      api_key: "no-key-oauth-forwarded"
-
-  # ── Non-Claude models (OpenRouter cash account; metered per-consumer via
-  #    virtual keys). These are the Hindsight memory-op workhorses. ──────────
-  - model_name: gpt-oss-20b
+  - model_name: claude-haiku-4-5-20251001
     litellm_params:
-      model: openrouter/openai/gpt-oss-20b
+      model: anthropic/claude-haiku-4-5-20251001
+  # Fable — OAuth passthrough. Concrete id + family alias, both forwarding to
+  # the current Fable upstream. If the CLI emits a dated fable id, add it here
+  # as another drift-alias (same pattern as claude-opus-4-7 → 4-8).
+  - model_name: claude-fable-5
+    litellm_params:
+      model: anthropic/claude-fable-5
+  - model_name: fable
+    litellm_params:
+      model: anthropic/claude-fable-5
+
+  # ── OpenRouter — explicit allowlist (no wildcard) ───────────────────
+  # Governance: only models listed here are routable. Per-agent virtual
+  # key model_aliases (e.g. claude-sonnet-4-6 → an OpenRouter model) let
+  # the Claude CLI keep sending its native model names while LiteLLM
+  # transparently redirects specific agents to alternative providers.
+  # No data training: OpenAI and Google confirmed; DeepSeek and Z.AI are
+  # China-based with opaque policies — treat as no-PII for those models.
+
+  # OpenAI Codex via OpenRouter
+  # Manual cost override — not yet in BerriAI's community price map (added
+  # 2026-07-07, priced from https://openrouter.ai/api/v1/models).
+  - model_name: openrouter/openai/gpt-5.5
+    litellm_params:
+      model: openrouter/openai/gpt-5.5
       api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.00003
+  # gpt-5.5-codex does not exist on OpenRouter (confirmed 2026-07-07) — the
+  # newest real codex slug is gpt-5.3-codex. Repointed rather than deleted so
+  # the sr-codex-5.5 alias below keeps working.
+  - model_name: openrouter/openai/gpt-5.5-codex
+    litellm_params:
+      model: openrouter/openai/gpt-5.3-codex
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.00000175
+      output_cost_per_token: 0.000014
+
+  - model_name: openrouter/openai/gpt-5-codex
+    litellm_params:
+      model: openrouter/openai/gpt-5-codex
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/openai/gpt-5.2-codex
+    litellm_params:
+      model: openrouter/openai/gpt-5.2-codex
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # OpenAI gpt-oss-20b (open-weight) via OpenRouter — added 2026-07-07 (per Ken)
+  # for Hindsight memory ops (consolidation/retain) to move background burn off
+  # the Anthropic subscription quota. Short alias `gpt-oss-20b` for consumers.
   - model_name: openrouter/openai/gpt-oss-20b
     litellm_params:
       model: openrouter/openai/gpt-oss-20b
       api_key: os.environ/OPENROUTER_API_KEY
+      # require_parameters: only route to OpenRouter providers that honor the
+      # requested response_format/json_schema. Without this, OpenRouter may pick
+      # a provider (e.g. Groq) whose structured-output enforcement fails for this
+      # reasoning model, returning content:null → hindsight structured-parse
+      # error. Added 2026-07-09 after the fallback was observed dumping valid
+      # JSON into reasoning_content while content came back null.
+      extra_body:
+        provider:
+          require_parameters: true
+
+  # ── NOT VENDORED: the disabled local-Ollama deployments ────────────────────
+  # The live host copy additionally carries a DISABLED local Ollama deployment
+  # (model_name `gpt-oss-20b-ollama-disabled-20260718`, renamed OUT of the
+  # gpt-oss-20b group on 2026-07-18) and a commented-out second local block for
+  # the simrig box. Both are pinned to LAN / Tailscale addresses of Ken's
+  # machines and carry `api_key: "none"`, i.e. deployment-specific host detail
+  # that must not live in a public repo (same rule as the Coolify service id).
+  # They are therefore deliberately NOT vendored here.
+  #
+  # ⚠ CONSEQUENCE FOR THE OPERATOR: copying this file over the live one DELETES
+  # those two blocks from the host. They are inert today (neither is in any
+  # routing group, so no traffic reaches them), but the comment history and the
+  # "restore by renaming this back into the group" recipe go with them — take a
+  # backup of the live file before syncing, which is the documented procedure in
+  # README.md anyway.
+  #
+  # To re-enable a local box, add a deployment on the host with
+  # `model: openai/gpt-oss:20b`, `api_base: http://<local-ollama-host>:11434/v1`,
+  # `api_key: "none"`, `max_tokens: 8192`, `timeout: 90` (fail fast so a hung
+  # completion cannot pin a hindsight worker slot) and
+  # `extra_body: {reasoning_effort: low, think: low}` (Ollama honors the native
+  # `think` field too). NEVER give a local/non-Anthropic deployment
+  # forward_client_headers_to_llm_api (I2). That is a ROUTING change and
+  # therefore Ken's call — and it belongs in this file first, not on the host.
+  #
+  # NOTE: the in-group OpenRouter canary deployment (weight 1) was REMOVED
+  # 2026-07-09 (per Ken, "overflow_fix_now"). Rationale: with require_parameters
+  # ON, ~5% of ALL structured retains were shuffled to OpenRouter even while the
+  # local box was healthy, and each of those 404'd ("No endpoints found that can
+  # handle the requested parameters") — a constant ~12/min NotFound stream. The
+  # require_parameters guard is needed to avoid content:null, but combined with
+  # hindsight's strict json_schema it over-constrains provider selection to zero.
+
+  # ── CONSUMER-FACING gpt-oss-20b (hindsight retain/reflect/consolidation) ──
+  # CURRENT STATE (verified 2026-07-25): serves from OPENROUTER
+  # (openrouter/openai/gpt-oss-20b). There is NO local deployment in this group.
+  # History, shortest form:
+  #  - 2026-07-08 → 07-18: local Ollama on the LAN desktop.
+  #  - 2026-07-18: desktop appeared wedged; alias flipped to OpenRouter.
+  #  - 2026-07-24: flipped to the simrig (Windows, RTX 5070 Ti 16GB, Ollama
+  #    0.32.3) over Tailscale, ~150 tok/s MXFP4.
+  #  - 2026-07-25 (per Ken): FLIPPED BACK TO OPENROUTER — every hindsight call was
+  #    hanging the full local timeout before failing over, pinning worker slots.
+  #    Params restored verbatim from the pre-simrig backup (max_tokens 8192,
+  #    provider.order fireworks/together/deepinfra/novita).
+  # ⚠ CAUSE CORRECTION (audited 2026-07-25): the simrig is not "firewalled" — the
+  # Tailscale NODE is offline (`tailscale status` reports it offline with tx>0,
+  # rx 0, and curl to :11434/api/tags hangs to the full connect timeout with no
+  # RST from BOTH the host netns and the litellm container netns). So it's the
+  # box being off, not a port-level block; nothing about the litellm/network
+  # config needs changing to "fix" it.
+  # ⚠ Do NOT set HINDSIGHT_API_LLM_STRICT_SCHEMA to fix small-model JSON here.
+  # Tried 2026-07-09: combined with provider require_parameters it constrained
+  # OpenRouter provider selection to ZERO endpoints and produced a constant
+  # ~12/min 404 stream ("No endpoints found that can handle the requested
+  # parameters"). See the notes on the two entries either side of this one.
+  - model_name: gpt-oss-20b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-20b
+      api_key: os.environ/OPENROUTER_API_KEY
+      # Hard output ceiling: a single reflect/MM-refresh/consolidation call can
+      # otherwise run away to 20k-40k tokens and trip OutputTooLongError. 8192
+      # clears legit consolidation batches (12-memory structured JSON) while
+      # staying well below the runaway regime.
+      max_tokens: 8192
+      # Client/server timeout alignment (added 2026-07-25). Without a per-model
+      # timeout these calls inherit litellm_settings.request_timeout (600s) with
+      # num_retries: 3, while hindsight — the only consumer of this alias — gives
+      # up at 120s (DEFAULT_LLM_TIMEOUT, no HINDSIGHT_API_LLM_TIMEOUT override
+      # set on switchroom-hindsight). The two disagreed by 5x: hindsight
+      # abandoned the call at 120s while litellm kept the upstream slot held for
+      # up to 600s, which is the mechanism behind the 2026-07-24 19:30-20:50 UTC
+      # extraction-timeout cluster (two retains lost). 90s < 120s makes the
+      # SERVER give up first, so litellm returns a real error hindsight can retry
+      # on instead of the client walking away from a still-running request.
+      # DO NOT RAISE past ~110s without first raising hindsight's client timeout
+      # — the invariant is server timeout < client timeout.
+      timeout: 90
+      extra_body:
+        reasoning_effort: low
+        provider:
+          order: ["fireworks", "together", "deepinfra", "novita"]
+
+  # ⚠ FALLBACK IS A NO-OP AS CONFIGURED (audited 2026-07-25). This entry is the
+  # router-level fallback target for gpt-oss-20b above, but its litellm_params are
+  # now functionally identical to that primary: same model
+  # (openrouter/openai/gpt-oss-20b), same api_key, same max_tokens (8192), same
+  # extra_body.reasoning_effort (low) and same provider.order
+  # (fireworks/together/deepinfra/novita). Failing over from OpenRouter to the
+  # identical OpenRouter route retries the same providers in the same order, so it
+  # adds latency without adding availability. It only differed meaningfully while
+  # the primary was a LOCAL box. Deliberately NOT changed by the reconciliation —
+  # routing is Ken's call.
+  # Note: this entry has no per-model `timeout`, so a fallback hop still inherits
+  # request_timeout (600s). Only relevant once this tier is made distinct.
+  - model_name: gpt-oss-20b-openrouter
+    litellm_params:
+      model: openrouter/openai/gpt-oss-20b
+      api_key: os.environ/OPENROUTER_API_KEY
+      # Pin an explicit allowlist of providers that honor structured-output
+      # (json_schema/response_format) — all verified structured:True on
+      # OpenRouter 2026-07-14. The earlier blanket `require_parameters: true`
+      # capability pre-filter was matching ZERO endpoints at route time,
+      # 404-ing every fallback ("No endpoints found that can handle the
+      # requested parameters") whenever the local Ollama box was down. An
+      # explicit `order` routes deterministically instead of relying on the
+      # filter.
+      # 2026-07-19: same output-runaway cap as the gpt-oss-20b entry above —
+      # this is the deeper router-level fallback target so it needs the same
+      # guard against OutputTooLongError.
+      # 2026-07-22 (per Ken): raised 4096->8192, mirroring the gpt-oss-20b entry
+      # above (this is its router-level fallback twin). Same rationale: bounded,
+      # clears legit consolidation sizes, well below the runaway regime.
+      max_tokens: 8192
+      extra_body:
+        reasoning_effort: low
+        provider:
+          order: ["fireworks", "together", "deepinfra", "novita"]
+          # require_parameters removed 2026-07-18: even with the pinned order it
+          # was re-triggering the zero-match 404 ("No endpoints found that can
+          # handle the requested parameters") on backlog-drain fallback traffic,
+          # 870 errors/10min. The order allowlist is already structured-verified.
+
+  # Claude Sonnet 5 via OPENROUTER (metered credits, NOT the Anthropic
+  # subscription passthrough above) — added 2026-07-19 per Ken: hindsight
+  # retain moves here to chew OpenRouter credits before rollover. Anthropic is
+  # the only provider for this slug on OpenRouter; no require_parameters (the
+  # zero-match 404 footgun documented for gpt-oss-20b-openrouter applies).
+  # I2: `*-openrouter` groups NEVER carry forward_client_headers_to_llm_api —
+  # note this name is absent from model_group_settings above, deliberately.
+  - model_name: claude-sonnet-5-openrouter
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-5
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # OpenAI gpt-oss-120b (open-weight) via OpenRouter — added 2026-07-08 (per Ken)
+  # for Hindsight reflect (synthesis) ops. Short alias `gpt-oss-120b` for consumers.
+  - model_name: openrouter/openai/gpt-oss-120b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+      # Same structured-output guard as gpt-oss-20b (hindsight reflect uses it).
+      extra_body:
+        provider:
+          require_parameters: true
+  - model_name: gpt-oss-120b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+      extra_body:
+        provider:
+          require_parameters: true
+
+  # DeepSeek via OpenRouter — routed to US-hosted providers (OpenRouter provider selection)
+  - model_name: openrouter/deepseek/deepseek-r1-0528
+    litellm_params:
+      model: openrouter/deepseek/deepseek-r1-0528
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/deepseek/deepseek-v3.2
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v3.2
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Z.AI GLM via OpenRouter — routed to US-hosted providers (OpenRouter provider selection)
+  # GLM-5.2 confirmed on OpenRouter 2026-06-28
+  # Manual cost override — not yet in BerriAI's community price map (added
+  # 2026-07-07, priced from https://openrouter.ai/api/v1/models).
   - model_name: openrouter/z-ai/glm-5.2
     litellm_params:
       model: openrouter/z-ai/glm-5.2
       api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.0000009
+      output_cost_per_token: 0.00000286
+  - model_name: openrouter/z-ai/glm-5.1
+    litellm_params:
+      model: openrouter/z-ai/glm-5.1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/z-ai/glm-5
+    litellm_params:
+      model: openrouter/z-ai/glm-5
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # MiniMax M3 via OpenRouter — added 2026-07-07 (per Ken)
+  # Manual cost override — not yet in BerriAI's community price map (added
+  # 2026-07-07, priced from https://openrouter.ai/api/v1/models).
+  - model_name: openrouter/minimax/minimax-m3
+    litellm_params:
+      model: openrouter/minimax/minimax-m3
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.0000003
+      output_cost_per_token: 0.0000012
+
+  # DeepSeek V4 Flash via OpenRouter
+  # Manual cost override — not yet in BerriAI's community price map (added
+  # 2026-07-07, priced from https://openrouter.ai/api/v1/models).
+  - model_name: openrouter/deepseek/deepseek-v4-flash
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.00000009
+      output_cost_per_token: 0.00000018
+
+  # ── REPO-ONLY (not yet on the live host) ───────────────────────────────────
+  # Gemini Flash Lite via OpenRouter. This is the compiled-in default for
+  # Hindsight's LLM model (src/setup/hindsight.ts) and appears throughout
+  # src/litellm/model-validation.ts's consumer checks, but the live proxy does
+  # NOT register it — a config-driven default that would 400 at route time if a
+  # bank ever fell back to it. Kept here (rather than silently dropped) so the
+  # gap stays visible; syncing this file to the host ADDS the model, which is
+  # additive and safe. Nothing routes to it by default.
   - model_name: openrouter/google/gemini-3.1-flash-lite
     litellm_params:
       model: openrouter/google/gemini-3.1-flash-lite
       api_key: os.environ/OPENROUTER_API_KEY
 
-litellm_settings:
-  # Fleet-wide Anthropic pass-through pacer (docker/litellm-pacer — repo-managed).
-  callbacks: ["custom_pacing.pacer_instance"]
-  # NOTE: forward_client_headers_to_llm_api must NEVER appear here (global
-  # master switch = OAuth leak to every upstream). Scoped per-group below.
+  # ── Synthetic "sr-*" names for Ship D safe routing (I6 invariant) ──────────
+  # These names are NOT in model_group_settings → no OAuth forwarding.
+  # The /model Telegram command tells the agent to use --model sr-<name>;
+  # Claude Code sends the synthetic name; LiteLLM routes to OpenRouter.
+  - model_name: sr-deepseek-r1
+    litellm_params:
+      model: openrouter/deepseek/deepseek-r1-0528
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-deepseek-v3
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v3.2
+      api_key: os.environ/OPENROUTER_API_KEY
+  # sr-glm-5 tracks the CURRENT GLM rev — bumped 5.1 → 5.2 (per Ken 2026-07-08).
+  - model_name: sr-glm-5
+    litellm_params:
+      model: openrouter/z-ai/glm-5.2
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-codex-5.5
+    litellm_params:
+      model: openrouter/openai/gpt-5.5-codex
+      api_key: os.environ/OPENROUTER_API_KEY
+  # Full OpenRouter coverage — every registered openrouter/* model gets an sr-*
+  # name so it is selectable via /model (added 2026-07-08 per Ken: "work
+  # properly on anything from openrouter"). None are in model_group_settings,
+  # so no OAuth forwarding (I2) — they route on OPENROUTER_API_KEY only.
+  - model_name: sr-gpt-oss-20b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-20b
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-gpt-oss-120b
+    litellm_params:
+      model: openrouter/openai/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-gpt-5.5
+    litellm_params:
+      model: openrouter/openai/gpt-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-gpt-5-codex
+    litellm_params:
+      model: openrouter/openai/gpt-5-codex
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-gpt-5.2-codex
+    litellm_params:
+      model: openrouter/openai/gpt-5.2-codex
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-minimax-m3
+    litellm_params:
+      model: openrouter/minimax/minimax-m3
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: sr-deepseek-v4-flash
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
 
-router_settings:
-  # Non-Claude retries: transient OpenRouter 5xx/timeouts are worth one retry
-  # burst; anything worse falls through the chains below.
-  num_retries: 2
-  retry_after: 2 # seconds min backoff between retries
-  # Fallback chains. Non-Claude: G6 (OpenRouter credit exhaustion / model
-  # outage) degrades to a cheaper/alternate model instead of hard-failing the
-  # memory op. Claude: G8 recommended shape (broker owns account failover;
-  # this only reroutes on model-level errors).
-  fallbacks:
-    - gpt-oss-20b: ["openrouter/z-ai/glm-5.2", "openrouter/google/gemini-3.1-flash-lite"]
-    - openrouter/openai/gpt-oss-20b: ["openrouter/z-ai/glm-5.2", "openrouter/google/gemini-3.1-flash-lite"]
-    - openrouter/z-ai/glm-5.2: ["openrouter/google/gemini-3.1-flash-lite"]
-    - claude-opus: ["claude-sonnet"]
+  # ── xAI Grok / Moonshot Kimi / OpenAI GPT-5.6 ──────────────────────────────
+  # Added 2026-07-19 (per Ken). New flagship tiers from three providers, all
+  # routed via OpenRouter on OPENROUTER_API_KEY. NONE appear in
+  # model_group_settings, so the Anthropic OAuth Authorization header is NEVER
+  # forwarded to them (invariant I2). Prices are manual per-token overrides read
+  # from https://openrouter.ai/api/v1/models on 2026-07-19 — these revs are not
+  # yet in BerriAI's community price map, so without the override spend logs
+  # would record $0. Each canonical entry has a curated `sr-*` twin below so the
+  # model is selectable from the Telegram /model picker (invariant I6).
+  # Moonshot (Kimi) is China-based with an opaque data policy — treat as no-PII,
+  # same posture as the DeepSeek / Z.AI entries above.
 
-model_group_settings:
-  # I2: the OAuth Authorization header is forwarded ONLY for these
-  # subscription-Claude groups. num_retries: 1 per G8 (broker owns failover).
-  claude-opus:
-    forward_client_headers_to_llm_api: true
-    num_retries: 1
-  claude-sonnet:
-    forward_client_headers_to_llm_api: true
-    num_retries: 1
-  sonnet:
-    forward_client_headers_to_llm_api: true
-    num_retries: 1
-  # Non-Claude groups: NO forward_client_headers_to_llm_api here, ever.
-  gpt-oss-20b:
-    num_retries: 2
-  openrouter/openai/gpt-oss-20b:
-    num_retries: 2
-  openrouter/z-ai/glm-5.2:
-    num_retries: 2
-  openrouter/google/gemini-3.1-flash-lite:
-    num_retries: 2
+  # xAI Grok — US-hosted provider.
+  - model_name: openrouter/x-ai/grok-4.5
+    litellm_params:
+      model: openrouter/x-ai/grok-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000002
+      output_cost_per_token: 0.000006
+  - model_name: openrouter/x-ai/grok-4.3
+    litellm_params:
+      model: openrouter/x-ai/grok-4.3
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.00000125
+      output_cost_per_token: 0.0000025
 
-general_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
-  database_url: os.environ/DATABASE_URL
-  # Virtual keys / teams are provisioned by switchroom (src/litellm/provision.ts);
-  # keep proxy-side model storage off so this file stays the single source of
-  # model truth.
-  store_model_in_db: false
+  # Moonshot Kimi — China-based, opaque data policy → no-PII.
+  - model_name: openrouter/moonshotai/kimi-k3
+    litellm_params:
+      model: openrouter/moonshotai/kimi-k3
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+  - model_name: openrouter/moonshotai/kimi-k2.7-code
+    litellm_params:
+      model: openrouter/moonshotai/kimi-k2.7-code
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.0000044
 
-# ── Caching (deliberately OFF) ────────────────────────────────────────────────
-# Response caching is intentionally not enabled: the dominant traffic is the
-# Anthropic pass-through (never cacheable here) and Hindsight memory ops,
-# where stale cached completions corrupt retain/reflect output. If enabled
-# later, use Redis and scope with `cache_params.supported_call_types` to
-# non-Claude completion only:
-#
-# litellm_settings:
-#   cache: true
-#   cache_params:
-#     type: redis
-#     host: os.environ/REDIS_HOST
-#     port: os.environ/REDIS_PORT
-#     supported_call_types: ["completion"]
+  # OpenAI GPT-5.6 — Sol (flagship) / Terra (balanced) / Luna (cost-efficient).
+  - model_name: openrouter/openai/gpt-5.6-sol
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-sol
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.00003
+  - model_name: openrouter/openai/gpt-5.6-terra
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-terra
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.0000025
+      output_cost_per_token: 0.000015
+  - model_name: openrouter/openai/gpt-5.6-luna
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-luna
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000006
+
+  # ── Synthetic sr-* twins for the three providers above (selectable via ──────
+  # /model; no OAuth forwarding — I6). Cost overrides mirrored so spend logs are
+  # accurate regardless of whether a caller uses the canonical or the sr-* name.
+  - model_name: sr-grok-4.5
+    litellm_params:
+      model: openrouter/x-ai/grok-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000002
+      output_cost_per_token: 0.000006
+  - model_name: sr-grok-4.3
+    litellm_params:
+      model: openrouter/x-ai/grok-4.3
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.00000125
+      output_cost_per_token: 0.0000025
+  - model_name: sr-kimi-k3
+    litellm_params:
+      model: openrouter/moonshotai/kimi-k3
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+  - model_name: sr-kimi-k2.7-code
+    litellm_params:
+      model: openrouter/moonshotai/kimi-k2.7-code
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.0000044
+  - model_name: sr-gpt-5.6-sol
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-sol
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.00003
+  - model_name: sr-gpt-5.6-terra
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-terra
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.0000025
+      output_cost_per_token: 0.000015
+  - model_name: sr-gpt-5.6-luna
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-luna
+      api_key: os.environ/OPENROUTER_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000006
+
+  # ── VoyageAI (embeddings) ────────────────────────────────────────────
+  - model_name: voyage-law-2
+    model_info:
+      output_vector_size: 1024
+    litellm_params:
+      model: voyage/voyage-law-2
+      api_key: "os.environ/VOYAGE_API_KEY"
+      api_base: "os.environ/VOYAGE_API_BASE"
+  - model_name: voyage-multilingual-2
+    model_info:
+      mode: embedding
+      max_tokens: 32000
+      max_input_tokens: 32000
+      output_vector_size: 1024
+    litellm_params:
+      model: voyage/voyage-multilingual-2
+      api_key: "os.environ/VOYAGE_API_KEY"
+      api_base: "os.environ/VOYAGE_API_BASE"
+      input_cost_per_token: 0.00000012
+      output_cost_per_token: 0
+
+# ── PII Guardrails (Microsoft Presidio) ─────────────────────────────────────
+# Presidio analyzer + anonymizer run as sidecars in the same Coolify compose
+# project. LiteLLM reaches them by internal service DNS (not 127.0.0.1 —
+# LiteLLM runs in a Docker container, so localhost is its own container).
+# Ref: https://docs.litellm.ai/docs/proxy/guardrails/presidio
+guardrails:
+  - guardrail_name: presidio-pii
+    litellm_params:
+      guardrail: presidio
+      mode: pre_call           # scrub PII before the request reaches the LLM
+      # output_parse_pii deliberately OFF: the un-mask round-trip corrupts text
+      # (broken placeholder restoration) AND re-injects real PII into responses.
+      # Keeping PII masked end-to-end is both correct and the safer privacy posture.
+      output_parse_pii: false
+      presidio_analyzer_api_base: "http://presidio-analyzer:3000"
+      presidio_anonymizer_api_base: "http://presidio-anonymizer:3000"
