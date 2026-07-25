@@ -13819,6 +13819,23 @@ const handbackPreturnSignal = createHandbackPreturnSignal({
     const live = currentTurnMap.get(key)
     return live != null && (live.finalAnswerDelivered || live.endedAt != null)
   },
+  // #3544: a turn that is still LIVE on this topic owns the typing loop for the
+  // key — the seam's age-based orphan reap must not stop it out from under the
+  // composing turn (its canonical turn-end is the stop-owner). Deliberately NOT
+  // `isTurnSettled`'s condition: a turn that already delivered its answer is
+  // "settled" for card purposes but may still be mid-turn, and `endedAt != null`
+  // is the only signal that the turn-end stop has run.
+  hasLiveTurn: (key) => {
+    const live = currentTurnMap.get(key)
+    if (live == null || live.endedAt != null) return false
+    // Under the emission-authority kill-switch OFF (the default) `get(key)`
+    // returns the most-recent-set SINGLETON regardless of key — so verify the
+    // live turn actually belongs to THIS topic before suppressing the stop.
+    // Without this check a live turn on chat B would keep a stale chat-A pre-turn
+    // typing loop running forever (a leaked interval — strictly worse than the
+    // dark-indicator bug). Flag-ON is already per-key; the check is a no-op there.
+    return statusKey(live.sessionChatId, live.sessionThreadId) === key
+  },
 })
 
 /**

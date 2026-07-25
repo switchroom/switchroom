@@ -10,8 +10,11 @@
  * `typing…` indicator and no activity card. The user — who dispatched the work
  * and is waiting — sees nothing until the turn is well underway. Worse, a
  * handback turn historically never even got a turn-long typing loop
- * (`startTurnTypingLoop` has a single caller on the real-inbound path), so the
- * dark stretch extended past turn start.
+ * (`startTurnTypingLoop` had a single caller on the real-inbound path), so the
+ * dark stretch extended past turn start. That second half is now closed
+ * independently of this seam: the `enqueue` seam arms the loop for EVERY minted
+ * turn (#3544), so an un-adopted handback turn is lit for its whole compose
+ * window. This seam still covers the pre-turn stretch (release → enqueue).
  *
  * THE FIX (one continuous card lifecycle, NOT an orphan). The moment the
  * buffered handback is RELEASED, emit a pre-turn signal for its topic:
@@ -63,6 +66,10 @@
  *     gateway's mid-session + boot reapers are the crash backstop (the complete
  *     record lets them finalize an orphan across a restart), and a reap hook
  *     lets them stop the typing loop + drop the map entry too.
+ *     The typing stop on EITHER reap path is SKIPPED when a real turn is live
+ *     on that key (`hasLiveTurn`, #3544): the loop is keyed on (chat, thread),
+ *     so reaping a stale pre-turn entry must never darken a turn that is still
+ *     composing — that turn's canonical turn-end owns the stop.
  *
  *   • DEBOUNCE (~700ms) kills sub-second-worker flicker: a worker that finishes
  *     and whose turn mints within the debounce window never paints a pre-turn
@@ -155,6 +162,15 @@ export interface HandbackPreturnSignalDeps {
    *  entirely (design lever 5: never paint beneath a settled turn). Optional;
    *  defaults to "not settled". */
   isTurnSettled?: (statusKey: string) => boolean
+  /** True IFF a turn is CURRENTLY live (minted, not yet ended) on this topic
+   *  key. Consulted before the orphan reap stops the typing loop: that loop is
+   *  keyed on (chat, thread), NOT on this seam's entry, so stopping it while a
+   *  real turn is composing darkens that turn's indicator for the rest of its
+   *  life (#3544 — the 30 s reap killing a healthy loop). The stop is only
+   *  ours to make when nothing else owns the key; when a turn IS live, its
+   *  canonical turn-end owns the stop. Optional; defaults to "no live turn"
+   *  (the pre-#3544 behaviour). */
+  hasLiveTurn?: (statusKey: string) => boolean
   now?: () => number
   /** Debounce before painting the pre-turn card (kills sub-second flicker). */
   debounceMs?: number
@@ -312,12 +328,30 @@ export function createHandbackPreturnSignal(
       })
   }
 
+  /**
+   * Stop the typing loop for an entry ONLY when no real turn owns that key
+   * (#3544). The loop is keyed on (chat, thread); a live turn's indicator would
+   * otherwise be killed mid-compose by this seam's age-based reap, and nothing
+   * re-arms it. When a turn IS live the canonical turn-end owns the stop, so
+   * skipping here cannot leak an interval.
+   */
+  function stopTypingUnlessTurnLive(entry: PreTurnEntry, reason: string): void {
+    if (deps.hasLiveTurn?.(entry.statusKey) === true) {
+      log(
+        `handback-preturn-signal: ${reason} key=${entry.statusKey} ` +
+          `typing=kept (live turn owns the stop)\n`,
+      )
+      return
+    }
+    deps.stopTypingLoop(entry.chatId, entry.threadId)
+  }
+
   function reap(entry: PreTurnEntry): void {
     entry.reapTimer = null
     if (entry.consumed) return
     entry.consumed = true
     // Stop the forever-running typing loop and finalize the frozen card.
-    deps.stopTypingLoop(entry.chatId, entry.threadId)
+    stopTypingUnlessTurnLive(entry, 'orphan reap')
     if (entry.activityMessageId != null) {
       const record: PreTurnCardRecord = {
         turnKey: entry.syntheticTurnKey,
@@ -347,11 +381,31 @@ export function createHandbackPreturnSignal(
       if (chatId == null || chatId === '') return
       const threadId = inbound.threadId ?? null
       const adoptTurnId = deps.deriveTurnId(chatId, threadId, inbound.messageId)
-      if (adoptTurnId == null) return // no stable identity → can't be adopted
-      const statusKey = deps.chatKey(chatId, threadId)
+      // Observability (#3544): one line per handback RELEASE — the event that
+      // was previously invisible in the gateway log (zero `subagent_handback`
+      // lines were ever captured), so the next occurrence of a dark handback
+      // turn is diagnosable. Bounded by worker completions, not by turn volume.
+      const releaseKey = deps.chatKey(chatId, threadId)
+      if (adoptTurnId == null) {
+        log(`handback-preturn-signal: release key=${releaseKey} armed=no (no derivable turnId)\n`)
+        return // no stable identity → can't be adopted
+      }
+      const statusKey = releaseKey
       // Dedupe: a live entry already covers this topic (e.g. two handbacks for
       // the same topic released together — the first owns the pre-turn signal).
-      if (byKey.has(statusKey)) return
+      if (byKey.has(statusKey)) {
+        // NOT a dark turn any more: the enqueue seam arms the typing loop
+        // unconditionally for every minted turn (#3544), so a deduped handback
+        // still lights up — it just doesn't own the pre-turn card.
+        log(
+          `handback-preturn-signal: release key=${statusKey} turnId=${adoptTurnId} ` +
+            `armed=no (deduped: topic already has a live pre-turn entry)\n`,
+        )
+        return
+      }
+      log(
+        `handback-preturn-signal: release key=${statusKey} turnId=${adoptTurnId} armed=yes\n`,
+      )
       const startedAt = now()
       const syntheticTurnKey = `${PRETURN_TURNKEY_PREFIX}${statusKey}:${startedAt}`
       const entry: PreTurnEntry = {
@@ -423,7 +477,7 @@ export function createHandbackPreturnSignal(
       const entry = byKey.get(statusKey)
       if (entry == null) return
       entry.consumed = true
-      deps.stopTypingLoop(entry.chatId, entry.threadId)
+      stopTypingUnlessTurnLive(entry, 'reaped record')
       dropEntry(entry)
     },
 

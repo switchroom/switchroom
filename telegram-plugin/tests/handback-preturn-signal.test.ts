@@ -333,6 +333,68 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     expect(h.openCard).toHaveBeenCalledTimes(1)
   })
 
+  // ── #3544 ──────────────────────────────────────────────────────────────
+  // The 30 s orphan reap used to call `stopTypingLoop` unconditionally. That
+  // loop is keyed on (chat, thread), NOT on this seam's entry — so a handback
+  // turn still composing at 30 s had its indicator killed mid-turn, and nothing
+  // re-armed it. Outcome assertion: chat actions are still landing at 45 s.
+  it('#3544 — the orphan reap keeps typing alive when a real turn is live on the key (still emitting at 45s)', async () => {
+    vi.useFakeTimers()
+    try {
+      const liveKeys = new Set<string>()
+      const h = makeHarness({ hasLiveTurn: (k) => liveKeys.has(k) })
+      h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatH', messageId: 900 }))
+      await h.sched.advance(700) // debounce fires: typing armed, card painted
+      expect(h.typing.activeCount()).toBe(1)
+
+      // The handback's turn mints and is composing (a long one — worker results
+      // to read, a reply to write).
+      liveKeys.add('chatH:_')
+      const beforeReap = h.sendChatAction.mock.calls.length
+
+      await h.sched.advance(30_000) // the age-based orphan reap fires
+      // Pre-#3544 this was 0 and the chat went dark for the rest of the turn.
+      expect(h.typing.activeCount()).toBe(1)
+
+      // …and it is genuinely still EMITTING (not merely registered) at 45 s.
+      vi.advanceTimersByTime(15_000) // 15 s of the loop's 4 s refresh
+      expect(h.sendChatAction.mock.calls.length).toBeGreaterThan(beforeReap + 2)
+      expect(h.sendChatAction).toHaveBeenLastCalledWith('chatH', null)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('#3544 — the orphan reap still stops typing when NO turn is live (no leaked interval)', async () => {
+    const h = makeHarness({ hasLiveTurn: () => false })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatI', messageId: 901 }))
+    await h.sched.advance(700)
+    expect(h.typing.activeCount()).toBe(1)
+    await h.sched.advance(30_000)
+    expect(h.typing.activeCount()).toBe(0)
+    expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  it('#3544 — handleReaped keeps typing alive for a live turn, stops it otherwise', async () => {
+    const liveKeys = new Set<string>()
+    const h = makeHarness({ hasLiveTurn: (k) => liveKeys.has(k) })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatJ', messageId: 902 }))
+    await h.sched.advance(700)
+    const syntheticKey = [...h.records.keys()][0]!
+    expect(syntheticKey.startsWith(PRETURN_TURNKEY_PREFIX)).toBe(true)
+    liveKeys.add('chatJ:_')
+    h.signal.handleReaped(syntheticKey)
+    expect(h.typing.activeCount()).toBe(1) // live turn owns the stop
+    expect(h.signal.pendingCount()).toBe(0) // entry still dropped
+
+    // Same hook with no live turn DOES stop the loop.
+    const h2 = makeHarness({ hasLiveTurn: () => false })
+    h2.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatK', messageId: 903 }))
+    await h2.sched.advance(700)
+    h2.signal.handleReaped([...h2.records.keys()][0]!)
+    expect(h2.typing.activeCount()).toBe(0)
+  })
+
   it('skips the emit when the adopting turn already settled before the debounce fires', async () => {
     const settled = new Set<string>()
     const h = makeHarness({ isTurnSettled: (k) => settled.has(k) })
