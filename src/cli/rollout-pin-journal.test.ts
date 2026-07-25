@@ -8,7 +8,7 @@
  * failed on the original bug.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   mkdtempSync,
   writeFileSync,
@@ -23,6 +23,38 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+/**
+ * `pinJournalDir` has THREE precedence rules and rule 1
+ * (`SWITCHROOM_PIN_JOURNAL_DIR`) short-circuits the other two. Most tests here
+ * are about journal SEMANTICS, not about where the directory came from, so
+ * they take rule 1 via the `beforeEach` below.
+ *
+ * The tests that are specifically about *where the journal lives* — the ones
+ * that assert "never beside the config", which is THE production defect — must
+ * NOT take rule 1, or they assert nothing: with the env var set they pass
+ * verbatim against the pre-fix `dirname(resolve(configPath))` implementation.
+ * They delete the env var and drive rule 3 instead, which needs `homedir()`
+ * pointed somewhere hermetic. Hence this mock: `fakeHome` is null for every
+ * test that doesn't opt in, so the real `homedir()` is used and nothing else
+ * changes shape.
+ */
+let fakeHome: string | null = null;
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, homedir: () => fakeHome ?? actual.homedir() };
+});
+
+/**
+ * Opt a test out of rule 1 and into rules 2/3: clear the override and give
+ * `homedir()` a tmpdir. Returns the durable state dir rule 3 will land on.
+ */
+function useFakeHomeStateDir(): string {
+  delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+  fakeHome = mkdtempSync(join(tmpdir(), "pin-journal-home-"));
+  return join(fakeHome, ".switchroom");
+}
 import {
   pinJournalDir,
   pinJournalPath,
@@ -64,6 +96,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+  fakeHome = null;
 });
 
 function mkConfig(text = CONFIG): string {
@@ -73,7 +106,14 @@ function mkConfig(text = CONFIG): string {
   return p;
 }
 
-/** Simulate the production persistPin: journal, then write the new pin. */
+/**
+ * ARRANGE a config into the mid-persist state: journal on disk, new pin
+ * written. This is a fixture, NOT a stand-in for production `persistPin` —
+ * nothing here asserts that `rollout.ts` wires the two calls in this order, and
+ * a test that read it that way would be a false green. That wiring is asserted
+ * against the real `createRolloutDeps` in rollout.test.ts ("createRolloutDeps'
+ * persistPin JOURNALS to disk before it writes the pin").
+ */
 function provisionallyPersist(configPath: string, pin: string): void {
   const before = readFileSync(configPath, "utf8");
   beginPinPersist(configPath, pin);
@@ -103,15 +143,43 @@ describe("pin journal — the journal must outlive the container that wrote it",
     // journal landed somewhere that exists nowhere on the host and dies with
     // the container — making hostd-boot crash recovery dead code on exactly
     // the path this module targets.
-    const cfg = mkConfig();
+    //
+    // Rule 1 (`SWITCHROOM_PIN_JOURNAL_DIR`) is deliberately NOT used here: it
+    // short-circuits `pinJournalDir` before the rules that ARE the fix, so
+    // with it set this test passes verbatim against the pre-fix
+    // `dirname(resolve(configPath))`. Rule 3 (`<homedir()>/.switchroom`) is
+    // what hostd actually takes, so that is what is exercised.
+    const durable = useFakeHomeStateDir();
+    const cfg = mkConfig(); // a plain tmpdir — NOT named `.switchroom`, so rule 2 misses
     provisionallyPersist(cfg, "v0.19.4");
 
     const p = pinJournalPath(cfg);
-    expect(dirname(p)).toBe(stateDir); // the durable, directory-bind-mounted dir
+    expect(dirname(p)).toBe(durable); // the durable, directory-bind-mounted dir
     expect(dirname(p)).not.toBe(dirname(cfg)); // NOT the config's (ephemeral) dir
     expect(existsSync(p)).toBe(true);
     // Nothing at all was dropped next to the config.
     expect(readdirSync(dirname(cfg))).toEqual(["switchroom.yaml"]);
+  });
+
+  it("takes the config's own dir ONLY when it is itself a .switchroom dir", () => {
+    // Rule 2, the host-shell case. `~/.switchroom/switchroom.yaml` — here the
+    // config's directory IS the durable state dir, so co-locating is correct
+    // and sudo's `HOME` policy stops mattering. This is the one case where
+    // "beside the config" is the right answer, and pinning it is what stops a
+    // future rewrite from collapsing rules 2 and 3 into "always homedir".
+    const durable = useFakeHomeStateDir();
+    const opHome = mkdtempSync(join(tmpdir(), "pin-journal-ophome-"));
+    const opState = join(opHome, ".switchroom");
+    mkdirSync(opState);
+    const cfg = join(opState, "switchroom.yaml");
+    writeFileSync(cfg, CONFIG, "utf8");
+
+    provisionallyPersist(cfg, "v0.19.4");
+
+    expect(dirname(pinJournalPath(cfg))).toBe(opState);
+    // …and NOT the `homedir()` fallback, which is a different directory here.
+    expect(dirname(pinJournalPath(cfg))).not.toBe(durable);
+    expect(existsSync(pinJournalPath(cfg))).toBe(true);
   });
 
   it("recovery still finds the journal after a container recreate wipes the config's directory", () => {
@@ -120,6 +188,12 @@ describe("pin journal — the journal must outlive the container that wrote it",
     // `/state/config` the DIRECTORY is a fresh overlay: the file is remounted,
     // anything else written there is gone. Modelled with a symlink into a
     // separate "container view" directory that gets emptied.
+    //
+    // Rule 1 is cleared for the same reason as the test above: with the env
+    // override in place the journal lands in a tmpdir that the simulated
+    // recreate never touches, so the scenario passes against the very bug it
+    // is written to catch. Rule 3 is the one hostd takes.
+    useFakeHomeStateDir();
     const real = mkConfig();
     const viewDir = mkdtempSync(join(tmpdir(), "pin-journal-view-"));
     const viewPath = join(viewDir, "switchroom.yaml");
@@ -214,6 +288,31 @@ describe("pin journal — two writers must not share one journal", () => {
     // The first roll's journal is intact, so ITS revert still works.
     expect(readPinJournal(cfg)?.pin).toBe("v0.19.4");
     expect(readPinJournal(cfg)?.priorPin).toBe("v0.19.3");
+  });
+
+  it("does NOT exclude the hostd/host-shell pair — that is the fleet lock's job", () => {
+    // The limitation, pinned so the module header cannot drift back into
+    // claiming "two rolls against the same config path cannot interleave".
+    // The gate is keyed by journal path, i.e. by config-path STRING. The only
+    // two contending writers in this system reach the SAME physical file
+    // through two different strings (`cli/hostd.ts` bind-mounts
+    // `~/.switchroom/switchroom.yaml` onto `/state/config/switchroom.yaml`), so
+    // both begins succeed and the gate never fires between them.
+    const dir = mkdtempSync(join(tmpdir(), "pin-journal-pair-"));
+    const asShell = join(dir, "switchroom.yaml");
+    writeFileSync(asShell, CONFIG, "utf8");
+    const asHostd = join(dir, "state-config.yaml");
+    symlinkSync(asShell, asHostd);
+
+    const a = beginPinPersist(asShell, "v0.19.4"); // live writer: this process
+    // Same file, other path. If exclusivity spanned the pair this would throw.
+    expect(() => beginPinPersist(asHostd, "v0.19.5")).not.toThrow();
+    // Two live journals against one file, each intact and each correct about
+    // its OWN write — which is what keeps the dangerous failure (a cross-roll
+    // revert) impossible even though the benign one is not prevented here.
+    expect(readPinJournal(asShell)?.pin).toBe(a.pin);
+    expect(readPinJournal(asHostd)?.pin).toBe("v0.19.5");
+    expect(pinJournalPath(asShell)).not.toBe(pinJournalPath(asHostd));
   });
 
   it("overwrites (with a warning) a journal whose writer is gone", () => {

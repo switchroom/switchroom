@@ -666,6 +666,16 @@ export function executeRollout(
    * Single exit point for every stop-the-roll failure. Reverting the pin
    * here (rather than at each `return`) is what makes the guarantee
    * structural: a future failure branch cannot forget to revert.
+   *
+   * "Every" is load-bearing and was once false. A step that THREW — the
+   * documented behaviour of `beginPinPersist` when a live roll already holds
+   * the journal — bypassed this entirely: the exception escaped the executor
+   * and the commander action, so `encodeRolloutResultLine` never ran and hostd
+   * fell to its no-sentinel branch (`result: "error"`, no `rolled`, no
+   * `failedStep`) on a path where the canary and every earlier agent had
+   * already restarted. The step loop below is therefore wrapped in a try/catch
+   * that routes a throw through here; see that catch for which throws do and
+   * do NOT revert.
    */
   const fail = (partial: Omit<RolloutResult, "ok" | "rolled" | "warnings">): RolloutResult => {
     let pinReverted = false;
@@ -708,354 +718,398 @@ export function executeRollout(
     };
   };
 
-  for (const step of steps) {
-    switch (step.kind) {
-      case "persist-pin": {
-        // On the hostd path this runs AFTER the canary is green; on the
-        // host-shell path it runs FIRST. Either way: durably persist so
-        // subsequent reconciles read the same pin.
-        deps.log(`ROLL_STEP persist-pin — release.pin=${step.pin} to switchroom.yaml`);
-        if (deps.persistPin) {
-          deps.persistPin(step.pin);
-          // Provisional from here on: `fail()` reverts it, and the success
-          // path below commits it. Set AFTER the call so a throwing
-          // persistPin doesn't leave us claiming a write that never landed.
-          pinPersisted = true;
-        } else {
-          warnings.push(`persist-pin requested but no persist hook wired; pin NOT durable`);
-        }
-        emit({ phase: "persist-pin", target });
-        break;
-      }
-      case "apply": {
-        // hostd path: pin not yet persisted (it follows the canary), so
-        // pass the one-shot --pin so compose regenerates on the target.
-        // host-shell path: pin already persisted → bare apply reads it.
-        //
-        // On the hostd path we ALSO pass `--compose-only --non-interactive`.
-        // A version roll only needs the compose regenerated with the new
-        // image tags plus compose-level env (SWITCHROOM_VOICE_ENGINE) and the
-        // sidecar healthcheck — all emitted by generateCompose(), which
-        // `--compose-only` still runs. What `--compose-only` skips is the
-        // per-agent SCAFFOLD loop (start.sh / .mcp.json / settings.json).
-        // Under docker mode (v0.7+) per-agent state dirs are mode 0700 owned
-        // by per-agent UIDs; hostd runs unprivileged and cannot write into
-        // them, so a FULL apply fails scaffold for every agent, returns
-        // non-zero, and aborts the whole roll having rolled nothing (every
-        // historical hostd rollout in the audit log: failedStep "apply",
-        // rolled []). Skipping scaffold lets the roll actually complete.
-        deps.log(`ROLL_STEP apply — regenerating compose for ${target}`);
-        emit({ phase: "apply", target });
-        const applyArgs = execOpts.hostdContext
-          ? ["apply", "--pin", target, "--compose-only", "--non-interactive"]
-          : ["apply"];
-        const r = deps.run(applyArgs);
-        if (r.status !== 0) {
-          if (r.timedOut) {
-            deps.log(`  ✗ apply TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms — STOPPING`);
-            warnings.push(
-              `apply exceeded its ${ROLLOUT_RUN_TIMEOUT_MS}ms timeout and was ` +
-                `killed. The roll stopped cleanly rather than hanging.`,
-            );
+  /**
+   * The step currently executing, for the catch below. A throw carries no
+   * step context of its own, and `failedStep` is the field hostd's status row
+   * and the operator narration key off.
+   */
+  let currentStep: RolloutStep | undefined;
+
+  try {
+    for (const step of steps) {
+      currentStep = step;
+      switch (step.kind) {
+        case "persist-pin": {
+          // On the hostd path this runs AFTER the canary is green; on the
+          // host-shell path it runs FIRST. Either way: durably persist so
+          // subsequent reconciles read the same pin.
+          deps.log(`ROLL_STEP persist-pin — release.pin=${step.pin} to switchroom.yaml`);
+          if (deps.persistPin) {
+            deps.persistPin(step.pin);
+            // Provisional from here on: `fail()` reverts it, and the success
+            // path below commits it. Set AFTER the call so a throwing
+            // persistPin doesn't leave us claiming a write that never landed.
+            pinPersisted = true;
+          } else {
+            warnings.push(`persist-pin requested but no persist hook wired; pin NOT durable`);
           }
-          return fail({ failedStep: "apply", ...(r.timedOut ? { timedOut: true } : {}) });
+          emit({ phase: "persist-pin", target });
+          break;
         }
-        if (execOpts.hostdContext) {
-          // SURFACED (not hidden): --compose-only skipped the host-side
-          // per-agent scaffold loop (hostd is unprivileged and cannot write
-          // per-agent state dirs). This is NOT left stale: the per-agent
-          // restart-reconcile that follows for every agent in this roll
-          // refreshes each agent's own templates (start.sh / .mcp.json /
-          // settings.json) from inside its own container on restart. So a
-          // version roll picks up template changes automatically — no
-          // agent-run apply, and no manual host apply, is required here.
-          // A host-side `sudo switchroom apply` is only for STRUCTURAL
-          // changes (new-agent scaffolding / compose regeneration), not for
-          // per-agent template refresh on a roll.
-          warnings.push(
-            `apply ran --compose-only (hostd is unprivileged and cannot ` +
-              `write per-agent state dirs). Compose + compose-level env/` +
-              `healthcheck are up to date; per-agent template changes ` +
-              `(start.sh / .mcp.json / settings.json) are refreshed ` +
-              `automatically by each agent's restart-reconcile in this roll. ` +
-              `A host-side \`sudo switchroom apply\` is only needed for ` +
-              `structural changes (new agents / compose regeneration).`,
-          );
-        }
-        break;
-      }
-      case "restart-agent": {
-        deps.log(`ROLL_STEP restart-agent — ${step.agent} (--wait --force)`);
-        agentIndex += 1;
-        const isCanary = agentIndex === 1;
-        // The first agent restarted is the sanctioned canary gate
-        // (stop-on-first-mismatch). Narrate its start/pass/fail distinctly so
-        // the operator sees the canary decision, not just "agent 1/N".
-        emit(
-          isCanary
-            ? { phase: "canary-start", target, agent: step.agent, n: agentIndex, m: totalAgents }
-            : { phase: "agent-start", target, agent: step.agent, n: agentIndex, m: totalAgents },
-        );
-        // `agent restart` can exit 0 while still "polling" on boot — do
-        // NOT trust its status; the version assert is the real gate.
-        //
-        // hostd path: pass --pin <target> so the compose regeneration step
-        // inside `agent restart` uses the target image tag. Without this,
-        // `reconcileAndRestartAgent` re-reads the stale `release.pin` from
-        // config and overwrites the correct compose that `apply --pin` just
-        // wrote — putting the canary/agent on the old image (#2558). On the
-        // host-shell path the pin is already persisted before `apply` runs,
-        // so bare restart reads the correct pin from config; passing --pin
-        // there is harmless but unnecessary.
-        const restartArgs = execOpts.hostdContext
-          ? ["agent", "restart", step.agent, "--wait", "--force", "--pin", target]
-          : ["agent", "restart", step.agent, "--wait", "--force"];
-        // #3333 amendment C — staged canary rollout of the scoped ownership
-        // sweep. The reconcile sweep runs INSIDE this spawned `switchroom
-        // agent restart` process, so injecting the scoped-sweep env into the
-        // canary spawn ONLY (and reading it at the sweep site) flips exactly
-        // one agent per roll — the first-restarted canary. A global/container
-        // boot env would flip every agent at once and defeat the canary gate.
-        // Verify on the roll: the canary's restart-time collapse (scope=scoped
-        // in its `[ownership-sweep] #3333` log) with no approval-card storm,
-        // before the default is flipped ON (stage 5).
-        const restartRes = deps.run(
-          restartArgs,
-          isCanary ? { env: { [SCOPED_SWEEP_ENV]: "1" } } : undefined,
-        );
-        if (restartRes.timedOut) {
-          // A wedged container is precisely the case a roll exists to fix.
-          // Report it as a bounded, structural failure instead of letting the
-          // executor (and hostd's fleet-mutation latch) hang forever.
+        case "apply": {
+          // hostd path: pin not yet persisted (it follows the canary), so
+          // pass the one-shot --pin so compose regenerates on the target.
+          // host-shell path: pin already persisted → bare apply reads it.
           //
-          // STOP THE ROLL — do NOT fall through to the version probe. A
-          // timeout here means the `switchroom agent restart` CLI was
-          // SIGKILLed mid-flight, and a SIGKILL reaps only the direct child
-          // (see ROLLOUT_KILL_SIGNAL): its `docker compose up -d` grandchild
-          // can still be live, still rewriting the compose file. Two things
-          // follow, and both are silent if we continue:
-          //   1. the orphan may well have brought the container up on the
-          //      target tag, so the probe PASSES (`got === targetNorm`) and
-          //      the roll reports success — while everything the CLI does
-          //      AFTER the container starts (the post-start reconcile and the
-          //      #3333 scoped ownership sweep injected via SCOPED_SWEEP_ENV
-          //      on the canary) was killed and never ran. A half-applied
-          //      agent reported as fully rolled.
-          //   2. proceeding restarts the NEXT agent while that orphan is
-          //      still mutating containers and the shared compose file — the
-          //      exact race ROLLOUT_KILL_SIGNAL's note names.
-          // A passing probe is evidence the container came up; it is NOT
-          // evidence the restart COMPLETED. Fail closed: the operator is told
-          // to check for stray docker processes before re-running, which is
-          // only coherent if the roll actually stopped.
-          warnings.push(
-            `\`agent restart ${step.agent}\` exceeded its ` +
-              `${ROLLOUT_RUN_TIMEOUT_MS}ms timeout and was killed — the ` +
-              `container is likely wedged. The roll stopped cleanly rather ` +
-              `than hanging.`,
-          );
-          const gotAfterKill = deps.probeVersion(step.agent);
-          if (gotAfterKill !== null && normalizeVersion(gotAfterKill) === targetNorm) {
+          // On the hostd path we ALSO pass `--compose-only --non-interactive`.
+          // A version roll only needs the compose regenerated with the new
+          // image tags plus compose-level env (SWITCHROOM_VOICE_ENGINE) and the
+          // sidecar healthcheck — all emitted by generateCompose(), which
+          // `--compose-only` still runs. What `--compose-only` skips is the
+          // per-agent SCAFFOLD loop (start.sh / .mcp.json / settings.json).
+          // Under docker mode (v0.7+) per-agent state dirs are mode 0700 owned
+          // by per-agent UIDs; hostd runs unprivileged and cannot write into
+          // them, so a FULL apply fails scaffold for every agent, returns
+          // non-zero, and aborts the whole roll having rolled nothing (every
+          // historical hostd rollout in the audit log: failedStep "apply",
+          // rolled []). Skipping scaffold lets the roll actually complete.
+          deps.log(`ROLL_STEP apply — regenerating compose for ${target}`);
+          emit({ phase: "apply", target });
+          const applyArgs = execOpts.hostdContext
+            ? ["apply", "--pin", target, "--compose-only", "--non-interactive"]
+            : ["apply"];
+          const r = deps.run(applyArgs);
+          if (r.status !== 0) {
+            if (r.timedOut) {
+              deps.log(`  ✗ apply TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms — STOPPING`);
+              warnings.push(
+                `apply exceeded its ${ROLLOUT_RUN_TIMEOUT_MS}ms timeout and was ` +
+                  `killed. The roll stopped cleanly rather than hanging.`,
+              );
+            }
+            return fail({ failedStep: "apply", ...(r.timedOut ? { timedOut: true } : {}) });
+          }
+          if (execOpts.hostdContext) {
+            // SURFACED (not hidden): --compose-only skipped the host-side
+            // per-agent scaffold loop (hostd is unprivileged and cannot write
+            // per-agent state dirs). This is NOT left stale: the per-agent
+            // restart-reconcile that follows for every agent in this roll
+            // refreshes each agent's own templates (start.sh / .mcp.json /
+            // settings.json) from inside its own container on restart. So a
+            // version roll picks up template changes automatically — no
+            // agent-run apply, and no manual host apply, is required here.
+            // A host-side `sudo switchroom apply` is only for STRUCTURAL
+            // changes (new-agent scaffolding / compose regeneration), not for
+            // per-agent template refresh on a roll.
             warnings.push(
-              `${step.agent} is reporting ${gotAfterKill} (the roll target) ` +
-                `despite the killed restart — its orphaned \`docker compose\` ` +
-                `grandchild most likely finished the container start. The ` +
-                `restart's POST-start work (reconcile / ownership sweep) was ` +
-                `killed with the CLI and did NOT run, so this agent is ` +
-                `HALF-APPLIED, not rolled. Check for stray docker processes ` +
-                `host-side, then re-run.`,
+              `apply ran --compose-only (hostd is unprivileged and cannot ` +
+                `write per-agent state dirs). Compose + compose-level env/` +
+                `healthcheck are up to date; per-agent template changes ` +
+                `(start.sh / .mcp.json / settings.json) are refreshed ` +
+                `automatically by each agent's restart-reconcile in this roll. ` +
+                `A host-side \`sudo switchroom apply\` is only needed for ` +
+                `structural changes (new agents / compose regeneration).`,
             );
           }
-          deps.log(
-            `  ✗ ${step.agent} → restart TIMED OUT (killed after ` +
-              `${ROLLOUT_RUN_TIMEOUT_MS}ms; probe says ` +
-              `${gotAfterKill ?? "<unreachable>"}) — STOPPING`,
-          );
+          break;
+        }
+        case "restart-agent": {
+          deps.log(`ROLL_STEP restart-agent — ${step.agent} (--wait --force)`);
+          agentIndex += 1;
+          const isCanary = agentIndex === 1;
+          // The first agent restarted is the sanctioned canary gate
+          // (stop-on-first-mismatch). Narrate its start/pass/fail distinctly so
+          // the operator sees the canary decision, not just "agent 1/N".
           emit(
             isCanary
-              ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
-              : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+              ? { phase: "canary-start", target, agent: step.agent, n: agentIndex, m: totalAgents }
+              : { phase: "agent-start", target, agent: step.agent, n: agentIndex, m: totalAgents },
           );
-          // Through `fail()`, not a bare literal: this branch is a
-          // stop-the-roll failure like any other, and by the time a restart
-          // can time out the `persist-pin` step has already written the
-          // provisional durable pin. Returning directly would leave
-          // `release.pin` naming the build that just wedged a container —
-          // which every later restart/reconcile/`compose up` would then
-          // converge the rest of the fleet onto. The single exit point is
-          // what makes that guarantee structural rather than remembered.
-          return fail({
-            failedStep: "restart-agent",
-            failedAgent: step.agent,
-            got: gotAfterKill,
-            timedOut: true,
-          });
-        }
-        const got = deps.probeVersion(step.agent);
-        if (got === null || normalizeVersion(got) !== targetNorm) {
-          deps.log(`  ✗ ${step.agent} → ${got ?? "<unreachable>"} (expected ${target}) — STOPPING`);
-          // A failed canary is the gate that stops the whole roll; a
-          // failed non-canary is a per-agent stop. Narrate both distinctly.
+          // `agent restart` can exit 0 while still "polling" on boot — do
+          // NOT trust its status; the version assert is the real gate.
+          //
+          // hostd path: pass --pin <target> so the compose regeneration step
+          // inside `agent restart` uses the target image tag. Without this,
+          // `reconcileAndRestartAgent` re-reads the stale `release.pin` from
+          // config and overwrites the correct compose that `apply --pin` just
+          // wrote — putting the canary/agent on the old image (#2558). On the
+          // host-shell path the pin is already persisted before `apply` runs,
+          // so bare restart reads the correct pin from config; passing --pin
+          // there is harmless but unnecessary.
+          const restartArgs = execOpts.hostdContext
+            ? ["agent", "restart", step.agent, "--wait", "--force", "--pin", target]
+            : ["agent", "restart", step.agent, "--wait", "--force"];
+          // #3333 amendment C — staged canary rollout of the scoped ownership
+          // sweep. The reconcile sweep runs INSIDE this spawned `switchroom
+          // agent restart` process, so injecting the scoped-sweep env into the
+          // canary spawn ONLY (and reading it at the sweep site) flips exactly
+          // one agent per roll — the first-restarted canary. A global/container
+          // boot env would flip every agent at once and defeat the canary gate.
+          // Verify on the roll: the canary's restart-time collapse (scope=scoped
+          // in its `[ownership-sweep] #3333` log) with no approval-card storm,
+          // before the default is flipped ON (stage 5).
+          const restartRes = deps.run(
+            restartArgs,
+            isCanary ? { env: { [SCOPED_SWEEP_ENV]: "1" } } : undefined,
+          );
+          if (restartRes.timedOut) {
+            // A wedged container is precisely the case a roll exists to fix.
+            // Report it as a bounded, structural failure instead of letting the
+            // executor (and hostd's fleet-mutation latch) hang forever.
+            //
+            // STOP THE ROLL — do NOT fall through to the version probe. A
+            // timeout here means the `switchroom agent restart` CLI was
+            // SIGKILLed mid-flight, and a SIGKILL reaps only the direct child
+            // (see ROLLOUT_KILL_SIGNAL): its `docker compose up -d` grandchild
+            // can still be live, still rewriting the compose file. Two things
+            // follow, and both are silent if we continue:
+            //   1. the orphan may well have brought the container up on the
+            //      target tag, so the probe PASSES (`got === targetNorm`) and
+            //      the roll reports success — while everything the CLI does
+            //      AFTER the container starts (the post-start reconcile and the
+            //      #3333 scoped ownership sweep injected via SCOPED_SWEEP_ENV
+            //      on the canary) was killed and never ran. A half-applied
+            //      agent reported as fully rolled.
+            //   2. proceeding restarts the NEXT agent while that orphan is
+            //      still mutating containers and the shared compose file — the
+            //      exact race ROLLOUT_KILL_SIGNAL's note names.
+            // A passing probe is evidence the container came up; it is NOT
+            // evidence the restart COMPLETED. Fail closed: the operator is told
+            // to check for stray docker processes before re-running, which is
+            // only coherent if the roll actually stopped.
+            warnings.push(
+              `\`agent restart ${step.agent}\` exceeded its ` +
+                `${ROLLOUT_RUN_TIMEOUT_MS}ms timeout and was killed — the ` +
+                `container is likely wedged. The roll stopped cleanly rather ` +
+                `than hanging.`,
+            );
+            const gotAfterKill = deps.probeVersion(step.agent);
+            if (gotAfterKill !== null && normalizeVersion(gotAfterKill) === targetNorm) {
+              warnings.push(
+                `${step.agent} is reporting ${gotAfterKill} (the roll target) ` +
+                  `despite the killed restart — its orphaned \`docker compose\` ` +
+                  `grandchild most likely finished the container start. The ` +
+                  `restart's POST-start work (reconcile / ownership sweep) was ` +
+                  `killed with the CLI and did NOT run, so this agent is ` +
+                  `HALF-APPLIED, not rolled. Check for stray docker processes ` +
+                  `host-side, then re-run.`,
+              );
+            }
+            deps.log(
+              `  ✗ ${step.agent} → restart TIMED OUT (killed after ` +
+                `${ROLLOUT_RUN_TIMEOUT_MS}ms; probe says ` +
+                `${gotAfterKill ?? "<unreachable>"}) — STOPPING`,
+            );
+            emit(
+              isCanary
+                ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
+                : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+            );
+            // Through `fail()`, not a bare literal: this branch is a
+            // stop-the-roll failure like any other, and by the time a restart
+            // can time out the `persist-pin` step has already written the
+            // provisional durable pin. Returning directly would leave
+            // `release.pin` naming the build that just wedged a container —
+            // which every later restart/reconcile/`compose up` would then
+            // converge the rest of the fleet onto. The single exit point is
+            // what makes that guarantee structural rather than remembered.
+            return fail({
+              failedStep: "restart-agent",
+              failedAgent: step.agent,
+              got: gotAfterKill,
+              timedOut: true,
+            });
+          }
+          const got = deps.probeVersion(step.agent);
+          if (got === null || normalizeVersion(got) !== targetNorm) {
+            deps.log(`  ✗ ${step.agent} → ${got ?? "<unreachable>"} (expected ${target}) — STOPPING`);
+            // A failed canary is the gate that stops the whole roll; a
+            // failed non-canary is a per-agent stop. Narrate both distinctly.
+            emit(
+              isCanary
+                ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
+                : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+            );
+            return fail({
+              failedStep: "restart-agent",
+              failedAgent: step.agent,
+              got,
+              // No `timedOut` here by construction: the timeout branch above
+              // returns unconditionally, so reaching this point means the
+              // restart exited on its own and the VERSION ASSERT is what
+              // failed. Keeping the two failure shapes disjoint is what lets
+              // hostd (and `get_status`) distinguish "killed mid-flight,
+              // grandchildren may be live" from "ran to completion, wrong
+              // version" — they need different operator recovery.
+            });
+          }
+          rolled.push(step.agent);
+          deps.log(`  ✓ ${step.agent} → ${got}`);
           emit(
             isCanary
-              ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
+              ? { phase: "canary-pass", target, agent: step.agent, n: agentIndex, m: totalAgents }
               : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
-          );
-          return fail({
-            failedStep: "restart-agent",
-            failedAgent: step.agent,
-            got,
-            // No `timedOut` here by construction: the timeout branch above
-            // returns unconditionally, so reaching this point means the
-            // restart exited on its own and the VERSION ASSERT is what
-            // failed. Keeping the two failure shapes disjoint is what lets
-            // hostd (and `get_status`) distinguish "killed mid-flight,
-            // grandchildren may be live" from "ran to completion, wrong
-            // version" — they need different operator recovery.
-          });
-        }
-        rolled.push(step.agent);
-        deps.log(`  ✓ ${step.agent} → ${got}`);
-        emit(
-          isCanary
-            ? { phase: "canary-pass", target, agent: step.agent, n: agentIndex, m: totalAgents }
-            : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
-        );
-        break;
-      }
-      case "refresh-web": {
-        // Forward --allow-downgrade on a rollback roll: webd install's
-        // downgrade guard would otherwise guard.skip with exit 0 — agents
-        // roll back but web silently stays on the NEWER tag, no warning.
-        const downgradeArgs = execOpts.allowDowngrade ? ["--allow-downgrade"] : [];
-        deps.log(
-          `ROLL_STEP refresh-web — webd install --tag ${target}` +
-            (execOpts.allowDowngrade ? " --allow-downgrade" : ""),
-        );
-        emit({ phase: "web-refresh", target });
-        const r = deps.run(["webd", "install", "--tag", target, ...downgradeArgs]);
-        if (r.status !== 0) {
-          // A TIMED-OUT refresh is not the same failure as a non-zero exit,
-          // and the difference is operationally load-bearing. `deps.run`
-          // reports both as `status !== 0`, so without this branch a killed
-          // `webd install` produces the generic warning that tells the
-          // operator to re-run it IMMEDIATELY — while the killed CLI's
-          // `docker` grandchildren may still be live and mutating the same
-          // container. That is the same "grandchildren are NOT killed with
-          // it" signal the restart-agent timeout branch surfaces; surface it
-          // here too rather than losing it.
-          warnings.push(
-            r.timedOut
-              ? `web refresh TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms and was ` +
-                  `killed (non-fatal — agents already rolled) so switchroom-web ` +
-                  `is still on the PRIOR version. Its \`docker\` grandchildren ` +
-                  `are NOT killed with it: check for stray docker processes ` +
-                  `host-side BEFORE re-running, then finish it host-side: ` +
-                  `\`switchroom webd install --tag ${target}\`.`
-              : `web refresh FAILED (non-fatal — agents already rolled) so ` +
-                  `switchroom-web is still on the PRIOR version. Finish it ` +
-                  `host-side: \`switchroom webd install --tag ${target}\`.`,
           );
           break;
         }
-        // Belt-and-braces skew check: `webd install` exits 0 on a
-        // downgrade-guard skip (deliberate — deploy-version-guard.ts), so a
-        // zero exit does NOT prove web is on the target. Probe the running
-        // container's image tag and warn LOUDLY on any mismatch.
-        const webTag = deps.webImageTag?.();
-        if (
-          webTag !== undefined &&
-          webTag !== null &&
-          isVersionAssertable(webTag) &&
-          normalizeVersion(webTag) !== targetNorm
-        ) {
-          warnings.push(
-            `web refresh completed but switchroom-web is running ${webTag}, ` +
-              `NOT the roll target ${target} (most likely its downgrade guard ` +
-              `skipped the install). Finish it host-side: \`switchroom webd ` +
-              `install --tag ${target} --allow-downgrade\`.`,
+        case "refresh-web": {
+          // Forward --allow-downgrade on a rollback roll: webd install's
+          // downgrade guard would otherwise guard.skip with exit 0 — agents
+          // roll back but web silently stays on the NEWER tag, no warning.
+          const downgradeArgs = execOpts.allowDowngrade ? ["--allow-downgrade"] : [];
+          deps.log(
+            `ROLL_STEP refresh-web — webd install --tag ${target}` +
+              (execOpts.allowDowngrade ? " --allow-downgrade" : ""),
           );
-        }
-        break;
-      }
-      case "refresh-hostd": {
-        // Same downgrade-guard forwarding as refresh-web (hostd install
-        // shares deploy-version-guard.ts) — a host-shell rollback must not
-        // leave hostd silently on the newer tag.
-        const downgradeArgs = execOpts.allowDowngrade ? ["--allow-downgrade"] : [];
-        deps.log(
-          `ROLL_STEP refresh-hostd — hostd install --tag ${target}` +
-            (execOpts.allowDowngrade ? " --allow-downgrade" : ""),
-        );
-        const r = deps.run(["hostd", "install", "--tag", target, ...downgradeArgs]);
-        // Same timeout-vs-exit distinction as refresh-web above: a killed
-        // `hostd install` leaves live `docker` grandchildren, so the operator
-        // must sweep for strays before re-running it.
-        if (r.status !== 0)
-          warnings.push(
-            r.timedOut
-              ? `hostd refresh TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms and ` +
-                  `was killed (non-fatal; agents already rolled). Its \`docker\` ` +
-                  `grandchildren are NOT killed with it: check for stray docker ` +
-                  `processes host-side BEFORE re-running \`switchroom hostd ` +
-                  `install --tag ${target}\`.`
-              : `hostd refresh failed (non-fatal); agents already rolled`,
-          );
-        break;
-      }
-      case "refresh-hindsight": {
-        // hindsight is a STANDALONE `docker run` on the mutable `:latest`
-        // tag — it is NOT a compose service and does NOT self-heal on a pin
-        // bump, so a roll leaves it pinned to whatever `:latest` resolved to
-        // when it was last recreated (observed: hindsight stuck on claude
-        // 2.1.197 while the fleet moved to 2.1.199). `memory setup --recreate`
-        // pulls the latest hindsight image then recreates the container
-        // (pull → stop → start), reusing the running host ports so
-        // memory.config.url never drifts under the fleet. No-op cleanly when
-        // hindsight isn't installed on this host (guard below also returns
-        // false when docker is unavailable).
-        const hindsightExists = deps.hindsightExists ?? isHindsightContainerExists;
-        if (!hindsightExists()) {
-          deps.log(`ROLL_STEP refresh-hindsight — no hindsight container on this host; skipping`);
+          emit({ phase: "web-refresh", target });
+          const r = deps.run(["webd", "install", "--tag", target, ...downgradeArgs]);
+          if (r.status !== 0) {
+            // A TIMED-OUT refresh is not the same failure as a non-zero exit,
+            // and the difference is operationally load-bearing. `deps.run`
+            // reports both as `status !== 0`, so without this branch a killed
+            // `webd install` produces the generic warning that tells the
+            // operator to re-run it IMMEDIATELY — while the killed CLI's
+            // `docker` grandchildren may still be live and mutating the same
+            // container. That is the same "grandchildren are NOT killed with
+            // it" signal the restart-agent timeout branch surfaces; surface it
+            // here too rather than losing it.
+            warnings.push(
+              r.timedOut
+                ? `web refresh TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms and was ` +
+                    `killed (non-fatal — agents already rolled) so switchroom-web ` +
+                    `is still on the PRIOR version. Its \`docker\` grandchildren ` +
+                    `are NOT killed with it: check for stray docker processes ` +
+                    `host-side BEFORE re-running, then finish it host-side: ` +
+                    `\`switchroom webd install --tag ${target}\`.`
+                : `web refresh FAILED (non-fatal — agents already rolled) so ` +
+                    `switchroom-web is still on the PRIOR version. Finish it ` +
+                    `host-side: \`switchroom webd install --tag ${target}\`.`,
+            );
+            break;
+          }
+          // Belt-and-braces skew check: `webd install` exits 0 on a
+          // downgrade-guard skip (deliberate — deploy-version-guard.ts), so a
+          // zero exit does NOT prove web is on the target. Probe the running
+          // container's image tag and warn LOUDLY on any mismatch.
+          const webTag = deps.webImageTag?.();
+          if (
+            webTag !== undefined &&
+            webTag !== null &&
+            isVersionAssertable(webTag) &&
+            normalizeVersion(webTag) !== targetNorm
+          ) {
+            warnings.push(
+              `web refresh completed but switchroom-web is running ${webTag}, ` +
+                `NOT the roll target ${target} (most likely its downgrade guard ` +
+                `skipped the install). Finish it host-side: \`switchroom webd ` +
+                `install --tag ${target} --allow-downgrade\`.`,
+            );
+          }
           break;
         }
-        // Thread the pinned rollout target through as `--tag <target>` so the
-        // recreate pulls `…switchroom-hindsight:v<target>` — the SAME pinned
-        // image the rest of the fleet moved to — NOT floating `:latest`
-        // (which drifts hindsight off the roll's version; #2752 fix 1).
-        deps.log(
-          `ROLL_STEP refresh-hindsight — memory setup --recreate --tag ${target} (pull ${target} + recreate)`,
-        );
-        const r = deps.run(["memory", "setup", "--recreate", "--tag", target]);
-        if (r.status !== 0) {
-          // FATAL, not a soft warning (#2752 fix 2): `memory setup --recreate`
-          // already did `docker stop && docker rm` before the failing
-          // `startHindsight`, so a failed recreate leaves the fleet with NO
-          // memory backend. Folding that into the generic non-fatal web/hostd
-          // warning while returning ok:true reported success on a fleet whose
-          // memory is DOWN. Stop the roll (same stop-on-failure semantics as a
-          // failed agent restart) and name the manual recovery.
+        case "refresh-hostd": {
+          // Same downgrade-guard forwarding as refresh-web (hostd install
+          // shares deploy-version-guard.ts) — a host-shell rollback must not
+          // leave hostd silently on the newer tag.
+          const downgradeArgs = execOpts.allowDowngrade ? ["--allow-downgrade"] : [];
           deps.log(
-            `  ✗ hindsight recreate FAILED — the memory backend is DOWN (the ` +
-              `recreate stopped + removed the old container before the failed ` +
-              `start). Run \`switchroom memory setup\` to bring it back. — STOPPING`,
+            `ROLL_STEP refresh-hostd — hostd install --tag ${target}` +
+              (execOpts.allowDowngrade ? " --allow-downgrade" : ""),
           );
-          return fail({
-            failedStep: "refresh-hindsight",
-            ...(r.timedOut ? { timedOut: true } : {}),
-          });
+          const r = deps.run(["hostd", "install", "--tag", target, ...downgradeArgs]);
+          // Same timeout-vs-exit distinction as refresh-web above: a killed
+          // `hostd install` leaves live `docker` grandchildren, so the operator
+          // must sweep for strays before re-running it.
+          if (r.status !== 0)
+            warnings.push(
+              r.timedOut
+                ? `hostd refresh TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms and ` +
+                    `was killed (non-fatal; agents already rolled). Its \`docker\` ` +
+                    `grandchildren are NOT killed with it: check for stray docker ` +
+                    `processes host-side BEFORE re-running \`switchroom hostd ` +
+                    `install --tag ${target}\`.`
+                : `hostd refresh failed (non-fatal); agents already rolled`,
+            );
+          break;
         }
-        break;
-      }
-      case "sweep": {
-        deps.log(`ROLL_STEP sweep`);
-        for (const a of rolled) {
-          const v = deps.probeVersion(a);
-          deps.log(`  ${a}: ${v ?? "<unreachable>"}`);
+        case "refresh-hindsight": {
+          // hindsight is a STANDALONE `docker run` on the mutable `:latest`
+          // tag — it is NOT a compose service and does NOT self-heal on a pin
+          // bump, so a roll leaves it pinned to whatever `:latest` resolved to
+          // when it was last recreated (observed: hindsight stuck on claude
+          // 2.1.197 while the fleet moved to 2.1.199). `memory setup --recreate`
+          // pulls the latest hindsight image then recreates the container
+          // (pull → stop → start), reusing the running host ports so
+          // memory.config.url never drifts under the fleet. No-op cleanly when
+          // hindsight isn't installed on this host (guard below also returns
+          // false when docker is unavailable).
+          const hindsightExists = deps.hindsightExists ?? isHindsightContainerExists;
+          if (!hindsightExists()) {
+            deps.log(`ROLL_STEP refresh-hindsight — no hindsight container on this host; skipping`);
+            break;
+          }
+          // Thread the pinned rollout target through as `--tag <target>` so the
+          // recreate pulls `…switchroom-hindsight:v<target>` — the SAME pinned
+          // image the rest of the fleet moved to — NOT floating `:latest`
+          // (which drifts hindsight off the roll's version; #2752 fix 1).
+          deps.log(
+            `ROLL_STEP refresh-hindsight — memory setup --recreate --tag ${target} (pull ${target} + recreate)`,
+          );
+          const r = deps.run(["memory", "setup", "--recreate", "--tag", target]);
+          if (r.status !== 0) {
+            // FATAL, not a soft warning (#2752 fix 2): `memory setup --recreate`
+            // already did `docker stop && docker rm` before the failing
+            // `startHindsight`, so a failed recreate leaves the fleet with NO
+            // memory backend. Folding that into the generic non-fatal web/hostd
+            // warning while returning ok:true reported success on a fleet whose
+            // memory is DOWN. Stop the roll (same stop-on-failure semantics as a
+            // failed agent restart) and name the manual recovery.
+            deps.log(
+              `  ✗ hindsight recreate FAILED — the memory backend is DOWN (the ` +
+                `recreate stopped + removed the old container before the failed ` +
+                `start). Run \`switchroom memory setup\` to bring it back. — STOPPING`,
+            );
+            return fail({
+              failedStep: "refresh-hindsight",
+              ...(r.timedOut ? { timedOut: true } : {}),
+            });
+          }
+          break;
         }
-        break;
+        case "sweep": {
+          deps.log(`ROLL_STEP sweep`);
+          for (const a of rolled) {
+            const v = deps.probeVersion(a);
+            deps.log(`  ${a}: ${v ?? "<unreachable>"}`);
+          }
+          break;
+        }
       }
     }
+  } catch (e) {
+    // A step THREW rather than returning a status. Before this, the throw
+    // escaped `executeRollout`, escaped the commander action, and killed the
+    // process before `encodeRolloutResultLine` ran — so hostd took its
+    // no-sentinel branch and recorded `result: "error"` with no `rolled` /
+    // `failedStep` at all, on a path where (hostd ordering) every agent up to
+    // the failure has ALREADY restarted.
+    //
+    // The concrete source is `beginPinPersist`, which THROWS by contract when
+    // a live roll already holds the journal (rollout-pin-journal.ts). Routing
+    // it here keeps `fail()`'s promise structural: every stop-the-roll
+    // failure, thrown or returned, now RETURNS a RolloutResult and reverts a
+    // provisional pin exactly when one was written. The commander then does
+    // for it what it does for any failed result — the stdout sentinel on the
+    // hostd path, the `✗ Rollout STOPPED at …` narration and exit 1 on the
+    // host shell.
+    //
+    // Note which failures do NOT revert: a `persist-pin` step that threw never
+    // set `pinPersisted`, so `fail()` correctly leaves the journal alone —
+    // reverting on a throw from `beginPinPersist` would revert the OTHER
+    // roll's pin, which is precisely the damage the exclusivity gate exists to
+    // prevent. A throw from the config write AFTER `beginPinPersist` (the
+    // window where the journal exists but `pinPersisted` is still false) is
+    // likewise left to the stale-gated recovery sites, which is safe because
+    // the pin write is the thing that failed.
+    warnings.push(
+      `the ${currentStep?.kind ?? "rollout"} step THREW: ${(e as Error).message}. ` +
+        `The roll stopped and reported the failure instead of dying without a ` +
+        `result.`,
+    );
+    return fail({
+      ...(currentStep ? { failedStep: currentStep.kind } : {}),
+      ...(currentStep?.kind === "restart-agent" ? { failedAgent: currentStep.agent } : {}),
+    });
   }
   // The roll is PROVEN — every agent came back on the target and no fatal
   // step failed. Only now does the provisional pin become durable: commit

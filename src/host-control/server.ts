@@ -64,7 +64,11 @@ import {
   isVersionAssertable,
   type RolloutPhase,
 } from "../cli/rollout.js";
-import { recoverPinJournal } from "../cli/rollout-pin-journal.js";
+import {
+  recoverPinJournal,
+  commitPinPersist,
+  hasPinJournal,
+} from "../cli/rollout-pin-journal.js";
 import { restoreComposeBackup } from "../cli/write-compose.js";
 import { SWITCHROOM_VERSION } from "../cli/resolve-version.js";
 import {
@@ -89,7 +93,7 @@ import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
 import type { RolloutRelay } from "./rollout-relay.js";
 import { renderRolloutStatus } from "./render-rollout-status.js";
-import { loadConfig, resolveAgentsDir } from "../config/loader.js";
+import { loadConfig, resolveAgentsDir, findConfigFile } from "../config/loader.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import {
   collectScheduleEntries,
@@ -650,6 +654,52 @@ interface AutoRolloutLatch {
   reason?: string;
 }
 
+/**
+ * Last-resort config path when neither an explicit `opts.configPath`, nor
+ * `$SWITCHROOM_CONFIG`, nor {@link findConfigFile} can name one. This is the
+ * container path `hostd install` bind-mounts `~/.switchroom/switchroom.yaml`
+ * onto (`src/cli/hostd.ts` — the `:/state/config/switchroom.yaml:rw` mount and
+ * the `SWITCHROOM_CONFIG` it exports alongside it).
+ *
+ * Exported so a test can assert the fallback is the LAST arm, not the first.
+ */
+export const HOSTD_FALLBACK_CONFIG_PATH = "/state/config/switchroom.yaml";
+
+/**
+ * Resolve the live `switchroom.yaml` this daemon reads/writes.
+ *
+ * This MUST agree, string-for-string, with what the rollout child resolves —
+ * the child goes `getConfigPath` → {@link findConfigFile} → `$SWITCHROOM_CONFIG`
+ * (`src/cli/rollout.ts`). It is not merely cosmetic agreement: the pin
+ * journal's FILENAME is a digest of the absolute config path
+ * (`pinJournalPath`, `src/cli/rollout-pin-journal.ts`), so a daemon that
+ * resolves a different string than its child looks for a journal that does not
+ * exist and silently recovers nothing — at boot and on every rollout terminal.
+ * The older `dirname(configPath)` journal scheme degraded to "same directory,
+ * wrong name"; digest keying degrades to "invisible".
+ *
+ * Order:
+ *   1. an explicit `opts.configPath` (tests, and any future embedder);
+ *   2. `$SWITCHROOM_CONFIG` — what `hostd install` exports into the container
+ *      and what the child's `findConfigFile` consults first;
+ *   3. `findConfigFile()` — cwd / `~/.switchroom`, same as the child;
+ *   4. {@link HOSTD_FALLBACK_CONFIG_PATH}, only when 2 and 3 both come up
+ *      empty (a hostd whose config has been deleted out from under it —
+ *      `findConfigFile` THROWS there, and a throw out of a boot path or a
+ *      rollout `.finally()` would be worse than a wrong-but-conventional
+ *      guess).
+ */
+export function resolveHostdConfigPath(explicit?: string): string {
+  if (explicit) return explicit;
+  const env = process.env.SWITCHROOM_CONFIG;
+  if (env && env.trim().length > 0) return resolve(env.trim());
+  try {
+    return findConfigFile();
+  } catch {
+    return HOSTD_FALLBACK_CONFIG_PATH;
+  }
+}
+
 export class HostdServer {
   // One Server per bound socket path. `node:net.Server.listen` can
   // only be called once per instance — to bind N agent sockets we
@@ -790,11 +840,13 @@ export class HostdServer {
   constructor(private opts: ServerOptions) {}
 
   /**
-   * The live `switchroom.yaml` this daemon reads/writes. Mirrors the default
-   * pinned by the config-edit wire schema.
+   * The live `switchroom.yaml` this daemon reads/writes.
+   *
+   * See {@link resolveHostdConfigPath} for why this is NOT a hardcoded
+   * container path.
    */
   private hostdConfigPath(): string {
-    return this.opts.configPath ?? "/state/config/switchroom.yaml";
+    return resolveHostdConfigPath(this.opts.configPath);
   }
 
   /**
@@ -818,7 +870,15 @@ export class HostdServer {
    * success, revert on a clean failure), so this is purely the crash net:
    * SIGKILL / OOM / hostd recreate between the pin write and the terminal.
    * It is a no-op when no journal exists, which is why it's safe to call
-   * unconditionally at boot and on every rollout terminal.
+   * unconditionally at boot.
+   *
+   * NOT safe on every rollout terminal: a roll can succeed and still leave a
+   * journal behind when the child's own commit-unlink fails, and reverting
+   * THERE would roll back a proven pin. The terminal handler therefore routes
+   * a structurally-successful roll to {@link clearProvenRolloutPinJournal}
+   * instead. At BOOT there is no sentinel to consult, so the stale gate
+   * (writer dead / journal aged out) is all we have — which is why a journal
+   * that survives a successful commit must be reported loudly.
    *
    * Never throws — a stranded lock or a failed boot would be worse than the
    * stale pin it's fixing, so failures are reported and swallowed.
@@ -829,6 +889,38 @@ export class HostdServer {
       note = recoverPinJournal(this.hostdConfigPath());
     } catch (e) {
       note = `rollout pin journal recovery threw: ${(e as Error).message}`;
+    }
+    if (note) process.stderr.write(`hostd (${context}): ${note}\n`);
+    return note;
+  }
+
+  /**
+   * The PROVEN-roll counterpart of {@link recoverRolloutPinJournal}: delete a
+   * journal that outlived a roll the child structurally reported as `ok:true`.
+   *
+   * The child already tried this (`commitPin`) and surfaced its failure in the
+   * roll's warnings; this is the second attempt, from a different process,
+   * after the child's file handles are gone. It must NEVER revert: the pin it
+   * would revert is the one the roll just proved. A journal we cannot clear is
+   * reported so the operator can delete it host-side — while it exists, hostd's
+   * BOOT recovery (which has no sentinel to consult) will eventually revert
+   * that proven pin.
+   *
+   * Never throws — same contract as the recovery path it replaces.
+   */
+  private clearProvenRolloutPinJournal(context: string): string | null {
+    let note: string | null = null;
+    try {
+      const configPath = this.hostdConfigPath();
+      if (!hasPinJournal(configPath)) return null;
+      const err = commitPinPersist(configPath);
+      note =
+        err ??
+        `rollout pin journal: cleared a journal that outlived a SUCCESSFUL ` +
+          `roll (the child's own commit did not remove it). release.pin is ` +
+          `correct and was NOT reverted.`;
+    } catch (e) {
+      note = `rollout pin journal: clearing a proven roll's journal threw: ${(e as Error).message}`;
     }
     if (note) process.stderr.write(`hostd (${context}): ${note}\n`);
     return note;
@@ -3983,6 +4075,13 @@ export class HostdServer {
       const phase = parseRolloutPhaseLine(line);
       if (phase) this.onRolloutPhase(entry, phase);
     };
+    // Set ONLY when the child emitted a structured sentinel saying the roll
+    // completed. `entry.result === "completed"` is NOT the same test: the
+    // no-sentinel branch below infers "completed" from a zero exit code, which
+    // is exactly the case where we cannot tell a proven roll from a child that
+    // died quietly. See the `.finally()` below for why the distinction decides
+    // whether a surviving journal is DELETED or ACTED ON.
+    let sentinelProvenOk = false;
     this.runSwitchroom(args, { SWITCHROOM_HOSTD_CONTEXT: "1" }, onLine)
       .then((res) => {
         entry.exit_code = res.exit_code;
@@ -4005,6 +4104,7 @@ export class HostdServer {
           if (parsed.timedOut) entry.timed_out = true;
           // Structured `ok` is the authority; exit code corroborates.
           entry.result = parsed.ok ? "completed" : "error";
+          sentinelProvenOk = parsed.ok === true;
         } else {
           // No sentinel — the child died before finishing (e.g. SIGKILL).
           // Fall back to the exit code; structured fields stay unset so a
@@ -4027,17 +4127,32 @@ export class HostdServer {
         delete entry.prior_pin;
       })
       .finally(() => {
-        // Crash net for the durable pin. The rollout child commits its own
-        // provisional `release.pin` on success and reverts it on a clean
-        // failure, so a journal surviving to the TERMINAL means the child
-        // died in between (SIGKILL / OOM — the `result: "error"` rows with no
-        // sentinel). Reverting here, before the lock is released and before
-        // any other mutation can run, stops the next reconcile from
-        // converging the fleet onto a pin that was never proven. No-op in the
-        // normal case.
-        const pinNote = this.recoverRolloutPinJournal(
-          `rollout terminal ${entry.request_id}`,
-        );
+        // Crash net for the durable pin, GATED ON THE OUTCOME.
+        //
+        // The rollout child commits its own provisional `release.pin` on
+        // success and reverts it on a clean failure, so a journal surviving to
+        // the TERMINAL usually means the child died in between (SIGKILL / OOM).
+        // "Usually" is not "always", and the exception is the dangerous one:
+        // `commitPinPersist` can FAIL to unlink the journal (EIO, a read-only
+        // state dir, or a directory sitting at the journal path) on a roll that
+        // otherwise SUCCEEDED. The child returns ok:true with a warning and
+        // exits 0. Running recovery on that journal — with the child now dead,
+        // so `isJournalWriterAlive` is false — would revert a PROVEN pin to
+        // priorPin while telling the operator the roll succeeded, and every
+        // later reconcile would drag the fleet back to the prior version.
+        //
+        // So: a sentinel that says ok:true means the pin is proven. The
+        // surviving journal is then debris to DELETE, never input to act on.
+        // Everything else (ok:false, no sentinel at all, a rejected promise)
+        // goes through the stale-gated revert. Both run before the lock is
+        // released and before any other mutation can start.
+        const pinNote = sentinelProvenOk
+          ? this.clearProvenRolloutPinJournal(
+              `rollout terminal ${entry.request_id}`,
+            )
+          : this.recoverRolloutPinJournal(
+              `rollout terminal ${entry.request_id}`,
+            );
         if (pinNote) entry.stderr_tail = `${entry.stderr_tail ?? ""}\n${pinNote}`.trim();
         void this.writeTerminalAudit(entry);
         // KEN-131 — unattended (auto-update) roll that FAILED: no operator

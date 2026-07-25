@@ -71,9 +71,35 @@
  * journal. That matters: a shared journal would let a failing roll revert to
  * the OTHER roll's `priorPin` and delete its journal, after which the other
  * roll commits a no-op and reports success while the durable pin names the
- * wrong version. {@link beginPinPersist} additionally refuses to open a second
- * journal for the same config while the first writer is demonstrably alive, so
- * two rolls against the same config path cannot interleave either.
+ * wrong version.
+ *
+ * **What that keying does NOT buy: mutual exclusion between the two writers.**
+ * {@link beginPinPersist} refuses to open a second journal while the first
+ * writer is demonstrably alive, but that gate is keyed by journal path, i.e. by
+ * config-path STRING. The only two contending writers in this system —
+ * hostd (`/state/config/switchroom.yaml`) and a host-shell roll
+ * (`~/.switchroom/switchroom.yaml`) — reach the SAME physical file through that
+ * pair of strings (`cli/hostd.ts` bind-mounts one onto the other), so they get
+ * different journals and the gate can never fire BETWEEN them. It fires only
+ * between two rolls that resolved the same string: two host-shell rolls, or
+ * hostd against itself. Concurrent hostd + host-shell rolls are prevented by
+ * the fleet lock, not by this module; if that lock is bypassed, this module
+ * degrades to "each writer correctly reverts its own uncommitted write" and
+ * offers no ordering guarantee between them.
+ *
+ * Unifying the two is not available: the container path is a bind mount, not a
+ * symlink, so `realpath` returns it unchanged from inside hostd; inode keying
+ * breaks commit/revert, because `writeConfigFileSync` prefers tmp+rename and
+ * REPLACES the inode between {@link beginPinPersist} and
+ * {@link commitPinPersist}; and basename/constant keying collides genuinely
+ * different configs that share a filename (a repo checkout's
+ * `$PWD/switchroom.yaml` journals into `~/.switchroom` under rule 3 of
+ * {@link pinJournalDir}, next to the operator's fleet journal), which
+ * {@link rollbackPinPersist}'s `configPath` mismatch guard cannot tell apart
+ * from the legitimate two-namespace case. Path-string keying keeps the
+ * dangerous failure (cross-revert) impossible and leaves the benign one
+ * (no cross-writer exclusion) to the fleet lock. Pinned by
+ * "does NOT exclude the hostd/host-shell pair" in the tests.
  *
  * ## Why liveness + freshness
  *
@@ -222,8 +248,10 @@ export function pinJournalDir(configPath?: string): string {
  * (`/state/config/switchroom.yaml`) and a host-shell writer
  * (`~/.switchroom/switchroom.yaml`) on separate journals now that they share
  * one directory — see the module header for the concurrent-roll damage a
- * shared journal would cause. The config's basename is kept in the name purely
- * so an operator listing the directory can tell what a journal belongs to.
+ * shared journal would cause, and for why that same keying means
+ * {@link beginPinPersist}'s exclusivity gate does not span those two writers.
+ * The config's basename is kept in the name purely so an operator listing the
+ * directory can tell what a journal belongs to.
  */
 export function pinJournalPath(configPath: string): string {
   const abs = resolve(configPath);
@@ -373,8 +401,12 @@ export function readPinJournal(
  * Written atomically (tmp + rename) so a crash mid-write can never leave a
  * truncated journal that recovery would have to guess about.
  *
- * **Exclusive.** If a journal for this config already exists and its writer is
- * demonstrably alive, this THROWS rather than overwriting it. Two rolls sharing
+ * **Exclusive per journal path — which is per config-path STRING, not per
+ * file.** If a journal for this config already exists and its writer is
+ * demonstrably alive, this THROWS rather than overwriting it. That covers two
+ * rolls that resolved the same string; it does NOT cover hostd vs. a host-shell
+ * roll, which reach the same file through two different strings and so hold two
+ * different journals (module header, "What that keying does NOT buy"). Two rolls sharing
  * one journal is not a benign race: the loser's revert restores the winner's
  * `priorPin` and deletes the journal, after which the winner commits a no-op
  * and reports `ok:true` while the durable pin names the wrong version — worse

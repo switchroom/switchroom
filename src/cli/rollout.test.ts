@@ -8,7 +8,15 @@
  * injected side-effects so this runs without docker.
  */
 
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, afterEach } from "vitest";
@@ -41,14 +49,13 @@ import {
 } from "./rollout.js";
 import {
   beginPinPersist,
-  commitPinPersist,
-  rollbackPinPersist,
   hasPinJournal,
   pinJournalPath,
+  readPinJournal,
   recoverPinJournal,
   PIN_JOURNAL_MAX_AGE_MS,
 } from "./rollout-pin-journal.js";
-import { setReleasePinInConfig, getReleasePinFromConfig } from "./release-yaml.js";
+import { getReleasePinFromConfig } from "./release-yaml.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
 describe("normalizeVersion", () => {
@@ -1125,8 +1132,22 @@ describe("executeRollout — phase emission", () => {
 // `release.pin` say after the roll? — not that a hook was invoked.
 
 /**
- * Deps wired to the REAL pin-journal implementation against a tmpdir config,
- * mirroring `createRolloutDeps`'s persist/commit/revert triple.
+ * Deps for the pin scenarios below, built from the REAL
+ * {@link createRolloutDeps} against a tmpdir config.
+ *
+ * It used to hand-roll its own persist/commit/revert triple that "mirrored"
+ * the production factory. That shape is a false-green generator: a harness
+ * that reimplements the thing under test asserts only that the COPY works.
+ * It hid three production lines completely — `beginPinPersist` inside
+ * `persistPin`, its ordering relative to the config write, and
+ * `revertPin`'s `writeConfig: writeConfigPreservingOwnership` — each of which
+ * could be deleted from `rollout.ts` with the whole suite still green.
+ *
+ * Only the four deps that genuinely need faking are overridden: `run` and
+ * `probeVersion` (which would otherwise spawn docker), `log` (noise), and
+ * `hindsightExists`. The `spawn` handed to the factory throws, so a leak of
+ * any un-overridden subprocess dep fails loudly instead of silently shelling
+ * out from a unit test.
  */
 function pinHarness(opts: {
   versions: Record<string, string | null>;
@@ -1151,21 +1172,21 @@ function pinHarness(opts: {
     "utf8",
   );
   const deps: RolloutDeps = {
+    // THE PRODUCTION persist/commit/revert triple — not a copy of it.
+    ...createRolloutDeps({
+      configPath,
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: (() => {
+        throw new Error("pinHarness: an un-overridden dep tried to spawn a subprocess");
+      }) as unknown as RolloutSpawnSync,
+      warn: () => undefined,
+    }),
     run: (args) => ({ status: opts.runStatus ? opts.runStatus(args) : 0 }),
     probeVersion: (agent) => opts.versions[agent] ?? null,
     log: () => undefined,
+    emitPhase: () => undefined,
     hindsightExists: () => false,
-    persistPin: (p) => {
-      const before = readFileSync(configPath, "utf8");
-      const after = setReleasePinInConfig(before, p);
-      if (after === before) return;
-      beginPinPersist(configPath, p);
-      writeFileSync(configPath, after, "utf8");
-    },
-    // Mirrors createRolloutDeps: the error is RETURNED so the executor can
-    // put it in RolloutResult.warnings, not just written to stderr.
-    commitPin: () => commitPinPersist(configPath),
-    revertPin: () => rollbackPinPersist(configPath).reverted,
   };
   return {
     deps,
@@ -1247,6 +1268,91 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.pinReverted).toBe(true);
     expect(h.journalled()).toBe(false);
     expect(r.warnings.join(" ")).toMatch(/REVERTED to the prior version/);
+  });
+
+  it("createRolloutDeps' persistPin JOURNALS to disk before it writes the pin", () => {
+    // The production wiring, exercised directly rather than through a harness
+    // that mirrors it. Three separate production lines live here and nothing
+    // else covers them: the `beginPinPersist` call itself, its ORDERING
+    // relative to the config write, and the state dir the journal lands in.
+    const stateDir = mkdtempSync(join(tmpdir(), "rollout-persist-state-"));
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = stateDir;
+    const dir = mkdtempSync(join(tmpdir(), "rollout-persist-"));
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `telegram:\n  bot_token: x\nrelease:\n  pin: v0.19.3\nagents:\n  clerk:\n    extends: default\n`,
+      "utf8",
+    );
+    const deps = createRolloutDeps({
+      configPath,
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: (() => {
+        throw new Error("no subprocess expected");
+      }) as unknown as RolloutSpawnSync,
+      warn: () => undefined,
+    });
+
+    deps.persistPin?.(TARGET);
+
+    // A journal EXISTS on disk, in the durable state dir — delete the
+    // `beginPinPersist(configPath, pin)` line from production `persistPin` and
+    // this is the assertion that notices.
+    const journalPath = pinJournalPath(configPath);
+    expect(journalPath.startsWith(stateDir + "/")).toBe(true);
+    expect(existsSync(journalPath)).toBe(true);
+    // …and it was written BEFORE the config, so it records the pin being
+    // REPLACED. Move `beginPinPersist` after `writeConfigPreservingOwnership`
+    // and priorPin becomes the new pin — two-phase commit silently defeated,
+    // with the journal still present to make it look wired.
+    const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+      pin: string;
+      priorPin?: string;
+    };
+    expect(journal.pin).toBe(TARGET);
+    expect(journal.priorPin).toBe("v0.19.3");
+    expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe(TARGET);
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+  });
+
+  it("createRolloutDeps' revertPin restores the pin through the ownership-preserving writer", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "rollout-revert-state-"));
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = stateDir;
+    const dir = mkdtempSync(join(tmpdir(), "rollout-revert-"));
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `telegram:\n  bot_token: x # keep me\nrelease:\n  pin: v0.19.3\nagents:\n  clerk:\n    extends: default\n`,
+      "utf8",
+    );
+    const deps = createRolloutDeps({
+      configPath,
+      scriptPath: "switchroom",
+      hostdCtx: false,
+      spawn: (() => {
+        throw new Error("no subprocess expected");
+      }) as unknown as RolloutSpawnSync,
+      warn: () => undefined,
+    });
+    deps.persistPin?.(TARGET);
+    const inodeAfterPersist = statSync(configPath).ino;
+
+    expect(deps.revertPin?.()).toBe(true);
+
+    expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe("v0.19.3");
+    expect(hasPinJournal(configPath)).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toContain("bot_token: x # keep me");
+    // Routed through `writeConfigPreservingOwnership` — NOT a bare
+    // `writeFileSync`. The observable signature is the atomic tmp+rename:
+    // it REPLACES the inode (which is precisely why that writer has to chown
+    // back afterwards — CLAUDE.md's "tmp+rename re-owns the file to the
+    // writer's euid" rule). A bare `writeFileSync` truncates in place and
+    // keeps the inode, so dropping
+    // `writeConfig: writeConfigPreservingOwnership` from production
+    // `revertPin` flips this.
+    expect(statSync(configPath).ino).not.toBe(inodeAfterPersist);
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
 
   it("createRolloutDeps' commitPin RETURNS the error, not just warns it", () => {
@@ -1412,6 +1518,30 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(h.pin()).toBe(TARGET);
   });
 
+  it("does NOT commit a journal it never wrote", () => {
+    // `commitPin` unlinks the journal for this config. A roll that persisted
+    // NOTHING (target came from `config.release.pin`) must therefore leave it
+    // alone: the journal on disk belongs to an earlier roll that crashed
+    // mid-persist, and it is the only record that `release.pin` names an
+    // unproven build. Deleting it on this roll's success destroys the
+    // crash-recovery evidence permanently — every recovery site keys off the
+    // file's existence — and the bad pin becomes undetectable.
+    const h = pinHarness({
+      versions: { "test-harness": "0.19.4" },
+      initialPin: TARGET,
+    });
+    beginPinPersist(h.configPath, TARGET); // the crashed roll's journal
+    const steps = planRollout(["test-harness"], { hostdContext: true });
+    expect(steps.some((s) => s.kind === "persist-pin")).toBe(false);
+
+    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+
+    expect(r.ok).toBe(true);
+    expect(h.journalled()).toBe(true);
+    // …and it still names the earlier roll's write, so recovery can act on it.
+    expect(readPinJournal(h.configPath)?.priorPin).toBe(TARGET);
+  });
+
   it("warns loudly when the pin was persisted but no revert hook is wired", () => {
     const deps: RolloutDeps = {
       run: () => ({ status: 0 }),
@@ -1423,6 +1553,72 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.warnings.join(" ")).toMatch(/no revert hook was wired/);
+  });
+
+  it("REPORTS a step that THREW instead of dying without a result", () => {
+    // `beginPinPersist` THROWS by contract when a live roll already holds the
+    // journal, and nothing between it and the commander caught that. The
+    // exception escaped `executeRollout`, so `encodeRolloutResultLine` never
+    // ran and hostd took its no-sentinel branch: `result` inferred from the
+    // exit code, no `rolled`, no `failedStep`. `fail()`'s docstring called
+    // itself "the single exit point for every stop-the-roll failure" while
+    // this path bypassed it entirely.
+    const h = pinHarness({ versions: {} });
+    const deps: RolloutDeps = {
+      ...h.deps,
+      persistPin: () => {
+        throw new Error("rollout pin journal: … is held by a LIVE roll (pid 41 …)");
+      },
+    };
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    expect(steps[0]).toEqual({ kind: "persist-pin", pin: TARGET });
+
+    let r: RolloutResult | undefined;
+    expect(() => {
+      r = executeRollout(steps, TARGET, deps);
+    }).not.toThrow();
+
+    // A structured result exists, so the sentinel gets emitted and the status
+    // row names the step instead of reading "error, no detail".
+    expect(r?.ok).toBe(false);
+    expect(r?.failedStep).toBe("persist-pin");
+    expect(r?.warnings.join(" ")).toMatch(/held by a LIVE roll/);
+    // And the config is untouched: the throw came from the exclusivity gate,
+    // so the journal on disk belongs to the OTHER roll. Reverting here would
+    // clobber exactly what that gate exists to protect.
+    expect(r?.pinReverted).toBeUndefined();
+    expect(h.pin()).toBe("v0.19.3");
+  });
+
+  it("names the AGENT when a restart step throws past a persisted pin", () => {
+    // The same catch must preserve the two fields the terminal row and the
+    // operator narration key off — and, unlike the `persist-pin` throw above,
+    // this one IS past the provisional write, so it must revert.
+    const h = pinHarness({
+      versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
+    });
+    const deps: RolloutDeps = {
+      ...h.deps,
+      probeVersion: (agent) => {
+        if (agent === "nadia") throw new Error("docker daemon vanished");
+        return "0.19.4";
+      },
+    };
+    const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
+
+    let r: RolloutResult | undefined;
+    expect(() => {
+      r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    }).not.toThrow();
+
+    expect(r?.ok).toBe(false);
+    expect(r?.failedStep).toBe("restart-agent");
+    expect(r?.failedAgent).toBe("nadia");
+    expect(r?.warnings.join(" ")).toMatch(/docker daemon vanished/);
+    // THE outcome: the durable pin does not name the build the roll abandoned.
+    expect(r?.pinReverted).toBe(true);
+    expect(h.pin()).toBe("v0.19.3");
+    expect(h.journalled()).toBe(false);
   });
 
   it("carries pinReverted + timedOut across the hostd result sentinel", () => {
