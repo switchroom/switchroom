@@ -169,7 +169,7 @@ describe('reapStaleOpenTurns (#2918 mid-session sweep)', () => {
     db.prepare('UPDATE turns SET started_at = ? WHERE turn_key = ?').run(startedAt, turnKey)
   }
 
-  it('stamps an ownerless open row aged past the TTL as restart', () => {
+  it("stamps an ownerless open row aged past the TTL as 'reaped_stale', not 'restart' (#3555)", () => {
     const db = openTurnsDbInMemory()
     const now = 1_000_000_000_000
     recordTurnStart(db, { turnKey: 'dm:dead', chatId: '111' })
@@ -183,7 +183,12 @@ describe('reapStaleOpenTurns (#2918 mid-session sweep)', () => {
     expect(res.reapedTurnKeys).toEqual(['dm:dead'])
     const turn = getTurnByKey(db, 'dm:dead')
     expect(turn?.ended_at).toBe(now)
-    expect(turn?.ended_via).toBe('restart')
+    // #3555: this sweep is NOT a restart. Stamping 'restart' contaminated
+    // every restart statistic derived from the column (1055 rows on one host,
+    // 91.7% clustered at the 15-min reaper TTL, against exactly ONE actual
+    // gateway exit in the same window).
+    expect(turn?.ended_via).toBe('reaped_stale')
+    expect(turn?.ended_via).not.toBe('restart')
     db.close()
   })
 
@@ -233,7 +238,7 @@ describe('reapStaleOpenTurns (#2918 mid-session sweep)', () => {
       now,
     })
     expect(res.reapedTurnKeys).toEqual(['dm:dead'])
-    expect(getTurnByKey(db, 'dm:dead')?.ended_via).toBe('restart')
+    expect(getTurnByKey(db, 'dm:dead')?.ended_via).toBe('reaped_stale')
     expect(getTurnByKey(db, 'dm:live')?.ended_at).toBeNull()
     db.close()
   })

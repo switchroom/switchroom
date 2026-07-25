@@ -17,7 +17,7 @@
  *     thread_id             TEXT              -- nullable: forum topics only
  *     started_at            INTEGER NOT NULL  -- unix ms
  *     ended_at              INTEGER           -- nullable until turn ends
- *     ended_via             TEXT              -- 'stop' | 'sigterm' | 'restart' | 'timeout' | 'unknown'
+ *     ended_via             TEXT              -- 'stop'|'sigterm'|'restart'|'reaped_stale'|'timeout'|'unknown'
  *     last_assistant_msg_id TEXT              -- last outbound message_id in this turn
  *     last_assistant_done   INTEGER           -- 0|1; 1 = stream_reply done=true sent
  *     last_user_msg_id      TEXT              -- inbound message_id that started the turn
@@ -84,7 +84,26 @@ function loadDatabaseClass(): SqliteDatabaseConstructor {
 // Types
 // ---------------------------------------------------------------------------
 
-export type TurnEndedVia = 'stop' | 'sigterm' | 'restart' | 'timeout' | 'unknown'
+/**
+ * How a turn stopped being open.
+ *
+ * `'reaped_stale'` (#3555) is distinct from `'restart'` on purpose. The
+ * mid-session sweep (`reapStaleOpenTurns`) used to stamp `'restart'`, which
+ * made every restart-derived statistic unusable: 1055 rows on one host, 967
+ * of them (91.7%) clustered at 15-19 min — the signature of the 15-min
+ * `MID_SESSION_CARD_REAPER_TTL_MS` on a 5-min sweep, NOT of gateway
+ * restarts (the same window's log holds exactly ONE `[supervise] gateway
+ * exited`). Behaviourally the two are identical — both are clean interrupts,
+ * both are in `INTERRUPTED_VIA`, both map to a `'resume'` — but they are now
+ * separable in the data.
+ */
+export type TurnEndedVia =
+  | 'stop'
+  | 'sigterm'
+  | 'restart'
+  | 'reaped_stale'
+  | 'timeout'
+  | 'unknown'
 
 export interface Turn {
   turn_key: string
@@ -554,7 +573,7 @@ export interface ReapStaleOpenTurnsOpts {
 }
 
 export interface ReapStaleOpenTurnsResult {
-  /** Rows stamped `ended_via='restart'` by this sweep. */
+  /** Rows stamped `ended_via='reaped_stale'` by this sweep (#3555). */
   reaped: number
   /** The turn_keys that were stamped, for logging / card finalization. */
   reapedTurnKeys: string[]
@@ -568,15 +587,19 @@ export interface ReapStaleOpenTurnsResult {
  * leaves its row `ended_at IS NULL`, and its activity card keeps spinning
  * until the NEXT gateway boot (often many hours later). This sweep runs on a
  * periodic timer inside the live gateway and stamps those ownerless open rows
- * `ended_via='restart'` (the same clean-interrupt classification the boot
- * reaper uses for a non-hung orphan) so the stale card can be finalized
- * without waiting for a restart.
+ * so the stale card can be finalized without waiting for a restart.
  *
  * CORRECTNESS: only rows that are BOTH (a) not owned by any live turn
  * (`turn_key ∉ activeTurnKeys`) AND (b) older than `ttlMs` are swept. A
  * healthy in-flight turn — however long it runs — is always in
- * `activeTurnKeys` and is never touched. Never invents a new state; reuses
- * `'restart'` so the existing resume/report policy applies unchanged.
+ * `activeTurnKeys` and is never touched.
+ *
+ * #3555: this used to stamp `'restart'`, borrowing the boot reaper's
+ * classification. That was a lie in the data — nothing here restarted; the
+ * sweep merely gave up on a row after `ttlMs`. It stamps `'reaped_stale'`
+ * now. `'reaped_stale'` is a member of `INTERRUPTED_VIA` and maps to the
+ * same `'resume'` in `selectResumeBuilder`, so the resume/report policy is
+ * byte-for-byte unchanged; only the forensic label differs.
  */
 export function reapStaleOpenTurns(
   db: SqliteDatabase,
@@ -594,7 +617,7 @@ export function reapStaleOpenTurns(
   const stamp = db.prepare(`
     UPDATE turns
     SET ended_at   = ?,
-        ended_via  = 'restart',
+        ended_via  = 'reaped_stale',
         updated_at = ?
     WHERE turn_key = ? AND ended_at IS NULL
   `)
@@ -688,6 +711,7 @@ export function listTurnsForAgent(
 /** ended_via values that mean "this turn did not finish on its own". */
 const INTERRUPTED_VIA: ReadonlySet<TurnEndedVia> = new Set<TurnEndedVia>([
   'restart',
+  'reaped_stale', // #3555 — same clean-interrupt semantics, honest label
   'sigterm',
   'timeout',
   'unknown',
@@ -782,9 +806,13 @@ export function markAnswerRedelivered(
 
 /**
  * Return the single most-recently-started turn IFF it was interrupted
- * (`ended_at IS NULL`, or `ended_via` in {restart, sigterm, timeout,
- * unknown}). Returns null when the latest turn ended cleanly (`'stop'`)
- * or there are no turns at all.
+ * (`ended_at IS NULL`, or `ended_via` in {restart, reaped_stale, sigterm,
+ * timeout, unknown} — i.e. `INTERRUPTED_VIA`). Returns null when the latest
+ * turn ended cleanly (`'stop'`) or there are no turns at all.
+ *
+ * `'reaped_stale'` (#3555) is in that set for the same reason `'restart'` is:
+ * a row the mid-session sweep gave up on was still a turn the user was owed
+ * an answer for. Omitting it would silently drop the resume.
  *
  * This is the resume gate. Keying on the *latest* turn (not "latest
  * interrupted turn anywhere in history") is deliberate: once the agent

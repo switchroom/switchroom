@@ -368,6 +368,7 @@ describe('selectResumeBuilder', () => {
   const cases: Array<[TurnEndedVia | null, 'resume' | 'report' | null]> = [
     ['timeout', 'report'],
     ['restart', 'resume'],
+    ['reaped_stale', 'resume'], // #3555 — same clean-interrupt policy as restart
     ['sigterm', 'resume'],
     ['unknown', 'resume'],
     [null, 'resume'],
@@ -393,6 +394,20 @@ describe('selectResumeBuilder', () => {
     expect(selectResumeBuilder('timeout', { ageMs: MAX + 1, maxAgeMs: MAX })).toBe('report')
     expect(selectResumeBuilder('stop', { ageMs: MAX + 1, maxAgeMs: MAX })).toBe(null)
   })
+  // #3555 — the mid-session sweep stopped mislabelling itself as 'restart'.
+  // Renaming the label must not change what the gateway DOES with the turn:
+  // 'reaped_stale' has to behave identically to 'restart' at every input.
+  it("'reaped_stale' is policy-identical to 'restart' (rename is forensic only)", () => {
+    expect(selectResumeBuilder('reaped_stale')).toBe(selectResumeBuilder('restart'))
+    expect(selectResumeBuilder('reaped_stale', { ageMs: MAX - 1, maxAgeMs: MAX }))
+      .toBe(selectResumeBuilder('restart', { ageMs: MAX - 1, maxAgeMs: MAX }))
+    expect(selectResumeBuilder('reaped_stale', { ageMs: MAX + 1, maxAgeMs: MAX }))
+      .toBe(selectResumeBuilder('restart', { ageMs: MAX + 1, maxAgeMs: MAX }))
+    // and pin the absolute values so a future change to BOTH is still caught
+    expect(selectResumeBuilder('reaped_stale')).toBe('resume')
+    expect(selectResumeBuilder('reaped_stale', { ageMs: MAX + 1, maxAgeMs: MAX })).toBe('report')
+  })
+
   it('legacy behaviour preserved when age/maxAge omitted (blanket resume)', () => {
     expect(selectResumeBuilder('restart')).toBe('resume')
     expect(selectResumeBuilder('restart', { ageMs: MAX + 1 })).toBe('resume') // needs BOTH to cap
