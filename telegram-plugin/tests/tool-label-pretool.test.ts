@@ -110,12 +110,16 @@ describe('computeLabel — Bash fallback when description is omitted', () => {
   })
 
   it('NEVER echoes arguments, flag values, URLs, or env assignments', () => {
+    // Token-shaped literals are assembled at runtime: GitHub Push Protection
+    // and check-no-pii-secrets both reject contiguous ones, fake or not
+    // (pattern from secret-detect-secretlint.test.ts).
+    const fakeAnthropic = 'sk-' + 'ant-oat01-FAKEVALUE'
     const cases = [
-      'curl -H "Authorization: Bearer sk-live-abcdef123456" https://api.example.com/v1/x',
+      'curl -H "Authorization: Bearer ' + 'sk-' + 'live-abcdef123456" https://api.example.com/v1/x',
       'psql postgres://user:hunter2@db.internal:5432/prod -c "select 1"',
       'aws s3 cp s3://private-bucket/key.pem . --profile prod',
       'export TOKEN=ghp_AAAABBBBCCCCDDDD && ./run',
-      'echo "sk-ant-oat01-SECRETVALUE" > /root/.creds',
+      `echo "${fakeAnthropic}" > /root/.creds`,
       'ssh deploy@10.0.0.7 -i /root/.ssh/id_ed25519',
       'git clone https://x-access-token:ghs_SECRET@github.com/o/r.git',
     ]
