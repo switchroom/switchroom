@@ -29,6 +29,14 @@
  *     ambiguous (strikethrough marker vs. approx) and dropping is the safest
  *     choice that never mangles a real word.
  *   - `->` / `=>` / `→` become the spoken word "to".
+ *   - Block boundaries (headings, bullets, ordered items) become SENTENCE
+ *     boundaries: the marker is replaced with terminating punctuation so a
+ *     multi-bullet reply is spoken as separate sentences with breath between
+ *     them, instead of the newline-collapse fusing it into one run-on.
+ *   - A multi-segment filesystem path (`/var/log/syslog`, `~/.config/x/y`,
+ *     `a/b/c`) is spoken as its LAST segment, or "a path" when that segment
+ *     is unspeakable noise. A single `word/word` is prose and is left for the
+ *     downstream "word slash word" pass in normalizeForTts.
  *   - A tiny, well-tested set of trivially-safe abbreviations is expanded
  *     ("e.g." → "for example", "i.e." → "that is", "etc." → "and so on",
  *     "vs" → "versus", "approx" → "approximately", "w/" → "with").
@@ -237,11 +245,140 @@ const UNIT_MAP: Record<string, { s: string; p: string }> = {
   tb: { s: 'terabyte', p: 'terabytes' },
 }
 
-/** Curated initialisms spoken letter-by-letter. Uppercase keys only. */
+/**
+ * Curated initialisms spoken letter-by-letter. Uppercase keys only.
+ *
+ * Only tokens in this set are ever expanded, so widening the set is safe:
+ * word-style acronyms (NASA, ALWAYS) still fall through untouched because the
+ * generic all-caps matcher consults this map before doing anything.
+ */
 const ACRONYMS = new Set([
   'CI', 'PR', 'API', 'URL', 'GPU', 'CPU', 'TTS', 'STT', 'HTTP', 'JSON',
   'SQL', 'UI',
+  // Common in agent replies; previously read as nonsense words ("hoops",
+  // "duh-ness", "mick-p") by the engine.
+  'HTTPS', 'SSH', 'DNS', 'CLI', 'AWS', 'UTC', 'MCP', 'PDF', 'ID', 'OK',
+  'VM', 'LLM', 'YAML', 'RAM', 'USB',
 ])
+
+/** Longest key in ACRONYMS — the all-caps matcher's upper length bound. */
+const ACRONYM_MAX_LEN = Math.max(...[...ACRONYMS].map((a) => a.length))
+
+/**
+ * A filesystem-path-shaped token: two or more `/`-separated segments, with an
+ * optional leading segment (`a/b/c`), `~` (`~/.config/foo`) or nothing
+ * (`/var/log/syslog`). Requiring TWO separators is deliberate — a single
+ * `word/word` is prose ("and/or") and is left for the downstream
+ * "word slash word" pass in tts-normalize.
+ */
+const PATH_TOKEN_RE =
+  /(?<![\w~./-])(?:~|\.{1,2}|[A-Za-z0-9_.@-]+)?(?:\/[A-Za-z0-9_.@+-]+){2,}\/?(?![\w/-])/g
+
+/**
+ * A path-shaped token needs an ANCHOR before we may swallow it: a leading
+ * `/`, `./`, `../` or `~/`, or a final segment carrying a file extension.
+ * "Two or more slashes ⇒ path" is false in English — `yes/no/maybe`,
+ * `read/write/exec`, `he/she/they`, `client/server/proxy` and
+ * `unit/integration/e2e` are all prose, and swallowing them DELETES words
+ * from the reply. Anything that is only a run of ordinary lowercase
+ * word-shaped segments is left for the downstream "word slash word" pass.
+ */
+function looksLikePath(m: string, segs: string[]): boolean {
+  if (/^(?:\/|\.{1,2}\/|~\/)/.test(m)) return true
+  const last = segs[segs.length - 1]!
+  if (/\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(last)) return true
+  // Every segment an ordinary lowercase word (letters, then optional digits)
+  // ⇒ prose, not a path.
+  return !segs.every((sg) => /^[a-z][a-z0-9]*$/.test(sg))
+}
+
+/** True when a path segment is worth speaking (a real name, not a blob). */
+function isSpeakableSegment(seg: string): boolean {
+  if (!/[A-Za-z]/.test(seg)) return false
+  if (seg.length > 32) return false
+  // A hex blob (sha, uuid chunk) reads as noise; prefer "a path".
+  if (/^[0-9a-f]{8,}$/i.test(seg)) return false
+  return true
+}
+
+/**
+ * Speak a filesystem path as just its final segment ("/var/log/syslog" →
+ * "syslog"), or "a path" when that segment carries no speakable name. Reading
+ * a full path aloud is the worst kind of TTS noise — a long run of "slash"
+ * between unpronounceable fragments. An all-numeric token run (a date like
+ * `12/25/2026`) is explicitly NOT a path and is returned untouched.
+ */
+function speakPaths(input: string): string {
+  return input.replace(PATH_TOKEN_RE, (m) => {
+    const segs = m.split('/').filter((sg) => sg.length > 0)
+    if (segs.length < 2) return m
+    if (segs.every((sg) => /^\d+$/.test(sg))) return m
+    if (!looksLikePath(m, segs)) return m
+    const last = segs[segs.length - 1]!
+    return isSpeakableSegment(last) ? last : 'a path'
+  })
+}
+
+/** A line whose leading markup starts a new block (heading / list item). */
+const BLOCK_MARKER_RE = /^[ \t]{0,3}(?:#{1,6}[ \t]+|[-*+][ \t]+|\d+[.)][ \t]+)/
+/** Heading subset — a heading never has continuation lines. */
+const HEADING_MARKER_RE = /^[ \t]{0,3}#{1,6}[ \t]+/
+
+/** Give a line sentence-terminating punctuation without doubling it. */
+function ensureTerminated(line: string): string {
+  const t = line.replace(/[ \t]+$/, '')
+  if (!t.trim()) return t
+  // Already terminal (or a natural pause) — leave it, never emit ".." / ". .".
+  if (/[.!?:;]$/.test(t)) return t
+  // A trailing comma at a block boundary is an artifact of list formatting.
+  if (/,$/.test(t)) return `${t.slice(0, -1)}.`
+  return `${t}.`
+}
+
+/**
+ * Strip heading / list markers AND turn each block boundary into a sentence
+ * boundary. Without this the later newline-collapse joins every bullet into
+ * one breathless run-on sentence — the single biggest voice-pacing complaint.
+ *
+ * A wrapped list item (a continuation line carrying no marker of its own) is
+ * terminated only at the END of the unit, so a sentence split across two
+ * source lines is not chopped mid-clause. The line immediately BEFORE a block
+ * starts is terminated too, so "Steps" + bullets doesn't read as
+ * "Steps first".
+ */
+function applyBlockPauses(input: string): string {
+  const lines = input.split('\n')
+  const isBlock = lines.map((l) => BLOCK_MARKER_RE.test(l))
+  const isHeading = lines.map((l) => HEADING_MARKER_RE.test(l))
+  const stripped = lines.map((l, i) =>
+    isBlock[i] ? l.slice(l.match(BLOCK_MARKER_RE)![0].length) : l,
+  )
+  // A line is "inside a block unit" if it starts one, or continues one. A
+  // heading owns exactly its own line — the prose under it is a new unit.
+  const inUnit: boolean[] = []
+  for (let i = 0; i < stripped.length; i++) {
+    inUnit[i] =
+      isBlock[i] === true ||
+      (i > 0 &&
+        inUnit[i - 1] === true &&
+        isHeading[i - 1] !== true &&
+        stripped[i]!.trim() !== '')
+  }
+  return stripped
+    .map((line, i) => {
+      const next = stripped[i + 1]
+      const nextIsBlock = isBlock[i + 1] === true
+      const unitEndsHere =
+        isHeading[i] === true ||
+        next === undefined ||
+        next.trim() === '' ||
+        nextIsBlock
+      if (inUnit[i] && unitEndsHere) return ensureTerminated(line)
+      if (nextIsBlock && line.trim() !== '') return ensureTerminated(line)
+      return line
+    })
+    .join('\n')
+}
 
 /**
  * Convert a Markdown/plain reply into clean text for a TTS engine.
@@ -277,7 +414,12 @@ export function normalizeForSpeech(input: string): string {
     /[\u{1F000}-\u{1FAFF}\u{1F1E6}-\u{1F1FF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{200D}\u{2B50}\u{3030}\u{303D}\u{3297}\u{3299}\u{24C2}]/gu,
     '',
   )
-  s = s.replace(/:([a-z0-9][a-z0-9_+-]*):/gi, ' ')
+  //    Digit-bodied shortcodes are real (`:100:`, `:8ball:`,
+  //    `:1st_place_medal:`), so the body may start with a digit — the
+  //    timestamp protection is positional instead: the opening colon may not
+  //    follow a digit/colon and the closing colon may not precede a digit, so
+  //    the pass can never eat the colons out of `14:30:46`.
+  s = s.replace(/(?<![\w:]):([a-z0-9][a-z0-9_+-]*):(?!\d)/gi, ' ')
 
   // 1. Fenced code blocks first (```lang … ``` or ~~~ … ~~~) — drop the
   //    whole block before any inline processing can see its contents.
@@ -301,6 +443,11 @@ export function normalizeForSpeech(input: string): string {
   // Any residual backticks → drop.
   s = s.replace(/`/g, '')
 
+  // 5b. Filesystem paths → their last segment. Runs before the block/symbol
+  //     passes (and before the downstream "word slash word" pass in
+  //     normalizeForTts) so a path is never spelled out slash-by-slash.
+  s = speakPaths(s)
+
   // 6. Emphasis markers. Paired forms first (longest marker first), then
   //    strip residual markup-by-construction doubles. A LONE `*` or `_` in
   //    the middle of maths/words is left alone (see step 11).
@@ -316,10 +463,8 @@ export function normalizeForSpeech(input: string): string {
   // 7. Leading block markup, per line: headings, blockquotes, list markers.
   //    List bullets/numbers become a natural sentence pause rather than a
   //    spoken "dash" / "1 dot".
-  s = s.replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, '')
   s = s.replace(/^[ \t]{0,3}>[ \t]?/gm, '')
-  s = s.replace(/^[ \t]{0,3}[-*+][ \t]+/gm, '')
-  s = s.replace(/^[ \t]{0,3}\d+[.)][ \t]+/gm, '')
+  s = applyBlockPauses(s)
 
   // 8. Horizontal rules (---, ___, ***) on their own line → drop.
   s = s.replace(/^[ \t]{0,3}([-_*])\1{2,}[ \t]*$/gm, '')
@@ -360,7 +505,12 @@ export function normalizeForSpeech(input: string): string {
   })
   //     Clock time HH:MM (24h ok) → spoken. Guarded by word boundaries so a
   //     ratio like "3:2" or a bare number isn't caught (needs 2-digit MM).
-  s = s.replace(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g, (m, hh, mm) => {
+  //     The (?<![\d:]) / (?!:?\d) guards skip HH:MM:SS entirely (parity with
+  //     normalizeForTts) — a half-spoken time with a dangling ":46" reads
+  //     worse than leaving the digits as-is. The LOOKBEHIND is load-bearing:
+  //     without it the scan re-anchors INSIDE the timestamp (`09:00:00` →
+  //     "09:zero o'clock") because the trailing `00` is itself a legal HH:MM.
+  s = s.replace(/(?<![\d:])\b([01]?\d|2[0-3]):([0-5]\d)(?!:?\d)/g, (m, hh, mm) => {
     const h = Number(hh)
     const min = Number(mm)
     const hw = belowThousand(h)
@@ -370,11 +520,18 @@ export function normalizeForSpeech(input: string): string {
 
   // 14. Numbers, units & symbols → spoken words. Each sub-pass is guarded so
   //     it only fires on a clear number+token, never mid-word.
-  //     Currency: $5 / $5.50 → "five dollars" / "five dollars fifty".
-  s = s.replace(/\$(\d{1,9})(?:\.(\d{2}))?\b/g, (m, dollars, cents) => {
-    const dw = numberToWords(Number(dollars))
+  //     Currency: $5 / $5.50 → "five dollars" / "five dollars fifty";
+  //     $1,000 → "one thousand dollars" (thousands separators consumed, so
+  //     the old "one dollar,000" misreading is impossible). The trailing
+  //     lookahead bails on odd cents ("$5.203") and partial thousands
+  //     ("$1,00") — the whole token is left unchanged rather than half-read.
+  //     The guard must NOT fire on an ordinary sentence comma ("$500, plus
+  //     tax") — only on a comma/period that STARTS another digit group.
+  s = s.replace(/\$(\d{1,3}(?:,\d{3})+|\d{1,9})(?:\.(\d{2}))?(?!\d|[.,]\d)/g, (m, dollarsRaw, cents) => {
+    const dollars = Number(String(dollarsRaw).replace(/,/g, ''))
+    const dw = numberToWords(dollars)
     if (!dw) return m
-    const noun = Number(dollars) === 1 && !cents ? 'dollar' : 'dollars'
+    const noun = dollars === 1 && !cents ? 'dollar' : 'dollars'
     if (cents && cents !== '00') {
       const cw = numberToWords(Number(cents))
       return `${dw} ${noun} ${cw}`
@@ -419,7 +576,7 @@ export function normalizeForSpeech(input: string): string {
   // 15. Acronyms → letter-by-letter for a curated set of initialisms. Only a
   //     standalone all-caps token that exactly matches the map is expanded;
   //     word-style acronyms (NASA) and sub-tokens of larger words are left.
-  s = s.replace(/\b[A-Z]{2,5}\b/g, (tok) =>
+  s = s.replace(new RegExp(`\\b[A-Z]{2,${ACRONYM_MAX_LEN}}\\b`, 'g'), (tok) =>
     ACRONYMS.has(tok) ? tok.split('').join(' ') : tok,
   )
 

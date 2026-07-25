@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Voice out — pacing & misreadings
+
+- **Lists and headings are spoken as separate sentences** — stripping a bullet
+  or `1.` marker left nothing behind, and the newline-collapse then joined a
+  whole markdown list into one breathless run-on sentence. Block boundaries now
+  emit sentence-terminating punctuation (without doubling `..` when the item
+  already ends in `.`/`!`/`?`), and a wrapped list item is terminated only at
+  the end of the unit so a sentence split across two source lines isn't chopped
+  mid-clause.
+- **`14:30:46` is no longer half-read** — `normalizeForSpeech` lacked the
+  `(?!:?\d)` HH:MM:SS guard that `normalizeForTts` already had. It also had a
+  deeper cause: the `:shortcode:` emoji pass ate the colons out of a timestamp
+  (`14:30:46` → "14 46") before any time pass could see it. The shortcode body
+  must now start with a letter.
+- **`$1,000` reads as "one thousand dollars"** (was "one dollar,000") — the
+  thousands-separator currency pattern is backported from `normalizeForTts`.
+- **More acronyms, and file paths stop being spelled out** — HTTPS/SSH/DNS/CLI/
+  AWS/UTC/MCP/PDF/ID/OK/VM/LLM/YAML/RAM/USB join the letter-by-letter set, and
+  a multi-segment path (`/var/log/syslog`, `~/.config/nvim/init.lua`,
+  `src/gateway/gateway.ts`) is spoken as just its last segment — or "a path"
+  when that segment is a hex blob. A single `word/word` is still prose.
+
 ## v0.19.16 — Telegram: forwarded-message coalescing, Listen button, quieter progress cards, cleaner voice
 
 ### Telegram forwarding (#3523)
