@@ -22,6 +22,7 @@ import {
   validateGrant,
   revokeGrant,
   listGrants,
+  __clearGrantCompareMemo,
 } from "./grants.js";
 
 function makeDb(): Database {
@@ -188,6 +189,121 @@ describe("validateGrant", () => {
     const result = await validateGrant(db, badToken, "KEY");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("grant-invalid");
+  });
+});
+
+describe("validateGrant bcrypt-compare memo (#3574)", () => {
+  beforeEach(() => {
+    __clearGrantCompareMemo();
+  });
+
+  it("collapses repeat validation cost to well under one bcrypt compare", async () => {
+    // WHY THIS EXISTS: the broker calls validateGrant once per `get`
+    // (server.ts:1284) and once per `list` (:1105), and bcryptjs is pure JS
+    // that BLOCKS the broker's single shared event loop. Measured on the
+    // fleet host: ~57ms per compare, and 8 "concurrent" compares took 459ms
+    // (fully serialized). N-key hooks like secret-guard-pretool.mjs
+    // therefore cost the broker (N+1) compares of serialized CPU, which no
+    // client-side concurrency can shorten — and when that blows a client's
+    // deadline the hook scans a PARTIAL key set, silently unguarding
+    // secrets. Hence the memo.
+    //
+    // Self-baselining: measure ONE cold compare in-test rather than
+    // hardcoding a millisecond figure, so the assertion holds on any CPU.
+    const db = makeDb();
+    const { token } = await mintGrant(db, "myagent", ["KEY"], 3600);
+
+    const coldStart = performance.now();
+    expect((await validateGrant(db, token, "KEY")).ok).toBe(true);
+    const coldMs = performance.now() - coldStart;
+
+    const REPEATS = 20;
+    const warmStart = performance.now();
+    for (let i = 0; i < REPEATS; i++) {
+      expect((await validateGrant(db, token, "KEY")).ok).toBe(true);
+    }
+    const warmMs = performance.now() - warmStart;
+
+    // 20 memoized validations must cost less than a SINGLE cold compare.
+    // Un-memoized that loop is 20 × coldMs, so the margin is ~20×.
+    expect(warmMs).toBeLessThan(coldMs);
+  });
+
+  it("still honours revocation immediately after a memoized success", async () => {
+    // THE security property. The memo covers only the immutable
+    // "secret hashes to this digest" fact; revoked_at is re-read from
+    // SQLite on every call, so a kill-switch must take effect on the very
+    // next request — no TTL wait.
+    const db = makeDb();
+    const { token, id } = await mintGrant(db, "myagent", ["KEY"], 3600);
+    expect((await validateGrant(db, token, "KEY")).ok).toBe(true); // memoize
+
+    revokeGrant(db, id);
+
+    const after = await validateGrant(db, token, "KEY");
+    expect(after.ok).toBe(false);
+    if (!after.ok) expect(after.reason).toBe("grant-revoked");
+  });
+
+  it("still honours expiry after a memoized success", async () => {
+    const db = makeDb();
+    const { token, id } = await mintGrant(db, "myagent", ["KEY"], 3600);
+    expect((await validateGrant(db, token, "KEY")).ok).toBe(true); // memoize
+
+    db.run("UPDATE vault_grants SET expires_at = ? WHERE id = ?", [
+      Math.floor(Date.now() / 1000) - 10,
+      id,
+    ]);
+
+    const after = await validateGrant(db, token, "KEY");
+    expect(after.ok).toBe(false);
+    if (!after.ok) expect(after.reason).toBe("grant-expired");
+  });
+
+  it("still honours key_allow after a memoized success", async () => {
+    const db = makeDb();
+    const { token } = await mintGrant(db, "myagent", ["ALLOWED_KEY"], 3600);
+    expect((await validateGrant(db, token, "ALLOWED_KEY")).ok).toBe(true); // memoize
+
+    // Same token, different key — the memo is keyed on the secret, NOT on
+    // the requested key, so scope must still be evaluated per call.
+    const other = await validateGrant(db, token, "OTHER_KEY");
+    expect(other.ok).toBe(false);
+    if (!other.ok) expect(other.reason).toBe("grant-key-not-allowed");
+  });
+
+  it("does not accept a wrong secret for a grant whose real secret is memoized", async () => {
+    // A cache that keyed on grant id alone would turn one successful
+    // validation into a bypass for every other secret. The memo key
+    // includes sha256(secret), so it cannot.
+    const db = makeDb();
+    const { token, id } = await mintGrant(db, "myagent", ["KEY"], 3600);
+    expect((await validateGrant(db, token, "KEY")).ok).toBe(true); // memoize
+
+    const forged = `${id}.ffffffffffffffffffffffffffffffff`;
+    const result = await validateGrant(db, forged, "KEY");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("grant-invalid");
+  });
+
+  it("does not accept the old secret after the stored hash is rotated", async () => {
+    // The memo key includes secret_hash, so rotating the row's hash
+    // invalidates the entry structurally — no TTL wait, no explicit flush.
+    const db = makeDb();
+    const { token, id } = await mintGrant(db, "myagent", ["KEY"], 3600);
+    expect((await validateGrant(db, token, "KEY")).ok).toBe(true); // memoize
+
+    const { id: otherId } = await mintGrant(db, "myagent", ["KEY"], 3600);
+    const otherHash = db
+      .query<{ secret_hash: string }, [string]>(
+        "SELECT secret_hash FROM vault_grants WHERE id = ?",
+      )
+      .get(otherId)!.secret_hash;
+    db.run("UPDATE vault_grants SET secret_hash = ? WHERE id = ?", [otherHash, id]);
+
+    const after = await validateGrant(db, token, "KEY");
+    expect(after.ok).toBe(false);
+    if (!after.ok) expect(after.reason).toBe("grant-invalid");
   });
 });
 
