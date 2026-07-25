@@ -8889,7 +8889,7 @@ async function runMidSessionCardReaper(): Promise<void> {
       if (reaped > 0) {
         process.stderr.write(
           `telegram gateway: mid-session reaper stamped ${reaped} orphaned turn(s) ` +
-            `as 'restart' (${reapedTurnKeys.join(',')})\n`,
+            `as 'reaped_stale' (${reapedTurnKeys.join(',')})\n`,
         )
       }
     } catch (err) {

@@ -462,6 +462,19 @@ describe('findLatestTurnIfInterrupted', () => {
     db.close()
   })
 
+  it("returns a reaped_stale-stamped turn as interrupted (#3555 — the rename must not drop resume)", () => {
+    // If 'reaped_stale' were left out of INTERRUPTED_VIA, the honest label
+    // would silently cost the user their resume — the exact regression the
+    // rename must not cause.
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'rs:1', chatId: 'rs' })
+    recordTurnEnd(db, { turnKey: 'rs:1', endedVia: 'reaped_stale' })
+    const t = findLatestTurnIfInterrupted(db)
+    expect(t).not.toBeNull()
+    expect(t!.ended_via).toBe('reaped_stale')
+    db.close()
+  })
+
   it('returns a restart-stamped turn as interrupted', () => {
     const db = openTurnsDbInMemory()
     recordTurnStart(db, { turnKey: 'bbb:1', chatId: 'bbb' })

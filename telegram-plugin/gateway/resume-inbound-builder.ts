@@ -458,9 +458,13 @@ export function buildResumeDeferredReportInbound(
  * the gateway calls this with the classified `ended_via` so the
  * report-vs-resume policy lives in one testable place.
  *
- *   - 'timeout'                         → 'report'  (watchdog kill)
- *   - 'restart' | 'sigterm' | 'unknown' → 'resume'  (clean interrupt)
- *   - 'stop'                            → null      (finished; nothing to do)
+ *   - 'timeout'                                → 'report'  (watchdog kill)
+ *   - 'restart'|'reaped_stale'|'sigterm'|'unknown' → 'resume' (clean interrupt)
+ *   - 'stop'                                   → null      (finished; nothing to do)
+ *
+ * #3555: `'reaped_stale'` (mid-session stale-row sweep) is treated exactly
+ * like `'restart'` here — it is the same clean interrupt, just no longer
+ * mislabelled as a restart in the data.
  */
 export function selectResumeBuilder(
   endedVia: TurnEndedVia | null,
@@ -473,7 +477,12 @@ export function selectResumeBuilder(
 ): 'resume' | 'report' | null {
   let kind: 'resume' | 'report' | null
   if (endedVia === 'timeout') kind = 'report'
-  else if (endedVia === 'restart' || endedVia === 'sigterm' || endedVia === 'unknown') kind = 'resume'
+  else if (
+    endedVia === 'restart' ||
+    endedVia === 'reaped_stale' ||
+    endedVia === 'sigterm' ||
+    endedVia === 'unknown'
+  ) kind = 'resume'
   else if (endedVia == null) kind = 'resume' // still-open at boot = killed mid-flight
   else kind = null
   if (
