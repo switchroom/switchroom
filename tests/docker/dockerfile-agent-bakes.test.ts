@@ -169,9 +169,10 @@ describe("Dockerfile.agent Playwright provisioning", () => {
  * because (a) it's public OSS and (b) baking-in avoids a fragile
  * per-agent pipx install in the boot path.
  *
- * The 700MB Chromium binary cloakbrowser spawns is NOT baked — it's
- * shared across the fleet via a host bind mount of `~/.cloakbrowser/`
- * (see src/agents/compose.ts).
+ * The ~700MB Chromium binary cloakbrowser spawns is NOT baked (licence-
+ * gated + would bloat every image pull) — it's shared across the fleet
+ * via a host bind mount of `~/.switchroom/cloakbrowser/` onto the baked
+ * CLOAKBROWSER_CACHE_DIR (see src/agents/compose.ts).
  */
 describe("Dockerfile.agent webkite/cloakbrowser provisioning", () => {
   it("apt-installs pipx (the package manager cloakbrowser ships through)", () => {
@@ -190,5 +191,31 @@ describe("Dockerfile.agent webkite/cloakbrowser provisioning", () => {
 
   it("CLOAKBROWSER_PIPX_HOME is an absolute /opt path (not under HOME)", () => {
     expect(dockerfile).toMatch(/ENV\s+CLOAKBROWSER_PIPX_HOME=\/opt\//);
+  });
+
+  // #TBD regression. cloakbrowser's config.py::get_cache_dir() reads
+  // CLOAKBROWSER_CACHE_DIR and only falls back to ~/.cloakbrowser. Pinning
+  // it to a fixed NON-HOME image path is what makes the shared RO mount
+  // authoritative; without this ENV each agent silently downloaded its own
+  // private ~697MB Chromium into $HOME.
+  it("pins CLOAKBROWSER_CACHE_DIR to the shared-mount image path", () => {
+    expect(dockerfile).toMatch(
+      /ENV\s+CLOAKBROWSER_CACHE_DIR=\/opt\/switchroom\/cloakbrowser-cache/,
+    );
+  });
+
+  it("pre-creates the cache dir root-owned so a missing mount cannot self-heal into a private copy", () => {
+    // Agents run as UID 10001. An empty root-owned dir means cloakbrowser
+    // fails loudly (webkite still cloud-renders) instead of re-downloading.
+    expect(dockerfile).toMatch(
+      /RUN\s+mkdir\s+-p\s+\$\{CLOAKBROWSER_CACHE_DIR\}/,
+    );
+    expect(dockerfile).not.toMatch(
+      /chown[^\n]*\$\{CLOAKBROWSER_CACHE_DIR\}/,
+    );
+  });
+
+  it("does NOT bake the licence-gated Chromium binary into the image", () => {
+    expect(dockerfile).not.toMatch(/cloakbrowser\s+install/);
   });
 });

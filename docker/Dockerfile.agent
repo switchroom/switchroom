@@ -135,9 +135,12 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 # `webkite mcp` MCP server to fetch bot-gated sites. The webkite binary
 # itself is mounted from the operator's host (private beta — not
 # baked or committed); cloakbrowser is public OSS so we bake the
-# Python tool here. The 700MB chromium binary it spawns is shared
-# across the fleet via a host bind mount of `~/.cloakbrowser/` (see
-# compose.ts), NOT baked into the image.
+# Python tool here. The ~700MB chromium binary it spawns is shared
+# across the fleet via a host bind mount of `~/.switchroom/cloakbrowser/`
+# onto CLOAKBROWSER_CACHE_DIR (see compose.ts), NOT baked into the
+# image: the binary is licence-gated (cloakbrowser's download.py gates
+# the current build behind a login/key + concurrency tier) and would add
+# ~700MB to every image pull.
 #
 # Why bake instead of per-agent install: a pipx venv has shebang lines
 # pointing at the venv's own python interpreter. If we mounted the
@@ -157,6 +160,26 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && PIPX_HOME=${CLOAKBROWSER_PIPX_HOME} PIPX_BIN_DIR=/usr/local/bin \
     pipx install cloakbrowser
+
+# Shared stealth-Chromium cache path (#TBD). cloakbrowser's
+# `get_cache_dir()` honours CLOAKBROWSER_CACHE_DIR and only falls back to
+# `~/.cloakbrowser` when it is unset — so we pin it to a fixed NON-HOME
+# image path and bind-mount the operator's one shared copy onto it RO
+# (compose.ts). Prior to this the fleet relied on path-shadowing the
+# per-agent HOME, which silently produced N private 697MB downloads when
+# the mount didn't materialise.
+#
+# The directory is created here root-owned and left EMPTY on purpose:
+# agents run as a non-root per-agent UID (image default 10001), so when
+# the shared RO mount is absent an agent cannot silently re-download its
+# own private 697MB copy — cloakbrowser aborts with `[Errno 13]
+# Permission denied` (verified live) and start.sh warns loudly at boot.
+# ORDERING NOTE for the rollout: once this ENV ships, any pre-existing
+# per-agent `$HOME/.cloakbrowser` copy is ignored, so the shared cache
+# must be populated (see `switchroom doctor`) at or before the rebuild or
+# agents temporarily lose local render (cloud render is unaffected).
+ENV CLOAKBROWSER_CACHE_DIR=/opt/switchroom/cloakbrowser-cache
+RUN mkdir -p ${CLOAKBROWSER_CACHE_DIR} && chmod 0755 ${CLOAKBROWSER_CACHE_DIR}
 
 # Fleet-wide webkite render config (#2805). Baked here at a NON-HOME image
 # path so it survives container rebuilds and is identical across the fleet;

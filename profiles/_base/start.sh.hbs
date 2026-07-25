@@ -1104,6 +1104,21 @@ if [ -f /opt/switchroom/webkite/config.toml ]; then
   unset sr_wk_target
 fi
 
+# Shared cloakbrowser Chromium cache (#TBD). The image pins
+# CLOAKBROWSER_CACHE_DIR to /opt/switchroom/cloakbrowser-cache and
+# compose bind-mounts the operator's single ~/.switchroom/cloakbrowser/
+# copy RO onto it. If that mount didn't materialise the dir is empty and
+# root-owned, so cloakbrowser cannot silently re-download its own ~700MB
+# private copy (verified live: it aborts with `[Errno 13] Permission
+# denied` instead of extracting) — it only loses local render. Warn
+# loudly, never fatally: webkite still cloud-renders when the
+# Cloudflare/Firecrawl credentials are present.
+sr_cb_dir="${CLOAKBROWSER_CACHE_DIR:-/opt/switchroom/cloakbrowser-cache}"
+if ! ls -d "$sr_cb_dir"/chromium-*/ >/dev/null 2>&1; then
+  echo "WARNING (cloakbrowser shared cache): shared cloakbrowser Chromium missing at $sr_cb_dir — webkite local render unavailable (cloud render still works if Cloudflare/Firecrawl creds are set). On the host run: CLOAKBROWSER_CACHE_DIR=~/.switchroom/cloakbrowser cloakbrowser install && switchroom apply" >&2
+fi
+unset sr_cb_dir
+
 # LiteLLM routing (opt-in, #litellm). When SWITCHROOM_LITELLM is set (compose
 # env, gated on litellm.enabled && keyConfirmed), route the unmodified `claude`
 # CLI through the operator's LiteLLM proxy at ANTHROPIC_BASE_URL: fetch the

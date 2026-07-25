@@ -20,7 +20,10 @@ function cfg(partial: Partial<SwitchroomConfig>): SwitchroomConfig {
   return partial as unknown as SwitchroomConfig;
 }
 
-function byName(rs: { name: string; status: string; detail?: string }[], name: string) {
+function byName(
+  rs: { name: string; status: string; detail?: string; fix?: string }[],
+  name: string,
+) {
   return rs.find((r) => r.name === name);
 }
 
@@ -73,8 +76,12 @@ function deps(fs: FakeFs, extra: Partial<WebkiteProbeDeps> = {}): WebkiteProbeDe
 }
 
 const BIN = "/home/op/.switchroom/bin/webkite";
-const CLOAK = "/home/op/.cloakbrowser";
-const CHROME = "/home/op/.cloakbrowser/chromium-146/chrome";
+// #TBD: the shared cache the fleet actually mounts.
+const CLOAK = "/home/op/.switchroom/cloakbrowser";
+const CHROME = "/home/op/.switchroom/cloakbrowser/chromium-146/chrome";
+// Pre-fix per-operator location — no longer mounted anywhere.
+const LEGACY_CLOAK = "/home/op/.cloakbrowser";
+const LEGACY_CHROME = "/home/op/.cloakbrowser/chromium-146/chrome";
 
 describe("runWebkiteChecks", () => {
   it("returns [] when every agent opts out of webkite", () => {
@@ -116,13 +123,45 @@ describe("runWebkiteChecks", () => {
     expect(byName(r, "webkite: cloakbrowser")?.status).toBe("warn");
   });
 
-  it("passes cloakbrowser when chromium/chrome is present", () => {
+  it("passes cloakbrowser when chromium/chrome is present in the shared cache", () => {
     const config = cfg({ agents: { a: {} as never } });
     const r = runWebkiteChecks(
       config,
       deps({ heads: { [BIN]: ELF_X64 }, dirs: { [CLOAK]: ["chromium-146"] }, files: { [CHROME]: "" } }),
     );
     expect(byName(r, "webkite: cloakbrowser")?.status).toBe("ok");
+  });
+
+  // #TBD: chromium sitting ONLY at the legacy ~/.cloakbrowser is the exact
+  // state that produced 5 private 697MB copies — nothing mounts that path,
+  // so it must warn (with a migration fix), not pass.
+  it("warns with a migration hint when chromium is only at the legacy ~/.cloakbrowser (#TBD)", () => {
+    const config = cfg({ agents: { a: {} as never } });
+    const r = runWebkiteChecks(
+      config,
+      deps({
+        heads: { [BIN]: ELF_X64 },
+        dirs: { [LEGACY_CLOAK]: ["chromium-146"] },
+        files: { [LEGACY_CHROME]: "" },
+      }),
+    );
+    const c = byName(r, "webkite: cloakbrowser");
+    expect(c?.status).toBe("warn");
+    expect(c?.fix).toContain("~/.switchroom/cloakbrowser");
+  });
+
+  // A doctor that dispenses advice which doesn't work IS the bug: the old
+  // hint (`XDG_DATA_HOME=… webkite setup --yes cloakbrowser`) relocated pipx,
+  // never the Chromium cache. The working lever is CLOAKBROWSER_CACHE_DIR,
+  // which cloakbrowser's config.py::get_cache_dir() reads.
+  it("hints the cache-dir env var that actually populates the shared cache (#TBD)", () => {
+    const config = cfg({ agents: { a: {} as never } });
+    const r = runWebkiteChecks(config, deps({ heads: { [BIN]: ELF_X64 } }));
+    const c = byName(r, "webkite: cloakbrowser");
+    expect(c?.status).toBe("warn");
+    expect(c?.fix).toContain("CLOAKBROWSER_CACHE_DIR=~/.switchroom/cloakbrowser");
+    expect(c?.fix).toContain("cloakbrowser install");
+    expect(c?.fix).not.toContain("XDG_DATA_HOME");
   });
 
   it("OK per-agent scaffold when wired + pre-approved + WebFetch denied", () => {

@@ -13,10 +13,11 @@
  *      build) won't run in-container — the agent silently loses web
  *      access. We read the ELF header on the host so the gross mistake
  *      is caught before a fleet roll, not after.
- *   2. cloakbrowser      — the local stealth Chromium render path lives
- *      at `~/.cloakbrowser/`. Absent → webkite can only cloud-render
- *      (Cloudflare/Firecrawl) and fails on bot-gated sites with no
- *      local fallback.
+ *   2. cloakbrowser      — the fleet-shared stealth Chromium lives at
+ *      `~/.switchroom/cloakbrowser/` and is bind-mounted RO onto the
+ *      image's CLOAKBROWSER_CACHE_DIR (#TBD). Absent → webkite can only
+ *      cloud-render (Cloudflare/Firecrawl) and fails on bot-gated sites
+ *      with no local fallback.
  *   3. scaffold wiring   — for each webkite-enabled agent that HAS been
  *      scaffolded: `.mcp.json` must carry the `webkite` entry,
  *      `settings.json` `permissions.allow` must pre-approve
@@ -179,26 +180,42 @@ export function runWebkiteChecks(
   }
 
   // ── 2. cloakbrowser local render ──────────────────────────────────
-  const cloakDir = join(d.homeDir, ".cloakbrowser");
-  let chromeFound = false;
-  if (d.existsSync(cloakDir)) {
+  // Probe the SHARED cache (`~/.switchroom/cloakbrowser/`) — the mount
+  // source compose.ts emits (#TBD). The legacy per-operator
+  // `~/.cloakbrowser/` is probed only to produce a migration hint: it is
+  // no longer mounted anywhere, so a fleet with only that is NOT healthy.
+  const sharedCloakDir = join(d.homeDir, ".switchroom", "cloakbrowser");
+  const legacyCloakDir = join(d.homeDir, ".cloakbrowser");
+  const hasChromium = (dir: string): boolean => {
+    if (!d.existsSync(dir)) return false;
     try {
-      for (const entry of d.readdirSync(cloakDir)) {
-        if (entry.startsWith("chromium-") && d.existsSync(join(cloakDir, entry, "chrome"))) {
-          chromeFound = true;
-          break;
+      for (const entry of d.readdirSync(dir)) {
+        if (entry.startsWith("chromium-") && d.existsSync(join(dir, entry, "chrome"))) {
+          return true;
         }
       }
-    } catch { /* unreadable dir — fall through to the not-found branch */ }
-  }
-  if (chromeFound) {
-    results.push({ name: "webkite: cloakbrowser", status: "ok", detail: "stealth Chromium present (local render available)" });
+    } catch { /* unreadable dir — treat as absent */ }
+    return false;
+  };
+  if (hasChromium(sharedCloakDir)) {
+    results.push({
+      name: "webkite: cloakbrowser",
+      status: "ok",
+      detail: "shared stealth Chromium present at ~/.switchroom/cloakbrowser (local render available; one copy mounted RO into every agent)",
+    });
+  } else if (hasChromium(legacyCloakDir)) {
+    results.push({
+      name: "webkite: cloakbrowser",
+      status: "warn",
+      detail: "stealth Chromium is at the legacy ~/.cloakbrowser but NOT at the shared ~/.switchroom/cloakbrowser — nothing mounts the legacy path, so every agent re-downloads its own ~700MB copy",
+      fix: "Move it to the shared path, then re-apply: mv ~/.cloakbrowser ~/.switchroom/cloakbrowser && chmod -R a+rX ~/.switchroom/cloakbrowser && switchroom apply",
+    });
   } else {
     results.push({
       name: "webkite: cloakbrowser",
       status: "warn",
-      detail: "no local stealth Chromium at ~/.cloakbrowser/chromium-*/chrome — webkite can only cloud-render (Cloudflare/Firecrawl) and will fail bot-gated sites with no local fallback",
-      fix: "Install once on the host: XDG_DATA_HOME=~/.switchroom/webkite-share webkite setup --yes cloakbrowser",
+      detail: "no shared stealth Chromium at ~/.switchroom/cloakbrowser/chromium-*/chrome — webkite can only cloud-render (Cloudflare/Firecrawl) and will fail bot-gated sites with no local fallback",
+      fix: "Populate once on the host, then re-apply: CLOAKBROWSER_CACHE_DIR=~/.switchroom/cloakbrowser cloakbrowser install && chmod -R a+rX ~/.switchroom/cloakbrowser && switchroom apply",
     });
   }
 
