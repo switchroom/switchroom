@@ -32,6 +32,10 @@ import {
 } from "./client.js";
 import type { BrokerClientOpts } from "../broker/client.js";
 import type { ApprovalDecisionMeta } from "../broker/protocol.js";
+import {
+  isGatedWriteApproved,
+  requireOperatorApprovalForWrites,
+} from "./gated-write-policy.js";
 
 export interface WaitForApprovalOpts {
   agent_unit: string;
@@ -77,7 +81,23 @@ export type WaitForApprovalResult =
   | { kind: "drift_revoked"; request_id: string }
   | { kind: "timeout"; request_id: string }
   | { kind: "aborted"; request_id?: string }
-  | { kind: "error"; reason: "broker_unreachable" | "missing_decision" };
+  | {
+      kind: "error";
+      reason:
+        | "broker_unreachable"
+        | "missing_decision"
+        /**
+         * The decision is live and granted, but was recorded with
+         * `origin != 'operator'` while
+         * `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE=1` — i.e. it is not
+         * proof an operator tapped, and may be the agent's own
+         * self-recorded row (see gated-write-policy.ts). Reported as an
+         * error rather than "denied" so the caller doesn't mis-tell the
+         * user a human refused them; every caller's `error` branch fails
+         * closed. Unreachable while the flag is off (the default).
+         */
+        | "not_operator_verified";
+    };
 
 /** Fallback wait when neither `timeout_ms` nor config is set: 60 min. */
 const FALLBACK_TIMEOUT_MS = 60 * 60_000;
@@ -233,6 +253,21 @@ export async function waitForApproval(
         // recorded a deny under the same (agent_unit, scope, action). Trust
         // `decision.decision` for the binary outcome.
         const isDeny = DENY_MODES.has(look.decision.decision);
+        // Provenance gate (self-approval bypass, #3598): a granted row is
+        // only proof of a human tap if the kernel stamped it
+        // `origin='operator'`. An agent can mint its own granted row on its
+        // own socket (acl.ts:39 blocks cross-agent, not self, forgery), so
+        // `state === "granted"` alone cannot authorize. No-op while the
+        // flag is off, which is the shipped default.
+        if (
+          !isDeny &&
+          !isGatedWriteApproved(
+            { state: "granted", origin: look.decision.origin },
+            requireOperatorApprovalForWrites(),
+          ).allow
+        ) {
+          return { kind: "error", reason: "not_operator_verified" };
+        }
         return {
           kind: "decided",
           state: isDeny ? "denied" : "granted",

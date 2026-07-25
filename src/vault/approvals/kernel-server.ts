@@ -337,10 +337,29 @@ const OPERATOR_ALLOWED_OPS: ReadonlySet<string> = new Set(["approval_list"]);
  * world — the per-agent socket is shared by the gateway AND claude
  * (same container, same UID; see `src/agents/compose.ts` — one `agent`
  * service, one `kernel-<agent>-sock` volume), so nothing recorded on it
- * is proof a human tapped. `'operator'` becomes producible when the
- * host-side approval verifier lands (RFC vault-approval-hard-boundary
- * PR ②) and is granted a write op on a claude-unreachable channel;
- * this function is the single place that decision is made.
+ * is proof a human tapped.
+ *
+ * Note precisely what is missing, because "no signal exists" would be
+ * false: `handleConnection` already captures SO_PEERCRED at accept(2),
+ * and `getPeerCred` returns `{pid, uid, gid}`
+ * (`src/vault/broker/peercred-ffi.ts:42-46`) — we keep the uid for audit
+ * and drop the pid on purpose. Keeping the pid would NOT yield
+ * provenance: under same-uid co-residency claude can read
+ * `/proc/<gateway-pid>/environ`, ptrace the gateway, or exec a process
+ * matching its exe path, so any pid→identity mapping is forgeable by the
+ * process it is meant to distrust — and this server's own PID namespace
+ * makes a peer pid from the agent container untranslatable anyway. The
+ * missing ingredient is a channel boundary, not a better fingerprint.
+ *
+ * That boundary partly exists already: `bindOperatorSocket` binds a 0600
+ * operator socket mounted only into the kernel container
+ * (`src/agents/compose.ts:1686`), kept read-only by `OPERATOR_ALLOWED_OPS`
+ * under a pinned contract (`kernel-operator-acl.test.ts`). So `'operator'`
+ * becomes producible once the host-side approval verifier lands (RFC
+ * vault-approval-hard-boundary PR ②): grant that socket a write op with a
+ * per-op authorization story, and move the tap consumer out of the agent
+ * container so it can reach it. This function is the single place that
+ * decision is made.
  */
 export function listenerOrigin(isOperator: boolean): "agent" | "operator" {
   return isOperator ? "operator" : "agent";

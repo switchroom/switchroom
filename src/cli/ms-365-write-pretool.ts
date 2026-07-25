@@ -970,11 +970,11 @@ async function main(): Promise<void> {
       recordOutcome(Date.now(), { ...ledgerEntry, outcome: "applied" });
       allow();
     }
-    if (state === "granted") {
+    if (state === "granted" && !verdict.allow) {
       // Granted but not operator-verified — fail closed immediately
       // rather than poll to the deadline on a decision we will never
       // accept.
-      fail(verdict.allow ? "unreachable" : verdict.reason);
+      fail(verdict.reason);
     }
     if (state === "expired" || state === "drift_revoked") {
       // Grant lapsed (TTL elapsed / approver drift) — NOT an intentional deny.

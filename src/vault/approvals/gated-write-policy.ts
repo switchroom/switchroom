@@ -38,6 +38,22 @@
  * 10001`). The kernel therefore cannot tell the two apart, so every
  * decision it records is honestly `origin='agent'`.
  *
+ * To be precise about WHY, because "there is no signal" would be false:
+ * a signal exists and is UNUSABLE. The kernel already captures
+ * SO_PEERCRED at accept(2) (`kernel-server.ts:handleConnection`), and
+ * `getPeerCred` returns `{pid, uid, gid}`
+ * (`src/vault/broker/peercred-ffi.ts:42-46`) — the kernel keeps the uid
+ * for audit and deliberately discards the pid as forensic-only. Keeping
+ * the pid would not help:
+ *   - same uid ⇒ claude can read `/proc/<gateway-pid>/environ`, ptrace
+ *     the gateway, or exec a process whose exe path matches it, so ANY
+ *     pid→identity mapping is forgeable by the exact process it is meant
+ *     to distrust; and
+ *   - the kernel runs in its own PID namespace, so a peer pid from the
+ *     agent container is not even translatable to something it could
+ *     inspect.
+ * Provenance needs a channel boundary, not a better fingerprint.
+ *
  * Consequence: with `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE=1`, the
  * self-approval bypass is closed — AND every legitimate Telegram approval
  * for a gated Drive / M365 write is also refused, because it is
@@ -46,7 +62,19 @@
  * comment is the honest reason. The flag becomes the correct default the
  * moment the host-side approval verifier (RFC
  * vault-approval-hard-boundary PR ②) starts writing operator-origin rows
- * on a channel claude cannot reach. Same reasoning applies to the
+ * on a channel claude cannot reach.
+ *
+ * That follow-up is NOT greenfield: the claude-unreachable channel
+ * already exists. `bindOperatorSocket` binds
+ * `/run/switchroom/kernel/operator/sock` 0600 to the host operator uid,
+ * mounted only into the kernel container (`src/agents/compose.ts:1686`),
+ * and it is read-only by an explicitly pinned contract —
+ * `OPERATOR_ALLOWED_OPS = {approval_list}` (`kernel-server.ts`), asserted
+ * in `kernel-operator-acl.test.ts`. So the RFC's work is (a) grant that
+ * socket a write op with a per-op authorization story, and (b) relocate
+ * the tap consumer OUT of the agent container so it can reach that
+ * socket. `listenerOrigin()` is already the single function that would
+ * then start returning 'operator'. Same reasoning applies to the
  * broker's sibling `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT`
  * (`src/vault/broker/server.ts`), which stays default-off for the
  * identical reason.

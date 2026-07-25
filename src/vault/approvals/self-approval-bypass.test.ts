@@ -24,9 +24,9 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import * as net from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { bootstrap, type KernelServerHandle } from "./kernel-server.js";
 import { encodeRequest } from "../broker/protocol.js";
 import { requestApproval, consumeNonce, recordDecision } from "./kernel.js";
@@ -215,4 +215,112 @@ describe("self-approval bypass — agent-recorded decisions are not operator tap
     expect(lookup.state).toBe("granted");
     expect(lookup.decision.origin).toBe("agent");
   });
+});
+
+/**
+ * Hook-level wiring (review finding F8). The suites above call
+ * `isGatedWriteApproved` directly, so a refactor that dropped
+ * `REQUIRE_OPERATOR_ORIGIN` from `src/cli/drive-write-pretool.ts` — i.e.
+ * removed the enforcement from the only place it actually runs — would
+ * still leave them green. These tests SPAWN the real hook against a real
+ * kernel socket holding a real self-approved decision, and assert the
+ * flag changes the hook's verdict.
+ */
+describe("drive-write-pretool — the gate is actually wired into the hook", () => {
+  let dir: string;
+  let handle: KernelServerHandle;
+  let stateDir: string;
+  const HOOK = resolve(import.meta.dir, "../../cli/drive-write-pretool.ts");
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "kernel-hookgate-"));
+    handle = await bootstrap({
+      socketParent: dir,
+      agents: [AGENT],
+      dbPath: ":memory:",
+    });
+    // access.json → allowFrom, else the hook fails closed on "no operator
+    // paired" before it ever reaches the approval lookup.
+    stateDir = join(dir, "state");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, "access.json"),
+      JSON.stringify({ allowFrom: APPROVER }),
+    );
+
+    // The self-approval attack, straight into the kernel db this socket
+    // serves: origin='agent', state will read 'granted'.
+    const r = requestApproval(handle.db, {
+      agent_unit: AGENT,
+      scope: SCOPE,
+      action: "write",
+      approver_set: APPROVER,
+    });
+    const nonce = consumeNonce(handle.db, r.request_id)!;
+    recordDecision(handle.db, {
+      nonce,
+      decision: "allow_always",
+      approver_set: APPROVER,
+      granted_by_user_id: 4242,
+      // origin omitted ⇒ 'agent', exactly what the kernel stamps for a
+      // decision recorded on a per-agent socket.
+    });
+  });
+
+  afterEach(() => {
+    try {
+      handle.stop();
+    } catch {
+      /* ignore */
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Run the hook over a gated Drive write; returns exit code + stdout. */
+  async function runHook(
+    env: Record<string, string>,
+  ): Promise<{ code: number; stdout: string }> {
+    const proc = Bun.spawn(["bun", HOOK], {
+      stdin: new TextEncoder().encode(
+        JSON.stringify({
+          tool_name: "mcp__google-workspace__modify_doc_text",
+          tool_input: { document_id: DOC, content: "hi" },
+        }),
+      ),
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        SWITCHROOM_AGENT_NAME: AGENT,
+        SWITCHROOM_KERNEL_SOCKET: join(dir, AGENT, "sock"),
+        TELEGRAM_STATE_DIR: stateDir,
+        // Point the auth-broker at a dead path so the flag-ON case can
+        // never accidentally proceed to a live Google call.
+        SWITCHROOM_VAULT_BROKER_SOCK: join(dir, "no-such-broker.sock"),
+        ...env,
+      },
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    return { code, stdout };
+  }
+
+  it("flag OFF: the self-approved decision satisfies the hook (documents the live exposure)", async () => {
+    const { code, stdout } = await runHook({});
+    // allow() = exit 0 with no decision payload on stdout.
+    expect(code).toBe(0);
+    expect(stdout).not.toContain('"block"');
+  }, 20_000);
+
+  it("SECURITY: flag ON: the same self-approved decision does NOT satisfy the hook", async () => {
+    const { stdout } = await runHook({
+      SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE: "1",
+    });
+    // The hook must NOT fall through to allow. It blocks — either on the
+    // provenance check itself or, having refused the fast path, on the
+    // downstream auth-broker. Either way the write is refused, which is
+    // the security outcome; asserting only "not allowed" keeps the test
+    // from pinning an unrelated downstream message.
+    expect(stdout).toContain('"block"');
+  }, 20_000);
 });
