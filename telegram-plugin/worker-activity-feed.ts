@@ -143,6 +143,25 @@ export interface BotApiForWorkerFeed {
 const DESC_MAX = 80
 
 /**
+ * Repeat marker appended to a narrative step that fired more than once in a
+ * row (`Running a command ·×3`). Rendered inline on the step line so a worker
+ * whose every step carries the SAME label still visibly advances instead of
+ * freezing the card. `·` is already the card's separator glyph.
+ */
+const REPEAT_SUFFIX_RE = / ·×(\d+)$/
+
+/** The step text without its `·×N` marker (identity for dedup comparisons). */
+export function stripRepeatSuffix(line: string): string {
+  return line.replace(REPEAT_SUFFIX_RE, '')
+}
+
+/** How many times a step line has fired: 1 when it carries no marker. */
+export function repeatCountOf(line: string): number {
+  const m = REPEAT_SUFFIX_RE.exec(line)
+  return m == null ? 1 : Number(m[1])
+}
+
+/**
  * Thin adapter over the unified `renderStatusCard` primitive (emoji 🛠, label
  * 'Worker'): builds the header, passes raw narrative steps (the primitive runs
  * stripMarkdown → collapse ws → clip → escape per line), and on finish passes
@@ -428,6 +447,13 @@ interface WorkerRow {
    * live render so the feed reads like the main agent's answer.
    */
   narrative: string[]
+  /**
+   * `view.toolCount` observed when the newest narrative step was last recorded
+   * or counted. The repeat counter (`·×N`) increments only when toolCount has
+   * MOVED — the watcher re-emits an unchanged view every tick, so counting
+   * label-equality alone would inflate the number with no work behind it.
+   */
+  lastNarrativeToolCount: number | null
   /** Last view for this worker (drives the heartbeat re-render + combined row). */
   lastView: WorkerActivityView | null
   /** Latest state observed for this worker; excluded from the running set once
@@ -794,10 +820,33 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   function accumulateNarrative(row: WorkerRow, view: WorkerActivityView): void {
     const line = view.latestSummary.trim()
     if (line.length === 0) return
+
+    // A REPEAT of the current step is counted, not dropped. A worker whose
+    // steps all render the same label (e.g. Bash calls with no description →
+    // "Running a command") used to hit the dedup below on every tool call and
+    // the card held ONE frozen line for the whole job — indistinguishable from
+    // a wedged worker. `·×N` makes the repetition visible and, because a new
+    // count resets stepStartedAtMs, the climbing `· Ns` step timer restarts
+    // with each real call.
+    //
+    // Gated on `view.toolCount`, NOT on the label: the watcher re-emits an
+    // UNCHANGED view on every tick, so counting label-equality alone would
+    // inflate the number with no work behind it. One increment per observed
+    // tool call, deterministically.
+    const last = row.narrative.length > 0 ? row.narrative[row.narrative.length - 1] : null
+    if (last != null && stripRepeatSuffix(last) === line) {
+      if (view.toolCount === row.lastNarrativeToolCount) return
+      row.lastNarrativeToolCount = view.toolCount
+      row.narrative[row.narrative.length - 1] = `${line} ·×${repeatCountOf(last) + 1}`
+      row.stepStartedAtMs = nowFn()
+      return
+    }
+
     // Dedup within the whole rolling window (the watcher re-emits the same
     // narrative across ticks, and a preamble + its tool label can repeat
     // non-adjacently — the A,B,A duplication observed on live cards).
-    if (row.narrative.includes(line)) return
+    if (row.narrative.some((l) => stripRepeatSuffix(l) === line)) return
+    row.lastNarrativeToolCount = view.toolCount
     row.narrative.push(line)
     // The `→` current-step line just CHANGED — reset the per-step timer.
     row.stepStartedAtMs = nowFn()
@@ -1545,6 +1594,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           agentId,
           ordinal: ++g.workerOrdinalCounter,
           narrative: [],
+          lastNarrativeToolCount: null,
           lastView: null,
           state: 'running',
           finished: false,

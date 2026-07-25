@@ -49,18 +49,33 @@ describe('buildTelegramProgressGuidance', () => {
     expect(out).toContain('mcp__switchroom-telegram__progress_update')
   })
 
-  it('mentions the inflection points (start, blocker, chunk done)', () => {
+  it('names the inflection points worth spending a send on', () => {
     const out = buildTelegramProgressGuidance({ defaultChatId: '1' })
-    expect(out).toContain('Start of work')
-    expect(out).toContain('Blocker')
-    expect(out).toContain('chunk done')
+    expect(out).toContain('blocker or pivot')
+    expect(out).toContain('long silent stretch')
   })
 
-  it('explains that progress_update lands on the parent card, not as a separate message', () => {
+  // Truthfulness guard. The pinned progress card was deleted in #1122/#1126
+  // and the card-injection path in `executeProgressUpdate` went with it, but
+  // this prompt kept telling every sub-agent its updates land on a card row
+  // and cost the user nothing. A sub-agent that believes a send is free will
+  // spam the chat (exactly the #256 regression). The guidance must describe
+  // what the tool does TODAY: a real, rate-limited Telegram message.
+  it('does NOT claim a pinned card or a free/no-message send', () => {
+    const out = buildTelegramProgressGuidance({ defaultChatId: '1' }).toLowerCase()
+    expect(out).not.toContain('pinned card')
+    expect(out).not.toContain('pinned progress card')
+    expect(out).not.toContain('does not send a separate telegram message')
+    expect(out).not.toContain('call it freely')
+  })
+
+  it('states that it sends a real Telegram message, and its limits', () => {
     const out = buildTelegramProgressGuidance({ defaultChatId: '1' })
-    expect(out.toLowerCase()).toContain('pinned')
-    expect(out.toLowerCase()).toContain('card')
-    expect(out.toLowerCase()).toContain('does not send a separate telegram message')
+    expect(out.toLowerCase()).toContain('new plain telegram message')
+    expect(out.toLowerCase()).toContain('sparingly')
+    expect(out).toContain('20 seconds')
+    expect(out).toContain('5 per turn')
+    expect(out).toContain('300 chars')
   })
 })
 

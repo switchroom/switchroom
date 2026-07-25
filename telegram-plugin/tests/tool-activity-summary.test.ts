@@ -21,8 +21,15 @@ describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () =>
     expect(
       describeToolUse("Bash", { command: "ls -la /tmp", description: "List workspace" }),
     ).toBe("List workspace");
-    // No description → safe generic, still never the raw command.
-    expect(describeToolUse("Bash", { command: "grep -r foo ." })).toBe("Running a command");
+    // No description → sanitised PROGRAM-ONLY derivation, never the raw
+    // command (its args routinely carry tokens and private paths). The old
+    // behavior was a constant "Running a command" for every Bash call, which
+    // froze the sub-agent step feed on one line for a whole job.
+    expect(describeToolUse("Bash", { command: "grep -r foo ." })).toBe("Running grep");
+    // Nothing safe to derive → the generic label is still the floor.
+    expect(describeToolUse("Bash", { command: "$(cat /run/secrets/token) --x" })).toBe(
+      "Running a command",
+    );
   });
 
   it("Read/Edit/Write render the file basename, not the full path", () => {

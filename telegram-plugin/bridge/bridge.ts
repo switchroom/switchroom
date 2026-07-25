@@ -134,6 +134,20 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'progress_update',
+    description:
+      'Post a short interim progress line to Telegram mid-task ("still working through X"). Sends a NEW plain message to the chat — it is not an edit and not a card row, so use it sparingly and only when the user genuinely benefits from knowing where a long task stands. The gateway enforces its own limits: text is truncated at 300 chars, at most one update per 20s per chat+thread, and at most 5 per turn; over-limit calls return {ok:false, reason:"too_soon"|"turn_limit"} instead of sending. Prefer edit_message when you already own a message to update, and always deliver the actual answer with reply.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat to post the progress line in — pass chat_id from the inbound message.' },
+        text: { type: 'string', description: 'The progress line. One short sentence; truncated at 300 chars by the gateway.' },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message in the same chat if not specified.' },
+      },
+      required: ['chat_id', 'text'],
+    },
+  },
+  {
     name: 'react',
     description: 'Add an emoji reaction to a Telegram message. Telegram only accepts a fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc) — non-whitelisted emoji will be rejected.',
     inputSchema: {
