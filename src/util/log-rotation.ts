@@ -82,6 +82,12 @@ export interface RotateOptions {
    * the size is re-checked while holding the lock, so the loser sees the
    * freshly-truncated file and declines.
    *
+   * BOUND, not merely documented convention: the lock is proven mutually
+   * exclusive for at most TWO concurrent rotators per path. At three the
+   * stale-lock reclaim has a real window (see {@link withRotateLock}'s
+   * residual). Adding a third writer process to a locked log is a design
+   * change, not a config change, and must revisit that analysis first.
+   *
    * Single-writer logs (vault audit, hostd audit — both serialized
    * in-process, see `audit-hashchain.ts` single-writer-process contract)
    * do not need it and leave this false.
@@ -128,16 +134,75 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * cannot delete the new holder's lock on the way out.
  *
  * Residual, stated honestly rather than papered over with an invariant
- * that is not true: three-plus processes interleaving inside the
- * sub-millisecond window of step 3 can still restore a lock over a
- * just-taken one. It needs a crashed holder, a >30s-idle log, and
- * microsecond-precise arrival of a third racer; the failure mode is one
- * lost rotation cycle, not a lost generation. Everything shorter than
- * that — the ordinary two-reclaimer race the reviewer reproduced — is
- * closed here, and the under-lock size re-check in
- * {@link maybeRotateLogFile} is the second, independent guard against
+ * that is not true. The breach is at step 1, not step 3: `rename` moves
+ * the lock off `lockPath`, so for the whole rename→claim interval the
+ * path is genuinely UNLOCKED and any arrival can legitimately
+ * `open(wx)` it. With three processes that is reachable — A parks a
+ * stale lock and reclaims; C arrives in A's interval and takes the path;
+ * B, which parked a live lock and is unwinding its step-3 mismatch, then
+ * runs its cleanup `unlinkSync(parked)` on what is now A's only link.
+ * A and C are both inside `fn()`, and `linkSync` is not what does the
+ * damage — it EEXISTs and cannot clobber. The cost is NOT one lost
+ * cycle: both rotators re-check `overCap` before either truncates, so
+ * both proceed, and at maxFiles=2 the second `unlinkSync(<log>.2)`
+ * destroys real history while its zero-byte copy lands on the first's
+ * fresh `.1`. Prior generation gone AND current snapshot zeroed — the
+ * exact outcome {@link RotateOptions.lock} calls strictly worse than the
+ * unlocked copy/truncate window.
+ *
+ * It is UNREACHABLE for the only `lock: true` log. That is
+ * `rotateWebhookLogIfNeeded` (`src/web/webhook-handler.ts:196`), which
+ * has exactly two writer processes per path — `handleWebhookIngest` in
+ * the web container and `recordWebhookEvent` in the agent gateway — and
+ * the interleaving needs a third. Raising any locked log to three
+ * concurrent writers is therefore a DESIGN change, not a config change:
+ * it re-opens this window and must revisit this comment. Closing it in
+ * code would need an identity-checked rename (POSIX has none) or a
+ * kernel `flock`/`fcntl` lease (not in Node's stdlib), so it is
+ * documented rather than fixed.
+ *
+ * Everything at two contenders — the ordinary two-reclaimer race the
+ * reviewer reproduced — is closed here, and the under-lock size re-check
+ * in {@link maybeRotateLogFile} is the second, independent guard against
  * copying an already-rotated (empty) file over a good `.1`.
  */
+/**
+ * Reap `<lockPath>.stale.<pid>.<rand>` files stranded by a crash between
+ * the reclaim's `rename` and its cleanup `unlink` (#3600 round-3, L2).
+ * Nothing else globs these names, so without this they accumulate one per
+ * crash-in-window, forever, in the agent's telegram dir.
+ *
+ * Only parks whose mtime is already past {@link ROTATE_LOCK_STALE_MS} are
+ * taken, and `keep` (our own, this reclaim) is always skipped. A peer
+ * mid-reclaim can hold an eligible park — reaping it makes that peer's
+ * step-2 stat fail, so it declines and takes no lock. That is a missed
+ * rotation cycle at worst; it cannot wedge the path or produce two
+ * rotators.
+ *
+ * Entirely best-effort: every failure is swallowed, so this can never
+ * throw out of the reclaim it runs inside.
+ */
+function sweepStaleParks(lockPath: string, keep: string): void {
+  try {
+    const dir = path.dirname(lockPath);
+    const prefix = `${path.basename(lockPath)}.stale.`;
+    const cutoff = Date.now() - ROTATE_LOCK_STALE_MS;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(prefix)) continue;
+      const full = path.join(dir, name);
+      if (full === keep) continue;
+      try {
+        if (fs.statSync(full).mtimeMs > cutoff) continue;
+        fs.unlinkSync(full);
+      } catch {
+        /* raced with a peer's reclaim or another sweeper — leave it */
+      }
+    }
+  } catch {
+    /* unreadable dir — sweeping is housekeeping, never fatal */
+  }
+}
+
 function withRotateLock<T>(
   logPath: string,
   tag: string,
@@ -208,6 +273,9 @@ function withRotateLock<T>(
     } catch {
       /* best-effort — the park name is unique to us */
     }
+    // We are the one process known to be reclaiming this path right now:
+    // the cheapest safe moment to collect parks other crashes stranded.
+    sweepStaleParks(lockPath, parked);
     try {
       fd = fs.openSync(lockPath, "wx", 0o600);
     } catch {

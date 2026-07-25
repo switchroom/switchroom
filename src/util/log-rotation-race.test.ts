@@ -173,6 +173,74 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
     expect(realFs.existsSync(lock)).toBe(false); // released
   });
 
+  it("sweeps park files a crashed reclaim stranded (L2)", () => {
+    // A crash between the reclaim's `rename` and its cleanup `unlink`
+    // leaves `<lock>.stale.<pid>.<rand>` behind forever — nothing else
+    // globs that name. A successful reclaim must collect the aged ones.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    realFs.writeFileSync(lock, "");
+    const old = Date.now() / 1000 - 300;
+    realFs.utimesSync(lock, old, old);
+
+    // Two leaked parks from earlier crashes, both past the threshold.
+    const leaked = [`${lock}.stale.999.aaaaaaaa`, `${lock}.stale.998.bbbbbbbb`];
+    for (const f of leaked) {
+      realFs.writeFileSync(f, "");
+      realFs.utimesSync(f, old, old);
+    }
+    // A park younger than the threshold — a peer may be mid-reclaim with
+    // it, so it must survive; and an unrelated neighbour must too.
+    const fresh = `${lock}.stale.997.cccccccc`;
+    realFs.writeFileSync(fresh, "");
+    const neighbour = `${log}.1`;
+    realFs.writeFileSync(neighbour, HISTORY);
+
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 3,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(true);
+
+    for (const f of leaked) expect(realFs.existsSync(f)).toBe(false);
+    expect(realFs.existsSync(fresh)).toBe(true);
+    expect(realFs.existsSync(neighbour)).toBe(true);
+    // And our own park did not survive either.
+    expect(
+      realFs.readdirSync(dir).filter((f) => f.includes(".stale.")),
+    ).toEqual([path.basename(fresh)]);
+  });
+
+  it("a failing sweep never breaks the reclaim (L2)", () => {
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    realFs.writeFileSync(lock, "");
+    const old = Date.now() / 1000 - 300;
+    realFs.utimesSync(lock, old, old);
+
+    const leaked = `${lock}.stale.999.aaaaaaaa`;
+    realFs.writeFileSync(leaked, "");
+    realFs.utimesSync(leaked, old, old);
+
+    // The park vanishes under the sweep (a peer reaped it first): the
+    // unlink throws ENOENT and must be swallowed, not escape the reclaim.
+    hooks.beforeUnlink = (p) => {
+      if (p === leaked) realFs.rmSync(leaked, { force: true });
+    };
+
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(true);
+    expect(realFs.statSync(`${log}.1`).size).toBe(CAP * 4);
+    expect(realFs.statSync(log).size).toBe(0);
+  });
+
   it("release does not delete a lock that is no longer ours", () => {
     // We overran the stale threshold and a peer reclaimed while we were
     // inside; the identity-guarded release must not unlink the peer's
