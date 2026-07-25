@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Turn registry — mid-session reaps are no longer labelled "restart" (#3555)
+
+- **`reapStaleOpenTurns` stamps `ended_via='reaped_stale'`** instead of
+  borrowing `'restart'`. Nothing restarts in that path — the mid-session sweep
+  simply gives up on an ownerless open row past the 15-minute reaper TTL. The
+  old label contaminated the column: on one host 1055 `'restart'` rows, 967 of
+  them (91.7%) in a 15-19 minute band matching the TTL, against exactly ONE
+  `[supervise] gateway exited` in the same window. **Any statistic previously
+  computed from `ended_via='restart'` needs re-deriving.** Behaviour is
+  unchanged — `'reaped_stale'` is in `INTERRUPTED_VIA` and maps to the same
+  `'resume'`, so affected turns still resume exactly as before.
+
+  ⚠️ **DO NOT ROLL BACK PAST THIS VERSION ONCE DEPLOYED.** The change is
+  forward-compatible but *not* backward-compatible. A pre-#3555 binary does
+  not know `'reaped_stale'`: its `INTERRUPTED_VIA` excludes it and its
+  `selectResumeBuilder` matches no branch, so a turn stamped by the new binary
+  and then read by the old one is treated as cleanly finished and the user's
+  interrupted turn is **silently dropped**. With a 15-minute reaper TTL on a
+  5-minute sweep, freshly-stamped rows are common, so the exposure window is
+  real rather than theoretical. Roll forward to fix; do not downgrade.
+
 ### Voice out — pacing & misreadings
 
 - **Lists and headings are spoken as separate sentences** — stripping a bullet

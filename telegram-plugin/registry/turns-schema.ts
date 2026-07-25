@@ -806,9 +806,13 @@ export function markAnswerRedelivered(
 
 /**
  * Return the single most-recently-started turn IFF it was interrupted
- * (`ended_at IS NULL`, or `ended_via` in {restart, sigterm, timeout,
- * unknown}). Returns null when the latest turn ended cleanly (`'stop'`)
- * or there are no turns at all.
+ * (`ended_at IS NULL`, or `ended_via` in {restart, reaped_stale, sigterm,
+ * timeout, unknown} — i.e. `INTERRUPTED_VIA`). Returns null when the latest
+ * turn ended cleanly (`'stop'`) or there are no turns at all.
+ *
+ * `'reaped_stale'` (#3555) is in that set for the same reason `'restart'` is:
+ * a row the mid-session sweep gave up on was still a turn the user was owed
+ * an answer for. Omitting it would silently drop the resume.
  *
  * This is the resume gate. Keying on the *latest* turn (not "latest
  * interrupted turn anywhere in history") is deliberate: once the agent
