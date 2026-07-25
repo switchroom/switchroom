@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+### Hindsight — the pending-retains backlog was a re-post loop, not lost memory (#3596)
+
+The queue on this fleet grew to 5,751 entries. The cause was **not** that
+memory was being lost — a full sweep on 2026-07-25 found **4,048 (70.4%)
+already existed as documents** in their bank, 3,815 of them with facts
+extracted. Only 1,703 (29.6%) were genuinely absent.
+
+- **Root cause: the SessionStart drain built the backlog it was supposed to
+  clear.** `drain_pending.py` runs inside the hook and clamps each entry's
+  HTTP timeout to the remaining hook budget (1-8s), while `_retry_one` posts
+  `async_processing=False` — a synchronous retain that takes 30-90s. So the
+  server committed the document and the client *always* gave up before the
+  ack. The entry was never deleted, was re-posted on every session start
+  forever, and aged toward `.dead` while the memory it carried was already
+  durable.
+- **`--backlog` is now a two-phase, out-of-hook replay.** Phase 1 (reconcile)
+  GETs the document and drops the entry if it already exists: no POST, no LLM
+  work, no cost, resumable at any point — on the measured fleet that is 70% of
+  the queue for free. Phase 2 posts only genuinely-absent entries with a
+  realistic timeout (`HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`, 180s) and then
+  **re-GETs to confirm the document before deleting the entry** —
+  commit-before-delete, because a 200 is an ack and not proof (#3244). It is
+  still `async_processing=False` for exactly that reason: deleting the queue
+  entry on an async ack is the #3244 silent-loss bug.
+- **Replay is paced, because the model pool is fleet-shared.**
+  `HINDSIGHT_DRAIN_CONCURRENCY` now defaults to **1**, not 4: the group
+  serving retain has 4 lanes shared with live retains, reflect and
+  consolidation, so 11 agents at width 4 is 44 lanes of demand against 4.
+  Phase 2 sleeps between entries (`HINDSIGHT_DRAIN_SLEEP_S`) and pauses
+  entirely while an operator-supplied probe (`HINDSIGHT_DRAIN_P95_CMD`,
+  threshold `HINDSIGHT_DRAIN_P95_BACKOFF_MS`) reports the upstream is already
+  slow, so the replay can never be what trips a latency alarm.
+- **A full queue now evicts the OLDEST entry instead of refusing the newest.**
+  `lib/pending.py` previously returned `None` at `MAX_ENTRIES`, throwing away
+  the turn that had just happened — the one most likely to still matter — and
+  three of six call sites discarded that return, so it was silent. It now
+  sheds oldest-first into a bounded `pending-evicted/` archive with an
+  append-only `pending-evictions.log`, and dedupes on
+  `(bank, document_id, sha256(content))` (`reconcile_tail` re-enqueues the same
+  slice every boot until its watermark is confirmed; 63% of one measured fleet
+  queue was duplicates). Both caps are env-driven
+  (`HINDSIGHT_PENDING_MAX_ENTRIES`, `HINDSIGHT_PENDING_MAX_BYTES`), because a
+  count cap alone bounds disk only to within ~1500x at the measured content
+  spread (499 B .. 744 KB). This ports the design already validated and running
+  out of band on the fleet — file patches to the vendored plugin do not survive
+  `switchroom apply`, which is why it belongs in-repo.
+- **Residual drops are still recorded.** With eviction in place, a *drop* now
+  means the entry could not be written at all (disk full, permissions). That
+  case gets a loud stderr line plus a durable `pending-drops.json` ledger — a
+  **sibling** of the queue dir, so it can never be listed as an entry, drained,
+  or counted against the caps.
+- **`switchroom doctor` told the operator two false things.** It claimed a live
+  backlog "drains automatically on the agent's next SessionStart" (it cannot —
+  that drain is what built it), and it hardcoded the cap at 1000 while the live
+  cap is env-driven at 2000, so it reported "at cap, dropping new failures"
+  against containers that were happily accepting entries. The row now reads the
+  agent's **live** cap out of the container, describes a full queue accurately
+  (`warn`: at the eviction threshold — nothing lost yet, the next entry sheds
+  the oldest), and reserves `fail` for actual loss: `.dead` markers, residual
+  drops, or recorded evictions. The remediation names the reconcile phase first
+  and spells out the pacing.
+
 ## v0.19.18 — MCP instructions truncation (security), turn-liveness fixes, hindsight ranking & recall, CI hardening
 
 ### Telegram — the MCP `instructions` string was silently truncated, disabling a security guardrail (#3587)

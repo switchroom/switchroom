@@ -1,5 +1,7 @@
 """Tests for the pending-retains persistent queue (#1071)."""
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -83,16 +85,30 @@ class PendingQueueTest(unittest.TestCase):
         self.assertEqual(len(names), 1)
         self.assertFalse(any(n.endswith(".tmp") for n in names))
 
-    def test_enqueue_returns_none_when_full(self):
-        # Pre-populate with MAX_ENTRIES dummy files.
+    def test_enqueue_evicts_oldest_when_full_instead_of_refusing(self):
+        """switchroom #3596: a full queue sheds the OLDEST entry.
+
+        This test previously asserted the opposite -- that ``enqueue()``
+        returns ``None`` at ``MAX_ENTRIES`` -- which meant throwing away the
+        turn that had just happened, the one most likely to still matter,
+        while keeping a queue full of stale ones.
+        """
         os.makedirs(self._dir, mode=0o700)
+        oldest = os.path.join(self._dir, f"{0:013d}-aaaaaaaaaaaa.json")
         for i in range(pending_mod.MAX_ENTRIES):
             with open(os.path.join(self._dir, f"{i:013d}-aaaaaaaaaaaa.json"), "w") as f:
                 json.dump({"placeholder": True}, f)
-        result = pending_mod.enqueue(self._sample_payload(), RuntimeError("boom"))
-        self.assertIsNone(result)
-        # Count unchanged
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = pending_mod.enqueue(self._sample_payload(), RuntimeError("boom"))
+
+        self.assertIsNotNone(result, "the incoming entry must never be refused")
+        self.assertTrue(os.path.exists(result))
+        self.assertFalse(os.path.exists(oldest), "the oldest entry was evicted")
+        # Cap still honoured: one in, one out.
         self.assertEqual(pending_mod.count(), pending_mod.MAX_ENTRIES)
+        self.assertIn("evicted OLDEST", stderr.getvalue())
 
     def test_iter_entries_ordered_oldest_first(self):
         p1 = pending_mod.enqueue(self._sample_payload("doc-1"), RuntimeError("e1"))

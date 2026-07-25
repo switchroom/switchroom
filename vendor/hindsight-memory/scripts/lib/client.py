@@ -206,6 +206,49 @@ class HindsightClient:
         }
         return self._request("POST", path, body, timeout=timeout)
 
+    def document_exists(
+        self,
+        bank_id: str,
+        document_id: str,
+        timeout: int = 30,
+    ) -> Optional[bool]:
+        """TRI-STATE presence check for one document (switchroom #3596).
+
+        ``True`` — the document is there. ``False`` — the server said 404.
+        ``None`` — **unknown** (transport error, 5xx, timeout).
+
+        The tri-state is load-bearing and must not be collapsed to a bool.
+        Two callers depend on it:
+
+        * the backlog drain's reconcile phase, which SKIPS a retain when the
+          memory already exists. Treating "unknown" as ``False`` there would
+          re-POST a document that is already durable — the duplicated-LLM-cost
+          bug this check exists to avoid (70.4% of one measured 5,751-entry
+          fleet backlog already existed as documents).
+        * commit-before-delete, which only deletes a queue entry once presence
+          is CONFIRMED. Treating "unknown" as ``True`` there would delete the
+          last on-disk copy of a turn on a flaky GET — the #3244 silent-loss
+          shape, reintroduced from the other direction.
+
+        Deliberately does NOT reuse ``_request()``: that wraps every
+        ``HTTPError`` into a ``RuntimeError``, which would make a 404
+        indistinguishable from a 503 without string-matching the message.
+        """
+        bank = urllib.parse.quote(bank_id, safe="")
+        did = urllib.parse.quote(document_id, safe="")
+        url = f"{self.api_url}/v1/default/banks/{bank}/documents/{did}"
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self._resolve_timeout(timeout)
+            ) as resp:
+                resp.read()
+                return True
+        except urllib.error.HTTPError as e:
+            return False if e.code == 404 else None
+        except Exception:
+            return None
+
     def list_session_document_ids(
         self,
         bank_id: str,

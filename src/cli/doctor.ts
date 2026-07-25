@@ -1385,11 +1385,18 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
 }
 
 /**
- * The bounded queue cap — keep in sync with MAX_ENTRIES in
- * ``vendor/hindsight-memory/scripts/lib/pending.py``. At the cap the
- * drainer starts dropping new failures, so it escalates warn → fail.
+ * Fallback queue cap, used only when the probe cannot read the agent's
+ * own ``HINDSIGHT_PENDING_MAX_ENTRIES``.
+ *
+ * Keep in sync with the default of ``MAX_ENTRIES`` in
+ * ``vendor/hindsight-memory/scripts/lib/pending.py``. The cap is
+ * env-driven there and is already retuned fleet-wide via
+ * ``switchroom.yaml``, so hardcoding a number here made doctor report
+ * "at cap" against a container that was happily accepting entries. The
+ * probe therefore reads the LIVE value out of the container and only
+ * falls back to this constant.
  */
-const PENDING_RETAINS_MAX_ENTRIES = 1000;
+const PENDING_RETAINS_DEFAULT_MAX_ENTRIES = 2000;
 
 /**
  * Per-agent probe result for the pending-retains queue.
@@ -1407,6 +1414,34 @@ export interface PendingRetainsProbeResult {
   pending: number;
   /** count of ``*.json.dead`` markers */
   dead: number;
+  /**
+   * Cumulative count of RESIDUAL drops — retains that could not be
+   * written at all (disk full, permissions) even after eviction made
+   * room. Read from the ``pending-drops.json`` ledger written by
+   * ``lib/pending.py:record_drop()``, which is a SIBLING of the queue
+   * directory so it can never be counted as an entry. Each drop is a
+   * turn's memory that is permanently gone, so a non-zero value fails
+   * the row even after the live queue has drained.
+   */
+  dropped: number;
+  /**
+   * Cumulative count of entries EVICTED to make room for newer ones,
+   * one line per eviction in the ``pending-evictions.log`` ledger.
+   *
+   * Eviction is the deliberate policy (shed the oldest, never refuse the
+   * newest — see ``lib/pending.py``), and the evicted payload is kept in
+   * the bounded ``pending-evicted/`` archive, so this is not the same
+   * category of loss as ``dropped``. But it IS loss, and it must never
+   * be inferable only from a depth reading — hence a distinct counter.
+   */
+  evicted: number;
+  /**
+   * The agent's live ``HINDSIGHT_PENDING_MAX_ENTRIES``, i.e. the depth
+   * at which the next enqueue starts evicting. Read from inside the
+   * container rather than assumed, because it is retuned via
+   * ``switchroom.yaml``.
+   */
+  cap: number;
 }
 
 /**
@@ -1425,16 +1460,35 @@ export function probePendingRetainsQueue(
   // Container HOME per compose.ts (`HOME: "/state/agent/home"`). Same
   // default relative path as lib/pending.py: $HOME/.hindsight/pending-retains.
   const dir = "/state/agent/home/.hindsight/pending-retains";
+  const base = "/state/agent/home/.hindsight";
   // `.json$` matches queued entries but NOT `.json.dead` (which ends in
   // `.dead`), so the two counts don't overlap. grep -c on empty input
   // prints 0 and exits 1, so guard with the -d test and swallow status.
+  //
+  // `X` is the residual-drop count from `pending-drops.json` and `E` the
+  // eviction count from `pending-evictions.log`. BOTH are siblings of the
+  // queue directory, not inside it (`lib/pending.py:_sibling()`), so they
+  // can never inflate P — the older in-directory `.drops.json` location is
+  // still read as a fallback for agents on an older plugin build.
+  //
+  // `C` is the agent's LIVE cap. Reading it here rather than assuming a
+  // constant is the point: it is env-driven and retuned via switchroom.yaml.
   const script =
-    `P=0; D=0; ` +
+    `P=0; D=0; X=0; E=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
     `if [ -d '${dir}' ]; then ` +
     `P=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json$' || true); ` +
     `D=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json\\.dead$' || true); ` +
     `fi; ` +
-    `echo "P=$P D=$D"`;
+    `for L in '${base}/pending-drops.json' '${dir}/.drops.json'; do ` +
+    `if [ "$X" = 0 ] && [ -f "$L" ]; then ` +
+    `X=$(grep -o '"count"[^0-9]*[0-9][0-9]*' "$L" 2>/dev/null ` +
+    `| grep -o '[0-9][0-9]*$' | head -n1); ` +
+    `[ -n "$X" ] || X=0; ` +
+    `fi; done; ` +
+    `if [ -f '${base}/pending-evictions.log' ]; then ` +
+    `E=$(grep -c 'evicted=' '${base}/pending-evictions.log' 2>/dev/null || true); ` +
+    `fi; ` +
+    `echo "P=$P D=$D X=$X E=$E C=$C"`;
   const r = spawnSync(
     "docker",
     ["exec", `switchroom-${agentName}`, "sh", "-c", script],
@@ -1442,18 +1496,36 @@ export function probePendingRetainsQueue(
   );
   // docker/daemon failure, container absent (exit ≥125), or timeout
   // (status null) → skip this agent, don't false-alarm.
-  if (r.error || r.status === null || r.status !== 0) {
-    return { state: "unreachable", pending: 0, dead: 0 };
-  }
+  const unreachable: PendingRetainsProbeResult = {
+    state: "unreachable",
+    pending: 0,
+    dead: 0,
+    dropped: 0,
+    evicted: 0,
+    cap: PENDING_RETAINS_DEFAULT_MAX_ENTRIES,
+  };
+  if (r.error || r.status === null || r.status !== 0) return unreachable;
   const out = r.stdout.toString();
   const pm = out.match(/P=(\d+)/);
   const dm = out.match(/D=(\d+)/);
-  if (!pm || !dm) return { state: "unreachable", pending: 0, dead: 0 };
+  if (!pm || !dm) return unreachable;
   const pending = parseInt(pm[1], 10);
   const dead = parseInt(dm[1], 10);
-  if (dead > 0) return { state: "dead", pending, dead };
-  if (pending > 0) return { state: "backlog", pending, dead };
-  return { state: "ok", pending, dead };
+  // Older agent images emit no X=/E=/C= at all; absent reads as 0 (and
+  // the default cap) rather than "unreachable".
+  const xm = out.match(/X=(\d+)/);
+  const em = out.match(/E=(\d+)/);
+  const cm = out.match(/C=(\d+)/);
+  const dropped = xm ? parseInt(xm[1], 10) : 0;
+  const evicted = em ? parseInt(em[1], 10) : 0;
+  const cap =
+    cm && parseInt(cm[1], 10) > 0
+      ? parseInt(cm[1], 10)
+      : PENDING_RETAINS_DEFAULT_MAX_ENTRIES;
+  const common = { pending, dead, dropped, evicted, cap };
+  if (dead > 0) return { state: "dead", ...common };
+  if (pending > 0) return { state: "backlog", ...common };
+  return { state: "ok", ...common };
 }
 
 /**
@@ -1464,9 +1536,15 @@ export function probePendingRetainsQueue(
  * verdict and name the specific agents that are off.
  *
  * Verdict precedence:
- *   - fail  — any agent has ``.dead`` markers (permanently-failed retains)
- *             OR any queue is at/over the bounded cap (dropping failures)
- *   - warn  — any agent has a live backlog (drains on next SessionStart)
+ *   - fail  — any agent has ``.dead`` markers (permanently-failed retains),
+ *             any residual drop (a turn's memory that could not be written
+ *             at all), or any recorded eviction (older memories shed to
+ *             keep newer ones)
+ *   - warn  — any agent has a live backlog. A backlog does NOT fail on
+ *             depth alone: a full queue evicts rather than refusing, so
+ *             depth by itself is a symptom, not loss. Depth at/over the
+ *             agent's live cap is called out inside the warn as "at the
+ *             eviction threshold", which is what is actually true.
  *   - skip  — every agent container is unreachable (fleet down)
  *   - ok    — all reachable agents have an empty/missing queue
  *
@@ -1505,17 +1583,25 @@ export function checkPendingRetainsQueues(
   }
 
   const dead: string[] = [];
-  const capped: string[] = [];
+  const atThreshold: string[] = [];
   const backlog: string[] = [];
   const unreachable: string[] = [];
+  const dropped: string[] = [];
+  const evicted: string[] = [];
   let okCount = 0;
   for (const [a, r] of results) {
+    // Drops and evictions are cumulative and independent of the current
+    // depth: an agent whose queue has since drained still shed those
+    // turns, so report them from any state.
+    if (r.dropped > 0) dropped.push(`${a} (${r.dropped})`);
+    if (r.evicted > 0) evicted.push(`${a} (${r.evicted})`);
     if (r.state === "dead") {
       dead.push(
         `${a} (${r.dead} dead${r.pending > 0 ? `, ${r.pending} queued` : ""})`,
       );
     } else if (r.state === "backlog") {
-      if (r.pending >= PENDING_RETAINS_MAX_ENTRIES) capped.push(`${a} (${r.pending})`);
+      // Compare against the agent's OWN cap, not a constant.
+      if (r.pending >= r.cap) atThreshold.push(`${a} (${r.pending}/${r.cap})`);
       else backlog.push(`${a} (${r.pending})`);
     } else if (r.state === "unreachable") {
       unreachable.push(a);
@@ -1526,33 +1612,95 @@ export function checkPendingRetainsQueues(
   const skippedNote =
     unreachable.length > 0 ? `; skipped (unreachable): ${unreachable.join(", ")}` : "";
 
-  // fail: dead markers or a capped queue.
-  if (dead.length > 0 || capped.length > 0) {
+  // The SessionStart drain cannot clear a backlog, and in fact CREATES
+  // one: it clamps each entry's HTTP timeout to the remaining hook budget
+  // (1-8s) while the retain posts synchronously and takes 30-90s, so the
+  // server commits and the client always gives up before the ack. Telling
+  // the operator a backlog "drains automatically on the next SessionStart"
+  // was false at any real scale — point them at the explicit replay.
+  //
+  // The pacing guidance is not decoration. The model group behind retain
+  // has a small, fixed number of lanes shared with live retains, reflect
+  // and consolidation; a fleet-wide replay at default width is the fastest
+  // way to turn a memory backlog into a latency incident.
+  const backlogFix =
+    `Clear a backlog explicitly (the SessionStart drain cannot — its per-entry ` +
+    `timeout is clamped to the hook budget, far below a real retain): ` +
+    `\`docker exec switchroom-<agent> python3 ` +
+    `/state/agent/.claude/plugins/hindsight-memory/scripts/drain_pending.py --backlog\`. ` +
+    `Run \`--phase reconcile\` first — it costs nothing and typically clears most of ` +
+    `the queue by confirming those documents already exist. PACE THE REST: the retain ` +
+    `model pool is small and shared with live traffic, so drain ONE agent at a time at ` +
+    `the default HINDSIGHT_DRAIN_CONCURRENCY=1, keep HINDSIGHT_DRAIN_SLEEP_S set, and ` +
+    `set HINDSIGHT_DRAIN_P95_CMD so the replay backs off instead of tripping the ` +
+    `latency alarm. Fix the upstream first (bank health rows above), or every retry ` +
+    `just ages entries toward .dead.`;
+
+  // fail: dead markers, residual drops, or recorded evictions. NOT depth:
+  // a full queue evicts rather than refusing, so depth alone is a symptom.
+  if (dead.length > 0 || dropped.length > 0 || evicted.length > 0) {
     const parts: string[] = [];
     if (dead.length > 0) parts.push(`dead markers: ${dead.join(", ")}`);
-    if (capped.length > 0) {
-      parts.push(`at cap of ${PENDING_RETAINS_MAX_ENTRIES} (dropping new failures): ${capped.join(", ")}`);
+    if (dropped.length > 0) {
+      parts.push(`permanently dropped (could not be written): ${dropped.join(", ")}`);
+    }
+    if (evicted.length > 0) {
+      parts.push(`evicted to make room for newer entries: ${evicted.join(", ")}`);
+    }
+    if (atThreshold.length > 0) {
+      parts.push(`at the eviction threshold: ${atThreshold.join(", ")}`);
     }
     if (backlog.length > 0) parts.push(`backlog: ${backlog.join(", ")}`);
+    const fixParts: string[] = [];
+    if (dead.length > 0) {
+      fixParts.push(
+        `Dead entries mean Hindsight was unreachable long enough that retries gave up. ` +
+          `Inspect them per agent: ` +
+          `\`docker exec switchroom-<agent> ls /state/agent/home/.hindsight/pending-retains/*.json.dead\`. ` +
+          `Fix the upstream, then re-enqueue (rename .dead → .json) or discard.`,
+      );
+    }
+    if (dropped.length > 0) {
+      fixParts.push(
+        `Dropped retains are GONE — the entry could not be written even after eviction ` +
+          `made room (check disk and permissions), and no payload was kept. Details in ` +
+          `\`.hindsight/pending-drops.json\` per agent; the counter is cumulative, reset ` +
+          `it by deleting that file once you've acknowledged the loss.`,
+      );
+    }
+    if (evicted.length > 0) {
+      fixParts.push(
+        `Evicted entries were shed OLDEST-first so the newest memory could still be ` +
+          `queued — the payloads are in \`.hindsight/pending-evicted/\` (itself bounded, ` +
+          `so they expire) and the ledger is \`.hindsight/pending-evictions.log\`. Drain ` +
+          `the backlog and raise HINDSIGHT_PENDING_MAX_ENTRIES / ` +
+          `HINDSIGHT_PENDING_MAX_BYTES if this recurs.`,
+      );
+    }
+    fixParts.push(backlogFix);
     return {
       name,
       status: "fail",
       detail: `${parts.join("; ")}${skippedNote}`,
-      fix:
-        `Dead entries mean Hindsight was unreachable long enough that retries gave up. ` +
-        `Inspect them per agent: ` +
-        `\`docker exec switchroom-<agent> ls /state/agent/home/.hindsight/pending-retains/*.json.dead\`. ` +
-        `Fix the upstream (bank health rows above), then re-enqueue (rename .dead → .json) or discard. ` +
-        `Live backlog drains automatically on the agent's next SessionStart.`,
+      fix: fixParts.join(" "),
     };
   }
 
-  // warn: live backlog only.
-  if (backlog.length > 0) {
+  // warn: live backlog only — nothing has actually been lost yet.
+  if (backlog.length > 0 || atThreshold.length > 0) {
+    const parts: string[] = [];
+    if (atThreshold.length > 0) {
+      parts.push(
+        `at the eviction threshold (the next failed retain sheds the oldest ` +
+          `entry, it is NOT refused): ${atThreshold.join(", ")}`,
+      );
+    }
+    if (backlog.length > 0) parts.push(`queued: ${backlog.join(", ")}`);
     return {
       name,
       status: "warn",
-      detail: `queued (drains on next SessionStart): ${backlog.join(", ")}${skippedNote}`,
+      detail: `${parts.join("; ")}${skippedNote}`,
+      fix: backlogFix,
     };
   }
 
