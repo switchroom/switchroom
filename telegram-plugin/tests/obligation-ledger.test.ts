@@ -660,3 +660,77 @@ describe("ObligationLedger — noteCapturedDelivery (#3282)", () => {
     expect(L.isOpen("c:3#1")).toBe(false);
   });
 });
+
+describe("ObligationLedger — #3550: the represent grace retires once its turn has ended", () => {
+  function input(id: string, openedAt: number) {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text: "x", openedAt };
+  }
+  const REPR_GRACE = 120_000; // default
+  const TRAIL = 45_000;       // OBLIGATION_ESCALATE_GRACE_MS default
+
+  // The bug: the per-represent grace is a proxy for "the re-present has not
+  // landed yet". Once a turn that started after it has ENDED, the proxy is
+  // provably false, yet the obligation stayed frozen for the rest of the 120s.
+  it("acts once the trailing grace clears, instead of waiting out the full represent window", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 0));
+    L.markRepresented("c:3#1", 5_000);
+    L.noteTurnEnded("c:3#1", 15_000); // the re-presented turn ran and ended
+    const eligibleAt = 15_000 + TRAIL + 1; // trailing-answer grace from turn end
+    expect(eligibleAt).toBeLessThan(5_000 + REPR_GRACE); // i.e. this is genuinely earlier
+    expect(
+      L.decideAtIdle({ now: eligibleAt, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+  });
+
+  it("still refuses to act during the trailing-answer grace — the answer may be landing", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 0));
+    L.markRepresented("c:3#1", 5_000);
+    L.noteTurnEnded("c:3#1", 15_000);
+    // 1ms before the trailing grace expires: the slow answer still has its beat.
+    expect(
+      L.decideAtIdle({ now: 15_000 + TRAIL - 1, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+  });
+
+  it("an IN-FLIGHT re-present (no turn ended after it) keeps the FULL window — the protection is untouched", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 0));
+    L.noteTurnEnded("c:3#1", 4_000); // the turn BEFORE the represent — must not count
+    L.markRepresented("c:3#1", 5_000);
+    expect(
+      L.decideAtIdle({ now: 5_000 + REPR_GRACE - 1, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    expect(
+      L.decideAtIdle({ now: 5_000 + REPR_GRACE + 1, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+  });
+
+  it("with the trailing grace disabled the full represent window is kept — never leaves the obligation ungated", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 0));
+    L.markRepresented("c:3#1", 5_000);
+    L.noteTurnEnded("c:3#1", 15_000);
+    expect(
+      L.decideAtIdle({ now: 16_000, graceMs: 0, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+  });
+
+  it("representGraceStillProtecting states the rule directly", () => {
+    const P = ObligationLedger.representGraceStillProtecting;
+    // in-flight re-present, inside window → still protecting
+    expect(P({ lastRepresentedAt: 5_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(true);
+    // turn ended after the re-present → spent
+    expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(false);
+    // turn ended BEFORE the re-present → irrelevant, still protecting
+    expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 4_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(true);
+    // window already elapsed → not protecting either way
+    expect(P({ lastRepresentedAt: 5_000 }, 5_000 + REPR_GRACE, REPR_GRACE, TRAIL)).toBe(false);
+    // kill switch / never re-presented
+    expect(P({ lastRepresentedAt: 5_000 }, 6_000, 0, TRAIL)).toBe(false);
+    expect(P({}, 6_000, REPR_GRACE, TRAIL)).toBe(false);
+    // trailing grace disabled → the early-out is withheld
+    expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 10_000, REPR_GRACE, 0)).toBe(true);
+  });
+});
