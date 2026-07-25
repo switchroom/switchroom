@@ -443,6 +443,247 @@ assert "entity_records=phase1.entities.entity_records" in (BASE / "retain/orches
 print("switchroom hindsight unit_entities FK-race patch: reassert_entities + entity_records threading applied (Phase-2 resurrects concurrently-pruned parent in same txn)")
 PYEOF
 
+# Cross-encoder saturation fix: `apply_combined_scoring` in
+# engine/search/reranking.py computes the ONLY final ranking score as
+#   combined_score = CE_normalized * recency_boost * temporal_boost * proof_count_boost
+# Keyword/semantic (RRF) is explicitly zeroed out and excluded. On a real bank
+# the local ms-marco cross-encoder saturates: measured live on bank `overlord`,
+# a 116-result recall had EVERY cross_encoder_score_normalized inside
+# 0.9800-0.9999 — a ~2% spread, i.e. no discriminating power left. The
+# multiplicative boosts then decide the order: their worst-case max/min ratio is
+# (1.1*1.1*1.05)/(0.9*0.9*0.95) ≈ 1.65, which dwarfs a 2% CE gap. The record
+# with the highest CE score in the entire set (0.9999) ranked 7th —
+# 0.9999 * 1.1000 = 1.0999 lost to an older consolidated record at 1.1234 whose
+# only advantage was proof_count 9 vs 1. Fresh single-source facts are
+# structurally buried under older consolidated ones on every bank.
+#
+# Fix: DAMP the boost product — combined = CE * (r_boost * t_boost * p_boost) ** k
+# — so the boosts modulate the cross-encoder decision instead of replacing it.
+# k is derived, not tuned: it is chosen so the worst-case boost ratio collapses
+# to exactly 1 + _CE_DECISIVE_RELATIVE_GAP, i.e. a candidate whose CE score is
+# >= 2% (the measured saturation spread) above another's outranks it no matter
+# how the boosts fall. k is a function of the alphas ONLY.
+#
+# HONEST SCOPE. This is a calibration change, not a defect fix, and it is
+# unconditional: at the shipped alphas k = 0.03949 on EVERY query, which
+# compresses the boost band from ~[0.81, 1.21] to ~[0.99, 1.01]. That is the
+# intent on a saturated set, but it applies identically to a healthy
+# well-spread set where there was no bug — such a set keeps its CE ordering
+# either way, but its recency/temporal/proof_count authority is cut ~20x. The
+# decisive gap is therefore an OPERATIONAL KNOB, not a baked constant:
+#
+#   HINDSIGHT_CE_DECISIVE_RELATIVE_GAP=<float>
+#
+# overrides it per-deployment, read once at import. Raising it weakens the
+# damping; any value at or above ~0.65 makes k clamp to 1.0, i.e. EXACTLY
+# upstream behaviour with this patch still baked in. So backing this change
+# out is a container restart with one env var, not an image rebuild — which
+# matters because the failure mode here is a silent recall-quality regression
+# with no telemetry that would surface it. Invalid, empty, non-finite and
+# non-positive values fall back to the 0.02 default rather than failing recall.
+#
+# What this deliberately does NOT do, and why — each of these was a defect in
+# the first version of this patch, which min-max rescaled the CE scores onto
+# [0.1, 1.0] whenever their spread was below a 0.05 threshold:
+#
+#   * It does not touch `cross_encoder_score_normalized`. That field is an
+#     ABSOLUTE, caller-visible quantity: engine/memory_engine.py applies the
+#     agent-supplied `min_scores.reranker` floor directly to it (and
+#     `min_scores` is a documented MCP recall parameter any agent can pass).
+#     Rescaling it forced the worst candidate in EVERY result set to 0.1 and
+#     the best to 1.0, silently turning `min_scores: {reranker: 0.8}` from
+#     "116 results" into a handful. The encoder's score is now passed through
+#     exactly as produced.
+#   * It is set-independent. A min-max rescale is computed over whichever
+#     candidates survived retrieval, so the same pair reordered when an
+#     unrelated third document joined the set — and this deployment sets
+#     HINDSIGHT_API_RERANKER_MAX_CANDIDATES=150, which makes set membership
+#     churny. Here a candidate's score is a pure function of its own fields.
+#   * It is noise-proportional. A min-max rescale is scale-invariant, so a
+#     spread of 1e-7 (pure float noise from a saturated encoder) was stretched
+#     to the full [0.1, 1.0] band exactly like a real spread of 0.049, letting
+#     noise decide the ranking outright. Here a 1e-7 CE difference stays 1e-7
+#     and remains subordinate to the boosts, which is the correct outcome when
+#     the encoder genuinely cannot tell two candidates apart.
+#   * It is continuous. The old threshold made spread 0.0499 stretch ~18x while
+#     0.0501 was untouched — an unjustified cliff. There is no threshold here.
+#   * It keeps combined_score on the same [0, 1] scale as CE (at the default
+#     gap the multiplier is confined to ~[0.990, 1.010]).
+#     engine/search/recall_boost.py calibrates its additive boost levels
+#     against that scale — its own comment reads "high=0.5 wins over most
+#     semantic matches; only a strong direct match (>0.5 normalized) still
+#     wins" — and `min_scores.final` floors `sr.weight`. Inflating the band
+#     toward 1.0 would have broken both.
+#
+# The transform is strictly monotone in CE, so it changes no CE ordering; it
+# only bounds how far the secondary signals may move a result. The alphas, the
+# boost formulae, and the passthrough branch are untouched.
+#
+# Named module constants, not magic numbers. Self-verifying: the build FAILS
+# LOUDLY if upstream reformats any anchor, drops `import math` (on which
+# _boost_authority depends), or reintroduces a write to the CE field in ANY
+# form. Guarded by tests/docker/dockerfile-hindsight-bakes.test.ts and
+# behaviourally by tests/docker/hindsight-search-patches.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+import re
+
+f = pathlib.Path("/app/api/hindsight_api/engine/search/reranking.py")
+s = f.read_text()
+
+# `os` for the operational override; the anchor doubles as the guard that
+# upstream still imports `math`, which _boost_authority depends on.
+OLD_IMPORTS = "import math\nfrom datetime import datetime, timezone\n"
+NEW_IMPORTS = "import math\nimport os\nfrom datetime import datetime, timezone\n"
+
+OLD_CONST = "# Recency decay: maps a memory's age (days) onto a freshness signal in [0, 1]"
+NEW_CONST = (
+    "# switchroom: measured cross-encoder saturation. On bank `overlord` a 116-result\n"
+    "# recall had EVERY cross_encoder_score_normalized inside 0.9800-0.9999 — a ~2%\n"
+    "# spread. This is the RELATIVE CE gap that must be DECISIVE: a candidate whose\n"
+    "# CE score is at least this much above another's outranks it regardless of how\n"
+    "# the recency / temporal / proof_count boosts fall.\n"
+    "_CE_DECISIVE_RELATIVE_GAP_DEFAULT: float = 0.02\n"
+    '_CE_DECISIVE_RELATIVE_GAP_ENV: str = "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP"\n'
+    "\n"
+    "\n"
+    "def _decisive_relative_gap() -> float:\n"
+    '    """Operator override for the decisive CE gap, read once at import.\n'
+    "\n"
+    "    This damping is a calibration judgement, not a defect fix, and its failure\n"
+    "    mode is a silent recall-quality regression rather than an error. Making the\n"
+    "    gap an env var means backing it out is a container restart, not an image\n"
+    "    rebuild: any value at or above ~0.65 clamps the exponent to 1.0, which is\n"
+    "    byte-for-byte upstream scoring with this patch still baked in.\n"
+    "\n"
+    "    A bad value must never break recall, so anything unparseable, non-finite or\n"
+    "    non-positive falls back to the default.\n"
+    '    """\n'
+    '    raw = os.environ.get(_CE_DECISIVE_RELATIVE_GAP_ENV, "").strip()\n'
+    "    if not raw:\n"
+    "        return _CE_DECISIVE_RELATIVE_GAP_DEFAULT\n"
+    "    try:\n"
+    "        value = float(raw)\n"
+    "    except (TypeError, ValueError):\n"
+    "        return _CE_DECISIVE_RELATIVE_GAP_DEFAULT\n"
+    "    if not math.isfinite(value) or value <= 0.0:\n"
+    "        return _CE_DECISIVE_RELATIVE_GAP_DEFAULT\n"
+    "    return value\n"
+    "\n"
+    "\n"
+    "_CE_DECISIVE_RELATIVE_GAP: float = _decisive_relative_gap()\n"
+    "\n"
+    "\n"
+    "def _boost_authority(\n"
+    "    recency_alpha: float, temporal_alpha: float, proof_count_alpha: float\n"
+    ") -> float:\n"
+    '    """Exponent that caps how far the combined boost multiplier may reorder CE.\n'
+    "\n"
+    "    Each boost is ``1 + alpha * (signal - 0.5)`` with ``signal`` in [0, 1], so it\n"
+    "    spans ``[1 - alpha/2, 1 + alpha/2]``. Raising their product to this exponent\n"
+    "    confines the product's worst-case max/min ratio to exactly\n"
+    "    ``1 + _CE_DECISIVE_RELATIVE_GAP``. Undamped that ratio is ~1.65 at the default\n"
+    "    alphas, which is why proof_count could decide the order of a saturated set.\n"
+    "\n"
+    "    Depends ONLY on the alphas and the module-level gap — never on the candidate\n"
+    "    set — so a candidate's combined_score is a pure function of its own fields\n"
+    "    and cannot change because an unrelated document joined or left the set.\n"
+    "\n"
+    "    Returns 1.0 (exact upstream behaviour, no damping) when the boosts are\n"
+    "    disabled, already too weak to overturn the decisive gap, or when the\n"
+    "    operator has widened the gap past what the boosts can span.\n"
+    '    """\n'
+    "    hi = 1.0\n"
+    "    lo = 1.0\n"
+    "    for alpha in (recency_alpha, temporal_alpha, proof_count_alpha):\n"
+    "        hi *= 1.0 + alpha / 2.0\n"
+    "        lo *= 1.0 - alpha / 2.0\n"
+    "    if lo <= 0.0 or hi <= lo:\n"
+    "        return 1.0\n"
+    "    return min(1.0, math.log1p(_CE_DECISIVE_RELATIVE_GAP) / math.log(hi / lo))\n"
+    "\n"
+    "\n"
+    "# Recency decay: maps a memory's age (days) onto a freshness signal in [0, 1]"
+)
+
+OLD_LOOP = (
+    "    for sr in scored_results:\n"
+    "        # Recency: configurable decay (linear default; see compute_recency_decay)\n"
+)
+NEW_LOOP = (
+    "    # switchroom: derived once per call from the alphas alone — see\n"
+    "    # _boost_authority. Set-independent by construction.\n"
+    "    _boost_exponent = _boost_authority(recency_alpha, temporal_alpha, proof_count_alpha)\n"
+    "\n"
+    "    for sr in scored_results:\n"
+    "        # Recency: configurable decay (linear default; see compute_recency_decay)\n"
+)
+
+OLD_BODY = (
+    "        proof_count_boost = 1.0 + proof_count_alpha * (proof_norm - 0.5)\n"
+    "        sr.combined_score = sr.cross_encoder_score_normalized * recency_boost * temporal_boost * proof_count_boost\n"
+)
+NEW_BODY = (
+    "        proof_count_boost = 1.0 + proof_count_alpha * (proof_norm - 0.5)\n"
+    "        # switchroom: damp the boost product so it MODULATES the cross-encoder\n"
+    "        # decision instead of replacing it. Measured live: with every CE score\n"
+    "        # inside 0.9800-0.9999, the undamped boosts decided the order and the\n"
+    "        # single highest-CE memory ranked 7th behind older, more heavily-proven\n"
+    "        # ones — proof_count was deciding relevance.\n"
+    "        #\n"
+    "        # cross_encoder_score_normalized is deliberately NOT rewritten: it is an\n"
+    "        # absolute, caller-visible score that memory_engine filters against with\n"
+    "        # the agent-supplied min_scores.reranker floor.\n"
+    "        _boost = recency_boost * temporal_boost * proof_count_boost\n"
+    "        sr.combined_score = sr.cross_encoder_score_normalized * (_boost**_boost_exponent)\n"
+)
+
+for name, anchor in (
+    ("imports", OLD_IMPORTS),
+    ("constant", OLD_CONST),
+    ("loop", OLD_LOOP),
+    ("combined_score", OLD_BODY),
+):
+    n = s.count(anchor)
+    assert n == 1, (
+        f"switchroom hindsight CE-saturation patch: {name} anchor found {n}x (expected 1) "
+        "in engine/search/reranking.py — upstream reformatted apply_combined_scoring "
+        "or its imports; re-author this patch in docker/Dockerfile.hindsight"
+    )
+
+s = (
+    s.replace(OLD_IMPORTS, NEW_IMPORTS, 1)
+    .replace(OLD_CONST, NEW_CONST, 1)
+    .replace(OLD_LOOP, NEW_LOOP, 1)
+    .replace(OLD_BODY, NEW_BODY, 1)
+)
+f.write_text(s)
+
+t = f.read_text()
+assert "\nimport math\n" in t, "switchroom hindsight CE-saturation patch: `import math` is gone — _boost_authority cannot work"
+assert "\nimport os\n" in t, "switchroom hindsight CE-saturation patch: `import os` missing — the operator override cannot be read"
+assert "_CE_DECISIVE_RELATIVE_GAP_DEFAULT: float = 0.02" in t, "switchroom hindsight CE-saturation patch: decisive-gap default missing after patch"
+assert '_CE_DECISIVE_RELATIVE_GAP_ENV: str = "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP"' in t, "switchroom hindsight CE-saturation patch: env-override name missing after patch"
+assert "_CE_DECISIVE_RELATIVE_GAP: float = _decisive_relative_gap()" in t, "switchroom hindsight CE-saturation patch: gap is not wired to the env override"
+assert "def _boost_authority(" in t, "switchroom hindsight CE-saturation patch: _boost_authority helper missing after patch"
+assert "_boost_exponent = _boost_authority(recency_alpha, temporal_alpha, proof_count_alpha)" in t, "switchroom hindsight CE-saturation patch: per-call exponent missing after patch"
+assert "sr.combined_score = sr.cross_encoder_score_normalized * (_boost**_boost_exponent)" in t, "switchroom hindsight CE-saturation patch: damped combined_score missing after patch"
+
+# STRUCTURAL guard, not an exact-string one: the withdrawn revision of this
+# patch min-max rescaled cross_encoder_score_normalized, which memory_engine
+# filters against with the agent-supplied min_scores.reranker floor. Matching
+# on the assignment FORM means a reformatted or renamed reintroduction trips
+# it too — the sole permitted writer is upstream's own passthrough reseed.
+_ce_writes = re.findall(r"^\s*sr\.cross_encoder_score_normalized\s*=(?!=)[^\n]*", t, re.M)
+assert _ce_writes == ["            sr.cross_encoder_score_normalized = 1.0 - (0.9 * new_rank / denom)"], (
+    "switchroom hindsight CE-saturation patch: cross_encoder_score_normalized is written "
+    f"somewhere other than upstream's is_passthrough_reranker reseed — found {_ce_writes!r}. "
+    "That field carries the absolute, agent-supplied min_scores.reranker floor and must "
+    "never be rescaled"
+)
+print("switchroom hindsight CE-saturation patch: boost product damped so proof_count can no longer decide ranking; cross_encoder_score_normalized left untouched for min_scores; gap overridable via HINDSIGHT_CE_DECISIVE_RELATIVE_GAP")
+PYEOF
+
 # BM25 compound-token fix: `tokenize_query` in engine/search/retrieval.py did
 #   re.sub(r"[^\w\s]", " ", query_text.lower()).split()
 # which SHREDS every punctuated identifier. Postgres does not: verified against
