@@ -10,6 +10,7 @@ import { describe, it, expect } from "vitest";
 import {
   detectHeaderMisconfig,
   detectRetryFallbackGaps,
+  BARE_ANTHROPIC_FAMILY_ALIASES,
   isClaudeAllowlistedGroup,
   parseLitellmConfig,
 } from "./header-passthrough-guard.js";
@@ -59,14 +60,38 @@ model_group_settings:
 `;
 
 describe("isClaudeAllowlistedGroup", () => {
-  it("allows claude-* and the bare sonnet/fable aliases", () => {
-    for (const g of ["claude-opus-4", "claude-sonnet-5", "claude-haiku-4", "claude-fable-5", "sonnet", "fable"]) {
+  it("allows claude-* and the bare opus/sonnet/fable aliases", () => {
+    for (const g of [
+      "claude-opus-4",
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-haiku-4",
+      "claude-fable-5",
+      "opus",
+      "sonnet",
+      "fable",
+    ]) {
       expect(isClaudeAllowlistedGroup(g)).toBe(true);
     }
   });
-  it("EXCLUDES *-openrouter even when it matches claude-*", () => {
+  it("allows every member of BARE_ANTHROPIC_FAMILY_ALIASES (the maintenance contract)", () => {
+    expect(BARE_ANTHROPIC_FAMILY_ALIASES.has("opus")).toBe(true);
+    for (const alias of BARE_ANTHROPIC_FAMILY_ALIASES) {
+      expect(isClaudeAllowlistedGroup(alias)).toBe(true);
+    }
+  });
+  it("EXCLUDES *-openrouter even when it matches claude-* or a bare alias", () => {
     expect(isClaudeAllowlistedGroup("claude-sonnet-5-openrouter")).toBe(false);
     expect(isClaudeAllowlistedGroup("sonnet-openrouter")).toBe(false);
+    expect(isClaudeAllowlistedGroup("opus-openrouter")).toBe(false);
+    for (const alias of BARE_ANTHROPIC_FAMILY_ALIASES) {
+      expect(isClaudeAllowlistedGroup(`${alias}-openrouter`)).toBe(false);
+    }
+  });
+  it("does not allowlist a bare alias by prefix/substring (exact match only)", () => {
+    for (const g of ["opusx", "myopus", "opus-oss", "sonnetish"]) {
+      expect(isClaudeAllowlistedGroup(g)).toBe(false);
+    }
   });
   it("rejects non-Claude groups", () => {
     for (const g of ["gpt-oss", "glm", "openrouter/z-ai/glm-5.2", "gemini"]) {

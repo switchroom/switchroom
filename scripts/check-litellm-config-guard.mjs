@@ -28,7 +28,8 @@
  *   - `forward_client_headers_to_llm_api: true` under `litellm_settings`
  *     (the global master switch), OR
  *   - the same flag on any `model_group_settings` group NOT in the Claude
- *     allowlist (`claude-*`, `sonnet`, `fable`; `*-openrouter` EXCLUDED).
+ *     allowlist (`claude-*`, plus the bare aliases `opus`/`sonnet`/`fable`;
+ *     `*-openrouter` EXCLUDED).
  *
  * Also emits a NON-FATAL 4b advisory when a Claude group sets `num_retries > 1`
  * with no `fallbacks` chain (the broker owns failover — see model-routing.md
@@ -119,9 +120,15 @@ function resolveLivePath() {
 
 const path = resolveLivePath();
 
+// Mirrors BARE_ANTHROPIC_FAMILY_ALIASES in src/litellm/header-passthrough-guard.ts
+// (the reference implementation — keep the two in sync). Every bare Anthropic
+// family alias registered in the proxy's model_list must be listed here, or this
+// guard FAILs on a group that is in fact an Anthropic OAuth passthrough.
+const BARE_ANTHROPIC_FAMILY_ALIASES = new Set(["opus", "sonnet", "fable"]);
+
 function isClaudeAllowlistedGroup(name) {
   if (name.endsWith("-openrouter")) return false;
-  return name.startsWith("claude-") || name === "sonnet" || name === "fable";
+  return name.startsWith("claude-") || BARE_ANTHROPIC_FAMILY_ALIASES.has(name);
 }
 
 function flagTruthy(v) {
@@ -243,7 +250,7 @@ function checkConfig(path, { required }) {
     console.error(`check-litellm-config-guard: FAIL — OAuth-leak header scoping in ${path}:`);
     for (const v of violations) console.error(`  - ${v}`);
     console.error(
-      `\n  Fix: scope ${FLAG} to Claude model groups only (claude-*, sonnet, fable);\n` +
+      `\n  Fix: scope ${FLAG} to Claude model groups only (claude-*, opus, sonnet, fable);\n` +
         `  never global under litellm_settings, never on a non-Claude/*-openrouter group.`,
     );
     return false;

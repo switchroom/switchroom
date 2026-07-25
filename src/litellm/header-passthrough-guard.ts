@@ -106,16 +106,42 @@ export function discoverLiveLitellmConfigPath(opts?: {
 }
 
 /**
+ * Bare (unversioned) Anthropic family aliases registered in the proxy's
+ * `model_list` — model groups whose name does NOT start with `claude-` but that
+ * still route to `anthropic/…` on the subscription OAuth.
+ *
+ * MAINTENANCE CONTRACT: every bare Anthropic family alias registered in the
+ * proxy's `model_list` MUST appear here, or the I2 guard raises a
+ * false-positive OAuth-leak violation against it — `npm run lint` fails on any
+ * host where the live config is discoverable, and the fleet-health sensor
+ * escalates a bogus L0 finding into the priority ledger. `opus` was added
+ * 2026-07-25 after exactly that drift; `sonnet` and `fable` had each been
+ * hand-added the same way before it. When you register a bare alias in
+ * `docker/litellm-proxy/litellm-config.yaml` (or the live host copy), add it
+ * here in the same change. See `docs/model-routing.md` § I1/I2.
+ *
+ * Membership is exact-match only, so an OpenRouter suffix variant of any of
+ * these (e.g. `sonnet-openrouter`) is a different group name, is NOT a member,
+ * and is additionally rejected by the explicit suffix check below.
+ */
+export const BARE_ANTHROPIC_FAMILY_ALIASES: ReadonlySet<string> = new Set([
+  "opus",
+  "sonnet",
+  "fable",
+]);
+
+/**
  * A subscription-Claude group is allowed to forward the OAuth header. Mirrors
- * `docs/model-routing.md:66-68`: `claude-*` (covers `claude-opus-*`,
- * `claude-sonnet-*`, `claude-haiku-*`, `claude-fable-5`), plus the bare aliases
- * `sonnet` and `fable`. `*-openrouter` groups are EXCLUDED even though they may
- * match `claude-*` (e.g. `claude-sonnet-5-openrouter`) — those route to
- * OpenRouter, a third party that must never see the subscription token.
+ * `docs/model-routing.md` § I2: `claude-*` (covers `claude-opus-*`,
+ * `claude-sonnet-*`, `claude-haiku-*`, `claude-fable-5`), plus the bare family
+ * aliases in `BARE_ANTHROPIC_FAMILY_ALIASES`. `*-openrouter` groups are
+ * EXCLUDED even though they may match `claude-*` (e.g.
+ * `claude-sonnet-5-openrouter`) — those route to OpenRouter, a third party that
+ * must never see the subscription token.
  */
 export function isClaudeAllowlistedGroup(name: string): boolean {
   if (name.endsWith("-openrouter")) return false;
-  return name.startsWith("claude-") || name === "sonnet" || name === "fable";
+  return name.startsWith("claude-") || BARE_ANTHROPIC_FAMILY_ALIASES.has(name);
 }
 
 /** A header-passthrough scoping violation (an OAuth-leak surface). */

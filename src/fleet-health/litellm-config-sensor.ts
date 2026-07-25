@@ -18,6 +18,7 @@
 import { readFileSync, existsSync } from "node:fs";
 
 import type { Finding } from "./detect.js";
+import type { LiveConfigDiscovery } from "../litellm/header-passthrough-guard.js";
 import {
   COOLIFY_SERVICES_DIR,
   detectHeaderMisconfig,
@@ -39,6 +40,9 @@ export interface LitellmSensorOptions {
   /** Injectable for tests. */
   existsFn?: (p: string) => boolean;
   readFn?: (p: string) => string;
+  /** Live-config discovery, injectable so tests never depend on the host's
+   *  real `/data/coolify/services` tree (see `DiscoverFn`). */
+  discoverFn?: DiscoverFn;
   log?: (msg: string) => void;
   /** Timestamp for the finding (ISO). Defaults to now. */
   nowIso?: string;
@@ -53,15 +57,27 @@ export interface LitellmSensorResult {
 }
 
 /**
+ * Live-config discovery seam. Defaults to the real filesystem scan; tests
+ * inject a stub so they assert the resolution LOGIC instead of the host's
+ * filesystem. A test that reads the real `/data/coolify/services` passes in
+ * hermetic CI and FAILS on any host where a live proxy config genuinely
+ * exists — a host-dependent test is a real defect, fixed by injecting here.
+ */
+export type DiscoverFn = () => LiveConfigDiscovery;
+
+/**
  * Resolve the live config path: explicit arg → `LITELLM_CONFIG_PATH` env →
  * discovery under the Coolify services dir. Returns null when the live copy is
  * not resolvable, which the caller treats as a visible skip — never a pass.
  */
-export function resolveLitellmConfigPath(explicit?: string): string | null {
+export function resolveLitellmConfigPath(
+  explicit?: string,
+  discoverFn: DiscoverFn = () => discoverLiveLitellmConfigPath(),
+): string | null {
   if (explicit) return explicit;
   const fromEnv = process.env.LITELLM_CONFIG_PATH;
   if (fromEnv) return fromEnv;
-  return discoverLiveLitellmConfigPath().path;
+  return discoverFn().path;
 }
 
 /**
@@ -73,7 +89,7 @@ export function resolveLitellmConfigPath(explicit?: string): string | null {
 export function scanLitellmConfig(
   opts: LitellmSensorOptions = {},
 ): LitellmSensorResult {
-  const path = resolveLitellmConfigPath(opts.path);
+  const path = resolveLitellmConfigPath(opts.path, opts.discoverFn);
   const exists = opts.existsFn ?? existsSync;
   const read = opts.readFn ?? ((p: string) => readFileSync(p, "utf-8"));
   const log = opts.log ?? (() => {});

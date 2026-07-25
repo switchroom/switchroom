@@ -6,6 +6,7 @@
 
 import { describe, it, expect } from "vitest";
 
+import type { DiscoverFn } from "./litellm-config-sensor.js";
 import {
   scanLitellmConfig,
   resolveLitellmConfigPath,
@@ -18,6 +19,15 @@ import {
 import { mapSignal } from "./mapping.js";
 
 const PATH = "/fake/litellm-config.yaml";
+
+/** Hermetic stand-in for live-config discovery on a host with no live proxy.
+ *  Injected wherever a test exercises path RESOLUTION, so the assertion never
+ *  depends on whether this machine happens to run the real LiteLLM proxy. */
+const NO_LIVE_CONFIG: DiscoverFn = () => ({
+  path: null,
+  reason: "no-services-dir",
+  candidates: [],
+});
 
 function withYaml(yaml: string, log?: (m: string) => void) {
   return scanLitellmConfig({
@@ -42,9 +52,20 @@ describe("resolveLitellmConfigPath", () => {
   });
   it("falls through to discovery, which returns null off-host (never a bogus path)", () => {
     delete process.env.LITELLM_CONFIG_PATH;
-    // In CI/dev the Coolify services dir does not exist, so this must resolve
-    // to null (→ a visible skip) rather than a fabricated path.
-    expect(resolveLitellmConfigPath()).toBe(null);
+    // Discovery is INJECTED, not read from the host: on a machine that really
+    // does run the live proxy, the real scan finds a config and this assertion
+    // would fail for reasons that have nothing to do with the logic under test.
+    expect(resolveLitellmConfigPath(undefined, NO_LIVE_CONFIG)).toBe(null);
+  });
+  it("uses the discovered path when discovery finds exactly one live config", () => {
+    delete process.env.LITELLM_CONFIG_PATH;
+    expect(
+      resolveLitellmConfigPath(undefined, () => ({
+        path: "/svc/theproxy/litellm-config.yaml",
+        reason: "found",
+        candidates: ["/svc/theproxy/litellm-config.yaml"],
+      })),
+    ).toBe("/svc/theproxy/litellm-config.yaml");
   });
 });
 
@@ -133,6 +154,7 @@ describe("scanLitellmConfig", () => {
     delete process.env.LITELLM_CONFIG_PATH;
     const logs: string[] = [];
     const res = scanLitellmConfig({
+      discoverFn: NO_LIVE_CONFIG, // hermetic: never consults the host's real fs
       existsFn: () => true, // would pass if the null path were not short-circuited
       readFn: () => "litellm_settings:\n  forward_client_headers_to_llm_api: true\n",
       log: (m) => logs.push(m),
@@ -153,6 +175,33 @@ model_group_settings:
 `);
     expect(res.status).toBe("ok");
     expect(res.findings).toEqual([]);
+  });
+
+  it("bare `opus` group with the flag → ok, no findings (Anthropic OAuth passthrough)", () => {
+    // Regression: the live proxy gained a bare `opus` group routing to
+    // anthropic/claude-opus-5 (2026-07-25). It was missing from the allowlist,
+    // so the sensor reported a violation and would have escalated a bogus L0
+    // finding into the priority ledger.
+    const res = withYaml(`
+model_group_settings:
+  opus:
+    forward_client_headers_to_llm_api: true
+  claude-opus-5:
+    forward_client_headers_to_llm_api: true
+`);
+    expect(res.findings).toEqual([]);
+    expect(res.status).toBe("ok");
+  });
+
+  it("`opus-openrouter` with the flag → violation (the suffix hole stays closed)", () => {
+    const res = withYaml(`
+model_group_settings:
+  opus-openrouter:
+    forward_client_headers_to_llm_api: true
+`);
+    expect(res.status).toBe("violation");
+    expect(res.findings).toHaveLength(1);
+    expect(res.findings[0].turn_id).toContain("opus-openrouter");
   });
 
   it("global flag → violation finding attributed to the proxy pseudo-agent", () => {
