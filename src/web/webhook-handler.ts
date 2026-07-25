@@ -53,6 +53,10 @@ import {
   type WebhookSource,
 } from './webhook-verify.js'
 import type { WebhookDispatchConfig } from './webhook-dispatch.js'
+import {
+  maybeRotateLogFile,
+  resolveRotationConfig,
+} from '../util/log-rotation.js'
 import { forwardToGateway, type WebhookForwardResponse } from './webhook-ingest-client.js'
 import { EDGE_HEADER, verifyEdgeHeader } from './webhook-edge.js'
 
@@ -141,6 +145,45 @@ export interface WebhookHandlerResult {
 }
 
 const KNOWN_SOURCES: WebhookSource[] = ['github', 'generic', 'linear']
+
+/**
+ * Rotation cap for `<agent>/telegram/webhook-events.jsonl` (#3596).
+ *
+ * This file had NO bound and NO reaper: on the live host one busy agent's
+ * log reached 121,772,086 bytes while the next-busiest sat at 328 KB —
+ * ~370x, all of it on the shared, bind-mounted host disk. 8 MiB is a
+ * generous window for a log whose consumer is "the agent reads the recent
+ * tail on demand" (schema.ts:1554). Env: `SWITCHROOM_WEBHOOK_LOG_MAX_BYTES`
+ * (negative disables rotation).
+ */
+export const DEFAULT_WEBHOOK_LOG_MAX_BYTES = 8 * 1024 * 1024
+/** Rotated generations retained → total bounded at ~(2+1) × 8 MiB = 24 MiB
+ *  per agent. Env: `SWITCHROOM_WEBHOOK_LOG_MAX_FILES`. */
+export const DEFAULT_WEBHOOK_LOG_MAX_FILES = 2
+
+/** Effective webhook-log rotation config (env-overridable). */
+export function resolveWebhookLogRotation(): {
+  maxBytes: number
+  maxFiles: number
+} {
+  return resolveRotationConfig({
+    envBytesVar: 'SWITCHROOM_WEBHOOK_LOG_MAX_BYTES',
+    envFilesVar: 'SWITCHROOM_WEBHOOK_LOG_MAX_FILES',
+    defaultBytes: DEFAULT_WEBHOOK_LOG_MAX_BYTES,
+    defaultFiles: DEFAULT_WEBHOOK_LOG_MAX_FILES,
+  })
+}
+
+/**
+ * Rotate `webhook-events.jsonl` if it has hit the cap. Call immediately
+ * BEFORE each append (both writer paths: the gateway-side recorder and
+ * the legacy host-runtime handler). Best-effort — never throws, so a
+ * rotation problem can never turn a verified webhook into a 500.
+ */
+export function rotateWebhookLogIfNeeded(logPath: string): boolean {
+  const { maxBytes, maxFiles } = resolveWebhookLogRotation()
+  return maybeRotateLogFile(logPath, { maxBytes, maxFiles, tag: 'webhook-log' })
+}
 
 function jsonReply(
   status: number,
@@ -522,6 +565,9 @@ export async function handleWebhookIngest(
   const logPath = join(telegramDir, 'webhook-events.jsonl')
   try {
     mkdirSync(telegramDir, { recursive: true })
+    // Bound the log BEFORE appending (#3596) — unbounded, this file hit
+    // 121 MB on a live agent.
+    rotateWebhookLogIfNeeded(logPath)
     const record = {
       ts: now,
       source,
@@ -542,6 +588,11 @@ export async function handleWebhookIngest(
 /**
  * Read the agent's webhook event log. Used by tests; agents can also
  * call this via Bash (`cat <path>`) as documented in CLAUDE.md.
+ *
+ * Seam-aware (#3596): the log is size-rotated on write, so history lives
+ * in `<log>.1 … .N` after a rotation. Rotated generations are read
+ * oldest-first ahead of the active file, which keeps this consumer's
+ * chronological contract intact across a rotation.
  */
 export function readWebhookLog(
   agent: string,
@@ -549,7 +600,23 @@ export function readWebhookLog(
 ): Array<Record<string, unknown>> {
   const dir = (resolveAgentDir ?? ((a) => join(homedir(), '.switchroom', 'agents', a)))(agent)
   const logPath = join(dir, 'telegram', 'webhook-events.jsonl')
-  if (!existsSync(logPath)) return []
-  const lines = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean)
-  return lines.map((l) => JSON.parse(l) as Record<string, unknown>)
+  const { maxFiles } = resolveWebhookLogRotation()
+  const out: Array<Record<string, unknown>> = []
+  const paths: string[] = []
+  for (let n = maxFiles; n >= 1; n--) paths.push(`${logPath}.${n}`)
+  paths.push(logPath)
+  for (const p of paths) {
+    if (!existsSync(p)) continue
+    for (const line of readFileSync(p, 'utf-8').split('\n')) {
+      if (line.length === 0) continue
+      // A rotated generation can end in a torn line if the process died
+      // mid-append; skip it rather than throwing at the consumer.
+      try {
+        out.push(JSON.parse(line) as Record<string, unknown>)
+      } catch {
+        continue
+      }
+    }
+  }
+  return out
 }

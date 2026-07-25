@@ -44,6 +44,7 @@ import { checkDowngrade } from "./deploy-version-guard.js";
 import { removeStaleContainerIfNeeded } from "./singleton-stale-cleanup.js";
 import {
   defaultAuditLogPath,
+  readAuditRaw,
   formatForCli,
   readAndFilter,
 } from "../host-control/audit-reader.js";
@@ -864,7 +865,9 @@ export function registerHostdCommand(program: Command): void {
         );
         return;
       }
-      const raw = readFileSync(logPath, "utf-8");
+      // Seam-aware: back-fills from `<log>.1` right after a rotation so
+      // `hostd audit` never looks like it lost history (#3596).
+      const raw = readAuditRaw(logPath);
       const limit = Math.max(1, parseInt(opts.tail ?? "50", 10) || 50);
       const filters = {
         agent: opts.agent,

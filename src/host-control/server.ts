@@ -55,6 +55,10 @@ import {
 } from "./protocol.js";
 import { err } from "./error-builder.js";
 import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js";
+import {
+  maybeRotateLogFile,
+  resolveRotationConfig,
+} from "../util/log-rotation.js";
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
@@ -156,6 +160,22 @@ export const DEFAULT_OPERATOR_ATTEST_VERBS: readonly string[] = [
  *  mirroring the vault broker's `method: "passphrase"` attribution. */
 export const ATTEST_AUDIT_METHOD = "passphrase-attest";
 
+/**
+ * Rotation cap for `~/.switchroom/host-control-audit.log`: 32 MiB, the
+ * same threshold the vault broker's audit log uses
+ * (`DEFAULT_AUDIT_MAX_BYTES`). Rows here are fatter than the broker's
+ * (~4 KiB with redacted terminal tails vs ~300 B), so this is ~8k rows
+ * per generation. The live host reached 44 MB unrotated before this
+ * existed. Env override: `SWITCHROOM_HOSTD_AUDIT_MAX_BYTES`.
+ */
+export const DEFAULT_HOSTD_AUDIT_MAX_BYTES = 32 * 1024 * 1024;
+/**
+ * Rotated generations retained: `.1` … `.3`. Total on-disk hostd audit
+ * history is bounded at ~(3 + 1) × 32 MiB = 128 MiB. Env override:
+ * `SWITCHROOM_HOSTD_AUDIT_MAX_FILES`.
+ */
+export const DEFAULT_HOSTD_AUDIT_MAX_FILES = 3;
+
 export interface ServerOptions {
   /** Operator HOME — daemon binds sockets under `<homeDir>/.switchroom/hostd/<agent>/sock`. */
   homeDir: string;
@@ -175,6 +195,13 @@ export interface ServerOptions {
   dockerBin?: string;
   /** Audit-log path. Default: `<homeDir>/.switchroom/host-control-audit.log`. */
   auditLogPath?: string;
+  /** Rotate the audit log once it reaches this many bytes. `0`/undefined →
+   *  env `SWITCHROOM_HOSTD_AUDIT_MAX_BYTES` → {@link DEFAULT_HOSTD_AUDIT_MAX_BYTES}.
+   *  A negative value disables rotation (operator escape hatch). */
+  auditMaxBytes?: number;
+  /** How many rotated generations (`.1` … `.N`) to retain. `0`/undefined →
+   *  env `SWITCHROOM_HOSTD_AUDIT_MAX_FILES` → {@link DEFAULT_HOSTD_AUDIT_MAX_FILES}. */
+  auditMaxFiles?: number;
   /** Allow non-Linux dev mode (skips chown). */
   allowNonLinux?: boolean;
   /**
@@ -4372,6 +4399,21 @@ export class HostdServer {
     );
   }
 
+  /** Rotate `<audit>.log` → `<audit>.log.1` when it reaches the cap.
+   *  Best-effort and never throws — housekeeping must not break the
+   *  privileged-verb request path it guards. */
+  private maybeRotateAuditLog(path: string): void {
+    const { maxBytes, maxFiles } = resolveRotationConfig({
+      maxBytes: this.opts.auditMaxBytes,
+      maxFiles: this.opts.auditMaxFiles,
+      envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
+      envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
+      defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+      defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
+    });
+    maybeRotateLogFile(path, { maxBytes, maxFiles, tag: "hostd-audit" });
+  }
+
   /** Append one JSONL row. Best-effort: a failed append logs to
    *  stderr but never throws into the request path. Serialized via
    *  `auditAppendChain` so large rows can't interleave. */
@@ -4386,6 +4428,20 @@ export class HostdServer {
       if (this.auditChainState === undefined) {
         this.auditChainState = seedChain(path);
       }
+      // Size-based rotation, INSIDE the serialized section so it can never
+      // interleave with an in-flight append (#3596). Rows carry redacted
+      // terminal output (~4 KiB each) so this file grew to 44 MB unbounded
+      // on a live host before this bound existed.
+      //
+      // The hash chain is deliberately NOT re-seeded across the rotation:
+      // `this.auditChainState` keeps advancing, so the first row written
+      // into the freshly-truncated file links back to the last row now
+      // living in `<path>.1` and cross-file tamper-evidence continuity
+      // holds. `verifyAuditLog` scores per-row self-consistency and merely
+      // COUNTS linkage breaks as segments, so a rotation seam is never
+      // reported as tampering; `parseAuditLine` returns null on a torn
+      // line, so the reader is unaffected either way.
+      this.maybeRotateAuditLog(path);
       const { line, next } = chainRow(this.auditChainState, row);
       try {
         await appendFile(path, line);

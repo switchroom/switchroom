@@ -52,7 +52,7 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
-import { readAndFilter, defaultAuditLogPath } from "../host-control/audit-reader.js";
+import { readAndFilter, defaultAuditLogPath, readAuditRaw } from "../host-control/audit-reader.js";
 import { isHindsightContainerExists } from "../setup/hindsight.js";
 import { deployedImageTag } from "./deploy-version-guard.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
@@ -858,7 +858,7 @@ export function resolveRollbackTarget(auditLogPath?: string): string | null {
   const logPath = auditLogPath ?? defaultAuditLogPath(homedir());
   let raw: string;
   try {
-    raw = readFileSync(logPath, "utf8");
+    raw = readAuditRaw(logPath);
   } catch {
     return null;
   }

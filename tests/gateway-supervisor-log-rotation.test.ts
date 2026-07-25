@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, statSync, rmSync, utimesSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -40,6 +41,26 @@ function extractRotator(): string {
 let dir: string;
 let fnPath: string;
 
+/** The retained generation, whichever form it took (#3596 compresses on
+ *  rotate when gzip is available, so it may be `.1` or `.1.gz`). */
+function rotatedPath(log: string): string | null {
+  if (existsSync(log + ".1.gz")) return log + ".1.gz";
+  if (existsSync(log + ".1")) return log + ".1";
+  return null;
+}
+function rotatedExists(log: string): boolean {
+  return rotatedPath(log) !== null;
+}
+/** Uncompressed byte count of the retained generation. */
+function rotatedRawSize(log: string): number {
+  const p = rotatedPath(log);
+  if (p === null) return 0;
+  if (p.endsWith(".gz")) {
+    return gunzipSync(readFileSync(p)).length;
+  }
+  return statSync(p).size;
+}
+
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "rot-test-"));
   fnPath = join(dir, "rot.fn");
@@ -75,8 +96,8 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
       15_000,
     );
     // .1 generation captured the old (over-cap) content.
-    expect(existsSync(log + ".1"), "expected rotated .1 generation").toBe(true);
-    expect(statSync(log + ".1").size).toBeGreaterThanOrEqual(2000);
+    expect(rotatedExists(log), "expected rotated .1 generation").toBe(true);
+    expect(rotatedRawSize(log)).toBeGreaterThanOrEqual(2000);
     // Live file was truncated (only the small rotation-notice line remains).
     expect(statSync(log).size).toBeLessThan(1000);
     expect(readFileSync(log, "utf-8")).toContain("rotated");
@@ -94,7 +115,7 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
       },
       15_000,
     );
-    expect(existsSync(log + ".1")).toBe(false);
+    expect(rotatedExists(log)).toBe(false);
     expect(readFileSync(log, "utf-8")).not.toContain("rotated");
   }, 15_000);
 
@@ -125,7 +146,7 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
       },
       15_000,
     );
-    expect(existsSync(log + ".1")).toBe(true);
+    expect(rotatedExists(log)).toBe(true);
     expect(readFileSync(log, "utf-8")).toContain("SENTINEL_AFTER_ROTATE");
   }, 15_000);
 
@@ -151,7 +172,7 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
       },
       15_000,
     );
-    expect(existsSync(log + ".1")).toBe(false);
+    expect(rotatedExists(log)).toBe(false);
     expect(statSync(log).size).toBeGreaterThanOrEqual(2000);
     // No sleep/test shell errors — the loop slept cleanly on the default.
     expect(readFileSync(stderrFile, "utf-8")).toBe("");
@@ -174,7 +195,7 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
       },
       15_000,
     );
-    expect(existsSync(log + ".1")).toBe(false);
+    expect(rotatedExists(log)).toBe(false);
     expect(statSync(log).size).toBeGreaterThanOrEqual(2000);
     expect(readFileSync(stderrFile, "utf-8")).toBe("");
   }, 15_000);
@@ -191,7 +212,138 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
       },
       15_000,
     );
-    expect(existsSync(log + ".1")).toBe(false);
+    expect(rotatedExists(log)).toBe(false);
     expect(statSync(log).size).toBeGreaterThanOrEqual(5000);
+  }, 15_000);
+});
+
+describe("_switchroom_log_rotator — #3596 the .1 generation is bounded", () => {
+  // Before #3596 the `.1` file was written once and NEVER reaped: on the
+  // live host clerk/gateway-supervisor.log.1 sat at 582 MB (dated Jul 11)
+  // while the live log was ~5 MB, i.e. months from being overwritten by
+  // the next rotation. Two bounds now apply — compress on rotate, and an
+  // age reaper that runs every cycle whether or not a rotation happens.
+
+  it("compresses the rotated generation (the 582 MB .1 case)", () => {
+    const log = join(dir, "gz.log");
+    // Highly compressible 200 KB — gzip must shrink it dramatically.
+    writeFileSync(log, "a".repeat(200_000) + "\n");
+    runBash(
+      `_switchroom_log_rotator ${JSON.stringify(log)} & RPID=$!
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+      {
+        SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",
+      },
+      15_000,
+    );
+    expect(existsSync(log + ".1.gz"), "expected a compressed .1.gz").toBe(true);
+    expect(existsSync(log + ".1"), "plain .1 should be gone").toBe(false);
+    // Content preserved, on-disk footprint slashed.
+    expect(gunzipSync(readFileSync(log + ".1.gz")).length).toBeGreaterThanOrEqual(200_000);
+    expect(statSync(log + ".1.gz").size).toBeLessThan(20_000);
+  }, 15_000);
+
+  it("SWITCHROOM_SIDECAR_LOG_COMPRESS=0 keeps the plain .1", () => {
+    const log = join(dir, "nogz.log");
+    writeFileSync(log, "b".repeat(2000) + "\n");
+    runBash(
+      `_switchroom_log_rotator ${JSON.stringify(log)} & RPID=$!
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+      {
+        SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",
+        SWITCHROOM_SIDECAR_LOG_COMPRESS: "0",
+      },
+      15_000,
+    );
+    expect(existsSync(log + ".1")).toBe(true);
+    expect(existsSync(log + ".1.gz")).toBe(false);
+  }, 15_000);
+
+  it("reaps an aged .1 even when the live log never crosses the cap", () => {
+    // THE regression this exists for: a small live log means no rotation
+    // ever fires, so pre-#3596 nothing would ever touch the stale .1.
+    const log = join(dir, "aged.log");
+    writeFileSync(log, "small\n");
+    const stale = log + ".1";
+    writeFileSync(stale, "c".repeat(50_000));
+    // Backdate 30 days.
+    const old = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    utimesSync(stale, old, old);
+    runBash(
+      `_switchroom_log_rotator ${JSON.stringify(log)} & RPID=$!
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+      {
+        SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000000",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC: "86400", // 1 day
+      },
+      15_000,
+    );
+    expect(existsSync(stale), "aged .1 should have been reaped").toBe(false);
+    // The live log is untouched (no rotation was warranted).
+    expect(readFileSync(log, "utf-8")).toContain("small");
+  }, 15_000);
+
+  it("reaps an aged .1.gz too", () => {
+    const log = join(dir, "aged-gz.log");
+    writeFileSync(log, "small\n");
+    const stale = log + ".1.gz";
+    writeFileSync(stale, "not-really-gzip-but-name-matches");
+    const old = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    utimesSync(stale, old, old);
+    runBash(
+      `_switchroom_log_rotator ${JSON.stringify(log)} & RPID=$!
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+      {
+        SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000000",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC: "86400",
+      },
+      15_000,
+    );
+    expect(existsSync(stale)).toBe(false);
+  }, 15_000);
+
+  it("does NOT reap a fresh .1", () => {
+    const log = join(dir, "fresh.log");
+    writeFileSync(log, "small\n");
+    const fresh = log + ".1";
+    writeFileSync(fresh, "d".repeat(5000));
+    runBash(
+      `_switchroom_log_rotator ${JSON.stringify(log)} & RPID=$!
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+      {
+        SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000000",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC: "86400",
+      },
+      15_000,
+    );
+    expect(existsSync(fresh)).toBe(true);
+    expect(statSync(fresh).size).toBe(5000);
+  }, 15_000);
+
+  it("a garbage max-age falls back to the 14d default (no shell errors)", () => {
+    const log = join(dir, "garbage-age.log");
+    writeFileSync(log, "small\n");
+    const stale = log + ".1";
+    writeFileSync(stale, "e".repeat(5000));
+    const old = new Date(Date.now() - 3 * 24 * 3600 * 1000); // 3d — under 14d
+    utimesSync(stale, old, old);
+    const stderrFile = join(dir, "garbage-age.stderr");
+    runBash(
+      `_switchroom_log_rotator ${JSON.stringify(log)} 2> ${JSON.stringify(stderrFile)} & RPID=$!
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+      {
+        SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000000",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",
+        SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC: "bogus",
+      },
+      15_000,
+    );
+    expect(existsSync(stale), "3d-old .1 is under the 14d default").toBe(true);
+    expect(readFileSync(stderrFile, "utf-8")).toBe("");
   }, 15_000);
 });

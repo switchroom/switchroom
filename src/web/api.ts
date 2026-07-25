@@ -39,6 +39,7 @@ import {
 } from "./blocked-approvals-read.js";
 import {
   defaultAuditLogPath,
+  readAuditRaw,
   readAndFilter,
   type AuditEntry,
 } from "../host-control/audit-reader.js";
@@ -1024,7 +1025,7 @@ export async function handleGetSystemHealth(
     const logPath = defaultAuditLogPath(home);
     if (existsSync(logPath)) {
       hostd.auditLogPresent = true;
-      const raw = readFileSync(logPath, "utf-8");
+      const raw = readAuditRaw(logPath);
       // Drop read-only/health-probe verbs — agent_smoke alone is the large
       // majority of rows and buries the actual privileged mutations this
       // panel exists to surface. Read a wide window, filter, then take 10.

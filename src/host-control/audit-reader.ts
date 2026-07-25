@@ -13,6 +13,7 @@
  * module to share parsing + filtering semantics.
  */
 
+import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -78,6 +79,93 @@ export interface AuditFilters {
 
 export function defaultAuditLogPath(home: string = homedir()): string {
   return join(home, ".switchroom", "host-control-audit.log");
+}
+
+/**
+ * How many bytes of audit history a seam-aware read aims to return.
+ * Sized so `--tail 50` (and the dashboard's 1000-row window) still has
+ * material to work with immediately after a rotation.
+ */
+export const AUDIT_READ_WINDOW_BYTES = 4 * 1024 * 1024;
+
+/** How many rotated generations a seam-aware read will walk back through
+ *  (mirrors `DEFAULT_HOSTD_AUDIT_MAX_FILES`). The byte window above is the
+ *  real bound — this just stops the `existsSync` walk. */
+export const AUDIT_READ_MAX_GENERATIONS = 3;
+
+/** Read the last `n` bytes of `path`, dropping a leading partial line.
+ *  Returns "" if the file is missing/unreadable. */
+function tailBytes(path: string, n: number): string {
+  if (n <= 0) return "";
+  let fd: number;
+  let size: number;
+  try {
+    size = statSync(path).size;
+    fd = openSync(path, "r");
+  } catch {
+    return "";
+  }
+  try {
+    const len = Math.min(n, size);
+    const start = size - len;
+    const buf = Buffer.alloc(len);
+    let read = 0;
+    while (read < len) {
+      const got = readSync(fd, buf, read, len - read, start + read);
+      if (got <= 0) break;
+      read += got;
+    }
+    let text = buf.subarray(0, read).toString("utf-8");
+    // Dropped a leading partial line? Cut to the first newline. (Not
+    // needed when we started at byte 0 — that line is whole.)
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Seam-aware raw read of the hostd audit log (#3596).
+ *
+ * The active log is size-rotated (`server.ts` → `maybeRotateAuditLog`),
+ * so reading ONLY `<path>` shows an almost-empty file for a while right
+ * after a rotation — `switchroom hostd audit`, the dashboard panel and
+ * `get_status` would all appear to have lost history. This reads the
+ * active file and, when it is smaller than the read window, back-fills
+ * from `<path>.1` (oldest-first) so the seam is invisible to consumers.
+ *
+ * Bounded by construction: at most `windowBytes` of `.1` is read, and a
+ * partial first line is dropped (`parseAuditLine` would return null for
+ * it anyway).
+ */
+export function readAuditRaw(
+  logPath: string,
+  windowBytes: number = AUDIT_READ_WINDOW_BYTES,
+  maxFiles: number = AUDIT_READ_MAX_GENERATIONS,
+): string {
+  // Newest-first: active, then `.1`, `.2`, … stopping as soon as the
+  // window is full or a generation is absent.
+  const chunks: string[] = [];
+  let budget = windowBytes;
+  const active = tailBytes(logPath, budget);
+  chunks.push(active);
+  budget -= Buffer.byteLength(active, "utf-8");
+  for (let n = 1; n <= maxFiles && budget > 0; n++) {
+    const chunk = tailBytes(`${logPath}.${n}`, budget);
+    if (chunk.length === 0) break;
+    chunks.push(chunk);
+    budget -= Buffer.byteLength(chunk, "utf-8");
+  }
+  // Emit oldest-first so consumers keep their chronological contract.
+  return chunks
+    .reverse()
+    .filter((c) => c.length > 0)
+    .map((c) => (c.endsWith("\n") ? c : c + "\n"))
+    .join("");
 }
 
 /** Parse a single JSONL line. Returns null on malformed input — the log
