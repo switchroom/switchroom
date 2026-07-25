@@ -8,12 +8,14 @@ sequential calls and can never complete inside any client deadline — the
 memory is permanently unsaveable.
 """
 
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -383,14 +385,27 @@ class TestEnqueueQueuesBoundedEntries(unittest.TestCase):
         )
 
     def test_queue_cap_is_still_respected_when_splitting(self):
+        """A memory needing more parts than the cap is REFUSED, not partly kept.
+
+        This asserted "queue the 2 parts that fit" before the rebase onto
+        #3599. That answer stopped being available: #3599 replaced the
+        "refuse at MAX_ENTRIES" branch with ``_evict_to_fit``, so writing
+        part 20 of 20 under a 2-entry cap now sheds parts 1-18 of the SAME
+        memory along with everything else already queued, and leaves a
+        meaningless tail fragment behind. Refusing matches #3599's own
+        byte-cap guard: one memory must never cost the whole queue.
+        """
         content = _json_transcript(40, 20000)
         original = pending.MAX_ENTRIES
         pending.MAX_ENTRIES = 2
         try:
-            pending.enqueue(self._payload(content), RuntimeError("boom"))
+            with redirect_stderr(io.StringIO()) as err:
+                got = pending.enqueue(self._payload(content), RuntimeError("boom"))
         finally:
             pending.MAX_ENTRIES = original
-        self.assertEqual(len(pending.iter_entries()), 2)
+        self.assertIsNone(got)
+        self.assertEqual(len(pending.iter_entries()), 0)
+        self.assertIn("more than the whole", err.getvalue())
 
 
 class TestModuleIsPure(unittest.TestCase):

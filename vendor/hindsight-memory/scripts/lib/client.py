@@ -215,10 +215,14 @@ class HindsightClient:
         request. Splitting must never turn one bounded POST into N of them:
         the Stop hook passes ``timeout=15`` because it has a hook budget to
         respect, and ``15 × N`` would stall the session. Once the budget is
-        spent no further part is started and the call raises, so the caller's
-        existing enqueue path runs — and ``pending.enqueue`` queues the
-        remainder as bounded per-part entries the drainer can finish. The
-        parts already committed are upserted on that drain, not duplicated.
+        spent no further part is started and the call raises, exactly as an
+        unsplit failure does, so each caller's EXISTING failure path handles
+        the remainder: the hook paths (``retain.py``, ``subagent_retain.py``,
+        ``reconcile_tail.py``) enqueue, and ``pending.enqueue`` queues the
+        remainder as bounded per-part entries the drainer can finish; the
+        drain paths count an attempt and keep the entry;
+        ``backfill_transcripts.py`` logs and backs off. The parts already
+        committed are upserted on the next attempt, not duplicated.
         """
         parts = split_retain_content(content)
         total = len(parts)
@@ -231,8 +235,11 @@ class HindsightClient:
                 if remaining <= 0:
                     raise TimeoutError(
                         f"retain wall budget of {timeout}s exhausted after "
-                        f"{index}/{total} parts; remainder is enqueued for the "
-                        f"drainer"
+                        f"{index}/{total} parts; no further part was started. "
+                        f"The caller's own failure path decides the remainder: "
+                        f"the hook paths enqueue it (as bounded per-part "
+                        f"entries), the drain paths count an attempt and keep "
+                        f"the entry queued."
                     )
                 # Clamp the request deadline to what is left of the budget so
                 # the final part cannot overrun it either.

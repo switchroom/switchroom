@@ -379,6 +379,25 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(() => h.hindsightRetainBudgetEnv()).not.toThrow();
   });
 
+  it("keeps HINDSIGHT_RETAIN_CLIENT_DEADLINE_S equal to the plugin's own constant", async () => {
+    // #3611 declares this constant "mirrors DEFAULT_RETAIN_CLIENT_DEADLINE_S
+    // in vendor/hindsight-memory/scripts/lib/retain_split.py", and its budget
+    // assertion is only meaningful if that is TRUE. Two literals in two
+    // languages with a doc comment between them is not a mirror, it is a
+    // promise; this is the check that makes it one. The python side derives
+    // BOTH its content bound and the backlog drain's per-entry deadline from
+    // its copy (#3610), so a silent drift here reintroduces the re-post loop
+    // #3599 fixed, one size class up.
+    const h = await import("../../src/setup/hindsight.js");
+    const src = readFileSync(
+      join(process.cwd(), "vendor/hindsight-memory/scripts/lib/retain_split.py"),
+      "utf8",
+    );
+    const m = src.match(/^DEFAULT_RETAIN_CLIENT_DEADLINE_S\s*=\s*([0-9.]+)\s*$/m);
+    expect(m, "retain_split.py must define DEFAULT_RETAIN_CLIENT_DEADLINE_S").not.toBeNull();
+    expect(Number(m![1])).toBe(h.HINDSIGHT_RETAIN_CLIENT_DEADLINE_S);
+  });
+
   it("refuses to emit a budget where the server outlives the client deadline", async () => {
     const h = await import("../../src/setup/hindsight.js");
     // The 2026-07-25 shape: a ~190s job under a 90s deadline.

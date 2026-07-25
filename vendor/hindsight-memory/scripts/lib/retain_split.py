@@ -84,12 +84,22 @@ from typing import Optional
 #                               a separate defect, fixed by capping
 #                               HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS).
 #   client_deadline     280 s  — the deadline of the DURABILITY path (the
-#                               supervised backlog drain), deliberately not
-#                               the live Stop hook's 15s. The live path is
+#                               out-of-hook backlog drain, #3599), deliberately
+#                               not the live Stop hook's 15s. The live path is
 #                               allowed to miss its deadline: it enqueues to
 #                               pending-retains and the drain retries. Sizing
 #                               to 15s would cut content to a single chunk and
 #                               shred every transcript for no gain.
+#                               This is the ONE definition of that deadline:
+#                               `drain_pending._backlog_timeout()` defaults to
+#                               `retain_client_deadline()` rather than a second
+#                               literal, and `src/setup/hindsight.ts`
+#                               (`HINDSIGHT_RETAIN_CLIENT_DEADLINE_S`, #3611)
+#                               mirrors it as the client half of that PR's
+#                               `server per-call timeout < client deadline`
+#                               assertion — which its derived 204s server
+#                               timeout satisfies against 280 and would NOT
+#                               against #3599's original 180s literal.
 #
 #   floor(280 / 18.4) = 15 chunks  →  15 × 3000 = 45,000 chars
 #
@@ -117,6 +127,19 @@ def _env_number(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def retain_client_deadline() -> float:
+    """Seconds a DURABILITY caller waits for one retain POST.
+
+    The single definition of that deadline. ``retain_content_limit()`` sizes
+    content so a whole POST fits inside it, and
+    ``drain_pending._backlog_timeout()`` takes it as its default so the drainer
+    actually waits that long — a shorter drain deadline would abandon a
+    correctly-sized part mid-extraction and rebuild the very re-post loop #3599
+    fixed, one size class up.
+    """
+    return _env_number("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", DEFAULT_RETAIN_CLIENT_DEADLINE_S)
+
+
 def retain_content_limit() -> int:
     """Max chars of retain content that can complete inside the client deadline.
 
@@ -134,7 +157,7 @@ def retain_content_limit() -> int:
 
     chunk_size = int(_env_number("HINDSIGHT_RETAIN_CHUNK_SIZE", DEFAULT_RETAIN_CHUNK_SIZE))
     latency = _env_number("HINDSIGHT_RETAIN_CHUNK_LATENCY_S", DEFAULT_RETAIN_CHUNK_LATENCY_S)
-    deadline = _env_number("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", DEFAULT_RETAIN_CLIENT_DEADLINE_S)
+    deadline = retain_client_deadline()
 
     chunks = int(deadline // latency)
     if chunks < 1:

@@ -215,9 +215,25 @@ EVICTIONS_LOG_KEEP_LINES = 2000
 #: ``{session_id}-r{start_uuid}-{end_uuid}``, or the legacy-transcript fallback
 #: ``{session_id}-r{sha256[:32]}``. ``subagent_retain.py`` uses the same recipe
 #: over a ``{session}-sub-{agent}`` composite key, so it matches too.
+#: A split retain appends ``-p{i}of{n}`` (``retain_split.part_document_id``).
+#: That suffix is a pure function of the SAME content the core id derives
+#: from — the split is deterministic in (content, bound) — so a part id is
+#: content-derived exactly when its core is, and must be reconcilable on
+#: presence for the same reason. Without this the split entries introduced by
+#: #3610 would be the ONLY entries excluded from #3599's free phase-1
+#: reconcile: every one would take a full re-POST forever, which is the
+#: re-post loop #3599 exists to kill, aimed at the largest entries in the
+#: queue. It does NOT loosen the pre-#3244 guard: a bare session id with a
+#: part suffix (``{session}-p2of5``) still has no content-derived core and
+#: still returns False.
 _UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+#: ``*``, not ``?``: a part queued under one bound and drained under a smaller
+#: one (an operator lowers ``HINDSIGHT_RETAIN_CLIENT_DEADLINE_S``) is re-split
+#: at POST time into ``{core}-p2of5-p1of2``. Still a pure function of content,
+#: still reconcilable; ``?`` would silently exclude it.
+_PART_SUFFIX_RE = r"(?:-p[0-9]+of[0-9]+)*"
 _CONTENT_DERIVED_ID_RE = re.compile(
-    r"-r(?:%s-%s|[0-9a-fA-F]{32})$" % (_UUID_RE, _UUID_RE)
+    r"-r(?:%s-%s|[0-9a-fA-F]{32})%s$" % (_UUID_RE, _UUID_RE, _PART_SUFFIX_RE)
 )
 
 
@@ -237,6 +253,12 @@ def is_content_derived_document_id(document_id) -> bool:
       it deletes a turn that was never committed — confirmed against a
       live entry on this fleet (525 KB of content, ``document_id`` a bare
       UUID, GET 200).
+
+    * **Split parts** (``{core}-p{i}of{n}``, #3610) inherit the verdict of
+      their core: the part suffix is derived from the same content, so a 200
+      on ``…-r{uuid}-{uuid}-p2of5`` proves that part's own content was
+      committed. A part suffix on a bare session id proves nothing and is
+      still False.
 
     Anything unrecognised is False: the safe direction is to keep the
     entry and let the POST path decide.
@@ -785,12 +807,41 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     base_doc = payload.get("document_id", "conversation")
     base_meta = payload.get("metadata")
 
-    first: Optional[str] = None
+    part_payloads = []
     for index, part in enumerate(parts):
         part_payload = dict(payload)
         part_payload["content"] = part
         part_payload["document_id"] = part_document_id(base_doc, index, total)
         part_payload["metadata"] = part_metadata(base_meta, index, total)
+        part_payloads.append(part_payload)
+
+    # #3599's "an entry larger than the whole cap can never fit" guard,
+    # applied to the whole LOGICAL memory rather than to one part, against
+    # BOTH caps. Splitting would otherwise defeat it: each part fits, so the
+    # eviction loop becomes satisfiable and every part gets written — but the
+    # parts together still exceed the cap, so the later parts evict the
+    # earlier parts of the same memory AND every unrelated memory already
+    # queued. The queue is left holding a tail fragment of one memory and
+    # nothing else: strictly worse than #3599's outcome of refusing the one
+    # memory that cannot fit, so refuse it here too.
+    total_bytes = sum(_entry_blob_bytes(p, error) for p in part_payloads)
+    if total_bytes > MAX_BYTES:
+        record_drop(payload, ValueError(
+            f"entry is {total_bytes} bytes across {total} parts, larger than "
+            f"the whole HINDSIGHT_PENDING_MAX_BYTES cap ({MAX_BYTES}); "
+            f"refusing this entry rather than evicting the entire queue for it"
+        ))
+        return None
+    if total > MAX_ENTRIES:
+        record_drop(payload, ValueError(
+            f"entry splits into {total} parts, more than the whole "
+            f"HINDSIGHT_PENDING_MAX_ENTRIES cap ({MAX_ENTRIES}); refusing "
+            f"this entry rather than evicting the entire queue for it"
+        ))
+        return None
+
+    first: Optional[str] = None
+    for part_payload in part_payloads:
         # Each part goes through the FULL enqueue pipeline — dedupe, the
         # MAX_BYTES refusal, eviction, the drop ledger — because each part
         # is an independently drainable memory, not a fragment that only
@@ -810,14 +861,31 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     return first
 
 
-def _enqueue_one(d: str, payload: dict, error: BaseException) -> Optional[str]:
-    """Write exactly ONE queue entry for ``payload``. See ``enqueue()``."""
+def _build_entry(payload: dict, error: BaseException) -> dict:
+    """The on-disk entry dict for ``payload``, exactly as it will be written."""
     entry = dict(payload)
     entry["schema"] = SCHEMA
     entry["failed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     entry["error_class"] = type(error).__name__
     entry["error_message"] = _clip_error(error)
     entry.setdefault("attempt_count", 1)
+    return entry
+
+
+def _entry_blob_bytes(payload: dict, error: BaseException) -> int:
+    """Serialised size of the entry ``payload`` would be written as.
+
+    Shares ``_build_entry`` with ``_enqueue_one`` so the pre-split total-size
+    guard measures the same bytes the per-entry ``MAX_BYTES`` guard does; the
+    only field that varies between the two calls is ``failed_at``, whose
+    encoding is fixed-width.
+    """
+    return len(json.dumps(_build_entry(payload, error), ensure_ascii=False).encode("utf-8"))
+
+
+def _enqueue_one(d: str, payload: dict, error: BaseException) -> Optional[str]:
+    """Write exactly ONE queue entry for ``payload``. See ``enqueue()``."""
+    entry = _build_entry(payload, error)
 
     blob = json.dumps(entry, ensure_ascii=False)
     blob_bytes = len(blob.encode("utf-8"))

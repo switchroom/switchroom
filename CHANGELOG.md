@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+### Hindsight — bound retain content so oversized memories can persist at all (#3610)
+
+The sibling of #3599, not a duplicate of it. #3599 showed that 70.4% of the
+queue was already durable and being re-posted forever; this is about the
+remainder. A retain POST is not one model call — the daemon chunks content at
+`retain_chunk_size` (3000) and runs ONE sequential extraction call per chunk,
+so server wall time is linear in `len(content)` while the client holds a
+single deadline for the whole POST. Past the derived bound a retain cannot
+complete at ANY client deadline: it fails every attempt, burns `MAX_ATTEMPTS`
+and goes `.dead`. On the 2026-07-25 fleet backlog that was 154 of 629 entries
+(median content 26,112 chars, p90 150,224, max 744,546 — ~249 sequential
+extraction calls). A presence GET retires such an entry for free when the
+document IS already durable, which is #3599's fix; splitting is what makes it
+persist when it is NOT.
+
+- **The bound is enforced at `HindsightClient.retain()`** — the one function
+  every retain POST in the plugin goes through — and is derived, not chosen:
+  `retain_chunk_size × floor(client_deadline / chunk_latency)` =
+  `3000 × floor(280 / 18.4)` = 45,000 chars. All three inputs are
+  env-overridable. Splits are taken on transcript structure (JSON message
+  boundaries / `[role: …]…[…:end]` blocks), never a byte offset, and a split
+  message keeps its role envelope on every fragment.
+- **`timeout` is now the caller's TOTAL wall budget**, not a per-request read
+  deadline. Splitting must never turn one bounded POST into N of them: the
+  Stop hook's `timeout=15` would otherwise become `15 × N`.
+- **`pending.enqueue()` splits too**, into one entry PER PART, so no entry is
+  ever queued that the drainer cannot finish inside one deadline. Part
+  `document_id`s are deterministic (`{base}-p{i}of{n}`), so a part already
+  committed by the failed POST is upserted on drain, never duplicated. This
+  does raise queue DEPTH for oversized memories (one memory becomes N
+  entries) — that is the intended trade against entries that could never
+  drain, and both caps still bound the queue.
+- **`HINDSIGHT_DRAIN_BACKLOG_TIMEOUT` now defaults to the derived retain
+  client deadline (280s) instead of the `180` literal #3599 shipped.** Those
+  had to become one number: a maximally-sized part is ~276s of sequential
+  extraction, and #3611's DERIVED server per-call timeout is 204s — so under
+  180s the drain client abandoned requests the server was still legitimately
+  working on, which is the re-post loop #3599 fixed, one size class up.
+  `src/setup/hindsight.ts` already declared `HINDSIGHT_RETAIN_CLIENT_DEADLINE_S`
+  a mirror of the plugin constant; a test now enforces that rather than
+  trusting the comment.
+- **`enqueue()` refuses a memory whose PARTS TOGETHER exceed either cap**
+  (`HINDSIGHT_PENDING_MAX_BYTES` or `HINDSIGHT_PENDING_MAX_ENTRIES`). #3599's
+  guard measured one entry against one cap; after splitting, every part fits
+  individually, so the eviction loop becomes satisfiable and the later parts
+  evict the earlier parts *and* every unrelated queued memory — leaving a
+  tail fragment of one memory and nothing else. Worse than #3599's outcome,
+  so the guard is hoisted to the whole logical memory and given a count-cap
+  sibling.
+- **Split part ids stay inside #3599's free reconcile.**
+  `is_content_derived_document_id()` is anchored at the end of the id, so
+  `-p{i}of{n}` would have pushed every split part — by construction the
+  largest, most expensive entries in the queue — outside the presence-only
+  reconcile and into a full re-POST on every drain. The suffix is a pure
+  function of the same content the core id derives from, so it inherits the
+  core's verdict; a part suffix on a pre-#3244 bare session id still proves
+  nothing and is still refused.
+
 ### Hindsight — the pending-retains backlog was a re-post loop, not lost memory (#3596)
 
 The queue on this fleet grew to 5,751 entries. The cause was **not** that
@@ -21,7 +79,8 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
   GETs the document and drops the entry if it already exists: no POST, no LLM
   work, no cost, resumable at any point — on the measured fleet that is 70% of
   the queue for free. Phase 2 posts only genuinely-absent entries with a
-  realistic timeout (`HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`, 180s) and then
+  realistic timeout (`HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`, which since #3610
+  defaults to the derived retain client deadline of 280s) and then
   **re-GETs to confirm the document before deleting the entry** —
   commit-before-delete, because a 200 is an ack and not proof (#3244). It is
   still `async_processing=False` for exactly that reason: deleting the queue

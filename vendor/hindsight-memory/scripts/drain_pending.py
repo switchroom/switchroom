@@ -99,6 +99,7 @@ from lib.pending import (
     mark_dead,
     update_attempt,
 )
+from lib.retain_split import retain_client_deadline
 
 
 STALL_THRESHOLD = 3
@@ -200,8 +201,28 @@ def _backlog_timeout() -> int:
     A synchronous retain takes 30-90s on this fleet, so the SessionStart
     default (5-8s, further clamped by the hook budget) guarantees a
     client-side timeout on a request the server then commits anyway.
+
+    The default is DERIVED, not a literal: it is
+    ``retain_split.retain_client_deadline()`` (280s), the same deadline the
+    retain content bound is sized against. Those two must be ONE number.
+    This function shipped as a bare ``180`` (#3599), and against a 180s
+    deadline both halves of the retain budget break: a maximally-sized part
+    is ~276s of sequential extraction, and the SERVER per-call timeout
+    derived in ``src/setup/hindsight.ts`` (#3611) is 204s — so the drain
+    client would abandon a request the server is still legitimately working
+    on, leave the entry queued, and rebuild the re-post loop #3599 exists to
+    kill, one size class up.
+
+    ``HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`` still overrides it outright;
+    ``HINDSIGHT_RETAIN_CLIENT_DEADLINE_S`` moves the derivation and the
+    content bound together.
     """
-    return _env_num("HINDSIGHT_DRAIN_BACKLOG_TIMEOUT", 180, int, lo=1)
+    return _env_num(
+        "HINDSIGHT_DRAIN_BACKLOG_TIMEOUT",
+        int(retain_client_deadline()),
+        int,
+        lo=1,
+    )
 
 
 def _backlog_budget_seconds() -> float:
@@ -640,7 +661,8 @@ def _drain_backlog_impl(
 
     # BUDGET GRANULARITY: checked between waves, not mid-wave, so a run can
     # overshoot `budget` by at most one wave — up to HINDSIGHT_DRAIN_BACKLOG_
-    # TIMEOUT (180s default) plus the confirming GETs. That is deliberate:
+    # TIMEOUT (280s default, `_backlog_timeout`) plus the confirming GETs.
+    # That is deliberate:
     # abandoning an in-flight wave would leave entries whose POST the server
     # is still committing, and the whole point of commit-before-delete is not
     # to guess about those. Unlike the in-hook drain (whose overshoot is
