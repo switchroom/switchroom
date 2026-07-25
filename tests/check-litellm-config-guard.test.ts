@@ -16,7 +16,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { discoverLiveLitellmConfigPath } from "../src/litellm/header-passthrough-guard.js";
+import {
+  BARE_ANTHROPIC_FAMILY_ALIASES,
+  discoverLiveLitellmConfigPath,
+} from "../src/litellm/header-passthrough-guard.js";
 
 const REPO = resolve(import.meta.dirname, "..");
 const SCRIPT = resolve(REPO, "scripts/check-litellm-config-guard.mjs");
@@ -201,6 +204,39 @@ model_group_settings:
           expect(r.stdout).not.toMatch(/SKIP \(live\)/);
           expect(r.stdout).toContain(ts.path);
         }
+      });
+    }
+  });
+
+  // Allowlist parity: the .mjs guard re-implements `isClaudeAllowlistedGroup`
+  // because it cannot import the TS core. Drive BOTH from the TS set so adding a
+  // bare alias to one copy and not the other fails CI instead of producing a
+  // false-positive OAuth-leak FAIL on-host (the bare `opus` regression).
+  describe("bare Anthropic family aliases are allowlisted in both copies", () => {
+    for (const alias of BARE_ANTHROPIC_FAMILY_ALIASES) {
+      it(`'${alias}' with the flag → exit 0, OK`, () => {
+        const r = runWith(
+          fixture(`
+model_group_settings:
+  ${alias}:
+    forward_client_headers_to_llm_api: true
+`),
+        );
+        expect(r.stderr).not.toMatch(/FAIL/);
+        expect(r.ok).toBe(true);
+        expect(r.stdout).toMatch(/OK/);
+      });
+
+      it(`'${alias}-openrouter' with the flag → exit 1, FAIL (no suffix hole)`, () => {
+        const r = runWith(
+          fixture(`
+model_group_settings:
+  ${alias}-openrouter:
+    forward_client_headers_to_llm_api: true
+`),
+        );
+        expect(r.ok).toBe(false);
+        expect(r.stderr).toMatch(new RegExp(`${alias}-openrouter`));
       });
     }
   });

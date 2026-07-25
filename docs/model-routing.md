@@ -69,11 +69,19 @@ These must always hold.
   `openrouter/*` `model_group_settings` entry, would forward the subscription
   OAuth `Authorization: Bearer` token to OpenRouter (a third party). The live
   config currently does this correctly — the flag appears only under Claude
-  model groups (`claude-opus-*`, `claude-sonnet-*`, `sonnet`, `claude-haiku-*`,
-  `claude-fable-5`, `fable`), never in `litellm_settings` or under any
+  model groups (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`,
+  `claude-fable-5`, plus the bare family aliases `opus`, `sonnet`, `fable`),
+  never in `litellm_settings` or under any
   OpenRouter/OpenAI entry, and the config's own comments warn against the
   global form — but I2 holds **only** as long as that operator convention is
   maintained. It is not automatically guaranteed.
+  The allowlist the guard enforces is `claude-*` (minus any `*-openrouter`
+  suffix) plus the exact bare aliases in `BARE_ANTHROPIC_FAMILY_ALIASES`
+  (`src/litellm/header-passthrough-guard.ts`). **Registering a new bare
+  Anthropic family alias in `model_list` means adding it to that set in the
+  same change** — otherwise the guard reports it as a non-Claude group and
+  lint / the fleet-health sensor raise a false-positive OAuth-leak violation
+  (this is what happened when the bare `opus` group was added 2026-07-25).
 - **I3 — The auth broker owns OAuth.** The `switchroom-auth-broker` singleton
   is the sole writer of every consumer's `.claude/credentials.json` (agents and
   Hindsight alike) and owns the refresh loop; this is what enables account
