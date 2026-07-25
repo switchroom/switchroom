@@ -44,6 +44,8 @@ const hooks = vi.hoisted(() => ({
   beforeUnlink: undefined as ((p: string) => void) | undefined,
   beforeStat: undefined as ((p: string) => void) | undefined,
   afterStat: undefined as ((p: string) => void) | undefined,
+  /** Throwing from here simulates an `fstat` failure on that fd (L1). */
+  beforeFstat: undefined as ((fd: number) => void) | undefined,
   beforeCopy: undefined as ((from: string, to: string) => void) | undefined,
   beforeTruncate: undefined as ((p: string) => void) | undefined,
   beforeClose: undefined as ((fd: number) => void) | undefined,
@@ -80,6 +82,10 @@ vi.mock("node:fs", async (importOriginal) => {
       hooks.beforeClose?.(fd);
       return actual.closeSync(fd);
     },
+    fstatSync: ((fd: number, o?: realFs.StatOptions) => {
+      hooks.beforeFstat?.(fd);
+      return actual.fstatSync(fd, o);
+    }) as unknown as typeof realFs.fstatSync,
     statSync: ((p: realFs.PathLike, o?: realFs.StatSyncOptions) => {
       hooks.beforeStat?.(String(p));
       const s = actual.statSync(p, o);
@@ -105,6 +111,7 @@ function clearHooks(): void {
   hooks.beforeUnlink = undefined;
   hooks.beforeStat = undefined;
   hooks.afterStat = undefined;
+  hooks.beforeFstat = undefined;
   hooks.beforeCopy = undefined;
   hooks.beforeTruncate = undefined;
   hooks.beforeClose = undefined;
@@ -357,6 +364,64 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
     expect(realFs.existsSync(lock)).toBe(true);
     expect(realFs.statSync(lock).ino).toBe(peerIno);
   });
+
+  it("release does not delete a peer's lock that arrived after our identity check (H2)", () => {
+    // The test above lands the peer BEFORE the release guard reads the
+    // lock, where an inode comparison is enough. This one lands it INSIDE
+    // the release's own check→syscall gap, which the comparison never
+    // covered: `statSync(lockPath).ino === ourIno` and
+    // `unlinkSync(lockPath)` are two syscalls, so a peer that parks and
+    // claims between them is deleted on our verdict about a file that is
+    // no longer there. The log ends up with NO lock while the peer
+    // believes it holds one — the same observable failure the round-6 H3
+    // ordering fix addressed, still live afterwards because ordering makes
+    // the inode NUMBER meaningful and cannot make two syscalls atomic
+    // (#3600 round-7, H2).
+    //
+    // Fire on whichever syscall the implementation first points at
+    // `lockPath` during release — `rename` with park-verify, `unlink` in
+    // the pre-fix code — so this bites both shapes. Pre-fix the hook lands
+    // after the guard's stat and our unlink then removes the peer's LIVE
+    // lock; with park-verify the rename takes the file first, the parked
+    // inode fails the comparison, and it is linked back untouched.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+
+    let truncated = false;
+    let peerIno = -1;
+    hooks.beforeTruncate = () => {
+      truncated = true;
+    };
+    const peerReclaims = (p: string) => {
+      // Only at release: our own rotation has finished (the truncate ran)
+      // and the next thing to touch `lockPath` is the release itself.
+      if (p !== lock || !truncated || peerIno !== -1) return;
+      realFs.rmSync(lock, { force: true });
+      realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+      peerIno = realFs.statSync(lock).ino;
+    };
+    hooks.beforeRename = peerReclaims;
+    hooks.beforeUnlink = peerReclaims;
+
+    expect(
+      maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "t",
+        lock: true,
+      }),
+    ).toBe(true);
+
+    expect(peerIno).not.toBe(-1); // the interleaving really happened
+    expect(realFs.statSync(`${log}.1`).size).toBe(CAP * 4); // we did rotate
+    // The damage that must NOT happen: the peer's brand-new live lock
+    // survives release, same inode, so the log is still locked.
+    expect(realFs.existsSync(lock)).toBe(true);
+    expect(realFs.statSync(lock).ino).toBe(peerIno);
+    // And the park we took to decide that was put back, not left as debris.
+    expect(
+      realFs.readdirSync(dir).filter((f) => f.includes(".stale.")),
+    ).toEqual([]);
+  });
 });
 
 /**
@@ -377,15 +442,24 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
  *     reclaimer's `.1`, the shifted history at `.2` and the rows its
  *     writers appended all survive ("declines outright…").
  *   - the unlink gap — the peer's freshly shifted history at `.2` is
- *     deleted ("…but the unlink gap destroys its shifted history").
+ *     deleted ("…but the unlink gap destroys its shifted history"). Since
+ *     round 7 this gap carries the same shrank-since-entry gate as the
+ *     copy, so a landing before the GATE's stat costs nothing ("declines
+ *     the oldest-generation drop when the peer rotated after our lock
+ *     check"); the destructive test above lands after it.
  *   - the shift gap — `.1` ABSENT, `.2` the peer's snapshot: our
  *     unserialized `rename` moved its fresh `.1` to `.2` over the history
- *     that was there ("does not copy over the peer's .1").
+ *     that was there ("does not copy over the peer's .1"). Gated the same
+ *     way ("declines the shift when the peer rotated after our lock
+ *     check"), with the same post-gate-stat residual.
  *   - the copy gap — worst of the four, and how bad depends on the PEER:
  *     with a busy peer, `.1` is a duplicate of the live file and the
  *     prior generation is gone ("loses a generation…"); with a QUIET peer
  *     we copy its freshly-truncated zero bytes and the log loses
- *     everything it has ("loses EVERY byte…", round-6 H1).
+ *     everything it has ("loses EVERY byte…", round-6 H1). Both are the
+ *     residual PAST the round-7 gate's own stat; a landing before that
+ *     stat now costs nothing ("declines the copy when the peer rotated
+ *     after our lock check" and its quiet twin).
  *   - the truncate gap — the only one where WE destroy rows in the ACTIVE
  *     file (the quiet copy gap costs the same rows via the snapshot they
  *     had moved to), and the only one with no next checkpoint behind it.
@@ -541,12 +615,177 @@ describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
     expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
   });
 
+  /**
+   * Land the peer at the START of the check→`copyFileSync` gap: the
+   * instant AFTER the pre-copy `held()` stat of the lockfile, so the lock
+   * guard cannot see it, and before the data gate's own stat of the active
+   * file (#3600 round-7, M1). The two residual tests below inject at
+   * `beforeCopy` instead — the LAST instant of the same gap, past the gate
+   * — which is why they pass identically against the gated and the ungated
+   * code and cannot demonstrate this fix.
+   *
+   * The pre-copy `held()` stat is the first stat of the lockfile after our
+   * shift rename, so `shifted` identifies it without counting syscalls.
+   */
+  function firePeerAtCopyGapStart(run: () => void): () => boolean {
+    let shifted = false;
+    let fired = false;
+    hooks.beforeRename = (from) => {
+      if (from === `${log}.1`) shifted = true;
+    };
+    hooks.afterStat = (p) => {
+      if (p !== lock || !shifted || fired) return;
+      fired = true;
+      hooks.afterStat = undefined;
+      run();
+    };
+    return () => fired;
+  }
+
+  /**
+   * Land the peer at the START of a gap by firing just after the Nth stat
+   * of the LOCKFILE, which is the `held()` check for the Nth destructive
+   * syscall (nothing else in `withRotateLock` stats the lock path on this
+   * route). Same idea as `firePeerAtCopyGapStart`, for the gaps that come
+   * before the shift.
+   */
+  function firePeerAfterLockStat(n: number, run: () => void): () => boolean {
+    let seen = 0;
+    let fired = false;
+    hooks.afterStat = (p) => {
+      if (p !== lock || fired) return;
+      if (++seen !== n) return;
+      fired = true;
+      hooks.afterStat = undefined;
+      run();
+    };
+    return () => fired;
+  }
+
+  it("declines the oldest-generation drop when the peer rotated after our lock check (H1 sweep)", () => {
+    // The unlink gap, gate side. `held()`'s stat cannot see a peer that
+    // reclaims immediately after it, and what our unlink then destroys is
+    // the history the peer's own rotation just shifted into `<log>.2` —
+    // asserted as LOST in "does not shift the peer's fresh .1 off the end
+    // — but the unlink gap destroys its shifted history", which lands the
+    // peer one syscall later. The same evidence that gates the copy gates
+    // this too: the active file shrank, so these generations are the
+    // peer's (#3600 round-7, H1 sibling sweep). Nothing is destroyed.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+    realFs.writeFileSync(`${log}.2`, "OLDEST\n");
+
+    // Lock stat #1 is `held("drop <log>.2")` — `.2` exists, so the drop is
+    // the first destructive syscall and its check is the first lock stat.
+    const fired = firePeerAfterLockStat(1, () => peerReclaimsAndRotates(2, NEW));
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired()).toBe(true);
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe(HISTORY); // NOT dropped
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY); // peer's snapshot
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW); // peer's live rows
+  });
+
+  it("declines the shift when the peer rotated after our lock check (H1 sweep)", () => {
+    // The shift gap, gate side. One syscall later ("does not copy over the
+    // peer's .1") our rename moves the peer's fresh `.1` onto `.2`, over
+    // the history sitting there. Gated, both survive where they are.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    // No `<log>.2`, so there is no oldest-generation drop and lock stat #1
+    // is `held("shift <log>.1 → <log>.2")`.
+    const fired = firePeerAfterLockStat(1, () => peerReclaimsAndRotates(2, NEW));
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired()).toBe(true);
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY); // peer's snapshot
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe(HISTORY); // its shifted history
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW);
+  });
+
+  it("declines the copy when the peer rotated after our lock check (H1 gate)", () => {
+    // A peer that rotated under us leaves `.1` holding ITS fresh snapshot.
+    // Copying now overwrites that snapshot with whatever the peer's own
+    // truncate left in the active file. The data gate catches it the same
+    // way the truncate's does: our baseline is the active file's size on
+    // ENTRY, an append-only log only grows, so a shrink is someone else's
+    // truncate. Remove the gate and this fails with `.1` holding NEW —
+    // the peer's snapshot gone, one generation lost (#3600 round-7, H1).
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    const fired = firePeerAtCopyGapStart(() => peerReclaimsAndRotates(2, NEW));
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired()).toBe(true);
+    expect(rotated).toBe(false);
+    // Nothing of the peer's cycle is damaged: its snapshot is still at
+    // `.1` and the rows it appended after rotating are still live.
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW);
+  });
+
+  it("declines the copy when the peer rotated after our lock check and is quiet (H1 gate)", () => {
+    // Same gap, quiet peer — the shape round 6 declined to fix, arguing a
+    // code change "recovers no data because the peer's snapshot was
+    // already overwritten by our copy". The copy is the thing being
+    // skipped, so it recovers all of it: with the gate the log's live rows
+    // survive whole in `.1`; without it, `.1` is zero bytes, `.2` is gone
+    // and the active file is empty — every byte of the log lost (the
+    // residual test two below shows exactly that outcome, one injection
+    // point later). Total loss → zero loss (#3600 round-7, H1).
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    const fired = firePeerAtCopyGapStart(() => peerReclaimsAndRotates(2, ""));
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired()).toBe(true);
+    expect(rotated).toBe(false);
+    // The peer's full snapshot — every live row the log had — is intact.
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
+    expect(realFs.statSync(`${log}.1`).size).toBe(CAP * 4);
+    // The active file is the peer's freshly-truncated zero bytes, which is
+    // correct: those rows are the ones now sitting in `.1`.
+    expect(realFs.statSync(log).size).toBe(0);
+  });
+
   it("loses a generation when the reclaim lands in the copy gap (residual)", () => {
     // The documented worst case (#3600 round-5, M2), asserted so the
-    // residual cannot quietly become untrue. The peer lands between the
-    // pre-copy `held()` check and `copyFileSync` itself, so that ONE
-    // syscall proceeds unserialized: by then `.1` is the peer's fresh
-    // snapshot, and we overwrite it with a copy of the LIVE file.
+    // residual cannot quietly become untrue. The peer lands at the LAST
+    // instant of the check→`copyFileSync` gap — after the data gate's own
+    // stat of the active file, which is the window round-7's gate cannot
+    // close (it is a stat followed by a separate syscall, like every other
+    // check here). That ONE syscall proceeds unserialized: by then `.1` is
+    // the peer's fresh snapshot, and we overwrite it with a copy of the
+    // LIVE file.
     realFs.writeFileSync(log, BODY);
     realFs.writeFileSync(`${log}.1`, HISTORY);
 
@@ -580,11 +819,14 @@ describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
   });
 
   it("loses EVERY byte when the reclaim lands in the copy gap and the peer is quiet", () => {
-    // Same gap as the test above, one variable changed: the peer does not
-    // append after rotating. That is the ordinary state of a low-traffic
-    // log, and it is the real worst case (#3600 round-6, H1) — the test
-    // above masks it, because the rows its peer appends are what make the
-    // unguarded `copyFileSync` copy anything at all.
+    // Same residual window as the test above (after the data gate's stat,
+    // before the copy), one variable changed: the peer does not append
+    // after rotating. That is the ordinary state of a low-traffic log, and
+    // it is the real worst case (#3600 round-6, H1) — the test above masks
+    // it, because the rows its peer appends are what make the unguarded
+    // `copyFileSync` copy anything at all. Compare the gate test of the
+    // same shape above: one injection point earlier, the gate turns this
+    // outcome into no loss at all.
     //
     // With a quiet peer the active file it leaves is ZERO bytes, so our
     // one unserialized copy writes zero bytes over the peer's fresh `.1`,
@@ -707,6 +949,152 @@ describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
     expect(errs.join("")).toContain("rows another rotator wrote");
   });
 
+  it("the truncate gate is blind to a peer that re-appends exactly what we snapshotted (L2)", () => {
+    // The gate is `liveBytes < snapshotBytes` — STRICT, because in the
+    // ordinary rotation the two are equal and `<=` would decline every
+    // rotation this module performs. The documented residual therefore
+    // covers a peer that re-appends AT LEAST `snapshotBytes`, not "more
+    // than" it: landing on exactly that size passes the gate too (#3600
+    // round-7, L2). The peer here rotates and re-appends precisely as many
+    // bytes as we snapshotted, at the START of the truncate gap where the
+    // gate is what has to catch it — and does not.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    const errs: string[] = [];
+    const spy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: unknown) => {
+        errs.push(String(chunk));
+        return true;
+      });
+
+    let copied = false;
+    let fired = false;
+    hooks.beforeCopy = () => {
+      copied = true;
+    };
+    hooks.afterStat = (p) => {
+      if (p !== lock || !copied || fired) return;
+      fired = true;
+      hooks.afterStat = undefined;
+      // EXACTLY the snapshot's size, not one byte more.
+      peerReclaimsAndRotates(2, "y".repeat(BODY.length));
+    };
+
+    let rotated: boolean;
+    try {
+      rotated = maybeRotateLogFile(log, {
+        maxBytes: CAP,
+        maxFiles: 2,
+        tag: "victim",
+        lock: true,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fired).toBe(true);
+    expect(realFs.statSync(`${log}.1`).size).toBe(BODY.length); // snapshot size
+    // The gate did not fire: the sizes are equal, not shrunk.
+    expect(errs.join("")).not.toContain("shrank from");
+    // So we truncated, and the peer's rows are gone.
+    expect(rotated).toBe(true);
+    expect(realFs.statSync(log).size).toBe(0);
+    expect(errs.join("")).toContain("rows another rotator wrote");
+  });
+
+  it("an unverifiable lock fd drops every lock checkpoint (L1)", () => {
+    // `stillHeld()` returns a constant `true` when the `fstat` on our own
+    // lock fd failed — we cannot verify identity, and never rotating is
+    // the worse failure. The cost is not "one more gap": it is that none
+    // of the four checkpoints fires at all, so a peer that rotated before
+    // we touched anything does not stop us anywhere (#3600 round-7, L1).
+    //
+    // Compare "declines outright when the peer rotated before we touched
+    // anything", which is this exact interleaving with a verifiable fd and
+    // asserts that we touch NOTHING. Here the whole rotation runs: we drop
+    // the generation the peer just shifted its history into, shift its
+    // fresh snapshot off `.1`, copy, and truncate its live rows. The data
+    // gates cannot help — our baseline is measured after the peer's
+    // truncate, so nothing looks shrunk.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+    realFs.writeFileSync(`${log}.2`, "OLDEST\n");
+
+    let lockFd = -1;
+    hooks.afterOpen = (p, flags, fd) => {
+      if (p === lock && flags === "wx" && lockFd === -1) lockFd = fd;
+    };
+    hooks.beforeFstat = (fd) => {
+      // Only OUR lock fd: the snapshot's fstat must still work.
+      if (fd === lockFd) throw new Error("EBADF: simulated fstat failure");
+    };
+
+    let stats = 0;
+    hooks.beforeStat = (p) => {
+      if (p !== log) return;
+      if (++stats !== 2) return; // the under-lock size re-check
+      hooks.beforeStat = undefined;
+      peerReclaimsAndRotates(2, NEW);
+    };
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(lockFd).not.toBe(-1);
+    expect(stats).toBeGreaterThanOrEqual(2); // the interleaving happened
+    // Every destructive syscall went through, unserialized:
+    expect(rotated).toBe(true);
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe(BODY); // peer's `.1`, shifted
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(NEW); // over its snapshot
+    expect(realFs.statSync(log).size).toBe(0); // and its live rows truncated
+    expect(realFs.existsSync(`${log}.3`)).toBe(false);
+  });
+
+  it("names the step that failed when the snapshot cannot be measured (L3)", () => {
+    // `open`, `fsync` and `fstat` on the snapshot fail for three different
+    // reasons and used to share one diagnostic — "could not fsync
+    // snapshot" — so an `fstat` failure sent the operator after durability
+    // when the problem was measurement (#3600 round-7, L3). The size is a
+    // precondition for the truncate gate, so a failure here still declines
+    // the rotation; what changed is that the line says which step it was.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    let snapFd = -1;
+    hooks.afterOpen = (p, flags, fd) => {
+      if (p === `${log}.1` && flags === "r" && snapFd === -1) snapFd = fd;
+    };
+    hooks.beforeFstat = (fd) => {
+      if (fd === snapFd) throw new Error("EBADF: simulated fstat failure");
+    };
+
+    const errs: string[] = [];
+    const spy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: unknown) => {
+        errs.push(String(chunk));
+        return true;
+      });
+    let rotated: boolean;
+    try {
+      rotated = rotateLogFile(log, 2, "t");
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(snapFd).not.toBe(-1); // we really did hit the snapshot's fstat
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(log, "utf8")).toBe(BODY); // active intact
+    expect(errs.join("")).toContain("could not measure snapshot");
+    expect(errs.join("")).not.toContain("could not fsync snapshot");
+  });
+
   it("a rotator that lost the lock touches nothing at all", () => {
     // Unit-level: the predicate is false from the first call, so every
     // generation and the active file must be byte-identical afterwards.
@@ -797,12 +1185,15 @@ describe("inode identity's premise: the lock fd stays open (M3)", () => {
     // the list is what let that survive round 5 (#3600 round-6, H3), so it
     // is included now and the ordering fix is what makes it pass.
     const isGeneration = (p: string) => /^\.\d+$/.test(p.slice(log.length));
+    const isLockPark = (p: string) => p.startsWith(`${lock}.stale.`);
     hooks.beforeUnlink = (p) => {
       if (isGeneration(p)) note(`unlink ${gen(p)}`);
       else if (p === lock) note("unlink <lock>");
+      else if (isLockPark(p)) note("unlink <lock park>");
     };
     hooks.beforeRename = (from) => {
       if (isGeneration(from)) note(`rename ${gen(from)}`);
+      else if (from === lock) note("rename <lock> → park");
     };
     hooks.beforeCopy = (from, to) => {
       if (from === log) note(`copy <log> → ${gen(to)}`);
@@ -826,7 +1217,14 @@ describe("inode identity's premise: the lock fd stays open (M3)", () => {
       "rename <log>.1 [fd open]",
       "copy <log> → <log>.1 [fd open]",
       "truncate <log> [fd open]",
-      "unlink <lock> [fd open]",
+      // Release is park-verify-unlink now (#3600 round-7, H2), so it is
+      // TWO syscalls at the lock path and both need the premise: the
+      // rename decides which file we are judging, and the comparison that
+      // follows is `parked.ino === ourIno` — which only means "our lock"
+      // while `fd` still pins that number. Close early and a peer's fresh
+      // lock can carry it, we park that, match, and delete it.
+      "rename <lock> → park [fd open]",
+      "unlink <lock park> [fd open]",
     ]);
     // And it IS closed by the end — otherwise the tags above would be
     // vacuously "fd open" and this test would prove nothing.

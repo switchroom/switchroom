@@ -179,10 +179,21 @@ export function resolveWebhookLogRotation(): {
  * BEFORE each append (both writer paths: the gateway-side recorder and
  * the legacy host-runtime handler). Best-effort — never throws, so a
  * rotation problem can never turn a verified webhook into a 500.
+ *
+ * Returns nothing ON PURPOSE (#3600 round-7, L4). `maybeRotateLogFile`'s
+ * boolean is not trustworthy in one interleaving — it reports `true` for a
+ * rotation that destroyed a concurrent rotator's rows, because the other
+ * reading of `false` ("the active file is untouched") would be a worse
+ * lie; the honest channel is its stderr line. Both of this wrapper's call
+ * sites already discard the value, but a wrapper that hands it out is an
+ * open invitation for a future `if (rotated)` to inherit the lie with
+ * nothing to stop it. `void` stops it in the type system instead of in a
+ * comment someone has to go and find. `rotateAuditLog` in
+ * `src/vault/broker/audit-log.ts` is the same shape for the same reason.
  */
-export function rotateWebhookLogIfNeeded(logPath: string): boolean {
+export function rotateWebhookLogIfNeeded(logPath: string): void {
   const { maxBytes, maxFiles } = resolveWebhookLogRotation()
-  return maybeRotateLogFile(logPath, {
+  maybeRotateLogFile(logPath, {
     maxBytes,
     maxFiles,
     tag: 'webhook-log',
