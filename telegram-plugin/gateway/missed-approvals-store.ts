@@ -19,13 +19,18 @@
  * record and edits the card closed.
  *
  * File format: a single JSON object `{ pending, delivered }`, written
- * synchronously to avoid interleaving on concurrent auto-denies, mode 0o600.
- * Mirrors the `permission-card-store.ts` pattern. Both lists are hard-capped
- * so the file stays tiny under a runaway loop.
+ * synchronously to avoid interleaving on concurrent auto-denies, mode 0o600,
+ * ATOMICALLY (tmp + fsync + rename) so a crash mid-persist can't leave a torn
+ * file. Mirrors the `permission-card-store.ts` pattern. Both lists are
+ * hard-capped so the file stays tiny under a runaway loop. A corrupt file is
+ * quarantined and logged loudly rather than silently read as "nothing was
+ * missed" — see store-file.ts.
  */
 
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
+import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { quarantineCorruptStoreFile, readStoreJsonSync } from './store-file.js'
 
 export interface MissedApproval {
   /** The permission request_id that timed out (dedup key). */
@@ -80,29 +85,39 @@ export interface MissedApprovalsStore {
 export const MAX_PENDING = 50
 export const MAX_DELIVERED = 20
 
-export function createMissedApprovalsStore(stateDir: string): MissedApprovalsStore {
+export function createMissedApprovalsStore(
+  stateDir: string,
+  /** Log sink — defaults to stderr (the gateway's runtime log). */
+  log: (line: string) => void = l => process.stderr.write(l),
+): MissedApprovalsStore {
   const filePath = join(stateDir, 'missed-approvals.json')
 
   function read(): FileShape {
-    try {
-      const raw = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(raw) as Partial<FileShape>
-      return {
-        pending: Array.isArray(parsed?.pending) ? parsed.pending : [],
-        delivered: Array.isArray(parsed?.delivered) ? parsed.delivered : [],
-      }
-    } catch {
+    const parsed = readStoreJsonSync(filePath, 'missed-approvals-store', log) as
+      | Partial<FileShape>
+      | undefined
+    if (parsed === undefined) return { pending: [], delivered: [] }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      quarantineCorruptStoreFile(
+        filePath,
+        'missed-approvals-store',
+        'parsed to a non-object — not a missed-approvals file',
+        log,
+      )
       return { pending: [], delivered: [] }
+    }
+    return {
+      pending: Array.isArray(parsed.pending) ? parsed.pending : [],
+      delivered: Array.isArray(parsed.delivered) ? parsed.delivered : [],
     }
   }
 
   function write(f: FileShape): void {
     try {
-      writeFileSync(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
+      // tmp + fsync + rename — never truncate the destination in place.
+      atomicWriteFileSync(filePath, JSON.stringify(f), 0o600)
     } catch (err) {
-      process.stderr.write(
-        `telegram gateway: missed-approvals-store write failed: ${(err as Error).message}\n`,
-      )
+      log(`telegram gateway: missed-approvals-store write failed: ${(err as Error).message}\n`)
     }
   }
 

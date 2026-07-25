@@ -8,7 +8,9 @@
  * immediately. It reads as "my approval didn't stick."
  *
  * Fix: mirror the store to a tiny JSON file in STATE_DIR (same shape as
- * permission-card-store.ts — synchronous writes, mode 0o600, one small file).
+ * permission-card-store.ts — synchronous ATOMIC writes (tmp + fsync + rename),
+ * mode 0o600, one small file; a corrupt file is quarantined and logged loudly
+ * rather than silently read as "no grants" — see store-file.ts).
  * Write-through on every grant and on sweep-expiry removal; reload at boot,
  * dropping entries already past their ABSOLUTE expiry.
  *
@@ -23,8 +25,9 @@
  * and never write (any pre-existing file is ignored).
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { quarantineCorruptStoreFile, readStoreJsonSync } from './store-file.js'
 import {
   serializeScopedGrants,
   deserializeScopedGrants,
@@ -50,18 +53,25 @@ export function scopedGrantPersistEnabled(
 export function createScopedGrantStore(
   stateDir: string,
   env: Record<string, string | undefined> = process.env,
+  /** Log sink — defaults to stderr (the gateway's runtime log). */
+  log: (line: string) => void = l => process.stderr.write(l),
 ): ScopedGrantPersistence {
   const filePath = join(stateDir, 'scoped-grants.json')
   const enabled = scopedGrantPersistEnabled(env)
 
   function read(): unknown[] {
-    try {
-      const raw = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(raw)
-      return Array.isArray(parsed) ? parsed : []
-    } catch {
+    const parsed = readStoreJsonSync(filePath, 'scoped-grant-store', log)
+    if (parsed === undefined) return []
+    if (!Array.isArray(parsed)) {
+      quarantineCorruptStoreFile(
+        filePath,
+        'scoped-grant-store',
+        'parsed to a non-array — not a scoped-grants file',
+        log,
+      )
       return []
     }
+    return parsed
   }
 
   return {
@@ -75,14 +85,11 @@ export function createScopedGrantStore(
     save(store) {
       if (!enabled) return
       try {
-        writeFileSync(filePath, JSON.stringify(serializeScopedGrants(store)), {
-          encoding: 'utf-8',
-          mode: 0o600,
-        })
+        // tmp + fsync + rename — a crash mid-persist leaves the previous
+        // grant set intact rather than a torn file that reads as "no grants".
+        atomicWriteFileSync(filePath, JSON.stringify(serializeScopedGrants(store)), 0o600)
       } catch (err) {
-        process.stderr.write(
-          `telegram gateway: scoped-grant-store write failed: ${(err as Error).message}\n`,
-        )
+        log(`telegram gateway: scoped-grant-store write failed: ${(err as Error).message}\n`)
       }
     },
   }
