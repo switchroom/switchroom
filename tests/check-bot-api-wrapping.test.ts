@@ -53,7 +53,16 @@ describe('scripts/check-bot-api-wrapping.sh (#1075)', () => {
     'passes against the live repo (regression gate)',
     () => {
       const result = runScript(REPO)
-      expect(result.ok).toBe(true)
+      // Surface the script's own output as the assertion message: it
+      // prints the offending file:line, and without this the only thing
+      // CI logs is `expected false to be true`. That is exactly what
+      // happened on main run 30061831999 (2026-07-24) — the gate caught
+      // a real unwrapped call and the log named neither the file nor the
+      // line, so triage started from zero. `runScript` already captures
+      // both streams; this stops discarding them. (The synthetic breach
+      // tests below already assert on message content — only this
+      // live-repo gate was blind.)
+      expect(result.ok, `${result.stdout}${result.stderr}`).toBe(true)
       expect(result.stdout).toMatch(/clean/)
     },
     // Local runs finish in ~1.5s; hosted Buildkite agents have slower I/O
