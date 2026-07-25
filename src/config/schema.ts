@@ -3861,6 +3861,22 @@ export const FleetHealthConfigSchema = z.object({
       "on this agent — never a self-authored loop (on-leash, " +
       "no-self-escalation).",
     ),
+  litellm_config_path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Absolute path to the operator-maintained LiteLLM proxy config that the " +
+      "I2 header-passthrough sensor reads " +
+      "(`src/fleet-health/litellm-config-sensor.ts`). Operator-supplied " +
+      "because the real path embeds a deployment-identifying Coolify service " +
+      "id that must not live in the public repo — set it here (host-local " +
+      "switchroom.yaml) so the load-bearing OAuth-leak check is on by default " +
+      "for every scan, instead of depending on a LITELLM_CONFIG_PATH env var " +
+      "being exported into the cron's shell. Precedence: this field → " +
+      "LITELLM_CONFIG_PATH env → unset, in which case the sensor SKIPS with a " +
+      "visible notice.",
+    ),
 });
 
 /**

@@ -1086,13 +1086,13 @@ page (design: [`reference/rfcs/fleet-health.md`](../reference/rfcs/fleet-health.
 serves the job spec `fleet-stays-healthy`).
 
 It is **top-level and operator-owned** — not part of the per-agent
-`defaults → profiles → agents` cascade. The one field assigns WHICH agent
-owns the detection work, so every scan and deep-dive is attributable and
-on-leash.
+`defaults → profiles → agents` cascade. `owner_agent` assigns WHICH agent owns
+the detection work, so every scan and deep-dive is attributable and on-leash.
 
 | Field | Cascade | Description |
 |-------|---------|-------------|
 | `fleet_health.owner_agent` | override (top-level only) | The admin agent that runs the nightly model-free sensor + weekly budgeted deep-dive that populate `~/.switchroom/fleet-health/ledger.json`. Default **unset** → the feature is inert: no crons scheduled, the admin page renders its empty state. The named agent must be `admin: true`. A dedicated owner (not any admin) keeps the fleet-health memory scoped and the token spend accountable. The detection runs **only** as operator-set schedules on this agent — never a self-authored loop. |
+| `fleet_health.litellm_config_path` | override (top-level only) | Absolute path to the operator-maintained LiteLLM proxy config that the I2 header-passthrough sensor reads. It is operator-supplied because the real path embeds a deployment-identifying Coolify service id, which must not live in the public repo. Precedence: this field → `LITELLM_CONFIG_PATH` env → **unset**, in which case the sensor logs `SKIPPED — no config path` and the OAuth-leak check does not run (the expected state in CI/dev). Set it on any host running a real LiteLLM proxy. |
 
 The ledger at `~/.switchroom/fleet-health/ledger.json` is per-deployment state
 written by the owner agent; it is **never committed to the repo** (same rule
@@ -1103,6 +1103,9 @@ read-only and ranks the 22 job records worst-first by `priority_score`
 ```yaml
 fleet_health:
   owner_agent: klanker   # admin: true; runs the sensor + deep-dive crons
+  # Host-local path to the live LiteLLM proxy config (I2 OAuth-leak sensor).
+  # Omit off-host; the sensor then skips with a visible notice.
+  litellm_config_path: /data/coolify/services/<litellm-service-id>/litellm-config.yaml
 ```
 
 The live detection pipeline (the `switchroom fleet-health` CLI, the scoring, the

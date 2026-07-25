@@ -43,20 +43,30 @@ export interface LitellmSensorOptions {
 
 export interface LitellmSensorResult {
   status: "ok" | "violation" | "skipped";
-  path: string;
+  /** The path scanned, or `null` when no path resolved at all (env unset and
+   *  no explicit override) — distinct from a resolved-but-absent file, so a
+   *  consumer can never mistake an empty string for a real path. */
+  path: string | null;
   findings: Finding[];
 }
 
-/** Resolve the config path: explicit arg → `LITELLM_CONFIG_PATH` env → null.
- *  There is no hard-coded default (the real path embeds a deployment-
- *  identifying Coolify service id); the operator sets the env on the host. */
+/** Resolve the config path: explicit arg (the CLI passes
+ *  `fleet_health.litellm_config_path` from switchroom.yaml) → the
+ *  `LITELLM_CONFIG_PATH` env → null. There is no hard-coded default (the real
+ *  path embeds a deployment-identifying Coolify service id); the operator
+ *  supplies it in host-local config, or via the env for a one-off run. */
 export function resolveLitellmConfigPath(explicit?: string): string | null {
   return explicit ?? process.env[LITELLM_CONFIG_PATH_ENV] ?? null;
 }
 
 /**
- * Run the LiteLLM header-passthrough sensor. Absent file → `skipped` with a
- * VISIBLE log notice (hermetic CI/dev, or a host where the path moved). Present
+ * Run the LiteLLM header-passthrough sensor. No configured path (neither
+ * `fleet_health.litellm_config_path` nor the `LITELLM_CONFIG_PATH` env) →
+ * `skipped` with a VISIBLE log notice naming what to set; an absent, unreadable
+ * or unparseable file → likewise `skipped` with a VISIBLE notice (hermetic
+ * CI/dev, or a host where the path moved). Neither case ever reports a silent
+ * pass: `status` is `skipped`, never `ok`, so the difference between "checked
+ * and clean" and "did not check" stays legible to the caller. Present
  * file with a scoping violation → one `Finding` per violation, attributed to
  * the litellm-proxy pseudo-agent, so it escalates into the ledger.
  */
@@ -71,11 +81,13 @@ export function scanLitellmConfig(
 
   if (path == null) {
     log(
-      `fleet-health: litellm-config sensor SKIPPED — ${LITELLM_CONFIG_PATH_ENV} unset ` +
-        `(set it on the host to the operator-maintained LiteLLM config path; ` +
-        `hermetic CI/dev expected to skip)`,
+      `fleet-health: litellm-config sensor SKIPPED — no config path: set ` +
+        `fleet_health.litellm_config_path in switchroom.yaml (or the ` +
+        `${LITELLM_CONFIG_PATH_ENV} env) to the operator-maintained LiteLLM ` +
+        `config path; the I2 OAuth-leak check does NOT run until you do. ` +
+        `Hermetic CI/dev expected to skip.`,
     );
-    return { status: "skipped", path: "", findings: [] };
+    return { status: "skipped", path: null, findings: [] };
   }
 
   if (!exists(path)) {

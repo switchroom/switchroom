@@ -69,6 +69,12 @@ These must always hold.
   OpenRouter/OpenAI entry, and the config's own comments warn against the
   global form — but I2 holds **only** as long as that operator convention is
   maintained. It is not automatically guaranteed.
+  The service id above is deliberately a `<litellm-service-id>` placeholder —
+  it identifies a live deployment and does not belong in a public repo. The
+  fleet-health sensor that checks the live file gets the real path from
+  `fleet_health.litellm_config_path` in the host-local `switchroom.yaml` (or
+  the `LITELLM_CONFIG_PATH` env); with neither set it logs
+  `SKIPPED — no config path` and the check does not run.
 - **I3 — The auth broker owns OAuth.** The `switchroom-auth-broker` singleton
   is the sole writer of every consumer's `.claude/credentials.json` (agents and
   Hindsight alike) and owns the refresh loop; this is what enables account

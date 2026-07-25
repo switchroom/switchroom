@@ -65,7 +65,19 @@ export function registerFleetHealthCommand(program: Command): void {
         const windowDays = Number(opts.windowDays) || 30;
         const log = (m: string) => console.error(chalk.gray(m));
 
-        const result = runScan({ ownerAgent, windowDays, log });
+        // The I2 sensor's config path is operator-supplied (the real path
+        // embeds a deployment-identifying Coolify service id, so it cannot be
+        // defaulted in this repo). Prefer switchroom.yaml over the env so the
+        // load-bearing OAuth-leak check is on for every scan without relying
+        // on the cron shell exporting LITELLM_CONFIG_PATH.
+        const litellmConfigPath = cfg.fleet_health?.litellm_config_path;
+
+        const result = runScan({
+          ownerAgent,
+          windowDays,
+          log,
+          litellmConfigPath,
+        });
         const ledger = result.ledger;
 
         log(

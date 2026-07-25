@@ -79,6 +79,24 @@ const RULES = [
   { id: 'real Telegram id (user)', re: new RegExp('\\b' + '82487' + '03757\\b') },
   { id: 'real Telegram id (alt)', re: new RegExp('\\b' + '82881' + '44562\\b') },
   { id: 'real Telegram id (group)', re: new RegExp('\\b' + '38527' + '47971\\b') },
+  // Live Coolify service id for the LiteLLM proxy, scrubbed in PR #3530. It
+  // identifies a real deployment (and the exact host path of the
+  // operator-maintained proxy config). Docs use the `<litellm-service-id>`
+  // placeholder; the sensor and lint guard read the real path from
+  // `fleet_health.litellm_config_path` / `LITELLM_CONFIG_PATH`. Without this
+  // rule nothing stopped an agent pasting the id straight back into a doc or a
+  // default — the scrub would silently un-do itself.
+  {
+    id: 'live Coolify litellm service id (use <litellm-service-id>)',
+    re: new RegExp('vhz4' + 'jc1tzvk6' + 'gdql8jue' + 'iwq4', 'i'),
+  },
+  // Any other long Coolify service-dir slug is deployment-identifying for the
+  // same reason. The placeholder form `<litellm-service-id>` does not match
+  // (angle brackets + hyphens are outside the char class).
+  {
+    id: 'deployment-identifying Coolify service dir (use <litellm-service-id>)',
+    re: new RegExp('coolify/' + 'services/' + '[a-z0-9]{20,}'),
+  },
   // Contiguous Anthropic-token-shaped literal. Real tokens were never
   // committed; this enforces the CLAUDE.md "Secrets in tests" rule —
   // token-shaped fixtures must be runtime-assembled, never a contiguous

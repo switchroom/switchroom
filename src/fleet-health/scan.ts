@@ -47,9 +47,12 @@ export interface ScanOptions {
   /** Override the silent-no-op windowing floor (unix seconds). Defaults to
    *  `SILENT_NOOP_FLOOR_TS`. Exposed for tests / future re-baselining. */
   silentNoopFloorTs?: number;
-  /** Override the LiteLLM config path the I2 header-passthrough sensor reads.
-   *  Defaults to `LITELLM_CONFIG_PATH` env → the host-correct default. Exposed
-   *  for tests; absent file → the sensor skips with a visible notice. */
+  /** The LiteLLM config path the I2 header-passthrough sensor reads. The CLI
+   *  passes `fleet_health.litellm_config_path` from switchroom.yaml; falling
+   *  back to the `LITELLM_CONFIG_PATH` env when unset. There is no hard-coded
+   *  default (the real path embeds a deployment-identifying Coolify service
+   *  id), so unset → the sensor skips with a visible notice, as does an
+   *  absent file. */
   litellmConfigPath?: string;
 }
 

@@ -54,7 +54,15 @@ describe("scanLitellmConfig", () => {
     });
     expect(res.status).toBe("skipped");
     expect(res.findings).toEqual([]);
-    expect(logs.some((l) => /SKIPPED.*LITELLM_CONFIG_PATH unset/.test(l))).toBe(true);
+    // `null`, not "" — a consumer must not mistake a sentinel for a real path.
+    expect(res.path).toBeNull();
+    // The notice must name BOTH knobs and say the check did not run, so the
+    // operator can tell "did not check" from "checked and clean".
+    const notice = logs.find((l) => /SKIPPED — no config path/.test(l));
+    expect(notice).toBeDefined();
+    expect(notice).toContain("fleet_health.litellm_config_path");
+    expect(notice).toContain("LITELLM_CONFIG_PATH");
+    expect(notice).toMatch(/does NOT run/);
   });
 
   it("absent file → skipped with a VISIBLE notice, no findings", () => {

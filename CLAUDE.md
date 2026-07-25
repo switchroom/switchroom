@@ -146,11 +146,15 @@ Traps that bite repeatedly:
 - **`check-litellm-config-guard` SKIPS off-host** — the operator-maintained
   LiteLLM config path comes from `LITELLM_CONFIG_PATH` (no hard-coded
   default — the real path embeds a deployment-identifying Coolify service
-  id), which is unset in CI/dev, so the lint step is a near-vacuous belt. The load-bearing
-  I2 OAuth-leak enforcement is the fleet-health sensor
+  id), which is unset in CI/dev, so the lint step is a near-vacuous belt. The
+  load-bearing I2 OAuth-leak enforcement is the fleet-health sensor
   (`src/fleet-health/litellm-config-sensor.ts`), which runs where the file
-  lives and escalates a violation into the priority ledger. Point
-  `LITELLM_CONFIG_PATH` at a real config to exercise the lint locally.
+  lives and escalates a violation into the priority ledger. That sensor takes
+  its path from **`fleet_health.litellm_config_path` in the host-local
+  `switchroom.yaml`** (env `LITELLM_CONFIG_PATH` as the fallback) — set the
+  config field on the host, or the sensor logs `SKIPPED — no config path` and
+  the check does not run. Point `LITELLM_CONFIG_PATH` at a real config to
+  exercise the lint locally.
 
 ### Secrets in tests
 

@@ -37,7 +37,26 @@ function fixture(yaml: string): string {
   return p;
 }
 
+/** Run the script with LITELLM_CONFIG_PATH explicitly removed from the env. */
+function runWithoutEnv(): { ok: boolean; stdout: string; stderr: string } {
+  const env = { ...process.env };
+  delete env.LITELLM_CONFIG_PATH;
+  const r = spawnSync("node", [SCRIPT], { cwd: REPO, encoding: "utf8", env });
+  return { ok: r.status === 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
 describe("check-litellm-config-guard.mjs", () => {
+  it("LITELLM_CONFIG_PATH unset → exit 0 with a visible SKIP notice (no hard-coded default)", () => {
+    const r = runWithoutEnv();
+    // Must SKIP cleanly, not crash on an undefined path and not silently PASS.
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toMatch(/SKIP — LITELLM_CONFIG_PATH unset/);
+    expect(r.stdout).toMatch(/LITELLM_CONFIG_PATH/);
+    // A skip is not an OK: the "correctly scoped" success line must be absent.
+    expect(r.stdout).not.toMatch(/OK/);
+    expect(r.stderr).not.toMatch(/FAIL/);
+  });
+
   it("absent file → exit 0 with a visible SKIP notice", () => {
     const r = runWith("/definitely/not/here/litellm-config.yaml");
     expect(r.ok).toBe(true);
