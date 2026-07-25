@@ -66,8 +66,14 @@ mkdir -p "$CACHE_DIR" 2>/dev/null || true
 # Date-keyed cache filename: when the calendar day rolls over, the
 # `today's daily` file path the renderer reads changes (the template
 # embeds different filenames in its output), so we invalidate the cache
-# at midnight by varying the filename. Yesterday's file lingers
-# harmlessly until the next sweep.
+# at midnight by varying the filename.
+#
+# Prior days' files are never cleaned up — there is no sweeper for this
+# directory anywhere in the repo. That is deliberate and cheap, not an
+# oversight: three small files per agent per day (~1100/year), a hash
+# and a signature of 65 bytes each plus a body bounded by
+# DEFAULT_DYNAMIC_TOTAL_MAX_CHARS. If that ever needs reclaiming it
+# should be a real sweeper, not a comment claiming one exists.
 #
 # LOCAL time, not UTC — this MUST match the renderer. See
 # `dailyMemoryRelativePath` in src/agents/workspace.ts, which derives
@@ -120,12 +126,23 @@ YESTERDAY_FILE="$WS_DIR/memory/${YESTERDAY_DATE}.md"
 # Signature of the source set: name + mtime + size for each source the
 # renderer reads, with missing files recorded explicitly so a deletion
 # changes the signature.
+#
+# `%.9Y` (nanosecond mtime), NOT `%Y`. With whole-second mtimes, a
+# content change that lands in the same second as the previous one and
+# happens to keep the same file size produces an identical signature, so
+# the edit is served stale indefinitely — until some later change moves
+# the second or the size. That is strictly worse than the max-mtime
+# comparison this replaced, which fell through on an equal-second
+# collision (`-gt` is false when equal) and re-rendered. Nanosecond
+# resolution closes it. If a filesystem reports a zero nanosecond field
+# the signature degrades to second precision, i.e. exactly the old
+# behaviour, never worse.
 _ws_source_signature() {
   local src meta
   {
     for src in "$WS_DIR/MEMORY.md" "$TODAY_FILE" "$YESTERDAY_FILE"; do
       if [ -f "$src" ]; then
-        meta=$(stat -c '%Y:%s' "$src" 2>/dev/null || echo "stat-error")
+        meta=$(stat -c '%.9Y:%s' "$src" 2>/dev/null || echo "stat-error")
         printf '%s\t%s\n' "$src" "$meta"
       else
         printf '%s\tMISSING\n' "$src"
@@ -138,9 +155,26 @@ _ws_source_signature() {
 # render window is not falsely credited to this body.
 SRC_SIG="$(_ws_source_signature)"
 
+# Is the cached body intact? CACHE_FILE holds sha256 of the render output
+# with no trailing newline; BODY_FILE holds that same output plus one
+# trailing newline (or is empty for an empty render). Command substitution
+# strips trailing newlines, so this reproduces the recorded hash exactly in
+# both cases. Without it a body truncated by a crash mid-write is served to
+# the model verbatim and pinned into the fast path forever, because the
+# signature only vouches for the *sources*, never for the body. One sha256
+# over at most DEFAULT_DYNAMIC_TOTAL_MAX_CHARS is negligible against the
+# ~825ms render it guards.
+_ws_body_intact() {
+  local recorded actual
+  recorded=$(head -1 "$CACHE_FILE" 2>/dev/null || echo "")
+  [ -n "$recorded" ] || return 1
+  actual=$(printf '%s' "$(cat "$BODY_FILE" 2>/dev/null)" | sha256sum 2>/dev/null | cut -d' ' -f1)
+  [ -n "$actual" ] && [ "$actual" = "$recorded" ]
+}
+
 if [ -f "$BODY_FILE" ] && [ -f "$SIG_FILE" ] && [ -n "$SRC_SIG" ]; then
   RECORDED_SIG=$(head -1 "$SIG_FILE" 2>/dev/null || echo "")
-  if [ "$RECORDED_SIG" = "$SRC_SIG" ]; then
+  if [ "$RECORDED_SIG" = "$SRC_SIG" ] && _ws_body_intact; then
     # Fast path: the source set is unchanged since this body was made.
     # In inject-on-change mode, also check the session-state file — if the
     # session_id matches the last-emitted session AND the hash matches, we
@@ -239,17 +273,41 @@ _ws_record_session_state() {
   fi
 }
 
-# Record the pre-render source signature against the body we are about to
-# serve. Written only once a body file actually exists, so a failed body
-# write can never leave a "fresh" signature pointing at a stale body.
-_ws_record_sig() {
+# Write a cache file atomically: fill a per-PID temp file, then rename it
+# into place. A plain `>` redirect truncates first, so a concurrent hook
+# process can observe (and cache, and serve) a half-written body. rename(2)
+# is atomic within a filesystem, so a reader sees either the whole old file
+# or the whole new one.
+_ws_write_atomic() {
+  local dest="$1" content="$2" tmp="$1.tmp.$$"
+  if printf '%s' "$content" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$dest" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+}
+
+# Publish the body and the pre-render source signature that vouches for it.
+# Body first, signature second, both atomic: the signature is what arms the
+# fast path, so it must never become visible before the body it describes.
+# The signature is only written once the body file actually exists, so a
+# failed body write can never leave a "fresh" signature pointing at a stale
+# body.
+_ws_publish() {
+  _ws_write_atomic "$BODY_FILE" "$BODY_OUT"
   if [ -n "$SRC_SIG" ] && [ -f "$BODY_FILE" ]; then
-    printf '%s\n' "$SRC_SIG" > "$SIG_FILE" 2>/dev/null || true
+    _ws_write_atomic "$SIG_FILE" "$SRC_SIG
+"
   fi
 }
 
 if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" = "$OLD_HASH" ] && [ -f "$BODY_FILE" ]; then
-  _ws_record_sig
+  # Rewrite the body unconditionally, even though the hash says it is
+  # unchanged. NEW_HASH and OLD_HASH both derive from CACHE_FILE and the
+  # fresh render — neither validates BODY_FILE — so a body truncated by a
+  # crash mid-write would otherwise be cat'd to the model AND pinned into
+  # the fast path by the signature we are about to stamp on it.
+  _ws_publish
   # Content unchanged since last render. In inject-on-change mode, check if
   # we already injected this content in the current session — if so, suppress.
   if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
@@ -269,9 +327,9 @@ if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" = "$OLD_HASH" ] && [ -f "$BODY_FILE" ]; t
 else
   # Refresh sidecar: write hash + body, then echo body.
   if [ -n "$NEW_HASH" ]; then
-    printf '%s\n' "$NEW_HASH" > "$CACHE_FILE" 2>/dev/null || true
-    printf '%s' "$BODY_OUT" > "$BODY_FILE" 2>/dev/null || true
-    _ws_record_sig
+    _ws_write_atomic "$CACHE_FILE" "$NEW_HASH
+"
+    _ws_publish
     if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
       _ws_record_session_state "$NEW_HASH" "$SESSION_ID"
     fi

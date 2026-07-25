@@ -1,6 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  chmodSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -344,6 +355,79 @@ describe("workspace-dynamic-hook.sh", () => {
     makeShim(shimDir, "second body content");
     const b = runHook({ agentName: "klanker", cacheDir, shimDir, agentDirOverride: fakeAgentDir });
     expect(b.stdout).toContain("second body");
+  });
+
+  it("re-renders on a same-second, same-size source change", () => {
+    // Regression guard for the signature's mtime precision. With a
+    // whole-second `stat -c %Y`, a content change landing in the same
+    // second as the previous one while keeping the same file size
+    // produces an identical signature, and the edit is served stale
+    // indefinitely — until some later change moves the second or the
+    // size. `%.9Y` (nanoseconds) closes it.
+    const fakeAgentDir = join(tmp, "agent");
+    const wsDir = join(fakeAgentDir, "workspace");
+    mkdirSync(wsDir, { recursive: true });
+    const memPath = join(wsDir, "MEMORY.md");
+    writeFileSync(memPath, "AAAA");
+    const stamp = statSync(memPath).mtime;
+
+    makeShim(shimDir, "first body content");
+    const a = runHook({ agentName: "klanker", cacheDir, shimDir, agentDirOverride: fakeAgentDir });
+    expect(a.stdout).toContain("first body");
+
+    // Same byte length, and forced back to the *same whole second* as the
+    // original write (nanoseconds still differ, which is the point).
+    writeFileSync(memPath, "BBBB");
+    const changed = statSync(memPath);
+    utimesSync(memPath, changed.atime, new Date(stamp.getTime()));
+    expect(Math.floor(statSync(memPath).mtimeMs / 1000)).toBe(
+      Math.floor(stamp.getTime() / 1000),
+    );
+    expect(statSync(memPath).size).toBe(4);
+
+    makeShim(shimDir, "second body content");
+    const b = runHook({ agentName: "klanker", cacheDir, shimDir, agentDirOverride: fakeAgentDir });
+    expect(b.stdout).toContain("second body");
+  });
+
+  it("repairs a truncated cached body instead of serving and pinning it", () => {
+    // Nothing in the cache validated BODY_FILE: the signature vouches for
+    // the *sources*, and the hash-match branch compares NEW_HASH to
+    // OLD_HASH, both derived from CACHE_FILE and the fresh render. So a
+    // body truncated by a crash mid-write was cat'd to the model verbatim
+    // AND pinned into the fast path. Two defenses now: the fast path
+    // verifies the body against the recorded hash before serving it, and
+    // the hash-match branch rewrites the body unconditionally.
+    const fakeAgentDir = join(tmp, "agent");
+    const wsDir = join(fakeAgentDir, "workspace");
+    mkdirSync(wsDir, { recursive: true });
+    writeFileSync(join(wsDir, "MEMORY.md"), "remembered things");
+
+    const payload = "intact body content";
+    makeShim(shimDir, payload);
+    const a = runHook({ agentName: "klanker", cacheDir, shimDir, agentDirOverride: fakeAgentDir });
+    expect(a.stdout).toContain("intact body");
+
+    // Simulate a crash mid-write: body truncated, hash file left intact.
+    const bodyFile = join(cacheDir, "switchroom-hookcache", `workspace-dynamic.${todayLocal()}.body`);
+    writeFileSync(bodyFile, "intact bo");
+
+    // Same render output → hash matches → the hash-match branch runs.
+    const b = runHook({ agentName: "klanker", cacheDir, shimDir, agentDirOverride: fakeAgentDir });
+    expect(b.stdout).toContain("intact body content");
+    expect(readFileSync(bodyFile, "utf-8")).toBe(`${payload}\n`);
+  });
+
+  // Hygiene guard on the atomic-write helper itself, not a regression
+  // test for an observed bug: a botched `mv` would strand `.tmp.$$`
+  // files in the cache dir and grow it without bound.
+  it("never leaves a temp cache file behind", () => {
+    const fakeAgentDir = join(tmp, "agent");
+    mkdirSync(join(fakeAgentDir, "workspace"), { recursive: true });
+    makeShim(shimDir, "body content");
+    runHook({ agentName: "klanker", cacheDir, shimDir, agentDirOverride: fakeAgentDir });
+    const entries = readdirSync(join(cacheDir, "switchroom-hookcache"));
+    expect(entries.filter((e) => e.includes(".tmp."))).toEqual([]);
   });
 
   it("exits silently with no output when SWITCHROOM_AGENT_NAME is unset", () => {
