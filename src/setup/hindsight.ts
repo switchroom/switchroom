@@ -313,7 +313,17 @@ export function hindsightConsumerMirrorDir(config: {
  * - MAX_CANDIDATES: vendor default 300. At our `recallBudget=low`
  *   ~100 candidates feed in and we cap to 12 final memories; scoring
  *   300 wastes ~50% of rerank CPU on candidates that will never make
- *   the top-N.
+ *   the top-N. Cut again 150 -> 50 in #3619; see the stage trace below.
+ *
+ *   (#3619 note: `recallBudget` is ALREADY `"low"` — set in the plugin
+ *   settings cascade, `vendor/hindsight-memory/settings.json:9`, not via
+ *   `HINDSIGHT_RECALL_BUDGET`, so an env-only audit misses it. The vendor
+ *   README's "High latency on recall" remedy is therefore already applied
+ *   and is NOT the lever here. Measured on overlord, n=5 per budget:
+ *   low 2.68s / mid 1.83s / high 3.34s median wall — `low` is not even the
+ *   fastest — with `visited=150` and reranking ~1.5-1.9s in all three.
+ *   Budget selects retrieval strategies; the reranker is capped
+ *   independently and dominates regardless of it.)
  *
  * - LOCAL_MAX_CONCURRENT: vendor default 4. With 9 always-on agents
  *   that's up to 36 simultaneous CPU-bound rerank tasks on a shared
@@ -329,7 +339,96 @@ export function hindsightConsumerMirrorDir(config: {
  * NEED tuning for a single-host fleet install.
  */
 export const HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING = "true";
-export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 150;
+
+/**
+ * Cross-encoder rerank candidate cap. Vendor default 300; switchroom ran 150
+ * from v0.13.22 until #3619 measured where recall latency actually goes.
+ *
+ * ## The measurement (2026-07-26, live fleet, `trace: true` stage metrics)
+ *
+ * Per-recall breakdown on an OTHERWISE IDLE server — i.e. this is the fast
+ * path, not a contended one:
+ *
+ * | stage                    | kdogg  | ken-profile | klanker | overlord |
+ * |--------------------------|--------|-------------|---------|----------|
+ * | generate_query_embedding |   12ms |      13ms   |   15ms  |   230ms  |
+ * | parallel_retrieval       |  123ms |     128ms   |  219ms  |   778ms  |
+ * | **reranking**            |**506ms**| **840ms**  |**2402ms**|**2648ms**|
+ * | everything else          |    5ms |      11ms   |   13ms  |    16ms  |
+ * | **total**                | 0.65s  |    1.00s    |  2.65s  |   3.67s  |
+ *
+ * Reranking is **72-91% of every recall**. It is a torch cross-encoder running
+ * a forward pass per query/candidate pair on CPU (no GPU on this host —
+ * `engine/cross_encoder.py` falls back to `device="cpu"`), so its cost is
+ * roughly linear in total candidate TEXT, not in bank size. Same bank, same
+ * 150-candidate cap, varying only the memory types included:
+ *
+ *     types=[world]        rerank 1373ms   total 1.55s
+ *     types=[experience]   rerank 1656ms   total 1.84s
+ *     types=[observation]  rerank 3892ms   total 4.52s   <- long texts
+ *
+ * That is the mechanism behind the "worse on bigger/older banks" correlation
+ * in #3619: mature banks accumulate long observation memories, so the same
+ * fixed candidate count costs several times more to rerank. Note the fleet
+ * OPTS IN to observations on the hot path — `recallTypes` in the plugin
+ * settings cascade is `["world", "experience", "observation"]`, where the
+ * vendor default is `["world", "experience"]`.
+ *
+ * ## The cost curve, measured in isolation
+ *
+ * `cross-encoder/ms-marco-MiniLM-L-6-v2` on this host's CPU, median of 3,
+ * driven directly (no API, no fusion) so the only variable is the candidate
+ * set. Cost is linear in N and ~8x higher per candidate for long
+ * observation-shaped text than for short facts:
+ *
+ *     candidates:            25       50      100      150
+ *     short facts:          60ms    121ms    229ms    332ms   (~2.3 ms/cand)
+ *     long observations:   385ms    843ms   1923ms   3048ms   (~19 ms/cand)
+ *
+ * So on a mature bank, 150 -> 50 takes the stage from ~3.0s to ~0.84s.
+ *
+ * ## And it queues
+ *
+ * `LocalSTCrossEncoder` runs on a shared `ThreadPoolExecutor` with
+ * `max_workers = HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` (4), while
+ * recall admission (`HINDSIGHT_API_RECALL_MAX_CONCURRENT`) allows 8. So
+ * concurrent recalls queue INSIDE the reranking phase, and the wait is
+ * invisible in telemetry — it is billed to `reranking`, not to the
+ * instrumented `semaphore_wait` (which stayed at 0.00s throughout):
+ *
+ *     kdogg (12-row bank)  conc=1  0.62s wall, rerank 0.53s, sem_wait 0.00s
+ *                          conc=4  2.42s wall, rerank 2.20s, sem_wait 0.00s
+ *                          conc=12 4.48s wall, rerank 4.08s, sem_wait 0.00s
+ *     overlord             conc=1  4.04s wall, rerank 3.55s
+ *                          conc=8 19.28s wall, rerank 17.88s
+ *
+ * `parallel_retrieval` and `generate_query_embedding` stay flat across all of
+ * those. Cutting the candidate cap shortens every queued job, so it reduces
+ * the queue depth as well as the per-request cost.
+ *
+ * ## Why 50
+ *
+ * The reranker only REORDERS candidates that RRF fusion already selected, and
+ * we then keep ~12-20 final memories. Scoring 150 to choose 20 spends ~87% of
+ * the stage on candidates that cannot place. At the measured ~17ms/candidate
+ * on a mature bank, 150 -> 50 removes roughly 1.7s from overlord's 3.67s
+ * recall. This is deliberately conservative — a 3x cut that still leaves 2.5x
+ * headroom over the final result count — rather than the ~20 the arithmetic
+ * alone would suggest, because the quality effect of a deeper rerank pool is
+ * not measured here and a latency fix must not silently become a recall-
+ * quality regression.
+ *
+ * ## What this does NOT fix
+ *
+ * Sub-second recall is achievable but not reached by this knob alone.
+ * `parallel_retrieval` runs four retrievers (semantic, BM25, graph traversal,
+ * temporal extraction) on the hot path and costs 123-778ms where a vector
+ * search over banks this size should be tens of milliseconds. That is an
+ * upstream-engine change, tracked separately — see the PR description for
+ * #3619. Raising this constant back up re-opens the outage; the guard in
+ * `hindsight-reranker-budget.test.ts` is what stops that happening quietly.
+ */
+export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 50;
 // Vendor default 4. v0.13.22 dropped this to 2 paired with the now-
 // reverted `--cpus=2.0` CPU cap; with CPU restored, 4-way concurrency
 // is the right knob — lets 4 fleet agents' recalls overlap without

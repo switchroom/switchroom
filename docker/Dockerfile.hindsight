@@ -496,8 +496,10 @@ PYEOF
 #     exactly as produced.
 #   * It is set-independent. A min-max rescale is computed over whichever
 #     candidates survived retrieval, so the same pair reordered when an
-#     unrelated third document joined the set — and this deployment sets
-#     HINDSIGHT_API_RERANKER_MAX_CANDIDATES=150, which makes set membership
+#     unrelated third document joined the set — and this deployment caps
+#     HINDSIGHT_API_RERANKER_MAX_CANDIDATES below the engine default (the
+#     value lives in HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES,
+#     src/setup/hindsight.ts; 50 since #3619), which makes set membership
 #     churny. Here a candidate's score is a pure function of its own fields.
 #   * It is noise-proportional. A min-max rescale is scale-invariant, so a
 #     spread of 1e-7 (pure float noise from a saturated encoder) was stretched
@@ -741,8 +743,10 @@ PYEOF
 #     seeing the intact token.
 #
 # Live impact is not merely latent: BM25 feeds candidate generation and this
-# deployment sets HINDSIGHT_API_RERANKER_MAX_CANDIDATES=150 (below the code
-# default of 300), so noise inflating RRF pushes genuine hits past the cut on
+# deployment sets HINDSIGHT_API_RERANKER_MAX_CANDIDATES below the engine
+# default of 300 (see HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES in
+# src/setup/hindsight.ts; 50 since #3619, tightening the cut further), so
+# noise inflating RRF pushes genuine hits past the cut on
 # large banks. Self-verifying; guarded by
 # tests/docker/dockerfile-hindsight-bakes.test.ts.
 RUN python3 - <<'PYEOF'
