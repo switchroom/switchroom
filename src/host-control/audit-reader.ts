@@ -13,9 +13,14 @@
  * module to share parsing + filtering semantics.
  */
 
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveRotationConfig } from "../util/log-rotation.js";
+import {
+  DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+  DEFAULT_HOSTD_AUDIT_MAX_FILES,
+} from "./audit-rotation-config.js";
 
 export interface AuditEntry {
   ts: string;
@@ -88,21 +93,60 @@ export function defaultAuditLogPath(home: string = homedir()): string {
  */
 export const AUDIT_READ_WINDOW_BYTES = 4 * 1024 * 1024;
 
-/** How many rotated generations a seam-aware read will walk back through
- *  (mirrors `DEFAULT_HOSTD_AUDIT_MAX_FILES`). The byte window above is the
- *  real bound — this just stops the `existsSync` walk. */
-export const AUDIT_READ_MAX_GENERATIONS = 3;
+/**
+ * Whole-history window for callers that must not miss an old row
+ * (`resolveRollbackTarget` — #3600 review, finding 3). 128 MiB is the
+ * writer-side ceiling at the default 32 MiB × (3+1) generations, so this
+ * is "everything that exists" without being unbounded.
+ */
+export const AUDIT_READ_FULL_WINDOW_BYTES = 128 * 1024 * 1024;
+
+/**
+ * How many rotated generations a seam-aware read walks back through.
+ * Derived from the SAME resolver the writer uses (honouring
+ * `SWITCHROOM_HOSTD_AUDIT_MAX_FILES`), so a raised retention can never
+ * write more generations than the reader reads (#3600 review, finding 6).
+ * The byte window remains the real bound.
+ */
+export function auditReadMaxGenerations(): number {
+  return resolveRotationConfig({
+    envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
+    envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
+    defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+    defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
+  }).maxFiles;
+}
+
+export interface AuditReadOptions {
+  /** Byte ceiling on the returned text. Default {@link AUDIT_READ_WINDOW_BYTES}. */
+  windowBytes?: number;
+  /** Generations to walk. Default {@link auditReadMaxGenerations}. */
+  maxFiles?: number;
+  /**
+   * Surface real I/O failures (EACCES, EIO, …) as a thrown error rather
+   * than an empty read. A MISSING file is never an error either way.
+   *
+   * Callers that report ABSENCE — `get_status` ("no update_apply row
+   * found"), `resolveRollbackTarget` (null → operator must pass an
+   * explicit `--pin`) — MUST set this: on a privileged-verb surface,
+   * silently reporting "it never happened" because the log was
+   * unreadable is the wrong default (#3600 review, finding 4).
+   */
+  strict?: boolean;
+}
 
 /** Read the last `n` bytes of `path`, dropping a leading partial line.
- *  Returns "" if the file is missing/unreadable. */
-function tailBytes(path: string, n: number): string {
+ *  A missing file yields "". Other I/O errors yield "" unless `strict`,
+ *  in which case they throw. */
+function tailBytes(path: string, n: number, strict = false): string {
   if (n <= 0) return "";
   let fd: number;
   let size: number;
   try {
     size = statSync(path).size;
     fd = openSync(path, "r");
-  } catch {
+  } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     return "";
   }
   try {
@@ -110,10 +154,18 @@ function tailBytes(path: string, n: number): string {
     const start = size - len;
     const buf = Buffer.alloc(len);
     let read = 0;
-    while (read < len) {
-      const got = readSync(fd, buf, read, len - read, start + read);
-      if (got <= 0) break;
-      read += got;
+    try {
+      while (read < len) {
+        const got = readSync(fd, buf, read, len - read, start + read);
+        if (got <= 0) break;
+        read += got;
+      }
+    } catch (err) {
+      // open(2) can succeed where read(2) fails (EISDIR, EIO, a vanished
+      // network mount). Same policy as the open failure above: loud under
+      // `strict`, best-effort otherwise.
+      if (strict) throw err;
+      return "";
     }
     let text = buf.subarray(0, read).toString("utf-8");
     // Dropped a leading partial line? Cut to the first newline. (Not
@@ -144,19 +196,28 @@ function tailBytes(path: string, n: number): string {
  */
 export function readAuditRaw(
   logPath: string,
-  windowBytes: number = AUDIT_READ_WINDOW_BYTES,
-  maxFiles: number = AUDIT_READ_MAX_GENERATIONS,
+  opts: AuditReadOptions = {},
 ): string {
-  // Newest-first: active, then `.1`, `.2`, … stopping as soon as the
-  // window is full or a generation is absent.
+  const windowBytes = opts.windowBytes ?? AUDIT_READ_WINDOW_BYTES;
+  const maxFiles = opts.maxFiles ?? auditReadMaxGenerations();
+  const strict = opts.strict ?? false;
+  // Newest-first: active, then `.1`, `.2`, … stopping once the window is
+  // full or every generation has been considered.
   const chunks: string[] = [];
   let budget = windowBytes;
-  const active = tailBytes(logPath, budget);
+  const active = tailBytes(logPath, budget, strict);
   chunks.push(active);
   budget -= Buffer.byteLength(active, "utf-8");
   for (let n = 1; n <= maxFiles && budget > 0; n++) {
-    const chunk = tailBytes(`${logPath}.${n}`, budget);
-    if (chunk.length === 0) break;
+    const gen = `${logPath}.${n}`;
+    // An EXISTING-but-empty generation must not stop the walk — a
+    // crashed/raced rotation can leave a zero-byte `.1` while `.2`/`.3`
+    // still hold real history (#3600 review, finding 5). Only a genuinely
+    // ABSENT generation ends it: rotation shifts contiguously, so there is
+    // nothing older beyond the first gap.
+    if (!existsSync(gen)) break;
+    const chunk = tailBytes(gen, budget, strict);
+    if (chunk.length === 0) continue;
     chunks.push(chunk);
     budget -= Buffer.byteLength(chunk, "utf-8");
   }

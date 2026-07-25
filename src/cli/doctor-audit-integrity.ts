@@ -30,9 +30,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { verifyAuditLog } from "../util/audit-hashchain.js";
+import { resolveRotationConfig } from "../util/log-rotation.js";
+import {
+  DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+  DEFAULT_HOSTD_AUDIT_MAX_FILES,
+} from "../host-control/audit-rotation-config.js";
 import {
   failOpenStatePath,
   readFailOpenState,
+  DEFAULT_AUDIT_MAX_BYTES,
+  DEFAULT_AUDIT_MAX_FILES,
   type FailOpenState,
 } from "../vault/broker/audit-log.js";
 
@@ -62,16 +69,72 @@ export interface AuditIntegrityDeps {
 interface LogTarget {
   label: string;
   path: string;
+  /** Rotated generations (`<path>.1` … `.N`) this log retains — resolved
+   *  from the writer's own config so a raised retention is still fully
+   *  verified (#3600). */
+  maxFiles: number;
 }
 
 function rootWrittenLogs(home: string): LogTarget[] {
   return [
-    { label: "vault-broker", path: join(home, ".switchroom", "vault-audit.log") },
+    {
+      label: "vault-broker",
+      path: join(home, ".switchroom", "vault-audit.log"),
+      maxFiles: resolveRotationConfig({
+        envBytesVar: "SWITCHROOM_VAULT_AUDIT_MAX_BYTES",
+        envFilesVar: "SWITCHROOM_VAULT_AUDIT_MAX_FILES",
+        defaultBytes: DEFAULT_AUDIT_MAX_BYTES,
+        defaultFiles: DEFAULT_AUDIT_MAX_FILES,
+      }).maxFiles,
+    },
     {
       label: "hostd",
       path: join(home, ".switchroom", "host-control-audit.log"),
+      maxFiles: resolveRotationConfig({
+        envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
+        envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
+        defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+        defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
+      }).maxFiles,
     },
   ];
+}
+
+/**
+ * Concatenate the log's retained history OLDEST-first: `<path>.N` … `.1`
+ * then the active file. An absent generation is skipped rather than
+ * ending the walk, so a gap (a crashed rotation, an operator deleting one
+ * file) still gets the surviving generations verified.
+ *
+ * Returns the combined text plus the paths that actually contributed —
+ * an empty `sources` means "nothing on disk at all", which is the
+ * genuinely missing case.
+ */
+function readRetainedHistory(
+  read: (p: string) => string,
+  path: string,
+  maxFiles: number,
+): { text: string; sources: string[] } {
+  const parts: { path: string; text: string }[] = [];
+  for (let n = maxFiles; n >= 1; n--) {
+    const gen = `${path}.${n}`;
+    let t: string;
+    try {
+      t = read(gen);
+    } catch {
+      continue; // absent generation — older ones may still exist
+    }
+    parts.push({ path: gen, text: t });
+  }
+  try {
+    parts.push({ path, text: read(path) });
+  } catch {
+    /* active file absent — rotated generations (if any) still count */
+  }
+  const text = parts
+    .map((p) => (p.text.endsWith("\n") || p.text.length === 0 ? p.text : p.text + "\n"))
+    .join("");
+  return { text, sources: parts.map((p) => p.path) };
 }
 
 export function runAuditIntegrityChecks(
@@ -108,25 +171,34 @@ export function runAuditIntegrityChecks(
     });
   }
 
-  for (const { label, path } of rootWrittenLogs(home)) {
-    let text: string;
-    try {
-      text = read(path);
-    } catch {
+  for (const { label, path, maxFiles } of rootWrittenLogs(home)) {
+    // #3600 review, finding 2 — BOTH root-written logs are size-rotated
+    // now, so verifying only the active file would silently shrink this
+    // tamper check to the current generation: after the first rotation
+    // doctor would report "ok" while attesting nothing about the ~96 MiB
+    // sitting in `.1`-`.3`. Verify the whole RETAINED history,
+    // oldest-first, so the chain is checked exactly as it was written.
+    const { text, sources } = readRetainedHistory(read, path, maxFiles);
+
+    if (sources.length === 0) {
       results.push({
         name: `${label} audit log present`,
         status: "warn",
-        detail: `no audit log at ${path} — the ${label} may never have written one, or it was removed (audit-blinding is a cheap pre-attack step; WS10-F3/F4)`,
+        detail: `no audit log at ${path} (nor any rotated generation) — the ${label} may never have written one, or it was removed (audit-blinding is a cheap pre-attack step; WS10-F3/F4)`,
         fix: `Confirm the ${label} is running and its audit volume is mounted; investigate if the file vanished.`,
       });
       continue;
     }
 
     if (text.trim().length === 0) {
+      // An empty ACTIVE file is normal for a few ms after a rotation (and
+      // persists if the triggering append then fails), so this only fires
+      // when every retained generation is empty too — which really is the
+      // fail-open / audit-blinding symptom.
       results.push({
         name: `${label} audit log non-empty`,
         status: "warn",
-        detail: `${path} exists but is empty — expected at least boot/activity rows; an emptied audit trail is the WS10-F3 fail-open symptom`,
+        detail: `${sources.join(", ")} exist but are empty — expected at least boot/activity rows; an emptied audit trail is the WS10-F3 fail-open symptom`,
         fix: `Investigate whether audit writes are failing (check ${label} stderr) and whether the file was truncated.`,
       });
       continue;

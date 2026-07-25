@@ -184,3 +184,91 @@ describe("runAuditIntegrityChecks", () => {
     expect(c?.status).toBe("ok");
   });
 });
+
+// ── #3600 review, finding 2 — rotation must not shrink the tamper check ──
+//
+// Both root-written logs are size-rotated now. Verifying only the active
+// file would mean that after the first rotation `doctor` reports "ok"
+// while attesting nothing about the ~96 MiB of history in `.1`-`.3`, and
+// that the momentarily-empty active file trips the "audit-blinding" warn.
+
+describe("runAuditIntegrityChecks across a rotation seam (#3600)", () => {
+  it("VERIFIES the rotated generations, not just the active file", () => {
+    // Tamper lives ONLY in `.1`; the active file is pristine. Pre-fix this
+    // reported ok — the whole point of the finding.
+    const good = chainedLog([{ ts: "t1", op: "agent_restart" }]);
+    const tamperedGen = good.replace('"agent_restart"', '"agent_stop"');
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({
+        [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+        [`${HOSTD}.1`]: tamperedGen,
+        [HOSTD]: chainedLog([{ ts: "t2", op: "agent_restart" }]),
+      }),
+    });
+    const hostd = r.find((c) => c.name.includes("hostd audit chain"));
+    expect(hostd?.status).toBe("fail");
+  });
+
+  it("still reports ok when the whole retained history verifies", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({
+        [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+        [`${HOSTD}.2`]: chainedLog([{ ts: "a", op: "agent_restart" }]),
+        [`${HOSTD}.1`]: chainedLog([{ ts: "b", op: "agent_restart" }]),
+        [HOSTD]: chainedLog([{ ts: "c", op: "agent_restart" }]),
+      }),
+    });
+    const hostd = r.find((c) => c.name.includes("hostd audit chain"));
+    expect(hostd?.status).toBe("ok");
+  });
+
+  it("an EMPTY active file with a populated .1 is NOT the fail-open symptom", () => {
+    // Rotation produces exactly this for a few ms — and permanently if the
+    // triggering append then fails.
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({
+        [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+        [`${HOSTD}.1`]: chainedLog([{ ts: "b", op: "agent_restart" }]),
+        [HOSTD]: "",
+      }),
+    });
+    expect(
+      r.find((c) => c.name.includes("hostd audit log non-empty")),
+    ).toBeUndefined();
+    expect(
+      r.find((c) => c.name.includes("hostd audit log present")),
+    ).toBeUndefined();
+    expect(r.find((c) => c.name.includes("hostd audit chain"))?.status).toBe("ok");
+  });
+
+  it("EVERY generation empty still warns (the real audit-blinding signal)", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({
+        [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+        [`${HOSTD}.1`]: "",
+        [HOSTD]: "",
+      }),
+    });
+    expect(
+      r.find((c) => c.name.includes("hostd audit log non-empty"))?.status,
+    ).toBe("warn");
+  });
+
+  it("a log present ONLY as a rotated generation is not reported missing", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({
+        [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+        [`${HOSTD}.1`]: chainedLog([{ ts: "b", op: "agent_restart" }]),
+      }),
+    });
+    expect(
+      r.find((c) => c.name.includes("hostd audit log present")),
+    ).toBeUndefined();
+    expect(r.find((c) => c.name.includes("hostd audit chain"))?.status).toBe("ok");
+  });
+});

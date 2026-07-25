@@ -13,17 +13,34 @@
  * dance, both now call into here, and the vault broker delegates to it.
  *
  * ── Why copy-then-truncate rather than rename ────────────────────────
- * In the deployed topology these logs are bind-mounted into containers as
- * SINGLE FILES (not their parent directory) — e.g. the hostd audit log is
- * visible to admin agents at `/host-home/.switchroom/host-control-audit.log`,
- * and the vault audit log is mounted file-wise into the broker container.
- * A single-file bind mount makes the path a mount point inside that
- * container's mount namespace, and `rename(2)` cannot replace an active
- * mount point: it fails EBUSY on every attempt and the log grows forever
- * (issue #2953). Copying the bytes out to `<path>.1` and then
- * `ftruncate`-ing the original back to zero keeps the active inode (and
- * therefore the mount, mode, and any open O_APPEND fd) in place, so it
- * works whether the operator mounts the file or its parent directory.
+ * `rename` is wrong for every log this module serves — but for a
+ * DIFFERENT reason per log. State them precisely, because "rename works
+ * fine on the host" is true for the hostd log and will otherwise invite
+ * an "optimisation" back to rename (#3600 review):
+ *
+ *   - Vault broker audit log: the active file is bind-mounted into the
+ *     broker container as a SINGLE FILE, making the path a mount point in
+ *     that namespace. `rename(2)` cannot replace an active mount point —
+ *     it fails EBUSY on every attempt and the log grows forever (#2953).
+ *
+ *   - hostd audit log: hostd is the source-side writer, so EBUSY is NOT
+ *     the operative constraint (rename would succeed on the host). The
+ *     decisive reason is the READERS: every admin agent bind-mounts this
+ *     file `:ro` as a single file (`src/cli/apply.ts:1107-1116` pre-creates
+ *     it precisely so that `:ro` mount source exists), and hostd writes it
+ *     through its own `/host-home` mount. A bind mount pins an INODE, not
+ *     a path — renaming the active file would leave every one of those
+ *     mounts permanently attached to the old, rotated inode. `/audit
+ *     hostd` in each agent would silently freeze at the rotation instant,
+ *     forever, with no error surfaced anywhere.
+ *
+ *   - Sidecar supervisor logs: the supervised child holds an open
+ *     `O_APPEND` fd on the path; rename orphans that fd and the live file
+ *     stops growing (the copytruncate rationale in start.sh.hbs).
+ *
+ * Copying the bytes out to `<path>.1` and then `ftruncate`-ing the
+ * original back to zero keeps the active INODE — and therefore every
+ * mount, every open fd, and the mode — in place, satisfying all three.
  *
  * The `.1 … .maxFiles` generations are ordinary files created by this
  * module, never mount points, so shifting THOSE with `rename` is fine.
@@ -46,6 +63,92 @@ export interface RotateOptions {
   maxFiles: number;
   /** Prefix for stderr diagnostics, e.g. "vault-audit". */
   tag: string;
+  /**
+   * Serialize rotation against OTHER PROCESSES via an `O_CREAT|O_EXCL`
+   * lockfile at `<path>.rotate.lock` (#3600 review, finding 1).
+   *
+   * Required whenever two processes can append to the same log. The
+   * webhook event log is exactly that: `handleWebhookIngest` runs in the
+   * web container and `recordWebhookEvent` in the agent's gateway, both
+   * writing `<agent>/telegram/webhook-events.jsonl`. Without a lock they
+   * can both stat an over-cap file, A rotates (`.1` ← copy, active
+   * truncated), then B rotates the NOW-EMPTY active file — shifting the
+   * real `.1` to `.2` and copying zero bytes over `.1`. With maxFiles=2
+   * that discards a whole generation of events; the empty-copy is
+   * strictly worse than the ordinary copy/truncate race window.
+   *
+   * The lock closes it twice over: only one rotator runs at a time, AND
+   * the size is re-checked while holding the lock, so the loser sees the
+   * freshly-truncated file and declines.
+   *
+   * Single-writer logs (vault audit, hostd audit — both serialized
+   * in-process, see `audit-hashchain.ts` single-writer-process contract)
+   * do not need it and leave this false.
+   */
+  lock?: boolean;
+}
+
+/** Stale-lock threshold: a rotation is a copy + fsync + truncate, tens of
+ *  ms even for 32 MiB. A lock older than this is a crashed holder. */
+const ROTATE_LOCK_STALE_MS = 30_000;
+
+/**
+ * Run `fn` while holding an `O_CREAT|O_EXCL` lockfile beside the log.
+ * Returns `null` if the lock could not be taken (another process is
+ * mid-rotation) — the caller treats that as "someone else handled it".
+ *
+ * A lock left behind by a killed process is reclaimed after
+ * {@link ROTATE_LOCK_STALE_MS}; the reclaim is itself racy-safe because
+ * the reclaimer re-attempts the same `O_EXCL` create and only one can win.
+ */
+function withRotateLock<T>(
+  logPath: string,
+  tag: string,
+  fn: () => T,
+): T | null {
+  const lockPath = `${logPath}.rotate.lock`;
+  let fd: number;
+  try {
+    fd = fs.openSync(lockPath, "wx", 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+      process.stderr.write(
+        `[${tag}] ERROR: could not take rotation lock ${lockPath}: ${(err as Error).message}\n`,
+      );
+      return null;
+    }
+    // Held. Reclaim only if it is stale (holder died mid-rotation).
+    let age = 0;
+    try {
+      age = Date.now() - fs.statSync(lockPath).mtimeMs;
+    } catch {
+      return null; // vanished under us — the holder just finished
+    }
+    if (age < ROTATE_LOCK_STALE_MS) return null;
+    process.stderr.write(
+      `[${tag}] WARN: reclaiming stale rotation lock ${lockPath} (${Math.round(age / 1000)}s old)\n`,
+    );
+    try {
+      fs.unlinkSync(lockPath);
+      fd = fs.openSync(lockPath, "wx", 0o600);
+    } catch {
+      return null; // someone else won the reclaim
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* best-effort */
+    }
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 
 /**
@@ -144,14 +247,29 @@ export function maybeRotateLogFile(
   opts: RotateOptions,
 ): boolean {
   if (!(opts.maxBytes > 0)) return false;
-  let size: number;
+  if (!overCap(logPath, opts.maxBytes)) return false;
+  if (!opts.lock) {
+    return rotateLogFile(logPath, opts.maxFiles, opts.tag);
+  }
+  // Multi-writer log: take the cross-process lock and RE-CHECK the size
+  // under it. The recheck is the part that matters — a racing process may
+  // have rotated between our stat above and our acquiring the lock, and
+  // rotating the now-empty active file would copy zero bytes over a good
+  // `.1` and shift the real history off the end of the window.
+  const rotated = withRotateLock(logPath, opts.tag, () => {
+    if (!overCap(logPath, opts.maxBytes)) return false;
+    return rotateLogFile(logPath, opts.maxFiles, opts.tag);
+  });
+  return rotated === true;
+}
+
+/** True iff `logPath` exists and is at least `maxBytes` long. Never throws. */
+function overCap(logPath: string, maxBytes: number): boolean {
   try {
-    size = fs.statSync(logPath).size;
+    return fs.statSync(logPath).size >= maxBytes;
   } catch {
     return false; // not created yet (or unreadable) — nothing to rotate
   }
-  if (size < opts.maxBytes) return false;
-  return rotateLogFile(logPath, opts.maxFiles, opts.tag);
 }
 
 /**

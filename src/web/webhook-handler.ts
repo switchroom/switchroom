@@ -182,7 +182,19 @@ export function resolveWebhookLogRotation(): {
  */
 export function rotateWebhookLogIfNeeded(logPath: string): boolean {
   const { maxBytes, maxFiles } = resolveWebhookLogRotation()
-  return maybeRotateLogFile(logPath, { maxBytes, maxFiles, tag: 'webhook-log' })
+  return maybeRotateLogFile(logPath, {
+    maxBytes,
+    maxFiles,
+    tag: 'webhook-log',
+    // TWO PROCESSES write this file (#3600 review, finding 1):
+    // `handleWebhookIngest` runs in the web container and
+    // `recordWebhookEvent` in the agent's gateway. Unlike the audit logs
+    // there is no promise chain serializing them, so rotation takes a
+    // cross-process lockfile and re-checks the size while holding it —
+    // otherwise the loser of the race rotates the already-truncated file,
+    // copying 0 bytes over a `.1` that holds a full generation of events.
+    lock: true,
+  })
 }
 
 function jsonReply(

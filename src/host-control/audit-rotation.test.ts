@@ -142,7 +142,7 @@ describe("hostd audit log rotation (#3596)", () => {
     // Simulate a rotated file whose first line is torn (crash mid-append)
     // by reading with a window smaller than the file, forcing a mid-line
     // start inside `.1`.
-    const raw = readAuditRaw(logPath, 4 * 1024);
+    const raw = readAuditRaw(logPath, { windowBytes: 4 * 1024 });
     for (const line of raw.split("\n")) {
       if (line.length === 0) continue;
       // Every emitted line must be parseable — the torn one was dropped.

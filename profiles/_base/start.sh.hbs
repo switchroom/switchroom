@@ -210,6 +210,16 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     #   * compress on rotate (gzip typically takes a text log to <10%), and
     #   * an AGE bound — a `.1`/`.1.gz` older than this is deleted on the
     #     next check even if no rotation happens.
+    # Be honest about what the age bound COSTS (#3600 review): right after
+    # a rotation the `.1` holds everything and the live log is empty, so
+    # if the agent then goes quiet for 14 days that history is DELETED
+    # while the near-empty live log survives. This is deliberate for a
+    # debug trace log — bounding shared host disk beats retaining stale
+    # traces — but it is deletion of the only copy, not merely eviction of
+    # a superseded backup. Raise SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC
+    # (or set it to 0 to disable the reaper) where that matters. Agent
+    # AUDIT trails are not affected: those are the hostd/vault logs, which
+    # rotate by count, never by age.
     local _max_age_sec="${SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC:-1209600}"  # 14 days
     local _compress="${SWITCHROOM_SIDECAR_LOG_COMPRESS:-1}"
     # Validate BOTH env overrides up front; garbage falls back to the

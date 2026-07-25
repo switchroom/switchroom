@@ -59,6 +59,10 @@ import {
   maybeRotateLogFile,
   resolveRotationConfig,
 } from "../util/log-rotation.js";
+import {
+  DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+  DEFAULT_HOSTD_AUDIT_MAX_FILES,
+} from "./audit-rotation-config.js";
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
@@ -160,21 +164,13 @@ export const DEFAULT_OPERATOR_ATTEST_VERBS: readonly string[] = [
  *  mirroring the vault broker's `method: "passphrase"` attribution. */
 export const ATTEST_AUDIT_METHOD = "passphrase-attest";
 
-/**
- * Rotation cap for `~/.switchroom/host-control-audit.log`: 32 MiB, the
- * same threshold the vault broker's audit log uses
- * (`DEFAULT_AUDIT_MAX_BYTES`). Rows here are fatter than the broker's
- * (~4 KiB with redacted terminal tails vs ~300 B), so this is ~8k rows
- * per generation. The live host reached 44 MB unrotated before this
- * existed. Env override: `SWITCHROOM_HOSTD_AUDIT_MAX_BYTES`.
- */
-export const DEFAULT_HOSTD_AUDIT_MAX_BYTES = 32 * 1024 * 1024;
-/**
- * Rotated generations retained: `.1` … `.3`. Total on-disk hostd audit
- * history is bounded at ~(3 + 1) × 32 MiB = 128 MiB. Env override:
- * `SWITCHROOM_HOSTD_AUDIT_MAX_FILES`.
- */
-export const DEFAULT_HOSTD_AUDIT_MAX_FILES = 3;
+// Rotation constants live in their own module so the pure reader can share
+// them without importing the daemon — re-exported here for callers that
+// already import from `server.ts`.
+export {
+  DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+  DEFAULT_HOSTD_AUDIT_MAX_FILES,
+} from "./audit-rotation-config.js";
 
 export interface ServerOptions {
   /** Operator HOME — daemon binds sockets under `<homeDir>/.switchroom/hostd/<agent>/sock`. */
