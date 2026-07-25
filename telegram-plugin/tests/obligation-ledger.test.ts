@@ -722,8 +722,10 @@ describe("ObligationLedger — #3550: the represent grace retires once its turn 
     const P = ObligationLedger.representGraceStillProtecting;
     // in-flight re-present, inside window → still protecting
     expect(P({ lastRepresentedAt: 5_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(true);
-    // turn ended after the re-present → spent
-    expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(false);
+    // turn ended after the re-present, but still inside the floor → protecting
+    expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(true);
+    // turn ended after the re-present, past the floor → spent
+    expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 5_000 + TRAIL, REPR_GRACE, TRAIL)).toBe(false);
     // turn ended BEFORE the re-present → irrelevant, still protecting
     expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 4_000 }, 10_000, REPR_GRACE, TRAIL)).toBe(true);
     // window already elapsed → not protecting either way
@@ -733,6 +735,184 @@ describe("ObligationLedger — #3550: the represent grace retires once its turn 
     expect(P({}, 6_000, REPR_GRACE, TRAIL)).toBe(false);
     // trailing grace disabled → the early-out is withheld
     expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 10_000, REPR_GRACE, 0)).toBe(true);
+  });
+
+  // ── Review finding 3: the derived rung interval needs a FLOOR ──────────────
+  // Retiring the represent window makes the rung interval derived (trailing
+  // grace + the represent-turn's duration) where the flat 120s used to floor it
+  // regardless of tuning. `MIN_REPRESENT_INTERVAL_MS` closes that footgun as a
+  // mechanism rather than a doc warning.
+  describe("MIN_REPRESENT_INTERVAL_MS floors the derived rung interval", () => {
+    const SNAPPY = 1_000; // SWITCHROOM_OBLIGATION_ESCALATE_GRACE_MS=1000
+
+    it("a small-but-non-zero trailing grace cannot collapse the ladder to seconds", () => {
+      const FLOOR = ObligationLedger.MIN_REPRESENT_INTERVAL_MS;
+      const L = new ObligationLedger(2);
+      L.openIfAbsent(input("c:3#1", 0));
+      L.markRepresented("c:3#1", 5_000);
+      L.noteTurnEnded("c:3#1", 6_000); // represent turn ran and ended in 1s
+      // Pre-floor this was eligible at 6_000 + 1_000 = 7_000 — 2s after the
+      // re-present. The ladder would have escalated inside ~15-20s.
+      expect(
+        L.decideAtIdle({ now: 7_000, graceMs: SNAPPY, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+      // Still held right up to the floor…
+      expect(
+        L.decideAtIdle({ now: 5_000 + FLOOR - 1, graceMs: SNAPPY, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+      // …and released at it (the floor, not the full 120s window — the #3550
+      // early-out is clamped, not reverted).
+      expect(
+        L.decideAtIdle({ now: 5_000 + FLOOR, graceMs: SNAPPY, representGraceMs: REPR_GRACE }).action,
+      ).toBe("represent");
+      expect(5_000 + FLOOR).toBeLessThan(5_000 + REPR_GRACE);
+    });
+
+    it("the floor never EXTENDS a window past the represent grace the operator configured", () => {
+      // representGraceMs below the floor: the configured window still wins, so
+      // the clamp can only ever shorten-cap, never lengthen.
+      const SHORT_REPR = 10_000;
+      expect(SHORT_REPR).toBeLessThan(ObligationLedger.MIN_REPRESENT_INTERVAL_MS);
+      const L = new ObligationLedger(2);
+      L.openIfAbsent(input("c:3#1", 0));
+      L.markRepresented("c:3#1", 5_000);
+      L.noteTurnEnded("c:3#1", 6_000);
+      expect(
+        L.decideAtIdle({ now: 5_000 + SHORT_REPR, graceMs: SNAPPY, representGraceMs: SHORT_REPR }).action,
+      ).toBe("represent");
+    });
+
+    it("at the shipped defaults the floor never binds — behaviour is unchanged", () => {
+      // 45s trailing ≥ the 30s floor, and it is measured from a turn end that is
+      // strictly LATER than the re-present, so the trailing grace always expires
+      // after the floor. The clamp is inert in the shipped configuration.
+      const P = ObligationLedger.representGraceStillProtecting;
+      for (const turnDurationMs of [1, 1_000, 10_000, 60_000]) {
+        const represented = 5_000;
+        const turnEnded = represented + turnDurationMs;
+        const eligibleAt = turnEnded + TRAIL; // what the trailing grace alone allows
+        expect(P({ lastRepresentedAt: represented, lastTurnEndedAt: turnEnded }, eligibleAt, REPR_GRACE, TRAIL)).toBe(false);
+      }
+    });
+  });
+
+  // ── Review finding 5: a turn that ended WITHOUT consuming its re-present ───
+  // `representGraceStillProtecting` retires the window on a bare timestamp
+  // comparison (`lastTurnEndedAt > lastRepresentedAt`) and the doc comment
+  // justifies that as "the agent ran a whole turn on it". The code cannot in
+  // fact distinguish a consuming turn from a turn that ended without ever
+  // seeing the re-present — a bridge-down abort, an instantly-failed turn, or
+  // one torn down by #3575's silence-poke fallback. These tests pin what the
+  // ledger ACTUALLY does in that case, so the behaviour is asserted rather than
+  // assumed by the comment.
+  describe("a turn that ends WITHOUT consuming the re-present", () => {
+    it("retires the window on the bare timestamp — but never before the floor", () => {
+      const FLOOR = ObligationLedger.MIN_REPRESENT_INTERVAL_MS;
+      const L = new ObligationLedger(2);
+      L.openIfAbsent(input("c:3#1", 0));
+      L.markRepresented("c:3#1", 5_000);
+      // A turn that died 200ms after the represent fired. It cannot have carried
+      // the re-presented text to the agent, yet it stamps lastTurnEndedAt.
+      L.noteTurnEnded("c:3#1", 5_200);
+      // The ledger treats it as spent, so the next rung is NOT held for the full
+      // 120s. It is held for max(floor, trailing-from-turn-end) instead.
+      const eligibleAt = Math.max(5_000 + FLOOR, 5_200 + TRAIL);
+      expect(
+        L.decideAtIdle({ now: eligibleAt - 1, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+      expect(
+        L.decideAtIdle({ now: eligibleAt, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+      ).toBe("represent");
+      // Documented consequence: an aborted turn shortens the rung. That is
+      // SAFE-BY-DIRECTION — a turn that never consumed the re-present is a turn
+      // that never answered, so re-presenting sooner is the correct action; the
+      // cost is one rung of the (already bounded) budget spent earlier.
+      expect(eligibleAt).toBeLessThan(5_000 + REPR_GRACE);
+    });
+
+    it("burns at most maxRepresents rungs even if EVERY turn aborts instantly", () => {
+      // The worst case for the timestamp proxy: no turn ever consumes anything.
+      // Termination must still hold and the ladder must still land on escalate.
+      const FLOOR = ObligationLedger.MIN_REPRESENT_INTERVAL_MS;
+      const L = new ObligationLedger(2);
+      L.openIfAbsent(input("c:3#1", 0));
+      let now = 0;
+      const actions: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const d = L.decideAtIdle({ now, graceMs: TRAIL, representGraceMs: REPR_GRACE });
+        actions.push(d.action);
+        if (d.action === "represent") {
+          L.markRepresented("c:3#1", now);
+          L.noteTurnEnded("c:3#1", now + 200); // instant abort — nothing consumed
+          now += Math.max(FLOOR, TRAIL) + 1_000;
+        } else if (d.action === "escalate") {
+          break;
+        } else {
+          now += 5_000;
+        }
+      }
+      expect(actions.filter((a) => a === "represent")).toHaveLength(2); // maxRepresents
+      expect(actions.at(-1)).toBe("escalate");
+    });
+
+    it("a turn that ended BEFORE the re-present is still not mistaken for a consuming one", () => {
+      // The complement: only a STRICTLY later stamp retires the window, so a
+      // stale pre-represent turn end can never shorten it.
+      const L = new ObligationLedger(2);
+      L.openIfAbsent(input("c:3#1", 0));
+      L.noteTurnEnded("c:3#1", 4_999);
+      L.markRepresented("c:3#1", 5_000);
+      expect(
+        L.decideAtIdle({ now: 5_000 + REPR_GRACE - 1, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+    });
+  });
+
+  // ── Review finding 6: the hydrated post-restart shape ──────────────────────
+  // A snapshot restored with lastTurnEndedAt > lastRepresentedAt hits the
+  // early-out on the FIRST sweep after boot. Pre-#3550 the represent window was
+  // measured from lastRepresentedAt and survived the restart, so a crash 2s
+  // after a re-present still cost 118s before the next rung.
+  describe("hydrated post-restart obligation (E1 > R1)", () => {
+    it("cannot fire on the first sweep after boot — the floor survives hydration", () => {
+      const FLOOR = ObligationLedger.MIN_REPRESENT_INTERVAL_MS;
+      const L = new ObligationLedger(2);
+      L.hydrate([
+        {
+          ...input("c:3#1", 0),
+          representCount: 1,
+          lastRepresentedAt: 100_000,
+          lastTurnEndedAt: 101_000, // the turn the crash ended
+        },
+      ]);
+      // Boot sweep, ~5s after the crash. Without the floor this is eligible at
+      // 101_000+TRAIL and, with a snappier trailing tune, immediately — racing
+      // the boot-resume inbound so the user sees the resume AND a re-present.
+      expect(
+        L.decideAtIdle({ now: 105_000, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+      expect(
+        L.decideAtIdle({ now: 105_000, graceMs: 1_000, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+      // The floor is measured from the DURABLE lastRepresentedAt, so it holds
+      // across the restart rather than restarting from boot.
+      expect(
+        L.decideAtIdle({ now: 100_000 + FLOOR - 1, graceMs: 1_000, representGraceMs: REPR_GRACE }).action,
+      ).toBe("none");
+      expect(
+        L.decideAtIdle({ now: 100_000 + FLOOR, graceMs: 1_000, representGraceMs: REPR_GRACE }).action,
+      ).toBe("represent");
+    });
+
+    it("still eventually advances after a restart — the floor delays, never prevents", () => {
+      const L = new ObligationLedger(2);
+      L.hydrate([
+        { ...input("c:3#1", 0), representCount: 1, lastRepresentedAt: 100_000, lastTurnEndedAt: 101_000 },
+      ]);
+      expect(
+        L.decideAtIdle({ now: 101_000 + TRAIL, graceMs: TRAIL, representGraceMs: REPR_GRACE }).action,
+      ).toBe("represent");
+    });
   });
 });
 

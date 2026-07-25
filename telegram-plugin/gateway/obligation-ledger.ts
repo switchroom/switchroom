@@ -294,6 +294,21 @@ export class ObligationLedger {
    *
    * A re-present with NO ended turn after it — the genuinely in-flight case
    * the grace was written for — is untouched and keeps the full window.
+   *
+   * FLOOR (`MIN_REPRESENT_INTERVAL_MS`). Retiring the represent window makes the
+   * rung interval DERIVED — `trailingGraceMs + the represent-turn's duration`
+   * — where it used to be floored by the flat 120s window regardless of how the
+   * trailing grace was tuned. Without a floor,
+   * `SWITCHROOM_OBLIGATION_ESCALATE_GRACE_MS=1000` (a plausible "make it
+   * snappier" tune) collapses the whole ladder to ~1s+d per rung and escalates
+   * to the operator within ~15-20s of the original message. That is a config
+   * footgun the old code could not have, so it is closed by a MECHANISM, not a
+   * doc warning: the early-out is withheld until at least
+   * `min(representGraceMs, max(trailingGraceMs, MIN_REPRESENT_INTERVAL_MS))`
+   * has elapsed since the re-present. At the defaults (45s trailing / 120s
+   * represent) the floor is 45s and never binds — the trailing grace, measured
+   * from the strictly-later turn end, always expires after it — so this changes
+   * nothing in the shipped configuration.
    */
   static representGraceStillProtecting(
     o: Pick<Obligation, 'lastRepresentedAt' | 'lastTurnEndedAt'>,
@@ -303,13 +318,32 @@ export class ObligationLedger {
   ): boolean {
     if (representGraceMs <= 0) return false
     if (o.lastRepresentedAt == null) return false
-    if (now - o.lastRepresentedAt >= representGraceMs) return false
+    const sinceRepresent = now - o.lastRepresentedAt
+    if (sinceRepresent >= representGraceMs) return false
     // Inside the window. Is it still protecting anything?
     const representTurnEnded =
       o.lastTurnEndedAt != null && o.lastTurnEndedAt > o.lastRepresentedAt
-    if (representTurnEnded && trailingGraceMs > 0) return false // spent — trailing grace takes over
+    if (representTurnEnded && trailingGraceMs > 0) {
+      // Spent — the trailing grace takes over, but never sooner than the floor
+      // (and never longer than the represent window the operator configured).
+      const floorMs = Math.min(
+        representGraceMs,
+        Math.max(trailingGraceMs, ObligationLedger.MIN_REPRESENT_INTERVAL_MS),
+      )
+      return sinceRepresent < floorMs
+    }
     return true
   }
+
+  /**
+   * The hard floor on the interval between two rungs of the represent ladder,
+   * used by `representGraceStillProtecting`. Independent of how the trailing
+   * grace is tuned, an obligation is never acted on again within this long of
+   * its own re-present. 30s comfortably exceeds the 5s sweep tick and the
+   * round-trip for a re-presented turn to reach the agent and answer, which is
+   * the only thing the represent window was ever debouncing.
+   */
+  static readonly MIN_REPRESENT_INTERVAL_MS = 30_000
 
   /** The oldest open obligation that is currently ELIGIBLE to act on — i.e. NOT
    *  within any grace window:
