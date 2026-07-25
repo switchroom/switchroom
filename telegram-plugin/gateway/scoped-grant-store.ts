@@ -10,7 +10,9 @@
  * Fix: mirror the store to a tiny JSON file in STATE_DIR (same shape as
  * permission-card-store.ts — synchronous ATOMIC writes (tmp + fsync + rename),
  * mode 0o600, one small file; a corrupt file is quarantined and logged loudly
- * rather than silently read as "no grants" — see store-file.ts).
+ * rather than silently read as "no grants" — see store-file.ts). NOTE: atomic
+ * REPLACEMENT only — whole-old-or-whole-new, not power-loss durability; the
+ * missing parent-directory fsync is tracked in #3603.
  * Write-through on every grant and on sweep-expiry removal; reload at boot,
  * dropping entries already past their ABSOLUTE expiry.
  *

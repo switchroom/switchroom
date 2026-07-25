@@ -30,6 +30,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  utimesSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -367,10 +368,44 @@ describe('quarantine copies do not collide and do not accumulate without bound',
     const copies = quarantinedFiles('x.json')
     expect(copies).toHaveLength(MAX_QUARANTINED_COPIES)
     // The reap drops the OLDEST — exactly the newest MAX are kept, even
-    // though every one of these lands in the same millisecond (which is why
-    // the filename carries a monotonic sequence, not just a timestamp).
+    // though these all land in the same millisecond (so the ordering cannot
+    // be coming from the embedded timestamp alone).
     expect(copies.map(f => readFileSync(join(dir, f), 'utf-8')).sort()).toEqual(
       Array.from({ length: MAX_QUARANTINED_COPIES }, (_, i) => `copy-${total - MAX_QUARANTINED_COPIES + i}`),
     )
+  })
+
+  it('a RESTARTED process does not get its fresh copy reaped as "oldest"', () => {
+    // Regression: ordering used to come from the `<epoch-ms>-<seq>` embedded
+    // in the filename, but `seq` restarts at 0 on every process boot. A prior
+    // process that burned seq 000001..000005 within millisecond T, followed
+    // by a restart quarantining in that same T, produced a NEW copy named
+    // `T-000000-…` — lexicographically the OLDEST of the set, so the reaper
+    // deleted precisely the forensic bytes the operator needed. Ordering is
+    // by mtime now, which no process restart can rewind.
+    const file = join(dir, 'x.json')
+    const stamp = Date.now()
+    for (let i = 1; i <= MAX_QUARANTINED_COPIES; i++) {
+      // The prior process's sequence numbers — deliberately HIGHER than the
+      // restarted process's (whose counter is back near 0), which is the
+      // whole point: a name-ordered reaper would rank the fresh copy oldest.
+      const seeded = `${file}.corrupt-${stamp}-${String(900_000 + i).padStart(6, '0')}-aaaaaaaa`
+      writeFileSync(seeded, `old-${i}`)
+      // Genuinely older on disk (the prior process wrote them seconds ago),
+      // while still carrying the same embedded millisecond in the NAME — so
+      // a name-ordered reaper and an mtime-ordered one disagree, which is
+      // exactly the discriminating case.
+      const past = new Date(Date.now() - (MAX_QUARANTINED_COPIES + 1 - i) * 1000)
+      utimesSync(seeded, past, past)
+    }
+
+    // The restarted process quarantines fresh bytes; its seq is back at 0.
+    writeFileSync(file, 'NEWEST-FORENSIC-BYTES')
+    quarantineCorruptStoreFile(file, 'test-store', 'forced', log)
+
+    const kept = quarantinedFiles('x.json').map(f => readFileSync(join(dir, f), 'utf-8'))
+    expect(kept).toHaveLength(MAX_QUARANTINED_COPIES)
+    expect(kept).toContain('NEWEST-FORENSIC-BYTES')
+    expect(kept).not.toContain('old-1') // the genuinely oldest went instead
   })
 })

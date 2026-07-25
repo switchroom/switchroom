@@ -48,7 +48,7 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { readFileSync, readdirSync, renameSync, rmSync } from 'node:fs'
+import { readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 
 /** Default sink — matches the stores' existing `process.stderr.write` use. */
@@ -71,37 +71,57 @@ export type StoreReadResult =
   | { status: 'unreadable' }
 
 /**
- * Monotonic within this process, so two quarantines in the SAME millisecond
- * still sort in creation order. Without it the name's tail is random and the
- * reaper below — which sorts lexicographically — could drop the NEWEST
- * forensic copy instead of the oldest.
+ * Monotonic within this process. Purely a name-uniqueness aid now — the
+ * reaper orders by mtime, NOT by name (see `reapOldQuarantines`), because a
+ * name-based order is only monotonic within one process: a restart resets
+ * this counter to 0, and a fresh copy written in the same epoch-ms as a
+ * prior process's burst would sort as the OLDEST and be reaped first.
  */
 let quarantineSeq = 0
 
 /**
  * `<file>.corrupt-<epoch-ms>-<seq>-<rand>`.
  *
- * `<epoch-ms>` then zero-padded `<seq>` makes lexicographic order equal
- * chronological order. `<rand>` makes the name unique: two quarantines in
- * the same millisecond (or from two processes) would otherwise collide and
- * the second `renameSync` would silently clobber the first forensic copy —
- * same reasoning as the tempfile naming in `src/util/atomic.ts`.
+ * All three tail components exist to make the name UNIQUE: two quarantines
+ * in the same millisecond, or from two processes, would otherwise collide
+ * and the second `renameSync` would silently clobber the first forensic copy
+ * — same reasoning as the tempfile naming in `src/util/atomic.ts`. The name
+ * is deliberately NOT the ordering key; mtime is.
  */
 function quarantinePath(filePath: string): string {
   const seq = String(quarantineSeq++).padStart(6, '0')
   return `${filePath}.corrupt-${Date.now()}-${seq}-${randomBytes(4).toString('hex')}`
 }
 
-/** Reap all but the newest {@link MAX_QUARANTINED_COPIES} forensic copies. */
+/**
+ * Reap all but the newest {@link MAX_QUARANTINED_COPIES} forensic copies.
+ *
+ * Ordered by the filesystem's own mtime (nanosecond resolution via the
+ * bigint stat), which is correct by construction across process restarts —
+ * unlike the embedded `<epoch-ms>-<seq>`, whose sequence restarts at 0 on
+ * every boot and would make a fresh copy sort as the oldest whenever a
+ * restart lands in the same millisecond as the previous process's burst.
+ * The name is used only as a stable tie-break.
+ */
 function reapOldQuarantines(filePath: string, log: (line: string) => void): void {
   const dir = dirname(filePath)
   const prefix = `${basename(filePath)}.corrupt-`
   try {
     const copies = readdirSync(dir)
       .filter(f => f.startsWith(prefix))
-      .sort() // `<epoch-ms>-<seq>` prefix ⇒ lexicographic == chronological
+      .map(name => {
+        let mtimeNs = 0n
+        try {
+          mtimeNs = statSync(join(dir, name), { bigint: true }).mtimeNs
+        } catch {
+          // Vanished under us (a concurrent reap) — sorts oldest; the rmSync
+          // below is `force`, so a missing file is a no-op either way.
+        }
+        return { name, mtimeNs }
+      })
+      .sort((a, b) => (a.mtimeNs === b.mtimeNs ? a.name.localeCompare(b.name) : a.mtimeNs < b.mtimeNs ? -1 : 1))
     for (const stale of copies.slice(0, Math.max(0, copies.length - MAX_QUARANTINED_COPIES))) {
-      rmSync(join(dir, stale), { force: true })
+      rmSync(join(dir, stale.name), { force: true })
     }
   } catch (err) {
     // Reaping is opportunistic — never let it mask the corruption itself.

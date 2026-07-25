@@ -38,7 +38,8 @@
  * either the whole previous array or the whole new one. A file that IS
  * corrupt (from a pre-fix write, or anything else) is quarantined and logged
  * loudly rather than silently read as "no pending cards" — see
- * `store-file.ts`.
+ * `store-file.ts`. NOTE: atomic REPLACEMENT only — whole-old-or-whole-new, not
+ * power-loss durability; the missing parent-directory fsync is tracked in #3603.
  */
 
 import { unlinkSync } from 'node:fs'

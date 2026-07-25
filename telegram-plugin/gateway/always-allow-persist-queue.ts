@@ -34,7 +34,9 @@
  * File format mirrors `missed-approvals-store.ts`: a single bounded JSON
  * array, written synchronously and ATOMICALLY (tmp + fsync + rename),
  * mode 0o600 — a crash mid-persist leaves the previous queue intact
- * instead of a torn file.
+ * instead of a torn file. NOTE: atomic REPLACEMENT only —
+ * whole-old-or-whole-new, not power-loss durability; the missing
+ * parent-directory fsync is tracked in #3603.
  *
  * Failure semantics (hardened post-#2973 adversarial review): a failed
  * READ degrades to an empty list so the gateway still boots — but a

@@ -24,7 +24,9 @@
  * file. Mirrors the `permission-card-store.ts` pattern. Both lists are
  * hard-capped so the file stays tiny under a runaway loop. A corrupt file is
  * quarantined and logged loudly rather than silently read as "nothing was
- * missed" — see store-file.ts.
+ * missed" — see store-file.ts. NOTE: atomic REPLACEMENT only —
+ * whole-old-or-whole-new, not power-loss durability; the missing
+ * parent-directory fsync is tracked in #3603.
  */
 
 import { unlinkSync } from 'node:fs'
