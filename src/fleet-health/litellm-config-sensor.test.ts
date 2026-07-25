@@ -11,7 +11,6 @@ import {
   resolveLitellmConfigPath,
   LITELLM_PROXY_PSEUDO_AGENT,
 } from "./litellm-config-sensor.js";
-import { DEFAULT_LITELLM_CONFIG_PATH } from "../litellm/header-passthrough-guard.js";
 import { mapSignal } from "./mapping.js";
 
 const PATH = "/fake/litellm-config.yaml";
@@ -27,11 +26,14 @@ function withYaml(yaml: string, log?: (m: string) => void) {
 }
 
 describe("resolveLitellmConfigPath", () => {
-  it("falls back to the host-correct default (no /host prefix)", () => {
+  it("returns null when neither arg nor env is set (no hard-coded default)", () => {
     delete process.env.LITELLM_CONFIG_PATH;
-    expect(resolveLitellmConfigPath()).toBe(DEFAULT_LITELLM_CONFIG_PATH);
-    expect(DEFAULT_LITELLM_CONFIG_PATH.startsWith("/data/coolify/")).toBe(true);
-    expect(DEFAULT_LITELLM_CONFIG_PATH.startsWith("/host/")).toBe(false);
+    expect(resolveLitellmConfigPath()).toBeNull();
+  });
+  it("reads the LITELLM_CONFIG_PATH env when set", () => {
+    process.env.LITELLM_CONFIG_PATH = "/env/path.yaml";
+    expect(resolveLitellmConfigPath()).toBe("/env/path.yaml");
+    delete process.env.LITELLM_CONFIG_PATH;
   });
   it("honors an explicit override arg over the env", () => {
     process.env.LITELLM_CONFIG_PATH = "/env/path.yaml";
@@ -41,6 +43,20 @@ describe("resolveLitellmConfigPath", () => {
 });
 
 describe("scanLitellmConfig", () => {
+  it("no path (env unset, no override) → skipped with a VISIBLE notice", () => {
+    delete process.env.LITELLM_CONFIG_PATH;
+    const logs: string[] = [];
+    const res = scanLitellmConfig({
+      existsFn: () => {
+        throw new Error("existsFn must not be called when no path resolves");
+      },
+      log: (m) => logs.push(m),
+    });
+    expect(res.status).toBe("skipped");
+    expect(res.findings).toEqual([]);
+    expect(logs.some((l) => /SKIPPED.*LITELLM_CONFIG_PATH unset/.test(l))).toBe(true);
+  });
+
   it("absent file → skipped with a VISIBLE notice, no findings", () => {
     const logs: string[] = [];
     const res = scanLitellmConfig({

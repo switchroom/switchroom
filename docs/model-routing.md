@@ -52,7 +52,7 @@ These must always hold.
   **This scoping is enforced by convention in the operator-maintained LiteLLM
   proxy config, not by any switchroom code.** That config is a Coolify-hosted
   file at
-  `/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`;
+  `/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`;
   switchroom emits **no** `litellm_settings` or `model_list` (grep the tree —
   the only occurrences are documentation comments), so it neither writes nor
   validates this flag. The operator places
@@ -276,7 +276,7 @@ inspected to confirm the routing env. That check verified non-Claude models
 OpenRouter through LiteLLM** — `api.anthropic.com` cannot serve
 `gpt-oss-120b`, so a successful response to that model is proof the request
 did not touch the Anthropic subscription endpoint. The live LiteLLM config
-(`/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`)
+(`/host/data/coolify/services/<litellm-service-id>/litellm-config.yaml`)
 and Hindsight's live container env (`ANTHROPIC_BASE_URL=http://127.0.0.1:4010`,
 global model `openrouter/z-ai/glm-5.2`) were also read directly for the I2 and
 Hindsight-credential claims above.

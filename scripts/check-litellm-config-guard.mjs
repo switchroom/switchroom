@@ -14,8 +14,8 @@
  * Coolify), so this scoping had zero code enforcement.
  *
  * IMPORTANT — this lint step is a cheap belt, NOT the load-bearing check. The
- * config file lives on the switchroom host (default
- * `/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`) and is
+ * config file lives on the switchroom host (e.g.
+ * `/data/coolify/services/<litellm-service-id>/litellm-config.yaml`) and is
  * absent in CI/dev, where this guard SKIPS with a visible notice. The
  * load-bearing enforcement is the fleet-health sensor
  * (`src/fleet-health/litellm-config-sensor.ts`), which runs where the file
@@ -31,7 +31,8 @@
  * with no `fallbacks` chain (the broker owns failover — see model-routing.md
  * Known Gaps).
  *
- * Override the path with `LITELLM_CONFIG_PATH`.
+ * The path comes from `LITELLM_CONFIG_PATH` (no hard-coded default — the real
+ * path embeds a deployment-identifying Coolify service id); unset → SKIP.
  *
  * Run: `npm run lint:litellm-config-guard` (also part of `npm run lint`).
  */
@@ -39,11 +40,20 @@
 import { existsSync, readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
-const DEFAULT_LITELLM_CONFIG_PATH =
-  "/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml";
 const FLAG = "forward_client_headers_to_llm_api";
 
-const path = process.env.LITELLM_CONFIG_PATH ?? DEFAULT_LITELLM_CONFIG_PATH;
+const path = process.env.LITELLM_CONFIG_PATH;
+
+if (!path) {
+  console.log(
+    `check-litellm-config-guard: SKIP — LITELLM_CONFIG_PATH unset\n` +
+      `  (no hard-coded default: the real path embeds a deployment-identifying\n` +
+      `   Coolify service id. Set LITELLM_CONFIG_PATH to point at the live\n` +
+      `   config; the load-bearing check is the fleet-health litellm-config\n` +
+      `   sensor that runs on the host.)`,
+  );
+  process.exit(0);
+}
 
 function isClaudeAllowlistedGroup(name) {
   if (name.endsWith("-openrouter")) return false;

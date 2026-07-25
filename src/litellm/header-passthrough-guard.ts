@@ -27,16 +27,20 @@ import { parse as parseYaml } from "yaml";
 export const FORWARD_HEADERS_FLAG = "forward_client_headers_to_llm_api";
 
 /**
- * The host-correct default path to the operator-maintained LiteLLM config.
+ * Env var naming the operator-maintained LiteLLM config path on the host
+ * (e.g. `/data/coolify/services/<litellm-service-id>/litellm-config.yaml`).
  *
- * NOTE (red-team item 2): `docs/model-routing.md` cites `/host/data/coolify/…`
- * — but that `/host` prefix is ONLY valid inside the root-agent debugging
- * container (which bind-mounts the host root at `/host`). The real switchroom
- * host path — where the fleet-health sensor actually runs — has no `/host`
- * prefix. Override with `LITELLM_CONFIG_PATH` when it moves.
+ * There is deliberately NO hard-coded default: the path embeds a
+ * deployment-identifying Coolify service id, so it is operator-supplied via
+ * this env var (set on the switchroom host). Consumers — the fleet-health
+ * sensor and the lint guard — SKIP with a visible notice when it is unset.
+ *
+ * NOTE (red-team item 2): inside the root-agent debugging container the host
+ * root is bind-mounted at `/host`, so the same file appears with a `/host`
+ * prefix there. Set `LITELLM_CONFIG_PATH` to whichever path is real for the
+ * process reading it.
  */
-export const DEFAULT_LITELLM_CONFIG_PATH =
-  "/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml";
+export const LITELLM_CONFIG_PATH_ENV = "LITELLM_CONFIG_PATH";
 
 /**
  * A subscription-Claude group is allowed to forward the OAuth header. Mirrors

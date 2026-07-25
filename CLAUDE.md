@@ -144,8 +144,9 @@ Traps that bite repeatedly:
   ranges in the same PR. New Telegram API calls go through
   `retryApiCall`/`robustApiCall`, not raw.
 - **`check-litellm-config-guard` SKIPS off-host** — the operator-maintained
-  LiteLLM config (default `/data/coolify/services/…/litellm-config.yaml`) is
-  absent in CI/dev, so the lint step is a near-vacuous belt. The load-bearing
+  LiteLLM config path comes from `LITELLM_CONFIG_PATH` (no hard-coded
+  default — the real path embeds a deployment-identifying Coolify service
+  id), which is unset in CI/dev, so the lint step is a near-vacuous belt. The load-bearing
   I2 OAuth-leak enforcement is the fleet-health sensor
   (`src/fleet-health/litellm-config-sensor.ts`), which runs where the file
   lives and escalates a violation into the priority ledger. Point
