@@ -946,6 +946,13 @@ export class HostdServer {
       const at = journal ? Date.parse(journal.at) : Number.NaN;
       // An unreadable/malformed journal (readPinJournal returns null) or an
       // unparseable timestamp cannot be attributed either — same verdict.
+      //
+      // `<` vs `<=` is a genuine 1 ms tie (a journal stamped in the same
+      // millisecond the child was spawned) and is deliberately left untested:
+      // the two verdicts differ only for that single millisecond, both are
+      // defensible there, and the safe one is reachable either way. Don't read
+      // a surviving `<=` mutant here as a coverage gap — the discriminating
+      // input shape does not exist in production.
       if (!Number.isFinite(at) || at < startedAt) {
         note =
           `rollout pin journal: LEFT IN PLACE a journal this roll did not ` +

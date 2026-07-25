@@ -48,6 +48,26 @@ const TARGET = "v2.0.0";
  */
 const DEAD_PID = 0x3fffffff;
 
+/**
+ * How long before "now" this roll's child was spawned, in the fixture.
+ *
+ * Load-bearing, not decoration. The terminal attributes a journal by comparing
+ * its `at` against `entry.started_at`, and the production shape is
+ * `started_at < at < now`: no child can write a journal AFTER the terminal
+ * that reads it has run. If the fixture stamped `started_at` at `Date.now()`,
+ * {@link afterStart} would have to put `at` in the FUTURE — on the far side of
+ * BOTH candidate discriminators — and the delete-path test could no longer
+ * tell `entry.started_at` from `Date.now()` at the
+ * `clearProvenRolloutPinJournal` call site: swap the argument there and the
+ * suite would stay green with the regression fully live. Backdating the roll
+ * puts `afterStart` strictly between the two, which is the only positioning
+ * that discriminates.
+ */
+const ROLL_STARTED_AGO_MS = 60_000;
+
+/** Where {@link afterStart} sits in that window: after the start, before now. */
+const JOURNAL_WRITTEN_AGO_MS = 30_000;
+
 function config(pin: string): string {
   return `telegram:\n  bot_token: x\nrelease:\n  pin: ${pin}\nagents:\n  clerk:\n    extends: default\n`;
 }
@@ -102,7 +122,10 @@ function makeServer(child: { stdout: string; exit_code: number }): Harness {
     verb: "rollout",
     caller: { kind: "agent", name: "overlord" },
     result: "started",
-    started_at: Date.now(),
+    // Backdated on purpose — see ROLL_STARTED_AGO_MS. The terminal adjudicates
+    // within milliseconds of this call, so a `Date.now()` stamp here would
+    // collapse the `started_at` / `now` window that attribution is tested on.
+    started_at: Date.now() - ROLL_STARTED_AGO_MS,
     pin: TARGET,
     prior_pin: PRIOR_PIN,
   };
@@ -124,9 +147,12 @@ const started: Array<{ stop(): Promise<void> }> = [];
  * Plant the journal a dead child left behind: pin written, never committed.
  *
  * `at` is an EXPLICIT parameter because it is the attribution discriminator
- * the terminal uses. A journal written AFTER this roll started is this roll's
- * own child's — its `commitPin` failed to unlink it, so the terminal may clear
- * it. A journal written BEFORE is a PREDECESSOR's orphan: this roll's child
+ * the terminal uses. A journal written BETWEEN this roll's start and now is
+ * this roll's own child's — its `commitPin` failed to unlink it, so the
+ * terminal may clear it. (Both bounds matter: the child cannot have written it
+ * before the child existed, and it cannot have written it after the terminal
+ * reading it ran.) A journal written BEFORE the start is a PREDECESSOR's
+ * orphan: this roll's child
  * journalled nothing (production `persistPin` no-ops when the config already
  * names the target), and clearing it destroys the only record that
  * `release.pin` names a build this roll never proved for the agents it did not
@@ -147,9 +173,21 @@ function plantOrphanJournal(configPath: string, at: Date): void {
   );
 }
 
-/** A journal timestamp that unambiguously belongs to THIS roll's child. */
+/**
+ * A journal timestamp that unambiguously belongs to THIS roll's child: strictly
+ * after `started_at` AND strictly before now, which is the only window a real
+ * child could have written in. See {@link ROLL_STARTED_AGO_MS} for why landing
+ * inside the window (rather than past its far edge) is what makes the
+ * delete-path test discriminate.
+ */
 function afterStart(h: Harness): Date {
-  return new Date((h.entry.started_at as number) + 1_000);
+  const at = new Date(
+    (h.entry.started_at as number) + (ROLL_STARTED_AGO_MS - JOURNAL_WRITTEN_AGO_MS),
+  );
+  // Guard the fixture itself: the production shape is started_at < at < now.
+  expect(at.getTime()).toBeGreaterThan(h.entry.started_at as number);
+  expect(at.getTime()).toBeLessThan(Date.now());
+  return at;
 }
 
 /** A journal timestamp that unambiguously predates this roll. */
@@ -204,10 +242,15 @@ describe("rollout terminal — a PROVEN pin is never reverted", () => {
     // …and the debris is gone, so hostd's next BOOT recovery — which has no
     // sentinel to consult and only the stale gate — can't revert it later.
     // Deleting is correct HERE, and only here, because the journal is
-    // attributable to this roll: `afterStart` puts its `at` past the roll's
-    // `started_at`, which is the production shape (this roll's own child wrote
-    // it and then failed to unlink it). The sibling test below pins the
-    // opposite verdict for a journal that predates the roll.
+    // attributable to this roll: `afterStart` puts its `at` INSIDE the roll's
+    // own window — after `started_at`, before the terminal that is reading it
+    // — which is the production shape (this roll's own child wrote it and then
+    // failed to unlink it). That positioning is what makes this assertion
+    // discriminating rather than decorative: `at` is on the near side of both
+    // `started_at` and `now`, so passing `Date.now()` instead of
+    // `entry.started_at` at the call site flips this journal to LEFT IN PLACE
+    // and fails the expectation below. The sibling test pins the opposite
+    // verdict for a journal that predates the roll.
     expect(h.journalExists()).toBe(false);
     expect(h.entry.result).toBe("completed");
     expect(String(h.entry.stderr_tail ?? "")).toMatch(/outlived a SUCCESSFUL roll/);

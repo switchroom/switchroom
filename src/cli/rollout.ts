@@ -410,7 +410,10 @@ export interface RolloutDeps {
    * PROVISIONAL by contract: the production implementation journals the
    * prior config text first (see rollout-pin-journal.ts), so the write is
    * only durable once {@link RolloutDeps.commitPin} runs. The executor calls
-   * {@link RolloutDeps.revertPin} on every failure path after this ran.
+   * {@link RolloutDeps.revertPin} on every failure path after this returned
+   * **true** — and on none after it returned false, because a no-op persist
+   * wrote nothing and journalled nothing, so there is nothing of this roll's to
+   * revert (`fail()` gates on `pinPersisted`). See the return contract below.
    *
    * **Returns whether it actually WROTE** — true when a provisional pin write
    * was journalled, false when the call was a no-op because the config already

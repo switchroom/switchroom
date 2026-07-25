@@ -2196,7 +2196,7 @@ describe("executeRollout — a timed-out restart stops even when the probe PASSE
   });
 });
 
-describe("rollout CLI — --dry-run changes NOTHING, including the crash net", () => {
+describe("rollout CLI — the pre-roll crash net and its --dry-run gate", () => {
   afterEach(() => {
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
     process.exitCode = 0;
@@ -2258,10 +2258,86 @@ describe("rollout CLI — --dry-run changes NOTHING, including the crash net", (
       process.stdout.write = write;
     }
 
-    // It really did reach the plan print, so the gate above it ran.
-    expect(out.join("")).toMatch(/persist-pin|Plan|rollout/i);
+    // It really did reach the plan print, so the gate above it ran. Anchored on
+    // `formatRolloutPlan`'s header, which nothing else in this command emits:
+    // an alternation including /rollout/i matches almost any stdout the verb
+    // can produce (its own usage text, an error, the command name itself), so
+    // it would assert far less than this comment claims. `persist-pin` is NOT
+    // the anchor — this invocation plans no such step (the pin already matches
+    // the config), so matching on it would fail for a reason unrelated to the
+    // gate.
+    expect(out.join("")).toMatch(/Rollout plan → v0\.0\.1:/);
+    expect(out.join("")).toMatch(/apply — regenerate compose/);
     // …and NOTHING on disk moved.
     expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe("v0.19.3");
     expect(hasPinJournal(configPath)).toBe(true);
+  });
+
+  it("DOES run pin-journal recovery on a real (non-dry-run) invocation", async () => {
+    // The other half of the gate, and the one that carries the crash net. The
+    // dry-run test above pins "recovery did NOT run"; deleting the whole
+    // `if (!opts.dryRun) { recoverPinJournal(...) }` block satisfies it just as
+    // well, so on its own it cannot tell the net from its absence.
+    //
+    // Reaching the real path without spawning a roll uses the action's own
+    // ordering: recovery runs BEFORE `getConfig(program)` and before every
+    // guard, so a target that is not version-assertable (`nightly` — a
+    // floating channel) lets recovery execute and then bails at the
+    // `isVersionAssertable` refusal with exitCode 2. No child process, no
+    // compose write, no apply — but the crash net has already run for real.
+    const dir = mkdtempSync(join(tmpdir(), "rollout-realrun-"));
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(
+      join(tmpdir(), "rollout-realrun-state-"),
+    );
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `switchroom:\n  version: 1\ntelegram:\n  bot_token: x\n  forum_chat_id: "1"\n` +
+        `release:\n  pin: v0.19.3\nagents:\n  clerk:\n    topic_name: clerk\n`,
+      "utf8",
+    );
+    // Same stale journal as above: a crashed predecessor wrote v0.19.3
+    // provisionally over v0.0.9 and never committed it.
+    writeFileSync(
+      pinJournalPath(configPath),
+      JSON.stringify({
+        v: 1,
+        configPath,
+        pin: "v0.19.3",
+        priorPin: "v0.0.9",
+        pid: 0x3fffffff,
+        at: new Date(Date.now() - PIN_JOURNAL_MAX_AGE_MS * 4).toISOString(),
+      }),
+      "utf8",
+    );
+
+    const program = new Command();
+    program.exitOverride();
+    program.option("-c, --config <path>", "Path to switchroom.yaml config file");
+    registerRolloutCommand(program);
+    const err: string[] = [];
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: string) => {
+      err.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await program.parseAsync(
+        ["--config", configPath, "rollout", "--pin", "nightly"],
+        { from: "user" },
+      );
+    } finally {
+      process.stderr.write = writeErr;
+    }
+
+    // It bailed at the version-assertable guard — so nothing was rolled…
+    expect(process.exitCode).toBe(2);
+    expect(err.join("")).toMatch(/isn't version-assertable/);
+    // …and yet the crash net had ALREADY run: the unproven pin is reverted to
+    // the last PROVEN one and the journal is gone. Delete the `if
+    // (!opts.dryRun)` recovery block and both of these fail.
+    expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe("v0.0.9");
+    expect(hasPinJournal(configPath)).toBe(false);
+    expect(err.join("")).toMatch(/reverted an UNCOMMITTED release\.pin/);
   });
 });
