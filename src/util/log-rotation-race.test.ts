@@ -27,6 +27,7 @@ const hooks = vi.hoisted(() => ({
   beforeRename: undefined as ((from: string) => void) | undefined,
   beforeOpen: undefined as ((p: string, flags: string) => void) | undefined,
   beforeUnlink: undefined as ((p: string) => void) | undefined,
+  beforeStat: undefined as ((p: string) => void) | undefined,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -46,10 +47,14 @@ vi.mock("node:fs", async (importOriginal) => {
       hooks.beforeOpen?.(String(p), flags);
       return actual.openSync(p, flags, mode);
     },
+    statSync: ((p: realFs.PathLike, o?: realFs.StatSyncOptions) => {
+      hooks.beforeStat?.(String(p));
+      return actual.statSync(p, o);
+    }) as unknown as typeof realFs.statSync,
   };
 });
 
-const { maybeRotateLogFile } = await import("./log-rotation.js");
+const { maybeRotateLogFile, rotateLogFile } = await import("./log-rotation.js");
 
 let dir: string;
 let log: string;
@@ -65,14 +70,29 @@ beforeEach(() => {
   hooks.beforeRename = undefined;
   hooks.beforeOpen = undefined;
   hooks.beforeUnlink = undefined;
+  hooks.beforeStat = undefined;
 });
 
 afterEach(() => {
   hooks.beforeRename = undefined;
   hooks.beforeOpen = undefined;
   hooks.beforeUnlink = undefined;
+  hooks.beforeStat = undefined;
   realFs.rmSync(dir, { recursive: true, force: true });
 });
+
+/**
+ * Age our LIVE lock past the stale threshold (i.e. our rotation overran),
+ * then run a second process end to end: it EEXISTs, judges the lock
+ * stale, park-verify-claims it, rotates, and appends fresh rows
+ * afterwards. This is the whole of H1 — it needs no third process.
+ */
+function peerReclaimsAndRotates(maxFiles: number, appended: string): void {
+  const old = Date.now() / 1000 - 300;
+  realFs.utimesSync(lock, old, old);
+  maybeRotateLogFile(log, { maxBytes: CAP, maxFiles, tag: "peer", lock: true });
+  realFs.appendFileSync(log, appended);
+}
 
 describe("the under-lock size re-check (finding 4)", () => {
   it("declines to rotate a file a peer rotated while we waited for the lock", () => {
@@ -189,11 +209,20 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
       realFs.utimesSync(f, old, old);
     }
     // A park younger than the threshold — a peer may be mid-reclaim with
-    // it, so it must survive; and an unrelated neighbour must too.
+    // it, so it must survive.
     const fresh = `${lock}.stale.997.cccccccc`;
     realFs.writeFileSync(fresh, "");
+    // Neighbours that do NOT carry the park prefix. Both are older than
+    // the threshold, which is the whole point: the sweep's eligibility
+    // test is age, so the ONLY thing keeping them alive is the prefix
+    // guard. `<log>.1` is the previous generation and `webhook.sock` is
+    // the gateway's socket — both really do sit in this directory.
     const neighbour = `${log}.1`;
     realFs.writeFileSync(neighbour, HISTORY);
+    realFs.utimesSync(neighbour, old, old);
+    const sock = path.join(dir, "webhook.sock");
+    realFs.writeFileSync(sock, "");
+    realFs.utimesSync(sock, old, old);
 
     expect(
       maybeRotateLogFile(log, {
@@ -206,7 +235,14 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
 
     for (const f of leaked) expect(realFs.existsSync(f)).toBe(false);
     expect(realFs.existsSync(fresh)).toBe(true);
-    expect(realFs.existsSync(neighbour)).toBe(true);
+    expect(realFs.existsSync(sock)).toBe(true);
+    // `<log>.1` was SHIFTED to `.2`, not destroyed. Asserting the bytes at
+    // `.2` is what makes this bite: rotation recreates `.1` unconditionally
+    // (log-rotation.ts, `copyFileSync(logPath, snapshotPath)`), so
+    // `existsSync(<log>.1)` is true whether or not the sweep ate the
+    // original (#3600 round-4, L2).
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe(HISTORY);
+    expect(realFs.statSync(`${log}.1`).size).toBe(CAP * 4);
     // And our own park did not survive either.
     expect(
       realFs.readdirSync(dir).filter((f) => f.includes(".stale.")),
@@ -256,6 +292,9 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
       peerIno = realFs.statSync(lock).ino;
     };
 
+    // We now DECLINE as well as release safely (#3600 round-4, H1): once
+    // the lock is the peer's, finishing the rotation is the clobber. The
+    // release guard is what this test is about, and it still holds.
     expect(
       maybeRotateLogFile(log, {
         maxBytes: CAP,
@@ -263,10 +302,166 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
         tag: "t",
         lock: true,
       }),
-    ).toBe(true);
+    ).toBe(false);
 
     expect(peerIno).not.toBe(-1);
     expect(realFs.existsSync(lock)).toBe(true);
     expect(realFs.statSync(lock).ino).toBe(peerIno);
+  });
+});
+
+/**
+ * H1 (#3600 round-4). The reclaim cannot tell "stale because the holder
+ * died" from "stale because the holder is slow": the lock mtime is
+ * stamped once by `open(wx)` and never refreshed, so a LIVE holder that
+ * overruns the threshold is reclaimable by a peer, at TWO writers. The
+ * close is not to prevent that but to make the loser harmless — every
+ * destructive syscall in `rotateLogFile` re-asserts the lock inode.
+ *
+ * Each test lands the peer at a different point in the victim's rotation
+ * and asserts the OUTCOME: the reclaimer's snapshot, the shifted history,
+ * and the rows the reclaimer's writers appended all survive.
+ */
+describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
+  const BODY = "x".repeat(CAP * 4);
+  const NEW = "ROWS WRITTEN AFTER THE PEER ROTATED\n".repeat(64);
+
+  it("declines outright when the peer rotated before we touched anything", () => {
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    // Fire on the UNDER-LOCK size re-check — we hold the lock, we have
+    // destroyed nothing yet. The peer rotates and its writers append
+    // enough to put us back over cap, so the re-check passes and the
+    // inode guard is what has to stop us.
+    let stats = 0;
+    hooks.beforeStat = (p) => {
+      if (p !== log) return;
+      if (++stats !== 2) return;
+      hooks.beforeStat = undefined;
+      peerReclaimsAndRotates(2, NEW);
+    };
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(stats).toBeGreaterThanOrEqual(2); // the interleaving happened
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY); // peer's snapshot
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe(HISTORY); // shifted, not dropped
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW); // not re-truncated
+  });
+
+  it("does not shift the peer's fresh .1 off the end of the window", () => {
+    // `.1` absent, `.2` present: our first destructive syscall is the
+    // oldest-generation unlink, and the peer lands on it. By the time we
+    // reach the shift loop, `.1` is the peer's brand-new snapshot.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.2`, "OLDEST\n");
+
+    let fired = false;
+    hooks.beforeUnlink = (p) => {
+      if (p !== `${log}.2` || fired) return;
+      fired = true;
+      hooks.beforeUnlink = undefined;
+      peerReclaimsAndRotates(2, NEW);
+    };
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired).toBe(true);
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY); // still `.1`
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW);
+  });
+
+  it("does not copy over the peer's .1", () => {
+    // The peer lands inside our shift rename — i.e. in the documented
+    // check→syscall gap, so that ONE rename proceeds unserialized and
+    // moves the peer's `.1` to `.2`. The next checkpoint must catch it:
+    // no zero-byte `.1` may be created over the peer's snapshot, and the
+    // rows its writers appended must survive.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+
+    let fired = false;
+    hooks.beforeRename = (from) => {
+      if (from !== `${log}.1` || fired) return;
+      fired = true;
+      hooks.beforeRename = undefined;
+      peerReclaimsAndRotates(2, NEW);
+    };
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired).toBe(true);
+    expect(rotated).toBe(false);
+    expect(realFs.existsSync(`${log}.1`)).toBe(false); // no copy happened
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe(BODY); // peer's snapshot
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW);
+  });
+
+  it("does not truncate rows written after the peer's rotation", () => {
+    // The peer lands on the snapshot fsync — after our copy, before our
+    // truncate. Truncating now would destroy rows that belong to the
+    // peer's already-completed cycle, not ours.
+    realFs.writeFileSync(log, BODY);
+
+    let fired = false;
+    hooks.beforeOpen = (p, flags) => {
+      if (p !== `${log}.1` || flags !== "r" || fired) return;
+      fired = true;
+      hooks.beforeOpen = undefined;
+      peerReclaimsAndRotates(2, NEW);
+    };
+
+    const rotated = maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "victim",
+      lock: true,
+    });
+
+    expect(fired).toBe(true);
+    expect(rotated).toBe(false);
+    expect(realFs.readFileSync(log, "utf8")).toBe(NEW); // rows intact
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
+  });
+
+  it("a rotator that lost the lock touches nothing at all", () => {
+    // Unit-level: the predicate is false from the first call, so every
+    // generation and the active file must be byte-identical afterwards.
+    realFs.writeFileSync(log, BODY);
+    realFs.writeFileSync(`${log}.1`, HISTORY);
+    realFs.writeFileSync(`${log}.2`, "OLDEST\n");
+
+    expect(rotateLogFile(log, 2, "victim", () => false)).toBe(false);
+
+    expect(realFs.readFileSync(log, "utf8")).toBe(BODY);
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(HISTORY);
+    expect(realFs.readFileSync(`${log}.2`, "utf8")).toBe("OLDEST\n");
+  });
+
+  it("rotates normally when the lock is still ours", () => {
+    // The guard must not be a blanket refusal: the ordinary path still
+    // rotates, and an absent predicate (unlocked callers) is unaffected.
+    realFs.writeFileSync(log, BODY);
+    expect(rotateLogFile(log, 2, "t", () => true)).toBe(true);
+    expect(realFs.readFileSync(`${log}.1`, "utf8")).toBe(BODY);
+    expect(realFs.statSync(log).size).toBe(0);
   });
 });
