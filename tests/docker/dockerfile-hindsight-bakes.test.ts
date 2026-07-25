@@ -224,35 +224,69 @@ describe("Dockerfile.hindsight shape", () => {
     // apply_combined_scoring makes CE * recency * temporal * proof_count the
     // ONLY final score (RRF is explicitly zeroed). Measured live on bank
     // `overlord`: a 116-result recall had every CE score inside 0.9800-0.9999,
-    // so the ±5% proof_count boost decided the order and the single highest-CE
-    // memory ranked 7th behind older, more-proven ones. The patch extends
-    // upstream's own `is_passthrough_reranker` escape hatch with a variance
-    // gate: below a named spread threshold, min-max rescale the CE scores
-    // (monotone — no CE ordering changes, only the dynamic range is restored).
-    // Behaviour is proven in tests/docker/hindsight-search-patches.test.ts.
+    // so the boosts — undamped worst-case ratio ~1.65 — decided the order and
+    // the single highest-CE memory ranked 7th behind older, more-proven ones.
+    // The patch DAMPS the boost product so it modulates the CE decision
+    // instead of replacing it. Behaviour (including the safety properties
+    // below) is proven in tests/docker/hindsight-search-patches.test.ts.
 
     // The exact-once anchor guard (fail-loud on upstream drift).
     expect(dockerfile).toMatch(
       /switchroom hindsight CE-saturation patch: \{name\} anchor found \{n\}x/,
     );
-    // Named module constant, not a magic number.
-    expect(dockerfile).toMatch(/_CE_SATURATION_SPREAD_THRESHOLD: float = 0\.05/);
-    // Extends the existing passthrough branch rather than adding a parallel one.
-    expect(dockerfile).toMatch(/    elif len\(scored_results\) > 1:/);
+    // Named module constant tied to the MEASURED saturation spread, and a
+    // derivation from the alphas — not a hand-tuned exponent.
+    expect(dockerfile).toMatch(/_CE_DECISIVE_RELATIVE_GAP: float = 0\.02/);
+    expect(dockerfile).toMatch(/def _boost_authority\(/);
     expect(dockerfile).toMatch(
-      /if 0\.0 < _ce_spread < _CE_SATURATION_SPREAD_THRESHOLD:/,
+      /math\.log1p\(_CE_DECISIVE_RELATIVE_GAP\) \/ math\.log\(hi \/ lo\)/,
     );
-    // The goal is a saturation guard, NOT a re-weighting: no patch may rewrite
-    // a boost alpha or the combined_score formula itself.
+    // The exponent is derived ONCE PER CALL from the alphas alone. That is what
+    // makes a candidate's score a pure function of its own fields — no
+    // candidate-set-relative quantity may appear.
+    expect(dockerfile).toMatch(
+      /_boost_exponent = _boost_authority\(recency_alpha, temporal_alpha, proof_count_alpha\)/,
+    );
+    expect(dockerfile).toMatch(
+      /sr\.combined_score = sr\.cross_encoder_score_normalized \* \(_boost\*\*_boost_exponent\)/,
+    );
+
+    // ---- Negative guards: the withdrawn min-max CE rescale must not return.
+    // It rewrote cross_encoder_score_normalized, which memory_engine.py filters
+    // against with the agent-supplied min_scores.reranker floor — measured:
+    // it dropped 78 of 100 results at reranker=0.8 that upstream kept. It was
+    // also candidate-set-relative and amplified 1e-7 of float noise into a
+    // ranking decision.
+    expect(dockerfile).not.toMatch(/_CE_SATURATION_SPREAD_THRESHOLD/);
+    expect(dockerfile).not.toMatch(/_ce_spread/);
+    expect(dockerfile).not.toMatch(/_ce_lo/);
+    // No patch may assign to the caller-visible CE field outside upstream's own
+    // passthrough reseed (which the patch quotes verbatim as an anchor).
+    const ceAssignments = [
+      ...dockerfile.matchAll(/sr\.cross_encoder_score_normalized\s*=/g),
+    ];
+    expect(
+      ceAssignments.length,
+      "cross_encoder_score_normalized must only be assigned by upstream's " +
+        "passthrough reseed — it carries the absolute min_scores.reranker floor",
+    ).toBe(2);
+    expect(dockerfile).toMatch(
+      /sr\.cross_encoder_score_normalized = 1\.0 - \(0\.9 \* new_rank \/ denom\)/,
+    );
+    // No re-weighting of the alphas or the boost formulae themselves.
     expect(dockerfile).not.toMatch(/_(RECENCY|TEMPORAL|PROOF_COUNT)_ALPHA[^\n]*=\s*\d/);
-    expect(dockerfile).not.toMatch(/sr\.combined_score\s*=/);
-    expect(dockerfile).not.toMatch(/(recency|temporal|proof_count)_boost\s*=\s*1/);
-    // Post-replace re-assertions (verification-on-build).
+    expect(dockerfile).not.toMatch(/(recency|temporal|proof_count)_boost\s*=\s*1\.0 \+ \d/);
+
+    // Post-replace re-assertions (verification-on-build), including the guard
+    // that the withdrawn rescale has not crept back in at build time.
     expect(dockerfile).toMatch(
-      /assert "_CE_SATURATION_SPREAD_THRESHOLD: float = 0\.05" in t,/,
+      /assert "_CE_DECISIVE_RELATIVE_GAP: float = 0\.02" in t,/,
     );
     expect(dockerfile).toMatch(
-      /switchroom hindsight CE-saturation patch: saturated cross-encoder scores are min-max rescaled/,
+      /assert "sr\.cross_encoder_score_normalized = 0\.1 \+ 0\.9 \* \(" not in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight CE-saturation patch: boost product damped/,
     );
   });
 
@@ -260,8 +294,8 @@ describe("Dockerfile.hindsight shape", () => {
     // tokenize_query shredded `v0.19.17` into v0/19/17, but to_tsvector indexes
     // it as ONE lexeme — zero overlap on the discriminating term, and the
     // stripped `19` then matched clock timestamps like 19:33:13. The patch
-    // preserves the intact compound token and has the native-tsvector dialect
-    // emit `compound | (frag & frag & ...)`, dropping the standalone fragments.
+    // APPENDS the intact compound token, keeping the fragments, so the emitted
+    // token list is a strict superset of upstream's.
 
     // The exact-once anchor guard (fail-loud on upstream drift).
     expect(dockerfile).toMatch(
@@ -271,22 +305,28 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /_COMPOUND_TOKEN_RE = re\.compile\(r"\\\\w\+\(\?:\[\.\/-\]\\\\w\+\)\+"\)/,
     );
-    // Both halves of the fix are present.
     expect(dockerfile).toMatch(/if compound not in tokens:/);
-    expect(dockerfile).toMatch(/compound_fragments: set\[str\] = set\(\)/);
-    expect(dockerfile).toMatch(/groups\.append\(f"\(\{token\} \| \(/);
-    expect(dockerfile).toMatch(/join\(frags\)\}\)\)"\)/);
-    // `re` must be imported into the dialect module the patch adds usage to.
-    expect(dockerfile).toMatch(/"import re\\n"/);
-    // Post-replace re-assertions (verification-on-build).
+    // Append, never substitute — the upstream fragments must survive.
+    expect(dockerfile).toMatch(/tokens\.append\(compound\)/);
+
+    // ---- Negative guards: the withdrawn tsquery-narrowing half must not
+    // return. Emitting `compound | (f1 & f2 & ...)` and dropping the standalone
+    // fragments narrowed matching for EVERY ./-// token — verified on postgres
+    // 16, a doc saying `shipped in 2026 during july` stopped matching a query
+    // containing `2026-07-25`, and `a report about art` stopped matching
+    // `state-of-the-art`. Every fact in these banks carries a date stamp.
+    expect(dockerfile).not.toMatch(/compound_fragments: set\[str\] = set\(\)/);
+    expect(dockerfile).not.toMatch(/compound_fragments\.update/);
+    expect(dockerfile).not.toMatch(/groups\.append/);
+    // sql/postgresql.py must not be touched at all by this patch.
+    expect(dockerfile).not.toMatch(/apply\("sql\/postgresql\.py"/);
+
+    // Post-replace re-assertions (verification-on-build), including the
+    // build-time guard that the native tsquery is still a plain OR join.
+    expect(dockerfile).toMatch(/assert "_COMPOUND_TOKEN_RE" in t,/);
+    expect(dockerfile).toMatch(/assert "compound_fragments" not in pg,/);
     expect(dockerfile).toMatch(
-      /assert "_COMPOUND_TOKEN_RE" in retrieval_new,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "compound_fragments: set\[str\] = set\(\)" in pg_new,/,
-    );
-    expect(dockerfile).toMatch(
-      /switchroom hindsight BM25 compound-token patch: intact compound tokens preserved/,
+      /switchroom hindsight BM25 compound-token patch: intact compound tokens appended/,
     );
   });
 
