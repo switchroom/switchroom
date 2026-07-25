@@ -336,6 +336,87 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(generateHindsightComposeSnippet()).toContain(`HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${t}`);
   });
 
+  it("caps retain output tokens well below the vendor 64000 runaway default", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // 64000 tokens at the measured 80.6 tok/s is a ~13 minute call; one such
+    // request was observed running 767.6s on 2026-07-25.
+    expect(h.HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS).toBe(16384);
+    expect(h.HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS).toBeLessThan(64000);
+
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const envPairs = envPairsFromArgs(findRunArgs());
+    expect(envPairs).toContain(
+      `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=${h.HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS}`,
+    );
+    expect(h.generateHindsightComposeSnippet()).toContain(
+      `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=${h.HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS}`,
+    );
+  });
+
+  it("derives the retain server timeout from the token cap rather than hardcoding it", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // ceil(16384 / 80.6) = 204
+    expect(h.hindsightRetainLlmTimeoutSeconds()).toBe(204);
+    // Derived, not constant: double the cap and the deadline follows.
+    expect(h.hindsightRetainLlmTimeoutSeconds(32768)).toBe(407);
+    expect(h.hindsightRetainLlmTimeoutSeconds(16384, 40)).toBe(410);
+
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const envPairs = envPairsFromArgs(findRunArgs());
+    expect(envPairs).toContain(
+      `HINDSIGHT_API_RETAIN_LLM_TIMEOUT=${h.hindsightRetainLlmTimeoutSeconds()}`,
+    );
+    expect(h.generateHindsightComposeSnippet()).toContain(
+      `HINDSIGHT_API_RETAIN_LLM_TIMEOUT=${h.hindsightRetainLlmTimeoutSeconds()}`,
+    );
+  });
+
+  it("holds the shipped budget: server per-call timeout < retain client deadline", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    expect(h.hindsightRetainLlmTimeoutSeconds()).toBeLessThan(
+      h.HINDSIGHT_RETAIN_CLIENT_DEADLINE_S,
+    );
+    expect(() => h.hindsightRetainBudgetEnv()).not.toThrow();
+  });
+
+  it("refuses to emit a budget where the server outlives the client deadline", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // The 2026-07-25 shape: a ~190s job under a 90s deadline.
+    expect(() =>
+      h.assertHindsightRetainBudget({
+        maxCompletionTokens: 16384,
+        chunkSize: 3000,
+        serverTimeoutS: 190,
+        clientDeadlineS: 90,
+      }),
+    ).toThrow(/strictly less than the retain client deadline/);
+    // Equality is a violation too — it must be strictly less.
+    expect(() =>
+      h.assertHindsightRetainBudget({
+        maxCompletionTokens: 16384,
+        chunkSize: 3000,
+        serverTimeoutS: 280,
+        clientDeadlineS: 280,
+      }),
+    ).toThrow(/strictly less than the retain client deadline/);
+  });
+
+  it("refuses to emit a token cap the hindsight container would refuse to boot on", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // config.py validate_retain_*: max_completion_tokens must exceed chunk_size.
+    expect(() =>
+      h.assertHindsightRetainBudget({
+        maxCompletionTokens: 3000,
+        chunkSize: 3000,
+        serverTimeoutS: 40,
+        clientDeadlineS: 280,
+      }),
+    ).toThrow(/must exceed retain_chunk_size/);
+    expect(h.HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS).toBeGreaterThan(
+      h.HINDSIGHT_RETAIN_CHUNK_SIZE,
+    );
+  });
+
   it("sets modest consolidation throughput knobs (batch size + slots) on both emit paths", async () => {
     const h = await import("../../src/setup/hindsight.js");
     startHindsight({ apiPort: 8888, uiPort: 9999 });

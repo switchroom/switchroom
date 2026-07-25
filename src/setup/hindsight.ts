@@ -352,6 +352,149 @@ export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
 export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
 
 /**
+ * Retain LLM budget — output cap and the deadline that must bracket it.
+ *
+ * These numbers used to live in unrelated places (a vendor default inside the
+ * image, a client timeout in the plugin, a deployment timeout in the LiteLLM
+ * config) with nothing tying them together, which is exactly how the
+ * 2026-07-25 incident happened: a ~190s job under a 90s deadline, and a single
+ * request that ran 767.6s. Emitting them from one derivation, behind an
+ * assertion, makes an inconsistent budget impossible to ship.
+ *
+ * `HINDSIGHT_RETAIN_CHUNK_SIZE` mirrors the vendor default we do NOT override
+ * (`hindsight_api/config.py` `DEFAULT_RETAIN_CHUNK_SIZE = 3000`). It appears
+ * here only because the daemon refuses to boot unless
+ * `retain_max_completion_tokens > retain_chunk_size`, and that precondition
+ * must be checked before we hand the container an env it will die on.
+ */
+export const HINDSIGHT_RETAIN_CHUNK_SIZE = 3000;
+
+/**
+ * Max output tokens for a retain fact-extraction call.
+ *
+ * The vendor default is 64000 (`config.py DEFAULT_RETAIN_MAX_COMPLETION_TOKENS`),
+ * which is less a cap than permission to run away: at the measured local
+ * generation rate (87.1 and 80.6 tok/s across the two Ollama boxes,
+ * 2026-07-25) 64000 tokens is a ~12 minute call. It was observed doing exactly
+ * that — one request generated the full 64000 tokens over 767.6s, and every
+ * call exceeding 8192 completion tokens (n=17 in a 110-minute window) blew
+ * hindsight's own client timeout. Each runaway also tripped the per-deployment
+ * timeout on both local boxes, cooling them and dumping fleet traffic onto the
+ * metered OpenRouter fallback.
+ *
+ * 16384 is ~3.4 minutes at the slower measured rate: headroom for a
+ * legitimately verbose extraction, far too little for a reasoning loop.
+ */
+export const HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 16384;
+
+/**
+ * Slowest measured local generation rate, tokens/second (2026-07-25: 87.1 and
+ * 80.6 tok/s across the two Ollama boxes). Take the slower — a budget that
+ * only holds on the faster box is not a budget.
+ */
+export const HINDSIGHT_RETAIN_MIN_TOKENS_PER_SECOND = 80.6;
+
+/**
+ * The retain CLIENT deadline: how long a caller waits for one retain POST.
+ * Mirrors `DEFAULT_RETAIN_CLIENT_DEADLINE_S` in the plugin's
+ * `vendor/hindsight-memory/scripts/lib/retain_split.py`, which sizes its
+ * content bound off the same number. Explicit constant so the assertion below
+ * is a real check, not a comparison against a literal nobody maintains.
+ */
+export const HINDSIGHT_RETAIN_CLIENT_DEADLINE_S = 280;
+
+/**
+ * Server-side per-call deadline, DERIVED from the output cap:
+ *
+ *   ceil(maxCompletionTokens / minTokensPerSecond)
+ *   = ceil(16384 / 80.6) = 204s
+ *
+ * Exactly long enough for the model to emit its whole permitted output at the
+ * slowest measured rate, and not a second longer. Raising the token cap moves
+ * this automatically; the two can no longer drift apart.
+ */
+export function hindsightRetainLlmTimeoutSeconds(
+  maxCompletionTokens: number = HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS,
+  tokensPerSecond: number = HINDSIGHT_RETAIN_MIN_TOKENS_PER_SECOND,
+): number {
+  if (!(maxCompletionTokens > 0) || !(tokensPerSecond > 0)) {
+    throw new Error(
+      `hindsight retain budget: maxCompletionTokens (${maxCompletionTokens}) and ` +
+        `tokensPerSecond (${tokensPerSecond}) must both be positive`,
+    );
+  }
+  return Math.ceil(maxCompletionTokens / tokensPerSecond);
+}
+
+/**
+ * Fail loudly on an inconsistent retain budget, at config-emit time, before a
+ * container is ever handed it. Precedent: the daemon's own
+ * `retain_max_completion_tokens > retain_chunk_size` boot check.
+ *
+ * 1. **`maxCompletionTokens > chunkSize`** — the daemon refuses to boot
+ *    otherwise, and a crash-looping hindsight is no memory backend for the
+ *    entire fleet.
+ * 2. **server per-call timeout < client POST deadline** — a hung LLM call must
+ *    die server-side and surface as a real error rather than the client
+ *    abandoning first. When the client gives up first the server keeps
+ *    generating (and, on a metered fallback, keeps billing) against a request
+ *    nobody is waiting for. That is the 767.6s call.
+ *
+ * What this deliberately does NOT promise: the server deadline is per
+ * extraction call and one retain runs many calls sequentially, so satisfying
+ * it does not mean a whole POST fits inside the client deadline. Bounding
+ * total content is the plugin's job (`lib/retain_split.py`); the two are
+ * complementary halves of the same guarantee.
+ */
+export function assertHindsightRetainBudget(budget: {
+  maxCompletionTokens: number;
+  chunkSize: number;
+  serverTimeoutS: number;
+  clientDeadlineS: number;
+}): void {
+  const { maxCompletionTokens, chunkSize, serverTimeoutS, clientDeadlineS } = budget;
+  if (maxCompletionTokens <= chunkSize) {
+    throw new Error(
+      `hindsight retain budget: HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS ` +
+        `(${maxCompletionTokens}) must exceed retain_chunk_size (${chunkSize}) or the ` +
+        `hindsight container refuses to boot (config.py validate_retain_*).`,
+    );
+  }
+  if (serverTimeoutS >= clientDeadlineS) {
+    throw new Error(
+      `hindsight retain budget: server per-call timeout (${serverTimeoutS}s) must be ` +
+        `strictly less than the retain client deadline (${clientDeadlineS}s), or the ` +
+        `client abandons first and the server keeps generating against a request ` +
+        `nobody is waiting for. Lower HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS, ` +
+        `or raise HINDSIGHT_RETAIN_CLIENT_DEADLINE_S and ` +
+        `DEFAULT_RETAIN_CLIENT_DEADLINE_S in ` +
+        `vendor/hindsight-memory/scripts/lib/retain_split.py together.`,
+    );
+  }
+}
+
+/**
+ * The retain budget env vars as `[key, value]` pairs. Asserted before it
+ * returns, so both emit paths ({@link startHindsight} and
+ * {@link generateHindsightComposeSnippet}) fail loudly on a violation and can
+ * never drift from each other.
+ */
+export function hindsightRetainBudgetEnv(): Array<[string, string]> {
+  const maxCompletionTokens = HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS;
+  const serverTimeoutS = hindsightRetainLlmTimeoutSeconds(maxCompletionTokens);
+  assertHindsightRetainBudget({
+    maxCompletionTokens,
+    chunkSize: HINDSIGHT_RETAIN_CHUNK_SIZE,
+    serverTimeoutS,
+    clientDeadlineS: HINDSIGHT_RETAIN_CLIENT_DEADLINE_S,
+  });
+  return [
+    ["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS", String(maxCompletionTokens)],
+    ["HINDSIGHT_API_RETAIN_LLM_TIMEOUT", String(serverTimeoutS)],
+  ];
+}
+
+/**
  * Consolidation throughput knobs — throttled HARD for shared-quota safety.
  * Consolidation is LLM-bound via the claude-code provider (observed
  * ~510s/op), and every concurrent op is a live claude (Sonnet) subprocess
@@ -950,6 +1093,10 @@ export function startHindsight(
     // Reflect wall timeout — let large-bank mental-model refreshes finish
     // (vendor 300s times out on 12k+ obs banks → stale user-profile models).
     "-e", `HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
+    // Retain output cap + its derived per-call deadline. Asserted consistent
+    // by hindsightRetainBudgetEnv() before it returns — see the constants
+    // above for the 767.6s runaway this replaces.
+    ...hindsightRetainBudgetEnv().flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     // Consolidation concurrency: throttled by #2894 to a hard ceiling of
     // MAX_SLOTS 1 × LLM_PARALLELISM 2 = 2 concurrent model calls (was 18), so
     // consolidation can never exhaust the shared failover quota. Batch size 12
@@ -1473,6 +1620,8 @@ export function generateHindsightComposeSnippet(
     `      - HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT}`,
     `      - HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
     `      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
+    // Retain budget — same derivation + assertion as the docker-run path.
+    ...hindsightRetainBudgetEnv().map(([k, v]) => `      - ${k}=${v}`),
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
