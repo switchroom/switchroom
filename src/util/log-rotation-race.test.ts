@@ -386,8 +386,10 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
  *     prior generation is gone ("loses a generation…"); with a QUIET peer
  *     we copy its freshly-truncated zero bytes and the log loses
  *     everything it has ("loses EVERY byte…", round-6 H1).
- *   - the truncate gap — the only one that destroys LIVE rows and the
- *     only one with no next checkpoint. Caught by a data-based gate for
+ *   - the truncate gap — the only one where WE destroy rows in the ACTIVE
+ *     file (the quiet copy gap costs the same rows via the snapshot they
+ *     had moved to), and the only one with no next checkpoint behind it.
+ *     Caught by a data-based gate for
  *     every landing before its stat ("declines the truncate when the peer
  *     rotated after our lock check"); the surviving window after that
  *     stat destroys the peer's rows and returns `true` ("destroys the
@@ -620,7 +622,7 @@ describe("a reclaimed holder does not clobber the reclaimer (H1)", () => {
     // The peer lands in the check→`truncateSync` gap: AFTER `held()`'s
     // stat of the lockfile, so the lock guard cannot see it. This is the
     // one gap with no next checkpoint — the truncate is the last one — and
-    // the only gap that destroys LIVE rows rather than history depth.
+    // the only one where WE destroy rows in the active file itself.
     //
     // The data-based gate is what catches it: the active file is now
     // SHORTER than the snapshot we just wrote to `.1`, which only happens

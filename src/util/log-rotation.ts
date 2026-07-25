@@ -244,9 +244,11 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  *          held. The worst case does not shrink from "all history" to
  *          "one generation": it is still total loss. What shrinks is how
  *          much has to go wrong to reach it, not what it costs.
- *   4. check→`truncateSync` — the only gap that destroys LIVE rows
- *      rather than history depth, and the only one with no next
- *      checkpoint behind it, because the truncate IS the last one. The
+ *   4. check→`truncateSync` — the only gap where WE destroy rows in the
+ *      ACTIVE file (the quiet copy gap costs the same rows, but by
+ *      overwriting the snapshot they had been moved to), and the only
+ *      one with no next checkpoint behind it, because the truncate IS
+ *      the last one. The
  *      peer rotates and appends; we truncate its rows away and return
  *      `true`, telling the caller the rotation succeeded. This is the
  *      one gap that got a code change rather than a paragraph (#3600
@@ -627,8 +629,8 @@ export function rotateLogFile(
   //
   // Why a second one at all: the truncate gap is the only gap with no
   // NEXT checkpoint to catch what slipped through, because this is the
-  // last one, and it is the only gap that destroys LIVE rows rather than
-  // history depth. A peer that reclaims after `held()`'s stat, rotates,
+  // last one, and the only one where WE destroy rows in the active file
+  // itself. A peer that reclaims after `held()`'s stat, rotates,
   // and appends leaves us truncating rows that belong entirely to its
   // completed cycle (reproduced, #3600 round-6).
   //
