@@ -64,7 +64,7 @@ import {
   buildBatchAbortReason,
 } from "../ms365/batch-ledger.js";
 import {
-  isGatedWriteApproved,
+  evaluateGatedWrite,
   requireOperatorApprovalForWrites,
 } from "../vault/approvals/gated-write-policy.js";
 
@@ -960,21 +960,24 @@ async function main(): Promise<void> {
     const lookup = await approvalLookupByRequest(agentName, requestId, approverSet);
     if (!lookup) continue;
     const state = lookup.state;
-    const verdict = isGatedWriteApproved(
+    // Shared classifier — the same unit-tested function both Drive gate
+    // sites use, so the provenance rule cannot be present in one hook and
+    // missing in the other.
+    const action = evaluateGatedWrite(
       { state: state ?? null, origin: lookup.origin },
       REQUIRE_OPERATOR_ORIGIN,
     );
-    if (verdict.allow) {
+    if (action.kind === "allow") {
       // Record the applied write so a later op that lapses can report an
       // accurate "N of the batch already applied" count.
       recordOutcome(Date.now(), { ...ledgerEntry, outcome: "applied" });
       allow();
     }
-    if (state === "granted" && !verdict.allow) {
+    if (action.kind === "block") {
       // Granted but not operator-verified — fail closed immediately
       // rather than poll to the deadline on a decision we will never
       // accept.
-      fail(verdict.reason);
+      fail(action.reason);
     }
     if (state === "expired" || state === "drift_revoked") {
       // Grant lapsed (TTL elapsed / approver drift) — NOT an intentional deny.

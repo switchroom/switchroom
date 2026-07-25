@@ -50,7 +50,7 @@ import {
   stripPrefix,
 } from "../drive/write-preview.js";
 import {
-  isGatedWriteApproved,
+  evaluateGatedWrite,
   requireOperatorApprovalForWrites,
   type GatedWriteLookup,
 } from "../vault/approvals/gated-write-policy.js";
@@ -369,8 +369,19 @@ async function main(): Promise<void> {
     block("no operator paired — cannot post approval card");
   }
   const existing = await approvalLookup(scope, allowFrom);
-  if (isGatedWriteApproved(existing, REQUIRE_OPERATOR_ORIGIN).allow) {
+  const existingAction = evaluateGatedWrite(existing, REQUIRE_OPERATOR_ORIGIN);
+  if (existingAction.kind === "allow") {
     allow();
+  }
+  if (existingAction.kind === "block") {
+    // A live grant that is NOT operator-verified. Refuse HERE — before
+    // the auth-broker call, the documents.get, and the card post below.
+    // The verdict already exists and can never become allowable, so
+    // carrying on would spend a live Google API call and show the
+    // operator a fresh approval card that the poll site would instantly
+    // self-refuse. (review 2026-07-25 F2: "fail closed immediately" was
+    // true of ms-365 but not of this hook. Now it is true of both.)
+    block(`Drive write refused: ${existingAction.reason}`);
   }
 
   // 3. Auth-broker access token.
@@ -443,14 +454,29 @@ async function main(): Promise<void> {
     }
     const lookup = await approvalLookup(scope, allowFrom);
     const state = lookup.state;
-    const verdict = isGatedWriteApproved(lookup, REQUIRE_OPERATOR_ORIGIN);
-    if (verdict.allow) {
+    // Same shared classifier as the pre-card fast path above — the
+    // provenance rule lives in ONE unit-tested function so it cannot be
+    // present at one gate site and missing at the other.
+    const action = evaluateGatedWrite(lookup, REQUIRE_OPERATOR_ORIGIN);
+    if (action.kind === "allow") {
       allow();
     }
-    if (state === "granted") {
-      // Granted but not operator-verified — fail closed rather than
-      // spin until the deadline on a decision we will never accept.
-      block(`Drive write refused: ${verdict.reason}`);
+    if (action.kind === "block") {
+      // Granted but not operator-verified — the operator tapped and the
+      // kernel recorded an agent-origin row, which is not proof of a tap.
+      // Fail closed rather than spin to the deadline on a decision we
+      // will never accept.
+      //
+      // COVERAGE BOUNDARY (measured, review 2026-07-25 F1): this branch is
+      // defence-in-depth only, and mutation-testing confirms deleting it
+      // leaves the hook suite green — because a pre-existing bad grant is
+      // already refused by the fast path above, so an end-to-end test can
+      // never reach here. It fires only for a decision recorded AFTER the
+      // fast path ran (mid-poll). The rule it enforces is not untested:
+      // `evaluateGatedWrite` is unit-tested in gated-write-policy.test.ts
+      // (deleting its block branch fails BOTH suites), which is precisely
+      // why the logic was hoisted out of the call sites.
+      block(`Drive write refused: ${action.reason}`);
     }
     if (state === "denied" || state === "drift_revoked") {
       block(`user denied Drive write (kernel verdict: ${state})`);

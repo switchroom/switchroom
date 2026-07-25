@@ -294,9 +294,17 @@ describe("drive-write-pretool — the gate is actually wired into the hook", () 
         SWITCHROOM_AGENT_NAME: AGENT,
         SWITCHROOM_KERNEL_SOCKET: join(dir, AGENT, "sock"),
         TELEGRAM_STATE_DIR: stateDir,
-        // Point the auth-broker at a dead path so the flag-ON case can
-        // never accidentally proceed to a live Google call.
-        SWITCHROOM_VAULT_BROKER_SOCK: join(dir, "no-such-broker.sock"),
+        // HERMETICITY (review 2026-07-25, F3): the auth-broker reads
+        // SWITCHROOM_AUTH_BROKER_SOCKET (src/auth/broker/client.ts:83).
+        // An earlier revision set SWITCHROOM_VAULT_BROKER_SOCK — a
+        // DIFFERENT broker — so the hook fell through to this host's REAL
+        // auth-broker and the flag-ON assertion passed on an unrelated
+        // ACCOUNT_NOT_FOUND for the ambient agent, never exercising the
+        // provenance mechanism. Point both at dead paths inside the test
+        // tmpdir so the hook cannot reach any live service, and assert the
+        // provenance reason specifically (below).
+        SWITCHROOM_AUTH_BROKER_SOCKET: join(dir, "no-such-auth-broker.sock"),
+        SWITCHROOM_VAULT_BROKER_SOCK: join(dir, "no-such-vault-broker.sock"),
         ...env,
       },
     });
@@ -316,11 +324,167 @@ describe("drive-write-pretool — the gate is actually wired into the hook", () 
     const { stdout } = await runHook({
       SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE: "1",
     });
-    // The hook must NOT fall through to allow. It blocks — either on the
-    // provenance check itself or, having refused the fast path, on the
-    // downstream auth-broker. Either way the write is refused, which is
-    // the security outcome; asserting only "not allowed" keeps the test
-    // from pinning an unrelated downstream message.
-    expect(stdout).toContain('"block"');
+    const out = JSON.parse(stdout) as { decision: string; reason: string };
+    expect(out.decision).toBe("block");
+    // Assert it blocked for the RIGHT reason — the provenance check —
+    // not on some downstream error. This is what makes the test hermetic
+    // and meaningful: the reason string can only come from
+    // evaluateGatedWrite (review F1/F3).
+    expect(out.reason).toContain("origin='agent'");
+    expect(out.reason).toContain("not proof an operator tapped");
   }, 20_000);
+
+  it("SECURITY: flag ON refuses BEFORE the auth-broker / documents.get / card post", async () => {
+    // F2: the refusal must happen on the pre-card fast path. If it did
+    // not, the hook would reach the (dead) auth-broker and block with
+    // "auth-broker error" / "auth-broker unreachable" instead — and in
+    // production would have shown the operator a spurious approval card
+    // and spent a live Google API call first.
+    const { stdout } = await runHook({
+      SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE: "1",
+    });
+    const out = JSON.parse(stdout) as { reason: string };
+    expect(out.reason).not.toContain("auth-broker");
+    expect(out.reason).not.toContain("documents.get");
+    expect(out.reason).not.toContain("gateway");
+    expect(out.reason).not.toContain("timed out");
+  }, 20_000);
+});
+
+/**
+ * ms-365-write-pretool — the OTHER hook, and the one the re-review of
+ * #3598 found had no hook-level coverage at all. Its single gate site is
+ * the post-card poll loop (`ms-365-write-pretool.ts` while-loop), so the
+ * only way to reach it end-to-end is to stand up a fake gateway that
+ * answers `request_ms365_approval` with a request_id that already carries
+ * a self-recorded (origin='agent') decision in the kernel db. That is
+ * exactly the attack: card posted or not, the agent has pre-minted its
+ * own verdict.
+ */
+describe("ms-365-write-pretool — the poll-loop gate is wired into the hook", () => {
+  let dir: string;
+  let handle: KernelServerHandle;
+  let stateDir: string;
+  let gateway: net.Server;
+  let requestId: string;
+  const HOOK = resolve(import.meta.dir, "../../cli/ms-365-write-pretool.ts");
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "kernel-ms365gate-"));
+    handle = await bootstrap({
+      socketParent: dir,
+      agents: [AGENT],
+      dbPath: ":memory:",
+    });
+    stateDir = join(dir, "state");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, "access.json"),
+      JSON.stringify({ allowFrom: APPROVER }),
+    );
+
+    // Self-approval: request + record, origin defaults to 'agent'.
+    const r = requestApproval(handle.db, {
+      agent_unit: AGENT,
+      scope: "ms-365:write:evt-1",
+      action: "write",
+      approver_set: APPROVER,
+    });
+    requestId = r.request_id;
+    const nonce = consumeNonce(handle.db, r.request_id)!;
+    recordDecision(handle.db, {
+      nonce,
+      decision: "allow_always",
+      approver_set: APPROVER,
+      granted_by_user_id: 4242,
+    });
+
+    // Fake gateway: accepts the card request and hands back the
+    // pre-approved request_id, so the hook proceeds to its poll loop.
+    gateway = net.createServer((conn) => {
+      let buf = "";
+      conn.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        let i: number;
+        while ((i = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          const req = JSON.parse(line) as { correlationId: string };
+          conn.write(
+            JSON.stringify({
+              type: "ms365_approval_posted",
+              correlationId: req.correlationId,
+              ok: true,
+              requestId,
+              expiresAtMs: Date.now() + 30_000,
+            }) + "\n",
+          );
+        }
+      });
+    });
+    await new Promise<void>((res) =>
+      gateway.listen(join(stateDir, "gateway.sock"), res),
+    );
+  });
+
+  afterEach(() => {
+    try {
+      gateway.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      handle.stop();
+    } catch {
+      /* ignore */
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function runHook(
+    env: Record<string, string>,
+  ): Promise<{ code: number; stdout: string }> {
+    const proc = Bun.spawn(["bun", HOOK], {
+      stdin: new TextEncoder().encode(
+        JSON.stringify({
+          tool_name: "mcp__ms-365__update-calendar-event",
+          tool_input: { eventId: "evt-1", subject: "moved" },
+        }),
+      ),
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        SWITCHROOM_AGENT_NAME: AGENT,
+        SWITCHROOM_KERNEL_SOCKET: join(dir, AGENT, "sock"),
+        SWITCHROOM_GATEWAY_SOCKET: join(stateDir, "gateway.sock"),
+        TELEGRAM_STATE_DIR: stateDir,
+        // Hermetic: no live auth-broker / Graph enrichment (fail-soft).
+        SWITCHROOM_AUTH_BROKER_SOCKET: join(dir, "no-such-auth-broker.sock"),
+        SWITCHROOM_VAULT_BROKER_SOCK: join(dir, "no-such-vault-broker.sock"),
+        ...env,
+      },
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    return { code, stdout };
+  }
+
+  it("flag OFF: the self-approved decision satisfies the hook (documents the live exposure)", async () => {
+    const { code, stdout } = await runHook({});
+    expect(code).toBe(0);
+    expect(stdout).not.toContain('"block"');
+  }, 30_000);
+
+  it("SECURITY: flag ON: the poll-loop gate refuses the self-approved decision", async () => {
+    const { stdout } = await runHook({
+      SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE: "1",
+    });
+    const out = JSON.parse(stdout) as { decision: string; reason: string };
+    expect(out.decision).toBe("block");
+    // Blocked on PROVENANCE, not on a timeout or a downstream error.
+    expect(out.reason).toContain("origin='agent'");
+    expect(out.reason).toContain("not proof an operator tapped");
+    expect(out.reason).not.toContain("timeout");
+  }, 30_000);
 });

@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import {
   isGatedWriteApproved,
+  evaluateGatedWrite,
   requireOperatorApprovalForWrites,
   REQUIRE_OPERATOR_WRITE_ENV,
 } from "./gated-write-policy.js";
@@ -67,6 +68,45 @@ describe("isGatedWriteApproved — requirement ON", () => {
       const v = isGatedWriteApproved({ state: s, origin: "operator" }, true);
       expect(v.allow).toBe(false);
       if (!v.allow) expect(v.reason).toContain("not 'granted'");
+    }
+  });
+});
+
+/**
+ * `evaluateGatedWrite` is the three-way classifier EVERY gate site in
+ * both write hooks calls (drive fast path, drive poll loop, ms-365 poll
+ * loop). The review of #3598 mutation-tested the hooks and found the
+ * poll-loop site deletable with the suite green, because the rule was
+ * inlined per site. It now lives here, once, and these tests are what
+ * make the rule covered no matter which call site invokes it.
+ */
+describe("evaluateGatedWrite — the shared three-way gate", () => {
+  it("SECURITY: a live grant that is not operator-verified BLOCKS, never waits", () => {
+    // Blocking rather than waiting matters: a `wait` here would spin the
+    // hook to its deadline and (in the Drive hook) post the operator a
+    // card that would then be self-refused.
+    for (const origin of ["agent", undefined] as const) {
+      const a = evaluateGatedWrite({ state: "granted", origin }, true);
+      expect(a.kind).toBe("block");
+      if (a.kind === "block") expect(a.reason).toContain("not proof an operator tapped");
+    }
+  });
+
+  it("allows an operator-verified grant with the requirement on", () => {
+    expect(evaluateGatedWrite({ state: "granted", origin: "operator" }, true).kind).toBe("allow");
+  });
+
+  it("flag OFF is a pure no-op: any granted decision allows, origin untouched", () => {
+    for (const origin of ["agent", "operator", undefined] as const) {
+      expect(evaluateGatedWrite({ state: "granted", origin }, false).kind).toBe("allow");
+    }
+  });
+
+  it("non-terminal / terminal non-grant states WAIT so each hook keeps its own handling", () => {
+    for (const s of ["pending", "no_decision", "denied", "expired", "drift_revoked", null]) {
+      for (const req of [true, false]) {
+        expect(evaluateGatedWrite({ state: s, origin: "operator" }, req).kind).toBe("wait");
+      }
     }
   });
 });

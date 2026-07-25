@@ -143,3 +143,51 @@ export function isGatedWriteApproved(
   }
   return { allow: true };
 }
+
+/**
+ * Three-way outcome for a gated-write approval lookup, used at EVERY
+ * gate site in both write hooks.
+ *
+ * Why a shared classifier and not an inline `if` per site: the write
+ * hooks check approval in two places each (the pre-card fast path and
+ * the post-card poll loop), and a per-site inline check is one careless
+ * refactor away from being dropped at exactly one of them — the review
+ * of #3598 mutation-tested precisely that and found the poll-loop site
+ * deletable with the whole suite green. Routing every site through one
+ * exported, unit-tested function makes the enforcement logic itself
+ * covered no matter which caller invokes it, and leaves the call sites
+ * with nothing to get wrong beyond calling it.
+ *
+ *   - `allow`  — proceed with the tool call.
+ *   - `block`  — refuse NOW, with a reason. This includes the security
+ *                case (a live grant that is not operator-verified): once
+ *                seen it can never become allowable, so callers must not
+ *                keep polling on it.
+ *   - `wait`   — no verdict yet (pending / no decision / kernel
+ *                unreachable). Caller keeps polling or posts a card.
+ *
+ * Terminal non-grant states (denied / expired / drift_revoked) are
+ * returned as `wait` on purpose: each hook already has its own bespoke
+ * handling and messaging for those (ms-365 consults its batch ledger),
+ * and this function's job is the provenance decision, not to take that
+ * over. Callers check them after this returns non-`allow`.
+ */
+export type GatedWriteAction =
+  | { kind: "allow" }
+  | { kind: "block"; reason: string }
+  | { kind: "wait" };
+
+export function evaluateGatedWrite(
+  lookup: GatedWriteLookup,
+  requireOperator: boolean,
+): GatedWriteAction {
+  const verdict = isGatedWriteApproved(lookup, requireOperator);
+  if (verdict.allow) return { kind: "allow" };
+  // A live grant that failed the predicate failed it on PROVENANCE — the
+  // only other way to fail is a non-granted state. Refuse immediately:
+  // polling on it would burn the whole hook deadline (and, in the Drive
+  // hook, post an approval card the operator would see and which would
+  // then be self-refused) waiting for a verdict that already exists.
+  if (lookup.state === "granted") return { kind: "block", reason: verdict.reason };
+  return { kind: "wait" };
+}

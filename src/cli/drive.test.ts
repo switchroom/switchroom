@@ -147,6 +147,37 @@ describe("drive connect", () => {
     expect(writes.deletes).toBe(1); // cleanup
   });
 
+  it("SECURITY: not_operator_verified cleans up, exits 1, and does not blame the broker", async () => {
+    // #3598 provenance gate: waitForApproval refuses a granted-but-
+    // agent-origin decision. The CLI must say so accurately rather than
+    // reporting a generic broker fault, and must still fail closed.
+    const { deps, exit, writes, errOut } = makeDeps({
+      waitForApproval: vi.fn(
+        async () =>
+          ({ kind: "error", reason: "not_operator_verified" }) as WaitForApprovalResult,
+      ),
+    });
+    await __test.runConnect({ agentName: "klanker" }, deps);
+    expect(exit.code).toBe(4); // EXIT_ERROR — fails closed
+    expect(writes.deletes).toBe(1);
+    const msg = errOut.join("\n");
+    expect(msg).toContain("not operator-verified");
+    expect(msg).toContain("SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_WRITE=1");
+    expect(msg).not.toContain("Broker error");
+  });
+
+  it("other broker errors still report as a broker fault", async () => {
+    const { deps, exit, errOut } = makeDeps({
+      waitForApproval: vi.fn(
+        async () =>
+          ({ kind: "error", reason: "missing_decision" }) as WaitForApprovalResult,
+      ),
+    });
+    await __test.runConnect({ agentName: "klanker" }, deps);
+    expect(exit.code).toBe(4);
+    expect(errOut.join("\n")).toContain("Broker error: missing_decision");
+  });
+
   it("timeout: cleans up and exits 2", async () => {
     const { deps, exit, writes } = makeDeps({
       waitForApproval: vi.fn(
