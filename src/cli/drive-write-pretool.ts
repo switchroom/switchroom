@@ -49,6 +49,11 @@ import {
   buildWritePreview,
   stripPrefix,
 } from "../drive/write-preview.js";
+import {
+  isGatedWriteApproved,
+  requireOperatorApprovalForWrites,
+  type GatedWriteLookup,
+} from "../vault/approvals/gated-write-policy.js";
 
 // ─── Tunables ─────────────────────────────────────────────────────────────
 
@@ -171,10 +176,16 @@ async function rpcKernel(
   });
 }
 
+/**
+ * Look the scope up in the kernel. Returns BOTH the lifecycle state and
+ * the decision's server-stamped `origin` — `state` alone cannot
+ * distinguish an operator tap from a decision this agent recorded for
+ * itself on this same socket (see gated-write-policy.ts).
+ */
 async function approvalLookup(
   scope: string,
   approverSet: string[],
-): Promise<string | null> {
+): Promise<GatedWriteLookup> {
   const r = await rpcKernel({
     v: 1,
     op: "approval_lookup",
@@ -183,9 +194,20 @@ async function approvalLookup(
     action: "write",
     current_approver_set: approverSet,
   });
-  if (r === null || r.ok !== true) return null;
-  return typeof r.state === "string" ? r.state : null;
+  if (r === null || r.ok !== true) return { state: null };
+  const dec = r.decision as { origin?: unknown } | null | undefined;
+  const origin =
+    dec != null && (dec.origin === "operator" || dec.origin === "agent")
+      ? dec.origin
+      : undefined;
+  return {
+    state: typeof r.state === "string" ? r.state : null,
+    origin,
+  };
 }
+
+/** Read once at hook start — the gate must not change mid-poll. */
+const REQUIRE_OPERATOR_ORIGIN = requireOperatorApprovalForWrites();
 
 // ─── Operator allowFrom discovery ─────────────────────────────────────────
 
@@ -347,7 +369,7 @@ async function main(): Promise<void> {
     block("no operator paired — cannot post approval card");
   }
   const existing = await approvalLookup(scope, allowFrom);
-  if (existing === "granted") {
+  if (isGatedWriteApproved(existing, REQUIRE_OPERATOR_ORIGIN).allow) {
     allow();
   }
 
@@ -419,9 +441,16 @@ async function main(): Promise<void> {
     if (!first) {
       await new Promise((r) => setTimeout(r, KERNEL_POLL_INTERVAL_MS));
     }
-    const state = await approvalLookup(scope, allowFrom);
-    if (state === "granted") {
+    const lookup = await approvalLookup(scope, allowFrom);
+    const state = lookup.state;
+    const verdict = isGatedWriteApproved(lookup, REQUIRE_OPERATOR_ORIGIN);
+    if (verdict.allow) {
       allow();
+    }
+    if (state === "granted") {
+      // Granted but not operator-verified — fail closed rather than
+      // spin until the deadline on a decision we will never accept.
+      block(`Drive write refused: ${verdict.reason}`);
     }
     if (state === "denied" || state === "drift_revoked") {
       block(`user denied Drive write (kernel verdict: ${state})`);

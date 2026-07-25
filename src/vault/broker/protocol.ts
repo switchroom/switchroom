@@ -559,6 +559,19 @@ export const ApprovalDecisionMetaSchema = z.object({
   last_used_at: z.number().nullable(),
   revoked_at: z.number().nullable(),
   revoke_reason: z.string().nullable(),
+  /**
+   * Provenance of the decision (`approval_decisions.origin`). SERVER-SET
+   * from the bound kernel listener — never echoed from a wire payload.
+   * `'operator'` means the row was written on a channel the agent cannot
+   * reach; `'agent'` means it was written on a per-agent socket and is
+   * therefore FORGEABLE by anything in the agent container.
+   *
+   * Optional on the wire for mixed-version rollouts: an old kernel omits
+   * it, and consumers MUST treat `undefined` exactly like `'agent'` (fail
+   * closed) — see `isGatedWriteApproved` in
+   * `src/vault/approvals/gated-write-policy.ts`.
+   */
+  origin: z.enum(["agent", "operator"]).optional(),
 });
 export type ApprovalDecisionMeta = z.infer<typeof ApprovalDecisionMetaSchema>;
 

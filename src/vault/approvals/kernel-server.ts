@@ -323,6 +323,29 @@ export const KERNEL_OPERATOR_NAME = "operator";
  */
 const OPERATOR_ALLOWED_OPS: ReadonlySet<string> = new Set(["approval_list"]);
 
+/**
+ * Provenance stamp for a decision recorded on this connection
+ * (`approval_decisions.origin`). Derived ONLY from which listener
+ * accepted the connection — there is deliberately no wire field for it,
+ * because a wire field would be settable by the very process the column
+ * exists to distrust.
+ *
+ * Today this returns `'agent'` for every connection that can actually
+ * record a decision: `OPERATOR_ALLOWED_OPS` is read-only, so the
+ * operator listener cannot reach `approval_record` /
+ * `approval_consume_record` at all. That is the honest state of the
+ * world — the per-agent socket is shared by the gateway AND claude
+ * (same container, same UID; see `src/agents/compose.ts` — one `agent`
+ * service, one `kernel-<agent>-sock` volume), so nothing recorded on it
+ * is proof a human tapped. `'operator'` becomes producible when the
+ * host-side approval verifier lands (RFC vault-approval-hard-boundary
+ * PR ②) and is granted a write op on a claude-unreachable channel;
+ * this function is the single place that decision is made.
+ */
+export function listenerOrigin(isOperator: boolean): "agent" | "operator" {
+  return isOperator ? "operator" : "agent";
+}
+
 function handleRequest(
   socket: net.Socket,
   req: BrokerRequest,
@@ -411,6 +434,11 @@ function handleRequest(
           last_used_at: r.decision.last_used_at,
           revoked_at: r.decision.revoked_at,
           revoke_reason: r.decision.revoke_reason,
+          // Provenance MUST cross the wire: without it no consumer can
+          // tell a real operator tap from a decision the agent recorded
+          // for itself on this very socket (self-approval bypass). Read
+          // straight off the DB row — never from the request payload.
+          origin: r.decision.origin,
         }
       : null;
     socket.write(encodeResponse({ ok: true, state: r.state, decision }));
@@ -440,6 +468,8 @@ function handleRequest(
           last_used_at: r.decision.last_used_at,
           revoked_at: r.decision.revoked_at,
           revoke_reason: r.decision.revoke_reason,
+          // See approval_lookup above — provenance is part of the answer.
+          origin: r.decision.origin,
         }
       : null;
     socket.write(encodeResponse({ ok: true, state: r.state, decision }));
@@ -517,6 +547,11 @@ function handleRequest(
       approver_set: req.approver_set,
       granted_by_user_id: req.granted_by_user_id,
       ttl_ms: req.ttl_ms ?? undefined,
+      // Provenance is derived from the BOUND LISTENER, never the wire —
+      // see listenerOrigin(). On a per-agent socket this is always
+      // 'agent', which is the honest answer: anything in the agent
+      // container can reach that socket.
+      origin: listenerOrigin(isOperator),
     });
     socket.write(encodeResponse({ ok: true, decision_id }));
     return;
@@ -544,6 +579,8 @@ function handleRequest(
       approver_set: req.approver_set,
       granted_by_user_id: req.granted_by_user_id,
       ttl_ms: req.ttl_ms ?? undefined,
+      // See approval_record above — listener-derived, never wire-derived.
+      origin: listenerOrigin(isOperator),
     });
     if (!res.consumed) {
       socket.write(encodeResponse({ ok: true, consumed: false }));
