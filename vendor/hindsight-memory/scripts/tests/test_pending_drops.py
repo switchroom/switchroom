@@ -34,6 +34,7 @@ if SCRIPTS_DIR not in sys.path:
 
 import drain_pending  # noqa: E402
 import lib.pending as pending  # noqa: E402
+import lib.retain_split as retain_split  # noqa: E402
 
 CONFIG = {"debug": False}
 
@@ -87,6 +88,11 @@ class _QueueTempDirMixin:
         "HINDSIGHT_DRAIN_SLEEP_S",
         "HINDSIGHT_DRAIN_P95_CMD",
         "HINDSIGHT_DRAIN_P95_BACKOFF_MS",
+        # `_backlog_timeout` derives its default from this (#3610), so an
+        # ambient value would silently move the assertions below.
+        "HINDSIGHT_RETAIN_CLIENT_DEADLINE_S",
+        # The retain content bound, which decides whether `enqueue` splits.
+        "HINDSIGHT_RETAIN_MAX_CONTENT_CHARS",
     )
 
     def setUp(self):
@@ -565,6 +571,59 @@ class DropLedgerTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(pending.count(), 20, "every other entry survived")
         self.assertIn("larger than the whole", err.getvalue())
         self.assertEqual(pending.read_drops()["count"], 1)
+
+    def test_a_memory_with_more_parts_than_the_count_cap_is_refused(self):
+        """The count-cap sibling of the byte-cap guard (#3610).
+
+        Splitting turns one memory into N entries, so the count cap can be
+        blown the same way the byte cap can — and with a satisfiable eviction
+        loop the later parts shed the earlier ones plus everything already
+        queued, leaving a tail fragment and nothing else. Refuse instead.
+        """
+        pending.MAX_ENTRIES = 4
+        pending.MAX_BYTES = 10**9  # only the COUNT cap may fire here
+        for i in range(3):
+            pending.enqueue(_payload(content=f"turn-{i}", doc=f"d{i}"), RuntimeError("x"))
+        self.assertEqual(pending.count(), 3)
+
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        try:
+            with redirect_stderr(io.StringIO()) as err:
+                got = pending.enqueue(
+                    _payload(content="z" * 30_000, doc=_cd_doc(9)), RuntimeError("x")
+                )
+        finally:
+            os.environ.pop("HINDSIGHT_RETAIN_MAX_CONTENT_CHARS", None)
+
+        self.assertIsNone(got, "a 10-part memory under a 4-entry cap is refused")
+        self.assertEqual(pending.count(), 3, "every other entry survived")
+        self.assertIn("more than the whole", err.getvalue())
+        self.assertEqual(pending.read_drops()["count"], 1)
+
+    def test_a_split_that_fits_the_count_cap_is_still_queued_per_part(self):
+        """The other side of that boundary: refusal must not swallow a
+        memory the queue can actually hold."""
+        pending.MAX_ENTRIES = 20
+        pending.MAX_BYTES = 10**9
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        try:
+            got = pending.enqueue(
+                _payload(content="z" * 30_000, doc=_cd_doc(9)), RuntimeError("x")
+            )
+        finally:
+            os.environ.pop("HINDSIGHT_RETAIN_MAX_CONTENT_CHARS", None)
+
+        self.assertIsNotNone(got)
+        self.assertEqual(pending.count(), 10, "one entry per part")
+        self.assertEqual(pending.read_drops(), {}, "nothing was dropped")
+        docs = sorted(e["document_id"] for _p, e in pending.iter_entries())
+        self.assertEqual(docs[0], f"{_cd_doc(9)}-p10of10")
+        for _p, entry in pending.iter_entries():
+            self.assertLessEqual(len(entry["content"]), 3000)
+            self.assertTrue(
+                pending.is_content_derived_document_id(entry["document_id"]),
+                "every queued part stays inside the free presence reconcile",
+            )
 
     def test_an_entry_exactly_at_the_byte_cap_is_enqueued_not_dropped(self):
         """``blob_bytes > MAX_BYTES``, not ``>=`` (#3599 review R4-La).
@@ -1193,6 +1252,56 @@ class PresenceReconcileGateTest(_QueueTempDirMixin, unittest.TestCase):
                 pending.is_content_derived_document_id(bad), f"must not accept {bad!r}"
             )
 
+    def test_a_split_part_inherits_the_verdict_of_its_core_id(self):
+        """#3610's part ids must stay inside #3599's free reconcile.
+
+        The gate is anchored at the end of the id, so ``-p{i}of{n}`` would
+        otherwise push EVERY split part outside it — and split parts are, by
+        construction, the largest and most expensive entries in the queue.
+        Each would take a full re-POST on every drain instead of a sub-second
+        presence GET: the re-post loop #3599 fixed, aimed at the worst case.
+
+        The suffix must not rescue a pre-#3244 id, which is the whole point
+        of the gate, so both directions are asserted here.
+        """
+        core = _cd_doc(1)
+        for total in (2, 5, 12, 249):
+            for index in range(min(total, 3)):
+                part = retain_split.part_document_id(core, index, total)
+                self.assertTrue(
+                    pending.is_content_derived_document_id(part),
+                    f"a split part of a content-derived id is content-derived: {part!r}",
+                )
+        # sha256 fallback core, and the sub-agent namespace, split too
+        self.assertTrue(
+            pending.is_content_derived_document_id(f"{SESSION}-r" + "a1" * 16 + "-p1of3")
+        )
+        self.assertTrue(
+            pending.is_content_derived_document_id(
+                f"{SESSION}-sub-worker7-r{_uuid(1)}-{_uuid(2)}-p2of4"
+            )
+        )
+        # A part re-split under a lowered bound nests its suffix, and is still
+        # a pure function of content.
+        self.assertTrue(
+            pending.is_content_derived_document_id(
+                retain_split.part_document_id(
+                    retain_split.part_document_id(core, 1, 5), 0, 2
+                )
+            )
+        )
+        # A part suffix on a PRE-#3244 id still proves nothing.
+        for bad in (
+            f"{self.BARE_SESSION_ID}-p1of3",
+            "conversation-p2of2",
+            f"{SESSION}-r{_uuid(1)}-p1of2",  # only one uuid: not the slice shape
+            f"{core}-pXofY",  # not the emitted suffix shape
+            f"{core}-p1of2-trailing",  # suffix must be terminal
+        ):
+            self.assertFalse(
+                pending.is_content_derived_document_id(bad), f"must not accept {bad!r}"
+            )
+
     def _queue_bare(self, n=2):
         for i in range(n):
             pending.enqueue(
@@ -1567,12 +1676,50 @@ class ClampAndEnvKnobBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(drain_pending._backlog_concurrency(), 16)
 
     def test_env_num_falls_back_to_the_default_on_garbage(self):
+        default = int(retain_split.retain_client_deadline())
         os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "not-a-number"
-        self.assertEqual(drain_pending._backlog_timeout(), 180)
+        self.assertEqual(drain_pending._backlog_timeout(), default)
         os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = ""
         self.assertEqual(
-            drain_pending._backlog_timeout(), 180, "empty is unset, not 0"
+            drain_pending._backlog_timeout(), default, "empty is unset, not 0"
         )
+
+    def test_the_backlog_timeout_defaults_to_the_retain_client_deadline(self):
+        """The drain deadline and the content bound are ONE number (#3610).
+
+        A maximally-sized part is sized to just fit inside
+        ``retain_client_deadline()``. If the drainer's own deadline were
+        shorter — as the ``180`` literal #3599 shipped was — it would abandon a
+        correctly-sized part mid-extraction, leave the entry queued, and
+        rebuild the re-post loop #3599 fixed. Moving the deadline must move
+        both, so this asserts the derivation, not the number.
+        """
+        os.environ.pop("HINDSIGHT_DRAIN_BACKLOG_TIMEOUT", None)
+        os.environ.pop("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", None)
+        self.assertEqual(drain_pending._backlog_timeout(), 280)
+
+        os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = "600"
+        try:
+            self.assertEqual(
+                drain_pending._backlog_timeout(),
+                600,
+                "moving the client deadline must move the drain deadline",
+            )
+            self.assertEqual(
+                retain_split.retain_content_limit(),
+                3000 * int(600 // 18.4),
+                "and the content bound, from the same input",
+            )
+        finally:
+            os.environ.pop("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", None)
+
+    def test_an_explicit_backlog_timeout_still_overrides_the_derivation(self):
+        os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = "600"
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "42"
+        try:
+            self.assertEqual(drain_pending._backlog_timeout(), 42)
+        finally:
+            os.environ.pop("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", None)
 
     def test_no_clamp_is_applied_when_lo_and_hi_are_absent(self):
         """``lo``/``hi`` default to ``None``; that branch must be a no-op,

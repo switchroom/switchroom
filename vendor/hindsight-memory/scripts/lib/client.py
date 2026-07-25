@@ -5,11 +5,14 @@ Openclaw HindsightClient (client.js), adapted for Python stdlib.
 """
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
+
+from .retain_split import part_document_id, part_metadata, split_retain_content
 
 DEFAULT_TIMEOUT = 15  # seconds
 HEALTH_CHECK_RETRIES = 3
@@ -189,7 +192,85 @@ class HindsightClient:
         reconciliation) MUST use this so a bare async 200 can never falsely mark
         unpersisted work as committed. (Merge precondition: the daemon honours
         ``async=false`` as commit-before-ack — verified by the §1.1 probe.)
+
+        **Oversized content is split before it is posted** (``lib/retain_split``).
+        The daemon runs one sequential extraction LLM call per
+        ``retain_chunk_size`` (3000) chars, so server wall time is linear in
+        ``len(content)`` while the client has a single deadline for the whole
+        POST — past ~45,000 chars a retain cannot complete at ANY client
+        timeout and the memory is permanently unsaveable (measured: 154 of the
+        629 entries in the 2026-07-25 fleet backlog). This is the enforcement
+        point precisely because every retain POST in the plugin goes through
+        it, so the bound is code-enforced rather than left to each producer.
+
+        Parts are posted SEQUENTIALLY, each with the caller's ``timeout`` (the
+        timeout is a per-HTTP-request read deadline, and each part is its own
+        request) and each with the caller's ``async_processing`` — so a
+        durability caller still gets commit-before-ack per part. Any part
+        failing raises, exactly as an unsplit failure does, so the caller's
+        existing enqueue/retry handling is unchanged; already-committed parts
+        carry deterministic ids and are upserted, not duplicated, on retry.
+
+        ``timeout`` bounds the CALLER'S TOTAL WALL TIME, not just each HTTP
+        request. Splitting must never turn one bounded POST into N of them:
+        the Stop hook passes ``timeout=15`` because it has a hook budget to
+        respect, and ``15 × N`` would stall the session. Once the budget is
+        spent no further part is started and the call raises, exactly as an
+        unsplit failure does, so each caller's EXISTING failure path handles
+        the remainder: the hook paths (``retain.py``, ``subagent_retain.py``,
+        ``reconcile_tail.py``) enqueue, and ``pending.enqueue`` queues the
+        remainder as bounded per-part entries the drainer can finish; the
+        drain paths count an attempt and keep the entry;
+        ``backfill_transcripts.py`` logs and backs off. The parts already
+        committed are upserted on the next attempt, not duplicated.
         """
+        parts = split_retain_content(content)
+        total = len(parts)
+        response = None
+        deadline = time.monotonic() + timeout
+        part_timeout = timeout
+        for index, part in enumerate(parts):
+            if index > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"retain wall budget of {timeout}s exhausted after "
+                        f"{index}/{total} parts; no further part was started. "
+                        f"The caller's own failure path decides the remainder: "
+                        f"the hook paths enqueue it (as bounded per-part "
+                        f"entries), the drain paths count an attempt and keep "
+                        f"the entry queued."
+                    )
+                # Clamp the request deadline to what is left of the budget so
+                # the final part cannot overrun it either.
+                part_timeout = max(1, int(remaining))
+            response = self._retain_one(
+                bank_id=bank_id,
+                content=part,
+                document_id=part_document_id(document_id, index, total),
+                context=context,
+                metadata=part_metadata(metadata, index, total),
+                tags=tags,
+                timeout=part_timeout,
+                async_processing=async_processing,
+            )
+        if total > 1 and isinstance(response, dict):
+            response = dict(response)
+            response["split_parts"] = total
+        return response
+
+    def _retain_one(
+        self,
+        bank_id: str,
+        content: str,
+        document_id: str,
+        context: Optional[str],
+        metadata: Optional[dict],
+        tags: Optional[list],
+        timeout: int,
+        async_processing: bool,
+    ) -> dict:
+        """POST exactly one retain item. Raises on any HTTP/transport error."""
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories"
         item = {
             "content": content,
