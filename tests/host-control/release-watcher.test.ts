@@ -178,4 +178,101 @@ describe("ReleaseWatcher", () => {
     expect(checkFn).not.toHaveBeenCalled();
     w.stop();
   });
+
+  // KEN-129 — notifyFn hook (update-check drift card).
+
+  it("calls notifyFn with the release id when applyOnDetect=false", async () => {
+    const applyFn = vi.fn();
+    const restartFn = vi.fn();
+    const notifyFn = vi.fn().mockResolvedValue(undefined);
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true, version: "sha256:abc" }),
+      applyFn,
+      restartFn,
+      applyOnDetect: false,
+      notifyFn,
+    });
+    await w.tick();
+    expect(notifyFn).toHaveBeenCalledTimes(1);
+    expect(notifyFn).toHaveBeenCalledWith("sha256:abc");
+    expect(applyFn).not.toHaveBeenCalled();
+    expect(restartFn).not.toHaveBeenCalled();
+  });
+
+  it("does NOT call notifyFn when no release is available", async () => {
+    const notifyFn = vi.fn();
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: false }),
+      applyFn: vi.fn(),
+      restartFn: vi.fn(),
+      applyOnDetect: false,
+      notifyFn,
+    });
+    await w.tick();
+    expect(notifyFn).not.toHaveBeenCalled();
+  });
+
+  it("does NOT call notifyFn when applyOnDetect=true (auto-apply supersedes notify)", async () => {
+    const notifyFn = vi.fn();
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true, version: "sha256:abc" }),
+      applyFn: vi.fn().mockResolvedValue(undefined),
+      restartFn: vi.fn().mockResolvedValue(undefined),
+      applyOnDetect: true,
+      notifyFn,
+    });
+    await w.tick();
+    expect(notifyFn).not.toHaveBeenCalled();
+  });
+
+  it("a throwing notifyFn is logged and does not break the tick (next tick still runs)", async () => {
+    const notifyFn = vi.fn().mockRejectedValue(new Error("card exploded"));
+    const logs: string[] = [];
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true, version: "sha256:abc" }),
+      applyFn: vi.fn(),
+      restartFn: vi.fn(),
+      applyOnDetect: false,
+      notifyFn,
+      log: (m) => logs.push(m),
+    });
+    await w.tick();
+    await w.tick();
+    expect(notifyFn).toHaveBeenCalledTimes(2);
+    expect(
+      logs.some((m) => m.includes("notify_failed") && m.includes("card exploded")),
+    ).toBe(true);
+  });
+});
+
+describe("ReleaseWatcher — applyFn receives the check's version (KEN-131)", () => {
+  it("passes the detected version through so the auto-update path can pin the rollout", async () => {
+    const applyFn = vi.fn().mockResolvedValue(undefined);
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true, version: "v1.2.3" }),
+      applyFn,
+      restartFn: vi.fn().mockResolvedValue(undefined),
+      applyOnDetect: true,
+    });
+    await w.tick();
+    expect(applyFn).toHaveBeenCalledWith("v1.2.3");
+  });
+
+  it("passes undefined when the check reports no version (legacy digest path unchanged)", async () => {
+    const applyFn = vi.fn().mockResolvedValue(undefined);
+    const w = new ReleaseWatcher({
+      intervalMs: 1_000_000,
+      checkFn: async () => ({ available: true }),
+      applyFn,
+      restartFn: vi.fn().mockResolvedValue(undefined),
+      applyOnDetect: true,
+    });
+    await w.tick();
+    expect(applyFn).toHaveBeenCalledWith(undefined);
+  });
 });

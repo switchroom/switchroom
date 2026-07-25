@@ -61,12 +61,19 @@ host_control:
     enabled: true
     interval_minutes: 5            # floor 5, ceiling 1440
     apply_on_detect: true          # false → log-only (dogfood mode)
+    notify_on_detect: false        # KEN-129 — operator approval card, see below
     image_ref: ghcr.io/switchroom/switchroom-agent:latest
 ```
 
 When `enabled: true`, hostd polls `docker manifest inspect <image_ref>` every `interval_minutes`. If the remote digest diverges from the local image's `RepoDigests`, it runs `switchroom update` then `switchroom restart all` (graceful — drains in-flight Telegram turns via the existing `decideRestart` path). Events land at `~/.switchroom/release-watcher-events.jsonl` (`release_detected` → `apply_started/succeeded/failed` → `restart_started` → `fleet_caught_up`), with `duration_ms` on `fleet_caught_up` giving the AC's `time_from_release_to_fleet_caught_up_seconds` counter. Failures log and drop the tick — no retry-storm.
 
 Default is `enabled: false` so existing deployments don't suddenly self-roll. Pair with `apply_on_detect: false` to dogfood the detector without rolling the fleet.
+
+### Operator-in-the-loop update card (KEN-129, stage 1 of KEN-128)
+
+With `apply_on_detect: false` and `notify_on_detect: true`, a detected release doesn't roll the fleet — instead hostd posts **one operator approval card** ("⬆️ Switchroom update available — fleet is behind", with the `switchroom update --check` plan in the body) through an admin agent's Telegram gateway. Tapping ✅ Approve starts the standard hostd `update_apply` path (fleet-mutation-locked, durable status rows, `get_status`-pollable, in-chat rollout narration). Deny / timeout simply dismisses the card.
+
+Guarantees: **one card per release id** — the last-notified digest persists at `~/.switchroom/release-notify-state.json`, so restarts and repeat ticks never re-card the same release (a card that failed to *reach* the operator is retried next tick); no card posts while a fleet mutation is already in flight; no card when the fleet is current.
 
 ## Guardrails on agent-authored entries
 

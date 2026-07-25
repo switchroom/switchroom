@@ -17,6 +17,16 @@ import { execFile as execFileCb } from 'child_process'
 import { promisify } from 'util'
 
 import { readQuotaCache, writeQuotaCache } from './quota-cache.js'
+// Static cross-boundary import (same pattern as model-command.ts /
+// auth-broker-client.ts — the plugin bundler resolves ../../src/*
+// statically). generation-stamp.ts is dependency-free by design, so
+// this drags nothing else in. A dynamic import here would silently
+// no-op if the bundler missed it, killing the probe in production
+// while unit tests (which run unbundled) stayed green.
+import {
+  detectStampDrift,
+  readGenerationStamp,
+} from '../../src/agents/generation-stamp.js'
 import { fetchQuota, formatQuotaLine, type QuotaResult } from '../quota-check.js'
 
 const execFile = promisify(execFileCb)
@@ -1491,4 +1501,107 @@ export interface SkillsFsImpl {
 const realSkillsFs: SkillsFsImpl = {
   readdir: (p) => readdirSync(p),
   exists: (p) => existsSync(p),
+}
+
+// ─── Probe: Generated-surface drift (KEN-130) ────────────────────────────────
+
+/**
+ * Surfaces two drift signals on the boot card:
+ *
+ *   1. Live stamp comparison — the generation stamp written by the last
+ *      host-side reconcile (`<agentDir>/.switchroom-generated.json`)
+ *      vs the deployed start.sh / managed CLAUDE.md section / .mcp.json.
+ *      Pure fs hash compare via src/agents/generation-stamp.ts (which is
+ *      dependency-free by design), so it runs at every boot without any
+ *      host involvement.
+ *   2. The host-side drift report (`<agentDir>/.switchroom-drift.json`)
+ *      written by `switchroom doctor` — covers the surfaces only the
+ *      host can render (compose, hooks re-render, skills pool, image
+ *      hook scripts). Rendered with its age so a stale report is
+ *      readable as such; doctor rewrites it (empty when clean) on every
+ *      run and reconcile refreshes the stamp, so staleness windows are
+ *      short.
+ *
+ * No stamp AND no report → ok (fresh agent / pre-KEN-130 host): the
+ * silent-when-healthy contract means clean fleets never grow a row.
+ */
+export async function probeDrift(
+  agentDir: string,
+  opts: { agentName?: string; nowMs?: () => number } = {},
+): Promise<ProbeResult> {
+  return withTimeout('Drift', (async (): Promise<ProbeResult> => {
+    const surfaces: string[] = []
+
+    // 1. Stamp comparison (in-container checkable surfaces).
+    let stampGeneratedAtMs = NaN
+    try {
+      const stampResult = detectStampDrift(agentDir)
+      for (const f of stampResult.findings) {
+        surfaces.push(`${f.surface} (${f.detail})`)
+      }
+      if (stampResult.hasStamp) {
+        const raw = readGenerationStamp(agentDir)
+        if (raw?.generatedAt) stampGeneratedAtMs = Date.parse(raw.generatedAt)
+      }
+    } catch {
+      /* unexpected fs failure — skip signal 1, never break the boot card */
+    }
+
+    // 2. Host-written doctor report.
+    try {
+      const raw = readFileSync(join(agentDir, '.switchroom-drift.json'), 'utf8')
+      const report = JSON.parse(raw) as {
+        version?: number
+        generatedAt?: string
+        findings?: Array<{ surface?: string; detail?: string }>
+      }
+      if (report?.version === 1 && Array.isArray(report.findings)) {
+        const gen = report.generatedAt ? Date.parse(report.generatedAt) : NaN
+        // A report OLDER than the generation stamp predates the last
+        // `switchroom apply` — that apply re-enforced every surface the
+        // report describes (compose rewrite + full reconcile), so its
+        // findings are stale. Without this guard a freshly-applied fleet
+        // keeps showing a degraded Drift row on every boot until the
+        // operator happens to rerun doctor (doctor rewrites the report;
+        // apply does not). Any still-real drift resurfaces on the next
+        // doctor run.
+        const supersededByApply =
+          Number.isFinite(stampGeneratedAtMs) &&
+          Number.isFinite(gen) &&
+          gen < stampGeneratedAtMs
+        if (!supersededByApply) {
+          const seen = new Set(surfaces.map((s) => s.split(' ')[0]))
+          let ageNote = ''
+          if (Number.isFinite(gen)) {
+            const ageMs = (opts.nowMs?.() ?? Date.now()) - gen
+            if (ageMs > 3_600_000) {
+              const hours = Math.round(ageMs / 3_600_000)
+              const human = hours >= 48 ? `${Math.round(hours / 24)}d` : `${hours}h`
+              ageNote = ` — as of ${human} ago`
+            }
+          }
+          for (const f of report.findings) {
+            if (!f?.surface || seen.has(f.surface)) continue
+            seen.add(f.surface)
+            surfaces.push(`${f.surface}${ageNote}`)
+          }
+        }
+      }
+    } catch {
+      /* no report / unreadable — fine, doctor hasn't run */
+    }
+
+    if (surfaces.length === 0) {
+      return { status: 'ok', label: 'Drift', detail: 'generated surfaces in sync' }
+    }
+    const shown = surfaces.slice(0, 4).join(', ')
+    const more = surfaces.length > 4 ? ` +${surfaces.length - 4} more` : ''
+    const target = opts.agentName ? ` ${opts.agentName}` : ''
+    return {
+      status: 'degraded',
+      label: 'Drift',
+      detail: `${surfaces.length} drifted surface(s): ${shown}${more}`,
+      nextStep: `Run \`switchroom apply\` (or \`switchroom agent reconcile${target} --restart\`); see \`switchroom doctor\` for detail`,
+    }
+  })())
 }

@@ -391,6 +391,19 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (typeof m.timeoutMs !== "number"
         || !Number.isFinite(m.timeoutMs)
         || (m.timeoutMs as number) <= 0) return false;
+      // Optional header override (KEN-129) — absent falls back to the
+      // default config-edit header. SINGLE LINE ONLY: the header renders
+      // VERBATIM as the card's first line (it carries intentional markdown,
+      // so it can't be escaped), which means a newline would let a caller
+      // forge the `Agent:` / `Reason:` lines beneath it — or unbalance the
+      // diff's ``` fence — on a card the operator is about to approve.
+      // Control characters are rejected for the same reason.
+      if (m.title !== undefined
+        && (typeof m.title !== "string"
+          || (m.title as string).length === 0
+          || (m.title as string).length > 200
+          // eslint-disable-next-line no-control-regex
+          || /[\u0000-\u001f\u007f]/.test(m.title as string))) return false;
       return true;
     }
     case "request_config_finalize": {

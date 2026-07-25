@@ -12,6 +12,15 @@ export interface ApprovalRequest {
   reason: string;
   unifiedDiff: string;
   timeoutMs: number;
+  /**
+   * Optional card header override (KEN-129). Default renders the
+   * config-edit header ("🛠 Config edit proposed"); the update-check
+   * drift card passes its own so the operator isn't told a fleet
+   * update is a config edit. Old gateways ignore the field and fall
+   * back to the default header — graceful degrade in mixed-version
+   * rolls.
+   */
+  title?: string;
 }
 
 export interface ApprovalResult {
@@ -241,6 +250,7 @@ export class SocketApprovalGateway implements ApprovalGateway {
               reason: req.reason,
               unifiedDiff: req.unifiedDiff,
               timeoutMs: req.timeoutMs,
+              ...(req.title ? { title: req.title } : {}),
             }) + "\n",
           );
         } catch (err) {

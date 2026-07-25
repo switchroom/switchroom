@@ -427,6 +427,11 @@ export interface RequestConfigApprovalMessage {
   unifiedDiff: string;
   /** Card timeout in milliseconds (gateway-enforced). */
   timeoutMs: number;
+  /**
+   * Optional card header override (KEN-129 — update-check drift card).
+   * Absent → the default "🛠 Config edit proposed" header. ≤200 chars.
+   */
+  title?: string;
 }
 
 /**

@@ -47,6 +47,7 @@ import {
   probeKernel,
   probeSkills,
   probeConnections,
+  probeDrift,
   watchAgentProcess,
   AGENT_LIVE_WINDOW_MS,
   AGENT_LIVE_POLL_INTERVAL_MS,
@@ -124,6 +125,7 @@ export type ProbeKey =
   | 'kernel'
   | 'skills'
   | 'connections'
+  | 'drift'
 
 export type ProbeMap = Partial<Record<ProbeKey, ProbeResult | null>>
 
@@ -258,11 +260,12 @@ const PROBE_LABELS: Record<ProbeKey, string> = {
   kernel:    'Kernel',
   skills:    'Skills',
   connections: 'Connections',
+  drift:     'Drift',
 }
 
 const PROBE_KEYS: ReadonlyArray<ProbeKey> = [
   'account', 'agent', 'gateway', 'quota', 'hindsight',
-  'scheduler', 'broker', 'kernel', 'skills', 'connections',
+  'scheduler', 'broker', 'kernel', 'skills', 'connections', 'drift',
 ]
 
 const REASON_EMOJI: Record<RestartReason, string> = {
@@ -787,6 +790,7 @@ export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
     probeKernel(undefined, { dockerMode: opts.dockerMode }).then(r => { probes.kernel = r }),
     probeSkills(opts.agentDir, { agentName: opts.agentSlug ?? opts.agentName }).then(r => { probes.skills = r }),
     probeConnections(opts.agentDir).then(r => { probes.connections = r }),
+    probeDrift(opts.agentDir, { agentName: opts.agentSlug ?? opts.agentName }).then(r => { probes.drift = r }),
   ])
 
   return probes

@@ -53,8 +53,11 @@ export interface ReleaseWatcherOptions {
    *  remote tag's digest no longer matches the deployed digest. */
   checkFn: () => Promise<ReleaseCheckResult>;
   /** Run the equivalent of `switchroom update` end-to-end. Resolves
-   *  when the apply completes (or rejects on failure). */
-  applyFn: () => Promise<void>;
+   *  when the apply completes (or rejects on failure). Receives the
+   *  check's `version` identifier when one was reported (KEN-131 —
+   *  the auto-update path needs the concrete `vX.Y.Z` target to drive
+   *  `switchroom rollout --pin`; the legacy digest path ignores it). */
+  applyFn: (version?: string) => Promise<void>;
   /** Run the equivalent of `switchroom restart all` (graceful by
    *  default — drains in-flight turns). Resolves when scheduling
    *  completes; the per-agent drain happens asynchronously. */
@@ -63,6 +66,14 @@ export interface ReleaseWatcherOptions {
    *  stop short of calling applyFn / restartFn. Use to dogfood the
    *  check loop without auto-rolling the fleet. */
   applyOnDetect: boolean;
+  /** KEN-129 — optional notify hook, consulted only when
+   *  `applyOnDetect` is false. Receives the detected release id so
+   *  the update notifier can post a "fleet is behind — tap to apply"
+   *  operator approval card. Awaited inside the tick (the in-flight
+   *  guard then naturally prevents a second card racing the first);
+   *  errors are logged and dropped — a notify failure never breaks
+   *  the watch loop. */
+  notifyFn?: (version: string) => Promise<void>;
   /** Receives one event per state transition for telemetry / audit. */
   onEvent?: (e: ReleaseWatcherEvent) => void;
   /** Diagnostic log sink. */
@@ -135,7 +146,16 @@ export class ReleaseWatcher {
             ? ", auto-applying"
             : " (apply_on_detect=false; not rolling)"),
       );
-      if (!this.opts.applyOnDetect) return;
+      if (!this.opts.applyOnDetect) {
+        if (this.opts.notifyFn) {
+          try {
+            await this.opts.notifyFn(check.version ?? "");
+          } catch (err) {
+            this.log(`notify_failed: ${errMsg(err)}`);
+          }
+        }
+        return;
+      }
 
       const applyStarted = this.now();
       this.emit({
@@ -144,7 +164,7 @@ export class ReleaseWatcher {
         ...(check.version ? { version: check.version } : {}),
       });
       try {
-        await this.opts.applyFn();
+        await this.opts.applyFn(check.version);
       } catch (err) {
         this.emit({
           at: this.now(),
