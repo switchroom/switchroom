@@ -97,11 +97,22 @@ function quarantinePath(filePath: string): string {
  * Reap all but the newest {@link MAX_QUARANTINED_COPIES} forensic copies.
  *
  * Ordered by the filesystem's own mtime (nanosecond resolution via the
- * bigint stat), which is correct by construction across process restarts —
- * unlike the embedded `<epoch-ms>-<seq>`, whose sequence restarts at 0 on
- * every boot and would make a fresh copy sort as the oldest whenever a
- * restart lands in the same millisecond as the previous process's burst.
- * The name is used only as a stable tie-break.
+ * bigint stat) — unlike the embedded `<epoch-ms>-<seq>`, whose sequence
+ * restarts at 0 on every boot and would make a fresh copy sort as the oldest
+ * whenever a restart lands in the same millisecond as the previous process's
+ * burst. The name is used only as a stable tie-break.
+ *
+ * Where the guarantee ends: this is exact only on filesystems that record
+ * mtime at (sub-)nanosecond granularity — ext4, xfs, apfs, btrfs all do. On a
+ * coarse-granularity filesystem (older ext3, some network/FUSE mounts, where
+ * mtime rounds to a whole second) a burst of more than MAX_QUARANTINED_COPIES
+ * quarantines inside one second all tie on `mtimeNs`, the sort falls through
+ * to the name, and the restart-reset ordering above comes back: the prior
+ * process burns seq 000001-000005 in second T, a restart quarantines at
+ * 000000, all six tie, and the freshest copy is reaped first. That costs a
+ * forensic copy on a rare filesystem and never live state, so it is not
+ * defended against here — but do not read this reaper as unconditionally
+ * restart-safe.
  */
 function reapOldQuarantines(filePath: string, log: (line: string) => void): void {
   const dir = dirname(filePath)
