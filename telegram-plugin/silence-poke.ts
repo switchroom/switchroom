@@ -532,6 +532,84 @@ export function formatFrameworkFallbackText(
 }
 
 /**
+ * #3551 — inputs to the silence-fallback TEARDOWN NOTICE decision.
+ *
+ * Distinct from `formatFrameworkFallbackText`, which answers "is anything
+ * happening worth narrating?" (and, since the stall-notice was retired,
+ * answers `null` on every branch but `blockedOnApproval`). This one answers a
+ * different, terminal question: "the framework is about to END this live turn
+ * — does the user need to be told?"
+ */
+export interface FallbackTeardownNoticeInput {
+  /** This fire is genuinely tearing down a live turn for THIS chat/thread.
+   *  False on the multi-chat case where the current turn belongs elsewhere, or
+   *  when there was no turn left to end. */
+  tearsDownLiveTurn: boolean
+  /** Loop role of the turn being torn down; null when unknown. */
+  role: LoopRole | null
+  /** A final answer already landed on this turn. */
+  finalAnswerDelivered: boolean
+  /** This fire is ALREADY sending user-visible text (the approval re-ping, or
+   *  the deterministic update_apply status line). Never stack a second message. */
+  otherTextSent: boolean
+  /** The obligation ledger is on, so the killed turn's unanswered inbound will
+   *  be re-presented. Governs the tail sentence — never claim a re-ask that
+   *  cannot happen. */
+  representWillFollow: boolean
+  silenceMs: number
+}
+
+export type FallbackTeardownNoticeDecision =
+  | { send: false; reason: 'other-text-sent' | 'no-live-turn-torn-down' | 'non-user-turn' | 'answer-already-delivered' }
+  | { send: true; text: string }
+
+/**
+ * #3551 — decide whether a silence-poke fire that ENDS a live turn must say so.
+ *
+ * The bug this closes: on the non-approval branch the 300s fallback delivered
+ * NO text (`formatFrameworkFallbackText` returns null) while still tearing the
+ * turn down and redelivering buffered inbound. From the user's seat: five
+ * minutes of nothing, then the agent inexplicably restarting the same request,
+ * with no signal that the framework — not the agent — made that happen.
+ * Measured: 110 fires / 14 days, p50 silence 302s, ~9h of dead air.
+ *
+ * The fix is NOT to stop killing the turn. The teardown is the fallback's one
+ * genuinely load-bearing job (`#1122`: without it every later inbound queues
+ * behind a dead turn forever), and removing it would trade a silent turn for a
+ * permanently wedged conversation. The fix is to make the kill OBSERVABLE.
+ *
+ * This is deliberately NOT a re-introduction of the retired stall notice, and
+ * the gates below are what keep it that way:
+ *   - `otherTextSent` — never stack on the approval re-ping / update-status line.
+ *   - `tearsDownLiveTurn` — a late-fire against an already-dead key says nothing.
+ *   - `role !== 'user'` — a cron/system turn's silence is legitimate; nobody is
+ *     waiting, so its teardown is housekeeping, not news.
+ *   - `finalAnswerDelivered` — the user already has their answer; ending the
+ *     residual housekeeping turn is invisible to them and needs no notice.
+ * What remains is exactly one case: a HUMAN asked something, got nothing for
+ * N minutes, and the framework just ended that attempt. That is a terminal
+ * event, fired at most once per turn (the caller drops the key immediately
+ * after), not a cadence-based progress ping — the thing
+ * `reference/rfcs/conversational-pacing.md` § Anti-patterns bans.
+ */
+export function decideFallbackTeardownNotice(
+  input: FallbackTeardownNoticeInput,
+): FallbackTeardownNoticeDecision {
+  if (input.otherTextSent) return { send: false, reason: 'other-text-sent' }
+  if (!input.tearsDownLiveTurn) return { send: false, reason: 'no-live-turn-torn-down' }
+  if (input.role !== 'user') return { send: false, reason: 'non-user-turn' }
+  if (input.finalAnswerDelivered) return { send: false, reason: 'answer-already-delivered' }
+  const minutes = Math.max(1, Math.round(input.silenceMs / 60_000))
+  const tail = input.representWillFollow
+    ? 'Your message is still tracked and is being re-asked now.'
+    : 'Your message was not answered — please re-send it.'
+  return {
+    send: true,
+    text: `⚠️ no output for ${minutes} min — the framework ended that stalled turn. ${tail}`,
+  }
+}
+
+/**
  * #2995 — the LONGEST-running in-flight tool for a turn key, or null when
  * none is tracked. Read-only accessor over `inFlightTools` for the
  * mid-flight busy-ack: the gateway needs the blocking step's name/label

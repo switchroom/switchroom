@@ -38,6 +38,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     SILENCE_FALLBACK_HARD_MS,
     SILENCE_FLOOR_MS,
     SILENCE_DEFER_INFLIGHT_TOOLS,
+    OBLIGATION_LEDGER_ENABLED,
     TURN_PREVIEW_MAX,
     STATE_DIR,
     isLegitimatelyWorking,
@@ -452,6 +453,44 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       // singleton, verbatim; flag-ON deletes only this topic's entry and clears
       // the mirror iff it still points here — a live sibling topic is untouched.
       endCurrentTurnForKey(wedgedTurn, fbKey)
+    }
+    // #3551 — the teardown NOTICE. Everything above just ENDED a live turn. On
+    // the non-approval branch `text` is null (`formatFrameworkFallbackText`
+    // returns a string only when parked on an approval card), so before this
+    // the user saw literally nothing: N minutes of silence, then the agent
+    // apparently starting the same request over. Killing a user's turn with no
+    // user-visible signal is a correctness bug, not a tuning knob — 110 fires /
+    // 14 days, ~9h of dead air (#3551). The teardown itself is NOT removed (it
+    // is the #1122 unwedge, the fallback's one load-bearing job); it is made
+    // observable. Sent AFTER the teardown so the notice cannot itself be
+    // clobbered by the state purge, and gated by `decideFallbackTeardownNotice`
+    // so it can only ever speak for a human-waiting, undelivered turn that this
+    // fire actually killed — at most once, since `endTurn(fbKey)` above dropped
+    // the key.
+    const teardownNotice = silencePoke.decideFallbackTeardownNotice({
+      tearsDownLiveTurn: turnMatchesFallback,
+      role: wedgedTurn?.role ?? null,
+      finalAnswerDelivered: wedgedTurn?.finalAnswerDelivered ?? false,
+      otherTextSent: text != null,
+      representWillFollow: OBLIGATION_LEDGER_ENABLED,
+      silenceMs: ctx.silenceMs,
+    })
+    if (teardownNotice.send) {
+      try {
+        // LOUD (disable_notification: false). The user asked a question and is
+        // being told their attempt was killed — that is exactly the case where
+        // silence would train them to distrust the channel.
+        await sendSilenceText(fbChatId, ctx.threadId ?? null, teardownNotice.text, false)
+      } catch (err) {
+        process.stderr.write(
+          `silence-poke teardown notice sendMessage failed chat=${fbChatId} thread=${ctx.threadId}: ${err}\n`,
+        )
+      }
+    } else {
+      process.stderr.write(
+        `telegram gateway: silence-poke teardown notice skipped reason=${teardownNotice.reason} ` +
+        `chat=${fbChatId} thread=${ctx.threadId ?? '-'}\n`,
+      )
     }
     // Best-effort: clear any pending silent-end marker so the Stop hook
     // doesn't double-block when claude eventually exits the wedged turn.

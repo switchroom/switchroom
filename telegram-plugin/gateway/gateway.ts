@@ -9688,6 +9688,9 @@ function gatewayLivenessWiringDeps() {
     SILENCE_FALLBACK_HARD_MS,
     SILENCE_FLOOR_MS,
     SILENCE_DEFER_INFLIGHT_TOOLS,
+    // #3551 — governs the teardown notice's tail sentence: only promise a
+    // re-ask when the obligation ledger is actually on to deliver one.
+    OBLIGATION_LEDGER_ENABLED,
     TURN_PREVIEW_MAX,
     STATE_DIR,
     isLegitimatelyWorking,
