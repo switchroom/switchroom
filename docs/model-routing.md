@@ -59,8 +59,10 @@ These must always hold.
   the lint guard and fleet-health sensor discover the live file by scanning
   `/data/coolify/services/*/litellm-config.yaml`, or take `LITELLM_CONFIG_PATH`)
   (procedure in `docker/litellm-proxy/README.md` — switchroom itself never
-  mutates or restarts the live proxy, and the live file must be reconciled
-  into the repo copy on first rollout). The config places
+  mutates or restarts the live proxy). The first-rollout reconciliation of the
+  live file into the repo copy was completed 2026-07-25 — the two are now
+  semantically identical bar two documented deltas listed in that README.
+  The config places
   `forward_client_headers_to_llm_api: true` under individual Claude entries in
   `model_group_settings` and leaves it off both globally (in `litellm_settings`,
   where it is a Boolean master switch) and on every `openrouter/*` /
