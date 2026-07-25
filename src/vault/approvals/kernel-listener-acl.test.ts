@@ -252,3 +252,185 @@ describe("kernel listener-identity ACL on mutating ops (#1399)", () => {
     expect(second.decision_id).toBeUndefined();
   });
 });
+
+/**
+ * approval_list was the ONE kernel op with no listener-identity ACL: it
+ * passed the wire-supplied `agent_unit` straight to listDecisions. Agent B
+ * could therefore enumerate agent A's decisions on B's own legitimate
+ * socket — scopes (which embed Google doc ids / M365 paths),
+ * granted_by_user_id (the operator's Telegram user id), grant timestamps
+ * and revoke reasons. `agent_unit` is optional on the wire, so omitting it
+ * dumped the WHOLE fleet.
+ */
+describe("kernel listener-identity ACL on approval_list", () => {
+  let dir: string;
+  let handle: KernelServerHandle;
+  let aliceSock: string;
+  let bobSock: string;
+  let opSock: string;
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "kernel-list-acl-"));
+    handle = await bootstrap({
+      socketParent: dir,
+      agents: ["alice", "bob"],
+      dbPath: ":memory:",
+      operatorUid: process.getuid?.() ?? 0,
+    });
+    aliceSock = join(dir, "alice", "sock");
+    bobSock = join(dir, "bob", "sock");
+    opSock = join(dir, "operator", "sock");
+  });
+
+  afterEach(() => {
+    try {
+      handle.stop();
+    } catch {
+      /* ignore */
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Give `who` one real allow_always decision on a sensitive scope. */
+  async function grantFor(sockPath: string, who: string, scope: string): Promise<void> {
+    const req = await rpc(sockPath, {
+      v: 1,
+      op: "approval_request",
+      agent_unit: who,
+      scope,
+      action: "write",
+      approver_set: ["op1"],
+      why: "list-acl fixture",
+    });
+    expect(req.ok).toBe(true);
+    const rec = await rpc(sockPath, {
+      v: 1,
+      op: "approval_consume_record",
+      request_id: req.request_id,
+      decision: "allow_always",
+      approver_set: ["op1"],
+      granted_by_user_id: 424242,
+    });
+    expect(rec.ok).toBe(true);
+    expect(rec.consumed).toBe(true);
+  }
+
+  it("denies an explicit cross-agent approval_list", async () => {
+    await grantFor(aliceSock, "alice", "doc:gdrive:write:SECRET_DOC");
+
+    const denied = await rpc(bobSock, {
+      v: 1,
+      op: "approval_list",
+      agent_unit: "alice",
+    });
+    expect(denied.ok).toBe(false);
+    expect(denied.code).toBe("DENIED");
+    expect(denied.decisions).toBeUndefined();
+    // Nothing about alice's grant leaks in the payload.
+    expect(JSON.stringify(denied)).not.toContain("SECRET_DOC");
+    expect(JSON.stringify(denied)).not.toContain("424242");
+  });
+
+  it("an omitted agent_unit lists only the caller's own decisions, not the fleet", async () => {
+    await grantFor(aliceSock, "alice", "doc:gdrive:write:SECRET_DOC");
+    await grantFor(bobSock, "bob", "doc:gdrive:write:BOB_DOC");
+
+    const resp = await rpc(bobSock, { v: 1, op: "approval_list" });
+    expect(resp.ok).toBe(true);
+    expect(resp.decisions.map((d: { agent_unit: string }) => d.agent_unit)).toEqual(["bob"]);
+    expect(resp.decisions.map((d: { scope: string }) => d.scope)).toEqual([
+      "doc:gdrive:write:BOB_DOC",
+    ]);
+    expect(JSON.stringify(resp)).not.toContain("SECRET_DOC");
+  });
+
+  it("same-agent approval_list still works and returns the full metadata", async () => {
+    await grantFor(aliceSock, "alice", "doc:gdrive:write:SECRET_DOC");
+
+    const resp = await rpc(aliceSock, {
+      v: 1,
+      op: "approval_list",
+      agent_unit: "alice",
+    });
+    expect(resp.ok).toBe(true);
+    expect(resp.decisions.length).toBe(1);
+    expect(resp.decisions[0].agent_unit).toBe("alice");
+    expect(resp.decisions[0].scope).toBe("doc:gdrive:write:SECRET_DOC");
+    expect(resp.decisions[0].granted_by_user_id).toBe(424242);
+  });
+
+  // F4 — documented wire invariant. A `state: "granted"` allow_once response
+  // carries revoked_at != null, because the burn is the same atomic step that
+  // authorizes this very use. Pinned here so a future reader who finds the
+  // shape "self-contradictory" and starts re-gating on revoked_at (which
+  // would deny the one use the operator actually approved) trips a test
+  // instead of shipping it.
+  it("granted allow_once response carries the burn (revoked_at set, state still granted)", async () => {
+    const req = await rpc(aliceSock, {
+      v: 1,
+      op: "approval_request",
+      agent_unit: "alice",
+      scope: "doc:gdrive:write:ONCE_DOC",
+      action: "write",
+      approver_set: ["op1"],
+      why: "one-shot wire shape",
+    });
+    expect(req.ok).toBe(true);
+    const rec = await rpc(aliceSock, {
+      v: 1,
+      op: "approval_consume_record",
+      request_id: req.request_id,
+      decision: "allow_once",
+      approver_set: ["op1"],
+      granted_by_user_id: 1,
+    });
+    expect(rec.consumed).toBe(true);
+
+    const first = await rpc(aliceSock, {
+      v: 1,
+      op: "approval_lookup",
+      agent_unit: "alice",
+      scope: "doc:gdrive:write:ONCE_DOC",
+      action: "write",
+      current_approver_set: ["op1"],
+    });
+    expect(first.ok).toBe(true);
+    expect(first.state).toBe("granted");
+    // The invariant: granted AND already burned, in the same response.
+    expect(first.decision.revoked_at).not.toBeNull();
+    expect(first.decision.revoke_reason).toBe("allow_once_consumed");
+
+    // And the next lookup gets nothing — the one use is spent.
+    const second = await rpc(aliceSock, {
+      v: 1,
+      op: "approval_lookup",
+      agent_unit: "alice",
+      scope: "doc:gdrive:write:ONCE_DOC",
+      action: "write",
+      current_approver_set: ["op1"],
+    });
+    expect(second.ok).toBe(true);
+    expect(second.state).toBe("no_decision");
+  });
+
+  it("the operator socket keeps its fleet-wide read (it is the dashboard)", async () => {
+    await grantFor(aliceSock, "alice", "doc:gdrive:write:SECRET_DOC");
+    await grantFor(bobSock, "bob", "doc:gdrive:write:BOB_DOC");
+
+    const all = await rpc(opSock, { v: 1, op: "approval_list" });
+    expect(all.ok).toBe(true);
+    expect(
+      all.decisions.map((d: { agent_unit: string }) => d.agent_unit).sort(),
+    ).toEqual(["alice", "bob"]);
+
+    const justAlice = await rpc(opSock, {
+      v: 1,
+      op: "approval_list",
+      agent_unit: "alice",
+    });
+    expect(justAlice.ok).toBe(true);
+    expect(justAlice.decisions.map((d: { agent_unit: string }) => d.agent_unit)).toEqual([
+      "alice",
+    ]);
+  });
+});
