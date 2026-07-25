@@ -2259,15 +2259,15 @@ describe("rollout CLI — the pre-roll crash net and its --dry-run gate", () => 
     }
 
     // It really did reach the plan print, so the gate above it ran. Anchored on
-    // `formatRolloutPlan`'s header, which nothing else in this command emits:
-    // an alternation including /rollout/i matches almost any stdout the verb
-    // can produce (its own usage text, an error, the command name itself), so
-    // it would assert far less than this comment claims. `persist-pin` is NOT
-    // the anchor — this invocation plans no such step (the pin already matches
-    // the config), so matching on it would fail for a reason unrelated to the
-    // gate.
+    // `formatRolloutPlan`'s own output, which nothing else in this command
+    // emits: an alternation including /rollout/i matches almost any stdout the
+    // verb can produce (its usage text, an error, the command name itself), so
+    // it would assert far less than this comment claims. Note the rendered
+    // literal is `persist release.pin=`, NOT the step KIND `persist-pin` — the
+    // renderer spells the step out, so matching the kind name would fail here
+    // for a reason that has nothing to do with the gate under test.
     expect(out.join("")).toMatch(/Rollout plan → v0\.0\.1:/);
-    expect(out.join("")).toMatch(/apply — regenerate compose/);
+    expect(out.join("")).toMatch(/persist release\.pin=v0\.0\.1 to switchroom\.yaml/);
     // …and NOTHING on disk moved.
     expect(getReleasePinFromConfig(readFileSync(configPath, "utf8"))).toBe("v0.19.3");
     expect(hasPinJournal(configPath)).toBe(true);
