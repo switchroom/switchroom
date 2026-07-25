@@ -135,6 +135,24 @@ be written at all (disk full, permissions) even after making room. That
 residual case still must not be silent, so it is recorded in the
 ``pending-drops.json`` ledger — a sibling of the queue dir, like the
 eviction log, so it can never be mistaken for a queue entry.
+
+Bounded entries
+---------------
+``MAX_BYTES`` is about the QUEUE's capacity. A second, much smaller bound
+is about whether an entry can ever be DRAINED: ``enqueue()`` splits an
+oversized payload into one entry PER PART (``lib/retain_split``) instead
+of writing a single giant entry. This is load-bearing, not tidiness. The
+daemon runs one sequential extraction LLM call per ``retain_chunk_size``
+chars, so an entry above the derived content bound cannot complete inside
+ANY client deadline — including the 280s out-of-hook backlog deadline that
+``drain_pending._backlog_timeout()`` now takes from the same derivation.
+Such an entry fails every drain, burns its ``MAX_ATTEMPTS``, and is
+renamed ``.dead``: the mechanism that stranded 154 of the 629 entries in
+the 2026-07-25 fleet backlog. Note this is orthogonal to the re-post loop
+#3599 fixed — a presence GET retires an oversized entry for free when the
+document IS already durable; splitting is what makes the entry drainable
+when it is NOT. Part document_ids are deterministic, so a part already
+committed by the failed POST is upserted on drain, not duplicated.
 """
 
 from __future__ import annotations
@@ -148,6 +166,8 @@ import sys
 import time
 import uuid
 from typing import Optional
+
+from .retain_split import part_document_id, part_metadata, split_retain_content
 
 
 SCHEMA = 1
@@ -738,10 +758,16 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     ``client.retain()`` plus connection info (``api_url``, ``api_token``)
     so the drainer can rebuild the client without re-resolving config.
 
-    Returns the absolute path of the entry — which may be an EXISTING
-    identical entry (dedupe) — or ``None`` in the residual case where the
-    entry could not be written at all. Atomic: writes ``<name>.tmp`` then
-    renames to ``<name>``.
+    Oversized content is SPLIT into one entry PER PART before anything is
+    written, so no entry is ever queued that the drainer cannot finish
+    inside one client deadline (see "Bounded entries" above). Content at or
+    under the bound is written as a single entry exactly as before, with
+    the document_id and metadata untouched.
+
+    Returns the absolute path of the (first) written entry — which may be
+    an EXISTING identical entry (dedupe) — or ``None`` in the residual case
+    where NO part could be written at all. Atomic per entry: writes
+    ``<name>.tmp`` then renames to ``<name>``.
 
     A full queue no longer refuses the incoming entry: ``_evict_to_fit()``
     sheds the OLDEST entries into ``pending-evicted/`` instead. Refusing
@@ -750,6 +776,42 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     """
     d = _ensure_dir()
 
+    content = payload.get("content")
+    parts = split_retain_content(content) if isinstance(content, str) else [content]
+    total = len(parts)
+    if total <= 1:
+        return _enqueue_one(d, payload, error)
+
+    base_doc = payload.get("document_id", "conversation")
+    base_meta = payload.get("metadata")
+
+    first: Optional[str] = None
+    for index, part in enumerate(parts):
+        part_payload = dict(payload)
+        part_payload["content"] = part
+        part_payload["document_id"] = part_document_id(base_doc, index, total)
+        part_payload["metadata"] = part_metadata(base_meta, index, total)
+        # Each part goes through the FULL enqueue pipeline — dedupe, the
+        # MAX_BYTES refusal, eviction, the drop ledger — because each part
+        # is an independently drainable memory, not a fragment that only
+        # means something alongside its siblings. A part that cannot be
+        # written is recorded as a drop and the remaining parts still go in;
+        # returning ``None`` for the whole memory because part 7 of 9 hit
+        # ENOSPC would discard eight recoverable turns.
+        #
+        # A part CAN evict an earlier part of the same memory when the queue
+        # is already at its cap (eviction is FIFO and earlier parts are
+        # older). That is the same trade `_evict_to_fit` documents — the
+        # evicted part MOVES to ``pending-evicted/``, so it is shed, not
+        # destroyed, except under the sustained-ENOSPC case named there.
+        written = _enqueue_one(d, part_payload, error)
+        if written is not None and first is None:
+            first = written
+    return first
+
+
+def _enqueue_one(d: str, payload: dict, error: BaseException) -> Optional[str]:
+    """Write exactly ONE queue entry for ``payload``. See ``enqueue()``."""
     entry = dict(payload)
     entry["schema"] = SCHEMA
     entry["failed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

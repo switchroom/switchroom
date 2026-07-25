@@ -10,11 +10,15 @@ memory is permanently unsaveable.
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from lib import client as client_mod  # noqa: E402
+from lib import pending  # noqa: E402
 from lib import retain_split  # noqa: E402
 from lib.client import HindsightClient  # noqa: E402
 from lib.retain_split import (  # noqa: E402
@@ -246,7 +250,10 @@ class TestClientEnforcesTheBound(unittest.TestCase):
             self.assertIs(body["async"], False)
             self.assertEqual(body["items"][0]["context"], "claude-code")
             self.assertEqual(body["items"][0]["tags"], ["t"])
-            self.assertEqual(timeout, 280)
+            # Each part gets a positive request deadline, clamped to what is
+            # left of the caller's 280s wall budget (never more than it).
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 280)
 
     def test_a_failing_part_raises_so_the_caller_still_enqueues_and_retries(self):
         client = _RecordingClient("http://hindsight.invalid", fail_on=2)
@@ -280,6 +287,110 @@ class TestClientEnforcesTheBound(unittest.TestCase):
         self.assertGreater(len(self.client.posts), 1)
         for _p, body, _t in self.client.posts:
             self.assertLessEqual(len(body["items"][0]["content"]), 6000)
+
+
+class TestRetainRespectsTheCallersWallBudget(unittest.TestCase):
+    """Splitting must not turn one bounded POST into N of them.
+
+    The Stop hook passes ``timeout=15`` because it has a hook budget. Posting
+    17 parts at 15s each would stall the session for over four minutes — a
+    worse bug than the one being fixed. Fails against the first cut of the fix,
+    which passed the caller's timeout to every part with no overall bound.
+    """
+
+    def test_total_wall_time_is_bounded_by_the_callers_timeout(self):
+        class _SlowClient(_RecordingClient):
+            def _request(self, method, path, body=None, timeout=None):
+                self.clock[0] += 9.0  # each part burns 9s
+                return super()._request(method, path, body, timeout)
+
+        client = _SlowClient("http://hindsight.invalid")
+        client.clock = [0.0]
+        real_monotonic = client_mod.time.monotonic
+        client_mod.time.monotonic = lambda: client.clock[0]
+        try:
+            with self.assertRaises(TimeoutError):
+                client.retain("bank", _json_transcript(40, 20000), timeout=15)
+        finally:
+            client_mod.time.monotonic = real_monotonic
+        # 15s budget, 9s per part: part 1 runs, part 2 starts (6s left), part 3
+        # must not. Bounded — not all 40-message-worth of parts.
+        self.assertEqual(len(client.posts), 2)
+
+    def test_parts_that_fit_the_budget_all_post(self):
+        client = _RecordingClient("http://hindsight.invalid")
+        content = _json_transcript(40, 20000)
+        result = client.retain("bank", content, timeout=280)
+        self.assertGreater(len(client.posts), 1)
+        self.assertEqual(result["split_parts"], len(client.posts))
+
+
+class TestEnqueueQueuesBoundedEntries(unittest.TestCase):
+    """An oversized entry can never be drained, so it must never be queued.
+
+    drain_pending marks an entry ``.dead`` after MAX_ATTEMPTS failures. A
+    queued 744k-char payload fails every attempt by construction, so queuing it
+    whole is a scheduled data loss. Fails against pre-fix pending.enqueue,
+    which wrote one entry of whatever size it was handed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._prev = os.environ.get("HOME")
+        os.environ["HOME"] = self.tmp
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._prev
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _payload(self, content):
+        return {
+            "api_url": "http://hindsight.invalid",
+            "bank_id": "bank",
+            "document_id": "sess-r1-2",
+            "content": content,
+            "metadata": {"source": "test"},
+        }
+
+    def test_small_payload_still_queues_exactly_one_unchanged_entry(self):
+        pending.enqueue(self._payload("short content"), RuntimeError("boom"))
+        entries = pending.iter_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0][1]["content"], "short content")
+        self.assertEqual(entries[0][1]["document_id"], "sess-r1-2")
+
+    def test_oversized_payload_is_queued_as_multiple_bounded_entries(self):
+        content = _json_transcript(40, 20000)
+        pending.enqueue(self._payload(content), RuntimeError("boom"))
+        entries = pending.iter_entries()
+        limit = retain_content_limit()
+        self.assertGreater(len(entries), 1)
+        for _path, entry in entries:
+            self.assertLessEqual(len(entry["content"]), limit)
+
+    def test_queued_parts_have_distinct_deterministic_ids(self):
+        content = _json_transcript(40, 20000)
+        pending.enqueue(self._payload(content), RuntimeError("boom"))
+        ids = [e["document_id"] for _p, e in pending.iter_entries()]
+        self.assertEqual(len(ids), len(set(ids)))
+        total = len(ids)
+        self.assertEqual(
+            sorted(ids),
+            sorted(part_document_id("sess-r1-2", i, total) for i in range(total)),
+        )
+
+    def test_queue_cap_is_still_respected_when_splitting(self):
+        content = _json_transcript(40, 20000)
+        original = pending.MAX_ENTRIES
+        pending.MAX_ENTRIES = 2
+        try:
+            pending.enqueue(self._payload(content), RuntimeError("boom"))
+        finally:
+            pending.MAX_ENTRIES = original
+        self.assertEqual(len(pending.iter_entries()), 2)
 
 
 class TestModuleIsPure(unittest.TestCase):

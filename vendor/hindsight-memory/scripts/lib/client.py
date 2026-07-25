@@ -5,6 +5,7 @@ Openclaw HindsightClient (client.js), adapted for Python stdlib.
 """
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -209,11 +210,33 @@ class HindsightClient:
         failing raises, exactly as an unsplit failure does, so the caller's
         existing enqueue/retry handling is unchanged; already-committed parts
         carry deterministic ids and are upserted, not duplicated, on retry.
+
+        ``timeout`` bounds the CALLER'S TOTAL WALL TIME, not just each HTTP
+        request. Splitting must never turn one bounded POST into N of them:
+        the Stop hook passes ``timeout=15`` because it has a hook budget to
+        respect, and ``15 × N`` would stall the session. Once the budget is
+        spent no further part is started and the call raises, so the caller's
+        existing enqueue path runs — and ``pending.enqueue`` queues the
+        remainder as bounded per-part entries the drainer can finish. The
+        parts already committed are upserted on that drain, not duplicated.
         """
         parts = split_retain_content(content)
         total = len(parts)
         response = None
+        deadline = time.monotonic() + timeout
+        part_timeout = timeout
         for index, part in enumerate(parts):
+            if index > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"retain wall budget of {timeout}s exhausted after "
+                        f"{index}/{total} parts; remainder is enqueued for the "
+                        f"drainer"
+                    )
+                # Clamp the request deadline to what is left of the budget so
+                # the final part cannot overrun it either.
+                part_timeout = max(1, int(remaining))
             response = self._retain_one(
                 bank_id=bank_id,
                 content=part,
@@ -221,7 +244,7 @@ class HindsightClient:
                 context=context,
                 metadata=part_metadata(metadata, index, total),
                 tags=tags,
-                timeout=timeout,
+                timeout=part_timeout,
                 async_processing=async_processing,
             )
         if total > 1 and isinstance(response, dict):
