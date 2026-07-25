@@ -129,15 +129,29 @@ obligation:
 `npm run lint:<name>` alias; see `package.json`):
 `check-plugin-references`, `check-bot-api-wrapping`,
 `check-bun-test-imports`, `check-no-pii-secrets`,
-`check-vault-test-hermeticity`, `check-no-broadcast-delivery`,
-`check-stale-tool-descriptions`, `check-web-subscription-honest`,
-`check-litellm-config-guard`.
+`check-vault-test-hermeticity`, `check-auth-test-hermeticity`,
+`check-no-broadcast-delivery`, `check-stale-tool-descriptions`,
+`check-web-subscription-honest`, `check-litellm-config-guard`.
 
 Traps that bite repeatedly:
 
 - **`check-no-pii-secrets` fails on real operator PII** — real Telegram
   chat/user IDs, emails, hostnames pasted into tests or docs. Use synthetic
   IDs and the repo's placeholder conventions.
+- **`check-auth-test-hermeticity` guards the auth-broker live-probe flake**
+  (#3612). `AuthBroker` force-probes accounts through `fetchQuota` (10s
+  default abort) inside request paths the broker harnesses deadline at 3s,
+  so an un-seamed broker in a unit test is a latency coin flip that reds CI
+  as `Error: rpc timeout` (#3609, #3613). `tests/vitest-setup/auth-net-guard.mjs`
+  (a `setupFiles` entry) replaces `globalThis.fetch` with a rejecting stub
+  for every vitest file that constructs an `AuthBroker` or calls
+  `fetchQuota` — so **`fetch` throwing `SWITCHROOM_AUTH_TEST_NET_GUARD` in
+  an auth test is the guard working, not a bug**. If your test needs a real
+  quota result, inject `_testFetchQuota` (broker) or `fetchImpl`
+  (`fetchQuota`). The lint fails if the wiring is removed or if a
+  fetchQuota-reachable file is vitest-`exclude`d (bun-run) where the setup
+  file cannot load; `src/auth/broker/net-hermeticity.test.ts` is the
+  matching runtime alarm.
 - **`gateway.ts` raw `bot.api` allowlist is file:line-keyed** — any insertion
   in `telegram-plugin/gateway/gateway.ts` shifts entries and fails
   `check-bot-api-wrapping` while tsc stays green. Run it locally and widen

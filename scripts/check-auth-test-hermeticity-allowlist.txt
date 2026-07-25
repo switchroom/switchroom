@@ -1,0 +1,16 @@
+# Allowlist for check-auth-test-hermeticity.mjs
+#
+# One repo-relative path per line. An entry belongs here only when a test
+# file CAN reach `fetchQuota` (it constructs an `AuthBroker` or calls the
+# probe) but is excluded from the vitest run — i.e. it runs under
+# `bun test`, where the vitest setup-file guard
+# (tests/vitest-setup/auth-net-guard.mjs) cannot load.
+#
+# Every entry is a live-network flake waiting to happen, so this list is
+# shrink-to-zero: prefer injecting the seam in the file itself
+# (`fetchQuota({ …, fetchImpl })` or
+# `new AuthBroker(cfg, { …, _testFetchQuota })`) over adding a line here.
+# If you must add one, put the justification in a `#` comment above it.
+#
+# Currently EMPTY — every reachable test file runs under vitest and is
+# covered by the guard. Keep it that way.

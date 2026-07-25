@@ -71,6 +71,17 @@ export default defineConfig({
     globals: true,
     environment: "node",
     reporters: ["default"],
+    // Hermeticity gate (#3612). `AuthBroker` force-probes candidate
+    // accounts through `fetchQuota` (10s default abort) inside request
+    // paths the broker harnesses deadline at 3s, so an un-seamed broker in
+    // a unit test is a pure-latency CI coin flip — it went red on main as
+    // `Error: rpc timeout` twice (#3609, #3613), each time fixed one file
+    // at a time. This setup file installs a rejecting `globalThis.fetch`
+    // for every test file that can reach `fetchQuota`, so the class cannot
+    // regrow one new test at a time. `npm run lint:auth-test-hermeticity`
+    // fails if this entry is removed or the guard stops covering a file
+    // that needs it.
+    setupFiles: ["./tests/vitest-setup/auth-net-guard.mjs"],
     pool: "forks",
     poolOptions: {
       forks: {
