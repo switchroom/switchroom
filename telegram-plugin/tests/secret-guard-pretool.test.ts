@@ -17,7 +17,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, unlinkSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, unlinkSync, existsSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createServer, type Server, type Socket } from 'node:net'
@@ -39,10 +39,18 @@ interface FakeBroker {
 function startFakeBroker(
   values: Record<string, string>,
   opts: {
-    /** Artificial per-request service delay, ms. Models the real broker's
-     *  round-trip cost so a sequential implementation is distinguishable
-     *  from a concurrent one by wall clock. */
+    /** Artificial per-request service delay, ms, implemented with
+     *  setTimeout. This models NETWORK/IO latency only — it does NOT occupy
+     *  the broker's event loop, so it makes client-side fan-out look like a
+     *  pure win. Use `cpuMs` for the honest model of the real broker. */
     delayMs?: number
+    /** Artificial per-request SYNCHRONOUS CPU cost, ms. This is what the
+     *  real broker actually does: every tokened request awaits a
+     *  `bcryptjs.compare` (src/vault/grants.ts, BCRYPT_COST=10), and
+     *  bcryptjs is pure JS that blocks the event loop — measured ~57ms per
+     *  compare, with 8 "concurrent" compares taking 459ms (fully
+     *  serialized). A busy-wait reproduces that; a setTimeout does not. */
+    cpuMs?: number
     /** Keys whose `get` should return DENIED instead of a value. */
     denyKeys?: string[]
     /** Keys whose `get` should never be answered at all (socket left open). */
@@ -53,6 +61,13 @@ function startFakeBroker(
     const dir = mkdtempSync(join(tmpdir(), 'fake-broker-'))
     const socketPath = join(dir, 'broker.sock')
     const delayMs = opts.delayMs ?? 0
+    const cpuMs = opts.cpuMs ?? 0
+    /** Block the event loop for `cpuMs`, the way bcryptjs.compare does. */
+    const burnCpu = () => {
+      if (cpuMs <= 0) return
+      const until = Date.now() + cpuMs
+      while (Date.now() < until) { /* deliberate busy-wait */ }
+    }
     const denyKeys = new Set(opts.denyKeys ?? [])
     const hangKeys = new Set(opts.hangKeys ?? [])
     let connectionCount = 0
@@ -75,6 +90,10 @@ function startFakeBroker(
             inFlightGets++
             if (inFlightGets > maxConcurrentGets) maxConcurrentGets = inFlightGets
           }
+          // The real broker awaits validateGrant -> bcryptjs.compare BEFORE
+          // it can reply, and that call blocks its single event loop. Burn
+          // here, synchronously, for the same reason and at the same point.
+          burnCpu()
           const reply = (obj: unknown) => {
             setTimeout(() => {
               if (isGet) inFlightGets--
@@ -122,9 +141,12 @@ function startFakeBroker(
 function runHook(opts: {
   toolInput: unknown
   brokerSocket?: string | null
+  /** Prepended to the child's PATH — used to plant a `switchroom` shim. */
+  pathPrefix?: string
 }): Promise<{ stdout: string; stderr: string; status: number; elapsedMs: number }> {
+  const basePath = process.env.PATH ?? ''
   const env: Record<string, string> = {
-    PATH: process.env.PATH ?? '',
+    PATH: opts.pathPrefix ? `${opts.pathPrefix}:${basePath}` : basePath,
     NODE_PATH: process.env.NODE_PATH ?? '',
     HOME: process.env.HOME ?? '',
   }
@@ -148,6 +170,47 @@ function runHook(opts: {
     })
     child.stdin.end(stdinJson)
   })
+}
+
+/**
+ * Plant an executable `switchroom` on a fresh directory that records every
+ * invocation by touching a sentinel file, then returns a plausible-looking
+ * success so a forking implementation would appear to work (and therefore
+ * would NOT be caught by the block/allow assertions alone).
+ *
+ * Returns the directory to prepend to PATH and the sentinel path.
+ */
+function plantSwitchroomShim(): { dir: string; sentinel: string } {
+  // NOT under os.tmpdir(): /tmp is mounted `noexec` in the agent containers
+  // this suite runs in (verified 2026-07-25 — `findmnt -no OPTIONS /tmp` =>
+  // `rw,nosuid,nodev,noexec`). A shim planted there is silently unrunnable,
+  // which would make the no-fork assertion below vacuously true — the exact
+  // class of bug this test exists to close. Plant it beside the test file,
+  // on the repo filesystem, which is executable.
+  const dir = mkdtempSync(join(__dirname, '.shim-'))
+  const sentinel = join(dir, 'FORKED')
+  const shim = join(dir, 'switchroom')
+  writeFileSync(shim, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sentinel}"\nexit 0\n`)
+  chmodSync(shim, 0o755)
+
+  // Self-check: prove the shim is REACHABLE and RECORDS, so "sentinel
+  // absent" can only ever mean "the hook did not fork" — never "the shim
+  // could not run". Without this the test can go vacuous again the moment
+  // it runs on a noexec mount.
+  const probe = spawnSync('switchroom', ['self-check'], {
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` },
+  })
+  if (probe.status !== 0 || !existsSync(sentinel)) {
+    rmSync(dir, { recursive: true, force: true })
+    throw new Error(
+      `no-fork shim is not executable (status=${probe.status}, `
+      + `error=${probe.error?.message ?? 'none'}) — the no-fork assertion `
+      + `would be vacuous. Fix the shim location, do not skip this test.`,
+    )
+  }
+  unlinkSync(sentinel)
+
+  return { dir, sentinel }
 }
 
 let broker: FakeBroker | null = null
@@ -216,10 +279,17 @@ describe('secret-guard-pretool.mjs (broker-direct)', () => {
   })
 
   it('total cost is ~2 round trips, not 1 + N (#3543)', async () => {
-    // 8 keys at a 40ms service delay. Sequential => >= 9 * 40 = 360ms of
-    // broker time. Concurrent => ~2 * 40 = 80ms. The 250ms ceiling sits far
-    // below the sequential floor and far above the concurrent cost plus
-    // node startup, so it discriminates the two without being flaky.
+    // Deliberately NOT a wall-clock assertion. The earlier version of this
+    // test asserted elapsedMs < 250; measured node cold start for this hook
+    // is 104-127ms on an idle box and this suite runs under `bun test` on a
+    // 2-vCPU CI runner alongside the rest of telegram-plugin/tests, so a
+    // 250ms ceiling had ~65ms of headroom and would have flaked (#3574
+    // review F3).
+    //
+    // `maxConcurrentGets` is the timing-INDEPENDENT discriminator for the
+    // same property: the sequential 1 + N implementation could never exceed
+    // 1 in flight no matter how fast or slow the box is, while the fan-out
+    // has all 8 outstanding at once. Same guarantee, zero clock dependence.
     const values: Record<string, string> = {}
     for (let i = 0; i < 8; i++) values['k' + i] = `secret-value-number-${i}-xxxxxxxx`
     broker = await startFakeBroker(values, { delayMs: 40 })
@@ -228,27 +298,156 @@ describe('secret-guard-pretool.mjs (broker-direct)', () => {
       brokerSocket: broker.socketPath,
     })
     expect(r.status).toBe(0)
-    expect(r.elapsedMs).toBeLessThan(250)
+    expect(broker.maxConcurrentGets).toBe(8)
+    // 1 list + 8 gets, one request per connection.
+    expect(broker.connectionCount).toBe(9)
   })
 
-  it('does not fork a child process per key', async () => {
-    // The generation-1 shape forked `switchroom vault get` per key. The
-    // broker must see exactly one connection per request turn and the hook
-    // must speak the socket itself — so connections are bounded by 1 + N,
-    // and no `switchroom` binary is required on PATH at all (the env we
-    // hand the child has no SWITCHROOM_CLI_PATH).
-    broker = await startFakeBroker({
-      'a': 'aaaaaaaa-secret-value-aaaaaaaa',
-      'b': 'bbbbbbbb-secret-value-bbbbbbbb',
-      'c': 'cccccccc-secret-value-cccccccc',
-    })
-    await runHook({
+  it('client fan-out does NOT reduce wall time against a CPU-bound broker (#3574)', async () => {
+    // The honest counterpart to the test above. The `delayMs` fake sleeps,
+    // so it credits the fan-out with a speedup that CANNOT exist against
+    // the real broker, whose per-request cost is a synchronous, event-loop-
+    // blocking `bcryptjs.compare` inside validateGrant. `cpuMs` reproduces
+    // that.
+    //
+    // Asserted property: with a CPU-bound broker the client's concurrency
+    // is irrelevant to wall time — total cost is still ~(N+1) × cpuMs,
+    // i.e. STRICTLY MORE than the serialized floor. This is a lower bound
+    // (>=), so it cannot flake upward on a loaded runner; it fails only if
+    // someone re-introduces the false "concurrency makes it O(1)" model.
+    // This is a DIFFERENTIAL, not an absolute budget, for the reason F3
+    // flagged: an absolute wall-clock ceiling has to leave room for node
+    // cold start (measured 104-127ms for this hook on an idle box) and
+    // flakes on a loaded CI runner. Running the SAME hook against both
+    // broker models subtracts node startup and every other fixed cost
+    // automatically — the baseline is measured, not assumed.
+    //
+    //   sleeping broker (delayMs): fan-out wins   => ~startup + 2 × COST
+    //   CPU-bound broker (cpuMs):  fan-out cannot => ~startup + (N+1) × COST
+    //
+    // so the gap should be ~(N-1) × COST = 160ms. We assert only that it
+    // exceeds 2 × COST (80ms): if concurrency helped a CPU-bound broker the
+    // way it helps a sleeping one, the gap would be ~0. Load inflates both
+    // runs, so the LOWER bound on a difference is what stays stable.
+    const N = 5
+    const COST_MS = 40
+    const values: Record<string, string> = {}
+    for (let i = 0; i < N; i++) values['c' + i] = `cpu-secret-value-${i}-xxxxxxxx`
+
+    const sleepy = await startFakeBroker(values, { delayMs: COST_MS })
+    let sleepyMs: number
+    try {
+      const rs = await runHook({ toolInput: { command: 'echo hi' }, brokerSocket: sleepy.socketPath })
+      expect(rs.status).toBe(0)
+      sleepyMs = rs.elapsedMs
+    } finally {
+      await sleepy.stop()
+    }
+
+    broker = await startFakeBroker(values, { cpuMs: COST_MS })
+    const r = await runHook({
       toolInput: { command: 'echo hi' },
       brokerSocket: broker.socketPath,
     })
-    // 1 list + 3 gets, one request per connection (the shape the broker
-    // protocol documents; see protocol.ts:8-11).
-    expect(broker.connectionCount).toBe(4)
+    expect(r.status).toBe(0)
+    expect(r.elapsedMs - sleepyMs).toBeGreaterThan(2 * COST_MS)
+    // And the guard must still be COMPLETE despite that cost: every key
+    // resolved within the deadline, including the last. Partial coverage is
+    // the security failure mode this whole area is about.
+    expect(broker.connectionCount).toBe(N + 1)
+    expect(r.stderr).not.toContain('DEGRADED')
+  }, 20_000)
+
+  it('caps the fan-out at MAX_CONCURRENT_GETS and still guards every key past the cap', async () => {
+    // Two properties the fan-out owes us on a vault larger than the cap
+    // (MAX_CONCURRENT_GETS = 32), both timing-independent:
+    //   1. the cap is real — 40 keys must never put more than 32 gets in
+    //      flight (an unbounded fan-out would show 40);
+    //   2. the batch loop drains the remainder — key #40, which can only be
+    //      fetched in the second batch, is still guarded.
+    const values: Record<string, string> = {}
+    for (let i = 0; i < 40; i++) values['k' + i] = `secret-value-number-${i}-xxxxxxxxxx`
+    broker = await startFakeBroker(values, { delayMs: 40 })
+    const r = await runHook({
+      // k39 is the 40th key — past the first batch of 32.
+      toolInput: { command: 'echo secret-value-number-39-xxxxxxxxxx' },
+      brokerSocket: broker.socketPath,
+    })
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('"decision":"block"')
+    expect(r.stdout).toContain('k39')
+    expect(broker.maxConcurrentGets).toBeLessThanOrEqual(32)
+    expect(broker.maxConcurrentGets).toBeGreaterThan(1)
+    expect(broker.connectionCount).toBe(41)
+  }, 10_000)
+
+  it('does not fork a child process per key', async () => {
+    // The generation-1 shape forked `switchroom vault get` per key. Asserting
+    // a connection COUNT cannot prove that — a fork-per-key implementation
+    // produces the same 1 + N connections, because each forked CLI opens its
+    // own (#3574 review F2). So plant an executable `switchroom` on PATH that
+    // records every invocation and assert it was never invoked.
+    const { dir, sentinel } = plantSwitchroomShim()
+    try {
+      broker = await startFakeBroker({
+        'a': 'aaaaaaaa-secret-value-aaaaaaaa',
+        'b': 'bbbbbbbb-secret-value-bbbbbbbb',
+        'c': 'cccccccc-secret-value-cccccccc',
+      })
+      await runHook({
+        toolInput: { command: 'echo hi' },
+        brokerSocket: broker.socketPath,
+        pathPrefix: dir,
+      })
+      // The shim is genuinely reachable and would have fired — the hook
+      // simply never shells out. (It exits 0 with plausible output, so a
+      // forking implementation would still allow/block correctly and could
+      // only be caught here.)
+      expect(existsSync(sentinel)).toBe(false)
+      // Secondary: the hook speaks the socket itself, one request per
+      // connection turn (the shape protocol.ts:8-11 documents).
+      expect(broker.connectionCount).toBe(4)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('logs a DEGRADED line when a `get` gets no broker response (#3574)', async () => {
+    // The fan-out silently drops any key whose `get` never returns, and a
+    // dropped key is an unguarded secret. That is exactly what a broker
+    // connection cap would cause (this hook needs N+1 connections where the
+    // sequential version needed 1). Prose in a comment can't catch it, so
+    // the hook must leave a deterministic trace on stderr.
+    broker = await startFakeBroker({
+      'hung-key': 'hung-secret-value-aaaaaaaa',
+      'live-key': 'live-secret-value-bbbbbbbb',
+    }, { hangKeys: ['hung-key'] })
+    const r = await runHook({
+      toolInput: { command: 'echo hi' },
+      brokerSocket: broker.socketPath,
+    })
+    expect(r.status).toBe(0)
+    expect(r.stderr).toContain('DEGRADED')
+    expect(r.stderr).toContain('1/2')
+    // Decision channel stays clean — the warning must not leak to stdout,
+    // where Claude Code parses the block decision.
+    expect(r.stdout).toBe('')
+  }, 10_000)
+
+  it('does not log DEGRADED when every key resolves', async () => {
+    // Guards the inverse: a DENIED reply is a broker ANSWER, not an
+    // unreachable connection, so it must not raise the degradation signal
+    // (otherwise the line is noise and gets ignored).
+    broker = await startFakeBroker({
+      'denied-key': 'denied-secret-value-aaaaaaaa',
+      'live-key': 'live-secret-value-bbbbbbbb',
+    }, { denyKeys: ['denied-key'] })
+    const r = await runHook({
+      toolInput: { command: 'echo hi' },
+      brokerSocket: broker.socketPath,
+    })
+    expect(r.status).toBe(0)
+    expect(r.stderr).not.toContain('DEGRADED')
   })
 
   it('still blocks on the other keys when one key is DENIED', async () => {

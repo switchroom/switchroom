@@ -24,8 +24,38 @@
  *   below are measured, not assumed.
  *
  *   Generation 3 (this one) keeps the same two logical phases but fans the
- *   `get` phase out CONCURRENTLY, one request per connection, so wall time
- *   is ~2 round trips regardless of key count instead of 1 + N.
+ *   `get` phase out CONCURRENTLY, one request per connection, so the CLIENT
+ *   issues ~2 round trips' worth of requests instead of 1 + N serialized
+ *   ones.
+ *
+ *   ⚠ READ THIS BEFORE QUOTING A NUMBER. Client concurrency is NOT the
+ *   whole cost, and an earlier draft of this header claimed "~2 round trips
+ *   regardless of key count" — which was false against the real broker, for
+ *   the same reason generation 2's "sub-10ms" claim was false. Whenever the
+ *   request carries a token (which is ALWAYS, in an agent container:
+ *   readVaultToken() below always finds `.vault-token`), the broker runs
+ *   `validateGrant` per request — `list` at src/vault/broker/server.ts:1105
+ *   and every `get` at :1284 — and that awaits a `bcryptjs.compare`
+ *   (src/vault/grants.ts, BCRYPT_COST=10). bcryptjs is pure JS and BLOCKS
+ *   the broker's single event loop: measured 2026-07-25, one compare is
+ *   ~57ms on the fleet host and 8 "concurrent" compares took 459ms — fully
+ *   serialized. The broker is shared by every agent, so N keys cost the
+ *   broker (N+1) × compare of serialized CPU that no amount of client
+ *   fan-out can shorten.
+ *
+ *   That is why #3574 also added an exact positive-result memo for the
+ *   bcrypt comparison in src/vault/grants.ts (revocation/expiry/key_allow
+ *   are still read live from SQLite on every call — only the immutable
+ *   "does this secret hash to this digest" fact is memoized). With it, the
+ *   per-request broker CPU collapses to a Map lookup after the first
+ *   request and the fan-out delivers what it promises. Without it, this
+ *   hook's real cost is dominated by broker CPU, not by round trips.
+ *
+ *   The failure mode when broker CPU DOES saturate is a security
+ *   degradation, not a hang: on deadline expiry we keep whatever arrived
+ *   and scan a PARTIAL key set, so a secret can be guarded on one tool call
+ *   and unguarded on the next. `warnOnUnreachableGets` below exists so that
+ *   can never happen silently.
  *
  *   Why one request per connection rather than pipelining N gets down the
  *   single connection: the broker dispatches each line to an async handler
@@ -44,8 +74,11 @@
  *   go unguarded for the cache lifetime — i.e. it would make the guard fail
  *   open in a case where it currently blocks. Rejected on those grounds.
  *
- *   Measured (fake broker, 6 keys, 19ms service delay, median of 5):
- *     sequential  167.7ms  →  concurrent  ~59ms.
+ *   Measured client-side only (fake broker with an ASYNC 19ms service delay,
+ *   6 keys, median of 5): sequential 167.7ms → concurrent ~59ms. Treat this
+ *   as an upper bound on what the fan-out alone buys — a fake broker that
+ *   sleeps does not model the real broker's synchronous bcrypt CPU. See the
+ *   CPU-bound fake-broker test in the sibling test file.
  *
  *   When the broker is unreachable (not running, socket missing, denied)
  *   the hook fails open — same behavior as before. Vault security is owned
@@ -70,6 +103,26 @@ const MIN_VALUE_LENGTH_TO_GUARD = 8
  * fan-out on a large vault would open one unix socket per key at once. 32
  * keeps a typical vault (single digits to low tens of keys) at a single
  * round trip while capping the worst case at ceil(N/32) rounds.
+ *
+ * ⚠ COUPLING — this hook now needs up to MAX_CONCURRENT_GETS + 1 broker
+ * connections where generation 2 needed exactly ONE. That makes the guard
+ * sensitive to a limit the broker does not currently impose. Verified as of
+ * 2026-07-25: src/vault/broker/server.ts sets no `maxConnections`, no rate
+ * limit and no per-connection mutex, `validateGrant` is a read-only SQLite
+ * lookup, and the socket is bind-mounted into agent containers with no
+ * relay in between — so nothing caps us today.
+ *
+ * But if a future operator adds DoS hardening (server.maxConnections, a
+ * connection rate limiter, an inetd-style relay), the surplus `get`
+ * connections would be refused, `brokerRequest` would resolve null for
+ * those keys, and a tool call carrying one of their secrets would turn
+ * from BLOCK into a silent allow. Reproduced against a 1-connection and a
+ * 3-connection fake broker: old = BLOCK, new = allow.
+ *
+ * The deterministic guard for that is `warnOnUnreachableGets` below — a
+ * connection cap can no longer degrade the guard silently; it always
+ * leaves a line on stderr (captured by bin/run-hook.sh). If you ever cap
+ * broker connections, lower MAX_CONCURRENT_GETS below that cap.
  */
 const MAX_CONCURRENT_GETS = 32
 
@@ -217,6 +270,11 @@ async function loadVaultValuesViaBroker() {
 
   // 2. fetch every value concurrently — one round trip regardless of N
   //    (up to MAX_CONCURRENT_GETS in flight).
+  //    `unreachable` counts keys whose `get` produced NO response at all
+  //    (connect refused, socket error, deadline) as opposed to a broker
+  //    reply of DENIED/UNKNOWN_KEY. That distinction is the connection-cap
+  //    signal — see the MAX_CONCURRENT_GETS note above.
+  let unreachable = 0
   const fetched = await mapWithConcurrency(
     listRsp.keys,
     MAX_CONCURRENT_GETS,
@@ -225,6 +283,7 @@ async function loadVaultValuesViaBroker() {
         token ? { v: 1, op: 'get', key: k, token } : { v: 1, op: 'get', key: k },
         deadline,
       )
+      if (getRsp === null) unreachable++
       if (!getRsp || getRsp.ok !== true || !getRsp.entry) return null
       // Only string-kind entries are scannable haystack candidates;
       // binary/files entries can't be substring-matched against a
@@ -238,7 +297,38 @@ async function loadVaultValuesViaBroker() {
     },
   )
 
+  warnOnUnreachableGets(unreachable, listRsp.keys.length)
+
   return fetched.filter((v) => v !== null)
+}
+
+/**
+ * Deterministic degradation signal (#3574 review).
+ *
+ * The fan-out silently drops any key whose `get` never came back, and a
+ * dropped key is an UNGUARDED secret — exactly the failure a broker
+ * connection cap would produce. Prose in a comment cannot catch that at
+ * runtime, so emit one line on stderr instead. bin/run-hook.sh captures
+ * hook stderr, so `grep secret-guard ...` answers "is the guard degraded?"
+ * without anyone having to reason about connection budgets.
+ *
+ * One aggregate line, not one per key: bounded output regardless of vault
+ * size. stderr only — stdout is the hook's decision channel and must stay
+ * empty on allow.
+ */
+function warnOnUnreachableGets(unreachable, total) {
+  if (unreachable <= 0) return
+  try {
+    process.stderr.write(
+      `secret-guard-pretool: DEGRADED — ${unreachable}/${total} vault `
+      + `key(s) unresolved within the ${BROKER_TIMEOUT_MS}ms deadline `
+      + `(no broker response: deadline expired, connection refused, or `
+      + `socket error). Those secrets are NOT guarded for this tool call. `
+      + `Likely causes: broker CPU saturation (per-request bcrypt in `
+      + `validateGrant), or a broker connection cap below `
+      + `MAX_CONCURRENT_GETS (currently ${MAX_CONCURRENT_GETS}).\n`,
+    )
+  } catch { /* stderr closed — never let logging change the decision */ }
 }
 
 // ─── Scan ─────────────────────────────────────────────────────────────────
