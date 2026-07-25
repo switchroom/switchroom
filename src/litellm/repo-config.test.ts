@@ -152,11 +152,21 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
 
   it("declares the proxy image on exactly one non-comment line shaped <image>:<tag>", () => {
     expect(imagePinLines).toHaveLength(1);
-    expect(imagePinLines[0]).toMatch(/^[\w.\-/]+:[\w.\-]+$/);
-    // Floating tags defeat the pin.
-    expect(imagePinLines[0].endsWith(":latest")).toBe(false);
-    expect(imagePinLines[0].endsWith(":main-latest")).toBe(false);
-    expect(imagePinLines[0].endsWith(":main-stable")).toBe(false);
+    // The shape permits `@sha256:<64 hex>` because a digest is the STRONGEST
+    // pin, and the coupling test below explicitly blesses one. Three forms are
+    // legal: `<image>:<tag>`, `<image>@sha256:<digest>`, and the belt-and-braces
+    // `<image>:<tag>@sha256:<digest>` this repo ships (the tag matches the host
+    // compose line verbatim; the digest makes it immutable). A bare `<image>`
+    // with neither tag nor digest stays rejected.
+    expect(imagePinLines[0]).toMatch(
+      /^[\w.\-/]+(?::[\w.\-]+(?:@sha256:[0-9a-f]{64})?|@sha256:[0-9a-f]{64})$/,
+    );
+    // Floating tags defeat the pin — checked against the TAG portion, so a
+    // floating tag is still caught when digest-qualified (`:latest@sha256:…`).
+    const tagPart = imagePinLines[0].split("@")[0];
+    expect(tagPart.endsWith(":latest")).toBe(false);
+    expect(tagPart.endsWith(":main-latest")).toBe(false);
+    expect(tagPart.endsWith(":main-stable")).toBe(false);
   });
 
   // The shape check above deliberately does NOT prove the pin is real: the
@@ -182,11 +192,5 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
       // A real pin must be immutable-ish: a digest, or a tag with a version.
       expect(imagePinLines[0]).toMatch(/(@sha256:[0-9a-f]{64}|:\S*\d)/);
     }
-  });
-
-  it("is not yet a verified pin (KEN-125 follow-up: operator must supply the live tag)", () => {
-    // Documents the KNOWN, disclosed gap rather than pretending it is closed.
-    // Delete this test in the PR that lands the real tag.
-    expect(imagePinLines[0]).toContain(PLACEHOLDER_TAG);
   });
 });
