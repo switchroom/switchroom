@@ -199,6 +199,57 @@ class DedupeTest(_QueueTempDirMixin, unittest.TestCase):
         pending.enqueue(_payload(content="two", doc="d1"), RuntimeError("x"))
         self.assertEqual(pending.count(), 2)
 
+    def test_dedupe_survives_an_attempted_entry(self):
+        """The scenario the guard exists for, and the one it used to miss.
+
+        The queued copy is ALWAYS post-``update_attempt`` by the time
+        ``reconcile_tail`` re-enqueues, because the SessionStart drain
+        attempts every entry on every boot. A size-indexed dedupe therefore
+        matched nothing in steady state and the queue grew by one duplicate
+        per boot.
+        """
+        first = pending.enqueue(_payload(content="same", doc="d1"), RuntimeError("x"))
+        _, entry = pending.iter_entries()[0]
+        pending.update_attempt(first, entry, TimeoutError("upstream timed out"))
+        self.assertNotEqual(
+            os.path.getsize(first),
+            len(json.dumps(entry, ensure_ascii=False).encode("utf-8")) - 1,
+        )
+
+        again = pending.enqueue(_payload(content="same", doc="d1"), RuntimeError("x"))
+        self.assertEqual(again, first, "attempted entry must still dedupe")
+        self.assertEqual(pending.count(), 1)
+
+    def test_dedupe_survives_a_different_error_message(self):
+        """The error string is not part of the memory's identity."""
+        a = pending.enqueue(_payload(content="same", doc="d1"), RuntimeError("short"))
+        b = pending.enqueue(
+            _payload(content="same", doc="d1"), ConnectionError("a much longer error")
+        )
+        self.assertEqual(a, b)
+        self.assertEqual(pending.count(), 1)
+
+    def test_dedupe_reads_no_files(self):
+        """The key is in the filename, so a lookup is a listing scan only."""
+        pending.enqueue(_payload(content="same", doc="d1"), RuntimeError("x"))
+        real_open = open
+        queue_dir = self._dir.rstrip("/")
+
+        def no_entry_reads(path, *a, **kw):
+            if os.path.dirname(str(path)) == queue_dir:
+                raise AssertionError(f"dedupe opened a queue entry: {path}")
+            return real_open(path, *a, **kw)
+
+        with unittest.mock.patch("builtins.open", no_entry_reads):
+            self.assertIsNotNone(pending._find_duplicate(self._dir, pending._dupe_key(
+                {"bank_id": "bank-a", "document_id": "d1", "content": "same"}
+            )))
+
+    def test_different_banks_do_not_collide(self):
+        pending.enqueue(_payload(bank="bank-a", content="same"), RuntimeError("x"))
+        pending.enqueue(_payload(bank="bank-b", content="same"), RuntimeError("x"))
+        self.assertEqual(pending.count(), 2)
+
     def test_entry_without_document_id_is_always_kept(self):
         """No document_id => identity cannot be established => never merge."""
         p = _payload()
@@ -275,6 +326,62 @@ class DropLedgerTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertLessEqual(len(stored), pending.MAX_ERROR_MESSAGE_CHARS + 20)
         self.assertTrue(stored.endswith("[truncated]"))
 
+    def test_oversized_entry_is_refused_without_wiping_the_queue(self):
+        """One entry must never cost the whole queue.
+
+        With no guard the eviction loop can never satisfy its condition, so
+        it evicts EVERY entry and writes the oversized one anyway -- and
+        the bounded archive then discards most of what it just shed.
+        """
+        pending.MAX_BYTES = 100_000
+        for i in range(20):
+            pending.enqueue(_payload(content=f"turn-{i}", doc=f"d{i}"), RuntimeError("x"))
+        self.assertEqual(pending.count(), 20)
+
+        with redirect_stderr(io.StringIO()) as err:
+            got = pending.enqueue(
+                _payload(content="z" * 200_000, doc="huge"), RuntimeError("x")
+            )
+
+        self.assertIsNone(got, "the oversized entry is refused")
+        self.assertEqual(pending.count(), 20, "every other entry survived")
+        self.assertIn("larger than the whole", err.getvalue())
+        self.assertEqual(pending.read_drops()["count"], 1)
+
+    def test_corrupt_entry_is_quarantined_not_skipped_forever(self):
+        """A skipped corrupt entry is immortal: never reconciled, never
+        drained, never aged to .dead, but still counted in the depth."""
+        good = pending.enqueue(_payload(), RuntimeError("x"))
+        bad = os.path.join(self._dir, "1700000000000-deadbeefdead.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("{ not json at all")
+
+        with redirect_stderr(io.StringIO()) as err:
+            entries = pending.iter_entries()
+
+        self.assertEqual([p for p, _ in entries], [good])
+        self.assertFalse(os.path.exists(bad), "no longer occupying a queue slot")
+        self.assertEqual(pending.count(), 1, "no longer inflating the depth")
+        self.assertIn("quarantined", err.getvalue())
+        quarantined = os.path.join(
+            os.path.dirname(self._dir.rstrip("/")), "pending-corrupt"
+        )
+        self.assertEqual(os.listdir(quarantined), [os.path.basename(bad)])
+
+    def test_transient_read_error_is_skipped_not_quarantined(self):
+        """An OSError is not evidence the payload is bad."""
+        pending.enqueue(_payload(), RuntimeError("x"))
+        real_open = open
+
+        def flaky(path, *a, **kw):
+            if str(path).endswith(".json"):
+                raise OSError(11, "Resource temporarily unavailable")
+            return real_open(path, *a, **kw)
+
+        with unittest.mock.patch("builtins.open", flaky):
+            self.assertEqual(pending.iter_entries(), [])
+        self.assertEqual(pending.count(), 1, "entry left intact for the next pass")
+
     def test_healthy_enqueue_writes_no_drop_ledger(self):
         self.assertIsNotNone(pending.enqueue(_payload(), RuntimeError("x")))
         self.assertEqual(pending.read_drops(), {})
@@ -305,10 +412,73 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
             _t.sleep(0.5)
 
         with unittest.mock.patch.object(drain_pending, "_retry_one", slow_ok):
-            summary = drain_pending.drain(CONFIG)
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: False
+            ):
+                summary = drain_pending.drain(CONFIG)
 
         self.assertTrue(summary["budget_exceeded"])
         self.assertLess(summary["drained"], 20)
+        self.assertGreater(pending.count(), 0)
+
+    # The path that ACTUALLY runs on every boot is the sequential drain, not
+    # --backlog. Fixing the re-post loop only in the operator-invoked mode
+    # would change nothing operationally: every agent boot would go on
+    # re-POSTing its already-durable backlog exactly as before.
+    def test_session_start_drain_reconciles_before_re_posting(self):
+        self._queue(6)
+        posted = []
+        durable = {"doc-0", "doc-1", "doc-2", "doc-3"}
+
+        def exists(entry, timeout=30):
+            return entry["document_id"] in durable
+
+        with unittest.mock.patch.object(drain_pending, "_document_state", exists):
+            with unittest.mock.patch.object(
+                drain_pending, "_retry_one", lambda e, timeout: posted.append(e["document_id"])
+            ):
+                summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["reconciled"], 4)
+        self.assertEqual(
+            sorted(posted),
+            ["doc-4", "doc-5"],
+            "already-durable entries must not be re-POSTed inside the hook",
+        )
+        self.assertEqual(pending.count(), 0)
+
+    def test_session_start_reconcile_never_deletes_on_an_unknown_result(self):
+        """Unknown must fall through to the retry, never to a delete."""
+        self._queue(3)
+        posted = []
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: None
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_retry_one", lambda e, timeout: posted.append(e)
+            ):
+                summary = drain_pending.drain(CONFIG)
+        self.assertEqual(summary["reconciled"], 0)
+        self.assertEqual(len(posted), 3, "unknown falls through to the retry")
+
+    def test_session_start_reconcile_respects_the_hook_budget(self):
+        """The GET replaces the POST; it must not be an extra unbounded call."""
+        self._queue(10)
+        os.environ["HINDSIGHT_DRAIN_BUDGET_S"] = "2"
+        seen = []
+
+        def slow_get(entry, timeout=30):
+            import time as _t
+
+            seen.append(timeout)
+            _t.sleep(0.5)
+            return True
+
+        with unittest.mock.patch.object(drain_pending, "_document_state", slow_get):
+            summary = drain_pending.drain(CONFIG)
+
+        self.assertTrue(summary["budget_exceeded"])
+        self.assertTrue(all(t <= 5 for t in seen), f"timeout not clamped: {seen}")
         self.assertGreater(pending.count(), 0)
 
     def test_reconcile_phase_skips_already_durable_entries_without_posting(self):
@@ -324,7 +494,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
 
         with unittest.mock.patch.object(drain_pending, "_document_state", exists):
             with unittest.mock.patch.object(
-                drain_pending, "_retry_one", lambda e, t: posted.append(e)
+                drain_pending, "_retry_one", lambda e, timeout: posted.append(e)
             ):
                 with redirect_stderr(io.StringIO()):
                     summary = drain_pending.drain_backlog(CONFIG, phase="reconcile")
@@ -348,7 +518,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
     def test_drain_confirms_the_document_before_deleting_the_entry(self):
         """Commit-before-delete: a 200 is an ack, not proof (#3244)."""
         self._queue(2)
-        with unittest.mock.patch.object(drain_pending, "_retry_one", lambda e, t: None):
+        with unittest.mock.patch.object(drain_pending, "_retry_one", lambda e, timeout: None):
             # POST succeeds, but the document is still not there.
             with unittest.mock.patch.object(
                 drain_pending, "_document_state", lambda e, timeout=30: False
@@ -362,7 +532,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
 
     def test_drain_deletes_once_the_document_is_confirmed(self):
         self._queue(5)
-        with unittest.mock.patch.object(drain_pending, "_retry_one", lambda e, t: None):
+        with unittest.mock.patch.object(drain_pending, "_retry_one", lambda e, timeout: None):
             with unittest.mock.patch.object(
                 drain_pending, "_document_state", lambda e, timeout=30: True
             ):
@@ -389,7 +559,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         os.environ["HINDSIGHT_DRAIN_BACKLOG_TIMEOUT"] = "90"
         seen = []
         with unittest.mock.patch.object(
-            drain_pending, "_retry_one", lambda e, t: seen.append(t)
+            drain_pending, "_retry_one", lambda e, timeout: seen.append(timeout)
         ):
             with unittest.mock.patch.object(
                 drain_pending, "_document_state", lambda e, timeout=30: True
@@ -410,7 +580,7 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         ):
             with unittest.mock.patch.object(drain_pending.time, "sleep", slept.append):
                 with unittest.mock.patch.object(
-                    drain_pending, "_retry_one", lambda e, t: None
+                    drain_pending, "_retry_one", lambda e, timeout: None
                 ):
                     with unittest.mock.patch.object(
                         drain_pending, "_document_state", lambda e, timeout=30: True
@@ -421,6 +591,31 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(slept.count(120), 2, "backed off until p95 recovered")
         self.assertIn("BACKOFF", err.getvalue())
         self.assertEqual(summary["drained"], 1)
+
+    def test_p95_backoff_is_bounded_by_the_drain_budget(self):
+        """A persistently slow upstream must not block past the budget.
+
+        An unbounded `while True: sleep(120)` would run indefinitely, past
+        the one guarantee this mode makes about how long it will run.
+        """
+        self._queue(2)
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_BUDGET_S"] = "60"
+        slept = []
+
+        with unittest.mock.patch.object(
+            drain_pending, "_p95_probe_ms", lambda: 99000
+        ):
+            with unittest.mock.patch.object(drain_pending.time, "sleep", slept.append):
+                with unittest.mock.patch.object(
+                    drain_pending, "_retry_one", lambda e, timeout: None
+                ):
+                    with redirect_stderr(io.StringIO()) as err:
+                        summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+
+        self.assertEqual(slept, [], "60s budget cannot absorb a 120s pause")
+        self.assertTrue(summary["budget_exceeded"])
+        self.assertIn("budget is exhausted", err.getvalue())
+        self.assertEqual(pending.count(), 2, "entries stay queued")
 
     def test_absent_p95_probe_does_not_block(self):
         os.environ.pop("HINDSIGHT_DRAIN_P95_CMD", None)

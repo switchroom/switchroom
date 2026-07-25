@@ -186,6 +186,32 @@ describe("checkPendingRetainsQueues (#1071/#1094)", () => {
     expect(r.fix).toContain("HINDSIGHT_PENDING_MAX_ENTRIES");
   });
 
+  // Eviction is DESIGNED behaviour here and the ledger is append-only, so a
+  // cumulative count would pin this row to fail forever after one legitimate
+  // eviction. A check that trains operators to ignore it is worse than none.
+  it("the eviction count is windowed, and says so", () => {
+    const r = checkPendingRetainsQueues(cfg(["marko"]), {
+      probe: probeFrom({ marko: { ...ok(), evicted: 5 } }),
+    });
+    expect(r.detail).toMatch(/in the last \d+d/);
+    expect(r.fix).toMatch(/clears on its own/i);
+    // …and must NOT tell the operator to delete the record of what was shed.
+    expect(r.fix).not.toMatch(/reset it by deleting/i);
+  });
+
+  // "Set HINDSIGHT_DRAIN_P95_CMD" without a command is unactionable — the
+  // operator has to go find the query the watchdog uses.
+  it("warn: the p95 guidance ships a copy-pasteable command", () => {
+    const r = checkPendingRetainsQueues(cfg(["ziggy"]), {
+      probe: probeFrom({ ziggy: backlog(400) }),
+    });
+    const fix = r.fix ?? "";
+    expect(fix).toContain("HINDSIGHT_DRAIN_P95_CMD");
+    expect(fix).toContain("percentile_cont(0.95)");
+    expect(fix).toContain("LiteLLM_SpendLogs");
+    expect(fix).toMatch(/millisecond integer on stdout/);
+  });
+
   it("ok: zero drops and zero evictions never mention either", () => {
     const r = checkPendingRetainsQueues(cfg(["clerk"]), {
       probe: probeFrom({ clerk: ok() }),

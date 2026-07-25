@@ -67,17 +67,26 @@ class PendingQueueTest(unittest.TestCase):
         self.assertIn("failed_at", entry)
         self.assertEqual(entry["schema"], pending_mod.SCHEMA)
 
-    def test_enqueue_filename_is_unix_ms_uuid(self):
+    def test_enqueue_filename_is_unix_ms_key_uuid(self):
+        """``<unix-ms>-<dupe-key>-<uuid>.json`` (switchroom #3596).
+
+        The dedupe key moved INTO the name so a duplicate lookup is a
+        listing prefix match with zero file reads. The leading millisecond
+        timestamp is unchanged, so the lexicographic sort in
+        ``_list_entries`` is still oldest-first.
+        """
         path = pending_mod.enqueue(self._sample_payload(), RuntimeError("boom"))
         name = os.path.basename(path)
         self.assertTrue(name.endswith(".json"))
         head = name[: -len(".json")]
-        ts_part, uuid_part = head.split("-", 1)
+        ts_part, key_part, uuid_part = head.split("-")
         self.assertTrue(ts_part.isdigit())
         # Filename ts should be within 10 s of now
         now_ms = int(time.time() * 1000)
         self.assertLess(abs(now_ms - int(ts_part)), 10_000)
         self.assertEqual(len(uuid_part), 12)
+        self.assertEqual(len(key_part), 16)
+        self.assertRegex(key_part, r"^[0-9a-f]{16}$")
 
     def test_enqueue_atomic_no_tmp_left_behind(self):
         pending_mod.enqueue(self._sample_payload(), RuntimeError("boom"))

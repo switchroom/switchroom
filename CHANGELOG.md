@@ -53,6 +53,30 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
   case gets a loud stderr line plus a durable `pending-drops.json` ledger — a
   **sibling** of the queue dir, so it can never be listed as an entry, drained,
   or counted against the caps.
+- **The reconcile runs in the automatic path too, not only in `--backlog`.**
+  `session_start.py` calls `drain()` on every boot, so fixing the re-post loop
+  only in the operator-invoked mode would have changed nothing operationally.
+  The sequential drain now GETs before it POSTs: a sub-second GET *replaces* a
+  doomed 30-90s server-side extraction, so this reduces both hook latency and
+  upstream load rather than adding to either.
+- **Dedupe is keyed on the filename, not on the serialized size.** The queued
+  copy is always post-`update_attempt` by the time `reconcile_tail` re-enqueues
+  (the SessionStart drain attempts every entry on every boot), so a
+  size-indexed pre-filter matched nothing in steady state and the queue grew by
+  one duplicate per boot; a differing error string defeated it too. The key now
+  lives in the name (`<unix-ms>-<key>-<uuid>.json`), so a lookup is a prefix
+  match over the directory listing with zero file reads. (The measured 63% /
+  84.7 MB collapse on the fleet came from `dedupe_queue.py`, a one-shot
+  out-of-band sweep — this is the preventive guard, a different mechanism.)
+- **An oversized entry no longer costs the whole queue.** If a payload exceeds
+  `HINDSIGHT_PENDING_MAX_BYTES` the eviction loop could never satisfy its
+  condition: it evicted every entry and wrote the incoming one anyway, and the
+  bounded archive then discarded most of what it had just shed. That single
+  entry is now refused and recorded as a drop.
+- **Corrupt entries are quarantined instead of skipped.** A malformed entry was
+  immortal — never reconciled, never drained, never aged to `.dead`, but still
+  holding a slot and still counted in the depth doctor reports. It now moves to
+  `pending-corrupt/`, matching the out-of-band drainer.
 - **`switchroom doctor` told the operator two false things.** It claimed a live
   backlog "drains automatically on the agent's next SessionStart" (it cannot —
   that drain is what built it), and it hardcoded the cap at 1000 while the live
@@ -61,8 +85,12 @@ extracted. Only 1,703 (29.6%) were genuinely absent.
   agent's **live** cap out of the container, describes a full queue accurately
   (`warn`: at the eviction threshold — nothing lost yet, the next entry sheds
   the oldest), and reserves `fail` for actual loss: `.dead` markers, residual
-  drops, or recorded evictions. The remediation names the reconcile phase first
-  and spells out the pacing.
+  drops, or evictions **in the last 7 days** — windowed, because eviction is
+  deliberate policy under this design and a cumulative count over an
+  append-only ledger would pin the row red forever after one legitimate
+  eviction. The remediation names the reconcile phase first, spells out the
+  pacing, and ships the actual p95 query rather than telling the operator to
+  set `HINDSIGHT_DRAIN_P95_CMD` to something it never names.
 
 ## v0.19.18 — MCP instructions truncation (security), turn-liveness fixes, hindsight ranking & recall, CI hardening
 

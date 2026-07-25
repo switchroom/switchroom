@@ -1399,6 +1399,15 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
 const PENDING_RETAINS_DEFAULT_MAX_ENTRIES = 2000;
 
 /**
+ * How far back the eviction ledger is counted. Eviction is deliberate
+ * policy here (a full queue sheds its oldest entry rather than refusing
+ * the newest), and ``pending-evictions.log`` is append-only, so counting
+ * it cumulatively would pin the row to `fail` forever after the first
+ * legitimate eviction. Recent evictions are the actionable signal.
+ */
+const PENDING_RETAINS_EVICTION_WINDOW_DAYS = 7;
+
+/**
  * Per-agent probe result for the pending-retains queue.
  *   - "ok"          — directory missing or empty (no failed retains)
  *   - "backlog"     — queued ``.json`` entries, none dead (will retry)
@@ -1425,8 +1434,15 @@ export interface PendingRetainsProbeResult {
    */
   dropped: number;
   /**
-   * Cumulative count of entries EVICTED to make room for newer ones,
-   * one line per eviction in the ``pending-evictions.log`` ledger.
+   * Count of entries EVICTED to make room for newer ones **within the
+   * last ``PENDING_RETAINS_EVICTION_WINDOW_DAYS``**, from the
+   * ``pending-evictions.log`` ledger (one line per eviction).
+   *
+   * Windowed, not cumulative, and deliberately so: eviction is the
+   * DESIGNED behaviour of a full queue under this scheme, and the ledger
+   * is append-only, so a cumulative count would leave the row red forever
+   * after one legitimate eviction. A check that trains operators to
+   * ignore it is worse than no check.
    *
    * Eviction is the deliberate policy (shed the oldest, never refuse the
    * newest — see ``lib/pending.py``), and the evicted payload is kept in
@@ -1473,6 +1489,13 @@ export function probePendingRetainsQueue(
   //
   // `C` is the agent's LIVE cap. Reading it here rather than assuming a
   // constant is the point: it is env-driven and retuned via switchroom.yaml.
+  // Ledger lines start with an ISO-8601 UTC timestamp, which sorts
+  // lexicographically, so awk can window them with a plain string compare.
+  const cutoff = new Date(
+    Date.now() - PENDING_RETAINS_EVICTION_WINDOW_DAYS * 86400_000,
+  )
+    .toISOString()
+    .replace(/\.\d+Z$/, "Z");
   const script =
     `P=0; D=0; X=0; E=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
     `if [ -d '${dir}' ]; then ` +
@@ -1486,7 +1509,9 @@ export function probePendingRetainsQueue(
     `[ -n "$X" ] || X=0; ` +
     `fi; done; ` +
     `if [ -f '${base}/pending-evictions.log' ]; then ` +
-    `E=$(grep -c 'evicted=' '${base}/pending-evictions.log' 2>/dev/null || true); ` +
+    `E=$(awk -v c='${cutoff}' '$1 >= c && /evicted=/ {n++} END {print n+0}' ` +
+    `'${base}/pending-evictions.log' 2>/dev/null || echo 0); ` +
+    `[ -n "$E" ] || E=0; ` +
     `fi; ` +
     `echo "P=$P D=$D X=$X E=$E C=$C"`;
   const r = spawnSync(
@@ -1631,10 +1656,16 @@ export function checkPendingRetainsQueues(
     `Run \`--phase reconcile\` first — it costs nothing and typically clears most of ` +
     `the queue by confirming those documents already exist. PACE THE REST: the retain ` +
     `model pool is small and shared with live traffic, so drain ONE agent at a time at ` +
-    `the default HINDSIGHT_DRAIN_CONCURRENCY=1, keep HINDSIGHT_DRAIN_SLEEP_S set, and ` +
-    `set HINDSIGHT_DRAIN_P95_CMD so the replay backs off instead of tripping the ` +
-    `latency alarm. Fix the upstream first (bank health rows above), or every retry ` +
-    `just ages entries toward .dead.`;
+    `the default HINDSIGHT_DRAIN_CONCURRENCY=1, and keep HINDSIGHT_DRAIN_SLEEP_S set. ` +
+    `Point HINDSIGHT_DRAIN_P95_CMD at the same figure the latency watchdog alarms on so ` +
+    `the replay backs off instead of causing the alarm — on a LiteLLM deployment that is ` +
+    `\`docker exec -i <postgres> psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c ` +
+    `"select coalesce((select round(percentile_cont(0.95) within group (order by ` +
+    `request_duration_ms)) from \\"LiteLLM_SpendLogs\\" where \\"startTime\\" > now() ` +
+    `- interval '10 minutes' and metadata->>'user_api_key_alias' like 'hindsight-%' and ` +
+    `status='success' and request_duration_ms is not null), -1)"\` (must print a ` +
+    `millisecond integer on stdout; unset = no backoff). Fix the upstream first (bank ` +
+    `health rows above), or every retry just ages entries toward .dead.`;
 
   // fail: dead markers, residual drops, or recorded evictions. NOT depth:
   // a full queue evicts rather than refusing, so depth alone is a symptom.
@@ -1645,7 +1676,10 @@ export function checkPendingRetainsQueues(
       parts.push(`permanently dropped (could not be written): ${dropped.join(", ")}`);
     }
     if (evicted.length > 0) {
-      parts.push(`evicted to make room for newer entries: ${evicted.join(", ")}`);
+      parts.push(
+        `evicted to make room for newer entries in the last ` +
+          `${PENDING_RETAINS_EVICTION_WINDOW_DAYS}d: ${evicted.join(", ")}`,
+      );
     }
     if (atThreshold.length > 0) {
       parts.push(`at the eviction threshold: ${atThreshold.join(", ")}`);
@@ -1674,7 +1708,10 @@ export function checkPendingRetainsQueues(
           `queued — the payloads are in \`.hindsight/pending-evicted/\` (itself bounded, ` +
           `so they expire) and the ledger is \`.hindsight/pending-evictions.log\`. Drain ` +
           `the backlog and raise HINDSIGHT_PENDING_MAX_ENTRIES / ` +
-          `HINDSIGHT_PENDING_MAX_BYTES if this recurs.`,
+          `HINDSIGHT_PENDING_MAX_BYTES if this recurs. This count covers the last ` +
+          `${PENDING_RETAINS_EVICTION_WINDOW_DAYS} days only, so the row clears on its ` +
+          `own once evictions stop — no ledger reset needed, and don't delete it (it is ` +
+          `the record of what was shed).`,
       );
     }
     fixParts.push(backlogFix);

@@ -334,6 +334,26 @@ def drain(
         remaining = budget - elapsed
         effective_timeout = max(1, min(timeout, int(remaining) if remaining >= 1 else 1))
 
+        # RECONCILE BEFORE RETRY — this is the fix for the re-post loop in
+        # the path that actually runs on every boot, not just in --backlog.
+        # 70.4% of the measured fleet backlog already existed as documents;
+        # re-POSTing those inside the hook is a guaranteed client timeout
+        # (the clamp above is far below a 30-90s synchronous retain), 30-90s
+        # of wasted server-side extraction, and one more step toward .dead
+        # for a memory that was never actually lost.
+        #
+        # A GET is sub-second and it REPLACES that doomed POST, so this
+        # strictly reduces both hook latency and upstream load. Only a
+        # definite True drops the entry: False and None (unknown) fall
+        # through to the retry, because guessing "present" would delete the
+        # last on-disk copy of a turn.
+        if _document_state(entry, timeout=effective_timeout) is True:
+            delete_entry(path)
+            summary["reconciled"] += 1
+            consecutive_failures = 0
+            last_error_class = None
+            continue
+
         try:
             _retry_one(entry, timeout=effective_timeout)
         except Exception as e:
@@ -397,14 +417,28 @@ def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
     )
 
 
-def _wait_for_upstream(config: dict, backoff_ms: int) -> None:
-    """Block while the operator-supplied p95 probe says upstream is slow."""
+def _wait_for_upstream(backoff_ms: int, started: float, budget: float) -> bool:
+    """Block while the p95 probe says upstream is slow. False ⇒ give up.
+
+    The wait is bounded by the SAME wall-clock budget as the drain itself.
+    An unbounded ``while True: sleep(120)`` would let a persistently
+    degraded upstream block ``drain_backlog()`` indefinitely, long past the
+    budget the operator set — the one guarantee this mode makes about how
+    long it will run.
+    """
     if backoff_ms <= 0:
-        return
+        return True
     while True:
         p95 = _p95_probe_ms()
         if p95 < 0 or p95 <= backoff_ms:
-            return
+            return True
+        if time.monotonic() - started + 120 > budget:
+            _blog(
+                f"upstream still slow (p95={p95}ms > {backoff_ms}ms) and the "
+                f"budget is exhausted — stopping rather than waiting past it. "
+                f"Remaining entries stay queued; re-run when upstream recovers."
+            )
+            return False
         _blog(
             f"BACKOFF: upstream p95={p95}ms > {backoff_ms}ms — pausing 120s so "
             f"the replay never becomes the cause of a latency alarm"
@@ -448,13 +482,24 @@ def _drain_backlog_impl(
     consecutive_failures = 0
     last_error_class: str | None = None
 
+    # BUDGET GRANULARITY: checked between waves, not mid-wave, so a run can
+    # overshoot `budget` by at most one wave — up to HINDSIGHT_DRAIN_BACKLOG_
+    # TIMEOUT (180s default) plus the confirming GETs. That is deliberate:
+    # abandoning an in-flight wave would leave entries whose POST the server
+    # is still committing, and the whole point of commit-before-delete is not
+    # to guess about those. Unlike the in-hook drain (whose overshoot is
+    # clamped to ~1s because a SessionStart hook has a hard deadline), this
+    # mode has no deadline to miss — so a bounded overshoot is the cheaper
+    # trade.
     for start in range(0, len(entries), width):
         if time.monotonic() - started > budget:
             summary["budget_exceeded"] = True
             _blog("budget exhausted, stopping. Remaining entries stay queued — re-run to continue.")
             break
 
-        _wait_for_upstream(config, backoff_ms)
+        if not _wait_for_upstream(backoff_ms, started, budget):
+            summary["budget_exceeded"] = True
+            break
 
         wave = entries[start : start + width]
         # Results are collected in SUBMISSION order (not completion order)

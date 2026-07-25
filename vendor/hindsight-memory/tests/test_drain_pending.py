@@ -94,13 +94,45 @@ class DrainPendingTest(unittest.TestCase):
         self.assertFalse(summary["stalled"])
         self.assertFalse(summary["budget_exceeded"])
 
-    def test_drain_success_deletes_entry(self):
+    def test_drain_reconciles_an_already_durable_entry_without_posting(self):
+        """switchroom #3596: GET before POST, in the SessionStart path too.
+
+        This test used to assert `drained == 1` against a mock that answered
+        200 to EVERYTHING, including the presence GET — i.e. it asserted
+        that an already-durable document gets re-POSTed anyway. That is the
+        re-post loop: the hook's clamped timeout guarantees the client gives
+        up, so the entry survives and is re-posted on every boot forever
+        while the memory was never actually lost.
+        """
         path = _seed_entry(self._pending)
         import drain_pending
 
-        with patch("urllib.request.urlopen", return_value=FakeOk()):
+        posts = []
+
+        def record(req, *a, **kw):
+            posts.append(getattr(req, "method", None) or req.get_method())
+            return FakeOk()
+
+        with patch("urllib.request.urlopen", side_effect=record):
             summary = drain_pending.drain({})
+        self.assertEqual(summary["reconciled"], 1)
+        self.assertEqual(summary["drained"], 0)
+        self.assertEqual(summary["retried"], 0)
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(posts, ["GET"], "no retain POST for a durable document")
+
+    def test_drain_success_deletes_entry(self):
+        """A genuinely absent document is POSTed and the entry deleted."""
+        path = _seed_entry(self._pending)
+        import drain_pending
+
+        with patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: False
+        ):
+            with patch("urllib.request.urlopen", return_value=FakeOk()):
+                summary = drain_pending.drain({})
         self.assertEqual(summary["drained"], 1)
+        self.assertEqual(summary["reconciled"], 0)
         self.assertEqual(summary["retried"], 0)
         self.assertFalse(os.path.exists(path))
 
@@ -249,11 +281,18 @@ class DrainPendingTest(unittest.TestCase):
 
         import drain_pending
 
-        with patch("urllib.request.urlopen", side_effect=maybe_ok):
-            summary = drain_pending.drain({})
+        # All three documents are genuinely absent, so every entry takes the
+        # POST path — otherwise the presence GET would consume call slots
+        # and this would be testing the reconcile phase by accident.
+        with patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: False
+        ):
+            with patch("urllib.request.urlopen", side_effect=maybe_ok):
+                summary = drain_pending.drain({})
 
         self.assertEqual(summary["drained"], 2)
         self.assertEqual(summary["retried"], 1)
+        self.assertEqual(summary["reconciled"], 0)
 
 
 if __name__ == "__main__":

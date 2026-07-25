@@ -68,11 +68,38 @@ Deduplication
 -------------
 ``reconcile_tail`` re-enqueues the same transcript slice on every boot
 until its watermark is confirmed, so a stalled upstream multiplied one
-memory into dozens of identical files (measured: 63% of the fleet queue,
-84.7 MB). Same bank + same content-derived ``document_id`` + same content
-is the same memory — the daemon would upsert them onto one document
-anyway — so ``enqueue()`` returns the existing path instead of writing a
-copy.
+memory into dozens of identical files. (The measured 63% / 84.7 MB
+collapse on this fleet was achieved by ``dedupe_queue.py``, a one-shot
+out-of-band sweep keyed on ``(bank, document_id, sha256(content))`` with
+no size index. What follows is the *preventive* guard that stops the
+duplicates accumulating in the first place — a different mechanism, and
+it does not get the credit for that number.)
+
+Same bank + same content-derived ``document_id`` + same content is the
+same memory — the daemon would upsert them onto one document anyway — so
+``enqueue()`` returns the existing path instead of writing a copy.
+
+The dedupe key is carried IN THE FILENAME
+(``<unix-ms>-<key>-<uuid>.json``), so a lookup is a prefix match over the
+directory listing with ZERO file reads. It deliberately is not inferred
+from the serialized bytes: an entry's JSON also carries ``failed_at``,
+``error_message``, ``attempt_count`` and — after any drain attempt —
+``last_attempt_at``, none of which are part of the memory's identity. An
+earlier revision pre-filtered candidates on ``os.path.getsize()``, which
+made the guard a no-op in exactly the scenario it was written for: the
+queued copy is ALWAYS post-``update_attempt`` by the time
+``reconcile_tail`` re-enqueues (the SessionStart drain attempts every
+entry on every boot), so its size had already drifted, and a
+one-character difference in the error string defeated it too.
+
+Oversized entries
+-----------------
+An entry larger than ``MAX_BYTES`` can never fit, and the eviction loop
+would otherwise evict the ENTIRE queue trying to make room for it and
+then write it anyway — trading every queued memory for one. ``enqueue()``
+refuses that single entry instead (recorded as a residual drop). Not
+reachable at the 256 MB default, but ``HINDSIGHT_PENDING_MAX_BYTES`` is
+operator-tunable.
 
 Residual drops
 --------------
@@ -120,6 +147,11 @@ DROPS_FILE = "pending-drops.json"
 #: errors can carry a full HTTP body; an unbounded copy per entry inflates
 #: the queue against MAX_BYTES for no diagnostic gain.
 MAX_ERROR_MESSAGE_CHARS = 500
+
+#: The eviction ledger is append-only; these bound it so it cannot grow
+#: without limit on a queue that evicts steadily.
+EVICTIONS_LOG_MAX_BYTES = 1024 * 1024
+EVICTIONS_LOG_KEEP_LINES = 2000
 
 
 def _clip_error(e: BaseException) -> str:
@@ -240,9 +272,21 @@ def _log_eviction(name: str, size: int, reason: str, depth: int, nbytes: int) ->
         depth,
         nbytes,
     )
+    log = evictions_log_path()
     try:
-        with open(evictions_log_path(), "a", encoding="utf-8") as f:
+        with open(log, "a", encoding="utf-8") as f:
             print(line, file=f)
+        # Bounded, not append-forever. `switchroom doctor` windows this by
+        # timestamp so a single legitimate eviction can't turn the row red
+        # permanently, but the FILE still needs a ceiling of its own.
+        if os.path.getsize(log) > EVICTIONS_LOG_MAX_BYTES:
+            with open(log, encoding="utf-8") as f:
+                kept = f.readlines()[-(EVICTIONS_LOG_KEEP_LINES):]
+            tmp = log + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, log)
     except OSError:
         pass
     print(
@@ -292,51 +336,75 @@ def _evict_to_fit(d: str, incoming_bytes: int) -> int:
     return evicted
 
 
-def _dupe_key(entry: dict) -> tuple:
-    """Identity of a queued retain: (bank, document, content-hash).
+def _dupe_key(entry: dict) -> Optional[str]:
+    """Stable 16-hex identity of a queued retain, or ``None``.
 
+    Derived from ``(bank_id, document_id, sha256(content))``.
     ``document_id`` is already content-derived, so two entries sharing
     this key are the same memory and the daemon would upsert them onto
     the same document.
+
+    ``None`` when there is no ``document_id``: identity cannot be
+    established, so the entry must always be kept rather than merged.
     """
+    did = entry.get("document_id")
+    if did is None:
+        return None
     content = entry.get("content")
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False, sort_keys=True)
-    return (
-        entry.get("bank_id"),
-        entry.get("document_id"),
-        hashlib.sha256(content.encode("utf-8")).hexdigest(),
-    )
+    h = hashlib.sha256()
+    # Length-prefixed so ("ab", "c") and ("a", "bc") cannot collide.
+    for part in (str(entry.get("bank_id")), str(did)):
+        h.update(b"%d:" % len(part))
+        h.update(part.encode("utf-8"))
+    h.update(hashlib.sha256(content.encode("utf-8")).digest())
+    return h.hexdigest()[:16]
 
 
-def _find_duplicate(d: str, entry: dict, blob_bytes: int) -> Optional[str]:
+def _find_duplicate(d: str, key: Optional[str]) -> Optional[str]:
     """Return the path of an already-queued identical entry, or ``None``.
 
-    Size-indexed: ``os.stat()`` is cheap, and only files of EXACTLY the
-    incoming size are opened and hashed — normally zero or one — so this
-    stays O(dir listing) even at a 2000-entry queue.
+    A pure filename prefix match — no file is opened, no payload is
+    hashed — because ``enqueue()`` stamps the key into the name. Entries
+    written by an older plugin build have no key segment and simply never
+    match, which is the safe direction: a missed dedupe costs a duplicate
+    file, a false one would discard a distinct memory.
     """
-    try:
-        key = _dupe_key(entry)
-    except Exception:
+    if not key:
         return None
-    if key[1] is None:
-        return None  # no document_id -> cannot establish identity, keep it
+    needle = f"-{key}-"
     for name in _list_entries(d):
-        p = os.path.join(d, name)
-        try:
-            if os.path.getsize(p) != blob_bytes:
-                continue
-            with open(p, encoding="utf-8") as f:
-                other = json.load(f)
-        except (OSError, ValueError):
-            continue
-        try:
-            if _dupe_key(other) == key:
-                return p
-        except Exception:
-            continue
+        if needle in name:
+            return os.path.join(d, name)
     return None
+
+
+def quarantine_corrupt(path: str) -> Optional[str]:
+    """Move an unparsable entry into the ``pending-corrupt/`` sibling.
+
+    Without this a corrupt entry is IMMORTAL: ``iter_entries()`` skips it,
+    so it is never reconciled, never drained and never aged to ``.dead``,
+    yet it still occupies a queue slot and still counts toward the depth
+    that ``switchroom doctor`` reports — inflating the warning forever
+    with eviction as its only exit. Mirrors the out-of-band drainer, which
+    moves unparsable entries to ``pending-corrupt`` rather than skipping.
+
+    Returns the new path, or ``None`` if the move failed.
+    """
+    dest_dir = _sibling("pending-corrupt")
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(path))
+        shutil.move(path, dest)
+    except OSError:
+        return None
+    print(
+        f"[Hindsight] pending-retains: entry is unparsable, quarantined to "
+        f"{dest} (it can no longer block the queue; inspect or delete it).",
+        file=sys.stderr,
+    )
+    return dest
 
 
 def read_drops() -> dict:
@@ -444,22 +512,37 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     entry["error_message"] = _clip_error(error)
     entry.setdefault("attempt_count", 1)
 
-    ts_ms = int(time.time() * 1000)
-    short_uuid = uuid.uuid4().hex[:12]
-    name = f"{ts_ms}-{short_uuid}.json"
-    final = os.path.join(d, name)
-    tmp = final + ".tmp"
-
     blob = json.dumps(entry, ensure_ascii=False)
     blob_bytes = len(blob.encode("utf-8"))
 
+    key = _dupe_key(entry)
+    ts_ms = int(time.time() * 1000)
+    short_uuid = uuid.uuid4().hex[:12]
+    # The key goes in the NAME so dedupe is a listing prefix match with no
+    # file reads. `_list_entries` still sorts oldest-first: the fixed-width
+    # millisecond timestamp remains the leading segment.
+    name = f"{ts_ms}-{key}-{short_uuid}.json" if key else f"{ts_ms}-{short_uuid}.json"
+    final = os.path.join(d, name)
+    tmp = final + ".tmp"
+
     # DEDUPE first: reconcile_tail re-enqueues the same transcript slice on
-    # every boot until its watermark is confirmed, so a stalled upstream used
-    # to multiply one memory into dozens of identical queue files. Returning
-    # the existing path keeps every caller's "queued" contract intact.
-    dup = _find_duplicate(d, entry, blob_bytes)
+    # every boot until its watermark is confirmed, so a stalled upstream would
+    # otherwise multiply one memory into dozens of queue files. Returning the
+    # existing path keeps every caller's "queued" contract intact.
+    dup = _find_duplicate(d, key)
     if dup is not None:
         return dup
+
+    # An entry bigger than the whole byte cap can never fit. Without this
+    # guard the eviction loop below evicts the ENTIRE queue trying to make
+    # room and then writes it anyway — trading every queued memory for one.
+    if blob_bytes > MAX_BYTES:
+        record_drop(payload, ValueError(
+            f"entry is {blob_bytes} bytes, larger than the whole "
+            f"HINDSIGHT_PENDING_MAX_BYTES cap ({MAX_BYTES}); refusing this "
+            f"entry rather than evicting the entire queue for it"
+        ))
+        return None
 
     # Then make room by evicting the OLDEST entries rather than refusing
     # this (newest, most valuable) one.
@@ -487,9 +570,12 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
 def iter_entries() -> list[tuple[str, dict]]:
     """Return ``[(path, entry_dict), ...]`` oldest first.
 
-    Unreadable / malformed files are skipped silently — the drainer
-    handles its own logging. We never crash the SessionStart hook on
-    a corrupt entry.
+    A malformed entry is QUARANTINED, not skipped. Skipping made it
+    immortal — never reconciled, never drained, never aged to ``.dead``,
+    but still holding a queue slot and still counted in the depth doctor
+    reports. Transient read errors (``OSError``) are still just skipped;
+    only unparsable content is moved aside. We never crash the
+    SessionStart hook on a corrupt entry either way.
     """
     d = pending_dir()
     out: list[tuple[str, dict]] = []
@@ -498,8 +584,13 @@ def iter_entries() -> list[tuple[str, dict]]:
         try:
             with open(p, encoding="utf-8") as f:
                 out.append((p, json.load(f)))
-        except (OSError, json.JSONDecodeError):
+        except OSError:
             continue
+        except ValueError:
+            # ValueError, not JSONDecodeError: a non-UTF-8 entry raises
+            # UnicodeDecodeError, which is a ValueError but NOT a
+            # JSONDecodeError, and is exactly as unparsable.
+            quarantine_corrupt(p)
     return out
 
 
