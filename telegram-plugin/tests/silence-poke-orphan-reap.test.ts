@@ -13,7 +13,7 @@
  * These tests assert the OUTCOME (state gone, no fallback delivered, real fires
  * unaffected), not merely that the code path runs.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import {
@@ -268,14 +268,25 @@ describe('#3552 — the production isTurnLive predicate', () => {
   // The `CurrentTurnMap` here is the REAL production class, re-imported with
   // the flag ON through its read-once seam (mirroring per-topic-current-turn's
   // `loadMap`) — not a hand-modelled stand-in of the mirror semantics.
+  // The re-import-per-flag seam is the query-string idiom from
+  // per-topic-current-turn.test.ts's `loadMap`: the flag is read ONCE at module
+  // top, and a fresh query string forces a fresh evaluation against the env we
+  // set here. Deliberately NOT `vi.resetModules()` — this suite runs under BOTH
+  // vitest and `bun test` in CI, and bun ignores it (the flag-ON tests then
+  // silently ran flag-OFF and failed there while passing locally).
   async function loadFlagOnTurnMap(): Promise<TurnMapLike> {
     const prev = process.env.SWITCHROOM_EMISSION_AUTHORITY
     process.env.SWITCHROOM_EMISSION_AUTHORITY = '1'
     try {
-      vi.resetModules()
-      const mod = await import('../gateway/current-turn-map.js')
+      // A STATIC specifier with a distinguishing query — the module is
+      // evaluated once, under the flag we just set, and both flag-ON tests
+      // share that evaluation (each still builds its own map instance). A
+      // template-literal specifier is not statically analyzable and Vite
+      // rejects it ("Unknown variable dynamic import"); `vi.resetModules()`
+      // is a no-op under bun. This form works under both runners.
+      const mod = await import('../gateway/current-turn-map.js?emissionAuthorityOn')
       expect(mod.EMISSION_AUTHORITY_ENABLED, 'the re-import seam must observe the flag').toBe(true)
-      return new mod.CurrentTurnMap<unknown>() as unknown as TurnMapLike
+      return new mod.CurrentTurnMap() as TurnMapLike
     } finally {
       if (prev == null) delete process.env.SWITCHROOM_EMISSION_AUTHORITY
       else process.env.SWITCHROOM_EMISSION_AUTHORITY = prev
