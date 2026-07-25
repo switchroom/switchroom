@@ -191,7 +191,19 @@ export function parseProcStartTimeMs(
   return Math.floor(startEpochMs);
 }
 
-function pidStartTimeMs(pid: number): number | null {
+/**
+ * Wall-clock ms at which the process at `pid` started, or null when it cannot
+ * be determined (non-Linux, no such pid, unparseable /proc).
+ *
+ * Exported because it is the repo's ONE correct answer to "is the process at
+ * this pid still the process I recorded?" — `kill(pid, 0)` alone cannot tell a
+ * surviving holder from an unrelated process that inherited the pid. Also used
+ * by the rollout pin journal (`src/cli/rollout-pin-journal.ts`), where the pid
+ * is recorded inside a container: PID namespaces restart at 1, so after a
+ * container recreate the recorded pid is very likely occupied by an unrelated
+ * live process and a bare liveness probe answers "alive" essentially always.
+ */
+export function pidStartTimeMs(pid: number): number | null {
   if (process.platform !== "linux") return null;
   try {
     const statLine = readFileSync(`/proc/${pid}/stat`, "utf8");
