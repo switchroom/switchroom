@@ -255,7 +255,18 @@ describe("tool-label-pretool.mjs", () => {
     // labelled here too. Bash/Task use the model-authored description.
     const cases: Array<[string, Record<string, unknown>, string]> = [
       ["Bash", { command: "ls -la", description: "List workspace" }, "List workspace"],
-      ["Bash", { command: "ls" }, "Running a command"], // no description → safe fallback
+      // No model-authored description → the label is DERIVED from the command
+      // through the allowlist added in d8f73d59c (#3609): program basename
+      // only (plus one bare subcommand for known multiplexers). This replaced
+      // the constant "Running a command", which froze the worker step feed on
+      // one line for any sub-agent that never wrote a description. Canonical
+      // coverage for the allowlist itself lives in
+      // telegram-plugin/tests/tool-label-pretool.test.ts.
+      ["Bash", { command: "ls" }, "Running ls"],
+      ["Bash", { command: "git status --short" }, "Running git status"],
+      // Nothing safe to derive → the generic fallback is still reachable.
+      ["Bash", { command: "$(cat /run/secrets/token) --x" }, "Running a command"],
+      ["Bash", {}, "Running a command"],
       ["Task", { description: "Review the migration", prompt: "y" }, "Delegating: Review the migration"],
       ["Agent", { description: "Audit deps", prompt: "y" }, "Delegating: Audit deps"],
       ["TodoWrite", { todos: [] }, "Updating the plan"],

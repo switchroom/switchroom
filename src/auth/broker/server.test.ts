@@ -49,7 +49,54 @@ function makeHarness(): Harness {
   return h;
 }
 
+/* ─── Offline net guard (mandatory for this whole file) ──────────
+ *
+ * `mark-exhausted` awaits a LIVE quota probe INSIDE the request path:
+ *
+ *   markExhaustedAndRoll (server.ts) → nextHealthyAccountLive
+ *                                    → probeAndCacheOne → fetchQuota
+ *
+ * `nextHealthyAccountLive` force-probes every candidate whose eligibility is
+ * still `unknown`, and `fetchQuota`'s default abort is 10s
+ * (src/auth/quota.ts:364) — more than 3x the 3s deadline `rpc()` below
+ * enforces. Any broker in this file constructed WITHOUT a `_testFetchQuota`
+ * seam is therefore latency-bound on api.anthropic.com and fails with
+ * `Error: rpc timeout` whenever the runner's egress is slow. That is what went
+ * red on main: run 30160839499 / vitest-shard (1), and locally 1 failure in 15
+ * repeat runs of this one file.
+ *
+ * The live-probe path arrived in 839791d3e (#2565, tri-state eligibility);
+ * d8f73d59c (#3609) fixed the same class in
+ * src/auth/broker/server-consumer-follow-active.test.ts per-broker and
+ * explicitly deferred "13 tests in src/auth/broker/server.test.ts with the
+ * identical un-injected live probe" — these are those 13.
+ *
+ * Rather than thread `_testFetchQuota` through 99 broker constructions (and
+ * leave every FUTURE one free to re-flake), the guard is installed at the file
+ * level: `globalThis.fetch` is replaced for the duration of every test with a
+ * stub that rejects immediately. Semantics are unchanged — `fetchQuota` catches
+ * and returns `{ ok: false, reason: "quota probe network error: …" }`, i.e. the
+ * probe FAILURE a real probe could only ever produce here anyway (the seeded
+ * tokens are fakes), so the candidate stays `unknown` and the selector takes it
+ * as the roll target exactly as before. Tests that inject `_testFetchQuota`
+ * bypass `fetch` entirely and are untouched.
+ */
+const NET_GUARD_MARKER = "test: offline net guard (server.test.ts never calls the network)";
+let realFetch: typeof globalThis.fetch;
+let netGuardCalls = 0;
+
+beforeEach(() => {
+  netGuardCalls = 0;
+  realFetch = globalThis.fetch;
+  const guard = async (): Promise<never> => {
+    netGuardCalls += 1;
+    throw new Error(NET_GUARD_MARKER);
+  };
+  globalThis.fetch = guard as unknown as typeof globalThis.fetch;
+});
+
 afterEach(() => {
+  globalThis.fetch = realFetch;
   for (const h of harnesses) {
     try { rmSync(h.tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -643,7 +690,18 @@ describe("AuthBroker — consumer failover on quota exhaustion", () => {
     const quota = JSON.parse(readFileSync(join(h.stateDir, "quota.json"), "utf-8"));
     expect((quota["default"]?.exhausted_until ?? 0) > Date.now()).toBe(false);
     expect(quota["secondary"].exhausted_until > Date.now()).toBe(true);
+    // mark-exhausted's roll DID force a live candidate probe, and it went
+    // through the offline net guard rather than the wire. A zero here means
+    // the guard was removed and this test is latency-bound on
+    // api.anthropic.com again — which is exactly how it went red on main.
+    expect(netGuardCalls).toBeGreaterThan(0);
     broker.stop();
+  });
+});
+
+describe("AuthBroker — offline net guard", () => {
+  it("no test in this file can reach the network: global fetch rejects immediately", async () => {
+    await expect(fetch("https://api.anthropic.com/v1/messages")).rejects.toThrow(NET_GUARD_MARKER);
   });
 });
 
