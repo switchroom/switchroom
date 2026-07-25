@@ -342,6 +342,16 @@ export interface StatusEntry {
   failed_agent?: string;
   /** Actual version detected on failed_agent (null = unreachable). BONUS #2458 got-field gap. */
   got?: string | null;
+  /**
+   * True when the roll stopped because a bounded subprocess exceeded its
+   * timeout and was killed (see ROLLOUT_RUN_TIMEOUT_MS / ROLLOUT_PROBE_TIMEOUT_MS
+   * in cli/rollout.ts). A timeout is operationally distinct from a plain
+   * non-zero exit — the step may have left work half-done and docker
+   * grandchildren may still be running — so it is surfaced as its own field
+   * rather than being flattened into the stderr tail. Absent (not `false`)
+   * on rolls that did not time out.
+   */
+  timed_out?: boolean;
   // ─── Update-apply deferral result (#2458) ──────────────────────────
   // Steps that were deferred because the update ran in hostd-context
   // (SWITCHROOM_HOSTD_CONTEXT=1). Populated by parsing the
@@ -3909,6 +3919,10 @@ export class HostdServer {
           // unreachable). Preserve it so get_status readers can surface the
           // mismatch without scraping stdout.
           if (parsed.got !== undefined) entry.got = parsed.got;
+          // A timeout is its own outcome class: preserve it so get_status /
+          // the terminal audit row can say "killed on timeout" rather than
+          // just "exit 1". Only set when true — absence means "not a timeout".
+          if (parsed.timedOut) entry.timed_out = true;
           // Structured `ok` is the authority; exit code corroborates.
           entry.result = parsed.ok ? "completed" : "error";
         } else {
