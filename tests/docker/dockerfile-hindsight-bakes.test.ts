@@ -220,74 +220,37 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
-  it("keeps the cross-encoder saturation fix (assert-guarded, fail-loud)", () => {
-    // apply_combined_scoring makes CE * recency * temporal * proof_count the
-    // ONLY final score (RRF is explicitly zeroed). Measured live on bank
-    // `overlord`: a 116-result recall had every CE score inside 0.9800-0.9999,
-    // so the boosts — undamped worst-case ratio ~1.65 — decided the order and
-    // the single highest-CE memory ranked 7th behind older, more-proven ones.
-    // The patch DAMPS the boost product so it modulates the CE decision
-    // instead of replacing it. Behaviour (including the safety properties
-    // below) is proven in tests/docker/hindsight-search-patches.test.ts.
-
-    // The exact-once anchor guard (fail-loud on upstream drift).
-    expect(dockerfile).toMatch(
-      /switchroom hindsight CE-saturation patch: \{name\} anchor found \{n\}x/,
-    );
-    // Named module constant tied to the MEASURED saturation spread, and a
-    // derivation from the alphas — not a hand-tuned exponent.
-    expect(dockerfile).toMatch(/_CE_DECISIVE_RELATIVE_GAP: float = 0\.02/);
-    expect(dockerfile).toMatch(/def _boost_authority\(/);
-    expect(dockerfile).toMatch(
-      /math\.log1p\(_CE_DECISIVE_RELATIVE_GAP\) \/ math\.log\(hi \/ lo\)/,
-    );
-    // The exponent is derived ONCE PER CALL from the alphas alone. That is what
-    // makes a candidate's score a pure function of its own fields — no
-    // candidate-set-relative quantity may appear.
-    expect(dockerfile).toMatch(
-      /_boost_exponent = _boost_authority\(recency_alpha, temporal_alpha, proof_count_alpha\)/,
-    );
-    expect(dockerfile).toMatch(
-      /sr\.combined_score = sr\.cross_encoder_score_normalized \* \(_boost\*\*_boost_exponent\)/,
-    );
-
-    // ---- Negative guards: the withdrawn min-max CE rescale must not return.
-    // It rewrote cross_encoder_score_normalized, which memory_engine.py filters
-    // against with the agent-supplied min_scores.reranker floor — measured:
-    // it dropped 78 of 100 results at reranker=0.8 that upstream kept. It was
-    // also candidate-set-relative and amplified 1e-7 of float noise into a
-    // ranking decision.
+  it("never rewrites the caller-visible cross_encoder_score_normalized field", () => {
+    // engine/memory_engine.py applies the agent-supplied `min_scores.reranker`
+    // floor DIRECTLY to cross_encoder_score_normalized, and `min_scores` is a
+    // documented MCP recall parameter any agent may pass. The field is an
+    // ABSOLUTE, caller-visible quantity — no switchroom patch may rewrite it.
+    //
+    // A withdrawn revision min-max rescaled it onto [0.1, 1.0] whenever the
+    // spread fell under a threshold. Measured against the pinned upstream
+    // image, that dropped 78 of 100 results at `min_scores: {reranker: 0.8}`
+    // which upstream returned, was candidate-set-relative, and amplified 1e-7
+    // of float noise into a ranking decision. This guard keeps it out.
     expect(dockerfile).not.toMatch(/_CE_SATURATION_SPREAD_THRESHOLD/);
     expect(dockerfile).not.toMatch(/_ce_spread/);
     expect(dockerfile).not.toMatch(/_ce_lo/);
-    // No patch may assign to the caller-visible CE field outside upstream's own
-    // passthrough reseed (which the patch quotes verbatim as an anchor).
-    const ceAssignments = [
-      ...dockerfile.matchAll(/sr\.cross_encoder_score_normalized\s*=/g),
-    ];
+
+    // Structural rather than exact-string: ANY assignment to the field trips
+    // this, however it is reformatted or renamed around. The sole permitted
+    // writer is upstream's own is_passthrough_reranker reseed, which patches
+    // may quote verbatim as an anchor but must never alter.
+    const ceWrites = [
+      ...dockerfile.matchAll(/sr\.cross_encoder_score_normalized\s*=(?!=)[^\n]*/g),
+    ].map((m) => m[0]);
     expect(
-      ceAssignments.length,
-      "cross_encoder_score_normalized must only be assigned by upstream's " +
-        "passthrough reseed — it carries the absolute min_scores.reranker floor",
-    ).toBe(2);
-    expect(dockerfile).toMatch(
-      /sr\.cross_encoder_score_normalized = 1\.0 - \(0\.9 \* new_rank \/ denom\)/,
-    );
+      ceWrites.filter((w) => !w.includes("1.0 - (0.9 * new_rank / denom)")),
+      "only upstream's passthrough reseed may assign cross_encoder_score_normalized — " +
+        "it carries the absolute min_scores.reranker floor",
+    ).toEqual([]);
+
     // No re-weighting of the alphas or the boost formulae themselves.
     expect(dockerfile).not.toMatch(/_(RECENCY|TEMPORAL|PROOF_COUNT)_ALPHA[^\n]*=\s*\d/);
     expect(dockerfile).not.toMatch(/(recency|temporal|proof_count)_boost\s*=\s*1\.0 \+ \d/);
-
-    // Post-replace re-assertions (verification-on-build), including the guard
-    // that the withdrawn rescale has not crept back in at build time.
-    expect(dockerfile).toMatch(
-      /assert "_CE_DECISIVE_RELATIVE_GAP: float = 0\.02" in t,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "sr\.cross_encoder_score_normalized = 0\.1 \+ 0\.9 \* \(" not in t,/,
-    );
-    expect(dockerfile).toMatch(
-      /switchroom hindsight CE-saturation patch: boost product damped/,
-    );
   });
 
   it("keeps the BM25 compound-token fix (assert-guarded, fail-loud)", () => {

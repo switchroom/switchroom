@@ -1,44 +1,34 @@
 /**
- * Behavioural proof for the three search/provider patches
+ * Behavioural proof for the two search/provider patches
  * `docker/Dockerfile.hindsight` bakes into the pinned upstream Hindsight
  * image. `dockerfile-hindsight-bakes.test.ts` pins the *shape* of those patch
  * blocks (grep-on-file, runs everywhere). This file proves the *outcome*: it
  * runs the same probe against unpatched upstream (must be RED on every bug)
  * and against upstream + the patch blocks applied (must be GREEN).
  *
- * The three defects, all reproduced live on bank `overlord` before the fix:
+ * The two defects, both reproduced live on bank `overlord` before the fix:
  *
- *  1. Cross-encoder saturation. `apply_combined_scoring` makes
- *     `CE * recency_boost * temporal_boost * proof_count_boost` the only final
- *     score (RRF is explicitly zeroed). A 116-result recall had every CE score
- *     inside 0.9800-0.9999, so the boosts — whose undamped worst-case ratio is
- *     ~1.65 — decided the order and the single highest-CE memory ranked 7th
- *     behind older, more-proven ones.
- *  2. `tokenize_query` shredded `v0.19.17` into `v0`/`19`/`17`, while
+ *  1. `tokenize_query` shredded `v0.19.17` into `v0`/`19`/`17`, while
  *     `to_tsvector` indexes it as ONE lexeme — zero overlap on the only
  *     discriminating term, and the stripped `19` then matched clock
  *     timestamps like `19:33:13`.
- *  3. Both LiteLLM timeout handlers ended in a bare `raise`, re-raising an
+ *  2. Both LiteLLM timeout handlers ended in a bare `raise`, re-raising an
  *     `asyncio.TimeoutError` whose `str()` is empty → an operator-facing
  *     "TimeoutError:" with no cause.
  *
- * Beyond proving those three fixes, the probe pins the properties that make
- * the fixes SAFE, because each was violated by an earlier revision of this
- * work and none is visible from the patch text alone:
+ * (A third patch — damping the ranking boost product — was deliberately split
+ * out of this PR. It is a calibration change rather than a defect fix, so it
+ * ships separately with its own probe coverage in order to stay independently
+ * revertible. Nothing here depends on it.)
  *
- *  - `cross_encoder_score_normalized` is never rewritten. `memory_engine.py`
- *    applies the agent-supplied `min_scores.reranker` floor to that field as
- *    an ABSOLUTE cutoff, so rescaling it silently drops results (measured:
- *    a min-max rescale drops 78 of 100 results at `min_scores.reranker=0.8`
- *    that upstream kept).
- *  - Scores are set-independent: a candidate's `combined_score` cannot change
- *    because an unrelated document joined the candidate set.
- *  - CE noise does not decide: a 1e-7 CE difference must stay subordinate to
- *    the boosts rather than being stretched into a ranking decision.
- *  - `combined_score` stays on the [0, 1] CE scale that `recall_boost.py`'s
- *    additive levels and `min_scores.final` are calibrated against.
+ * Beyond proving those two fixes, the probe pins the property that makes the
+ * BM25 change SAFE, because an earlier revision of this work violated it and
+ * it is not visible from the patch text alone:
+ *
  *  - `tokenize_query` stays a STRICT SUPERSET of upstream's token list, so the
  *    OR-joined query can only match more documents than upstream, never fewer.
+ *    A document that never enters the BM25 candidate set can never be reranked
+ *    back in, so a recall loss there is unrecoverable downstream.
  *
  * The patch blocks are extracted from the Dockerfile itself rather than
  * duplicated here, so this test cannot drift from what actually ships. It
@@ -85,7 +75,7 @@ const UPSTREAM_IMAGE = (() => {
 })();
 
 /**
- * The three patch blocks under test, pulled out of the Dockerfile's
+ * The two patch blocks under test, pulled out of the Dockerfile's
  * `RUN python3 - <<'PYEOF' … PYEOF` heredocs by their unique patch names.
  */
 function patchBlocks(): string[] {
@@ -93,7 +83,6 @@ function patchBlocks(): string[] {
     ...dockerfile.matchAll(/^RUN python3 - <<'PYEOF'\n([\s\S]*?)^PYEOF$/gm),
   ].map((m) => m[1]);
   const wanted = [
-    "CE-saturation patch",
     "BM25 compound-token patch",
     "timeout-message patch",
   ];
@@ -110,7 +99,7 @@ function patchBlocks(): string[] {
 }
 
 /**
- * Python probe. Exits 0 only when all three fixes are in effect AND every
+ * Python probe. Exits 0 only when both fixes are in effect AND every
  * safety property above holds; prints the offending assertions otherwise.
  * Deliberately asserts OUTCOMES — final rank order, the emitted tsquery
  * string, a real driven timeout — rather than merely calling the code or
@@ -120,105 +109,12 @@ const PROBE = String.raw`
 import asyncio
 import re
 import sys
-from datetime import datetime, timedelta, timezone
 
-from hindsight_api.engine.search.reranking import apply_combined_scoring
 from hindsight_api.engine.search.retrieval import tokenize_query
-from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult, ScoredResult
 from hindsight_api.engine.sql import create_sql_dialect
 
 failures = []
-UTC = timezone.utc
-NOW = datetime(2026, 7, 25, tzinfo=UTC)
 
-
-def mk(uid, ce, proof, age_days=10):
-    r = RetrievalResult(
-        id=uid, text=uid, fact_type="observation",
-        occurred_start=NOW - timedelta(days=age_days), proof_count=proof,
-    )
-    return ScoredResult(
-        candidate=MergedCandidate(retrieval=r, rrf_score=0.0),
-        cross_encoder_score_normalized=ce,
-    )
-
-
-def order(rows):
-    apply_combined_scoring(rows, NOW)
-    return [s.id for s in sorted(rows, key=lambda s: s.combined_score, reverse=True)]
-
-
-# ------------------------------------------------------------------ fix 1
-# (a) THE BUG. Saturated CE band as measured live. Same date on both rows, so
-# recency/temporal are identical and proof_count is the only other signal.
-fresh, old = mk("fresh-high-ce", 0.9999, 1), mk("old-high-proof", 0.9800, 10)
-o = order([fresh, old])
-print("SATURATED_ORDER", o, fresh.combined_score, old.combined_score)
-if o[0] != "fresh-high-ce":
-    failures.append("saturated CE: proof_count decided the ranking")
-
-# (b) NOISE MUST NOT DECIDE. A 1e-7 CE difference is float noise from a
-# saturated encoder, not signal, so the stale/unproven row must not win on it.
-# A min-max rescale is scale-invariant and stretches exactly this noise across
-# the whole band, handing it the decision outright.
-noisy = mk("noise-stale", 0.9800001, 1, age_days=3000)
-real = mk("real-fresh", 0.9800000, 50, age_days=1)
-o = order([noisy, real])
-print("NOISE_ORDER", o, noisy.combined_score, real.combined_score)
-if o[0] != "real-fresh":
-    failures.append("CE noise (1e-7 spread) decided the ranking over recency+proof")
-
-# (c) SET-INDEPENDENCE. The same pair must score identically whether or not an
-# unrelated third document survived retrieval alongside it.
-a1, b1 = mk("A", 0.98, 1), mk("B", 0.99, 9)
-order([a1, b1])
-a2, b2, c2 = mk("A", 0.98, 1), mk("B", 0.99, 9), mk("C", 0.94, 3)
-order([a2, b2, c2])
-print("SETDEP_DELTA", abs(a1.combined_score - a2.combined_score), abs(b1.combined_score - b2.combined_score))
-if abs(a1.combined_score - a2.combined_score) > 1e-12 or abs(b1.combined_score - b2.combined_score) > 1e-12:
-    failures.append("combined_score changed when an unrelated document joined the candidate set")
-
-# (d) min_scores INTERACTION. memory_engine applies the agent-supplied
-# min_scores.reranker floor as an ABSOLUTE filter on
-# cross_encoder_score_normalized, so rewriting that field silently drops
-# results that upstream would have returned.
-band = [mk("m%d" % i, 0.9800 + i * 0.0002, 1 + i) for i in range(100)]
-before = [s.cross_encoder_score_normalized for s in band]
-order(band)
-after = [s.cross_encoder_score_normalized for s in band]
-survivors = len([x for x in after if x >= 0.8])
-print("MINSCORES_SURVIVORS", survivors, "/", len(band))
-print("CE_MUTATED", any(x != y for x, y in zip(before, after)))
-if any(x != y for x, y in zip(before, after)):
-    failures.append("cross_encoder_score_normalized was rewritten - min_scores.reranker floor silently changes meaning")
-if survivors != len(band):
-    failures.append("min_scores reranker=0.8 now drops %d of %d results that upstream kept" % (len(band) - survivors, len(band)))
-
-# (e) SCALE. recall_boost.py calibrates its additive levels against the [0, 1]
-# CE scale ("high=0.5 wins over most semantic matches"), and min_scores.final
-# floors sr.weight. combined_score must stay on that scale - the boosts may
-# modulate it by at most the decisive-gap fraction, not reshape it.
-ratios = [s.combined_score / s.cross_encoder_score_normalized for s in band]
-print("WEIGHT_RATIO_RANGE", min(ratios), max(ratios))
-if min(ratios) < 0.98 or max(ratios) > 1.02:
-    failures.append("combined_score left the [0, 1] CE scale that recall_boost/min_scores.final assume")
-
-# (f) A healthy (well-spread) encoder is still ordered by CE, absolute scores
-# untouched.
-hi, lo = mk("hi", 0.90, 1), mk("lo", 0.40, 150)
-o = order([hi, lo])
-print("HEALTHY", o, hi.cross_encoder_score_normalized, lo.cross_encoder_score_normalized)
-if o[0] != "hi" or abs(hi.cross_encoder_score_normalized - 0.90) > 1e-12 or abs(lo.cross_encoder_score_normalized - 0.40) > 1e-12:
-    failures.append("healthy CE spread was disturbed")
-
-# (g) Upstream's is_passthrough_reranker branch must still reseed CE from RRF
-# rank - the patch must not have clobbered it.
-p1, p2 = mk("p1", 0.5, 1), mk("p2", 0.5, 1)
-p1.candidate.rrf_score, p2.candidate.rrf_score = 0.9, 0.1
-apply_combined_scoring([p1, p2], NOW, is_passthrough_reranker=True)
-print("PASSTHROUGH", p1.cross_encoder_score_normalized, p2.cross_encoder_score_normalized)
-if abs(p1.cross_encoder_score_normalized - 1.0) > 1e-9 or abs(p2.cross_encoder_score_normalized - 0.1) > 1e-9:
-    failures.append("upstream is_passthrough_reranker branch was clobbered")
 
 # ------------------------------------------------------------------ fix 2
 dialect = create_sql_dialect("postgresql")
@@ -458,16 +354,11 @@ describe.skipIf(!dockerOk || !imageOk)(
     });
 
     it(
-      "unpatched upstream is RED on all three defects (proves the probe bites)",
+      "unpatched upstream is RED on both defects (proves the probe bites)",
       () => {
         const { status, stdout } = runProbe(false);
         expect(stdout, "probe did not run to completion").toContain("PROBE_EXECUTED");
         expect(status, `probe unexpectedly passed:\n${stdout}`).not.toBe(0);
-
-        // Defect 1 — the concrete inversion: the highest-CE row loses to the
-        // high-proof row.
-        expect(stdout).toContain("saturated CE: proof_count decided the ranking");
-        expect(stdout).toMatch(/SATURATED_ORDER \['old-high-proof', 'fresh-high-ce'\]/);
 
         // Defect 2 — the intact compound never reaches the tsquery.
         expect(stdout).toContain("tokenize_query destroyed the intact version token");
@@ -497,19 +388,6 @@ describe.skipIf(!dockerOk || !imageOk)(
         expect(stdout, "probe did not run to completion").toContain("PROBE_EXECUTED");
         expect(status, `probe failed:\n${stdout}`).toBe(0);
         expect(stdout).toContain("FAILURES []");
-
-        // Fix 1: highest-CE row now wins despite proof_count 1 vs 10 …
-        expect(stdout).toMatch(/SATURATED_ORDER \['fresh-high-ce', 'old-high-proof'\]/);
-        // … while 1e-7 of CE noise still does NOT get to decide …
-        expect(stdout).toMatch(/NOISE_ORDER \['real-fresh', 'noise-stale'\]/);
-        // … scores are set-independent to the last bit …
-        expect(stdout).toContain("SETDEP_DELTA 0.0 0.0");
-        // … the caller-visible CE field is untouched, so an agent-supplied
-        // min_scores.reranker floor keeps upstream semantics exactly …
-        expect(stdout).toContain("CE_MUTATED False");
-        expect(stdout).toContain("MINSCORES_SURVIVORS 100 / 100");
-        // … and upstream's passthrough branch still works.
-        expect(stdout).toMatch(/PASSTHROUGH 1\.0 0\.0999999/);
 
         // Fix 2: the intact compound is APPENDED, never substituted — the
         // fragments upstream emitted all survive as standalone OR arms, so the
