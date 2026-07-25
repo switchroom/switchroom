@@ -67,10 +67,11 @@ To roll out a change:
 Single non-comment line: the exact `image:` reference the host compose file
 must use. Bump procedure: update the pin here (with changelog notes in the
 PR), merge, then the operator edits the compose `image:` to match and
-redeploys. The file currently carries an `UNVERIFIED-AGAINST-LIVE` marker —
-the operator must replace the placeholder tag with the live deployed tag on
-first reconcile. Only the host can answer *which* tag that is (the public
-registry knows which tags exist, not which one this deployment runs), so read
+redeploys. The pin was verified against the live deployment on 2026-07-25 and
+is stored digest-qualified (`<image>:<tag>@sha256:<digest>`): the tag half must
+match the host compose `image:` line verbatim, the digest half makes it
+immutable. Only the host can answer *which* tag is deployed (the public registry
+knows which tags exist, not which one this deployment runs), so on any bump read
 it there:
 
 ```sh
@@ -79,10 +80,11 @@ docker inspect --format '{{.Config.Image}}' <litellm-container-name>
 docker inspect --format '{{index .RepoDigests 0}}' <litellm-container-name>
 ```
 
-Paste the result into `litellm-image.txt` and delete its
-`UNVERIFIED-AGAINST-LIVE` notice — `src/litellm/repo-config.test.ts` couples
-the two, so a placeholder without the marker (or a real tag that kept the
-marker) fails the suite.
+Paste the result into `litellm-image.txt`. `src/litellm/repo-config.test.ts`
+enforces the shape (tag, digest, or tag@digest — never a floating tag) and
+still couples the `REPLACE-WITH-LIVE-PINNED-TAG` placeholder to an
+`UNVERIFIED-AGAINST-LIVE` marker, so a future placeholder can never ship
+silently.
 
 ## What is deliberately NOT here
 
