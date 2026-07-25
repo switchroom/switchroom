@@ -8,7 +8,7 @@ import * as path from "node:path";
 import {
   readAuditRaw,
   auditReadMaxGenerations,
-  AUDIT_READ_FULL_WINDOW_BYTES,
+  auditReadFullWindowBytes,
 } from "./audit-reader.js";
 import { DEFAULT_HOSTD_AUDIT_MAX_FILES } from "./audit-rotation-config.js";
 
@@ -86,14 +86,38 @@ describe("auditReadMaxGenerations — no hand-mirrored constant (finding 6)", ()
   });
 });
 
-describe("AUDIT_READ_FULL_WINDOW_BYTES (finding 3)", () => {
+describe("auditReadFullWindowBytes (finding 3)", () => {
   it("reaches rows the default 4 MiB tail window would drop", () => {
     const marker = '{"marker":"oldest"}\n';
     // 5 MiB of noise after the marker pushes it out of the default window.
     fs.writeFileSync(log, marker + "n".repeat(5 * 1024 * 1024) + "\n");
     expect(readAuditRaw(log)).not.toContain("oldest");
     expect(
-      readAuditRaw(log, { windowBytes: AUDIT_READ_FULL_WINDOW_BYTES }),
+      readAuditRaw(log, { windowBytes: auditReadFullWindowBytes() }),
     ).toContain("oldest");
+  });
+
+  it("scales with the WRITER's retention, so the window never reads less than the writer keeps (re-review, finding 3)", () => {
+    // A hardcoded 128 MiB is correct only at the default maxFiles=3.
+    // Raise retention and the window must grow with it, or
+    // resolveRollbackTarget silently truncates the extra generations
+    // auditReadMaxGenerations() faithfully walks.
+    const base = auditReadFullWindowBytes();
+    process.env.SWITCHROOM_HOSTD_AUDIT_MAX_FILES = "6";
+    try {
+      expect(auditReadMaxGenerations()).toBe(6);
+      expect(auditReadFullWindowBytes()).toBe((6 + 1) * 32 * 1024 * 1024);
+      expect(auditReadFullWindowBytes()).toBeGreaterThan(base);
+    } finally {
+      delete process.env.SWITCHROOM_HOSTD_AUDIT_MAX_FILES;
+    }
+    expect(auditReadFullWindowBytes()).toBe(base);
+
+    process.env.SWITCHROOM_HOSTD_AUDIT_MAX_BYTES = String(64 * 1024 * 1024);
+    try {
+      expect(auditReadFullWindowBytes()).toBe((3 + 1) * 64 * 1024 * 1024);
+    } finally {
+      delete process.env.SWITCHROOM_HOSTD_AUDIT_MAX_BYTES;
+    }
   });
 });

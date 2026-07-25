@@ -94,12 +94,32 @@ export function defaultAuditLogPath(home: string = homedir()): string {
 export const AUDIT_READ_WINDOW_BYTES = 4 * 1024 * 1024;
 
 /**
- * Whole-history window for callers that must not miss an old row
- * (`resolveRollbackTarget` — #3600 review, finding 3). 128 MiB is the
- * writer-side ceiling at the default 32 MiB × (3+1) generations, so this
- * is "everything that exists" without being unbounded.
+ * Resolve the hostd audit rotation config the WRITER will use. Single
+ * source of truth for both the generation count and the byte window
+ * (#3600 review, finding 6 / re-review, finding 3) — a hand-mirrored
+ * constant here silently truncates history the moment an operator raises
+ * `SWITCHROOM_HOSTD_AUDIT_MAX_FILES`/`_MAX_BYTES`.
  */
-export const AUDIT_READ_FULL_WINDOW_BYTES = 128 * 1024 * 1024;
+function auditRotation(): { maxBytes: number; maxFiles: number } {
+  return resolveRotationConfig({
+    envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
+    envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
+    defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+    defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
+  });
+}
+
+/**
+ * Whole-history window for callers that must not miss an old row
+ * (`resolveRollbackTarget` — #3600 review, finding 3). Derived as
+ * `(maxFiles + 1) x maxBytes`: the writer-side ceiling on everything that
+ * can exist on disk, so this is "all of it" without being unbounded.
+ * 128 MiB at the defaults (32 MiB x (3+1)).
+ */
+export function auditReadFullWindowBytes(): number {
+  const { maxBytes, maxFiles } = auditRotation();
+  return (maxFiles + 1) * maxBytes;
+}
 
 /**
  * How many rotated generations a seam-aware read walks back through.
@@ -109,12 +129,7 @@ export const AUDIT_READ_FULL_WINDOW_BYTES = 128 * 1024 * 1024;
  * The byte window remains the real bound.
  */
 export function auditReadMaxGenerations(): number {
-  return resolveRotationConfig({
-    envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
-    envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
-    defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
-    defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
-  }).maxFiles;
+  return auditRotation().maxFiles;
 }
 
 export interface AuditReadOptions {

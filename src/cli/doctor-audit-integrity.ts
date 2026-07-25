@@ -102,39 +102,45 @@ function rootWrittenLogs(home: string): LogTarget[] {
 
 /**
  * Concatenate the log's retained history OLDEST-first: `<path>.N` … `.1`
- * then the active file. An absent generation is skipped rather than
+ * then the active file. An ABSENT generation is skipped rather than
  * ending the walk, so a gap (a crashed rotation, an operator deleting one
  * file) still gets the surviving generations verified.
  *
- * Returns the combined text plus the paths that actually contributed —
- * an empty `sources` means "nothing on disk at all", which is the
- * genuinely missing case.
+ * An UNREADABLE generation is NOT absence and must never be skipped
+ * quietly (#3600 re-review, finding 2): this is the tamper-detection
+ * surface, so `chmod 000` on a doctored `.1` would otherwise buy an
+ * attacker a clean "chain valid — tamper-evidence active" verdict. Those
+ * paths come back in `unreadable` and the caller fails the check.
+ *
+ * Returns the combined text, the paths that actually contributed — an
+ * empty `sources` means "nothing on disk at all", the genuinely missing
+ * case — and the paths that exist but could not be read.
  */
 function readRetainedHistory(
   read: (p: string) => string,
   path: string,
   maxFiles: number,
-): { text: string; sources: string[] } {
+): { text: string; sources: string[]; unreadable: { path: string; error: string }[] } {
   const parts: { path: string; text: string }[] = [];
-  for (let n = maxFiles; n >= 1; n--) {
-    const gen = `${path}.${n}`;
-    let t: string;
+  const unreadable: { path: string; error: string }[] = [];
+  const attempt = (p: string) => {
     try {
-      t = read(gen);
-    } catch {
-      continue; // absent generation — older ones may still exist
+      parts.push({ path: p, text: read(p) });
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      // ENOENT is the only "it is not there" errno. Everything else
+      // (EACCES, EIO, EISDIR, ELOOP, a vanished network mount) means the
+      // file exists and we could not see it.
+      if (e.code === "ENOENT") return;
+      unreadable.push({ path: p, error: e.code ?? e.message ?? String(err) });
     }
-    parts.push({ path: gen, text: t });
-  }
-  try {
-    parts.push({ path, text: read(path) });
-  } catch {
-    /* active file absent — rotated generations (if any) still count */
-  }
+  };
+  for (let n = maxFiles; n >= 1; n--) attempt(`${path}.${n}`);
+  attempt(path);
   const text = parts
     .map((p) => (p.text.endsWith("\n") || p.text.length === 0 ? p.text : p.text + "\n"))
     .join("");
-  return { text, sources: parts.map((p) => p.path) };
+  return { text, sources: parts.map((p) => p.path), unreadable };
 }
 
 export function runAuditIntegrityChecks(
@@ -178,7 +184,21 @@ export function runAuditIntegrityChecks(
     // doctor would report "ok" while attesting nothing about the ~96 MiB
     // sitting in `.1`-`.3`. Verify the whole RETAINED history,
     // oldest-first, so the chain is checked exactly as it was written.
-    const { text, sources } = readRetainedHistory(read, path, maxFiles);
+    const { text, sources, unreadable } = readRetainedHistory(read, path, maxFiles);
+
+    if (unreadable.length > 0) {
+      // Cannot attest what we cannot read. Fail rather than verify the
+      // remainder and print "tamper-evidence active" (#3600 re-review,
+      // finding 2) — hiding a doctored generation behind a chmod must
+      // never be cheaper than tampering with a readable one.
+      results.push({
+        name: `${label} audit chain readable`,
+        status: "fail",
+        detail: `${unreadable.map((u) => `${u.path} (${u.error})`).join(", ")} exist(s) but could not be read — the ${label} audit chain CANNOT be verified over the full retained history, so no tamper-evidence claim can be made about ${sources.length > 0 ? "the remaining generation(s)" : "this log"}`,
+        fix: `Restore read access (root-owned, mode 0600 is expected — run doctor as the operator/root) and re-run; if the file is not a regular file or the volume is failing, investigate immediately: an unreadable audit generation is an audit-blinding signal (WS10-F3/F4).`,
+      });
+      continue;
+    }
 
     if (sources.length === 0) {
       results.push({

@@ -56,7 +56,7 @@ import {
   readAndFilter,
   defaultAuditLogPath,
   readAuditRaw,
-  AUDIT_READ_FULL_WINDOW_BYTES,
+  auditReadFullWindowBytes,
 } from "../host-control/audit-reader.js";
 import { isHindsightContainerExists } from "../setup/hindsight.js";
 import { deployedImageTag } from "./deploy-version-guard.js";
@@ -870,7 +870,7 @@ export function resolveRollbackTarget(auditLogPath?: string): string | null {
     // hosts that need it. And a read error must not masquerade as
     // absence; the caller then requires an explicit `--pin`.
     raw = readAuditRaw(logPath, {
-      windowBytes: AUDIT_READ_FULL_WINDOW_BYTES,
+      windowBytes: auditReadFullWindowBytes(),
       strict: true,
     });
   } catch (err) {

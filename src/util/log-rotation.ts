@@ -26,8 +26,9 @@
  *   - hostd audit log: hostd is the source-side writer, so EBUSY is NOT
  *     the operative constraint (rename would succeed on the host). The
  *     decisive reason is the READERS: every admin agent bind-mounts this
- *     file `:ro` as a single file (`src/cli/apply.ts:1107-1116` pre-creates
- *     it precisely so that `:ro` mount source exists), and hostd writes it
+ *     file `:ro` as a single file — the mount is emitted at
+ *     `src/agents/compose.ts:2529-2531` (`src/cli/apply.ts:1107-1116` only
+ *     pre-creates the file so that mount source exists) — and hostd writes it
  *     through its own `/host-home` mount. A bind mount pins an INODE, not
  *     a path — renaming the active file would leave every one of those
  *     mounts permanently attached to the old, rotated inode. `/audit
@@ -97,9 +98,45 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * Returns `null` if the lock could not be taken (another process is
  * mid-rotation) — the caller treats that as "someone else handled it".
  *
- * A lock left behind by a killed process is reclaimed after
- * {@link ROTATE_LOCK_STALE_MS}; the reclaim is itself racy-safe because
- * the reclaimer re-attempts the same `O_EXCL` create and only one can win.
+ * A lock left behind by a killed process (container stop, OOM kill) is
+ * reclaimed after {@link ROTATE_LOCK_STALE_MS}. The reclaim must itself be
+ * mutually exclusive, and `unlink` + `open(O_EXCL)` is NOT (#3600
+ * re-review, finding 1): two reclaimers can interleave so that the
+ * second's `unlink` removes the FIRST's freshly created lockfile, after
+ * which its own exclusive create succeeds and both run. One stale lock
+ * would degrade the lock to no lock, in exactly the crash scenario the
+ * lock exists for.
+ *
+ * POSIX gives us no identity-checked `unlink`, so the reclaim is done as
+ * park-verify-claim:
+ *
+ *   1. `rename(lockPath -> lockPath.stale.<pid>.<rand>)` — atomic, and the
+ *      park name is unique to us, so the file we now hold is unambiguous.
+ *   2. verify the parked file IS the stale lock we observed (same inode,
+ *      still older than the threshold). A racer that reclaimed just before
+ *      us parks as step 1 too — but what it parked is that racer's LIVE
+ *      lock, which fails this check.
+ *   3. on mismatch, put it back with `link(2)` (atomic create-if-absent, so
+ *      it cannot clobber a lock taken meanwhile) and decline. Only on a
+ *      match do we unlink the stale file and take the lock normally, which
+ *      can still lose EEXIST to a fresh arrival — correct, that arrival
+ *      holds it.
+ *
+ * Release is inode-guarded for the same reason: we only unlink the
+ * lockfile if the path still resolves to the inode we created, so if our
+ * own lock was reclaimed out from under us (we overran the threshold) we
+ * cannot delete the new holder's lock on the way out.
+ *
+ * Residual, stated honestly rather than papered over with an invariant
+ * that is not true: three-plus processes interleaving inside the
+ * sub-millisecond window of step 3 can still restore a lock over a
+ * just-taken one. It needs a crashed holder, a >30s-idle log, and
+ * microsecond-precise arrival of a third racer; the failure mode is one
+ * lost rotation cycle, not a lost generation. Everything shorter than
+ * that — the ordinary two-reclaimer race the reviewer reproduced — is
+ * closed here, and the under-lock size re-check in
+ * {@link maybeRotateLogFile} is the second, independent guard against
+ * copying an already-rotated (empty) file over a good `.1`.
  */
 function withRotateLock<T>(
   logPath: string,
@@ -128,12 +165,61 @@ function withRotateLock<T>(
     process.stderr.write(
       `[${tag}] WARN: reclaiming stale rotation lock ${lockPath} (${Math.round(age / 1000)}s old)\n`,
     );
+    // Park-verify-claim (see the doc comment). `observed` is the identity
+    // we judged stale; anything else at that path is someone's live lock.
+    let observed: fs.Stats;
     try {
-      fs.unlinkSync(lockPath);
+      observed = fs.statSync(lockPath);
+    } catch {
+      return null; // gone — a peer is mid-reclaim
+    }
+    const parked = `${lockPath}.stale.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+    try {
+      fs.renameSync(lockPath, parked);
+    } catch {
+      return null; // a peer parked it first
+    }
+    let mine = false;
+    try {
+      const p = fs.statSync(parked);
+      mine =
+        p.ino === observed.ino &&
+        Date.now() - p.mtimeMs >= ROTATE_LOCK_STALE_MS;
+    } catch {
+      mine = false;
+    }
+    if (!mine) {
+      // We parked a LIVE lock (a peer reclaimed between our stat and our
+      // rename). Put it back without clobbering whatever is there now.
+      try {
+        fs.linkSync(parked, lockPath);
+      } catch {
+        /* a lock already exists at the path — the holder is covered */
+      }
+      try {
+        fs.unlinkSync(parked);
+      } catch {
+        /* best-effort */
+      }
+      return null;
+    }
+    try {
+      fs.unlinkSync(parked);
+    } catch {
+      /* best-effort — the park name is unique to us */
+    }
+    try {
       fd = fs.openSync(lockPath, "wx", 0o600);
     } catch {
-      return null; // someone else won the reclaim
+      return null; // a fresh arrival took the lock between our rename and this
     }
+  }
+  // Identify the lock we hold, so release can prove it is still ours.
+  let ourIno: number | null = null;
+  try {
+    ourIno = fs.fstatSync(fd).ino;
+  } catch {
+    /* leave null — release then falls back to not unlinking */
   }
   try {
     return fn();
@@ -144,9 +230,11 @@ function withRotateLock<T>(
       /* best-effort */
     }
     try {
-      fs.unlinkSync(lockPath);
+      if (ourIno !== null && fs.statSync(lockPath).ino === ourIno) {
+        fs.unlinkSync(lockPath);
+      }
     } catch {
-      /* best-effort */
+      /* gone already, or someone else's — either way not ours to remove */
     }
   }
 }

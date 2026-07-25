@@ -43,7 +43,11 @@ function legacyRow(o: Record<string, unknown>): string {
 /** A reader that serves `files[path]`; absent path → throw (ENOENT). */
 function reader(files: Record<string, string>) {
   return (p: string) => {
-    if (!(p in files)) throw new Error("ENOENT");
+    if (!(p in files)) {
+      throw Object.assign(new Error(`ENOENT: no such file, open '${p}'`), {
+        code: "ENOENT",
+      });
+    }
     return files[p];
   };
 }
@@ -268,6 +272,87 @@ describe("runAuditIntegrityChecks across a rotation seam (#3600)", () => {
     });
     expect(
       r.find((c) => c.name.includes("hostd audit log present")),
+    ).toBeUndefined();
+    expect(r.find((c) => c.name.includes("hostd audit chain"))?.status).toBe("ok");
+  });
+});
+
+// ── #3600 re-review, finding 2 — unreadable is NOT absent ───────────────
+//
+// `readRetainedHistory` skips generations the reader throws on. If that
+// skip cannot tell ENOENT from EACCES, an attacker doctors `.1`, chmods
+// it 000, and doctor prints "chain valid ... tamper-evidence active" —
+// a false attestation, on the surface whose entire job is attestation.
+
+describe("runAuditIntegrityChecks — unreadable generations (#3600 re-review)", () => {
+  /** Serves `files[path]`; `errors[path]` throws that errno instead. */
+  function readerWithErrors(
+    files: Record<string, string>,
+    errors: Record<string, string>,
+  ) {
+    return (p: string) => {
+      if (p in errors) {
+        throw Object.assign(new Error(`${errors[p]}: ${p}`), {
+          code: errors[p],
+        });
+      }
+      if (!(p in files)) {
+        throw Object.assign(new Error(`ENOENT: no such file, open '${p}'`), {
+          code: "ENOENT",
+        });
+      }
+      return files[p];
+    };
+  }
+
+  it("FAILS instead of attesting when a rotated generation cannot be read", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: readerWithErrors(
+        {
+          [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+          [HOSTD]: chainedLog([{ ts: "c", op: "agent_restart" }]),
+        },
+        { [`${HOSTD}.1`]: "EACCES" },
+      ),
+    });
+    const readable = r.find((c) => c.name.includes("hostd audit chain readable"));
+    expect(readable?.status).toBe("fail");
+    expect(readable?.detail).toContain(`${HOSTD}.1`);
+    expect(readable?.detail).toContain("EACCES");
+    // and it must NOT also print a clean chain verdict for this log
+    expect(r.find((c) => c.name === "hostd audit chain")).toBeUndefined();
+  });
+
+  it("fails the same way when the ACTIVE file is unreadable", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: readerWithErrors(
+        {
+          [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+          [`${HOSTD}.1`]: chainedLog([{ ts: "b", op: "agent_restart" }]),
+        },
+        { [HOSTD]: "EIO" },
+      ),
+    });
+    expect(
+      r.find((c) => c.name.includes("hostd audit chain readable"))?.status,
+    ).toBe("fail");
+  });
+
+  it("ENOENT is still plain absence, not a failure", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: readerWithErrors(
+        {
+          [VAULT]: chainedLog([{ ts: "t", op: "get" }]),
+          [HOSTD]: chainedLog([{ ts: "c", op: "agent_restart" }]),
+        },
+        {},
+      ),
+    });
+    expect(
+      r.find((c) => c.name.includes("hostd audit chain readable")),
     ).toBeUndefined();
     expect(r.find((c) => c.name.includes("hostd audit chain"))?.status).toBe("ok");
   });
