@@ -690,6 +690,29 @@ def _injected_score_stats(results) -> dict:
     single malformed entry cannot drag the aggregate).
 
     Aggregates ONLY — no query text and no memory text is recorded here.
+
+    READING THESE ACROSS THE CE-DAMPING ROLLOUT (#3579). `scores.final` is the
+    engine's `combined_score`, and #3579 changes how that number is composed:
+    ``CE * boost`` becomes ``CE * boost**k`` with k ≈ 0.0395 at the engine's
+    default alphas. So these three fields SHIFT ON DEPLOY as a scale artifact,
+    not as a quality change. Measured against the pinned upstream image on a
+    saturated 100-result band (CE 0.9800-0.9999), the injected top-8 moved from
+    min/median/max 1.0822/1.0843/1.1136 (spread 0.0314) to 0.9977/0.9979/0.9981
+    (spread 0.0004): the level drops ~8% and the spread collapses ~78x as
+    combined_score converges onto the raw cross-encoder score. Two consequences:
+
+      * Any threshold or dashboard band calibrated on pre-#3579 data is invalid
+        afterwards, and a before/after comparison across the deploy boundary
+        measures the rescale, not recall quality. Re-baseline after rollout.
+      * These aggregates are PERMUTATION-INVARIANT over the injected set, so
+        they cannot see a pure re-ordering of the head-slice - which is exactly
+        what #3579 does. They move only when the head-slice MEMBERSHIP changes
+        (in the measured band it changed completely: 0 of 8 ids in common).
+        Membership churn is therefore the signal to watch, not the level.
+
+    Setting `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP` at or above ~0.651 clamps k to
+    1.0 and restores the pre-#3579 scale exactly, which is also how to get a
+    like-for-like reading back.
     """
     empty = {
         "injected_score_min": None,

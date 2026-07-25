@@ -137,6 +137,8 @@ function patchBlocks(): string[] {
  */
 const PROBE = String.raw`
 import asyncio
+import inspect
+import math
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -271,22 +273,72 @@ def _probe_gap_knob():
             _os.environ["HINDSIGHT_CE_DECISIVE_RELATIVE_GAP"] = value
         return importlib.reload(_rr)
 
+    # PRODUCTION ALPHAS. memory_engine.py calls apply_combined_scoring without
+    # passing any alpha, so the SIGNATURE DEFAULTS are what runs for all 12
+    # agents - and every number below (the damping exponent, the clamp
+    # threshold) is a function of them. Pin them: if upstream re-tunes an alpha
+    # the damping silently changes strength, so that must fail loudly here
+    # rather than ship.
+    _sig = inspect.signature(_rr.apply_combined_scoring).parameters
+    ALPHAS = tuple(
+        _sig[n].default for n in ("recency_alpha", "temporal_alpha", "proof_count_alpha")
+    )
+    print("PROD_ALPHAS", ALPHAS)
+    if ALPHAS != (0.2, 0.2, 0.1):
+        failures.append(
+            "apply_combined_scoring's default alphas moved to %r (expected (0.2, 0.2, 0.1)); "
+            "the damping exponent and the ~0.65 kill-switch threshold are both derived "
+            "from them and must be re-measured" % (ALPHAS,)
+        )
+
+    # The MEASURED damping at the production alphas. Undamped, the boost
+    # product's worst-case max/min ratio is ~1.651 - which is exactly why
+    # proof_count could outrank a higher-CE memory in a saturated set. Damped,
+    # it must land on 1 + gap = 1.02 exactly.
+    _hi = _lo = 1.0
+    for _a in ALPHAS:
+        _hi *= 1.0 + _a / 2.0
+        _lo *= 1.0 - _a / 2.0
+    k = _rr._boost_authority(*ALPHAS)
+    print("K_AT_PROD_ALPHAS", k, "UNDAMPED_RATIO", _hi / _lo, "DAMPED_RATIO", (_hi / _lo) ** k)
+    if abs(k - 0.03949271225122802) > 1e-9:
+        failures.append("damping exponent at the production alphas moved to %r (measured 0.0394927)" % (k,))
+    if abs((_hi / _lo) ** k - 1.02) > 1e-9:
+        failures.append(
+            "damped boost product worst-case ratio is %r, not the 1 + gap = 1.02 the "
+            "derivation promises" % ((_hi / _lo) ** k,)
+        )
+
     # A wide gap clamps the exponent to 1.0 - byte-for-byte upstream scoring
     # with the patch still baked in. This is THE rollback path; if it does not
-    # hold, the only way out of a bad calibration is an image rebuild.
+    # hold, the only way out of a bad calibration is an image rebuild. Driven at
+    # the PRODUCTION alphas, where the clamp threshold is exp(log(hi/lo)) - 1 =
+    # ~0.651: just below it must still damp, at/above it must be exactly 1.0.
     m = reload_with("1.0")
     rows = [mk("fresh-high-ce", 0.9999, 1), mk("old-high-proof", 0.9800, 10)]
     m.apply_combined_scoring(rows, NOW)
     ranked = [r.id for r in sorted(rows, key=lambda r: r.combined_score, reverse=True)]
-    exp_off = m._boost_authority(0.1, 0.1, 0.05)
+    exp_off = m._boost_authority(*ALPHAS)
     print("GAP_ROLLBACK", m._CE_DECISIVE_RELATIVE_GAP, exp_off, ranked)
     if abs(exp_off - 1.0) > 1e-12:
         failures.append("HINDSIGHT_CE_DECISIVE_RELATIVE_GAP=1.0 did not clamp the exponent to 1.0 - the env rollback path is broken")
     if ranked[0] != "old-high-proof":
         failures.append("exponent 1.0 did not reproduce upstream scoring - the high-proof row should win again, got %r" % (ranked,))
 
+    # The clamp threshold itself, straddled. Anything at or above it is exact
+    # upstream scoring, so this is the operator-facing "how wide is wide enough"
+    # answer and it must not drift silently.
+    _thresh = math.expm1(math.log(_hi / _lo))
+    _below = reload_with("%.12f" % (_thresh * 0.99,))._boost_authority(*ALPHAS)
+    _at = reload_with("%.12f" % (_thresh * 1.01,))._boost_authority(*ALPHAS)
+    print("GAP_CLAMP_THRESHOLD", _thresh, _below, _at)
+    if not (_below < 1.0):
+        failures.append("a gap just BELOW the ~%.3f clamp threshold already clamped to 1.0 - the knob has lost its range" % (_thresh,))
+    if abs(_at - 1.0) > 1e-12:
+        failures.append("a gap just ABOVE the ~%.3f clamp threshold did not clamp to 1.0 - the documented kill-switch is wrong" % (_thresh,))
+
     # The knob is monotone: a wider gap always damps less.
-    exps = [reload_with(v)._boost_authority(0.1, 0.1, 0.05) for v in ("0.005", "0.02", "0.10", "0.30")]
+    exps = [reload_with(v)._boost_authority(*ALPHAS) for v in ("0.005", "0.02", "0.10", "0.30")]
     print("GAP_MONOTONE", exps)
     if exps != sorted(exps) or exps[0] >= exps[-1]:
         failures.append("decisive-gap knob is not monotone in the damping exponent: %r" % (exps,))
@@ -648,8 +700,25 @@ describe.skipIf(!dockerOk || !imageOk)(
       // upstream scoring with the patch still baked in. That makes backing
       // this calibration out a container restart, not an image rebuild.
       expect(stdout).toContain("GAP_DEFAULT 0.02");
+
+      // memory_engine.py passes NO alphas, so these signature defaults are what
+      // actually runs for all 12 agents — and both numbers below are derived
+      // from them. Pinned so an upstream re-tune cannot silently change the
+      // damping strength.
+      expect(stdout).toContain("PROD_ALPHAS (0.2, 0.2, 0.1)");
+      // The measured damping: k = log1p(0.02) / log(1.651) = 0.0394927, which
+      // collapses the boost product's worst-case ratio from ~1.651 to exactly
+      // 1 + gap = 1.02.
+      expect(stdout).toMatch(
+        /^K_AT_PROD_ALPHAS 0\.03949271225122802 UNDAMPED_RATIO 1\.65107212475633\d* DAMPED_RATIO 1\.02(?:0*\d*)?$/m
+      );
       expect(stdout).toContain(
         "GAP_ROLLBACK 1.0 1.0 ['old-high-proof', 'fresh-high-ce']"
+      );
+      // The kill-switch threshold, straddled at the production alphas: just
+      // below ~0.651 still damps (<1.0), just above is exactly 1.0 = upstream.
+      expect(stdout).toMatch(
+        /GAP_CLAMP_THRESHOLD 0\.65107212475633\d+ 0\.9\d+ 1\.0$/m
       );
       // … the knob is monotone, and no bad value can break recall.
       expect(stdout).toMatch(/GAP_MONOTONE \[/);
