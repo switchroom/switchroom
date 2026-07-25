@@ -1679,13 +1679,46 @@ function formatAgentBankLabel(agentName: string, bankId: string): string {
  * Callers that hard-exit await `flushPendingBankOps()` after the scaffold
  * loop. Everything else can ignore it and keep the old drain behaviour.
  */
-const pendingBankOps: Promise<unknown>[] = [];
+const pendingBankOps = new Set<Promise<unknown>>();
 
-/** Register a bank-op chain so `flushPendingBankOps` can wait on it. */
+/**
+ * Register a bank-op chain so `flushPendingBankOps` can wait on it.
+ *
+ * Entries self-evict the moment they settle. `flushPendingBankOps` is only
+ * awaited by apply, but chains are also started from `switchroom setup`,
+ * `agent`, `create-orchestrator`, `doctor`, `rename-orchestrator` and the
+ * reconcile bridge — without eviction a long-lived process would accumulate
+ * one settled promise per scaffold forever (PR #3529 review, N2b).
+ */
 function trackBankOps(p: Promise<unknown>): void {
   // Swallow here only for tracking purposes — each chain already has its own
   // .catch for user-facing reporting.
-  pendingBankOps.push(p.catch(() => undefined));
+  const tracked: Promise<void> = p
+    .then(
+      () => undefined,
+      () => undefined,
+    )
+    .then(() => {
+      // `tracked` is assigned and added below before this microtask can run,
+      // so the delete always finds its own entry.
+      pendingBankOps.delete(tracked);
+    });
+  pendingBankOps.add(tracked);
+}
+
+/**
+ * Drop every registered chain without waiting on it. Test-hygiene hook only:
+ * the scaffold/reconcile suites start real chains that must not leak into a
+ * later test's flush (PR #3529 review, N2a). Product code uses
+ * `flushPendingBankOps`, which actually waits.
+ */
+export function __resetPendingBankOpsForTests(): void {
+  pendingBankOps.clear();
+}
+
+/** Number of chains still registered. Test-only observability for N2b. */
+export function __pendingBankOpsCountForTests(): number {
+  return pendingBankOps.size;
 }
 
 /**
@@ -1697,8 +1730,9 @@ function trackBankOps(p: Promise<unknown>): void {
  * Exported for tests and for `runApply`.
  */
 export async function flushPendingBankOps(timeoutMs = 15_000): Promise<boolean> {
-  if (pendingBankOps.length === 0) return true;
-  const inFlight = pendingBankOps.splice(0, pendingBankOps.length);
+  if (pendingBankOps.size === 0) return true;
+  const inFlight = [...pendingBankOps];
+  pendingBankOps.clear();
   let timer: NodeJS.Timeout | undefined;
   const timedOut = new Promise<boolean>((resolve) => {
     timer = setTimeout(() => resolve(false), timeoutMs);
@@ -5356,22 +5390,29 @@ export function scaffoldAgent(
         missions.bank_mission = userBankMission;
       }
 
-      await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
-        .then((result) => {
-          if (result.ok) {
-            const note = userRetainMission
-              ? "(custom retain_mission)"
-              : seededRetainMission
-                ? "(default retain_mission)"
-                : "(retain_mission left as-is)";
-            console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)} ${chalk.dim(note)}`);
-          } else {
-            console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-          }
-        })
-        .catch((err) => {
-          console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-        });
+      // Same emptiness guard as the reconcile site: in post-upgrade steady
+      // state the mission decision is "none" and `missions` is `{}`, so an
+      // unconditional call cost every agent two HTTP round-trips on every
+      // apply and printed a success line for a call that changed nothing
+      // (PR #3529 review, N1).
+      if (Object.keys(missions).length > 0) {
+        await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+          .then((result) => {
+            if (result.ok) {
+              const note = userRetainMission
+                ? "(custom retain_mission)"
+                : seededRetainMission
+                  ? "(default retain_mission)"
+                  : "(retain_mission left as-is)";
+              console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)} ${chalk.dim(note)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+            }
+          })
+          .catch((err) => {
+            console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+          });
+      }
 
       // Ensure operator-DECLARED per-specialist mental models (Phase 5). Only
       // models named in memory.mental_models are created — no blind seeding
