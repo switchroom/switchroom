@@ -393,6 +393,22 @@ describe("run-hook.sh", () => {
     expect(readTimingLines()).toHaveLength(0);
   });
 
+  it("SWITCHROOM_HOOK_TIMING_MIN_MS still logs invocations at or above the floor", () => {
+    // Paired with the test above on purpose (#3574 review, LOW). A filter
+    // that is merely "drop everything whenever MIN_MS is set" passes the
+    // 100000ms case perfectly while silently discarding the SLOW hooks the
+    // whole feature exists to surface. Only the over-the-floor half of the
+    // pair can catch that, so both halves must exist.
+    const script = makeScript("slow.sh", "sleep 0.3\nexit 0");
+    runHook("hook:timing-over", script, [], {
+      SWITCHROOM_HOOK_TIMING_MIN_MS: "50",
+    });
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].source).toBe("hook:timing-over");
+    expect(lines[0].duration_ms).toBeGreaterThanOrEqual(50);
+  });
+
   it("escapes quotes and backslashes in the source so the line stays valid JSON", () => {
     const script = makeScript("ok.sh", "exit 0");
     const nasty = 'hook:"quo\\ted"';
