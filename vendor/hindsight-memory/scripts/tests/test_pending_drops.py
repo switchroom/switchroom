@@ -1297,6 +1297,29 @@ class TrimDirBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertIn(f"{1000:013d}-x.json", msg, "names the oldest dropped")
         self.assertIn("arch", msg, "names the directory")
 
+    def test_exactly_ten_dropped_names_are_all_listed(self):
+        """The name list truncates ABOVE ten, not at ten.
+
+        ``len(dropped) > 10`` vs ``>=`` differ only on a trim of exactly
+        ten, where the mutant appends a nonsense "+0 more".
+        """
+        d = self._archive([1] * 12)
+        with redirect_stderr(io.StringIO()) as err:
+            pending._trim_dir(d, max_entries=2, max_bytes=10**9)
+        msg = err.getvalue()
+        self.assertIn("trimmed 10 archived copies", msg)
+        self.assertNotIn("more", msg, "ten names fit; there is no remainder")
+        self.assertEqual(msg.count("-x.json"), 10)
+
+    def test_eleven_dropped_names_truncate_to_ten_plus_a_remainder(self):
+        d = self._archive([1] * 13)
+        with redirect_stderr(io.StringIO()) as err:
+            pending._trim_dir(d, max_entries=2, max_bytes=10**9)
+        msg = err.getvalue()
+        self.assertIn("trimmed 11 archived copies", msg)
+        self.assertIn("+1 more", msg)
+        self.assertEqual(msg.count("-x.json"), 10)
+
     def test_a_large_trim_caps_the_name_list(self):
         """A 1500-entry trim must not emit a 1500-name line."""
         d = self._archive([1] * 20)
@@ -1668,6 +1691,89 @@ class WaitForUpstreamBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         got, slept, _ = self._wait(38000, [0])
         self.assertTrue(got)
         self.assertEqual(slept, [])
+
+
+class ClipErrorBoundaryTest(unittest.TestCase):
+    """``_clip_error`` clips ABOVE the cap and leaves the cap itself alone.
+
+    The ledger and every queued entry carry this string; the cap exists so
+    one pathological upstream message cannot bloat the queue. ``<=`` vs
+    ``<`` is invisible unless a message lands exactly on the cap, so that
+    is the case pinned here.
+    """
+
+    CAP = pending.MAX_ERROR_MESSAGE_CHARS
+
+    def test_a_message_exactly_at_the_cap_is_untouched(self):
+        msg = "x" * self.CAP
+        out = pending._clip_error(RuntimeError(msg))
+        self.assertEqual(out, msg)
+        self.assertNotIn("truncated", out)
+
+    def test_one_character_over_the_cap_is_clipped(self):
+        out = pending._clip_error(RuntimeError("x" * (self.CAP + 1)))
+        self.assertTrue(out.endswith("…[truncated]"))
+        self.assertEqual(out[: self.CAP], "x" * self.CAP)
+
+    def test_a_short_message_is_untouched(self):
+        self.assertEqual(pending._clip_error(RuntimeError("boom")), "boom")
+
+
+class EvictionsLogRotationBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
+    """The eviction ledger rotates ABOVE its cap, not AT it.
+
+    ``switchroom doctor`` reads this file, and rotation drops all but
+    ``EVICTIONS_LOG_KEEP_LINES``. ``>`` vs ``>=`` costs a whole ledger's
+    history on a file that is exactly at its ceiling — invisible to the
+    existing rotation test, which sets the cap to 1 byte and so can never
+    land on the boundary.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._prev = (
+            pending.EVICTIONS_LOG_MAX_BYTES,
+            pending.EVICTIONS_LOG_KEEP_LINES,
+        )
+        self.addCleanup(self._restore)
+        log = pending.evictions_log_path()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        self.log = log
+
+    def _restore(self):
+        (
+            pending.EVICTIONS_LOG_MAX_BYTES,
+            pending.EVICTIONS_LOG_KEEP_LINES,
+        ) = self._prev
+
+    def _one_line_bytes(self):
+        """Write one ledger line with rotation effectively off; return its size."""
+        pending.EVICTIONS_LOG_MAX_BYTES = 10**9
+        pending.EVICTIONS_LOG_KEEP_LINES = 1
+        with redirect_stderr(io.StringIO()):
+            pending._log_eviction("aaaa.json", 10, "count", 1, 10)
+        return os.path.getsize(self.log)
+
+    def _lines(self):
+        with open(self.log, encoding="utf-8") as f:
+            return [ln for ln in f.read().splitlines() if ln]
+
+    def test_a_ledger_exactly_at_the_cap_is_not_rotated(self):
+        one = self._one_line_bytes()
+        # Both lines are the same fixed-width shape, so two of them land
+        # exactly on a 2*one cap.
+        pending.EVICTIONS_LOG_MAX_BYTES = 2 * one
+        with redirect_stderr(io.StringIO()):
+            pending._log_eviction("aaaa.json", 10, "count", 1, 10)
+        self.assertEqual(os.path.getsize(self.log), 2 * one, "fixture assumption")
+        self.assertEqual(len(self._lines()), 2, "a ledger AT the cap is within it")
+
+    def test_one_byte_over_the_cap_rotates_to_the_keep_window(self):
+        one = self._one_line_bytes()
+        pending.EVICTIONS_LOG_MAX_BYTES = 2 * one - 1
+        with redirect_stderr(io.StringIO()):
+            pending._log_eviction("aaaa.json", 10, "count", 1, 10)
+        self.assertEqual(len(self._lines()), 1, "over the cap, rotation runs")
 
 
 if __name__ == "__main__":

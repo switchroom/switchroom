@@ -306,5 +306,74 @@ class HealthCheckRetryBoundaryTest(unittest.TestCase):
         self.assertEqual(slept, [])
 
 
+class SessionDocumentIdsPagingTest(unittest.TestCase):
+    """``session_document_ids`` must page until the server runs out.
+
+    The loop stops on a SHORT page (``len(items) < page``). With ``<=`` it
+    stops on a FULL one too, so a session with exactly one page of
+    documents reports only that page — and the #3244 recovery caller reads
+    a truncated set as "these turns were never retained" and restores
+    duplicates. A sweep found this uncovered: no test ever served more
+    than one page.
+    """
+
+    def _serve(self, pages):
+        """Serve ``pages`` (a list of lists of ids) by offset."""
+        seen = []
+
+        def handler(h):
+            import urllib.parse as up
+
+            q = up.parse_qs(up.urlparse(h.path).query)
+            offset = int(q.get("offset", ["0"])[0])
+            limit = int(q.get("limit", ["200"])[0])
+            seen.append((offset, limit))
+            idx = offset // limit
+            items = pages[idx] if idx < len(pages) else []
+            body = (
+                '{"items": ['
+                + ", ".join('{"id": "%s"}' % i for i in items)
+                + "]}"
+            ).encode()
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+
+        srv = _Server(("127.0.0.1", 0), _Handler)
+        srv.behaviour = handler
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return HindsightClient(f"http://127.0.0.1:{srv.server_address[1]}"), seen
+
+    def test_a_full_page_is_followed_by_another_request(self):
+        c, seen = self._serve([["a", "b"], ["c"]])
+        got = c.list_session_document_ids(BANK, "sess-1", page=2, timeout=5)
+        self.assertEqual(got, {"a", "b", "c"}, "a full page must not end the walk")
+        self.assertEqual([o for o, _ in seen], [0, 2])
+
+    def test_a_short_page_ends_the_walk(self):
+        c, seen = self._serve([["a"], ["never-fetched"]])
+        got = c.list_session_document_ids(BANK, "sess-1", page=2, timeout=5)
+        self.assertEqual(got, {"a"})
+        self.assertEqual(len(seen), 1, "a short page means the server is done")
+
+    def test_an_exactly_full_last_page_costs_one_empty_confirmation(self):
+        """The walk cannot know a full page was the last one without asking."""
+        c, seen = self._serve([["a", "b"], []])
+        got = c.list_session_document_ids(BANK, "sess-1", page=2, timeout=5)
+        self.assertEqual(got, {"a", "b"})
+        self.assertEqual(len(seen), 2)
+
+    def test_max_pages_bounds_the_walk(self):
+        c, seen = self._serve([["a", "b"]] * 10)
+        c.list_session_document_ids(BANK, "sess-1", page=2, max_pages=3, timeout=5)
+        self.assertEqual(len(seen), 3, "max_pages is a hard bound")
+
+
 if __name__ == "__main__":
     unittest.main()
