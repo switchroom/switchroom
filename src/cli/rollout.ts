@@ -843,10 +843,26 @@ export function executeRollout(
         emit({ phase: "web-refresh", target });
         const r = deps.run(["webd", "install", "--tag", target, ...downgradeArgs]);
         if (r.status !== 0) {
+          // A TIMED-OUT refresh is not the same failure as a non-zero exit,
+          // and the difference is operationally load-bearing. `deps.run`
+          // reports both as `status !== 0`, so without this branch a killed
+          // `webd install` produces the generic warning that tells the
+          // operator to re-run it IMMEDIATELY — while the killed CLI's
+          // `docker` grandchildren may still be live and mutating the same
+          // container. That is the same "grandchildren are NOT killed with
+          // it" signal the restart-agent timeout branch surfaces; surface it
+          // here too rather than losing it.
           warnings.push(
-            `web refresh FAILED (non-fatal — agents already rolled) so ` +
-              `switchroom-web is still on the PRIOR version. Finish it ` +
-              `host-side: \`switchroom webd install --tag ${target}\`.`,
+            r.timedOut
+              ? `web refresh TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms and was ` +
+                  `killed (non-fatal — agents already rolled) so switchroom-web ` +
+                  `is still on the PRIOR version. Its \`docker\` grandchildren ` +
+                  `are NOT killed with it: check for stray docker processes ` +
+                  `host-side BEFORE re-running, then finish it host-side: ` +
+                  `\`switchroom webd install --tag ${target}\`.`
+              : `web refresh FAILED (non-fatal — agents already rolled) so ` +
+                  `switchroom-web is still on the PRIOR version. Finish it ` +
+                  `host-side: \`switchroom webd install --tag ${target}\`.`,
           );
           break;
         }
@@ -880,7 +896,19 @@ export function executeRollout(
             (execOpts.allowDowngrade ? " --allow-downgrade" : ""),
         );
         const r = deps.run(["hostd", "install", "--tag", target, ...downgradeArgs]);
-        if (r.status !== 0) warnings.push(`hostd refresh failed (non-fatal); agents already rolled`);
+        // Same timeout-vs-exit distinction as refresh-web above: a killed
+        // `hostd install` leaves live `docker` grandchildren, so the operator
+        // must sweep for strays before re-running it.
+        if (r.status !== 0)
+          warnings.push(
+            r.timedOut
+              ? `hostd refresh TIMED OUT after ${ROLLOUT_RUN_TIMEOUT_MS}ms and ` +
+                  `was killed (non-fatal; agents already rolled). Its \`docker\` ` +
+                  `grandchildren are NOT killed with it: check for stray docker ` +
+                  `processes host-side BEFORE re-running \`switchroom hostd ` +
+                  `install --tag ${target}\`.`
+              : `hostd refresh failed (non-fatal); agents already rolled`,
+          );
         break;
       }
       case "refresh-hindsight": {
@@ -1179,13 +1207,28 @@ export function createRolloutDeps(params: {
    * belt-and-braces — see DOCKER_INSPECT_TIMEOUT_MS / DOCKER_PROBE_TIMEOUT_MS).
    * Threading through the injected `spawn` is also what makes the bound
    * unit-assertable without docker.
+   *
+   * Fails CLOSED on a throw. `isHindsightContainerExists`'s module default
+   * (`defaultDockerProbe`, `src/setup/hindsight.ts`) wraps its `execFileSync`
+   * in try/catch, so before this runner was threaded in, ANY throw from the
+   * probe became a clean `false` (→ "no hindsight container → skip"). Node's
+   * `spawnSync` reports failures on `r.error` rather than throwing —
+   * ENOENT included — so a throw here is theoretical, but "theoretical" is
+   * not a contract: swallowing it keeps the injected runner's failure shape
+   * identical to the default it replaces, instead of letting an unexpected
+   * throw escape `executeRollout` mid-roll after every agent has restarted.
    */
   const dockerRun: DockerRunner = (args) => {
-    const r = spawn("docker", args, {
-      encoding: "utf8",
-      timeout: ROLLOUT_PROBE_TIMEOUT_MS,
-      killSignal: ROLLOUT_KILL_SIGNAL,
-    });
+    let r: ReturnType<RolloutSpawnSync>;
+    try {
+      r = spawn("docker", args, {
+        encoding: "utf8",
+        timeout: ROLLOUT_PROBE_TIMEOUT_MS,
+        killSignal: ROLLOUT_KILL_SIGNAL,
+      });
+    } catch {
+      return { ok: false, stdout: "", stderr: "" };
+    }
     if (isSpawnTimeout(r, ROLLOUT_KILL_SIGNAL)) {
       warn(
         `⚠️  rollout: \`docker ${args.join(" ")}\` did not answer within ` +

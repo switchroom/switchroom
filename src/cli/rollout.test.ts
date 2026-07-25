@@ -1365,6 +1365,92 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
     // Fails closed: refresh-hindsight no-ops instead of blocking forever.
     expect(deps.hindsightExists?.()).toBe(false);
   });
+
+  // LOW-3 — fail-closed parity with the probe default this runner replaces.
+  //
+  // `isHindsightContainerExists`'s module default (`defaultDockerProbe`,
+  // src/setup/hindsight.ts) wraps its `execFileSync` in try/catch, so ANY
+  // throw became a clean `false`. The injected `dockerRun` had no try/catch,
+  // so a throw would escape `executeRollout` mid-roll — AFTER every agent has
+  // already restarted. spawnSync reports failures on `r.error` rather than
+  // throwing (ENOENT included), so this is parity insurance, not a live bug.
+  it("a THROWING docker spawn still fails closed for hindsightExists", () => {
+    const deps = depsWith(() => {
+      throw new Error("spawnSync exploded");
+    });
+    expect(() => deps.hindsightExists?.()).not.toThrow();
+    expect(deps.hindsightExists?.()).toBe(false);
+  });
+
+  it("a THROWING docker spawn yields an unknown web tag rather than escaping", () => {
+    const deps = depsWith(() => {
+      throw new Error("spawnSync exploded");
+    });
+    expect(() => deps.webImageTag?.()).not.toThrow();
+    expect(deps.webImageTag?.()).toBeNull();
+  });
+});
+
+// ── LOW-2: a TIMED-OUT web/hostd refresh must say so ──────────────────────
+//
+// Both steps gate only on `r.status !== 0`, and `deps.run` reports a SIGKILLed
+// child as `status: 1`. So a timed-out `webd install` / `hostd install`
+// produced the generic non-fatal warning that tells the operator to re-run the
+// command IMMEDIATELY — while the killed CLI's `docker` grandchildren may
+// still be live and mutating the same container. That's the same
+// "grandchildren are NOT killed with it" hazard the restart-agent timeout
+// branch already surfaces; these steps must surface it too.
+describe("executeRollout — a timed-out web/hostd refresh names the timeout", () => {
+  const TARGET = "v0.19.4";
+
+  /** Deps whose `webd`/`hostd` spawns report a timeout kill. */
+  function timedOutRefreshDeps(which: "webd" | "hostd"): RolloutDeps {
+    const { deps: base } = harness({ versions: { clerk: "0.19.4" } });
+    return {
+      ...base,
+      run: (args, o) => {
+        const r = base.run(args, o);
+        return args[0] === which ? { status: 1, timedOut: true } : r;
+      },
+    };
+  }
+
+  it("refresh-web: the warning says TIMED OUT and to sweep strays BEFORE re-running", () => {
+    const deps = timedOutRefreshDeps("webd");
+    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    // Still non-fatal — agents already rolled.
+    expect(r.ok).toBe(true);
+    const w = r.warnings.find((x) => /web refresh/.test(x));
+    expect(w).toBeTruthy();
+    expect(w).toMatch(/TIMED OUT/);
+    expect(w).toMatch(/grandchildren are NOT killed with it/);
+    expect(w).toMatch(/BEFORE re-running/);
+    expect(w).toContain(`switchroom webd install --tag ${TARGET}`);
+  });
+
+  it("refresh-hostd: the warning says TIMED OUT and to sweep strays BEFORE re-running", () => {
+    const deps = timedOutRefreshDeps("hostd");
+    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    expect(r.ok).toBe(true);
+    const w = r.warnings.find((x) => /hostd refresh/.test(x));
+    expect(w).toBeTruthy();
+    expect(w).toMatch(/TIMED OUT/);
+    expect(w).toMatch(/grandchildren are NOT killed with it/);
+    expect(w).toMatch(/BEFORE re-running/);
+    expect(w).toContain(`switchroom hostd install --tag ${TARGET}`);
+  });
+
+  it("an ordinary non-zero refresh exit keeps the plain wording (shapes stay disjoint)", () => {
+    const { deps } = harness({
+      versions: { clerk: "0.19.4" },
+      runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
+    });
+    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.join(" ")).not.toMatch(/TIMED OUT/);
+    expect(r.warnings.some((w) => /web refresh FAILED/.test(w))).toBe(true);
+    expect(r.warnings.some((w) => /hostd refresh failed \(non-fatal\)/.test(w))).toBe(true);
+  });
 });
 
 describe("createRolloutDeps — a timeout can never be reported as success", () => {
