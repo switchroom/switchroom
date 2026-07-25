@@ -4059,8 +4059,10 @@ export function integrationRetractionKeys(
  *     repo or the agent image.
  *   - cloakbrowser Python tool: baked into the agent image at
  *     `/opt/cloakbrowser` (public OSS, no constraint violation).
- *   - cloakbrowser Chromium: operator-mounted from `~/.cloakbrowser/`
- *     so the whole fleet shares one ~700MB install.
+ *   - cloakbrowser Chromium: operator-mounted RO from
+ *     `~/.switchroom/cloakbrowser/` onto the image's
+ *     CLOAKBROWSER_CACHE_DIR (`/opt/switchroom/cloakbrowser-cache`) so
+ *     the whole fleet shares one ~700MB install (#TBD).
  *
  * Credential injection: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN /
  * FIRECRAWL_API_KEY are fetched from the vault-broker by start.sh.hbs

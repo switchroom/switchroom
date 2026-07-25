@@ -2784,21 +2784,40 @@ function emitAgentService(
   // any per-agent install. existsSync-guarded because dev installs
   // without webkite staged should not hard-fail compose `up`.
   //
-  // Cloakbrowser's stealth Chromium (~700MB extracted) lives at the
-  // operator's `~/.cloakbrowser/` (cloakbrowser hardcodes that path).
-  // Mounted RO at the per-agent HOME so cloakbrowser's runtime lookup
-  // (`$HOME/.cloakbrowser/chromium-*/chrome`) resolves to the shared
-  // operator install — one ~700MB copy on disk instead of N. The
-  // cloakbrowser pipx tool itself is baked into the agent image
+  // Cloakbrowser's stealth Chromium (~700MB extracted) is shared fleet-
+  // wide from `~/.switchroom/cloakbrowser/`, mounted RO onto the image's
+  // fixed CLOAKBROWSER_CACHE_DIR (`/opt/switchroom/cloakbrowser-cache`,
+  // set in Dockerfile.agent) — one ~700MB copy on disk instead of N.
+  //
+  // #TBD: this used to shadow `$HOME/.cloakbrowser` from the operator's
+  // stray `~/.cloakbrowser`, on the belief that cloakbrowser hardcodes
+  // that path. It does NOT — `cloakbrowser/config.py::get_cache_dir()`
+  // reads CLOAKBROWSER_CACHE_DIR and only defaults to `~/.cloakbrowser`.
+  // The old source also sat OUTSIDE `~/.switchroom/`, which is the only
+  // subtree hostd bind-mounts, so the existsSync guard was always false
+  // whenever compose was generated from hostd — the mount was silently
+  // never emitted and every agent downloaded its own private 697MB copy.
+  // Keeping the source under `~/.switchroom/` keeps the probe truthful in
+  // both the host-CLI and hostd generation contexts.
+  //
+  // The target sits under `/opt/switchroom`, which BIND_MOUNT_TARGET_DENYLIST
+  // reserves for switchroom-owned image paths — i.e. an operator cannot
+  // shadow or redirect this cache from yaml. That's the point.
+  //
+  // The `:ro` is load-bearing, not incidental: a shared WRITABLE browser
+  // cache would let any one agent rewrite a Chromium binary that every
+  // other agent then executes as itself. Do not relax it.
+  //
+  // The cloakbrowser pipx tool itself is baked into the agent image
   // (Dockerfile.agent) so the venv shebang lines resolve in-container.
   if (existsSync(`${probeHome}/.switchroom/bin/webkite`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/bin/webkite:/usr/local/bin/webkite:ro`,
     );
   }
-  if (existsSync(`${probeHome}/.cloakbrowser`)) {
+  if (existsSync(`${probeHome}/.switchroom/cloakbrowser`)) {
     lines.push(
-      `      - ${homePrefix}/.cloakbrowser:/state/agent/home/.cloakbrowser:ro`,
+      `      - ${homePrefix}/.switchroom/cloakbrowser:/opt/switchroom/cloakbrowser-cache:ro`,
     );
   }
   // Operator-authored shared webkite config (e.g. defaults.format,

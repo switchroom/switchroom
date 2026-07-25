@@ -975,7 +975,7 @@ describe("generateCompose", () => {
     try {
       mkdirSync(join(tmp, ".switchroom", "bin"), { recursive: true });
       writeFileSync(join(tmp, ".switchroom", "bin", "webkite"), "#!/bin/sh\n");
-      mkdirSync(join(tmp, ".cloakbrowser", "chromium-1"), { recursive: true });
+      mkdirSync(join(tmp, ".switchroom", "cloakbrowser", "chromium-1"), { recursive: true });
       mkdirSync(join(tmp, ".switchroom", "webkite"), { recursive: true });
       writeFileSync(join(tmp, ".switchroom", "webkite", "config.toml"), "");
       const out = generateCompose({
@@ -986,7 +986,7 @@ describe("generateCompose", () => {
         `${tmp}/.switchroom/bin/webkite:/usr/local/bin/webkite:ro`,
       );
       expect(out).toContain(
-        `${tmp}/.cloakbrowser:/state/agent/home/.cloakbrowser:ro`,
+        `${tmp}/.switchroom/cloakbrowser:/opt/switchroom/cloakbrowser-cache:ro`,
       );
       expect(out).toContain(
         `${tmp}/.switchroom/webkite/config.toml:/state/agent/home/.config/webkite/config.toml:ro`,
@@ -1011,7 +1011,7 @@ describe("generateCompose", () => {
         homeDir: tmp,
       });
       expect(out).not.toContain(`/.switchroom/bin/webkite:`);
-      expect(out).not.toContain(`/.cloakbrowser:`);
+      expect(out).not.toContain(`/.switchroom/cloakbrowser:`);
       expect(out).not.toContain(`/.switchroom/webkite/config.toml:`);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
@@ -3210,6 +3210,47 @@ describe("conditional-mount probe home (in-hostd apply — marko meta_pages regr
     // existsSync(/home/op/.switchroom/mcp-launchers) is false → not mounted.
     // This is exactly the in-hostd failure mode the probeHomeDir split fixes.
     expect(yaml).not.toContain("/.switchroom/mcp-launchers:");
+  });
+
+  // #TBD: the cloakbrowser shared-Chromium mount used to probe (and bake)
+  // `~/.cloakbrowser`, which sits OUTSIDE the only subtree hostd bind-mounts
+  // (`~/.switchroom/`). So on every in-hostd generation the existsSync guard
+  // was false and the mount was silently never emitted — each agent then
+  // downloaded its own private ~697MB Chromium (5 agents ≈ 3.4GB observed).
+  // Moving the source under `~/.switchroom/` makes the probe truthful in the
+  // hostd context. This test fails on pristine main.
+  it("emits the shared cloakbrowser mount on an in-hostd apply (#TBD)", () => {
+    // Mirror hostd exactly: only ~/.switchroom is visible at probeHomeDir.
+    mkdirSync(join(tmpDir, ".switchroom", "cloakbrowser", "chromium-146.0"), {
+      recursive: true,
+    });
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op", // baked source — does NOT exist on this filesystem
+      probeHomeDir: tmpDir, // container-real home (mirrors /host-home in hostd)
+    });
+    expect(yaml).toContain(
+      "/home/op/.switchroom/cloakbrowser:/opt/switchroom/cloakbrowser-cache:ro",
+    );
+    // The legacy HOME-shadowing target must be gone: cloakbrowser resolves
+    // the cache via CLOAKBROWSER_CACHE_DIR, not via $HOME/.cloakbrowser.
+    expect(yaml).not.toContain("/state/agent/home/.cloakbrowser");
+  });
+
+  it("keeps the shared cloakbrowser mount read-only (#TBD)", () => {
+    // Load-bearing: a shared WRITABLE browser cache would let one agent
+    // rewrite a Chromium binary every other agent executes as itself.
+    mkdirSync(join(tmpDir, ".switchroom", "cloakbrowser", "chromium-146.0"), {
+      recursive: true,
+    });
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op",
+      probeHomeDir: tmpDir,
+    });
+    expect(yaml).not.toContain(
+      "/home/op/.switchroom/cloakbrowser:/opt/switchroom/cloakbrowser-cache:rw",
+    );
   });
 
   // #2387: a conditional dir that is a symlink to an ABSOLUTE host path
