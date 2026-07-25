@@ -32,11 +32,24 @@
  *
  * File format: JSON array of PersistedApprovalCard objects. Written
  * synchronously (mode 0o600) to avoid interleaving on concurrent card posts;
- * production rate is a handful of cards, so the file stays tiny.
+ * production rate is a handful of cards, so the file stays tiny. The write
+ * goes through `atomicWriteFileSync` (tmp + fsync + rename) so a crash
+ * mid-persist can never leave a torn file behind — the destination holds
+ * either the whole previous array or the whole new one. A file that IS
+ * corrupt (from a pre-fix write, or anything else) is quarantined and logged
+ * loudly rather than silently read as "no pending cards" — see
+ * `store-file.ts`. NOTE: atomic REPLACEMENT only — whole-old-or-whole-new, not
+ * power-loss durability; the missing parent-directory fsync is tracked in #3603.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, chmodSync } from 'node:fs'
+import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
+import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import {
+  preserveUnreadableStoreFile,
+  quarantineCorruptStoreFile,
+  readStoreJsonSync,
+} from './store-file.js'
 
 /** The four agent-initiated approval-card families we persist. */
 export type ApprovalCardFamily =
@@ -111,30 +124,47 @@ export interface PendingCardStore {
   clear(): void
 }
 
-export function createPendingCardStore(stateDir: string): PendingCardStore {
+export function createPendingCardStore(
+  stateDir: string,
+  /** Log sink — defaults to stderr (the gateway's runtime log). */
+  log: (line: string) => void = l => process.stderr.write(l),
+): PendingCardStore {
   const filePath = join(stateDir, 'pending-approval-cards.json')
 
+  /** Set when the last read failed for a non-ENOENT reason — the next write
+   * must preserve the file it could not read instead of clobbering it. */
+  let unreadable = false
+
   function read(): PersistedApprovalCard[] {
-    try {
-      const raw = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(raw)
-      return Array.isArray(parsed) ? (parsed as PersistedApprovalCard[]) : []
-    } catch {
+    const result = readStoreJsonSync(filePath, 'pending-card-store', log)
+    unreadable = result.status === 'unreadable'
+    if (result.status !== 'ok') return []
+    if (!Array.isArray(result.value)) {
+      quarantineCorruptStoreFile(
+        filePath,
+        'pending-card-store',
+        'parsed to a non-array — not a pending-card file',
+        log,
+      )
       return []
     }
+    return result.value as PersistedApprovalCard[]
   }
 
   function write(entries: PersistedApprovalCard[]): void {
     try {
-      writeFileSync(filePath, JSON.stringify(entries), { encoding: 'utf-8', mode: 0o600 })
-      // `mode` only applies when writeFileSync CREATES the file; an existing
-      // file keeps its prior perms. Re-assert 0600 on every write so the file
-      // can never stay laxer than intended.
-      chmodSync(filePath, 0o600)
+      // Fail closed: never let an overwrite be what destroys state we merely
+      // failed to READ (flaky mount, transient EACCES) — throws if it can't.
+      if (unreadable) {
+        preserveUnreadableStoreFile(filePath, 'pending-card-store', log)
+        unreadable = false
+      }
+      // tmp + fsync + rename, mode pinned to 0600 on the tempfile fd (so an
+      // existing file can't keep laxer perms, and a crash mid-write leaves
+      // the previous good file untouched).
+      atomicWriteFileSync(filePath, JSON.stringify(entries), 0o600)
     } catch (err) {
-      process.stderr.write(
-        `telegram gateway: pending-card-store write failed: ${(err as Error).message}\n`,
-      )
+      log(`telegram gateway: pending-card-store write failed: ${(err as Error).message}\n`)
     }
   }
 

@@ -32,11 +32,18 @@
  * {@link MAX_QUEUE_SIZE} below, and the tests that pin them.
  *
  * File format mirrors `missed-approvals-store.ts`: a single bounded JSON
- * array, written synchronously, mode 0o600.
+ * array, written synchronously and ATOMICALLY (tmp + fsync + rename),
+ * mode 0o600 — a crash mid-persist leaves the previous queue intact
+ * instead of a torn file. NOTE: atomic REPLACEMENT only —
+ * whole-old-or-whole-new, not power-loss durability; the missing
+ * parent-directory fsync is tracked in #3603.
  *
  * Failure semantics (hardened post-#2973 adversarial review): a failed
- * READ degrades to an empty list — a corrupt/missing queue file is not
- * fatal, it just means "nothing queued yet". A failed WRITE is a
+ * READ degrades to an empty list so the gateway still boots — but a
+ * CORRUPT file is no longer silent: the bytes are quarantined to
+ * `<file>.corrupt-<ts>` and a loud line goes to the log (see
+ * `store-file.ts`), because "queue silently came up empty" is exactly
+ * how queued retries disappeared unnoticed. A failed WRITE is a
  * different story: silently swallowing it would mean `enqueue()` tells
  * its caller "queued for retry" when nothing was actually persisted to
  * disk, and a concurrent `recordAttempt()`/`remove()` would silently
@@ -51,8 +58,14 @@
  * success.
  */
 
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { writeFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
+import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import {
+  preserveUnreadableStoreFile,
+  quarantineCorruptStoreFile,
+  readStoreJsonSync,
+} from './store-file.js'
 
 /** Hard cap on retry attempts per entry — never retry indefinitely. */
 export const MAX_ATTEMPTS = 5
@@ -161,13 +174,33 @@ export function computeBackoffMs(attempts: number, retryAfterMs?: number): numbe
   return exp
 }
 
+/**
+ * The real writer: `atomicWriteFileSync` (tmp + fsync + rename) behind a
+ * `writeFileSync`-shaped signature, so the injectable seam below keeps its
+ * existing type and the fault-injection tests are unaffected. Only `mode`
+ * from the options bag is meaningful here; the store always passes 0o600.
+ */
+export const atomicWriteSeam = ((path, data, opts) => {
+  const mode = typeof opts === 'object' && opts !== null && typeof opts.mode === 'number' ? opts.mode : 0o600
+  atomicWriteFileSync(path as string, data as string, mode)
+}) as typeof writeFileSync
+
 export function createAlwaysAllowPersistQueue(
   stateDir: string,
   /** Injectable for tests to force a write failure (disk full / permissions /
    * read-only fs) without real filesystem faults — we run as root in CI/
    * containers, so chmod-based permission tricks don't reliably fail, and
-   * bun's test runner doesn't support mocking node:fs built-ins. */
-  writeFileSyncFn: typeof writeFileSync = writeFileSync,
+   * bun's test runner doesn't support mocking node:fs built-ins.
+   *
+   * CAUTION: a test that injects a seam replaces the ATOMIC writer. Such a
+   * test proves failure PROPAGATION, never atomicity — the injected function
+   * is whatever the test supplies (typically a plain `writeFileSync`, which
+   * is exactly the non-atomic writer this store moved off). Tests that mean
+   * to exercise the real write path must either leave this defaulted or wrap
+   * the exported {@link atomicWriteSeam}. */
+  writeFileSyncFn: typeof writeFileSync = atomicWriteSeam,
+  /** Log sink — defaults to stderr (the gateway's runtime log). */
+  log: (line: string) => void = l => process.stderr.write(l),
 ): AlwaysAllowPersistQueue {
   const filePath = join(stateDir, 'always-allow-persist-queue.json')
 
@@ -183,6 +216,26 @@ export function createAlwaysAllowPersistQueue(
   // single promise chain, so at most one is ever in flight at a time,
   // regardless of how many callers invoke enqueue/recordAttempt/remove
   // "concurrently".
+  //
+  // SCOPE (verified, not assumed): this is an IN-PROCESS promise chain, not
+  // an OS file lock. It serializes callers inside ONE gateway process only.
+  // Two gateway processes sharing a STATE_DIR WOULD still lose updates to
+  // each other, and that is not impossible — only rare. `startup-mutex.ts`
+  // makes concurrent gateways UNLIKELY, not unreachable: its bootMismatch
+  // path steals the lock with NO liveness check when the holder's bootId
+  // differs from the current one (exactly the restart-overlap case on a
+  // shared STATE_DIR — see the `boot.lock_stale_recovered_boot_mismatch`
+  // revert referenced at gateway.ts), `readCurrentBootId()` returns null
+  // off-Linux which disables the gate entirely, the lock is taken once at
+  // boot and never revalidated, and `isGatewayMain` lets harnesses bypass
+  // it. So: rare, not guaranteed.
+  //
+  // Cross-process mutual exclusion is deliberately OUT OF SCOPE for this
+  // change (which is about torn writes, not lost updates), and every write
+  // here is now atomic so an overlap can lose an update but can never
+  // corrupt the file. A real `flock` (cf. src/vault/flock-concurrent.test.ts)
+  // is the durable fix — tracked as follow-up. Do not read the startup mutex
+  // as a hard singleton invariant.
   let lock: Promise<unknown> = Promise.resolve()
   function withLock<T>(fn: () => T): Promise<T> {
     const result = lock.then(fn, fn) // run fn even if the previous link rejected
@@ -192,14 +245,39 @@ export function createAlwaysAllowPersistQueue(
     return result
   }
 
+  /** Set when the last read failed for a non-ENOENT reason — the next write
+   * must preserve the file it could not read instead of clobbering it. */
+  let unreadable = false
+
   function read(): FileShape {
-    try {
-      const raw = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(raw) as Partial<FileShape>
-      return { entries: Array.isArray(parsed?.entries) ? parsed.entries : [] }
-    } catch {
+    const result = readStoreJsonSync(filePath, 'always-allow-persist-queue', log)
+    unreadable = result.status === 'unreadable'
+    if (result.status !== 'ok') return { entries: [] }
+    const parsed = result.value as Partial<FileShape>
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      quarantineCorruptStoreFile(
+        filePath,
+        'always-allow-persist-queue',
+        'parsed to a non-object — not a persist-queue file',
+        log,
+      )
       return { entries: [] }
     }
+    // A PRESENT-but-non-array `entries` is corruption, not "empty queue".
+    // Coercing it to [] would resurrect the silent-loss bug: a half-written
+    // `{"entries": {}}` parses fine, so quarantine would never fire and the
+    // queued retries would vanish unnoticed. An ABSENT `entries` is the
+    // legitimate cold-start/partial-shape case and stays silent.
+    if (parsed.entries !== undefined && !Array.isArray(parsed.entries)) {
+      quarantineCorruptStoreFile(
+        filePath,
+        'always-allow-persist-queue',
+        '`entries` is present but not an array — truncated or malformed write',
+        log,
+      )
+      return { entries: [] }
+    }
+    return { entries: parsed.entries ?? [] }
   }
 
   /** Unlike `read()`, a write failure is NOT swallowed — it propagates so
@@ -207,6 +285,14 @@ export function createAlwaysAllowPersistQueue(
    * not actually land on disk (disk full, permissions, etc.) instead of
    * silently proceeding as if it had. */
   function write(f: FileShape): void {
+    // Fail closed: never let an overwrite be what destroys a queue we merely
+    // failed to READ (flaky mount, transient EACCES) — this throws if the
+    // previous bytes can't be preserved, and that throw is exactly the
+    // propagate-don't-swallow contract above.
+    if (unreadable) {
+      preserveUnreadableStoreFile(filePath, 'always-allow-persist-queue', log)
+      unreadable = false
+    }
     writeFileSyncFn(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
   }
 

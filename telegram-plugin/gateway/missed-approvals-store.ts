@@ -19,13 +19,24 @@
  * record and edits the card closed.
  *
  * File format: a single JSON object `{ pending, delivered }`, written
- * synchronously to avoid interleaving on concurrent auto-denies, mode 0o600.
- * Mirrors the `permission-card-store.ts` pattern. Both lists are hard-capped
- * so the file stays tiny under a runaway loop.
+ * synchronously to avoid interleaving on concurrent auto-denies, mode 0o600,
+ * ATOMICALLY (tmp + fsync + rename) so a crash mid-persist can't leave a torn
+ * file. Mirrors the `permission-card-store.ts` pattern. Both lists are
+ * hard-capped so the file stays tiny under a runaway loop. A corrupt file is
+ * quarantined and logged loudly rather than silently read as "nothing was
+ * missed" — see store-file.ts. NOTE: atomic REPLACEMENT only —
+ * whole-old-or-whole-new, not power-loss durability; the missing
+ * parent-directory fsync is tracked in #3603.
  */
 
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
+import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import {
+  preserveUnreadableStoreFile,
+  quarantineCorruptStoreFile,
+  readStoreJsonSync,
+} from './store-file.js'
 
 export interface MissedApproval {
   /** The permission request_id that timed out (dedup key). */
@@ -80,29 +91,67 @@ export interface MissedApprovalsStore {
 export const MAX_PENDING = 50
 export const MAX_DELIVERED = 20
 
-export function createMissedApprovalsStore(stateDir: string): MissedApprovalsStore {
+export function createMissedApprovalsStore(
+  stateDir: string,
+  /** Log sink — defaults to stderr (the gateway's runtime log). */
+  log: (line: string) => void = l => process.stderr.write(l),
+): MissedApprovalsStore {
   const filePath = join(stateDir, 'missed-approvals.json')
 
+  const EMPTY = (): FileShape => ({ pending: [], delivered: [] })
+
+  /** Set when the last read failed for a non-ENOENT reason — the next write
+   * must preserve the file it could not read instead of clobbering it. */
+  let unreadable = false
+
   function read(): FileShape {
-    try {
-      const raw = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(raw) as Partial<FileShape>
-      return {
-        pending: Array.isArray(parsed?.pending) ? parsed.pending : [],
-        delivered: Array.isArray(parsed?.delivered) ? parsed.delivered : [],
+    const result = readStoreJsonSync(filePath, 'missed-approvals-store', log)
+    unreadable = result.status === 'unreadable'
+    if (result.status !== 'ok') return EMPTY()
+    const parsed = result.value as Partial<FileShape>
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      quarantineCorruptStoreFile(
+        filePath,
+        'missed-approvals-store',
+        'parsed to a non-object — not a missed-approvals file',
+        log,
+      )
+      return EMPTY()
+    }
+    // A PRESENT-but-non-array list is corruption, not "empty". Coercing it to
+    // [] would resurrect the exact bug this store was hardened against: a
+    // half-written `{"pending": null}` parses fine, so quarantine would never
+    // fire and the digest would silently come up empty. An ABSENT list is the
+    // legitimate cold-start/partial-shape case and stays silent.
+    for (const field of ['pending', 'delivered'] as const) {
+      if (parsed[field] !== undefined && !Array.isArray(parsed[field])) {
+        quarantineCorruptStoreFile(
+          filePath,
+          'missed-approvals-store',
+          `\`${field}\` is present but not an array — truncated or malformed write`,
+          log,
+        )
+        return EMPTY()
       }
-    } catch {
-      return { pending: [], delivered: [] }
+    }
+    return {
+      pending: parsed.pending ?? [],
+      delivered: parsed.delivered ?? [],
     }
   }
 
   function write(f: FileShape): void {
     try {
-      writeFileSync(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
+      // Fail closed: never let an overwrite be what destroys state we merely
+      // failed to READ (flaky mount, transient EACCES).
+      if (unreadable) {
+        preserveUnreadableStoreFile(filePath, 'missed-approvals-store', log)
+        unreadable = false
+      }
+      // tmp + fsync + rename — never truncate the destination in place.
+      atomicWriteFileSync(filePath, JSON.stringify(f), 0o600)
     } catch (err) {
-      process.stderr.write(
-        `telegram gateway: missed-approvals-store write failed: ${(err as Error).message}\n`,
-      )
+      log(`telegram gateway: missed-approvals-store write failed: ${(err as Error).message}\n`)
     }
   }
 
