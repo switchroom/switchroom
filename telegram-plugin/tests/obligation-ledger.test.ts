@@ -5,6 +5,7 @@ import {
   obligationEscalationText,
   type Obligation,
 } from "../gateway/obligation-ledger.js";
+import { deriveTurnId } from "../gateway/derive-turn-id.js";
 
 function input(id: string, openedAt: number, text = "do the thing") {
   return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text, openedAt };
@@ -732,5 +733,60 @@ describe("ObligationLedger — #3550: the represent grace retires once its turn 
     expect(P({}, 6_000, REPR_GRACE, TRAIL)).toBe(false);
     // trailing grace disabled → the early-out is withheld
     expect(P({ lastRepresentedAt: 5_000, lastTurnEndedAt: 6_000 }, 10_000, REPR_GRACE, 0)).toBe(true);
+  });
+});
+
+describe("#3550 G2 — the seam that makes noteTurnEnded actually fire in production", () => {
+  // Every other #3550 test calls noteTurnEnded() directly, so they prove the
+  // LEDGER RULE but not the WIRING. In production the stamp only lands because
+  // the represent inbound round-trips back to the same key: the gateway builds
+  // the inbound from the obligation, and the turn it spawns derives its turn id
+  // from that inbound's chat/thread/message. noteTurnEnded is a keyed lookup —
+  // if `deriveTurnId(buildObligationRepresentInbound(o)) !== o.originTurnId` it
+  // silently no-ops, this entire fix goes dead in the field, and every other
+  // test in this file still passes green. That linkage was asserted only by a
+  // comment at obligation-wiring.ts:250-256. This pins it.
+  function obligationFor(chatId: string, threadId: number | undefined, messageId: number) {
+    const L = new ObligationLedger(2);
+    const originTurnId = deriveTurnId(chatId, threadId ?? null, messageId)!;
+    L.openIfAbsent({ originTurnId, chatId, threadId, messageId, text: "do the thing", openedAt: 0 });
+    return L.list()[0];
+  }
+
+  const cases: Array<[string, string, number | undefined, number]> = [
+    ["forum topic", "-100123", 3, 715],
+    ["DM (no thread)", "12345", undefined, 42],
+    ["general topic id 1", "-100999", 1, 8],
+  ];
+
+  for (const [label, chatId, threadId, messageId] of cases) {
+    it(`round-trips the origin id through the represent inbound — ${label}`, () => {
+      const o = obligationFor(chatId, threadId, messageId);
+      const inbound = buildObligationRepresentInbound(o, 1_000);
+      const derived = deriveTurnId(inbound.chatId, inbound.threadId ?? null, inbound.messageId);
+      expect(derived).toBe(o.originTurnId);
+    });
+  }
+
+  it("a represent-spawned turn's derived key actually reaches noteTurnEnded (end-to-end on the real seam)", () => {
+    const L = new ObligationLedger(2);
+    const originTurnId = deriveTurnId("-100123", 3, 715)!;
+    L.openIfAbsent({ originTurnId, chatId: "-100123", threadId: 3, messageId: 715, text: "x", openedAt: 0 });
+    L.markRepresented(originTurnId, 5_000);
+    // Stamp using ONLY what a represent-spawned turn would know: the inbound.
+    const inbound = buildObligationRepresentInbound(L.list()[0], 5_000);
+    const turnKey = deriveTurnId(inbound.chatId, inbound.threadId ?? null, inbound.messageId)!;
+    L.noteTurnEnded(turnKey, 15_000);
+    // If the seam drifted, noteTurnEnded no-ops, lastTurnEndedAt stays undefined,
+    // the #3550 early-out never fires, and this stays "none" until t=125_000.
+    expect(L.list()[0].lastTurnEndedAt).toBe(15_000);
+    expect(
+      L.decideAtIdle({ now: 15_000 + 45_000 + 1, graceMs: 45_000, representGraceMs: 120_000 }).action,
+    ).toBe("represent");
+  });
+
+  it("the represent inbound also echoes origin_turn_id in meta (the close-side half of the same seam)", () => {
+    const o = obligationFor("-100123", 3, 715);
+    expect(buildObligationRepresentInbound(o, 1_000).meta?.origin_turn_id).toBe(o.originTurnId);
   });
 });

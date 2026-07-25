@@ -95,6 +95,10 @@ function runSchedule(
   graceMs = 0,
   bgGraceMs = 0,
   bgAlwaysActive = false,
+  // #3550 — per-represent grace. Exercised so the determinism proof actually
+  // reaches `representGraceStillProtecting`; without this the fuzz never passes
+  // representGraceMs and the branch is unvisited.
+  representGraceMs = 0,
 ): Sim {
   const PATH = "/state/agent/telegram/obligations.json";
   const store = memStore();
@@ -107,6 +111,7 @@ function runSchedule(
   // terminal (no livelock).
   let clock = 1_000_000;
   const SWEEP_TICK = 5_000;
+  const TURN_DURATION = 1_000; // virtual ms a turn occupies before it ends
   const r = rng(seed);
 
   const pending = [...msgs]; // not yet received
@@ -130,7 +135,12 @@ function runSchedule(
     turnsHad.set(id, had + 1);
     if (byId.get(id)!.answerOnAttempt === attemptIndex) {
       close(id, "answered");
-    } else if (graceMs > 0 && ledger.isOpen(id)) {
+    } else if ((graceMs > 0 || representGraceMs > 0) && ledger.isOpen(id)) {
+      // A turn takes real time: its end is strictly LATER than the represent
+      // that triggered it. Without this the sim stamps lastTurnEndedAt equal to
+      // lastRepresentedAt and the #3550 early-out (which requires strictly
+      // greater) is never reached — the branch would go unproven.
+      clock += TURN_DURATION;
       ledger.noteTurnEnded(id, clock);
     }
   };
@@ -163,12 +173,13 @@ function runSchedule(
       deliverTurn(m.id); // original turn (attempt 0)
     } else if (open) {
       const decision =
-        graceMs > 0 || bgGraceMs > 0
+        graceMs > 0 || bgGraceMs > 0 || representGraceMs > 0
           ? ledger.decideAtIdle({
               now: clock,
               graceMs,
               backgroundWorkActive: bgGraceMs > 0 && bgAlwaysActive,
               backgroundGraceMs: bgGraceMs,
+              representGraceMs,
             })
           : ledger.decideAtIdle();
       if (decision.action === "none") {
@@ -181,7 +192,10 @@ function runSchedule(
       // INVARIANT (no double-ask): a terminated obligation must never resurface.
       expect(terminals.has(o.originTurnId)).toBe(false);
       if (decision.action === "represent") {
-        ledger.markRepresented(o.originTurnId);
+        // Stamp on the SAME virtual clock as noteTurnEnded, otherwise the
+        // per-represent window is measured against a wall-clock `Date.now()`
+        // default and never interacts with the grace under test.
+        ledger.markRepresented(o.originTurnId, clock);
         deliverTurn(o.originTurnId); // the re-present turn
       } else if (decision.action === "escalate") {
         if (ESC_IN_FLIGHT.has(o.originTurnId)) continue;
@@ -329,6 +343,54 @@ describe("obligation determinism — every inbound reaches a terminal, no silent
       for (const m of msgs) {
         const t = terminals.get(m.id);
         expect(t, `bg seed=${seed} msg=${m.id} answer=${m.answerOnAttempt} escFail=${m.escalateFailsFor}`).toBeDefined();
+        if (m.answerOnAttempt <= MAX_REPRESENTS) {
+          expect(t).toBe("answered");
+        } else if (m.escalateFailsFor < ESCALATE_MAX) {
+          expect(t).toBe("escalation-delivered");
+        } else {
+          expect(t).toBe("escalation-give-up");
+        }
+      }
+    }
+  });
+
+  it("holds across 3000 schedules WITH the per-represent grace on (#3550 — the retire-early branch never loses a terminal)", () => {
+    // #3550 added an early-out to the per-represent grace: the window is retired
+    // once a turn that started after the re-present has ENDED. This case exists
+    // because the other three fuzz proofs never pass `representGraceMs` at all,
+    // so none of them reach that branch — and a claim of fuzz coverage for the
+    // #3550 diff would be vacuous without it.
+    //
+    // In this schedule EVERY non-answering turn stamps noteTurnEnded after its
+    // re-present, so the early-out fires on essentially every rung — i.e. this
+    // exercises the changed branch densely rather than incidentally. The
+    // terminal each message reaches must still be IDENTICAL to the no-grace
+    // run: the early-out may only change WHEN the ladder advances, never WHERE
+    // it lands.
+    const ANSWER = [0, 1, 2, 3, 99];
+    const ESCFAIL = [0, 1, 2, 3, 5];
+    const GRACE_MS = 45_000;       // trailing-answer grace, still armed
+    const REPR_GRACE_MS = 120_000; // mirrors OBLIGATION_REPRESENT_GRACE_MS default
+    for (let seed = 1; seed <= 3000; seed++) {
+      const r = rng(seed * 7919);
+      const n = 1 + Math.floor(r() * 5);
+      const msgs: Msg[] = [];
+      for (let i = 0; i < n; i++) {
+        const msgId = seed * 100 + i;
+        msgs.push({
+          id: `c:3#${msgId}`,
+          msgId,
+          answerOnAttempt: pick(ANSWER, r),
+          escalateFailsFor: pick(ESCFAIL, r),
+        });
+      }
+      const { terminals, steps } = runSchedule(
+        msgs, seed * 104729, GRACE_MS, 0, false, REPR_GRACE_MS,
+      );
+      expect(steps).toBeLessThan(10_000); // no represent-grace livelock
+      for (const m of msgs) {
+        const t = terminals.get(m.id);
+        expect(t, `repr seed=${seed} msg=${m.id} answer=${m.answerOnAttempt} escFail=${m.escalateFailsFor}`).toBeDefined();
         if (m.answerOnAttempt <= MAX_REPRESENTS) {
           expect(t).toBe("answered");
         } else if (m.escalateFailsFor < ESCALATE_MAX) {
