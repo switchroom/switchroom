@@ -16,6 +16,8 @@
 #     claude on stdout still work.
 #   - Stderr is teed: visible in journald as before AND captured to a
 #     buffer so we can attach the tail to the issue detail.
+#   - On EVERY invocation, success or failure: append one JSON line
+#     carrying `duration_ms` to the hook-timing log (#3564).
 #   - On exit 0: auto-resolve any prior unresolved issue with the same
 #     fingerprint. So a transient flake clears itself on next success.
 #   - On non-zero exit: record an issue with severity=error, code = the
@@ -27,6 +29,45 @@
 #
 # The wrapper exits with the original command's exit code, so claude
 # code's hook contract (block / allow / non-zero behaviour) is preserved.
+#
+# ── Timing log (#3564) ──────────────────────────────────────────────────
+#
+# Before this, the wrapper logged ONLY failures — no timestamps, no
+# durations. That is why `secret-guard-pretool` could sit at ~145ms per
+# tool call for months (#3543) and `workspace-dynamic-hook` at ~825ms-1.1s
+# per message (#3546) without producing a single log line: neither was
+# FAILING, merely slow, and slow-but-successful was invisible.
+#
+# So every invocation now appends one JSON line to
+#   ${TELEGRAM_STATE_DIR}/hook-timings-<Ddd>.log        (Mon..Sun)
+# shaped as:
+#   {"ts":"...","date":"YYYY-MM-DD","source":"hook:x","code":"x.mjs",
+#    "duration_ms":142,"status":0}
+# so `grep duration_ms` answers any future hook-cost question.
+#
+# Cost discipline — the wrapper's own overhead was measured at 0-2ms and
+# must stay there, so the whole timing path is FORK-FREE:
+#   - `EPOCHREALTIME` (bash 5 builtin) for start/end, integer arithmetic
+#     for the delta. No `date`, no `stat`, no subshell.
+#   - The file name embeds the weekday, giving a self-truncating 7-day
+#     ring: on the first write of a new day the existing file's first line
+#     carries last week's date, so we truncate instead of appending. The
+#     staleness check is a builtin `read` from the file — measured
+#     0.024ms/append vs 0.81ms for a single `stat` fork, which is why
+#     size-based rotation was rejected here.
+# Measured net cost of `log_timing` (2000-iteration in-shell loop, a busy
+# build host): 0.40-0.78ms per invocation, dominated by the append's
+# open/write/close. That fits inside the stated 0-2ms wrapper budget with
+# room to spare; a `date` + `stat` implementation would not.
+#
+# Env:
+#   SWITCHROOM_HOOK_TIMING=0        disable timing log entirely
+#   SWITCHROOM_HOOK_TIMING_DIR      override the log directory
+#   SWITCHROOM_HOOK_TIMING_MIN_MS   only log invocations at/above this
+#                                   duration (default 0 = log everything;
+#                                   the whole failure mode here is that
+#                                   slow-but-successful is invisible, so
+#                                   the default must not filter).
 
 set -u
 
@@ -82,8 +123,14 @@ STATE_DIR="${TELEGRAM_STATE_DIR:-}"
 STDERR_TMP="$(mktemp -t run-hook-stderr.XXXXXX 2>/dev/null || mktemp)"
 trap 'rm -f "$STDERR_TMP" 2>/dev/null || true' EXIT
 
+# Fork-free monotonic-ish start stamp. EPOCHREALTIME is a bash 5 builtin;
+# on bash 4 it is unset and timing degrades to a silent no-op.
+TIMING_START="${EPOCHREALTIME:-}"
+
 "$COMMAND" "$@" 2>"$STDERR_TMP"
 STATUS=$?
+
+TIMING_END="${EPOCHREALTIME:-}"
 
 # Replay captured stderr to our own stderr now that the command has
 # fully exited — preserves journald visibility without the streaming
@@ -94,6 +141,102 @@ fi
 
 emit_warn() {
   echo "run-hook.sh: $1" >&2
+}
+
+# ── Timing log (#3564) ────────────────────────────────────────────────────
+#
+# Everything below is deliberately FORK-FREE: no command substitution (which
+# forks a subshell), no `date`, no `stat`. Helpers return values by assigning
+# to a caller-visible global rather than via `$(...)`.
+
+# Split EPOCHREALTIME ("1753412345.123456") into whole milliseconds.
+# LC_NUMERIC can make the separator a comma, so accept either.
+# Sets `_EPOCH_MS`; returns 1 (and leaves _EPOCH_MS empty) on a bad shape.
+_EPOCH_MS=""
+_epoch_to_ms() {
+  local raw="$1" secs usecs
+  _EPOCH_MS=""
+  case "$raw" in
+    *[.,]*) secs="${raw%%[.,]*}"; usecs="${raw#*[.,]}" ;;
+    *)      secs="$raw"; usecs="0" ;;
+  esac
+  case "$secs" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$usecs" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  # Pad/truncate the fractional part to exactly 6 digits, then force base 10
+  # so a leading zero is not read as octal.
+  usecs="${usecs}000000"
+  usecs="${usecs:0:6}"
+  _EPOCH_MS=$(( secs * 1000 + (10#$usecs) / 1000 ))
+  return 0
+}
+
+# JSON-escape into `_JSON_ESCAPED`. Hook sources and command basenames are
+# operator-authored and tame, but a backslash or quote in one must not be
+# able to emit a malformed line (or inject extra fields) into a log that
+# other tooling parses.
+_JSON_ESCAPED=""
+_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  _JSON_ESCAPED="$s"
+}
+
+log_timing() {
+  [ "${SWITCHROOM_HOOK_TIMING:-1}" = "0" ] && return 0
+  [ -n "$TIMING_START" ] || return 0
+  [ -n "$TIMING_END" ] || return 0
+
+  local timing_dir="${SWITCHROOM_HOOK_TIMING_DIR:-$STATE_DIR}"
+  [ -n "$timing_dir" ] || return 0
+  [ -d "$timing_dir" ] || return 0
+
+  local start_ms end_ms duration_ms
+  _epoch_to_ms "$TIMING_START" || return 0
+  start_ms="$_EPOCH_MS"
+  _epoch_to_ms "$TIMING_END" || return 0
+  end_ms="$_EPOCH_MS"
+  duration_ms=$(( end_ms - start_ms ))
+  # A clock step backwards must not emit a negative duration.
+  [ "$duration_ms" -lt 0 ] && duration_ms=0
+
+  local min_ms="${SWITCHROOM_HOOK_TIMING_MIN_MS:-0}"
+  case "$min_ms" in
+    ''|*[!0-9]*) min_ms=0 ;;
+  esac
+  [ "$duration_ms" -lt "$min_ms" ] && return 0
+
+  # Builtin date formatting — no `date` fork.
+  local today dow ts
+  printf -v today '%(%Y-%m-%d)T' -1
+  printf -v dow '%(%a)T' -1
+  printf -v ts '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+
+  local logfile="${timing_dir}/hook-timings-${dow}.log"
+
+  # 7-day self-truncating ring: the weekday-named file is either today's or
+  # exactly a week stale, so if its first line does not carry today's date,
+  # reset it. `read` from a file is a builtin — no fork.
+  if [ -s "$logfile" ]; then
+    local first=''
+    read -r first < "$logfile" 2>/dev/null || first=''
+    case "$first" in
+      *"\"date\":\"${today}\""*) : ;;
+      *) : > "$logfile" 2>/dev/null || return 0 ;;
+    esac
+  fi
+
+  local esc_source esc_code
+  _json_escape "$SOURCE"; esc_source="$_JSON_ESCAPED"
+  _json_escape "$CODE";   esc_code="$_JSON_ESCAPED"
+
+  printf '{"ts":"%s","date":"%s","source":"%s","code":"%s","duration_ms":%s,"status":%s}\n' \
+    "$ts" "$today" "$esc_source" "$esc_code" "$duration_ms" "$STATUS" \
+    >> "$logfile" 2>/dev/null || true
 }
 
 # When RUN_HOOK_DEBUG=1 is set, drop the stderr redirect on the
@@ -227,6 +370,11 @@ resolve_success() {
       >/dev/null 2>&1 || true
   fi
 }
+
+# Timing is emitted on EVERY path, including the degraded no-CLI path below
+# — it writes a file directly and does not need the switchroom CLI, so hook
+# cost stays observable even when issue tracking is off (#3564).
+log_timing
 
 if [ -z "$SWITCHROOM_CLI" ]; then
   # Degraded path. Emit a single warning so the operator knows visibility

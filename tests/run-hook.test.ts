@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  chmodSync,
+  readdirSync,
+  readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -297,6 +304,146 @@ describe("run-hook.sh", () => {
     const issues = listIssues() as Array<{ resolved_at?: number }>;
     expect(issues).toHaveLength(1);
     expect(issues[0].resolved_at).toBeDefined();
+  });
+
+  // ── Timing log (#3564) ─────────────────────────────────────────────────
+  //
+  // Before #3564 the wrapper logged ONLY failures, so a hook that regressed
+  // from 20ms to 500ms produced no log output at all. These assert the
+  // OUTCOME: a parseable duration_ms line exists per invocation and its
+  // value tracks the wrapped command's actual runtime.
+
+  function readTimingLines(dir = stateDir): Array<Record<string, unknown>> {
+    const files = readdirSync(dir).filter((f) => f.startsWith("hook-timings-"));
+    return files.flatMap((f) =>
+      readFileSync(join(dir, f), "utf-8")
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .map((l) => JSON.parse(l) as Record<string, unknown>),
+    );
+  }
+
+  it("logs a duration_ms line on SUCCESS (the previously invisible case)", () => {
+    const script = makeScript("ok.sh", "exit 0");
+    runHook("hook:timing-ok", script);
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].source).toBe("hook:timing-ok");
+    expect(lines[0].code).toBe("ok.sh");
+    expect(lines[0].status).toBe(0);
+    expect(typeof lines[0].duration_ms).toBe("number");
+    expect(typeof lines[0].ts).toBe("string");
+  });
+
+  it("logs a duration_ms line on FAILURE too, carrying the exit status", () => {
+    const script = makeScript("fail.sh", "exit 7");
+    runHook("hook:timing-fail", script);
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].status).toBe(7);
+    expect(typeof lines[0].duration_ms).toBe("number");
+  });
+
+  it("duration_ms reflects the wrapped command's real runtime", () => {
+    // A slow hook must be distinguishable from a fast one in the log —
+    // that is the entire point of #3564. 300ms of sleep must show up as
+    // >= 250ms (slack for timer granularity), and a no-op must not.
+    runHook("hook:timing-slow", makeScript("slow.sh", "sleep 0.3"));
+    runHook("hook:timing-fast", makeScript("fast.sh", "exit 0"));
+    const bySource = new Map(
+      readTimingLines().map((l) => [l.source as string, l.duration_ms as number]),
+    );
+    expect(bySource.get("hook:timing-slow")).toBeGreaterThanOrEqual(250);
+    expect(bySource.get("hook:timing-fast")).toBeLessThan(250);
+  });
+
+  it("appends one line per invocation", () => {
+    const script = makeScript("ok.sh", "exit 0");
+    runHook("hook:timing-a", script);
+    runHook("hook:timing-b", script);
+    runHook("hook:timing-c", script);
+    expect(readTimingLines()).toHaveLength(3);
+  });
+
+  it("still logs timing when the switchroom CLI is missing (degraded path)", () => {
+    // Issue recording is off on this path; hook cost must stay observable.
+    const script = makeScript("ok.sh", "exit 0");
+    // PATH keeps coreutils (the wrapper itself needs basename/mktemp) but
+    // excludes any `switchroom` binary, so the CLI lookup genuinely fails.
+    runHook("hook:timing-degraded", script, [], {
+      SWITCHROOM_CLI_PATH: "/nonexistent/switchroom",
+      PATH: "/usr/bin:/bin",
+    });
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].source).toBe("hook:timing-degraded");
+  });
+
+  it("SWITCHROOM_HOOK_TIMING=0 disables the log", () => {
+    const script = makeScript("ok.sh", "exit 0");
+    runHook("hook:timing-off", script, [], { SWITCHROOM_HOOK_TIMING: "0" });
+    expect(readTimingLines()).toHaveLength(0);
+  });
+
+  it("SWITCHROOM_HOOK_TIMING_MIN_MS filters out fast invocations", () => {
+    const script = makeScript("ok.sh", "exit 0");
+    runHook("hook:timing-under", script, [], {
+      SWITCHROOM_HOOK_TIMING_MIN_MS: "100000",
+    });
+    expect(readTimingLines()).toHaveLength(0);
+  });
+
+  it("SWITCHROOM_HOOK_TIMING_MIN_MS still logs invocations at or above the floor", () => {
+    // Paired with the test above on purpose (#3574 review, LOW). A filter
+    // that is merely "drop everything whenever MIN_MS is set" passes the
+    // 100000ms case perfectly while silently discarding the SLOW hooks the
+    // whole feature exists to surface. Only the over-the-floor half of the
+    // pair can catch that, so both halves must exist.
+    const script = makeScript("slow.sh", "sleep 0.3\nexit 0");
+    runHook("hook:timing-over", script, [], {
+      SWITCHROOM_HOOK_TIMING_MIN_MS: "50",
+    });
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].source).toBe("hook:timing-over");
+    expect(lines[0].duration_ms).toBeGreaterThanOrEqual(50);
+  });
+
+  it("escapes quotes and backslashes in the source so the line stays valid JSON", () => {
+    const script = makeScript("ok.sh", "exit 0");
+    const nasty = 'hook:"quo\\ted"';
+    runHook(nasty, script);
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].source).toBe(nasty);
+  });
+
+  it("truncates a weekday log left over from the previous week", () => {
+    // The log file name embeds the weekday, giving a self-truncating 7-day
+    // ring. A file whose first line carries a different date is last
+    // week's and must be reset, not appended to — otherwise the ring grows
+    // without bound.
+    const script = makeScript("ok.sh", "exit 0");
+    runHook("hook:ring", script);
+    const files = readdirSync(stateDir).filter((f) => f.startsWith("hook-timings-"));
+    expect(files).toHaveLength(1);
+    const logPath = join(stateDir, files[0]);
+    // Rewrite the file as if it were written seven days ago.
+    writeFileSync(
+      logPath,
+      JSON.stringify({
+        ts: "2000-01-01T00:00:00+0000",
+        date: "2000-01-01",
+        source: "hook:stale",
+        code: "old.sh",
+        duration_ms: 1,
+        status: 0,
+      }) + "\n",
+    );
+    runHook("hook:ring", script);
+    const lines = readTimingLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].source).toBe("hook:ring");
   });
 
   it("rejects malformed invocation (no source/command)", () => {

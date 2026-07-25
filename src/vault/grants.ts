@@ -15,7 +15,7 @@
  *     string reasons; use the exported `DenyReason` union instead.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as bcrypt from "bcryptjs";
 import type { Database } from "bun:sqlite";
 
@@ -113,6 +113,101 @@ export function migrateGrantsSchema(db: Database): void {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const BCRYPT_COST = 10;
+
+// ─── bcrypt-compare memo (#3574) ─────────────────────────────────────────────
+//
+// WHY: `bcryptjs` is pure JS. Measured on the fleet host, one
+// `bcrypt.compare` at BCRYPT_COST=10 costs ~57ms and BLOCKS the event loop
+// (8 concurrent compares took 459ms — i.e. fully serialized — and let
+// exactly ONE 1ms timer tick fire during that window). The broker is a
+// single process shared by every agent, and it calls validateGrant once per
+// `get` (server.ts:1284) plus once per `list` (server.ts:1105). So a hook
+// that reads N keys costs the broker N+1 × 57ms of SERIALIZED CPU, which no
+// amount of client-side concurrency can reduce. Under fleet load that
+// starves clients with short deadlines — for secret-guard-pretool.mjs the
+// result is a partial, nondeterministic key set and therefore SILENTLY
+// UNGUARDED secrets. That is a security bug, not just a latency bug.
+//
+// WHAT IS MEMOIZED — only the bcrypt comparison, nothing else:
+//
+//   key   = grantId : secret_hash : sha256(secret)
+//   value = the boolean `hashMatches`
+//
+// This is EXACT, not approximate. "Does this secret hash to this digest" is
+// an immutable mathematical fact for a fixed (secret, secret_hash) pair, so
+// a hit returns the same answer bcrypt would. The secret_hash is IN the key,
+// so rotating a grant's secret produces a different key and can never hit a
+// stale entry.
+//
+// WHAT IS NOT MEMOIZED — everything that can change: the row lookup,
+// revoked_at, expires_at, key_allow and write_allow are re-read from SQLite
+// on EVERY call, exactly as before. Revocation therefore still takes effect
+// on the very next request; the memo cannot keep a killed grant alive.
+//
+// Only POSITIVE results are stored: a cached negative would be a free
+// oracle for an attacker probing tokens, and rejects are not the hot path.
+// The raw secret is never stored — the key holds sha256(secret).
+//
+// The TTL and size cap are belt-and-braces (bound memory, bound the blast
+// radius of any assumption above being wrong), not the correctness argument.
+const COMPARE_MEMO_TTL_MS = 60_000;
+const COMPARE_MEMO_MAX_ENTRIES = 512;
+const compareMemo = new Map<string, number>(); // key → expiry epoch ms
+
+function memoKey(id: string, secretHash: string, secret: string): string {
+  return `${id}:${secretHash}:${createHash("sha256").update(secret).digest("hex")}`;
+}
+
+/**
+ * bcrypt.compare with an exact positive-result memo. See the block comment
+ * above for the (non-obvious) reason this is safe.
+ */
+async function compareSecret(
+  id: string,
+  secret: string,
+  secretHash: string,
+): Promise<boolean> {
+  const k = memoKey(id, secretHash, secret);
+  const now = Date.now();
+  const expiry = compareMemo.get(k);
+  if (expiry !== undefined) {
+    if (expiry > now) return true;
+    compareMemo.delete(k);
+  }
+
+  let hashMatches: boolean;
+  try {
+    hashMatches = await bcrypt.compare(secret, secretHash);
+  } catch {
+    hashMatches = false;
+  }
+
+  if (hashMatches) {
+    // Evict expired entries first; if still full, drop the oldest-inserted
+    // (Map preserves insertion order) so the memo can never grow unbounded.
+    if (compareMemo.size >= COMPARE_MEMO_MAX_ENTRIES) {
+      for (const [ck, cexp] of compareMemo) {
+        if (cexp <= now) compareMemo.delete(ck);
+      }
+      while (compareMemo.size >= COMPARE_MEMO_MAX_ENTRIES) {
+        const oldest = compareMemo.keys().next();
+        if (oldest.done) break;
+        compareMemo.delete(oldest.value);
+      }
+    }
+    compareMemo.set(k, now + COMPARE_MEMO_TTL_MS);
+  }
+  return hashMatches;
+}
+
+/**
+ * Drop every memoized comparison. Exported for tests and for any future
+ * operator-facing "flush credentials" path — production correctness does
+ * NOT depend on calling this (revocation is read live from SQLite).
+ */
+export function __clearGrantCompareMemo(): void {
+  compareMemo.clear();
+}
 
 function generateId(): string {
   // "vg_" + 6 random hex chars
@@ -286,14 +381,11 @@ export async function validateGrant(
     return { ok: false, reason: "grant-invalid" };
   }
 
-  // bcrypt compare (timing-safe)
+  // bcrypt compare (timing-safe), memoized on (id, secret_hash, secret) —
+  // see the COMPARE_MEMO block comment. Revocation/expiry/key_allow below
+  // are still evaluated from the row we just read, every single call.
   const secretHash = row.secret_hash as string;
-  let hashMatches: boolean;
-  try {
-    hashMatches = await bcrypt.compare(secret, secretHash);
-  } catch {
-    hashMatches = false;
-  }
+  const hashMatches = await compareSecret(id, secret, secretHash);
 
   if (!hashMatches) {
     return { ok: false, reason: "grant-invalid" };
@@ -358,12 +450,7 @@ export async function validateGrantForWrite(
   if (!row) return { ok: false, reason: "grant-invalid" };
 
   const secretHash = row.secret_hash as string;
-  let hashMatches: boolean;
-  try {
-    hashMatches = await bcrypt.compare(secret, secretHash);
-  } catch {
-    hashMatches = false;
-  }
+  const hashMatches = await compareSecret(id, secret, secretHash);
   if (!hashMatches) return { ok: false, reason: "grant-invalid" };
 
   const grant = rowToGrant(row);
