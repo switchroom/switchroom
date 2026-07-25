@@ -13,8 +13,14 @@
  * module to share parsing + filtering semantics.
  */
 
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveRotationConfig } from "../util/log-rotation.js";
+import {
+  DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+  DEFAULT_HOSTD_AUDIT_MAX_FILES,
+} from "./audit-rotation-config.js";
 
 export interface AuditEntry {
   ts: string;
@@ -78,6 +84,164 @@ export interface AuditFilters {
 
 export function defaultAuditLogPath(home: string = homedir()): string {
   return join(home, ".switchroom", "host-control-audit.log");
+}
+
+/**
+ * How many bytes of audit history a seam-aware read aims to return.
+ * Sized so `--tail 50` (and the dashboard's 1000-row window) still has
+ * material to work with immediately after a rotation.
+ */
+export const AUDIT_READ_WINDOW_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Resolve the hostd audit rotation config the WRITER will use. Single
+ * source of truth for both the generation count and the byte window
+ * (#3600 review, finding 6 / re-review, finding 3) — a hand-mirrored
+ * constant here silently truncates history the moment an operator raises
+ * `SWITCHROOM_HOSTD_AUDIT_MAX_FILES`/`_MAX_BYTES`.
+ */
+function auditRotation(): { maxBytes: number; maxFiles: number } {
+  return resolveRotationConfig({
+    envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
+    envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
+    defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+    defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
+  });
+}
+
+/**
+ * Whole-history window for callers that must not miss an old row
+ * (`resolveRollbackTarget` — #3600 review, finding 3). Derived as
+ * `(maxFiles + 1) x maxBytes`: the writer-side ceiling on everything that
+ * can exist on disk, so this is "all of it" without being unbounded.
+ * 128 MiB at the defaults (32 MiB x (3+1)).
+ */
+export function auditReadFullWindowBytes(): number {
+  const { maxBytes, maxFiles } = auditRotation();
+  return (maxFiles + 1) * maxBytes;
+}
+
+/**
+ * How many rotated generations a seam-aware read walks back through.
+ * Derived from the SAME resolver the writer uses (honouring
+ * `SWITCHROOM_HOSTD_AUDIT_MAX_FILES`), so a raised retention can never
+ * write more generations than the reader reads (#3600 review, finding 6).
+ * The byte window remains the real bound.
+ */
+export function auditReadMaxGenerations(): number {
+  return auditRotation().maxFiles;
+}
+
+export interface AuditReadOptions {
+  /** Byte ceiling on the returned text. Default {@link AUDIT_READ_WINDOW_BYTES}. */
+  windowBytes?: number;
+  /** Generations to walk. Default {@link auditReadMaxGenerations}. */
+  maxFiles?: number;
+  /**
+   * Surface real I/O failures (EACCES, EIO, …) as a thrown error rather
+   * than an empty read. A MISSING file is never an error either way.
+   *
+   * Callers that report ABSENCE — `get_status` ("no update_apply row
+   * found"), `resolveRollbackTarget` (null → operator must pass an
+   * explicit `--pin`) — MUST set this: on a privileged-verb surface,
+   * silently reporting "it never happened" because the log was
+   * unreadable is the wrong default (#3600 review, finding 4).
+   */
+  strict?: boolean;
+}
+
+/** Read the last `n` bytes of `path`, dropping a leading partial line.
+ *  A missing file yields "". Other I/O errors yield "" unless `strict`,
+ *  in which case they throw. */
+function tailBytes(path: string, n: number, strict = false): string {
+  if (n <= 0) return "";
+  let fd: number;
+  let size: number;
+  try {
+    size = statSync(path).size;
+    fd = openSync(path, "r");
+  } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return "";
+  }
+  try {
+    const len = Math.min(n, size);
+    const start = size - len;
+    const buf = Buffer.alloc(len);
+    let read = 0;
+    try {
+      while (read < len) {
+        const got = readSync(fd, buf, read, len - read, start + read);
+        if (got <= 0) break;
+        read += got;
+      }
+    } catch (err) {
+      // open(2) can succeed where read(2) fails (EISDIR, EIO, a vanished
+      // network mount). Same policy as the open failure above: loud under
+      // `strict`, best-effort otherwise.
+      if (strict) throw err;
+      return "";
+    }
+    let text = buf.subarray(0, read).toString("utf-8");
+    // Dropped a leading partial line? Cut to the first newline. (Not
+    // needed when we started at byte 0 — that line is whole.)
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Seam-aware raw read of the hostd audit log (#3596).
+ *
+ * The active log is size-rotated (`server.ts` → `maybeRotateAuditLog`),
+ * so reading ONLY `<path>` shows an almost-empty file for a while right
+ * after a rotation — `switchroom hostd audit`, the dashboard panel and
+ * `get_status` would all appear to have lost history. This reads the
+ * active file and, when it is smaller than the read window, back-fills
+ * from `<path>.1` (oldest-first) so the seam is invisible to consumers.
+ *
+ * Bounded by construction: at most `windowBytes` of `.1` is read, and a
+ * partial first line is dropped (`parseAuditLine` would return null for
+ * it anyway).
+ */
+export function readAuditRaw(
+  logPath: string,
+  opts: AuditReadOptions = {},
+): string {
+  const windowBytes = opts.windowBytes ?? AUDIT_READ_WINDOW_BYTES;
+  const maxFiles = opts.maxFiles ?? auditReadMaxGenerations();
+  const strict = opts.strict ?? false;
+  // Newest-first: active, then `.1`, `.2`, … stopping once the window is
+  // full or every generation has been considered.
+  const chunks: string[] = [];
+  let budget = windowBytes;
+  const active = tailBytes(logPath, budget, strict);
+  chunks.push(active);
+  budget -= Buffer.byteLength(active, "utf-8");
+  for (let n = 1; n <= maxFiles && budget > 0; n++) {
+    const gen = `${logPath}.${n}`;
+    // An EXISTING-but-empty generation must not stop the walk — a
+    // crashed/raced rotation can leave a zero-byte `.1` while `.2`/`.3`
+    // still hold real history (#3600 review, finding 5). Only a genuinely
+    // ABSENT generation ends it: rotation shifts contiguously, so there is
+    // nothing older beyond the first gap.
+    if (!existsSync(gen)) break;
+    const chunk = tailBytes(gen, budget, strict);
+    if (chunk.length === 0) continue;
+    chunks.push(chunk);
+    budget -= Buffer.byteLength(chunk, "utf-8");
+  }
+  // Emit oldest-first so consumers keep their chronological contract.
+  return chunks
+    .reverse()
+    .filter((c) => c.length > 0)
+    .map((c) => (c.endsWith("\n") ? c : c + "\n"))
+    .join("");
 }
 
 /** Parse a single JSONL line. Returns null on malformed input — the log

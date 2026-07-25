@@ -26,6 +26,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import {
   createFileDedupStore,
+  rotateWebhookLogIfNeeded,
   type DedupStore,
 } from './webhook-handler.js'
 import {
@@ -150,6 +151,10 @@ export function recordWebhookEvent(
   const logPath = join(telegramDir, 'webhook-events.jsonl')
   try {
     mkdirSync(telegramDir, { recursive: true })
+    // Bound the log BEFORE appending (#3596). This writer had no size
+    // check and nothing ever reaped the file: on the live host it reached
+    // 121,772,086 bytes for one agent against 328 KB for the next.
+    rotateWebhookLogIfNeeded(logPath)
     const record = {
       ts: now,
       source: rec.source,

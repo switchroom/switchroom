@@ -36,6 +36,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { hostdRequest } from "../../host-control/client.js";
 import {
   defaultAuditLogPath,
+  readAuditRaw,
   parseAuditLine,
   type AuditEntry,
 } from "../../host-control/audit-reader.js";
@@ -981,7 +982,10 @@ export function getLastUpdateApplyStatus(): {
   }
   let raw: string;
   try {
-    raw = readFileSync(path, "utf-8");
+    // strict: an EACCES/EIO on a privileged-verb status surface must
+    // surface as a read FAILURE, never as "no update_apply row found" —
+    // those two answers are operationally opposite (#3600 review).
+    raw = readAuditRaw(path, { strict: true });
   } catch (err) {
     return errorText(
       `get_status: failed to read audit log at ${path}: ${(err as Error).message}`,

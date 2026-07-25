@@ -52,7 +52,12 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
-import { readAndFilter, defaultAuditLogPath } from "../host-control/audit-reader.js";
+import {
+  readAndFilter,
+  defaultAuditLogPath,
+  readAuditRaw,
+  auditReadFullWindowBytes,
+} from "../host-control/audit-reader.js";
 import { isHindsightContainerExists } from "../setup/hindsight.js";
 import { deployedImageTag, type DockerRunner } from "./deploy-version-guard.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
@@ -988,8 +993,24 @@ export function resolveRollbackTarget(auditLogPath?: string): string | null {
   const logPath = auditLogPath ?? defaultAuditLogPath(homedir());
   let raw: string;
   try {
-    raw = readFileSync(logPath, "utf8");
-  } catch {
+    // Full window + strict (#3600 review, findings 3 & 4): this resolves
+    // the rollback TARGET, so a rollout row missed because it fell
+    // outside a 4 MiB tail — `agent_smoke` rows dominate the log — would
+    // silently degrade to "no prior rollout found" on exactly the busy
+    // hosts that need it. And a read error must not masquerade as
+    // absence; the caller then requires an explicit `--pin`.
+    raw = readAuditRaw(logPath, {
+      windowBytes: auditReadFullWindowBytes(),
+      strict: true,
+    });
+  } catch (err) {
+    // A missing log yields "" (not a throw), so reaching here means a REAL
+    // I/O failure. Say so — otherwise the caller's "no prior rollout
+    // found; pass --pin" reads as a fact about history rather than as
+    // "I could not look" (#3600 review, finding 4).
+    process.stderr.write(
+      `rollout: could not read the hostd audit log at ${logPath}: ${(err as Error).message} — cannot resolve a rollback target from history; pass --pin explicitly.\n`,
+    );
     return null;
   }
   // Read all rollout terminal completed rows (most-recent at the end).

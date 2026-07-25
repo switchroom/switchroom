@@ -30,9 +30,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { verifyAuditLog } from "../util/audit-hashchain.js";
+import { resolveRotationConfig } from "../util/log-rotation.js";
+import {
+  DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+  DEFAULT_HOSTD_AUDIT_MAX_FILES,
+} from "../host-control/audit-rotation-config.js";
 import {
   failOpenStatePath,
   readFailOpenState,
+  DEFAULT_AUDIT_MAX_BYTES,
+  DEFAULT_AUDIT_MAX_FILES,
   type FailOpenState,
 } from "../vault/broker/audit-log.js";
 
@@ -62,16 +69,78 @@ export interface AuditIntegrityDeps {
 interface LogTarget {
   label: string;
   path: string;
+  /** Rotated generations (`<path>.1` … `.N`) this log retains — resolved
+   *  from the writer's own config so a raised retention is still fully
+   *  verified (#3600). */
+  maxFiles: number;
 }
 
 function rootWrittenLogs(home: string): LogTarget[] {
   return [
-    { label: "vault-broker", path: join(home, ".switchroom", "vault-audit.log") },
+    {
+      label: "vault-broker",
+      path: join(home, ".switchroom", "vault-audit.log"),
+      maxFiles: resolveRotationConfig({
+        envBytesVar: "SWITCHROOM_VAULT_AUDIT_MAX_BYTES",
+        envFilesVar: "SWITCHROOM_VAULT_AUDIT_MAX_FILES",
+        defaultBytes: DEFAULT_AUDIT_MAX_BYTES,
+        defaultFiles: DEFAULT_AUDIT_MAX_FILES,
+      }).maxFiles,
+    },
     {
       label: "hostd",
       path: join(home, ".switchroom", "host-control-audit.log"),
+      maxFiles: resolveRotationConfig({
+        envBytesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_BYTES",
+        envFilesVar: "SWITCHROOM_HOSTD_AUDIT_MAX_FILES",
+        defaultBytes: DEFAULT_HOSTD_AUDIT_MAX_BYTES,
+        defaultFiles: DEFAULT_HOSTD_AUDIT_MAX_FILES,
+      }).maxFiles,
     },
   ];
+}
+
+/**
+ * Concatenate the log's retained history OLDEST-first: `<path>.N` … `.1`
+ * then the active file. An ABSENT generation is skipped rather than
+ * ending the walk, so a gap (a crashed rotation, an operator deleting one
+ * file) still gets the surviving generations verified.
+ *
+ * An UNREADABLE generation is NOT absence and must never be skipped
+ * quietly (#3600 re-review, finding 2): this is the tamper-detection
+ * surface, so `chmod 000` on a doctored `.1` would otherwise buy an
+ * attacker a clean "chain valid — tamper-evidence active" verdict. Those
+ * paths come back in `unreadable` and the caller fails the check.
+ *
+ * Returns the combined text, the paths that actually contributed — an
+ * empty `sources` means "nothing on disk at all", the genuinely missing
+ * case — and the paths that exist but could not be read.
+ */
+function readRetainedHistory(
+  read: (p: string) => string,
+  path: string,
+  maxFiles: number,
+): { text: string; sources: string[]; unreadable: { path: string; error: string }[] } {
+  const parts: { path: string; text: string }[] = [];
+  const unreadable: { path: string; error: string }[] = [];
+  const attempt = (p: string) => {
+    try {
+      parts.push({ path: p, text: read(p) });
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      // ENOENT is the only "it is not there" errno. Everything else
+      // (EACCES, EIO, EISDIR, ELOOP, a vanished network mount) means the
+      // file exists and we could not see it.
+      if (e.code === "ENOENT") return;
+      unreadable.push({ path: p, error: e.code ?? e.message ?? String(err) });
+    }
+  };
+  for (let n = maxFiles; n >= 1; n--) attempt(`${path}.${n}`);
+  attempt(path);
+  const text = parts
+    .map((p) => (p.text.endsWith("\n") || p.text.length === 0 ? p.text : p.text + "\n"))
+    .join("");
+  return { text, sources: parts.map((p) => p.path), unreadable };
 }
 
 export function runAuditIntegrityChecks(
@@ -108,25 +177,48 @@ export function runAuditIntegrityChecks(
     });
   }
 
-  for (const { label, path } of rootWrittenLogs(home)) {
-    let text: string;
-    try {
-      text = read(path);
-    } catch {
+  for (const { label, path, maxFiles } of rootWrittenLogs(home)) {
+    // #3600 review, finding 2 — BOTH root-written logs are size-rotated
+    // now, so verifying only the active file would silently shrink this
+    // tamper check to the current generation: after the first rotation
+    // doctor would report "ok" while attesting nothing about the ~96 MiB
+    // sitting in `.1`-`.3`. Verify the whole RETAINED history,
+    // oldest-first, so the chain is checked exactly as it was written.
+    const { text, sources, unreadable } = readRetainedHistory(read, path, maxFiles);
+
+    if (unreadable.length > 0) {
+      // Cannot attest what we cannot read. Fail rather than verify the
+      // remainder and print "tamper-evidence active" (#3600 re-review,
+      // finding 2) — hiding a doctored generation behind a chmod must
+      // never be cheaper than tampering with a readable one.
+      results.push({
+        name: `${label} audit chain readable`,
+        status: "fail",
+        detail: `${unreadable.map((u) => `${u.path} (${u.error})`).join(", ")} exist(s) but could not be read — the ${label} audit chain CANNOT be verified over the full retained history, so no tamper-evidence claim can be made about ${sources.length > 0 ? "the remaining generation(s)" : "this log"}`,
+        fix: `Restore read access (root-owned, mode 0600 is expected — run doctor as the operator/root) and re-run; if the file is not a regular file or the volume is failing, investigate immediately: an unreadable audit generation is an audit-blinding signal (WS10-F3/F4).`,
+      });
+      continue;
+    }
+
+    if (sources.length === 0) {
       results.push({
         name: `${label} audit log present`,
         status: "warn",
-        detail: `no audit log at ${path} — the ${label} may never have written one, or it was removed (audit-blinding is a cheap pre-attack step; WS10-F3/F4)`,
+        detail: `no audit log at ${path} (nor any rotated generation) — the ${label} may never have written one, or it was removed (audit-blinding is a cheap pre-attack step; WS10-F3/F4)`,
         fix: `Confirm the ${label} is running and its audit volume is mounted; investigate if the file vanished.`,
       });
       continue;
     }
 
     if (text.trim().length === 0) {
+      // An empty ACTIVE file is normal for a few ms after a rotation (and
+      // persists if the triggering append then fails), so this only fires
+      // when every retained generation is empty too — which really is the
+      // fail-open / audit-blinding symptom.
       results.push({
         name: `${label} audit log non-empty`,
         status: "warn",
-        detail: `${path} exists but is empty — expected at least boot/activity rows; an emptied audit trail is the WS10-F3 fail-open symptom`,
+        detail: `${sources.join(", ")} exist but are empty — expected at least boot/activity rows; an emptied audit trail is the WS10-F3 fail-open symptom`,
         fix: `Investigate whether audit writes are failing (check ${label} stderr) and whether the file was truncated.`,
       });
       continue;

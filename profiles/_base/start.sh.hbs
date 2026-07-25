@@ -195,11 +195,33 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   # the child keeps appending to the same (now-empty) inode. Worst-case
   # race is a few log lines written between the cp and the truncate being
   # lost; acceptable for a debug trace log. Keeps at most ~2×cap on disk
-  # (live + one .1 generation). Cap + interval are env-overridable.
+  # (live + one .1 generation), and since #3596 that .1 is compressed on
+  # rotate and age-reaped, so it can't outlive its usefulness. Cap,
+  # interval, max-age and compression are all env-overridable.
   _switchroom_log_rotator() {
     local _logfile="$1"
     local _max="${SWITCHROOM_SIDECAR_LOG_MAX_BYTES:-52428800}"   # 50 MiB default
     local _interval="${SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC:-300}"  # 5 min
+    # #3596: the `.1` generation was written once and then NEVER reaped.
+    # A log that grows fast during an incident and slowly afterwards keeps
+    # its giant `.1` forever — on the live host clerk/gateway-supervisor.log.1
+    # was 582 MB (dated Jul 11) while the live log sat at ~5 MB, i.e. months
+    # away from ever being overwritten by the next rotation. Two bounds:
+    #   * compress on rotate (gzip typically takes a text log to <10%), and
+    #   * an AGE bound — a `.1`/`.1.gz` older than this is deleted on the
+    #     next check even if no rotation happens.
+    # Be honest about what the age bound COSTS (#3600 review): right after
+    # a rotation the `.1` holds everything and the live log is empty, so
+    # if the agent then goes quiet for 14 days that history is DELETED
+    # while the near-empty live log survives. This is deliberate for a
+    # debug trace log — bounding shared host disk beats retaining stale
+    # traces — but it is deletion of the only copy, not merely eviction of
+    # a superseded backup. Raise SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC
+    # (or set it to 0 to disable the reaper) where that matters. Agent
+    # AUDIT trails are not affected: those are the hostd/vault logs, which
+    # rotate by count, never by age.
+    local _max_age_sec="${SWITCHROOM_SIDECAR_LOG_ROTATE_MAX_AGE_SEC:-1209600}"  # 14 days
+    local _compress="${SWITCHROOM_SIDECAR_LOG_COMPRESS:-1}"
     # Validate BOTH env overrides up front; garbage falls back to the
     # default. Unvalidated, a non-numeric interval makes `sleep` fail
     # instantly and the `while true` loop hot-spins a CPU core for the
@@ -208,12 +230,28 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     # interval would also hot-spin, so it falls back too.
     case "$_max" in ''|*[!0-9]*) _max=52428800;; esac
     case "$_interval" in ''|0|*[!0-9]*) _interval=300;; esac
+    # Same garbage guard for the age bound; 0 disables the age reaper
+    # (the size-triggered overwrite still applies).
+    case "$_max_age_sec" in ''|*[!0-9]*) _max_age_sec=1209600;; esac
+    # `find -mmin` takes MINUTES; round up so a sub-minute age still reaps.
+    local _max_age_min=$(( (_max_age_sec + 59) / 60 ))
     # A cap of 0 disables rotation entirely (operator escape hatch).
     # (Negative values contain '-' → non-numeric per the guard above →
     # default cap, i.e. rotation stays on.)
     [ "$_max" -eq 0 ] && return 0
+    local _dir _base
+    _dir=$(dirname "$_logfile")
+    _base=$(basename "$_logfile")
     while true; do
       sleep "$_interval"
+      # Age-reap the retained generation first — this runs every cycle,
+      # INDEPENDENT of whether the live log is over cap, which is exactly
+      # the case the old code never handled (#3596).
+      if [ "$_max_age_min" -gt 0 ]; then
+        find "$_dir" -maxdepth 1 -type f \
+          \( -name "$_base.1" -o -name "$_base.1.gz" \) \
+          -mmin "+$_max_age_min" -exec rm -f {} + 2>/dev/null || true
+      fi
       [ -f "$_logfile" ] || continue
       local _size
       _size=$(wc -c < "$_logfile" 2>/dev/null || echo 0)
@@ -222,6 +260,13 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
       if [ "$_size" -gt "$_max" ]; then
         if cp "$_logfile" "$_logfile.1" 2>/dev/null; then
           : > "$_logfile"
+          # Drop any stale compressed generation, then (best-effort)
+          # compress the fresh one. gzip failing (missing binary, ENOSPC)
+          # just leaves the plain `.1` — never fatal.
+          rm -f "$_logfile.1.gz" 2>/dev/null || true
+          if [ "$_compress" != "0" ] && command -v gzip >/dev/null 2>&1; then
+            gzip -f "$_logfile.1" 2>/dev/null || true
+          fi
           echo "[supervise] rotated $_logfile (${_size} bytes > ${_max} cap) → ${_logfile}.1" >> "$_logfile"
         else
           # cp failed (e.g. ENOSPC — exactly when rotation matters most).

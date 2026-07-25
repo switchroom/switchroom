@@ -28,6 +28,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { chainRow, seedChain, type ChainState } from "../../util/audit-hashchain.js";
 import { safeAuditLogPath } from "./test-isolation-guard.js";
+import {
+  resolveRotationConfig,
+  rotateLogFile,
+} from "../../util/log-rotation.js";
 
 /** Operations the broker can perform. (PR-6: `approval_consume_record`
  *  and `approval_lookup_by_request` are additive members of the shared
@@ -214,21 +218,14 @@ function resolveRotation(opts: AuditLoggerOptions): {
   maxBytes: number;
   maxFiles: number;
 } {
-  const envBytes = Number(process.env.SWITCHROOM_VAULT_AUDIT_MAX_BYTES);
-  const envFiles = Number(process.env.SWITCHROOM_VAULT_AUDIT_MAX_FILES);
-  const maxBytes =
-    opts.maxBytes !== undefined && opts.maxBytes !== 0
-      ? opts.maxBytes
-      : Number.isFinite(envBytes) && envBytes !== 0
-        ? envBytes
-        : DEFAULT_AUDIT_MAX_BYTES;
-  const maxFiles =
-    opts.maxFiles !== undefined && opts.maxFiles > 0
-      ? opts.maxFiles
-      : Number.isFinite(envFiles) && envFiles > 0
-        ? envFiles
-        : DEFAULT_AUDIT_MAX_FILES;
-  return { maxBytes, maxFiles };
+  return resolveRotationConfig({
+    maxBytes: opts.maxBytes,
+    maxFiles: opts.maxFiles,
+    envBytesVar: "SWITCHROOM_VAULT_AUDIT_MAX_BYTES",
+    envFilesVar: "SWITCHROOM_VAULT_AUDIT_MAX_FILES",
+    defaultBytes: DEFAULT_AUDIT_MAX_BYTES,
+    defaultFiles: DEFAULT_AUDIT_MAX_FILES,
+  });
 }
 
 /**
@@ -236,119 +233,18 @@ function resolveRotation(opts: AuditLoggerOptions): {
  * past `maxFiles`, then snapshot `<path>` → `<path>.1` and truncate the
  * active file back to zero bytes IN PLACE.
  *
- * Why copy-then-truncate rather than rename (issue #2953): in the deployed
- * topology the active log is bind-mounted into the broker container as a
- * SINGLE FILE (not its parent directory), which makes `<path>` a mount
- * point inside the container's mount namespace. `rename(2)` cannot replace
- * an active mount point, so `rename(<path>, <path>.1)` fails with EBUSY on
- * every attempt and the log grows unbounded. Copying the bytes out to
- * `<path>.1` and then `ftruncate`-ing the original to length 0 keeps the
- * active inode/mount point in place, so it works regardless of whether the
- * operator mounts the file or its parent directory.
+ * The mechanism (copy → fsync → ftruncate, never rename, because the
+ * active log is a single-file bind mount inside the broker container —
+ * issue #2953/#2955) now lives in `src/util/log-rotation.ts` so the hostd
+ * audit log and the per-agent webhook event log share it rather than
+ * growing their own copies. This wrapper only pins the diagnostic tag.
  *
- * The active file is truncated (not deleted/recreated), so its inode, mode,
- * and — critically — its bind mount survive. The in-process hash chain is
- * intentionally NOT reset, so the first row appended after truncation links
- * back to the last row now living in `<path>.1` and cross-file continuity
- * holds. Best-effort: any failure is reported and rotation is skipped (the
- * current file keeps growing rather than losing data).
- *
- * NOTE: the `.1 … .maxFiles` rotated files are ordinary files created by
- * this function inside the log's directory, so shifting them with `rename`
- * is safe — only the active `<path>` is (potentially) a mount point.
+ * The in-process hash chain is intentionally NOT reset, so the first row
+ * appended after truncation links back to the last row now living in
+ * `<path>.1` and cross-file tamper-evidence continuity holds.
  */
 function rotateAuditLog(logPath: string, maxFiles: number): void {
-  // Delete the oldest retained file if it exists — it would fall off the
-  // window after the shift.
-  const oldest = `${logPath}.${maxFiles}`;
-  if (fs.existsSync(oldest)) {
-    try {
-      fs.unlinkSync(oldest);
-    } catch (err) {
-      process.stderr.write(
-        `[vault-audit] ERROR: could not drop oldest rotation ${oldest}: ${(err as Error).message}\n`,
-      );
-    }
-  }
-  // Shift .(n-1) → .n for n = maxFiles down to 2. These are ordinary files
-  // (never mount points), so rename is fine.
-  for (let n = maxFiles - 1; n >= 1; n--) {
-    const from = `${logPath}.${n}`;
-    const to = `${logPath}.${n + 1}`;
-    if (!fs.existsSync(from)) continue;
-    try {
-      fs.renameSync(from, to);
-    } catch (err) {
-      process.stderr.write(
-        `[vault-audit] ERROR: could not rotate ${from} → ${to}: ${(err as Error).message}\n`,
-      );
-      return;
-    }
-  }
-  // Finally, snapshot active → .1 by COPYING the bytes, then truncate the
-  // active file in place. Copy first: if the copy fails we leave the active
-  // file untouched (grow rather than lose rows). Only after the snapshot is
-  // durably on stable storage do we truncate the live file back to zero
-  // length.
-  //
-  // DURABILITY (#2955 review): `copyFileSync` returning does NOT mean the
-  // bytes are on stable storage — they may sit in the page cache. Truncate
-  // is an explicit data-destroying op, so without an fsync of the snapshot
-  // between copy and truncate, a host-crash window loses rows AND leaves
-  // the active file zeroed. fsync the `.1` snapshot (and best-effort the
-  // parent dir) before truncating — matches `vault.ts`'s durability
-  // discipline and makes the "safely on disk" claim below literally true.
-  const snapshotPath = `${logPath}.1`;
-  try {
-    fs.copyFileSync(logPath, snapshotPath);
-  } catch (err) {
-    process.stderr.write(
-      `[vault-audit] ERROR: could not snapshot active audit log ${logPath} → ${snapshotPath}: ${(err as Error).message}\n`,
-    );
-    return;
-  }
-  // Durably persist the snapshot before destroying the source. Best-effort:
-  // some filesystems reject fsync, but a failed fsync here is still safer
-  // than skipping it — we proceed to truncate only when the snapshot has
-  // been open + flushed. If the fsync throws, leave the active file intact
-  // (grow rather than risk losing rows to a truncate on an unflushed copy).
-  try {
-    const fd = fs.openSync(snapshotPath, "r");
-    try {
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch (err) {
-    process.stderr.write(
-      `[vault-audit] ERROR: could not fsync audit snapshot ${snapshotPath}; leaving active log intact to avoid data loss: ${(err as Error).message}\n`,
-    );
-    return;
-  }
-  // Best-effort fsync of the parent dir so the snapshot's dirent update is
-  // persisted (POSIX permits a post-copy crash to lose the dirent otherwise).
-  // A failure here is non-fatal — the data is flushed; only the directory
-  // entry update is at risk, and re-running rotation is idempotent.
-  try {
-    const dirFd = fs.openSync(path.dirname(snapshotPath), "r");
-    try {
-      fs.fsyncSync(dirFd);
-    } finally {
-      fs.closeSync(dirFd);
-    }
-  } catch {
-    /* best-effort: some filesystems refuse fsync on directories */
-  }
-  try {
-    // truncate(2) resets length to 0 while preserving the inode, mode, and
-    // any bind mount at this path — unlike rename, which would fail EBUSY on
-    // a single-file bind mount (issue #2953).
-    fs.truncateSync(logPath, 0);
-  } catch (err) {
-    process.stderr.write(
-      `[vault-audit] ERROR: could not truncate active audit log ${logPath}: ${(err as Error).message}\n`,
-    );
-  }
+  rotateLogFile(logPath, maxFiles, "vault-audit");
 }
 
 /**
