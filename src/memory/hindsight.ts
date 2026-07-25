@@ -265,26 +265,31 @@ export function isHindsightEnabled(
  * exclusion-only mission made the model return an empty/degenerate response
  * on chatty-but-real turns (measured against 6 live retain windows).
  *
- * 2026-07-25 (review finding 4 — fleet is not all coding agents): the first
- * cut of the enumerated exclusions carried a seventh bullet, "Greetings,
- * acknowledgements, and routine operational chatter". Over half the fleet is
- * non-coding (health coach, family admin, client-relationship agents), and
- * "routine operational chatter" is a vibe judgement — exactly the class a
- * 20B model gets wrong. Combined with the sanctioned empty-list output it
- * discarded soft taste preferences ("I loved that film") wholesale. Bullets
- * 1-6 each name a MECHANICALLY recognizable artifact and are kept verbatim;
- * bullet 7 is narrowed to content-free acknowledgements only, and the
- * positive clause now names personal likes/dislikes/opinions explicitly so a
- * casual conversation still yields its durable preference.
+ * 2026-07-25 (review finding 4, PROPOSED AND THEN REVERTED — do not
+ * re-attempt without better evidence): a follow-up review argued bullet 7
+ * ("Greetings, acknowledgements, and routine operational chatter") was a
+ * vibe judgement that discarded soft taste preferences on the fleet's
+ * non-coding agents, and narrowed it to content-free acknowledgements plus a
+ * personal-likes clause. Sampling disproved the premise and showed the change
+ * was a regression:
+ *  - the claimed film-window loss did not reproduce — the mission as written
+ *    below already kept the horror-dislike and film preferences;
+ *  - on a real operational window the narrowed mission extracted 8 facts vs 0
+ *    for this text and 4 for the pre-PR default, including "Plugin PR worker
+ *    still running" — which the in-flight-narration bullet above explicitly
+ *    forbids. Looser than the baseline it was meant to improve on;
+ *  - the sampling method is unreliable at n=1: identical input under the
+ *    identical narrowed mission yielded 0, then 6, then 6 facts.
+ * So the text stays as-is and the mission-CONTENT question is deferred to
+ * #3532 (profile-scoped retain missions) — a coding agent and a health coach
+ * should not share one extraction mission, which is the durable fix that a
+ * single global reword cannot be.
  */
 export const DEFAULT_RETAIN_MISSION =
   "Extract durable facts that will still be true and useful weeks from now: " +
   "user preferences and standing rules, ongoing projects and recurring " +
   "commitments, technical and architectural decisions with their rationale, " +
-  "and people/tool relationships. Personal preferences count: what the user " +
-  "likes, dislikes, enjoys, avoids, or holds an opinion about — films, food, " +
-  "music, places, people, tools — is a durable preference even when the " +
-  "conversation around it is casual. A preference revealed by a request is " +
+  "and people/tool relationships. A preference revealed by a request is " +
   "durable — record the preference (what the user likes, wants, or always " +
   "does), not the request itself.\n\n" +
   "NEVER extract:\n" +
@@ -300,9 +305,7 @@ export const DEFAULT_RETAIN_MISSION =
   "- Transient state (unread counts, build status, what is running right now) " +
   "unless the fact is explicitly dated, in which case record it as a dated " +
   "observation.\n" +
-  "- Content-free acknowledgements on their own (\"hi\", \"thanks\", \"ok\", " +
-  "\"got it\") — but a casual message that also carries an opinion, a like or " +
-  "a dislike is NOT content-free: keep the preference.\n\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
   "If a candidate fact matches an exclusion, drop it rather than rewording " +
   "it. If nothing durable remains, return an empty facts list.";
 

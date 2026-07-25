@@ -52,18 +52,25 @@
   plugin independently pushes this one via `lib/bank.py: ensure_bank_mission`
   on a fresh state dir. Before this change the two texts differed.
 
-  Two 2026-07-25 review corrections folded in. (1) The rewrite reached no
-  existing agent: `ensure_bank_mission` short-circuits on the already-seeded
+  One 2026-07-25 review correction folded in: the rewrite reached no
+  existing agent. `ensure_bank_mission` short-circuits on the already-seeded
   flag in `bank_missions.json` and switchroom seeded the default only on the
   fresh-agent path, so all 13 live banks kept the 2026-07-19 text. Switchroom's
   `reconcileAgent` now upgrades the bank mission on `switchroom apply` when the
   bank's current text byte-equals a known previous default
   (`SUPERSEDED_RETAIN_MISSIONS`); a customized mission still matches nothing and
-  is never clobbered. (2) The exclusion bullet "Greetings, acknowledgements, and
-  routine operational chatter" was a vibe judgement that a 20B model applies
-  badly and that discarded soft taste preferences on the fleet's non-coding
-  agents; it is narrowed to content-free acknowledgements, and the positive
-  clause now names personal likes/dislikes/opinions explicitly.
+  is never clobbered.
+
+  A second proposed correction — narrowing the "Greetings, acknowledgements,
+  and routine operational chatter" bullet and adding a personal-preference
+  clause — was written and then REVERTED. Sampling did not reproduce the
+  preference loss it was meant to fix, and the narrowed mission extracted MORE
+  noise than both this text and the pre-PR default on a real operational
+  window (8 facts vs 0 vs 4, including in-flight worker narration its own
+  bullet forbids). The sampling method is also n=1-unreliable: identical input
+  under the identical narrowed mission gave 0, 6, 6. No extraction-quality
+  claim is made here in either direction; the mission-content question is
+  deferred to switchroom#3532 (profile-scoped retain missions).
 
 - **`recallContextTurns` default `1` → `2`** (switchroom hindsight-leverage
   PR2, workstream A2). A bare follow-up user message ("and the port?", "what
