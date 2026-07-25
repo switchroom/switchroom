@@ -252,8 +252,10 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * park its brand-new live lock. Then the absence window is real and the
  * cost above is real — but reaching it now requires the peer to have
  * judged us stale and to land inside a single syscall, not merely to have
- * reclaimed us at some point. The peer's lock INODE survives it (step 3)
- * and nothing of the peer's is ever unlinked — but be exact about what
+ * reclaimed us at some point. The peer's lock INODE survives it (step 3):
+ * the only name of the peer's we ever unlink is the park, and only once
+ * `link` has already put that inode back at `lockPath`, so no unlink of
+ * ours can cost the peer its lock — but be exact about what
  * "survives" means, because it is not always at `lockPath`: where `link`
  * works the file is restored there, and where it cannot (a filesystem
  * without hardlinks, or a third arrival already holding the path) the
@@ -399,10 +401,12 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * residual it describes as reachable, is asserted by a named test in
  * `log-rotation-race.test.ts`, and those names are checked mechanically by
  * "every test name this file cites exists". Where something is NOT pinned
- * this file now says so where it is written. There are three: the release's
- * `vanished` branch (inert — no outcome to assert), the acquire
- * park-verify's inode clause (defence in depth the age clause plausibly
- * subsumes), and the DURATION bound on the missed release, which is an
+ * this file now says so where it is written. There are four: the release's
+ * `vanished` branch (inert — no outcome to assert), the acquire reclaim's
+ * `vanished` branch (inert for the identical reason; claiming otherwise was
+ * itself a false claim — #3600 round-11, F7), the acquire park-verify's
+ * inode clause (defence in depth the age clause plausibly subsumes), and
+ * the DURATION bound on the missed release, which is an
  * argument from the code — the lock's mtime is stamped once and never
  * refreshed — rather than a test.
  *
@@ -625,9 +629,23 @@ function withRotateLock<T>(
     } catch {
       vanished = true; // a peer's sweep reaped our park — nothing to put back
     }
-    // Unlike the release's `vanished` (which is inert), this one IS an
-    // outcome: it returns null instead of falling into the mismatch
-    // restore, i.e. we decline without taking the lock.
+    // This is the SAME READABILITY SPLIT as the release's `vanished`, not a
+    // guard. Round 10 claimed the opposite here — that unlike the release's
+    // this one "IS an outcome" — and that was the mirror image of the false
+    // claim it fixed in the same commit (#3600 round-11, F7). The release's
+    // own argument applies verbatim: `mine` is still false, so falling
+    // through enters the mismatch path below; `statSync(parked)` has just
+    // ENOENTed, so `linkSync(parked, lockPath)` must ENOENT too, `restored`
+    // stays false, no unlink runs, and that path `return null`s as well.
+    // Same value, same filesystem state, one extra failing syscall.
+    // Verified by mutation: `if (false) return null;` here survives all 47
+    // scoped tests. It is therefore deliberately untested, exactly like its
+    // release-side twin.
+    //
+    // Both inertness arguments assume `vanished` means what the `catch`
+    // above calls it — ENOENT, a peer's sweep reaped our park. A stat
+    // failing for another reason (EACCES, EIO) would leave `parked` present
+    // and the `link` able to succeed, and then neither branch is inert.
     if (vanished) return null;
     if (!mine) {
       // We parked a LIVE lock (a peer reclaimed between our stat and our
@@ -846,7 +864,17 @@ function withRotateLock<T>(
             // park is gone the mismatch path's `link` ENOENTs, `restored`
             // stays false, and no unlink runs either way. It is therefore
             // deliberately untested; a test written for it would assert a
-            // difference that does not exist.
+            // difference that does not exist. The acquire reclaim's
+            // `vanished` is the same split for the same reason — round 10
+            // claimed it was an outcome and round 11 falsified that the same
+            // way (#3600 round-11, F7).
+            //
+            // This argument assumes `vanished` is the ENOENT the `catch`
+            // above names. A stat failing for another reason (EACCES, EIO)
+            // would leave `parked` present and the mismatch path's `link`
+            // able to succeed — the branch is inert under the file's stated
+            // reading, not under every possible stat failure. Same caveat,
+            // stated the same way, at the acquire twin.
             //
             // The load-bearing half of the round-8 M1 fix is the
             // CONDITIONAL unlink below, and that is pinned: making it
