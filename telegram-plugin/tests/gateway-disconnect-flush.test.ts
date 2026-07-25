@@ -282,3 +282,35 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
     expect(deps.activeTurnStartedAt.size).toBe(0)
   })
 })
+
+describe('#3552 — onTurnKeyEnded disarms per-turn timers on bridge death', () => {
+  it('reports EVERY torn-down turn key, from both the controller loop and the dangling sweep', () => {
+    const { deps } = makeDeps('clerk')
+    // A third key that the controller loop does not cover — it only lives in
+    // activeTurnStartedAt (finalize already ran on the canonical reply path),
+    // so it is picked up by the dangling sweep.
+    deps.activeTurnStartedAt.set('chat3:thr3:msg3', 300)
+    const ended: string[] = []
+
+    flushOnAgentDisconnect({ ...deps, onTurnKeyEnded: (k: string) => ended.push(k) })
+
+    // Outcome: no turn key survives the flush without being reported, so no
+    // silence-poke state can outlive the dead bridge's turns.
+    expect(new Set(ended)).toEqual(
+      new Set(['chat1:thr1:msg1', 'chat2:thr2:msg2', 'chat3:thr3:msg3']),
+    )
+    expect(deps.activeTurnStartedAt.size).toBe(0)
+  })
+
+  it('is never called for an anonymous disconnect (no turns were owned)', () => {
+    const { deps } = makeDeps(null)
+    const ended: string[] = []
+    flushOnAgentDisconnect({ ...deps, onTurnKeyEnded: (k: string) => ended.push(k) })
+    expect(ended).toEqual([])
+  })
+
+  it('omitting onTurnKeyEnded is safe (optional callback)', () => {
+    const { deps } = makeDeps('clerk')
+    expect(() => flushOnAgentDisconnect(deps)).not.toThrow()
+  })
+})

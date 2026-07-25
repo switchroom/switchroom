@@ -68,6 +68,13 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
   thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS, floor: SILENCE_FLOOR_MS },
   deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
   isLegitimatelyWorking: (key) => isLegitimatelyWorking(key),
+  // #3552 — orphan-state reaper predicate. Deliberately the SAME condition the
+  // `onFrameworkFallback` late-fire guard below uses: no `activeTurnStartedAt`
+  // entry AND no current turn ⇒ the turn this state belongs to is over. Note
+  // `activeTurnStartedAt` alone is NOT sufficient — `releaseTurnBufferGate`
+  // clears it mid-turn on every final-answer reply while the turn keeps running
+  // (post-answer housekeeping), and silence-poke must keep watching that turn.
+  isTurnLive: (key) => !(activeTurnStartedAt.get(key) == null && getCurrentTurn() == null),
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
@@ -142,6 +149,13 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // events (124 of 138 `currentTurn_nulled=false` cases). Distinct
     // log line so observability still tracks the fact that the silence
     // crossed threshold; the wedge counter is no longer polluted.
+    //
+    // #3552: with the `isTurnLive` reaper wired above, this branch is now only
+    // the sub-poll-interval race (the turn ends between the tick's reap check
+    // and this handler running). The steady-state case it used to absorb —
+    // state armed for the full 300s against a turn that ended minutes earlier,
+    // 504 events in 14 days vs 110 real fires — is reaped at the tick instead,
+    // so this counter finally reads as the genuine race it names.
     if (activeTurnStartedAt.get(ctx.key) == null && getCurrentTurn() == null) {
       process.stderr.write(
         `telegram gateway: silence-poke framework-fallback late-fire skipped — ` +

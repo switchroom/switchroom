@@ -193,6 +193,8 @@ export interface MidTurnFloorContext {
 export type SilencePokeMetric =
   | { kind: 'silence_fallback_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
   | { kind: 'mid_turn_floor'; key: string; silence_ms: number; forced: boolean; decision: 'fire' | string }
+  /** #3552 — per-turn state dropped because its turn is provably over. */
+  | { kind: 'silence_poke_orphan_reaped'; key: string; silence_ms: number }
 
 export interface SilencePokeDeps {
   /** Called when the 300s fallback fires. Caller sends the user-visible
@@ -239,6 +241,30 @@ export interface SilencePokeDeps {
    * combines both. Returns null when there is no live turn for `key`.
    */
   floorState?: (key: string) => { role: LoopRole; finalAnswerDelivered: boolean } | null
+  /**
+   * #3552 — orphan-state reaper predicate. Returns true while `key` still has a
+   * LIVE turn behind it, false once the turn is provably over.
+   *
+   * Why: `startTurn(key)` arms per-turn state that only `endTurn(key)` drops,
+   * and several turn-end paths never reach an `endTurn` call — a bridge death
+   * (`disconnect-flush`), a keyed teardown that bypasses the `turn_end` handler,
+   * or any future path that nulls the turn without the cleanup tail. The state
+   * then survives its turn and sits in the Map until the 300s fallback fires
+   * against a dead key, is recognised as a late fire, logs
+   * `turn_ended_cleanly_during_window` and only THEN calls `endTurn`. Measured:
+   * 504 such skips vs 110 real fires in 14 days (switchroom#3552).
+   *
+   * Wiring this callback moves that cleanup from "300s later, at fire time" to
+   * "the next poll tick", deterministically and independent of which path ended
+   * the turn. The predicate MUST be the same one the fallback's late-fire guard
+   * uses (`activeTurnStartedAt` empty AND no current turn) so a turn that has
+   * merely released its buffer gate mid-turn — the normal post-final-answer
+   * state, where silence-poke must keep watching — is never reaped.
+   *
+   * Optional: when absent (test harnesses) the reaper is off and behaviour is
+   * exactly as before.
+   */
+  isTurnLive?: (key: string) => boolean
 }
 
 const state = new Map<string, SilencePokeState>()
@@ -602,6 +628,19 @@ function tick(now: number): void {
     const zeroAt = s.lastOutboundAt ?? s.turnStartedAt
     const silence = now - zeroAt
     if (silence < 0) continue
+
+    // #3552 — orphan reap. Drop per-turn state the moment its turn is provably
+    // over, instead of leaving it armed until the 300s fallback fires against a
+    // dead key and disarms it as a "late fire". Deterministic and path-agnostic:
+    // it does not matter WHICH turn-end path forgot to call `endTurn`, the state
+    // cannot outlive the turn by more than one poll interval. Same predicate as
+    // the fallback's late-fire guard, so a mid-turn buffer-gate release (the
+    // normal post-final-answer state, turn still live) is never reaped.
+    if (activeDeps.isTurnLive != null && !activeDeps.isTurnLive(key)) {
+      state.delete(key)
+      activeDeps.emitMetric({ kind: 'silence_poke_orphan_reaped', key, silence_ms: silence })
+      continue
+    }
 
     // #2527 — the early, quiet mid-turn liveness beat (below the fallback
     // window). Evaluated every tick; fires at most once per turn.

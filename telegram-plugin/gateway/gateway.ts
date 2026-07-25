@@ -10780,6 +10780,13 @@ if (isGatewayMain) ipcServer = createIpcServer({
         // fires after the gateway has stopped.
         typingEmitter.reset()
       },
+      // #3552 — the bridge died with turns in flight; disarm each dead turn's
+      // silence-poke state HERE. Before this, the armed 300s timer outlived the
+      // turn and was only dropped when the fallback eventually fired against the
+      // stale key and logged `turn_ended_cleanly_during_window` (504 events in
+      // 14 days vs 110 real fires). `endTurn` is idempotent, so being called for
+      // a key reported by both flush loops is safe.
+      onTurnKeyEnded: (key) => silencePoke.endTurn(key),
       // When dangling activeTurnStartedAt keys were swept (setDone raced
       // disconnect), the module-scope `currentTurn` may also point at the
       // dead bridge's turn. Null it so the next inbound starts a fresh

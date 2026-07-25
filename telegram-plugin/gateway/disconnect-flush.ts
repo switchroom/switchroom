@@ -67,6 +67,18 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
    *  No-op if no dangling keys are found. */
   onDanglingTurnsSwept?: (purgedKeys: string[]) => void
 
+  /** #3552 — called once per turn key this flush tears down (both the
+   *  controller loop and the dangling sweep). The bridge that owned those turns
+   *  just died, so every per-turn timer keyed on them is orphaned. The gateway
+   *  wires this to `silencePoke.endTurn`: without it the armed 300s silence-poke
+   *  state outlived the dead turn and was only disarmed when the fallback later
+   *  fired against the stale key and logged `turn_ended_cleanly_during_window`.
+   *  Deterministic disarm at the point the turn actually ends.
+   *
+   *  Idempotent by contract — a key may be reported by both loops below.
+   *  Optional (test harnesses). */
+  onTurnKeyEnded?: (key: string) => void
+
   /** Logger — receives the one-line decision trace. */
   log: (msg: string) => void
 }
@@ -90,6 +102,7 @@ export function flushOnAgentDisconnect<
     disposeProgressDriver,
     stopTurnTypingLoops,
     onDanglingTurnsSwept,
+    onTurnKeyEnded,
     log,
   } = deps
 
@@ -112,6 +125,8 @@ export function flushOnAgentDisconnect<
     activeStatusReactions.delete(key)
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)
+    // #3552: disarm this turn's silence-poke state here, not 300s later.
+    onTurnKeyEnded?.(key)
   }
   clearActiveReactions()
 
@@ -131,6 +146,8 @@ export function flushOnAgentDisconnect<
     for (const k of danglingKeys) {
       activeTurnStartedAt.delete(k)
       activeReactionMsgIds.delete(k)
+      // #3552: same deterministic disarm for the keys the controller loop missed.
+      onTurnKeyEnded?.(k)
     }
     log(
       `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
