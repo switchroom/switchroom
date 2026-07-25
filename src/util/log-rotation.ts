@@ -122,8 +122,9 @@ export interface RotateOptions {
    * empty, i.e. the empty-copy outcome named two paragraphs up reached
    * WITH the lock held — from every landing up to each gate's own stat.
    * What it does not remove is that gate's own stat→syscall gap. See
-   * {@link withRotateLock}'s residual, which enumerates all four gaps and
-   * what each still destroys (#3600 round-6 H1/H2, round-7 H1).
+   * {@link withRotateLock}'s residual, which enumerates all five gaps —
+   * these four plus the release's own — and what each still destroys
+   * (#3600 round-6 H1/H2, round-7 H1, round-10 F3).
    *
    * Single-writer logs (vault audit, hostd audit — both serialized
    * in-process, see `audit-hashchain.ts` single-writer-process contract)
@@ -251,8 +252,18 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * park its brand-new live lock. Then the absence window is real and the
  * cost above is real — but reaching it now requires the peer to have
  * judged us stale and to land inside a single syscall, not merely to have
- * reclaimed us at some point. The lock survives it (step 3), the peer
- * declines at its next checkpoint, and nothing is deleted.
+ * reclaimed us at some point. The peer's lock INODE survives it (step 3)
+ * and nothing of the peer's is ever unlinked — but be exact about what
+ * "survives" means, because it is not always at `lockPath`: where `link`
+ * works the file is restored there, and where it cannot (a filesystem
+ * without hardlinks, or a third arrival already holding the path) the
+ * inode survives only as the named park, `lockPath` is left ABSENT, and a
+ * later arrival can take the lock. Both halves are asserted — "release
+ * leaves the peer's lock alone even where the restore would fail" and "a
+ * restore that fails does not destroy the peer's lock inode", which
+ * asserts `existsSync(lockPath) === false` outright. Either way the peer
+ * declines at its next checkpoint. This is gap 5 of the five enumerated
+ * further down.
  *
  * The other new residual is a MISSED release: if a peer's release parked
  * our live lock and is mid-restore when our step 0 stats, we read ENOENT,
@@ -260,6 +271,22 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * restored with nobody holding it, and rotations skip until it ages past
  * {@link ROTATE_LOCK_STALE_MS} and is reclaimed. Bounded, non-destructive,
  * and it trades a delayed rotation for the destroyed generation above.
+ * That ENOENT arm is what bounds it, so it is pinned rather than asserted
+ * in prose: "release touches nothing when its opening stat cannot see our
+ * lock" (#3600 round-10, F1).
+ *
+ * Two things about that bound, since "30 seconds" is the wrong answer in
+ * both directions. The AGING part is ≤ {@link ROTATE_LOCK_STALE_MS}, not
+ * that value flat: the lockfile's mtime is stamped once, by the `open(wx)`
+ * that created it, and nothing in this file ever refreshes it (mtime
+ * refresh was considered and declined — see the end of this block), so an
+ * orphaned lock is already as old as the rotation that abandoned it at the
+ * instant it is abandoned, and has that much less to age. The RECLAIM part
+ * is unbounded above: nothing sweeps on a schedule, so the wedge does not
+ * end when the lock reads stale, it ends at the next over-cap write
+ * attempt after that. Honest statement: up to 30s of aging, plus however
+ * long until the next attempt. No rows are lost either way — the log keeps
+ * being written, it simply is not rotated.
  *
  * Teaching `stillHeld()` to tolerate the absence — ENOENT plus
  * `fstat(fd).nlink > 0` means our inode still has SOME name, i.e. we are
@@ -276,9 +303,12 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * H2), "release leaves the peer's lock alone even where the restore would
  * fail" and "a restore that fails does not destroy the peer's lock inode"
  * (#3600 round-8, M1) — plus its reclaim-side twin, "a RECLAIM whose
- * restore fails does not destroy the peer's lock inode". Those names are
- * checked mechanically, not by eye: "every test name this file cites
- * exists" fails if a citation here names no test (#3600 round-8, L2).
+ * restore fails does not destroy the peer's lock inode", and step 0's own
+ * ENOENT arm, "release touches nothing when its opening stat cannot see our
+ * lock" (#3600 round-10, F1). Those names are checked mechanically, not by
+ * eye: "every test name this file cites exists" fails if a citation here
+ * names no test (#3600 round-8, L2) — and, since round 10, if a citation is
+ * quietly moved into that check's own allowlist (F2).
  *
  * Note precisely what step 0 is and is not. It is NOT a `stillHeld()`-style
  * re-check that the release then trusts: a stat saying "ours" is exactly
@@ -357,24 +387,33 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  * They do not bound the DAMAGE of the syscall that gets through, and
  * specifically they do not bound it to "one generation". Rounds 3-7 of the
  * #3600 review each caught a sentence here claiming more than the code
- * does; every claim in this block is pinned by a named test in
- * `log-rotation-race.test.ts`, and the tests, not the prose, are the
- * record.
+ * does.
+ *
+ * The obvious defence — "every claim in this block is pinned by a named
+ * test, and the tests, not the prose, are the record" — stood here until
+ * round 10 and was itself one of those sentences (#3600 round-10, F5).
+ * Mutation testing falsified it: the release filter's ENOENT arm had no
+ * test at all, and the citation checker that is supposed to keep these
+ * names honest had two holes of its own. What is true, and is all that is
+ * claimed now: every OUTCOME this block describes as prevented, and every
+ * residual it describes as reachable, is asserted by a named test in
+ * `log-rotation-race.test.ts`, and those names are checked mechanically by
+ * "every test name this file cites exists". Where something is NOT pinned
+ * this file now says so where it is written. There are three: the release's
+ * `vanished` branch (inert — no outcome to assert), the acquire
+ * park-verify's inode clause (defence in depth the age clause plausibly
+ * subsumes), and the DURATION bound on the missed release, which is an
+ * argument from the code — the lock's mtime is stamped once and never
+ * refreshed — rather than a test.
  *
  * When the reclaim lands BEFORE our first destructive syscall we touch
  * nothing ("declines outright when the peer rotated before we touched
  * anything" — `.1` the peer's snapshot, `.2` the shifted history, active
  * untouched). A landing anywhere else is caught by the NEXT checkpoint
- * and costs nothing either — except in the FOUR check→syscall gaps, one
- * per destructive syscall in {@link rotateLogFile}, where that syscall is
- * already committed. (The lockfile's own release unlink was a FIFTH site
- * of the same shape and is NOT in this list because it no longer has the
- * shape: the unlink now names a park nobody else can reach, and identity
- * is decided by the atomic `rename` that produced that name, not by a
- * stat of `lockPath`. Release does open with a stat, but a mismatch there
- * only ever STOPS us — no destructive syscall runs on its say-so — so it
- * is not a check→syscall gap. #3600 round-7 H2, round-8 H2, above.) Those
- * four are not equivalent; each destroys something different:
+ * and costs nothing either — except in the FIVE check→syscall gaps, where
+ * that syscall is already committed: one per destructive syscall in
+ * {@link rotateLogFile}, and one in the release below. They are not
+ * equivalent; each destroys something different:
  *
  *   1. check→`unlinkSync(<log>.<keep>)` — the oldest-generation drop.
  *      The peer's rotation has just shifted real history into that slot;
@@ -397,7 +436,8 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  *      same way and for the same reason, once per loop iteration
  *      ("declines the shift when the peer rotated after our lock
  *      check"); residual likewise the gate's own stat→`rename` window.
- *   3. check→`copyFileSync` — the gap that WAS the worst of the four, and
+ *   3. check→`copyFileSync` — the gap that WAS the worst of the log's
+ *      four, and
  *      the one round 7 closed for every landing up to the gate's own stat
  *      (#3600 round-7, H1). The copy now carries a data-based gate
  *      symmetric to the truncate's: {@link rotateLogFile} measures the
@@ -461,6 +501,33 @@ const ROTATE_LOCK_STALE_MS = 30_000;
  *      sentence is. What the gate does cover is the ordinary shape of the
  *      landing: a peer that rotated leaves the active file shorter than
  *      our snapshot.
+ *   5. check→`renameSync(lockPath, <park>)` in the RELEASE below — the
+ *      only one of the five that destroys nothing in the LOG and instead
+ *      costs a peer its lock. It is here because for two rounds this list
+ *      said the release no longer had the shape, which was wrong (#3600
+ *      round-10, F3). What round 7 removed was the release's
+ *      stat→`unlink(lockPath)` pair: the unlink now names a park nobody
+ *      else can reach, and identity is decided by the atomic `rename` that
+ *      produced that name. What round 8 then ADDED, in front of it, is
+ *      step 0's `stat(lockPath)` — and on a MATCH the very next syscall is
+ *      that `rename`. A peer that reclaims in between has its brand-new
+ *      LIVE lock parked on the strength of our stat, which is the shape
+ *      exactly. Cost when it lands: `lockPath` goes absent for at least the
+ *      rename→`link` window, which is enough for the peer's next
+ *      `stillHeld()` to read ENOENT and abandon a rotation that may already
+ *      have dropped its oldest generation; and where `link` CANNOT restore
+ *      it, `lockPath` stays absent and the peer's lock inode survives only
+ *      as a park for the sweep. Asserted end to end, `existsSync(lockPath)
+ *      === false` and all, in "a restore that fails does not destroy the
+ *      peer's lock inode". Nothing of the peer's is ever unlinked.
+ *
+ *      What step 0 buys is the MISMATCH direction, which is final,
+ *      unfalsifiable while `fd` is open, and opens no window at all; what
+ *      it costs is this gap plus the missed release in the release
+ *      residual. It narrows the release's exposure from every mismatched
+ *      release to a reclaim landing inside one syscall; it does not change
+ *      its shape. Its ENOENT arm is pinned by "release touches nothing when
+ *      its opening stat cannot see our lock".
  *
  * So: the window shrinks from "the whole rotation" to "between two
  * adjacent syscalls", and reaching it needs a rotation that overruns
@@ -545,12 +612,22 @@ function withRotateLock<T>(
     let vanished = false;
     try {
       const p = fs.statSync(parked);
+      // The AGE clause is what the tests bite on; the inode clause is
+      // defence in depth and is NOT independently pinned — dropping
+      // `p.ino === observed.ino` survives the scoped suites, plausibly
+      // because a lock that arrived after our staleness stat is by
+      // construction fresh and so fails the age clause anyway (#3600
+      // round-10, recorded). Kept because "plausibly" is not "provably":
+      // the age clause rests on a clock, the inode clause does not.
       mine =
         p.ino === observed.ino &&
         Date.now() - p.mtimeMs >= ROTATE_LOCK_STALE_MS;
     } catch {
       vanished = true; // a peer's sweep reaped our park — nothing to put back
     }
+    // Unlike the release's `vanished` (which is inert), this one IS an
+    // outcome: it returns null instead of falling into the mismatch
+    // restore, i.e. we decline without taking the lock.
     if (vanished) return null;
     if (!mine) {
       // We parked a LIVE lock (a peer reclaimed between our stat and our
@@ -653,8 +730,26 @@ function withRotateLock<T>(
       // nlink > 0` ⇒ "parked, not deleted") returns true for a holder a
       // stale reclaim is about to displace legitimately, which would let a
       // destructive syscall through in exactly the H1 interleaving these
-      // checkpoints exist to stop. A spurious decline costs a rotation
-      // cycle; a spurious proceed costs a generation.
+      // checkpoints exist to stop.
+      //
+      // Be exact about the price of that choice, because the obvious
+      // sentence for it — "a spurious decline costs a rotation cycle" — is
+      // true only at the FIRST checkpoint and can be false at every one
+      // after it (#3600 round-10, F4). A decline costs whatever
+      // {@link rotateLogFile} has already done, and by control flow that
+      // grows along the rotation: at the first checkpoint it really is just
+      // the cycle, but a decline at the truncate checkpoint lands after the
+      // oldest-generation unlink, the shifts and the copy, so it costs the
+      // oldest generation and leaves the window shifted — exactly what that
+      // function's `false` contract spells out ("a mid-rotation decline can
+      // already have dropped `<path>.<maxFiles>` or shifted a generation").
+      //
+      // The trade still runs this way, on the OTHER side of the ledger, not
+      // this one: a spurious decline never destroys rows in the ACTIVE file
+      // and never overwrites a peer's snapshot, while a spurious proceed
+      // does both — up to the quiet-peer copy where every byte the log has
+      // is lost. Bounded damage to the generations beats unbounded damage
+      // to the live rows; it is not "a cycle versus a generation".
       return false;
     }
   };
@@ -683,9 +778,18 @@ function withRotateLock<T>(
     // observable failure H3 was fixed for. Ordering could not close it;
     // only deciding identity about a file NOBODY ELSE CAN NAME does.
     // `rename` gives us that atomically, so we take the file first and
-    // judge it second, exactly as the stale reclaim above does. (The stat
-    // in step 0 below does not walk that back: nothing destructive runs on
-    // a match there — a match only means we go on to park and judge.)
+    // judge it second, exactly as the stale reclaim above does.
+    //
+    // What step 0 below does and does not walk back, exactly (#3600
+    // round-10, F3): it does not restore the old stat→`unlink` shape — no
+    // unlink is ever taken on its verdict — but it is NOT true that
+    // "nothing destructive runs on a match". A match runs
+    // `renameSync(lockPath, parked)` one syscall later, and if a peer
+    // reclaimed in that syscall the file that gets parked is the peer's
+    // LIVE lock. That is gap 5 in the doc block's list, its cost is stated
+    // there, and it is asserted in "a restore that fails does not destroy
+    // the peer's lock inode". Step 0 is load-bearing on the MISMATCH side
+    // only.
     if (ourIno !== null) {
       // STEP 0 — a stat that can only rule the release OUT (#3600 round-8,
       // H2). A stat cannot prove the lock is still ours (that is the whole
@@ -704,7 +808,13 @@ function withRotateLock<T>(
       try {
         looksOurs = fs.statSync(lockPath).ino === ourIno;
       } catch {
-        /* nothing at the path — nothing of ours left to release */
+        /* Nothing of ours left to release — and this arm is load-bearing,
+           not defensive tidying: setting `looksOurs = true` here (or
+           initialising it true) makes the release go on to `rename` a path
+           that may by then hold a peer's LIVE lock. Both mutations survived
+           all 46 scoped tests until round 10; "release touches nothing when
+           its opening stat cannot see our lock" kills them (#3600 round-10,
+           F1). */
       }
       if (looksOurs) {
         const parked = `${lockPath}.stale.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
@@ -726,6 +836,24 @@ function withRotateLock<T>(
           if (vanished) {
             // Nothing to restore and nothing to unlink: the sweep that
             // reaped it performed exactly the release we came here to do.
+            //
+            // This branch is a READABILITY SPLIT, not a guard, and saying
+            // otherwise was the last unearned claim in this function (#3600
+            // round-10, F6). It has no outcome of its own: two independent
+            // mutations — collapsing it into the mismatch path below, and
+            // making it `unlink(parked)` — each survive all 47 scoped
+            // tests, and they are genuinely equivalent, because once the
+            // park is gone the mismatch path's `link` ENOENTs, `restored`
+            // stays false, and no unlink runs either way. It is therefore
+            // deliberately untested; a test written for it would assert a
+            // difference that does not exist.
+            //
+            // The load-bearing half of the round-8 M1 fix is the
+            // CONDITIONAL unlink below, and that is pinned: making it
+            // unconditional here fails "a restore that fails does not
+            // destroy the peer's lock inode", and doing the same at the
+            // acquire-side twin fails its sibling — one test each, two in
+            // total across the two sites.
           } else if (mine) {
             try {
               fs.unlinkSync(parked);
@@ -804,9 +932,11 @@ function withRotateLock<T>(
  * Reaping a LIVE release park is harmless in a second way: that park IS
  * the releasing process's own lock inode, so unlinking it is precisely the
  * release that process was about to perform. Its `statSync(parked)` then
- * throws, which it reads as "vanished" — a case distinct from a mismatch,
- * so it attempts no restore and no unlink — and both agree the lock is
- * released. (The release's OTHER park — a peer's live lock, mismatched —
+ * throws and it does nothing further — by the `vanished` label, or, if that
+ * label were removed, by the mismatch path whose `link` would ENOENT and
+ * whose unlink is conditional on a restore that cannot happen. The label is
+ * for the reader; the harmlessness comes from the code either way, and both
+ * ends agree the lock is released. (The release's OTHER park — a peer's live lock, mismatched —
  * can also be reaped here, from the branch where its restore failed and it
  * deliberately left the file. That is the leak this sweep is for.)
  *
@@ -938,8 +1068,9 @@ function fsyncAndMeasure(
  * syscall" bounds the COUNT and nothing else: depending on which of the
  * four gaps it lands in, that one syscall costs a generation of history,
  * the peer's live rows, or — the residual copy gap with a quiet peer —
- * every byte the log has. {@link withRotateLock} enumerates all four with
- * the test that asserts each.
+ * every byte the log has. {@link withRotateLock} enumerates these four,
+ * plus a fifth of the same shape in its own release, with the test that
+ * asserts each.
  */
 export function rotateLogFile(
   logPath: string,

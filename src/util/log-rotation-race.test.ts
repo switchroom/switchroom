@@ -580,6 +580,95 @@ describe("stale-lock reclaim is mutually exclusive (finding 1)", () => {
     expect(realFs.statSync(path.join(dir, debris[0])).ino).toBe(peerIno);
   });
 
+  it("release touches nothing when its opening stat cannot see our lock (round-10, the filter's ENOENT arm)", () => {
+    // Step 0's ENOENT arm is what BOUNDS the missed-release residual, and
+    // until round 10 nothing tested it: `catch { looksOurs = true }` and
+    // `let looksOurs = true` each survived all 46 scoped tests (#3600
+    // round-10, F1). Neither is equivalent. Under either, the release goes
+    // on to `rename(lockPath, <park>)`, and when what sits at `lockPath` is
+    // a peer's brand-new LIVE lock that park is exactly the round-8 M1
+    // damage, reached through the arm that exists to prevent it.
+    //
+    // The interleaving: a peer judged us stale and reclaimed us — park,
+    // unlink, `open(wx)` — so `lockPath` carries ITS live lock by the time
+    // we release, and our step-0 stat nonetheless reads ENOENT, as it does
+    // whenever it lands inside somebody's park window (the missed-release
+    // residual, documented at step 0 in `log-rotation.ts`).
+    //
+    // Those are two different instants and there is no hook between the
+    // step-0 stat and the rename it guards, so the reclaim is driven at a
+    // real syscall (the post-truncate `stillHeld()`) and the ENOENT is
+    // INJECTED into the next stat of `lockPath`, which IS step 0. The
+    // injection is what makes this differential rather than a path
+    // observation: the filesystem is byte-identical in both arms, so the
+    // only thing that can move the outcome is the value of `looksOurs`. A
+    // hook that instead really removed the lock would make the mutant's
+    // rename ENOENT too and hide the defect.
+    //
+    // `linkThrows` is on for the same reason the M1 residual test above
+    // needs it: with hardlinks available the mutant's restore puts the
+    // peer's lock back and the damage leaves no trace in the end state.
+    realFs.writeFileSync(log, "x".repeat(CAP * 4));
+    hooks.linkThrows = true;
+
+    let truncated = false;
+    hooks.beforeTruncate = () => {
+      truncated = true;
+    };
+    let peerIno = -1;
+    let injected = false;
+    let firing = false;
+    hooks.beforeStat = (p) => {
+      // `firing` keeps the peer's own stat — which re-enters this mocked
+      // module — from recursing into the hook.
+      if (p !== lock || !truncated || firing) return;
+      if (peerIno === -1) {
+        // The FIRST stat of `lockPath` after the truncate is
+        // `rotateLogFile`'s post-truncate `stillHeld()`, not the release.
+        // That is where the peer lands: it judges us stale and reclaims —
+        // park, unlink, `open(wx)` — so from here on `lockPath` carries ITS
+        // live lock. Our rotation is already complete, so all that costs is
+        // the "rows another rotator wrote … are LOST" diagnostic.
+        firing = true;
+        try {
+          realFs.rmSync(lock, { force: true });
+          realFs.closeSync(realFs.openSync(lock, "wx", 0o600));
+          peerIno = realFs.statSync(lock).ino;
+        } finally {
+          firing = false;
+        }
+        return;
+      }
+      if (injected) return; // the assertions below stat it too
+      injected = true;
+      // The NEXT stat of `lockPath` is the release's step 0 — and this is
+      // the ENOENT it reads.
+      const e: NodeJS.ErrnoException = new Error(
+        "ENOENT: no such file or directory, stat",
+      );
+      e.code = "ENOENT";
+      throw e;
+    };
+
+    maybeRotateLogFile(log, {
+      maxBytes: CAP,
+      maxFiles: 2,
+      tag: "t",
+      lock: true,
+    });
+
+    expect(peerIno).not.toBe(-1); // the peer really reclaimed
+    expect(injected).toBe(true); // and the release really read the ENOENT
+    // The claim: an ENOENT at step 0 ENDS the release. The peer's live lock
+    // is still at the path, still its own inode …
+    expect(realFs.existsSync(lock)).toBe(true);
+    expect(realFs.statSync(lock).ino).toBe(peerIno);
+    // … and we parked nothing, so there is no debris to reap either.
+    expect(
+      realFs.readdirSync(dir).filter((f) => f.includes(".stale.")),
+    ).toEqual([]);
+  });
+
   it("a RECLAIM whose restore fails does not destroy the peer's lock inode (round-8 M1, sibling)", () => {
     // The reclaim's mismatch branch is the same code as the release's, one
     // branch away, and carried the same defect: swallow the failed `link`,
@@ -1486,15 +1575,29 @@ describe("the doc block's citations are checkable", () => {
       .map((l) => l.replace(/^\s*(\*|\/\/)\s?/, ""))
       .join(" ")
       .replace(/\s+/g, " ");
+    // The exclusion set is CODE punctuation only. An em-dash used to be in
+    // it and had no business there: test titles contain em-dashes, and
+    // exactly one citation did — "does not shift the peer's fresh .1 off the
+    // end — but the unlink gap destroys its shifted history". That citation
+    // was therefore invisible to the very mechanism built to catch renamed
+    // citations, and renaming its test kept the check green (#3600 round-10,
+    // F2). Anything the wider net now sweeps in that is genuinely prose goes
+    // in the allowlist below, deliberately and one at a time.
     const candidates = [...comments.matchAll(/"([^"]{20,120})"/g)]
       .map((m) => m[1])
-      .filter((s) => !/[`#{}—[\]]/.test(s) && /^[a-z]/.test(s));
+      .filter((s) => !/[`#{}[\]]/.test(s) && /^[a-z]/.test(s));
 
     // Quoted PROSE that is not a citation. Explicit, so that a new quote in
     // title shape fails this test until someone decides which it is —
     // that decision is the point, and it is cheap.
     const notCitations = new Set([
+      // The three round-10 additions are quotations of sentences the source
+      // used to assert and now retracts, kept verbatim so that the
+      // retraction names what it retracts (#3600 round-10, F3/F4).
+      "a cycle versus a generation",
+      "a spurious decline costs a rotation cycle",
       "between two adjacent syscalls",
+      "nothing destructive runs on a match",
       "our lock was destroyed",
       "rename works fine on the host",
       "rows another rotator wrote … are LOST",
@@ -1514,5 +1617,20 @@ describe("the doc block's citations are checkable", () => {
     // And the allowlist itself must not rot: every entry has to still be
     // present in the source, or it is a stale exemption hiding a real one.
     expect([...notCitations].filter((c) => !comments.includes(c))).toEqual([]);
+    // Nor may it ABSORB drift. "Still present in the source" is satisfied by
+    // a real citation too, so on its own that guard let a live citation be
+    // moved into the allowlist and its test renamed with the check still
+    // green (#3600 round-10, F2). An entry that names a real test is
+    // misfiled by construction — a non-citation cannot be one — so the
+    // laundering step is what gets rejected, at the moment it is made.
+    expect(
+      [...notCitations].filter((c) =>
+        titles.some((t) => t === c || t.startsWith(c)),
+      ),
+    ).toEqual([]);
+    // What this pair still cannot separate: allowlisting a citation AND
+    // renaming its test in the same change leaves a string that names no
+    // test, which is indistinguishable from genuine prose. The guard is a
+    // ratchet on the cheap move, not a proof.
   });
 });
