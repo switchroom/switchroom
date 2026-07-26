@@ -165,6 +165,32 @@ describe('edit-flood fuse — a runaway edit stream cannot exceed the ceiling', 
   })
 })
 
+describe('edit-flood fuse — supersede is scoped to ONE message', () => {
+  it('a queued edit to card A is not killed by an edit to card B in the same chat', async () => {
+    const clock = new FakeClock()
+    const landed: string[] = []
+    // The per-CHAT edit tier is the binding one here (per-message is wide).
+    const fuse = createEditFloodFuse({
+      clock, perMessageMaxPerWindow: 100, perChatEditMaxPerWindow: 1,
+      perChatWindowMs: 10_000, maxDeferMs: 120_000,
+    })
+
+    const inflight = [1, 2, 3].map((m) => fuse.apply(
+      'editMessageText', { chat_id: CHAT, message_id: m, text: `card ${m}` },
+      async () => { landed.push(`card ${m}`); return true },
+    ))
+    await clock.advance(60_000)
+    await Promise.all(inflight)
+
+    // Last-write-wins means "a newer frame of THIS card replaces an older frame
+    // of THIS card". Killing card 2's queued edit because card 3 arrived would
+    // not be coalescing, it would be data loss — card 2 would never repaint.
+    expect(landed.sort()).toEqual(['card 1', 'card 2', 'card 3'])
+    expect(fuse.stats().superseded).toBe(0)
+    expect(fuse.stats().dropped).toBe(0)
+  })
+})
+
 describe('edit-flood fuse — AIMD: a soft 429 tightens the sustained rate', () => {
   it('halves the ceiling after an observed 429 and restores it after the tighten window', async () => {
     const clock = new FakeClock()
@@ -210,6 +236,18 @@ describe('edit-flood fuse — AIMD: a soft 429 tightens the sustained rate', () 
     await clock.advance(600_001)
     expect(fuse.stats().tightened).toBe(false)
     expect(fuse.stats().perMessageCeiling).toBe(20)
+  })
+
+  it('does NOT tighten on an ordinary error whose text merely contains "429"', async () => {
+    const clock = new FakeClock()
+    const fuse = createEditFloodFuse({ clock })
+    const notAFlood = new Error('Bad Request: message 429 not found')
+    await expect(fuse.apply('editMessageText', { chat_id: CHAT, message_id: 429, text: 'x' },
+      async () => { throw notAFlood })).rejects.toThrow(/not found/)
+    // A false positive here would halve every ceiling for ten minutes on a
+    // routine deleted-message error.
+    expect(fuse.stats().floodObserved).toBe(0)
+    expect(fuse.stats().tightened).toBe(false)
   })
 
   it('recognises a 429 that arrives as a raw ApiResponse rather than a throw', async () => {

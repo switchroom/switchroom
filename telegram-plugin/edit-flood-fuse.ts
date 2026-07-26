@@ -188,8 +188,14 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
    * without limit. A window with no in-flight waiter and no timestamps inside
    * the widest window is dead state.
    */
+  let sinceEvict = 0
   function evict(now: number): void {
     if (windows.size < 4096) return
+    // Sweep at most once per 1024 admissions: an unconditional sweep would be
+    // O(n) on EVERY outbound call once the map is large, i.e. the fuse itself
+    // would become the latency problem it exists to prevent.
+    if (++sinceEvict < 1024) return
+    sinceEvict = 0
     const widest = Math.max(perMessageWindowMs, perChatWindowMs)
     for (const [k, w] of windows) {
       if (w.waiter === null && (w.ts.length === 0 || w.ts[w.ts.length - 1]! <= now - widest)) {
@@ -224,9 +230,20 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       if (e.error_code === 429) return true
       if (e.parameters != null && typeof e.parameters.retry_after === 'number') return true
     }
+    // Match on the SEMANTIC markers only. A bare "429" substring
+    // false-positives on ordinary server text (e.g. "message 429 not found"),
+    // and a false positive here halves every ceiling for ten minutes.
     const msg = err instanceof Error ? err.message : String(err ?? '')
-    return /\b429\b/.test(msg) || /too many requests/i.test(msg) || /retry after/i.test(msg)
+    return /too many requests/i.test(msg) || /retry[ _-]?after/i.test(msg)
   }
+
+/**
+   * How a call that finds no room behaves:
+   *   supersede — per-message edits: a newer edit to the SAME message kills it
+   *   drop      — per-chat edits: waits, then drops at the defer deadline
+   *   release   — sends: waits, then passes through (never lost)
+   */
+  type WaitMode = 'supersede' | 'drop' | 'release'
 
   /** Give back a slot reserved by `awaitRoom` (used when a later tier denies). */
   function unreserve(key: string, at: number): void {
@@ -246,7 +263,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
    * Returns the reserved timestamp, or null when the call must be dropped.
    */
   async function awaitRoom(
-    key: string, windowMs: number, max: number, method: string, supersedable: boolean,
+    key: string, windowMs: number, max: number, method: string, mode: WaitMode,
   ): Promise<number | null> {
     const w = win(key)
     const deadline = clock.now() + maxDeferMs
@@ -262,7 +279,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         // Held as long as we are willing to hold. An edit is dropped (the next
         // render carries full state); a send is released (losing a reply is
         // worse than a late one).
-        if (supersedable) {
+        if (mode !== 'release') {
           counters.dropped++
           onTrip?.({ method, key, action: 'dropped' })
           return null
@@ -277,9 +294,12 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         counted = true
         onTrip?.({ method, key, action: 'deferred' })
       }
-      // Last-write-wins: a newer edit to the same message kills this one.
+      // Last-write-wins: a newer edit to the same message kills this one. Only
+      // valid on the per-MESSAGE tier — on a per-chat key the "newer" edit is
+      // usually to a DIFFERENT message, and killing an unrelated card's edit is
+      // not last-write-wins, it is data loss.
       let killed = false
-      if (supersedable) {
+      if (mode === 'supersede') {
         w.waiter?.kill()
         const superseded = new Promise<void>((resolve) => {
           w.waiter = { kill: () => { killed = true; resolve() } }
@@ -320,10 +340,10 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     if (isEdit) {
       if (msg == null) return runObserved(next)
       const msgKey = `m:${chat}:${msg}`
-      const msgSlot = await awaitRoom(msgKey, perMessageWindowMs, perMessageMax, method, true)
+      const msgSlot = await awaitRoom(msgKey, perMessageWindowMs, perMessageMax, method, 'supersede')
       if (msgSlot === null) return DROPPED_RESULT as unknown as R
       const chatKey = `ce:${chat}`
-      const chatSlot = await awaitRoom(chatKey, perChatWindowMs, perChatEditMax, method, true)
+      const chatSlot = await awaitRoom(chatKey, perChatWindowMs, perChatEditMax, method, 'drop')
       if (chatSlot === null) {
         // Denied by the second tier — hand the first tier's slot back so a
         // dropped edit never consumes budget it did not use.
@@ -334,7 +354,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     }
 
     const chatKey = `cs:${chat}`
-    await awaitRoom(chatKey, perChatWindowMs, perChatSendMax, method, false)
+    await awaitRoom(chatKey, perChatWindowMs, perChatSendMax, method, 'release')
     return runObserved(next)
   }
 
