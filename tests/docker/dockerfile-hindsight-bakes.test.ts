@@ -531,6 +531,76 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the duplicate-ANN-scan fix (assert-guarded, fail-loud)", () => {
+    // retrieve_all_fact_types_parallel ran the vector-similarity scan twice per
+    // recall: Step 2's semantic arm, then `semantic_seeds=None` into the graph
+    // retriever, whose _find_semantic_seeds issues its own
+    // `ORDER BY embedding <=> $1::vector LIMIT $5` per fact type — serialized
+    // behind Step 2's connection block. The patch threads Step 2's rows through
+    // as the seeds. Outcome coverage lives in hindsight-search-patches.test.ts.
+
+    // The exact-once anchor guards (fail-loud on upstream drift), one per site.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight duplicate-ANN-scan patch: retrieve_all_fact_types_parallel anchor found \{n\}x/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight duplicate-ANN-scan patch: Step 2 preamble anchor found \{n\}x/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight duplicate-ANN-scan patch: Step 3 retriever\.retrieve call site anchor found \{n\}x/,
+    );
+
+    // The mirrored seed constants are only correct while link_expansion still
+    // calls _find_semantic_seeds with them — asserted against that file at
+    // build time, so an upstream retune fails the build rather than silently
+    // deriving a different seed set.
+    expect(dockerfile).toMatch(/_GRAPH_SEED_LIMIT = 20/);
+    expect(dockerfile).toMatch(/_GRAPH_SEED_MIN_SIMILARITY = 0\.3/);
+    expect(dockerfile).toContain(
+      String.raw`assert "                    limit=20,\n                    threshold=0.3,\n" in le,`,
+    );
+    // …and only correct while the seeds are still consumed by id alone, which
+    // is what makes "same id set" the right equivalence relation.
+    expect(dockerfile).toMatch(
+      /assert "seed_ids = list\(\{s\.id for s in all_seeds\}\)" in le,/,
+    );
+    // …and while the receiving branch still honours the parameter at all.
+    expect(dockerfile).toMatch(
+      /assert "            if semantic_seeds:\\n                all_seeds = list\(semantic_seeds\)\\n" in le,/,
+    );
+
+    // Correctness-first fallbacks: decline to derive whenever the arm's pool is
+    // narrower than the seed query's, or the arm's trim may have cut seeds.
+    expect(dockerfile).toMatch(
+      /if arm_min_similarity > _GRAPH_SEED_MIN_SIMILARITY:\n +return None/,
+    );
+    expect(dockerfile).toMatch(
+      /if len\(seeds\) < _GRAPH_SEED_LIMIT and len\(seeds\) == len\(ranked\) and len\(ranked\) >= arm_limit:/,
+    );
+    // Sorted explicitly: no new dependence on UNION ALL row order.
+    expect(dockerfile).toMatch(
+      /ranked = sorted\(semantic_results, key=lambda r: r\.similarity, reverse=True\)/,
+    );
+
+    // Scope guard: this patch does NOT thread temporal seeds. Step 2's temporal
+    // rows are coverage-selected and upstream passes none, so threading them
+    // would ADD seeds rather than reproduce upstream's graph output.
+    expect(dockerfile).toMatch(
+      /assert t\.count\("temporal_seeds=None,"\) == 1,/,
+    );
+
+    // Post-replace re-assertions (verification-on-build), including that no
+    // `semantic_seeds=None` call site survives and that the result still parses.
+    expect(dockerfile).toMatch(/assert "def _graph_semantic_seeds\(" in t,/);
+    expect(dockerfile).toMatch(
+      /assert "            semantic_seeds=None,\\n" not in t,/,
+    );
+    expect(dockerfile).toMatch(/compile\(t, str\(f\), "exec"\)/);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight duplicate-ANN-scan patch: graph expansion now seeds off Step 2's semantic arm/,
+    );
+  });
+
   it("keeps the LiteLLM empty-TimeoutError-message fix (assert-guarded, fail-loud)", () => {
     // Both retry loops ended their timeout handler with a bare `raise`,
     // re-raising an asyncio.TimeoutError with no args — so operators saw

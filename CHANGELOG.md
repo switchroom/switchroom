@@ -25,6 +25,38 @@ Embeddings come along for free. They run on the same torch, and make the same
 device probe, so they move to the GPU with no extra work — a smaller win
 (tens of milliseconds a call, not seconds), but a free one.
 
+### Recall no longer runs the same vector scan twice
+
+`retrieve_all_fact_types_parallel` ran the ANN scan
+(`ORDER BY embedding <=> $1::vector`) once for the semantic arm, discarded it,
+and then let the graph retriever issue its own — one per fact type, serialized
+behind the semantic stage's connection block. A three-fact-type recall did
+three vector scans where one is enough.
+
+Step 2's semantic rows are now threaded through as `semantic_seeds`. The
+parameter already existed and was already honoured by
+`link_expansion_retrieval`; nothing downstream changes shape. The derivation
+**declines** and lets upstream's own query run whenever the two sets are not
+provably identical — a per-request `min_scores.semantic` floor above the 0.3
+seed threshold, or a `thinking_budget` below the 20-seed cap — because a
+silently narrowed seed set is a quieter recall, and that is worse than a
+slower one.
+
+Verified, not assumed. The probe in
+`tests/docker/hindsight-search-patches.test.ts` counts the vector scans a whole
+recall issues (3 unpatched, 1 patched) and diffs the delivered seed ids against
+the output of upstream's own `_find_semantic_seeds`, called with the same
+parameters as the real call site — not against a hardcoded model. On the live
+`overlord` bank (67k `world` units), the two queries returned identical top-20
+seed sets across all 25 sampled query vectors.
+
+Honest scope: on that bank the removed scan measures ~10ms per fact type
+server-side (world 10.07ms / experience 11.33ms / observation 9.56ms, 10 warm
+samples each). Live graph timings are n=31 mean 0.258s p90 1.412s, so the
+graph tail is expansion-CTE work, not this scan. This removes real duplicated
+work; it is not the fix for the tail, and no end-to-end before/after was taken
+because the change is not deployed.
+
 ## v0.19.22 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
 
 ### LiteLLM paired timeout budgets are now DERIVED, and drift is detected
