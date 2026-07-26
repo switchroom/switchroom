@@ -38,7 +38,10 @@ class PendingQueueTest(unittest.TestCase):
             "api_url": "http://fake:9077",
             "api_token": None,
             "bank_id": "test-bank",
-            "content": "user: hello\nassistant: hi",
+            # Distinct per document: the queue's dedupe key is
+            # (bank_id, part_position, sha256(content)) since switchroom
+            # #3691, so a shared body would collapse these into one entry.
+            "content": f"user: hello\nassistant: hi ({document_id})",
             "document_id": document_id,
             "context": "claude-code",
             "metadata": {"session_id": "sess-1"},
@@ -59,7 +62,7 @@ class PendingQueueTest(unittest.TestCase):
         with open(path) as f:
             entry = json.load(f)
         self.assertEqual(entry["bank_id"], "test-bank")
-        self.assertEqual(entry["content"], "user: hello\nassistant: hi")
+        self.assertEqual(entry["content"], self._sample_payload()["content"])
         self.assertEqual(entry["document_id"], "doc-1")
         self.assertEqual(entry["error_class"], "ValueError")
         self.assertEqual(entry["error_message"], "nope")

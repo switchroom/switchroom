@@ -53,8 +53,15 @@ of that loop, not of lost memory: a full sweep of 5,751 queued entries on
 this fleet (2026-07-25) found **4,048 (70.4%) already existed as
 documents**, 3,815 of them with facts extracted.
 
-``--backlog`` is therefore a two-phase, out-of-hook replay:
+``--backlog`` is therefore a three-phase, out-of-hook replay:
 
+* **Phase 0 — collapse duplicates (free, no network).** Queued entries
+  sharing ``(bank_id, part_position, sha256(content))`` are the same
+  memory; the redundant copies are archived so the phases below never pay
+  for one memory twice. Measured 2026-07-26: 1,060 queued files across 11
+  agents fell into ~368 distinct groups — ~65% of the queue was duplicate,
+  with one group repeated 32 times. At ~168 s per phase-2 extraction that
+  one group alone was 90 minutes of LLM lane time for a single memory.
 * **Phase 1 — reconcile (free).** GET the document. If it exists, the
   memory is already durable; retire the queue entry without a POST. No
   LLM work, no cost, idempotent, resumable at any point. Only for
@@ -84,7 +91,7 @@ reports the upstream is already slow.
 Standalone usage::
 
     python3 drain_pending.py               # bounded in-hook drain
-    python3 drain_pending.py --backlog     # two-phase backlog replay
+    python3 drain_pending.py --backlog     # three-phase backlog replay
     python3 drain_pending.py --backlog --phase reconcile   # free pass only
     python3 drain_pending.py --backlog --dry-run
 """
@@ -105,6 +112,7 @@ from lib.config import debug_log, load_config
 from lib.pending import (
     MAX_ATTEMPTS,
     archive_reconciled,
+    collapse_duplicates,
     is_content_derived_document_id,
     is_permanent_failure,
     iter_entries,
@@ -531,17 +539,21 @@ def _new_summary() -> dict:
         # so it must not be counted as drained/reconciled, which would
         # report a retire that did not happen.
         "archive_failed": 0,
+        # Redundant copies retired by `pending.collapse_duplicates` before
+        # any network work. Backlog mode only — see `_drain_backlog_impl`.
+        "collapsed": 0,
         "stalled": False,
         "budget_exceeded": False,
     }
 
 
 def drain_backlog(config: dict | None = None, **kw) -> dict:
-    """Two-phase backlog replay, off the SessionStart budget entirely.
+    """Three-phase backlog replay, off the SessionStart budget entirely.
 
     See the module docstring. Summary shape is ``drain()``'s plus
-    ``reconciled`` (already durable — no POST issued) and ``unknown``
-    (presence could not be established; left queued).
+    ``reconciled`` (already durable — no POST issued), ``unknown``
+    (presence could not be established; left queued) and ``collapsed``
+    (redundant duplicate copies archived before any network work).
     """
     return drain(config, backlog=True, **kw)
 
@@ -566,6 +578,7 @@ def drain(
          "unknown": int,   # presence unknown, left queued
          "archive_failed": int,  # durable, but the archive was unwritable
                                  # so the entry is STILL QUEUED
+         "collapsed": int, # duplicate copies archived (backlog mode only)
          "stalled": bool,  # stall guard tripped
          "budget_exceeded": bool}
     """
@@ -784,8 +797,30 @@ def _wait_for_upstream(backoff_ms: int, started: float, budget: float) -> bool:
 def _drain_backlog_impl(
     config: dict, phase: str = "both", dry_run: bool = False
 ) -> dict:
-    """Concurrent-capable, long-budget, two-phase backlog replay."""
+    """Concurrent-capable, long-budget, three-phase backlog replay."""
     summary = _new_summary()
+
+    # PHASE 0 — collapse duplicates (local, free, no network at all).
+    #
+    # Runs FIRST because every later phase is per-entry: a GET in phase 1
+    # and, worse, a ~168 s LLM-backed extraction in phase 2. On the measured
+    # 2026-07-26 fleet backlog ~65% of queued files were byte-identical
+    # copies of another queued file (top group 32x), so skipping this pass
+    # means paying phase 2 up to 32 times over for one memory.
+    #
+    # DELIBERATELY NOT run by the in-hook drain. It reads every queued entry
+    # to recompute identity from content — bounded, but not instant — and
+    # the SessionStart drain's whole contract is a hard wall-clock ceiling
+    # on hook latency. New duplicates cannot accumulate there anyway:
+    # `pending.enqueue`'s filename-keyed guard stops those at the producer.
+    if not dry_run:
+        summary["collapsed"] = collapse_duplicates()
+        if summary["collapsed"]:
+            _blog(
+                f"phase 0: collapsed {summary['collapsed']} duplicate entries "
+                f"(byte-identical content already queued under another entry); "
+                f"archived, not deleted"
+            )
 
     if phase in ("reconcile", "both"):
         _reconcile_phase(config, summary, dry_run)
@@ -935,7 +970,7 @@ def _parse_args(argv: list[str] | None):
     ap.add_argument(
         "--backlog",
         action="store_true",
-        help="two-phase backlog replay, off the SessionStart budget",
+        help="three-phase backlog replay, off the SessionStart budget",
     )
     ap.add_argument(
         "--phase",
@@ -967,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     if any(
         summary[k]
         for k in (
+            "collapsed",
             "drained",
             "retried",
             "dead",
@@ -978,6 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[Hindsight] drain_pending{'(backlog)' if args.backlog else ''}: "
             f"drained={summary['drained']} reconciled={summary['reconciled']} "
+            f"collapsed={summary['collapsed']} "
             f"retried={summary['retried']} dead={summary['dead']} "
             f"unknown={summary['unknown']} "
             f"archive_failed={summary['archive_failed']} "
