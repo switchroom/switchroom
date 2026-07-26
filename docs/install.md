@@ -117,8 +117,21 @@ Interactive wizard. You'll be prompted for:
 
 The wizard scaffolds your first agent (`assistant` by default) and
 writes `~/.switchroom/switchroom.yaml` and
-`~/.switchroom/agents/assistant/`. It does **not** start any docker
-containers — that's Step 5.
+`~/.switchroom/agents/assistant/`. It does **not** start any agent
+containers — that's Step 5. (It does start the Hindsight memory
+container, unless you picked `none`.)
+
+Because `setup` runs before `apply`, its final verification step reports
+the fleet as **pending**, not failed — that is the expected first-install
+outcome and it exits 0. It exits non-zero only when something it actually
+attempted is broken.
+
+**On a machine without Docker:** `SWITCHROOM_MEMORY_BACKEND=none` (or
+`memory.backend: none` in the yaml) is the supported way through the
+wizard — memory setup is skipped, and the unreachable Docker is then
+reported as pending rather than a hard failure, so config generation on a
+Docker-less CI runner works. Your agents still need Docker to actually
+run.
 
 ### Non-interactive setup (CI / scripting)
 
@@ -247,6 +260,31 @@ agents, and MCP wireup, and prints actionable fixes.
   during setup — switchroom is trying to write to its own install dir.
   Tracked work; see the install-validation follow-up that moves profile
   rendering to a user-writable cache dir.
+- **`Memory backend setup failed: Docker is not installed`** — no `docker`
+  on PATH. The memory backend (Hindsight) is a container, and so is every
+  agent, so setup stops instead of pretending it succeeded. Install Docker
+  and re-run, or re-run with `SWITCHROOM_MEMORY_BACKEND=none`.
+- **`Memory backend setup failed: Docker is installed but its daemon is not
+  responding`** — the CLI is there but nothing is listening (the usual macOS
+  case: Docker Desktop isn't running). Start Docker (`open -a Docker`, or
+  `sudo systemctl start docker`) and re-run. Don't reinstall.
+- **`Memory backend setup failed: …ports…` / `…did not stay running`** — the
+  Hindsight container could not be given a free port, or exited immediately
+  after start. These used to be silent (the wizard still said "Setup
+  complete!") — now they stop setup. `docker logs switchroom-hindsight
+  --tail 50` says why; `SWITCHROOM_MEMORY_BACKEND=none` skips memory if you
+  want to proceed without it.
+- **`Setup did NOT complete: verification failed`** — the final step now
+  checks the real thing: docker is reachable, no switchroom container is
+  crash-looping or stuck, and an agent you asked it to start actually came
+  up and stayed up. Setup exits non-zero in that case (so scripted installs
+  stop). The rows above the message name what failed; `switchroom doctor`
+  and `docker logs switchroom-<agent> --tail 50` are the next steps.
+  A fleet that simply isn't up yet is reported as *pending*, not a failure —
+  that's the normal state right after Step 3. A container that reads
+  `created` or `restarting` for a moment (a `docker restart`, or an `apply`
+  reconcile in flight) is re-sampled before any verdict, so re-running setup
+  during a bounce does not fail a healthy fleet.
 - **Telegram bot doesn't reply** — `switchroom agent logs assistant -f`
   and `switchroom doctor`. The most common cause is OAuth not yet
   completed (`switchroom auth list` — confirm an account is present

@@ -763,10 +763,33 @@ const defaultDockerProbe: DockerProbe = (args) => {
 };
 
 /**
- * Check if Docker is available on the system.
+ * Why docker can't be used, when it can't.
+ *
+ * `docker --version` succeeding only proves the CLI is on PATH. On macOS
+ * (Docker Desktop ships the CLI but the VM is frequently stopped) that is
+ * the far more common failure, and telling the operator to "install Docker"
+ * when it is already installed sends them down the wrong road — review L8.
+ * `docker ps` is the cheapest probe that actually reaches the daemon.
+ */
+export type DockerAvailability = "ok" | "no-cli" | "daemon-unreachable";
+
+/**
+ * Distinguish "no docker CLI on PATH" from "CLI present, daemon not
+ * answering", so callers can print the right next step.
+ */
+export function probeDockerAvailability(
+  probe: DockerProbe = defaultDockerProbe,
+): DockerAvailability {
+  if (probe(["--version"]) === null) return "no-cli";
+  if (probe(["ps", "--quiet"]) === null) return "daemon-unreachable";
+  return "ok";
+}
+
+/**
+ * Check if Docker is usable — CLI present AND daemon reachable.
  */
 export function isDockerAvailable(probe: DockerProbe = defaultDockerProbe): boolean {
-  return probe(["--version"]) !== null;
+  return probeDockerAvailability(probe) === "ok";
 }
 
 /**
