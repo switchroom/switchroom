@@ -216,7 +216,7 @@ export const RETAIN_FAILURE_RATE = 0.1;
  * in entries means something different than it did when `QUEUE_FLOOR` and
  * `QUEUE_GROWTH_MIN_ABS` were first set.
  *
- * B7b REVISION (#3694): the bound is now a FRACTION of the client deadline
+ * B7b REVISION (#3693): the bound is now a FRACTION of the client deadline
  * rather than the whole of it, moving `retain_content_limit()` 48,000 →
  * 33,000. Unlike B7a's ~6 % this is a 45 % change and is NOT inside the
  * noise: the same backlog splits into ~1.45× as many parts with not one new

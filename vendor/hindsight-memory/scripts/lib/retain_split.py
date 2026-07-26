@@ -115,12 +115,12 @@ from typing import Optional
 #
 #   deadline_safety    0.7    — the FRACTION of the deadline a maximally-sized
 #                               part is allowed to consume. See below; this
-#                               input did not exist until #3694 and was
+#                               input did not exist until #3693 and was
 #                               effectively 1.0.
 #
 #   floor(310 × 0.7 / 18.4) = 11 chunks  →  11 × 3000 = 33,000 chars
 #
-# WHY THERE IS A SAFETY FRACTION AT ALL (#3694). Without it the bound was
+# WHY THERE IS A SAFETY FRACTION AT ALL (#3693). Without it the bound was
 # `floor(deadline / latency)`, which sizes a maximally-sized part to consume
 # ~100% of the deadline BY CONSTRUCTION: 16 × 18.4 = 294.4s against a 310s
 # deadline is 15.6s — 5% — of headroom for the POST/response, server queueing,
@@ -186,7 +186,7 @@ def retain_deadline_safety() -> float:
 
     Clamped to ``(0, 1]``. A value above 1.0 is not honoured: it would size
     parts to overrun the deadline by construction, which is exactly the defect
-    (#3694) this input exists to prevent, so it is treated as "no margin at
+    (#3693) this input exists to prevent, so it is treated as "no margin at
     all" — 1.0 — rather than as a licence to go further.
     """
     value = _env_number("HINDSIGHT_RETAIN_DEADLINE_SAFETY", DEFAULT_RETAIN_DEADLINE_SAFETY)
@@ -212,7 +212,7 @@ def retain_content_limit() -> int:
     latency = _env_number("HINDSIGHT_RETAIN_CHUNK_LATENCY_S", DEFAULT_RETAIN_CHUNK_LATENCY_S)
     deadline = retain_client_deadline()
 
-    # A FRACTION of the deadline, not all of it (#3694). Sizing to the whole
+    # A FRACTION of the deadline, not all of it (#3693). Sizing to the whole
     # deadline leaves a maximally-sized part no headroom for the POST itself,
     # server queueing, or a chunk slower than the MEAN `latency` is measured
     # as — so the part times out, the drain bumps its attempt count, and it

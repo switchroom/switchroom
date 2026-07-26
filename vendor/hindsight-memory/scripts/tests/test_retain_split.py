@@ -86,7 +86,7 @@ class TestDerivedLimit(unittest.TestCase):
 
 
 class TestTheBoundLeavesMarginUnderTheDeadline(unittest.TestCase):
-    """The bound must NOT consume the whole deadline (#3694).
+    """The bound must NOT consume the whole deadline (#3693).
 
     Sizing a maximally-sized part to ~100% of the client deadline is what
     manufactured `.dead` entries on this fleet: every `.dead` marker measured
@@ -120,7 +120,7 @@ class TestTheBoundLeavesMarginUnderTheDeadline(unittest.TestCase):
     def test_a_maximally_sized_part_finishes_well_inside_the_deadline(self):
         deadline = retain_split.retain_client_deadline()
         worst = self._worst_case_seconds()
-        # The pre-#3694 derivation gave 294.4s against 310s -> 0.95 here.
+        # The pre-#3693 derivation gave 294.4s against 310s -> 0.95 here.
         self.assertLessEqual(
             worst / deadline,
             0.8,

@@ -21,11 +21,11 @@ describe("the #3610 memories → parts conversion", () => {
     expect(QUEUE_GROWTH_MIN_ABS).toBe(120);
   });
 
-  // #3694 lowered the content bound 48,000 → 33,000, so the SAME backlog
+  // #3693 lowered the content bound 48,000 → 33,000, so the SAME backlog
   // splits into more parts. If the conversion factor is ever left behind at a
   // bound change, every count threshold silently tightens and the watchdog
   // starts alerting on a queue that holds no more memory than before.
-  it("is scaled for the post-#3694 content bound, not the pre-#3694 one", () => {
+  it("is scaled for the post-#3693 content bound, not the pre-#3693 one", () => {
     expect(PARTS_PER_MEMORY).toBeGreaterThanOrEqual(4.4 * (45_000 / 33_000));
   });
 
@@ -42,7 +42,7 @@ describe("the #3610 memories → parts conversion", () => {
     expect(QUEUE_GROWTH_MIN_ABS).toBeGreaterThan(20);
     // Five worst-case memories must not clear the floor. 23 parts is the
     // worst single entry in the live 2026-07-26 backlog re-split at the
-    // post-#3694 33,000 bound (it was 17 at 45,000, B6).
+    // post-#3693 33,000 bound (it was 17 at 45,000, B6).
     expect(5 * 23).toBeLessThan(QUEUE_GROWTH_MIN_ABS);
   });
 });

@@ -1861,7 +1861,7 @@ class ClampAndEnvKnobBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
             )
             self.assertEqual(
                 retain_split.retain_content_limit(),
-                # Same input, less the #3694 safety fraction: the bound is a
+                # Same input, less the #3693 safety fraction: the bound is a
                 # FRACTION of the deadline, not all of it, so a maximally-sized
                 # part still has headroom when the drain waits exactly 600s.
                 3000 * int((600 * retain_split.retain_deadline_safety()) // 18.4),
