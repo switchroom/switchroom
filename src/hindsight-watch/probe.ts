@@ -224,6 +224,18 @@ export function probeSpool(
     } catch {
       // Nothing has ever been evicted for this agent. Not a fault.
     }
+    // `.dead` markers used to be written INSIDE `pending-retains`; they are
+    // now retired into the `pending-dead/` sibling so that no janitor glob
+    // over the live queue can match a memory. Both locations are counted:
+    // if only the in-queue form were counted, the relocation would read as
+    // `dead` dropping to zero, i.e. a silent loss of the loss signal.
+    try {
+      for (const f of readdirSync(resolve(hindsightDir, "pending-dead"))) {
+        if (f.endsWith(".dead")) dead++;
+      }
+    } catch {
+      // Nothing has ever been retired for this agent. Not a fault.
+    }
     drops += readDropCount(hindsightDir);
   }
   return { pending, dead, evicted, drops, agents };

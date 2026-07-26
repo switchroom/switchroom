@@ -5,8 +5,12 @@ SessionStart calls into ``drain()`` to retry any retain payloads that
 ``session_end.py`` queued on failure (#1071). Each entry is retried up
 to ``MAX_ATTEMPTS`` (5) times; after that a **permanently** failing entry
 (a 4xx that a re-POST cannot fix — see ``pending.is_permanent_failure``)
-is renamed to ``.dead`` so the queue no longer drains it but the operator
-can still inspect via ``switchroom doctor``. An entry failing on anything
+is retired into the ``pending-dead/`` archive so the queue no longer
+drains it but the operator can still inspect via ``switchroom doctor``.
+The marker deliberately does NOT stay in the live queue directory: it is
+the only remaining copy of that memory, and leaving it among the live
+entries put it in the path of every janitor that sweeps that
+directory. An entry failing on anything
 else — a 5xx, a timeout, a connection error — stays queued past the
 attempt budget: a transient upstream is never evidence that the memory
 is unsaveable, and retiring it would lose content the user believes was
@@ -62,6 +66,15 @@ documents**, 3,815 of them with facts extracted.
   agents fell into ~368 distinct groups — ~65% of the queue was duplicate,
   with one group repeated 32 times. At ~168 s per phase-2 extraction that
   one group alone was 90 minutes of LLM lane time for a single memory.
+* **Phase 0b — relocate legacy ``.dead`` markers (free, no network).**
+  Markers written by an older build into the live queue directory are moved
+  into ``pending-dead/``, so the live queue holds only live entries and no
+  janitor glob over it can match a memory.
+* **Phase 0c — re-split over-bound entries (free, no network).** An entry
+  whose content exceeds ``retain_content_limit()`` needs more sequential
+  extraction calls than fit the client deadline, so it can never be drained
+  as-is; splitting it makes every part drainable. Measured 2026-07-26: 18 of
+  211 queued entries exceeded 100,000 chars, the largest 744,546.
 * **Phase 1 — reconcile (free).** GET the document. If it exists, the
   memory is already durable; retire the queue entry without a POST. No
   LLM work, no cost, idempotent, resumable at any point. Only for
@@ -117,9 +130,11 @@ from lib.pending import (
     is_permanent_failure,
     iter_entries,
     mark_dead,
+    resplit_over_bound_entries,
+    sweep_legacy_dead_markers,
     update_attempt,
 )
-from lib.retain_split import retain_client_deadline
+from lib.retain_split import retain_client_deadline, retain_content_limit
 
 
 STALL_THRESHOLD = 3
@@ -542,6 +557,9 @@ def _new_summary() -> dict:
         # Redundant copies retired by `pending.collapse_duplicates` before
         # any network work. Backlog mode only — see `_drain_backlog_impl`.
         "collapsed": 0,
+        "dead_relocated": 0,
+        "resplit": 0,
+        "resplit_parts": 0,
         "stalled": False,
         "budget_exceeded": False,
     }
@@ -579,6 +597,9 @@ def drain(
          "archive_failed": int,  # durable, but the archive was unwritable
                                  # so the entry is STILL QUEUED
          "collapsed": int, # duplicate copies archived (backlog mode only)
+         "dead_relocated": int,  # legacy .dead markers moved out of the queue dir
+         "resplit":   int, # over-bound entries split into drainable parts
+         "resplit_parts": int,  # parts those entries became
          "stalled": bool,  # stall guard tripped
          "budget_exceeded": bool}
     """
@@ -822,6 +843,40 @@ def _drain_backlog_impl(
                 f"archived, not deleted"
             )
 
+        # PHASE 0b — relocate any legacy `.dead` markers out of the live
+        # queue directory. Free, local, and an UPGRADE step: markers written
+        # by an older build sit in the directory external janitors sweep, and
+        # a marker is the only remaining copy of its memory.
+        moved = sweep_legacy_dead_markers()
+        if moved:
+            summary["dead_relocated"] = moved
+            _blog(
+                f"phase 0b: relocated {moved} legacy .dead marker(s) out of "
+                f"the live queue directory; the queue now holds only live "
+                f"entries, so no janitor glob over it can match a memory"
+            )
+
+        # PHASE 0c — re-split entries the drain provably CANNOT retain.
+        #
+        # An entry over `retain_content_limit()` needs more sequential
+        # extraction calls than fit the deadline, so every POST is guaranteed
+        # waste; if the server rejects the body as a 4xx it is classified
+        # permanent and the memory goes `.dead`. Splitting it makes every
+        # part drainable, which is the difference between a lost memory and a
+        # slow one. Runs after the duplicate collapse so a duplicated
+        # over-bound entry is split ONCE, not once per copy.
+        entries_split, parts_written = resplit_over_bound_entries()
+        if entries_split:
+            summary["resplit"] = entries_split
+            summary["resplit_parts"] = parts_written
+            _blog(
+                f"phase 0c: re-split {entries_split} entr"
+                f"{'y' if entries_split == 1 else 'ies'} over the "
+                f"{retain_content_limit()}-char retain bound into "
+                f"{parts_written} drainable part(s); the originals are "
+                f"archived, not deleted"
+            )
+
     if phase in ("reconcile", "both"):
         _reconcile_phase(config, summary, dry_run)
     if phase == "reconcile":
@@ -1003,6 +1058,8 @@ def main(argv: list[str] | None = None) -> int:
         summary[k]
         for k in (
             "collapsed",
+            "dead_relocated",
+            "resplit",
             "drained",
             "retried",
             "dead",
@@ -1015,6 +1072,8 @@ def main(argv: list[str] | None = None) -> int:
             f"[Hindsight] drain_pending{'(backlog)' if args.backlog else ''}: "
             f"drained={summary['drained']} reconciled={summary['reconciled']} "
             f"collapsed={summary['collapsed']} "
+            f"dead_relocated={summary['dead_relocated']} "
+            f"resplit={summary['resplit']}(+{summary['resplit_parts']} parts) "
             f"retried={summary['retried']} dead={summary['dead']} "
             f"unknown={summary['unknown']} "
             f"archive_failed={summary['archive_failed']} "

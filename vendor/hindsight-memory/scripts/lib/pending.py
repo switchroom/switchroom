@@ -216,7 +216,12 @@ import time
 import uuid
 from typing import Optional
 
-from .retain_split import part_document_id, part_metadata, split_retain_content
+from .retain_split import (
+    part_document_id,
+    part_metadata,
+    retain_content_limit,
+    split_retain_content,
+)
 
 
 SCHEMA = 1
@@ -252,6 +257,27 @@ DUPLICATE_MAX_ENTRIES = int(
 DUPLICATE_MAX_BYTES = int(
     os.environ.get("HINDSIGHT_PENDING_DUPLICATE_MAX_BYTES") or (64 * 1024 * 1024)
 )
+# ``resplit_over_bound_entries`` retires the pre-split original here. Like
+# the duplicate archive, this copy is REDUNDANT by construction: it is only
+# moved after its parts are queued, and the parts carry the whole memory. So
+# it is bounded on the same terms — a MOVE into a capped archive, never a
+# delete of a memory that has nowhere else to live. (``pending-dead/`` is the
+# deliberate exception: see :func:`dead_dir`.)
+RESPLIT_MAX_ENTRIES = int(
+    os.environ.get("HINDSIGHT_PENDING_RESPLIT_MAX_ENTRIES") or 500
+)
+RESPLIT_MAX_BYTES = int(
+    os.environ.get("HINDSIGHT_PENDING_RESPLIT_MAX_BYTES") or (64 * 1024 * 1024)
+)
+# Fields `_build_entry` adds on top of the caller's payload. `enqueue()`
+# takes a PAYLOAD, so an entry read back off disk has to be stripped of them
+# before it can be re-enqueued (see `resplit_over_bound_entries`); leaving
+# them in would round-trip a stale `failed_at`/`attempt_count` into the new
+# entries and mis-order the queue.
+_ENTRY_ONLY_FIELDS = frozenset(
+    {"schema", "failed_at", "error_class", "error_message", "attempt_count", "dead_at"}
+)
+
 MAX_ATTEMPTS = 5
 
 #: Residual-drop ledger. A SIBLING of the queue directory (like the
@@ -418,6 +444,35 @@ def duplicate_dir() -> str:
     )
 
 
+def dead_dir() -> str:
+    """Archive directory for ``MAX_ATTEMPTS`` failures (sibling of the queue).
+
+    ``.dead`` markers used to be written INSIDE the queue directory, as
+    ``<entry>.json.dead``. A ``.dead`` marker is the ONLY remaining copy of
+    that memory — ``mark_dead`` unlinks the live entry once the marker is
+    durable — so leaving it in the live queue directory put the last copy of
+    a memory in the one directory that external janitorial tooling has every
+    reason to sweep. On this fleet exactly that happened: a host cron ran
+    ``find <queue> -name '*.dead' -mtime +14 | xargs rm -f``. Measured on
+    2026-07-26, 6 such markers were live in the queue directory, each one on
+    a countdown to permanent deletion.
+
+    Fixing the janitor is not a fix — the next one has the same shape. The
+    product-level fix is that the live queue directory contains ONLY live
+    entries, so no glob over it can ever match a memory. Dead markers move
+    out to this sibling, alongside ``pending-evicted``/``pending-reconciled``
+    /``pending-corrupt``, and ``sweep_legacy_dead_markers`` migrates any that
+    a previous version left behind.
+
+    NOT TTL-pruned, deliberately, and NOT trimmed to a cap: a dead entry is
+    an unrecovered memory, and dropping it is the loss this whole subsystem
+    exists to prevent. It is bounded instead by making it hard to REACH --
+    ``resplit_over_bound_entries`` recovers the entries that used to arrive
+    here, so the steady-state population is the genuinely unrecoverable ones.
+    """
+    return os.environ.get("HINDSIGHT_PENDING_DEAD_DIR") or _sibling("pending-dead")
+
+
 def evictions_log_path() -> str:
     """Append-only eviction ledger.
 
@@ -499,6 +554,12 @@ def _trim_dir(a: str, max_entries: int, max_bytes: int) -> int:
     an entry only reaches it through the ledgered eviction path, and under
     sustained ENOSPC it may not reach it at all.
     """
+    # `.json` ONLY, and that is load-bearing beyond "skip stray files": a
+    # `.dead` marker is named `<entry>.json.dead`, so it can never be
+    # selected here even if a future caller points a trim at `pending-dead/`.
+    # That archive holds the only remaining copy of an unrecovered memory and
+    # must stay uncapped; making it structurally unreachable is stronger than
+    # relying on nobody wiring up the call. See :func:`dead_dir`.
     try:
         names = sorted(n for n in os.listdir(a) if n.endswith(".json"))
     except OSError:
@@ -673,6 +734,105 @@ def collapse_duplicates() -> int:
             file=sys.stderr,
         )
     return collapsed
+
+
+def resplit_dir() -> str:
+    """Archive directory for entries retired by ``resplit_over_bound_entries``."""
+    return os.environ.get("HINDSIGHT_PENDING_RESPLIT_DIR") or _sibling(
+        "pending-resplit"
+    )
+
+
+def resplit_over_bound_entries() -> tuple[int, int]:
+    """Re-split queued entries whose content exceeds the current bound.
+
+    Returns ``(entries_resplit, parts_written)``.
+
+    THE ENTRY THIS EXISTS FOR is one whose ``content`` is larger than
+    ``retain_content_limit()``. Such an entry is not slow, it is IMPOSSIBLE:
+    the server runs one sequential extraction call per chunk, so the POST
+    cannot finish inside the deadline the drain waits, and re-POSTing it is
+    guaranteed waste. Today it either churns forever at the back of the drain
+    order or — if the server rejects the body as a 4xx, which
+    ``is_permanent_failure`` correctly classifies as permanent — goes
+    ``.dead``. Both outcomes are wrong for a memory that is perfectly
+    recoverable: ``enqueue()`` already knows how to split it.
+
+    Two ways an over-bound entry gets into a queue, and both are live here:
+      * it was enqueued by a build older than the split-on-enqueue path;
+      * the bound MOVED under it. It does that whenever the client deadline
+        or the deadline-safety fraction changes, so this is not a one-off
+        migration — it is the queue's standing response to a bound change.
+    Measured on this fleet 2026-07-26: 18 of 211 queued entries exceeded
+    100,000 chars, the largest 744,546 — i.e. 15x the bound.
+
+    Ordering matters. The original is archived into ``pending-resplit/`` only
+    AFTER at least one part is durably written, so a crash mid-way leaves the
+    original queued (worst case: the parts are written twice, and a re-split
+    is deterministic, so the second write dedupes onto the first). If NOT ONE
+    part could be written — ``enqueue`` refused the whole memory as larger
+    than the queue cap, or the disk is full — the original is left queued
+    untouched and is not counted. Nothing is deleted on any path.
+
+    WHAT THIS COSTS, honestly. One entry becomes N, so the queue gets DEEPER
+    (measured worst case on this fleet: 744,546 chars -> 23 parts). On a
+    queue already at its cap that means ``enqueue``'s eviction path sheds
+    the oldest entries into ``pending-evicted/`` — shed, not destroyed,
+    except under the sustained-ENOSPC case ``_evict_to_fit`` documents. The
+    trade is deliberate: depth is recoverable, and an over-bound entry is
+    not drainable at any depth.
+    """
+    limit = retain_content_limit()
+    resplit = 0
+    parts = 0
+    for path, entry in iter_entries():
+        content = entry.get("content")
+        if not isinstance(content, str) or len(content) <= limit:
+            continue
+
+        payload = {k: v for k, v in entry.items() if k not in _ENTRY_ONLY_FIELDS}
+        before = count()
+        first = enqueue(payload, RuntimeError(
+            f"re-split: content was {len(content)} chars, over the current "
+            f"{limit}-char retain bound"
+        ))
+        written = max(0, count() - before)
+        if first is None and written == 0:
+            print(
+                f"[Hindsight] pending: could not re-split "
+                f"{os.path.basename(path)} ({len(content)} chars, bound "
+                f"{limit}) — entry STAYS QUEUED (never deleted)",
+                file=sys.stderr,
+            )
+            continue
+
+        dest_dir = resplit_dir()
+        try:
+            os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+            shutil.move(path, os.path.join(dest_dir, os.path.basename(path)))
+        except OSError as e:
+            # The parts are already queued; leaving the original queued too
+            # means the memory is retained twice, which the upsert on
+            # document_id makes harmless. Losing it would not be.
+            print(
+                f"[Hindsight] pending: re-split {os.path.basename(path)} into "
+                f"{written} part(s) but could not archive the original into "
+                f"{dest_dir} ({e}) — it STAYS QUEUED (never deleted)",
+                file=sys.stderr,
+            )
+            continue
+
+        _trim_dir(dest_dir, RESPLIT_MAX_ENTRIES, RESPLIT_MAX_BYTES)
+        resplit += 1
+        parts += written
+        print(
+            f"[Hindsight] pending: re-split {os.path.basename(path)} "
+            f"({len(content)} chars, over the {limit}-char bound) into "
+            f"{written} queued part(s); the original is archived under "
+            f"{dest_dir}, not deleted",
+            file=sys.stderr,
+        )
+    return resplit, parts
 
 
 def _log_eviction(name: str, size: int, reason: str, depth: int, nbytes: int) -> None:
@@ -1303,11 +1463,27 @@ def is_permanent_failure(error: BaseException) -> bool:
 
 
 def mark_dead(path: str, entry: dict) -> Optional[str]:
-    """Convert an entry that exceeded ``MAX_ATTEMPTS`` into a permanent
-    failure marker at ``<path>.dead`` so the queue no longer drains it
-    but operators can still inspect.
+    """Retire an entry that exceeded ``MAX_ATTEMPTS`` into ``dead_dir()``.
 
     Returns the marker path, or ``None`` if it failed.
+
+    WHERE THE MARKER GOES, AND WHY IT MOVED. This used to write
+    ``<path>.dead`` — i.e. INSIDE the live queue directory. Since the marker
+    is the only remaining copy of the memory (the live entry is unlinked once
+    it is durable), that put the last copy of a memory in the directory
+    external janitors sweep. It is not hypothetical: a host cron on this
+    fleet ran ``find <queue> -name '*.dead' -mtime +14 -delete``. Measured
+    2026-07-26, 6 such markers were live in the queue directory, each on a
+    countdown to permanent deletion. The marker now lands in the
+    ``pending-dead/`` sibling, so the live queue directory holds ONLY live
+    entries and no glob over it can match a memory. See :func:`dead_dir`.
+
+    FAILURE IS NOT DELETION. If the marker cannot be written at all, this
+    returns ``None`` and **leaves the live entry exactly where it is**. The
+    drain then re-attempts it on the next run, which is wasteful and visible;
+    the alternative — falling back to a marker inside the queue directory —
+    would quietly restore the loss channel this function exists to close.
+    Queued-and-retrying beats destroyed, every time.
 
     Crash-window invariant (#1094 item 3): **a live ``<path>.json`` entry
     must never carry a ``dead_at`` stamp.** The old two-step form violated
@@ -1316,21 +1492,25 @@ def mark_dead(path: str, entry: dict) -> Optional[str]:
     crash between the two renames left a live entry with ``dead_at`` set
     that the drainer would re-enter and re-bump. Here we instead:
 
-      1. write the dead_at-stamped payload to ``<path>.tmp``
-      2. ``os.replace(tmp, dead_path)``  — the .dead marker appears in one
-         atomic step (never drained: the drainer only lists ``*.json``)
+      1. write the dead_at-stamped payload to a ``.tmp`` inside ``dead_dir()``
+      2. ``os.replace(tmp, dead_path)``  — the marker appears in one atomic
+         step, in a directory the drainer never lists at all
       3. ``os.unlink(path)``            — drop the original live entry
 
-    At every crash point the invariant holds: the ``dead_at`` stamp only
-    ever lands on ``<path>.dead``. A crash after step 2 leaves both the
-    (stale, no-dead_at) live entry and the .dead marker; the next drain
-    re-marks it dead (os.replace overwrites the marker idempotently),
-    never observing a live entry with dead_at.
+    At every crash point the invariant holds: the ``dead_at`` stamp only ever
+    lands in ``dead_dir()``. A crash after step 2 leaves both the (stale, no-
+    dead_at) live entry and the marker; the next drain re-marks it dead
+    (``os.replace`` overwrites the marker idempotently), never observing a
+    live entry with dead_at. Step 1 writes the tmp in the DESTINATION
+    directory so step 2 is a same-directory rename and cannot fail on a
+    cross-filesystem boundary halfway through.
     """
     entry["dead_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    dead_path = path + ".dead"
-    tmp = path + ".tmp"
+    dest_dir = dead_dir()
+    dead_path = os.path.join(dest_dir, os.path.basename(path) + ".dead")
+    tmp = dead_path + ".tmp"
     try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(entry, f, ensure_ascii=False)
         os.chmod(tmp, 0o600)
@@ -1344,9 +1524,64 @@ def mark_dead(path: str, entry: dict) -> Optional[str]:
             pass
         return dead_path
     except OSError:
-        # Clean up a possibly-orphaned tmp so it doesn't linger.
+        # Clean up a possibly-orphaned tmp so it doesn't linger. The live
+        # entry is deliberately left alone — see "FAILURE IS NOT DELETION".
         try:
             os.unlink(tmp)
         except OSError:
             pass
         return None
+
+
+def sweep_legacy_dead_markers() -> int:
+    """Move ``*.dead`` markers left inside the queue dir into ``dead_dir()``.
+
+    Versions before this one wrote the marker as ``<entry>.json.dead``, next
+    to the live entries. Those markers are the only copy of their memory and
+    are sitting in the directory a janitor sweeps, so an upgrade has to
+    RELOCATE them, not just stop producing new ones. Returns the number moved.
+
+    Idempotent and safe to run on every drain: a queue with no legacy markers
+    does no work and returns 0. A marker whose name already exists in
+    ``dead_dir()`` is left where it is rather than overwritten — the two are
+    the same entry by construction (the name carries the queue's unique
+    suffix), but "leave both copies" is the answer that cannot lose one.
+    """
+    d = pending_dir()
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".dead"))
+    except OSError:
+        return 0
+    if not names:
+        return 0
+
+    dest_dir = dead_dir()
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    except OSError as e:
+        print(
+            f"[Hindsight] pending: cannot create {dest_dir} ({e}); "
+            f"{len(names)} legacy .dead marker(s) STAY in the live queue "
+            f"directory (they are not deleted)",
+            file=sys.stderr,
+        )
+        return 0
+
+    moved = 0
+    for name in names:
+        dest = os.path.join(dest_dir, name)
+        if os.path.exists(dest):
+            continue
+        try:
+            shutil.move(os.path.join(d, name), dest)
+        except OSError:
+            continue
+        moved += 1
+    if moved:
+        print(
+            f"[Hindsight] pending: relocated {moved} legacy .dead marker(s) "
+            f"out of the live queue directory into {dest_dir} — the live "
+            f"queue now holds only live entries",
+            file=sys.stderr,
+        )
+    return moved

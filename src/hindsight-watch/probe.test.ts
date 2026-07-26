@@ -66,6 +66,27 @@ describe("probeSpool — #3599's loss channels are siblings, not queue entries",
     expect(s.pending).toBe(1); // NOT 3
   });
 
+  it("counts pending-dead/ so relocating markers cannot zero the loss signal", () => {
+    queue("alpha", { "a.json": "{}" });
+    const dd = join(hindsight("alpha"), "pending-dead");
+    mkdirSync(dd, { recursive: true });
+    writeFileSync(join(dd, "d1.json.dead"), "{}");
+    writeFileSync(join(dd, "d2.json.dead"), "{}");
+    const s = probeSpool(dir);
+    expect(s.dead).toBe(2);
+    expect(s.pending).toBe(1); // NOT 3
+  });
+
+  it("counts dead in BOTH locations while legacy in-queue markers survive", () => {
+    // A fleet mid-migration has markers in the old and the new place at once.
+    // Counting only one would under-report the loss channel.
+    queue("alpha", { "a.json": "{}", "legacy.json.dead": "{}" });
+    const dd = join(hindsight("alpha"), "pending-dead");
+    mkdirSync(dd, { recursive: true });
+    writeFileSync(join(dd, "moved.json.dead"), "{}");
+    expect(probeSpool(dir).dead).toBe(2);
+  });
+
   it("sums the record_drop ledger count", () => {
     queue("alpha", {});
     writeFileSync(

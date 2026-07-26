@@ -447,6 +447,28 @@ describe("buildPendingRetainsProbeScript — eviction window arithmetic", () => 
     expect(r.D).toBe(2);
   });
 
+  it("counts dead markers in the pending-dead/ sibling too", () => {
+    // Markers moved OUT of the live queue directory so no janitor glob can
+    // match a memory. If the probe only counted the in-queue form, that
+    // relocation would read as "0 dead" and silently retire the operator's
+    // only view of permanently-failed retains.
+    const dd = join(base, "pending-dead");
+    mkdirSync(dd, { recursive: true });
+    for (const n of ["1-a.json.dead", "2-b.json.dead"])
+      writeFileSync(join(dd, n), "{}");
+    const r = runProbe();
+    expect(r.D).toBe(2);
+    expect(r.P).toBe(0); // and never as queue depth
+  });
+
+  it("sums dead across BOTH locations during a mid-migration fleet", () => {
+    writeFileSync(join(base, "pending-retains", "legacy.json.dead"), "{}");
+    const dd = join(base, "pending-dead");
+    mkdirSync(dd, { recursive: true });
+    writeFileSync(join(dd, "moved.json.dead"), "{}");
+    expect(runProbe().D).toBe(2);
+  });
+
   it("reads the residual-drop count from the sibling ledger", () => {
     writeFileSync(
       join(base, "pending-drops.json"),

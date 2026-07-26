@@ -95,6 +95,9 @@ class _QueueTempDirMixin:
         "HINDSIGHT_RETAIN_CLIENT_DEADLINE_S",
         # The retain content bound, which decides whether `enqueue` splits.
         "HINDSIGHT_RETAIN_MAX_CONTENT_CHARS",
+        "HINDSIGHT_PENDING_DUPLICATE_DIR",
+        "HINDSIGHT_PENDING_DEAD_DIR",
+        "HINDSIGHT_PENDING_RESPLIT_DIR",
     )
 
     def setUp(self):
@@ -1420,8 +1423,12 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         )
 
         self.assertEqual(summary["dead"], 1)
-        self.assertTrue(os.path.exists(path + ".dead"))
+        # The marker lands in the pending-dead/ archive, NOT beside the live
+        # entries -- see `pending.dead_dir`.
+        self.assertTrue(os.path.exists(
+            os.path.join(pending.dead_dir(), os.path.basename(path) + ".dead")))
         self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".dead"))
 
     def test_extraction_500_past_max_attempts_never_kills_the_memory(self):
         """The regression this gate exists for.
@@ -1566,8 +1573,10 @@ class TransportFailureEndToEndTest(_QueueTempDirMixin, unittest.TestCase):
         path = self._exhaust_attempts()
         summary = self._drain_with_urlopen(self._http_error(400))
         self.assertEqual(summary["dead"], 1, "a 4xx rejection must still retire")
-        self.assertTrue(os.path.exists(path + ".dead"))
+        self.assertTrue(os.path.exists(
+            os.path.join(pending.dead_dir(), os.path.basename(path) + ".dead")))
         self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".dead"))
 
 
 class ArchiveFailureNeverDeletesTest(_QueueTempDirMixin, unittest.TestCase):
@@ -2601,6 +2610,308 @@ class EvictionsLogRotationBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             pending._log_eviction("aaaa.json", 10, "count", 1, 10)
         self.assertEqual(len(self._lines()), 1, "over the cap, rotation runs")
+
+
+class DeadMarkersLeaveTheLiveQueueTest(_QueueTempDirMixin, unittest.TestCase):
+    """A `.dead` marker is the ONLY copy of its memory, so it must not sit
+    in the directory external janitors sweep.
+
+    Live evidence: a host cron on this fleet ran
+    ``find <queue> -name '*.dead' -mtime +14 -delete`` (6 markers were live
+    in the queue when this was measured on 2026-07-26, each on a countdown
+    to permanent deletion). Fixing that one cron is
+    not a fix -- the next janitor has the same shape. These tests pin the
+    product-level invariant instead: THE LIVE QUEUE DIRECTORY CONTAINS ONLY
+    LIVE ENTRIES.
+    """
+
+    def _dead_names(self):
+        try:
+            return sorted(os.listdir(pending.dead_dir()))
+        except OSError:
+            return []
+
+    def test_a_janitor_globbing_the_live_queue_cannot_match_a_memory(self):
+        path = pending.enqueue(_payload(content="doomed"), RuntimeError("x"))
+        pending.mark_dead(path, dict(_payload(content="doomed")))
+
+        # This is literally what the host cron matched on.
+        leftovers = [n for n in os.listdir(self._dir) if n.endswith(".dead")]
+        self.assertEqual(leftovers, [], "no .dead file may remain in the queue dir")
+        self.assertEqual(len(self._dead_names()), 1, "and the memory still exists")
+
+    def test_the_marker_still_carries_the_whole_memory(self):
+        path = pending.enqueue(_payload(content="precious"), RuntimeError("x"))
+        marker = pending.mark_dead(path, dict(_payload(content="precious")))
+        with open(marker, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["content"], "precious")
+        self.assertTrue(marker.startswith(pending.dead_dir()))
+
+    def test_an_unwritable_dead_archive_leaves_the_entry_QUEUED(self):
+        """Failure to archive is never a licence to delete."""
+        path = pending.enqueue(_payload(content="stays"), RuntimeError("x"))
+        blocker = os.path.join(self._tmp, "blocked")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("not a directory")
+        os.environ["HINDSIGHT_PENDING_DEAD_DIR"] = os.path.join(blocker, "dead")
+
+        self.assertIsNone(pending.mark_dead(path, dict(_payload(content="stays"))))
+        self.assertTrue(os.path.exists(path), "the live entry must survive")
+        self.assertEqual(pending.count(), 1)
+
+    def test_legacy_markers_in_the_queue_dir_are_relocated_not_deleted(self):
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        legacy = []
+        for i in range(3):
+            name = os.path.join(self._dir, f"100{i}000-abc-{i}.json.dead")
+            with open(name, "w", encoding="utf-8") as f:
+                json.dump(_payload(content=f"old-{i}"), f)
+            legacy.append(name)
+
+        self.assertEqual(pending.sweep_legacy_dead_markers(), 3)
+        self.assertEqual(
+            [n for n in os.listdir(self._dir) if n.endswith(".dead")], []
+        )
+        self.assertEqual(len(self._dead_names()), 3)
+        for name in legacy:
+            self.assertFalse(os.path.exists(name))
+        # Content survived the move -- this is the whole point.
+        moved = os.path.join(pending.dead_dir(), self._dead_names()[0])
+        with open(moved, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["content"], "old-0")
+
+    def test_the_sweep_is_idempotent_and_never_overwrites(self):
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        name = os.path.join(self._dir, "1000000-abc-0.json.dead")
+        with open(name, "w", encoding="utf-8") as f:
+            json.dump(_payload(content="first"), f)
+        self.assertEqual(pending.sweep_legacy_dead_markers(), 1)
+        self.assertEqual(pending.sweep_legacy_dead_markers(), 0)
+
+        # A same-named marker reappearing must not clobber the archived one.
+        with open(name, "w", encoding="utf-8") as f:
+            json.dump(_payload(content="second"), f)
+        self.assertEqual(pending.sweep_legacy_dead_markers(), 0)
+        with open(os.path.join(pending.dead_dir(), os.path.basename(name)),
+                  encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["content"], "first")
+
+    def test_the_sweep_leaves_live_entries_alone(self):
+        pending.enqueue(_payload(content="alive"), RuntimeError("x"))
+        self.assertEqual(pending.sweep_legacy_dead_markers(), 0)
+        self.assertEqual(pending.count(), 1)
+
+    def test_a_dead_marker_is_STRUCTURALLY_UNTRIMMABLE(self):
+        """The deliberate exception: a dead marker is the only copy left.
+
+        Every other archive holds a redundant copy and is capped. This one
+        holds unrecovered memories, so a cap would be a delete by another
+        name -- exactly the loss channel this change closes. The guarantee
+        is not "we remember not to call the trim": `_trim_dir` selects
+        `*.json` and a marker is `<entry>.json.dead`, so pointing a trim
+        straight at the dead archive with a zero cap still removes nothing.
+        """
+        for i in range(40):
+            path = pending.enqueue(_payload(content=f"dead-{i}"), RuntimeError("x"))
+            pending.mark_dead(path, dict(_payload(content=f"dead-{i}")))
+        self.assertEqual(len(self._dead_names()), 40)
+
+        with redirect_stderr(io.StringIO()):
+            dropped = pending._trim_dir(pending.dead_dir(), 0, 0)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(self._dead_names()), 40, "a memory was trimmed away")
+
+    def test_the_backlog_drain_relocates_legacy_markers(self):
+        """The migration only happens if the drain actually calls it.
+
+        Nothing else on the fleet runs `sweep_legacy_dead_markers`, so an
+        unwired phase 0b leaves every existing marker sitting in the janitor's
+        path -- the exact condition this change exists to end. Asserting the
+        function works in isolation does not catch that; this does.
+        """
+        path = pending.enqueue(_payload(content="legacy"), RuntimeError("x"))
+        legacy = path + ".dead"
+        os.replace(path, legacy)
+
+        summary = drain_pending.drain_backlog(CONFIG, phase="reconcile")
+
+        self.assertEqual(summary["dead_relocated"], 1)
+        self.assertFalse(os.path.exists(legacy), "marker left in the live queue dir")
+        self.assertEqual(self._dead_names(), [os.path.basename(legacy)])
+
+    def test_a_dry_run_relocates_nothing(self):
+        path = pending.enqueue(_payload(content="legacy"), RuntimeError("x"))
+        legacy = path + ".dead"
+        os.replace(path, legacy)
+
+        summary = drain_pending.drain_backlog(CONFIG, phase="reconcile", dry_run=True)
+
+        self.assertEqual(summary["dead_relocated"], 0)
+        self.assertTrue(os.path.exists(legacy))
+
+
+class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
+    """An entry over the retain bound is RECOVERABLE, so it must never die.
+
+    Such an entry needs more sequential extraction calls than fit the client
+    deadline, so every POST is guaranteed waste; if the server rejects the
+    body as a 4xx it is (correctly) classified permanent and the memory goes
+    `.dead`. Splitting it is the difference between a lost memory and a slow
+    one. Two ways one gets into a queue and both are live on this fleet: an
+    older build enqueued it unsplit, or the BOUND MOVED under it.
+    """
+
+    def _resplit_names(self):
+        try:
+            return sorted(os.listdir(pending.resplit_dir()))
+        except OSError:
+            return []
+
+    def test_an_over_bound_entry_becomes_drainable_parts(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="z" * 90_000), RuntimeError("x"))
+        self.assertEqual(pending.count(), 1, "queued unsplit under the old bound")
+
+        # The bound MOVES -- exactly what a deadline or safety-factor change
+        # does. The entry is now unretainable as-is.
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual(entries, 1)
+        self.assertGreaterEqual(parts, 30)
+        self.assertFalse(os.path.exists(path), "the original left the queue")
+        self.assertEqual(len(self._resplit_names()), 1, "archived, not deleted")
+        for _p, entry in pending.iter_entries():
+            self.assertLessEqual(len(entry["content"]), 3000)
+
+    def test_no_line_of_the_memory_is_lost_across_the_resplit(self):
+        """Every line survives -- that is the guarantee that matters.
+
+        `split_retain_content` promises to lose no MESSAGE, not to be
+        byte-exact: it splits on line boundaries and the boundary newline
+        itself is not carried into either part (measured: 29 newlines lost
+        over a 30-way split). That is a pre-existing property of the splitter
+        that the LIVE enqueue path already has; this test pins the property a
+        re-split must not go beyond -- no line of the memory may vanish.
+
+        Order is deliberately not asserted: the parts are independent queue
+        entries whose filenames carry a random suffix, so `iter_entries()`
+        returns them in filename order, not part order. Reassembly is by the
+        part metadata, not by queue position.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        body = "".join(f"line {i}\n" for i in range(9000))
+        pending.enqueue(_payload(content=body), RuntimeError("x"))
+
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        pending.resplit_over_bound_entries()
+        rejoined = "\n".join(e["content"] for _p, e in pending.iter_entries())
+        surviving = [ln for ln in rejoined.split("\n") if ln]
+        expected = [f"line {i}" for i in range(9000)]
+        # Cheap, readable failure first: name the lines that went missing
+        # rather than dumping a 9000-element list diff.
+        missing = sorted(set(expected) - set(surviving))
+        self.assertEqual(missing[:10], [], f"{len(missing)} line(s) lost in the re-split")
+        self.assertEqual(len(surviving), len(expected), "a line was duplicated or dropped")
+
+    def test_the_resplit_archive_is_itself_bounded(self):
+        """The archived original is redundant, so it must not eat the disk.
+
+        It is only moved AFTER its parts are queued, so unlike
+        `pending-dead/` (which holds the only copy of an unrecovered memory
+        and is deliberately uncapped) this archive can be trimmed on the
+        same terms as `pending-duplicate/`.
+        """
+        prev = pending.RESPLIT_MAX_ENTRIES
+        pending.RESPLIT_MAX_ENTRIES = 2
+        try:
+            os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+            for i in range(5):
+                pending.enqueue(_payload(content=f"{i}" * 40_000), RuntimeError("x"))
+            os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+            with redirect_stderr(io.StringIO()):
+                resplit, _parts = pending.resplit_over_bound_entries()
+            self.assertEqual(resplit, 5)
+            self.assertLessEqual(len(self._resplit_names()), 2)
+        finally:
+            pending.RESPLIT_MAX_ENTRIES = prev
+
+    def test_the_archived_original_is_still_readable(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        pending.enqueue(_payload(content="q" * 50_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        pending.resplit_over_bound_entries()
+
+        archived = os.path.join(pending.resplit_dir(), self._resplit_names()[0])
+        with open(archived, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["content"]), 50_000)
+
+    def test_an_entry_within_the_bound_is_untouched(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="small"), RuntimeError("x"))
+        self.assertEqual(pending.resplit_over_bound_entries(), (0, 0))
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(self._resplit_names(), [])
+
+    def test_resplitting_is_idempotent(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        pending.enqueue(_payload(content="w" * 40_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        pending.resplit_over_bound_entries()
+        depth = pending.count()
+        self.assertEqual(pending.resplit_over_bound_entries(), (0, 0))
+        self.assertEqual(pending.count(), depth, "a second pass is a no-op")
+
+    def test_an_entry_that_cannot_be_split_STAYS_QUEUED(self):
+        """No part written => the original is left exactly where it was."""
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="v" * 40_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+
+        with unittest.mock.patch.object(pending, "_enqueue_one", return_value=None):
+            entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual((entries, parts), (0, 0))
+        self.assertTrue(os.path.exists(path), "never deleted on failure")
+        self.assertEqual(self._resplit_names(), [])
+
+    def test_the_parts_carry_no_stale_attempt_metadata(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="u" * 40_000), RuntimeError("x"))
+        for _ in range(4):
+            with open(path, encoding="utf-8") as f:
+                entry = json.load(f)
+            pending.update_attempt(path, entry, RuntimeError("again"))
+
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        pending.resplit_over_bound_entries()
+        for _p, entry in pending.iter_entries():
+            self.assertEqual(
+                entry["attempt_count"], 1,
+                "a re-split part starts its own budget -- inheriting an "
+                "exhausted one would send it straight back toward .dead",
+            )
+            self.assertNotIn("dead_at", entry)
+
+    def test_the_backlog_drain_resplits_before_paying_for_extraction(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        pending.enqueue(_payload(content="t" * 40_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+
+        summary = drain_pending.drain_backlog(CONFIG, phase="reconcile")
+        self.assertEqual(summary["resplit"], 1)
+        self.assertGreaterEqual(summary["resplit_parts"], 14)
+
+    def test_a_dry_run_resplits_nothing(self):
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="s" * 40_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+
+        summary = drain_pending.drain_backlog(
+            CONFIG, phase="reconcile", dry_run=True
+        )
+        self.assertEqual(summary["resplit"], 0)
+        self.assertTrue(os.path.exists(path))
 
 
 if __name__ == "__main__":
