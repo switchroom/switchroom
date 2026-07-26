@@ -104,9 +104,14 @@ RUN VIRTUAL_ENV=/app/api/.venv uv pip install --no-cache-dir 'claude-agent-sdk==
 # silently-broken wheel would make the API fail to boot, autoheal would
 # restart-loop it, and fleet memory would be down until a manual rollback — so
 # the wheel is proven at BUILD time. Where that assert runs, precisely: the
-# multi-arch `build-hindsight` job (path-gated, QEMU) — NOT the four required
-# PR checks, which never build this image. So the guarantee is "no CUDA-broken
-# image can be published", not "no CUDA-broken commit can be merged".
+# `build-hindsight` job, which DOES run on pull_request when this path changes,
+# and whose result is consumed by the required `images-ok` check — so for a PR
+# touching this path, a CUDA-broken commit is genuinely blocked from merge.
+# Two real edges remain: on PRs the build is pinned to `platforms:
+# linux/amd64` with the QEMU step skipped, so the non-amd64 branch below is
+# never executed by CI at all (the arm64 leg is built only on main/tags); and
+# `build-hindsight` skips on merge_group, where docker-e2e's `hindsight-probe`
+# is the gate instead.
 #
 # Safety property, and its limit. AT INIT the fallback is total: device
 # selection happens once when the provider is constructed, so if CUDA is

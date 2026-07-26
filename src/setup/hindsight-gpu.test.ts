@@ -139,16 +139,31 @@ describe("hindsightGpuEnabled — fail-safe host-capabilities gate", () => {
     // would emit `--gpus all` on a host that cannot honour it — arriving at the
     // exact container-create failure this gate exists to prevent, through the
     // gate. Anything not literally `true` must read as "not proven".
+    //
+    // The two fields are varied INDEPENDENTLY, and that is the point. Writing
+    // the same bogus value into both would leave a HALF-revert alive: relaxing
+    // only `containerToolkit` back to a truthy test still rejects a
+    // both-fields-bogus verdict, while restoring the exact original bug —
+    // `gpuPresent: true` with `containerToolkit: "false"` emitting `--gpus all`
+    // on a toolkit-less host, where container-create hard-fails. Pin each half.
     mkdirSync(join(home, ".switchroom"), { recursive: true });
-    for (const bogus of ['"false"', '"true"', "1", '"yes"', "{}"]) {
+    const bogus = ['"false"', '"true"', "1", '"yes"', "{}"];
+    const cases: Array<[string, string]> = [
+      // one field genuinely true, the other corrupt ⇒ catches a half-revert
+      ...bogus.map((b): [string, string] => ["true", b]),
+      ...bogus.map((b): [string, string] => [b, "true"]),
+      // both corrupt ⇒ catches a full revert
+      ...bogus.map((b): [string, string] => [b, b]),
+    ];
+    for (const [gpuPresent, containerToolkit] of cases) {
       writeFileSync(
         join(home, ".switchroom", "host-capabilities.json"),
-        `{"version":1,"voice":{"gpuPresent":${bogus},"containerToolkit":${bogus},` +
+        `{"version":1,"voice":{"gpuPresent":${gpuPresent},"containerToolkit":${containerToolkit},` +
           `"engine":"local","detectedAt":"2026-07-26T00:00:00.000Z"}}\n`,
       );
       expect(
         hindsightGpuEnabled(),
-        `non-boolean probe ${bogus} must not enable GPU`,
+        `verdict {gpuPresent: ${gpuPresent}, containerToolkit: ${containerToolkit}} must not enable GPU`,
       ).toBe(false);
     }
   });
