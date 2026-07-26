@@ -197,6 +197,21 @@ describe("hindsight drain sidecar — structure", () => {
     expect(block).not.toMatch(/HINDSIGHT_DRAIN_CONCURRENCY=/);
   });
 
+  // The measured `timeout=900 conc=1 -> drained 5 of 5` result is real, but
+  // the durable reading of it is that the CONTENT BOUND consumed the whole
+  // deadline (#3693), not that the drain should wait three times as long.
+  // `_backlog_timeout()` and `retain_content_limit()` are derived from ONE
+  // number on purpose; pinning a literal here would silently unpick that and
+  // size a max part against a deadline nothing else in the system knows about.
+  it("does not pin a drain timeout — it stays derived from the retain client deadline", () => {
+    const block = SRC.slice(
+      SRC.indexOf("5) hindsight backlog drain"),
+      SRC.indexOf("SWITCHROOM_DOCKER_TMUX_INNER=1"),
+    );
+    expect(block).not.toMatch(/HINDSIGHT_DRAIN_BACKLOG_TIMEOUT=/);
+    expect(block).not.toMatch(/HINDSIGHT_RETAIN_CLIENT_DEADLINE_S=/);
+  });
+
   it("the sidecar region is valid bash", () => {
     const from = SRC.indexOf("  _hs_drain_script=");
     const to = SRC.indexOf("{{/if}}", from);

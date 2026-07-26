@@ -496,6 +496,27 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   #    cap fleet-wide demand. Sustained oversubscription is absorbed by the
   #    p95 backoff, and the real fix is more lanes.
   #
+  #    WHY NO `HINDSIGHT_DRAIN_BACKLOG_TIMEOUT` HERE, given the measurement.
+  #    A host-side stopgap measured, on the SHIPPED defaults:
+  #      timeout=310 conc=1, busy lane  ->  drained 0 of 2
+  #      timeout=310 conc=3, FREE lane  ->  drained 0 of 3, stalled
+  #      timeout=900 conc=1, free lane  ->  drained 5 of 5
+  #    It failed on an IDLE lane, so scheduling and contention were never the
+  #    whole story. The reading that matters is the third row's concurrency,
+  #    not its timeout: raising concurrency made it WORSE, which is why 1 is
+  #    the value above and is not a knob this sidecar exposes.
+  #    The timeout is deliberately left DERIVED rather than pinned at 900.
+  #    `_backlog_timeout()` defaults to `retain_client_deadline()` and the
+  #    content bound is sized against that same number — they must stay one
+  #    number, and hard-coding 900 here would silently unpick that. What
+  #    those runs actually measured was the bound consuming ~100% of the
+  #    deadline, so a maximally-sized part could never finish; that is fixed
+  #    at its root in #3693 (the bound is now a FRACTION of the deadline),
+  #    which brings a max part to 202s inside a 310s deadline. Entries
+  #    already queued ABOVE the current bound are recovered by re-splitting
+  #    them, not by waiting longer. An operator who still wants a longer
+  #    deadline moves HINDSIGHT_RETAIN_CLIENT_DEADLINE_S, which moves both.
+  #
   #    Failure is never terminal: the drain exits non-zero only when it
   #    promoted entries to `.dead`, and the loop below ignores the status
   #    and waits for the next tick. `--backlog` reads api_url/token/bank
