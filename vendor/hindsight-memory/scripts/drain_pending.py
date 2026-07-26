@@ -215,15 +215,29 @@ def _backlog_timeout() -> int:
     client-side timeout on a request the server then commits anyway.
 
     The default is DERIVED, not a literal: it is
-    ``retain_split.retain_client_deadline()`` (280s), the same deadline the
+    ``retain_split.retain_client_deadline()`` (310s), the same deadline the
     retain content bound is sized against. Those two must be ONE number.
     This function shipped as a bare ``180`` (#3599), and against a 180s
     deadline both halves of the retain budget break: a maximally-sized part
     is ~276s of sequential extraction, and the SERVER per-call timeout
-    derived in ``src/setup/hindsight.ts`` (#3611) is 204s — so the drain
+    derived in ``src/setup/hindsight.ts`` is larger still — so the drain
     client would abandon a request the server is still legitimately working
     on, leave the entry queued, and rebuild the re-post loop #3599 exists to
     kill, one size class up.
+
+    This is the OUTERMOST deadline of the paired-budget family, and it is the
+    one the 2026-07-26 backlog-recovery logs show as a fixed ~280.1s per-entry
+    give-up. That was not an unexplained third number: it is this default at
+    the then-current ``DEFAULT_RETAIN_CLIENT_DEADLINE_S = 280.0``, plus the
+    request's own setup overhead. It was WRONG for the same reason #3611's
+    204s was wrong — it did not cover hindsight's LiteLLM routing chain
+    (local 200s + OpenRouter fallback 90s + router margin 10s = 300s), so
+    every drained entry whose retain fell through to the fallback was
+    abandoned client-side at 280s while the server was still inside a
+    legitimate 300s budget. Raising the derivation's base to 310 fixes this
+    lane and the in-hook lane with the same number, by construction.
+    ``src/litellm/timeout-budget.ts`` is where the chain is declared, and
+    ``tests/setup/hindsight.test.ts`` fails if these drift apart again.
 
     ``HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`` still overrides it outright;
     ``HINDSIGHT_RETAIN_CLIENT_DEADLINE_S`` moves the derivation and the

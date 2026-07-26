@@ -392,8 +392,16 @@ model_list:
       # extraction-timeout cluster (two retains lost). 90s < 120s makes the
       # SERVER give up first, so litellm returns a real error hindsight can retry
       # on instead of the client walking away from a still-running request.
-      # DO NOT RAISE past ~110s without first raising hindsight's client timeout
-      # — the invariant is server timeout < client timeout.
+      # 2026-07-26: DO NOT edit this number here alone. It is one half of a
+      # PAIR — switchroom derives hindsight's client budget for this lane from
+      # it, in `src/litellm/timeout-budget.ts` (LITELLM_TIMEOUT_TIERS.interactive).
+      # And the invariant is NOT "server < client": the router's fallback hop
+      # runs inside the SAME client request, so it is
+      #     local + fallback + margin  <=  client
+      # i.e. 90 + 60 + 10 = 160 <= HINDSIGHT_API_LLM_TIMEOUT (160, emitted by
+      # src/setup/hindsight.ts). Change this value in timeout-budget.ts and
+      # here together; the fleet-health litellm-config sensor reports it loudly
+      # when they drift apart.
       timeout: 90
       extra_body:
         reasoning_effort: low
@@ -410,12 +418,20 @@ model_list:
   # adds latency without adding availability. It only differed meaningfully while
   # the primary was a LOCAL box. Deliberately NOT changed by the reconciliation —
   # routing is Ken's call.
-  # Note: this entry has no per-model `timeout`, so a fallback hop still inherits
-  # request_timeout (600s). Only relevant once this tier is made distinct.
   - model_name: gpt-oss-20b-openrouter
     litellm_params:
       model: openrouter/openai/gpt-oss-20b
       api_key: os.environ/OPENROUTER_API_KEY
+      # 2026-07-26: this entry previously carried NO per-model `timeout`, so a
+      # fallback hop inherited request_timeout (600s) — 4x hindsight's whole
+      # client budget for the lane, which means the client always hung up
+      # mid-fallback and the failover path effectively did not exist. 60s is
+      # the value the live proxy runs (raised there from a useless 25s on
+      # 2026-07-26, at which the tier NEVER completed: 5,184 read timeouts in
+      # 24h). It is the OTHER half of the pair described on the gpt-oss-20b
+      # entry above: 90 + 60 + 10 = 160 <= HINDSIGHT_API_LLM_TIMEOUT.
+      # Declared in src/litellm/timeout-budget.ts; edit both together.
+      timeout: 60
       # Pin an explicit allowlist of providers that honor structured-output
       # (json_schema/response_format) — all verified structured:True on
       # OpenRouter 2026-07-14. The earlier blanket `require_parameters: true`

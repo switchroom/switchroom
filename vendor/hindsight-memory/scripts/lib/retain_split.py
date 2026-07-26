@@ -83,7 +83,7 @@ from typing import Optional
 #                               completion-token bucket; the runaway bucket is
 #                               a separate defect, fixed by capping
 #                               HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS).
-#   client_deadline     280 s  — the deadline of the DURABILITY path (the
+#   client_deadline     310 s  — the deadline of the DURABILITY path (the
 #                               out-of-hook backlog drain, #3599), deliberately
 #                               not the live Stop hook's 15s. The live path is
 #                               allowed to miss its deadline: it enqueues to
@@ -96,20 +96,31 @@ from typing import Optional
 #                               literal, and `src/setup/hindsight.ts`
 #                               (`HINDSIGHT_RETAIN_CLIENT_DEADLINE_S`, #3611)
 #                               mirrors it as the client half of that PR's
-#                               `server per-call timeout < client deadline`
-#                               assertion — which its derived 204s server
-#                               timeout satisfies against 280 and would NOT
-#                               against #3599's original 180s literal.
+#                               `hindsight per-call timeout < client deadline`
+#                               assertion. A test in `tests/setup/hindsight.test.ts`
+#                               enforces that the two stay equal, so the mirror
+#                               is checked, not merely asserted in prose.
+#                               WAS 280.0. Raised to 310 when the retain
+#                               per-call timeout became derived from the litellm
+#                               routing chain (`local 200 + fallback 90 +
+#                               margin 10 = 300`) instead of from the token
+#                               budget alone: #3611's 204s could not cover that
+#                               chain, so the retain OpenRouter fallback hop had
+#                               4s of headroom and could never complete. 310 is
+#                               that 300 plus the same one margin, so the plugin
+#                               always outlives hindsight by construction. It is
+#                               NOT a hand-set number on either side — change
+#                               `src/litellm/timeout-budget.ts` and both move.
 #
-#   floor(280 / 18.4) = 15 chunks  →  15 × 3000 = 45,000 chars
+#   floor(310 / 18.4) = 16 chunks  →  16 × 3000 = 48,000 chars
 #
 # Sanity check against the same backlog: every entry at or below 60,000 chars
-# drained successfully inside the 280s deadline (observed per-entry times
-# 0.3s–153.4s at concurrency 3), so 45,000 sits inside demonstrated-good
-# territory with margin for a slower model or a busier box.
+# drained successfully inside the (then 280s) deadline (observed per-entry
+# times 0.3s–153.4s at concurrency 3), so 48,000 still sits inside
+# demonstrated-good territory with margin for a slower model or a busier box.
 DEFAULT_RETAIN_CHUNK_SIZE = 3000
 DEFAULT_RETAIN_CHUNK_LATENCY_S = 18.4
-DEFAULT_RETAIN_CLIENT_DEADLINE_S = 280.0
+DEFAULT_RETAIN_CLIENT_DEADLINE_S = 310.0
 
 # Absolute floor: one chunk. A bound below one chunk would split every
 # transcript into extraction-sized confetti and is never the right answer.

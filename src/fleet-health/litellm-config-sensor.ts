@@ -1,6 +1,11 @@
 /**
- * Fleet Health — LiteLLM config sensor (I2 OAuth-leak guard, the load-bearing
- * enforcement point for PR4a).
+ * Fleet Health — LiteLLM config sensor. Two invariants, one file read:
+ *   1. the I2 OAuth-leak guard (header passthrough scoping) — the load-bearing
+ *      enforcement point for PR4a;
+ *   2. paired-timeout-budget drift — the live per-deployment `timeout` values
+ *      vs the tiers `src/litellm/timeout-budget.ts` derives every hindsight
+ *      client budget from. A half that moves alone breaks the router's fallback
+ *      hop silently; this is what makes it loud.
  *
  * The `scripts/check-litellm-config-guard.mjs` lint step covers the
  * repo-managed config (`docker/litellm-proxy/litellm-config.yaml`, KEN-125) but
@@ -25,6 +30,10 @@ import {
   discoverLiveLitellmConfigPath,
   parseLitellmConfig,
 } from "../litellm/header-passthrough-guard.js";
+import {
+  detectLitellmTimeoutDrift,
+  extractGroupTimeouts,
+} from "../litellm/timeout-budget.js";
 
 /** The pseudo-agent the litellm misconfig finding is attributed to. It is not a
  *  real switchroom agent — it names the shared LiteLLM proxy so the ledger's
@@ -126,22 +135,47 @@ export function scanLitellmConfig(
     return { status: "skipped", path, findings: [] };
   }
 
+  const findings: Finding[] = [];
+
   const violations = detectHeaderMisconfig(parsed);
   if (violations.length === 0) {
     log(`fleet-health: litellm-config sensor OK — header passthrough correctly scoped (${path})`);
-    return { status: "ok", path, findings: [] };
   }
-
-  const findings: Finding[] = violations.map((v, i) => {
+  for (const v of violations) {
     const where = v.scope === "global" ? "litellm_settings (global)" : `group '${v.group}'`;
-    return {
+    findings.push({
       signal: "litellm-header-passthrough-misconfig",
       agent: LITELLM_PROXY_PSEUDO_AGENT,
       turn_id: `litellm-config:${v.scope}:${v.group ?? "global"}`,
       log_pointer: `${path}: ${where} — ${v.detail}`,
       ts: nowIso,
-    };
-  });
+    });
+  }
+
+  // Paired-timeout-budget drift: the live per-deployment timeouts vs the tiers
+  // switchroom derives every hindsight client budget from
+  // (`src/litellm/timeout-budget.ts`). The in-repo vitest asserts the invariant
+  // over the DECLARATION and is fully deterministic in CI; only this sensor can
+  // see whether the live proxy still agrees with that declaration. Same division
+  // of labour as the I2 guard above.
+  const drifts = detectLitellmTimeoutDrift(extractGroupTimeouts(parsed));
+  if (drifts.length === 0) {
+    log(
+      `fleet-health: litellm-config sensor OK — per-deployment timeouts match the declared ` +
+        `tiers in src/litellm/timeout-budget.ts (${path})`,
+    );
+  }
+  for (const d of drifts) {
+    findings.push({
+      signal: "litellm-timeout-budget-drift",
+      agent: LITELLM_PROXY_PSEUDO_AGENT,
+      turn_id: `litellm-timeout:${d.role}:${d.group}`,
+      log_pointer: `${path}: group '${d.group}' — ${d.detail}`,
+      ts: nowIso,
+    });
+  }
+
+  if (findings.length === 0) return { status: "ok", path, findings: [] };
   for (const f of findings) {
     log(`fleet-health: litellm-config sensor VIOLATION — ${f.log_pointer}`);
   }

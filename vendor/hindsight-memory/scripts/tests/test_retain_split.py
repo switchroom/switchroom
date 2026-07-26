@@ -10,6 +10,7 @@ memory is permanently unsaveable.
 
 import io
 import json
+import math
 import os
 import shutil
 import sys
@@ -60,12 +61,13 @@ class TestDerivedLimit(unittest.TestCase):
             os.environ.pop(key, None)
 
     def test_limit_is_chunk_size_times_chunks_that_fit_the_deadline(self):
-        # chunk_size * floor(deadline / latency) = 3000 * floor(280/18.4) = 45000
-        self.assertEqual(retain_content_limit(), 45000)
+        # chunk_size * floor(deadline / latency) = 3000 * floor(310/18.4) = 48000
+        self.assertEqual(retain_content_limit(), 48000)
 
     def test_limit_is_derived_from_chunk_size_not_a_constant(self):
         os.environ["HINDSIGHT_RETAIN_CHUNK_SIZE"] = "1000"
-        self.assertEqual(retain_content_limit(), 15000)
+        # 1000 * floor(310 / 18.4) = 1000 * 16
+        self.assertEqual(retain_content_limit(), 16000)
 
     def test_limit_tracks_the_client_deadline(self):
         os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = "92"
@@ -78,7 +80,7 @@ class TestDerivedLimit(unittest.TestCase):
 
     def test_garbage_env_falls_back_to_the_derived_default(self):
         os.environ["HINDSIGHT_RETAIN_CHUNK_LATENCY_S"] = "not-a-number"
-        self.assertEqual(retain_content_limit(), 45000)
+        self.assertEqual(retain_content_limit(), 48000)
 
 
 class TestSplitBounds(unittest.TestCase):
@@ -88,11 +90,11 @@ class TestSplitBounds(unittest.TestCase):
 
     def test_every_part_of_an_oversized_json_transcript_is_within_the_limit(self):
         content = _json_transcript(40, 5000)  # ~200k chars
-        self.assertGreater(len(content), 45000)
+        self.assertGreater(len(content), retain_content_limit())
         parts = split_retain_content(content)
         self.assertGreater(len(parts), 1)
         for part in parts:
-            self.assertLessEqual(len(part), 45000)
+            self.assertLessEqual(len(part), retain_content_limit())
 
     def test_every_part_of_an_oversized_text_transcript_is_within_the_limit(self):
         content = _text_transcript(60, 4000)  # ~240k chars
@@ -106,16 +108,22 @@ class TestSplitBounds(unittest.TestCase):
         content = _json_transcript(200, 3700)
         self.assertGreater(len(content), 744000)
         parts = split_retain_content(content)
-        self.assertTrue(all(len(p) <= 45000 for p in parts))
-        # ~249 sequential extraction calls become bounded batches of <=15.
-        self.assertGreaterEqual(len(parts), 16)
+        self.assertTrue(all(len(p) <= retain_content_limit() for p in parts))
+        # ~249 sequential extraction calls become bounded batches of at most
+        # `retain_content_limit() / chunk_size` calls each. Both the bound and
+        # the expected part count are DERIVED here: the literal 16 this line
+        # carried was correct only at the 45,000-char bound and went stale the
+        # moment the client deadline moved 280 -> 310 (bound 48,000). A split
+        # must always produce at least ceil(len / bound) parts, whatever the
+        # bound currently is.
+        self.assertGreaterEqual(len(parts), math.ceil(len(content) / retain_content_limit()))
 
     def test_single_oversized_message_is_split_not_dropped(self):
         content = _json_transcript(1, 300000)
         parts = split_retain_content(content)
         self.assertGreater(len(parts), 1)
         for part in parts:
-            self.assertLessEqual(len(part), 45000)
+            self.assertLessEqual(len(part), retain_content_limit())
 
     def test_single_unbreakable_line_still_respects_the_bound(self):
         # No structural boundary anywhere: the bound must still hold.
@@ -224,7 +232,7 @@ class TestClientEnforcesTheBound(unittest.TestCase):
         self.assertGreater(len(self.client.posts), 1)
         for _path, body, _timeout in self.client.posts:
             self.assertEqual(len(body["items"]), 1)
-            self.assertLessEqual(len(body["items"][0]["content"]), 45000)
+            self.assertLessEqual(len(body["items"][0]["content"]), retain_content_limit())
 
     def test_small_retain_still_posts_exactly_once_with_the_original_id(self):
         self.client.retain("bank", "small transcript", document_id="doc")

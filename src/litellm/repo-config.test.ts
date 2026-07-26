@@ -19,6 +19,12 @@ import {
   isClaudeAllowlistedGroup,
   parseLitellmConfig,
 } from "./header-passthrough-guard.js";
+import {
+  LITELLM_ROUTER_MARGIN_S,
+  LITELLM_TIMEOUT_TIERS,
+  detectLitellmTimeoutDrift,
+  extractGroupTimeouts,
+} from "./timeout-budget.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const configPath = join(repoRoot, "docker", "litellm-proxy", "litellm-config.yaml");
@@ -273,6 +279,110 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
       ).toBe(false);
       // A real pin must be immutable-ish: a digest, or a tag with a version.
       expect(imagePinLines[0]).toMatch(/(@sha256:[0-9a-f]{64}|:\S*\d)/);
+    }
+  });
+});
+
+describe("repo-managed litellm-config.yaml — paired timeout budgets (Fix B)", () => {
+  const actual = extractGroupTimeouts(parsed);
+
+  it("declares a per-deployment timeout on every group switchroom budgets for", () => {
+    // A group with no `timeout` inherits litellm_settings.request_timeout
+    // (600s here) — 4x the interactive lane's whole client budget, so the
+    // client always hangs up mid-fallback and the failover path does not
+    // exist. `gpt-oss-20b-openrouter` shipped in exactly that state until
+    // 2026-07-26; this test is what stops it recurring.
+    for (const tier of Object.values(LITELLM_TIMEOUT_TIERS)) {
+      for (const group of [tier.group, tier.fallbackGroup]) {
+        if (group === null || !actual.has(group)) continue; // absent lane: #3407's signal
+        expect(actual.get(group), `${configPath}: group '${group}' has no per-model timeout`).not.toBeNull();
+      }
+    }
+  });
+
+  it("matches the tiers switchroom derives its client budgets from", () => {
+    // The shipped config and src/litellm/timeout-budget.ts are two halves of
+    // one number. If this fails, one half was edited alone — which is the
+    // 2026-07-25/26 defect class, caught here at review time instead of by an
+    // operator noticing a lane has silently produced nothing for a week.
+    const drifts = detectLitellmTimeoutDrift(actual);
+    expect(
+      drifts.map((d) => `${d.group}: config ${d.actualS ?? "none"}s vs declared ${d.declaredS}s`),
+    ).toEqual([]);
+  });
+
+  it("keeps every router fallback edge represented in the declared tiers", () => {
+    // A fallback edge switchroom does not know about is an unbudgeted hop: the
+    // chain arithmetic silently omits it and the client budget is too small.
+    const fallbacks = (parsed.router_settings as Record<string, unknown> | undefined)?.fallbacks;
+    const declared = new Map(
+      Object.values(LITELLM_TIMEOUT_TIERS).map(
+        (t) => [t.group, t.fallbackGroup] as [string, string | null],
+      ),
+    );
+    for (const edge of Array.isArray(fallbacks) ? fallbacks : []) {
+      if (!edge || typeof edge !== "object") continue;
+      for (const [from, to] of Object.entries(edge as Record<string, unknown>)) {
+        if (!declared.has(from)) continue; // a lane switchroom does not budget
+        const targets = Array.isArray(to) ? to : [to];
+        expect(
+          targets,
+          `${configPath}: '${from}' falls back to ${JSON.stringify(targets)}, but ` +
+            `LITELLM_TIMEOUT_TIERS declares '${declared.get(from)}'`,
+        ).toContain(declared.get(from));
+      }
+    }
+  });
+
+  it("keeps every budgeted group OUT of the fleet pacer's allowlist", () => {
+    // LITELLM_ROUTER_MARGIN_S (10s) covers only litellm's own in-request work.
+    // It does NOT cover a pacer hold, and it could not: PACE_MAX_WAIT_S alone
+    // defaults to 20s and the hard backstop is clamped as high as 280s. The
+    // margin is sound today ONLY because no group these tiers budget matches
+    // PACE_MODEL_GROUPS. Adding e.g. `gpt-oss-*` to that allowlist would make
+    // every derived client budget too small again — silently, and in exactly
+    // the paired-drift shape this module exists to prevent. So it is checked
+    // rather than commented.
+    const pacerPath = join(repoRoot, "docker", "litellm-pacer", "custom_pacing.py");
+    const src = readFileSync(pacerPath, "utf8");
+
+    const read = (name: string): string[] => {
+      const m = new RegExp(`${name}\\s*=\\s*_csv_env\\(\\s*"${name}"\\s*,\\s*"([^"]*)"`).exec(src);
+      // An unreadable guard is not a guard. If the pacer's declaration shape
+      // changes, fail here instead of silently asserting over an empty list.
+      expect(m, `${pacerPath}: could not read the ${name} default`).not.toBeNull();
+      return m![1]
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    };
+
+    const globMatches = (pattern: string, value: string): boolean =>
+      new RegExp(
+        `^${pattern
+          .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replace(/\*/g, ".*")
+          .replace(/\?/g, ".")}$`,
+      ).test(value);
+
+    const paced = read("PACE_MODEL_GROUPS");
+    const excluded = read("PACE_MODEL_GROUPS_EXCLUDE");
+    expect(paced.length).toBeGreaterThan(0);
+
+    for (const tier of Object.values(LITELLM_TIMEOUT_TIERS)) {
+      for (const group of [tier.group, tier.fallbackGroup]) {
+        if (group === null) continue;
+        // Same precedence as _group_is_paced(): exclusion wins.
+        const isPaced =
+          !excluded.some((p) => globMatches(p, group)) && paced.some((p) => globMatches(p, group));
+        expect(
+          isPaced,
+          `${pacerPath}: PACE_MODEL_GROUPS ${JSON.stringify(paced)} paces '${group}', which ` +
+            `LITELLM_TIMEOUT_TIERS budgets with only a ${LITELLM_ROUTER_MARGIN_S}s margin. A ` +
+            `pacer hold (PACE_MAX_WAIT_S defaults to 20s) does not fit in that margin — raise ` +
+            `the tier's timeouts to cover it, or keep the group unpaced.`,
+        ).toBe(false);
+      }
     }
   });
 });
