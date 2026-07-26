@@ -128,21 +128,49 @@ function spawnSqlRead(dbPath, sql, cb) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Bare-string dispatch failure. When the Agent/Task dispatch never produced a
+ * worker at all, Claude Code hands the hook a BARE STRING and there is no
+ * `is_error` flag to read — the whole tool_response IS the message. Every
+ * bare-string result observed across the fleet (54 of 2692 Agent/Task
+ * dispatches scanned in every agent's claude-code transcript dir) is one of:
+ *
+ *   52x  "Error: Cannot create agent worktree: not in a git repository…"
+ *    1x  "Error: Agent type 'code-reviewer' not found. Available agents: …"
+ *    1x  "InputValidationError: [\n  { \"expected\": \"string\", … } ]"
+ *
+ * so the probe must match a `<Prefix>Error` head, not just a literal `Error:`
+ * — the plain-`Error:` form the pre-review patch used recorded that
+ * InputValidationError dispatch as a SUCCESSFUL sub-agent completion, with the
+ * validation error stored as its result_summary. Nothing else terminalizes
+ * those rows (no worker exists, so the watcher never sees one), so getting the
+ * status right here is the only chance.
+ */
+const BARE_DISPATCH_ERROR_RE = /^\s*[A-Za-z]*Error\b/
+
+/**
  * Terminal status for a response already classified as KIND_COMPLETION.
  *
- * `is_error` / `error` are the structured failure signals. The text probe
- * catches the shape Claude Code uses for a dispatch that never produced a
- * worker at all — a BARE STRING starting with `Error:` (observed in
- * production: "Error: Cannot create agent worktree: not in a git
- * repository…"), which carries no `is_error` flag because the whole
- * tool_response IS the string. Anchored at the start so a report that merely
- * discusses an error mid-text stays `completed`.
+ * Signals, in precedence order:
+ *   1. `is_error` / `error` — the structured failure flags.
+ *   2. `status` on a structured Agent envelope (see structuredTerminalStatus).
+ *      Machine-readable: `completed` is a success, anything else in the
+ *      terminal set is a failure.
+ *   3. A bare-string dispatch failure (BARE_DISPATCH_ERROR_RE).
+ *
+ * The bare-string probe is deliberately scoped to `typeof toolResponse ===
+ * 'string'` rather than run over toolResponseText(): a worker's own report
+ * (a `content` array) that merely OPENS with "Error: I could not reproduce…"
+ * is a report ABOUT an error, not a failed dispatch, and must stay
+ * `completed`. The pre-review patch ran the probe over the flattened text and
+ * mislabelled exactly that case.
  */
 function detectStatus(toolResponse) {
   if (!toolResponse) return 'completed'
   if (toolResponse.is_error === true) return 'failed'
   if (toolResponse.error != null) return 'failed'
-  if (/^\s*Error:/.test(toolResponseText(toolResponse))) return 'failed'
+  const structured = structuredTerminalStatus(toolResponse)
+  if (structured != null) return structured === 'completed' ? 'completed' : 'failed'
+  if (typeof toolResponse === 'string' && BARE_DISPATCH_ERROR_RE.test(toolResponse)) return 'failed'
   return 'completed'
 }
 
@@ -216,13 +244,55 @@ function isStructuredAsyncLaunch(toolResponse) {
   if (toolResponse.status === 'async_launched') return true
   // `isAsync` alone says "this dispatch is asynchronous", not "it is still
   // running". If a future claude-code reuses the same envelope to report an
-  // async agent's OUTCOME, an explicitly terminal `status` wins — otherwise we
-  // would refuse to ever terminalize that row from the hook.
-  if (toolResponse.isAsync === true) {
-    const s = typeof toolResponse.status === 'string' ? toolResponse.status.toLowerCase() : ''
-    return !(s === 'completed' || s === 'failed' || s === 'error' || s === 'cancelled' || s === 'canceled')
-  }
+  // async agent's OUTCOME, an explicitly terminal `status` wins — the row is
+  // then classified KIND_COMPLETION by structuredTerminalStatus below, so the
+  // hook can still terminalize it. A non-terminal / absent status (queued,
+  // running, in_progress, none at all) means "still in flight" → launch.
+  if (toolResponse.isAsync === true) return structuredTerminalStatus(toolResponse) == null
   return false
+}
+
+/**
+ * The terminal statuses claude-code's Agent envelope uses for an end-of-life
+ * result. Single source of truth: read by isStructuredAsyncLaunch (to refuse
+ * calling a finished dispatch a launch), classifyAgentResponse (to call it a
+ * completion) and detectStatus (to pick completed vs failed). Keeping one set
+ * is what stops those three from drifting into disagreement.
+ */
+const TERMINAL_AGENT_STATUSES = new Set([
+  'completed', 'failed', 'error', 'cancelled', 'canceled',
+])
+
+/**
+ * DETERMINISTIC completion signal — the mirror of isStructuredAsyncLaunch.
+ *
+ * The synchronous-completion envelope is machine-readable too. Captured from
+ * production transcripts (agent `marko`, three real sync dispatches of 164s /
+ * 387s / 490s):
+ *
+ *   { status: 'completed', agentId, agentType, resolvedModel, prompt,
+ *     content: [{ type: 'text', text: '…' }], totalDurationMs, totalTokens,
+ *     totalToolUseCount, usage, toolStats }
+ *
+ * Reading `status` STRUCTURALLY, ahead of the prose ACK backstop, matters for
+ * the same reason the launch side does: isAsyncLaunchAck() pattern-matches the
+ * flattened response TEXT, and on a real completion that text is the worker's
+ * own report. A worker whose report happens to quote the ACK ("Async agent
+ * launched successfully"), or to print `agentId: <id>` on its own line near
+ * the word "background" — i.e. any worker reporting on sub-agent dispatch,
+ * including one reviewing this hook — was classified KIND_ASYNC_LAUNCH,
+ * promoted to background, and never terminalized by the hook. The structured
+ * status settles it before prose ever gets a vote.
+ *
+ * Returns the lowercased terminal status, or null when the response carries no
+ * machine-readable terminal status (which includes `async_launched`).
+ */
+function structuredTerminalStatus(toolResponse) {
+  if (toolResponse == null || typeof toolResponse !== 'object') return null
+  if (Array.isArray(toolResponse)) return null
+  if (typeof toolResponse.status !== 'string') return null
+  const s = toolResponse.status.toLowerCase()
+  return TERMINAL_AGENT_STATUSES.has(s) ? s : null
 }
 
 /**
@@ -335,27 +405,60 @@ function hasCompletionShape(toolResponse) {
  * Classify a PostToolUse tool_response for an Agent/Task dispatch.
  *
  * The whole point of the three-way split is that only KIND_COMPLETION is
- * allowed to write a terminal row. KIND_ASYNC_LAUNCH promotes to background
- * and KIND_UNKNOWN does nothing but bump activity — both leave the watcher's
+ * allowed to write a terminal row. KIND_ASYNC_LAUNCH and KIND_UNKNOWN both
+ * promote to background and bump activity only, leaving the watcher's
  * JSONL-driven `recordSubagentEnd` (turn_end / stall synthesis) as the
  * authoritative end-of-life signal, with `reapStuckRunningRows` behind it.
  * Failing to terminalize here is recoverable; terminalizing a live worker is
  * not — it makes the `wk:<agentId>` reaper unpin a running worker's card and
  * turns every duration in the registry into fiction.
  *
- * Accepted residual on KIND_UNKNOWN: the row keeps background = 0 (we decline
- * to guess in that direction too), and `reapStuckRunningRows` only sweeps
- * background = 1 rows — so a row that is BOTH unknown-shaped AND never links
- * its JSONL would sit `running` indefinitely. The watcher's turn_end path
- * covers any row that does link (the common case), and the stderr warning
- * above is the alarm that gets a real fix written. That is strictly better
- * than the alternative it replaces: silently asserting a live worker finished.
+ * Order matters. Both STRUCTURAL signals are read before the prose backstop,
+ * because the prose tiers match the flattened response TEXT and on a real
+ * completion that text is the worker's own report — see
+ * structuredTerminalStatus() for the self-referential failure that causes.
+ *
+ * KIND_UNKNOWN takes the same DB path as a launch (background = 1, no terminal
+ * write) rather than staying background = 0. That is NOT a guess about
+ * liveness — it is what keeps the row inside the safety net. `background = 0`
+ * is a contract, not a free-form flag: `reapStuckRunningRows` deliberately
+ * excludes foreground rows *because* "their lifecycle goes through PostToolUse
+ * which writes `completed` directly" (subagents-schema.ts). A row this hook
+ * declines to terminalize while leaving background = 0 satisfies neither
+ * owner — PostToolUse won't end it and the reaper won't sweep it — so under a
+ * claude-code shape drift EVERY row would sit `running` forever, unbounded and
+ * silent. Routed through the promote path instead, the worst case is bounded:
+ * the watcher ends it if the JSONL links, and the 1h reaper otherwise moves it
+ * to `stalled` with a reason recorded in result_summary.
  */
 function classifyAgentResponse(toolResponse) {
   if (isStructuredAsyncLaunch(toolResponse)) return KIND_ASYNC_LAUNCH
+  if (structuredTerminalStatus(toolResponse) != null) return KIND_COMPLETION
   if (isAsyncLaunchAck(toolResponse)) return KIND_ASYNC_LAUNCH
   if (hasCompletionShape(toolResponse)) return KIND_COMPLETION
   return KIND_UNKNOWN
+}
+
+/**
+ * Choose the UPDATE to apply for a (background-flag, kind) pair.
+ *
+ * SINGLE source of truth, shared by the node:sqlite and sqlite3-CLI branches
+ * of updateRow(). Those two used to carry hand-duplicated conditionals that
+ * disagreed on their default arm: the sync branch fell through to the
+ * non-terminal update while the CLI branch fell through to the TERMINAL one,
+ * so any `kind` neither branch enumerated (a future fourth kind, or a caller
+ * that omitted the field) would silently terminalize a live row on exactly one
+ * of the two paths — the same class of failure as #3667, reachable only on the
+ * fallback runtime where nobody would look.
+ *
+ * Returns 'foreground' (terminal write), 'promote' (set background = 1,
+ * activity bump only) or 'background' (activity bump only). Anything not
+ * explicitly recognised as a completion fails SAFE — non-terminal.
+ */
+function chooseUpdate(isBackground, kind) {
+  if (isBackground) return 'background'
+  if (kind === KIND_COMPLETION) return 'foreground'
+  return 'promote'
 }
 
 /**
@@ -398,9 +501,15 @@ function describeShape(toolResponse) {
  * the gateway's worker-feed card fire (onProgress re-reads `background` per
  * tick) AND prevents the premature `completed` the foreground path would write.
  *
- * Unrecognised shape (KIND_UNKNOWN): activity bump only. We cannot tell a
- * launch from a completion, so we decline to guess and leave the watcher in
- * charge of the terminal write (#3667).
+ * Unrecognised shape (KIND_UNKNOWN): same path as a launch — promote to
+ * background = 1, bump activity, write no terminal status. We cannot tell a
+ * launch from a completion, so we decline to guess about the OUTCOME, but we
+ * must still hand the row to an owner: background = 0 means "PostToolUse ends
+ * this row", which is precisely what we are declining to do, and it is the
+ * flag `reapStuckRunningRows` filters on. See classifyAgentResponse (#3667).
+ *
+ * Both runtime branches below route through chooseUpdate() so they cannot
+ * disagree.
  *
  * The done(err | null) callback is invoked after all DB operations complete.
  */
@@ -459,12 +568,11 @@ function updateRow(dbPath, { id, status, resultSummary, now, kind }, done) {
         try { db.exec('PRAGMA busy_timeout = 5000') } catch { /* best-effort */ }
         const row = db.prepare(SELECT_SQL).get(snapId)
         const isBackground = row != null && row.background === 1
-        if (isBackground) {
-          db.prepare(BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
-        } else if (snapKind === KIND_ASYNC_LAUNCH) {
-          db.prepare(PROMOTE_BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
-        } else if (snapKind === KIND_COMPLETION) {
+        const choice = chooseUpdate(isBackground, snapKind)
+        if (choice === 'foreground') {
           db.prepare(FOREGROUND_SQL).run(snapNow, snapStatus, snapResultSummary, snapNow, snapId)
+        } else if (choice === 'promote') {
+          db.prepare(PROMOTE_BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
         } else {
           db.prepare(BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
         }
@@ -482,13 +590,14 @@ function updateRow(dbPath, { id, status, resultSummary, now, kind }, done) {
     if (err) { done(err); return }
     // sqlite3 outputs "0" or "1" (or empty if row not found).
     const isBackground = bgResult === '1'
-    if (isBackground || snapKind === KIND_UNKNOWN) {
+    const choice = chooseUpdate(isBackground, snapKind)
+    if (choice === 'foreground') {
       spawnSql(
         snapDbPath,
-        fillPlaceholders(BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
+        fillPlaceholders(FOREGROUND_SQL.trim(), [snapNow, snapStatus, snapResultSummary, snapNow, snapId]),
         done,
       )
-    } else if (snapKind === KIND_ASYNC_LAUNCH) {
+    } else if (choice === 'promote') {
       spawnSql(
         snapDbPath,
         fillPlaceholders(PROMOTE_BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
@@ -497,7 +606,7 @@ function updateRow(dbPath, { id, status, resultSummary, now, kind }, done) {
     } else {
       spawnSql(
         snapDbPath,
-        fillPlaceholders(FOREGROUND_SQL.trim(), [snapNow, snapStatus, snapResultSummary, snapNow, snapId]),
+        fillPlaceholders(BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
         done,
       )
     }
@@ -571,6 +680,16 @@ function main() {
     process.exit(0)
   }
 
+  // A well-formed JSON body that is not an object still has to be rejected
+  // BEFORE any property read. `JSON.parse('null')` succeeds and returns null,
+  // and `null.tool_name` is an uncaught TypeError — which in production means
+  // a non-zero hook exit, which means bin/run-hook.sh files a red issue card
+  // for a payload the hook was always going to ignore. (Pre-existing on main;
+  // not reachable from claude-code's own protocol, but this hook runs on every
+  // PostToolUse across the fleet, so it must not be one bad byte from
+  // throwing.)
+  if (event == null || typeof event !== 'object') process.exit(0)
+
   // Only care about sub-agent dispatches. Claude Code emits the dispatch
   // tool under either the legacy name 'Agent' or the newer 'Task'
   // depending on version. The matching session-tail / progress-card /
@@ -608,9 +727,15 @@ function main() {
   // the update path in updateRow. See classifyAgentResponse (#3667).
   const kind = classifyAgentResponse(toolResponse)
   if (kind === KIND_UNKNOWN) {
-    // Loud but non-fatal: this is the drift alarm. If claude-code changes the
-    // Agent tool_response shape again, this line — not a registry full of
-    // 0.2s "completed" workers — is how we find out.
+    // Best-effort drift breadcrumb, NOT the safety mechanism. In production
+    // this hook runs under bin/run-hook.sh, which records an issue only on a
+    // NON-ZERO exit and auto-resolves on exit 0 — and claude-code discards a
+    // 0-exit hook's stderr — so this line reaches a human only under
+    // RUN_HOOK_DEBUG / journald. Exiting non-zero instead would card an error
+    // on every dispatch under drift, which is worse. What actually bounds the
+    // damage is the classification: an unrecognised shape is never
+    // terminalized and is routed to background = 1, so the watcher's
+    // recordSubagentEnd or the 1h reaper owns the row's end of life.
     process.stderr.write(
       `[subagent-tracker-posttool] unrecognised Agent tool_response shape `
       + `(${describeShape(toolResponse)}) — leaving row non-terminal; `

@@ -10,11 +10,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
-import { recordSubagentEnd } from '../registry/subagents-schema.js'
+import { recordSubagentEnd, reapStuckRunningRows } from '../registry/subagents-schema.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -691,19 +691,43 @@ describe('subagent-tracker-posttool — async launch is not a completion (#3667)
 
     const db = openDb()
     const row = db
-      .prepare('SELECT status, ended_at, background FROM subagents WHERE id = ?')
-      .get('toolu_3667c') as { status: string; ended_at: number | null; background: number }
+      .prepare('SELECT status, ended_at, background, last_activity_at, started_at FROM subagents WHERE id = ?')
+      .get('toolu_3667c') as {
+        status: string
+        ended_at: number | null
+        background: number
+        last_activity_at: number | null
+        started_at: number
+      }
     expect(row.status).toBe('running')
     expect(row.ended_at).toBeNull()
-    // Unknown ≠ background: we decline to guess in both directions.
-    expect(row.background).toBe(0)
+    // background = 0 is a CONTRACT ("PostToolUse terminalizes this row"), not
+    // a free-form flag, and it is what reapStuckRunningRows filters on. A row
+    // this hook refuses to terminalize must be handed to the watcher/reaper,
+    // or under a shape drift EVERY row would sit `running` forever with no
+    // owner at all.
+    expect(row.background).toBe(1)
+
+    // Prove the hand-off is real, not just a flag: the reaper must actually
+    // sweep this row once it goes stale. Would FAIL if the row stayed
+    // background = 0 (the reaper's SELECT requires background = 1).
+    const reaped = reapStuckRunningRows(
+      db as unknown as Parameters<typeof reapStuckRunningRows>[0],
+      { now: (row.last_activity_at ?? row.started_at) + 3_600_001, ttlMs: 3_600_000 },
+    )
+    expect(reaped.ids).toContain('toolu_3667c')
+    const swept = db
+      .prepare('SELECT status, result_summary FROM subagents WHERE id = ?')
+      .get('toolu_3667c') as { status: string; result_summary: string | null }
+    expect(swept.status).toBe('stalled')
+    expect(swept.result_summary).toContain('reaped')
   })
 
-  it('does not read an explicitly terminal async envelope as a fresh launch', () => {
+  it('terminalizes an explicitly terminal async envelope instead of calling it a launch', () => {
     // Boundary: `isAsync: true` means "this dispatch is asynchronous", not
-    // "still running". If a future claude-code reuses the envelope to report an
-    // OUTCOME, promoting it to a running background row would be wrong — the
-    // hook must fall through to the drift alarm instead of claiming a launch.
+    // "still running". If a future claude-code reuses the envelope to report
+    // an OUTCOME, the machine-readable `status` is authoritative — the whole
+    // point of #3667 is to read structured fields instead of guessing.
     expect(runHook(PRETOOL_SCRIPT, {
       session_id: 's-3667g',
       tool_name: 'Agent',
@@ -717,14 +741,67 @@ describe('subagent-tracker-posttool — async launch is not a completion (#3667)
       tool_response: { isAsync: true, status: 'completed', agentId: 'zz1' },
     })
     expect(postResult.status).toBe(0)
-    expect(postResult.stderr).toContain('unrecognised Agent tool_response shape')
+    // Recognised, so no drift alarm.
+    expect(postResult.stderr).not.toContain('unrecognised Agent tool_response shape')
 
     const db = openDb()
     const row = db
       .prepare('SELECT status, background, ended_at FROM subagents WHERE id = ?')
       .get('toolu_3667g') as { status: string; background: number; ended_at: number | null }
-    expect(row.background).toBe(0)
+    expect(row.status).toBe('completed')
+    expect(row.ended_at).not.toBeNull()
+  })
+
+  it('records a terminal async envelope with a FAILED status as failed, not completed', () => {
+    // The status is not just a liveness signal — it carries the outcome. A
+    // classifier that terminalized on `status` but read the outcome from
+    // is_error/text alone would file every failure as a success.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667h',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667h',
+      tool_input: { subagent_type: 'worker', description: 'Failing envelope' },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667h',
+      tool_response: { isAsync: true, status: 'failed', agentId: 'zz2' },
+    })
+    expect(postResult.status).toBe(0)
+    // A failure is not a handback.
+    expect(postResult.stdout).not.toContain('additionalContext')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_3667h') as { status: string; ended_at: number | null }
+    expect(row.status).toBe('failed')
+    expect(row.ended_at).not.toBeNull()
+  })
+
+  it('does NOT read a still-in-flight async status as terminal', () => {
+    // Only the terminal statuses count. A non-terminal `status` on an
+    // isAsync envelope is still a launch — the row must stay alive.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667i',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667i',
+      tool_input: { subagent_type: 'worker', description: 'In flight' },
+    }).status).toBe(0)
+
+    expect(runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667i',
+      tool_response: { isAsync: true, status: 'running', agentId: 'zz3' },
+    }).status).toBe(0)
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, background, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_3667i') as { status: string; background: number; ended_at: number | null }
     expect(row.status).toBe('running')
+    expect(row.background).toBe(1)
     expect(row.ended_at).toBeNull()
   })
 
@@ -782,6 +859,146 @@ describe('subagent-tracker-posttool — async launch is not a completion (#3667)
     expect(row.result_summary).toContain('Cannot create agent worktree')
   })
 
+  it('terminalizes a prefixed bare-string dispatch error (InputValidationError) as failed', () => {
+    // Also observed in production (1 of the 54 bare-string results): the
+    // dispatch failure does NOT start with a literal "Error:". A probe
+    // anchored on that exact prefix filed this as a SUCCESSFUL sub-agent
+    // completion with the validation error stored as its result_summary —
+    // and nothing else ever revisits the row, because no worker was created.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667j',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667j',
+      tool_input: { subagent_type: 'worker', description: 'Bad input' },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667j',
+      tool_response:
+        'InputValidationError: [\n  {\n    "expected": "string",\n'
+        + '    "code": "invalid_type",\n    "path": [ "prompt" ]\n  }\n]',
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).not.toContain('additionalContext')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_3667j') as { status: string; ended_at: number | null }
+    expect(row.status).toBe('failed')
+    expect(row.ended_at).not.toBeNull()
+  })
+
+  it('does not call a worker report that OPENS with "Error:" a failed dispatch', () => {
+    // The bare-string probe must not be run over a worker's own report. A
+    // report that opens "Error: I could not reproduce…" describes an error,
+    // it is not a failed dispatch, and filing it as `failed` misreports a
+    // sub-agent that ran to completion.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667k',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667k',
+      tool_input: { subagent_type: 'worker', description: 'Repro attempt', run_in_background: false },
+    }).status).toBe(0)
+
+    expect(runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667k',
+      tool_response: {
+        content: [{ type: 'text', text: 'Error: could not be reproduced — here is what I checked instead.' }],
+      },
+    }).status).toBe(0)
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status FROM subagents WHERE id = ?')
+      .get('toolu_3667k') as { status: string }
+    expect(row.status).toBe('completed')
+  })
+
+  it('terminalizes the production SYNCHRONOUS completion envelope', () => {
+    // The PR body claimed "Zero synchronous completions" from a 318-dispatch
+    // sample. Rescanning every agent's transcripts (2692 Agent/Task results)
+    // found 3 real ones, all on agent `marko`, running 164s-490s. They are a
+    // THIRD shape with its own machine-readable `status` — pinned here so the
+    // classifier is verified against it rather than assumed to be unreachable.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667l',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667l',
+      tool_input: { subagent_type: 'worker', description: 'Sync reconcile', run_in_background: false },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667l',
+      tool_response: {
+        status: 'completed',
+        prompt: 'Reconcile yesterday…',
+        agentId: 'a1b2c3',
+        agentType: 'general-purpose',
+        content: [{ type: 'text', text: 'Analysis complete. 15 contacts checked.' }],
+        resolvedModel: 'claude-opus-5',
+        totalDurationMs: 490_293,
+        totalTokens: 120_000,
+        totalToolUseCount: 42,
+        usage: {},
+        toolStats: {},
+      },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stderr).not.toContain('unrecognised Agent tool_response shape')
+    expect(postResult.stdout).toContain('additionalContext')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at, result_summary FROM subagents WHERE id = ?')
+      .get('toolu_3667l') as { status: string; ended_at: number | null; result_summary: string | null }
+    expect(row.status).toBe('completed')
+    expect(row.ended_at).not.toBeNull()
+    expect(row.result_summary).toContain('15 contacts checked')
+  })
+
+  it('reads the structured status BEFORE the prose ACK, so a report about async launches still terminalizes', () => {
+    // Self-referential trap: isAsyncLaunchAck() pattern-matches the flattened
+    // response TEXT, and on a real completion that text is the worker's own
+    // report. A worker reporting on sub-agent dispatch — e.g. one reviewing
+    // this very hook — quotes the ACK phrase verbatim, which classified the
+    // completed worker as a fresh LAUNCH: promoted to background, never
+    // terminalized, no handback. The structured `status` must settle it first.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667m',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667m',
+      tool_input: { subagent_type: 'worker', description: 'Review the ACK detector', run_in_background: false },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667m',
+      tool_response: {
+        status: 'completed',
+        totalDurationMs: 61_000,
+        content: [{
+          type: 'text',
+          text: 'Reviewed the detector. The canonical ACK is "Async agent launched '
+            + 'successfully", followed by\nagentId: aec3ddbae614f85f5\nand a line saying '
+            + 'the agent is working in the background.',
+        }],
+      },
+    })
+    expect(postResult.status).toBe(0)
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at, background FROM subagents WHERE id = ?')
+      .get('toolu_3667m') as { status: string; ended_at: number | null; background: number }
+    expect(row.status).toBe('completed')
+    expect(row.ended_at).not.toBeNull()
+    expect(row.background).toBe(0)
+  })
+
   it('still terminalizes a genuine foreground completion (control)', () => {
     // The fix must not swing the other way: a real sync completion still ends
     // the row, with its result summary and a handback nudge.
@@ -813,6 +1030,149 @@ describe('subagent-tracker-posttool — async launch is not a completion (#3667)
     expect(row.ended_at).not.toBeNull()
     expect(row.background).toBe(0)
     expect(row.result_summary).toContain('3 files changed')
+  })
+})
+
+describe('subagent-tracker-posttool — never throws on a malformed event', () => {
+  // This hook runs on EVERY PostToolUse across the fleet. An uncaught throw
+  // exits non-zero, and bin/run-hook.sh turns a non-zero hook exit into a red
+  // issue card — so a payload the hook was always going to ignore must not be
+  // able to manufacture one. `JSON.parse('null')` in particular parses fine
+  // and then `null.tool_name` threw a TypeError (pre-existing on main).
+  const BAD_BODIES = ['null', '42', '"a string"', 'true', '[]', '[1,2,3]', '{}', 'not json at all', '']
+
+  for (const body of BAD_BODIES) {
+    it(`exits 0 with no output on stdin ${JSON.stringify(body)}`, () => {
+      const result = spawnSync(process.execPath, [POSTTOOL_SCRIPT], {
+        input: body,
+        encoding: 'utf8',
+        env: { ...process.env, SWITCHROOM_AGENT_DIR: agentDir },
+        timeout: 15_000,
+      })
+      expect(result.status).toBe(0)
+      expect(result.stdout).toBe('')
+      expect(result.stderr).not.toContain('TypeError')
+    })
+  }
+
+  it('exits 0 when tool_use_id is missing or falsy', () => {
+    for (const event of [
+      { tool_name: 'Agent' },
+      { tool_name: 'Agent', tool_use_id: null },
+      { tool_name: 'Agent', tool_use_id: '', tool_response: { result: 'x' } },
+    ]) {
+      const result = runHook(POSTTOOL_SCRIPT, event)
+      expect(result.status).toBe(0)
+      expect(result.stderr).not.toContain('TypeError')
+    }
+  })
+})
+
+describe('subagent-tracker-posttool — concurrent dispatch (#3667)', () => {
+  it('promotes every row correctly when 12 posttools race on one DB', () => {
+    // A parent fanning out workers fires many PostToolUse hooks against the
+    // same registry.db within milliseconds. Each must land: SQLITE_BUSY
+    // swallowed as a lost update would silently leave rows unpromoted and
+    // back in the #3667 failure mode.
+    const ids = Array.from({ length: 12 }, (_, i) => `toolu_conc_${i}`)
+    for (const id of ids) {
+      expect(runHook(PRETOOL_SCRIPT, {
+        session_id: 's-conc',
+        tool_name: 'Agent',
+        tool_use_id: id,
+        tool_input: { subagent_type: 'worker', description: id },
+      }).status).toBe(0)
+    }
+
+    const results = ids.map((id) => runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: id,
+      tool_response: { ...PROD_ASYNC_LAUNCH_RESPONSE, agentId: id },
+    }))
+    for (const r of results) expect(r.status).toBe(0)
+
+    const db = openDb()
+    const rows = db
+      .prepare("SELECT status, background, ended_at FROM subagents WHERE id LIKE 'toolu_conc_%'")
+      .all() as Array<{ status: string; background: number; ended_at: number | null }>
+    expect(rows.length).toBe(ids.length)
+    for (const row of rows) {
+      expect(row.status).toBe('running')
+      expect(row.background).toBe(1)
+      expect(row.ended_at).toBeNull()
+    }
+  })
+
+  it('is idempotent when the same row gets several posttool invocations', () => {
+    // Repeat delivery must not flip a promoted row back, nor terminalize it.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-idem',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_idem',
+      tool_input: { subagent_type: 'worker', description: 'repeat' },
+    }).status).toBe(0)
+
+    for (let i = 0; i < 4; i++) {
+      expect(runHook(POSTTOOL_SCRIPT, {
+        tool_name: 'Agent',
+        tool_use_id: 'toolu_idem',
+        tool_response: PROD_ASYNC_LAUNCH_RESPONSE,
+      }).status).toBe(0)
+    }
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, background, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_idem') as { status: string; background: number; ended_at: number | null }
+    expect(row.status).toBe('running')
+    expect(row.background).toBe(1)
+    expect(row.ended_at).toBeNull()
+  })
+})
+
+describe('subagent-tracker-posttool — runtime-path parity (#3667)', () => {
+  // updateRow has TWO implementations of the same decision: a node:sqlite /
+  // bun:sqlite branch and a sqlite3-CLI fallback. The tests above only ever
+  // exercise the first (bun always resolves a sync binding), so a divergence
+  // in the fallback is invisible to behavioural testing — which is how it got
+  // there: the CLI copy of the conditional fell through to the TERMINAL
+  // update for any `kind` it did not enumerate, while the sync copy fell
+  // through to the non-terminal one. A future fourth kind would have
+  // terminalized live rows on the fallback runtime only.
+  //
+  // Static guard: both branches must dispatch on the shared chooseUpdate()
+  // helper, and neither may re-derive the choice from `kind` inline.
+  const SOURCE = readFileSync(POSTTOOL_SCRIPT, 'utf8')
+
+  it('defines chooseUpdate as the single source of truth for the update path', () => {
+    expect(SOURCE).toContain('function chooseUpdate(')
+    // Once for the sync branch, once for the CLI fallback — and nowhere else.
+    const callSites = SOURCE.match(/const choice = chooseUpdate\(/g) ?? []
+    expect(callSites.length).toBe(2)
+  })
+
+  it('never re-derives the update path from `kind` inside updateRow', () => {
+    const updateRowBody = SOURCE.slice(
+      SOURCE.indexOf('function updateRow('),
+      SOURCE.indexOf('// Foreground handback nudge'),
+    )
+    expect(updateRowBody.length).toBeGreaterThan(0)
+    // No comparison against a KIND_* constant may survive inside updateRow —
+    // that is exactly the duplicated conditional chooseUpdate replaced.
+    expect(updateRowBody).not.toMatch(/snapKind\s*===\s*KIND_/)
+    expect(updateRowBody).not.toMatch(/kind\s*===\s*KIND_/)
+  })
+
+  it('fails SAFE (non-terminal) for a kind neither branch enumerates', () => {
+    // chooseUpdate's contract, asserted on the source: only an explicit
+    // KIND_COMPLETION may reach the terminal update.
+    const body = SOURCE.slice(
+      SOURCE.indexOf('function chooseUpdate('),
+      SOURCE.indexOf('function chooseUpdate(') + 400,
+    )
+    expect(body).toContain("if (kind === KIND_COMPLETION) return 'foreground'")
+    // The trailing arm — everything unrecognised — must NOT be 'foreground'.
+    expect(body).toMatch(/return 'promote'\s*\n\}/)
   })
 })
 
