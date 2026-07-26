@@ -43,11 +43,11 @@ import { richMessage } from '../rich-send.js'
 import { finalizeCallback } from '../inline-keyboard-callbacks.js'
 import { retryWithThreadFallback, type RetryCallOpts } from '../retry-api-call.js'
 import {
-  mintGrantViaBroker,
-  listViaBroker,
-  listGrantsViaBroker,
+  mintGrantViaBroker as realMintGrantViaBroker,
+  listViaBroker as realListViaBroker,
+  listGrantsViaBroker as realListGrantsViaBroker,
+  vaultTokenFilePath as realVaultTokenFilePath,
   revokeGrantViaBroker,
-  vaultTokenFilePath,
 } from '../../src/vault/broker/client.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -444,6 +444,21 @@ export interface CallbackQueryHandlersDeps {
    * whose rate-window retry also failed.
    */
   emitOperatorEvent: (event: OperatorEvent) => void
+
+  /**
+   * Broker seams, injectable for tests (#3627). Production leaves these unset
+   * and gets the real `src/vault/broker/client.js` functions.
+   *
+   * Why DI and not a module mock: CI sweeps this whole test directory with
+   * `bun test`, whose `mock.module` is PROCESS-GLOBAL and irreversible — a
+   * broker-client mock registered by one file leaks into every file that runs
+   * after it. Injection keeps the seam per-suite, matching the house pattern
+   * (telegram-plugin/tests/vault-write-posture.test.ts).
+   */
+  brokerMintGrant?: typeof realMintGrantViaBroker
+  brokerList?: typeof realListViaBroker
+  brokerListGrants?: typeof realListGrantsViaBroker
+  brokerVaultTokenFilePath?: typeof realVaultTokenFilePath
 }
 
 // Freshness throttle for the /auth dashboard ↻ refresh button — one live
@@ -598,6 +613,13 @@ export function createCallbackQueryHandlers(deps: CallbackQueryHandlersDeps) {
   } = deps
   const bot = deps.bot as CallbackBotApi
   const lockedBot = deps.lockedBot as CallbackBotApi
+  // #3627: broker seams — the real client unless a test injects a fake. Bound
+  // to the ORIGINAL names so every call site below reads as a direct broker
+  // call (and the structural pins that anchor on those names keep holding).
+  const mintGrantViaBroker = deps.brokerMintGrant ?? realMintGrantViaBroker
+  const listViaBroker = deps.brokerList ?? realListViaBroker
+  const listGrantsViaBroker = deps.brokerListGrants ?? realListGrantsViaBroker
+  const vaultTokenFilePath = deps.brokerVaultTokenFilePath ?? realVaultTokenFilePath
 
 /**
  * Handle a callback_query from an auth dashboard button. Parses the
