@@ -745,6 +745,36 @@ export function combinedHistoryDepth(w: number): number {
 export const workerHistoryDepth = combinedHistoryDepth
 
 /**
+ * The combined card's first line: a SELF-CONTAINED glance at the whole swarm
+ * (#3666) — `🛠 Workers · 3 running · oldest 38m16s · 196 tools · 1.2M tok`.
+ *
+ * Two jobs, both load-bearing:
+ *
+ *   1. In the feed it answers "what is my fleet doing" without reading the
+ *      rows — the aggregate the per-row lines never showed.
+ *   2. In Telegram's pinned bar, where the card collapses to ONE line, it is
+ *      the part most likely to survive truncation, so the preview leads with
+ *      real information instead of a four-word chrome stub that ran into
+ *      row 1's ordinal (`… 3 running1. Fix issue …`).
+ *
+ * It always ends in a UNIT WORD (`running` / `oldest <elapsed>` / `tools` /
+ * `tok`), never a bare number, so the first collapse seam reads as
+ * `… · 196 tools 1. Fix issue …` — a list starting after a unit — rather than
+ * two numbers colliding. Aggregates cover ALL rows (including any spilled to
+ * `+M more working…`), matching the `N running` count beside them.
+ */
+function glanceLine(rows: CombinedWorkerRow[]): string {
+  const oldestMs = rows.reduce((m, r) => Math.max(m, r.elapsedMs), 0)
+  const tools = rows.reduce((n, r) => n + r.toolCount, 0)
+  const tok = rows.reduce((n, r) => n + (r.totalTokens ?? 0), 0)
+  const toolWord = tools === 1 ? 'tool' : 'tools'
+  return (
+    `🛠 **Workers** · _${rows.length} running · oldest ${formatFeedElapsed(oldestMs)}` +
+    ` · ${tools} ${toolWord}${tokenSegment(tok)}_`
+  )
+}
+
+/**
  * Render N≥1 live workers into ONE combined feed body (ready Telegram
  * markdown; callers send verbatim — do NOT re-escape). Layout:
  *
@@ -791,36 +821,6 @@ export const workerHistoryDepth = combinedHistoryDepth
  * until the body fits STATUS_CARD_CHAR_BUDGET, so a burst of long descriptions
  * can never overflow the wire limit. Returns null only when `rows` is empty.
  */
-/**
- * The combined card's first line: a SELF-CONTAINED glance at the whole swarm
- * (#3666) — `🛠 Workers · 3 running · oldest 38m16s · 196 tools · 1.2M tok`.
- *
- * Two jobs, both load-bearing:
- *
- *   1. In the feed it answers "what is my fleet doing" without reading the
- *      rows — the aggregate the per-row lines never showed.
- *   2. In Telegram's pinned bar, where the card collapses to ONE line, it is
- *      the part most likely to survive truncation, so the preview leads with
- *      real information instead of a four-word chrome stub that ran into
- *      row 1's ordinal (`… 3 running1. Fix issue …`).
- *
- * It always ends in a UNIT WORD (`running` / `oldest <elapsed>` / `tools` /
- * `tok`), never a bare number, so the first collapse seam reads as
- * `… · 196 tools 1. Fix issue …` — a list starting after a unit — rather than
- * two numbers colliding. Aggregates cover ALL rows (including any spilled to
- * `+M more working…`), matching the `N running` count beside them.
- */
-function glanceLine(rows: CombinedWorkerRow[]): string {
-  const oldestMs = rows.reduce((m, r) => Math.max(m, r.elapsedMs), 0)
-  const tools = rows.reduce((n, r) => n + r.toolCount, 0)
-  const tok = rows.reduce((n, r) => n + (r.totalTokens ?? 0), 0)
-  const toolWord = tools === 1 ? 'tool' : 'tools'
-  return (
-    `🛠 **Workers** · _${rows.length} running · oldest ${formatFeedElapsed(oldestMs)}` +
-    ` · ${tools} ${toolWord}${tokenSegment(tok)}_`
-  )
-}
-
 export function renderCombinedWorkerFeed(
   rows: CombinedWorkerRow[],
   opts: CombinedWorkerFeedOpts,
