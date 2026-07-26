@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from 'grammy'
@@ -535,5 +535,132 @@ describe('resolution edit failure fallback (#3627 item 2)', () => {
     // Telegram-side failure must never leak into the drain loop.
     expect(out.handled).toBe(true)
     expect(hDeps.pendingVaultRequestAccesses.has('s1')).toBe(false)
+  })
+})
+
+// ── review follow-ups: the retry loop's edges ─────────────────────────────
+
+describe('retry loop — attestation, topic routing and the token write', () => {
+  it('a POSTURE attestation never retries a mismatch-shaped error', async () => {
+    // `approvalAuth: telegram-id` mints with `{ kind: 'posture' }` — the
+    // gateway never sent a passphrase, so there is nothing for the operator
+    // to retype. A mismatch-shaped broker message on that path must stay
+    // TERMINAL; treating it as retryable would leave the stage alive with a
+    // re-prompt the operator can't satisfy.
+    const { deps: hDeps, sent } = makeHandlerDeps()
+    hDeps.pendingVaultRequestAccesses.set('s1', stagedAccess())
+    const handlers = createCallbackQueryHandlers(hDeps)
+    const { ctx, edits } = makeCtx()
+    brokerState.mintResults.push({ kind: 'error', msg: MISMATCH_MSG })
+
+    const outcome = await handlers.performVaultAccessApproval(
+      ctx,
+      stagedAccess(),
+      's1',
+      '111',
+      { kind: 'posture' },
+    )
+
+    expect(outcome.kind).toBe('failed')
+    expect(hDeps.pendingVaultRequestAccesses.has('s1')).toBe(false)
+    expect(hDeps.pendingCardStore.remove).toHaveBeenCalledWith('s1')
+    expect(sent).toHaveLength(0)
+    expect(edits.at(-1)!.text).toContain('mint_grant failed')
+  })
+
+  it('a card tapped mid-retry INHERITS the burned attempts (no free reset)', async () => {
+    // Tapping a second Approve between attempts must not hand out a fresh
+    // budget of 3. Drives the real approve callback so the queue-join branch
+    // itself is under test, not a hand-built pending op.
+    const { deps: hDeps, sent } = makeHandlerDeps()
+    hDeps.pendingVaultRequestAccesses.set('s1', stagedAccess())
+    hDeps.pendingVaultRequestAccesses.set(
+      's2',
+      stagedAccess({ key: 'coolify/api-token', card_message_id: 43 }),
+    )
+    // Two wrong entries already burned on s1.
+    armQueue(hDeps, [{ stageId: 's1', cardMessageId: 42 }], 2)
+    const handlers = createCallbackQueryHandlers(hDeps)
+    const { ctx } = makeCtx()
+
+    await handlers.handleVaultRequestAccessCallback(ctx, 'vra:approve:s2')
+
+    const joined = accessOp(hDeps.pendingVaultOps.get(CHAT))
+    expect(joined?.attempts).toBe(2)
+    expect(joined?.items.map((i) => i.stageId)).toEqual(['s1', 's2'])
+
+    // The very next wrong passphrase is the third — terminal for BOTH cards.
+    const { deps } = makeInterceptDeps(hDeps)
+    brokerState.mintResults.push({ kind: 'error', msg: MISMATCH_MSG })
+    brokerState.mintResults.push({ kind: 'error', msg: MISMATCH_MSG })
+    await interceptVault({ ctx, text: 'nope-3', chat_id: CHAT, msgId: 9 }, deps)
+
+    expect(hDeps.pendingVaultRequestAccesses.has('s1')).toBe(false)
+    expect(hDeps.pendingVaultRequestAccesses.has('s2')).toBe(false)
+    expect(hDeps.pendingVaultOps.get(CHAT)).toBeUndefined()
+    // The join prompt is the only send — no retry prompt after the lockout.
+    expect(sent.filter((s) => s.text.includes('attempts remaining'))).toHaveLength(0)
+  })
+
+  it('routes the retry prompt into the card’s forum topic', async () => {
+    // A batch re-prompt posted to General while the card sits in a busy topic
+    // is the same "operator never sees it" failure #3627 item 1 closes.
+    const { deps: hDeps, sent } = makeHandlerDeps()
+    hDeps.pendingVaultRequestAccesses.set('s1', stagedAccess({ threadId: 77 }))
+    hDeps.pendingVaultOps.set(CHAT, {
+      kind: 'passphrase-for-access-approve',
+      items: [{ stageId: 's1', cardChatId: CHAT, cardMessageId: 42, senderId: '111', threadId: 77 }],
+      startedAt: Date.now(),
+    })
+    const { deps } = makeInterceptDeps(hDeps)
+    const { ctx } = makeCtx()
+    brokerState.mintResults.push({ kind: 'error', msg: MISMATCH_MSG })
+
+    await interceptVault({ ctx, text: 'wrong', chat_id: CHAT, msgId: 7 }, deps)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.threadId).toBe(77)
+  })
+
+  it('the CACHED-passphrase tap re-prompts, and survives a card with no message id', async () => {
+    // The Approve tap with a live (but wrong) cached passphrase never reaches
+    // interceptVault, so it has its own mismatch wiring. Also exercises the
+    // `card_message_id == null` case: there is no card to edit, so the
+    // resolution has to reach the operator as a fresh message instead.
+    const { deps: hDeps, sent } = makeHandlerDeps()
+    hDeps.vaultPassphraseCache.set(CHAT, { passphrase: 'stale', expiresAt: Date.now() + 60_000 })
+    hDeps.pendingVaultRequestAccesses.set('s1', stagedAccess({ card_message_id: undefined }))
+    const handlers = createCallbackQueryHandlers(hDeps)
+    const { ctx, edits } = makeCtx()
+    brokerState.mintResults.push({ kind: 'error', msg: MISMATCH_MSG })
+
+    await handlers.handleVaultRequestAccessCallback(ctx, 'vra:approve:s1')
+
+    // Stage survives, the stale cache is dropped, and the operator is asked
+    // again with the count.
+    expect(hDeps.pendingVaultRequestAccesses.has('s1')).toBe(true)
+    expect(hDeps.vaultPassphraseCache.get(CHAT)).toBeUndefined()
+    expect(accessOp(hDeps.pendingVaultOps.get(CHAT))?.attempts).toBe(1)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.text).toContain('Wrong passphrase. 2 attempts remaining.')
+    expect(edits).toHaveLength(0)
+  })
+
+  it('writes the minted token to the injected vaultTokenFilePath', async () => {
+    // Pins the #3627 switch from an inline `homedir()` path formula to the
+    // broker client's `vaultTokenFilePath` seam: the gateway must write where
+    // the reader looks, not where `homedir()` happens to point.
+    const { deps: hDeps } = makeHandlerDeps()
+    hDeps.pendingVaultRequestAccesses.set('s1', stagedAccess())
+    armQueue(hDeps, [{ stageId: 's1', cardMessageId: 42 }])
+    const { deps } = makeInterceptDeps(hDeps)
+    const { ctx } = makeCtx()
+    brokerState.mintResults.push({ kind: 'ok', token: 'vgt_fake', id: 'vg_tok', expires_at: null })
+
+    await interceptVault({ ctx, text: 'right', chat_id: CHAT, msgId: 7 }, deps)
+
+    const path = join(tokenDir, 'worker', '.vault-token')
+    expect(existsSync(path)).toBe(true)
+    expect(readFileSync(path, 'utf-8')).toBe('vgt_fake')
   })
 })
