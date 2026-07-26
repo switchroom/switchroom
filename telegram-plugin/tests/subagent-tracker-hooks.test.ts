@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
+import { recordSubagentEnd } from '../registry/subagents-schema.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -543,6 +544,275 @@ describe('subagent-tracker-posttool', () => {
       | undefined
     expect(row?.background).toBe(0)
     expect(row?.status).toBe('completed')
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// #3667 — the PRODUCTION async-launch payload
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Every posttool test above feeds a hand-written `{ content: [...] }` or
+// `{ result: '...' }` shape. Claude Code's Agent tool has never returned
+// either of those for a dispatch: it returns a STRUCTURED object with no text
+// anywhere on it. Because the prose ACK tiers read '' from that object, the
+// hook classified 314/318 real dispatches as foreground completions and
+// stamped `status='completed', ended_at≈started_at` ~0.2s after launch, while
+// `last_activity_at` kept climbing for the worker's real lifetime.
+//
+// So these tests pin the REAL payload, captured verbatim from a live parent
+// transcript (`toolUseResult`, claude-code 2.1.219). Update it only against a
+// freshly captured transcript, never by hand.
+const PROD_ASYNC_LAUNCH_RESPONSE = {
+  isAsync: true,
+  status: 'async_launched',
+  agentId: 'aec3ddbae614f85f5',
+  description: 'Fix subagent rows terminalizing early',
+  resolvedModel: 'claude-opus-5',
+  prompt: 'Work in /share/code/switchroom. Read the repo conventions first...',
+  outputFile: '/tmp/claude-x/tasks/aec3ddbae614f85f5.output',
+  canReadOutputFile: true,
+}
+
+describe('subagent-tracker-posttool — async launch is not a completion (#3667)', () => {
+  it('leaves a still-running worker non-terminal on the production async-launch payload', () => {
+    // Pretool sees the production tool_input: NO run_in_background key (the
+    // runtime auto-backgrounds and does not echo the flag) → background=0.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667a',
+      tool_input: { subagent_type: 'worker', description: 'Fix subagent rows terminalizing early' },
+    }).status).toBe(0)
+
+    const db = openDb()
+    const before = db
+      .prepare('SELECT background, status, started_at FROM subagents WHERE id = ?')
+      .get('toolu_3667a') as { background: number; status: string; started_at: number }
+    expect(before.background).toBe(0)
+    expect(before.status).toBe('running')
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667a',
+      tool_response: PROD_ASYNC_LAUNCH_RESPONSE,
+    })
+    expect(postResult.status).toBe(0)
+
+    const after = db
+      .prepare('SELECT background, status, ended_at, last_activity_at, result_summary FROM subagents WHERE id = ?')
+      .get('toolu_3667a') as {
+        background: number
+        status: string
+        ended_at: number | null
+        last_activity_at: number
+        result_summary: string | null
+      }
+
+    // THE failure shape: a launched-but-still-running worker must not read as
+    // terminal, and must carry no end timestamp at all.
+    expect(after.status).toBe('running')
+    expect(after.ended_at).toBeNull()
+    // Promoted off the mis-recorded foreground flag, so the watcher/card path
+    // treats it as the background worker it actually is.
+    expect(after.background).toBe(1)
+    // Liveness still recorded.
+    expect(after.last_activity_at).toBeGreaterThanOrEqual(before.started_at)
+    // The launch payload embeds the whole dispatch prompt — it must never be
+    // mistaken for the worker's result.
+    expect(after.result_summary).toBeNull()
+
+    // No handback nudge: nothing has been handed back yet.
+    expect(postResult.stdout).not.toContain('additionalContext')
+  })
+
+  it('records a truthful duration when the worker actually finishes later', () => {
+    // The other half of the failure shape: `ended_at` must reflect REAL
+    // completion, not the launch ACK. After the ACK the watcher's
+    // JSONL-driven turn_end write is what terminalizes the row.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667b',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667b',
+      tool_input: { subagent_type: 'worker', description: 'Long job' },
+    }).status).toBe(0)
+
+    expect(runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667b',
+      tool_response: PROD_ASYNC_LAUNCH_RESPONSE,
+    }).status).toBe(0)
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT started_at, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_3667b') as { started_at: number; ended_at: number | null }
+    expect(row.ended_at).toBeNull()
+
+    // Watcher's terminal write, 5 minutes after dispatch. Uses the REAL
+    // recordSubagentEnd the watcher's turn_end path calls, so this test can't
+    // pass against a hand-copied approximation of it.
+    const realEnd = row.started_at + 300_000
+    recordSubagentEnd(db as unknown as Parameters<typeof recordSubagentEnd>[0], {
+      id: 'toolu_3667b',
+      endedAt: realEnd,
+      status: 'completed',
+    })
+
+    const done = db
+      .prepare('SELECT status, ended_at, started_at FROM subagents WHERE id = ?')
+      .get('toolu_3667b') as { status: string; ended_at: number; started_at: number }
+    expect(done.status).toBe('completed')
+    // The regression signature was ended_at - started_at < ~1s on a job that
+    // ran for minutes. Assert the recorded duration is the real one.
+    expect(done.ended_at - done.started_at).toBe(300_000)
+  })
+
+  it('does NOT terminalize on an unrecognised tool_response shape', () => {
+    // Drift guard: if claude-code changes the payload again, the hook must
+    // decline to guess rather than declare a live worker finished. It warns on
+    // stderr instead, and the watcher stays in charge of the terminal write.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667c',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667c',
+      tool_input: { subagent_type: 'worker', description: 'Drifted payload' },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667c',
+      tool_response: { someFutureField: 42, launchToken: 'abc' },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).not.toContain('additionalContext')
+    expect(postResult.stderr).toContain('unrecognised Agent tool_response shape')
+    // Shape only — never values (the payload can embed the dispatch prompt).
+    expect(postResult.stderr).not.toContain('abc')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at, background FROM subagents WHERE id = ?')
+      .get('toolu_3667c') as { status: string; ended_at: number | null; background: number }
+    expect(row.status).toBe('running')
+    expect(row.ended_at).toBeNull()
+    // Unknown ≠ background: we decline to guess in both directions.
+    expect(row.background).toBe(0)
+  })
+
+  it('does not read an explicitly terminal async envelope as a fresh launch', () => {
+    // Boundary: `isAsync: true` means "this dispatch is asynchronous", not
+    // "still running". If a future claude-code reuses the envelope to report an
+    // OUTCOME, promoting it to a running background row would be wrong — the
+    // hook must fall through to the drift alarm instead of claiming a launch.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667g',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667g',
+      tool_input: { subagent_type: 'worker', description: 'Terminal envelope' },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667g',
+      tool_response: { isAsync: true, status: 'completed', agentId: 'zz1' },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stderr).toContain('unrecognised Agent tool_response shape')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, background, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_3667g') as { status: string; background: number; ended_at: number | null }
+    expect(row.background).toBe(0)
+    expect(row.status).toBe('running')
+    expect(row.ended_at).toBeNull()
+  })
+
+  it('does NOT terminalize when tool_response is absent', () => {
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667d',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667d',
+      tool_input: { subagent_type: 'worker', description: 'No response' },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667d',
+    })
+    expect(postResult.status).toBe(0)
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at FROM subagents WHERE id = ?')
+      .get('toolu_3667d') as { status: string; ended_at: number | null }
+    expect(row.status).toBe('running')
+    expect(row.ended_at).toBeNull()
+  })
+
+  it('terminalizes a bare-string dispatch error as failed', () => {
+    // Also observed in production: the Agent tool returns a bare string when
+    // the dispatch itself fails, so there is no `is_error` flag to read. No
+    // worker exists, so the watcher will never terminalize this row — the hook
+    // must, and it must not call the failure a success.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667e',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667e',
+      tool_input: { subagent_type: 'worker', description: 'Doomed dispatch' },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667e',
+      tool_response:
+        'Error: Cannot create agent worktree: not in a git repository and no '
+        + 'WorktreeCreate hooks are configured.',
+    })
+    expect(postResult.status).toBe(0)
+    // A failed dispatch is not a handback.
+    expect(postResult.stdout).not.toContain('additionalContext')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at, result_summary FROM subagents WHERE id = ?')
+      .get('toolu_3667e') as { status: string; ended_at: number | null; result_summary: string | null }
+    expect(row.status).toBe('failed')
+    expect(row.ended_at).not.toBeNull()
+    expect(row.result_summary).toContain('Cannot create agent worktree')
+  })
+
+  it('still terminalizes a genuine foreground completion (control)', () => {
+    // The fix must not swing the other way: a real sync completion still ends
+    // the row, with its result summary and a handback nudge.
+    expect(runHook(PRETOOL_SCRIPT, {
+      session_id: 's-3667f',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667f',
+      tool_input: { subagent_type: 'worker', description: 'Sync task', run_in_background: false },
+    }).status).toBe(0)
+
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_3667f',
+      tool_response: { content: [{ type: 'text', text: 'All done: 3 files changed.' }] },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).toContain('additionalContext')
+
+    const db = openDb()
+    const row = db
+      .prepare('SELECT status, ended_at, background, result_summary FROM subagents WHERE id = ?')
+      .get('toolu_3667f') as {
+        status: string
+        ended_at: number | null
+        background: number
+        result_summary: string | null
+      }
+    expect(row.status).toBe('completed')
+    expect(row.ended_at).not.toBeNull()
+    expect(row.background).toBe(0)
+    expect(row.result_summary).toContain('3 files changed')
   })
 })
 

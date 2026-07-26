@@ -127,21 +127,34 @@ function spawnSqlRead(dbPath, sql, cb) {
 // Status detection
 // ---------------------------------------------------------------------------
 
+/**
+ * Terminal status for a response already classified as KIND_COMPLETION.
+ *
+ * `is_error` / `error` are the structured failure signals. The text probe
+ * catches the shape Claude Code uses for a dispatch that never produced a
+ * worker at all — a BARE STRING starting with `Error:` (observed in
+ * production: "Error: Cannot create agent worktree: not in a git
+ * repository…"), which carries no `is_error` flag because the whole
+ * tool_response IS the string. Anchored at the start so a report that merely
+ * discusses an error mid-text stays `completed`.
+ */
 function detectStatus(toolResponse) {
   if (!toolResponse) return 'completed'
   if (toolResponse.is_error === true) return 'failed'
   if (toolResponse.error != null) return 'failed'
-  // Claude Code wraps sub-agent output in { type: 'text', text: '...' } arrays;
-  // a top-level "error" key or is_error flag means the tool itself failed.
+  if (/^\s*Error:/.test(toolResponseText(toolResponse))) return 'failed'
   return 'completed'
 }
 
 function extractResultSummary(toolResponse) {
   if (!toolResponse) return null
-  // Claude Code's Agent tool wraps text in `content: [{ type: 'text', text }]`.
-  // Try that first since it's the actual production shape.
-  if (Array.isArray(toolResponse.content)) {
-    const textPart = toolResponse.content.find(
+  // Claude Code's Agent tool wraps text in `content: [{ type: 'text', text }]`,
+  // and some versions hand the hook that content array unwrapped.
+  const blocks = Array.isArray(toolResponse)
+    ? toolResponse
+    : (Array.isArray(toolResponse.content) ? toolResponse.content : null)
+  if (blocks != null) {
+    const textPart = blocks.find(
       (c) => c && typeof c === 'object' && c.type === 'text' && typeof c.text === 'string',
     )
     if (textPart) return textPart.text.slice(0, 200) || null
@@ -163,20 +176,61 @@ function extractResultSummary(toolResponse) {
  */
 function toolResponseText(toolResponse) {
   if (!toolResponse) return ''
-  if (Array.isArray(toolResponse.content)) {
-    return toolResponse.content
+  if (typeof toolResponse === 'string') return toolResponse
+  const blocks = Array.isArray(toolResponse)
+    ? toolResponse
+    : (Array.isArray(toolResponse.content) ? toolResponse.content : null)
+  if (blocks != null) {
+    return blocks
       .filter((c) => c && typeof c === 'object' && c.type === 'text' && typeof c.text === 'string')
       .map((c) => c.text)
       .join('\n')
   }
   if (typeof toolResponse.result === 'string') return toolResponse.result
   if (typeof toolResponse.output === 'string') return toolResponse.output
-  if (typeof toolResponse === 'string') return toolResponse
   return ''
 }
 
 /**
- * Detect Claude Code's async-launch ACK in a PostToolUse tool_response.
+ * DETERMINISTIC async-launch signal (#3667).
+ *
+ * Claude Code's Agent/Task tool hands PostToolUse a STRUCTURED result object
+ * for an async dispatch — verified verbatim against claude-code 2.1.219 by
+ * reading `toolUseResult` out of a live parent transcript:
+ *
+ *   { isAsync: true, status: 'async_launched', agentId: '<stem>',
+ *     description: '…', resolvedModel: '…', prompt: '…',
+ *     outputFile: '…', canReadOutputFile: true }
+ *
+ * There is NO `content` array and NO `result`/`output` string on it, so the
+ * prose tiers in isAsyncLaunchAck() below saw an EMPTY string and returned
+ * false for every real dispatch — which is exactly how ~95% of registry rows
+ * came to be terminalized ~0.2s after launch by the foreground path (#3667).
+ * Prose matching was never reached in production; these two machine-readable
+ * fields are the real signal, so they are checked FIRST and the prose tiers
+ * are demoted to a backstop.
+ */
+function isStructuredAsyncLaunch(toolResponse) {
+  if (toolResponse == null || typeof toolResponse !== 'object') return false
+  if (Array.isArray(toolResponse)) return false
+  if (toolResponse.status === 'async_launched') return true
+  // `isAsync` alone says "this dispatch is asynchronous", not "it is still
+  // running". If a future claude-code reuses the same envelope to report an
+  // async agent's OUTCOME, an explicitly terminal `status` wins — otherwise we
+  // would refuse to ever terminalize that row from the hook.
+  if (toolResponse.isAsync === true) {
+    const s = typeof toolResponse.status === 'string' ? toolResponse.status.toLowerCase() : ''
+    return !(s === 'completed' || s === 'failed' || s === 'error' || s === 'cancelled' || s === 'canceled')
+  }
+  return false
+}
+
+/**
+ * Detect Claude Code's async-launch ACK PROSE in a PostToolUse tool_response.
+ *
+ * Backstop only — see isStructuredAsyncLaunch() for the primary, structural
+ * signal. Retained because a claude-code version that drops the structured
+ * fields but still returns the ACK text must not regress to terminalizing.
  *
  * A `run_in_background` Agent/Task returns IMMEDIATELY with an
  * acknowledgement ("Async agent launched successfully … The agent is working
@@ -206,9 +260,10 @@ function toolResponseText(toolResponse) {
  *      print a bare id on its own line. This survives BOTH prose phrases
  *      (tiers 1 & 2) rewording in the same bump.
  *
- * If all three miss, promotion degrades to the pretool's input-derived flag —
- * still correct whenever the model DID pass run_in_background, never worse than
- * before. The exact ACK contract is pinned by drift-variant tests in
+ * If all three miss, classifyAgentResponse falls through to the completion /
+ * unknown split — and an unrecognised shape is NOT terminalized, so a total
+ * prose miss can no longer produce the #3667 "completed 0.2s after launch"
+ * row. The exact ACK contract is pinned by drift-variant tests in
  * subagent-tracker-hooks.test.ts ("async-launch ACK contract"); when bumping
  * the pinned claude-code version, re-verify the live ACK against those.
  *
@@ -239,6 +294,84 @@ function isAsyncLaunchAck(toolResponse) {
 }
 
 // ---------------------------------------------------------------------------
+// Response classification (#3667)
+// ---------------------------------------------------------------------------
+
+/** The dispatch was ACKed, not finished — the worker is still running. */
+const KIND_ASYNC_LAUNCH = 'async_launch'
+/** A real, recognisable end-of-life result — safe to terminalize the row. */
+const KIND_COMPLETION = 'completion'
+/** Shape we do not recognise — we know NOTHING about liveness. */
+const KIND_UNKNOWN = 'unknown'
+
+/**
+ * Does this tool_response carry a recognisable COMPLETED sub-agent result?
+ *
+ * Deliberately an allowlist of known-real shapes, never a fallthrough. The
+ * bug this replaces (#3667) came from the opposite posture: anything the hook
+ * failed to recognise was treated as a completion (`detectStatus` returned
+ * 'completed' for a null / unknown response), so one unrecognised payload
+ * shape silently poisoned `status` + `ended_at` on nearly every row.
+ */
+function hasCompletionShape(toolResponse) {
+  if (toolResponse == null) return false
+  if (typeof toolResponse === 'string') return toolResponse.length > 0
+  if (typeof toolResponse !== 'object') return false
+  if (toolResponse.is_error === true || toolResponse.error != null) return true
+  const blocks = Array.isArray(toolResponse)
+    ? toolResponse
+    : (Array.isArray(toolResponse.content) ? toolResponse.content : null)
+  if (blocks != null) {
+    return blocks.some(
+      (c) => c && typeof c === 'object' && c.type === 'text' && typeof c.text === 'string',
+    )
+  }
+  if (typeof toolResponse.result === 'string') return true
+  if (typeof toolResponse.output === 'string') return true
+  return false
+}
+
+/**
+ * Classify a PostToolUse tool_response for an Agent/Task dispatch.
+ *
+ * The whole point of the three-way split is that only KIND_COMPLETION is
+ * allowed to write a terminal row. KIND_ASYNC_LAUNCH promotes to background
+ * and KIND_UNKNOWN does nothing but bump activity — both leave the watcher's
+ * JSONL-driven `recordSubagentEnd` (turn_end / stall synthesis) as the
+ * authoritative end-of-life signal, with `reapStuckRunningRows` behind it.
+ * Failing to terminalize here is recoverable; terminalizing a live worker is
+ * not — it makes the `wk:<agentId>` reaper unpin a running worker's card and
+ * turns every duration in the registry into fiction.
+ *
+ * Accepted residual on KIND_UNKNOWN: the row keeps background = 0 (we decline
+ * to guess in that direction too), and `reapStuckRunningRows` only sweeps
+ * background = 1 rows — so a row that is BOTH unknown-shaped AND never links
+ * its JSONL would sit `running` indefinitely. The watcher's turn_end path
+ * covers any row that does link (the common case), and the stderr warning
+ * above is the alarm that gets a real fix written. That is strictly better
+ * than the alternative it replaces: silently asserting a live worker finished.
+ */
+function classifyAgentResponse(toolResponse) {
+  if (isStructuredAsyncLaunch(toolResponse)) return KIND_ASYNC_LAUNCH
+  if (isAsyncLaunchAck(toolResponse)) return KIND_ASYNC_LAUNCH
+  if (hasCompletionShape(toolResponse)) return KIND_COMPLETION
+  return KIND_UNKNOWN
+}
+
+/**
+ * One-line description of an unrecognised tool_response, for the stderr
+ * warning. Emits only the SHAPE (typeof + top-level key names) — never
+ * values, because the async payload embeds the full dispatch prompt and this
+ * line lands in journald.
+ */
+function describeShape(toolResponse) {
+  if (toolResponse == null) return 'null'
+  if (Array.isArray(toolResponse)) return `array(${toolResponse.length})`
+  if (typeof toolResponse !== 'object') return typeof toolResponse
+  return `object{${Object.keys(toolResponse).slice(0, 12).join(',')}}`
+}
+
+// ---------------------------------------------------------------------------
 // DB write
 // ---------------------------------------------------------------------------
 
@@ -249,23 +382,29 @@ function isAsyncLaunchAck(toolResponse) {
  * and last_activity_at — PostToolUse fires on actual completion.
  *
  * Background agents (background = 1): PostToolUse fires on the launch ACK
- * (~10 s), NOT on actual completion. Only bump last_activity_at and capture
- * result_summary; leave status/ended_at alone so the watcher's
+ * (measured 78-880 ms in production), NOT on actual completion. Only bump
+ * last_activity_at and capture result_summary; leave status/ended_at alone
+ * so the watcher's
  * recordSubagentEnd (driven by the JSONL turn_end event) remains the
  * authoritative end-of-life signal.
  *
- * Mis-recorded background (DB background = 0 but `asyncLaunch` is true):
+ * Mis-recorded background (DB background = 0 but `kind` is KIND_ASYNC_LAUNCH):
  * Claude Code returned the async-launch ACK even though run_in_background was
- * absent from the tool_input the pretool saw, so the row was wrongly recorded
- * foreground. PROMOTE it to background = 1 and take the background path — do
- * NOT terminalize, because the worker is still running (the ACK is a launch,
- * not a completion). This is the authoritative correction that makes the
- * gateway's worker-feed card fire (onProgress re-reads `background` per tick)
- * AND prevents the premature `completed` the foreground path would write.
+ * absent from the tool_input the pretool saw — which on claude-code 2.1.219 is
+ * EVERY dispatch, since the runtime auto-backgrounds Agent calls and never
+ * echoes the flag. PROMOTE the row to background = 1 and take the background
+ * path — do NOT terminalize, because the worker is still running (the ACK is a
+ * launch, not a completion). This is the authoritative correction that makes
+ * the gateway's worker-feed card fire (onProgress re-reads `background` per
+ * tick) AND prevents the premature `completed` the foreground path would write.
+ *
+ * Unrecognised shape (KIND_UNKNOWN): activity bump only. We cannot tell a
+ * launch from a completion, so we decline to guess and leave the watcher in
+ * charge of the terminal write (#3667).
  *
  * The done(err | null) callback is invoked after all DB operations complete.
  */
-function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done) {
+function updateRow(dbPath, { id, status, resultSummary, now, kind }, done) {
   // SQL to read the background flag so we can choose the right update path.
   const SELECT_SQL = `SELECT background FROM subagents WHERE id = ?`
 
@@ -300,7 +439,7 @@ function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done
   const snapStatus = status
   const snapResultSummary = resultSummary
   const snapNow = now
-  const snapAsyncLaunch = asyncLaunch === true
+  const snapKind = kind
 
   // Resolve a synchronous SQLite binding (node:sqlite under Node 22+,
   // bun:sqlite under bun, else null → CLI fallback). See helper docs.
@@ -322,10 +461,12 @@ function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done
         const isBackground = row != null && row.background === 1
         if (isBackground) {
           db.prepare(BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
-        } else if (snapAsyncLaunch) {
+        } else if (snapKind === KIND_ASYNC_LAUNCH) {
           db.prepare(PROMOTE_BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
-        } else {
+        } else if (snapKind === KIND_COMPLETION) {
           db.prepare(FOREGROUND_SQL).run(snapNow, snapStatus, snapResultSummary, snapNow, snapId)
+        } else {
+          db.prepare(BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
         }
         db.close()
         done(null)
@@ -341,13 +482,13 @@ function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done
     if (err) { done(err); return }
     // sqlite3 outputs "0" or "1" (or empty if row not found).
     const isBackground = bgResult === '1'
-    if (isBackground) {
+    if (isBackground || snapKind === KIND_UNKNOWN) {
       spawnSql(
         snapDbPath,
         fillPlaceholders(BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
         done,
       )
-    } else if (snapAsyncLaunch) {
+    } else if (snapKind === KIND_ASYNC_LAUNCH) {
       spawnSql(
         snapDbPath,
         fillPlaceholders(PROMOTE_BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
@@ -371,7 +512,7 @@ function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done
  * Synchronously read the `background` flag for a subagent row. Returns
  * 0 (foreground), 1 (background), or null (unknown — sync SQLite
  * unavailable, or row not found). Used to gate the foreground handback
- * nudge: a background sub-agent's PostToolUse fires on the ~10s launch
+ * nudge: a background sub-agent's PostToolUse fires on the sub-second launch
  * ACK, not on completion, so it must NOT be nudged here (the gateway's
  * subagent-watcher handles the background handback via inject_inbound).
  */
@@ -459,12 +600,23 @@ function main() {
 
   const toolResponse = event.tool_response ?? null
 
-  // Authoritative background signal: Claude Code's async-launch ACK. Trusted
-  // over the pretool's input-derived flag (which is missing whenever the
-  // model/runtime omits run_in_background from tool_input — see
-  // isAsyncLaunchAck). Gates both the nudge below and the promote path in
-  // updateRow.
-  const asyncLaunch = isAsyncLaunchAck(toolResponse)
+  // Authoritative classification of what this PostToolUse actually means:
+  // an async LAUNCH (worker still running), a real COMPLETION, or an
+  // unrecognised shape. Trusted over the pretool's input-derived background
+  // flag, which is missing whenever the runtime omits run_in_background from
+  // tool_input (claude-code 2.1.219: always). Gates both the nudge below and
+  // the update path in updateRow. See classifyAgentResponse (#3667).
+  const kind = classifyAgentResponse(toolResponse)
+  if (kind === KIND_UNKNOWN) {
+    // Loud but non-fatal: this is the drift alarm. If claude-code changes the
+    // Agent tool_response shape again, this line — not a registry full of
+    // 0.2s "completed" workers — is how we find out.
+    process.stderr.write(
+      `[subagent-tracker-posttool] unrecognised Agent tool_response shape `
+      + `(${describeShape(toolResponse)}) — leaving row non-terminal; `
+      + `watcher owns completion\n`,
+    )
+  }
 
   // conversational-pacing beat 4 (foreground half). A foreground
   // sub-agent's PostToolUse fires at real completion, mid-parent-turn,
@@ -472,13 +624,16 @@ function main() {
   // user-facing handback. Background sub-agents are gated OUT: their
   // PostToolUse fires on the launch ACK (BACKGROUND_SQL leaves status
   // untouched for that reason), and their handback is driven by the
-  // gateway's subagent-watcher onFinish path instead. A launch ACK is also
-  // gated out via `!asyncLaunch` — at this point the DB flag may still read 0
-  // (updateRow promotes it on the next tick), so the ACK is the reliable
-  // tell. Fail-silent: an unknown background flag (null) skips the nudge.
+  // gateway's subagent-watcher onFinish path instead. A launch ACK — and any
+  // unrecognised shape — is gated out via `kind === KIND_COMPLETION`: at this
+  // point the DB flag may still read 0 (updateRow promotes it on the next
+  // tick), so the classification is the reliable tell, and nudging "synthesise
+  // the handback" when nothing has been handed back is exactly the #3667
+  // symptom the parent saw. Fail-silent: an unknown background flag (null)
+  // skips the nudge.
   if (
     process.env.SWITCHROOM_SUBAGENT_HANDBACK !== '0'
-    && !asyncLaunch
+    && kind === KIND_COMPLETION
     && detectStatus(toolResponse) === 'completed'
     && readBackgroundFlagSync(dbPath, id) === 0
   ) {
@@ -492,7 +647,7 @@ function main() {
       status: detectStatus(toolResponse),
       resultSummary: extractResultSummary(toolResponse),
       now: Date.now(),
-      asyncLaunch,
+      kind,
     },
     (err) => {
       if (err) {
