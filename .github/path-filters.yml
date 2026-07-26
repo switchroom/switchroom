@@ -40,6 +40,13 @@ lint:
   - 'telegram-plugin/bun.lock'
   - 'scripts/check-*.mjs'
   - 'scripts/check-bot-api-wrapping.sh'
+  # The release asset-name contract (#3633): install.sh and the parser +
+  # verifier behind check-release-asset-names.mjs. install.sh matched NOTHING
+  # here before, so a PR that only edited the installer skipped the very guard
+  # that exists to stop it drifting from release.yml.
+  - 'install.sh'
+  - 'scripts/release-assets.mjs'
+  - 'scripts/verify-release-bundle.mjs'
   - '.github/actions/setup-switchroom/**'
   - '.github/workflows/ci-lint.yml'
   - *ws9f1-security
@@ -49,6 +56,17 @@ core:
   - 'tests/**'
   - 'telegram-plugin/**/*.ts'
   - 'scripts/build.mjs'
+  # tests/release-asset-contract.test.ts drives the real install.sh + the
+  # release-bundle verifier — changing either must re-run it. It also SPAWNS
+  # check-release-asset-names.mjs and asserts its failure text on every drift
+  # case, so that script belongs here too: `scripts/check-*.mjs` is in the
+  # `lint` filter ONLY, which would let a PR touching just that script skip
+  # the tests covering it — the same skip→pass hole this block closes for
+  # install.sh.
+  - 'install.sh'
+  - 'scripts/release-assets.mjs'
+  - 'scripts/verify-release-bundle.mjs'
+  - 'scripts/check-release-asset-names.mjs'
   - 'vitest.config.ts'
   - 'tsconfig.json'
   - 'package.json'
