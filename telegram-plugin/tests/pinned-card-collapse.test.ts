@@ -102,16 +102,27 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
 
   it('kills the exact artifacts from the report', () => {
     const collapsed = collapsePreview(body)
-    // 1. the count/ordinal collision
+    // 1. the count/ordinal collision — glance line into row 1's ordinal.
+    //    This seam is owned by the collapse separator (a worker HEADER carries
+    //    no leading indent, so nothing else separates it).
+    //    (The reported spelling was `3 running1.`; with the packed glance line
+    //    the same seam now reads `… 512.3k tok` → `1. Fix issue`, so assert on
+    //    the CURRENT last token of line 1 — an assertion on the old spelling
+    //    alone would be vacuously green.)
     expect(collapsed).not.toContain('running1.')
-    expect(collapsed).not.toMatch(/\d1\. Fix issue/)
-    // 2. the mid-word ✓ (model tag running into the step trail)
+    expect(collapsed).not.toContain('tok1.')
+    expect(collapsed).toMatch(/tok\u00A01\. Fix issue/)
+    // 2. the mid-word ✓ (model tag running into the step trail). Here the
+    //    separator and WORKER_STEP_INDENT (#3662, three U+00A0 leading a step
+    //    line) stack, hence `\u00A0+` rather than exactly one.
     expect(collapsed).not.toContain('opus 5✓')
-    expect(collapsed).toContain(`opus 5${NB}✓`)
-    // 3. the step trail running into the next step / next row
+    expect(collapsed).toMatch(/opus 5\u00A0+✓/)
+    // 3. the step trail running into the next step, and into the next row's
+    //    header (that last seam is separator-only: headers are unindented).
     expect(collapsed).not.toContain('gateway.ts→')
-    expect(collapsed).toContain(`gateway.ts${NB}→`)
+    expect(collapsed).toMatch(/gateway\.ts\u00A0+→/)
     expect(collapsed).not.toContain('search2.')
+    expect(collapsed).toContain(`search${NB}2.`)
   })
 
   it('leads with a self-contained glance that ends in a unit word, not a bare number', () => {
@@ -126,10 +137,20 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
   })
 
   it('CONTROL: the same lines joined without collapseSafe still mash (pre-fix shape)', () => {
+    // Discriminator: re-join the SAME rendered lines with the separator removed
+    // and show the collapsed preview mashes again. Without this, the assertions
+    // above could all be passing for reasons unrelated to the fix.
+    //
+    // The seams asserted here are the ones the separator alone owns: a worker
+    // HEADER line carries no leading WORKER_STEP_INDENT (#3662), so the
+    // glance→row-1 and step→next-row seams have nothing else holding them
+    // apart. (The header→step and step→step seams are separated by the indent
+    // even pre-fix, which is why they are not the control.)
     const lines = cardLines(body).map((l) => l.replace(new RegExp(NB + '$'), ''))
     const preFix = stackCardLines(lines)
     const collapsed = collapsePreview(preFix)
-    expect(collapsed).toContain('opus 5✓')
+    expect(collapsed).toContain('tok1.')
+    expect(collapsed).toContain('search2.')
     // …and the property assertion itself would have failed on it.
     expect(() => expectNoMashedSeams(preFix)).toThrow()
   })
