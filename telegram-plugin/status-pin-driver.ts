@@ -16,11 +16,18 @@
  *     `🛠 Worker` message). We NEVER send a new message to pin. This is
  *     the boundary that keeps us inside the one sanctioned exception on
  *     `chat-is-the-single-source-of-truth`.
- *   - On UNPIN we DROP THE CLAIM (clear state) EVEN IF `unpinChatMessage`
- *     throws. This is the whole point: pin state must never get stuck.
- *     The message may have been unpinned out-of-band (operator, or a
- *     crash) — re-claiming it would be more confusing than surfacing it
- *     again later, and a stuck claim would leave a permanent pin.
+ *   - On UNPIN we DROP THE CLAIM (clear state) when the unpin succeeded OR
+ *     failed TERMINALLY (`isUnpinTerminalError`: Telegram answered with a
+ *     stable 4xx — rights revoked, message/chat gone). Pin state must never
+ *     get stuck: the message may have been unpinned out-of-band (operator,
+ *     or a crash), and re-claiming it would be more confusing than surfacing
+ *     it again later.
+ *   - #3664 Defect B: a NEVER-CONFIRMED failure (`FLOOD_WAIT_ACTIVE` — a
+ *     local pre-call fail-fast — network, 5xx, retries exhausted) is the one
+ *     case we do NOT drop: the message is provably still pinned, so the claim
+ *     is RETAINED for retry. Dropping it erased both the in-memory claim and
+ *     the durable store row, orphaning a live pin nothing could ever find
+ *     again. Retention is bounded by the boot sweep's forfeit ladder.
  *   - API failures are reported via `onError` but never throw; the caller
  *     decides logging cadence.
  *
@@ -30,7 +37,7 @@
  */
 
 import type { PinState, DesiredPin, PinRightsCache } from './status-pin.js'
-import { decidePinAction, isPinRightsError } from './status-pin.js'
+import { decidePinAction, isPinRightsError, isUnpinTerminalError } from './status-pin.js'
 
 /** Minimal subset of grammy's `bot.api` the pin driver depends on.
  *  Lets tests swap in a fake without dragging in the full Bot type. */
@@ -75,8 +82,10 @@ export interface ReconcilePinArgs {
  *   - `pin`  : pins the existing message SILENTLY; on failure the claim is
  *              NOT taken (returns prevState) so the next reconcile retries
  *              rather than tracking a message it never pinned.
- *   - `unpin`: unpins best-effort and returns `null` — the claim is dropped
- *              EVEN IF the unpin throws (never leave state stuck pinned).
+ *   - `unpin`: unpins best-effort and returns `null` — the claim is dropped on
+ *              success and on a TERMINAL failure (never leave state stuck
+ *              pinned). A never-confirmed failure returns prevState so the
+ *              still-pinned message keeps a record to retry from (#3664).
  *   - `noop` : returns prevState unchanged.
  */
 export async function reconcilePin(
@@ -89,27 +98,41 @@ export async function reconcilePin(
   if (action.kind === 'unpin') {
     // Skip the unpin API call in a chat the bot can't manage pins in — the
     // call would fail with the same rights 400 and spam the log. The claim is
-    // dropped either way (below), so skipping is safe.
-    if (!args.rightsCache?.isBlocked(args.chatId)) {
-      try {
-        await args.api.unpinChatMessage(args.chatId, action.messageId)
-      } catch (err) {
-        // Symmetric with the pin path below: a permanent rights 400 on UNPIN
-        // (rights revoked mid-session after we pinned) also enters the
-        // negative cache and logs once via onPinRightsDisabled — otherwise
-        // every later unpin attempt would burn an API call and spam
-        // `status-pin unpin failed` per attempt, the exact class this cache
-        // exists to kill (#3073 review finding). Claim is dropped regardless.
-        if (args.rightsCache && isPinRightsError(err)) {
-          const firstTime = args.rightsCache.block(args.chatId)
-          if (firstTime) args.onPinRightsDisabled?.(args.chatId)
-        } else {
-          args.onError?.('unpin', err)
-        }
+    // dropped (a pin we can never unpin is not worth tracking), so skipping
+    // is safe.
+    if (args.rightsCache?.isBlocked(args.chatId)) return null
+    try {
+      await args.api.unpinChatMessage(args.chatId, action.messageId)
+    } catch (err) {
+      // Symmetric with the pin path below: a permanent rights 400 on UNPIN
+      // (rights revoked mid-session after we pinned) also enters the
+      // negative cache and logs once via onPinRightsDisabled — otherwise
+      // every later unpin attempt would burn an API call and spam
+      // `status-pin unpin failed` per attempt, the exact class this cache
+      // exists to kill (#3073 review finding). That class is terminal, so the
+      // claim is dropped below.
+      if (args.rightsCache && isPinRightsError(err)) {
+        const firstTime = args.rightsCache.block(args.chatId)
+        if (firstTime) args.onPinRightsDisabled?.(args.chatId)
+      } else {
+        args.onError?.('unpin', err)
       }
+      // #3664 Defect B: drop the claim ONLY on a TERMINAL failure — one where
+      // Telegram answered and the answer can't change (4xx ≠ 429: rights
+      // revoked, message/chat gone, bot kicked). On a NEVER-CONFIRMED failure
+      // (`FLOOD_WAIT_ACTIVE`, which is a local pre-call fail-fast; network;
+      // 5xx; retries exhausted) the message is still pinned, so we RETAIN the
+      // claim: returning prevState makes the caller keep both the in-memory
+      // claim and the durable status-pins.json row (see the non-null branch of
+      // reconcileAndPersistStatusPin), so the next reconcile, the mid-session
+      // reaper and the next-boot sweep can all retry. Dropping the last record
+      // of a pin that is provably still up is strictly worse than a claim that
+      // retries — and retention is bounded by the boot sweep's
+      // BOOT_UNPIN_MAX_ATTEMPTS forfeit ladder.
+      if (!isUnpinTerminalError(err)) return args.prevState
     }
-    // Drop the claim regardless of the unpin outcome. A stuck claim would
-    // leave a permanent pin on a crash / out-of-band unpin — the exact
+    // Unpin confirmed (or terminally rejected) — drop the claim. A stuck claim
+    // would leave a permanent pin on a crash / out-of-band unpin — the exact
     // failure this driver exists to prevent (see slot-banner-driver.ts).
     return null
   }

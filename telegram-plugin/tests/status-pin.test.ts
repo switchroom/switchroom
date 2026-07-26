@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { GrammyError } from 'grammy'
-import { decidePinAction, isPinRightsError, PinRightsCache } from '../status-pin.js'
+import { decidePinAction, isPinRightsError, isUnpinTerminalError, PinRightsCache } from '../status-pin.js'
+import { makeFloodWaitActiveError, GIVE_UP_MESSAGE } from '../retry-api-call.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState } from '../status-pin.js'
 
@@ -88,9 +89,18 @@ describe('reconcilePin (driver)', () => {
     expect(calls).toEqual([{ verb: 'unpin', messageId: 42 }])
   })
 
-  it('CRITICAL: drops the claim even when unpinChatMessage throws', async () => {
+  it('CRITICAL: drops the claim on a TERMINAL unpin failure — never stays stuck pinned', async () => {
+    // A 400 means the call REACHED Telegram and was rejected for a reason that
+    // cannot change on retry (message gone / rights). Dropping is correct.
     const errors: string[] = []
-    const { api, calls } = fakeApi({ unpinThrows: true })
+    const calls: { verb: string; messageId: number }[] = []
+    const api: PinBotApi = {
+      pinChatMessage: async () => {},
+      unpinChatMessage: async (_chat, message_id) => {
+        calls.push({ verb: 'unpin', messageId: message_id })
+        throw grammyError(400, 'Bad Request: message to unpin not found')
+      },
+    }
     const next = await reconcilePin({
       api,
       chatId: '123',
@@ -98,10 +108,73 @@ describe('reconcilePin (driver)', () => {
       desired: { pinned: false },
       onError: (phase) => errors.push(phase),
     })
-    // State MUST be cleared even though the API threw — never stay stuck pinned.
     expect(next).toBeNull()
     expect(calls).toEqual([{ verb: 'unpin', messageId: 42 }])
     expect(errors).toEqual(['unpin'])
+  })
+
+  it('#3664 Defect B: a FLOOD_WAIT_ACTIVE unpin failure RETAINS the claim (no API call was made)', async () => {
+    // FLOOD_WAIT_ACTIVE is a purely LOCAL fail-fast: the send gate refused to
+    // issue the call, so the message is provably STILL PINNED. Dropping the
+    // claim here erased the in-memory claim AND the durable store row, leaving
+    // an orphan nothing could ever find again.
+    const errors: string[] = []
+    const prev: PinState = { messageId: 42 }
+    const next = await reconcilePin({
+      api: {
+        pinChatMessage: async () => {},
+        unpinChatMessage: async () => {
+          throw makeFloodWaitActiveError(16739, Date.now() + 16739_000, null)
+        },
+      },
+      chatId: '123',
+      prevState: prev,
+      desired: { pinned: false },
+      onError: (phase) => errors.push(phase),
+    })
+    // The claim SURVIVES so the next reconcile / reaper / boot sweep retries.
+    expect(next).toEqual({ messageId: 42 })
+    expect(errors).toEqual(['unpin'])
+  })
+
+  it('#3664 Defect B: retains the claim on a never-confirmed transport failure (retries exhausted / network / 5xx)', async () => {
+    for (const err of [
+      new Error(GIVE_UP_MESSAGE),
+      new Error('fetch failed'),
+      grammyError(500, 'Internal Server Error'),
+    ]) {
+      const next = await reconcilePin({
+        api: {
+          pinChatMessage: async () => {},
+          unpinChatMessage: async () => {
+            throw err
+          },
+        },
+        chatId: '123',
+        prevState: { messageId: 42 },
+        desired: { pinned: false },
+      })
+      expect(next).toEqual({ messageId: 42 })
+    }
+  })
+
+  it('#3664 Defect B: a retained claim retries the unpin and clears once it lands', async () => {
+    let attempts = 0
+    const api: PinBotApi = {
+      pinChatMessage: async () => {},
+      unpinChatMessage: async () => {
+        attempts += 1
+        if (attempts === 1) throw makeFloodWaitActiveError(300, Date.now() + 300_000, null)
+      },
+    }
+    const common = { api, chatId: '123', desired: { pinned: false } as const }
+
+    const first = await reconcilePin({ ...common, prevState: { messageId: 42 } })
+    expect(first).toEqual({ messageId: 42 }) // retained
+
+    const second = await reconcilePin({ ...common, prevState: first })
+    expect(second).toBeNull() // flood window closed; unpin landed; claim cleared
+    expect(attempts).toBe(2)
   })
 
   it('does NOT claim a message whose pin failed (retries next reconcile)', async () => {
@@ -423,7 +496,7 @@ describe('reconcilePin — rights-aware negative cache (#3024)', () => {
     }
 
     const first = await reconcilePin({ ...common, prevState: { messageId: 21 } })
-    expect(first).toBeNull() // claim dropped regardless (drop-on-unpin contract)
+    expect(first).toBeNull() // rights 400 is TERMINAL — claim dropped (#3664)
     expect(unpinCalls).toBe(1) // it did try once
     expect(disabled).toEqual(['-1009000000007']) // logged exactly once
     expect(unpinFails).toEqual([]) // NOT routed through per-attempt onError
@@ -472,5 +545,33 @@ describe('reconcilePin — rights-aware negative cache (#3024)', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled)
     }
+  })
+})
+
+describe('isUnpinTerminalError (#3664 Defect B classifier)', () => {
+  it('treats a stable 4xx as terminal — Telegram answered, retrying cannot help', () => {
+    expect(isUnpinTerminalError(grammyError(400, 'Bad Request: message to unpin not found'))).toBe(true)
+    expect(isUnpinTerminalError(grammyError(400, 'Bad Request: chat not found'))).toBe(true)
+    expect(isUnpinTerminalError(grammyError(403, 'Forbidden: bot was kicked'))).toBe(true)
+    expect(
+      isUnpinTerminalError(
+        grammyError(400, 'Bad Request: not enough rights to manage pinned messages in the chat'),
+      ),
+    ).toBe(true)
+  })
+
+  it('treats FLOOD_WAIT_ACTIVE as NON-terminal even though it carries the 429 duck-type shape', () => {
+    const err = makeFloodWaitActiveError(16739, Date.now() + 16739_000, null)
+    expect(err.error_code).toBe(429) // the shape other cooldown gates duck-type on
+    expect(isUnpinTerminalError(err)).toBe(false)
+  })
+
+  it('treats transport failures as NON-terminal (the unpin may never have landed)', () => {
+    expect(isUnpinTerminalError(new Error(GIVE_UP_MESSAGE))).toBe(false)
+    expect(isUnpinTerminalError(new Error('fetch failed'))).toBe(false)
+    expect(isUnpinTerminalError(grammyError(500, 'Internal Server Error'))).toBe(false)
+    expect(isUnpinTerminalError(grammyError(429, 'Too Many Requests'))).toBe(false)
+    expect(isUnpinTerminalError(undefined)).toBe(false)
+    expect(isUnpinTerminalError('boom')).toBe(false)
   })
 })
