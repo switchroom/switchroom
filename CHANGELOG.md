@@ -93,6 +93,7 @@ retaggable (`promote.yml`) where npm and `/releases/latest` are not, and
 converting the workflow that also serves every PR and main push (and carries
 the `images-ok` required check) to gate the one *recoverable* leg is the
 inverse trade of the npm case. Tracked in #3685 with the candidate shapes.
+
 ### A runtime probe for the perturbed-JSON-retry patch, so a silent revert fails CI
 
 #3669 shipped the perturbed-JSON-retry patch with two of the three layers the
