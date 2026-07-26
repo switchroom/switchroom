@@ -22,7 +22,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES } from "./hindsight.js";
 
 const VENDOR = join(process.cwd(), "vendor", "hindsight-memory");
 
@@ -109,22 +108,11 @@ describe("recall budget coherence", () => {
   });
 });
 
-describe("reranker candidate budget", () => {
-  it("stays at or below the level that keeps recall off the timeout cliff", () => {
-    // Measured 2026-07-26 (see the constant's doc comment): the cross-encoder
-    // costs ~17ms per candidate on a mature bank, and reranking was 72-91% of
-    // total recall latency. At 150 candidates that is ~2.6s of pure rerank,
-    // which put overlord's recall at 3.7s idle and well past the 8s per-bank
-    // timeout under fleet concurrency — a measured 96.8% own-bank timeout
-    // rate. This ceiling is the regression guard: raising the cap back to 150
-    // reintroduces the outage, so it must be a deliberate, reviewed change.
-    expect(HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES).toBeLessThanOrEqual(50);
-  });
-
-  it("stays high enough to give the final result set real headroom", () => {
-    // Recall keeps ~12-20 final memories. A cap at or below that would make
-    // the reranker a no-op reorder of exactly the results we already had,
-    // trading a real quality signal for latency we did not need.
-    expect(HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES).toBeGreaterThanOrEqual(40);
-  });
-});
+// NOTE: a `reranker candidate budget` block pinning
+// HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES <= 50 was proposed alongside these
+// guards and dropped in review. Cutting the cap 150 -> 50 removes roughly half
+// of what actually reaches the prompt: the cap is a hard prefix slice of the
+// RRF-sorted pool (engine `memory_engine.py:4744-4754`), and on the live
+// overlord bank 28 of 61 injected memories across 8 queries came from RRF rank
+// >50, including five queries' top result. Latency tuning of this constant is
+// tracked separately and needs an answer-quality A/B first.
