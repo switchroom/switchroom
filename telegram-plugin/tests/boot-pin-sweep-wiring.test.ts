@@ -48,6 +48,20 @@ describe('boot pin sweep wiring (#3664)', () => {
     expect(readyIdx).toBeGreaterThan(assignIdx)
   })
 
+  it('routes the pin API through the asserting seam, never a raw lockedBot.api pin', () => {
+    // Salvage S1/S3: `statusPinApi()` must build on `createStatusPinApi`, which
+    // asserts the bot exists and converts a send-gate SHED into a throw. A
+    // hand-rolled `robustApiCall(() => lockedBot.api.pinChatMessage(...))`
+    // anywhere in the gateway would bypass both invariants.
+    expect(gatewaySrc).toContain('return createStatusPinApi(')
+    // Every `status-pin.*` verb is now issued from status-pin-api.ts. A raw
+    // `robustApiCall(() => lockedBot.api.unpinChatMessage(…), { verb:
+    // 'status-pin.unpin' })` reappearing here would be a driver call that
+    // skips assertBotReady + assertLanded.
+    const statusPinVerbs = gatewaySrc.match(/verb:\s*['"`]status-pin\.(?:un)?pin['"`]/g) ?? []
+    expect(statusPinVerbs).toEqual([])
+  })
+
   it('arms only from inside the startup-mutex block, never at bare module scope', () => {
     // Every arm() site must be indented (i.e. nested inside the
     // `if (isGatewayMain) { … }` startup-lock block), never a top-level

@@ -637,6 +637,7 @@ import type { HostdRequest, HostdResponse } from '../../src/host-control/protoco
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import { createBootSweepGate } from './boot-sweep-gate.js'
+import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './status-pin-api.js'
 import {
   createDmPinSweeper,
   collectDmChatIdsFromStores,
@@ -1440,6 +1441,9 @@ async function rawEditMessageChecklist(args: {
 
 const chatLock = createChatLock()
 // P0b (#2996): wrapped in initGatewayBot() once `bot` is constructed at boot.
+// The `!` is an ASSERTION, not a guarantee — a module-eval-time reader gets
+// `undefined` and tsc will not warn (#3664). Anything touching the Bot API from
+// module scope must run behind `bootPinSweepGate` / assert readiness first.
 let lockedBot!: Bot<Context>
 let botUsername = ''
 
@@ -8662,21 +8666,14 @@ function persistBannerRow(row: PersistedStatusPin | null): void {
   )
 }
 
-// The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
-// lazily so this helper can be declared alongside the state it owns.
+// The Bot API surface the pin driver needs. `lockedBot` is assigned late (in
+// initGatewayBot) so it is read lazily; createStatusPinApi also asserts it
+// exists and converts a send-gate SHED into a throw — see status-pin-api.ts.
 function statusPinApi(): PinBotApi {
-  return {
-    pinChatMessage: (chat_id, message_id, opts) =>
-      robustApiCall(
-        () => lockedBot.api.pinChatMessage(chat_id, message_id, opts),
-        { chat_id: String(chat_id), verb: 'status-pin.pin' },
-      ),
-    unpinChatMessage: (chat_id, message_id) =>
-      robustApiCall(
-        () => lockedBot.api.unpinChatMessage(chat_id, message_id),
-        { chat_id: String(chat_id), verb: 'status-pin.unpin' },
-      ),
-  }
+  return createStatusPinApi(
+    () => lockedBot as unknown as PinCapableBot | undefined,
+    robustApiCall as RobustApiSeam,
+  )
 }
 
 /**
