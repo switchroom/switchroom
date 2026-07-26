@@ -104,17 +104,38 @@ For larger tasks:
    - Charge: *find reasons this change is wrong* — correctness, missed edge
      cases, untested behavior, inconsistency with surrounding code, docs
      drift, security/data-loss risk.
-   - Output: a findings list, each with severity (high/medium/low), the
-     evidence (`file:line`), and a concrete fix.
-6. **Fix ALL findings — including lows.** A low you skip is a bug you
-   shipped. If a finding is genuinely invalid, rebut it with evidence in
-   writing; silence is not a rebuttal.
-7. **Re-review the fix.** The re-review verdict must contain, per original
-   finding: the finding ID, what changed (`file:line` of the fix), whether it
-   fully resolves the finding (`RESOLVED` / `PARTIAL` / `REBUTTED` with
-   evidence), and whether the fix introduced anything new. A bare "fixed" is
-   not a verdict.
-8. **Merge only on CI green.** No exceptions. A red or flaky CI run is a
+   - Output: a findings list, each carrying an explicit severity field —
+     `blocker` / `major` / `low`, one per finding, never omitted — plus the
+     evidence (`file:line`) and a concrete fix. The severity field is what
+     the merge gate reads, so an unlabelled finding is an invalid finding:
+     send it back for a severity rather than guessing one. A structured
+     findings tool (e.g. `ReportFindings`) already emits this shape; use it
+     rather than inventing a parallel format.
+6. **Severity gates the merge — mechanically.** Every `blocker` and `major`
+   finding is fixed before merge; those are the gate. **Lows do not block:**
+   fix a low inline only if it is a genuine one-liner, otherwise file it as a
+   follow-up issue and merge. Filing is mandatory — a low is tracked, never
+   waived. If a finding is genuinely invalid, rebut it with evidence in
+   writing; silence is not a rebuttal. Review terminates here: a reviewer
+   whose verdict is "mergeable, file the lows" is not talked into another
+   round, by you or by itself.
+7. **Re-review only a behavioural fix.** A fix commit confined to docs,
+   comments, log strings, or tests does not earn another adversarial pass —
+   read it and ship. When the fix changed behaviour, the re-review verdict
+   must contain, per original finding: the finding ID, what changed
+   (`file:line` of the fix), whether it fully resolves the finding
+   (`RESOLVED` / `PARTIAL` / `REBUTTED` with evidence), and whether the fix
+   introduced anything new. A bare "fixed" is not a verdict.
+8. **Two rounds is the cap, and it is enforced outside your judgement.**
+   Every commit answering a review round is subject-prefixed `review-fix:`
+   (or carries a `Review-Round:` trailer). `scripts/check-review-rounds.mjs`
+   counts them from git history and the `review-rounds` CI check fails a
+   third round. There is exactly one way past it: an operator adds the
+   `review-cap-override` label to the PR — a durable, visible artifact, not
+   a re-run and not a self-persuaded exception. When you hit the cap, the
+   correct move is the one the failure message names: file the remaining
+   findings as follow-up issues and merge.
+9. **Merge only on CI green.** No exceptions. A red or flaky CI run is a
    blocker to investigate, not to override.
 
 ## 5. Communicate while you work

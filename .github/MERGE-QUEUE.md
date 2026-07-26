@@ -133,9 +133,13 @@ of bug as the #2816 non-main-dispatch follow-up. Queue builds tag
   seven is produced directly by a job in its own workflow on the
   triggering event.
 - `ci-evals.yml`, `ci-full.yml`, `ci-tests-race-long.yml`,
-  `ci-claude-latest-canary.yml`, `npm-publish.yml`, `promote.yml` and
-  `release.yml` produce no required context. That is the complete
-  remainder: the seven workflows above plus these seven are all 14.
+  `ci-claude-latest-canary.yml`, `npm-publish.yml`, `promote.yml`,
+  `release.yml` and `ci-review-rounds.yml` produce no required context.
+  That is the complete remainder: the seven workflows above plus these
+  eight are all 15. `ci-review-rounds.yml` is built ruleset-ready — its
+  `review-rounds` sentinel always reports, including on `merge_group` —
+  but until an operator adds that context to ruleset 16470166 it is
+  advisory, because `--auto --squash` merges past a non-required check.
 
 ## Diagnosing a stuck queue
 

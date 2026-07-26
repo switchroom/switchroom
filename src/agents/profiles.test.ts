@@ -568,14 +568,43 @@ describe("renderDevProtocolFragment", () => {
     expect(fragment.toLowerCase()).toContain("single-concern pr");
   });
 
-  it("pins the pipeline: CI authority, fix all findings, merge on green", async () => {
+  it("pins the pipeline: CI authority, blocker/medium merge gate, merge on green", async () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
     expect(fragment.toLowerCase()).toContain("ci is the full-suite authority");
-    expect(fragment).toContain("Fix ALL findings");
+    expect(fragment).toContain("Blockers and mediums block the merge");
     expect(fragment).toContain("Merge only on CI green");
     expect(fragment.toLowerCase()).toContain("durable fixes over hack patches");
     expect(fragment.toLowerCase()).toContain("outcomes, not just code paths");
+  });
+
+  // Ken 2026-07-26: the old rule ("fix ALL findings including lows, then
+  // re-review the fix") was a loop generator by construction — an
+  // adversarial reviewer always surfaces lows, fixing lows produces a new
+  // diff, and a new diff earned another re-review. These two tests pin the
+  // termination conditions that replaced it: a severity gate, and a
+  // behaviour-scoped re-review trigger.
+  it("bounds the review loop: lows are filed, not merge-blocking", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment).toContain("lows don't");
+    expect(fragment.toLowerCase()).toContain("file a follow-up issue and merge");
+    // Tracked, not waived — filing stays mandatory.
+    expect(fragment.toLowerCase()).toContain("filing is mandatory");
+    // The unbounded phrasing must be gone, not merely reworded around it.
+    expect(fragment).not.toContain("Fix ALL findings");
+    expect(fragment).not.toContain("including lows");
+  });
+
+  it("bounds the review loop: re-review only on a behavioural fix", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment).toContain("Re-review only a behavioural fix");
+    expect(fragment.toLowerCase()).toContain(
+      "docs/comment/log/test-only commit doesn't earn one",
+    );
+    // Adversarial review itself must survive the change.
+    expect(fragment).toContain("Adversarial review of the diff");
   });
 
   it("pins the communication rules: 30s watch cap and 15 sub-agent cap", async () => {

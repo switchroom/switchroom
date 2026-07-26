@@ -21,20 +21,21 @@ How development work gets done here — orient, clarify, align, ship, communicat
 
 For tasks that are architecturally significant, cross-cutting, or ambiguous in approach:
 
-- **Design report before implementation.** Present an evidence-grounded design (what exists today with citations, what changes, why this approach) to the user and get alignment before writing the code.
+- **Design report before implementation.** Present an evidence-grounded design (what exists today with citations, what changes, why this approach) to the user and get alignment before coding.
 - **Red-team your own plan.** Adversarially review the design item by item — a per-item verdict backed by evidence, not a rubber stamp.
-- **Stage delivery.** Ship as focused, single-concern PRs rather than one omnibus change.
+- **Stage delivery.** Ship focused, single-concern PRs, not one omnibus change.
 
 ### Pipeline — how a change ships
 
 - **Branch off fresh main.** Always pull before branching.
-- **Scoped tests + lint locally; CI is the full-suite authority.** Run the tests that cover what you touched plus `npm run lint` before pushing — but the merge gate is CI green, not your local run.
-- **Adversarial review of the diff.** Every change gets reviewed as an adversary would read it: what breaks, what's untested, what's inconsistent.
-- **Fix ALL findings — including lows.** A "low" you skip is a bug you shipped. Then **re-review the fix** before calling it done.
+- **Scoped tests + lint locally; CI is the full-suite authority.** Run the tests covering what you touched plus `npm run lint` before pushing.
+- **Adversarial review of the diff.** Read every change as an adversary would: what breaks, what's untested, what's inconsistent.
+- **Blockers and mediums block the merge; lows don't** — fix a low inline if it's a one-liner, else file a follow-up issue and merge. Filing is mandatory.
+- **Re-review only a behavioural fix** — a docs/comment/log/test-only commit doesn't earn one. Prefix a fix commit `review-fix:`; two rounds is the cap, and CI enforces it.
 - **Merge only on CI green.** No exceptions, no "it's probably fine".
 - **Durable fixes over hack patches.** Fix the root cause; a workaround needs an explicit reason and a filed follow-up.
-- **Deterministic mechanisms over model-dependent behavior.** If a guarantee can be enforced by code (a check, a hook, a schema), don't leave it to prompt discipline.
-- **Tests assert outcomes, not just code paths.** A test that exercises the code but wouldn't fail on the bug is not a test.
+- **Deterministic mechanisms over model-dependent behavior.** If code can enforce a guarantee (a check, a hook, a schema), don't leave it to prompt discipline.
+- **Tests assert outcomes, not just code paths.** A test that wouldn't fail on the bug it guards is not a test.
 
 ### Communicate while you work
 
