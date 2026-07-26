@@ -169,6 +169,9 @@ export interface InboundInterceptorDeps {
     ReturnType<typeof createCallbackQueryHandlers>,
     | 'executeDeferredSecretSave'
     | 'performVaultAccessApproval'
+    // #3627: owns the per-passphrase-entry attempt counter + re-prompt /
+    // lockout decision after the broker refuses a mint as a mismatch.
+    | 'resolveAccessApprovalPassphraseMismatch'
     | 'parseGrantDuration'
     | 'grantWizardConfirm'
   >
@@ -750,10 +753,13 @@ export async function interceptVault(
         // unlocking. We captured the next message as the passphrase,
         // cache it, delete the chat copy, and resume the approve
         // flow for EVERY queued stage (#1051 — without the queue, a
-        // concurrent second tap orphaned the first stage). Wrong
+        // concurrent second tap orphaned the first stage). A wrong
         // passphrase surfaces via the broker's
-        // DENIED:passphrase-mismatch path and edits each card to the
-        // mint_grant-failed message (see performVaultAccessApproval).
+        // DENIED:passphrase-mismatch path; #3627 keeps those stages
+        // ALIVE and re-prompts with the attempts remaining (counted per
+        // passphrase ENTRY, since this one entry drains the whole batch)
+        // until MAX_VAULT_PASSPHRASE_ATTEMPTS, then falls back to the
+        // terminal card edit.
         const passphrase = p.text.trim()
         if (!passphrase) {
           await deps.switchroomReply(p.ctx, 'Passphrase cannot be empty. Ask the agent to re-issue the request card.', { html: true })
@@ -767,6 +773,11 @@ export async function interceptVault(
         // grows monotonically (item 1 mints grant for [keyA]; item 2
         // lists, finds [keyA], unions with keyB → mints [keyA, keyB]).
         // Parallel processing would race on the list-and-merge.
+        // #3627: stages the broker refused as a passphrase MISMATCH. They
+        // are still staged and their cards still say "waiting" — collected
+        // here so one re-prompt covers the whole batch.
+        const mismatched: typeof pendingVault.items = []
+        let mismatchMsg = ''
         for (const item of pendingVault.items) {
           const stagedAccess = deps.pendingVaultRequestAccesses.get(item.stageId)
           if (!stagedAccess) {
@@ -783,7 +794,19 @@ export async function interceptVault(
               .catch(() => {})
             continue
           }
-          await deps.callbackQueryHandlers().performVaultAccessApproval(p.ctx, stagedAccess, item.stageId, item.senderId, { kind: 'passphrase', passphrase })
+          const outcome = await deps.callbackQueryHandlers().performVaultAccessApproval(p.ctx, stagedAccess, item.stageId, item.senderId, { kind: 'passphrase', passphrase })
+          if (outcome?.kind === 'passphrase-mismatch') {
+            mismatched.push(item)
+            mismatchMsg = outcome.msg
+          }
+        }
+        if (mismatched.length > 0) {
+          await deps.callbackQueryHandlers().resolveAccessApprovalPassphraseMismatch(p.ctx, {
+            chat_id: p.chat_id,
+            failed: mismatched,
+            priorAttempts: pendingVault.attempts ?? 0,
+            brokerMsg: mismatchMsg,
+          })
         }
       } else if (pendingVault.kind === 'grant-wizard' && pendingVault.awaitingCustomDuration) {
         // Issue #227: custom duration text reply for grant wizard

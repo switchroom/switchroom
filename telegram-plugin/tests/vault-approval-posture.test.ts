@@ -101,7 +101,12 @@ describe('handleVaultRequestAccessCallback — posture branch', () => {
   it('passphrase-mode branch unchanged: cache lookup + prompt still present', () => {
     const approveBlock = sliceAccessApproveBlock()
     expect(approveBlock).toMatch(/vaultPassphraseCache\.get\(pending\.chat_id\)/)
-    expect(approveBlock).toMatch(/Reply with your passphrase/i)
+    // #3627: the prompt COPY moved into the shared
+    // `buildAccessPassphrasePromptText` builder (so the first prompt and the
+    // wrong-passphrase re-prompt can't drift). The passphrase-mode branch
+    // must still route into it.
+    expect(approveBlock).toMatch(/sendAccessPassphrasePrompt\(/)
+    expect(gatewaySrc).toMatch(/Reply with your passphrase/i)
     expect(approveBlock).toMatch(/passphrase-for-access-approve/)
     // Pinned: the queued-drain path passes the typed passphrase via
     // the new attestation shape `{ kind: 'passphrase', passphrase }`.
