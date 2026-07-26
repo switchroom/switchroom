@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.19.20 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
+## v0.19.21 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
 
 ### LiteLLM paired timeout budgets are now DERIVED, and drift is detected
 
@@ -189,6 +189,46 @@ retaggable (`promote.yml`) where npm and `/releases/latest` are not, and
 converting the workflow that also serves every PR and main push (and carries
 the `images-ok` required check) to gate the one *recoverable* leg is the
 inverse trade of the npm case. Tracked in #3685 with the candidate shapes.
+
+### The completeness gate's own tag binding — why this release is v0.19.21, not v0.19.20 (#3691)
+
+`v0.19.20` was tagged, built and **never shipped**. It is a dead tag: the
+GitHub Release is a permanent draft (with all five assets correctly attached)
+and nothing was ever published to npm. This is the release it was meant to be,
+cut fresh off a fixed `main`.
+
+The guard shipped above mis-wired itself. In `release.yml`'s `publish` job, the
+"attach binaries" step bound the tag as `TAG:`, while the assertion it invokes
+three lines later, `scripts/ci/assert-release-assets-complete.mjs:116`, reads
+`process.env.EXPECT_TAG` and exits 1 on empty. So on a completely healthy
+release — four binaries and a checksums file uploaded, `gh release upload`
+green — the gate exited 1 with `EXPECT_TAG is required`, and the step's own
+error handler misreported it as `assets are still missing from  after upload`
+(the tag interpolating to the empty string it never had). `publish` went red,
+`npm` and `finalize` never ran, and the release stayed a draft.
+
+That is the *designed* failure direction — nothing half-shipped, and
+`/releases/latest` kept serving the previous complete release — but it fired on
+a release that was whole. The blame is entirely inside this feature: the step
+was authored with `TAG` in #3665, and the assertion that reads `EXPECT_TAG` was
+added by #3686. The "a `v*` tag cannot half-ship" work shipped its own guard
+disconnected from the thing it guards.
+
+- **Every step in `release.yml` that invokes the gate now binds `EXPECT_TAG`** —
+  `guard`, `publish`, `images-gate` and `finalize`, one name across the file
+  (`npm-publish.yml` already bound it in both of its own gates).
+- **Rule R10 in `tests/release-pipeline-gating.test.ts` makes it structural.**
+  Any step in either workflow that runs `assert-release-assets-complete.mjs`
+  without a non-empty `EXPECT_TAG` in scope now fails CI. R7 already asserted
+  the gate is *called*, and called early enough; R10 asserts it is *wired*.
+  A binding inherited from the job's `env:` satisfies it; a blank value does
+  not. The v0.19.20 regression itself is one of the mutation cases.
+
+Worth stating plainly, because a re-dispatch was the obvious reflex and it
+cannot work: `workflow_dispatch` executes the workflow YAML **at the dispatched
+ref**, so `gh workflow run release.yml --ref v0.19.20` re-runs the broken file.
+When the defect lives in the tag's own tree, the only path is a fix on `main`
+and a fresh tag.
 
 ### A runtime probe for the perturbed-JSON-retry patch, so a silent revert fails CI
 
