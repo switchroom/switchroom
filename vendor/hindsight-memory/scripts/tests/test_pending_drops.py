@@ -253,9 +253,9 @@ class EvictionTest(_QueueTempDirMixin, unittest.TestCase):
     def test_eviction_is_logged_to_the_ledger(self):
         """Eviction is not silent loss, but it IS loss -- doctor reads this."""
         pending.MAX_ENTRIES = 1
-        pending.enqueue(_payload(doc="d0"), RuntimeError("x"))
+        pending.enqueue(_payload(content="m0", doc="d0"), RuntimeError("x"))
         with redirect_stderr(io.StringIO()):
-            pending.enqueue(_payload(doc="d1"), RuntimeError("x"))
+            pending.enqueue(_payload(content="m1", doc="d1"), RuntimeError("x"))
         with open(pending.evictions_log_path(), encoding="utf-8") as f:
             line = f.read().strip()
         self.assertIn("evicted=", line)
@@ -290,7 +290,9 @@ class EvictionTest(_QueueTempDirMixin, unittest.TestCase):
             with unittest.mock.patch.object(pending.time, "time", lambda: next(clock)):
                 with redirect_stderr(io.StringIO()):
                     paths = [
-                        pending.enqueue(_payload(doc=f"d{i}"), RuntimeError("x"))
+                        pending.enqueue(
+                            _payload(content=f"m{i}", doc=f"d{i}"), RuntimeError("x")
+                        )
                         for i in range(5)
                     ]
             evicted_names = [os.path.basename(p) for p in paths[:-1]]
@@ -320,9 +322,9 @@ class EvictionTest(_QueueTempDirMixin, unittest.TestCase):
         prev = (pending.EVICTIONS_LOG_MAX_BYTES, pending.EVICTIONS_LOG_KEEP_LINES)
         pending.EVICTIONS_LOG_MAX_BYTES, pending.EVICTIONS_LOG_KEEP_LINES = 1, 3
         try:
-            pending.enqueue(_payload(doc="d0"), RuntimeError("x"))
+            pending.enqueue(_payload(content="m0", doc="d0"), RuntimeError("x"))
             with redirect_stderr(io.StringIO()):
-                pending.enqueue(_payload(doc="d1"), RuntimeError("x"))
+                pending.enqueue(_payload(content="m1", doc="d1"), RuntimeError("x"))
         finally:
             pending.EVICTIONS_LOG_MAX_BYTES, pending.EVICTIONS_LOG_KEEP_LINES = prev
 
@@ -476,13 +478,340 @@ class DedupeTest(_QueueTempDirMixin, unittest.TestCase):
         pending.enqueue(_payload(bank="bank-b", content="same"), RuntimeError("x"))
         self.assertEqual(pending.count(), 2)
 
-    def test_entry_without_document_id_is_always_kept(self):
-        """No document_id => identity cannot be established => never merge."""
+    def test_entry_without_content_is_always_kept(self):
+        """No content => identity cannot be established => never merge.
+
+        This used to key off ``document_id``. It does not any more
+        (switchroom #3688): the id varies per enqueue for the producer that
+        dominates this queue, so it was never a usable identity. Content is.
+        """
         p = _payload()
-        p.pop("document_id")
+        p.pop("content")
         pending.enqueue(dict(p), RuntimeError("x"))
         pending.enqueue(dict(p), RuntimeError("x"))
         self.assertEqual(pending.count(), 2)
+
+    def test_entry_without_document_id_still_dedupes_on_content(self):
+        """The id is not required for identity — the content carries it."""
+        p = _payload(content="same")
+        p.pop("document_id")
+        a = pending.enqueue(dict(p), RuntimeError("x"))
+        b = pending.enqueue(dict(p), RuntimeError("x"))
+        self.assertEqual(a, b)
+        self.assertEqual(pending.count(), 1)
+
+    def test_same_content_under_a_fresh_document_id_is_ONE_entry(self):
+        """THE bug (switchroom #3688), pinned as an outcome.
+
+        Measured on the live fleet 2026-07-26: 1,060 queued files, ~368
+        distinct ``(bank_id, part_position, sha256(content))`` groups. The top
+        group held
+        32 files carrying ONE byte-identical 45,000-char part under 32
+        DIFFERENT document ids, because ``subagent_retain.py`` stamps the
+        sub-agent's own session id into the id
+        (``{parent}-sub-{agent_id}-r{start}-{end}``) and every SubagentStop
+        mints a new one. With ``document_id`` in the dedupe key not one of
+        those 32 matched, so the queue refilled itself faster than it
+        drained and the same LLM extraction was paid for 32 times.
+
+        Restore ``document_id`` to ``_dupe_key`` and this goes red.
+        """
+        parent = "34c4bbeb-f805-4dd3-b085-46ac2eb57ae9"
+        slice_ids = f"r{_uuid(7)}-{_uuid(8)}"
+        content = "the same sub-agent work log, byte for byte" * 50
+        for agent_id in ("aa2170a03a351e0", "a8857997182e1e9", "a836dfc39b5eb94"):
+            pending.enqueue(
+                _payload(content=content, doc=f"{parent}-sub-{agent_id}-{slice_ids}"),
+                RuntimeError("timed out"),
+            )
+        self.assertEqual(
+            pending.count(),
+            1,
+            "re-enqueuing identical content under a fresh document_id must be "
+            "a no-op, not a new queue entry",
+        )
+
+    def test_the_surviving_entry_keeps_a_usable_document_id(self):
+        """Dedupe must not leave an entry the drain cannot act on."""
+        doc = _cd_doc(3)
+        pending.enqueue(_payload(content="c", doc=doc), RuntimeError("x"))
+        pending.enqueue(_payload(content="c", doc=_cd_doc(4)), RuntimeError("x"))
+        (_, entry), = pending.iter_entries()
+        self.assertEqual(entry["document_id"], doc, "the FIRST entry survives")
+        self.assertTrue(pending.is_content_derived_document_id(entry["document_id"]))
+
+    def test_identical_parts_of_ONE_split_are_never_merged(self):
+        """The parts of a split are positions, not copies.
+
+        ``split_retain_content`` cuts on a character bound, so repetitive
+        content yields byte-identical parts. Merging them would leave the
+        document missing every position but one — content loss, not a
+        redundant copy. Drop ``_part_position`` from the key and this goes
+        red: 10 parts collapse to 1.
+        """
+        pending.MAX_ENTRIES = 20
+        pending.MAX_BYTES = 10**9
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        try:
+            pending.enqueue(
+                _payload(content="z" * 30_000, doc=_cd_doc(5)), RuntimeError("x")
+            )
+        finally:
+            os.environ.pop("HINDSIGHT_RETAIN_MAX_CONTENT_CHARS", None)
+
+        entries = [e for _p, e in pending.iter_entries()]
+        self.assertEqual(len(entries), 10, "one queued entry per position")
+        self.assertEqual(
+            len({e["content"] for e in entries}),
+            1,
+            "fixture check: the parts really are byte-identical",
+        )
+
+    def test_the_same_position_under_a_GROWING_total_still_dedupes(self):
+        """The measured 32x group carried -p7of15, -p7of16 and -p7of18.
+
+        The enclosing transcript kept growing between SubagentStops while
+        part 7 itself did not change. Key on the total as well as the index
+        and that group splits three ways and collapses nothing.
+        """
+        base = _cd_doc(6)
+        for total in (15, 16, 18):
+            pending.enqueue(
+                _payload(content="part-seven", doc=f"{base}-p7of{total}"),
+                RuntimeError("x"),
+            )
+        self.assertEqual(pending.count(), 1, "one memory, one queue entry")
+
+    def test_a_part_position_is_read_off_the_id_not_the_metadata(self):
+        """Entries queued by older builds may carry no part metadata."""
+        self.assertEqual(pending._part_position({"document_id": "abc"}), "")
+        self.assertEqual(pending._part_position({"document_id": "abc-p7of16"}), "7")
+        self.assertEqual(
+            pending._part_position({"document_id": "abc-p2of5-p1of2"}),
+            "2.1",
+            "innermost split reads last",
+        )
+        self.assertEqual(pending._part_position({"document_id": None}), "")
+
+
+class CollapseDuplicatesTest(_QueueTempDirMixin, unittest.TestCase):
+    """``collapse_duplicates`` — the other half of content-keyed identity.
+
+    ``enqueue``'s filename key stops NEW duplicates. It cannot touch the
+    ones already on disk: those were written with the old id-bearing key, so
+    a fresh enqueue of their content computes a different key and never
+    matches them. This pass recomputes identity from CONTENT, which makes it
+    generation-agnostic, and the backlog drain runs it before spending a
+    single LLM call.
+    """
+
+    def _duplicate_names(self):
+        try:
+            return sorted(os.listdir(pending.duplicate_dir()))
+        except OSError:
+            return []
+
+    def _write_legacy(self, name, content, bank="bank-a", doc=None, attempts=1):
+        """Write an entry the way an OLDER build would have named it.
+
+        ``<unix-ms>-<uuid>.json`` with no key segment at all — the shape
+        that predates #3596 — so nothing about the filename can be doing
+        the identity work in these cases.
+        """
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        entry = dict(_payload(bank=bank, content=content, doc=doc or _cd_doc(1)))
+        entry["attempt_count"] = attempts
+        p = os.path.join(self._dir, name)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(entry, f)
+        return p
+
+    def test_duplicates_collapse_to_one_live_entry(self):
+        for i in range(5):
+            self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i}.json", "same-memory")
+        self.assertEqual(pending.count(), 5)
+
+        with redirect_stderr(io.StringIO()):
+            collapsed = pending.collapse_duplicates()
+
+        self.assertEqual(collapsed, 4)
+        self.assertEqual(pending.count(), 1)
+
+    def test_collapse_archives_the_losers_and_never_deletes_them(self):
+        for i in range(3):
+            self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i}.json", "same-memory")
+
+        with redirect_stderr(io.StringIO()):
+            pending.collapse_duplicates()
+
+        archived = self._duplicate_names()
+        self.assertEqual(len(archived), 2, "losers are MOVED, not removed")
+        for name in archived:
+            with open(os.path.join(pending.duplicate_dir(), name)) as f:
+                self.assertEqual(json.load(f)["content"], "same-memory")
+
+    def test_the_copy_with_the_fewest_attempts_survives(self):
+        """Durability-first survivor selection.
+
+        Every copy carries identical content, so any of them delivers the
+        same memory — but only the one with attempts left can still get
+        there before MAX_ATTEMPTS. Keeping the OLDEST outright would
+        systematically keep the most-attempted copy, which is backwards.
+        """
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", attempts=4)
+        keep = self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "same", attempts=1)
+        self._write_legacy("0000000003000-aaaaaaaaaaa2.json", "same", attempts=3)
+
+        with redirect_stderr(io.StringIO()):
+            pending.collapse_duplicates()
+
+        survivors = [p for p, _ in pending.iter_entries()]
+        self.assertEqual(survivors, [keep])
+
+    def test_distinct_memories_are_never_collapsed(self):
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "memory-one")
+        self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "memory-two")
+        self._write_legacy("0000000003000-aaaaaaaaaaa2.json", "memory-three")
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 0)
+        self.assertEqual(pending.count(), 3)
+
+    def test_identical_parts_of_ONE_split_are_never_collapsed(self):
+        """The backlog is full of split parts; do not eat a document's tail.
+
+        A legacy 3-part entry whose parts happen to be byte-identical must
+        survive the sweep intact. Only the position keeps them apart.
+        """
+        base = _cd_doc(2)
+        for i in range(1, 4):
+            self._write_legacy(
+                f"000000000{i}000-aaaaaaaaaaa{i}.json",
+                "zzz",
+                doc=f"{base}-p{i}of3",
+            )
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 0)
+        self.assertEqual(pending.count(), 3, "every position kept")
+        self.assertEqual(self._duplicate_names(), [], "nothing archived")
+
+    def test_the_same_position_from_different_runs_IS_collapsed(self):
+        """The complement: same index, different totals and ids -> one entry."""
+        for i, total in enumerate((15, 16, 18), start=1):
+            self._write_legacy(
+                f"000000000{i}000-aaaaaaaaaaa{i}.json",
+                "zzz",
+                doc=f"{_cd_doc(i)}-p7of{total}",
+            )
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 2)
+        self.assertEqual(pending.count(), 1)
+
+    def test_same_content_in_different_banks_is_never_collapsed(self):
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", bank="bank-a")
+        self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "same", bank="bank-b")
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 0)
+        self.assertEqual(pending.count(), 2)
+
+    def test_entries_without_content_are_never_grouped(self):
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        for i in range(2):
+            p = os.path.join(self._dir, f"{1000 + i:013d}-aaaaaaaaaaa{i}.json")
+            e = dict(_payload())
+            e.pop("content")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(e, f)
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 0)
+        self.assertEqual(pending.count(), 2)
+
+    def test_an_unarchivable_duplicate_stays_queued_and_is_not_counted(self):
+        """Archiving never falls back to a delete, and never over-reports."""
+        for i in range(3):
+            self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i}.json", "same")
+
+        with unittest.mock.patch.object(
+            pending.shutil, "move", side_effect=OSError("ENOSPC")
+        ):
+            with redirect_stderr(io.StringIO()) as err:
+                collapsed = pending.collapse_duplicates()
+
+        self.assertEqual(collapsed, 0, "a retire that did not happen is not counted")
+        self.assertEqual(pending.count(), 3, "the entries are STILL QUEUED")
+        self.assertIn("STAYS QUEUED", err.getvalue())
+
+    def test_the_duplicate_archive_is_itself_bounded(self):
+        prev = pending.DUPLICATE_MAX_ENTRIES
+        pending.DUPLICATE_MAX_ENTRIES = 2
+        try:
+            for i in range(6):
+                self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i}.json", "same")
+            with redirect_stderr(io.StringIO()):
+                pending.collapse_duplicates()
+            self.assertLessEqual(len(self._duplicate_names()), 2)
+        finally:
+            pending.DUPLICATE_MAX_ENTRIES = prev
+
+    def test_the_backlog_drain_collapses_before_paying_for_extraction(self):
+        """The user-visible outcome: one memory costs ONE extraction.
+
+        Thirty-two byte-identical copies is what the live queue actually
+        held. At the measured ~168 s per phase-2 extraction, draining them
+        all is ~90 minutes of shared LLM lane time to persist one memory.
+        """
+        for i in range(32):
+            self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i:02d}.json", "one-memory")
+
+        posted = []
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: bool(posted)
+        ):
+            with unittest.mock.patch.object(
+                drain_pending,
+                "_retry_one",
+                lambda e, timeout: posted.append(e["document_id"]),
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertEqual(summary["collapsed"], 31)
+        self.assertEqual(len(posted), 1, "one memory must cost exactly one retain")
+        self.assertEqual(pending.count(), 0)
+
+    def test_the_in_hook_drain_does_not_collapse(self):
+        """The SessionStart drain's contract is a hard latency ceiling.
+
+        Collapsing reads every queued entry to recompute identity from
+        content; that belongs out of hook. New duplicates cannot accumulate
+        in-hook anyway — ``enqueue``'s filename key stops those.
+        """
+        for i in range(4):
+            self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i}.json", "same")
+
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: None
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_retry_one", lambda e, timeout: None
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["collapsed"], 0)
+        self.assertEqual(len(self._duplicate_names()), 0)
+
+    def test_a_dry_run_collapses_nothing(self):
+        for i in range(3):
+            self._write_legacy(f"{1000 + i:013d}-aaaaaaaaaaa{i}.json", "same")
+        with redirect_stderr(io.StringIO()):
+            summary = drain_pending.drain_backlog(CONFIG, dry_run=True)
+        self.assertEqual(summary["collapsed"], 0)
+        self.assertEqual(pending.count(), 3)
 
 
 class DropLedgerTest(_QueueTempDirMixin, unittest.TestCase):

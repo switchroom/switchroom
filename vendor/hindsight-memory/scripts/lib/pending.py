@@ -70,8 +70,8 @@ bounds disk only to within ~1500x; hence ``MAX_BYTES``. Retain fires
 every 3rd turn and the busiest agent queues ~100 entries/day, so 2000
 entries is ~3 weeks of total upstream outage headroom.
 
-Deduplication
--------------
+Deduplication — the identity is (bank, part position, content)
+--------------------------------------------------------------
 ``reconcile_tail`` re-enqueues the same transcript slice on every boot
 until its watermark is confirmed, so a stalled upstream multiplied one
 memory into dozens of identical files. (The measured 63% / 84.7 MB
@@ -81,9 +81,47 @@ no size index. What follows is the *preventive* guard that stops the
 duplicates accumulating in the first place — a different mechanism, and
 it does not get the credit for that number.)
 
-Same bank + same content-derived ``document_id`` + same content is the
-same memory — the daemon would upsert them onto one document anyway — so
-``enqueue()`` returns the existing path instead of writing a copy.
+**Same bank + same position in a split + byte-identical content is the
+same memory.** The key is ``(bank_id, part_position, sha256(content))``;
+the rest of ``document_id`` is deliberately NOT in it (switchroom #3688).
+Including the whole id made the guard a near-no-op against the producer
+that actually fills this queue: ``subagent_retain.py`` embeds the
+sub-agent's own session id in the document id
+(``{parent}-sub-{agent_id}-r{start}-{end}``), so every SubagentStop
+re-queues a near-identical slice of the SAME parent transcript under a
+FRESH id. Measured on this fleet 2026-07-26: 1,060 queued files across 11
+agents collapsing to ~368 ``(bank_id, part_position, sha256(content))``
+groups (~65% duplicates, top group 32x — 32 distinct document ids over
+one byte-identical 45,000-char part). Keyed with the whole id, the guard
+matched none of them.
+
+The part position (the ``-p{i}of{n}`` index, total discarded) stays in
+the key because a split's parts are not guaranteed to differ from one
+another — repetitive content cut on a character bound yields identical
+parts — and merging those would leave the document missing positions
+upstream. That is content loss, not a redundant copy, so it is not part
+of the trade below. See :func:`_part_position`.
+
+WHAT THIS COSTS, stated exactly. Two *different* documents whose content
+happens to be byte-identical for one part now collapse onto one queue
+entry, so the loser's document can end up missing that part upstream.
+That is a real difference and it is the accepted trade, because the thing
+this queue exists to protect is the MEMORY, not the container: the
+surviving entry carries byte-identical content into the SAME bank, so no
+text and no extractable fact is lost — only the second copy of it. The
+alternative is the measured status quo, where identical text is extracted
+by the LLM 32 times over, at ~168 s a part, for one memory. Collapsing is
+also reversible: ``collapse_duplicates()`` MOVES the loser into the
+bounded ``pending-duplicate/`` archive rather than deleting it.
+
+The filename key only protects entries queued by THIS build. Entries
+already on disk carry the old id-bearing key, so a new enqueue of their
+content computes a different key and never matches them — the safe
+direction (a missed dedupe costs a file, a false one would cost a
+memory), but it leaves the accumulated backlog duplicated.
+``collapse_duplicates()`` closes that: it recomputes the key from CONTENT
+for every live entry, so it is generation-agnostic, and the drain runs it
+before doing any work.
 
 The dedupe key is carried IN THE FILENAME
 (``<unix-ms>-<key>-<uuid>.json``), so a lookup is a prefix match over the
@@ -203,6 +241,16 @@ RECONCILED_MAX_ENTRIES = int(
 )
 RECONCILED_MAX_BYTES = int(
     os.environ.get("HINDSIGHT_PENDING_RECONCILED_MAX_BYTES") or (64 * 1024 * 1024)
+)
+# ``collapse_duplicates`` retires the losing copies here, on the same terms
+# as the other two archives: a collapsed duplicate is byte-identical to an
+# entry that is STILL QUEUED, so this archive is the most redundant of the
+# three — but it is still a MOVE, never a delete.
+DUPLICATE_MAX_ENTRIES = int(
+    os.environ.get("HINDSIGHT_PENDING_DUPLICATE_MAX_ENTRIES") or 500
+)
+DUPLICATE_MAX_BYTES = int(
+    os.environ.get("HINDSIGHT_PENDING_DUPLICATE_MAX_BYTES") or (64 * 1024 * 1024)
 )
 MAX_ATTEMPTS = 5
 
@@ -360,6 +408,13 @@ def reconciled_dir() -> str:
     """
     return os.environ.get("HINDSIGHT_PENDING_RECONCILED_DIR") or _sibling(
         "pending-reconciled"
+    )
+
+
+def duplicate_dir() -> str:
+    """Archive directory for entries retired by ``collapse_duplicates``."""
+    return os.environ.get("HINDSIGHT_PENDING_DUPLICATE_DIR") or _sibling(
+        "pending-duplicate"
     )
 
 
@@ -530,6 +585,96 @@ def archive_reconciled(path: str) -> Optional[str]:
     return dest
 
 
+def archive_duplicate(path: str) -> Optional[str]:
+    """Retire a REDUNDANT queue entry into ``pending-duplicate/``.
+
+    Used only by ``collapse_duplicates()``, and only for an entry whose
+    ``(bank_id, part_position, sha256(content))`` twin is still queued. Like
+    ``archive_reconciled`` this MOVES rather than deletes — the survivor is
+    evidence, not proof, that the content will land, and this module never
+    turns evidence into an irreversible delete.
+
+    Returns the destination path, or ``None`` when the entry could NOT be
+    retired — in which case it is still queued and untouched, and the
+    caller must not count it as collapsed. A concurrent drain that retired
+    the same entry first lands here too (``shutil.move`` raises
+    ``FileNotFoundError``, an ``OSError``), which is why the failure path
+    is a no-op rather than a raise.
+    """
+    dest_dir = duplicate_dir()
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(path))
+        shutil.move(path, dest)
+    except OSError as e:
+        print(
+            f"[Hindsight] pending: could not archive duplicate "
+            f"{os.path.basename(path)} into {dest_dir} ({e}) — entry STAYS "
+            f"QUEUED (never deleted)",
+            file=sys.stderr,
+        )
+        return None
+    _trim_dir(dest_dir, DUPLICATE_MAX_ENTRIES, DUPLICATE_MAX_BYTES)
+    return dest
+
+
+def collapse_duplicates() -> int:
+    """Collapse entries sharing ``(bank_id, part_position, sha256(content))``.
+
+    Returns the number of redundant copies retired.
+
+    ``enqueue()``'s filename-keyed guard stops NEW duplicates. This is the
+    other half: it recomputes the key from the entry's own CONTENT, so it
+    also collapses entries written by an older build (whose filename key
+    still carries ``document_id`` and therefore never matches) and entries
+    whose duplicate arrived while a drain held them. Generation-agnostic by
+    construction — the filename is not consulted for identity at all.
+
+    SURVIVOR SELECTION is deterministic and durability-first: the copy with
+    the LOWEST ``attempt_count`` wins, ties broken by oldest filename. All
+    copies carry byte-identical content, so any of them delivers the same
+    memory; the one with the most attempts left is the one most likely to
+    get there before ``MAX_ATTEMPTS`` promotes it to ``.dead``. Picking the
+    oldest outright would systematically keep the most-attempted copy —
+    exactly backwards.
+
+    An entry whose key is ``None`` (no ``content``) is never grouped: its
+    identity cannot be established, so it is always kept.
+
+    A copy that cannot be archived stays queued and is NOT counted, so the
+    return value is a count of retires that actually happened.
+    """
+    groups: dict[str, list[tuple[int, str, dict]]] = {}
+    for order, (path, entry) in enumerate(iter_entries()):
+        key = _dupe_key(entry)
+        if not key:
+            continue
+        groups.setdefault(key, []).append((order, path, entry))
+
+    collapsed = 0
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        survivor = min(
+            members,
+            key=lambda m: (int(m[2].get("attempt_count", 1) or 1), m[0]),
+        )
+        for member in members:
+            if member is survivor:
+                continue
+            if archive_duplicate(member[1]) is not None:
+                collapsed += 1
+        print(
+            f"[Hindsight] pending: collapsed {len(members) - 1} duplicate "
+            f"cop{'y' if len(members) == 2 else 'ies'} of key {key} onto "
+            f"{os.path.basename(survivor[1])} (byte-identical content, same "
+            f"bank; the copies are archived under {duplicate_dir()}, not "
+            f"deleted)",
+            file=sys.stderr,
+        )
+    return collapsed
+
+
 def _log_eviction(name: str, size: int, reason: str, depth: int, nbytes: int) -> None:
     line = "%s evicted=%s bytes=%d reason=%s queue_depth=%d queue_bytes=%d" % (
         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -627,35 +772,86 @@ def _evict_to_fit(d: str, incoming_bytes: int) -> int:
     return evicted
 
 
+_PART_SUFFIX_TAIL_RE = re.compile(r"-p(\d+)of\d+$")
+
+
+def _part_position(entry: dict) -> str:
+    """Where this entry sits inside a split retain, as ``"7"`` / ``"2.1"``.
+
+    ``""`` for an unsplit retain. Read off the ``-p{i}of{n}`` suffix chain
+    that :func:`lib.retain_split.part_document_id` appends, innermost split
+    last, so a re-split part reads ``"2.1"`` (part 1 of part 2).
+
+    Only the INDEX is taken; the total is deliberately discarded. That is
+    what lets the key still collapse the duplicates it exists for: the
+    32-way group measured on this fleet carried ``-p7of15``, ``-p7of16``
+    and ``-p7of18`` over byte-identical content, because the enclosing
+    transcript kept growing while the part itself did not. Keying on the
+    total would have split that group three ways and matched nothing.
+    """
+    doc = entry.get("document_id")
+    if not isinstance(doc, str):
+        return ""
+    indices = []
+    while True:
+        m = _PART_SUFFIX_TAIL_RE.search(doc)
+        if not m:
+            break
+        indices.append(m.group(1))
+        doc = doc[: m.start()]
+    return ".".join(reversed(indices))
+
+
 def _dupe_key(entry: dict) -> Optional[str]:
     """Stable 16-hex identity of a queued retain, or ``None``.
 
-    Derived from ``(bank_id, document_id, sha256(content))``. The CONTENT
-    hash is what makes the key an identity: two entries sharing it carry
-    byte-identical content for the same bank and document, so they are the
-    same memory and the daemon would upsert them onto the same document.
+    Derived from ``(bank_id, part_position, sha256(content))`` and NOTHING
+    ELSE. Two entries sharing this key carry byte-identical content, for
+    the same bank, at the same position inside a split — the same memory,
+    however it got queued and whatever document id the producer stamped on
+    it.
 
-    Do NOT read this as "``document_id`` is content-derived, therefore a
-    matching id means matching content" — that only holds post-#3244
-    (``retain.slice_document_id``); pre-#3244 entries carry a bare session
-    id shared by every retain in that session. Dedupe is safe on either
-    because it hashes the content itself; a *presence GET* is not, which is
-    why that path is gated on ``is_content_derived_document_id``.
+    The part position is in the key because a split's parts are NOT
+    guaranteed to differ from each other: ``split_retain_content`` cuts on
+    a character bound, so highly repetitive content (a long run of
+    identical log lines, a padded transcript) yields byte-identical parts.
+    Without the position, a 10-part memory collapses to a single queued
+    part and the other nine positions never reach the bank — real loss, not
+    a redundant copy. With it, parts of one memory can never merge into
+    each other while duplicate re-enqueues of the SAME position still do.
 
-    ``None`` when there is no ``document_id``: identity cannot be
-    established, so the entry must always be kept rather than merged.
+    The WHOLE ``document_id`` used to be the key's dominant term and is not
+    any more (switchroom #3688) — see the module docstring for the
+    measurement that forced it and for the exact cost. Short version: the
+    id varies per enqueue for the producer that dominates this queue
+    (``subagent_retain.py`` embeds the sub-agent session id), so an
+    id-bearing key never matched a re-enqueue and the queue refilled itself
+    faster than it drained. The part position is the one fragment of the id
+    that survives into the key, and only because dropping it would lose
+    content rather than duplicate it.
+
+    ``None`` when ``content`` is absent: identity cannot be established, so
+    the entry must always be kept rather than merged. An EMPTY string is
+    identity enough — degenerate, but two empty retains into one bank are
+    genuinely the same (non-)memory.
+
+    Nothing else in the entry may enter this key. ``failed_at``,
+    ``error_message``, ``attempt_count`` and ``last_attempt_at`` all drift
+    between the first enqueue and the re-enqueue this guard exists to
+    catch; keying on any of them re-creates the no-op the size pre-filter
+    once was.
     """
-    did = entry.get("document_id")
-    if did is None:
-        return None
     content = entry.get("content")
+    if content is None:
+        return None
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False, sort_keys=True)
     h = hashlib.sha256()
-    # Length-prefixed so ("ab", "c") and ("a", "bc") cannot collide.
-    for part in (str(entry.get("bank_id")), str(did)):
-        h.update(b"%d:" % len(part))
-        h.update(part.encode("utf-8"))
+    # Length-prefixed so a bank id ending in digits cannot be confused with
+    # the part position that follows it.
+    for field in (str(entry.get("bank_id")), _part_position(entry)):
+        h.update(b"%d:" % len(field))
+        h.update(field.encode("utf-8"))
     h.update(hashlib.sha256(content.encode("utf-8")).digest())
     return h.hexdigest()[:16]
 
