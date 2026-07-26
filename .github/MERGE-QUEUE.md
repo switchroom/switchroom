@@ -56,12 +56,19 @@ and each work job's gate gained `|| github.event_name == 'merge_group'`.
 
 Two deliberate exceptions, neither of which lowers the bar:
 
-- **`ci-uat.yml`'s `uat-gate-run`** — already skipped on every PR and main
-  push (`UAT_GATE_ENABLED` has been `false` since 2026-07-04), so the
-  queue gets the identical `uat-gate` verdict a PR gets. Running it would
-  burn live subscription quota on the single `uat-host` self-hosted runner
-  per queue entry, and a busy/unregistered runner would stall the entry
-  until the 60-min timeout ejected it.
+- **`ci-uat.yml`'s `uat-gate-run`** — the only required-context ancestor
+  bound to `[self-hosted, uat-host]`, a single machine. A queue entry has
+  no "it'll pick up in a minute": a busy or unregistered runner stalls the
+  entry until the 60-min timeout ejects it, taking the train with it, and
+  each entry would burn live subscription quota on a real Telegram
+  round-trip. Independently of that policy call, its gate reads
+  `needs.changes.outputs.relevant`, which is **empty** on a queue ref, so
+  it skips on its own merits no matter how `UAT_GATE_ENABLED` is set —
+  don't rest this exception on the variable's current value.
+  (Corroborating but contingent: `UAT_GATE_ENABLED` has been `false`
+  since 2026-07-04, so the job is already skipped on every PR and main
+  push, and the queue therefore gets the identical `uat-gate` verdict a
+  PR gets.)
 - **`docker-images.yml`'s `build-hindsight` / `build-voice`** — the 6.4GB
   hindsight pull and the CUDA voice build are the heaviest in the repo.
   The hindsight image's behavioural gate (`hindsight-probe` in
