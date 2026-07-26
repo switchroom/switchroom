@@ -153,7 +153,13 @@ Such an entry fails every drain and burns its ``MAX_ATTEMPTS``: the
 mechanism that stranded 154 of the 629 entries in the 2026-07-25 fleet
 backlog. (It is no longer renamed ``.dead`` for that — a client-side
 timeout is not a permanent failure — but it still never drains until it
-is split, so splitting remains the fix.) Note this is orthogonal to the re-post loop
+is split, so splitting remains the fix. Such an entry is therefore
+IMMORTAL, and ``enqueue`` is the only caller of the splitter, so one
+queued before #3610 is never split in place. That is precisely the shape
+``drain_pending._drain_order`` / ``_over_budget`` exist to contain: it is
+demoted behind every entry still inside its attempt budget and abstains
+from the stall guard, so it can delay only itself rather than wedging the
+drain.) Note this is orthogonal to the re-post loop
 #3599 fixed — a presence GET retires an oversized entry for free when the
 document IS already durable; splitting is what makes the entry drainable
 when it is NOT. Part document_ids are deterministic, so a part already

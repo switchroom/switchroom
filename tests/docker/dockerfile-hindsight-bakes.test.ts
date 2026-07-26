@@ -646,6 +646,18 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /if call_kwargs\.get\("temperature"\) is not None:/,
     );
+    // And it is capped at 0.7, not 1.0. `call()` defaults to max_retries=10,
+    // so a +0.3 ramp from 0.1 saturates by attempt 4 and spends the rest at
+    // the cap. The json_schema response_format is advisory (one of the two
+    // measured bad bodies was prose emitted while a schema was set), so a cap
+    // of 1.0 would make the LATE attempts the likeliest to emit invalid JSON
+    // — a retry strategy that degrades as it goes.
+    expect(dockerfile).toMatch(
+      /0\.7, float\(call_kwargs\["temperature"\]\) \+ 0\.3/,
+    );
+    expect(dockerfile).not.toMatch(
+      /1\.0, float\(call_kwargs\["temperature"\]\) \+ 0\.3/,
+    );
     // Guard the identifier the patch body depends on.
     expect(dockerfile).toMatch(
       /assert s\.count\("call_kwargs = self\._build_common_kwargs\("\) >= 1,/,

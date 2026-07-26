@@ -12,6 +12,13 @@ attempt budget: a transient upstream is never evidence that the memory
 is unsaveable, and retiring it would lose content the user believes was
 saved.
 
+An entry past the budget is DEMOTED rather than retired (``_drain_order``
+and ``_over_budget``): it sorts behind everything still inside its budget
+and abstains from the stall guard. That is what keeps "never destroy a
+memory" from degrading into "never drain anything" — the drain is
+sequential and oldest-first, so without the demotion three chronically
+failing entries sit at the head and end every run at zero progress.
+
 Boundaries
 ----------
 * Per-entry HTTP timeout: ``HINDSIGHT_DRAIN_TIMEOUT`` (default 5s), but
@@ -353,6 +360,76 @@ def _document_state(entry: dict, timeout: int = 30):
         return None
 
 
+def _drain_order(entries: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Oldest-first, but with budget-exhausted entries demoted to the back.
+
+    THE HEAD-OF-LINE BUG THIS EXISTS FOR. Since the permanence gate in
+    ``_record_failure``, an entry failing on anything transient stays queued
+    past ``MAX_ATTEMPTS`` indefinitely — deliberately, because a transient
+    upstream is not evidence the memory is unsaveable. But ``iter_entries()``
+    is oldest-first, and the entries that have been failing longest are by
+    construction the OLDEST, so they sit at the head of every drain. Backlog
+    concurrency defaults to 1 (``_backlog_concurrency``), so the drain is
+    sequential: three such entries in a row trip ``STALL_THRESHOLD`` and the
+    run breaks having drained nothing — and, because they never retire, it
+    breaks identically on every subsequent run. Measured on this branch before
+    this function existed: 6 queued entries, the 3 oldest raising
+    ``TimeoutError``, 4 consecutive ``drain_backlog`` runs each returning
+    ``stalled=True, drained=0`` with the queue depth still 6. The 3 healthy
+    entries behind them were never even attempted. On ``main`` the same repro
+    converges: run 0 retires the 3 heads to ``.dead`` and run 1 onward drains
+    normally. So the permanence gate, alone, traded "rarely destroys a memory"
+    for "eventually drains nothing at all".
+
+    ``.dead`` was doing double duty: it was the honesty policy AND it was the
+    queue's only un-wedging mechanism. Removing it as a policy has to leave
+    the un-wedging behind, and demotion is that — it keeps every property the
+    gate was added for (the entry is still queued, still retried, never
+    destroyed) while removing the one it broke (it can no longer starve a
+    healthy entry behind it).
+
+    The terminal condition for a permanently-unsaveable entry is therefore no
+    longer deletion but DEMOTION: ``attempt_count`` only ever climbs, so such
+    an entry crosses the budget once and stays in the back group for good,
+    where it can delay only itself. It is still reconciled for free on every
+    run — ``_reconcile_phase`` sweeps ALL entries with a sub-second presence
+    GET, in no particular order and with no stall guard — so an entry whose
+    document did land is still retired without a POST.
+
+    Ordering is a stable partition, so relative age is preserved inside each
+    group and FIFO still holds for everything that has not blown its budget.
+    """
+    fresh: list[tuple[str, dict]] = []
+    exhausted: list[tuple[str, dict]] = []
+    for path, entry in entries:
+        (exhausted if _over_budget(entry) else fresh).append((path, entry))
+    return fresh + exhausted
+
+
+def _over_budget(entry: dict) -> bool:
+    """Has this entry already burned its ``MAX_ATTEMPTS`` budget?
+
+    Such an entry is chronically failing but, since the permanence gate, is
+    never retired. It gets two demotions — last in the drain order
+    (``_drain_order``) and no vote in the stall guard (see below) — because
+    ordering alone does not close the wedge. Ordering fixes the common shape
+    (a few old poison entries in front of healthy ones), but not the shape
+    where the WHOLE queue is over budget: an upstream down for a week takes
+    every entry past 5 attempts, and when it recovers the partition is empty
+    on one side, the poisoned entries are at the head again, and the run
+    stalls before reaching the entries that would now succeed. Measured: with
+    ordering alone and all 6 entries at ``MAX_ATTEMPTS``, 4 consecutive runs
+    still returned ``stalled=True, drained=0``.
+    """
+    try:
+        return int(entry.get("attempt_count", 0)) >= MAX_ATTEMPTS
+    except (TypeError, ValueError):
+        # A hand-edited or corrupt counter must not decide ordering, and must
+        # not raise on the drain path. Treat it as fresh: the cost of guessing
+        # wrong here is one retry in the normal position, not a lost memory.
+        return False
+
+
 def _record_failure(
     config: dict,
     path: str,
@@ -381,10 +458,28 @@ def _record_failure(
     # succeeds on a later attempt, so five unlucky samples were destroying
     # memories that were never unsaveable. See ``pending.is_permanent_failure``.
     #
-    # Nothing here becomes unbounded: the queue's own MAX_ENTRIES / MAX_BYTES
-    # caps still shed the oldest entries into ``pending-evicted/`` (an archive,
-    # not a delete), and ``switchroom doctor`` still surfaces queue depth.
-    # Those are the disk bounds; the attempt counter never was one.
+    # WHAT BOUNDS THIS, precisely — because an unbounded queue of undying
+    # entries would be a worse outcome than the bug this gate fixes.
+    #
+    # DISK is bounded by the queue's MAX_ENTRIES / MAX_BYTES caps, which shed
+    # the oldest entries into ``pending-evicted/`` (an archive, not a delete).
+    # Note what that bound is NOT: ``_evict_to_fit`` is called only from
+    # ``enqueue`` (lib/pending.py:933), so it fires on new writes, never on
+    # drain — and it "bounds" the queue by shedding memory unsaved, which is
+    # the very outcome this gate exists to avoid. It is a backstop, not the
+    # answer.
+    #
+    # PROGRESS is bounded by ``_drain_order`` / ``_over_budget``. An entry that
+    # can never be persisted no longer terminates by being destroyed; it
+    # terminates by being DEMOTED — sorted behind every entry still inside its
+    # budget, and stripped of its vote in the stall guard. ``attempt_count``
+    # only ever climbs, so the crossing happens once and is permanent. That is
+    # the real terminal condition, and it is what keeps a poisoned entry from
+    # starving the queue behind it. Without it, three such entries ended every
+    # drain at zero progress, permanently (tests/test_pending_wedge.py).
+    #
+    # The attempt counter itself was never a bound on either, and ``switchroom
+    # doctor`` still surfaces queue depth so the operator sees a growing tail.
     if attempts >= MAX_ATTEMPTS and is_permanent_failure(e):
         marker = mark_dead(path, entry)
         summary["dead"] += 1
@@ -469,7 +564,11 @@ def drain(
 
     summary = _new_summary()
 
-    entries = iter_entries()
+    # Budget-exhausted entries go last so they cannot starve the healthy ones
+    # behind them — see ``_drain_order``. Matters even more here than in the
+    # backlog drain: the in-hook budget is ~4s, so a single entry at the head
+    # that always burns its clamped timeout consumes the entire run.
+    entries = _drain_order(iter_entries())
     if not entries:
         debug_log(config, "drain_pending: queue empty")
         return summary
@@ -525,14 +624,30 @@ def drain(
             # allowance must not be handed out twice (#3599 review F2).
             _retry_one(entry, timeout=_clamp(timeout, budget, started))
         except Exception as e:
+            # Read the budget state BEFORE _record_failure: update_attempt
+            # mutates `entry["attempt_count"]` in place (lib/pending.py:1020),
+            # so asking afterwards would count the entry that just CROSSED the
+            # budget on this very failure as an abstainer, silently weakening
+            # the stall guard for ordinary entries.
+            abstains = _over_budget(entry)
             err_class = _record_failure(config, path, entry, e, summary)
-            if err_class == last_error_class:
-                consecutive_failures += 1
-            else:
-                consecutive_failures = 1
-                last_error_class = err_class
+            # STALL GUARD ABSTENTION — see ``_over_budget``. The guard exists
+            # to detect a broken UPSTREAM and stop hammering it. A chronically
+            # failing entry that has already burned its attempt budget is
+            # evidence about that ENTRY, not about the upstream, and letting it
+            # vote is what wedges the queue: it never retires, so it fails
+            # identically on every run, and three of them end every run before
+            # the healthy entries behind them are ever reached. It abstains —
+            # neither incrementing the counter nor resetting it, so a genuine
+            # upstream outage is still caught by the fresh entries around it.
+            if not abstains:
+                if err_class == last_error_class:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 1
+                    last_error_class = err_class
 
-            if consecutive_failures >= STALL_THRESHOLD:
+            if not abstains and consecutive_failures >= STALL_THRESHOLD:
                 summary["stalled"] = True
                 print(
                     f"[Hindsight] drain_pending: {consecutive_failures} consecutive "
@@ -670,7 +785,10 @@ def _drain_backlog_impl(
     backoff_ms = _p95_backoff_ms()
     started = time.monotonic()
 
-    entries = iter_entries()
+    # See ``_drain_order``: without this, three budget-exhausted entries at the
+    # head trip the stall guard on every run forever and the drain never makes
+    # progress again.
+    entries = _drain_order(iter_entries())
     if not entries:
         _blog("phase 2: nothing left to retain")
         return summary
@@ -757,15 +875,22 @@ def _drain_backlog_impl(
             # and breaking immediately after the tripping entry makes the
             # two paths bump exactly the same number of entries.
             err_class = type(err).__name__
-            if err_class == last_error_class:
-                consecutive_failures += 1
-            else:
-                consecutive_failures = 1
-                last_error_class = err_class
+            # STALL GUARD ABSTENTION for entries past their attempt budget —
+            # see ``_over_budget`` and the matching branch in the sequential
+            # drain. Evaluated here, before ``_record_failure``, which is both
+            # where the sequential drain evaluates it and necessary anyway
+            # because ``update_attempt`` mutates ``attempt_count`` in place.
+            abstains = _over_budget(entry)
+            if not abstains:
+                if err_class == last_error_class:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 1
+                    last_error_class = err_class
 
             _record_failure(config, path, entry, err, summary)
 
-            if consecutive_failures >= STALL_THRESHOLD:
+            if not abstains and consecutive_failures >= STALL_THRESHOLD:
                 summary["stalled"] = True
                 _blog(
                     f"{consecutive_failures} consecutive failures with "

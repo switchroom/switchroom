@@ -2188,7 +2188,12 @@ PYEOF
 #  2. A capped temperature bump — only when the caller already set a
 #     temperature (so models that reject the parameter are untouched). Retain
 #     extraction runs at 0.1, i.e. near-greedy, so an uncached resample would
-#     otherwise reproduce the same malformed output.
+#     otherwise reproduce the same malformed output. The cap is 0.7, not 1.0:
+#     `call()` takes max_retries=10 by default, so a +0.3 ramp would sit at
+#     1.0 for most attempts, and the requested json_schema is advisory rather
+#     than enforced (one measured bad body was prose emitted WITH a schema
+#     set). Ramping to 1.0 would make the late attempts the likeliest to
+#     produce invalid JSON — backwards for a retry.
 # Both apply only on the retry path; the first attempt is byte-for-byte the
 # request upstream would have sent, so cache hit-rate for healthy calls is
 # unchanged. Self-verifying; guarded by
@@ -2222,9 +2227,19 @@ REPL = (
     '                    call_kwargs["extra_body"] = _extra\n'
     "                    # Only nudge a temperature the caller actually set, so\n"
     "                    # models that reject the parameter keep their kwargs clean.\n"
+    "                    # Capped at 0.7, NOT 1.0: `call()` defaults to\n"
+    "                    # max_retries=10, so an uncapped +0.3 ramp from 0.1 hits\n"
+    "                    # 1.0 by attempt 4 and spends the remaining seven there.\n"
+    "                    # The json_schema response_format is advisory, not\n"
+    "                    # enforced — one of the two measured bad bodies was a\n"
+    "                    # numbered prose list emitted WHILE a schema was set — so\n"
+    "                    # temperature 1.0 makes malformed JSON more likely, and a\n"
+    "                    # ramp whose late attempts are its worst attempts is\n"
+    "                    # backwards for a retry. 0.7 still breaks a sticky mode\n"
+    "                    # while staying where the model can hold a schema.\n"
     '                    if call_kwargs.get("temperature") is not None:\n'
     '                        call_kwargs["temperature"] = min(\n'
-    '                            1.0, float(call_kwargs["temperature"]) + 0.3\n'
+    '                            0.7, float(call_kwargs["temperature"]) + 0.3\n'
     "                        )\n"
     "                    backoff = min(initial_backoff * (2**attempt), max_backoff)\n"
 )
