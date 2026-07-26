@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.19.21 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
+## v0.19.22 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
 
 ### LiteLLM paired timeout budgets are now DERIVED, and drift is detected
 
@@ -190,12 +190,13 @@ converting the workflow that also serves every PR and main push (and carries
 the `images-ok` required check) to gate the one *recoverable* leg is the
 inverse trade of the npm case. Tracked in #3685 with the candidate shapes.
 
-### The completeness gate's own tag binding — why this release is v0.19.21, not v0.19.20 (#3691)
+### The completeness gate's own tag binding — the defect that killed v0.19.20 (#3691)
 
 `v0.19.20` was tagged, built and **never shipped**. It is a dead tag: the
 GitHub Release is a permanent draft (with all five assets correctly attached)
-and nothing was ever published to npm. This is the release it was meant to be,
-cut fresh off a fixed `main`.
+and nothing was ever published to npm. It is the first of two dead tags this
+release supersedes; the second, `v0.19.21`, died on the defect described in the
+section below, which was sitting one layer behind this one.
 
 The guard shipped above mis-wired itself. In `release.yml`'s `publish` job, the
 "attach binaries" step bound the tag as `TAG:`, while the assertion it invokes
@@ -229,6 +230,76 @@ cannot work: `workflow_dispatch` executes the workflow YAML **at the dispatched
 ref**, so `gh workflow run release.yml --ref v0.19.20` re-runs the broken file.
 When the defect lives in the tag's own tree, the only path is a fix on `main`
 and a fresh tag.
+
+### Why this release is v0.19.22 — the npm gate's own token could not see the draft (#3694)
+
+`v0.19.21` was tagged, built, fully assembled and **never shipped**, exactly as
+`v0.19.20` was before it. Its GitHub Release is also a permanent draft carrying
+all five assets, and nothing reached npm. It died on a defect that had been
+masked behind the one above — the pipeline had never got far enough to reach
+it.
+
+Run 30189755957 contains the entire proof as a three-way control inside a
+single run. Three jobs invoked the same
+`scripts/ci/assert-release-assets-complete.mjs` against the same tag, minutes
+apart:
+
+- `guard` (`contents: write`) → `found:true`
+- `publish` (`contents: write`) → `found:true`, `missing:[]` — all five assets
+- `npm` (`contents: read`) → `found:false`, `draft:null`, exit 4
+
+Same script, same endpoint, same tag, same release; the only variable was the
+token. `GET /repos/{owner}/{repo}/releases` returns **draft** releases only to
+a caller with push access, and a draft is precisely the state this gate exists
+to inspect — that is why it reads the list endpoint rather than
+`/releases/tags/{tag}` in the first place. Under `contents: read` the draft is
+filtered out of the response, the gate truthfully reports "no release exists
+for this tag", and it blocks. A true statement about what that token could
+see, and a false one about the world. `npm` went red, `finalize` never ran, and
+the release stayed a draft.
+
+**Both halves had to move, and neither alone does anything useful.**
+`release.yml`'s `npm` job is a `uses:` call into `npm-publish.yml`, and a
+caller job's `permissions:` block **caps** the token the called workflow
+receives. Raising only the callee is worse than a no-op: a called workflow that
+requests more than its caller grants fails the **whole run at startup**, before
+any job begins — verified on a probe run (30190529154: zero jobs,
+`startup_failure`). Raising only the caller leaves the callee's own block as
+the cap. So both now read `contents: write`:
+
+- **`release.yml`'s `npm` caller job.**
+- **`npm-publish.yml`'s workflow-level block.** This half also covers the
+  documented `workflow_dispatch` recovery lever, where there is no caller to
+  inherit from and the release is by definition still a draft.
+
+The alternative — hold `npm` at `contents: read` and have `publish` pass its
+verdict down as a job output — was considered and rejected. `npm` already
+`needs: [publish]`, so an output buys no ordering it does not already have; it
+would delete the last independent re-verification before an **irreversible**
+`npm publish`, substituting a boolean inherited from an earlier job for a fresh
+look at the API; and it would leave the `workflow_dispatch` recovery path
+permanently broken, because that path has no caller to inherit a verdict from.
+The marginal risk of the write scope is small — the `npm` job already carries
+`NPM_TOKEN`, a strictly bigger prize than repo write.
+
+- **Rule R11 in `tests/release-pipeline-gating.test.ts` makes it structural.**
+  Any job in either workflow that runs `assert-release-assets-complete.mjs`
+  without `contents: write` in effect now fails CI, as does any job that
+  `uses:` `npm-publish.yml` without granting it. R11 resolves the scope the way
+  Actions does: a job-level `permissions:` block **replaces** the workflow-level
+  one rather than layering onto it, so a job block that omits `contents:` reads
+  as `none`. `read-all` is caught; `write-all` is not falsely flagged. The
+  actual `v0.19.21` tree (`git show v0.19.21:.github/workflows/release.yml`) is
+  one of the mutation cases and R11 is the *only* rule that fires on it; each
+  half-fix-alone is another.
+
+The fixed combination had never executed in this repository — every previous
+successful npm publish predates #3654 and ran on the old `push` trigger, when
+releases were created already published. Rather than discover that on a third
+tag, it was rehearsed on a live read-only probe (run 30190629605) that drove
+the real script through the real reusable-workflow call against the real
+`v0.19.21` draft, one leg per scope: `contents: read` → `found:false`,
+`contents: write` → `found:true`, `missing:[]`.
 
 ### A runtime probe for the perturbed-JSON-retry patch, so a silent revert fails CI
 
