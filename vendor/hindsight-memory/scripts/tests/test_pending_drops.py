@@ -1842,7 +1842,15 @@ class ClampAndEnvKnobBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         """
         os.environ.pop("HINDSIGHT_DRAIN_BACKLOG_TIMEOUT", None)
         os.environ.pop("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", None)
-        self.assertEqual(drain_pending._backlog_timeout(), 280)
+        # Assert the DERIVATION, per this test's own docstring: the drain
+        # deadline is retain_client_deadline(), whatever that currently is.
+        # It was pinned to the literal 280 here, which meant the test went
+        # stale the moment the deadline became derived from the litellm
+        # routing chain (280 -> 310) instead of being hand-set.
+        self.assertEqual(
+            drain_pending._backlog_timeout(),
+            int(retain_split.retain_client_deadline()),
+        )
 
         os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = "600"
         try:

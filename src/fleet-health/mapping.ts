@@ -104,6 +104,20 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "keep-my-subscription-honest",
     signature: "litellm-header-passthrough:oauth-leak-scope",
   },
+  "litellm-timeout-budget-drift": {
+    // A per-deployment `timeout` in the live LiteLLM config no longer matches
+    // the tier switchroom derived its client budgets from
+    // (`src/litellm/timeout-budget.ts`). Classic `drift`: nothing errors at
+    // apply time, but every client budget on that lane is now computed from a
+    // stale number, so the router's fallback hop can be cut off mid-flight.
+    // severity 3 — this exact defect class ran undetected on the retain lane
+    // (client 204s vs a 290s chain) and turned every failover into a
+    // guaranteed error, i.e. dropped memories, for as long as nobody noticed.
+    failure_mode: "drift",
+    severity: 3,
+    job_spec: "fleet-stays-healthy",
+    signature: "litellm-timeout-budget:tier-drift",
+  },
 };
 
 /** The full set of 23 job-spec slugs the ledger carries a record for. Kept

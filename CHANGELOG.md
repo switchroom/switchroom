@@ -2,6 +2,100 @@
 
 ## Unreleased
 
+### LiteLLM paired timeout budgets are now DERIVED, and drift is detected
+
+A hindsight LLM call crosses three stacked deadlines, and LiteLLM's router
+fallback runs *inside* one client request. So the invariant is not
+`local < client`, it is `local + fallback + margin <= client`. It was
+maintained by hand, in a config comment, and broke twice in two days in
+opposite directions:
+
+- retain (#3611) moved the client budget to a derived `ceil(16384/80.6) = 204s`
+  without moving the litellm halves (`200 + 90 = 290`), so the retain
+  OpenRouter fallback had 4s of headroom and could never complete;
+- interactive raised its fallback hop `25s -> 60s` on 2026-07-26, giving
+  `90 + 60 = 150` against hindsight's 120s `DEFAULT_LLM_TIMEOUT`.
+
+- **`src/litellm/timeout-budget.ts` is the single declaration.** Per-lane tiers
+  (primary group + fallback group + each one's per-deployment timeout) live
+  there with the measurements that justify them. Every client budget is
+  computed from that declaration, so the halves are one number by construction.
+- **#3611's derivation is preserved as a FLOOR, not replaced.**
+  `clientBudgetSeconds(tier, floor)` is `max(floor, local + fallback + margin)`,
+  so the token-budget-derived lower bound and the chain lower bound must both
+  be satisfied. Taking the max does not reopen the runaway #3611 fixed — that
+  is cut by the output-token cap and by litellm's own per-deployment timeout,
+  both upstream of the client.
+- **`assertClientBudget` runs on the hindsight env emit paths**, so an
+  inconsistent budget cannot reach a container.
+- **All four hindsight timeouts are now emitted, not defaulted**:
+  `HINDSIGHT_API_LLM_TIMEOUT=160`, `HINDSIGHT_API_REFLECT_LLM_TIMEOUT=160`
+  (Ken's 160s interactive budget, derived as `90 + 60 + 10`, not typed),
+  `HINDSIGHT_API_RETAIN_LLM_TIMEOUT=300` and
+  `HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT=300` (`200 + 90 + 10`). The retain
+  lane previously shipped 204s; interactive and consolidation shipped nothing
+  and silently took the vendor's 120s.
+- **The plugin's retain client deadline moves `280s -> 310s`** in lockstep
+  (`retain_split.py`), because `290 <= RETAIN_LLM_TIMEOUT < 280` is
+  unsatisfiable at any derivation. The derived content bound follows it,
+  `45,000 -> 48,000` chars.
+- **This also explains, and fixes, the ~280.1s per-entry give-up in the
+  backlog-recovery logs.** It was never a third hand-set number: the backlog
+  drainer's `_backlog_timeout()` defaults to `int(retain_client_deadline())`
+  (`vendor/hindsight-memory/scripts/drain_pending.py:220`), i.e. the same
+  280.0 constant. It is the OUTERMOST deadline in the family and it did not
+  cover the 300s routing chain, so every drained entry whose retain fell
+  through to the OpenRouter fallback was abandoned client-side while the
+  server was still inside a legitimate budget — the entry stayed queued and
+  burned another attempt toward `.dead`. Moving the base to 310 fixes the
+  in-hook and out-of-hook lanes with one number, and
+  `tests/setup/hindsight.test.ts` now asserts the drain deadline stays both
+  derived and above the chain.
+- **Drift is now loud, three ways.** `src/litellm/repo-config.test.ts` fails CI
+  when the shipped `docker/litellm-proxy/litellm-config.yaml` disagrees with
+  the declaration, omits a per-deployment timeout on a budgeted group, or adds
+  a fallback edge the tiers do not know about. On-host, the fleet-health
+  litellm-config sensor emits a `litellm-timeout-budget-drift` finding
+  (`drift` / severity 3 / `fleet-stays-healthy`) against the LIVE proxy config,
+  which the ledger escalates like any other L0.
+- **`gpt-oss-20b-openrouter` gains `timeout: 60`** in the repo-managed config.
+  It carried none, so it inherited `request_timeout: 600` — 4x the whole
+  client budget for its lane.
+- **The 10s margin no longer claims to cover a pacer hold, and a test enforces
+  why it does not have to.** `LITELLM_ROUTER_MARGIN_S` justified itself partly
+  by "the pacer's admission delay", which is not true of any lane it budgets:
+  `docker/litellm-pacer/custom_pacing.py` paces only groups matching
+  `PACE_MODEL_GROUPS` (default `claude-*,sonnet,fable`) and no `gpt-oss-20b*`
+  group matches. That mattered rather than being pedantic — `PACE_MAX_WAIT_S`
+  alone defaults to 20s, twice the margin, and the hard backstop is clamped as
+  high as 280s, so a margin that genuinely had to cover a pacer hold would be
+  far too small. `src/litellm/repo-config.test.ts` now fails if any budgeted
+  group is ever added to the pacer's allowlist.
+- **The emit-time assertions are documented as defence in depth, not as the
+  mechanism.** All three `assertClientBudget` calls in `hindsightLlmBudgetEnv`
+  compare a value produced by `clientBudgetSeconds` (`max(floor, chain)`)
+  against that same `chain`, so they cannot fire as written — and neither can
+  `assertHindsightRetainBudget`'s `server < client` half now that the client
+  deadline is derived from the server one. They are kept because they catch the
+  NEXT edit (any hand-set or config-sourced budget), but the checks that can
+  actually FAIL today are the tests over files nothing derives, and the
+  docstring now says so instead of implying the opposite.
+- **Deadline literals in comments and assertions that went stale with the
+  280 -> 310 move are now derived or dated**: the drain-bound part-count
+  assertion in `test_retain_split.py` (was a literal `16`, now
+  `ceil(len / retain_content_limit())`), and the `45,000` / `280s` citations in
+  `src/hindsight-watch/evaluate.test.ts` and `src/litellm/timeout-budget.test.ts`
+  — including two that claimed `gpt-oss-20b-openrouter` still carries no
+  timeout, which this very change fixes.
+- **Unrelated but caught here and not worth leaving on main: #3676's
+  `tests/source-files-are-text.test.ts` was a coin flip on a cold cache.** It
+  reads ~2,600 files under vitest's default 5s per-test timeout. Measured on
+  the fleet host immediately after that PR landed: 10.1s on the first run after
+  a fresh checkout, 71ms on every run after — same work, page cache the only
+  difference, and a CI runner is always the cold case. It now carries an
+  explicit 60s timeout sized for the I/O rather than scanning less. The NUL
+  detection itself is unchanged and still fails on a planted raw NUL.
+
 ### A `v*` tag can no longer half-ship — release.yml is now the orchestrator (#3654)
 
 Three workflows fired independently on a `v*` tag with nothing cross-gating

@@ -237,3 +237,86 @@ model_group_settings:
     expect(res.status).toBe("skipped");
   });
 });
+
+describe("scanLitellmConfig — paired-timeout-budget drift (Fix B guard)", () => {
+  it("live timeouts matching the declaration → ok, no findings", () => {
+    const res = withYaml(`
+model_list:
+  - model_name: gpt-oss-20b
+    litellm_params: { model: a, timeout: 90 }
+  - model_name: gpt-oss-20b-openrouter
+    litellm_params: { model: b, timeout: 60 }
+  - model_name: gpt-oss-20b-retain
+    litellm_params: { model: c, timeout: 200 }
+  - model_name: gpt-oss-20b-retain-openrouter
+    litellm_params: { model: d, timeout: 90 }
+`);
+    expect(res.status).toBe("ok");
+    expect(res.findings).toEqual([]);
+  });
+
+  it("a half that moved alone → violation the ledger can escalate", () => {
+    // The 2026-07-25/26 defect class, made loud: the operator edits one
+    // per-deployment timeout on the host and nothing else changes. Before this
+    // guard, every client budget on the lane was silently wrong.
+    const res = withYaml(`
+model_list:
+  - model_name: gpt-oss-20b-retain
+    litellm_params: { model: c, timeout: 200 }
+  - model_name: gpt-oss-20b-retain-openrouter
+    litellm_params: { model: d, timeout: 150 }
+`);
+    expect(res.status).toBe("violation");
+    expect(res.findings).toHaveLength(1);
+    const f = res.findings[0];
+    expect(f.signal).toBe("litellm-timeout-budget-drift");
+    expect(f.agent).toBe(LITELLM_PROXY_PSEUDO_AGENT);
+    expect(f.turn_id).toBe("litellm-timeout:retain:gpt-oss-20b-retain-openrouter");
+    expect(f.log_pointer).toContain(PATH);
+    expect(f.log_pointer).toContain("150s");
+    expect(f.log_pointer).toContain("90s");
+    const m = mapSignal(f.signal);
+    expect(m.job_spec).toBe("fleet-stays-healthy");
+    expect(m.failure_mode).toBe("drift");
+    expect(m.severity).toBe(3);
+  });
+
+  it("a group with no timeout at all → violation (it inherits request_timeout)", () => {
+    const res = withYaml(`
+model_list:
+  - model_name: gpt-oss-20b-openrouter
+    litellm_params: { model: b }
+`);
+    expect(res.status).toBe("violation");
+    expect(res.findings).toHaveLength(1);
+    expect(res.findings[0].log_pointer).toContain("carries NO per-deployment timeout");
+  });
+
+  it("reports BOTH invariants from one file read, without either masking the other", () => {
+    const res = withYaml(`
+litellm_settings:
+  forward_client_headers_to_llm_api: true
+model_list:
+  - model_name: gpt-oss-20b
+    litellm_params: { model: a, timeout: 45 }
+`);
+    expect(res.status).toBe("violation");
+    expect(res.findings.map((f) => f.signal).sort()).toEqual([
+      "litellm-header-passthrough-misconfig",
+      "litellm-timeout-budget-drift",
+    ]);
+  });
+
+  it("logs the drift violation so it is visible in the scan output", () => {
+    const logs: string[] = [];
+    withYaml(
+      `
+model_list:
+  - model_name: gpt-oss-20b
+    litellm_params: { model: a, timeout: 45 }
+`,
+      (m) => logs.push(m),
+    );
+    expect(logs.some((l) => /VIOLATION.*gpt-oss-20b/.test(l))).toBe(true);
+  });
+});

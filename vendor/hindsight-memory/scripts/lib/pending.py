@@ -147,7 +147,7 @@ oversized payload into one entry PER PART (``lib/retain_split``) instead
 of writing a single giant entry. This is load-bearing, not tidiness. The
 daemon runs one sequential extraction LLM call per ``retain_chunk_size``
 chars, so an entry above the derived content bound cannot complete inside
-ANY client deadline — including the 280s out-of-hook backlog deadline that
+ANY client deadline — including the out-of-hook backlog deadline that
 ``drain_pending._backlog_timeout()`` now takes from the same derivation.
 Such an entry fails every drain and burns its ``MAX_ATTEMPTS``: the
 mechanism that stranded 154 of the 629 entries in the 2026-07-25 fleet

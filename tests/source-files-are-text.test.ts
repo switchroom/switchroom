@@ -71,6 +71,17 @@ function candidateTextFiles(): string[] {
   return [...new Set(paths)];
 }
 
+/**
+ * Vitest's default per-test timeout is 5s, which is not enough here on a COLD
+ * page cache: this reads ~2,600 files, and measured on the fleet host the first
+ * run after a fresh checkout took 10.1s while every subsequent run took 71ms —
+ * same work, same files, cache the only difference. A CI runner is always the
+ * cold case, so the default would make this test a coin flip rather than a
+ * guard. It is I/O-bound by design (the whole point is to look at every file),
+ * so the right answer is a timeout sized for the I/O, not less scanning.
+ */
+const SCAN_TIMEOUT_MS = 60_000;
+
 describe("source files are text, not binary (PR #3676 regression)", () => {
   it("contains no raw NUL byte in any tracked or newly added text file", () => {
     const offenders: string[] = [];
@@ -86,5 +97,5 @@ describe("source files are text, not binary (PR #3676 regression)", () => {
     }
     // Named, not just counted — the whole point is that the diff can't tell you.
     expect(offenders).toEqual([]);
-  });
+  }, SCAN_TIMEOUT_MS);
 });

@@ -1,6 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
+import {
+  LITELLM_ROUTER_MARGIN_S,
+  LITELLM_TIMEOUT_TIERS,
+  assertClientBudget,
+  clientBudgetSeconds,
+} from "../litellm/timeout-budget.js";
 
 /**
  * Default Hindsight host ports.
@@ -395,23 +401,18 @@ export const HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 16384;
 export const HINDSIGHT_RETAIN_MIN_TOKENS_PER_SECOND = 80.6;
 
 /**
- * The retain CLIENT deadline: how long a caller waits for one retain POST.
- * Mirrors `DEFAULT_RETAIN_CLIENT_DEADLINE_S` in the plugin's
- * `vendor/hindsight-memory/scripts/lib/retain_split.py`, which sizes its
- * content bound off the same number. Explicit constant so the assertion below
- * is a real check, not a comparison against a literal nobody maintains.
- */
-export const HINDSIGHT_RETAIN_CLIENT_DEADLINE_S = 280;
-
-/**
- * Server-side per-call deadline, DERIVED from the output cap:
+ * Token-budget-derived per-call deadline, from the output cap (#3611):
  *
  *   ceil(maxCompletionTokens / minTokensPerSecond)
  *   = ceil(16384 / 80.6) = 204s
  *
  * Exactly long enough for the model to emit its whole permitted output at the
- * slowest measured rate, and not a second longer. Raising the token cap moves
- * this automatically; the two can no longer drift apart.
+ * slowest measured rate. Raising the token cap moves this automatically; the
+ * two can no longer drift apart.
+ *
+ * This is now a FLOOR on the emitted retain deadline rather than the emitted
+ * value itself — see {@link hindsightRetainClientTimeoutSeconds} for why, and
+ * for the second lower bound it is taken against.
  */
 export function hindsightRetainLlmTimeoutSeconds(
   maxCompletionTokens: number = HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS,
@@ -425,6 +426,62 @@ export function hindsightRetainLlmTimeoutSeconds(
   }
   return Math.ceil(maxCompletionTokens / tokensPerSecond);
 }
+
+/**
+ * Hindsight's per-call LLM deadline for the RETAIN lane — the value emitted as
+ * `HINDSIGHT_API_RETAIN_LLM_TIMEOUT`.
+ *
+ * This one number sits between two deadlines and has to satisfy both, which is
+ * why it is derived rather than chosen:
+ *
+ *   litellm chain (200 + 90) + margin 10  <=  THIS  <  retain client deadline
+ *                          300            <=  300  <         310
+ *
+ * ── Lower bound (new, #3611's missing half) ─────────────────────────────────
+ * litellm's router fallback runs INSIDE this one request: up to 200s on the
+ * local `gpt-oss-20b-retain` group, then up to 90s on
+ * `gpt-oss-20b-retain-openrouter`. #3611 set this to the token-derived 204s
+ * while the chain below it was already 290s, so the retain fallback hop had 4s
+ * of headroom and could never complete. {@link clientBudgetSeconds} now takes
+ * the max of the two lower bounds, so the token derivation is preserved as a
+ * FLOOR (204s — never starve a legitimately full-length extraction) rather than
+ * being the whole answer.
+ *
+ * Raising this from 204 to 300 does not reopen the 767.6s runaway #3611 fixed.
+ * A runaway is cut by `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS` at the
+ * source and by litellm's own 200s per-deployment timeout upstream of this
+ * client — a longer CLIENT deadline cannot make an upstream call run longer, it
+ * only stops the client abandoning a failover that is still in flight.
+ *
+ * ── Upper bound (#3611's assertion, unchanged) ──────────────────────────────
+ * Must stay strictly under the retain POST deadline the plugin holds, or the
+ * plugin walks away while hindsight is still working — see
+ * {@link assertHindsightRetainBudget}.
+ */
+export function hindsightRetainClientTimeoutSeconds(): number {
+  return clientBudgetSeconds(
+    LITELLM_TIMEOUT_TIERS.retain,
+    hindsightRetainLlmTimeoutSeconds(),
+  );
+}
+
+/**
+ * The retain CLIENT deadline: how long a caller waits for one retain POST.
+ *
+ * DERIVED, not hand-set: one margin above
+ * {@link hindsightRetainClientTimeoutSeconds}, so the plugin always outlives
+ * hindsight's own LLM deadline by construction. It was the literal `280` until
+ * the retain chain grew past it — a hand-set number in a chain of derived ones
+ * is the drift bug wearing a different hat.
+ *
+ * Mirrored by `DEFAULT_RETAIN_CLIENT_DEADLINE_S` in the plugin's
+ * `vendor/hindsight-memory/scripts/lib/retain_split.py`, which sizes its
+ * content bound and the backlog-drain timeout off the same number (#3610).
+ * `tests/setup/hindsight.test.ts` enforces that the two stay equal, so the
+ * mirror is a check rather than a comment.
+ */
+export const HINDSIGHT_RETAIN_CLIENT_DEADLINE_S =
+  hindsightRetainClientTimeoutSeconds() + LITELLM_ROUTER_MARGIN_S;
 
 /**
  * Fail loudly on an inconsistent retain budget, at config-emit time, before a
@@ -474,23 +531,131 @@ export function assertHindsightRetainBudget(budget: {
 }
 
 /**
- * The retain budget env vars as `[key, value]` pairs. Asserted before it
- * returns, so both emit paths ({@link startHindsight} and
- * {@link generateHindsightComposeSnippet}) fail loudly on a violation and can
- * never drift from each other.
+ * Hindsight's per-call LLM deadline for the INTERACTIVE lane — emitted as both
+ * `HINDSIGHT_API_LLM_TIMEOUT` (the global default, used by recall and the
+ * default LLM config) and `HINDSIGHT_API_REFLECT_LLM_TIMEOUT`, because both
+ * route to the `gpt-oss-20b` group.
+ *
+ * `90 (local) + 60 (openrouter fallback) + 10 (margin) = 160s`.
+ *
+ * Previously NOT EMITTED AT ALL, so it silently took hindsight's vendor default
+ * of 120s (`hindsight_api/config.py:733 DEFAULT_LLM_TIMEOUT`). When the
+ * interactive fallback hop was raised 25s → 60s on 2026-07-26 the chain became
+ * 150s against that unmoved 120s default, so the fallback could not complete —
+ * the same paired-drift defect as the retain lane, in the lane where a person
+ * is actually waiting. An unset knob is still half of a pair; it just has
+ * nobody's name on it. Emitting it explicitly is what makes it derivable.
+ *
+ * 160s is also the value Ken set for this lane on 2026-07-26, arrived at
+ * independently — the derivation reproduces it rather than replacing it.
+ *
+ * The measured interactive floor is comfortably under this: reflect durations
+ * over 24h (n=36) were max 118.2s, p99 95.5s, p95 82.9s, median 29.2s.
  */
-export function hindsightRetainBudgetEnv(): Array<[string, string]> {
+export function hindsightInteractiveLlmTimeoutSeconds(): number {
+  return clientBudgetSeconds(LITELLM_TIMEOUT_TIERS.interactive);
+}
+
+/**
+ * Hindsight's per-call LLM deadline for the CONSOLIDATION lane — emitted as
+ * `HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT`.
+ *
+ * `200 (local) + 90 (openrouter fallback) + 10 (margin) = 300s`.
+ *
+ * Also previously unemitted, so it took the same 120s vendor default while its
+ * routing chain was 290s — the identical defect as the interactive lane. The
+ * live symptom was in the logs: 173 `exceeded timeout=120.0s` errors and
+ * 160/630 consolidation calls needing at least one retry.
+ */
+export function hindsightConsolidationLlmTimeoutSeconds(): number {
+  return clientBudgetSeconds(LITELLM_TIMEOUT_TIERS.consolidation);
+}
+
+/**
+ * Every LLM timeout budget hindsight is handed, as `[key, value]` pairs.
+ *
+ * Asserted before it returns, so both emit paths ({@link startHindsight} and
+ * {@link generateHindsightComposeSnippet}) fail loudly on a violation and can
+ * never drift from each other — or from the litellm routing chain each budget
+ * is derived from.
+ *
+ * Two independent assertions run per lane:
+ *   - {@link assertClientBudget}: the budget covers `local + fallback + margin`,
+ *     so the router's fallback hop can actually complete (the 2026-07-25/26
+ *     defect).
+ *   - {@link assertHindsightRetainBudget}: retain-specific — the token cap
+ *     exceeds the chunk size (or the container refuses to boot) and hindsight's
+ *     deadline stays strictly under the plugin's POST deadline (#3611).
+ *
+ * Honest caveat, and it applies to BOTH of them from this call site:
+ *
+ *  - The three {@link assertClientBudget} calls below cannot fail as written.
+ *    Each budget comes from {@link clientBudgetSeconds}, which returns
+ *    `max(floor, local + fallback + margin)`, and the assertion's threshold is
+ *    that same `local + fallback + margin`. Asserting a value against the
+ *    lower bound it was clamped to is a tautology.
+ *  - {@link assertHindsightRetainBudget}'s `server < client` half is tautological
+ *    for the same reason: {@link HINDSIGHT_RETAIN_CLIENT_DEADLINE_S} is now
+ *    derived from {@link hindsightRetainClientTimeoutSeconds} plus one margin.
+ *    Its `maxCompletionTokens > chunkSize` half is NOT — those two are
+ *    independent constants and it can still fire.
+ *
+ * They are kept deliberately, as the guard that catches the NEXT edit rather
+ * than this one: the moment any lane's budget is hand-set, or read from config,
+ * or `clientBudgetSeconds` is bypassed, these stop being tautologies and become
+ * the emit-time failure that keeps a broken budget out of a container. They are
+ * defence in depth, not the primary mechanism, and this comment exists so
+ * nobody mistakes them for it.
+ *
+ * The checks that can actually FAIL today, and are therefore the load-bearing
+ * ones, all live in tests over files nothing derives:
+ *   - `src/litellm/timeout-budget.test.ts` exercises {@link assertClientBudget}
+ *     directly against the shipped-bug values (204/120) and its boundaries.
+ *   - `src/litellm/repo-config.test.ts` compares the declared tiers against the
+ *     real `docker/litellm-proxy/litellm-config.yaml`.
+ *   - `tests/setup/hindsight.test.ts` asserts
+ *     {@link HINDSIGHT_RETAIN_CLIENT_DEADLINE_S} equals
+ *     `DEFAULT_RETAIN_CLIENT_DEADLINE_S` in the plugin's `retain_split.py`.
+ */
+export function hindsightLlmBudgetEnv(): Array<[string, string]> {
   const maxCompletionTokens = HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS;
-  const serverTimeoutS = hindsightRetainLlmTimeoutSeconds(maxCompletionTokens);
+
+  const interactiveS = hindsightInteractiveLlmTimeoutSeconds();
+  const retainS = hindsightRetainClientTimeoutSeconds();
+  const consolidationS = hindsightConsolidationLlmTimeoutSeconds();
+
+  assertClientBudget({
+    role: "interactive",
+    tier: LITELLM_TIMEOUT_TIERS.interactive,
+    clientBudgetS: interactiveS,
+  });
+  assertClientBudget({
+    role: "retain",
+    tier: LITELLM_TIMEOUT_TIERS.retain,
+    clientBudgetS: retainS,
+  });
+  assertClientBudget({
+    role: "consolidation",
+    tier: LITELLM_TIMEOUT_TIERS.consolidation,
+    clientBudgetS: consolidationS,
+  });
+
   assertHindsightRetainBudget({
     maxCompletionTokens,
     chunkSize: HINDSIGHT_RETAIN_CHUNK_SIZE,
-    serverTimeoutS,
+    serverTimeoutS: retainS,
     clientDeadlineS: HINDSIGHT_RETAIN_CLIENT_DEADLINE_S,
   });
+
   return [
     ["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS", String(maxCompletionTokens)],
-    ["HINDSIGHT_API_RETAIN_LLM_TIMEOUT", String(serverTimeoutS)],
+    // Interactive lane: recall + the default LLM config, and reflect, both of
+    // which route to `gpt-oss-20b`. Emitted explicitly so the 120s vendor
+    // default can never silently become half of a mismatched pair again.
+    ["HINDSIGHT_API_LLM_TIMEOUT", String(interactiveS)],
+    ["HINDSIGHT_API_REFLECT_LLM_TIMEOUT", String(interactiveS)],
+    ["HINDSIGHT_API_RETAIN_LLM_TIMEOUT", String(retainS)],
+    ["HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT", String(consolidationS)],
   ];
 }
 
@@ -1116,10 +1281,12 @@ export function startHindsight(
     // Reflect wall timeout — let large-bank mental-model refreshes finish
     // (vendor 300s times out on 12k+ obs banks → stale user-profile models).
     "-e", `HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
-    // Retain output cap + its derived per-call deadline. Asserted consistent
-    // by hindsightRetainBudgetEnv() before it returns — see the constants
-    // above for the 767.6s runaway this replaces.
-    ...hindsightRetainBudgetEnv().flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+    // Retain output cap + the DERIVED per-call deadline for every lane
+    // (interactive / reflect / retain / consolidation). Asserted consistent by
+    // hindsightLlmBudgetEnv() before it returns — against the token budget
+    // (the 767.6s runaway, see the constants above) AND against each lane's
+    // litellm routing chain (src/litellm/timeout-budget.ts).
+    ...hindsightLlmBudgetEnv().flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     // Consolidation concurrency: throttled by #2894 to a hard ceiling of
     // MAX_SLOTS 1 × LLM_PARALLELISM 2 = 2 concurrent model calls (was 18), so
     // consolidation can never exhaust the shared failover quota. Batch size 12
@@ -1644,7 +1811,7 @@ export function generateHindsightComposeSnippet(
     `      - HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
     `      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
     // Retain budget — same derivation + assertion as the docker-run path.
-    ...hindsightRetainBudgetEnv().map(([k, v]) => `      - ${k}=${v}`),
+    ...hindsightLlmBudgetEnv().map(([k, v]) => `      - ${k}=${v}`),
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,

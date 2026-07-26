@@ -121,10 +121,15 @@ describe("evaluateQueueGrowth — rising vs draining", () => {
 
 describe("evaluateQueueGrowth — recalibrated for #3610's split (parts, not memories)", () => {
   it("does NOT fire on five worst-case memories splitting into 85 parts", () => {
-    // #3610 caps retain content at 45,000 chars; the largest entry measured
-    // on this fleet (744,546 chars) becomes 17 parts. Five such memories
-    // failing once is +85 entries with only five memories behind them, and
-    // must not read as "the spool turned around".
+    // #3610 caps retain content at `retain_content_limit()` — 45,000 chars
+    // when this case was measured, 48,000 since the client deadline became
+    // derived from the litellm routing chain (see B7a in ./thresholds.ts).
+    // At the 45,000 of the measurement the largest entry on this fleet
+    // (744,546 chars) becomes 17 parts. Five such memories failing once is
+    // +85 entries with only five memories behind them, and must not read as
+    // "the spool turned around". The scenario is kept at the measured
+    // numbers; the bound moving to 48,000 lowers it to 16 parts and makes
+    // this case strictly easier to pass, so it is still the worst case.
     //
     // The pre-#3610 thresholds WOULD have fired here: floor 100 (< 440) and
     // growth need max(20, 10%×440 = 44) = 44, which +85 clears. That is
@@ -264,7 +269,8 @@ describe("evaluateAll", () => {
     // backend already runs 19.4% of retains past it (measured 2026-07-25:
     // 52/268, with a 1.1% failure rate). Any threshold this instrument can
     // express fires permanently, so the signal was removed rather than
-    // retuned. Restoring it needs `le` edges above the 280s client deadline.
+    // retuned. Restoring it needs `le` edges above the retain client deadline
+    // (280s when this was measured, 310s since — see B7a in ./thresholds.ts).
     const verdicts = evaluateAll([sample(0), sample(1)]);
     expect(verdicts.some((v) => v.signal.includes("latency"))).toBe(false);
   });

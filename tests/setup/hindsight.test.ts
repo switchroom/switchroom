@@ -353,30 +353,123 @@ describe("hindsight broker-fed mode (#1245)", () => {
     );
   });
 
-  it("derives the retain server timeout from the token cap rather than hardcoding it", async () => {
+  it("keeps #3611's token-derived value as a FLOOR on the retain deadline", async () => {
     const h = await import("../../src/setup/hindsight.js");
-    // ceil(16384 / 80.6) = 204
+    // ceil(16384 / 80.6) = 204. Unchanged, and still derived from the cap:
+    // double the cap and the floor follows.
     expect(h.hindsightRetainLlmTimeoutSeconds()).toBe(204);
-    // Derived, not constant: double the cap and the deadline follows.
     expect(h.hindsightRetainLlmTimeoutSeconds(32768)).toBe(407);
     expect(h.hindsightRetainLlmTimeoutSeconds(16384, 40)).toBe(410);
-
-    startHindsight({ apiPort: 8888, uiPort: 9999 });
-    const envPairs = envPairsFromArgs(findRunArgs());
-    expect(envPairs).toContain(
-      `HINDSIGHT_API_RETAIN_LLM_TIMEOUT=${h.hindsightRetainLlmTimeoutSeconds()}`,
-    );
-    expect(h.generateHindsightComposeSnippet()).toContain(
-      `HINDSIGHT_API_RETAIN_LLM_TIMEOUT=${h.hindsightRetainLlmTimeoutSeconds()}`,
+    // …but it is a floor, not the answer: the litellm retain chain
+    // (200 + 90 + 10 margin) is larger, so the emitted deadline is that.
+    expect(h.hindsightRetainClientTimeoutSeconds()).toBe(300);
+    expect(h.hindsightRetainClientTimeoutSeconds()).toBeGreaterThanOrEqual(
+      h.hindsightRetainLlmTimeoutSeconds(),
     );
   });
 
-  it("holds the shipped budget: server per-call timeout < retain client deadline", async () => {
+  it("emits a retain deadline that COVERS the litellm fallback hop (the #3611 gap)", async () => {
     const h = await import("../../src/setup/hindsight.js");
-    expect(h.hindsightRetainLlmTimeoutSeconds()).toBeLessThan(
+    const tb = await import("../../src/litellm/timeout-budget.js");
+    // The bug: #3611 shipped HINDSIGHT_API_RETAIN_LLM_TIMEOUT=204 (confirmed
+    // live on switchroom-hindsight 2026-07-26) while the litellm retain chain
+    // under it was 200 + 90 = 290. The fallback hop had 4s of headroom and
+    // could never complete. This asserts the emitted value covers the chain.
+    const emitted = h.hindsightRetainClientTimeoutSeconds();
+    expect(emitted).toBeGreaterThanOrEqual(
+      tb.minimumClientBudgetSeconds(tb.LITELLM_TIMEOUT_TIERS.retain),
+    );
+    expect(emitted).toBe(300);
+    expect(emitted).not.toBe(204); // the shipped bug
+
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const envPairs = envPairsFromArgs(findRunArgs());
+    expect(envPairs).toContain(`HINDSIGHT_API_RETAIN_LLM_TIMEOUT=${emitted}`);
+    expect(h.generateHindsightComposeSnippet()).toContain(
+      `HINDSIGHT_API_RETAIN_LLM_TIMEOUT=${emitted}`,
+    );
+  });
+
+  it("emits the INTERACTIVE budget (160s) rather than leaving the 120s vendor default", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // Neither HINDSIGHT_API_LLM_TIMEOUT nor HINDSIGHT_API_REFLECT_LLM_TIMEOUT
+    // was emitted at all before this, so both silently took
+    // hindsight_api/config.py DEFAULT_LLM_TIMEOUT = 120.0 while the litellm
+    // interactive chain became 90 + 60 = 150. An unset knob is still half of a
+    // pair. 90 + 60 + 10 = 160 — the value Ken set for this lane, derived.
+    expect(h.hindsightInteractiveLlmTimeoutSeconds()).toBe(160);
+
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const envPairs = envPairsFromArgs(findRunArgs());
+    const snippet = h.generateHindsightComposeSnippet();
+    for (const key of ["HINDSIGHT_API_LLM_TIMEOUT", "HINDSIGHT_API_REFLECT_LLM_TIMEOUT"]) {
+      expect(envPairs).toContain(`${key}=160`);
+      expect(snippet).toContain(`${key}=160`);
+    }
+  });
+
+  it("emits the CONSOLIDATION budget (300s) rather than leaving the 120s vendor default", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // Same defect, third lane: 173 `exceeded timeout=120.0s` errors observed
+    // against a 200 + 90 = 290s chain.
+    expect(h.hindsightConsolidationLlmTimeoutSeconds()).toBe(300);
+
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    expect(envPairsFromArgs(findRunArgs())).toContain(
+      "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT=300",
+    );
+    expect(h.generateHindsightComposeSnippet()).toContain(
+      "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT=300",
+    );
+  });
+
+  it("holds the shipped budget end to end: chain <= per-call timeout < client deadline", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    const tb = await import("../../src/litellm/timeout-budget.js");
+    // The whole three-deadline stack, asserted as one chain:
+    //   litellm 200+90 (+10 margin) = 300 <= 300 < 310
+    expect(tb.minimumClientBudgetSeconds(tb.LITELLM_TIMEOUT_TIERS.retain)).toBeLessThanOrEqual(
+      h.hindsightRetainClientTimeoutSeconds(),
+    );
+    expect(h.hindsightRetainClientTimeoutSeconds()).toBeLessThan(
       h.HINDSIGHT_RETAIN_CLIENT_DEADLINE_S,
     );
-    expect(() => h.hindsightRetainBudgetEnv()).not.toThrow();
+    expect(h.HINDSIGHT_RETAIN_CLIENT_DEADLINE_S).toBe(310);
+    expect(() => h.hindsightLlmBudgetEnv()).not.toThrow();
+  });
+
+  it("keeps the reflect WALL timeout above the reflect per-call timeout", async () => {
+    // Third deadline on the same lane: HINDSIGHT_API_REFLECT_WALL_TIMEOUT
+    // bounds the whole agentic reflect loop, which makes SEVERAL per-call LLM
+    // requests. If the per-call budget ever grew past the wall budget, reflect
+    // would be killed by its own wall clock before a single call could use its
+    // full deadline — the same paired-drift class, one level up.
+    const h = await import("../../src/setup/hindsight.js");
+    const perCall = Number(new Map(h.hindsightLlmBudgetEnv()).get("HINDSIGHT_API_REFLECT_LLM_TIMEOUT"));
+    expect(perCall).toBeGreaterThan(0);
+    expect(h.HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S).toBeGreaterThan(perCall);
+  });
+
+  it("every emitted LLM timeout covers its own litellm routing chain", async () => {
+    // The general form of the bug, asserted over whatever is emitted rather
+    // than over specific numbers: if any lane's budget ever drops below its
+    // chain again, this fails regardless of which lane or which half moved.
+    const h = await import("../../src/setup/hindsight.js");
+    const tb = await import("../../src/litellm/timeout-budget.js");
+    const env = new Map(h.hindsightLlmBudgetEnv());
+    const lanes: Array<[string, tb.LitellmTimeoutTier]> = [
+      ["HINDSIGHT_API_LLM_TIMEOUT", tb.LITELLM_TIMEOUT_TIERS.interactive],
+      ["HINDSIGHT_API_REFLECT_LLM_TIMEOUT", tb.LITELLM_TIMEOUT_TIERS.interactive],
+      ["HINDSIGHT_API_RETAIN_LLM_TIMEOUT", tb.LITELLM_TIMEOUT_TIERS.retain],
+      ["HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT", tb.LITELLM_TIMEOUT_TIERS.consolidation],
+    ];
+    for (const [key, tier] of lanes) {
+      const raw = env.get(key);
+      expect(raw, `${key} must be emitted, not left to the vendor default`).toBeDefined();
+      expect(() =>
+        tb.assertClientBudget({ role: key, tier, clientBudgetS: Number(raw) }),
+      ).not.toThrow();
+    }
   });
 
   it("keeps HINDSIGHT_RETAIN_CLIENT_DEADLINE_S equal to the plugin's own constant", async () => {
@@ -396,6 +489,39 @@ describe("hindsight broker-fed mode (#1245)", () => {
     const m = src.match(/^DEFAULT_RETAIN_CLIENT_DEADLINE_S\s*=\s*([0-9.]+)\s*$/m);
     expect(m, "retain_split.py must define DEFAULT_RETAIN_CLIENT_DEADLINE_S").not.toBeNull();
     expect(Number(m![1])).toBe(h.HINDSIGHT_RETAIN_CLIENT_DEADLINE_S);
+  });
+
+  it("keeps the backlog drain's per-entry deadline above the retain routing chain", async () => {
+    // The OUTERMOST member of the paired-budget family, and the one that
+    // produced the unexplained ~280.1s per-entry give-up in the 2026-07-26
+    // backlog-recovery logs. It is not a third hand-set number: the drainer's
+    // `_backlog_timeout()` defaults to `int(retain_client_deadline())`
+    // (vendor/hindsight-memory/scripts/drain_pending.py:220), which reads
+    // DEFAULT_RETAIN_CLIENT_DEADLINE_S — 280.0 at the time. 280 < 300, so
+    // every drained entry that fell through to the OpenRouter fallback was
+    // abandoned client-side while the server was still inside a legitimate
+    // budget, and the entry stayed queued to burn another attempt.
+    //
+    // This asserts the OUTCOME (the outer deadline covers the whole chain),
+    // not the number, so it fails on the 280 shape and on any future edit
+    // that lowers either side independently.
+    const h = await import("../../src/setup/hindsight.js");
+    const tb = await import("../../src/litellm/timeout-budget.js");
+
+    const drainSrc = readFileSync(
+      join(process.cwd(), "vendor/hindsight-memory/scripts/drain_pending.py"),
+      "utf8",
+    );
+    expect(
+      drainSrc,
+      "the drain deadline must stay DERIVED from retain_client_deadline(), not a literal",
+    ).toContain("int(retain_client_deadline())");
+
+    const chain = tb.minimumClientBudgetSeconds(tb.LITELLM_TIMEOUT_TIERS.retain);
+    expect(chain).toBe(300);
+    expect(h.HINDSIGHT_RETAIN_CLIENT_DEADLINE_S).toBeGreaterThan(chain);
+    // The exact regression: the shipped 280 must not satisfy this.
+    expect(280).toBeLessThan(chain);
   });
 
   it("refuses to emit a budget where the server outlives the client deadline", async () => {

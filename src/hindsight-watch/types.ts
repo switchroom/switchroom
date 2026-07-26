@@ -40,8 +40,11 @@ export interface Sample {
    * Live spooled retains across the fleet (`*.json`).
    *
    * Post-#3610 this counts memory PARTS, not memories: one oversized
-   * transcript enqueues one entry per 45,000-char part. Every threshold
-   * compared against it is scaled by `PARTS_PER_MEMORY`.
+   * transcript enqueues one entry per part, where the part size is derived
+   * from the retain client deadline (`retain_content_limit()`; 45,000 chars at
+   * the 280s deadline #3610 shipped, 48,000 at the 310s it is now — see B7a in
+   * `thresholds.ts`). Every threshold compared against it is scaled by
+   * `PARTS_PER_MEMORY`.
    */
   pending: number;
   /** permanently-failed spooled retains across the fleet (`*.json.dead`) */

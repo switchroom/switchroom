@@ -75,7 +75,9 @@ export type GatewaySignal =
  *  agent's turns.jsonl or gateway log. Each sensor reads a hard artifact
  *  (an operator-maintained config file, etc.) and emits a finding when the
  *  invariant it guards is violated. */
-export type SensorSignal = "litellm-header-passthrough-misconfig";
+export type SensorSignal =
+  | "litellm-header-passthrough-misconfig"
+  | "litellm-timeout-budget-drift";
 
 export type L0Signal = TurnSignal | GatewaySignal | SensorSignal;
 

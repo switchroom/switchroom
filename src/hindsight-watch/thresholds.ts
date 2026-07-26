@@ -66,6 +66,21 @@
  *      ~276 s of server work is now WITHIN the design envelope rather than
  *      pathological. B5 is superseded.
  *
+ *  B7a REVISION: #3611's 204 s was derived from the token budget ALONE and
+ *      did not cover the litellm routing chain underneath it
+ *      (`gpt-oss-20b-retain` 200 s + `gpt-oss-20b-retain-openrouter` 90 s =
+ *      290 s), so the retain fallback hop had 4 s of headroom and could never
+ *      complete. Both budgets are now derived from
+ *      `src/litellm/timeout-budget.ts` as `max(token-derived floor, local +
+ *      fallback + margin)`: `HINDSIGHT_API_RETAIN_LLM_TIMEOUT = 300` and
+ *      `HINDSIGHT_RETAIN_CLIENT_DEADLINE_S = 310`, which moves
+ *      `retain_content_limit()` 45,000 → 48,000 chars
+ *      (3000 × floor(310 / 18.4) = 3000 × 16). The B6 part-count figures
+ *      above are stated against 45,000 and are left as the measured record;
+ *      re-derived at 48,000 they shift by ~6 %, inside the noise
+ *      {@link PARTS_PER_MEMORY} is calibrated against, and move no threshold
+ *      in this file.
+ *
  *  B8  Live `/metrics`, 2026-07-25 16:44 UTC, container up since
  *      2026-07-25T14:01:35Z (2.7 h), health `healthy`, RestartCount 0:
  *        retain operations   265 success / 3 failure  ⇒  1.1 % failure rate
