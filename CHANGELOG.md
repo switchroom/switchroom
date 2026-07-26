@@ -2,7 +2,286 @@
 
 ## Unreleased
 
-### Memory recall reranks on the GPU when the host has one
+## v0.19.23 — the retain queue drains and stops losing memories, capability-gated hindsight performance defaults, bounded adversarial review, a 22% smaller agent prompt
+
+### The always-loaded agent prompt is ~22% smaller, and ratcheted (#3709)
+
+The rendered `CLAUDE.md` for the worst-case stack (root-tier + default profile)
+went from 39,909 B / 479 lines to 31,506 B / 370 lines (-21.1%); the plain
+non-admin default from 35,062 B / 448 lines to 27,368 B / 342 lines (-21.9%).
+
+The cut is structural, not cosmetic. Delegation was stated **three** times with
+competing absolutes (`## Sub-Agent Delegation`, `## Execution Bias`,
+`## Delegation — the last word`; 4,354 B of overlap); it is now stated once, in
+the unconditionally-appended delegation fragment, still appended LAST so it keeps
+the tail recency #3231 bought. The "never wait more than 10 seconds" vs "always
+delegate" conflict resolves into one criterion — dispatching IS the fast
+response. The steer-or-queue rule, previously duplicated in the default and
+coding templates only, moves into the fragment and so now reaches EVERY profile.
+Grounding merged into the same fragment as the pacing rule it used to contradict.
+
+The root-tier block's claim to "supersede" the admin surface because hostd verbs
+"aren't wired into your container" was **false** — `scaffold.ts` wires hostd for
+`admin === true || root === true`, `compose.ts` documents that `root: true`
+forces admin semantics on, and hostd gates server-side in `checkGate`. Both
+blocks are kept, compressed, and reframed accurately by path: the agent's own
+shell (`docker`, `/host`, `/host-home`) is un-tapped, while hostd verbs are wired
+AND still gated on an operator approval card.
+
+Every switchroom-specific gotcha is preserved (VAULT-BROKER-DENIED recovery,
+`/host` semantics, `resume_interrupted` vs `resume_watchdog_timeout`, `NO_REPLY`,
+the cron floor/quota numbers, the intent→tool trigger table). What was dropped is
+per-tool parameter narration and `E_*` code lists that duplicate the MCP tool
+schemas.
+
+### Adversarial review is bounded by a severity gate and a round cap (#3707)
+
+"Fix ALL findings including lows, then re-review the fix" is a loop generator by
+construction: a reviewer always surfaces lows, fixing lows makes a new diff, and
+a new diff earned another re-review. Observed on #3702 (the reviewer's own
+verdict was MERGEABLE + file the lows; the rule overrode it into an extra round
+whose sole finding was a doc comment) and on PRs that ran four rounds.
+
+- **Severity gate:** blockers and mediums block the merge; lows do not. A low is
+  fixed inline only if it is a genuine one-liner, otherwise it is filed as a
+  follow-up issue and the PR merges. Filing is mandatory — tracked, not waived.
+- **Re-review trigger:** only a *behavioural* fix earns another adversarial pass.
+  A fix commit confined to docs, comments, log strings or tests does not.
+- **Deterministic round cap:** commits answering a review round are
+  `review-fix:`-prefixed, `scripts/check-review-rounds.mjs` counts them from git
+  history, and `ci-review-rounds.yml` fails a third round. The only way past is
+  the durable `review-cap-override` PR label.
+
+`ci-review-rounds.yml` is advisory until an operator adds `review-rounds` to
+ruleset 16470166 (the command is in the workflow header).
+
+### An inconclusive backstop read-back is no longer a delivery failure (#3702)
+
+#3278 made the backstop delivery verdict confirmation-gated: `delivered` required
+every chunk to be `landed-confirmed` by the read-back probe. The probe is
+tri-state, and its third state — `ambiguous` (429/5xx/network/gate shed) —
+establishes nothing. Treating it as not-delivered inverted the guard: the turn
+was recorded `send_failed`, the status reaction painted error, and the delivery
+obligation stayed OPEN for a re-present, all for an answer the user demonstrably
+received. Across the live fleet the probe resolved `ambiguous` 146 times and
+`absent` 0 times — it is issued at cosmetic priority in the same millisecond as
+the send it probes, so the per-chat token bucket sheds it every time. Those turns
+are the `send_failed` cluster the fleet-health ledger ranked second (priority
+47.00, 172 occurrences).
+
+The verdict is now evidence-based: every chunk LANDED, and at least one landed id
+is a fresh non-card chat id (the receipt gate). A probe can still *lower* the
+verdict — an `absent` result demotes the chunk to `unsent` — which keeps #3278's
+real contribution while an inconclusive probe changes nothing. Also fixes a
+latent false positive in the probe: `createBackstopReadBack` classified any
+non-shed gate result as `exists`, but a gate no-op drop or an expired queue entry
+resolves `undefined` without ever reaching Telegram — that is `ambiguous`, not
+proof of presence. The landed-but-uncorroborated ids are now a first-class result
+field (`landedUnconfirmedIds`), stamped on the turn as `landed_unconfirmed`
+(omitted when 0, so an ordinary `turns.jsonl` row is byte-identical) and reported
+by `scanAgent` as `landed_unconfirmed_turns` — counted, never escalated.
+
+Known and not fixed here: the probe is 100% shed in production, so #3278's
+absence detection is effectively dead. Raising its priority is not a one-liner.
+
+### Test turn records no longer pollute production `turns.jsonl` (#3701)
+
+`emitTurnRecord` hard-coded `/state/agent/turns.jsonl`, ignoring
+`SWITCHROOM_AGENT_STATE_DIR` — which the sibling context-occupancy writer in the
+same file already honours. Inside an agent container that path is the
+bind-mounted production `~/.switchroom/agents/<name>/turns.jsonl`, so a
+characterization test driving the real turn-end funnel appended synthetic rows
+straight into a live agent's turn record even though it had isolated
+`TELEGRAM_STATE_DIR` into a tmpdir. The fleet-health L0 sensor then read them
+back as production turns: **267 of the 377** live silent-no-op candidates across
+the fleet on 2026-07-26 were foreign rows, so the top ledger entry (priority
+53.83) was mostly test fixtures.
+
+Three layers, write-side to read-side: `resolveTurnsJsonlPath()` makes the writer
+honour the state-dir env var (production containers do not set it, so the default
+is unchanged); a vitest setup file plus a `bunfig.toml` preload point
+`SWITCHROOM_AGENT_STATE_DIR` at a per-worker tmpdir when unset, so hermeticity is
+runner-enforced rather than a discipline future authors must remember; and
+`ownedTurns()` drops rows attributed to a different agent in
+`detectTurnFindings`/`scanAgent`, so the 356 foreign rows already on disk never
+enter findings, the turn count or the status mix — without rewriting operator
+state. The attribution filter is total: a non-string `agent` is unattributable
+and therefore KEPT (the pre-PR inert behaviour), `turn_id` is type-guarded the
+same way, and `parseTurns` skips lines that parse to a non-object, so one junk
+byte on disk can no longer throw the whole agent into `skipped[]`.
+
+### No recoverable memory can be destroyed by a janitor (#3697)
+
+A `.dead` marker is the ONLY remaining copy of its memory — `mark_dead` unlinks
+the live entry once the marker is durable — and it was written INSIDE
+`pending-retains/`, the one directory external janitorial tooling has every
+reason to sweep. A host cron on this fleet did exactly that
+(`find <queue> -name '*.dead' -mtime +14 | xargs rm -f`); measured 2026-07-26, 6
+markers were live in the queue directory, each on a countdown to permanent
+deletion. Fixing the cron is not a fix — the next janitor has the same shape.
+
+1. **Dead markers leave the live queue.** `mark_dead` retires into a new
+   `pending-dead/` sibling, so the queue directory holds only live entries and no
+   glob over it can match a memory. `sweep_legacy_dead_markers` (drain phase 0b)
+   relocates markers an older build left behind. Failure is never deletion: if
+   the marker cannot be written, the live entry stays exactly where it is.
+   `pending-dead/` is uncapped structurally — `_trim_dir` selects `*.json` and a
+   marker is `<entry>.json.dead`, so pointing a trim at it with a zero cap still
+   removes nothing.
+2. **Over-bound entries are re-split, not retired.** An entry larger than
+   `retain_content_limit()` needs more sequential extraction calls than fit the
+   client deadline, so it is not slow, it is impossible.
+   `resplit_over_bound_entries` (drain phase 0c) splits it into drainable parts;
+   the original is archived into `pending-resplit/` only after a part is actually
+   written — a re-split that wrote nothing (the single-part dedupe-hit case) must
+   not archive the original — and on every failure path it stays queued. This is
+   also the queue's standing response to the bound MOVING, which #3693 makes
+   routine.
+
+Both observability paths sum the new location, so the relocation cannot silently
+read as "0 dead": `probeSpool` for hindsight-watch, and the doctor's
+per-container probe script.
+
+### The retain queue drains on a schedule, serialised per agent (#3689)
+
+`pending-retains` had exactly one automatic consumer: the SessionStart hook,
+which runs once per session boot under a hard ~9s latency budget against work
+measured at 85-280s per entry. An agent that simply stays up therefore never
+drained at all. Measured on this fleet 2026-07-26: 8 of 11 agents had drained
+nothing and the queue had reached 1,060 files. A memory stuck in that queue is a
+memory the agent cannot recall.
+
+A fifth supervised sidecar (`hindsight-drain`) is rendered in `start.sh` for
+agents with hindsight enabled. Periodic, not boot-only (default every 900s, floor
+60s, `SWITCHROOM_HINDSIGHT_DRAIN_INTERVAL_S` to override,
+`SWITCHROOM_HINDSIGHT_DRAIN=0` as a kill switch). Serialised: `flock -n` on
+`$HOME/.hindsight/drain.lock` makes overlapping runs impossible — an overshooting
+run causes the next tick to SKIP, never to stack — and that is the same lock path
+the out-of-band recovery tooling takes, so a manual sweep and this loop mutually
+exclude. Lane-respecting: `HINDSIGHT_DRAIN_CONCURRENCY` stays at 1, and the first
+tick is delayed by a deterministic per-agent offset so the fleet does not wake
+together against the 4 shared LLM slots (the honest limit — N agents × 1 lane
+still exceeds 4 — is documented at the call site). And deterministic: it runs
+because the container is up, with no model turn and nothing an agent can prompt
+away.
+
+### The pending retain queue is keyed on content, not `document_id` (#3688)
+
+The retain queue was refilling itself faster than it drained. Its dedupe key was
+`(bank_id, document_id, sha256(content))`, and `document_id` is NOT stable across
+re-enqueues of the same memory: `subagent_retain.py` stamps the sub-agent's own
+session id into it, so every SubagentStop queued a near-identical slice of the
+SAME parent transcript under a fresh id and the guard matched nothing. Measured
+on this fleet 2026-07-26: 1,060 queued files across 11 agents collapsed to ~368
+distinct `(bank, position, content)` groups — ~65% duplicates, top group 32× (32
+document ids over one byte-identical 45,000-char part). At ~168s per LLM
+extraction that one group was 90 minutes of saturated lane time for a single
+memory.
+
+The key is now `(bank_id, part_position, sha256(content))`. The part *index*
+stays in because `split_retain_content` cuts on a character bound, so repetitive
+content yields byte-identical parts and merging those would leave the document
+missing positions upstream; discarding the *total* is what collapses the measured
+group, whose members carried `-p7of15`/`-p7of16`/`-p7of18` over identical bytes.
+Because `enqueue`'s filename key only protects entries queued by this build,
+`collapse_duplicates()` recomputes identity from CONTENT for every live entry and
+runs as phase 0 of the backlog drain, before any GET or extraction is paid for.
+Losers MOVE into a bounded `pending-duplicate/` archive — the module's
+archive-never-delete promise holds.
+
+### Retain parts are sized to a fraction of the client deadline (#3693)
+
+`retain_content_limit()` derived the split bound as
+`chunk_size * floor(deadline / latency)`, which sizes a maximally-sized part to
+consume ~100% of the client deadline BY CONSTRUCTION: 16 chunks × 18.4s = 294.4s
+against a 310s deadline is 15.6s of headroom for the POST, server queueing, and
+any chunk slower than the n=752 MEAN that latency input is. Half of all
+extraction calls are slower than the mean, so a part sized to the mean missed its
+deadline about half the time. `drain_pending._backlog_timeout()` defaults to that
+same deadline, so the drainer inherited the same zero margin, timed the entry
+out, bumped its attempt count and eventually aged the memory to `.dead` — every
+`.dead` marker on this fleet on 2026-07-26 held 16,076-44,568 chars, i.e. every
+one sat UNDER the then-current 45,000 bound and still could not finish.
+
+A deadline-safety fraction (default 0.7, `HINDSIGHT_RETAIN_DEADLINE_SAFETY`,
+clamped to (0,1] so it can never reintroduce the overrun) takes the bound to
+33,000 chars: 202.4s against 310s, 107.6s of headroom, enough for a chunk
+distribution ~50% worse than its own mean. 0.7 independently matches the 30,000
+limit the host-side stopgap converged on empirically. Total LLM work is unchanged
+— the chunk count across a logical memory is the same, only its grouping into
+parts changes — so the cost is more parts, each of which now finishes.
+hindsight-watch's `PARTS_PER_MEMORY` rescales 4.4 → 6.0 with it, because that
+factor is calibrated against the bound and a 45% bound change is not inside the
+noise.
+
+### Capability-gated hindsight performance defaults (#3700)
+
+Hindsight recall p90 is 5.83s and reflect p90 is 122s on this host class, against
+upstream's published 100-600ms recall and 800-3000ms reflect — 10-58× off. The
+cause is I/O and CPU bound, not algorithmic: `memory_links` is 16,604,592 rows /
+7,242 MB and `memory_units` 559,316 rows / 3,443 MB in a 12 GB DB, and
+graph/link_expansion is bimodal (p50 0.024s vs p90 1.412s) — cold buffer misses,
+not bad plans.
+
+New `src/setup/hindsight-perf-defaults.ts` holds the pure, testable core:
+ungated on every host, `RECALL_MAX_CANDIDATES_PER_SOURCE=60`,
+`LINK_EXPANSION_PER_ENTITY_LIMIT=50`, `LINK_EXPANSION_TIMEOUT=2`,
+`LLM_REASONING_EFFORT=low`; gated on the existing GPU verdict,
+`RERANKER_LOCAL_FP16=true`; gated on a new self-hosted-LLM-endpoint verdict
+(`hindsightLocalLlmEnabled`), `LLM_MAX_CONCURRENT=4`,
+`RETAIN_LLM_MAX_CONCURRENT=1`, `CONSOLIDATION_LLM_MAX_CONCURRENT=1`. Both launch
+paths route through one resolver so the docker-run argv and the compose snippet
+stay in parity by construction, and a parity test asserts it. Operators override
+via a new allowlisted `hindsight.env` in `switchroom.yaml` or the process
+environment (yaml outranks env); an override REPLACES the default rather than
+being appended after it, and is emitted even when its capability group is off.
+
+Deliberately not shipped: `DB_MAX_PARALLEL_WORKERS_PER_GATHER=0` (upstream scopes
+it to background-worker processes; this container runs one process, so setting it
+would serialise the very recall path this is speeding up — a test asserts neither
+path emits it), and `RERANKER_MAX_CANDIDATES`, which stays at 150.
+
+Also fixes a pre-existing bug in `isLoopbackHttpUrl`:
+`new URL("http://[::1]:4010").hostname` is `"[::1]"` **with** brackets, so the
+`h === "::1"` comparison never matched and an IPv6-loopback LiteLLM base was
+classified remote — `hindsightNeedsHostNetwork()` then left hindsight on the
+bridge network, the silent-retain outage class.
+
+### Embedded pg0 is sized against the container it actually runs in (#3708)
+
+Hindsight's embedded PostgreSQL bakes its tuning into the child's ARGV, and two
+values were wrong for this container by a wide margin.
+`effective_cache_size=1GB` is a ~5× under-declaration — the live cgroup was
+carrying 5,212 MiB of reclaimable page cache on top of the buffer pool inside an
+8 GiB `mem_limit` — and `shared_buffers=256MB` against a ~12 GB bank is ~2% of
+the data, which is precisely the bimodal cold/hot distribution #3700 measured.
+
+Postgres ranks the `command line` source ABOVE both `postgresql.conf` and
+`postgresql.auto.conf`, so `ALTER SYSTEM SET` cannot move them (verified live:
+`ALTER SYSTEM` + `pg_reload_conf()` left `pg_settings` reporting the old value
+with `source='command line'`). The one route that works is
+`EmbeddedPostgres.ensure_running()` short-circuiting on an already-running
+instance, so `docker/hindsight-entrypoint.sh` now PRE-STARTS pg0 with tuned `-c`
+flags and `hindsight_api` adopts the tuned cluster. New
+`src/setup/hindsight-pg-defaults.ts` follows the #3700 pattern — named constants,
+a derived budget (8192 MiB limit − 2560 app anon − 2048 page-cache floor = 3584
+MiB), one resolver shared by both launch paths, and an operator override with an
+`off` sentinel per knob. Defaults: `effective_cache_size=4096MB`,
+`shared_buffers=1536MB` (19% of the ceiling, under the conventional 25%).
+
+The pre-start is best-effort by construction: a missing pg0 binary, a
+non-embedded `HINDSIGHT_API_DB_URL`, a differently-named instance or a failed
+`pg0 start` all log and return 0. A sizing change can never be why the container
+fails to boot.
+
+Two premises this work started from were corrected, both verified live: the
+planner is NOT choosing seq scans on `memory_links` (no Seq Scan in any EXPLAIN
+variant at 20/100/300 seeds; `pg_stat_user_tables` has 13 seq scans vs 1,875,153
+index scans — what `effective_cache_size` buys is ~12% more accurate cost
+pricing), and raising `shared_buffers` does NOT require raising `shm_size` in
+lockstep on this build, because pg0 runs postgres with `shared_memory_type=mmap`.
+
+### Memory recall reranks on the GPU when the host has one (#3698)
 
 Reranking was the single largest slice of every recall: 2.5-4.0s of a 5.83s
 total on this fleet's host, and the `overlord` bank timed out against its 8s
@@ -25,7 +304,7 @@ Embeddings come along for free. They run on the same torch, and make the same
 device probe, so they move to the GPU with no extra work — a smaller win
 (tens of milliseconds a call, not seconds), but a free one.
 
-### Recall no longer runs the same vector scan twice
+### Recall no longer runs the same vector scan twice (#3699)
 
 `retrieve_all_fact_types_parallel` ran the ANN scan
 (`ORDER BY embedding <=> $1::vector`) once for the semantic arm, discarded it,
