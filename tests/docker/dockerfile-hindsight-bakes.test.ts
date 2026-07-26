@@ -631,6 +631,14 @@ describe("Dockerfile.hindsight shape", () => {
     // response id on the repeat, vs 37.66s and a new id once the cache was
     // bypassed). That is how a transient bad completion burned all attempts
     // and failed a retain — which in turn aged a queued memory toward .dead.
+    //
+    // SCOPE: this test is structural, not behavioural. Every assertion below
+    // is an unanchored substring match, so it proves the patch is PRESENT,
+    // never that it RUNS — indenting the perturbation body under a falsy
+    // guard keeps all of them green (measured 2026-07-26). The behavioural
+    // gate is tests/docker/hindsight-retry-perturbation-patches.test.ts,
+    // which applies this block to the pinned image and asserts the retry is
+    // actually a different request. Do not treat this file as sufficient.
 
     // The exact-once anchor guard (fail-loud on upstream drift).
     expect(dockerfile).toMatch(
@@ -646,12 +654,14 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /if call_kwargs\.get\("temperature"\) is not None:/,
     );
-    // And it is capped at 0.7, not 1.0. `call()` defaults to max_retries=10,
-    // so a +0.3 ramp from 0.1 saturates by attempt 4 and spends the rest at
-    // the cap. The json_schema response_format is advisory (one of the two
-    // measured bad bodies was prose emitted while a schema was set), so a cap
-    // of 1.0 would make the LATE attempts the likeliest to emit invalid JSON
-    // — a retry strategy that degrades as it goes.
+    // And it is capped at 0.7, not 1.0. The json_schema response_format is
+    // advisory (one of the two measured bad bodies was prose emitted while a
+    // schema was set), so a cap of 1.0 would make the LATE attempts the
+    // likeliest to emit invalid JSON — a retry strategy that degrades as it
+    // goes. An uncapped +0.3 ramp from 0.1 always ENDS on 1.0: the retain
+    // path runs 4 attempts (0.1/0.4/0.7/1.0 — fact_extraction.py passes
+    // max_retries=llm_max_retries, DEFAULT_LLM_MAX_RETRIES=3), and a caller
+    // taking `call()`'s own max_retries=10 default saturates by attempt 4.
     expect(dockerfile).toMatch(
       /0\.7, float\(call_kwargs\["temperature"\]\) \+ 0\.3/,
     );

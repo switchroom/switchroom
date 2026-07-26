@@ -110,6 +110,7 @@ jobs:
               - 'docker/Dockerfile.hindsight'
               - 'tests/docker/hindsight-search-patches.test.ts'
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
+              - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -307,10 +308,21 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-recall-isolation-patches.test.ts
 
+      - name: Run the hindsight retry-perturbation probe (RED/GREEN, must not skip)
+        # Same contract again, for the perturbed-JSON-retry patch (#3669).
+        # This is the layer the bakes test structurally CANNOT provide:
+        # its assertions are unanchored substring matches, so indenting the
+        # perturbation under a falsy guard leaves all 24 of them green while
+        # the behaviour is gone (measured 2026-07-26 — bakes 24/24 pass,
+        # this probe goes red on TEMPERATURES/DISTINCT_RETRY_REQUESTS).
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-retry-perturbation-patches.test.ts
+
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

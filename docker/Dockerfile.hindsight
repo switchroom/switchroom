@@ -2161,10 +2161,11 @@ print(
 PYEOF
 
 # Perturbed JSON retry: upstream's `except json.JSONDecodeError` handler in
-# `LiteLLMProvider.call()` sleeps and then re-issues the SAME `call_kwargs` —
-# a byte-identical request. Behind a caching LiteLLM proxy that is not a retry
-# at all: the proxy replays the identical unparseable body from its response
-# cache, so all N attempts consume one bad completion and the retain fails.
+# `LiteLLMLLM.call()` (litellm_llm.py:50, :216) sleeps and then re-issues the
+# SAME `call_kwargs` — a byte-identical request. Behind a caching LiteLLM
+# proxy that is not a retry at all: the proxy replays the identical
+# unparseable body from its response cache, so all N attempts consume one bad
+# completion and the retain fails.
 #
 # Measured on this host 2026-07-26 (fleet backlog drain), against the proxy at
 # 127.0.0.1:4010 with a fresh random marker in the prompt:
@@ -2188,16 +2189,25 @@ PYEOF
 #  2. A capped temperature bump — only when the caller already set a
 #     temperature (so models that reject the parameter are untouched). Retain
 #     extraction runs at 0.1, i.e. near-greedy, so an uncached resample would
-#     otherwise reproduce the same malformed output. The cap is 0.7, not 1.0:
-#     `call()` takes max_retries=10 by default, so a +0.3 ramp would sit at
-#     1.0 for most attempts, and the requested json_schema is advisory rather
-#     than enforced (one measured bad body was prose emitted WITH a schema
-#     set). Ramping to 1.0 would make the late attempts the likeliest to
-#     produce invalid JSON — backwards for a retry.
+#     otherwise reproduce the same malformed output. The cap is 0.7, not 1.0,
+#     because the requested json_schema is advisory rather than enforced (one
+#     measured bad body was prose emitted WITH a schema set), so 1.0 makes
+#     malformed JSON MORE likely — and an uncapped +0.3 ramp always lands on
+#     1.0 at its LAST attempts, i.e. it makes a retry's final chances its
+#     worst ones. That holds at either retry budget: the retain path runs 4
+#     attempts (fact_extraction.py:1327 passes max_retries=llm_max_retries,
+#     config.py:730 DEFAULT_LLM_MAX_RETRIES=3), where uncapped would ramp
+#     0.1/0.4/0.7/1.0 and end at 1.0; a caller that takes the
+#     `call()` signature default of max_retries=10 (litellm_llm.py:223) would
+#     ramp to 1.0 by attempt 4 and spend the remaining seven there.
 # Both apply only on the retry path; the first attempt is byte-for-byte the
 # request upstream would have sent, so cache hit-rate for healthy calls is
-# unchanged. Self-verifying; guarded by
-# tests/docker/dockerfile-hindsight-bakes.test.ts.
+# unchanged. Self-verifying, and guarded on two layers, because the structural
+# one alone is not enough: tests/docker/dockerfile-hindsight-bakes.test.ts
+# matches literals (it stays green if this body is indented under a falsy
+# guard — measured), and
+# tests/docker/hindsight-retry-perturbation-patches.test.ts applies this block
+# to the pinned image and asserts the retry is a DIFFERENT request each time.
 RUN python3 - <<'PYEOF'
 import pathlib
 
@@ -2227,9 +2237,11 @@ REPL = (
     '                    call_kwargs["extra_body"] = _extra\n'
     "                    # Only nudge a temperature the caller actually set, so\n"
     "                    # models that reject the parameter keep their kwargs clean.\n"
-    "                    # Capped at 0.7, NOT 1.0: `call()` defaults to\n"
-    "                    # max_retries=10, so an uncapped +0.3 ramp from 0.1 hits\n"
-    "                    # 1.0 by attempt 4 and spends the remaining seven there.\n"
+    "                    # Capped at 0.7, NOT 1.0: an uncapped +0.3 ramp from\n"
+    "                    # 0.1 always ENDS on 1.0 — the retain path runs 4\n"
+    "                    # attempts (0.1/0.4/0.7/1.0), and a caller taking the\n"
+    "                    # max_retries=10 signature default hits 1.0 by attempt\n"
+    "                    # 4 and spends the remaining seven there.\n"
     "                    # The json_schema response_format is advisory, not\n"
     "                    # enforced — one of the two measured bad bodies was a\n"
     "                    # numbered prose list emitted WHILE a schema was set — so\n"
