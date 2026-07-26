@@ -40,6 +40,7 @@ describe("INTEGRATION_MCP_RESOLVERS — registry shape", () => {
       "Microsoft 365",
       "Notion",
       "Webkite",
+      "Context7",
     ]);
   });
 
@@ -70,6 +71,7 @@ describe("INTEGRATION_MCP_RESOLVERS — registry shape", () => {
     expect(keys).toContain("ms-365");
     expect(keys).toContain("notion");
     expect(keys).toContain("webkite");
+    expect(keys).toContain("context7");
   });
 
   it("each resolver is callable and accepts the (name, agentConfig, switchroomConfig) shape", () => {
@@ -79,7 +81,13 @@ describe("INTEGRATION_MCP_RESOLVERS — registry shape", () => {
     // gdrive/m365/notion gate on their workspace blocks which are
     // absent here, so they return null without the flag either way.
     const optOutAll = {
-      mcp_servers: { gdrive: false, "ms-365": false, notion: false, webkite: false },
+      mcp_servers: {
+        gdrive: false,
+        "ms-365": false,
+        notion: false,
+        webkite: false,
+        context7: false,
+      },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
     for (const integration of INTEGRATION_MCP_RESOLVERS) {
@@ -113,6 +121,35 @@ describe("INTEGRATION_MCP_RESOLVERS — registry shape", () => {
       "test-agent",
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { mcp_servers: { webkite: false } } as any,
+      undefined,
+    );
+    expect(result).toBeNull();
+  });
+
+  it("context7 resolver emits the remote-HTTP entry when not opted out", () => {
+    const context7 = INTEGRATION_MCP_RESOLVERS.find((i) => i.emitKey === "context7");
+    expect(context7).toBeDefined();
+    const result = context7!.resolve(
+      "test-agent",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {} as any,
+      undefined,
+    );
+    // toEqual (not toMatchObject) so an added env/headers block — i.e. a
+    // credential accidentally baked into every agent's .mcp.json — fails
+    // this test rather than sliding through.
+    expect(result).toEqual({
+      key: "context7",
+      value: { type: "http", url: "https://mcp.context7.com/mcp" },
+    });
+  });
+
+  it("context7 resolver returns null when the agent opts out", () => {
+    const context7 = INTEGRATION_MCP_RESOLVERS.find((i) => i.emitKey === "context7");
+    const result = context7!.resolve(
+      "test-agent",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { mcp_servers: { context7: false } } as any,
       undefined,
     );
     expect(result).toBeNull();

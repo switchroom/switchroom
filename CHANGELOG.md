@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### context7 as a fleet-default MCP — server AND the prompt trigger that makes it get used
+
+Adds Upstash's **context7** (live library/framework documentation lookup) as a
+fleet-default MCP server on the same footing as webkite: wired by
+`resolveContext7McpEntry` in `INTEGRATION_MCP_RESOLVERS`, pre-approved via
+`CONTEXT7_MCP_TOOLS`, opted out per agent with `mcp_servers.context7: false`.
+
+The problem it fixes is agents answering third-party API questions from
+training memory. That failure is invisible at read time — a stale signature
+looks exactly like a correct one — so it needs a rule, not a judgement call.
+
+**Provisioning a tool is not the same as using it.** webkite has been wired on
+every agent for months at near-zero call volume, because nothing in the system
+prompt named a trigger. So this change ships a matching
+`LIBRARY_DOCS_GUIDANCE` block in `renderFleetInvariants()` — the file every
+agent reads via `--add-dir ~/.switchroom/fleet` — giving context7 an explicit
+trigger condition (about to state a signature / config key / CLI flag / import
+path; writing non-trivial code against an unread library; a version-mismatch
+smell) and an explicit negative scope so it isn't called on general programming
+questions. `tests/scaffold.library-docs-prompt.test.ts` is the regression gate:
+if the guidance silently drops out, the capability reverts to
+provisioned-and-unused with no other symptom.
+
+Transport is remote streamable HTTP (`https://mcp.context7.com/mcp`), **not**
+`npx -y @upstash/context7-mcp` as Anthropic's official context7 plugin uses.
+`npx -y` would resolve and execute the latest published version of a
+third-party package inside every agent container at every session spawn — a
+per-boot npm-registry dependency and an unpinned supply-chain surface. No
+credential is wired: the free tier is anonymous and IP-rate-limited (verified
+live — `initialize`, `tools/list`, and a `resolve-library-id` call all succeeded
+unauthenticated). If the fleet ever hits those limits the upgrade is a
+`context7/api-key` vault key rendered into an `Authorization` header.
+
+Note for operators: library/package names and the free-text query an agent
+sends to `query-docs` leave the host to Upstash's public endpoint. Agents
+working on private code should not paste private identifiers into the query
+argument; `mcp_servers.context7: false` turns the server off per agent.
+
 ## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
 
 ### Hindsight — bound retain content so oversized memories can persist at all (#3610)

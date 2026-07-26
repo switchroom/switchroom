@@ -354,6 +354,71 @@ false\` in that agent's switchroom.yaml block — webkite goes away
 and the native tools come back together.`;
 
 /**
+ * Library/framework documentation lookup. One of the fleet invariant
+ * blocks. Provisioning a tool is not the same as USING it: webkite has
+ * been wired on every agent for months with near-zero calls because
+ * nothing in the prompt named a trigger condition. This block gives
+ * context7 an explicit, checkable trigger so the capability actually
+ * gets reached for.
+ *
+ * The failure mode it targets is the model answering an API question
+ * from training memory — confidently, and wrong for anything that
+ * moved since the cutoff. That is indistinguishable from a correct
+ * answer at read time, which is exactly why it needs a rule rather
+ * than a judgement call.
+ *
+ * context7 is wired by `resolveContext7McpEntry` (fleet-default,
+ * per-agent `mcp_servers.context7: false` opt-out) and pre-approved
+ * via CONTEXT7_MCP_TOOLS.
+ */
+const LIBRARY_DOCS_GUIDANCE = `## Library and framework docs — look them up, don't recall them
+
+Your training data has a cutoff. Library APIs do not. When you answer
+a question about a library, framework, SDK, CLI, or cloud service from
+memory, you cannot tell from the inside whether that memory is current
+or two major versions stale — and a confidently wrong API answer costs
+more than the lookup.
+
+So: **before you write or review code against a third-party library,
+look its docs up with \`context7\`.** Two tools, used in order:
+
+- \`mcp__context7__resolve-library-id\` — turn a package/product name
+  ("next.js", "prisma", "boto3") into a Context7 library ID like
+  \`/vercel/next.js\`. Call this first unless the user already gave
+  you an ID in \`/org/project\` form.
+- \`mcp__context7__query-docs\` — fetch current, version-specific docs
+  and code examples for that library ID.
+
+**Trigger condition — reach for context7 when:**
+- You're about to state a library's API surface: a function signature,
+  config key, CLI flag, env var, or import path.
+- You're writing non-trivial code against a library you haven't read
+  the docs for this session.
+- You're debugging behaviour that looks like a version mismatch, or
+  the user mentions a version/migration.
+- Your answer would otherwise begin "I think the API is…".
+
+**Don't** reach for it for general programming concepts, refactoring,
+business-logic debugging, or code review that doesn't touch a
+third-party API — it costs a round-trip and adds nothing there.
+
+Prefer context7 over a web search for library docs: it returns the
+source documentation, not a blog post about it. \`webkite_search\` is
+still the right tool for everything that is not library documentation.
+
+If context7 has no entry for the library (it happens for private or
+very new packages), say so and fall back to \`webkite_read\` against
+the project's own docs site — don't silently answer from memory.
+
+**Query hygiene:** context7 is a public third-party endpoint. Your
+query text leaves this host. Send the library name and the API
+question — never private identifiers, internal repo or service names,
+customer data, or a paste of proprietary source.
+
+To turn it off for one agent, set \`mcp_servers.context7: false\` in
+that agent's switchroom.yaml block.`;
+
+/**
  * Vault key discovery. One of the fleet invariant blocks. Stops the
  * single most common vault failure: an agent GUESSING a secret's key
  * name (\`postiz/api-key\`) when it already holds the real one
@@ -521,6 +586,8 @@ export function renderFleetInvariants(): string {
     MEMORY_GUIDANCE,
     "",
     WEB_FETCH_GUIDANCE,
+    "",
+    LIBRARY_DOCS_GUIDANCE,
     "",
     VAULT_GUIDANCE,
     "",
@@ -1202,6 +1269,23 @@ const HOSTD_MCP_TOOLS = [
 const WEBKITE_MCP_TOOLS = [
   "mcp__webkite",
   "mcp__webkite__*",
+];
+
+/**
+ * Pre-approved MCP tool names for the fleet-default `context7` server
+ * (wired by resolveContext7McpEntry unless the agent opts out). Same
+ * rationale as WEBKITE_MCP_TOOLS: LIBRARY_DOCS_GUIDANCE instructs every
+ * agent to reach for context7 before answering a library-API question,
+ * so the FIRST such question would wedge the turn on a Telegram
+ * permission prompt if these weren't pre-approved — i.e. the guidance
+ * would train agents that the tool is annoying rather than useful.
+ * Both tools are read-only documentation lookups against a public API;
+ * the wildcard covers `resolve-library-id` + `query-docs` and any
+ * future additions without a re-bump.
+ */
+const CONTEXT7_MCP_TOOLS = [
+  "mcp__context7",
+  "mcp__context7__*",
 ];
 
 /**
@@ -4089,6 +4173,60 @@ export function resolveWebkiteMcpEntry(
   };
 }
 
+/**
+ * The Context7 remote MCP endpoint. Streamable-HTTP, public, no
+ * credential required for the free tier — verified against the live
+ * service on 2026-07-26 (`initialize` → Context7 3.2.5, `tools/list` →
+ * `resolve-library-id` + `query-docs`, and a `resolve-library-id` call
+ * for "react" all succeeded with no auth header).
+ */
+const CONTEXT7_MCP_URL = "https://mcp.context7.com/mcp";
+
+/**
+ * Resolve the per-agent `context7` MCP entry.
+ *
+ * Same shape as webkite: a fleet-default capability with no top-level
+ * switchroom.yaml config block, gated only on the per-agent opt-out
+ * (`mcp_servers.context7: false`). It pairs with
+ * LIBRARY_DOCS_GUIDANCE, which is the half that makes agents actually
+ * call it.
+ *
+ * Transport choice — remote HTTP, NOT `npx -y @upstash/context7-mcp`
+ * (which is what Anthropic's official context7 plugin uses):
+ *   - `npx -y` resolves and installs the LATEST published version from
+ *     the npm registry at every session spawn. That is a per-boot
+ *     network dependency on a second registry, a multi-second cold
+ *     start on every agent, and an unpinned third-party package
+ *     executing inside the agent container. The HTTP transport has
+ *     none of those properties.
+ *   - Claude Code speaks streamable HTTP natively (`type: "http"`),
+ *     the same transport hindsight uses in http mode.
+ *
+ * Credentials: none. Context7's free tier is IP-rate-limited and
+ * anonymous. An optional `CONTEXT7_API_KEY` raises those limits; if
+ * the fleet ever hits them, the upgrade is a vault key
+ * (`context7/api-key`) resolved into an `Authorization: Bearer`
+ * header here. Deliberately NOT wired now: a `secrets:` declaration
+ * for a key the vault doesn't hold would fail the broker on every
+ * agent for a capability that works fine without it.
+ *
+ * Returns null when the entry must not be emitted.
+ */
+export function resolveContext7McpEntry(
+  _agentName: string,
+  agentConfig: AgentConfig,
+  _switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig } | null {
+  if ((agentConfig.mcp_servers ?? {})["context7"] === false) return null;
+  return {
+    key: "context7",
+    value: {
+      type: "http",
+      url: CONTEXT7_MCP_URL,
+    },
+  };
+}
+
 export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
   {
     label: "Google Workspace",
@@ -4119,6 +4257,12 @@ export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
     emitKey: "webkite",
     retractionKey: "webkite",
     resolve: resolveWebkiteMcpEntry,
+  },
+  {
+    label: "Context7",
+    emitKey: "context7",
+    retractionKey: "context7",
+    resolve: resolveContext7McpEntry,
   },
 ];
 
@@ -4185,6 +4329,14 @@ export function computeDesiredPermissionAllow(
     // as the MCP entry emission, so a webkite-disabled agent doesn't
     // carry dangling pre-approvals.
     ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
+    // Context7 is fleet-default (resolveContext7McpEntry) unless the
+    // agent opts out. Same reasoning as webkite: LIBRARY_DOCS_GUIDANCE
+    // tells every agent to look library docs up before answering, so
+    // the first such lookup is common and would otherwise wedge on a
+    // permission prompt. Gated on the same opt-out as the MCP entry
+    // emission, so a context7-disabled agent doesn't carry dangling
+    // pre-approvals.
+    ...(agentConfig.mcp_servers?.["context7"] === false ? [] : CONTEXT7_MCP_TOOLS),
   ]);
 }
 
@@ -4465,7 +4617,18 @@ export function scaffoldAgent(
       // opt-out as the MCP entry emission.
       const webkiteAllowTools =
         agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS;
-      for (const t of [...AGENT_CONFIG_MCP_TOOLS, ...HOSTD_MCP_TOOLS, ...webkiteAllowTools]) {
+      // Existing-agent twin of the permissionAllow context7 spread —
+      // same rationale as webkiteAllowTools directly above. Without it
+      // every already-deployed agent's first context7 call wedges on a
+      // permission prompt despite .mcp.json wiring the server.
+      const context7AllowTools =
+        agentConfig.mcp_servers?.["context7"] === false ? [] : CONTEXT7_MCP_TOOLS;
+      for (const t of [
+        ...AGENT_CONFIG_MCP_TOOLS,
+        ...HOSTD_MCP_TOOLS,
+        ...webkiteAllowTools,
+        ...context7AllowTools,
+      ]) {
         if (!allow.includes(t)) allow.push(t);
       }
       settings.permissions.allow = allow;
