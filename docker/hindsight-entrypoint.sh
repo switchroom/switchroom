@@ -95,6 +95,21 @@ REINDEX_SELFHEAL="${SWITCHROOM_HINDSIGHT_REINDEX_SELFHEAL:-1}"
 # pg0 instance descriptor (holds the embedded-postgres password); the
 # reaper reads it to connect. Overridable for host tests.
 PG0_INSTANCE="${SWITCHROOM_HINDSIGHT_PG0_INSTANCE:-/home/hindsight/.pg0/instances/hindsight/instance.json}"
+# --- pg0 sizing pre-start (#3706) -------------------------------------------
+# Values come from src/setup/hindsight-pg-defaults.ts via `docker run -e` /
+# compose `environment:`. EMPTY OR UNSET DISABLES that flag, and empty/unset
+# for BOTH disables the pre-start entirely — so an older switchroom that does
+# not set them keeps today's behaviour byte for byte. The literal `off` (any
+# case) is the operator's per-knob opt-out.
+PG_EFFECTIVE_CACHE_SIZE="${SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE:-}"
+PG_SHARED_BUFFERS="${SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS:-}"
+# pg0 CLI. The python wheel bundles it; the venv's python minor version is not
+# guaranteed stable, so glob rather than hard-code. Overridable for tests.
+PG0_BIN="${SWITCHROOM_HINDSIGHT_PG0_BIN:-}"
+# Instance name pg0 keys the running server under. Must match the name
+# hindsight_api resolves from HINDSIGHT_API_DB_URL, or its ensure_running()
+# will not adopt ours.
+PG0_NAME="${SWITCHROOM_HINDSIGHT_PG0_NAME:-hindsight}"
 
 log() { echo "switchroom-hindsight-entrypoint: $*" >&2; }
 
@@ -241,6 +256,112 @@ reap_stale_processing_when_ready() {
   ) &
 }
 
+# ---------------------------------------------------------------------------
+# pg0 sizing pre-start (#3706)
+#
+# Hindsight's embedded PostgreSQL is pg0, and pg0 bakes its tuning into the
+# `postgres` child's ARGV:
+#
+#   postgres -D … -F -p 5432 -c work_mem=64MB -c maintenance_work_mem=512MB
+#            -c effective_cache_size=1GB -c shared_buffers=256MB …
+#
+# PostgreSQL ranks the `command line` source ABOVE both postgresql.conf and
+# postgresql.auto.conf, so `ALTER SYSTEM SET` cannot move those two values —
+# verified live: ALTER SYSTEM + pg_reload_conf() left pg_settings reporting the
+# old value with source='command line'.
+#
+# The route that DOES work: hindsight_api's EmbeddedPostgres.ensure_running()
+# (api/hindsight_api/pg0.py) short-circuits when the named instance is already
+# running — it returns the existing URI and never re-applies config. So we
+# start pg0 ourselves, with tuned `-c` flags, before exec'ing the upstream CMD.
+# pg0 MERGES `-c` over its own defaults (verified: a probe started with
+# `-c effective_cache_size=4GB -c shared_buffers=1536MB` kept pg0's work_mem,
+# maintenance_work_mem, max_parallel_maintenance_workers and logging flags).
+#
+# BEST-EFFORT BY CONSTRUCTION. Every failure path returns 0 and leaves pg0
+# unstarted, so hindsight_api starts it exactly as it does today with pg0's own
+# defaults. A sizing change can never be why the container fails to boot.
+#
+# Connection identity is READ from the existing instance descriptor rather than
+# assumed, so we can never rewrite it with different credentials; on first boot
+# (no descriptor) we use hindsight_api's own DEFAULT_USERNAME / DEFAULT_PASSWORD
+# / DEFAULT_DATABASE ("hindsight") and let pg0 auto-allocate the port, which is
+# byte-identical to what EmbeddedPostgres() would have done.
+prestart_pg0() {
+  # Normalise the two knobs; `off` (any case) means "leave pg0's default".
+  case "$(printf '%s' "${PG_EFFECTIVE_CACHE_SIZE}" | tr '[:upper:]' '[:lower:]')" in
+    off) PG_EFFECTIVE_CACHE_SIZE="" ;;
+  esac
+  case "$(printf '%s' "${PG_SHARED_BUFFERS}" | tr '[:upper:]' '[:lower:]')" in
+    off) PG_SHARED_BUFFERS="" ;;
+  esac
+  # Nothing to apply ⇒ do not touch pg0 at all (pre-#3706 behaviour).
+  [ -n "${PG_EFFECTIVE_CACHE_SIZE}" ] || [ -n "${PG_SHARED_BUFFERS}" ] || return 0
+
+  # Only the embedded-pg0 database is ours to pre-start. An operator pointing
+  # hindsight at an external postgres (or a differently-named/ported pg0
+  # instance) must not have a server started underneath them.
+  case "${HINDSIGHT_API_DB_URL:-pg0}" in
+    pg0 | "pg0://${PG0_NAME}") : ;;
+    *)
+      log "pg0 pre-start skipped: HINDSIGHT_API_DB_URL=${HINDSIGHT_API_DB_URL:-} is not the default embedded instance"
+      return 0
+      ;;
+  esac
+
+  _pg0="${PG0_BIN}"
+  if [ -z "${_pg0}" ]; then
+    _pg0="$(command -v pg0 2>/dev/null || ls /app/api/.venv/lib/python3.*/site-packages/pg0/bin/pg0 2>/dev/null | head -1)"
+  fi
+  if [ -z "${_pg0}" ] || [ ! -x "${_pg0}" ]; then
+    log "pg0 pre-start skipped: pg0 binary not found (hindsight_api will start pg0 with its own defaults)"
+    return 0
+  fi
+
+  # Identity: reuse the descriptor when it exists so we never rewrite it.
+  _pu="hindsight"; _pp="hindsight"; _pd="hindsight"; _pport=""
+  if [ -r "${PG0_INSTANCE}" ]; then
+    if { read -r _v_u; read -r _v_d; read -r _v_p; read -r _v_pw; } <<EOF
+$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("username","hindsight"));print(d.get("database","hindsight"));print(d.get("port",""));print(d.get("password","hindsight"))' "${PG0_INSTANCE}" 2>/dev/null)
+EOF
+    then
+      if [ -n "${_v_u}" ]; then _pu="${_v_u}"; fi
+      if [ -n "${_v_d}" ]; then _pd="${_v_d}"; fi
+      if [ -n "${_v_pw}" ]; then _pp="${_v_pw}"; fi
+      if [ -n "${_v_p}" ]; then _pport="${_v_p}"; fi
+    fi
+  fi
+
+  # NOTE: `set --` inside a POSIX function shadows only the FUNCTION's
+  # positional parameters; the script's "$@" (the upstream CMD this entrypoint
+  # execs) is restored on return. Every branch below is an `if`, never a bare
+  # `[ … ] && …` — under `set -eu` a false AND-OR list at statement level would
+  # abort the whole entrypoint.
+  set -- start --name "${PG0_NAME}" --username "${_pu}" --password "${_pp}" --database "${_pd}"
+  if [ -n "${_pport}" ]; then set -- "$@" --port "${_pport}"; fi
+  if [ -n "${PG_EFFECTIVE_CACHE_SIZE}" ]; then
+    set -- "$@" -c "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE}"
+  fi
+  if [ -n "${PG_SHARED_BUFFERS}" ]; then
+    set -- "$@" -c "shared_buffers=${PG_SHARED_BUFFERS}"
+  fi
+
+  if _out="$("${_pg0}" "$@" 2>&1)"; then
+    log "pg0 pre-start ok: name=${PG0_NAME} effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-<pg0-default>} shared_buffers=${PG_SHARED_BUFFERS:-<pg0-default>}"
+    return 0
+  fi
+
+  # `already running` is not a failure — some other path won the race and the
+  # instance is up; hindsight_api adopts it either way.
+  if printf '%s' "${_out}" | grep -qi 'already running'; then
+    log "pg0 pre-start: instance ${PG0_NAME} already running; leaving it alone"
+    return 0
+  fi
+
+  log "WARNING: pg0 pre-start failed; falling back to hindsight_api's own pg0 start with pg0 defaults. detail: $(printf '%s' "${_out}" | tr '\n' ' ' | cut -c1-300)"
+  return 0
+}
+
 # 1. Wait for the broker socket. The broker may still be starting on
 # the host when this container boots (no cross-project depends_on).
 i=0
@@ -298,6 +419,13 @@ export CLAUDE_CONFIG_DIR="${CRED_DIR}"
 
 # 4b. Boot-deferred stale-claim reaper (does not block boot; see fn header).
 reap_stale_processing_when_ready || true
+
+# 4c. pg0 sizing pre-start (#3706). MUST run before the exec: hindsight_api's
+# ensure_running() adopts an already-running instance without re-applying
+# config, which is the only reason we can set these at all. Synchronous by
+# necessity (a background race would let hindsight_api win and start pg0
+# untuned); bounded by pg0's own start, and best-effort — see prestart_pg0().
+prestart_pg0 || true
 
 # 5. Hand off to upstream start-all.sh.
 exec "$@"

@@ -715,6 +715,243 @@ esac
     expect(raw).toMatch(/REINDEX INDEX CONCURRENTLY pk_async_operations/);
   });
 
+  // ── pg0 sizing pre-start (#3706) ───────────────────────────────────────
+  //
+  // pg0 bakes `-c shared_buffers=… -c effective_cache_size=…` into the
+  // `postgres` child's ARGV, and postgres ranks the `command line` source
+  // above `postgresql.auto.conf` — so `ALTER SYSTEM SET` cannot change them
+  // (verified live: ALTER SYSTEM + pg_reload_conf() left pg_settings reporting
+  // the old value with source='command line'). The only route is to start pg0
+  // ourselves with tuned flags BEFORE the exec, because hindsight_api's
+  // EmbeddedPostgres.ensure_running() short-circuits on an already-running
+  // instance.
+  //
+  // These tests drive the entrypoint with a FAKE pg0 that records its argv and
+  // assert the OUTCOME: the tuned flags land, an operator opt-out removes only
+  // the knob it names, and every failure path still reaches `exec` so a sizing
+  // change can never be why the container fails to boot.
+
+  /** Write a fake `pg0` that logs argv (one arg per line) and exits `code`. */
+  function installFakePg0(logPath: string, code = 0): string {
+    const binDir = execTmpDir("swr-fakepg0-");
+    const pg0 = join(binDir, "pg0");
+    writeFileSync(
+      pg0,
+      `#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a" >> "${logPath}"; done
+[ ${code} -eq 0 ] || echo "fake pg0: could not create shared memory segment" >&2
+exit ${code}
+`,
+      { mode: 0o755 },
+    );
+    return pg0;
+  }
+
+  /**
+   * Boot the entrypoint to completion with extra env, returning stderr + the
+   * exit status. The CMD defaults to one that exits immediately.
+   */
+  function runWithEnv(
+    extraEnv: Record<string, string>,
+    cmd: string[] = ["true"],
+  ): Promise<{ status: number | null; stderr: string }> {
+    return new Promise((res) => {
+      const child = spawn("sh", [ENTRYPOINT, ...cmd], {
+        env: {
+          ...process.env,
+          SWITCHROOM_AUTH_BROKER_SOCKET: socketPath,
+          SWITCHROOM_HINDSIGHT_CRED_DIR: credDir,
+          SWITCHROOM_HINDSIGHT_WAIT_S: "5",
+          SWITCHROOM_HINDSIGHT_REFRESH_S: "0",
+          SWITCHROOM_HINDSIGHT_FETCHER: FETCHER,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: join(dir, "does-not-exist.json"),
+          ...extraEnv,
+        },
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+      const killer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      }, 20000);
+      child.on("close", (status) => {
+        clearTimeout(killer);
+        res({ status, stderr });
+      });
+    });
+  }
+
+  /** Read a fake-pg0 argv log back as an array. */
+  function argvOf(logPath: string): string[] {
+    return existsSync(logPath)
+      ? readFileSync(logPath, "utf-8").split("\n").filter((l) => l !== "")
+      : [];
+  }
+
+  it("pre-starts pg0 with BOTH tuned -c flags before exec'ing the CMD", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv.log");
+    const marker = join(dir, "cmd-ran");
+    const r = await runWithEnv(
+      {
+        SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+        SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+        SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "1536MB",
+      },
+      ["sh", "-c", `touch ${marker}`],
+    );
+    expect(r.status).toBe(0);
+    const argv = argvOf(log);
+    expect(argv[0]).toBe("start");
+    // The flags themselves — the whole point of the change.
+    expect(argv).toContain("effective_cache_size=4096MB");
+    expect(argv).toContain("shared_buffers=1536MB");
+    // ...each introduced by its own `-c`, which is pg0's flag syntax.
+    expect(argv.filter((a) => a === "-c").length).toBe(2);
+    // The instance identity hindsight_api will look for, or it won't adopt ours.
+    expect(argv[argv.indexOf("--name") + 1]).toBe("hindsight");
+    // Ordering matters: pre-start must happen BEFORE the exec, otherwise
+    // hindsight_api wins the race and starts pg0 untuned.
+    expect(r.stderr).toMatch(/pg0 pre-start ok/);
+    expect(existsSync(marker)).toBe(true);
+  }, 20_000);
+
+  it("does NOT touch pg0 at all when neither knob is set (pre-#3706 behaviour)", async () => {
+    // An older switchroom, or an operator who cleared both, must get exactly
+    // today's boot: hindsight_api starts pg0 itself.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-none.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "",
+      SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "",
+    });
+    expect(r.status).toBe(0);
+    expect(argvOf(log)).toEqual([]);
+    expect(r.stderr).not.toMatch(/pg0 pre-start ok/);
+  }, 20_000);
+
+  it("`off` opts out ONE knob and leaves the other applied", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-off.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+      SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "OFF",
+    });
+    expect(r.status).toBe(0);
+    const argv = argvOf(log);
+    expect(argv).toContain("effective_cache_size=4096MB");
+    // The sentinel must not leak through as a literal postgres value either —
+    // `shared_buffers=off` would make the server refuse to start.
+    expect(argv.some((a) => a.startsWith("shared_buffers="))).toBe(false);
+  }, 20_000);
+
+  it("a FAILING pg0 pre-start warns loudly but still boots (fallback intact)", async () => {
+    // The safety property the whole design rests on: hindsight_api then starts
+    // pg0 with pg0's own defaults, exactly as before this change.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-fail.log");
+    const marker = join(dir, "cmd-ran-after-failure");
+    const r = await runWithEnv(
+      {
+        SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log, 1),
+        SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+        SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "1536MB",
+      },
+      ["sh", "-c", `touch ${marker}`],
+    );
+    expect(r.status).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+    expect(r.stderr).toMatch(/WARNING: pg0 pre-start failed/);
+    expect(r.stderr).not.toMatch(/pg0 pre-start ok/);
+  }, 20_000);
+
+  it("skips the pre-start when the DB is not the default embedded instance", async () => {
+    // Starting a server underneath an operator who pointed hindsight at an
+    // external postgres (or a differently-named pg0) would be actively wrong.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-extdb.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+      SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "1536MB",
+      HINDSIGHT_API_DB_URL: "postgresql://user:pw@db.example.com:5432/hindsight",
+    });
+    expect(r.status).toBe(0);
+    expect(argvOf(log)).toEqual([]);
+    expect(r.stderr).toMatch(/pg0 pre-start skipped/);
+  }, 20_000);
+
+  it("reuses the existing instance's credentials + port instead of rewriting them", async () => {
+    // `pg0 start` REWRITES instance.json. If we passed different credentials
+    // than the live cluster's, hindsight_api's ensure_running() would hand the
+    // engine a URI that cannot authenticate.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-ident.log");
+    const instance = join(dir, "instance.json");
+    writeFileSync(
+      instance,
+      JSON.stringify({
+        pid: 153,
+        port: 5433,
+        username: "hsuser",
+        password: "hspass",
+        database: "hsdb",
+      }),
+    );
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG0_INSTANCE: instance,
+      // A READABLE descriptor also arms the boot-deferred reaper, whose
+      // background subshell holds the stdio pipes open so `close` never
+      // fires. Disable it — this test is about the pre-start argv only.
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+      SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "1536MB",
+    });
+    expect(r.status).toBe(0);
+    const argv = argvOf(log);
+    expect(argv[argv.indexOf("--username") + 1]).toBe("hsuser");
+    expect(argv[argv.indexOf("--password") + 1]).toBe("hspass");
+    expect(argv[argv.indexOf("--database") + 1]).toBe("hsdb");
+    expect(argv[argv.indexOf("--port") + 1]).toBe("5433");
+  }, 20_000);
+
+  it("falls back to hindsight_api's own defaults when no descriptor exists (first boot)", async () => {
+    // EmbeddedPostgres' DEFAULT_USERNAME/PASSWORD/DATABASE are all
+    // "hindsight", and it passes no port so pg0 auto-allocates. A first boot
+    // must be byte-identical to what hindsight_api itself would have done.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-firstboot.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG0_INSTANCE: join(dir, "absent.json"),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+    });
+    expect(r.status).toBe(0);
+    const argv = argvOf(log);
+    expect(argv[argv.indexOf("--username") + 1]).toBe("hindsight");
+    expect(argv[argv.indexOf("--password") + 1]).toBe("hindsight");
+    expect(argv[argv.indexOf("--database") + 1]).toBe("hindsight");
+    expect(argv).not.toContain("--port");
+  }, 20_000);
+
+  it("boots normally when the pg0 binary is missing entirely", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const marker = join(dir, "cmd-ran-no-pg0");
+    const r = await runWithEnv(
+      {
+        SWITCHROOM_HINDSIGHT_PG0_BIN: join(dir, "no-such-pg0"),
+        SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+        SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "1536MB",
+      },
+      ["sh", "-c", `touch ${marker}`],
+    );
+    expect(r.status).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+    expect(r.stderr).toMatch(/pg0 pre-start skipped: pg0 binary not found/);
+  }, 20_000);
+
   it("Dockerfile pins UID 11000 to match HINDSIGHT_DEFAULT_UID", () => {
     // The broker chowns the per-consumer socket to consumer.uid (mode 0600).
     // If the runtime UID inside hindsight didn't match what the operator
