@@ -45,10 +45,49 @@ name: release
 #     Security (macOS 15 removed the right-click → Open bypass).
 #     docs/operators/install.md tells macOS users to use the installer.
 #
-# Ordering vs npm-publish.yml / docker-images.yml: all three fire independently
-# on the same `v*` tag. Nothing cross-gates them at the workflow level — the
-# `switchroom-release` skill is the gate that requires all three green before a
-# fleet rollout.
+# ─── THIS IS THE RELEASE ORCHESTRATOR (#3654) ─────────────────────────
+#
+# It used to be one of three workflows firing independently on the same `v*`
+# tag with nothing cross-gating them, so a tag could half-ship: npm published
+# while the binaries were red, or binaries attached while npm never ran. npm
+# is the leg that CANNOT BE UNDONE, so it is now last and conditional.
+#
+# The pipeline this file runs on a tag:
+#
+#   guard ──┐                                    (~1 min: fail fast, and pull
+#           │                                     an incomplete PUBLISHED
+#   build ──┴─▶ bundle ──▶ publish ──┐            release back to draft)
+#                       (attach assets)│
+#   images-gate ─────────────────────┬┴─▶ npm (workflow_call → npm-publish.yml)
+#   (waits for docker-images)        │            │
+#                                    └────────────┴──▶ finalize (un-draft)
+#
+# Two invariants, both mechanical rather than procedural:
+#
+#   1. NOTHING IRREVERSIBLE UNTIL EVERYTHING IS GREEN. `npm` needs BOTH the
+#      assets being attached AND docker-images concluding success for this
+#      exact tag+commit. npm-publish.yml additionally re-proves both from
+#      inside its own run, so even a hand dispatch cannot bypass this.
+#
+#   2. NOTHING PUBLIC UNTIL EVERYTHING IS GREEN. install.sh resolves the
+#      version it installs from `/releases/latest`, which EXCLUDES DRAFTS.
+#      The operator creates the release as a draft (switchroom-release skill
+#      step 2); `finalize` is the only thing that publishes it. So a failed
+#      release leaves the PREVIOUS complete release serving `curl | sh`
+#      installs, instead of a v0.19.19-style empty release 404ing every user.
+#      `guard` forcibly re-drafts an incomplete release that was created
+#      published, so the invariant does not depend on the operator
+#      remembering `--draft` — and it runs FIRST, with no `needs:`, so that
+#      window is ~1 minute rather than the ~25 the native build legs take.
+#      (That failure is not hypothetical: at the time this was written
+#      `/releases/latest` was v0.19.19, `draft: false`, `assets: []` — every
+#      `curl | sh` install on every platform was 404ing on the download.)
+#
+# NOT closed by this: docker-images still moves the `:latest` IMAGE tag on a
+# tag push regardless of the other legs. That is deliberate scope — image
+# tags are retaggable (promote.yml) where npm and `/releases/latest` are not,
+# and folding docker-images into this pipeline would mean restructuring the
+# workflow that also serves every PR and main push. Tracked in #3685.
 
 on:
   push:
@@ -289,9 +328,166 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
+  # Wait for the OTHER tag-triggered workflow. docker-images.yml keeps its own
+  # `tags: ["v*"]` trigger and runs in parallel with the build above — this
+  # job is what makes its result BINDING on everything downstream.
+  #
+  # Deliberately not folded into this workflow via `workflow_call`:
+  # docker-images.yml also serves every PR and main push and carries the
+  # `images-ok` required check, so converting it would put the whole image
+  # pipeline at risk to gate a leg that is retaggable anyway. More decisively,
+  # a reusable-workflow conversion could only be proven correct by cutting a
+  # real tag; this gate's failure mode if anything about it is wrong is
+  # FAIL-CLOSED (no matching run found ⇒ the gate blocks), which is the mode
+  # you want on a release path you cannot rehearse.
+  images-gate:
+    name: gate on docker-images for this tag
+    # No `needs:` — runs from the start so a red image build surfaces early
+    # instead of after ~25 minutes of native macOS build legs.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.dry_run == false &&
+       startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout (for the classifier script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Wait for docker-images to conclude for this tag + commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECT_TAG: ${{ github.ref_name }}
+          EXPECT_SHA: ${{ github.sha }}
+          # docker-images on a tag builds base + 6 dependents on two native
+          # arches plus the QEMU hindsight and CUDA voice images. 90 minutes
+          # is generous headroom over its observed worst case; the job
+          # timeout above is the hard stop.
+          WAIT_SECONDS: "5400"
+          POLL_SECONDS: "60"
+        shell: bash
+        run: |
+          # classify-workflow-run.mjs owns every decision (see its header for
+          # why head_sha alone is ambiguous — the tagged commit is also on
+          # main, so the main-push run shares it). This loop only owns time.
+          #   exit 0 → green, proceed
+          #   exit 2 → pending, keep waiting
+          #   exit 1 → concluded non-success, stop now (a re-run of
+          #            docker-images plus a re-dispatch of this workflow is
+          #            the recovery, and it is cheaper than a job that hangs)
+          deadline=$(( $(date +%s) + WAIT_SECONDS ))
+          while :; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/docker-images.yml/runs?head_sha=$EXPECT_SHA&per_page=100" \
+              > /tmp/image-runs.json || : > /tmp/image-runs.json
+            set +e
+            node scripts/ci/classify-workflow-run.mjs < /tmp/image-runs.json
+            rc=$?
+            set -e
+            case "$rc" in
+              0) echo "docker-images is green for $EXPECT_TAG — release may proceed."; exit 0 ;;
+              2) : ;;
+              *)
+                echo "::error::docker-images did not succeed for $EXPECT_TAG ($EXPECT_SHA). Nothing has been published to npm and the GitHub Release stays a draft. Fix and re-run docker-images (gh workflow run docker-images.yml --ref $EXPECT_TAG), then re-run this workflow (gh workflow run release.yml --ref $EXPECT_TAG -f dry_run=false)."
+                exit 1
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out after ${WAIT_SECONDS}s waiting for a docker-images run on $EXPECT_TAG ($EXPECT_SHA). Refusing to proceed — an unverifiable image build is treated as a failed one."
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+  # Runs IMMEDIATELY — deliberately no `needs:`. Two jobs' worth of value in
+  # about a minute:
+  #
+  #   1. It shrinks the window in which a release created WITHOUT `--draft`
+  #      sits on `/releases/latest` with no binaries, breaking every
+  #      `curl | sh` install, from ~25 minutes (the native macOS build legs)
+  #      to ~1. The operator is supposed to pass `--draft`; this is what
+  #      makes the invariant hold when they don't.
+  #   2. It fails the whole pipeline in ~3 minutes, not ~25, when no release
+  #      exists for the tag at all — the single most common release-run
+  #      failure before this (#3633).
+  guard:
+    name: hold an incomplete release out of `latest`
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.dry_run == false &&
+       startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (for the release-completeness script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Locate the release, and hold an incomplete one back from `latest`
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECT_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          # The release object is created by the operator with
+          # `gh release create vX.Y.Z --draft` (switchroom-release skill,
+          # step 2) BEFORE the tag is pushed, so it normally already exists.
+          # Poll briefly for the API to catch up, then FAIL LOUDLY rather
+          # than inventing a release with auto-notes that would collide with
+          # the operator's CHANGELOG notes.
+          #
+          # The LIST endpoint, not `gh release view`: a draft has no
+          # published-release representation to view, and the draft is the
+          # state that matters here. Page 1 is sufficient and does not need
+          # `--paginate`: GitHub returns drafts first, then published
+          # releases newest-first, so the release for the tag being built
+          # (created minutes ago) is always at the top. If it somehow were
+          # not, the script reports notFound and this job FAILS — the error
+          # is a blocked release, never a silent pass.
+          found=""
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > /tmp/releases.json || : > /tmp/releases.json
+            set +e
+            node scripts/ci/assert-release-assets-complete.mjs < /tmp/releases.json > /tmp/release-summary.json
+            rc=$?
+            set -e
+            case "$rc" in
+              0|3) found=1; break ;;
+              4)   echo "attempt $i: release $EXPECT_TAG not visible yet — retrying in 15s" ;;
+              *)   echo "::error::release completeness check failed to run (exit $rc)"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          if [ -z "$found" ]; then
+            echo "::error::no GitHub Release exists for $EXPECT_TAG after ~150s. Create it as a DRAFT (gh release create $EXPECT_TAG --draft --notes-file …) then re-run this workflow via workflow_dispatch on the tag with dry_run=false."
+            exit 1
+          fi
+          cat /tmp/release-summary.json
+
+          # THE HALF-SHIP GUARD (#3654). install.sh reads
+          # `/releases/latest`, which excludes drafts. A release that is
+          # already PUBLISHED but missing assets is therefore actively
+          # breaking every `curl | sh` install right now — pull it back to
+          # draft so the previous complete release serves installs until
+          # `finalize` re-publishes this one. A complete published release
+          # (a re-run over an already-shipped tag) is left alone.
+          draft=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).draft===true?"true":"false"))' < /tmp/release-summary.json)
+          nmissing=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).missing.length))' < /tmp/release-summary.json)
+          if [ "$nmissing" -gt 0 ] && [ "$draft" != "true" ]; then
+            echo "::warning title=holding release back::$EXPECT_TAG is published but missing $nmissing asset(s) — re-drafting it so /releases/latest keeps serving the previous complete release until this one is whole."
+            gh release edit "$EXPECT_TAG" --repo "$GITHUB_REPOSITORY" --draft=true
+          fi
+
   publish:
     name: attach assets to the release
-    needs: bundle
+    # `guard` as well as `bundle`: the release must exist and be held out of
+    # `latest` before anything is attached to it.
+    needs: [bundle, guard]
     # Tag pushes publish. A workflow_dispatch publishes only when explicitly
     # asked (dry_run=false) AND the dispatch ref is a tag.
     if: >-
@@ -304,6 +500,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout (for the release-completeness script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - name: Download the assembled bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -316,25 +515,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          # The release object is created by the operator with
-          # `gh release create vX.Y.Z` (switchroom-release skill, step 2),
-          # which creates the tag and the release together — so it normally
-          # exists before this job runs. Poll briefly for the API to catch up,
-          # then FAIL LOUDLY rather than inventing a release with auto-notes
-          # that would collide with the operator's CHANGELOG notes.
-          found=""
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              found=1; break
-            fi
-            echo "attempt $i: release $TAG not visible yet — retrying in 15s"
-            sleep 15
-          done
-          if [ -z "$found" ]; then
-            echo "::error::no GitHub Release exists for $TAG after ~150s. Create it (gh release create $TAG --notes-file …) then re-run this workflow via workflow_dispatch on the tag with dry_run=false."
-            exit 1
-          fi
-
           files=""
           for asset in $RELEASE_ASSETS; do files="$files dist-bins/$asset"; done
           files="$files dist-bins/$CHECKSUMS_FILE"
@@ -344,15 +524,90 @@ jobs:
           # Close the loop: the failure this whole workflow exists to prevent
           # is a release page with zero assets. Assert every expected asset is
           # actually attached before calling the job green.
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '.assets[].name' > /tmp/attached.txt
-          cat /tmp/attached.txt
-          missing=""
-          for asset in $RELEASE_ASSETS "$CHECKSUMS_FILE"; do
-            grep -Fxq "$asset" /tmp/attached.txt || missing="$missing $asset"
-          done
-          if [ -n "$missing" ]; then
-            echo "::error::upload reported success but these assets are not on the release:$missing"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > /tmp/releases.json
+          set +e
+          node scripts/ci/assert-release-assets-complete.mjs < /tmp/releases.json
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::assets are still missing from $TAG after upload (exit $rc). The upload reported success, so suspect a rename: scripts/check-release-asset-names.mjs is the static half of this contract."
             exit 1
           fi
-          echo "All release assets attached to $TAG."
+          echo "All release assets attached to $TAG (still a draft until finalize)."
+
+  # The irreversible leg, and the reason the whole pipeline exists. `needs`
+  # is the plain all-must-succeed form on purpose: no `always()`, no
+  # `!cancelled()`, no `continue-on-error` anywhere on this chain, because
+  # every one of those turns an upstream failure into a green publish.
+  npm:
+    name: publish to npm
+    needs: [publish, images-gate]
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.dry_run == false &&
+       startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      # Passed explicitly rather than `secrets: inherit` — the called
+      # workflow gets exactly the one secret it needs and nothing else.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # The ONLY step that makes this release visible to `install.sh`. Runs last,
+  # after every other leg, so `/releases/latest` can never point at a release
+  # that is missing binaries or that npm never received.
+  finalize:
+    name: publish the GitHub Release
+    needs: [publish, images-gate, npm]
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.dry_run == false &&
+       startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (for the release-completeness script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Re-verify the bundle, then take the release out of draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECT_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          # Re-derive completeness from install.sh rather than trusting the
+          # upstream job's verdict: this is the last gate before the release
+          # becomes `/releases/latest` for every `curl | sh` user, and an
+          # asset deleted between jobs would otherwise slip through.
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > /tmp/releases.json
+          set +e
+          node scripts/ci/assert-release-assets-complete.mjs < /tmp/releases.json
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::refusing to publish $EXPECT_TAG out of draft — it is missing assets install.sh needs (exit $rc). It stays a draft, so /releases/latest keeps serving the previous complete release; re-run this workflow once the assets are attached."
+            exit 1
+          fi
+
+          gh release edit "$EXPECT_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+          # Confirm the flip actually landed — `gh release edit` reporting
+          # success while the release stays a draft would silently leave the
+          # installer on the previous version.
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > /tmp/releases-after.json
+          node scripts/ci/assert-release-assets-complete.mjs < /tmp/releases-after.json > /tmp/after.json
+          still_draft=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).draft===true?"true":"false"))' < /tmp/after.json)
+          if [ "$still_draft" = "true" ]; then
+            echo "::error::$EXPECT_TAG is still a draft after \`gh release edit --draft=false\`; install.sh will keep resolving the previous release."
+            exit 1
+          fi
+          echo "Release $EXPECT_TAG is published with a complete asset bundle."
