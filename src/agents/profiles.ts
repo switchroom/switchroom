@@ -328,15 +328,29 @@ export function renderDevProtocolFragment(
  * recency.
  *
  * Root cause it closes (regression #3231): the strong delegation guidance
- * ("Golden rule: when in doubt, delegate") lives mid-file in the profile
+ * ("Golden rule: when in doubt, delegate") lived mid-file in the profile
  * body, while the execution-discipline ("Act in-turn — do it this turn")
  * and dev-protocol ("read the code, run the tests, keep moving") fragments
  * were appended at the tail. In a long prompt the tail-end inline-execution
  * voice won on recency and overrode the mid-file delegation rule, so agents
- * started doing execution inline instead of dispatching a worker. Restoring
- * tail position for a one-block restatement of the golden rule — and
- * cross-referencing it from the two competing fragments — makes the
- * delegation preference deterministic rather than recency-dependent.
+ * started doing execution inline instead of dispatching a worker.
+ *
+ * The first fix was ordering: re-state the golden rule in this tail
+ * fragment and cross-reference it from the two competing fragments. That
+ * left the SAME rule stated three times ("## Sub-Agent Delegation" in the
+ * profile body, "## Execution Bias", "## Delegation — the last word") with
+ * conflicting absolutes, which is the failure mode Anthropic's Claude 5
+ * context-engineering guidance calls out directly — overlapping and
+ * conflicting instructions make the model deliberate more, not behave
+ * better.
+ *
+ * This fragment is now the SINGLE source: the profile-body sections and the
+ * "Execution Bias" section were deleted, their non-duplicated content folded
+ * in here (including the steer-or-queue rule, which previously only reached
+ * the default and coding profiles). Single-sourcing is strictly stronger
+ * than ordering — there is no competing statement left to lose to — and tail
+ * position is retained on top of it. Both properties are pinned in
+ * `src/agents/profiles.test.ts` ("delegation single-sourcing + recency").
  *
  * Returns the rendered Markdown, or an empty string if the fragment
  * file is missing (e.g. partial install).

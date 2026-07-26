@@ -2,8 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, lstatSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { scaffoldAgent } from "../src/agents/scaffold.js";
 import type { AgentConfig, TelegramConfig } from "../src/config/schema.js";
+// @ts-expect-error — plain .mjs guard module, shared with the ratchet unit test.
+import {
+  evaluateRatchet,
+  readRatchet,
+  readMainRatchet,
+} from "../scripts/check-claude-md-byte-ratchet.mjs";
+
+/** Repo root, so the ratchet file resolves regardless of vitest's cwd. */
+const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 
 const telegramConfig: TelegramConfig = {
   bot_token: "123456:ABC-DEF",
@@ -108,83 +118,50 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     const result = scaffoldAgent("health-coach", config, tmpDir, telegramConfig);
     const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
 
-    // CLAUDE.md should be significantly smaller without persona block.
-    // Cap raised from 12000 → 16000 for vault/hindsight/sub-agent/Telegram
-    // additions in v0.3-v0.4; raised again 16000 → 24000 for the
-    // lifecycle additions in #557 (wake-audit + restart-visibility);
-    // raised again 24000 → 26000 for the phone-first-UX epic #572
-    // (`!` interrupt marker, voice transcripts, sticker/GIF persona
-    // guidance, Telegraph long-reply auto-publish); cap had already
-    // drifted to ~27.3KB on upstream/main from incremental persona /
-    // skill / handoff edits before the bump below. Raised again
-    // 26000 → 32000 for the unconditional vault-protocol fragment
-    // appended to every agent's CLAUDE.md (~2.9KB; teaches the agent
-    // when to call vault_request_access, when to degrade gracefully
-    // in cron context, and why --no-broker / env-file fallbacks can't
-    // work from inside a sandbox — RCA: gymbro silently fell back to
-    // estimates on VAULT-BROKER-DENIED instead of requesting a grant).
-    // Raised again 32000 → 33000 for PR1 of the voice/architecture
-    // cleanup (#1177): unified AI-tells ban-list into SOUL.md "Never"
-    // and added a procedural "Execution Bias" section to CLAUDE.md.
-    // LOWERED 33000 → 28000 in PR2 of the same cleanup (#TBD):
-    // hoisted resume protocol, wake audit, "why did you restart" debug
-    // commands, `!` interrupt implementation detail, and "status?"
-    // UX-failure signal procedures out of telegram-style.md.hbs into
-    // a new bundled `switchroom-runtime` skill. Always-loaded prompt
-    // now points at the skill via short triggers; procedural detail
-    // loads on demand. ~5KB removed from every-turn context.
-    // RAISED 28000 → 32000 for the agent-self-sufficiency epic
-    // (#TBD): four new always-loaded blocks the goal explicitly
-    // required — (a) "What you are" honest-identity statement +
-    // peer-awareness pointer at `peers_list`, (b) admin-vs-non-admin
-    // refusal posture so non-admin agents hand off to the right
-    // peer instead of trying to run hostd verbs, (c) peers_list +
-    // skill_install/skill_remove rows in the self-service fragment.
-    // Net adds ~3KB; trimmed otherwise where prose was redundant.
-    // The previous 33000 ceiling left effectively no headroom for
-    // future fragments, so we step back up to a comparable point.
-    // Each block is load-bearing. Future bumps should justify themselves
-    // similarly.
-    // RAISED 33500 → 37500 for the unconditional dev-protocol fragment
-    // (~3.6KB): Ken's fleet-wide development protocol (orient/ground,
-    // clarify vs proceed, design-align, pipeline, communication) —
-    // always-loaded summary pointing at the bundled `dev-protocol`
-    // skill for the long-form playbook.
-    // RAISED 37500 → 40000 for the unconditional delegation-golden-rule
-    // tail fragment (#3231 / PR #3232, ~1.2KB): restores tail-of-prompt
-    // recency for the "when in doubt, delegate" signal. At the prior 37500
-    // ceiling the WORST-CASE stack (root-tier + default profile) sat at
-    // ~37464B — effectively zero headroom — so this load-bearing fragment
-    // tipped that stack to ~38.7KB and breached the ceiling. Bumped to
-    // 40000 to restore ~1.3KB of real headroom for the worst case (see the
-    // worst-case ceiling test below, which is what surfaces this).
-    expect(claudeMd.length).toBeLessThan(40000);
+    // Byte ceiling for a SMALL profile. The number is not a magic
+    // constant: it is the checked-in RATCHET in
+    // scripts/claude-md-byte-ratchet.txt, which may only ever be LOWERED.
+    // autoTighten is off here because this small-profile stack legitimately
+    // sits far below the worst-case ceiling the ratchet tracks; the
+    // worst-case test below is what keeps the ratchet honest.
+    const { ok, errors } = evaluateRatchet({
+      actual: claudeMd.length,
+      ratchet: readRatchet(REPO_ROOT),
+      autoTighten: false,
+    });
+    expect(errors.join("\n")).toBe("");
+    expect(ok).toBe(true);
   });
 
-  it("worst-case stack (root-tier + default profile) stays under the byte ceiling", () => {
-    // L2 (review PR #3232): the slim-CLAUDE.md ceiling test above exercises a
-    // SMALL profile (health-coach, ~23.5KB), leaving real headroom against the
-    // ceiling untested. The actual worst case is a root-tier agent on the
-    // DEFAULT profile (~38.7KB — the full admin surface PLUS the root-tier
-    // host-access block on top of the largest profile body), which sits closest
-    // to the ceiling. Guard headroom where it actually matters: a future
-    // fragment that overflows the ceiling for the worst-case stack must fail
-    // here even though the health-coach test would still pass. This test is
-    // what surfaced that PR #3232's delegation fragment breached the old 37500
-    // ceiling for this stack (37464 → 38658), prompting the bump to 40000.
-    // Later, #3446's "When to synthesize" synthesis-triggers fragment
-    // silently pushed this stack to 40626 — over the 40000 ceiling without a
-    // bump — which surfaced as a required-check failure on the next PR (#3482)
-    // even though #3482 adds ZERO bytes to CLAUDE.md (its formatting floor
-    // card goes into --append-system-prompt, not CLAUDE.md). Fixed durably by
-    // TIGHTENING that fragment's prose (rules + backstops kept, wordiness cut)
-    // rather than bumping the ceiling — restoring the stack to ~39746
-    // (~254B headroom). Do NOT paper over a future breach with a ceiling bump
-    // unless the added prose is genuinely load-bearing and irreducible.
+  it("worst-case stack (root-tier + default profile) obeys the byte RATCHET — raising it is not the remedy", () => {
+    // The worst case is a root-tier agent on the DEFAULT profile: the full
+    // admin surface PLUS the root-tier host-access block on top of the largest
+    // profile body. That is the stack scripts/claude-md-byte-ratchet.txt
+    // tracks, so this test enforces all three ratchet rules:
+    //
+    //   INFLATION    — the prompt may not grow past the ceiling.
+    //   AUTO-TIGHTEN — a PR that SHRINKS the prompt must record the new,
+    //                  lower ceiling in the same PR, so it can never silently
+    //                  re-inflate to an old high-water mark.
+    //   NEVER-RAISE  — a PR may lower the ratchet, never raise it.
+    //
+    // History is why this is a ratchet and no longer a bare number: the old
+    // ceiling went 26000 → 32000 → 33000 → (28000) → 32000 → 33500 → 37500 →
+    // 40000, because "raise the ceiling" was always the cheapest way past a
+    // breach. It is no longer available. If this test reds with INFLATION,
+    // the fix is to move procedure into an on-demand skill, push tool usage
+    // into the tool description, or delete a rule that duplicates another —
+    // NOT to edit the ratchet file upward.
     const config = makeAgentConfig({ root: true } as Partial<AgentConfig>);
     const result = scaffoldAgent("overlord", config, tmpDir, telegramConfig);
     const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
-    expect(claudeMd.length).toBeLessThan(40000);
+    const { ok, errors } = evaluateRatchet({
+      actual: claudeMd.length,
+      ratchet: readRatchet(REPO_ROOT),
+      mainRatchet: readMainRatchet(REPO_ROOT),
+    });
+    expect(errors.join("\n")).toBe("");
+    expect(ok).toBe(true);
   });
 
   it("root: true renders the root-tier host-access block + the admin surface", () => {
@@ -199,10 +176,22 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     expect(claudeMd).toContain("## Admin surface");
     expect(claudeMd).not.toContain("You're NOT `admin: true`");
     // Accuracy pins (the root agent runs as uid 0; these claims were
-    // verified against the live container):
-    // 1. The root block resolves the contradiction with the admin
-    //    approval-card section (root is no-tap, not gated by hostd).
-    expect(claudeMd).toContain("supersedes the \"Admin surface\" section");
+    // verified against the live container AND against source):
+    // 1. The root block composes with the admin approval-card section BY
+    //    PATH, not by rank. It must NOT claim to supersede it: root: true
+    //    forces admin semantics on, so the hostd MCP server IS wired for a
+    //    root agent (src/agents/scaffold.ts gates on `admin === true ||
+    //    root === true`; src/agents/compose.ts mounts the hostd socket for
+    //    every agent and hostd gates server-side in checkGate). The old
+    //    "supersedes / those verbs aren't wired into your container" text
+    //    was factually wrong and would have made a root agent skip real
+    //    tools it has. What IS true: the agent's OWN shell (docker, /host,
+    //    /host-home) is un-tapped, while hostd verbs still block on an
+    //    operator approval card.
+    expect(claudeMd).not.toContain("supersedes the \"Admin surface\" section");
+    expect(claudeMd).toContain("How this composes with the Admin surface above — by path, not by rank");
+    expect(claudeMd).toContain("standing and un-tapped");
+    expect(claudeMd).toContain("still wired for you and still gated");
     // 2. Correct host-side per-agent log path (NOT the in-container
     //    /var/log/switchroom path, which doesn't exist under /host).
     expect(claudeMd).toContain("/host-home/.switchroom/logs/<agent>/");
