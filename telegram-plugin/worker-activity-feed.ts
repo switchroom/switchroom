@@ -53,6 +53,7 @@ import {
   cleanWorkerResultParagraph,
   stripMarkdown,
   truncate,
+  COLLAPSE_SAFE_SEPARATOR,
 } from './card-format.js'
 import { WORKER_HISTORY_MAX } from './status-no-truncate.js'
 import {
@@ -245,7 +246,10 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     // Header-only running render → append the starting placeholder with a GFM
     // hard break (`  \n`) so it stacks under the header instead of collapsing
     // onto the header line in the rich-message renderer (matches stackCardLines).
-    return `${card}  \n_starting…_`
+    // The collapse separator is carried here too (#3666) — this card is pinned,
+    // and a hand-rolled seam would be the one boundary that still mashed in
+    // Telegram's pinned bar.
+    return `${card}${COLLAPSE_SAFE_SEPARATOR}  \n_starting…_`
   }
   return card
 }

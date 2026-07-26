@@ -7,6 +7,7 @@ import {
 } from '../worker-activity-feed.js'
 import { renderCombinedWorkerFeed, combinedHistoryDepth } from '../tool-activity-summary.js'
 import { STATUS_CARD_CHAR_BUDGET, WORKER_STEP_INDENT } from '../status-no-truncate.js'
+import { COLLAPSE_SAFE_SEPARATOR } from '../card-format.js'
 import { richMessage } from '../rich-send.js'
 import { parseRichEntities, validateRichMarkdown } from './rich-markdown-oracle.js'
 import { createSendGate, isSendGateShed, type Clock } from '../send-gate.js'
@@ -1298,17 +1299,24 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     // is the actual thing the fix is for: a step must sit under its own worker.
     const body = renderCombinedWorkerFeed(rowsFor(3), { maxRows: 8 })!
     const I = WORKER_STEP_INDENT
+    // `S` is the pinned-bar collapse separator (#3666): every line that is
+    // followed by a hard break carries one trailing U+00A0 so the pinned-message
+    // bar (which drops the newline and substitutes nothing) does not mash the
+    // last glyph of a line into the first glyph of the next. It is TRAILING and
+    // exactly one char — structurally distinct from the LEADING three-char
+    // `WORKER_STEP_INDENT`, which is what this golden is really pinning.
+    const S = COLLAPSE_SAFE_SEPARATOR
     expect(linesOf(body)).toEqual([
-      '🛠 **Workers** · _3 running_',
-      '**1. worker task 1** _· 1m00s · 3 tools_',
-      `${I}~~_✓ w1 step a_~~`,
-      `${I}**→ w1 step b**`,
-      '**2. worker task 2** _· 2m00s · 3 tools_',
-      `${I}~~_✓ w2 step a_~~`,
-      `${I}**→ w2 step b**`,
-      '**3. worker task 3** _· 3m00s · 3 tools_',
-      `${I}~~_✓ w3 step a_~~`,
-      `${I}**→ w3 step b**`,
+      `🛠 **Workers** · _3 running · oldest 3m00s · 9 tools_${S}`,
+      `**1. worker task 1** _· 1m00s · 3 tools_${S}`,
+      `${I}~~_✓ w1 step a_~~${S}`,
+      `${I}**→ w1 step b**${S}`,
+      `**2. worker task 2** _· 2m00s · 3 tools_${S}`,
+      `${I}~~_✓ w2 step a_~~${S}`,
+      `${I}**→ w2 step b**${S}`,
+      `**3. worker task 3** _· 3m00s · 3 tools_${S}`,
+      `${I}~~_✓ w3 step a_~~${S}`,
+      `${I}**→ w3 step b**`, // last line: nothing follows it to collide with
     ])
   })
 
@@ -1377,6 +1385,15 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     })
     expect(single).toContain('~~_✓ step a_~~')
     expect(single).toContain('**→ step b**')
-    expect(single.includes(NBSP)).toBe(false)
+    // No LEADING indent: the single-worker card has nothing to nest under, so
+    // its step lines must sit flush at the left margin. Asserted per line on the
+    // leading edge rather than as "no U+00A0 anywhere in the card", because
+    // #3666 puts one TRAILING U+00A0 on every hard-broken line of every pinned
+    // card (this one included) as the collapse separator. A regression that
+    // leaked WORKER_STEP_INDENT onto these lines still fails here.
+    for (const l of single.split('\n')) {
+      expect(l.startsWith(NBSP)).toBe(false)
+      expect(l.startsWith(WORKER_STEP_INDENT)).toBe(false)
+    }
   })
 })
