@@ -98,9 +98,16 @@ RUN VIRTUAL_ENV=/app/api/.venv uv pip install --no-cache-dir 'claude-agent-sdk==
 # restart-loop it, and fleet memory would be down until a manual rollback — so
 # the wheel is proven at BUILD time, where a failure is just a red CI job.
 #
-# Runtime safety property: this raises the CEILING, never the floor. If CUDA is
-# unreachable at runtime (no --gpus, no toolkit, GPU otherwise unusable),
-# cross_encoder.py falls back to CPU — worst case is exactly today's behaviour.
+# Safety property, and its limit. AT INIT the fallback is total: device
+# selection happens once when the provider is constructed, so if CUDA is
+# unreachable then (no --gpus, no toolkit, no driver) cross_encoder.py — and
+# embeddings.py, which rides this same wheel and makes the same probe — select
+# CPU and behave exactly as they do today. AT REQUEST TIME it is NOT: because
+# the device is already chosen, a CUDA OOM mid-recall surfaces as a 500 on that
+# recall, not an automatic CPU retry. Steady-state VRAM is comfortable (~1.2-
+# 1.8GB of models against ~5.3GB free), so that is a tail risk, not the
+# expected path — but it is a real one, tracked as a follow-up rather than
+# papered over here.
 ARG TARGETARCH
 RUN set -eu; \
     if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \

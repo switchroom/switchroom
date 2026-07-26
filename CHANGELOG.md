@@ -18,9 +18,12 @@ generated compose file.
 
 Both are gated on the host-capabilities verdict switchroom already probes for
 voice (NVIDIA GPU present AND the nvidia-container-toolkit wired), so a host
-without a usable GPU is untouched. If CUDA turns out to be unreachable at
-runtime the reranker falls back to CPU on its own, which is exactly the
-behaviour it has today.
+without a usable GPU is untouched — if CUDA is unreachable when the reranker
+starts, it selects CPU on its own and behaves exactly as it does today.
+
+Embeddings come along for free. They run on the same torch, and make the same
+device probe, so they move to the GPU with no extra work — a smaller win
+(tens of milliseconds a call, not seconds), but a free one.
 
 ## v0.19.22 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
 
