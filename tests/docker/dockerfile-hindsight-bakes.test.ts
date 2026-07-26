@@ -57,6 +57,58 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("reinstalls torch from a CUDA wheel index (the reranker runs on GPU)", () => {
+    // The recall reranker is sentence-transformers + PyTorch, and upstream's
+    // cross_encoder.py already selects `cuda` when torch.cuda.is_available().
+    // Upstream's venv ships `torch==2.12.1+cpu` (torch.version.cuda is None),
+    // which is the ONLY reason reranking is CPU-bound. Pin the CUDA reinstall.
+    expect(dockerfile).toMatch(
+      /--index-url\s+https:\/\/download\.pytorch\.org\/whl\/cu\d+/,
+    );
+    // CUDA local-version tag on an explicit version pin. A `+cpu` (or
+    // untagged) requirement would resolve straight back to the CPU build and
+    // silently undo the whole change while every other assertion here passed.
+    const torchReq = dockerfile.match(/'torch==([^']+)'/);
+    expect(torchReq, "the Dockerfile must pin an explicit torch requirement").not.toBeNull();
+    expect(torchReq![1]).toMatch(/^\d+\.\d+\.\d+\+cu\d+$/);
+    expect(torchReq![1]).not.toContain("+cpu");
+    // uv against the existing venv — same rule as the SDK install above
+    // (upstream's uv-managed venv ships no `pip` binary).
+    expect(dockerfile).toMatch(
+      /VIRTUAL_ENV=\/app\/api\/\.venv\s+uv\s+pip\s+install[\s\S]{0,120}?--index-url\s+https:\/\/download\.pytorch\.org/,
+    );
+  });
+
+  it("asserts at BUILD time that torch is really a CUDA build (fail-loud guard)", () => {
+    // The dangerous failure mode is a wheel that installs but resolves back to
+    // CPU (or imports broken): the reranker silently stays slow, or the API
+    // fails to boot, autoheal restart-loops the container, and fleet memory is
+    // down until someone rolls the image tag back. Prove it at BUILD time,
+    // where a failure is just a red CI job.
+    expect(dockerfile).toMatch(/import torch;\s*assert torch\.version\.cuda,/);
+    expect(dockerfile).toContain(
+      "switchroom hindsight CUDA-torch install: torch {torch.__version__} is not a CUDA build",
+    );
+    // The assert must FOLLOW the install — one that precedes it proves nothing.
+    const installIdx = dockerfile.search(/--index-url\s+https:\/\/download\.pytorch\.org/);
+    const assertIdx = dockerfile.search(/assert torch\.version\.cuda,/);
+    expect(installIdx).toBeGreaterThanOrEqual(0);
+    expect(assertIdx).toBeGreaterThan(installIdx);
+  });
+
+  it("restricts the CUDA torch payload to amd64 (fleet GPU hosts are x86_64)", () => {
+    // Multiple GB of vendored nvidia-* libs per arch, on an image already
+    // ~6.4GB, for an arch with no GPU host behind it. Dockerfile.voice makes
+    // the same call. arm64 keeps upstream's CPU torch and reranks on CPU.
+    expect(dockerfile).toMatch(/^ARG TARGETARCH$/m);
+    expect(dockerfile).toMatch(/if \[ "\$\{TARGETARCH:-amd64\}" = "amd64" \]; then/);
+    // ARG must be declared after the FROM it applies to, or the shell sees an
+    // empty value and the build silently takes the non-amd64 branch on amd64.
+    const fromIdx = dockerfile.search(/^FROM\s+ghcr\.io\/vectorize-io\/hindsight/m);
+    const argIdx = dockerfile.search(/^ARG TARGETARCH$/m);
+    expect(argIdx).toBeGreaterThan(fromIdx);
+  });
+
   it("installs the @anthropic-ai/claude-code CLI globally", () => {
     // Allow the install to be quoted + version-pinned, e.g.
     // `npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"`.

@@ -7,6 +7,7 @@ import {
   assertClientBudget,
   clientBudgetSeconds,
 } from "../litellm/timeout-budget.js";
+import { loadHostCapabilities } from "./host-capabilities.js";
 
 /**
  * Default Hindsight host ports.
@@ -1228,6 +1229,44 @@ export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: stri
   return `python3 -c "${buildLiteLlmAwareHealthPy(apiPort, litellmBaseUrl)}"`;
 }
 
+/**
+ * Should hindsight be launched with GPU passthrough?
+ *
+ * The recall reranker is sentence-transformers + PyTorch, and
+ * `hindsight_api/engine/reranker/cross_encoder.py` already selects `cuda`
+ * whenever `torch.cuda.is_available()`. docker/Dockerfile.hindsight installs a
+ * CUDA-flavoured torch on amd64 (see the `torch-cuda ok` build assert), so the
+ * only remaining requirement is that the container actually SEES the device —
+ * `--gpus all` on the run path, the `deploy.resources.reservations.devices`
+ * stanza on the compose path.
+ *
+ * This is GATED, not unconditional. `docker run --gpus all` FAILS outright on
+ * a host without the nvidia-container-toolkit ("could not select device
+ * driver"), which would turn a GPU-less install's `switchroom memory setup`
+ * into a hard error. So we reuse exactly the fail-safe rule the voice sidecar
+ * uses (`src/agents/compose.ts`, PR-B2): pass the GPU through only when the
+ * persisted host-capabilities verdict says a GPU is present AND Docker can
+ * reach it. No verdict file (fresh install, never ran `switchroom setup`) ⇒
+ * false ⇒ today's CPU behaviour.
+ *
+ * The booleans live under the `voice` key purely because that feature wrote
+ * the schema first (`src/setup/host-capabilities.ts` v1) — they are host
+ * hardware facts, not voice settings.
+ *
+ * Degrading to `false` on a GPU host is safe (CPU reranking, i.e. today);
+ * degrading to CPU inside a GPU-enabled container is also safe
+ * (cross_encoder.py's own `torch.cuda.is_available()` fallback). The only
+ * genuinely bad outcome is emitting `--gpus` where Docker can't honour it,
+ * which is precisely what this gate prevents.
+ *
+ * @param override Test/caller seam. When omitted the persisted verdict is read.
+ */
+export function hindsightGpuEnabled(override?: boolean): boolean {
+  if (override !== undefined) return override;
+  const caps = loadHostCapabilities();
+  return Boolean(caps?.voice?.gpuPresent && caps?.voice?.containerToolkit);
+}
+
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
@@ -1242,6 +1281,12 @@ export function startHindsight(
    * path; the consumer-side mount path is always HINDSIGHT_CRED_DIR.
    */
   mirrorDir?: string,
+  /**
+   * GPU-passthrough override. Omit in production — {@link hindsightGpuEnabled}
+   * reads the persisted host-capabilities verdict. Tests pass an explicit
+   * boolean so the suite never depends on the runner having (or lacking) a GPU.
+   */
+  gpu?: boolean,
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
@@ -1360,6 +1405,13 @@ export function startHindsight(
     // HINDSIGHT_DEFAULT_SHM_SIZE) or all writes/queries fail with
     // "No space left on device". Keep in sync with the compose snippet.
     `--shm-size=${HINDSIGHT_DEFAULT_SHM_SIZE}`,
+    // GPU passthrough for the local cross-encoder reranker. Gated on the
+    // persisted host-capabilities verdict — see hindsightGpuEnabled() for why
+    // this must never be unconditional. Kept in sync with the compose snippet
+    // (generateHindsightComposeSnippet emits the equivalent
+    // deploy.resources.reservations.devices stanza); the run/compose parity
+    // test pins that both paths move together.
+    ...(hindsightGpuEnabled(gpu) ? ["--gpus", "all"] : []),
     // Liveness signal for a wedged API: docker had no health probe for
     // hindsight, so an unresponsive server (or a never-booting one) stayed
     // "up" forever. This marks the container "unhealthy" in `docker inspect`
@@ -1675,7 +1727,10 @@ export function getHindsightMcpUrl(): {
  * container chowns and binds the per-consumer socket inside it). The
  * hindsight compose project is separate; it consumes the volume.
  *
- * Networking + healthcheck track {@link startHindsight}: when an explicit
+ * Networking, healthcheck and GPU passthrough track {@link startHindsight}:
+ * the `deploy.resources.reservations.devices` stanza here is the compose twin
+ * of that path's `--gpus all`, gated on the same {@link hindsightGpuEnabled}
+ * verdict so the two generators can never disagree about GPU. When an explicit
  * LiteLLM config is passed, OR any configured per-op `*_LLM_BASE_URL`
  * points at host loopback, the snippet emits `network_mode: host` (ports
  * are published on the host stack directly — no `ports:` mapping) and pairs
@@ -1702,10 +1757,17 @@ export function generateHindsightComposeSnippet(
    * so compose never silently diverges from the docker-run path.
    */
   litellm?: LiteLLMHindsightConfig,
+  /**
+   * GPU-passthrough override, mirroring {@link startHindsight}'s `gpu` param.
+   * Omit in production — {@link hindsightGpuEnabled} reads the persisted
+   * host-capabilities verdict.
+   */
+  gpu?: boolean,
 ): string {
   const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
   const perOpLlm = resolveHindsightPerOpLlm(llm);
   const hostNetwork = hindsightNeedsHostNetwork(llm, litellm);
+  const gpuEnabled = hindsightGpuEnabled(gpu);
   const apiPort = HINDSIGHT_DEFAULT_API_PORT;
   // Bridge compose keeps the image-default internal bind (8888) and maps the
   // host port onto it. Host-network binds HINDSIGHT_API_PORT on the host
@@ -1823,6 +1885,23 @@ export function generateHindsightComposeSnippet(
     // PostgreSQL shm — see HINDSIGHT_DEFAULT_SHM_SIZE. Without this the
     // container gets Docker's 64MB default and all writes/queries fail.
     `    shm_size: ${HINDSIGHT_DEFAULT_SHM_SIZE}`,
+    // GPU passthrough for the local cross-encoder reranker — the compose twin
+    // of the docker-run path's `--gpus all`. Same shape as the voice sidecar
+    // (src/agents/compose.ts), same fail-safe gate (hindsightGpuEnabled): a
+    // host with no nvidia-container-toolkit gets no stanza at all, because
+    // compose would refuse to start the service ("could not select device
+    // driver") exactly like `docker run --gpus` does.
+    ...(gpuEnabled
+      ? [
+          "    deploy:",
+          "      resources:",
+          "        reservations:",
+          "          devices:",
+          "            - driver: nvidia",
+          "              count: 1",
+          '              capabilities: ["gpu"]',
+        ]
+      : []),
     // Liveness — restart a wedged/never-booted API (see the docker-run path).
     // When host-network + LiteLLM base is known, pair /health with a TCP
     // probe of the proxy so docker health reflects LLM reachability too.

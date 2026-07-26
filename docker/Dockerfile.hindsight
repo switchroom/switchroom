@@ -72,6 +72,47 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 RUN VIRTUAL_ENV=/app/api/.venv uv pip install --no-cache-dir 'claude-agent-sdk==0.2.87' \
  && /app/api/.venv/bin/python -c "from claude_agent_sdk import query; print('claude-agent-sdk ok')" >&2
 
+# ── CUDA-enabled torch for the local reranker ────────────────────────────
+# The recall reranker is sentence-transformers + PyTorch (provider `local` →
+# LocalSTCrossEncoder, model cross-encoder/ms-marco-MiniLM-L-6-v2), NOT ONNX
+# Runtime. hindsight_api/engine/reranker/cross_encoder.py ALREADY selects
+# `cuda` when `torch.cuda.is_available()` — so the ONLY thing standing between
+# this image and GPU reranking is that upstream's venv ships `torch==2.12.1+cpu`
+# (`torch.version.cuda is None`). Reinstall the SAME torch version from the
+# cu130 wheel index; no application code change is needed.
+#
+# cu130 matches the fleet GPU host's driver (580.x, reports CUDA 13.0)
+# natively, and the wheel vendors its own nvidia-* runtime libs, so this needs
+# no CUDA base image and no host CUDA toolkit — only the
+# nvidia-container-toolkit, which `src/setup/gpu-detect.ts` already probes and
+# which `src/setup/hindsight.ts` gates the `--gpus` flag on.
+#
+# amd64 ONLY, deliberately — the same call docker/Dockerfile.voice makes. The
+# cu130 index does publish aarch64 wheels, but the fleet's GPU hosts are x86_64
+# and the CUDA payload is multiple GB per arch; baking it into the (already
+# 6.4GB) arm64 leg costs real registry + pull weight for something that can
+# never be used there. arm64 keeps upstream's CPU torch and reranks on CPU.
+#
+# FAIL-LOUD: on amd64 the build asserts `torch.version.cuda` is non-None. A
+# silently-broken wheel would make the API fail to boot, autoheal would
+# restart-loop it, and fleet memory would be down until a manual rollback — so
+# the wheel is proven at BUILD time, where a failure is just a red CI job.
+#
+# Runtime safety property: this raises the CEILING, never the floor. If CUDA is
+# unreachable at runtime (no --gpus, no toolkit, GPU otherwise unusable),
+# cross_encoder.py falls back to CPU — worst case is exactly today's behaviour.
+ARG TARGETARCH
+RUN set -eu; \
+    if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+      VIRTUAL_ENV=/app/api/.venv uv pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        'torch==2.12.1+cu130'; \
+      /app/api/.venv/bin/python -c "import torch; assert torch.version.cuda, f'switchroom hindsight CUDA-torch install: torch {torch.__version__} is not a CUDA build (torch.version.cuda={torch.version.cuda!r}) — the reranker would silently stay on CPU'; print(f'torch-cuda ok: {torch.__version__} (cuda {torch.version.cuda})')" >&2; \
+    else \
+      echo "torch-cuda skipped on non-amd64 arch: ${TARGETARCH}" >&2; \
+      /app/api/.venv/bin/python -c "import torch; print(f'torch ok (cpu build): {torch.__version__}')" >&2; \
+    fi
+
 # #2392: neutralize the upstream claude_code-provider env isolation, which is
 # incompatible with our file-based creds. Upstream PR #1825 (for #1751, a
 # plugin-recursion retain loop) made `_get_isolated_claude_env()` set, for
