@@ -171,6 +171,46 @@ describe("check-release-asset-names (static contract)", () => {
     expect(r.ok).toBe(false);
     expect(r.out).toContain("separator");
   });
+
+  // ---- #3634: every asset is built on its own OS ----
+  //
+  // The workflow's smoke run catches a cross-compiled darwin target by
+  // accident (Linux cannot exec a Mach-O). That is an emergent property of
+  // the build host, not a rule anyone stated — and the signature step is
+  // `if: startsWith(matrix.target.runner, 'macos')`, so moving a macOS leg to
+  // ubuntu ALSO silently skips the only signature check there is. These cases
+  // make the rule explicit and prove it bites.
+
+  it("fails when a macOS asset is moved to a Linux runner (the #3634 regression)", () => {
+    const env = stage({ workflow: (s) => s.replace("runner: macos-15 }", "runner: ubuntu-latest }") });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("switchroom-macos-arm64");
+    expect(r.out).toContain("ubuntu-latest");
+    expect(r.out).toContain("#3634");
+  });
+
+  it("fails when a Linux asset is moved to a macOS runner", () => {
+    const env = stage({ workflow: (s) => s.replace("runner: ubuntu-24.04-arm }", "runner: macos-15 }") });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("switchroom-linux-arm64");
+    expect(r.out).toContain("macos-15");
+  });
+
+  it("fails when a build-matrix target declares no runner at all", () => {
+    const env = stage({ workflow: (s) => s.replace(", runner: ubuntu-24.04-arm }", " }") });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("no `runner` label");
+  });
+
+  it("fails when the macOS signature verification step is dropped", () => {
+    const env = stage({ workflow: (s) => s.replaceAll("codesign --verify", "codesign -v") });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("codesign --verify");
+  });
 });
 
 describe("verify-release-bundle (runtime contract)", () => {
@@ -229,6 +269,48 @@ describe("verify-release-bundle (runtime contract)", () => {
     expect(out).not.toContain("ERR_MODULE_NOT_FOUND");
     expect(out).toContain("OK release bundle");
     expect(r.status).toBe(0);
+  });
+});
+
+/**
+ * The release workflow's smoke step is a STRING EQUALITY:
+ *
+ *   out="$("./switchroom-linux-amd64" --version)"
+ *   [ "$out" = "${GITHUB_REF#refs/tags/v}" ] || fail
+ *
+ * so `switchroom --version` must print the bare version and nothing else. A
+ * banner, a `v` prefix, a "switchroom " prefix or a second line breaks EVERY
+ * build leg and blocks the release — and nothing anywhere asserted that shape.
+ * Commander's `.version(VERSION)` gives it today; this makes that a contract.
+ */
+describe("switchroom --version shape (the release smoke assertion depends on it)", () => {
+  const bunAvailable = (() => {
+    if (process.env.BUN_BUILD_COMPILE_SKIP) return false;
+    const probe = spawnSync("bun", ["--version"], { encoding: "utf8" });
+    return probe.status === 0;
+  })();
+
+  it.skipIf(!bunAvailable)("prints exactly the bare version, one line, no prefix", () => {
+    const r = spawnSync("bun", ["bin/switchroom.ts", "--version"], {
+      cwd: REPO,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    expect(r.status, `stdout: ${r.stdout}\nstderr: ${r.stderr}`).toBe(0);
+
+    const stdout = r.stdout ?? "";
+    // Exactly one line, terminated by a single newline — no banner, no trailer.
+    expect(stdout.split("\n").filter((l) => l.length > 0)).toHaveLength(1);
+    const out = stdout.trim();
+    // The same shape release.yml's tag guard accepts, with no decoration: what
+    // the workflow compares against is `${tag#v}`, so a leading `v` or a
+    // "switchroom " prefix would fail the equality on every leg.
+    expect(out).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+([-.+].+)?$/);
+    // Belt and braces: no whitespace inside means no "switchroom 1.2.3" form.
+    expect(out).not.toMatch(/\s/);
+    // And stdout must not be padded — the workflow uses `$( )`, which strips
+    // only trailing newlines, so a leading space would break the comparison.
+    expect(stdout.startsWith(out)).toBe(true);
   });
 });
 

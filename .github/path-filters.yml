@@ -57,10 +57,16 @@ core:
   - 'telegram-plugin/**/*.ts'
   - 'scripts/build.mjs'
   # tests/release-asset-contract.test.ts drives the real install.sh + the
-  # release-bundle verifier — changing either must re-run it.
+  # release-bundle verifier — changing either must re-run it. It also SPAWNS
+  # check-release-asset-names.mjs and asserts its failure text on every drift
+  # case, so that script belongs here too: `scripts/check-*.mjs` is in the
+  # `lint` filter ONLY, which would let a PR touching just that script skip
+  # the tests covering it — the same skip→pass hole this block closes for
+  # install.sh.
   - 'install.sh'
   - 'scripts/release-assets.mjs'
   - 'scripts/verify-release-bundle.mjs'
+  - 'scripts/check-release-asset-names.mjs'
   - 'vitest.config.ts'
   - 'tsconfig.json'
   - 'package.json'

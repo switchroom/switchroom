@@ -39,6 +39,26 @@ export const RELEASE_WORKFLOW_PATH = fileURLToPath(
  */
 export const CHECKSUM_SEPARATOR = "  ";
 
+/**
+ * Which runner labels are allowed to build which platform's asset (#3634).
+ *
+ * `bun build --compile --target=bun-darwin-arm64` cross-compiles from Linux
+ * happily, but the resulting Mach-O cannot be `codesign`ed in that job — it
+ * ships unsigned, and an unsigned arm64 Mach-O is SIGKILLed on exec. #3634 is
+ * exactly that regression. The workflow's smoke run catches most of it by
+ * accident (Linux cannot exec a Mach-O), but "a foreign binary happens to be
+ * unrunnable on the build host" is an emergent property, not a stated rule.
+ * This is the stated rule: every asset is built on its own OS.
+ *
+ * Keyed by the platform token install.sh derives (`platform=linux`,
+ * `platform=macos`). A platform with no entry here is a HARD failure rather
+ * than an unchecked pass — adding a target must force this decision.
+ */
+export const PLATFORM_RUNNER_PREFIXES = {
+  linux: ["ubuntu-", "linux-"],
+  macos: ["macos-"],
+};
+
 class ContractError extends Error {}
 
 function fail(message) {
@@ -113,7 +133,8 @@ export function parseInstallerContract(text) {
  * Derive what `.github/workflows/release.yml` produces and attaches.
  *
  * @param {string} text contents of release.yml
- * @returns {{matrixAssets: string[], declaredAssets: string[], checksumsFile: string}}
+ * @returns {{matrixAssets: string[], matrixRunners: Record<string, string>,
+ *            declaredAssets: string[], checksumsFile: string}}
  */
 export async function parseWorkflowContract(text) {
   // `yaml` is imported lazily and ONLY on this path. The release workflow runs
@@ -128,10 +149,18 @@ export async function parseWorkflowContract(text) {
   if (!Array.isArray(targets) || targets.length === 0) {
     fail("release.yml: jobs.build.strategy.matrix.target is missing or empty");
   }
+  const matrixRunners = {};
   const matrixAssets = targets.map((t, i) => {
     if (!t || typeof t.asset !== "string" || t.asset.length === 0) {
       fail(`release.yml: build matrix entry ${i} has no \`asset\` name`);
     }
+    if (typeof t.runner !== "string" || t.runner.length === 0) {
+      fail(
+        `release.yml: build matrix entry ${i} (${t.asset}) has no \`runner\` label — #3634 requires ` +
+          "every asset to name the OS it is built on",
+      );
+    }
+    matrixRunners[t.asset] = t.runner;
     return t.asset;
   });
 
@@ -157,7 +186,18 @@ export async function parseWorkflowContract(text) {
     );
   }
 
-  return { matrixAssets, declaredAssets, checksumsFile };
+  // The macOS legs must still verify what bun ad-hoc signed. Same rationale as
+  // the `sha256sum` presence check above: dropping the signature check would be
+  // a deliberate decision, so make it one that has to be taken here.
+  if (!/\bcodesign\s+--verify\b/.test(text)) {
+    fail(
+      "release.yml: no `codesign --verify` step found. The macOS legs build on a real Mac (#3634) " +
+        "specifically so the Mach-O signature bun produces can be checked before publish; an arm64 " +
+        "binary with a bad signature is SIGKILLed on exec.",
+    );
+  }
+
+  return { matrixAssets, matrixRunners, declaredAssets, checksumsFile };
 }
 
 /**
@@ -214,6 +254,46 @@ export function diffContracts(installer, workflow) {
   }
   if (new Set(workflow.matrixAssets).size !== workflow.matrixAssets.length) {
     problems.push(`release.yml build matrix has duplicate asset names: [${workflow.matrixAssets.join(", ")}]`);
+  }
+
+  // #3634: every asset is built on its OWN OS. Cross-compiling the darwin
+  // targets on Linux is what makes them unsigned (and un-signable in that job),
+  // and it also skips the `if: startsWith(matrix.target.runner, 'macos')`
+  // signature check — so the regression would be silent in the workflow's own
+  // guards. Assert the runner OS against the platform the asset name encodes.
+  // asset name -> installer platform, derived the SAME way parseInstallerContract
+  // derives the asset list, so the two can never disagree about which platform
+  // an asset belongs to.
+  const platformOf = new Map();
+  for (const platform of installer.platforms) {
+    for (const arch of installer.arches) {
+      platformOf.set(installer.template.replace("${platform}", platform).replace("${arch}", arch), platform);
+    }
+  }
+  for (const [asset, runner] of Object.entries(workflow.matrixRunners ?? {})) {
+    const resolved = platformOf.get(asset);
+    if (!resolved) {
+      problems.push(
+        `release.yml builds '${asset}' but its name matches none of install.sh's platforms ` +
+          `[${installer.platforms.join(", ")}] — the runner-OS rule (#3634) cannot be checked for it`,
+      );
+      continue;
+    }
+    const allowed = PLATFORM_RUNNER_PREFIXES[resolved];
+    if (!allowed) {
+      problems.push(
+        `no runner-OS rule for platform '${resolved}' — add it to PLATFORM_RUNNER_PREFIXES in ` +
+          "scripts/release-assets.mjs so a new target cannot be cross-compiled unnoticed (#3634)",
+      );
+      continue;
+    }
+    if (!allowed.some((prefix) => runner.startsWith(prefix))) {
+      problems.push(
+        `release.yml builds '${asset}' (platform '${resolved}') on runner '${runner}', which is not a ` +
+          `${resolved} runner [${allowed.join(", ")}]. #3634: cross-compiled darwin binaries ship unsigned ` +
+          "and the workflow's codesign step is skipped on a non-macOS runner",
+      );
+    }
   }
   return problems;
 }
