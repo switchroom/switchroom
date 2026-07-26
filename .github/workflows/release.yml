@@ -512,14 +512,22 @@ jobs:
       - name: Attach binaries + checksums to the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          # `EXPECT_TAG`, not a step-local `TAG`: the same variable names the
+          # tag for `gh release upload` AND is the required input of
+          # assert-release-assets-complete.mjs below. v0.19.20 shipped this
+          # step with `TAG` while the assertion read `EXPECT_TAG`, so the
+          # assertion exited 1 ("EXPECT_TAG is required") on a release whose
+          # assets had all uploaded fine — failing `publish`, skipping `npm`
+          # and `finalize`, and stranding the release as a draft. One name is
+          # the fix; R10 in tests/release-pipeline-gating.test.ts is the guard.
+          EXPECT_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
           files=""
           for asset in $RELEASE_ASSETS; do files="$files dist-bins/$asset"; done
           files="$files dist-bins/$CHECKSUMS_FILE"
           # shellcheck disable=SC2086
-          gh release upload "$TAG" $files --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$EXPECT_TAG" $files --repo "$GITHUB_REPOSITORY" --clobber
 
           # Close the loop: the failure this whole workflow exists to prevent
           # is a release page with zero assets. Assert every expected asset is
@@ -530,10 +538,10 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "::error::assets are still missing from $TAG after upload (exit $rc). The upload reported success, so suspect a rename: scripts/check-release-asset-names.mjs is the static half of this contract."
+            echo "::error::assets are still missing from $EXPECT_TAG after upload (exit $rc). The upload reported success, so suspect a rename: scripts/check-release-asset-names.mjs is the static half of this contract."
             exit 1
           fi
-          echo "All release assets attached to $TAG (still a draft until finalize)."
+          echo "All release assets attached to $EXPECT_TAG (still a draft until finalize)."
 
   # The irreversible leg, and the reason the whole pipeline exists. `needs`
   # is the plain all-must-succeed form on purpose: no `always()`, no
