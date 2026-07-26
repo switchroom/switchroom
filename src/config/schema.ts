@@ -2068,7 +2068,13 @@ export const HindsightConfigSchema = z.object({
       "src/setup/hindsight-perf-defaults.ts: RERANKER_LOCAL_FP16, " +
       "LLM_MAX_CONCURRENT, RETAIN/CONSOLIDATION_LLM_MAX_CONCURRENT, " +
       "RECALL_MAX_CANDIDATES_PER_SOURCE, LINK_EXPANSION_PER_ENTITY_LIMIT, " +
-      "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT). A value set here " +
+      "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT), plus the " +
+      "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
+      "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
+      "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
+      "SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS — a postgres size string such " +
+      "as `4GB`, or the sentinel `off` to leave pg0's own default for that " +
+      "one knob). A value set here " +
       "REPLACES switchroom's default and is emitted even when the gating " +
       "capability is absent, so an operator can always force a knob. Other " +
       "`HINDSIGHT_API_*` keys are deliberately IGNORED — a blanket " +

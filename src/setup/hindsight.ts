@@ -12,6 +12,10 @@ import {
   hindsightPerfEnv,
   resolveHindsightPerfOverrides,
 } from "./hindsight-perf-defaults.js";
+import {
+  hindsightPgEnv,
+  resolveHindsightPgOverrides,
+} from "./hindsight-pg-defaults.js";
 
 /**
  * Default Hindsight host ports.
@@ -1391,6 +1395,22 @@ export function hindsightPerfEnvPairs(
   );
 }
 
+/**
+ * The single derivation of the embedded-PostgreSQL (pg0) sizing env pairs,
+ * shared by {@link startHindsight} and {@link generateHindsightComposeSnippet}
+ * for the same anti-drift reason as {@link hindsightPerfEnvPairs}.
+ *
+ * These are consumed by `docker/hindsight-entrypoint.sh`, which pre-starts pg0
+ * with the corresponding `-c` flags — the ONLY route that works, because
+ * postgres ranks `command line` above `ALTER SYSTEM`. See
+ * src/setup/hindsight-pg-defaults.ts.
+ */
+export function hindsightPgEnvPairs(
+  perf?: HindsightPerfOptions,
+): Array<[string, string]> {
+  return hindsightPgEnv(resolveHindsightPgOverrides(perf?.env, perf?.processEnv));
+}
+
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
@@ -1482,6 +1502,13 @@ export function startHindsight(
     // `hindsight.env` replaces the default rather than being appended after
     // it. See src/setup/hindsight-perf-defaults.ts.
     ...hindsightPerfEnvPairs(llm, litellm, gpu, perf).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+    // Embedded-PostgreSQL (pg0) sizing, read by hindsight-entrypoint.sh's
+    // pre-start. pg0 bakes its tuning into the postgres child's ARGV, which
+    // outranks `ALTER SYSTEM`, so pre-starting the instance is the only route
+    // that can change it. Best-effort in the entrypoint: a pre-start that
+    // fails leaves pg0's own defaults in place rather than blocking boot.
+    // See src/setup/hindsight-pg-defaults.ts.
+    ...hindsightPgEnvPairs(perf).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
   ];
 
   // The `claude-code` provider drives an underlying claude subprocess; pin
@@ -2024,6 +2051,9 @@ export function generateHindsightComposeSnippet(
     // docker-run path's block, from the SAME resolver so the two can never
     // disagree about which knobs a host gets (see hindsightPerfEnvPairs).
     ...hindsightPerfEnvPairs(llm, litellm, gpu, perf).map(([k, v]) => `      - ${k}=${v}`),
+    // pg0 sizing — compose twin of the docker-run block, from the SAME
+    // resolver (see hindsightPgEnvPairs / hindsight-pg-defaults.ts).
+    ...hindsightPgEnvPairs(perf).map(([k, v]) => `      - ${k}=${v}`),
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
