@@ -24,6 +24,7 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
@@ -170,6 +171,108 @@ class DrainWedgeTest(_QueueTempDirMixin, unittest.TestCase):
 
         self.assertTrue(summary["stalled"])
         self.assertEqual(summary["retried"], 3)
+
+
+    def test_the_in_hook_sequential_drain_is_protected_too(self):
+        """``drain()`` is the path that runs on EVERY boot, not ``--backlog``.
+
+        It carries its own copy of the stall guard, so it needs its own
+        demotion or the wedge just moves to the path that matters most: the
+        in-hook budget is ~4s, so a single always-timing-out entry at the head
+        consumes the whole run before anything else is reached.
+        """
+        self._seed(6, lambda c: pending.MAX_ATTEMPTS if c in POISON else 0)
+
+        with unittest.mock.patch.object(drain_pending, "_retry_one", self._retry):
+            with unittest.mock.patch.object(
+                drain_pending,
+                "_document_state",
+                lambda e, timeout=30: False,
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(summary["drained"], 3, "healthy entries drain in-hook too")
+        self.assertFalse(summary["stalled"])
+        self.assertEqual(pending.count(), 3)
+
+    def test_poison_heads_do_not_eat_the_in_hook_budget(self):
+        """Pins the ORDERING specifically, which the abstention alone does not.
+
+        Abstaining from the stall guard stops a poison entry ENDING the run,
+        but not its consuming the run. The in-hook budget is ~4s of wall clock
+        and a chronically failing entry fails by TIMING OUT, so three of them
+        at the head burn the whole budget and the loop exits on
+        `budget_exceeded` with the healthy entries behind them untouched —
+        no stall guard involved.
+
+        Mutation-checked: reverting only the ``_drain_order`` call in
+        ``drain()`` (leaving the abstention intact) fails this test and no
+        other in the suite.
+        """
+        os.environ["HINDSIGHT_DRAIN_BUDGET_S"] = "0.5"
+        self._seed(6, lambda c: pending.MAX_ATTEMPTS if c in POISON else 0)
+
+        def slow_poison(entry, timeout):
+            if entry["content"] in POISON:
+                time.sleep(0.25)  # a client deadline being burned
+                raise TimeoutError("client deadline exceeded")
+            return None
+
+        with unittest.mock.patch.object(drain_pending, "_retry_one", slow_poison):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: False
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain(CONFIG)
+
+        self.assertEqual(
+            summary["drained"], 3, "healthy entries must be reached before the budget"
+        )
+
+    def test_poison_heads_do_not_eat_the_backlog_budget(self):
+        """The same budget-consumption wedge on the ``--backlog`` path.
+
+        The tests above reach the backlog drain through the STALL guard, which
+        the abstention alone already defeats — so none of them notice if
+        ``_drain_backlog_impl`` stops ordering. But its ordering is load-
+        bearing for the same reason the in-hook one is, only slower: waves are
+        width 1 (``_backlog_concurrency``) and a chronically failing entry
+        burns ``HINDSIGHT_DRAIN_BACKLOG_TIMEOUT`` (280s) before failing, so
+        ~13 of them at the head exhaust the 1h budget and the run ends on
+        `budget_exceeded` having retained nothing — again with no stall guard
+        involved, and again identically on the next run.
+
+        Scaled down here: 3 poison entries at 0.6s against a 1.0s budget (the
+        floor ``_backlog_budget_seconds`` clamps to). Ordered correctly the
+        healthy entries cost ~0s and all drain; ordered oldest-first the
+        budget is gone after the second poison entry and none do.
+
+        Mutation-checked: reverting only the ``_drain_order`` call in
+        ``_drain_backlog_impl`` fails this test and no other in the suite.
+        """
+        os.environ["HINDSIGHT_DRAIN_BACKLOG_BUDGET_S"] = "1.0"
+        self._seed(6, lambda c: pending.MAX_ATTEMPTS if c in POISON else 0)
+
+        def slow_poison(entry, timeout):
+            if entry["content"] in POISON:
+                time.sleep(0.6)  # a backlog-mode deadline being burned
+                raise TimeoutError("client deadline exceeded")
+            return None
+
+        with unittest.mock.patch.object(drain_pending, "_retry_one", slow_poison):
+            with unittest.mock.patch.object(
+                drain_pending,
+                "_document_state",
+                lambda e, timeout=30: e["content"] not in POISON,
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+
+        self.assertEqual(
+            summary["drained"], 3, "healthy entries must be reached before the budget"
+        )
+        self.assertFalse(summary["stalled"], "this wedge is budget, not stall")
 
 
 class DrainOrderTest(unittest.TestCase):
