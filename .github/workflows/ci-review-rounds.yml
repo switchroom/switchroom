@@ -1,0 +1,89 @@
+name: ci-review-rounds
+
+# The deterministic cap on adversarial review rounds (Ken 2026-07-26).
+#
+# The protocol change that goes with it: blockers and mediums block the
+# merge, lows are FILED not fixed-now, and a re-review is earned only by a
+# behavioural fix. This workflow is the mechanism behind that prose, because
+# "deterministic mechanisms over model-dependent behavior" applies to this
+# rule too — a PR that has taken more than two review-fix rounds fails here
+# and the only way past is the durable `review-cap-override` label.
+#
+# Rounds are counted from git history: commits subject-prefixed
+# `review-fix:` (or carrying a `Review-Round:` trailer) on the PR branch.
+# Logic + tests live in scripts/check-review-rounds.mjs and
+# tests/review-rounds-gate.test.ts.
+#
+# Sentinel pattern (same shape as ci-lint.yml): the heavy job may skip on
+# non-PR events, and the `review-rounds` context always reports so it is
+# safe to add to Ruleset 16470166's required list.
+#
+# OPERATOR STEP — until `review-rounds` is in that ruleset it is advisory:
+# `gh pr merge --auto --squash` merges the moment the REQUIRED checks go
+# green and does not wait on a non-required one. To make the cap block,
+# append it to the ruleset's required_status_checks (verified shape as of
+# 2026-07-26: 7 contexts, all `integration_id: 15368` = GitHub Actions):
+#   gh api repos/switchroom/switchroom/rulesets/16470166   # read current
+#   # then PUT it back with {"context":"review-rounds","integration_id":15368}
+#   # appended to that rule's parameters.required_status_checks.
+
+on:
+  pull_request:
+    branches: [main]
+    # `labeled` / `unlabeled` so adding the override label re-runs the gate
+    # instead of needing an empty push.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-review-rounds-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+jobs:
+  review-rounds-run:
+    # PRs only: a merge_group ref has no PR labels to read, and by then the
+    # gate has already had its say on the PR itself.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # Full history so the base..head range is resolvable.
+          fetch-depth: 0
+
+      - name: Count review rounds
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Label names as comma-separated text, kept in `env:` rather than
+          # interpolated into the `run:` body (release-workflow rule).
+          REVIEW_ROUNDS_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        # The script runs `git log -z` itself. Do NOT hoist that into a shell
+        # variable here: command substitution drops NUL bytes, every commit
+        # would collapse into one message, and the gate would silently score
+        # any PR as a single round.
+        run: node scripts/check-review-rounds.mjs
+
+  # ─── Sentinel ─────────────────────────────────────────────────────
+  # Always reports, so this context can be made ruleset-required without
+  # blocking merge_group / dispatch runs where the heavy job skips.
+  review-rounds:
+    needs: [review-rounds-run]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verdict
+        run: |
+          r='${{ needs.review-rounds-run.result }}'
+          if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+            echo "::error::review-rounds-run=$r — review-round cap exceeded (or the check broke); see the job log"
+            exit 1
+          fi
+          echo "review-rounds-run=$r → pass (ran=success, or skipped on a non-PR event)"

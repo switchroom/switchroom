@@ -133,6 +133,10 @@ obligation:
 `check-no-broadcast-delivery`, `check-stale-tool-descriptions`,
 `check-web-subscription-honest`, `check-litellm-config-guard`.
 
+`scripts/check-review-rounds.mjs` is deliberately NOT in `npm run lint` — it
+needs a PR range and PR labels, so it runs only in `ci-review-rounds.yml`.
+Its logic is unit-tested in `tests/review-rounds-gate.test.ts`.
+
 Traps that bite repeatedly:
 
 - **`check-no-pii-secrets` fails on real operator PII** — real Telegram
@@ -324,9 +328,15 @@ repo too — the five parts, condensed:
    verdicts with evidence); stage delivery as focused single-concern PRs.
 4. **Pipeline.** Branch off fresh main. Scoped tests + `npm run lint`
    locally; CI is the full-suite authority. Adversarial review of the diff;
-   fix ALL findings including lows; re-review the fix; merge only on CI
-   green. Durable fixes over hack patches; deterministic mechanisms over
-   model-dependent behavior; tests assert outcomes, not just code paths.
+   fix every blocker and medium before merge; lows don't block — inline only
+   if a genuine one-liner, otherwise file a follow-up issue and merge.
+   Re-review only when the fix changed behaviour (docs/comment/log/test-only
+   fix commits don't earn another pass). **Prefix every commit answering a
+   review round `review-fix:`** — `scripts/check-review-rounds.mjs` counts
+   them and the `review-rounds` check fails past 2 rounds unless a
+   `review-cap-override` label is on the PR. Merge only on CI green. Durable
+   fixes over hack patches; deterministic mechanisms over model-dependent
+   behavior; tests assert outcomes, not just code paths.
 5. **Communicate.** Consolidated messages, always-visible progress, no
    foreground watches over 30s (background + notification), max 15 parallel
    sub-agents.
