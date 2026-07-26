@@ -287,17 +287,30 @@ export interface ContainerRow {
  * Classify a container's status string into a coarse health bucket.
  *
  * Docker status strings look like:
- *   "Up 3 hours (healthy)"      → running/healthy
- *   "Up 2 minutes"               → running (no healthcheck)
- *   "Restarting (1) 30 seconds"  → crash-looping
- *   "Created"                    → stuck before first start
- *   "Exited (1) 5 minutes ago"   → stopped
+ *   "Up 3 hours (healthy)"             → running/healthy
+ *   "Up 2 minutes"                      → running (no healthcheck)
+ *   "Up 2 minutes (unhealthy)"          → running but its healthcheck FAILS
+ *   "Up 4 seconds (health: starting)"   → running, healthcheck not decided yet
+ *   "Restarting (1) 30 seconds"         → crash-looping
+ *   "Created"                           → stuck before first start
+ *   "Exited (1) 5 minutes ago"          → stopped
+ *
+ * `running-unhealthy` and `running-starting` are split out of
+ * `running-no-healthcheck` deliberately (setup-verification review M6): a
+ * wedged `switchroom-hindsight` reports "Up 2 minutes (unhealthy)" — that
+ * healthcheck exists precisely to make a wedged API visible — and folding it
+ * into plain "running" let a dead memory backend verify green. Callers that
+ * only match the stuck/crash-loop signature (doctor's
+ * `checkContainerRuntimeHealth`) are unaffected: they test `restarting` /
+ * `created` only, and neither new bucket collides with those.
  *
  * @internal exported for testing
  */
 export type ContainerHealth =
   | "running-healthy"
   | "running-no-healthcheck"
+  | "running-unhealthy"
+  | "running-starting"
   | "restarting"
   | "created"
   | "exited"
@@ -305,6 +318,9 @@ export type ContainerHealth =
 
 export function classifyContainerStatus(status: string): ContainerHealth {
   const s = status.toLowerCase().trim();
+  // Order matters: test the qualified forms before the bare "up ".
+  if (s.startsWith("up ") && s.includes("(unhealthy)")) return "running-unhealthy";
+  if (s.startsWith("up ") && s.includes("(health: starting)")) return "running-starting";
   if (s.startsWith("up ") && s.includes("(healthy)")) return "running-healthy";
   if (s.startsWith("up ")) return "running-no-healthcheck";
   if (s.startsWith("restarting")) return "restarting";
@@ -325,8 +341,14 @@ export type DockerPsDeps = {
   listContainers: () => ContainerRow[] | null;
 };
 
-/** Default (real) implementation — calls docker ps. */
-function defaultListContainers(): ContainerRow[] | null {
+/**
+ * Default (real) implementation — calls docker ps.
+ *
+ * Exported so other surfaces that need the SAME container-state snapshot
+ * (the setup wizard's verification step, `src/setup/verify.ts`) reuse this
+ * probe instead of shelling out to docker with slightly different flags.
+ */
+export function listSwitchroomContainers(): ContainerRow[] | null {
   const r = spawnSync(
     "docker",
     [
@@ -345,7 +367,7 @@ function defaultListContainers(): ContainerRow[] | null {
   });
 }
 
-const DEFAULT_DOCKER_PS_DEPS: DockerPsDeps = { listContainers: defaultListContainers };
+const DEFAULT_DOCKER_PS_DEPS: DockerPsDeps = { listContainers: listSwitchroomContainers };
 
 /**
  * Check runtime container health for the 2026-06-23 incident class.

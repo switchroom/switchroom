@@ -326,13 +326,25 @@ export function normalizeParagraphBreaks(text: string): string {
   //       it was the "stray blank line" seen in real replies. Collapse it.
   //
   // Deliberately ASCII-only: the `[ \t\r]` character class excludes U+00A0 by
-  // construction, so a line whose only content is a non-breaking space a user
-  // legitimately typed is left intact rather than silently collapsed. (This
-  // used to also protect the NBSP paragraph spacer that addParagraphSpacers
-  // injected downstream; that spacer pass was removed in the #2669 follow-up —
-  // paragraph gaps now rely on plain `\n\n` — but keeping this ASCII-only is
-  // still the conservative choice.) Runs on code-masked text, so a blank-ish
-  // line inside a fenced block is parked and never touched.
+  // construction, so a line whose only content is a non-breaking space is left
+  // intact rather than silently collapsed.
+  //
+  // That is load-bearing, not merely conservative. `addParagraphSpacers` (below)
+  // wedges a U+00A0-only line into every prose paragraph gap to force a VISIBLE
+  // gap (#2692) and is LIVE on the outbound path today — gateway/
+  // outbound-send-path.ts (`normalizeOutboundBody`) and gateway/gateway.ts (the
+  // rich `sendRichMessage` chunker). Within a single `normalizeOutboundBody`
+  // pass the spacer is injected AFTER this normalizer, so this pass usually does
+  // not see it — but the ASCII-only class is a deliberate, pinned invariant, not
+  // an accident of that ordering: tests/paragraph-normalizer.test.ts ("the
+  // deliberate U+00A0 spacer … is preserved") asserts
+  // `normalizeParagraphBreaks(spaced) === spaced`, so this function stays safe
+  // to re-enter over already-spacered text. Widening `[ \t\r]` to catch U+00A0
+  // would eat the spacer, fail that test, and regress #2692.
+  //
+  // It also leaves a non-breaking space a user legitimately typed alone. Runs on
+  // code-masked text, so a blank-ish line inside a fenced block is parked and
+  // never touched.
   let out = masked
     // Collapse any run of newlines interleaved with ASCII whitespace-only
     // interior lines down to a single clean `\n\n`. Requires at least one

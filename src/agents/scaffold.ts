@@ -354,6 +354,95 @@ false\` in that agent's switchroom.yaml block — webkite goes away
 and the native tools come back together.`;
 
 /**
+ * Library/framework documentation lookup. One of the fleet invariant
+ * blocks. The failure mode it targets is the model answering an API
+ * question from training memory — confidently, and wrong for anything
+ * that moved since the cutoff. That is indistinguishable from a
+ * correct answer at read time, which is why it needs a rule rather
+ * than a judgement call.
+ *
+ * SCOPE — deliberately narrow. The context7 server ships its own MCP
+ * `instructions` field, and it already states the trigger condition
+ * ("even when you think you know the answer"), the negative scope
+ * (refactoring / business logic / code review / general concepts) and
+ * the prefer-over-web-search rule. Claude Code delivers a server's
+ * `instructions` even when its TOOLS are tool-search-deferred —
+ * verified in-fleet on 2026-07-26: `webkite` and `perplexity` carry no
+ * `alwaysLoad` in `.mcp.json` under `ENABLE_TOOL_SEARCH=true`, yet
+ * both servers' `instructions` appear verbatim in the running agent's
+ * system prompt. So restating the trigger here would be pure
+ * duplication of text the model already has. This block carries only
+ * what the server CANNOT know:
+ *   - the opt-out, and that the block is void for an opted-out agent
+ *     (see the renderFleetInvariants note below);
+ *   - the failure signal — a lookup that returns nothing OR errors
+ *     (the anonymous free tier is per-IP rate-limited and the whole
+ *     fleet shares one host IP, so 429s are expected) must be
+ *     declared, never silently swallowed into a memory answer;
+ *   - which fleet tool to fall back to (`webkite_read`);
+ *   - query hygiene — this is a public third-party endpoint and the
+ *     query text leaves the host.
+ *
+ * NOTE — `renderFleetInvariants()` renders ONE fleet-wide file
+ * (`~/.switchroom/fleet/switchroom-invariants.md`) read by every
+ * agent via `--add-dir`; there is no per-agent variant to
+ * parameterise. So the opted-out case is handled by CONDITIONAL
+ * PHRASING inside the block, not by a render argument.
+ *
+ * context7 is wired by `resolveContext7McpEntry` (fleet-default,
+ * per-agent `mcp_servers.context7: false` opt-out) and pre-approved
+ * via CONTEXT7_MCP_TOOLS.
+ */
+const LIBRARY_DOCS_GUIDANCE = `## Library and framework docs — look them up, don't recall them
+
+Your training data has a cutoff. Library APIs do not. When you answer
+a question about a library, framework, SDK, CLI, or cloud service from
+memory, you cannot tell from the inside whether that memory is current
+or two major versions stale — and a confidently wrong API answer costs
+more than the lookup.
+
+So: **before you write or review code against a third-party library,
+look its docs up with \`context7\`** — \`mcp__context7__resolve-library-id\`
+to turn a package name ("next.js", "prisma", "boto3") into a Context7
+library ID, then \`mcp__context7__query-docs\` to fetch the docs for
+that ID. The server states its own rules on when to reach for it and
+when not to bother; those arrive with its tool schemas. What follows is
+only what the server cannot know about this fleet.
+
+**If you have no \`context7\` tools, this block does not apply to
+you.** context7 is a fleet default, but an agent can be opted
+out with \`mcp_servers.context7: false\` in its switchroom.yaml block —
+check your actual tool list rather than assuming. Without it, use
+\`webkite_read\` against the library's own docs site and name that
+source in your answer.
+
+Its tools are tool-search-deferred, like most of your MCP surface, so
+the first context7 call in a session pays one extra round-trip to load
+the schema. That is normal, not an error, and not a reason to skip the
+lookup.
+
+**A lookup that fails is a fact you must state — never a licence to
+answer from memory.** Two distinct failures, one rule:
+- **No entry.** context7 has nothing for the library (common for
+  private or very new packages).
+- **The call errors.** A transport failure, a timeout, or a rate-limit
+  / HTTP 429. The free tier is anonymous and rate-limited per IP, and
+  every agent on this host shares one IP — so 429s are an expected
+  condition here, not an exotic one.
+
+In either case: say the lookup failed and why, fall back to
+\`webkite_read\` against the project's own docs site, and name the
+source your answer actually came from. If you end up relying on
+training memory anyway, say so explicitly and mark it unverified. A
+silent fallback to memory after a failed lookup is precisely the
+failure this block exists to prevent.
+
+**Query hygiene:** context7 is a public third-party endpoint. Your
+query text leaves this host. Send the library name and the API
+question — never private identifiers, internal repo or service names,
+customer data, or a paste of proprietary source.`;
+
+/**
  * Vault key discovery. One of the fleet invariant blocks. Stops the
  * single most common vault failure: an agent GUESSING a secret's key
  * name (\`postiz/api-key\`) when it already holds the real one
@@ -521,6 +610,8 @@ export function renderFleetInvariants(): string {
     MEMORY_GUIDANCE,
     "",
     WEB_FETCH_GUIDANCE,
+    "",
+    LIBRARY_DOCS_GUIDANCE,
     "",
     VAULT_GUIDANCE,
     "",
@@ -1203,6 +1294,48 @@ const WEBKITE_MCP_TOOLS = [
   "mcp__webkite",
   "mcp__webkite__*",
 ];
+
+/**
+ * Pre-approved MCP tool names for the fleet-default `context7` server
+ * (wired by resolveContext7McpEntry unless the agent opts out).
+ * LIBRARY_DOCS_GUIDANCE instructs every agent to reach for context7
+ * before answering a library-API question, so the FIRST such question
+ * would wedge the turn on a Telegram permission prompt if these
+ * weren't pre-approved — i.e. the guidance would train agents that the
+ * tool is annoying rather than useful.
+ *
+ * ENUMERATED, deliberately NOT wildcarded like WEBKITE_MCP_TOOLS. The
+ * difference is who controls the tool namespace. webkite is a binary
+ * the operator builds and mounts, so `mcp__webkite__*` can only grow
+ * when the operator makes it grow. context7's tool surface is defined
+ * by a remote endpoint a third party (Upstash) controls: a
+ * `mcp__context7__*` grant would silently pre-approve whatever verb
+ * they ship next — on every fleet agent, with no approval card and no
+ * change on our side. Enumeration pins the grant to the two read-only
+ * lookups that exist today (verified against the live server's
+ * `tools/list` on 2026-07-26: exactly `resolve-library-id` and
+ * `query-docs`), so a third tool costs the operator one approval tap
+ * — the correct default for a surface we don't control.
+ *
+ * Narrowing precedent: HOSTD_MCP_TOOLS above. Like that set, there is
+ * deliberately NO bare `mcp__context7` token — the bare server token
+ * approves the whole server and would defeat the enumeration.
+ */
+const CONTEXT7_MCP_TOOLS = [
+  "mcp__context7__resolve-library-id",
+  "mcp__context7__query-docs",
+];
+
+/**
+ * Blanket `context7` grants retracted from an existing agent's
+ * `settings.permissions.allow` when that agent opts out. Not a
+ * released shape — the wildcard never shipped in a tagged release —
+ * but an agent scaffolded from an in-development build of the
+ * context7 branch can hold it, and an opt-out must not leave a
+ * server-wide pre-approval behind. See the merge-path retraction in
+ * scaffoldAgent.
+ */
+const CONTEXT7_BLANKET_TOKENS = ["mcp__context7", "mcp__context7__*"];
 
 /**
  * Legacy `mcp__switchroom__*` permission tokens that pre-#235 agents have
@@ -4089,6 +4222,60 @@ export function resolveWebkiteMcpEntry(
   };
 }
 
+/**
+ * The Context7 remote MCP endpoint. Streamable-HTTP, public, no
+ * credential required for the free tier — verified against the live
+ * service on 2026-07-26 (`initialize` → Context7 3.2.5, `tools/list` →
+ * `resolve-library-id` + `query-docs`, and a `resolve-library-id` call
+ * for "react" all succeeded with no auth header).
+ */
+const CONTEXT7_MCP_URL = "https://mcp.context7.com/mcp";
+
+/**
+ * Resolve the per-agent `context7` MCP entry.
+ *
+ * Same shape as webkite: a fleet-default capability with no top-level
+ * switchroom.yaml config block, gated only on the per-agent opt-out
+ * (`mcp_servers.context7: false`). It pairs with
+ * LIBRARY_DOCS_GUIDANCE, which is the half that makes agents actually
+ * call it.
+ *
+ * Transport choice — remote HTTP, NOT `npx -y @upstash/context7-mcp`
+ * (which is what Anthropic's official context7 plugin uses):
+ *   - `npx -y` resolves and installs the LATEST published version from
+ *     the npm registry at every session spawn. That is a per-boot
+ *     network dependency on a second registry, a multi-second cold
+ *     start on every agent, and an unpinned third-party package
+ *     executing inside the agent container. The HTTP transport has
+ *     none of those properties.
+ *   - Claude Code speaks streamable HTTP natively (`type: "http"`),
+ *     the same transport hindsight uses in http mode.
+ *
+ * Credentials: none. Context7's free tier is IP-rate-limited and
+ * anonymous. An optional `CONTEXT7_API_KEY` raises those limits; if
+ * the fleet ever hits them, the upgrade is a vault key
+ * (`context7/api-key`) resolved into an `Authorization: Bearer`
+ * header here. Deliberately NOT wired now: a `secrets:` declaration
+ * for a key the vault doesn't hold would fail the broker on every
+ * agent for a capability that works fine without it.
+ *
+ * Returns null when the entry must not be emitted.
+ */
+export function resolveContext7McpEntry(
+  _agentName: string,
+  agentConfig: AgentConfig,
+  _switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig } | null {
+  if ((agentConfig.mcp_servers ?? {})["context7"] === false) return null;
+  return {
+    key: "context7",
+    value: {
+      type: "http",
+      url: CONTEXT7_MCP_URL,
+    },
+  };
+}
+
 export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
   {
     label: "Google Workspace",
@@ -4119,6 +4306,12 @@ export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
     emitKey: "webkite",
     retractionKey: "webkite",
     resolve: resolveWebkiteMcpEntry,
+  },
+  {
+    label: "Context7",
+    emitKey: "context7",
+    retractionKey: "context7",
+    resolve: resolveContext7McpEntry,
   },
 ];
 
@@ -4185,6 +4378,24 @@ export function computeDesiredPermissionAllow(
     // as the MCP entry emission, so a webkite-disabled agent doesn't
     // carry dangling pre-approvals.
     ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
+    // Context7 is fleet-default (resolveContext7McpEntry) unless the
+    // agent opts out. Same reasoning as webkite: LIBRARY_DOCS_GUIDANCE
+    // tells every agent to look library docs up before answering, so
+    // the first such lookup is common and would otherwise wedge on a
+    // permission prompt. Gated on the same opt-out as the MCP entry
+    // emission.
+    //
+    // NOTE — this function RETURNS a freshly computed list, so an
+    // opted-out agent gets no context7 token here by construction.
+    // That is NOT by itself enough to claim "no dangling pre-approval
+    // anywhere": on a DEPLOYED agent, `switchroom apply` takes the
+    // settings.json merge path in scaffoldAgent, which reads the
+    // existing allow list rather than rebuilding it from this
+    // function. Retraction on that path is explicit — see the
+    // context7 filter in that merge block. (reconcileAgent assigns
+    // computeDesiredPermissionAllow's output wholesale, so it retracts
+    // by reconstruction.)
+    ...(agentConfig.mcp_servers?.["context7"] === false ? [] : CONTEXT7_MCP_TOOLS),
   ]);
 }
 
@@ -4451,10 +4662,44 @@ export function scaffoldAgent(
       // grant before re-seeding the narrowed read-only-only set, so
       // an existing agent that baked in `mcp__hostd__*` stops having
       // the mutating verbs pre-approved.
+      //
+      // Context7 opt-out must RETRACT on this path, not merely stop
+      // re-seeding. The loop below is union-only (push-if-absent), and
+      // this merge block is the path every already-deployed agent takes
+      // on `switchroom apply` — so without an explicit filter, setting
+      // `mcp_servers.context7: false` would drop the .mcp.json server
+      // (retractStaleIntegrationKeys, below) while leaving the
+      // pre-approval tokens behind indefinitely, converging only if the
+      // agent later went through reconcileAgent. Retract the enumerated
+      // tokens AND any blanket `mcp__context7*` grant an agent picked up
+      // from an in-development build.
+      //
+      // Two things this filter deliberately does NOT do. It never fires
+      // for an opted-IN agent, so a token the operator wants stays. And
+      // it never strips a token the agent DECLARES in its own
+      // `tools.allow` — reconcileAgent assigns computeDesiredPermissionAllow's
+      // output wholesale and that output includes the declared list
+      // regardless of the opt-out, so stripping a declared token here
+      // would make the two paths disagree and flip-flop the file on
+      // alternating apply/reconcile runs.
+      //
+      // webkite has the same latent union-only gap on this path —
+      // deliberately not changed here (it alters behaviour for already-
+      // deployed opted-out agents); tracked in #3672.
+      const context7OptedOut = agentConfig.mcp_servers?.["context7"] === false;
+      const declaredAllow = new Set(agentConfig.tools?.allow ?? []);
+      const context7Retract = context7OptedOut
+        ? [...CONTEXT7_MCP_TOOLS, ...CONTEXT7_BLANKET_TOKENS].filter(
+          (t) => !declaredAllow.has(t),
+        )
+        : [];
       const allow: string[] = (Array.isArray(settings.permissions.allow)
         ? settings.permissions.allow
         : []
-      ).filter((p: string) => !LEGACY_HOSTD_BLANKET_TOKENS.includes(p));
+      ).filter(
+        (p: string) =>
+          !LEGACY_HOSTD_BLANKET_TOKENS.includes(p) && !context7Retract.includes(p),
+      );
       // Webkite is fleet-default; re-seed its tools into EXISTING agents'
       // allow on apply (writeIfMissing above skips the template for
       // existing agents, so the fresh permissionAllow never lands). This
@@ -4465,7 +4710,18 @@ export function scaffoldAgent(
       // opt-out as the MCP entry emission.
       const webkiteAllowTools =
         agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS;
-      for (const t of [...AGENT_CONFIG_MCP_TOOLS, ...HOSTD_MCP_TOOLS, ...webkiteAllowTools]) {
+      // Existing-agent twin of the permissionAllow context7 spread —
+      // same rationale as webkiteAllowTools directly above. Without it
+      // every already-deployed agent's first context7 call wedges on a
+      // permission prompt despite .mcp.json wiring the server. The
+      // opted-out direction is handled by `context7Retract` above.
+      const context7AllowTools = context7OptedOut ? [] : CONTEXT7_MCP_TOOLS;
+      for (const t of [
+        ...AGENT_CONFIG_MCP_TOOLS,
+        ...HOSTD_MCP_TOOLS,
+        ...webkiteAllowTools,
+        ...context7AllowTools,
+      ]) {
         if (!allow.includes(t)) allow.push(t);
       }
       settings.permissions.allow = allow;
@@ -4803,8 +5059,18 @@ export function scaffoldAgent(
     // hasTrustDialogAccepted but never enabledMcpjsonServers, so any
     // server scaffolded after original onboarding (gdrive, plus
     // agent-config/hostd for non-original agents) is silently ignored.
-    // Union every server we just wrote into the allowlist. NOTE: on a
-    // brand-new agent `.claude.json` does not exist yet at this point —
+    // Union every server we just wrote into the allowlist. UNION-ONLY:
+    // ensureMcpServersTrusted never removes a key, so a server that
+    // stops being emitted (e.g. `mcp_servers.context7: false`) keeps its
+    // stale `enabledMcpjsonServers` entry across applies. That entry is
+    // inert — trust is a per-server allowlist consulted only for servers
+    // that are actually present in `.mcp.json`, and the opted-out server
+    // is retracted from `.mcp.json` — so this is untidiness, not a
+    // dangling capability. Deliberately not "fixed" here: the removal
+    // direction would need a switchroom-owned-key ledger to avoid
+    // clobbering trust an operator granted by hand for a server
+    // switchroom doesn't manage. Tracked in #3672.
+    // NOTE: on a brand-new agent `.claude.json` does not exist yet at this point —
     // this call silently no-ops and the post-`preTrustWorkspace` pass
     // below is what actually lands the trust. Kept here too because it
     // is idempotent and covers the re-scaffold path where the file

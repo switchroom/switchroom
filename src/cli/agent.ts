@@ -1154,9 +1154,18 @@ export function registerAgentCommand(program: Command): void {
         const names =
           name === "all" ? Object.keys(config.agents) : [name];
 
+        // Setup-verification review H3: every realistic failure below
+        // (undefined agent, quarantined, preflight errors, startAgent throw)
+        // printed red and then exited 0, so `switchroom agent start x && ...`
+        // sailed on and `switchroom setup`'s start seam could only ever
+        // observe ENOENT. Keep the loop's continue-on-error behaviour for
+        // `all` — but report the truth in the exit code.
+        const failed: string[] = [];
+
         for (const n of names) {
           if (!config.agents[n]) {
             console.error(chalk.red(`Agent "${n}" is not defined in switchroom.yaml`));
+            failed.push(n);
             continue;
           }
 
@@ -1167,6 +1176,7 @@ export function registerAgentCommand(program: Command): void {
           // `switchroom agent unquarantine <name>`. --force bypasses
           // (matches the existing --force semantics for preflight).
           if (!opts.force && checkQuarantineRefusal(agentsDir, n)) {
+            failed.push(n);
             continue;
           }
 
@@ -1183,6 +1193,7 @@ export function registerAgentCommand(program: Command): void {
               console.error(
                 chalk.gray(`\n  Fix the issues above, or use --force to skip preflight.\n`)
               );
+              failed.push(n);
               continue;
             }
           }
@@ -1194,7 +1205,18 @@ export function registerAgentCommand(program: Command): void {
             console.error(
               chalk.red(`Failed to start ${n}: ${(err as Error).message}`)
             );
+            failed.push(n);
           }
+        }
+
+        if (failed.length > 0) {
+          console.error(
+            chalk.red(
+              `\n  Did not start: ${failed.join(", ")} — see the errors above.\n`,
+            ),
+          );
+          // exitCode (not process.exit) so buffered stdout still flushes.
+          process.exitCode = 1;
         }
       })
     );

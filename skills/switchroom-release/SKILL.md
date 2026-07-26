@@ -37,9 +37,9 @@ Once the changelog PR is merged:
 - **Notes extraction gotcha (historical):** the naive `awk '/^## vX/,/^## v/' CHANGELOG` range collapses to a single line. Use a start-flag awk: `awk 'f{print} /^## vX\.Y\.Z/{print; f=1} f && /^## v/ && !/^## vX\.Y\.Z/{exit}'` — or extract the section to a temp file by line range.
 - **`gh release create` has been silently dropped in past runs.** After running it, verify: `gh release view vX.Y.Z` must return the release. If it didn't create, re-run.
 
-## Step 3 — Wait for BOTH tag-push workflows (hard gates)
+## Step 3 — Wait for ALL THREE tag-push workflows (hard gates)
 
-The tag push triggers `docker-images` AND `npm-publish` in parallel. **Do not proceed to rollout until both are green AND verified.**
+The tag push triggers `docker-images`, `npm-publish` AND `release` in parallel. **Do not proceed to rollout until all three are green AND verified.**
 
 ### Gate A — npm publish (`npm-publish.yml`)
 - `gh run list --workflow=npm-publish.yml --limit 1` — wait for it to reach `completed` / `success`.
@@ -51,7 +51,13 @@ The tag push triggers `docker-images` AND `npm-publish` in parallel. **Do not pr
 - Verify all 6 images are published: `docker manifest inspect ghcr.io/switchroom/<image>:vX.Y.Z` for `agent`, `auth-broker`, `kernel`, `broker`, `web`, `hostd`. Each must resolve.
 - If any image is missing: do NOT roll — the rollout canary version-assert fails on an unpublished tag. Wait + re-check.
 
-**Only when Gate A AND Gate B are green + verified** do you proceed.
+### Gate C — static binaries (`release.yml`)
+- `gh run list --workflow=release.yml --limit 1` — wait for `completed` / `success`.
+- Verify the release page actually has assets: `gh release view vX.Y.Z --json assets --jq '.assets[].name'` must list all four binaries (`switchroom-{linux,macos}-{amd64,arm64}`) **and** `switchroom-checksums.txt`. This is the gate that did not exist through v0.19.19 — every release up to then shipped **zero** assets and the advertised `curl | sh` installer (`install.sh`) was dead on every platform (#3633).
+- `release.yml` uploads to a release that must ALREADY EXIST — it deliberately does not invent one, so step 2's `gh release create` is a prerequisite, not optional. If the workflow failed with "no GitHub Release exists for …", create the release, then re-run: `gh workflow run release.yml --ref vX.Y.Z -f dry_run=false`.
+- To rehearse a change to this workflow without publishing anything: `gh workflow run release.yml --ref <branch>` (dry_run defaults to true — it builds, checksums and verifies the bundle, and attaches it as a workflow artifact only).
+
+**Only when Gates A, B AND C are green + verified** do you proceed.
 
 ## Step 4 — Fleet rollout (operator-gated, canary-first)
 

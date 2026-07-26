@@ -647,10 +647,15 @@ describe("Hindsight port-collision regression", () => {
     // the call site may be formatted multi-line (#2578 added trailing args).
     expect(src).not.toMatch(/startHindsight\(\s*undefined/);
     // Must use the shared guard helpers (not a parallel implementation) and
-    // hand the chosen ports to startHindsight (first argument = `ports`).
+    // hand the chosen ports to the launch (first argument = `ports`).
     expect(src).toContain("pickHindsightPorts");
     expect(src).toContain("preflightHindsightPorts");
-    expect(src).toMatch(/startHindsight\(\s*ports\b/);
+    // The launch now goes through an injectable seam (setup-verification
+    // review H2 needed a docker-free test of "started but did not stay
+    // running"), so accept either name at the call site — and pin that the
+    // seam's DEFAULT is still the real `startHindsight`.
+    expect(src).toMatch(/(?:startHindsight|startContainer)\(\s*ports\b/);
+    expect(src).toMatch(/deps\.startContainer \?\? startHindsight/);
   });
 
   it("setup's port guard selects a free port instead of binding the occupied default", async () => {

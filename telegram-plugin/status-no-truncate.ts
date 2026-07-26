@@ -59,5 +59,62 @@ export const STATUS_LINE_MAX = 200
  */
 export const STATUS_CARD_CHAR_BUDGET = RICH_MESSAGE_MAX_CHARS
 
-/** Indent marker for a nested (foreground sub-agent) step line. */
+/**
+ * Indent marker for a nested (foreground sub-agent) step line.
+ *
+ * NOTE: the three leading spaces here are ASCII, which Telegram's server-side
+ * markdown parser DROPS — the visible nesting cue on this surface is the `↳`
+ * glyph, not the indent. That is a known latent wart, deliberately left alone
+ * — it needs its own live render check on the single-worker / agent card,
+ * tracked in #3668. Do NOT "fix" it by swapping in U+00A0 without that check,
+ * and do NOT copy this string as the idiom for a real indent.
+ *
+ * @see WORKER_STEP_INDENT — the U+00A0 indent used for actual left-nesting on
+ * the combined (2+ worker) card, and the reasoning for why ASCII cannot work.
+ */
 export const NESTED_PREFIX = '   ↳ '
+
+/**
+ * Left indent for a step line rendered UNDER a worker header on the combined
+ * (2+ worker) card — three NON-BREAKING spaces (U+00A0), written as escapes so
+ * the bytes are visible in source.
+ *
+ * ── Why NBSP and not three ASCII spaces ───────────────────────────────────
+ * Card bodies reach Telegram as raw GFM markdown (`richMessage` →
+ * `sendRichMessage` / `editMessageText({ markdown })`, #2669) and are parsed
+ * SERVER-SIDE by a CommonMark/GFM-family parser. That parser strips leading
+ * ASCII spaces/tabs from a paragraph line (and 4+ of them would instead open
+ * an indented CODE block), so an ASCII indent renders FLAT —
+ * `reference/telegram-formatting-guide.md` states it outright: "Telegram drops
+ * leading whitespace". `NESTED_PREFIX` above is not a counter-example — its
+ * three ASCII spaces are dropped too; the visible cue there is the `↳` glyph.
+ *
+ * U+00A0 is NOT stripped: it is ordinary text content to that parser. The
+ * outbound paragraph spacer rests on the same property — a U+00A0-only line
+ * survives as a real paragraph where an ASCII-blank line is discarded,
+ * live-verified on the rich path in #2692 and re-verified in #3229.
+ *
+ * ── Honest limit of that precedent ────────────────────────────────────────
+ * #2692/#3229 verified a materially DIFFERENT string shape: a U+00A0-only
+ * line sitting alone inside a `\n\n` paragraph gap. This constant is U+00A0
+ * runs LEADING a content line that follows a `  \n` GFM hard break. Those are
+ * not the same case, and no test in this repo can observe the difference —
+ * every assertion here is on the string we hand to the Bot API, and whether
+ * Telegram's parser strips leading U+00A0 after a hard break is decided
+ * server-side, off-box. So this rests on an INFERENCE: CommonMark defines
+ * block-structure indentation over spaces and tabs ONLY, and U+00A0 is neither
+ * (it is a Zs "Unicode whitespace" character, which the spec uses only for
+ * emphasis flanking — never for stripping line-leading indentation), so a
+ * leading U+00A0 run is ordinary text content. Combined with the #2692/#3229
+ * evidence that Telegram's parser is CommonMark-family on this point. That is
+ * NOT a live check of this exact shape. If the indent ever renders flat on a
+ * phone, this inference is the thing that was wrong — re-check it live before
+ * assuming the bug is downstream.
+ *
+ * Deliberately NOT the guide's other indent idiom, the blockquote (`> `): card
+ * lines are joined by `stackCardLines`, which promotes EVERY inter-line break
+ * to a GFM hard break *because* card lines are never block-structure lines. A
+ * `> ` prefix breaks that precondition, and the next worker's header line
+ * would be absorbed into the quote as a lazy continuation.
+ */
+export const WORKER_STEP_INDENT = '\u00A0\u00A0\u00A0'

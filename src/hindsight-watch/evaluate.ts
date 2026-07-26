@@ -112,13 +112,17 @@ export function evaluateQueueGrowth(ring: Sample[]): Verdict {
  * Three channels, because after #3599 `.dead` alone is no longer the whole
  * story:
  *
- *  - `*.json.dead` — a retain retried to `MAX_ATTEMPTS` exhaustion. Still a
- *    real signal (18 markers live on this fleet today), and #3610 made it
- *    STRONGER by removing its dominant benign cause: 154 of the 629 entries
- *    in the 2026-07-25 backlog were `.dead` only because they were too big
- *    to complete inside any client deadline. Those now split and drain, so
- *    a `.dead` marker today is much more likely to be a genuine fault than
- *    it was when this signal was first written.
+ *  - `*.json.dead` — a retain retried to `MAX_ATTEMPTS` exhaustion ON A
+ *    PERMANENT failure. Still a real signal (18 markers live on this fleet
+ *    today), and successively STRONGER. #3610 removed its dominant benign
+ *    cause: 154 of the 629 entries in the 2026-07-25 backlog were `.dead`
+ *    only because they were too big to complete inside any client deadline,
+ *    and those now split and drain. The permanence gate in
+ *    `pending.is_permanent_failure` removed the rest — a 5xx, a timeout or a
+ *    connection error now keeps the entry queued instead of retiring it, so
+ *    a flaky extraction model can no longer manufacture `.dead` markers. A
+ *    marker today means the server positively REJECTED the request (a 4xx
+ *    other than 408/425/429), which is close to always a genuine fault.
  *  - `pending-evicted/` — memory shed at the queue's `MAX_ENTRIES` /
  *    `MAX_BYTES` cap. Archived rather than persisted, and under a full disk
  *    `_evict_to_fit` removes outright.

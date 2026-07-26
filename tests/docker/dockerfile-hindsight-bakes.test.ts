@@ -396,6 +396,283 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the recall-admission-split fix (assert-guarded, fail-loud)", () => {
+    // Background consolidation reaches recall through the SAME
+    // MemoryEngine.recall_async a user's turn does, so both contended on the
+    // single `_search_semaphore` admission gate. Measured on this host: mean
+    // admission wait 5.43s, p90 15.7s, max 27.4s against a recall hook whose
+    // per-bank socket timeout is 8s — fleet p50 pinned at 8.02s. The patch
+    // admits background callers through a small reservation semaphore FIRST,
+    // then the same shared one. Behaviour (including that total concurrency is
+    // unchanged) is proven against the pinned upstream image in
+    // tests/docker/hindsight-recall-isolation-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight recall-admission-split patch: anchor found \{n\}x/,
+    );
+    // The admission helper, and the nesting order that makes it a RESERVATION
+    // rather than a second budget: background takes its own semaphore and then
+    // the shared one, so the peak is still recall_max_concurrent.
+    expect(dockerfile).toMatch(
+      /"async def _recall_admission\(shared, background_reservation, is_background\):\\n"/,
+    );
+    expect(dockerfile).toMatch(/"    if is_background:\\n"/);
+    expect(dockerfile).toMatch(/"        async with background_reservation:\\n"/);
+    expect(dockerfile).toMatch(/"            async with shared:\\n"/);
+    // The two call sites: recall_async admits through the helper, and the
+    // consolidator flags its recall as background.
+    expect(dockerfile).toMatch(
+      /"            async with _recall_admission\(\\n"/,
+    );
+    // The ARGUMENT LINE, pinned exactly. This is the load-bearing one: swapping
+    // the third argument for a literal `False` reverts the whole split while
+    // leaving the helper defined, the call site intact and `_search_semaphore`
+    // present as an argument — every other check here would still pass.
+    expect(dockerfile).toContain(
+      '"                self._search_semaphore, self._background_search_semaphore, _background\\n"',
+    );
+    expect(dockerfile).toMatch(/"            _background=True,\\n"/);
+    // The config knob + the boot validation that keeps a foreground floor.
+    expect(dockerfile).toMatch(
+      /ENV_CONSOLIDATION_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT"/,
+    );
+    expect(dockerfile).toMatch(
+      /DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT = 2/,
+    );
+    expect(dockerfile).toMatch(
+      /and self\.consolidation_recall_max_concurrent >= self\.recall_max_concurrent/,
+    );
+    // The DEFAULT is derived from the shared budget rather than fixed, so
+    // lowering HINDSIGHT_API_RECALL_MAX_CONCURRENT cannot turn a deployment
+    // that boots today into one that refuses to boot. Only an EXPLICIT
+    // incoherent value fails validation.
+    expect(dockerfile).toMatch(
+      /def _consolidation_recall_max_concurrent\(getenv\)/,
+    );
+    expect(dockerfile).toMatch(
+      /return max\(1, min\(DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT, shared - 1\)\)/,
+    );
+    // Post-replace re-assertions (verification-on-build). The negative one is
+    // load-bearing: a surviving bare acquisition would let background bypass
+    // the reservation entirely.
+    expect(dockerfile).toMatch(
+      /assert "async def _recall_admission\(" in me_new,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "async with self\._search_semaphore:" not in me_new,/,
+    );
+    expect(dockerfile).toMatch(/assert "_background=True," in cons_new,/);
+    // …and the build-time twin of the argument pin above.
+    expect(dockerfile).toMatch(
+      /a hard-coded third argument silently reverts the admission split/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight recall-admission-split patch: background consolidation recalls now pass a/,
+    );
+    // The two config.py patch blocks are ORDER-COUPLED on the same
+    // HindsightConfig.validate() anchor; this block additionally requires
+    // `@classmethod / def from_env` to still follow it, so it must run first.
+    // Swapping them fails the build loudly, but reads as upstream drift.
+    expect(dockerfile).toMatch(
+      /ORDER-COUPLED WITH THE worker-slot-ceiling BLOCK BELOW — DO NOT SWAP THEM/,
+    );
+  });
+
+  it("keeps the worker-slot-ceiling fix (assert-guarded, fail-loud)", () => {
+    // HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS is a reservation, i.e. a FLOOR:
+    // WorkerPoller._get_available_slots documents that in-flight beyond the
+    // reservation is served from the shared pool, so one type could hold all
+    // DEFAULT_WORKER_MAX_SLOTS = 10 slots. This patch adds the missing CEILING.
+    // Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-recall-isolation-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight worker-slot-ceiling patch: anchor found \{n\}x/,
+    );
+    // The mechanism: a per-type limit table with a consolidation default, an
+    // env parser whose empty string means "uncapped", and the config field.
+    expect(dockerfile).toMatch(
+      /WORKER_SLOT_LIMIT_TYPES: dict\[str, tuple\[str, int \| None\]\] = \{/,
+    );
+    expect(dockerfile).toMatch(
+      /"consolidation": \("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT", 4\)/,
+    );
+    expect(dockerfile).toMatch(
+      /def _parse_worker_slot_limits\(getenv, max_slots: int\)/,
+    );
+    expect(dockerfile).toMatch(/worker_slot_limits=_parse_worker_slot_limits\(/);
+    // Same rule as the admission reservation: a DEFAULT cap is clamped to
+    // worker_max_slots so lowering that knob cannot break boot; an EXPLICIT
+    // over-large cap still fails validation below.
+    expect(dockerfile).toMatch(
+      /limits\[op_type\] = max\(1, min\(int\(default\), max_slots\)\)/,
+    );
+    // Boot validation, at the same point as the existing reservation-sum check.
+    expect(dockerfile).toMatch(/if limit > self\.worker_max_slots:/);
+    expect(dockerfile).toMatch(/if limit < reserved:/);
+    // The ceiling bounds SELECTION, it is not a post-selection filter. Phase 2a
+    // is one `ORDER BY created_at LIMIT n` across every non-consolidation type,
+    // so discarding the surplus afterwards spends the shared budget on rows that
+    // are never claimed — one capped type then starves every other type of the
+    // whole batch. An at-ceiling type is excluded in the WHERE clause instead,
+    // with a refill fetch for the unspent remainder.
+    expect(dockerfile).toContain(
+      "AND operation_type != ALL(${idx}::text[])",
+    );
+    expect(dockerfile).toMatch(
+      /exhausted = sorted\(t for t, h in remaining_ceilings\.items\(\) if h <= 0\)/,
+    );
+    // The budget is spent per ACCEPTED row, never per selected row (otherwise
+    // rows the ceiling drops under-budget phase 2b).
+    expect(dockerfile).toMatch(/_accept\(\[row\]\)\n\s+remaining_shared -= 1/);
+    // Scoped to the REPLACEMENT body. `remaining_shared -= len(rows)` is
+    // upstream's line and MUST still appear verbatim in CLAIM_BODY_OLD — it is
+    // part of the anchor being replaced. It must not survive into the new body.
+    const claimBodyOldIdx = dockerfile.indexOf("CLAIM_BODY_OLD = r'''");
+    const claimBodyNewIdx = dockerfile.indexOf("CLAIM_BODY_NEW = r'''");
+    expect(claimBodyOldIdx).toBeGreaterThan(-1);
+    expect(claimBodyNewIdx).toBeGreaterThan(claimBodyOldIdx);
+    expect(dockerfile.slice(claimBodyOldIdx, claimBodyNewIdx)).toMatch(
+      /remaining_shared -= len\(rows\)/,
+    );
+    expect(dockerfile.slice(claimBodyNewIdx)).not.toMatch(
+      /remaining_shared -= len\(rows\)/,
+    );
+    // At zero headroom phase 2b is skipped OUTRIGHT — no busy-banks scan, no
+    // FOR UPDATE locks on rows this worker must discard.
+    expect(dockerfile).toMatch(
+      /consolidation_shared = _headroom\("consolidation", remaining_shared\)/,
+    );
+    expect(dockerfile).toMatch(/if consolidation_shared > 0:/);
+    // Enforcement runs BEFORE the row is marked processing — that UPDATE is the
+    // actual claim, so enforcing after it would leave rows half-claimed.
+    expect(dockerfile).toMatch(
+      /remaining_ceilings = dict\(type_ceilings\) if type_ceilings else \{\}/,
+    );
+    expect(dockerfile).toMatch(/        # Mark all claimed rows as processing/);
+    // Threaded from the poller through both DB backends.
+    expect(dockerfile).toMatch(/"        type_ceilings=None,\\n"/);
+    expect(dockerfile).toMatch(
+      /for rel in \("engine\/db\/ops_postgresql\.py", "engine\/db\/ops_oracle\.py"\):/,
+    );
+    expect(dockerfile).toMatch(/slot_limits=config\.worker_slot_limits,/);
+    // The reservations themselves must NOT be renamed here: renaming a shipped
+    // env var is a breaking config change, filed upstream instead.
+    expect(dockerfile).not.toMatch(
+      /HINDSIGHT_API_WORKER_CONSOLIDATION_MIN_SLOTS/,
+    );
+    // Post-replace re-assertions (verification-on-build), including the
+    // ORDERING guard that enforcement precedes the claiming UPDATE.
+    expect(dockerfile).toMatch(
+      /assert t\.index\("remaining_ceilings = dict\(type_ceilings\)"\) < t\.index\(/,
+    );
+    expect(dockerfile).toContain(
+      "at-ceiling types are not excluded ",
+    );
+    expect(dockerfile).toContain(
+      "phase 2b is not clamped by ",
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight worker-slot-ceiling patch: worker_slot_limits is a real per-type CAP/,
+    );
+  });
+
+  it("keeps the sem-wait-always-logged fix (assert-guarded, fail-loud)", () => {
+    // Two gates hid the admission wait. It was only logged above 0.01s, so
+    // recalls that did NOT queue left no datum and the measured mean was biased
+    // upwards by the missing zeros; and the whole completion line sits behind
+    // `if not quiet:` while the consolidator recalls with _quiet=True, so the
+    // BACKGROUND population this PR pins at 2 emitted nothing at all. Behaviour
+    // is proven against the pinned upstream image in
+    // tests/docker/hindsight-recall-isolation-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight sem-wait-always-logged patch: anchor found \{n\}x/,
+    );
+    // The conditional is the anchor being replaced, and the append is now
+    // unconditional.
+    expect(dockerfile).toMatch(/"            if semaphore_wait > 0\.01:\\n"/);
+    // The dead ternary goes with the gate: wait_parts can no longer be empty, so
+    // the `else ""` branch was unreachable.
+    expect(dockerfile).toContain(
+      "wait_info = f\\\" | waits: {', '.join(wait_parts)}\\\"\\n",
+    );
+    // A quiet (background) recall still reports its admission wait — otherwise
+    // the reservation backing consolidation up is invisible, which is the exact
+    // "we mis-sized this from biased logs" failure the patch exists to prevent.
+    expect(dockerfile).toContain("[RECALL {recall_id}] Complete (quiet):");
+    // …as ONE line, not the multi-line buffer _quiet exists to suppress.
+    expect(dockerfile).not.toMatch(
+      /else:\n\s+logger\.info\("\\\\n" \+ "\\\\n"\.join\(log_buffer\)\)/,
+    );
+    // Post-replace re-assertions (verification-on-build), including the SCOPE
+    // guard: the conn= threshold is deliberately untouched by this patch.
+    expect(dockerfile).toMatch(
+      /assert "if semaphore_wait > 0\.01:" not in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert 'if max_conn_wait > 0\.01:' in t,/,
+    );
+    expect(dockerfile).toContain(
+      "a quiet (background) recall still ",
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight sem-wait-always-logged patch: sem= now emitted on every recall/,
+    );
+  });
+
+  it("keeps the perturbed-JSON-retry fix (assert-guarded, fail-loud)", () => {
+    // Upstream's `except json.JSONDecodeError` handler re-issued the SAME
+    // call_kwargs, so behind a caching LiteLLM proxy every "retry" replayed
+    // the identical unparseable body (measured 2026-07-26: 0.02s and the same
+    // response id on the repeat, vs 37.66s and a new id once the cache was
+    // bypassed). That is how a transient bad completion burned all attempts
+    // and failed a retain — which in turn aged a queued memory toward .dead.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight perturbed-JSON-retry patch: anchor found \{n\}x/,
+    );
+    // The load-bearing perturbation: bypass the PROXY response cache. It must
+    // travel in `extra_body` — litellm's top-level `cache=` kwarg is consumed
+    // by the SDK and never reaches the wire (measured, same run).
+    expect(dockerfile).toMatch(/_cache\["no-cache"\] = True/);
+    expect(dockerfile).toMatch(/call_kwargs\["extra_body"\] = _extra/);
+    // Secondary perturbation, and only when the caller already set one, so
+    // models that reject the parameter keep their kwargs untouched.
+    expect(dockerfile).toMatch(
+      /if call_kwargs\.get\("temperature"\) is not None:/,
+    );
+    // And it is capped at 0.7, not 1.0. `call()` defaults to max_retries=10,
+    // so a +0.3 ramp from 0.1 saturates by attempt 4 and spends the rest at
+    // the cap. The json_schema response_format is advisory (one of the two
+    // measured bad bodies was prose emitted while a schema was set), so a cap
+    // of 1.0 would make the LATE attempts the likeliest to emit invalid JSON
+    // — a retry strategy that degrades as it goes.
+    expect(dockerfile).toMatch(
+      /0\.7, float\(call_kwargs\["temperature"\]\) \+ 0\.3/,
+    );
+    expect(dockerfile).not.toMatch(
+      /1\.0, float\(call_kwargs\["temperature"\]\) \+ 0\.3/,
+    );
+    // Guard the identifier the patch body depends on.
+    expect(dockerfile).toMatch(
+      /assert s\.count\("call_kwargs = self\._build_common_kwargs\("\) >= 1,/,
+    );
+    // Post-replace re-assertions (verification-on-build), including a parse
+    // check so a bad splice fails the build rather than the container.
+    expect(dockerfile).toMatch(
+      /assert t\.count\(ANCHOR\) == 0, "switchroom hindsight perturbed-JSON-retry patch: unpatched handler still present"/,
+    );
+    expect(dockerfile).toMatch(/^ast\.parse\(t\)$/m);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight perturbed-JSON-retry patch: invalid-JSON retries now bypass the proxy response cache/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
