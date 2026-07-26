@@ -2,6 +2,158 @@
 
 ## Unreleased
 
+### A `v*` tag can no longer half-ship — release.yml is now the orchestrator (#3654)
+
+Three workflows fired independently on a `v*` tag with nothing cross-gating
+them: `docker-images`, `release` (added by #3665) and `npm-publish`. Any one
+could go red while the others shipped. The worst ordering was routine, not
+exotic — **npm publishes in ~2 minutes; the four native binary legs take
+~25** — so the default outcome of a broken build was `switchroom@X.Y.Z`
+permanently on npm, advertising a `curl | sh` install path pointing at
+release assets that do not exist. npm has no undo.
+
+The second half was live in production while this was written:
+`/releases/latest` was **v0.19.19, `draft: false`, `assets: []`**. That is the
+exact object `install.sh` resolves (`install.sh:76`), so every `curl | sh`
+install on every platform was 404ing on the asset download — and it had been
+since the moment `gh release create` ran, ~25 minutes before the binaries
+would even have been ready.
+
+**`npm-publish.yml` no longer has a `push` trigger.** It is reachable only via
+`workflow_call` from `release.yml` (as the last job, after the assets are
+attached *and* `docker-images` is confirmed green for that exact tag+commit)
+and via `workflow_dispatch` for recovery.
+
+**`release.yml` sequences the pipeline:** `guard` → `build` ×4 → `bundle` →
+`publish` → `images-gate` → `npm` → `finalize`. Plain `needs:` throughout —
+no `always()`, no `!cancelled()`, no `continue-on-error` anywhere on the
+chain, since each of those turns an upstream failure into a green publish.
+
+**The GitHub Release is held as a draft until every leg is green.**
+`/releases/latest` excludes drafts, so an in-flight or failed release leaves
+the *previous complete* release serving installs instead of breaking them.
+`finalize` is the only thing that un-drafts, and it re-derives the expected
+asset set from `install.sh` immediately before flipping the flag rather than
+trusting the upstream job. The `guard` job runs with **no `needs:`** so that a
+release created without `--draft` is pulled back within ~1 minute instead of
+sitting broken on `latest` for the whole build — and so a missing release
+fails the run in ~3 minutes rather than after ~25 minutes of macOS runner
+time.
+
+**Ordering is a convention; the self-gate is the guarantee.** `npm-publish.yml`
+re-proves both preconditions *from inside its own run* before anything
+irreversible: the release for the tag carries every asset `install.sh` asks
+for, and `docker-images` concluded `success` for that tag+commit. So a hand
+dispatch cannot bypass the ordering either.
+
+Two small pure scripts own every decision, so the shell owns only time:
+- `scripts/ci/classify-workflow-run.mjs` — success / failed / pending for a
+  workflow run. `head_sha` alone is **ambiguous**, verified against the live
+  API: commit `0bdb34ec` (v0.19.19) has two `docker-images` runs, one with
+  `head_branch: "v0.19.19"` and one with `head_branch: "main"`. Matching also
+  on `head_branch` is what separates them. Verdict is an allow-list on
+  `conclusion === "success"`, and no-match is **pending, never success**, so
+  a wrong assumption fails closed.
+- `scripts/ci/assert-release-assets-complete.mjs` — expected assets derived
+  from `install.sh` via the existing `scripts/release-assets.mjs`, never
+  hard-coded, so adding a platform to the installer automatically makes it
+  required at the gate. Uses the *list* endpoint because
+  `/releases/tags/{tag}` hides drafts — the one state that matters here.
+
+`docker-images.yml` was deliberately **not** converted to a reusable workflow.
+It also serves every PR and main push and carries the `images-ok` required
+check, and more decisively: a `workflow_call` conversion could only be proven
+correct by cutting a real tag, and if any assumption in it were wrong it would
+fail **open** (images mis-tagged). The polling gate's failure mode is closed
+(no matching run ⇒ blocked). On a path that cannot be rehearsed, that
+asymmetry decides it.
+
+**Tested by mutation, because neither workflow runs on a pull request.**
+A dropped `needs:`, a re-added `push` trigger or a stray `if: always()` would
+otherwise be invisible until the next real release, when the damage is an
+unpublishable npm version. `tests/release-pipeline-gating.test.ts` expresses
+nine rules over the parsed workflows and proves each one by weakening a clone
+until it goes red; `tests/release-gate-scripts.test.ts` covers the two scripts
+including the main-push-run rejection and the eight non-success conclusions.
+Rule R8 also pins the script-injection discipline: **no `${{ }}` inside any
+`run:` body** in either workflow — these hold `contents: write` and
+`NPM_TOKEN`, and an interpolated expression is written into the script file on
+the runner where log masking cannot reach it. `npm-publish.yml` had five, two
+of them `${{ secrets.NPM_TOKEN }}`; all now pass through `env:`.
+
+`skills/switchroom-release/SKILL.md` now **pins an explicit SHA**
+(`gh release create --target "$SHA"`, then `git push origin
+"$SHA:refs/tags/vX.Y.Z"`) instead of `--target main`, which resolves
+server-side — with agents merging PRs in parallel, a PR landing between the
+pre-flight check and the create call was silently swallowed into the release.
+
+Not closed by this: `docker-images` still moves the `:latest` **image** tag on
+a tag push regardless of the other legs. Deliberate scope — image tags are
+retaggable (`promote.yml`) where npm and `/releases/latest` are not, and
+converting the workflow that also serves every PR and main push (and carries
+the `images-ok` required check) to gate the one *recoverable* leg is the
+inverse trade of the npm case. Tracked in #3685 with the candidate shapes.
+
+### A runtime probe for the perturbed-JSON-retry patch, so a silent revert fails CI
+
+#3669 shipped the perturbed-JSON-retry patch with two of the three layers the
+#3660 review established for a build-time source patch: a build-level assert
+and a `dockerfile-hindsight-bakes.test.ts` mention. The missing layer was the
+one that checks BEHAVIOUR, and it is the layer that matters — the bakes
+assertions are unanchored substring matches, so they cannot distinguish
+"this code runs" from "this code is present".
+
+Measured on 2026-07-26, indenting the whole perturbation body under a falsy
+`if os.environ.get(...)` guard (`os` is already imported at
+`litellm_llm.py:18`, so the revert raises nothing) left every asserted literal
+in the file and **all 24 bakes tests passed** while the fix was inert.
+
+`tests/docker/hindsight-retry-perturbation-patches.test.ts` closes that. It
+extracts the real `RUN python3` heredoc from the Dockerfile, applies it to the
+digest-pinned upstream image, and drives `LiteLLMLLM.call()` against a body
+that never parses — asserting the retry is a DIFFERENT request each time:
+
+- RED (unpatched): `EXTRA_BODY [null, null, null, null]`, `TEMPERATURES
+  [0.1, 0.1, 0.1, 0.1]`, `DISTINCT_RETRY_REQUESTS 1 of 4`.
+- GREEN (patched): `TEMPERATURES [0.1, 0.4, 0.7, 0.7]`,
+  `DISTINCT_RETRY_REQUESTS 3 of 4`.
+
+The revert above turns it red. It runs in the `hindsight-probe` job under
+`SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1` (an unavailable docker/image is a hard
+failure, never a skip), and the file is in the `hindsight` paths filter so a
+change to the probe alone still runs it.
+
+### The permanence gate, asserted over the real client wrapping
+
+`pending.is_permanent_failure` decides whether a failed retain is retired to
+`.dead`, and its input is produced by `lib/client.py:91-97` — which catches
+only `HTTPError` and re-raises it as `RuntimeError("HTTP {code} from …")`,
+letting a bare `URLError` through untouched. Every existing permanence test
+injected a synthetic exception at `drain_pending._retry_one`, i.e. ABOVE that
+wrapping, so the shape the gate actually receives in production was asserted
+nowhere.
+
+`TransportFailureEndToEndTest` patches `urllib.request.urlopen` instead and
+drives the real drain: an outage (`URLError`) and a rate limit (`429`) past
+`MAX_ATTEMPTS` keep the memory queued, and a `400` rejection still retires it
+— the second half being what stops "never retire" from trading a data-loss
+bug for an unbounded queue.
+
+#3669 added an equivalent outage case, but to `vendor/hindsight-memory/tests/`,
+which no workflow discovers (`ci-tests-python.yml` runs `unittest discover
+tests/` from `vendor/hindsight-memory/scripts`) — so it never ran. The new
+tests live in the discovered suite and were mutation-checked: dropping the
+gate fails 2 of 3, dropping `429` from `_RETRYABLE_4XX` fails 1, and making
+`is_permanent_failure` always-false fails 1.
+
+Also corrects two comments on the #3669 patch: the class is `LiteLLMLLM`
+(`litellm_llm.py:50`), not `LiteLLMProvider`; and the 0.7 cap's rationale
+cited `call()`'s `max_retries=10` signature default (`litellm_llm.py:223`)
+while the retain path passes `max_retries=llm_max_retries`
+(`fact_extraction.py:1327`, `DEFAULT_LLM_MAX_RETRIES = 3` at `config.py:730`)
+— 4 attempts, contradicting the same comment's own measurement. The cap is
+unchanged and still right; the reason now states both budgets.
+
 ### context7 as a fleet-default MCP — server AND the prompt trigger that makes it get used
 
 Adds Upstash's **context7** (live library/framework documentation lookup) as a
@@ -141,7 +293,105 @@ this change, which already applied to `docker-images` + `npm-publish`; this
 adds a third leg to it). The `switchroom-release` skill's Gate C is the
 process-side mitigation until #3654 lands a mechanism: a release is not done
 until `gh release view vX.Y.Z --json assets` lists all four binaries plus the
-checksums file.
+checksums file. *(Closed in Unreleased — see "A `v*` tag can no longer
+half-ship".)*
+
+### The LiteLLM virtual-key model allowlist now has a declarative home, and unreachable lanes FAIL doctor
+
+A LiteLLM virtual key carries a `models` allowlist, enforced at REQUEST auth
+(`can_key_call_model`, `litellm/proxy/auth/auth_checks.py:2959`, reached from
+`user_api_key_auth.py:2690`). It is stored in the proxy's Postgres
+`LiteLLM_VerificationToken` row — **not** in `litellm-config.yaml`, not in
+`switchroom.yaml`, not in the vault. So it had no declarative home at all: a DB
+rebuild silently reverted it, and `switchroom apply` never noticed because the
+hindsight branch short-circuited on "a key exists in the vault".
+
+The failure is silent in the only way that matters. On 2026-07-26
+`gpt-oss-20b-retain` and `gpt-oss-20b-consolidation` were declared in
+`switchroom.yaml`, deployed, and healthy — and had recorded ZERO calls since
+creation, because every request was rejected at auth before reaching a
+deployment. Not unused: **unreachable**, for weeks, with no error anywhere.
+
+- **`switchroom.yaml` IS the declaration.** `hindsight.llm.model` and the per-op
+  `retain` / `reflect` / `consolidation` `.model` overrides already say exactly
+  which groups hindsight calls. `src/litellm/key-allowlist.ts` derives the
+  required allowlist from them and `apply` reconciles the key to match — the
+  same shape as the existing TEAM-binding reconciliation, idempotent, restored
+  automatically, no new file to keep in sync.
+- **Reconciliation is a UNION, never a truncation.** A key may legitimately
+  carry groups switchroom does not manage; writing only the derived set would
+  turn a routine `apply` into an outage for whatever else shares the key. An
+  EMPTY allowlist is LiteLLM's "unrestricted" and is left alone rather than
+  being downgraded into a restriction.
+- **Only litellm-routed ops count.** An op pinned to `provider: claude-code`
+  reaches Anthropic through the OAuth passthrough and never presents the
+  virtual key, so demanding a grant for it would be a false positive.
+- **Router FALLBACK targets are NOT required** — verified against the running
+  proxy rather than assumed. `can_key_call_model` runs only on the model the
+  client asked for; the router's fallback dispatch does not re-enter it. The
+  allowlist stays exactly as narrow as the config.
+- **A new doctor check makes it loud.** `LiteLLM key allowlist` FAILs when a
+  config-declared group is not reachable by the hindsight key, naming both the
+  group and the config key that declared it. Availability-safe like #3407: an
+  unreachable proxy, an unresolvable secret, or an unrecognised key WARN.
+  #3407 proves a model EXISTS; this proves the key can CALL it — existence
+  lives in the yaml, reachability lives in a Postgres row, and until now
+  nothing compared the two.
+- **It is the LANE's key that gets fixed and checked, not the service key.**
+  Two different virtual keys wear the name "hindsight": the vault's
+  `litellm/hindsight/api-key` becomes the claude-code passthrough bearer, while
+  the litellm-routed lanes present `hindsight.llm.<op>.api_key`. On the live
+  fleet those are DIFFERENT key values, so reconciling the vault one would have
+  granted a key nobody presents and then reported OK — a false pass on exactly
+  the silent failure this change exists to remove. Requirements are now grouped
+  per presenting key (`requiredKeyDemands`), and `apply` and doctor each act on
+  every distinct key, naming the config path that declared it. A lane whose
+  `api_key` cannot be resolved WARNs instead of being silently skipped.
+- **An unperformed check never reports as a clean skip.** `apply` used to print
+  the same calm `~ … (skipped)` line whether the allowlist was verified, or the
+  admin key could not be resolved, or `/key/info` failed outright — and a check
+  that was never run looking exactly like one that passed is how the original
+  defect stayed invisible for weeks. Those now WARN and say what was not
+  checked; only "the proxy does not recognise this key" stays quiet, because the
+  key-provisioning step reports it with the right remedy.
+- **A lane that declares NO `api_key` is a third case, and is never reconciled
+  or failed against some other key.** "No `api_key`" does not mean "the
+  provisioned service key" — there is no fallback to fall back to. switchroom
+  emits `HINDSIGHT_API_<OP>_LLM_API_KEY` only for an op that declares one and
+  never a global `HINDSIGHT_API_LLM_API_KEY` (`src/cli/setup.ts` records that
+  name as "no longer used"); hindsight reads the global as a bare
+  `os.getenv(ENV_LLM_API_KEY)` with no default; `litellm` sits in the engine's
+  `_PROVIDERS_WITHOUT_API_KEY`, so nothing raises; and its provider then omits
+  the key from the request entirely (`if self.api_key:`). The provisioned vault
+  key is not it either — that value is injected solely as the
+  `ANTHROPIC_CUSTOM_HEADERS` bearer for the claude-code passthrough, a lane
+  `can_key_call_model` never sees. So such a lane presents a credential
+  switchroom cannot name: `apply` widens nothing on its behalf (a green
+  "+ granted" line for a key the lane never sends is motion, not a fix) and
+  doctor WARNs — naming the lanes, the groups left unverified, and the
+  `hindsight.llm.<op>.api_key` that would make them checkable — rather than
+  passing or failing a key by proxy. Sibling lanes that DO declare a key are
+  still reconciled and still FAIL on their own merits.
+- **The allowlist predicate matches the proxy's, including the two shapes that
+  are not literal names.** `all-team-models` DELEGATES to the parent team's
+  list rather than granting anything itself — and it REPLACES the rest of the
+  row rather than merging with it, so even `["*", "all-team-models"]` is not
+  unrestricted. It is therefore `indeterminate` (WARN) and never written to:
+  appending to it would be silently discarded by the proxy. An entry
+  containing `*` is a PATTERN, not a literal, so `gpt-oss-*`
+  correctly covers `gpt-oss-20b-retain`. Treating either as a plain string
+  produced false FAILs and pointless writes.
+- **A raw NUL byte can make a source file unreviewable, so a test now forbids
+  it.** `src/litellm/key-allowlist.ts` reached review as `Bin 0 -> 11340 bytes`
+  / `+0/-0` — 253 lines of new logic that GitHub could not display and that
+  `git blame` and 3-way text merge would never see again — because a template
+  literal held a real `\0` instead of the escape. A reviewer cannot catch this
+  by reading the diff, since the diff is what goes missing, so
+  `tests/source-files-are-text.test.ts` scans every tracked text-extension file
+  mechanically. It immediately found three more, two of which had ALREADY been
+  binary on `main` unnoticed (`src/util/audit-hashchain.ts`,
+  `telegram-plugin/tests/boot-version-string.test.ts`); all are now escaped,
+  byte-identical in behaviour and readable again.
 
 ## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
 
