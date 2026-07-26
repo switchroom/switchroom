@@ -36,17 +36,20 @@ interface Step {
   name?: string;
   uses?: string;
   run?: string;
+  env?: Record<string, unknown>;
 }
 interface Job {
   needs?: string | string[];
   if?: unknown;
   uses?: string;
   steps?: Step[];
+  env?: Record<string, unknown>;
   "continue-on-error"?: unknown;
 }
 interface Workflow {
   on?: Record<string, unknown>;
   jobs?: Record<string, Job>;
+  env?: Record<string, unknown>;
 }
 
 function load(file: string): Workflow {
@@ -65,6 +68,19 @@ function stepsOf(job: Job): Step[] {
 /** First job whose steps contain `needle` in a `run:` body. */
 function jobDoing(wf: Workflow, needle: string): [string, Job] | undefined {
   return Object.entries(wf.jobs ?? {}).find(([, j]) => stepsOf(j).some((s) => (s.run ?? "").includes(needle)));
+}
+/**
+ * Is `name` bound to a non-empty value for this step? GitHub layers env as
+ * workflow < job < step, so a step inherits whatever the outer scopes set.
+ * An empty binding is NOT a binding — the gate scripts read `?? ""` and
+ * treat blank as absent, so `EXPECT_TAG: ""` fails exactly like omitting it.
+ */
+function envBound(wf: Workflow, job: Job, step: Step, name: string): boolean {
+  for (const scope of [step.env, job.env, wf.env]) {
+    const v = scope?.[name];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return true;
+  }
+  return false;
 }
 
 /**
@@ -215,6 +231,37 @@ export function auditGating(release: Workflow, npmPublish: Workflow): string[] {
         if ((s.run ?? "").includes("${{")) {
           problems.push(
             `R8: ${file} job ${id} step "${s.name ?? "?"}" interpolates \`\${{ }}\` inside \`run:\` — pass it via \`env:\`.`,
+          );
+        }
+      }
+    }
+  }
+
+  // R10 — every caller of the completeness gate must bind `EXPECT_TAG`.
+  // The script reads the tag to check from that variable and exits 1
+  // ("EXPECT_TAG is required") when it is blank. Crucially that exit is
+  // INDISTINGUISHABLE, to the shell wrapping it, from "assets are missing":
+  // both callers branch on `rc -ne 0`. So forgetting the variable does not
+  // skip the gate, it fails the gate — on every release, forever, with a
+  // message blaming the assets. v0.19.20 shipped exactly this: the upload
+  // step bound a step-local `TAG` while the assertion read `EXPECT_TAG`, so
+  // `publish` went red with all five assets already correctly attached,
+  // `npm` and `finalize` were skipped, and the release stranded as a draft
+  // while `/releases/latest` kept serving the asset-less v0.19.19.
+  //
+  // R7 asserts the gate is CALLED and called early enough; R10 asserts the
+  // call can actually run. Neither implies the other.
+  for (const [file, wf] of [
+    ["release.yml", release],
+    ["npm-publish.yml", npmPublish],
+  ] as const) {
+    for (const [id, job] of Object.entries(wf.jobs ?? {})) {
+      for (const s of stepsOf(job)) {
+        if (!(s.run ?? "").includes("assert-release-assets-complete.mjs")) continue;
+        if (!envBound(wf, job, s, "EXPECT_TAG")) {
+          problems.push(
+            `R10: ${file} job ${id} step "${s.name ?? "?"}" runs assert-release-assets-complete.mjs without ` +
+              "binding a non-empty `EXPECT_TAG` — the script exits 1 and the caller misreports it as missing assets.",
           );
         }
       }
@@ -417,5 +464,50 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
       stepsOf(job)[0]!.run = 'echo "${{ secrets.NPM_TOKEN }}" > /tmp/x';
     });
     expect(p.join("\n")).toMatch(/R8:.*interpolates/);
+  });
+
+  // The exact v0.19.20 regression: `publish` bound `TAG`, the assertion read
+  // `EXPECT_TAG`. Reproduced as a mutation so it can never come back.
+  it("R10: the v0.19.20 regression — the upload step binding `TAG` instead of `EXPECT_TAG` — is caught", () => {
+    const p = mutate((r) => {
+      const [, upload] = jobDoing(r, "gh release upload")!;
+      const step = stepsOf(upload).find((s) => (s.run ?? "").includes("assert-release-assets-complete.mjs"))!;
+      const tag = step.env!.EXPECT_TAG;
+      delete step.env!.EXPECT_TAG;
+      step.env!.TAG = tag;
+    });
+    expect(p.join("\n")).toMatch(/R10:.*release\.yml.*EXPECT_TAG/);
+  });
+
+  it("R10: binding EXPECT_TAG to an empty value is caught (blank is not a binding)", () => {
+    const p = mutate((r) => {
+      const [, upload] = jobDoing(r, "gh release upload")!;
+      const step = stepsOf(upload).find((s) => (s.run ?? "").includes("assert-release-assets-complete.mjs"))!;
+      step.env!.EXPECT_TAG = "";
+    });
+    expect(p.join("\n")).toMatch(/R10:.*EXPECT_TAG/);
+  });
+
+  it("R10: dropping EXPECT_TAG from npm-publish's own completeness gate is caught", () => {
+    const p = mutate((_r, n) => {
+      for (const job of Object.values(n.jobs!)) {
+        for (const s of stepsOf(job)) {
+          if ((s.run ?? "").includes("assert-release-assets-complete.mjs")) delete s.env?.EXPECT_TAG;
+        }
+      }
+    });
+    expect(p.join("\n")).toMatch(/R10:.*npm-publish\.yml.*EXPECT_TAG/);
+  });
+
+  // Guards the rule against over-firing: GitHub really does inherit env from
+  // the job and workflow scopes, so a valid outer binding must stay clean.
+  it("R10: an EXPECT_TAG inherited from the job scope satisfies the rule", () => {
+    const p = mutate((r) => {
+      const [, upload] = jobDoing(r, "gh release upload")!;
+      const step = stepsOf(upload).find((s) => (s.run ?? "").includes("assert-release-assets-complete.mjs"))!;
+      delete step.env!.EXPECT_TAG;
+      upload.env = { EXPECT_TAG: "${{ github.ref_name }}" };
+    });
+    expect(p.join("\n")).not.toMatch(/R10:/);
   });
 });
