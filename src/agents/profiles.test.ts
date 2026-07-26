@@ -357,29 +357,35 @@ describe("agent-self-service partial — cron/skill MCP discoverability (#1163)"
   });
 
   it("calls out the 5-minute interval floor + the matching error code", async () => {
-    // The broker rejects intervals <5min with E_CRON_TOO_FREQUENT.
-    // The fragment must tell the agent BEFORE it issues the rejected
-    // write so it doesn't surprise the user with an error.
+    // The broker rejects intervals <5min. The fragment must state the
+    // FLOOR before the agent issues a rejected write, because the number
+    // changes the advice it gives the user ("offer */5 instead"). The
+    // E_* code itself is NOT pinned here: error codes are carried by the
+    // MCP tool schema, and re-narrating them in the always-loaded prompt
+    // is duplication the agent already has at call time.
     const { renderAgentSelfServiceFragment } = await import("./profiles.js");
     const fragment = renderAgentSelfServiceFragment();
     expect(fragment.toLowerCase()).toMatch(/5[- ]min/);
-    expect(fragment).toContain("E_CRON_TOO_FREQUENT");
+    // It must offer the agent a legal alternative to propose instead.
+    expect(fragment).toMatch(/\*\/5|\*\/15|\*\/30/);
   });
 
-  it("calls out the 20-entry quota + the matching error code", async () => {
+  it("calls out the 20-entry quota so the agent checks before promising", async () => {
+    // The NUMBER is the load-bearing part (it gates what the agent may
+    // promise the user); the E_* code is the tool schema's job.
     const { renderAgentSelfServiceFragment } = await import("./profiles.js");
     const fragment = renderAgentSelfServiceFragment();
     expect(fragment).toMatch(/20\b/);
-    expect(fragment).toContain("E_QUOTA_EXCEEDED");
+    expect(fragment.toLowerCase()).toContain("cron_list");
   });
 
-  it("calls out the secrets-rejection rail + the matching error code", async () => {
-    // Agents must learn NOT to bake secrets: into their own entries —
-    // the broker rejects with E_OVERLAY_SECRETS_REQUIRES_APPROVAL.
-    // Runtime vault_request_access is the right path instead.
+  it("routes secrets to runtime vault_request_access, not to schedule entries", async () => {
+    // Agents must learn NOT to bake `secrets:` into their own entries.
+    // What matters in the prompt is the ALTERNATIVE path, since that is a
+    // behaviour the schema can't teach; the E_* code is the schema's job.
     const { renderAgentSelfServiceFragment } = await import("./profiles.js");
     const fragment = renderAgentSelfServiceFragment();
-    expect(fragment).toContain("E_OVERLAY_SECRETS_REQUIRES_APPROVAL");
+    expect(fragment).toContain("secrets:");
     expect(fragment.toLowerCase()).toContain("vault_request_access");
   });
 
@@ -484,22 +490,28 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
   });
 
   it("is appended to a scaffolded CLAUDE.md regardless of profile", async () => {
-    // The core claim: the grounding posture AND pacing discipline reach
-    // EVERY agent on EVERY profile, not just default. We rebuild the exact
-    // compose the scaffold does (profile CLAUDE.md.hbs render + unconditional
-    // append of the three shared fragments) for all four structurally
-    // different profiles and assert the execution-discipline text appears in
-    // ALL: default, coding, executive-assistant, health-coach.
+    // The core claim: the grounding posture AND the delegation/pacing
+    // discipline reach EVERY agent on EVERY profile, not just default. We
+    // rebuild the exact compose the scaffold does (profile CLAUDE.md.hbs
+    // render + unconditional append of the shared fragments, delegation
+    // last) for all four structurally different profiles.
+    //
+    // Pacing is pinned via the DELEGATION marker, not a standalone
+    // "Act in-turn" heading: the former "Sub-Agent Delegation" /
+    // "Execution Bias" / "Delegation — the last word" triplicate stated
+    // pacing three times with conflicting absolutes, and is now a single
+    // merged section carried by one fragment.
     const {
       renderExecutionDisciplineFragment,
       renderVaultProtocolFragment,
       renderAgentSelfServiceFragment,
       renderDevProtocolFragment,
+      renderDelegationGoldenRuleFragment,
     } = await import("./profiles.js");
     const Handlebars = (await import("handlebars")).default;
 
     const groundingMarker = "Grounding — check before you assert";
-    const pacingMarker = "Act in-turn";
+    const pacingMarker = "## Delegation";
     const devProtocolMarker = "## Development Protocol";
 
     const composeForProfile = (profileName: string): string => {
@@ -509,12 +521,13 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
         noEscape: true,
       })({});
       // Mirror scaffold.ts append order: vault, self-service,
-      // discipline, dev-protocol.
+      // discipline, dev-protocol, delegation (last — tail recency).
       for (const frag of [
         renderVaultProtocolFragment(),
         renderAgentSelfServiceFragment(),
         renderExecutionDisciplineFragment(),
         renderDevProtocolFragment(),
+        renderDelegationGoldenRuleFragment(),
       ]) {
         if (frag) rendered = rendered.trimEnd() + "\n\n" + frag + "\n";
       }
@@ -627,26 +640,36 @@ describe("renderDevProtocolFragment", () => {
     expect(fragment.length).toBeGreaterThan(500);
   });
 
-  it("cross-references the Sub-Agent Delegation section rather than licensing inline work", async () => {
+  it("cross-references the Delegation section rather than licensing inline work", async () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
     // Regression #3231: the dev-protocol must state it governs HOW
-    // delegated work is done, not authorize doing it inline.
+    // delegated work is done, not authorize doing it inline. The section
+    // it points at is now the single merged "Delegation" section (the
+    // former "Sub-Agent Delegation" / "Execution Bias" / "Delegation —
+    // the last word" triplicate collapsed into one).
     expect(fragment).toContain("not a license to do it inline");
-    expect(fragment).toContain("Sub-Agent Delegation");
+    expect(fragment).toContain("Delegation");
+    expect(fragment).not.toContain("Sub-Agent Delegation");
   });
 });
 
-describe("delegation recency (regression #3231)", () => {
-  // The strong delegation signal ("when in doubt, delegate") lives mid-file
-  // in the profile body, while the execution-discipline ("Act in-turn") and
-  // dev-protocol ("read the code, run the tests, keep moving") fragments are
-  // appended at the tail. In a long prompt the tail inline-execution voice
-  // won on recency and overrode the mid-file delegation rule, so agents did
-  // execution inline instead of dispatching a worker. The fix restores tail
-  // position for the delegation golden rule via an unconditional-append
-  // fragment. These tests pin that structural fix so a future reorder can't
-  // silently regress it.
+describe("delegation single-sourcing + recency (regression #3231)", () => {
+  // #3231: the delegation signal ("when in doubt, delegate") lived mid-file
+  // in the profile body while a tail "Act in-turn" pacing rule pulled the
+  // other way, and recency made the tail win — agents executed inline
+  // instead of dispatching. The first fix was ORDERING (re-state delegation
+  // in a tail fragment). That left the rule stated THREE times ("Sub-Agent
+  // Delegation" + "Execution Bias" + "Delegation — the last word") with
+  // conflicting absolutes, which is the failure mode Anthropic's Claude 5
+  // context guidance names directly: overlapping, conflicting instructions
+  // make the model deliberate more, not behave better.
+  //
+  // The fix is now STRUCTURAL and strictly stronger than ordering: delegation
+  // is stated ONCE, in a single unconditional-append fragment, and that
+  // fragment is still appended LAST so it also wins on recency. These tests
+  // pin BOTH properties — single-sourcing (no profile template re-states it)
+  // and tail position — so neither can silently regress.
 
   const composeClaudeMd = async (profileName: string): Promise<string> => {
     const {
@@ -675,28 +698,44 @@ describe("delegation recency (regression #3231)", () => {
     return rendered;
   };
 
-  // The tail fragment's unique heading — NOT present anywhere in the
-  // pre-fix compose, so on the pre-fix ordering indexOf returns -1 and the
-  // "after Act in-turn" assertion below fails (red-on-regression).
-  const tailDelegationMarker = "## Delegation — the last word";
-  const actInTurnMarker = "**Act in-turn.**";
+  // The delegation fragment's heading. It is the ONLY delegation section in
+  // the composed prompt — that is the property under test.
+  const delegationHeading = "## Delegation";
+  // The dev-protocol fragment is the last thing appended BEFORE delegation,
+  // and it is the strongest competing "do the work" voice. Delegation must
+  // still sit after it, so recency favours dispatching.
+  const devProtocolMarker = "## Development Protocol";
+  const PROFILES = ["default", "coding", "executive-assistant", "health-coach"];
 
-  it("appends the delegation golden-rule fragment AFTER the Act-in-turn marker on every profile", async () => {
-    for (const profile of ["default", "coding", "executive-assistant", "health-coach"]) {
+  it("states delegation exactly ONCE in the composed prompt on every profile", async () => {
+    // Red-on-regression: if a profile template re-introduces its own
+    // "## Sub-Agent Delegation" section (or any second delegation heading),
+    // the count goes to 2 and this fails. Conflicting restatements across
+    // layers are the thing #3231's second-round fix removed.
+    for (const profile of PROFILES) {
       const claude = await composeClaudeMd(profile);
-      const actInTurnIdx = claude.indexOf(actInTurnMarker);
-      const tailDelegationIdx = claude.indexOf(tailDelegationMarker);
+      const headings = claude.match(/^#{2,3} .*Delegation.*$/gim) ?? [];
+      expect(headings, `${profile}: delegation stated exactly once`).toHaveLength(1);
+      expect(claude, `${profile}: no revived Sub-Agent Delegation section`).not.toContain(
+        "Sub-Agent Delegation",
+      );
+    }
+  });
 
-      expect(actInTurnIdx, `${profile}: Act-in-turn marker present`).toBeGreaterThan(-1);
-      expect(tailDelegationIdx, `${profile}: tail delegation fragment present`).toBeGreaterThan(-1);
-      // The load-bearing assertion: the delegation golden rule must win on
-      // recency by sitting AFTER the inline-execution "Act in-turn" signal.
-      // On the pre-fix ordering (no tail fragment) tailDelegationIdx is -1
-      // and this fails.
+  it("appends the single delegation section AFTER the dev-protocol fragment on every profile", async () => {
+    for (const profile of PROFILES) {
+      const claude = await composeClaudeMd(profile);
+      const devIdx = claude.indexOf(devProtocolMarker);
+      const delegationIdx = claude.indexOf(delegationHeading);
+
+      expect(devIdx, `${profile}: dev-protocol marker present`).toBeGreaterThan(-1);
+      expect(delegationIdx, `${profile}: delegation fragment present`).toBeGreaterThan(-1);
+      // Load-bearing: delegation must win on recency over the competing
+      // "do the work" voice of the dev-protocol.
       expect(
-        tailDelegationIdx,
-        `${profile}: delegation golden rule must appear AFTER Act-in-turn (recency)`,
-      ).toBeGreaterThan(actInTurnIdx);
+        delegationIdx,
+        `${profile}: delegation must appear AFTER the dev-protocol (recency)`,
+      ).toBeGreaterThan(devIdx);
     }
   });
 
@@ -708,12 +747,12 @@ describe("delegation recency (regression #3231)", () => {
   // (scaffoldAgent → writeTwoSectionClaudeMdWithFingerprint) and asserts the
   // tail-recency ordering in the byte-for-byte output every agent actually
   // ships with. It is red-on-regression if scaffold.ts reorders the appends.
-  it("real scaffolded CLAUDE.md places the delegation tail AFTER Act-in-turn on every profile", () => {
+  it("real scaffolded CLAUDE.md states delegation once, at the tail, on every profile", () => {
     const telegramConfig: TelegramConfig = {
       bot_token: "123456:ABC-DEF",
       forum_chat_id: "-1001234567890",
     };
-    const profiles = ["default", "coding", "executive-assistant", "health-coach"];
+    const profiles = PROFILES;
     for (const profile of profiles) {
       const tmp = mkdtempSync(join(tmpdir(), "switchroom-scaffold-recency-"));
       try {
@@ -725,41 +764,60 @@ describe("delegation recency (regression #3231)", () => {
         const result = scaffoldAgent(`recency-${profile}`, config, tmp, telegramConfig);
         const claude = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
 
-        const actInTurnIdx = claude.indexOf(actInTurnMarker);
-        const tailDelegationIdx = claude.indexOf(tailDelegationMarker);
+        const devIdx = claude.indexOf(devProtocolMarker);
+        const delegationIdx = claude.indexOf(delegationHeading);
 
-        expect(actInTurnIdx, `${profile}: Act-in-turn marker present in production output`).toBeGreaterThan(-1);
-        expect(tailDelegationIdx, `${profile}: tail delegation fragment present in production output`).toBeGreaterThan(-1);
-        // Load-bearing: in the REAL scaffolded file the delegation golden rule
-        // must sit AFTER Act-in-turn. If scaffold.ts's append order regresses,
-        // this fails even though the helper-based test above would not.
+        expect(devIdx, `${profile}: dev-protocol marker present in production output`).toBeGreaterThan(-1);
+        expect(delegationIdx, `${profile}: delegation fragment present in production output`).toBeGreaterThan(-1);
+        // Load-bearing on the REAL compose path: stated once, and last.
+        // If scaffold.ts reorders the appends, or a template revives its own
+        // delegation section, this fails where the helper-based test would not.
         expect(
-          tailDelegationIdx,
-          `${profile}: production CLAUDE.md must place delegation golden rule AFTER Act-in-turn (recency)`,
-        ).toBeGreaterThan(actInTurnIdx);
+          (claude.match(/^#{2,3} .*Delegation.*$/gim) ?? []).length,
+          `${profile}: production CLAUDE.md states delegation exactly once`,
+        ).toBe(1);
+        expect(
+          delegationIdx,
+          `${profile}: production CLAUDE.md must place delegation AFTER the dev-protocol (recency)`,
+        ).toBeGreaterThan(devIdx);
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
     }
   });
 
-  it("the Act-in-turn fragment cross-references delegation so it composes rather than overrides", async () => {
-    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
-    const fragment = renderExecutionDisciplineFragment();
-    expect(fragment).toContain("Sub-Agent Delegation");
-    expect(fragment.toLowerCase()).toContain("does not override");
+  it("resolves act-in-turn vs delegate INSIDE the one delegation section, not as a cross-reference", async () => {
+    // The old shape needed the execution-discipline fragment to cross-
+    // reference "Sub-Agent Delegation" and say it "does not override" it —
+    // a repair for a conflict that only existed because the rule was stated
+    // in two places. Now the two signals live in ONE section that states
+    // their composition directly, so no cross-reference is needed and the
+    // grounding fragment must not re-open the topic.
+    const { renderDelegationGoldenRuleFragment, renderExecutionDisciplineFragment } =
+      await import("./profiles.js");
+    const delegation = renderDelegationGoldenRuleFragment();
     // The concrete composition: for execution-class work the in-turn act
-    // IS dispatching the sub-agent.
-    expect(fragment.toLowerCase()).toContain("dispatching the sub-agent");
+    // IS dispatching the worker, and that IS the fast response.
+    expect(delegation.toLowerCase()).toContain("acting in-turn and delegating are the same move");
+    expect(delegation.toLowerCase()).toContain("dispatch and acknowledge");
+    // Single-sourced: the grounding fragment carries no competing pacing rule.
+    expect(renderExecutionDisciplineFragment().toLowerCase()).not.toContain("act in-turn");
   });
 
   describe("renderDelegationGoldenRuleFragment", () => {
-    it("restates the golden rule and its recency intent", async () => {
+    it("carries the golden rule and the execution-class criterion", async () => {
+      // It no longer describes itself as a "tail reminder": it is not a
+      // restatement any more, it is the single source. Tail POSITION is
+      // pinned structurally by the ordering tests above, which is the
+      // property that actually matters.
       const { renderDelegationGoldenRuleFragment } = await import("./profiles.js");
       const fragment = renderDelegationGoldenRuleFragment();
       expect(fragment.toLowerCase()).toContain("when in doubt, delegate");
-      expect(fragment).toContain("tail reminder");
       expect(fragment).toContain("@worker");
+      expect(fragment).toContain("@researcher");
+      expect(fragment).toContain("@reviewer");
+      // The criterion that replaced three competing absolutes.
+      expect(fragment).toContain("3+ sequential tool calls");
       expect(fragment.length).toBeGreaterThan(300);
     });
 
@@ -770,7 +828,7 @@ describe("delegation recency (regression #3231)", () => {
   });
 });
 
-describe("steer-forwarding guidance — delegation-carrying profile templates", () => {
+describe("steer-forwarding guidance — the shared delegation fragment", () => {
   // Job spec: reference/jobs/steer-or-queue-mid-flight.md. Gap: when a
   // mid-turn user message amends work already delegated to a running
   // background sub-agent, agents tended to hold the amendment until
@@ -781,64 +839,82 @@ describe("steer-forwarding guidance — delegation-carrying profile templates", 
   // steer-vs-queue in the reply; and because the spec's default for an
   // unmarked follow-up is QUEUE, the guidance must carry the ambiguity
   // tiebreak ("queue it and say so") rather than biasing toward steer.
-  // Pinned on BOTH templates that carry delegation guidance: default
-  // (full Sub-Agent Delegation section) and coding (short form) — on the
-  // raw .hbs AND on the rendered output (same Handlebars compose path as
-  // the scaffold), so a future conditional wrapper that stops the
-  // paragraph rendering is caught too.
+  //
+  // This used to be pinned on TWO profile templates (default + coding),
+  // which duplicated the text and left every OTHER profile without it.
+  // It now lives once, in the unconditionally-appended delegation
+  // fragment, so it reaches EVERY profile — these tests pin it there and
+  // assert the templates no longer carry a rival copy.
 
   const readTemplate = (profile: string): string =>
     readFileSync(join(getProfilePath(profile), "CLAUDE.md.hbs"), "utf-8");
 
-  const renderTemplate = async (profile: string): Promise<string> => {
-    const Handlebars = (await import("handlebars")).default;
-    return Handlebars.compile(readTemplate(profile), { noEscape: true })({});
+  const fragment = async (): Promise<string> => {
+    const { renderDelegationGoldenRuleFragment } = await import("./profiles.js");
+    return renderDelegationGoldenRuleFragment();
   };
 
-  it("default profile: forwards mid-turn amendments to the running worker via SendMessage", () => {
-    const template = readTemplate("default");
-    expect(template).toContain("SendMessage");
-    expect(template.toLowerCase()).toContain("rather than holding it for handback");
+  it("forwards mid-turn amendments to the running worker via SendMessage", async () => {
+    const f = await fragment();
+    expect(f).toContain("SendMessage");
+    expect(f.toLowerCase()).toContain("rather than holding it for handback");
   });
 
-  it("default profile: carries the ambiguity tiebreak — unsure means queue, said out loud", () => {
-    const template = readTemplate("default");
-    expect(template.toLowerCase()).toContain("queue it and say so");
-    expect(template.toLowerCase()).toContain("queue is the default");
+  it("carries the ambiguity tiebreak — unsure means queue, said out loud", async () => {
+    const f = (await fragment()).toLowerCase();
+    expect(f).toContain("queue it and say so");
+    expect(f).toContain("queue is the default");
   });
 
-  it("default profile: requires stating steer-vs-queue in the reply, never inferred", () => {
-    const template = readTemplate("default");
-    expect(template.toLowerCase()).toContain("folded your update into the running worker");
-    expect(template.toLowerCase()).toContain("queued as a separate task");
-    expect(template.toLowerCase()).toContain("never inferred");
+  it("requires stating steer-vs-queue in the reply, never inferred", async () => {
+    const f = (await fragment()).toLowerCase();
+    expect(f).toContain("folded your update into the running worker");
+    expect(f).toContain("queued as a separate task");
+    expect(f).toContain("never classify silently");
+    expect(f).toContain("never inferred");
   });
 
-  it("default profile: covers the too-late steer (worker done → apply in the parent)", () => {
-    const template = readTemplate("default");
-    expect(template.toLowerCase()).toContain("effectively done");
-    expect(template.toLowerCase()).toContain("apply the update yourself in the parent");
+  it("covers the too-late steer (worker done → apply in the parent)", async () => {
+    const f = (await fragment()).toLowerCase();
+    expect(f).toContain("effectively done");
+    expect(f).toContain("apply the update yourself in the parent");
   });
 
-  it("coding profile: carries the same steer-forwarding + visibility rule", () => {
-    const template = readTemplate("coding");
-    expect(template).toContain("SendMessage");
-    expect(template.toLowerCase()).toContain("never classify silently");
-    expect(template.toLowerCase()).toContain("effectively done");
+  it("reaches EVERY profile, including ones that never carried it before", () => {
+    // The point of moving it into the unconditional-append fragment: the
+    // scaffolded prompt for executive-assistant / health-coach now carries
+    // the steer rule too. Asserted on the REAL production compose path.
+    const telegramConfig: TelegramConfig = {
+      bot_token: "123456:ABC-DEF",
+      forum_chat_id: "-1001234567890",
+    };
+    for (const profile of ["default", "coding", "executive-assistant", "health-coach"]) {
+      const tmp = mkdtempSync(join(tmpdir(), "switchroom-scaffold-steer-"));
+      try {
+        const config = {
+          extends: profile,
+          topic_name: "Steer Test",
+          schedule: [],
+        } as unknown as AgentConfig;
+        const result = scaffoldAgent(`steer-${profile}`, config, tmp, telegramConfig);
+        const claude = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8").toLowerCase();
+        expect(claude, `${profile}: steer handle`).toContain("sendmessage");
+        expect(claude, `${profile}: ambiguity tiebreak`).toContain("queue it and say so");
+        expect(claude, `${profile}: too-late steer`).toContain("effectively done");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
   });
 
-  it("coding profile: carries the ambiguity tiebreak — unsure means queue, said out loud", () => {
-    const template = readTemplate("coding");
-    expect(template.toLowerCase()).toContain("queue it and say so");
-    expect(template.toLowerCase()).toContain("queue is the default");
-  });
-
-  it("both profiles: the steer guidance survives Handlebars rendering (not lost to a conditional)", async () => {
-    for (const profile of ["default", "coding"]) {
-      const rendered = (await renderTemplate(profile)).toLowerCase();
-      expect(rendered, `${profile}: steer handle`).toContain("sendmessage");
-      expect(rendered, `${profile}: ambiguity tiebreak`).toContain("queue it and say so");
-      expect(rendered, `${profile}: too-late steer`).toContain("effectively done");
+  it("is single-sourced: no profile template keeps a rival copy", () => {
+    // Red-on-regression if someone re-pastes the steer paragraph back into
+    // a template — that is how the three-way conflict grew last time.
+    for (const profile of ["default", "coding", "executive-assistant", "health-coach"]) {
+      const template = readTemplate(profile).toLowerCase();
+      expect(template, `${profile}: no duplicated steer paragraph`).not.toContain(
+        "queue it and say so",
+      );
     }
   });
 });

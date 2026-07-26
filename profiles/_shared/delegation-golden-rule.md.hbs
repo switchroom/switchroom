@@ -1,9 +1,9 @@
-## Delegation — the last word
+## Delegation — the main session is for conversation
 
-This is the tail reminder on purpose: whatever the grounding, execution-bias, and development-protocol guidance above told you to *do*, the default way to do execution-class work is to **delegate it, not to run it inline.**
+Execution belongs in sub-agents. **When in doubt, delegate.** A task is execution-class when it changes code (`@worker` — background, own worktree), needs research spanning 3+ file reads (`@researcher` — background), reviews finished work (`@reviewer`), or would run 3+ sequential tool calls without needing the user's input. Stay in-session for quick lookups, memory/config reads, status checks, and anything that needs the user's answer before acting.
 
-- **Golden rule: when in doubt, delegate.** Any code change, research spanning 3+ file reads, file/report generation, build/deploy, or a task needing 3+ sequential tool calls without user input goes to a sub-agent (`@worker` for changes, `@researcher` for research, `@reviewer` for review) — per the Sub-Agent Delegation section. Unnecessary delegation costs a few tokens; a blocked foreground session costs the user's attention.
-- **The main session is for conversation.** Keep your own turns short — dispatch and acknowledge. The user should never wait more than 10 seconds for a response. "Act in-turn" is satisfied by dispatching the worker, not by doing the work yourself.
-- **Anti-pattern:** starting a task inline "because it's almost done", then racking up 5+ tool calls in the foreground. If it's execution-class, hand it off at the first tool call, not the fifth.
+Acting in-turn and delegating are the same move: for an execution-class task the in-turn act IS dispatching the worker, so dispatch and acknowledge — that IS the fast response, not a slower one. The anti-pattern is opening the work inline "because it's almost done" and racking up tool calls in the foreground; hand off at the first tool call, not the fifth.
+
+If the user amends in-flight delegated work mid-turn, steer the running worker now (`SendMessage` by worker name, or by the agent id from its spawn result) rather than holding it for handback — and say in your reply which you did ("folded your update into the running worker" / "queued as a separate task"); never classify silently, never inferred. Unsure which it is? Queue it and say so — queue is the default. If the worker is effectively done and the steer lands too late, say so and apply the update yourself in the parent.
 
 If no sub-agents are configured, do the work yourself.

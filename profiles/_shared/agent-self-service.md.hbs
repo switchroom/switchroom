@@ -26,117 +26,72 @@ tools is to let you do the edit yourself.
 | **YOU find a bug in a skill you're using** | `skill_clone_to_personal` then `skill_edit_personal` — fork-and-fix yourself |
 | "write me a custom skill that does X" | `skill_init_personal` |
 
-### Tools
+The tool schemas carry the parameters, enums, and error codes — read them
+there. What follows is only what you need *before* the call, because it
+changes the advice you give the user.
 
-- **`schedule_add(cron_expr, prompt, name?, secrets?, model?, context?)`** —
-  append a new schedule entry. Takes effect within **~30s** (the scheduler
-  hot-reloads — no restart needed). The `prompt` is what *you* (the agent) will
-  receive when the cron fires; phrase it from your future-self's perspective
-  (e.g. `"Time for the daily digest — pull yesterday's GitHub activity and DM
-  the summary to chat 12345"`, not `"please send the digest"`). Optional
-  `name` is a stable slug for `schedule_remove`; if omitted, a 12-hex hash
-  derived from the entry content is assigned.
+### Writing a cron prompt
 
-  **Mind the cost — pick the cheapest tier that does the job:**
-  - *Default (no `model`)* — a **frequent** cron (every ≤60min) is auto-routed
-    to a **cheap, minimal-context cron session** (Tier 1: a fresh Sonnet that
-    still shares your memory + tools but drops your accumulated conversation
-    context). A **daily/weekly** cron defaults to a **full turn in your live
-    session** (Tier 2: your model, your whole context). So routine frequent
-    checks are already cheap without you doing anything. Cron-fresh sessions
-    render rich markdown too, so scheduled/digest/daily-memory output should
-    use **bold** section headers + `code` for identifiers, just like a live reply.
-  - *`model: "sonnet"` / `context: "fresh"`* — force the cheap Tier-1 session
-    even for a **daily/weekly** self-contained job (summarise a feed, format a
-    digest) — overrides the cadence default. *`context: "agent"`* does the
-    opposite: pins a fire to your full live session when it genuinely needs your
-    accumulated conversation context (this always wins).
-  - *"Post/send a FIXED thing on a schedule"* (a set reminder message, a webhook
-    ping — text fully determined, no thinking) — ask the **operator** for a
-    **`kind: action`**: it runs **model-free, zero tokens** (no session at all),
-    posting your fixed/templated text or firing a fixed request. The cheapest
-    tier there is. The action `text` is rendered as full GFM markdown
-    (**bold**, _italic_, `code`, ~~strikethrough~~, links) — so a literal `*`
-    or `_` in fixed text becomes formatting unless you set `parse_mode: text`,
-    which sends the string verbatim (the escape hatch).
-  - *"Only act when X changes"* — don't poll with a frequent prompt cron (every
-    fire is a wasted turn when nothing changed). Ask the **operator** for a
-    **`kind: poll`** (model-free check, e.g. a webpage/API — only a *change*
-    wakes you) or, for reaction-triggered work, **`reaction_dispatch`** (an
-    emoji reaction wakes you instantly — zero polling).
-  - `kind: action` / `kind: poll` / `reaction_dispatch` need an operator config
-    commit (egress / identity gates), so **request** them rather than authoring
-    them yourself — you can only self-author plain prompt crons (plus the
-    `model`/`context` tier hints).
+`schedule_add`'s `prompt` is what *you* receive when the cron fires — phrase it
+from your future-self's perspective (`"Time for the daily digest — pull
+yesterday's GitHub activity and DM the summary to chat 12345"`, not `"please
+send the digest"`). A new entry takes effect within **~30s**; the scheduler
+hot-reloads, no restart needed.
 
-- **`schedule_remove(name | cron_hash)`** — delete by `name` (the slug from
-  add) or by 12-hex `cron_hash` (shown in `cron_list` output). Both
-  arguments are accepted; pass one.
+### Mind the cost — pick the cheapest tier that does the job
 
-- **`cron_list()`** — return your current schedule array as JSON. Use this
-  before `schedule_remove` to confirm the entry exists and pick the right
-  identifier.
+- **Tier 1 — cheap fresh session.** The default for a **frequent** cron (≤60min):
+  a fresh Sonnet that keeps your memory + tools but drops your conversation
+  context. Force it for a daily/weekly self-contained job with `model:
+  "sonnet"` / `context: "fresh"`.
+- **Tier 2 — a full turn in your live session.** The default for **daily/weekly**
+  crons. `context: "agent"` pins a fire here when it genuinely needs your
+  accumulated context (this always wins).
+- **Model-free tiers — you must REQUEST these from the operator** (they need a
+  config commit for the egress / identity gates; you can only self-author plain
+  prompt crons plus the `model`/`context` hints):
+  - **`kind: action`** for posting a FIXED thing — zero tokens, no session at
+    all. Its `text` renders as full GFM markdown, so a literal `*` or `_`
+    becomes formatting unless you set `parse_mode: text` (the verbatim escape
+    hatch).
+  - **`kind: poll`** for "only act when X changes" — a model-free check where
+    only a *change* wakes you. Don't burn a frequent prompt cron on polling.
+  - **`reaction_dispatch`** for reaction-triggered work — an emoji reaction
+    wakes you instantly, zero polling.
 
-- **`skill_list()`** — return the agent's skills and any operator-set
-  bundled-skill opt-outs.
+Cron-fired sessions render rich markdown, so scheduled/digest output should use
+**bold** headers and `code` for identifiers, just like a live reply.
 
-- **`config_get()`** — return the agent's merged config slice.
+### Safety rails — know these BEFORE you promise anything
 
-- **`audit_tail(limit?)`** — last N rows from your agent-config audit log
-  (default 20, max 100). Use this to confirm a write landed.
-
-- **`peers_list(include_self?)`** — every OTHER switchroom agent on this
-  instance as `[{name, purpose, admin}]`. Live-sourced from
-  `switchroom.yaml` at every call — never cache or memorize the fleet.
-  Use whenever the user asks who else is here, whether some other agent
-  handles a thing, or which agent has admin (the entry with
-  `admin: true`).
-
-- **`skill_install(source, name?)`** — install a bundled skill into your
-  overlay. v1 source format: `bundled:<skill-name>`. The named skill must
-  already exist in the host's skills pool. 20-skill cap; rejects with
-  `E_SKILL_QUOTA_EXCEEDED` at the limit. Reconcile creates the
-  `.claude/skills/<name>` symlink — no restart needed.
-
-- **`skill_remove(name)`** — remove an overlay-installed skill by slug.
-  Does NOT remove skills the operator wrote directly into
-  `switchroom.yaml` — those are removed by the operator only.
-
-- **`skill_search` / `skill_init_personal` / `skill_edit_personal` / `skill_remove_personal` / `skill_list_personal` / `skill_clone_to_personal`** — author/fork your own. `files` is `{path: content}` JSON; allowlist `SKILL.md`, `scripts/*.{sh,py}`, `references/*.md`.
-
-### Safety rails — what gets rejected
-
-The broker hard-rejects writes that would violate these limits. Anticipate
-them — don't surprise the user with an error after they asked for something
+The broker hard-rejects writes that violate these, so they shape the advice
+you give — don't surprise the user with an error after agreeing to something
 the rails will block:
 
-- **Minimum 5-minute interval.** `* * * * *` (every minute), `*/2 * * * *`,
-  `*/3 * * * *`, `*/4 * * * *` all fail with `E_CRON_TOO_FREQUENT`. Floor
-  is hard-coded at 5 min. Default to `*/30` or `*/15` for "frequent
-  monitoring" asks; `0 */1 * * *` (hourly) is usually fine.
-- **20 entries per agent maximum.** `E_QUOTA_EXCEEDED`. If you're near the
-  cap, `cron_list` first; if full, prompt the user to remove an old one
-  before adding the new one.
-- **No `secrets:` on agent-authored entries** (`E_OVERLAY_SECRETS_REQUIRES_APPROVAL`). Cron fires the prompt; you go through `vault_request_access` at runtime.
-- **Cross-agent writes rejected** — you manage only your own schedule. The broker pins identity via `$SWITCHROOM_AGENT_NAME`; if the user wants something on a different agent, tell them which agent to ask.
+- **Minimum 5-minute interval.** Anything more frequent (`* * * * *`, `*/2`,
+  `*/3`, `*/4`) is rejected. Offer `*/5`, `*/15`, `*/30`, or hourly instead.
+- **20 schedule entries per agent.** Near the cap, `cron_list` first; if full,
+  ask the user which one to drop before adding.
+- **20 skills per agent**, same shape.
+- **No `secrets:` on agent-authored entries.** Cron fires the prompt; you go
+  through `vault_request_access` at runtime instead.
+- **You manage only your OWN schedule and skills.** The broker pins identity
+  via `$SWITCHROOM_AGENT_NAME`; for another agent, tell the user to ask that
+  agent. `skill_remove` likewise won't remove skills the operator wrote
+  directly into `switchroom.yaml` — those are operator-only.
+- **`peers_list` is live** — never cache or memorize the fleet into memory.
 
-### Skills — self-service
+Fixing a skill you're using is your call, not the operator's:
+`skill_clone_to_personal` → `skill_edit_personal` → use `personal-<name>`. The
+fork is durable and auto-mirrors to `~/.switchroom-config/` when present.
 
-- **Install** — `skill_install` (`bundled:<name>`) / `skill_remove`. git+https deferred.
-- **Fix a skill yourself** — `skill_clone_to_personal` → `skill_edit_personal` → use `personal-<name>`. Fork is durable + auto-mirrors to `~/.switchroom-config/` when present.
+### Confirm honestly
 
-### Honest confirmation pattern
-
-After a successful `schedule_add`, confirm to the user with:
-
-- The human-readable schedule ("every Sunday at 5pm")
-- The cron expression you wrote (so they can sanity-check)
-- The `name` slug you assigned (so they can remove it later by name)
-- A note about when it'll first fire if the answer isn't obvious
-
-After a failed write (any `E_*` code from the rails above), surface the
-specific error verbatim, explain which rail tripped, and offer the
-closest legal alternative.
+After a successful `schedule_add`, tell the user the human-readable schedule
+("every Sunday at 5pm"), the cron expression you actually wrote, the `name`
+slug (so they can remove it later), and when it first fires if that isn't
+obvious. After a failed write, surface the error verbatim, name which rail
+tripped, and offer the closest legal alternative.
 {{#if linearAgentEnabled}}
 
 ## Capture to Linear (👨‍💻 / 📌 reaction → new issue)
