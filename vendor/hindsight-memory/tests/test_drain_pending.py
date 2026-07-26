@@ -1,5 +1,6 @@
 """Tests for drain_pending.drain() (#1071)."""
 
+import io
 import json
 import os
 import sys
@@ -212,7 +213,31 @@ class DrainPendingTest(unittest.TestCase):
         self.assertEqual(entry["attempt_count"], 2)
         self.assertIn("last_attempt_at", entry)
 
-    def test_drain_max_attempts_marks_dead(self):
+    def test_drain_max_attempts_marks_dead_on_a_permanent_failure(self):
+        """Exhausting the budget on a 4xx still retires the entry."""
+        from lib.pending import MAX_ATTEMPTS
+
+        path = _seed_entry(self._pending, attempt=MAX_ATTEMPTS)
+        import drain_pending
+
+        def boom(*a, **kw):
+            raise urllib.error.HTTPError(
+                "http://h/v1/x", 400, "Bad Request", {}, io.BytesIO(b"bad payload")
+            )
+
+        with patch("urllib.request.urlopen", side_effect=boom):
+            summary = drain_pending.drain({})
+        self.assertEqual(summary["dead"], 1)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(path + ".dead"))
+
+    def test_drain_max_attempts_keeps_the_memory_on_a_transient_failure(self):
+        """A dead upstream must never retire a memory, however many attempts.
+
+        ``URLError`` is what an unreachable daemon raises. Before the
+        permanence gate this retired the entry at MAX_ATTEMPTS — i.e. an
+        outage destroyed memory that was perfectly saveable.
+        """
         from lib.pending import MAX_ATTEMPTS
 
         path = _seed_entry(self._pending, attempt=MAX_ATTEMPTS)
@@ -223,9 +248,10 @@ class DrainPendingTest(unittest.TestCase):
 
         with patch("urllib.request.urlopen", side_effect=boom):
             summary = drain_pending.drain({})
-        self.assertEqual(summary["dead"], 1)
-        self.assertFalse(os.path.exists(path))
-        self.assertTrue(os.path.exists(path + ".dead"))
+        self.assertEqual(summary["dead"], 0)
+        self.assertEqual(summary["retried"], 1)
+        self.assertTrue(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".dead"))
 
     def test_drain_stall_guard_stops_after_threshold(self):
         # Seed 10 entries; with a same-error-class stream, the stall

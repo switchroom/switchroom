@@ -1064,23 +1064,77 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
         )
         self.assertEqual(pending.count(), 12, "stalled entries stay queued")
 
-    def test_backlog_ages_entries_toward_dead_like_the_sequential_drain(self):
+    def _exhaust_attempts(self):
+        """Queue one entry already sitting on the MAX_ATTEMPTS boundary."""
         self._queue(1)
         path, entry = pending.iter_entries()[0]
         entry["attempt_count"] = pending.MAX_ATTEMPTS
         with open(path, "w", encoding="utf-8") as f:
             json.dump(entry, f)
+        return path
 
+    def _drain_failing_with(self, error):
         def always_fail(entry, timeout):
-            raise ConnectionError("upstream down")
+            raise error
 
         with unittest.mock.patch.object(drain_pending, "_retry_one", always_fail):
             with redirect_stderr(io.StringIO()):
-                summary = drain_pending.drain_backlog(CONFIG, phase="drain")
+                return drain_pending.drain_backlog(CONFIG, phase="drain")
+
+    def test_backlog_ages_entries_toward_dead_like_the_sequential_drain(self):
+        """A PERMANENT failure past MAX_ATTEMPTS still retires the entry."""
+        path = self._exhaust_attempts()
+        summary = self._drain_failing_with(
+            RuntimeError('HTTP 400 from http://h/v1/x: {"detail":"bad payload"}')
+        )
 
         self.assertEqual(summary["dead"], 1)
         self.assertTrue(os.path.exists(path + ".dead"))
         self.assertFalse(os.path.exists(path))
+
+    def test_extraction_500_past_max_attempts_never_kills_the_memory(self):
+        """The regression this gate exists for.
+
+        An HTTP 500 "Fact extraction failed … JSONDecodeError" means the
+        extraction model returned an empty or non-JSON completion on THAT
+        sampling run. The identical content persists fine on a later attempt,
+        so exhausting the attempt budget on it must NOT retire the memory.
+        Before the ``is_permanent_failure`` gate this drain produced
+        ``dead=1`` and removed the queue entry.
+        """
+        path = self._exhaust_attempts()
+        summary = self._drain_failing_with(
+            RuntimeError(
+                "HTTP 500 from http://h/v1/x: "
+                '{"detail":"Fact extraction failed: 1/1 chunks failed. '
+                "First failures: chunk 0: JSONDecodeError: Expecting value: "
+                'line 1 column 1 (char 0)"}'
+            )
+        )
+
+        self.assertEqual(summary["dead"], 0, "a 5xx must never retire a memory")
+        self.assertEqual(summary["retried"], 1)
+        self.assertFalse(os.path.exists(path + ".dead"))
+        self.assertTrue(os.path.exists(path), "the queued memory survives")
+        self.assertEqual(pending.count(), 1)
+
+    def test_transient_transport_failure_past_max_attempts_stays_queued(self):
+        """Timeouts / connection errors are transient too — never ``.dead``."""
+        for error in (ConnectionError("upstream down"), TimeoutError("timed out")):
+            with self.subTest(error=type(error).__name__):
+                path = self._exhaust_attempts()
+                summary = self._drain_failing_with(error)
+                self.assertEqual(summary["dead"], 0)
+                self.assertTrue(os.path.exists(path))
+                os.unlink(path)
+
+    def test_attempt_count_keeps_climbing_past_the_budget_on_transients(self):
+        """The counter still records reality; only ``.dead`` is gated."""
+        path = self._exhaust_attempts()
+        self._drain_failing_with(ConnectionError("upstream down"))
+        with open(path, encoding="utf-8") as f:
+            entry = json.load(f)
+        self.assertEqual(entry["attempt_count"], pending.MAX_ATTEMPTS + 1)
 
     def test_dry_run_issues_no_writes(self):
         self._queue(3)

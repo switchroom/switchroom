@@ -2160,6 +2160,98 @@ print(
 )
 PYEOF
 
+# Perturbed JSON retry: upstream's `except json.JSONDecodeError` handler in
+# `LiteLLMProvider.call()` sleeps and then re-issues the SAME `call_kwargs` —
+# a byte-identical request. Behind a caching LiteLLM proxy that is not a retry
+# at all: the proxy replays the identical unparseable body from its response
+# cache, so all N attempts consume one bad completion and the retain fails.
+#
+# Measured on this host 2026-07-26 (fleet backlog drain), against the proxy at
+# 127.0.0.1:4010 with a fresh random marker in the prompt:
+#   cold             41.29s  id=chatcmpl-112
+#   warm-identical    0.02s  id=chatcmpl-112   <-- cache replay, same id
+#   extra_body no-cache 37.66s id=chatcmpl-101 <-- cache genuinely bypassed
+# That matches the production symptom exactly: a failing extraction burned its
+# 4 attempts in 7.1s while a healthy call takes 80-150s — and 1+2+4=7s of that
+# was the handler's own backoff, leaving ~0.1s of actual LLM work for four
+# "attempts". The two observed bad bodies were (a) an empty completion (Ollama
+# zero-value response: content="", zero usage, created=-62135596800) and
+# (b) a numbered prose list where JSON was requested; neither is a property of
+# the input, so a genuinely fresh sample can succeed where a replay never can.
+#
+# Two perturbations, in decreasing order of evidence:
+#  1. `extra_body={"cache": {"no-cache": True}}` — the load-bearing one. It
+#     MUST be `extra_body`: the same run measured litellm's top-level `cache=`
+#     kwarg being swallowed by the SDK (0.02s, same id — the SDK's own cache
+#     is disabled here, so the kwarg never reaches the wire). Only `extra_body`
+#     is forwarded into the proxy request body.
+#  2. A capped temperature bump — only when the caller already set a
+#     temperature (so models that reject the parameter are untouched). Retain
+#     extraction runs at 0.1, i.e. near-greedy, so an uncached resample would
+#     otherwise reproduce the same malformed output.
+# Both apply only on the retry path; the first attempt is byte-for-byte the
+# request upstream would have sent, so cache hit-rate for healthy calls is
+# unchanged. Self-verifying; guarded by
+# tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+f = pathlib.Path("/app/api/hindsight_api/engine/providers/litellm_llm.py")
+s = f.read_text()
+
+ANCHOR = (
+    "            except json.JSONDecodeError as e:\n"
+    "                last_exception = e\n"
+    "                if attempt < max_retries:\n"
+    '                    logger.warning("LiteLLM returned invalid JSON, retrying...")\n'
+    "                    backoff = min(initial_backoff * (2**attempt), max_backoff)\n"
+)
+
+REPL = (
+    "            except json.JSONDecodeError as e:\n"
+    "                last_exception = e\n"
+    "                if attempt < max_retries:\n"
+    '                    logger.warning("LiteLLM returned invalid JSON, retrying...")\n'
+    "                    # switchroom: re-sending an identical request to a caching\n"
+    "                    # proxy replays the same unparseable body (measured: 0.02s,\n"
+    "                    # identical response id). Perturb so the retry is a real one.\n"
+    "                    _extra = dict(call_kwargs.get(\"extra_body\") or {})\n"
+    "                    _cache = dict(_extra.get(\"cache\") or {})\n"
+    '                    _cache["no-cache"] = True\n'
+    '                    _extra["cache"] = _cache\n'
+    '                    call_kwargs["extra_body"] = _extra\n'
+    "                    # Only nudge a temperature the caller actually set, so\n"
+    "                    # models that reject the parameter keep their kwargs clean.\n"
+    '                    if call_kwargs.get("temperature") is not None:\n'
+    '                        call_kwargs["temperature"] = min(\n'
+    '                            1.0, float(call_kwargs["temperature"]) + 0.3\n'
+    "                        )\n"
+    "                    backoff = min(initial_backoff * (2**attempt), max_backoff)\n"
+)
+
+n = s.count(ANCHOR)
+assert n == 1, (
+    f"switchroom hindsight perturbed-JSON-retry patch: anchor found {n}x (expected 1) in "
+    "engine/providers/litellm_llm.py — upstream reformatted the JSONDecodeError retry "
+    "handler; re-author this patch in docker/Dockerfile.hindsight."
+)
+assert s.count("call_kwargs = self._build_common_kwargs(") >= 1, (
+    "switchroom hindsight perturbed-JSON-retry patch: `call_kwargs` no longer names the "
+    "request dict in litellm_llm.py — re-author this patch."
+)
+
+s = s.replace(ANCHOR, REPL, 1)
+f.write_text(s)
+
+t = f.read_text()
+assert t.count('_cache["no-cache"] = True') == 1, "switchroom hindsight perturbed-JSON-retry patch: cache bypass missing after patch"
+assert t.count('call_kwargs["extra_body"] = _extra') == 1, "switchroom hindsight perturbed-JSON-retry patch: extra_body assignment missing after patch"
+assert t.count(ANCHOR) == 0, "switchroom hindsight perturbed-JSON-retry patch: unpatched handler still present"
+import ast
+ast.parse(t)
+print("switchroom hindsight perturbed-JSON-retry patch: invalid-JSON retries now bypass the proxy response cache and raise temperature instead of replaying the identical request")
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

@@ -3,9 +3,14 @@
 
 SessionStart calls into ``drain()`` to retry any retain payloads that
 ``session_end.py`` queued on failure (#1071). Each entry is retried up
-to ``MAX_ATTEMPTS`` (5) times; after that it's renamed to ``.dead`` so
-the queue no longer drains it but the operator can still inspect via
-``switchroom doctor``.
+to ``MAX_ATTEMPTS`` (5) times; after that a **permanently** failing entry
+(a 4xx that a re-POST cannot fix — see ``pending.is_permanent_failure``)
+is renamed to ``.dead`` so the queue no longer drains it but the operator
+can still inspect via ``switchroom doctor``. An entry failing on anything
+else — a 5xx, a timeout, a connection error — stays queued past the
+attempt budget: a transient upstream is never evidence that the memory
+is unsaveable, and retiring it would lose content the user believes was
+saved.
 
 Boundaries
 ----------
@@ -36,8 +41,7 @@ accumulated backlog. Worse, they CREATE one: the per-entry timeout is
 clamped to the remaining hook budget (1-8s) while ``_retry_one`` posts
 synchronously and a real retain takes 30-90s, so **the server commits the
 document and the client always gives up before the ack**. The entry is
-never deleted and is re-posted on every session start, forever, until it
-hits ``MAX_ATTEMPTS`` and goes ``.dead``. The queue depth was a symptom
+never deleted and is re-posted on every session start. The queue depth was a symptom
 of that loop, not of lost memory: a full sweep of 5,751 queued entries on
 this fleet (2026-07-25) found **4,048 (70.4%) already existed as
 documents**, 3,815 of them with facts extracted.
@@ -95,6 +99,7 @@ from lib.pending import (
     MAX_ATTEMPTS,
     archive_reconciled,
     is_content_derived_document_id,
+    is_permanent_failure,
     iter_entries,
     mark_dead,
     update_attempt,
@@ -358,16 +363,35 @@ def _record_failure(
     """Apply the per-entry failure policy. Returns the error class name.
 
     Shared by the sequential (SessionStart) and backlog drains so both age
-    entries toward ``.dead`` on exactly the same schedule.
+    entries toward ``.dead`` on exactly the same schedule — and, since the
+    permanence gate below, refuse to retire them on exactly the same rule.
     """
     err_class = type(e).__name__
     attempts = int(entry.get("attempt_count", 1))
-    if attempts >= MAX_ATTEMPTS:
+    # ``.dead`` retires a memory the user believes was saved, so it is gated on
+    # the failure being PERMANENT — a 4xx that re-POSTing cannot fix. A
+    # transient failure keeps its attempt counter climbing but stays queued,
+    # because an exhausted attempt budget is not evidence that the content is
+    # unpersistable.
+    #
+    # Before this gate, ANY five failures retired the entry. The dominant
+    # failure on this fleet is an HTTP 500 "Fact extraction failed … chunk 0:
+    # JSONDecodeError" — the extraction model returned an empty or non-JSON
+    # completion for one chunk on that sampling run. The identical content
+    # succeeds on a later attempt, so five unlucky samples were destroying
+    # memories that were never unsaveable. See ``pending.is_permanent_failure``.
+    #
+    # Nothing here becomes unbounded: the queue's own MAX_ENTRIES / MAX_BYTES
+    # caps still shed the oldest entries into ``pending-evicted/`` (an archive,
+    # not a delete), and ``switchroom doctor`` still surfaces queue depth.
+    # Those are the disk bounds; the attempt counter never was one.
+    if attempts >= MAX_ATTEMPTS and is_permanent_failure(e):
         marker = mark_dead(path, entry)
         summary["dead"] += 1
         print(
             f"[Hindsight] drain_pending: entry exceeded {MAX_ATTEMPTS} "
-            f"attempts, marking dead at {marker} (last error: {err_class}: {e})",
+            f"attempts on a permanent failure, marking dead at {marker} "
+            f"(last error: {err_class}: {e})",
             file=sys.stderr,
         )
     else:
@@ -375,7 +399,12 @@ def _record_failure(
         summary["retried"] += 1
         debug_log(
             config,
-            f"drain_pending: retry {attempts}/{MAX_ATTEMPTS} failed for {path} ({err_class}: {e})",
+            # ``attempts`` can now exceed MAX_ATTEMPTS — a transient failure
+            # keeps the entry queued past the budget instead of retiring it —
+            # so print the budget as a threshold, not as a fraction that would
+            # render the nonsense "retry 7/5".
+            f"drain_pending: retry {attempts} (budget {MAX_ATTEMPTS}) failed "
+            f"for {path} ({err_class}: {e})",
         )
     return err_class
 

@@ -10,7 +10,10 @@ entry into the bounded ``pending-reconciled/`` archive (the drain never
 deletes — see "Retiring an entry" below for that promise and its one
 bound, a full disk), failure bumps an attempt
 counter (up to MAX_ATTEMPTS) and leaves the entry for the run after
-that.
+that. Exhausting MAX_ATTEMPTS retires the entry to ``.dead`` only when
+the failure is PERMANENT (``is_permanent_failure`` — a 4xx a re-POST
+cannot fix). A transient failure never retires the memory, however many
+attempts it has burned.
 
 Layout
 ------
@@ -146,9 +149,11 @@ daemon runs one sequential extraction LLM call per ``retain_chunk_size``
 chars, so an entry above the derived content bound cannot complete inside
 ANY client deadline — including the 280s out-of-hook backlog deadline that
 ``drain_pending._backlog_timeout()`` now takes from the same derivation.
-Such an entry fails every drain, burns its ``MAX_ATTEMPTS``, and is
-renamed ``.dead``: the mechanism that stranded 154 of the 629 entries in
-the 2026-07-25 fleet backlog. Note this is orthogonal to the re-post loop
+Such an entry fails every drain and burns its ``MAX_ATTEMPTS``: the
+mechanism that stranded 154 of the 629 entries in the 2026-07-25 fleet
+backlog. (It is no longer renamed ``.dead`` for that — a client-side
+timeout is not a permanent failure — but it still never drains until it
+is split, so splitting remains the fix.) Note this is orthogonal to the re-post loop
 #3599 fixed — a presence GET retires an oversized entry for free when the
 document IS already durable; splitting is what makes the entry drainable
 when it is NOT. Part document_ids are deterministic, so a part already
@@ -1025,6 +1030,74 @@ def update_attempt(path: str, entry: dict, error: BaseException) -> bool:
         return True
     except OSError:
         return False
+
+
+#: HTTP statuses that are 4xx but describe a TRANSIENT condition, so they
+#: must be read as retryable despite the 4xx class.
+_RETRYABLE_4XX = frozenset({408, 425, 429})
+
+
+def is_permanent_failure(error: BaseException) -> bool:
+    """True when ``error`` can never succeed on a later identical retry.
+
+    This is the gate on ``mark_dead`` (see ``drain_pending._record_failure``).
+    Getting it wrong in the permissive direction costs a re-POST — which is an
+    upsert, so it costs time. Getting it wrong in the strict direction costs
+    the USER'S MEMORY. So the rule is deliberately asymmetric: an error is
+    permanent only when we can positively identify it as a client-side defect
+    in the request itself. Everything we cannot classify is retryable.
+
+    PERMANENT — a 4xx other than 408/425/429. The server understood us and
+    rejected the request: a malformed payload, an unknown bank, an oversized
+    body, a bad token. Re-POSTing the identical bytes reproduces it exactly,
+    so attempts are pure waste and ``.dead`` is the honest outcome.
+
+    RETRYABLE — everything else. Notably 5xx, which is what a failed
+    fact-extraction surfaces as::
+
+        HTTP 500 ...: {"detail": "Fact extraction failed: 1/1 chunks failed.
+        First failures: chunk 0: JSONDecodeError: Expecting value: line 1
+        column 1 (char 0)"}
+
+    That 500 means the extraction model returned an empty or non-JSON
+    completion for one chunk (measured 2026-07-26: Ollama returning
+    ``content: ""`` with all-zero usage, and gpt-oss-20b emitting a numbered
+    prose list instead of the JSON schema). It is a property of one sampling
+    run, NOT of the queued content — the very same entry succeeds on a later
+    attempt. Counting it toward ``MAX_ATTEMPTS`` is what turned a flaky model
+    into permanently lost memories: five unlucky samples and a real memory
+    went ``.dead``.
+
+    Timeouts, connection resets, DNS failures and anything unrecognised are
+    retryable for the same reason — none of them is evidence that the content
+    can never be persisted.
+
+    The fleet bears this out. A census of every ``.dead`` marker on this host
+    (2026-07-26, 129 markers across 10 agents) found the retiring error was
+    ``TimeoutError`` 128 times and ``URLError`` once. **Not one was a 4xx.**
+    Every permanently-lost memory here was lost to a transient failure, so
+    this gate would have kept all 129 queued and drainable. Two were retired
+    at 00:56Z that same morning — this was live, not historical.
+
+    ``client.HindsightClient._request`` re-raises ``urllib`` HTTP failures as
+    ``RuntimeError(f"HTTP {code} from {url}: {body}")`` with the original
+    ``HTTPError`` chained on ``__cause__``, so the status is read from the
+    cause when present and parsed out of the message otherwise (the message
+    form is what a de-chained/re-serialised error leaves behind).
+    """
+    code = getattr(error, "code", None)
+    cause = getattr(error, "__cause__", None)
+    if not isinstance(code, int) and cause is not None:
+        code = getattr(cause, "code", None)
+    if not isinstance(code, int):
+        text = str(error)
+        if text.startswith("HTTP "):
+            head = text[5:].split(" ", 1)[0]
+            if head.isdigit():
+                code = int(head)
+    if not isinstance(code, int):
+        return False
+    return 400 <= code < 500 and code not in _RETRYABLE_4XX
 
 
 def mark_dead(path: str, entry: dict) -> Optional[str]:

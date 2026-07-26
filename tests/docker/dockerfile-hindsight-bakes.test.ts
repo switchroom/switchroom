@@ -624,6 +624,43 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the perturbed-JSON-retry fix (assert-guarded, fail-loud)", () => {
+    // Upstream's `except json.JSONDecodeError` handler re-issued the SAME
+    // call_kwargs, so behind a caching LiteLLM proxy every "retry" replayed
+    // the identical unparseable body (measured 2026-07-26: 0.02s and the same
+    // response id on the repeat, vs 37.66s and a new id once the cache was
+    // bypassed). That is how a transient bad completion burned all attempts
+    // and failed a retain — which in turn aged a queued memory toward .dead.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight perturbed-JSON-retry patch: anchor found \{n\}x/,
+    );
+    // The load-bearing perturbation: bypass the PROXY response cache. It must
+    // travel in `extra_body` — litellm's top-level `cache=` kwarg is consumed
+    // by the SDK and never reaches the wire (measured, same run).
+    expect(dockerfile).toMatch(/_cache\["no-cache"\] = True/);
+    expect(dockerfile).toMatch(/call_kwargs\["extra_body"\] = _extra/);
+    // Secondary perturbation, and only when the caller already set one, so
+    // models that reject the parameter keep their kwargs untouched.
+    expect(dockerfile).toMatch(
+      /if call_kwargs\.get\("temperature"\) is not None:/,
+    );
+    // Guard the identifier the patch body depends on.
+    expect(dockerfile).toMatch(
+      /assert s\.count\("call_kwargs = self\._build_common_kwargs\("\) >= 1,/,
+    );
+    // Post-replace re-assertions (verification-on-build), including a parse
+    // check so a bad splice fails the build rather than the container.
+    expect(dockerfile).toMatch(
+      /assert t\.count\(ANCHOR\) == 0, "switchroom hindsight perturbed-JSON-retry patch: unpatched handler still present"/,
+    );
+    expect(dockerfile).toMatch(/^ast\.parse\(t\)$/m);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight perturbed-JSON-retry patch: invalid-JSON retries now bypass the proxy response cache/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
