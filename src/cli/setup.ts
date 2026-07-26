@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync, copyFileSync, readFileSync, mkdirSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { resolve, dirname } from "node:path";
 import { loadConfig, resolveAgentsDir, resolvePath, findConfigFile, ConfigError } from "../config/loader.js";
@@ -42,6 +43,7 @@ import {
   pickHindsightPorts,
   preflightHindsightPorts,
   type LiteLLMHindsightConfig,
+  type DockerProbe,
 } from "../setup/hindsight.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
 import {
@@ -61,6 +63,14 @@ import {
   setAgentSupergroupChatId,
 } from "./supergroup-setup-yaml.js";
 import { setSwitchroomTimezone } from "./timezone-setup-yaml.js";
+import {
+  waitForAgentContainerUp,
+  verifyFleetContainers,
+  hasFatal,
+  SetupVerificationError,
+  type VerifyFinding,
+} from "../setup/verify.js";
+import type { ContainerRow } from "./doctor-docker.js";
 import { detectServerTimezone } from "../config/timezone.js";
 import { isValidTimezone } from "../config/schema.js";
 
@@ -69,7 +79,17 @@ const STEP_ACTIVE = chalk.blue("->");
 const STEP_DONE = chalk.green("OK");
 
 function stepHeader(num: number, title: string, status: string): void {
-  console.log(`\n${status} ${chalk.bold(`Step ${num}:`)} ${title}`);
+  stepHeaderTo((line) => console.log(line), num, title, status);
+}
+
+/** stepHeader with an injectable sink (tests capture output). */
+function stepHeaderTo(
+  log: (line: string) => void,
+  num: number,
+  title: string,
+  status: string,
+): void {
+  log(`\n${status} ${chalk.bold(`Step ${num}:`)} ${title}`);
 }
 
 /**
@@ -180,32 +200,67 @@ export function registerSetupCommand(program: Command): void {
         await stepGoogleWorkspace(config, nonInteractive);
 
         // ── Step 13: Verification ────────────────────────────────
-        await stepVerification(config, nonInteractive);
+        // Throws (→ exit 1) when the fleet is demonstrably broken.
+        const verdict = await stepVerification(config, nonInteractive);
 
         await captureEvent("setup_completed", {
           agent_count: Object.keys(config.agents).length,
           interactive: !nonInteractive,
+          verified: verdict === "verified",
         });
 
-        console.log(
-          chalk.bold.green("\n  Setup complete!") +
-            chalk.gray(" Your agents are ready.\n"),
-        );
+        // The closing line must not claim more than the verification step
+        // actually proved (install-path review H7).
+        if (verdict === "verified") {
+          console.log(
+            chalk.bold.green("\n  Setup complete!") +
+              chalk.gray(" Your agents are running.\n"),
+          );
+        } else {
+          console.log(
+            chalk.bold.yellow("\n  Setup finished — config written, fleet not started yet.") +
+              chalk.gray(" Follow the steps above to bring it up.\n"),
+          );
+        }
       } catch (err) {
         await captureException(err, { action: "setup" });
-        if (err instanceof ConfigError) {
-          console.error(chalk.red(`\nConfig error: ${err.message}`));
-          if (err.details) {
-            for (const d of err.details) {
-              console.error(chalk.gray(d));
-            }
-          }
-          process.exit(1);
-        }
-        console.error(chalk.red(`\nSetup failed: ${(err as Error).message}`));
-        process.exit(1);
+        process.exit(reportSetupFailure(err));
       }
     });
+}
+
+/**
+ * Print a setup failure and return the process exit code.
+ *
+ * Split out of the action so the exit contract is testable: EVERY failure
+ * path — including a failed verification — must return non-zero, so a
+ * scripted/CI install (`switchroom setup --non-interactive && ...`) stops
+ * instead of sailing past a dead fleet (install-path review H7).
+ */
+export function reportSetupFailure(
+  err: unknown,
+  log: (line: string) => void = (line) => console.error(line),
+): number {
+  if (err instanceof SetupVerificationError) {
+    // The per-check rows were already printed by the verification step;
+    // keep the exit message short and point at doctor.
+    log(
+      chalk.red(
+        "\nSetup did NOT complete: verification failed (see the rows above).",
+      ),
+    );
+    log(chalk.gray("Diagnose with: switchroom doctor"));
+    return 1;
+  }
+  if (err instanceof ConfigError) {
+    log(chalk.red(`\nConfig error: ${err.message}`));
+    if (err.details) {
+      for (const d of err.details) log(chalk.gray(d));
+    }
+    return 1;
+  }
+  log(chalk.red(`\nSetup failed: ${err instanceof Error ? err.message : String(err)}`));
+  return 1;
 }
 
 // ─── Step 1: Config File ─────────────────────────────────────────────────────
@@ -942,10 +997,17 @@ async function resolveLiteLLMForHindsight(
   };
 }
 
-async function stepMemoryBackend(
+/** Injectable seams for the memory-backend step (tests: no docker needed). */
+export interface MemoryBackendDeps {
+  /** Docker probe passed to `isDockerAvailable` / container checks. */
+  dockerProbe?: DockerProbe;
+}
+
+export async function stepMemoryBackend(
   config: SwitchroomConfig,
   nonInteractive: boolean,
   switchroomConfigPath: string,
+  deps: MemoryBackendDeps = {},
 ): Promise<void> {
   stepHeader(6, "Memory backend", STEP_ACTIVE);
 
@@ -1041,24 +1103,44 @@ async function stepMemoryBackend(
     }
   }
 
-  // Check Docker availability
-  if (!isDockerAvailable()) {
+  // Check Docker availability.
+  //
+  // Pre-H7 this printed a GREEN `OK Manual setup pending` and returned — so
+  // a host with no Docker (where nothing in the fleet can run) still saw a
+  // successful step and a "Setup complete!" at the end. Hindsight is the
+  // default memory backend and it is a container; if Docker is absent the
+  // step did not succeed, so say so and fail. (Compatible with the
+  // hindsight-default-on direction in
+  // docs/proposed/hindsight-litellm-integration-audit-2026-07-26.md item 5:
+  // "a hard, named failure with a resume instruction". The opt-out below is
+  // the documented escape hatch for a Docker-less machine.)
+  if (!isDockerAvailable(deps.dockerProbe)) {
+    console.log(chalk.red("  x Docker is not available on this system."));
     console.log(
-      chalk.yellow("  Docker is not available on this system."),
+      chalk.gray(
+        "  Hindsight memory runs as a Docker container (and so does every agent).",
+      ),
     );
-    console.log(chalk.gray("  Install Docker, then re-run `switchroom setup`."));
-    console.log(chalk.green(`  ${STEP_DONE} Manual setup pending`));
-    return;
+    console.log(
+      chalk.gray(
+        "  Install Docker, then re-run `switchroom setup` — or re-run with " +
+          "SWITCHROOM_MEMORY_BACKEND=none to skip memory setup.",
+      ),
+    );
+    throw new Error(
+      "Memory backend setup failed: Docker is not available. Install Docker and " +
+        "re-run `switchroom setup`, or set SWITCHROOM_MEMORY_BACKEND=none to skip it.",
+    );
   }
 
   // Check if already running
-  if (isHindsightRunning()) {
+  if (isHindsightRunning(deps.dockerProbe)) {
     console.log(chalk.green(`  ${STEP_DONE} Hindsight container already running (switchroom-hindsight)`));
     return;
   }
 
   // Check if container exists but is stopped
-  if (isHindsightContainerExists()) {
+  if (isHindsightContainerExists(deps.dockerProbe)) {
     console.log(chalk.gray("  Found stopped switchroom-hindsight container, removing..."));
     stopHindsight();
   }
@@ -1134,7 +1216,7 @@ async function stepMemoryBackend(
       console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
     }
 
-    if (isHindsightRunning()) {
+    if (isHindsightRunning(deps.dockerProbe)) {
       spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (switchroom-hindsight)`));
       console.log(chalk.gray(`  API: http://localhost:${ports.apiPort}/mcp`));
       console.log(chalk.gray(`  UI:  http://localhost:${ports.uiPort}`));
@@ -1885,48 +1967,161 @@ async function stepGoogleWorkspace(
   }
 }
 
-// ─── Step 12: Verification ───────────────────────────────────────────────────
+// ─── Step 13: Verification ───────────────────────────────────────────────────
 
-async function stepVerification(
+/**
+ * Injectable seams for the verification step. Tests drive the whole step
+ * without docker, without a `switchroom` binary on PATH, and without
+ * wall-clock waits.
+ */
+export interface VerificationDeps {
+  /** `docker ps -a` rows; null when docker is unreachable. */
+  listContainers?: () => ContainerRow[] | null;
+  /** Poll sleep — no-op in tests. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Runs `switchroom agent start <name>`; throws on failure. */
+  startAgent?: (name: string) => void;
+  /** Interactive "start it now?" prompt. */
+  confirmStart?: (name: string) => Promise<boolean>;
+  /** Output sink (defaults to console.log). */
+  log?: (line: string) => void;
+  timeoutMs?: number;
+  intervalMs?: number;
+  stableSamples?: number;
+}
+
+function defaultStartAgent(name: string): void {
+  // Keep shelling out to the `switchroom` CLI (not lifecycle.startAgent
+  // directly) so the operator gets the same reconcile-then-start path
+  // `switchroom agent start` performs. Errors propagate: a missing binary
+  // (ENOENT) or a non-zero exit is a real verification failure now, not a
+  // yellow shrug.
+  execFileSync("switchroom", ["agent", "start", name], { stdio: "inherit" });
+}
+
+/**
+ * Final step: prove something, or fail loudly.
+ *
+ * Pre-H7 this printed four manual instructions and an unconditional green
+ * `OK Verification steps ready`, and swallowed an `agent start` failure in a
+ * bare `catch {}` — so the wizard reported success on a host where nothing
+ * was running. Now:
+ *
+ *   - a start we attempted must produce a container that comes up AND stays
+ *     up (`waitForAgentContainerUp`), otherwise the step fails;
+ *   - the fleet's container runtime is checked with doctor's own
+ *     `checkContainerRuntimeHealth` (crash-loop / stuck-Created signature);
+ *   - docker being unreachable is a failure, not a footnote;
+ *   - "not up yet" (the normal state on a first install, where `setup` runs
+ *     before `apply`) is reported as PENDING in yellow — never as a green OK.
+ *
+ * Throws `SetupVerificationError` on any fatal finding; the wizard's action
+ * handler turns that into a non-zero exit so scripted installs stop here.
+ */
+export async function stepVerification(
   config: SwitchroomConfig,
   nonInteractive: boolean,
-): Promise<void> {
-  stepHeader(13, "Verification", STEP_ACTIVE);
+  deps: VerificationDeps = {},
+): Promise<"verified" | "pending"> {
+  const log = deps.log ?? ((line: string) => console.log(line));
+  stepHeaderTo(log, 13, "Verification", STEP_ACTIVE);
 
   const agentNames = Object.keys(config.agents);
   const firstName = agentNames[0];
-  const firstAgent = config.agents[firstName];
+  const firstAgent = firstName ? config.agents[firstName] : undefined;
 
-  console.log(chalk.gray("  To verify your setup:"));
-  console.log(chalk.gray(`    1. Start an agent:  switchroom agent start ${firstName}`));
-  console.log(chalk.gray(`    2. Check status:    switchroom agent list`));
-  console.log(
-    chalk.gray(
-      `    3. Send a message in the "${firstAgent.topic_name}" topic`,
-    ),
-  );
-  console.log(chalk.gray("    4. Check auth:      switchroom auth list"));
+  const findings: VerifyFinding[] = [];
 
-  if (!nonInteractive) {
-    const startNow = await askYesNo(
-      `\n  Start ${chalk.cyan(firstName)} now?`,
-      false,
-    );
+  // ── Optionally start the first agent, and hold that start to account ──
+  if (!nonInteractive && firstName) {
+    const confirm =
+      deps.confirmStart ??
+      ((name: string) => askYesNo(`\n  Start ${chalk.cyan(name)} now?`, false));
+    const startNow = await confirm(firstName);
     if (startNow) {
+      const start = deps.startAgent ?? defaultStartAgent;
+      let started = true;
       try {
-        const { execFileSync } = await import("node:child_process");
-        console.log(chalk.gray(`  Starting ${firstName}...`));
-        execFileSync("switchroom", ["agent", "start", firstName], { stdio: "inherit" });
-        console.log(chalk.green(`  ${STEP_DONE} Agent started`));
-      } catch {
-        console.log(
-          chalk.yellow(
-            `  Could not start automatically. Run: switchroom agent start ${firstName}`,
-          ),
+        log(chalk.gray(`  Starting ${firstName}...`));
+        start(firstName);
+      } catch (err) {
+        started = false;
+        findings.push({
+          name: `${firstName}: agent start`,
+          status: "fail",
+          detail: `\`switchroom agent start ${firstName}\` failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          fix:
+            "If the compose file does not exist yet, run `switchroom apply` " +
+            `first, then \`switchroom agent start ${firstName}\`.`,
+        });
+      }
+      if (started) {
+        log(chalk.gray(`  Waiting for ${firstName} to come up...`));
+        findings.push(
+          await waitForAgentContainerUp(firstName, deps, {
+            timeoutMs: deps.timeoutMs,
+            intervalMs: deps.intervalMs,
+            stableSamples: deps.stableSamples,
+          }),
         );
       }
     }
   }
 
-  console.log(chalk.green(`  ${STEP_DONE} Verification steps ready`));
+  // ── Fleet runtime health (doctor's own check) ──────────────────────────
+  findings.push(...verifyFleetContainers(config, deps));
+
+  for (const f of findings) {
+    if (f.status === "ok") {
+      log(chalk.green(`  ${STEP_DONE} ${f.name}: ${f.detail}`));
+    } else if (f.status === "pending") {
+      log(chalk.yellow(`  .. ${f.name}: ${f.detail}`));
+    } else {
+      log(chalk.red(`  x  ${f.name}: ${f.detail}`));
+    }
+    if (f.fix && f.status !== "ok") log(chalk.gray(`     ${f.fix}`));
+  }
+
+  if (hasFatal(findings)) {
+    log(chalk.red("\n  Verification FAILED — your fleet is not healthy."));
+    throw new SetupVerificationError(findings);
+  }
+
+  // Only reached when nothing is broken. Still honest about what was NOT
+  // proven: a pending fleet gets the checklist, not a success claim.
+  if (findings.some((f) => f.status === "pending")) {
+    log(chalk.yellow("\n  Setup wrote your config, but the fleet is not verified yet."));
+    log(chalk.gray("  Finish with:"));
+    log(chalk.gray("    1. switchroom apply"));
+    log(
+      chalk.gray(
+        "    2. docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d",
+      ),
+    );
+    if (firstName) {
+      log(chalk.gray(`    3. switchroom agent list   # ${firstName} should be running`));
+      if (firstAgent) {
+        log(
+          chalk.gray(
+            `    4. Send a message in the "${firstAgent.topic_name}" topic`,
+          ),
+        );
+      }
+    }
+    log(chalk.gray("    5. switchroom doctor"));
+    return "pending";
+  }
+
+  log(chalk.green(`  ${STEP_DONE} Verified: the fleet is running`));
+  if (firstAgent) {
+    log(
+      chalk.gray(
+        `  Try it: send a message in the "${firstAgent.topic_name}" topic ` +
+          "(auth: `switchroom auth list`, health: `switchroom doctor`).",
+      ),
+    );
+  }
+  return "verified";
 }

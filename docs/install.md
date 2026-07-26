@@ -247,6 +247,18 @@ agents, and MCP wireup, and prints actionable fixes.
   during setup — switchroom is trying to write to its own install dir.
   Tracked work; see the install-validation follow-up that moves profile
   rendering to a user-writable cache dir.
+- **`Memory backend setup failed: Docker is not available`** — the memory
+  backend (Hindsight) is a container, and so is every agent, so setup stops
+  instead of pretending it succeeded. Install Docker and re-run, or re-run
+  with `SWITCHROOM_MEMORY_BACKEND=none` to skip memory setup.
+- **`Setup did NOT complete: verification failed`** — the final step now
+  checks the real thing: docker is reachable, no switchroom container is
+  crash-looping or stuck, and an agent you asked it to start actually came
+  up and stayed up. Setup exits non-zero in that case (so scripted installs
+  stop). The rows above the message name what failed; `switchroom doctor`
+  and `docker logs switchroom-<agent> --tail 50` are the next steps.
+  A fleet that simply isn't up yet is reported as *pending*, not a failure —
+  that's the normal state right after Step 3.
 - **Telegram bot doesn't reply** — `switchroom agent logs assistant -f`
   and `switchroom doctor`. The most common cause is OAuth not yet
   completed (`switchroom auth list` — confirm an account is present

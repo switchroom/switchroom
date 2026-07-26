@@ -325,8 +325,14 @@ export type DockerPsDeps = {
   listContainers: () => ContainerRow[] | null;
 };
 
-/** Default (real) implementation — calls docker ps. */
-function defaultListContainers(): ContainerRow[] | null {
+/**
+ * Default (real) implementation — calls docker ps.
+ *
+ * Exported so other surfaces that need the SAME container-state snapshot
+ * (the setup wizard's verification step, `src/setup/verify.ts`) reuse this
+ * probe instead of shelling out to docker with slightly different flags.
+ */
+export function listSwitchroomContainers(): ContainerRow[] | null {
   const r = spawnSync(
     "docker",
     [
@@ -345,7 +351,7 @@ function defaultListContainers(): ContainerRow[] | null {
   });
 }
 
-const DEFAULT_DOCKER_PS_DEPS: DockerPsDeps = { listContainers: defaultListContainers };
+const DEFAULT_DOCKER_PS_DEPS: DockerPsDeps = { listContainers: listSwitchroomContainers };
 
 /**
  * Check runtime container health for the 2026-06-23 incident class.
