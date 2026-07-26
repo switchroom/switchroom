@@ -786,10 +786,11 @@ function glanceLine(rows: CombinedWorkerRow[]): string {
  *      **→ {newest step}**
  *   _+M more working…_
  *
- * INDENT: every step line carries a leading `WORKER_STEP_INDENT` (a U+00A0 run,
- * NOT ASCII spaces — Telegram drops leading ASCII whitespace) so the steps nest
- * under their worker header and the per-worker blocks are scannable. Header and
- * chrome lines stay at the left margin.
+ * INDENT: every step line carries a leading `WORKER_STEP_INDENT` (a U+2800 run
+ * — neither ASCII spaces nor U+00A0; Telegram left-trims BOTH, see the
+ * constant's doc comment) so the steps nest under their worker header and the
+ * per-worker blocks are scannable. Header and chrome lines stay at the left
+ * margin.
  *
  * NUMBERING (#3298): when the card tracks 2+ rows AND a row carries `ordinal`,
  * its header gets a stable `{ordinal}. ` prefix. Ordinals are assigned by the
@@ -879,9 +880,10 @@ export function renderCombinedWorkerFeed(
       // WORKER_STEP_INDENT nests every step line one level under its worker
       // header, so the boundary between two workers is visible at a glance on a
       // phone (the header lines stay at the left margin, their steps sit in).
-      // It is a U+00A0 run, not ASCII spaces — Telegram's server-side markdown
-      // parser drops leading ASCII whitespace and would render the indent flat.
-      // See the constant's doc comment for the evidence.
+      // It is a U+2800 run. NOT ASCII spaces and NOT U+00A0: Telegram's
+      // server-side parser left-trims a leading Unicode-whitespace run, so both
+      // render flat (#3662 shipped U+00A0 and was inert). U+2800 is category So,
+      // not Zs. See the constant's doc comment for the live evidence.
       const esc = hist.slice(-depth).map(escapeStepLine)
       renderStepFeed(bodyOut, esc, false, '', depth, WORKER_STEP_INDENT)
     }
