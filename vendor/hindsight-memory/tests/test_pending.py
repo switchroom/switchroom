@@ -40,7 +40,7 @@ class PendingQueueTest(unittest.TestCase):
             "bank_id": "test-bank",
             # Distinct per document: the queue's dedupe key is
             # (bank_id, part_position, sha256(content)) since switchroom
-            # #3691, so a shared body would collapse these into one entry.
+            # #3688, so a shared body would collapse these into one entry.
             "content": f"user: hello\nassistant: hi ({document_id})",
             "document_id": document_id,
             "context": "claude-code",

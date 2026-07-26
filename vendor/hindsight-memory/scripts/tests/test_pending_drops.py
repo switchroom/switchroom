@@ -482,7 +482,7 @@ class DedupeTest(_QueueTempDirMixin, unittest.TestCase):
         """No content => identity cannot be established => never merge.
 
         This used to key off ``document_id``. It does not any more
-        (switchroom #3691): the id varies per enqueue for the producer that
+        (switchroom #3688): the id varies per enqueue for the producer that
         dominates this queue, so it was never a usable identity. Content is.
         """
         p = _payload()
@@ -501,7 +501,7 @@ class DedupeTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(pending.count(), 1)
 
     def test_same_content_under_a_fresh_document_id_is_ONE_entry(self):
-        """THE bug (switchroom #3691), pinned as an outcome.
+        """THE bug (switchroom #3688), pinned as an outcome.
 
         Measured on the live fleet 2026-07-26: 1,060 queued files, ~368
         distinct ``(bank_id, part_position, sha256(content))`` groups. The top

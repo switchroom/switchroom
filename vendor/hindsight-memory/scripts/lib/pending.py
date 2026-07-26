@@ -83,7 +83,7 @@ it does not get the credit for that number.)
 
 **Same bank + same position in a split + byte-identical content is the
 same memory.** The key is ``(bank_id, part_position, sha256(content))``;
-the rest of ``document_id`` is deliberately NOT in it (switchroom #3691).
+the rest of ``document_id`` is deliberately NOT in it (switchroom #3688).
 Including the whole id made the guard a near-no-op against the producer
 that actually fills this queue: ``subagent_retain.py`` embeds the
 sub-agent's own session id in the document id
@@ -821,7 +821,7 @@ def _dupe_key(entry: dict) -> Optional[str]:
     each other while duplicate re-enqueues of the SAME position still do.
 
     The WHOLE ``document_id`` used to be the key's dominant term and is not
-    any more (switchroom #3691) — see the module docstring for the
+    any more (switchroom #3688) — see the module docstring for the
     measurement that forced it and for the exact cost. Short version: the
     id varies per enqueue for the producer that dominates this queue
     (``subagent_retain.py`` embeds the sub-agent session id), so an
