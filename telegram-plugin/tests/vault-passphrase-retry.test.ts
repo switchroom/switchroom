@@ -28,42 +28,71 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from 'grammy'
 import { InlineKeyboard } from 'grammy'
-import {
-  createCallbackQueryHandlers,
-  isPassphraseMismatchBrokerError,
-  buildAccessPassphrasePromptText,
-  MAX_VAULT_PASSPHRASE_ATTEMPTS,
-  type CallbackQueryHandlersDeps,
-  type PendingVaultRequestAccess,
-  type PendingVaultRequestSave,
-  type PendingSecretRequest,
-  type ArmedSecretCapture,
-  type PendingMentalModelPropose,
-  type DeferredSecret,
-  type PendingVaultOp,
+import type {
+  CallbackQueryHandlersDeps,
+  PendingVaultRequestAccess,
+  PendingVaultRequestSave,
+  PendingSecretRequest,
+  ArmedSecretCapture,
+  PendingMentalModelPropose,
+  DeferredSecret,
+  PendingVaultOp,
 } from '../gateway/callback-query-handlers.js'
-import { interceptVault, type InboundInterceptorDeps } from '../gateway/inbound-interceptors.js'
+import type { InboundInterceptorDeps } from '../gateway/inbound-interceptors.js'
 import { createSweepableCardStore } from '../gateway/approval-card-stores.js'
 import { createSweepableStore } from '../gateway/pending-state-stores.js'
 import { StagingMap } from '../secret-detect/staging.js'
 
+/** Queued mint outcomes + recorded calls for the mocked broker client. */
+const brokerState = {
+  mintResults: [] as Array<Record<string, unknown>>,
+  mintCalls: [] as Array<Record<string, unknown>>,
+}
+
 // The broker client is the only seam mocked: every mint goes through it, and
-// the wrong-passphrase signal we retry on IS its error message. The spy state
-// is created inside the factory and re-exported as a test handle (no
-// `vi.hoisted` — bun's vitest-compat layer doesn't implement it, and CI runs
-// parts of this dir under `bun test`).
+// the wrong-passphrase signal we retry on IS its error message.
+//
+// Runner note: this file runs under BOTH vitest and `bun test tests` (CI's
+// bun-test-run sweeps the whole dir — telegram-plugin/scripts/bun-test-ci.sh).
+// vitest hoists `vi.mock` above the imports; bun's compat layer does NOT, so
+// the modules under test are imported LAZILY below (top-level await), after
+// the mock is registered. The spy state lives outside the factory for the same
+// reason — a `__state` re-export can't be read through a static import that
+// bun already bound to the real module. No `vi.hoisted` either (bun's compat
+// layer doesn't implement it).
 vi.mock('../../src/vault/broker/client.js', () => {
-  const state = {
-    /** Queued mint outcomes, consumed one per mint call. */
-    mintResults: [] as Array<Record<string, unknown>>,
-    mintCalls: [] as Array<Record<string, unknown>>,
-  }
+  // Every RUNTIME export of the real module has to be present: a factory mock
+  // REPLACES the module, and bun resolves named imports eagerly (a missing one
+  // is a hard `SyntaxError: Export named 'x' not found` at import time, not a
+  // lazy undefined). The ones this suite doesn't model throw if reached, so a
+  // test can never silently depend on an unstubbed broker call.
+  const notStubbed = (name: string) =>
+    vi.fn(() => {
+      throw new Error(`broker client ${name}() is not stubbed in this suite`)
+    })
   return {
-    __state: state,
+    defaultBrokerSocketPath: vi.fn(() => '/tmp/vault-retry-test.sock'),
+    resolveBrokerSocketPath: vi.fn(() => '/tmp/vault-retry-test.sock'),
+    brokerIsComposeManaged: vi.fn(() => false),
+    // Mirrors the real formula (src/vault/broker/client.ts:151) so the
+    // token write under test lands in this suite's scratch dir.
+    vaultTokenFilePath: vi.fn((slug: string) =>
+      `${process.env.SWITCHROOM_AGENTS_DIR ?? '/nonexistent'}/${slug}/.vault-token`,
+    ),
+    readVaultTokenFile: vi.fn(() => null),
+    VaultTokenRejectedError: class VaultTokenRejectedError extends Error {},
+    createBrokerClient: notStubbed('createBrokerClient'),
+    rpcRaw: notStubbed('rpcRaw'),
+    getViaBrokerStructured: notStubbed('getViaBrokerStructured'),
+    putViaBroker: notStubbed('putViaBroker'),
+    getViaBroker: notStubbed('getViaBroker'),
+    statusViaBroker: notStubbed('statusViaBroker'),
+    lockViaBroker: notStubbed('lockViaBroker'),
+    unlockViaBroker: notStubbed('unlockViaBroker'),
     mintGrantViaBroker: vi.fn(async (args: Record<string, unknown>) => {
-      state.mintCalls.push(args)
+      brokerState.mintCalls.push(args)
       return (
-        state.mintResults.shift() ?? {
+        brokerState.mintResults.shift() ?? {
           kind: 'ok',
           token: 'vgt_test',
           id: 'vg_abc123',
@@ -78,21 +107,28 @@ vi.mock('../../src/vault/broker/client.js', () => {
     revokeGrantViaBroker: vi.fn(async () => ({ kind: 'ok' })),
   }
 })
-import * as brokerClient from '../../src/vault/broker/client.js'
 
-const brokerState = (brokerClient as unknown as {
-  __state: { mintResults: Array<Record<string, unknown>>; mintCalls: Array<Record<string, unknown>> }
-}).__state
+const {
+  createCallbackQueryHandlers,
+  isPassphraseMismatchBrokerError,
+  buildAccessPassphrasePromptText,
+  MAX_VAULT_PASSPHRASE_ATTEMPTS,
+} = await import('../gateway/callback-query-handlers.js')
+const { interceptVault } = await import('../gateway/inbound-interceptors.js')
 
 /** The broker's real wrong-passphrase wire message (server.ts:2166-2172). */
 const MISMATCH_MSG = "supplied passphrase does not match the broker's unlocked passphrase"
 
 const CHAT = '111'
 
-// A grant success writes `~/.switchroom/agents/<agent>/.vault-token`; point
-// HOME at a scratch dir so no test ever touches the real fleet state.
+// A grant success writes the agent's `.vault-token`; point the agents dir at
+// a scratch tmpdir so no test can touch real fleet state. SWITCHROOM_AGENTS_DIR
+// (not HOME) is the durable lever here: bun's `os.homedir()` snapshots the
+// process's startup HOME and ignores a later `process.env.HOME` assignment, so
+// a HOME override is silently INEFFECTIVE under `bun test` — the runner CI
+// sweeps this directory with.
 beforeEach(() => {
-  process.env.HOME = mkdtempSync(join(tmpdir(), 'vault-retry-test-'))
+  process.env.SWITCHROOM_AGENTS_DIR = mkdtempSync(join(tmpdir(), 'vault-retry-test-'))
   brokerState.mintResults.length = 0
   brokerState.mintCalls.length = 0
 })

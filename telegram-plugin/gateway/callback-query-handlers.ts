@@ -37,8 +37,7 @@
 
 import { execFileSync } from 'child_process'
 import { mkdirSync, writeFileSync } from 'fs'
-import { homedir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { InlineKeyboard, type Context } from 'grammy'
 import { richMessage } from '../rich-send.js'
 import { finalizeCallback } from '../inline-keyboard-callbacks.js'
@@ -48,6 +47,7 @@ import {
   listViaBroker,
   listGrantsViaBroker,
   revokeGrantViaBroker,
+  vaultTokenFilePath,
 } from '../../src/vault/broker/client.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -700,9 +700,13 @@ async function handleVaultRecentDenialCallback(ctx: Context, data: string): Prom
   // vault grant wizard. The agent restarts in the background pick up
   // the new token via SWITCHROOM_AGENT_NAME on next CLI invocation.
   const { token, id } = result
-  const tokenPath = join(homedir(), '.switchroom', 'agents', agentName, '.vault-token')
+  // #3627: the path formula lives in the broker client (the module that
+  // MINTS the token and later reads it back), so the gateway can't drift from
+  // it — the inline `homedir()` copy this replaces silently ignored
+  // SWITCHROOM_AGENTS_DIR, writing tokens where the reader wouldn't look.
+  const tokenPath = vaultTokenFilePath(agentName)
   try {
-    mkdirSync(join(homedir(), '.switchroom', 'agents', agentName), { recursive: true })
+    mkdirSync(dirname(tokenPath), { recursive: true })
     writeFileSync(tokenPath, token, { mode: 0o600 })
   } catch (err) {
     await switchroomReply(
@@ -1122,9 +1126,11 @@ async function performVaultAccessApproval(
   }
 
   const { token, id } = result
-  const tokenPath = join(homedir(), '.switchroom', 'agents', pending.agent, '.vault-token')
+  // #3627: single source of truth for the token path (see the note on the
+  // deferred-secret write above) — honours SWITCHROOM_AGENTS_DIR.
+  const tokenPath = vaultTokenFilePath(pending.agent)
   try {
-    mkdirSync(join(homedir(), '.switchroom', 'agents', pending.agent), { recursive: true })
+    mkdirSync(dirname(tokenPath), { recursive: true })
     writeFileSync(tokenPath, token, { mode: 0o600 })
   } catch (err) {
     await switchroomReply(
@@ -2464,9 +2470,10 @@ async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<P
   }
   // Write token to the agent's .vault-token file
   const { token, id } = result
-  const tokenPath = join(homedir(), '.switchroom', 'agents', state.agent!, '.vault-token')
+  // #3627: same single source of truth as the other two token writes.
+  const tokenPath = vaultTokenFilePath(state.agent!)
   try {
-    mkdirSync(join(homedir(), '.switchroom', 'agents', state.agent!), { recursive: true })
+    mkdirSync(dirname(tokenPath), { recursive: true })
     writeFileSync(tokenPath, token, { mode: 0o600 })
   } catch (err) {
     await switchroomReply(ctx, `**Grant created but token write failed:** ${escapeHtmlForTg(String(err))}`, { html: true })
