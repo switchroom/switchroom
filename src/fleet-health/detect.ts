@@ -112,8 +112,11 @@ export interface AgentScanResult {
   gw_hits: Record<GatewaySignal, number>;
   /** #3702 — how many of this agent's turns delivered at least one landed
    *  message id the read-back probe never corroborated (`landed_unconfirmed >
-   *  0`). Reported in the digest so the fleet can watch the rate at which a
-   *  delivery is called `complete` on the Bot API's ack alone. Deliberately NOT
+   *  0`). Available on the scan result for a future digest — no consumer reads
+   *  `ScanResult.perAgent` yet, so the durable per-turn `landed_unconfirmed`
+   *  field on `turns.jsonl` is currently the only way to watch the rate at
+   *  which a delivery is called `complete` on the Bot API's ack alone
+   *  (surfacing the aggregate is filed as follow-up). Deliberately NOT
    *  part of `escalate` and NOT a `Finding` — an inconclusive probe is not a
    *  failure; it is the measurement that tells us if that assumption ever
    *  breaks. */
