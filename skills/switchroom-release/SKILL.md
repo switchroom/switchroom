@@ -88,7 +88,14 @@ The tag push triggers `docker-images` and `release`. `release` internally waits 
 
 ### Gate A — docker images (`docker-images.yml`)
 - `gh run list --workflow=docker-images.yml --limit 1` — wait for `completed` / `success`.
-- Verify all 6 images are published: `docker manifest inspect ghcr.io/switchroom/<image>:vX.Y.Z` for `agent`, `auth-broker`, `kernel`, `broker`, `web`, `hostd`. Each must resolve.
+- Verify all 6 images are published. The repository name is `switchroom-<name>`, **not** `<name>` — `.github/workflows/docker-images.yml` builds `${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image.name }}`, so `ghcr.io/switchroom/agent` does not exist and returns `manifest unknown`. Check each of:
+  ```bash
+  for n in agent auth-broker kernel broker web hostd; do
+    docker manifest inspect "ghcr.io/switchroom/switchroom-$n:vX.Y.Z" >/dev/null \
+      && echo "OK   switchroom-$n" || echo "MISS switchroom-$n"
+  done
+  ```
+  Each must resolve.
 - If any image is missing: do NOT roll — the rollout canary version-assert fails on an unpublished tag. Wait + re-check. `release` will block on this by itself, so a red image build means npm never publishes and the release never leaves draft. That is the design.
 
 ### Gate B — the release pipeline (`release.yml`)
@@ -140,6 +147,8 @@ gh workflow run release.yml -R switchroom/switchroom --ref vX.Y.Z -f dry_run=fal
 ```
 
 It re-runs every leg — including `finalize`, which is what actually takes the release out of draft. Re-running one leg on its own generally leaves the release stuck as a draft.
+
+**But a re-dispatch cannot fix a defect that lives in the tag's own tree.** `workflow_dispatch` executes the workflow YAML **at the dispatched ref**, so `--ref vX.Y.Z` re-runs the same broken file and fails identically, every time. This is not theoretical — it is how v0.19.20 died (#3691). Before reaching for the re-dispatch, root-cause the failure in the workflow source **at that tag** (`git show vX.Y.Z:.github/workflows/release.yml`) and compare it to `main`. If the bug is in the tag's tree, the only path is a fix merged to `main` plus a **fresh tag**; abandon the old tag as a permanent draft (do not delete it, do not hand-publish it) and burn a patch version. Re-dispatch is for *transient* failures — a flaky runner, an npm 5xx, a `docker-images` run that has since gone green.
 
 - **`release` failed at `guard` ("no GitHub Release exists"):** step 2b was skipped or the tag name is misspelled. Create the draft release, then re-dispatch as above.
 - **`release` failed at `images-gate`:** `docker-images` was not green for this tag+commit. Fix it, `gh workflow run docker-images.yml --ref vX.Y.Z`, wait for green, then re-dispatch `release.yml`. Nothing was published to npm and the release is still a draft — nothing to undo.
