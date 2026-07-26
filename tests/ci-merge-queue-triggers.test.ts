@@ -10,6 +10,13 @@
  * ever produced, and every enqueued PR sat in `AWAITING_CHECKS` until
  * `check_response_timeout_minutes: 60` ejected it. Nothing could merge.
  *
+ * The queue was switched back OFF the same day to unblock `main` (as of
+ * 2026-07-26 the ruleset has no `merge_queue` rule). These assertions are
+ * therefore a PRECONDITION, not a description of live behaviour: they are
+ * what makes it safe to turn the queue on again. Do not delete them
+ * because "we don't use a merge queue" — that is exactly the state in
+ * which the next person turns it on and wedges `main` a second time.
+ *
  * Why this test has to exist: EVERY invariant below is invisible on a
  * pull request. A PR run exercises the `pull_request` paths only; the
  * `merge_group` paths are exercised for the first time when the PR is

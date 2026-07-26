@@ -1,9 +1,19 @@
 # Merge queue — how CI reports on `gh-readonly-queue/...` refs
 
-Ruleset **16470166** (`main branch protection`) enables a GitHub merge
-queue with `merge_method: SQUASH`, `grouping_strategy: ALLGREEN`,
-`max_entries_to_build: 5` and `check_response_timeout_minutes: 60`. Its
-required status checks are exactly:
+> **Current state (verified 2026-07-26 13:20 AEST):** the merge queue is
+> **OFF**. Ruleset **16470166** (`main branch protection`) carries only
+> `deletion`, `non_fast_forward` and `required_status_checks` — there is
+> no `merge_queue` rule, and `repository.mergeQueue(branch:"main")` is
+> `null`. It was enabled earlier that day, wedged `main` for the reason
+> below, and was switched back off to unblock merging. **This document
+> and the `merge_group:` triggers it describes are the prerequisite for
+> turning it back on safely** — they are inert while it is off, and they
+> are what stops the outage recurring when it is turned on.
+
+Ruleset **16470166** (`main branch protection`) requires exactly these
+status checks (verified live against the ruleset — if this table and the
+ruleset ever disagree, the ruleset wins and
+`tests/ci-merge-queue-triggers.test.ts` must be updated to match):
 
 | context | workflow | job |
 |---|---|---|
@@ -20,7 +30,8 @@ When a PR is enqueued, GitHub pushes a temporary
 **`merge_group`** event. It then waits for those seven contexts to report
 **on that ref**. A workflow that only triggers on `pull_request` + `push`
 never runs there, so the contexts are never produced and the entry sits in
-`AWAITING_CHECKS` until the 60-minute timeout **ejects** it.
+`AWAITING_CHECKS` until `check_response_timeout_minutes` **ejects** it
+(60 minutes as the queue was configured on 2026-07-26).
 
 Every workflow producing a required context therefore carries a
 `merge_group:` trigger. `tests/ci-merge-queue-triggers.test.ts` enforces
@@ -44,9 +55,9 @@ path-gated. **There is no path filtering on a queue ref**, deliberately:
   gives `dorny/paths-filter` a new way to *fail* — and a failed `changes`
   job hard-fails the sentinel by design, recreating the exact outage this
   file exists to prevent.
-- With `ALLGREEN` + `max_entries_to_merge: 5`, one queue ref can carry
-  several PRs. "Changed paths" is a fuzzier question for a batch than for
-  a PR.
+- Under the `ALLGREEN` grouping strategy a single queue ref can carry
+  several PRs at once. "Which paths changed" is a fuzzier question for a
+  batch than it is for one PR.
 - The repo's existing policy for `push: main` is already "always run,
   don't gamble on main". A queue ref **is** candidate main.
 
@@ -59,9 +70,9 @@ Two deliberate exceptions, neither of which lowers the bar:
 - **`ci-uat.yml`'s `uat-gate-run`** — the only required-context ancestor
   bound to `[self-hosted, uat-host]`, a single machine. A queue entry has
   no "it'll pick up in a minute": a busy or unregistered runner stalls the
-  entry until the 60-min timeout ejects it, taking the train with it, and
-  each entry would burn live subscription quota on a real Telegram
-  round-trip. Independently of that policy call, its gate reads
+  entry until the check-response timeout ejects it, taking the train with
+  it, and each entry would burn live subscription quota on a real
+  Telegram round-trip. Independently of that policy call, its gate reads
   `needs.changes.outputs.relevant`, which is **empty** on a queue ref, so
   it skips on its own merits no matter how `UAT_GATE_ENABLED` is set —
   don't rest this exception on the variable's current value.
@@ -84,8 +95,8 @@ workflows. Two reasons:
 - Cancelling a workflow whose sentinel is `if: always()` is the **#3614**
   orphan-wedge shape: the sentinel can survive the cancel stuck in
   `queued`, never reaching a terminal state, pinning the concurrency group
-  and starving the ref. On a queue ref that would burn the whole 60-minute
-  window with no self-service recovery.
+  and starving the ref. On a queue ref that would burn the entire
+  check-response window with no self-service recovery.
 
 The group **key** needed no change: every one of the seven already keys on
 `github.ref`, which on a `merge_group` run is the queue's own
@@ -122,12 +133,25 @@ of bug as the #2816 non-main-dispatch follow-up. Queue builds tag
   seven is produced directly by a job in its own workflow on the
   triggering event.
 - `ci-evals.yml`, `ci-full.yml`, `ci-tests-race-long.yml`,
-  `ci-claude-latest-canary.yml`, `npm-publish.yml`, `promote.yml` produce
-  no required context.
+  `ci-claude-latest-canary.yml`, `npm-publish.yml`, `promote.yml` and
+  `release.yml` produce no required context. That is the complete
+  remainder: the seven workflows above plus these seven are all 14.
 
 ## Diagnosing a stuck queue
 
 ```bash
+# Is the queue even enabled? null == off (it is off as of 2026-07-26).
+gh api graphql -f query='
+  { repository(owner:"switchroom", name:"switchroom") {
+      mergeQueue(branch:"main") { id configuration {
+        mergeMethod mergingStrategy checkResponseTimeout
+      } } } }'
+
+# Do the ruleset's required contexts still match MERGE-QUEUE.md + the test?
+gh api repos/switchroom/switchroom/rulesets/16470166 \
+  --jq '.rules[] | select(.type=="required_status_checks")
+        | .parameters.required_status_checks[].context'
+
 # Is anything listening for merge_group at all?
 gh run list --event merge_group --limit 10
 
