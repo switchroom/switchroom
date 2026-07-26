@@ -141,4 +141,16 @@ describe('#3278 createBackstopReadBack — full gate+edit+classify wiring', () =
     const readBack = createBackstopReadBack(wiring({ gate, editMessageText }))
     expect(await readBack(0, [55], 'answer')).toBe('ambiguous')
   })
+
+  test('gate NO-OP drop (resolves undefined) ⇒ ambiguous, NOT a false exists', async () => {
+    // The gate's edit path drops a repeat of the last payload it actually sent
+    // (`counters.dropped`) and drops an expired queue entry, resolving
+    // `undefined` in both cases. Nothing reached Telegram, so nothing was
+    // proven — classifying it `exists` would fabricate a confirmation from a
+    // call that never happened.
+    const gate = vi.fn(async () => undefined)
+    const editMessageText = vi.fn(async () => true)
+    const readBack = createBackstopReadBack(wiring({ gate, editMessageText }))
+    expect(await readBack(0, [55], 'answer')).toBe('ambiguous')
+  })
 })

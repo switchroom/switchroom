@@ -611,7 +611,14 @@ export function createBackstopReadBack(
     }
     try {
       const r = await w.gate(() => w.editMessageText(messageId, body, editApiOpts), gateOpts)
-      return w.isShed(r) ? 'ambiguous' : 'exists'
+      // A shed resolves the SEND_GATE_SHED sentinel; a gate no-op drop (the
+      // identical payload is already the last one sent for this message id) or
+      // an expired queue entry resolves `undefined`. In BOTH cases the edit
+      // never reached Telegram, so there is no evidence of existence —
+      // `ambiguous`, never a fabricated `exists`. Only a real API result
+      // (grammy resolves `true` or the edited Message) proves presence.
+      if (w.isShed(r) || r === undefined) return 'ambiguous'
+      return 'exists'
     } catch (err) {
       return classifyReadBackError(err)
     }
