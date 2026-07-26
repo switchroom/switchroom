@@ -81,7 +81,10 @@ export default defineConfig({
     // regrow one new test at a time. `npm run lint:auth-test-hermeticity`
     // fails if this entry is removed or the guard stops covering a file
     // that needs it.
-    setupFiles: ["./tests/vitest-setup/auth-net-guard.mjs"],
+    setupFiles: [
+      "./tests/vitest-setup/auth-net-guard.mjs",
+      "./tests/vitest-setup/agent-state-dir-guard.mjs",
+    ],
     pool: "forks",
     poolOptions: {
       forks: {
@@ -332,6 +335,11 @@ export default defineConfig({
       // status-query-telemetry.test.ts uses bun:test (truthful-telemetry PR) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/status-query-telemetry.test.ts",
+      // agent-state-dir-preload.test.ts is the runtime alarm for the BUN half
+      // of the state-dir guard (bunfig.toml `[test] preload`) — it must run
+      // under bun by definition. The vitest half is pinned by
+      // tests/agent-state-dir-guard.test.ts.
+      "**/telegram-plugin/tests/agent-state-dir-preload.test.ts",
     ],
     coverage: {
       provider: "v8",
