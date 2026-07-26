@@ -61,3 +61,31 @@ export const STATUS_CARD_CHAR_BUDGET = RICH_MESSAGE_MAX_CHARS
 
 /** Indent marker for a nested (foreground sub-agent) step line. */
 export const NESTED_PREFIX = '   ↳ '
+
+/**
+ * Left indent for a step line rendered UNDER a worker header on the combined
+ * (2+ worker) card — three NON-BREAKING spaces (U+00A0), written as escapes so
+ * the bytes are visible in source.
+ *
+ * ── Why NBSP and not three ASCII spaces ───────────────────────────────────
+ * Card bodies reach Telegram as raw GFM markdown (`richMessage` →
+ * `sendRichMessage` / `editMessageText({ markdown })`, #2669) and are parsed
+ * SERVER-SIDE by a CommonMark/GFM-family parser. That parser strips leading
+ * ASCII spaces/tabs from a paragraph line (and 4+ of them would instead open
+ * an indented CODE block), so an ASCII indent renders FLAT —
+ * `reference/telegram-formatting-guide.md` states it outright: "Telegram drops
+ * leading whitespace". `NESTED_PREFIX` above is not a counter-example — its
+ * three ASCII spaces are dropped too; the visible cue there is the `↳` glyph.
+ *
+ * U+00A0 is NOT stripped: it is ordinary text content to that parser. That is
+ * the same property the outbound paragraph spacer rests on — a U+00A0-only
+ * line survives as a real paragraph where an ASCII-blank line is discarded,
+ * live-verified on this exact rich path in #2692 and re-verified in #3229.
+ *
+ * Deliberately NOT the guide's other indent idiom, the blockquote (`> `): card
+ * lines are joined by `stackCardLines`, which promotes EVERY inter-line break
+ * to a GFM hard break *because* card lines are never block-structure lines. A
+ * `> ` prefix breaks that precondition, and the next worker's header line
+ * would be absorbed into the quote as a lazy continuation.
+ */
+export const WORKER_STEP_INDENT = '\u00A0\u00A0\u00A0'

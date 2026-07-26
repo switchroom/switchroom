@@ -89,6 +89,7 @@ import {
   WORKER_HISTORY_MAX,
   STATUS_LINE_MAX,
   NESTED_PREFIX,
+  WORKER_STEP_INDENT,
 } from './status-no-truncate.js'
 import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
@@ -297,6 +298,11 @@ function escapeStepLine(raw: string): string {
  * `allDone`    — when true ALL steps render done (✓ struck italic); when false the
  *                newest renders in-progress (→ bold)
  * `liveSuffix` — appended INSIDE the newest in-progress line (heartbeat tick)
+ * `indent`     — literal prefix put on EVERY emitted line (incl. the
+ *                `+N earlier…` header), OUTSIDE the markdown spans so it never
+ *                lands inside an emphasis run. Default `''` — byte-identical
+ *                output for callers that don't indent. The combined worker card
+ *                passes `WORKER_STEP_INDENT` to nest steps under their worker.
  */
 export function renderStepFeed(
   out: string[],
@@ -304,14 +310,19 @@ export function renderStepFeed(
   allDone: boolean,
   liveSuffix = '',
   window: number = STATUS_ROLLING_LINES,
+  indent = '',
 ): void {
   if (steps.length === 0) return
   const shown = steps.slice(-Math.max(1, window))
   const hidden = steps.length - shown.length
-  if (hidden > 0) out.push(`_✓ +${hidden} earlier…_`)
+  if (hidden > 0) out.push(`${indent}_✓ +${hidden} earlier…_`)
   const lastIdx = shown.length - 1
   shown.forEach((s, i) => {
-    out.push(!allDone && i === lastIdx ? `**→ ${s}${liveSuffix}**` : `~~_✓ ${s}_~~`)
+    out.push(
+      !allDone && i === lastIdx
+        ? `${indent}**→ ${s}${liveSuffix}**`
+        : `${indent}~~_✓ ${s}_~~`,
+    )
   })
 }
 
@@ -735,11 +746,16 @@ export const workerHistoryDepth = combinedHistoryDepth
  *
  *   🛠 **Workers** · _N running_
  *   **1. {desc1}** _· {elapsed} · {n} tools_
- *   ~~_✓ {earlier step}_~~
- *   **→ {newest step}**
+ *      ~~_✓ {earlier step}_~~
+ *      **→ {newest step}**
  *   **2. {desc2}** _· {elapsed} · {n} tools_
- *   **→ {newest step}**
+ *      **→ {newest step}**
  *   _+M more working…_
+ *
+ * INDENT: every step line carries a leading `WORKER_STEP_INDENT` (a U+00A0 run,
+ * NOT ASCII spaces — Telegram drops leading ASCII whitespace) so the steps nest
+ * under their worker header and the per-worker blocks are scannable. Header and
+ * chrome lines stay at the left margin.
  *
  * NUMBERING (#3298): when the card tracks 2+ rows AND a row carries `ordinal`,
  * its header gets a stable `{ordinal}. ` prefix. Ordinals are assigned by the
@@ -808,7 +824,7 @@ export function renderCombinedWorkerFeed(
       bodyOut.push(rowHeader(r))
       const hist = rowHistory(r)
       if (hist.length === 0) {
-        bodyOut.push('→ _starting…_')
+        bodyOut.push(`${WORKER_STEP_INDENT}→ _starting…_`)
         continue
       }
       // Paint the last-K history lines with the SAME `✓`/`→` idiom as the
@@ -816,8 +832,15 @@ export function renderCombinedWorkerFeed(
       // pipeline (escapeStepLine), then renderStepFeed strikes the prior steps
       // and bolds the newest in-progress step. The window equals the depth so a
       // per-worker `+N earlier…` marker never appears inside the combined feed.
+      //
+      // WORKER_STEP_INDENT nests every step line one level under its worker
+      // header, so the boundary between two workers is visible at a glance on a
+      // phone (the header lines stay at the left margin, their steps sit in).
+      // It is a U+00A0 run, not ASCII spaces — Telegram's server-side markdown
+      // parser drops leading ASCII whitespace and would render the indent flat.
+      // See the constant's doc comment for the evidence.
       const esc = hist.slice(-depth).map(escapeStepLine)
-      renderStepFeed(bodyOut, esc, false, '', depth)
+      renderStepFeed(bodyOut, esc, false, '', depth, WORKER_STEP_INDENT)
     }
     const out = [...chrome, ...bodyOut]
     if (hidden > 0) out.push(`_+${hidden} more working…_`)

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   createWorkerActivityFeed,
+  renderWorkerActivity,
   type BotApiForWorkerFeed,
   type WorkerActivityView,
 } from '../worker-activity-feed.js'
 import { renderCombinedWorkerFeed, combinedHistoryDepth } from '../tool-activity-summary.js'
-import { STATUS_CARD_CHAR_BUDGET } from '../status-no-truncate.js'
+import { STATUS_CARD_CHAR_BUDGET, WORKER_STEP_INDENT } from '../status-no-truncate.js'
+import { richMessage } from '../rich-send.js'
+import { parseRichEntities, validateRichMarkdown } from './rich-markdown-oracle.js'
 import { createSendGate, isSendGateShed, type Clock } from '../send-gate.js'
 
 /**
@@ -1233,5 +1236,109 @@ describe('worker numbering — stable per-card ordinals end to end (#3298)', () 
     await h.feed.update('a', 'chat', view('task alpha', 'same step', 0))
     await drain()
     expect(h.edits.length).toBe(landed)
+  })
+})
+
+// ── Per-worker step indent on the combined card ───────────────────────────────
+//
+// The multi-worker card put its `✓`/`→` step lines at the SAME left margin as
+// the numbered worker header lines, so where one worker ended and the next
+// began was invisible at a glance (operator report, 2026-07). Steps now nest
+// one level under their worker.
+//
+// The indent MUST be a U+00A0 run, not ASCII spaces: card bodies go to Telegram
+// as raw GFM markdown (`richMessage` → `sendRichMessage` /
+// `editMessageText({ markdown })`, #2669) and are parsed server-side by a
+// CommonMark/GFM-family parser that DROPS leading ASCII whitespace (see
+// `reference/telegram-formatting-guide.md`, and #2692/#3229 where a U+00A0-only
+// line survives as a real paragraph while an ASCII-blank one is discarded). So
+// these tests assert the indent bytes, not merely "the line is indented" —
+// an ASCII-space indent would look right in a string and render flat on a phone.
+describe('combined worker card — steps indent under their worker (U+00A0)', () => {
+  const NBSP = '\u00A0'
+  const rowsFor = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      description: `worker task ${i + 1}`,
+      elapsedMs: 60_000 * (i + 1),
+      toolCount: 3,
+      ordinal: i + 1,
+      currentStep: `w${i + 1} step b`,
+      historyLines: [`w${i + 1} step a`, `w${i + 1} step b`],
+    }))
+
+  /** Card lines as sent (the body is hard-break joined by stackCardLines). */
+  const linesOf = (body: string) => body.split('\n').map((l) => l.replace(/[ \t]+$/, ''))
+
+  it('every step line starts with the U+00A0 indent; header and chrome lines do not', () => {
+    const body = renderCombinedWorkerFeed(rowsFor(3), { maxRows: 8 })!
+    const lines = linesOf(body)
+    const stepLines = lines.filter((l) => l.includes('✓ w') || l.includes('→ w'))
+    const headerLines = lines.filter((l) => /\*\*\d\. worker task/.test(l))
+
+    expect(stepLines.length).toBe(6) // 3 workers × 2 steps
+    expect(headerLines.length).toBe(3)
+    // Load-bearing: the exact indent bytes. `WORKER_STEP_INDENT` is U+00A0 ×3;
+    // a plain-ASCII `'   '` indent fails this assertion, as does today's
+    // pre-fix flat output (which had no prefix at all).
+    for (const l of stepLines) {
+      expect(l.startsWith(WORKER_STEP_INDENT)).toBe(true)
+      expect(l.startsWith(NBSP)).toBe(true)
+      expect(l.startsWith(' ')).toBe(false)
+    }
+    // Workers stay at the left margin so the nesting reads as nesting.
+    for (const l of headerLines) expect(l.startsWith(NBSP)).toBe(false)
+    expect(lines[0].startsWith('🛠')).toBe(true)
+  })
+
+  it('WORKER_STEP_INDENT contains no ASCII space or tab (Telegram would drop it)', () => {
+    expect(WORKER_STEP_INDENT.length).toBeGreaterThan(0)
+    expect(/^[\u00A0]+$/.test(WORKER_STEP_INDENT)).toBe(true)
+  })
+
+  it('the `starting…` placeholder line is indented too', () => {
+    const body = renderCombinedWorkerFeed(
+      [
+        { description: 'fresh worker', elapsedMs: 1000, toolCount: 0, ordinal: 1, currentStep: '' },
+        ...rowsFor(1),
+      ],
+      { maxRows: 8 },
+    )!
+    const starting = linesOf(body).find((l) => l.includes('starting…'))!
+    expect(starting).toBeDefined()
+    expect(starting.startsWith(WORKER_STEP_INDENT)).toBe(true)
+    expect(starting.startsWith(NBSP)).toBe(true)
+  })
+
+  it('the indent survives the real outbound guard chain byte-for-byte and stays parseable', () => {
+    const body = renderCombinedWorkerFeed(rowsFor(3), { maxRows: 8 })!
+    // `richMessage` is the ONE adapter every `{ markdown }` wire send funnels
+    // through (rich-send.ts) — it must not escape, strip, or rewrite the indent.
+    const wire = richMessage(body).markdown
+    expect(wire).toBe(body)
+    expect(wire.includes(`${WORKER_STEP_INDENT}**→ w1 step b**`)).toBe(true)
+    expect(wire.includes(`${NBSP}**→ w1 step b**`)).toBe(true)
+    // Independent CommonMark/GFM oracle: still well-formed on the rich path.
+    expect(validateRichMarkdown(wire)).toEqual([])
+    // …and the indent stays OUTSIDE the entities — it must not leak into the
+    // bold/strike spans (which would render the NBSPs inside the styled text).
+    const ents = parseRichEntities(wire)
+    expect(ents.some((e) => e.type === 'bold' && e.text === '→ w1 step b')).toBe(true)
+    expect(ents.some((e) => e.type === 'strikethrough' && e.text === '_✓ w1 step a_')).toBe(true)
+    expect(ents.every((e) => !e.text.includes(NBSP))).toBe(true)
+  })
+
+  it('the SINGLE-worker 🛠 card is untouched (no indent on its step lines)', () => {
+    const single = renderWorkerActivity({
+      workerId: 'w1',
+      description: 'lone worker',
+      latestSummary: 'step b',
+      narrativeLines: ['step a', 'step b'],
+      elapsedMs: 60_000,
+      toolCount: 3,
+      state: 'running',
+    })
+    expect(single).toContain('~~_✓ step a_~~')
+    expect(single).toContain('**→ step b**')
+    expect(single.includes(NBSP)).toBe(false)
   })
 })
