@@ -203,8 +203,13 @@ class PendingQueueTest(unittest.TestCase):
             self.assertNotIn(
                 "dead_at", e, "a live queue entry must never carry dead_at"
             )
-        # The .dead marker exists and carries dead_at.
-        dead = path + ".dead"
+        # The .dead marker exists and carries dead_at. It lives in the
+        # `pending-dead/` SIBLING, not in the live queue directory: a marker
+        # is the only remaining copy of its memory, and the queue dir is the
+        # one external janitors glob (switchroom #3697).
+        dead = os.path.join(
+            pending_mod.dead_dir(), os.path.basename(path) + ".dead"
+        )
         self.assertTrue(os.path.isfile(dead))
         with open(dead) as f:
             self.assertIn("dead_at", json.load(f))

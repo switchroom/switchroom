@@ -500,6 +500,36 @@ def dead_dir() -> str:
     return os.environ.get("HINDSIGHT_PENDING_DEAD_DIR") or _sibling("pending-dead")
 
 
+def _retired_under(name: str) -> Optional[str]:
+    """Which archive sibling holds the retired queue entry ``name``, or ``None``.
+
+    An entry that vanished from the live queue mid-drain did NOT necessarily
+    get evicted. There is no mutex around the queue directory —
+    ``lib/pacing.py``'s ``retain-inflight.lock`` is a per-POST storm guard and
+    ``drain_pending.py`` takes no lock at all — so an in-hook ``drain()`` in
+    another process can retire the very entry this one is working on into
+    ``pending-reconciled/`` (memory confirmed durable upstream) between two
+    syscalls here. "Gone from the queue" therefore has to be RESOLVED, not
+    assumed: the difference between reconciled and evicted is the difference
+    between a memory that reached the bank and one that was shed, and callers
+    stamp the permanent-loss ledger off that distinction.
+
+    Search order is the archives that can hold a whole entry. ``mark_dead``
+    appends ``.dead`` to the name, so that spelling is checked too.
+    """
+    for d in (
+        evicted_dir(),
+        reconciled_dir(),
+        duplicate_dir(),
+        dead_dir(),
+        _sibling("pending-corrupt"),
+    ):
+        for candidate in (name, name + ".dead"):
+            if os.path.exists(os.path.join(d, candidate)):
+                return d
+    return None
+
+
 def evictions_log_path() -> str:
     """Append-only eviction ledger.
 
@@ -813,6 +843,24 @@ def resplit_over_bound_entries() -> tuple[int, int]:
     original. Counting that as a part archived a live memory into a capped
     archive while logging "into 0 queued part(s)".
 
+    NEW, and STILL LIVE, for the same reason. A part written early in the
+    loop can be FIFO-shed by a later part once the queue is at its cap, and
+    ``pending-evicted/`` is not re-drained by anything, so a shed part is a
+    slice of the memory that will not reach the bank. It is counted as shed
+    (named on its own stderr line) rather than as a queued part: the
+    ``(entries, parts)`` tuple feeds phase 0c's summary, and a summary that
+    counts evicted parts as drainable work is the same lie one level down.
+
+    WHERE THE ORIGINAL WENT is resolved, never assumed. The archive move
+    failing with the original already gone from the queue is usually
+    ``_evict_to_fit`` shedding it, but an unsynchronised in-hook ``drain()``
+    can equally have reconciled it away in the same window — see
+    ``_retired_under``. The two mean opposite things for the deferred
+    per-part drops (shed: the missing part is genuinely lost; reconciled:
+    the whole memory is already durable upstream and the missing part is a
+    copy that was not made), so the ledger is stamped off the resolved
+    destination rather than off the failure alone.
+
     A refusal here does NOT stamp the drop ledger
     (``record_refusal_as_drop=False``): the ledger means permanently lost and
     `switchroom doctor` fails on it, but the original is still queued and is
@@ -841,6 +889,7 @@ def resplit_over_bound_entries() -> tuple[int, int]:
 
         payload = {k: v for k, v in entry.items() if k not in _ENTRY_ONLY_FIELDS}
         d = _ensure_dir()
+        name = os.path.basename(path)
         before = set(_list_entries(d))
         deferred: list = []
         _first, returned = enqueue_parts(
@@ -852,58 +901,110 @@ def resplit_over_bound_entries() -> tuple[int, int]:
             record_refusal_as_drop=False,
             deferred_drops=deferred,
         )
+        after = set(_list_entries(d))
         # New FILES only. A queue-depth delta would be wrong in both
         # directions: 0 when a part deduped onto an existing entry (the
         # single-part case dedupes onto the original itself), and understated
         # whenever `_evict_to_fit` shed an entry to make room for a part.
-        written = len([p for p in returned if os.path.basename(p) not in before])
-        if written == 0:
+        fresh = [
+            os.path.basename(p) for p in returned if os.path.basename(p) not in before
+        ]
+        # ...and of those, only the ones STILL LIVE. A part written early in
+        # the loop can be FIFO-shed by a LATER part of the same memory when
+        # the queue is at its cap — `enqueue_parts` documents that trade — and
+        # the shed part lands in `pending-evicted/`, which nothing re-drains
+        # (every consumer only counts or trims it). Calling it a "queued part"
+        # is the same class of log-lie as the "STAYS QUEUED" line below: the
+        # operator reads N parts queued when N-1 are.
+        shed = sorted(n for n in fresh if n not in after)
+        queued = len(fresh) - len(shed)
+        # `queued == 0 while fresh` cannot arise through `_evict_to_fit` (it
+        # evicts to make room FOR the incoming part, so the last part written
+        # always survives), but the guard is on the LIVE count regardless:
+        # archiving the original is only safe once something of it is
+        # actually in the queue.
+        if queued == 0:
             print(
                 f"[Hindsight] pending: could not re-split "
-                f"{os.path.basename(path)} ({len(content)} chars, bound "
+                f"{name} ({len(content)} chars, bound "
                 f"{limit}) — entry STAYS QUEUED (never deleted)",
                 file=sys.stderr,
             )
             continue
+        if shed:
+            print(
+                f"[Hindsight] pending: re-split {name} wrote {len(fresh)} "
+                f"part(s) but the queue was at its cap, so {len(shed)} of "
+                f"them ({', '.join(shed)}) were themselves FIFO-evicted into "
+                f"{evicted_dir()} — nothing re-drains that directory, so only "
+                f"{queued} part(s) of this memory are live",
+                file=sys.stderr,
+            )
 
         dest_dir = resplit_dir()
+        durable_upstream = False
         try:
             os.makedirs(dest_dir, mode=0o700, exist_ok=True)
-            shutil.move(path, os.path.join(dest_dir, os.path.basename(path)))
+            shutil.move(path, os.path.join(dest_dir, name))
         except OSError as e:
             if os.path.exists(path):
                 # The parts are already queued; leaving the original queued
                 # too means the memory is retained twice, which the upsert on
                 # document_id makes harmless. Losing it would not be.
                 print(
-                    f"[Hindsight] pending: re-split {os.path.basename(path)} "
-                    f"into {written} part(s) but could not archive the original "
+                    f"[Hindsight] pending: re-split {name} "
+                    f"into {queued} part(s) but could not archive the original "
                     f"into {dest_dir} ({e}) — it STAYS QUEUED (never deleted)",
                     file=sys.stderr,
                 )
                 continue
-            # The move failed because the original is NO LONGER IN THE QUEUE:
-            # writing the parts filled it and `_evict_to_fit` FIFO-shed the
-            # very entry being re-split (it is the oldest — the parts are all
-            # newer than it). Saying "STAYS QUEUED" here is simply false, and
-            # this is the line an operator reads under exactly that pressure.
-            # Nothing is lost — the parts carry the whole memory and the
-            # original is under `evicted_dir()` — but the entry IS retired
-            # from the live queue, so it counts like an archived one below.
+            # The move failed because the original is NO LONGER IN THE QUEUE.
+            # Saying "STAYS QUEUED" here is simply false, and this is the line
+            # an operator reads under exactly that pressure. WHERE it went is
+            # not assumable, though: the usual cause is `_evict_to_fit`
+            # FIFO-shedding the very entry being re-split (it is the oldest —
+            # the parts are all newer than it), but an unsynchronised in-hook
+            # `drain()` can equally have RECONCILED it away inside the same
+            # window. Those two mean opposite things for the deferred drops,
+            # so resolve the destination instead of naming one.
+            gone_to = _retired_under(name)
+            durable_upstream = gone_to is not None and gone_to == reconciled_dir()
+            if durable_upstream:
+                where = (
+                    f"it is NOT queued: a concurrent drain reconciled it into "
+                    f"{gone_to} while the parts were being written, so the "
+                    f"whole memory is already durable upstream"
+                )
+            elif gone_to is not None:
+                # Only NOW may the reassuring clause be printed. A non-empty
+                # `deferred` is exactly the case where the parts do NOT carry
+                # the whole memory (one never got written), and a non-empty
+                # `shed` the case where one of them is no longer queued.
+                carries = not deferred and not shed
+                where = (
+                    f"it is NOT queued, it is under {gone_to} because writing "
+                    f"the parts filled the queue and it was itself evicted"
+                    + (" (the parts carry the whole memory)" if carries else "")
+                )
+            else:
+                where = (
+                    f"it is NOT queued and no archive sibling holds it either "
+                    f"— it left the live queue by a path this drain cannot "
+                    f"see, so treat the {queued} queued part(s) as the only "
+                    f"copy"
+                )
             print(
-                f"[Hindsight] pending: re-split {os.path.basename(path)} into "
-                f"{written} queued part(s); the original could not be archived "
-                f"into {dest_dir} ({e}) because writing the parts filled the "
-                f"queue and it was itself evicted — it is NOT queued, it is "
-                f"under {evicted_dir()} (the parts carry the whole memory)",
+                f"[Hindsight] pending: re-split {name} into "
+                f"{queued} queued part(s); the original could not be archived "
+                f"into {dest_dir} ({e}) — {where}",
                 file=sys.stderr,
             )
         else:
             _trim_dir(dest_dir, RESPLIT_MAX_ENTRIES, RESPLIT_MAX_BYTES)
             print(
-                f"[Hindsight] pending: re-split {os.path.basename(path)} "
+                f"[Hindsight] pending: re-split {name} "
                 f"({len(content)} chars, over the {limit}-char bound) into "
-                f"{written} queued part(s); the original is archived under "
+                f"{queued} queued part(s); the original is archived under "
                 f"{dest_dir}, not deleted",
                 file=sys.stderr,
             )
@@ -915,12 +1016,25 @@ def resplit_over_bound_entries() -> tuple[int, int]:
         # genuinely writing N parts, which silenced phase 0c's `_blog` line
         # and under-reported `summary["resplit"]`.
         resplit += 1
-        parts += written
+        parts += queued
         # And only now can a per-part failure be called a loss: the original
         # is gone from the queue, so nothing will retry the parts that never
         # got written. While it was still queued, stamping these would have
         # failed `switchroom doctor` for a memory that was never lost.
-        record_deferred_drops(deferred)
+        if durable_upstream:
+            # ...unless the original left by being RECONCILED. The whole
+            # memory reached the bank, so a part that never got written is a
+            # redundant copy that was not made, not a lost turn.
+            if deferred:
+                print(
+                    f"[Hindsight] pending: {len(deferred)} part(s) of {name} "
+                    f"could not be written, but the original was reconciled "
+                    f"upstream, so nothing was lost and the drop ledger is "
+                    f"not stamped",
+                    file=sys.stderr,
+                )
+        else:
+            record_deferred_drops(deferred)
     return resplit, parts
 
 
@@ -1298,8 +1412,8 @@ def enqueue_parts(
     not stamp it.
 
     ``deferred_drops`` closes the same hole on the PER-PART door. A per-part
-    failure inside ``_enqueue_one`` (its own ``MAX_BYTES`` refusal, or a
-    write that fails after eviction made room) is NOT self-evidently a loss:
+    failure inside ``_enqueue_one`` — in practice a write that fails after
+    eviction made room — is NOT self-evidently a loss:
     when every part fails, ``enqueue_parts`` hands back nothing, the caller
     keeps its copy queued, and phase 0c retries the whole thing on the next
     backlog drain — so stamping there makes the ledger climb by one part per
@@ -1309,6 +1423,21 @@ def enqueue_parts(
     caller's copy actually leaves the live queue. With ``deferred_drops=None``
     (the producers: ``session_end`` / ``retain``, who hold no other copy) the
     ledger is stamped immediately, exactly as before.
+
+    "In practice a write failure" is exact, and the deferral of
+    ``_enqueue_one``'s OWN ``MAX_BYTES`` refusal is defence-in-depth rather
+    than covered behaviour: no deferring caller can reach it today. On the
+    multi-part path the ``total_bytes > MAX_BYTES`` guard above short-circuits
+    first, and ``sum(part_bytes) <= MAX_BYTES`` implies every individual part
+    is under it (both sides measure the same ``_build_entry`` blob). On the
+    ``total <= 1`` path the payload is re-enqueued UNCHANGED, so its dupe key
+    is the key of the very entry ``resplit_over_bound_entries`` is re-splitting
+    and ``_find_duplicate`` — which runs BEFORE the guard — returns that entry.
+    The one residual crack is an original queued by a pre-#3688 build, whose
+    filename carries no key segment for the prefix match to hit; the guard is
+    kept deferral-aware for that case rather than assumed unreachable.
+    Verified 2026-07-26 by making the branch raise when ``deferred_drops`` is
+    not None: the whole python suite stayed green, i.e. no test reaches it.
     """
     d = _ensure_dir()
 

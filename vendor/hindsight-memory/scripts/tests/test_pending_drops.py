@@ -2754,6 +2754,75 @@ class DeadMarkersLeaveTheLiveQueueTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertEqual(dropped, 0)
         self.assertEqual(len(self._dead_names()), 40, "a memory was trimmed away")
 
+    def _write_legacy_markers(self, n: int) -> list:
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        names = []
+        for i in range(n):
+            name = f"100{i}000-abc-{i}.json.dead"
+            with open(os.path.join(self._dir, name), "w", encoding="utf-8") as f:
+                json.dump(_payload(content=f"old-{i}"), f)
+            names.append(name)
+        return names
+
+    def _legacy_leftovers(self):
+        return sorted(n for n in os.listdir(self._dir) if n.endswith(".dead"))
+
+    def test_an_uncreatable_dead_archive_reports_ZERO_relocated(self):
+        """The count is a claim about the LIVE QUEUE, not an intention.
+
+        Phase 0b turns it straight into `summary["dead_relocated"]` and the
+        line "the queue now holds only live entries, so no janitor glob over
+        it can match a memory". When `dead_dir()` cannot be created not one
+        marker moved, so returning `len(names)` would print that sentence
+        over a queue directory still holding every marker -- the exact
+        condition this change exists to end, now with an operator told it was
+        fixed.
+        """
+        self._write_legacy_markers(3)
+
+        with unittest.mock.patch.object(
+            pending.os, "makedirs",
+            side_effect=OSError(errno.EACCES, "Permission denied"),
+        ):
+            with redirect_stderr(io.StringIO()) as err:
+                moved = pending.sweep_legacy_dead_markers()
+
+        self.assertEqual(moved, 0, "nothing moved, so nothing may be claimed")
+        self.assertEqual(
+            len(self._legacy_leftovers()), 3,
+            "and every marker is still in the janitor's path",
+        )
+        self.assertEqual(self._dead_names(), [])
+        self.assertIn("STAY in the live queue", err.getvalue())
+
+    def test_a_marker_that_could_not_be_MOVED_is_not_counted(self):
+        """One marker per `except OSError`, and a `pass` there counts a lie.
+
+        The loop swallows a per-marker failure deliberately -- one unwritable
+        marker must not abandon the other nine -- but swallowing it is not
+        the same as having moved it. Dropping the `continue` leaves the
+        marker in the live queue directory AND reports it relocated.
+        """
+        names = self._write_legacy_markers(2)
+        real_move = shutil.move
+
+        def refuse_the_second(src, dst):
+            if str(src).endswith(names[1]):
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_move(src, dst)
+
+        with unittest.mock.patch.object(pending.shutil, "move", refuse_the_second):
+            with redirect_stderr(io.StringIO()) as err:
+                moved = pending.sweep_legacy_dead_markers()
+
+        self.assertEqual(moved, 1, "only the marker that actually moved counts")
+        self.assertEqual(
+            self._legacy_leftovers(), [names[1]],
+            "the refused one is still in the live queue directory",
+        )
+        self.assertEqual(self._dead_names(), [names[0]])
+        self.assertIn("relocated 1 legacy .dead marker(s)", err.getvalue())
+
     def test_the_backlog_drain_relocates_legacy_markers(self):
         """The migration only happens if the drain actually calls it.
 
@@ -3271,6 +3340,54 @@ class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
 
     # --- An original evicted out from under its own re-split --------------
 
+    @staticmethod
+    def _clock_frozen_at(when: float):
+        """Freeze the millisecond `_enqueue_one` stamps into entry names.
+
+        Entry names are `<unix-ms>-<dupe-key>-<uuid>.json` and FIFO order is
+        their lexicographic sort, so entries written inside ONE millisecond
+        tie-break on the CONTENT-DERIVED dupe key -- stable and total, but
+        arbitrary. Production never hits that on the re-split path: the
+        original was queued by an EARLIER process, milliseconds to days
+        before its parts. A test that enqueues both inside one tick does hit
+        it, and then `_evict_to_fit` sheds whichever name happens to sort
+        first -- measured 6 failures in 40 isolated runs of the case below
+        before this pin. So pin the age relationship the product guarantees
+        instead of racing the clock for it.
+        """
+        return unittest.mock.patch.object(pending.time, "time", lambda: when)
+
+    def _nth_part_write_fails(self, n: int):
+        """ENOSPC on the `n`-th part write, and on nothing else.
+
+        Counting every `os.rename` would be wrong: `shutil.move` renames too
+        when source and destination share a filesystem, so an eviction inside
+        the same loop shifts the count. Only the tmp -> `<entry>.json` rename
+        inside the LIVE QUEUE dir is a part landing.
+        """
+        real_rename = os.rename
+        seen = {"n": 0}
+
+        def flaky(src, dst):
+            landing = str(dst).endswith(".json") and os.path.dirname(
+                os.path.abspath(str(dst))
+            ) == os.path.abspath(self._dir)
+            if landing:
+                seen["n"] += 1
+                if seen["n"] == n:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+            return real_rename(src, dst)
+
+        return unittest.mock.patch.object(pending.os, "rename", flaky)
+
+    def _an_original_older_than_its_parts(self, content: str) -> str:
+        """Enqueue `content` stamped an hour ago; return its queue path."""
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        with self._clock_frozen_at(time.time() - 3600):
+            path = pending.enqueue(_payload(content=content), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        return path
+
     def test_a_resplit_that_evicts_its_own_original_says_so(self):
         """The parts fill the queue and FIFO-shed the entry being re-split.
 
@@ -3282,10 +3399,8 @@ class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
         when it is in `pending-evicted/`, and returned (0, 0) after writing
         fourteen parts.
         """
-        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
-        path = pending.enqueue(_payload(content="z" * 40_000), RuntimeError("x"))
+        path = self._an_original_older_than_its_parts("z" * 40_000)
         name = os.path.basename(path)
-        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
         pending.MAX_ENTRIES = 14
 
         err = io.StringIO()
@@ -3305,10 +3420,218 @@ class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
             "exactly this pressure",
         )
         self.assertIn(pending.evicted_dir(), log, "say where it actually is")
+
+    def test_the_evicted_branch_counts_the_parts_it_actually_wrote(self):
+        """The return tuple alone, pinned on its own.
+
+        This is the assertion that keeps the `continue` off the evicted
+        branch: with it restored the drain writes fourteen parts and reports
+        (0, 0), so phase 0c's `_blog` line and `summary["resplit"]` both go
+        silent on a re-split that happened. It is deliberately free of log
+        wording and of every archive-location assertion, so no rewording of
+        the operator line can retire the guard by accident.
+        """
+        self._an_original_older_than_its_parts("z" * 40_000)
+        pending.MAX_ENTRIES = 14
+
+        with redirect_stderr(io.StringIO()):
+            entries, parts = pending.resplit_over_bound_entries()
+
         self.assertEqual(
             (entries, parts), (1, 14),
-            "fourteen parts were genuinely written, so phase 0c's summary "
-            "and `_blog` line must report them",
+            "fourteen parts were genuinely written and are queued, so phase "
+            "0c's summary and `_blog` line must report them",
+        )
+        self.assertEqual(pending.count(), 14, "and all fourteen really are live")
+
+    def test_a_part_shed_to_make_room_is_not_counted_as_queued(self):
+        """The other side of the eviction race, and an accounting lie.
+
+        FIFO sheds the OLDEST name, which is the original only while the
+        original IS the oldest. Freeze the parts into an older millisecond
+        and part fourteen evicts a PART instead: `shutil.move` then SUCCEEDS,
+        the original is archived under `pending-resplit/`, and the drain used
+        to report "into 14 queued part(s)" with thirteen queued and one
+        sitting in `pending-evicted/`. Nothing re-drains that directory (see
+        `drain_pending`, `probe.ts`, `doctor.ts` -- all of them only count or
+        trim it), so the shed part is a slice of the memory that will not
+        reach the bank, and the operator line must not paper over it.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="y" * 40_000), RuntimeError("x"))
+        name = os.path.basename(path)
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        pending.MAX_ENTRIES = 14
+
+        err = io.StringIO()
+        # The parts land an hour "before" the original, so the oldest name in
+        # the queue when part fourteen needs room is a part, not the original.
+        with self._clock_frozen_at(time.time() - 3600):
+            with redirect_stderr(err):
+                entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual(pending.count(), 13, "thirteen parts survived")
+        self.assertEqual(
+            self._resplit_names(), [name], "the original WAS archived here"
+        )
+        shed = self._archive_names()
+        self.assertEqual(len(shed), 1, "one part was shed to make room")
+        self.assertNotIn(name, shed, "and it was a part, not the original")
+
+        self.assertEqual(
+            (entries, parts), (1, 13),
+            "a part in pending-evicted/ is not a queued part -- nothing "
+            "re-drains that directory",
+        )
+        log = err.getvalue()
+        self.assertIn("into 13 queued part(s)", log)
+        self.assertNotIn("into 14 queued part(s)", log)
+        # The eviction itself already logs "evicted OLDEST ... into <dir>", so
+        # asserting on `evicted_dir()` alone here passes with no re-split line
+        # at all -- vacuous. Pin the re-split's OWN line: the operator reading
+        # "the original is archived" has to be told, in the same breath, that
+        # a part went the other way.
+        self.assertRegex(
+            log,
+            r"re-split \S+ wrote 14 part\(s\).*13 part\(s\) of this memory "
+            r"are live",
+            "the re-split must reconcile 14 written against 13 live",
+        )
+        self.assertIn(
+            f"FIFO-evicted into {pending.evicted_dir()}", log,
+            "and say where the shed part went",
+        )
+        self.assertIn(shed[0], log, "named, so it can be found")
+
+    def _resplit_with_the_last_part_failing(self):
+        """Original evicted AND one part unwritten, the two together.
+
+        Part fourteen is the one that triggers `_evict_to_fit` (the queue is
+        at its cap of fourteen), so failing THAT part's write is the only
+        arrangement where the original leaves the queue and a part is
+        genuinely lost in the same drain. Returns `(entries, parts, log)`.
+        """
+        path = self._an_original_older_than_its_parts("w" * 40_000)
+        pending.MAX_ENTRIES = 14
+
+        err = io.StringIO()
+        with self._nth_part_write_fails(14):
+            with redirect_stderr(err):
+                entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertFalse(os.path.exists(path), "the original left the queue")
+        self.assertIn(
+            os.path.basename(path), self._archive_names(),
+            "by eviction -- pending-resplit/ never got it",
+        )
+        self.assertEqual(self._resplit_names(), [])
+        self.assertEqual((entries, parts), (1, 13), "thirteen of fourteen")
+        return entries, parts, err.getvalue()
+
+    def test_a_part_that_fails_is_stamped_when_the_original_is_EVICTED(self):
+        """The archived branch is not the only one that retires the original.
+
+        `record_deferred_drops` is reached on BOTH branches below the move,
+        and only the archived one was covered: gating the stamp on the
+        original having reached `pending-resplit/` left this drain silent
+        about part fourteen, which nothing will ever retry -- the original is
+        in `pending-evicted/` and no consumer re-drains that directory.
+        """
+        self._resplit_with_the_last_part_failing()
+
+        self.assertEqual(
+            pending.read_drops().get("count"), 1,
+            "the part that never landed is gone for good and must be visible",
+        )
+        self.assertEqual(pending.read_drops().get("last_error_class"), "OSError")
+
+    def test_the_evicted_branch_does_not_reassure_when_a_part_was_lost(self):
+        """Two contradictory lines in one drain is a log-lie, not a nuance.
+
+        The evicted branch printed "(the parts carry the whole memory)"
+        unconditionally and `record_deferred_drops` then printed "permanently
+        lost" for the same entry, in the same drain. A non-empty `deferred`
+        is EXACTLY the case where the parts do not carry the whole memory.
+        """
+        _entries, _parts, log = self._resplit_with_the_last_part_failing()
+
+        self.assertNotIn(
+            "carry the whole memory", log,
+            "one part never got written, so they demonstrably do not",
+        )
+        self.assertIn("permanently lost", log, "and the loss is still said")
+        self.assertIn(pending.evicted_dir(), log, "with the original's location")
+
+    def test_a_concurrent_reconcile_is_not_reported_as_an_eviction(self):
+        """"Gone from the queue" is resolved, not assumed.
+
+        Nothing serialises this drain against an in-hook `drain()` --
+        `lib/pacing.py`'s `retain-inflight.lock` is a per-POST storm guard and
+        `drain_pending` takes no lock -- so the original can be RECONCILED out
+        from under the archive move. Attributing that to eviction told the
+        operator the memory was shed when it had just been confirmed durable
+        upstream, and stamped a permanent DROP for a part of a memory that
+        reached the bank whole.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="v" * 40_000), RuntimeError("x"))
+        name = os.path.basename(path)
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+
+        real_move = shutil.move
+
+        def reconcile_first(src, dst):
+            """The other process wins the race, between two syscalls here."""
+            if os.path.abspath(src) == os.path.abspath(path):
+                # Exactly what `archive_reconciled` does in the other
+                # process, minus the recursion back through this patch.
+                os.makedirs(pending.reconciled_dir(), mode=0o700, exist_ok=True)
+                real_move(src, os.path.join(pending.reconciled_dir(), name))
+                raise OSError(errno.ENOENT, "No such file or directory")
+            return real_move(src, dst)
+
+        err = io.StringIO()
+        with self._nth_part_write_fails(5):  # part five never lands
+            with unittest.mock.patch.object(pending.shutil, "move", reconcile_first):
+                with redirect_stderr(err):
+                    entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual(self._reconciled_names(), [name], "that is where it went")
+        self.assertEqual(self._archive_names(), [], "it was never evicted")
+        self.assertEqual((entries, parts), (1, 13))
+
+        log = err.getvalue()
+        self.assertIn(pending.reconciled_dir(), log, "say where it actually is")
+        self.assertNotIn("it was itself evicted", log)
+        self.assertEqual(
+            pending.read_drops(), {},
+            "the whole memory is durable upstream, so the part that never "
+            "got written is a redundant copy, not a lost turn",
+        )
+
+    def test_content_exactly_at_the_bound_is_not_re_split(self):
+        """`<= limit` is the bound, and the equal case is the whole point.
+
+        `split_retain_content` passes content of exactly `limit` chars
+        through unsplit, so re-splitting it here is pure churn: the payload
+        dedupes straight back onto the original and the drain prints "could
+        not re-split" about an entry that never needed splitting. At `<`
+        every drain does that for every at-the-bound entry.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        path = pending.enqueue(_payload(content="b" * 3000), RuntimeError("x"))
+        self.assertEqual(pending.count(), 1, "it was queued whole, not split")
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual((entries, parts), (0, 0))
+        self.assertTrue(os.path.exists(path), "untouched")
+        self.assertEqual(
+            err.getvalue(), "",
+            "an entry AT the bound is not even considered -- one char over "
+            "is over, one char at is not",
         )
 
     def test_an_archive_failure_that_leaves_the_original_queued_still_says_so(self):
