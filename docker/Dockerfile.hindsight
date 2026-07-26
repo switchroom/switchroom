@@ -901,6 +901,18 @@ PYEOF
 # foreground never acquires the background semaphore, so the acquisition order
 # (background -> shared) is total and no cycle exists.
 #
+# ORDER-COUPLED WITH THE worker-slot-ceiling BLOCK BELOW — DO NOT SWAP THEM.
+# Both append a validation clause to config.py at the same anchor, the tail of
+# HindsightConfig.validate():
+#     f"Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS."
+#         )
+# THIS block additionally requires `\n    @classmethod\n    def from_env` to
+# still follow that anchor, so it must run while the anchor is still the last
+# thing in validate(). The ceiling block below anchors on the shorter form and
+# is order-independent. Running them in the other order makes THIS block's
+# anchor match 0x and fails the build loudly (it does not mis-apply) — but the
+# failure would read as upstream drift, which it is not.
+#
 # Self-verifying; guarded structurally by
 # tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
 # unpatched upstream / GREEN patched) by
@@ -1140,6 +1152,17 @@ assert "async with self._search_semaphore:" not in me_new, (
     "switchroom hindsight recall-admission-split patch: a bare shared-semaphore acquisition "
     "still remains — background recalls would bypass the reservation"
 )
+# The ARGUMENTS, not just the call. `_recall_admission(shared, background, False)`
+# reverts the entire split while leaving every other assertion in this block green
+# (`self._search_semaphore` survives as an argument, the helper is still defined,
+# the call is still made). The third argument MUST be the caller's `_background`.
+assert (
+    "                self._search_semaphore, self._background_search_semaphore, _background\n"
+) in me_new, (
+    "switchroom hindsight recall-admission-split patch: recall_async does not pass "
+    "(_search_semaphore, _background_search_semaphore, _background) to _recall_admission — "
+    "a hard-coded third argument silently reverts the admission split"
+)
 assert "_background=True," in cons_new, (
     "switchroom hindsight recall-admission-split patch: consolidation still recalls as foreground"
 )
@@ -1172,6 +1195,13 @@ PYEOF
 #
 # The misleading ..._MAX_SLOTS name is deliberately NOT changed here (renaming a
 # shipped env var is a breaking config change); it is filed upstream instead.
+#
+# ORDER-COUPLED WITH THE recall-admission-split BLOCK ABOVE — DO NOT SWAP THEM.
+# Both append a validation clause to config.py at the same
+# `Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS.` anchor. This
+# block's anchor is the shorter, order-independent form; the block above ALSO
+# requires `@classmethod / def from_env` to still follow it, so it has to go
+# first. See the note on that block.
 #
 # Self-verifying; guarded by tests/docker/dockerfile-hindsight-bakes.test.ts and
 # tests/docker/hindsight-recall-isolation-patches.test.ts.
@@ -1221,7 +1251,10 @@ cfg_new = apply("config.py", [
         "# operation type may hold at once, reserved and shared combined. Each maps an\n"
         "# operation_type to its env var and default cap; None means uncapped (exact\n"
         "# upstream behaviour). Adding a type here is the ONLY change needed to make it\n"
-        "# cappable — the config field, from_env() and the poller all derive from it.\n"
+        "# cappable — the config field, from_env() and the poller all derive from it, and\n"
+        "# claim_tasks bounds a capped type in the SELECT itself, so capping a type that\n"
+        "# phase 2a actually claims (everything except consolidation) does not cost the\n"
+        "# other types their share of the shared budget.\n"
         "#\n"
         "# consolidation defaults to 4 of DEFAULT_WORKER_MAX_SLOTS = 10 because it is the\n"
         "# only type observed saturating the worker; every other type stays uncapped so\n"
@@ -1563,7 +1596,19 @@ poller_new = apply("worker/poller.py", [
     ),
 ])
 
-# ---- 3. db ops: never mark an over-ceiling row as processing ----
+# ---- 3. db ops: enforce the per-type CEILING inside the claim itself ----
+#
+# NOT a post-selection filter. The shared pool is a single `ORDER BY created_at
+# LIMIT n` across every non-consolidation type, so dropping the surplus after
+# selection spends the shared budget on rows that are never claimed and starves
+# the types that were not over their cap. The ceiling is therefore pushed into
+# the WHERE clause (`operation_type != ALL(...)`) with a refill fetch for the
+# unspent remainder, and phase 2b is skipped outright when consolidation has no
+# headroom rather than taking FOR UPDATE locks on rows it must discard.
+#
+# The phase 1 + phase 2 body is byte-identical in ops_postgresql.py and
+# ops_oracle.py upstream (verified: the 4213-byte block matches exactly), so one
+# anchor covers both backends.
 CLAIM_SIG_OLD = (
     "        reserved_limits,\n"
     "        shared_limit,\n"
@@ -1580,42 +1625,290 @@ CLAIM_SIG_NEW = (
     "    ):\n"
 )
 
-CEILING_OLD = (
-    "        if not all_rows:\n"
-    "            return []\n"
-    "\n"
-    "        # Mark all claimed rows as processing\n"
-)
-CEILING_NEW = (
-    "        # switchroom: enforce the per-operation-type CEILING before anything is\n"
-    "        # marked processing. The shared pool claims by created_at across types, so\n"
-    "        # this is the only point that can bound one type's share of the worker;\n"
-    "        # `type_ceilings` is the remaining headroom the poller has not already spent\n"
-    "        # this batch. Rows dropped here were selected FOR UPDATE SKIP LOCKED but are\n"
-    "        # never transitioned out of 'pending', so the row lock is released with the\n"
-    "        # transaction and the task is simply claimed on a later poll. None/empty =\n"
-    "        # uncapped, i.e. byte-for-byte upstream behaviour.\n"
-    "        if type_ceilings:\n"
-    "            kept = []\n"
-    "            used: dict[str, int] = {}\n"
-    "            for row in all_rows:\n"
-    "                op_type = row[\"operation_type\"]\n"
-    "                cap = type_ceilings.get(op_type)\n"
-    "                if cap is not None:\n"
-    "                    if used.get(op_type, 0) >= cap:\n"
-    "                        continue\n"
-    "                    used[op_type] = used.get(op_type, 0) + 1\n"
-    "                kept.append(row)\n"
-    "            all_rows = kept\n"
-    "\n"
-    "        if not all_rows:\n"
-    "            return []\n"
-    "\n"
-    "        # Mark all claimed rows as processing\n"
-)
+# The exact upstream body, replaced wholesale. `apply()` asserts it appears
+# exactly once per file, so any upstream reformatting fails the build loudly
+# instead of silently leaving the ceiling unenforced.
+CLAIM_BODY_OLD = r'''        # --- Phase 1: claim from reserved pools ---
+        for op_type, limit in reserved_limits.items():
+            if limit <= 0:
+                continue
+
+            if op_type == "consolidation":
+                busy_banks = await conn.fetch(
+                    f"""
+                    SELECT DISTINCT bank_id FROM {table}
+                    WHERE operation_type = 'consolidation' AND status = 'processing'
+                    """,
+                )
+                busy_bank_ids = [r["bank_id"] for r in busy_banks]
+
+                rows = await self._claim_consolidation_tasks(
+                    conn,
+                    table,
+                    busy_bank_ids,
+                    claimed_ids,
+                    limit,
+                    consolidation_bank_priority,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, operation_type, task_payload, retry_count
+                    FROM {table}
+                    WHERE status = 'pending'
+                      AND task_payload IS NOT NULL
+                      AND operation_type = $1
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                    ORDER BY created_at
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    op_type,
+                    limit,
+                )
+
+            for row in rows:
+                claimed_ids.append(row["operation_id"])
+                all_rows.append(row)
+
+        # --- Phase 2: claim from shared pool ---
+        remaining_shared = shared_limit
+        if remaining_shared > 0:
+            # 2a. Non-consolidation tasks
+            if claimed_ids:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, operation_type, task_payload, retry_count
+                    FROM {table}
+                    WHERE status = 'pending'
+                      AND task_payload IS NOT NULL
+                      AND operation_type != 'consolidation'
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                      AND operation_id != ALL($1::uuid[])
+                    ORDER BY created_at
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    claimed_ids,
+                    remaining_shared,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, operation_type, task_payload, retry_count
+                    FROM {table}
+                    WHERE status = 'pending'
+                      AND task_payload IS NOT NULL
+                      AND operation_type != 'consolidation'
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                    ORDER BY created_at
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    remaining_shared,
+                )
+
+            for row in rows:
+                claimed_ids.append(row["operation_id"])
+                all_rows.append(row)
+            remaining_shared -= len(rows)
+
+            # 2b. Consolidation tasks (with bank-serialization + optional priority)
+            if remaining_shared > 0:
+                busy_banks_2 = await conn.fetch(
+                    f"""
+                    SELECT DISTINCT bank_id FROM {table}
+                    WHERE operation_type = 'consolidation' AND status = 'processing'
+                    """,
+                )
+                busy_bank_ids_2 = [r["bank_id"] for r in busy_banks_2]
+
+                rows = await self._claim_consolidation_tasks(
+                    conn,
+                    table,
+                    busy_bank_ids_2,
+                    claimed_ids,
+                    remaining_shared,
+                    consolidation_bank_priority,
+                )
+
+                for row in rows:
+                    claimed_ids.append(row["operation_id"])
+                    all_rows.append(row)
+
+        if not all_rows:
+            return []
+
+        # Mark all claimed rows as processing
+'''
+
+CLAIM_BODY_NEW = r'''        # --- Phase 1: claim from reserved pools ---
+        # switchroom: `remaining_ceilings` is the per-operation-type CEILING headroom
+        # for THIS call - what the poller has not already spent this batch - and it is
+        # decremented as rows are accepted, so one claim_tasks call can never push a
+        # type past its cap across the phases below.
+        #
+        # A capped type is bounded BEFORE selection, never filtered after it. Phase 2a
+        # is a single `ORDER BY created_at LIMIT n` across every non-consolidation
+        # type, so discarding the surplus afterwards spends the shared budget on rows
+        # that are then thrown away: with ceilings {"retain": 2}, 12 pending retain
+        # (older) and 5 pending graph_maintenance, a post-filter claims 2 retain and 0
+        # graph_maintenance where upstream claims 9 tasks. Instead, a type with no
+        # headroom left is excluded in SQL (`operation_type != ALL(...)`) and the fetch
+        # is retried for the unspent remainder, so nothing is ever selected FOR UPDATE
+        # that this call cannot claim. None/empty ceilings = byte-for-byte upstream.
+        remaining_ceilings = dict(type_ceilings) if type_ceilings else {}
+
+        def _headroom(op_type, budget):
+            """switchroom: `budget` clamped to op_type's remaining ceiling headroom."""
+            cap = remaining_ceilings.get(op_type)
+            return budget if cap is None else min(budget, cap)
+
+        def _accept(rows):
+            """switchroom: record claimed rows and spend their ceiling headroom."""
+            for row in rows:
+                op_type = row["operation_type"]
+                if op_type in remaining_ceilings:
+                    remaining_ceilings[op_type] = max(0, remaining_ceilings[op_type] - 1)
+                claimed_ids.append(row["operation_id"])
+                all_rows.append(row)
+
+        for op_type, limit in reserved_limits.items():
+            # switchroom: the ceiling binds the reserved pool too, and it binds it here
+            # in the mechanism rather than resting on the poller's clamp alone.
+            limit = _headroom(op_type, limit)
+            if limit <= 0:
+                continue
+
+            if op_type == "consolidation":
+                busy_banks = await conn.fetch(
+                    f"""
+                    SELECT DISTINCT bank_id FROM {table}
+                    WHERE operation_type = 'consolidation' AND status = 'processing'
+                    """,
+                )
+                busy_bank_ids = [r["bank_id"] for r in busy_banks]
+
+                rows = await self._claim_consolidation_tasks(
+                    conn,
+                    table,
+                    busy_bank_ids,
+                    claimed_ids,
+                    limit,
+                    consolidation_bank_priority,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, operation_type, task_payload, retry_count
+                    FROM {table}
+                    WHERE status = 'pending'
+                      AND task_payload IS NOT NULL
+                      AND operation_type = $1
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                    ORDER BY created_at
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    op_type,
+                    limit,
+                )
+
+            _accept(rows)
+
+        # --- Phase 2: claim from shared pool ---
+        remaining_shared = shared_limit
+        if remaining_shared > 0:
+            # 2a. Non-consolidation tasks
+            # switchroom: refill loop. Types whose ceiling headroom is exhausted are
+            # excluded in SQL, so the LIMIT is only ever spent on rows this call can
+            # actually claim; when a type hits its cap part-way through a fetch, the
+            # unspent remainder is re-queried with that type excluded. The budget is
+            # decremented per ACCEPTED row, not per selected row, so rows a ceiling
+            # would drop no longer under-budget phase 2b.
+            #
+            # Terminates: a row can only be dropped if its type had headroom at fetch
+            # time and has none now, so every extra iteration adds at least one type to
+            # `exhausted`, which is bounded by len(type_ceilings). With no ceilings the
+            # loop runs exactly one query with exactly upstream's SQL.
+            while remaining_shared > 0:
+                exhausted = sorted(t for t, h in remaining_ceilings.items() if h <= 0)
+                conditions: list[str] = []
+                params: list = []
+                idx = 1
+                if claimed_ids:
+                    conditions.append(f"AND operation_id != ALL(${idx}::uuid[])")
+                    params.append(claimed_ids)
+                    idx += 1
+                if exhausted:
+                    conditions.append(f"AND operation_type != ALL(${idx}::text[])")
+                    params.append(exhausted)
+                    idx += 1
+                params.append(remaining_shared)
+                extra_clause = "".join("\n                      " + c for c in conditions)
+
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, operation_type, task_payload, retry_count
+                    FROM {table}
+                    WHERE status = 'pending'
+                      AND task_payload IS NOT NULL
+                      AND operation_type != 'consolidation'
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW()){extra_clause}
+                    ORDER BY created_at
+                    LIMIT ${idx}
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    *params,
+                )
+                if not rows:
+                    break
+
+                dropped = 0
+                for row in rows:
+                    if _headroom(row["operation_type"], 1) <= 0:
+                        dropped += 1
+                        continue
+                    _accept([row])
+                    remaining_shared -= 1
+                if dropped == 0:
+                    break
+
+            # 2b. Consolidation tasks (with bank-serialization + optional priority)
+            # switchroom: clamped by consolidation's own ceiling headroom, and SKIPPED
+            # entirely at zero. Upstream still ran the busy-banks scan and took FOR
+            # UPDATE locks on rows this worker could not claim - per active schema, per
+            # poll. Multi-worker, those locks briefly hide the head consolidation rows
+            # from a worker that does have headroom.
+            consolidation_shared = _headroom("consolidation", remaining_shared)
+            if consolidation_shared > 0:
+                busy_banks_2 = await conn.fetch(
+                    f"""
+                    SELECT DISTINCT bank_id FROM {table}
+                    WHERE operation_type = 'consolidation' AND status = 'processing'
+                    """,
+                )
+                busy_bank_ids_2 = [r["bank_id"] for r in busy_banks_2]
+
+                rows = await self._claim_consolidation_tasks(
+                    conn,
+                    table,
+                    busy_bank_ids_2,
+                    claimed_ids,
+                    consolidation_shared,
+                    consolidation_bank_priority,
+                )
+
+                _accept(rows)
+
+        if not all_rows:
+            return []
+
+        # Mark all claimed rows as processing
+'''
 
 for rel in ("engine/db/ops_postgresql.py", "engine/db/ops_oracle.py"):
-    apply(rel, [(CLAIM_SIG_OLD, CLAIM_SIG_NEW), (CEILING_OLD, CEILING_NEW)])
+    apply(rel, [(CLAIM_SIG_OLD, CLAIM_SIG_NEW), (CLAIM_BODY_OLD, CLAIM_BODY_NEW)])
 
 ops_new = apply("engine/db/ops.py", [
     (
@@ -1701,12 +1994,29 @@ assert "type_ceilings: dict[str, int] | None = None," in ops_new, (
 )
 for rel in ("engine/db/ops_postgresql.py", "engine/db/ops_oracle.py"):
     t = (BASE / rel).read_text()
-    assert "if type_ceilings:" in t, (
+    assert "remaining_ceilings = dict(type_ceilings) if type_ceilings else {}" in t, (
         f"switchroom hindsight worker-slot-ceiling patch: ceiling enforcement missing in {rel}"
     )
-    assert t.index("if type_ceilings:") < t.index("# Mark all claimed rows as processing"), (
-        f"switchroom hindsight worker-slot-ceiling patch: ceiling filter runs AFTER the "
+    # The ceiling must bound SELECTION, not just what is returned. A post-selection
+    # filter still spends the single shared-pool LIMIT on rows it then discards, so
+    # a burst of one capped type starves every other type of the whole batch.
+    assert 'AND operation_type != ALL(${idx}::text[])' in t, (
+        f"switchroom hindsight worker-slot-ceiling patch: at-ceiling types are not excluded "
+        f"in the shared-pool WHERE clause in {rel} — the ceiling would be a post-selection "
+        f"filter and the shared budget would be spent on rows that are never claimed"
+    )
+    # …and the whole of it must precede the UPDATE that actually claims a row.
+    assert t.index("remaining_ceilings = dict(type_ceilings)") < t.index(
+        "# Mark all claimed rows as processing"
+    ), (
+        f"switchroom hindsight worker-slot-ceiling patch: ceiling enforcement runs AFTER the "
         f"processing UPDATE in {rel} — over-ceiling rows would already be claimed"
+    )
+    # L1: at zero headroom phase 2b must not run at all — no busy-banks scan and no
+    # FOR UPDATE locks on rows this worker cannot claim.
+    assert 'consolidation_shared = _headroom("consolidation", remaining_shared)' in t, (
+        f"switchroom hindsight worker-slot-ceiling patch: phase 2b is not clamped by "
+        f"consolidation's ceiling headroom in {rel}"
     )
 assert "slot_limits=config.worker_slot_limits," in http_new, (
     "switchroom hindsight worker-slot-ceiling patch: api/http.py poller not wired"
@@ -1720,15 +2030,31 @@ print(
 )
 PYEOF
 
-# Always emit `sem=` on the recall completion line.
+# Make the recall admission wait OBSERVABLE — on every recall, including the
+# background ones.
 #
-# The wait was only logged when it exceeded 0.01s, so the recalls that did NOT
-# queue left no datum at all. Scraping the logs therefore could not distinguish
-# a fleet where 45% of recalls wait from one where none do, and averaging the
-# lines that DID appear silently biased the reported mean upwards — which is
-# exactly how the admission contention above was mis-sized on first measurement.
-# An unconditional `sem=0.000s` makes the distribution recoverable. Scoped to the
-# admission wait: the `conn=` threshold is deliberately left alone.
+# Two gates hid it, and between them the exact population this image now caps
+# emitted nothing at all:
+#
+#  1. The wait was only logged when it exceeded 0.01s, so the recalls that did
+#     NOT queue left no datum. Scraping the logs therefore could not distinguish
+#     a fleet where 45% of recalls wait from one where none do, and averaging the
+#     lines that DID appear silently biased the reported mean upwards — exactly
+#     how the admission contention above was mis-sized on first measurement.
+#  2. The whole completion line is emitted under `if not quiet:`, and the
+#     consolidator recalls with `_quiet=True`. So BACKGROUND recalls — the
+#     population the reservation semaphore above pins at 2 — logged no `sem=`
+#     line whatsoever. A reservation you cannot see queueing is a reservation you
+#     will mis-size the same way twice: if consolidation starts backing up behind
+#     its own cap, nothing in the logs says so.
+#
+# Fix 1 is an unconditional `sem=0.000s`, which makes the distribution
+# recoverable. Fix 2 emits ONE compact line for a quiet recall rather than the
+# whole multi-line buffer, so the datum exists without restoring the noise
+# `_quiet` was introduced to suppress (and background is capped at 2 concurrent,
+# so the volume is bounded by construction).
+#
+# Scoped to the admission wait: the `conn=` threshold is deliberately left alone.
 #
 # Self-verifying; guarded by tests/docker/dockerfile-hindsight-bakes.test.ts and
 # tests/docker/hindsight-recall-isolation-patches.test.ts.
@@ -1738,10 +2064,31 @@ import pathlib
 f = pathlib.Path("/app/api/hindsight_api/engine/memory_engine.py")
 s = f.read_text()
 
+
+def apply(anchor, repl, source):
+    n = source.count(anchor)
+    assert n == 1, (
+        f"switchroom hindsight sem-wait-always-logged patch: anchor found {n}x (expected 1) "
+        f"in engine/memory_engine.py — upstream reformatted the recall completion block; "
+        f"re-author this patch in docker/Dockerfile.hindsight. Anchor head: "
+        f"{anchor.splitlines()[0]!r}"
+    )
+    return source.replace(anchor, repl, 1)
+
+
+# ---- 1. sem= on every recall, and wait_info unconditional with it ----
+#
+# The `if wait_parts else ""` tail went with the gate: wait_parts now always
+# carries sem=, so the conditional could never take its empty branch. Removing it
+# keeps the line honest rather than leaving a dead ternary that reads as though a
+# recall might still produce no wait information.
 OLD = (
     "            wait_parts = []\n"
     "            if semaphore_wait > 0.01:\n"
     '                wait_parts.append(f"sem={semaphore_wait:.3f}s")\n'
+    "            if max_conn_wait > 0.01:\n"
+    '                wait_parts.append(f"conn={max_conn_wait:.3f}s")\n'
+    "            wait_info = f\" | waits: {', '.join(wait_parts)}\" if wait_parts else \"\"\n"
 )
 NEW = (
     "            wait_parts = []\n"
@@ -1751,14 +2098,40 @@ NEW = (
     "            # absent lines silently biased the measured mean upwards. An unconditional\n"
     "            # sem=0.000s is the datum that makes the distribution recoverable.\n"
     '            wait_parts.append(f"sem={semaphore_wait:.3f}s")\n'
+    "            if max_conn_wait > 0.01:\n"
+    '                wait_parts.append(f"conn={max_conn_wait:.3f}s")\n'
+    "            # switchroom: unconditional — wait_parts always holds sem= now, so the\n"
+    "            # empty-string branch of the old ternary tail was unreachable.\n"
+    "            wait_info = f\" | waits: {', '.join(wait_parts)}\"\n"
 )
-n = s.count(OLD)
-assert n == 1, (
-    f"switchroom hindsight sem-wait-always-logged patch: anchor found {n}x (expected 1) in "
-    "engine/memory_engine.py — upstream reformatted the recall wait_parts block; re-author "
-    "this patch in docker/Dockerfile.hindsight"
+s = apply(OLD, NEW, s)
+
+# ---- 2. a quiet (BACKGROUND) recall still reports its admission wait ----
+QUIET_OLD = (
+    "            if not quiet:\n"
+    '                logger.info("\\n" + "\\n".join(log_buffer))\n'
+    "\n"
+    "            return RecallResultModel(\n"
 )
-s = s.replace(OLD, NEW, 1)
+QUIET_NEW = (
+    "            if not quiet:\n"
+    '                logger.info("\\n" + "\\n".join(log_buffer))\n'
+    "            else:\n"
+    "                # switchroom: a quiet recall is exactly the BACKGROUND population the\n"
+    "                # reservation semaphore caps (the consolidator recalls with\n"
+    "                # _quiet=True). Suppressing its wait entirely is what made the\n"
+    "                # original contention unmeasurable, and it would equally hide the\n"
+    "                # reservation itself backing consolidation up. Emit the ONE datum —\n"
+    "                # not the whole multi-line buffer _quiet exists to suppress.\n"
+    "                logger.info(\n"
+    '                    f"[RECALL {recall_id}] Complete (quiet): {len(top_scored)} facts, "\n'
+    '                    f"{total_time:.3f}s{wait_info}"\n'
+    "                )\n"
+    "\n"
+    "            return RecallResultModel(\n"
+)
+s = apply(QUIET_OLD, QUIET_NEW, s)
+
 f.write_text(s)
 
 t = f.read_text()
@@ -1768,13 +2141,22 @@ assert "if semaphore_wait > 0.01:" not in t, (
 assert t.count('wait_parts.append(f"sem={semaphore_wait:.3f}s")') == 1, (
     "switchroom hindsight sem-wait-always-logged patch: sem= is not emitted exactly once"
 )
+assert "join(wait_parts)}\" if wait_parts else \"\"" not in t, (
+    "switchroom hindsight sem-wait-always-logged patch: the dead conditional tail on "
+    "wait_info survived — wait_parts can no longer be empty, so its empty branch is "
+    "unreachable"
+)
 assert 'if max_conn_wait > 0.01:' in t, (
     "switchroom hindsight sem-wait-always-logged patch: the conn= branch was altered — this "
     "patch is scoped to the admission wait only"
 )
+assert "[RECALL {recall_id}] Complete (quiet):" in t, (
+    "switchroom hindsight sem-wait-always-logged patch: a quiet (background) recall still "
+    "emits no admission-wait line — the reservation is unobservable"
+)
 print(
     "switchroom hindsight sem-wait-always-logged patch: sem= now emitted on every recall, "
-    "including sem=0.000s"
+    "including sem=0.000s and including quiet/background recalls"
 )
 PYEOF
 

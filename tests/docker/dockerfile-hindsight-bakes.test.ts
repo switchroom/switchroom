@@ -425,6 +425,13 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /"            async with _recall_admission\(\\n"/,
     );
+    // The ARGUMENT LINE, pinned exactly. This is the load-bearing one: swapping
+    // the third argument for a literal `False` reverts the whole split while
+    // leaving the helper defined, the call site intact and `_search_semaphore`
+    // present as an argument — every other check here would still pass.
+    expect(dockerfile).toContain(
+      '"                self._search_semaphore, self._background_search_semaphore, _background\\n"',
+    );
     expect(dockerfile).toMatch(/"            _background=True,\\n"/);
     // The config knob + the boot validation that keeps a foreground floor.
     expect(dockerfile).toMatch(
@@ -456,8 +463,19 @@ describe("Dockerfile.hindsight shape", () => {
       /assert "async with self\._search_semaphore:" not in me_new,/,
     );
     expect(dockerfile).toMatch(/assert "_background=True," in cons_new,/);
+    // …and the build-time twin of the argument pin above.
+    expect(dockerfile).toMatch(
+      /a hard-coded third argument silently reverts the admission split/,
+    );
     expect(dockerfile).toMatch(
       /switchroom hindsight recall-admission-split patch: background consolidation recalls now pass a/,
+    );
+    // The two config.py patch blocks are ORDER-COUPLED on the same
+    // HindsightConfig.validate() anchor; this block additionally requires
+    // `@classmethod / def from_env` to still follow it, so it must run first.
+    // Swapping them fails the build loudly, but reads as upstream drift.
+    expect(dockerfile).toMatch(
+      /ORDER-COUPLED WITH THE worker-slot-ceiling BLOCK BELOW — DO NOT SWAP THEM/,
     );
   });
 
@@ -494,12 +512,46 @@ describe("Dockerfile.hindsight shape", () => {
     // Boot validation, at the same point as the existing reservation-sum check.
     expect(dockerfile).toMatch(/if limit > self\.worker_max_slots:/);
     expect(dockerfile).toMatch(/if limit < reserved:/);
-    // Enforcement runs BEFORE the row is marked processing — that UPDATE is the
-    // actual claim, so filtering after it would leave rows half-claimed.
-    expect(dockerfile).toMatch(/"        if type_ceilings:\\n"/);
-    expect(dockerfile).toMatch(
-      /"        # Mark all claimed rows as processing\\n"/,
+    // The ceiling bounds SELECTION, it is not a post-selection filter. Phase 2a
+    // is one `ORDER BY created_at LIMIT n` across every non-consolidation type,
+    // so discarding the surplus afterwards spends the shared budget on rows that
+    // are never claimed — one capped type then starves every other type of the
+    // whole batch. An at-ceiling type is excluded in the WHERE clause instead,
+    // with a refill fetch for the unspent remainder.
+    expect(dockerfile).toContain(
+      "AND operation_type != ALL(${idx}::text[])",
     );
+    expect(dockerfile).toMatch(
+      /exhausted = sorted\(t for t, h in remaining_ceilings\.items\(\) if h <= 0\)/,
+    );
+    // The budget is spent per ACCEPTED row, never per selected row (otherwise
+    // rows the ceiling drops under-budget phase 2b).
+    expect(dockerfile).toMatch(/_accept\(\[row\]\)\n\s+remaining_shared -= 1/);
+    // Scoped to the REPLACEMENT body. `remaining_shared -= len(rows)` is
+    // upstream's line and MUST still appear verbatim in CLAIM_BODY_OLD — it is
+    // part of the anchor being replaced. It must not survive into the new body.
+    const claimBodyOldIdx = dockerfile.indexOf("CLAIM_BODY_OLD = r'''");
+    const claimBodyNewIdx = dockerfile.indexOf("CLAIM_BODY_NEW = r'''");
+    expect(claimBodyOldIdx).toBeGreaterThan(-1);
+    expect(claimBodyNewIdx).toBeGreaterThan(claimBodyOldIdx);
+    expect(dockerfile.slice(claimBodyOldIdx, claimBodyNewIdx)).toMatch(
+      /remaining_shared -= len\(rows\)/,
+    );
+    expect(dockerfile.slice(claimBodyNewIdx)).not.toMatch(
+      /remaining_shared -= len\(rows\)/,
+    );
+    // At zero headroom phase 2b is skipped OUTRIGHT — no busy-banks scan, no
+    // FOR UPDATE locks on rows this worker must discard.
+    expect(dockerfile).toMatch(
+      /consolidation_shared = _headroom\("consolidation", remaining_shared\)/,
+    );
+    expect(dockerfile).toMatch(/if consolidation_shared > 0:/);
+    // Enforcement runs BEFORE the row is marked processing — that UPDATE is the
+    // actual claim, so enforcing after it would leave rows half-claimed.
+    expect(dockerfile).toMatch(
+      /remaining_ceilings = dict\(type_ceilings\) if type_ceilings else \{\}/,
+    );
+    expect(dockerfile).toMatch(/        # Mark all claimed rows as processing/);
     // Threaded from the poller through both DB backends.
     expect(dockerfile).toMatch(/"        type_ceilings=None,\\n"/);
     expect(dockerfile).toMatch(
@@ -512,9 +564,15 @@ describe("Dockerfile.hindsight shape", () => {
       /HINDSIGHT_API_WORKER_CONSOLIDATION_MIN_SLOTS/,
     );
     // Post-replace re-assertions (verification-on-build), including the
-    // ORDERING guard that the filter precedes the claiming UPDATE.
+    // ORDERING guard that enforcement precedes the claiming UPDATE.
     expect(dockerfile).toMatch(
-      /assert t\.index\("if type_ceilings:"\) < t\.index\("# Mark all claimed rows as processing"\),/,
+      /assert t\.index\("remaining_ceilings = dict\(type_ceilings\)"\) < t\.index\(/,
+    );
+    expect(dockerfile).toContain(
+      "at-ceiling types are not excluded ",
+    );
+    expect(dockerfile).toContain(
+      "phase 2b is not clamped by ",
     );
     expect(dockerfile).toMatch(
       /switchroom hindsight worker-slot-ceiling patch: worker_slot_limits is a real per-type CAP/,
@@ -522,11 +580,13 @@ describe("Dockerfile.hindsight shape", () => {
   });
 
   it("keeps the sem-wait-always-logged fix (assert-guarded, fail-loud)", () => {
-    // The admission wait was only logged above 0.01s, so recalls that did NOT
-    // queue left no datum and the measured mean was biased upwards by the
-    // missing zeros. Emitting sem= unconditionally makes the distribution
-    // recoverable from the logs. Behaviour is proven against the pinned
-    // upstream image in tests/docker/hindsight-recall-isolation-patches.test.ts.
+    // Two gates hid the admission wait. It was only logged above 0.01s, so
+    // recalls that did NOT queue left no datum and the measured mean was biased
+    // upwards by the missing zeros; and the whole completion line sits behind
+    // `if not quiet:` while the consolidator recalls with _quiet=True, so the
+    // BACKGROUND population this PR pins at 2 emitted nothing at all. Behaviour
+    // is proven against the pinned upstream image in
+    // tests/docker/hindsight-recall-isolation-patches.test.ts.
 
     // The exact-once anchor guard (fail-loud on upstream drift).
     expect(dockerfile).toMatch(
@@ -535,6 +595,19 @@ describe("Dockerfile.hindsight shape", () => {
     // The conditional is the anchor being replaced, and the append is now
     // unconditional.
     expect(dockerfile).toMatch(/"            if semaphore_wait > 0\.01:\\n"/);
+    // The dead ternary goes with the gate: wait_parts can no longer be empty, so
+    // the `else ""` branch was unreachable.
+    expect(dockerfile).toContain(
+      "wait_info = f\\\" | waits: {', '.join(wait_parts)}\\\"\\n",
+    );
+    // A quiet (background) recall still reports its admission wait — otherwise
+    // the reservation backing consolidation up is invisible, which is the exact
+    // "we mis-sized this from biased logs" failure the patch exists to prevent.
+    expect(dockerfile).toContain("[RECALL {recall_id}] Complete (quiet):");
+    // …as ONE line, not the multi-line buffer _quiet exists to suppress.
+    expect(dockerfile).not.toMatch(
+      /else:\n\s+logger\.info\("\\\\n" \+ "\\\\n"\.join\(log_buffer\)\)/,
+    );
     // Post-replace re-assertions (verification-on-build), including the SCOPE
     // guard: the conn= threshold is deliberately untouched by this patch.
     expect(dockerfile).toMatch(
@@ -542,6 +615,9 @@ describe("Dockerfile.hindsight shape", () => {
     );
     expect(dockerfile).toMatch(
       /assert 'if max_conn_wait > 0\.01:' in t,/,
+    );
+    expect(dockerfile).toContain(
+      "a quiet (background) recall still ",
     );
     expect(dockerfile).toMatch(
       /switchroom hindsight sem-wait-always-logged patch: sem= now emitted on every recall/,

@@ -340,6 +340,45 @@ if bare_shared:
         "would bypass the reservation"
     )
 
+
+def _arg_repr(node):
+    """A stable, readable description of one call argument."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id + "." + node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Constant):
+        return "<literal %r>" % (node.value,)
+    return "<" + type(node).__name__ + ">"
+
+
+# The ARGUMENTS, not just the presence of the call. Asserting only that
+# _recall_admission is called leaves the whole split revertible by a one-token
+# edit: _recall_admission(shared, background, False) keeps the helper defined,
+# keeps the call site, keeps _search_semaphore as an argument, and admits every
+# background recall as foreground again. The third argument MUST be the caller's
+# _background parameter, and the first two must be the two real semaphores.
+ADMISSION_ARGS_EXPECTED = [
+    "self._search_semaphore",
+    "self._background_search_semaphore",
+    "_background",
+]
+if admission_calls:
+    _call = admission_calls[0].context_expr
+    admission_args = [_arg_repr(a) for a in _call.args] + [
+        (kw.arg or "**") + "=" + _arg_repr(kw.value) for kw in _call.keywords
+    ]
+else:
+    admission_args = []
+print("ADMISSION_ARGS", admission_args)
+if admission_args != ADMISSION_ARGS_EXPECTED:
+    fail(
+        "recall_async passes %r to _recall_admission, expected %r - the caller's "
+        "_background flag must reach the admission helper, otherwise the split is "
+        "hard-coded and background recalls take the foreground path"
+        % (admission_args, ADMISSION_ARGS_EXPECTED)
+    )
+
 import hindsight_api.engine.consolidation.consolidator as consolidator
 
 ctree = ast.parse(inspect.getsource(consolidator))
@@ -433,13 +472,21 @@ from hindsight_api.worker.poller import WorkerPoller
 
 
 class FakeConn:
-    """Enough of asyncpg to drive the real claim_tasks end to end."""
+    """Enough of asyncpg to drive the real claim_tasks end to end.
+
+    Row order is insertion order, which stands in for 'ORDER BY created_at'.
+    Placeholder indices are read out of the SQL rather than guessed positionally,
+    so the '!= ALL(...)' filters are applied to the parameter the real query
+    actually binds them to.
+    """
 
     def __init__(self, pending):
         self.pending = list(pending)
         self.claimed = []
+        self.fetches = []
 
     async def fetch(self, sql, *params):
+        self.fetches.append(sql)
         if "SELECT DISTINCT bank_id" in sql:
             return []
         limit = int(params[-1]) if params else len(self.pending)
@@ -450,11 +497,17 @@ class FakeConn:
             rows = [r for r in rows if r["operation_type"] == "consolidation"]
         elif "operation_type != 'consolidation'" in sql:
             rows = [r for r in rows if r["operation_type"] != "consolidation"]
-        excluded = set()
-        for p in params[:-1]:
-            if isinstance(p, list) and p and isinstance(p[0], uuid.UUID):
-                excluded = {str(x) for x in p}
-        rows = [r for r in rows if str(r["operation_id"]) not in excluded]
+
+        m = re.search(r"operation_id != ALL\(\$(\d+)", sql)
+        if m:
+            excluded = {str(x) for x in params[int(m.group(1)) - 1]}
+            rows = [r for r in rows if str(r["operation_id"]) not in excluded]
+
+        m = re.search(r"operation_type != ALL\(\$(\d+)", sql)
+        if m:
+            excluded_types = set(params[int(m.group(1)) - 1])
+            rows = [r for r in rows if r["operation_type"] not in excluded_types]
+
         return rows[:limit]
 
     async def execute(self, sql, *params):
@@ -463,23 +516,37 @@ class FakeConn:
         return None
 
 
-def pending(n_consolidation, n_retain=0):
+def rows_of(*spec):
+    """Pending rows in created_at order: rows_of(("retain", 12), ("consolidation", 3))."""
     rows = []
-
-    def row(op_type):
-        return {
-            "operation_id": uuid.uuid4(),
-            "operation_type": op_type,
-            "task_payload": "{}",
-            "retry_count": 0,
-            "bank_id": f"bank-{len(rows)}",
-        }
-
-    for _ in range(n_consolidation):
-        rows.append(row("consolidation"))
-    for _ in range(n_retain):
-        rows.append(row("retain"))
+    for op_type, n in spec:
+        for _ in range(n):
+            rows.append(
+                {
+                    "operation_id": uuid.uuid4(),
+                    "operation_type": op_type,
+                    "task_payload": "{}",
+                    "retry_count": 0,
+                    "bank_id": f"bank-{len(rows)}",
+                }
+            )
     return rows
+
+
+def pending(n_consolidation, n_retain=0):
+    return rows_of(("consolidation", n_consolidation), ("retain", n_retain))
+
+
+def claim(conn, reserved, shared, ceilings=None):
+    """Drive the real claim_tasks, passing ceilings only when it supports them."""
+    kwargs = {"consolidation_bank_priority": None}
+    if ceilings is not None and supports_ceilings:
+        kwargs["type_ceilings"] = ceilings
+    rows = asyncio.run(ops.claim_tasks(conn, "async_operations", "w1", reserved, shared, **kwargs))
+    counts = {}
+    for r in rows:
+        counts[r["operation_type"]] = counts.get(r["operation_type"], 0) + 1
+    return rows, counts
 
 
 ops = PostgreSQLOps()
@@ -509,26 +576,79 @@ if {str(r["operation_id"]) for r in rows} != set(conn.claimed):
 if supports_ceilings:
     # A ceiling on one type must not throttle another, and an uncapped type
     # must be claimed in full.
-    conn3 = FakeConn(pending(12, n_retain=5))
-    rows3 = asyncio.run(
-        ops.claim_tasks(
-            conn3,
-            "async_operations",
-            "w1",
-            {},
-            9,
-            consolidation_bank_priority=None,
-            type_ceilings={"consolidation": 2},
-        )
-    )
-    by_type = {}
-    for r in rows3:
-        by_type[r["operation_type"]] = by_type.get(r["operation_type"], 0) + 1
-    print("MIXED_CLAIM", sorted(by_type.items()))
+    #
+    # NOTE this configuration caps ONLY consolidation, which phase 2a excludes in
+    # SQL — so it exercises the one case where "filter after selection" and
+    # "bound before selection" agree. It is kept because it is the shipping
+    # default, but it proves nothing about a capped type phase 2a actually
+    # claims. MIXED_CLAIM_SHARED_BUDGET below is the assertion that does.
+    _, by_type = claim(FakeConn(pending(12, n_retain=5)), {}, 9, {"consolidation": 2})
+    print("MIXED_CLAIM_CONSOLIDATION_ONLY", sorted(by_type.items()))
     if by_type.get("consolidation", 0) > 2:
         fail("the ceiling did not bound consolidation in a mixed batch")
     if by_type.get("retain", 0) != 5:
         fail("the uncapped retain type was throttled by another type's ceiling")
+
+    # THE REGRESSION the ceiling must not introduce: a capped type that phase 2a
+    # DOES claim must not spend the shared budget on rows it cannot keep.
+    #
+    # 12 pending retain (older) + 5 graph_maintenance, shared_limit=9, retain
+    # capped at 2. Phase 2a is one 'ORDER BY created_at LIMIT 9' across both
+    # types, so a post-selection filter selects 9 retain rows, keeps 2, and
+    # claims ZERO graph_maintenance — against upstream's 9 claimed tasks. Bounded
+    # before selection, the at-ceiling type is excluded in SQL and the unspent
+    # budget refills: 2 retain + 5 graph_maintenance.
+    conn5 = FakeConn(rows_of(("retain", 12), ("graph_maintenance", 5)))
+    rows5, by_type5 = claim(conn5, {}, 9, {"retain": 2})
+    print("MIXED_CLAIM_SHARED_BUDGET", sorted(by_type5.items()), "TOTAL", len(rows5))
+    if by_type5.get("retain", 0) != 2:
+        fail(f"retain claimed {by_type5.get('retain', 0)} rows under a ceiling of 2")
+    if by_type5.get("graph_maintenance", 0) != 5:
+        fail(
+            "the shared budget was spent on retain rows the ceiling then discarded: "
+            f"{by_type5.get('graph_maintenance', 0)} of 5 pending graph_maintenance tasks "
+            "were claimed. A ceiling must bound SELECTION, not filter after it, or one "
+            "capped type starves every other type of the whole batch"
+        )
+    if set(conn5.claimed) != {str(r["operation_id"]) for r in rows5}:
+        fail("rows dropped by the ceiling were still marked processing (half-claimed)")
+
+    # L1/L2: with consolidation at its ceiling, phase 2b must not run AT ALL —
+    # no busy-banks scan, no FOR UPDATE locks on rows this worker must discard —
+    # and the budget phase 2a did not spend must still reach the rest of the batch.
+    #
+    # 9 retain (capped at 1) + 9 consolidation (capped at 0), shared_limit=9. A
+    # post-selection filter claims exactly ONE task here and leaves 8 slots idle
+    # against 17 pending, because phase 2a burned all 9 on retain rows it dropped.
+    conn6 = FakeConn(rows_of(("retain", 9), ("consolidation", 9)))
+    rows6, by_type6 = claim(conn6, {}, 9, {"retain": 1, "consolidation": 0})
+    busy_scans = sum(1 for s in conn6.fetches if "SELECT DISTINCT bank_id" in s)
+    print(
+        "AT_CEILING_BATCH", sorted(by_type6.items()), "TOTAL", len(rows6),
+        "BUSY_BANK_SCANS", busy_scans,
+    )
+    if by_type6.get("consolidation", 0) != 0:
+        fail("a type at zero ceiling headroom was still claimed")
+    if by_type6.get("retain", 0) != 1:
+        fail(f"retain claimed {by_type6.get('retain', 0)} rows under a ceiling of 1")
+    if busy_scans != 0:
+        fail(
+            f"phase 2b ran its busy-banks scan {busy_scans}x with consolidation at zero "
+            "ceiling headroom - it takes FOR UPDATE locks on rows it must discard, which "
+            "multi-worker briefly hides head consolidation rows from a worker that does "
+            "have headroom"
+        )
+
+    # …and the same batch with headroom restored proves the skip above is the
+    # ceiling talking, not the probe failing to reach phase 2b at all.
+    conn7 = FakeConn(rows_of(("retain", 9), ("consolidation", 9)))
+    _, by_type7 = claim(conn7, {}, 9, {"retain": 1, "consolidation": 4})
+    busy_scans7 = sum(1 for s in conn7.fetches if "SELECT DISTINCT bank_id" in s)
+    print("HEADROOM_BATCH", sorted(by_type7.items()), "BUSY_BANK_SCANS", busy_scans7)
+    if by_type7.get("consolidation", 0) != 4 or by_type7.get("retain", 0) != 1:
+        fail(f"with headroom the batch should claim 1 retain + 4 consolidation: {by_type7}")
+    if busy_scans7 != 1:
+        fail(f"phase 2b did not run with consolidation headroom left ({busy_scans7} scans)")
 
     # No ceilings == upstream, byte for byte.
     conn4 = FakeConn(pending(12))
@@ -626,42 +746,121 @@ else:
 
 
 # =====================================================================
-# fix 3 - sem= is emitted on EVERY recall
+# fix 3 - the admission wait is OBSERVABLE on every recall, background included
 # =====================================================================
-# Execute the REAL shipping wait-line assembly with a zero admission wait.
-# (It lives in MemoryEngine._search_with_retries, the recall search path.)
+# Executes the REAL shipping completion block: the wait-line assembly AND the
+# 'if not quiet:' emission gate that decides whether any of it reaches the log.
+# Both matter — an unconditional sem= that is then swallowed by _quiet leaves the
+# BACKGROUND population (the one this PR pins at 2 concurrent) emitting nothing,
+# which is the same blind spot that mis-sized the contention in the first place.
+
+
+class _CapturingLogger:
+    """Stands in for the module logger so the emission itself is observable."""
+
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *a, **k):
+        self.lines.append(str(msg))
+
+    error = warning = debug = info
+
+
+def run_completion_block(block, *, quiet, semaphore_wait, max_conn_wait):
+    """Execute the real completion block and return (wait_info, emitted lines)."""
+    log = _CapturingLogger()
+    scope = {
+        "semaphore_wait": semaphore_wait,
+        "max_conn_wait": max_conn_wait,
+        "quiet": quiet,
+        "logger": log,
+        "log_buffer": ["[RECALL r-1] Start"],
+        "recall_id": "r-1",
+        "recall_start": 0.0,
+        "total_time": 1.25,
+        "top_scored": [object()] * 3,
+        "total_tokens": 100,
+        "num_chunks": 1,
+        "total_chunk_tokens": 10,
+        "num_entities": 2,
+        "total_entity_tokens": 20,
+        "fact_type_summary": "world=3",
+    }
+    exec(compile(block, "<recall-completion>", "exec"), scope)
+    return scope["wait_info"], log.lines
+
+
 engine_src = inspect.getsource(me)
-m = re.search(r"^( *)wait_parts = \[\]\n(?:.*?\n)??\1wait_info = [^\n]*", engine_src, re.S | re.M)
+# From 'wait_parts = []' up to (not including) the 'return RecallResultModel('
+# that follows at the same indentation - i.e. the whole completion block.
+m = re.search(
+    r"^( *)wait_parts = \[\]\n(?P<body>(?:.*?\n)*?)\1return RecallResultModel\(",
+    engine_src,
+    re.M,
+)
 if not m:
-    fail("could not locate the recall wait-line assembly - re-author this probe")
+    fail("could not locate the recall completion block - re-author this probe")
 else:
     indent = m.group(1)
+    raw = indent + "wait_parts = []\n" + m.group("body")
     block = "\n".join(
         line[len(indent) :] if line.startswith(indent) else line
-        for line in m.group(0).splitlines()
+        for line in raw.splitlines()
     )
-    scope = {"semaphore_wait": 0.0, "max_conn_wait": 0.0}
-    exec(compile(block, "<recall-wait-line>", "exec"), scope)
-    print("WAIT_INFO_AT_ZERO %r" % scope["wait_info"])
-    if "sem=" not in scope["wait_info"]:
+    if "if not quiet:" not in block:
+        fail("the recall completion block no longer contains the quiet gate - re-author this probe")
+
+    wait_info, loud = run_completion_block(
+        block, quiet=False, semaphore_wait=0.0, max_conn_wait=0.0
+    )
+    print("WAIT_INFO_AT_ZERO %r" % wait_info)
+    if "sem=" not in wait_info:
         fail(
             "sem= is absent when the admission wait is 0.000s - the >0.01s gate hides that a "
             "recall did not queue, so no log scrape can recover the wait distribution"
         )
-    elif "sem=0.000s" not in scope["wait_info"]:
-        fail(f"expected sem=0.000s in the zero-wait line, got {scope['wait_info']!r}")
+    elif "sem=0.000s" not in wait_info:
+        fail(f"expected sem=0.000s in the zero-wait line, got {wait_info!r}")
+    print("FOREGROUND_EMITTED", len(loud))
+    if not any("sem=" in line for line in loud):
+        fail("a foreground recall emitted no sem= line at all")
 
-    scope2 = {"semaphore_wait": 5.43, "max_conn_wait": 0.0}
-    exec(compile(block, "<recall-wait-line>", "exec"), scope2)
-    print("WAIT_INFO_AT_MEASURED_MEAN %r" % scope2["wait_info"])
-    if "sem=5.430s" not in scope2["wait_info"]:
+    wait_info2, _ = run_completion_block(
+        block, quiet=False, semaphore_wait=5.43, max_conn_wait=0.0
+    )
+    print("WAIT_INFO_AT_MEASURED_MEAN %r" % wait_info2)
+    if "sem=5.430s" not in wait_info2:
         fail("a real 5.43s admission wait is no longer reported")
 
-    scope3 = {"semaphore_wait": 0.0, "max_conn_wait": 0.0053}
-    exec(compile(block, "<recall-wait-line>", "exec"), scope3)
-    print("WAIT_INFO_CONN_SUBTHRESHOLD %r" % scope3["wait_info"])
-    if "conn=" in scope3["wait_info"]:
+    wait_info3, _ = run_completion_block(
+        block, quiet=False, semaphore_wait=0.0, max_conn_wait=0.0053
+    )
+    print("WAIT_INFO_CONN_SUBTHRESHOLD %r" % wait_info3)
+    if "conn=" in wait_info3:
         fail("the connection-wait threshold was changed - this fix is scoped to sem= only")
+
+    # THE QUIET GATE. consolidator.py recalls with _quiet=True, so this is the
+    # exact population the background reservation caps. If it emits nothing, the
+    # reservation backing consolidation up is invisible in the logs - the very
+    # failure ("we mis-sized this from biased logs") the fix exists to prevent.
+    _, quiet_lines = run_completion_block(
+        block, quiet=True, semaphore_wait=5.43, max_conn_wait=0.0
+    )
+    quiet_sem = [line for line in quiet_lines if "sem=5.430s" in line]
+    print("QUIET_EMITTED", len(quiet_lines), "QUIET_SEM_LINES", len(quiet_sem))
+    if not quiet_sem:
+        fail(
+            "a quiet (BACKGROUND) recall emitted no sem= line - the whole completion line "
+            "is gated on 'if not quiet:' and the consolidator passes _quiet=True, so the "
+            "population this reservation caps is unobservable and cannot be re-measured"
+        )
+    # …and it stays ONE line: _quiet exists to suppress the multi-line buffer, and
+    # restoring that noise would be a different regression.
+    if len(quiet_lines) > 1:
+        fail(f"a quiet recall emitted {len(quiet_lines)} log records, expected exactly 1")
+    if quiet_sem and "\n" in quiet_sem[0]:
+        fail("the quiet recall line restored the full multi-line log buffer")
 
 
 print("FAILURES", failures)
@@ -846,6 +1045,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       // … and the wiring that causes it: the consolidator's recall is admitted
       // as foreground, straight onto the shared semaphore.
       expect(stdout).toContain("RECALL_ADMISSION_WIRED 0 BARE_SHARED_ACQUIRES 1");
+      expect(stdout).toContain("ADMISSION_ARGS []");
       expect(stdout).toContain("CONSOLIDATOR_RECALLS 1 MARKED_BACKGROUND 0");
       expect(stdout).toContain("CONFIG_HAS_BG_FIELD False");
 
@@ -861,10 +1061,17 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("CONFIG_HAS_SLOT_LIMITS False");
 
       // Defect 3 — a recall that did not queue produces NO wait information at
-      // all, so the 0-wait population is unrecoverable from the logs.
+      // all, so the 0-wait population is unrecoverable from the logs …
       expect(stdout).toContain("WAIT_INFO_AT_ZERO ''");
       expect(stdout).toContain(
         "sem= is absent when the admission wait is 0.000s"
+      );
+      // … and a BACKGROUND (quiet) recall emits nothing whatsoever, even when it
+      // waited 5.43s, because the whole completion line sits behind
+      // `if not quiet:` and the consolidator passes _quiet=True.
+      expect(stdout).toContain("QUIET_EMITTED 0 QUIET_SEM_LINES 0");
+      expect(stdout).toContain(
+        "a quiet (BACKGROUND) recall emitted no sem= line"
       );
       // The >0.01s lines upstream DID emit are unchanged by the fix.
       expect(stdout).toContain(
@@ -898,6 +1105,14 @@ describe.skipIf(!dockerOk || !imageOk)(
       // every consolidator recall is flagged background.
       expect(stdout).toContain("RECALL_HAS_BACKGROUND_PARAM True");
       expect(stdout).toContain("RECALL_ADMISSION_WIRED 1 BARE_SHARED_ACQUIRES 0");
+      // The call's ARGUMENTS, pinned. Asserting only that _recall_admission is
+      // called leaves the split revertible by one token — hard-coding the third
+      // argument to False sends every background recall down the foreground path
+      // while every other assertion in this file stays green.
+      expect(stdout).toContain(
+        "ADMISSION_ARGS ['self._search_semaphore', " +
+          "'self._background_search_semaphore', '_background']"
+      );
       expect(stdout).toContain("CONSOLIDATOR_RECALLS 1 MARKED_BACKGROUND 1");
       // An incoherent admission policy fails at boot rather than silently
       // reintroducing the starvation.
@@ -914,7 +1129,26 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("CEILING_CLAIMED 4 MARKED_PROCESSING 4");
       // … it does not throttle an uncapped type sharing the batch …
       expect(stdout).toContain(
-        "MIXED_CLAIM [('consolidation', 2), ('retain', 5)]"
+        "MIXED_CLAIM_CONSOLIDATION_ONLY [('consolidation', 2), ('retain', 5)]"
+      );
+      // … and — the property the line above cannot see, because phase 2a
+      // excludes consolidation in SQL anyway — a capped type that phase 2a DOES
+      // claim must not spend the shared budget on rows it then discards. 12
+      // older retain capped at 2, 5 graph_maintenance, shared_limit 9: a
+      // post-selection filter claims 2 and 0 here, against upstream's 9.
+      expect(stdout).toContain(
+        "MIXED_CLAIM_SHARED_BUDGET [('graph_maintenance', 5), ('retain', 2)] TOTAL 7"
+      );
+      // At zero headroom phase 2b is skipped outright — no busy-banks scan, no
+      // FOR UPDATE locks on rows this worker must discard — and the budget phase
+      // 2a did not spend is not lost.
+      expect(stdout).toContain(
+        "AT_CEILING_BATCH [('retain', 1)] TOTAL 1 BUSY_BANK_SCANS 0"
+      );
+      // The same batch WITH headroom still reaches phase 2b, so the skip above
+      // is the ceiling talking and not the probe missing the phase entirely.
+      expect(stdout).toContain(
+        "HEADROOM_BATCH [('consolidation', 4), ('retain', 1)] BUSY_BANK_SCANS 1"
       );
       // … and with no ceilings configured the claim path is upstream's.
       expect(stdout).toContain("UNCAPPED_CLAIMED 10");
@@ -941,6 +1175,10 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain(
         "WAIT_INFO_CONN_SUBTHRESHOLD ' | waits: sem=0.000s'"
       );
+      // …and the BACKGROUND population the reservation caps is observable: a
+      // quiet recall emits exactly one line, carrying its admission wait. One,
+      // not the whole buffer — _quiet still suppresses the noise it exists for.
+      expect(stdout).toContain("QUIET_EMITTED 1 QUIET_SEM_LINES 1");
     }, 240_000);
   }
 );
