@@ -130,15 +130,21 @@ describe('activity-card durability wiring', () => {
     )
     expect(orchestrator).toMatch(/await activityCardBootReaper\(\)/)
     // (2) Both orchestrator invocation sites (mutex-won + mutex-fallback)
-    // sit AFTER acquireStartupLock.
+    // sit AFTER acquireStartupLock. Since #3664 they ARM the boot sweep gate
+    // rather than dispatching directly: the sweep now also needs `lockedBot`
+    // to exist (gate.botReady() at the end of initGatewayBot), because every
+    // boot unpin was dereferencing an unassigned lockedBot. The mutex half of
+    // the invariant — reachable only post-lock — is unchanged and asserted
+    // here; the bot-ready half lives in boot-pin-sweep-wiring.test.ts.
     const afterLock = between(gatewaySrc, 'await acquireStartupLock({', 'catch (err)')
-    expect(afterLock).toMatch(/void runBootPinCleanupAndDmSweep\(\)/)
-    // (3) Neither the reaper nor the orchestrator is invoked at module import
+    expect(afterLock).toMatch(/bootPinSweepGate\.arm\(\)/)
+    // (3) Neither the reaper nor the sweep is armed/invoked at module import
     // time — the same losing-double-boot hazard the NOTE at
     // statusPinBootCleanup documents.
     const beforeMain = gatewaySrc.split('await acquireStartupLock({')[0] ?? ''
     expect(beforeMain).not.toMatch(/^\s*void activityCardBootReaper\(\)/m)
     expect(beforeMain).not.toMatch(/^\s*void runBootPinCleanupAndDmSweep\(\)/m)
+    expect(beforeMain).not.toMatch(/^\s*bootPinSweepGate\.(arm|botReady)\(\)/m)
   })
 
   it('the reaper wrapper counts a benign-400 as vanished, not finalized (honest boot log)', () => {
