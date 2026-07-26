@@ -396,6 +396,158 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the recall-admission-split fix (assert-guarded, fail-loud)", () => {
+    // Background consolidation reaches recall through the SAME
+    // MemoryEngine.recall_async a user's turn does, so both contended on the
+    // single `_search_semaphore` admission gate. Measured on this host: mean
+    // admission wait 5.43s, p90 15.7s, max 27.4s against a recall hook whose
+    // per-bank socket timeout is 8s — fleet p50 pinned at 8.02s. The patch
+    // admits background callers through a small reservation semaphore FIRST,
+    // then the same shared one. Behaviour (including that total concurrency is
+    // unchanged) is proven against the pinned upstream image in
+    // tests/docker/hindsight-recall-isolation-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight recall-admission-split patch: anchor found \{n\}x/,
+    );
+    // The admission helper, and the nesting order that makes it a RESERVATION
+    // rather than a second budget: background takes its own semaphore and then
+    // the shared one, so the peak is still recall_max_concurrent.
+    expect(dockerfile).toMatch(
+      /"async def _recall_admission\(shared, background_reservation, is_background\):\\n"/,
+    );
+    expect(dockerfile).toMatch(/"    if is_background:\\n"/);
+    expect(dockerfile).toMatch(/"        async with background_reservation:\\n"/);
+    expect(dockerfile).toMatch(/"            async with shared:\\n"/);
+    // The two call sites: recall_async admits through the helper, and the
+    // consolidator flags its recall as background.
+    expect(dockerfile).toMatch(
+      /"            async with _recall_admission\(\\n"/,
+    );
+    expect(dockerfile).toMatch(/"            _background=True,\\n"/);
+    // The config knob + the boot validation that keeps a foreground floor.
+    expect(dockerfile).toMatch(
+      /ENV_CONSOLIDATION_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT"/,
+    );
+    expect(dockerfile).toMatch(
+      /DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT = 2/,
+    );
+    expect(dockerfile).toMatch(
+      /and self\.consolidation_recall_max_concurrent >= self\.recall_max_concurrent/,
+    );
+    // The DEFAULT is derived from the shared budget rather than fixed, so
+    // lowering HINDSIGHT_API_RECALL_MAX_CONCURRENT cannot turn a deployment
+    // that boots today into one that refuses to boot. Only an EXPLICIT
+    // incoherent value fails validation.
+    expect(dockerfile).toMatch(
+      /def _consolidation_recall_max_concurrent\(getenv\)/,
+    );
+    expect(dockerfile).toMatch(
+      /return max\(1, min\(DEFAULT_CONSOLIDATION_RECALL_MAX_CONCURRENT, shared - 1\)\)/,
+    );
+    // Post-replace re-assertions (verification-on-build). The negative one is
+    // load-bearing: a surviving bare acquisition would let background bypass
+    // the reservation entirely.
+    expect(dockerfile).toMatch(
+      /assert "async def _recall_admission\(" in me_new,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "async with self\._search_semaphore:" not in me_new,/,
+    );
+    expect(dockerfile).toMatch(/assert "_background=True," in cons_new,/);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight recall-admission-split patch: background consolidation recalls now pass a/,
+    );
+  });
+
+  it("keeps the worker-slot-ceiling fix (assert-guarded, fail-loud)", () => {
+    // HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS is a reservation, i.e. a FLOOR:
+    // WorkerPoller._get_available_slots documents that in-flight beyond the
+    // reservation is served from the shared pool, so one type could hold all
+    // DEFAULT_WORKER_MAX_SLOTS = 10 slots. This patch adds the missing CEILING.
+    // Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-recall-isolation-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight worker-slot-ceiling patch: anchor found \{n\}x/,
+    );
+    // The mechanism: a per-type limit table with a consolidation default, an
+    // env parser whose empty string means "uncapped", and the config field.
+    expect(dockerfile).toMatch(
+      /WORKER_SLOT_LIMIT_TYPES: dict\[str, tuple\[str, int \| None\]\] = \{/,
+    );
+    expect(dockerfile).toMatch(
+      /"consolidation": \("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT", 4\)/,
+    );
+    expect(dockerfile).toMatch(
+      /def _parse_worker_slot_limits\(getenv, max_slots: int\)/,
+    );
+    expect(dockerfile).toMatch(/worker_slot_limits=_parse_worker_slot_limits\(/);
+    // Same rule as the admission reservation: a DEFAULT cap is clamped to
+    // worker_max_slots so lowering that knob cannot break boot; an EXPLICIT
+    // over-large cap still fails validation below.
+    expect(dockerfile).toMatch(
+      /limits\[op_type\] = max\(1, min\(int\(default\), max_slots\)\)/,
+    );
+    // Boot validation, at the same point as the existing reservation-sum check.
+    expect(dockerfile).toMatch(/if limit > self\.worker_max_slots:/);
+    expect(dockerfile).toMatch(/if limit < reserved:/);
+    // Enforcement runs BEFORE the row is marked processing — that UPDATE is the
+    // actual claim, so filtering after it would leave rows half-claimed.
+    expect(dockerfile).toMatch(/"        if type_ceilings:\\n"/);
+    expect(dockerfile).toMatch(
+      /"        # Mark all claimed rows as processing\\n"/,
+    );
+    // Threaded from the poller through both DB backends.
+    expect(dockerfile).toMatch(/"        type_ceilings=None,\\n"/);
+    expect(dockerfile).toMatch(
+      /for rel in \("engine\/db\/ops_postgresql\.py", "engine\/db\/ops_oracle\.py"\):/,
+    );
+    expect(dockerfile).toMatch(/slot_limits=config\.worker_slot_limits,/);
+    // The reservations themselves must NOT be renamed here: renaming a shipped
+    // env var is a breaking config change, filed upstream instead.
+    expect(dockerfile).not.toMatch(
+      /HINDSIGHT_API_WORKER_CONSOLIDATION_MIN_SLOTS/,
+    );
+    // Post-replace re-assertions (verification-on-build), including the
+    // ORDERING guard that the filter precedes the claiming UPDATE.
+    expect(dockerfile).toMatch(
+      /assert t\.index\("if type_ceilings:"\) < t\.index\("# Mark all claimed rows as processing"\),/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight worker-slot-ceiling patch: worker_slot_limits is a real per-type CAP/,
+    );
+  });
+
+  it("keeps the sem-wait-always-logged fix (assert-guarded, fail-loud)", () => {
+    // The admission wait was only logged above 0.01s, so recalls that did NOT
+    // queue left no datum and the measured mean was biased upwards by the
+    // missing zeros. Emitting sem= unconditionally makes the distribution
+    // recoverable from the logs. Behaviour is proven against the pinned
+    // upstream image in tests/docker/hindsight-recall-isolation-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight sem-wait-always-logged patch: anchor found \{n\}x/,
+    );
+    // The conditional is the anchor being replaced, and the append is now
+    // unconditional.
+    expect(dockerfile).toMatch(/"            if semaphore_wait > 0\.01:\\n"/);
+    // Post-replace re-assertions (verification-on-build), including the SCOPE
+    // guard: the conn= threshold is deliberately untouched by this patch.
+    expect(dockerfile).toMatch(
+      /assert "if semaphore_wait > 0\.01:" not in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert 'if max_conn_wait > 0\.01:' in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight sem-wait-always-logged patch: sem= now emitted on every recall/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

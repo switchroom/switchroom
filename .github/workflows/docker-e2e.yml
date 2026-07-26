@@ -109,6 +109,7 @@ jobs:
             hindsight:
               - 'docker/Dockerfile.hindsight'
               - 'tests/docker/hindsight-search-patches.test.ts'
+              - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -240,10 +241,12 @@ jobs:
           done
 
   # ─── Hindsight patch probe (F5: this must NEVER silently skip) ────
-  # tests/docker/hindsight-search-patches.test.ts is the only behavioural
-  # evidence that the patches baked into docker/Dockerfile.hindsight actually
-  # change tokenization/error behaviour — a change that reaches every live
-  # agent's recall. It previously used
+  # tests/docker/hindsight-search-patches.test.ts and
+  # tests/docker/hindsight-recall-isolation-patches.test.ts are the only
+  # behavioural evidence that the patches baked into docker/Dockerfile.hindsight
+  # actually change tokenization/error behaviour and recall admission/worker
+  # scheduling — changes that reach every live agent's recall. The first
+  # previously used
   # `describe.skipIf(!imageOk)` with a deliberate no-pull policy, so on a
   # hosted runner (where the 6.4GB upstream image is never present) it
   # reported green without executing a single assertion.
@@ -295,11 +298,22 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-search-patches.test.ts
 
+      - name: Run the hindsight recall-isolation probe (RED/GREEN, must not skip)
+        # Same contract as the step above, for the admission-split /
+        # worker-slot-ceiling / sem-logging patches. A separate step so a
+        # failure names which patch family broke, and so the pulled image is
+        # reused rather than pulled twice.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-recall-isolation-patches.test.ts
+
       - name: Label-scoped teardown
         if: always()
         run: |
-          ids=$(docker ps -aq --filter label=switchroom.test=hindsight-search-patches 2>/dev/null || true)
-          if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches; do
+            ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
+            if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
+          done
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context (see ci-lint.yml header for the
