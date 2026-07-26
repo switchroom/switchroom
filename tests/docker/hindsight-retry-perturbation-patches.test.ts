@@ -11,16 +11,23 @@
  * Dockerfile behaviour change whose revert nothing caught; the remedy that
  * landed was a THREE-layer gate (a build-time assert, a runtime probe, and a
  * bakes-test mention). #3669 shipped layers 1 and 3 only, and the hole is
- * demonstrable: inserting one inert line ahead of the perturbation —
+ * demonstrable: indent the whole perturbation body under a falsy guard —
  *
  *     if os.environ.get("HINDSIGHT_PERTURB"):
- *         pass
- *     _extra = dict(call_kwargs.get("extra_body") or {})
+ *         _extra = dict(call_kwargs.get("extra_body") or {})
+ *         ...
+ *         call_kwargs["extra_body"] = _extra
  *
- * — leaves every literal the bakes test greps for present, still parses under
- * the patch's own `ast.parse`, still satisfies its post-replace text asserts,
- * and reverts the fix. That mutation was measured green on all 24 bakes cases.
+ * — and the fix is inert while every literal the bakes test greps for is still
+ * present. `os` is already imported (`litellm_llm.py:18`), so nothing raises;
+ * the block still parses under the patch's own `ast.parse` and still satisfies
+ * its post-replace text asserts, because those assert on COUNTS of substrings,
+ * not on column. Measured 2026-07-26: all 24 bakes cases green, fix disabled.
  * Only running the patched module catches it, which is what this file does.
+ *
+ * (The weaker mutation of merely INSERTING `if ...: pass` above the body is a
+ * no-op — the perturbation still executes at its original indentation — so it
+ * proves nothing. The indent is what makes it a genuine revert.)
  *
  * THE DEFECT, in the real shipping source. `LiteLLMLLM.call()`
  * (`/app/api/hindsight_api/engine/providers/litellm_llm.py:216`) builds
