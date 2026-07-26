@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Memory recall reranks on the GPU when the host has one
+
+Reranking was the single largest slice of every recall: 2.5-4.0s of a 5.83s
+total on this fleet's host, and the `overlord` bank timed out against its 8s
+per-bank budget almost every time. It ran on the CPU for one reason — the
+hindsight image's venv shipped `torch==2.12.1+cpu`. The reranker's own
+provider (`cross_encoder.py`) already asks for `cuda` when torch offers it.
+
+The image now installs the same torch version from the cu130 wheel index on
+amd64, with a build-time assert that the wheel really is a CUDA build, and
+`switchroom memory setup` passes the GPU through — `--gpus all` on the
+docker-run path, a `deploy.resources.reservations.devices` reservation in the
+generated compose file.
+
+Both are gated on the host-capabilities verdict switchroom already probes for
+voice (NVIDIA GPU present AND the nvidia-container-toolkit wired), so a host
+without a usable GPU is untouched — if CUDA is unreachable when the reranker
+starts, it selects CPU on its own and behaves exactly as it does today.
+
+Embeddings come along for free. They run on the same torch, and make the same
+device probe, so they move to the GPU with no extra work — a smaller win
+(tens of milliseconds a call, not seconds), but a free one.
+
 ## v0.19.22 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
 
 ### LiteLLM paired timeout budgets are now DERIVED, and drift is detected

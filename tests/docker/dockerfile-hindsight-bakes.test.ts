@@ -30,6 +30,45 @@ const dockerfile = readFileSync(
   "utf8",
 );
 
+/**
+ * Every `RUN` instruction, as its own array of physical lines (continuations
+ * folded in).
+ *
+ * Assertions about the CUDA stanza are scoped through this rather than through
+ * a file-wide `dockerfile.search()`. A file-wide search is positional and
+ * therefore fragile in a way that FAILS OPEN: the else-branch used to be
+ * sliced between the first `else \` and the first `fi` anywhere in the file,
+ * so adding an unrelated `if/else` earlier in the Dockerfile would silently
+ * re-point the slice at foreign text and every assertion inside it would go
+ * vacuous while staying green. Scoping to the instruction that actually
+ * contains the CUDA install cannot drift that way.
+ */
+function runInstructions(): string[][] {
+  const lines = dockerfile.split("\n");
+  const out: string[][] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^RUN\b/.test(lines[i])) continue;
+    const block = [lines[i]];
+    while (/\\\s*$/.test(block[block.length - 1]) && i + 1 < lines.length) {
+      block.push(lines[++i]);
+    }
+    out.push(block);
+  }
+  return out;
+}
+
+/** The single RUN instruction carrying the arch-gated CUDA torch install. */
+function cudaTorchRun(): string[] {
+  const matches = runInstructions().filter((b) =>
+    b.join("\n").includes("TARGETARCH:-amd64"),
+  );
+  expect(
+    matches,
+    "exactly one RUN instruction must carry the arch-gated CUDA torch install",
+  ).toHaveLength(1);
+  return matches[0];
+}
+
 describe("Dockerfile.hindsight shape", () => {
   it("extends the canonical upstream image", () => {
     expect(dockerfile).toMatch(
@@ -55,6 +94,128 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /from\s+claude_agent_sdk\s+import\s+query/,
     );
+  });
+
+  it("reinstalls torch from a CUDA wheel index (the reranker runs on GPU)", () => {
+    // The recall reranker is sentence-transformers + PyTorch, and upstream's
+    // cross_encoder.py already selects `cuda` when torch.cuda.is_available().
+    // Upstream's venv ships `torch==2.12.1+cpu` (torch.version.cuda is None),
+    // which is the ONLY reason reranking is CPU-bound. Pin the CUDA reinstall.
+    expect(dockerfile).toMatch(
+      /--index-url\s+https:\/\/download\.pytorch\.org\/whl\/cu\d+/,
+    );
+    // CUDA local-version tag on an explicit version pin. A `+cpu` (or
+    // untagged) requirement would resolve straight back to the CPU build and
+    // silently undo the whole change while every other assertion here passed.
+    const torchReq = dockerfile.match(/'torch==([^']+)'/);
+    expect(torchReq, "the Dockerfile must pin an explicit torch requirement").not.toBeNull();
+    expect(torchReq![1]).toMatch(/^\d+\.\d+\.\d+\+cu\d+$/);
+    expect(torchReq![1]).not.toContain("+cpu");
+    // uv against the existing venv — same rule as the SDK install above
+    // (upstream's uv-managed venv ships no `pip` binary).
+    expect(dockerfile).toMatch(
+      /VIRTUAL_ENV=\/app\/api\/\.venv\s+uv\s+pip\s+install[\s\S]{0,120}?--index-url\s+https:\/\/download\.pytorch\.org/,
+    );
+  });
+
+  it("asserts at BUILD time that torch is really a CUDA build (fail-loud guard)", () => {
+    // The dangerous failure mode is a wheel that installs but resolves back to
+    // CPU (or imports broken): the reranker silently stays slow, or the API
+    // fails to boot, autoheal restart-loops the container, and fleet memory is
+    // down until someone rolls the image tag back. Prove it at BUILD time,
+    // where a failure is just a red CI job.
+    //
+    // The interpreter is part of the assertion, not incidental: the API runs
+    // out of /app/api/.venv, and a bare `python3` is the image's SYSTEM python,
+    // which has its own (or no) torch. Verifying there would green-light a
+    // build whose venv torch is still `+cpu` — the guard would pass while the
+    // thing it guards is broken. Pin the interpreter path.
+    const block = cudaTorchRun();
+    expect(block.join("\n")).toMatch(
+      /\/app\/api\/\.venv\/bin\/python\s+-c\s+["']import torch;\s*assert torch\.version\.cuda,/,
+    );
+    expect(dockerfile).toContain(
+      "switchroom hindsight CUDA-torch install: torch {torch.__version__} is not a CUDA build",
+    );
+    // The assert must FOLLOW the install — one that precedes it proves nothing.
+    // Both indices are taken over the EXECUTABLE lines of this instruction, not
+    // over the whole file: a file-wide search can be satisfied by a decoy in a
+    // comment, which would let a real assert sit above a real install and still
+    // read as ordered.
+    const code = block.filter((l) => !/^\s*#/.test(l));
+    const installIdx = code.findIndex((l) =>
+      /--index-url\s+https:\/\/download\.pytorch\.org/.test(l),
+    );
+    const assertIdx = code.findIndex((l) => /assert torch\.version\.cuda,/.test(l));
+    expect(installIdx, "the CUDA install line must exist").toBeGreaterThanOrEqual(0);
+    expect(assertIdx).toBeGreaterThan(installIdx);
+    // Every torch probe in this instruction — including the non-amd64 branch's
+    // informational one — must use the venv interpreter, for the same reason.
+    // Quote-agnostic: `-c 'import torch;` is the same command as `-c "import
+    // torch;` to the shell, and a double-quote-only pattern would not see it.
+    const probes = block.filter((l) => /-c\s+["']import torch;/.test(l));
+    expect(probes.length, "the instruction must contain torch probes").toBeGreaterThan(0);
+    for (const probe of probes) {
+      expect(probe, "torch probes must run under the venv interpreter").toContain(
+        "/app/api/.venv/bin/python",
+      );
+    }
+  });
+
+  it("restricts the CUDA torch payload to amd64 (fleet GPU hosts are x86_64)", () => {
+    // Multiple GB of vendored nvidia-* libs per arch, on an image already
+    // ~6.4GB, for an arch with no GPU host behind it. Dockerfile.voice makes
+    // the same call. arm64 keeps upstream's CPU torch and reranks on CPU.
+    expect(dockerfile).toMatch(/^ARG TARGETARCH$/m);
+    expect(dockerfile).toMatch(/if \[ "\$\{TARGETARCH:-amd64\}" = "amd64" \]; then/);
+    // ARG must be re-declared inside the stage it is used in: BuildKit's
+    // built-in TARGETARCH is only bound to stages that declare it, and a
+    // declaration above the FROM does not carry into the stage. Note which way
+    // that fails — `${TARGETARCH:-amd64}` defaults an EMPTY value to amd64, so
+    // a missing declaration takes the CUDA branch, not the CPU one. The
+    // resulting hazard is an arm64 build attempting the x86_64 CUDA install
+    // (a hard failure), never a silent CPU fallback on amd64.
+    const fromIdx = dockerfile.search(/^FROM\s+ghcr\.io\/vectorize-io\/hindsight/m);
+    const argIdx = dockerfile.search(/^ARG TARGETARCH$/m);
+    expect(argIdx).toBeGreaterThan(fromIdx);
+
+    // The non-amd64 branch is never EXECUTED by PR CI. Not because the job is
+    // skipped — `build-hindsight` does run on pull_request and passes — but
+    // because PR builds pin `platforms: linux/amd64` and skip the QEMU setup
+    // step (`if: github.event_name != 'pull_request'`), so only the amd64 leg
+    // is ever built there. This assertion is therefore the only thing standing
+    // between that branch and an untested regression, and it has to be
+    // airtight rather than indicative.
+    //
+    // Hence an ALLOWLIST, not a blocklist. Enumerating forbidden spellings
+    // cannot hold: `pip3 install`, `uv add`, `apt-get install
+    // nvidia-cuda-toolkit` and `sh /opt/install-torch.sh` all install things
+    // while matching no plausible blocklist. Requiring each line to BE one of
+    // the two known statements rejects every one of them by construction.
+    const block = cudaTorchRun();
+    const elseIdx = block.findIndex((l) => /^\s*else\s*\\?\s*$/.test(l));
+    const fiIdx = block.findIndex((l) => /^\s*fi\s*;?\s*\\?\s*$/.test(l));
+    expect(elseIdx, "the non-amd64 branch must exist").toBeGreaterThanOrEqual(0);
+    expect(fiIdx).toBeGreaterThan(elseIdx);
+
+    const ELSE_BRANCH_ALLOWED = [
+      /^\s*echo "torch-cuda skipped on non-amd64 arch: \$\{TARGETARCH\}" >&2; \\$/,
+      /^\s*\/app\/api\/\.venv\/bin\/python -c "import torch; print\(f'torch ok \(cpu build\): \{torch\.__version__\}'\)" >&2; \\$/,
+    ];
+    const elseLines = block
+      .slice(elseIdx + 1, fiIdx)
+      .filter((l) => l.trim() !== "" && !/^\s*#/.test(l));
+    expect(
+      elseLines.length,
+      "the non-amd64 branch must contain exactly its two known statements",
+    ).toBe(ELSE_BRANCH_ALLOWED.length);
+    for (const [i, pattern] of ELSE_BRANCH_ALLOWED.entries()) {
+      expect(
+        elseLines[i],
+        `non-amd64 branch line ${i + 1} is not the expected statement — ` +
+          "this branch is unbuilt by PR CI, so anything new here ships unverified",
+      ).toMatch(pattern);
+    }
   });
 
   it("installs the @anthropic-ai/claude-code CLI globally", () => {
