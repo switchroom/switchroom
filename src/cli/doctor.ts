@@ -33,6 +33,7 @@ import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectPro
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
+import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
@@ -1347,6 +1348,17 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // keeps "remembering" nothing and no surface goes red. Inspect each bank's
   // REST surface for unextracted documents and stale mental models.
   results.push(...(await checkBankIngestHealth(config, url, { includeConsolidationBacklog: true })));
+
+  // Auto-recall health (#3619). Reachability, ingest, and /health all stayed
+  // green through the 2026-07 regression while the busiest agents lost their
+  // OWN bank on ~90% of recall fires — the hook exits 0 on a bank timeout and
+  // Claude Code swallows its stderr, so no surface went red for six weeks.
+  // `recall_log.jsonl` is the only durable record; read it per agent so a
+  // degraded recall path becomes an operator-visible row.
+  const memoryAgentsDir = resolveAgentsDir(config);
+  for (const agentName of Object.keys(config.agents)) {
+    results.push(checkAgentRecallHealth(agentName, resolve(memoryAgentsDir, agentName)));
+  }
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {
