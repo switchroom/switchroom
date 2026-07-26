@@ -55,17 +55,32 @@ gh release create "vX.Y.Z" -R switchroom/switchroom \
 ```
 
 - **`--draft` is mandatory.** A published release with no assets immediately becomes `/releases/latest` and 404s every `curl | sh` install for the entire ~25-minute build window. `release.yml` will forcibly re-draft an incomplete published release within about a minute, but do not rely on the safety net — it exists for the case where this step was done wrong.
-- A draft release does **not** create the tag ref. That is 2c's job, and it is why this ordering has no race: the release object exists before the workflows that need it start.
+- Creating the release object *before* the tag is what removes the race: `release.yml`'s `guard` job needs it to exist within ~150s of the tag push.
 - **Notes extraction gotcha (historical):** the naive `awk '/^## vX/,/^## v/' CHANGELOG` range collapses to a single line. Use a start-flag awk: `awk 'f{print} /^## vX\.Y\.Z/{print; f=1} f && /^## v/ && !/^## vX\.Y\.Z/{exit}'` — or extract the section to a temp file by line range.
-- **`gh release create` has been silently dropped in past runs.** Verify with `gh release list -R switchroom/switchroom --limit 5` (a draft does NOT show up under `gh release view` reliably; the list does show drafts). If it didn't create, re-run.
+- **`gh release create` has been silently dropped in past runs.** Verify it exists and is a draft:
+  ```bash
+  gh release view vX.Y.Z -R switchroom/switchroom --json tagName,isDraft
+  ```
+  `gh` resolves drafts by tag name (it falls back to scanning the release list). Note the raw REST `GET /releases/tags/{tag}` does **not** — it 404s on a draft. That difference is why the workflow scripts use the list endpoint; don't "fix" them to use the by-tag endpoint.
 
 ### 2c — Push the tag at that same pinned SHA
 
+GitHub does not create the tag ref for a *draft* release (it creates it on publish), so the tag push below is what actually starts the pipeline. Confirm that before pushing, because if the ref already existed at `$SHA` the push would be a silent no-op and **no workflow would fire**:
+
 ```bash
+git ls-remote --tags origin "refs/tags/vX.Y.Z"   # expect NO output
 git push origin "$SHA:refs/tags/vX.Y.Z"
 ```
 
-This is what fires `docker-images` and `release`. Pushing the SHA-to-ref form rather than `git tag && git push --tags` guarantees the tag lands on the commit you pinned in 2a, not on whatever your local `main` happens to be.
+Pushing the SHA-to-ref form rather than `git tag && git push --tags` guarantees the tag lands on the commit you pinned in 2a, not on whatever your local `main` happens to be. (If the ref *does* already exist at a different commit, the push is rejected — that is the safe direction. Do not force it; work out why first.)
+
+Then confirm both workflows actually started before you walk away:
+
+```bash
+gh run list -R switchroom/switchroom --branch vX.Y.Z --limit 5
+```
+
+You should see a `docker-images` run and a `release` run. If you see neither, the tag ref already existed and nothing fired.
 
 ## Step 3 — Wait for the pipeline (two workflows, one of them orchestrated)
 
