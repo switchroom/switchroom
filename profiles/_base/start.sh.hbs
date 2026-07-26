@@ -458,6 +458,86 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   fi
 {{/if}}
 
+{{#if hindsightEnabled}}
+  # 5) hindsight backlog drain — the memory queue's only real consumer.
+  #
+  #    WHY THIS EXISTS. `pending-retains` is written whenever a retain
+  #    fails, but before this the ONLY automatic thing that drained it was
+  #    the SessionStart hook (`session_start.py`), which runs once per
+  #    session boot under a hard ~9s latency budget against work measured
+  #    at 85-280s per entry. So an agent that simply stays up never drained
+  #    at all: on this fleet 8 of 11 agents had not drained a single entry
+  #    and the queue reached 1,060 files. A memory sitting in that queue is
+  #    a memory the agent cannot recall — the job this feature exists for.
+  #
+  #    A sidecar, not a cron entry: cron fires cost a model turn and depend
+  #    on the agent remembering to keep the entry. This is a deterministic
+  #    mechanism — it runs because the container is up, needs no LLM turn of
+  #    its own, and cannot be prompted away.
+  #
+  #    SERIALISED. `flock -n` on a per-agent lockfile makes overlapping runs
+  #    impossible: a run that overshoots the interval causes the next tick to
+  #    SKIP, never to stack. The lock path is deliberately the one the
+  #    out-of-band recovery tooling also takes, so a manual sweep and this
+  #    loop mutually exclude instead of double-processing an entry.
+  #
+  #    LANE-RESPECTING. Retain extraction is served by a small fixed pool of
+  #    LLM lanes (4 on this fleet, 2 boxes x 2 slots) SHARED with live
+  #    retains, reflect and consolidation, already near saturation. So:
+  #    `HINDSIGHT_DRAIN_CONCURRENCY` is left at its default of 1 (one
+  #    in-flight POST per agent — do not raise it here), `drain_pending`'s
+  #    own inter-retain sleep and p95 backoff still apply, and the first
+  #    tick is delayed by a per-agent offset derived from the agent NAME so
+  #    the fleet does not all wake together. The offset is a `cksum` of the
+  #    name modulo the interval: deterministic (same agent, same offset,
+  #    every boot) and evenly spread, with no shared coordinator.
+  #    HONEST LIMIT: N agents x 1 lane still exceeds 4 lanes when every
+  #    agent has a backlog. The offset spreads the START times; it does not
+  #    cap fleet-wide demand. Sustained oversubscription is absorbed by the
+  #    p95 backoff, and the real fix is more lanes.
+  #
+  #    Failure is never terminal: the drain exits non-zero only when it
+  #    promoted entries to `.dead`, and the loop below ignores the status
+  #    and waits for the next tick. `--backlog` reads api_url/token/bank
+  #    from each queue ENTRY, so this sidecar needs no HINDSIGHT_* env
+  #    (those are exported later, in the inner pass) — only $HOME, to find
+  #    the queue.
+  #
+  #    Kill switch: SWITCHROOM_HINDSIGHT_DRAIN=0 at the container level.
+  #    Interval: SWITCHROOM_HINDSIGHT_DRAIN_INTERVAL_S (default 900s).
+  _hs_drain_script="{{agentDir}}/.claude/plugins/hindsight-memory/scripts/drain_pending.py"
+  if [ "$SWITCHROOM_HINDSIGHT_DRAIN" != "0" ] \
+     && [ -f "$_hs_drain_script" ] \
+     && command -v python3 >/dev/null 2>&1 \
+     && command -v flock >/dev/null 2>&1; then
+    _switchroom_hindsight_drain_loop() {
+      local _script="$1"
+      local _interval="${SWITCHROOM_HINDSIGHT_DRAIN_INTERVAL_S:-900}"
+      # Reject a non-numeric or too-eager interval rather than busy-looping
+      # against the LLM lane. 60s is the floor.
+      case "$_interval" in ''|*[!0-9]*) _interval=900 ;; esac
+      [ "$_interval" -lt 60 ] && _interval=60
+      local _lock="$HOME/.hindsight/drain.lock"
+      mkdir -p "$HOME/.hindsight" 2>/dev/null || true
+      # Deterministic per-agent phase offset (see the note above).
+      local _offset=0
+      if command -v cksum >/dev/null 2>&1; then
+        _offset=$(( $(printf '%s' "{{name}}" | cksum | cut -d' ' -f1) % _interval ))
+      fi
+      echo "[hindsight-drain] starting: interval=${_interval}s offset=${_offset}s lock=${_lock}"
+      sleep "$_offset"
+      while true; do
+        # -n: if a drain (ours or an operator sweep) already holds the
+        # lock, skip this tick entirely instead of queueing behind it.
+        flock -n "$_lock" python3 "$_script" --backlog || true
+        sleep "$_interval"
+      done
+    }
+    _switchroom_supervise hindsight-drain /var/log/switchroom/hindsight-drain.log \
+      _switchroom_hindsight_drain_loop "$_hs_drain_script" &
+  fi
+{{/if}}
+
   export SWITCHROOM_DOCKER_TMUX_INNER=1
   exec tmux -L "switchroom-{{name}}" \
     new-session -A -s "{{name}}" -x 400 -y 50 \
