@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+### A runtime probe for the perturbed-JSON-retry patch, so a silent revert fails CI
+
+#3669 shipped the perturbed-JSON-retry patch with two of the three layers the
+#3660 review established for a build-time source patch: a build-level assert
+and a `dockerfile-hindsight-bakes.test.ts` mention. The missing layer was the
+one that checks BEHAVIOUR, and it is the layer that matters — the bakes
+assertions are unanchored substring matches, so they cannot distinguish
+"this code runs" from "this code is present".
+
+Measured on 2026-07-26, indenting the whole perturbation body under a falsy
+`if os.environ.get(...)` guard (`os` is already imported at
+`litellm_llm.py:18`, so the revert raises nothing) left every asserted literal
+in the file and **all 24 bakes tests passed** while the fix was inert.
+
+`tests/docker/hindsight-retry-perturbation-patches.test.ts` closes that. It
+extracts the real `RUN python3` heredoc from the Dockerfile, applies it to the
+digest-pinned upstream image, and drives `LiteLLMLLM.call()` against a body
+that never parses — asserting the retry is a DIFFERENT request each time:
+
+- RED (unpatched): `EXTRA_BODY [null, null, null, null]`, `TEMPERATURES
+  [0.1, 0.1, 0.1, 0.1]`, `DISTINCT_RETRY_REQUESTS 1 of 4`.
+- GREEN (patched): `TEMPERATURES [0.1, 0.4, 0.7, 0.7]`,
+  `DISTINCT_RETRY_REQUESTS 3 of 4`.
+
+The revert above turns it red. It runs in the `hindsight-probe` job under
+`SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1` (an unavailable docker/image is a hard
+failure, never a skip), and the file is in the `hindsight` paths filter so a
+change to the probe alone still runs it.
+
+### The permanence gate, asserted over the real client wrapping
+
+`pending.is_permanent_failure` decides whether a failed retain is retired to
+`.dead`, and its input is produced by `lib/client.py:91-97` — which catches
+only `HTTPError` and re-raises it as `RuntimeError("HTTP {code} from …")`,
+letting a bare `URLError` through untouched. Every existing permanence test
+injected a synthetic exception at `drain_pending._retry_one`, i.e. ABOVE that
+wrapping, so the shape the gate actually receives in production was asserted
+nowhere.
+
+`TransportFailureEndToEndTest` patches `urllib.request.urlopen` instead and
+drives the real drain: an outage (`URLError`) and a rate limit (`429`) past
+`MAX_ATTEMPTS` keep the memory queued, and a `400` rejection still retires it
+— the second half being what stops "never retire" from trading a data-loss
+bug for an unbounded queue.
+
+#3669 added an equivalent outage case, but to `vendor/hindsight-memory/tests/`,
+which no workflow discovers (`ci-tests-python.yml` runs `unittest discover
+tests/` from `vendor/hindsight-memory/scripts`) — so it never ran. The new
+tests live in the discovered suite and were mutation-checked: dropping the
+gate fails 2 of 3, dropping `429` from `_RETRYABLE_4XX` fails 1, and making
+`is_permanent_failure` always-false fails 1.
+
+Also corrects two comments on the #3669 patch: the class is `LiteLLMLLM`
+(`litellm_llm.py:50`), not `LiteLLMProvider`; and the 0.7 cap's rationale
+cited `call()`'s `max_retries=10` signature default (`litellm_llm.py:223`)
+while the retain path passes `max_retries=llm_max_retries`
+(`fact_extraction.py:1327`, `DEFAULT_LLM_MAX_RETRIES = 3` at `config.py:730`)
+— 4 attempts, contradicting the same comment's own measurement. The cap is
+unchanged and still right; the reason now states both budgets.
+
 ### context7 as a fleet-default MCP — server AND the prompt trigger that makes it get used
 
 Adds Upstash's **context7** (live library/framework documentation lookup) as a

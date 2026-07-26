@@ -26,6 +26,8 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import urllib.error
+import urllib.request
 from contextlib import redirect_stderr
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -1147,6 +1149,96 @@ class BacklogDrainTest(_QueueTempDirMixin, unittest.TestCase):
                 )
         self.assertEqual(summary["reconciled"], 3)
         self.assertEqual(pending.count(), 3, "a dry run must not delete anything")
+
+
+class TransportFailureEndToEndTest(_QueueTempDirMixin, unittest.TestCase):
+    """The permanence gate over the REAL client wrapping (#3669 follow-up).
+
+    Every other permanence test injects a synthetic exception at
+    ``drain_pending._retry_one`` — i.e. ABOVE ``lib/client.py``. That skips
+    the layer which actually decides what a fault LOOKS like to
+    ``pending.is_permanent_failure``: ``client._request`` catches only
+    ``HTTPError`` and re-raises it as ``RuntimeError("HTTP {code} from …")``
+    (lib/client.py:91-97), while a bare ``URLError`` propagates untouched.
+    So the gate's input shape is produced there and asserted nowhere.
+
+    These tests patch ``urllib.request.urlopen`` instead and drive the real
+    drain, keeping that wrapping in the loop. #3669 added an equivalent
+    end-to-end case, but to ``vendor/hindsight-memory/tests/`` — which no
+    workflow discovers (ci-tests-python.yml runs ``unittest discover
+    tests/`` from ``vendor/hindsight-memory/scripts``), so it never ran.
+    """
+
+    def _queue_one(self):
+        pending.enqueue(_payload(content="turn-0", doc=_cd_doc(0)), RuntimeError("boom"))
+        self.assertEqual(pending.count(), 1)
+
+    def _exhaust_attempts(self):
+        """One entry sitting on the MAX_ATTEMPTS boundary."""
+        self._queue_one()
+        path, entry = pending.iter_entries()[0]
+        entry["attempt_count"] = pending.MAX_ATTEMPTS
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entry, f)
+        return path
+
+    @staticmethod
+    def _http_error(code):
+        def raise_it(*_a, **_kw):
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1:9/none/v1/retain",
+                code,
+                "rejected",
+                {},
+                io.BytesIO(b'{"detail":"rejected"}'),
+            )
+
+        return raise_it
+
+    def _drain_with_urlopen(self, side_effect):
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=side_effect):
+            with redirect_stderr(io.StringIO()):
+                return drain_pending.drain_backlog(CONFIG, phase="drain")
+
+    def test_outage_past_max_attempts_keeps_the_memory(self):
+        """A dead daemon raises bare ``URLError`` — no ``.code``, so transient.
+
+        Before the gate this retired the entry at MAX_ATTEMPTS: an outage
+        destroyed memory that was perfectly saveable.
+        """
+        path = self._exhaust_attempts()
+
+        def down(*_a, **_kw):
+            raise urllib.error.URLError("still down")
+
+        summary = self._drain_with_urlopen(down)
+        self.assertEqual(summary["dead"], 0, "an outage must never retire a memory")
+        self.assertTrue(os.path.exists(path), "the queued memory survives")
+        self.assertFalse(os.path.exists(path + ".dead"))
+
+    def test_rate_limit_past_max_attempts_keeps_the_memory(self):
+        """429 wears a 4xx code but is the most transient fault there is.
+
+        This is the case the raw ``400 <= code < 500`` rule would get
+        wrong, asserted through the real ``HTTP {code} from …`` wrapping.
+        """
+        path = self._exhaust_attempts()
+        summary = self._drain_with_urlopen(self._http_error(429))
+        self.assertEqual(summary["dead"], 0, "a rate limit must never retire a memory")
+        self.assertTrue(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".dead"))
+
+    def test_server_rejection_past_max_attempts_still_retires(self):
+        """The other half of the gate: a fix that never retires is a leak.
+
+        A positively-rejected payload must still age to ``.dead``, or the
+        queue grows without bound.
+        """
+        path = self._exhaust_attempts()
+        summary = self._drain_with_urlopen(self._http_error(400))
+        self.assertEqual(summary["dead"], 1, "a 4xx rejection must still retire")
+        self.assertTrue(os.path.exists(path + ".dead"))
+        self.assertFalse(os.path.exists(path))
 
 
 class ArchiveFailureNeverDeletesTest(_QueueTempDirMixin, unittest.TestCase):
