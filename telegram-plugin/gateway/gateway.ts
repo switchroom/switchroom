@@ -718,7 +718,7 @@ import {
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
-import { maybeRotate, resolveTurnsJsonlPath } from './turns-jsonl-rotate.js'
+import { maybeRotate, resolveAgentStateDir, resolveTurnsJsonlPath } from './turns-jsonl-rotate.js'
 import {
   buildTurnRecord,
   finalizeBackstopSendGated,
@@ -1032,7 +1032,7 @@ const blockedApprovalStore = createBlockedApprovalStore(
   // Fallback: the agent's OWN state dir, which the scaffold chowns to the agent
   // uid, so a write there always succeeds. Guarantees the record can never be
   // silently lost when the shared dir isn't writable by this agent's uid.
-  process.env.SWITCHROOM_AGENT_STATE_DIR ?? '/state/agent',
+  resolveAgentStateDir(),
 )
 
 /**
@@ -5014,7 +5014,7 @@ function snapshotContextOccupancy(): void {
     } catch {
       cap = null; // config unreadable → show occupancy without a ratio
     }
-    const stateDir = process.env.SWITCHROOM_AGENT_STATE_DIR ?? "/state/agent";
+    const stateDir = resolveAgentStateDir();
     writeContextOccupancySnapshot(
       stateDir,
       buildContextOccupancy(occupancy, cap, Date.now()),

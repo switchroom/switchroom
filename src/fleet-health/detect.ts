@@ -137,14 +137,24 @@ export const GATEWAY_SIGNATURES: Record<GatewaySignal, RegExp> = {
 };
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
- *  (a corrupt line must never crash the scan — RFC: defensive). */
+ *  (a corrupt line must never crash the scan — RFC: defensive).
+ *
+ *  "Malformed" is not only unparseable JSON: a line that parses to a
+ *  NON-OBJECT (`null`, `7`, `"x"`, `[…]`) is skipped too. Every downstream
+ *  consumer dereferences fields off the record, and `null.agent` /
+ *  `null.turn_id` throws a TypeError that `scanAgent`'s caller
+ *  (`src/fleet-health/scan.ts`) converts into a whole-agent `skipped[]` —
+ *  i.e. one junk byte on disk would silently erase that agent from the health
+ *  board. Skipping the row here keeps the crash-proof contract literal. */
 export function parseTurns(text: string): TurnRecord[] {
   const out: TurnRecord[] = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     try {
-      out.push(JSON.parse(line) as TurnRecord);
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      out.push(parsed as TurnRecord);
     } catch {
       // skip malformed line
     }
@@ -165,10 +175,21 @@ export function parseTurns(text: string): TurnRecord[] {
  * 377 live silent-no-op candidates across the fleet, i.e. the top-priority
  * ledger entry was mostly test fixtures.
  *
- * The rule is deterministic and total: a row whose `agent` is set and does not
- * match the scanned agent is not that agent's production signal, so it never
- * enters findings or the status mix. Rows with no `agent` field are kept (they
- * cannot be attributed anywhere else).
+ * The rule is deterministic and TOTAL — total in the literal sense: it is
+ * defined for every value `parseTurns` can hand it, and it never throws.
+ * `parseTurns` does no shape validation beyond "is an object" (a corrupt line
+ * must never crash the scan), so `agent` can be any JSON value. Only a STRING
+ * `agent` can attribute a row to another agent; anything else (missing, number,
+ * array, object, null) is unattributable and is KEPT — dropping it would be a
+ * guess, and throwing on it would be worse than both. A thrown TypeError here
+ * propagates out of `scanAgent` into `src/fleet-health/scan.ts`'s catch, which
+ * pushes the WHOLE agent into `skipped[]` — one junk row would erase every real
+ * finding for that agent from the ledger, which is the same "health board lies"
+ * failure this filter exists to prevent.
+ *
+ * So: a row whose `agent` is a string that does not match the scanned agent is
+ * not that agent's production signal and never enters findings or the status
+ * mix. Every other row is kept.
  *
  * The write-side path fix (`resolveTurnsJsonlPath`) stops NEW foreign rows;
  * this keeps the ones already on disk — and any future cross-attribution — out
@@ -180,8 +201,13 @@ export function ownedTurns(
 ): TurnRecord[] {
   const slug = agent.trim().toLowerCase();
   return turns.filter((t) => {
-    const owner = t.agent?.trim().toLowerCase();
-    return owner == null || owner === "" || owner === slug;
+    // Type-guard, not an optional chain: `t.agent` is typed `string | undefined`
+    // but arrives unvalidated from JSON.parse, so `?.trim()` is a TypeError
+    // waiting on `{"agent":123}`.
+    const raw: unknown = t?.agent;
+    if (typeof raw !== "string") return true;
+    const owner = raw.trim().toLowerCase();
+    return owner === "" || owner === slug;
   });
 }
 
@@ -207,7 +233,11 @@ export function detectTurnFindings(
   const findings: Finding[] = [];
   const silentNoopFloorTs = opts.silentNoopFloorTs ?? SILENT_NOOP_FLOOR_TS;
   for (const t of ownedTurns(agent, turns)) {
-    const tid = t.turn_id ?? "?";
+    // Same unvalidated-JSON hazard as `ownedTurns`: `turn_id` is typed
+    // `string | undefined` but a row on disk can carry any JSON value, and
+    // `tid.includes(...)` below would throw on a number — erasing the whole
+    // agent from the ledger via scan.ts's catch.
+    const tid = typeof t.turn_id === "string" ? t.turn_id : "?";
     const st = t.status;
     const tl = typeof t.tools === "number" ? t.tools : 0;
     const dur = typeof t.duration_ms === "number" ? t.duration_ms : 0;

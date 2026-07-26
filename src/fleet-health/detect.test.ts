@@ -260,3 +260,72 @@ describe("cross-attributed rows never count as this agent's drift", () => {
     expect(res.escalate).toBe(false);
   });
 });
+
+describe("the attribution filter is TOTAL — one junk row cannot erase an agent", () => {
+  // `parseTurns` does no shape validation ("a corrupt line must never crash the
+  // scan"), so `agent` / `turn_id` can hold ANY JSON value. `ownedTurns`
+  // dereferences `agent`; a TypeError there escapes `scanAgent` into
+  // src/fleet-health/scan.ts's catch, which drops the WHOLE agent into
+  // `skipped[]` — every real finding for that agent silently vanishes from the
+  // ledger. That is the same "health board lies" failure the filter exists to
+  // prevent, so malformed rows must be inert, never fatal.
+  const real = (seq: number) =>
+    JSON.stringify({
+      ts: SILENT_NOOP_FLOOR_TS + seq,
+      agent: "alpha",
+      turn_id: `${CHAT}:_#${seq}`,
+      status: "complete",
+      tools: 0,
+      duration_ms: 1000,
+    });
+
+  const junkAgents = [
+    ['number `agent`', '{"ts":1,"agent":123,"turn_id":"j1","status":"complete","tools":0}'],
+    ['array `agent`', '{"ts":1,"agent":["x"],"turn_id":"j2","status":"complete","tools":0}'],
+    ['object `agent`', '{"ts":1,"agent":{"n":"x"},"turn_id":"j3","status":"complete","tools":0}'],
+    ['null `agent`', '{"ts":1,"agent":null,"turn_id":"j4","status":"complete","tools":0}'],
+    ['boolean `agent`', '{"ts":1,"agent":true,"turn_id":"j5","status":"complete","tools":0}'],
+  ] as const;
+
+  for (const [label, row] of junkAgents) {
+    it(`${label}: does not throw, and the row is KEPT (unattributable, as before)`, () => {
+      const parsed = parseTurns(row);
+      expect(parsed).toHaveLength(1);
+      expect(() => detectTurnFindings("alpha", parsed)).not.toThrow();
+      // `killed-incomplete-turn` is not in play (status complete); the row is
+      // present in the scan rather than dropped — matching the pre-filter
+      // behaviour where a non-string `agent` was simply never read.
+      const res = scanAgent("alpha", row, "");
+      expect(res.turns).toBe(1);
+    });
+  }
+
+  it("a junk row does not take the agent's REAL findings down with it", () => {
+    // The regression shape: one bad line on disk + real drift. Before the fix
+    // the whole scan threw and scan.ts skipped the agent, so the real
+    // silent-no-op finding disappeared from the ledger.
+    const text = [real(1), '{"ts":2,"agent":99,"turn_id":"j","status":"complete","tools":0}'].join(
+      "\n",
+    );
+    const res = scanAgent("alpha", text, "");
+    expect(res.findings.map((f) => f.signal)).toContain("silent-no-op-candidate");
+  });
+
+  it("a non-string `turn_id` is inert too (the `synthetic-` probe would throw)", () => {
+    const row = '{"ts":1,"agent":"alpha","turn_id":7,"status":"killed","tools":0}';
+    expect(() => scanAgent("alpha", row, "")).not.toThrow();
+    expect(scanAgent("alpha", row, "").findings.map((f) => f.signal)).toEqual([
+      "killed-incomplete-turn",
+    ]);
+  });
+
+  it("parseTurns skips lines that parse to a NON-OBJECT", () => {
+    // `JSON.parse("null")` succeeds, so these are not caught by the try/catch;
+    // every consumer then dereferences a field off `null` and throws.
+    expect(parseTurns(['null', '7', '"x"', '[1,2]', 'true'].join("\n"))).toEqual([]);
+    expect(() => scanAgent("alpha", "null", "")).not.toThrow();
+    // …and a junk line never displaces a valid neighbour.
+    const res = scanAgent("alpha", ["null", real(9)].join("\n"), "");
+    expect(res.turns).toBe(1);
+  });
+});

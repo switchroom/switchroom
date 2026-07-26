@@ -33,7 +33,7 @@
  * on); PR-E drives the funnel flag in a separate worker with its env pre-set.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -419,5 +419,37 @@ describe('turn-lifecycle characterization — idle-only sweeps (P0c gate: tick b
     expect(seam.obligationLedger.isOpen(originTurnId)).toBe(true)
     // Clean up for later cases.
     seam.obligationLedger.close(originTurnId)
+  })
+})
+
+describe('turn-lifecycle characterization — the turn record lands in THIS test\'s state dir', () => {
+  // The leak this pins: `emitTurnRecord` hard-coded `/state/agent/turns.jsonl`,
+  // so THIS harness — which drives the real turn-end funnel with
+  // SWITCHROOM_AGENT_NAME=chartestagent — appended its synthetic rows into the
+  // production turn record of whichever agent container it ran in, even though
+  // it had isolated SWITCHROOM_AGENT_STATE_DIR into a tmpdir. The fleet-health
+  // L0 sensor then scored those rows as that agent's real production turns
+  // (356 foreign rows on disk, 267 of 377 live silent-no-op candidates).
+  //
+  // Self-driving (does not lean on the cases above), so it fails on the bug
+  // whatever order or filter it runs under.
+  it('emitTurnRecord writes turns.jsonl under SWITCHROOM_AGENT_STATE_DIR, stamped with this agent', () => {
+    const turnsPath = join(stateDir, 'turns.jsonl')
+    const before = existsSync(turnsPath) ? readFileSync(turnsPath, 'utf-8') : ''
+
+    const turn = makeTurn({ replyCalled: true, finalAnswerDelivered: true })
+    goLive(turn)
+    seam.endCurrentTurnAtomic(turn)
+
+    expect(
+      existsSync(turnsPath),
+      `no turns.jsonl in the isolated state dir (${stateDir}) — the writer ignored ` +
+        'SWITCHROOM_AGENT_STATE_DIR and wrote to a live agent state dir instead',
+    ).toBe(true)
+    const added = readFileSync(turnsPath, 'utf-8').slice(before.length).trim().split('\n')
+    expect(added.length).toBeGreaterThanOrEqual(1)
+    const rec = JSON.parse(added[added.length - 1])
+    expect(rec.agent).toBe(SELF_AGENT)
+    expect(rec.turn_id).toBe(turn.turnId)
   })
 })

@@ -1,6 +1,6 @@
 /**
- * agent-state-dir-guard — a vitest setup file that stops a unit test writing
- * into a LIVE agent's state dir.
+ * agent-state-dir-guard — the test-runner entry point that stops a unit test
+ * writing into a LIVE agent's state dir.
  *
  * ── The defect class this closes ────────────────────────────────────────
  *
@@ -23,21 +23,24 @@
  *
  * ── Mechanism ───────────────────────────────────────────────────────────
  *
- * Wired as a `test.setupFiles` entry, so it runs in every vitest worker BEFORE
- * the test module (and its module-level env writes) is imported. If
- * `SWITCHROOM_AGENT_STATE_DIR` is already set — a test that chose its own
- * tmpdir, or a deliberate override — it is left alone. Otherwise it points at a
- * per-worker tmpdir, so the default can never be a real agent's state dir.
+ * Loaded by BOTH runners, before any test module (and its module-level env
+ * writes) is imported:
  *
- * Same shape as the sibling `auth-net-guard.mjs`: enforced by the runner, with
- * no per-file opt-in to forget.
+ *   vitest    `test.setupFiles` in vitest.config.ts
+ *   bun test  `[test] preload` in bunfig.toml + telegram-plugin/bunfig.toml
+ *             (bun reads the bunfig in its cwd; CI runs `bun test` from
+ *             telegram-plugin/, `npm run test:bun` from the repo root)
+ *
+ * If a guarded var is already set — a test that chose its own tmpdir, or a
+ * deliberate override — it is left alone. Otherwise it points at a per-process
+ * tmpdir (removed at exit), so the default can never be a real agent's state
+ * dir.
+ *
+ * Both wirings are lint-enforced by `npm run lint:agent-state-dir-hermeticity`
+ * (`scripts/check-agent-state-dir-hermeticity.mjs`): deleting either one fails
+ * CI instead of silently un-protecting a runner. Same shape as the sibling
+ * `auth-net-guard.mjs` + `check-auth-test-hermeticity.mjs` pair.
  */
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { installAgentStateDirGuard } from "./agent-state-dir-guard-core.mjs";
 
-if (!process.env.SWITCHROOM_AGENT_STATE_DIR) {
-  process.env.SWITCHROOM_AGENT_STATE_DIR = mkdtempSync(
-    join(tmpdir(), "switchroom-vitest-agent-state-"),
-  );
-}
+installAgentStateDirGuard();

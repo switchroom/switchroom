@@ -335,6 +335,11 @@ export default defineConfig({
       // status-query-telemetry.test.ts uses bun:test (truthful-telemetry PR) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/status-query-telemetry.test.ts",
+      // agent-state-dir-preload.test.ts is the runtime alarm for the BUN half
+      // of the state-dir guard (bunfig.toml `[test] preload`) — it must run
+      // under bun by definition. The vitest half is pinned by
+      // tests/agent-state-dir-guard.test.ts.
+      "**/telegram-plugin/tests/agent-state-dir-preload.test.ts",
     ],
     coverage: {
       provider: "v8",
