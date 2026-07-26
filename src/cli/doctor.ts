@@ -1551,6 +1551,15 @@ export function buildPendingRetainsProbeScript(
     `P=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json$' || true); ` +
     `D=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json\\.dead$' || true); ` +
     `fi; ` +
+    // `.dead` markers are now retired into the `pending-dead/` SIBLING rather
+    // than left among the live entries (a marker is the only remaining copy of
+    // its memory, and the queue directory is what janitors sweep). Both
+    // locations are summed: counting only the in-queue form would make the
+    // relocation read as "0 dead", i.e. silently retire the operator's only
+    // view of permanently-failed retains.
+    `if [ -d '${base}/pending-dead' ]; then ` +
+    `D=$((D + $(ls -1 '${base}/pending-dead' 2>/dev/null | grep -c '\\.dead$' || true))); ` +
+    `fi; ` +
     `for L in '${base}/pending-drops.json' '${dir}/.drops.json'; do ` +
     `if [ "$X" = 0 ] && [ -f "$L" ]; then ` +
     `X=$(grep -o '"count"[^0-9]*[0-9][0-9]*' "$L" 2>/dev/null ` +

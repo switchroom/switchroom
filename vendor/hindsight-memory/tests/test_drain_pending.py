@@ -15,6 +15,21 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 
+def _dead_marker(path: str) -> str:
+    """Where `mark_dead` puts the marker for the queue entry at `path`.
+
+    NOT `<path>.dead` any more: a marker is the only remaining copy of its
+    memory, so it leaves the live queue directory for the `pending-dead/`
+    sibling rather than sitting in the directory external janitors glob
+    (switchroom #3697). Asserting the old spelling made this suite red on a
+    deliberate change -- invisibly, because CI discovers only
+    `scripts/tests/`.
+    """
+    from lib.pending import dead_dir
+
+    return os.path.join(dead_dir(), os.path.basename(path) + ".dead")
+
+
 class FakeOk:
     """Minimal urlopen() context-manager stand-in for a 200 OK."""
 
@@ -229,7 +244,7 @@ class DrainPendingTest(unittest.TestCase):
             summary = drain_pending.drain({})
         self.assertEqual(summary["dead"], 1)
         self.assertFalse(os.path.exists(path))
-        self.assertTrue(os.path.exists(path + ".dead"))
+        self.assertTrue(os.path.exists(_dead_marker(path)))
 
     def test_drain_max_attempts_keeps_the_memory_on_a_transient_failure(self):
         """A dead upstream must never retire a memory, however many attempts.
@@ -251,7 +266,7 @@ class DrainPendingTest(unittest.TestCase):
         self.assertEqual(summary["dead"], 0)
         self.assertEqual(summary["retried"], 1)
         self.assertTrue(os.path.exists(path))
-        self.assertFalse(os.path.exists(path + ".dead"))
+        self.assertFalse(os.path.exists(_dead_marker(path)))
 
     def test_drain_stall_guard_stops_after_threshold(self):
         # Seed 10 entries; with a same-error-class stream, the stall
