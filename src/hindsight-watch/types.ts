@@ -42,8 +42,10 @@ export interface Sample {
    * Post-#3610 this counts memory PARTS, not memories: one oversized
    * transcript enqueues one entry per part, where the part size is derived
    * from the retain client deadline (`retain_content_limit()`; 45,000 chars at
-   * the 280s deadline #3610 shipped, 48,000 at the 310s it is now — see B7a in
-   * `thresholds.ts`). Every threshold compared against it is scaled by
+   * the 280s deadline #3610 shipped, 48,000 at the 310s of B7a, and 33,000
+   * since #3694 sized it to a FRACTION of that deadline rather than all of it
+   * — see B7a/B7b in `thresholds.ts`). Every threshold compared against it is
+   * scaled by
    * `PARTS_PER_MEMORY`.
    */
   pending: number;

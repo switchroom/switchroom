@@ -68,7 +68,8 @@ from typing import Optional
 # The bound — derived, not chosen
 # ---------------------------------------------------------------------------
 #
-#   max_content_chars = retain_chunk_size × floor(client_deadline / chunk_latency)
+#   max_content_chars = retain_chunk_size
+#                       × floor(client_deadline × deadline_safety / chunk_latency)
 #
 # Each input is a measured or read property of the deployment, not a taste
 # call, and each is env-overridable so the bound tracks the deployment:
@@ -112,15 +113,44 @@ from typing import Optional
 #                               NOT a hand-set number on either side — change
 #                               `src/litellm/timeout-budget.ts` and both move.
 #
-#   floor(310 / 18.4) = 16 chunks  →  16 × 3000 = 48,000 chars
+#   deadline_safety    0.7    — the FRACTION of the deadline a maximally-sized
+#                               part is allowed to consume. See below; this
+#                               input did not exist until #3694 and was
+#                               effectively 1.0.
 #
-# Sanity check against the same backlog: every entry at or below 60,000 chars
-# drained successfully inside the (then 280s) deadline (observed per-entry
-# times 0.3s–153.4s at concurrency 3), so 48,000 still sits inside
-# demonstrated-good territory with margin for a slower model or a busier box.
+#   floor(310 × 0.7 / 18.4) = 11 chunks  →  11 × 3000 = 33,000 chars
+#
+# WHY THERE IS A SAFETY FRACTION AT ALL (#3694). Without it the bound was
+# `floor(deadline / latency)`, which sizes a maximally-sized part to consume
+# ~100% of the deadline BY CONSTRUCTION: 16 × 18.4 = 294.4s against a 310s
+# deadline is 15.6s — 5% — of headroom for the POST/response, server queueing,
+# and any chunk slower than the n=752 MEAN the latency input is. Half the
+# extraction calls are slower than the mean; a part sized to the mean therefore
+# misses the deadline roughly half the time. `drain_pending._backlog_timeout()`
+# defaults to the SAME deadline, so the drainer inherits the same zero margin,
+# times the entry out, bumps its attempt count, and after MAX_ATTEMPTS ages it
+# to `.dead`. That is not a theory: on this fleet every `.dead` marker measured
+# on 2026-07-26 held content of 16,076–44,568 chars — every one of them UNDER
+# the then-current 45,000 bound. The bound was manufacturing dead memories.
+#
+# 0.7 is not a taste call either: it is the utilisation at which the observed
+# per-chunk latency distribution fits, and it independently matches the 30,000
+# char limit the host-side stopgap converged on empirically before this landed.
+# At 0.7 a maximally-sized part is 11 × 18.4 = 202.4s against 310s, leaving
+# 107.6s — enough for a chunk distribution ~50% worse than its own mean.
+#
+# The trade is more parts per logical memory (33,000 rather than 48,000 chars
+# each). That costs nothing in total LLM work — the chunk count across the
+# whole memory is unchanged, only its grouping — and each part now finishes.
+# A part that finishes is worth strictly more than a larger part that does not.
 DEFAULT_RETAIN_CHUNK_SIZE = 3000
 DEFAULT_RETAIN_CHUNK_LATENCY_S = 18.4
 DEFAULT_RETAIN_CLIENT_DEADLINE_S = 310.0
+
+# Fraction of the client deadline a maximally-sized part may consume.
+# Clamped to (0, 1]: a value above 1.0 would size parts to overrun the
+# deadline outright, which is the defect this input exists to prevent.
+DEFAULT_RETAIN_DEADLINE_SAFETY = 0.7
 
 # Absolute floor: one chunk. A bound below one chunk would split every
 # transcript into extraction-sized confetti and is never the right answer.
@@ -151,6 +181,18 @@ def retain_client_deadline() -> float:
     return _env_number("HINDSIGHT_RETAIN_CLIENT_DEADLINE_S", DEFAULT_RETAIN_CLIENT_DEADLINE_S)
 
 
+def retain_deadline_safety() -> float:
+    """Fraction of the client deadline a maximally-sized part may consume.
+
+    Clamped to ``(0, 1]``. A value above 1.0 is not honoured: it would size
+    parts to overrun the deadline by construction, which is exactly the defect
+    (#3694) this input exists to prevent, so it is treated as "no margin at
+    all" — 1.0 — rather than as a licence to go further.
+    """
+    value = _env_number("HINDSIGHT_RETAIN_DEADLINE_SAFETY", DEFAULT_RETAIN_DEADLINE_SAFETY)
+    return min(1.0, value)
+
+
 def retain_content_limit() -> int:
     """Max chars of retain content that can complete inside the client deadline.
 
@@ -170,7 +212,12 @@ def retain_content_limit() -> int:
     latency = _env_number("HINDSIGHT_RETAIN_CHUNK_LATENCY_S", DEFAULT_RETAIN_CHUNK_LATENCY_S)
     deadline = retain_client_deadline()
 
-    chunks = int(deadline // latency)
+    # A FRACTION of the deadline, not all of it (#3694). Sizing to the whole
+    # deadline leaves a maximally-sized part no headroom for the POST itself,
+    # server queueing, or a chunk slower than the MEAN `latency` is measured
+    # as — so the part times out, the drain bumps its attempt count, and it
+    # ages to `.dead`. See the derivation block at the top of this module.
+    chunks = int((deadline * retain_deadline_safety()) // latency)
     if chunks < 1:
         chunks = 1
     return max(MIN_RETAIN_CONTENT_CHARS, chunk_size * chunks)
