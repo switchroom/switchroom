@@ -49,6 +49,7 @@
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrative-flush.js'
 import { richMessage } from '../rich-send.js'
+import { isSendGateShed } from '../send-gate.js'
 import { appendShownBlock } from '../shown-ledger.js'
 import {
   appendActivityLabel, clipNarrative, formatStepSuffix, renderActivityFeedWithNested,
@@ -446,10 +447,41 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
             )
           } else {
             const id = turn.activityMessageId
-            await robustApiCall(
+            // #3620: the live activity card is THE highest-volume repeated
+            // editMessageText on one message id in the whole gateway, and until
+            // this fix it passed NO `messageId` / `editPayload` to the send
+            // gate. `sendGate.gate` only routes to its edit path when BOTH are
+            // present (send-gate.ts `gate()`), so every card edit fell through
+            // to the plain-send path: no per-message edit floor, no
+            // last-write-wins coalescing, no no-op payload skip, and — because
+            // an untagged non-edit send defaults to `critical`
+            // (UNTAGGED_SEND_CLASS) — never shed and never budget-capped. The
+            // card was therefore free to edit one message at the per-chat
+            // bucket rate (1/s = 60/min) for as long as a turn ran, which is
+            // what earned the 2026-07-25 62-minute flood ban.
+            //
+            // Tagging it COSMETIC + keying it engages all four protections,
+            // including the long-horizon per-message edit budget that is
+            // scoped to cosmetic edits.
+            const editRes = await robustApiCall(
               () => bot.api.editMessageText(chat, id, richMessage(html), {}),
-              { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.edit' },
+              {
+                chat_id: chat,
+                ...(thread != null ? { threadId: thread } : {}),
+                verb: 'activity-summary.edit',
+                priorityClass: 'cosmetic',
+                messageId: id,
+                editPayload: html,
+              },
             )
+            // Shed honesty: a shed edit did NOT land (the gate resolves the
+            // SEND_GATE_SHED sentinel, not `undefined`). Leaving
+            // `activityLastSentRender` behind keeps the newest render PENDING so
+            // the next drain (a fresh tool label, or the feed heartbeat)
+            // repaints it, and `break`ing stops the drain hot-looping against a
+            // closed gate. A no-op drop still resolves `undefined` — that
+            // payload IS on screen, so it advances normally below.
+            if (isSendGateShed(editRes)) break
           }
           turn.activityLastSentRender = target
         } catch (err) {
@@ -853,7 +885,21 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
       try {
         await robustApiCall(
           () => bot.api.editMessageText(chat, id, richMessage(finalHtml), {}),
-          { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.finalize' },
+          {
+            chat_id: chat,
+            ...(thread != null ? { threadId: thread } : {}),
+            verb: 'activity-summary.finalize',
+            // Keyed for the same reason as the drain edit: this edits the SAME
+            // message id the drain has been repainting, so it must share that
+            // message's edit floor / coalescer / budget rather than slipping
+            // past the gate as an untagged `critical` send. `useful` (not
+            // `cosmetic`) because it paints the card's terminal state — it may
+            // be deferred, but it should not be shed at the first sign of
+            // pressure.
+            priorityClass: 'useful',
+            messageId: id,
+            editPayload: finalHtml,
+          },
         )
       } catch (err) {
         // Same transport-class discipline as the delete path: the card
