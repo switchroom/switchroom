@@ -259,7 +259,9 @@ DUPLICATE_MAX_BYTES = int(
 )
 # ``resplit_over_bound_entries`` retires the pre-split original here. Like
 # the duplicate archive, this copy is REDUNDANT by construction: it is only
-# moved after its parts are queued, and the parts carry the whole memory. So
+# moved once at least one NEW queue file exists for it (a dedupe hit is not a
+# new file — see ``resplit_over_bound_entries``), and the parts carry the
+# whole memory. So
 # it is bounded on the same terms — a MOVE into a capped archive, never a
 # delete of a memory that has nowhere else to live. (``pending-dead/`` is the
 # deliberate exception: see :func:`dead_dir`.)
@@ -275,7 +277,18 @@ RESPLIT_MAX_BYTES = int(
 # them in would round-trip a stale `failed_at`/`attempt_count` into the new
 # entries and mis-order the queue.
 _ENTRY_ONLY_FIELDS = frozenset(
-    {"schema", "failed_at", "error_class", "error_message", "attempt_count", "dead_at"}
+    {
+        "schema",
+        "failed_at",
+        "error_class",
+        "error_message",
+        "attempt_count",
+        # `update_attempt` stamps this on every retry. It describes the OLD
+        # entry's attempt history, so carrying it into a fresh part would
+        # pair a `last_attempt_at` from days ago with `attempt_count: 1`.
+        "last_attempt_at",
+        "dead_at",
+    }
 )
 
 MAX_ATTEMPTS = 5
@@ -767,12 +780,29 @@ def resplit_over_bound_entries() -> tuple[int, int]:
     100,000 chars, the largest 744,546 — i.e. 15x the bound.
 
     Ordering matters. The original is archived into ``pending-resplit/`` only
-    AFTER at least one part is durably written, so a crash mid-way leaves the
-    original queued (worst case: the parts are written twice, and a re-split
-    is deterministic, so the second write dedupes onto the first). If NOT ONE
-    part could be written — ``enqueue`` refused the whole memory as larger
-    than the queue cap, or the disk is full — the original is left queued
-    untouched and is not counted. Nothing is deleted on any path.
+    AFTER at least one NEW queue file exists for it, so a crash mid-way leaves
+    the original queued (worst case: the parts are written twice, and a
+    re-split is deterministic, so the second write dedupes onto the first). If
+    NOT ONE new part file appeared — ``enqueue_parts`` refused the whole memory
+    as larger than the queue cap, the disk is full, or every part deduped onto
+    something already queued — the original is left queued untouched and is
+    not counted. Nothing is deleted on any path.
+
+    "NEW file", not "``_enqueue_one`` returned a path", is the load-bearing
+    distinction, and it is why the count is a set difference against the
+    queue listing taken just before the call. ``_enqueue_one`` returns the
+    path of an ALREADY-QUEUED identical entry on a dedupe hit. When the
+    splitter yields a SINGLE part for this content — which it does whenever
+    the entry is over the bound but still one part's worth under the CURRENT
+    bound — ``enqueue_parts`` re-enqueues the payload unchanged, so the dupe
+    key matches the very entry being re-split and the "written" path IS the
+    original. Counting that as a part archived a live memory into a capped
+    archive while logging "into 0 queued part(s)".
+
+    A refusal here does NOT stamp the drop ledger
+    (``record_refusal_as_drop=False``): the ledger means permanently lost and
+    `switchroom doctor` fails on it, but the original is still queued and is
+    retried on every backlog drain, so stamping it would climb forever.
 
     WHAT THIS COSTS, honestly. One entry becomes N, so the queue gets DEEPER
     (measured worst case on this fleet: 744,546 chars -> 23 parts). On a
@@ -791,13 +821,22 @@ def resplit_over_bound_entries() -> tuple[int, int]:
             continue
 
         payload = {k: v for k, v in entry.items() if k not in _ENTRY_ONLY_FIELDS}
-        before = count()
-        first = enqueue(payload, RuntimeError(
-            f"re-split: content was {len(content)} chars, over the current "
-            f"{limit}-char retain bound"
-        ))
-        written = max(0, count() - before)
-        if first is None and written == 0:
+        d = _ensure_dir()
+        before = set(_list_entries(d))
+        _first, returned = enqueue_parts(
+            payload,
+            RuntimeError(
+                f"re-split: content was {len(content)} chars, over the current "
+                f"{limit}-char retain bound"
+            ),
+            record_refusal_as_drop=False,
+        )
+        # New FILES only. A queue-depth delta would be wrong in both
+        # directions: 0 when a part deduped onto an existing entry (the
+        # single-part case dedupes onto the original itself), and understated
+        # whenever `_evict_to_fit` shed an entry to make room for a part.
+        written = len([p for p in returned if os.path.basename(p) not in before])
+        if written == 0:
             print(
                 f"[Hindsight] pending: could not re-split "
                 f"{os.path.basename(path)} ({len(content)} chars, bound "
@@ -1163,13 +1202,45 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     the newest memory was the wrong end to shed from — it is the turn most
     likely to still matter.
     """
+    return enqueue_parts(payload, error)[0]
+
+
+def enqueue_parts(
+    payload: dict,
+    error: BaseException,
+    *,
+    record_refusal_as_drop: bool = True,
+) -> tuple[Optional[str], list[str]]:
+    """``enqueue()``, plus EVERY path ``_enqueue_one`` handed back.
+
+    ``enqueue()`` returns only the first path, which cannot tell a caller
+    how many entries the call actually put in the queue. Callers that own a
+    copy of the memory (``resplit_over_bound_entries`` holds the original)
+    need that: they may only retire their copy once the parts are down.
+
+    The returned list is the paths ``_enqueue_one`` RETURNED, which is not
+    the same as the paths it CREATED — a dedupe hit returns the path of an
+    already-queued identical entry. The caller decides what that means for
+    it; :func:`resplit_over_bound_entries` subtracts the paths that were
+    already queued before the call, which is what makes a re-split that
+    deduped straight back onto its own original count as zero parts.
+
+    ``record_refusal_as_drop=False`` suppresses the drop-ledger entry on the
+    two whole-memory refusals below. ``record_drop`` means "this memory is
+    PERMANENTLY LOST" — `switchroom doctor` fails on a non-zero ledger — so
+    a caller that keeps the memory queued when the refusal comes back must
+    not stamp it. Only the whole-memory refusals are suppressed; a per-part
+    failure inside ``_enqueue_one`` still records, because by then the other
+    parts are queued and the caller will retire its copy.
+    """
     d = _ensure_dir()
 
     content = payload.get("content")
     parts = split_retain_content(content) if isinstance(content, str) else [content]
     total = len(parts)
     if total <= 1:
-        return _enqueue_one(d, payload, error)
+        one = _enqueue_one(d, payload, error)
+        return one, ([] if one is None else [one])
 
     base_doc = payload.get("document_id", "conversation")
     base_meta = payload.get("metadata")
@@ -1193,21 +1264,24 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     # memory that cannot fit, so refuse it here too.
     total_bytes = sum(_entry_blob_bytes(p, error) for p in part_payloads)
     if total_bytes > MAX_BYTES:
-        record_drop(payload, ValueError(
-            f"entry is {total_bytes} bytes across {total} parts, larger than "
-            f"the whole HINDSIGHT_PENDING_MAX_BYTES cap ({MAX_BYTES}); "
-            f"refusing this entry rather than evicting the entire queue for it"
-        ))
-        return None
+        if record_refusal_as_drop:
+            record_drop(payload, ValueError(
+                f"entry is {total_bytes} bytes across {total} parts, larger than "
+                f"the whole HINDSIGHT_PENDING_MAX_BYTES cap ({MAX_BYTES}); "
+                f"refusing this entry rather than evicting the entire queue for it"
+            ))
+        return None, []
     if total > MAX_ENTRIES:
-        record_drop(payload, ValueError(
-            f"entry splits into {total} parts, more than the whole "
-            f"HINDSIGHT_PENDING_MAX_ENTRIES cap ({MAX_ENTRIES}); refusing "
-            f"this entry rather than evicting the entire queue for it"
-        ))
-        return None
+        if record_refusal_as_drop:
+            record_drop(payload, ValueError(
+                f"entry splits into {total} parts, more than the whole "
+                f"HINDSIGHT_PENDING_MAX_ENTRIES cap ({MAX_ENTRIES}); refusing "
+                f"this entry rather than evicting the entire queue for it"
+            ))
+        return None, []
 
     first: Optional[str] = None
+    returned: list[str] = []
     for part_payload in part_payloads:
         # Each part goes through the FULL enqueue pipeline — dedupe, the
         # MAX_BYTES refusal, eviction, the drop ledger — because each part
@@ -1223,9 +1297,11 @@ def enqueue(payload: dict, error: BaseException) -> Optional[str]:
         # evicted part MOVES to ``pending-evicted/``, so it is shed, not
         # destroyed, except under the sustained-ENOSPC case named there.
         written = _enqueue_one(d, part_payload, error)
-        if written is not None and first is None:
-            first = written
-    return first
+        if written is not None:
+            returned.append(written)
+            if first is None:
+                first = written
+    return first, returned
 
 
 def _build_entry(payload: dict, error: BaseException) -> dict:

@@ -68,13 +68,19 @@ documents**, 3,815 of them with facts extracted.
   one group alone was 90 minutes of LLM lane time for a single memory.
 * **Phase 0b — relocate legacy ``.dead`` markers (free, no network).**
   Markers written by an older build into the live queue directory are moved
-  into ``pending-dead/``, so the live queue holds only live entries and no
-  janitor glob over it can match a memory.
+  into ``pending-dead/``. ``mark_dead`` no longer produces such a marker, so
+  after this phase has run once the live queue holds only live entries and no
+  janitor glob over it can match a memory. Note the CONDITION: phases 0b and
+  0c run in BACKLOG mode only (``drain_backlog``, and not under
+  ``--dry-run``). The SessionStart ``drain()`` never calls them, so on a host
+  where the backlog drain has not run, legacy markers are still sitting in
+  the queue directory.
 * **Phase 0c — re-split over-bound entries (free, no network).** An entry
   whose content exceeds ``retain_content_limit()`` needs more sequential
   extraction calls than fit the client deadline, so it can never be drained
   as-is; splitting it makes every part drainable. Measured 2026-07-26: 18 of
-  211 queued entries exceeded 100,000 chars, the largest 744,546.
+  211 queued entries exceeded 100,000 chars, the largest 744,546. Backlog
+  mode only, same as 0b.
 * **Phase 1 — reconcile (free).** GET the document. If it exists, the
   memory is already durable; retire the queue entry without a POST. No
   LLM work, no cost, idempotent, resumable at any point. Only for

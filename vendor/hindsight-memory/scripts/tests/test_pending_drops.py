@@ -2659,6 +2659,38 @@ class DeadMarkersLeaveTheLiveQueueTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertTrue(os.path.exists(path), "the live entry must survive")
         self.assertEqual(pending.count(), 1)
 
+    def test_a_failed_REPLACE_also_leaves_the_entry_QUEUED(self):
+        """The other half of "FAILURE IS NOT DELETION".
+
+        `test_an_unwritable_dead_archive_leaves_the_entry_QUEUED` fails at
+        `os.makedirs`, so the tmp never exists and the cleanup block's
+        `os.unlink(tmp)` raises before anything else in it can run -- which
+        shields a stray `os.unlink(path)` placed AFTER it from ever being
+        observed. Here the tmp write SUCCEEDS and only `os.replace` fails, so
+        every statement in the cleanup block executes.
+        """
+        path = pending.enqueue(_payload(content="stays"), RuntimeError("x"))
+        real_replace = os.replace
+
+        def _fail_replace(src, dst, *a, **kw):
+            if str(dst).endswith(".dead"):
+                raise OSError("replace refused")
+            return real_replace(src, dst, *a, **kw)
+
+        with unittest.mock.patch("os.replace", side_effect=_fail_replace):
+            self.assertIsNone(
+                pending.mark_dead(path, dict(_payload(content="stays")))
+            )
+
+        self.assertTrue(os.path.exists(path), "the live entry must survive")
+        self.assertEqual(pending.count(), 1)
+        self.assertEqual(self._dead_names(), [], "no marker, so no copy exists")
+        # And the orphaned tmp really was cleaned up -- that is what the
+        # `os.unlink(tmp)` in the cleanup block is FOR.
+        self.assertEqual(
+            [n for n in os.listdir(pending.dead_dir()) if n.endswith(".tmp")], []
+        )
+
     def test_legacy_markers_in_the_queue_dir_are_relocated_not_deleted(self):
         os.makedirs(self._dir, mode=0o700, exist_ok=True)
         legacy = []
@@ -2882,16 +2914,197 @@ class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 entry = json.load(f)
             pending.update_attempt(path, entry, RuntimeError("again"))
+        # Age the queue stamp explicitly rather than relying on the clock:
+        # `failed_at` is second-resolution, so a same-second test could not
+        # tell a fresh stamp from a round-tripped one.
+        stale_failed_at = "2020-01-01T00:00:00Z"
+        with open(path, encoding="utf-8") as f:
+            stale = json.load(f)
+        stale["failed_at"] = stale_failed_at
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(stale, f)
+        # Guard the fixture: the assertions below are vacuous unless the
+        # original really is carrying every field a retried entry accumulates.
+        self.assertEqual(stale["attempt_count"], 5)
+        self.assertIn("last_attempt_at", stale)
+        self.assertEqual(stale["error_class"], "RuntimeError")
+        self.assertEqual(stale["error_message"], "again")
 
         os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
         pending.resplit_over_bound_entries()
-        for _p, entry in pending.iter_entries():
+        entries = pending.iter_entries()
+        self.assertGreaterEqual(len(entries), 13, "the entry really was split")
+        for _p, entry in entries:
             self.assertEqual(
                 entry["attempt_count"], 1,
                 "a re-split part starts its own budget -- inheriting an "
                 "exhausted one would send it straight back toward .dead",
             )
             self.assertNotIn("dead_at", entry)
+            # `update_attempt` stamps `last_attempt_at`, so it is entry-only
+            # metadata too. Round-tripping it pairs a timestamp from the old
+            # entry's last retry with a fresh `attempt_count: 1` -- an entry
+            # that claims it was last attempted before it was ever queued.
+            self.assertNotIn(
+                "last_attempt_at", entry,
+                "a fresh part has never been attempted",
+            )
+            self.assertEqual(
+                entry["error_class"], "RuntimeError",
+                "the part records why IT was queued (the re-split), not the "
+                "error the original last failed with",
+            )
+            self.assertIn("re-split", entry["error_message"])
+            self.assertNotEqual(
+                entry["failed_at"], stale_failed_at,
+                "a stale failed_at mis-orders the part in the drain queue",
+            )
+            self.assertEqual(entry["schema"], pending.SCHEMA)
+
+    # --- The archive is only earned by a NEW file -------------------------
+    #
+    # `_enqueue_one` returns the path of an ALREADY-QUEUED identical entry on
+    # a dedupe hit, so "enqueue handed back a path" is not "a part was
+    # written". Both cases below are the same bug from two angles: a re-split
+    # that wrote nothing must not archive the original, because the archive
+    # is capped (`_trim_dir`) and the original is then the only copy.
+
+    def test_a_resplit_that_dedupes_onto_its_own_original_STAYS_QUEUED(self):
+        """The real repro, no patching: ONE part, so `enqueue` re-enqueues
+        the payload unchanged, the dupe key matches the entry being re-split,
+        and the "written" path IS the original.
+
+        A JSON transcript is re-serialised compactly by the splitter, so a
+        pretty-printed one over the bound can compact to a single part under
+        it. That is not exotic -- it is any indented transcript whose
+        whitespace is most of its size.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        blocks = [{"type": "text", "text": f"line {i}"} for i in range(60)]
+        content = json.dumps([{"role": "user", "content": blocks}], indent=8)
+        path = pending.enqueue(_payload(content=content), RuntimeError("x"))
+        self.assertEqual(pending.count(), 1)
+
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        self.assertGreater(len(content), 3000, "the entry is over the bound")
+        self.assertEqual(
+            len(retain_split.split_retain_content(content)), 1,
+            "the splitter yields a SINGLE part -- the condition under test",
+        )
+
+        with redirect_stderr(io.StringIO()):
+            entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual((entries, parts), (0, 0))
+        self.assertTrue(os.path.exists(path), "the ONLY copy was archived away")
+        self.assertEqual(pending.count(), 1)
+        self.assertEqual(self._resplit_names(), [], "nothing was earned")
+
+    def test_a_deduped_part_is_not_counted_as_a_written_part(self):
+        """`_enqueue_one` returns an EXISTING path and writes no new file.
+
+        Distinct from `test_an_entry_that_cannot_be_split_STAYS_QUEUED`,
+        which returns None and so makes "no path came back" and "no file
+        appeared" true at once -- it cannot tell the two guards apart.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="d" * 40_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+
+        # Non-None, already on disk, and no new file is created.
+        with unittest.mock.patch.object(pending, "_enqueue_one", return_value=path):
+            with redirect_stderr(io.StringIO()):
+                entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual((entries, parts), (0, 0))
+        self.assertTrue(os.path.exists(path), "never deleted on a no-op split")
+        self.assertEqual(pending.count(), 1)
+        self.assertEqual(self._resplit_names(), [])
+
+    def test_the_part_count_is_not_a_queue_depth_delta(self):
+        """Parts WRITTEN, not queue growth.
+
+        When the queue is near its cap, `_evict_to_fit` sheds an older entry
+        for each part it makes room for, so the depth barely moves while N
+        parts are genuinely written. A depth delta under-reports that (and at
+        the extreme reads 0, which is the "stays queued" signal) -- so the
+        count is taken from what `_enqueue_one` handed back.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        for i in range(10):
+            pending.enqueue(
+                _payload(content=f"filler-{i}", doc=_cd_doc(i + 50)),
+                RuntimeError("x"),
+            )
+        path = pending.enqueue(_payload(content="y" * 40_000), RuntimeError("x"))
+        self.assertEqual(pending.count(), 11)
+
+        # 11 queued + 14 parts does not fit, so writing the parts evicts.
+        pending.MAX_ENTRIES = 20
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        with redirect_stderr(io.StringIO()):
+            entries, parts = pending.resplit_over_bound_entries()
+
+        self.assertEqual(entries, 1)
+        # 20 at the cap, less the original once it is archived out.
+        self.assertEqual(pending.count(), 19, "the cap held, so eviction fired")
+        self.assertLess(
+            19 - 11, 14, "the depth grew by less than the parts written"
+        )
+        self.assertEqual(
+            parts, 14,
+            "every part written is counted, even the ones whose room was "
+            "made by evicting an older entry",
+        )
+        self.assertFalse(os.path.exists(path), "the original was archived")
+
+    # --- A refusal the caller absorbs is not a permanent loss -------------
+
+    def _refused_resplit_leaves_the_ledger_clean(self, cap: str, value: int):
+        """`record_drop` means the memory is GONE; here it is still queued.
+
+        `switchroom doctor` FAILS on a non-zero drop ledger, and phase 0c
+        retries on every backlog drain (10 min on this fleet), so stamping a
+        refusal turns a safely-queued memory into a permanent, monotonically
+        climbing doctor failure.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        path = pending.enqueue(_payload(content="r" * 40_000), RuntimeError("x"))
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        setattr(pending, cap, value)
+
+        with redirect_stderr(io.StringIO()):
+            for _ in range(3):  # every drain retries the same entry
+                self.assertEqual(pending.resplit_over_bound_entries(), (0, 0))
+
+        self.assertEqual(
+            pending.read_drops(), {},
+            "nothing was lost -- the original is still queued and retryable",
+        )
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(self._resplit_names(), [])
+
+    def test_a_resplit_refused_on_the_entry_cap_stamps_no_drop(self):
+        self._refused_resplit_leaves_the_ledger_clean("MAX_ENTRIES", 2)
+
+    def test_a_resplit_refused_on_the_byte_cap_stamps_no_drop(self):
+        self._refused_resplit_leaves_the_ledger_clean("MAX_BYTES", 4096)
+
+    def test_the_producer_path_still_stamps_a_refused_memory_as_dropped(self):
+        """The suppression is scoped to the re-split caller, not global.
+
+        `session_end` / `retain` have no other copy of the memory, so when
+        `enqueue` refuses one the turn really is lost and the ledger is the
+        only record of it.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+        pending.MAX_BYTES = 4096  # smaller than the split memory as a whole
+        with redirect_stderr(io.StringIO()):
+            self.assertIsNone(
+                pending.enqueue(_payload(content="e" * 40_000), RuntimeError("x"))
+            )
+        self.assertEqual(pending.read_drops().get("count"), 1)
+        self.assertEqual(pending.count(), 0)
 
     def test_the_backlog_drain_resplits_before_paying_for_extraction(self):
         os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
