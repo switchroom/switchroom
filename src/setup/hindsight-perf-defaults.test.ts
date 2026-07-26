@@ -33,6 +33,7 @@ import {
   HINDSIGHT_DEFAULT_LINK_EXPANSION_PER_ENTITY_LIMIT,
   HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S,
   HINDSIGHT_DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE,
+  HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT,
   HINDSIGHT_PERF_DEFAULTS_GPU,
   HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
   HINDSIGHT_PERF_DEFAULTS_UNGATED,
@@ -558,6 +559,17 @@ describe("run ⇄ compose parity for the performance defaults", () => {
         }
         // Parity alone is symmetric — two paths that BOTH dropped `perf` would
         // still agree. Pin the operator's values on the compose side directly.
+        // Guard first: the pins below only prove the override travelled if the
+        // override value DIFFERS from the default it replaces. Should either
+        // default ever drift onto the override literal, the pin would pass
+        // against a generator that ignored `perf` entirely — so fail loudly
+        // here instead of going quietly vacuous (same guard as mutation M28).
+        expect(String(HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S)).not.toBe(
+          String(OPERATOR_PERF.env.HINDSIGHT_API_LINK_EXPANSION_TIMEOUT),
+        );
+        expect(String(HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT)).not.toBe(
+          String(OPERATOR_PERF.env.HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT),
+        );
         expect(fromCompose.get("HINDSIGHT_API_LINK_EXPANSION_TIMEOUT")).toEqual(["7"]);
         expect(fromCompose.get("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT")).toEqual(["3"]);
         // ...and at least one gated knob genuinely differs across the matrix,
