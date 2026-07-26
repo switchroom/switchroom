@@ -636,6 +636,7 @@ import { formatUpdateStatusLine } from './update-status-line.js'
 import type { HostdRequest, HostdResponse } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
+import { createBootSweepGate } from './boot-sweep-gate.js'
 import {
   createDmPinSweeper,
   collectDmChatIdsFromStores,
@@ -9292,12 +9293,11 @@ const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
 })
 
 /**
- * Boot-time pin cleanup + DM stale-pin sweep, sequenced under the startup
- * mutex. Collects the DM chat IDs with a prior-session pin record BEFORE the
- * store reapers empty the stores, runs the three existing boot reapers, marks
- * the DM sweep eligible (this gateway now owns the shared state), then
- * unpin-alls each recorded DM chat. Fire-and-forget from the caller — never
- * blocks boot, never rejects unhandled.
+ * Boot-time pin cleanup + DM stale-pin sweep. Collects the DM chat IDs with a
+ * prior-session pin record BEFORE the store reapers empty the stores, runs the
+ * three boot reapers, marks the DM sweep eligible, then unpin-alls each
+ * recorded DM chat. Dispatched only via `bootPinSweepGate` below (mutex won AND
+ * `lockedBot` constructed); fire-and-forget — never blocks boot.
  */
 async function runBootPinCleanupAndDmSweep(): Promise<void> {
   let dmChatIds: string[] = []
@@ -9322,11 +9322,15 @@ async function runBootPinCleanupAndDmSweep(): Promise<void> {
   await statusPinBootCleanup()
   await activityCardBootReaper()
   await queuedCardBootReaper()
-  // This gateway now owns the shared per-agent pin state — enable the DM
-  // unpin-all path (both the boot sweep below and lazy first-inbound sweeps).
+  // This gateway owns the shared pin state — enable the DM unpin-all path
+  // (the boot sweep below AND lazy first-inbound sweeps).
   dmPinSweepEligible = true
   for (const id of dmChatIds) await dmPinSweeper.sweep(id)
 }
+
+// #3664: needs BOTH the mutex (arm) and a constructed `lockedBot` (botReady,
+// end of initGatewayBot) before it may run — see boot-sweep-gate.ts.
+const bootPinSweepGate = createBootSweepGate({ run: runBootPinCleanupAndDmSweep, onError: (err) => process.stderr.write(`telegram gateway: boot pin cleanup / DM sweep failed: ${(err as Error).message}\n`) })
 
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
 // feed for every turn. The PreToolUse sidecar emits a `tool_label` per tool
@@ -9487,14 +9491,11 @@ if (isGatewayMain) {  // #2996 P0c: gated in place; guarded await never runs on 
       const carrierAgentDir = resolveAgentDirFromEnv()
       if (carrierAgentDir != null) consumeSessionModelCarrierOnHealthyBoot(carrierAgentDir)
     }
-    // We WON the startup mutex — this gateway is the sole live owner of the
-    // shared per-agent status-pin store, so it's now safe to clean up orphaned
-    // pins from a prior (dead) session. Gated here (not at import time) so a
-    // LOSING double-boot never unpins the live holder's legitimate pins.
-    // Fire-and-forget: cleanup is best-effort and must not block boot.
-    // #3026: sequenced so the DM stale-pin sweep runs after the reapers and
-    // only once this gateway owns the shared state.
-    void runBootPinCleanupAndDmSweep()
+    // We WON the startup mutex — the sole live owner of the shared per-agent
+    // pin store may clear a dead session's orphans (a LOSING double-boot must
+    // not, hence arming here, not at import). #3664: arming is HALF the
+    // precondition — the gate holds the sweep until `lockedBot` exists.
+    bootPinSweepGate.arm()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -9517,8 +9518,8 @@ if (isGatewayMain) {  // #2996 P0c: gated in place; guarded await never runs on 
         const carrierAgentDir = resolveAgentDirFromEnv()
         if (carrierAgentDir != null) consumeSessionModelCarrierOnHealthyBoot(carrierAgentDir)
       }
-      // #3026: same sequenced cleanup + DM stale-pin sweep as the mutex path.
-      void runBootPinCleanupAndDmSweep()
+      // #3026: same sequenced cleanup + DM sweep, same #3664 bot-ready gate.
+      bootPinSweepGate.arm()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
@@ -23089,6 +23090,9 @@ async function initGatewayBot(): Promise<void> {
 
   // Install the grammY registration surface (P0a) — once, before the runner.
   registerGatewayHandlers(bot, {})
+
+  // #3664: `lockedBot` exists now — release the boot pin sweep iff armed.
+  bootPinSweepGate.botReady()
 }
 
 // One-shot startup guard. The outer for-loop below re-enters its try block

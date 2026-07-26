@@ -33,6 +33,7 @@ import {
 import { reconcilePin } from "../status-pin-driver.js";
 import type { PinState, DesiredPin } from "../status-pin.js";
 import { decidePinAction } from "../status-pin.js";
+import { makeFloodWaitActiveError } from "../retry-api-call.js";
 
 const PATH = "/state/agent/telegram/status-pins.json";
 
@@ -182,6 +183,83 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
 
+  it("(C) #3664: a never-confirmed unpin (FLOOD_WAIT_ACTIVE) KEEPS the claim + the durable row, and the next boot clears the pin", async () => {
+    // Defect B: the unpin was refused LOCALLY by the send gate, so the message
+    // is provably still pinned. The old driver returned null anyway, which made
+    // reconcileAndPersistStatusPin delete the row and the gateway delete the
+    // in-memory claim — erasing BOTH records of a live pin. Nothing (reaper or
+    // boot sweep) could ever find it again.
+    const { fs } = memFs();
+    const pinned = new Set<string>();
+    let floodOpen = true;
+    const tg = {
+      pinned,
+      api: {
+        pinChatMessage: async (chat_id: string | number, message_id: number) => {
+          pinned.add(`${chat_id}:${message_id}`);
+        },
+        unpinChatMessage: async (chat_id: string | number, message_id: number) => {
+          // The send gate fail-fast: NO request leaves the process.
+          if (floodOpen) throw makeFloodWaitActiveError(16739, Date.now() + 16739_000, null);
+          pinned.delete(`${chat_id}:${message_id}`);
+        },
+      },
+    };
+
+    const gw1 = makeGateway(fs, tg);
+    await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: true, messageId: 715 });
+    expect(pinned.has("-100123:715")).toBe(true);
+
+    // Turn ends → unpin requested → refused locally.
+    await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: false });
+
+    // The pin is STILL UP …
+    expect(pinned.has("-100123:715")).toBe(true);
+    // … and BOTH records survive: the in-memory claim …
+    expect(gw1.statusPinState.get("fg:c:3")).toEqual({ messageId: 715 });
+    // … and the durable row (what boot cleanup reads).
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "fg:c:3", chatId: "-100123", messageId: 715 },
+    ]);
+
+    // Same session, flood window closed: the retained claim retries and clears.
+    floodOpen = false;
+    await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: false });
+    expect(pinned.has("-100123:715")).toBe(false);
+    expect(gw1.statusPinState.has("fg:c:3")).toBe(false);
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
+  it("(D) #3664: if the process dies while the flood window is open, the retained row lets the NEXT boot clear the orphan", async () => {
+    const { fs } = memFs();
+    const pinned = new Set<string>();
+    let floodOpen = true;
+    const tg = {
+      pinned,
+      api: {
+        pinChatMessage: async (chat_id: string | number, message_id: number) => {
+          pinned.add(`${chat_id}:${message_id}`);
+        },
+        unpinChatMessage: async (chat_id: string | number, message_id: number) => {
+          if (floodOpen) throw makeFloodWaitActiveError(16739, Date.now() + 16739_000, null);
+          pinned.delete(`${chat_id}:${message_id}`);
+        },
+      },
+    };
+
+    const gw1 = makeGateway(fs, tg);
+    await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: true, messageId: 715 });
+    await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: false }); // refused
+    // CRASH here — in-memory state is gone, only the durable row remains.
+
+    floodOpen = false;
+    const gw2 = makeGateway(fs, tg);
+    const res = await gw2.bootCleanup();
+    expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
+    expect(pinned.has("-100123:715")).toBe(false);
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
   it("clean shutdown (sweep DID run) leaves nothing for boot cleanup to do", async () => {
     // Contrast: when the SIGTERM sweep runs (unpin each key), the store is
     // emptied and the pin removed — boot cleanup is a no-op. This guards the
@@ -241,15 +319,15 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
     const lockIdx = lines.findIndex((l) => l.includes("acquireStartupLock({"));
     expect(lockIdx).toBeGreaterThan(-1);
 
-    // Every `void runBootPinCleanupAndDmSweep()` invocation must come AFTER
-    // the acquireStartupLock outcome is available (the boot block the winner
-    // — or the link()-unsupported fallback — reaches).
+    // #3664: the winner ARMS the bot-ready gate rather than dispatching the
+    // sweep inline. Every arm() site must still come AFTER the
+    // acquireStartupLock outcome is available (the boot block the winner — or
+    // the link()-unsupported fallback — reaches).
     const callIdxs = lines
       .map((l, i) => ({ l, i }))
       .filter(
         ({ l }) =>
-          /void runBootPinCleanupAndDmSweep\(\)/.test(l) &&
-          !l.trimStart().startsWith("//"),
+          /bootPinSweepGate\.arm\(\)/.test(l) && !l.trimStart().startsWith("//"),
       )
       .map(({ i }) => i);
     expect(callIdxs.length).toBeGreaterThan(0);
@@ -292,7 +370,10 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
     expect(blockedIdx).toBeGreaterThan(-1);
     const afterBlocked = gatewaySrc.slice(blockedIdx);
     const exitIdx = afterBlocked.indexOf("process.exit(1)");
-    const cleanupIdx = afterBlocked.indexOf("void runBootPinCleanupAndDmSweep()");
+    // #3664: the winner now ARMS a two-condition gate instead of dispatching
+    // the sweep inline (the sweep also needs `lockedBot`), so the marker for
+    // "the winner's cleanup path" is the arm() call.
+    const cleanupIdx = afterBlocked.indexOf("bootPinSweepGate.arm()");
     expect(exitIdx).toBeGreaterThan(-1);
     expect(cleanupIdx).toBeGreaterThan(-1);
     // The exit for the blocked branch appears before the winner's cleanup call.
