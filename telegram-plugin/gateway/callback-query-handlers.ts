@@ -152,6 +152,12 @@ export type PendingVaultOp =
   // sequentially. Each item carries its own stageId + card refs;
   // they're all in the same chat by construction (pendingVaultOps
   // map is keyed by chat_id).
+  //
+  // #3627: `attempts` counts WRONG passphrase entries so far for this
+  // queue. It lives on the pending-op (per passphrase ENTRY), not on the
+  // individual staged cards, because one entry drains the whole batch —
+  // a per-card counter would show confusing "2 attempts remaining" per
+  // card for what the operator experienced as a single typo.
   | {
       kind: 'passphrase-for-access-approve'
       items: Array<{
@@ -159,7 +165,11 @@ export type PendingVaultOp =
         cardChatId: string
         cardMessageId: number
         senderId: string
+        /** Forum topic the card lives in, so a retry prompt lands beside it. */
+        threadId?: number
       }>
+      /** Wrong-passphrase entries so far (0 on the first prompt). */
+      attempts?: number
       startedAt: number
     }
 
@@ -441,6 +451,108 @@ export interface CallbackQueryHandlersDeps {
 const AUTH_REFRESH_THROTTLE_MS = 5_000
 
 /**
+ * #3627 — how many passphrase entries the operator gets on a
+ * `vault_request_access` approval before the staged cards fail terminally.
+ * Counted per PASSPHRASE ENTRY (the `passphrase-for-access-approve` pending
+ * op), not per card: one entry drains the whole queued batch.
+ */
+export const MAX_VAULT_PASSPHRASE_ATTEMPTS = 3
+
+/**
+ * Result of one `performVaultAccessApproval` run. `passphrase-mismatch` is the
+ * ONLY retryable outcome (#3627): the stage is deliberately left alive and the
+ * card left in its "waiting for passphrase" state so the caller can re-prompt.
+ * Every other broker failure stays terminal and has already surfaced its own
+ * card edit / operator reply by the time it returns.
+ */
+export type VaultAccessApprovalOutcome =
+  | { kind: 'ok' }
+  | { kind: 'passphrase-mismatch'; msg: string }
+  | { kind: 'failed'; msg: string }
+
+/**
+ * True when a broker `mint_grant` error is the wrong-passphrase denial
+ * (`denied:passphrase-mismatch`, src/vault/broker/server.ts:2166) rather than
+ * an ACL / bad-request / internal failure. The broker's wire error drops the
+ * audit result code and carries only the human message ("supplied passphrase
+ * does not match the broker's unlocked passphrase"), so this matches on the
+ * message shape — deliberately narrow: an unrelated DENIED must NOT be
+ * retryable, or a genuinely refused mint would re-prompt three times.
+ */
+export function isPassphraseMismatchBrokerError(msg: string): boolean {
+  const m = msg.toLowerCase()
+  if (!m.includes('passphrase')) return false
+  return m.includes('does not match') || m.includes('mismatch')
+}
+
+/**
+ * The `ACTION NEEDED: passphrase required` prompt body (#3627).
+ *
+ * Shared by the first prompt (after an Approve tap on a locked vault) and the
+ * wrong-passphrase re-prompt, so the header, the delete-on-read promise, and
+ * the 🚨 urgency icon can never drift apart between the two. 🚨 (not ⚠️):
+ * this message BLOCKS an approval the operator already tapped, so it outranks
+ * the generic-warning glyph the gateway uses everywhere else.
+ *
+ * A discriminated union, not one bag of optionals: the retry prompt has no
+ * agent/key to render (a batch spans several), and the first prompt has no
+ * attempt count — modelling them as one optional-heavy shape invites a caller
+ * to pass `''` for fields the other branch needs.
+ */
+export type AccessPassphrasePromptSpec =
+  | {
+      kind: 'retry'
+      /** Attempts left AFTER the failure being reported. */
+      retryRemaining: number
+      itemCount: number
+    }
+  | {
+      kind: 'first'
+      /** `batch` = one entry covers several cards; `admin-only` = admin key. */
+      variant: 'batch' | 'admin-only' | 'locked'
+      itemCount: number
+      agentEscaped: string
+      key: string
+    }
+export function buildAccessPassphrasePromptText(opts: AccessPassphrasePromptSpec): string {
+  const header = `**🚨🔐 ACTION NEEDED: passphrase required**`
+  if (opts.kind === 'retry') {
+    const plural = opts.retryRemaining === 1 ? 'attempt' : 'attempts'
+    return (
+      `${header}\n\n` +
+      `Wrong passphrase. ${opts.retryRemaining} ${plural} remaining.\n` +
+      `Type your vault passphrase again as your **next message**.\n` +
+      (opts.itemCount > 1
+        ? `One entry covers **${opts.itemCount}** pending approvals in this chat.\n`
+        : ``) +
+      `\n_We delete the passphrase message the moment we read it._`
+    )
+  }
+  if (opts.variant === 'batch') {
+    return (
+      `${header}\n\n` +
+      `Type your vault passphrase as your **next message**.\n` +
+      `One entry covers **${opts.itemCount}** pending approvals in this chat, no re-type per card.\n\n` +
+      `_We delete the passphrase message the moment we read it._`
+    )
+  }
+  if (opts.variant === 'admin-only') {
+    return (
+      `${header}\n\n` +
+      `\`${opts.key}\` is an **admin-only credential**.\n` +
+      `Type your vault passphrase as your **next message** to mint the grant for **${opts.agentEscaped}**.\n\n` +
+      `_The passphrase is what proves it's you. An agent can never mint this key on its own. We delete the passphrase message the moment we read it._`
+    )
+  }
+  return (
+    `${header}\n\n` +
+    `Your vault is locked.\n` +
+    `Reply with your passphrase as your **next message** to unlock and mint the grant for **${opts.agentEscaped}**.\n\n` +
+    `_Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches. We delete the passphrase message the moment we read it._`
+  )
+}
+
+/**
  * Build the callback-query handler families over the injected gateway deps.
  * Bodies are verbatim from gateway.ts — behavior-preserving (#2996).
  */
@@ -666,13 +778,201 @@ type AccessApprovalAttestation =
   | { kind: 'passphrase'; passphrase: string }
   | { kind: 'posture' }
 
+/**
+ * #3627 item 2 — edit a `vault_request_access` card to its RESOLVED state
+ * (granted / failed / already-covered), with a guaranteed operator-visible
+ * outcome.
+ *
+ * Every resolution edit used to be `.catch(() => {})`: when the edit itself
+ * failed (message deleted, flood wait, topic gone) the card stayed frozen on
+ * "waiting for your vault passphrase" and the operator had NO signal that the
+ * request had in fact resolved. Now the failure is logged and the same
+ * resolved text is re-sent as a fresh message, so the outcome is never
+ * silently swallowed.
+ *
+ * Never throws: both the edit and the fallback send are contained, because
+ * every caller runs it after the grant has already been minted/refused and
+ * must not have its own control flow broken by a Telegram-side failure.
+ */
+async function editResolvedCard(
+  ctx: Context,
+  target: { chat_id: string; threadId?: number },
+  messageId: number,
+  markdown: string,
+  label: string,
+): Promise<void> {
+  // messageId <= 0 means "no card to edit" (a stage whose card id was never
+  // recorded) — go straight to the fresh-message path so the outcome still
+  // reaches the operator.
+  if (messageId > 0) {
+    try {
+      // Through robustApiCall (not raw): a flood-wait must be RETRIED, not
+      // treated as an edit failure — falling back to a fresh message on a
+      // 429 would double-post the resolution.
+      await robustApiCall(
+        () =>
+          ctx.api.editMessageText(target.chat_id, messageId, richMessage(markdown), {
+            reply_markup: { inline_keyboard: [] },
+          }),
+        { chat_id: target.chat_id, verb: `vault_request_access.${label}_edit` },
+      )
+      return
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: vault card resolution edit FAILED (${label}) ` +
+        `chat=${target.chat_id} msg=${messageId}: ${String(err)} — sending fallback message\n`,
+      )
+    }
+  }
+  try {
+    await retryWithThreadFallback<{ message_id: number }>(
+      robustApiCall,
+      (tid) =>
+        lockedBot.api.sendRichMessage(target.chat_id, richMessage(markdown), {
+          ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+        }),
+      {
+        threadId: target.threadId,
+        chat_id: target.chat_id,
+        verb: `vault_request_access.${label}_fallback`,
+      },
+    )
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: vault card resolution FALLBACK SEND failed (${label}) ` +
+      `chat=${target.chat_id}: ${String(err)}\n`,
+    )
+  }
+}
+
+/**
+ * #3627 item 1/3 — send the `ACTION NEEDED: passphrase required` prompt as a
+ * fresh message (never an in-place edit: see the long rationale at the first
+ * prompt call site). Shared by the initial prompt and the wrong-passphrase
+ * re-prompt so both land at the bottom of the chat WITH a notification.
+ */
+async function sendAccessPassphrasePrompt(
+  target: { chat_id: string; threadId?: number },
+  spec: AccessPassphrasePromptSpec,
+): Promise<void> {
+  const promptText = buildAccessPassphrasePromptText(spec)
+  // #1075: deleted-topic safe — fall back to the main chat. Wrapped
+  // through robustApiCall for flood-wait retries, mirroring the card send.
+  await retryWithThreadFallback<{ message_id: number }>(
+    robustApiCall,
+    (tid) =>
+      lockedBot.api.sendRichMessage(target.chat_id, richMessage(promptText), {
+        ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+      }),
+    {
+      threadId: target.threadId,
+      chat_id: target.chat_id,
+      verb: 'vault_request_access.passphrase_prompt',
+    },
+  ).catch((err: unknown) => {
+    // #3627: never silent. A prompt that failed to send leaves the operator
+    // staring at a card that says "waiting for your vault passphrase" with
+    // nothing to reply to — the same silent-failure class item 2 closes on
+    // the resolution edits.
+    process.stderr.write(
+      `telegram gateway: vault passphrase prompt send FAILED chat=${target.chat_id} ` +
+      `kind=${spec.kind}: ${String(err)}\n`,
+    )
+  })
+}
+
+/**
+ * #3627 item 3 — decide what happens after a passphrase entry that the broker
+ * refused as a mismatch for one or more staged cards.
+ *
+ * Attempts are counted on the PASSPHRASE ENTRY (`attempts` on the pending op),
+ * not per card: one entry drains the whole queued batch, so a per-card counter
+ * would report "2 attempts remaining" N times for a single typo.
+ *
+ *  - Under the cap → re-arm the pending op with ONLY the still-unresolved
+ *    stages and re-prompt with the remaining count. The stages and their cards
+ *    stay alive, so the next entry resumes exactly where this one failed.
+ *  - At the cap → today's terminal behaviour: drop each stage, strip its card
+ *    and say plainly that the agent must re-issue.
+ *
+ * The (wrong) passphrase is dropped from the chat cache either way, so a
+ * later Approve tap can never silently re-use it.
+ */
+async function resolveAccessApprovalPassphraseMismatch(
+  ctx: Context,
+  args: {
+    chat_id: string
+    failed: Array<{
+      stageId: string
+      cardChatId: string
+      cardMessageId: number
+      senderId: string
+      threadId?: number
+    }>
+    priorAttempts: number
+    brokerMsg: string
+  },
+): Promise<void> {
+  const { chat_id, failed, priorAttempts, brokerMsg } = args
+  if (failed.length === 0) return
+  vaultPassphraseCache.delete(chat_id)
+  const attempts = priorAttempts + 1
+  const remaining = MAX_VAULT_PASSPHRASE_ATTEMPTS - attempts
+  const threadId = failed.find((it) => it.threadId != null)?.threadId
+  process.stderr.write(
+    `telegram gateway: vault_request_access passphrase mismatch chat=${chat_id} ` +
+    `stages=${failed.map((f) => f.stageId).join(',')} attempts=${attempts}/${MAX_VAULT_PASSPHRASE_ATTEMPTS}\n`,
+  )
+  if (remaining > 0) {
+    // Union with any queue still open for this chat instead of overwriting it.
+    // The batch drain deletes the op before it runs, so this is normally just
+    // `failed`; but the cached-passphrase tap path can hit a mismatch while
+    // OTHER cards sit queued for the same chat, and clobbering that queue
+    // would strand them (staged, card still saying "waiting", no pending op
+    // to route the next passphrase entry back to them).
+    const open = pendingVaultOps.get(chat_id)
+    const carried =
+      open?.kind === 'passphrase-for-access-approve'
+        ? open.items.filter((it) => !failed.some((f) => f.stageId === it.stageId))
+        : []
+    const requeued = [...failed, ...carried]
+    pendingVaultOps.set(chat_id, {
+      kind: 'passphrase-for-access-approve',
+      items: requeued,
+      attempts,
+      // Restart the input TTL: the operator is being asked again NOW, so the
+      // clock for their reply starts now too.
+      startedAt: Date.now(),
+    })
+    await sendAccessPassphrasePrompt(
+      { chat_id, ...(threadId != null ? { threadId } : {}) },
+      { kind: 'retry', retryRemaining: remaining, itemCount: requeued.length },
+    )
+    return
+  }
+  // Cap reached — terminal, as before #3627.
+  for (const item of failed) {
+    pendingVaultRequestAccesses.delete(item.stageId)
+    pendingCardStore.remove(item.stageId)
+    await editResolvedCard(
+      ctx,
+      { chat_id: item.cardChatId, ...(item.threadId != null ? { threadId: item.threadId } : {}) },
+      item.cardMessageId,
+      `❌ **Too many wrong passphrase attempts** (${MAX_VAULT_PASSPHRASE_ATTEMPTS}). ` +
+      `This request was cancelled — ask the agent to re-issue it.\n` +
+      `_Broker: ${escapeHtmlForTg(brokerMsg)}_`,
+      'passphrase_lockout',
+    )
+  }
+}
+
 async function performVaultAccessApproval(
   ctx: Context,
   pending: PendingVaultRequestAccess,
   stageId: string,
   senderId: string,
   attestation: AccessApprovalAttestation,
-): Promise<void> {
+): Promise<VaultAccessApprovalOutcome> {
   const brokerAuthOpts =
     attestation.kind === 'passphrase'
       ? { passphrase: attestation.passphrase }
@@ -693,19 +993,23 @@ async function performVaultAccessApproval(
         pendingVaultRequestAccesses.delete(stageId)
         pendingCardStore.remove(stageId)
         if (pending.card_message_id != null) {
-          await ctx.api
-            .editMessageText(
-              pending.chat_id,
-              pending.card_message_id,
-              `ℹ️ **${escapeHtmlForTg(pending.agent)}** already has standing-ACL access to ` +
-              `\`${pending.key}\` (schedule.secrets[]). ` +
-              `**No grant minted** — a token would shadow the standing ACL. ` +
-              richMessage(`The agent can read it directly.`),
-              { reply_markup: { inline_keyboard: [] } },
-            )
-            .catch(() => {})
+          // #3627 drive-by: this text used to be a raw string CONCATENATED
+          // with a `richMessage()` object, which renders as
+          // `…already has access[object Object]` with literal `**` markers
+          // (the edit ran with parse_mode unset). Whole body now goes
+          // through the one rich path, like every sibling resolution edit.
+          await editResolvedCard(
+            ctx,
+            pending,
+            pending.card_message_id,
+            `ℹ️ **${escapeHtmlForTg(pending.agent)}** already has standing-ACL access to ` +
+            `\`${pending.key}\` (schedule.secrets[]). ` +
+            `**No grant minted** — a token would shadow the standing ACL. ` +
+            `The agent can read it directly.`,
+            'standing_acl',
+          )
         }
-        return
+        return { kind: 'ok' }
       }
     } catch {
       // Probe failed: fall through and mint as before (fail-open).
@@ -782,26 +1086,39 @@ async function performVaultAccessApproval(
   const result = await mintGrantViaBroker(mintArgs)
   if (result.kind === 'unreachable') {
     await switchroomReply(ctx, `🔴 Broker unreachable: ${escapeHtmlForTg(result.msg)}`, { html: true })
-    return
+    return { kind: 'failed', msg: result.msg }
   }
   if (result.kind === 'error') {
-    // Mint refused (most likely wrong passphrase). Drop the staged
+    // #3627 item 3: a WRONG PASSPHRASE is retryable. Leave the stage and
+    // the card exactly as they are ("waiting for your vault passphrase")
+    // and hand the decision to the caller, which owns the per-entry
+    // attempt counter and re-prompts or locks out. Any other mint refusal
+    // (ACL, bad request, broker internals) stays terminal below — a
+    // re-prompt would just burn the operator's attempts on an error no
+    // passphrase can fix.
+    // Gated on the passphrase attestation: under `approvalAuth: telegram-id`
+    // the gateway never sends a passphrase, so there is nothing for the
+    // operator to retype — a mismatch-shaped message there must stay
+    // terminal rather than leaving the stage alive with no re-prompt.
+    if (attestation.kind === 'passphrase' && isPassphraseMismatchBrokerError(result.msg)) {
+      return { kind: 'passphrase-mismatch', msg: result.msg }
+    }
+    // Mint refused for a non-passphrase reason. Drop the staged
     // request so a re-attempt starts cleanly. The operator can ask
     // the agent to re-issue, or the broker error message will tell
     // them the next step.
     pendingVaultRequestAccesses.delete(stageId)
     pendingCardStore.remove(stageId)
     if (pending.card_message_id != null) {
-      await ctx.api
-        .editMessageText(
-          pending.chat_id,
-          pending.card_message_id,
-          richMessage(`**mint_grant failed:** ${escapeHtmlForTg(result.msg)}`),
-          { reply_markup: { inline_keyboard: [] } },
-        )
-        .catch(() => {})
+      await editResolvedCard(
+        ctx,
+        pending,
+        pending.card_message_id,
+        `**mint_grant failed:** ${escapeHtmlForTg(result.msg)}`,
+        'mint_failed',
+      )
     }
-    return
+    return { kind: 'failed', msg: result.msg }
   }
 
   const { token, id } = result
@@ -818,7 +1135,7 @@ async function performVaultAccessApproval(
       `--keys ${escapeHtmlForTg(pending.key)} --duration ${Math.round(pending.ttl_seconds / 86400)}d\` on the host._`,
       { html: true },
     )
-    return
+    return { kind: 'failed', msg: String(err) }
   }
 
   pendingVaultRequestAccesses.delete(stageId)
@@ -833,25 +1150,22 @@ async function performVaultAccessApproval(
       getVaultApprovalAuthMode() === 'telegram-id'
         ? `\n_Approver verified by Telegram identity — broker auto-unlocked at startup._`
         : ''
-    await ctx.api
-      .editMessageText(
-        pending.chat_id,
-        pending.card_message_id,
-        richMessage(
-          buildVaultGrantApprovedCardText({
-            agentEscaped: escapeHtmlForTg(pending.agent),
-            scope: pending.scope,
-            key: pending.key,
-            days,
-            grantId: id,
-            reasonEscaped:
-              reasonNormalized.length > 0 ? escapeHtmlForTg(reasonNormalized) : undefined,
-            footer,
-          }),
-        ),
-        { reply_markup: { inline_keyboard: [] } },
-      )
-      .catch(() => {})
+    await editResolvedCard(
+      ctx,
+      pending,
+      pending.card_message_id,
+      buildVaultGrantApprovedCardText({
+        agentEscaped: escapeHtmlForTg(pending.agent),
+        scope: pending.scope,
+        key: pending.key,
+        days,
+        grantId: id,
+        reasonEscaped:
+          reasonNormalized.length > 0 ? escapeHtmlForTg(reasonNormalized) : undefined,
+        footer,
+      }),
+      'grant_approved',
+    )
   }
 
   // #1052: deliver a synthetic inbound message back to the agent so
@@ -891,6 +1205,7 @@ async function performVaultAccessApproval(
     `telegram gateway: vault_grant_approved injection agent=${pending.agent} ` +
     `key=${pending.key} stage=${stageId} delivered=${delivered}\n`,
   )
+  return { kind: 'ok' }
 }
 
 /**
@@ -1364,6 +1679,9 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
         cardChatId: pending.chat_id,
         cardMessageId: pending.card_message_id,
         senderId,
+        // #3627: carried so a wrong-passphrase RE-prompt lands in the same
+        // forum topic as the card it belongs to.
+        ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
       }
       const items =
         existing?.kind === 'passphrase-for-access-approve'
@@ -1372,6 +1690,13 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
       pendingVaultOps.set(pending.chat_id, {
         kind: 'passphrase-for-access-approve',
         items,
+        // #3627: a card joining a queue that already burned attempts inherits
+        // the count — the cap belongs to the passphrase ENTRY sequence, and
+        // resetting it here would hand out unlimited retries by tapping a
+        // second card between attempts.
+        ...(existing?.kind === 'passphrase-for-access-approve' && existing.attempts
+          ? { attempts: existing.attempts }
+          : {}),
         startedAt: existing?.kind === 'passphrase-for-access-approve' ? existing.startedAt : Date.now(),
       })
       // Card text differs slightly when joining an existing batch so
@@ -1408,37 +1733,55 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
       //      that later messages bury.
       //   3. It fires a notification — `disable_notification` is deliberately
       //      NOT set — so the operator is actually pinged to act.
+      //   4. #3627: the header leads with 🚨, not ⚠️ — this prompt BLOCKS an
+      //      approval the operator already tapped, so it has to out-shout the
+      //      generic warnings the gateway posts everywhere else. Body text
+      //      lives in `buildAccessPassphrasePromptText` so the retry prompt
+      //      below can never drift from this one.
       // Attention-grabbing header, short lines, key in code formatting.
-      const promptText = joiningBatch
-        ? `**⚠️🔐 ACTION NEEDED: passphrase required**\n\n` +
-          `Type your vault passphrase as your **next message**.\n` +
-          `One entry covers **${items.length}** pending approvals in this chat, no re-type per card.\n\n` +
-          `_We delete the passphrase message the moment we read it._`
-        : isAdminOnly
-        ? `**⚠️🔐 ACTION NEEDED: passphrase required**\n\n` +
-          `\`${pending.key}\` is an **admin-only credential**.\n` +
-          `Type your vault passphrase as your **next message** to mint the grant for **${escapeHtmlForTg(pending.agent)}**.\n\n` +
-          `_The passphrase is what proves it's you. An agent can never mint this key on its own. We delete the passphrase message the moment we read it._`
-        : `**⚠️🔐 ACTION NEEDED: passphrase required**\n\n` +
-          `Your vault is locked.\n` +
-          `Reply with your passphrase as your **next message** to unlock and mint the grant for **${escapeHtmlForTg(pending.agent)}**.\n\n` +
-          `_Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches. We delete the passphrase message the moment we read it._`
-
-      // #1075: deleted-topic safe — fall back to the main chat. Wrapped
-      // through robustApiCall for flood-wait retries, mirroring the card send.
-      await retryWithThreadFallback<{ message_id: number }>(
-        robustApiCall,
-        (tid) =>
-          lockedBot.api.sendRichMessage(pending.chat_id, richMessage(promptText), {
-            ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
-          }),
-        { threadId: pending.threadId, chat_id: pending.chat_id, verb: 'vault_request_access.passphrase_prompt' },
-      ).catch(() => {})
+      await sendAccessPassphrasePrompt(
+        {
+          chat_id: pending.chat_id,
+          ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+        },
+        {
+          kind: 'first',
+          variant: joiningBatch ? 'batch' : isAdminOnly ? 'admin-only' : 'locked',
+          itemCount: items.length,
+          agentEscaped: escapeHtmlForTg(pending.agent),
+          key: pending.key,
+        },
+      )
       return
     }
 
     await ctx.answerCallbackQuery({ text: '⏳ Minting grant…' }).catch(() => {})
-    await performVaultAccessApproval(ctx, pending, stageId, senderId, { kind: 'passphrase', passphrase: cached.passphrase })
+    const outcome = await performVaultAccessApproval(ctx, pending, stageId, senderId, {
+      kind: 'passphrase',
+      passphrase: cached.passphrase,
+    })
+    // #3627: the CACHED passphrase was wrong (stale cache, or it was cached
+    // by a flow that never validated it). Same contract as the typed-entry
+    // path — the stage survives, the cache is dropped, and the operator gets
+    // a re-prompt with the remaining attempts instead of a dead card.
+    if (outcome.kind === 'passphrase-mismatch') {
+      const openOp = pendingVaultOps.get(pending.chat_id)
+      await resolveAccessApprovalPassphraseMismatch(ctx, {
+        chat_id: pending.chat_id,
+        failed: [
+          {
+            stageId,
+            cardChatId: pending.chat_id,
+            cardMessageId: pending.card_message_id ?? 0,
+            senderId,
+            ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+          },
+        ],
+        priorAttempts:
+          openOp?.kind === 'passphrase-for-access-approve' ? (openOp.attempts ?? 0) : 0,
+        brokerMsg: outcome.msg,
+      })
+    }
     return
   }
 
@@ -2853,6 +3196,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
   return {
     handleVaultRecentDenialCallback,
     performVaultAccessApproval,
+    resolveAccessApprovalPassphraseMismatch,
     handleSkillProposalCallback,
     handleMentalModelProposeCallback,
     handleVaultRequestAccessCallback,
