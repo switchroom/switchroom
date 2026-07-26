@@ -70,11 +70,24 @@ export interface RetryCallOpts {
    *     send waits for a short window but fails fast (structured
    *     `FLOOD_WAIT_ACTIVE`) when the remaining window is long.
    *   - `useful`    — progress-card creation, worker handbacks, checklists,
-   *     boot/config cards. Queued with a TTL; dropped when stale. DEFAULT
-   *     when unset.
+   *     boot/config cards. Queued with a TTL; dropped when stale.
    *   - `cosmetic`  — typing, reactions, all card EDITS, stream updates,
    *     heartbeats. Shed immediately when no token is free OR any flood
    *     window is open.
+   *
+   * UNTAGGED default — NOT `useful`. This doc said "`useful` — DEFAULT when
+   * unset" and was factually wrong (#3664); it is the comment a reader
+   * reasoning about droppability lands on, so read the corrected rule:
+   *
+   *   - An untagged non-edit SEND admits as `UNTAGGED_SEND_CLASS` in
+   *     `send-gate.ts`, which is `'critical'` — non-droppable, never shed.
+   *   - An untagged EDIT is recorded `useful`, but the gate only SHEDS edits
+   *     classed `cosmetic`; an untagged edit coalesces (latest payload wins)
+   *     rather than dropping.
+   *
+   * So nothing is droppable unless a call site OPTS IN by tagging
+   * `useful`/`cosmetic`. See the `PriorityClass` docblock in send-gate.ts for
+   * the authoritative statement.
    */
   priorityClass?: 'critical' | 'useful' | 'cosmetic'
 }

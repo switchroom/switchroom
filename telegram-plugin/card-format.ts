@@ -39,6 +39,69 @@ import { normalizeDashes } from './text-voice-scrub.js'
 export { escapeMarkdown, codeSpanSafe }
 
 /**
+ * Separator appended to every card line that is followed by a hard break when
+ * `stackCardLines` runs in `collapseSafe` mode (#3666).
+ *
+ * It is a NO-BREAK SPACE (U+00A0), chosen deliberately:
+ *
+ *   - It is a real character in the message text, so it survives Telegram's
+ *     pinned-bar collapse (which drops the `\n` and substitutes nothing) and
+ *     keeps the two lines' glyphs apart in the one-line preview.
+ *   - It is NOT ASCII whitespace, so neither this module's own
+ *     trailing-whitespace strip nor the GFM parser's hard-break handling
+ *     (which consumes only the ASCII spaces immediately before the newline)
+ *     can eat it.
+ *   - It is invisible where the card is normally read — the chat feed — since
+ *     it lands at end-of-line. That is the whole reason a separator with
+ *     visible ink (`' ·'`, `' —'`) was rejected: it would put dangling
+ *     punctuation on every line of every pinned card to fix a defect that only
+ *     manifests on the pin bar.
+ *
+ * If a real-pin eyeball shows a single space is too weak a break, this constant
+ * is the one place to strengthen it (e.g. `' ·'`) — the seam is deliberate.
+ */
+export const COLLAPSE_SAFE_SEPARATOR = '\u00A0'
+
+/**
+ * Normalise a line's tail before `stackCardLines` re-terminates it.
+ *
+ * Two strips, both there for the SAME reason: this function must be idempotent,
+ * so re-stacking an already-stacked body can never accumulate terminator
+ * characters.
+ *
+ *   - trailing ASCII whitespace, so exactly one `  \n` hard break is emitted;
+ *   - in `collapseSafe` mode, any `COLLAPSE_SAFE_SEPARATOR` run the line
+ *     already carries (interleaved with ASCII whitespace, since a caller may
+ *     have split the body on `\n` rather than on `  \n`), so exactly one
+ *     separator is emitted.
+ *
+ * The separator strip is written against the CONSTANT, not against a hardcoded
+ * U+00A0, so it stays correct if the separator is ever strengthened to visible
+ * ink. That one-constant seam is what COLLAPSE_SAFE_SEPARATOR's own doc comment
+ * promises, and it would be a lie if this strip did not follow it.
+ */
+function normalizeLineTail(line: string, collapseSafe: boolean): string {
+  let out = line.replace(/[ \t\r]+$/, '')
+  // The length guard is not defensive noise: `''.endsWith('')` is true and
+  // `''.slice(0, -0)` is `''`, so an empty separator would spin this loop
+  // forever — a hang in the gateway's render path. The doc comment above the
+  // constant invites future edits to it, so make that edit unable to hang.
+  if (!collapseSafe || COLLAPSE_SAFE_SEPARATOR.length === 0) return out
+  while (out.endsWith(COLLAPSE_SAFE_SEPARATOR)) {
+    out = out.slice(0, -COLLAPSE_SAFE_SEPARATOR.length).replace(/[ \t\r]+$/, '')
+  }
+  return out
+}
+
+/** Options for `stackCardLines`. */
+export interface StackCardLinesOpts {
+  /** Append `COLLAPSE_SAFE_SEPARATOR` to each hard-broken line so the stack
+   *  stays readable on a surface that collapses it to one line (#3666).
+   *  Opt-in: only pinned cards pay the (tiny) extra character per line. */
+  collapseSafe?: boolean
+}
+
+/**
  * Join a card's pre-rendered, single-line entries so they STACK in the
  * Bot API 10.1 rich-message renderer (#2669) — the same visual result the
  * main reply path gets after `normalizeParagraphBreaks`.
@@ -63,8 +126,19 @@ export { escapeMarkdown, codeSpanSafe }
  * This is the card-surface analogue of the reply path's
  * `normalizeParagraphBreaks`: it guarantees a card authored as stacked
  * bullet/step lines renders identically to a normal reply.
+ *
+ * `opts.collapseSafe` (#3666) additionally makes the stack survive being
+ * rendered on a surface that COLLAPSES the message to one line — Telegram's
+ * pinned-message bar drops the newlines and substitutes nothing, mashing the
+ * last glyph of each line into the first glyph of the next
+ * (`… · opus 5✓ Reading gateway.ts→ Running search …`). Opt-in, because it is
+ * only correct for cards that are actually pinned; see COLLAPSE_SAFE_SEPARATOR.
  */
-export function stackCardLines(lines: string[]): string {
+export function stackCardLines(
+  lines: string[],
+  opts?: StackCardLinesOpts,
+): string {
+  const collapseSafe = opts?.collapseSafe === true
   const pieces: string[] = []
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
@@ -75,12 +149,27 @@ export function stackCardLines(lines: string[]): string {
     // A blank current or next line is a genuine `\n\n` paragraph gap — leave
     // the separator a plain newline so the blank entry reconstructs the gap.
     if (cur === '' || next === '') {
+      // The gap still needs a collapse separator when THIS line has content:
+      // a collapsing surface drops the `\n\n` with no substitute exactly as it
+      // drops a `  \n`, and the blank entry is the empty string, so it
+      // contributes NO character of its own to hold the two sides apart. Only
+      // when `cur` is blank is the separator skipped — appending it to a blank
+      // entry would turn the gap into a visible U+00A0 paragraph in the FEED.
+      if (collapseSafe && cur !== '') {
+        pieces[pieces.length - 1] = normalizeLineTail(line, true) + COLLAPSE_SAFE_SEPARATOR
+      }
       pieces.push('\n')
       continue
     }
     // Strip any trailing whitespace the line already carried so we emit
-    // exactly one `  \n` hard break (never accumulate spaces on a re-run).
-    pieces[pieces.length - 1] = line.replace(/[ \t\r]+$/, '')
+    // exactly one `  \n` hard break (never accumulate spaces on a re-run) and,
+    // under collapseSafe, exactly one separator — see normalizeLineTail.
+    // The collapse separator is appended AFTER the strip (it is not ASCII
+    // whitespace, so it survives both this strip and the markdown parser's
+    // own trailing-whitespace handling) and BEFORE the two hard-break spaces,
+    // which stay immediately adjacent to the `\n` so the break still parses.
+    pieces[pieces.length - 1] =
+      normalizeLineTail(line, collapseSafe) + (collapseSafe ? COLLAPSE_SAFE_SEPARATOR : '')
     pieces.push('  \n')
   }
   return pieces.join('')

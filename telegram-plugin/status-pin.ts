@@ -21,7 +21,8 @@
  * gateway (via `status-pin-driver.ts`) translates a `PinAction` into
  * actual Telegram API calls. The design mirrors `slot-banner.ts` +
  * `slot-banner-driver.ts` — one pure decision, one side-effecting
- * reconcile, the claim dropped on unpin even when the API throws.
+ * reconcile, the claim dropped on unpin unless the unpin never reached
+ * Telegram at all (`isUnpinTerminalError`, #3664).
  */
 
 /** The message the framework is currently claiming as pinned for a key. */
@@ -43,8 +44,9 @@ export type PinAction =
    *  back into PinState. No new message is sent — this pins a message the
    *  chat already rendered. */
   | { kind: 'pin'; messageId: number }
-  /** Unpin + forget. Caller unpins (best-effort) and clears state EVEN IF
-   *  the unpin call throws. */
+  /** Unpin + forget. Caller unpins (best-effort) and clears state on success
+   *  or a TERMINAL failure; a never-confirmed failure keeps the claim so the
+   *  still-pinned message can be retried (`isUnpinTerminalError`, #3664). */
   | { kind: 'unpin'; messageId: number }
 
 /**
@@ -53,8 +55,8 @@ export type PinAction =
  *
  * Exactly one action per (prev, desired) — the whole point is that pin
  * state can never get stuck: an in-flight → done transition always yields
- * an `unpin`, and the driver drops the claim on unpin regardless of API
- * outcome.
+ * an `unpin`, and the driver drops the claim once the unpin is confirmed
+ * or terminally rejected (see `isUnpinTerminalError`).
  */
 export function decidePinAction(
   prev: PinState | null,
@@ -112,6 +114,42 @@ function errorDescription(err: unknown): string {
  */
 export function isPinRightsError(err: unknown): boolean {
   return errorDescription(err).includes('not enough rights')
+}
+
+/**
+ * True when an UNPIN failure is TERMINAL — Telegram received the request and
+ * answered definitively, so the answer will not change on retry and the claim
+ * is safe to drop (#3664 Defect B).
+ *
+ * The distinction that matters: a 4xx (other than 429) means the call REACHED
+ * Telegram and was rejected for a reason that is stable — the bot lacks pin
+ * rights, the message/chat is gone, the bot was kicked. Re-issuing the same
+ * unpin forever cannot help, and holding the claim would leave the driver
+ * stuck (the failure mode the drop-on-unpin contract exists to prevent).
+ *
+ * Everything else is NOT confirmed and MUST retain the claim:
+ *
+ *   - `FLOOD_WAIT_ACTIVE` (retry-api-call.ts) — a purely LOCAL fail-fast: the
+ *     send gate refused to make the call, so no request ever left the process
+ *     and the message is provably still pinned. It carries Telegram's 429
+ *     duck-type shape, which is why 429 is excluded here.
+ *   - `retryApiCall: max retries exceeded`, network HttpError, 5xx — the
+ *     unpin may never have landed.
+ *
+ * Dropping the claim on those erased the in-memory claim AND (via
+ * `reconcileAndPersistStatusPin`, which deletes the durable row on a null
+ * return) the persisted record — leaving a message pinned in Telegram that no
+ * reaper and no boot sweep could ever see again. Retaining is bounded: the
+ * boot sweep retries a retained row and forfeits it after
+ * `BOOT_UNPIN_MAX_ATTEMPTS`, so a retained claim can't be permanent either.
+ */
+export function isUnpinTerminalError(err: unknown): boolean {
+  if (isPinRightsError(err)) return true
+  if (err != null && typeof err === 'object') {
+    const code = (err as { error_code?: unknown }).error_code
+    if (typeof code === 'number') return code >= 400 && code < 500 && code !== 429
+  }
+  return false
 }
 
 /**
