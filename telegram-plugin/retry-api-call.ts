@@ -70,11 +70,18 @@ export interface RetryCallOpts {
    *     send waits for a short window but fails fast (structured
    *     `FLOOD_WAIT_ACTIVE`) when the remaining window is long.
    *   - `useful`    — progress-card creation, worker handbacks, checklists,
-   *     boot/config cards. Queued with a TTL; dropped when stale. DEFAULT
-   *     when unset.
+   *     boot/config cards. Queued with a TTL; dropped when stale.
    *   - `cosmetic`  — typing, reactions, all card EDITS, stream updates,
    *     heartbeats. Shed immediately when no token is free OR any flood
    *     window is open.
+   *
+   * DEFAULT when unset is NOT `useful`: an untagged SEND admits as
+   * `UNTAGGED_SEND_CLASS = 'critical'` (send-gate.ts:119, hardened in review of
+   * #3106 so no untagged call is silently droppable), and an untagged EDIT is
+   * recorded `useful` but coalesces rather than sheds (send-gate.ts:1101).
+   * Callers that reason about droppability — e.g. the status-pin state machine,
+   * which reads "did not throw" as "painted" — depend on that, so correcting
+   * this comment matters (#3634).
    */
   priorityClass?: 'critical' | 'useful' | 'cosmetic'
 }

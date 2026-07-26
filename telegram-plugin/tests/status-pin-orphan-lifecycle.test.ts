@@ -38,6 +38,11 @@ import {
   createOrphanPinRegistry,
   ORPHAN_PIN_MAX_ATTEMPTS,
 } from "../gateway/status-pin-orphans.js";
+import {
+  createStatusPinApi,
+  type PinCapableBot,
+} from "../gateway/status-pin-api.js";
+import { SEND_GATE_SHED } from "../send-gate.js";
 
 const PATH = "/state/agent/telegram/status-pins.json";
 
@@ -150,7 +155,7 @@ describe("#3634 D1: the boot pin sweep must not run before the bot exists", () =
       botReady: g.gate.ready,
       scanDmChatIds: () => {
         order.push("scan");
-        return ["8248703757"];
+        return ["12345"];
       },
       statusPinCleanup: async () => {
         order.push("status-pins");
@@ -178,7 +183,7 @@ describe("#3634 D1: the boot pin sweep must not run before the bot exists", () =
       "activity-cards",
       "queued-cards",
       "enable-dm",
-      "dm:8248703757",
+      "dm:12345",
     ]);
   });
 
@@ -517,5 +522,68 @@ describe("#3634: in-process orphan retry", () => {
     await Promise.all([reg.drain("-100123"), reg.drain("-100123")]);
     expect(maxInFlight).toBe(1);
     expect(reg.size()).toBe(0);
+  });
+});
+
+describe("#3634: a shed send never looks like a painted pin", () => {
+  // The bug shape review caught on #3631: a dropped call resolving
+  // success-shaped, so the state machine records a never-painted change as
+  // on-screen. `reconcilePin` reads "did not throw" as "landed", so the pin API
+  // must convert the send gate's SEND_GATE_SHED sentinel into a throw.
+  const shedRobust = async () => SEND_GATE_SHED as unknown;
+  const bot = () =>
+    ({
+      api: {
+        pinChatMessage: async () => true,
+        unpinChatMessage: async () => true,
+      },
+    }) as PinCapableBot;
+
+  it("a shed unpin is reported as failed and re-homed, not swallowed", async () => {
+    const api = createStatusPinApi(bot, shedRobust);
+    const outcomes: Array<[string, number]> = [];
+    const next = await reconcilePin({
+      api,
+      chatId: "-100123",
+      prevState: { messageId: 715 },
+      desired: { pinned: false },
+      onError: () => {},
+      onUnpinOutcome: (o, id) => outcomes.push([o, id]),
+    });
+    expect(next).toBeNull();
+    // NOT ['ok', 715] — the message is still pinned in Telegram.
+    expect(outcomes).toEqual([["failed", 715]]);
+  });
+
+  it("a shed pin does not claim the message", async () => {
+    const api = createStatusPinApi(bot, shedRobust);
+    const next = await reconcilePin({
+      api,
+      chatId: "-100123",
+      prevState: null,
+      desired: { pinned: true, messageId: 715 },
+      onError: () => {},
+    });
+    // Claiming it would leave the gateway believing a pin exists that never
+    // painted — and it would never retry.
+    expect(next).toBeNull();
+  });
+
+  it("a landed call is passed through untouched", async () => {
+    const seen: unknown[] = [];
+    const api = createStatusPinApi(bot, async (fn) => {
+      const r = await fn();
+      seen.push(r);
+      return r;
+    });
+    await expect(api.unpinChatMessage("-100123", 715)).resolves.toBe(true);
+    expect(seen).toEqual([true]);
+  });
+
+  it("does NOT treat a benign undefined as a shed", async () => {
+    // The gate resolves `undefined` for a no-op drop; conflating it with a shed
+    // is the ambiguity SEND_GATE_SHED exists to remove.
+    const api = createStatusPinApi(bot, async () => undefined);
+    await expect(api.unpinChatMessage("-100123", 715)).resolves.toBeUndefined();
   });
 });
