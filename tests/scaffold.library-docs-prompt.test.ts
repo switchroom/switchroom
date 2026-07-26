@@ -25,15 +25,69 @@ describe("fleet invariants — library-docs (context7) guidance", () => {
     );
   });
 
-  it("names a concrete trigger condition, not just the tool's existence", () => {
-    // The webkite lesson: a block that only describes what a tool IS
-    // produces zero calls. These are the checkable triggers.
+  it("does NOT duplicate the trigger/negative-scope text the server already ships", () => {
+    // Verified against the live server on 2026-07-26: context7's MCP
+    // `initialize` response carries an `instructions` field that already
+    // states the trigger ("even when you think you know the answer"),
+    // the negative scope (refactoring / business logic / code review /
+    // general concepts) and the prefer-over-web-search rule. Claude Code
+    // delivers a server's `instructions` even when its TOOLS are
+    // tool-search-deferred — confirmed in-fleet: `webkite` and
+    // `perplexity` carry no `alwaysLoad` under ENABLE_TOOL_SEARCH=true
+    // and both servers' instructions still appear in the running agent's
+    // system prompt. So restating any of it here is prompt-prefix cost
+    // for zero information, on every agent, every turn. This test is the
+    // ratchet against it creeping back.
     const out = renderFleetInvariants();
-    expect(out).toContain("**Trigger condition — reach for context7 when:**");
-    expect(out).toContain("function signature");
-    // ...and an explicit negative scope, so agents don't burn a
-    // round-trip on every general programming question.
-    expect(out).toMatch(/\*\*Don't\*\* reach for it/);
+    const block = out.slice(
+      out.indexOf("## Library and framework docs"),
+      out.indexOf("## Secrets in the vault"),
+    );
+    expect(block).not.toContain("Trigger condition");
+    expect(block).not.toMatch(/\*\*Don't\*\* reach for it/);
+    expect(block).not.toContain("Prefer context7 over a web search");
+  });
+
+  it("tells the agent to DECLARE a failed lookup — including an ERROR, not just an empty result", () => {
+    // The whole point of the change is preventing a silent
+    // answer-from-training-memory. A guidance block that only handles
+    // "context7 has no entry" leaves the likeliest failure — a
+    // transport error or a 429 — routing straight back to the failure
+    // mode. The anonymous free tier is rate-limited per source IP and
+    // every agent on this host shares one IP, so 429 is an expected
+    // condition, not a hypothetical.
+    const out = renderFleetInvariants();
+    expect(out).toContain("**The call errors.**");
+    expect(out).toContain("429");
+    expect(out).toContain("**No entry.**");
+    // ...and the rule that binds both cases.
+    expect(out).toMatch(/never a licence to\nanswer from memory/);
+    expect(out).toContain("mark it unverified");
+  });
+
+  it("stays true for an agent that is OPTED OUT of context7", () => {
+    // renderFleetInvariants() takes no arguments and renders ONE
+    // fleet-wide file read by every agent via `--add-dir` — there is no
+    // per-agent variant. So an agent with `mcp_servers.context7: false`
+    // reads this exact text. It must therefore say what to do when the
+    // tools are absent, rather than instructing an agent to call tools
+    // it does not have.
+    const out = renderFleetInvariants();
+    expect(out).toContain("this block does not apply to\nyou");
+    expect(out).toContain("check your actual tool list rather than assuming");
+    // ...and names the fallback that IS available to an opted-out agent.
+    expect(out).toContain("webkite_read");
+  });
+
+  it("acknowledges that context7's tools are tool-search-deferred", () => {
+    // buildToolSearchEnvVars() sets ENABLE_TOOL_SEARCH=true, which
+    // force-defers every MCP tool without `alwaysLoad` — and the
+    // context7 entry sets none. Guidance that names the tools as though
+    // they were already loaded invites the model to read the first
+    // call's schema-fetch round-trip as breakage and give up.
+    const out = renderFleetInvariants();
+    expect(out).toContain("tool-search-deferred");
+    expect(out).toContain("That is normal, not an error");
   });
 
   it("names the REAL context7 tool ids", () => {

@@ -13,17 +13,50 @@ The problem it fixes is agents answering third-party API questions from
 training memory. That failure is invisible at read time — a stale signature
 looks exactly like a correct one — so it needs a rule, not a judgement call.
 
-**Provisioning a tool is not the same as using it.** webkite has been wired on
-every agent for months at near-zero call volume, because nothing in the system
-prompt named a trigger. So this change ships a matching
-`LIBRARY_DOCS_GUIDANCE` block in `renderFleetInvariants()` — the file every
-agent reads via `--add-dir ~/.switchroom/fleet` — giving context7 an explicit
-trigger condition (about to state a signature / config key / CLI flag / import
-path; writing non-trivial code against an unread library; a version-mismatch
-smell) and an explicit negative scope so it isn't called on general programming
-questions. `tests/scaffold.library-docs-prompt.test.ts` is the regression gate:
-if the guidance silently drops out, the capability reverts to
-provisioned-and-unused with no other symptom.
+**Only the pre-approval this repo controls.** The two context7 tools are
+pre-approved by NAME (`mcp__context7__resolve-library-id`,
+`mcp__context7__query-docs`), not by a `mcp__context7__*` wildcard. webkite gets
+a wildcard because its binary is built and mounted by the operator; context7's
+tool surface is defined by a remote endpoint Upstash controls, so a wildcard
+would silently pre-approve whatever verb they ship next, on every fleet agent,
+with no approval card and no change here. A third tool now costs one operator
+tap. Same narrowing as `HOSTD_MCP_TOOLS`.
+
+**The prompt half carries only what the server can't say itself.** context7's
+own MCP `instructions` field already states the trigger condition, the negative
+scope, and the prefer-over-web-search rule — and Claude Code delivers a
+server's `instructions` even when its tools are tool-search-deferred (confirmed
+in-fleet: `webkite` and `perplexity` carry no `alwaysLoad` under
+`ENABLE_TOOL_SEARCH=true`, and both servers' instructions still appear in a
+running agent's system prompt). So `LIBRARY_DOCS_GUIDANCE` in
+`renderFleetInvariants()` restates none of it. It carries four fleet-specific
+rules the endpoint cannot know:
+
+- **A failed lookup must be declared.** Not just "context7 has no entry" — a
+  transport error, a timeout, or an HTTP 429 too. The anonymous tier is
+  rate-limited per source IP and every agent on this host shares one IP, so 429
+  is an expected condition. Silently falling back to training memory after a
+  failed lookup is the exact failure this change exists to prevent.
+- **The opt-out, stated from the agent's side.** `renderFleetInvariants()`
+  renders one fleet-wide file with no per-agent variant, so an agent with
+  `mcp_servers.context7: false` reads this same text — the block says outright
+  that it doesn't apply if the tools are absent, and names `webkite_read` as
+  the fallback.
+- **Deferral is normal.** context7's tools carry no `alwaysLoad`, so the first
+  call in a session pays a schema-fetch round-trip; the block says that's not
+  an error.
+- **Query hygiene** for a public third-party endpoint.
+
+`tests/scaffold.library-docs-prompt.test.ts` is the regression gate in both
+directions: it fails if the guidance drops out, and it fails if the
+server-duplicated trigger/negative-scope text creeps back in.
+
+**Opt-out retracts on the deployed-agent path.** `switchroom apply` on an
+existing agent takes the settings.json merge path, which is union-only — so
+setting `mcp_servers.context7: false` used to drop the `.mcp.json` server while
+leaving the pre-approval tokens behind until the agent next went through
+`reconcileAgent`. That path now retracts the context7 tokens (and any blanket
+`mcp__context7*` grant from an in-development build) explicitly.
 
 Transport is remote streamable HTTP (`https://mcp.context7.com/mcp`), **not**
 `npx -y @upstash/context7-mcp` as Anthropic's official context7 plugin uses.
@@ -36,9 +69,15 @@ unauthenticated). If the fleet ever hits those limits the upgrade is a
 `context7/api-key` vault key rendered into an `Authorization` header.
 
 Note for operators: library/package names and the free-text query an agent
-sends to `query-docs` leave the host to Upstash's public endpoint. Agents
-working on private code should not paste private identifiers into the query
-argument; `mcp_servers.context7: false` turns the server off per agent.
+sends to `query-docs` leave the host to Upstash's public endpoint. Today that
+is bounded by prompt guidance (the query-hygiene rule), not by an enforced
+filter — a known accepted risk, with #3670 open for a deterministic mechanism
+(a query filter, and/or defaulting the root/admin agents off). Follow-ups #3671
+(`doctor-context7` probe) and #3672 (union-only retraction paths) are also open.
+Agents working on private code should not paste private identifiers
+into the query argument; `mcp_servers.context7: false` turns the server off per
+agent. Documented for operators in `docs/configuration.md` under *Built-in MCP
+Servers*.
 
 ## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
 

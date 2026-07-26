@@ -783,6 +783,11 @@ describe("scaffoldAgent", () => {
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
+    expect(settings.permissions.allow).not.toContain(
+      "mcp__context7__resolve-library-id",
+    );
+    expect(settings.permissions.allow).not.toContain("mcp__context7__query-docs");
+    // No blanket grant either, in any form.
     expect(settings.permissions.allow).not.toContain("mcp__context7__*");
     expect(settings.permissions.allow).not.toContain("mcp__context7");
     // Opting out of context7 must NOT disturb webkite — they're
@@ -802,8 +807,98 @@ describe("scaffoldAgent", () => {
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
-    expect(settings.permissions.allow).toContain("mcp__context7__*");
-    expect(settings.permissions.allow).toContain("mcp__context7");
+    expect(settings.permissions.allow).toContain(
+      "mcp__context7__resolve-library-id",
+    );
+    expect(settings.permissions.allow).toContain("mcp__context7__query-docs");
+  });
+
+  it("pre-approves context7 by ENUMERATION — never a wildcard over a third-party namespace", () => {
+    // The security-relevant assertion of this whole change. context7's
+    // tool surface lives on a remote endpoint Upstash controls, unlike
+    // webkite (an operator-built binary). A `mcp__context7__*` grant
+    // would auto-approve whatever verb they ship next, on every fleet
+    // agent, with no approval card and no config change here — so the
+    // wildcard must never come back. Same narrowing as HOSTD_MCP_TOOLS.
+    const config = makeAgentConfig({});
+    const result = scaffoldAgent("ctx7-narrow", config, tmpDir, telegramConfig);
+    const allow: string[] = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    ).permissions.allow;
+    expect(allow).not.toContain("mcp__context7__*");
+    // The bare server token approves the WHOLE server and would defeat
+    // the enumeration just as thoroughly as the wildcard.
+    expect(allow).not.toContain("mcp__context7");
+    expect(allow.filter((t) => t.startsWith("mcp__context7"))).toEqual([
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+    ]);
+  });
+
+  it("retracts context7 pre-approval from an EXISTING agent that opts out (merge path)", () => {
+    // The merge path is union-only by default, and it is the path every
+    // one of the deployed agents takes on `switchroom apply`. Without an
+    // explicit retraction, `mcp_servers.context7: false` would drop the
+    // .mcp.json server but leave the pre-approval tokens — including a
+    // blanket grant from an in-development build — behind forever.
+    const config = makeAgentConfig({});
+    const switchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "ctx7-merge-retract": config },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent(
+      "ctx7-merge-retract", config, tmpDir, telegramConfig, switchroomConfig,
+    );
+    const settingsPath = join(result.agentDir, ".claude", "settings.json");
+    // Simulate an agent that also carries the blanket grant.
+    const s1 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    s1.permissions.allow.push("mcp__context7", "mcp__context7__*");
+    writeFileSync(settingsPath, JSON.stringify(s1, null, 2));
+    // Re-apply with the opt-out set — merge path, existing settings.json.
+    const optedOut = makeAgentConfig(
+      { mcp_servers: { context7: false } } as Partial<AgentConfig>,
+    );
+    scaffoldAgent("ctx7-merge-retract", optedOut, tmpDir, telegramConfig, {
+      ...switchroomConfig,
+      agents: { "ctx7-merge-retract": optedOut },
+    } as SwitchroomConfig);
+    const after: string[] = JSON.parse(
+      readFileSync(settingsPath, "utf-8"),
+    ).permissions.allow;
+    expect(after.filter((t) => t.startsWith("mcp__context7"))).toEqual([]);
+    // ...and webkite's pre-approval is untouched by the retraction.
+    expect(after).toContain("mcp__webkite__*");
+  });
+
+  it("merge-path retraction never strips a token the agent DECLARES in tools.allow", () => {
+    // Contradictory-but-legal config: opted out of the server yet still
+    // declaring the tool. reconcileAgent assigns
+    // computeDesiredPermissionAllow's output wholesale and that output
+    // always includes the declared list, opt-out or not — so if this
+    // path stripped a declared token, apply and reconcile would disagree
+    // and the file would flip-flop on alternating runs. Operator config
+    // wins; the retraction only cleans up switchroom-seeded tokens.
+    const config = makeAgentConfig({
+      mcp_servers: { context7: false },
+      tools: { allow: ["mcp__context7__query-docs"], deny: [] },
+    } as Partial<AgentConfig>);
+    const switchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "ctx7-declared": config },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent(
+      "ctx7-declared", config, tmpDir, telegramConfig, switchroomConfig,
+    );
+    // Second pass = the existing-agent merge path.
+    scaffoldAgent("ctx7-declared", config, tmpDir, telegramConfig, switchroomConfig);
+    const allow: string[] = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    ).permissions.allow;
+    expect(allow).toContain("mcp__context7__query-docs");
+    // ...but the token switchroom would have seeded is still gone.
+    expect(allow).not.toContain("mcp__context7__resolve-library-id");
   });
 
   it("re-seeds context7 pre-approval into an EXISTING agent's allow (merge path)", () => {
@@ -830,12 +925,13 @@ describe("scaffoldAgent", () => {
     );
     writeFileSync(settingsPath, JSON.stringify(s1, null, 2));
     expect(JSON.parse(readFileSync(settingsPath, "utf-8")).permissions.allow)
-      .not.toContain("mcp__context7__*");
+      .not.toContain("mcp__context7__resolve-library-id");
     // Re-scaffold (existing-agent merge path) must re-seed context7.
     scaffoldAgent("ctx7-existing", config, tmpDir, telegramConfig, switchroomConfig);
     const s2 = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(s2.permissions.allow).toContain("mcp__context7__*");
-    expect(s2.permissions.allow).toContain("mcp__context7");
+    expect(s2.permissions.allow).toContain("mcp__context7__resolve-library-id");
+    expect(s2.permissions.allow).toContain("mcp__context7__query-docs");
+    expect(s2.permissions.allow).not.toContain("mcp__context7__*");
   });
 
   it("reconcile pre-approves context7 MCP tools in permissions.allow", () => {
@@ -850,7 +946,11 @@ describe("scaffoldAgent", () => {
     const settings = JSON.parse(
       readFileSync(join(tmpDir, "ctx7-reconcile", ".claude", "settings.json"), "utf-8"),
     );
-    expect(settings.permissions.allow).toContain("mcp__context7__*");
+    expect(settings.permissions.allow).toContain(
+      "mcp__context7__resolve-library-id",
+    );
+    expect(settings.permissions.allow).toContain("mcp__context7__query-docs");
+    expect(settings.permissions.allow).not.toContain("mcp__context7__*");
   });
 
   it("retracts a stale context7 entry from .mcp.json when the agent opts out", () => {
