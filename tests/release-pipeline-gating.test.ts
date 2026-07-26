@@ -38,18 +38,21 @@ interface Step {
   run?: string;
   env?: Record<string, unknown>;
 }
+type Permissions = string | Record<string, string> | undefined;
 interface Job {
   needs?: string | string[];
   if?: unknown;
   uses?: string;
   steps?: Step[];
   env?: Record<string, unknown>;
+  permissions?: Permissions;
   "continue-on-error"?: unknown;
 }
 interface Workflow {
   on?: Record<string, unknown>;
   jobs?: Record<string, Job>;
   env?: Record<string, unknown>;
+  permissions?: Permissions;
 }
 
 function load(file: string): Workflow {
@@ -81,6 +84,29 @@ function envBound(wf: Workflow, job: Job, step: Step, name: string): boolean {
     if (v !== undefined && v !== null && String(v).trim() !== "") return true;
   }
   return false;
+}
+
+/**
+ * The effective `contents:` scope of a job's GITHUB_TOKEN.
+ *
+ * Unlike `env:`, permissions do NOT layer: a job-level `permissions:` block
+ * REPLACES the workflow-level one outright, and every scope it omits becomes
+ * `none`. So this resolves job-first-or-workflow, never a merge of the two.
+ * An absent block anywhere means "whatever the repo default happens to be",
+ * which is not a guarantee — report it as `null` and let the caller fail
+ * closed rather than assume write.
+ */
+function contentsScope(wf: Workflow, job: Job): string | null {
+  const p: Permissions = job.permissions !== undefined ? job.permissions : wf.permissions;
+  if (p === undefined || p === null) return null;
+  if (typeof p === "string") {
+    // The shorthand forms: `write-all` / `read-all` / `{}` (= none).
+    if (p === "write-all") return "write";
+    if (p === "read-all") return "read";
+    return "none";
+  }
+  const v = p.contents;
+  return typeof v === "string" ? v : "none";
 }
 
 /**
@@ -264,6 +290,73 @@ export function auditGating(release: Workflow, npmPublish: Workflow): string[] {
               "binding a non-empty `EXPECT_TAG` — the script exits 1 and the caller misreports it as missing assets.",
           );
         }
+      }
+    }
+  }
+
+  // R11 — every job that runs the completeness gate must hold
+  // `contents: write`, because that is what lets it SEE A DRAFT.
+  //
+  // `GET /repos/{o}/{r}/releases` returns draft releases only to a caller
+  // with push access; to a `contents: read` token the drafts simply are not
+  // in the payload. The release is a DRAFT at every point this gate runs —
+  // `finalize` is the only thing that un-drafts it, and it runs last — so a
+  // read-scoped caller gets `found:false` for a release that exists and is
+  // complete, and exits 4 ("no release exists for this tag").
+  //
+  // That exit is INDISTINGUISHABLE, to every wrapper on this chain, from
+  // "the assets are missing": all of them branch on `rc -ne 0`. So the wrong
+  // permission does not skip the gate, it fails the gate — on every release,
+  // forever, blaming the assets. Exactly the shape of the R10 defect, one
+  // axis over: R10 is about the ENV a gate call needs, R11 is about the
+  // PERMISSION the same call needs. Neither implies the other.
+  //
+  // v0.19.21 shipped this. The proof is a three-way control inside one run
+  // (30189755957) — same script, same endpoint, same tag, differing only in
+  // this permission:
+  //     guard   (contents: write) → {"found":true,"draft":true,...}
+  //     publish (contents: write) → {"found":true,"draft":true,"missing":[]}
+  //     npm     (contents: read)  → {"found":false,"draft":null,...}
+  // All five assets were attached; npm refused to publish anyway and
+  // `finalize` was skipped, stranding the release as a draft while
+  // `/releases/latest` kept serving the asset-less v0.19.19.
+  //
+  // It stayed latent until then because before #3654 releases were created
+  // PUBLISHED, and a published release is visible to any token. The
+  // draft-until-finalize model is what made `contents: read` insufficient.
+  for (const [file, wf] of [
+    ["release.yml", release],
+    ["npm-publish.yml", npmPublish],
+  ] as const) {
+    for (const [id, job] of Object.entries(wf.jobs ?? {})) {
+      if (!stepsOf(job).some((s) => (s.run ?? "").includes("assert-release-assets-complete.mjs"))) continue;
+      const scope = contentsScope(wf, job);
+      if (scope !== "write") {
+        problems.push(
+          `R11: ${file} job ${id} runs assert-release-assets-complete.mjs with \`contents: ${scope ?? "(unset)"}\` — ` +
+            "the releases LIST endpoint hides DRAFTS from a token without push access, so the gate reports " +
+            "`found:false` for a complete release and blocks every release.",
+        );
+      }
+    }
+  }
+
+  // R11 (caller half) — a job that CALLS npm-publish.yml must itself grant
+  // `contents: write`. A caller job's `permissions:` block is a CAP on the
+  // token the reusable workflow receives, not a default it can exceed, so
+  // raising the permission inside npm-publish.yml alone is a silent no-op:
+  // the callee would still run read-scoped and the gate would still go red.
+  // Both halves or neither.
+  if (Object.values(npmPublish.jobs ?? {}).some((j) => stepsOf(j).some((s) => (s.run ?? "").includes("assert-release-assets-complete.mjs")))) {
+    for (const [id, job] of releaseJobs) {
+      if (!(job.uses ?? "").endsWith("npm-publish.yml")) continue;
+      const scope = contentsScope(release, job);
+      if (scope !== "write") {
+        problems.push(
+          `R11: release.yml job ${id} calls npm-publish.yml with \`contents: ${scope ?? "(unset)"}\` — a caller job's ` +
+            "permissions CAP the called workflow's token, so npm-publish.yml's own `contents: write` is neutered " +
+            "and its draft-visibility gate fails closed on every release.",
+        );
       }
     }
   }
@@ -497,6 +590,87 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
       }
     });
     expect(p.join("\n")).toMatch(/R10:.*npm-publish\.yml.*EXPECT_TAG/);
+  });
+
+  // ── R11: the v0.19.21 regression ───────────────────────────────────────
+  //
+  // Reconstructing the tag's ACTUAL configuration is the proof that matters.
+  // `git show v0.19.21:.github/workflows/{release,npm-publish}.yml` differs
+  // from the fixed files in exactly these two lines, so setting them back
+  // reproduces the tree that died — and R11 is the only rule that fires on
+  // it, which is also how we know it went undetected before.
+  it("R11: the v0.19.21 tree — `contents: read` on both halves of the npm call — is caught", () => {
+    const p = mutate((r, n) => {
+      (r.jobs!.npm.permissions as Record<string, string>).contents = "read";
+      (n.permissions as Record<string, string>).contents = "read";
+    });
+    expect(p.join("\n")).toMatch(/R11: npm-publish\.yml job publish runs assert-release-assets-complete\.mjs with `contents: read`/);
+    expect(p.join("\n")).toMatch(/R11: release\.yml job npm calls npm-publish\.yml with `contents: read`/);
+    // …and nothing else. The pipeline was otherwise clean, which is exactly
+    // why two tags died before anyone could see this.
+    expect(p.filter((x) => !x.startsWith("R11:"))).toEqual([]);
+  });
+
+  it("R11: fixing only npm-publish.yml, leaving the caller capped at read, is caught", () => {
+    // The half-fix that looks right and does nothing: the callee asks for
+    // write, the caller's block never grants it.
+    const p = mutate((r) => {
+      (r.jobs!.npm.permissions as Record<string, string>).contents = "read";
+    });
+    expect(p.join("\n")).toMatch(/R11: release\.yml job npm calls npm-publish\.yml .*CAP/s);
+  });
+
+  it("R11: fixing only the caller, leaving npm-publish.yml at read, is caught", () => {
+    const p = mutate((_r, n) => {
+      (n.permissions as Record<string, string>).contents = "read";
+    });
+    expect(p.join("\n")).toMatch(/R11: npm-publish\.yml job publish runs assert-release-assets-complete/);
+  });
+
+  it("R11: downgrading the un-draft job so it can no longer see the draft is caught", () => {
+    // `finalize` has never executed in any release to date; it re-runs the
+    // same gate on the same draft and would fail the same way.
+    const p = mutate((r) => {
+      (jobDoing(r, "--draft=false")![1].permissions as Record<string, string>).contents = "read";
+    });
+    expect(p.join("\n")).toMatch(/R11: release\.yml job finalize/);
+  });
+
+  it("R11: dropping a gate job's permissions block entirely is caught (repo default is not a guarantee)", () => {
+    const p = mutate((r) => {
+      delete jobDoing(r, "gh release upload")![1].permissions;
+    });
+    // Falls back to release.yml's workflow-level `contents: read`.
+    expect(p.join("\n")).toMatch(/R11: release\.yml job publish .*`contents: read`/);
+  });
+
+  // Guards R11 against over-firing on the legal shorthand: `write-all` really
+  // does grant contents:write, and a rule that flagged it would push people
+  // toward silencing the rule rather than fixing the permission.
+  it("R11: the `write-all` shorthand satisfies the rule", () => {
+    const p = mutate((r) => {
+      jobDoing(r, "gh release upload")![1].permissions = "write-all";
+    });
+    expect(p.join("\n")).not.toMatch(/R11:/);
+  });
+
+  // Guards the rule against under-firing on the OTHER shorthand.
+  it("R11: the `read-all` shorthand is caught", () => {
+    const p = mutate((r) => {
+      jobDoing(r, "gh release upload")![1].permissions = "read-all";
+    });
+    expect(p.join("\n")).toMatch(/R11: release\.yml job publish .*`contents: read`/);
+  });
+
+  // Permissions do NOT layer the way env does: a job block REPLACES the
+  // workflow block, so a job that sets only `actions: read` silently drops
+  // contents to `none`. Pin that, because it is the subtle way this defect
+  // returns.
+  it("R11: a job block that omits `contents:` drops it to none, and is caught", () => {
+    const p = mutate((r) => {
+      jobDoing(r, "--draft=false")![1].permissions = { actions: "read" };
+    });
+    expect(p.join("\n")).toMatch(/R11: release\.yml job finalize .*`contents: none`/);
   });
 
   // Guards the rule against over-firing: GitHub really does inherit env from
