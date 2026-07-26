@@ -48,6 +48,32 @@ describe('boot pin sweep wiring (#3664)', () => {
     expect(readyIdx).toBeGreaterThan(assignIdx)
   })
 
+  it('runs the sweep steps through runBootPinSweepSteps, not a bare await chain', () => {
+    // Salvage S2. The BEHAVIOUR (a throwing step must not strand the steps
+    // behind it, and must never strand the DM-eligibility flip) is proven in
+    // boot-sweep-gate.test.ts. This fence is what makes that proof apply to the
+    // gateway: the reapers must reach the runner as injected steps, and nothing
+    // may reintroduce the bare sequential chain that skipped the isolation.
+    expect(gatewaySrc).toContain('return runBootPinSweepSteps({')
+    const stepFns = ['statusPinBootCleanup', 'activityCardBootReaper', 'queuedCardBootReaper']
+    for (const stepFn of stepFns) {
+      // Passed BY REFERENCE as a step, never invoked inline in the sweep.
+      expect(gatewaySrc).toContain(`: ${stepFn},`)
+      const inlineAwaits = gatewaySrc.match(new RegExp(`await\\s+${stepFn}\\s*\\(`, 'g')) ?? []
+      expect(inlineAwaits).toEqual([])
+    }
+    // The DM-eligibility flip is what a throw used to strand, so it must live
+    // INSIDE the enableDmSweep step callback — not as a statement sequenced
+    // after the reapers, where one rejection skips it for the whole session.
+    const lines = gatewaySrc.split('\n')
+    const flipIdxs = lines
+      .map((l, i) => ({ l, i }))
+      .filter(({ l }) => /^\s*dmPinSweepEligible = true\s*$/.test(l))
+      .map(({ i }) => i)
+    expect(flipIdxs.length).toBe(1)
+    expect(lines[flipIdxs[0] - 1]).toContain('enableDmSweep: () => {')
+  })
+
   it('routes the pin API through the asserting seam, never a raw lockedBot.api pin', () => {
     // Salvage S1/S3: `statusPinApi()` must build on `createStatusPinApi`, which
     // asserts the bot exists and converts a send-gate SHED into a throw. A

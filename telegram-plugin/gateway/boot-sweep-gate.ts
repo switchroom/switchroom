@@ -1,5 +1,7 @@
 /**
- * boot-sweep-gate.ts — two-condition arming gate for the boot pin sweep (#3664).
+ * boot-sweep-gate.ts — control flow for the boot pin sweep (#3664): WHEN it may
+ * start (`createBootSweepGate`, the two-condition arming gate) and HOW its steps
+ * are sequenced once it does (`runBootPinSweepSteps`, per-step isolation).
  *
  * Why this exists
  * ---------------
@@ -84,4 +86,79 @@ export function createBootSweepGate(args: {
       return started
     },
   }
+}
+
+/** Dependencies of {@link runBootPinSweepSteps}. All side effects are injected
+ *  so the sequencing contract is provable without a gateway. */
+export interface BootPinSweepSteps {
+  /** Pure fs scan for DM chat ids with a prior-session pin record. MUST run
+   *  BEFORE the reapers, which empty those same stores. */
+  scanDmChatIds: () => string[]
+  statusPinCleanup: () => Promise<unknown>
+  activityCardReaper: () => Promise<unknown>
+  queuedCardReaper: () => Promise<unknown>
+  /** Flips the flag authorising the DM unpin-all path — for this sweep AND for
+   *  later lazy first-inbound sweeps. */
+  enableDmSweep: () => void
+  sweepDm: (chatId: string) => Promise<unknown>
+  log?: (line: string) => void
+}
+
+/**
+ * Run one sweep step, absorbing (and logging) a throw. See
+ * {@link runBootPinSweepSteps} for why isolation is mandatory here.
+ *
+ * Absorbs unconditionally: a non-`Error` throw is stringified rather than
+ * logged as `undefined`, and a `log` that itself throws (a closed stderr on a
+ * dying process) is swallowed too — otherwise the one function whose whole job
+ * is "never let a step take the sweep down" could take the sweep down.
+ */
+async function step(name: string, fn: () => Promise<unknown>, log: (line: string) => void) {
+  try {
+    await fn()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    try {
+      log(`telegram gateway: boot pin sweep step '${name}' failed: ${msg}\n`)
+    } catch {
+      /* stderr is gone — nothing useful left to do */
+    }
+  }
+}
+
+/**
+ * Sequence the boot sweep's steps, each individually absorbed.
+ *
+ * Why isolation is mandatory (#3664 salvage S2). The steps used to run as a
+ * bare sequential `await` chain. `runStatusPinBootCleanup` absorbs its own
+ * per-row throws, but the two card reapers issue real Bot API calls and can
+ * reject outright — and a rejection there did not merely skip the later
+ * reapers, it skipped `enableDmSweep()`. That flag authorises the DM
+ * unpin-all path for the WHOLE SESSION (the boot sweep AND every later lazy
+ * first-inbound sweep), so one throwing reaper silently disabled DM stale-pin
+ * cleanup entirely.
+ *
+ * That was unreachable before #3664 only because the sweep never actually ran
+ * — every step died on `undefined is not an object (evaluating
+ * 'lockedBot.api')` before doing anything. Making the sweep work for the first
+ * time is precisely what makes an earlier step's throw newly reachable, so the
+ * isolation lands with the fix rather than after it.
+ *
+ * Never rejects: every step is best-effort and the caller fire-and-forgets it.
+ */
+export async function runBootPinSweepSteps(deps: BootPinSweepSteps): Promise<void> {
+  const log = deps.log ?? ((l: string) => process.stderr.write(l))
+
+  let dmChatIds: string[] = []
+  await step('dm-chat-scan', async () => {
+    dmChatIds = deps.scanDmChatIds()
+  }, log)
+
+  await step('status-pin-cleanup', deps.statusPinCleanup, log)
+  await step('activity-card-reaper', deps.activityCardReaper, log)
+  await step('queued-card-reaper', deps.queuedCardReaper, log)
+
+  // Unconditional: reached even when every step above threw. See the docblock.
+  await step('enable-dm-sweep', async () => deps.enableDmSweep(), log)
+  for (const id of dmChatIds) await step(`dm-sweep:${id}`, () => deps.sweepDm(id), log)
 }

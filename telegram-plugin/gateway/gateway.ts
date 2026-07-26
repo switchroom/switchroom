@@ -636,7 +636,7 @@ import { formatUpdateStatusLine } from './update-status-line.js'
 import type { HostdRequest, HostdResponse } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
-import { createBootSweepGate } from './boot-sweep-gate.js'
+import { createBootSweepGate, runBootPinSweepSteps } from './boot-sweep-gate.js'
 import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './status-pin-api.js'
 import {
   createDmPinSweeper,
@@ -9293,36 +9293,37 @@ const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
  * Boot-time pin cleanup + DM stale-pin sweep. Collects the DM chat IDs with a
  * prior-session pin record BEFORE the store reapers empty the stores, runs the
  * three boot reapers, marks the DM sweep eligible, then unpin-alls each
- * recorded DM chat. Dispatched only via `bootPinSweepGate` below (mutex won AND
- * `lockedBot` constructed); fire-and-forget — never blocks boot.
+ * recorded DM chat. Ordering and per-step isolation live in
+ * `runBootPinSweepSteps` (boot-sweep-gate.ts) — a throwing reaper must not
+ * strand `enableDmSweep`. Dispatched only via `bootPinSweepGate` below (mutex
+ * won AND `lockedBot` constructed); fire-and-forget — never blocks boot.
  */
-async function runBootPinCleanupAndDmSweep(): Promise<void> {
-  let dmChatIds: string[] = []
-  try {
-    dmChatIds = collectDmChatIdsFromStores({
-      statusPins:
-        statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
-          ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+function runBootPinCleanupAndDmSweep(): Promise<void> {
+  return runBootPinSweepSteps({
+    scanDmChatIds: () =>
+      collectDmChatIdsFromStores({
+        statusPins:
+          statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
+            ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+            : [],
+        activityCards: activityCardPersistEnabled
+          ? loadActivityCards(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs)
           : [],
-      activityCards: activityCardPersistEnabled
-        ? loadActivityCards(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs)
-        : [],
-      queuedCards: queuedCardPersistEnabled
-        ? loadQueuedCards(QUEUED_CARD_STORE_PATH, queuedCardStoreFs)
-        : [],
-    })
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: dm-pin-sweep: store scan failed: ${(err as Error).message}\n`,
-    )
-  }
-  await statusPinBootCleanup()
-  await activityCardBootReaper()
-  await queuedCardBootReaper()
-  // This gateway owns the shared pin state — enable the DM unpin-all path
-  // (the boot sweep below AND lazy first-inbound sweeps).
-  dmPinSweepEligible = true
-  for (const id of dmChatIds) await dmPinSweeper.sweep(id)
+        queuedCards: queuedCardPersistEnabled
+          ? loadQueuedCards(QUEUED_CARD_STORE_PATH, queuedCardStoreFs)
+          : [],
+      }),
+    statusPinCleanup: statusPinBootCleanup,
+    activityCardReaper: activityCardBootReaper,
+    queuedCardReaper: queuedCardBootReaper,
+    // This gateway owns the shared pin state — enable the DM unpin-all path
+    // (this sweep AND lazy first-inbound sweeps).
+    enableDmSweep: () => {
+      dmPinSweepEligible = true
+    },
+    sweepDm: (id) => dmPinSweeper.sweep(id),
+    log: (line) => process.stderr.write(line),
+  })
 }
 
 // #3664: needs BOTH the mutex (arm) and a constructed `lockedBot` (botReady,

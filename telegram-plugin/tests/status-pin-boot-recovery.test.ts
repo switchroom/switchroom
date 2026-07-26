@@ -335,15 +335,17 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
       expect(idx).toBeGreaterThan(lockIdx);
     }
 
-    // statusPinBootCleanup() itself must only ever be invoked from INSIDE
-    // that orchestrator — never at a bare post-import call site that a
-    // losing double-boot could reach.
+    // statusPinBootCleanup itself must only ever be REACHED from INSIDE that
+    // orchestrator — never at a bare post-import call site that a losing
+    // double-boot could reach. Since the #3664 S2 salvage the orchestrator
+    // hands it to runBootPinSweepSteps BY REFERENCE (per-step isolation), so
+    // the step binding counts as a reach, not just a `()` call.
     const declIdx = lines.findIndex((l) =>
       /async function statusPinBootCleanup/.test(l),
     );
     expect(declIdx).toBeGreaterThan(-1);
     const orchestratorIdx = lines.findIndex((l) =>
-      /async function runBootPinCleanupAndDmSweep/.test(l),
+      /function runBootPinCleanupAndDmSweep/.test(l),
     );
     expect(orchestratorIdx).toBeGreaterThan(-1);
     const invocationIdxs = lines
@@ -351,7 +353,7 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
       .filter(
         ({ l, i }) =>
           i !== declIdx &&
-          /statusPinBootCleanup\(\)/.test(l) &&
+          /statusPinBootCleanup\(\)|:\s*statusPinBootCleanup,/.test(l) &&
           !l.trimStart().startsWith("//") &&
           !l.includes("statusPinBootCleanup() is deliberately NOT"),
       )

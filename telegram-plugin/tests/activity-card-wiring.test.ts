@@ -119,16 +119,19 @@ describe('activity-card durability wiring', () => {
 
   it('the boot reaper runs ONLY after the startup mutex is won (never at import time)', () => {
     // #3026: the reaper is now invoked via the mutex-gated orchestrator
-    // runBootPinCleanupAndDmSweep() (which awaits it alongside
+    // runBootPinCleanupAndDmSweep() (which runs it alongside
     // statusPinBootCleanup + queuedCardBootReaper, then runs the DM
     // stale-pin sweep). Invariant unchanged: reachable only post-lock.
-    // (1) The orchestrator awaits the reaper.
+    // (1) The orchestrator runs the reaper. Since the #3664 S2 salvage the
+    // steps are INJECTED into runBootPinSweepSteps (each individually
+    // absorbed, so a throwing reaper cannot strand the DM sweep behind it)
+    // instead of being awaited inline — so the marker is the step binding.
     const orchestrator = between(
       gatewaySrc,
-      'async function runBootPinCleanupAndDmSweep()',
+      'function runBootPinCleanupAndDmSweep()',
       'dmPinSweepEligible = true',
     )
-    expect(orchestrator).toMatch(/await activityCardBootReaper\(\)/)
+    expect(orchestrator).toMatch(/activityCardReaper: activityCardBootReaper,/)
     // (2) Both orchestrator invocation sites (mutex-won + mutex-fallback)
     // sit AFTER acquireStartupLock. Since #3664 they ARM the boot sweep gate
     // rather than dispatching directly: the sweep now also needs `lockedBot`
