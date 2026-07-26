@@ -139,7 +139,10 @@ describe("per-source candidate cap derivation", () => {
     // abandons the bank at 8s (vendor scripts/recall.py), so a graph stall
     // kills the WHOLE recall — including the semantic and BM25 results that
     // already returned — and writes no telemetry row. A bound strictly under
-    // the client timeout is what converts that into graceful degradation.
+    // the client timeout is what lets the engine shed the stalling stage
+    // before the client walks away. It is NOT a ceiling on recall: the knob
+    // wraps only the entity-expansion query, and its fallback is untimed —
+    // see the constant's doc comment for what the engine actually does.
     const PER_BANK_CLIENT_TIMEOUT_S = 8;
     expect(HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S).toBeLessThan(PER_BANK_CLIENT_TIMEOUT_S);
   });
@@ -302,15 +305,23 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("covers every managed key and nothing else", () => {
-    const declared = new Set(
-      [
-        ...HINDSIGHT_PERF_DEFAULTS_UNGATED,
-        ...HINDSIGHT_PERF_DEFAULTS_GPU,
-        ...HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
-      ].map(([k]) => k),
-    );
-    expect([...HINDSIGHT_PERF_ENV_KEYS].sort()).toEqual([...declared].sort());
+  it("is overridable on exactly these eight keys, by name", () => {
+    // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
+    // is DEFINED as the union of those arrays, so asserting it equals that union
+    // is a tautology — it passes no matter which keys are in the arrays. The
+    // override surface is a documented contract (src/config/schema.ts's
+    // `hindsight.env` description names these keys), so pin the literal list:
+    // adding or dropping a managed key must fail here and force the doc update.
+    expect([...HINDSIGHT_PERF_ENV_KEYS].sort()).toEqual([
+      "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
+      "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
+      "HINDSIGHT_API_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_LLM_REASONING_EFFORT",
+      "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
+      "HINDSIGHT_API_RERANKER_LOCAL_FP16",
+      "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
+    ]);
   });
 });
 
@@ -320,6 +331,13 @@ describe("isSelfHostedHttpUrl", () => {
     "http://127.0.0.1:4010",
     "http://localhost:4010",
     "http://[::1]:4010",
+    // IPv6 unique-local (fc00::/7) and link-local (fe80::/10) literals — the
+    // two regexes in isSelfHostedHttpUrl. Without these cases both regexes can
+    // be deleted with the whole suite still green (mutation M1).
+    "http://[fd00::1]:4010",
+    "http://[fc00:abcd::5]:4010",
+    "http://[fe80::1]:4010",
+    "http://[feba::1]:4010",
     "http://10.1.2.3:8000",
     "http://192.168.1.10:11434",
     "http://172.16.0.5:4010",
@@ -340,6 +358,11 @@ describe("isSelfHostedHttpUrl", () => {
     "http://172.32.0.1:4010",
     // 11.x is NOT private, however much it looks like 10.x.
     "http://11.0.0.1:4010",
+    // Bracket the two IPv6 ranges the same way: fb00 is one nibble below
+    // fc00::/7, and fec0::/10 (deprecated site-local) is outside fe80::/10.
+    "http://[fb00::1]:4010",
+    "http://[fec0::1]:4010",
+    "http://[2001:db8::1]:4010",
     "not a url",
     "",
   ])("treats %s as NOT self-hosted", (url) => {
@@ -449,20 +472,82 @@ describe("startHindsight — performance defaults reach the container", () => {
       processEnv: {},
     });
     const env = runEnv(runArgs());
+    // The value FIRST: "at most once" alone cannot tell "emitted once with the
+    // operator's 3" from "silently dropped", so a resolver that ignored
+    // overrides for the ungated group passed this test (mutation M28).
+    expect(env.get("HINDSIGHT_API_LINK_EXPANSION_TIMEOUT")).toEqual(["3"]);
+    expect(String(HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S)).not.toBe("3");
     for (const key of HINDSIGHT_PERF_ENV_KEYS) {
       expect(env.get(key)?.length ?? 0, `${key} must appear at most once`).toBeLessThanOrEqual(1);
     }
   });
+
+  it("reads a self-hosted per-op LLM base URL when there is no litellm block", () => {
+    // The `llm` argument's wiring into hindsightLocalLlmEnabled. Every other
+    // launch-path case configures the endpoint through `litellm`, so dropping
+    // `llm` from hindsightPerfEnvPairs left the suite green (mutation M29).
+    // Here `llm` carries the ONLY base URL and it is LAN-private, so the
+    // local-LLM group must switch on from that argument alone.
+    const llm = { retain: { base_url: "http://192.168.1.50:11434" } };
+    startHindsight(undefined, undefined, undefined, llm, undefined, false);
+    const fromRun = runEnv(runArgs());
+    expect(fromRun.get("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toEqual(["4"]);
+    expect(fromRun.get("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT")).toEqual(["1"]);
+    expect(fromRun.get("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT")).toEqual(["1"]);
+    // ...and the compose twin reads the same argument the same way.
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(llm, undefined, undefined, false),
+    );
+    expect(fromCompose.get("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toEqual(["4"]);
+  });
+
+  it("leaves the LLM concurrency caps alone when the only per-op base URL is cloud", () => {
+    // The control for the case above: same argument position, hosted URL, so a
+    // predicate that just returned `true` whenever `llm` was present would fail.
+    startHindsight(
+      undefined,
+      undefined,
+      undefined,
+      { retain: { base_url: "https://api.openai.com/v1" } },
+      undefined,
+      false,
+    );
+    expect(runEnv(runArgs()).has("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toBe(false);
+  });
 });
 
 describe("run ⇄ compose parity for the performance defaults", () => {
+  /**
+   * An operator override carried through EVERY parity cell.
+   *
+   * Without it both generators were called with `perf` undefined, so the
+   * compose path could ignore its `perf` argument entirely and still agree
+   * with the run path (mutation M17 — dropping `perf` from the
+   * hindsightPerfEnvPairs call inside generateHindsightComposeSnippet left the
+   * suite green). Two keys on purpose:
+   *   • LINK_EXPANSION_TIMEOUT is ungated, so it exercises the REPLACE path in
+   *     every cell.
+   *   • RETAIN_LLM_MAX_CONCURRENT is in the local-LLM group, so with
+   *     CLOUD_LITELLM it exercises the "group OFF, override still emitted"
+   *     append path across both generators too.
+   * Neither key is one of the two the matrix assertions below probe, so the
+   * gated-knob divergence check is unaffected.
+   */
+  const OPERATOR_PERF = {
+    env: {
+      HINDSIGHT_API_LINK_EXPANSION_TIMEOUT: 7,
+      HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT: 3,
+    },
+    processEnv: {},
+  };
+
   for (const gpu of [true, false]) {
     for (const litellm of [LOOPBACK_LITELLM, CLOUD_LITELLM]) {
       it(`agree for gpu=${gpu} litellm=${litellm.baseUrl}`, () => {
-        startHindsight(undefined, litellm, undefined, undefined, undefined, gpu);
+        startHindsight(undefined, litellm, undefined, undefined, undefined, gpu, OPERATOR_PERF);
         const fromRun = runEnv(runArgs());
         const fromCompose = composeEnv(
-          generateHindsightComposeSnippet(undefined, undefined, litellm, gpu),
+          generateHindsightComposeSnippet(undefined, undefined, litellm, gpu, OPERATOR_PERF),
         );
         // Compare the OUTCOME of both generators, key by key, for every knob
         // this module manages — not merely that both called the resolver.
@@ -471,6 +556,10 @@ describe("run ⇄ compose parity for the performance defaults", () => {
             fromRun.get(key) ?? null,
           );
         }
+        // Parity alone is symmetric — two paths that BOTH dropped `perf` would
+        // still agree. Pin the operator's values on the compose side directly.
+        expect(fromCompose.get("HINDSIGHT_API_LINK_EXPANSION_TIMEOUT")).toEqual(["7"]);
+        expect(fromCompose.get("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT")).toEqual(["3"]);
         // ...and at least one gated knob genuinely differs across the matrix,
         // so a resolver that returned {} for everything wouldn't pass.
         expect(fromRun.has("HINDSIGHT_API_RERANKER_LOCAL_FP16")).toBe(gpu);

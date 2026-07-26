@@ -110,12 +110,32 @@ export const HINDSIGHT_RECALL_SOURCE_COUNT = 4;
  *
  *   • one source alone can no longer fill the reranker budget
  *     (`perSource < rerankerMax`), and
- *   • the four sources together can still fill it, so the cap costs no
- *     recall quality when the pool is healthy
- *     (`perSource * sources >= rerankerMax`).
+ *   • the four sources together can still fill it
+ *     (`perSource * sources >= rerankerMax`), so the cap costs little recall
+ *     quality when the pool is healthy.
  *
- * Both are asserted in hindsight-perf-defaults.test.ts; raising the reranker
- * budget moves this automatically.
+ * "Little", not "nothing", and the difference is worth being precise about.
+ * The engine applies the cap per source, after each arm's own sort and BEFORE
+ * fusion (memory_engine.py, `per_source_cap` / `cap_per_source` on the
+ * semantic, bm25, graph and temporal lists). So the second half proves the
+ * fused pool can still be FILLED to the reranker budget — not that the same
+ * items reach it. An item ranked, say, #80 in both the semantic and the BM25
+ * arm has strong RRF consensus today and would be dropped from both arms
+ * before fusion under a 60 cap, so consensus-but-mid-ranked items are the
+ * class this trades away. In practice that is small — final k is ~10, and the
+ * items that survive fusion are overwhelmingly top-of-arm — but it is a real
+ * trade, not a free one.
+ *
+ * Both halves are asserted in hindsight-perf-defaults.test.ts; raising the
+ * reranker budget moves this automatically.
+ *
+ * NOTE the anchor: 150 is SWITCHROOM's reranker budget, not upstream's.
+ * Upstream's `DEFAULT_RERANKER_MAX_CANDIDATES` is 300; the 150 here is a
+ * prior switchroom tightening (src/setup/hindsight.ts). The 40% ratio is
+ * therefore derived against a switchroom value and would want revisiting if
+ * switchroom ever moves back toward upstream's 300 — at which point 40%
+ * yields 120 per source, still satisfying both halves, but the absolute
+ * per-arm truncation point moves with it.
  */
 export const HINDSIGHT_DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE = Math.ceil(
   HINDSIGHT_RERANKER_MAX_CANDIDATES_FOR_DERIVATION * 0.4,
@@ -143,11 +163,33 @@ export const HINDSIGHT_DEFAULT_LINK_EXPANSION_PER_ENTITY_LIMIT = 50;
  * graph stall today kills the WHOLE recall, losing the semantic and BM25
  * results that had already returned, and leaves no telemetry row.
  *
- * A bound BELOW the client's per-bank timeout inverts that: the graph source
- * degrades, recall still returns with the other three sources, and the turn
- * keeps its memories. 2s is 20x upstream's documented <100ms target for this
- * stage and above the measured 1.412s p90, so it should not fire on a healthy
- * query at all — it only converts a tail stall into graceful degradation.
+ * A bound BELOW the client's per-bank timeout gives the engine a chance to
+ * shed the expensive part instead. Be precise about what it actually sheds —
+ * read from the engine source, `engine/search/link_expansion_retrieval.py`:
+ *
+ *   • The timeout wraps ONE query: the entity-expansion CTE inside
+ *     `_expand_combined` (`asyncio.wait_for(conn.fetch(full_query, ...),
+ *     timeout=config.link_expansion_timeout)`). On fire it degrades WITHIN the
+ *     graph source — it drops entity expansion and re-runs a semantic+causal
+ *     query — it does NOT drop the graph source in favour of the other three.
+ *   • That fallback `conn.fetch` carries NO timeout of its own. Neither does
+ *     the seed lookup (`_find_semantic_seeds`) that runs before it. So this
+ *     knob bounds one stage, not the graph source and certainly not recall.
+ *   • The whole block runs once per fact_type — three by default
+ *     (`world`, `experience`, `observation`), dispatched concurrently by
+ *     `retrieve_all_fact_types_parallel` via `asyncio.gather`. Concurrent, so
+ *     the waits overlap rather than summing to 6s; but each has its own
+ *     unbounded fallback afterwards, and they contend for the same pool.
+ *
+ * So this is NOT a 2s ceiling on recall, and nothing here makes the 8s client
+ * timeout unreachable. What it buys is real but narrower: the single stage
+ * most responsible for the cold-page tail stops being allowed to burn 10s per
+ * fact_type before it gives up, which leaves the rest of the pipeline enough
+ * of the client's 8s to return something.
+ *
+ * The value: 2s is 20x upstream's documented <100ms target for this stage and
+ * above the measured 1.412s p90, so it should not fire on a healthy query at
+ * all — it only bites the tail.
  */
 export const HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S = 2;
 
