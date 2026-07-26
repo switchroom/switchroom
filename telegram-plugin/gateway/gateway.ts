@@ -294,6 +294,7 @@ import {
   retryWithThreadFallback,
   isFloodWaitActiveError,
 } from '../retry-api-call.js'
+import { installEditFloodFuse } from '../edit-flood-fuse.js'
 import { createSendGate, sendGateConfigFromEnv, isSendGateShed } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
 import { installTgPostLogger, installRichMarkdownGuard, withTgPostTags } from '../shared/bot-runtime.js'
@@ -22959,6 +22960,13 @@ async function initGatewayBot(): Promise<void> {
 
   bot = new Bot(TOKEN)
   installTgPostLogger(bot); installRichMarkdownGuard(bot) // #3252/#3463: universal fmt guard installed after logger (composes outermost); see installRichMarkdownGuard docblock
+  // #3620 flood fuse — installed LAST so it composes OUTERMOST: the one seam no
+  // outbound call can bypass (grammY has no route to the network that skips the
+  // transformer stack). Kill-switch SWITCHROOM_EDIT_FUSE=0; see edit-flood-fuse.ts.
+  installEditFloodFuse(bot, {
+    enabled: process.env.SWITCHROOM_EDIT_FUSE !== '0',
+    onTrip: (i) => process.stderr.write(`edit-flood-fuse ${i.action} method=${i.method} key=${i.key}\n`),
+  })
 
   // Diagnostic update tap (#3300): one compact line per received update, logged
   // BEFORE any specific handler runs, so a routing-layer drop is diagnosable

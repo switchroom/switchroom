@@ -167,6 +167,31 @@ class _Harness(unittest.TestCase):
             context = json.loads(raw)["hookSpecificOutput"]["additionalContext"]
         return context
 
+    def _assert_no_fallback(self, context):
+        """Assert the transcript fallback did NOT fire.
+
+        Switchroom #3619: a degraded own-bank read now emits a one-line
+        DEGRADED disclosure, so "the hook emitted nothing at all" is no longer
+        a valid proxy for "the fallback did not fire" — assert on the fallback
+        block itself. These tests are about fallback GATING, not about whether
+        any context was produced.
+
+        Review follow-up (#3626): this deliberately does NOT tolerate a `None`
+        context. Every caller reaches it with the OWN bank hard-errored, which
+        is exactly the condition the disclosure must fire on, so `None` means
+        the disclosure regressed. An earlier `if context is None: return`
+        guard here made the `DEGRADED` assertion vacuous under precisely that
+        mutation — stubbing `degraded_block = ""` left all 12 tests in this
+        file green.
+        """
+        self.assertIsNotNone(
+            context,
+            "own bank hard-errored, so the #3619 degraded disclosure must have "
+            "been emitted — a silent turn is the regression this guards",
+        )
+        self.assertNotIn("<hindsight_transcript_fallback>", context)
+        self.assertIn("DEGRADED", context)
+
 
 class FiresOnEmptyFactLayer(_Harness):
     def test_fires_when_all_banks_zero_and_no_deadline_hit(self):
@@ -264,7 +289,7 @@ class DoesNotFireWhenBankErrored(_Harness):
             bank_errors={"own-bank": ConnectionRefusedError("connection refused")},
         )
         context = self._run(client, transcript_path=transcript)
-        self.assertIsNone(context, "fallback must not fire when a bank hard-errored")
+        self._assert_no_fallback(context)
         e = self._read_log()[0]
         self.assertTrue(e["bank_errored"])
         self.assertFalse(e["deadline_hit"])
@@ -283,7 +308,7 @@ class DoesNotFireWhenBankErrored(_Harness):
             transcript_path=transcript,
             config_extra={"recallParallel": False},
         )
-        self.assertIsNone(context, "fallback must not fire when a bank hard-errored")
+        self._assert_no_fallback(context)
         e = self._read_log()[0]
         self.assertEqual(e["recall_mode"], "serial")
         self.assertTrue(e["bank_errored"])

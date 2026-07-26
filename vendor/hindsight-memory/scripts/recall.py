@@ -1296,6 +1296,56 @@ def _combine_context(base, nudge) -> str:
     return "\n\n".join(parts)
 
 
+def degraded_recall_notice(bank_id, bank_timings) -> str:
+    """Switchroom #3619 — return the degraded-recall disclosure for this turn,
+    or "" when the agent's own bank answered.
+
+    Until now a recall whose own bank timed out was indistinguishable, from the
+    agent's side, from a bank that genuinely held nothing relevant: both
+    produced an empty block and silence. That ambiguity is what let a measured
+    ~90% own-bank timeout rate run for weeks unnoticed while every agent's
+    CLAUDE.md asserted recall "auto-fires on every inbound message" — the agent
+    had no way to know it was answering from an empty context, so it never said
+    so and the operator never saw it.
+
+    Only the agent's OWN bank warrants the notice: additional banks (a shared
+    profile bank, say) are supplementary, and a side-bank timeout does not mean
+    the agent lost its own memory. Matching is by `bank_id`, never by position
+    in `bank_timings` — the fan-out order is not stable.
+
+    Kept to a single short line on purpose: this fires on an already-degraded
+    turn, and a verbose block would spend the very budget the degradation is
+    starving. The caller must keep it OUT of the cached context (see
+    `_combine_context`) — it is per-turn state and would otherwise replay on a
+    later healthy cache hit.
+    """
+    if not bank_id or not bank_timings:
+        return ""
+    own = next(
+        (
+            bt
+            for bt in bank_timings
+            if isinstance(bt, dict) and bt.get("bank_id") == bank_id
+        ),
+        None,
+    )
+    if not own:
+        return ""
+    if own.get("timed_out"):
+        reason = "timed out"
+    elif own.get("errored"):
+        reason = "was unreachable"
+    else:
+        return ""
+    return (
+        f"[Hindsight] Memory recall was DEGRADED this turn: your own bank "
+        f"('{bank_id}') {reason}, so the memories below (if any) are "
+        f"incomplete and may be missing entirely. Treat an absence of "
+        f"relevant memory as UNKNOWN, not as 'nothing was remembered' — "
+        f"say so rather than asserting there is no prior context."
+    )
+
+
 def main():
     config = load_config()
 
@@ -2129,13 +2179,22 @@ def main():
         "transcript_fallback_truncated": transcript_fallback_telemetry["truncated"],
     })
 
-    # If neither block has content, there's nothing to inject — exit
+    # Switchroom #3619 — DEGRADED-RECALL DISCLOSURE. See
+    # `degraded_recall_notice` for why this exists and why only the agent's
+    # OWN bank counts.
+    degraded_block = degraded_recall_notice(bank_id, bank_timings)
+
+    # If no block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput. #2848: unless
     # the directive-capture nudge fired, in which case emit the nudge alone
     # (a correction with no memories/directives still needs the reminder).
+    # #3619: a degraded own-bank read is likewise worth emitting alone — that
+    # is precisely the turn on which the agent must not assume it remembers.
     if not directives_block and not memories_block and not transcript_fallback_block:
-        if nudge_block:
-            _emit_cached_context(nudge_block)
+        if degraded_block or nudge_block:
+            _emit_cached_context(
+                "\n\n".join([b for b in (degraded_block, nudge_block) if b])
+            )
         return
 
     # Compose final context. Directives block goes ABOVE memories so the
@@ -2143,6 +2202,12 @@ def main():
     # transcript fallback (#3369) goes LAST — it is the lowest-confidence
     # signal (raw transcript, not synthesized fact) and only present when
     # memories_block is empty by construction.
+    #
+    # #3619's degraded notice is deliberately NOT part of context_message: like
+    # the #2848 nudge it is per-turn state, and this string is what gets cached
+    # and written to LAST_RECALL_STATE. Caching it would replay "recall was
+    # DEGRADED" on later healthy cache hits; it is prepended at emit time
+    # instead, so a cache hit re-derives the turn's real condition.
     parts = []
     if directives_block:
         parts.append(directives_block)
@@ -2177,11 +2242,15 @@ def main():
 
     # Output JSON for Claude Code hook system. #2848: append the
     # directive-capture nudge (if it fired) at emit time — it's kept out of
-    # the cached / last-recall context above so it can't go stale.
+    # the cached / last-recall context above so it can't go stale. #3619: the
+    # degraded-recall notice is prepended for the same reason, and goes FIRST
+    # because it changes how everything after it should be read.
     output = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": _combine_context(context_message, nudge_block),
+            "additionalContext": _combine_context(
+                _combine_context(degraded_block, context_message), nudge_block
+            ),
         }
     }
     json.dump(output, sys.stdout)

@@ -329,10 +329,18 @@ class TotalFailureStillLogs(_LogTestBase):
             bank_behaviour={"test-bank": socket.timeout("timed out")},
         )
         ctx, raw = _run_main_with(client, prompt=BARE)
-        # No block injected (no directives, no memories).
-        self.assertIsNone(ctx)
-        self.assertEqual(raw.strip(), "")
-        # …but the telemetry row exists and records the deadline hit.
+        # No memories and no directives were injected — there were none to
+        # inject. Switchroom #3619: the turn is no longer SILENT, though. The
+        # own bank timed out, so the agent gets the one-line degraded
+        # disclosure and nothing else — previously "empty because the bank
+        # timed out" and "empty because the bank held nothing" were
+        # indistinguishable to the agent, which is what let a ~90% own-bank
+        # timeout rate hide for weeks.
+        self.assertIsNotNone(ctx)
+        self.assertIn("DEGRADED", ctx)
+        self.assertNotIn("<hindsight_memories>", ctx)
+        self.assertNotIn("<hindsight_directives>", ctx)
+        # …and the telemetry row still exists and records the deadline hit.
         entries = self._read_log()
         self.assertEqual(len(entries), 1)
         e = entries[0]
