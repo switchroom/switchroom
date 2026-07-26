@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.20 — release binaries attached and the pipeline gated end-to-end, derived LiteLLM timeout budgets, context7 by default
+
 ### LiteLLM paired timeout budgets are now DERIVED, and drift is detected
 
 A hindsight LLM call crosses three stacked deadlines, and LiteLLM's router
@@ -486,6 +488,29 @@ deployment. Not unused: **unreachable**, for weeks, with no error anywhere.
   binary on `main` unnoticed (`src/util/audit-hashchain.ts`,
   `telegram-plugin/tests/boot-version-string.test.ts`); all are now escaped,
   byte-identical in behaviour and readable again.
+
+### Also in this release
+
+Merged since v0.19.19 and not covered by a section above:
+
+- **Telegram — activity and status cards.** The edit-flood fuse is now
+  bypass-proof at the grammY transformer seam (#3631) and activity-card edits
+  are keyed through the send gate (#3628), so a card storm cannot route around
+  either. Worker steps indent under their header on the combined card (#3662),
+  using U+2800 rather than U+00A0, which Telegram renders flat (#3684). Live
+  sub-agent rows are no longer terminalized by the async-launch ACK (#3677).
+  Pinned status cards stay readable when Telegram collapses them (#3679), and
+  status pins get unpinned again — the boot sweep is gated on bot-ready and
+  unconfirmed unpins are retained for retry (#3675).
+- **Hindsight.** Foreground recall is isolated from background consolidation
+  (#3660), so a consolidation pass can no longer stall an interactive recall.
+  Degraded auto-recall is now visible to both the agent and `doctor` (#3626)
+  instead of failing quietly.
+- **Setup & vault.** The setup wizard's verification step actually verifies
+  (#3661). The vault passphrase card is louder, card-edit failures are no
+  longer silent, and entry gets a 3-attempt retry (#3627, #3632).
+- **CI.** Required checks now run on `merge_group`, so the merge queue can
+  drain (#3683).
 
 ## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
 
