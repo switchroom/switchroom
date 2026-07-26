@@ -116,6 +116,16 @@ Bot API 10.1 rich messages.
   only. Chunk-safe — `splitMarkdownChunks` never bisects a row.
 - **Blockquote** — `> quoted`. Quoted text or indented continuation; the right way to
   indent because Telegram drops leading whitespace.
+  - "Leading whitespace" means **Unicode** whitespace, not just ASCII. A leading
+    U+00A0 run is trimmed too — #3662 shipped a three-U+00A0 card indent, the bytes
+    reached the Bot API intact, and the card still rendered dead flat on a phone.
+  - Where a blockquote is unusable (e.g. card lines joined by `stackCardLines`, which
+    requires that no line be a GFM block-structure line), use **U+2800 BRAILLE PATTERN
+    BLANK**: general category So, not Zs, so no whitespace-trimming rule can eat it,
+    yet it renders as blank width. Live-verified on a phone 2026-07-26; see
+    `WORKER_STEP_INDENT` in `telegram-plugin/status-no-truncate.ts`.
+  - Do **not** reach for a leading `· ` as a pseudo-indent: Telegram promotes it to a
+    real list bullet, which is a block-structure line.
 - **Pull-quote / expandable blockquote** — `**> …`** (Bot API 10.1 expandable
   blockquote). A long quote the reader can collapse/expand.
 - **Section heading** — `#` … `######`. Only in a genuinely long, multi-section answer.

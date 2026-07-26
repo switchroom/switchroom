@@ -1247,15 +1247,21 @@ describe('worker numbering — stable per-card ordinals end to end (#3298)', () 
 // began was invisible at a glance (operator report, 2026-07). Steps now nest
 // one level under their worker.
 //
-// The indent MUST be a U+00A0 run, not ASCII spaces: card bodies go to Telegram
-// as raw GFM markdown (`richMessage` → `sendRichMessage` /
-// `editMessageText({ markdown })`, #2669) and are parsed server-side by a
-// CommonMark/GFM-family parser that DROPS leading ASCII whitespace (see
-// `reference/telegram-formatting-guide.md`, and #2692/#3229 where a U+00A0-only
-// line survives as a real paragraph while an ASCII-blank one is discarded). So
-// these tests assert the indent bytes, not merely "the line is indented" —
-// an ASCII-space indent would look right in a string and render flat on a phone.
-describe('combined worker card — steps indent under their worker (U+00A0)', () => {
+// The indent MUST be a U+2800 run. Card bodies go to Telegram as raw GFM
+// markdown (`richMessage` → `sendRichMessage` / `editMessageText({ markdown })`,
+// #2669) and are parsed server-side by a CommonMark/GFM-family parser that
+// LEFT-TRIMS a leading whitespace run — ASCII *and* Unicode. #3662 shipped three
+// U+00A0 and was inert: the bytes reached the Bot API intact and the card still
+// rendered flat, because U+00A0 is category Zs. U+2800 BRAILLE PATTERN BLANK is
+// category So — zero ink, non-zero width, not whitespace to any trimming rule —
+// and was live-verified on a phone on 2026-07-26.
+//
+// So these tests assert the indent's CHARACTER PROPERTY as well as its bytes: a
+// byte-only assertion is exactly what let #3662 ship green while broken.
+describe('combined worker card — steps indent under their worker (U+2800)', () => {
+  /** The indent glyph. */
+  const BLANK = '\u2800'
+  /** The #3666 pinned-bar collapse separator — TRAILING, structurally distinct. */
   const NBSP = '\u00A0'
   const rowsFor = (n: number) =>
     Array.from({ length: n }, (_, i) => ({
@@ -1270,7 +1276,7 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
   /** Card lines as sent (the body is hard-break joined by stackCardLines). */
   const linesOf = (body: string) => body.split('\n').map((l) => l.replace(/[ \t]+$/, ''))
 
-  it('every step line starts with the U+00A0 indent; header and chrome lines do not', () => {
+  it('every step line starts with the U+2800 indent; header and chrome lines do not', () => {
     const body = renderCombinedWorkerFeed(rowsFor(3), { maxRows: 8 })!
     const lines = linesOf(body)
     const stepLines = lines.filter((l) => l.includes('✓ w') || l.includes('→ w'))
@@ -1278,16 +1284,17 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
 
     expect(stepLines.length).toBe(6) // 3 workers × 2 steps
     expect(headerLines.length).toBe(3)
-    // Load-bearing: the exact indent bytes. `WORKER_STEP_INDENT` is U+00A0 ×3;
-    // a plain-ASCII `'   '` indent fails this assertion, as does today's
-    // pre-fix flat output (which had no prefix at all).
+    // Load-bearing: the exact indent bytes. `WORKER_STEP_INDENT` is U+2800 ×3;
+    // a plain-ASCII `'   '` indent fails this assertion, so does the U+00A0 run
+    // #3662 shipped, and so does flat output with no prefix at all.
     for (const l of stepLines) {
       expect(l.startsWith(WORKER_STEP_INDENT)).toBe(true)
-      expect(l.startsWith(NBSP)).toBe(true)
+      expect(l.startsWith(BLANK)).toBe(true)
       expect(l.startsWith(' ')).toBe(false)
+      expect(l.startsWith(NBSP)).toBe(false)
     }
     // Workers stay at the left margin so the nesting reads as nesting.
-    for (const l of headerLines) expect(l.startsWith(NBSP)).toBe(false)
+    for (const l of headerLines) expect(l.startsWith(BLANK)).toBe(false)
     expect(lines[0].startsWith('🛠')).toBe(true)
   })
 
@@ -1320,12 +1327,73 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     ])
   })
 
-  it('WORKER_STEP_INDENT is exactly three U+00A0 — no ASCII space or tab', () => {
-    // Pin the WIDTH, not just the character class. A `/^[\u00A0]+$/` shape
-    // check alone stays green if the indent is trimmed to a single U+00A0,
-    // which reads as near-flat on a phone and silently undoes this fix.
-    expect(WORKER_STEP_INDENT).toBe('\u00A0'.repeat(3))
-    expect(/^[\u00A0]+$/.test(WORKER_STEP_INDENT)).toBe(true)
+  // ── The assertion that would have caught #3662 ──────────────────────────
+  //
+  // Every OTHER test in this file (and in pinned-card-collapse.test.ts) asserts
+  // the string we hand the Bot API. #3662 shipped a U+00A0 indent that passed
+  // ALL of them and still rendered dead flat on a phone, because the stripping
+  // happens SERVER-SIDE: Telegram's CommonMark-family parser left-trims an
+  // inline whitespace run at the head of a content line, and U+00A0 is Unicode
+  // whitespace (category Zs). A byte assertion cannot observe that.
+  //
+  // So assert the PROPERTY that decides the outcome instead of the bytes: the
+  // indent must not be composed of characters that ANY whitespace-trimming rule
+  // — ASCII `/\s/`, Unicode `White_Space`, or category `Zs` — can classify as
+  // whitespace. U+2800 BRAILLE PATTERN BLANK qualifies: category So (Symbol,
+  // other), zero ink, non-zero width. Live-verified on a phone 2026-07-26.
+  const isTrimmableWhitespace = (ch: string) =>
+    /\s/u.test(ch) || /\p{White_Space}/u.test(ch) || /\p{Zs}/u.test(ch)
+
+  it('WORKER_STEP_INDENT is not Unicode whitespace — a Zs indent is trimmed server-side', () => {
+    const chars = [...WORKER_STEP_INDENT]
+    // Pin the WIDTH too: a single blank char reads as near-flat on a phone and
+    // would silently undo this fix while keeping the character class green.
+    expect(chars.length).toBe(3)
+    for (const ch of chars) {
+      const cp = `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}`
+      expect(
+        isTrimmableWhitespace(ch),
+        `WORKER_STEP_INDENT contains ${cp}, which is Unicode whitespace (\\s / White_Space / Zs). ` +
+          `Telegram parses card bodies server-side and LEFT-TRIMS a leading whitespace run, so this ` +
+          `indent renders FLAT on a phone — exactly the #3662 failure this test exists to catch ` +
+          `(#3662 shipped three U+00A0; the bytes reached the Bot API intact and the card was still ` +
+          `flat). The indent must be a zero-ink glyph that is NOT whitespace-categorised: use U+2800 ` +
+          `BRAILLE PATTERN BLANK (category So), live-verified on a real phone 2026-07-26.`,
+      ).toBe(false)
+    }
+  })
+
+  it('the whitespace predicate actually rejects every plausible wrong choice', () => {
+    // A property assertion is only worth having if the property discriminates.
+    // These are the characters a future edit would reach for as "a blank-looking
+    // indent"; every one is ASCII space/tab or category Zs, and every one is
+    // left-trimmed server-side.
+    const flatOnAPhone = [
+      ' ', // ASCII SPACE
+      '\t', // TAB
+      '\u00A0', // NO-BREAK SPACE — what #3662 shipped
+      '\u2002', // EN SPACE
+      '\u2003', // EM SPACE
+      '\u2007', // FIGURE SPACE
+      '\u200A', // HAIR SPACE
+      '\u3000', // IDEOGRAPHIC SPACE
+    ]
+    for (const bad of flatOnAPhone) expect(isTrimmableWhitespace(bad)).toBe(true)
+    // …and it accepts the one we ship.
+    expect(isTrimmableWhitespace('\u2800')).toBe(false)
+  })
+
+  it('WORKER_STEP_INDENT is exactly three U+2800 BRAILLE PATTERN BLANK', () => {
+    // Byte pin, the companion to the property test above: that one says "not
+    // whitespace", this one says "the specific glyph we live-tested".
+    expect(WORKER_STEP_INDENT).toBe('\u2800'.repeat(3))
+    expect(/^[\u2800]+$/.test(WORKER_STEP_INDENT)).toBe(true)
+    // And not a GFM block-structure lead-in: a leading `·` was also tried live
+    // and Telegram promoted it to a real list bullet, which breaks the
+    // `stackCardLines` precondition that card lines are never block-structure
+    // lines (card-format.ts) — the next worker header gets absorbed as a lazy
+    // continuation.
+    expect(/^[-*+>|#·]/.test(WORKER_STEP_INDENT)).toBe(false)
   })
 
   it('the `starting…` placeholder line is indented too', () => {
@@ -1339,7 +1407,7 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     const starting = linesOf(body).find((l) => l.includes('starting…'))!
     expect(starting).toBeDefined()
     expect(starting.startsWith(WORKER_STEP_INDENT)).toBe(true)
-    expect(starting.startsWith(NBSP)).toBe(true)
+    expect(starting.startsWith(BLANK)).toBe(true)
   })
 
   it('the indent survives the real outbound guard chain byte-for-byte and stays parseable', () => {
@@ -1349,7 +1417,7 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     const wire = richMessage(body).markdown
     expect(wire).toBe(body)
     expect(wire.includes(`${WORKER_STEP_INDENT}**→ w1 step b**`)).toBe(true)
-    expect(wire.includes(`${NBSP}**→ w1 step b**`)).toBe(true)
+    expect(wire.includes(`${BLANK}**→ w1 step b**`)).toBe(true)
     // Adding the indent introduced no fence/emphasis corruption.
     //
     // Scope, deliberately understated: `validateRichMarkdown` checks fence
@@ -1363,13 +1431,14 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     // assertions above are what discriminate an ASCII indent.
     expect(validateRichMarkdown(wire)).toEqual([])
     // …and the indent stays OUTSIDE the markdown spans — it must not land
-    // inside an emphasis run (which would style the NBSPs). Note this checks
+    // inside an emphasis run (which would style the blanks). Note this checks
     // OUR OWN capture regexes in the oracle, not Telegram's real entity
     // offsets; it pins where we place the indent relative to the `**`/`~~`
     // delimiters, which is the part this repo actually controls.
     const ents = parseRichEntities(wire)
     expect(ents.some((e) => e.type === 'bold' && e.text === '→ w1 step b')).toBe(true)
     expect(ents.some((e) => e.type === 'strikethrough' && e.text === '_✓ w1 step a_')).toBe(true)
+    expect(ents.every((e) => !e.text.includes(BLANK))).toBe(true)
     expect(ents.every((e) => !e.text.includes(NBSP))).toBe(true)
   })
 
@@ -1392,6 +1461,7 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     // card (this one included) as the collapse separator. A regression that
     // leaked WORKER_STEP_INDENT onto these lines still fails here.
     for (const l of single.split('\n')) {
+      expect(l.startsWith(BLANK)).toBe(false)
       expect(l.startsWith(NBSP)).toBe(false)
       expect(l.startsWith(WORKER_STEP_INDENT)).toBe(false)
     }

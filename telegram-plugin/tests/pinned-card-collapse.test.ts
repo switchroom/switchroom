@@ -42,19 +42,23 @@ import {
  *   - inline entity markup (`**`, `~~`, `_`) is formatting, not text -> dropped
  *   - the two spaces before each `\n` are GFM hard-break SYNTAX, consumed by
  *     the parser -> dropped
- *   - LEADING ASCII whitespace on a line is dropped by Telegram's server-side
+ *   - a LEADING whitespace run on a line is dropped by Telegram's server-side
  *     CommonMark parser (reference/telegram-formatting-guide.md:118, "Telegram
- *     drops leading whitespace"). Modelling this is what makes the nested-card
- *     assertion below DISCRIMINATING instead of vacuous: `NESTED_PREFIX` is
- *     three ASCII spaces (#3668, still open), so it cannot hold a collapsed
- *     seam apart — only the separator can. `WORKER_STEP_INDENT` (#3662) is
- *     U+00A0 and correctly survives this strip.
+ *     drops leading whitespace"). Modelled as ASCII **and** Unicode-whitespace
+ *     (`\p{White_Space}`, which covers the Zs category): #3662 shipped a U+00A0
+ *     indent on the assumption that only ASCII was stripped, and a live phone
+ *     check on 2026-07-26 proved otherwise — the card rendered flat. Modelling
+ *     this is what makes the nested-card assertion below DISCRIMINATING instead
+ *     of vacuous: `NESTED_PREFIX` is three ASCII spaces (#3668, still open), so
+ *     it cannot hold a collapsed seam apart — only the separator can.
+ *     `WORKER_STEP_INDENT` is now U+2800 (category So, not whitespace at all),
+ *     which survives this strip.
  *   - the newline itself is dropped with no substitute (this is the defect)
  */
 function previewLines(body: string): string[] {
   return body
     .split(/[ \t]*\n/)
-    .map((l) => l.replace(/^[ \t]+/, '').replace(/\*\*|~~|_/g, ''))
+    .map((l) => l.replace(/^[\s\p{White_Space}]+/u, '').replace(/\*\*|~~|_/g, ''))
 }
 
 /** The whole collapsed one-line preview. */
@@ -141,9 +145,9 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
     expect(collapsed).not.toContain('tok1.')
     expect(collapsed).toContain(`tok${NB}1. Fix issue`)
     // 2. the mid-word ✓ (model tag running into the step trail). Here the
-    //    separator and WORKER_STEP_INDENT (#3662, three U+00A0 leading a step
-    //    line) stack, so the seam is separator + indent, asserted against
-    //    both constants rather than a hardcoded run of spaces.
+    //    separator and WORKER_STEP_INDENT (three U+2800 leading a step line)
+    //    stack, so the seam is separator + indent, asserted against both
+    //    constants rather than a hardcoded run of spaces.
     expect(collapsed).not.toContain('opus 5✓')
     expect(collapsed).toContain(`opus 5${NB}${WORKER_STEP_INDENT}✓`)
     // 3. the step trail running into the next step, and into the next row's
@@ -171,7 +175,7 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
     // above could all be passing for reasons unrelated to the fix.
     //
     // The seams asserted here are the ones the separator alone owns: a worker
-    // HEADER line carries no leading WORKER_STEP_INDENT (#3662), so the
+    // HEADER line carries no leading WORKER_STEP_INDENT, so the
     // glance->row-1 and step->next-row seams have nothing else holding them
     // apart. (The header->step and step->step seams are separated by the indent
     // even pre-fix, which is why they are not the control.)
@@ -220,7 +224,7 @@ describe('single-worker / agent status card survives the collapse too (#3666)', 
     // NESTED_PREFIX is three ASCII SPACES, which Telegram's parser drops (see
     // previewLines), so on this surface the collapse separator is the ONLY
     // thing holding the parent->child seam apart. Unlike the combined card,
-    // there is no U+00A0 indent to mask a regression here.
+    // there is no U+2800 indent to mask a regression here.
     const body = renderActivityFeedWithNested(
       ['Reading gateway.ts'],
       ['Searching memory', 'Running tests'],
