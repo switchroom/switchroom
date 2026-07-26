@@ -79,6 +79,27 @@ export interface PersistedStatusPin {
  *  re-fail on every boot forever. */
 export const BOOT_UNPIN_MAX_ATTEMPTS = 5
 
+/**
+ * Durable key for a pin whose RUNTIME unpin failed (#3634).
+ *
+ * The driver's drop-on-unpin contract clears the in-memory claim even when
+ * `unpinChatMessage` throws — deliberately, so pin STATE can never wedge. But
+ * the persist layer used to delete the durable row on that same signal, so an
+ * unpin that failed with FLOOD_WAIT_ACTIVE / a 5xx left the message pinned in
+ * Telegram with NOTHING on disk naming it: boot cleanup had no row to retry,
+ * and the pin was permanent.
+ *
+ * Now a failed unpin re-homes the record under this key — chat+message scoped,
+ * so it can never collide with the live `fg:`/`wk:` row (which is cleared as
+ * before, letting a fresh pin claim that key immediately). It carries no
+ * `expiresAt`, so it is work-scoped: the next boot cleanup unpins it, with the
+ * existing `attempts` retry/forfeit ladder bounding a permanently-undeliverable
+ * one. Unpins are idempotent, so a redundant retry is harmless.
+ */
+export function orphanPinKey(chatId: string, messageId: number): string {
+  return `orphan:${chatId}:${messageId}`
+}
+
 /** Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
  *  pin (pending undefined). v2 adds the optional `pending` flag. Both load
  *  fail-open — an unknown/newer version yields []. */
@@ -427,6 +448,12 @@ export function reconcileAndPersistStatusPin(args: {
   /** Execute the real pin/unpin; returns the confirmed message id (pin) or
    *  null (cleared). Must never throw — API errors are swallowed inside. */
   applyPin: () => Promise<{ messageId: number } | null>
+  /** Read AFTER `applyPin` settles, on a `clear` op only: the message id whose
+   *  unpin did NOT land (threw, or was skipped for missing pin rights), or
+   *  null when the unpin succeeded. Non-null re-homes the record under
+   *  `orphanPinKey()` so boot cleanup retries it instead of the pin leaking
+   *  with no durable trace (#3634). */
+  unpinFailedMessageId?: () => number | null
   log?: (line: string) => void
 }): Promise<{ messageId: number } | null> {
   const { path, fs, pinKey, chatId, op } = args
@@ -487,6 +514,26 @@ export function reconcileAndPersistStatusPin(args: {
     const next = await args.applyPin()
     if (next == null) {
       applyStatusPinRow(path, fs, pinKey, null, log)
+      // #3634: the claim is gone, but did the UNPIN actually land? If it did
+      // not, the message is still pinned in Telegram — re-home it under an
+      // orphan row (same store, same lock, distinct key) so the next boot
+      // cleanup retries it. Dropping BOTH the claim and the row here is what
+      // made a flood-wait'd unpin a permanent pin.
+      const orphanId = args.unpinFailedMessageId?.() ?? null
+      if (orphanId != null) {
+        const oKey = orphanPinKey(chatId, orphanId)
+        applyStatusPinRow(
+          path,
+          fs,
+          oKey,
+          { pinKey: oKey, chatId, messageId: orphanId },
+          log,
+        )
+        log(
+          `status-pin-store: unpin did not land (key=${pinKey} chat=${chatId} ` +
+            `msg=${orphanId}) — retained orphan row ${oKey} for boot retry\n`,
+        )
+      }
     } else {
       applyStatusPinRow(
         path,

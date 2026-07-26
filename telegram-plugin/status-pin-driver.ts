@@ -65,6 +65,24 @@ export interface ReconcilePinArgs {
    *  per-attempt `status-pin pin failed` spam. Only fires when `rightsCache`
    *  is supplied. */
   onPinRightsDisabled?: (chatId: string) => void
+  /** Reports whether the UNPIN actually landed (#3634). The claim is dropped
+   *  either way — that contract is load-bearing and unchanged — but the caller
+   *  needs to know the difference so a FAILED unpin (flood-wait, 5xx, rights
+   *  revoked) can be recorded as a durable orphan instead of vanishing.
+   *  Dropping the claim AND the durable row on a failed unpin is what left
+   *  finished cards pinned forever with nothing left to reconcile them.
+   *
+   *  - `ok`                 — Telegram accepted the unpin; the pin is gone.
+   *  - `failed`             — the unpin threw; the message is probably STILL
+   *                           pinned and must be retried.
+   *  - `skipped-no-rights`  — no API call was made because the chat is in the
+   *                           pin-rights negative cache; also still pinned.
+   *
+   *  Only ever called for an `unpin` action. Never for `pin` / `noop`. */
+  onUnpinOutcome?: (
+    outcome: 'ok' | 'failed' | 'skipped-no-rights',
+    messageId: number,
+  ) => void
 }
 
 /**
@@ -89,11 +107,16 @@ export async function reconcilePin(
   if (action.kind === 'unpin') {
     // Skip the unpin API call in a chat the bot can't manage pins in — the
     // call would fail with the same rights 400 and spam the log. The claim is
-    // dropped either way (below), so skipping is safe.
-    if (!args.rightsCache?.isBlocked(args.chatId)) {
+    // dropped either way (below), so skipping is safe — but the outcome is
+    // reported so the caller can still record the leaked pin (#3634).
+    if (args.rightsCache?.isBlocked(args.chatId)) {
+      args.onUnpinOutcome?.('skipped-no-rights', action.messageId)
+    } else {
       try {
         await args.api.unpinChatMessage(args.chatId, action.messageId)
+        args.onUnpinOutcome?.('ok', action.messageId)
       } catch (err) {
+        args.onUnpinOutcome?.('failed', action.messageId)
         // Symmetric with the pin path below: a permanent rights 400 on UNPIN
         // (rights revoked mid-session after we pinned) also enters the
         // negative cache and logs once via onPinRightsDisabled — otherwise

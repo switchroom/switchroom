@@ -25,6 +25,12 @@ const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'
 // narrative-lane.ts (bodies indented +2 inside the factory — multi-line
 // markers below use the lane spelling).
 const laneSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'), 'utf-8')
+// #3634: the reaper's seam binding (the Telegram edit/unpin + the honest boot
+// log) moved out of gateway.ts into its own module under the line ratchet.
+const reaperSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'activity-card-boot-reaper-wiring.ts'),
+  'utf-8',
+)
 
 function between(src: string, startMarker: string, endMarker: string): string {
   const after = src.split(startMarker)[1] ?? ''
@@ -128,7 +134,11 @@ describe('activity-card durability wiring', () => {
       'async function runBootPinCleanupAndDmSweep()',
       'dmPinSweepEligible = true',
     )
-    expect(orchestrator).toMatch(/await activityCardBootReaper\(\)/)
+    // #3634: the orchestrator delegates its sequencing to runBootPinSweep, so
+    // the reaper is handed over as a step rather than awaited inline. The
+    // invariant under test is unchanged — it is invoked from HERE and nowhere
+    // earlier — and runBootPinSweep awaits every step it is given.
+    expect(orchestrator).toMatch(/activityCardReaper: \(\) => activityCardBootReaper\(\)/)
     // (2) Both orchestrator invocation sites (mutex-won + mutex-fallback)
     // sit AFTER acquireStartupLock.
     const afterLock = between(gatewaySrc, 'await acquireStartupLock({', 'catch (err)')
@@ -142,12 +152,10 @@ describe('activity-card durability wiring', () => {
   })
 
   it('the reaper wrapper counts a benign-400 as vanished, not finalized (honest boot log)', () => {
-    const wrapper = between(
-      gatewaySrc,
-      'async function activityCardBootReaper()',
-      '\n// NOTE: statusPinBootCleanup()',
-    )
-    expect(wrapper).toMatch(/vanished/)
-    expect(wrapper).toMatch(/at-most-once/)
+    // #3634: the wrapper body (and its boot log) now lives in
+    // activity-card-boot-reaper-wiring.ts; gateway.ts only binds the seams.
+    expect(gatewaySrc).toMatch(/await runActivityCardBootReaperWiring\(\{/)
+    expect(reaperSrc).toMatch(/vanished/)
+    expect(reaperSrc).toMatch(/at-most-once/)
   })
 })

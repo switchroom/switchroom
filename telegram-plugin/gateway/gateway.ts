@@ -636,6 +636,10 @@ import { formatUpdateStatusLine } from './update-status-line.js'
 import type { HostdRequest, HostdResponse } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
+import { runBootPinSweep, createBotReadyGate } from './boot-pin-sweep.js'
+import { createOrphanPinRegistry } from './status-pin-orphans.js'
+import { createStatusPinApi, type PinCapableBot } from './status-pin-api.js'
+import { runActivityCardBootReaperWiring } from './activity-card-boot-reaper-wiring.js'
 import {
   createDmPinSweeper,
   collectDmChatIdsFromStores,
@@ -1439,7 +1443,11 @@ async function rawEditMessageChecklist(args: {
 
 const chatLock = createChatLock()
 // P0b (#2996): wrapped in initGatewayBot() once `bot` is constructed at boot.
+// The `!` is an ASSERTION, not a guarantee — module-eval-time readers get
+// `undefined`. Anything touching the Bot API from there (the boot pin sweep,
+// #3634) MUST await `gatewayBotReady.ready` first. See boot-pin-sweep.ts.
 let lockedBot!: Bot<Context>
+const gatewayBotReady = createBotReadyGate()
 let botUsername = ''
 
 // ─── Access control ───────────────────────────────────────────────────────
@@ -8661,21 +8669,18 @@ function persistBannerRow(row: PersistedStatusPin | null): void {
   )
 }
 
-// The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
-// lazily so this helper can be declared alongside the state it owns.
+// The Bot API surface the pin driver needs. `lockedBot` is assigned late (in
+// initGatewayBot) so it is read lazily; `createStatusPinApi` also asserts it is
+// there, turning the old opaque `undefined is not an object (evaluating
+// 'lockedBot.api')` boot failure into a named error (#3634).
 function statusPinApi(): PinBotApi {
-  return {
-    pinChatMessage: (chat_id, message_id, opts) =>
-      robustApiCall(
-        () => lockedBot.api.pinChatMessage(chat_id, message_id, opts),
-        { chat_id: String(chat_id), verb: 'status-pin.pin' },
-      ),
-    unpinChatMessage: (chat_id, message_id) =>
-      robustApiCall(
-        () => lockedBot.api.unpinChatMessage(chat_id, message_id),
-        { chat_id: String(chat_id), verb: 'status-pin.unpin' },
-      ),
-  }
+  return createStatusPinApi(
+    () => lockedBot as unknown as PinCapableBot | undefined,
+    robustApiCall as (
+      fn: () => Promise<unknown>,
+      opts: Record<string, unknown>,
+    ) => Promise<unknown>,
+  )
 }
 
 /**
@@ -8710,74 +8715,21 @@ async function statusPinBootCleanup(): Promise<void> {
     )
   }
 }
-/**
- * Boot-time orphan-card reaper (Known Gap 1,
- * `reference/rfcs/deterministic-turn-liveness.md`). Thin gateway wrapper over
- * the pure `runActivityCardBootReaper` — binds the live fs seam, a real
- * Telegram edit, and the gateway logger. Finalizes ANY card left open by a
- * prior (crashed/restarted) session with ONE honest edit — never a new
- * message, so no ping. Guarantee is AT-MOST-ONCE: the pure routine deletes each
- * record before attempting its edit and does not retry, so a failed edit
- * forfeits that orphan rather than risk a double-finalize on a later boot (see
- * the module doc in activity-card-store.ts for the full tradeoff). A benign-400
- * (card already gone) is reported as `vanished`, not `finalized`.
- *
- * MUST run ONLY after this gateway wins the startup mutex (the store is a
- * shared per-agent file; a losing double-boot would finalize a card the
- * still-alive holder's in-flight turn still legitimately owns) — identical
- * ordering constraint to `statusPinBootCleanup`.
- *
- * Deliberately does NOT attempt to resume climbing the old card: the resumed
- * turn (if any) opens its own fresh card. Honest finalization, not
- * resumption, is the goal (see the module doc in activity-card-store.ts).
- *
- * After the finalizing edit, also unpins the card, but ONLY for a record whose
- * persisted `pinned` flag is true — i.e. the card was actually pin-eligible on
- * open (`PIN_STATUS_WHILE_WORKING`). This unpin is DEFENSE-IN-DEPTH, not the
- * primary unpin path: `statusPinBootCleanup` already unpins orphaned status
- * pins from its own durable store on boot. The reaper's unpin is belt-and-
- * braces for the case where the two stores disagree; the record's `pinned`
- * flag must therefore reflect the ACTUAL pin outcome (see the open path), not
- * an unconditional `true`, or the reaper would attempt an unpin on a card that
- * was never pinned.
- */
+/** Boot-time orphan-card reaper. The seam binding lives in
+ *  activity-card-boot-reaper-wiring.ts (extracted from here under the gateway
+ *  line ratchet, #3634); that module's docblock carries the full contract —
+ *  at-most-once finalize, startup-mutex ordering, and the bot-ready ordering
+ *  this whole boot sweep now depends on. */
 async function activityCardBootReaper(): Promise<void> {
-  if (!activityCardPersistEnabled) return
-  const { finalized, vanished, unpinned, total } = await runActivityCardBootReaper({
+  await runActivityCardBootReaperWiring({
+    enabled: activityCardPersistEnabled,
     path: ACTIVITY_CARD_STORE_PATH,
     fs: activityCardStoreFs,
-    finalizeCard: (record) =>
-      robustApiCall(
-        () =>
-          lockedBot.api.editMessageText(
-            record.chatId,
-            record.activityMessageId,
-            richMessage(restartOrphanCardFinalizeText(record.startedAt)),
-            {},
-          ),
-        {
-          chat_id: record.chatId,
-          ...(record.threadId != null ? { threadId: record.threadId } : {}),
-          verb: 'activity-card.boot-reap-finalize',
-        },
-      ),
-    unpinCard: (record) =>
-      robustApiCall(
-        () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
-        {
-          chat_id: record.chatId,
-          ...(record.threadId != null ? { threadId: record.threadId } : {}),
-          verb: 'activity-card.boot-reap-unpin',
-        },
-      ),
+    getBot: () => lockedBot as never,
+    robustApiCall: robustApiCall as never,
+    finalizeBody: (startedAt) => richMessage(restartOrphanCardFinalizeText(startedAt)),
+    run: runActivityCardBootReaper as never,
   })
-  if (total > 0) {
-    process.stderr.write(
-      `telegram gateway: activity-card: finalized ${finalized}/${total} ` +
-        `(vanished ${vanished}/${total}), unpinned ${unpinned}/${total} ` +
-        `orphaned card(s) from a prior session (at-most-once)\n`,
-    )
-  }
 }
 
 /**
@@ -9109,6 +9061,10 @@ async function reconcileStatusPin(
     // in-memory claim map at its top, so overlapping same-key reconciles must
     // run one-at-a-time or a stale `prev` clears the disk row under a live pin.
     await withPinReconcileLock(pinKey, () => reconcileStatusPinInner(pinKey, chatId, desired))
+    // #3634: retry pins whose unpin never landed. Outside the per-key lock
+    // (orphan keys are chat+message scoped, so they never contend); absorbed
+    // by the surrounding catch. See status-pin-orphans.ts.
+    await statusPinOrphans.drain(chatId)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     process.stderr.write(
@@ -9117,6 +9073,16 @@ async function reconcileStatusPin(
     )
   }
 }
+
+// #3634: in-process retry for pins whose unpin did NOT land. The durable half
+// is the `orphanPinKey()` row boot cleanup retries. See status-pin-orphans.ts.
+const statusPinOrphans = createOrphanPinRegistry({
+  unpin: (chatId, messageId) => statusPinApi().unpinChatMessage(chatId, messageId),
+  clearRow: (key) => {
+    if (!statusPinPersistEnabled) return
+    void mutateStatusPinRow(STATUS_PIN_STORE_PATH, statusPinStoreFs, key, null)
+  },
+})
 
 async function reconcileStatusPinInner(
   pinKey: string,
@@ -9132,6 +9098,10 @@ async function reconcileStatusPinInner(
   // older duplicate-pin concern (two edits both reading prev=null).
   const prev = statusPinState.get(pinKey) ?? null
 
+  // #3634: read back by the persist layer so a pin whose unpin did NOT land is
+  // recorded instead of vanishing along with the dropped claim.
+  let unpinLeaked: number | null = null
+
   const runReconcile = () =>
     reconcilePin({
       api: statusPinApi(),
@@ -9139,6 +9109,11 @@ async function reconcileStatusPinInner(
       prevState: prev,
       desired,
       rightsCache: statusPinRightsCache,
+      onUnpinOutcome: (outcome, messageId) => {
+        if (outcome === 'ok') return
+        unpinLeaked = messageId
+        statusPinOrphans.register(chatId, messageId)
+      },
       onPinRightsDisabled: (chat) => {
         // Logged ONCE per chat per process (#3024). Every subsequent auto-pin
         // attempt in this chat is skipped silently until a restart clears the
@@ -9193,6 +9168,7 @@ async function reconcileStatusPinInner(
     chatId,
     op,
     applyPin: runReconcile,
+    unpinFailedMessageId: () => unpinLeaked,
   })
   if (next == null) {
     statusPinState.delete(pinKey)
@@ -9293,39 +9269,37 @@ const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
 
 /**
  * Boot-time pin cleanup + DM stale-pin sweep, sequenced under the startup
- * mutex. Collects the DM chat IDs with a prior-session pin record BEFORE the
- * store reapers empty the stores, runs the three existing boot reapers, marks
- * the DM sweep eligible (this gateway now owns the shared state), then
- * unpin-alls each recorded DM chat. Fire-and-forget from the caller — never
- * blocks boot, never rejects unhandled.
+ * mutex. Thin binder over `runBootPinSweep` (boot-pin-sweep.ts), which owns
+ * the ordering contract: the DM store scan is pure fs and runs immediately,
+ * but every UNPIN waits on `gatewayBotReady` — without that gate the whole
+ * sweep ran at module-eval time and every unpin died on `undefined is not an
+ * object (evaluating 'lockedBot.api')` (#3634). Fire-and-forget from the
+ * caller — never blocks boot, never rejects unhandled.
  */
 async function runBootPinCleanupAndDmSweep(): Promise<void> {
-  let dmChatIds: string[] = []
-  try {
-    dmChatIds = collectDmChatIdsFromStores({
-      statusPins:
-        statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
-          ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+  await runBootPinSweep({
+    botReady: gatewayBotReady.ready,
+    scanDmChatIds: () =>
+      collectDmChatIdsFromStores({
+        statusPins:
+          statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
+            ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+            : [],
+        activityCards: activityCardPersistEnabled
+          ? loadActivityCards(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs)
           : [],
-      activityCards: activityCardPersistEnabled
-        ? loadActivityCards(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs)
-        : [],
-      queuedCards: queuedCardPersistEnabled
-        ? loadQueuedCards(QUEUED_CARD_STORE_PATH, queuedCardStoreFs)
-        : [],
-    })
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: dm-pin-sweep: store scan failed: ${(err as Error).message}\n`,
-    )
-  }
-  await statusPinBootCleanup()
-  await activityCardBootReaper()
-  await queuedCardBootReaper()
-  // This gateway now owns the shared per-agent pin state — enable the DM
-  // unpin-all path (both the boot sweep below and lazy first-inbound sweeps).
-  dmPinSweepEligible = true
-  for (const id of dmChatIds) await dmPinSweeper.sweep(id)
+        queuedCards: queuedCardPersistEnabled
+          ? loadQueuedCards(QUEUED_CARD_STORE_PATH, queuedCardStoreFs)
+          : [],
+      }),
+    statusPinCleanup: () => statusPinBootCleanup(),
+    activityCardReaper: () => activityCardBootReaper(),
+    queuedCardReaper: () => queuedCardBootReaper(),
+    enableDmSweep: () => {
+      dmPinSweepEligible = true
+    },
+    sweepDm: (id) => dmPinSweeper.sweep(id),
+  })
 }
 
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
@@ -22999,6 +22973,10 @@ async function initGatewayBot(): Promise<void> {
   }
 
   lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+  // Release everything that parked on the Bot API being usable — in particular
+  // the boot orphan-pin sweep, which is fired from the startup-mutex block at
+  // module-eval time, thousands of lines before this assignment (#3634).
+  gatewayBotReady.markReady()
 
   // RFC B §9 (moved here by P0b): register /approvals against the approval
   // kernel. The kernel's IPC client round-trips through the vault broker; the
