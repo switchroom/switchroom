@@ -15,6 +15,11 @@ import {
   type SessionActivityHeader,
 } from "../tool-activity-summary.js";
 import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from "../status-no-truncate.js";
+import { COLLAPSE_SAFE_SEPARATOR } from "../card-format.js";
+
+/** The pinned-card collapse separator (#3666) every status-card line now
+ *  carries before its hard break. Aliased for readable goldens. */
+const NB = COLLAPSE_SAFE_SEPARATOR;
 
 describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () => {
   it("Bash uses the model-authored description verbatim, never the command", () => {
@@ -95,10 +100,10 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
       "**→ Reading gateway.ts**",
     );
     expect(appendActivityLine(lines, "mcp__hindsight__reflect", { query: "x" })).toBe(
-      "~~_✓ Reading gateway.ts_~~  \n**→ Searching memory**",
+      `~~_✓ Reading gateway.ts_~~${NB}  \n**→ Searching memory**`,
     );
     expect(appendActivityLine(lines, "Bash", { command: "ls", description: "List workspace" })).toBe(
-      "~~_✓ Reading gateway.ts_~~  \n~~_✓ Searching memory_~~  \n**→ List workspace**",
+      `~~_✓ Reading gateway.ts_~~${NB}  \n~~_✓ Searching memory_~~${NB}  \n**→ List workspace**`,
     );
   });
 
@@ -121,7 +126,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = Array.from({ length: total }, (_, i) => `Action ${i + 1}`);
     const out = renderActivityFeed(lines)!;
     const hidden = total - STATUS_ROLLING_LINES;
-    expect(out.startsWith(`_✓ +${hidden} earlier…_  \n`)).toBe(true);
+    expect(out.startsWith(`_✓ +${hidden} earlier…_${NB}  \n`)).toBe(true);
     // Only the last STATUS_ROLLING_LINES actions are shown; older ones collapsed.
     const firstVisible = total - STATUS_ROLLING_LINES + 1;
     expect(out).toContain(`~~_✓ Action ${firstVisible}_~~`);
@@ -156,7 +161,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = ["Reading a.ts", "Searching memory", "Running a command"];
     const out = renderActivityFeed(lines, true)!;
     expect(out).toBe(
-      "~~_✓ Reading a.ts_~~  \n~~_✓ Searching memory_~~  \n~~_✓ Running a command_~~",
+      `~~_✓ Reading a.ts_~~${NB}  \n~~_✓ Searching memory_~~${NB}  \n~~_✓ Running a command_~~`,
     );
     expect(out).not.toContain("→"); // no in-progress arrow anywhere
   });
@@ -195,7 +200,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   describe("liveSuffix (heartbeat)", () => {
     it("appends the suffix to the newest in-progress line only", () => {
       expect(renderActivityFeed(["Reading a.ts", "Running a command"], false, " · 18s")).toBe(
-        "~~_✓ Reading a.ts_~~  \n**→ Running a command · 18s**",
+        `~~_✓ Reading a.ts_~~${NB}  \n**→ Running a command · 18s**`,
       );
     });
     it("single live line gets the suffix", () => {
@@ -207,7 +212,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
       const out = renderActivityFeed(["Reading a.ts", "Running a command"], true, " · 18s")!;
       expect(out).not.toContain("·");
       expect(out).not.toContain("→");
-      expect(out).toBe("~~_✓ Reading a.ts_~~  \n~~_✓ Running a command_~~");
+      expect(out).toBe(`~~_✓ Reading a.ts_~~${NB}  \n~~_✓ Running a command_~~`);
     });
     it("default empty suffix is byte-identical to no suffix", () => {
       expect(renderActivityFeed(["Reading a.ts"], false, "")).toBe(
@@ -222,7 +227,7 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
     const lines: string[] = [];
     expect(appendActivityLabel(lines, "Searching memory")).toBe("**→ Searching memory**");
     expect(appendActivityLabel(lines, "List workspace")).toBe(
-      "~~_✓ Searching memory_~~  \n**→ List workspace**",
+      `~~_✓ Searching memory_~~${NB}  \n**→ List workspace**`,
     );
     // consecutive dup collapses
     appendActivityLabel(lines, "List workspace");
@@ -417,7 +422,7 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
   it("stepCount footer appears on final=true with no children (delegates to flat render)", () => {
     const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 3)!;
     expect(out).toContain("_✓ 3 steps_");
-    expect(out).toBe("~~_✓ Reading a.ts_~~  \n_✓ 3 steps_");
+    expect(out).toBe(`~~_✓ Reading a.ts_~~${NB}  \n_✓ 3 steps_`);
   });
 
   // Liveness-driven feed open (dark-turn fix): a turn that emits no tool_label
@@ -1052,7 +1057,11 @@ describe("status-card body stacks like a reply (#2669 rich-message renderer)", (
   it("multiple step bullets stack on their own lines (no soft-break collapse)", () => {
     const out = renderActivityFeed(["Reading a.ts", "Searching memory", "Running tests"], true)!;
     const lines = out.split("  \n");
-    expect(lines).toEqual(["~~_✓ Reading a.ts_~~", "~~_✓ Searching memory_~~", "~~_✓ Running tests_~~"]);
+    expect(lines).toEqual([
+      `~~_✓ Reading a.ts_~~${NB}`,
+      `~~_✓ Searching memory_~~${NB}`,
+      "~~_✓ Running tests_~~",
+    ]);
     // Not a single lone `\n` survives to collapse two bullets.
     expect(out).not.toMatch(/(?<! {2})\n/);
   });
@@ -1076,6 +1085,6 @@ describe("status-card body stacks like a reply (#2669 rich-message renderer)", (
     // prose by escapeStepLine; the inline-markup-survives case is covered by
     // the stackCardLines unit test, which operates on pre-rendered lines.)
     const out = renderActivityFeed(["Reading a.ts", "Running tests"], false)!;
-    expect(out).toBe("~~_✓ Reading a.ts_~~  \n**→ Running tests**");
+    expect(out).toBe(`~~_✓ Reading a.ts_~~${NB}  \n**→ Running tests**`);
   });
 });

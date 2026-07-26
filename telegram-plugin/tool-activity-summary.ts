@@ -450,7 +450,10 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
   // Stack lines with GFM hard breaks (`  \n`) so the card's styled prose lines
   // don't collapse onto one visual line in the rich-message renderer — see
   // stackCardLines. This is what makes a card render identically to a reply.
-  const joined = stackCardLines(out)
+  // collapseSafe (#3666): the agent status card and the single-worker card are
+  // both PINNED, and Telegram's pinned bar shows them collapsed to one line
+  // with the newlines dropped — the separator keeps that preview legible.
+  const joined = stackCardLines(out, { collapseSafe: true })
   if (joined.length <= STATUS_CARD_CHAR_BUDGET) return joined
   return fitCardToBudget(opts, headerLines)
 }
@@ -503,7 +506,8 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
     const lastIdx = shown.length - 1
     shown.forEach((esc, i) => lines.push(buildBullet(esc, i === lastIdx)))
     lines.push(...footerLines)
-    const candidate = stackCardLines(lines)
+    // collapseSafe: same pinned surface as renderStatusCard (#3666).
+    const candidate = stackCardLines(lines, { collapseSafe: true })
     if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
   }
 
@@ -529,7 +533,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   if (parentMarker != null) lines.push(parentMarker)
   lines.push(newestLine)
   lines.push(...footerLines)
-  return stackCardLines(lines)
+  return stackCardLines(lines, { collapseSafe: true })
 }
 
 /**
@@ -741,10 +745,40 @@ export function combinedHistoryDepth(w: number): number {
 export const workerHistoryDepth = combinedHistoryDepth
 
 /**
+ * The combined card's first line: a SELF-CONTAINED glance at the whole swarm
+ * (#3666) — `🛠 Workers · 3 running · oldest 38m16s · 196 tools · 1.2M tok`.
+ *
+ * Two jobs, both load-bearing:
+ *
+ *   1. In the feed it answers "what is my fleet doing" without reading the
+ *      rows — the aggregate the per-row lines never showed.
+ *   2. In Telegram's pinned bar, where the card collapses to ONE line, it is
+ *      the part most likely to survive truncation, so the preview leads with
+ *      real information instead of a four-word chrome stub that ran into
+ *      row 1's ordinal (`… 3 running1. Fix issue …`).
+ *
+ * It always ends in a UNIT WORD (`running` / `oldest <elapsed>` / `tools` /
+ * `tok`), never a bare number, so the first collapse seam reads as
+ * `… · 196 tools 1. Fix issue …` — a list starting after a unit — rather than
+ * two numbers colliding. Aggregates cover ALL rows (including any spilled to
+ * `+M more working…`), matching the `N running` count beside them.
+ */
+function glanceLine(rows: CombinedWorkerRow[]): string {
+  const oldestMs = rows.reduce((m, r) => Math.max(m, r.elapsedMs), 0)
+  const tools = rows.reduce((n, r) => n + r.toolCount, 0)
+  const tok = rows.reduce((n, r) => n + (r.totalTokens ?? 0), 0)
+  const toolWord = tools === 1 ? 'tool' : 'tools'
+  return (
+    `🛠 **Workers** · _${rows.length} running · oldest ${formatFeedElapsed(oldestMs)}` +
+    ` · ${tools} ${toolWord}${tokenSegment(tok)}_`
+  )
+}
+
+/**
  * Render N≥1 live workers into ONE combined feed body (ready Telegram
  * markdown; callers send verbatim — do NOT re-escape). Layout:
  *
- *   🛠 **Workers** · _N running_
+ *   🛠 **Workers** · _N running · oldest {elapsed} · {n} tools · {t} tok_
  *   **1. {desc1}** _· {elapsed} · {n} tools_
  *      ~~_✓ {earlier step}_~~
  *      **→ {newest step}**
@@ -770,6 +804,15 @@ export const workerHistoryDepth = combinedHistoryDepth
  * their full recent history and a 6-way fan-out degrades to one line each, the
  * card staying bounded regardless of fan-out. When a worker has no history yet
  * it falls back to a single `→ starting…`/currentStep line.
+ *
+ * PINNED-BAR READABILITY (#3666): line 1 is a self-contained glance
+ * (`glanceLine`) and the stack is joined with `collapseSafe`, because this card
+ * is pinned and Telegram's pinned bar renders it collapsed onto ONE line with
+ * the newlines dropped and NOTHING substituted. Both halves are needed: the
+ * glance so the preview leads with information, the per-line separator so every
+ * later seam (`opus 5` → `✓ …` → `→ …`) degrades to a word gap instead of a
+ * mashed glyph. There is no Bot API for a separate pin-bar preview — the client
+ * derives it from the message text — so the text is the only lever.
  *
  * Pure. Rows are rendered in the order supplied (the manager passes them
  * dispatch-order, oldest first). `maxRows` caps the visible rows; the hidden
@@ -818,7 +861,7 @@ export function renderCombinedWorkerFeed(
     // Per-worker depth follows Ken's deterministic curve max(3, 7−w) (#3349):
     // the curve drives DEPTH; the total-line budget below drives ROW COUNT.
     const depth = combinedHistoryDepth(shown.length)
-    const chrome: string[] = [`🛠 **Workers** · _${rows.length} running_`]
+    const chrome: string[] = [glanceLine(rows)]
     const bodyOut: string[] = []
     for (const r of shown) {
       bodyOut.push(rowHeader(r))
@@ -844,7 +887,11 @@ export function renderCombinedWorkerFeed(
     }
     const out = [...chrome, ...bodyOut]
     if (hidden > 0) out.push(`_+${hidden} more working…_`)
-    return { body: stackCardLines(out), bodyLines: bodyOut.length }
+    // collapseSafe (#3666): this card is PINNED, and Telegram's pinned bar
+    // renders it collapsed to one line with the newlines dropped and nothing
+    // substituted. Without the separator the glance line runs straight into
+    // row 1's ordinal and every step glyph mashes into the previous line.
+    return { body: stackCardLines(out, { collapseSafe: true }), bodyLines: bodyOut.length }
   }
 
   // Cap to maxRows first, then shrink the visible set while EITHER the total
