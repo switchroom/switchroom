@@ -79,6 +79,70 @@ into the query argument; `mcp_servers.context7: false` turns the server off per
 agent. Documented for operators in `docs/configuration.md` under *Built-in MCP
 Servers*.
 
+### Release binaries actually get built and attached (#3633, #3634)
+
+`install.sh` — the `curl | sh` path two docs call the recommended install —
+downloads `switchroom-{linux,macos}-{amd64,arm64}` and
+`switchroom-checksums.txt` from the GitHub release page. Nothing produced
+them. There was no release workflow, only an unadopted draft at
+`docs/proposed/release.yml`, and the last four releases (v0.19.19, .17, .15,
+.13) each shipped **zero** assets. The installer was dead on every platform
+for two months.
+
+`.github/workflows/release.yml` now builds all four binaries on `v*` tags and
+attaches them plus a `sha256sum`-format checksums file to the release. Three
+things the draft got wrong are fixed:
+
+- **Native runners per target** (`ubuntu-latest`, `ubuntu-24.04-arm`,
+  `macos-15-intel`, `macos-15`) instead of cross-compiling all four on Linux —
+  the same no-QEMU pattern as `docker-images.yml`. This is what lets every leg
+  smoke-run the binary it just produced and assert `--version` equals the tag,
+  so a broken compile can no longer ship silently, and it lets the macOS legs
+  verify their Mach-O code signature on a real Mac (#3634). That "native"
+  property is itself enforced now, not just written down:
+  `check-release-asset-names.mjs` fails lint if a macOS asset is moved to a
+  Linux runner (or vice versa), if a matrix target declares no runner, or if
+  the `codesign --verify` step is dropped.
+- **What is NOT done: Apple notarization** (#3634 stays open for it). It needs
+  Developer ID / App Store Connect credentials this repo does not have. The
+  macOS binaries are **ad-hoc signed** by `bun build --compile` and verified on
+  a real Mac, which is what makes them executable on Apple Silicon at all, and
+  which is sufficient for the `curl | sh` path — `curl` does not set the
+  `com.apple.quarantine` xattr, so Gatekeeper's notarization check does not
+  gate it. It is **not** sufficient for a binary downloaded from the Releases
+  page **in a browser**: that does get quarantined, and macOS 15 removed the
+  right-click→Open bypass. `docs/operators/install.md` now says so, and points
+  those users at the installer.
+- **The asset-name contract is enforced, not documented.**
+  `scripts/check-release-asset-names.mjs` (in `npm run lint`) parses both
+  `install.sh` and `release.yml` and fails when the names, the checksums
+  filename, or the workflow's own asset list drift apart.
+  `scripts/verify-release-bundle.mjs` then re-checks the real built files at
+  release time, including that each checksum line is findable by the
+  installer's literal `grep -F "  <asset>"` — the two-space `sha256sum`
+  separator is load-bearing.
+- **`install.sh` is exercised by tests for the first time.**
+  `tests/release-asset-contract.test.ts` drives the real installer against a
+  workflow-shaped bundle (download → checksum-verify → install) and asserts
+  the tamper guard still bites. It also pins the output shape of
+  `switchroom --version`: the workflow's smoke step is a string equality
+  against the bare tag version, so a banner or a `v` prefix there would fail
+  every build leg.
+
+The workflow uploads to a release that must already exist (`gh release
+create`, per the `switchroom-release` skill) rather than inventing one with
+auto-generated notes, and `gh workflow run release.yml` gives a dry-run path
+that builds and verifies the full bundle without touching any release.
+
+Known and unchanged by this: a `v*` tag fires `docker-images`, `npm-publish`
+and now `release` as three independent workflows with nothing cross-gating
+them, so one can go red while the others ship (#3654 — the hazard predates
+this change, which already applied to `docker-images` + `npm-publish`; this
+adds a third leg to it). The `switchroom-release` skill's Gate C is the
+process-side mitigation until #3654 lands a mechanism: a release is not done
+until `gh release view vX.Y.Z --json assets` lists all four binaries plus the
+checksums file.
+
 ## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
 
 ### Hindsight — bound retain content so oversized memories can persist at all (#3610)

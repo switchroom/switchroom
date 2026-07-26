@@ -30,6 +30,16 @@ below still requires the `claude` CLI on the host (Node 20.11+, per
 Prerequisites) — that requirement is not optional even on the binary
 install.
 
+**On macOS, use this one-liner — do not download the binary from the
+Releases page in a browser.** The published `switchroom-macos-*` binaries
+are ad-hoc signed (which is what makes them runnable on Apple Silicon) but
+**not Apple-notarized** — the repo has no Developer ID credentials, tracked
+in #3634. `curl` does not set the `com.apple.quarantine` xattr, so the
+one-liner is unaffected by Gatekeeper. A browser download *is* quarantined,
+and macOS 15 (Sequoia) removed the right-click → Open bypass, so it will be
+refused until you allow it under System Settings → Privacy & Security. macOS
+remains a development target, not a release-validated one (see the README).
+
 Then bring up your fleet:
 
 ```sh
@@ -172,4 +182,7 @@ web UI (Settings → Developer settings → Personal access tokens →
 ## Related
 
 - `runtime-mode.md` — Docker is the only supported runtime in v0.7+.
-- `docs/proposed/docker-images.yml` — the GHCR build/push workflow.
+- `.github/workflows/docker-images.yml` — the GHCR build/push workflow.
+- `.github/workflows/release.yml` — builds the static `switchroom` binaries
+  that `install.sh` downloads, and attaches them (plus
+  `switchroom-checksums.txt`) to each `vX.Y.Z` GitHub Release.
