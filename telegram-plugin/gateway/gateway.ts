@@ -9078,6 +9078,16 @@ async function reconcileStatusPin(
 // is the `orphanPinKey()` row boot cleanup retries. See status-pin-orphans.ts.
 const statusPinOrphans = createOrphanPinRegistry({
   unpin: (chatId, messageId) => statusPinApi().unpinChatMessage(chatId, messageId),
+  // A leaked id can be CLAIMED AGAIN (the group worker card is ONE long-lived
+  // message pinned/unpinned across turns), so retrying blind would tear down a
+  // card the user is watching. Any key currently claiming this exact
+  // chat+message means the orphan is superseded.
+  isLive: (chatId, messageId) => {
+    for (const [key, st] of statusPinState) {
+      if (st.messageId === messageId && statusPinChatIds.get(key) === chatId) return true
+    }
+    return false
+  },
   clearRow: (key) => {
     if (!statusPinPersistEnabled) return
     void mutateStatusPinRow(STATUS_PIN_STORE_PATH, statusPinStoreFs, key, null)

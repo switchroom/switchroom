@@ -14,12 +14,28 @@
  *
  * Bounded: `maxAttempts` retries per orphan, then it is forfeited in-process
  * (the durable row is still there, so boot cleanup gets its own ladder). Keyed
- * by chat+message, so registering the same leaked pin twice is idempotent.
+ * by chat+message, so registering the same leaked pin twice is idempotent. The
+ * map is also capped (`MAX_TRACKED_ORPHANS`) so a pathological run of failed
+ * unpins cannot grow it without bound — an evicted orphan still has its durable
+ * row, so eviction defers cleanup to boot rather than losing it.
+ *
+ * NEVER UNPINS A LIVE PIN. A leaked message id can be CLAIMED AGAIN before the
+ * retry fires — the group worker card (`wk:group:<feedKey>`) is one long-lived
+ * message that is pinned, unpinned and re-pinned across turns, so a turn-end
+ * unpin that flood-failed can be followed by a re-pin of that very id. Draining
+ * blind would then unpin a card the user is actively watching. `isLive` is
+ * therefore consulted immediately before every retry, and a superseded orphan
+ * is DISCARDED (row and all): the live claim now owns that message and its own
+ * row governs it.
  */
 
 import { orphanPinKey } from './status-pin-store.js'
 
 export const ORPHAN_PIN_MAX_ATTEMPTS = 5
+
+/** Cap on tracked orphans. Well above any plausible real leak count; exists so
+ *  a pathological failure run cannot grow the map without bound. */
+export const MAX_TRACKED_ORPHANS = 100
 
 export interface OrphanPinRegistryDeps {
   /** Best-effort unpin. May throw; a throw counts as one failed attempt. */
@@ -27,6 +43,11 @@ export interface OrphanPinRegistryDeps {
   /** Drop the durable orphan row once the unpin finally lands (or is
    *  forfeited). Receives the `orphanPinKey()` value. */
   clearRow: (pinKey: string) => void
+  /** True when this chat+message is CURRENTLY claimed as a live status pin.
+   *  Consulted immediately before each retry — see the module docblock. When
+   *  omitted, every orphan is treated as stale (test convenience only; the
+   *  gateway always passes it). */
+  isLive?: (chatId: string, messageId: number) => boolean
   maxAttempts?: number
   log?: (line: string) => void
 }
@@ -58,6 +79,18 @@ export function createOrphanPinRegistry(
     register(chatId, messageId) {
       const key = orphanPinKey(chatId, messageId)
       if (orphans.has(key)) return
+      if (orphans.size >= MAX_TRACKED_ORPHANS) {
+        // Evict the oldest (Map preserves insertion order). Its durable row is
+        // untouched, so boot cleanup still finishes it.
+        const oldest = orphans.keys().next().value
+        if (oldest != null) {
+          orphans.delete(oldest)
+          log(
+            `telegram gateway: orphan pin registry full (${MAX_TRACKED_ORPHANS}) — ` +
+              `evicted ${oldest} from in-process retry; its durable row remains\n`,
+          )
+        }
+      }
       orphans.set(key, { chatId, messageId, attempts: 0 })
     },
 
@@ -67,6 +100,17 @@ export function createOrphanPinRegistry(
       try {
         for (const [key, o] of [...orphans]) {
           if (o.chatId !== chatId) continue
+          if (deps.isLive?.(o.chatId, o.messageId) === true) {
+            // Superseded: this message is pinned again and a live claim owns
+            // it. Unpinning here would tear down a card the user is watching.
+            orphans.delete(key)
+            deps.clearRow(key)
+            log(
+              `telegram gateway: orphan pin superseded — message is pinned again ` +
+                `(chat=${o.chatId} msg=${o.messageId}); dropped ${key}\n`,
+            )
+            continue
+          }
           try {
             await deps.unpin(o.chatId, o.messageId)
             orphans.delete(key)

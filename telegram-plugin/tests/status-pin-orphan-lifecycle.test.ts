@@ -37,6 +37,7 @@ import {
 import {
   createOrphanPinRegistry,
   ORPHAN_PIN_MAX_ATTEMPTS,
+  MAX_TRACKED_ORPHANS,
 } from "../gateway/status-pin-orphans.js";
 import {
   createStatusPinApi,
@@ -585,5 +586,60 @@ describe("#3634: a shed send never looks like a painted pin", () => {
     // is the ambiguity SEND_GATE_SHED exists to remove.
     const api = createStatusPinApi(bot, async () => undefined);
     await expect(api.unpinChatMessage("-100123", 715)).resolves.toBeUndefined();
+  });
+});
+
+describe("#3634: the retry never tears down a live pin", () => {
+  it("discards an orphan whose message has been pinned again", async () => {
+    // The group worker card is ONE long-lived message pinned/unpinned across
+    // turns: a flood-failed turn-end unpin can be followed by a re-pin of that
+    // same id. Retrying blind would unpin the card the user is watching.
+    const chat = fakeChat();
+    const cleared: string[] = [];
+    const live = new Set<number>();
+    const reg = createOrphanPinRegistry({
+      unpin: chat.unpin,
+      clearRow: (k) => cleared.push(k),
+      isLive: (_c, id) => live.has(id),
+      log: () => {},
+    });
+    reg.register("-100123", 715);
+
+    // A new turn re-pins 715 and the gateway now holds a live claim on it.
+    chat.pin(715);
+    live.add(715);
+    await reg.drain("-100123");
+
+    // OUTCOME: the card is STILL PINNED, and the stale orphan is gone.
+    expect(chat.pinned.has(715)).toBe(true);
+    expect(chat.unpinCalls).toEqual([]);
+    expect(reg.size()).toBe(0);
+    expect(cleared).toEqual([orphanPinKey("-100123", 715)]);
+  });
+
+  it("still unpins an orphan that is not live", async () => {
+    const chat = fakeChat();
+    chat.pin(715);
+    const reg = createOrphanPinRegistry({
+      unpin: chat.unpin,
+      clearRow: () => {},
+      isLive: () => false,
+      log: () => {},
+    });
+    reg.register("-100123", 715);
+    await reg.drain("-100123");
+    expect(chat.pinned.size).toBe(0);
+  });
+
+  it("caps the tracked set so a failure run cannot grow it without bound", () => {
+    const reg = createOrphanPinRegistry({
+      unpin: async () => {
+        throw new Error("nope");
+      },
+      clearRow: () => {},
+      log: () => {},
+    });
+    for (let i = 0; i < MAX_TRACKED_ORPHANS + 25; i++) reg.register("-100123", i);
+    expect(reg.size()).toBe(MAX_TRACKED_ORPHANS);
   });
 });

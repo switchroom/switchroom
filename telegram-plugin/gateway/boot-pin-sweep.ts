@@ -103,14 +103,20 @@ export async function runBootPinSweep(deps: BootPinSweepDeps): Promise<void> {
 
 /**
  * A one-shot readiness latch. `ready` resolves the first time `markReady()` is
- * called and stays resolved; `isReady()` reports the current state (used by
- * the defensive guard in `statusPinApi()` so a future caller that skips the
- * gate fails with a NAMED error instead of a bare TypeError).
+ * called and stays resolved; later calls are no-ops, so a re-entrant or
+ * repeated `initGatewayBot()` cannot re-arm the gate.
+ *
+ * There is deliberately NO `isReady()` synchronous peek. The gate exists to be
+ * AWAITED; a boolean invites `if (ready) …` call sites that skip the wait and
+ * reintroduce the exact race this module fixes. The backstop for a caller that
+ * skips the gate anyway is the null check in `status-pin-api.ts`
+ * (`STATUS_PIN_BOT_NOT_READY`), which reads the real signal — whether
+ * `lockedBot` is actually assigned — rather than a mirrored flag that could
+ * drift from it.
  */
 export interface BotReadyGate {
   ready: Promise<void>
   markReady: () => void
-  isReady: () => boolean
 }
 
 export function createBotReadyGate(): BotReadyGate {
@@ -126,6 +132,5 @@ export function createBotReadyGate(): BotReadyGate {
       resolved = true
       resolve()
     },
-    isReady: () => resolved,
   }
 }
