@@ -203,6 +203,103 @@ process-side mitigation until #3654 lands a mechanism: a release is not done
 until `gh release view vX.Y.Z --json assets` lists all four binaries plus the
 checksums file.
 
+### The LiteLLM virtual-key model allowlist now has a declarative home, and unreachable lanes FAIL doctor
+
+A LiteLLM virtual key carries a `models` allowlist, enforced at REQUEST auth
+(`can_key_call_model`, `litellm/proxy/auth/auth_checks.py:2959`, reached from
+`user_api_key_auth.py:2690`). It is stored in the proxy's Postgres
+`LiteLLM_VerificationToken` row — **not** in `litellm-config.yaml`, not in
+`switchroom.yaml`, not in the vault. So it had no declarative home at all: a DB
+rebuild silently reverted it, and `switchroom apply` never noticed because the
+hindsight branch short-circuited on "a key exists in the vault".
+
+The failure is silent in the only way that matters. On 2026-07-26
+`gpt-oss-20b-retain` and `gpt-oss-20b-consolidation` were declared in
+`switchroom.yaml`, deployed, and healthy — and had recorded ZERO calls since
+creation, because every request was rejected at auth before reaching a
+deployment. Not unused: **unreachable**, for weeks, with no error anywhere.
+
+- **`switchroom.yaml` IS the declaration.** `hindsight.llm.model` and the per-op
+  `retain` / `reflect` / `consolidation` `.model` overrides already say exactly
+  which groups hindsight calls. `src/litellm/key-allowlist.ts` derives the
+  required allowlist from them and `apply` reconciles the key to match — the
+  same shape as the existing TEAM-binding reconciliation, idempotent, restored
+  automatically, no new file to keep in sync.
+- **Reconciliation is a UNION, never a truncation.** A key may legitimately
+  carry groups switchroom does not manage; writing only the derived set would
+  turn a routine `apply` into an outage for whatever else shares the key. An
+  EMPTY allowlist is LiteLLM's "unrestricted" and is left alone rather than
+  being downgraded into a restriction.
+- **Only litellm-routed ops count.** An op pinned to `provider: claude-code`
+  reaches Anthropic through the OAuth passthrough and never presents the
+  virtual key, so demanding a grant for it would be a false positive.
+- **Router FALLBACK targets are NOT required** — verified against the running
+  proxy rather than assumed. `can_key_call_model` runs only on the model the
+  client asked for; the router's fallback dispatch does not re-enter it. The
+  allowlist stays exactly as narrow as the config.
+- **A new doctor check makes it loud.** `LiteLLM key allowlist` FAILs when a
+  config-declared group is not reachable by the hindsight key, naming both the
+  group and the config key that declared it. Availability-safe like #3407: an
+  unreachable proxy, an unresolvable secret, or an unrecognised key WARN.
+  #3407 proves a model EXISTS; this proves the key can CALL it — existence
+  lives in the yaml, reachability lives in a Postgres row, and until now
+  nothing compared the two.
+- **It is the LANE's key that gets fixed and checked, not the service key.**
+  Two different virtual keys wear the name "hindsight": the vault's
+  `litellm/hindsight/api-key` becomes the claude-code passthrough bearer, while
+  the litellm-routed lanes present `hindsight.llm.<op>.api_key`. On the live
+  fleet those are DIFFERENT key values, so reconciling the vault one would have
+  granted a key nobody presents and then reported OK — a false pass on exactly
+  the silent failure this change exists to remove. Requirements are now grouped
+  per presenting key (`requiredKeyDemands`), and `apply` and doctor each act on
+  every distinct key, naming the config path that declared it. A lane whose
+  `api_key` cannot be resolved WARNs instead of being silently skipped.
+- **An unperformed check never reports as a clean skip.** `apply` used to print
+  the same calm `~ … (skipped)` line whether the allowlist was verified, or the
+  admin key could not be resolved, or `/key/info` failed outright — and a check
+  that was never run looking exactly like one that passed is how the original
+  defect stayed invisible for weeks. Those now WARN and say what was not
+  checked; only "the proxy does not recognise this key" stays quiet, because the
+  key-provisioning step reports it with the right remedy.
+- **A lane that declares NO `api_key` is a third case, and is never reconciled
+  or failed against some other key.** "No `api_key`" does not mean "the
+  provisioned service key" — there is no fallback to fall back to. switchroom
+  emits `HINDSIGHT_API_<OP>_LLM_API_KEY` only for an op that declares one and
+  never a global `HINDSIGHT_API_LLM_API_KEY` (`src/cli/setup.ts` records that
+  name as "no longer used"); hindsight reads the global as a bare
+  `os.getenv(ENV_LLM_API_KEY)` with no default; `litellm` sits in the engine's
+  `_PROVIDERS_WITHOUT_API_KEY`, so nothing raises; and its provider then omits
+  the key from the request entirely (`if self.api_key:`). The provisioned vault
+  key is not it either — that value is injected solely as the
+  `ANTHROPIC_CUSTOM_HEADERS` bearer for the claude-code passthrough, a lane
+  `can_key_call_model` never sees. So such a lane presents a credential
+  switchroom cannot name: `apply` widens nothing on its behalf (a green
+  "+ granted" line for a key the lane never sends is motion, not a fix) and
+  doctor WARNs — naming the lanes, the groups left unverified, and the
+  `hindsight.llm.<op>.api_key` that would make them checkable — rather than
+  passing or failing a key by proxy. Sibling lanes that DO declare a key are
+  still reconciled and still FAIL on their own merits.
+- **The allowlist predicate matches the proxy's, including the two shapes that
+  are not literal names.** `all-team-models` DELEGATES to the parent team's
+  list rather than granting anything itself — and it REPLACES the rest of the
+  row rather than merging with it, so even `["*", "all-team-models"]` is not
+  unrestricted. It is therefore `indeterminate` (WARN) and never written to:
+  appending to it would be silently discarded by the proxy. An entry
+  containing `*` is a PATTERN, not a literal, so `gpt-oss-*`
+  correctly covers `gpt-oss-20b-retain`. Treating either as a plain string
+  produced false FAILs and pointless writes.
+- **A raw NUL byte can make a source file unreviewable, so a test now forbids
+  it.** `src/litellm/key-allowlist.ts` reached review as `Bin 0 -> 11340 bytes`
+  / `+0/-0` — 253 lines of new logic that GitHub could not display and that
+  `git blame` and 3-way text merge would never see again — because a template
+  literal held a real `\0` instead of the escape. A reviewer cannot catch this
+  by reading the diff, since the diff is what goes missing, so
+  `tests/source-files-are-text.test.ts` scans every tracked text-extension file
+  mechanically. It immediately found three more, two of which had ALREADY been
+  binary on `main` unnoticed (`src/util/audit-hashchain.ts`,
+  `telegram-plugin/tests/boot-version-string.test.ts`); all are now escaped,
+  byte-identical in behaviour and readable again.
+
 ## v0.19.19 — hindsight retain durability, approval-kernel fail-open fixes, bounded rollout & logs
 
 ### Hindsight — bound retain content so oversized memories can persist at all (#3610)

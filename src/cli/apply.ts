@@ -331,7 +331,11 @@ export async function provisionLiteLLMKeys(
   let brokerKeyMaterialized = false;
 
   // Lazy imports — only paid for when at least one agent opts in or hindsight is wired.
-  const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey, validateKey, bindKeyToTeam }, { addAgentSecret }] =
+  const [
+    { getViaBrokerStructured, putViaBroker },
+    { ensureTeam, ensureKey, validateKey, bindKeyToTeam, updateKeyModels },
+    { addAgentSecret },
+  ] =
     await Promise.all([
       import("../vault/broker/client.js"),
       import("../litellm/provision.js"),
@@ -833,7 +837,39 @@ export async function provisionLiteLLMKeys(
       try {
         const existing = await getViaBrokerStructured(hindsightVaultKey);
         if (existing.kind === "ok") {
-          writeOut(chalk.gray(`  ~ litellm/hindsight: key already provisioned (skipped)\n`));
+          // The key EXISTS — but existing used to mean "done", and that is
+          // exactly how the model allowlist went unmanaged. The allowlist is
+          // enforced at request auth and lives only in the proxy's Postgres
+          // row, so a DB rebuild reverts it and nothing notices: the affected
+          // lane simply stops producing traffic. Reconcile it from the config
+          // that declares which lanes hindsight calls, the same way the
+          // per-agent branch above reconciles TEAM binding. See
+          // src/litellm/key-allowlist.ts.
+          const masterKey = await resolveConfigSecret(adminKeyRef, getViaBrokerStructured);
+          if (masterKey) {
+            await reconcileHindsightKeyAllowlist({
+              baseUrl,
+              masterKey,
+              config,
+              validateKey,
+              updateKeyModels,
+              resolveSecret: (ref) => resolveConfigSecret(ref, getViaBrokerStructured),
+              writeOut,
+              writeErr: ctx.writeErr,
+            });
+          } else {
+            // Deliberately NOT the "(skipped)" line: the admin key could not be
+            // resolved, so the allowlist was never looked at. Reporting an
+            // unperformed check as a clean skip is how the original defect
+            // stayed invisible.
+            ctx.writeErr(
+              chalk.yellow(
+                `  ! litellm/hindsight: key already provisioned, but the litellm ` +
+                  `admin_key (\`${adminKeyRef}\`) could not be resolved — model ` +
+                  `allowlist left unverified.\n`,
+              ),
+            );
+          }
         } else {
           // Resolve admin key (may be a vault ref).
           let masterKey = adminKeyRef;
@@ -889,6 +925,205 @@ export async function provisionLiteLLMKeys(
           chalk.yellow(`  ! litellm/hindsight: key provisioning failed — ${(err as Error).message}\n`),
         );
       }
+    }
+  }
+}
+
+/**
+ * Resolve a config secret value — `litellm.admin_key`, or a per-op
+ * `hindsight.llm.<op>.api_key` — to the actual secret. A literal is returned
+ * as-is; a `vault:<key>` reference is read through the broker. Returns null
+ * when it cannot be resolved, so callers degrade to a warning rather than
+ * failing an already-provisioned agent (#2781 parity).
+ */
+export async function resolveConfigSecret(
+  ref: string,
+  getViaBrokerStructured: typeof import("../vault/broker/client.js").getViaBrokerStructured,
+): Promise<string | null> {
+  if (!isVaultReference(ref)) return ref;
+  const resolved = await getViaBrokerStructured(parseVaultReference(ref));
+  if (resolved.kind !== "ok") return null;
+  if (resolved.entry.kind !== "string") return null;
+  return resolved.entry.value;
+}
+
+/**
+ * Reconcile the hindsight service key's MODEL ALLOWLIST against the config that
+ * declares which model groups hindsight calls.
+ *
+ * Why this exists: the allowlist is enforced at request auth
+ * (`can_key_call_model`) and stored ONLY in the proxy's Postgres token row, so
+ * it has no declarative home on the proxy side and a DB rebuild silently
+ * reverts it. On 2026-07-26 the `gpt-oss-20b-retain` and
+ * `gpt-oss-20b-consolidation` lanes were declared in `switchroom.yaml`, served
+ * by the proxy, and absent from the key — every call was rejected at auth and
+ * the lanes had ZERO traffic since creation. Not unused: unreachable.
+ *
+ * Availability-safe throughout. Anything ambiguous (proxy unreachable, key
+ * unrecognised, model list unavailable) degrades to a warning and keeps the key
+ * exactly as it is; nothing here can delete, regenerate, or truncate.
+ *
+ * Reconciles ONE KEY PER DISTINCT `api_key` the config names. A
+ * `provider: litellm` op presents `hindsight.llm.<op>.api_key`
+ * (`HINDSIGHT_API_<OP>_LLM_API_KEY`), while the provisioned key at
+ * `litellm/hindsight/api-key` authenticates the claude-code passthrough — two
+ * different keys in general, and reconciling only the provisioned one would
+ * grant access to a key the failing lane never presents.
+ *
+ * An op that declares NO `api_key` is a third case, and deliberately NOT
+ * reconciled: switchroom emits no global `HINDSIGHT_API_LLM_API_KEY` (see
+ * src/cli/setup.ts, where the name is retained only as a legacy no-op), and
+ * hindsight reads it as a bare `os.getenv` with no default, so such a lane
+ * presents no credential this function can name. Widening the provisioned
+ * service key's allowlist on its behalf would grant a key that lane never sends
+ * — motion that looks like a fix and changes nothing. It warns instead.
+ */
+export async function reconcileHindsightKeyAllowlist(args: {
+  baseUrl: string;
+  masterKey: string;
+  config: SwitchroomConfig;
+  validateKey: typeof import("../litellm/provision.js").validateKey;
+  updateKeyModels: typeof import("../litellm/provision.js").updateKeyModels;
+  /** Resolve a literal-or-`vault:` config secret reference. */
+  resolveSecret: (ref: string) => Promise<string | null>;
+  writeOut: (s: string) => void;
+  writeErr: (s: string) => void;
+  fetchFn?: import("../litellm/provision.js").FetchFn;
+}): Promise<void> {
+  const { baseUrl, masterKey, config, writeOut, writeErr } = args;
+  const { fetchProxyModels } = await import("../litellm/model-validation.js");
+  const { requiredKeyModels, requiredKeyDemands, reconciledAllowlist, classifyAllowlist } =
+    await import("../litellm/key-allowlist.js");
+
+  const probe = await fetchProxyModels(baseUrl, masterKey, args.fetchFn);
+  if (probe.kind !== "ok") {
+    writeErr(
+      chalk.yellow(
+        `  ! litellm/hindsight: could not read the proxy model list (${probe.msg}) — ` +
+          `key model allowlist left unverified.\n`,
+      ),
+    );
+    return;
+  }
+
+  const demands = requiredKeyDemands(requiredKeyModels(config, new Set(probe.models)));
+  if (demands.length === 0) {
+    writeOut(
+      chalk.gray(
+        `  ~ litellm/hindsight: key already provisioned; no litellm-routed ` +
+          `model groups declared (nothing to reconcile)\n`,
+      ),
+    );
+    return;
+  }
+
+  // SEQUENTIAL on purpose — do NOT turn this into a `Promise.all`. Two config
+  // paths may name different refs that resolve to the SAME key value, and each
+  // iteration re-reads that key's current allowlist and writes back a union of
+  // it. Run concurrently, both iterations would read the pre-update list and
+  // the second write would clobber the first grant with a stale union: a lost
+  // update, and a silent one, because the write still reports `ok`.
+  for (const demand of demands) {
+    const label = `litellm/hindsight (${demand.declaredBy.join(", ")})`;
+
+    // No `api_key` on the op ⇒ UNKNOWN key, not the service key. Reconciling
+    // `litellm/hindsight/api-key` here would widen a key this lane never
+    // presents, so the grant would read as success while the lane stayed
+    // unreachable. Name the missing config instead.
+    if (demand.apiKeyRef === null) {
+      writeErr(
+        chalk.yellow(
+          `  ! ${label}: routed through litellm but declares no \`api_key\`, so ` +
+            `switchroom cannot tell which virtual key it presents — model ` +
+            `allowlist left unverified (the provisioned ` +
+            `\`litellm/hindsight/api-key\` is NOT a fallback; it authenticates ` +
+            `the claude-code passthrough). Set \`hindsight.llm.<op>.api_key\`.\n`,
+        ),
+      );
+      continue;
+    }
+
+    const key = await args.resolveSecret(demand.apiKeyRef);
+    if (!key) {
+      writeErr(
+        chalk.yellow(
+          `  ! ${label}: could not resolve the api_key this lane presents ` +
+            `(${demand.declaredBy.map((c) => `${c}.api_key`).join(" / ")}) — ` +
+            `model allowlist left unverified.\n`,
+        ),
+      );
+      continue;
+    }
+
+    const validation = await args.validateKey({ baseUrl, masterKey, key }, args.fetchFn);
+    if (validation.kind === "unreachable") {
+      // Distinct from `unknown` on purpose. The proxy answered `/v1/models`
+      // moments ago, so a failure HERE means the allowlist was never read.
+      // Reporting that as a clean "(skipped)" is the same unperformed-check-
+      // dressed-as-a-pass that let the original defect hide for weeks.
+      writeErr(
+        chalk.yellow(
+          `  ! ${label}: could not read the key's model allowlist ` +
+            `(${validation.detail}) — left unverified.\n`,
+        ),
+      );
+      continue;
+    }
+    if (validation.kind !== "valid") {
+      // `unknown` = DB drift, which the provisioning path owns and reports with
+      // the right remedy. Never re-provision from here, and do not say it twice.
+      writeOut(
+        chalk.gray(
+          `  ~ ${label}: the proxy does not recognise this key — allowlist not ` +
+            `reconciled (the key-provisioning step owns this)\n`,
+        ),
+      );
+      continue;
+    }
+
+    const groups = [...new Set(demand.required.map((r) => r.group))];
+    const next = reconciledAllowlist(validation.models, demand.required);
+    if (next === null) {
+      const posture = classifyAllowlist(validation.models);
+      writeOut(
+        chalk.gray(
+          `  ~ ${label}: key already provisioned + validated ` +
+            `(${
+              posture === "unrestricted"
+                ? "model allowlist unrestricted"
+                : posture === "indeterminate"
+                  ? "model allowlist delegated to the key's team — not reconciled"
+                  : `reaches all ${groups.length} declared model group(s)`
+            })\n`,
+        ),
+      );
+      continue;
+    }
+
+    const added = next.filter((m) => !validation.models.includes(m));
+    const upd = await args.updateKeyModels(
+      { baseUrl, masterKey, key, models: next },
+      args.fetchFn,
+    );
+    if (upd.kind === "ok") {
+      writeOut(
+        chalk.green(
+          `  + ${label}: granted key access to ${added.length} declared model ` +
+            `group(s) it could NOT reach — ${added.join(", ")}. Every call to ` +
+            `${added.length === 1 ? "it" : "them"} was being rejected at auth ` +
+            `("key not allowed to access model").\n`,
+        ),
+      );
+    } else {
+      writeErr(
+        chalk.yellow(
+          `  ! ${label}: key CANNOT reach declared model group(s) ` +
+            `${added.join(", ")} and the allowlist update FAILED (${upd.detail}) — ` +
+            `every call to ${added.length === 1 ? "that lane" : "those lanes"} will be ` +
+            `rejected at auth until it is fixed. Manual: POST ${baseUrl}/key/update ` +
+            `{"key":"<key>","models":${JSON.stringify(next)}}.\n`,
+        ),
+      );
     }
   }
 }

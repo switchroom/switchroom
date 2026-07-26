@@ -202,7 +202,7 @@ describe("validateGoogleAccountLabel", () => {
   });
 
   it("rejects null bytes", () => {
-    expect(() => validateGoogleAccountLabel("alice @example.com")).toThrow();
+    expect(() => validateGoogleAccountLabel("alice\u0000@example.com")).toThrow();
   });
 
   it("rejects non-string input via type-narrowing", () => {

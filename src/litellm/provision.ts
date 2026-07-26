@@ -540,7 +540,18 @@ export interface ValidateKeyOpts {
  *       Never triggers a destructive re-provision.
  */
 export type ValidateKeyResult =
-  | { kind: "valid"; teamId: string | null }
+  | {
+      kind: "valid";
+      teamId: string | null;
+      /**
+       * The key's model allowlist (`info.models`). `[]` means UNRESTRICTED in
+       * LiteLLM — not "no models"; see `isUnrestrictedAllowlist` in
+       * `key-allowlist.ts`. An absent/unreadable field degrades to `[]`, which
+       * is the safe direction: it reads as unrestricted and reconciles
+       * nothing, rather than inventing a truncation.
+       */
+      models: string[];
+    }
   | { kind: "unknown" }
   | { kind: "unreachable"; detail: string };
 
@@ -573,15 +584,26 @@ export async function validateKey(
     // team binding lives at info.team_id — null/absent ⇒ UNBOUND. Surface it
     // so a valid-but-unbound key can be healed in place (F1). A missing /
     // unparseable body degrades to `null` (unknown binding), never an error.
+    //
+    // `info.models` is the key's model allowlist, enforced at request auth by
+    // `can_key_call_model` (auth_checks.py). Surfaced so a key that cannot
+    // reach a config-declared lane can be healed in place (see
+    // `updateKeyModels` + `key-allowlist.ts`).
     let teamId: string | null = null;
+    let models: string[] = [];
     try {
-      const json = (await resp.json()) as { info?: { team_id?: unknown } } | null;
+      const json = (await resp.json()) as
+        | { info?: { team_id?: unknown; models?: unknown } }
+        | null;
       const t = json?.info?.team_id;
       if (typeof t === "string" && t.length > 0) teamId = t;
+      const m = json?.info?.models;
+      if (Array.isArray(m)) models = m.filter((x): x is string => typeof x === "string");
     } catch {
-      /* body unreadable/non-JSON — treat binding as unknown (null). */
+      /* body unreadable/non-JSON — binding unknown (null), allowlist unknown
+         ([] ⇒ reads as unrestricted ⇒ reconciles nothing). */
     }
-    return { kind: "valid", teamId };
+    return { kind: "valid", teamId, models };
   }
   const body = await safeText(resp);
   if (looksLikeUnknownKey(resp.status, body)) return { kind: "unknown" };
@@ -631,6 +653,67 @@ export async function bindKeyToTeam(
       method: "POST",
       headers: authHeaders(opts.masterKey),
       body: JSON.stringify({ key: opts.key, team_id: opts.teamId }),
+    });
+  } catch (err) {
+    return { kind: "error", detail: (err as Error).message };
+  }
+  if (resp.ok) return { kind: "ok" };
+  const body = await safeText(resp);
+  return { kind: "error", detail: `HTTP ${resp.status}: ${body.slice(0, 200)}` };
+}
+
+/** Options for `updateKeyModels`. */
+export interface UpdateKeyModelsOpts {
+  baseUrl: string;
+  masterKey: string;
+  /** The existing virtual key string whose allowlist to rewrite. */
+  key: string;
+  /**
+   * The FULL allowlist to store. LiteLLM's `/key/update` REPLACES `models`
+   * rather than appending, so callers must pass the union they want to end up
+   * with — `reconciledAllowlist()` in `key-allowlist.ts` computes it.
+   */
+  models: string[];
+}
+
+/** Outcome of an allowlist-only /key/update. */
+export type UpdateKeyModelsResult =
+  | { kind: "ok" }
+  | { kind: "error"; detail: string };
+
+/**
+ * Rewrite an EXISTING virtual key's model allowlist in place via
+ * POST /key/update {key, models}.
+ *
+ * Why this is needed at all: the allowlist is enforced at request auth
+ * (`can_key_call_model`, `litellm/proxy/auth/auth_checks.py`) and stored in the
+ * proxy's Postgres `LiteLLM_VerificationToken` row — NOT in
+ * `litellm-config.yaml`. It therefore has no declarative home on the proxy side
+ * and a DB rebuild silently reverts it. Reconciling it from `switchroom.yaml`
+ * on every apply is what gives it one.
+ *
+ * Contract verified against LiteLLM v1.91.0
+ * (`litellm/proxy/management_endpoints/key_management_endpoints.py update_key_fn`
+ * + `_types.py`): `UpdateKeyRequest` inherits the optional `models` field from
+ * `GenerateRequestBase` via `KeyRequestBase`, and the handler writes it through
+ * to the token row. Semantics are REPLACE, not merge — hence the full-union
+ * contract on {@link UpdateKeyModelsOpts.models}.
+ *
+ * Best-effort + LOUD on failure: never throws, never deletes or regenerates the
+ * key (which would churn the vault and break in-flight callers) — returns a
+ * structured error the caller surfaces as a warning.
+ */
+export async function updateKeyModels(
+  opts: UpdateKeyModelsOpts,
+  fetchFn: FetchFn = fetch,
+): Promise<UpdateKeyModelsResult> {
+  const url = `${normalizeBase(opts.baseUrl)}/key/update`;
+  let resp: Response;
+  try {
+    resp = await fetchFn(url, {
+      method: "POST",
+      headers: authHeaders(opts.masterKey),
+      body: JSON.stringify({ key: opts.key, models: opts.models }),
     });
   } catch (err) {
     return { kind: "error", detail: (err as Error).message };

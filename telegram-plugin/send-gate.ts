@@ -489,7 +489,7 @@ function hashPayload(payload: unknown): string {
     // `stableStringify(undefined)` (and any value that JSON.stringify drops)
     // returns undefined; hash a fixed sentinel so createHash never throws
     // (#3092 L2 — a caller may set editPayload: undefined alongside messageId).
-    s = j === undefined ? ' undefined' : j
+    s = j === undefined ? '\u0000undefined' : j
   }
   return createHash('sha256').update(s).digest('hex')
 }

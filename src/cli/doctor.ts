@@ -35,6 +35,7 @@ import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnex
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
+import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
@@ -3458,6 +3459,26 @@ export function registerDoctorCommand(program: Command): void {
             // fails) when the proxy is unreachable.
             title: "LiteLLM model routing (#3407)",
             results: await runLitellmModelChecks(config, {
+              resolveSecret: (ref) => {
+                if (!isVaultReference(ref)) return ref; // literal admin_key
+                if (!passphrase || !existsSync(vaultPath)) return null;
+                try {
+                  return getStringSecret(passphrase, vaultPath, parseVaultReference(ref));
+                } catch {
+                  return null;
+                }
+              },
+            }),
+          },
+          {
+            // The sibling of #3407, and the half it cannot see. #3407 proves a
+            // declared model EXISTS in the proxy; this proves the hindsight
+            // virtual KEY can actually call it. Existence lives in
+            // litellm-config.yaml, reachability lives in a Postgres row, and
+            // nothing compared the two — which is how two declared, deployed,
+            // healthy lanes recorded zero calls for weeks (2026-07-26).
+            title: "LiteLLM key allowlist",
+            results: await runLitellmKeyAllowlistChecks(config, {
               resolveSecret: (ref) => {
                 if (!isVaultReference(ref)) return ref; // literal admin_key
                 if (!passphrase || !existsSync(vaultPath)) return null;
