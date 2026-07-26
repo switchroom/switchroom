@@ -49,6 +49,19 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # Merge queue — the required `images-ok` sentinel must report on the
+  # temporary `gh-readonly-queue/main/...` ref or the entry is ejected.
+  #
+  # merge_group is a VALIDATION event here, exactly like pull_request:
+  # build only, never push, never write registry cache, never log in to
+  # GHCR, amd64 only. Publication stays on the real push to `main` that
+  # follows the merge. This matters because this workflow's "is this a
+  # publishing event?" test was historically spelled
+  # `github.event_name != 'pull_request'` — which is TRUE on merge_group
+  # — so every such site now excludes merge_group explicitly. That
+  # invariant is enforced by tests/ci-merge-queue-triggers.test.ts,
+  # because none of it is observable on a PR. See .github/MERGE-QUEUE.md.
+  merge_group:
   # Manual re-trigger. GHA marks a run failed (no auto-retry) when its
   # jobs sit queued past the hosted-runner scheduling window during a
   # capacity blip; `gh run rerun` then refuses ("cannot be retried")
@@ -69,9 +82,15 @@ permissions:
 # path-gated image (e.g. hindsight) gets rebuilt (#1336, and observed
 # live on 2026-07-05: three successive merges cancelled both the push
 # run carrying a hindsight pin bump and the recovery dispatch).
+#
+# merge_group runs keep the plain `github.ref` group (the queue's own
+# `gh-readonly-queue/...` branch — never shared with the PR's
+# `refs/pull/<n>/merge`), but are NOT cancellable: a cancelled required
+# context ejects the queue entry, and cancelling the `images-ok`
+# `if: always()` sentinel is the #3614 orphan-wedge shape.
 concurrency:
   group: docker-images-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' }}
 
 env:
   REGISTRY: ghcr.io
@@ -113,6 +132,12 @@ jobs:
   # per-arch job renames in this rework don't touch branch protection;
   # keep the sentinel's `needs` list complete when adding jobs.
   changes:
+    # merge_group is deliberately absent: a queue ref has no diff base,
+    # so this job is SKIPPED there. That is safe — the `images-ok`
+    # sentinel treats a skipped `changes` as fine (only failure/cancel is
+    # infra breakage), and every downstream `if:` uses `!cancelled()` so a
+    # skipped `changes` does not auto-skip them (the same path tag pushes
+    # and workflow_dispatch already take).
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -131,10 +156,16 @@ jobs:
 
   build-base:
     needs: changes
-    # Non-PR events (main push / tag / dispatch): always build.
-    # PRs: only when image inputs changed. `!cancelled()` because
-    # `changes` is skipped on tag/dispatch and a skipped need would
-    # otherwise auto-skip this job.
+    # Non-PR events (main push / tag / dispatch / merge_group): always
+    # build. PRs: only when image inputs changed. `!cancelled()` because
+    # `changes` is skipped on tag/dispatch/merge_group and a skipped need
+    # would otherwise auto-skip this job.
+    #
+    # merge_group DOES build here — deliberately. `images-ok` is a
+    # required context, and if every build job skipped on the queue ref
+    # the sentinel would be a rubber stamp that green-lights a merge
+    # having compiled nothing. It builds amd64-only and pushes nothing
+    # (see the `merge_group` note in the `on:` block).
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
     strategy:
       fail-fast: false
@@ -143,7 +174,10 @@ jobs:
         # green anyway, and the arm64 artifact is only consumed from
         # main/tag pushes. Non-PR: both arches, each on a NATIVE
         # runner (no QEMU).
-        arch: ${{ github.event_name == 'pull_request' && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
+        # merge_group is amd64-only for the same reason PRs are: the
+        # queue validates buildability and pushes nothing, and the arm64
+        # artifact is only ever consumed from a main/tag push.
+        arch: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -173,7 +207,9 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
-        if: github.event_name != 'pull_request'
+        # merge_group excluded: a queue run is validation-only and pushes
+        # nothing, so it needs no registry credential.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -185,7 +221,13 @@ jobs:
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            # Merge-queue validation: build-only, never pushed. Keyed on
+            # the queue ref's sha because `github.event.pull_request.number`
+            # is EMPTY on merge_group — interpolating it would emit the
+            # invalid reference `${IMAGE}:pr-` and fail the build.
+            echo "tags=${IMAGE}:mq-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             # PR builds: synthesize a non-pushed tag for build-only mode.
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           else
@@ -205,7 +247,7 @@ jobs:
           file: docker/Dockerfile.base
           platforms: linux/${{ matrix.arch }}
           tags: ${{ steps.tags.outputs.tags }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
           # Cache via GHCR registry, not type=gha (#1965). The GHA
           # Azure-blob backend restores each layer behind a short-lived
           # SAS token; on the heavy images' large layers that token
@@ -224,7 +266,7 @@ jobs:
           cache-from: |
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-base:buildcache-${{ matrix.arch }}
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-base:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-base:buildcache-{1},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.arch) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && format('type=registry,ref=ghcr.io/{0}/switchroom-base:buildcache-{1},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.arch) || '' }}
           # sec WS9-F3 (#1418, relaxed per header): signed provenance +
           # SBOM only on tag pushes — release artifacts are what
           # `switchroom update` verifies; attestation on every main/PR
@@ -248,7 +290,11 @@ jobs:
   # Manifest-only (`imagetools create`): no rebuild, no layer re-export.
   merge-base:
     needs: build-base
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-base.result == 'success' }}
+    # merge_group excluded: this job PUBLISHES (:latest / :sha-<short> /
+    # :vX.Y.Z) from the per-arch scratch tags. A queue run pushes no
+    # scratch tags and must never move a user-facing tag — publication
+    # happens on the real push to main after the merge lands.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.build-base.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -332,12 +378,15 @@ jobs:
     # Same gate as build-base, plus an explicit success check on the
     # base build — `!cancelled()` alone would let dependents run past
     # a FAILED base (unlike the default all-needs-succeeded semantics
-    # it replaces).
+    # it replaces). merge_group builds here too; see build-base.
     if: ${{ !cancelled() && needs.build-base.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ github.event_name == 'pull_request' && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
+        # merge_group is amd64-only for the same reason PRs are: the
+        # queue validates buildability and pushes nothing, and the arm64
+        # artifact is only ever consumed from a main/tag push.
+        arch: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
         image:
           - { name: agent,        file: docker/Dockerfile.agent }
           - { name: broker,       file: docker/Dockerfile.broker }
@@ -378,7 +427,9 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
-        if: github.event_name != 'pull_request'
+        # merge_group excluded: a queue run is validation-only and pushes
+        # nothing, so it needs no registry credential.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -391,7 +442,14 @@ jobs:
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image.name }}"
           BASE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            # Merge-queue validation — see build-base for why the PR
+            # number can't be used here. Like a PR, the queue's base
+            # build pushed no scratch tag, so build FROM published
+            # :latest.
+            echo "tags=${IMAGE}:mq-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "base=${BASE}:latest" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
             # On PRs the base wasn't pushed, so depend on the published
             # :latest (multi-arch; buildx resolves the amd64 leg).
@@ -410,7 +468,7 @@ jobs:
           file: ${{ matrix.image.file }}
           platforms: linux/${{ matrix.arch }}
           tags: ${{ steps.tags.outputs.tags }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
           build-args: |
             BASE_IMAGE=${{ steps.tags.outputs.base }}
           # GHCR registry cache, not type=gha — #1965. `agent` (Chromium/
@@ -425,7 +483,7 @@ jobs:
           cache-from: |
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache-${{ matrix.arch }}
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-{1}:buildcache-{2},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.image.name, matrix.arch) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && format('type=registry,ref=ghcr.io/{0}/switchroom-{1}:buildcache-{2},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.image.name, matrix.arch) || '' }}
           # sec WS9-F3 (#1418, relaxed per header): attestation on tag
           # pushes only.
           provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
@@ -435,7 +493,9 @@ jobs:
   # manifests. Same pattern as merge-base.
   merge-dependents:
     needs: build-dependents
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-dependents.result == 'success' }}
+    # merge_group excluded — see merge-base. Publication is a push-to-main
+    # concern, never a queue-validation concern.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.build-dependents.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -495,6 +555,14 @@ jobs:
     # Still single-job multi-arch via QEMU (NOT split per-arch like
     # base/dependents): this job is skipped on almost every main push,
     # so doubling its job count buys nothing on the common path.
+    #
+    # On merge_group this SKIPS (`changes` doesn't run there, so the
+    # `hindsight` output is empty). That is not a hole: the hindsight
+    # image's real gate is docker-e2e's `hindsight-probe`, which DOES run
+    # on merge_group, and the path-aware build + publish still happens on
+    # the push to main straight after the merge. Forcing the 6.4GB
+    # multi-arch build onto every queue entry would push the queue past
+    # its 60-min check_response_timeout for no added signal.
     needs: changes
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.hindsight == 'true') }}
     runs-on: ubuntu-latest
@@ -503,14 +571,18 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up QEMU (only when arm64 build runs)
-        if: github.event_name != 'pull_request'
+        # merge_group excluded: a queue run is validation-only and pushes
+        # nothing, so it needs no registry credential.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
-        if: github.event_name != 'pull_request'
+        # merge_group excluded: a queue run is validation-only and pushes
+        # nothing, so it needs no registry credential.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -536,6 +608,10 @@ jobs:
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            # Merge-queue validation: build-only, never pushed. Same
+            # empty-`pull_request.number` hazard as #2816 below.
+            echo "tags=${IMAGE}:mq-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           else
@@ -552,12 +628,12 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.hindsight
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           tags: ${{ steps.tags.outputs.tags }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
           # GHCR registry cache, not type=gha — #1965 (see build-base).
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-hindsight:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-hindsight:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && format('type=registry,ref=ghcr.io/{0}/switchroom-hindsight:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
           # sec WS9-F3 (#1418, relaxed per header): attestation on tag
           # pushes only.
           provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
@@ -588,6 +664,11 @@ jobs:
     # `changes` header): the CUDA layers make voice the heaviest build
     # and its context almost never changes; retag-unchanged covers the
     # skipped-on-main-push case. Tags + dispatch always build.
+    #
+    # Skips on merge_group for the same reason as build-hindsight — this
+    # is the single heaviest build in the repo and running it per queue
+    # entry would blow the queue's 60-min check_response_timeout. The
+    # build + publish still runs on the push to main after the merge.
     needs: changes
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.voice == 'true') }}
     runs-on: ubuntu-latest
@@ -599,7 +680,9 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
-        if: github.event_name != 'pull_request'
+        # merge_group excluded: a queue run is validation-only and pushes
+        # nothing, so it needs no registry credential.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -625,6 +708,10 @@ jobs:
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            # Merge-queue validation: build-only, never pushed (see
+            # build-hindsight's twin branch).
+            echo "tags=${IMAGE}:mq-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           else
@@ -642,14 +729,14 @@ jobs:
           # job-level comment). No QEMU/arm64 leg on any event.
           platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
           # GHCR registry cache, not type=gha — #1965 (see build-base). The
           # CUDA base + faster-whisper pip layer are heavy, so the registry
           # cache materially shortens warm builds. cache-to gated to non-PR
           # (fork PRs have no GHCR write token; an export failure would break
           # the required build check).
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-voice:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-voice:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && format('type=registry,ref=ghcr.io/{0}/switchroom-voice:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
           # sec WS9-F3 (#1418, relaxed per header): attestation on tag
           # pushes only.
           provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
@@ -885,8 +972,8 @@ jobs:
         run: |
           c='${{ needs.changes.result }}'
           # `changes` is intentionally skipped on tag pushes /
-          # workflow_dispatch (no diff base) — skipped is fine; only a
-          # failure/cancel is infra breakage.
+          # workflow_dispatch / merge_group (no diff base) — skipped is
+          # fine; only a failure/cancel is infra breakage.
           if [ "$c" = "failure" ] || [ "$c" = "cancelled" ]; then
             echo "::error::changes=$c — path-filter infra failed; can't trust skip"
             exit 1
