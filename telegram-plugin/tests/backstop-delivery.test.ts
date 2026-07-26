@@ -10,6 +10,7 @@ import {
 } from '../gateway/backstop-delivery.js'
 import {
   backstopSendOutcomeGated,
+  buildTurnRecord,
   finalizeBackstopSendGated,
   computeTurnStatus,
 } from '../gateway/turn-record-status.js'
@@ -472,5 +473,142 @@ describe('#3278 runBackstopDelivery — read-back drives the delivery outcome', 
     const res = await runBackstopDelivery(ledger, '#gap', ['c0', 'c1'], null, { sendChunk, readBack }, 2)
     expect(res.delivered).toBe(false)
     expect(res.exhausted).toBe(true)
+  })
+
+  // Mixed sequence: the two probe states that MOVE the verdict, composed in one
+  // run. Chunk 0's first send is silently discarded (`absent` ⇒ demote ⇒
+  // re-send) and the probe on the RE-SEND is shed (`ambiguous`). Under the old
+  // confirmation-gated verdict the re-sent chunk was never `landed-confirmed`,
+  // so the whole turn came out `delivered:false` — a `send_failed` for an answer
+  // that had just been successfully re-sent. Demote-and-re-send and
+  // ambiguity-is-not-failure must compose.
+  it('absent ⇒ demote ⇒ re-send, then AMBIGUOUS on the re-send ⇒ delivered, sent exactly twice', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    let sends = 0
+    const sendChunk = vi.fn(async () => { sends++; return [990 + sends] })
+    let probes = 0
+    const readBack = vi.fn(async (): Promise<ReadBackResult> => {
+      probes++
+      return probes === 1 ? 'absent' : 'ambiguous'
+    })
+    const res = await runBackstopDelivery(ledger, '#mixed', ['answer'], null, { sendChunk, readBack }, 3)
+    expect(sendChunk).toHaveBeenCalledTimes(2) // initial + exactly one re-send
+    expect(readBack).toHaveBeenCalledTimes(2) // probed once per landing
+    expect(res.delivered).toBe(true) // the re-send landed a fresh id; ambiguity proves nothing
+    expect(res.confirmed).toBe(false) // ...and is honestly reported as uncorroborated
+    expect(res.sentIds).toEqual([992]) // the demoted first id is gone; the re-send's id stands
+    expect(res.landedUnconfirmedIds).toEqual([992])
+    // The outcome the user actually experiences: a `complete` turn record.
+    const turn: { finalAnswerDelivered: boolean; deliveryOutcome?: 'delivered' | 'failed' | 'suppressed' } = {
+      finalAnswerDelivered: true,
+    }
+    finalizeBackstopSendGated(turn, {
+      threw: !res.delivered, sentIds: res.sentIds, chunkCount: res.chunkCount, cardMessageId: null,
+    })
+    expect(computeTurnStatus(turn)).toBe('complete')
+  })
+})
+
+// ── The observability of the new optimism (#3702 L2/L5/L6a) ─────────────────
+//
+// Counting an inconclusive probe as delivered is a BET. These pin the two
+// artifacts that let the fleet find out if it is ever wrong: the per-delivery
+// stderr line, and the `landed_unconfirmed` field on the turns.jsonl row.
+describe('#3702 landed-unconfirmed is MEASURED, not silently assumed', () => {
+  it('a delivered-but-unconfirmed turn writes the diagnostic stderr line', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const lines: string[] = []
+    const res = await runBackstopDelivery(
+      ledger, '#obs', ['answer'], null,
+      {
+        sendChunk: async () => [1001],
+        readBack: async (): Promise<ReadBackResult> => 'ambiguous',
+        stderr: (s) => lines.push(s),
+      },
+      3,
+    )
+    expect(res.delivered).toBe(true)
+    expect(res.confirmed).toBe(false)
+    const diag = lines.filter(l => l.includes('backstop delivery landed-unconfirmed'))
+    expect(diag).toHaveLength(1)
+    expect(diag[0]).toContain('#obs')
+    expect(diag[0]).toContain('1 of 1 landed id(s)') // the measured quantity, not just a warning
+  })
+
+  it('a fully CONFIRMED delivery writes NO landed-unconfirmed line (no false alarm)', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const lines: string[] = []
+    const res = await runBackstopDelivery(
+      ledger, '#conf', ['answer'], null,
+      {
+        sendChunk: async () => [1002],
+        readBack: async (): Promise<ReadBackResult> => 'exists',
+        stderr: (s) => lines.push(s),
+      },
+      3,
+    )
+    expect(res.confirmed).toBe(true)
+    expect(res.landedUnconfirmedIds).toEqual([])
+    expect(lines.filter(l => l.includes('backstop delivery landed-unconfirmed'))).toHaveLength(0)
+  })
+
+  it('landedUnconfirmedIds is exactly the uncorroborated subset of sentIds', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    // chunk 0 confirmed, chunk 1 landed-unconfirmed (shed probe).
+    const res = await runBackstopDelivery(
+      ledger, '#subset', ['c0', 'c1'], null,
+      {
+        sendChunk: async (i: number) => [1100 + i],
+        readBack: async (i: number): Promise<ReadBackResult> => (i === 0 ? 'exists' : 'ambiguous'),
+      },
+      3,
+    )
+    expect(res.sentIds).toEqual([1100, 1101])
+    expect(res.landedUnconfirmedIds).toEqual([1101]) // c0 is corroborated; c1 is the bet
+    expect(res.delivered).toBe(true)
+    expect(res.confirmed).toBe(false)
+  })
+
+  it('the count reaches turns.jsonl: a complete turn carries `landed_unconfirmed`', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const res = await runBackstopDelivery(
+      ledger, '#row', ['c0', 'c1'], null,
+      {
+        sendChunk: async (i: number) => [1200 + i],
+        readBack: async (): Promise<ReadBackResult> => 'ambiguous',
+      },
+      3,
+    )
+    const turn = {
+      agent: 'test-agent',
+      startedAt: 1_000_000,
+      toolCallCount: 0,
+      turnId: '#row',
+      finalAnswerDelivered: true,
+      deliveryOutcome: 'delivered' as const,
+      landedUnconfirmed: res.landedUnconfirmedIds.length,
+    }
+    const row = buildTurnRecord(turn, 1_002_000)
+    // The status is honest AND the bet is visible on the same row — that pairing
+    // is the point: a `complete` we could not corroborate is countable.
+    expect(row.status).toBe('complete')
+    expect(row.landed_unconfirmed).toBe(2)
+  })
+
+  it('an ordinary confirmed turn omits the field entirely (row shape unchanged)', () => {
+    const row = buildTurnRecord(
+      {
+        agent: 'test-agent',
+        startedAt: 1_000_000,
+        toolCallCount: 0,
+        turnId: '#plain',
+        finalAnswerDelivered: true,
+        deliveryOutcome: 'delivered',
+        landedUnconfirmed: 0,
+      },
+      1_002_000,
+    )
+    expect(row.status).toBe('complete')
+    expect('landed_unconfirmed' in row).toBe(false)
   })
 })

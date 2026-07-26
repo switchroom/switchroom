@@ -2456,9 +2456,9 @@ async function deliverAnswer(args: {
    *  the send alive if the user deleted their message. Null for synthesized
    *  turns (cron/handback) — those send bare, as before. */
   replyToMessageId: number | null
-  /** #3282 captured-answer RESUME (see captured-answer-resume.ts): re-deliver the SAME byte-identical chunks + pre-hydrate the ledger (non-confirmed tail only). */
+  /** #3282 captured-answer RESUME (see captured-answer-resume.ts): re-deliver the SAME byte-identical chunks + pre-hydrate the ledger (unsent tail only; a landed chunk is re-probed, never re-sent). */
   resume?: { snapshot: CapturedDeliverySnapshot; hydrate: (ledger: BackstopDeliveryLedger, turnId: string) => void }
-}): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean }> {
+}): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean; landedUnconfirmed: number }> {
   const { chatId, turnId } = args
   // Spacers into `\n\n` gaps then split (as executeReply); a resume re-delivers the EXACT captured chunks (byte-stable, no re-split).
   const chunks = args.resume
@@ -2594,6 +2594,7 @@ async function deliverAnswer(args: {
     chunkCount: result.chunkCount,
     delivered: result.delivered,
     exhausted: result.exhausted,
+    landedUnconfirmed: result.landedUnconfirmedIds.length, // #3702 — the caller stamps this on the turn record
   }
 }
 
@@ -3427,6 +3428,7 @@ export type CurrentTurn = {
   // turn-end paths (reply-tool tail, silent-marker, genuine no-reply), where
   // the legacy `finalAnswerDelivered` reading still applies unchanged.
   deliveryOutcome?: DeliveryOutcome
+  landedUnconfirmed?: number // #3702 — landed ids no read-back corroborated; emitted as `landed_unconfirmed` (rationale: turn-record-status.ts)
   // Feed-reopen-after-ack refinement — whether the reply that set
   // `finalAnswerDelivered` was a *substantive* final answer (stream
   // `done`, or ≥200 chars) as opposed to a short pinging interim ACK.
@@ -5033,7 +5035,7 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
             toolCallCount: turn.toolCallCount ?? 0,
             turnId: turn.turnId,
             finalAnswerDelivered: turn.finalAnswerDelivered,
-            deliveryOutcome: turn.deliveryOutcome,
+            deliveryOutcome: turn.deliveryOutcome, landedUnconfirmed: turn.landedUnconfirmed,
           },
           endedAt,
         ),

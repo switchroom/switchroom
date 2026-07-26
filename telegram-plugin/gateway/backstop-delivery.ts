@@ -169,7 +169,11 @@ export class BackstopDeliveryLedger {
   /** Landed message ids of CONFIRMED chunks only, in chunk-index order — the
    *  read-back view of the ledger (ids proven present in the chat). The delivery
    *  predicate counts LANDED ids (`sentIds`), not these; this is the stronger
-   *  proven-present subset, kept as the natural pair to `hasConfirmedChunk`. */
+   *  proven-present subset. Its production consumer is
+   *  {@link BackstopDeliveryResult.landedUnconfirmedIds} — `sentIds` minus these
+   *  is the landed-but-uncorroborated set that reaches `turns.jsonl` as
+   *  `landed_unconfirmed`, the counter that measures whether this module's
+   *  optimism about an inconclusive probe is ever wrong. */
   confirmedIds(turnId: string): number[] {
     const m = this.chunks.get(turnId)
     const set = this.confirmed.get(turnId)
@@ -346,6 +350,18 @@ export interface BackstopDeliveryResult {
    * returned fresh ids for every chunk but the probe could not corroborate them.
    */
   confirmed: boolean
+  /**
+   * The landed message ids NO read-back corroborated — `sentIds` minus the
+   * confirmed subset, in chunk-index order. Empty when {@link confirmed}.
+   *
+   * This is the MEASURABLE form of this module's central bet: a landed id whose
+   * probe came back inconclusive is counted as delivered. Its count is stamped
+   * onto the turn record as `landed_unconfirmed` (see `buildTurnRecord`) so the
+   * fleet can tell how often that bet is being made — and, if a
+   * `landed_unconfirmed` turn is ever followed by a "you never answered me",
+   * that the bet was wrong. Purely observational: nothing keys a failure on it.
+   */
+  landedUnconfirmedIds: number[]
   /** How many attempts ran (1..maxAttempts). */
   attempts: number
   /** True when retries were exhausted without full delivery (terminal fail). */
@@ -369,8 +385,10 @@ export interface BackstopDeliveryResult {
  * and `ambiguous` leaves it `landed-unconfirmed` — never re-sent (duplicate-risk
  * beats missing-risk). An API-ack'd-but-silently-dropped send (fresh id, absent
  * on read-back) is therefore reported `delivered:false` and the caller leaves
- * the obligation OPEN. An INCONCLUSIVE probe is not a failure: it leaves
- * `delivered` alone and only clears `confirmed` (see `BackstopDeliveryResult`).
+ * the obligation OPEN — a correct mechanism that is INERT UNTIL #3703, because
+ * the probe is 100% shed in production and never resolves `absent`. An
+ * INCONCLUSIVE probe is not a failure: it leaves `delivered` alone and only
+ * clears `confirmed` (see `BackstopDeliveryResult`).
  *
  * `recordOutbound` (when provided) fires ONCE at the end with the full landed
  * set and a `texts` array ALIGNED to the actual sent ids (via `ledger.entries`).
@@ -491,15 +509,31 @@ export async function runBackstopDelivery(
   // `absent` verdict demotes the chunk to `unsent` above, so it is no longer
   // landed — which keeps #3278's real contribution (a positive absence is
   // caught and re-sent) while an inconclusive probe changes nothing.
+  //
+  // Honesty about what that contribution is worth TODAY: it is INERT UNTIL
+  // #3703. The probe is issued at cosmetic priority in the same millisecond as
+  // the send it probes, so the per-chat token bucket sheds it 100% of the time
+  // (146 `ambiguous` / 0 `absent` across the live fleet) and the `absent` branch
+  // is structurally unreachable in production. The demote-and-re-send path below
+  // is a correct mechanism with no live trigger; #3703 is the change that wakes
+  // the probe (and must first fix its resplit-overwrite hazard). Do not read
+  // this block as "absence is still caught in production" — it is not, yet.
   const allLanded = chunkCount > 0 && ledger.unsentIndices(turnId, chunkCount).length === 0
   const delivered =
     allLanded && backstopReceiptIds(sentIds, cardMessageId).length > 0
   const exhausted = !delivered
+  // The landed-but-uncorroborated set (L2/L5): `sentIds` minus the read-back
+  // confirmed subset. Surfaced on the result so the caller can stamp
+  // `landed_unconfirmed` on the turn record — the only way to measure whether
+  // counting an inconclusive probe as delivered is ever wrong.
+  const confirmedSet = new Set(ledger.confirmedIds(turnId))
+  const landedUnconfirmedIds = sentIds.filter(id => !confirmedSet.has(id))
   if (delivered && !confirmed) {
     stderr(
       `telegram gateway: backstop delivery landed-unconfirmed for turn ${turnId} — ` +
       `every chunk returned a fresh message id but the read-back probe was ` +
-      `inconclusive; counting it delivered (an ambiguous probe is not a failure)\n`,
+      `inconclusive for ${landedUnconfirmedIds.length} of ${sentIds.length} landed ` +
+      `id(s); counting it delivered (an ambiguous probe is not a failure)\n`,
     )
   }
 
@@ -515,5 +549,5 @@ export async function runBackstopDelivery(
     deps.recordOutbound(ids, texts)
   }
 
-  return { sentIds, chunkCount, delivered, confirmed, attempts, exhausted }
+  return { sentIds, chunkCount, delivered, confirmed, landedUnconfirmedIds, attempts, exhausted }
 }

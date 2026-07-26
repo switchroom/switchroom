@@ -51,6 +51,13 @@ export interface TurnRecord {
   tools?: number;
   status?: string;
   turn_id?: string;
+  /** #3702 — landed backstop message ids the read-back probe never
+   *  corroborated (absent on an ordinary row). A `complete` turn carrying this
+   *  was called delivered on the Bot API's ack alone. Counted, NOT escalated:
+   *  it measures how often that bet is made, and is not itself a failure mode
+   *  (escalating it would recreate the phantom `send_failed` cluster the
+   *  counter exists to explain). */
+  landed_unconfirmed?: number;
 }
 
 /** The L0 failure-mode signals emitted from `turns.jsonl`. Kept as stable
@@ -103,6 +110,14 @@ export interface AgentScanResult {
   findings: Finding[];
   /** Raw gateway signature hit counts (for the digest / escalate decision). */
   gw_hits: Record<GatewaySignal, number>;
+  /** #3702 — how many of this agent's turns delivered at least one landed
+   *  message id the read-back probe never corroborated (`landed_unconfirmed >
+   *  0`). Reported in the digest so the fleet can watch the rate at which a
+   *  delivery is called `complete` on the Bot API's ack alone. Deliberately NOT
+   *  part of `escalate` and NOT a `Finding` — an inconclusive probe is not a
+   *  failure; it is the measurement that tells us if that assumption ever
+   *  breaks. */
+  landed_unconfirmed_turns: number;
   escalate: boolean;
 }
 
@@ -301,5 +316,17 @@ export function scanAgent(
     gw_hits["duplicate-delivery-represent"] > 0 ||
     gw_hits["reply-delivery-failure"] > 0;
 
-  return { agent, turns: turns.length, status_mix, findings, gw_hits, escalate };
+  const landed_unconfirmed_turns = turns.filter(
+    (t) => (t.landed_unconfirmed ?? 0) > 0,
+  ).length;
+
+  return {
+    agent,
+    turns: turns.length,
+    status_mix,
+    findings,
+    gw_hits,
+    landed_unconfirmed_turns,
+    escalate,
+  };
 }

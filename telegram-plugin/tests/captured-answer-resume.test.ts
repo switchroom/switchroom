@@ -271,6 +271,110 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
     expect(oblLedger.isOpen('#t1')).toBe(false)
   })
 
+  // #3702 L3 — the close condition is LANDED, not confirmed. A snapshot whose
+  // chunks all landed but were NEVER corroborated (the read-back is 100% shed in
+  // production, #3703) is resolved on HYDRATION alone: the resume re-probes,
+  // resolves nothing again, sends zero messages, and closes.
+  //
+  // This is the case the durable outbound-text oracle CANNOT reach — history
+  // disabled here, so `hasOutboundWithText` never fires and the old
+  // confirmation-gated verdict would have kept the obligation OPEN, re-running
+  // the same shed probe on every sweep with no send available to it, until the
+  // represent cap escalated a false "never answered you" to the operator.
+  it('fully-landed-but-UNCONFIRMED snapshot, no oracle ⇒ ZERO sends and the obligation CLOSES', async () => {
+    const chunks = ['c0', 'c1']
+    const snapshot = {
+      chunks,
+      chunkStates: [
+        { index: 0, messageIds: [5000], confirmed: false },
+        { index: 1, messageIds: [5001], confirmed: false },
+      ],
+    }
+    const resumeLedger = new BackstopDeliveryLedger()
+    const sentIdx: number[] = []
+    const oblLedger = new ObligationLedger(2)
+    oblLedger.openIfAbsent(obligation({ capturedDelivery: snapshot }))
+    oblLedger.noteCapturedDelivery('#t1', snapshot)
+
+    // No durable corroboration is available from EITHER source: the snapshot
+    // flags are false, history is off, and the re-probe sheds (ambiguous).
+    mockOracle = () => false
+
+    const lines: string[] = []
+    const dispatcher = createCapturedResumeDispatcher({
+      deliverAnswer: async (a) => {
+        a.resume.hydrate(resumeLedger, a.turnId)
+        const res = await runBackstopDelivery(
+          resumeLedger, a.turnId, a.resume.snapshot.chunks, a.cardMessageId,
+          {
+            sendChunk: async (i: number) => { sentIdx.push(i); return [7000 + i] },
+            readBack: async (): Promise<ReadBackResult> => 'ambiguous',
+          },
+          3,
+        )
+        expect(res.confirmed).toBe(false) // nothing corroborated it, at any point
+        expect(res.landedUnconfirmedIds).toEqual([5000, 5001]) // ...and it is counted
+        return { delivered: res.delivered, sentIds: res.sentIds }
+      },
+      obligationLedger: oblLedger,
+      backstopDeliveryLedger: resumeLedger,
+      flushedTurnSupersede: { record: () => {} },
+      historyEnabled: false,
+      stderr: (s) => lines.push(s),
+    })
+    dispatcher.dispatch(oblLedger.list()[0])
+    await flush(dispatcher)
+
+    expect(sentIdx).toEqual([]) // nothing re-posted — the user never sees a duplicate
+    expect(oblLedger.isOpen('#t1')).toBe(false) // closed on the landed-id evidence
+    // ...and the log must say what actually happened. These ids are LANDED, not
+    // confirmed: calling them "confirmed" is the overstatement #3702 removed from
+    // the verdict, and a log that reintroduces it re-lies to the next debugger.
+    const closed = lines.find((l) => l.includes('resume delivered'))
+    expect(closed).toBeDefined()
+    expect(closed).toContain('2 message id(s) landed')
+    expect(closed).not.toContain('confirmed')
+  })
+
+  // The other half of that decision: a positive ABSENCE still re-opens the send
+  // path, so "landed" is not a rubber stamp. (Inert in production until #3703
+  // wakes the probe, but the mechanism must remain correct.)
+  it('a landed chunk the re-probe finds ABSENT is demoted and RE-SENT, not closed on the stale id', async () => {
+    const chunks = ['c0']
+    const snapshot = { chunks, chunkStates: [{ index: 0, messageIds: [5000], confirmed: false }] }
+    const resumeLedger = new BackstopDeliveryLedger()
+    const sentIdx: number[] = []
+    const oblLedger = new ObligationLedger(2)
+    oblLedger.openIfAbsent(obligation({ capturedDelivery: snapshot }))
+    oblLedger.noteCapturedDelivery('#t1', snapshot)
+    mockOracle = () => false
+
+    let probes = 0
+    const dispatcher = createCapturedResumeDispatcher({
+      deliverAnswer: async (a) => {
+        a.resume.hydrate(resumeLedger, a.turnId)
+        const res = await runBackstopDelivery(
+          resumeLedger, a.turnId, a.resume.snapshot.chunks, a.cardMessageId,
+          {
+            sendChunk: async (i: number) => { sentIdx.push(i); return [7000 + i] },
+            readBack: async (): Promise<ReadBackResult> => (++probes === 1 ? 'absent' : 'exists'),
+          },
+          3,
+        )
+        return { delivered: res.delivered, sentIds: res.sentIds }
+      },
+      obligationLedger: oblLedger,
+      backstopDeliveryLedger: resumeLedger,
+      flushedTurnSupersede: { record: () => {} },
+      historyEnabled: false,
+    })
+    dispatcher.dispatch(oblLedger.list()[0])
+    await flush(dispatcher)
+
+    expect(sentIdx).toEqual([0]) // the silently-dropped chunk IS re-sent
+    expect(oblLedger.isOpen('#t1')).toBe(false)
+  })
+
   it('a partial RESUME (tail still fails) leaves the obligation OPEN + consumes represent budget', async () => {
     const chunks = ['c0', 'c1']
     const snapshot = {
