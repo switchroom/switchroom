@@ -4,6 +4,7 @@ import {
   ensureKey,
   validateKey,
   bindKeyToTeam,
+  updateKeyModels,
   LiteLLMProvisionError,
   type FetchFn,
 } from "./provision.js";
@@ -455,7 +456,7 @@ describe("validateKey", () => {
     };
     const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
     // An UNBOUND key → teamId null (so the caller can re-bind it).
-    expect(r).toEqual({ kind: "valid", teamId: null });
+    expect(r).toEqual({ kind: "valid", teamId: null, models: [] });
     expect(calls[0]).toContain("/key/info?key=sk-x");
   });
 
@@ -470,7 +471,7 @@ describe("validateKey", () => {
         json: { key: "sk-x", info: { team_id: "team-uuid-42", spend: 0 } },
       });
     const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
-    expect(r).toEqual({ kind: "valid", teamId: "team-uuid-42" });
+    expect(r).toEqual({ kind: "valid", teamId: "team-uuid-42", models: [] });
   });
 
   it("returns unknown on a 400 'not found' (DB drift)", async () => {
@@ -573,5 +574,112 @@ describe("bindKeyToTeam", () => {
     const r = await bindKeyToTeam({ baseUrl: "http://h", masterKey: "m", key: "sk-x", teamId: "t1" }, fetchFn);
     expect(r.kind).toBe("error");
     expect((r as { detail: string }).detail).toMatch(/ECONNREFUSED/);
+  });
+});
+
+describe("validateKey — the key's model allowlist", () => {
+  it("surfaces info.models so a key that cannot reach a declared lane is visible", () => {
+    // The whole reason this field is read: the allowlist has no declarative
+    // home on the proxy side, so `apply`/`doctor` can only see it here.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({
+        ok: true,
+        status: 200,
+        json: {
+          key: "sk-x",
+          info: { team_id: "t", models: ["gpt-oss-20b", "gpt-oss-120b"] },
+        },
+      });
+    return validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn).then(
+      (r) => {
+        expect(r).toEqual({
+          kind: "valid",
+          teamId: "t",
+          models: ["gpt-oss-20b", "gpt-oss-120b"],
+        });
+      },
+    );
+  });
+
+  it("degrades an absent or non-array models field to [] (reads as unrestricted)", async () => {
+    // [] is LiteLLM's "unrestricted", which reconciles NOTHING. That is the
+    // safe direction: an unreadable field must never be mistaken for "this key
+    // reaches nothing" and trigger a truncating write.
+    for (const models of [undefined, null, "gpt-oss-20b", 42, {}]) {
+      const fetchFn: FetchFn = async () =>
+        mockResponse({ ok: true, status: 200, json: { key: "sk-x", info: { models } } });
+      const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+      expect(r).toEqual({ kind: "valid", teamId: null, models: [] });
+    }
+  });
+
+  it("drops non-string entries rather than propagating them into a write", async () => {
+    const fetchFn: FetchFn = async () =>
+      mockResponse({
+        ok: true,
+        status: 200,
+        json: { key: "sk-x", info: { models: ["gpt-oss-20b", 7, null, "gpt-oss-120b"] } },
+      });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r).toEqual({ kind: "valid", teamId: null, models: ["gpt-oss-20b", "gpt-oss-120b"] });
+  });
+
+  it("degrades an unreadable body to [] instead of throwing", async () => {
+    const fetchFn: FetchFn = async () => mockResponse({ ok: true, status: 200 });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r).toEqual({ kind: "valid", teamId: null, models: [] });
+  });
+});
+
+describe("updateKeyModels", () => {
+  it("POSTs the FULL allowlist to /key/update, keyed by the key itself", async () => {
+    // /key/update REPLACES `models` (v1.91.0 key_management_endpoints.py
+    // update_key_fn), so the caller must send the union it wants to end up
+    // with. Sending only the delta would silently REVOKE everything else.
+    let seenUrl = "";
+    let seenBody: unknown = null;
+    const fetchFn: FetchFn = async (url, init) => {
+      seenUrl = String(url);
+      seenBody = JSON.parse(String((init as RequestInit).body));
+      return mockResponse({ ok: true, status: 200, json: {} });
+    };
+    const r = await updateKeyModels(
+      {
+        baseUrl: "http://h",
+        masterKey: "m",
+        key: "sk-x",
+        models: ["gpt-oss-20b", "gpt-oss-20b-retain"],
+      },
+      fetchFn,
+    );
+    expect(r).toEqual({ kind: "ok" });
+    expect(seenUrl).toBe("http://h/key/update");
+    expect(seenBody).toEqual({ key: "sk-x", models: ["gpt-oss-20b", "gpt-oss-20b-retain"] });
+    // It must NOT regenerate or delete the key — that would churn the vault
+    // and 401 every in-flight caller.
+    expect(seenUrl).not.toContain("/key/delete");
+    expect(seenUrl).not.toContain("/key/generate");
+  });
+
+  it("returns a structured error, never throws, on a non-2xx", async () => {
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 403, text: "Authentication Error" });
+    const r = await updateKeyModels(
+      { baseUrl: "http://h", masterKey: "m", key: "sk-x", models: ["a"] },
+      fetchFn,
+    );
+    expect(r.kind).toBe("error");
+    expect(r.kind === "error" && r.detail).toContain("HTTP 403");
+  });
+
+  it("returns a structured error, never throws, on a transport failure", async () => {
+    const fetchFn: FetchFn = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const r = await updateKeyModels(
+      { baseUrl: "http://h", masterKey: "m", key: "sk-x", models: ["a"] },
+      fetchFn,
+    );
+    expect(r).toEqual({ kind: "error", detail: "ECONNREFUSED" });
   });
 });
