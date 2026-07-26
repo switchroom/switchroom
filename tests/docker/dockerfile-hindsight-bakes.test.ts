@@ -85,7 +85,15 @@ describe("Dockerfile.hindsight shape", () => {
     // fails to boot, autoheal restart-loops the container, and fleet memory is
     // down until someone rolls the image tag back. Prove it at BUILD time,
     // where a failure is just a red CI job.
-    expect(dockerfile).toMatch(/import torch;\s*assert torch\.version\.cuda,/);
+    //
+    // The interpreter is part of the assertion, not incidental: the API runs
+    // out of /app/api/.venv, and a bare `python3` is the image's SYSTEM python,
+    // which has its own (or no) torch. Verifying there would green-light a
+    // build whose venv torch is still `+cpu` — the guard would pass while the
+    // thing it guards is broken. Pin the interpreter path.
+    expect(dockerfile).toMatch(
+      /\/app\/api\/\.venv\/bin\/python\s+-c\s+"import torch;\s*assert torch\.version\.cuda,/,
+    );
     expect(dockerfile).toContain(
       "switchroom hindsight CUDA-torch install: torch {torch.__version__} is not a CUDA build",
     );
@@ -94,6 +102,13 @@ describe("Dockerfile.hindsight shape", () => {
     const assertIdx = dockerfile.search(/assert torch\.version\.cuda,/);
     expect(installIdx).toBeGreaterThanOrEqual(0);
     expect(assertIdx).toBeGreaterThan(installIdx);
+    // Every torch probe in this stage — including the non-amd64 branch's
+    // informational one — must use the venv interpreter, for the same reason.
+    for (const probe of dockerfile.match(/^.*-c "import torch;.*$/gm) ?? []) {
+      expect(probe, "torch probes must run under the venv interpreter").toContain(
+        "/app/api/.venv/bin/python",
+      );
+    }
   });
 
   it("restricts the CUDA torch payload to amd64 (fleet GPU hosts are x86_64)", () => {
@@ -102,11 +117,28 @@ describe("Dockerfile.hindsight shape", () => {
     // the same call. arm64 keeps upstream's CPU torch and reranks on CPU.
     expect(dockerfile).toMatch(/^ARG TARGETARCH$/m);
     expect(dockerfile).toMatch(/if \[ "\$\{TARGETARCH:-amd64\}" = "amd64" \]; then/);
-    // ARG must be declared after the FROM it applies to, or the shell sees an
-    // empty value and the build silently takes the non-amd64 branch on amd64.
+    // ARG must be re-declared inside the stage it is used in: BuildKit's
+    // built-in TARGETARCH is only bound to stages that declare it, and a
+    // declaration above the FROM does not carry into the stage. Note which way
+    // that fails — `${TARGETARCH:-amd64}` defaults an EMPTY value to amd64, so
+    // a missing declaration takes the CUDA branch, not the CPU one. The
+    // resulting hazard is an arm64 build attempting the x86_64 CUDA install
+    // (a hard failure), never a silent CPU fallback on amd64.
     const fromIdx = dockerfile.search(/^FROM\s+ghcr\.io\/vectorize-io\/hindsight/m);
     const argIdx = dockerfile.search(/^ARG TARGETARCH$/m);
     expect(argIdx).toBeGreaterThan(fromIdx);
+
+    // The non-amd64 branch is NOT exercised by PR CI (the multi-arch
+    // build-hindsight job is path-gated and does not run on pull_request), so
+    // nothing but this assertion stands between it and an untested regression.
+    // Pin it to its trivial shape: echo + an import probe, no package install.
+    const elseBranch = dockerfile.slice(
+      dockerfile.search(/^\s*else \\$/m),
+      dockerfile.search(/^\s*fi$/m),
+    );
+    expect(elseBranch, "the non-amd64 branch must exist").not.toBe("");
+    expect(elseBranch).not.toMatch(/pip\s+install/);
+    expect(elseBranch).not.toContain("--index-url");
   });
 
   it("installs the @anthropic-ai/claude-code CLI globally", () => {

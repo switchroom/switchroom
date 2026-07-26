@@ -132,6 +132,27 @@ describe("hindsightGpuEnabled — fail-safe host-capabilities gate", () => {
     expect(hindsightGpuEnabled()).toBe(true);
   });
 
+  it("does NOT accept non-boolean truthy probes (a corrupt verdict fails safe)", () => {
+    // loadHostCapabilities() shape-checks the document but does NOT type-check
+    // these two fields, so a hand-edited or corrupted verdict can hold anything.
+    // The STRING "false" is the nasty one: it is truthy, so a COERCING gate
+    // would emit `--gpus all` on a host that cannot honour it — arriving at the
+    // exact container-create failure this gate exists to prevent, through the
+    // gate. Anything not literally `true` must read as "not proven".
+    mkdirSync(join(home, ".switchroom"), { recursive: true });
+    for (const bogus of ['"false"', '"true"', "1", '"yes"', "{}"]) {
+      writeFileSync(
+        join(home, ".switchroom", "host-capabilities.json"),
+        `{"version":1,"voice":{"gpuPresent":${bogus},"containerToolkit":${bogus},` +
+          `"engine":"local","detectedAt":"2026-07-26T00:00:00.000Z"}}\n`,
+      );
+      expect(
+        hindsightGpuEnabled(),
+        `non-boolean probe ${bogus} must not enable GPU`,
+      ).toBe(false);
+    }
+  });
+
   it("honours an explicit override without touching the persisted verdict", () => {
     writeCaps(true, true);
     expect(hindsightGpuEnabled(false)).toBe(false);

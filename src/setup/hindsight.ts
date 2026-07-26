@@ -1259,12 +1259,19 @@ export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: stri
  * genuinely bad outcome is emitting `--gpus` where Docker can't honour it,
  * which is precisely what this gate prevents.
  *
+ * Both probes are compared with `=== true`, NOT coerced. `loadHostCapabilities`
+ * does a shape check but no per-field type check, so a hand-edited or corrupt
+ * verdict holding the STRING `"false"` would satisfy a truthiness test and emit
+ * `--gpus all` on a host that cannot honour it — the precise failure this gate
+ * exists to prevent, arrived at through the gate. Anything that is not
+ * literally `true` is treated as "not proven", which is the fail-safe reading.
+ *
  * @param override Test/caller seam. When omitted the persisted verdict is read.
  */
 export function hindsightGpuEnabled(override?: boolean): boolean {
   if (override !== undefined) return override;
   const caps = loadHostCapabilities();
-  return Boolean(caps?.voice?.gpuPresent && caps?.voice?.containerToolkit);
+  return caps?.voice?.gpuPresent === true && caps?.voice?.containerToolkit === true;
 }
 
 export function startHindsight(
