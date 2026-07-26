@@ -172,4 +172,7 @@ web UI (Settings → Developer settings → Personal access tokens →
 ## Related
 
 - `runtime-mode.md` — Docker is the only supported runtime in v0.7+.
-- `docs/proposed/docker-images.yml` — the GHCR build/push workflow.
+- `.github/workflows/docker-images.yml` — the GHCR build/push workflow.
+- `.github/workflows/release.yml` — builds the static `switchroom` binaries
+  that `install.sh` downloads, and attaches them (plus
+  `switchroom-checksums.txt`) to each `vX.Y.Z` GitHub Release.

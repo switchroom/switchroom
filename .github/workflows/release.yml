@@ -1,0 +1,326 @@
+name: release
+
+# Build the static `switchroom` CLI binaries for linux/macos x amd64/arm64 on
+# every `v*` tag push and attach them — plus a SHA256 checksums file — to the
+# GitHub Release for that tag.
+#
+# WHY THIS EXISTS: `install.sh` (the advertised `curl | sh` install path) has
+# always downloaded `switchroom-<platform>-<arch>` + `switchroom-checksums.txt`
+# from the release page, but nothing produced them. Every release through
+# v0.19.19 shipped ZERO assets, so the installer was dead on every platform.
+#
+# THE ASSET-NAME CONTRACT IS ENFORCED, NOT DOCUMENTED. The names below must
+# match exactly what `install.sh` asks for. `scripts/check-release-asset-names.mjs`
+# (part of `npm run lint`) parses BOTH this file and `install.sh` and fails the
+# build if they disagree; `scripts/verify-release-bundle.mjs` re-checks the real
+# produced files at release time, including that each checksum line is matchable
+# by the installer's exact `grep -F "  <asset>"`. Rename anything here and lint
+# goes red before the release does.
+#
+# Runners: NATIVE per target (same house pattern as docker-images.yml — no
+# QEMU, no cross-compile) for one reason above all: it lets every leg SMOKE-RUN
+# the binary it just produced and assert `--version` equals the tag. A silently
+# broken compile can no longer ship. Native macOS also lets us verify (and, if
+# needed, repair) the Mach-O code signature — bun ad-hoc signs `--compile`
+# output, and an arm64 Mach-O with a bad signature is killed on exec.
+#
+# NOT DONE HERE: Apple notarization. It needs Developer ID secrets this repo
+# does not have. Ad-hoc signing is enough to *execute*; Gatekeeper's quarantine
+# prompt on a `curl`-downloaded binary is still handled installer-side
+# (install.sh xattr strip). Wiring a notarize step that silently no-ops without
+# secrets would be worse than not having one.
+#
+# Ordering vs npm-publish.yml / docker-images.yml: all three fire independently
+# on the same `v*` tag. Nothing cross-gates them at the workflow level — the
+# `switchroom-release` skill is the gate that requires all three green before a
+# fleet rollout.
+
+on:
+  push:
+    tags: ["v*"]
+  # Recovery / rehearsal lever. Dispatching with dry_run=true (the default)
+  # builds, checksums and verifies the full bundle and uploads it as a workflow
+  # artifact WITHOUT touching any GitHub Release — the way to prove a change to
+  # this workflow works before a real tag. Dispatch on a `vX.Y.Z` tag ref with
+  # dry_run=false to re-attach assets after a failed release run.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + verify only; do not upload to the GitHub Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Single source of truth for the release bundle, cross-checked against BOTH
+  # the build matrix below and install.sh by
+  # scripts/check-release-asset-names.mjs. Keep the order stable.
+  RELEASE_ASSETS: "switchroom-linux-amd64 switchroom-linux-arm64 switchroom-macos-amd64 switchroom-macos-arm64"
+  CHECKSUMS_FILE: "switchroom-checksums.txt"
+
+jobs:
+  build:
+    name: build ${{ matrix.target.asset }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      # Not fail-fast: a release needs all four legs, and seeing which ones
+      # broke beats cancelling the survivors. The bundle job `needs:` this
+      # job, so a single red leg still blocks publish.
+      fail-fast: false
+      matrix:
+        target:
+          # Runner labels track GitHub's hosted images and need review when
+          # images are retired (macos-13, the old Intel image, was; its
+          # replacement is macos-15-intel). A retired label fails the job
+          # immediately with "no runner matching labels" — loud, not silent.
+          - { bun: bun-linux-x64, asset: switchroom-linux-amd64, runner: ubuntu-latest }
+          - { bun: bun-linux-arm64, asset: switchroom-linux-arm64, runner: ubuntu-24.04-arm }
+          - { bun: bun-darwin-x64, asset: switchroom-macos-amd64, runner: macos-15-intel }
+          - { bun: bun-darwin-arm64, asset: switchroom-macos-arm64, runner: macos-15 }
+    steps:
+      - name: Checkout (full history — resolveVersion() uses `git describe`)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node (scripts/build.mjs runs under node)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        uses: ./.github/actions/setup-switchroom
+
+      - name: Resolve the release tag (empty on a non-tag dispatch)
+        id: ver
+        shell: bash
+        run: |
+          # Mirrors npm-publish.yml: the git tag is the version source of
+          # truth. A workflow_dispatch on a branch has no tag — that is legal
+          # for a dry run, and the version assertion below is skipped.
+          ref=""
+          case "$GITHUB_REF" in
+            refs/tags/v*) ref="${GITHUB_REF#refs/tags/}" ;;
+          esac
+          if [ -n "$ref" ]; then
+            ver="${ref#v}"
+            if ! echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.+].+)?$'; then
+              echo "::error::tag '$ref' is not a version tag (got '$ver'); refusing to build a release"
+              exit 1
+            fi
+            echo "tag=$ref" >> "$GITHUB_OUTPUT"
+            echo "version=$ver" >> "$GITHUB_OUTPUT"
+            echo "Building release assets for $ref (version $ver)"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "No version tag on ${GITHUB_REF} — dry-run build, version assertion skipped"
+          fi
+
+      - name: Build dist/ (regenerates src/build-info.ts from the tag)
+        env:
+          # Arms the mis-stamp guard in scripts/build.mjs — same wiring as
+          # docker-images.yml. Empty on non-tag builds so the guard stays quiet.
+          TAG_VERSION: ${{ steps.ver.outputs.tag }}
+        run: npm run build
+
+      - name: Compile ${{ matrix.target.asset }}
+        # No TAG_VERSION here on purpose: the version is already baked into
+        # src/build-info.ts by the step above, which is the only thing the
+        # compile reads. Setting it here would imply a wiring that doesn't exist.
+        shell: bash
+        run: |
+          bun build \
+            --compile \
+            --target=${{ matrix.target.bun }} \
+            --minify \
+            bin/switchroom.ts \
+            --outfile "${{ matrix.target.asset }}"
+          chmod +x "${{ matrix.target.asset }}"
+          ls -lh "${{ matrix.target.asset }}"
+
+      - name: Verify / repair the macOS code signature
+        if: startsWith(matrix.target.runner, 'macos')
+        shell: bash
+        run: |
+          # bun ad-hoc signs its `--compile` output. An arm64 Mach-O whose
+          # signature does not validate is SIGKILLed on exec, so verify it
+          # here on a real Mac and ad-hoc re-sign only if the check fails.
+          # (Re-signing unconditionally would risk breaking a good binary for
+          # no reason; the smoke run below is the backstop either way.)
+          asset="${{ matrix.target.asset }}"
+          if codesign --verify --verbose=2 "$asset" 2>&1; then
+            echo "code signature verified as produced by bun"
+          else
+            echo "::warning::signature did not verify — ad-hoc re-signing $asset"
+            codesign --force --sign - "$asset"
+            codesign --verify --verbose=2 "$asset"
+          fi
+
+      - name: Smoke-run the binary and assert its version
+        shell: bash
+        run: |
+          # The check the draft workflow never had: a binary that cannot even
+          # print its own version must never reach the release page. On a tag
+          # build we additionally assert the STAMPED version equals the tag —
+          # catching a stale src/build-info.ts or a mis-wired TAG_VERSION.
+          asset="./${{ matrix.target.asset }}"
+          out="$("$asset" --version)"
+          echo "$asset --version -> $out"
+          expected="${{ steps.ver.outputs.version }}"
+          if [ -n "$expected" ]; then
+            if [ "$out" != "$expected" ]; then
+              echo "::error::${{ matrix.target.asset }} reports version '$out' but the tag says '$expected'"
+              exit 1
+            fi
+            echo "version matches the tag ($expected)"
+          fi
+
+      - name: Upload ${{ matrix.target.asset }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target.asset }}
+          path: ${{ matrix.target.asset }}
+          if-no-files-found: error
+          retention-days: 5
+
+  bundle:
+    name: assemble + verify bundle
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (for the verifier script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download every build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+
+      - name: Flatten into dist-bins (explicit list, not a glob)
+        shell: bash
+        run: |
+          # Each leg uploads one artifact named after its asset, so the
+          # download lands at artifacts/<asset>/<asset>. Move by explicit name
+          # rather than globbing: a missing or misnamed leg fails HERE instead
+          # of silently producing a short bundle.
+          mkdir -p dist-bins
+          for asset in $RELEASE_ASSETS; do
+            src="artifacts/$asset/$asset"
+            if [ ! -f "$src" ]; then
+              echo "::error::expected build artifact $src is missing"
+              ls -R artifacts || true
+              exit 1
+            fi
+            mv "$src" "dist-bins/$asset"
+            chmod +x "dist-bins/$asset"
+          done
+          ls -lh dist-bins
+
+      - name: Compute SHA256 checksums
+        shell: bash
+        working-directory: dist-bins
+        run: |
+          # sha256sum's canonical "<hash>  <name>" two-space format is what
+          # install.sh matches with `grep -F "  ${asset}"`. Feed it the
+          # explicit asset list so the checksums file can never pick up a
+          # stray file or miss one.
+          # shellcheck disable=SC2086
+          sha256sum $RELEASE_ASSETS > "$CHECKSUMS_FILE"
+          cat "$CHECKSUMS_FILE"
+
+      - name: Verify the bundle against the install.sh contract
+        shell: bash
+        run: |
+          # Re-derives the expected asset names + checksum-line shape straight
+          # from install.sh and checks them against the REAL files. This is the
+          # runtime half of the naming contract (the static half runs in lint).
+          node scripts/verify-release-bundle.mjs dist-bins
+
+      - name: Upload the assembled release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle
+          path: dist-bins/*
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: attach assets to the release
+    needs: bundle
+    # Tag pushes publish. A workflow_dispatch publishes only when explicitly
+    # asked (dry_run=false) AND the dispatch ref is a tag.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.dry_run == false &&
+       startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the assembled bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: dist-bins
+
+      - name: Attach binaries + checksums to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          # The release object is created by the operator with
+          # `gh release create vX.Y.Z` (switchroom-release skill, step 2),
+          # which creates the tag and the release together — so it normally
+          # exists before this job runs. Poll briefly for the API to catch up,
+          # then FAIL LOUDLY rather than inventing a release with auto-notes
+          # that would collide with the operator's CHANGELOG notes.
+          found=""
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              found=1; break
+            fi
+            echo "attempt $i: release $TAG not visible yet — retrying in 15s"
+            sleep 15
+          done
+          if [ -z "$found" ]; then
+            echo "::error::no GitHub Release exists for $TAG after ~150s. Create it (gh release create $TAG --notes-file …) then re-run this workflow via workflow_dispatch on the tag with dry_run=false."
+            exit 1
+          fi
+
+          files=""
+          for asset in $RELEASE_ASSETS; do files="$files dist-bins/$asset"; done
+          files="$files dist-bins/$CHECKSUMS_FILE"
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" $files --repo "$GITHUB_REPOSITORY" --clobber
+
+          # Close the loop: the failure this whole workflow exists to prevent
+          # is a release page with zero assets. Assert every expected asset is
+          # actually attached before calling the job green.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' > /tmp/attached.txt
+          cat /tmp/attached.txt
+          missing=""
+          for asset in $RELEASE_ASSETS "$CHECKSUMS_FILE"; do
+            grep -Fxq "$asset" /tmp/attached.txt || missing="$missing $asset"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::upload reported success but these assets are not on the release:$missing"
+            exit 1
+          fi
+          echo "All release assets attached to $TAG."
