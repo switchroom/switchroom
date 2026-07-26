@@ -211,6 +211,29 @@ describe("classifyRecallHealth — the 2026-07 outage must go red", () => {
     expect(result.status).toBe("ok");
     expect(result.detail).toContain("no recall telemetry");
   });
+
+  it("does not call an agent idle when its rows merely predate bank_timings", () => {
+    // Review finding (#3626). kdogg on the 2026-07-26 host has 12 real recall
+    // rows, none carrying `bank_timings`. Both that and a never-run agent land
+    // on considered === 0, and both used to report "agent idle, or plugin not
+    // yet fired" — false for kdogg, and it sends the operator hunting a dead
+    // plugin that is in fact running fine.
+    const legacyRows = Array.from({ length: 12 }, () => ({
+      bank_id: "kdogg",
+      result_count: 3,
+      total_elapsed_ms: 620,
+    }));
+    const stats = summarizeRecallRows(legacyRows);
+    expect(stats.considered).toBe(0);
+    expect(stats.rowsSeen).toBe(12);
+
+    const result = classifyRecallHealth("kdogg", stats);
+    expect(result.status).toBe("ok");
+    expect(result.detail).toContain("12 recall rows");
+    expect(result.detail).toContain("bank_timings");
+    // The load-bearing assertion: it must NOT claim the agent is idle.
+    expect(result.detail).not.toContain("agent idle");
+  });
 });
 
 describe("readRecallLogTail", () => {

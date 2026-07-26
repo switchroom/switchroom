@@ -175,9 +175,20 @@ class _Harness(unittest.TestCase):
         a valid proxy for "the fallback did not fire" — assert on the fallback
         block itself. These tests are about fallback GATING, not about whether
         any context was produced.
+
+        Review follow-up (#3626): this deliberately does NOT tolerate a `None`
+        context. Every caller reaches it with the OWN bank hard-errored, which
+        is exactly the condition the disclosure must fire on, so `None` means
+        the disclosure regressed. An earlier `if context is None: return`
+        guard here made the `DEGRADED` assertion vacuous under precisely that
+        mutation — stubbing `degraded_block = ""` left all 12 tests in this
+        file green.
         """
-        if context is None:
-            return
+        self.assertIsNotNone(
+            context,
+            "own bank hard-errored, so the #3619 degraded disclosure must have "
+            "been emitted — a silent turn is the regression this guards",
+        )
         self.assertNotIn("<hindsight_transcript_fallback>", context)
         self.assertIn("DEGRADED", context)
 

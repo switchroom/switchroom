@@ -118,6 +118,18 @@ export interface RecallLogRow {
 }
 
 export interface RecallHealthStats {
+  /**
+   * Every row parsed from the window, including ones we cannot score.
+   *
+   * Kept alongside `considered` so the classifier can tell "this agent has
+   * never fired a recall" apart from "this agent has fired recalls, but all of
+   * them predate `bank_timings`". Both leave `considered` at 0 and were
+   * reported identically as "no recall telemetry yet (agent idle, or plugin
+   * not yet fired)" — which is simply false for the second case (kdogg on the
+   * 2026-07-26 host has 12 real rows, none carrying the field) and points the
+   * operator at the wrong thing.
+   */
+  rowsSeen: number;
   /** Rows that carried `bank_timings` (older rows predate the field). */
   considered: number;
   /** Rows whose OWN bank hit its per-request timeout. */
@@ -158,6 +170,7 @@ export function summarizeRecallRows(rows: RecallLogRow[]): RecallHealthStats {
     elapsed.length > 0 ? elapsed[Math.floor(elapsed.length / 2)] : null;
 
   return {
+    rowsSeen: rows.length,
     considered: withTimings.length,
     ownBankTimeouts,
     ownBankErrors,
@@ -177,9 +190,23 @@ export function classifyRecallHealth(
   stats: RecallHealthStats,
 ): CheckResult {
   const name = `${agentName} auto-recall`;
-  const { considered, ownBankTimeouts, ownBankErrors, medianElapsedMs } = stats;
+  const { rowsSeen, considered, ownBankTimeouts, ownBankErrors, medianElapsedMs } = stats;
 
   if (considered === 0) {
+    if (rowsSeen > 0) {
+      // Recall HAS been firing — the rows just predate `bank_timings`, so we
+      // cannot say anything about own-bank health. Say that, rather than
+      // "agent idle", which sends the operator looking for a dead plugin that
+      // is in fact running.
+      return {
+        name,
+        status: "ok",
+        detail:
+          `${rowsSeen} recall rows in the window, none carrying bank_timings ` +
+          "(pre-A3 telemetry schema) — own-bank health not scoreable until the " +
+          "agent fires a recall on the current hook",
+      };
+    }
     return {
       name,
       status: "ok",
