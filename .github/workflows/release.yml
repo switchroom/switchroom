@@ -556,7 +556,33 @@ jobs:
        inputs.dry_run == false &&
        startsWith(github.ref, 'refs/tags/v'))
     permissions:
-      contents: read
+      # `write`, not `read` — and this block is HALF the fix; npm-publish.yml's
+      # own `permissions:` is the other half. A caller job's block CAPS the
+      # token the called workflow gets, so raising either one alone is a
+      # silent no-op.
+      #
+      # WHY WRITE AT ALL: npm-publish.yml's self-gate reads
+      # `GET /repos/{o}/{r}/releases`, and that endpoint returns DRAFT
+      # releases ONLY to a caller with push access. At this point in the
+      # pipeline the release IS a draft — `finalize` un-drafts it only after
+      # npm succeeds — so a `contents: read` token sees no release for the
+      # tag at all and the gate exits 4 ("no release exists"), reported as
+      # "missing assets install.sh needs".
+      #
+      # v0.19.21 died exactly here, and the proof is a three-way control
+      # inside ONE run (30189755957): same script, same endpoint, same tag —
+      # `guard` (contents: write) got found:true, `publish` (contents: write)
+      # got found:true/missing:[] with all five assets attached, and `npm`
+      # (contents: read) got found:false/draft:null. The only variable was
+      # this permission. R11 in tests/release-pipeline-gating.test.ts is the
+      # guard against it coming back.
+      #
+      # The marginal risk is small: this job already carries `NPM_TOKEN`,
+      # which is a strictly bigger prize than repo write, and the alternative
+      # (trusting an upstream job's verdict instead of re-verifying) would
+      # remove the last independent check before an npm publish that cannot
+      # be undone.
+      contents: write
       actions: read
       id-token: write
     uses: ./.github/workflows/npm-publish.yml

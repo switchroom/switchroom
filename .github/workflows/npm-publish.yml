@@ -78,7 +78,25 @@ on:
         type: string
 
 permissions:
-  contents: read
+  # `write` is required to READ, not to write. The self-gate below calls
+  # `GET /repos/{o}/{r}/releases`, and GitHub returns DRAFT releases from
+  # that endpoint only to a caller with PUSH ACCESS. The release is still a
+  # draft every time this workflow runs — release.yml's `finalize` un-drafts
+  # it only after this publish succeeds, which the gate's own comment (below)
+  # already says. Nothing here mutates a release.
+  #
+  # This did not bite before #3654 because releases were created PUBLISHED,
+  # and a published release is visible to anyone; the draft-until-finalize
+  # model made the existing `contents: read` insufficient. v0.19.21 is the
+  # regression: the gate reported found:false / draft:null for a tag whose
+  # draft carried all five assets.
+  #
+  # Both halves are needed. release.yml's `npm` job block caps this one, so
+  # this alone would still yield a read-only token on the workflow_call path.
+  # This block is what covers the `workflow_dispatch` recovery lever, which
+  # has no caller to inherit from — and which is used precisely when the
+  # release is stuck as a draft.
+  contents: write
   actions: read     # read docker-images run conclusions for the self-gate
   id-token: write   # npm provenance (sigstore) — requires npm provenance enabled on the package; harmless if not.
 
