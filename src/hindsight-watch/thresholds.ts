@@ -216,7 +216,25 @@ export const RETAIN_FAILURE_RATE = 0.1;
  * in entries means something different than it did when `QUEUE_FLOOR` and
  * `QUEUE_GROWTH_MIN_ABS` were first set.
  *
- * 4.4 is measured, not assumed (B6): over the 174 live pre-split queue
+ * B7b REVISION (#3693): the bound is now a FRACTION of the client deadline
+ * rather than the whole of it, moving `retain_content_limit()` 48,000 →
+ * 33,000. Unlike B7a's ~6 % this is a 45 % change and is NOT inside the
+ * noise: the same backlog splits into ~1.45× as many parts with not one new
+ * memory behind it, so leaving the factor at 4.4 would tighten every count
+ * threshold below by that much and reintroduce exactly the B6 false positive
+ * they exist to prevent. The B6 population (174 pre-split entries) no longer
+ * exists to re-measure, so the revision is applied as the bound RATIO:
+ *
+ *   4.4 × (45,000 / 33,000) = 6.0
+ *
+ * Ratio-scaling is EXACT for entries far above the bound and OVER-estimates
+ * for entries below it (those are one part at either bound), so the factor
+ * errs high — i.e. quieter — which is the safe direction for a watchdog.
+ * Corroborated against the live 2026-07-26 backlog (209 entries): re-splitting
+ * it at 33,000 rather than 48,000 moves 336 parts → 531, a ratio of 1.58,
+ * slightly above the 1.45 applied here, so 6.0 remains the conservative side.
+ *
+ * 4.4 was measured, not assumed (B6): over the 174 live pre-split queue
  * entries, `Σ ceil(content_chars / 45,000) / 174 = 4.397`. That population
  * is deliberately the right one to calibrate against — it is a real backlog
  * on this fleet, and the concrete false positive being prevented is exactly
@@ -226,12 +244,13 @@ export const RETAIN_FAILURE_RATE = 0.1;
  * Two honest limits on this number:
  *  - It is the BACKLOG distribution, which skews large (small retains drain
  *    first and are not in it). Steady-state parts-per-memory is lower, so
- *    4.4 is a conservative — i.e. quieter — factor.
- *  - The worst single entry splits 17 ways, so a handful of very large
- *    memories can still move the depth a long way. That is the reason the
- *    absolute growth floor below is scaled at all.
+ *    the factor is a conservative — i.e. quieter — one.
+ *  - The worst single entry splits 23 ways at the 33,000 bound (17 at
+ *    45,000), so a handful of very large memories can still move the depth a
+ *    long way. That is the reason the absolute growth floor below is scaled
+ *    at all.
  */
-export const PARTS_PER_MEMORY = 4.4;
+export const PARTS_PER_MEMORY = 6.0;
 
 /**
  * Convert a threshold stated in MEMORIES into the spool's post-#3610 unit.

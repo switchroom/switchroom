@@ -57,22 +57,24 @@ class TestDerivedLimit(unittest.TestCase):
             "HINDSIGHT_RETAIN_CHUNK_SIZE",
             "HINDSIGHT_RETAIN_CHUNK_LATENCY_S",
             "HINDSIGHT_RETAIN_CLIENT_DEADLINE_S",
+            "HINDSIGHT_RETAIN_DEADLINE_SAFETY",
         ):
             os.environ.pop(key, None)
 
     def test_limit_is_chunk_size_times_chunks_that_fit_the_deadline(self):
-        # chunk_size * floor(deadline / latency) = 3000 * floor(310/18.4) = 48000
-        self.assertEqual(retain_content_limit(), 48000)
+        # chunk_size * floor(deadline * safety / latency)
+        #   = 3000 * floor(310 * 0.7 / 18.4) = 3000 * 11 = 33000
+        self.assertEqual(retain_content_limit(), 33000)
 
     def test_limit_is_derived_from_chunk_size_not_a_constant(self):
         os.environ["HINDSIGHT_RETAIN_CHUNK_SIZE"] = "1000"
-        # 1000 * floor(310 / 18.4) = 1000 * 16
-        self.assertEqual(retain_content_limit(), 16000)
+        # 1000 * floor(310 * 0.7 / 18.4) = 1000 * 11
+        self.assertEqual(retain_content_limit(), 11000)
 
     def test_limit_tracks_the_client_deadline(self):
         os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = "92"
-        # floor(92 / 18.4) = 5 chunks
-        self.assertEqual(retain_content_limit(), 15000)
+        # floor(92 * 0.7 / 18.4) = floor(3.5) = 3 chunks
+        self.assertEqual(retain_content_limit(), 9000)
 
     def test_limit_never_falls_below_one_chunk(self):
         os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = "1"
@@ -80,7 +82,77 @@ class TestDerivedLimit(unittest.TestCase):
 
     def test_garbage_env_falls_back_to_the_derived_default(self):
         os.environ["HINDSIGHT_RETAIN_CHUNK_LATENCY_S"] = "not-a-number"
+        self.assertEqual(retain_content_limit(), 33000)
+
+
+class TestTheBoundLeavesMarginUnderTheDeadline(unittest.TestCase):
+    """The bound must NOT consume the whole deadline (#3693).
+
+    Sizing a maximally-sized part to ~100% of the client deadline is what
+    manufactured `.dead` entries on this fleet: every `.dead` marker measured
+    on 2026-07-26 held 16,076-44,568 chars, i.e. every one of them sat UNDER
+    the then-current bound and still could not finish inside the deadline the
+    bound was derived from. `latency` is a MEAN (n=752), so half the
+    extraction calls are slower than it; a part sized to the mean misses its
+    deadline about half the time, the drain bumps its attempt count, and
+    MAX_ATTEMPTS later the memory is dead.
+
+    These assert the OUTCOME — real headroom — rather than the arithmetic, so
+    they fail on the zero-margin derivation regardless of how it is spelled.
+    """
+
+    def tearDown(self):
+        for key in (
+            "HINDSIGHT_RETAIN_MAX_CONTENT_CHARS",
+            "HINDSIGHT_RETAIN_CHUNK_SIZE",
+            "HINDSIGHT_RETAIN_CHUNK_LATENCY_S",
+            "HINDSIGHT_RETAIN_CLIENT_DEADLINE_S",
+            "HINDSIGHT_RETAIN_DEADLINE_SAFETY",
+        ):
+            os.environ.pop(key, None)
+
+    @staticmethod
+    def _worst_case_seconds() -> float:
+        """Sequential extraction time of a maximally-sized part."""
+        chunks = retain_content_limit() / retain_split.DEFAULT_RETAIN_CHUNK_SIZE
+        return chunks * retain_split.DEFAULT_RETAIN_CHUNK_LATENCY_S
+
+    def test_a_maximally_sized_part_finishes_well_inside_the_deadline(self):
+        deadline = retain_split.retain_client_deadline()
+        worst = self._worst_case_seconds()
+        # The pre-#3693 derivation gave 294.4s against 310s -> 0.95 here.
+        self.assertLessEqual(
+            worst / deadline,
+            0.8,
+            f"a maximally-sized part is {worst:.1f}s of extraction against a "
+            f"{deadline:.0f}s deadline: no room for the POST, server queueing, "
+            f"or a chunk slower than the mean",
+        )
+
+    def test_the_headroom_absorbs_a_chunk_distribution_worse_than_its_mean(self):
+        deadline = retain_split.retain_client_deadline()
+        # Every chunk running 25% slower than the measured mean must still fit.
+        self.assertLessEqual(self._worst_case_seconds() * 1.25, deadline)
+
+    def test_the_margin_holds_at_every_deadline_not_just_the_default(self):
+        for seconds in ("120", "200", "310", "600", "900"):
+            os.environ["HINDSIGHT_RETAIN_CLIENT_DEADLINE_S"] = seconds
+            worst = self._worst_case_seconds()
+            deadline = float(seconds)
+            with self.subTest(deadline=seconds):
+                self.assertLessEqual(worst / deadline, 0.8)
+
+    def test_the_safety_fraction_is_operator_tunable(self):
+        os.environ["HINDSIGHT_RETAIN_DEADLINE_SAFETY"] = "0.5"
+        # floor(310 * 0.5 / 18.4) = floor(8.42) = 8 chunks
+        self.assertEqual(retain_content_limit(), 24000)
+
+    def test_a_safety_fraction_above_one_cannot_reintroduce_the_overrun(self):
+        os.environ["HINDSIGHT_RETAIN_DEADLINE_SAFETY"] = "2.0"
+        # Clamped to 1.0, so the WORST an operator can do is the old
+        # zero-margin bound -- never a part sized to overrun outright.
         self.assertEqual(retain_content_limit(), 48000)
+        self.assertLessEqual(self._worst_case_seconds(), retain_split.retain_client_deadline())
 
 
 class TestSplitBounds(unittest.TestCase):
