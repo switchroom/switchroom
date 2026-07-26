@@ -12,7 +12,9 @@ Cut a release of `switchroom/switchroom` and get it live on the fleet. This is a
 
 - A release = a `vX.Y.Z` **git tag** on `main` (the merge commit of the CHANGELOG PR).
 - The tag is the version source of truth (`scripts/build.mjs:resolveVersion()`). `package.json` `version` is a **stale placeholder by design** — never bump it in a commit (the `//version` comment + #2733 discipline). The uncommitted pack-time bump happens in CI now, not by hand.
-- Cutting the tag fires TWO workflows in parallel on tag push: `docker-images` (builds + pushes the 6 ghcr images) and `npm-publish` (builds, packs, verifies, publishes to npm). **Rollout is gated on BOTH going green.**
+- Cutting the tag fires **two** workflows: `docker-images` (builds + pushes the 6 ghcr images) and `release` (the **orchestrator** — builds the four static binaries, attaches them, waits for `docker-images`, then calls `npm-publish`, then takes the GitHub Release out of draft).
+- **`npm-publish.yml` no longer has a tag trigger (#3654).** It is reachable only via `workflow_call` from `release.yml` and via `workflow_dispatch`. npm is the one leg that cannot be undone, so it runs last and only once everything else is green. It also re-proves both preconditions from inside its own run, so a hand dispatch cannot bypass the ordering either.
+- **The GitHub Release is created as a DRAFT and stays one until every leg is green.** `install.sh` resolves the version to install from `/releases/latest`, and that endpoint excludes drafts — so a half-finished release is invisible to `curl | sh` users and the previous complete release keeps serving them. This is not theoretical: v0.19.19 shipped published-with-zero-assets and broke the installer on every platform.
 
 ## Before you start — pre-flight (verify, don't assume)
 
@@ -28,36 +30,75 @@ Cut a release of `switchroom/switchroom` and get it live on the fleet. This is a
 - The release commit touches **CHANGELOG.md only**. Do NOT bump `package.json` (placeholder discipline).
 - Branch protection blocks direct push to `main`, so: create a `release/vX.Y.Z` branch, push it, open a `chore: release vX.Y.Z` PR (base `main`), arm auto-merge (squash, delete-branch) on green CI.
 
-## Step 2 — Cut the tag (on the merge commit, not the PR branch)
+## Step 2 — Create the DRAFT release on a PINNED SHA, then push the tag
 
-Once the changelog PR is merged:
-- `git fetch origin && git checkout main && git pull --ff-only`
-- Tag the merge commit and create the GitHub Release:
-  - `gh release create vX.Y.Z -R switchroom/switchroom --target main --title 'vX.Y.Z — <summary>' --notes-file <notes-file>`
+Once the changelog PR is merged. **Order matters, and so does the pin.**
+
+### 2a — Resolve and PIN the commit
+
+```bash
+git fetch origin
+SHA="$(git rev-parse origin/main)"
+git --no-pager log -1 --oneline "$SHA"    # show the operator exactly what is being released
+```
+
+**Never pass `--target main`.** `main` is resolved server-side at the moment the API call lands, and agents merge PRs in parallel here — a PR that merged in the seconds between your pre-flight check and your `gh release create` would be silently swallowed into the release. Resolve `$SHA` once, confirm it is the commit you inspected in pre-flight, and use that literal SHA everywhere below.
+
+### 2b — Create the release as a DRAFT
+
+```bash
+gh release create "vX.Y.Z" -R switchroom/switchroom \
+  --draft \
+  --target "$SHA" \
+  --title 'vX.Y.Z — <summary>' \
+  --notes-file <notes-file>
+```
+
+- **`--draft` is mandatory.** A published release with no assets immediately becomes `/releases/latest` and 404s every `curl | sh` install for the entire ~25-minute build window. `release.yml` will forcibly re-draft an incomplete published release within about a minute, but do not rely on the safety net — it exists for the case where this step was done wrong.
+- A draft release does **not** create the tag ref. That is 2c's job, and it is why this ordering has no race: the release object exists before the workflows that need it start.
 - **Notes extraction gotcha (historical):** the naive `awk '/^## vX/,/^## v/' CHANGELOG` range collapses to a single line. Use a start-flag awk: `awk 'f{print} /^## vX\.Y\.Z/{print; f=1} f && /^## v/ && !/^## vX\.Y\.Z/{exit}'` — or extract the section to a temp file by line range.
-- **`gh release create` has been silently dropped in past runs.** After running it, verify: `gh release view vX.Y.Z` must return the release. If it didn't create, re-run.
+- **`gh release create` has been silently dropped in past runs.** Verify with `gh release list -R switchroom/switchroom --limit 5` (a draft does NOT show up under `gh release view` reliably; the list does show drafts). If it didn't create, re-run.
 
-## Step 3 — Wait for ALL THREE tag-push workflows (hard gates)
+### 2c — Push the tag at that same pinned SHA
 
-The tag push triggers `docker-images`, `npm-publish` AND `release` in parallel. **Do not proceed to rollout until all three are green AND verified.**
+```bash
+git push origin "$SHA:refs/tags/vX.Y.Z"
+```
 
-### Gate A — npm publish (`npm-publish.yml`)
-- `gh run list --workflow=npm-publish.yml --limit 1` — wait for it to reach `completed` / `success`.
-- Verify the publish is live: `npm view switchroom version` must return `X.Y.Z` (not the old version). Retry a few times — npm registry propagation can lag a few seconds.
-- If this workflow fails: **the release is not published.** Do NOT roll. Diagnose (NPM_TOKEN unset? npm 5xx? empty dist?). Re-run via `gh workflow run npm-publish.yml --ref vX.Y.Z` after fixing.
+This is what fires `docker-images` and `release`. Pushing the SHA-to-ref form rather than `git tag && git push --tags` guarantees the tag lands on the commit you pinned in 2a, not on whatever your local `main` happens to be.
 
-### Gate B — docker images (`docker-images.yml`)
+## Step 3 — Wait for the pipeline (two workflows, one of them orchestrated)
+
+The tag push triggers `docker-images` and `release`. `release` internally waits for `docker-images`, then publishes to npm, then un-drafts the GitHub Release. **Do not proceed to rollout until both are green AND verified.**
+
+### Gate A — docker images (`docker-images.yml`)
 - `gh run list --workflow=docker-images.yml --limit 1` — wait for `completed` / `success`.
 - Verify all 6 images are published: `docker manifest inspect ghcr.io/switchroom/<image>:vX.Y.Z` for `agent`, `auth-broker`, `kernel`, `broker`, `web`, `hostd`. Each must resolve.
-- If any image is missing: do NOT roll — the rollout canary version-assert fails on an unpublished tag. Wait + re-check.
+- If any image is missing: do NOT roll — the rollout canary version-assert fails on an unpublished tag. Wait + re-check. `release` will block on this by itself, so a red image build means npm never publishes and the release never leaves draft. That is the design.
 
-### Gate C — static binaries (`release.yml`)
-- `gh run list --workflow=release.yml --limit 1` — wait for `completed` / `success`.
-- Verify the release page actually has assets: `gh release view vX.Y.Z --json assets --jq '.assets[].name'` must list all four binaries (`switchroom-{linux,macos}-{amd64,arm64}`) **and** `switchroom-checksums.txt`. This is the gate that did not exist through v0.19.19 — every release up to then shipped **zero** assets and the advertised `curl | sh` installer (`install.sh`) was dead on every platform (#3633).
-- `release.yml` uploads to a release that must ALREADY EXIST — it deliberately does not invent one, so step 2's `gh release create` is a prerequisite, not optional. If the workflow failed with "no GitHub Release exists for …", create the release, then re-run: `gh workflow run release.yml --ref vX.Y.Z -f dry_run=false`.
-- To rehearse a change to this workflow without publishing anything: `gh workflow run release.yml --ref <branch>` (dry_run defaults to true — it builds, checksums and verifies the bundle, and attaches it as a workflow artifact only).
+### Gate B — the release pipeline (`release.yml`)
+- `gh run list --workflow=release.yml --limit 1` — wait for `completed` / `success`. Expect ~25-30 minutes: four native build legs plus the wait on `docker-images`.
+- Its jobs, in order: `guard` (release exists + held out of `latest`) → `build` ×4 → `bundle` → `publish` (attach) → `images-gate` (wait on docker-images) → `npm` → `finalize` (un-draft). A red job anywhere leaves the release a **draft** and npm **unpublished** — which is the correct, recoverable state.
+- Verify the release page actually has assets **and is no longer a draft**:
+  ```bash
+  gh release view vX.Y.Z -R switchroom/switchroom --json isDraft,assets \
+    --jq '{isDraft, assets: [.assets[].name]}'
+  ```
+  `isDraft` must be `false`, and `assets` must list all four binaries (`switchroom-{linux,macos}-{amd64,arm64}`) **and** `switchroom-checksums.txt`. This is the gate that did not exist through v0.19.19 — every release up to then shipped **zero** assets and the advertised `curl | sh` installer (`install.sh`) was dead on every platform (#3633).
+- Confirm the installer's own resolution path agrees:
+  ```bash
+  gh api repos/switchroom/switchroom/releases/latest --jq '{tag_name, assets: [.assets[].name]}'
+  ```
+  This is literally what `install.sh` calls. If it still reports the previous version, `finalize` did not run.
+
+### Gate C — npm publish
+- npm is published by the `npm` job **inside** the `release` run, not by a separate workflow run. `gh run list --workflow=npm-publish.yml` will show nothing new for a normal release — that is expected, not a failure.
+- Verify the publish is live: `npm view switchroom version` must return `X.Y.Z` (not the old version). Retry a few times — npm registry propagation can lag a few seconds.
 
 **Only when Gates A, B AND C are green + verified** do you proceed.
+
+### Rehearsing a workflow change without releasing anything
+`gh workflow run release.yml --ref <branch>` — `dry_run` defaults to `true`, so it builds, checksums and verifies the full bundle and attaches it as a workflow artifact, touching no GitHub Release, no npm, and no image tags. This is the only supported way to prove a change to the release pipeline before a real tag.
 
 ## Step 4 — Fleet rollout (operator-gated, canary-first)
 
@@ -69,14 +110,26 @@ The tag push triggers `docker-images`, `npm-publish` AND `release` in parallel. 
 
 - **Never bump `package.json` `version` in a commit.** It's a stale placeholder; the tag is the source of truth and `npm-publish.yml` does the uncommitted pack-time bump.
 - **Never run `npm publish` by hand from the agent container.** You can't reach the operator's npm auth, and the workflow is the reliable path. If the workflow is broken, fix the workflow — don't side-step it.
-- **Never roll the fleet before Gate A (npm) AND Gate B (images) are both green + verified.** A release that's on the fleet but not on npm is the exact regression this skill exists to prevent.
+- **Never create the GitHub Release without `--draft`,** and **never `gh release create --target main`.** Pin the SHA (step 2a).
+- **Never take the release out of draft by hand** while the pipeline is still running. `finalize` is the only thing that should publish it; un-drafting early puts an incomplete release on `/releases/latest` and breaks every installer.
+- **Never roll the fleet before Gates A, B AND C are green + verified.** A release that's on the fleet but not on npm is the exact regression this skill exists to prevent.
 - **Never push directly to `main`.** The CHANGELOG PR goes through auto-merge on green.
 - **Never force-push `main` or bypass hooks (`--no-verify`).**
 
 ## If something goes wrong
 
-- **npm-publish failed but the tag is already pushed:** fix + `gh workflow run npm-publish.yml --ref vX.Y.Z`. Do NOT roll until it's green + `npm view` confirms.
-- **Images failed but npm succeeded:** the npm package is live but the fleet can't roll yet. Fix the image workflow / re-run. (npm being ahead of images is fine — the CLI is published for npm consumers; the fleet waits on images.)
+**The single recovery command for almost everything is a re-dispatch of the orchestrator:**
+
+```bash
+gh workflow run release.yml -R switchroom/switchroom --ref vX.Y.Z -f dry_run=false
+```
+
+It re-runs every leg — including `finalize`, which is what actually takes the release out of draft. Re-running one leg on its own generally leaves the release stuck as a draft.
+
+- **`release` failed at `guard` ("no GitHub Release exists"):** step 2b was skipped or the tag name is misspelled. Create the draft release, then re-dispatch as above.
+- **`release` failed at `images-gate`:** `docker-images` was not green for this tag+commit. Fix it, `gh workflow run docker-images.yml --ref vX.Y.Z`, wait for green, then re-dispatch `release.yml`. Nothing was published to npm and the release is still a draft — nothing to undo.
+- **`release` failed at `npm` (e.g. a transient npm 5xx):** re-dispatch `release.yml` as above. `npm-publish` treats "already published" as success, so a re-run is safe and idempotent. Dispatching `npm-publish.yml --ref vX.Y.Z` directly also works and its own gates still apply, but it will NOT un-draft the release, so you would then have to re-dispatch `release.yml` anyway.
+- **Everything is green but the release is still a draft:** `finalize` did not run. Check `gh run view <run-id>` for a skipped job, then re-dispatch. Do not hand-publish — `finalize` re-verifies the asset set immediately before flipping the flag.
 - **Rollout started before publish verified (the old bug):** abort the rollout, publish, then re-roll. Do not let a half-published release sit on the fleet.
 
 ## Operator one-time setup (tell them once, not every release)

@@ -373,24 +373,47 @@ published to npm because publish wasn't gated. Don't let that recur.
   `scripts/build.mjs:resolveVersion()`. The committed `package.json`
   `version` is a stale placeholder by design (see its `//version` comment) —
   never bump it in a commit. Release = CHANGELOG consolidation PR → merge →
-  tag `vX.Y.Z` on the merge commit → push tag (triggers `docker-images`
-  AND `npm-publish` in parallel).
-- **npm publish is automated by `.github/workflows/npm-publish.yml`** on
-  tag push: it does the uncommitted pack-time `package.json` bump, builds,
-  verifies `dist/cli/switchroom.js` is non-empty AND in the tarball (the
-  v0.12.6→7 empty-build guard), `npm publish --ignore-scripts
-  --provenance`, and verifies `npm view switchroom version` shows the new
-  version. Needs the `NPM_TOKEN` repo secret (set once). **Do NOT roll
-  the fleet until this workflow is green AND `npm view switchroom version`
-  returns the tag version.** Never run `npm publish` by hand from an
-  agent container (no npm auth there); fix the workflow, don't side-step
+  **pin `SHA=$(git rev-parse origin/main)`** → `gh release create vX.Y.Z
+  --draft --target "$SHA"` → `git push origin "$SHA:refs/tags/vX.Y.Z"`.
+  Never `--target main`: it resolves server-side and agents merge in
+  parallel, so an unrelated PR can be swallowed into the release.
+- **`.github/workflows/release.yml` is the release ORCHESTRATOR (#3654).**
+  A tag push starts exactly two workflows — `docker-images` and `release` —
+  and `release` sequences everything else: attach the four static binaries →
+  wait for `docker-images` to conclude `success` for that exact tag+commit →
+  `workflow_call` into `npm-publish.yml` → un-draft the GitHub Release.
+  **`npm-publish.yml` has NO tag trigger.** npm is the only irreversible leg,
+  so it runs last, and it re-proves both preconditions from inside its own
+  run — a hand `workflow_dispatch` cannot half-ship either. Any red leg
+  leaves the release a draft with npm unpublished, which is recoverable;
+  re-dispatch `release.yml --ref vX.Y.Z -f dry_run=false` to resume.
+- **The GitHub Release is created as a DRAFT and only `finalize` publishes
+  it.** `install.sh` resolves the version from `/releases/latest`, which
+  excludes drafts — so an in-flight or failed release leaves the previous
+  complete release serving `curl | sh` installs. Creating it published is
+  the v0.19.19 failure (published, zero assets, `latest`, installer 404 on
+  every platform); `release.yml`'s `guard` job re-drafts an incomplete
+  published release within ~1 minute as the safety net.
+- **npm publish (`.github/workflows/npm-publish.yml`)** does the uncommitted
+  pack-time `package.json` bump, builds, verifies `dist/cli/switchroom.js`
+  is non-empty AND in the tarball (the v0.12.6→7 empty-build guard),
+  `npm publish --ignore-scripts --provenance`, and verifies `npm view
+  switchroom version` shows the new version. Needs the `NPM_TOKEN` repo
+  secret (set once). **Do NOT roll the fleet until `npm view switchroom
+  version` returns the tag version.** Never run `npm publish` by hand from
+  an agent container (no npm auth there); fix the workflow, don't side-step
   it. Release builds need a **real `node_modules`**, not a worktree
   symlink — a symlinked one made `bun build` silently emit an empty
   `dist/cli/` (broke v0.12.6→7); the workflow's setup-switchroom action
   avoids this and the empty-build guard catches it.
-- Create the GitHub Release (`gh release create`) — historically silently
-  dropped. The naive `awk '/^## vX/,/^## v/'` CHANGELOG range collapses to
-  one line; use a start-flag awk instead.
+- **Both release workflows keep every `${{ }}` out of `run:` bodies** — they
+  hold `contents: write` and `NPM_TOKEN`, and an interpolated expression is
+  materialised into the script file on the runner where log masking cannot
+  reach it. `tests/release-pipeline-gating.test.ts` fails the build if one
+  reappears, and mutation-tests every gating rule (neither workflow runs on
+  a PR, so a broken gate would otherwise only surface at the next release).
+- The naive `awk '/^## vX/,/^## v/'` CHANGELOG notes range collapses to one
+  line; use a start-flag awk instead.
 - The web container is a separate compose project
   (`~/.switchroom/web/docker-compose.yml`) — `switchroom update` doesn't
   touch it; pull + up manually.

@@ -2,6 +2,97 @@
 
 ## Unreleased
 
+### A `v*` tag can no longer half-ship — release.yml is now the orchestrator (#3654)
+
+Three workflows fired independently on a `v*` tag with nothing cross-gating
+them: `docker-images`, `release` (added by #3665) and `npm-publish`. Any one
+could go red while the others shipped. The worst ordering was routine, not
+exotic — **npm publishes in ~2 minutes; the four native binary legs take
+~25** — so the default outcome of a broken build was `switchroom@X.Y.Z`
+permanently on npm, advertising a `curl | sh` install path pointing at
+release assets that do not exist. npm has no undo.
+
+The second half was live in production while this was written:
+`/releases/latest` was **v0.19.19, `draft: false`, `assets: []`**. That is the
+exact object `install.sh` resolves (`install.sh:76`), so every `curl | sh`
+install on every platform was 404ing on the asset download — and it had been
+since the moment `gh release create` ran, ~25 minutes before the binaries
+would even have been ready.
+
+**`npm-publish.yml` no longer has a `push` trigger.** It is reachable only via
+`workflow_call` from `release.yml` (as the last job, after the assets are
+attached *and* `docker-images` is confirmed green for that exact tag+commit)
+and via `workflow_dispatch` for recovery.
+
+**`release.yml` sequences the pipeline:** `guard` → `build` ×4 → `bundle` →
+`publish` → `images-gate` → `npm` → `finalize`. Plain `needs:` throughout —
+no `always()`, no `!cancelled()`, no `continue-on-error` anywhere on the
+chain, since each of those turns an upstream failure into a green publish.
+
+**The GitHub Release is held as a draft until every leg is green.**
+`/releases/latest` excludes drafts, so an in-flight or failed release leaves
+the *previous complete* release serving installs instead of breaking them.
+`finalize` is the only thing that un-drafts, and it re-derives the expected
+asset set from `install.sh` immediately before flipping the flag rather than
+trusting the upstream job. The `guard` job runs with **no `needs:`** so that a
+release created without `--draft` is pulled back within ~1 minute instead of
+sitting broken on `latest` for the whole build — and so a missing release
+fails the run in ~3 minutes rather than after ~25 minutes of macOS runner
+time.
+
+**Ordering is a convention; the self-gate is the guarantee.** `npm-publish.yml`
+re-proves both preconditions *from inside its own run* before anything
+irreversible: the release for the tag carries every asset `install.sh` asks
+for, and `docker-images` concluded `success` for that tag+commit. So a hand
+dispatch cannot bypass the ordering either.
+
+Two small pure scripts own every decision, so the shell owns only time:
+- `scripts/ci/classify-workflow-run.mjs` — success / failed / pending for a
+  workflow run. `head_sha` alone is **ambiguous**, verified against the live
+  API: commit `0bdb34ec` (v0.19.19) has two `docker-images` runs, one with
+  `head_branch: "v0.19.19"` and one with `head_branch: "main"`. Matching also
+  on `head_branch` is what separates them. Verdict is an allow-list on
+  `conclusion === "success"`, and no-match is **pending, never success**, so
+  a wrong assumption fails closed.
+- `scripts/ci/assert-release-assets-complete.mjs` — expected assets derived
+  from `install.sh` via the existing `scripts/release-assets.mjs`, never
+  hard-coded, so adding a platform to the installer automatically makes it
+  required at the gate. Uses the *list* endpoint because
+  `/releases/tags/{tag}` hides drafts — the one state that matters here.
+
+`docker-images.yml` was deliberately **not** converted to a reusable workflow.
+It also serves every PR and main push and carries the `images-ok` required
+check, and more decisively: a `workflow_call` conversion could only be proven
+correct by cutting a real tag, and if any assumption in it were wrong it would
+fail **open** (images mis-tagged). The polling gate's failure mode is closed
+(no matching run ⇒ blocked). On a path that cannot be rehearsed, that
+asymmetry decides it.
+
+**Tested by mutation, because neither workflow runs on a pull request.**
+A dropped `needs:`, a re-added `push` trigger or a stray `if: always()` would
+otherwise be invisible until the next real release, when the damage is an
+unpublishable npm version. `tests/release-pipeline-gating.test.ts` expresses
+nine rules over the parsed workflows and proves each one by weakening a clone
+until it goes red; `tests/release-gate-scripts.test.ts` covers the two scripts
+including the main-push-run rejection and the eight non-success conclusions.
+Rule R8 also pins the script-injection discipline: **no `${{ }}` inside any
+`run:` body** in either workflow — these hold `contents: write` and
+`NPM_TOKEN`, and an interpolated expression is written into the script file on
+the runner where log masking cannot reach it. `npm-publish.yml` had five, two
+of them `${{ secrets.NPM_TOKEN }}`; all now pass through `env:`.
+
+`skills/switchroom-release/SKILL.md` now **pins an explicit SHA**
+(`gh release create --target "$SHA"`, then `git push origin
+"$SHA:refs/tags/vX.Y.Z"`) instead of `--target main`, which resolves
+server-side — with agents merging PRs in parallel, a PR landing between the
+pre-flight check and the create call was silently swallowed into the release.
+
+Not closed by this: `docker-images` still moves the `:latest` **image** tag on
+a tag push regardless of the other legs. Deliberate scope — image tags are
+retaggable (`promote.yml`) where npm and `/releases/latest` are not, and
+converting the workflow that also serves every PR and main push (and carries
+the `images-ok` required check) to gate the one *recoverable* leg is the
+inverse trade of the npm case. Tracked in #3685 with the candidate shapes.
 ### A runtime probe for the perturbed-JSON-retry patch, so a silent revert fails CI
 
 #3669 shipped the perturbed-JSON-retry patch with two of the three layers the
@@ -201,7 +292,8 @@ this change, which already applied to `docker-images` + `npm-publish`; this
 adds a third leg to it). The `switchroom-release` skill's Gate C is the
 process-side mitigation until #3654 lands a mechanism: a release is not done
 until `gh release view vX.Y.Z --json assets` lists all four binaries plus the
-checksums file.
+checksums file. *(Closed in Unreleased — see "A `v*` tag can no longer
+half-ship".)*
 
 ### The LiteLLM virtual-key model allowlist now has a declarative home, and unreachable lanes FAIL doctor
 
