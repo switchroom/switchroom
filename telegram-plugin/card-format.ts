@@ -62,6 +62,37 @@ export { escapeMarkdown, codeSpanSafe }
  */
 export const COLLAPSE_SAFE_SEPARATOR = '\u00A0'
 
+/**
+ * Normalise a line's tail before `stackCardLines` re-terminates it.
+ *
+ * Two strips, both there for the SAME reason: this function must be idempotent,
+ * so re-stacking an already-stacked body can never accumulate terminator
+ * characters.
+ *
+ *   - trailing ASCII whitespace, so exactly one `  \n` hard break is emitted;
+ *   - in `collapseSafe` mode, any `COLLAPSE_SAFE_SEPARATOR` run the line
+ *     already carries (interleaved with ASCII whitespace, since a caller may
+ *     have split the body on `\n` rather than on `  \n`), so exactly one
+ *     separator is emitted.
+ *
+ * The separator strip is written against the CONSTANT, not against a hardcoded
+ * U+00A0, so it stays correct if the separator is ever strengthened to visible
+ * ink. That one-constant seam is what COLLAPSE_SAFE_SEPARATOR's own doc comment
+ * promises, and it would be a lie if this strip did not follow it.
+ */
+function normalizeLineTail(line: string, collapseSafe: boolean): string {
+  let out = line.replace(/[ \t\r]+$/, '')
+  // The length guard is not defensive noise: `''.endsWith('')` is true and
+  // `''.slice(0, -0)` is `''`, so an empty separator would spin this loop
+  // forever — a hang in the gateway's render path. The doc comment above the
+  // constant invites future edits to it, so make that edit unable to hang.
+  if (!collapseSafe || COLLAPSE_SAFE_SEPARATOR.length === 0) return out
+  while (out.endsWith(COLLAPSE_SAFE_SEPARATOR)) {
+    out = out.slice(0, -COLLAPSE_SAFE_SEPARATOR.length).replace(/[ \t\r]+$/, '')
+  }
+  return out
+}
+
 /** Options for `stackCardLines`. */
 export interface StackCardLinesOpts {
   /** Append `COLLAPSE_SAFE_SEPARATOR` to each hard-broken line so the stack
@@ -117,20 +148,28 @@ export function stackCardLines(
     const next = lines[i + 1].trim()
     // A blank current or next line is a genuine `\n\n` paragraph gap — leave
     // the separator a plain newline so the blank entry reconstructs the gap.
-    // No collapse separator here either: the blank entry already contributes a
-    // whitespace character of its own to a collapsed render.
     if (cur === '' || next === '') {
+      // The gap still needs a collapse separator when THIS line has content:
+      // a collapsing surface drops the `\n\n` with no substitute exactly as it
+      // drops a `  \n`, and the blank entry is the empty string, so it
+      // contributes NO character of its own to hold the two sides apart. Only
+      // when `cur` is blank is the separator skipped — appending it to a blank
+      // entry would turn the gap into a visible U+00A0 paragraph in the FEED.
+      if (collapseSafe && cur !== '') {
+        pieces[pieces.length - 1] = normalizeLineTail(line, true) + COLLAPSE_SAFE_SEPARATOR
+      }
       pieces.push('\n')
       continue
     }
     // Strip any trailing whitespace the line already carried so we emit
-    // exactly one `  \n` hard break (never accumulate spaces on a re-run).
+    // exactly one `  \n` hard break (never accumulate spaces on a re-run) and,
+    // under collapseSafe, exactly one separator — see normalizeLineTail.
     // The collapse separator is appended AFTER the strip (it is not ASCII
     // whitespace, so it survives both this strip and the markdown parser's
     // own trailing-whitespace handling) and BEFORE the two hard-break spaces,
     // which stay immediately adjacent to the `\n` so the break still parses.
     pieces[pieces.length - 1] =
-      line.replace(/[ \t\r]+$/, '') + (collapseSafe ? COLLAPSE_SAFE_SEPARATOR : '')
+      normalizeLineTail(line, collapseSafe) + (collapseSafe ? COLLAPSE_SAFE_SEPARATOR : '')
     pieces.push('  \n')
   }
   return pieces.join('')
