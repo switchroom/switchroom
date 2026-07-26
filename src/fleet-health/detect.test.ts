@@ -159,3 +159,36 @@ describe("scanAgent escalation decision", () => {
     expect(res.findings).toHaveLength(0);
   });
 });
+
+/**
+ * #3702 — a backstop delivery whose read-back probe was inconclusive is counted
+ * `complete` on the Bot API's ack alone. `landed_unconfirmed` on the turn row is
+ * the measurement of how often that bet is made; the scan surfaces the count so
+ * it is visible in the digest WITHOUT becoming a failure signal (escalating it
+ * would recreate the phantom `send_failed` cluster it exists to explain).
+ */
+describe("scanAgent landed_unconfirmed accounting (#3702)", () => {
+  it("counts turns whose delivery was never corroborated", () => {
+    const text = [
+      turn(1, {}), // ordinary row — field absent
+      turn(2, { landed_unconfirmed: 2 }),
+      turn(3, { landed_unconfirmed: 1 }),
+      turn(4, { landed_unconfirmed: 0 }), // explicitly zero ⇒ not counted
+    ].join("\n");
+    const res = scanAgent("alpha", text, "");
+    expect(res.landed_unconfirmed_turns).toBe(2);
+  });
+
+  it("is NOT a failure signal — it neither escalates nor emits a finding", () => {
+    const res = scanAgent("alpha", turn(1, { landed_unconfirmed: 3 }), "");
+    expect(res.landed_unconfirmed_turns).toBe(1);
+    expect(res.escalate).toBe(false);
+    expect(res.findings).toHaveLength(0);
+    expect(res.status_mix).toEqual({ complete: 1 });
+  });
+
+  it("is zero on a fleet that never made the bet", () => {
+    const res = scanAgent("alpha", turn(1, {}) + "\n" + turn(2, {}), "");
+    expect(res.landed_unconfirmed_turns).toBe(0);
+  });
+});

@@ -14,8 +14,8 @@
  *
  * ── The fix (design-of-record §2.2) ─────────────────────────────────────────
  * Make the re-present a *byte-identical captured-answer resume* of ONLY the
- * not-yet-`landed-confirmed` tail — never a regeneration — so a chunk that
- * already reached the chat is provably never re-posted:
+ * not-yet-LANDED tail — never a regeneration — so a chunk that already reached
+ * the chat is provably never re-posted:
  *
  *   1. On a partial (`!delivered`) turn-flush, persist a {@link
  *      CapturedDeliverySnapshot} (the split chunks + each landed chunk's ids and
@@ -25,9 +25,9 @@
  *   2. The obligation sweep's `represent` branch becomes source-aware: when the
  *      obligation carries a captured-delivery snapshot it drives THIS resume
  *      (re-run `runBackstopDelivery` for the SAME `turnId` and the SAME captured
- *      chunks, resuming at the first non-`landed-confirmed` index) instead of
- *      pushing a fresh-generation inbound. No snapshot ⇒ the genuine "model wrote
- *      nothing / never fired a backstop" case falls through to fresh generation
+ *      chunks, resuming at the first UNSENT index) instead of pushing a
+ *      fresh-generation inbound. No snapshot ⇒ the genuine "model wrote nothing
+ *      / never fired a backstop" case falls through to fresh generation
  *      unchanged.
  *   3. The in-memory ledger is rehydrated from the snapshot AND reconciled against
  *      the durable outbound-text oracle (`hasOutboundWithText`), so a chunk that
@@ -39,8 +39,28 @@
  * chunks (not a regenerated answer). #3278's per-chunk state machine
  * (`unsent → pending → landed-unconfirmed → {landed-confirmed | unsent}`) binds
  * here too: the resume re-PROBES `landed-unconfirmed` chunks (never re-sends
- * them) and re-SENDS only `unsent` ones, so a confirmed chunk is never duplicated
+ * them) and re-SENDS only `unsent` ones, so a landed chunk is never duplicated
  * by either the in-fire retry OR the cross-represent resume.
+ *
+ * ── The CLOSE condition is LANDED, not confirmed (#3702) ────────────────────
+ * `runBackstopDelivery`'s verdict is evidence-based: every chunk landed a
+ * message id and at least one is a fresh non-card id. An inconclusive read-back
+ * does not lower it (only a POSITIVE `absent`, which demotes the chunk back to
+ * `unsent`, does). So a resume over a snapshot whose chunks ALL landed but were
+ * never corroborated closes the obligation having sent NOTHING — the re-probe
+ * ran, resolved nothing, and the landed-id evidence stood.
+ *
+ * That is deliberate, not an oversight. The alternative — keep the obligation
+ * OPEN because nothing corroborated the ids — has no corrective action
+ * available: the resume never re-sends a LANDED chunk, so every subsequent
+ * represent would re-run the same shed probe, send zero messages, and burn
+ * represent budget until the cap escalates a false "the agent never answered
+ * you" nudge to the operator. Representing cannot deliver anything the first
+ * delivery did not; the only thing it can produce is noise. When the durable
+ * outbound-text oracle CAN corroborate (history enabled + the row present) it
+ * confirms the chunk at hydration and the same close happens by the older
+ * `hasOutboundWithText` route — this path is the same decision when that oracle
+ * is unavailable.
  *
  * This module is PURE state + orchestration over injected effects — no Telegram,
  * no SQLite, no gateway module state — so the resume decision is unit-testable
@@ -55,10 +75,10 @@ import type { CapturedDeliverySnapshot, Obligation } from './obligation-ledger.j
 /**
  * Build the durable {@link CapturedDeliverySnapshot} from the live per-chunk
  * ledger after a partial `runBackstopDelivery`. Captures every LANDED chunk's
- * message ids + confirmed flag so the resume can (a) never re-send a confirmed
- * chunk and (b) re-PROBE a landed-unconfirmed chunk instead of blindly re-sending
- * it. Chunks that never landed (send threw) are simply absent → the resume treats
- * them as `unsent` and re-sends them. Pure.
+ * message ids + confirmed flag so the resume can (a) never re-send a chunk that
+ * already landed and (b) re-PROBE a landed-unconfirmed chunk instead of blindly
+ * re-sending it. Chunks that never landed (send threw) are simply absent → the
+ * resume treats them as `unsent` and re-sends them. Pure.
  */
 export function buildCapturedDeliverySnapshot(
   ledger: BackstopDeliveryLedger,
@@ -165,9 +185,13 @@ export interface CapturedResumeDispatcher {
  * The obligation-sweep's captured-answer resume driver. Owns the in-flight guard
  * + the deliver→close/leave-open orchestration so the gateway sweep stays a
  * two-line dispatch. On each dispatch it consumes one represent-budget unit
- * (bounding the ladder → escalate), re-delivers only the non-confirmed tail, and:
+ * (bounding the ladder → escalate), re-delivers only the UNSENT tail (a landed
+ * chunk is re-probed, never re-sent), and:
  *   - fully delivered ⇒ record the supersede tail, close the obligation, GC the
- *     ledger (the represent ladder stops);
+ *     ledger (the represent ladder stops). Since #3702 "delivered" means every
+ *     chunk LANDED — so a snapshot that is already fully landed closes here
+ *     having sent nothing (see the module header for why that is the right
+ *     call, and why leaving it OPEN would only manufacture a false escalation);
  *   - still partial / error ⇒ leave the obligation OPEN so the next eligible
  *     sweep (after the per-represent grace) retries, until the represent cap
  *     escalates it to the operator nudge — no infinite loop.
@@ -176,7 +200,7 @@ export function createCapturedResumeDispatcher(ports: CapturedResumePorts): Capt
   const stderr = ports.stderr ?? (() => {})
   const inFlight = new Set<string>()
 
-  /** Re-deliver the non-confirmed tail of `o`'s captured answer, byte-identical,
+  /** Re-deliver the UNSENT tail of `o`'s captured answer, byte-identical,
    *  by rehydrating the per-chunk ledger from the snapshot reconciled against the
    *  durable text oracle. Never regenerates. */
   function deliver(o: Obligation, snapshot: CapturedDeliverySnapshot): Promise<{ delivered: boolean; sentIds: number[] }> {
@@ -221,16 +245,21 @@ export function createCapturedResumeDispatcher(ports: CapturedResumePorts): Capt
       if (delivered) {
         ports.obligationLedger.close(o.originTurnId)
         ports.backstopDeliveryLedger.clear(o.originTurnId)
+        // `sentIds` is `ledger.sentIds()` — every LANDED id, which since #3702
+        // routinely includes ids no read-back corroborated. Say "landed", not
+        // "confirmed": claiming confirmation for an uncorroborated id is exactly
+        // the overstatement this PR removed from the delivery verdict.
         stderr(
           `telegram gateway: captured-answer resume delivered — origin=${o.originTurnId} ` +
-            `${sentIds.length} chunk(s) confirmed; obligation closed\n`,
+            `${sentIds.length} message id(s) landed; obligation closed\n`,
         )
       } else {
-        // Tail still not confirmed — leave the obligation OPEN for the next paced
-        // sweep / escalation (bounded by the represent cap).
+        // Not fully landed (a chunk never got an id, or a positive `absent`
+        // demoted one) — leave the obligation OPEN for the next paced sweep /
+        // escalation (bounded by the represent cap).
         stderr(
           `telegram gateway: captured-answer resume partial — origin=${o.originTurnId} ` +
-            `tail still not confirmed; left OPEN for retry\n`,
+            `tail still not landed; left OPEN for retry\n`,
         )
       }
     } catch (err) {

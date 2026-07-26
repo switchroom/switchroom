@@ -148,6 +148,20 @@ export interface TurnRecordRow {
   tools: number
   status: TurnStatus
   turn_id: string
+  /**
+   * How many landed message ids of this turn's backstop delivery the read-back
+   * probe never corroborated (`sentIds` minus the confirmed subset). OMITTED
+   * when zero, so an ordinary row is byte-identical to before.
+   *
+   * This is the measurable counterpart of the delivery verdict: since an
+   * inconclusive probe counts as delivered, a `complete` row carrying
+   * `landed_unconfirmed > 0` is a turn we called delivered on the Bot API's
+   * ack alone. Counting those is how the fleet can tell whether that optimism
+   * is ever wrong (a `landed_unconfirmed` turn followed by a "you never
+   * answered me" is the falsifying observation). It is NOT a failure signal and
+   * nothing escalates on it.
+   */
+  landed_unconfirmed?: number
 }
 
 /**
@@ -165,6 +179,7 @@ export function buildTurnRecord(
     turnId: string
     finalAnswerDelivered: boolean
     deliveryOutcome?: DeliveryOutcome
+    landedUnconfirmed?: number
   },
   endedAt: number,
 ): TurnRecordRow {
@@ -175,5 +190,9 @@ export function buildTurnRecord(
     tools: turn.toolCallCount ?? 0,
     status: computeTurnStatus(turn),
     turn_id: turn.turnId,
+    // Emitted ONLY when non-zero (see `TurnRecordRow.landed_unconfirmed`).
+    ...(turn.landedUnconfirmed != null && turn.landedUnconfirmed > 0
+      ? { landed_unconfirmed: turn.landedUnconfirmed }
+      : {}),
   }
 }

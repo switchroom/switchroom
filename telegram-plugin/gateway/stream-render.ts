@@ -1856,6 +1856,12 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
             sentIds = delivery.sentIds
             chunkCount = delivery.chunkCount
             delivered = delivery.delivered
+            // #3702 — how many landed ids the read-back never corroborated.
+            // Stamped on the turn so `emitTurnRecord` writes `landed_unconfirmed`
+            // (omitted when 0): the fleet-visible counter for deliveries we call
+            // `complete` on the Bot API's ack alone, because the probe is
+            // inconclusive. Observational only — it never changes the status.
+            turn.landedUnconfirmed = delivery.landedUnconfirmed
 
             // #546 dedup: record what turn-flush just sent so a late-arriving
             // reply / stream_reply with the same content gets suppressed.
