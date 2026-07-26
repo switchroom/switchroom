@@ -1290,8 +1290,33 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     expect(lines[0].startsWith('🛠')).toBe(true)
   })
 
-  it('WORKER_STEP_INDENT contains no ASCII space or tab (Telegram would drop it)', () => {
-    expect(WORKER_STEP_INDENT.length).toBeGreaterThan(0)
+  it('golden body — each worker header is immediately followed by ITS indented steps', () => {
+    // The assertions above are set-membership only: they count step lines and
+    // header lines and check prefixes independently, so a refactor that emitted
+    // all three headers and THEN all six steps — nesting completely destroyed —
+    // would still pass every one of them. This pins the full line ORDER, which
+    // is the actual thing the fix is for: a step must sit under its own worker.
+    const body = renderCombinedWorkerFeed(rowsFor(3), { maxRows: 8 })!
+    const I = WORKER_STEP_INDENT
+    expect(linesOf(body)).toEqual([
+      '🛠 **Workers** · _3 running_',
+      '**1. worker task 1** _· 1m00s · 3 tools_',
+      `${I}~~_✓ w1 step a_~~`,
+      `${I}**→ w1 step b**`,
+      '**2. worker task 2** _· 2m00s · 3 tools_',
+      `${I}~~_✓ w2 step a_~~`,
+      `${I}**→ w2 step b**`,
+      '**3. worker task 3** _· 3m00s · 3 tools_',
+      `${I}~~_✓ w3 step a_~~`,
+      `${I}**→ w3 step b**`,
+    ])
+  })
+
+  it('WORKER_STEP_INDENT is exactly three U+00A0 — no ASCII space or tab', () => {
+    // Pin the WIDTH, not just the character class. A `/^[\u00A0]+$/` shape
+    // check alone stays green if the indent is trimmed to a single U+00A0,
+    // which reads as near-flat on a phone and silently undoes this fix.
+    expect(WORKER_STEP_INDENT).toBe('\u00A0'.repeat(3))
     expect(/^[\u00A0]+$/.test(WORKER_STEP_INDENT)).toBe(true)
   })
 
@@ -1317,10 +1342,23 @@ describe('combined worker card — steps indent under their worker (U+00A0)', ()
     expect(wire).toBe(body)
     expect(wire.includes(`${WORKER_STEP_INDENT}**→ w1 step b**`)).toBe(true)
     expect(wire.includes(`${NBSP}**→ w1 step b**`)).toBe(true)
-    // Independent CommonMark/GFM oracle: still well-formed on the rich path.
+    // Adding the indent introduced no fence/emphasis corruption.
+    //
+    // Scope, deliberately understated: `validateRichMarkdown` checks fence
+    // balance, unterminated inline code/links, and emphasis pairing ONLY (see
+    // tests/rich-markdown-oracle.ts). It models NEITHER leading-whitespace
+    // stripping NOR indented code blocks, so a regression to four ASCII spaces
+    // would ALSO return `[]` here. This is NOT rendering evidence and must not
+    // be read as proof that the indent survives Telegram's parser — that
+    // question is server-side and unobservable from this repo (see the honest
+    // limit note on WORKER_STEP_INDENT in status-no-truncate.ts). The byte
+    // assertions above are what discriminate an ASCII indent.
     expect(validateRichMarkdown(wire)).toEqual([])
-    // …and the indent stays OUTSIDE the entities — it must not leak into the
-    // bold/strike spans (which would render the NBSPs inside the styled text).
+    // …and the indent stays OUTSIDE the markdown spans — it must not land
+    // inside an emphasis run (which would style the NBSPs). Note this checks
+    // OUR OWN capture regexes in the oracle, not Telegram's real entity
+    // offsets; it pins where we place the indent relative to the `**`/`~~`
+    // delimiters, which is the part this repo actually controls.
     const ents = parseRichEntities(wire)
     expect(ents.some((e) => e.type === 'bold' && e.text === '→ w1 step b')).toBe(true)
     expect(ents.some((e) => e.type === 'strikethrough' && e.text === '_✓ w1 step a_')).toBe(true)
