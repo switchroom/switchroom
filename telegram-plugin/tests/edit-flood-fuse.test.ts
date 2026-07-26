@@ -13,7 +13,7 @@ import {
   createEditFloodFuse, installEditFloodFuse, EDIT_FLOOD_FUSE_DEFAULTS,
   type FuseInstallable,
 } from '../edit-flood-fuse.js'
-import type { Clock } from '../send-gate.js'
+import { SEND_GATE_DEFAULTS, type Clock } from '../send-gate.js'
 
 const CHAT = '1001'
 
@@ -308,13 +308,124 @@ describe('edit-flood fuse — structural: installed where nothing can bypass it'
     expect(fuse.stats().deferred).toBe(0)
   })
 
-  it('defaults sit above every legitimate cadence in the codebase', () => {
-    // The worker feed's own min edit interval is 2500ms (≤24 edits/min for a
-    // chat) and the send gate's cosmetic per-message budget is 30/min. The
-    // fuse must bind only on a genuine runaway, so its per-message ceiling is
-    // below those but its per-CHAT ceiling is not.
-    expect(EDIT_FLOOD_FUSE_DEFAULTS.perMessageMaxPerWindow).toBeLessThan(24)
-    expect(EDIT_FLOOD_FUSE_DEFAULTS.perChatEditMaxPerWindow).toBeGreaterThanOrEqual(24)
+  // Review 2026-07-26 (R1). This test used to be titled "defaults sit above
+  // every legitimate cadence in the codebase" while asserting
+  // `perMessageMaxPerWindow < 24` — i.e. it asserted the OPPOSITE of its own
+  // name, and green-lit a false claim in the PR description. The defaults are
+  // fine; the story about them was wrong. Retitled and re-pointed at the
+  // property that is actually true and actually load-bearing.
+  it('defaults are a BINDING ceiling below the send gate\'s own permitted cadence', () => {
+    // The send gate's 1500ms edit floor permits 40 edits/min/message and its
+    // cosmetic budget permits 30/min. Telegram's per-group limit is ~20/min
+    // and edits count against it — so the in-repo "legitimate" cadences are
+    // themselves above what Telegram tolerates. The fuse therefore sits BELOW
+    // them on purpose and IS the binding constraint on a hot card.
+    const gateFloorPerMin = 60_000 / SEND_GATE_DEFAULTS.editFloorMs
+    expect(EDIT_FLOOD_FUSE_DEFAULTS.perMessageMaxPerWindow).toBeLessThan(gateFloorPerMin)
+    // A per-chat ceiling below the per-message ceiling would make the
+    // per-message tier unreachable and route every over-budget frame through
+    // the drop-capable chat tier instead of the supersede-capable message one.
+    expect(EDIT_FLOOD_FUSE_DEFAULTS.perChatEditMaxPerWindow)
+      .toBeGreaterThanOrEqual(EDIT_FLOOD_FUSE_DEFAULTS.perMessageMaxPerWindow)
+    // A defer that could outlast the window it is waiting on would drop frames
+    // that were about to get room anyway.
+    expect(EDIT_FLOOD_FUSE_DEFAULTS.maxDeferMs)
+      .toBeLessThan(EDIT_FLOOD_FUSE_DEFAULTS.perMessageWindowMs)
     expect(EDIT_FLOOD_FUSE_DEFAULTS.perMessageWindowMs).toBe(60_000)
+  })
+
+  it('fuses editMessageChecklist — the checklist tools drive one message id in a loop', async () => {
+    const clock = new FakeClock()
+    const landed: number[] = []
+    const fuse = createEditFloodFuse({ clock, perMessageMaxPerWindow: 3, perMessageWindowMs: 60_000 })
+    const inflight: Promise<unknown>[] = []
+    for (let i = 0; i < 40; i++) {
+      inflight.push(fuse.apply('editMessageChecklist',
+        { chat_id: CHAT, message_id: 77, checklist: { title: `v${i}` } },
+        async () => { landed.push(i); return true }))
+      await clock.advance(50)
+    }
+    await clock.advance(1_000)
+    const inWindow = landed.length
+    await clock.advance(EDIT_FLOOD_FUSE_DEFAULTS.maxDeferMs + 1_000)
+    await Promise.all(inflight)
+    // Pre-fix this method was absent from EDIT_METHODS, so all 40 passed
+    // straight through — the exact shape of the flood the fuse exists to stop.
+    expect(inWindow).toBeLessThanOrEqual(3)
+  })
+
+  it('paces sendRichMessage — the plugin\'s PRIMARY send — without ever dropping it', async () => {
+    const clock = new FakeClock()
+    const landed: number[] = []
+    const fuse = createEditFloodFuse({
+      clock, perChatSendMaxPerWindow: 2, perChatWindowMs: 10_000, maxDeferMs: 60_000,
+    })
+    const inflight: Promise<unknown>[] = []
+    for (let i = 0; i < 6; i++) {
+      inflight.push(fuse.apply('sendRichMessage', { chat_id: CHAT, rich_message: { markdown: `r${i}` } },
+        async () => { landed.push(i); return { message_id: i } }))
+    }
+    // Pre-fix `sendRichMessage` was not in SEND_METHODS, so `deferred` stayed 0
+    // and the "non-edit sends are paced" property covered nothing this gateway
+    // actually sends.
+    await clock.advance(1)
+    expect(fuse.stats().deferred).toBeGreaterThan(0)
+    await clock.advance(120_000)
+    await Promise.all(inflight)
+    expect(landed).toHaveLength(6)
+    expect(fuse.stats().dropped).toBe(0)
+  })
+})
+
+describe('edit-flood fuse — a card\'s LAST pending frame is never silently dropped', () => {
+  it('releases (late) rather than drops an edit that nothing newer will repaint', async () => {
+    const clock = new FakeClock()
+    const landed: string[] = []
+    // Per-message tier wide open; the per-CHAT edit tier is saturated by a
+    // DIFFERENT card, which is the tier whose over-budget mode is `drop`.
+    const fuse = createEditFloodFuse({
+      clock, perMessageMaxPerWindow: 100, perChatEditMaxPerWindow: 1,
+      perChatWindowMs: 600_000, maxDeferMs: 5_000,
+    })
+    // Card A burns the chat's only edit slot for the next 10 minutes.
+    await fuse.apply('editMessageText', { chat_id: CHAT, message_id: 1, text: 'A' },
+      async () => { landed.push('A'); return true })
+
+    // Card B's turn-final `finalize`: the ONE frame that paints its terminal
+    // state, with nothing behind it. Pre-fix this was dropped at the defer
+    // deadline and `true` was returned, so the send gate recorded a payload
+    // that never reached the screen and no-op-skipped every retry — card B
+    // stayed frozen mid-run for the rest of the session.
+    const finalize = fuse.apply('editMessageText', { chat_id: CHAT, message_id: 2, text: 'B done' },
+      async () => { landed.push('B done'); return true })
+    await clock.advance(10_000)
+    await finalize
+
+    expect(landed).toEqual(['A', 'B done'])
+    expect(fuse.stats().dropped).toBe(0)
+  })
+
+  it('still DROPS an over-budget frame when a newer frame for the same message is in flight', async () => {
+    const clock = new FakeClock()
+    const landed: string[] = []
+    const fuse = createEditFloodFuse({
+      clock, perMessageMaxPerWindow: 100, perChatEditMaxPerWindow: 1,
+      perChatWindowMs: 600_000, maxDeferMs: 5_000,
+    })
+    await fuse.apply('editMessageText', { chat_id: CHAT, message_id: 1, text: 'A' },
+      async () => { landed.push('A'); return true })
+
+    // Two frames for card 2 — the older one is genuinely stale, so the drop is
+    // honest and the ceiling still holds. Without this the fix would have
+    // turned the per-chat ceiling into pure pacing.
+    const stale = fuse.apply('editMessageText', { chat_id: CHAT, message_id: 2, text: 'v1' },
+      async () => { landed.push('v1'); return true })
+    const fresh = fuse.apply('editMessageText', { chat_id: CHAT, message_id: 2, text: 'v2' },
+      async () => { landed.push('v2'); return true })
+    await clock.advance(10_000)
+    await Promise.all([stale, fresh])
+
+    expect(fuse.stats().dropped).toBeGreaterThan(0)
+    expect(landed).not.toContain('v1')
   })
 })

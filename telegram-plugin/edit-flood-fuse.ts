@@ -48,10 +48,32 @@
  *     resumes at FULL rate; nothing in the stack previously reduced the
  *     sustained rate after a soft 429.
  *
- * This is a fuse, not a scheduler: it sits ABOVE every legitimate cadence in
- * the codebase (the worker feed's own floor is 2500ms ⇒ ≤24 edits/min across
- * a whole chat, and the send gate's cosmetic budget is 30/min per message)
- * and only binds when something has genuinely run away.
+ * ── Where the ceiling actually sits (review 2026-07-26, R1) ───────────────
+ * An earlier draft of this docblock claimed the fuse "sits ABOVE every
+ * legitimate cadence". That is FALSE and the claim mattered, so it is
+ * corrected here rather than deleted. The in-repo cadences are:
+ *
+ *   - send gate `editFloorMs` = 1500ms          ⇒ up to 40 edits/min/message
+ *   - send gate cosmetic budget 150 / 300s      ⇒ 30 edits/min/message
+ *   - worker feed's own floor 2500ms            ⇒ 24 edits/min/message
+ *
+ * The per-message ceiling here is 20/60s, i.e. BELOW all three. That is
+ * deliberate — Telegram's own per-group limit is ~20 messages/minute and
+ * edits count against it, so the *legitimate* cadences are themselves above
+ * what Telegram tolerates; that is precisely how `overlord` got banned while
+ * every in-repo pacer believed it was behaving. The fuse is therefore the
+ * BINDING constraint on a hot card, not a never-reached backstop.
+ *
+ * Because it binds routinely, "over budget" must never mean "silently
+ * lost". Two rules follow, and both are load-bearing:
+ *   - per-MESSAGE over-budget edits SUPERSEDE (newest wins, older frame is
+ *     discarded) — safe, because the frame that killed it will paint;
+ *   - per-CHAT over-budget edits may only be DROPPED while a NEWER frame for
+ *     that same message is still in flight to repaint it. When the waiting
+ *     frame is the only one for its card (a turn-final `finalize`, say) it is
+ *     RELEASED late instead of dropped. Dropping it would freeze the card
+ *     mid-run AND return `true` to the send gate, which would then record a
+ *     never-painted payload as on-screen and no-op-skip every retry.
  */
 
 import type { Bot } from 'grammy'
@@ -66,6 +88,12 @@ const EDIT_METHODS: ReadonlySet<string> = new Set([
   'editMessageMedia',
   'editMessageReplyMarkup',
   'editMessageLiveLocation',
+  // Review 2026-07-26 (R2): the checklist tools drive this one exactly like a
+  // card — `update_checklist` re-edits ONE message id in a loop
+  // (gateway.ts `_rawEditMessageChecklist`, called through `bot.api.raw`, which
+  // grammY routes through the transformer stack like everything else). Omitting
+  // it left a same-shaped flood path completely unfused.
+  'editMessageChecklist',
 ])
 
 /** Methods that CREATE user-visible output — paced, never dropped. */
@@ -73,6 +101,15 @@ const SEND_METHODS: ReadonlySet<string> = new Set([
   'sendMessage', 'sendPhoto', 'sendDocument', 'sendMediaGroup', 'sendAnimation',
   'sendVideo', 'sendVoice', 'sendAudio', 'sendSticker', 'sendLocation',
   'forwardMessage', 'forwardMessages', 'copyMessage', 'copyMessages',
+  // Review 2026-07-26 (R3): `sendRichMessage` is the plugin's PRIMARY send —
+  // every rich reply, every activity-card OPEN, every stream finalisation goes
+  // through it (`rich-send.ts`, `narrative-lane.ts`, `stream-render.ts`).
+  // Leaving it out meant the "non-edit sends are paced" property applied to
+  // almost nothing that this gateway actually sends. Sends are never dropped,
+  // so this only ever adds a bounded (`maxDeferMs`) delay under real pressure.
+  // NOTE: `sendRichMessageDraft` is deliberately NOT here — an ephemeral
+  // 30s-preview draft is high-cadence by design and is not a persisted message.
+  'sendRichMessage',
 ])
 
 export interface EditFloodFuseConfig {
@@ -131,6 +168,13 @@ interface Window {
   ts: number[]
   /** The newest waiter on this key; a fresh waiter supersedes it. */
   waiter: { kill: () => void } | null
+  /**
+   * How many calls for this key are currently inside `apply` (per-MESSAGE keys
+   * only). Read at the per-chat defer deadline: dropping is only honest while
+   * a NEWER frame for the same message is still in flight to repaint. See the
+   * docblock's "Where the ceiling actually sits" (R1).
+   */
+  inflight: number
 }
 
 /**
@@ -172,7 +216,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   function win(key: string): Window {
     let w = windows.get(key)
     if (w === undefined) {
-      w = { ts: [], waiter: null }
+      w = { ts: [], waiter: null, inflight: 0 }
       windows.set(key, w)
     }
     return w
@@ -198,7 +242,11 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     sinceEvict = 0
     const widest = Math.max(perMessageWindowMs, perChatWindowMs)
     for (const [k, w] of windows) {
-      if (w.waiter === null && (w.ts.length === 0 || w.ts[w.ts.length - 1]! <= now - widest)) {
+      // `inflight > 0` keeps a key whose caller is mid-wait: evicting it would
+      // hand that caller a stale Window object while a FRESH one (empty `ts`)
+      // took its place in the map, resetting the ceiling for everyone else.
+      if (w.waiter === null && w.inflight === 0
+        && (w.ts.length === 0 || w.ts[w.ts.length - 1]! <= now - widest)) {
         windows.delete(k)
       }
     }
@@ -264,6 +312,14 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
    */
   async function awaitRoom(
     key: string, windowMs: number, max: number, method: string, mode: WaitMode,
+    /**
+     * Consulted ONLY at the defer deadline for `mode: 'drop'`. Returning false
+     * converts the drop into a late release: this call is the last thing that
+     * will ever paint its message, so losing it is not "shedding a stale
+     * frame", it is freezing a card. Absent ⇒ drop unconditionally (the
+     * pre-review behaviour).
+     */
+    dropGuard?: () => boolean,
   ): Promise<number | null> {
     const w = win(key)
     const deadline = clock.now() + maxDeferMs
@@ -279,13 +335,14 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         // Held as long as we are willing to hold. An edit is dropped (the next
         // render carries full state); a send is released (losing a reply is
         // worse than a late one).
-        if (mode !== 'release') {
+        if (mode !== 'release' && (dropGuard === undefined || dropGuard())) {
           counters.dropped++
           onTrip?.({ method, key, action: 'dropped' })
           return null
         }
-        // A send is released rather than dropped, and still takes a slot so
-        // the window reflects what actually went out.
+        // A send — or an edit that nothing newer will repaint — is released
+        // rather than dropped, and still takes a slot so the window reflects
+        // what actually went out.
         w.ts.push(now)
         return now
       }
@@ -340,17 +397,30 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     if (isEdit) {
       if (msg == null) return runObserved(next)
       const msgKey = `m:${chat}:${msg}`
-      const msgSlot = await awaitRoom(msgKey, perMessageWindowMs, perMessageMax, method, 'supersede')
-      if (msgSlot === null) return DROPPED_RESULT as unknown as R
-      const chatKey = `ce:${chat}`
-      const chatSlot = await awaitRoom(chatKey, perChatWindowMs, perChatEditMax, method, 'drop')
-      if (chatSlot === null) {
-        // Denied by the second tier — hand the first tier's slot back so a
-        // dropped edit never consumes budget it did not use.
-        unreserve(msgKey, msgSlot)
-        return DROPPED_RESULT as unknown as R
+      const mw = win(msgKey)
+      // Counted BEFORE the first await so a frame that arrives while an older
+      // one is waiting is visible to that older one's `dropGuard`.
+      mw.inflight++
+      try {
+        const msgSlot = await awaitRoom(msgKey, perMessageWindowMs, perMessageMax, method, 'supersede')
+        if (msgSlot === null) return DROPPED_RESULT as unknown as R
+        const chatKey = `ce:${chat}`
+        const chatSlot = await awaitRoom(
+          chatKey, perChatWindowMs, perChatEditMax, method, 'drop',
+          // R1: only drop while something newer for THIS message is still in
+          // flight to repaint it. `> 1` = this frame plus at least one newer.
+          () => mw.inflight > 1,
+        )
+        if (chatSlot === null) {
+          // Denied by the second tier — hand the first tier's slot back so a
+          // dropped edit never consumes budget it did not use.
+          unreserve(msgKey, msgSlot)
+          return DROPPED_RESULT as unknown as R
+        }
+        return runObserved(next)
+      } finally {
+        mw.inflight--
       }
-      return runObserved(next)
     }
 
     const chatKey = `cs:${chat}`
