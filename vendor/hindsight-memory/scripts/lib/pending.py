@@ -271,11 +271,28 @@ RESPLIT_MAX_ENTRIES = int(
 RESPLIT_MAX_BYTES = int(
     os.environ.get("HINDSIGHT_PENDING_RESPLIT_MAX_BYTES") or (64 * 1024 * 1024)
 )
-# Fields `_build_entry` adds on top of the caller's payload. `enqueue()`
-# takes a PAYLOAD, so an entry read back off disk has to be stripped of them
-# before it can be re-enqueued (see `resplit_over_bound_entries`); leaving
-# them in would round-trip a stale `failed_at`/`attempt_count` into the new
-# entries and mis-order the queue.
+# Fields that belong to a queue ENTRY rather than to the caller's PAYLOAD.
+# `enqueue()` takes a payload, so an entry read back off disk has to be
+# stripped of them before it can be re-enqueued (see
+# `resplit_over_bound_entries`).
+#
+# Which members are load-bearing, checked against `_build_entry` (it is the
+# only writer of the first four):
+#
+#   - `attempt_count`, `last_attempt_at`, `dead_at` are LOAD-BEARING.
+#     `_build_entry` uses `setdefault` for `attempt_count` and never touches
+#     the other two, so leaving them in really does round-trip an exhausted
+#     retry budget — and a `last_attempt_at` from days ago paired with a
+#     fresh `attempt_count: 1` — straight into the new parts, sending a
+#     re-split part back toward `.dead` on its first failure.
+#   - `schema`, `failed_at`, `error_class`, `error_message` are
+#     DEFENCE-IN-DEPTH. `_build_entry` assigns all four unconditionally, so
+#     they cannot round-trip today. They are stripped anyway to keep the
+#     contract "what goes into `enqueue()` is a payload, not an entry" true
+#     of the dict itself, so no future `setdefault` here (as `attempt_count`
+#     already is) silently starts inheriting them. The strip is asserted on
+#     the payload, not only on the resulting entries — see
+#     `test_the_parts_carry_no_stale_attempt_metadata`.
 _ENTRY_ONLY_FIELDS = frozenset(
     {
         "schema",
@@ -283,9 +300,6 @@ _ENTRY_ONLY_FIELDS = frozenset(
         "error_class",
         "error_message",
         "attempt_count",
-        # `update_attempt` stamps this on every retry. It describes the OLD
-        # entry's attempt history, so carrying it into a fresh part would
-        # pair a `last_attempt_at` from days ago with `attempt_count: 1`.
         "last_attempt_at",
         "dead_at",
     }
@@ -802,7 +816,12 @@ def resplit_over_bound_entries() -> tuple[int, int]:
     A refusal here does NOT stamp the drop ledger
     (``record_refusal_as_drop=False``): the ledger means permanently lost and
     `switchroom doctor` fails on it, but the original is still queued and is
-    retried on every backlog drain, so stamping it would climb forever.
+    retried on every backlog drain, so stamping it would climb forever. The
+    same reasoning applies one level down, to a PER-PART failure — an
+    over-cap part, or a part whose write hit ENOSPC — which is why the drops
+    are collected on ``deferred_drops`` and only stamped
+    (``record_deferred_drops``) on the branches below where the original has
+    actually left the live queue.
 
     WHAT THIS COSTS, honestly. One entry becomes N, so the queue gets DEEPER
     (measured worst case on this fleet: 744,546 chars -> 23 parts). On a
@@ -823,6 +842,7 @@ def resplit_over_bound_entries() -> tuple[int, int]:
         payload = {k: v for k, v in entry.items() if k not in _ENTRY_ONLY_FIELDS}
         d = _ensure_dir()
         before = set(_list_entries(d))
+        deferred: list = []
         _first, returned = enqueue_parts(
             payload,
             RuntimeError(
@@ -830,6 +850,7 @@ def resplit_over_bound_entries() -> tuple[int, int]:
                 f"{limit}-char retain bound"
             ),
             record_refusal_as_drop=False,
+            deferred_drops=deferred,
         )
         # New FILES only. A queue-depth delta would be wrong in both
         # directions: 0 when a part deduped onto an existing entry (the
@@ -850,27 +871,56 @@ def resplit_over_bound_entries() -> tuple[int, int]:
             os.makedirs(dest_dir, mode=0o700, exist_ok=True)
             shutil.move(path, os.path.join(dest_dir, os.path.basename(path)))
         except OSError as e:
-            # The parts are already queued; leaving the original queued too
-            # means the memory is retained twice, which the upsert on
-            # document_id makes harmless. Losing it would not be.
+            if os.path.exists(path):
+                # The parts are already queued; leaving the original queued
+                # too means the memory is retained twice, which the upsert on
+                # document_id makes harmless. Losing it would not be.
+                print(
+                    f"[Hindsight] pending: re-split {os.path.basename(path)} "
+                    f"into {written} part(s) but could not archive the original "
+                    f"into {dest_dir} ({e}) — it STAYS QUEUED (never deleted)",
+                    file=sys.stderr,
+                )
+                continue
+            # The move failed because the original is NO LONGER IN THE QUEUE:
+            # writing the parts filled it and `_evict_to_fit` FIFO-shed the
+            # very entry being re-split (it is the oldest — the parts are all
+            # newer than it). Saying "STAYS QUEUED" here is simply false, and
+            # this is the line an operator reads under exactly that pressure.
+            # Nothing is lost — the parts carry the whole memory and the
+            # original is under `evicted_dir()` — but the entry IS retired
+            # from the live queue, so it counts like an archived one below.
             print(
                 f"[Hindsight] pending: re-split {os.path.basename(path)} into "
-                f"{written} part(s) but could not archive the original into "
-                f"{dest_dir} ({e}) — it STAYS QUEUED (never deleted)",
+                f"{written} queued part(s); the original could not be archived "
+                f"into {dest_dir} ({e}) because writing the parts filled the "
+                f"queue and it was itself evicted — it is NOT queued, it is "
+                f"under {evicted_dir()} (the parts carry the whole memory)",
                 file=sys.stderr,
             )
-            continue
+        else:
+            _trim_dir(dest_dir, RESPLIT_MAX_ENTRIES, RESPLIT_MAX_BYTES)
+            print(
+                f"[Hindsight] pending: re-split {os.path.basename(path)} "
+                f"({len(content)} chars, over the {limit}-char bound) into "
+                f"{written} queued part(s); the original is archived under "
+                f"{dest_dir}, not deleted",
+                file=sys.stderr,
+            )
 
-        _trim_dir(dest_dir, RESPLIT_MAX_ENTRIES, RESPLIT_MAX_BYTES)
+        # Reached only on the branches where the original has LEFT the live
+        # queue (archived, or evicted out from under the archive). Both are
+        # a completed re-split, so both count — the `continue` above used to
+        # skip the accounting on the evicted branch, returning (0, 0) after
+        # genuinely writing N parts, which silenced phase 0c's `_blog` line
+        # and under-reported `summary["resplit"]`.
         resplit += 1
         parts += written
-        print(
-            f"[Hindsight] pending: re-split {os.path.basename(path)} "
-            f"({len(content)} chars, over the {limit}-char bound) into "
-            f"{written} queued part(s); the original is archived under "
-            f"{dest_dir}, not deleted",
-            file=sys.stderr,
-        )
+        # And only now can a per-part failure be called a loss: the original
+        # is gone from the queue, so nothing will retry the parts that never
+        # got written. While it was still queued, stamping these would have
+        # failed `switchroom doctor` for a memory that was never lost.
+        record_deferred_drops(deferred)
     return resplit, parts
 
 
@@ -1179,6 +1229,21 @@ def record_drop(payload: dict, error: BaseException) -> int:
     return count_now
 
 
+def record_deferred_drops(drops: list) -> int:
+    """Stamp the ledger for drops ``enqueue_parts`` handed back deferred.
+
+    Call this ONLY once the caller's own copy of the memory has left the
+    live queue — that is the moment a per-part failure stops being a
+    retryable "nothing was written, the original stays queued" and becomes
+    the permanent loss ``record_drop`` claims. Returns how many were
+    recorded, so a caller can assert it stamped nothing on the keep-queued
+    branches.
+    """
+    for payload, error in drops:
+        record_drop(payload, error)
+    return len(drops)
+
+
 def enqueue(payload: dict, error: BaseException) -> Optional[str]:
     """Persist a failed retain payload.
 
@@ -1210,6 +1275,7 @@ def enqueue_parts(
     error: BaseException,
     *,
     record_refusal_as_drop: bool = True,
+    deferred_drops: Optional[list] = None,
 ) -> tuple[Optional[str], list[str]]:
     """``enqueue()``, plus EVERY path ``_enqueue_one`` handed back.
 
@@ -1229,9 +1295,20 @@ def enqueue_parts(
     two whole-memory refusals below. ``record_drop`` means "this memory is
     PERMANENTLY LOST" — `switchroom doctor` fails on a non-zero ledger — so
     a caller that keeps the memory queued when the refusal comes back must
-    not stamp it. Only the whole-memory refusals are suppressed; a per-part
-    failure inside ``_enqueue_one`` still records, because by then the other
-    parts are queued and the caller will retire its copy.
+    not stamp it.
+
+    ``deferred_drops`` closes the same hole on the PER-PART door. A per-part
+    failure inside ``_enqueue_one`` (its own ``MAX_BYTES`` refusal, or a
+    write that fails after eviction made room) is NOT self-evidently a loss:
+    when every part fails, ``enqueue_parts`` hands back nothing, the caller
+    keeps its copy queued, and phase 0c retries the whole thing on the next
+    backlog drain — so stamping there makes the ledger climb by one part per
+    part per drain while describing zero lost memories, and it never resets
+    once the disk is fixed. Pass a list and those drops are collected onto it
+    instead; call :func:`record_deferred_drops` only on the branch where the
+    caller's copy actually leaves the live queue. With ``deferred_drops=None``
+    (the producers: ``session_end`` / ``retain``, who hold no other copy) the
+    ledger is stamped immediately, exactly as before.
     """
     d = _ensure_dir()
 
@@ -1239,7 +1316,7 @@ def enqueue_parts(
     parts = split_retain_content(content) if isinstance(content, str) else [content]
     total = len(parts)
     if total <= 1:
-        one = _enqueue_one(d, payload, error)
+        one = _enqueue_one(d, payload, error, deferred_drops=deferred_drops)
         return one, ([] if one is None else [one])
 
     base_doc = payload.get("document_id", "conversation")
@@ -1287,16 +1364,19 @@ def enqueue_parts(
         # MAX_BYTES refusal, eviction, the drop ledger — because each part
         # is an independently drainable memory, not a fragment that only
         # means something alongside its siblings. A part that cannot be
-        # written is recorded as a drop and the remaining parts still go in;
-        # returning ``None`` for the whole memory because part 7 of 9 hit
-        # ENOSPC would discard eight recoverable turns.
+        # written is recorded as a drop (or collected onto ``deferred_drops``
+        # for the caller to decide, see above) and the remaining parts still
+        # go in; returning ``None`` for the whole memory because part 7 of 9
+        # hit ENOSPC would discard eight recoverable turns.
         #
         # A part CAN evict an earlier part of the same memory when the queue
         # is already at its cap (eviction is FIFO and earlier parts are
         # older). That is the same trade `_evict_to_fit` documents — the
         # evicted part MOVES to ``pending-evicted/``, so it is shed, not
         # destroyed, except under the sustained-ENOSPC case named there.
-        written = _enqueue_one(d, part_payload, error)
+        written = _enqueue_one(
+            d, part_payload, error, deferred_drops=deferred_drops
+        )
         if written is not None:
             returned.append(written)
             if first is None:
@@ -1326,8 +1406,28 @@ def _entry_blob_bytes(payload: dict, error: BaseException) -> int:
     return len(json.dumps(_build_entry(payload, error), ensure_ascii=False).encode("utf-8"))
 
 
-def _enqueue_one(d: str, payload: dict, error: BaseException) -> Optional[str]:
-    """Write exactly ONE queue entry for ``payload``. See ``enqueue()``."""
+def _enqueue_one(
+    d: str,
+    payload: dict,
+    error: BaseException,
+    *,
+    deferred_drops: Optional[list] = None,
+) -> Optional[str]:
+    """Write exactly ONE queue entry for ``payload``. See ``enqueue()``.
+
+    ``deferred_drops``, when a list is passed, DEFERS both ``record_drop``
+    calls below: the ``(payload, error)`` pair is appended to the list
+    instead of being stamped on the ledger straight away. The caller then
+    owns the decision and must call :func:`record_deferred_drops` if — and
+    only if — it stops keeping its own copy of the memory. See
+    ``enqueue_parts`` for why that decision cannot be made here.
+    """
+    def _drop(err: BaseException) -> None:
+        if deferred_drops is None:
+            record_drop(payload, err)
+        else:
+            deferred_drops.append((payload, err))
+
     entry = _build_entry(payload, error)
 
     blob = json.dumps(entry, ensure_ascii=False)
@@ -1359,7 +1459,7 @@ def _enqueue_one(d: str, payload: dict, error: BaseException) -> Optional[str]:
     # guard the eviction loop below evicts the ENTIRE queue trying to make
     # room and then writes it anyway — trading every queued memory for one.
     if blob_bytes > MAX_BYTES:
-        record_drop(payload, ValueError(
+        _drop(ValueError(
             f"entry is {blob_bytes} bytes, larger than the whole "
             f"HINDSIGHT_PENDING_MAX_BYTES cap ({MAX_BYTES}); refusing this "
             f"entry rather than evicting the entire queue for it"
@@ -1380,11 +1480,12 @@ def _enqueue_one(d: str, payload: dict, error: BaseException) -> Optional[str]:
         # full, permissions). This is the only path that now loses a turn,
         # and it is recorded rather than returned bare — callers handle
         # ``None``, but none of them can see *why* without the ledger.
+        # ``_drop`` defers it for a caller that still holds the memory.
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        record_drop(payload, write_err)
+        _drop(write_err)
         return None
     return final
 
