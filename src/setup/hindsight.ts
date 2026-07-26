@@ -8,6 +8,10 @@ import {
   clientBudgetSeconds,
 } from "../litellm/timeout-budget.js";
 import { loadHostCapabilities } from "./host-capabilities.js";
+import {
+  hindsightPerfEnv,
+  resolveHindsightPerfOverrides,
+} from "./hindsight-perf-defaults.js";
 
 /**
  * Default Hindsight host ports.
@@ -1133,7 +1137,12 @@ export function resolveHindsightLlm(
 export function isLoopbackHttpUrl(url: string): boolean {
   try {
     const u = new URL(url.includes("://") ? url : `http://${url}`);
-    const h = (u.hostname || "").toLowerCase();
+    // `new URL("http://[::1]:4010").hostname` is "[::1]" — WITH the brackets.
+    // Comparing the raw hostname against "::1" therefore never matched, so an
+    // IPv6-loopback LiteLLM base was silently classified as remote and
+    // hindsightNeedsHostNetwork() left the container on the bridge network
+    // (the silent-retain outage class). Strip the brackets first.
+    const h = (u.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
     return h === "localhost" || h === "127.0.0.1" || h === "::1";
   } catch {
     return false;
@@ -1179,6 +1188,67 @@ export function hindsightNeedsHostNetwork(
 ): boolean {
   if (litellm?.baseUrl?.trim()) return true;
   return collectHindsightLlmBaseUrls(llm).some(isLoopbackHttpUrl);
+}
+
+/**
+ * True when `url` names an endpoint on this host or this LAN — loopback,
+ * RFC1918 private space, link-local, `.local` mDNS, or Docker's
+ * `host.docker.internal` bridge alias.
+ *
+ * This is the "finite slot pool" test, not the "reachable" test: what makes a
+ * self-hosted LLM different from a cloud provider is that it serves a handful
+ * of fixed slots, so filling them starves every other client on the box.
+ * A hostname that is not provably private reads as cloud — the fail-safe
+ * direction, since being wrong there just leaves upstream's default in place.
+ */
+export function isSelfHostedHttpUrl(url: string): boolean {
+  let host: string;
+  try {
+    const u = new URL(url.includes("://") ? url : `http://${url}`);
+    host = (u.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return false;
+  }
+  if (!host) return false;
+  if (isLoopbackHttpUrl(url)) return true;
+  if (host === "host.docker.internal" || host === "gateway.docker.internal") return true;
+  if (host.endsWith(".local") || host.endsWith(".internal")) return true;
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+  if (/^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host)) return true;
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 127) return true; // 127.0.0.0/8 (bare-IP form isLoopbackHttpUrl misses)
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  return false;
+}
+
+/**
+ * Whether hindsight's LLM traffic terminates on a self-hosted endpoint.
+ *
+ * The capability gate for the LLM concurrency caps (see
+ * `hindsight-perf-defaults.ts`): upstream's default of 32 concurrent requests
+ * assumes a cloud provider, and on a local endpoint it starves every other
+ * client sharing the box. Reads the SAME inputs the launch paths already take,
+ * via {@link collectHindsightLlmBaseUrls}, so it can never disagree with the
+ * host-network / health-probe decisions made from those URLs.
+ *
+ * No configured base URL at all ⇒ `false` ⇒ upstream's default stands. That is
+ * the fail-safe reading: a hosted provider throttled to 4 would be a
+ * throughput regression for no reason.
+ *
+ * @param override Test/caller seam, mirroring `hindsightGpuEnabled(override?)`.
+ */
+export function hindsightLocalLlmEnabled(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+  override?: boolean,
+): boolean {
+  if (override !== undefined) return override;
+  return collectHindsightLlmBaseUrls(llm, litellm).some(isSelfHostedHttpUrl);
 }
 
 /**
@@ -1274,6 +1344,53 @@ export function hindsightGpuEnabled(override?: boolean): boolean {
   return caps?.voice?.gpuPresent === true && caps?.voice?.containerToolkit === true;
 }
 
+/**
+ * Inputs for the capability-gated performance defaults, threaded through both
+ * launch paths as ONE trailing options object so the two generators keep
+ * identical shapes (the positional-parameter list is already long enough to
+ * make a silent argument-order mismatch between them plausible).
+ */
+export interface HindsightPerfOptions {
+  /**
+   * The operator's `hindsight.env` block from switchroom.yaml. Any key in
+   * `HINDSIGHT_PERF_ENV_KEYS` set here REPLACES switchroom's default for that
+   * key; other keys are ignored (see hindsight-perf-defaults.ts).
+   */
+  env?: Record<string, string | number | boolean>;
+  /**
+   * Local-LLM verdict override. Omit in production —
+   * {@link hindsightLocalLlmEnabled} derives it from the configured LLM base
+   * URLs. Tests pass an explicit boolean.
+   */
+  localLlm?: boolean;
+  /** Process-environment seam for tests; defaults to `process.env`. */
+  processEnv?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The single derivation of the performance env pairs, shared by
+ * {@link startHindsight} and {@link generateHindsightComposeSnippet}.
+ *
+ * Exists so the two launch paths cannot drift: exactly like
+ * {@link hindsightGpuEnabled}, there is ONE place that decides, and both
+ * consumers route through it. The run ⇄ compose parity test asserts the
+ * outcome of both generators for the same inputs, not just that both call it.
+ */
+export function hindsightPerfEnvPairs(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+  gpu?: boolean,
+  perf?: HindsightPerfOptions,
+): Array<[string, string]> {
+  return hindsightPerfEnv(
+    {
+      gpu: hindsightGpuEnabled(gpu),
+      localLlm: hindsightLocalLlmEnabled(llm, litellm, perf?.localLlm),
+    },
+    resolveHindsightPerfOverrides(perf?.env, perf?.processEnv),
+  );
+}
+
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
@@ -1294,6 +1411,11 @@ export function startHindsight(
    * boolean so the suite never depends on the runner having (or lacking) a GPU.
    */
   gpu?: boolean,
+  /**
+   * Capability-gated performance defaults + the operator's `hindsight.env`
+   * overrides. See {@link HindsightPerfOptions}.
+   */
+  perf?: HindsightPerfOptions,
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
@@ -1353,6 +1475,13 @@ export function startHindsight(
     // `docker inspect` and survives operators who wrap start without the
     // entrypoint default.
     "-e", `HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
+    // Capability-gated performance defaults (recall p90 5.83s / reflect p90
+    // 122s vs upstream's published 100-600ms / 800-3000ms). Emitted through
+    // ONE resolver shared with the compose path; every gated group is omitted
+    // on a host that cannot prove the capability, and an operator value in
+    // `hindsight.env` replaces the default rather than being appended after
+    // it. See src/setup/hindsight-perf-defaults.ts.
+    ...hindsightPerfEnvPairs(llm, litellm, gpu, perf).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
   ];
 
   // The `claude-code` provider drives an underlying claude subprocess; pin
@@ -1770,6 +1899,11 @@ export function generateHindsightComposeSnippet(
    * host-capabilities verdict.
    */
   gpu?: boolean,
+  /**
+   * Capability-gated performance defaults + operator `hindsight.env`
+   * overrides, mirroring {@link startHindsight}'s `perf` param.
+   */
+  perf?: HindsightPerfOptions,
 ): string {
   const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
   const perOpLlm = resolveHindsightPerOpLlm(llm);
@@ -1886,6 +2020,10 @@ export function generateHindsightComposeSnippet(
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     `      - HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
     `      - HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
+    // Capability-gated performance defaults — the compose twin of the
+    // docker-run path's block, from the SAME resolver so the two can never
+    // disagree about which knobs a host gets (see hindsightPerfEnvPairs).
+    ...hindsightPerfEnvPairs(llm, litellm, gpu, perf).map(([k, v]) => `      - ${k}=${v}`),
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,

@@ -730,6 +730,10 @@ export function registerMemoryCommand(program: Command): void {
           effectiveTag,
           hindsightConfig.hindsight?.llm,
           hindsightConsumerMirrorDir(hindsightConfig),
+          // gpu: omitted ⇒ hindsightGpuEnabled() reads the persisted verdict.
+          undefined,
+          // Operator overrides for the capability-gated performance defaults.
+          { env: hindsightConfig.hindsight?.env },
         );
         if (litellmCfg) {
           console.log(chalk.gray("  LiteLLM routing enabled for hindsight (--network host)."));
@@ -774,6 +778,10 @@ export function registerMemoryCommand(program: Command): void {
           generateHindsightComposeSnippet(
             snippetConfig.hindsight?.llm,
             hindsightConsumerMirrorDir(snippetConfig),
+            // litellm / gpu: omitted ⇒ same defaults the docker-run path uses.
+            undefined,
+            undefined,
+            { env: snippetConfig.hindsight?.env },
           ),
         );
       }

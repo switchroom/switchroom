@@ -2058,6 +2058,23 @@ export const HindsightConfigSchema = z.object({
       "`consolidation` blocks override individual ops. All fields optional; " +
       "unset fields fall back to the hard-coded defaults.",
     ),
+  env: z
+    .record(z.union([z.string(), z.number(), z.boolean()]))
+    .optional()
+    .describe(
+      "Operator overrides for switchroom's capability-gated Hindsight " +
+      "performance defaults. Only the keys switchroom actually manages are " +
+      "honoured (`HINDSIGHT_PERF_ENV_KEYS` in " +
+      "src/setup/hindsight-perf-defaults.ts: RERANKER_LOCAL_FP16, " +
+      "LLM_MAX_CONCURRENT, RETAIN/CONSOLIDATION_LLM_MAX_CONCURRENT, " +
+      "RECALL_MAX_CANDIDATES_PER_SOURCE, LINK_EXPANSION_PER_ENTITY_LIMIT, " +
+      "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT). A value set here " +
+      "REPLACES switchroom's default and is emitted even when the gating " +
+      "capability is absent, so an operator can always force a knob. Other " +
+      "`HINDSIGHT_API_*` keys are deliberately IGNORED — a blanket " +
+      "passthrough would collide with the vars startHindsight() derives " +
+      "itself (HINDSIGHT_API_PORT, the retain token/deadline budget).",
+    ),
 });
 
 /**
