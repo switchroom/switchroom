@@ -152,6 +152,39 @@ export function parseTurns(text: string): TurnRecord[] {
   return out;
 }
 
+/**
+ * Keep only the rows that BELONG to the agent whose `turns.jsonl` this is.
+ *
+ * A row carries the `agent` its gateway stamped at write time. Normally that is
+ * the owning agent, but foreign rows can land in the file: `emitTurnRecord`
+ * used to hard-code `/state/agent/turns.jsonl`, so any test that drove the real
+ * turn-end funnel INSIDE an agent container appended rows stamped with the
+ * test's own `SWITCHROOM_AGENT_NAME` into that agent's production record. Those
+ * rows are deliberately synthetic (zero tools, instant completion) — exactly
+ * the shape the silent-no-op detector flags. On 2026-07-26 they were 267 of the
+ * 377 live silent-no-op candidates across the fleet, i.e. the top-priority
+ * ledger entry was mostly test fixtures.
+ *
+ * The rule is deterministic and total: a row whose `agent` is set and does not
+ * match the scanned agent is not that agent's production signal, so it never
+ * enters findings or the status mix. Rows with no `agent` field are kept (they
+ * cannot be attributed anywhere else).
+ *
+ * The write-side path fix (`resolveTurnsJsonlPath`) stops NEW foreign rows;
+ * this keeps the ones already on disk — and any future cross-attribution — out
+ * of the ledger without rewriting operator state.
+ */
+export function ownedTurns(
+  agent: string,
+  turns: readonly TurnRecord[],
+): TurnRecord[] {
+  const slug = agent.trim().toLowerCase();
+  return turns.filter((t) => {
+    const owner = t.agent?.trim().toLowerCase();
+    return owner == null || owner === "" || owner === slug;
+  });
+}
+
 function isoFromTs(ts: number | undefined): string | null {
   if (typeof ts !== "number" || !Number.isFinite(ts)) return null;
   // turns.jsonl `ts` is unix seconds.
@@ -161,6 +194,10 @@ function isoFromTs(ts: number | undefined): string | null {
 /**
  * Run the turns.jsonl detectors over one agent's parsed turns. Pure — returns
  * the flagged findings. Mirrors the reference detector's three turn checks.
+ *
+ * Rows attributed to a DIFFERENT agent are dropped first (`ownedTurns`): they
+ * are never this agent's production signal. The filter lives here, in the
+ * finding producer, so no caller can route around it.
  */
 export function detectTurnFindings(
   agent: string,
@@ -169,7 +206,7 @@ export function detectTurnFindings(
 ): Finding[] {
   const findings: Finding[] = [];
   const silentNoopFloorTs = opts.silentNoopFloorTs ?? SILENT_NOOP_FLOOR_TS;
-  for (const t of turns) {
+  for (const t of ownedTurns(agent, turns)) {
     const tid = t.turn_id ?? "?";
     const st = t.status;
     const tl = typeof t.tools === "number" ? t.tools : 0;
@@ -295,7 +332,9 @@ export function scanAgent(
   gatewayText: string,
   opts: DetectOptions = {},
 ): AgentScanResult {
-  const turns = parseTurns(turnsText);
+  // Foreign-attributed rows are dropped up front so the turn COUNT and the
+  // status mix describe this agent too, not just the findings.
+  const turns = ownedTurns(agent, parseTurns(turnsText));
   const status_mix: Record<string, number> = {};
   for (const t of turns) {
     const st = t.status ?? "unknown";

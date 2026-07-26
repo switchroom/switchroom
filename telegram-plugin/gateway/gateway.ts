@@ -718,7 +718,7 @@ import {
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
-import { maybeRotate } from './turns-jsonl-rotate.js'
+import { maybeRotate, resolveTurnsJsonlPath } from './turns-jsonl-rotate.js'
 import {
   buildTurnRecord,
   finalizeBackstopSendGated,
@@ -5040,7 +5040,7 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
           endedAt,
         ),
       ) + '\n'
-    const turnsPath = '/state/agent/turns.jsonl'
+    const turnsPath = resolveTurnsJsonlPath() // honours SWITCHROOM_AGENT_STATE_DIR
     // Size-cap rotation: keep at most one rotated generation so the file can't
     // grow unbounded on a long-lived agent. Best-effort (never throws).
     maybeRotate(turnsPath, {

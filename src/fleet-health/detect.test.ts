@@ -192,3 +192,71 @@ describe("scanAgent landed_unconfirmed accounting (#3702)", () => {
     expect(res.landed_unconfirmed_turns).toBe(0);
   });
 });
+
+describe("cross-attributed rows never count as this agent's drift", () => {
+  // Regression for the fleet-health measurement bug: `emitTurnRecord` wrote to a
+  // hard-coded `/state/agent/turns.jsonl`, so a characterization test running
+  // inside an agent container appended rows stamped with ITS OWN agent name
+  // (`chartestagent`) into the host agent's production turn record. Those rows
+  // are complete/tools:0 — the exact silent-no-op shape — and they dominated the
+  // top ledger entry (267 of 377 live candidates on 2026-07-26).
+  const foreign = (seq: number) =>
+    JSON.stringify({
+      ts: SILENT_NOOP_FLOOR_TS + seq,
+      agent: "chartestagent",
+      turn_id: `t-${seq}`,
+      status: "complete",
+      tools: 0,
+      duration_ms: 1000,
+    });
+
+  it("drops a foreign-agent silent-no-op row (would be flagged as alpha's)", () => {
+    const findings = detectTurnFindings("alpha", parseTurns(foreign(1)));
+    expect(findings).toHaveLength(0);
+  });
+
+  it("drops a foreign-agent send_failed row", () => {
+    const row = JSON.stringify({
+      ts: SILENT_NOOP_FLOOR_TS + 2,
+      agent: "chartestagent",
+      turn_id: "t-2",
+      status: "send_failed",
+      tools: 0,
+      duration_ms: 1000,
+    });
+    expect(detectTurnFindings("alpha", parseTurns(row))).toHaveLength(0);
+  });
+
+  it("keeps the owning agent's rows (match is case-insensitive on the slug)", () => {
+    const own = JSON.stringify({
+      ts: SILENT_NOOP_FLOOR_TS + 3,
+      agent: "ALPHA",
+      turn_id: `${CHAT}:_#3`,
+      status: "complete",
+      tools: 0,
+      duration_ms: 1000,
+    });
+    const findings = detectTurnFindings("alpha", parseTurns(own));
+    expect(findings.map((f) => f.signal)).toEqual(["silent-no-op-candidate"]);
+  });
+
+  it("keeps rows with no `agent` field (unattributable, so not foreign)", () => {
+    const legacy = JSON.stringify({
+      ts: SILENT_NOOP_FLOOR_TS + 4,
+      turn_id: `${CHAT}:_#4`,
+      status: "complete",
+      tools: 0,
+      duration_ms: 1000,
+    });
+    expect(detectTurnFindings("alpha", parseTurns(legacy))).toHaveLength(1);
+  });
+
+  it("scanAgent excludes foreign rows from findings, turn count and status mix", () => {
+    const text = [turn(1, {}), foreign(5), foreign(6)].join("\n");
+    const res = scanAgent("alpha", text, "");
+    expect(res.turns).toBe(1);
+    expect(res.status_mix).toEqual({ complete: 1 });
+    expect(res.findings).toHaveLength(0);
+    expect(res.escalate).toBe(false);
+  });
+});

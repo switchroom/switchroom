@@ -81,7 +81,10 @@ export default defineConfig({
     // regrow one new test at a time. `npm run lint:auth-test-hermeticity`
     // fails if this entry is removed or the guard stops covering a file
     // that needs it.
-    setupFiles: ["./tests/vitest-setup/auth-net-guard.mjs"],
+    setupFiles: [
+      "./tests/vitest-setup/auth-net-guard.mjs",
+      "./tests/vitest-setup/agent-state-dir-guard.mjs",
+    ],
     pool: "forks",
     poolOptions: {
       forks: {
