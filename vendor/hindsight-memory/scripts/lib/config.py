@@ -29,21 +29,6 @@ DEFAULTS = {
     # formatting. Set to 0 (or any non-positive value) to disable the cap
     # and inject everything Hindsight returns.
     "recallMaxMemories": 12,
-    # Switchroom-local: minimum lexical (containment) overlap between the
-    # user's query terms and a memory's text terms. Memories below this
-    # threshold are dropped before formatting. 0.0 disables the gate
-    # (current behaviour: inject everything Hindsight returns up to the
-    # count cap). NOTE: Hindsight's HTTP recall API DOES return per-result
-    # relevance scores (`scores.final`, plus `.semantic`/`.keyword`/
-    # `.reranker`) — verified at runtime — and recall.py now reads and
-    # sorts the merged set by `scores.final`. This lexical gate is a
-    # separate quality filter layered on top — see #475. The metric is
-    # containment, `|Q n M| / |M|`, not Jaccard: dividing by the union made
-    # the score a function of prompt length rather than relevance — see
-    # #3541 and recall.py's design note. At the 0.10 fleet default this is
-    # close to a passthrough (a <=10-token memory clears it on one shared
-    # word); precision is the engine rerank's job, not this gate's.
-    "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
     # Switchroom-local: when True (default; Ken-approved ON) recall biases
     # toward synthesized `observation`-tier facts. Escape hatch: pin off via
@@ -299,10 +284,6 @@ ENV_OVERRIDES = {
     # agents.<name>.memory.recall.max_memories (cascading through
     # defaults.memory.recall.max_memories) when present in switchroom.yaml.
     "HINDSIGHT_RECALL_MAX_MEMORIES": ("recallMaxMemories", int),
-    # Switchroom-local: lexical-overlap threshold (#475). Float in
-    # [0.0, 1.0]. Set by start.sh from agents.<name>.memory.recall.min_overlap
-    # (cascading through defaults). 0.0 = off (current behaviour).
-    "HINDSIGHT_RECALL_MIN_OVERLAP": ("recallMinOverlap", float),
     # Switchroom-local: recall fact types (comma-separated). Set by start.sh
     # from agents.<name>.memory.recall.types only when the operator overrode
     # the switchroom default (world,experience,observation) — i.e. the

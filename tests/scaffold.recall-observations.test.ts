@@ -83,7 +83,12 @@ describe("hindsight recall overrides — observations + trivial-skip", () => {
     const s = settingsAfterInstall();
     expect(s.retainEveryNTurns).toBe(3);
     expect(s.recallMaxMemories).toBe(8);
-    expect(s.recallMinOverlap).toBe(0.1);
+    // The `recallMinOverlap` lexical gate was removed outright (no
+    // replacement floor): it discarded 79.8% of post-reranker candidates
+    // fleet-wide and dropped the engine's own top hit on 31.2% of replayed
+    // production queries while filtering no measurable noise. Pinning it
+    // absent stops a future settings override quietly reinstating it.
+    expect(s.recallMinOverlap).toBeUndefined();
   });
 
   // #2816 tag-filter port — INTENTIONALLY DORMANT (see the decision comment in

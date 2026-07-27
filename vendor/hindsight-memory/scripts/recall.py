@@ -402,140 +402,42 @@ def _is_demoted_memory(memory) -> bool:
     return False
 
 
-# Switchroom #475 — lexical-overlap relevance gate.
+# Tokenizer shared by the transcript fallback (`_build_transcript_fallback`).
 #
-# Hindsight's HTTP recall API DOES return per-result relevance scores
-# (`RecallResult.scores.final`, plus `.semantic`/`.keyword`/`.reranker`);
-# the merged multi-bank set is now sorted by `scores.final` before the
-# `recallMaxMemories` cap (see the sort just before the cap in
-# process_recall) so the most relevant memories survive the head-slice
-# regardless of which bank they came from. This gate is a *complementary*,
-# opt-in absolute precision floor: `scores.final` is a relative rank that
-# still orders weakly-matching memories rather than excluding them, so on a
-# low-relevance prompt the top-N could still be low-signal. The lexical
-# overlap between the user's query terms and each memory's text terms is a
-# rank-independent absolute measure that drops memories below a
-# configurable threshold outright — something the relative sort does not do.
+# --- history: the removed lexical-overlap recall gate (#475, #3541, #3761) ---
 #
-# --- switchroom #3541: the metric is CONTAINMENT, not Jaccard ---
+# These tokens used to feed a `recallMinOverlap` gate that ran between the
+# engine's reranker and the `recallMaxMemories` head-slice, dropping any
+# candidate whose containment overlap with the prompt fell below a threshold.
+# It was removed outright — no replacement floor — after measurement showed it
+# was pure loss:
 #
-# This gate originally scored with Jaccard similarity,
-# `|Q ∩ M| / |Q ∪ M|`. That is the wrong metric here, because the two
-# sides have wildly asymmetric lengths: the recall query is the whole
-# prior-context preamble (production p50 778 chars) while a memory is a
-# single fact (tens of tokens). The union term is dominated by |Q|, so the
-# SAME memory with the SAME real overlap scores lower purely because the
-# prompt was longer. Query length, not relevance, decided the outcome.
+#   * On healthy production rows (non-timeout, non-error, ts >= 2026-07-20,
+#     n=212 across the fleet) it discarded 6026 of 7549 post-reranker
+#     candidates — 79.8% fleet-wide, 94.4% for overlord, 91.0% for klanker.
+#   * Replaying 330 real logged queries against the live engine, the gate
+#     dropped the engine's OWN top-ranked candidate on 31.2% of queries. It
+#     was not acting as a floor; it was acting as a rival, worse ranker.
+#   * It filtered no measurable noise. The rate at which the best injected
+#     memory scored below 1e-3 was 27.0% with the gate and 28.2% with no gate
+#     at all — inside sampling noise. It cost a third of top hits and bought
+#     nothing.
 #
-# Measured on production recall telemetry (1548 rows, 646 of which put
-# candidates through the gate, ts >= 2026-07-18, all fleet agents'
-# `recall_log.jsonl`), at the fleet default threshold of 0.10:
+# The root cause is in the tokenizer below: it keeps only alphabetic tokens of
+# length > 1, so digits, identifiers, version numbers, PR numbers, file paths
+# and short symbols are invisible to it. For a fleet whose prompts are mostly
+# identifiers that is close to worst case.
 #
-#   query_chars    rows   candidates   survived   survival%   zero-result%
-#      0- 200        30        1364          99       7.3%          23.3%
-#    200- 400       110        4199         238       5.7%          17.3%
-#    400- 600       143        5305         293       5.5%          72.7%
-#    600- 750       213        7288          67       0.9%          93.0%
-#    750-1000       150        4968          70       1.4%          90.0%
+# No score floor replaced it. `scores.final` is NOT calibrated across queries —
+# the engine's own docs state a clearly-relevant match may score ~0.001 while
+# ranked first, and freed slots are not backfilled. Measured over the same 330
+# replays, every candidate floor value had `top1lost% == zero%` exactly: a
+# floor never trims a bad tail, it only empties the whole result set. A floor
+# at 0.001 would take zero-result recalls from 5.8% to 28.2%; at 0.05, to
+# 40.6%. That re-creates #3541. `min_scores` is deliberately left unset.
 #
-# 22447 of 23124 candidate memories (97.1%) were discarded, and the
-# discard rate rose monotonically with prompt length — the signature of
-# the union-term artifact, not of a relevance judgement. Where the gate
-# actually got to run, it was decisive: of the 526 turns that had at least
-# one bank return successfully, 440 (83.7%) still delivered zero memories.
-#
-# How much of the empty-recall problem is this? Roughly a third — NOT all
-# of it. Partitioning the zero-result recalls by why they were empty:
-#
-#   >=1 bank returned OK, and overlap_dropped > 0   448  (~32%)  <- this gate
-#   ALL banks timed out or errored                  565  (~41%)  <- the deadline
-#   >=1 bank returned OK, nothing dropped             7
-#
-# So the 8s outer deadline accounts for MORE empty recalls than the gate
-# does, and it is still live after this change: `deadline_hit` is set on
-# 991 of 18656 logged recalls and the p50 `total_elapsed_ms` on the
-# deadline-hitting rows sits at the 8s ceiling. Fixing the metric does not
-# close #3541's latency half — see the reranker analysis in that issue.
-# This change fixes the gate; it does not fix the timeout.
-#
-# The correct metric for asymmetric-length comparison is containment:
-# `|Q ∩ M| / |M|` — "what fraction of THIS MEMORY's terms are present in
-# the prompt", invariant to how much unrelated preamble the prompt
-# carries. (Not `min(|Q|, |M|)`; see `containment_overlap` for why the
-# textbook overlap coefficient's short-prompt regime flip is undesirable
-# here.)
-#
-# --- what the 0.10 threshold does, and does not, buy ---
-#
-# Be honest about the retained default: at 0.10, containment is close to a
-# PASSTHROUGH. Because the denominator is the memory's own token count, a
-# memory of <= 10 content tokens clears 0.10 on a SINGLE shared word. Only
-# longer memories are meaningfully filtered (a 40-token memory still needs
-# 4 shared terms). Measured on the production-shaped prompt used in the
-# regression tests, a wholly off-topic memory that merely reuses words
-# from the prior-context preamble scores 0.857 — HIGHER than the genuinely
-# relevant memory at 0.571.
-#
-# That inversion is the reason the threshold is NOT being raised to
-# compensate. Raising it would drop the relevant memory before the
-# off-topic one, because on a preamble-heavy prompt containment is not
-# monotone in relevance. Lexical overlap cannot make that distinction at
-# any threshold; the engine's reranker can, and does.
-#
-# The threshold was nevertheless re-derived from data rather than inherited
-# from the Jaccard era. 31 real production queries (reconstructed from
-# transcripts with the hook's own compose+truncate, validated by matching
-# 320 of them verbatim against logged recall rows) were replayed against
-# the live engine; the 202 returned candidates were rescored offline:
-#
-#   containment    survival%   zero-result%   mean kept/query
-#      0.05           99.5%          0.0%           6.5
-#      0.10           86.1%          6.5%           5.6   <- shipped
-#      0.20           65.8%         41.9%           4.3
-#      0.30           58.4%         41.9%           3.8
-#      0.40           52.5%         54.8%           3.4
-#
-# (Jaccard @0.10 on the same candidates: 70.3% survival, 32.3%
-# zero-result — i.e. the fix cuts empty recalls from ~1 turn in 3 to
-# ~1 in 15 on this sample.)
-#
-# 0.30 and 0.40 leave 42-55% of turns with NO memories at all — they
-# re-create the exact failure #3541 is about, for a precision gain the
-# inversion above says is illusory. 0.10 is the shipped value.
-#
-# Sample caveat, stated plainly: these are single-bank (overlord) replays
-# and the engine returned ~6.5 already-top-ranked candidates per query,
-# not the ~35-candidate pools seen in the fleet logs. The ABSOLUTE
-# survival percentages are therefore optimistic versus production; the
-# RANKING of the thresholds, and the zero-result cliff above 0.10, are the
-# load-bearing results.
-#
-# So the honest statement of the design after #3541 is: the effective
-# precision control is the engine rerank plus the `recallMaxMemories`
-# head-slice, and this gate is a cheap floor that removes only candidates
-# with (near-)zero lexical relationship to the prompt. It is no longer
-# doing the job the #475 note above describes — "on a low-relevance prompt
-# the top-N could still be low-signal" is a real concern that this gate
-# does not actually address. Doing so needs a relevance-score floor
-# (`scores.final`), not a lexical one; that is deliberately out of scope
-# here and wants its own measured change.
-#
-# This is safe to run permissively: the gate is a FLOOR, not a ranker.
-# `_sort_by_final_score` orders the survivors by the engine's reranked
-# relevance score immediately afterwards, and only then does
-# `recallMaxMemories` head-slice. So admitting more candidates cannot
-# lower the quality of what is injected — it can only give the
-# score-sort a non-empty set to choose the top-N from. And because
-# `|Q ∩ M| / |M| >= |Q ∩ M| / |Q ∪ M|` always, at a fixed threshold this
-# metric admits a superset of what the deployed Jaccard gate admits: no
-# memory that survives in production today can be dropped by this change.
-#
-# Threshold default is 0.0 (disabled) so the gate is opt-in initially.
-# Operators tune via `memory.recall.min_overlap` in switchroom.yaml or
-# `HINDSIGHT_RECALL_MIN_OVERLAP=0.15` env. Telemetry surfaces the dropped
-# count via the existing recall_log.jsonl (#432 4.3) under
-# `overlap_dropped`, so the gate's effect is observable per turn from
-# `switchroom memory recall-log <agent>`.
+# Precision now rests where it belongs: the engine's rerank ordering, the
+# `_sort_by_final_score` merge sort, and the `recallMaxMemories` head-slice.
 #
 # A small English stop-word set is removed from both sides before the
 # overlap is computed — common-word coincidence is not a real signal.
@@ -585,78 +487,6 @@ def _overlap_tokens(text) -> set:
     return out
 
 
-def containment_overlap(query: str, memory_text: str) -> float:
-    """Containment of the MEMORY in the query, after stop-word + punctuation
-    stripping: ``|Q ∩ M| / |M|``.
-
-    Returns a float in [0.0, 1.0]. Empty/degenerate inputs return 0.0 —
-    it's safer to drop than retain when we can't compute.
-
-    Unlike Jaccard (`|Q ∩ M| / |Q ∪ M|`, used until switchroom #3541) this
-    is INVARIANT TO QUERY LENGTH. The recall query is a long prior-context
-    preamble and a memory is a short fact; dividing by the union made the
-    score collapse as the prompt grew, so the gate discarded 97.1% of
-    already-reranked candidates and did so monotonically in prompt length.
-    Dividing by the memory asks the question the gate actually means: what
-    fraction of this memory's terms appear in the prompt. See the design
-    note above `_OVERLAP_STOPWORDS` for the production measurement.
-
-    That invariance is specifically against growth of NON-OVERLAPPING
-    preamble in the query — the failure mode #3541 hit — and is not
-    unqualified: a short query still scores low against a long memory
-    (whenever `|Q| < threshold * |M|` the memory is dropped however
-    relevant it is), and where `Q ⊆ M` the metric degenerates to exactly
-    Jaccard. So `|M|` is a trade against `min(|Q|, |M|)`, not a strict
-    improvement over it; the paragraph below is the argument for which
-    side of that trade is safer here.
-
-    Why ``|M|`` and not ``min(|Q|, |M|)`` (the textbook overlap coefficient):
-    the two agree only where the memory is the shorter side, and that is NOT
-    a safe assumption here. Replaying real production queries against the
-    live engine, `|Q| < |M|` held for 87 of 202 candidate pairs — 43%.
-    Memories are routinely LONGER than the prompt that retrieves them.
-    Wherever that happens `min()` selects the QUERY and the metric silently
-    becomes the converse measure: what fraction of the *prompt* appears in
-    the memory. That regime flip re-introduces exactly the query-length
-    dependence #3541 is about — a one-word prompt scores 1.0 against any
-    memory containing that word. Dividing by `|M|` unconditionally has no
-    such discontinuity.
-
-    Safety, relative to what production runs today: for any Q and M,
-
-        |Q ∩ M| / |Q ∪ M|  <=  |Q ∩ M| / |M|  <=  |Q ∩ M| / min(|Q|, |M|)
-
-    because `|Q ∪ M| >= |M| >= min(|Q|, |M|)`. So at a fixed threshold this
-    metric admits a SUPERSET of what the deployed Jaccard gate admits: no
-    memory that survives the gate today can be dropped by this change.
-    """
-    a = _overlap_tokens(query)
-    b = _overlap_tokens(memory_text)
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(b)
-
-
-def _filter_by_overlap(results, query: str, threshold: float):
-    """Drop memories whose containment overlap with the query is below the
-    threshold. Threshold <= 0 short-circuits to passthrough (no
-    iteration cost).
-
-    Returns (kept_results, dropped_count).
-    """
-    if threshold <= 0:
-        return results, 0
-    kept = []
-    dropped = 0
-    for m in results:
-        text = m.get("text", "") if isinstance(m, dict) else ""
-        if containment_overlap(query, text) >= threshold:
-            kept.append(m)
-        else:
-            dropped += 1
-    return kept, dropped
-
-
 def _result_final_score(m) -> float:
     """Return a result's engine relevance score (`scores.final`).
 
@@ -679,12 +509,11 @@ def _injected_score_stats(results) -> dict:
     """Relevance-score aggregates for the INJECTED set (post-head-slice).
 
     Switchroom #3541 review finding — recall-quality telemetry.
-    `recall_log.jsonl` records volume and plumbing only (`overlap_dropped`,
-    `capped`, `pre_cap_count`, `memory_ids`, `deadline_hit`). With the
-    overlap gate deliberately near-passthrough at 0.10, 100% of precision now
-    rests on the engine's `scores.final` plus the `recallMaxMemories`
-    head-slice — and no field observes that. Post-rollout, `overlap_dropped`
-    collapsing to 0 while `result_count` rises to the cap reads as
+    `recall_log.jsonl` records volume and plumbing only (`capped`,
+    `pre_cap_count`, `memory_ids`, `deadline_hit`). With the lexical overlap
+    gate removed (#3761) 100% of precision rests on the engine's
+    `scores.final` plus the `recallMaxMemories` head-slice — and no volume
+    field observes that. `result_count` rising to the cap reads as
     unambiguous success on every existing dashboard whether the reranker is
     good OR whether every agent is being fed 8 mediocre memories per turn.
     These three fields are what distinguishes those two worlds.
@@ -1935,28 +1764,6 @@ def main():
                 f"memories (active_thread_id={active_thread_id})",
             )
 
-    # Switchroom #475 — lexical-overlap relevance gate. Drops memories
-    # whose containment overlap with the query is below
-    # `recallMinOverlap` (default 0.0 = disabled). Runs after the
-    # demote filter so the threshold sees the operator-curated set.
-    # #3541: the metric is containment, NOT Jaccard — see the design
-    # note above `_OVERLAP_STOPWORDS`. Jaccard made the gate a function
-    # of prompt length and it discarded 97.1% of reranked candidates.
-    overlap_threshold = config.get("recallMinOverlap", 0.0)
-    if isinstance(overlap_threshold, (int, float)) and overlap_threshold > 0:
-        pre_overlap_count = len(results)
-        results, overlap_dropped = _filter_by_overlap(
-            results, query, float(overlap_threshold)
-        )
-        if overlap_dropped > 0:
-            debug_log(
-                config,
-                f"Overlap gate dropped {overlap_dropped}/{pre_overlap_count} "
-                f"memories below threshold {overlap_threshold}",
-            )
-    else:
-        overlap_dropped = 0
-
     # Switchroom hindsight-leverage PR5 — per-tag score penalty. Applied
     # IMMEDIATELY before the relevance sort so a down-weighted tag (e.g.
     # `sidechain: 0.8`) reorders the merged set without dropping anything. This
@@ -2129,7 +1936,6 @@ def main():
         # doctor's directive-count check will be FAILing too.
         "directives_omitted": count_omitted_directives(directives),
         "demoted_count": demoted_count,
-        "overlap_dropped": overlap_dropped,
         "capped": capped,
         "pre_cap_count": pre_cap_count,
         "memory_ids": [
