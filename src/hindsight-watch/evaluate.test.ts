@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   evaluateAll,
+  evaluateConsolidationQueueAge,
   evaluateContainer,
   evaluateFailureRate,
+  evaluateLlmFallback,
   evaluateQueueGrowth,
   evaluateRetainLoss,
 } from "./evaluate.js";
@@ -257,26 +259,129 @@ describe("evaluateAll", () => {
   it("returns one verdict per level/edge signal", () => {
     const verdicts = evaluateAll([sample(0), sample(1)]);
     expect(verdicts.map((v) => v.signal).sort()).toEqual([
+      "consolidation-queue-age",
       "container",
+      "llm-fallback-ineffective",
+      "recall-candidate-floor",
+      "recall-injected-score",
+      "recall-own-bank-timeout",
+      "recall-zero-memory",
       "retain-failure-rate",
       "retain-loss",
       "retain-queue-growth",
     ]);
   });
 
-  it("no longer emits a latency signal — hindsight's histogram cannot resolve one", () => {
+  it("still emits no RETAIN latency signal — hindsight's histogram cannot resolve one", () => {
     // The exposition's largest finite `le` is 120s and a healthy post-#3610
     // backend already runs 19.4% of retains past it (measured 2026-07-25:
     // 52/268, with a 1.1% failure rate). Any threshold this instrument can
     // express fires permanently, so the signal was removed rather than
     // retuned. Restoring it needs `le` edges above the retain client deadline
     // (280s when this was measured, 310s since — see B7a in ./thresholds.ts).
+    //
+    // `recall-latency` is NOT a counter-example: it reads `total_elapsed_ms`
+    // from `recall_log.jsonl`, an exact per-turn wall-clock number, not a
+    // bucketed histogram — which is precisely why a latency SLI is expressible
+    // on the recall side and still is not on the retain side.
     const verdicts = evaluateAll([sample(0), sample(1)]);
-    expect(verdicts.some((v) => v.signal.includes("latency"))).toBe(false);
+    expect(verdicts.some((v) => v.signal.includes("latency") && v.signal.startsWith("retain"))).toBe(
+      false,
+    );
   });
 
   it("reports no-data everywhere on a single sample — never a false all-clear", () => {
     const verdicts = evaluateAll([sample(0)]);
     expect(verdicts.filter((v) => v.signal !== "container").every((v) => v.state === "no-data")).toBe(true);
+  });
+});
+
+/**
+ * Consolidation queue age. Measured live 2026-07-27: 77 pending, oldest
+ * 14 327 s (3.98 h) — a real warn that is deliberately NOT a page.
+ */
+describe("evaluateConsolidationQueueAge", () => {
+  function ringWith(c: Sample["consolidation"]): Sample[] {
+    return [sample(0, { consolidation: c }), sample(1, { consolidation: c })];
+  }
+
+  it("pages past the 12h cap", () => {
+    const v = evaluateConsolidationQueueAge(ringWith({ pending: 40, oldestAgeS: 13 * 3600 }));
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("page");
+  });
+
+  it("warns — not pages — at the fleet's measured 3.98h backlog", () => {
+    const v = evaluateConsolidationQueueAge(ringWith({ pending: 77, oldestAgeS: 14_327 }));
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("warn");
+  });
+
+  it("is clean under the warn threshold", () => {
+    expect(evaluateConsolidationQueueAge(ringWith({ pending: 3, oldestAgeS: 120 })).state).toBe("ok");
+  });
+
+  it("is clean on an empty queue regardless of a stale age reading", () => {
+    expect(evaluateConsolidationQueueAge(ringWith({ pending: 0, oldestAgeS: 99_999 })).state).toBe("ok");
+  });
+
+  it("reports no-data (not ok) when the psql probe could not run", () => {
+    expect(evaluateConsolidationQueueAge(ringWith(null)).state).toBe("no-data");
+  });
+});
+
+/**
+ * `llm-fallback-ineffective`. The pre-existing OpenRouter-adjacent checks all
+ * alert on OpenRouter *being used*, so a fallback that never fires reads as
+ * clean. This signal inverts that: because LiteLLM's router fallback happens
+ * INSIDE one hindsight request, a `success="false"` means the local
+ * deployment failed AND the OpenRouter hop did not rescue it.
+ */
+describe("evaluateLlmFallback", () => {
+  function llmWindow(n: number, ok: number, fail: number): Sample[] {
+    const out: Sample[] = [];
+    for (let i = 0; i < n; i++) out.push(sample(i, { llmOk: ok * i, llmFail: fail * i }));
+    return out;
+  }
+
+  it("pages when a tenth of calls fail outright despite the fallback", () => {
+    // 4 intervals × (36 ok + 4 fail) = 144 ok / 16 fail = 160 calls, 10.0%.
+    const v = evaluateLlmFallback(llmWindow(5, 36, 4));
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("page");
+    expect(v.measured?.rate).toBeCloseTo(0.1, 6);
+  });
+
+  it("warns in the 2-10% band", () => {
+    const v = evaluateLlmFallback(llmWindow(5, 40, 2));
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("warn");
+  });
+
+  it("is clean at the fleet's measured 0/800", () => {
+    expect(evaluateLlmFallback(llmWindow(5, 200, 0)).state).toBe("ok");
+  });
+
+  it("reports no-data below the call floor rather than pass on one bad call", () => {
+    // 1 failure out of 2 calls is 50%, but two calls is not evidence.
+    const v = evaluateLlmFallback(llmWindow(2, 1, 1));
+    expect(v.state).toBe("no-data");
+  });
+
+  it("credits the whole value on a counter reset instead of a negative delta", () => {
+    // hindsight restarts mid-window: fail goes 500 → 30. A naive next-prev is
+    // -470, which would read as a healthy window at the exact moment the
+    // backend crashed.
+    const ring = [
+      sample(0, { llmOk: 5000, llmFail: 500 }),
+      sample(1, { llmOk: 40, llmFail: 30 }),
+    ];
+    const v = evaluateLlmFallback(ring);
+    expect(v.measured?.fail).toBe(30);
+    expect(v.measured?.total).toBe(70);
+  });
+
+  it("reports no-data when the exposition carries no LLM counter at all", () => {
+    expect(evaluateLlmFallback([sample(0), sample(1)]).state).toBe("no-data");
   });
 });

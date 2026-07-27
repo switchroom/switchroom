@@ -132,15 +132,23 @@ export function applyHysteresis(
   return { next, transition: "none" };
 }
 
-function firingHeader(signal: SignalId): string {
-  return `🔴 hindsight: ${signal}`;
+/**
+ * Alert header. A `warn`-severity breach gets an orange dot and the word
+ * "degraded", so an operator can triage from the notification shade without
+ * opening a terminal. Anything else keeps the original red — including every
+ * pre-existing signal, none of which sets a severity.
+ */
+function firingHeader(v: Verdict): string {
+  return v.severity === "warn"
+    ? `🟠 hindsight: ${v.signal} degraded`
+    : `🔴 hindsight: ${v.signal}`;
 }
 
 /** Operator DM for a signal going (or staying) firing. */
 export function formatFiring(v: Verdict, repeat: boolean): string {
   const still = repeat ? " (still firing)" : "";
   return (
-    `${firingHeader(v.signal)}${still}\n` +
+    `${firingHeader(v)}${still}\n` +
     `${v.detail}\n` +
     `Check: switchroom hindsight-watch --dry-run`
   );

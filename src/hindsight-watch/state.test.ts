@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultStatePath, loadState, pushSample, saveState } from "./state.js";
+import {
+  defaultStatePath,
+  loadState,
+  normalizeConsolidationSample,
+  normalizeRecallSample,
+  pushSample,
+  saveState,
+} from "./state.js";
 import { MAX_SAMPLE_AGE_MS, RING_MAX } from "./thresholds.js";
 import { emptyState, type Sample } from "./types.js";
 
@@ -57,7 +64,82 @@ describe("loadState", () => {
     const s = pushSample(emptyState(), sample(42));
     s.signals["retain-failure-rate"] = { status: "firing", breaches: 3, clears: 0, firedAt: 7 };
     saveState(p, s);
-    expect(loadState(p)).toEqual(s);
+    // `loadState` materializes the optional recall/consolidation blocks as
+    // explicit `null` (the validated "we have no measurement" value) rather
+    // than leaving them absent, so an evaluator can never read `undefined` and
+    // compute a NaN comparison that silently passes.
+    expect(loadState(p)).toEqual({
+      ...s,
+      ring: s.ring.map((r) => ({ ...r, recall: null, consolidation: null })),
+    });
+  });
+});
+
+/**
+ * The fail-open shape this whole change exists to remove, applied to the
+ * watchdog's OWN persisted state: `undefined / undefined` is NaN, and every
+ * `NaN >= threshold` comparison is false — so a partially-written `recall`
+ * block would score as a clean pass on all six recall signals.
+ */
+describe("normalizeRecallSample", () => {
+  const good = {
+    rows: 100,
+    agents: 12,
+    timeoutConsidered: 100,
+    ownBankDegraded: 86,
+    zeroConsidered: 100,
+    zeroResult: 47,
+    poolConsidered: 100,
+    poolMedian: 0,
+    scoreConsidered: 100,
+    scoreP50: 0.001,
+    elapsedConsidered: 100,
+    elapsedP95Ms: 8023,
+  };
+
+  it("accepts a complete block", () => {
+    expect(normalizeRecallSample(good)).toEqual(good);
+  });
+
+  it("rejects a block missing ANY count field, rather than zero-filling it", () => {
+    for (const k of Object.keys(good)) {
+      const partial: Record<string, unknown> = { ...good };
+      delete partial[k];
+      expect(`${k}:${normalizeRecallSample(partial)}`).toBe(`${k}:null`);
+    }
+  });
+
+  it("rejects NaN, Infinity and negative counts", () => {
+    expect(normalizeRecallSample({ ...good, rows: Number.NaN })).toBeNull();
+    expect(normalizeRecallSample({ ...good, rows: Number.POSITIVE_INFINITY })).toBeNull();
+    expect(normalizeRecallSample({ ...good, ownBankDegraded: -1 })).toBeNull();
+    expect(normalizeRecallSample({ ...good, poolMedian: Number.NaN })).toBeNull();
+  });
+
+  it("allows a null statistic (its sample was legitimately empty)", () => {
+    expect(normalizeRecallSample({ ...good, poolMedian: null })).not.toBeNull();
+  });
+
+  it("tolerates an absent diagnostic error field — no threshold reads it", () => {
+    expect(normalizeRecallSample({ ...good, topError: "ReadTimeout" })?.topError).toBe("ReadTimeout");
+    expect(normalizeRecallSample(good)).not.toBeNull();
+  });
+
+  it("rejects a non-object", () => {
+    expect(normalizeRecallSample(null)).toBeNull();
+    expect(normalizeRecallSample(undefined)).toBeNull();
+    expect(normalizeRecallSample(7)).toBeNull();
+  });
+});
+
+describe("normalizeConsolidationSample", () => {
+  it("accepts a complete block and rejects a partial one", () => {
+    expect(normalizeConsolidationSample({ pending: 77, oldestAgeS: 14327 })).toEqual({
+      pending: 77,
+      oldestAgeS: 14327,
+    });
+    expect(normalizeConsolidationSample({ pending: 77 })).toBeNull();
+    expect(normalizeConsolidationSample({ pending: 77, oldestAgeS: Number.NaN })).toBeNull();
   });
 });
 

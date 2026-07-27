@@ -258,6 +258,217 @@ intends to fill it should raise `resources.memory` alongside. Agents pick the
 new size up when their container is recreated; a running container keeps the
 mount it booted with.
 
+### The memory watchdog is armed, and it can finally see recall
+
+`switchroom hindsight-watch` shipped complete and tested in #3617 with a
+CHANGELOG line reading *"This does not install a cron"* and four manual steps
+in `docs/hindsight-watch.md`. The steps were never run. Verified on this host
+before this change: no `/etc/cron.d/hindsight-watch`, no
+`~/.switchroom/hindsight-watch/state.json`, no log file — **the watchdog had
+never executed.** Meanwhile the fleet's auto-recall ran at 86 % own-bank
+timeout for six weeks and no alert fired.
+
+Two independent failures, one root cause each.
+
+**The watchdog was never armed.** A doc that has to be obeyed is not a
+mechanism. `switchroom hindsight-watch --install-cron` now writes the fragment
+itself — 15-minute cadence, `flock -n` so a slow tick cannot be overlapped by
+the next, an explicit `PATH` (cron's default has no `docker`, which the
+container and consolidation probes shell out to), a trailing newline (cron
+silently ignores a fragment without one), mode 0644, idempotent. It **refuses
+to install for `root`**, because root's `$HOME` is not where the state file and
+agents scaffold live, so a root tick would read an empty fleet and report a
+clean bill of health forever — the precise failure being eliminated.
+
+And `switchroom doctor` now **FAILs** while the watchdog is unarmed or its
+state file is stale past an hour, distinguishing "not installed" from
+"installed but cron isn't running". A monitoring system whose own absence is
+silent is not a monitoring system.
+
+**Every armed signal watched retain and liveness; none watched recall.** That
+was not an oversight so much as a consequence of the recall path failing open
+at every layer: `recall.py` exits 0 on a bank timeout (blocking the user's
+prompt would be worse), Claude Code swallows hook stderr on a zero exit, the
+agent is handed an empty context indistinguishable from "nothing relevant",
+and both `probeHindsight` (one MCP `initialize`) and the container healthcheck
+(`GET /health` + a TCP connect) are satisfied by a recall path that answers
+fast and empty. Five signals now read `recall_log.jsonl`, the hook's own and
+only durable telemetry:
+
+Measured by an actual `--dry-run` against the live fleet (430 in-window rows,
+8 agents contributing, 2026-07-27):
+
+| Signal | Warn / page | Live reading | Verdict |
+|---|---|---|---|
+| `recall-own-bank-timeout` | >5 % / >15 % | **88.4 %** (380/430) — healthy agents 0 % | PAGE |
+| `recall-candidate-floor` | ≤8 / ≤3 | **median 0** — healthy agents 28–40 | PAGE |
+| `recall-injected-score` | ≤0.02 / ≤0.01 | **p50 0.0013** (n=198) — healthy p50 0.0850 | PAGE |
+| `recall-zero-memory` | >25 % / >40 % | **54.0 %** (232/430) | PAGE |
+| `consolidation-queue-age` | ≥2 h / ≥12 h | **4.6 h**, 122 pending | WARN |
+| `llm-fallback-ineffective` | ≥2 % / ≥10 % | **0.00 %** (0/800) | clean |
+
+`consolidation-queue-age` correctly lands on WARN, not PAGE — evidence the
+severity split is doing real work rather than turning everything red, and the
+warn itself is aligned to the `SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S` default
+already in `docker/hindsight-maintenance.sh` so the push and pull views agree.
+
+**Two of the proposed thresholds did not survive calibration, and that is the
+part of this change worth reading.** The table above is measured DURING the
+outage, so it only demonstrates that a line can see the outage — the easy
+half. The hard half is not firing once the outage is fixed, and answering it
+needs a different population: rows where recall SUCCEEDED (no bank timed out,
+errored, or hit the shared deadline), which is the best available proxy for a
+repaired fleet. Over full log history that is n=183 across 9 agents, and two
+lines failed against it:
+
+- **`recall-latency` is deleted, not retuned.** Healthy recall measures p50
+  **6420 ms** and p95 **8037 ms**, with every one of the nine agents' healthy
+  p95 between 7816 ms and 11859 ms. The drafted page line of 6000 ms sat
+  *below the healthy median*; resampled into 60-row windows it fires on >90 %
+  of healthy traffic. The failure mode was the worst kind for a watchdog: once
+  the recall fixes land and every other signal goes quiet, this one would page
+  every 15 minutes forever on a working fleet. Raising it does not save it —
+  the per-bank budget is 8 s, so any line clear of healthy noise can only mean
+  "pinned at the deadline", which `recall-own-bank-timeout` already reports
+  from a cleaner instrument. This is the identical defect this file recorded
+  when it deleted `RETAIN_P95_SECONDS`, reintroduced one signal-set later and
+  caught the same way. Wall time is still summarised and still shown, riding
+  along on the own-bank-timeout DM as diagnostic context; it just carries no
+  threshold until the distribution can be re-baselined against a fixed fleet
+  (#3792 — gated on that measurement, not on a date).
+- **`recall-injected-score` warn moves 0.05 → 0.02.** The page line at 0.01 is
+  sound and unchanged: healthy p50 0.0850 against degraded 0.0006 is a ~140×
+  separation with a 0.0 % bootstrap false-page rate. The warn was not. The
+  healthy distribution is bimodal, spanning p10 0.0005 to p90 0.9259, so its
+  p50 cleared 0.05 by only 1.7× — and because a tick reads a ~60-row window,
+  resampling puts the false-warn rate at **22.8 %**, roughly one healthy tick
+  in four. Hysteresis does not rescue that, since consecutive ticks read
+  overlapping 200-row / 24 h windows and their breaches are correlated rather
+  than independent. An earlier draft of the comment also claimed a healthy
+  agent's 0.061 was "two orders of magnitude above the warn line" when it is
+  1.2× — that arithmetic error is what let the line through, and it is
+  recorded in `thresholds.ts` rather than quietly fixed. At 0.02 the measured
+  false-warn rate is 0.8 % at a 60-row window and 0.0 % at 100 rows, while
+  98.8 % of degraded rows still fall below it. The residual 0.02 → 0.01 band is
+  narrow, and that is a property of the p50 on a bimodal distribution rather
+  than of the constant: the better-conditioned statistic is the FRACTION of
+  injected rows below a fixed floor (healthy 28.4 % vs degraded 98.4 % at a
+  0.01 floor, bootstrapping to 0.00 % false-fire and 100 % detection across a
+  0.60–0.90 band). Filed as #3793 rather than substituted after review, because
+  changing the estimator changes what the signal means.
+
+The remaining five lines were checked the same way and hold: healthy own-bank
+timeout is exactly 0 % against a 5 % warn, healthy pool median is 41 against a
+warn of 8, and healthy zero-memory is 15.3 % against a 25 % warn — that last
+being the thinnest headroom on the board at 1.6× and the one most likely to
+need attention next.
+
+**`recall-candidate-floor` and `recall-injected-score` are the two that
+matter.** `doctor-recall-health.ts` deliberately does not score `result_count`
+because an empty match is legitimately common, which leaves one failure shape
+completely invisible — a recall that is fast, successful, and near-empty.
+Those two signals are the only things that see it, and a test asserts they
+page while own-bank-timeout and zero-memory both read clean.
+
+The reduction is fail-**closed** throughout, because the fail-open default
+("field missing ⇒ 0 ⇒ fine") is the bug class being fixed. Each SLI carries
+its own denominator (topic-filtered rows carry `result_count` but no
+`bank_timings`, so one shared denominator would silently dilute whichever rate
+came second); cache hits are excluded wholesale; the overlap gate's drops are
+added back into the candidate pool, since scoring `pre_cap_count` raw would
+read an aggressive gate as an empty index and point at the wrong fix; rows over
+24 h old are dropped so a fleet whose recall stopped entirely cannot page
+forever off a frozen log; and a partial persisted `recall` block is rejected to
+`null` rather than zero-filled — `undefined / undefined` is `NaN` and every
+`NaN >= threshold` is false, so a corrupt block would otherwise have scored as
+a clean pass on every recall signal at once.
+
+Breaches now carry a severity: `warn` renders 🟠 "… degraded", `page` renders
+🔴. Every pre-existing signal sets no severity and is unchanged.
+
+**The healthy-fleet test now replays the real distribution.** The fixture it
+replaces built every row at `elapsedMs: 1100` and a constant score of 0.31,
+then asserted "recall signals stay silent on a healthy fleet" — a name that
+promises threshold SAFETY while the numbers could only demonstrate threshold
+DIRECTION. Against constants chosen mid-range, every line in the drafted range
+stays silent, including both of the ones that were wrong. So the fixture is
+now a captured sample of 183 real recalls that succeeded
+(`healthy-fleet.fixture.ts`, numeric telemetry only — bank ids remapped, no
+query text), and the safety claim is asserted as what it actually is: a
+false-positive RATE, measured by resampling the fixture into tick-sized windows
+with a seeded PRNG. The shipped injected-score warn must fire on <5 % of
+healthy windows; the rejected 0.05 must fire on >10 %; and every latency line
+below the 8 s budget must fire on >90 %, which is the deletion argument stated
+as a test rather than as prose. Reverting the warn to 0.05 leaves
+"no recall signal breaches" green and fails the rate test — the exact gap that
+let it through the first time.
+
+**An oversized `/metrics` body degrades instead of blinding the watchdog.**
+`probeMetrics` threw past `METRICS_MAX_BYTES`, the throw surfaced as a
+`ProbeError`, and `probeOnce` aborts the whole tick on one — at which point
+`run.ts` correctly reports nothing else, because a blind watchdog must not
+issue confident verdicts. The consequence was that a body one byte over the
+cap silenced the recall signals too, and those are read from local JSONL files
+that were perfectly readable. A self-imposed buffer limit should not be able to
+blind a signal it has nothing to do with. Over-cap now raises a distinct
+`MetricsTooLargeError`, which `probeOnce` alone catches: the metrics-derived
+signals (`retain-failure-rate`, `llm-fallback-ineffective`) go `no-data` —
+inert, never a pass — and everything else evaluates normally. Every other
+metrics failure (unreachable, non-200, unparseable) still blinds the tick,
+because those do mean the watchdog cannot see hindsight. It is deliberately
+NOT truncate-and-parse: a truncated exposition missing the `success="false"`
+series would read as zero failures, which is fail-open.
+
+The cap itself was 4 MB with a comment claiming that was "~16× the current
+body", measured when the body was 258,741 B. It is now **1,889,558 B**, so the
+margin was 2.1× — and this change's per-bank labels project it to ~3.1 MB, or
+76 % of the cap. Raised to 16 MB, restoring ~5×. In a file whose stated premise
+is that no threshold is a guess, a 7× stale measurement guarding a hard failure
+was worth correcting on its own.
+
+### Two observability gaps that made the incident harder to diagnose than it needed to be
+
+**Per-bank metric labels are on.** `hindsight_operation_duration_seconds`
+carried `operation`/`source`/`success`/`budget`/`tenant` and nothing
+identifying the *bank*, so no per-bank SLO was expressible from `/metrics` at
+all — through the regression the aggregate histogram looked merely mediocre
+while overlord and klanker sat near 97 % own-bank timeout and lawgpt at 0 %, an
+outage on two banks averaged into a shrug across twelve. This needed no patch:
+hindsight already emits the label (`metrics.py:517`), gated behind
+`HINDSIGHT_API_METRICS_INCLUDE_BANK_ID`, which upstream defaults **off** "to
+avoid high-cardinality OTel metric growth". That is the right default for a
+multi-tenant SaaS and the wrong one for a fleet that is single-tenant by
+invariant, where the label's cardinality is the agent roster. So it is one line
+in `src/setup/hindsight.ts`, not a Dockerfile patch.
+
+**`recall_log.jsonl` rows now carry an `error` STRING.** Every failure channel
+on a row was a boolean — `deadline_hit`, `bank_errored`, per-bank
+`timed_out`/`errored` — which says *that* something broke and never *which*
+thing, so a log full of `errored: true` could not distinguish a connection
+refused from a 500 from a bad bank id. The reason existed only on the
+`[Hindsight] Recall failed: …` stderr line that Claude Code swallows. Rows now
+carry a bounded, type-prefixed, single-line reason per bank plus a row-level
+summary (own bank first, side banks named), and the watchdog puts the modal
+reason into the operator DM, so an alert says *"ReadTimeout:
+HTTPConnectionPool…"* rather than only *"86 %"*.
+
+### `llm-fallback-ineffective`: alerting on a fallback that never fires
+
+The pre-existing OpenRouter-adjacent checks all alert on OpenRouter *being
+used*, so a fallback that never fires reads as clean. There was no check to
+un-invert — and inverting the nearest one, `litellm-header-passthrough-misconfig`,
+would breach the Claude-native invariant it exists to protect.
+
+The reason there is nothing to invert is structural: LiteLLM's router fallback
+happens **inside** a single hindsight request, so hindsight records only the
+model it *asked* for and no `*-openrouter` series appears on `/metrics` at all
+(verified: zero series, 2026-07-27). The question is therefore best asked
+positively — a `success="false"` on `hindsight_llm_calls_total` means the local
+deployment failed **and** the OpenRouter hop did not rescue it. The new signal
+warns at ≥2 % and pages at ≥10 % of hindsight LLM calls failing outright
+(measured today: 0/800). No LiteLLM configuration was touched.
+
+
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
 ### The per-scope observation cap is an overridable managed key

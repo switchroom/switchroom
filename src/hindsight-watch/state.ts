@@ -38,9 +38,74 @@ export function loadState(path: string): WatchState {
   if (typeof parsed !== "object" || parsed === null) return emptyState();
   const s = parsed as Partial<WatchState>;
   if (s.v !== 1 || !Array.isArray(s.ring)) return emptyState();
-  const ring = s.ring.filter(isSample).slice(-RING_MAX);
+  const ring = s.ring
+    .filter(isSample)
+    .map((sample) => ({
+      ...sample,
+      recall: normalizeRecallSample(sample.recall),
+      consolidation: normalizeConsolidationSample(sample.consolidation),
+    }))
+    .slice(-RING_MAX);
   const signals = typeof s.signals === "object" && s.signals !== null ? s.signals : {};
   return { v: 1, ring, signals };
+}
+
+/**
+ * A count field is valid when it is a finite, non-negative number.
+ *
+ * Load-bearing rather than pedantic. If a persisted `recall` block carried
+ * `undefined` for a field — an older build, a hand-edited file, a partial
+ * write — the evaluators would compute `undefined / undefined = NaN`, and
+ * every `NaN >= threshold` comparison is FALSE. A corrupt block would
+ * therefore evaluate as a clean pass on all six recall signals: the exact
+ * fail-open shape this whole change exists to remove. Validating here drops a
+ * bad block to `null`, which the evaluators report as `no-data` — inert,
+ * visible, and never a silent all-clear.
+ */
+function isCount(x: unknown): x is number {
+  return typeof x === "number" && Number.isFinite(x) && x >= 0;
+}
+
+/** A statistic that is legitimately absent when its sample was empty. */
+function isNullableStat(x: unknown): x is number | null {
+  return x === null || (typeof x === "number" && Number.isFinite(x));
+}
+
+/**
+ * Validate a persisted `recall` block, or drop it to `null`.
+ *
+ * All-or-nothing: a block missing ANY field is rejected wholesale rather than
+ * patched with zeroes, because a zero here is indistinguishable from a real
+ * measurement of zero and would score as either a perfect pass or a false
+ * page depending on the SLI.
+ */
+export function normalizeRecallSample(x: unknown): Sample["recall"] {
+  if (x === null || typeof x !== "object") return null;
+  const r = x as Record<string, unknown>;
+  const counts = [
+    "rows",
+    "agents",
+    "timeoutConsidered",
+    "ownBankDegraded",
+    "zeroConsidered",
+    "zeroResult",
+    "poolConsidered",
+    "scoreConsidered",
+    "elapsedConsidered",
+  ];
+  if (!counts.every((k) => isCount(r[k]))) return null;
+  if (!isNullableStat(r.poolMedian)) return null;
+  if (!isNullableStat(r.scoreP50)) return null;
+  if (!isNullableStat(r.elapsedP95Ms)) return null;
+  return x as Sample["recall"];
+}
+
+/** Validate a persisted `consolidation` block, or drop it to `null`. */
+export function normalizeConsolidationSample(x: unknown): Sample["consolidation"] {
+  if (x === null || typeof x !== "object") return null;
+  const c = x as Record<string, unknown>;
+  if (!isCount(c.pending) || !isCount(c.oldestAgeS)) return null;
+  return x as Sample["consolidation"];
 }
 
 function isSample(x: unknown): x is Sample {
@@ -49,8 +114,13 @@ function isSample(x: unknown): x is Sample {
   return (
     typeof s.ts === "number" &&
     Number.isFinite(s.ts) &&
-    typeof s.retainOk === "number" &&
-    typeof s.retainFail === "number" &&
+    // `retainOk`/`retainFail` are deliberately NOT required: a tick whose
+    // `/metrics` body was over the cap persists without them, and discarding
+    // that sample would also discard its recall block, which was fine. They
+    // are type-checked only when present — `evaluateFailureRate` skips any
+    // interval missing them rather than zero-filling.
+    (s.retainOk === undefined || typeof s.retainOk === "number") &&
+    (s.retainFail === undefined || typeof s.retainFail === "number") &&
     typeof s.pending === "number" &&
     typeof s.dead === "number" &&
     typeof s.evicted === "number" &&
