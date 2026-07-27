@@ -120,7 +120,7 @@ describe('queueFloodBlockedReply', () => {
     const text = 'the answer the operator is waiting for'
     const res = queueFloodBlockedReply({
       err: floodWaitActiveError(15908),
-      chatId: '8248703757',
+      chatId: '12345',
       threadId: null,
       text,
       priorityClass: 'critical',
@@ -132,7 +132,7 @@ describe('queueFloodBlockedReply', () => {
     expect(records).toHaveLength(1)
     // THE outcome: the content is on disk, verbatim.
     expect(records[0]!.text).toBe(text)
-    expect(records[0]!.chatId).toBe('8248703757')
+    expect(records[0]!.chatId).toBe('12345')
     expect(records[0]!.source).toBe(FLOOD_QUEUED_SOURCE)
     // And the caller is told it is queued, not delivered, and told not to resend.
     expect(res!.notice).toMatch(/QUEUED/)
@@ -266,7 +266,7 @@ describe('end-to-end: queued during the window, delivered after it closes', () =
     // 2. The user-facing send is refused by that window.
     const queued = queueFloodBlockedReply({
       err: floodWaitActiveError(15908),
-      chatId: '8248703757',
+      chatId: '12345',
       threadId: null,
       text: answer,
       priorityClass: 'critical',
@@ -310,7 +310,7 @@ describe('end-to-end: queued during the window, delivered after it closes', () =
     expect(closed.delivered).toBe(1)
     expect(send).toHaveBeenCalledTimes(1)
     const [chatId, threadId, delivered] = send.mock.calls[0]! as unknown as [string, number | null, string]
-    expect(chatId).toBe('8248703757')
+    expect(chatId).toBe('12345')
     expect(threadId).toBeNull()
     expect(delivered).toContain(answer)
 
