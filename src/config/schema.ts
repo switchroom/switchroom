@@ -656,6 +656,41 @@ export const AgentMemorySchema = z
             "`injected_additional_bank_count` via " +
             "`switchroom memory recall-log`.",
           ),
+        min_score: z
+          .number()
+          .min(0)
+          .optional()
+          .describe(
+            "Absolute floor on a memory's engine relevance score " +
+            "(`scores.final`) for it to be injected. 0 disables (default, " +
+            "and the shipped fleet behaviour). Exists for one measured " +
+            "failure: when the agent's own bank times out, recall still " +
+            "injects side-bank residue under the banner 'Relevant memories " +
+            "from past conversations' — 98.4% of degraded turns have a best " +
+            "injected score below 0.01, against 28.4% of healthy ones. Six " +
+            "noise memories are worse than none, because the agent cannot " +
+            "tell them apart. Below-floor results are dropped BEFORE " +
+            "rendering, and when the floor empties the set the turn says so " +
+            "rather than going silent. Do NOT read this as a general " +
+            "precision control: `scores.final` is not calibrated across " +
+            "queries, and #3761 measured that an unconditional 0.01 floor " +
+            "empties ~28% of HEALTHY recalls — which is why " +
+            "`min_score_scope` defaults to degraded turns only. Observe " +
+            "`dropped_below_min_score` via `switchroom memory recall-log`.",
+          ),
+        min_score_scope: z
+          .enum(["degraded", "all"])
+          .optional()
+          .describe(
+            "Which turns `min_score` binds on. \"degraded\" (default) — only " +
+            "turns where the agent's OWN bank timed out or was unreachable, " +
+            "the population where a below-floor score actually predicts " +
+            "noise and where the agent already receives the degraded-recall " +
+            "disclosure. \"all\" — every turn; only for an operator who has " +
+            "measured their own bank's score distribution, since it " +
+            "re-creates the empty-recall failure of #3541 at any floor " +
+            "calibrated on degraded data. No effect while `min_score` is 0.",
+          ),
         types: z
           .array(z.string())
           .optional()
@@ -2941,6 +2976,8 @@ const profileFields = {
           request_timeout_seconds: z.number().int().min(1).optional(),
           own_bank_min_slots: z.number().int().min(0).optional(),
           additional_bank_min_slots: z.number().int().min(0).optional(),
+          min_score: z.number().min(0).optional(),
+          min_score_scope: z.enum(["degraded", "all"]).optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })

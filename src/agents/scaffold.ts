@@ -3288,6 +3288,25 @@ const HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT = 2;
 const HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT = 1;
 
 /**
+ * Absolute relevance floor for injected memories (#3837), switchroom's shipped
+ * default: OFF.
+ *
+ * 0 disables the filter outright in recall.py (`_filter_by_min_score`
+ * short-circuits), so the fleet's injected sets are unchanged by #3837 until an
+ * operator opts in. That is deliberate and it is what the measurement supports:
+ * a below-floor `scores.final` predicts noise on a DEGRADED own-bank read
+ * (98.4% of those rows have a best injected score under 0.01) but not on a
+ * healthy one (28.4% do), and the score is not calibrated across queries, so
+ * there is no fleet-wide value safe to turn on unmeasured.
+ *
+ * The scope constant is the population a non-zero floor binds on and defaults
+ * to "degraded" for the same reason — it is inert while the floor is 0. Both
+ * are exported unconditionally for the #3774 reason above.
+ */
+const HINDSIGHT_RECALL_MIN_SCORE_DEFAULT = 0;
+const HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT = "degraded";
+
+/**
  * Merge switchroom-specific overrides into the vendored hindsight
  * plugin's `settings.json`. Idempotent — runs after every plugin
  * copy on every scaffold/reconcile/restart.
@@ -3654,6 +3673,10 @@ interface BuildWorkspaceContextArgs {
   // these unconditionally so a stale claude-code.json cannot shadow them.
   hindsightRecallOwnBankMinSlots: number;
   hindsightRecallAdditionalBankMinSlots: number;
+  // #3837 — absolute relevance floor + the population it binds on. Also always
+  // resolved and always exported (0 = off, the shipped default).
+  hindsightRecallMinScore: number;
+  hindsightRecallMinScoreScope: string;
   // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
@@ -3704,6 +3727,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallRequestTimeoutSeconds,
     hindsightRecallOwnBankMinSlots,
     hindsightRecallAdditionalBankMinSlots,
+    hindsightRecallMinScore,
+    hindsightRecallMinScoreScope,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -3793,6 +3818,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallRequestTimeoutSeconds,
     hindsightRecallOwnBankMinSlots,
     hindsightRecallAdditionalBankMinSlots,
+    hindsightRecallMinScore,
+    hindsightRecallMinScoreScope,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -4742,6 +4769,15 @@ export function scaffoldAgent(
   const hindsightRecallAdditionalBankMinSlots =
     agentConfig.memory?.recall?.additional_bank_min_slots ??
     HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
+  // #3837 score floor. Same unconditional-export treatment as the slot floors
+  // (#3774): a conditional export would let a stale hand-edited
+  // `~/.hindsight/claude-code.json` silently turn a filter ON that switchroom
+  // ships OFF. Resolving to 0 here makes "disabled" the authoritative state.
+  const hindsightRecallMinScore =
+    agentConfig.memory?.recall?.min_score ?? HINDSIGHT_RECALL_MIN_SCORE_DEFAULT;
+  const hindsightRecallMinScoreScope =
+    agentConfig.memory?.recall?.min_score_scope ??
+    HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -4822,6 +4858,8 @@ export function scaffoldAgent(
     hindsightRecallRequestTimeoutSeconds,
     hindsightRecallOwnBankMinSlots,
     hindsightRecallAdditionalBankMinSlots,
+    hindsightRecallMinScore,
+    hindsightRecallMinScoreScope,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -7214,6 +7252,15 @@ function reconcileAgentInner(
   const hindsightRecallAdditionalBankMinSlots =
     agentConfig.memory?.recall?.additional_bank_min_slots ??
     HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
+  // #3837 score floor. Same unconditional-export treatment as the slot floors
+  // (#3774): a conditional export would let a stale hand-edited
+  // `~/.hindsight/claude-code.json` silently turn a filter ON that switchroom
+  // ships OFF. Resolving to 0 here makes "disabled" the authoritative state.
+  const hindsightRecallMinScore =
+    agentConfig.memory?.recall?.min_score ?? HINDSIGHT_RECALL_MIN_SCORE_DEFAULT;
+  const hindsightRecallMinScoreScope =
+    agentConfig.memory?.recall?.min_score_scope ??
+    HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -7318,6 +7365,8 @@ function reconcileAgentInner(
       hindsightRecallRequestTimeoutSeconds,
       hindsightRecallOwnBankMinSlots,
       hindsightRecallAdditionalBankMinSlots,
+      hindsightRecallMinScore,
+      hindsightRecallMinScoreScope,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
@@ -8106,6 +8155,8 @@ function reconcileAgentInner(
       hindsightRecallRequestTimeoutSeconds,
       hindsightRecallOwnBankMinSlots,
       hindsightRecallAdditionalBankMinSlots,
+      hindsightRecallMinScore,
+      hindsightRecallMinScoreScope,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,

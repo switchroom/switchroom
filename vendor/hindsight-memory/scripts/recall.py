@@ -580,6 +580,101 @@ def _injected_score_stats(results) -> dict:
         return empty
 
 
+# Switchroom #3837 — opt-in absolute score floor (`recallMinScore`).
+#
+# READ #3761 FIRST. It removed the lexical `recallMinOverlap` gate and stated
+# "no replacement floor", on a 330-query replay showing that for EVERY floor
+# value tested `top1lost% == zero%`: a floor at 0.001 took zero-result recalls
+# from 5.8% to 28.2%, at 0.05 to 40.6%. That measurement stands and this change
+# does not contradict it — which is why the floor ships DISABLED (0.0) and why
+# its default scope is not "every turn".
+#
+# What #3761 did not separate is the CONDITION of the bank read. Measured
+# fleet-wide from `recall_log.jsonl` on 2026-07-27 and recorded independently
+# in `src/hindsight-watch/thresholds.ts` (RECALL_SCORE_P50_PAGE):
+#
+#   own bank HEALTHY  (n=74)   p50 injected_score_max 0.0850   28.4% below 0.01
+#   own bank DEGRADED (n=247)  p50 injected_score_max 0.0006   98.4% below 0.01
+#
+# A ~140x separation in the p50, and the below-0.01 fraction separates
+# 28.4% vs 98.4%. Two conclusions follow, and only the second is actionable:
+#
+#   * On a HEALTHY turn a low `scores.final` does NOT imply noise. The healthy
+#     distribution is bimodal, p10 0.0005 to p90 0.9259 — the score is not
+#     calibrated across queries, so 28.4% of perfectly good turns would be
+#     emptied by a 0.01 floor. That is #3761's result, reproduced. A floor
+#     applied unconditionally re-creates #3541.
+#   * On a DEGRADED turn — the agent's own bank timed out or was unreachable,
+#     so what survives is side-bank residue — 98.4% of injected sets have a
+#     best score below 0.01, and the turn ALREADY carries
+#     `degraded_recall_notice`. Withholding that residue costs at most the
+#     1.6% tail and replaces "six memories presented as recall" with the
+#     honest "recall was DEGRADED, treat absence as UNKNOWN" the agent can
+#     act on. Injecting noise under the banner of recall is strictly worse
+#     than injecting nothing WITH a disclosure, because the agent cannot tell
+#     the two apart; injecting nothing WITHOUT a disclosure is the failure
+#     mode #3619 fixed and is not re-introduced here.
+#
+# Hence `recallMinScoreScope`, default "degraded": when the operator sets a
+# floor, it binds only on turns where the own-bank read was degraded, which is
+# the population the evidence supports. "all" widens it to every turn for an
+# operator who has measured their own bank and wants it — no fleet default
+# recommends that today.
+#
+# Nothing is dropped silently. When the floor empties a non-empty set the turn
+# emits `min_score_withheld_notice` (and the degraded notice too, when that
+# fired), so an empty recall is never mistaken for an empty memory. Per-turn
+# telemetry lands on `recall_log.jsonl` as `min_score_floor`,
+# `min_score_scope`, `min_score_applied` and `dropped_below_min_score`,
+# alongside the existing `injected_score_*` fields — the same instrument the
+# problem was measured with, so the effect is measurable the same way.
+def _filter_by_min_score(results, threshold: float):
+    """Drop results whose engine score (`scores.final`) is below `threshold`.
+
+    Returns ``(kept, dropped)``. ``threshold <= 0`` short-circuits to
+    passthrough with no iteration cost, so the disabled default cannot alter
+    the injected set.
+
+    A result carrying NO usable score is KEPT, never dropped. `-inf` is the
+    sentinel `_result_final_score` returns for a malformed or score-less
+    entry, and "the engine gave us no score" is not evidence of irrelevance —
+    dropping on it would turn a response-shape change upstream into silent
+    total recall loss. Same reasoning as the sort, which parks score-less
+    entries last rather than discarding them.
+    """
+    if threshold <= 0:
+        return results, 0
+    kept = []
+    dropped = 0
+    for m in results:
+        score = _result_final_score(m)
+        if score == float("-inf") or score >= threshold:
+            kept.append(m)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def min_score_withheld_notice(dropped: int, threshold: float) -> str:
+    """One line telling the agent that recall HAD candidates and withheld them.
+
+    Only meaningful when the floor emptied the injected set. The distinction
+    it preserves is #3619's: "I could not retrieve anything worth trusting" is
+    not "there is nothing to remember", and an agent that cannot tell those
+    apart asserts the second. Kept to a single short line — this fires on an
+    already-thin turn.
+    """
+    if dropped <= 0:
+        return ""
+    return (
+        f"[Hindsight] Memory recall returned {dropped} candidate "
+        f"{'memory' if dropped == 1 else 'memories'}, all scoring below the "
+        f"configured relevance floor ({threshold:g}), so none were injected. "
+        f"Treat an absence of relevant memory as UNKNOWN, not as 'nothing was "
+        f"remembered'."
+    )
+
+
 def _sort_by_final_score(results):
     """Sort merged multi-bank results by `scores.final` descending, in place.
 
@@ -1676,6 +1771,15 @@ def main():
                 # No directives block is built on a cache hit.
                 "directives_omitted": None,
                 "demoted_count": 0,
+                # #3837 score-floor fields, present for a uniformly queryable
+                # schema. A cache hit replays a formatted context block, not a
+                # result set, so the floor cannot have run: None (not 0.0/False)
+                # so a cache-hit row is never counted as an observed
+                # floor-disabled turn.
+                "min_score_floor": None,
+                "min_score_scope": None,
+                "min_score_applied": None,
+                "dropped_below_min_score": None,
                 "capped": False,
                 # #3541 quality telemetry — present for a uniformly queryable
                 # schema. A cache hit replays a formatted context block, not a
@@ -2146,6 +2250,45 @@ def main():
     # regardless of source bank. Stable sort: ties keep own-bank-first order.
     _sort_by_final_score(results)
 
+    # Switchroom #3619 — DEGRADED-RECALL DISCLOSURE. Computed HERE rather than
+    # at emit time because the #3837 score floor is scoped by it: the same
+    # single source of truth for "the agent's own bank did not answer" decides
+    # both whether the floor binds and what the agent is told. See
+    # `degraded_recall_notice` for why only the agent's OWN bank counts.
+    degraded_block = degraded_recall_notice(bank_id, bank_timings)
+
+    # Switchroom #3837 — opt-in absolute score floor. Runs AFTER the tag
+    # weights and the relevance sort (so it judges the same effective
+    # `scores.final` the ranking used) and BEFORE the head-slice cap, so the
+    # cap sees only survivors. Disabled by default (`recallMinScore` 0.0);
+    # when set it binds on degraded turns only unless the operator widens
+    # `recallMinScoreScope` to "all". The design note above
+    # `_filter_by_min_score` carries the measurement, and why #3761's "no
+    # replacement floor" finding is not contradicted by this.
+    min_score_floor = config.get("recallMinScore", 0.0)
+    if isinstance(min_score_floor, bool) or not isinstance(min_score_floor, (int, float)):
+        min_score_floor = 0.0
+    min_score_floor = float(min_score_floor)
+    min_score_scope = config.get("recallMinScoreScope", "degraded")
+    if min_score_scope not in ("degraded", "all"):
+        min_score_scope = "degraded"
+    min_score_applied = min_score_floor > 0 and (
+        min_score_scope == "all" or bool(degraded_block)
+    )
+    dropped_below_min_score = 0
+    if min_score_applied:
+        pre_min_score_count = len(results)
+        results, dropped_below_min_score = _filter_by_min_score(
+            results, min_score_floor
+        )
+        if dropped_below_min_score > 0:
+            debug_log(
+                config,
+                f"Score floor dropped {dropped_below_min_score}/"
+                f"{pre_min_score_count} memories below scores.final "
+                f"{min_score_floor} (scope={min_score_scope})",
+            )
+
     # Switchroom-local: client-side count cap. Plugin v0.4.0 has no
     # `recallTopK` in the Claude Code integration (Openclaw-only), and a
     # token budget alone doesn't bound count — a single long memory can
@@ -2333,6 +2476,19 @@ def main():
         # doctor's directive-count check will be FAILing too.
         "directives_omitted": count_omitted_directives(directives),
         "demoted_count": demoted_count,
+        # Switchroom #3837 — score-floor telemetry, deliberately alongside the
+        # `injected_score_*` fields below: those are what the floor was derived
+        # from, and these are what says whether it bound and what it cost.
+        # `min_score_floor` is the configured value (0.0 = disabled),
+        # `min_score_scope` the population it may bind on, `min_score_applied`
+        # whether it actually ran this turn, and `dropped_below_min_score` how
+        # many results it removed. dropped > 0 with result_count 0 is the case
+        # the feature exists for: candidates existed, all were noise, none were
+        # injected, and the agent was told so.
+        "min_score_floor": min_score_floor,
+        "min_score_scope": min_score_scope,
+        "min_score_applied": min_score_applied,
+        "dropped_below_min_score": dropped_below_min_score,
         "capped": capped,
         "pre_cap_count": pre_cap_count,
         "memory_ids": [
@@ -2430,10 +2586,17 @@ def main():
         "error": recall_error_summary(bank_id, bank_timings, directives_timed_out),
     })
 
-    # Switchroom #3619 — DEGRADED-RECALL DISCLOSURE. See
-    # `degraded_recall_notice` for why this exists and why only the agent's
-    # OWN bank counts.
-    degraded_block = degraded_recall_notice(bank_id, bank_timings)
+    # (`degraded_block` — the #3619 disclosure — was computed before the score
+    # floor above, which is scoped by it.)
+    #
+    # Switchroom #3837 — when the floor emptied a non-empty set, say so. Not
+    # emitted when survivors remain: a partial drop still injects real
+    # memories and does not change how the turn should be read.
+    withheld_block = (
+        min_score_withheld_notice(dropped_below_min_score, min_score_floor)
+        if not results
+        else ""
+    )
 
     # If no block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput. #2848: unless
@@ -2441,10 +2604,13 @@ def main():
     # (a correction with no memories/directives still needs the reminder).
     # #3619: a degraded own-bank read is likewise worth emitting alone — that
     # is precisely the turn on which the agent must not assume it remembers.
+    # #3837: so is a set the score floor withheld entirely.
     if not directives_block and not memories_block and not transcript_fallback_block:
-        if degraded_block or nudge_block:
+        if degraded_block or withheld_block or nudge_block:
             _emit_cached_context(
-                "\n\n".join([b for b in (degraded_block, nudge_block) if b])
+                "\n\n".join(
+                    [b for b in (degraded_block, withheld_block, nudge_block) if b]
+                )
             )
         return
 
@@ -2500,7 +2666,10 @@ def main():
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": _combine_context(
-                _combine_context(degraded_block, context_message), nudge_block
+                _combine_context(
+                    _combine_context(degraded_block, withheld_block), context_message
+                ),
+                nudge_block,
             ),
         }
     }
