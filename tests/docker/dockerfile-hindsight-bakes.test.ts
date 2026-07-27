@@ -329,6 +329,13 @@ describe("Dockerfile.hindsight shape", () => {
   //    it would fight a deliberate upstream design decision. The latency it
   //    bought is largely absorbed by the per-bank vector indexes that
   //    `hindsight-admin repair-bank` (upstream #2645) now maintains.
+  //
+  //    POSTSCRIPT (2026-07-27): upstream itself reversed that stance one day
+  //    later in PR #2968 (merge b475f5cc), reintroducing seed reuse *with* a
+  //    correctness guard — reuse only when the semantic floor is no stricter
+  //    than the graph seed floor. We now carry THAT (see the #2968 block), so
+  //    the guard below discriminates on the switchroom implementation's own
+  //    markers rather than on the generic `semantic_seeds` token.
   // ---------------------------------------------------------------------
   it("does NOT carry the retired max_turns/ToolSearch patch (upstream ships tools=[])", () => {
     expect(dockerfile).not.toMatch(/switchroom max_turns\/ToolSearch standard-call fix/);
@@ -343,10 +350,19 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).not.toMatch(/entity_records/);
   });
 
-  it("does NOT carry the retired duplicate-ANN-scan patch (upstream removed semantic_seeds)", () => {
-    expect(dockerfile).not.toMatch(/duplicate-ANN-scan/);
-    expect(dockerfile).not.toMatch(/semantic_seeds/);
-    expect(dockerfile).not.toMatch(/_find_semantic_seeds/);
+  it("does NOT carry the retired switchroom-authored duplicate-ANN-scan patch", () => {
+    // NOTE: the bare tokens `semantic_seeds` / `_find_semantic_seeds` are NOT
+    // usable as discriminators any more — the upstream #2968 carry below
+    // legitimately reintroduces seed reuse under upstream's OWN design, with
+    // upstream's correctness guard. What must stay dead is the *switchroom*
+    // implementation, whose premise ("the parameter already exists and is
+    // already honoured") 0.8.5 falsified. Its unique markers:
+    expect(dockerfile).not.toMatch(/switchroom hindsight duplicate-ANN-scan patch/);
+    expect(dockerfile).not.toMatch(/def _graph_semantic_seeds\(/);
+    expect(dockerfile).not.toMatch(/semantic_seeds=_graph_semantic_seeds\(/);
+    expect(dockerfile).not.toMatch(/_GRAPH_SEED_LIMIT/);
+    expect(dockerfile).not.toMatch(/_GRAPH_SEED_MIN_SIMILARITY/);
+    expect(dockerfile).not.toMatch(/temporal_seeds/);
   });
 
   it("keeps the cross-encoder saturation fix (assert-guarded, fail-loud)", () => {
@@ -826,6 +842,99 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /switchroom hindsight perturbed-JSON-retry patch: invalid-JSON retries now bypass the proxy response cache/,
     );
+  });
+
+  it("keeps the upstream #2968 graph-seed-reuse carry (assert-guarded, fail-loud)", () => {
+    // TEMPORARY CARRY. Upstream merged b475f5cc to `main` on 2026-07-27, after
+    // v0.8.5 (the digest pinned in this Dockerfile) was cut, so there is no
+    // release to upgrade to. DELETE the block — and flip this test into a
+    // `does NOT carry` guard alongside the other retired patches — the moment
+    // the FROM digest resolves to v0.8.6 or newer.
+    //
+    // SCOPE: structural, not behavioural. Every assertion here is a substring
+    // match, so it proves the patch is PRESENT, never that it RUNS. The
+    // behavioural gate is tests/docker/hindsight-graph-seed-patch.test.ts,
+    // which applies this block to the pinned image and asserts the derived
+    // seed ids equal the dedicated query's. Do not treat this file as
+    // sufficient.
+
+    // The provenance header must survive edits: without the merge SHA and the
+    // deletion condition, a future rebaser cannot tell an adopted carry from a
+    // switchroom-original patch.
+    expect(dockerfile).toMatch(
+      /# ── UPSTREAM CARRY: vectorize-io\/hindsight PR #2968 ─+/,
+    );
+    expect(dockerfile).toMatch(/#   merge commit:   b475f5cc/);
+    expect(dockerfile).toMatch(
+      /# DELETE THIS BLOCK WHEN, and only when, the `FROM` digest above resolves to\n# upstream v0\.8\.6 or newer/,
+    );
+
+    // The exact-once anchor guard (fail-loud on upstream drift). Shared by all
+    // five patched files via apply().
+    expect(dockerfile).toMatch(
+      /the \{label!r\} anchor was found \{n\}x \(expected 1\) in \{rel\}\./,
+    );
+
+    // The divergence guard. v0.8.5 hardcodes the graph seed floor; upstream
+    // main reads it from config. If a future base introduces the config key,
+    // the mirrored 0.3 would silently ignore the operator's setting, so the
+    // build must fail rather than diverge.
+    expect(dockerfile).toMatch(
+      /assert "graph_seed_min_similarity" not in _cfg,/,
+    );
+
+    // The load-bearing derivation, both halves.
+    expect(dockerfile).toMatch(
+      / +graph_seed_min_similarity=GRAPH_SEED_MIN_SIMILARITY,\\n"/,
+    );
+    expect(dockerfile).toMatch(
+      / +preselected_semantic_seeds=semantic_bm25_results\[ft\]\.graph_seeds,\\n"/,
+    );
+
+    // The CORRECTNESS GUARD is the reason this carry is safe at all: reuse is
+    // declined whenever the semantic arm's floor is stricter than the graph
+    // seed floor, because the shared pool would then be NARROWER than the
+    // dedicated query's result. Hard-coding the threshold would keep every
+    // other assertion green while silently quieting recall.
+    expect(dockerfile).toMatch(
+      /if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity/,
+    );
+    // ...and the trim must not be able to cut a seed out of the pool it feeds
+    // (thinking_budget below GRAPH_SEED_LIMIT).
+    expect(dockerfile).toMatch(
+      /semantic_candidate_limit = max\(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0\)/,
+    );
+    // An EMPTY preselected list must NOT re-trigger the scan; only None does.
+    expect(dockerfile).toMatch(/"            if preselected_semantic_seeds is None:\\n"/);
+
+    // The index-served UUID lookup, and the tolerance it must preserve:
+    // non-canonical ids matched nothing under `id::text` and must still match
+    // nothing, so they are filtered out BEFORE the ::uuid cast (which would
+    // otherwise raise 22P02 for the whole query).
+    expect(dockerfile).toMatch(/"            WHERE id = ANY\(\\n"/);
+    expect(dockerfile).toMatch(/SELECT input\.unit_id::uuid/);
+    expect(dockerfile).toMatch(
+      /WHERE input\.unit_id ~ '\^\[0-9a-f\]\{\{8\}\}-/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "id::text = ANY\(\$1\)" not in ops,/,
+    );
+
+    // Post-replace re-assertions (verification-on-build): a patch that applied
+    // but landed inert must fail the build.
+    expect(dockerfile).toMatch(
+      /assert le\.count\("await _find_semantic_seeds\("\) == 1,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert 'grouped\.get\("observation", \(\[\], \[\]\)\)\[0\]' not in cons,/,
+    );
+    // The repo-wide sweep: a missed caller of the reshaped combined query is an
+    // AttributeError on a live recall path, so it must be a build failure.
+    expect(dockerfile).toMatch(/for _p in BASE\.rglob\("\*\.py"\):/);
+    expect(dockerfile).toMatch(/assert not _stale,/);
+    // Every patched file is re-parsed, so a bad splice fails the build rather
+    // than the container.
+    expect(dockerfile).toMatch(/^    ast\.parse\(s\)$/m);
   });
 
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
