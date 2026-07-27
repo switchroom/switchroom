@@ -529,6 +529,56 @@ export const AgentMemorySchema = z
             "result instead of round-tripping to Hindsight. 0 disables. " +
             "Default is 600 (10 min) for switchroom-managed agents.",
           ),
+        query_max_tokens: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Cap on the number of DISTINCT BM25 terms the recall hook may " +
+            "put on the wire. `recallMaxQueryChars` bounds characters, which " +
+            "is not the cost driver: Hindsight OR-joins every query token " +
+            "into one tsquery and Postgres native FTS ranks the entire " +
+            "matched set before the top-60 heapsort, so cost tracks TERMS. " +
+            "An 800-char composed query is ~96 distinct terms and matched " +
+            "119,510 of 135,565 rows on the `overlord` bank (14.0s for the " +
+            "3-arm " +
+            "BM25 UNION), past the per-bank timeout — 96.8% of that agent's " +
+            "own-bank recalls returned nothing. Plugin default is 24 " +
+            "(measured 48,433 rows / 2.7s on the same bank). Terms are " +
+            "chosen recency-first (the latest turn beats prior context), " +
+            "then by selectivity. 0 disables shaping (rollback lever).",
+          ),
+        query_stop_terms: z
+          // A BM25 term, as Hindsight's tokenizer produces them: word chars
+          // plus the `. / -` that hold compound tokens (semvers, paths,
+          // hyphenated identifiers) together. Anything else could never match
+          // a token anyway, and the constraint keeps the value trivially safe
+          // to embed in the single-quoted start.sh export.
+          .array(z.string().min(1).regex(/^[\w./-]+$/))
+          .optional()
+          .describe(
+            "Extra terms dropped from the BM25 recall query, on top of the " +
+            "built-in English stopword list. For BANK-SPECIFIC " +
+            "high-document-frequency words a generic stoplist cannot know " +
+            "about: on `overlord`, `switchroom` matches 20% of the bank and " +
+            "`agent` another 20%, purely because that is what the corpus is " +
+            "about, and each such term drags tens of thousands of rows into " +
+            "the ranking. Defaults to [].",
+          ),
+        request_timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Per-bank HTTP read timeout, in seconds, for one recall " +
+            "request. Plugin default is 12, matching the UserPromptSubmit " +
+            "hook ceiling; the shared `recallParallelDeadlineSeconds` (10) " +
+            "is the tighter outer guard in the default configuration, so " +
+            "this is a per-request safety net. Was a hardcoded 8 in the " +
+            "plugin before #3757.",
+          ),
         types: z
           .array(z.string())
           .optional()
@@ -2799,6 +2849,9 @@ const profileFields = {
         .object({
           max_memories: z.number().int().min(0).optional(),
           cache_ttl_secs: z.number().int().min(0).optional(),
+          query_max_tokens: z.number().int().min(0).optional(),
+          query_stop_terms: z.array(z.string().min(1).regex(/^[\w./-]+$/)).optional(),
+          request_timeout_seconds: z.number().int().min(1).optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })

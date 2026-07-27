@@ -3436,6 +3436,17 @@ interface BuildWorkspaceContextArgs {
   hindsightApiBaseUrl: string;
   hindsightRecallMaxMemories: number | undefined;
   hindsightRecallCacheTtlSecs: number | undefined;
+  /**
+   * Switchroom #3757 — BM25 term cap for the recall query, the bank-specific
+   * stop-term list beside it, and the per-bank request timeout. These live in
+   * switchroom.yaml specifically so they SURVIVE `switchroom apply`: apply
+   * re-copies the plugin from `vendor/hindsight-memory`, so a hand-edit of the
+   * installed `scripts/recall.py` is reverted on the next reconcile — which is
+   * exactly how the hardcoded 8s timeout came back on 2026-07-27.
+   */
+  hindsightRecallQueryMaxTokens: number | undefined;
+  hindsightRecallQueryStopTermsJson: string | undefined;
+  hindsightRecallRequestTimeoutSeconds: number | undefined;
   // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
@@ -3480,6 +3491,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallQueryMaxTokens,
+    hindsightRecallQueryStopTermsJson,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -3563,6 +3577,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallQueryMaxTokens,
+    hindsightRecallQueryStopTermsJson,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -4472,6 +4489,19 @@ export function scaffoldAgent(
   // switchroom-managed default of 600s baked into start.sh.hbs."
   // Set to 0 in switchroom.yaml to disable caching for an agent.
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
+  // Switchroom #3757 — BM25 query shaping + per-request timeout. Resolved from
+  // the CASCADED config (defaults → profile → agent) like the sibling recall
+  // knobs, so a fleet-wide `defaults.memory.recall.*` is honoured. Exported
+  // only when the operator set a value; unset leaves the plugin's own
+  // settings.json default (24 terms / [] / 12s) in force.
+  const hindsightRecallQueryMaxTokens = agentConfig.memory?.recall?.query_max_tokens;
+  const rawRecallQueryStopTerms = agentConfig.memory?.recall?.query_stop_terms;
+  const hindsightRecallQueryStopTermsJson =
+    rawRecallQueryStopTerms && rawRecallQueryStopTerms.length > 0
+      ? JSON.stringify(rawRecallQueryStopTerms)
+      : undefined;
+  const hindsightRecallRequestTimeoutSeconds =
+    agentConfig.memory?.recall?.request_timeout_seconds;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -4546,6 +4576,9 @@ export function scaffoldAgent(
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallQueryMaxTokens,
+    hindsightRecallQueryStopTermsJson,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -6898,6 +6931,19 @@ function reconcileAgentInner(
     : HINDSIGHT_DEFAULT_API_BASE_URL;
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
+  // Switchroom #3757 — BM25 query shaping + per-request timeout. Resolved from
+  // the CASCADED config (defaults → profile → agent) like the sibling recall
+  // knobs, so a fleet-wide `defaults.memory.recall.*` is honoured. Exported
+  // only when the operator set a value; unset leaves the plugin's own
+  // settings.json default (24 terms / [] / 12s) in force.
+  const hindsightRecallQueryMaxTokens = agentConfig.memory?.recall?.query_max_tokens;
+  const rawRecallQueryStopTerms = agentConfig.memory?.recall?.query_stop_terms;
+  const hindsightRecallQueryStopTermsJson =
+    rawRecallQueryStopTerms && rawRecallQueryStopTerms.length > 0
+      ? JSON.stringify(rawRecallQueryStopTerms)
+      : undefined;
+  const hindsightRecallRequestTimeoutSeconds =
+    agentConfig.memory?.recall?.request_timeout_seconds;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -6996,6 +7042,9 @@ function reconcileAgentInner(
       hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
+      hindsightRecallQueryMaxTokens,
+      hindsightRecallQueryStopTermsJson,
+      hindsightRecallRequestTimeoutSeconds,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
@@ -7778,6 +7827,9 @@ function reconcileAgentInner(
       hindsightApiBaseUrl,
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
+      hindsightRecallQueryMaxTokens,
+      hindsightRecallQueryStopTermsJson,
+      hindsightRecallRequestTimeoutSeconds,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,

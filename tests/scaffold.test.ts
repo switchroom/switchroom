@@ -2667,6 +2667,78 @@ describe("reconcileAgent", () => {
     expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=0");
   });
 
+  // #3757 — BM25 query shaping + per-request timeout must be OPERATOR-OWNED,
+  // not literals in the installed plugin. `switchroom apply` re-copies the
+  // plugin from vendor/, so a hand-edit of the installed scripts/recall.py is
+  // reverted on the next reconcile — which is exactly how the hardcoded 8s
+  // recall timeout came back on 2026-07-27 after being patched on 07-25.
+  // These tests pin the switchroom.yaml -> start.sh env path that makes the
+  // values survive an apply.
+  const memoryOn = (agentConfig: ReturnType<typeof makeAgentConfig>) =>
+    buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+
+  it("start.sh omits the #3757 recall-shaping exports when the operator sets nothing", () => {
+    const agentConfig = makeAgentConfig();
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    // Unset means "use the plugin's own settings.json default" (24 / [] / 12s).
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS");
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_QUERY_STOP_TERMS");
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS");
+  });
+
+  it("start.sh exports the #3757 recall knobs from memory.recall in switchroom.yaml", () => {
+    const agentConfig = makeAgentConfig({
+      memory: {
+        collection: "test-agent",
+        recall: {
+          query_max_tokens: 16,
+          query_stop_terms: ["switchroom", "agent"],
+          request_timeout_seconds: 14,
+        },
+      },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=16");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=14");
+    // JSON array, single-quoted so the double quotes survive the shell.
+    // Rendering is noEscape (src/agents/profiles.ts:158); if that ever
+    // changed, `&quot;` would reach the plugin as literal text and the list
+    // would silently parse as empty, so assert the rendered bytes.
+    expect(startSh).toContain(
+      `export HINDSIGHT_RECALL_QUERY_STOP_TERMS='["switchroom","agent"]'`,
+    );
+  });
+
+  it("start.sh exports HINDSIGHT_RECALL_QUERY_MAX_TOKENS=0 when the operator disables shaping", () => {
+    // 0 is the rollback lever ("send the query unshaped"), not the same as
+    // unset — so it must still emit, hence the isNumber guard.
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { query_max_tokens: 0 } },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=0");
+  });
+
+  it("start.sh omits HINDSIGHT_RECALL_QUERY_STOP_TERMS for an empty list", () => {
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { query_stop_terms: [] } },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_QUERY_STOP_TERMS");
+  });
+
   it("start.sh does NOT export HINDSIGHT_RECALL_CACHE_TTL_SECS by default (v0.13.22 — 0% measured hit rate)", () => {
     // The 2026-05-24 audit measured 0% cache hit rate across 430+
     // Telegram turns: the cache key is (session_id, prompt, bank,

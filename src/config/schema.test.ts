@@ -1525,3 +1525,48 @@ describe("resources.tmp_size — per-agent /tmp tmpfs sizing", () => {
     expect(AgentSchema.parse({ topic_name: "ops" }).resources).toBeUndefined();
   });
 });
+
+describe("AgentSchema — memory.recall query shaping (#3757)", () => {
+  const agent = (recall: Record<string, unknown>) => ({
+    model: "opus",
+    topic_name: "test",
+    purpose: "test agent",
+    memory: { collection: "a", recall },
+  });
+
+  it("accepts the three shaping knobs and preserves their values", () => {
+    const r = AgentSchema.parse(
+      agent({
+        query_max_tokens: 16,
+        query_stop_terms: ["switchroom", "v0.19.24", "src/config", "well-known"],
+        request_timeout_seconds: 14,
+      }),
+    );
+    expect(r.memory?.recall?.query_max_tokens).toBe(16);
+    expect(r.memory?.recall?.request_timeout_seconds).toBe(14);
+    expect(r.memory?.recall?.query_stop_terms).toEqual([
+      "switchroom",
+      "v0.19.24",
+      "src/config",
+      "well-known",
+    ]);
+  });
+
+  it("accepts query_max_tokens: 0 — the documented rollback lever", () => {
+    expect(AgentSchema.parse(agent({ query_max_tokens: 0 })).memory?.recall?.query_max_tokens)
+      .toBe(0);
+  });
+
+  it("rejects a stop term that could never be a BM25 token", () => {
+    // Also what keeps the single-quoted start.sh export unbreakable: a term
+    // containing a quote would terminate the shell string.
+    for (const bad of ["", "two words", "it's", `say "hi"`, "a;rm -rf /"]) {
+      expect(() => AgentSchema.parse(agent({ query_stop_terms: [bad] }))).toThrow();
+    }
+  });
+
+  it("rejects a negative token cap and a zero timeout", () => {
+    expect(() => AgentSchema.parse(agent({ query_max_tokens: -1 }))).toThrow();
+    expect(() => AgentSchema.parse(agent({ request_timeout_seconds: 0 }))).toThrow();
+  });
+});

@@ -76,6 +76,29 @@ DEFAULTS = {
     # by recallTranscriptTailBytes so the added per-turn read stays O(1).
     "recallContextTurns": 2,
     "recallMaxQueryChars": 800,
+    # Switchroom #3757 — BM25 term budget for the query put on the wire.
+    # `recallMaxQueryChars` bounds CHARACTERS; the server's keyword arm costs
+    # per DISTINCT TERM, because it OR-joins every token into one tsquery and
+    # Postgres native FTS ranks the entire matched set before the top-60
+    # heapsort. An 800-char composed query is ~96 distinct terms and matched
+    # 119,510 rows on the live `overlord` bank — 14.0s for the 3-arm UNION,
+    # and up to 94s under load, past the
+    # per-bank client timeout, so the agent got NOTHING on 96.8% of its
+    # own-bank recalls in the 7 days to 2026-07-27. 24 terms measures at
+    # 40,308 rows / 2.9s on the same bank while keeping the high-signal terms
+    # of the latest turn. Selection is recency-first (latest turn beats prior
+    # context), then by a selectivity proxy — see lib/content.shape_recall_query.
+    # 0 disables shaping entirely (rollback lever).
+    # Operator knob: `memory.recall.query_max_tokens` in switchroom.yaml.
+    "recallQueryMaxTokens": 24,
+    # Switchroom #3757 — extra terms to drop from the BM25 query on top of the
+    # built-in English stopword list. For BANK-SPECIFIC high-document-frequency
+    # words a generic stoplist cannot know about: on `overlord`, `switchroom`
+    # matches 27,090 of 135,443 rows (20%) and `agent` 26,496 (20%), purely
+    # because that is what the corpus is about. Empty by default — an operator
+    # sets it per-agent after reading `switchroom memory recall-log <agent>`.
+    # Operator knob: `memory.recall.query_stop_terms` in switchroom.yaml.
+    "recallQueryStopTerms": [],
     # Switchroom hindsight-leverage A2 (PR2) — latency bound for the multi-turn
     # composition. With recallContextTurns>1 now the default, EVERY recall reads
     # the transcript to slice the last N human turns. A long session's .jsonl can
@@ -189,6 +212,18 @@ DEFAULTS = {
     # can never push the hook past its ceiling. Slots still unfinished when the
     # deadline elapses are abandoned (daemon threads) and marked timed_out.
     "recallParallelDeadlineSeconds": 10,
+    # Switchroom #3757 — per-bank HTTP read timeout (seconds) for one recall
+    # request. Was a hardcoded `timeout=8` in recall.py, which made it BOTH the
+    # binding constraint on a slow bank AND un-tunable without hand-editing the
+    # installed plugin — and a hand-edit does not survive `switchroom apply`,
+    # which re-copies the plugin from `vendor/hindsight-memory` (that revert is
+    # exactly what put the 8s literal back on 2026-07-27). 12s matches the
+    # UserPromptSubmit hook ceiling in hooks.json; the shared
+    # `recallParallelDeadlineSeconds` (10s) is the tighter outer guard in the
+    # default configuration, so this is a per-request safety net rather than
+    # the primary bound. Non-positive values fall back to the default.
+    # Operator knob: `memory.recall.request_timeout_seconds` in switchroom.yaml.
+    "recallRequestTimeoutSeconds": 12,
     # Switchroom hindsight-leverage E1 / PR8 (#3369) — bounded transcript-grep
     # fallback. Boot reconciliation (reconcile_tail.py) closes the crash-loss
     # window at the NEXT SessionStart, but between an abrupt kill and that boot,
@@ -303,6 +338,10 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK_MAX_CHARS": ("recallTranscriptFallbackMaxChars", int),
     "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK_DEADLINE_MS": ("recallTranscriptFallbackDeadlineMs", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
+    # Switchroom #3757 — BM25 query shaping + per-request timeout.
+    "HINDSIGHT_RECALL_QUERY_MAX_TOKENS": ("recallQueryMaxTokens", int),
+    "HINDSIGHT_RECALL_QUERY_STOP_TERMS": ("recallQueryStopTerms", list),
+    "HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS": ("recallRequestTimeoutSeconds", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     # Switchroom hindsight-leverage A2 — byte-tail bound for the multi-turn
     # transcript read (0 = read whole file / rollback lever).

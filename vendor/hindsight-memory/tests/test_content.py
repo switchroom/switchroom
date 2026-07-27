@@ -11,9 +11,11 @@ from lib.content import (
     format_current_time,
     format_memories,
     prepare_retention_transcript,
+    shape_recall_query,
     slice_last_turns_by_user_boundary,
     strip_channel_envelope,
     strip_memory_tags,
+    tokenize_for_bm25,
     truncate_recall_query,
 )
 
@@ -648,3 +650,184 @@ class TestFormatCurrentTime:
         monkeypatch.delenv("TZ", raising=False)
         out = format_current_time()
         assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:AM|PM)", out), out
+
+
+# ---------------------------------------------------------------------------
+# Switchroom #3757 — BM25 query shaping
+#
+# The bug these guard: the recall hook composed an 800-char, ~110-token query
+# and Hindsight OR-joined every token into one tsquery. On the live `overlord`
+# bank that matched 119,510 of 135,565 rows and took 14.0s for the 3-arm BM25
+# UNION — past the per-bank client timeout, so 96.8% of that agent's own-bank
+# recalls returned NOTHING. Two of those tokens were scaffolding this hook
+# added itself: `user` (67,363 rows = 50% of the bank) and `assistant`
+# (29,942 = 22%).
+# ---------------------------------------------------------------------------
+
+
+def _production_shaped_query():
+    """A composed query with the shape recall.py actually produces."""
+    msgs = _msgs(
+        ("user", "the deploy went out this morning but the rollout never reached the fleet"),
+        (
+            "assistant",
+            "I checked the manifest for v0.19.17 and the digest does not match what "
+            "the agent container is running, so the pull raced the tag",
+        ),
+    )
+    return compose_recall_query(
+        "why did recall for the v0.19.17 rollout return v0.18.15 instead",
+        msgs,
+        recall_context_turns=2,
+    )
+
+
+class TestComposedQueryHasNoRoleLabels:
+    def test_compose_does_not_prefix_role_labels(self):
+        # The regression this guards: `context_lines.append(f"{role}: {content}")`.
+        msgs = _msgs(("user", "prior question"), ("assistant", "prior answer"))
+        result = compose_recall_query("current question", msgs, recall_context_turns=2)
+        assert "prior question" in result
+        assert "prior answer" in result
+        assert "user:" not in result
+        assert "assistant:" not in result
+
+    def test_role_labels_are_not_bm25_tokens(self):
+        # The property that actually matters — not "the string is absent" but
+        # "the term never reaches the tsquery".
+        query = _production_shaped_query()
+        shaped = shape_recall_query(query, "why did recall for the v0.19.17 rollout "
+                                           "return v0.18.15 instead")
+        terms = set(tokenize_for_bm25(shaped))
+        assert "user" not in terms
+        assert "assistant" not in terms
+        assert "prior" not in terms
+        assert "context" not in terms
+
+    def test_labels_embedded_in_transcript_text_are_still_stripped(self):
+        # Defence in depth: an old composed string, or a turn that literally
+        # contains a `user:` line, must not smuggle the label back in.
+        legacy = "Prior context:\n\nuser: the deploy failed\nassistant: I checked it\n\nwhy"
+        terms = set(tokenize_for_bm25(shape_recall_query(legacy, "why")))
+        assert "user" not in terms
+        assert "assistant" not in terms
+        assert "deploy" in terms
+
+
+class TestShapeRecallQuery:
+    def test_caps_distinct_bm25_terms(self):
+        query = " ".join(f"distinctword{i}" for i in range(200))
+        shaped = shape_recall_query(query, "", max_tokens=24)
+        assert len(set(tokenize_for_bm25(shaped))) <= 24
+
+    def test_cap_counts_compound_token_expansion(self):
+        # A compound is emitted by the server ALONGSIDE its fragments
+        # (`v0.19.17` → v0.19.17, v0, 19, 17), so a naive "count the words we
+        # sent" cap would silently ship 4x the terms it promised.
+        query = " ".join(f"v0.19.{i}" for i in range(40))
+        shaped = shape_recall_query(query, "", max_tokens=24)
+        assert len(set(tokenize_for_bm25(shaped))) <= 24
+
+    def test_cap_is_configurable(self):
+        query = " ".join(f"distinctword{i}" for i in range(200))
+        assert len(set(tokenize_for_bm25(shape_recall_query(query, "", max_tokens=8)))) <= 8
+        assert len(set(tokenize_for_bm25(shape_recall_query(query, "", max_tokens=40)))) <= 40
+
+    def test_zero_disables_shaping(self):
+        query = "Prior context:\n\nsomething\n\nlatest"
+        assert shape_recall_query(query, "latest", max_tokens=0) == query
+
+    def test_prefers_latest_turn_over_prior_context(self):
+        # A chronological truncation would keep the OLDEST context and throw
+        # away the question the user actually asked.
+        prior = " ".join(f"stalecontextword{i}" for i in range(60))
+        latest = "why does the reaper skip orphaned worktrees"
+        query = f"Prior context:\n\n{prior}\n\n{latest}"
+        # Budget = exactly the latest turn's content terms: prior context is
+        # what gets sacrificed, never the question.
+        tight = set(tokenize_for_bm25(shape_recall_query(query, latest, max_tokens=4)))
+        assert tight == {"reaper", "skip", "orphaned", "worktrees"}
+        assert not any(t.startswith("stalecontextword") for t in tight)
+        # With slack, the latest turn is still fully present and the leftover
+        # budget goes to context (which is the point of composing at all).
+        loose = set(tokenize_for_bm25(shape_recall_query(query, latest, max_tokens=12)))
+        assert {"reaper", "skip", "orphaned", "worktrees"} <= loose
+        assert any(t.startswith("stalecontextword") for t in loose)
+        assert len(loose) <= 12
+
+    def test_drops_english_stopwords(self):
+        latest = "what did we decide about the worktree reaper"
+        terms = set(tokenize_for_bm25(shape_recall_query(latest, latest, max_tokens=24)))
+        assert "worktree" in terms
+        assert "reaper" in terms
+        assert "decide" in terms
+        for stop in ("what", "did", "we", "about", "the"):
+            assert stop not in terms
+
+    def test_operator_stop_terms_are_dropped(self):
+        # Bank-specific high-df words the generic stoplist cannot know about.
+        latest = "the switchroom agent rollout stalled on the reaper"
+        terms = set(
+            tokenize_for_bm25(
+                shape_recall_query(latest, latest, max_tokens=24,
+                                   stop_terms=["switchroom", "agent"])
+            )
+        )
+        assert "reaper" in terms
+        assert "rollout" in terms
+        assert "switchroom" not in terms
+        assert "agent" not in terms
+
+    def test_short_query_survives_intact(self):
+        # No regression for the small-bank / short-prompt case: every content
+        # word is kept, so recall quality is unchanged.
+        latest = "worktree gc reaper timings"
+        terms = set(tokenize_for_bm25(shape_recall_query(latest, latest, max_tokens=24)))
+        assert terms == {"worktree", "gc", "reaper", "timings"}
+
+    def test_all_stopword_query_is_not_emptied(self):
+        # A conversational prompt must never be shaped down to nothing — an
+        # empty query would return zero memories, the exact failure we are
+        # fixing.
+        latest = "what about that"
+        shaped = shape_recall_query(latest, latest, max_tokens=24)
+        assert tokenize_for_bm25(shaped)
+
+    def test_untokenizable_query_returns_original(self):
+        assert shape_recall_query("!!! ???", "!!! ???", max_tokens=24) == "!!! ???"
+
+    def test_preserves_original_word_order(self):
+        latest = "reaper skipped orphaned worktrees before rollout"
+        shaped = shape_recall_query(latest, latest, max_tokens=24)
+        # "before" is a stopword; the survivors keep the source order.
+        assert shaped.split() == ["reaper", "skipped", "orphaned", "worktrees", "rollout"]
+
+    def test_preserves_original_case(self):
+        # The shaped string feeds BOTH arms. BM25 lowercases server-side, but
+        # the embedding arm does not, so shaping must not flatten `Python` to
+        # `python` or `PR` to `pr`.
+        latest = "should the Python worker open a PR against Coolify"
+        shaped = shape_recall_query(latest, latest, max_tokens=24)
+        assert shaped.split() == ["Python", "worker", "open", "PR", "Coolify"]
+
+    def test_production_shaped_query_fits_the_budget(self):
+        query = _production_shaped_query()
+        latest = "why did recall for the v0.19.17 rollout return v0.18.15 instead"
+        shaped = shape_recall_query(query, latest, max_tokens=24)
+        terms = set(tokenize_for_bm25(shaped))
+        assert len(terms) <= 24
+        # The discriminating identifiers from the latest turn survive.
+        assert "v0.19.17" in terms
+        assert "rollout" in terms
+
+
+class TestTokenizeForBm25:
+    def test_matches_server_tokenizer_on_compounds(self):
+        # Mirrors hindsight_api/engine/search/retrieval.py::tokenize_query —
+        # fragments PLUS the intact compound.
+        tokens = tokenize_for_bm25("bumped to v0.19.17")
+        assert "v0.19.17" in tokens
+        assert {"v0", "19", "17"} <= set(tokens)
+
+    def test_empty_for_punctuation_only(self):
+        assert tokenize_for_bm25("!!! ???") == []

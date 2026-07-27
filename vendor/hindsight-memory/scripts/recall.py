@@ -58,8 +58,10 @@ from lib.content import (
     compose_recall_query,
     format_current_time,
     format_memories,
+    shape_recall_query,
     strip_channel_envelope,
     strip_memory_tags,
+    tokenize_for_bm25,
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
@@ -1537,7 +1539,35 @@ def main():
     if len(query) > recall_max_query_chars:
         query = query[:recall_max_query_chars]
 
-    debug_log(config, f"Recalling from bank '{bank_id}', query length: {len(query)}")
+    # Switchroom recall-latency fix (#3757) — bound the BM25 term count of the
+    # query we put on the wire. `recallMaxQueryChars` bounds CHARACTERS, which
+    # is not the cost driver: Hindsight OR-joins every token into one tsquery
+    # and Postgres native FTS ranks the whole matched set before the top-60
+    # heapsort, so cost tracks the number of DISTINCT TERMS. An 800-char
+    # composed query is ~96 distinct terms and matched 119,510 rows on the
+    # live `overlord` bank (14.0s for the 3-arm UNION, and up to 94s under
+    # load) — past the 8s client timeout, which is why 96.8% of that agent's
+    # own-bank recalls returned nothing. Shaped to 24 terms the same query
+    # matches 48,433 rows in 2.5-2.8s.
+    #
+    # `search_query` is what the SERVER sees. `query` (unshaped) stays the
+    # client-side lexical reference: the `recallMinOverlap` containment gate
+    # and the transcript-grep fallback both measure against the user's real
+    # words, so shaping cannot silently move their thresholds. `query_chars`
+    # telemetry also stays on the unshaped value for continuity with the
+    # existing recall_log history.
+    search_query = shape_recall_query(
+        query,
+        recall_query_text,
+        max_tokens=config.get("recallQueryMaxTokens", 24),
+        stop_terms=config.get("recallQueryStopTerms") or (),
+    )
+
+    debug_log(
+        config,
+        f"Recalling from bank '{bank_id}', query length: {len(query)}, "
+        f"search terms: {len(set(tokenize_for_bm25(search_query)))}",
+    )
 
     # Fetch active directives FIRST (independent of recall — even if recall
     # finds no memories, an agent with active directives still needs them
@@ -1571,11 +1601,18 @@ def main():
             ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
         )
 
+    try:
+        recall_request_timeout = float(config.get("recallRequestTimeoutSeconds", 12))
+    except (TypeError, ValueError):
+        recall_request_timeout = 12.0
+    if recall_request_timeout <= 0:
+        recall_request_timeout = 12.0
+
     def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups):
         def _bank_task():
             return client.recall(
                 bank_id=target_bank_id,
-                query=query,
+                query=search_query,
                 max_tokens=config.get("recallMaxTokens", 1024),
                 budget=config.get("recallBudget", "mid"),
                 types=config.get("recallTypes"),
@@ -1589,12 +1626,27 @@ def main():
                 # slots for denser coverage inside the same budget. On by default;
                 # operators can pin off via `recallPreferObservations: false`.
                 prefer_observations=config.get("recallPreferObservations", True),
-                # 8s in-script per-request timeout: even parallelised, each bank
+                # Per-request in-script timeout: even parallelised, each bank
                 # carries its own hard deadline so a single hung bank returns
                 # cleanly with no memories rather than sitting on the shared
-                # deadline. Tightened from 10s in v0.13.22 (2026-05-24 breach
-                # audit); the shared deadline below is the outer ceiling guard.
-                timeout=8,
+                # deadline. Tightened from 10s to 8s in v0.13.22 (2026-05-24
+                # breach audit); the shared deadline below is the outer ceiling
+                # guard.
+                #
+                # Switchroom #3757: no longer a hardcoded literal. It was the
+                # binding constraint on a slow bank (96.8% of overlord's
+                # own-bank recalls hit exactly 8s and returned NOTHING), and a
+                # hand-patch of the installed copy does not survive
+                # `switchroom apply` — the plugin dir is re-copied from
+                # `vendor/hindsight-memory` on every reconcile. Default raised
+                # to 12s, matching the UserPromptSubmit hook's own 12s budget
+                # (hooks/hooks.json). Note the SHARED multi-bank deadline
+                # (`recallParallelDeadlineSeconds`, default 10s) is the tighter
+                # outer bound in the default configuration, so at the default
+                # this timeout only binds when an operator raises that. SAFETY
+                # NET behind the query-shaping fix above, not the fix.
+                # Operator knob: `memory.recall.request_timeout_seconds`.
+                timeout=recall_request_timeout,
             )
         return _bank_task
 
@@ -1901,12 +1953,22 @@ def main():
     # On by default; HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK=false is the rollback
     # lever. Mutually exclusive with memories_block by construction: a non-empty
     # memories_block requires results, which requires pre_filter_count > 0.
+    #
+    # Switchroom #3757 — `deadline_hit` NO LONGER SUPPRESSES the fallback.
+    # The original gate was written when a deadline meant "the fact layer is
+    # unknown, don't guess". In practice a timeout was the COMMON case (96.8%
+    # of overlord's own-bank recalls over the 7 days to 2026-07-27), and the
+    # gate meant a timed-out turn got neither memories NOR the fallback — the
+    # agent went in blind. A timeout and an outage are different: on a timeout
+    # the banks are healthy and reachable, we simply ran out of time, so the
+    # bounded transcript grep is strictly better than nothing. A hard bank
+    # ERROR still suppresses it (`bank_errored`), because that genuinely can
+    # masquerade as an empty fact layer while the store is down.
     transcript_fallback_block = None
     transcript_fallback_telemetry = dict(_FALLBACK_TELEMETRY_ZERO)
     if (
         config.get("recallTranscriptFallback", True)
         and pre_filter_count == 0
-        and not deadline_hit
         and not bank_errored
     ):
         transcript_fallback_block, transcript_fallback_telemetry = _transcript_grep_fallback(

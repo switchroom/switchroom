@@ -737,6 +737,37 @@ export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
 {{#if (isNumber hindsightRecallCacheTtlSecs)}}
 export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{/if}}
+# BM25 term budget for the recall query (#3757). The hook composes a query
+# from the last 2 turns and Hindsight OR-joins EVERY token into one
+# to_tsquery; Postgres native FTS cannot top-k from the GIN index, so it
+# ranks the entire matched set before the top-60 heapsort. Measured on the
+# live `overlord` bank (135,565 rows, 3 fact-type arms): 96 distinct terms
+# = 119,510 rows ranked = 14.0s, versus 24 terms = 48,433 rows = 2.7s.
+# Plugin default is 24; export only when the operator overrode it via
+# memory.recall.query_max_tokens. 0 disables shaping (rollback lever).
+{{#if (isNumber hindsightRecallQueryMaxTokens)}}
+export HINDSIGHT_RECALL_QUERY_MAX_TOKENS={{hindsightRecallQueryMaxTokens}}
+{{/if}}
+# Bank-specific high-document-frequency terms to drop from the BM25 query
+# (#3757, memory.recall.query_stop_terms). Postgres' `english` config
+# already strips generic English stopwords; this is for words a generic
+# stoplist cannot know are useless in THIS bank — on `overlord`,
+# `switchroom` matched 27,075 rows (20%) and `agent` a similar share.
+# JSON array (the plugin also accepts a comma-separated string), single-
+# quoted so the JSON's double quotes reach the plugin intact. The schema
+# constrains each term to `[\w./-]+`, so it cannot contain a quote.
+{{#if hindsightRecallQueryStopTermsJson}}
+export HINDSIGHT_RECALL_QUERY_STOP_TERMS='{{hindsightRecallQueryStopTermsJson}}'
+{{/if}}
+# Per-bank HTTP timeout for a single recall request (#3757). Was hardcoded
+# at 8s in the plugin, which fired on 96.8% of overlord's own-bank recalls
+# and returned the model nothing at all. Plugin default is now 12s; the
+# shared multi-bank deadline (recallParallelDeadlineSeconds, default 10s)
+# is normally the tighter bound, so this is the safety net, not the budget.
+# Export only when the operator overrode memory.recall.request_timeout_seconds.
+{{#if (isNumber hindsightRecallRequestTimeoutSeconds)}}
+export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS={{hindsightRecallRequestTimeoutSeconds}}
+{{/if}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the
