@@ -21,11 +21,19 @@ import {
   pickHindsightPorts,
   pullHindsightImage,
   getRunningHindsightPorts,
+  getHindsightContainerEnv,
+  getHindsightImageEnv,
+  hindsightContainerEnvPairs,
+  hindsightResolvedCapabilities,
   preflightHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
+import {
+  diffDroppedHindsightEnv,
+  formatDroppedHindsightEnvReport,
+} from "../setup/hindsight-env-drift.js";
 import {
   buildRepairBankArgv,
   classifyRepairPreflight,
@@ -494,7 +502,14 @@ export function registerMemoryCommand(program: Command): void {
         "fleet. Omit for `:latest` (the standalone default).",
     )
     .option("--provider <provider>", "LLM provider (ollama, openai, anthropic)")
-    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; tag?: string; provider?: string }) => {
+    .option(
+      "--strict-env",
+      "Refuse the recreate (before the running container is touched) if it would drop " +
+        "env vars that are live on the container but declared in neither `hindsight.env` " +
+        "nor switchroom's managed defaults. Default is to warn loudly and proceed, so a " +
+        "rollout is never wedged half-way with memory down.",
+    )
+    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; tag?: string; provider?: string; strictEnv?: boolean }) => {
       if (opts.status) {
         if (!isDockerAvailable()) {
           console.log(chalk.red("  Docker is not available."));
@@ -596,6 +611,75 @@ export function registerMemoryCommand(program: Command): void {
       if (isHindsightRunning() && !recreate) {
         console.log(chalk.green("\n  Hindsight container is already running (switchroom-hindsight).\n"));
         return;
+      }
+
+      // ── Env-drift guard ────────────────────────────────────────────────
+      // A recreate rebuilds the container env FROM SCRATCH out of
+      // `hindsight.env` + switchroom's managed defaults, so anything set
+      // imperatively on the live container and declared in neither source is
+      // dropped. That drop used to be completely silent; it has bitten three
+      // times, most recently taking HINDSIGHT_API_RERANKER_LOCAL_FP16 off the
+      // reranker (fp32 ⇒ ~2x per-candidate time on the interactive recall
+      // path). Compare live env against the env we are ABOUT to launch with,
+      // before the container is removed, and say exactly what is going.
+      //
+      // Deliberately not auto-carried over: see hindsight-env-drift.ts. And
+      // deliberately non-fatal by default — `switchroom update` drives this
+      // path, and hard-failing mid-rollout would trade a perf regression for
+      // fleet memory being down. `--strict-env` opts into the refusal, and it
+      // fires here, before the pull and before stopHindsight(), so a refusal
+      // leaves the running container completely untouched.
+      let envDriftLines: string[] = [];
+      if (recreate && isHindsightContainerExists()) {
+        try {
+          const liveEnv = getHindsightContainerEnv();
+          if (liveEnv) {
+            const driftConfig = getConfig(program);
+            const driftLitellm = await resolveLiteLLMForHindsight(driftConfig);
+            const driftPerf = { env: driftConfig.hindsight?.env };
+            const nextEnv = hindsightContainerEnvPairs({
+              // The recreate rebinds the port it is already on (reusePorts);
+              // fall back to the default only when it could not be read.
+              apiPort: reusePorts?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT,
+              litellm: driftLitellm,
+              llm: driftConfig.hindsight?.llm,
+              perf: driftPerf,
+            });
+            const dropped = diffDroppedHindsightEnv(
+              liveEnv,
+              nextEnv,
+              getHindsightImageEnv() ?? [],
+            );
+            envDriftLines = formatDroppedHindsightEnvReport(
+              dropped,
+              hindsightResolvedCapabilities(
+                driftConfig.hindsight?.llm,
+                driftLitellm,
+                undefined,
+                driftPerf,
+              ),
+            );
+          }
+        } catch (err) {
+          // The guard must never be the reason a recreate fails. Say it was
+          // skipped rather than pretending the env matched.
+          console.log(
+            chalk.gray(`  (env-drift check skipped: ${(err as Error).message})`),
+          );
+        }
+      }
+      if (envDriftLines.length > 0) {
+        console.log("");
+        for (const line of envDriftLines) console.log(chalk.yellow(line));
+        console.log("");
+        if (opts.strictEnv) {
+          console.error(
+            chalk.red(
+              "  Refusing to recreate (--strict-env). The running container was NOT touched.\n",
+            ),
+          );
+          process.exit(1);
+        }
       }
 
       if (recreate) {
