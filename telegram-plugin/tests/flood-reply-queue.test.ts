@@ -1,7 +1,7 @@
 /**
  * A user-facing reply refused by an open Telegram flood window must be
  * DURABLY QUEUED and delivered when the window closes — never discarded
- * (#3857).
+ * (#3861).
  *
  * ── The bug these tests guard ────────────────────────────────────────────
  * Reproduced live on 2026-07-28 during overlord's flood ban. The reply tool

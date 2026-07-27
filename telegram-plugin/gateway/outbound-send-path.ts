@@ -1961,7 +1961,7 @@ export async function sendReply(
     threadId = _sendResult.threadId
     previewMessageId = _sendResult.previewMessageId
   } catch (err) {
-    // #3857 — a flood-blocked reply is QUEUED, never discarded. Pre-fix this
+    // #3861 — a flood-blocked reply is QUEUED, never discarded. Pre-fix this
     // catch re-wrapped `FLOOD_WAIT_ACTIVE` into a string and threw the answer
     // away: `retryApiCall` fails fast BEFORE the wire while a long window is
     // open, so during a multi-hour ban EVERY answer the agent composed for the
@@ -1989,7 +1989,7 @@ export async function sendReply(
       // The obligation is DISCHARGED by the durable enqueue. Without this the
       // obligation tracker keeps re-prompting the agent to reply every few
       // minutes for the whole ban — dozens of forced turns it physically
-      // cannot satisfy (and pre-#3857 each attempt destroyed its own answer).
+      // cannot satisfy (and pre-#3861 each attempt destroyed its own answer).
       if (turn != null && isSubstantiveFinalReply({ text, disableNotification: modelDisableNotification })) {
         closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
       }

@@ -135,7 +135,7 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
   if (pending.length === 0) return summary
   const deliveredNonces = readDeliveredNonces(deps.stateDir)
 
-  // #3857 — deliver in CAPTURE order. `listPendingRecords` returns readdir
+  // #3861 — deliver in CAPTURE order. `listPendingRecords` returns readdir
   // order, which is filesystem-dependent (hash order on most Linux filesystems,
   // i.e. effectively the nonce's hash). That was harmless while the outbox held
   // at most one stray handback per turn; it is not harmless now that a
