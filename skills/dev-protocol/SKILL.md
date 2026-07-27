@@ -97,6 +97,19 @@ is not a rebuttal.
 
 - **CI is the full-suite authority.** Local scoped tests are a fast filter,
   never the merge evidence. Never claim done off a local run alone.
+- **`main` is behind a merge queue: `gh pr merge` ENQUEUES, it does not
+  merge.** The command exits 0 and the PR stays `OPEN`. The queue then re-runs
+  all seven required contexts on its own `gh-readonly-queue/main/pr-<n>-<sha>`
+  ref before landing anything, so "green on the PR" is necessary but not
+  sufficient. Never report a PR merged off that exit code — poll until its
+  state is `MERGED` and the commit is an ancestor of `origin/main`. Two flags
+  to know: `--delete-branch` is **rejected outright** while the queue is on
+  (delete the branch after it lands), and `--subject` is ignored, since the
+  queue composes the merge commit from the PR title plus `(#<pr>)` — so the PR
+  title is the commit title, write it accordingly. An entry stuck in
+  `AWAITING_CHECKS` means a required workflow is not listening for
+  `merge_group`; `.github/MERGE-QUEUE.md` owns that failure mode and the
+  invariants that prevent it.
 - **A test that wouldn't fail on the bug it guards is not a test.** Assert the
   observable outcome, not that the code path executed.
 - **Prefer a deterministic mechanism over prompt discipline.** If a check, a
