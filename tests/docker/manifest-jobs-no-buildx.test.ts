@@ -33,6 +33,10 @@ const WORKFLOWS = ['docker-images.yml', 'promote.yml']
 
 const BUILDX_ACTION = 'docker/setup-buildx-action'
 const BUILD_ACTION = 'docker/build-push-action'
+// Real build jobs now reach setup-buildx-action THROUGH this composite,
+// which warms the BuildKit image with a bounded retry first (#3815). For
+// this file's purposes it is the same thing: a job that sets up a builder.
+const LOCAL_BUILDX_ACTION = './.github/actions/setup-buildx'
 
 interface Step {
   uses?: string
@@ -61,8 +65,16 @@ function isManifestOnly(job: Job): boolean {
   return usesImagetools && !buildsImages
 }
 
+/** Direct reference — what a manifest-only job must never do. */
 function usesBuildx(job: Job): boolean {
   return stepsOf(job).some((s) => (s.uses ?? '').includes(BUILDX_ACTION))
+}
+
+/** Direct OR via the warm-pull composite — "this job sets up a builder". */
+function setsUpBuilder(job: Job): boolean {
+  return stepsOf(job).some(
+    (s) => (s.uses ?? '').includes(BUILDX_ACTION) || (s.uses ?? '') === LOCAL_BUILDX_ACTION,
+  )
 }
 
 describe('manifest-only workflow jobs never set up buildx (no docker.io dependency)', () => {
@@ -109,7 +121,10 @@ describe('manifest-only workflow jobs never set up buildx (no docker.io dependen
     expect(builders.length).toBeGreaterThan(0)
     for (const name of builders) {
       const job = all.find((j) => j.name === name)!.job
-      expect(usesBuildx(job), `build job ${name} must still set up buildx`).toBe(true)
+      expect(
+        setsUpBuilder(job),
+        `build job ${name} must still set up buildx (directly or via ${LOCAL_BUILDX_ACTION})`,
+      ).toBe(true)
     }
   })
 })

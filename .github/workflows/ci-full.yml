@@ -249,7 +249,13 @@ jobs:
         run: npm run build
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        # Composite action, NOT docker/setup-buildx-action directly (#3815) —
+        # this job uses the docker-container driver, which boots BuildKit by
+        # pulling moby/buildkit from Docker Hub before the login below ever
+        # runs. The composite warms that image into the local image store
+        # behind a bounded, transient-only retry first.
+        # Enforced by tests/ci-buildx-warm-pull.test.ts.
+        uses: ./.github/actions/setup-buildx
 
       - name: Log in to GHCR (cache-from + BASE_IMAGE pulls only)
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
