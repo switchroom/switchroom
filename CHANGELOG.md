@@ -1,5 +1,145 @@
 # Changelog
 
+## v0.19.26 — the recall deadline envelope is declarative and drift-visible, and recall drops a duplicate ANN scan per fact type
+
+### The recall deadline envelope is declarative, and drift makes an apply that reverts it visible
+
+Three of the tunables that decide whether auto-recall returns anything at all
+lived as literals inside the vendored hindsight plugin tree — the tree
+`switchroom apply` rm's and re-copies. An operator who needed a different value
+had to hand-edit the installed plugin, and the next apply silently restored the
+shipped default while `switchroom.yaml` went on reading as though the host were
+tuned. The live fleet did exactly this three separate times; today's apply
+reinstated `hooks/hooks.json` `timeout: 12` and `recall.py` `timeout=8`, wiping
+the 2026-07-25 patches with no error and no log line.
+
+The three keys are one nested envelope, and inverting any pair yields a config
+that is silently useless:
+
+    hook ceiling (hooks.json timeout)
+      └── parallel fan-out deadline (recallParallelDeadlineSeconds)
+            └── per-bank HTTP timeout (recallRequestTimeoutSeconds)
+
+They are now resolved together in `src/setup/hindsight-recall-tunables.ts` from
+`memory.recall.{hook_timeout_seconds,parallel_deadline_seconds,request_timeout_seconds}`,
+with the envelope enforced by clamping rather than by documentation.
+`recall.py`'s bare `timeout=8` became the managed key
+`recallRequestTimeoutSeconds` (env `HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS`).
+
+**The shipped defaults are unchanged — 12 / 10 / 8 on every host that does not
+configure them.** This makes the keys settable; it does not change what
+switchroom ships.
+
+Each key travels by the only carrier that can actually win. The env exports in
+`start.sh` are authoritative and unconditional, because
+`~/.hindsight/claude-code.json` *survives* an apply and loads after
+`settings.json` — a settings-only stamp would be quietly defeated by exactly the
+stale hand-edit this change exists to retire, and env sits above both.
+`settings.json` is still stamped so the deployed file is coherent when read on
+its own. The hook ceiling has no env channel at all — Claude Code does not
+expand environment variables in a hook `timeout` — so the deployed
+`hooks/hooks.json` is rewritten post-copy on every reconcile, the same
+vendor-stays-pristine stamping `applyHindsightSettingsOverrides` already used.
+
+A new drift surface (`memory-tunables`, surface 7 in `src/agents/drift.ts`)
+recomputes the expected effective values and reports when the installed plugin
+disagrees, following the `.switchroom-drift.json` precedent rather than
+inventing a mechanism. It compares *values*, not file hashes, so an unrelated
+vendor bump does not trip it, and it also reports when a configured value was
+clamped to keep the envelope valid — otherwise the clamp is the next silent
+revert.
+
+Also fixed: `dirContentEquals` dropped its content-overrides map when recursing
+into subdirectories, so any stamped nested file made the up-to-date check
+permanently false and forced an rm-and-recopy of the whole plugin tree on every
+reconcile.
+
+The clamp enforces the same inequality the repo's own budget guard does:
+`parallel_deadline_seconds` must sit at least `RECALL_DEADLINE_HEADROOM_SECONDS`
+(2s) *below* the hook ceiling, not merely at or below it. At equality a
+deadline-abandoned fan-out has zero budget left to format its block, write the
+cache and flush stdout, so Claude Code SIGKILLs the hook mid-write and the turn
+loses both the memories and the `recall_log` row that would have explained why —
+which made `{hook_timeout_seconds: 12, parallel_deadline_seconds: 12}` resolve to
+a broken `12/12/8` with no clamp and no warning. `hindsight-reranker-budget.test.ts`
+could never have caught it: it reads only the vendored defaults, never operator
+yaml. A hook ceiling below 3s admits no coherent envelope at all and is now
+raised (and reported) rather than silently flattened.
+
+Also fixed: `hindsight-reranker-budget.test.ts` located the per-bank timeout with
+a file-wide `/^\s*timeout=([0-9.]+),$/` scan, which stopped matching the moment
+the value became a managed key — it fell through to an unrelated
+`subprocess.run(..., timeout=5)` in the issue reporter ~650 lines away and kept
+passing, measuring nothing. It is now anchored inside `_make_bank_task` and
+throws if that anchor moves.
+
+The per-bank `request_timeout_seconds` now *derives* from the effective
+deadline when unset rather than taking the vendored literal (12s since #3760).
+The shared fan-out deadline is the tighter outer guard, so a per-bank value
+above it can never fire, and stamping 12 against the shipped 10s deadline would
+have put every stock agent through the clamp — reporting a clamp on config the
+operator never wrote. An explicitly configured value above the deadline still
+clamps, and still reports. The TypeScript constant is now pinned against
+`lib/config.py`'s `DEFAULTS["recallRequestTimeoutSeconds"]` by a test: #3760 and
+#3759 each carried a literal for this one key and disagreed (12 vs 8), and
+because `start.sh` exports it unconditionally and env outranks the vendored
+value, the losing literal would have overridden the shipped default on every
+host with CI green.
+
+Deliberately not done: `recallMaxMemories` was already declarative and is
+untouched.
+
+### Recall stops issuing a duplicate ANN scan per fact type (temporary carry of upstream hindsight #2968)
+
+Every recall ran the same vector scan twice per fact type. Step 2
+(`retrieve_semantic_bm25_combined`) over-fetches semantic candidates for HNSW
+recall; Step 3 then handed the graph retriever no seeds, so
+`LinkExpansionRetriever.retrieve` issued its own
+`ORDER BY embedding <=> $1::vector` — once per fact type, serialized behind the
+connection block Step 2 had just closed. Separately, `fetch_unit_dates` compared
+`id::text = ANY($1)`, casting the indexed primary key and forcing a sequential
+scan.
+
+Upstream fixed both in `vectorize-io/hindsight` PR #2968 (merge `b475f5cc`,
+2026-07-27), citing 302,602 calls / 2,072s of accumulated load for the redundant
+seed query and 120.049ms → 0.240ms median for the id lookup once
+`pk_memory_units` served it. That merge landed **after** v0.8.5 was cut, and
+v0.8.5 is upstream's tip release, so there is nothing to upgrade to.
+`docker/Dockerfile.hindsight` therefore carries the diff as a build-time patch,
+using the same self-verifying mechanism as the existing patches.
+
+**This block is temporary and its removal condition is written into it: delete
+it — with `tests/docker/hindsight-graph-seed-patch.test.ts` and the matching CI
+step — the moment the pinned base reaches upstream v0.8.6.**
+
+Reuse is not unconditional, and that is the whole safety argument. The shared
+pool is only reused when the semantic arm's SQL floor is *no stricter* than the
+graph seed floor; a per-request `min_scores.semantic` above 0.3 makes the pool
+narrower than the dedicated query's result, so the retriever falls back to its
+own query rather than silently returning fewer graph entry points. A quieter
+recall is worse than a slower one.
+
+switchroom shipped its own version of this optimisation and retired it when
+0.8.5 deliberately deleted the parameter it depended on. This is not a
+re-litigation of that: #2968 is upstream reversing its own stance one day later
+and adding the correctness guard the retired patch had to invent for itself. The
+negative guard that keeps the switchroom-authored form dead still stands,
+retargeted to that form's own markers.
+
+One deliberate divergence from upstream's diff: upstream reads the seed floor
+from `config.graph_seed_min_similarity`, a key v0.8.5 does not have (it hardcodes
+`limit=20, threshold=0.3`). The carry mirrors those literals as named constants
+and **asserts the config key is still absent**, so a future base that introduces
+it fails the build instead of quietly ignoring an operator's setting.
+
+Not carried: upstream PR #2502 (`stop emitting unsupported maxItems`). It fixes
+AWS Bedrock Converse rejecting `maxItems` in a structured-output schema. Measured
+against the backend this fleet actually uses (Ollama behind the LiteLLM proxy),
+a consolidation-shaped `json_schema` request with `maxItems` of none / 5 / 100 /
+1000 returned HTTP 200 every time with no latency trend (0.386–0.520s across 12
+calls). `maxItems` is neither rejected nor expensive here, so carrying the patch
+would add a maintenance obligation for no effect.
+
 ## v0.19.25 — hindsight 0.8.5, recall stops timing out on mature banks, and `switchroom memory repair` fixes silently under-returning banks
 
 ### Recall no longer times out on mature banks
@@ -210,144 +350,6 @@ transcript fallback still uses them for its keyword match.
 A leftover `recallMinOverlap` key in an operator's `settings.json` is inert; a
 test pins that, since a removed knob coming back through stale config is the
 obvious regression.
-
-### The recall deadline envelope is declarative, and drift makes an apply that reverts it visible
-
-Three of the tunables that decide whether auto-recall returns anything at all
-lived as literals inside the vendored hindsight plugin tree — the tree
-`switchroom apply` rm's and re-copies. An operator who needed a different value
-had to hand-edit the installed plugin, and the next apply silently restored the
-shipped default while `switchroom.yaml` went on reading as though the host were
-tuned. The live fleet did exactly this three separate times; today's apply
-reinstated `hooks/hooks.json` `timeout: 12` and `recall.py` `timeout=8`, wiping
-the 2026-07-25 patches with no error and no log line.
-
-The three keys are one nested envelope, and inverting any pair yields a config
-that is silently useless:
-
-    hook ceiling (hooks.json timeout)
-      └── parallel fan-out deadline (recallParallelDeadlineSeconds)
-            └── per-bank HTTP timeout (recallRequestTimeoutSeconds)
-
-They are now resolved together in `src/setup/hindsight-recall-tunables.ts` from
-`memory.recall.{hook_timeout_seconds,parallel_deadline_seconds,request_timeout_seconds}`,
-with the envelope enforced by clamping rather than by documentation.
-`recall.py`'s bare `timeout=8` became the managed key
-`recallRequestTimeoutSeconds` (env `HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS`).
-
-**The shipped defaults are unchanged — 12 / 10 / 8 on every host that does not
-configure them.** This makes the keys settable; it does not change what
-switchroom ships.
-
-Each key travels by the only carrier that can actually win. The env exports in
-`start.sh` are authoritative and unconditional, because
-`~/.hindsight/claude-code.json` *survives* an apply and loads after
-`settings.json` — a settings-only stamp would be quietly defeated by exactly the
-stale hand-edit this change exists to retire, and env sits above both.
-`settings.json` is still stamped so the deployed file is coherent when read on
-its own. The hook ceiling has no env channel at all — Claude Code does not
-expand environment variables in a hook `timeout` — so the deployed
-`hooks/hooks.json` is rewritten post-copy on every reconcile, the same
-vendor-stays-pristine stamping `applyHindsightSettingsOverrides` already used.
-
-A new drift surface (`memory-tunables`, surface 7 in `src/agents/drift.ts`)
-recomputes the expected effective values and reports when the installed plugin
-disagrees, following the `.switchroom-drift.json` precedent rather than
-inventing a mechanism. It compares *values*, not file hashes, so an unrelated
-vendor bump does not trip it, and it also reports when a configured value was
-clamped to keep the envelope valid — otherwise the clamp is the next silent
-revert.
-
-Also fixed: `dirContentEquals` dropped its content-overrides map when recursing
-into subdirectories, so any stamped nested file made the up-to-date check
-permanently false and forced an rm-and-recopy of the whole plugin tree on every
-reconcile.
-
-The clamp enforces the same inequality the repo's own budget guard does:
-`parallel_deadline_seconds` must sit at least `RECALL_DEADLINE_HEADROOM_SECONDS`
-(2s) *below* the hook ceiling, not merely at or below it. At equality a
-deadline-abandoned fan-out has zero budget left to format its block, write the
-cache and flush stdout, so Claude Code SIGKILLs the hook mid-write and the turn
-loses both the memories and the `recall_log` row that would have explained why —
-which made `{hook_timeout_seconds: 12, parallel_deadline_seconds: 12}` resolve to
-a broken `12/12/8` with no clamp and no warning. `hindsight-reranker-budget.test.ts`
-could never have caught it: it reads only the vendored defaults, never operator
-yaml. A hook ceiling below 3s admits no coherent envelope at all and is now
-raised (and reported) rather than silently flattened.
-
-Also fixed: `hindsight-reranker-budget.test.ts` located the per-bank timeout with
-a file-wide `/^\s*timeout=([0-9.]+),$/` scan, which stopped matching the moment
-the value became a managed key — it fell through to an unrelated
-`subprocess.run(..., timeout=5)` in the issue reporter ~650 lines away and kept
-passing, measuring nothing. It is now anchored inside `_make_bank_task` and
-throws if that anchor moves.
-
-The per-bank `request_timeout_seconds` now *derives* from the effective
-deadline when unset rather than taking the vendored literal (12s since #3760).
-The shared fan-out deadline is the tighter outer guard, so a per-bank value
-above it can never fire, and stamping 12 against the shipped 10s deadline would
-have put every stock agent through the clamp — reporting a clamp on config the
-operator never wrote. An explicitly configured value above the deadline still
-clamps, and still reports. The TypeScript constant is now pinned against
-`lib/config.py`'s `DEFAULTS["recallRequestTimeoutSeconds"]` by a test: #3760 and
-#3759 each carried a literal for this one key and disagreed (12 vs 8), and
-because `start.sh` exports it unconditionally and env outranks the vendored
-value, the losing literal would have overridden the shipped default on every
-host with CI green.
-
-Deliberately not done: `recallMaxMemories` was already declarative and is
-untouched.
-
-### Recall stops issuing a duplicate ANN scan per fact type (temporary carry of upstream hindsight #2968)
-
-Every recall ran the same vector scan twice per fact type. Step 2
-(`retrieve_semantic_bm25_combined`) over-fetches semantic candidates for HNSW
-recall; Step 3 then handed the graph retriever no seeds, so
-`LinkExpansionRetriever.retrieve` issued its own
-`ORDER BY embedding <=> $1::vector` — once per fact type, serialized behind the
-connection block Step 2 had just closed. Separately, `fetch_unit_dates` compared
-`id::text = ANY($1)`, casting the indexed primary key and forcing a sequential
-scan.
-
-Upstream fixed both in `vectorize-io/hindsight` PR #2968 (merge `b475f5cc`,
-2026-07-27), citing 302,602 calls / 2,072s of accumulated load for the redundant
-seed query and 120.049ms → 0.240ms median for the id lookup once
-`pk_memory_units` served it. That merge landed **after** v0.8.5 was cut, and
-v0.8.5 is upstream's tip release, so there is nothing to upgrade to.
-`docker/Dockerfile.hindsight` therefore carries the diff as a build-time patch,
-using the same self-verifying mechanism as the existing patches.
-
-**This block is temporary and its removal condition is written into it: delete
-it — with `tests/docker/hindsight-graph-seed-patch.test.ts` and the matching CI
-step — the moment the pinned base reaches upstream v0.8.6.**
-
-Reuse is not unconditional, and that is the whole safety argument. The shared
-pool is only reused when the semantic arm's SQL floor is *no stricter* than the
-graph seed floor; a per-request `min_scores.semantic` above 0.3 makes the pool
-narrower than the dedicated query's result, so the retriever falls back to its
-own query rather than silently returning fewer graph entry points. A quieter
-recall is worse than a slower one.
-
-switchroom shipped its own version of this optimisation and retired it when
-0.8.5 deliberately deleted the parameter it depended on. This is not a
-re-litigation of that: #2968 is upstream reversing its own stance one day later
-and adding the correctness guard the retired patch had to invent for itself. The
-negative guard that keeps the switchroom-authored form dead still stands,
-retargeted to that form's own markers.
-
-One deliberate divergence from upstream's diff: upstream reads the seed floor
-from `config.graph_seed_min_similarity`, a key v0.8.5 does not have (it hardcodes
-`limit=20, threshold=0.3`). The carry mirrors those literals as named constants
-and **asserts the config key is still absent**, so a future base that introduces
-it fails the build instead of quietly ignoring an operator's setting.
-
-Not carried: upstream PR #2502 (`stop emitting unsupported maxItems`). It fixes
-AWS Bedrock Converse rejecting `maxItems` in a structured-output schema. Measured
-against the backend this fleet actually uses (Ollama behind the LiteLLM proxy),
-a consolidation-shaped `json_schema` request with `maxItems` of none / 5 / 100 /
-1000 returned HTTP 200 every time with no latency trend (0.386–0.520s across 12
-calls). `maxItems` is neither rejected nor expensive here, so carrying the patch
-would add a maintenance obligation for no effect.
 
 ### `switchroom doctor` detects banks with no per-bank vector index
 
