@@ -404,6 +404,7 @@ import {
   type OperatorEvent,
   type OperatorEventKind,
 } from '../operator-events.js'
+import { createMcpFailureHook } from './mcp-failure-hook.js'
 import { pendingUserNoticeGate } from '../pending-user-notice.js'
 import { recordOperatorEvent } from '../operator-events-history.js'
 import {
@@ -14007,7 +14008,13 @@ function surfaceConsolidationLegibility(
   })
 }
 
+/** Blocked-paid-dependency alerting — policy in `mcp-credential-failure.ts`,
+ *  seam in `gateway/mcp-failure-hook.ts`. Tees the SAME
+ *  `emitGatewayOperatorEvent` path so there is ONE operator-alert mechanism. */
+const noteMcpDependencyFailure = createMcpFailureHook({ agent: AGENT_NAME, emit: emitGatewayOperatorEvent })
+
 function handleSessionEvent(ev: SessionEvent): void {
+  noteMcpDependencyFailure(ev)
   handleSessionEventCore(gatewayStreamRenderDeps(), ev)
 }
 
