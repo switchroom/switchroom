@@ -133,10 +133,66 @@ Per-op fields: `model`, `provider`, `base_url`, `api_key` (all optional,
 endpoint/credential; `api_key` accepts a `vault:` reference). These map to the
 engine's `HINDSIGHT_API_<OP>_LLM_MODEL` / `_PROVIDER` / `_BASE_URL` /
 `_API_KEY` env vars, with the global `HINDSIGHT_API_LLM_*` as the fallback for
-anything unset.
+anything unset. There is one more per-op field, `context_window`, which is not
+an env var at all — see below.
+
+### Declare the backend's context window (`context_window`)
+
+`hindsight.llm.context_window` declares how many tokens the backend serving
+hindsight actually accepts. Switchroom derives the token budget from it —
+consolidation batch size, the retain / consolidation `max_completion_tokens`
+caps, and the reflect `max_context_tokens` cap — so a single call cannot
+overflow the window:
+
+```yaml
+hindsight:
+  llm:
+    provider: litellm
+    model: openai/gpt-oss-20b
+    context_window: 32768        # llama.cpp -c 65536 -np 2 → 32768 per slot
+    consolidation:
+      context_window: 131072     # this lane routes to a big-window model
+```
+
+Absent → a per-provider default: `200000` for `claude-code`, a deliberately
+conservative `32768` for anything else (a non-Claude provider in switchroom
+usually means LiteLLM in front of a local llama.cpp / Ollama slot). All three
+lanes — `retain`, `reflect`, `consolidation` — are budgeted independently, so a
+per-op `context_window` only ratchets that lane.
+
+**Set this if you self-host the backend.** A context overflow on llama.cpp is
+*silent*: with `--context-shift` it discards the oldest tokens and keeps only
+the first `--keep`, which is exactly where the system prompt and JSON schema
+live, so the model then answers conversationally and returns **HTTP 200 with
+`finish_reason: stop`**. Nothing errors; retain and consolidation just quietly
+stop extracting. On the reference fleet that ran undetected for a week at a
+44–47% malformed-response rate, against 2% for the same model on a
+131k-window route. Declaring the window turns it into a loud failure at
+`switchroom memory setup` time instead of never — an over-budget declaration
+aborts the launch with the arithmetic that doesn't fit.
+
+Under-declaring costs throughput (smaller batches, more LLM calls);
+over-declaring corrupts memory. When in doubt, under-declare.
 
 Takes effect on the next `switchroom memory setup` / rollout recreate of the
 hindsight container (env is read at container launch).
+
+### Capability-gated tunings you don't have to set
+
+Switchroom emits these automatically when it can prove the host qualifies, so
+they survive a container recreate instead of having to be re-applied by hand.
+Override any of them through `hindsight.env` (an operator value always wins,
+even when the gate is off).
+
+| Var | Emitted when | Value | Why |
+|-----|--------------|-------|-----|
+| `HINDSIGHT_API_LLM_STRICT_SCHEMA` | LLM endpoint is self-hosted | `true` | Without it a local `gpt-oss:20b` prefixes prose to its JSON; ~45% of retain/consolidation calls then fail to parse. Upstream defaults it `False`. |
+| `HINDSIGHT_API_LLM_MAX_RETRIES` | LLM endpoint is self-hosted | `2` | A local endpoint isn't rate-limited, so upstream's `3` mostly adds latency to a call that will fail the same way. |
+| `HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE` | container can reach a GPU | `128` | Upstream's `32` is the CPU/MPS value. Measured on CUDA: rerank of 150 candidates `4.347s → 0.174s`, recall p50 `3.2s → 0.8s`. A 128-wide batch on CPU is a regression, hence the gate. |
+
+"Self-hosted" is decided by `hindsightLocalLlmEnabled()` — a loopback, LAN, or
+`*.local` base URL on `hindsight.llm` or the LiteLLM proxy. The GPU gate is the
+same one that adds `--gpus all`.
 
 **Changing models?** Follow the step-by-step runbook in
 [`hindsight-model-change.md`](hindsight-model-change.md) — it covers the two

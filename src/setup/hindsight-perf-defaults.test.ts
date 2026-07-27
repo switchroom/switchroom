@@ -187,16 +187,20 @@ describe("hindsightPerfEnv — capability gating", () => {
 
   it("declares exactly the gated knobs this PR ships, by name", () => {
     // Same anti-vacuity discipline for the two gated groups: the GPU group
-    // must be FP16 and nothing else, and the local-LLM group must be the
-    // three concurrency caps and nothing else. Without this, quietly moving a
-    // knob between groups (or dropping one) passes every other test here.
+    // must be FP16 plus the CUDA rerank batch size and nothing else, and the
+    // local-LLM group must be the three concurrency caps plus the two
+    // local-endpoint LLM knobs and nothing else. Without this, quietly moving
+    // a knob between groups (or dropping one) passes every other test here.
     expect(HINDSIGHT_PERF_DEFAULTS_GPU.map(([k]) => k)).toEqual([
       "HINDSIGHT_API_RERANKER_LOCAL_FP16",
+      "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
     ]);
     expect(HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM.map(([k]) => k)).toEqual([
       "HINDSIGHT_API_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+      "HINDSIGHT_API_LLM_MAX_RETRIES",
     ]);
   });
 
@@ -306,7 +310,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these eight keys, by name", () => {
+  it("is overridable on exactly these eleven keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -318,8 +322,11 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
       "HINDSIGHT_API_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_LLM_MAX_RETRIES",
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
+      "HINDSIGHT_API_LLM_STRICT_SCHEMA",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
+      "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
       "HINDSIGHT_API_RERANKER_LOCAL_FP16",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
     ]);
@@ -514,6 +521,104 @@ describe("startHindsight — performance defaults reach the container", () => {
       false,
     );
     expect(runEnv(runArgs()).has("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toBe(false);
+  });
+});
+
+// ── the tunings that used to exist only on the live container ─────────────
+describe("hand-applied container tunings are now emitted by both launch paths", () => {
+  /**
+   * These five values were applied imperatively with `docker exec`/`docker run`
+   * on the live fleet and were therefore destroyed by the next
+   * `switchroom memory setup` (the installed 0.19.23 CLI emits no reference to
+   * any of them). Each is measured-good, so the regression this block guards is
+   * "the recreate silently reverts the fix":
+   *
+   *   • LLM_STRICT_SCHEMA=true    — without it gpt-oss:20b prefixes prose to its
+   *     JSON and ~45% of local retain/consolidation calls fail to parse.
+   *   • LLM_MAX_RETRIES=2         — a local endpoint isn't rate-limited, so
+   *     upstream's 3 mostly adds latency to a call that will fail again.
+   *   • RERANKER_LOCAL_BATCH_SIZE=128 — CUDA value; rerank of 150 candidates
+   *     went 4.347s → 0.174s, recall p50 3.2s → 0.8s.
+   *   • REFLECT_MAX_CONTEXT_TOKENS / CONSOLIDATION_MAX_COMPLETION_TOKENS — now
+   *     DERIVED from the declared context window
+   *     (tests/setup/hindsight-context-budget.test.ts owns their values); here
+   *     we only assert they reach both containers ungated.
+   */
+  const GATED_LOCAL_LLM = [
+    ["HINDSIGHT_API_LLM_STRICT_SCHEMA", "true"],
+    ["HINDSIGHT_API_LLM_MAX_RETRIES", "2"],
+  ] as const;
+  const GATED_GPU = [["HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE", "128"]] as const;
+
+  it("emits the local-LLM tunings on BOTH paths when the endpoint is self-hosted", () => {
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false),
+    );
+    for (const [key, value] of GATED_LOCAL_LLM) {
+      expect(fromRun.get(key), `${key} on docker run`).toEqual([value]);
+      expect(fromCompose.get(key), `${key} on compose`).toEqual([value]);
+    }
+  });
+
+  it("withholds the local-LLM tunings from a cloud endpoint on BOTH paths", () => {
+    // strict-schema costs nothing on a frontier model but IS a hard constraint
+    // some hosted providers reject outright, and retries=2 is a reliability
+    // downgrade against a rate-limited API. Absent capability ⇒ upstream default.
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, true);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, CLOUD_LITELLM, true),
+    );
+    for (const [key] of GATED_LOCAL_LLM) {
+      expect(fromRun.has(key), `${key} must be absent on docker run`).toBe(false);
+      expect(fromCompose.has(key), `${key} must be absent on compose`).toBe(false);
+    }
+  });
+
+  it("emits the CUDA rerank batch size on BOTH paths only for a GPU host", () => {
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, true);
+    const withGpu = runEnv(runArgs());
+    const withGpuCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, CLOUD_LITELLM, true),
+    );
+    for (const [key, value] of GATED_GPU) {
+      expect(withGpu.get(key), `${key} on docker run`).toEqual([value]);
+      expect(withGpuCompose.get(key), `${key} on compose`).toEqual([value]);
+    }
+
+    execFileSyncMock.mockClear();
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false);
+    const noGpu = runEnv(runArgs());
+    const noGpuCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false),
+    );
+    for (const [key] of GATED_GPU) {
+      // 32 (upstream's CPU/MPS default) is correct without CUDA — a 128-wide
+      // batch on CPU is a latency regression, not a speed-up.
+      expect(noGpu.has(key), `${key} must be absent on docker run`).toBe(false);
+      expect(noGpuCompose.has(key), `${key} must be absent on compose`).toBe(false);
+    }
+  });
+
+  it("emits the derived context-budget knobs on BOTH paths, ungated", () => {
+    // Unlike the two groups above these are NOT capability-gated: an oversized
+    // prompt corrupts memory on any backend, so the cap ships everywhere. The
+    // cloud/CPU host is the hostile case — if they were gated they'd vanish here.
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, CLOUD_LITELLM, false),
+    );
+    for (const key of [
+      "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS",
+      "HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS",
+      "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE",
+    ]) {
+      expect(fromRun.get(key)?.length, `${key} exactly once on docker run`).toBe(1);
+      expect(fromCompose.get(key), `${key} must match across paths`).toEqual(fromRun.get(key));
+    }
   });
 });
 
