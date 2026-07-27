@@ -512,11 +512,12 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
         : "Add defaults.subagents to switchroom.yaml to enable Sonnet/Haiku delegation. See docs/sub-agents.md for the worker/researcher/reviewer pattern.",
   });
 
-  // Adaptive-thinking effort guard (#1978). Opus 4.x / Opus 5 + thinking_effort
-  // above the `low` floor can 400 on thinking blocks when work runs
-  // through concurrent sub-agents (an upstream claude CLI merge bug).
-  // Resolve each agent's effective model + effort and flag the combo so
-  // an operator sees it at `doctor`/`apply` time, not as silent 400s.
+  // Adaptive-thinking effort guard (#1978). PINNED Opus 4.x only: the
+  // upstream claude-CLI merge bug that produced the 400 on thinking blocks
+  // was fixed in claude-code 2.1.156 (pinned by switchroom v0.14.8; the base
+  // image now runs 2.1.219), so Opus 5 and the bare `opus` alias are no
+  // longer flagged. Resolve each agent's effective model + effort and flag
+  // the combo so an operator sees it at `doctor`/`apply` time.
   const effortRisks: string[] = [];
   for (const [name, agentConfig] of Object.entries(config.agents)) {
     const resolved = resolveAgentConfig(
@@ -533,11 +534,11 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
     status: effortRisks.length > 0 ? "warn" : "ok",
     detail:
       effortRisks.length > 0
-        ? `${effortRisks.length} agent(s) on Opus (4.x/5) with thinking_effort > low: ${effortRisks.join(", ")}`
+        ? `${effortRisks.length} agent(s) on pinned Opus 4.x with thinking_effort > low: ${effortRisks.join(", ")}`
         : "no risky model/effort combos",
     fix:
       effortRisks.length > 0
-        ? "Pin `thinking_effort: low` for Opus 4.x / Opus 5 agents — medium+ can 400 on 'thinking blocks cannot be modified' with concurrent sub-agents (issue #1978). Removing the field is NOT a fix (Opus defaults effort=high when unset)."
+        ? "Pin `thinking_effort: low` for pinned Opus 4.x agents, or move them to a current Opus model. medium+ could 400 on 'thinking blocks cannot be modified' with concurrent sub-agents (issue #1978); the upstream fix shipped in claude-code 2.1.156 but the Opus 4.x reproduction was never re-tested. Removing the field is NOT a fix (Opus defaults effort=high when unset)."
         : undefined,
   });
 

@@ -18036,7 +18036,7 @@ function broadcastTierNotice(markdown: string): void {
  *     the user must re-issue `/model <premium>`, which the notice says plainly.
  *   - Effort is NATIVE: no `.session-effort` carrier is written, so the restart
  *     sheds any live /effort override and the downgraded default boots at the
- *     configured `thinking_effort` (the fleet `low` pin, #1978).
+ *     configured `thinking_effort` (#1978 / thinking-effort-risk.ts).
  *   - Loop-bounded by the NATURAL on-default guard: after the downgrade boot the
  *     session runs the configured default (override gone), so a re-entry returns
  *     `skip` ('on-default') and never re-downgrades — even if the default is

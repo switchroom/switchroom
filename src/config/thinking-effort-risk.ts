@@ -1,34 +1,51 @@
 /**
- * Model-aware thinking-effort risk guard (#1978).
+ * Model-aware thinking-effort risk guard (#1978) — LEGACY, Opus 4.x only.
  *
- * Opus 4.x and Opus 5 models use *adaptive thinking* — they emit
+ * Opus models use *adaptive thinking* — they emit
  * `thinking`/`redacted_thinking` blocks. switchroom dispatches work to
  * concurrent sub-agents (worker/researcher/reviewer via the Task tool,
- * often `background: true`), and the bundled `claude` CLI can mis-merge
- * the interleaved streaming content blocks, after which the Anthropic
- * API rejects the turn with:
+ * often `background: true`), and old builds of the bundled `claude` CLI
+ * could mis-merge the interleaved streaming content blocks, after which
+ * the Anthropic API rejected the turn with:
  *
  *   400 messages.N.content.M: 'thinking' or 'redacted_thinking' blocks
  *   in the latest assistant message cannot be modified.
  *
- * This is an UPSTREAM claude CLI bug (a fix is credited in claude's own
- * changelog for the concurrent-agent / interleaved-streaming merge
- * path), not a switchroom bug — so switchroom can't fully fix it; it can
- * only (a) keep effort at the safe floor and (b) warn loudly when an
- * operator configures a combo known to trigger it.
+ * THIS BUG IS FIXED UPSTREAM. It was an UPSTREAM claude CLI streaming-merge
+ * bug, not a switchroom bug, and the fix shipped in claude-code **2.1.156**
+ * — pinned by switchroom v0.14.8 (CHANGELOG "Claude CLI pinned to `@2.1.156`
+ * (the 400-fix build)"). Containers now run 2.1.219
+ * (`docker/Dockerfile.base:157`), 63 builds past the fix.
+ *
+ * The guard is therefore retained ONLY for pinned Opus 4.x model ids
+ * (`claude-opus-4*`), where the `medium`+ reproduction was actually observed
+ * and where nobody has re-tested since. It deliberately does NOT match Opus 5
+ * or the bare `opus` alias:
+ *
+ *   - Opus 5 runs at `thinking_effort: medium` on klanker and overlord since
+ *     2026-07-25 with no recurrence of the 400.
+ *   - The `opus` alias now resolves to Opus 5 (claude-code 2.1.219 made Opus 5
+ *     the default Opus), so matching the bare alias would flag Opus 5 by proxy.
+ *
+ * A related, separately-verified NON-cause: the em-dash scrubber was once
+ * blamed for invalidating thinking-block signatures. That is wrong —
+ * `normalizePunctuation` (`telegram-plugin/format.ts`) runs only in the
+ * Telegram send path and never rewrites the session `.jsonl`, so it cannot
+ * touch what is replayed to the API.
  *
  * `effort: low` keeps adaptive thinking near-zero (few/no thinking
- * blocks to mis-merge) and is the safe floor; `medium`+ reliably
- * reproduces the 400. The scaffold defaults unset `thinking_effort` to
- * `low` (see SWITCHROOM_DEFAULT_THINKING_EFFORT), so an UNSET value is
- * safe — only an explicit `medium`/`high`/`xhigh`/`max` on an Opus 4.x /
- * Opus 5 model is flagged.
+ * blocks to mis-merge) and was the safe floor; `medium`+ reproduced the 400
+ * on Opus 4.x under the pre-2.1.156 CLI. The scaffold defaults unset
+ * `thinking_effort` to `low` (see SWITCHROOM_DEFAULT_THINKING_EFFORT), so an
+ * UNSET value is safe — only an explicit `medium`/`high`/`xhigh`/`max` on a
+ * pinned Opus 4.x model is flagged.
  *
- * Scope note: this guard intentionally only flags the Opus family — 4.x and
- * 5, plus the bare `opus` alias (see `isAdaptiveThinkingOpus` below).
- * Sonnet 5 also has adaptive thinking, but the fleet runs Sonnet
- * sub-agents at higher effort without hitting this, so flagging it would
- * be a false alarm. Revisit if the failure is observed on Sonnet.
+ * Scope note: this guard intentionally flags the Opus 4.x family ONLY — not
+ * Opus 5, not the bare `opus` alias, not Sonnet. Sonnet 5 also has adaptive
+ * thinking, but the fleet runs Sonnet sub-agents at higher effort without
+ * hitting this, so flagging it would be a false alarm. When the Opus 4.x
+ * reproduction is re-tested green on a post-2.1.156 CLI, delete this module
+ * and its `doctor` check outright.
  *
  * Pure (no I/O) so it can back both `switchroom doctor` and a config-load
  * advisory, and be unit-tested directly.
@@ -39,20 +56,18 @@ const RISKY_EFFORTS = new Set(["medium", "high", "xhigh", "max"]);
 
 /**
  * True for models whose adaptive thinking + switchroom's concurrent
- * sub-agent dispatch is known to trigger the claude-CLI thinking-block
- * merge 400. Matches the `opus` alias (resolves to the latest Opus,
- * currently Opus 5) and any pinned `claude-opus-4-*` / `claude-opus-5`
- * id (including future `claude-opus-5-*` date-stamped pins).
+ * sub-agent dispatch was known to trigger the claude-CLI thinking-block
+ * merge 400 on a pre-2.1.156 CLI.
+ *
+ * Matches PINNED Opus 4.x ids only (`claude-opus-4`, `claude-opus-4-8`,
+ * date-stamped `claude-opus-4-*` pins). It deliberately does NOT match the
+ * bare `opus` alias — that alias resolves to Opus 5 on the bundled CLI, so
+ * matching it would flag Opus 5 by proxy — nor any `claude-opus-5*` id.
  */
 export function isAdaptiveThinkingOpus(model: string | undefined): boolean {
   if (!model) return false;
   const m = model.trim().toLowerCase();
-  return (
-    m === "opus" ||
-    m.startsWith("claude-opus-4") ||
-    m === "claude-opus-5" ||
-    m.startsWith("claude-opus-5-")
-  );
+  return m.startsWith("claude-opus-4");
 }
 
 export interface ThinkingEffortRisk {
@@ -64,10 +79,10 @@ export interface ThinkingEffortRisk {
 /**
  * Assess whether a (model, thinking_effort) combo risks the adaptive-
  * thinking merge 400. Safe (`risky: false`) when effort is unset (→
- * scaffold floor `low`), when effort is `low`, or when the model isn't an
- * Opus 4.x / Opus 5 adaptive-thinking model.
+ * scaffold floor `low`), when effort is `low`, or when the model isn't a
+ * pinned Opus 4.x id (Opus 5 and the bare `opus` alias are safe).
  *
- * @param model   Resolved model — alias (`opus`) or full id (`claude-opus-5`).
+ * @param model   Resolved model — alias (`opus`) or full id (`claude-opus-4-8`).
  * @param effort  Resolved `thinking_effort` (may be undefined).
  */
 export function assessThinkingEffortRisk(
@@ -80,10 +95,10 @@ export function assessThinkingEffortRisk(
   return {
     risky: true,
     reason:
-      `thinking_effort '${effort}' on adaptive-thinking model '${model}' can trigger ` +
+      `thinking_effort '${effort}' on pinned Opus 4.x model '${model}' could trigger ` +
       `'400 thinking/redacted_thinking blocks cannot be modified' errors when work runs ` +
-      `through concurrent sub-agents (issue #1978). Pin 'thinking_effort: low' (the safe ` +
-      `floor) unless the bundled claude CLI includes the concurrent-agent thinking-block ` +
-      `merge fix.`,
+      `through concurrent sub-agents (issue #1978). The upstream claude-CLI fix shipped in ` +
+      `2.1.156, but the Opus 4.x reproduction has not been re-tested since, so pin ` +
+      `'thinking_effort: low' or move the agent to a current Opus model.`,
   };
 }

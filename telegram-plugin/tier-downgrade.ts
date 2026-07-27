@@ -33,9 +33,10 @@
  *
  * Effort is NATIVE. A live `/effort` override records in gateway memory only
  * (no carrier), so the self-restart sheds it and the downgraded default boots at
- * the configured `thinking_effort` (the fleet `low` pin, #1978 /
+ * the configured `thinking_effort` (#1978 /
  * src/config/thinking-effort-risk.ts). This module writes NO effort carrier —
- * that is the whole point: the downgraded opus must resolve LOW.
+ * that is the whole point: the downgraded opus must resolve to the configured
+ * default, whatever that is.
  *
  * Loop guard — the natural on-default guard is the real bound. After the
  * downgrade boot the session runs the configured default (the override is gone

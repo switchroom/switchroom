@@ -51,14 +51,16 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
   the POST-repoint intent so `.routing-mode` can compare landed vs declared.
   Change the repoint case and that function together or a healthy boot fires a
   spurious "Routing divergence" alert.
-- **Opus is covered by the adaptive-thinking risk check.**
+- **Only PINNED Opus 4.x is covered by the adaptive-thinking risk check.**
   `isAdaptiveThinkingOpus()` (`src/config/thinking-effort-risk.ts`) matches
-  `opus`, `claude-opus-4*`, `claude-opus-5`, `claude-opus-5-*`; `switchroom
-  doctor` WARNs on those with `thinking_effort` above the `low` floor
-  (`src/cli/doctor.ts:512`). The documented failure is the upstream claude-CLI
-  interleaved-streaming merge bug (#1978): `400 messages.N.content.M: 'thinking'
-  or 'redacted_thinking' blocks in the latest assistant message cannot be
-  modified`. Pin `thinking_effort: low`.
+  `claude-opus-4*` and nothing else; `switchroom doctor` WARNs on those with
+  `thinking_effort` above the `low` floor (`src/cli/doctor.ts:533`). The
+  documented failure is the upstream claude-CLI interleaved-streaming merge bug
+  (#1978): `400 messages.N.content.M: 'thinking' or 'redacted_thinking' blocks
+  in the latest assistant message cannot be modified`. It was FIXED in
+  claude-code 2.1.156, so Opus 5 and the bare `opus` alias are deliberately not
+  matched and the fleet runs `medium`. Don't re-add the Opus 5 arms, and don't
+  advise pinning `low` fleet-wide.
 - **Cron tiering keys off the model STRING — but only third**
   (`src/scheduler/cron-routing.ts`). Two gates decide before the model is
   consulted: `kind: action` returns `tier: "action"` at `:89` and is

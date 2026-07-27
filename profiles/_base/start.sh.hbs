@@ -1799,7 +1799,7 @@ esac
 # tells the operator once.
 #
 # NB: the CONFIGURED default resolution is untouched (#3186 constraint) —
-# the fleet `thinking_effort: low` pin (see #1978 /
+# the configured `thinking_effort` (see #1978 /
 # src/config/thinking-effort-risk.ts) resolves exactly as before.
 _EFFECTIVE_EFFORT={{#if thinkingEffort}}'{{thinkingEffort}}'{{else}}''{{/if}}
 if [ -f "{{agentDir}}/.session-effort" ]; then

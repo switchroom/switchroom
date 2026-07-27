@@ -5,14 +5,31 @@ import {
 } from "./thinking-effort-risk.js";
 
 describe("isAdaptiveThinkingOpus", () => {
-  it("matches the opus alias and pinned opus-4.x / opus-5 ids", () => {
-    expect(isAdaptiveThinkingOpus("opus")).toBe(true);
+  it("matches pinned opus-4.x ids", () => {
+    expect(isAdaptiveThinkingOpus("claude-opus-4")).toBe(true);
     expect(isAdaptiveThinkingOpus("claude-opus-4-8")).toBe(true);
     expect(isAdaptiveThinkingOpus("claude-opus-4-7")).toBe(true);
+    expect(isAdaptiveThinkingOpus("claude-opus-4-1-20250805")).toBe(true);
     expect(isAdaptiveThinkingOpus("CLAUDE-OPUS-4-8")).toBe(true); // case-insensitive
-    expect(isAdaptiveThinkingOpus("claude-opus-5")).toBe(true);
-    expect(isAdaptiveThinkingOpus("claude-opus-5-20260501")).toBe(true); // future date-stamped pin
-    expect(isAdaptiveThinkingOpus("CLAUDE-OPUS-5")).toBe(true); // case-insensitive
+    expect(isAdaptiveThinkingOpus("  claude-opus-4-8  ")).toBe(true); // trimmed
+  });
+
+  // The #1978 CLI merge bug was fixed upstream in claude-code 2.1.156 (pinned
+  // by switchroom v0.14.8; docker/Dockerfile.base now pins 2.1.219). The guard
+  // is legacy scope for pinned Opus 4.x only, so Opus 5 must NOT be flagged.
+  it("does NOT match Opus 5 (bug fixed upstream at CLI 2.1.156)", () => {
+    expect(isAdaptiveThinkingOpus("claude-opus-5")).toBe(false);
+    expect(isAdaptiveThinkingOpus("claude-opus-5-20260501")).toBe(false);
+    expect(isAdaptiveThinkingOpus("CLAUDE-OPUS-5")).toBe(false);
+    expect(isAdaptiveThinkingOpus("claude-opus-6")).toBe(false);
+  });
+
+  // The bare alias resolves to the latest Opus (Opus 5 on claude-code 2.1.219),
+  // so matching it would flag Opus 5 by proxy.
+  it("does NOT match the bare `opus` alias", () => {
+    expect(isAdaptiveThinkingOpus("opus")).toBe(false);
+    expect(isAdaptiveThinkingOpus("OPUS")).toBe(false);
+    expect(isAdaptiveThinkingOpus(" opus ")).toBe(false);
   });
 
   it("does not match sonnet/haiku or unset", () => {
@@ -25,18 +42,24 @@ describe("isAdaptiveThinkingOpus", () => {
 });
 
 describe("assessThinkingEffortRisk", () => {
-  it("flags Opus 4.x with effort above the low floor", () => {
+  it("flags pinned Opus 4.x with effort above the low floor", () => {
     for (const effort of ["medium", "high", "xhigh", "max"]) {
       const r = assessThinkingEffortRisk("claude-opus-4-8", effort);
       expect(r.risky).toBe(true);
       expect(r.reason).toContain("thinking");
     }
-    expect(assessThinkingEffortRisk("opus", "medium").risky).toBe(true);
   });
 
-  it("flags Opus 5 with effort above the low floor", () => {
-    expect(assessThinkingEffortRisk("claude-opus-5", "high").risky).toBe(true);
-    expect(assessThinkingEffortRisk("claude-opus-5-20260501", "max").risky).toBe(true);
+  // Regression guard for the fleet default moving off the `low` floor: an
+  // Opus 5 (or `opus`-alias) agent at medium/high must produce NO doctor warn.
+  it("does NOT flag Opus 5 or the `opus` alias at any effort", () => {
+    for (const model of ["claude-opus-5", "claude-opus-5-20260501", "opus"]) {
+      for (const effort of ["medium", "high", "xhigh", "max"]) {
+        const r = assessThinkingEffortRisk(model, effort);
+        expect(r.risky).toBe(false);
+        expect(r.reason).toBeUndefined();
+      }
+    }
   });
 
   it("is safe when effort is the floor or unset (scaffold defaults to low)", () => {
