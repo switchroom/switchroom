@@ -76,7 +76,7 @@ describe('renderWorkerActivity', () => {
 
   it('renders the native header + running status + step feed', () => {
     const out = renderWorkerActivity(view())
-    expect(out).toContain('🛠 **Worker** · _research competitors_')
+    expect(out).toContain('└─ 🛠 **WORKER** · _research competitors_')
     // Unified header: running shows "<elapsed> · N tools" (no "running ·" word).
     expect(out).toContain('_10s · 3 tools_')
     expect(out).toContain('3 tools')
@@ -100,7 +100,7 @@ describe('renderWorkerActivity', () => {
 
   it('shows a "starting…" line when no step has run yet', () => {
     const out = renderWorkerActivity(view({ lastTool: null, latestSummary: '' }))
-    expect(out).toContain('🛠 **Worker**')
+    expect(out).toContain('└─ 🛠 **WORKER**')
     expect(out).toContain('starting…')
     expect(out).not.toContain('→')
   })
@@ -121,7 +121,7 @@ describe('renderWorkerActivity', () => {
     const out = renderWorkerActivity(
       view({ state: 'done', toolCount: 5, latestSummary: 'PR #21 opened' }),
     )
-    expect(out).toContain('🛠 **Worker** · _research competitors_')
+    expect(out).toContain('└─ 🛠 **WORKER** · _research competitors_')
     // Unified done header: "done · N tools · <elapsed>".
     expect(out).toContain('_done · 5 tools · ')
     expect(out).toContain('─────')
@@ -227,7 +227,7 @@ describe('renderWorkerActivity', () => {
         narrativeLines: ['- ran the **full** suite', '`git push`'],
       }),
     )
-    expect(running).toContain('🛠 **Worker** · _Build the sync_')
+    expect(running).toContain('└─ 🛠 **WORKER** · _Build the sync_')
     expect(running).toContain('ran the full suite')
     expect(running).toContain('git push')
     // The CONTENT bold/code markers were stripped — no `**full**`, no backticks.
@@ -298,7 +298,7 @@ describe('createWorkerActivityFeed', () => {
     // #2669: the worker feed body is raw GFM markdown sent through the rich
     // path (the gateway wires sendMessage → sendRichMessage). No parse_mode.
     expect(bot.sent[0].opts?.parse_mode).toBeUndefined()
-    expect(bot.sent[0].text).toContain('🛠 **Worker**')
+    expect(bot.sent[0].text).toContain('└─ 🛠 **WORKER**')
     expect(feed.has('w1')).toBe(true)
   })
 
@@ -932,7 +932,7 @@ describe('createWorkerActivityFeed — heartbeat', () => {
     await drain()
     expect(bot.sent).toHaveLength(1)
     expect(feed.messageIdOf('w1')).toBe(1000)
-    expect(bot.sent[0].text).toContain('🛠 **Worker**')
+    expect(bot.sent[0].text).toContain('└─ 🛠 **WORKER**')
 
     // And it keeps updating: a later heartbeat edits the message with a
     // climbing `· Ns` suffix so the still-alive worker visibly advances.
@@ -1328,7 +1328,7 @@ describe('header row + rolling overflow survive in the unified worker render', (
     )
     const out = renderWorkerActivity(view({ narrativeLines, toolCount: 7 }))
 
-    expect(out).toContain('🛠 **Worker**')
+    expect(out).toContain('└─ 🛠 **WORKER**')
     // Unified running status line.
     expect(out).toContain('_10s · 7 tools_')
     expect(out).toContain('7 tools')
@@ -1344,7 +1344,7 @@ describe('header row + rolling overflow survive in the unified worker render', (
 
     expect(out.length).toBeLessThanOrEqual(4096)
     expect(out).toContain('earlier…')
-    expect(out).toContain('🛠 **Worker**')
+    expect(out).toContain('└─ 🛠 **WORKER**')
     expect(out).toContain('_10s · ')
   })
 
@@ -1359,7 +1359,7 @@ describe('header row + rolling overflow survive in the unified worker render', (
     expect(out.length).toBeLessThanOrEqual(4096)
     const hasBullet = out.includes('→') || out.includes('✓')
     expect(hasBullet).toBe(true)
-    expect(out).toContain('🛠 **Worker**')
+    expect(out).toContain('└─ 🛠 **WORKER**')
     expect(out).toContain('_10s · ')
     expect(isValidWorkerMarkdown(out)).toBe(true)
   })
@@ -1525,7 +1525,7 @@ describe('worker-feed send-gate shed contract', () => {
     await feed.update('w1', 'chat', view({ elapsedMs: clock }))
     expect(bot.sendCalls).toBe(1)
     expect(bot.sent).toHaveLength(1)
-    expect(bot.sent[0].text).toContain('🛠 **Worker**')
+    expect(bot.sent[0].text).toContain('└─ 🛠 **WORKER**')
     expect(feed.has('w1')).toBe(true)
   })
 

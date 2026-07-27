@@ -90,6 +90,8 @@ import {
   STATUS_LINE_MAX,
   NESTED_PREFIX,
   WORKER_STEP_INDENT,
+  SUBORDINATE_LINE_INDENT,
+  nestSubordinateCardLines,
 } from './status-no-truncate.js'
 import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
@@ -372,6 +374,18 @@ export interface StatusCardOpts {
    * full recent trail — see WORKER_HISTORY_MAX.
    */
   historyWindow?: number
+  /**
+   * Render this card as structurally SUBORDINATE to the 🤖 agent card (#3820):
+   * line 1 is prefixed with `└─ ` and every later line with
+   * `SUBORDINATE_LINE_INDENT`, so the whole block sits one level in from the
+   * agent card's left margin.
+   *
+   * This is what makes "my agent" vs "a background worker" answerable from the
+   * card's SHAPE without reading its label — the two cards were otherwise
+   * byte-for-byte the same layout, differing only by an emoji + one word.
+   * Worker surfaces pass `true`; the agent card never does.
+   */
+  subordinate?: boolean
 }
 
 /**
@@ -381,7 +395,8 @@ export interface StatusCardOpts {
  * Pipeline: header → escape+clip every raw step/child → rolling-window each
  * group with `+N earlier…` → wrap (parent done-styled when children present;
  * newest-in-progress `→` bold else `✓` italic; NESTED_PREFIX for children) →
- * optional `✓ N steps` footer → optional result block → fitCardToBudget.
+ * optional `✓ N steps` footer → optional result block → subordinate nesting
+ * (#3820, when `opts.subordinate`) → fitCardToBudget.
  */
 export function renderStatusCard(opts: StatusCardOpts): string | null {
   const { header, final = false, liveSuffix = '', stepCount, result } = opts
@@ -453,7 +468,9 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
   // collapseSafe (#3666): the agent status card and the single-worker card are
   // both PINNED, and Telegram's pinned bar shows them collapsed to one line
   // with the newlines dropped — the separator keeps that preview legible.
-  const joined = stackCardLines(out, { collapseSafe: true })
+  const joined = stackCardLines(opts.subordinate === true ? nestSubordinateCardLines(out) : out, {
+    collapseSafe: true,
+  })
   if (joined.length <= STATUS_CARD_CHAR_BUDGET) return joined
   return fitCardToBudget(opts, headerLines)
 }
@@ -475,6 +492,15 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   const rawSteps = opts.steps.filter((s) => s != null)
   const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
   const hasChildren = rawChildren.length > 0
+  const subordinate = opts.subordinate === true
+  // Subordinate nesting (#3820) costs a fixed prefix on EVERY line — the header
+  // prefix and the body indent are the same length by invariant (see
+  // SUBORDINATE_HEADER_PREFIX), so it is one flat per-line charge rather than a
+  // line-1 special case. Charged into the arithmetic below so the extreme
+  // single-oversized-bullet branch still lands under the wire cap.
+  const nestCost = subordinate ? SUBORDINATE_LINE_INDENT.length : 0
+  const stack = (lines: string[]): string =>
+    stackCardLines(subordinate ? nestSubordinateCardLines(lines) : lines, { collapseSafe: true })
 
   // Fixed footer/result lines (always kept).
   const footerLines: string[] = []
@@ -483,7 +509,9 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
     footerLines.push(WORKER_RESULT_RULE)
     footerLines.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
   }
-  const fixedCost = [...headerLines, ...footerLines].join('\n').length
+  const fixedCost =
+    [...headerLines, ...footerLines].join('\n').length +
+    (headerLines.length + footerLines.length) * nestCost
 
   // The active "body" group whose oldest bullets we drop: children when
   // present (parent collapses to a single "+N" marker), else parent steps.
@@ -507,7 +535,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
     shown.forEach((esc, i) => lines.push(buildBullet(esc, i === lastIdx)))
     lines.push(...footerLines)
     // collapseSafe: same pinned surface as renderStatusCard (#3666).
-    const candidate = stackCardLines(lines, { collapseSafe: true })
+    const candidate = stack(lines)
     if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
   }
 
@@ -515,11 +543,12 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   // newest text, then escape, then wrap — re-checking post-escape because
   // escaping can expand the string (& → &amp;).
   const rawNewest = body.length > 0 ? stripMarkdown(body[body.length - 1]).replace(/\s+/g, ' ').trim() : ''
-  const wrapperOverhead = final
-    ? (prefix + '_✓ _').length
-    : (prefix + '**→ **').length + liveSuffix.length
+  const wrapperOverhead =
+    (final ? (prefix + '_✓ _').length : (prefix + '**→ **').length + liveSuffix.length) + nestCost
   const headerFooterCost =
-    fixedCost + (fixedCost > 0 ? 1 : 0) + (parentMarker != null ? parentMarker.length + 1 : 0)
+    fixedCost +
+    (fixedCost > 0 ? 1 : 0) +
+    (parentMarker != null ? parentMarker.length + nestCost + 1 : 0)
   const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
   let raw = rawNewest.slice(0, Math.max(0, budget))
   let newest = escapeMarkdown(raw)
@@ -533,7 +562,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   if (parentMarker != null) lines.push(parentMarker)
   lines.push(newestLine)
   lines.push(...footerLines)
-  return stackCardLines(lines, { collapseSafe: true })
+  return stack(lines)
 }
 
 /**
@@ -769,7 +798,7 @@ function glanceLine(rows: CombinedWorkerRow[]): string {
   const tok = rows.reduce((n, r) => n + (r.totalTokens ?? 0), 0)
   const toolWord = tools === 1 ? 'tool' : 'tools'
   return (
-    `🛠 **Workers** · _${rows.length} running · oldest ${formatFeedElapsed(oldestMs)}` +
+    `🛠 **WORKERS** · _${rows.length} running · oldest ${formatFeedElapsed(oldestMs)}` +
     ` · ${tools} ${toolWord}${tokenSegment(tok)}_`
   )
 }
@@ -778,13 +807,17 @@ function glanceLine(rows: CombinedWorkerRow[]): string {
  * Render N≥1 live workers into ONE combined feed body (ready Telegram
  * markdown; callers send verbatim — do NOT re-escape). Layout:
  *
- *   🛠 **Workers** · _N running · oldest {elapsed} · {n} tools · {t} tok_
- *   **1. {desc1}** _· {elapsed} · {n} tools_
- *      ~~_✓ {earlier step}_~~
- *      **→ {newest step}**
- *   **2. {desc2}** _· {elapsed} · {n} tools_
- *      **→ {newest step}**
- *   _+M more working…_
+ *   └─ 🛠 **WORKERS** · _N running · oldest {elapsed} · {n} tools · {t} tok_
+ *      **1. {desc1}** _· {elapsed} · {n} tools_
+ *         ~~_✓ {earlier step}_~~
+ *         **→ {newest step}**
+ *      **2. {desc2}** _· {elapsed} · {n} tools_
+ *         **→ {newest step}**
+ *      _+M more working…_
+ *
+ * SUBORDINATION (#3820): line 1 carries `└─ ` and every later line carries
+ * `SUBORDINATE_LINE_INDENT`, so the whole card reads as a child block of the
+ * 🤖 agent card rather than a second top-level card with the same silhouette.
  *
  * INDENT: every step line carries a leading `WORKER_STEP_INDENT` (a U+2800 run
  * — neither ASCII spaces nor U+00A0; Telegram left-trims BOTH, see the
@@ -893,7 +926,17 @@ export function renderCombinedWorkerFeed(
     // renders it collapsed to one line with the newlines dropped and nothing
     // substituted. Without the separator the glance line runs straight into
     // row 1's ordinal and every step glyph mashes into the previous line.
-    return { body: stackCardLines(out, { collapseSafe: true }), bodyLines: bodyOut.length }
+    //
+    // Subordinate nesting (#3820) is applied LAST, over the finished line list:
+    // the glance line takes `└─ ` and every row header / step / spill line takes
+    // one `SUBORDINATE_LINE_INDENT`, so this card reads as a child block of the
+    // 🤖 agent card the same way the single-worker card does. Step lines already
+    // carry WORKER_STEP_INDENT, so they end up one level deeper than their row
+    // header — the intra-card hierarchy is preserved, just shifted right.
+    return {
+      body: stackCardLines(nestSubordinateCardLines(out), { collapseSafe: true }),
+      bodyLines: bodyOut.length,
+    }
   }
 
   // Cap to maxRows first, then shrink the visible set while EITHER the total
