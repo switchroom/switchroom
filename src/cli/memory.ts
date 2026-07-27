@@ -907,27 +907,35 @@ export function registerMemoryCommand(program: Command): void {
             { timeoutMs },
           );
 
+          // `result.ok` now means the tag was READ BACK out of the memory unit
+          // the server returned, not merely that the call returned HTTP 200
+          // with isError:false — which it does even when the `add_tags`
+          // argument is silently dropped and nothing is written.
           if (result.ok) {
             console.log(
-              chalk.green("✓ Tag applied."),
+              chalk.green("✓ Tag applied"),
               chalk.gray(
-                "Recall.py's filter excludes the memory on the next auto-recall (or after agent restart if a session cache is warm).",
+                "(confirmed: the tag is present on the memory the server returned).\n" +
+                  "  Recall.py's filter excludes the memory on the next auto-recall (or after agent restart if a session cache is warm).",
               ),
             );
             return;
           }
 
           console.error(
-            chalk.red("✗ Tag failed:"),
+            chalk.red("✗ Tag NOT applied:"),
             chalk.gray(result.reason),
           );
           console.error(
             chalk.gray(
-              "  Hindsight 0.8.5 has no tag-write path for an existing memory: the\n" +
-                "  `update_memory` MCP tool (and the equivalent REST PATCH) accepts only\n" +
-                "  text / context / occurred_start / occurred_end / fact_type / entities —\n" +
-                "  there is no `add_tags` or `tags`. Tags can only be attached at retain\n" +
-                "  time, so this verb cannot succeed until upstream grows one.\n" +
+              "  Hindsight has no per-memory tag-write path (checked against 0.8.4 live\n" +
+                "  and the 0.8.5 wheel): `update_memory` and `PATCH .../memories/{id}`\n" +
+                "  both accept only text / context / occurred_start / occurred_end /\n" +
+                "  fact_type / entities — no `add_tags`, no `tags`. An unknown argument is\n" +
+                "  SILENTLY DROPPED (the call still returns isError:false), so this command\n" +
+                "  verifies by reading the tag back off the memory the server returns.\n" +
+                "  Tags can otherwise only be attached at retain time, so this verb cannot\n" +
+                "  succeed until upstream grows a per-memory tag-write argument (#3772).\n" +
                 "  To stop a memory surfacing right now, retire it instead:\n" +
                 "  `mcp__hindsight__invalidate_memory(memory_id=…, reason=…)` — reversible\n" +
                 "  via `restore: true`, but it also hides the memory from reflect and\n" +

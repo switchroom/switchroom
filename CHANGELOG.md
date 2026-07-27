@@ -134,7 +134,7 @@ container's `mem_limit` cgroup, so an agent that raises `tmp_size` *and*
 intends to fill it should raise `resources.memory` alongside. Agents pick the
 new size up when their container is recreated; a running container keeps the
 mount it booted with.
-### The hindsight MCP contract is re-pinned to the 0.8.5 surface
+### The hindsight MCP contract is re-pinned to the surface the fleet actually runs
 
 The golden tools/list snapshot had not been refreshed since 2026-06-07. It
 recorded **29** tools; the server has advertised **32** since at least 0.8.4.
@@ -153,18 +153,31 @@ The snapshot is not decorative. Two things read it:
   `EXPECTED_HINDSIGHT_TOOLS`, which likewise did not track either curation
   tool, so neither was ever validated.
 
-The snapshot is now regenerated from a live `tools/list` capture, forward-
-patched with the three additive schema changes verified by diffing the
-`hindsight-api-slim` 0.8.4 and 0.8.5 wheels: `create_mental_model` gains
-`tags_match`, `list_memories` gains `tags` and `tags_match`. 0.8.5 adds no MCP
-tools and removes none. `recall`'s `min_scores` / `prefer_observations` and
-`reflect`'s `include_based_on` / `include_trace` — present on the server, absent
-from the fallback — are picked up too.
+The snapshot is now a **verbatim live capture of 0.8.4** — the version
+`docker/Dockerfile.hindsight` pins — and picks up `recall`'s `min_scores` /
+`prefer_observations` and `reflect`'s `include_based_on` / `include_trace`,
+which were on the server all along and absent from the fallback.
 
-Keeping the two in step is now mechanical rather than aspirational:
-`tests/memory.hindsight-contract.fixture.test.ts` asserts the fallback table's
-tool set, `required` sets and `props` sets are equal to the snapshot's. The old
-arrangement was a comment asking the next person to remember.
+**It is deliberately not forward-patched to 0.8.5.** Running the contract ahead
+of the pinned image is not harmless optimism: hindsight drops an unknown
+argument *silently* (`isError: false`, and the response is byte-identical to the
+call without it). So a fallback advertising `list_memories.tags` on a 0.8.4
+server makes an agent issue a tag-scoped query and receive the **unfiltered**
+list believing it was filtered — the silent-wrong-answer class the shim exists
+to prevent. The 0.8.5 delta is known and additive (`create_mental_model`
++`tags_match`, `list_memories` +`tags` +`tags_match`; no tools added or removed,
+both wheels register 32) and belongs with the image bump in #3768.
+
+Two mechanisms keep this honest rather than remembered:
+
+- `docker/Dockerfile.hindsight` now carries a machine-read
+  `# switchroom:hindsight-api-version=` marker, and
+  `tests/memory.hindsight-contract.fixture.test.ts` asserts it equals the
+  snapshot's `_meta.hindsight_api_version`. Bumping the image without
+  re-capturing the snapshot reds the suite.
+- The same test asserts the fallback table's tool set, `required` sets and
+  `props` sets are equal to the snapshot's. The old arrangement was a comment
+  asking the next person to remember.
 
 ### `update_memory` was never a phantom tool — and `memory demote` still cannot work
 
@@ -175,18 +188,40 @@ reading the stale 29-tool snapshot.
 
 The real gap is narrower and does not close on its own. `update_memory` accepts
 `text` / `context` / `occurred_start` / `occurred_end` / `fact_type` /
-`entities` — there is no `tags`, no `add_tags`, and the REST equivalent
+`entities` — there is no `tags`, no `add_tags`, and the per-memory REST route
 (`PATCH /v1/default/banks/{bank_id}/memories/{memory_id}`) takes the same field
-set. Hindsight 0.8.5 has **no tag-write path for an existing memory** at all;
-tags can only be attached at retain time. So `memory demote` cannot succeed
-until upstream grows one — and `docs/configuration.md` was meanwhile telling
-operators to call `update_memory(tags=[…])`, which never worked.
+set. Neither 0.8.4 nor 0.8.5 has a **per-memory tag-write path**; tags can
+otherwise only be attached at retain time. (`PATCH .../documents/{document_id}`
+*does* rewrite a document's memory-unit tags, but it is document-scoped,
+replaces rather than appends, needs a non-null `document_id` and re-triggers
+consolidation — it cannot demote one memory. Tracked on #3772.) Meanwhile
+`docs/configuration.md` was telling operators to call
+`update_memory(tags=[…])`, which never worked.
 
-Corrected: the doc now shows the two things that *do* work (tag at retain time,
-or retire the memory with `invalidate_memory` — reversible, but stronger, since
-it hides the memory from reflect and manual recall too), the CLI's failure
-message names the actual cause instead of blaming the operator's deployment,
-and the mis-diagnosis is corrected at each callsite comment that repeated it.
+**And the failure is invisible to the MCP error channel.** `isError` fires for
+an unknown *tool*, never for an unknown *argument* — verified live on 0.8.4,
+where `update_memory{memory_id, add_tags}` and `update_memory{memory_id}` return
+byte-identical bodies, both `isError: false`, while a genuinely unknown tool
+name yields `isError: true`. Application errors are equally invisible: a missing
+memory answers `isError: false` with `{"error": "Memory '…' not found"}`. So an
+`isError` guard on this callsite can never fire, and an earlier revision of this
+work claiming demote "fails loudly" on the back of one was wrong.
+
+`addMemoryTag` now **reads the tag back** out of the updated memory unit that
+`update_memory` returns (upstream tail-calls `get_memory_unit`, which always
+emits a `tags` key), and returns `ok: false` unless the tag is present. An
+unreadable or error body is a failure, not a pass — the old "treat HTTP 200 as
+success" fallback is exactly how `memory demote` printed "✓ Tag applied." while
+tagging nothing. The check is self-healing: the day upstream grows a per-memory
+tag-write argument, the read-back confirms and demote starts working with no
+code change.
+
+Corrected alongside: the doc now shows the two things that *do* work (tag at
+retain time, or retire the memory with `invalidate_memory` — reversible, but
+stronger, since it hides the memory from reflect and manual recall too), the
+CLI's failure message names the actual cause instead of blaming the operator's
+deployment, and the mis-diagnosis is corrected at each callsite comment that
+repeated it.
 
 The exemption is self-invalidating rather than a comment: the callsite is
 recorded with `knownUnsupportedArgs: ["add_tags"]`, and the fixture test asserts

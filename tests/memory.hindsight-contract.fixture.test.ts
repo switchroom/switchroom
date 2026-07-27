@@ -29,18 +29,80 @@ import {
 import { FALLBACK_TOOL_TABLE } from "../src/cli/hindsight-mcp-shim.js";
 
 interface Snapshot {
+  _meta?: { count?: number; hindsight_api_version?: string };
   tools: Record<string, { required: string[]; props: string[] }>;
 }
 const snapshot = JSON.parse(
   readFileSync(resolve(__dirname, "fixtures", "hindsight-tools-list.snapshot.json"), "utf-8"),
 ) as Snapshot;
 
-/** Tool count on the hindsight surface switchroom targets (0.8.5). */
+/** Tool count on the hindsight surface switchroom targets (0.8.4; 0.8.5 adds
+ *  and removes none — both wheels register 32). */
 const HINDSIGHT_TOOL_COUNT = 32;
+
+/**
+ * The `api_version` the pinned hindsight image resolves to, read out of
+ * `docker/Dockerfile.hindsight`'s machine-read marker rather than duplicated
+ * here — a second hand-maintained copy is a third thing to forget.
+ */
+function pinnedHindsightApiVersion(): string {
+  const dockerfile = readFileSync(
+    resolve(__dirname, "..", "docker", "Dockerfile.hindsight"),
+    "utf-8",
+  );
+  const hits = dockerfile.match(/^#\s*switchroom:hindsight-api-version=(\S+)\s*$/gm) ?? [];
+  expect(
+    hits.length,
+    "docker/Dockerfile.hindsight must carry exactly one `# switchroom:hindsight-api-version=<v>` " +
+      "marker naming the api_version its pinned digest resolves to",
+  ).toBe(1);
+  return hits[0].split("=")[1].trim();
+}
 
 describe("hindsight contract — golden snapshot integrity", () => {
   it(`the snapshot captures all ${HINDSIGHT_TOOL_COUNT} server tools`, () => {
     expect(Object.keys(snapshot.tools).length).toBe(HINDSIGHT_TOOL_COUNT);
+  });
+
+  it("_meta.count is not decorative — it matches the tools actually captured", () => {
+    expect(snapshot._meta?.count).toBe(Object.keys(snapshot.tools).length);
+  });
+
+  /**
+   * THE SNAPSHOT MUST NOT RUN AHEAD OF THE PINNED IMAGE.
+   *
+   * A snapshot captured from (or forward-patched to) a newer server than the
+   * one the repo ships is not harmlessly optimistic. `FALLBACK_TOOL_TABLE` is
+   * built from this file and is the manifest an agent's tools/list returns on a
+   * cold boot; hindsight drops an unknown ARGUMENT silently (isError:false, and
+   * the response is byte-identical to the call without it, verified live on
+   * 0.8.4). So a forward-patched prop makes an agent issue e.g. a tag-scoped
+   * `list_memories` and receive the UNFILTERED list believing it was filtered.
+   *
+   * A previous revision of this branch shipped exactly that: `_meta` stamped
+   * 0.8.5 with `list_memories.tags`, `list_memories.tags_match` and
+   * `create_mental_model.tags_match` bolted on, while
+   * docker/Dockerfile.hindsight pinned 0.8.4. This assertion is what makes that
+   * un-shippable rather than merely regrettable, and it is what forces a
+   * re-capture when #3768 bumps the image.
+   */
+  it("_meta.hindsight_api_version equals the api_version docker/Dockerfile.hindsight pins", () => {
+    expect(
+      snapshot._meta?.hindsight_api_version,
+      "the committed MCP contract must describe the image this repo actually ships — " +
+        "re-capture tests/fixtures/hindsight-tools-list.snapshot.json from the pinned " +
+        "image (and reconcile FALLBACK_TOOL_TABLE) in the same commit as an image bump",
+    ).toBe(pinnedHindsightApiVersion());
+  });
+
+  it("does not advertise the 0.8.5-only props while the pinned image is 0.8.4", () => {
+    // Mutation-guard for the fix above, pinned by name so a reintroduction is
+    // caught even if _meta is edited to match. Drop this test in the same
+    // commit that re-captures the snapshot against 0.8.5 (#3768).
+    if (pinnedHindsightApiVersion() !== "0.8.4") return;
+    expect(snapshot.tools.list_memories.props).not.toContain("tags");
+    expect(snapshot.tools.list_memories.props).not.toContain("tags_match");
+    expect(snapshot.tools.create_mental_model.props).not.toContain("tags_match");
   });
 
   it("EXPECTED_HINDSIGHT_TOOLS agrees with the captured server truth (required-args, no const/snapshot drift)", () => {

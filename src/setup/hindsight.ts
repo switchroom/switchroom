@@ -262,14 +262,17 @@ export const HINDSIGHT_DEFAULT_MCP_STATELESS = true;
  * `update_memory`, both of which now FAIL HONESTLY instead of silently
  * reporting success.
  *
- * CORRECTION (2026-07-27, hindsight 0.8.5 re-audit): the second of those was
- * mis-diagnosed, and the "29 advertised tools" figure above is stale. The
+ * CORRECTION (2026-07-27, hindsight 0.8.4/0.8.5 re-audit): the second of those
+ * was mis-diagnosed, and the "29 advertised tools" figure above is stale. The
  * server advertises **32** (verified live against 0.8.4 and against the 0.8.5
  * wheel), and `update_memory` / `invalidate_memory` / `clear_mental_model` are
  * real, unconditionally-registered tools — the 2026-06-07 tools/list snapshot
  * simply predated them. The real gap is narrower than "phantom tool":
- * `update_memory` has no tag-write argument, so `switchroom memory demote`
- * still cannot work. vault-sweep's single-memory delete path was subsequently
+ * `update_memory` has no PER-MEMORY tag-write argument, so `switchroom memory
+ * demote` still cannot work. And because the tool IS real, the unknown argument
+ * is silently dropped (isError stays false) rather than rejected — so that
+ * callsite verifies by reading the tag back off the memory unit the call
+ * returns; an isError check could never fire there. vault-sweep's single-memory delete path was subsequently
  * reworked onto the real `invalidate_memory` tool. The allowlist verdict is
  * unchanged — the safe minimum is now ~18 of 32, so the blast-radius argument
  * gets stronger, not weaker.

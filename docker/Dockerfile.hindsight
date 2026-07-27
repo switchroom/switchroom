@@ -40,6 +40,17 @@
 # publishes only `:latest` (no `:vX.Y.Z` tag in ghcr), so the digest IS the
 # version pin. A bump runs DB migrations on the persisted memory volume —
 # back up `switchroom-hindsight-data` first.
+#
+# MACHINE-READ MARKER — the `api_version` the digest below resolves to. Bump it
+# in the SAME commit as the digest. `tests/memory.hindsight-contract.fixture.test.ts`
+# asserts it equals `_meta.hindsight_api_version` in
+# `tests/fixtures/hindsight-tools-list.snapshot.json`, so an image bump reds the
+# suite until the MCP tools/list snapshot is re-captured from the new image.
+# That coupling is deliberate: shipping a contract snapshot that runs ahead of
+# the pinned image makes the shim's cold-boot fallback advertise props the
+# server silently drops, and the agent then believes a filter applied when it
+# did not.
+# switchroom:hindsight-api-version=0.8.4
 FROM ghcr.io/vectorize-io/hindsight:latest@sha256:2c60f233eaba8f51db31adb920a560735aaf6f314e4b63c36c73159742dfa1a7
 
 USER root
