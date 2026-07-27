@@ -505,14 +505,31 @@ export function auditGating(
     // real tag push must). Pinning it to `finalize` also catches DRIFT —
     // change the release's trigger gating and forget the promotion's and
     // this fires, which is what a hardcoded string would miss.
-    const normalizeIf = (x: unknown) => String(x ?? "").replace(/\s+/g, " ").trim();
+    // Normalised before comparing, because two spellings GitHub treats as
+    // identical must not fail the rule — a rule that reds on a cosmetic edit
+    // gets silenced rather than fixed. Both conditions are folded YAML
+    // scalars whose continuation lines are more-indented, so YAML really does
+    // preserve their newlines and a re-wrap really does change the parsed
+    // string; and `if: ${{ expr }}` is exactly equivalent to `if: expr`,
+    // which is the form most actions linters and most humans reach for.
+    const normalizeIf = (x: unknown) =>
+      String(x ?? "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/^\$\{\{\s*(.*?)\s*\}\}$/, "$1")
+        .trim();
     if (undraftEntry) {
       const promoteIf = normalizeIf(job.if);
       const undraftIf = normalizeIf(undraftEntry[1].if);
-      if (promoteIf === "") {
+      // Only meaningful while the un-draft job HAS a gate to copy. If neither
+      // has one, that is the un-draft job's defect, not the promotion's —
+      // fall through to the equality branch so the message blames the right
+      // job instead of pointing at an ungated `finalize` as the model.
+      if (promoteIf === "" && undraftIf !== "") {
         problems.push(
-          `R13: the promotion job (${id}) has no \`if:\` — it must be gated exactly like the un-draft job ` +
-            `(${undraftEntry[0]}), or a dry-run dispatch would move :latest.`,
+          `R13: the promotion job (${id}) has no \`if:\` — it must carry the same EXPLICIT gate as the un-draft ` +
+            `job (${undraftEntry[0]}). It is skipped today only because \`needs: ${undraftEntry[0]}\` propagates ` +
+            "that job's skip, which is one refactor of the `needs:` edge away from not holding.",
         );
       } else if (promoteIf !== undraftIf) {
         problems.push(
@@ -947,12 +964,27 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
   });
 
   it("R13: deleting the promotion job's `if:` entirely is caught", () => {
-    // The other direction: ungated, a `-f dry_run=true` rehearsal dispatch
-    // would move `:latest` for real.
+    // Not because an ungated job would run on a dry run — `needs: finalize`
+    // means a skipped `finalize` skips this too, so the immediate behaviour
+    // is unchanged. It is caught because that safety is INHERITED from one
+    // `needs:` edge rather than stated, and the whole point of R13 is that
+    // `needs:` and `if:` are separate guarantees.
     const p = mutate((r) => {
       delete Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!.if;
     });
     expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) has no `if:`/);
+  });
+
+  it("R13: with BOTH `if:`s gone, the un-draft job is blamed rather than the promotion", () => {
+    // The empty-`if:` message tells you to copy the un-draft job's gate. If
+    // that job has none either, following it literally could never clear the
+    // error — so this case must fall through to the equality branch, which
+    // names both jobs and the real defect.
+    const p = mutate((r) => {
+      delete Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!.if;
+      delete jobDoing(r, "--draft=false")![1].if;
+    });
+    expect(p.join("\n")).not.toMatch(/R13: the promotion job \(images-latest\) has no `if:`/);
   });
 
   it("R13: tightening the un-draft job's gating without the promotion job's is caught as drift", () => {
@@ -960,6 +992,8 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
       jobDoing(r, "--draft=false")![1].if = "github.event_name == 'push'";
     });
     expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) has `if:/);
+    // Nothing else reads `finalize`'s `if:`, so this must be the only firing.
+    expect(p.filter((x) => !x.startsWith("R13: the promotion job (images-latest) has `if:"))).toEqual([]);
   });
 
   // Guards the rule against over-firing: the two conditions are written as
@@ -970,6 +1004,17 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
     const p = mutate((r) => {
       const job = Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!;
       job.if = `  ${String(job.if).replace(/\s+/g, "\n   ")}\n`;
+    });
+    expect(p.join("\n")).not.toMatch(/R13:/);
+  });
+
+  // The other cosmetic edit that must stay clean, and the likelier one:
+  // GitHub treats `if: ${{ expr }}` and `if: expr` as the same condition,
+  // and the wrapped form is what most actions linters and most humans write.
+  it("R13: wrapping the promotion job's `if:` in `${{ }}` changes nothing and stays clean", () => {
+    const p = mutate((r) => {
+      const job = Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!;
+      job.if = `\${{ ${String(job.if)} }}`;
     });
     expect(p.join("\n")).not.toMatch(/R13:/);
   });
