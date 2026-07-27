@@ -717,6 +717,7 @@ import {
 } from './emission-authority.js'
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
+import { latestTurnForChat } from './latest-turn-lookup.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
 import { maybeRotate, resolveAgentStateDir, resolveTurnsJsonlPath } from './turns-jsonl-rotate.js'
 import {
@@ -3484,12 +3485,14 @@ export type CurrentTurn = {
   flushedAnswerText: string | null
   // 2026-07 double-reply-on-DM fix (F2 — recency bound). Wall-clock ms the turn
   // ENDED (stamped once by `endCurrentTurnAtomic`), or null while still live.
-  // The `findLatestEndedTurnForChat` supersede tier carries DESTRUCTIVE
-  // authority (it drives message deletion), so `resolveReplyOwnerTurn` only
-  // honours a latest-ended turn whose `endedAt` is within the supersede TTL —
+  // The `latest-ended` supersede tier carries DESTRUCTIVE authority (it drives
+  // message deletion), so `resolveReplyOwnerTurn` only honours a latest-ended
+  // turn whose `endedAt` is non-null (#3725 — the registry is populated at turn
+  // START, so the tail entry may still be RUNNING) AND within the supersede TTL —
   // otherwise a late reply belonging to an OLDER turn could resolve its owner to
-  // a NEWER turn sitting at the registry tail and delete that newer turn's legit
-  // answer. Unbounded routing use of `findLatestEndedTurnForChat` is unaffected.
+  // a NEWER turn at the registry tail and delete that turn's legit answer. The
+  // unbounded ROUTING use (`endedOnly: false`) is unaffected: it only picks a
+  // topic to deliver into and deletes nothing.
   endedAt: number | null
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
@@ -3999,21 +4002,18 @@ const LATE_REPLY_TOPIC_RECOVERY_ENABLED =
   process.env.SWITCHROOM_LATE_REPLY_TOPIC_RECOVERY !== '0'
 
 /**
- * The most-recently-started turn for a chat from the bounded recently-ended
- * registry — the deterministic fallback for a LATE answer reply when the model
- * echoed no `origin_turn_id` and `currentTurn` has already cleared. Iterates in
- * insertion order so the last match is the most recent turn for that chat.
- * Returns null when the chat has no remembered turn (so the caller keeps the
- * legacy result). NB: this is the chat's own most-recent TURN, not the
- * `chatThreadMap` last-seen-any-message heuristic that caused the wrong-topic
- * bug — a late reply almost always belongs to the turn that just ended.
+ * The most recent turn for a chat from the bounded recent-turn registry — the
+ * deterministic fallback for a LATE answer reply when the model echoed no
+ * `origin_turn_id` and `currentTurn` has already cleared. Returns null when the
+ * chat has no matching turn (so the caller keeps the legacy result). NB: this is
+ * the chat's own most-recent TURN, not the `chatThreadMap` last-seen-any-message
+ * heuristic that caused the wrong-topic bug. `endedOnly` selects the consumer's
+ * semantics — routing takes the tail entry even when that turn is still RUNNING;
+ * the destructive `latest-ended` owner tier takes only a genuinely ENDED turn,
+ * because the registry is populated at turn START (#3725; see the module).
  */
-function findLatestEndedTurnForChat(chatId: string): CurrentTurn | null {
-  let latest: CurrentTurn | null = null
-  for (const t of recentTurnsById.values()) {
-    if (t.sessionChatId === chatId) latest = t
-  }
-  return latest
+function findLatestTurnForChat(chatId: string, opts: { endedOnly: boolean }): CurrentTurn | null {
+  return latestTurnForChat(recentTurnsById.values(), chatId, opts)
 }
 
 /**
@@ -4029,7 +4029,7 @@ function findLatestEndedTurnForChat(chatId: string): CurrentTurn | null {
  *   1. the live `currentTurn` passed in (null once the flush nulled the atom);
  *   2. `findTurnByOriginId(origin_turn_id)` — the model echo;
  *   3. `findTurnByQuotedMessageId(chat_id, reply_to)` — framework-owned quote;
- *   4. `findLatestEndedTurnForChat(chat_id)` — the chat's last-ended turn.
+ *   4. `findLatestTurnForChat(chat_id, {endedOnly:true})` — last ENDED turn.
  * Returns the CurrentTurn for the winning id (so callers can read its
  * `answerDelivered` latch), or null when every lookup missed.
  */
@@ -4040,7 +4040,7 @@ function resolveReplyOwnerTurn(
 ): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates } {
   const origin = findTurnByOriginId(args.origin_turn_id as string | undefined)
   const quoted = findTurnByQuotedMessageId(chatId, args.reply_to)
-  const latestEnded = findLatestEndedTurnForChat(chatId)
+  const latestEnded = findLatestTurnForChat(chatId, { endedOnly: true })
   const byId = new Map<string, CurrentTurn>()
   // Populate lowest-precedence first so a higher tier's turn wins the id slot
   // when two lookups resolve the same turn (they carry the same turnId anyway).
@@ -4049,9 +4049,9 @@ function resolveReplyOwnerTurn(
   }
   // F2 — bound the DESTRUCTIVE latest-ended tier to the supersede TTL so a stale
   // latest-ended turn can't inherit deletion authority over a newer turn's flush
-  // record. `endedAt` is null only for a turn still resolvable but not yet ended
-  // (not a supersede risk); leave the age unset then (unbounded) rather than
-  // fabricate one.
+  // record. #3725: the lookup above is `endedOnly`, so `endedAt` is non-null here
+  // and the age is ALWAYS a real number — a not-yet-ended turn is no longer a
+  // candidate at all, and an explicit null age now fails CLOSED downstream.
   const latestEndedAgeMs =
     latestEnded?.endedAt != null ? Date.now() - latestEnded.endedAt : null
   const candidates: ReplyOwnerCandidates = {
@@ -4114,7 +4114,7 @@ function resolveAnswerThreadWithLog(
     explicitThreadId == null &&
     originTurn == null &&
     liveTurn == null
-      ? findLatestEndedTurnForChat(chatId)
+      ? findLatestTurnForChat(chatId, { endedOnly: false })
       : null
   const threadId = resolveAnswerThreadId({
     explicitThreadId,

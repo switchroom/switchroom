@@ -735,7 +735,8 @@ export interface SendReplyGatewayDeps {
    *  The candidates are load-bearing, not diagnostics: `decideContentGateBypass`
    *  corroborates a model-steerable `origin`/`quoted` attribution against the
    *  framework-derived `latestEndedTurnId` inside them before allowing a
-   *  content-gate bypass. */
+   *  content-gate bypass — an anchor that is an ENDED turn within the supersede
+   *  TTL, never one still running (#3725). */
   resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates }
   findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null
   findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTurn | null
@@ -1012,7 +1013,7 @@ export async function sendReply(
     // owner turn resolved (no record to clobber on the collapse path).
     const gateThreadId = ownerTurn?.sessionThreadId ?? replyThreadId
     // MUST-FIX 2 (dup-audit / Fable) — the content-gate READ is CHAT-WIDE, not
-    // lane-specific: `findLatestEndedTurnForChat` resolves owners chat-wide, so a
+    // lane-specific: `findLatestTurnForChat` resolves owners chat-wide, so a
     // handback in topic A can supersede topic B's ended turn; a thread-keyed gate
     // read (the F2 regression) let a reply dodge that handback by carrying a
     // different `message_thread_id`. Chat-wide makes the gate un-steerable — any
@@ -1041,7 +1042,10 @@ export async function sendReply(
     //   - `origin` / `quoted` — MODEL-SUPPLIED attributions, so they bypass ONLY
     //                when CORROBORATED: the turn they resolve must be the same
     //                turn the framework-derived, TTL-bounded `latestEndedTurnId`
-    //                resolves, and no handback may be in the window. A reply that
+    //                resolves (#3725 — that anchor is a genuinely ENDED turn
+    //                within the TTL; a turn still RUNNING in this chat is not a
+    //                candidate and corroborates nothing), and no handback may be
+    //                in the window. A reply that
     //                steers itself onto a DIFFERENT ended turn fails
     //                corroboration and keeps the content gate, so the Fable
     //                silent-edit-over stays closed; a reply that merely echoes
