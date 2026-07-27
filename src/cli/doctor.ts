@@ -53,6 +53,7 @@ import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runWebkiteChecks } from "./doctor-webkite.js";
 import { runCronSessionChecks } from "./doctor-cron-session.js";
+import { runFloodPressureChecks } from "./doctor-flood-pressure.js";
 import { runGeneratedSurfaceDriftChecks } from "./doctor-drift.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
@@ -3678,6 +3679,13 @@ export function registerDoctorCommand(program: Command): void {
             }),
           },
           { title: "Telegram", results: await checkTelegram(config) },
+          {
+            // The 2026-07-27 4.4h flood ban had days of escalating penalties
+            // behind it and nothing was watching. Reads the per-agent 429
+            // pressure ledger the gateway's flood breaker now keeps.
+            title: "Telegram flood pressure (429)",
+            results: runFloodPressureChecks(config),
+          },
           { title: "Agents", results: checkAgents(config, configPath) },
           {
             title: "Agent dotfile ownership (#3157)",
