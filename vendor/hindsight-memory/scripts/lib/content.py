@@ -508,13 +508,10 @@ def shape_recall_query(
     # (a pasted stack trace, a list of ids) outscores an ordinary question on
     # every slot, which would cost the user the thing they actually just asked.
     # Same shape as above: a ceiling of `max_tokens // 3`, never an allocation.
-    latest_reserve = [
-        t
-        for t in sorted(
-            (t for t in candidates if t in latest_tokens and t not in reserved_set),
-            key=lambda t: (-weight(t), first_seen[t]),
-        )
-    ][:reserve_size]
+    latest_reserve = sorted(
+        (t for t in candidates if t in latest_tokens and t not in reserved_set),
+        key=lambda t: (-weight(t), first_seen[t]),
+    )[:reserve_size]
     reserved_set.update(latest_reserve)
 
     filled = sorted(
