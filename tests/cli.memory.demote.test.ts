@@ -118,7 +118,7 @@ describe("memory demote — argument validation", () => {
 describe("memory demote — happy-path wiring", () => {
   it("attempts the API call when agent + memory-id are valid (network failure surfaces cleanly)", () => {
     // Hindsight is pointed at port 1 (closed) so the call fails fast
-    // with a connection error. Exit 1 with a clear "Tag failed:" line
+    // with a connection error. Exit 1 with a clear "Tag NOT applied:" line
     // tells us the dispatcher reached the API layer; the actual API
     // wire shape is covered by tests/memory.add-memory-tag.test.ts.
     const { status, stdout, stderr } = run(
@@ -132,7 +132,7 @@ describe("memory demote — happy-path wiring", () => {
     expect(stdout).toContain("clerk");
     expect(stdout).toContain("[demote-from-recall]");
     // Failure line is on stderr.
-    expect(stderr).toMatch(/Tag failed/);
+    expect(stderr).toMatch(/Tag NOT applied/);
     // Hint references the recall-log workflow so operators know how to
     // verify the ID is valid.
     expect(stderr).toContain("recall-log clerk");

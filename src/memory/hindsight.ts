@@ -886,9 +886,18 @@ export async function ensureMentalModel(
           // guards that). Optional knobs (trigger_refresh_after_consolidation,
           // max_tokens) are added by the caller in `createArguments` only when
           // set. Do NOT add `types` — it is not in create_mental_model's schema
-          // (props: name, source_query, mental_model_id, tags, max_tokens,
-          // trigger_refresh_after_consolidation, bank_id); the server silently
-          // drops it and it reds memory.hindsight-contract.fixture.
+          // (props on 0.8.5: name, source_query, mental_model_id, tags,
+          // tags_match, max_tokens, trigger_refresh_after_consolidation,
+          // bank_id); the server silently drops it and it reds
+          // memory.hindsight-contract.fixture.
+          //
+          // `tags_match` (new in 0.8.5) only matters for a TAGGED model, and
+          // switchroom never passes `tags` here — declared models in
+          // `memory.mental_models[]` have no tags field. If that ever changes,
+          // note the upstream default: a tagged model with no explicit
+          // tags_match resolves to `all_strict`, i.e. a memory must carry EVERY
+          // one of the model's tags to be included. Pass "any" unless you mean
+          // that.
           arguments: createArguments,
         },
       }),
@@ -1338,6 +1347,101 @@ export async function updateBankMissions(
 }
 
 /**
+ * Pure: decide whether an `update_memory` MCP response actually applied `tag`.
+ *
+ * WHY THIS IS A READ-BACK AND NOT AN `isError` CHECK (2026-07-27, verified
+ * live against hindsight 0.8.4 and by AST-diffing the 0.8.4/0.8.5 wheels):
+ *
+ * `isError` fires only for an unknown TOOL. `update_memory` is a real,
+ * unconditionally-registered tool, so an unknown ARGUMENT — `add_tags` — is
+ * **silently dropped** by the server and the call returns `isError:false` with
+ * a response byte-identical to the same call without the argument. An
+ * `isError` guard therefore can never fire here, and any claim that demote
+ * "fails loudly" on the back of one is false.
+ *
+ * Application errors are equally invisible to `isError`: a missing memory
+ * comes back as `isError:false` with the body `{"error": "Memory '…' not
+ * found"}` (probed live). Both classes have to be read out of the body.
+ *
+ * What makes detection possible at all is that `update_memory` returns the
+ * **updated memory unit** — `hindsight_api/mcp_tools.py` `_register_update_memory`
+ * returns `memory.update_memory_unit(...)`, which tail-calls `get_memory_unit`
+ * and always emits a `tags` key (`engine/memory_engine.py`, `"tags": row["tags"]
+ * if row["tags"] else []`). So the response IS the read-back: if the tag is not
+ * in it, the write did not happen. No second round-trip, no extra callsite.
+ *
+ * This also self-heals: the day upstream grows a per-memory tag-write argument,
+ * the returned unit carries the tag and this returns ok without any code change.
+ *
+ * Every non-confirming shape is a failure. "Could not verify" is a failure, not
+ * a pass — reporting success on an unread body is the exact bug this replaces.
+ */
+export function verifyTagWriteResponse(
+  result: { isError?: boolean; content?: Array<{ text?: string }> } | undefined,
+  tag: string,
+): { ok: true } | { ok: false; reason: string } {
+  const cannotApply =
+    "hindsight has no per-memory tag-write path: `update_memory` accepts only " +
+    "text / context / occurred_start / occurred_end / fact_type / entities, and " +
+    "an unknown argument like `add_tags` is silently dropped (isError stays false)";
+
+  if (!result) {
+    return { ok: false, reason: "no MCP result envelope in the update_memory response" };
+  }
+  if (result.isError === true) {
+    return { ok: false, reason: result.content?.[0]?.text ?? "update_memory returned isError" };
+  }
+
+  const text = result.content?.[0]?.text;
+  if (typeof text !== "string" || text.length === 0) {
+    return {
+      ok: false,
+      reason: `update_memory returned no body, so the tag write could not be confirmed — ${cannotApply}`,
+    };
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return {
+      ok: false,
+      reason: `update_memory returned an unparseable body (${text.slice(0, 120)}), so the tag write could not be confirmed`,
+    };
+  }
+
+  if (typeof body !== "object" || body === null) {
+    return {
+      ok: false,
+      reason: `update_memory returned a non-object body (${text.slice(0, 120)}), so the tag write could not be confirmed`,
+    };
+  }
+
+  const record = body as Record<string, unknown>;
+  if (typeof record.error === "string") {
+    // Application errors arrive with isError:false — e.g. a bad memory id.
+    return { ok: false, reason: record.error };
+  }
+
+  const tags = record.tags;
+  if (!Array.isArray(tags)) {
+    return {
+      ok: false,
+      reason: `update_memory returned no \`tags\` field, so the tag write could not be confirmed — ${cannotApply}`,
+    };
+  }
+  if (!tags.includes(tag)) {
+    return {
+      ok: false,
+      reason:
+        `the server accepted the call but the memory came back WITHOUT \`${tag}\` ` +
+        `(tags: ${tags.length === 0 ? "none" : tags.map(String).join(", ")}) — ${cannotApply}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Append a tag to an existing memory in a Hindsight bank.
  *
  * Wraps the Hindsight MCP `update_memory` tool. Used by
@@ -1347,6 +1451,10 @@ export async function updateBankMissions(
  * `_is_demoted_memory` filter (#432 4.4) excludes the memory from
  * subsequent auto-recall blocks while keeping it queryable via
  * `mcp__hindsight__recall` and `reflect`.
+ *
+ * Success is decided by {@link verifyTagWriteResponse} reading the tag back out
+ * of the returned memory unit — NOT by HTTP status and NOT by `isError`, both
+ * of which are structurally blind to the failure that actually occurs here.
  *
  * Best-effort with timeout; never throws. Mirrors `updateBankMissions`
  * shape so the caller pattern stays consistent across switchroom's
@@ -1406,16 +1514,32 @@ export async function addMemoryTag(
 
     // Step 2: call update_memory with `add_tags` to append the tag.
     //
-    // HONEST-FAILURE note (2026-06-07 audit): the live hindsight server has NO
-    // `update_memory` tool — it returns HTTP 200 with an MCP error envelope
-    // `{result:{isError:true, content:[{text:"Unknown tool: 'update_memory'"}]}}`.
-    // The prior code only checked `toolResponse.ok` (the HTTP status), so it
-    // returned `{ok:true}` and `switchroom memory demote` reported success while
-    // tagging nothing. We now inspect `result.isError` so the call fails
-    // honestly here AND stays forward-compatible: if a future hindsight build
-    // adds `update_memory`/`add_tags` it just works. (There is no single-memory
-    // tag path on the current MCP or REST surface; restoring demote needs a
-    // document-granularity rework — tracked separately.)
+    // HONEST-FAILURE note, CORRECTED 2026-07-27 against hindsight 0.8.4 (live)
+    // and the 0.8.4/0.8.5 wheels (AST diff):
+    //
+    // The 2026-06-07 audit recorded `update_memory` as a phantom tool. That was
+    // wrong — it is a real, unconditionally-registered MCP tool (and has been
+    // since at least 0.8.4; the audit's snapshot was just stale). What is
+    // actually missing is the ARG: `update_memory` accepts only
+    // text / context / occurred_start / occurred_end / fact_type / entities
+    // (plus bank_id / memory_id). There is no `add_tags` and no `tags`, and the
+    // per-memory REST route `PATCH /v1/default/banks/{bank}/memories/{id}` takes
+    // the same field set — so there is no PER-MEMORY tag-write path on either
+    // wheel. (`PATCH .../documents/{document_id}` does rewrite the tags of a
+    // document's memory units, but it is document-scoped, REPLACES rather than
+    // appends, requires a non-null document_id, and triggers re-consolidation —
+    // unusable for demoting one memory. Tracked on #3772.) Tags can otherwise
+    // only be attached at retain time.
+    //
+    // Because the tool is real, the server does NOT reject the unknown argument:
+    // it silently drops it and answers isError:false with a body byte-identical
+    // to the same call without it (probed live). An isError check therefore
+    // cannot detect this, and neither can the HTTP status the pre-#3762 code
+    // used. Detection comes from verifyTagWriteResponse() reading the tag back
+    // out of the memory unit update_memory returns. That also makes the callsite
+    // forward-compatible: the day upstream grows a tag-write arg the read-back
+    // simply confirms and this starts succeeding, and the `knownUnsupportedArgs`
+    // entry in src/memory/hindsight-tools.ts reds the fixture test to say so.
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
     const toolResponse = await fetchImpl(`${apiUrl}`, {
       method: "POST",
@@ -1447,22 +1571,27 @@ export async function addMemoryTag(
       return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
     }
 
-    // Check the MCP result envelope — a tools/call can return HTTP 200 with
-    // isError:true (e.g. "Unknown tool"). Don't report success on an error.
+    // Read the tag back out of the returned memory unit. HTTP 200 means
+    // nothing here and neither does isError (see verifyTagWriteResponse) —
+    // the ONLY evidence that the write landed is the tag being present in the
+    // response body. An unreadable body is a failure, not a pass: the legacy
+    // "treat HTTP-200 as success" fallback is precisely how `memory demote`
+    // printed "✓ Tag applied." while tagging nothing.
+    let parsed: {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
     try {
-      const parsed = await parseSseOrJson<{
+      parsed = await parseSseOrJson<{
         result?: { isError?: boolean; content?: Array<{ text?: string }> };
       }>(toolResponse);
-      if (parsed.result?.isError === true) {
-        const msg = parsed.result.content?.[0]?.text ?? "tool returned isError";
-        return { ok: false, reason: msg };
-      }
-    } catch {
-      // Body unparseable — treat HTTP-200 as success (legacy behaviour) rather
-      // than fail a working call on a parse hiccup.
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `could not read the update_memory response (${String(err)}), so the tag write is unconfirmed`,
+      };
     }
 
-    return { ok: true };
+    return verifyTagWriteResponse(parsed.result, tag);
   } catch (err) {
     if ((err as Error).name === "AbortError") {
       return { ok: false, reason: "Timeout" };

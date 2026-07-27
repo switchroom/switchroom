@@ -31,17 +31,48 @@ const snapshot = JSON.parse(repo("tests/fixtures/hindsight-tools-list.snapshot.j
 describe("A. isError guard — every hindsight tools/call checks result.isError", () => {
   const src = repo("src/memory/hindsight.ts");
   // Split into exported function bodies; flag any that issues a tools/call but
-  // never references isError.
+  // never establishes that the MCP envelope was inspected.
   const funcs = src.split(/\nexport (?:async )?function /).slice(1);
+  const nameOf = (body: string) => body.slice(0, body.indexOf("("));
+  const byName = new Map(funcs.map((b) => [nameOf(b), b]));
+
+  /**
+   * A callsite satisfies the guard either by inspecting `.isError` itself, or
+   * by handing the envelope to a same-file helper that does.
+   *
+   * The delegated form is not a loophole — it is the stronger shape, and one
+   * resolution step is all that is allowed. `addMemoryTag` passes the raw
+   * result to `verifyTagWriteResponse`, which checks `.isError` AND reads the
+   * returned memory back, because on this backend an unknown *argument* is
+   * dropped SILENTLY (isError stays false; verified live on 0.8.4 — the
+   * responses with and without `add_tags` are byte-identical). A guard that
+   * accepted only a literal `.isError` in the caller would have pushed the
+   * verification back inline, i.e. would have forced the weaker check.
+   *
+   * A callsite that inspects nothing, or delegates to a helper that inspects
+   * nothing, still reds.
+   */
+  const inspectsEnvelope = (body: string, depth = 1): boolean => {
+    if (/\.isError/.test(body)) return true;
+    if (depth === 0) return false;
+    for (const [helper, helperBody] of byName) {
+      if (helper === nameOf(body)) continue;
+      if (!new RegExp(`\\b${helper}\\s*\\(`).test(body)) continue;
+      if (inspectsEnvelope(helperBody, depth - 1)) return true;
+    }
+    return false;
+  };
 
   for (const body of funcs) {
-    const name = body.slice(0, body.indexOf("("));
+    const name = nameOf(body);
     const makesToolCall = /method:\s*["']tools\/call["']/.test(body);
     if (!makesToolCall) continue;
-    it(`${name} inspects result.isError`, () => {
+    it(`${name} inspects the MCP result envelope`, () => {
       expect(
-        /\.isError/.test(body),
-        `${name} makes a hindsight tools/call but never checks result.isError — a renamed/unknown arg would return HTTP 200 + isError and this would report false success`,
+        inspectsEnvelope(body),
+        `${name} makes a hindsight tools/call but neither checks result.isError nor ` +
+          `delegates the envelope to a same-file helper that does — a renamed/unknown ` +
+          `arg would return HTTP 200 and this would report false success`,
       ).toBe(true);
     });
   }
@@ -49,6 +80,23 @@ describe("A. isError guard — every hindsight tools/call checks result.isError"
   it("found the expected tools/call functions (guard is actually scanning)", () => {
     const withToolCall = funcs.filter((b) => /method:\s*["']tools\/call["']/.test(b)).length;
     expect(withToolCall).toBeGreaterThanOrEqual(4); // ensureUserProfileMentalModel, createBank, updateBankMissions, addMemoryTag
+  });
+
+  it("the delegation escape hatch does not accept a helper that inspects nothing", () => {
+    // Mutation-guard for the guard: a caller whose only helper ignores the
+    // envelope must still fail, or the relaxation above would be a loophole.
+    const caller = `sham(): void {\n  const r = await post({ method: "tools/call" });\n  blindHelper(r);\n}`;
+    const scoped = new Map([["blindHelper", `blindHelper(r) {\n  return { ok: true };\n}`]]);
+    const probe = (body: string, depth = 1): boolean => {
+      if (/\.isError/.test(body)) return true;
+      if (depth === 0) return false;
+      for (const [helper, helperBody] of scoped) {
+        if (!new RegExp(`\\b${helper}\\s*\\(`).test(body)) continue;
+        if (probe(helperBody, depth - 1)) return true;
+      }
+      return false;
+    };
+    expect(probe(caller)).toBe(false);
   });
 });
 

@@ -26,17 +26,83 @@ import {
   HINDSIGHT_PROMPT_TOOLS,
   HINDSIGHT_HOOK_TOOLS,
 } from "../src/memory/hindsight-tools.js";
+import { FALLBACK_TOOL_TABLE } from "../src/cli/hindsight-mcp-shim.js";
 
 interface Snapshot {
+  _meta?: { count?: number; hindsight_api_version?: string };
   tools: Record<string, { required: string[]; props: string[] }>;
 }
 const snapshot = JSON.parse(
   readFileSync(resolve(__dirname, "fixtures", "hindsight-tools-list.snapshot.json"), "utf-8"),
 ) as Snapshot;
 
+/** Tool count on the hindsight surface switchroom targets (0.8.4; 0.8.5 adds
+ *  and removes none — both wheels register 32). */
+const HINDSIGHT_TOOL_COUNT = 32;
+
+/**
+ * The `api_version` the pinned hindsight image resolves to, read out of
+ * `docker/Dockerfile.hindsight`'s machine-read marker rather than duplicated
+ * here — a second hand-maintained copy is a third thing to forget.
+ */
+function pinnedHindsightApiVersion(): string {
+  const dockerfile = readFileSync(
+    resolve(__dirname, "..", "docker", "Dockerfile.hindsight"),
+    "utf-8",
+  );
+  const hits = dockerfile.match(/^#\s*switchroom:hindsight-api-version=(\S+)\s*$/gm) ?? [];
+  expect(
+    hits.length,
+    "docker/Dockerfile.hindsight must carry exactly one `# switchroom:hindsight-api-version=<v>` " +
+      "marker naming the api_version its pinned digest resolves to",
+  ).toBe(1);
+  return hits[0].split("=")[1].trim();
+}
+
 describe("hindsight contract — golden snapshot integrity", () => {
-  it("the snapshot captures all 29 server tools", () => {
-    expect(Object.keys(snapshot.tools).length).toBe(29);
+  it(`the snapshot captures all ${HINDSIGHT_TOOL_COUNT} server tools`, () => {
+    expect(Object.keys(snapshot.tools).length).toBe(HINDSIGHT_TOOL_COUNT);
+  });
+
+  it("_meta.count is not decorative — it matches the tools actually captured", () => {
+    expect(snapshot._meta?.count).toBe(Object.keys(snapshot.tools).length);
+  });
+
+  /**
+   * THE SNAPSHOT MUST NOT RUN AHEAD OF THE PINNED IMAGE.
+   *
+   * A snapshot captured from (or forward-patched to) a newer server than the
+   * one the repo ships is not harmlessly optimistic. `FALLBACK_TOOL_TABLE` is
+   * built from this file and is the manifest an agent's tools/list returns on a
+   * cold boot; hindsight drops an unknown ARGUMENT silently (isError:false, and
+   * the response is byte-identical to the call without it, verified live on
+   * 0.8.4). So a forward-patched prop makes an agent issue e.g. a tag-scoped
+   * `list_memories` and receive the UNFILTERED list believing it was filtered.
+   *
+   * A previous revision of this branch shipped exactly that: `_meta` stamped
+   * 0.8.5 with `list_memories.tags`, `list_memories.tags_match` and
+   * `create_mental_model.tags_match` bolted on, while
+   * docker/Dockerfile.hindsight pinned 0.8.4. This assertion is what makes that
+   * un-shippable rather than merely regrettable, and it is what forces a
+   * re-capture when #3768 bumps the image.
+   */
+  it("_meta.hindsight_api_version equals the api_version docker/Dockerfile.hindsight pins", () => {
+    expect(
+      snapshot._meta?.hindsight_api_version,
+      "the committed MCP contract must describe the image this repo actually ships — " +
+        "re-capture tests/fixtures/hindsight-tools-list.snapshot.json from the pinned " +
+        "image (and reconcile FALLBACK_TOOL_TABLE) in the same commit as an image bump",
+    ).toBe(pinnedHindsightApiVersion());
+  });
+
+  it("does not advertise the 0.8.5-only props while the pinned image is 0.8.4", () => {
+    // Mutation-guard for the fix above, pinned by name so a reintroduction is
+    // caught even if _meta is edited to match. Drop this test in the same
+    // commit that re-captures the snapshot against 0.8.5 (#3768).
+    if (pinnedHindsightApiVersion() !== "0.8.4") return;
+    expect(snapshot.tools.list_memories.props).not.toContain("tags");
+    expect(snapshot.tools.list_memories.props).not.toContain("tags_match");
+    expect(snapshot.tools.create_mental_model.props).not.toContain("tags_match");
   });
 
   it("EXPECTED_HINDSIGHT_TOOLS agrees with the captured server truth (required-args, no const/snapshot drift)", () => {
@@ -53,6 +119,41 @@ describe("hindsight contract — golden snapshot integrity", () => {
   });
 });
 
+/**
+ * The shim's first-boot fallback manifest is what an agent's tools/list returns
+ * when hindsight has never been reachable in that session. If it drifts below
+ * the real surface, the affected tools are INVISIBLE to the agent and the
+ * symptom is indistinguishable from an upstream removal.
+ *
+ * That is not hypothetical: the table shipped 29 tools against a 32-tool server
+ * for weeks, hiding `update_memory`, `invalidate_memory` and
+ * `clear_mental_model` — the tools `switchroom memory demote` and vault-sweep
+ * reach for — plus six accepted props. Byte-equality with the snapshot is the
+ * deterministic fix; a comment saying "keep these in sync" is not.
+ */
+describe("hindsight contract — the shim fallback manifest mirrors the snapshot", () => {
+  it("advertises exactly the snapshot's tool set (no missing tool, no phantom)", () => {
+    expect(Object.keys(FALLBACK_TOOL_TABLE).sort()).toEqual(
+      Object.keys(snapshot.tools).sort(),
+    );
+  });
+
+  for (const tool of Object.keys(snapshot.tools).sort()) {
+    it(`${tool}: fallback required+props match the snapshot exactly`, () => {
+      const [required, props] = FALLBACK_TOOL_TABLE[tool];
+      expect(
+        [...required].sort(),
+        `fallback '${tool}' required-args drifted from the snapshot`,
+      ).toEqual([...snapshot.tools[tool].required].sort());
+      expect(
+        [...props].sort(),
+        `fallback '${tool}' accepted props drifted from the snapshot — a prop ` +
+          `missing here is a capability the agent cannot see on first boot`,
+      ).toEqual([...snapshot.tools[tool].props].sort());
+    });
+  }
+});
+
 describe("hindsight contract — every TS callsite satisfies the tool schema", () => {
   for (const cs of HINDSIGHT_TS_CALLSITES) {
     it(`${cs.where} → ${cs.tool}(${cs.argKeys.join(",")}) is contract-valid`, () => {
@@ -66,14 +167,33 @@ describe("hindsight contract — every TS callsite satisfies the tool schema", (
           `${cs.where} omits required arg '${req}' of '${cs.tool}' → the call silently no-ops`,
         ).toContain(req);
       }
-      // (c) NO arg sent that the server doesn't accept (silently dropped).
+      // (c) NO arg sent that the server doesn't accept (silently dropped),
+      //     except args explicitly declared unsupported — those are asserted
+      //     separately below so the exemption self-invalidates.
+      const exempt = new Set(cs.knownUnsupportedArgs ?? []);
       for (const sent of cs.argKeys) {
+        if (exempt.has(sent)) continue;
         expect(
           real.props,
           `${cs.where} sends '${sent}' which '${cs.tool}' does NOT accept → SILENTLY DROPPED (isError can't catch this)`,
         ).toContain(sent);
       }
     });
+
+    if (cs.knownUnsupportedArgs?.length) {
+      it(`${cs.where} → ${cs.tool}: declared-unsupported args are still unsupported upstream`, () => {
+        const real = snapshot.tools[cs.tool];
+        expect(real).toBeDefined();
+        for (const arg of cs.knownUnsupportedArgs!) {
+          expect(
+            real.props,
+            `'${arg}' is now an accepted prop of '${cs.tool}' — the upstream gap ` +
+              `that broke ${cs.where} has CLOSED. Drop the knownUnsupportedArgs ` +
+              `exemption and un-break the feature it was blocking.`,
+          ).not.toContain(arg);
+        }
+      });
+    }
   }
 });
 

@@ -14,8 +14,39 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   addMemoryTag,
+  verifyTagWriteResponse,
   DEMOTE_FROM_RECALL_TAG,
 } from "../src/memory/hindsight.js";
+
+/**
+ * An SSE-framed MCP tools/call response whose `content[0].text` is `body`
+ * serialized the way hindsight serializes it — `json.dumps(...)` of the
+ * updated memory unit, or of `{"error": ...}`. Both arrive with isError:false.
+ */
+const mcpBody = (body: unknown): string =>
+  "event: message\n" +
+  "data: " +
+  JSON.stringify({
+    jsonrpc: "2.0",
+    id: 2,
+    result: {
+      isError: false,
+      content: [{ type: "text", text: JSON.stringify(body) }],
+    },
+  }) +
+  "\n";
+
+/** The memory unit hindsight returns from update_memory (get_memory_unit's
+ *  dict; `tags` is always present, defaulting to []). */
+const memoryUnit = (tags: string[]) => ({
+  id: "mem-abc123",
+  text: "a fact",
+  context: "",
+  type: "world",
+  entities: [],
+  tags,
+  state: "valid",
+});
 
 describe("DEMOTE_FROM_RECALL_TAG", () => {
   it("matches the canonical Python-side filter literal", () => {
@@ -65,7 +96,10 @@ describe("addMemoryTag — happy path", () => {
         ok: true,
         headers: new Map([["mcp-session-id", "test-session"]]),
       } as any)
-      .mockResolvedValueOnce({ ok: true } as any);
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => mcpBody(memoryUnit([DEMOTE_FROM_RECALL_TAG])),
+      } as any);
 
     const result = await addMemoryTag(
       "http://test.local/mcp/",
@@ -107,7 +141,10 @@ describe("addMemoryTag — happy path", () => {
         ok: true,
         headers: new Map([["mcp-session-id", "s"]]),
       } as any)
-      .mockResolvedValueOnce({ ok: true } as any);
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => mcpBody(memoryUnit(["anti-pattern:misleading-reply"])),
+      } as any);
 
     const result = await addMemoryTag(
       "http://test.local/mcp/",
@@ -151,6 +188,7 @@ describe("addMemoryTag — error paths", () => {
       } as any)
       .mockResolvedValueOnce({
         ok: true,
+        text: async () => mcpBody(memoryUnit([DEMOTE_FROM_RECALL_TAG])),
       } as any);
     const result = await addMemoryTag(
       "http://test.local/mcp/",
@@ -227,7 +265,10 @@ describe("addMemoryTag — defaults", () => {
         ok: true,
         headers: new Map([["mcp-session-id", "s"]]),
       } as any)
-      .mockResolvedValueOnce({ ok: true } as any);
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => mcpBody(memoryUnit([DEMOTE_FROM_RECALL_TAG])),
+      } as any);
     const result = await addMemoryTag(
       "http://test.local/mcp/",
       "clerk",
@@ -236,5 +277,127 @@ describe("addMemoryTag — defaults", () => {
       { fetchImpl: mockFetch as any },
     );
     expect(result).toEqual({ ok: true });
+  });
+});
+
+/**
+ * THE SILENT-DROP CLASS — the reason this wrapper cannot trust `isError`.
+ *
+ * `update_memory` is a real, unconditionally-registered MCP tool, so an unknown
+ * ARGUMENT (`add_tags`) is not rejected: hindsight drops it and answers
+ * isError:false with a body byte-identical to the same call without it
+ * (probed live against 0.8.4). Application errors are equally invisible — a
+ * missing memory answers isError:false with `{"error": "Memory '…' not found"}`.
+ *
+ * So the only honest signal is the tag being present in the memory unit the
+ * call returns. Every test here fails if that read-back is removed and the
+ * wrapper goes back to returning ok on HTTP-200/!isError.
+ */
+describe("addMemoryTag — the failure isError cannot see", () => {
+  it("returns ok:false when the server accepts the call but the tag is NOT on the returned memory", async () => {
+    // This is the real 0.8.4/0.8.5 behaviour: add_tags dropped, tags unchanged.
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, headers: new Map() } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => mcpBody(memoryUnit([])),
+      } as any);
+
+    const result = await addMemoryTag(
+      "http://test.local/mcp/",
+      "clerk",
+      "mem-abc123",
+      DEMOTE_FROM_RECALL_TAG,
+      { fetchImpl: mockFetch as any },
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/WITHOUT/);
+      expect(result.reason).toMatch(/silently dropped/i);
+    }
+  });
+
+  it("returns ok:false on an application error delivered with isError:false", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, headers: new Map() } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => mcpBody({ error: "Memory 'mem-nope' not found" }),
+      } as any);
+
+    const result = await addMemoryTag(
+      "http://test.local/mcp/",
+      "clerk",
+      "mem-nope",
+      DEMOTE_FROM_RECALL_TAG,
+      { fetchImpl: mockFetch as any },
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("Memory 'mem-nope' not found");
+  });
+
+  it("returns ok:false when the body is unreadable — 'could not verify' is a FAILURE, not a pass", async () => {
+    // The pre-#3762 wrapper swallowed a parse failure and returned ok:true.
+    // That is how `memory demote` printed "✓ Tag applied." while tagging nothing.
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, headers: new Map() } as any)
+      .mockResolvedValueOnce({ ok: true, text: async () => "not json at all" } as any);
+
+    const result = await addMemoryTag(
+      "http://test.local/mcp/",
+      "clerk",
+      "mem-abc",
+      DEMOTE_FROM_RECALL_TAG,
+      { fetchImpl: mockFetch as any },
+    );
+
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("verifyTagWriteResponse — pure verdicts", () => {
+  const unit = (tags: string[]) =>
+    ({
+      isError: false,
+      content: [{ text: JSON.stringify({ id: "m1", tags }) }],
+    }) as const;
+
+  it("ok only when the tag is actually present in the returned unit", () => {
+    expect(verifyTagWriteResponse(unit(["[demote-from-recall]"]), "[demote-from-recall]")).toEqual({
+      ok: true,
+    });
+  });
+
+  it("fails when the returned unit carries other tags but not this one", () => {
+    const v = verifyTagWriteResponse(unit(["lesson:foo"]), "[demote-from-recall]");
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toContain("lesson:foo");
+  });
+
+  it("fails when the response has no `tags` field at all", () => {
+    const v = verifyTagWriteResponse(
+      { isError: false, content: [{ text: JSON.stringify({ id: "m1" }) }] },
+      "[demote-from-recall]",
+    );
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toMatch(/no `tags` field/);
+  });
+
+  it("still surfaces a genuine isError (unknown TOOL) — the one thing the envelope does catch", () => {
+    const v = verifyTagWriteResponse(
+      { isError: true, content: [{ text: "Unknown tool: 'delete_memory'" }] },
+      "[demote-from-recall]",
+    );
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.reason).toContain("Unknown tool");
+  });
+
+  it("fails on a missing result envelope rather than assuming success", () => {
+    expect(verifyTagWriteResponse(undefined, "[demote-from-recall]").ok).toBe(false);
   });
 });
