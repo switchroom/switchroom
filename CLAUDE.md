@@ -219,9 +219,19 @@ obligation:
 `check-mcp-instructions-budget`, `check-web-subscription-honest`,
 `check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
 `check-litellm-config-guard`, `check-release-asset-names`,
-`check-status-pin-single-path`.
+`check-status-pin-single-path`, `check-agent-attribution-trailers`.
 
 Traps that bite repeatedly:
+
+- **`check-agent-attribution-trailers` needs full history.** It diffs
+  `origin/<base>..HEAD` and looks for `Switchroom-Agent:` /
+  `Switchroom-Model:` on machine-authored commits. Under a depth-1
+  checkout there is no base ref and it SKIPs — which is why
+  `ci-lint.yml` checks out with `fetch-depth: 0`. If it fails locally,
+  your agent container is committing without the attribution hook: set
+  `git config --global core.hooksPath /opt/switchroom/git-hooks`, then
+  re-stamp with
+  `git rebase -i --exec 'git commit --amend --no-edit' <base>`.
 
 - **`check-no-pii-secrets` fails on real operator PII** — real Telegram
   chat/user IDs, emails, hostnames pasted into tests or docs. Use synthetic

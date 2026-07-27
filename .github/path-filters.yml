@@ -71,6 +71,16 @@ core:
   - 'scripts/release-assets.mjs'
   - 'scripts/verify-release-bundle.mjs'
   - 'scripts/check-release-asset-names.mjs'
+  # Agent attribution: tests/agent-attribution-check.test.ts and
+  # tests/agent-pr-label.test.ts SPAWN these two scripts and assert their exit
+  # codes and failure text. Same reason as check-release-asset-names.mjs above —
+  # `scripts/check-*.mjs` is in the `lint` filter only, and agent-pr-label.mjs
+  # matches no existing entry at all, so without these a PR editing just one of
+  # them would skip the only tests that cover it. (The hook script and the
+  # profile/docker templates the tests also read are already covered by the
+  # ws9f1-security anchor.)
+  - 'scripts/check-agent-attribution-trailers.mjs'
+  - 'scripts/agent-pr-label.mjs'
   - 'vitest.config.ts'
   - 'tsconfig.json'
   - 'package.json'

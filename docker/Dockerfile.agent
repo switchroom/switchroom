@@ -229,6 +229,22 @@ COPY telegram-plugin/hooks /opt/switchroom/telegram-plugin/hooks
 COPY bin/*.sh /opt/switchroom/bin/
 RUN chmod +x /opt/switchroom/bin/*.sh
 
+# ─── Global git hooks dir (commit attribution) ───────────────────────────
+#
+# `core.hooksPath` points at a DIRECTORY whose entries are named after the
+# hook, so /opt/switchroom/bin (a flat pile of *.sh) cannot be it.
+# Materialise a dedicated dir here, in the IMAGE, so the hook is part of the
+# read-only image rather than agent-writable scaffold: an agent cannot delete
+# the file that attributes its commits — it can only (visibly) unset
+# `core.hooksPath`, which scripts/check-agent-attribution-trailers.mjs then
+# catches in CI.
+#
+# start.sh sets `git config --global core.hooksPath /opt/switchroom/git-hooks`
+# on every boot; see profiles/_base/start.sh.hbs.
+RUN mkdir -p /opt/switchroom/git-hooks \
+ && cp /opt/switchroom/bin/git-agent-attribution-hook.sh /opt/switchroom/git-hooks/prepare-commit-msg \
+ && chmod +x /opt/switchroom/git-hooks/prepare-commit-msg
+
 # ─── Frequently-changed dist COPYs (LAST, only these bust on src-only PRs) ───
 #
 # autoaccept-poll bundle: a small bun-runnable JS that uses
