@@ -35,6 +35,7 @@ import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
+import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
@@ -1389,6 +1390,11 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // (shm exhaustion or OAuth quota 429). These surface both from the local
   // container's shm config + recent logs; no-ops on a remote/dockerless setup.
   results.push(...checkHindsightContainerHealth());
+
+  // Per-bank partial vector indexes are created ONCE at bank creation and
+  // never backfilled, so a bank that missed that window recalls by scanning —
+  // no error, no log line, just a truncated candidate pool. Detection only.
+  results.push(checkHnswPartialIndexes());
 
   // Memory-down signal (#outage 2026-07): a GET /health != 200 means the
   // backend is down / crash-looping — otherwise invisible, since auto-recall
