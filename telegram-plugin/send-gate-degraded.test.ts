@@ -113,7 +113,7 @@ describe('send-gate PR2: cosmetic shedding', () => {
     expect(gate.stats().global.sent).toBe(1)
   })
 
-  it('sheds a cosmetic EDIT while the message-edit window is open', async () => {
+  it('COALESCES a cosmetic EDIT through an open message-edit window instead of shedding it (#3716)', async () => {
     const clock = new FakeClock()
     const { calls, fn } = recorder(clock)
     const gate = createSendGate({
@@ -122,17 +122,35 @@ describe('send-gate PR2: cosmetic shedding', () => {
       // H1: msg-edit scope is keyed `${chat_id}:${messageId}`.
       initialWindows: [{ scopeKey: 'msg-edit:5:42', untilTs: HOUR }],
     })
+    const opts = { chat_id: '5', messageId: 42, priorityClass: 'cosmetic' as const }
 
-    const res = await gate.gate(fn('edit'), {
-      chat_id: '5',
-      messageId: 42,
-      editPayload: 'v1',
-      priorityClass: 'cosmetic',
-    })
+    // A burst of cosmetic edits arrives while the window is wide open. The old
+    // behaviour dropped every one of them (SEND_GATE_SHED), which stranded the
+    // card on whatever body happened to be on screen when the window opened.
+    const p1 = gate.gate(fn('v1'), { ...opts, editPayload: 'v1' })
+    await flush()
+    const p2 = gate.gate(fn('v2'), { ...opts, editPayload: 'v2' })
+    await flush()
+    const p3 = gate.gate(fn('v3'), { ...opts, editPayload: 'v3' })
+    await flush()
 
-    expect(res).toBe(SEND_GATE_SHED)
+    // Nothing has hit the API yet — the window still suppresses the send, which
+    // is the flood protection doing its job.
     expect(calls).toHaveLength(0)
-    expect(gate.stats().global.shed).toBe(1)
+    // ...but nothing was DISCARDED either.
+    expect(gate.stats().global.shed).toBe(0)
+
+    // Walk past the window. Exactly ONE send lands, carrying the NEWEST payload:
+    // the burst was aggregated, not dropped, and not replayed edit-by-edit.
+    await clock.advance(HOUR + 1000)
+    await flush()
+    await Promise.allSettled([p1, p2, p3])
+
+    expect(calls.map((c) => c.label)).toEqual(['v3'])
+    expect(gate.stats().global.sent).toBe(1)
+    expect(gate.stats().global.shed).toBe(0)
+    // v1 and v2 were superseded in the pending slot (last-write-wins).
+    expect(gate.stats().global.coalesced).toBeGreaterThan(0)
   })
 })
 
@@ -343,7 +361,7 @@ describe('send-gate PR2: H1 cross-chat message_id isolation', () => {
     expect(calls.every((c) => c.at === 0)).toBe(true)
   })
 
-  it('a 429 on chat A message 100 does NOT shed chat B message 100 cosmetic edits', async () => {
+  it('a 429 on chat A message 100 does NOT delay chat B message 100 cosmetic edits', async () => {
     const clock = new FakeClock()
     const { calls, fn } = recorder(clock)
     const gate = createSendGate({
@@ -353,14 +371,17 @@ describe('send-gate PR2: H1 cross-chat message_id isolation', () => {
       initialWindows: [{ scopeKey: 'msg-edit:A:100', untilTs: HOUR }],
     })
 
-    // Chat A cosmetic edit → shed (its scope window is open).
-    const rA = await gate.gate(fn('A-edit'), {
+    // Chat A cosmetic edit → deferred, its scope window is open (#3716: deferred,
+    // NOT shed — the edit is held and lands with its state once the window ends).
+    const pA = gate.gate(fn('A-edit'), {
       chat_id: 'A',
       messageId: 100,
       editPayload: 'A-edit',
       priorityClass: 'cosmetic',
     })
-    // Chat B cosmetic edit to the SAME message_id → must NOT shed (different scope).
+    await flush()
+    // Chat B cosmetic edit to the SAME message_id → must be unaffected (different
+    // scope). This is the H1 isolation the test exists to guard.
     const rB = await gate.gate(fn('B-edit'), {
       chat_id: 'B',
       messageId: 100,
@@ -368,10 +389,18 @@ describe('send-gate PR2: H1 cross-chat message_id isolation', () => {
       priorityClass: 'cosmetic',
     })
 
-    expect(rA).toBe(SEND_GATE_SHED) // A shed
-    expect(rB).toBe('B-edit') // B sent
+    expect(rB).toBe('B-edit') // B sent immediately, unblocked by A's window
     expect(calls.map((c) => c.label)).toEqual(['B-edit'])
-    expect(gate.stats().global.shed).toBe(1)
+    // A is still pending, not discarded.
+    expect(gate.stats().global.shed).toBe(0)
+
+    // Once A's window closes, A's edit lands too — nothing was lost.
+    await clock.advance(HOUR + 1000)
+    await flush()
+    await Promise.allSettled([pA])
+
+    expect(calls.map((c) => c.label).sort()).toEqual(['A-edit', 'B-edit'])
+    expect(gate.stats().global.shed).toBe(0)
   })
 })
 
