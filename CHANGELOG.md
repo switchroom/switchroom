@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Consolidation throughput defaults, and the stale rationale behind them
+
+The comment governing switchroom's consolidation knobs asserted that
+consolidation is "LLM-bound via the claude-code provider" where "every
+concurrent op is a live claude (Sonnet) subprocess spending the subscription's
+quota", and throttled everything to a 2-concurrent-call ceiling on that basis
+(the 2026-07-06 429 wall that starved live agent turns). That premise no longer
+describes a deployment that has moved the lane onto local inference —
+`hindsight.llm.consolidation` with `provider: litellm` against a loopback proxy
+has no shared Anthropic quota to exhaust and no per-call cash cost. The binding
+constraint there is local inference slots, not subscription quota. The
+rationale is rewritten to say so, the 2026-07-06 incident is preserved as
+history rather than deleted, and an explicit **restore condition** is recorded:
+if consolidation returns to `provider: claude-code`, these values go back down.
+`MAX_SLOTS` and `LLM_PARALLELISM` are deliberately unchanged, so the
+subscription-path ceiling stays intact for anyone still on the default provider.
+
+- **`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND` 100 → 500.** A
+  correctness knob, not only a throughput one: the engine sets
+  `stats["mental_models_refreshed"] = 0` on any round that hits the limit
+  (`consolidator.py`), so a bank whose backlog never drops below the limit hits
+  it every round and therefore **never refreshes its mental models**. At 100
+  that described four of the six banks on the fleet that found it.
+- **`HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT` is now emitted, at 6.**
+  switchroom never emitted the per-type slot *ceiling* and so silently
+  inherited upstream's 4 — observed saturated (`consolidation=4/1(avail=0,cap=4)`)
+  while five of the worker's ten slots sat idle. This is the ceiling and is a
+  different knob from `..._MAX_SLOTS`, the reservation floor; upstream's own
+  config warns about the naming.
+- **`HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY` is now settable via
+  `hindsight.env`**, with no shipped default. Upstream claims consolidation work
+  with a flat `ORDER BY created_at` across all banks unless a priority map is
+  configured, so a 29k backlog gets no preference over an 83. The map is the
+  fix, but its content is a list of *this deployment's* bank names, so it lands
+  as a new "managed but defaultless" key (`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`):
+  operators get a declarative channel that survives `switchroom apply`, and
+  anyone who does not opt in keeps upstream's flat FIFO unchanged.
+
+Both emit paths (the `docker run -e` argv and the generated compose
+`environment:`) carry every one of these, asserted by a test that checks
+literal values on **both** paths — an assertion written as
+`` `KEY=${THE_CONSTANT}` `` passes no matter what the constant becomes and
+cannot catch the value regression it appears to guard.
+
+`HINDSIGHT_API_LLM_MAX_CONCURRENT` is deliberately **left at 4**. The right
+value is "how many concurrent slots does this operator's local endpoint
+expose", which is a deployment fact rather than a property of switchroom; 4 is
+upstream's own worked example for an unknown shared endpoint. It is already an
+overridable key, so a measured deployment raises it in `hindsight.env`. The
+same note now records that
+`HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT` (default 1) is the *actual*
+ceiling on consolidation inference — it is a process-wide semaphore composed
+with the global cap, so worker slots and `LLM_PARALLELISM` pipeline the non-LLM
+stages but do not multiply concurrent LLM calls.
+
 ### Review policy is stated once, and no longer counts rounds
 
 v0.19.23 bounded adversarial review with a severity gate plus a counted round

@@ -2104,7 +2104,12 @@ export const HindsightConfigSchema = z.object({
       "RETAIN/CONSOLIDATION_LLM_MAX_CONCURRENT, LLM_STRICT_SCHEMA, " +
       "LLM_MAX_RETRIES, " +
       "RECALL_MAX_CANDIDATES_PER_SOURCE, LINK_EXPANSION_PER_ENTITY_LIMIT, " +
-      "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT), plus the " +
+      "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT), the override-only keys " +
+      "switchroom manages but ships NO default for " +
+      "(`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`: " +
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY — a per-deployment " +
+      "`bank-pattern:priority,...` map; unset means upstream's flat " +
+      "created_at FIFO across banks), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

@@ -45,6 +45,15 @@ function findRunArgs(): string[] {
   return runCall![1] as string[];
 }
 
+/** Every `-e KEY=VALUE` payload from a captured `docker run` argv. */
+function runEnvPairs(args: string[]): string[] {
+  const pairs: string[] = [];
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === "-e") pairs.push(args[i + 1] as string);
+  }
+  return pairs;
+}
+
 describe("hindsight broker-fed mode (#1245)", () => {
   beforeEach(() => {
     mockedExec.mockReset();
@@ -562,27 +571,95 @@ describe("hindsight broker-fed mode (#1245)", () => {
     );
   });
 
-  it("sets modest consolidation throughput knobs (batch size + slots) on both emit paths", async () => {
+  it("emits every consolidation scheduling var on BOTH emit paths, with the same value", async () => {
     const h = await import("../../src/setup/hindsight.js");
     startHindsight({ apiPort: 8888, uiPort: 9999 });
-    const args = findRunArgs();
-    const envPairs: string[] = [];
-    for (let i = 0; i < args.length - 1; i++) {
-      if (args[i] === "-e") envPairs.push(args[i + 1] as string);
-    }
-    expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`);
-    expect(envPairs).toContain(`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`);
-    expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`);
-    expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`);
-    // Subscription-honest ceiling: concurrent model calls = slots × parallelism.
-    // #2894 throttled this to a hard ceiling of 1 × 2 = 2 after an 18-way
-    // fan-out exhausted the shared failover quota (2026-07-06 token-burn).
-    // The old guard (≤24) let that exact 18-way fan-out pass — this pins the
-    // ceiling at ≤2 so any regression that re-raises slots/parallelism trips it.
-    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS * h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM).toBeLessThanOrEqual(2);
+    const envPairs = runEnvPairs(findRunArgs());
     const snippet = h.generateHindsightComposeSnippet();
-    expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`);
-    expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`);
+
+    // LITERAL values, not `=${constant}`. An assertion written against the
+    // constant it is checking passes no matter what the constant becomes, so
+    // it cannot catch a silent value regression — which is precisely the class
+    // of drift this file exists to prevent.
+    const expected: Array<[string, string]> = [
+      ["HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS", "1"],
+      ["HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT", "6"],
+      ["HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM", "2"],
+      ["HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND", "500"],
+    ];
+    for (const [key, value] of expected) {
+      // docker-run path
+      expect(envPairs, `${key} missing/wrong on the docker-run path`).toContain(
+        `${key}=${value}`,
+      );
+      // compose path — the twin that a `switchroom apply` actually renders.
+      // A var present on only one path is dropped the moment the other path
+      // recreates the container.
+      expect(snippet, `${key} missing/wrong in the compose snippet`).toContain(
+        `      - ${key}=${value}`,
+      );
+    }
+    // …and the constants really are what the literals above claim, so the
+    // exported API and the emitted env can't disagree.
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS).toBe(1);
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBe(6);
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM).toBe(2);
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND).toBe(500);
+
+    expect(envPairs).toContain(
+      `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
+    );
+
+    // Subscription-path ceiling: concurrent model calls = reserved slots ×
+    // parallelism. #2894 throttled this to 1 × 2 = 2 after an 18-way fan-out
+    // exhausted the shared failover quota (2026-07-06 token-burn). switchroom
+    // still ships `claude-code` as the default provider, so an operator who has
+    // NOT moved consolidation onto local inference must keep that ceiling —
+    // this pins it at ≤2 so a regression that re-raises slots/parallelism trips.
+    expect(
+      h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS *
+        h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM,
+    ).toBeLessThanOrEqual(2);
+  });
+
+  it("keeps the consolidation slot CEILING above the reserved FLOOR and inside the worker pool", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // Two knobs, confusingly similar upstream names (config.py warns about it):
+    // MAX_SLOTS is the reserved floor, SLOT_LIMIT the per-type ceiling.
+    const UPSTREAM_WORKER_MAX_SLOTS = 10;
+
+    // (a) BOOT correctness. HindsightConfig.validate() REJECTS an explicit
+    //     ceiling below the type's own reservation ("the floor is
+    //     unsatisfiable") or above worker_max_slots — both make the container
+    //     refuse to start. Asserted against the same rules pinned in
+    //     tests/docker/hindsight-recall-isolation-patches.test.ts.
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBeGreaterThanOrEqual(
+      h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS,
+    );
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBeLessThanOrEqual(
+      UPSTREAM_WORKER_MAX_SLOTS,
+    );
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBeGreaterThan(0);
+
+    // (b) DESIGN intent, stricter than (a): consolidation must not be able to
+    //     take the whole worker. Every other op type (retain,
+    //     refresh_mental_model, graph_maintenance, import_documents) is
+    //     uncapped upstream, so slots left over are the only thing keeping them
+    //     schedulable while consolidation is saturated.
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBeLessThan(
+      UPSTREAM_WORKER_MAX_SLOTS,
+    );
+  });
+
+  it("bounds consolidation per-round scope so a huge bank still re-queues", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // The round limit is what forces a re-queue; it must stay a real bound.
+    // It is ALSO a correctness knob: the engine sets
+    // stats["mental_models_refreshed"] = 0 on any round that hits it
+    // (consolidator.py), so a bank permanently above the limit never refreshes
+    // its mental models. Upstream's own default is 1000 — stay at or under it.
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND).toBeGreaterThan(100);
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND).toBeLessThanOrEqual(1000);
   });
 
   it("raises the memory limit to give the throughput bump headroom (8g, was 4g)", async () => {
