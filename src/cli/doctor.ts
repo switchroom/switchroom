@@ -36,6 +36,7 @@ import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnex
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
+import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
@@ -1418,6 +1419,14 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   for (const agentName of Object.keys(config.agents)) {
     results.push(checkAgentRecallHealth(agentName, resolve(memoryAgentsDir, agentName)));
   }
+
+  // …and whether anything WATCHES all of the above between doctor runs. Every
+  // row above is pull-only: it goes red exactly when an operator thinks to
+  // look. `switchroom hindsight-watch` is the push side — and it shipped
+  // without installing its own cron, so on this host it had never executed.
+  // The six-week recall regression therefore ran with the one component that
+  // would have paged sitting unarmed, and nothing said so. This row does.
+  results.push(checkHindsightWatchArmed());
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {

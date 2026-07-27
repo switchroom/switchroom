@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyHysteresis, tick } from "./run.js";
+import { applyHysteresis, formatFiring, tick } from "./run.js";
 import { loadState } from "./state.js";
 import { RENOTIFY_MS } from "./thresholds.js";
 import type { SignalState, Verdict } from "./types.js";
@@ -513,5 +513,28 @@ describe("tick — end to end over a real state file", () => {
     expect(rate?.verdict.state).toBe("no-data");
     expect(sent.texts).toEqual([]);
     expect(r.exitCode).toBe(0);
+  });
+});
+
+describe("formatFiring — severity in the notification shade", () => {
+  const base = { signal: "recall-candidate-floor" as const, state: "breach" as const, detail: "d" };
+
+  it("renders a page-severity breach red", () => {
+    expect(formatFiring({ ...base, severity: "page" }, false)).toContain(
+      "🔴 hindsight: recall-candidate-floor",
+    );
+  });
+
+  it("renders a warn-severity breach orange and says 'degraded'", () => {
+    // So an operator can triage a 3.98h consolidation backlog from the phone
+    // without opening a terminal, and does not learn to ignore the red dot.
+    const out = formatFiring({ ...base, severity: "warn" }, false);
+    expect(out).toContain("🟠");
+    expect(out).toContain("degraded");
+  });
+
+  it("leaves every pre-existing signal red — none of them sets a severity", () => {
+    const out = formatFiring({ signal: "retain-failure-rate", state: "breach", detail: "d" }, false);
+    expect(out.startsWith("🔴 hindsight: retain-failure-rate\n")).toBe(true);
   });
 });

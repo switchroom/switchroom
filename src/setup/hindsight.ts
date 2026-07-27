@@ -642,6 +642,25 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
       "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS",
       String(contextBudget.reflect.maxContextTokens),
     ],
+    // Per-bank labels on the `hindsight_operation_*` families.
+    //
+    // Upstream defaults this OFF — "to avoid high-cardinality OTel metric
+    // growth" (`DEFAULT_METRICS_INCLUDE_BANK_ID` in the vendored `config.py`).
+    // That is the right default for a multi-tenant SaaS with unbounded
+    // tenants and the wrong one here: this fleet is single-tenant by
+    // invariant (`reference/invariants.md`), so the label's cardinality is
+    // bounded by the agent roster (12 today) and grows with headcount, not
+    // with traffic.
+    //
+    // The cost of leaving it off: `hindsight_operation_duration_seconds`
+    // carried operation/source/success/budget/tenant and nothing identifying
+    // the BANK, so no per-bank SLO could be built from `/metrics` at all.
+    // Through the 2026-07 recall regression the aggregate histogram looked
+    // merely mediocre while overlord and klanker sat at ~97 % own-bank
+    // timeout and lawgpt at 0 % — an outage on two banks averaged into a
+    // shrug across twelve. Emitting the label is what makes the two
+    // distinguishable without parsing 12 separate JSONL files.
+    ["HINDSIGHT_API_METRICS_INCLUDE_BANK_ID", "true"],
   ];
 }
 

@@ -32,6 +32,31 @@ workers issue thousands.
 | `retain-queue-growth` | spool ≥440 entries deep **and** grew by ≥max(88, 10 %) across the window | level |
 | `retain-loss` | any new `*.json.dead` marker, `pending-evicted/` entry, or `pending-drops.json` count — memory that left the queue without being persisted | edge |
 | `container` | `switchroom-hindsight` unhealthy, restarted, or recreated | edge |
+| `recall-own-bank-timeout` | >5 % (warn) / >15 % (page) of recalls had the agent's **own** bank time out or hard-error | level |
+| `recall-candidate-floor` | median candidate pool (`pre_cap_count + overlap_dropped`) ≤8 (warn) / ≤3 (page) | level |
+| `recall-injected-score` | p50 of `injected_score_max` ≤0.05 (warn) / ≤0.01 (page) | level |
+| `recall-zero-memory` | >25 % (warn) / >40 % (page) of recalls injected nothing | level |
+| `recall-latency` | recall p95 ≥4 s (warn) / ≥6 s (page) | level |
+| `consolidation-queue-age` | oldest pending `async_operations` row ≥2 h (warn) / ≥12 h (page) | level |
+| `llm-fallback-ineffective` | ≥2 % (warn) / ≥10 % (page) of hindsight LLM calls failed outright | level |
+
+The six recall signals read `recall_log.jsonl` — the hook's own telemetry —
+because **every layer of the recall path fails open** and none of the metrics
+above can see it: `recall.py` exits 0 on a bank timeout (blocking the prompt
+would be worse), Claude Code swallows hook stderr on a zero exit, the agent is
+handed an empty context indistinguishable from "nothing relevant", and both
+`probeHindsight` and the container healthcheck are satisfied by a recall path
+that answers fast and empty. The fleet ran at 86 % own-bank timeout for six
+weeks with every pre-existing signal green.
+
+**`recall-candidate-floor` and `recall-injected-score` are the two that matter
+most.** `doctor-recall-health.ts` deliberately does not score `result_count`
+(an empty match is legitimately common), which leaves one failure shape
+completely invisible: a recall that is fast, successful, and near-empty. Those
+two signals are the only things that see it.
+
+Breaches now carry a **severity**: `warn` renders 🟠 "… degraded", `page`
+renders 🔴. Every pre-existing signal sets no severity and stays 🔴.
 
 A **level** signal needs two consecutive breaching evaluations to fire; an
 **edge** signal fires on the first, because it reports a discrete event that
@@ -77,6 +102,57 @@ measurement in the doc comment. Summary:
 - **re-notify quiet period: 6 h** — a firing signal DMs once, then at most
   once per 6 h while it stays firing.
 
+### Recall thresholds
+
+Measured by a real `--dry-run` against the live fleet on 2026-07-27,
+mid-incident: 430 in-window rows across the 8 agents that had recent recall
+telemetry. Each number is quoted against BOTH the sick reading and the
+healthiest agent's reading, so the headroom is demonstrated rather than
+asserted:
+
+| SLI | Warn / page | Measured (sick) | Measured (healthy agent) | Verdict |
+|---|---|---|---|---|
+| own-bank timeout rate | >5 % / >15 % | **88.4 %** (380/430) | 0 % | PAGE |
+| zero-memory turn rate | >25 % / >40 % | **54.0 %** (232/430) | 0–22.5 % | PAGE |
+| candidate-pool median | ≤8 / ≤3 | **0** | 28–40 | PAGE |
+| injected top-hit p50 | ≤0.05 / ≤0.01 | **0.0013** (n=198) | 0.061–0.61 | PAGE |
+| recall p95 | ≥4 s / ≥6 s | **8063 ms** (bank budget 8000 ms) | ~1.1 s | PAGE |
+| consolidation oldest | ≥2 h / ≥12 h | **4.6 h** (122 pending) | — | WARN |
+| LLM outright-failure rate | ≥2 % / ≥10 % | **0.00 %** (0/800) | — | clean |
+
+`consolidation-queue-age` landing on WARN rather than PAGE is the severity
+split doing real work: a backlog worth mentioning is not a backlog worth
+waking someone for.
+
+Notes on the reduction, all of which are fail-CLOSED by design:
+
+- **Each SLI carries its own denominator.** Topic-filtered rows carry
+  `result_count` but no `bank_timings`, so one shared denominator would
+  silently dilute whichever rate was computed second.
+- **Cache hits are excluded wholesale** — a cache-hit row carries
+  `result_count: null` and no timings, so counting it would inflate every
+  denominator with rows that measured nothing.
+- **`pre_cap_count` alone is not the pool.** It is post-overlap-gate, so the
+  gate's drops are added back; scoring it raw would read an aggressive overlap
+  gate as an empty index and point at the wrong fix.
+- **30-row sample floor per SLI**, and rows older than **24 h** are dropped —
+  otherwise a fleet whose recall stopped firing entirely would page forever off
+  a frozen log.
+- **A missing or partial persisted `recall` block is rejected to `null`**, not
+  zero-filled. `undefined / undefined` is `NaN` and every `NaN >= threshold` is
+  false, so a corrupt block would otherwise score as a clean pass on all six
+  recall signals — the exact fail-open shape this exists to remove.
+- **`consolidation-queue-age`'s 2 h warn** matches the existing
+  `SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S` default in
+  `docker/hindsight-maintenance.sh`, so the push and pull views agree.
+- **`llm-fallback-ineffective` reads the failure rate, not OpenRouter
+  traffic.** LiteLLM's router fallback happens *inside* one hindsight request,
+  so hindsight only ever records the model it ASKED for and no `*-openrouter`
+  series exists on `/metrics` (verified: zero, 2026-07-27). A
+  `success="false"` therefore means the local deployment failed **and** the
+  OpenRouter hop did not rescue it — which is the question worth alerting on.
+  A fallback that never fires can no longer read as clean.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -97,20 +173,32 @@ notified — the next tick retries it.
    switchroom hindsight-watch --dry-run
    ```
 
-2. Install the cron (15-minute cadence, `flock` so ticks cannot overlap):
+2. Install the cron:
 
-   ```
-   # /etc/cron.d/hindsight-watch
-   */15 * * * * kenthompson /usr/bin/flock -n /run/lock/hindsight-watch.lock \
-     /usr/local/bin/switchroom hindsight-watch \
-     >> /var/log/hindsight-watch.log 2>&1
+   ```bash
+   sudo switchroom hindsight-watch --install-cron --cron-user "$USER"
    ```
 
-   Run it as the **operator** user, not root: the state file and the agents
-   scaffold both live under the operator's `~/.switchroom`.
+   This writes `/etc/cron.d/hindsight-watch` (15-minute cadence, `flock -n` so
+   ticks cannot overlap, explicit `PATH` because the probes shell out to
+   `docker`, mode 0644). It is idempotent — re-running is a no-op when the
+   fragment already matches.
 
-3. Confirm delivery by watching the log for the first tick, and
-   `~/.switchroom/hindsight-watch/state.json` for the persisted window.
+   It **refuses to install for `root`**: the state file and the agents
+   scaffold live under the operator's `~/.switchroom`, so a root tick would
+   read an empty fleet and report a clean bill of health forever.
+
+3. Confirm:
+
+   ```bash
+   switchroom doctor    # the `hindsight-watch armed` row
+   ```
+
+   `switchroom doctor` **FAILs** while the watchdog is unarmed or its state
+   file is stale past an hour (four missed ticks). That row exists because the
+   previous version of this doc said "install the cron" and nobody did — the
+   watchdog shipped complete and never executed, and nothing anywhere said so.
+   A monitoring system whose own absence is silent is not a monitoring system.
 
 Alerts arrive as a plain operator DM through the first agent gateway socket
 that accepts them. The gateway fences delivery to its own operator chat, so
@@ -125,4 +213,6 @@ the watchdog cannot address a foreign chat.
 --container <name>    default switchroom-hindsight
 --state <path>        default ~/.switchroom/hindsight-watch/state.json
 --agents-dir <path>   default ~/.switchroom/agents
+--install-cron        write /etc/cron.d/hindsight-watch and exit
+--cron-user <user>    unix user the cron tick runs as (never root)
 ```

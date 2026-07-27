@@ -15,14 +15,21 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { parseExposition, readRetainSignals, type RetainSignals } from "./metrics.js";
+import {
+  parseExposition,
+  readLlmSignals,
+  readRetainSignals,
+  type LlmSignals,
+  type RetainSignals,
+} from "./metrics.js";
+import { probeRecallLogs, type RecallStats } from "./recall-log.js";
 import {
   DEFAULT_CONTAINER,
   DEFAULT_METRICS_URL,
   METRICS_MAX_BYTES,
   METRICS_TIMEOUT_MS,
 } from "./thresholds.js";
-import type { Sample } from "./types.js";
+import type { ConsolidationSample, Sample } from "./types.js";
 
 /**
  * A probe failed in a way that means the watchdog CANNOT SEE hindsight. It
@@ -40,11 +47,22 @@ export class ProbeError extends Error {
   }
 }
 
-/** GET `/metrics` and reduce it to the retain signals. Throws on any failure. */
+/** The `/metrics` slice one tick consumes. */
+export interface MetricsSample {
+  retain: RetainSignals;
+  /** null when the exposition carries no LLM-call family (see `readLlmSignals`) */
+  llm: LlmSignals | null;
+}
+
+/**
+ * GET `/metrics` and reduce it to the signals one tick needs. Throws on any
+ * failure to fetch, read or parse — an unreachable or unparseable endpoint is
+ * an alert, never a clean bill of health.
+ */
 export async function probeMetrics(
   url: string = DEFAULT_METRICS_URL,
   fetchImpl: typeof fetch = fetch,
-): Promise<RetainSignals> {
+): Promise<MetricsSample> {
   let res: Response;
   try {
     res = await fetchImpl(url, {
@@ -66,7 +84,8 @@ export async function probeMetrics(
     throw new ProbeError(`reading ${url}: ${(e as Error).message}`, "metrics");
   }
   try {
-    return readRetainSignals(parseExposition(body));
+    const series = parseExposition(body);
+    return { retain: readRetainSignals(series), llm: readLlmSignals(series) };
   } catch (e) {
     throw new ProbeError(`parsing ${url}: ${(e as Error).message}`, "metrics");
   }
@@ -176,13 +195,19 @@ function readDropCount(hindsightDir: string): number {
  * "always empty": that refers to the OPERATOR's own `$HOME/.hindsight`,
  * which really is empty. The per-agent scaffold path used here is not.
  */
-export function probeSpool(
-  agentsDir: string = resolve(
-    process.env.SWITCHROOM_HOME ?? process.env.HOME ?? homedir(),
-    ".switchroom",
-    "agents",
-  ),
-): SpoolDepth {
+/**
+ * The agents scaffold dir, honouring `SWITCHROOM_HOME` like the rest of the
+ * CLI. Shared by the spool and recall-log probes so the two can never read
+ * different fleets.
+ */
+export function resolveAgentsDir(explicit?: string): string {
+  return (
+    explicit ??
+    resolve(process.env.SWITCHROOM_HOME ?? process.env.HOME ?? homedir(), ".switchroom", "agents")
+  );
+}
+
+export function probeSpool(agentsDir: string = resolveAgentsDir()): SpoolDepth {
   let names: string[];
   try {
     names = readdirSync(agentsDir);
@@ -250,17 +275,92 @@ export interface ProbeOptions {
   now?: () => number;
 }
 
-/** Run all three probes into one sample. Any failure throws a ProbeError. */
-export async function probeOnce(opts: ProbeOptions = {}): Promise<{ sample: Sample; spool: SpoolDepth }> {
+/**
+ * Shell run inside the hindsight container to read the consolidation queue.
+ *
+ * Deliberately a near-copy of `docker/hindsight-maintenance.sh`'s `_sql`
+ * bootstrap (glob the pg0 install for `psql`, read the instance descriptor for
+ * the credentials) rather than a new connection convention, so the watchdog
+ * and the maintenance loop cannot end up reading two different databases.
+ *
+ * Prints `<pending>|<oldest_age_seconds>` on success and nothing on any
+ * missing precondition. The password is passed via `PGPASSWORD` in the
+ * container's own environment and never crosses back out — the only thing
+ * this returns is two integers.
+ */
+const CONSOLIDATION_QUEUE_SH = `
+set -e
+B="$(ls -d /home/hindsight/.pg0/installation/*/bin 2>/dev/null | head -1)"
+PSQL="$(command -v psql 2>/dev/null || echo "\${B:-/nonexistent}/psql")"
+[ -x "$PSQL" ] || exit 0
+D=/home/hindsight/.pg0/instances/hindsight/instance.json
+[ -r "$D" ] || exit 0
+
+# shlex.quote every field before eval. The descriptor is local and not
+# attacker-controlled, but a password containing a shell metacharacter would
+# otherwise either break the eval (silently degrading this signal to no-data
+# forever) or execute part of itself. Quoting removes the class outright.
+eval "$(python3 -c 'import json,shlex,sys
+d=json.load(open(sys.argv[1]))
+q=lambda k,dflt: shlex.quote(str(d.get(k) or dflt))
+print("U=%s DB=%s P=%s PW=%s"%(q("username","hindsight"),q("database","hindsight"),q("port",5432),q("password","")))' "$D")"
+[ -n "$PW" ] || exit 0
+PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
+  "SELECT count(*)||'|'||coalesce(max(extract(epoch from (now()-created_at)))::bigint,0) FROM async_operations WHERE status IN ('pending','processing')"
+`;
+
+/**
+ * Read the `async_operations` backlog, or null when it cannot be read.
+ *
+ * **Soft-fails on purpose**, unlike the three probes above. Those three throw
+ * because their absence means the watchdog cannot see the thing it exists to
+ * watch. This one needs a psql client and a pg descriptor that legitimately
+ * do not exist off-host (CI, a dev laptop), so throwing would make the whole
+ * watchdog unrunnable anywhere but production. Null degrades exactly ONE
+ * signal to `no-data` — visibly, in the printed output — and the container
+ * being down is already covered by the `container` signal.
+ */
+export function probeConsolidationQueue(
+  container: string = DEFAULT_CONTAINER,
+  run: Runner = defaultRunner,
+): ConsolidationSample | null {
+  const r = run("docker", ["exec", container, "sh", "-c", CONSOLIDATION_QUEUE_SH]);
+  if (r.status !== 0) return null;
+  const [pendingRaw, ageRaw] = r.stdout.trim().split("|");
+  const pending = Number(pendingRaw);
+  const oldestAgeS = Number(ageRaw);
+  if (!Number.isFinite(pending) || !Number.isFinite(oldestAgeS)) return null;
+  if (pending < 0 || oldestAgeS < 0) return null;
+  return { pending, oldestAgeS };
+}
+
+/** Run every probe into one sample. A core-probe failure throws a ProbeError. */
+export async function probeOnce(
+  opts: ProbeOptions = {},
+): Promise<{ sample: Sample; spool: SpoolDepth; recall: RecallStats }> {
   const now = opts.now ?? Date.now;
-  const retain = await probeMetrics(opts.metricsUrl, opts.fetchImpl);
+  const ts = now();
+  const metrics = await probeMetrics(opts.metricsUrl, opts.fetchImpl);
   const container = probeContainer(opts.container, opts.run);
   const spool = probeSpool(opts.agentsDir);
+  // `probeSpool` above already threw if the agents dir is unreadable, so this
+  // cannot be reached with a bad dir today. Wrapped anyway: if the two probes
+  // are ever reordered, an unreadable dir must still surface as a probe
+  // failure rather than as a `recall` block full of confident zeroes.
+  let recall: RecallStats;
+  try {
+    recall = probeRecallLogs(resolveAgentsDir(opts.agentsDir), ts);
+  } catch (e) {
+    throw new ProbeError(`reading recall logs: ${(e as Error).message}`, "spool");
+  }
+  const consolidation = probeConsolidationQueue(opts.container, opts.run);
   return {
     sample: {
-      ts: now(),
-      retainOk: retain.ok,
-      retainFail: retain.fail,
+      ts,
+      retainOk: metrics.retain.ok,
+      retainFail: metrics.retain.fail,
+      llmOk: metrics.llm?.ok,
+      llmFail: metrics.llm?.fail,
       pending: spool.pending,
       dead: spool.dead,
       evicted: spool.evicted,
@@ -268,7 +368,10 @@ export async function probeOnce(opts: ProbeOptions = {}): Promise<{ sample: Samp
       restartCount: container.restartCount,
       startedAt: container.startedAt,
       health: container.health,
+      recall,
+      consolidation,
     },
     spool,
+    recall,
   };
 }
