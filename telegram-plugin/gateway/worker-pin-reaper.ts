@@ -99,6 +99,47 @@ export interface StoreOrphanRow {
   pending?: boolean
   /** Time-scoped `tool:` pin. Never a worker orphan; excluded. */
   expiresAt?: number
+  /** Wall-clock ms the claim was first taken (#3810). Absent on a pre-v3 row. */
+  pinnedAt?: number
+}
+
+/**
+ * The live worker-activity feed's liveness probe, as the reaper needs it.
+ * Nullable ON PURPOSE — see `groupPinStatus`.
+ */
+export interface WorkerFeedLivenessProbe {
+  hasRunningInFeed(feedKey: string): boolean
+}
+
+/**
+ * Verdict for a GROUP-level pin key (`wk:group:<feedKey>`, the shape the
+ * coalesced feed produces since #3207). Vouched off the live feed rather than
+ * the sub-agent registry: `group:<feedKey>` is not a jsonl agent id.
+ *
+ * #3811 — the gateway used to write this as
+ * `feed?.hasRunningInFeed(key) ? 'running' : 'terminal'`, which collapses two
+ * very different facts into one verdict:
+ *
+ *   - "a live feed exists and affirmatively says this group is done"  → terminal
+ *   - "there is NO feed object to ask"                                → nothing known
+ *
+ * A `'terminal'` verdict reaps at ANY age — it bypasses the TTL exemption
+ * entirely — so the second case could unpin a GENUINELY LIVE group pin out from
+ * under running workers during a window where `workerActivityFeed` is null
+ * (teardown/rebuild on a bridge flap, and every tick before the first bridge
+ * connect). That is the inverse of the stale-pin bug and much harder to notice:
+ * the user loses the pin for work that is still in flight.
+ *
+ * "No feed to ask" is `'unknown'`: the TTL still applies, so a truly stale pin
+ * is still bounded, but nothing is reaped on the strength of a question we
+ * never got to ask.
+ */
+export function groupPinStatus(
+  feed: WorkerFeedLivenessProbe | null | undefined,
+  feedKey: string,
+): WorkerRegistryStatus {
+  if (feed == null) return 'unknown'
+  return feed.hasRunningInFeed(feedKey) ? 'running' : 'terminal'
 }
 
 /**
@@ -110,13 +151,21 @@ export interface StoreOrphanRow {
  * it too, group-safely (per-message unpin of a bot-tracked row — never an
  * unpin-all, never a human pin).
  *
- * The store persists NO timestamp, so a store-only candidate carries
- * `pinnedAt = now`: only a TERMINAL registry verdict can reap it. It is never
- * TTL-reaped (no trustworthy age to age it out), never touched while its worker
- * is `running`, and it is always a `wk:` row (the documented leak class).
+ * AGE (#3810). A v3+ row carries the real `pinnedAt` the claim was taken at, so
+ * a store orphan ages honestly and the ordinary TTL gate applies to it exactly
+ * as it does to an in-memory claim. A pre-v3 row has no timestamp and keeps the
+ * old conservative stamp (`pinnedAt = now`, i.e. TERMINAL-verdict reaping only)
+ * rather than guessing an age — but that case now self-clears within one
+ * restart, because every write from v3 onward records the field.
+ *
+ * Why the honest age matters: `storeOnlyWorkerPinCandidates` was the ONLY net
+ * for a `wk:` row with no in-memory claim, and with the TTL permanently
+ * disabled a `wk:<agentId>` row whose turnsDb row had been pruned (verdict
+ * `'unknown'`, never `'terminal'`) was never mid-session reaped at all — its
+ * stale `🛠 Worker` pin sat at the top of the chat until the next gateway boot.
+ *
  * `pending` rows (pin API in-flight) and time-scoped `tool:` rows are excluded,
- * as are rows already tracked in memory (the in-memory reaper owns those, with
- * a real `pinnedAt` that can drive the TTL).
+ * as are rows already tracked in memory (the in-memory reaper owns those).
  */
 export function storeOnlyWorkerPinCandidates(args: {
   rows: Iterable<StoreOrphanRow>
@@ -133,7 +182,7 @@ export function storeOnlyWorkerPinCandidates(args: {
     out.push({
       pinKey: r.pinKey,
       chatId: r.chatId,
-      pinnedAt: args.now,
+      pinnedAt: r.pinnedAt ?? args.now,
       messageId: r.messageId,
     })
   }

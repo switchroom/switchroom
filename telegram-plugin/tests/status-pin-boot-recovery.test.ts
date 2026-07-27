@@ -11,7 +11,7 @@
  * We cannot import gateway.ts directly (its module top-level runs the whole boot
  * IIFE incl. the startup mutex + bot.start). Instead we model the gateway's
  * status-pin subsystem faithfully with the SAME functions gateway.ts calls
- * (reconcileAndPersistStatusPin, reconcilePin, runStatusPinBootCleanup) over an
+ * (runStatusPinReconcile, executePinLeg, runStatusPinBootCleanup) over an
  * in-memory fs + a fake Telegram whose pin set we can inspect — so a regression
  * in the ordering / cleanup contract reds here.
  *
@@ -25,17 +25,27 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   loadStatusPins,
+  type PersistedStatusPin,
   persistStatusPins,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
   type StatusPinStoreFsSeam,
 } from "../gateway/status-pin-store.js";
-import { reconcilePin } from "../status-pin-driver.js";
-import type { PinState, DesiredPin } from "../status-pin.js";
-import { decidePinAction } from "../status-pin.js";
+import { executePinLeg } from "../status-pin-driver.js";
+import type { DesiredPin, PinState } from "../status-pin.js";
+import {
+  runStatusPinReconcile,
+  type StatusPinClaim,
+} from "../gateway/status-pin-retarget.js";
 import { makeFloodWaitActiveError } from "../retry-api-call.js";
 
 const PATH = "/state/agent/telegram/status-pins.json";
+
+/** Drop the #3810 claim-age stamp so a row's identity fields can be compared
+ *  literally. The age itself is asserted in status-pin-store.test.ts. */
+function idOnly(rows: PersistedStatusPin[]): Omit<PersistedStatusPin, "pinnedAt">[] {
+  return rows.map(({ pinnedAt: _age, ...rest }) => rest);
+}
 
 function memFs(seed: Record<string, string> = {}) {
   const files = new Map<string, string>(Object.entries(seed));
@@ -78,33 +88,22 @@ function fakeTelegram() {
  * with injectable fs + api so a single test can span a "crash" and a fresh boot.
  */
 function makeGateway(fs: StatusPinStoreFsSeam, tg: ReturnType<typeof fakeTelegram>) {
-  const statusPinState = new Map<string, PinState>();
-  const statusPinChatIds = new Map<string, string>();
+  // ONE claim registry — the same single record the gateway keeps (#3809).
+  const statusPinClaims = new Map<string, StatusPinClaim>();
 
   async function reconcileStatusPin(pinKey: string, chatId: string, desired: DesiredPin) {
-    const prev = statusPinState.get(pinKey) ?? null;
-    const action = decidePinAction(prev, desired);
-    const op =
-      action.kind === "pin"
-        ? ({ kind: "pin", messageId: action.messageId } as const)
-        : ({ kind: "clear" } as const);
-    const next = await reconcileAndPersistStatusPin({
-      path: PATH,
-      fs,
+    const claim = statusPinClaims.get(pinKey);
+    const prev: PinState | null = claim == null ? null : { messageId: claim.messageId };
+    await runStatusPinReconcile({
       pinKey,
       chatId,
-      op,
-      applyPin: () =>
-        reconcilePin({ api: tg.api, chatId, prevState: prev, desired }),
-      log: () => {},
+      prev,
+      desired,
+      persist: { path: PATH, fs },
+      runPin: (action, from) =>
+        executePinLeg({ api: tg.api, chatId, prevState: from, action }),
+      claims: statusPinClaims,
     });
-    if (next == null) {
-      statusPinState.delete(pinKey);
-      statusPinChatIds.delete(pinKey);
-    } else {
-      statusPinState.set(pinKey, next);
-      statusPinChatIds.set(pinKey, chatId);
-    }
   }
 
   async function bootCleanup() {
@@ -116,7 +115,7 @@ function makeGateway(fs: StatusPinStoreFsSeam, tg: ReturnType<typeof fakeTelegra
     });
   }
 
-  return { statusPinState, reconcileStatusPin, bootCleanup };
+  return { statusPinClaims, reconcileStatusPin, bootCleanup };
 }
 
 describe("status-pin boot recovery (gateway wiring)", () => {
@@ -130,7 +129,7 @@ describe("status-pin boot recovery (gateway wiring)", () => {
 
     // Pin is live in Telegram and recorded on disk (confirmed).
     expect(tg.pinned.has("-100123:715")).toBe(true);
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715 },
     ]);
 
@@ -144,7 +143,7 @@ describe("status-pin boot recovery (gateway wiring)", () => {
 
     expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
     expect(tg.pinned.has("-100123:715")).toBe(false); // orphan unpinned
-    expect(loadStatusPins(PATH, fs)).toEqual([]); // store emptied
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]); // store emptied
   });
 
   it("(B) pending pin (crash inside the persist-after-pin window) → recovered next boot", async () => {
@@ -171,7 +170,7 @@ describe("status-pin boot recovery (gateway wiring)", () => {
 
     // Orphan is live in Telegram; a PENDING record is on disk.
     expect(tg.pinned.has("-100123:715")).toBe(true);
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
     ]);
 
@@ -180,7 +179,7 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     const res = await gw2.bootCleanup();
     expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
     expect(tg.pinned.has("-100123:715")).toBe(false);
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("(C) #3664: a never-confirmed unpin (FLOOD_WAIT_ACTIVE) KEEPS the claim + the durable row, and the next boot clears the pin", async () => {
@@ -216,9 +215,9 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     // The pin is STILL UP …
     expect(pinned.has("-100123:715")).toBe(true);
     // … and BOTH records survive: the in-memory claim …
-    expect(gw1.statusPinState.get("fg:c:3")).toEqual({ messageId: 715 });
+    expect(gw1.statusPinClaims.get("fg:c:3")?.messageId).toBe(715);
     // … and the durable row (what boot cleanup reads).
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715 },
     ]);
 
@@ -226,8 +225,8 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     floodOpen = false;
     await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: false });
     expect(pinned.has("-100123:715")).toBe(false);
-    expect(gw1.statusPinState.has("fg:c:3")).toBe(false);
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(gw1.statusPinClaims.has("fg:c:3")).toBe(false);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("(D) #3664: if the process dies while the flood window is open, the retained row lets the NEXT boot clear the orphan", async () => {
@@ -257,7 +256,7 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     const res = await gw2.bootCleanup();
     expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
     expect(pinned.has("-100123:715")).toBe(false);
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("clean shutdown (sweep DID run) leaves nothing for boot cleanup to do", async () => {
@@ -271,7 +270,7 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     // Clean sweep: unpin the key.
     await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: false });
     expect(tg.pinned.size).toBe(0);
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
 
     const gw2 = makeGateway(fs, tg);
     expect(await gw2.bootCleanup()).toEqual({ cleared: 0, retained: 0, kept: 0, total: 0 });

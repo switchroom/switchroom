@@ -2,8 +2,59 @@ import { describe, it, expect } from 'vitest'
 import { GrammyError } from 'grammy'
 import { decidePinAction, isPinRightsError, isUnpinTerminalError, PinRightsCache } from '../status-pin.js'
 import { makeFloodWaitActiveError, GIVE_UP_MESSAGE } from '../retry-api-call.js'
-import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
-import type { PinState } from '../status-pin.js'
+import { executePinLeg, type PinBotApi } from '../status-pin-driver.js'
+import type { DesiredPin, PinState, PinRightsCache as _RightsCache } from '../status-pin.js'
+import {
+  runStatusPinReconcile,
+  type StatusPinClaim,
+} from '../gateway/status-pin-retarget.js'
+
+/**
+ * Drive a whole desired-state reconcile through the REAL unified path — the
+ * orchestrator (`runStatusPinReconcile`, which owns the single retarget
+ * expansion) composed with the driver (`executePinLeg`), exactly as gateway.ts
+ * wires them. `persist: null` mirrors the STATIC / feature-off binding.
+ *
+ * These cases used to call `reconcilePin(prev, desired)` directly, back when the
+ * driver re-decided the action itself and carried its OWN copy of the retarget
+ * expansion (#3831). The driver can no longer express a retarget, so exercising
+ * the same behaviours now means exercising the composition — which is what
+ * production actually runs.
+ */
+async function reconcilePin(args: {
+  api: PinBotApi
+  chatId: string
+  prevState: PinState | null
+  desired: DesiredPin
+  rightsCache?: _RightsCache
+  onError?: (phase: 'pin' | 'unpin', err: unknown) => void
+  onPinRightsDisabled?: (chatId: string) => void
+}): Promise<PinState | null> {
+  const claims = new Map<string, StatusPinClaim>()
+  if (args.prevState != null) {
+    claims.set('k', { messageId: args.prevState.messageId, chatId: args.chatId, pinnedAt: 1 })
+  }
+  await runStatusPinReconcile({
+    pinKey: 'k',
+    chatId: args.chatId,
+    prev: args.prevState,
+    desired: args.desired,
+    persist: null,
+    runPin: (action, from) =>
+      executePinLeg({
+        api: args.api,
+        chatId: args.chatId,
+        prevState: from,
+        action,
+        rightsCache: args.rightsCache,
+        onError: args.onError,
+        onPinRightsDisabled: args.onPinRightsDisabled,
+      }),
+    claims,
+  })
+  const claim = claims.get('k')
+  return claim == null ? null : { messageId: claim.messageId }
+}
 
 /** A real GrammyError with the given code + description, mirroring the wire
  *  shape Telegram returns for the pin-rights failure that crashed marko. */
@@ -64,7 +115,7 @@ function fakeApi(opts: { pinThrows?: boolean; unpinThrows?: boolean } = {}) {
   return { api, calls }
 }
 
-describe('reconcilePin (driver)', () => {
+describe('unified reconcile path (orchestrator + driver)', () => {
   it('pin on in-progress: pins the EXISTING message SILENTLY and claims it', async () => {
     const { api, calls } = fakeApi()
     const next = await reconcilePin({
@@ -333,7 +384,7 @@ describe('reconcilePin (driver)', () => {
 // the whole gateway down. Auto status-pin is best-effort/cosmetic — a
 // pin-rights failure must be absorbed, never fatal, and never reach the
 // process-level unhandledRejection handler.
-describe('reconcilePin — pin-rights 400 must never crash (marko 2026-07-01)', () => {
+describe('unified reconcile path — pin-rights 400 must never crash (marko 2026-07-01)', () => {
   it('absorbs the "not enough rights" 400 via onError and never rejects', async () => {
     const rightsErr = grammyError(
       400,
@@ -468,7 +519,7 @@ function countingApi(pinError?: unknown) {
   }
 }
 
-describe('reconcilePin — rights-aware negative cache (#3024)', () => {
+describe('unified reconcile path — rights-aware negative cache (#3024)', () => {
   const rightsErr = () =>
     grammyError(400, 'Bad Request: not enough rights to manage pinned messages in the chat')
 

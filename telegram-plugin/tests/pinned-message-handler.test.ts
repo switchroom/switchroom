@@ -3,7 +3,7 @@
  * extracted from gateway.ts (switchroom#2996 P6 cluster F). Asserts the
  * chat-scoped ownership guard (only OUR pins get their service message
  * deleted), the reconcile-store race retry, and best-effort logging on a
- * delete failure — against injected pin-state maps + a mock deleteServiceMessage.
+ * delete failure — against an injected claim registry + a mock deleteServiceMessage.
  */
 
 import { describe, it, expect, vi } from 'vitest'
@@ -11,13 +11,18 @@ import {
   handlePinnedMessage,
   type PinnedMessageHandlerDeps,
 } from '../gateway/pinned-message-handler.js'
+import type { StatusPinClaim } from '../gateway/status-pin-retarget.js'
+
+/** One claim, the single record the gateway now keeps per pin key (#3809). */
+function claim(messageId: number, chatId: string): StatusPinClaim {
+  return { messageId, chatId, pinnedAt: 1000 }
+}
 
 function makeDeps(over: Partial<PinnedMessageHandlerDeps> = {}) {
   const deleteServiceMessage = vi.fn(async () => {})
   const log = vi.fn()
   const deps: PinnedMessageHandlerDeps = {
-    statusPinState: new Map(),
-    statusPinChatIds: new Map(),
+    statusPinClaims: new Map(),
     deleteServiceMessage,
     log,
     ...over,
@@ -38,8 +43,7 @@ function ctxWith(chatId: number, pinnedMessageId: number | undefined, serviceMsg
 describe('handlePinnedMessage — ownership guard', () => {
   it('deletes the service message when the pin is ours in this chat', async () => {
     const { deps, deleteServiceMessage } = makeDeps({
-      statusPinState: new Map([['fg:a', { messageId: 555 }]]),
-      statusPinChatIds: new Map([['fg:a', '42']]),
+      statusPinClaims: new Map([['fg:a', claim(555, '42')]]),
     })
     await handlePinnedMessage(ctxWith(42, 555, 999), deps)
     expect(deleteServiceMessage).toHaveBeenCalledWith('42', 999)
@@ -47,8 +51,8 @@ describe('handlePinnedMessage — ownership guard', () => {
 
   it('does NOT delete when the pinned id matches but the tracked chat differs', async () => {
     const { deps, deleteServiceMessage } = makeDeps({
-      statusPinState: new Map([['fg:a', { messageId: 555 }]]),
-      statusPinChatIds: new Map([['fg:a', '99']]), // tracked in a DIFFERENT chat
+      // tracked in a DIFFERENT chat
+      statusPinClaims: new Map([['fg:a', claim(555, '99')]]),
     })
     await handlePinnedMessage(ctxWith(42, 555, 999), deps)
     expect(deleteServiceMessage).not.toHaveBeenCalled()
@@ -75,16 +79,13 @@ describe('handlePinnedMessage — reconcile-store race', () => {
     // #3354 bun-test failure). The handler waits 250ms before its single
     // re-check; populate the store inside that window and await the real
     // delay.
-    const state = new Map<string, { messageId: number }>()
-    const chatIds = new Map<string, string>()
+    const claims = new Map<string, StatusPinClaim>()
     const { deps, deleteServiceMessage } = makeDeps({
-      statusPinState: state,
-      statusPinChatIds: chatIds,
+      statusPinClaims: claims,
     })
     const p = handlePinnedMessage(ctxWith(42, 555, 999), deps)
     // Store catches up during the 250ms race window.
-    state.set('fg:a', { messageId: 555 })
-    chatIds.set('fg:a', '42')
+    claims.set('fg:a', claim(555, '42'))
     await p
     expect(deleteServiceMessage).toHaveBeenCalledWith('42', 999)
   })
@@ -93,8 +94,7 @@ describe('handlePinnedMessage — reconcile-store race', () => {
 describe('handlePinnedMessage — best-effort delete failure', () => {
   it('logs a concise reason when the delete throws', async () => {
     const { deps, log } = makeDeps({
-      statusPinState: new Map([['fg:a', { messageId: 555 }]]),
-      statusPinChatIds: new Map([['fg:a', '42']]),
+      statusPinClaims: new Map([['fg:a', claim(555, '42')]]),
       deleteServiceMessage: vi.fn(async () => {
         throw new Error('not enough rights')
       }),

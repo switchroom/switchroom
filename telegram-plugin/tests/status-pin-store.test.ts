@@ -13,8 +13,11 @@ import {
   type TrackedStatusPin,
 } from "../gateway/status-pin-store.js";
 import { decidePinAction, type PinState, type DesiredPin } from "../status-pin.js";
-import { reconcilePin, type PinBotApi } from "../status-pin-driver.js";
-import { runStatusPinReconcile } from "../gateway/status-pin-retarget.js";
+import { executePinLeg, type PinBotApi } from "../status-pin-driver.js";
+import {
+  runStatusPinReconcile,
+  type StatusPinClaim,
+} from "../gateway/status-pin-retarget.js";
 import { makeFloodWaitActiveError } from "../retry-api-call.js";
 
 /** In-memory fs seam with an atomic rename, so the store's tmp→rename
@@ -48,6 +51,26 @@ function pin(over: Partial<PersistedStatusPin> = {}): PersistedStatusPin {
   return { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, ...over };
 }
 
+/**
+ * Strip the #3810 claim-age stamp from persisted rows.
+ *
+ * Every confirmed/pending row now carries `pinnedAt` (the durable claim age the
+ * mid-session store-orphan reaper needs). Row assertions that are about pin
+ * IDENTITY — which key, which chat, which message, pending or not — stay about
+ * identity by normalising the age away. The age has its own dedicated teeth in
+ * the `claim age` describe below; it is not silently untested.
+ */
+function idOnly(rows: PersistedStatusPin[]): Omit<PersistedStatusPin, "pinnedAt">[] {
+  return rows.map(({ pinnedAt: _age, ...rest }) => rest);
+}
+
+/** The `prev` snapshot a reconcile reads from the single claim registry (#3809),
+ *  exactly as gateway.ts's `reconcileStatusPinInner` does. */
+function prevOf(claims: Map<string, StatusPinClaim>, pinKey: string): PinState | null {
+  const c = claims.get(pinKey);
+  return c == null ? null : { messageId: c.messageId };
+}
+
 describe("status-pin-store", () => {
   it("round-trips the pin claim set", () => {
     const { fs } = memFs();
@@ -56,7 +79,7 @@ describe("status-pin-store", () => {
       pin({ pinKey: "wk:agent-x", chatId: "-100999", messageId: 42 }),
     ];
     persistStatusPins(PATH, fs, snap);
-    expect(loadStatusPins(PATH, fs)).toEqual(snap);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual(snap);
   });
 
   it("writes via tmp + atomic rename (crash-safe)", () => {
@@ -80,22 +103,22 @@ describe("status-pin-store", () => {
     expect(loadStatusPins(PATH, fs)).toHaveLength(1);
     // Reconcile deleted the key → snapshot of the now-empty Map.
     persistStatusPins(PATH, fs, []);
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("loads [] when no file exists (fresh boot)", () => {
     const { fs } = memFs();
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("fail-open: corrupt JSON loads as [] (never crashes boot)", () => {
     const { fs } = memFs({ [PATH]: "{not json" });
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("fail-open: wrong envelope version / shape loads as []", () => {
-    // v3 is an unknown FUTURE version (v1 + v2 are the supported set).
-    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 3, pins: [pin()] }) });
+    // v4 is an unknown FUTURE version (v1–v3 are the supported set).
+    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 4, pins: [pin()] }) });
     expect(loadStatusPins(PATH, f1)).toEqual([]);
     const { fs: f2 } = memFs({ [PATH]: JSON.stringify({ v: 1, pins: "nope" }) });
     expect(loadStatusPins(PATH, f2)).toEqual([]);
@@ -203,7 +226,7 @@ describe("runStatusPinBootCleanup", () => {
     ]);
     expect(res).toEqual({ cleared: 2, retained: 0, kept: 0, total: 2 });
     // Store empty afterwards → no re-attempt next boot.
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("retry-safe (#3001): a failing unpin is non-fatal, RETAINS the row with an attempt counter, and drops only the succeeded one", async () => {
@@ -225,7 +248,7 @@ describe("runStatusPinBootCleanup", () => {
     // One failed, one succeeded — the failure is retained for a next-boot
     // retry instead of forfeiting the orphan (the pre-#3001 behaviour).
     expect(res).toEqual({ cleared: 1, retained: 1, kept: 0, total: 2 });
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:1", chatId: "-100123", messageId: 5, attempts: 1 },
     ]);
   });
@@ -251,7 +274,7 @@ describe("runStatusPinBootCleanup", () => {
     // Final attempt failed too — forfeited, not retained: a permanently-
     // undeliverable unpin must not re-fail on every future boot.
     expect(res).toEqual({ cleared: 0, retained: 0, kept: 0, total: 1 });
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("tool pins (#3001): an UNEXPIRED `tool:` row survives the boot untouched; an EXPIRED one is unpinned and dropped", async () => {
@@ -277,7 +300,7 @@ describe("runStatusPinBootCleanup", () => {
     // deliberate agent pin with no "work finished" event).
     expect(unpinned).toEqual([71, 72]);
     expect(res).toEqual({ cleared: 2, retained: 0, kept: 1, total: 3 });
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "tool:-100123:70", chatId: "-100123", messageId: 70, expiresAt: now + 1 },
     ]);
   });
@@ -316,7 +339,7 @@ describe("runStatusPinBootCleanup", () => {
     });
     expect(unpinned).toEqual([["-100777", 314]]);
     expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 });
 
@@ -360,7 +383,7 @@ describe("status-pin-store — concurrent-writer race", () => {
     // Let the reconcile reach its applyPin await (pending row now on disk).
     await Promise.resolve();
     await Promise.resolve();
-    expect(onDiskAtPin).toEqual([
+    expect(idOnly(onDiskAtPin)).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
     ]);
 
@@ -383,12 +406,12 @@ describe("status-pin-store — concurrent-writer race", () => {
     // BOTH rows survive: the status pin was NOT dropped by the concurrent
     // banner write (the pre-fix bug), and the banner row is present.
     const loaded = loadStatusPins(PATH, fs);
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "fg:c:3",
       chatId: "-100123",
       messageId: 715,
     });
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "banner:owner",
       chatId: "-100999",
       messageId: 42,
@@ -436,12 +459,12 @@ describe("status-pin-store — concurrent-writer race", () => {
     await reconcileB;
 
     const loaded = loadStatusPins(PATH, fs);
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "fg:c:3",
       chatId: "-100123",
       messageId: 715,
     });
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "wk:agent-x",
       chatId: "-100999",
       messageId: 42,
@@ -525,16 +548,44 @@ describe("status-pin-store — envelope version compat", () => {
     expect(loaded[0].messageId).toBe(715);
   });
 
-  it("round-trips a v2 pending flag and writes v2 envelopes", () => {
+  it("round-trips a v2 pending flag and writes v3 envelopes", () => {
     const { fs, files } = memFs();
     persistStatusPins(PATH, fs, [pin({ pending: true })]);
-    expect(JSON.parse(files.get(PATH)!).v).toBe(2);
+    expect(JSON.parse(files.get(PATH)!).v).toBe(3);
     expect(loadStatusPins(PATH, fs)[0].pending).toBe(true);
   });
 
+  it("#3810: a v3 row round-trips its pinnedAt claim age; a v1/v2 row loads without one", () => {
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 3,
+        pins: [
+          { pinKey: "wk:group:g1", chatId: "-100123", messageId: 715, pinnedAt: 1234 },
+          { pinKey: "wk:group:g2", chatId: "-100123", messageId: 716 },
+        ],
+      }),
+    });
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded[0].pinnedAt).toBe(1234);
+    expect(loaded[1].pinnedAt).toBeUndefined();
+  });
+
+  it("drops a row with a non-numeric pinnedAt", () => {
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 3,
+        pins: [
+          pin({ messageId: 715 }),
+          { pinKey: "k", chatId: "c", messageId: 1, pinnedAt: "soon" },
+        ],
+      }),
+    });
+    expect(loadStatusPins(PATH, fs)).toHaveLength(1);
+  });
+
   it("rejects an unknown future envelope version (fail-open [])", () => {
-    const { fs } = memFs({ [PATH]: JSON.stringify({ v: 3, pins: [pin()] }) });
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    const { fs } = memFs({ [PATH]: JSON.stringify({ v: 4, pins: [pin()] }) });
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("drops a row with a non-boolean pending field", () => {
@@ -579,12 +630,12 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       log: () => {},
     });
     // At the moment the pin API ran, a pending record was already on disk.
-    expect(onDiskAtPin).toEqual([
+    expect(idOnly(onDiskAtPin)).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
     ]);
     // After success it's confirmed (pending cleared).
     expect(next).toEqual({ messageId: 715 });
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715 },
     ]);
   });
@@ -616,7 +667,7 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
     // persist-AFTER-pin ordering FAILED to do — the store would have been empty
     // and boot cleanup blind to the orphan).
     const persisted = loadStatusPins(PATH, fs);
-    expect(persisted).toEqual([
+    expect(idOnly(persisted)).toEqual([
       { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
     ]);
 
@@ -631,7 +682,7 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       log: () => {},
     });
     expect(unpinned).toEqual([["-100123", 715]]);
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("clears the pending record when the pin API fails (no phantom claim)", async () => {
@@ -642,13 +693,13 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       pinKey: "fg:c:3",
       chatId: "-100123",
       op: { kind: "pin", messageId: 715 },
-      // reconcilePin returns null (prevState) when the pin API throws.
+      // executePinLeg returns null (prevState) when the pin API throws.
       applyPin: async () => null,
       log: () => {},
     });
     expect(next).toBeNull();
     // Pending record dropped — nothing to leak, nothing was pinned.
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   it("preserves OTHER live claims while flipping one key pending→confirmed", async () => {
@@ -671,8 +722,8 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       log: () => {},
     });
     const loaded = loadStatusPins(PATH, fs);
-    expect(loaded).toContainEqual(other);
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual(other);
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "fg:c:3",
       chatId: "-100123",
       messageId: 715,
@@ -696,12 +747,12 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       log: () => {},
     });
     const loaded = loadStatusPins(PATH, fs);
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "banner:owner",
       chatId: "-100999",
       messageId: 42,
     });
-    expect(loaded).toContainEqual({
+    expect(idOnly(loaded)).toContainEqual({
       pinKey: "fg:c:3",
       chatId: "-100123",
       messageId: 715,
@@ -721,11 +772,11 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       log: () => {},
     });
     expect(next).toBeNull();
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
   // F1 (invisible-worker-cards review): a `clear` op is emitted for BOTH a real
-  // unpin AND a `noop: already pinned`. For a noop, reconcilePin issues NO
+  // unpin AND a `noop: already pinned`. For a noop, executePinLeg issues NO
   // Telegram call and returns the LIVE claim (non-null). The pre-fix clear
   // branch dropped the row unconditionally, so the worker feed's per-edit
   // syncPin (every steady-state edit maps to a noop-clear) erased the durable
@@ -736,7 +787,7 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
     const { fs, calls } = memFs();
     persistStatusPins(PATH, fs, [pin({ pinKey: "wk:group:g1", messageId: 715 })]);
     const before = calls.length;
-    // applyPin returns the live claim unchanged (what reconcilePin does on noop).
+    // applyPin returns the live claim unchanged (what executePinLeg does on noop).
     const next = await reconcileAndPersistStatusPin({
       path: PATH,
       fs,
@@ -748,7 +799,7 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
     });
     expect(next).toEqual({ messageId: 715 });
     // Row survives (rewritten confirmed, no `pending`).
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "wk:group:g1", chatId: "-100123", messageId: 715 },
     ]);
     // Sanity: at least one disk write happened (the confirm rewrite) — the fix
@@ -770,7 +821,7 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
         log: () => {},
       });
     }
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "wk:group:g1", chatId: "-100123", messageId: 715 },
     ]);
   });
@@ -784,7 +835,7 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
  * row while a flood-delayed open-pin lands, leaving a stuck pin with no row.
  *
  * These tests exercise the REAL fix primitives — `withPinReconcileLock` +
- * `reconcileAndPersistStatusPin` + `reconcilePin` + `decidePinAction` — composed
+ * `reconcileAndPersistStatusPin` + `executePinLeg` + `decidePinAction` — composed
  * exactly as the gateway wires them (read prev INSIDE the per-key lock), and
  * prove the row survives. The `noLock` control models the pre-fix ordering
  * (prev read OUTSIDE the lock) and shows it regresses — so the lock, not luck,
@@ -793,11 +844,11 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
 describe("status-pin-store — F2 per-key reconcile serialization", () => {
   // A gateway-faithful reconcile: an in-memory claim map (the `prev` source read
   // at the TOP of the reconcile), the real decide→op mapping, and
-  // reconcileAndPersistStatusPin driving reconcilePin against a call-counting
+  // reconcileAndPersistStatusPin driving executePinLeg against a call-counting
   // pin API. An optional gate lets a test hold ONE reconcile's applyPin open to
   // force the exact interleave. `serialize` toggles the F2 fix.
   function makeReconciler(fs: StatusPinStoreFsSeam, opts: { serialize: boolean }) {
-    const claims = new Map<string, PinState>();
+    const claims = new Map<string, StatusPinClaim>();
     const pinCalls: number[] = [];
     const unpinCalls: number[] = [];
     const api: PinBotApi = {
@@ -808,8 +859,6 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
         unpinCalls.push(id);
       },
     };
-    const chatIds = new Map<string, string>();
-    const pinnedAt = new Map<string, number>();
     // Drives the REAL production orchestrator the gateway calls, so the persist
     // ordering and the RETARGET two-leg expansion under test are the shipped
     // ones — not a copy that could drift out from under this suite.
@@ -817,14 +866,14 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
       return runStatusPinReconcile({
         pinKey,
         chatId,
-        prev: claims.get(pinKey) ?? null, // read BEFORE the store op (the F2 window)
+        prev: prevOf(claims, pinKey), // read BEFORE the store op (the F2 window)
         desired,
         persist: { path: PATH, fs },
-        runPin: async (from, want) => {
+        runPin: async (action, from) => {
           if (gate) await gate; // hold the pin open inside the store lock
-          return reconcilePin({ api, chatId, prevState: from, desired: want });
+          return executePinLeg({ api, chatId, prevState: from, action });
         },
-        registries: { state: claims, chatIds, pinnedAt },
+        claims,
       });
     }
     function reconcile(
@@ -872,7 +921,7 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
     // and claim together. The Telegram pin is cleaned up — nothing stuck.
     expect(pinCalls).toEqual([900]); // A pinned it
     expect(unpinCalls).toEqual([900]); // B unpinned it (the fix)
-    expect(rows).toEqual([]);
+    expect(idOnly(rows)).toEqual([]);
     expect(claims.get("fg:c:3") ?? null).toBeNull();
   });
 
@@ -886,7 +935,7 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
     // issued → stuck until a boot cleanup that can no longer see it.
     expect(pinCalls).toEqual([900]); // message 900 WAS pinned
     expect(unpinCalls).toEqual([]); // …but never unpinned (no-op clear on prev=null)
-    expect(rows).toEqual([]); // …and the durable row is gone → unreapable
+    expect(idOnly(rows)).toEqual([]); // …and the durable row is gone → unreapable
   });
 
   it("serialized steady-state noop reconciles add ZERO pin/unpin API calls (finn-flood guard)", async () => {
@@ -898,7 +947,7 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
     expect(r.unpinCalls).toEqual([]);
 
     // 20 steady-state edits — each a re-pin of the SAME id → decidePinAction
-    // noop → reconcilePin issues NO Telegram call. The serialization + F1
+    // noop → executePinLeg issues NO Telegram call. The serialization + F1
     // row-preservation must not add a single pin/unpin API call.
     for (let i = 0; i < 20; i++) {
       await r.reconcile("wk:group:g1", "-100123", { pinned: true, messageId: 900 });
@@ -906,7 +955,7 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
     expect(r.pinCalls).toEqual([900]); // still exactly one pin, ever
     expect(r.unpinCalls).toEqual([]); // never unpinned
     // The durable row is intact throughout (F1).
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "wk:group:g1", chatId: "-100123", messageId: 900 },
     ]);
   });
@@ -924,7 +973,7 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
 
     await r.reconcile("fg:c:7", "-100123", { pinned: true, messageId: 900 });
     expect(r.pinCalls).toEqual([900]);
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:7", chatId: "-100123", messageId: 900 },
     ]);
 
@@ -933,10 +982,10 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
 
     expect(r.unpinCalls).toEqual([900]); // stale card unpinned
     expect(r.pinCalls).toEqual([900, 901]); // …AND the new card pinned
-    expect(r.claims.get("fg:c:7")).toEqual({ messageId: 901 });
+    expect(r.claims.get("fg:c:7")?.messageId).toBe(901);
     // The durable row tracks the message that is genuinely pinned, so the
     // mid-session reaper and the boot sweep can both still reach it.
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:7", chatId: "-100123", messageId: 901 },
     ]);
   });
@@ -946,7 +995,7 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
     // still pinned, so we must NOT pin the new one and must NOT lose the row —
     // otherwise the chat holds a pin nothing on disk names.
     const { fs } = memFs();
-    const claims = new Map<string, PinState>();
+    const claims = new Map<string, StatusPinClaim>();
     const pinCalls: number[] = [];
     const unpinCalls: number[] = [];
     let floodTheUnpin = false;
@@ -963,12 +1012,12 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
       runStatusPinReconcile({
         pinKey: "fg:c:8",
         chatId: "-100123",
-        prev: claims.get("fg:c:8") ?? null,
+        prev: prevOf(claims, "fg:c:8"),
         desired,
         persist: { path: PATH, fs },
-        runPin: (from, want) =>
-          reconcilePin({ api, chatId: "-100123", prevState: from, desired: want }),
-        registries: { state: claims, chatIds: new Map(), pinnedAt: new Map() },
+        runPin: (action, from) =>
+          executePinLeg({ api, chatId: "-100123", prevState: from, action }),
+        claims,
       });
 
     await reconcile({ pinned: true, messageId: 900 });
@@ -977,8 +1026,8 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
 
     expect(unpinCalls).toEqual([900]); // attempted…
     expect(pinCalls).toEqual([900]); // …and the pin leg was correctly SKIPPED
-    expect(claims.get("fg:c:8")).toEqual({ messageId: 900 }); // claim retained
-    expect(loadStatusPins(PATH, fs)).toEqual([
+    expect(claims.get("fg:c:8")?.messageId).toBe(900); // claim retained
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
       { pinKey: "fg:c:8", chatId: "-100123", messageId: 900 },
     ]);
   });

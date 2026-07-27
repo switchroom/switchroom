@@ -1,11 +1,23 @@
 /**
- * Status-pin driver — executes a PinAction against a Telegram Bot API.
+ * Status-pin driver — executes ONE already-decided `PinLegAction` against a
+ * Telegram Bot API.
  *
- * The pure decision lives in `status-pin.ts` (decidePinAction). This
- * module is the side-effecting half: takes the previously-claimed state
- * and the desired state, computes ONE action, executes it, and returns
- * the next state. The state itself stays in the caller (the gateway holds
- * a `Map<pinKey, PinState>` and re-passes the entry on every call).
+ * The pure decision lives in `status-pin.ts` (`decidePinAction`) and is taken
+ * exactly ONCE per leg, by the orchestrator (`gateway/status-pin-retarget.ts`).
+ * This module is the side-effecting half only: it is HANDED a leg action,
+ * executes it, and returns the next claim. The state itself stays in the caller
+ * (the gateway holds a `Map<pinKey, StatusPinClaim>` and re-passes the entry on
+ * every call).
+ *
+ * #3831 — why this takes an ACTION and not a `desired` state. It used to take
+ * `(prevState, desired)` and re-run `decidePinAction` itself, which meant one
+ * reconcile decided the same transition up to THREE times (orchestrator leg
+ * split → persist-op mapping → driver) and, worse, gave the driver a `repin`
+ * branch to implement. That branch expanded the retarget a SECOND time, with no
+ * per-leg persistence, and was unreachable from the gateway — a dead fork that
+ * a future caller wiring `reconcilePin` directly would have silently inherited.
+ * The parameter type is now `PinLegAction`, which cannot express `repin`, so
+ * the expansion exists in one place and cannot re-fork.
  *
  * Copied from `slot-banner-driver.ts`. The load-bearing contract (see
  * slot-banner-driver.ts:100-110):
@@ -36,8 +48,8 @@
  * job spec.
  */
 
-import type { PinState, DesiredPin, PinRightsCache } from './status-pin.js'
-import { decidePinAction, isPinRightsError, isUnpinTerminalError } from './status-pin.js'
+import type { PinState, PinLegAction, PinRightsCache } from './status-pin.js'
+import { isPinRightsError, isUnpinTerminalError } from './status-pin.js'
 
 /** Minimal subset of grammy's `bot.api` the pin driver depends on.
  *  Lets tests swap in a fake without dragging in the full Bot type. */
@@ -53,13 +65,13 @@ export interface PinBotApi {
   ): Promise<unknown>
 }
 
-export interface ReconcilePinArgs {
+export interface ExecutePinLegArgs {
   api: PinBotApi
   chatId: string
   /** State the caller is holding from the last reconcile. `null` on first. */
   prevState: PinState | null
-  /** What the caller wants pinned for this key right now. */
-  desired: DesiredPin
+  /** The single transition to execute, decided by the orchestrator. */
+  action: PinLegAction
   /** Optional API-failure observer. Default: silent. */
   onError?: (phase: 'pin' | 'unpin', err: unknown) => void
   /** Optional per-process rights-aware negative cache (issue #3024). When a
@@ -75,9 +87,9 @@ export interface ReconcilePinArgs {
 }
 
 /**
- * Execute the next pin-state transition for one key. Returns the new
- * `PinState` (or `null` when unpinned / nothing pinned). Always resolves;
- * never throws — API errors route through `onError`.
+ * Execute ONE decided pin transition for a key. Returns the new `PinState`
+ * (or `null` when unpinned / nothing pinned). Always resolves; never throws —
+ * API errors route through `onError`.
  *
  *   - `pin`  : pins the existing message SILENTLY; on failure the claim is
  *              NOT taken (returns prevState) so the next reconcile retries
@@ -86,42 +98,18 @@ export interface ReconcilePinArgs {
  *              success and on a TERMINAL failure (never leave state stuck
  *              pinned). A never-confirmed failure returns prevState so the
  *              still-pinned message keeps a record to retry from (#3664).
- *   - `repin`: the wanted message CHANGED — unpins the stale claim then pins
- *              the new message, both in this one call, returning the new
- *              claim. A never-confirmed unpin aborts the pin leg and retains
- *              the old claim (the old message is still up and must keep a
- *              record). Single-shot callers depend on this: they never
- *              reconcile the key a second time.
  *   - `noop` : returns prevState unchanged.
+ *
+ * A RETARGET is NOT executable here by construction — `PinLegAction` has no
+ * `repin` member. `runStatusPinReconcile` splits it into an unpin leg and a pin
+ * leg, each persisted, and owns the abort rule (#3831).
  */
-export async function reconcilePin(
-  args: ReconcilePinArgs,
+export async function executePinLeg(
+  args: ExecutePinLegArgs,
 ): Promise<PinState | null> {
-  const action = decidePinAction(args.prevState, args.desired)
+  const { action } = args
 
   if (action.kind === 'noop') return args.prevState
-
-  if (action.kind === 'repin') {
-    // RETARGET: unpin the stale claim, then pin the new message — BOTH legs in
-    // this one call. Callers that reconcile a key exactly once (the foreground
-    // activity card) have no "next reconcile" to finish the job, so splitting
-    // it left nothing pinned. See the `repin` docblock in status-pin.ts.
-    const afterUnpin = await reconcilePin({
-      ...args,
-      desired: { pinned: false },
-    })
-    // A non-null result here means the unpin was NEVER CONFIRMED (#3664
-    // Defect B): the old message is provably still pinned and the claim was
-    // deliberately retained. Pinning the new one now would leave two pins with
-    // a record of only one. Keep the retained claim and let the next reconcile
-    // / the mid-session reaper / the boot sweep retry.
-    if (afterUnpin != null) return afterUnpin
-    return reconcilePin({
-      ...args,
-      prevState: null,
-      desired: { pinned: true, messageId: action.pinMessageId },
-    })
-  }
 
   if (action.kind === 'unpin') {
     // Skip the unpin API call in a chat the bot can't manage pins in — the

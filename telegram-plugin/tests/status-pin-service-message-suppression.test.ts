@@ -43,13 +43,17 @@ describe('status-pin service-message suppression', () => {
     // message (which would nuke manual/operator pins too) — AND it must be
     // chat-scoped (pinnedMessageIsOurs requires chatId + messageId), never a
     // messageId-only match.
-    expect(MODULE_SRC).toContain('deps.statusPinState')
+    expect(MODULE_SRC).toContain('deps.statusPinClaims')
     expect(MODULE_SRC).toMatch(/pinned_message\?\.message_id/)
     expect(MODULE_SRC).toContain('pinnedMessageIsOurs(')
     // The chatId computed from the update must be fed to the guard.
     expect(MODULE_SRC).toMatch(/pinnedMessageIsOurs\(trackedPins\(\), chatId, pinnedId\)/)
-    // And the tracked entries must carry their chat association.
-    expect(MODULE_SRC).toContain('deps.statusPinChatIds.get(pinKey)')
+    // And the tracked entries must carry their chat association. Since #3809
+    // that association is STRUCTURAL — one claim record per key carrying both
+    // messageId and chatId — so the guard reads it off the claim itself and a
+    // chat-less tracked pin can no longer be constructed.
+    expect(MODULE_SRC).toMatch(/chatId: c\.chatId/)
+    expect(MODULE_SRC).toMatch(/messageId: c\.messageId/)
   })
 
   it('bails out when the pinned message is not one of ours', () => {

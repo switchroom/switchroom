@@ -4,13 +4,22 @@ import {
   type WorkerActivityView,
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
-import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
-import { decidePinAction, type PinState, type DesiredPin } from '../status-pin.js'
+import { executePinLeg, type PinBotApi } from '../status-pin-driver.js'
+import type { PinState, DesiredPin } from '../status-pin.js'
 import {
-  reconcileAndPersistStatusPin,
   loadStatusPins,
+  type PersistedStatusPin,
   type StatusPinStoreFsSeam,
 } from '../gateway/status-pin-store.js'
+import {
+  runStatusPinReconcile,
+  type StatusPinClaim,
+} from '../gateway/status-pin-retarget.js'
+
+/** Drop the #3810 claim-age stamp so a row's identity can be compared literally. */
+function idOnly(rows: PersistedStatusPin[]): Omit<PersistedStatusPin, 'pinnedAt'>[] {
+  return rows.map(({ pinnedAt: _age, ...rest }) => rest)
+}
 
 /**
  * Outcome tests for the invisible-worker-cards fix (2026-07-15).
@@ -21,9 +30,10 @@ import {
  * the pin was lost out-of-band (its in-memory claim dropped), the reused message
  * kept being edited live but was never re-pinned → scroll-buried / invisible.
  *
- * These tests wire the feed's `reconcilePin` hook into the REAL status-pin
- * driver + a claim map exactly as the gateway does (`wk:group:<feedKey>` key,
- * `void reconcileStatusPin`), and assert the PIN-CALL OUTCOMES:
+ * These tests wire the feed's `reconcilePin` hook into the REAL unified reconcile
+ * path (`runStatusPinReconcile` over `executePinLeg`) + a claim map exactly as
+ * the gateway does (`wk:group:<feedKey>` key, `void reconcileStatusPin`), and
+ * assert the PIN-CALL OUTCOMES:
  *   1. a steady-state edit re-pins when the claim was lost — and does NOT re-pin
  *      (no storm) when the claim is already correct.
  *   2. routing an unpin through the reconciler CLEARS the claim, so a later edit
@@ -68,13 +78,13 @@ function makeFakeBot(): FakeBot {
 }
 
 /**
- * Mirror the gateway's status-pin reconcile: a `Map<key,PinState>` claim store
- * driven through the real `reconcilePin` driver against a fake pin API that
- * records every pin/unpin call. This is the seam that turns a `reconcilePin`
- * hook call into an observable Telegram pin/unpin — proving OUTCOMES, not paths.
+ * Mirror the gateway's status-pin reconcile: ONE claim registry driven through
+ * the real orchestrator + driver against a fake pin API that records every
+ * pin/unpin call. This is the seam that turns a `reconcilePin` hook call into an
+ * observable Telegram pin/unpin — proving OUTCOMES, not paths.
  */
 function makePinHarness() {
-  const state = new Map<string, PinState>()
+  const claims = new Map<string, StatusPinClaim>()
   const pinCalls: number[] = []
   const unpinCalls: number[] = []
   let lastKey: string | null = null
@@ -87,10 +97,16 @@ function makePinHarness() {
     },
   }
   async function reconcile(key: string, chatId: string, desired: DesiredPin): Promise<void> {
-    const prev = state.get(key) ?? null
-    const next = await reconcilePin({ api, chatId, prevState: prev, desired })
-    if (next == null) state.delete(key)
-    else state.set(key, next)
+    const claim = claims.get(key)
+    await runStatusPinReconcile({
+      pinKey: key,
+      chatId,
+      prev: claim == null ? null : { messageId: claim.messageId },
+      desired,
+      persist: null,
+      runPin: (action, from) => executePinLeg({ api, chatId, prevState: from, action }),
+      claims,
+    })
   }
   const reconcilePinFn = (args: {
     feedKey: string
@@ -104,7 +120,8 @@ function makePinHarness() {
     else void reconcile(key, args.chatId, { pinned: false })
   }
   return {
-    state,
+    claims,
+    reconcile,
     pinCalls,
     unpinCalls,
     reconcilePinFn,
@@ -114,7 +131,7 @@ function makePinHarness() {
     },
     /** Directly drop the claim to simulate a pin lost out-of-band. */
     dropClaim(): void {
-      state.clear()
+      claims.clear()
     },
   }
 }
@@ -147,14 +164,15 @@ function memFs(): { fs: StatusPinStoreFsSeam; files: Map<string, string> } {
 
 /**
  * A pin harness that routes the feed's `reconcilePin` hook through the REAL
- * persistence path (`reconcileAndPersistStatusPin`) against a memFs-backed
- * status-pins.json — exactly as the gateway wires it: read prev claim → decide
- * → map to a persist op → reconcileAndPersistStatusPin(applyPin=reconcilePin).
- * This lets a test INSPECT THE FILE across steady-state edits (F1).
+ * persistence path against a memFs-backed status-pins.json — exactly as the
+ * gateway wires it: read prev claim → runStatusPinReconcile (which decides ONCE,
+ * maps each leg to a persist op, and drives executePinLeg through
+ * reconcileAndPersistStatusPin). This lets a test INSPECT THE FILE across
+ * steady-state edits (F1).
  */
 function makePersistingPinHarness(path: string) {
   const { fs } = memFs()
-  const claims = new Map<string, PinState>()
+  const claims = new Map<string, StatusPinClaim>()
   const pinCalls: number[] = []
   const unpinCalls: number[] = []
   const api: PinBotApi = {
@@ -166,22 +184,16 @@ function makePersistingPinHarness(path: string) {
     },
   }
   async function reconcile(key: string, chatId: string, desired: DesiredPin): Promise<void> {
-    const prev = claims.get(key) ?? null
-    const action = decidePinAction(prev, desired)
-    const op = action.kind === 'pin'
-      ? ({ kind: 'pin', messageId: action.messageId } as const)
-      : ({ kind: 'clear' } as const)
-    const next = await reconcileAndPersistStatusPin({
-      path,
-      fs,
+    const claim = claims.get(key)
+    await runStatusPinReconcile({
       pinKey: key,
       chatId,
-      op,
-      applyPin: () => reconcilePin({ api, chatId, prevState: prev, desired }),
-      log: () => {},
+      prev: claim == null ? null : { messageId: claim.messageId },
+      desired,
+      persist: { path, fs },
+      runPin: (action, from) => executePinLeg({ api, chatId, prevState: from, action }),
+      claims,
     })
-    if (next == null) claims.delete(key)
-    else claims.set(key, next)
   }
   const reconcilePinFn = (args: {
     feedKey: string
@@ -226,7 +238,7 @@ describe('worker-feed pin persistence — durable status-pins.json survives stea
     expect(pin.rows()).toHaveLength(1)
     const pinKey = pin.rows()[0].pinKey
     expect(pinKey).toMatch(/^wk:group:/)
-    expect(pin.rows()).toEqual([
+    expect(idOnly(pin.rows())).toEqual([
       { pinKey, chatId: 'chat', messageId: msgId },
     ])
 
@@ -241,7 +253,7 @@ describe('worker-feed pin persistence — durable status-pins.json survives stea
 
     // The durable row is STILL on disk (inspect the file), and no extra pin/
     // unpin API call was issued across all those steady-state edits.
-    expect(pin.rows()).toEqual([
+    expect(idOnly(pin.rows())).toEqual([
       { pinKey, chatId: 'chat', messageId: msgId },
     ])
     expect(pin.pinCalls).toEqual([msgId]) // exactly one pin, ever
@@ -269,7 +281,7 @@ describe('worker-feed pin persistence — steady-state re-pin (invisible-worker-
     expect(bot.sent).toHaveLength(1)
     const msgId = bot.sent[0].messageId
     expect(pin.pinCalls).toEqual([msgId])
-    expect(pin.state.get(pin.key())?.messageId).toBe(msgId)
+    expect(pin.claims.get(pin.key())?.messageId).toBe(msgId)
 
     // Steady-state edit while the pin is already correct → NO new pin (no storm).
     clock = 2000
@@ -284,7 +296,7 @@ describe('worker-feed pin persistence — steady-state re-pin (invisible-worker-
     await feed.update('w1', 'chat', view({ elapsedMs: 3000, toolCount: 9 }))
     await flush()
     expect(pin.pinCalls).toEqual([msgId, msgId]) // re-pinned the SAME live message
-    expect(pin.state.get(pin.key())?.messageId).toBe(msgId)
+    expect(pin.claims.get(pin.key())?.messageId).toBe(msgId)
   })
 })
 
@@ -306,27 +318,12 @@ describe('worker-feed pin persistence — unpin clears the claim', () => {
     await flush()
     const msgId = bot.sent[0].messageId
     const key = pin.key()
-    expect(pin.state.get(key)?.messageId).toBe(msgId)
+    expect(pin.claims.get(key)?.messageId).toBe(msgId)
 
     // Route an unpin of the worker message through the reconciler (the sanctioned
     // path): the claim is dropped AND the Telegram unpin is issued.
-    await (async () => {
-      const prev = pin.state.get(key) ?? null
-      const next = await reconcilePin({
-        api: {
-          pinChatMessage: async () => {},
-          unpinChatMessage: async (_c, id) => {
-            pin.unpinCalls.push(id)
-          },
-        },
-        chatId: 'chat',
-        prevState: prev,
-        desired: { pinned: false },
-      })
-      if (next == null) pin.state.delete(key)
-      else pin.state.set(key, next)
-    })()
-    expect(pin.state.has(key)).toBe(false) // claim cleared
+    await pin.reconcile(key, 'chat', { pinned: false })
+    expect(pin.claims.has(key)).toBe(false) // claim cleared
     expect(pin.unpinCalls).toContain(msgId)
 
     // A later steady edit now re-pins (the claim being clear is what lets
@@ -335,7 +332,7 @@ describe('worker-feed pin persistence — unpin clears the claim', () => {
     await feed.update('w1', 'chat', view({ elapsedMs: 2000, toolCount: 7 }))
     await flush()
     expect(pin.pinCalls).toContain(msgId)
-    expect(pin.state.get(key)?.messageId).toBe(msgId)
+    expect(pin.claims.get(key)?.messageId).toBe(msgId)
   })
 })
 
@@ -378,7 +375,7 @@ describe('worker-feed pin persistence — group-message lifetime cap rotation', 
     // re-established on the new id (deterministic, no burst: one unpin + one pin).
     expect(pin.unpinCalls).toContain(msgA)
     expect(pin.pinCalls).toContain(msgB)
-    expect(pin.state.get(pin.key())?.messageId).toBe(msgB)
+    expect(pin.claims.get(pin.key())?.messageId).toBe(msgB)
 
     // FIX 1: the retired message was collapsed to the honest "moved" note with
     // exactly ONE edit (not left frozen showing live rows, not re-edited per tick).

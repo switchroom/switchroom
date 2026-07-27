@@ -195,8 +195,8 @@ import {
   renderConsolidationLine,
 } from '../consolidation-legibility.js'
 import type { WebhookGatewayRecord } from '../../src/web/webhook-gateway-record.js'
-import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
-import type { PinState, DesiredPin } from '../status-pin.js'
+import { executePinLeg, type PinBotApi } from '../status-pin-driver.js'
+import type { PinState, DesiredPin, PinLegAction } from '../status-pin.js'
 import { PinRightsCache } from '../status-pin.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
@@ -637,7 +637,7 @@ import type { HostdRequest, HostdResponse } from '../../src/host-control/protoco
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import { createBootSweepGate, runBootPinSweepSteps } from './boot-sweep-gate.js'
-import { runStatusPinReconcile } from './status-pin-retarget.js'
+import { runStatusPinReconcile, type StatusPinClaim } from './status-pin-retarget.js'
 import { createPeriodicSweepGuard } from './periodic-sweep-guard.js'
 import { withDeadline } from './with-deadline.js'
 import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './status-pin-api.js'
@@ -691,6 +691,7 @@ import {
 } from './queued-card-store.js'
 import {
   decideWorkerPinReaps,
+  groupPinStatus,
   storeOnlyWorkerPinCandidates,
   WORKER_PIN_TTL_MS_DEFAULT,
 } from './worker-pin-reaper.js'
@@ -8524,19 +8525,18 @@ const PIN_STATUS_WHILE_WORKING = (() => {
 // It does NOT touch the reply / stream_reply send handlers (the v1 bug was send
 // handlers unconditionally unpinning on every send) and runs NO polling
 // watchdog / getChat().pinned_message reconciler.
-const statusPinState = new Map<string, PinState>()
+// ONE registry, keyed by pinKey → { messageId, chatId, pinnedAt } (#3809).
+// This was three parallel Maps (state / chatIds / pinnedAt), written on the
+// same commit but free to diverge; a `wk:` claim that lost its chatId entry was
+// skipped by the mid-session reaper on every pass AND excluded from the durable
+// store-orphan net, i.e. silently unreapable until the next boot. One record
+// makes the invariant structural — see StatusPinClaim in status-pin-retarget.ts.
+//
 // F2 serialization: same-pinKey reconciles run one-at-a-time via
 // `withPinReconcileLock` (status-pin-store.ts — kept there so it's
 // unit-testable) so each reads a fresh `prev`; see its doc for the stale-`prev`
 // race it closes. Adds zero Telegram API calls (a serialized noop still no-ops).
-// Companion registry: pinKey → chatId, so the pre-restart sweep can unpin
-// owned pins without threading the chat id through every call site. Written on
-// every desired-pinned reconcile, cleared alongside the state on unpin.
-const statusPinChatIds = new Map<string, string>()
-// Companion registry: pinKey → wall-clock ms the claim was FIRST taken (a
-// re-pin of the same key keeps the original timestamp). Feeds the TTL gate of
-// the mid-session `wk:` pin reaper (#3001); cleared alongside the state.
-const statusPinPinnedAt = new Map<string, number>()
+const statusPinClaims = new Map<string, StatusPinClaim>()
 // Rights-aware negative cache (#3024): chats where an auto status-pin attempt
 // failed with the permanent "not enough rights to manage pinned messages" 400.
 // Per-process only — a restart clears it so a later-granted pin right re-enables
@@ -8660,7 +8660,7 @@ const TOOL_PIN_TTL_MS = (() => {
 // mutation never rejects (persist is fail-open, load is fail-open).
 function persistBannerRow(row: PersistedStatusPin | null): void {
   if (!bannerPinPersistEnabled) return
-  void mutateStatusPinRow(
+  void mutateStatusPinRow( // allow-raw-pin-store: banner row bookkeeping — the slot banner has its own sanctioned driver; this only mirrors its outcome into the shared store file.
     STATUS_PIN_STORE_PATH,
     statusPinStoreFs,
     BANNER_PIN_KEY,
@@ -8700,7 +8700,7 @@ async function statusPinBootCleanup(): Promise<void> {
   const { cleared, retained, kept, total } = await runStatusPinBootCleanup({
     path: STATUS_PIN_STORE_PATH,
     fs: statusPinStoreFs,
-    unpin: (chatId, messageId) => api.unpinChatMessage(chatId, messageId),
+    unpin: (chatId, messageId) => api.unpinChatMessage(chatId, messageId), // allow-raw-pin: boot cleanup runs BEFORE any claim exists — it reconciles the durable rows themselves, so there is nothing to route through reconcileStatusPin.
   })
   if (total > 0) {
     process.stderr.write(
@@ -8763,7 +8763,7 @@ async function activityCardBootReaper(): Promise<void> {
       ),
     unpinCard: (record) =>
       robustApiCall(
-        () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
+        () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId), // allow-raw-pin: activity-card boot reaper — unpins a card recovered from the CARD store, which has no status-pin claim to reconcile through.
         {
           chat_id: record.chatId,
           ...(record.threadId != null ? { threadId: record.threadId } : {}),
@@ -8942,12 +8942,12 @@ async function runMidSessionCardReaper(): Promise<void> {
         // claim is tracked (e.g. claim already dropped out-of-band).
         unpinCard: async (record) => {
           const pinKey = `fg:${record.turnKey}`
-          if (statusPinState.has(pinKey)) {
+          if (statusPinClaims.has(pinKey)) {
             await reconcileStatusPin(pinKey, record.chatId, { pinned: false })
             return true
           }
           return robustApiCall(
-            () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
+            () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId), // allow-raw-pin: activity-card mid-session reaper — same as the boot reaper: a card-store record, not a status-pin claim.
             {
               chat_id: record.chatId,
               ...(record.threadId != null ? { threadId: record.threadId } : {}),
@@ -8975,17 +8975,12 @@ async function runMidSessionCardReaper(): Promise<void> {
   //    the durable store row clear together.
   if (WORKER_PIN_REAPER_ENABLED && PIN_STATUS_WHILE_WORKING) {
     try {
-      const inMemoryKeys = new Set(
-        [...statusPinState.keys()].filter((k) => k.startsWith('wk:')),
-      )
-      const inMemoryCandidates = [...inMemoryKeys].map((k) => ({
-        pinKey: k,
-        chatId: statusPinChatIds.get(k) ?? '',
-        // A missing timestamp (should not happen — set on every claim)
-        // degrades to "claimed just now": terminality can still reap it,
-        // the TTL gate never can. Conservative, never a spurious unpin.
-        pinnedAt: statusPinPinnedAt.get(k) ?? now,
-      }))
+      // One record per claim (#3809): chatId and pinnedAt are fields of the
+      // claim, so neither can go missing and strand the key as unreapable.
+      const inMemoryCandidates = [...statusPinClaims.entries()]
+        .filter(([k]) => k.startsWith('wk:'))
+        .map(([pinKey, claim]) => ({ pinKey, chatId: claim.chatId, pinnedAt: claim.pinnedAt }))
+      const inMemoryKeys = new Set(inMemoryCandidates.map((c) => c.pinKey))
       // #3001 durable group net: fold in `wk:` rows that live in the DURABLE
       // store but have NO in-memory claim — the divergence window where the
       // claim was lost but the Telegram pin + store row survive. These would
@@ -9012,8 +9007,11 @@ async function runMidSessionCardReaper(): Promise<void> {
           // missed unpin → 'terminal' (reap now). The feed's own group-empty
           // unpin is the primary path; this is the missed-unpin backstop.
           if (agentId.startsWith('group:')) {
-            const feedKey = agentId.slice('group:'.length)
-            return workerActivityFeed?.hasRunningInFeed(feedKey) ? 'running' : 'terminal'
+            // groupPinStatus distinguishes "no feed to ask" (→ 'unknown', TTL
+            // only) from "the feed says this group is done" (→ 'terminal',
+            // reap now). The `?.` shorthand conflated them and could unpin a
+            // LIVE group pin during a feed-null window (#3811).
+            return groupPinStatus(workerActivityFeed, agentId.slice('group:'.length))
           }
           if (turnsDb == null) return 'unknown'
           try {
@@ -9044,7 +9042,7 @@ async function runMidSessionCardReaper(): Promise<void> {
           // are best-effort/idempotent; a failed unpin still drops the row so
           // the next boot's cleanup is the final backstop.
           try {
-            await statusPinApi().unpinChatMessage(reap.chatId, reap.messageId)
+            await statusPinApi().unpinChatMessage(reap.chatId, reap.messageId) // allow-raw-pin: store-orphan reap — by definition there is NO in-memory claim, so this unpins the exact tracked message id (group-safe, never unpin-all).
           } catch (err) {
             process.stderr.write(
               `telegram gateway: worker-pin reaper store-orphan unpin failed ` +
@@ -9052,7 +9050,7 @@ async function runMidSessionCardReaper(): Promise<void> {
                 `${(err as Error).message}\n`,
             )
           }
-          await mutateStatusPinRow(
+          await mutateStatusPinRow( // allow-raw-pin-store: drops the row for the store orphan unpinned immediately above; there is no claim to reconcile.
             STATUS_PIN_STORE_PATH,
             statusPinStoreFs,
             reap.pinKey,
@@ -9142,14 +9140,15 @@ async function reconcileStatusPinInner(
   // settled — always the true current claim. Closes the stale-`prev` race (a
   // turn-end clear dropping the disk row under a flood-delayed open-pin) and the
   // older duplicate-pin concern (two edits both reading prev=null).
-  const prev = statusPinState.get(pinKey) ?? null
+  const claim = statusPinClaims.get(pinKey)
+  const prev: PinState | null = claim == null ? null : { messageId: claim.messageId }
 
-  const runReconcileFrom = (from: PinState | null, want: DesiredPin) =>
-    reconcilePin({
+  const runReconcileFrom = (action: PinLegAction, from: PinState | null) =>
+    executePinLeg({
       api: statusPinApi(),
       chatId,
       prevState: from,
-      desired: want,
+      action,
       rightsCache: statusPinRightsCache,
       onPinRightsDisabled: (chat) => {
         // Logged ONCE per chat per process (#3024). Every subsequent auto-pin
@@ -9179,11 +9178,7 @@ async function reconcileStatusPinInner(
       ? { path: STATUS_PIN_STORE_PATH, fs: statusPinStoreFs }
       : null,
     runPin: runReconcileFrom,
-    registries: {
-      state: statusPinState,
-      chatIds: statusPinChatIds,
-      pinnedAt: statusPinPinnedAt,
-    },
+    claims: statusPinClaims,
   })
 }
 
@@ -9200,14 +9195,10 @@ async function reconcileStatusPinInner(
  *  crash / interrupt never leaves a permanent pin behind. Best-effort;
  *  clears the claim regardless of the unpin outcome (drop-on-unpin). */
 async function unpinAllStatusPins(): Promise<void> {
-  const keys = [...statusPinState.keys()]
-  for (const key of keys) {
-    const st = statusPinState.get(key)
-    if (st == null) continue
-    // Recover the chat id from the state map's companion key registry.
-    const chatId = statusPinChatIds.get(key)
-    if (chatId == null) { statusPinState.delete(key); statusPinPinnedAt.delete(key); continue }
-    await reconcileStatusPin(key, chatId, { pinned: false })
+  // The chat id is a FIELD of the claim (#3809), so every claim is unpinnable —
+  // there is no "claim we know about but cannot address" branch to fall through.
+  for (const [key, claim] of [...statusPinClaims.entries()]) {
+    await reconcileStatusPin(key, claim.chatId, { pinned: false })
   }
 }
 
@@ -9226,14 +9217,14 @@ async function unpinAllStatusPins(): Promise<void> {
 let dmPinSweepEligible = false
 const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
   unpinAll: (chatId) =>
-    robustApiCall(() => lockedBot.api.unpinAllChatMessages(chatId), {
+    robustApiCall(() => lockedBot.api.unpinAllChatMessages(chatId), { // allow-raw-pin: DM-only boot sweep — clears pins this process cannot enumerate (pre-restart orphans) and immediately re-pins the live tracked ids below.
       chat_id: chatId,
       verb: 'dm-pin-sweep.unpin-all',
     }),
   pinSilent: (chatId, messageId) =>
     robustApiCall(
       () =>
-        lockedBot.api.pinChatMessage(chatId, messageId, {
+        lockedBot.api.pinChatMessage(chatId, messageId, { // allow-raw-pin: the re-pin half of the DM boot sweep — restores ids the sweep just cleared; the claims themselves are untouched.
           disable_notification: true,
         }),
       { chat_id: chatId, verb: 'dm-pin-sweep.repin' },
@@ -9248,8 +9239,8 @@ const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
   // degrades to in-memory-only. The sweeper dedupes.
   liveTrackedMessageIds: (chatId) => {
     const ids: number[] = []
-    for (const [key, st] of statusPinState.entries()) {
-      if (statusPinChatIds.get(key) === chatId) ids.push(st.messageId)
+    for (const claim of statusPinClaims.values()) {
+      if (claim.chatId === chatId) ids.push(claim.messageId)
     }
     if (statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled) {
       try {
@@ -13341,7 +13332,7 @@ async function executePinMessage(args: Record<string, unknown>): Promise<unknown
   // failure the agent should see.
   const pinMsgId = Number(args.message_id)
   await robustApiCall(
-    () => lockedBot.api.pinChatMessage(pinChatId, pinMsgId),
+    () => lockedBot.api.pinChatMessage(pinChatId, pinMsgId), // allow-raw-pin: MCP `pin_message` tool — an explicit, agent-requested pin of an arbitrary message, not a progress surface with a claim.
     { chat_id: pinChatId, verb: 'pin_message' },
   )
   // An explicit pin succeeded here, so the bot demonstrably HAS pin rights in
@@ -13358,7 +13349,7 @@ async function executePinMessage(args: Record<string, unknown>): Promise<unknown
   // failure must never fail the tool call the pin already landed for.
   if (toolPinPersistEnabled) {
     const toolPinKey = `tool:${pinChatId}:${pinMsgId}`
-    void mutateStatusPinRow(STATUS_PIN_STORE_PATH, statusPinStoreFs, toolPinKey, {
+    void mutateStatusPinRow(STATUS_PIN_STORE_PATH, statusPinStoreFs, toolPinKey, { // allow-raw-pin-store: records the TTL-scoped `tool:` row for the explicit pin above so the boot sweep can expire it.
       pinKey: toolPinKey,
       chatId: pinChatId,
       messageId: pinMsgId,
@@ -22349,8 +22340,7 @@ const voiceHandlerDeps: VoiceHandlerDeps = {
 // site (check-bot-api-wrapping stays satisfied — the raw call remains in
 // gateway.ts, already inside the retry policy).
 const pinnedMessageHandlerDeps: PinnedMessageHandlerDeps = {
-  statusPinState,
-  statusPinChatIds,
+  statusPinClaims,
   deleteServiceMessage: (chatId, serviceMsgId) =>
     robustApiCall(
       () => lockedBot.api.deleteMessage(chatId, serviceMsgId),
@@ -24058,7 +24048,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 if (messageId != null) {
                   void reconcileStatusPin(key, chatId, { pinned: true, messageId })
                 } else {
-                  const unpinChat = chatId || statusPinChatIds.get(key)
+                  const unpinChat = chatId || statusPinClaims.get(key)?.chatId
                   if (unpinChat != null && unpinChat.length > 0) {
                     void reconcileStatusPin(key, unpinChat, { pinned: false })
                   }

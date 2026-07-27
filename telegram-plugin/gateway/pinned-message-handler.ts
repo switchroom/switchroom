@@ -5,7 +5,7 @@
  * silent status-pin fires. The pin call passes `disable_notification: true`,
  * which kills the PUSH notification but NOT the in-chat service message — so we
  * delete that service message as it lands, but ONLY for pins we own (tracked in
- * `statusPinState`). Manual/operator pins are never silent and are never
+ * `statusPinClaims`). Manual/operator pins are never silent and are never
  * touched. Only silent status pins reach here as an OUR-pin match, so the
  * ownership check is the guard.
  *
@@ -21,13 +21,12 @@
 
 import type { Context, Filter } from 'grammy'
 import { pinnedMessageIsOurs, type TrackedStatusPin } from './status-pin-store.js'
-import type { PinState } from '../status-pin.js'
+import type { StatusPinClaim } from './status-pin-retarget.js'
 
 export interface PinnedMessageHandlerDeps {
-  /** Live pinKey→PinState registry of pins we own. */
-  statusPinState: ReadonlyMap<string, PinState>
-  /** Companion pinKey→chatId registry (chat-scoped ownership). */
-  statusPinChatIds: ReadonlyMap<string, string>
+  /** Live pinKey→claim registry of pins we own. ONE record per key (#3809):
+   *  the chat id is a field of the claim, not a parallel map that can diverge. */
+  statusPinClaims: ReadonlyMap<string, StatusPinClaim>
   /**
    * Delete the pin service message. Bound in gateway.ts through
    * `robustApiCall(() => lockedBot.api.deleteMessage(...))` so the raw Bot API
@@ -50,16 +49,13 @@ export async function handlePinnedMessage(
   // Chat-scoped ownership (see pinnedMessageIsOurs): the match requires BOTH
   // the messageId AND that the tracked entry lives in THIS chat, so a pin id
   // colliding across chats can't delete a foreign (e.g. operator-manual) pin
-  // notice. statusPinChatIds is the companion pinKey→chatId map written on
-  // every desired-pinned reconcile.
-  const trackedPins = (): TrackedStatusPin[] => {
-    const out: TrackedStatusPin[] = []
-    for (const [pinKey, state] of deps.statusPinState) {
-      const c = deps.statusPinChatIds.get(pinKey)
-      if (c != null) out.push({ chatId: c, messageId: state.messageId })
-    }
-    return out
-  }
+  // notice. Each claim carries its own chat id (#3809), so the match can never
+  // silently degrade to messageId-only because a companion map went missing.
+  const trackedPins = (): TrackedStatusPin[] =>
+    [...deps.statusPinClaims.values()].map((c) => ({
+      chatId: c.chatId,
+      messageId: c.messageId,
+    }))
   const isOurs = () => pinnedMessageIsOurs(trackedPins(), chatId, pinnedId)
 
   if (!isOurs()) {

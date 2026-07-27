@@ -38,7 +38,21 @@ export type DesiredPin =
   /** Work is done (or never opened a message); nothing should be pinned. */
   | { pinned: false }
 
-export type PinAction =
+/**
+ * A SINGLE, directly-executable pin transition — the only shape the driver
+ * (`status-pin-driver.ts`) can execute.
+ *
+ * The type is deliberately narrower than `PinAction`: it structurally EXCLUDES
+ * `repin`. That exclusion is the mechanism (#3831) that keeps the retarget
+ * expansion — "a repin is an unpin leg then a pin leg, and a never-confirmed
+ * unpin aborts the pin leg" — defined in exactly ONE place
+ * (`gateway/status-pin-retarget.ts`). It used to be written twice, once in the
+ * driver with no per-leg persistence and once in the orchestrator with it; the
+ * driver copy was unreachable in production and silently carried the weaker
+ * semantics. A driver that cannot NAME a repin cannot re-grow a second copy of
+ * it — the compiler enforces what a comment could not.
+ */
+export type PinLegAction =
   | { kind: 'noop'; reason: string }
   /** Pin an EXISTING message. Caller pins, then records the message_id
    *  back into PinState. No new message is sent — this pins a message the
@@ -48,6 +62,9 @@ export type PinAction =
    *  or a TERMINAL failure; a never-confirmed failure keeps the claim so the
    *  still-pinned message can be retried (`isUnpinTerminalError`, #3664). */
   | { kind: 'unpin'; messageId: number }
+
+export type PinAction =
+  | PinLegAction
   /**
    * RETARGET — the caller still wants something pinned for this key, but a
    * DIFFERENT message than the one we claim (the surface was re-posted: an

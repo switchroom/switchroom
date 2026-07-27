@@ -1,0 +1,25 @@
+# check-status-pin-single-path — SANCTIONED FILES
+#
+# Each non-comment line is `<repo-relative path> :: <why this file is allowed>`.
+# Adding a file here is a deliberate, reviewable act: it grants that file the
+# right to touch a raw pin surface that everything else must reach through the
+# unified path. Do not add a file because the lint is inconvenient — the whole
+# point of #3831 was that a SECOND implementation of this logic diverged
+# silently from the first.
+#
+# ── rule: raw-pin-api ─────────────────────────────────────────────────────
+# Files permitted to call `pinChatMessage` / `unpinChatMessage` /
+# `unpinAllChatMessages` on the Bot API without an inline marker.
+raw-pin-api :: telegram-plugin/gateway/status-pin-api.ts :: THE pin API surface — wraps the Bot API in the retry policy plus the assertLanded / assertBotReady invariants (#3664). Everything else drives Telegram through this.
+raw-pin-api :: telegram-plugin/status-pin-driver.ts :: THE status-pin executor — the single place a decided leg becomes a Telegram call, and the owner of the terminal-vs-never-confirmed claim semantics (#3664 Defect B) and the pin-rights negative cache (#3024).
+raw-pin-api :: telegram-plugin/slot-banner-driver.ts :: The slot-banner surface has its own driver with its own persistence and lifetime; it is a separate sanctioned owner, not a fork of the status-pin path. Its API seam is declared here (interface members, not calls).
+
+# ── rule: claim-store-write ───────────────────────────────────────────────
+# Files permitted to write status-pins.json directly.
+claim-store-write :: telegram-plugin/gateway/status-pin-store.ts :: THE durable claim store — owns the persist-BEFORE-pin ordering, the store lock, and the envelope version.
+
+# ── rule: single-wiring ───────────────────────────────────────────────────
+# Files permitted to compose the orchestrator + driver into a live subsystem.
+# Exactly one of these outside the modules themselves: a second composition is
+# a second pin subsystem, which is the #3831 class of bug.
+single-wiring :: telegram-plugin/gateway/gateway.ts :: THE gateway wiring — creates the one claim registry and binds runStatusPinReconcile to executePinLeg.
