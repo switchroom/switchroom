@@ -1,0 +1,211 @@
+
+===== CARD ===== Agent card — running
+🤖 **Agent**   
+_1m35s · 12 tools · 41.2k tok · opus 4.8_   
+~~_✓ Searching memory for card render paths_~~   
+~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
+~~_✓ Reading telegram-plugin/worker-activity-feed.ts_~~   
+~~_✓ Grepping for renderStatusCard callers_~~   
+**→ Drafting the inventory table**
+
+===== CARD ===== Agent card — final (turn complete)
+🤖 **Agent**   
+_done · 12 tools · 41.2k tok · 3m34s · opus 4.8_   
+~~_✓ Searching memory for card render paths_~~   
+~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
+~~_✓ Reading telegram-plugin/worker-activity-feed.ts_~~   
+~~_✓ Grepping for renderStatusCard callers_~~   
+~~_✓ Drafting the inventory table_~~   
+_✓ 17 steps_
+
+===== CARD ===== Agent card — steps only (no header)
+~~_✓ Searching memory for card render paths_~~   
+~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
+**→ Reading telegram-plugin/worker-activity-feed.ts**
+
+===== CARD ===== Agent card — with nested foreground sub-agent
+🤖 **Agent**   
+_1m35s · 12 tools · 41.2k tok · opus 4.8_   
+~~_✓ Searching memory for card render paths_~~   
+~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
+~~_✓ Reading telegram-plugin/worker-activity-feed.ts_~~   
+   ↳ ~~_Reading the repo conventions_~~   
+   ↳ ~~_Running the scoped test suite_~~   
+   ↳ **→ Summarising findings · 24s**
+
+===== CARD ===== Agent card — liveness early-open (no tools yet)
+🤖 **Agent**   
+_32s · 0 tools · opus 4.8_   
+**→ Working… · 32s**
+
+===== CARD ===== Agent card — liveness finalised
+🤖 **Agent**   
+_done · 0 tools · 1m28s · opus 4.8_   
+~~_✓ Working…_~~
+
+===== CARD ===== Agent card — post-answer background activity
+🤖 **Agent**   
+_2m10s · 3 tools · opus 4.8_   
+**→ Working in background… · 1m10s**
+
+===== CARD ===== Agent card — over-long steps (per-line clip)
+🤖 **Agent**   
+_1m35s · 12 tools · 41.2k tok · opus 4.8_   
+~~_✓ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…_~~   
+~~_✓ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…_~~   
+~~_✓ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…_~~   
+**→ Finally a short newest step**
+
+===== CARD ===== Worker card — just dispatched (no steps yet)
+🛠 **WORKER** · _Audit every card render path and de-indent the worker card_   
+_1s · 0 tools · 88.4k tok · opus 4.8_   
+_starting…_
+
+===== CARD ===== Worker card — single worker running
+🛠 **WORKER** · _Audit every card render path and de-indent the worker card_   
+_2m23s · 31 tools · 88.4k tok · opus 4.8_   
+~~_✓ Fetching origin and branching off main_~~   
+~~_✓ Reading telegram-plugin/status-no-truncate.ts_~~   
+~~_✓ Mapping renderStatusCard callers_~~   
+**→ Writing the preview harness · 18s**
+
+===== CARD ===== Worker card — done (with result recap)
+🛠 **WORKER** · _Audit every card render path and de-indent the worker card_   
+_done · 31 tools · 88.4k tok · 15m02s · opus 4.8_   
+~~_✓ Fetching origin and branching off main_~~   
+~~_✓ Reading telegram-plugin/status-no-truncate.ts_~~   
+~~_✓ Mapping renderStatusCard callers_~~   
+~~_✓ Writing the preview harness_~~   
+─────   
+✅ _Inventoried 14 card variants, found renderCombinedWorkerFeed forks the header + budget logic, and de-indented the worker card. PR #0000._
+
+===== CARD ===== Worker card — failed
+🛠 **WORKER** · _Audit every card render path and de-indent the worker card_   
+_failed · 31 tools · 88.4k tok · 1m01s · opus 4.8_   
+~~_✓ Fetching origin and branching off main_~~   
+~~_✓ Reading telegram-plugin/status-no-truncate.ts_~~   
+~~_✓ Mapping renderStatusCard callers_~~   
+~~_✓ Writing the preview harness_~~   
+─────   
+⚠️ _Scoped test run failed: 3 assertions in card-type-distinguishability.test.ts._
+
+===== CARD ===== Worker card — incomplete (killed / timed out)
+🛠 **WORKER** · _Audit every card render path and de-indent the worker card_   
+_incomplete · 31 tools · 88.4k tok · 30m05s · opus 4.8_   
+~~_✓ Fetching origin and branching off main_~~   
+~~_✓ Reading telegram-plugin/status-no-truncate.ts_~~   
+~~_✓ Mapping renderStatusCard callers_~~   
+~~_✓ Writing the preview harness_~~
+
+===== CARD ===== WORKERS card — 2 workers
+🛠 **WORKERS** · _2 running · oldest 2m15s · 21 tools · 60.0k tok_   
+**1. Audit every card render path** _· 1m15s · 7 tools · 20.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ audit step 1_~~   
+⠀⠀⠀~~_✓ audit step 2_~~   
+⠀⠀⠀~~_✓ audit step 3_~~   
+⠀⠀⠀~~_✓ audit step 4_~~   
+⠀⠀⠀**→ audit step 5**   
+**2. Fix the hindsight recall floor** _· 2m15s · 14 tools · 40.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ recall step 1_~~   
+⠀⠀⠀~~_✓ recall step 2_~~   
+⠀⠀⠀~~_✓ recall step 3_~~   
+⠀⠀⠀~~_✓ recall step 4_~~   
+⠀⠀⠀**→ recall step 5**
+
+===== CARD ===== WORKERS card — 4 workers
+🛠 **WORKERS** · _4 running · oldest 4m15s · 70 tools · 200.0k tok_   
+**1. Audit every card render path** _· 1m15s · 7 tools · 20.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ audit step 2_~~   
+⠀⠀⠀~~_✓ audit step 3_~~   
+⠀⠀⠀**→ audit step 4**   
+**2. Fix the hindsight recall floor** _· 2m15s · 14 tools · 40.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ recall step 2_~~   
+⠀⠀⠀~~_✓ recall step 3_~~   
+⠀⠀⠀**→ recall step 4**   
+**3. Release v0.19.24** _· 3m15s · 21 tools · 60.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ release step 2_~~   
+⠀⠀⠀~~_✓ release step 3_~~   
+⠀⠀⠀**→ release step 4**   
+**4. Investigate the flaky UAT scenario** _· 4m15s · 28 tools · 80.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ uat step 2_~~   
+⠀⠀⠀~~_✓ uat step 3_~~   
+⠀⠀⠀**→ uat step 4**
+
+===== CARD ===== WORKERS card — 8 workers (spill)
+🛠 **WORKERS** · _8 running · oldest 8m15s · 252 tools · 720.0k tok_   
+**1. Background task number 1** _· 1m15s · 7 tools · 20.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ t1 step 1_~~   
+⠀⠀⠀~~_✓ t1 step 2_~~   
+⠀⠀⠀**→ t1 step 3**   
+**2. Background task number 2** _· 2m15s · 14 tools · 40.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ t2 step 1_~~   
+⠀⠀⠀~~_✓ t2 step 2_~~   
+⠀⠀⠀**→ t2 step 3**   
+**3. Background task number 3** _· 3m15s · 21 tools · 60.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ t3 step 1_~~   
+⠀⠀⠀~~_✓ t3 step 2_~~   
+⠀⠀⠀**→ t3 step 3**   
+**4. Background task number 4** _· 4m15s · 28 tools · 80.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ t4 step 1_~~   
+⠀⠀⠀~~_✓ t4 step 2_~~   
+⠀⠀⠀**→ t4 step 3**   
+**5. Background task number 5** _· 5m15s · 35 tools · 100.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ t5 step 1_~~   
+⠀⠀⠀~~_✓ t5 step 2_~~   
+⠀⠀⠀**→ t5 step 3**   
+**6. Background task number 6** _· 6m15s · 42 tools · 120.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ t6 step 1_~~   
+⠀⠀⠀~~_✓ t6 step 2_~~   
+⠀⠀⠀**→ t6 step 3**   
+_+2 more working…_
+
+===== CARD ===== WORKERS card — survivors keep their ordinals
+🛠 **WORKERS** · _2 running · oldest 3m15s · 35 tools · 100.0k tok_   
+**2. Fix the hindsight recall floor** _· 2m15s · 14 tools · 40.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ recall step 1_~~   
+⠀⠀⠀~~_✓ recall step 2_~~   
+⠀⠀⠀~~_✓ recall step 3_~~   
+⠀⠀⠀**→ recall step 4**   
+**3. Release v0.19.24** _· 3m15s · 21 tools · 60.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ release step 1_~~   
+⠀⠀⠀~~_✓ release step 2_~~   
+⠀⠀⠀~~_✓ release step 3_~~   
+⠀⠀⠀**→ release step 4**
+
+===== CARD ===== WORKERS card — a worker with no history yet
+🛠 **WORKERS** · _2 running · oldest 2m15s · 21 tools · 60.0k tok_   
+**1. Audit every card render path** _· 1m15s · 7 tools · 20.0k tok · opus 4.8_   
+⠀⠀⠀~~_✓ audit step 1_~~   
+⠀⠀⠀~~_✓ audit step 2_~~   
+⠀⠀⠀~~_✓ audit step 3_~~   
+⠀⠀⠀~~_✓ audit step 4_~~   
+⠀⠀⠀**→ audit step 5**   
+**2. Freshly dispatched worker** _· 2m15s · 14 tools · 40.0k tok · opus 4.8_   
+⠀⠀⠀→ _starting…_
+
+===== CARD ===== Worker card — superseded (group message rotated)
+🛠 **WORKER** · _continued_
+
+_Live progress moved to a fresh card to stay pinned._
+
+===== CARD ===== Agent card — rolling-window overflow
+🤖 **Agent**   
+_1m35s · 12 tools · 41.2k tok · opus 4.8_   
+_✓ +9 earlier…_   
+~~_✓ Doing thing number 10_~~   
+~~_✓ Doing thing number 11_~~   
+~~_✓ Doing thing number 12_~~   
+~~_✓ Doing thing number 13_~~   
+**→ Doing thing number 14**
+
+===== CARD ===== Agent card — nested sub-agent with child overflow
+🤖 **Agent**   
+_1m35s · 12 tools · 41.2k tok · opus 4.8_   
+~~_✓ Searching memory for card render paths_~~   
+~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
+   ↳ _+6 earlier…_   
+   ↳ ~~_Child step 7_~~   
+   ↳ ~~_Child step 8_~~   
+   ↳ ~~_Child step 9_~~   
+   ↳ ~~_Child step 10_~~   
+   ↳ **→ Child step 11**
