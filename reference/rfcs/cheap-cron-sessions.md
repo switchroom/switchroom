@@ -12,6 +12,12 @@ status: Draft, post-review (rev 2)
 **Targets:** `upstream/main` @ v0.14.91
 **Compliance pillar touched:** 3 (Claude-native, subscription-honest), preserved by construction; see §7.
 
+> **Model ids below are as-of-writing (v0.14.91).** `claude-sonnet-4-6` was the
+> then-current `SWITCHROOM_DEFAULT_MAIN_MODEL`; it is `claude-sonnet-5` today
+> (`src/agents/scaffold.ts`). The ids are left unrewritten so the record stays
+> an accurate snapshot — read them as "the default cheap model", not as a
+> current pin.
+
 ---
 
 ## Review verdict (5-lens adversarial, rev 1 → rev 2)
