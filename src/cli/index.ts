@@ -47,6 +47,7 @@ import { registerWebdCommand } from "./webd.js";
 import { registerHostCommand } from "./host-repair.js";
 import { registerFleetHealthCommand } from "./fleet-health.js";
 import { registerHindsightWatchCommand } from "./hindsight-watch.js";
+import { registerOpenRouterWatchCommand } from "./openrouter-watch.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -121,3 +122,4 @@ registerWebdCommand(program);
 registerHostCommand(program);
 registerFleetHealthCommand(program);
 registerHindsightWatchCommand(program);
+registerOpenRouterWatchCommand(program);

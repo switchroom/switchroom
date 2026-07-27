@@ -52,6 +52,7 @@ import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runWebkiteChecks } from "./doctor-webkite.js";
+import { runOpenRouterCreditChecks, usesOpenRouter } from "./doctor-openrouter-credit.js";
 import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runFloodPressureChecks } from "./doctor-flood-pressure.js";
 import { runGeneratedSurfaceDriftChecks } from "./doctor-drift.js";
@@ -79,6 +80,27 @@ import { runClaudeCliVersionChecks } from "./doctor-claude-cli.js";
  * `CheckStatus` + `statusGlyph` live in ./doctor-status.ts (imported
  * above) so the 9 doctor modules share one definition.
  */
+/**
+ * Read the repo/host LiteLLM proxy config text, or null when there is none.
+ * Text, not YAML — the caller only substring-matches, so a partially-valid
+ * file still answers the question.
+ */
+function readLitellmConfigText(): string | null {
+  const candidates = [
+    process.env.LITELLM_CONFIG_PATH,
+    "/data/coolify/services/litellm/litellm-config.yaml",
+    join(process.cwd(), "docker", "litellm-proxy", "litellm-config.yaml"),
+  ].filter((p): p is string => typeof p === "string" && p.length > 0);
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) return readFileSync(p, "utf-8");
+    } catch {
+      // unreadable — try the next candidate
+    }
+  }
+  return null;
+}
+
 export interface CheckResult {
   name: string;
   status: CheckStatus;
@@ -3767,6 +3789,32 @@ export function registerDoctorCommand(program: Command): void {
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
           { title: "Webkite", results: runWebkiteChecks(config) },
+          {
+            // Proactive half of the OpenRouter credit work (#3868 is the
+            // reactive half). NOTE: this reports WARN — not a green tick —
+            // when the key has no per-key credit limit, because GET
+            // /api/v1/key then returns nulls and carries no account-balance
+            // field, so there is genuinely nothing to threshold. A monitor
+            // that passes when it cannot see manufactures confidence.
+            title: "OpenRouter Credit",
+            results: await runOpenRouterCreditChecks({
+              enabled: usesOpenRouter(readLitellmConfigText()),
+              readSecret: async (key) => {
+                try {
+                  const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+                  const result = await getViaBrokerStructured(key);
+                  if (result.kind === "ok" && result.entry.kind === "string") {
+                    return result.entry.value;
+                  }
+                  return null;
+                } catch {
+                  return null;
+                }
+              },
+              fetchFn: (url, init) =>
+                fetch(url, { headers: init?.headers, signal: init?.signal ?? AbortSignal.timeout(10_000) }),
+            }),
+          },
           // #2307 Tier-1: cron-session bridge liveness. Empty (no results) for
           // the fleet today — only agents the value-gate routes to a cron
           // session produce a line.
