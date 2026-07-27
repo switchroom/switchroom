@@ -1,11 +1,11 @@
 {
  "_meta": {
-  "captured_from": "http://127.0.0.1:18888/mcp/",
+  "captured_from": "docker run <pinned digest>: hindsight_api.api.mcp.create_mcp_server(multi_bank=True) registration surface",
   "server": "switchroom-hindsight",
   "captured_at": "2026-07-27",
-  "hindsight_api_version": "0.8.4",
+  "hindsight_api_version": "0.8.5",
   "count": 32,
-  "note": "Verbatim live tools/list capture from the running hindsight backend (api_version 0.8.4 per GET /version), which is the version docker/Dockerfile.hindsight pins. NOT forward-patched: an earlier revision of this file described the 0.8.5 surface while the fleet ran 0.8.4, which made src/cli/hindsight-mcp-shim.ts's cold-boot fallback advertise three props the server does not accept (list_memories.tags, list_memories.tags_match, create_mental_model.tags_match). Hindsight drops an unknown argument SILENTLY (isError:false), so an agent issuing a tag-filtered list_memories on 0.8.4 gets the UNFILTERED list back and believes it was filtered — a silent wrong answer, which is exactly what this snapshot exists to prevent. The 0.8.5 delta is known and additive (those same three props; no tools added or removed, both wheels register 32) — re-capture this file against 0.8.5 and bump _meta.hindsight_api_version when #3768 bumps the image pin."
+  "note": "Captured in-image from the exact digest docker/Dockerfile.hindsight pins, by building the FastMCP server the backend builds (create_mcp_server(memory, multi_bank=True)) and dumping each tool's JSON-schema required/properties. Cross-validated: the identical derivation run against the PREVIOUS pinned digest (0.8.4, sha256:2c60f233...) reproduces the live HTTP tools/list capture this file previously held, byte-for-byte across all 32 tools \u2014 so the method is equivalent to a live capture. NOT forward-patched: this file must never describe a newer server than the pinned image. Hindsight drops an unknown argument SILENTLY (isError:false), so a prop advertised here but unknown to the server makes an agent believe a filter was applied when it was not \u2014 a silent wrong answer. The 0.8.4 -> 0.8.5 delta is exactly additive and exactly three props (list_memories.tags, list_memories.tags_match, create_mental_model.tags_match); no tool was added or removed, both wheels register 32."
  },
  "tools": {
   "retain": {
@@ -118,6 +118,7 @@
     "name",
     "source_query",
     "tags",
+    "tags_match",
     "trigger_refresh_after_consolidation"
    ]
   },
@@ -200,6 +201,8 @@
     "limit",
     "offset",
     "q",
+    "tags",
+    "tags_match",
     "type"
    ]
   },

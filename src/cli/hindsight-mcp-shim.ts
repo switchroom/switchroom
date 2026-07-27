@@ -115,9 +115,18 @@ export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
  * harmless optimism: hindsight drops an unknown argument SILENTLY and answers
  * isError:false, so an agent that reads `list_memories.tags` off this manifest
  * and issues a tag-scoped query on 0.8.4 receives the UNFILTERED list and
- * believes it was filtered (verified live). The snapshot is therefore a
- * verbatim 0.8.4 capture with no forward-patch, and re-capturing it against
- * 0.8.5 belongs with the image bump in #3768.
+ * believes it was filtered (verified live). The snapshot is therefore always a
+ * capture of the PINNED image with no forward-patch, and re-capturing it is
+ * part of an image bump, not a follow-up to one.
+ *
+ * This table now describes 0.8.5, which the image pins: 0.8.5 registers the
+ * same 32 tools as 0.8.4 plus exactly three props — `list_memories.tags`,
+ * `list_memories.tags_match` and `create_mental_model.tags_match` (derived by
+ * dumping `create_mcp_server(...)`'s registration surface inside each pinned
+ * digest). Byte-equality with
+ * tests/fixtures/hindsight-tools-list.snapshot.json is asserted per tool in
+ * tests/memory.hindsight-contract.fixture.test.ts, so this table cannot drift
+ * in either direction without a red test.
  */
 export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   cancel_operation: [["operation_id"], ["bank_id", "operation_id"]],
@@ -125,7 +134,7 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   clear_mental_model: [["mental_model_id"], ["bank_id", "mental_model_id"]],
   create_bank: [["bank_id"], ["bank_id", "mission", "name"]],
   create_directive: [["content", "name"], ["bank_id", "content", "is_active", "name", "priority", "tags"]],
-  create_mental_model: [["name", "source_query"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "trigger_refresh_after_consolidation"]],
+  create_mental_model: [["name", "source_query"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "tags_match", "trigger_refresh_after_consolidation"]],
   delete_bank: [[], ["bank_id"]],
   delete_directive: [["directive_id"], ["bank_id", "directive_id"]],
   delete_document: [["document_id"], ["bank_id", "document_id"]],
@@ -140,7 +149,7 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   list_banks: [[], []],
   list_directives: [[], ["active_only", "bank_id", "tags"]],
   list_documents: [[], ["bank_id", "limit", "q"]],
-  list_memories: [[], ["bank_id", "limit", "offset", "q", "type"]],
+  list_memories: [[], ["bank_id", "limit", "offset", "q", "tags", "tags_match", "type"]],
   list_mental_models: [[], ["bank_id", "detail", "tags"]],
   list_operations: [[], ["bank_id", "limit", "status"]],
   list_tags: [[], ["bank_id", "limit", "q"]],

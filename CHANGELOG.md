@@ -69,6 +69,97 @@ mirrored credential belonged to the fallback.
 builders derive `isActive` from it via `effectiveServingLabel`. `active` keeps
 its old meaning for anything that genuinely wants the pin, and a
 pre-`serving` broker degrades to the previous behaviour.
+
+### The Hindsight fork rebases onto upstream v0.8.5, and rolling it back is now documented as two ordered steps
+
+The pinned upstream base moves v0.8.4 → v0.8.5 to pick up `hindsight-admin
+repair-bank` (upstream #2645): per-`(bank, fact_type)` vector indexes never
+self-heal, so a bank populated outside the create-time path falls back to the
+global HNSW index plus a post-filter and under-returns recall candidates.
+Measured on this fleet at the production `hnsw.ef_search=200`, one bank
+returned 55 of 100 requested candidates with 143 rows removed by filter; after
+`repair-bank --all` the same query plans onto the per-bank index and returns
+100/100 with none removed.
+
+This is a fork rebase, not a version bump, so every `# switchroom:` patch block
+was replayed against a pristine 0.8.5 tree and re-classified. Eleven blocks
+become eight, roughly 950 lines lighter: the `max_turns`/ToolSearch fix, the
+`unit_entities` FK-race fix and the duplicate-ANN-scan fix are all retired
+because upstream now does the same thing natively — and upstream's FK-race fix
+is strictly better than ours, because it row-locks the surviving parents so the
+pruner blocks, where ours only resurrected the parent after the fact. The
+retired blocks are asserted **absent**, not merely deleted, so a future rebase
+cannot silently resurrect a patch upstream has adopted.
+
+**The rollback story is the part worth reading.** Bumping the base runs four
+alembic migrations against the persisted memory volume, and one of them drops
+`search_vector` from the `invalidated_memory_units` archive. 0.8.5 no longer
+reads that column — but 0.8.4 requires it: its archive round-trip excludes only
+`"embedding"`, and it carries no special-casing for `search_vector` anywhere.
+So reverting the pinned digest **on its own** is not a rollback. It is a
+rollback into a broken state, where every `invalidate_memory` and every revert
+of an invalidated memory fails with `column "search_vector" does not exist` —
+and the older image will not stop you at boot, because alembic logs "Database
+is at a newer migration revision than this code version knows about" and
+carries on.
+
+The order is: **alembic downgrade first, while the newer image is still
+running** (it is the only one that ships the down-revisions), **then** repoint
+the digest. `docs/operators/hindsight-memory.md` gains a runbook section with
+the exact commands, and the Dockerfile comment says so at the pin.
+
+It also documents what the ordered rollback still costs, because "correct" is
+not "lossless": the re-added column comes back empty — upstream's own migration
+says "comes back empty regardless" — and nothing backfills it. Every memory
+archived while the fleet ran on 0.8.5 therefore returns with a NULL
+`search_vector`, so reverting one out of the archive lands it back in
+`memory_units` silently absent from the BM25 arm of recall. If those memories
+matter, restore from a pre-upgrade dump rather than downgrading in place. The
+word "unused" is gone from every description of the column: it was true on the
+version you roll forward to and false on the version you roll back to, which is
+precisely the wording that made the broken rollback look safe.
+
+The MCP contract fixture moves with the pin rather than after it. The captured
+tool surface, its `_meta.hindsight_api_version` marker and the shim's cold-boot
+`FALLBACK_TOOL_TABLE` are all re-derived from the 0.8.5 image in this same
+commit — the delta is exactly additive and exactly three props
+(`list_memories.tags`, `list_memories.tags_match`,
+`create_mental_model.tags_match`); both wheels register the same 32 tools. The
+derivation was cross-validated by running it against the *previous* pinned
+digest, where it reproduces the committed 0.8.4 capture byte-for-byte. The
+version guard now binds in both directions: on 0.8.4 those props must be
+absent (advertising a prop the server silently ignores makes an agent believe a
+filter was applied), and on 0.8.5 they must be present, so bumping the marker
+without re-capturing the fixture is a red test rather than a green one.
+
+### `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP` is reachable, so the CE-damping patch's rollback knob exists
+
+Switchroom's cross-encoder saturation damping is an unconditional calibration
+change whose failure mode is a silent recall-quality regression with no
+telemetry behind it. The patch was written with that in mind: it reads its
+decisive gap from `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP`, so backing the change
+out is meant to be a container restart with one env var rather than an image
+rebuild.
+
+That knob did not work. The key was absent from `HINDSIGHT_PERF_ENV_KEYS`, and
+`resolveHindsightPerfOverrides` skips unmanaged keys silently, so a
+`hindsight.env` line for it never reached the container — and because the patch
+reads the var once at import, there was no runtime fallback to recover through.
+The documented escape hatch for the riskiest patch in the file was unreachable.
+Same defect class as #3732, #3745 and #3763, with the twist that this key is a
+switchroom-patch knob rather than an upstream one, so it carries no
+`HINDSIGHT_API_` prefix and the sweeps for that prefix never saw it.
+
+It joins `HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS` — managed, but with no shipped
+default, because emitting one would replace the patch's own derived gap with a
+hard-coded constant on every host. Unset still means exactly what it meant
+before. A value at or above ~0.65 clamps the damping exponent to 1.0, i.e.
+upstream ranking with the patch still baked in.
+
+The durable half: a test now derives the env-var name from the Dockerfile patch
+itself and asserts it is a member of the managed set, so a future knob
+documented in a patch block cannot ship unreachable.
+
 ### The lexical-overlap recall gate is removed
 
 Auto-recall ran a `recallMinOverlap` gate between the engine's reranker and the
@@ -628,6 +719,83 @@ deployment failed **and** the OpenRouter hop did not rescue it. The new signal
 warns at ≥2 % and pages at ≥10 % of hindsight LLM calls failing outright
 (measured today: 0/800). No LiteLLM configuration was touched.
 
+### Recall reserves slots per bank, and injected bank composition is now logged
+
+Auto-recall fans out to the agent's own bank and the sender's profile bank,
+merges the results, sorts them globally by `scores.final` and head-slices at
+`recallMaxMemories` — **6 on this fleet**, from
+`defaults.memory.recall.max_memories` in `switchroom.yaml`, which cascades to
+`HINDSIGHT_RECALL_MAX_MEMORIES` and wins over the 8 stamped into the plugin's
+`settings.json`.
+
+That head-slice is winner-take-all across banks. On a turn where both banks
+return more candidates than the cap, nothing stops one bank's score
+distribution from filling every slot, and the agent is handed a dossier about
+its operator with none of its own session memory.
+
+**Scope, stated plainly: this fixes score-based crowd-out among results that
+did return. It does not fix the own-bank timeout.** A timed-out bank
+contributes zero candidates, so reservation is a strict no-op in exactly that
+case. Measured across 1,036 multi-bank non-cache `recall_log.jsonl` rows on this
+host since 2026-07-20: own-dead / profile-alive is 67.0% of turns (83.5% for
+overlord), own-dead / profile-dead 18.0%, and **both-alive — the only state
+where reservation can act at all — 15.1% fleet-wide, 6.4% for overlord** (6.8%
+once you also require more candidates than the cap). The own-bank timeout is a
+larger, separate defect.
+
+The half of this change that *does* address the majority case is the
+**telemetry**. A fully timed-out own bank still logs `result_count == 6`, which
+every existing dashboard reads as success — that is precisely why the own-bank
+timeout outage hid for weeks. Volume cannot see composition, so
+`recall_log.jsonl` now carries `injected_own_bank_count` and
+`injected_additional_bank_count` (always summing to `result_count`), plus
+`reserved_own_slots` / `reserved_additional_slots` for the slots the floors took
+from global relevance. A result with no stamped source bank counts as
+additional, so the own-bank number is never optimistic. This is the field that
+would have caught the outage.
+
+`recall.py` stamps each merged result with its source bank and reserves slot
+**floors** before the head-slice — `recallOwnBankMinSlots` /
+`recallAdditionalBankMinSlots`, cascading from
+`memory.recall.own_bank_min_slots` / `.additional_bank_min_slots`.
+Switchroom-managed agents get **2 own / 1 additional against the deployed cap of
+6**; the vendor default stays 0/0 (the pre-fix head-slice), which is also the
+rollback lever.
+
+Floors, not quotas — and enforced as such. Each side gets at most its floor,
+only if it returned that many, **and only up to half the cap between them**
+(`_reservable_slots`). The other half is always awarded on pure global
+relevance, so composition still moves with the scores in both directions: at cap
+6 with profile-favoured scores the split is 2 own / 4 profile, with own-favoured
+scores 5 own / 1 profile. Without that headroom the shipped floors would be a
+fixed quota — floors of 4 + 2 at a cap of 6 consume the cap exactly, the
+leftover-fill loop never runs, and `scores.final` has no influence on
+composition on any turn where both banks return. The clamp scales with the cap,
+so the invariant holds at 4, 8 or 12 as well. When the floors exceed that budget
+the own-bank floor is honoured first. Selection is re-sorted by relevance
+afterwards, so reservation changes *which* memories are injected, never the
+order they are presented in.
+
+Both env exports are written **unconditionally** (#3774): `~/.hindsight/
+claude-code.json` survives an apply and loads *after* the plugin's
+`settings.json`, so a conditional export would let a stale hand-edited value
+there shadow what switchroom stamps — silently and permanently. Writing the
+resolved effective value every boot makes the environment, applied last, the
+authority. Same resolution as #3759 / #3760.
+
+Not touched: the fan-out architecture itself. Every agent queries exactly two
+banks in parallel under one shared deadline, `additional_banks` is empty
+fleet-wide, and a slow bank cannot block a fast one. That design is sound; slot
+allocation was the only thing wrong with it.
+
+Tests assert composition, never volume, and the load-bearing ones are
+mutation-checked. Deleting the additional-bank floor, deleting the own-bank
+floor, removing the half-cap clamp, or hardcoding either `reserved_*_slots` to 0
+each fails the suite. The anchor cases pin that with floors off *either* bank
+takes all six slots depending on the score regime, that a fully timed-out own
+bank still logs `result_count == 6` while `injected_own_bank_count` reads 0, and
+that flipping the score regime changes the injected composition — the property
+that distinguishes a floor from a quota.
 
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 

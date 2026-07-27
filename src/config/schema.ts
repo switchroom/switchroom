@@ -619,6 +619,43 @@ export const AgentMemorySchema = z
             "effective deadline is clamped down to it, and the clamp is " +
             "reported.",
           ),
+        own_bank_min_slots: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Slots inside `max_memories` reserved as a FLOOR for the agent's " +
+            "own bank when recall fans out to more than one bank. The merged " +
+            "set is sorted globally by relevance and head-sliced, which is " +
+            "winner-take-all across banks: when both banks return more " +
+            "candidates than the cap, one bank's score distribution can fill " +
+            "every slot and the agent gets a dossier about its operator with " +
+            "none of its own session memory. A floor, not a quota: at most " +
+            "this many slots, only if the own bank returned that many, and " +
+            "only up to HALF the cap shared with `additional_bank_min_slots` " +
+            "— the rest is always won on pure relevance, so composition still " +
+            "moves with the scores. Fixes score-based crowd-out only; a " +
+            "timed-out bank returns no candidates and reservation is a no-op " +
+            "there. 0 disables (default). Switchroom-managed agents use 2 " +
+            "against the fleet-deployed cap of 6.",
+          ),
+        additional_bank_min_slots: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Slots inside `max_memories` reserved as a FLOOR for the " +
+            "additional (profile / shared / sender) banks. Symmetric with " +
+            "`own_bank_min_slots` — same floor-not-quota semantics, and the " +
+            "two share the same half-of-cap reservation budget. When they sum " +
+            "above that budget the own-bank floor is honoured first. 0 " +
+            "disables (default). Switchroom-managed agents use 1 against the " +
+            "fleet-deployed cap of 6. Observe `injected_own_bank_count` / " +
+            "`injected_additional_bank_count` via " +
+            "`switchroom memory recall-log`.",
+          ),
         types: z
           .array(z.string())
           .optional()
@@ -2190,7 +2227,10 @@ export const HindsightConfigSchema = z.object({
       "(`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`: " +
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY — a per-deployment " +
       "`bank-pattern:priority,...` map; unset means upstream's flat " +
-      "created_at FIFO across banks), plus the " +
+      "created_at FIFO across banks; and " +
+      "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP — the rollback knob for " +
+      "switchroom's CE-saturation damping patch, a float; >= ~0.65 backs the " +
+      "damping out entirely, unset means the patch's own derived gap), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
@@ -2896,7 +2936,10 @@ const profileFields = {
           hook_timeout_seconds: z.number().int().min(1).optional(),
           parallel_deadline_seconds: z.number().int().min(1).optional(),
           query_max_tokens: z.number().int().min(0).optional(),
-          query_stop_terms: z.array(z.string().min(1).regex(/^[\w./-]+$/)).optional(),          request_timeout_seconds: z.number().int().min(1).optional(),
+          query_stop_terms: z.array(z.string().min(1).regex(/^[\w./-]+$/)).optional(),
+          request_timeout_seconds: z.number().int().min(1).optional(),
+          own_bank_min_slots: z.number().int().min(0).optional(),
+          additional_bank_min_slots: z.number().int().min(0).optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })

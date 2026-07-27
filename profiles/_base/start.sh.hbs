@@ -798,6 +798,24 @@ export HINDSIGHT_RECALL_QUERY_STOP_TERMS='{{hindsightRecallQueryStopTermsJson}}'
 # into a skipped assignment — lets a stale hand-written claude-code.json shadow
 # the shipped default with every test still green.
 export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS={{hindsightRecallRequestTimeoutSeconds}}
+# Per-bank slot FLOORS inside the recall count cap. The merged multi-bank set
+# is sorted globally by relevance then head-sliced, which is winner-take-all
+# across banks: when both banks return more candidates than the cap, one bank's
+# score distribution can fill every slot and the agent gets a dossier about its
+# operator and none of its own session memory. Floors, not quotas — recall.py
+# bounds the two floors to HALF the cap between them, so the rest is always won
+# on pure relevance. Switchroom ships 2 own / 1 additional against the deployed
+# cap of 6; 0/0 restores the pure head-slice.
+#
+# EXPORTED UNCONDITIONALLY (#3774), like the two #3757 knobs above. The resolved
+# effective value (memory.recall.own_bank_min_slots / .additional_bank_min_slots
+# from the cascade, else the shipped default) is always written, because
+# ~/.hindsight/claude-code.json survives an apply and loads AFTER the plugin's
+# settings.json — a conditional export would let a stale hand-edited value there
+# shadow what switchroom stamps, silently and permanently.
+# Observe `injected_own_bank_count` via `switchroom memory recall-log <agent>`.
+export HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS={{hindsightRecallOwnBankMinSlots}}
+export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS={{hindsightRecallAdditionalBankMinSlots}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the

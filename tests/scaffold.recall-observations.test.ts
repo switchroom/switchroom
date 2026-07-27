@@ -91,6 +91,34 @@ describe("hindsight recall overrides — observations + trivial-skip", () => {
     expect(s.recallMinOverlap).toBeUndefined();
   });
 
+  // Per-bank slot reservation. The merged multi-bank set is sorted globally by
+  // relevance and head-sliced, which is winner-take-all across banks: when both
+  // banks return more candidates than the cap, one bank's score distribution
+  // can fill every slot. These floors are the switchroom opt-in over the
+  // vendor's 0/0 (pure head-slice).
+  it("reserves a floor of recall slots for each bank, sized to the DEPLOYED cap", () => {
+    const s = settingsAfterInstall();
+    expect(s.recallOwnBankMinSlots).toBe(2);
+    expect(s.recallAdditionalBankMinSlots).toBe(1);
+    // The cap this fleet actually runs is 6 — `defaults.memory.recall
+    // .max_memories: 6` in switchroom.yaml cascades to
+    // HINDSIGHT_RECALL_MAX_MEMORIES, and env wins over the 8 stamped into
+    // settings.json. recall.py bounds the two floors to HALF the cap between
+    // them (`_reservable_slots`), so floors summing above 3 would be silently
+    // clamped and the stamped numbers would be a lie. Pinning against 6 rather
+    // than against `s.recallMaxMemories` is deliberate: asserting against the
+    // stamped 8 is exactly the mistake that let floors of 4/2 look safe when
+    // at the deployed cap they consumed the whole of it and `scores.final`
+    // stopped influencing composition at all.
+    const DEPLOYED_CAP = 6;
+    expect(
+      (s.recallOwnBankMinSlots as number) + (s.recallAdditionalBankMinSlots as number),
+    ).toBeLessThanOrEqual(Math.floor(DEPLOYED_CAP / 2));
+    // Both floors must be non-zero, or one side can still be zeroed out.
+    expect(s.recallOwnBankMinSlots as number).toBeGreaterThan(0);
+    expect(s.recallAdditionalBankMinSlots as number).toBeGreaterThan(0);
+  });
+
   // #2816 tag-filter port — INTENTIONALLY DORMANT (see the decision comment in
   // renderHindsightSettingsOverrides + reference/rfcs/hindsight-synthesis-
   // layers.md). The scaffold must NOT set any recall tag filter: doing so would

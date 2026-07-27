@@ -29,6 +29,23 @@ DEFAULTS = {
     # formatting. Set to 0 (or any non-positive value) to disable the cap
     # and inject everything Hindsight returns.
     "recallMaxMemories": 12,
+    # Switchroom-local: per-bank slot FLOORS inside `recallMaxMemories`. The
+    # merged multi-bank set is sorted globally by `scores.final` and then
+    # head-sliced, which is winner-take-all across banks: when both banks return
+    # more candidates than the cap, one bank's score distribution can fill every
+    # slot and the agent gets a dossier about its operator with none of its own
+    # working memory. These are FLOORS, not quotas: each side gets at most this
+    # many slots, only if it has that many results, and only up to HALF the cap
+    # between them — the other half is always awarded on pure global relevance,
+    # so composition still moves with the scores. 0 disables reservation for
+    # that side (the pure pre-fix head-slice). Env:
+    # HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS /
+    # HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS. See recall.py's
+    # `_reserve_bank_slots` and `_reservable_slots`. Vendor default is 0/0
+    # (off); switchroom's scaffold opts in with 2 own / 1 additional against the
+    # cap of 6 its fleet actually deploys.
+    "recallOwnBankMinSlots": 0,
+    "recallAdditionalBankMinSlots": 0,
     "recallTypes": ["world", "experience"],
     # Switchroom-local: when True (default; Ken-approved ON) recall biases
     # toward synthesized `observation`-tier facts. Escape hatch: pin off via
@@ -302,6 +319,11 @@ ENV_OVERRIDES = {
     # agents.<name>.memory.recall.max_memories (cascading through
     # defaults.memory.recall.max_memories) when present in switchroom.yaml.
     "HINDSIGHT_RECALL_MAX_MEMORIES": ("recallMaxMemories", int),
+    # Switchroom-local: per-bank slot floors inside the count cap. Set by
+    # start.sh from agents.<name>.memory.recall.own_bank_min_slots /
+    # .additional_bank_min_slots (cascading through defaults). 0 = off.
+    "HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS": ("recallOwnBankMinSlots", int),
+    "HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS": ("recallAdditionalBankMinSlots", int),
     # Switchroom-local: recall fact types (comma-separated). Set by start.sh
     # from agents.<name>.memory.recall.types only when the operator overrode
     # the switchroom default (world,experience,observation) — i.e. the

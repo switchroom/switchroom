@@ -596,6 +596,174 @@ def _sort_by_final_score(results):
     return results
 
 
+# Key stamped onto every merged result naming the bank it came from. Private to
+# recall.py (leading underscore) and never rendered: `format_memories`
+# (lib/content.py:294) reads only `text` / `type` / `mentioned_at`, so an extra
+# key cannot leak into the injected `<hindsight_memories>` block.
+SOURCE_BANK_KEY = "_source_bank"
+
+
+def _tag_source_bank(bank_results, bank_id):
+    """Stamp `SOURCE_BANK_KEY` onto each result so slot reservation can tell
+    own-bank memories from additional-bank (profile / shared / sender) ones
+    after the global relevance sort has interleaved them.
+
+    Returns the same list. Non-dict entries are skipped rather than raising:
+    a malformed engine response must not take recall down.
+    """
+    for m in bank_results:
+        if isinstance(m, dict):
+            m[SOURCE_BANK_KEY] = bank_id
+    return bank_results
+
+
+def _reservable_slots(cap):
+    """How many of `cap` slots the per-bank floors may claim between them.
+
+    HALF the cap, rounded down. The other half is always awarded on pure global
+    relevance, and that headroom is what keeps these FLOORS rather than a fixed
+    quota. Without it the mechanism silently inverts at small caps: this fleet
+    runs `defaults.memory.recall.max_memories: 6` (switchroom.yaml — it cascades
+    to HINDSIGHT_RECALL_MAX_MEMORIES, which wins over the 8 stamped into the
+    plugin's settings.json), so floors of 4+2 would consume the entire cap,
+    `scores.final` would have no influence on composition on any turn where both
+    banks return, and the injected set would be a constant 4/2 split regardless
+    of relevance.
+
+    Scaling with the cap rather than clamping against a hardcoded 6 means the
+    invariant holds for any operator cap: at 6 the floors may claim 3, at 12 six,
+    at 4 two, at 1 none (reservation is simply off below cap 2).
+    """
+    if not isinstance(cap, int) or cap <= 0:
+        return 0
+    return cap // 2
+
+
+def _reserve_bank_slots(results, cap, own_bank_id, own_floor, additional_floor):
+    """Head-slice `results` to `cap`, guaranteeing a minimum number of slots to
+    the agent's OWN bank and to the additional (profile / shared / sender) banks.
+
+    Switchroom — profile-bank crowd-out fix. `_sort_by_final_score` above sorts
+    the merged multi-bank set by `scores.final` and the caller then head-slices
+    at `recallMaxMemories`. On a turn where BOTH banks return more candidates
+    than the cap, that head-slice is winner-take-all across banks: nothing stops
+    one bank's score distribution from filling every slot, and the shared
+    `ken-profile` bank's facts routinely outscore the agent's own working memory
+    because a profile bank is dense with short, highly-rerankable statements.
+    The result is an agent handed a dossier about its operator and none of its
+    own session memory.
+
+    Scope, precisely — this fixes score-based crowd-out among results that DID
+    return. It does NOT fix the own-bank timeout: a timed-out bank contributes
+    zero candidates, so `own_take` is 0 and reservation is a strict no-op there.
+    Measured across 1,036 multi-bank non-cache recalls on this host since
+    2026-07-20: own-dead/additional-alive is 67.0% of turns (83.5% for
+    overlord), and both-alive — the only state where reservation can act at all
+    — is 15.1% fleet-wide, 6.4% for overlord (6.8% once you also require more
+    candidates than the cap). The own-bank timeout is a separate, larger defect;
+    the `injected_own_bank_count` telemetry added alongside this is what makes
+    it legible per-turn.
+
+    Floors, not quotas, and enforced as such. Each side is guaranteed AT MOST
+    `floor` slots, only if it actually has that many results, and only up to
+    `_reservable_slots(cap)` (half the cap) between them; every other slot is
+    filled from the remaining candidates in pure global-relevance order. So at
+    the fleet's deployed cap of 6 with the shipped floors 2/1:
+
+      * own returns 10, profile returns 10  -> 2 own + 4 profile (profile-favoured
+                                              scores; own is never zeroed)
+      * own returns 10, profile returns 10  -> 5 own + 1 profile (own-favoured
+                                              scores; profile is never zeroed)
+      * own returns 0,  profile returns 10  -> 6 profile (no wasted slots)
+      * own returns 10, profile returns 0   -> 6 own      (no wasted slots)
+      * own returns 1,  profile returns 10  -> 1 own + 5 profile
+
+    Composition still moves with `scores.final` in both directions — that is the
+    property the half-cap headroom buys and the property a quota would destroy.
+
+    A floor of 0 disables reservation for that side. `cap <= 0` disables the cap
+    entirely (upstream contract) and is a passthrough here. When the floors sum
+    above the reservable half the OWN floor is honoured first — the crowd-out
+    being fixed is one-directional, and the agent's own memory is the side that
+    loses today.
+
+    Selection is stable and the returned list is re-sorted by relevance, so
+    reservation changes WHICH memories are injected, never the order they are
+    presented in. Returns `(selected, reserved_own, reserved_additional)` where
+    the two counts are the slots that would NOT have been won on global score
+    alone — i.e. the observable effect of this function, logged as telemetry.
+    """
+    if not isinstance(cap, int) or cap <= 0 or len(results) <= cap:
+        return results, 0, 0
+
+    baseline_ids = {id(m) for m in results[:cap]}
+
+    own = [m for m in results if _source_bank_of(m) == own_bank_id]
+    additional = [m for m in results if _source_bank_of(m) != own_bank_id]
+
+    # Floors compete for the reservable half only — never for the whole cap.
+    reservable = _reservable_slots(cap)
+    own_take = max(0, min(int(own_floor or 0), len(own), reservable))
+    additional_take = max(
+        0, min(int(additional_floor or 0), len(additional), reservable - own_take)
+    )
+
+    reserved = own[:own_take] + additional[:additional_take]
+    reserved_ids = {id(m) for m in reserved}
+
+    remaining = cap - len(reserved)
+    if remaining > 0:
+        for m in results:
+            if id(m) in reserved_ids:
+                continue
+            reserved.append(m)
+            reserved_ids.add(id(m))
+            remaining -= 1
+            if remaining == 0:
+                break
+
+    _sort_by_final_score(reserved)
+
+    promoted_own = sum(
+        1 for m in reserved if id(m) not in baseline_ids and _source_bank_of(m) == own_bank_id
+    )
+    promoted_additional = sum(
+        1 for m in reserved if id(m) not in baseline_ids and _source_bank_of(m) != own_bank_id
+    )
+    return reserved, promoted_own, promoted_additional
+
+
+def _injected_bank_composition(results, own_bank_id) -> dict:
+    """Own-bank / additional-bank split of the INJECTED set (post-head-slice).
+
+    Returns ``{"injected_own_bank_count", "injected_additional_bank_count"}``.
+    The two always sum to ``result_count``; results with no stamped source bank
+    (only possible from a cached row or a malformed engine response) count as
+    additional, so the own-bank number is never optimistic.
+    """
+    try:
+        own = sum(1 for m in results or [] if _source_bank_of(m) == own_bank_id)
+        return {
+            "injected_own_bank_count": own,
+            "injected_additional_bank_count": len(results or []) - own,
+        }
+    except Exception:
+        # Telemetry must never take recall down.
+        return {
+            "injected_own_bank_count": None,
+            "injected_additional_bank_count": None,
+        }
+
+
+def _source_bank_of(m):
+    """Read a result's stamped source bank, or None when absent/malformed."""
+    if isinstance(m, dict):
+        v = m.get(SOURCE_BANK_KEY)
+        if isinstance(v, str):
+            return v
+    return None
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     """True if `exc` is (or wraps) a network read/connect timeout.
 
@@ -1515,6 +1683,13 @@ def main():
                 "injected_score_min": None,
                 "injected_score_median": None,
                 "injected_score_max": None,
+                # Bank-composition telemetry — present for a uniformly queryable
+                # schema. Same reason as the score fields above: a cache hit
+                # replays a formatted block, not a per-bank result set.
+                "injected_own_bank_count": None,
+                "injected_additional_bank_count": None,
+                "reserved_own_slots": None,
+                "reserved_additional_slots": None,
                 "cache_hit": True,
                 # A3 stage-1 telemetry keys kept present for a uniformly
                 # queryable schema; a cache hit issues no bank HTTP, so there
@@ -1811,7 +1986,7 @@ def main():
                 )
                 if bank_results:
                     debug_log(config, f"Got {len(bank_results)} memories from bank '{b_id}'")
-                    results = results + bank_results
+                    results = results + _tag_source_bank(bank_results, b_id)
             elif b_outcome.error is not None:
                 # Own bank failure surfaces on stderr (journald signal); extra
                 # banks are debug-only, matching the pre-A3 serial behaviour.
@@ -1880,7 +2055,7 @@ def main():
                 bank_results = response.get("results", []) if isinstance(response, dict) else []
                 if bank_results:
                     debug_log(config, f"Got {len(bank_results)} memories from bank '{b_id}'")
-                    results = results + bank_results
+                    results = results + _tag_source_bank(bank_results, b_id)
             except Exception as e:
                 _bank_timed_out = _is_timeout_error(e)
                 # Non-timeout error → hard outage (see parallel-path note above).
@@ -1980,6 +2155,8 @@ def main():
     recall_max_memories = config.get("recallMaxMemories", 0)
     pre_cap_count = len(results)
     capped = False
+    reserved_own = 0
+    reserved_additional = 0
     if (
         isinstance(recall_max_memories, int)
         and recall_max_memories > 0
@@ -1990,7 +2167,29 @@ def main():
             f"Capping {len(results)} memories to {recall_max_memories} "
             f"(set HINDSIGHT_RECALL_MAX_MEMORIES=0 to disable)",
         )
-        results = results[:recall_max_memories]
+        # Switchroom — per-bank slot reservation. Head-slicing a globally sorted
+        # merged set is winner-take-all across banks: when both banks return more
+        # candidates than the cap, one bank's score distribution can fill every
+        # slot and the agent's own working memory is crowded out entirely.
+        # Guarantee a floor to each side (bounded to half the cap) before the
+        # remaining slots go to pure global relevance. This addresses score-based
+        # crowd-out only — a timed-out bank contributes no candidates and
+        # reservation is a no-op there; see _reserve_bank_slots for the measured
+        # share of turns it can bind on. Floors of 0/0 restore the head-slice.
+        results, reserved_own, reserved_additional = _reserve_bank_slots(
+            results,
+            recall_max_memories,
+            bank_id,
+            config.get("recallOwnBankMinSlots", 0),
+            config.get("recallAdditionalBankMinSlots", 0),
+        )
+        if reserved_own or reserved_additional:
+            debug_log(
+                config,
+                f"Bank slot reservation promoted {reserved_own} own-bank / "
+                f"{reserved_additional} additional-bank memories over "
+                f"higher-scoring ones",
+            )
         capped = True
 
     memories_block = None
@@ -2146,6 +2345,19 @@ def main():
         # alone can't distinguish "reranker is working" from "8 mediocre
         # memories per turn" now that the overlap gate is near-passthrough.
         **_injected_score_stats(results),
+        # Switchroom — injected BANK COMPOSITION. `result_count` above is a
+        # volume signal and cannot distinguish "6 own-bank memories" from "6
+        # profile-bank memories because the own bank timed out", which is
+        # exactly how the own-bank timeout outage stayed invisible for weeks:
+        # a fully-timed-out own bank still logged result_count == cap. These
+        # two counts always sum to `result_count`, so an own-bank collapse is
+        # readable off the log row without joining `bank_timings`.
+        **_injected_bank_composition(results, bank_id),
+        # Slots the reservation floors handed to a side that would have lost
+        # them on global relevance alone — the observable effect of
+        # `_reserve_bank_slots` (0/0 when the floors are off or non-binding).
+        "reserved_own_slots": reserved_own,
+        "reserved_additional_slots": reserved_additional,
         "cache_hit": False,
         # Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1) — per-bank
         # latency + timeout breakdown, directives-fetch latency, total

@@ -95,14 +95,37 @@ describe("hindsight contract — golden snapshot integrity", () => {
     ).toBe(pinnedHindsightApiVersion());
   });
 
-  it("does not advertise the 0.8.5-only props while the pinned image is 0.8.4", () => {
-    // Mutation-guard for the fix above, pinned by name so a reintroduction is
-    // caught even if _meta is edited to match. Drop this test in the same
-    // commit that re-captures the snapshot against 0.8.5 (#3768).
-    if (pinnedHindsightApiVersion() !== "0.8.4") return;
-    expect(snapshot.tools.list_memories.props).not.toContain("tags");
-    expect(snapshot.tools.list_memories.props).not.toContain("tags_match");
-    expect(snapshot.tools.create_mental_model.props).not.toContain("tags_match");
+  /**
+   * The 0.8.4 → 0.8.5 delta, pinned by name in BOTH directions.
+   *
+   * These three props are the entire tool-surface difference between the two
+   * wheels (verified by dumping `create_mcp_server(...)`'s registration surface
+   * inside each pinned digest: 32 tools either way, no tool added or removed).
+   * Naming them keeps the mutation-guard the 0.8.4 revision of this test
+   * provided — a snapshot forward-patched to 0.8.5 while the image pins 0.8.4
+   * still reds here even if `_meta` is edited to match — while adding the
+   * mirror obligation: on 0.8.5 the props must actually BE captured, so a
+   * marker bumped without a re-capture cannot pass.
+   */
+  it("carries exactly the tag props the pinned wheel registers — neither ahead nor behind", () => {
+    const pinned = pinnedHindsightApiVersion();
+    const shouldHaveTagProps = pinned !== "0.8.4";
+    const has = (tool: string, prop: string) =>
+      (snapshot.tools[tool]?.props as string[]).includes(prop);
+    for (const [tool, prop] of [
+      ["list_memories", "tags"],
+      ["list_memories", "tags_match"],
+      ["create_mental_model", "tags_match"],
+    ] as const) {
+      expect(
+        has(tool, prop),
+        shouldHaveTagProps
+          ? `${tool}.${prop} exists on ${pinned} but is missing from the snapshot — ` +
+            "the marker was bumped without re-capturing the fixture from the pinned image"
+          : `${tool}.${prop} does not exist on ${pinned}; advertising it makes the shim's ` +
+            "cold-boot manifest promise a filter the server silently ignores",
+      ).toBe(shouldHaveTagProps);
+    }
   });
 
   it("EXPECTED_HINDSIGHT_TOOLS agrees with the captured server truth (required-args, no const/snapshot drift)", () => {

@@ -31,11 +31,34 @@
 # from another org; an upstream repoint would otherwise flow into the
 # published hindsight image undetected. Dependabot tracks bumps.
 #
-# Pinned to vectorize-io/hindsight v0.8.4 (digest below; label
-# org.opencontainers.image.version=0.8.4, image revision 92f433c9 = the
-# v0.8.4 tag commit, built 2026-07-01). Bumped from v0.8.2 (sha256:7c069db2…)
-# to pick up 0.8.3 (merges divergent alembic heads, widens bank_id columns)
-# and 0.8.4. Prior history: v0.7.1→v0.8.2 fixed the `batch_retain`
+# Pinned to vectorize-io/hindsight v0.8.5 (digest below; label
+# org.opencontainers.image.version=0.8.5, image revision 705757f3, built
+# 2026-07-22). Bumped from v0.8.4 (sha256:2c60f233…) to pick up
+# `hindsight-admin repair-bank` — upstream #2645: per-(bank, fact_type)
+# vector indexes never self-heal, so banks populated outside the create-time
+# path fall back to the global HNSW + post-filter and silently under-return
+# recall candidates. 0.8.5 ALSO lands natively two fixes switchroom used to
+# carry as patches in this file (the unit_entities FK-race, upstream #2662,
+# and `tools=[]` on the standard claude_code call), both of which were
+# dropped in the same commit as this bump. Applying it runs 4 alembic
+# migrations (head b57a7c9e0d13 → d7b2f8a1c934), one of which drops the
+# `search_vector` column from the invalidated_memory_units archive. 0.8.5 no
+# longer reads that column — but 0.8.4 REQUIRES it (its archive round-trip
+# excludes only `"embedding"`, memory_engine.py:6579), so this migration is
+# what makes a naive rollback break. NOT "unused": unused on the version you
+# roll forward to, load-bearing on the one you roll back to.
+#
+# ROLLING BACK IS TWO ORDERED STEPS, NOT ONE: alembic downgrade FIRST (while
+# this image is still running — it is the only one that ships the
+# down-revisions), THEN repoint the digest. Reverting the digest alone leaves
+# every invalidate / revert-of-an-invalidate failing with
+# `column "search_vector" does not exist`, and the older image will NOT stop
+# you at boot — it logs "Database is at a newer migration revision …" and
+# carries on. Full runbook, including the empty-column caveat:
+# docs/operators/hindsight-memory.md § "Rolling the base image BACK".
+#
+# Prior history: v0.8.2→v0.8.4 merged divergent alembic heads and widened
+# bank_id columns; v0.7.1→v0.8.2 fixed the `batch_retain`
 # ForeignKeyViolation on `unit_entities` (switchroom #2392). NOTE: upstream
 # publishes only `:latest` (no `:vX.Y.Z` tag in ghcr), so the digest IS the
 # version pin. A bump runs DB migrations on the persisted memory volume —
@@ -50,8 +73,8 @@
 # the pinned image makes the shim's cold-boot fallback advertise props the
 # server silently drops, and the agent then believes a filter applied when it
 # did not.
-# switchroom:hindsight-api-version=0.8.4
-FROM ghcr.io/vectorize-io/hindsight:latest@sha256:2c60f233eaba8f51db31adb920a560735aaf6f314e4b63c36c73159742dfa1a7
+# switchroom:hindsight-api-version=0.8.5
+FROM ghcr.io/vectorize-io/hindsight:latest@sha256:0710076cd1539b4f89537d2e5b0ea1e4d179885bc12809a56cf748c538c8c4fb
 
 USER root
 
@@ -181,340 +204,6 @@ f.write_text(s)
 t = f.read_text()
 assert NEW_PATH in t and OLD_SS not in t and 'mkdtemp(prefix="hindsight-claude-code-")' not in t, "switchroom #2392 patch: verification failed"
 print("switchroom #2392: claude_code env isolation neutralized (CLAUDE_CONFIG_DIR=/run/claude-creds, SECURESTORAGE override dropped)")
-PYEOF
-
-# max_turns/ToolSearch standard-call fix: the STANDARD (non-tool) LLM-call
-# path in claude_code_llm.py builds `ClaudeAgentOptions` with
-# `allowed_tools=[]` but WITHOUT `tools=[]`. Clearing allowed_tools does NOT
-# unload the built-in Claude Code CLI tools — they stay resident, so on a
-# plain text-generation call Claude burns its single `max_turns=1` turn on a
-# ToolSearch step and then errors with "Reached maximum number of turns (1)".
-# The provider retries, wasting tokens and intermittently failing memory ops
-# (fact extraction / recall). The TOOL-calling path further down the SAME
-# file already carries the correct shape (`tools=[]` + `max_turns=2`, with a
-# comment) — this patch brings the standard path to parity: drop the built-in
-# CLI tools entirely so ToolSearch can't fire, and give one turn of headroom
-# so a stray tool turn can't wall a tool-less generation. Anchored tightly on
-# the `# Single-turn for API-style interactions` comment so we touch ONLY the
-# standard path, never the tool-calling one. Self-verifying: the build FAILS
-# LOUDLY if upstream reformats this call, so we never silently ship the
-# regression.
-RUN python3 - <<'PYEOF'
-import pathlib
-f = pathlib.Path("/app/api/hindsight_api/engine/providers/claude_code_llm.py")
-s = f.read_text()
-OLD = (
-    "            max_turns=1,  # Single-turn for API-style interactions\n"
-    "            allowed_tools=[],  # Disable tools for standard LLM calls\n"
-)
-NEW = (
-    "            tools=[],  # switchroom: disable built-in CLI tools so ToolSearch can't consume the single turn (max_turns wall / wasted-retry fix)\n"
-    "            max_turns=2,  # switchroom: headroom so a stray ToolSearch turn can't wall a tool-less text-gen call\n"
-    "            allowed_tools=[],  # Disable tools for standard LLM calls\n"
-)
-assert s.count(OLD) == 1, "switchroom max_turns/ToolSearch standard-call fix: the standard-call ClaudeAgentOptions anchor (max_turns=1 # Single-turn for API-style interactions + allowed_tools=[]) was not found exactly once — upstream reformatted the standard-call ClaudeAgentOptions; re-author this patch in docker/Dockerfile.hindsight"
-s = s.replace(OLD, NEW, 1)
-f.write_text(s)
-t = f.read_text()
-assert NEW in t, "switchroom max_turns/ToolSearch standard-call fix: verification failed — patched block not present"
-assert "            tools=[],  # switchroom" in t, "switchroom max_turns/ToolSearch standard-call fix: tools=[] not present on the standard path after patch"
-assert "max_turns=1,  # Single-turn" not in t, "switchroom max_turns/ToolSearch standard-call fix: a bare max_turns=1 standard-call still remains after patch"
-print("switchroom max_turns/ToolSearch standard-call fix: standard LLM call now sends tools=[] + max_turns=2 (ToolSearch can no longer wall the turn)")
-PYEOF
-
-# unit_entities FK-race fix: upstream v0.8.4 defect (to-be-filed upstream issue).
-# Entity resolution (retain Phase-1) and the unit_entities child insert (Phase-2)
-# run in SEPARATE committed transactions. Between them, graph_maintenance's
-# prune_orphan_entities can delete an entity that momentarily has no
-# unit_entities reference — so the Phase-2 bulk_insert_unit_entities then
-# violates fk_unit_entities_entity_id_entities. It is deterministic and
-# NON-retryable, so the memory is silently dropped. It fires on session_handoff
-# re-ingest (observed live). Deterministic repro flips 15/15 RED -> 0/15 with
-# memories persisted once the fix is in.
-#
-# Fix (proven end-to-end on the real retain orchestrator path in an isolated
-# scratch container): Phase-2 re-asserts the parent entity row in the SAME
-# transaction as the child insert (INSERT ... ON CONFLICT DO NOTHING),
-# resurrecting any concurrently-pruned parent before the FK is checked — a live
-# unit's referent is not an orphan. This threads the minimal entity metadata
-# Phase-1 already holds (entity_id, bank_id, canonical_name; the name is NOT NULL
-# and unrecoverable once the row is pruned, so it must be carried through) from
-# resolve_entities_only up through the Phase-1 result into the Phase-2 link call.
-# Callers that don't pass entity_records keep the exact pre-existing behavior.
-#
-# Self-verifying: each anchor asserts exactly-once against unmodified upstream
-# v0.8.4 source; the build FAILS LOUDLY if upstream reformats any of the six
-# touched functions, so we never silently ship a half-applied patch or drop the
-# fix. Guarded by tests/docker/dockerfile-hindsight-bakes.test.ts.
-RUN python3 - <<'PYEOF'
-import pathlib
-
-BASE = pathlib.Path("/app/api/hindsight_api/engine")
-
-
-def apply(rel, edits):
-    f = BASE / rel
-    s = f.read_text()
-    for anchor, repl in edits:
-        n = s.count(anchor)
-        assert n == 1, (
-            f"switchroom hindsight FK-race patch: anchor found {n}x (expected 1) "
-            f"in {rel} — upstream reformatted; re-author this patch in "
-            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
-        )
-        s = s.replace(anchor, repl, 1)
-    f.write_text(s)
-    return s
-
-
-# ---- 1. db/ops_postgresql.py : add idempotent reassert_entities() ----
-ops_new = apply("db/ops_postgresql.py", [
-    (
-        "            bank_id,\n"
-        "            missing_names,\n"
-        "        )\n"
-        "\n"
-        "    async def bulk_insert_unit_entities(",
-        "            bank_id,\n"
-        "            missing_names,\n"
-        "        )\n"
-        "\n"
-        "    async def reassert_entities(\n"
-        "        self,\n"
-        "        conn: DatabaseConnection,\n"
-        "        table: str,\n"
-        "        entity_ids: list,\n"
-        "        bank_ids: list,\n"
-        "        canonical_names: list,\n"
-        "    ) -> None:\n"
-        '        """Re-assert (id, bank_id, canonical_name) entity rows idempotently.\n'
-        "\n"
-        "        Resurrects any parent entity that graph_maintenance.prune_orphan_entities\n"
-        "        deleted in the window between Phase-1 resolution and the Phase-2\n"
-        "        unit_entities child insert. Runs on the SAME connection/transaction as\n"
-        "        the child insert, so the FK is satisfied at check time regardless of\n"
-        "        prune timing. ON CONFLICT DO NOTHING leaves a still-present row untouched.\n"
-        '        """\n'
-        "        await conn.execute(\n"
-        '            f"""\n'
-        "            INSERT INTO {table} (id, bank_id, canonical_name)\n"
-        "            SELECT i, b, n\n"
-        "            FROM unnest($1::uuid[], $2::text[], $3::text[]) AS t(i, b, n)\n"
-        "            ON CONFLICT DO NOTHING\n"
-        '            """,\n'
-        "            entity_ids,\n"
-        "            bank_ids,\n"
-        "            canonical_names,\n"
-        "        )\n"
-        "\n"
-        "    async def bulk_insert_unit_entities(",
-    ),
-])
-
-# ---- 2. entity_resolver.py : entity_records param + same-txn reassert ----
-er_new = apply("entity_resolver.py", [
-    (
-        "        unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],\n"
-        "        conn=None,\n"
-        "    ):",
-        "        unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],\n"
-        "        conn=None,\n"
-        "        entity_records: dict[str, dict] | None = None,\n"
-        "    ):",
-    ),
-    (
-        "            async with acquire_with_retry(self.pool) as conn:\n"
-        "                return await self._link_units_to_entities_batch_impl(conn, normalized)\n"
-        "        else:\n"
-        "            return await self._link_units_to_entities_batch_impl(conn, normalized)",
-        "            async with acquire_with_retry(self.pool) as conn:\n"
-        "                return await self._link_units_to_entities_batch_impl(conn, normalized, entity_records)\n"
-        "        else:\n"
-        "            return await self._link_units_to_entities_batch_impl(conn, normalized, entity_records)",
-    ),
-    (
-        "    async def _link_units_to_entities_batch_impl(self, conn, unit_entity_pairs: list[tuple[str, str, datetime | None]]):",
-        "    async def _link_units_to_entities_batch_impl(self, conn, unit_entity_pairs: list[tuple[str, str, datetime | None]], entity_records: dict[str, dict] | None = None):",
-    ),
-    (
-        "        unit_ids = [p[0] for p in sorted_pairs]\n"
-        "        entity_ids = [p[1] for p in sorted_pairs]\n"
-        "\n"
-        "        await self._ops.bulk_insert_unit_entities(",
-        "        unit_ids = [p[0] for p in sorted_pairs]\n"
-        "        entity_ids = [p[1] for p in sorted_pairs]\n"
-        "\n"
-        "        # Race guard: re-assert the parent entity rows in the SAME transaction\n"
-        "        # as the child insert below, resurrecting any entity that\n"
-        "        # graph_maintenance pruned in the Phase-1 -> Phase-2 window. A live\n"
-        "        # unit's referent is not an orphan. No-op when the rows already exist.\n"
-        "        if entity_records:\n"
-        "            reassert_ids: list = []\n"
-        "            reassert_banks: list = []\n"
-        "            reassert_names: list = []\n"
-        "            seen: set = set()\n"
-        "            for eid in entity_ids:\n"
-        "                if eid in seen:\n"
-        "                    continue\n"
-        "                seen.add(eid)\n"
-        "                rec = entity_records.get(eid)\n"
-        "                if rec is None:\n"
-        "                    rec = entity_records.get(str(eid))\n"
-        "                if not rec:\n"
-        "                    continue\n"
-        '                bank_id = rec.get("bank_id")\n'
-        '                canonical_name = rec.get("canonical_name")\n'
-        "                if bank_id is None or canonical_name is None:\n"
-        "                    continue\n"
-        "                reassert_ids.append(eid)\n"
-        "                reassert_banks.append(bank_id)\n"
-        "                reassert_names.append(canonical_name)\n"
-        "            if reassert_ids:\n"
-        "                await self._ops.reassert_entities(\n"
-        "                    conn,\n"
-        '                    fq_table("entities"),\n'
-        "                    reassert_ids,\n"
-        "                    reassert_banks,\n"
-        "                    reassert_names,\n"
-        "                )\n"
-        "\n"
-        "        await self._ops.bulk_insert_unit_entities(",
-    ),
-])
-
-# ---- 3. retain/types.py : EntityResolutionResult gains entity_records ----
-apply("retain/types.py", [
-    (
-        "    resolved_entity_ids: list[str]\n"
-        "    entity_to_unit: list[tuple]\n"
-        "    unit_to_entity_ids: dict[str, list[str]]\n"
-        "\n"
-        "\n"
-        "@dataclass\n"
-        "class Phase1Result:",
-        "    resolved_entity_ids: list[str]\n"
-        "    entity_to_unit: list[tuple]\n"
-        "    unit_to_entity_ids: dict[str, list[str]]\n"
-        "    # id -> {\"bank_id\":.., \"canonical_name\":..} for the resolved entities so\n"
-        "    # Phase-2's unit_entities child insert can re-assert (resurrect) a parent\n"
-        "    # entity concurrently pruned by graph_maintenance, in the same transaction.\n"
-        "    entity_records: dict[str, dict] | None = None\n"
-        "\n"
-        "\n"
-        "@dataclass\n"
-        "class Phase1Result:",
-    ),
-])
-
-# ---- 4. retain/link_utils.py : build + return entity_records (4-tuple) ----
-apply("retain/link_utils.py", [
-    (
-        '        _log(log_buffer, "  [6.2] Entity resolution (batched): 0 entities", level="debug")\n'
-        "        return [], [], {}",
-        '        _log(log_buffer, "  [6.2] Entity resolution (batched): 0 entities", level="debug")\n'
-        "        return [], [], {}, {}",
-    ),
-    (
-        "    _log(\n"
-        "        log_buffer,\n"
-        '        f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_start:.3f}s",\n'
-        '        level="debug",\n'
-        "    )\n"
-        "\n"
-        "    return resolved_entity_ids, entity_to_unit, unit_to_entity_ids",
-        "    _log(\n"
-        "        log_buffer,\n"
-        '        f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_start:.3f}s",\n'
-        '        level="debug",\n'
-        "    )\n"
-        "\n"
-        "    # Thread minimal entity metadata (id -> bank_id + canonical_name) so the\n"
-        "    # Phase-2 unit_entities child insert can re-assert a concurrently-pruned\n"
-        "    # parent in the SAME transaction. canonical_name is NOT NULL and gone once\n"
-        "    # graph_maintenance prunes the row, so it must be carried from here.\n"
-        "    entity_records: dict[str, dict] = {}\n"
-        "    for idx, ent in enumerate(all_entities_flat):\n"
-        "        eid = resolved_entity_ids[idx]\n"
-        '        name = ent.get("text")\n'
-        "        if eid is None or not name:\n"
-        "            continue\n"
-        '        entity_records.setdefault(str(eid), {"bank_id": bank_id, "canonical_name": name})\n'
-        "\n"
-        "    return resolved_entity_ids, entity_to_unit, unit_to_entity_ids, entity_records",
-    ),
-])
-
-# ---- 5. retain/entity_processing.py : 4-tuple early return ----
-apply("retain/entity_processing.py", [
-    (
-        "    if not unit_ids or not facts:\n"
-        "        return [], [], {}",
-        "    if not unit_ids or not facts:\n"
-        "        return [], [], {}, {}",
-    ),
-])
-
-# ---- 6. retain/orchestrator.py : unpack + store + thread entity_records ----
-apply("retain/orchestrator.py", [
-    (
-        "        resolved_entity_ids, entity_to_unit, unit_to_entity_ids = await entity_processing.resolve_entities(",
-        "        resolved_entity_ids, entity_to_unit, unit_to_entity_ids, entity_records = await entity_processing.resolve_entities(",
-    ),
-    (
-        "        entities=EntityResolutionResult(\n"
-        "            resolved_entity_ids=resolved_entity_ids,\n"
-        "            entity_to_unit=entity_to_unit,\n"
-        "            unit_to_entity_ids=unit_to_entity_ids,\n"
-        "        ),",
-        "        entities=EntityResolutionResult(\n"
-        "            resolved_entity_ids=resolved_entity_ids,\n"
-        "            entity_to_unit=entity_to_unit,\n"
-        "            unit_to_entity_ids=unit_to_entity_ids,\n"
-        "            entity_records=entity_records,\n"
-        "        ),",
-    ),
-    (
-        "    unit_to_entity_ids: dict[str, list[str]],\n"
-        "    semantic_ann_links: list[tuple],\n"
-        "    skip_semantic_links: bool = False,\n"
-        "    outbox_callback=None,\n"
-        "    ops=None,\n"
-        ") -> list[list[str]]:",
-        "    unit_to_entity_ids: dict[str, list[str]],\n"
-        "    semantic_ann_links: list[tuple],\n"
-        "    skip_semantic_links: bool = False,\n"
-        "    outbox_callback=None,\n"
-        "    ops=None,\n"
-        "    entity_records: dict[str, dict] | None = None,\n"
-        ") -> list[list[str]]:",
-    ),
-    (
-        "        await entity_resolver.link_units_to_entities_batch(unit_entity_pairs, conn=conn)",
-        "        await entity_resolver.link_units_to_entities_batch(\n"
-        "            unit_entity_pairs, conn=conn, entity_records=entity_records\n"
-        "        )",
-    ),
-    (
-        "                        unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
-        "                        semantic_ann_links=[],",
-        "                        unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
-        "                        entity_records=phase1.entities.entity_records,\n"
-        "                        semantic_ann_links=[],",
-    ),
-    (
-        "                    unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
-        "                    semantic_ann_links=phase1.semantic_ann_links,",
-        "                    unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
-        "                    entity_records=phase1.entities.entity_records,\n"
-        "                    semantic_ann_links=phase1.semantic_ann_links,",
-    ),
-])
-
-# ---- Post-conditions: fail loud if any edit silently no-oped ----
-assert "async def reassert_entities(" in ops_new, "switchroom hindsight FK-race patch: reassert_entities missing after patch"
-assert "entity_records.get(str(eid))" in er_new, "switchroom hindsight FK-race patch: reassert lookup fallback missing after patch"
-assert "entity_records=phase1.entities.entity_records" in (BASE / "retain/orchestrator.py").read_text(), "switchroom hindsight FK-race patch: orchestrator threading missing after patch"
-print("switchroom hindsight unit_entities FK-race patch: reassert_entities + entity_records threading applied (Phase-2 resurrects concurrently-pruned parent in same txn)")
 PYEOF
 
 # Cross-encoder saturation fix: `apply_combined_scoring` in
@@ -889,229 +578,6 @@ assert '        return " | ".join(tokens)' in pg, "switchroom hindsight BM25 com
 print("switchroom hindsight BM25 compound-token patch: intact compound tokens appended (strict superset of upstream tokens); native tsquery left as a plain OR join")
 PYEOF
 
-# Duplicate-ANN-scan fix: `retrieve_all_fact_types_parallel` in
-# engine/search/retrieval.py runs the vector-similarity scan TWICE per recall,
-# the second one serialized behind the first.
-#
-#   Step 2 opens one pooled connection and runs the combined semantic + BM25
-#   CTE. The semantic arm is `ORDER BY embedding <=> $1::vector LIMIT n` per
-#   fact_type — the ANN scan.
-#   Step 3 then gathers the per-fact-type graph tasks, and passes
-#   `semantic_seeds=None` into `retriever.retrieve(...)` even though Step 2
-#   just computed exactly those rows. link_expansion_retrieval.py's
-#   `retrieve()` reads
-#       if semantic_seeds: all_seeds = list(semantic_seeds)
-#       else:              all_seeds = await _find_semantic_seeds(...)
-#   and `_find_semantic_seeds` issues its own
-#   `ORDER BY embedding <=> $1::vector LIMIT $5`.
-#
-# So the pipeline does an ANN scan, throws it away for seeding purposes, and
-# then does a second one on a fresh connection AFTER Step 2's `async with`
-# block has exited. Measured on this deployment (foreground recall, n=30):
-# mean 4.218s / p50 4.364s / p90 5.831s end to end, of which the retrieval
-# residual is ~1.73s and graph is ~1.45s of that (84%).
-#
-# Fix: thread Step 2's semantic results through as `semantic_seeds`. The
-# parameter already exists and is already honoured by the receiving code —
-# nothing downstream changes shape.
-#
-# EQUIVALENCE, which is the whole safety argument. `retrieve()` uses the seeds
-# for their IDs ONLY (`seed_ids = list({s.id for s in all_seeds})`), so the
-# seed set is equivalent iff it contains the same unit ids. The two queries are
-# the same query:
-#   * same table, same `bank_id = $2`, same `fact_type`, same
-#     `embedding IS NOT NULL`, same `ORDER BY embedding <=> $1::vector`;
-#   * the same tags / tag_groups / created_after / created_before values, built
-#     by the same helpers — Step 3 forwards the identical arguments Step 2 got;
-#   * the seed query's `threshold=0.3` equals the shipped
-#     DEFAULT_SEMANTIC_MIN_SIMILARITY the arm uses, and `limit=20` is far below
-#     the arm's per-fact-type fetch (max(budget*5, 100) >= 100).
-# The helper therefore re-derives the seed set from the arm's rows: sort by
-# similarity descending, keep >= 0.3, take 20.
-#
-# It returns None (= keep upstream's own query) in the two cases where that
-# derivation is NOT provably the same set:
-#   1. `min_scores.semantic` raised the arm's floor above 0.3. The arm's
-#      candidate pool is then NARROWER than the seed query's, so rows the seed
-#      query would have returned were never fetched. Falling back here is the
-#      difference between a faster recall and a quieter one.
-#   2. The arm's Python trim bit (`len(rows) >= budget`) and every retained row
-#      still cleared 0.3 while fewer than 20 rows exist. Only reachable with a
-#      thinking_budget below 20 (the shipped fixed budgets are 100/300/1000),
-#      but it is the one shape where rows the seed query would have seen could
-#      have been trimmed away.
-# In every other case the trimmed-away rows are provably all below 0.3 (the
-# retained rows are the highest-similarity ones), so they could never have been
-# seeds.
-#
-# The helper sorts explicitly rather than trusting the row order the UNION ALL
-# happened to return, so it introduces NO new ordering assumption of its own —
-# it is at worst exactly as order-dependent as upstream's existing trim, which
-# already decides which semantic rows the user gets.
-#
-# `temporal_seeds` is deliberately left None. Step 2's temporal results come
-# from `retrieve_temporal_combined`, which applies time-bucket coverage
-# selection — a different set with different semantics, and upstream currently
-# passes NO temporal seeds at all, so threading them would ADD seeds and change
-# graph output rather than reproduce it. Out of scope here.
-#
-# Also out of scope, deliberately: the Step2/Step3 serialization itself and the
-# connection budget. This patch removes the duplicate scan only.
-#
-# Self-verifying: the build FAILS LOUDLY if upstream reformats either anchor or
-# retunes `_find_semantic_seeds`' limit/threshold call-site defaults out from
-# under the mirrored constants. Guarded behaviourally by
-# tests/docker/hindsight-search-patches.test.ts and structurally by
-# tests/docker/dockerfile-hindsight-bakes.test.ts.
-RUN python3 - <<'PYEOF'
-import pathlib
-
-f = pathlib.Path("/app/api/hindsight_api/engine/search/retrieval.py")
-s = f.read_text()
-
-# The mirrored constants must still match link_expansion_retrieval's call site,
-# or the derived seed set is not the set upstream would have produced.
-le = pathlib.Path("/app/api/hindsight_api/engine/search/link_expansion_retrieval.py").read_text()
-assert "all_seeds = await _find_semantic_seeds(" in le, "switchroom hindsight duplicate-ANN-scan patch: _find_semantic_seeds call site not found in link_expansion_retrieval.py — upstream restructured the seeding path; re-author this patch"
-assert "                    limit=20,\n                    threshold=0.3,\n" in le, "switchroom hindsight duplicate-ANN-scan patch: _find_semantic_seeds is no longer called with limit=20/threshold=0.3 — the mirrored _GRAPH_SEED_* constants would derive the WRONG seed set; re-author this patch"
-assert "            if semantic_seeds:\n                all_seeds = list(semantic_seeds)\n" in le, "switchroom hindsight duplicate-ANN-scan patch: retrieve() no longer honours semantic_seeds — threading them would be a no-op; re-author this patch"
-assert "seed_ids = list({s.id for s in all_seeds})" in le, "switchroom hindsight duplicate-ANN-scan patch: seeds are no longer consumed by id alone — the equivalence argument (id-set equality) no longer holds; re-author this patch"
-
-# --- 1. the seed-derivation helper -----------------------------------------
-DEF_ANCHOR = "async def retrieve_all_fact_types_parallel(\n"
-
-HELPER = '''# switchroom: mirrors link_expansion_retrieval._find_semantic_seeds' call-site
-# defaults. The build asserts they still match upstream, so a retune fails the
-# image build instead of silently deriving a different seed set.
-_GRAPH_SEED_LIMIT = 20
-_GRAPH_SEED_MIN_SIMILARITY = 0.3
-
-
-def _graph_semantic_seeds(
-    semantic_results: list[RetrievalResult],
-    arm_limit: int,
-    arm_min_similarity: float,
-) -> list[RetrievalResult] | None:
-    """switchroom: re-derive the graph seed set from the semantic arm's rows.
-
-    Returns the seeds LinkExpansionRetriever would have found for itself, so the
-    pipeline stops issuing a second ANN scan (`ORDER BY embedding <=> ...`)
-    serialized behind the one the semantic arm already ran.
-
-    The seeds are consumed by id alone, and both queries are the same query over
-    the same table with the same bank/fact_type/tag/created filters and the same
-    ordering, so the id set is reproducible from the arm's rows: take the rows at
-    or above the seed threshold, best-first, up to the seed limit.
-
-    Returns None (meaning: let upstream run its own query) whenever that is not
-    provably the same set:
-
-    * ``arm_min_similarity`` above the seed threshold. A per-request
-      ``min_scores.semantic`` floor makes the arm's candidate pool NARROWER than
-      the seed query's, so qualifying rows were never fetched.
-    * The arm's trim bit while every retained row still cleared the seed
-      threshold and fewer than the seed limit survived, i.e. rows the seed query
-      would have returned may have been trimmed away.
-
-    An empty list is returned when the arm genuinely found nothing at or above
-    the threshold; upstream treats that as falsy and re-queries, which is
-    harmless because that query returns nothing either.
-    """
-    if arm_min_similarity > _GRAPH_SEED_MIN_SIMILARITY:
-        return None
-    if any(r.similarity is None for r in semantic_results):
-        return None
-
-    # Sorted explicitly: never depend on the row order the UNION ALL returned.
-    ranked = sorted(semantic_results, key=lambda r: r.similarity, reverse=True)
-    seeds = [r for r in ranked if r.similarity >= _GRAPH_SEED_MIN_SIMILARITY][:_GRAPH_SEED_LIMIT]
-
-    if len(seeds) < _GRAPH_SEED_LIMIT and len(seeds) == len(ranked) and len(ranked) >= arm_limit:
-        return None
-    return seeds
-
-
-'''
-
-n = s.count(DEF_ANCHOR)
-assert n == 1, (
-    f"switchroom hindsight duplicate-ANN-scan patch: retrieve_all_fact_types_parallel anchor found {n}x "
-    "(expected 1) in search/retrieval.py — upstream reformatted the signature; re-author this patch "
-    "in docker/Dockerfile.hindsight"
-)
-s = s.replace(DEF_ANCHOR, HELPER + DEF_ANCHOR, 1)
-
-# --- 2. the arm's effective similarity floor, hoisted for the helper --------
-OLD_FLOOR = (
-    "    semantic_bm25_start = time.time()\n"
-    "    temporal_results_by_ft: dict[str, list[RetrievalResult]] = {}\n"
-    "    temporal_time = 0.0\n"
-)
-NEW_FLOOR = (
-    "    semantic_bm25_start = time.time()\n"
-    "    temporal_results_by_ft: dict[str, list[RetrievalResult]] = {}\n"
-    "    temporal_time = 0.0\n"
-    "    # switchroom: the floor retrieve_semantic_bm25_combined will apply to the\n"
-    "    # semantic arm, recomputed here so _graph_semantic_seeds can tell whether\n"
-    "    # the arm's candidate pool covers the graph seed query's.\n"
-    "    _arm_min_similarity = min_semantic if min_semantic is not None else get_config().semantic_min_similarity\n"
-)
-n = s.count(OLD_FLOOR)
-assert n == 1, (
-    f"switchroom hindsight duplicate-ANN-scan patch: Step 2 preamble anchor found {n}x (expected 1) "
-    "in search/retrieval.py — upstream reformatted retrieve_all_fact_types_parallel's Step 2; "
-    "re-author this patch in docker/Dockerfile.hindsight"
-)
-s = s.replace(OLD_FLOOR, NEW_FLOOR, 1)
-
-# The hoisted expression must stay byte-identical to the one inside the arm.
-assert (
-    "    sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity\n" in s
-), "switchroom hindsight duplicate-ANN-scan patch: retrieve_semantic_bm25_combined no longer derives sem_min as `min_semantic if min_semantic is not None else config.semantic_min_similarity` — the hoisted _arm_min_similarity would no longer describe the arm; re-author this patch"
-
-# --- 3. the call site -------------------------------------------------------
-OLD_CALL = (
-    "            query_text=query_text,\n"
-    "            semantic_seeds=None,\n"
-    "            temporal_seeds=None,\n"
-)
-NEW_CALL = (
-    "            query_text=query_text,\n"
-    "            # switchroom: Step 2 already ran this exact ANN scan. Passing its rows\n"
-    "            # through removes a second, serialized `ORDER BY embedding <=> ...`\n"
-    "            # per fact type. None here means the derivation was not provably\n"
-    "            # equivalent, so upstream runs its own query (correctness first).\n"
-    "            semantic_seeds=_graph_semantic_seeds(\n"
-    "                semantic_bm25_results.get(ft, ([], []))[0],\n"
-    "                thinking_budget,\n"
-    "                _arm_min_similarity,\n"
-    "            ),\n"
-    "            # switchroom: deliberately still None. Step 2's temporal rows come from\n"
-    "            # coverage selection, not from this query, so threading them would ADD\n"
-    "            # seeds rather than reproduce upstream's (which passes none).\n"
-    "            temporal_seeds=None,\n"
-)
-n = s.count(OLD_CALL)
-assert n == 1, (
-    f"switchroom hindsight duplicate-ANN-scan patch: Step 3 retriever.retrieve call site anchor found {n}x "
-    "(expected 1) in search/retrieval.py — upstream reformatted run_graph_for_fact_type; re-author this "
-    "patch in docker/Dockerfile.hindsight"
-)
-s = s.replace(OLD_CALL, NEW_CALL, 1)
-
-f.write_text(s)
-
-t = f.read_text()
-assert "def _graph_semantic_seeds(" in t, "switchroom hindsight duplicate-ANN-scan patch: helper missing after patch"
-assert "_GRAPH_SEED_LIMIT = 20" in t and "_GRAPH_SEED_MIN_SIMILARITY = 0.3" in t, "switchroom hindsight duplicate-ANN-scan patch: mirrored seed constants missing after patch"
-assert "semantic_seeds=_graph_semantic_seeds(" in t, "switchroom hindsight duplicate-ANN-scan patch: call site still passes something other than the derived seeds"
-assert "            semantic_seeds=None,\n" not in t, "switchroom hindsight duplicate-ANN-scan patch: a semantic_seeds=None call site survives — the duplicate ANN scan is still reachable"
-assert t.count("temporal_seeds=None,") == 1, "switchroom hindsight duplicate-ANN-scan patch: temporal_seeds must stay None exactly once (out of scope for this patch)"
-assert "_arm_min_similarity = min_semantic if min_semantic is not None else get_config().semantic_min_similarity" in t, "switchroom hindsight duplicate-ANN-scan patch: hoisted arm floor missing after patch"
-compile(t, str(f), "exec")
-print("switchroom hindsight duplicate-ANN-scan patch: graph expansion now seeds off Step 2's semantic arm (one ANN scan per fact type instead of two); falls back to upstream's own query whenever the derived seed set is not provably identical")
-PYEOF
-
 # Empty-TimeoutError-message fix: both retry loops in
 # engine/providers/litellm_llm.py end their timeout handler with a bare
 # `raise`, which re-raises the asyncio.TimeoutError produced by
@@ -1280,13 +746,21 @@ cfg_new = apply("config.py", [
         "            consolidation_recall_max_concurrent=_consolidation_recall_max_concurrent(os.getenv),\n",
     ),
     (
-        '                f"Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS."\n'
+        # switchroom: anchored on the LAST clause of validate() rather than the
+        # worker-slot one — 0.8.5 appended the operation_retention_days /
+        # operation_cleanup_batch_size checks after it, so the old anchor's
+        # trailing `@classmethod` context no longer followed.
+        "        if self.operation_cleanup_batch_size < 1:\n"
+        "            raise ValueError(\n"
+        '                f"{ENV_OPERATION_CLEANUP_BATCH_SIZE} must be >= 1, got {self.operation_cleanup_batch_size}"\n'
         "            )\n"
         "\n"
         "    @classmethod\n"
         '    def from_env(cls) -> "HindsightConfig":\n',
 
-        '                f"Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS."\n'
+        "        if self.operation_cleanup_batch_size < 1:\n"
+        "            raise ValueError(\n"
+        '                f"{ENV_OPERATION_CLEANUP_BATCH_SIZE} must be >= 1, got {self.operation_cleanup_batch_size}"\n'
         "            )\n"
         "\n"
         "        # switchroom: the background-recall reservation must leave the foreground a\n"
@@ -1666,13 +1140,18 @@ poller_new = apply("worker/poller.py", [
         '    """\n',
     ),
     (
+        # switchroom: `max_retries` was added to this signature in 0.8.5; it is
+        # carried in the anchor so the patch still binds to the whole parameter
+        # list rather than a prefix that could match a reformatted signature.
         "        slot_reservations: dict[str, int] | None = None,\n"
         "        consolidation_bank_priority: dict[str, int] | None = None,\n"
+        "        max_retries: int = 3,\n"
         "    ):\n",
 
         "        slot_reservations: dict[str, int] | None = None,\n"
         "        slot_limits: dict[str, int] | None = None,\n"
         "        consolidation_bank_priority: dict[str, int] | None = None,\n"
+        "        max_retries: int = 3,\n"
         "    ):\n",
     ),
     (
