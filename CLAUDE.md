@@ -42,9 +42,15 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
 - **Prefer the family aliases** `opus` / `sonnet` / `haiku` / `fable` over pinned
   ids: an alias tracks the current flagship, a pinned id goes stale. `fable`
   resolves ONLY through the LiteLLM proxy — `normalizeModelAlias()` folds
-  `claude-fable-5` → `fable`, and `declaredRoutingMode()` (scaffold.ts:1546)
-  routes `fable` / `sr-*` at the router root while other Claude models keep the
-  `/anthropic` passthrough (`src/agents/compose.ts` `ANTHROPIC_BASE_URL` split).
+  `claude-fable-5` → `fable`. **Adding a proxy-only model means editing the
+  repoint `case` in `profiles/_base/start.sh.hbs` (~:1772)** — that is where
+  routing actually moves. `src/agents/compose.ts` bakes `ANTHROPIC_BASE_URL` on
+  model CLASS, so `fable` (a Claude model) starts on the `/anthropic`
+  passthrough and start.sh repoints it to the router root at boot.
+  `declaredRoutingMode()` (`scaffold.ts:1546`) routes nothing: it only encodes
+  the POST-repoint intent so `.routing-mode` can compare landed vs declared.
+  Change the repoint case and that function together or a healthy boot fires a
+  spurious "Routing divergence" alert.
 - **Opus is covered by the adaptive-thinking risk check.**
   `isAdaptiveThinkingOpus()` (`src/config/thinking-effort-risk.ts`) matches
   `opus`, `claude-opus-4*`, `claude-opus-5`, `claude-opus-5-*`; `switchroom
