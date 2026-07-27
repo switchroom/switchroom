@@ -353,6 +353,19 @@ ENV_OVERRIDES = {
     # from agents.<name>.memory.recall.skip_trivial only on override; the
     # switchroom default is on (recall.py falls back to True).
     "HINDSIGHT_RECALL_SKIP_TRIVIAL": ("recallSkipTrivial", bool),
+    # Switchroom #3841: the last three recall settings that had a config key but
+    # no env channel at all, so switchroom.yaml could not reach them and a
+    # hand-edit of the installed plugin did not survive `switchroom apply`. Set
+    # by start.sh from agents.<name>.memory.recall.prefer_observations / .roles /
+    # .prompt_preamble (cascading through defaults), always exported at their
+    # existing effective values, so an operator who sets none of them sees no
+    # change. The other #3841 knobs (budget, max_tokens, context_turns,
+    # max_query_chars, transcript_tail_bytes, tags, tags_match, tag_groups,
+    # tag_weights, additional_bank_filters, transcript_fallback, parallel)
+    # already had entries in this table and only needed the yaml surface.
+    "HINDSIGHT_RECALL_PREFER_OBSERVATIONS": ("recallPreferObservations", bool),
+    "HINDSIGHT_RECALL_ROLES": ("recallRoles", list),
+    "HINDSIGHT_RECALL_PROMPT_PREAMBLE": ("recallPromptPreamble", str),
     # Switchroom #2848 Stage B: directive-capture nudge on/off. Set by
     # start.sh from agents.<name>.memory.directive_capture_nudge only when
     # the operator overrode it; the switchroom default is on (settings.json

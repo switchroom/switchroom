@@ -204,6 +204,98 @@ recall-log`. Operationally the values reach the plugin via the
 `HINDSIGHT_RECALL_MIN_SCORE` / `HINDSIGHT_RECALL_MIN_SCORE_SCOPE` env vars that
 `start.sh` exports unconditionally.
 
+### The remaining recall knobs — full `memory.recall.*` reference
+
+Everything the vendored plugin's recall hook reads is reachable from
+`switchroom.yaml`. Omit a key and you get the plugin's own default — the values
+below are exported verbatim by `start.sh` on every boot, so an agent with no
+`memory.recall:` block behaves exactly as it did before these keys existed.
+
+**Why they are exported even when unset.** The plugin's config cascade is
+built-in defaults → plugin `settings.json` → `~/.hindsight/claude-code.json` →
+environment. That third file is user-owned, survives `switchroom apply`, and
+loads *after* switchroom's `settings.json` stamp — so a stale hand-edit there
+silently outranks your yaml. Exporting unconditionally (#3774) puts
+switchroom last in the cascade and makes `switchroom.yaml` the single source of
+truth. It also means a value you set here **wins over the same variable set in
+an agent's `env:` map**, since compose environment is in place before
+`start.sh` runs.
+
+Any illegal value is rejected at `switchroom apply` time with a
+`HINDSIGHT-RECALL-CONFIG` error naming the key. That is deliberate: the plugin's
+env casting is fail-open, so a bad value there would be *dropped*, the default
+would stand, and your yaml would read as if it were in force.
+
+#### What gets recalled
+
+| Key | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `budget` | `low` \| `mid` \| `high` | `low` | Server-side retrieval effort per query. `mid`/`high` search harder (more candidates, more reranking) at the cost of recall latency on every single turn. Raise only for a bank large enough that `low` visibly misses things. |
+| `max_tokens` | integer ≥ 1 | `1024` | Token ceiling for the injected memory block. This bounds the *prompt cost* of recall; `max_memories` bounds the count. Raise for an agent that needs long-form recalled context, lower for a chatty agent you want to keep cheap. |
+| `prefer_observations` | boolean | `true` | Bias retrieval toward distilled observations over raw conversation chunks. Turn off when you want verbatim source text rather than the bank's summaries. |
+| `types` | list of strings | *(plugin default)* | Restrict recall to specific memory types. Documented here for completeness — this key predates the rest of the block. |
+| `skip_trivial` | boolean | *(plugin default)* | Skip recall on prompts the hook judges trivial (greetings, "thanks"). Also predates this block. |
+
+#### How the query is built
+
+| Key | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `context_turns` | integer ≥ 1 | `2` | How many recent turns are folded into the recall query. `1` makes recall track the immediate message tightly; higher values keep a longer thread in view but blur a topic switch. |
+| `roles` | non-empty list of strings | `["user","assistant"]` | Which transcript roles contribute to the query text. Set `["user"]` to query purely on what the human said, ignoring your own prior output. An empty list is rejected — it would leave recall nothing to build a query from. |
+| `max_query_chars` | integer ≥ 1 | `800` | Hard cap on the assembled query string. Long queries dilute semantic search; raise only if your agents routinely send long, information-dense prompts. |
+| `transcript_fallback` | boolean | `true` | When the hook receives no usable prompt text, fall back to reading the tail of the session transcript. Disable to make recall strictly prompt-driven. |
+| `transcript_tail_bytes` | integer ≥ 0 | `262144` | How many bytes of transcript tail that fallback reads. |
+| `prompt_preamble` | non-empty string | *(see below)* | The banner text prefixed to the injected memory block. Rewrite it to change how the agent is told to weigh recalled memories. Free-form text — quoting and escaping are handled for you. Empty is rejected: it would leave recalled memories in the prompt with nothing marking them as memories. |
+
+The default preamble is:
+
+> Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:
+
+#### Tag filtering and weighting
+
+These are **dormant by default** — `tags` is empty and `tag_groups` is unset, so
+no filtering happens unless you opt in. They exist for banks where memories are
+tagged with a taxonomy you maintain yourself; switchroom does not invent one.
+
+| Key | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `tags` | list of strings | `[]` (no filtering) | Only recall memories carrying these tags. |
+| `tags_match` | `any` \| `all` \| `any_strict` \| `all_strict` | `any` | How `tags` combines. The `_strict` variants require the tag to be present rather than merely scoring for it. Irrelevant while `tags` is empty. |
+| `tag_groups` | list of tag-lists, **or** a map of name → tag-list | *(unset)* | OR-of-ANDs filtering: a memory matches if it satisfies any one group. More expressive than `tags` + `tags_match`. |
+| `tag_weights` | map of tag → number ≥ 0 | `{"sidechain": 0.8}` | Score multipliers, not filters — a weight below `1` demotes without excluding. **Your map is merged over the default**, so setting `{"lesson": 1.4}` keeps the `sidechain: 0.8` demotion of delegated sub-agent memories. Set `sidechain` explicitly (e.g. `1`) to neutralise it. |
+
+```yaml
+agents:
+  archivist:
+    memory:
+      recall:
+        budget: mid
+        max_tokens: 2048
+        context_turns: 4
+        tag_weights:
+          lesson: 1.4        # promote; sidechain: 0.8 still applies
+```
+
+#### Multi-bank recall
+
+| Key | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `additional_banks` | list of strings | *(unset)* | Extra banks to query — see [Shared / profile recall banks](#shared--profile-recall-banks--memoryrecalladditional_banks) below. Also populated automatically from `knows` / `serves`. |
+| `additional_bank_filters` | map of bank name → `{tags, tags_match, tag_groups}` | `{}` | Per-bank tag filtering for those extra banks, using the same three fields as above. Use it when a shared bank is broad but this agent should only see one slice of it. |
+| `parallel` | boolean | `true` | Query additional banks concurrently. This is a **rollback lever**: set `false` to serialise if concurrent recall destabilises your Hindsight instance. Serial recall is slower on every turn. |
+
+```yaml
+agents:
+  clerk:
+    memory:
+      recall:
+        additional_banks: ["operator-profile"]
+        additional_bank_filters:
+          operator-profile:
+            tags: ["preferences", "projects"]
+            tags_match: any
+```
+
 ### Tuning auto-retain cadence — `memory.retain.every_n_turns` / `overlap_turns`
 
 The plugin's Stop hook consolidates recent conversation into the bank on a

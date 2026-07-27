@@ -842,6 +842,61 @@ export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS={{hindsightRecallAdditionalBan
 # Observe `dropped_below_min_score` via `switchroom memory recall-log <agent>`.
 export HINDSIGHT_RECALL_MIN_SCORE={{hindsightRecallMinScore}}
 export HINDSIGHT_RECALL_MIN_SCORE_SCOPE={{hindsightRecallMinScoreScope}}
+# ── The remaining recall knobs (#3841) ───────────────────────────────────────
+# Everything else `recall.py` reads out of the plugin config, resolved from
+# `memory.recall.*` in switchroom.yaml and exported UNCONDITIONALLY for the
+# #3774 reason spelled out above: `~/.hindsight/claude-code.json` loads AFTER
+# the plugin's settings.json and survives an apply, so a knob switchroom does
+# not export is a knob a stale hand-edit owns. Every default below is the value
+# the fleet already ran before this block existed — an operator who sets none of
+# these gets byte-identical recall — and each is pinned against the vendored
+# plugin by tests/scaffold.recall-passthrough.test.ts so the two cannot drift.
+# Structural values are single-quoted JSON; `_cast_env` parses them and, unlike
+# an empty export, actually ASSIGNS (an empty one is skipped and hands authority
+# straight back to claude-code.json).
+#
+# How hard Hindsight searches: low (vector only, ~1-2s) | mid (+LLM rerank,
+# ~5s measured) | high. Switchroom ships `low` — mid was the second-largest
+# contributor to perceived dead air after model TTFT.
+export HINDSIGHT_RECALL_BUDGET={{hindsightRecallPass.budget}}
+# Token budget for the injected block. The count cap (…MAX_MEMORIES) is the
+# other bound and the tighter of the two wins.
+export HINDSIGHT_RECALL_MAX_TOKENS={{hindsightRecallPass.maxTokens}}
+# Bias toward the synthesized `observation` tier, backfilling slots freed by
+# superseded raw facts. On by default (memory.recall.prefer_observations).
+export HINDSIGHT_RECALL_PREFER_OBSERVATIONS={{hindsightRecallPass.preferObservations}}
+# Recent human turns composed into the query, and the transcript roles they may
+# be drawn from. 2 turns so a bare follow-up ("and the port?") embeds with its
+# antecedent instead of recalling on the pronoun alone.
+export HINDSIGHT_RECALL_CONTEXT_TURNS={{hindsightRecallPass.contextTurns}}
+export HINDSIGHT_RECALL_ROLES={{{hindsightRecallPass.rolesQ}}}
+# Character bound on the composed query, applied BEFORE …QUERY_MAX_TOKENS
+# shapes it; truncation keeps the latest turn and drops oldest context first.
+export HINDSIGHT_RECALL_MAX_QUERY_CHARS={{hindsightRecallPass.maxQueryChars}}
+# Tail bytes read from the session transcript for that composition — the read
+# stays O(1) on a session log that can grow to many MB. 0 = whole file.
+export HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES={{hindsightRecallPass.transcriptTailBytes}}
+# The banner above injected memories. The agent reads this line as the
+# instruction for how to treat the block, so it is behaviour, not cosmetics.
+export HINDSIGHT_RECALL_PROMPT_PREAMBLE={{{hindsightRecallPass.promptPreambleQ}}}
+# Tag filters (upstream 962140eef port). Dormant by default and exported at
+# their no-op values — `[]` / `{}` fold to None in recall.py, so nothing is
+# filtered unless an operator sets memory.recall.tags / .tag_groups.
+export HINDSIGHT_RECALL_TAGS={{{hindsightRecallPass.tagsQ}}}
+export HINDSIGHT_RECALL_TAGS_MATCH={{hindsightRecallPass.tagsMatch}}
+export HINDSIGHT_RECALL_TAG_GROUPS={{{hindsightRecallPass.tagGroupsQ}}}
+export HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS={{{hindsightRecallPass.additionalBankFiltersQ}}}
+# Per-tag score multipliers — a DOWN-RANK, never a drop. Carries switchroom's
+# `sidechain: 0.8` seed (delegated sub-agent memories rank just under
+# first-party ones), merged with memory.recall.tag_weights.
+export HINDSIGHT_RECALL_TAG_WEIGHTS={{{hindsightRecallPass.tagWeightsQ}}}
+# Bounded transcript-grep fallback: only when EVERY bank returned zero AND no
+# bank hit its deadline. Covers the window between an abrupt kill and the next
+# boot reconciliation, where the fact layer never heard about the lost turns.
+export HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK={{hindsightRecallPass.transcriptFallback}}
+# Parallel multi-bank fan-out: total latency is the SLOWEST slot, not the SUM.
+# false is the serial rollback lever.
+export HINDSIGHT_RECALL_PARALLEL={{hindsightRecallPass.parallel}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the

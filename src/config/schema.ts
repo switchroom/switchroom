@@ -739,6 +739,199 @@ export const AgentMemorySchema = z
             "never skips a turn that references user/project/session state. " +
             "Set false to always run recall.",
           ),
+        // ── Passthrough knobs (#3841) ────────────────────────────────────
+        // Every one of these was previously reachable only by hand-editing
+        // the installed plugin (reverted by the next `switchroom apply`) or by
+        // smuggling a raw HINDSIGHT_RECALL_* into the agent's `env:` map. Each
+        // defaults to the value the fleet already runs, and start.sh exports
+        // all of them unconditionally (#3774) — see
+        // src/setup/hindsight-recall-passthrough.ts.
+        budget: z
+          .enum(["low", "mid", "high"])
+          .optional()
+          .describe(
+            "How hard Hindsight searches. \"low\" (switchroom default) = " +
+            "vector retrieval only, ~1-2s. \"mid\" adds the LLM rerank pass " +
+            "and measured ~5s of hook latency on real fleet turns — the " +
+            "second-largest contributor to perceived dead air after model " +
+            "TTFT. \"high\" is thorough and slower still. Raise it for an " +
+            "agent whose recall quality matters more than its reply latency " +
+            "(a research or audit role); leave it at low for chat.",
+          ),
+        max_tokens: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Token budget for the injected memory block. Default 1024. This " +
+            "is the TOKEN bound; `max_memories` is the separate COUNT bound " +
+            "and the tighter of the two wins. Raise it only alongside " +
+            "`max_memories` — on its own it buys nothing once the count cap " +
+            "binds.",
+          ),
+        prefer_observations: z
+          .boolean()
+          .optional()
+          .describe(
+            "Bias recall toward the synthesized `observation` tier, " +
+            "backfilling the slots freed by superseded raw facts for denser " +
+            "coverage inside the same budget. Default true. Set false to " +
+            "rank raw `world`/`experience` facts on equal footing — useful " +
+            "when auditing what the consolidation engine actually stored, or " +
+            "if a bank's observations are stale.",
+          ),
+        context_turns: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "How many recent human turns are composed into the recall query. " +
+            "Default 2, so a bare follow-up (\"and the port?\") embeds with " +
+            "its antecedent instead of recalling on the pronoun alone. 1 = " +
+            "the latest turn only. Raising it costs BM25 terms, which is the " +
+            "real recall cost driver — `query_max_tokens` still bounds the " +
+            "result, so a large value mostly shifts which terms survive.",
+          ),
+        roles: z
+          .array(z.string().min(1))
+          .min(1)
+          .optional()
+          .describe(
+            "Transcript roles the multi-turn composition may draw from. " +
+            "Default [\"user\", \"assistant\"]. Set [\"user\"] to compose " +
+            "the query from the human's words only — worth trying when an " +
+            "agent's own verbose replies are dominating the query terms. No " +
+            "effect while `context_turns` is 1.",
+          ),
+        prompt_preamble: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "The banner rendered above injected memories. The agent reads " +
+            "this line as the instruction for how to treat the block, so it " +
+            "is a behaviour knob, not cosmetics. Default tells the model to " +
+            "prioritise recent memories on conflict and ignore irrelevant " +
+            "ones. Override to tighten that framing for a specialised agent.",
+          ),
+        tags: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "Restrict recall to memories carrying these tags. Default [] = " +
+            "no filter (match everything). This is a HARD filter applied " +
+            "server-side — a memory without the tags cannot surface at any " +
+            "score — so it is for a genuinely scoped agent, not for " +
+            "ranking. Use `tag_weights` when you want a preference rather " +
+            "than an exclusion.",
+          ),
+        tags_match: z
+          .enum(["any", "all", "any_strict", "all_strict"])
+          .optional()
+          .describe(
+            "How `tags` combine. \"any\" (default) = at least one; " +
+            "\"all\" = every tag. The `_strict` forms additionally require " +
+            "the memory to actually carry the tags rather than merely rank " +
+            "for them. No effect while `tags` and `tag_groups` are empty.",
+          ),
+        tag_groups: z
+          .union([
+            z.array(z.array(z.string().min(1))),
+            z.record(z.string(), z.array(z.string().min(1))),
+          ])
+          .optional()
+          .describe(
+            "Tag filtering with grouping — either an OR-of-ANDs list " +
+            "([[\"a\",\"b\"],[\"c\"]] = (a AND b) OR c) or a named " +
+            "{group: [tags]} map. Default unset (no grouping). Use when a " +
+            "flat `tags` + `tags_match` cannot express the scope you need.",
+          ),
+        tag_weights: z
+          .record(z.string(), z.number().min(0))
+          .optional()
+          .describe(
+            "Per-tag multipliers applied to `scores.final` just before the " +
+            "final sort — a DEMOTION/PROMOTION, never a drop, so a " +
+            "down-weighted memory still surfaces when it is the only " +
+            "relevant hit. MERGED over switchroom's seed " +
+            "({\"sidechain\": 0.8}, which ranks delegated sub-agent " +
+            "process-memories just under first-party ones), so setting one " +
+            "unrelated weight does not silently undo it; pass " +
+            "`sidechain: 1.0` to neutralise the seed. Reach for this when " +
+            "recall_log shows one class of memory crowding the block.",
+          ),
+        additional_bank_filters: z
+          .record(
+            z.string(),
+            z
+              .object({
+                tags: z.array(z.string().min(1)).optional(),
+                tags_match: z.enum(["any", "all", "any_strict", "all_strict"]).optional(),
+                tag_groups: z
+                  .union([
+                    z.array(z.array(z.string().min(1))),
+                    z.record(z.string(), z.array(z.string().min(1))),
+                  ])
+                  .optional(),
+              })
+              .strict(),
+          )
+          .optional()
+          .describe(
+            "Per-bank overrides of the tag filters above, keyed by bank id " +
+            "(applies to `additional_banks` AND to sender banks). Default " +
+            "{} = every extra bank inherits the global filters. Use it to " +
+            "scope a shared bank — e.g. recall only `profile`-tagged " +
+            "memories from the operator's profile bank while leaving the " +
+            "agent's own bank unfiltered.",
+          ),
+        transcript_fallback: z
+          .boolean()
+          .optional()
+          .describe(
+            "When every bank returns zero results AND no bank hit its " +
+            "deadline, grep the current session's transcript tail for turns " +
+            "matching the query and inject them as a clearly-labelled " +
+            "lower-confidence block. Default true — it covers the window " +
+            "between an abrupt kill and the next boot reconciliation, where " +
+            "the fact layer was never told about the lost turns. Set false " +
+            "if you never want un-consolidated transcript text in context.",
+          ),
+        transcript_tail_bytes: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Bytes of the session transcript read from the tail for the " +
+            "multi-turn query composition. Default 262144 (256 KiB), which " +
+            "keeps the per-turn read O(1) on a session log that can grow to " +
+            "many MB. 0 = read the whole file (the pre-bound behaviour, and " +
+            "the rollback lever if a composition ever needs older turns).",
+          ),
+        max_query_chars: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Character bound on the composed recall query, applied before " +
+            "`query_max_tokens` shapes it. Default 800. Truncation preserves " +
+            "the latest turn and drops the oldest context first. Lower it " +
+            "for an agent whose turns are long pasted payloads.",
+          ),
+        parallel: z
+          .boolean()
+          .optional()
+          .describe(
+            "Run the directives fetch and every bank recall concurrently " +
+            "under one shared deadline, so total latency is the SLOWEST slot " +
+            "rather than their SUM. Default true. false restores the serial " +
+            "path — the rollback lever if the parallel path ever misbehaves; " +
+            "expect multi-bank recall latency to add up.",
+          ),
         topic_filter_mode: z
           .enum(["soft-preamble", "hard-filter"])
           .optional()
@@ -2978,6 +3171,45 @@ const profileFields = {
           additional_bank_min_slots: z.number().int().min(0).optional(),
           min_score: z.number().min(0).optional(),
           min_score_scope: z.enum(["degraded", "all"]).optional(),
+          // #3841 passthrough knobs. Mirrored here so a fleet-wide
+          // `defaults.memory.recall.budget` (etc.) cascades like its siblings;
+          // the descriptions live on AgentMemorySchema.recall above.
+          budget: z.enum(["low", "mid", "high"]).optional(),
+          max_tokens: z.number().int().min(1).optional(),
+          prefer_observations: z.boolean().optional(),
+          context_turns: z.number().int().min(1).optional(),
+          roles: z.array(z.string().min(1)).min(1).optional(),
+          prompt_preamble: z.string().min(1).optional(),
+          tags: z.array(z.string().min(1)).optional(),
+          tags_match: z.enum(["any", "all", "any_strict", "all_strict"]).optional(),
+          tag_groups: z
+            .union([
+              z.array(z.array(z.string().min(1))),
+              z.record(z.string(), z.array(z.string().min(1))),
+            ])
+            .optional(),
+          tag_weights: z.record(z.string(), z.number().min(0)).optional(),
+          additional_bank_filters: z
+            .record(
+              z.string(),
+              z
+                .object({
+                  tags: z.array(z.string().min(1)).optional(),
+                  tags_match: z.enum(["any", "all", "any_strict", "all_strict"]).optional(),
+                  tag_groups: z
+                    .union([
+                      z.array(z.array(z.string().min(1))),
+                      z.record(z.string(), z.array(z.string().min(1))),
+                    ])
+                    .optional(),
+                })
+                .strict(),
+            )
+            .optional(),
+          transcript_fallback: z.boolean().optional(),
+          transcript_tail_bytes: z.number().int().min(0).optional(),
+          max_query_chars: z.number().int().min(1).optional(),
+          parallel: z.boolean().optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })
