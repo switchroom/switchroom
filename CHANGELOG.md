@@ -1,6 +1,7 @@
 # Changelog
 
-## Unreleased
+## v0.19.25 — hindsight 0.8.5, recall stops timing out on mature banks, and `switchroom memory repair` fixes silently under-returning banks
+
 ### Recall no longer times out on mature banks
 
 Auto-recall was exceeding its client deadline on ~96% of own-bank requests for
