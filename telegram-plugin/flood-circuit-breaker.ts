@@ -30,6 +30,7 @@ import {
   renameSync,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { recordFlood429, flood429LedgerPathFromFloodState } from './flood-429-ledger.js'
 
 export interface FloodWaitState {
   /** Epoch ms at which the flood-wait window expires. */
@@ -225,6 +226,18 @@ export function writeFloodState(
  * Build the `onFloodWait` callback for `createRetryApiCall`, wired to persist
  * (and extend) the window at `path`. Reads current state, merges the new
  * retry_after, writes it back.
+ *
+ * It ALSO appends to the sibling 429 pressure ledger. `flood-wait.json` holds
+ * only the CURRENT window — every 429 overwrites the last — so the run-up to
+ * a ban is destroyed at exactly the moment it becomes evidence. That is why
+ * the 2026-07-27 4.4h ban had days of escalating penalties behind it that
+ * nothing could see. The ledger keeps that history and `switchroom doctor`
+ * classifies it (`src/cli/doctor-flood-pressure.ts`).
+ *
+ * Recording here rather than at the gateway callsites is deliberate: this is
+ * the one function EVERY `onFloodWait` wiring goes through (gateway.ts's two
+ * hooks and `shared/bot-runtime.ts`'s `createRobustApiCall`), so no future
+ * callsite can record a window without also recording its history.
  */
 export function makeFloodWaitRecorder(
   path: string,
@@ -235,6 +248,11 @@ export function makeFloodWaitRecorder(
     const t = now()
     const next = computeFloodWait(readFloodState(path), retryAfterSec, t)
     writeFloodState(path, next, log)
+    try {
+      recordFlood429(flood429LedgerPathFromFloodState(path), { ts: t, retryAfterSec }, log)
+    } catch {
+      /* best-effort — the pressure ledger must never break the breaker */
+    }
   }
 }
 
