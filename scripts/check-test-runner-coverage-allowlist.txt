@@ -1,0 +1,62 @@
+# check-test-runner-coverage allowlist — test files knowingly executed by
+# NEITHER CI runner. One glob per line; `#` starts a comment.
+#
+# This file is DEBT, not configuration. Every entry needs a reason and, where
+# the answer is "should run but doesn't", the issue that tracks it. Do not add
+# a line to make lint go green — read scripts/check-test-runner-coverage.mjs
+# first; options 1 and 2 there are almost always the right fix.
+
+# ── Legitimately gated: live Telegram + live Claude ────────────────────────
+# The UAT scenario harness (#863) drives a real MTProto user session against a
+# real bot and a real agent. It runs only on the gated uat-host runner, via
+# `bun run test:uat` in ci-uat.yml, and a curated subset at that. It must never
+# be discoverable on the default test path.
+**/telegram-plugin/uat/scenarios/**
+
+# ── Known orphan debt: tracked by #3756 ────────────────────────────────────
+# Every file below is vitest-excluded (bun:sqlite / bun:test) and listed in
+# package.json's `test:bun` — but NO workflow invokes `test:bun`, so none of
+# them run in CI. #3756 found this via two of the broker files and reported one
+# of them RED on pristine main. The set is wider than that issue records; the
+# durable fix is a root-level bun CI job (or a bun-runnable vitest shim), which
+# is out of scope for the PR that added this guard. Enumerated file-by-file
+# rather than glob'd by directory so a NEW orphan in these trees still fails.
+src/cli/vault-get-broker.test.ts
+src/drive/disconnect.test.ts
+src/drive/grants.test.ts
+src/drive/oauth.test.ts
+src/drive/onboarding.test.ts
+src/drive/reconciler.test.ts
+src/drive/vault-slots.test.ts
+src/drive/wrapper.test.ts
+src/litellm/provision-apply-e2e.test.ts
+src/vault/approvals/approval-origin.test.ts
+src/vault/approvals/kernel-listener-acl.test.ts
+src/vault/approvals/kernel-operator-acl.test.ts
+src/vault/approvals/kernel.test.ts
+src/vault/approvals/schema-idempotent.test.ts
+src/vault/approvals/self-approval-bypass.test.ts
+src/vault/approvals/vault-grant-dual-dispatch.test.ts
+src/vault/approvals/vd-unlock-dual-dispatch.test.ts
+src/vault/broker/auto-unlock.test.ts
+src/vault/broker/client-token.test.ts
+src/vault/broker/drift-detection.test.ts
+src/vault/broker/scope.test.ts
+src/vault/broker/server-admin-only-keys.test.ts
+src/vault/broker/server-approvals.test.ts
+src/vault/broker/server-grants.test.ts
+src/vault/broker/server-mint-grant-passphrase-attest.test.ts
+src/vault/broker/server-mint-grant-posture-attest.test.ts
+src/vault/broker/server-passphrase-attest.test.ts
+src/vault/broker/server-per-agent-unlock.test.ts
+src/vault/broker/server-scope-persist.test.ts
+src/vault/broker/server-token-fallthrough.test.ts
+src/vault/broker/server-tokenless-scope.test.ts
+src/vault/broker/server-unlock.test.ts
+src/vault/broker/server-write-grants.test.ts
+src/vault/broker/server.test.ts
+src/vault/grants-db.test.ts
+src/vault/grants.test.ts
+src/vault/resolver-via-broker.test.ts
+src/vault/write-grants.test.ts
+tests/vault-broker-passphrase.test.ts

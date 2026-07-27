@@ -40,18 +40,48 @@ ATTEMPT_TIMEOUT="${BUN_TEST_ATTEMPT_TIMEOUT:-180}"
 KILL_AFTER="${BUN_TEST_KILL_AFTER:-30}"
 MAX_ATTEMPTS="${BUN_TEST_MAX_ATTEMPTS:-3}"
 
-# Same explicit dir list as the Buildkite/CI invocation — running `bun
-# test` with no args recurses into telegram-plugin/uat/scenarios/ which
-# need live Telegram creds. Keep this in sync with ci-tests-plugin.yml if
-# the surface changes. BUN_TEST_TARGETS (space-separated) overrides the
-# list — used only to exercise the watchdog against a narrow subset.
+# THE single source of truth for what the bun CI job runs — `bun test` with
+# no args recurses into telegram-plugin/uat/scenarios/, which needs live
+# Telegram creds. Both ci-tests-plugin.yml and ci-full.yml invoke this script
+# rather than re-typing the list (they used to keep hand-copied duplicates,
+# which is how a test file ends up in no runner at all — see
+# scripts/check-test-runner-coverage.mjs). BUN_TEST_TARGETS (space-separated)
+# overrides the list — used only to exercise the watchdog against a subset.
 if [ -n "${BUN_TEST_TARGETS:-}" ]; then
   # shellcheck disable=SC2206
   BUN_TEST_ARGS=(${BUN_TEST_TARGETS})
 else
   BUN_TEST_ARGS=(
-    admin-commands gateway registry secret-detect tests
+    # TRAILING SLASHES ARE LOAD-BEARING. A `bun test` positional is a plain
+    # SUBSTRING match on the file path, not a directory selector: the bare
+    # `gateway` this list used to carry also matched
+    # `uat/scenarios/vault-card-survives-gateway-restart-dm.test.ts`, quietly
+    # pulling a live-Telegram scenario into the ordinary bun-test job (it only
+    # stayed harmless because that scenario self-skips without creds). `gateway/`
+    # matches the directory and nothing else.
+    admin-commands/ gateway/ registry/ secret-detect/ tests/
     channel-envelope-safety.test.ts
+    # Hosted UAT unit tests: no creds, no live Telegram, no driver session.
+    # Named as specific files / the runners dir — never a bare `uat` — so the
+    # filter can NEVER widen into uat/scenarios/, which does hit real Telegram
+    # and must stay on the gated uat-host runner (ci-uat.yml) only.
+    #
+    # These ran in NEITHER CI runner before this change: vitest.config.ts
+    # excludes `**/telegram-plugin/uat/**` wholesale (right for scenarios/,
+    # collateral damage for these) and this list never named them. So
+    # feed-matcher.test.ts — whose own docblock calls it "the CI-verifiable
+    # floor" for the worker-feed matcher, and which #3821 extended with
+    # `stripCardNesting` assertions — was executed by nothing.
+    #
+    # They go on the BUN side rather than being un-excluded from vitest because
+    # three of them import `bun:test`, and uat/runners/skill-coverage.test.ts
+    # transitively imports uat/driver.ts → `@mtcute/node`, which vite's resolver
+    # cannot load out of the bun workspace layout (bun's resolver has no
+    # trouble). Fenced by scripts/check-test-runner-coverage.mjs.
+    uat/feed-matcher.test.ts
+    uat/load-env.test.ts
+    uat/uat-driver.test.ts
+    uat/runners/
   )
 fi
 
