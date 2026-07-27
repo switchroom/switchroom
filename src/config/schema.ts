@@ -2019,7 +2019,10 @@ const HindsightPerOpLlmSchema = z
         "window. Absent → inherit " +
         "`hindsight.llm.context_window`, else a per-provider default " +
         "(conservative for non-`claude-code` providers, which usually mean " +
-        "a local llama.cpp/Ollama slot). All three lanes (`retain`, " +
+        "a local llama.cpp/Ollama slot; a self-hosted `base_url` — loopback, " +
+        "RFC1918, `.local`/`.internal` — forces the conservative default too, " +
+        "regardless of the provider NAME, since the endpoint is where the " +
+        "traffic actually terminates). All three lanes (`retain`, " +
         "`reflect`, `consolidation`) are budgeted independently.",
       ),
   })
