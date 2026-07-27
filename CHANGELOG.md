@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### The `:latest` promotion job's `if:` is now pinned to the un-draft job's
+
+#3735 asserted that `release.yml`'s `images-latest` job exists, promotes this
+run's tag to `:latest`, and `needs: finalize`. It never asserted the job's
+`if:`. Those are independent — `needs:` orders a job, `if:` decides whether it
+runs at all — so narrowing the condition to the dispatch clause alone
+(`github.event_name == 'workflow_dispatch' && inputs.dry_run == false`) left
+every test and every required check green while the job silently stopped firing
+on tag pushes. The release would still publish, `:vX.Y.Z` would still ship, and
+`:latest` would never advance again. Nothing fails; you find out by diffing
+manifest digests weeks later.
+
+That edit is plausible rather than adversarial: the comment block above the job
+names `gh workflow run promote.yml -f from=vX.Y.Z -f to=latest` as the recovery
+lever, so the condition reads like it is *about* dispatch.
+
+R13 now requires the promotion job's `if:` to equal the un-draft job's, compared
+whitespace-insensitively and with both jobs resolved structurally, the same way
+R13 already found them. Equality rather than a literal expression, because the
+requirement is genuinely relative: `:latest` must move in exactly the cases the
+release is published in, no more (a dry run must not move it) and no less. It
+also catches drift in the other direction — change `finalize`'s gating and
+forget the promotion's, and this fires. Four mutations prove it: the narrowing
+above (which fires this rule and no other, which is the proof the hole was
+real), a deleted `if:`, one-sided drift, and a whitespace reflow that must stay
+clean.
+
+Also corrected in the #3685 entry below: it claimed the mutation tests fire R12
+"on all four sites". They reconstruct the regression at three — `merge-base`,
+`merge-dependents` and `build-voice`; `build-hindsight` is never mutated. The
+rule itself iterates all four, so the guarantee held; only the prose overclaimed.
+
+The five remaining review findings are filed rather than fixed: #3736 (R12 only
+reads the interior of shell tag branches, so two realistic re-additions escape
+it), #3737, #3738, #3739 and #3740.
+
 ### `:latest` follows the release succeeding, not the tag push
 
 #3654 made a `v*` tag unable to half-ship for the two legs that cannot be
@@ -48,8 +84,13 @@ so it is pinned structurally instead. `tests/release-pipeline-gating.test.ts`
 gains R12 (a `v*` tag push publishes the version tag and nothing named
 `latest`), R13 (`release.yml` has a job promoting this run's tag to `:latest`,
 and it `needs:` the un-draft job, so it inherits the whole green chain) and R14
-(matrix coverage). Every rule is proved by mutation against the pre-#3685 tree:
-reconstructing it fires R12 on all four sites, R13 twice and R14 on `web`.
+(matrix coverage). Every rule is proved by mutation against the pre-#3685 tree.
+R12 iterates every `refs/tags/v*` branch in `docker-images.yml`, so the
+guarantee covers all four; the mutations reconstruct the regression at three of
+them — `merge-base` and `merge-dependents` in the `TAG_ARGS` form, `build-voice`
+in the `tags=` output form — which is enough to prove both shapes of the edit
+are caught. R13 and R14 have their own mutations: a deleted promotion job, a
+promotion that no longer waits for the un-draft, and the missing `web`.
 
 Deliberately NOT done: `docker-images.yml` was not converted into a
 `workflow_call` callee, the `:dev` / `:rc` channels and `promote-to-dev` are

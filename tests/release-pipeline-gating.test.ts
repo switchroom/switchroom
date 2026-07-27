@@ -486,6 +486,42 @@ export function auditGating(
           "that is still a draft, or whose npm/asset legs failed. That is the #3685 defect with a new owner.",
       );
     }
+    // R13 (gating half) — `needs:` only ORDERS the job; the `if:` decides
+    // whether it runs at all. Those are independent, and only the `needs:`
+    // half was asserted when #3735 landed.
+    //
+    // The hole it leaves is silent by construction. Narrow the promotion
+    // job's `if:` to the dispatch clause alone — `github.event_name ==
+    // 'workflow_dispatch' && inputs.dry_run == false`, a plausible tidy-up
+    // since the comment above the job advertises exactly that recovery
+    // lever — and the job never runs on a tag push. Every leg stays green,
+    // the release publishes, `:vX.Y.Z` ships, and `:latest` never advances
+    // again. Nothing fails; you find out by diffing manifest digests.
+    //
+    // Asserted as equality with the un-draft job's own `if:` rather than a
+    // literal expression, because the requirement really is relative:
+    // `:latest` must move in exactly the circumstances the release is
+    // published in — no more (a dry run must not move it) and no less (a
+    // real tag push must). Pinning it to `finalize` also catches DRIFT —
+    // change the release's trigger gating and forget the promotion's and
+    // this fires, which is what a hardcoded string would miss.
+    const normalizeIf = (x: unknown) => String(x ?? "").replace(/\s+/g, " ").trim();
+    if (undraftEntry) {
+      const promoteIf = normalizeIf(job.if);
+      const undraftIf = normalizeIf(undraftEntry[1].if);
+      if (promoteIf === "") {
+        problems.push(
+          `R13: the promotion job (${id}) has no \`if:\` — it must be gated exactly like the un-draft job ` +
+            `(${undraftEntry[0]}), or a dry-run dispatch would move :latest.`,
+        );
+      } else if (promoteIf !== undraftIf) {
+        problems.push(
+          `R13: the promotion job (${id}) has \`if: ${promoteIf}\` but the un-draft job (${undraftEntry[0]}) has ` +
+            `\`if: ${undraftIf}\` — :latest must move in exactly the cases the release is published in. Narrowing ` +
+            "this one leaves :latest silently frozen on tag pushes with every leg still green.",
+        );
+      }
+    }
   }
 
   // R14 — promote.yml's matrix must cover every image docker-images
@@ -889,6 +925,53 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
       job.needs = ["bundle"];
     });
     expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) does not `needs: finalize`/);
+  });
+
+  // The gating half of R13. `needs:` and `if:` are independent: the mutation
+  // below leaves `needs: finalize`, `with.from`, `with.to` and every other
+  // asserted property untouched, so before this rule existed the whole file
+  // stayed green while `:latest` stopped advancing on every future release.
+  it("R13: narrowing the promotion job's `if:` so it never fires on a tag push is caught", () => {
+    const p = mutate((r) => {
+      const job = Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!;
+      // The plausible edit: keep only the dispatch clause, because the job's
+      // own comment names `gh workflow run promote.yml` as the recovery
+      // lever. A tag push then skips it silently, forever.
+      job.if = "github.event_name == 'workflow_dispatch' && inputs.dry_run == false";
+    });
+    expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) has `if: .*` but the un-draft job \(finalize\) has/s);
+    // …and this is the ONLY rule that fires on it. That is the proof the
+    // hole was real: every other assertion in this file passes on a tree
+    // whose `:latest` never moves again.
+    expect(p.filter((x) => !x.startsWith("R13: the promotion job (images-latest) has `if:"))).toEqual([]);
+  });
+
+  it("R13: deleting the promotion job's `if:` entirely is caught", () => {
+    // The other direction: ungated, a `-f dry_run=true` rehearsal dispatch
+    // would move `:latest` for real.
+    const p = mutate((r) => {
+      delete Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!.if;
+    });
+    expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) has no `if:`/);
+  });
+
+  it("R13: tightening the un-draft job's gating without the promotion job's is caught as drift", () => {
+    const p = mutate((r) => {
+      jobDoing(r, "--draft=false")![1].if = "github.event_name == 'push'";
+    });
+    expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) has `if:/);
+  });
+
+  // Guards the rule against over-firing: the two conditions are written as
+  // folded YAML scalars, so re-wrapping one changes the parsed whitespace
+  // without changing the expression. A rule that failed on a reflow would
+  // get silenced rather than fixed.
+  it("R13: re-wrapping the promotion job's `if:` without changing it stays clean", () => {
+    const p = mutate((r) => {
+      const job = Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!;
+      job.if = `  ${String(job.if).replace(/\s+/g, "\n   ")}\n`;
+    });
+    expect(p.join("\n")).not.toMatch(/R13:/);
   });
 
   it("R13: promoting the wrong source or destination tag is caught", () => {
