@@ -33,7 +33,6 @@ import {
   STATUS_CARD_CHAR_BUDGET,
   STATUS_LINE_MAX,
   WORKER_STEP_INDENT,
-  SUBORDINATE_LINE_INDENT,
 } from '../status-no-truncate.js'
 
 /**
@@ -135,31 +134,28 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
 
   it('kills the exact artifacts from the report', () => {
     const collapsed = collapsePreview(body)
-    // 1. the count/ordinal collision — glance line into row 1's ordinal.
-    //    Since #3820 a worker header also carries the card-level
-    //    SUBORDINATE_LINE_INDENT (the whole worker card nests under the 🤖
-    //    agent card), so this seam is separator + card indent.
+    // 1. the count/ordinal collision — glance line into row 1's ordinal. Since
+    //    #3839 the row header is FLUSH (the #3820 card-level indent is gone),
+    //    so the separator is the ONLY thing holding this seam apart.
     //    (The reported spelling was `3 running1.`; with the packed glance line
     //    the same seam now reads `… 512.3k tok` -> `1. Fix issue`, so assert on
     //    the CURRENT last token of line 1 — an assertion on the old spelling
     //    alone would be vacuously green.)
     expect(collapsed).not.toContain('running1.')
     expect(collapsed).not.toContain('tok1.')
-    expect(collapsed).toContain(`tok${NB}${SUBORDINATE_LINE_INDENT}1. Fix issue`)
-    // 2. the mid-word ✓ (model tag running into the step trail). Here the
-    //    separator and WORKER_STEP_INDENT (three U+2800 leading a step line)
-    //    stack, so the seam is separator + indent, asserted against both
-    //    constants rather than a hardcoded run of spaces.
+    expect(collapsed).toContain(`tok${NB}1. Fix issue`)
+    // 2. the mid-word ✓ (model tag running into the step trail). A step line
+    //    still leads with WORKER_STEP_INDENT (three U+2800), so this seam is
+    //    separator + step indent — asserted against the constant rather than a
+    //    hardcoded run.
     expect(collapsed).not.toContain('opus 5✓')
-    expect(collapsed).toContain(`opus 5${NB}${SUBORDINATE_LINE_INDENT}${WORKER_STEP_INDENT}✓`)
+    expect(collapsed).toContain(`opus 5${NB}${WORKER_STEP_INDENT}✓`)
     // 3. the step trail running into the next step, and into the next row's
-    //    header (post-#3820 that last seam is separator + card indent).
+    //    header (post-#3839 that last seam is the separator alone).
     expect(collapsed).not.toContain('gateway.ts→')
-    expect(collapsed).toContain(
-      `gateway.ts${NB}${SUBORDINATE_LINE_INDENT}${WORKER_STEP_INDENT}→`,
-    )
+    expect(collapsed).toContain(`gateway.ts${NB}${WORKER_STEP_INDENT}→`)
     expect(collapsed).not.toContain('search2.')
-    expect(collapsed).toContain(`search${NB}${SUBORDINATE_LINE_INDENT}2.`)
+    expect(collapsed).toContain(`search${NB}2.`)
   })
 
   it('leads with a self-contained glance that ends in a unit word, not a bare number', () => {
@@ -178,13 +174,10 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
     // show the collapsed preview mashes again. Without this, the assertions
     // above could all be passing for reasons unrelated to the fix.
     //
-    // The control runs on the 🤖 AGENT card, not the worker card: since #3820
-    // every line of a worker card after line 1 carries a leading
-    // SUBORDINATE_LINE_INDENT, which separates its seams independently of the
-    // collapse separator — so a worker-card control would no longer isolate the
-    // separator's contribution. The agent card is the surface where the
-    // separator is still the ONLY thing holding the seams apart, which is
-    // exactly what this control must measure.
+    // The control runs on the 🤖 AGENT card. Post-#3839 the single-worker card
+    // is flush too, so either would isolate the separator's contribution; the
+    // agent card is kept because it has no step indent on ANY line, so no
+    // future indent change can quietly make this control vacuous.
     const agent = renderActivityFeed([
       'Reading gateway.ts',
       'Searching memory',
@@ -228,7 +221,9 @@ describe('single-worker / agent status card survives the collapse too (#3666)', 
     expectNoMashedSeams(body)
     const collapsed = collapsePreview(body)
     expect(collapsed).not.toContain('toolsstarting')
-    expect(collapsed).toContain(`0 tools${NB}${SUBORDINATE_LINE_INDENT}starting`)
+    // #3839: the single-worker card is flush, so the separator alone holds the
+    // hand-rolled `starting…` seam apart — nothing else masks a regression.
+    expect(collapsed).toContain(`0 tools${NB}starting`)
   })
 
   it('the nested child block stays separated even though its indent is ASCII (#3668)', () => {

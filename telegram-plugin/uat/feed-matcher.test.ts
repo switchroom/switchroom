@@ -52,29 +52,36 @@ describe("isWorkerFeedMessage", () => {
     expect(WORKER_FEED_RE.test("🛠 Worker · x")).toBe(true);
   });
 
-  it("still matches the #3820 SUBORDINATE worker card as Telegram delivers it", () => {
-    // Since #3820 the worker card leads with `└─ ` and indents every later line
-    // with a U+2800 run so it reads as a child of the 🤖 agent card. Telegram
-    // strips the bold/italic entities but delivers that chrome verbatim, and
-    // `String.trim()` removes neither (U+2800 is category So, not whitespace) —
-    // so every matcher here has to survive it or recall/reply scenarios start
-    // latching onto worker cards as answers.
-    const nested = "└─ 🛠 WORKER · crawling changelog\n⠀⠀⠀55s · 9 tools · opus 5";
-    expect(isWorkerFeedMessage(feed(nested))).toBe(true);
+  it("matches the FLUSH worker card as Telegram delivers it (#3839)", () => {
+    // #3839 removed the whole-card `└─ ` prefix and whole-card indent that
+    // #3820/#3821 put on worker cards, so the single-worker card arrives flush.
+    const flush = "🛠 WORKER · crawling changelog\n55s · 9 tools · opus 5";
+    expect(isWorkerFeedMessage(feed(flush))).toBe(true);
   });
 });
 
-describe("#3820 subordinate-card nesting is transparent to the matchers", () => {
-  it("classifies a nested agent-shaped card as the liveness card, not an answer", () => {
-    const nested =
-      "└─ 🛠 WORKER · crawl\n⠀⠀⠀12s · 3 tools\n⠀⠀⠀✓ Reading CLAUDE.md\n⠀⠀⠀→ Searching memory";
-    expect(isLivenessCardMessage(feed(nested))).toBe(true);
-    expect(isActivityFeedMessage(feed(nested))).toBe(true);
+describe("#3839 the surviving step indent is transparent to the matchers", () => {
+  it("classifies a flush agent-shaped worker card as the liveness card, not an answer", () => {
+    const flush =
+      "🛠 WORKER · crawl\n12s · 3 tools\n✓ Reading CLAUDE.md\n→ Searching memory";
+    expect(isLivenessCardMessage(feed(flush))).toBe(true);
+    expect(isActivityFeedMessage(feed(flush))).toBe(true);
   });
 
-  it("strips the header prefix and the indent, and leaves ordinary prose alone", () => {
-    expect(stripCardNesting("└─ 🛠 WORKER · crawl")).toBe("🛠 WORKER · crawl");
+  it("classifies a combined card whose step lines carry WORKER_STEP_INDENT", () => {
+    // The one indent that survives #3839: step lines under a worker row header
+    // on the 2+ worker card. `String.trim()` does NOT remove U+2800 (category
+    // So, not whitespace), so the matchers must normalise it explicitly or a
+    // recall/reply scenario latches onto the combined card as an answer.
+    const combined =
+      "🛠 WORKERS · 2 running · oldest 55s · 13 tools\n" +
+      "1. crawl · 55s · 9 tools\n⠀⠀⠀✓ Reading CLAUDE.md\n⠀⠀⠀→ Searching memory";
+    expect(isWorkerFeedMessage(feed(combined))).toBe(true);
+  });
+
+  it("strips the step indent and leaves ordinary prose alone", () => {
     expect(stripCardNesting("⠀⠀⠀→ Searching memory")).toBe("→ Searching memory");
+    expect(stripCardNesting("🛠 WORKER · crawl")).toBe("🛠 WORKER · crawl");
     expect(stripCardNesting("on it, pulling the logs now")).toBe(
       "on it, pulling the logs now",
     );

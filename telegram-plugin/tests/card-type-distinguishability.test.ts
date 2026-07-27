@@ -1,26 +1,26 @@
 /**
- * #3820 — the 🤖 agent card and the 🛠 worker card must not be visually
- * interchangeable when both are live in one chat.
+ * #3839 — every status card is FLUSH at the left margin, and the only
+ * indentation any card carries is the step indent that separates one worker's
+ * steps from the next worker's on the combined (2+ worker) card.
  *
- * Both surfaces render through the SAME primitive (`renderStatusCard`,
- * tool-activity-summary.ts), so before this fix they were byte-for-byte the
- * same layout — two header lines, the identical `Ns · N tools · Nk tok · model`
- * stat row, the identical `✓`/`→` step trail — differing only by an emoji and
- * one word. When a parent narrates the task it delegated, the two cards' step
- * lines are literally identical strings and the pair reads as a duplicate
- * rather than as parent + child.
+ * #3820/#3821 had made the worker card structurally subordinate to the 🤖 agent
+ * card: line 1 prefixed with `└─ ` and every later line indented by a U+2800
+ * run. Ken rejected that shape — it burns a level of horizontal space on a
+ * phone, and the worker card does not always sit below the agent card, so a
+ * card-LEVEL subordination marker asserts a relationship that is not always
+ * true. Net effect of this file's expectations: everything shifted left by one
+ * level; worker-vs-worker separation is carried by the surviving step indent
+ * plus the numbered row headers.
  *
- * These tests assert the RENDERED OUTPUT differs structurally, using the same
- * inputs on both surfaces so a shared-layout regression cannot pass:
- *   - the worker card's line 1 carries `└─ ` and the agent card's never does;
- *   - every later worker line carries the subordinate indent;
- *   - with identical step text and identical stats, NO line of one card equals
- *     any line of the other.
+ * These tests assert the RENDERED OUTPUT of the real renderers, and they fail
+ * on the pre-#3839 shape (which put `└─ ` on line 1 and U+2800 on every other
+ * line of both worker surfaces).
  *
- * Plus the Telegram-reality guards: the prefixes survive the real outbound
- * markdown guard (`richMessage`) byte-identical, the indent is not whitespace
- * under any trimming rule (the #3662 lesson), and `└─` is not a line-start
- * block-construct trigger.
+ * What is NOT asserted here any more, deliberately: that no rendered line is
+ * shared between the agent card and the worker card. With whole-card nesting
+ * gone and identical step text, the two cards' BODY lines coincide byte for
+ * byte — see the explicit characterization test at the end. Line 1 (🤖 `Agent`
+ * vs 🛠 `WORKER`) is now the only type cue, which is the accepted trade.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -29,22 +29,19 @@ import {
   renderCombinedWorkerFeed,
 } from '../tool-activity-summary.js'
 import { renderWorkerActivity, type WorkerActivityView } from '../worker-activity-feed.js'
-import {
-  SUBORDINATE_HEADER_PREFIX,
-  SUBORDINATE_LINE_INDENT,
-  WORKER_STEP_INDENT,
-  STATUS_CARD_CHAR_BUDGET,
-  nestSubordinateCardLines,
-} from '../status-no-truncate.js'
+import { WORKER_STEP_INDENT, STATUS_CARD_CHAR_BUDGET } from '../status-no-truncate.js'
 import { richMessage } from '../rich-send.js'
 
 /** Split a rendered card into display lines, dropping the hard-break padding. */
 function lines(card: string): string[] {
-  return card.split('\n').map((l) => l.replace(/[\u00A0 \t\r]+$/, ''))
+  return card.split('\n').map((l) => l.replace(/[  \t\r]+$/, ''))
 }
 
-/** The exact scenario from the issue: parent narrating the task it delegated. */
+/** The exact scenario from #3820: parent narrating the task it delegated. */
 const STEPS = ['PR 2502 details', 'Commits since v0.8.5']
+
+/** The card-level chrome #3839 removed. Asserted absent, never re-emitted. */
+const REMOVED_HEADER_PREFIX = '└─ '
 
 function agentCard(): string {
   const out = renderActivityFeed(STEPS, false, '', undefined, {
@@ -73,116 +70,145 @@ function workerView(over: Partial<WorkerActivityView> = {}): WorkerActivityView 
   } as WorkerActivityView
 }
 
-describe('#3820 agent vs worker card distinguishability', () => {
-  it('marks the worker card subordinate on line 1 and never the agent card', () => {
-    const agent = lines(agentCard())
-    const worker = lines(renderWorkerActivity(workerView()))
+function combinedCard(): string {
+  const card = renderCombinedWorkerFeed(
+    [
+      {
+        description: 'Check upstream hindsight changes',
+        elapsedMs: 55_000,
+        toolCount: 9,
+        currentStep: 'Commits since v0.8.5',
+        historyLines: STEPS,
+        ordinal: 1,
+      },
+      {
+        description: 'Fix the card renderer',
+        elapsedMs: 30_000,
+        toolCount: 4,
+        currentStep: 'Reading render.ts',
+        historyLines: ['Reading render.ts'],
+        ordinal: 2,
+      },
+    ],
+    { maxRows: 4 },
+  )
+  expect(card).not.toBeNull()
+  return card as string
+}
 
-    expect(worker[0].startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(true)
-    expect(agent[0].startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(false)
-    // The agent card stays flush at the left margin on EVERY line — it is the
-    // parent, so nothing about it may read as nested.
-    for (const l of agent) {
-      expect(l.startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(false)
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT)).toBe(false)
+/** Every worker surface, in each of its render states, as rendered strings. */
+function everyWorkerSurface(): Array<{ name: string; card: string }> {
+  return [
+    { name: 'running', card: renderWorkerActivity(workerView()) },
+    {
+      name: 'just dispatched',
+      card: renderWorkerActivity(workerView({ narrativeLines: [], latestSummary: '' })),
+    },
+    {
+      name: 'done + result block',
+      card: renderWorkerActivity(
+        workerView({ state: 'done', latestSummary: 'Rebased and opened the PR.' }),
+      ),
+    },
+    {
+      name: 'failed + result block',
+      card: renderWorkerActivity(
+        workerView({ state: 'failed', latestSummary: 'Scoped tests went red.' }),
+      ),
+    },
+    {
+      name: 'incomplete',
+      card: renderWorkerActivity(workerView({ state: 'incomplete', latestSummary: '' })),
+    },
+    { name: 'combined (2 workers)', card: combinedCard() },
+  ]
+}
+
+describe('#3839 every card is flush at the left margin', () => {
+  it('emits no `└─ ` header prefix on any surface', () => {
+    for (const { name, card } of [{ name: 'agent', card: agentCard() }, ...everyWorkerSurface()]) {
+      expect(card.includes(REMOVED_HEADER_PREFIX), `${name} card carries └─`).toBe(false)
     }
   })
 
-  it('indents every worker card line after line 1', () => {
-    const worker = lines(renderWorkerActivity(workerView()))
-    expect(worker.length).toBeGreaterThan(2)
-    for (const l of worker.slice(1)) {
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT)).toBe(true)
+  it('leaves every line of the SINGLE-worker card unindented', () => {
+    // Pre-#3839 line 1 started `└─ ` and lines 2..n started with a U+2800 run.
+    const surfaces = everyWorkerSurface()
+    for (const name of [
+      'running',
+      'just dispatched',
+      'done + result block',
+      'failed + result block',
+      'incomplete',
+    ]) {
+      const card = surfaces.find((s) => s.name === name)?.card as string
+      const l = lines(card)
+      expect(l.length).toBeGreaterThan(1)
+      for (const line of l) {
+        expect(line.startsWith(WORKER_STEP_INDENT), `${name}: "${line}"`).toBe(false)
+      }
     }
   })
 
-  it('shares no rendered line between the two cards even with identical steps and stats', () => {
-    // This is the issue's actual symptom: the parent narrates the task it
-    // delegated, so the step text overlaps. On the pre-#3820 renderer the
-    // stat row AND both step lines were byte-identical across the two cards.
-    const agent = lines(agentCard())
-    const worker = lines(renderWorkerActivity(workerView()))
-    const overlap = agent.filter((a) => worker.includes(a))
-    expect(overlap).toEqual([])
+  it('keeps the just-dispatched `starting…` tail flush too', () => {
+    // The one render state a user always sees first takes a hand-rolled append
+    // path outside renderStatusCard — the place a shape change silently misses.
+    const l = lines(renderWorkerActivity(workerView({ narrativeLines: [], latestSummary: '' })))
+    expect(l[0].startsWith('🛠 **WORKER**')).toBe(true)
+    expect(l[l.length - 1]).toBe('_starting…_')
   })
 
-  it('uses a high-contrast caps type label on the worker card only', () => {
-    const agent = agentCard()
-    const worker = renderWorkerActivity(workerView())
-    expect(worker).toContain('🛠 **WORKER**')
-    expect(agent).toContain('🤖 **Agent**')
-    expect(agent).not.toContain('WORKER')
-  })
-
-  it('keeps the terminal (result-block) worker render subordinate too', () => {
-    const worker = lines(
+  it('keeps the terminal result block flush', () => {
+    const l = lines(
       renderWorkerActivity(
         workerView({ state: 'done', latestSummary: 'Rebased and opened the PR.' }),
       ),
     )
-    expect(worker[0].startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(true)
-    for (const l of worker.slice(1)) {
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT)).toBe(true)
-    }
-    // The result block is present and nested, not floated back to the margin.
-    expect(worker.some((l) => l.startsWith(`${SUBORDINATE_LINE_INDENT}✅ `))).toBe(true)
+    expect(l.some((x) => x.startsWith('✅ '))).toBe(true)
+    expect(l.some((x) => x.startsWith(`${WORKER_STEP_INDENT}✅ `))).toBe(false)
   })
+})
 
-  it('keeps the just-dispatched (starting…) worker render subordinate', () => {
-    // The first state a user ever sees for a worker takes a hand-rolled append
-    // path outside renderStatusCard — the one place a nesting fix can silently
-    // miss.
-    const worker = lines(
-      renderWorkerActivity(workerView({ narrativeLines: [], latestSummary: '' })),
-    )
-    expect(worker[0].startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(true)
-    expect(worker[worker.length - 1]).toBe(`${SUBORDINATE_LINE_INDENT}_starting…_`)
-  })
-
-  it('nests the combined (2+ worker) card and keeps its internal hierarchy', () => {
-    const card = renderCombinedWorkerFeed(
-      [
-        {
-          description: 'Check upstream hindsight changes',
-          elapsedMs: 55_000,
-          toolCount: 9,
-          currentStep: 'Commits since v0.8.5',
-          historyLines: STEPS,
-          ordinal: 1,
-        },
-        {
-          description: 'Fix the card renderer',
-          elapsedMs: 30_000,
-          toolCount: 4,
-          currentStep: 'Reading render.ts',
-          historyLines: ['Reading render.ts'],
-          ordinal: 2,
-        },
-      ],
-      { maxRows: 4 },
-    )
-    expect(card).not.toBeNull()
-    const l = lines(card as string)
-    expect(l[0]).toBe(`${SUBORDINATE_HEADER_PREFIX}🛠 **WORKERS** · _2 running · oldest 55s · 13 tools_`)
-    // Row headers sit at one level; their steps stay one level deeper, so the
-    // card's own parent/child structure survives the shift right.
+describe('#3839 the combined card keeps exactly ONE level of indent', () => {
+  it('puts the glance line and row headers flush', () => {
+    const l = lines(combinedCard())
+    expect(l[0]).toBe('🛠 **WORKERS** · _2 running · oldest 55s · 13 tools_')
     const rowHeaders = l.filter((x) => x.includes('**1. ') || x.includes('**2. '))
     expect(rowHeaders.length).toBe(2)
-    for (const h of rowHeaders) {
-      expect(h.startsWith(SUBORDINATE_LINE_INDENT)).toBe(true)
-      expect(h.startsWith(SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT)).toBe(false)
-    }
+    for (const h of rowHeaders) expect(h.startsWith(WORKER_STEP_INDENT)).toBe(false)
+  })
+
+  it('indents step lines exactly one level — never two', () => {
+    const l = lines(combinedCard())
     const stepLines = l.filter((x) => x.includes('→ ') || x.includes('✓ '))
     expect(stepLines.length).toBeGreaterThan(0)
     for (const s of stepLines) {
-      expect(s.startsWith(SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT)).toBe(true)
+      expect(s.startsWith(WORKER_STEP_INDENT)).toBe(true)
+      // The pre-#3839 double indent (SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT).
+      expect(s.startsWith(WORKER_STEP_INDENT + WORKER_STEP_INDENT)).toBe(false)
     }
   })
 
-  it('stays under the wire char budget on the subordinate over-budget path', () => {
-    // fitCardToBudget has its own line assembly + its own arithmetic; the
-    // per-line nesting cost must be charged there or an oversized worker card
-    // can overflow the wire cap.
+  it('puts the `+M more working…` spill line flush', () => {
+    const rows = Array.from({ length: 5 }, (_, i) => ({
+      description: `task ${i + 1}`,
+      elapsedMs: 10_000,
+      toolCount: 1,
+      currentStep: 'working',
+      historyLines: ['working'],
+      ordinal: i + 1,
+    }))
+    const card = renderCombinedWorkerFeed(rows, { maxRows: 2 }) as string
+    const spill = lines(card).find((x) => x.includes('more working…'))
+    expect(spill).toBe('_+3 more working…_')
+  })
+})
+
+describe('#3839 char-budget accounting matches the flush shape', () => {
+  it('keeps an oversized worker card under the wire budget', () => {
+    // fitCardToBudget has its own line assembly + arithmetic. With the per-line
+    // nest cost removed it must still land under the cap, and must not emit any
+    // chrome the card no longer carries.
     const huge = Array.from({ length: 500 }, (_, i) => `${i} `.repeat(100))
     const card = renderStatusCard({
       header: {
@@ -194,41 +220,60 @@ describe('#3820 agent vs worker card distinguishability', () => {
         state: 'running',
       },
       steps: huge,
-      subordinate: true,
+      historyWindow: 6,
     })
     expect(card).not.toBeNull()
-    expect((card as string).length).toBeLessThanOrEqual(STATUS_CARD_CHAR_BUDGET)
-    expect((card as string).startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(true)
+    const s = card as string
+    expect(s.length).toBeLessThanOrEqual(STATUS_CARD_CHAR_BUDGET)
+    expect(s.includes(REMOVED_HEADER_PREFIX)).toBe(false)
+    for (const l of lines(s)) expect(l.startsWith(WORKER_STEP_INDENT)).toBe(false)
   })
 
-  it('leaves a non-subordinate card byte-identical to the un-nested render', () => {
-    const opts = {
-      header: {
-        emoji: '🤖',
-        label: 'Agent',
-        elapsedMs: 1000,
-        toolCount: 2,
-        state: 'running' as const,
-      },
-      steps: STEPS,
-    }
-    expect(renderStatusCard({ ...opts, subordinate: false })).toBe(renderStatusCard(opts))
+  it('keeps an oversized combined card under the wire budget', () => {
+    const rows = Array.from({ length: 6 }, (_, i) => ({
+      description: 'D'.repeat(72),
+      elapsedMs: 10_000,
+      toolCount: 3,
+      currentStep: 'x',
+      historyLines: Array.from({ length: 6 }, (_, k) => `${'s'.repeat(180)}-${i}-${k}`),
+      ordinal: i + 1,
+    }))
+    const card = renderCombinedWorkerFeed(rows, { maxRows: 6 }) as string
+    expect(card.length).toBeLessThanOrEqual(STATUS_CARD_CHAR_BUDGET)
   })
 })
 
-describe('#3820 subordinate prefixes survive Telegram reality', () => {
-  it('passes through the real outbound markdown guard byte-identical', () => {
+describe('#3839 the surviving type cues', () => {
+  it('uses a high-contrast caps type label on the worker card only', () => {
+    const agent = agentCard()
+    const worker = renderWorkerActivity(workerView())
+    expect(worker).toContain('🛠 **WORKER**')
+    expect(agent).toContain('🤖 **Agent**')
+    expect(agent).not.toContain('WORKER')
+  })
+
+  it('distinguishes the two cards on LINE 1 — the only remaining cue', () => {
+    // Characterization, not aspiration: with whole-card nesting gone and
+    // identical step text + stats, the two cards' BODY lines coincide byte for
+    // byte. Line 1 is doing all of the work, so it must never converge.
+    const agent = lines(agentCard())
+    const worker = lines(renderWorkerActivity(workerView()))
+    expect(agent[0]).not.toBe(worker[0])
+    expect(agent[0].startsWith('🤖 ')).toBe(true)
+    expect(worker[0].startsWith('🛠 ')).toBe(true)
+    // The documented cost of #3839, pinned so a future change to it is visible:
+    // every line BELOW line 1 is now shared between the two cards.
+    const overlap = agent.filter((a) => worker.includes(a))
+    expect(overlap).toEqual(agent.slice(1))
+  })
+})
+
+describe('#3839 the surviving step indent survives Telegram reality', () => {
+  it('passes every card through the real outbound markdown guard byte-identical', () => {
     // richMessage() is the ONE adapter every `{ markdown }` wire send funnels
     // through (rich-send.ts) — it runs the line-start / heading / dollar-math
-    // guards. A prefix that gets escaped there would render as literal markup.
-    for (const card of [
-      agentCard(),
-      renderWorkerActivity(workerView()),
-      renderCombinedWorkerFeed(
-        [{ description: 'a', elapsedMs: 1, toolCount: 1, currentStep: 'b', ordinal: 1 }],
-        { maxRows: 4 },
-      ) as string,
-    ]) {
+    // guards. Chrome that got escaped there would render as literal markup.
+    for (const { card } of [{ card: agentCard() }, ...everyWorkerSurface()]) {
       expect(richMessage(card).markdown).toBe(card)
     }
   })
@@ -237,32 +282,10 @@ describe('#3820 subordinate prefixes survive Telegram reality', () => {
     // U+00A0 shipped in #3662 and was INERT: Telegram left-trims a leading
     // Unicode-whitespace run, and U+00A0 is category Zs. Assert the PROPERTY,
     // not the bytes — a byte-only assertion is what let #3662 ship green.
-    for (const ch of Array.from(SUBORDINATE_LINE_INDENT)) {
+    for (const ch of Array.from(WORKER_STEP_INDENT)) {
       expect(/\s/.test(ch)).toBe(false)
       expect(/\p{White_Space}/u.test(ch)).toBe(false)
       expect(/\p{Zs}/u.test(ch)).toBe(false)
     }
-  })
-
-  it('uses a header prefix that is ink, not a line-start block trigger', () => {
-    const first = SUBORDINATE_HEADER_PREFIX[0]
-    // Not whitespace (would be trimmed), and not one of the GFM line-start
-    // block-construct triggers guarded in render/line-start-guard.ts.
-    expect(/\s/.test(first)).toBe(false)
-    expect('#>-+*'.includes(first)).toBe(false)
-    expect(/^\d+[.)]/.test(SUBORDINATE_HEADER_PREFIX)).toBe(false)
-  })
-
-  it('charges one flat per-line cost: header prefix and indent are equal length', () => {
-    // fitCardToBudget's arithmetic depends on this invariant.
-    expect(SUBORDINATE_HEADER_PREFIX.length).toBe(SUBORDINATE_LINE_INDENT.length)
-  })
-
-  it('nestSubordinateCardLines is pure and handles the empty case', () => {
-    expect(nestSubordinateCardLines([])).toEqual([])
-    expect(nestSubordinateCardLines(['a', 'b'])).toEqual([
-      `${SUBORDINATE_HEADER_PREFIX}a`,
-      `${SUBORDINATE_LINE_INDENT}b`,
-    ])
   })
 })

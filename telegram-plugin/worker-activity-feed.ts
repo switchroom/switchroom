@@ -55,11 +55,7 @@ import {
   truncate,
   COLLAPSE_SAFE_SEPARATOR,
 } from './card-format.js'
-import {
-  WORKER_HISTORY_MAX,
-  SUBORDINATE_HEADER_PREFIX,
-  SUBORDINATE_LINE_INDENT,
-} from './status-no-truncate.js'
+import { WORKER_HISTORY_MAX } from './status-no-truncate.js'
 import {
   renderStatusCard,
   formatStepSuffix,
@@ -168,30 +164,32 @@ export function repeatCountOf(line: string): number {
 
 /**
  * Thin adapter over the unified `renderStatusCard` primitive (emoji 🛠, label
- * 'WORKER', `subordinate: true`): builds the header, passes raw narrative steps
+ * 'WORKER'): builds the header, passes raw narrative steps
  * (the primitive runs stripMarkdown → collapse ws → clip → escape per line),
  * and on finish passes the cleaned result paragraph as the `result` block.
  *
  * Layout (running):
- *   └─ 🛠 **WORKER** · _{description}_
- *      _{elapsed} · {n} tools_
- *      ~~_✓ {earlier step}_~~
- *      **→ {newest step}**
+ *   🛠 **WORKER** · _{description}_
+ *   _{elapsed} · {n} tools_
+ *   ~~_✓ {earlier step}_~~
+ *   **→ {newest step}**
  *
  * Layout (finished): the feed renders all-done, then a rule + cleaned result:
- *   └─ 🛠 **WORKER** · _{description}_
- *      _done · {n} tools · {elapsed}_
- *      ~~_✓ {step}_~~
- *      ─────
- *      ✅ _{cleaned result paragraph}_
+ *   🛠 **WORKER** · _{description}_
+ *   _done · {n} tools · {elapsed}_
+ *   ~~_✓ {step}_~~
+ *   ─────
+ *   ✅ _{cleaned result paragraph}_
  *
- * SUBORDINATION (#3820): the `└─ ` prefix, the whole-block indent, and the
- * caps `WORKER` label exist so this card cannot be mistaken for the 🤖 agent
- * card at a glance on a phone. Before #3820 the two cards differed only by
- * their emoji and one capitalised word while sharing the identical two-line
- * header, stat row, and step trail. Do NOT "tidy" any of the three away
- * individually: each is a separate one-glance cue, and the pair is frequently
- * live in the same chat at the same time with overlapping step text.
+ * FLUSH (#3839): this card sits at the left margin. #3820/#3821 indented the
+ * whole block and prefixed line 1 with `└─ ` to mark it subordinate to the 🤖
+ * agent card; that was reverted because it burned a level of horizontal phone
+ * width and because this card does not always sit below the agent card, so a
+ * card-level subordination marker asserts a relationship that is not always
+ * true. The remaining type cue is line 1: the 🛠 emoji plus the caps `WORKER`
+ * label against the agent card's 🤖 `Agent`. Keep that pair — with identical
+ * step text and stats the two cards' BODY lines can now coincide byte for
+ * byte, so line 1 is doing all of the distinguishing work.
  */
 export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): string {
   const desc = truncate(stripMarkdown(v.description).trim() || 'background task', DESC_MAX)
@@ -251,12 +249,10 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     // Lone-worker card: window to the w=1 point of Ken's curve (6) so it shows
     // the full recent trail, not the 5-line agent-card default (#3349).
     historyWindow: workerHistoryDepth(1),
-    // Structurally subordinate to the 🤖 agent card (#3820).
-    subordinate: true,
   })
   if (card == null) {
     // Unreachable (header always present) — defensive.
-    return `${SUBORDINATE_HEADER_PREFIX}🛠 **WORKER** · _starting…_`
+    return '🛠 **WORKER** · _starting…_'
   }
   if (!finished && steps.length === 0) {
     // Header-only running render → append the starting placeholder with a GFM
@@ -265,11 +261,9 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     // The collapse separator is carried here too (#3666) — this card is pinned,
     // and a hand-rolled seam would be the one boundary that still mashed in
     // Telegram's pinned bar.
-    // The placeholder is a card BODY line, so it carries the subordinate indent
-    // like every other non-header line (#3820) — otherwise the one render state
-    // a user sees first (a just-dispatched worker) would be the one that isn't
-    // visibly nested.
-    return `${card}${COLLAPSE_SAFE_SEPARATOR}  \n${SUBORDINATE_LINE_INDENT}_starting…_`
+    // Flush like every other body line of this card (#3839) — the single-worker
+    // card carries no indentation at all now.
+    return `${card}${COLLAPSE_SAFE_SEPARATOR}  \n_starting…_`
   }
   return card
 }
@@ -616,10 +610,13 @@ const COOLDOWN_JITTER_MS = 500
  * rows and reads like a stuck worker. A single best-effort edit collapses it to
  * an honest "moved" note — issued once per rotation (≥ cap interval), never per
  * tick, so it adds no edit churn / pin storm. Plain voice, no em dash.
+ *
+ * Exported so the card-preview harness (`scripts/card-previews.ts`) renders the
+ * real string rather than a copy that can drift from it.
  */
-const WORKER_CARD_SUPERSEDED_BODY =
-  `${SUBORDINATE_HEADER_PREFIX}🛠 **WORKER** · _continued_\n\n` +
-  `${SUBORDINATE_LINE_INDENT}_Live progress moved to a fresh card to stay pinned._`
+export const WORKER_CARD_SUPERSEDED_BODY =
+  '🛠 **WORKER** · _continued_\n\n' +
+  '_Live progress moved to a fresh card to stay pinned._'
 
 function extractRetryAfterSecs(err: unknown): number | null {
   if (err == null || typeof err !== 'object') return null
