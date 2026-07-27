@@ -49,9 +49,18 @@
  * deterministic preflight is what makes the swap loud instead of silent.
  */
 
+import { isSelfHostedHttpUrl } from "./self-hosted-url.js";
+
 /** Per-op LLM config fields this module cares about (structural subset). */
 export interface ContextBudgetPerOpInput {
   provider?: string;
+  /**
+   * `HINDSIGHT_API_<OP>_LLM_BASE_URL`. Read here (#3723) because the endpoint
+   * is a STRONGER signal than the provider name for "how big is this lane's
+   * window?": a LiteLLM-fronted local box routinely carries the upstream
+   * vendor's name as its provider label.
+   */
+  base_url?: string;
   context_window?: number;
 }
 
@@ -178,6 +187,12 @@ export interface HindsightLaneBudget {
   lane: HindsightBudgetLane;
   /** Declared context window (tokens) for this lane's backend. */
   windowTokens: number;
+  /**
+   * `windowTokens` minus the {@link HINDSIGHT_CONTEXT_SAFETY_FRACTION} band —
+   * the budget every lane is actually held to. This, not `windowTokens`, is
+   * what the preflight compares against (#3721).
+   */
+  usableTokens: number;
   windowSource: ContextWindowSource;
   /** Effective provider for this lane (per-op override → global → default). */
   provider: string;
@@ -185,7 +200,7 @@ export interface HindsightLaneBudget {
   maxCompletionTokens: number;
   /** Estimated worst-case PROMPT tokens for one call at the derived settings. */
   estimatedPromptTokens: number;
-  /** `estimatedPromptTokens + maxCompletionTokens` — must fit the window. */
+  /** `estimatedPromptTokens + maxCompletionTokens` — must fit `usableTokens`. */
   worstCaseTotalTokens: number;
 }
 
@@ -195,15 +210,49 @@ export interface HindsightConsolidationBudget extends HindsightLaneBudget {
   batchSize: number;
 }
 
-export interface HindsightReflectBudget extends HindsightLaneBudget {
+/**
+ * The reflect lane. Deliberately NOT an extension of {@link HindsightLaneBudget}:
+ * reflect has no `maxCompletionTokens`, because **upstream exposes no reflect
+ * completion cap** (#3722).
+ *
+ * Verified against the shipped image: `config.py` defines
+ * `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS` and
+ * `HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS` and nothing of the kind
+ * for reflect — its only token knobs are `REFLECT_MAX_CONTEXT_TOKENS`,
+ * `REFLECT_MAX_ITERATIONS` and `REFLECT_SOURCE_FACTS_MAX_TOKENS`. So the
+ * completion figure here can only ever be a **reserve held back from the
+ * prompt cap**, never a cap pushed to the backend, and it is named that way so
+ * nobody reads it as an env-var-shaped quantity that failed to be emitted.
+ */
+export interface HindsightReflectBudget {
   lane: "reflect";
+  windowTokens: number;
+  usableTokens: number;
+  windowSource: ContextWindowSource;
+  provider: string;
   /**
    * Derived `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS` — the reflect loop's
    * accumulated-context bound. Equal to `estimatedPromptTokens`, because for
    * this lane the cap IS the worst-case prompt: the engine forces the final
-   * prompt once accumulation reaches it.
+   * prompt once accumulation reaches it. This is the ONLY reflect number
+   * switchroom emits.
    */
   maxContextTokens: number;
+  /**
+   * Tokens held back from `maxContextTokens` to leave room for reflect's own
+   * answer. **Not enforced at runtime** — see the interface doc: reflect's
+   * completion length is whatever the backend does, so this is a heuristic
+   * reserve, not a guarantee. Sizing it is the only thing switchroom can do.
+   */
+  completionReserveTokens: number;
+  estimatedPromptTokens: number;
+  /**
+   * `maxContextTokens + completionReserveTokens`. A self-consistency check on
+   * the derivation (did we actually hold the reserve back inside the usable
+   * band?), NOT an end-to-end proof — only `maxContextTokens` reaches the
+   * backend.
+   */
+  worstCaseTotalTokens: number;
 }
 
 export interface HindsightContextBudget {
@@ -217,40 +266,91 @@ function clamp(value: number, floor: number, ceiling: number): number {
 }
 
 /**
- * Default window for a provider name. `claude-code` (and a raw `anthropic`
- * provider) get Claude's 200k; everything else gets the conservative local
- * default, because a non-Claude provider in switchroom overwhelmingly means
- * "LiteLLM in front of something local whose window we do not know".
+ * The part of a declared window a lane may actually budget against: the window
+ * minus the {@link HINDSIGHT_CONTEXT_SAFETY_FRACTION} band. Single definition
+ * so no lane can quietly skip the band — the retain lane did exactly that
+ * before #3721, and its worst case (a FIXED 8,000-token prompt estimate plus
+ * the 3,072 completion floor) was checked against the raw window.
  */
-export function defaultContextWindowForProvider(provider: string): number {
+export function usableContextTokens(windowTokens: number): number {
+  return windowTokens - Math.floor(windowTokens * HINDSIGHT_CONTEXT_SAFETY_FRACTION);
+}
+
+/**
+ * Default window for a lane, from `(provider, base_url)` JOINTLY.
+ *
+ * `claude-code` (and a raw `anthropic` provider) get Claude's 200k; everything
+ * else gets the conservative local default, because a non-Claude provider in
+ * switchroom overwhelmingly means "LiteLLM in front of something local whose
+ * window we do not know".
+ *
+ * A **self-hosted `base_url` overrides the provider name** and forces the
+ * conservative window (#3723). Before that, this function read only the
+ * provider name while {@link isSelfHostedHttpUrl}-based
+ * `hindsightLocalLlmEnabled` read only the URL, and the two fail-safed in
+ * OPPOSITE directions — so
+ *
+ * ```yaml
+ * retain: { provider: anthropic, base_url: http://127.0.0.1:4010 }
+ * ```
+ *
+ * was throttled as a local endpoint by the concurrency caps and simultaneously
+ * budgeted for a 200,000-token window here: precisely the silent-overflow
+ * config the preflight exists to reject. The base URL is the stronger signal
+ * (it is where the traffic actually terminates), and both fail-safes now point
+ * the same way — toward the conservative window — because under-declaring
+ * costs throughput while over-declaring corrupts memory.
+ *
+ * @param provider effective provider name for the lane.
+ * @param baseUrl effective `base_url` for the lane, if the operator set one.
+ */
+export function defaultContextWindowForProvider(provider: string, baseUrl?: string): number {
+  const url = baseUrl?.trim();
+  if (url && isSelfHostedHttpUrl(url)) return HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW;
   const p = provider.trim().toLowerCase();
   if (p === "claude-code" || p === "anthropic") return HINDSIGHT_CLAUDE_CONTEXT_WINDOW;
   return HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW;
 }
 
 /**
- * Resolve one lane's declared window: per-op override → global → the
- * per-provider default for that lane's EFFECTIVE provider (per-op provider
- * override wins, since a lane can be pointed at a different backend).
+ * Resolve one lane's declared window: per-op override → global → the default
+ * for that lane's EFFECTIVE `(provider, base_url)` pair (the per-op provider
+ * and base URL win, since a lane can be pointed at a different backend).
+ *
+ * An explicitly declared window — per-op or global — always wins over the
+ * default, so `base_url` only ever decides the UNDECLARED case. An operator
+ * who declares a window is taken at their word.
  */
 export function resolveLaneContextWindow(
   lane: HindsightBudgetLane,
   llm?: ContextBudgetLlmInput,
-): { windowTokens: number; windowSource: ContextWindowSource; provider: string } {
+): {
+  windowTokens: number;
+  windowSource: ContextWindowSource;
+  provider: string;
+  baseUrl?: string;
+} {
   const perOp = llm?.[lane];
   const provider = perOp?.provider?.trim() || llm?.provider?.trim() || "claude-code";
+  // Only the lane's OWN base URL. Lanes are budgeted independently, and the
+  // config schema puts `base_url` on the per-op block only — `hindsight.llm`
+  // itself has no global `base_url` field (`HindsightPerOpLlmSchema` in
+  // config/schema.ts, `HindsightPerOpLlmConfig` in hindsight.ts), so there is
+  // nothing to inherit from.
+  const baseUrl = perOp?.base_url?.trim() || undefined;
   const perOpWindow = perOp?.context_window;
   if (typeof perOpWindow === "number" && perOpWindow > 0) {
-    return { windowTokens: Math.floor(perOpWindow), windowSource: "per-op", provider };
+    return { windowTokens: Math.floor(perOpWindow), windowSource: "per-op", provider, baseUrl };
   }
   const globalWindow = llm?.context_window;
   if (typeof globalWindow === "number" && globalWindow > 0) {
-    return { windowTokens: Math.floor(globalWindow), windowSource: "global", provider };
+    return { windowTokens: Math.floor(globalWindow), windowSource: "global", provider, baseUrl };
   }
   return {
-    windowTokens: defaultContextWindowForProvider(provider),
+    windowTokens: defaultContextWindowForProvider(provider, baseUrl),
     windowSource: "provider-default",
     provider,
+    baseUrl,
   };
 }
 
@@ -270,6 +370,15 @@ export function resolveLaneContextWindow(
  * 8,192 / retain completion 6,144 — the values applied by hand to the live
  * container when the incident was diagnosed. For 131k or 200k it lands on
  * the historical batch 12, so a big-window operator loses nothing.
+ *
+ * The retain lane has no batch knob and a FIXED prompt estimate, so nothing in
+ * its derivation shrinks with the window — `usable` binds it only through the
+ * preflight (see {@link assertHindsightContextBudgetFits}), which is why that
+ * check must compare against `usableTokens` and not the raw window (#3721).
+ * Practical effect: the smallest declared window switchroom will accept is
+ * 13,839 tokens (retain's 11,072-token worst case inside an 80% band), up from
+ * 11,072 before the fix. No derived value changed — only which windows the
+ * preflight admits.
  */
 export function resolveHindsightContextBudget(
   llm?: ContextBudgetLlmInput,
@@ -282,7 +391,7 @@ export function resolveHindsightContextBudget(
     HINDSIGHT_CONSOLIDATION_MAX_COMPLETION_FLOOR,
     HINDSIGHT_CONSOLIDATION_MAX_COMPLETION_CEILING,
   );
-  const consUsable = cons.windowTokens - Math.floor(cons.windowTokens * HINDSIGHT_CONTEXT_SAFETY_FRACTION);
+  const consUsable = usableContextTokens(cons.windowTokens);
   const consPromptBudget = consUsable - consMaxCompletion;
   const batchSize = clamp(
     Math.floor(
@@ -307,23 +416,27 @@ export function resolveHindsightContextBudget(
   // budget it as `usable window − room for reflect's own answer`, using the
   // same 3/16 completion share the retain lane gets. Rounded DOWN to a whole
   // thousand purely for legibility in `docker inspect` (32,768 → 20,000).
+  //
+  // The subtracted "room" is a RESERVE, not a cap (#3722): upstream has no
+  // reflect completion knob to emit it into, so holding it back from the
+  // prompt cap is the only enforcement available. See HindsightReflectBudget.
   const refl = resolveLaneContextWindow("reflect", llm);
-  const reflCompletionAllowance = clamp(
+  const reflCompletionReserve = clamp(
     Math.floor((refl.windowTokens * 3) / 16),
     HINDSIGHT_RETAIN_MAX_COMPLETION_FLOOR,
     HINDSIGHT_RETAIN_MAX_COMPLETION_CEILING,
   );
-  const reflUsable =
-    refl.windowTokens - Math.floor(refl.windowTokens * HINDSIGHT_CONTEXT_SAFETY_FRACTION);
+  const reflUsable = usableContextTokens(refl.windowTokens);
   const reflMaxContext = Math.max(
     HINDSIGHT_REFLECT_MAX_CONTEXT_FLOOR,
-    Math.floor((reflUsable - reflCompletionAllowance) / 1000) * 1000,
+    Math.floor((reflUsable - reflCompletionReserve) / 1000) * 1000,
   );
 
   return {
     consolidation: {
       lane: "consolidation",
       windowTokens: cons.windowTokens,
+      usableTokens: consUsable,
       windowSource: cons.windowSource,
       provider: cons.provider,
       batchSize,
@@ -334,16 +447,18 @@ export function resolveHindsightContextBudget(
     reflect: {
       lane: "reflect",
       windowTokens: refl.windowTokens,
+      usableTokens: reflUsable,
       windowSource: refl.windowSource,
       provider: refl.provider,
       maxContextTokens: reflMaxContext,
-      maxCompletionTokens: reflCompletionAllowance,
+      completionReserveTokens: reflCompletionReserve,
       estimatedPromptTokens: reflMaxContext,
-      worstCaseTotalTokens: reflMaxContext + reflCompletionAllowance,
+      worstCaseTotalTokens: reflMaxContext + reflCompletionReserve,
     },
     retain: {
       lane: "retain",
       windowTokens: ret.windowTokens,
+      usableTokens: usableContextTokens(ret.windowTokens),
       windowSource: ret.windowSource,
       provider: ret.provider,
       maxCompletionTokens: retMaxCompletion,
@@ -363,16 +478,58 @@ export class HindsightContextBudgetError extends Error {
   }
 }
 
-function laneFailure(b: HindsightLaneBudget): string | undefined {
-  if (b.worstCaseTotalTokens > b.windowTokens) {
+/**
+ * The lane-shaped subset the preflight checks. Reflect's completion figure is
+ * a reserve rather than a cap (#3722), so it is normalised in here under a
+ * neutral name instead of being called a `maxCompletionTokens` it is not.
+ */
+interface LaneCheck {
+  lane: HindsightBudgetLane;
+  windowTokens: number;
+  usableTokens: number;
+  windowSource: ContextWindowSource;
+  provider: string;
+  estimatedPromptTokens: number;
+  completionTokens: number;
+  /** "completion" for retain/consolidation, "completion reserve" for reflect. */
+  completionLabel: string;
+  worstCaseTotalTokens: number;
+  /** Only retain has upstream's `> retain_chunk_size` boot check. */
+  maxCompletionTokens?: number;
+}
+
+function laneCheck(b: HindsightLaneBudget): LaneCheck {
+  return { ...b, completionTokens: b.maxCompletionTokens, completionLabel: "completion" };
+}
+
+function reflectLaneCheck(b: HindsightReflectBudget): LaneCheck {
+  return {
+    ...b,
+    completionTokens: b.completionReserveTokens,
+    completionLabel: "completion reserve",
+  };
+}
+
+function laneFailure(b: LaneCheck): string | undefined {
+  // Against `usableTokens`, NOT the raw window (#3721). The safety band is the
+  // whole defence against the prompt ESTIMATES being wrong, and an overflow is
+  // silent, so a lane whose worst case only fits by eating the band has no
+  // slack left for the thing the band exists to absorb.
+  if (b.worstCaseTotalTokens > b.usableTokens) {
     return (
       `hindsight ${b.lane}: worst-case ${b.worstCaseTotalTokens} tokens ` +
-      `(${b.estimatedPromptTokens} prompt + ${b.maxCompletionTokens} completion) ` +
-      `exceeds the declared ${b.windowTokens}-token context window ` +
-      `(source: ${b.windowSource}, provider: ${b.provider}).`
+      `(${b.estimatedPromptTokens} prompt + ${b.completionTokens} ${b.completionLabel}) ` +
+      `exceeds the ${b.usableTokens} usable tokens of ` +
+      `the declared ${b.windowTokens}-token context window ` +
+      `(${Math.round(HINDSIGHT_CONTEXT_SAFETY_FRACTION * 100)}% safety band held back; ` +
+      `source: ${b.windowSource}, provider: ${b.provider}).`
     );
   }
-  if (b.lane === "retain" && b.maxCompletionTokens <= HINDSIGHT_UPSTREAM_RETAIN_CHUNK_SIZE) {
+  if (
+    b.lane === "retain" &&
+    b.maxCompletionTokens !== undefined &&
+    b.maxCompletionTokens <= HINDSIGHT_UPSTREAM_RETAIN_CHUNK_SIZE
+  ) {
     return (
       `hindsight retain: derived max_completion_tokens ${b.maxCompletionTokens} is not ` +
       `greater than the upstream retain_chunk_size ${HINDSIGHT_UPSTREAM_RETAIN_CHUNK_SIZE}; ` +
@@ -383,8 +540,9 @@ function laneFailure(b: HindsightLaneBudget): string | undefined {
 }
 
 /**
- * Preflight: fail LOUDLY when the derived budget cannot fit the declared
- * window. This is the whole point of the change.
+ * Preflight: fail LOUDLY when the derived budget cannot fit the **usable** part
+ * of the declared window (window minus the safety band). This is the whole
+ * point of the change.
  *
  * A context overflow on a llama.cpp backend produces a well-formed HTTP 200
  * carrying conversational garbage — no exception, no non-2xx, no
@@ -392,13 +550,25 @@ function laneFailure(b: HindsightLaneBudget): string | undefined {
  * is knowable is HERE, before the container is launched, where it is a pure
  * arithmetic comparison. Prompt discipline can't guarantee this; a throw at
  * setup time can.
+ *
+ * How strong the guarantee is, honestly, per lane (#3722):
+ *
+ *  - **retain / consolidation** — end to end. Both terms are emitted:
+ *    the prompt side via `CONSOLIDATION_LLM_BATCH_SIZE` (retain's prompt is an
+ *    estimate, hence the band) and the completion side via
+ *    `*_MAX_COMPLETION_TOKENS`, which upstream honours.
+ *  - **reflect** — prompt side only. Upstream has `REFLECT_MAX_CONTEXT_TOKENS`
+ *    and NO reflect completion knob, so the completion term in reflect's row
+ *    is a reserve switchroom holds back from the prompt cap, not a bound the
+ *    backend is told about. Reflect's actual answer length is unbounded
+ *    upstream; the check proves the reserve was held back, nothing more.
  */
 export function assertHindsightContextBudgetFits(budget: HindsightContextBudget): void {
   for (const lane of [
-    budget.consolidation,
-    budget.retain,
-    budget.reflect,
-  ] as HindsightLaneBudget[]) {
+    laneCheck(budget.consolidation),
+    laneCheck(budget.retain),
+    reflectLaneCheck(budget.reflect),
+  ]) {
     const failure = laneFailure(lane);
     if (failure) {
       throw new HindsightContextBudgetError(

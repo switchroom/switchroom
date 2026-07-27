@@ -829,35 +829,182 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     ).toBe(true)
   })
 
-  // The safety argument, asserted rather than asserted-in-prose: every shape that
-  // bypasses via a model-supplied tier ALSO bypasses with those model-supplied
-  // ids stripped (i.e. by the model simply omitting origin_turn_id / reply_to).
-  // So the widening hands a reply no reach it did not already have.
-  it('ZERO new capability: any corroborated origin/quoted bypass is reachable ' +
-    'with the model-supplied ids stripped', () => {
-    const shapes: Array<{ tier: 'origin' | 'quoted'; id: string; c: ReplyOwnerCandidates }> = [
-      { tier: 'origin', id: OWNER, c: cands({ originTurnId: OWNER }) },
-      { tier: 'quoted', id: OWNER, c: cands({ quotedTurnId: OWNER }) },
-      { tier: 'origin', id: OTHER, c: cands({ originTurnId: OTHER }) },
-      { tier: 'quoted', id: OTHER, c: cands({ quotedTurnId: OTHER, latestEndedTurnId: OTHER }) },
-    ]
-    for (const s of shapes) {
-      const withModelIds = decideContentGateBypass({
-        tier: s.tier,
-        resolvedTurnId: s.id,
-        candidates: s.c,
-        handbackCouldOwnReply: false,
-      })
-      // Strip the model-supplied ids: the framework alone resolves the owner.
-      const stripped: ReplyOwnerCandidates = { ...s.c, originTurnId: null, quotedTurnId: null }
-      const withoutModelIds = decideContentGateBypass({
-        tier: resolveReplyOwnerTier(stripped),
-        resolvedTurnId: resolveReplyOwnerTurnId(stripped),
-        candidates: stripped,
-        handbackCouldOwnReply: false,
-      })
-      if (withModelIds) expect(withoutModelIds).toBe(true)
+  // ─── #3726: total over degenerate input, and it fails CLOSED ───
+  //
+  // TypeScript makes `candidates` mandatory and the gateway always constructs
+  // it, so this is production-unreachable — but the function is EXPORTED, and a
+  // caller without the gateway's construction discipline used to get a
+  // `TypeError` out of the supersede decision path (fail-open-by-crash) instead
+  // of the safe answer. The safe answer is `false`: keep the #3429 content gate.
+  it('#3726: an absent candidate set returns false (fail CLOSED), never throws', () => {
+    for (const tier of ['origin', 'quoted', 'latest-ended'] as const) {
+      for (const absent of [undefined, null]) {
+        expect(
+          decideContentGateBypass({
+            tier,
+            resolvedTurnId: OWNER,
+            candidates: absent as unknown as ReplyOwnerCandidates,
+            handbackCouldOwnReply: false,
+          }),
+        ).toBe(false)
+      }
     }
+  })
+
+  // ─── ZERO new capability, as an EXHAUSTIVE property (#3724) ───
+  //
+  // The safety argument for widening `origin`/`quoted` from a blanket ban to
+  // corroboration: every shape that bypasses via a model-supplied tier ALSO
+  // bypasses with those model-supplied ids stripped (i.e. by the model simply
+  // omitting `origin_turn_id` / `reply_to`). So the widening hands a reply no
+  // reach it did not already have.
+  //
+  // #3724 — the previous form of this test hand-picked four candidate shapes and
+  // guarded its assertion behind `if (withModelIds)`, so one of the four
+  // asserted nothing at all, `handbackCouldOwnReply` was pinned `false`, and
+  // `liveTurnId` was never varied. It could only go red if the corroboration
+  // equality were deleted outright. It is replaced here by an exhaustive sweep
+  // of the whole (small) candidate space that derives `tier`/`resolvedTurnId`
+  // from the REAL resolvers rather than passing them in by hand — and, so the
+  // sweep is evidence rather than decoration, by a companion test that runs the
+  // SAME sweep over deliberately broken decisions and asserts it catches them.
+  const IDS = [null, OWNER, OTHER] as const
+  /** fresh / stale / unbounded (no age+ttl — the documented back-compat path). */
+  const AGES = [
+    { label: 'fresh', ageMs: 30_000 as number | null, ttlMs: DEFAULT_SUPERSEDE_TTL_MS as number | undefined },
+    { label: 'stale', ageMs: DEFAULT_SUPERSEDE_TTL_MS + 1, ttlMs: DEFAULT_SUPERSEDE_TTL_MS },
+    { label: 'unbounded', ageMs: null, ttlMs: undefined },
+  ]
+
+  type Decide = typeof decideContentGateBypass
+
+  /** The module's freshness rule, restated locally so the mutants below can
+   *  differ from the real decision in EXACTLY one respect each. */
+  const freshEnough = (c: ReplyOwnerCandidates): boolean =>
+    c.latestEndedTurnId != null &&
+    (c.latestEndedAgeMs == null || c.latestEndedTtlMs == null
+      ? true
+      : c.latestEndedAgeMs <= c.latestEndedTtlMs)
+
+  /**
+   * Sweep the full candidate space against `decide`, reporting every case that
+   * VIOLATES zero-new-capability (bypasses with the model-supplied ids present
+   * but not with them stripped) plus coverage counters that stop the sweep
+   * silently degrading to all-vacuous.
+   */
+  function sweepZeroNewCapability(decide: Decide): {
+    violations: string[]
+    cases: number
+    bypasses: number
+    modelTierBypasses: number
+  } {
+    const violations: string[] = []
+    let cases = 0
+    let bypasses = 0
+    let modelTierBypasses = 0
+    for (const liveTurnId of IDS)
+      for (const originTurnId of IDS)
+        for (const quotedTurnId of IDS)
+          for (const latestEndedTurnId of IDS)
+            for (const age of AGES)
+              for (const handbackCouldOwnReply of [false, true]) {
+                cases++
+                const c: ReplyOwnerCandidates = {
+                  liveTurnId,
+                  originTurnId,
+                  quotedTurnId,
+                  latestEndedTurnId,
+                  latestEndedAgeMs: age.ageMs,
+                  latestEndedTtlMs: age.ttlMs,
+                }
+                const tier = resolveReplyOwnerTier(c)
+                const withModelIds = decide({
+                  tier,
+                  resolvedTurnId: resolveReplyOwnerTurnId(c),
+                  candidates: c,
+                  handbackCouldOwnReply,
+                })
+                // Strip the model-supplied ids: the FRAMEWORK alone resolves the
+                // owner — the reach the model already had by staying silent.
+                const stripped: ReplyOwnerCandidates = {
+                  ...c,
+                  originTurnId: null,
+                  quotedTurnId: null,
+                }
+                const withoutModelIds = decide({
+                  tier: resolveReplyOwnerTier(stripped),
+                  resolvedTurnId: resolveReplyOwnerTurnId(stripped),
+                  candidates: stripped,
+                  handbackCouldOwnReply,
+                })
+                if (withModelIds) {
+                  bypasses++
+                  if (tier === 'origin' || tier === 'quoted') modelTierBypasses++
+                }
+                if (withModelIds && !withoutModelIds) {
+                  violations.push(
+                    `tier=${tier} live=${liveTurnId} origin=${originTurnId} ` +
+                      `quoted=${quotedTurnId} latestEnded=${latestEndedTurnId} ` +
+                      `age=${age.label} handback=${handbackCouldOwnReply}`,
+                  )
+                }
+              }
+    return { violations, cases, bypasses, modelTierBypasses }
+  }
+
+  it('ZERO new capability over the EXHAUSTIVE candidate space: no shape bypasses ' +
+    'with model-supplied ids that would not bypass without them', () => {
+    const r = sweepZeroNewCapability(decideContentGateBypass)
+    // The property itself — every violating shape is NAMED, not just counted.
+    expect(r.violations).toEqual([])
+    // Non-degeneracy: the sweep must actually cover the space and must actually
+    // reach the branch under test, so it can never quietly become a no-op.
+    expect(r.cases).toBe(IDS.length ** 4 * AGES.length * 2)
+    expect(r.bypasses).toBeGreaterThan(0)
+    // …and specifically, many cases must win their bypass on the WIDENED,
+    // model-steerable `origin`/`quoted` tiers — the thing being vouched for.
+    // Currently exactly 16 of the 486 cases do (no live turn, handback clear,
+    // a fresh-or-unbounded latest-ended id, and the steered id equal to it).
+    expect(r.modelTierBypasses).toBeGreaterThanOrEqual(16)
+  })
+
+  // NON-VACUITY, asserted deterministically rather than demonstrated by hand:
+  // the same sweep is run over mutants that break zero-new-capability in the two
+  // realistic ways #3724 called out. If it could not go red on these, it would
+  // not be evidence for the real function.
+  it('the sweep is NOT vacuous: it catches a bypass that ignores corroboration, ' +
+    'and one that ignores the handback window on the steerable tiers', () => {
+    // Mutant A — the widening WITHOUT the corroboration equality: `origin`/
+    // `quoted` bypass on any resolved turn. This is the Fable silent-edit-over.
+    const ignoresCorroboration: Decide = (input) => {
+      if (input.tier === 'live') return true
+      if (input.tier === 'none') return false
+      if (input.handbackCouldOwnReply) return false
+      if (input.candidates == null) return false
+      if (input.tier === 'origin' || input.tier === 'quoted') return true
+      if (!freshEnough(input.candidates)) return false
+      return input.resolvedTurnId === input.candidates.latestEndedTurnId
+    }
+    const a = sweepZeroNewCapability(ignoresCorroboration)
+    expect(a.violations.length).toBeGreaterThan(0)
+
+    // Mutant B — corroboration kept, handback guard dropped on the steerable
+    // tiers only. The OLD hand-picked test stayed GREEN under exactly this,
+    // because it pinned `handbackCouldOwnReply: false` in every shape.
+    const ignoresHandback: Decide = (input) => {
+      if (input.tier === 'live') return true
+      if (input.tier === 'none') return false
+      const steerable = input.tier === 'origin' || input.tier === 'quoted'
+      if (input.handbackCouldOwnReply && !steerable) return false
+      if (input.candidates == null) return false
+      if (!freshEnough(input.candidates)) return false
+      return (
+        input.resolvedTurnId != null &&
+        input.resolvedTurnId === input.candidates.latestEndedTurnId
+      )
+    }
+    const b = sweepZeroNewCapability(ignoresHandback)
+    expect(b.violations.length).toBeGreaterThan(0)
   })
 })
 
