@@ -17,6 +17,7 @@ function expectRelativePoolLink(linkPath: string, expectedPoolTarget: string): v
 }
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants, computeDesiredPermissionAllow, HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT, HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT } from "../src/agents/scaffold.js";
+import { resolveHindsightRecallTunables } from "../src/setup/hindsight-recall-tunables.js";
 import { createVault, setStringSecret } from "../src/vault/vault.js";
 import { renderTemplate, renderProfileClaudeTemplate } from "../src/agents/profiles.js";
 import { cronScriptFilename, cronUnitName } from "../src/agents/cron-unit-name.js";
@@ -2780,8 +2781,17 @@ describe("reconcileAgent", () => {
       `export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=${HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT}`,
     );
     expect(startSh).toContain(`export HINDSIGHT_RECALL_QUERY_STOP_TERMS='[]'`);
+    // The per-bank timeout is the INNER guard of the recall envelope, so the
+    // exported value is the resolved one, which derives from the shared
+    // fan-out deadline rather than taking the vendor literal outright
+    // (HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT is its ceiling). Assert
+    // against the resolver so the carrier and the envelope cannot drift apart.
+    const resolved = resolveHindsightRecallTunables(undefined);
+    expect(resolved.requestTimeoutSeconds).toBeLessThanOrEqual(
+      HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT,
+    );
     expect(startSh).toContain(
-      `export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=${HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT}`,
+      `export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=${resolved.requestTimeoutSeconds}`,
     );
   });
 
@@ -2811,7 +2821,11 @@ describe("reconcileAgent", () => {
         recall: {
           query_max_tokens: 16,
           query_stop_terms: ["switchroom", "agent"],
-          request_timeout_seconds: 14,
+          // Inside the shipped 10s fan-out deadline: a larger value is legal
+          // yaml but resolves through the envelope clamp (covered by
+          // scaffold.recall-tunables-survive-apply.test.ts), which would make
+          // this carrier assertion measure the clamp rather than the carry.
+          request_timeout_seconds: 9,
         },
       },
     });
@@ -2819,7 +2833,7 @@ describe("reconcileAgent", () => {
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
     expect(startSh).toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=16");
-    expect(startSh).toContain("export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=14");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=9");
     // JSON array, single-quoted so the double quotes survive the shell.
     // Rendering is noEscape (src/agents/profiles.ts:158); if that ever
     // changed, `&quot;` would reach the plugin as literal text and the list

@@ -44,6 +44,11 @@ import {
   usesSwitchroomTelegramPlugin,
 } from "../config/merge.js";
 import { isHindsightEnabled } from "../memory/hindsight.js";
+import {
+  resolveHindsightRecallTunables,
+  readHooksRecallTimeout,
+  type RecallTunableInput,
+} from "../setup/hindsight-recall-tunables.js";
 import { VERSION } from "../build-info.js";
 import { buildSettingsHooksBlock, detectHooksDrift } from "./scaffold.js";
 import { containerName } from "./lifecycle.js";
@@ -391,6 +396,150 @@ export function detectHookScriptDrift(
   ];
 }
 
+// ─── Surface 7: hindsight recall tunables ───────────────────────────────────
+
+/**
+ * Compare the INSTALLED hindsight plugin's effective recall-latency tunables
+ * against what the current `switchroom.yaml` says they should be.
+ *
+ * This surface exists because these values have silently reverted three times.
+ * They live inside the plugin tree that `switchroom apply` rm's and re-copies
+ * from `vendor/`, so before they were promoted to managed keys (see
+ * src/setup/hindsight-recall-tunables.ts) the only way to set them was a
+ * hand-edit that the next apply threw away. Making them declarative stops the
+ * revert; THIS row is what makes a revert impossible to miss if the stamping
+ * ever regresses — a missing stamp reads as an explicit FAIL rather than as
+ * "memory feels a bit worse lately".
+ *
+ * Deliberately compares EFFECTIVE VALUES, not file hashes. A hash compare
+ * would also fire on any unrelated vendor bump, which is noise; the question
+ * this row answers is narrowly "is the number the operator configured the
+ * number the plugin will actually use".
+ */
+export function detectHindsightRecallTunableDrift(
+  name: string,
+  agentConfig: AgentConfig,
+  agentDir: string,
+  config: SwitchroomConfig,
+): DriftFinding[] {
+  if (!isHindsightEnabled(config)) return [];
+
+  // Cascade defaults -> profile -> agent BEFORE reading anything. doctor-drift
+  // hands us the RAW `config.agents[name]` (src/cli/doctor-drift.ts:100),
+  // whereas the scaffold stamps from the CASCADED config
+  // (resolveHindsightRecallConfig). Reading the raw block here would report
+  // hard drift on every agent the moment the fleet sets these keys at the
+  // `defaults:` or profile tier — which is the likeliest place to set them.
+  const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+
+  // Mirrors installHindsightPlugin's own early-out: an agent with auto-recall
+  // off has no plugin to stamp, so there is nothing to drift.
+  if (resolved.memory?.auto_recall === false) return [];
+
+  const pluginDir = join(agentDir, ".claude", "plugins", "hindsight-memory");
+  // Plugin not installed at all — that is a different failure (and a noisy one
+  // to duplicate here); apply/reconcile surfaces it directly.
+  if (!existsSync(pluginDir)) return [];
+
+  const expected = resolveHindsightRecallTunables(
+    resolved.memory?.recall as RecallTunableInput | undefined,
+  );
+
+  const findings: DriftFinding[] = [];
+  const mismatches: string[] = [];
+
+  // Hook ceiling — stamped into hooks/hooks.json.
+  const hooksPath = join(pluginDir, "hooks", "hooks.json");
+  if (existsSync(hooksPath)) {
+    let installedHookTimeout: number | null = null;
+    try {
+      installedHookTimeout = readHooksRecallTimeout(readFileSync(hooksPath, "utf-8"));
+    } catch {
+      installedHookTimeout = null;
+    }
+    if (installedHookTimeout === null) {
+      mismatches.push(
+        "hooks/hooks.json has no readable UserPromptSubmit recall-hook timeout",
+      );
+    } else if (installedHookTimeout !== expected.hookTimeoutSeconds) {
+      mismatches.push(
+        `hook ceiling is ${installedHookTimeout}s, expected ` +
+          `${expected.hookTimeoutSeconds}s (memory.recall.hook_timeout_seconds)`,
+      );
+    }
+  }
+
+  // Parallel deadline + per-bank timeout — stamped into settings.json.
+  const settingsPath = join(pluginDir, "settings.json");
+  if (existsSync(settingsPath)) {
+    let settings: Record<string, unknown> | null = null;
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+    } catch {
+      settings = null;
+    }
+    if (settings === null) {
+      mismatches.push("settings.json is unreadable or malformed");
+    } else {
+      const checks: Array<[string, string, number]> = [
+        [
+          "recallParallelDeadlineSeconds",
+          "memory.recall.parallel_deadline_seconds",
+          expected.parallelDeadlineSeconds,
+        ],
+        [
+          "recallRequestTimeoutSeconds",
+          "memory.recall.request_timeout_seconds",
+          expected.requestTimeoutSeconds,
+        ],
+      ];
+      for (const [key, yamlKey, want] of checks) {
+        const got = settings[key];
+        if (got === undefined) {
+          mismatches.push(`settings.json is missing \`${key}\` (expected ${want})`);
+        } else if (got !== want) {
+          mismatches.push(
+            `\`${key}\` is ${JSON.stringify(got)}, expected ${want} (${yamlKey})`,
+          );
+        }
+      }
+    }
+  }
+
+  if (mismatches.length > 0) {
+    findings.push({
+      surface: "memory-tunables",
+      agent: name,
+      detail:
+        `installed hindsight plugin disagrees with switchroom.yaml: ` +
+        mismatches.join("; "),
+      fix:
+        "Run `switchroom apply` to re-stamp the plugin, then restart the agent " +
+        "(`switchroom agent restart <name>`). If it recurs immediately after an " +
+        "apply, the stamping in installHindsightPlugin has regressed — these " +
+        "values have silently reverted three times before, which is why this " +
+        "check exists.",
+    });
+  }
+
+  // A clamped value is not drift (the stamp matches what we resolved), but the
+  // operator wrote a number that is NOT what runs. Say so rather than letting
+  // it look applied.
+  if (expected.clamps.length > 0) {
+    findings.push({
+      surface: "memory-tunables",
+      agent: name,
+      detail: `recall tunable clamped: ${expected.clamps.join("; ")}`,
+      fix:
+        "Adjust the offending `memory.recall.*` value in switchroom.yaml so the " +
+        "nested deadlines hold (per-bank timeout <= parallel deadline <= hook " +
+        "ceiling), or raise the outer bound.",
+    });
+  }
+
+  return findings;
+}
+
 // ─── Aggregation + per-agent report file (boot-card handoff) ────────────────
 
 /** Basename of the per-agent drift report the boot-card probe reads. */
@@ -462,6 +611,9 @@ export function detectAgentDrift(
     }),
   );
   findings.push(...detectSkillsDrift(name, agentDir));
+  findings.push(
+    ...detectHindsightRecallTunableDrift(name, agentConfig, agentDir, config),
+  );
   if (!opts.skipContainerProbes) {
     findings.push(
       ...detectHookScriptDrift(name, {

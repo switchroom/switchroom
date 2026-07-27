@@ -737,6 +737,33 @@ export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
 {{#if (isNumber hindsightRecallCacheTtlSecs)}}
 export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{/if}}
+# Recall latency envelope (memory.recall.parallel_deadline_seconds /
+# .request_timeout_seconds cascade). Exported UNCONDITIONALLY, unlike the
+# override-only knobs above, and that is deliberate.
+#
+# The plugin's config load order is: built-in defaults -> plugin settings.json
+# -> ~/.hindsight/claude-code.json -> environment. Switchroom stamps these two
+# into settings.json as well, but claude-code.json sits BETWEEN the two and
+# SURVIVES `switchroom apply`. A hand-written value left in that file (the
+# documented pre-promotion workaround — the live fleet had exactly this,
+# pinning recallParallelDeadlineSeconds to a stale 16) would therefore silently
+# defeat a settings.json-only stamp. Env is the top of the chain, so exporting
+# the resolved value unconditionally is what actually makes switchroom.yaml
+# authoritative. Both values come from the same resolver
+# (src/setup/hindsight-recall-tunables.ts) fed the same CASCADED agent config —
+# scaffold/reconcile thread their resolved `agentConfig` into
+# installHindsightPlugin instead of letting it re-derive — so the two channels
+# cannot diverge. Sharing a resolver was NOT enough on its own: the stamp used
+# to re-derive from `agents[name] ?? {}`, and `{}` carries no `extends`, so it
+# silently dropped the profile tier on one side only.
+# Pinned by tests/scaffold.recall-envelope-carrier.test.ts, which asserts on the
+# RENDERED start.sh — a typo'd handlebars variable renders empty rather than
+# failing, and an empty export hands authority straight back to claude-code.json.
+#
+# The third knob in this envelope — the UserPromptSubmit hook ceiling — has no
+# env channel at all (Claude Code does not expand env in hooks.json `timeout`),
+# so it is stamped into the deployed hooks/hooks.json instead.
+export HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS={{hindsightRecallParallelDeadlineSeconds}}
 # BM25 term budget for the recall query (#3757). The hook composes a query
 # from the last 2 turns and Hindsight OR-joins EVERY token into one
 # to_tsquery; Postgres native FTS cannot top-k from the GIN index, so it
