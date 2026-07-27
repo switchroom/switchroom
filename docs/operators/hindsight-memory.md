@@ -64,6 +64,12 @@ docker exec switchroom-hindsight sh -lc '
 
 # 3. Bounce hindsight so the worker re-reads cleanly.
 switchroom agent restart test-harness --wait --force   # or: docker restart switchroom-hindsight
+
+# 4. MANDATORY: rebuild per-bank vector index coverage.
+#    A restored bank arrives populated, so it never hits the create-time index
+#    path — recall silently under-returns until this runs. See "Vector index
+#    coverage" below.
+switchroom memory repair --all
 ```
 
 ## Rolling the base image BACK (schema first, then the digest)
@@ -310,6 +316,76 @@ consolidation queue is advancing — watch for a stuck queue separately
 (see the stale-claim reaper in `hindsight-entrypoint.sh` and the
 `async_operations` `processing`/`pending` counts).
 
+## Vector index coverage (`switchroom memory repair`)
+
+Hindsight creates a bank's per-`(bank, fact_type)` **partial vector indexes**
+at bank-creation time — instant, because the bank is empty. A bank that
+arrives **already populated** never takes that path:
+
+- a logical restore (`switchroom memory` restore, `import-bank`, a `pg_dump`
+  reload),
+- a cross-version upgrade that repopulates rows outside the create path,
+- a vector-extension / backend switch.
+
+Recall on such a bank does not fail. It falls back to the **global** index plus
+a post-filter and quietly **under-returns**. This is not a hypothetical: this
+fleet ran that way, with several banks returning single-digit semantic
+candidates out of a 100-candidate budget, for roughly three months. Nothing
+went red, because every surface was checking liveness rather than coverage.
+
+Upstream shipped detection + repair in **0.8.5**
+([vectorize-io/hindsight#2645](https://github.com/vectorize-io/hindsight/issues/2645)).
+Switchroom exposes it:
+
+```bash
+# See what is missing without touching anything.
+switchroom memory repair --all --dry-run
+
+# Repair one bank, by bank id or by the agent that owns it.
+switchroom memory repair --bank agent_overlord
+switchroom memory repair --agent overlord
+
+# Repair the whole fleet.
+switchroom memory repair --all
+```
+
+Rebuilds use `CREATE INDEX CONCURRENTLY`, so they never block live
+retain/recall/consolidation. The command is **idempotent and safe to re-run** —
+a failed index is dropped, and re-running is the documented retry.
+
+`--dry-run` is scriptable — it reports coverage through the **exit code**, not
+only through prose:
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Coverage **confirmed** complete — at least one bank scanned, nothing to create. |
+| `3` | Indexes are **missing**. Recall on those banks is under-returning. |
+| `4` | Coverage **could not be confirmed**: no summary line, or zero banks scanned (a mistyped `--bank`/`--schema` looks exactly like this). Nothing is known to be fine. |
+| `1` | The check/repair itself failed (see output; a re-run is the retry). |
+
+`4` is deliberately not `0`. "The command ran and I learned nothing" is the
+failure mode this whole feature exists to eliminate, so it is never reported as
+a pass. And the meaningful codes avoid `2` on purpose: the underlying admin CLI
+is a typer app that exits `2` on a **usage** error, and `switchroom memory
+repair` never re-emits the child's code — a mistyped flag is `1`, never
+"coverage missing".
+
+Notes:
+
+- **Requires hindsight ≥ 0.8.5** (`HINDSIGHT_REPAIR_MIN_API_VERSION`). Against
+  an older server the verb refuses with the reason, rather than the admin CLI's
+  bare `No such command`. This is a *feature* floor and is checked at the point
+  of use only — it deliberately does not make `switchroom doctor` red, because
+  the doctor row tracks the MCP-contract floor (`HINDSIGHT_MIN_API_VERSION`,
+  the version the committed tools/list snapshot was captured from). A standing
+  red row for a capability you are not trying to use just teaches people to
+  ignore doctor.
+- **It will not remove the legacy global index.** `idx_memory_units_embedding`
+  survives on instances that predate the per-bank scheme, and `repair-bank`
+  does not drop it. Removing it is a manual `DROP INDEX CONCURRENTLY` decision.
+- **Run it after every restore.** The restore path is the single most reliable
+  way to produce a bank with no coverage, and it is silent.
+
 ## Chat-visible memory surfaces (what agents show users)
 
 Memory is no longer entirely invisible. Three operator-visible behaviours
@@ -332,11 +408,19 @@ recall, never per-turn:
 - **Store/correct side (📌 / ✂️)** is a deterministic tool-call observation —
   no model call, no polling. Opt out per-agent/fleet with the env var
   `SWITCHROOM_MEMORY_LEGIBILITY=0` (only the literal `0` disables).
-- **Update side (🧠)** depends on a `consolidation.completed` webhook the
-  pinned hindsight image (v0.8.4) does **not** emit, so the consumer
-  (`telegram-plugin/consolidation-legibility.ts`) stays dormant. It is also
-  OFF by default; an operator opts in with `SWITCHROOM_CONSOLIDATION_LEGIBILITY=1`,
-  but it does nothing until an engine that emits the webhook is pinned.
+- **Update side (🧠)** depends on a `consolidation.completed` webhook and stays
+  dormant — but **not** for the reason this page used to give. It claimed the
+  pinned engine does not emit the event. It does: `WebhookEventType.
+  CONSOLIDATION_COMPLETED` is emitted from `hindsight_api/engine/
+  memory_engine.py` in **both 0.8.4 and 0.8.5**, and the event is in the
+  documented supported set (`retain.completed`, `consolidation.completed`,
+  `memory_defense.triggered`). What is missing is on the switchroom side:
+  nothing registers a webhook subscription with hindsight and there is no
+  receiver endpoint, so the consumer
+  (`telegram-plugin/consolidation-legibility.ts`) is never fed. It is also OFF
+  by default (`SWITCHROOM_CONSOLIDATION_LEGIBILITY=1` to opt in). Enabling it
+  today does nothing; the work required is a subscription + receiver, not an
+  engine bump.
 
 ### Directive-capture nudge + verifier (Phase 3)
 

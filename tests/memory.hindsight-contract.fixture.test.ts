@@ -25,6 +25,7 @@ import {
   HINDSIGHT_TS_CALLSITES,
   HINDSIGHT_PROMPT_TOOLS,
   HINDSIGHT_HOOK_TOOLS,
+  HINDSIGHT_MIN_API_VERSION,
 } from "../src/memory/hindsight-tools.js";
 import { FALLBACK_TOOL_TABLE } from "../src/cli/hindsight-mcp-shim.js";
 
@@ -126,6 +127,19 @@ describe("hindsight contract — golden snapshot integrity", () => {
             "cold-boot manifest promise a filter the server silently ignores",
       ).toBe(shouldHaveTagProps);
     }
+  });
+
+  it("HINDSIGHT_MIN_API_VERSION names the version this snapshot was captured from", () => {
+    // The doctor version-skew check compares the LIVE server against this
+    // constant. If the constant and the snapshot drift apart, doctor reports
+    // "contract matches" while the contract it is defending was captured from
+    // a different server — the check silently stops being a check. Chained to
+    // the assertion above, this transitively pins the floor to the image
+    // docker/Dockerfile.hindsight actually ships.
+    expect(
+      snapshot._meta?.hindsight_api_version,
+      "re-capturing the snapshot must bump HINDSIGHT_MIN_API_VERSION (and vice versa)",
+    ).toBe(HINDSIGHT_MIN_API_VERSION);
   });
 
   it("EXPECTED_HINDSIGHT_TOOLS agrees with the captured server truth (required-args, no const/snapshot drift)", () => {

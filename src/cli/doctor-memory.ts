@@ -25,7 +25,11 @@
  * local container (remote URL / no docker / inside an agent container).
  */
 import { execFileSync } from "node:child_process";
-import { EXPECTED_HINDSIGHT_TOOLS } from "../memory/hindsight-tools.js";
+import {
+  EXPECTED_HINDSIGHT_TOOLS,
+  HINDSIGHT_MIN_API_VERSION,
+} from "../memory/hindsight-tools.js";
+import { compareApiVersion, fetchHindsightApiVersion } from "../memory/hindsight-repair.js";
 import {
   HINDSIGHT_DATA_VOLUME,
   HINDSIGHT_DEFAULT_WORKER_ID,
@@ -685,6 +689,91 @@ export function checkHindsightContainerHealth(
   }
 
   return results;
+}
+
+/**
+ * Pure: classify the live hindsight API version against the version the
+ * committed MCP contract was captured from ({@link HINDSIGHT_MIN_API_VERSION}).
+ *
+ * This is the check that was missing while the fleet ran a server three
+ * versions ahead of its own snapshot. Nothing in switchroom tracked the
+ * upstream version at all, so a capability that shipped upstream — new tools,
+ * new accepted props, `repair-bank` — was reachable by nobody and no surface
+ * said so. `classifyToolContract` cannot cover this: it only detects tools
+ * switchroom EXPECTS and the server lacks, never the reverse, so a server that
+ * grew capabilities stays green forever.
+ *
+ * Three outcomes:
+ *  - **older than the floor → fail.** The snapshot, the shim fallback manifest
+ *    and the args every callsite sends describe a surface this server may not
+ *    have.
+ *
+ * The floor is the version the SNAPSHOT was captured from — not the version any
+ * individual feature wants. Feature floors (e.g.
+ * `HINDSIGHT_REPAIR_MIN_API_VERSION`) are enforced at their own point of use,
+ * so this row never goes red over a capability the operator is not trying to
+ * use. A doctor row that is red by construction on the running fleet teaches
+ * people to skip doctor.
+ *  - **equal → ok.**
+ *  - **newer → warn.** Not an error (upstream's MCP changes are additive), but
+ *    the contract is stale by definition and the drift is silent in both
+ *    directions until someone re-captures it.
+ *
+ * `live === null` (probe failed / not reachable) returns null — no row. The
+ * /health check already owns "the backend is down"; a second red line for the
+ * same outage is noise.
+ */
+export function classifyHindsightVersionSkew(live: string | null): CheckResult | null {
+  if (live === null) return null;
+  const cmp = compareApiVersion(live, HINDSIGHT_MIN_API_VERSION);
+  if (cmp === 0) {
+    return {
+      name: "hindsight version",
+      status: "ok",
+      detail: `api_version ${live} matches the captured MCP contract`,
+    };
+  }
+  if (cmp < 0) {
+    return {
+      name: "hindsight version",
+      status: "fail",
+      detail:
+        `api_version ${live} is OLDER than the ${HINDSIGHT_MIN_API_VERSION} contract ` +
+        `switchroom captured — tools and args the CLI and agents send may not exist ` +
+        `on this server, and an unknown arg is dropped SILENTLY (isError stays false), ` +
+        `so the symptom is a wrong answer rather than an error`,
+      fix:
+        "Update the pinned image in `docker/Dockerfile.hindsight` and recreate " +
+        "the container with `switchroom memory --update` (a plain restart does " +
+        "not re-pull). If the downgrade is deliberate, re-capture " +
+        "tests/fixtures/hindsight-tools-list.snapshot.json from THIS server and " +
+        "lower HINDSIGHT_MIN_API_VERSION to match.",
+    };
+  }
+  return {
+    name: "hindsight version",
+    status: "warn",
+    detail:
+      `api_version ${live} is NEWER than the ${HINDSIGHT_MIN_API_VERSION} contract ` +
+      `switchroom captured — any tool or accepted prop added since is invisible to ` +
+      `agents (the shim's cold-boot manifest is built from that capture)`,
+    fix:
+      "Re-capture tests/fixtures/hindsight-tools-list.snapshot.json from the live " +
+      "server, reconcile EXPECTED_HINDSIGHT_TOOLS + the shim's FALLBACK_TOOL_TABLE, " +
+      "and bump HINDSIGHT_MIN_API_VERSION (src/memory/hindsight-tools.ts). The diff " +
+      "IS the upstream capability you are not yet using.",
+  };
+}
+
+/**
+ * Best-effort async wrapper: probe `<origin>/version` and classify the skew.
+ * Never throws; returns null when there is nothing to report.
+ */
+export async function checkHindsightVersion(
+  mcpUrl: string,
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<CheckResult | null> {
+  return classifyHindsightVersionSkew(await fetchHindsightApiVersion(mcpUrl, opts));
 }
 
 /**

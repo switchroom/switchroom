@@ -26,7 +26,17 @@ import {
   HINDSIGHT_DEFAULT_MCP_URL,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
+import {
+  buildRepairBankArgv,
+  classifyRepairPreflight,
+  fetchHindsightApiVersion,
+  parseRepairSummary,
+  classifyRepairOutcome,
+  HINDSIGHT_CONTAINER_NAME,
+  REPAIR_FAILED_EXIT,
+} from "../memory/hindsight-repair.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { join } from "node:path";
@@ -787,6 +797,134 @@ export function registerMemoryCommand(program: Command): void {
       }
       console.log();
     });
+
+  // switchroom memory repair — reachability for hindsight 0.8.5's
+  // `hindsight-admin repair-bank`. A bank that arrived already populated
+  // (logical restore, cross-version upgrade, vector-extension switch) never
+  // got its per-(bank, fact_type) partial vector indexes, so recall falls back
+  // to a global index + post-filter and silently under-returns. Seven fleet
+  // banks returned 0-4 candidates out of 100 for ~three months that way. See
+  // src/memory/hindsight-repair.ts for why this is a verb and not a
+  // passthrough or a doctor auto-fix.
+  memory
+    .command("repair")
+    .description(
+      "Verify and rebuild a bank's per-(bank, fact_type) vector index coverage (hindsight >= 0.8.5) — the fix for a restored/upgraded bank whose recall silently under-returns",
+    )
+    .option("--bank <id>", "Bank id to repair (mutually exclusive with --all)")
+    .option("--agent <name>", "Repair the bank belonging to this agent (resolves the bank id for you)")
+    .option("--all", "Repair every bank in the base schema and all discovered tenant schemas")
+    .option("--schema <name>", "Limit to a single schema (default: base + discovered tenant schemas)")
+    .option("--dry-run", "Report what would be repaired without creating or dropping any index")
+    .option("--container <name>", `Hindsight container name (default: ${HINDSIGHT_CONTAINER_NAME})`)
+    .action(
+      withConfigError(
+        async (opts: {
+          bank?: string;
+          agent?: string;
+          all?: boolean;
+          schema?: string;
+          dryRun?: boolean;
+          container?: string;
+        }) => {
+          const config = getConfig(program);
+
+          if (opts.agent && opts.bank) {
+            console.error(chalk.red("Pass either --agent or --bank, not both."));
+            process.exit(1);
+          }
+          let bank = opts.bank;
+          if (opts.agent) {
+            if (!config.agents[opts.agent]) {
+              console.error(
+                chalk.red(`Agent "${opts.agent}" is not defined in switchroom.yaml`),
+              );
+              process.exit(1);
+            }
+            bank = getCollectionForAgent(opts.agent, config);
+            console.log(chalk.gray(`  --agent ${opts.agent} → bank ${bank}`));
+          }
+
+          let argv: string[];
+          try {
+            argv = buildRepairBankArgv({
+              bank,
+              all: opts.all,
+              schema: opts.schema,
+              dryRun: opts.dryRun,
+              container: opts.container,
+            });
+          } catch (err) {
+            console.error(chalk.red(`✗ ${(err as Error).message}`));
+            process.exit(1);
+          }
+
+          if (!isDockerAvailable()) {
+            console.error(
+              chalk.red("✗ Docker is not available — `memory repair` runs the admin CLI inside the hindsight container."),
+            );
+            process.exit(REPAIR_FAILED_EXIT);
+          }
+
+          // Version preflight: against a pre-0.8.5 server the admin CLI answers
+          // `No such command 'repair-bank'`, which reads like a typo rather
+          // than "your image predates the fix". Say the real thing.
+          const apiUrl =
+            (config.memory?.config?.url as string | undefined) ?? HINDSIGHT_DEFAULT_MCP_URL;
+          const preflight = classifyRepairPreflight(await fetchHindsightApiVersion(apiUrl));
+          if (!preflight.ok) {
+            console.error(chalk.red(`✗ ${preflight.reason}`));
+            process.exit(REPAIR_FAILED_EXIT);
+          }
+
+          const target = bank ? `bank ${chalk.cyan(bank)}` : chalk.cyan("all banks");
+          console.log(
+            chalk.bold(
+              `\nRepairing vector index coverage for ${target}${opts.dryRun ? chalk.yellow(" (dry run)") : ""}`,
+            ),
+          );
+          console.log(
+            chalk.gray(
+              "  Rebuilds are CREATE INDEX CONCURRENTLY — safe on a live fleet, but not instant on a large bank.\n",
+            ),
+          );
+
+          // Tee rather than inherit: the operator still sees repair-bank's
+          // output live (a large bank is not instant), and we keep a copy so
+          // the summary can drive a machine-readable exit code. A dry run that
+          // found missing coverage must NOT exit 0 — otherwise the only way to
+          // know is to read the prose, which is how this went unnoticed for
+          // three months.
+          const child = spawn("docker", argv, { stdio: ["ignore", "pipe", "inherit"] });
+          let captured = "";
+          child.stdout?.on("data", (chunk: Buffer) => {
+            captured += chunk.toString();
+            process.stdout.write(chunk);
+          });
+          const childExit: number = await new Promise((resolve) => {
+            child.on("error", () => resolve(127));
+            child.on("close", (c) => resolve(c ?? 1));
+          });
+
+          // Every verdict — including "I could not tell" — comes from one pure
+          // function so it is testable and so no branch can quietly reach a
+          // green exit. The child's own code is NEVER re-emitted: repair-bank
+          // is a typer app whose usage error is exit 2, and re-emitting it
+          // would collide with this command's own coverage codes.
+          const outcome = classifyRepairOutcome({
+            childExit,
+            summary: parseRepairSummary(captured),
+            dryRun: Boolean(opts.dryRun),
+          });
+          if (outcome.level === "ok") {
+            console.log(chalk.green(`\n✓ ${outcome.headline}`), chalk.gray(outcome.detail));
+            return;
+          }
+          console.error(chalk.red(`\n✗ ${outcome.headline}`), chalk.gray(outcome.detail));
+          process.exit(outcome.exit);
+        },
+      ),
+    );
 
   // switchroom memory recall-log [agent]
   memory
