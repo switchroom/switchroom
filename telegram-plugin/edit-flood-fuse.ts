@@ -175,6 +175,7 @@ import type { Bot } from 'grammy'
 
 import type { Clock } from './send-gate.js'
 import { systemClock } from './send-gate.js'
+import { floodStatePath, makeFloodWaitProbe } from './flood-circuit-breaker.js'
 import {
   currentOutboundClass,
   defaultOutboundClass,
@@ -341,6 +342,24 @@ export interface EditFloodFuseConfig {
   tightenMs?: number
   /** Cap on compounding 429 tightening levels. Default 4 (⇒ 0.5^4 = 1/16). */
   maxTightenLevel?: number
+  /**
+   * Remaining ms of a KNOWN-OPEN Telegram flood window, or 0 when none — the
+   * persisted breaker state (`flood-circuit-breaker.ts`) that every other
+   * outbound path already consults. Wired by {@link editFloodFuseConfigFromEnv}.
+   *
+   * The fuse's tightening lived only in process memory, so before #3856 a
+   * gateway restart during a ban came back FULLY UNTIGHTENED and resumed at
+   * the rate that earned the ban — and a restart is the single most likely
+   * thing to happen during a multi-hour outage. Consulting the persisted
+   * window makes the response durable: while it is open the fuse holds
+   * `maxTightenLevel` regardless of what this process remembers.
+   *
+   * FAILS OPEN (throwing or absent probe ⇒ untightened): a breaker that cannot
+   * read its own state must never gag the bot.
+   */
+  floodWaitRemainingMs?: () => number
+  /** How often the persisted window may be re-read. Default 1000ms. */
+  floodProbeIntervalMs?: number
   /** Observability hook; fired whenever the fuse binds. */
   onTrip?: (info: {
     method: string
@@ -380,6 +399,11 @@ export interface EditFloodFuseStats {
   chatless: number
   /** Live per-bot-token ceiling (post-AIMD). */
   perTokenCeiling: number
+  /**
+   * True when a PERSISTED flood window is open right now — i.e. the tightening
+   * in force is durable rather than remembered, and survives a restart (#3856).
+   */
+  persistedFloodOpen: boolean
 }
 
 export const EDIT_FLOOD_FUSE_DEFAULTS = {
@@ -425,6 +449,8 @@ export const EDIT_FLOOD_FUSE_DEFAULTS = {
   tightenFactor: 0.5,
   tightenMs: 600_000,
   maxTightenLevel: 4,
+  /** The persisted flood window is re-read at most once a second (#3856). */
+  floodProbeIntervalMs: 1_000,
 } as const
 
 /** Parse a positive integer from env, or undefined when unset/invalid. */
@@ -454,6 +480,15 @@ export function editFloodFuseConfigFromEnv(
   assign('perChatReplyReserve', envInt(env.SWITCHROOM_CHAT_REPLY_RESERVE))
   assign('perTokenMaxPerWindow', envInt(env.SWITCHROOM_TOKEN_MAX_PER_SEC))
   assign('maxDeferMs', envInt(env.SWITCHROOM_EDIT_FUSE_MAX_DEFER_MS))
+  // #3856 — durable ban awareness. The fuse reads the SAME persisted marker
+  // (`flood-wait.json`) that `robustApiCall` and the outbox sweep consult, so a
+  // restart mid-ban comes back tightened instead of at full rate. Wired here
+  // rather than at the call site so no caller can forget it, and because
+  // `gateway.ts` is under a zero-slack line ratchet.
+  const stateDir = env.TELEGRAM_STATE_DIR
+  if (stateDir != null && stateDir !== '') {
+    cfg.floodWaitRemainingMs = makeFloodWaitProbe(floodStatePath(stateDir))
+  }
   return cfg
 }
 
@@ -510,6 +545,8 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   const tightenFactor = config.tightenFactor ?? D.tightenFactor
   const tightenMs = config.tightenMs ?? D.tightenMs
   const maxTightenLevel = Math.max(0, config.maxTightenLevel ?? D.maxTightenLevel)
+  const floodProbe = config.floodWaitRemainingMs
+  const floodProbeIntervalMs = Math.max(0, config.floodProbeIntervalMs ?? D.floodProbeIntervalMs)
   const onTrip = config.onTrip
 
   const windows = new Map<string, Window>()
@@ -531,13 +568,46 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   let tightenLevel = 0
   let tightenedUntil = 0
 
+  /**
+   * Cached read of the PERSISTED flood window (#3856). Throttled to
+   * `floodProbeIntervalMs` because `levelAt` runs on every admission and the
+   * probe is a file read — an unthrottled read would make the fuse the latency
+   * problem it exists to prevent. Between reads the cached remaining time is
+   * decayed by elapsed wall time, so a window never appears to last longer
+   * than it does.
+   *
+   * FAILS OPEN: any throw is treated as "no window". `makeFloodWaitProbe`
+   * already fails open on an unreadable marker and warns loudly (#3106); this
+   * catch covers the rest.
+   */
+  let probedAt = Number.NEGATIVE_INFINITY
+  let probedRemainingMs = 0
+  function persistedFloodRemainingMs(now: number): number {
+    if (floodProbe === undefined) return 0
+    const since = now - probedAt
+    if (since < floodProbeIntervalMs) return Math.max(0, probedRemainingMs - since)
+    probedAt = now
+    try {
+      const ms = floodProbe()
+      probedRemainingMs = Number.isFinite(ms) && ms > 0 ? ms : 0
+    } catch {
+      probedRemainingMs = 0
+    }
+    return probedRemainingMs
+  }
+
   /** Decay one level per `tightenMs` of quiet, rather than a single cliff. */
   function levelAt(now: number): number {
-    if (tightenLevel === 0) return 0
     while (tightenLevel > 0 && tightenedUntil <= now) {
       tightenLevel--
       tightenedUntil = tightenLevel > 0 ? tightenedUntil + tightenMs : 0
     }
+    // #3856 — a KNOWN-OPEN persisted window pins the fuse at its tightest
+    // regardless of in-memory state. This is what survives a restart: the
+    // process forgets, the marker on disk does not. It does not MUTATE
+    // `tightenLevel`, so when the window closes the fuse returns to whatever
+    // this process actually earned rather than staying pinned.
+    if (persistedFloodRemainingMs(now) > 0) return maxTightenLevel
     return tightenLevel
   }
 
@@ -609,27 +679,69 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     return { chat, msg }
   }
 
-  /** Record a 429 (whatever shape it arrives in) and tighten one more level. */
-  function noteFlood(now: number): void {
+  /**
+   * Record a 429 and tighten IN PROPORTION TO THE PENALTY (#3856).
+   *
+   * Before this, every 429 was worth exactly one level: a 3-second "slow down
+   * a touch" nudge and a **15908-second** ban produced the identical response.
+   * The whole point of AIMD is that the decrease matches the signal, and a
+   * four-hour ban is not one nudge's worth of signal. `retryAfterSec` is the
+   * severity Telegram itself states, so it is what the step is scaled by.
+   *
+   * The tightening is also held for at least the ban's own duration. A flat
+   * 10-minute `tightenMs` expired ~25× over during the 2026-07-27 ban, so the
+   * fuse would have been back at full rate long before the window closed.
+   */
+  function noteFlood(now: number, retryAfterSec: number): void {
     counters.floodObserved++
     levelAt(now)
-    tightenLevel = Math.min(maxTightenLevel, tightenLevel + 1)
-    // Every level currently in force is re-armed for a full `tightenMs`; the
-    // decay clock restarts from the newest 429, not from the first.
-    tightenedUntil = now + tightenMs
+    tightenLevel = Math.min(maxTightenLevel, tightenLevel + tightenStepFor(retryAfterSec))
+    // Every level currently in force is re-armed; the decay clock restarts
+    // from the newest 429, and never expires before the penalty itself does.
+    tightenedUntil = now + Math.max(tightenMs, retryAfterSec * 1000 + tightenMs)
   }
 
-  function looksLikeFlood(err: unknown): boolean {
+  /**
+   * Levels of multiplicative decrease one 429 is worth, by stated penalty:
+   *
+   *   ≤ 5s     1   a routine burst nudge
+   *   ≤ 60s    2   sustained overrate
+   *   ≤ 600s   3   a real ban
+   *   > 600s   ALL the way to `maxTightenLevel` — at this magnitude the rate
+   *               that produced it is categorically wrong, and stepping down
+   *               one level at a time would spend the next window earning the
+   *               next ban. The 2026-07-25 (3713s) and 2026-07-27 (15908s)
+   *               bans are both in this band.
+   */
+  function tightenStepFor(retryAfterSec: number): number {
+    if (!Number.isFinite(retryAfterSec) || retryAfterSec <= 5) return 1
+    if (retryAfterSec <= 60) return 2
+    if (retryAfterSec <= 600) return 3
+    return maxTightenLevel
+  }
+
+  /**
+   * The stated `retry_after` in seconds when `err` is a flood rejection, else
+   * null. Returns 0 for a flood whose magnitude is not stated (the text-match
+   * path), which `tightenStepFor` treats as the mildest case — an unquantified
+   * signal must not be inflated into a maximal response.
+   */
+  function floodRetryAfterSec(err: unknown): number | null {
     const e = err as { error_code?: number; parameters?: { retry_after?: number } } | null
     if (e != null && typeof e === 'object') {
-      if (e.error_code === 429) return true
-      if (e.parameters != null && typeof e.parameters.retry_after === 'number') return true
+      const stated = e.parameters?.retry_after
+      if (typeof stated === 'number') return stated
+      if (e.error_code === 429) return 0
     }
     // Match on the SEMANTIC markers only. A bare "429" substring
     // false-positives on ordinary server text (e.g. "message 429 not found"),
     // and a false positive here halves every ceiling for ten minutes.
     const msg = err instanceof Error ? err.message : String(err ?? '')
-    return /too many requests/i.test(msg) || /retry[ _-]?after/i.test(msg)
+    if (!/too many requests/i.test(msg) && !/retry[ _-]?after/i.test(msg)) return null
+    // grammY and the Bot API both surface the magnitude in the text; use it
+    // when it is there rather than throwing the severity away.
+    const m = /retry[ _-]?after[^0-9]{0,4}(\d+)/i.exec(msg)
+    return m != null ? Number(m[1]) : 0
   }
 
 /**
@@ -887,13 +999,16 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       const res = await next()
       // grammY throws on ok:false, but a transformer installed BELOW another
       // one can still observe a raw ApiResponse — handle both shapes.
-      const r = res as unknown as { ok?: boolean; error_code?: number }
+      const r = res as unknown as {
+        ok?: boolean; error_code?: number; parameters?: { retry_after?: number }
+      }
       if (r != null && typeof r === 'object' && r.ok === false && r.error_code === 429) {
-        noteFlood(clock.now())
+        noteFlood(clock.now(), r.parameters?.retry_after ?? 0)
       }
       return res
     } catch (err) {
-      if (looksLikeFlood(err)) noteFlood(clock.now())
+      const retryAfterSec = floodRetryAfterSec(err)
+      if (retryAfterSec !== null) noteFlood(clock.now(), retryAfterSec)
       throw err
     }
   }
@@ -914,6 +1029,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       meteredByDefault: counters.meteredByDefault,
       chatless: counters.chatless,
       perTokenCeiling: ceiling(perTokenMax, now),
+      persistedFloodOpen: persistedFloodRemainingMs(now) > 0,
     }
   }
 

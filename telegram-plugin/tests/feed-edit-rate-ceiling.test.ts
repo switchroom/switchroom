@@ -351,7 +351,12 @@ describe('feed flood ban — a 429 reduces the subsequent feed edit rate', () =>
     }
     expect(fuse.stats().tightenLevel).toBe(3)
 
-    await clock.advance(60_001)
+    // #3856: the hold is now `max(tightenMs, retry_after * 1000 + tightenMs)`,
+    // so a stated `retry_after: 3` holds for 63s — the fuse must not begin
+    // decaying while Telegram's own stated cooldown is still running. The
+    // one-level-at-a-time decay this test guards is unchanged; only the FIRST
+    // hold is longer, by the stated 3s.
+    await clock.advance(63_001)
     expect(fuse.stats().tightenLevel).toBe(2)
     await clock.advance(60_001)
     expect(fuse.stats().tightenLevel).toBe(1)
