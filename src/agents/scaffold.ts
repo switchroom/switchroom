@@ -794,6 +794,13 @@ import {
   type HindsightRecallTunables,
   type RecallTunableInput,
 } from "../setup/hindsight-recall-tunables.js";
+import {
+  resolveHindsightRecallPassthrough,
+  recallPassthroughTemplateFields,
+  HINDSIGHT_RECALL_TAG_WEIGHT_SEED,
+  type HindsightRecallPassthrough,
+  type RecallPassthroughInput,
+} from "../setup/hindsight-recall-passthrough.js";
 import { ensureBareClone } from "../repos/bare-clone.js";
 import {
   ensureAgentWorktree,
@@ -3494,12 +3501,17 @@ function renderHindsightSettingsOverrides(
   // tags delegated worker process-facts `sidechain`; this down-weights their
   // recall `scores.final` by 0.8 so first-party session memory ranks first,
   // while a sidechain fact still surfaces when it is the only relevant hit
-  // (a DOWN-RANK, not the hard demote-tag DROP filter). No first-class cascade
-  // knob yet (mirrors the intentionally-dormant recallTags port below);
-  // operators re-tune per-agent by setting HINDSIGHT_RECALL_TAG_WEIGHTS (a JSON
-  // object) via the agent's `env:` map in switchroom.yaml — the env value wins
-  // over this scaffold default (config.py ENV_OVERRIDES).
-  settings.recallTagWeights = { sidechain: 0.8 };
+  // (a DOWN-RANK, not the hard demote-tag DROP filter).
+  //
+  // #3841: the first-class knob is now `memory.recall.tag_weights`, which
+  // MERGES over this seed (an explicit `sidechain: 1.0` neutralises it) and is
+  // exported as HINDSIGHT_RECALL_TAG_WEIGHTS from start.sh unconditionally.
+  // The seed literal lives in hindsight-recall-passthrough.ts so this stamp and
+  // that export cannot drift. NOTE the migration: because the export is now
+  // unconditional, a raw `HINDSIGHT_RECALL_TAG_WEIGHTS` in an agent's `env:`
+  // map (the pre-#3841 escape hatch, set on the container BEFORE start.sh runs)
+  // no longer wins — use the yaml knob.
+  settings.recallTagWeights = { ...HINDSIGHT_RECALL_TAG_WEIGHT_SEED };
   // Static shared-bank recall (RFC reference/rfcs/per-speaker-memory-routing.md,
   // ship-B): recall these extra banks on every turn, merged into the agent's
   // own bank results. Sourced from memory.recall.additional_banks (cascaded);
@@ -3509,29 +3521,24 @@ function renderHindsightSettingsOverrides(
   if (additionalBanks.length > 0) {
     settings.recallAdditionalBanks = [...additionalBanks];
   }
-  // #2816 tag-filter port — INTENTIONALLY DORMANT (do not wire without an RFC).
+  // #2816 tag-filter port — still DORMANT BY DEFAULT, now operator-reachable.
   // The vendored recall.py reads `recallTags` / `recallTagsMatch` /
-  // `recallTagGroups` / `recallAdditionalBankFilters` (upstream 962140eef, and
-  // the env overrides HINDSIGHT_RECALL_TAGS / _TAGS_MATCH / _TAG_GROUPS exist in
-  // vendor/hindsight-memory/scripts/lib/config.py). But switchroom deliberately
-  // does NOT set any of them here, and there is no memory.recall.tags config
-  // surface in src/config/schema.ts — so the filters collapse to their no-op
-  // pass-through default (empty filter = match everything).
+  // `recallTagGroups` / `recallAdditionalBankFilters` (upstream 962140eef).
+  // Nothing is stamped here, deliberately: the settings.json side stays at the
+  // vendor no-op (empty filter = match everything), so an agent with no
+  // `memory.recall.tags*` config filters nothing, exactly as before.
   //
-  // This is a decision, not an oversight. reference/rfcs/hindsight-synthesis-
-  // layers.md frames the port as "a ready-made hook for future recall shaping
-  // (e.g. scoping additional-bank recall to specific tags), currently dormant" —
-  // explicitly future work, NOT part of the Phase 2 bank-specialization goals
-  // (which are mission/disposition-driven, already wired via updateBankMissions
-  // + resolveBankMissionExtras). Wiring a first-class tag surface now would mean
-  // inventing a per-bank tag taxonomy the RFC does not specify. The env-var
-  // escape hatch above remains available to advanced operators in the meantime.
-  //
-  // TODO(#2816): if/when an RFC calls for tag-scoped recall, add a
-  // `memory.recall.tags` (+ match/groups) cascade knob mirroring the
-  // `recallTypes` wiring above and export it through profiles/_base/start.sh.hbs
-  // (HINDSIGHT_RECALL_TAGS), letting the env value win over this scaffold
-  // default — then set settings.recallTags here from the resolved config.
+  // What #3841 changed is only the LEVER, not the default. The four keys now
+  // have a `memory.recall.{tags,tags_match,tag_groups,additional_bank_filters}`
+  // cascade surface, exported unconditionally from start.sh at their existing
+  // effective values ([] / "any" / {} / {}) — the passthrough shape #3774
+  // requires. That is the wiring the old TODO here described, minus the part it
+  // warned against: switchroom still does NOT invent a per-bank tag taxonomy.
+  // reference/rfcs/hindsight-synthesis-layers.md frames the port as "a
+  // ready-made hook for future recall shaping (e.g. scoping additional-bank
+  // recall to specific tags), currently dormant"; an operator who has such a
+  // taxonomy in their own bank can now express it in switchroom.yaml instead of
+  // hand-editing the installed plugin, and one who does not is unaffected.
   return JSON.stringify(settings, null, 2) + "\n";
 }
 
@@ -3677,6 +3684,11 @@ interface BuildWorkspaceContextArgs {
   // resolved and always exported (0 = off, the shipped default).
   hindsightRecallMinScore: number;
   hindsightRecallMinScoreScope: string;
+  // #3841 — the remaining recall knobs, resolved to their effective values and
+  // exported unconditionally for the same #3774 reason. Carried as one object
+  // rather than 15 flat fields; buildWorkspaceContext shell-quotes the
+  // JSON/string members into `hindsightRecallPass` for the template.
+  hindsightRecallPassthrough: HindsightRecallPassthrough;
   // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
@@ -3729,6 +3741,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallAdditionalBankMinSlots,
     hindsightRecallMinScore,
     hindsightRecallMinScoreScope,
+    hindsightRecallPassthrough,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -3820,6 +3833,19 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallAdditionalBankMinSlots,
     hindsightRecallMinScore,
     hindsightRecallMinScoreScope,
+    // #3841 — one nested object, so start.sh.hbs reads
+    // `{{hindsightRecallPass.budget}}` etc. Structural values arrive
+    // pre-serialised from the resolver and are shell-single-quoted here (the
+    // preamble is free-form operator text and the JSON carries double quotes;
+    // neither is safe bare). Never empty: an empty export is skipped by
+    // `_cast_env` and hands authority back to ~/.hindsight/claude-code.json.
+    // Built by the shared helper, NOT inline: reconcileAgentInner hand-builds
+    // its own template context, and a second copy of this mapping is the
+    // init-vs-reconcile drift scaffold.memory-prompt.test.ts guards.
+    hindsightRecallPass: recallPassthroughTemplateFields(
+      hindsightRecallPassthrough,
+      shellSingleQuote,
+    ),
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -4778,6 +4804,14 @@ export function scaffoldAgent(
   const hindsightRecallMinScoreScope =
     agentConfig.memory?.recall?.min_score_scope ??
     HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT;
+  // #3841 — everything else recall.py reads. Resolved from the same CASCADED
+  // agent config, always to a concrete value, and exported unconditionally.
+  // THROWS on an out-of-enum / wrong-typed value: a bad knob must red the
+  // apply, not sail through to a fail-open `_cast_env` that silently restores
+  // the plugin default while switchroom.yaml reads as though it were tuned.
+  const hindsightRecallPassthrough = resolveHindsightRecallPassthrough(
+    agentConfig.memory?.recall as RecallPassthroughInput | undefined,
+  );
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -4860,6 +4894,7 @@ export function scaffoldAgent(
     hindsightRecallAdditionalBankMinSlots,
     hindsightRecallMinScore,
     hindsightRecallMinScoreScope,
+    hindsightRecallPassthrough,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -7261,6 +7296,14 @@ function reconcileAgentInner(
   const hindsightRecallMinScoreScope =
     agentConfig.memory?.recall?.min_score_scope ??
     HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT;
+  // #3841 — everything else recall.py reads. Resolved from the same CASCADED
+  // agent config, always to a concrete value, and exported unconditionally.
+  // THROWS on an out-of-enum / wrong-typed value: a bad knob must red the
+  // apply, not sail through to a fail-open `_cast_env` that silently restores
+  // the plugin default while switchroom.yaml reads as though it were tuned.
+  const hindsightRecallPassthrough = resolveHindsightRecallPassthrough(
+    agentConfig.memory?.recall as RecallPassthroughInput | undefined,
+  );
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -7367,6 +7410,16 @@ function reconcileAgentInner(
       hindsightRecallAdditionalBankMinSlots,
       hindsightRecallMinScore,
       hindsightRecallMinScoreScope,
+      // #3841 — the SAME builder buildWorkspaceContext uses. This context is
+      // hand-built, so passing the resolver object straight through would leave
+      // every `{{hindsightRecallPass.*}}` path unknown, and handlebars renders
+      // an unknown path as "" rather than throwing: reconcile would silently
+      // emit `export HINDSIGHT_RECALL_BUDGET=` and hand the knob back to
+      // ~/.hindsight/claude-code.json.
+      hindsightRecallPass: recallPassthroughTemplateFields(
+        hindsightRecallPassthrough,
+        shellSingleQuote,
+      ),
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
@@ -8157,6 +8210,7 @@ function reconcileAgentInner(
       hindsightRecallAdditionalBankMinSlots,
       hindsightRecallMinScore,
       hindsightRecallMinScoreScope,
+      hindsightRecallPassthrough,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
