@@ -11,16 +11,32 @@
  * through (an unusable token must never be MORE restrictive than
  * presenting no token when the agent has a standing ACL).
  *
- * Harness limitation (same as the put precedent): a per-agent socket
- * path must literally be /run/switchroom/broker/<agent>/sock, which a
- * /tmp test cannot bind, so `agentName` is null here and the no-token
- * fall-through lands on the path-as-identity DENIED in test mode. The
- * positive "fall-through → standing ACL → secret served" path is
- * proven by the live gymbro repro + the identical, in-production `put`
- * fall-through. What IS unit-asserted here and is the highest-risk
- * invariant (reviewer B1): on fall-through there is exactly ONE
- * terminal audit row and it is NOT method:"grant" — the token-branch
- * deny-audit must be gone, or the #1433 hash-chain double-rows.
+ * Two harnesses, deliberately (#3750):
+ *
+ *  1. UNIDENTIFIED caller (describe #1). A /tmp test cannot bind the
+ *     literal /run/switchroom/broker/<agent>/sock, so `agentName` is
+ *     null and the post-fall-through no-token path lands on the
+ *     path-as-identity DENIED on Linux. That denial is CORRECT, not a
+ *     bug: an unidentified caller has no standing ACL to fall through
+ *     TO. So the invariant is asserted here as EQUIVALENCE — a request
+ *     carrying an unusable token must produce a byte-identical result
+ *     to the same request with NO token — never as a hard-coded
+ *     `ok: true`, which the design does not promise for a caller it
+ *     cannot identify. (#3750: the `list` case asserted exactly that
+ *     un-promised `ok: true` and was red on `main`.) Plus the
+ *     highest-risk invariant (reviewer B1): on fall-through there is
+ *     exactly ONE terminal audit row and it is NOT method:"grant" —
+ *     the token-branch deny-audit must be gone, or #1433's hash-chain
+ *     double-rows.
+ *
+ *  2. IDENTIFIED agent (describe #2). `_testAgentName` makes every
+ *     connection agent-bound regardless of bind path, so the POSITIVE
+ *     "fall-through → standing agents.<name>.secrets[] ACL → secret
+ *     served / keys listed" path IS unit-assertable. An earlier
+ *     revision of this header claimed it was not; that was stale, and
+ *     believing it is what produced the wrong `list` assertion. This
+ *     is the arm that goes red if the read path ever hard-denies on
+ *     grant-invalid / grant-expired / grant-key-not-allowed.
  */
 
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
@@ -183,19 +199,29 @@ describe("VaultBroker: read-path unusable-token fall-through", () => {
     expect(a[0].method).toBe("grant");
   });
 
-  it("list with INVALID token → falls through to no-token list (ACL-filtered, single non-grant audit row)", async () => {
-    // Unlike `get` (which hard-denies when the ACL grants nothing),
-    // `list` post-fall-through behaves exactly like a no-token list:
-    // it returns ok:true with the ACL-visible key set (empty in this
-    // harness since config.agents={}), NOT a DENIED. The point of the
-    // fix: an unusable token must behave identically to NO token.
+  it("list with INVALID token → result is identical to a no-token list, single non-grant audit row", async () => {
+    // The invariant is EQUIVALENCE, not success: an unusable token must
+    // behave exactly as if no token were presented. Asserting a bare
+    // `ok: true` here was wrong (#3750) — this harness cannot resolve an
+    // agentName, so the no-token path itself correctly DENIES on the
+    // path-as-identity gate, and there is nothing for a fall-through to
+    // land on. Comparing the two responses pins the real promise on
+    // every platform, and still goes red if the token branch ever
+    // hard-denies grant-invalid (the denial would read "grant-invalid"
+    // instead of the identity reason). The positive
+    // fall-through-to-ACL arm is asserted in the identified-agent
+    // describe below.
     const resp = await rpc(socketPath, { v: 1, op: "list", token: "vg_deadbe.0000000000000000000000000000000000000000000000000000000000000000" });
-    expect(resp.ok).toBe(true);
-    if (resp.ok && "keys" in resp) expect(Array.isArray((resp as any).keys)).toBe(true);
-    const a = listAudits();
-    expect(a).toHaveLength(1);                              // B1: single terminal row
-    expect(a[0].method).not.toBe("grant");                 // B1: token-branch audit gone
-    expect(a.some((e) => e.result === "denied:grant-invalid" && e.method === "grant")).toBe(false);
+    const withTokenAudits = listAudits().slice();
+    auditEntries.length = 0;
+    const noToken = await rpc(socketPath, { v: 1, op: "list" });
+    expect(resp).toEqual(noToken);
+    // Proof of fall-through: whatever the outcome, it is NOT reported as
+    // the token reason — the token branch did not terminate the request.
+    if (!resp.ok) expect(resp.msg).not.toContain("grant-invalid");
+    expect(withTokenAudits).toHaveLength(1);               // B1: single terminal row
+    expect(withTokenAudits[0].method).not.toBe("grant");   // B1: token-branch audit gone
+    expect(withTokenAudits.some((e) => e.result === "denied:grant-invalid" && e.method === "grant")).toBe(false);
   });
 
   it("list with VALID token → ok (returns covered+existing keys), audited method:grant", async () => {
@@ -203,6 +229,117 @@ describe("VaultBroker: read-path unusable-token fall-through", () => {
     const resp = await rpc(socketPath, { v: 1, op: "list", token });
     expect(resp.ok).toBe(true);
     if (resp.ok && "keys" in resp) expect((resp as any).keys).toContain("foo");
+    const a = listAudits();
+    expect(a).toHaveLength(1);
+    expect(a[0].method).toBe("grant");
+  });
+});
+
+// ── Harness #2: IDENTIFIED agent with a standing ACL (#3750) ───────────
+// `_testAgentName` treats every connection as agent-bound regardless of
+// bind path, so the path-as-identity gate resolves and the standing
+// `agents.agent1.secrets: [foo]` ACL is reachable. This is the arm that
+// actually pins the security-relevant promise: a token that grants
+// nothing usable must never leave the agent WORSE off than presenting
+// no token at all.
+describe("VaultBroker: read-path unusable-token fall-through (identified agent)", () => {
+  let broker: VaultBroker;
+  let socketPath: string;
+  let tmpDir: string;
+  let grantsDb: Database;
+  let auditEntries: AuditEntry[];
+  let prevNonLinuxFlag: string | undefined;
+
+  const BAD_TOKEN =
+    "vg_deadbe.0000000000000000000000000000000000000000000000000000000000000000";
+
+  beforeEach(async () => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-tokenft-agent-test-"));
+    socketPath = path.join(tmpDir, "test.sock");
+    grantsDb = makeInMemoryGrantsDb();
+    auditEntries = [];
+    const config = makeMinimalConfig();
+    // Standing operator-set ACL — the thing an unusable token must not shadow.
+    config.agents = { agent1: { secrets: ["foo"] } };
+    broker = new VaultBroker({
+      _testSecrets: cloneSecrets(),
+      _testConfig: config,
+      _testGrantsDb: grantsDb,
+      _testAgentName: "agent1",
+      _testAuditLogger: { write: (e: AuditEntry) => { auditEntries.push(e); return true; }, failOpenCount: () => 0 },
+    });
+    await broker.start(socketPath, undefined, undefined);
+  });
+
+  afterEach(() => {
+    broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+  });
+
+  const getAudits = () => auditEntries.filter((e) => e.op === "get");
+  const listAudits = () => auditEntries.filter((e) => e.op === "list");
+
+  it("get with INVALID token → falls through to the standing ACL and SERVES the secret", async () => {
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token: BAD_TOKEN });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) expect((resp as any).entry.value).toBe("bar-value");
+    const a = getAudits();
+    expect(a).toHaveLength(1);
+    expect(a[0].result).toBe("allowed");
+    expect(a[0].method).not.toBe("grant");
+  });
+
+  it("get with EXPIRED token → falls through to the standing ACL and SERVES the secret", async () => {
+    const { token, id } = await mintGrant(grantsDb, "agent1", ["foo"], null);
+    grantsDb.run(`UPDATE vault_grants SET expires_at = ? WHERE id = ?`, [Math.floor(Date.now() / 1000) - 3600, id]);
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) expect((resp as any).entry.value).toBe("bar-value");
+    expect(getAudits()).toHaveLength(1);
+  });
+
+  it("get with a token scoped to ANOTHER key → falls through, standing ACL still serves", async () => {
+    // grant-key-not-allowed: the token is genuine but covers nothing for
+    // this key. It must not shadow the standing ACL.
+    const { token } = await mintGrant(grantsDb, "agent1", ["other-key"], null);
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) expect((resp as any).entry.value).toBe("bar-value");
+  });
+
+  it("get with REVOKED token → still hard-denies (kill-switch survives an identified agent)", async () => {
+    const { token, id } = await mintGrant(grantsDb, "agent1", ["foo"], null);
+    grantsDb.run(`UPDATE vault_grants SET revoked_at = ? WHERE id = ?`, [Math.floor(Date.now() / 1000), id]);
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.msg).toContain("grant-revoked");
+    const a = getAudits();
+    expect(a).toHaveLength(1);
+    expect(a[0].method).toBe("grant");
+  });
+
+  it("list with INVALID token → falls through and lists the ACL-visible keys (identical to no token)", async () => {
+    const resp = await rpc(socketPath, { v: 1, op: "list", token: BAD_TOKEN });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "keys" in resp) expect((resp as any).keys).toEqual(["foo"]);
+    const withTokenAudits = listAudits().slice();
+    auditEntries.length = 0;
+    const noToken = await rpc(socketPath, { v: 1, op: "list" });
+    expect(resp).toEqual(noToken);
+    expect(withTokenAudits).toHaveLength(1);
+    expect(withTokenAudits[0].method).not.toBe("grant");
+  });
+
+  it("list with REVOKED token → still hard-denies (kill-switch survives an identified agent)", async () => {
+    const { token, id } = await mintGrant(grantsDb, "agent1", ["foo"], null);
+    grantsDb.run(`UPDATE vault_grants SET revoked_at = ? WHERE id = ?`, [Math.floor(Date.now() / 1000), id]);
+    const resp = await rpc(socketPath, { v: 1, op: "list", token });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.msg).toContain("grant-revoked");
     const a = listAudits();
     expect(a).toHaveLength(1);
     expect(a[0].method).toBe("grant");
