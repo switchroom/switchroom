@@ -737,19 +737,6 @@ export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
 {{#if (isNumber hindsightRecallCacheTtlSecs)}}
 export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{/if}}
-# Lexical-overlap relevance gate (#475). Drops memories whose containment
-# overlap (|Q n M| / |M|, see #3541) with the user's query is
-# below this threshold (range 0.0–1.0).
-# Plugin default is 0.0 (gate disabled); export only when the operator
-# overrode it via memory.recall.min_overlap in switchroom.yaml. Use 0.10:
-# it is a near-passthrough floor, not a precision control. Values at or
-# above 0.20 measurably starve recall — on production replay 0.20 leaves
-# ~41.9% of turns with NO memories at all, re-creating the bug #3541
-# fixed. Observe `overlap_dropped` via
-# `switchroom memory recall-log <agent>`.
-{{#if (isNumber hindsightRecallMinOverlap)}}
-export HINDSIGHT_RECALL_MIN_OVERLAP={{hindsightRecallMinOverlap}}
-{{/if}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the

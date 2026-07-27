@@ -141,12 +141,12 @@ describe("formatRecallLogView — directives_omitted", () => {
 });
 
 // Switchroom #3541 — recall QUALITY telemetry. Every pre-existing field on a
-// recall_log row measures VOLUME. Once the overlap gate became a
-// near-passthrough floor at 0.10, precision rested entirely on the engine's
-// `scores.final` plus the max_memories head-slice — so a rollout that fed each
-// agent `max_memories` mediocre memories per turn would raise `avg`/`max` and
-// zero out `overlap_dropped`, i.e. read as unambiguous success. These assert
-// the score range actually reaches the operator.
+// recall_log row measures VOLUME. With the lexical overlap gate removed
+// outright, precision rests entirely on the engine's `scores.final` plus the
+// max_memories head-slice — so a rollout that fed each agent `max_memories`
+// mediocre memories per turn would raise `avg`/`max` and fill `result_count`
+// to the cap, i.e. read as unambiguous success. These assert the score range
+// actually reaches the operator.
 describe("formatRecallLogView — injected relevance scores", () => {
   const ANSI = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
   const strip = (s: string) => s.replace(ANSI, "");
