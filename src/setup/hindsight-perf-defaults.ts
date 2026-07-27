@@ -683,9 +683,39 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *   env:
  *     HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY: "big-bank:3,busy-bank:2,*:1"
  * ```
+ *
+ * ### `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP`
+ *
+ * The documented rollback knob for switchroom's CE-saturation damping patch
+ * (`docker/Dockerfile.hindsight`, the `reranking.py` block). That patch is
+ * unconditional and its failure mode is a *silent* recall-quality regression
+ * with no telemetry that would surface it, so the patch deliberately reads its
+ * decisive gap from this env var once at import — backing the change out is
+ * meant to be a container restart with one env var, not an image rebuild. Any
+ * value at or above ~0.65 clamps the damping exponent to 1.0, i.e. exactly
+ * upstream ranking behaviour with the patch still baked in.
+ *
+ * Note the name: this is a switchroom-patch knob, not an upstream one, so it
+ * carries NO `HINDSIGHT_API_` prefix and upstream's config parser never sees
+ * it. Only the patched module reads it.
+ *
+ * It is here because an escape hatch that cannot be reached is not an escape
+ * hatch. Absent from this set, `resolveHindsightPerfOverrides` skipped it, so
+ * a `hindsight.env` line for it never reached the container — and because the
+ * patch reads the var once at import, there is no runtime fallback to recover
+ * through. Override-only rather than defaulted: switchroom ships the patch's
+ * own derived gap, and emitting a value here would replace a derived constant
+ * with a hard-coded one on every host.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_CE_DECISIVE_RELATIVE_GAP: "1.0"   # damping off, patch inert
+ * ```
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+  "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
 ]);
 
 /**

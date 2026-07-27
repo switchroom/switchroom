@@ -1,12 +1,12 @@
 /**
- * Behavioural proof for the four search/provider patches
+ * Behavioural proof for the three search/provider patches
  * `docker/Dockerfile.hindsight` bakes into the pinned upstream Hindsight
  * image. `dockerfile-hindsight-bakes.test.ts` pins the *shape* of those patch
  * blocks (grep-on-file, runs everywhere). This file proves the *outcome*: it
  * runs the same probe against unpatched upstream (must be RED on every bug)
  * and against upstream + the patch blocks applied (must be GREEN).
  *
- * The four defects, all reproduced live on bank `overlord` before the fix:
+ * The three defects, all reproduced live on bank `overlord` before the fix:
  *
  *  1. Cross-encoder saturation. `apply_combined_scoring` makes
  *     `CE * recency_boost * temporal_boost * proof_count_boost` the only final
@@ -21,11 +21,14 @@
  *  3. Both LiteLLM timeout handlers ended in a bare `raise`, re-raising an
  *     `asyncio.TimeoutError` whose `str()` is empty → an operator-facing
  *     "TimeoutError:" with no cause.
- *  4. `retrieve_all_fact_types_parallel` ran the vector-similarity scan TWICE
- *     per recall. Step 2's semantic arm is an ANN scan; Step 3 then passed
- *     `semantic_seeds=None` into the graph retriever, whose `_find_semantic_seeds`
- *     issues its own `ORDER BY embedding <=> $1::vector LIMIT $5` per fact type,
- *     serialized behind Step 2's connection block.
+ *
+ * (A fourth defect once lived here — `retrieve_all_fact_types_parallel` ran the
+ * vector-similarity scan twice per recall, because Step 3 passed
+ * `semantic_seeds=None` into the graph retriever. Upstream v0.8.5 REMOVED the
+ * `semantic_seeds` parameter outright and documented the removal as deliberate
+ * ("Graph traversal deliberately chooses its own bounded seeds"), so the patch
+ * and its probe were retired in the 0.8.4 -> 0.8.5 base bump rather than
+ * re-anchored. `dockerfile-hindsight-bakes.test.ts` now asserts it stays gone.)
  *
  * Beyond proving those three fixes, the probe pins the properties that make
  * the fixes SAFE, because each was violated by an earlier revision of this
@@ -44,13 +47,6 @@
  *    additive levels and `min_scores.final` are calibrated against.
  *  - `tokenize_query` stays a STRICT SUPERSET of upstream's token list, so the
  *    OR-joined query can only match more documents than upstream, never fewer.
- *  - The seeds the graph expansion is handed are the SAME SET, in the same
- *    order, that upstream's own seed query returns — asserted by calling that
- *    upstream query and diffing, not by trusting the derivation. Where the two
- *    are not provably identical (a `min_scores.semantic` floor above the seed
- *    threshold, or a thinking_budget below the seed cap) the derivation must
- *    decline and let upstream re-query. A faster wrong seed set is a
- *    regression, not a win.
  *
  * The patch blocks are extracted from the Dockerfile itself rather than
  * duplicated here, so this test cannot drift from what actually ships. It
@@ -97,7 +93,7 @@ const UPSTREAM_IMAGE = (() => {
 })();
 
 /**
- * The three patch blocks under test, pulled out of the Dockerfile's
+ * The patch blocks under test, pulled out of the Dockerfile's
  * `RUN python3 - <<'PYEOF' … PYEOF` heredocs by their unique patch names.
  */
 function patchBlocks(): string[] {
@@ -108,7 +104,6 @@ function patchBlocks(): string[] {
     "CE-saturation patch",
     "BM25 compound-token patch",
     "timeout-message patch",
-    "duplicate-ANN-scan patch",
   ];
   return wanted.map((name) => {
     const b = blocks.find((x) => x.includes(name));
@@ -478,187 +473,6 @@ for label, (how, msg) in sorted(timeouts.items()):
     elif "timed out after" not in msg or "scope=" not in msg:
         failures.append("%s timeout message lost the timeout/scope facts: %r" % (label, msg))
 
-# ------------------------------------------------------------------ fix 4
-# Drive the REAL retrieve_all_fact_types_parallel and the REAL
-# LinkExpansionRetriever over an in-memory corpus, and COUNT the
-# vector-similarity scans at the connection. Upstream issues one per fact type
-# on top of Step 2's arm; patched must issue exactly one for the whole recall.
-from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
-from hindsight_api.engine.search import link_expansion_retrieval as LE
-from hindsight_api.engine.search import retrieval as R
-
-SEED_LIMIT = 20
-SEED_THRESHOLD = 0.3
-
-
-def urow(ft, i, sim):
-    return {
-        "id": "%s-%02d" % (ft, i), "text": "fact %d" % i, "context": None,
-        "event_date": None, "occurred_start": None, "occurred_end": None,
-        "mentioned_at": None, "fact_type": ft, "document_id": None,
-        "chunk_id": None, "tags": None, "metadata": None, "proof_count": 1,
-        "similarity": sim, "bm25_score": None,
-    }
-
-
-# 40 world rows spanning the seed threshold (33 clear 0.3, so BOTH the 20-cap
-# and the threshold bite) plus 5 experience rows that all clear it (under the
-# cap, so the whole set is the seed set).
-CORPUS = [urow("world", i, round(0.95 - 0.02 * i, 4)) for i in range(40)]
-CORPUS += [urow("experience", i, round(0.90 - 0.10 * i, 4)) for i in range(5)]
-
-
-class FakeConn:
-    """Serves the real SQL the engine builds, from the corpus above.
-
-    Discriminates the three query shapes a recall issues so the probe can COUNT
-    ANN scans rather than infer them: the Step 2 combined arm, link_expansion's
-    standalone seed scan, and the graph expansion CTE.
-    """
-
-    backend_type = "postgresql"
-
-    def __init__(self, log):
-        self.log = log
-
-    async def fetch(self, query, *params):
-        if "'semantic' AS source" in query:
-            self.log.append("arm")
-            floor = float(re.search(r"<=> \$1::vector\)\) >= ([0-9.]+)", query).group(1))
-            return [dict(r, source="semantic") for r in CORPUS if r["similarity"] >= floor]
-        if "embedding <=>" in query:
-            # The duplicate scan this patch exists to remove.
-            self.log.append("seed")
-            _emb, _bank, ft, threshold, limit = params[:5]
-            hits = [r for r in CORPUS if r["fact_type"] == ft and r["similarity"] >= threshold]
-            hits.sort(key=lambda r: r["similarity"], reverse=True)
-            return hits[:limit]
-        self.log.append("expand")
-        return []
-
-
-class FakePool:
-    def __init__(self, conn):
-        self.conn = conn
-        self.ops = PostgreSQLOps()
-
-    async def acquire(self):
-        return self.conn
-
-    async def release(self, conn):
-        pass
-
-    def get_size(self):
-        return 1
-
-    def get_idle_size(self):
-        return 1
-
-
-class RecordingRetriever(LE.LinkExpansionRetriever):
-    """The REAL retriever, wrapped only to capture what it was handed."""
-
-    def __init__(self):
-        super().__init__()
-        self.seen = {}
-
-    async def retrieve(self, **kw):
-        self.seen[kw["fact_type"]] = kw["semantic_seeds"]
-        return await super().retrieve(**kw)
-
-
-async def _drive(fact_types, budget=300, min_semantic=None):
-    log = []
-    retriever = RecordingRetriever()
-    await R.retrieve_all_fact_types_parallel(
-        FakePool(FakeConn(log)), "alpha beta", "[0.1,0.2]", "bank-probe",
-        list(fact_types), budget, None, None,
-        graph_retriever=retriever, min_semantic=min_semantic,
-    )
-    return log, retriever.seen
-
-
-def seed_ids(seeds):
-    return None if seeds is None else [s.id for s in seeds]
-
-
-async def _reference(ft):
-    """The seed set upstream's OWN query returns, obtained by calling it."""
-    rows = await LE._find_semantic_seeds(
-        FakeConn([]), "[0.1,0.2]", "bank-probe", ft,
-        limit=SEED_LIMIT, threshold=SEED_THRESHOLD,
-    )
-    return [r.id for r in rows]
-
-
-# The mirrored seed constants are only right while the call site still passes
-# them; upstream retuning either one silently changes which set is equivalent.
-le_src = inspect.getsource(LE.LinkExpansionRetriever.retrieve)
-print("SEED_CALL_SITE_DEFAULTS", "limit=20" in le_src, "threshold=0.3" in le_src)
-if "limit=20" not in le_src or "threshold=0.3" not in le_src:
-    failures.append("link_expansion no longer seeds with limit=20/threshold=0.3 - the derived seed set is calibrated against those")
-
-FT = ["world", "experience"]
-scan_log, delivered = asyncio.run(_drive(FT))
-ref = {ft: asyncio.run(_reference(ft)) for ft in FT}
-
-ann = scan_log.count("arm") + scan_log.count("seed")
-print("ANN_SCANS", ann, "ARM", scan_log.count("arm"), "SEED_QUERIES", scan_log.count("seed"))
-print("REFERENCE_world", len(ref["world"]))
-print("REFERENCE_experience", len(ref["experience"]))
-for ft in FT:
-    print("DELIVERED_%s" % ft, seed_ids(delivered[ft]))
-
-if scan_log.count("seed") != 0:
-    failures.append(
-        "graph expansion still issued %d standalone ANN seed scan(s) after Step 2 already ran one"
-        % scan_log.count("seed")
-    )
-if ann != 1:
-    failures.append("recall issued %d vector-similarity scans (expected exactly 1)" % ann)
-
-# EQUIVALENCE. Same ids, same order, as upstream's own seed query - the whole
-# safety argument, since a narrowed seed set silently narrows recall.
-for ft in FT:
-    got = seed_ids(delivered[ft])
-    if got is None:
-        failures.append("%s: semantic_seeds was None - the graph path re-ran the ANN scan" % ft)
-    elif got != ref[ft]:
-        failures.append("%s: derived seeds %r != upstream seed query %r" % (ft, got, ref[ft]))
-
-# The corpus must keep exercising both bounds, or the equivalence check above
-# degenerates into a tautology.
-if len(ref["world"]) != SEED_LIMIT:
-    failures.append("probe corpus no longer exercises the %d-seed cap (%d)" % (SEED_LIMIT, len(ref["world"])))
-if len(ref["experience"]) >= SEED_LIMIT:
-    failures.append("probe corpus no longer exercises the under-cap case")
-
-# FALLBACK 1: a per-request min_scores.semantic floor ABOVE the seed threshold
-# makes the arm's pool narrower than the seed query's, so rows the seed query
-# would have returned were never fetched. Must decline and let upstream query.
-log_hi, seen_hi = asyncio.run(_drive(["world"], min_semantic=0.5))
-print("HIGH_FLOOR_SEEDS", seed_ids(seen_hi["world"]), "SEED_QUERIES", log_hi.count("seed"))
-if seen_hi["world"] is not None:
-    failures.append("min_scores.semantic=0.5 (above the 0.3 seed threshold) still derived seeds from the narrowed arm")
-if log_hi.count("seed") != 1:
-    failures.append("min_scores.semantic=0.5 did not fall back to upstream's own seed query")
-
-# FALLBACK 2: a thinking_budget below the seed cap can trim away rows the seed
-# query would have returned.
-log_lo, seen_lo = asyncio.run(_drive(["world"], budget=5))
-print("TINY_BUDGET_SEEDS", seed_ids(seen_lo["world"]), "SEED_QUERIES", log_lo.count("seed"))
-if seen_lo["world"] is not None:
-    failures.append("thinking_budget=5 (below the seed cap) still derived seeds from a trimmed arm")
-if log_lo.count("seed") != 1:
-    failures.append("thinking_budget=5 did not fall back to upstream's own seed query")
-
-# temporal_seeds stays out of scope: upstream passes none, and Step 2's temporal
-# rows are a coverage-selected set with different semantics, so threading them
-# would ADD seeds rather than reproduce upstream's behaviour.
-print("TEMPORAL_SEEDS_STILL_NONE", "temporal_seeds=None" in inspect.getsource(R.retrieve_all_fact_types_parallel))
-if "temporal_seeds=None" not in inspect.getsource(R.retrieve_all_fact_types_parallel):
-    failures.append("temporal_seeds is no longer None - that is a separate change with different semantics")
-
 print("FAILURES", failures)
 # Sentinel: proves the probe ran to completion. The harness asserts this, so a
 # probe that dies early or short-circuits can never be mistaken for a pass.
@@ -830,7 +644,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("unpatched upstream is RED on all four defects (proves the probe bites)", () => {
+    it("unpatched upstream is RED on all three defects (proves the probe bites)", () => {
       const { status, stdout } = runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
@@ -868,15 +682,6 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toMatch(
         /TIMEOUT call_with_tools CAUGHT_BY_ASYNCIO_TIMEOUTERROR ''/
       );
-
-      // Defect 4 — the duplicate ANN scan, counted at the connection: Step 2's
-      // arm plus one standalone seed scan per fact type.
-      expect(stdout).toContain("ANN_SCANS 3 ARM 1 SEED_QUERIES 2");
-      expect(stdout).toContain(
-        "graph expansion still issued 2 standalone ANN seed scan(s) after Step 2 already ran one"
-      );
-      expect(stdout).toContain("DELIVERED_world None");
-      expect(stdout).toContain("DELIVERED_experience None");
     }, 240_000);
 
     it("upstream + the baked patch blocks is GREEN, including every safety property", () => {
@@ -956,40 +761,6 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toMatch(
         /TIMEOUT call_with_tools CAUGHT_BY_ASYNCIO_TIMEOUTERROR 'LiteLLM tool call timed out after 0\.05s on 1 attempts \(TimeoutError, scope=tools\)'/
       );
-
-      // Fix 4: exactly ONE vector-similarity scan for the whole recall — the
-      // arm — and zero standalone seed scans, no matter how many fact types.
-      expect(stdout).toContain("ANN_SCANS 1 ARM 1 SEED_QUERIES 0");
-
-      // … and the seeds the graph expansion actually received are the SAME SET,
-      // in the same order, that upstream's own seed query returns. Diffed
-      // against that query's real output, with both of its bounds biting: the
-      // 20-seed cap on `world` (40 rows, 33 above the 0.3 threshold) and the
-      // under-cap case on `experience` (5 rows).
-      expect(stdout).toContain("SEED_CALL_SITE_DEFAULTS True True");
-      expect(stdout).toContain("REFERENCE_world 20");
-      expect(stdout).toContain("REFERENCE_experience 5");
-      expect(stdout).toContain(
-        "DELIVERED_world ['world-00', 'world-01', 'world-02', 'world-03', " +
-          "'world-04', 'world-05', 'world-06', 'world-07', 'world-08', " +
-          "'world-09', 'world-10', 'world-11', 'world-12', 'world-13', " +
-          "'world-14', 'world-15', 'world-16', 'world-17', 'world-18', " +
-          "'world-19']"
-      );
-      expect(stdout).toContain(
-        "DELIVERED_experience ['experience-00', 'experience-01', " +
-          "'experience-02', 'experience-03', 'experience-04']"
-      );
-
-      // … and it DECLINES rather than guessing wherever the derived set is not
-      // provably the upstream set. Correctness first: a narrowed seed set is a
-      // silently quieter recall, which is worse than a slower one.
-      expect(stdout).toContain("HIGH_FLOOR_SEEDS None SEED_QUERIES 1");
-      expect(stdout).toContain("TINY_BUDGET_SEEDS None SEED_QUERIES 1");
-
-      // … while temporal seeds stay out of scope (upstream passes none, and
-      // Step 2's temporal rows are a differently-selected set).
-      expect(stdout).toContain("TEMPORAL_SEEDS_STILL_NONE True");
     }, 240_000);
   }
 );
