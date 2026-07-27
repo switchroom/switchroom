@@ -18,18 +18,22 @@ import {
   HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS,
   HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT,
   HINDSIGHT_RETAIN_MAX_COMPLETION_CEILING,
+  HINDSIGHT_RETAIN_PROMPT_ESTIMATE_TOKENS,
   HINDSIGHT_UPSTREAM_REFLECT_MAX_CONTEXT_TOKENS,
   HINDSIGHT_UPSTREAM_RETAIN_CHUNK_SIZE,
   HindsightContextBudgetError,
   assertHindsightContextBudgetFits,
+  defaultContextWindowForProvider,
   resolveCheckedHindsightContextBudget,
   resolveHindsightContextBudget,
   resolveLaneContextWindow,
+  usableContextTokens,
 } from "../../src/setup/hindsight-context-budget.js";
 import {
   HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS,
   generateHindsightComposeSnippet,
   hindsightLlmBudgetEnv,
+  hindsightLocalLlmEnabled,
   startHindsight,
 } from "../../src/setup/hindsight.js";
 
@@ -173,7 +177,7 @@ describe("hindsight context budget — preflight (#3716)", () => {
       HindsightContextBudgetError,
     );
     expect(() => resolveCheckedHindsightContextBudget(tooSmall)).toThrow(
-      /exceeds the declared 4096-token context window/,
+      /exceeds the \d+ usable tokens of the declared 4096-token context window/,
     );
   });
 
@@ -229,6 +233,176 @@ describe("hindsight context budget — preflight (#3716)", () => {
     for (const llm of [undefined, { provider: "litellm" }, { provider: "claude-code" }, localLlm]) {
       expect(() => resolveCheckedHindsightContextBudget(llm)).not.toThrow();
     }
+  });
+});
+
+describe("hindsight context budget — the safety band binds the retain lane too (#3721)", () => {
+  // Retain's worst case pins at 11,072 across this whole band: the prompt term
+  // is the FIXED 8,000-token estimate and the completion term is clamped to the
+  // 3,072 floor. So the raw window it needs is 11,072, but the band it must fit
+  // inside is 0.8 × window — and those two disagree from 11,072 to 13,838.
+  const RETAIN_WORST_CASE = HINDSIGHT_RETAIN_PROMPT_ESTIMATE_TOKENS + 3_072;
+
+  it("pins the arithmetic the band boundaries are derived from", () => {
+    expect(RETAIN_WORST_CASE).toBe(11_072);
+    for (const window of [11_072, 13_838]) {
+      const b = resolveHindsightContextBudget({ provider: "litellm", context_window: window });
+      // The PRE-FIX check — worst case vs the raw window — passes here. That is
+      // what makes the two cases below a regression test rather than a walk of
+      // the code path: on main they did not throw.
+      expect(b.retain.worstCaseTotalTokens).toBe(RETAIN_WORST_CASE);
+      expect(b.retain.worstCaseTotalTokens).toBeLessThanOrEqual(b.retain.windowTokens);
+      expect(b.retain.worstCaseTotalTokens).toBeGreaterThan(b.retain.usableTokens);
+    }
+  });
+
+  it("REJECTS the low edge of the band (11,072 — raw check passes exactly)", () => {
+    const at = { provider: "litellm", context_window: 11_072 };
+    expect(() => resolveCheckedHindsightContextBudget(at)).toThrow(HindsightContextBudgetError);
+    expect(() => resolveCheckedHindsightContextBudget(at)).toThrow(/hindsight retain/);
+    // usable = 11072 − ⌊11072 × 0.2⌋ = 8858.
+    expect(usableContextTokens(11_072)).toBe(8_858);
+  });
+
+  it("REJECTS the high edge of the band (13,838 — usable 11,071, one short)", () => {
+    const at = { provider: "litellm", context_window: 13_838 };
+    expect(usableContextTokens(13_838)).toBe(RETAIN_WORST_CASE - 1);
+    expect(() => resolveCheckedHindsightContextBudget(at)).toThrow(/hindsight retain/);
+  });
+
+  it("ACCEPTS the first window above the band (13,839 — usable 11,072)", () => {
+    expect(usableContextTokens(13_839)).toBe(RETAIN_WORST_CASE);
+    expect(() =>
+      resolveCheckedHindsightContextBudget({ provider: "litellm", context_window: 13_839 }),
+    ).not.toThrow();
+  });
+
+  it("reports the band in the failure text, so the operator can do the sum", () => {
+    try {
+      resolveCheckedHindsightContextBudget({ provider: "litellm", context_window: 12_000 });
+      expect.unreachable("preflight should have thrown");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("usable tokens");
+      expect(msg).toContain("20% safety band");
+      expect(msg).toContain("declared 12000-token context window");
+    }
+  });
+
+  it("holds EVERY lane to the same band — no lane budgets the raw window", () => {
+    for (const window of [13_839, 16_384, LOCAL_SLOT_WINDOW, 131_072, 200_000]) {
+      const b = resolveHindsightContextBudget({ provider: "litellm", context_window: window });
+      const usable = usableContextTokens(window);
+      for (const lane of [b.retain, b.consolidation, b.reflect]) {
+        expect(lane.usableTokens, `${lane.lane}@${window}`).toBe(usable);
+        expect(lane.worstCaseTotalTokens, `${lane.lane}@${window}`).toBeLessThanOrEqual(usable);
+      }
+    }
+  });
+});
+
+describe("hindsight context budget — reflect's completion figure is a reserve, not a cap (#3722)", () => {
+  it("names it a reserve and never calls it a max-completion cap", () => {
+    // Upstream (config.py in the shipped image) defines
+    // RETAIN_/CONSOLIDATION_MAX_COMPLETION_TOKENS and nothing equivalent for
+    // reflect — its token knobs are REFLECT_MAX_CONTEXT_TOKENS,
+    // REFLECT_MAX_ITERATIONS, REFLECT_SOURCE_FACTS_MAX_TOKENS. So the field
+    // must not be shaped like an env var switchroom forgot to emit.
+    const b = resolveHindsightContextBudget(localLlm);
+    expect(b.reflect.completionReserveTokens).toBe(6_144);
+    expect(b.reflect).not.toHaveProperty("maxCompletionTokens");
+  });
+
+  it("holds the reserve back from the emitted prompt cap", () => {
+    // The reserve is unenforceable at runtime, so the ONLY thing it can do is
+    // shrink the one number that IS emitted. Assert that it did.
+    const b = resolveHindsightContextBudget(localLlm);
+    expect(b.reflect.maxContextTokens).toBeLessThanOrEqual(
+      b.reflect.usableTokens - b.reflect.completionReserveTokens,
+    );
+  });
+
+  it("emits no reflect completion var on either path (upstream has no such knob)", () => {
+    mockedExec.mockReset();
+    mockedExec.mockReturnValue("");
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, localLlm);
+    const runEnv = envPairsFromRun();
+    const snippet = generateHindsightComposeSnippet(localLlm);
+    const budgetEnv = hindsightLlmBudgetEnv(localLlm).map(([k]) => k);
+    for (const key of budgetEnv) expect(key).not.toMatch(/REFLECT.*COMPLETION/);
+    expect(runEnv.filter((e) => /REFLECT.*COMPLETION/.test(e))).toEqual([]);
+    expect(snippet).not.toMatch(/REFLECT.*COMPLETION/);
+    // …and the one reflect var that DOES exist upstream is still emitted.
+    expect(budgetEnv).toContain("HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS");
+  });
+});
+
+describe("hindsight context budget — provider name and base URL agree (#3723)", () => {
+  const LOOPBACK = "http://127.0.0.1:4010/v1";
+
+  it("forces the conservative window when a lane's base URL is self-hosted", () => {
+    // The hazardous config: `provider: anthropic` is just a routing label on a
+    // LiteLLM-fronted local box. Pre-fix this returned 200,000 while
+    // hindsightLocalLlmEnabled() called the same endpoint local — the exact
+    // silent-overflow shape the preflight exists to reject.
+    const llm = { retain: { provider: "anthropic", base_url: LOOPBACK } };
+    expect(resolveLaneContextWindow("retain", llm)).toMatchObject({
+      windowTokens: HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW,
+      windowSource: "provider-default",
+      provider: "anthropic",
+    });
+    expect(defaultContextWindowForProvider("anthropic", LOOPBACK)).toBe(
+      HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW,
+    );
+    // And the budget really is the ratcheted one, not just the number.
+    expect(resolveHindsightContextBudget(llm).retain.maxCompletionTokens).toBe(6_144);
+  });
+
+  it("agrees with hindsightLocalLlmEnabled on the same config", () => {
+    // The two detectors now read the same input, so they cannot disagree.
+    for (const url of [LOOPBACK, "http://10.0.0.7:11434", "http://ollama.local:11434"]) {
+      const llm = { retain: { provider: "anthropic", base_url: url } };
+      expect(hindsightLocalLlmEnabled(llm), url).toBe(true);
+      expect(resolveLaneContextWindow("retain", llm).windowTokens, url).toBe(
+        HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW,
+      );
+    }
+  });
+
+  it("leaves a genuinely hosted endpoint on the provider default", () => {
+    const llm = { retain: { provider: "anthropic", base_url: "https://api.anthropic.com" } };
+    expect(hindsightLocalLlmEnabled(llm)).toBe(false);
+    expect(resolveLaneContextWindow("retain", llm).windowTokens).toBe(
+      HINDSIGHT_CLAUDE_CONTEXT_WINDOW,
+    );
+  });
+
+  it("only decides the UNDECLARED case — an explicit window still wins", () => {
+    const llm = {
+      context_window: 131_072,
+      retain: { provider: "anthropic", base_url: LOOPBACK },
+      reflect: { provider: "anthropic", base_url: LOOPBACK, context_window: 65_536 },
+    };
+    expect(resolveLaneContextWindow("retain", llm)).toMatchObject({
+      windowTokens: 131_072,
+      windowSource: "global",
+    });
+    expect(resolveLaneContextWindow("reflect", llm)).toMatchObject({
+      windowTokens: 65_536,
+      windowSource: "per-op",
+    });
+  });
+
+  it("scopes the signal to the lane that carries it", () => {
+    // Lanes are budgeted independently: a loopback retain lane must not drag
+    // an unrelated claude-code consolidation lane down to 32k.
+    const llm = { provider: "claude-code", retain: { base_url: LOOPBACK } };
+    expect(resolveLaneContextWindow("retain", llm).windowTokens).toBe(
+      HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW,
+    );
+    expect(resolveLaneContextWindow("consolidation", llm).windowTokens).toBe(
+      HINDSIGHT_CLAUDE_CONTEXT_WINDOW,
+    );
   });
 });
 
