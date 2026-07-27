@@ -281,8 +281,22 @@ the value became a managed key — it fell through to an unrelated
 passing, measuring nothing. It is now anchored inside `_make_bank_task` and
 throws if that anchor moves.
 
+The per-bank `request_timeout_seconds` now *derives* from the effective
+deadline when unset rather than taking the vendored literal (12s since #3760).
+The shared fan-out deadline is the tighter outer guard, so a per-bank value
+above it can never fire, and stamping 12 against the shipped 10s deadline would
+have put every stock agent through the clamp — reporting a clamp on config the
+operator never wrote. An explicitly configured value above the deadline still
+clamps, and still reports. The TypeScript constant is now pinned against
+`lib/config.py`'s `DEFAULTS["recallRequestTimeoutSeconds"]` by a test: #3760 and
+#3759 each carried a literal for this one key and disagreed (12 vs 8), and
+because `start.sh` exports it unconditionally and env outranks the vendored
+value, the losing literal would have overridden the shipped default on every
+host with CI green.
+
 Deliberately not done: `recallMaxMemories` was already declarative and is
 untouched.
+
 ### `switchroom doctor` detects banks with no per-bank vector index
 
 Hindsight creates one PARTIAL vector index per (bank, fact_type) — and creates
