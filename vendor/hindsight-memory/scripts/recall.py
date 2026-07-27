@@ -1125,6 +1125,63 @@ def _combine_context(base, nudge) -> str:
     return "\n\n".join(parts)
 
 
+# Switchroom structural-fix #7 — WHAT failed, not merely THAT something did.
+#
+# Before this, every failure channel on a recall_log row was a BOOLEAN:
+# `timed_out`, `errored`, `deadline_hit`. So a log full of `errored: true`
+# could not answer the first question anyone asks during an incident — is this
+# a connection refused, a 500, a bad bank id, or an auth failure? Each implies
+# a different fix, and the log distinguished none of them. Worse, `recall.py`
+# exits 0 and Claude Code swallows hook stderr, so the exception text printed
+# on the `[Hindsight]` line reaches nobody: the JSONL row is the ONLY place
+# this information can survive.
+ERROR_TEXT_MAX_CHARS = 300
+
+
+def error_text(err) -> str | None:
+    """One-line, bounded, type-prefixed rendering of a failure. None when clean.
+
+    Type-prefixed because the message alone is often uselessly generic
+    (`''`, `'timed out'`); the exception class is frequently the most
+    diagnostic part. Bounded because rows are size-trimmed by line count and
+    an unbounded traceback-shaped message would evict real history.
+    """
+    if err is None:
+        return None
+    if isinstance(err, BaseException):
+        text = f"{type(err).__name__}: {err}"
+    else:
+        text = str(err)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    return text[:ERROR_TEXT_MAX_CHARS]
+
+
+def recall_error_summary(bank_id, bank_timings, directives_timed_out=None) -> str | None:
+    """One row-level string answering "what actually failed on this turn?".
+
+    The per-bank `error` strings are the ground truth, but a row-level field is
+    what makes the log GREPPABLE: an operator triaging an incident wants
+    `jq -r .error recall_log.jsonl | sort | uniq -c`, not a nested walk.
+
+    Own bank first, because a side-bank failure does not mean the agent lost
+    its memory (same rationale as `degraded_recall_notice`). Side banks are
+    reported only when the own bank was fine, and are prefixed with their bank
+    id so the summary is never ambiguous about whose failure it names.
+    """
+    entries = [bt for bt in (bank_timings or []) if isinstance(bt, dict)]
+    own = next((bt for bt in entries if bt.get("bank_id") == bank_id), None) if bank_id else None
+    if own and own.get("error"):
+        return error_text(own["error"])
+    for bt in entries:
+        if bt.get("bank_id") != bank_id and bt.get("error"):
+            return error_text(f"additional bank '{bt.get('bank_id')}': {bt['error']}")
+    if directives_timed_out:
+        return "directives fetch timed out"
+    return None
+
+
 def degraded_recall_notice(bank_id, bank_timings) -> str:
     """Switchroom #3619 — return the degraded-recall disclosure for this turn,
     or "" when the agent's own bank answered.
@@ -1429,6 +1486,11 @@ def main():
                 # miscounted as an observed no-error recall — matching the
                 # deadline_hit / directives_timed_out convention above.
                 "bank_errored": None,
+                # Switchroom structural-fix #7 — WHAT failed, in words. None
+                # here (not "") for the same reason as the fields above: no
+                # banks ran, so this row observed no failure and must not be
+                # counted as one.
+                "error": None,
             })
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
@@ -1640,6 +1702,12 @@ def main():
                 "elapsed_ms": b_outcome.elapsed_ms if b_outcome.elapsed_ms is not None else 0,
                 "timed_out": b_timed_out,
                 "errored": b_errored,
+                # The failure TEXT, not just the flags. On the parallel path a
+                # slot abandoned at the shared deadline carries no exception at
+                # all, so name that case explicitly rather than logging null
+                # and leaving "why is this row empty" unanswerable.
+                "error": error_text(b_outcome.error)
+                or (None if b_outcome.completed else "abandoned at the shared recall deadline"),
             })
     else:
         # Pre-A3 serial path (rollback lever, HINDSIGHT_RECALL_PARALLEL=false).
@@ -1663,6 +1731,7 @@ def main():
             _bank_start = time.monotonic()
             _bank_timed_out = False
             _bank_errored = False
+            _bank_error = None
             try:
                 response = _make_bank_task(b_id, b_tags, b_tags_match, b_tag_groups)()
                 bank_results = response.get("results", []) if isinstance(response, dict) else []
@@ -1673,6 +1742,7 @@ def main():
                 _bank_timed_out = _is_timeout_error(e)
                 # Non-timeout error → hard outage (see parallel-path note above).
                 _bank_errored = not _bank_timed_out
+                _bank_error = error_text(e)
                 if b_id == bank_id:
                     print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
                 else:
@@ -1682,6 +1752,7 @@ def main():
                 "elapsed_ms": int((time.monotonic() - _bank_start) * 1000),
                 "timed_out": _bank_timed_out,
                 "errored": _bank_errored,
+                "error": _bank_error,
             })
 
     # Switchroom hindsight-leverage A3 — FINALIZED `deadline_hit`: True when ANY
@@ -1983,6 +2054,14 @@ def main():
         "transcript_fallback_bytes_read": transcript_fallback_telemetry["bytes_read"],
         "transcript_fallback_elapsed_ms": transcript_fallback_telemetry["elapsed_ms"],
         "transcript_fallback_truncated": transcript_fallback_telemetry["truncated"],
+        # Switchroom structural-fix #7 — WHAT failed, in words. Every other
+        # failure channel on this row is a BOOLEAN (`deadline_hit`,
+        # `bank_errored`, per-bank `timed_out`/`errored`), which says THAT
+        # something broke and never WHICH thing, so an incident could not be
+        # triaged from the log at all. recall.py exits 0 and Claude Code
+        # swallows hook stderr, so this row is the only place the reason can
+        # survive. None on a healthy turn.
+        "error": recall_error_summary(bank_id, bank_timings, directives_timed_out),
     })
 
     # Switchroom #3619 — DEGRADED-RECALL DISCLOSURE. See

@@ -346,11 +346,315 @@ export const DEFAULT_METRICS_URL = "http://127.0.0.1:18888/metrics";
 export const DEFAULT_CONTAINER = "switchroom-hindsight";
 
 /**
- * Hard cap on the `/metrics` body we will read. B8 measured the live body at
- * 258,741 B — 4× the ~60 KB recorded a day earlier, so this cap is sized for
- * the growth, not for today's reading: 4 MB is ~16× the current body.
+ * Hard cap on the `/metrics` body we will read.
+ *
+ * B8's "258,741 B, so 4 MB is ~16× the current body" is STALE by 7×.
+ * Re-measured on the live endpoint 2026-07-27: the body is **1,889,558 B**,
+ * which made the old 4 MB cap 2.1×, not 16×. And this change adds
+ * `HINDSIGHT_API_METRICS_INCLUDE_BANK_ID`, whose worst case is ~27 banks ×
+ * the 45,490 B `hindsight_operation_*` block ≈ 1.2 MB more, landing near
+ * 3.1 MB — 76 % of a 4 MB cap. One more metric family, or a fleet twice this
+ * size, crosses it.
+ *
+ * 16 MB restores an ~5× margin over the projected post-change body. The cap
+ * exists to stop an unbounded read, not to police growth; at 16 MB it still
+ * refuses a runaway exposition long before memory pressure matters.
+ *
+ * Sizing it correctly used to be far more load-bearing than it should have
+ * been, because the OVERRUN was fatal: `probe.ts` threw, the throw surfaced
+ * as a `ProbeError`, and that took out the retain and LLM signals too — a
+ * body one byte over the cap blinded every metrics-derived signal at once,
+ * and the recall signals with them. It now degrades: the metrics probe
+ * returns null and only the metrics-derived signals go `no-data` (see
+ * `probe.ts`). An overrun costs exactly the signals that cannot be computed
+ * and nothing else. The raised cap and the degrade are belt and braces,
+ * deliberately — a cap whose breach is silent is not a safety mechanism.
  */
-export const METRICS_MAX_BYTES = 4 * 1024 * 1024;
+export const METRICS_MAX_BYTES = 16 * 1024 * 1024;
 
 /** `/metrics` fetch timeout. The endpoint answers in single-digit ms. */
 export const METRICS_TIMEOUT_MS = 10_000;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Recall SLIs — the READ half of memory
+//
+// Every threshold below was measured against the live fleet on 2026-07-27,
+// over the trailing 200 rows of each agent's `recall_log.jsonl` (2109 rows,
+// 12 agents). Fleet-wide readings at that moment:
+//
+//   own-bank timeout   86.0 %  (1023/1189 rows carrying bank_timings)
+//   zero-memory        46.6 %  (983/2109 rows carrying result_count)
+//   candidate pool     median 18   (per-agent: 0 for finn/klanker/overlord)
+//   injected score     p50 0.0011  (n=284; gymbro 0.22, reggie 0.61 healthy)
+//   recall p95         8053 ms     (p50 8023 ms — pinned at the 8 s budget)
+//   consolidation      77 pending, oldest 3.98 h
+//
+// Each constant records BOTH the sick reading and the healthy one, because a
+// threshold justified only by the incident is a threshold nobody can retune.
+//
+// THE HEALTHY READING IS THE ONE THAT SETS THE LINE, and it has to be drawn
+// from the right population. The fleet reading above is measured DURING the
+// incident, so it says only "this is broken now" — it cannot say whether a
+// threshold survives the fix. The population that can is rows where no bank
+// timed out, errored, or hit the shared deadline: the best available proxy
+// for a repaired fleet. Over full log history that is n=183 across 9 agents:
+//
+//   own-bank timeout   0 %       (by construction — this is the conditioner)
+//   zero-memory        15.3 %    (warn 25 % → 1.6× headroom, the thinnest)
+//   candidate pool     median 41 (warn 8 → 5×, page 3 → 13×)
+//   injected score     p50 0.0850, but p10 0.0005 … p90 0.9259
+//   recall wall time   p50 6420 ms, p95 8037 ms  ← see RECALL_P95, deleted
+//
+// Two of the originally-proposed lines did NOT survive that test and were
+// re-derived (injected-score warn) or deleted (latency) rather than shipped.
+// A threshold is only calibrated once it has been checked against a fleet
+// that is WORKING; checking it against the outage only proves it can see the
+// outage, which is the easy half.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Own-bank timeout rate: warn / page.
+ *
+ * The agent's own bank is the one carrying its memory; a recall that misses
+ * it has, in practice, no agent memory in it even when `result_count > 0`
+ * (2026-07-26 snapshot: of 1148 own-bank timeouts, only 28 returned anything
+ * at all, from the smaller side banks).
+ *
+ * 5 % / 15 % is TIGHTER than `doctor-recall-health.ts`'s 10 % / 25 %, and
+ * deliberately so: doctor is a pull check an operator runs after they already
+ * suspect something, while this pushes a DM. The regression it exists to
+ * catch spent its first week in the 5-15 % band and its sixth at 97 %. A
+ * healthy agent sits at 0 % — lawgpt, test-harness and kdogg all measured
+ * exactly 0 on the same snapshot — so 5 % is not near the noise floor of a
+ * working fleet, it is an order of magnitude above it.
+ *
+ * Today's fleet reading of 86 % pages, immediately and correctly.
+ */
+export const RECALL_OWN_BANK_TIMEOUT_WARN = 0.05;
+export const RECALL_OWN_BANK_TIMEOUT_PAGE = 0.15;
+
+/**
+ * Zero-memory turn rate: warn / page.
+ *
+ * The rate at which recall completes and injects nothing. A genuinely empty
+ * match IS normal — which is exactly why `doctor-recall-health.ts` refuses to
+ * score `result_count` at all — so this threshold is set where "normal
+ * emptiness" stops being a credible explanation rather than where emptiness
+ * begins.
+ *
+ * The healthy end of this fleet measured 0 % (test-harness, kdogg), 14.4 %
+ * (ziggy) and 22.5 % (lawgpt) — so a warn at 25 % clears every agent that is
+ * working, and a page at 40 % means the majority of turns are running blind.
+ * Today's fleet reading is 46.6 % and pages; carrie is at 85.5 %.
+ *
+ * This is a WEAKER signal than the two below and is kept as corroboration,
+ * not as the primary: on its own it cannot separate "the index is empty" from
+ * "the queries genuinely match nothing".
+ */
+export const RECALL_ZERO_MEMORY_WARN = 0.25;
+export const RECALL_ZERO_MEMORY_PAGE = 0.4;
+
+/**
+ * Candidate-pool floor: median `pre_cap_count + overlap_dropped`.
+ *
+ * **This is one of the two signals that catch the failure nothing else sees.**
+ * A recall can be fast, return HTTP 200, time out nowhere, and still hand the
+ * agent nothing — because the candidate pool it ranked was empty. Latency
+ * signals miss it (it is fast), timeout signals miss it (nothing timed out),
+ * result-count signals half-miss it (an empty match looks identical), and
+ * `probeHindsight`'s MCP `initialize` misses it entirely.
+ *
+ * `pre_cap_count` is measured AFTER the overlap gate, so `overlap_dropped` is
+ * added back: scoring the post-gate number alone would read an aggressive
+ * overlap gate as an empty index, which points at the wrong fix.
+ *
+ * The healthy fleet median is 28-40 (clerk 40, test-harness 38, gymbro 36,
+ * carrie 29, ziggy 29, marko 28). A median under 8 means half of all recalls
+ * had almost nothing to rank; under 3 means the retrieval layer is returning
+ * essentially nothing and the reranker is decorating noise. finn, klanker and
+ * overlord all measured a median of **0** on 2026-07-27 — this signal pages
+ * on them today and no other check in the repo notices.
+ */
+export const RECALL_POOL_MEDIAN_WARN = 8;
+export const RECALL_POOL_MEDIAN_PAGE = 3;
+
+/**
+ * Injected top-hit score: p50 of `injected_score_max`.
+ *
+ * **The second signal that catches the invisible failure.** Where the pool
+ * floor asks "was there anything to rank", this asks "was what we injected
+ * worth injecting". They fail independently: a healthy-sized pool of
+ * irrelevant candidates clears the floor and still poisons the turn, and
+ * #3541 shipped this field precisely because volume alone cannot distinguish
+ * "the reranker is working" from "8 mediocre memories per turn".
+ *
+ * `injected_score_max` is the BEST score in the injected set, so it is a
+ * generous measure — a p50 of 0.01 means half of all turns had no injected
+ * memory scoring above 0.01, i.e. the strongest thing the agent was given was
+ * indistinguishable from noise.
+ *
+ * PAGE at 0.01 is the well-founded line. Conditioned on a healthy own bank
+ * (n=74) the p50 is 0.0850; conditioned on a degraded one (n=247) it is
+ * 0.0006 — a ~140× separation, and 98.4 % of degraded rows fall below 0.01
+ * against 28.4 % of healthy ones. A 3000-draw bootstrap of the fleet p50 over
+ * healthy rows fires at 0.01 in 0.0 % of draws at every window size tried.
+ *
+ * WARN was 0.05 and that was WRONG — it is the correction worth recording.
+ * The healthy distribution is not merely wide, it is bimodal, spanning p10
+ * 0.0005 to p90 0.9259: about 3.5 orders of magnitude, because the score is
+ * not calibrated across queries. Its p50 of 0.0850 sits only 1.7× above a
+ * 0.05 line, so bootstrapping the fleet p50 over healthy rows fires in
+ * **22.8 %** of 60-row draws and 15.1 % of 100-row draws — better than one
+ * healthy tick in seven. Hysteresis does not rescue that: consecutive ticks
+ * read overlapping 200-row / 24 h windows, so their breaches are correlated,
+ * not independent, and `BREACHES_TO_FIRE_LEVEL = 2` is close to a single
+ * draw. An earlier revision of this comment also claimed ziggy's healthy
+ * 0.061 was "two orders of magnitude above the warn line"; it is 1.2×, and
+ * ziggy is the number that GOVERNS, being among the lowest healthy readings.
+ * That arithmetic error is what let the line through.
+ *
+ * 0.02 is the re-derived warn: 0.8 % of 60-row healthy draws and 0.0 % at
+ * 100 rows and above, while 98.8 % of degraded rows still fall below it and
+ * it stays ~33× above the degraded p50. Healthy per-agent p50s: finn 0.7523,
+ * reggie 0.5861, gymbro 0.2221, overlord 0.0674, ziggy 0.0601, klanker
+ * 0.0226, marko 0.0182. The last two sit near the line — they are also the
+ * two whose recall was recovering during the sample, and both are far above
+ * the 0.0006 a degraded bank produces.
+ *
+ * The narrow 0.02 → 0.01 band is an honest limitation, not an oversight: on
+ * a bimodal distribution the p50 is a poor estimator, so a genuinely EARLY
+ * warning needs a different statistic, not a different constant. The measured
+ * candidate is the fraction of injected rows scoring below a fixed floor —
+ * healthy 28.4 % vs degraded 98.4 % at a 0.01 floor, which bootstraps to
+ * 0.00 % false-fire and 100 % detection anywhere in a 0.60-0.90 threshold
+ * band. Filed as follow-up #3793 rather than swapped in here, because changing
+ * the estimator changes what the signal MEANS and that deserves its own
+ * review, not a post-review substitution.
+ *
+ * NOTE the denominator: `injected_score_max` is null when nothing was
+ * injected, so this SLI scores only rows that DID inject. That is on purpose
+ * — the empty case is `recall-zero-memory`'s job, and folding it in here
+ * would make one bad signal out of two good ones.
+ */
+export const RECALL_SCORE_P50_WARN = 0.02;
+export const RECALL_SCORE_P50_PAGE = 0.01;
+
+/*
+ * THERE IS NO `RECALL_P95_WARN_MS` / `RECALL_P95_PAGE_MS`. A recall latency
+ * SLI was drafted at 4 s / 6 s and deleted before it shipped. Recording why,
+ * because the number looked reasonable and the reasoning is the point.
+ *
+ * The draft justified 4 s / 6 s as sitting "above the 0.6-4.3 s an unloaded
+ * server answers in and below the 8 s wall". That band does not reproduce.
+ * Measured over the healthy-conditioned population — rows where no bank timed
+ * out, errored, or hit the shared deadline, n=183 across 9 agents:
+ *
+ *   FLEET      p50 6420 ms   p75 7566   p90 7935   p95 8037   p99 11426
+ *   per-agent healthy p95: 7816 (ziggy) … 11859 (overlord), every one of the
+ *   nine above 6000 ms; fastest healthy p50 is finn at 4321 ms, itself
+ *   already past the drafted WARN.
+ *
+ * So the PAGE line sat BELOW the healthy median. A 2000-draw bootstrap over
+ * healthy rows breaches 6000 ms in 100.0 % of draws. The failure mode is the
+ * one that matters most for a watchdog: the recall fixes land, timeouts go to
+ * 0 %, pool and scores recover — and this signal pages every 15 minutes
+ * forever on a fleet that is working, training the operator to ignore it.
+ *
+ * Raising it does not save it either. The per-bank budget is 8 s, so healthy
+ * traffic already reaches 8037 ms at p95; any line clear of that noise
+ * (≥12 s bootstraps to 0.0 %) can only ever mean "pinned at the deadline",
+ * which is exactly what `RECALL_OWN_BANK_TIMEOUT` already reports, from a
+ * cleaner instrument. The usable band between the healthy median and the
+ * budget wall is 6420-8000 ms — 1.25× — and no threshold separates healthy
+ * from degraded inside it before the timeout rate does.
+ *
+ * This is the same defect this file already articulates when deleting
+ * `RETAIN_P95_SECONDS` above: the healthy population sits past the threshold
+ * and the instrument saturates at a budget just beyond it. It was caught in
+ * review here rather than after six weeks of alert fatigue, which is the
+ * system working.
+ *
+ * `total_elapsed_ms` is still summarised into `RecallSample.elapsedP95Ms` and
+ * rendered as DIAGNOSTIC context on the own-bank-timeout DM — the datum is
+ * useful, it just cannot carry a threshold today. Restoring the signal needs
+ * a re-baseline against a fleet whose recall is actually fixed, gated on that
+ * measurement rather than on this one; filed as follow-up #3792.
+ */
+
+/**
+ * Consolidation queue age: warn / page, in seconds.
+ *
+ * The `async_operations` queue carries consolidation and the retain
+ * pipeline's deferred work. A rising oldest-entry age means the workers are
+ * not draining it — memory is accepted and then never actually consolidated.
+ *
+ * 2 h matches `SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S` in
+ * `docker/hindsight-maintenance.sh`, which already computes this exact number
+ * — and then only writes it to a container log nobody reads. Reusing the
+ * number rather than inventing one keeps the two views consistent; the change
+ * here is that breaching it now reaches a human.
+ *
+ * 12 h for the page: past half a day the backlog is no longer a transient
+ * spike, and the entries at the head are old enough that the sessions that
+ * produced them are over.
+ *
+ * Live reading 2026-07-27: 77 pending, oldest 14 327 s (3.98 h) — warns
+ * today, does not page. That is the intended resolution: a real, ongoing
+ * degradation that is not yet an emergency.
+ */
+export const CONSOLIDATION_AGE_WARN_S = 2 * 60 * 60;
+export const CONSOLIDATION_AGE_PAGE_S = 12 * 60 * 60;
+
+/**
+ * Minimum scored rows before a recall SLI is trusted.
+ *
+ * Below this a single bad recall dominates the rate and the signal would flap
+ * on a quiet fleet. 30 is ~1.5 % of the 2109-row live window and is reached
+ * by every non-idle agent. Under the floor the verdict is `no-data`, which is
+ * inert: it neither fires nor silently resolves a live alert.
+ */
+export const RECALL_MIN_SAMPLES = 30;
+
+/**
+ * Hindsight LLM-lane failure rate: warn / page.
+ *
+ * ## Why this is the fallback signal, and why it is not inverted
+ *
+ * LiteLLM's router fallback is **inside one client request**: hindsight asks
+ * for `openai/gpt-oss-20b-retain`, the router tries the local deployment,
+ * fails, and hops to `gpt-oss-20b-retain-openrouter` — all within the single
+ * call hindsight is awaiting (`src/litellm/timeout-budget.ts`). Hindsight
+ * therefore records the model it ASKED for, never the one that served, and
+ * `hindsight_llm_calls_total` carries no OpenRouter series at all (verified:
+ * 0 matching series on the live endpoint, 2026-07-27).
+ *
+ * The useful consequence is that this counter already answers the question we
+ * want asked. `success="false"` on a gpt-oss lane means the local deployment
+ * failed **and the OpenRouter fallback did not rescue it** — which is exactly
+ * "the fallback is not working", stated positively. A fallback that never
+ * fires can no longer read as clean, because the local failures it failed to
+ * absorb are the numerator.
+ *
+ * That is the un-inversion. The check alerts on the fallback FAILING, and
+ * never on OpenRouter merely serving — the latter is a legitimate,
+ * subscription-honest lane for the local gpt-oss models and is policed
+ * separately, on credential scoping, by
+ * `src/fleet-health/litellm-config-sensor.ts`.
+ *
+ * Live baseline 2026-07-27: 800 calls, **0 failures** (0.00 %). So a 2 % warn
+ * is not near the noise floor — there is no noise floor. It is set low
+ * because a working fallback should absorb essentially everything, and the
+ * defect class it guards (a timeout-budget mismatch that cuts the fallback
+ * hop off mid-flight) turns *every* failover into a guaranteed error rather
+ * than a rare one — so the failure mode is a step change, not a drift.
+ */
+export const LLM_FAILURE_RATE_WARN = 0.02;
+export const LLM_FAILURE_RATE_PAGE = 0.1;
+
+/**
+ * Minimum LLM calls in the window before the failure rate is scored.
+ *
+ * Hindsight issued 800 calls in the observed period; an idle hour can issue
+ * none. Under the floor the signal is `no-data` rather than a 0 % pass.
+ */
+export const LLM_MIN_SAMPLES = 20;

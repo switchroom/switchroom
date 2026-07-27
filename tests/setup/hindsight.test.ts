@@ -447,6 +447,20 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(() => h.hindsightLlmBudgetEnv()).not.toThrow();
   });
 
+  it("turns ON the per-bank metrics label that upstream defaults off", async () => {
+    // Structural fix #7. Upstream disables `bank_id` on the
+    // `hindsight_operation_*` families to bound cardinality for a multi-tenant
+    // SaaS. This fleet is single-tenant by invariant, so the label's
+    // cardinality is the agent roster, and WITHOUT it no per-bank SLO is
+    // expressible from /metrics at all: through the 2026-07 regression the
+    // aggregate histogram looked mediocre while two banks sat at ~97% own-bank
+    // timeout and another at 0%.
+    const h = await import("../../src/setup/hindsight.js");
+    expect(new Map(h.hindsightLlmBudgetEnv()).get("HINDSIGHT_API_METRICS_INCLUDE_BANK_ID")).toBe(
+      "true",
+    );
+  });
+
   it("keeps the reflect WALL timeout above the reflect per-call timeout", async () => {
     // Third deadline on the same lane: HINDSIGHT_API_REFLECT_WALL_TIMEOUT
     // bounds the whole agentic reflect loop, which makes SEVERAL per-call LLM

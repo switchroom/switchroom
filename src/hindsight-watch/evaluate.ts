@@ -8,13 +8,27 @@
 
 import { counterDelta } from "./metrics.js";
 import {
+  CONSOLIDATION_AGE_PAGE_S,
+  CONSOLIDATION_AGE_WARN_S,
+  LLM_FAILURE_RATE_PAGE,
+  LLM_FAILURE_RATE_WARN,
+  LLM_MIN_SAMPLES,
   MIN_RETAIN_SAMPLES,
   QUEUE_FLOOR,
   QUEUE_GROWTH_FRACTION,
   QUEUE_GROWTH_MIN_ABS,
+  RECALL_MIN_SAMPLES,
+  RECALL_OWN_BANK_TIMEOUT_PAGE,
+  RECALL_OWN_BANK_TIMEOUT_WARN,
+  RECALL_POOL_MEDIAN_PAGE,
+  RECALL_POOL_MEDIAN_WARN,
+  RECALL_SCORE_P50_PAGE,
+  RECALL_SCORE_P50_WARN,
+  RECALL_ZERO_MEMORY_PAGE,
+  RECALL_ZERO_MEMORY_WARN,
   RETAIN_FAILURE_RATE,
 } from "./thresholds.js";
-import type { Sample, Verdict } from "./types.js";
+import type { RecallSample, Sample, SignalId, Verdict } from "./types.js";
 
 function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`;
@@ -32,14 +46,33 @@ function windowMinutes(ring: Sample[]): number {
  * straddling interval is re-based instead of the whole window reading
  * negative.
  */
-function windowRetainCounts(ring: Sample[]): { ok: number; fail: number } {
+function windowRetainCounts(ring: Sample[]): { ok: number; fail: number; intervals: number } {
   let ok = 0;
   let fail = 0;
+  let intervals = 0;
   for (let i = 1; i < ring.length; i++) {
-    ok += counterDelta(ring[i - 1].retainOk, ring[i].retainOk);
-    fail += counterDelta(ring[i - 1].retainFail, ring[i].retainFail);
+    const pOk = ring[i - 1].retainOk;
+    const nOk = ring[i].retainOk;
+    const pFail = ring[i - 1].retainFail;
+    const nFail = ring[i].retainFail;
+    // Skip, do not zero-fill. A tick whose `/metrics` body was over the cap
+    // carries no retain counters at all; treating the gap as 0-to-0 would
+    // add a clean interval that never happened and dilute the failure rate
+    // toward pass. `counterDelta(undefined, n)` would be NaN, and every
+    // `NaN >= threshold` is false — the same fail-open trap by another route.
+    if (
+      typeof pOk !== "number" ||
+      typeof nOk !== "number" ||
+      typeof pFail !== "number" ||
+      typeof nFail !== "number"
+    ) {
+      continue;
+    }
+    ok += counterDelta(pOk, nOk);
+    fail += counterDelta(pFail, nFail);
+    intervals++;
   }
-  return { ok, fail };
+  return { ok, fail, intervals };
 }
 
 /** S1 — retain failure rate over the rolling window. The storm signal. */
@@ -48,9 +81,17 @@ export function evaluateFailureRate(ring: Sample[]): Verdict {
   if (ring.length < 2) {
     return { signal, state: "no-data", detail: "only one sample so far — need two to compute a rate" };
   }
-  const { ok, fail } = windowRetainCounts(ring);
+  const { ok, fail, intervals } = windowRetainCounts(ring);
   const total = ok + fail;
   const mins = windowMinutes(ring);
+  if (intervals === 0) {
+    return {
+      signal,
+      state: "no-data",
+      detail: `no tick pair in the last ${mins}m carried retain counters — /metrics was unreadable throughout`,
+      measured: { windowMinutes: mins },
+    };
+  }
   if (total < MIN_RETAIN_SAMPLES) {
     return {
       signal,
@@ -224,6 +265,362 @@ export function evaluateContainer(ring: Sample[]): Verdict {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Recall — the READ half
+//
+// These read the NEWEST sample rather than differencing across the window,
+// because each is already a statistic over a window of its own: one tick
+// reduces the trailing 200 recall rows per agent (`probeRecallLogs`). Taking
+// deltas of a median would be meaningless, and taking deltas of a rate would
+// re-derive a rate that is already correct.
+//
+// A missing `recall` block is `no-data`, never a pass. That is the single
+// most important line in this file: the fleet-wide silence this module exists
+// to end was produced by exactly one habit — treating "I could not measure
+// it" as "it is fine".
+// ─────────────────────────────────────────────────────────────────────────
+
+/** The newest sample's recall reduction, or null. */
+function latestRecall(ring: Sample[]): RecallSample | null {
+  if (ring.length === 0) return null;
+  return ring[ring.length - 1].recall ?? null;
+}
+
+function noRecallData(signal: SignalId): Verdict {
+  return {
+    signal,
+    state: "no-data",
+    detail: "no recall telemetry in this tick — recall log unread or empty",
+  };
+}
+
+/**
+ * Score a rate against a warn/page pair where HIGHER is worse.
+ *
+ * `page >= warn` is an invariant of every pair here; the page test runs first
+ * so a reading past both reports the worse of the two.
+ */
+function scoreHigherIsWorse(
+  value: number,
+  warn: number,
+  page: number,
+): { state: "breach" | "ok"; severity?: "warn" | "page" } {
+  if (value >= page) return { state: "breach", severity: "page" };
+  if (value >= warn) return { state: "breach", severity: "warn" };
+  return { state: "ok" };
+}
+
+/** As above, for the two SLIs where LOWER is worse (pool depth, score). */
+function scoreLowerIsWorse(
+  value: number,
+  warn: number,
+  page: number,
+): { state: "breach" | "ok"; severity?: "warn" | "page" } {
+  if (value <= page) return { state: "breach", severity: "page" };
+  if (value <= warn) return { state: "breach", severity: "warn" };
+  return { state: "ok" };
+}
+
+/**
+ * Render the modal `error` string as a DM suffix, or "" when absent.
+ *
+ * Purely presentational — deliberately NOT an input to any threshold, so a
+ * malformed value can shorten the message but can never change a verdict. The
+ * type guard matters because the string arrives from a persisted JSON blob
+ * that `normalizeRecallSample` intentionally does not police (it polices only
+ * the fields decisions read). Bounded to keep one pathological row from
+ * blowing out a Telegram DM.
+ */
+function errorSuffix(r: { topError?: string | null }): string {
+  if (typeof r.topError !== "string" || r.topError.trim() === "") return "";
+  const text = r.topError.trim();
+  return `\n  most common failure: ${text.length > 200 ? `${text.slice(0, 200)}…` : text}`;
+}
+
+/**
+ * Render recall wall time as DM context, or "" when unavailable.
+ *
+ * There is deliberately no `recall-latency` SIGNAL — see the deletion note in
+ * `thresholds.ts`, where the healthy fleet's own p95 of 8037 ms is shown to
+ * leave no thresholdable band below the 8 s per-bank budget. The measurement
+ * is still worth SHOWING: it is what distinguishes "own-bank recall failed"
+ * meaning *timed out at the wall* from meaning *errored immediately*, which
+ * is the first question the operator asks and the cheapest one to pre-answer.
+ *
+ * Presentational only, exactly like `errorSuffix` — no threshold reads it, so
+ * it can never move a verdict.
+ */
+function latencySuffix(r: { elapsedP95Ms?: number | null; elapsedConsidered?: number }): string {
+  const p95 = r.elapsedP95Ms;
+  if (typeof p95 !== "number" || !Number.isFinite(p95)) return "";
+  const n = typeof r.elapsedConsidered === "number" ? r.elapsedConsidered : 0;
+  return `\n  recall wall time p95 ${Math.round(p95)}ms over ${n} fire(s) (not thresholded — the 8000ms per-bank budget leaves no healthy band below it)`;
+}
+
+/**
+ * R1 — own-bank timeout rate.
+ *
+ * The agent's own bank is the one holding its memory. A recall that misses it
+ * is amnesiac in practice even when `result_count > 0`, because whatever came
+ * back came from the smaller side banks.
+ */
+export function evaluateRecallOwnBankTimeout(ring: Sample[]): Verdict {
+  const signal = "recall-own-bank-timeout" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+  if (r.timeoutConsidered < RECALL_MIN_SAMPLES) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        `only ${r.timeoutConsidered} recall(s) carrying bank_timings ` +
+        `— below the ${RECALL_MIN_SAMPLES}-row floor`,
+      measured: { considered: r.timeoutConsidered },
+    };
+  }
+  const rate = r.ownBankDegraded / r.timeoutConsidered;
+  const { state, severity } = scoreHigherIsWorse(
+    rate,
+    RECALL_OWN_BANK_TIMEOUT_WARN,
+    RECALL_OWN_BANK_TIMEOUT_PAGE,
+  );
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `own-bank recall failed on ${pct(rate)} of fires ` +
+      `(${r.ownBankDegraded}/${r.timeoutConsidered} across ${r.agents} agent(s)) ` +
+      `— warn ${pct(RECALL_OWN_BANK_TIMEOUT_WARN)}, page ${pct(RECALL_OWN_BANK_TIMEOUT_PAGE)}` +
+      errorSuffix(r) +
+      latencySuffix(r),
+    measured: {
+      rate,
+      degraded: r.ownBankDegraded,
+      considered: r.timeoutConsidered,
+      agents: r.agents,
+    },
+  };
+}
+
+/**
+ * R2 — zero-memory turn rate.
+ *
+ * Corroboration, not the primary: an empty match is legitimately common, so
+ * this only becomes evidence at a rate no ordinary query mix explains.
+ */
+export function evaluateRecallZeroMemory(ring: Sample[]): Verdict {
+  const signal = "recall-zero-memory" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+  if (r.zeroConsidered < RECALL_MIN_SAMPLES) {
+    return {
+      signal,
+      state: "no-data",
+      detail: `only ${r.zeroConsidered} scoreable recall(s) — below the ${RECALL_MIN_SAMPLES}-row floor`,
+      measured: { considered: r.zeroConsidered },
+    };
+  }
+  const rate = r.zeroResult / r.zeroConsidered;
+  const { state, severity } = scoreHigherIsWorse(
+    rate,
+    RECALL_ZERO_MEMORY_WARN,
+    RECALL_ZERO_MEMORY_PAGE,
+  );
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `${pct(rate)} of recalls injected NO memory ` +
+      `(${r.zeroResult}/${r.zeroConsidered}) ` +
+      `— warn ${pct(RECALL_ZERO_MEMORY_WARN)}, page ${pct(RECALL_ZERO_MEMORY_PAGE)}`,
+    measured: { rate, zero: r.zeroResult, considered: r.zeroConsidered },
+  };
+}
+
+/**
+ * R3 — candidate-pool floor.
+ *
+ * One of the two signals that see a fast, successful, near-empty recall.
+ * Nothing else in this repo scores it: `doctor-recall-health.ts` explicitly
+ * declines to score `result_count`, the healthcheck is a TCP connect, and
+ * `probeHindsight` is one MCP `initialize`.
+ */
+export function evaluateRecallCandidateFloor(ring: Sample[]): Verdict {
+  const signal = "recall-candidate-floor" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+  if (r.poolConsidered < RECALL_MIN_SAMPLES || r.poolMedian === null) {
+    return {
+      signal,
+      state: "no-data",
+      detail: `only ${r.poolConsidered} recall(s) reporting pre_cap_count — below the ${RECALL_MIN_SAMPLES}-row floor`,
+      measured: { considered: r.poolConsidered },
+    };
+  }
+  const { state, severity } = scoreLowerIsWorse(
+    r.poolMedian,
+    RECALL_POOL_MEDIAN_WARN,
+    RECALL_POOL_MEDIAN_PAGE,
+  );
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `median candidate pool ${r.poolMedian} memories over ${r.poolConsidered} recall(s) ` +
+      `— warn ≤${RECALL_POOL_MEDIAN_WARN}, page ≤${RECALL_POOL_MEDIAN_PAGE}. ` +
+      `A small pool means retrieval returned almost nothing to rank, ` +
+      `which no latency or timeout signal can see.`,
+    measured: { poolMedian: r.poolMedian, considered: r.poolConsidered },
+  };
+}
+
+/**
+ * R4 — injected top-hit score.
+ *
+ * The other signal that sees the invisible failure, and independent of R3: a
+ * healthy-sized pool of irrelevant candidates clears the floor and still
+ * poisons the turn.
+ */
+export function evaluateRecallInjectedScore(ring: Sample[]): Verdict {
+  const signal = "recall-injected-score" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+  if (r.scoreConsidered < RECALL_MIN_SAMPLES || r.scoreP50 === null) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        `only ${r.scoreConsidered} recall(s) injected a scored memory ` +
+        `— below the ${RECALL_MIN_SAMPLES}-row floor`,
+      measured: { considered: r.scoreConsidered },
+    };
+  }
+  const { state, severity } = scoreLowerIsWorse(
+    r.scoreP50,
+    RECALL_SCORE_P50_WARN,
+    RECALL_SCORE_P50_PAGE,
+  );
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `p50 injected top-hit score ${r.scoreP50.toFixed(4)} over ${r.scoreConsidered} recall(s) ` +
+      `— warn ≤${RECALL_SCORE_P50_WARN}, page ≤${RECALL_SCORE_P50_PAGE}. ` +
+      `Half of all turns had nothing injected scoring above this.`,
+    measured: { scoreP50: r.scoreP50, considered: r.scoreConsidered },
+  };
+}
+
+/*
+ * There is no `evaluateRecallLatency`. `total_elapsed_ms` IS summarised (into
+ * `RecallSample.elapsedP95Ms`) and IS shown, via `latencySuffix` on R1 — it
+ * just carries no threshold, because the healthy fleet's own p95 is 8037 ms
+ * against an 8000 ms per-bank budget and there is no band left underneath it.
+ * The full derivation, including the bootstrap that breaches a 6000 ms line
+ * in 100 % of healthy draws, is in `thresholds.ts` where the constants would
+ * otherwise have lived.
+ */
+
+/**
+ * R5 — consolidation queue age.
+ *
+ * `docker/hindsight-maintenance.sh` already computes this every tick and
+ * writes it to a container log. This is the same measurement with a
+ * destination a human actually reads.
+ */
+export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
+  const signal = "consolidation-queue-age" as const;
+  if (ring.length === 0) return { signal, state: "no-data", detail: "no samples" };
+  const c = ring[ring.length - 1].consolidation ?? null;
+  if (c === null) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        "consolidation queue not probed this tick (no psql client, no pg descriptor, " +
+        "or the container is down) — the `container` signal covers the last of those",
+    };
+  }
+  if (c.pending === 0) {
+    return {
+      signal,
+      state: "ok",
+      detail: "consolidation queue empty",
+      measured: { pending: 0, oldestAgeS: 0 },
+    };
+  }
+  const { state, severity } = scoreHigherIsWorse(
+    c.oldestAgeS,
+    CONSOLIDATION_AGE_WARN_S,
+    CONSOLIDATION_AGE_PAGE_S,
+  );
+  const hours = (s: number): string => `${(s / 3600).toFixed(1)}h`;
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `${c.pending} pending/processing async op(s), oldest ${hours(c.oldestAgeS)} old ` +
+      `— warn ≥${hours(CONSOLIDATION_AGE_WARN_S)}, page ≥${hours(CONSOLIDATION_AGE_PAGE_S)}`,
+    measured: { pending: c.pending, oldestAgeS: c.oldestAgeS },
+  };
+}
+
+/**
+ * F1 — the LLM lane's fallback is not absorbing local failures.
+ *
+ * Stated positively on purpose. LiteLLM's fallback runs INSIDE the client
+ * request, so hindsight records the model it asked for and a `success=false`
+ * means the primary failed AND the OpenRouter hop did not save it. A fallback
+ * that never fires can therefore no longer read as clean — see
+ * `LLM_FAILURE_RATE_WARN` for the full derivation.
+ */
+export function evaluateLlmFallback(ring: Sample[]): Verdict {
+  const signal = "llm-fallback-ineffective" as const;
+  if (ring.length < 2) {
+    return { signal, state: "no-data", detail: "only one sample so far — need two to compute a rate" };
+  }
+  let ok = 0;
+  let fail = 0;
+  for (let i = 1; i < ring.length; i++) {
+    const pOk = ring[i - 1].llmOk;
+    const nOk = ring[i].llmOk;
+    const pFail = ring[i - 1].llmFail;
+    const nFail = ring[i].llmFail;
+    // A sample from a build that did not carry these counters contributes
+    // nothing rather than a spurious delta against `undefined`.
+    if (typeof pOk === "number" && typeof nOk === "number") ok += counterDelta(pOk, nOk);
+    if (typeof pFail === "number" && typeof nFail === "number") fail += counterDelta(pFail, nFail);
+  }
+  const total = ok + fail;
+  const mins = windowMinutes(ring);
+  if (total < LLM_MIN_SAMPLES) {
+    return {
+      signal,
+      state: "no-data",
+      detail: `only ${total} hindsight LLM call(s) in the last ${mins}m — below the ${LLM_MIN_SAMPLES}-call floor`,
+      measured: { total, windowMinutes: mins },
+    };
+  }
+  const rate = fail / total;
+  const { state, severity } = scoreHigherIsWorse(rate, LLM_FAILURE_RATE_WARN, LLM_FAILURE_RATE_PAGE);
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `${pct(rate)} of hindsight LLM calls failed outright (${fail}/${total}) over ${mins}m ` +
+      `— warn ${pct(LLM_FAILURE_RATE_WARN)}, page ${pct(LLM_FAILURE_RATE_PAGE)}. ` +
+      `LiteLLM's fallback runs inside the request, so a failure here means the ` +
+      `OpenRouter hop did not absorb a local failure.`,
+    measured: { rate, fail, total, windowMinutes: mins },
+  };
+}
+
 /** Evaluate every level/edge signal over the window. Order is display order. */
 export function evaluateAll(ring: Sample[]): Verdict[] {
   return [
@@ -231,5 +628,11 @@ export function evaluateAll(ring: Sample[]): Verdict[] {
     evaluateFailureRate(ring),
     evaluateQueueGrowth(ring),
     evaluateRetainLoss(ring),
+    evaluateRecallOwnBankTimeout(ring),
+    evaluateRecallCandidateFloor(ring),
+    evaluateRecallInjectedScore(ring),
+    evaluateRecallZeroMemory(ring),
+    evaluateConsolidationQueueAge(ring),
+    evaluateLlmFallback(ring),
   ];
 }

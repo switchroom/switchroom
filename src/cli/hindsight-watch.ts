@@ -8,6 +8,7 @@ import {
   postOperatorNoticeViaGateways,
   type GatewayCandidate,
 } from "../host-control/config-degraded.js";
+import { CRON_PATH, CRON_SCHEDULE, installCron } from "../hindsight-watch/install-cron.js";
 import { tick } from "../hindsight-watch/run.js";
 import { defaultStatePath } from "../hindsight-watch/state.js";
 import {
@@ -46,9 +47,15 @@ export function registerHindsightWatchCommand(program: Command): void {
   program
     .command("hindsight-watch")
     .description(
-      "Model-free hindsight watchdog: retain failure rate, spool growth, " +
-        "memory loss, container health. Alerts the operator once, with hysteresis.",
+      "Model-free hindsight watchdog: recall health, retain failure rate, " +
+        "spool growth, memory loss, container health. Alerts once, with hysteresis.",
     )
+    .option(
+      "--install-cron",
+      `arm the watchdog: write ${CRON_PATH} (15-min, flock-guarded) and exit`,
+      false,
+    )
+    .option("--cron-user <user>", "unix user the cron tick runs as (default: current user)")
     .option("--dry-run", "evaluate and print; send no DM and write no state", false)
     .option("--json", "emit machine-readable JSON", false)
     .option("--metrics-url <url>", "hindsight /metrics endpoint", DEFAULT_METRICS_URL)
@@ -56,6 +63,10 @@ export function registerHindsightWatchCommand(program: Command): void {
     .option("--state <path>", "state file path (default ~/.switchroom/hindsight-watch/state.json)")
     .option("--agents-dir <path>", "agents scaffold dir (default ~/.switchroom/agents)")
     .action(async (opts) => {
+      if (opts.installCron) {
+        process.exitCode = runInstallCron(opts.cronUser);
+        return;
+      }
       const agentsDir: string =
         opts.agentsDir ??
         process.env.SWITCHROOM_AGENTS_DIR ??
@@ -90,6 +101,7 @@ export function registerHindsightWatchCommand(program: Command): void {
               signals: result.outcomes.map((o) => ({
                 signal: o.verdict.signal,
                 state: o.verdict.state,
+                severity: o.verdict.severity ?? null,
                 detail: o.verdict.detail,
                 measured: o.verdict.measured ?? null,
                 transition: o.transition,
@@ -103,9 +115,18 @@ export function registerHindsightWatchCommand(program: Command): void {
         );
       } else {
         for (const o of result.outcomes) {
+          // A `warn` breach renders distinctly from a `page` one. Without
+          // this the terminal view collapses both onto "BREACH", so an
+          // operator triaging a dry-run cannot tell a 4.6h consolidation
+          // backlog from an 88% recall outage — the same flattening the DM
+          // headers avoid. Signals with no severity keep the original label.
           const mark =
             o.verdict.state === "breach"
-              ? chalk.red("BREACH")
+              ? o.verdict.severity === "warn"
+                ? chalk.yellow("WARN  ")
+                : o.verdict.severity === "page"
+                  ? chalk.red("PAGE  ")
+                  : chalk.red("BREACH")
               : o.verdict.state === "no-data"
                 ? chalk.gray("no-data")
                 : chalk.green("ok");
@@ -122,6 +143,66 @@ export function registerHindsightWatchCommand(program: Command): void {
       }
       process.exitCode = result.exitCode;
     });
+}
+
+/**
+ * `--install-cron`: arm the watchdog.
+ *
+ * Refuses rather than guessing in the two cases where a guess would install a
+ * cron that silently never works:
+ *
+ *  - **running as root with no `--cron-user`.** `sudo switchroom …` would
+ *    otherwise write `root` into the user field, and root's `$HOME` is not
+ *    where the state file and the agents scaffold live — every tick would
+ *    read an empty fleet and report a clean bill of health forever. That is
+ *    the precise failure this whole change exists to eliminate, so it is a
+ *    hard error, not a warning.
+ *  - **an unresolvable binary path.** A relative or dev-mode argv[1] in a
+ *    cron line produces a fragment that fails on every tick with a message
+ *    only visible in `/var/log/syslog`.
+ */
+function runInstallCron(cronUser?: string): number {
+  const user = cronUser ?? process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME;
+  if (!user || user === "root") {
+    process.stderr.write(
+      chalk.red("hindsight-watch: refusing to install a cron for `root`.\n") +
+        "  The state file and the agents scaffold live under the OPERATOR's " +
+        "~/.switchroom, so a root tick would read an empty fleet and report " +
+        "everything healthy forever.\n" +
+        "  Re-run with `--cron-user <operator>`.\n",
+    );
+    return 1;
+  }
+
+  // `process.argv[1]` is the entry script. Under `npm run dev` that is a .ts
+  // file, which cron cannot execute — so require an absolute path to a real
+  // installed binary rather than emitting a fragment that can never run.
+  const binary = process.env.SWITCHROOM_BINARY ?? "/usr/local/bin/switchroom";
+  if (!binary.startsWith("/")) {
+    process.stderr.write(
+      chalk.red(`hindsight-watch: SWITCHROOM_BINARY must be an absolute path (got ${binary})\n`),
+    );
+    return 1;
+  }
+
+  let res: ReturnType<typeof installCron>;
+  try {
+    res = installCron({ user, binary });
+  } catch (e) {
+    process.stderr.write(
+      chalk.red(`hindsight-watch: could not write ${CRON_PATH}: ${(e as Error).message}\n`) +
+        "  This path needs root; re-run under sudo with `--cron-user <operator>`.\n",
+    );
+    return 1;
+  }
+
+  const verb = res.status === "installed" ? "installed" : "already up to date";
+  process.stdout.write(
+    `${chalk.green("✓")} hindsight-watch cron ${verb} at ${res.path} ` +
+      `(${CRON_SCHEDULE}, as ${user})\n` +
+      `  Verify with: switchroom doctor  |  switchroom hindsight-watch --dry-run\n`,
+  );
+  return 0;
 }
 
 /**

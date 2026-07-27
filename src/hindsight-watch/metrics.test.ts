@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   counterDelta,
   parseExposition,
+  readLlmSignals,
   readRetainSignals,
   sumMatching,
 } from "./metrics.js";
@@ -94,5 +95,41 @@ describe("counterDelta", () => {
     // A naive next-prev is -896, which would evaluate as a healthy window
     // precisely when the container just crashed.
     expect(counterDelta(900, 4)).toBe(4);
+  });
+});
+
+/**
+ * `readLlmSignals` — the LLM-call slice.
+ *
+ * Verbatim label shape from the live endpoint on 2026-07-27. Note what is
+ * NOT here: any `*-openrouter` model. LiteLLM's router fallback happens
+ * inside the request hindsight makes, so hindsight only ever records the model
+ * it ASKED for — which is why the fallback's effectiveness has to be read from
+ * the failure rate rather than from OpenRouter traffic.
+ */
+const LLM_EXPO = `# HELP hindsight_llm_calls_total LLM calls
+# TYPE hindsight_llm_calls_total counter
+hindsight_llm_calls_total{model="gpt-oss-20b",operation="recall",success="true",tenant="public"} 612.0
+hindsight_llm_calls_total{model="gpt-oss-20b-retain",operation="retain",success="true",tenant="public"} 188.0
+hindsight_llm_calls_total{model="gpt-oss-20b",operation="recall",success="false",tenant="public"} 7.0
+`;
+
+describe("readLlmSignals", () => {
+  it("sums successes and failures across every lane", () => {
+    const s = readLlmSignals(parseExposition(LLM_EXPO));
+    expect(s).toEqual({ ok: 800, fail: 7 });
+  });
+
+  it("returns null — not a throw — when the family is absent", () => {
+    // Deliberately unlike readRetainSignals: an idle backend that has made no
+    // LLM call since boot emits no series at all, and that must degrade ONE
+    // supplementary signal to no-data rather than blind the other ten behind
+    // a probe failure.
+    expect(readLlmSignals(parseExposition(LIVE))).toBeNull();
+  });
+
+  it("reads zero failures as zero, not as an absent family", () => {
+    const clean = LLM_EXPO.split("\n").filter((l) => !l.includes('success="false"')).join("\n");
+    expect(readLlmSignals(parseExposition(clean))).toEqual({ ok: 800, fail: 0 });
   });
 });

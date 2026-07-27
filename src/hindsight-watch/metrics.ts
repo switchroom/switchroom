@@ -184,3 +184,39 @@ export function counterDelta(prev: number, next: number): number {
   if (!Number.isFinite(prev) || !Number.isFinite(next)) return 0;
   return next >= prev ? next - prev : Math.max(0, next);
 }
+
+export const LLM_COUNTER = "hindsight_llm_calls_total";
+
+/** The LLM-call slice of one `/metrics` scrape. */
+export interface LlmSignals {
+  /** cumulative successful LLM calls across every lane */
+  ok: number;
+  /** cumulative failed LLM calls across every lane */
+  fail: number;
+}
+
+/**
+ * Extract the LLM-call signals, or null when the family is absent.
+ *
+ * Unlike `readRetainSignals` this returns null instead of throwing. The
+ * difference is deliberate: the retain counter is the watchdog's *reason for
+ * existing*, so its disappearance must wake someone. The LLM counter backs
+ * ONE supplementary signal, and an exposition that has stopped emitting it
+ * (an idle backend that has never made a call since boot emits no series at
+ * all) must degrade that one signal to `no-data` rather than blind the eight
+ * others behind a probe failure.
+ *
+ * Note what this counter can and cannot see. Hindsight records the model it
+ * ASKED LiteLLM for; LiteLLM's router fallback happens inside that same
+ * request, so no `*-openrouter` series ever appears here (verified: 0 on the
+ * live endpoint, 2026-07-27). `success="false"` therefore means the local
+ * deployment failed AND the fallback did not rescue it — which is exactly the
+ * question `llm-fallback-ineffective` asks.
+ */
+export function readLlmSignals(series: Series[]): LlmSignals | null {
+  if (!series.some((s) => s.name === LLM_COUNTER)) return null;
+  return {
+    ok: sumMatching(series, LLM_COUNTER, { success: "true" }),
+    fail: sumMatching(series, LLM_COUNTER, { success: "false" }),
+  };
+}
