@@ -237,6 +237,50 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_MAX_CONCURRENT = 1;
  */
 export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_FP16 = "true";
 
+/**
+ * Local-reranker batch size (upstream default `32`).
+ *
+ * 32 is upstream's CPU/MPS value; the vendored `cross_encoder.py` docstring
+ * names 128+ as the CUDA value, because a GPU is throughput-bound on batch
+ * occupancy rather than per-pair compute. Measured on this host class: rerank
+ * of 150 candidates 4.347s → **0.174s**, and end-to-end recall p50 3.2s →
+ * **0.8s**.
+ *
+ * GPU-gated for the same reason as FP16: on a CPU-only box a 128-pair batch is
+ * a latency spike and a memory spike, not a speed-up. Absent verdict ⇒ off ⇒
+ * upstream's 32.
+ */
+export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_BATCH_SIZE = 128;
+
+/**
+ * Grammar-enforced structured output (upstream default `False`).
+ *
+ * THE fix for the malformed-JSON storm on a local backend. `gpt-oss:20b`
+ * behind llama.cpp answers a schema-constrained request with a prose preamble
+ * often enough that ~45% of local calls failed to parse — and a parse failure
+ * wedges retain/consolidation rather than erroring visibly. Strict schema hands
+ * the provider its strongest schema mode (grammar constraint on llama.cpp), so
+ * the malformed shape becomes unrepresentable rather than merely unlikely.
+ *
+ * Gated on the local-LLM verdict, not hand-set: it is only unambiguously right
+ * where the provider actually supports grammar enforcement, and a hosted
+ * provider that doesn't should keep upstream's default rather than have a
+ * hand-set env var forced on it.
+ */
+export const HINDSIGHT_DEFAULT_LLM_STRICT_SCHEMA = "true";
+
+/**
+ * LLM retry attempts (upstream default `3`).
+ *
+ * Upstream's own performance guide (`performance#timeouts-and-retries`): a
+ * local endpoint is not rate-limited, so aggressive retry mostly adds latency
+ * — a local failure is usually deterministic and will fail again. 2 keeps one
+ * retry for a genuine transient (a slot evicted mid-request) and drops the
+ * third attempt that only ever bought queue time. Local-gated: on a cloud
+ * provider, where a 429 IS transient, upstream's 3 is correct.
+ */
+export const HINDSIGHT_DEFAULT_LLM_MAX_RETRIES = 2;
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -257,6 +301,10 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
 /** Emitted only when the container can reach a GPU. */
 export const HINDSIGHT_PERF_DEFAULTS_GPU: ReadonlyArray<readonly [string, string]> = [
   ["HINDSIGHT_API_RERANKER_LOCAL_FP16", HINDSIGHT_DEFAULT_RERANKER_LOCAL_FP16],
+  [
+    "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
+    String(HINDSIGHT_DEFAULT_RERANKER_LOCAL_BATCH_SIZE),
+  ],
 ];
 
 /** Emitted only when the LLM endpoint is local/self-hosted. */
@@ -270,6 +318,8 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
     "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
     String(HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_MAX_CONCURRENT),
   ],
+  ["HINDSIGHT_API_LLM_STRICT_SCHEMA", HINDSIGHT_DEFAULT_LLM_STRICT_SCHEMA],
+  ["HINDSIGHT_API_LLM_MAX_RETRIES", String(HINDSIGHT_DEFAULT_LLM_MAX_RETRIES)],
 ];
 
 /**

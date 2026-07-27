@@ -2006,6 +2006,22 @@ const HindsightPerOpLlmSchema = z
         "Per-op API key (upstream `HINDSIGHT_API_<OP>_LLM_API_KEY`). Literal " +
         "or `vault:` reference. Optional passthrough; absent → inherit global.",
       ),
+    context_window: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Context window (tokens) of the backend serving THIS op. NOT an " +
+        "upstream env var — switchroom derives the op's token budget " +
+        "(consolidation batch size / max-completion caps / reflect " +
+        "max-context cap) from it so a single call can never overflow the " +
+        "window. Absent → inherit " +
+        "`hindsight.llm.context_window`, else a per-provider default " +
+        "(conservative for non-`claude-code` providers, which usually mean " +
+        "a local llama.cpp/Ollama slot). All three lanes (`retain`, " +
+        "`reflect`, `consolidation`) are budgeted independently.",
+      ),
   })
   .describe(
     "Per-operation LLM override. Every field optional; an unset field (or " +
@@ -2038,6 +2054,24 @@ export const HindsightConfigSchema = z.object({
           "as `ANTHROPIC_MODEL` to the claude subprocess. Serves as the GLOBAL " +
           "default for every op absent a per-op override.",
         ),
+      context_window: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "GLOBAL context window (tokens) of the backend serving hindsight's " +
+          "LLM ops — the declared size switchroom derives every token budget " +
+          "from. Set this to the real window of whatever you point " +
+          "`hindsight.llm` at (e.g. 32768 for a llama.cpp slot launched with " +
+          "`-c 65536 -np 2`, 131072 for a large-window OpenRouter model). " +
+          "Absent → a per-provider default: 200000 for `claude-code`, a " +
+          "conservative 32768 for everything else. Overflowing a local " +
+          "backend's window does NOT error — llama.cpp context-shift silently " +
+          "drops the system prompt and the model answers conversationally " +
+          "with HTTP 200 — so this value is what makes the failure " +
+          "detectable at setup time instead of never.",
+        ),
       retain: HindsightPerOpLlmSchema.optional().describe(
         "Per-op override for the `retain` LLM op (memory ingestion). Emits " +
         "`HINDSIGHT_API_RETAIN_LLM_*`. Absent → uses the global model/provider.",
@@ -2066,7 +2100,9 @@ export const HindsightConfigSchema = z.object({
       "performance defaults. Only the keys switchroom actually manages are " +
       "honoured (`HINDSIGHT_PERF_ENV_KEYS` in " +
       "src/setup/hindsight-perf-defaults.ts: RERANKER_LOCAL_FP16, " +
-      "LLM_MAX_CONCURRENT, RETAIN/CONSOLIDATION_LLM_MAX_CONCURRENT, " +
+      "RERANKER_LOCAL_BATCH_SIZE, LLM_MAX_CONCURRENT, " +
+      "RETAIN/CONSOLIDATION_LLM_MAX_CONCURRENT, LLM_STRICT_SCHEMA, " +
+      "LLM_MAX_RETRIES, " +
       "RECALL_MAX_CANDIDATES_PER_SOURCE, LINK_EXPANSION_PER_ENTITY_LIMIT, " +
       "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +

@@ -16,6 +16,10 @@ import {
   hindsightPgEnv,
   resolveHindsightPgOverrides,
 } from "./hindsight-pg-defaults.js";
+import {
+  HINDSIGHT_CONSOLIDATION_BATCH_SIZE_CEILING,
+  resolveCheckedHindsightContextBudget,
+} from "./hindsight-context-budget.js";
 
 /**
  * Default Hindsight host ports.
@@ -626,8 +630,17 @@ export function hindsightConsolidationLlmTimeoutSeconds(): number {
  *     {@link HINDSIGHT_RETAIN_CLIENT_DEADLINE_S} equals
  *     `DEFAULT_RETAIN_CLIENT_DEADLINE_S` in the plugin's `retain_split.py`.
  */
-export function hindsightLlmBudgetEnv(): Array<[string, string]> {
-  const maxCompletionTokens = HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS;
+export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, string]> {
+  // Second, independent bound on the SAME retain cap: the declared context
+  // window. #3611's 16384 is a TIME budget (don't generate for 12 minutes);
+  // this one is a CONTEXT budget (don't overflow the slot). Both are real
+  // caps, so the tighter wins — see hindsight-context-budget.ts for why an
+  // overflow is invisible and therefore has to be caught here.
+  const contextBudget = resolveCheckedHindsightContextBudget(llm);
+  const maxCompletionTokens = Math.min(
+    HINDSIGHT_DEFAULT_RETAIN_MAX_COMPLETION_TOKENS,
+    contextBudget.retain.maxCompletionTokens,
+  );
 
   const interactiveS = hindsightInteractiveLlmTimeoutSeconds();
   const retainS = hindsightRetainClientTimeoutSeconds();
@@ -665,6 +678,25 @@ export function hindsightLlmBudgetEnv(): Array<[string, string]> {
     ["HINDSIGHT_API_REFLECT_LLM_TIMEOUT", String(interactiveS)],
     ["HINDSIGHT_API_RETAIN_LLM_TIMEOUT", String(retainS)],
     ["HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT", String(consolidationS)],
+    // Consolidation token budget — DERIVED from the declared context window,
+    // not hand-set. Batch size is the number of facts stuffed into one prompt,
+    // so it is the dominant term in prompt size and therefore a context
+    // decision (see the block above HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS).
+    // Upstream's `consolidation_max_completion_tokens` default is None (no
+    // cap at all), which is exactly the unbounded half of the overflow.
+    ["HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE", String(contextBudget.consolidation.batchSize)],
+    [
+      "HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS",
+      String(contextBudget.consolidation.maxCompletionTokens),
+    ],
+    // Reflect's accumulated-context bound. Upstream defaults it to 100_000 —
+    // three times a 32k slot, i.e. not a bound at all on a local backend: a
+    // long agentic reflect walks straight through the window and is
+    // context-shifted into the same silent HTTP-200 garbage.
+    [
+      "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS",
+      String(contextBudget.reflect.maxContextTokens),
+    ],
   ];
 }
 
@@ -692,14 +724,48 @@ export function hindsightLlmBudgetEnv(): Array<[string, string]> {
  *   1 × 2 = 2 concurrent claude subprocesses, ceiling.
  * - MAX_MEMORIES_PER_ROUND 100: bounded scope per op → faster slot release,
  *   more re-queue points where the fleet can reclaim the quota.
- * - LLM_BATCH_SIZE 12 (unchanged): facts per LLM call — tokens-per-call, not
- *   concurrency, so it doesn't affect the shared-quota ceiling.
- * Consolidation now drains slower by design; that is the accepted trade for
- * never walling the live fleet. All values remain operator-overridable via
- * the generated compose / -e (raise them only with a dedicated isolated
- * account pinned back on the consumer).
+ * - LLM_BATCH_SIZE: **no longer a constant here.** Derived from the declared
+ *   backend context window — see below and `hindsight-context-budget.ts`.
+ *
+ * Consolidation drains slower by design; that is the accepted trade for never
+ * walling the live fleet. The concurrency values above remain
+ * operator-overridable via the generated compose / -e (raise them only with a
+ * dedicated isolated account pinned back on the consumer).
+ *
+ * ## LLM_BATCH_SIZE is a CONTEXT-WINDOW decision, not only a quota one
+ *
+ * This block used to read: *"LLM_BATCH_SIZE 12 (unchanged): facts per LLM
+ * call — tokens-per-call, not concurrency, so it doesn't affect the
+ * shared-quota ceiling."* That was true of the QUOTA ceiling and actively
+ * misleading about the CONTEXT ceiling, and it went silently wrong the moment
+ * hindsight's backend moved off Claude's 200k window onto a local llama.cpp
+ * slot. Nothing in the codebase knew how big the backend's window was.
+ *
+ * Measured over 24h of live traffic (LiteLLM_SpendLogs, `openai/gpt-oss:20b`,
+ * n=695) against a **32,768-token slot** (`-c 65536 -np 2 --context-shift
+ * --keep 4`):
+ *   - p50 prompt 5,244 tok; **p90 prompt 32,270 tok**; max 32,754 tok — batch
+ *     12 routinely produced prompts that filled the entire window.
+ *   - 262/695 = **38%** of calls exceeded 16,384 prompt tokens.
+ *   - malformed-response rate 44% / 47% on the two local boxes vs **2%** on a
+ *     131k-window OpenRouter route. The variable is the window, not the model.
+ *
+ * And the overflow is INVISIBLE: llama.cpp context-shift discards the oldest
+ * tokens keeping only the first `--keep` (=4), which throws away the system
+ * prompt and JSON schema mid-generation; the model then answers
+ * conversationally and returns **HTTP 200 with `finish_reason: stop`**.
+ *
+ * So batch size and the completion caps are DERIVED from
+ * `hindsight.llm.context_window` and asserted to fit before launch. Picking
+ * "better" constants would only relocate the same latent bug to the next
+ * backend swap.
  */
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 12;
+// Batch-size CEILING — the value the derivation lands on whenever the declared
+// window is large enough to fit it (131k and 200k both are), so a big-window
+// operator keeps the historical tuned 12. The budget only ratchets DOWN from
+// here. Kept under the historical name because that is what it still means.
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE =
+  HINDSIGHT_CONSOLIDATION_BATCH_SIZE_CEILING;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 100;
@@ -1028,6 +1094,12 @@ export interface HindsightLlmConfig {
   provider?: string;
   /** `HINDSIGHT_API_LLM_MODEL`. Default {@link HINDSIGHT_DEFAULT_MODEL}. */
   model?: string;
+  /**
+   * Declared context window (tokens) of the backend. NOT an upstream env var
+   * — switchroom derives the token budget from it (see
+   * `hindsight-context-budget.ts`). Absent → a per-provider default.
+   */
+  context_window?: number;
   /** Per-op override for the `retain` LLM op. Falls back to the global. */
   retain?: HindsightPerOpLlmConfig;
   /** Per-op override for the `reflect` LLM op. Falls back to the global. */
@@ -1053,6 +1125,13 @@ export interface HindsightPerOpLlmConfig {
   base_url?: string;
   /** `HINDSIGHT_API_<OP>_LLM_API_KEY`. snake_case to match the zod config shape. */
   api_key?: string;
+  /**
+   * Declared context window (tokens) for THIS op's backend. Overrides the
+   * global `hindsight.llm.context_window`. Not emitted as env — it drives the
+   * derived token budget. All three lanes are budgeted independently, so a
+   * value here only ratchets this op.
+   */
+  context_window?: number;
 }
 
 /** The three LLM ops that support a per-op model override. */
@@ -1480,12 +1559,15 @@ export function startHindsight(
     // hindsightLlmBudgetEnv() before it returns — against the token budget
     // (the 767.6s runaway, see the constants above) AND against each lane's
     // litellm routing chain (src/litellm/timeout-budget.ts).
-    ...hindsightLlmBudgetEnv().flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+    // …and the CONTEXT budget: consolidation batch size + the two completion
+    // caps, derived from the declared window so a prompt cannot overflow the
+    // backend's slot (an overflow returns HTTP 200 + garbage, never an error).
+    ...hindsightLlmBudgetEnv(llm).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     // Consolidation concurrency: throttled by #2894 to a hard ceiling of
     // MAX_SLOTS 1 × LLM_PARALLELISM 2 = 2 concurrent model calls (was 18), so
-    // consolidation can never exhaust the shared failover quota. Batch size 12
-    // and per-round scope 100 bound tokens/scope per op. See constants above.
-    "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
+    // consolidation can never exhaust the shared failover quota. Per-round
+    // scope 100 bounds tokens/scope per op. (BATCH_SIZE is emitted above, by
+    // the context budget — it is a window decision, not a concurrency one.)
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
@@ -2040,9 +2122,11 @@ export function generateHindsightComposeSnippet(
     `      - HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT}`,
     `      - HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
     `      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
-    // Retain budget — same derivation + assertion as the docker-run path.
-    ...hindsightLlmBudgetEnv().map(([k, v]) => `      - ${k}=${v}`),
-    `      - HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
+    // Retain + timeout + CONTEXT budget — same derivation + assertion as the
+    // docker-run path (consolidation batch size, the completion caps and the
+    // reflect context cap all come from here, so the two paths cannot
+    // disagree about the token budget).
+    ...hindsightLlmBudgetEnv(llm).map(([k, v]) => `      - ${k}=${v}`),
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     `      - HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
