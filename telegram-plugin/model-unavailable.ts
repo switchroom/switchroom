@@ -790,6 +790,14 @@ export function resolveModelUnavailableFromOperatorEvent(
   ev: OperatorEventLike,
 ): ModelUnavailableDetection | null {
   const detail = typeof ev.detail === 'string' ? ev.detail : ''
+  // A THIRD-PARTY provider credit wall is never "model unavailable" in the
+  // Anthropic sense. Returning a detection here would route the event into the
+  // `modelUnavailable` branch of emitGatewayOperatorEvent, which renders the
+  // "⚠️ Model unavailable" card AND — for a `quota_exhausted` detection —
+  // fires `fireFleetAutoFallback`, benching a perfectly healthy Anthropic
+  // account slot because OpenRouter ran out of money. Return null so the event
+  // takes the plain `renderOperatorEvent` path with its provider-specific card.
+  if (ev.kind === 'provider-credit-exhausted') return null
   if (ev.kind === 'quota-exhausted') {
     return detectModelUnavailable(detail) ?? { kind: 'quota_exhausted', raw: detail }
   }
