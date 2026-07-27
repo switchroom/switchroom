@@ -802,6 +802,28 @@ class TestShapeRecallQuery:
         # "before" is a stopword; the survivors keep the source order.
         assert shaped.split() == ["reaper", "skipped", "orphaned", "worktrees", "rollout"]
 
+    def test_unparseable_cap_disables_shaping_instead_of_raising(self):
+        # max_tokens arrives from settings.json / env. A config error must
+        # degrade to "send it unshaped", never raise on the recall hot path.
+        latest = "the reaper skipped orphaned worktrees before the rollout"
+        for bad in (None, "x", "", [], {}):
+            assert shape_recall_query(latest, latest, max_tokens=bad) == latest
+
+    def test_numeric_string_cap_is_honoured(self):
+        latest = "the reaper skipped orphaned worktrees before the rollout"
+        shaped = shape_recall_query(latest, latest, max_tokens="3")
+        assert len(set(tokenize_for_bm25(shaped))) <= 3
+
+    def test_stop_terms_given_as_a_bare_string_are_split_not_iterated(self):
+        # "reaper,worktrees" iterated as characters would stop-list half the
+        # alphabet and gut the query.
+        latest = "the reaper skipped orphaned worktrees before the rollout"
+        shaped = shape_recall_query(latest, latest, 24, stop_terms="reaper, worktrees")
+        terms = set(tokenize_for_bm25(shaped))
+        assert "reaper" not in terms
+        assert "worktrees" not in terms
+        assert {"skipped", "orphaned", "rollout"} <= terms
+
     def test_preserves_original_case(self):
         # The shaped string feeds BOTH arms. BM25 lowercases server-side, but
         # the embedding arm does not, so shaping must not flatten `Python` to

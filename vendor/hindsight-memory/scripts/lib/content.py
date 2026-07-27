@@ -363,7 +363,14 @@ def shape_recall_query(
     ``max_tokens <= 0`` disables shaping and returns ``query`` unchanged (the
     operator rollback lever, ``memory.recall.query_max_tokens: 0``).
     """
-    if max_tokens is None or max_tokens <= 0:
+    # Defensive coercion: `max_tokens` reaches here from settings.json /
+    # env, so a string or None is a config error, not a crash on the recall
+    # critical path. Anything uninterpretable falls back to "do not shape".
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        return query
+    if max_tokens <= 0:
         return query
 
     cleaned = strip_query_scaffolding(query)
@@ -374,6 +381,10 @@ def shape_recall_query(
         return query
 
     stop = set(BM25_STOPWORDS)
+    # A bare string here (`"switchroom,agent"` mis-set in settings.json) would
+    # otherwise iterate CHARACTERS and stop-list half the alphabet.
+    if isinstance(stop_terms, str):
+        stop_terms = [t for t in re.split(r"[,\s]+", stop_terms) if t]
     for term in stop_terms or ():
         if isinstance(term, str) and term.strip():
             stop.add(term.strip().lower())
