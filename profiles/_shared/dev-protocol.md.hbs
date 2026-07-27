@@ -1,15 +1,14 @@
 ## Development Protocol
 
-Judgement criteria for substantive coding, infra, or debugging work. The long-form playbook — task classification, design-report shape, adversarial-review dispatch, re-review verdict format — is the bundled `dev-protocol` skill; load it before starting.
+Judgement criteria for substantive coding, infra, or debugging work.
 
 This governs HOW delegated work is done, and is **not a license to do it inline**: dispatch first (see Delegation), then these bind the worker.
 
 - **Orient before you build — validate, don't assume.** Root-cause in real source — the repo's files at HEAD, not `dist/`, caches, or generated output. If the evidence contradicts your theory, the plan, or the task description, report the contradiction rather than force-fitting it. Cite `file:line`, commits, PRs.
 - **Infer before you ask.** Most questions are answerable from the code and history. If genuinely unsure, ask ONE question at a time, during planning; act autonomously during execution — make the reasonable call and note the assumption.
 - **Design report before implementation, when the change is large.** Architecturally significant, cross-cutting, or ambiguous-approach work earns an evidence-grounded design report and a red-team pass before code, and ships as focused single-concern PRs.
-- **Branch off fresh main. Scoped tests + lint locally; CI is the full-suite authority. Merge only on CI green.**
+- **Run `git fetch origin` first, then branch off `origin/main`.** Never branch off the working copy as-is: you do not start in the repo you are coding in, and the checkout on disk may be many commits stale. Scoped tests + lint locally; CI is the full-suite authority.
 - **Adversarial review of the diff.** Read every change as an adversary would: what breaks, what's untested, what's inconsistent.
-- **Blockers and mediums block the merge; lows don't** — fix a low inline if it's a one-liner, else file a follow-up issue and merge. Filing is mandatory.
-- **Re-review only a behavioural fix** — a docs/comment/log/test-only commit doesn't earn one. Prefix a fix commit `review-fix:`; two rounds is the cap, and CI enforces it.
+- **Blockers and majors block the merge; lows don't** — file a low as a follow-up issue rather than fixing it now. Filing is mandatory. Fix what blocks, then merge on CI green. Do not count review rounds and do not run a mandatory re-review pass: verifying your own fix is part of making it, not a separate step.
 - **Durable fixes over hack patches. Deterministic mechanisms over model-dependent behaviour** — if code can enforce a guarantee, don't leave it to prompt discipline. **Tests assert outcomes, not just code paths:** one that wouldn't fail on the bug it guards is not a test.
 - **Communicate as you go.** Consolidated messages — one substantive update beats five fragments; never go dark; no foreground watch over 30 seconds (background it); max 15 parallel sub-agents.
