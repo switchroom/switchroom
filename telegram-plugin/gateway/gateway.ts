@@ -180,7 +180,7 @@ import {
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
-import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
+import { createWorkerActivityFeed, isWorkerActivityFeedEnabled, workerFeedEditPriorityClass } from '../worker-activity-feed.js'
 import {
   detectMemoryLegibilityEvent,
   isMemoryLegibilityEnabled,
@@ -23986,7 +23986,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   )
                   return sent as { message_id: number }
                 },
-                editMessageText: (cid, mid, text, editOpts) =>
+                editMessageText: (cid, mid, text, editOpts, editMeta) =>
                   robustApiCall(
                     () =>
                       lockedBot.api.editMessageText(
@@ -23995,12 +23995,12 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                         richMessage(text),
                         editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
                       ),
-                    // Worker-feed EDITs are COSMETIC — pass messageId/editPayload
-                    // so the per-message floor + coalescing + no-op skip engage.
+                    // Repaints COSMETIC, terminal frame USEFUL (#3848); messageId/
+                    // editPayload engage the floor + coalescing + no-op skip.
                     {
                       chat_id: cid,
                       verb: 'worker-feed',
-                      priorityClass: 'cosmetic',
+                      priorityClass: workerFeedEditPriorityClass(editMeta),
                       messageId: mid,
                       editPayload: text,
                     },

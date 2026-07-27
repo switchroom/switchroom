@@ -126,6 +126,49 @@ export interface WorkerActivityView {
   model?: string
 }
 
+/**
+ * Out-of-band metadata about ONE feed edit, handed to the transport adapter
+ * alongside the Bot API arguments (switchroom#3848).
+ *
+ * Deliberately a SEPARATE parameter rather than a field on `opts`: `opts` is
+ * forwarded verbatim to `editMessageText` and therefore onto the wire, and
+ * `outbound-class.ts` exists precisely so a priority signal never has to be
+ * smuggled into an outbound Bot API payload.
+ */
+export interface WorkerFeedEditMeta {
+  /**
+   * True when this edit paints the card's FINAL state — the last worker's
+   * terminal recap, or the "superseded" note on a rotated-out message. False
+   * for every intermediate / liveness repaint.
+   */
+  terminal: boolean
+}
+
+/**
+ * The send-gate priority class a worker-feed edit must carry.
+ *
+ * Intermediate repaints are `cosmetic`: dropping one costs nothing, because
+ * the next render carries full state, and holding them to the fuse's tight
+ * cosmetic ceilings (4/message/60s, 6/chat/60s) is what stops the feed
+ * earning a per-chat flood ban (#3847).
+ *
+ * A TERMINAL frame is `useful` (#3848). It is the last frame the operator
+ * ever reads for that card and nothing newer is coming to repaint it, so
+ * classing it cosmetic made the one frame carrying the finished state
+ * compete in — and get shed from — the same starved budget as a heartbeat.
+ * `useful` rather than `critical` matches the activity-summary finalize in
+ * `gateway/narrative-lane.ts`: it may be DEFERRED under pressure, but it is
+ * not shed, and it does not spend the per-chat reply reservation that keeps
+ * the operator's real answer unstarvable.
+ *
+ * Exported so the mapping is unit-testable; `gateway.ts` only calls it.
+ */
+export function workerFeedEditPriorityClass(
+  meta?: WorkerFeedEditMeta,
+): 'useful' | 'cosmetic' {
+  return meta?.terminal === true ? 'useful' : 'cosmetic'
+}
+
 export interface BotApiForWorkerFeed {
   sendMessage(
     chatId: string,
@@ -137,6 +180,12 @@ export interface BotApiForWorkerFeed {
     messageId: number,
     text: string,
     opts?: Record<string, unknown>,
+    /**
+     * Out-of-band edit metadata (NOT part of the Bot API payload). The
+     * gateway adapter maps `terminal` to the send-gate priority class via
+     * {@link workerFeedEditPriorityClass}.
+     */
+    meta?: WorkerFeedEditMeta,
   ): Promise<unknown>
 }
 
@@ -1194,7 +1243,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     }
 
     try {
-      const res = await opts.bot.editMessageText(g.chatId, g.messageId, body, sendOptsFor(g))
+      // #3848: tell the transport whether this is the card's LAST frame. A
+      // terminal recap must not be shed with the heartbeat repaints.
+      const res = await opts.bot.editMessageText(
+        g.chatId, g.messageId, body, sendOptsFor(g), { terminal: isTerminal },
+      )
       // Shed honesty (#3084): a cosmetic edit the gate shed resolves the
       // distinguishable SEND_GATE_SHED sentinel (NOT a bare `undefined`, which
       // the gate reserves for a benign no-op drop whose payload IS on screen).
@@ -1483,8 +1536,14 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // doesn't sit frozen showing live-styled rows (mistakable for a stuck
         // worker). ONE best-effort edit per rotation (≥ cap interval), fired
         // off-chain and swallowing errors — never per-tick, never a burst.
+        // #3848: terminal — this is the retired message's LAST frame, and it
+        // fires at most once per `groupMessageLifetimeCapMs`, so promoting it
+        // out of the cosmetic budget costs nothing and stops the retired card
+        // being left frozen showing live-styled rows.
         void opts.bot
-          .editMessageText(g.chatId, retiredId, WORKER_CARD_SUPERSEDED_BODY, sendOptsFor(g))
+          .editMessageText(
+            g.chatId, retiredId, WORKER_CARD_SUPERSEDED_BODY, sendOptsFor(g), { terminal: true },
+          )
           .catch(() => {})
       }
 
