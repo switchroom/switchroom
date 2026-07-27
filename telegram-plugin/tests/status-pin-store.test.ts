@@ -14,6 +14,8 @@ import {
 } from "../gateway/status-pin-store.js";
 import { decidePinAction, type PinState, type DesiredPin } from "../status-pin.js";
 import { reconcilePin, type PinBotApi } from "../status-pin-driver.js";
+import { runStatusPinReconcile } from "../gateway/status-pin-retarget.js";
+import { makeFloodWaitActiveError } from "../retry-api-call.js";
 
 /** In-memory fs seam with an atomic rename, so the store's tmp→rename
  *  crash-safety contract is exercised without touching the real disk. */
@@ -806,32 +808,24 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
         unpinCalls.push(id);
       },
     };
-    async function core(
-      pinKey: string,
-      chatId: string,
-      desired: DesiredPin,
-      gate?: Promise<void>,
-    ) {
-      const prev = claims.get(pinKey) ?? null; // read BEFORE the store op (the F2 window)
-      const action = decidePinAction(prev, desired);
-      const op =
-        action.kind === "pin"
-          ? ({ kind: "pin", messageId: action.messageId } as const)
-          : ({ kind: "clear" } as const);
-      const next = await reconcileAndPersistStatusPin({
-        path: PATH,
-        fs,
+    const chatIds = new Map<string, string>();
+    const pinnedAt = new Map<string, number>();
+    // Drives the REAL production orchestrator the gateway calls, so the persist
+    // ordering and the RETARGET two-leg expansion under test are the shipped
+    // ones — not a copy that could drift out from under this suite.
+    function core(pinKey: string, chatId: string, desired: DesiredPin, gate?: Promise<void>) {
+      return runStatusPinReconcile({
         pinKey,
         chatId,
-        op,
-        applyPin: async () => {
+        prev: claims.get(pinKey) ?? null, // read BEFORE the store op (the F2 window)
+        desired,
+        persist: { path: PATH, fs },
+        runPin: async (from, want) => {
           if (gate) await gate; // hold the pin open inside the store lock
-          return reconcilePin({ api, chatId, prevState: prev, desired });
+          return reconcilePin({ api, chatId, prevState: from, desired: want });
         },
-        log: () => {},
+        registries: { state: claims, chatIds, pinnedAt },
       });
-      if (next == null) claims.delete(pinKey);
-      else claims.set(pinKey, next);
     }
     function reconcile(
       pinKey: string,
@@ -914,6 +908,78 @@ describe("status-pin-store — F2 per-key reconcile serialization", () => {
     // The durable row is intact throughout (F1).
     expect(loadStatusPins(PATH, fs)).toEqual([
       { pinKey: "wk:group:g1", chatId: "-100123", messageId: 900 },
+    ]);
+  });
+
+  // ── RETARGET: a single reconcile must leave the NEW surface pinned ────────
+  // The foreground activity card reconciles its `fg:` pin exactly once, when a
+  // card OPENs (narrative-lane.ts). The ack-first reopen path nulls
+  // `activityMessageId` mid-turn, so a fresh card opens and that ONE reconcile
+  // is the only chance to move the pin. It used to emit an unpin and stop:
+  // nothing pinned, and a durable row that had been deleted — so neither the
+  // mid-session reaper nor the next boot's sweep had anything to work from.
+  it("RETARGET: one reconcile unpins the old card, pins the NEW one, and leaves the durable row on the new id", async () => {
+    const { fs } = memFs();
+    const r = makeReconciler(fs, { serialize: true });
+
+    await r.reconcile("fg:c:7", "-100123", { pinned: true, messageId: 900 });
+    expect(r.pinCalls).toEqual([900]);
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "fg:c:7", chatId: "-100123", messageId: 900 },
+    ]);
+
+    // The card is re-posted mid-turn — ONE reconcile, new message id.
+    await r.reconcile("fg:c:7", "-100123", { pinned: true, messageId: 901 });
+
+    expect(r.unpinCalls).toEqual([900]); // stale card unpinned
+    expect(r.pinCalls).toEqual([900, 901]); // …AND the new card pinned
+    expect(r.claims.get("fg:c:7")).toEqual({ messageId: 901 });
+    // The durable row tracks the message that is genuinely pinned, so the
+    // mid-session reaper and the boot sweep can both still reach it.
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "fg:c:7", chatId: "-100123", messageId: 901 },
+    ]);
+  });
+
+  it("RETARGET: a never-confirmed unpin keeps the OLD id in the durable row (no unreapable orphan)", async () => {
+    // #3664 Defect B composed with the retarget: the old message is provably
+    // still pinned, so we must NOT pin the new one and must NOT lose the row —
+    // otherwise the chat holds a pin nothing on disk names.
+    const { fs } = memFs();
+    const claims = new Map<string, PinState>();
+    const pinCalls: number[] = [];
+    const unpinCalls: number[] = [];
+    let floodTheUnpin = false;
+    const api: PinBotApi = {
+      pinChatMessage: async (_c, id) => {
+        pinCalls.push(id);
+      },
+      unpinChatMessage: async (_c, id) => {
+        unpinCalls.push(id);
+        if (floodTheUnpin) throw makeFloodWaitActiveError(300, Date.now() + 300_000, null);
+      },
+    };
+    const reconcile = (desired: DesiredPin) =>
+      runStatusPinReconcile({
+        pinKey: "fg:c:8",
+        chatId: "-100123",
+        prev: claims.get("fg:c:8") ?? null,
+        desired,
+        persist: { path: PATH, fs },
+        runPin: (from, want) =>
+          reconcilePin({ api, chatId: "-100123", prevState: from, desired: want }),
+        registries: { state: claims, chatIds: new Map(), pinnedAt: new Map() },
+      });
+
+    await reconcile({ pinned: true, messageId: 900 });
+    floodTheUnpin = true;
+    await reconcile({ pinned: true, messageId: 901 });
+
+    expect(unpinCalls).toEqual([900]); // attempted…
+    expect(pinCalls).toEqual([900]); // …and the pin leg was correctly SKIPPED
+    expect(claims.get("fg:c:8")).toEqual({ messageId: 900 }); // claim retained
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "fg:c:8", chatId: "-100123", messageId: 900 },
     ]);
   });
 });

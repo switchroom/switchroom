@@ -37,9 +37,14 @@ describe('decidePinAction (pure)', () => {
     expect(action.kind).toBe('noop')
   })
 
-  it('unpins the stale claim when the wanted message id changed (feed re-posted)', () => {
+  it('RETARGETS (unpin old + pin new) when the wanted message id changed (surface re-posted)', () => {
+    // Regression: this used to report a bare `unpin`, on the assumption that a
+    // later reconcile would pin the new message. Single-shot callers (the
+    // foreground activity card, which reconciles only when a card OPENs) have
+    // no later reconcile, so the new card was left unpinned for the rest of
+    // the turn. The decision must carry BOTH message ids.
     const action = decidePinAction({ messageId: 42 }, { pinned: true, messageId: 99 })
-    expect(action).toEqual({ kind: 'unpin', messageId: 42 })
+    expect(action).toEqual({ kind: 'repin', unpinMessageId: 42, pinMessageId: 99 })
   })
 })
 
@@ -175,6 +180,127 @@ describe('reconcilePin (driver)', () => {
     const second = await reconcilePin({ ...common, prevState: first })
     expect(second).toBeNull() // flood window closed; unpin landed; claim cleared
     expect(attempts).toBe(2)
+  })
+
+  // ── Retarget (`repin`) — the single-shot-caller leak ──────────────────────
+  // The foreground activity card reconciles its `fg:` pin EXACTLY ONCE, when a
+  // card OPENs (narrative-lane.ts; the edit branch never touches the pin). When
+  // the ack-first reopen path (feed-reopen-gate.ts) nulls `activityMessageId`
+  // and a FRESH card opens mid-turn, that single reconcile must leave the NEW
+  // card pinned. Previously it emitted only an unpin and the turn ran on with
+  // nothing pinned.
+  it('RETARGET: one reconcile unpins the stale message AND pins the new one', async () => {
+    const { api, calls } = fakeApi()
+    const next = await reconcilePin({
+      api,
+      chatId: '123',
+      prevState: { messageId: 42 },
+      desired: { pinned: true, messageId: 99 },
+    })
+    expect(next).toEqual({ messageId: 99 })
+    expect(calls.map((c) => [c.verb, c.messageId])).toEqual([
+      ['unpin', 42],
+      ['pin', 99],
+    ])
+    // The new pin must still be silent.
+    expect((calls[1].opts as Record<string, unknown>).disable_notification).toBe(true)
+  })
+
+  it('RETARGET: a TERMINAL unpin failure still pins the new message', async () => {
+    // "message to unpin not found" means the old surface is already gone — the
+    // retarget must complete, not abort.
+    const calls: { verb: string; messageId: number }[] = []
+    const next = await reconcilePin({
+      api: {
+        pinChatMessage: async (_c, message_id) => {
+          calls.push({ verb: 'pin', messageId: message_id })
+        },
+        unpinChatMessage: async (_c, message_id) => {
+          calls.push({ verb: 'unpin', messageId: message_id })
+          throw grammyError(400, 'Bad Request: message to unpin not found')
+        },
+      },
+      chatId: '123',
+      prevState: { messageId: 42 },
+      desired: { pinned: true, messageId: 99 },
+    })
+    expect(next).toEqual({ messageId: 99 })
+    expect(calls).toEqual([
+      { verb: 'unpin', messageId: 42 },
+      { verb: 'pin', messageId: 99 },
+    ])
+  })
+
+  it('RETARGET: a NEVER-CONFIRMED unpin retains the OLD claim and does NOT pin the new one', async () => {
+    // The old message is provably still pinned (#3664 Defect B). Pinning the
+    // new one now would leave two pins in the chat with a durable record of
+    // only one — the exact orphan class the retain rule exists to prevent.
+    const calls: { verb: string; messageId: number }[] = []
+    const next = await reconcilePin({
+      api: {
+        pinChatMessage: async (_c, message_id) => {
+          calls.push({ verb: 'pin', messageId: message_id })
+        },
+        unpinChatMessage: async (_c, message_id) => {
+          calls.push({ verb: 'unpin', messageId: message_id })
+          throw makeFloodWaitActiveError(300, Date.now() + 300_000, null)
+        },
+      },
+      chatId: '123',
+      prevState: { messageId: 42 },
+      desired: { pinned: true, messageId: 99 },
+    })
+    expect(next).toEqual({ messageId: 42 })
+    expect(calls).toEqual([{ verb: 'unpin', messageId: 42 }])
+  })
+
+  it('RETARGET: a failed pin leg drops the claim (nothing is pinned, nothing is tracked)', async () => {
+    const calls: { verb: string; messageId: number }[] = []
+    const next = await reconcilePin({
+      api: {
+        pinChatMessage: async (_c, message_id) => {
+          calls.push({ verb: 'pin', messageId: message_id })
+          throw new Error('fetch failed')
+        },
+        unpinChatMessage: async (_c, message_id) => {
+          calls.push({ verb: 'unpin', messageId: message_id })
+        },
+      },
+      chatId: '123',
+      prevState: { messageId: 42 },
+      desired: { pinned: true, messageId: 99 },
+    })
+    // prevState for the pin leg is null (the unpin landed), so a failed pin
+    // returns null — no phantom claim on a message we never pinned.
+    expect(next).toBeNull()
+    expect(calls).toEqual([
+      { verb: 'unpin', messageId: 42 },
+      { verb: 'pin', messageId: 99 },
+    ])
+  })
+
+  it('RETARGET: a pin-rights-blocked chat makes NO API calls and drops the claim', async () => {
+    const calls: string[] = []
+    const cache = new PinRightsCache()
+    cache.block('123')
+    const next = await reconcilePin({
+      api: {
+        pinChatMessage: async () => {
+          calls.push('pin')
+        },
+        unpinChatMessage: async () => {
+          calls.push('unpin')
+        },
+      },
+      chatId: '123',
+      prevState: { messageId: 42 },
+      desired: { pinned: true, messageId: 99 },
+      rightsCache: cache,
+    })
+    expect(calls).toEqual([])
+    // unpin leg returns null (claim dropped, nothing worth tracking); the pin
+    // leg is skipped from a null prev and returns null too.
+    expect(next).toBeNull()
   })
 
   it('does NOT claim a message whose pin failed (retries next reconcile)', async () => {

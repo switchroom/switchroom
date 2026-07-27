@@ -197,7 +197,7 @@ import {
 import type { WebhookGatewayRecord } from '../../src/web/webhook-gateway-record.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState, DesiredPin } from '../status-pin.js'
-import { decidePinAction, PinRightsCache } from '../status-pin.js'
+import { PinRightsCache } from '../status-pin.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
 import {
@@ -637,6 +637,9 @@ import type { HostdRequest, HostdResponse } from '../../src/host-control/protoco
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import { createBootSweepGate, runBootPinSweepSteps } from './boot-sweep-gate.js'
+import { runStatusPinReconcile } from './status-pin-retarget.js'
+import { createPeriodicSweepGuard } from './periodic-sweep-guard.js'
+import { withDeadline } from './with-deadline.js'
 import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './status-pin-api.js'
 import {
   createDmPinSweeper,
@@ -666,11 +669,9 @@ import { buildCapturedDeliverySnapshot, createCapturedResumeDispatcher } from '.
 import {
   loadStatusPins,
   mutateStatusPinRow,
-  reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
   withPinReconcileLock,
   type PersistedStatusPin,
-  type StatusPinPersistOp,
 } from './status-pin-store.js'
 import {
   loadActivityCards,
@@ -9069,8 +9070,20 @@ async function runMidSessionCardReaper(): Promise<void> {
   }
 }
 
+// Single-flight: a pass awaits Telegram calls that can park behind a flood-wait
+// for longer than the interval, so ticks fanned out. See periodic-sweep-guard.ts.
+const midSessionReaperGuard = createPeriodicSweepGuard({
+  run: runMidSessionCardReaper,
+  onSkip: () => process.stderr.write(
+    'telegram gateway: mid-session reaper tick skipped — previous pass still running\n',
+  ),
+  onError: (err) => process.stderr.write(
+    `telegram gateway: mid-session reaper pass threw: ${(err as Error).message}\n`,
+  ),
+})
+
 const midSessionCardReaper = isGatewayMain ? setInterval(() => {  // #2996 P0c gate
-  void runMidSessionCardReaper()
+  void midSessionReaperGuard.tick()
 }, MID_SESSION_CARD_REAPER_INTERVAL_MS) : undefined
 midSessionCardReaper?.unref()
 
@@ -9131,12 +9144,12 @@ async function reconcileStatusPinInner(
   // older duplicate-pin concern (two edits both reading prev=null).
   const prev = statusPinState.get(pinKey) ?? null
 
-  const runReconcile = () =>
+  const runReconcileFrom = (from: PinState | null, want: DesiredPin) =>
     reconcilePin({
       api: statusPinApi(),
       chatId,
-      prevState: prev,
-      desired,
+      prevState: from,
+      desired: want,
       rightsCache: statusPinRightsCache,
       onPinRightsDisabled: (chat) => {
         // Logged ONCE per chat per process (#3024). Every subsequent auto-pin
@@ -9155,53 +9168,23 @@ async function reconcileStatusPinInner(
       },
     })
 
-  // Classify the action so we persist INTENT before the pin API call. Only a
-  // fresh `pin` of a message that isn't already our claim opens the leak window
-  // (the API call actually pins something new); everything else (unpin, noop,
-  // re-pin of the same id) clears / leaves the record and is safe to persist
-  // after. See reconcileAndPersistStatusPin for the ordering rationale.
-  const action = decidePinAction(prev, desired)
-  const op: StatusPinPersistOp =
-    action.kind === 'pin'
-      ? { kind: 'pin', messageId: action.messageId }
-      : { kind: 'clear' }
-
-  if (!statusPinPersistEnabled) {
-    // Persistence off (STATIC / feature-off): just reconcile + update Maps.
-    const next = await runReconcile()
-    if (next == null) {
-      statusPinState.delete(pinKey)
-      statusPinChatIds.delete(pinKey)
-      statusPinPinnedAt.delete(pinKey)
-    } else {
-      statusPinState.set(pinKey, next)
-      statusPinChatIds.set(pinKey, chatId)
-      if (!statusPinPinnedAt.has(pinKey)) statusPinPinnedAt.set(pinKey, Date.now())
-    }
-    return
-  }
-
-  // Persist-BEFORE-pin ordering lives in reconcileAndPersistStatusPin: for a
-  // pin it writes a `pending` record first, then confirms it after the API call
-  // lands (or drops it on failure). A crash in the window leaves a pending
-  // record boot cleanup will unpin. In-memory Maps are updated from the result.
-  const next = await reconcileAndPersistStatusPin({
-    path: STATUS_PIN_STORE_PATH,
-    fs: statusPinStoreFs,
+  // Persist ordering + the RETARGET two-leg expansion: status-pin-retarget.ts.
+  await runStatusPinReconcile({
     pinKey,
     chatId,
-    op,
-    applyPin: runReconcile,
+    prev,
+    desired,
+    // persist:null ⇒ no durable row (STATIC / feature-off).
+    persist: statusPinPersistEnabled
+      ? { path: STATUS_PIN_STORE_PATH, fs: statusPinStoreFs }
+      : null,
+    runPin: runReconcileFrom,
+    registries: {
+      state: statusPinState,
+      chatIds: statusPinChatIds,
+      pinnedAt: statusPinPinnedAt,
+    },
   })
-  if (next == null) {
-    statusPinState.delete(pinKey)
-    statusPinChatIds.delete(pinKey)
-    statusPinPinnedAt.delete(pinKey)
-  } else {
-    statusPinState.set(pinKey, next)
-    statusPinChatIds.set(pinKey, chatId)
-    if (!statusPinPinnedAt.has(pinKey)) statusPinPinnedAt.set(pinKey, Date.now())
-  }
 }
 
 // #3207: the per-worker `reconcileWorkerPin(agentId, …)` (keyed `wk:<agentId>`)
@@ -22749,6 +22732,24 @@ async function shutdown(signal: string): Promise<void> {
     budgetMs: SHUTDOWN_DRAIN_BUDGET_MS,
     agentName,
   })
+
+  // Status-pin: unpin everything we own before we exit. `sweepBeforeSelfRestart`
+  // covered the gateway's OWN restart verbs, but SIGTERM/SIGINT — `docker
+  // restart`, a compose bounce, a host reboot: the common path — reached
+  // `process.exit(0)` with every live pin still pinned, leaving it at the top of
+  // the chat until the NEXT boot's cleanup won the mutex and built a bot
+  // (empirically: overlord logged `cleared 1/1 orphaned pin(s) from a prior
+  // session` on a routine 2026-07-27 restart). Runs after the drain (no live
+  // turn to race) and before `bot.api` goes away — `bot.stop()` only stops
+  // polling. Deadline-bounded on purpose: a flood-wait-parked unpin must not
+  // push shutdown into the `forceExitTimer` path, which skips the lock release.
+  try {
+    await withDeadline(unpinAllStatusPins(), 5_000, 'status-pin shutdown sweep timed out')
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: shutdown status-pin sweep incomplete: ${(err as Error).message}\n`,
+    )
+  }
 
   // Now finish the cleanup the drain didn't touch.
   inboundCoalescer.reset()
