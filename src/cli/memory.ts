@@ -26,10 +26,14 @@ import {
   hindsightContainerEnvPairs,
   hindsightResolvedCapabilities,
   preflightHindsightPorts,
+  getHindsightDeviceRequests,
+  hindsightGpuDecision,
+  resolveHindsightGpuOverride,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
+import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
 import {
   diffDroppedHindsightEnv,
   formatDroppedHindsightEnvReport,
@@ -509,7 +513,30 @@ export function registerMemoryCommand(program: Command): void {
         "nor switchroom's managed defaults. Default is to warn loudly and proceed, so a " +
         "rollout is never wedged half-way with memory down.",
     )
-    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; tag?: string; provider?: string; strictEnv?: boolean }) => {
+    // `--gpu` MUST be declared before `--no-gpu`: commander only leaves the
+    // pair's default `undefined` (i.e. "operator said nothing") when the
+    // positive form is defined first. Declared alone, `--no-gpu` would default
+    // `opts.gpu` to `true` and silently force GPU on every host.
+    .option(
+      "--gpu",
+      "Force GPU passthrough on for this launch, overriding host autodetection. " +
+        "Use when `~/.switchroom/host-capabilities.json` is wrong or unreadable and " +
+        "you know the host has a working nvidia container toolkit (`docker run --gpus " +
+        "all` hard-fails container create without one). Beats `hindsight.gpu`.",
+    )
+    .option(
+      "--no-gpu",
+      "Force GPU passthrough off for this launch, overriding host autodetection. " +
+        "Also the explicit opt-out for the recreate GPU drop guard.",
+    )
+    .option(
+      "--allow-gpu-drop",
+      "Proceed with a --recreate that would take GPU passthrough away from the " +
+        "running container. Without this the recreate refuses, because that drop " +
+        "moves the embedding model and cross-encoder reranker to CPU on the " +
+        "interactive recall path with no other signal.",
+    )
+    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; tag?: string; provider?: string; strictEnv?: boolean; gpu?: boolean; allowGpuDrop?: boolean }) => {
       if (opts.status) {
         if (!isDockerAvailable()) {
           console.log(chalk.red("  Docker is not available."));
@@ -613,6 +640,61 @@ export function registerMemoryCommand(program: Command): void {
         return;
       }
 
+      // ── GPU passthrough: decide, report, and guard the drop ──────────────
+      //
+      // FIRST, because the env-drift guard below needs the same answer: the
+      // GPU-gated perf defaults (HINDSIGHT_API_RERANKER_LOCAL_FP16, ..._BATCH_SIZE)
+      // are emitted only when this is true, so re-deriving it there would let
+      // the drift report disagree with the launch it is predicting.
+      //
+      // The 2026-07-28 regression: this decision silently evaluated false (the
+      // host-capabilities verdict file was root:root 0600 under a uid-1000
+      // home, the EACCES was swallowed, and an unreadable file was
+      // indistinguishable from "no GPU"). The container came back on CPU with
+      // no output at all. Every part of that is now visible here.
+      let gpuConfigured: boolean | undefined;
+      try {
+        gpuConfigured = getConfig(program).hindsight?.gpu;
+      } catch {
+        gpuConfigured = undefined;
+      }
+      const gpuDecision = hindsightGpuDecision(
+        resolveHindsightGpuOverride({ flag: opts.gpu, config: gpuConfigured }),
+      );
+      console.log(
+        (gpuDecision.enabled ? chalk.green : chalk.gray)(
+          `  GPU passthrough: ${gpuDecision.enabled ? "ON" : "off"} — ${gpuDecision.reason}`,
+        ),
+      );
+      if (gpuDecision.degraded) {
+        // Loud on the command's OWN output, not only on the library's stderr:
+        // this is the path whose behaviour the degraded read actually changes.
+        console.log(
+          chalk.yellow(
+            `\n  ⚠  Cannot read the host-capabilities verdict (${gpuDecision.capabilities.path}).\n` +
+            `     ${gpuDecision.capabilities.detail}\n` +
+            "     GPU is being treated as unproven because switchroom could not tell,\n" +
+            "     NOT because this host lacks one. Fix the file, or set `hindsight.gpu`\n" +
+            "     in switchroom.yaml / pass --gpu to state the answer explicitly.\n",
+          ),
+        );
+      }
+
+      // Does this recreate take GPU away from the container that is running?
+      // Positive evidence only: getHindsightDeviceRequests() returns null for
+      // "could not inspect", and the guard must never manufacture a refusal
+      // out of not knowing. Assessed here, REPORTED with the env-drift report
+      // below, and refused after both have been printed — an operator should
+      // see everything this recreate would change in one run, not one reason
+      // per invocation.
+      const gpuDrop = recreate
+        ? assessHindsightGpuDrop({
+            existing: getHindsightDeviceRequests(),
+            decision: gpuDecision,
+            allowDrop: opts.allowGpuDrop === true,
+          })
+        : { drops: false, blocks: false, message: "" };
+
       // ── Env-drift guard ────────────────────────────────────────────────
       // A recreate rebuilds the container env FROM SCRATCH out of
       // `hindsight.env` + switchroom's managed defaults, so anything set
@@ -643,6 +725,8 @@ export function registerMemoryCommand(program: Command): void {
               apiPort: reusePorts?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT,
               litellm: driftLitellm,
               llm: driftConfig.hindsight?.llm,
+              // The SAME GPU answer the launch will use, passed as a value.
+              gpu: gpuDecision.enabled,
               perf: driftPerf,
             });
             const dropped = diffDroppedHindsightEnv(
@@ -655,7 +739,7 @@ export function registerMemoryCommand(program: Command): void {
               hindsightResolvedCapabilities(
                 driftConfig.hindsight?.llm,
                 driftLitellm,
-                undefined,
+                gpuDecision.enabled,
                 driftPerf,
               ),
             );
@@ -672,14 +756,27 @@ export function registerMemoryCommand(program: Command): void {
         console.log("");
         for (const line of envDriftLines) console.log(chalk.yellow(line));
         console.log("");
-        if (opts.strictEnv) {
-          console.error(
-            chalk.red(
-              "  Refusing to recreate (--strict-env). The running container was NOT touched.\n",
-            ),
-          );
-          process.exit(1);
-        }
+      }
+      if (gpuDrop.drops) {
+        console.log(chalk[gpuDrop.blocks ? "red" : "yellow"](`\n  ${gpuDrop.message}\n`));
+      }
+
+      // Both refusals fire here — after everything has been printed, and still
+      // before the image pull and before stopHindsight(), so a refusal leaves
+      // the running container completely untouched.
+      if (gpuDrop.blocks) {
+        console.error(
+          chalk.red("  Refusing to recreate. The running container was NOT touched.\n"),
+        );
+        process.exit(1);
+      }
+      if (envDriftLines.length > 0 && opts.strictEnv) {
+        console.error(
+          chalk.red(
+            "  Refusing to recreate (--strict-env). The running container was NOT touched.\n",
+          ),
+        );
+        process.exit(1);
       }
 
       if (recreate) {
@@ -824,8 +921,11 @@ export function registerMemoryCommand(program: Command): void {
           effectiveTag,
           hindsightConfig.hindsight?.llm,
           hindsightConsumerMirrorDir(hindsightConfig),
-          // gpu: omitted ⇒ hindsightGpuEnabled() reads the persisted verdict.
-          undefined,
+          // The SAME answer that was printed and drop-guarded above, passed as
+          // a value rather than re-derived. Re-deriving would let the launch
+          // disagree with the guard that just cleared it — the exact class of
+          // silent divergence this PR exists to close.
+          gpuDecision.enabled,
           // Operator overrides for the capability-gated performance defaults.
           { env: hindsightConfig.hindsight?.env },
         );
@@ -872,9 +972,13 @@ export function registerMemoryCommand(program: Command): void {
           generateHindsightComposeSnippet(
             snippetConfig.hindsight?.llm,
             hindsightConsumerMirrorDir(snippetConfig),
-            // litellm / gpu: omitted ⇒ same defaults the docker-run path uses.
+            // litellm: omitted ⇒ same default the docker-run path uses.
             undefined,
-            undefined,
+            // gpu: the `hindsight.gpu` override still applies here, so the
+            // emitted compose file agrees with what `memory setup` would launch.
+            hindsightGpuDecision(
+              resolveHindsightGpuOverride({ config: snippetConfig.hindsight?.gpu }),
+            ).enabled,
             { env: snippetConfig.hindsight?.env },
           ),
         );

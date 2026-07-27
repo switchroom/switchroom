@@ -34,6 +34,10 @@ import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
+import {
+  readHostCapabilities,
+  type HostCapabilitiesRead,
+} from "../setup/host-capabilities.js";
 import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
@@ -1066,6 +1070,87 @@ export function checkHindsightEnvKeysAreManaged(
   };
 }
 
+/**
+ * FAIL when the persisted host-capabilities verdict exists but cannot be read.
+ *
+ * Nothing checked this file before, and its silent-failure mode is expensive:
+ * every GPU gate in switchroom (`hindsightGpuEnabled`, the GPU-only hindsight
+ * perf defaults, the compose voice sidecar) reads it, and an unreadable file
+ * used to be indistinguishable from "this host has no GPU". On 2026-07-28 that
+ * cost the fleet `--gpus all` plus `RERANKER_LOCAL_FP16` on the interactive
+ * recall path, with no error anywhere — the file was `root:root 0600` under a
+ * uid-1000 home (`sudo switchroom setup` writes as root; every later run is
+ * uid 1000).
+ *
+ * FAIL, not WARN: a present-but-unreadable verdict has no benign reading.
+ * Absent is a different thing entirely — a fresh install has never probed —
+ * so it stays OK, with the consequence spelled out.
+ *
+ * An explicit `hindsight.gpu` downgrades the row to WARN: the operator has
+ * stated the answer, so the unreadable file no longer decides anything for
+ * hindsight, but the voice/compose gates still read it.
+ *
+ * @internal exported for testing
+ */
+export function checkHostCapabilitiesReadable(
+  config: SwitchroomConfig,
+  read: HostCapabilitiesRead = readHostCapabilities(),
+): CheckResult {
+  const name = "host capabilities verdict";
+  const gpuPinned = typeof config.hindsight?.gpu === "boolean";
+
+  if (read.status === "absent") {
+    return {
+      name,
+      status: "ok",
+      detail:
+        `no verdict at ${read.path} — host never probed, so GPU-gated features ` +
+        "(hindsight `--gpus all`, the GPU perf defaults, local voice) stay off",
+      fix: "Run `switchroom setup` to probe the host, or set `hindsight.gpu: true` to force it.",
+    };
+  }
+
+  if (read.status === "unreadable" || read.status === "malformed") {
+    return {
+      name,
+      status: gpuPinned ? "warn" : "fail",
+      detail:
+        `${read.path} is ${read.status} (${read.detail}) — switchroom cannot tell ` +
+        "whether this host has a GPU, so every GPU gate reads false" +
+        (gpuPinned
+          ? `; hindsight is unaffected (\`hindsight.gpu: ${config.hindsight?.gpu}\` pins it) but voice/compose gates still read this file`
+          : ", silently withholding `--gpus all` and HINDSIGHT_API_RERANKER_LOCAL_FP16"),
+      fix:
+        `sudo chown $(id -u):$(id -g) ${read.path} && chmod 600 ${read.path}` +
+        (read.status === "malformed" ? " — then re-run `switchroom setup` to rewrite it" : "") +
+        ". Or set `hindsight.gpu: true|false` in switchroom.yaml to state the answer explicitly.",
+    };
+  }
+
+  const voice = read.caps?.voice;
+  const proven = voice?.gpuPresent === true && voice?.containerToolkit === true;
+  let mode: number | undefined;
+  try {
+    mode = statSync(read.path).mode & 0o777;
+  } catch {
+    mode = undefined;
+  }
+  // The writer uses 0600; anything group/world-writable means something else
+  // has been editing it, which is worth saying out loud even though the read
+  // itself succeeded.
+  const looseWrite = mode !== undefined && (mode & 0o022) !== 0;
+  return {
+    name,
+    status: looseWrite ? "warn" : "ok",
+    detail:
+      `${read.path} readable (mode ${mode === undefined ? "?" : "0" + mode.toString(8)})` +
+      `; GPU passthrough ${proven ? "proven" : "not proven"} ` +
+      `(gpuPresent=${JSON.stringify(voice?.gpuPresent)}, containerToolkit=${JSON.stringify(voice?.containerToolkit)})` +
+      (looseWrite ? " — but the file is group/world-writable" : ""),
+    ...(looseWrite ? { fix: `chmod 600 ${read.path}` } : {}),
+  };
+}
+
 export function checkHindsightConsumer(
   config: SwitchroomConfig,
   opts?: { socketProbe?: (consumerName: string) => "present" | "missing" | "unreachable" },
@@ -1317,10 +1402,21 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
 
   const results: CheckResult[] = [];
 
+  // The persisted GPU/voice verdict gates `--gpus all` and the GPU-only perf
+  // defaults, and an unreadable copy of it used to read exactly like "no GPU".
+  // Nothing checked the file itself until this row.
+  //
+  // Pushed FIRST, before the URL parse and the reachability probe, because
+  // every one of those paths `return`s early. A container that is down (or on
+  // an unparseable URL) is exactly when an operator is reading doctor output,
+  // and the verdict file is a plausible reason the container came back wrong.
+  results.push(checkHostCapabilitiesReadable(config));
+
   // Parse host and port out of the URL
   const match = url.match(/^https?:\/\/([^:/]+):?(\d+)?/);
   if (!match) {
     return [
+      ...results,
       {
         name: "hindsight URL",
         status: "fail",
@@ -1334,6 +1430,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
 
   if (!(await checkTcp(host, port))) {
     return [
+      ...results,
       {
         name: "hindsight reachable",
         status: "fail",

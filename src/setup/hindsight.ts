@@ -7,7 +7,12 @@ import {
   assertClientBudget,
   clientBudgetSeconds,
 } from "../litellm/timeout-budget.js";
-import { loadHostCapabilities } from "./host-capabilities.js";
+import {
+  isDegradedHostCapabilitiesRead,
+  readHostCapabilities,
+  warnDegradedHostCapabilities,
+  type HostCapabilitiesRead,
+} from "./host-capabilities.js";
 import {
   hindsightPerfEnv,
   resolveHindsightPerfOverrides,
@@ -1383,25 +1388,218 @@ export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: stri
  * the schema first (`src/setup/host-capabilities.ts` v1) — they are host
  * hardware facts, not voice settings.
  *
- * Degrading to `false` on a GPU host is safe (CPU reranking, i.e. today);
- * degrading to CPU inside a GPU-enabled container is also safe
- * (cross_encoder.py's own `torch.cuda.is_available()` fallback). The only
- * genuinely bad outcome is emitting `--gpus` where Docker can't honour it,
- * which is precisely what this gate prevents.
+ * Degrading to `false` on a GPU host is NOT free, which is the 2026-07-28
+ * correction to this comment's original claim. It costs the local reranker its
+ * device AND — because they live in `HINDSIGHT_PERF_DEFAULTS_GPU` — the
+ * `RERANKER_LOCAL_FP16` / `RERANKER_LOCAL_BATCH_SIZE` defaults, on the
+ * interactive recall path. Safe to LAUNCH, expensive to run. So the gate's
+ * fail-safe direction is kept, and the silence around it is what changed:
+ * a blind `false` is now reported (see {@link hindsightGpuDecision}) and a
+ * recreate that would drop live GPU is refused (see `assessHindsightGpuDrop`).
  *
- * Both probes are compared with `=== true`, NOT coerced. `loadHostCapabilities`
+ * Both probes are compared with `=== true`, NOT coerced. `readHostCapabilities`
  * does a shape check but no per-field type check, so a hand-edited or corrupt
  * verdict holding the STRING `"false"` would satisfy a truthiness test and emit
  * `--gpus all` on a host that cannot honour it — the precise failure this gate
  * exists to prevent, arrived at through the gate. Anything that is not
  * literally `true` is treated as "not proven", which is the fail-safe reading.
  *
- * @param override Test/caller seam. When omitted the persisted verdict is read.
+ * Autodetect is NOT the only lever. An explicit operator answer — the
+ * `hindsight.gpu` key in switchroom.yaml, or `--gpu`/`--no-gpu` on
+ * `switchroom memory setup` — wins in BOTH directions, so a host whose verdict
+ * file is unreadable (or plain wrong) is never stuck. See
+ * {@link resolveHindsightGpuOverride} / {@link hindsightGpuDecision}.
+ *
+ * @param override Explicit operator answer (flag/yaml), or a test seam. When
+ *   omitted the persisted verdict is read.
  */
 export function hindsightGpuEnabled(override?: boolean): boolean {
   if (override !== undefined) return override;
-  const caps = loadHostCapabilities();
-  return caps?.voice?.gpuPresent === true && caps?.voice?.containerToolkit === true;
+  return hindsightGpuDecision().enabled;
+}
+
+/** Where the effective GPU answer came from. Explicit sources outrank autodetect. */
+export type HindsightGpuSource = "flag" | "config" | "autodetect";
+
+/** An explicit operator answer plus which lever supplied it. */
+export interface HindsightGpuOverride {
+  value: boolean;
+  source: "flag" | "config";
+}
+
+/**
+ * The full GPU answer: the boolean, where it came from, and — crucially —
+ * whether the autodetect that produced it was itself blind.
+ */
+export interface HindsightGpuDecision {
+  /** The effective answer: does this launch get `--gpus all`? */
+  enabled: boolean;
+  source: HindsightGpuSource;
+  /**
+   * True when the answer is `false` from autodetect and the verdict file was
+   * present-but-unusable. The distinguishing fact the old boolean-only gate
+   * threw away: "this host has no GPU" vs "switchroom could not tell".
+   */
+  degraded: boolean;
+  /** The raw verdict read, for messages that must name the actual file. */
+  capabilities: HostCapabilitiesRead;
+  /** One line, operator-facing, explaining WHY the answer is what it is. */
+  reason: string;
+}
+
+/**
+ * Resolve the explicit operator override, if any. Flag beats yaml; both beat
+ * autodetect. `null` means "nobody said", i.e. fall through to the verdict.
+ *
+ * Deliberately total in both directions — an operator who has to force GPU ON
+ * past a bad verdict also has to be able to force it OFF past a good one,
+ * otherwise the "explicit wins" rule is only half true and the drop guard
+ * below would have no legitimate opt-out.
+ */
+export function resolveHindsightGpuOverride(opts: {
+  /** `--gpu` / `--no-gpu` on the CLI. */
+  flag?: boolean;
+  /** `hindsight.gpu` in switchroom.yaml. */
+  config?: boolean;
+}): HindsightGpuOverride | null {
+  if (typeof opts.flag === "boolean") return { value: opts.flag, source: "flag" };
+  if (typeof opts.config === "boolean") return { value: opts.config, source: "config" };
+  return null;
+}
+
+/**
+ * Decide GPU passthrough and explain the decision.
+ *
+ * This is the function that must be used anywhere the answer changes what gets
+ * launched — {@link hindsightGpuEnabled} is the thin boolean view for call
+ * sites that only need the bit.
+ */
+export function hindsightGpuDecision(
+  override?: HindsightGpuOverride | null,
+): HindsightGpuDecision {
+  const capabilities = readHostCapabilities();
+
+  if (override) {
+    const lever = override.source === "flag"
+      ? (override.value ? "--gpu" : "--no-gpu")
+      : `hindsight.gpu: ${override.value}`;
+    return {
+      enabled: override.value,
+      source: override.source,
+      // An explicit answer is not degraded whatever the file says — the
+      // operator overrode the autodetect, which is the whole point.
+      degraded: false,
+      capabilities,
+      reason: `explicit operator override (${lever})`,
+    };
+  }
+
+  // Present-but-unusable verdict: the answer is still the fail-safe `false`
+  // (emitting `--gpus all` blind would hard-fail container create on a
+  // toolkit-less host) but it is now flagged as a BLIND false, not a
+  // negative one.
+  if (isDegradedHostCapabilitiesRead(capabilities)) {
+    warnDegradedHostCapabilities(capabilities);
+    return {
+      enabled: false,
+      source: "autodetect",
+      degraded: true,
+      capabilities,
+      reason:
+        `host-capabilities verdict is ${capabilities.status} ` +
+        `(${capabilities.path}): ${capabilities.detail} — GPU treated as unproven`,
+    };
+  }
+
+  if (capabilities.status === "absent") {
+    return {
+      enabled: false,
+      source: "autodetect",
+      degraded: false,
+      capabilities,
+      reason:
+        `no host-capabilities verdict at ${capabilities.path} ` +
+        "(host never probed — run `switchroom setup`)",
+    };
+  }
+
+  const voice = capabilities.caps?.voice;
+  const enabled = voice?.gpuPresent === true && voice?.containerToolkit === true;
+  return {
+    enabled,
+    source: "autodetect",
+    degraded: false,
+    capabilities,
+    reason: enabled
+      ? "host-capabilities verdict proves a GPU and the nvidia container toolkit"
+      : `host-capabilities verdict does not prove GPU passthrough ` +
+        `(gpuPresent=${JSON.stringify(voice?.gpuPresent)}, ` +
+        `containerToolkit=${JSON.stringify(voice?.containerToolkit)})`,
+  };
+}
+
+/**
+ * One entry of `docker inspect`'s `HostConfig.DeviceRequests` — what
+ * `docker run --gpus all` actually materialises on the container.
+ */
+export interface HindsightDeviceRequest {
+  Driver?: string;
+  Count?: number;
+  DeviceIDs?: string[] | null;
+  Capabilities?: string[][] | null;
+}
+
+/**
+ * Read the live hindsight container's device requests.
+ *
+ * `null` means "could not tell" — no container, docker unavailable, or an
+ * unparseable inspect. Distinct from `[]`, which means the container exists
+ * and requests no devices. The drop guard treats only a NON-EMPTY GPU-shaped
+ * list as "this container currently has GPU", so a `null` never manufactures a
+ * false refusal.
+ */
+export function getHindsightDeviceRequests(
+  container = "switchroom-hindsight",
+): HindsightDeviceRequest[] | null {
+  let out: string;
+  try {
+    out = execFileSync(
+      "docker",
+      ["inspect", "--format", "{{json .HostConfig.DeviceRequests}}", container],
+      { stdio: "pipe", encoding: "utf-8" },
+    );
+  } catch {
+    return null;
+  }
+  const trimmed = out.trim();
+  // Docker renders an unset DeviceRequests as the JSON literal `null`.
+  if (trimmed === "" || trimmed === "null" || trimmed === "<no value>") return [];
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed === null) return [];
+    return Array.isArray(parsed) ? (parsed as HindsightDeviceRequest[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does this device-request list represent live GPU passthrough?
+ *
+ * `--gpus all` materialises as a single entry with `Count: -1` and
+ * `Capabilities: [["gpu"]]`; `--gpus device=0` uses `DeviceIDs` instead. Match
+ * on any of the three shapes rather than on one, so a container launched by an
+ * operator's own `docker run` variant still counts.
+ */
+export function deviceRequestsHaveGpu(reqs: HindsightDeviceRequest[] | null): boolean {
+  if (!reqs || reqs.length === 0) return false;
+  return reqs.some((r) => {
+    const caps = (r.Capabilities ?? []).flat().map((c) => String(c).toLowerCase());
+    if (caps.includes("gpu")) return true;
+    if ((r.Driver ?? "").toLowerCase() === "nvidia") return true;
+    if ((r.DeviceIDs?.length ?? 0) > 0) return true;
+    return (r.Count ?? 0) !== 0;
+  });
 }
 
 /**
