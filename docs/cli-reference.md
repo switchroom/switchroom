@@ -140,7 +140,15 @@ switchroom workspace status <agent>               # git status on the workspace
 ```bash
 switchroom debug turn <agent>                     # Dump the exact prompt layering from the last turn
 switchroom memory setup|search|stats|reflect      # Hindsight memory
+switchroom memory repair --all [--dry-run]        # Rebuild per-bank vector index coverage
 ```
+
+`memory repair` is the fix for a bank whose recall silently under-returns —
+one that arrived already populated (restore, cross-version upgrade,
+vector-extension switch) and so never got its per-`(bank, fact_type)` vector
+indexes. Idempotent, `CREATE INDEX CONCURRENTLY`, safe on a live fleet;
+requires hindsight ≥ 0.8.5. See `docs/operators/hindsight-memory.md`.
+
 
 The progress-card driver also writes a per-agent `card-events.jsonl`
 audit log: every edit, pin, unpin, and tool-label transition the user

@@ -342,6 +342,70 @@ container's `mem_limit` cgroup, so an agent that raises `tmp_size` *and*
 intends to fill it should raise `resources.memory` alongside. Agents pick the
 new size up when their container is recreated; a running container keeps the
 mount it booted with.
+### `switchroom memory repair` — vector index coverage is reachable, and skew is loud
+
+Hindsight creates a bank's per-`(bank, fact_type)` partial vector indexes when
+the bank is created — instant, because it is empty. A bank that arrives
+**already populated** never takes that path: a logical restore, a
+cross-version upgrade, a vector-extension switch. Recall on such a bank does
+not fail. It falls back to a global index plus a post-filter and quietly
+under-returns.
+
+This fleet ran that way. Several banks returned single-digit semantic
+candidates out of a 100-candidate budget for roughly three months, and nothing
+in switchroom noticed, because every surface that could have noticed was
+checking liveness rather than coverage. Upstream shipped detection and repair
+in 0.8.5 (vectorize-io/hindsight#2645) as `hindsight-admin repair-bank`. It
+lived in a venv inside the container at a path no operator would guess. A
+backend capability nobody can reach is the same as not having it.
+
+- **`switchroom memory repair [--bank <id> | --agent <name> | --all] [--schema
+  <s>] [--dry-run]`.** Runs the admin CLI inside the hindsight container.
+  `--agent` resolves the bank id for you, because operators think in agents.
+  Rebuilds use `CREATE INDEX CONCURRENTLY`, so they never block live traffic;
+  the command is idempotent and re-running is the documented retry.
+- **A first-class verb, not a passthrough.** A passthrough is undiscoverable —
+  you have to already know `repair-bank` exists to type it, which is the exact
+  condition that let the outage run for three months — and it cannot preflight:
+  against a pre-0.8.5 server it yields typer's `No such command 'repair-bank'`,
+  which reads like a typo rather than "your image predates the fix". The verb
+  says the real thing.
+- **Not a doctor auto-fix.** `doctor` stays read-only. `CREATE INDEX
+  CONCURRENTLY` across every bank is a mutation on a live database and deserves
+  explicit operator intent. Detection and repair stay split.
+
+### `switchroom doctor` now checks hindsight version skew
+
+`classifyToolContract` is one-directional: it only notices tools switchroom
+expects and the server *lacks*. A server that grew capabilities stays green
+forever — which is how the fleet ran a backend several versions ahead of its
+own captured contract with three MCP tools and `repair-bank` reachable by
+nobody. Nothing in `src/` tracked the upstream version at all.
+
+`HINDSIGHT_MIN_API_VERSION` (`src/memory/hindsight-tools.ts`) now declares the
+version the committed contract was captured from, and doctor compares it to
+the live `GET /version`:
+
+- **older → fail.** The tools and args switchroom sends may not exist here, and
+  `memory repair` is unavailable.
+- **newer → warn.** Not an error (upstream's MCP changes are additive), but the
+  contract is stale by definition and the drift is silent in both directions.
+  The diff is the capability you are not yet using.
+- **unreachable → no row.** The `/health` check already owns "the backend is
+  down"; a second red line for the same outage is noise.
+
+The fixture test asserts the constant equals the snapshot's
+`_meta.hindsight_api_version`, so bumping one without re-capturing the other
+reds the suite — the check cannot silently stop being a check.
+
+### Corrected: 0.8.4 does emit `consolidation.completed`
+
+`docs/operators/hindsight-memory.md` claimed the 🧠 legibility line was dormant
+because the pinned engine does not emit the webhook. It does, from
+`hindsight_api/engine/memory_engine.py`, in both 0.8.4 and 0.8.5. The gap is on
+the switchroom side: nothing registers a subscription and there is no receiver.
+The work required is a subscription plus a receiver, not an engine bump.
+
 ### The hindsight MCP contract is re-pinned to the surface the fleet actually runs
 
 The golden tools/list snapshot had not been refreshed since 2026-06-07. It

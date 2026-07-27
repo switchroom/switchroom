@@ -33,7 +33,7 @@ import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectPro
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
@@ -1374,6 +1374,14 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   if (toolsList.ok) {
     results.push(...classifyToolContract(toolsList.tools));
   }
+
+  // Version skew (2026-07-27). classifyToolContract is one-directional: it only
+  // notices tools switchroom expects and the server LACKS. A server that grew
+  // capabilities stays green forever — which is how the fleet ran a backend
+  // several versions ahead of its own captured contract, with `repair-bank`
+  // and three whole MCP tools reachable by nobody. This is the other direction.
+  const versionRow = await checkHindsightVersion(url);
+  if (versionRow) results.push(versionRow);
 
   // Consumer probe (#1245): broker-fed hindsight needs an
   // `auth.consumers[]` entry + a bound per-consumer socket. Replaces

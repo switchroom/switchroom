@@ -75,6 +75,29 @@ export interface HindsightToolSpec {
 }
 
 /**
+ * The hindsight API version the committed contract was captured from, and the
+ * FLOOR switchroom requires.
+ *
+ * A floor, not an equality pin, and the distinction is deliberate:
+ *  - **Below it** is a hard problem. The snapshot (and therefore
+ *    `EXPECTED_HINDSIGHT_TOOLS`, the shim's fallback manifest, and every arg
+ *    the CLI sends) describes a surface the running server may not have, and
+ *    `hindsight-admin repair-bank` — the only escape hatch for a bank with
+ *    missing per-(bank, fact_type) vector-index coverage — does not exist
+ *    before 0.8.5.
+ *  - **Above it** is not an error, because upstream's MCP changes have been
+ *    additive. It IS a staleness signal: a newer server may advertise tools and
+ *    props the snapshot has never heard of, and a capability switchroom cannot
+ *    see is a capability the fleet does not have. Not hypothetical — the
+ *    snapshot sat weeks stale while hiding three whole tools.
+ *
+ * `tests/memory.hindsight-contract.fixture.test.ts` asserts this equals the
+ * snapshot's `_meta.hindsight_api_version`, so the two cannot drift apart:
+ * bumping one without re-capturing the other reds the suite.
+ */
+export const HINDSIGHT_MIN_API_VERSION = "0.8.5";
+
+/**
  * The hindsight MCP tools switchroom calls (TS callers, the prompt guidance,
  * and the user-profile-refresh hook), with the args the server marks required.
  * `required` is cross-checked against the golden snapshot by the fixture test —

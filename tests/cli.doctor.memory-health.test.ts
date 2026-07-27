@@ -21,8 +21,13 @@ import {
   CONSOLIDATION_BACKLOG_FAIL,
   type AdvertisedTool,
   MIN_HINDSIGHT_SHM_BYTES,
+  classifyHindsightVersionSkew,
+  checkHindsightVersion,
 } from "../src/cli/doctor-memory.js";
-import { EXPECTED_HINDSIGHT_TOOLS } from "../src/memory/hindsight-tools.js";
+import {
+  EXPECTED_HINDSIGHT_TOOLS,
+  HINDSIGHT_MIN_API_VERSION,
+} from "../src/memory/hindsight-tools.js";
 
 /** The golden snapshot, reshaped into the advertised-tool form the doctor probe
  *  produces — so the unit test exercises the classifier against REAL server
@@ -568,5 +573,57 @@ describe("hindsight dual-writer + LiteLLM silent-outage classifiers (2026-07-19)
     const results = checkHindsightContainerHealth({ exec });
     expect(results.find((r) => r.name === "hindsight network mode")?.status).toBe("fail");
     expect(results.find((r) => r.name === "hindsight LiteLLM reachability")?.status).toBe("fail");
+  });
+});
+
+/**
+ * Version skew. `classifyToolContract` is one-directional — it only notices
+ * tools switchroom expects and the server lacks — so a server that grew
+ * capabilities stays green forever. That one-way blindness is how a
+ * three-month recall outage and an unreachable `repair-bank` went unnoticed.
+ */
+describe("hindsight version skew", () => {
+  it("is ok when the live version matches the captured contract", () => {
+    const r = classifyHindsightVersionSkew(HINDSIGHT_MIN_API_VERSION);
+    expect(r?.status).toBe("ok");
+  });
+
+  it("FAILS on a server older than the contract, and says repair is unavailable", () => {
+    const r = classifyHindsightVersionSkew("0.8.4");
+    expect(r?.status).toBe("fail");
+    expect(r?.detail).toContain("0.8.4");
+    expect(r?.detail).toMatch(/repair/i);
+    expect(r?.fix).toBeTruthy();
+  });
+
+  it("WARNS on a server newer than the contract — a capability nobody can see", () => {
+    const r = classifyHindsightVersionSkew("0.9.0");
+    expect(r?.status).toBe("warn");
+    expect(r?.detail).toContain("0.9.0");
+    // The fix must name what to re-capture, not just complain.
+    expect(r?.fix).toContain("hindsight-tools-list.snapshot.json");
+  });
+
+  it("orders numerically, so 0.8.10 is NEWER than a 0.8.9 contract (not older)", () => {
+    // Guards the lexical-compare bug: "0.8.10" < "0.8.9" as strings.
+    expect(classifyHindsightVersionSkew("0.8.10")?.status).not.toBe("fail");
+  });
+
+  it("emits NO row when the version probe fails — /health already owns the outage", () => {
+    expect(classifyHindsightVersionSkew(null)).toBeNull();
+  });
+
+  it("checkHindsightVersion probes /version and classifies it end to end", async () => {
+    const impl = (async () =>
+      ({ ok: true, status: 200, json: async () => ({ api_version: "0.8.4" }) }) as unknown as Response) as unknown as typeof fetch;
+    const r = await checkHindsightVersion("http://127.0.0.1:18888/mcp/", { fetchImpl: impl });
+    expect(r?.status).toBe("fail");
+  });
+
+  it("checkHindsightVersion returns null (not a throw) when hindsight is unreachable", async () => {
+    const boom = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    expect(await checkHindsightVersion("http://127.0.0.1:18888/mcp/", { fetchImpl: boom })).toBeNull();
   });
 });

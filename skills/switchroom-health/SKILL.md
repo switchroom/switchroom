@@ -80,6 +80,19 @@ done
 
 # Check Hindsight MCP reachable
 switchroom memory search "test" --agent assistant 2>/dev/null && echo "OK: memory search works" || echo "WARN: memory search failed"
+
+# Reachable is NOT healthy. A bank that arrived already populated (restore,
+# cross-version upgrade, vector-extension switch) never got its per-bank vector
+# indexes, so recall falls back to a global index + post-filter and silently
+# UNDER-RETURNS — a search still "works", it just returns almost nothing.
+# This fleet ran that way for ~3 months. Check coverage, not just liveness.
+# Exit 0 = coverage complete, 2 = indexes missing, 1 = the check itself failed.
+switchroom memory repair --all --dry-run >/tmp/sr-cov.txt 2>&1
+case $? in
+  0) echo "OK: vector index coverage complete" ;;
+  2) echo "FAIL: vector index coverage MISSING — recall is under-returning; run 'switchroom memory repair --all'"; tail -2 /tmp/sr-cov.txt ;;
+  *) echo "WARN: coverage check could not run (hindsight < 0.8.5, container down, or docker unavailable)"; tail -2 /tmp/sr-cov.txt ;;
+esac
 ```
 
 ## Step 3 — Interpret and report
@@ -108,6 +121,8 @@ For common failures, give the exact fix:
 | Fleet on the wrong account | `switchroom auth use <label>` (fleet-wide) or `switchroom auth agent override <agent> <label>` (one agent) |
 | Container unhealthy | `docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml restart switchroom-<name>` |
 | Missing .mcp.json | `switchroom apply` (full reconcile + rewrite compose; bring up via `docker compose ... up -d`) or `switchroom agent reconcile <name>` (targeted) |
+| Recall returns few/no results though hindsight is up (esp. after a restore or upgrade) | Missing per-bank vector index coverage. `switchroom memory repair --all --dry-run` to confirm, then `switchroom memory repair --all`. Idempotent, uses `CREATE INDEX CONCURRENTLY`, safe on a live fleet. Requires hindsight ≥ 0.8.5. |
+| `switchroom doctor` shows a red/amber `hindsight version` line | The running backend drifted from the MCP contract switchroom captured. Older → bump the pinned image (`switchroom memory --update`). Newer → re-capture `tests/fixtures/hindsight-tools-list.snapshot.json`; until then any tool added upstream is invisible to agents. |
 | Bot token unresolved | Check vault: `switchroom vault list` |
 | Memory unreachable | Check Hindsight MCP server is running |
 
