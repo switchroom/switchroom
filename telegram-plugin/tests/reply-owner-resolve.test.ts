@@ -963,9 +963,17 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     expect(r.bypasses).toBeGreaterThan(0)
     // …and specifically, many cases must win their bypass on the WIDENED,
     // model-steerable `origin`/`quoted` tiers — the thing being vouched for.
-    // Currently exactly 16 of the 486 cases do (no live turn, handback clear,
-    // a fresh-or-unbounded latest-ended id, and the steered id equal to it).
-    expect(r.modelTierBypasses).toBeGreaterThanOrEqual(16)
+    // Exactly 8 of the 486 cases do: no live turn, handback clear, a FRESH
+    // latest-ended id, and the steered id equal to it.
+    //
+    // This floor was 16 before #3725. The other 8 were the `latestEndedAgeMs
+    // == null` (unbounded) shapes, which corroborated a bypass off an anchor
+    // that had never ended. #3725 makes the latest-ended lookup `endedOnly`, so
+    // the age is always a real number and an explicit null age fails CLOSED —
+    // those 8 shapes are now correctly unreachable. Lowering the floor here is
+    // recording that narrowing, not conceding it: the property assertion above
+    // (`violations` empty) is unchanged and still passes.
+    expect(r.modelTierBypasses).toBeGreaterThanOrEqual(8)
   })
 
   // NON-VACUITY, asserted deterministically rather than demonstrated by hand:
