@@ -175,6 +175,14 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
+      "HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING",
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
+      "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
+      "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
+      "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
+      "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -313,7 +321,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these thirteen keys, by name", () => {
+  it("is overridable on exactly these twenty-two keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -323,6 +331,7 @@ describe("operator override wins", () => {
     expect([...HINDSIGHT_PERF_ENV_KEYS].sort()).toEqual([
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
+      "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
       "HINDSIGHT_API_LLM_MAX_CONCURRENT",
@@ -331,10 +340,17 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_LLM_STRICT_SCHEMA",
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
+      "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
+      "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
       "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
+      "HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING",
       "HINDSIGHT_API_RERANKER_LOCAL_FP16",
+      "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
     ]);
   });
 

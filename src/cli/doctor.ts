@@ -31,6 +31,7 @@ import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
+import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
@@ -1011,6 +1012,52 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
  *
  * @internal exported for testing
  */
+/**
+ * FAIL when `hindsight.env` names a key switchroom does not manage.
+ *
+ * The resolvers skip unmanaged keys deliberately (a blanket `HINDSIGHT_API_*`
+ * passthrough would collide with vars `startHindsight()` derives itself), but
+ * the skip is SILENT. That is the worst failure mode available: the line is in
+ * version control, it reads as configuration, and it does nothing. The
+ * operator's mental model of why memory behaves as it does is now wrong, and
+ * nothing anywhere says so.
+ *
+ * FAIL rather than WARN because there is no benign reading of the state. A key
+ * here is either a typo or a knob the operator believes is applied; both are
+ * defects, and both are silent without this row.
+ *
+ * @internal exported for testing
+ */
+export function checkHindsightEnvKeysAreManaged(
+  config: SwitchroomConfig,
+): CheckResult {
+  const unmanaged = findUnmanagedHindsightEnvKeys(config.hindsight?.env);
+  if (unmanaged.length === 0) {
+    return {
+      name: "hindsight env keys",
+      status: "ok",
+      detail:
+        Object.keys(config.hindsight?.env ?? {}).length === 0
+          ? "no `hindsight.env` overrides set"
+          : `all ${Object.keys(config.hindsight!.env!).length} \`hindsight.env\` key(s) are managed`,
+    };
+  }
+  return {
+    name: "hindsight env keys",
+    status: "fail",
+    detail:
+      `\`hindsight.env\` sets ${unmanaged.length} key(s) switchroom does not manage, ` +
+      `so they are silently discarded and the container runs switchroom's value: ` +
+      unmanaged.join(", "),
+    fix:
+      "Remove the key(s), fix the spelling, or promote them to managed keys in " +
+      "src/setup/hindsight-perf-defaults.ts (HINDSIGHT_PERF_DEFAULTS_UNGATED / " +
+      "HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS) so they have a declarative channel. " +
+      "The managed set is HINDSIGHT_PERF_ENV_KEYS plus HINDSIGHT_PG_ENV_KEYS; " +
+      "the `hindsight.env` description in src/config/schema.ts lists them.",
+  };
+}
+
 export function checkHindsightConsumer(
   config: SwitchroomConfig,
   opts?: { socketProbe?: (consumerName: string) => "present" | "missing" | "unreachable" },
@@ -1331,6 +1378,11 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // the legacy env-leak probe (the OpenAI-key shape it watched for
   // is no longer in use).
   results.push(checkHindsightConsumer(config));
+
+  // A `hindsight.env` key switchroom does not manage is DISCARDED silently —
+  // the operator commits a line and believes they changed something they did
+  // not. Make it loud.
+  results.push(checkHindsightEnvKeysAreManaged(config));
 
   // Backend health (#outage 2026-06-06): reachability over MCP is NOT enough —
   // the container can be up and serving MCP while every write silently fails

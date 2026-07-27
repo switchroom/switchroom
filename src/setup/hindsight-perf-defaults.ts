@@ -59,6 +59,8 @@
  * src/setup/hindsight-reranker-budget.test.ts:111-118.
  */
 
+import { HINDSIGHT_PG_ENV_KEYS } from "./hindsight-pg-defaults.js";
+
 /**
  * Host capabilities that gate a performance default.
  *
@@ -398,6 +400,174 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
  */
 export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
 
+// ─── Container env defaults promoted from bare constants in hindsight.ts ────
+//
+// Every constant below was emitted unconditionally on BOTH launch paths (the
+// `docker run` argv and the compose snippet) from a literal in hindsight.ts,
+// and was not a member of HINDSIGHT_PERF_ENV_KEYS. That combination is the
+// silent-drop defect: `resolveHindsightPerfOverrides` skips any key outside
+// the managed set, so an operator's `hindsight.env` line for one of these was
+// discarded with no error and no warning.
+//
+// They are shipped DEFAULTS, not local tuning, so they also belong in a place
+// a reader of switchroom.yaml can discover. Values are unchanged; what changes
+// is that they now have a declarative channel. Ungated for the same reason
+// MAX_OBSERVATIONS_PER_SCOPE is: the previous emission was unconditional, so
+// gating them would silently revert hosts to upstream's defaults.
+
+/**
+ * Reranker smart-defaults (v0.13.22).
+ *
+ * The hindsight server's cross-encoder reranker is the single biggest
+ * latency contributor on the recall path — 87% of p50 5.6s on the
+ * 2026-05-24 fleet audit. Each of these knobs has a vendor default that
+ * is sub-optimal for switchroom's workload (CPU-only, shared host,
+ * Telegram-shaped concurrency); we override to the optimal value out of
+ * the box so a fresh `switchroom setup` produces a fast hindsight
+ * without any operator tuning.
+ *
+ * - BUCKET_BATCHING: vendor default `false`. Vendor's own config.py
+ *   comment promises "36-54% speedup, quality-identical" by sorting
+ *   candidate pairs by length to avoid padding waste. Pure win on CPU.
+ *
+ * - MAX_CANDIDATES: vendor default 300. At our `recallBudget=low`
+ *   ~100 candidates feed in and we cap to 12 final memories; scoring
+ *   300 wastes ~50% of rerank CPU on candidates that will never make
+ *   the top-N.
+ *
+ * - LOCAL_MAX_CONCURRENT: vendor default 4. With 9 always-on agents
+ *   that's up to 36 simultaneous CPU-bound rerank tasks on a shared
+ *   16-core host — thrashes. Cap at 2 leaves headroom for burst.
+ *
+ * - RECALL_MAX_CONCURRENT: vendor default 32. Sized for a dedicated
+ *   hindsight box; switchroom is co-tenant with the fleet, hostd,
+ *   brokers, etc. 8 matches realistic concurrency without lock
+ *   contention.
+ *
+ * All four are operator-overridable declaratively through `hindsight.env`
+ * (they are members of {@link HINDSIGHT_PERF_DEFAULTS_UNGATED}) — but they
+ * should never NEED tuning for a single-host fleet install.
+ *
+ * They previously lived as bare constants in `hindsight.ts`, emitted
+ * unconditionally on both launch paths and absent from
+ * {@link HINDSIGHT_PERF_ENV_KEYS}, so a `hindsight.env` line for any of them
+ * was silently discarded while reading, in yaml, as durable config. The doc
+ * comment here used to name "editing the generated compose snippet or the
+ * `docker run -e ...` flags" as the recourse — i.e. it documented the exact
+ * imperative state the next `switchroom apply` throws away.
+ */
+export const HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING = "true";
+export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 150;
+// Vendor default 4. v0.13.22 dropped this to 2 paired with the now-
+// reverted `--cpus=2.0` CPU cap; with CPU restored, 4-way concurrency
+// is the right knob — lets 4 fleet agents' recalls overlap without
+// thrashing per-pair compute (which is the actual bottleneck, not
+// task-level contention).
+export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4;
+export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
+
+/**
+ * Reflect wall-clock timeout. Vendor default is 300s. Mental-model
+ * refresh re-runs the model's `source_query` through the agentic reflect
+ * loop; on a large bank (observed: 12-13k observations) that legitimately
+ * exceeds 300s, so the refresh times out and the model stays stale —
+ * which is the main reason user-profile models go unpopulated on
+ * high-volume agents (2026-06-19 fleet: refresh timeouts across 8 banks).
+ * 600s lets large-bank refreshes complete. Trade-off: an interactive
+ * `reflect` query also gets the longer ceiling, but those rarely approach
+ * 300s, so the net is strictly more models successfully refreshing.
+ */
+export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
+
+/**
+ * Per-round memory scope for one consolidation op (upstream default 1000;
+ * switchroom held this at 100 from the 2026-07-06 quota throttle).
+ *
+ * ## This is a CORRECTNESS knob, not only a throughput one
+ *
+ * The engine SKIPS mental-model refresh entirely on any round that hits this
+ * limit — `engine/consolidation/consolidator.py`:
+ *
+ * ```python
+ * if hit_round_limit:
+ *     stats["mental_models_refreshed"] = 0
+ *     logger.info(f"[CONSOLIDATION] bank={bank_id} skipping mental model refresh "
+ *                 f"(round limit hit, re-queued)")
+ * ```
+ *
+ * That is deliberate upstream behaviour (the next round will handle it), but
+ * it composes badly with a low limit and a large backlog: a bank whose
+ * backlog never drops below the limit hits the limit on EVERY round and
+ * therefore NEVER refreshes its mental models. At 100 that described 4 of the
+ * 6 banks on this fleet (backlogs measured 2026-07-27: 29,625 / 6,238 / 328 /
+ * 165 / 96 / 83 — the top four are all above 100 and the largest was still
+ * rising round over round). Mental models are the standing-answer layer
+ * agents rely on, so "silently never refreshed" is a correctness failure, not
+ * a slow drain.
+ *
+ * 500 is a 5x scope bump with the same shape of bound — it is still a bound,
+ * so a runaway bank still re-queues rather than monopolising a slot, and the
+ * consolidation prompt size per LLM call is unchanged (that is
+ * `LLM_BATCH_SIZE`, derived from the context window). What it costs is a
+ * longer hold on a worker slot per round; what it buys is that a mid-sized
+ * bank now finishes a round and refreshes.
+ *
+ * Raising this was gated on consolidation leaving the shared Anthropic quota
+ * — see the RESTORE CONDITION in the block above.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 500;
+
+/**
+ * Per-type worker slot CEILING for consolidation — upstream
+ * `HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT`.
+ *
+ * ## Ceiling vs floor — two different knobs with confusingly similar names
+ *
+ * Upstream's own `config.py` warns about this, and switchroom has been
+ * silently inheriting the wrong one:
+ *
+ *   - {@link HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}
+ *     (`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS`, 1) is the RESERVED
+ *     FLOOR: slots consolidation is always guaranteed.
+ *   - THIS (`..._SLOT_LIMIT`) is the CEILING: the most slots consolidation may
+ *     hold at once, reserved and shared combined
+ *     (`WORKER_SLOT_LIMIT_TYPES` in `config.py`, whose consolidation entry
+ *     defaults to `4`).
+ *
+ * switchroom never emitted the ceiling, so every install has silently run on
+ * upstream's 4 — and on this fleet that ceiling was observed fully saturated
+ * (`consolidation=4/1(avail=0,cap=4)`, four banks consolidating with more
+ * queued) while only 5 of the worker's 10 total slots were in use. Five idle
+ * slots that consolidation was forbidden from touching.
+ *
+ * (The 4 default and the 10-slot worker pool are pinned by
+ * tests/docker/hindsight-recall-isolation-patches.test.ts, which also proves
+ * `validate()` rejects a ceiling above the pool or below this type's own
+ * reservation — so this value must sit between MAX_SLOTS and 10.)
+ *
+ * 6 of `DEFAULT_WORKER_MAX_SLOTS` = 10 leaves 4 slots for every other op type
+ * (retain, refresh_mental_model, graph_maintenance, import_documents — all
+ * uncapped upstream) while letting consolidation use the idle capacity.
+ *
+ * Be honest about what this buys: consolidation LLM calls are still
+ * serialised by the `CONSOLIDATION_LLM_MAX_CONCURRENT` semaphore (default 1),
+ * so 6 slots do NOT mean 6 concurrent LLM calls. What they mean is that six
+ * banks' non-LLM stages pipeline, and that a small bank is no longer stuck
+ * behind big ones — the claim query is a flat `ORDER BY created_at` across
+ * all banks unless a priority map is configured (`ops_postgresql.py`
+ * `claim_tasks`; see `HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY` in
+ * hindsight-perf-defaults.ts).
+ *
+ * Emitted explicitly rather than left to the upstream default so the value is
+ * legible in `docker inspect` and cannot move under us on an image bump.
+ * Subject to the RESTORE CONDITION above: back to 1 if consolidation returns
+ * to `provider: claude-code`.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT = 6;
+
+/** Reserved consolidation slot FLOOR — see SLOT_LIMIT above for floor-vs-ceiling. */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -420,6 +590,38 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
   [
     "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
     String(HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE),
+  ],
+  [
+    "HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING",
+    HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING,
+  ],
+  [
+    "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
+    String(HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES),
+  ],
+  [
+    "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
+    String(HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT),
+  ],
+  [
+    "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
+    String(HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT),
+  ],
+  [
+    "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
+    String(HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S),
+  ],
+  [
+    "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+    String(HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS),
+  ],
+  [
+    "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
+    String(HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT),
+  ],
+  [
+    "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
+    String(HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND),
   ],
 ];
 
@@ -585,4 +787,36 @@ export function hindsightPerfEnv(
     out.push([key, overrides.get(key)!]);
   }
   return out;
+}
+
+// ─── Loud failure for a key that cannot be reached ──────────────────────────
+
+/**
+ * Names in `hindsight.env` that switchroom does NOT manage, and therefore
+ * silently discards.
+ *
+ * `resolveHindsightPerfOverrides` skips any key outside
+ * {@link HINDSIGHT_PERF_ENV_KEYS} (and `hindsightPgEnvPairs` does the same for
+ * {@link HINDSIGHT_PG_ENV_KEYS}). That skip is correct — a blanket
+ * `HINDSIGHT_API_*` passthrough would collide with the vars `startHindsight()`
+ * derives itself — but it is SILENT, which is the worst available failure
+ * mode: the operator writes a line, commits it, and believes they changed
+ * something they did not. No error, no warning, and the value in the container
+ * is still switchroom's.
+ *
+ * This is the same defect class as a plugin-side literal that `switchroom
+ * apply` reverts: config that reads as durable and isn't. Detection is the
+ * durable half — the key list will keep growing, so a mechanism that reports
+ * "you wrote a key nothing reads" beats enumerating today's gaps.
+ *
+ * Pure and total: takes the raw `hindsight.env` record, returns the offending
+ * keys in sorted order (empty when everything is managed). The caller decides
+ * how loud to be; `switchroom doctor` renders it as a FAIL.
+ */
+export function findUnmanagedHindsightEnvKeys(
+  configEnv?: Record<string, string | number | boolean> | undefined,
+): string[] {
+  return Object.keys(configEnv ?? {})
+    .filter((key) => !HINDSIGHT_PERF_ENV_KEYS.has(key) && !HINDSIGHT_PG_ENV_KEYS.has(key))
+    .sort();
 }
