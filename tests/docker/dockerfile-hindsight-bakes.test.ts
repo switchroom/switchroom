@@ -302,83 +302,50 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
-  it("keeps the max_turns/ToolSearch standard-call fix (assert-guarded, fail-loud)", () => {
-    // The STANDARD LLM-call path in claude_code_llm.py builds
-    // ClaudeAgentOptions with allowed_tools=[] but WITHOUT tools=[], so
-    // the built-in CLI tools stay loaded and ToolSearch burns the single
-    // max_turns=1 turn → "Reached maximum number of turns (1)" → wasted
-    // retries / failed memory ops. This build-time patch brings the
-    // standard path to parity with the tool-calling path (tools=[] +
-    // max_turns=2). It is self-verifying (asserts the anchor exists once
-    // before patching, re-asserts the result). Guard the patch block so
-    // nobody silently deletes it and reintroduces the max_turns wall.
-
-    // The exact-once assert on the pre-patch anchor (fail-loud on drift).
-    expect(dockerfile).toMatch(
-      /assert s\.count\(OLD\) == 1, "switchroom max_turns\/ToolSearch standard-call fix:/,
-    );
-    // The OLD anchor reconstructs the upstream (pre-patch) standard-call shape.
-    expect(dockerfile).toMatch(
-      /max_turns=1,  # Single-turn for API-style interactions/,
-    );
-    // The NEW replacement adds tools=[] + max_turns=2 on the standard path.
-    expect(dockerfile).toMatch(
-      /tools=\[\],  # switchroom: disable built-in CLI tools so ToolSearch/,
-    );
-    expect(dockerfile).toMatch(
+  // ---------------------------------------------------------------------
+  // RETIRED PATCHES — dropped in the v0.8.4 -> v0.8.5 base bump because
+  // upstream now does the same thing natively. These are asserted ABSENT
+  // rather than merely deleted: a patch that upstream has adopted must not
+  // silently reappear on a future rebase, where it would either fail its
+  // own exact-once anchor assert (breaking the build) or double-apply.
+  //
+  //  - max_turns/ToolSearch standard-call fix: 0.8.5 ships `tools=[]` on the
+  //    standard path itself (claude_code_llm.py, alongside its own
+  //    `max_turns=1  # Single-turn for API-style interactions`). With the
+  //    built-in tools unloaded ToolSearch cannot fire, so our extra turn of
+  //    headroom is dead weight.
+  //  - unit_entities FK-race fix: upstream #2662 adds bulk_reassert_entities
+  //    (engine/db/ops_postgresql.py) + reassert_entities_batch
+  //    (entity_resolver.py). Strictly better than ours: it row-LOCKS the
+  //    surviving parents so the pruner blocks, where ours only resurrected
+  //    the parent after the fact.
+  //  - duplicate-ANN-scan fix: 0.8.5 DELETED the `semantic_seeds` parameter
+  //    from LinkExpansionRetriever.retrieve() and documented the removal
+  //    ("Graph traversal deliberately chooses its own bounded seeds ...
+  //    reusing their results would silently change graph-retrieval recall
+  //    behavior"). Our patch's stated safety premise — that the parameter
+  //    already exists and is already honoured — is now false, so re-adding
+  //    it would fight a deliberate upstream design decision. The latency it
+  //    bought is largely absorbed by the per-bank vector indexes that
+  //    `hindsight-admin repair-bank` (upstream #2645) now maintains.
+  // ---------------------------------------------------------------------
+  it("does NOT carry the retired max_turns/ToolSearch patch (upstream ships tools=[])", () => {
+    expect(dockerfile).not.toMatch(/switchroom max_turns\/ToolSearch standard-call fix/);
+    expect(dockerfile).not.toMatch(
       /max_turns=2,  # switchroom: headroom so a stray ToolSearch turn/,
-    );
-    // Post-replace re-assertions must be present (verification-on-build).
-    expect(dockerfile).toMatch(
-      /assert "            tools=\[\],  # switchroom" in t,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "max_turns=1,  # Single-turn" not in t,/,
     );
   });
 
-  it("keeps the unit_entities FK-race fix (assert-guarded, fail-loud)", () => {
-    // Upstream v0.8.4 defect: retain Phase-1 (entity resolution) and Phase-2
-    // (the unit_entities child insert) run in SEPARATE committed transactions.
-    // graph_maintenance.prune_orphan_entities can delete an entity in that
-    // window (it momentarily has no unit_entities reference), so Phase-2's
-    // bulk_insert_unit_entities then violates fk_unit_entities_entity_id_entities
-    // — deterministic, non-retryable, memory silently dropped (fires on
-    // session_handoff re-ingest). The build-time patch makes Phase-2 re-assert
-    // (resurrect) the parent entity row in the SAME transaction as the child
-    // insert (INSERT ... ON CONFLICT DO NOTHING), threading the entity metadata
-    // Phase-1 already holds. Proven 15/15 RED -> 0/15 with memories persisted on
-    // the real retain orchestrator path. Self-verifying (asserts each anchor
-    // exactly once against unmodified upstream v0.8.4 before patching, re-asserts
-    // the result). Guard the patch block so nobody silently deletes it.
+  it("does NOT carry the retired unit_entities FK-race patch (upstream #2662)", () => {
+    expect(dockerfile).not.toMatch(/switchroom hindsight FK-race patch/);
+    expect(dockerfile).not.toMatch(/reassert_entities/);
+    expect(dockerfile).not.toMatch(/entity_records/);
+  });
 
-    // The exact-once anchor guard (fail-loud on upstream drift).
-    expect(dockerfile).toMatch(
-      /assert n == 1, \(\s*\n\s*f"switchroom hindsight FK-race patch: anchor found \{n\}x/,
-    );
-    // The new idempotent same-txn re-assert op.
-    expect(dockerfile).toMatch(/async def reassert_entities\(/);
-    expect(dockerfile).toMatch(/INSERT INTO \{table\} \(id, bank_id, canonical_name\)/);
-    expect(dockerfile).toMatch(/ON CONFLICT DO NOTHING/);
-    // The entity_records threading param on the link path.
-    expect(dockerfile).toMatch(
-      /entity_records: dict\[str, dict\] \| None = None,/,
-    );
-    // The orchestrator wires entity_records from the Phase-1 result into Phase-2.
-    expect(dockerfile).toMatch(
-      /entity_records=phase1\.entities\.entity_records/,
-    );
-    // Post-replace re-assertions must be present (verification-on-build).
-    expect(dockerfile).toMatch(
-      /assert "async def reassert_entities\(" in ops_new,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "entity_records\.get\(str\(eid\)\)" in er_new,/,
-    );
-    // The success line proves the block ran to completion.
-    expect(dockerfile).toMatch(
-      /switchroom hindsight unit_entities FK-race patch: reassert_entities \+ entity_records threading applied/,
-    );
+  it("does NOT carry the retired duplicate-ANN-scan patch (upstream removed semantic_seeds)", () => {
+    expect(dockerfile).not.toMatch(/duplicate-ANN-scan/);
+    expect(dockerfile).not.toMatch(/semantic_seeds/);
+    expect(dockerfile).not.toMatch(/_find_semantic_seeds/);
   });
 
   it("keeps the cross-encoder saturation fix (assert-guarded, fail-loud)", () => {
@@ -528,76 +495,6 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(/assert "compound_fragments" not in pg,/);
     expect(dockerfile).toMatch(
       /switchroom hindsight BM25 compound-token patch: intact compound tokens appended/,
-    );
-  });
-
-  it("keeps the duplicate-ANN-scan fix (assert-guarded, fail-loud)", () => {
-    // retrieve_all_fact_types_parallel ran the vector-similarity scan twice per
-    // recall: Step 2's semantic arm, then `semantic_seeds=None` into the graph
-    // retriever, whose _find_semantic_seeds issues its own
-    // `ORDER BY embedding <=> $1::vector LIMIT $5` per fact type — serialized
-    // behind Step 2's connection block. The patch threads Step 2's rows through
-    // as the seeds. Outcome coverage lives in hindsight-search-patches.test.ts.
-
-    // The exact-once anchor guards (fail-loud on upstream drift), one per site.
-    expect(dockerfile).toMatch(
-      /switchroom hindsight duplicate-ANN-scan patch: retrieve_all_fact_types_parallel anchor found \{n\}x/,
-    );
-    expect(dockerfile).toMatch(
-      /switchroom hindsight duplicate-ANN-scan patch: Step 2 preamble anchor found \{n\}x/,
-    );
-    expect(dockerfile).toMatch(
-      /switchroom hindsight duplicate-ANN-scan patch: Step 3 retriever\.retrieve call site anchor found \{n\}x/,
-    );
-
-    // The mirrored seed constants are only correct while link_expansion still
-    // calls _find_semantic_seeds with them — asserted against that file at
-    // build time, so an upstream retune fails the build rather than silently
-    // deriving a different seed set.
-    expect(dockerfile).toMatch(/_GRAPH_SEED_LIMIT = 20/);
-    expect(dockerfile).toMatch(/_GRAPH_SEED_MIN_SIMILARITY = 0\.3/);
-    expect(dockerfile).toContain(
-      String.raw`assert "                    limit=20,\n                    threshold=0.3,\n" in le,`,
-    );
-    // …and only correct while the seeds are still consumed by id alone, which
-    // is what makes "same id set" the right equivalence relation.
-    expect(dockerfile).toMatch(
-      /assert "seed_ids = list\(\{s\.id for s in all_seeds\}\)" in le,/,
-    );
-    // …and while the receiving branch still honours the parameter at all.
-    expect(dockerfile).toMatch(
-      /assert "            if semantic_seeds:\\n                all_seeds = list\(semantic_seeds\)\\n" in le,/,
-    );
-
-    // Correctness-first fallbacks: decline to derive whenever the arm's pool is
-    // narrower than the seed query's, or the arm's trim may have cut seeds.
-    expect(dockerfile).toMatch(
-      /if arm_min_similarity > _GRAPH_SEED_MIN_SIMILARITY:\n +return None/,
-    );
-    expect(dockerfile).toMatch(
-      /if len\(seeds\) < _GRAPH_SEED_LIMIT and len\(seeds\) == len\(ranked\) and len\(ranked\) >= arm_limit:/,
-    );
-    // Sorted explicitly: no new dependence on UNION ALL row order.
-    expect(dockerfile).toMatch(
-      /ranked = sorted\(semantic_results, key=lambda r: r\.similarity, reverse=True\)/,
-    );
-
-    // Scope guard: this patch does NOT thread temporal seeds. Step 2's temporal
-    // rows are coverage-selected and upstream passes none, so threading them
-    // would ADD seeds rather than reproduce upstream's graph output.
-    expect(dockerfile).toMatch(
-      /assert t\.count\("temporal_seeds=None,"\) == 1,/,
-    );
-
-    // Post-replace re-assertions (verification-on-build), including that no
-    // `semantic_seeds=None` call site survives and that the result still parses.
-    expect(dockerfile).toMatch(/assert "def _graph_semantic_seeds\(" in t,/);
-    expect(dockerfile).toMatch(
-      /assert "            semantic_seeds=None,\\n" not in t,/,
-    );
-    expect(dockerfile).toMatch(/compile\(t, str\(f\), "exec"\)/);
-    expect(dockerfile).toMatch(
-      /switchroom hindsight duplicate-ANN-scan patch: graph expansion now seeds off Step 2's semantic arm/,
     );
   });
 
