@@ -62,7 +62,12 @@ import {
   DEFAULT_SUPERSEDE_TTL_MS,
   type FlushedTurnSupersedeRegistry,
 } from '../flushed-turn-supersede.js'
-import { decideAnswerLatchSuppression, type ReplyOwnerTier } from '../reply-owner-resolve.js'
+import {
+  decideAnswerLatchSuppression,
+  decideContentGateBypass,
+  type ReplyOwnerTier,
+  type ReplyOwnerCandidates,
+} from '../reply-owner-resolve.js'
 import { deriveTelegraphTitle } from '../telegraph.js'
 import {
   mayInjectListenButton,
@@ -726,7 +731,12 @@ export interface SendReplyGatewayDeps {
   assertSendable(f: string): void
   statusKey(chatId: string, threadId?: number | null): string
   streamKey(chatId: string, threadId?: number | null): string
-  resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): { turn: CurrentTurn | null; tier: ReplyOwnerTier }
+  /** Resolves the owner turn AND returns the CANDIDATE SET it was derived from.
+   *  The candidates are load-bearing, not diagnostics: `decideContentGateBypass`
+   *  corroborates a model-steerable `origin`/`quoted` attribution against the
+   *  framework-derived `latestEndedTurnId` inside them before allowing a
+   *  content-gate bypass. */
+  resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates }
   findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null
   findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTurn | null
   resolveAnswerThreadWithLog(
@@ -946,7 +956,11 @@ export async function sendReply(
     // double-send). The quoted / latest-ended recoveries are precisely what the
     // router already did for the same reply, so unifying here makes the two
     // resolvers agree and the late-reply supersede fires by identity.
-    const { turn: ownerTurn, tier: ownerTier } = resolveReplyOwnerTurn(turn, chat_id, args)
+    const {
+      turn: ownerTurn,
+      tier: ownerTier,
+      candidates: ownerCandidates,
+    } = resolveReplyOwnerTurn(turn, chat_id, args)
     const resolvedTurnId = ownerTurn?.turnId ?? null
     // #3429 — pass the (normalized) reply text so the registry CAN apply the
     // new-content gate: identity match + TTL alone also fits a background
@@ -1014,23 +1028,32 @@ export async function sendReply(
       ownerEndedAt != null &&
       handbackAt > ownerEndedAt &&
       now - handbackAt <= DEFAULT_SUPERSEDE_TTL_MS
-    // MUST-FIX 1 (silent-data-loss, PROVEN by Fable 2026-07-21) — restrict the
-    // content-gate BYPASS to the tiers whose attribution is NOT model-steerable:
-    //   - `live`   — the framework-owned live `currentTurn` (not model-derived,
-    //                and `decideSupersede`'s same-turnId check bars it from an
-    //                ended turn's record). Bypasses even a handback window.
+    // MUST-FIX 1 (silent-data-loss, PROVEN by Fable 2026-07-21) + the 2026-07-27
+    // corroboration widening — decided by the pure `decideContentGateBypass` so
+    // the gateway runs the exact code the unit tests exercise. The rule, in
+    // brief (full rationale on that function):
+    //   - `live`   — framework-owned live `currentTurn`; bypasses unconditionally
+    //                (`decideSupersede`'s same-turnId check already bars it from
+    //                a DIFFERENT ended turn's record).
     //   - `latest-ended` — the ambiguous DM/late-reply fallback the marko fix
-    //                actually needs; bypass ONLY when no decoupled completion is
-    //                in the window (marker-absence ⇒ own answer).
-    // The `quoted` / `origin` tiers resolve from MODEL-SUPPLIED args
-    // (`args.reply_to` / `args.origin_turn_id`), so a reply can steer ITSELF onto
-    // a DIFFERENT ended turn's record — with marker-absence they used to bypass
-    // the content gate and silently edit-over that turn's delivered answer (the
-    // #3429 double-loss, executed by Fable). Those tiers therefore NEVER bypass:
-    // they always go through the content gate, so foreign content sends fresh and
-    // only a genuine same-answer reply collapses.
-    const replyIsOwnAnswer =
-      ownerTier === 'live' || (ownerTier === 'latest-ended' && !handbackCouldOwnReply)
+    //                needs; bypass ONLY when no decoupled completion is in the
+    //                window (marker-absence ⇒ own answer).
+    //   - `origin` / `quoted` — MODEL-SUPPLIED attributions, so they bypass ONLY
+    //                when CORROBORATED: the turn they resolve must be the same
+    //                turn the framework-derived, TTL-bounded `latestEndedTurnId`
+    //                resolves, and no handback may be in the window. A reply that
+    //                steers itself onto a DIFFERENT ended turn fails
+    //                corroboration and keeps the content gate, so the Fable
+    //                silent-edit-over stays closed; a reply that merely echoes
+    //                its OWN turn no longer loses the collapse it would have got
+    //                by omitting the echo entirely (the observed 2026-07-27
+    //                `via=origin` duplicate).
+    const replyIsOwnAnswer = decideContentGateBypass({
+      tier: ownerTier,
+      resolvedTurnId,
+      candidates: ownerCandidates,
+      handbackCouldOwnReply,
+    })
     const decision = flushedTurnSupersede.take(
       chat_id,
       gateThreadId,
@@ -1114,7 +1137,12 @@ export async function sendReply(
       if (decision.reason === 'new-content') {
         process.stderr.write(
           `telegram gateway: reply: flush supersede declined — new content (#3429) ` +
-          `chatId=${chat_id} ownerTurnId=${JSON.stringify(resolvedTurnId)}; sending fresh\n`,
+          `chatId=${chat_id} ownerTurnId=${JSON.stringify(resolvedTurnId)} ` +
+          // WHY the bypass didn't apply — without these two fields the
+          // 2026-07-27 duplicate looked like a pure text-matcher failure and
+          // took a log-archive dig to attribute to the tier restriction.
+          `tier=${ownerTier} latestEnded=${JSON.stringify(ownerCandidates.latestEndedTurnId)} ` +
+          `handbackInWindow=${handbackCouldOwnReply}; sending fresh\n`,
         )
       }
       if (suppressByLatch) {

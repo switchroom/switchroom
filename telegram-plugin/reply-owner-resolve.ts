@@ -144,6 +144,80 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
 }
 
 /**
+ * Whether the supersede path may BYPASS the #3429 content gate — i.e. treat the
+ * landing reply as this flushed turn's OWN answer and collapse the provisional
+ * flush REGARDLESS of the model having reworded it.
+ *
+ * ## Why this is not simply "the tier is positive"
+ *
+ * The pre-existing rule was `tier === 'live' || (tier === 'latest-ended' &&
+ * !handbackCouldOwnReply)`. `origin` and `quoted` were excluded WHOLESALE
+ * because both derive from MODEL-SUPPLIED args (`args.origin_turn_id` /
+ * `args.reply_to`): a reply can STEER its own attribution onto a DIFFERENT
+ * ended turn and, with the gate bypassed, silently edit over that turn's
+ * delivered answer (the #3429 double-loss, executed by Fable 2026-07-21).
+ *
+ * That wholesale exclusion over-fires. Observed 2026-07-27 on a DM agent (two
+ * answers delivered twice): the answer-ready quiescence flush posted the turn's
+ * composed prose as message A, the model then fired `reply` with a REWORDED
+ * version of the SAME answer, and — because it had echoed `origin_turn_id` back
+ * pointing at its OWN turn — the tier resolved `origin` rather than
+ * `latest-ended`, so no bypass applied and the content gate declined on the
+ * rewording (`reply: flush supersede declined — new content (#3429)`). Message B
+ * shipped as a visible duplicate. Had the model simply OMITTED the echo, the
+ * identical reply would have resolved `latest-ended` and collapsed to ONE
+ * message. The exclusion punished the model for supplying MORE information.
+ *
+ * ## The rule: corroborate the steerable tier, don't blanket-ban it
+ *
+ * A model-supplied attribution is dangerous only when it points somewhere the
+ * FRAMEWORK would not have gone on its own. So `origin`/`quoted` bypass the
+ * content gate IFF the turn they resolve is the SAME turn the framework-derived,
+ * TTL-bounded `latest-ended` candidate resolves — a candidate computed from
+ * `findLatestEndedTurnForChat` with no model input at all.
+ *
+ * This grants ZERO new capability, which is the safety argument: any reply that
+ * reaches the bypass via a corroborated `origin`/`quoted` attribution could
+ * already have reached it by omitting `origin_turn_id`/`reply_to` entirely and
+ * landing on `latest-ended` with the same turn and the same outcome. Steering to
+ * a DIFFERENT ended turn breaks corroboration (`origin` id ≠ latest-ended id),
+ * so the gate holds and the #3429/Fable silent-edit-over defence is untouched.
+ *
+ * `latest-ended` corroborates itself trivially (its resolved id IS the
+ * latest-ended candidate), so the rule below SUBSUMES the previous behaviour on
+ * that tier rather than changing it.
+ *
+ * `live` keeps its unconditional bypass: `currentTurn` is framework-owned, and
+ * `decideSupersede`'s same-turnId requirement already bars it from reaching a
+ * DIFFERENT ended turn's record. `none` never bypasses (nothing to attribute).
+ */
+export function decideContentGateBypass(input: {
+  /** The winning owner tier (`resolveReplyOwnerTier`). */
+  tier: ReplyOwnerTier
+  /** The owner turnId the supersede will act on (`resolveReplyOwnerTurnId`). */
+  resolvedTurnId: string | null
+  /** The SAME candidate set both of the above were derived from — supplies the
+   *  framework-derived `latestEndedTurnId` plus its freshness bound, so the
+   *  corroboration reuses the EXACT TTL rule `resolveReplyOwnerTier` applies
+   *  instead of duplicating it. */
+  candidates: ReplyOwnerCandidates
+  /** True when a decoupled-completion inbound (`subagent_handback`) was enqueued
+   *  in this chat AFTER the owner turn ended and within the supersede TTL — the
+   *  ambiguous window where the late reply might BE that handback rather than
+   *  the turn's own answer. Keeps the content gate on every non-`live` tier. */
+  handbackCouldOwnReply: boolean
+}): boolean {
+  if (input.tier === 'live') return true
+  if (input.tier === 'none') return false
+  if (input.handbackCouldOwnReply) return false
+  if (!latestEndedAccepted(input.candidates)) return false
+  return (
+    input.resolvedTurnId != null &&
+    input.resolvedTurnId === input.candidates.latestEndedTurnId
+  )
+}
+
+/**
  * The answer-delivered latch value — SOURCE-TAGGED (#3426).
  *
  * `false`   — no answer delivered this turn (latch unarmed).

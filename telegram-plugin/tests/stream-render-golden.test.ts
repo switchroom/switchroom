@@ -39,6 +39,28 @@ import {
   TYPING_REFRESH_MS,
 } from '../typing-emitter.js'
 import type { CurrentTurn } from '../gateway/gateway.js'
+import type { ReplyOwnerTier } from '../reply-owner-resolve.js'
+
+/** The owner-resolution shape `resolveReplyOwnerTurn` returns, including the
+ *  candidate set the content-gate bypass corroborates against. These fixtures
+ *  never exercise the supersede path, so the candidates mirror the resolved turn
+ *  (the corroborated shape) with no override needed. */
+function ownerRes(turn: CurrentTurn | null, tier: ReplyOwnerTier) {
+  const id = turn?.turnId ?? null
+  return {
+    turn,
+    tier,
+    candidates: {
+      liveTurnId: tier === 'live' ? id : null,
+      originTurnId: null,
+      quotedTurnId: null,
+      latestEndedTurnId: id,
+      latestEndedAgeMs: 1_000,
+      latestEndedTtlMs: 60_000,
+    },
+  }
+}
+
 
 const CHAT = '1001'
 
@@ -251,7 +273,7 @@ function makeSendReplyDeps(dedup: OutboundDedupCache, sharedSupersede?: FlushedT
     assertSendable: () => {},
     statusKey: key,
     streamKey: key,
-    resolveReplyOwnerTurn: () => ({ turn: null, tier: 'none' as const }),
+    resolveReplyOwnerTurn: () => ownerRes(null, 'none'),
     getLastSubagentHandbackAt: () => null,
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
@@ -443,7 +465,7 @@ describe('F3 — flush record() → same-turn reworded reply collapse (end-to-en
     // The model's REAL reply lands late with a REWORDED version of the same
     // answer: no live turn, latest-ended tier, NO handback in flight (CASE A).
     const s = makeSendReplyDeps(new OutboundDedupCache(), supersede)
-    s.deps.resolveReplyOwnerTurn = () => ({ turn, tier: 'latest-ended' as const })
+    s.deps.resolveReplyOwnerTurn = () => ownerRes(turn, 'latest-ended')
     // (getLastSubagentHandbackAt returns null in the base deps → own answer.)
 
     const res = await sendReply(s.deps, req(REWORDED))
@@ -496,7 +518,7 @@ describe('F5 — take()-before-record() interleaving delivers exactly one messag
     ).toBe('no-record') // record genuinely not written yet
 
     const s = makeSendReplyDeps(new OutboundDedupCache(), supersede)
-    s.deps.resolveReplyOwnerTurn = () => ({ turn, tier: 'latest-ended' as const })
+    s.deps.resolveReplyOwnerTurn = () => ownerRes(turn, 'latest-ended')
     // The same answer landing again in the race window → latch backstop suppresses.
     const res = await sendReply(s.deps, req(ANSWER))
 

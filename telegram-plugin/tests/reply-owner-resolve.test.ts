@@ -34,6 +34,7 @@ import {
   resolveReplyOwnerTurnId,
   resolveReplyOwnerTier,
   decideAnswerLatchSuppression,
+  decideContentGateBypass,
   type ReplyOwnerCandidates,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
@@ -682,6 +683,178 @@ describe('resolveReplyOwnerTier — precedence + latest-ended TTL bound', () => 
     for (const s of shapes) {
       // The id the winning tier points at equals what the id resolver returns.
       expect(resolveReplyOwnerTurnId(s)).toBe(idForTier(s))
+    }
+  })
+})
+
+/**
+ * `decideContentGateBypass` — WHEN the supersede path may treat a landing reply
+ * as this flushed turn's own answer and collapse the provisional flush even
+ * though the model REWORDED it.
+ *
+ * The rule replaced a blanket ban on the model-supplied `origin`/`quoted` tiers
+ * with CORROBORATION against the framework-derived `latestEndedTurnId`. The two
+ * properties that matter, both asserted below as outcomes:
+ *
+ *   - it closes the 2026-07-27 duplicate: a reply that echoes `origin_turn_id`
+ *     for its OWN turn now bypasses, exactly as it would have by omitting the
+ *     echo (the blanket ban punished the extra information);
+ *   - it grants ZERO new capability: for every candidate shape, a corroborated
+ *     `origin`/`quoted` bypass is reachable by dropping the model-supplied ids
+ *     and landing on `latest-ended` — so nothing bypasses that could not
+ *     already, and a STEERED attribution (pointing at a different turn than the
+ *     framework resolves) still cannot.
+ */
+describe('decideContentGateBypass — corroborated bypass of the #3429 content gate', () => {
+  const OWNER = 'turn-OWNER'
+  const OTHER = 'turn-OTHER'
+
+  /** Candidates whose framework-derived latest-ended IS `latestEnded`, fresh. */
+  const cands = (over: Partial<ReplyOwnerCandidates> = {}): ReplyOwnerCandidates => ({
+    liveTurnId: null,
+    originTurnId: null,
+    quotedTurnId: null,
+    latestEndedTurnId: OWNER,
+    latestEndedAgeMs: 30_000,
+    latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    ...over,
+  })
+
+  it('THE 2026-07-27 INCIDENT: an `origin` echo pointing at the SAME turn the ' +
+    'framework resolves bypasses the gate (pre-fix: banned → visible duplicate)', () => {
+    expect(
+      decideContentGateBypass({
+        tier: 'origin',
+        resolvedTurnId: OWNER,
+        candidates: cands({ originTurnId: OWNER }),
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(true)
+  })
+
+  it('a `quoted` attribution corroborated the same way also bypasses', () => {
+    expect(
+      decideContentGateBypass({
+        tier: 'quoted',
+        resolvedTurnId: OWNER,
+        candidates: cands({ quotedTurnId: OWNER }),
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(true)
+  })
+
+  it('THE FABLE VECTOR stays closed: an `origin`/`quoted` attribution STEERED onto ' +
+    'a different turn than the framework resolves never bypasses', () => {
+    for (const tier of ['origin', 'quoted'] as const) {
+      expect(
+        decideContentGateBypass({
+          tier,
+          resolvedTurnId: OTHER,
+          candidates: cands({
+            originTurnId: tier === 'origin' ? OTHER : null,
+            quotedTurnId: tier === 'quoted' ? OTHER : null,
+            latestEndedTurnId: OWNER,
+          }),
+          handbackCouldOwnReply: false,
+        }),
+      ).toBe(false)
+    }
+  })
+
+  it('a decoupled completion in the window keeps the gate on EVERY non-live tier', () => {
+    for (const tier of ['origin', 'quoted', 'latest-ended'] as const) {
+      expect(
+        decideContentGateBypass({
+          tier,
+          resolvedTurnId: OWNER,
+          candidates: cands({
+            originTurnId: tier === 'origin' ? OWNER : null,
+            quotedTurnId: tier === 'quoted' ? OWNER : null,
+          }),
+          handbackCouldOwnReply: true,
+        }),
+      ).toBe(false)
+    }
+  })
+
+  it('`live` bypasses unconditionally — even inside a handback window ' +
+    '(framework-owned, and decideSupersede bars it from another turn record)', () => {
+    expect(
+      decideContentGateBypass({
+        tier: 'live',
+        resolvedTurnId: OWNER,
+        candidates: cands({ liveTurnId: OWNER }),
+        handbackCouldOwnReply: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('`none` never bypasses (nothing to attribute the reply to)', () => {
+    expect(
+      decideContentGateBypass({
+        tier: 'none',
+        resolvedTurnId: null,
+        candidates: cands({ latestEndedTurnId: null }),
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(false)
+  })
+
+  it('a STALE framework candidate corroborates NOTHING — the F2 freshness bound ' +
+    'still denies a past-TTL turn any bypass authority', () => {
+    const stale = cands({
+      originTurnId: OWNER,
+      latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 1,
+    })
+    expect(
+      decideContentGateBypass({
+        tier: 'origin',
+        resolvedTurnId: OWNER,
+        candidates: stale,
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(false)
+  })
+
+  it('`latest-ended` behaviour is UNCHANGED by the widening (it corroborates itself)', () => {
+    expect(
+      decideContentGateBypass({
+        tier: 'latest-ended',
+        resolvedTurnId: OWNER,
+        candidates: cands(),
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(true)
+  })
+
+  // The safety argument, asserted rather than asserted-in-prose: every shape that
+  // bypasses via a model-supplied tier ALSO bypasses with those model-supplied
+  // ids stripped (i.e. by the model simply omitting origin_turn_id / reply_to).
+  // So the widening hands a reply no reach it did not already have.
+  it('ZERO new capability: any corroborated origin/quoted bypass is reachable ' +
+    'with the model-supplied ids stripped', () => {
+    const shapes: Array<{ tier: 'origin' | 'quoted'; id: string; c: ReplyOwnerCandidates }> = [
+      { tier: 'origin', id: OWNER, c: cands({ originTurnId: OWNER }) },
+      { tier: 'quoted', id: OWNER, c: cands({ quotedTurnId: OWNER }) },
+      { tier: 'origin', id: OTHER, c: cands({ originTurnId: OTHER }) },
+      { tier: 'quoted', id: OTHER, c: cands({ quotedTurnId: OTHER, latestEndedTurnId: OTHER }) },
+    ]
+    for (const s of shapes) {
+      const withModelIds = decideContentGateBypass({
+        tier: s.tier,
+        resolvedTurnId: s.id,
+        candidates: s.c,
+        handbackCouldOwnReply: false,
+      })
+      // Strip the model-supplied ids: the framework alone resolves the owner.
+      const stripped: ReplyOwnerCandidates = { ...s.c, originTurnId: null, quotedTurnId: null }
+      const withoutModelIds = decideContentGateBypass({
+        tier: resolveReplyOwnerTier(stripped),
+        resolvedTurnId: resolveReplyOwnerTurnId(stripped),
+        candidates: stripped,
+        handbackCouldOwnReply: false,
+      })
+      if (withModelIds) expect(withoutModelIds).toBe(true)
     }
   })
 })
