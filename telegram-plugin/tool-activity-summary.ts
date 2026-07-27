@@ -91,9 +91,45 @@ import {
   NESTED_PREFIX,
   WORKER_STEP_INDENT,
 } from './status-no-truncate.js'
-import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
+import { escapeMarkdown, truncate } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
-import { formatModelLabel } from './model-label.js'
+// The card layout core. Header composition (`metricsRun` /
+// `renderActivityHeader`), the per-line escape pipeline (`escapeStepLine`), the
+// bullet emitter (`emitSection`) and the char-budget backstop
+// (`fitCardToBudget`) each live there exactly once; the renderers below are
+// CONFIGURATIONS of it, never parallel implementations (#3844).
+import {
+  cardSpecLines,
+  cleanStepLine,
+  escapeStepLine,
+  emitSection,
+  fitCardToBudget,
+  formatFeedElapsed,
+  formatTokenCount,
+  metricsRun,
+  renderActivityHeader,
+  renderCardSpec,
+  renderCardTitleLine,
+  renderStepFeed,
+  tokenSegment,
+  toolWord,
+  type CardCandidate,
+  type CardSection,
+  type CardSpec,
+  type CardState,
+} from './card-layout.js'
+
+// Re-exported so every existing importer keeps its `tool-activity-summary.js`
+// entrypoint while the implementations live in the one layout core.
+export {
+  escapeStepLine,
+  formatFeedElapsed,
+  formatTokenCount,
+  renderActivityHeader,
+  renderCardTitleLine,
+  renderStepFeed,
+}
+export type { CardSection, CardSpec, CardState }
 
 /**
  * Optional header for the main-session activity card, matching the worker
@@ -166,92 +202,6 @@ export function clipNarrative(s: string): string {
 }
 
 /**
- * Render a two-line header for the activity card, matching the worker card's
- * style. Used by both the main-session card and the worker card.
- *
- * Line 1: `<emoji> <b>Label</b> · <i>description</i>`  (description optional)
- * Line 2: status + elapsed + tool count
- *
- * `emoji`       — leading emoji (e.g. "🤖", "🛠")
- * `label`       — bold name (e.g. "Agent", "Worker")
- * `description` — italicised task description (optional)
- * `elapsedMs`   — wall-clock elapsed, rendered via `formatFeedElapsed`
- * `toolCount`   — labeled tool calls this turn
- * `state`       — 'running' | 'done' | 'failed' | 'incomplete' (controls the
- *                 status line wording; 'failed'/'incomplete' render
- *                 `failed · …` / `incomplete · …` so a failed or reaped worker
- *                 never reads as done)
- *
- * Returns a two-element array of ready Telegram HTML lines (no trailing newline).
- */
-export function renderActivityHeader(
-  emoji: string,
-  label: string,
-  description: string,
-  elapsedMs: number,
-  toolCount: number,
-  state: 'running' | 'done' | 'failed' | 'incomplete',
-  model?: string,
-  totalTokens?: number,
-): [string, string] {
-  const toolWord = toolCount === 1 ? 'tool' : 'tools'
-  const elapsed = formatFeedElapsed(elapsedMs)
-  const descPart = description.length > 0 ? ` · _${escapeMarkdown(description)}_` : ''
-  const line1 = `${emoji} **${escapeMarkdown(label)}**${descPart}`
-  // Running total tokens: joins the dot-separated metrics between the tool
-  // count and the model tag. Omitted (empty) when the total is 0/unknown.
-  const tokPart = tokenSegment(totalTokens)
-  // Subtle live-model tag: joins the existing dot-separated metrics (never a new
-  // line). formatModelLabel returns null for absent/sentinel values → no suffix.
-  const modelLabel = formatModelLabel(model)
-  const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
-  const line2 = state === 'running'
-    ? `_${elapsed} · ${toolCount} ${toolWord}${tokPart}${modelPart}_`
-    : `_${state} · ${toolCount} ${toolWord}${tokPart} · ${elapsed}${modelPart}_`
-  return [line1, line2]
-}
-
-/**
- * Compact token-count formatter for the activity card's metrics line:
- *   <1000        → raw          ("940")
- *   ≥1000, <1e6  → one-decimal k ("12.4k", "1.0k")
- *   ≥1e6         → one-decimal M ("1.2M")
- * Negative / non-finite inputs clamp to "0". The caller appends " tok".
- */
-export function formatTokenCount(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return '0'
-  if (n < 1000) return String(Math.floor(n))
-  if (n < 1_000_000) {
-    // Round to the displayed 1-decimal k FIRST: inputs in [999_950, 999_999]
-    // round to "1000.0k", which must promote into the M branch rather than
-    // render a nonsense "1000.0k". Fall through when the rounded k reaches 1000.
-    const k = Number((n / 1000).toFixed(1))
-    if (k < 1000) return `${k.toFixed(1)}k`
-  }
-  return `${(n / 1_000_000).toFixed(1)}M`
-}
-
-/**
- * The ` · {N} tok` metrics segment, or '' when there are no tokens to show.
- * A 0 / undefined total (a worker that emitted no usage — e.g. a non-Claude
- * transcript) OMITS the segment entirely so the line stays clean; the same
- * predicate is used by BOTH render variants (single-worker header + combined
- * row) so they never diverge.
- */
-function tokenSegment(totalTokens: number | undefined): string {
-  if (totalTokens == null || totalTokens <= 0) return ''
-  return ` · ${formatTokenCount(totalTokens)} tok`
-}
-
-/** Format elapsed milliseconds for display in the activity header (e.g. "12s", "2m05s"). */
-export function formatFeedElapsed(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return `${m}m${(s % 60).toString().padStart(2, '0')}s`
-}
-
-/**
  * Minimum time the CURRENT step must have been running before its own
  * `· <elapsed>` suffix appears on the `→` line. Under this, no suffix — a
  * fresh step reads cleaner without a timer, and the header total already
@@ -268,62 +218,6 @@ export const STEP_TIMER_MIN_MS = 10_000
 export function formatStepSuffix(stepElapsedMs: number): string {
   if (stepElapsedMs < STEP_TIMER_MIN_MS) return ''
   return ` · ${formatFeedElapsed(stepElapsedMs)}`
-}
-
-// ─── Truncation pipeline (the single correctness-critical primitive) ────────
-//
-// Per RAW line, in this EXACT order:
-//   1. stripMarkdown(raw)
-//   2. .replace(/\s+/g, ' ').trim()
-//   3. truncate(_, STATUS_LINE_MAX)
-//   4. escapeMarkdown(_)   ← escape is ALWAYS the last per-line op.
-// Escaping last is load-bearing: clipping an already-escaped string can split
-// a markdown escape (\* → \), which renders wrong.
-
-/** Clean + clip + escape a single raw step line. Returns ready-to-wrap markdown. */
-function escapeStepLine(raw: string): string {
-  const cleaned = stripMarkdown(raw).replace(/\s+/g, ' ').trim()
-  return escapeMarkdown(truncate(cleaned, STATUS_LINE_MAX))
-}
-
-/**
- * Shared step-feed emitter. Appends `✓`/`→` bullet lines to `out` for the
- * given ALREADY-ESCAPED step strings, windowing to `window` (default
- * STATUS_ROLLING_LINES; the worker surfaces pass a deeper window) and
- * prepending a `+N earlier…` header when the feed overflows the window (on
- * BOTH surfaces now). The worker feed imports this directly.
- *
- * `out`        — accumulator mutated in place
- * `steps`      — pre-cleaned + pre-escaped HTML step strings
- * `allDone`    — when true ALL steps render done (✓ struck italic); when false the
- *                newest renders in-progress (→ bold)
- * `liveSuffix` — appended INSIDE the newest in-progress line (heartbeat tick)
- * `indent`     — literal prefix put on EVERY emitted line (incl. the
- *                `+N earlier…` header), OUTSIDE the markdown spans so it never
- *                lands inside an emphasis run. Default `''` — byte-identical
- *                output for callers that don't indent. The combined worker card
- *                passes `WORKER_STEP_INDENT` to nest steps under their worker.
- */
-export function renderStepFeed(
-  out: string[],
-  steps: string[],
-  allDone: boolean,
-  liveSuffix = '',
-  window: number = STATUS_ROLLING_LINES,
-  indent = '',
-): void {
-  if (steps.length === 0) return
-  const shown = steps.slice(-Math.max(1, window))
-  const hidden = steps.length - shown.length
-  if (hidden > 0) out.push(`${indent}_✓ +${hidden} earlier…_`)
-  const lastIdx = shown.length - 1
-  shown.forEach((s, i) => {
-    out.push(
-      !allDone && i === lastIdx
-        ? `${indent}**→ ${s}${liveSuffix}**`
-        : `${indent}~~_✓ ${s}_~~`,
-    )
-  })
 }
 
 // ─── Unified status-card primitive ──────────────────────────────────────────
@@ -372,6 +266,17 @@ export interface StatusCardOpts {
    * full recent trail — see WORKER_HISTORY_MAX.
    */
   historyWindow?: number
+  /**
+   * Body line rendered when the card has NO steps and NO children at all — the
+   * 🛠 worker card's `starting…` placeholder for a just-dispatched worker.
+   *
+   * This used to be string-concatenated onto the renderer's return value by
+   * `renderWorkerActivity` (#3846), which put one user-visible card line
+   * outside the primitive that owns line assembly, hard-break stacking and the
+   * char budget. It is a normal body line now, emitted by `emitSection` like
+   * every other one.
+   */
+  emptyPlaceholder?: string
 }
 
 /**
@@ -400,7 +305,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
   const steps = rawSteps.map(escapeStepLine)
   const children = rawChildren.map(escapeStepLine)
 
-  const headerLines = header != null
+  const chrome = header != null
     ? renderActivityHeader(
         header.emoji,
         header.label,
@@ -417,136 +322,138 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
       )
     : []
 
-  const out: string[] = [...headerLines]
-
-  if (hasChildren) {
-    // Parent lines all render done — the live → step lives in the nested block.
-    const shownParent = steps.slice(-window)
-    const hiddenParent = steps.length - shownParent.length
-    if (hiddenParent > 0) out.push(`_✓ +${hiddenParent} earlier…_`)
-    for (const s of shownParent) out.push(`~~_✓ ${s}_~~`)
-    // Child block.
-    const shownChild = children.slice(-window)
-    const hiddenChild = children.length - shownChild.length
-    if (hiddenChild > 0) out.push(`${NESTED_PREFIX}_+${hiddenChild} earlier…_`)
-    const lastChildIdx = shownChild.length - 1
-    shownChild.forEach((s, i) => {
-      out.push(
-        i === lastChildIdx && !final
-          ? `${NESTED_PREFIX}**→ ${s}${liveSuffix}**`
-          : `${NESTED_PREFIX}~~_${s}_~~`,
-      )
-    })
-  } else {
-    renderStepFeed(out, steps, final, liveSuffix, window)
-  }
-
-  if (final && stepCount != null && stepCount > 0) {
-    out.push(`_✓ ${stepCount} steps_`)
-  }
-
+  // Fixed footer/result lines — kept at every shrink level.
+  const footer: string[] = []
+  if (final && stepCount != null && stepCount > 0) footer.push(`_✓ ${stepCount} steps_`)
   if (result != null && result.text.length > 0) {
-    out.push(WORKER_RESULT_RULE)
-    out.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
+    footer.push(WORKER_RESULT_RULE)
+    footer.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
   }
 
-  // out always carries the two header lines, so it is never empty — but guard
-  // against a degenerate header-less future caller.
-  if (out.length === 0) return null
-  // Stack lines with GFM hard breaks (`  \n`) so the card's styled prose lines
-  // don't collapse onto one visual line in the rich-message renderer — see
-  // stackCardLines. This is what makes a card render identically to a reply.
-  // collapseSafe (#3666): the agent status card and the single-worker card are
-  // both PINNED, and Telegram's pinned bar shows them collapsed to one line
-  // with the newlines dropped — the separator keeps that preview legible.
-  const joined = stackCardLines(out, { collapseSafe: true })
-  if (joined.length <= STATUS_CARD_CHAR_BUDGET) return joined
-  return fitCardToBudget(opts, headerLines)
+  // The active "body" group the shrink levels erode: children when present
+  // (the parent trail collapses to a single `+N` marker), else parent steps.
+  const rawBody = hasChildren ? rawChildren : rawSteps
+  const escapedBody = hasChildren ? children : steps
+  const bodyIndent = hasChildren ? NESTED_PREFIX : ''
+  // The `↳` glyph already marks the nested block, so its bullets carry no ✓.
+  const bodyDoneMark = hasChildren ? '' : '✓ '
+
+  /** Level 0 — the full card, everything at its natural window. */
+  const fullSpec = (): CardSpec => ({
+    chrome,
+    sections: hasChildren
+      ? [
+          // Parent lines all render done — the live `→` lives in the nested block.
+          { steps, window, allDone: true },
+          {
+            steps: children,
+            window,
+            allDone: final,
+            liveSuffix,
+            indent: NESTED_PREFIX,
+            doneMark: '',
+          },
+        ]
+      : [{ steps, window, allDone: final, liveSuffix, placeholder: opts.emptyPlaceholder }],
+    footer,
+  })
+
+  const lines = cardSpecLines(fullSpec())
+  // `lines` always carries the two header lines, so it is never empty — but
+  // guard against a degenerate header-less future caller.
+  if (lines.length === 0) return null
+
+  // Parent-collapsed marker line used once the shrink levels start dropping
+  // children (the parent trail is spent bytes on an over-budget card).
+  const parentMarker =
+    hasChildren && rawSteps.length > 0 ? `_✓ +${rawSteps.length} earlier…_` : null
+
+  /**
+   * Shrink levels for the status card:
+   *   0                    — the full card.
+   *   1 … len(body)-1      — drop that many OLDEST body bullets, re-inserting a
+   *                          `+N earlier…` marker; done bullets lose their
+   *                          strike/✓ chrome (`doneStyle: 'plain'`).
+   *   len(body) (deepest)  — a single newest bullet that is ITSELF oversized:
+   *                          truncate the RAW text, THEN escape, THEN wrap, so
+   *                          an already-escaped markdown escape is never sliced.
+   */
+  const deepest = Math.max(1, escapedBody.length)
+  return fitCardToBudget((level) => {
+    if (level === 0) return { spec: fullSpec() }
+    const markerSection: CardSection = {
+      steps: [],
+      window: 1,
+      placeholder: parentMarker ?? undefined,
+    }
+    if (level < escapedBody.length) {
+      return {
+        spec: {
+          chrome,
+          sections: [
+            markerSection,
+            {
+              steps: escapedBody,
+              // Showing all but the `level` oldest — `emitSection` derives the
+              // `+level earlier…` marker from the hidden remainder.
+              window: escapedBody.length - level,
+              allDone: final,
+              liveSuffix,
+              indent: bodyIndent,
+              doneMark: bodyDoneMark,
+              doneStyle: 'plain',
+            },
+          ],
+          footer,
+        },
+      }
+    }
+    return {
+      spec: {
+        chrome,
+        sections: [markerSection, { steps: [], window: 1, placeholder: truncatedNewestLine() }],
+        footer,
+      },
+    }
+  }, deepest)
+
+  /**
+   * The deepest shrink level's single bullet. Charges the fixed header/footer
+   * (and the parent marker) against `STATUS_CARD_CHAR_BUDGET`, then clips the
+   * RAW newest text to what is left, re-checking after escaping because
+   * escaping can expand the string (`&` → `&amp;`).
+   */
+  function truncatedNewestLine(): string {
+    const fixedCost = [...chrome, ...footer].join('\n').length
+    const rawNewest = rawBody.length > 0 ? cleanStepLine(rawBody[rawBody.length - 1]) : ''
+    const wrapperOverhead = final
+      ? (bodyIndent + '_✓ _').length
+      : (bodyIndent + '**→ **').length + liveSuffix.length
+    const headerFooterCost =
+      fixedCost +
+      (fixedCost > 0 ? 1 : 0) +
+      (parentMarker != null ? parentMarker.length + 1 : 0)
+    const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
+    let raw = rawNewest.slice(0, Math.max(0, budget))
+    let newest = escapeMarkdown(raw)
+    while (
+      raw.length > 0 &&
+      wrapperOverhead + headerFooterCost + newest.length > STATUS_CARD_CHAR_BUDGET
+    ) {
+      const excess = wrapperOverhead + headerFooterCost + newest.length - STATUS_CARD_CHAR_BUDGET
+      raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
+      newest = escapeMarkdown(raw)
+    }
+    return final
+      ? `${bodyIndent}_✓ ${newest}_`
+      : `${bodyIndent}**→ ${newest}${liveSuffix}**`
+  }
 }
 
 /** Subtle horizontal rule between the running feed and the finished result. */
 const WORKER_RESULT_RULE = '─────'
 /** Hard cap on the terminal result paragraph. */
 const WORKER_RESULT_MAX = 320
-
-/**
- * Char-budget backstop. Keeps the header / footer / result block fixed and
- * drops the oldest body bullets one at a time, re-inserting a `+N earlier…`
- * marker, until the card fits STATUS_CARD_CHAR_BUDGET. In the extreme case
- * (a single newest bullet that is itself oversized) it truncates the RAW
- * newest text, THEN escapes, THEN wraps — never slicing already-escaped markdown.
- */
-function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
-  const { final = false, liveSuffix = '', stepCount, result } = opts
-  const rawSteps = opts.steps.filter((s) => s != null)
-  const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
-  const hasChildren = rawChildren.length > 0
-  // No per-line nesting cost since #3842 removed whole-card subordination:
-  // every line this function assembles is flush, so the arithmetic below
-  // charges only the line's own bytes.
-  const stack = (lines: string[]): string =>
-    stackCardLines(lines, { collapseSafe: true })
-
-  // Fixed footer/result lines (always kept).
-  const footerLines: string[] = []
-  if (final && stepCount != null && stepCount > 0) footerLines.push(`_✓ ${stepCount} steps_`)
-  if (result != null && result.text.length > 0) {
-    footerLines.push(WORKER_RESULT_RULE)
-    footerLines.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
-  }
-  const fixedCost = [...headerLines, ...footerLines].join('\n').length
-
-  // The active "body" group whose oldest bullets we drop: children when
-  // present (parent collapses to a single "+N" marker), else parent steps.
-  const body = hasChildren ? rawChildren : rawSteps
-  const escapedBody = body.map(escapeStepLine)
-  const prefix = hasChildren ? NESTED_PREFIX : ''
-
-  const buildBullet = (esc: string, isLast: boolean): string =>
-    !final && isLast ? `${prefix}**→ ${esc}${liveSuffix}**` : `${prefix}_${esc}_`
-
-  // Parent-collapsed marker line when we are dropping children but parent steps exist.
-  const parentMarker =
-    hasChildren && rawSteps.length > 0 ? `_✓ +${rawSteps.length} earlier…_` : null
-
-  for (let drop = 1; drop < escapedBody.length; drop++) {
-    const shown = escapedBody.slice(drop)
-    const lines: string[] = [...headerLines]
-    if (parentMarker != null) lines.push(parentMarker)
-    lines.push(hasChildren ? `${NESTED_PREFIX}_+${drop} earlier…_` : `_✓ +${drop} earlier…_`)
-    const lastIdx = shown.length - 1
-    shown.forEach((esc, i) => lines.push(buildBullet(esc, i === lastIdx)))
-    lines.push(...footerLines)
-    // collapseSafe: same pinned surface as renderStatusCard (#3666).
-    const candidate = stack(lines)
-    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
-  }
-
-  // Extreme: the single newest bullet is itself oversized. Truncate the RAW
-  // newest text, then escape, then wrap — re-checking post-escape because
-  // escaping can expand the string (& → &amp;).
-  const rawNewest = body.length > 0 ? stripMarkdown(body[body.length - 1]).replace(/\s+/g, ' ').trim() : ''
-  const wrapperOverhead =
-    final ? (prefix + '_✓ _').length : (prefix + '**→ **').length + liveSuffix.length
-  const headerFooterCost =
-    fixedCost +
-    (fixedCost > 0 ? 1 : 0) +
-    (parentMarker != null ? parentMarker.length + 1 : 0)
-  const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
-  let raw = rawNewest.slice(0, Math.max(0, budget))
-  let newest = escapeMarkdown(raw)
-  while (raw.length > 0 && wrapperOverhead + headerFooterCost + newest.length > STATUS_CARD_CHAR_BUDGET) {
-    const excess = wrapperOverhead + headerFooterCost + newest.length - STATUS_CARD_CHAR_BUDGET
-    raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
-    newest = escapeMarkdown(raw)
-  }
-  const newestLine = final ? `${prefix}_✓ ${newest}_` : `${prefix}**→ ${newest}${liveSuffix}**`
-  const lines: string[] = [...headerLines]
-  if (parentMarker != null) lines.push(parentMarker)
-  lines.push(newestLine)
-  lines.push(...footerLines)
-  return stack(lines)
-}
 
 /**
  * Render the accumulated feed as ready Telegram HTML — one action per line,
@@ -779,10 +686,13 @@ function glanceLine(rows: CombinedWorkerRow[]): string {
   const oldestMs = rows.reduce((m, r) => Math.max(m, r.elapsedMs), 0)
   const tools = rows.reduce((n, r) => n + r.toolCount, 0)
   const tok = rows.reduce((n, r) => n + (r.totalTokens ?? 0), 0)
-  const toolWord = tools === 1 ? 'tool' : 'tools'
+  // Aggregate glance, so it is NOT a `metricsRun` (no per-entity state/model,
+  // and it leads with the swarm count rather than elapsed). It still reads the
+  // same elapsed / tool-word / token primitives, so the vocabulary that DOES
+  // repeat across cards cannot drift.
   return (
     `🛠 **WORKERS** · _${rows.length} running · oldest ${formatFeedElapsed(oldestMs)}` +
-    ` · ${tools} ${toolWord}${tokenSegment(tok)}_`
+    ` · ${tools} ${toolWord(tools)}${tokenSegment(tok)}_`
   )
 }
 
@@ -855,88 +765,69 @@ export function renderCombinedWorkerFeed(
 
   const rowHeader = (r: CombinedWorkerRow): string => {
     const desc = escapeMarkdown(
-      truncate(stripMarkdown(r.description).replace(/\s+/g, ' ').trim() || 'background task', COMBINED_ROW_DESC_MAX),
+      truncate(cleanStepLine(r.description) || 'background task', COMBINED_ROW_DESC_MAX),
     )
-    const toolWord = r.toolCount === 1 ? 'tool' : 'tools'
-    const tokPart = tokenSegment(r.totalTokens)
-    const modelLabel = formatModelLabel(r.model)
-    const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
     // Stable ordinal prefix INSIDE the bold span, before the already-escaped
     // description — no new escaping surface, and the gateway md→HTML conversion
     // has no ordered-list auto-formatting on bolded text.
     const num = numbered && r.ordinal != null ? `${r.ordinal}. ` : ''
-    return `**${num}${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${tokPart}${modelPart}_`
+    // The metrics run is composed by the SAME function as the 🤖 agent header
+    // and the 🛠 single-worker header (`metricsRun`, card-layout.ts). A combined
+    // row is always live, so it reports 'running'; before #3844 this line spelled
+    // the run out by hand and agreed with the other two only by inspection.
+    return `**${num}${desc}** _· ${metricsRun(r.elapsedMs, r.toolCount, 'running', r.totalTokens, r.model)}_`
   }
 
   // Raw (unescaped) history for a worker, oldest→newest, empty lines stripped.
   // Falls back to the single currentStep when no history was supplied.
   const rowHistory = (r: CombinedWorkerRow): string[] => {
     const src = r.historyLines != null && r.historyLines.length > 0 ? r.historyLines : [r.currentStep]
-    return src.filter((s) => s != null && stripMarkdown(s).replace(/\s+/g, ' ').trim().length > 0)
+    return src.filter((s) => s != null && cleanStepLine(s).length > 0)
   }
 
-  const compose = (visibleCount: number): { body: string; bodyLines: number } => {
+  const compose = (visibleCount: number): CardCandidate => {
     const shown = rows.slice(0, visibleCount)
     const hidden = rows.length - shown.length
     // Per-worker depth follows Ken's deterministic curve max(3, 7−w) (#3349):
     // the curve drives DEPTH; the total-line budget below drives ROW COUNT.
     const depth = combinedHistoryDepth(shown.length)
-    const chrome: string[] = [glanceLine(rows)]
-    const bodyOut: string[] = []
-    for (const r of shown) {
-      bodyOut.push(rowHeader(r))
-      const hist = rowHistory(r)
-      if (hist.length === 0) {
-        bodyOut.push(`${WORKER_STEP_INDENT}→ _starting…_`)
-        continue
-      }
-      // Paint the last-K history lines with the SAME `✓`/`→` idiom as the
-      // single-worker card: escape each raw line through the shared per-line
-      // pipeline (escapeStepLine), then renderStepFeed strikes the prior steps
-      // and bolds the newest in-progress step. The window equals the depth so a
-      // per-worker `+N earlier…` marker never appears inside the combined feed.
-      //
-      // WORKER_STEP_INDENT nests every step line one level under its worker
-      // header, so the boundary between two workers is visible at a glance on a
-      // phone (the header lines stay at the left margin, their steps sit in).
-      // It is a U+2800 run. NOT ASCII spaces and NOT U+00A0: Telegram's
-      // server-side parser left-trims a leading Unicode-whitespace run, so both
-      // render flat (#3662 shipped U+00A0 and was inert). U+2800 is category So,
-      // not Zs. See the constant's doc comment for the live evidence.
-      const esc = hist.slice(-depth).map(escapeStepLine)
-      renderStepFeed(bodyOut, esc, false, '', depth, WORKER_STEP_INDENT)
-    }
-    const out = [...chrome, ...bodyOut]
-    if (hidden > 0) out.push(`_+${hidden} more working…_`)
-    // collapseSafe (#3666): this card is PINNED, and Telegram's pinned bar
-    // renders it collapsed to one line with the newlines dropped and nothing
-    // substituted. Without the separator the glance line runs straight into
-    // row 1's ordinal and every step glyph mashes into the previous line.
+    // Each worker is ONE SECTION of the shared card spec: its row header, then
+    // its last-K history lines painted with the SAME `✓`/`→` idiom as every
+    // other card (emitSection). The window equals the depth, so a per-worker
+    // `+N earlier…` marker never appears inside the combined feed.
     //
-    // No whole-card nesting (#3842): `out` goes to the stacker as-is, so the
-    // glance / row-header / spill lines land flush and only the step lines
-    // carry their WORKER_STEP_INDENT — one level of hierarchy, not two.
-    return {
-      body: stackCardLines(out, { collapseSafe: true }),
-      bodyLines: bodyOut.length,
-    }
+    // WORKER_STEP_INDENT nests every step line one level under its worker
+    // header, so the boundary between two workers is visible at a glance on a
+    // phone (the header lines stay at the left margin, their steps sit in).
+    // It is a U+2800 run. NOT ASCII spaces and NOT U+00A0: Telegram's
+    // server-side parser left-trims a leading Unicode-whitespace run, so both
+    // render flat (#3662 shipped U+00A0 and was inert). U+2800 is category So,
+    // not Zs. See the constant's doc comment for the live evidence.
+    const sections: CardSection[] = shown.map((r) => ({
+      header: [rowHeader(r)],
+      steps: rowHistory(r).slice(-depth).map(escapeStepLine),
+      window: depth,
+      indent: WORKER_STEP_INDENT,
+      placeholder: '→ _starting…_',
+    }))
+    const footer = hidden > 0 ? [`_+${hidden} more working…_`] : []
+    // No whole-card nesting (#3842): the glance / row-header / spill lines land
+    // flush and only the step lines carry their WORKER_STEP_INDENT — one level
+    // of hierarchy, not two.
+    const spec: CardSpec = { chrome: [glanceLine(rows)], sections, footer }
+    // The per-worker BODY lines (row headers + their steps) — the glance line and
+    // the spill line are fixed chrome and sit outside this ceiling.
+    const bodyLines = cardSpecLines(spec).length - 1 - footer.length
+    return { spec, overflow: bodyLines > MAX_COMBINED_BODY_LINES }
   }
 
-  // Cap to maxRows first, then shrink the visible set while EITHER the total
-  // body-line budget (#3349: bounds a big swarm without stealing depth from the
-  // shown workers) OR the wire char budget is exceeded. Newest (trailing) rows
-  // collapse into the `+M more working…` spill (`rows.slice(0, visibleCount)`
-  // keeps the head of the list).
-  let visible = Math.min(rows.length, maxRows)
-  let { body, bodyLines } = compose(visible)
-  while (
-    (bodyLines > MAX_COMBINED_BODY_LINES || body.length > STATUS_CARD_CHAR_BUDGET) &&
-    visible > 1
-  ) {
-    visible -= 1
-    ;({ body, bodyLines } = compose(visible))
-  }
-  return body
+  // Cap to maxRows first, then let the ONE shared budget enforcer shrink the
+  // visible set while EITHER the total body-line budget (#3349: bounds a big
+  // swarm without stealing depth from the shown workers) OR the wire char budget
+  // is exceeded. Newest (trailing) rows collapse into the `+M more working…`
+  // spill (`rows.slice(0, visibleCount)` keeps the head of the list).
+  const visible = Math.min(rows.length, maxRows)
+  return fitCardToBudget((level) => compose(Math.max(1, visible - level)), visible - 1)
 }
 
 /**
