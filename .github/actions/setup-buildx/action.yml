@@ -1,0 +1,45 @@
+name: setup-buildx
+description: |
+  `docker/setup-buildx-action` (docker-container driver) with the BuildKit
+  builder image warmed into the local image store first, behind a bounded
+  transient-only retry.
+
+  Use this ANYWHERE a job needs the docker-container driver. A job that
+  passes `driver: docker` boots no BuildKit container, has no docker.io
+  dependency, and should keep using `docker/setup-buildx-action` directly.
+
+  Rationale, the buildx source that makes the warm-up work, and the
+  measured failure rate live in `warm-buildkit-image.sh` and issue #3815.
+  Pinned by `tests/ci-buildx-warm-pull.test.ts`.
+
+inputs:
+  buildkit-image:
+    description: |
+      BuildKit builder image. Warmed by the pre-pull AND pinned through
+      `driver-opts: image=` so the two can never drift apart — a warm-pull
+      of a ref the driver does not boot is a silent no-op.
+
+      The default is buildx's own `bkimage.DefaultImage`
+      (driver/bkimage/bkimage.go), so this changes no behaviour beyond
+      making the ref explicit.
+    required: false
+    default: "moby/buildkit:buildx-stable-1"
+  warm-attempts:
+    description: Max warm-pull attempts before giving up (never fails the job).
+    required: false
+    default: "4"
+
+runs:
+  using: composite
+  steps:
+    - name: Warm the BuildKit builder image (bounded retry, issue #3815)
+      shell: bash
+      env:
+        BUILDKIT_IMAGE: ${{ inputs.buildkit-image }}
+        BUILDKIT_WARM_ATTEMPTS: ${{ inputs.warm-attempts }}
+      run: bash "${{ github.action_path }}/warm-buildkit-image.sh"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+      with:
+        driver-opts: image=${{ inputs.buildkit-image }}

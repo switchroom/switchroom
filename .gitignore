@@ -75,3 +75,6 @@ switchroom-checksums.txt
 
 # Synology NAS thumbnail artifacts
 @eaDir/
+
+# Scratch dir for tests/ci-buildx-warm-pull.test.ts when /tmp is noexec.
+.buildx-warm-test-*/
