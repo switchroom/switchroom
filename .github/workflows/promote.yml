@@ -25,9 +25,32 @@ name: promote
 #      conflict), the job fails loudly so the promotion is treated as
 #      "did not happen" rather than "happened with a different image."
 #
-# Matrix fans out across all 8 fleet images. `fail-fast: true` so a
+# Matrix fans out across all 9 fleet images. `fail-fast: true` so a
 # single bad image stops the promotion mid-flight rather than leaving a
 # half-promoted channel.
+#
+# ─── ALSO THE RELEASE PATH's `:latest` MOVE (#3685) ───────────────────
+#
+# release.yml's `images-latest` job calls this workflow via
+# `workflow_call` with `from: vX.Y.Z, to: latest`, after every release
+# leg is green. docker-images.yml therefore publishes `:vX.Y.Z` only on
+# a tag push and no longer moves `:latest` off the tag event itself.
+#
+# Two consequences, both load-bearing:
+#
+#   1. The matrix must cover EVERY image docker-images publishes on a
+#      tag, or that image's `:latest` silently stops advancing at
+#      release time. `web` was missing here while being in
+#      docker-images' `merge-dependents` matrix — harmless while this
+#      was dispatch-only, a real hole once the release path depends on
+#      it. `tests/release-pipeline-gating.test.ts` (R14) now derives the
+#      expected set from docker-images.yml and fails on any drift.
+#   2. No `${{ }}` inside a `run:` body. This is a release-path workflow
+#      holding `packages: write`, and `inputs.from` / `inputs.to` are
+#      operator-supplied strings on the dispatch path — interpolating
+#      them into the script GitHub writes to the runner's disk is script
+#      injection. They go through `env:` instead. Same rule release.yml
+#      and npm-publish.yml already follow (R8 in the same test).
 
 on:
   workflow_dispatch:
@@ -38,6 +61,18 @@ on:
         type: string
       to:
         description: "Destination tag (e.g. rc, latest)"
+        required: true
+        type: string
+  # Called by release.yml's `images-latest` job. Same two inputs, so
+  # `inputs.from` / `inputs.to` resolve identically on both paths.
+  workflow_call:
+    inputs:
+      from:
+        description: "Source tag (e.g. vX.Y.Z)"
+        required: true
+        type: string
+      to:
+        description: "Destination tag (e.g. latest)"
         required: true
         type: string
 
@@ -55,7 +90,12 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight, voice]
+        # Keep in sync with what docker-images.yml publishes on a tag:
+        # base + the merge-dependents matrix (agent, broker, kernel,
+        # hostd, auth-broker, web) + hindsight + voice. `web` was absent
+        # here until #3685; pinned by R14 in
+        # tests/release-pipeline-gating.test.ts.
+        image: [base, agent, broker, kernel, hostd, auth-broker, web, hindsight, voice]
     steps:
       # NO `docker/setup-buildx-action` here, deliberately. Every step in
       # this job is manifest-only (`imagetools inspect` / `imagetools
@@ -79,26 +119,35 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Precheck — source tag exists
+        env:
+          # Via `env:`, never interpolated into the script body — see the
+          # header. `inputs.*` is operator-supplied on the dispatch path.
+          IMAGE_NAME: ${{ matrix.image }}
+          FROM_TAG: ${{ inputs.from }}
+          TO_TAG: ${{ inputs.to }}
         run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
-          FROM="${IMAGE}:${{ inputs.from }}"
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${IMAGE_NAME}"
+          FROM="${IMAGE}:${FROM_TAG}"
           if ! docker buildx imagetools inspect "$FROM" >/dev/null 2>&1; then
             echo "::error::Source tag ${FROM} not found in registry."
-            echo "::error::Check for typos or wait for the build pipeline to publish :${{ inputs.from }}."
+            echo "::error::Check for typos or wait for the build pipeline to publish :${FROM_TAG}."
             exit 1
           fi
           # Capture source digest for the post-retag verification step.
           SRC_DIGEST=$(docker buildx imagetools inspect "$FROM" --format '{{.Manifest.Digest}}')
           echo "SRC_DIGEST=$SRC_DIGEST" >> "$GITHUB_ENV"
           echo "FROM_REF=$FROM" >> "$GITHUB_ENV"
-          echo "TO_REF=${IMAGE}:${{ inputs.to }}" >> "$GITHUB_ENV"
+          echo "TO_REF=${IMAGE}:${TO_TAG}" >> "$GITHUB_ENV"
 
       - name: Retag (no rebuild)
         run: |
+          set -euo pipefail
           docker buildx imagetools create -t "${TO_REF}" "${FROM_REF}"
 
       - name: Verify digest equality post-retag
         run: |
+          set -euo pipefail
           DST_DIGEST=$(docker buildx imagetools inspect "${TO_REF}" --format '{{.Manifest.Digest}}')
           if [ "${SRC_DIGEST}" != "${DST_DIGEST}" ]; then
             echo "::error::Digest mismatch after retag!"
