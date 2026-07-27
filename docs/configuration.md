@@ -466,6 +466,32 @@ hindsight:
 
 If you run your own Hindsight container outside `switchroom memory --start` (e.g. you point `memory.config.url` at an external server), switchroom doesn't manage that container's env — set the cap on your own image.
 
+### GPU passthrough for the Hindsight container
+
+The local embedding model and the cross-encoder reranker run on the GPU when the container can see one. Switchroom decides that by reading `~/.switchroom/host-capabilities.json`, the verdict `switchroom setup` writes after probing the host: `--gpus all` is added only when that file proves **both** a GPU and the nvidia container toolkit. It has to be gated — `docker run --gpus all` hard-fails container create on a host without the toolkit.
+
+You can override the autodetection in both directions:
+
+```yaml
+hindsight:
+  gpu: true    # force GPU passthrough on
+  # gpu: false # force it off on a GPU host
+```
+
+`--gpu` / `--no-gpu` on `switchroom memory setup` override the yaml for a single run. Explicit always beats autodetect. Force it on when you know the host has a working toolkit but the verdict file is wrong or unreadable — switchroom cannot verify the toolkit for you, so a wrong `true` fails the container create loudly rather than silently.
+
+**A recreate will not silently take GPU away.** `switchroom memory setup --recreate` inspects the running container first. If it currently has GPU passthrough and the next launch would not, the recreate is **refused** before the image pull and before the container is removed, naming the reason. That drop is otherwise invisible: it moves the reranker to CPU on the interactive recall path and also withholds the GPU-only defaults `HINDSIGHT_API_RERANKER_LOCAL_FP16` and `HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE`.
+
+Three ways past the refusal, in the order you probably want them:
+
+| You want | Use |
+| --- | --- |
+| GPU kept, because the verdict file is wrong | `--gpu`, or `hindsight.gpu: true` to make it stick |
+| CPU, deliberately, from now on | `hindsight.gpu: false` or `--no-gpu` (never refused — that is the declared opt-out) |
+| CPU, just this once | `--allow-gpu-drop` |
+
+`switchroom doctor` carries a `host capabilities verdict` row that FAILs when the file exists but cannot be read or parsed. That is the failure mode this guards: an unreadable verdict used to be indistinguishable from "this host has no GPU". The usual cause is `sudo switchroom setup` writing the file as root into a non-root home; the fix is printed in the row.
+
 Any server from `defaults.mcp_servers` also flows to all agents via the normal cascade.
 
 To suppress the built-in `playwright` server for a specific agent:

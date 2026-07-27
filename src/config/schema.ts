@@ -2178,6 +2178,24 @@ const HindsightPerOpLlmSchema = z
   );
 
 export const HindsightConfigSchema = z.object({
+  gpu: z
+    .boolean()
+    .optional()
+    .describe(
+      "Force GPU passthrough for the hindsight container on (`true`) or off " +
+      "(`false`), overriding host autodetection in BOTH directions. Absent " +
+      "(the default) → autodetect from the persisted host-capabilities " +
+      "verdict (`~/.switchroom/host-capabilities.json`), which enables " +
+      "`--gpus all` only when that file proves BOTH a GPU and the nvidia " +
+      "container toolkit. Set `true` when that verdict is wrong or unreadable " +
+      "and you know the host has a working toolkit — switchroom cannot verify " +
+      "it for you, and `docker run --gpus all` hard-fails container create on " +
+      "a host without one. Set `false` to pin the container to CPU on a GPU " +
+      "host. This is also the declarative opt-out for the recreate-time GPU " +
+      "drop guard (`switchroom memory setup --recreate` refuses to silently " +
+      "turn a GPU container into a CPU one). `--gpu`/`--no-gpu` on `memory " +
+      "setup` override this for a single run.",
+    ),
   llm: z
     .object({
       provider: z
