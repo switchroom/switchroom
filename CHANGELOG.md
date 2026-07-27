@@ -1,6 +1,51 @@
 # Changelog
 
 ## Unreleased
+### Recall no longer times out on mature banks
+
+Auto-recall was exceeding its client deadline on ~96% of own-bank requests for
+agents with large banks, and the agent got **nothing** on those turns — no
+memories and no fallback. Fleet-wide over 7 days: 1,812 recalls, 88.6% own-bank
+timeout, 78.9% returning zero memories (klanker 96.7%, overlord 96.8%, finn
+95.1%).
+
+The cause is query *shape*, not the database. The hook composed a query from
+the last two turns, Hindsight OR-joins every token into a single `to_tsquery`,
+and Postgres native FTS cannot top-k from a GIN index — it computes
+`ts_rank_cd` over the **entire matched set** before the top-60 heapsort. Cost
+tracks the number of distinct terms, and nothing bounded that;
+`recallMaxQueryChars` bounds characters, which is the wrong unit. Two of the
+terms were scaffolding the hook added itself: `compose_recall_query` prefixed
+each turn with a literal `user:` / `assistant:`, and on a mature bank those are
+the two highest-document-frequency tokens in existence.
+
+Measured on the live `overlord` bank (135,565 units): 96 distinct terms ranked
+119,510 rows in 14.0 s; 24 terms ranked 48,433 rows in 2.7 s. Replaying real
+logged prompt pairs against the live API, the unshaped query took a median
+32.6 s and exceeded the 12 s deadline on **every** successful request; shaped,
+median 5.8 s.
+
+So the recall query is now bounded to a **term budget**, default **24**,
+configurable as `memory.recall.query_max_tokens`. Selection reserves a third of
+the budget for the highest-merit terms across the whole window (so a
+conversational follow-up keeps a subject that lives only in the prior turn), a
+third for the latest turn (so a prior turn full of pasted identifiers cannot
+crowd out the question just asked), and fills the rest by a recency-weighted
+score. Merit rewards digits and compound identifiers and demotes common English
+words — all three measured against real document frequency on the live bank;
+token *length* and *case* were tested as signals, found to carry none, and are
+deliberately not used.
+
+Alongside it, the per-bank request timeout is configurable
+(`memory.recall.request_timeout_seconds`, default 12 s, was a hardcoded 8), the
+role-label prefixes are gone, and a deadline miss no longer suppresses the
+transcript-grep fallback — that fallback is now bounded by the hook's remaining
+budget so it cannot push the turn past Claude Code's hook ceiling.
+
+Both settings live in `switchroom.yaml` specifically so they survive
+`switchroom apply`, which re-copies the plugin from `vendor/hindsight-memory`
+and reverts hand-edits of the installed copy.
+
 
 ### The `/usage` card names the account that is actually serving
 

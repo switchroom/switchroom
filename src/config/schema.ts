@@ -563,17 +563,61 @@ export const AgentMemorySchema = z
             "zero headroom the hook is killed mid-write and the turn loses " +
             "both the memories and the recall_log row explaining why.",
           ),
+        query_max_tokens: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Cap on the number of DISTINCT BM25 terms the recall hook may " +
+            "put on the wire. `recallMaxQueryChars` bounds characters, which " +
+            "is not the cost driver: Hindsight OR-joins every query token " +
+            "into one tsquery and Postgres native FTS ranks the entire " +
+            "matched set before the top-60 heapsort, so cost tracks TERMS. " +
+            "An 800-char composed query is ~96 distinct terms and matched " +
+            "119,510 of 135,565 rows on the `overlord` bank (14.0s for the " +
+            "3-arm " +
+            "BM25 UNION), past the per-bank timeout — 96.8% of that agent's " +
+            "own-bank recalls returned nothing. Plugin default is 24 " +
+            "(measured 48,433 rows / 2.7s on the same bank). Terms are " +
+            "chosen recency-first (the latest turn beats prior context), " +
+            "then by selectivity. 0 disables shaping (rollback lever).",
+          ),
+        query_stop_terms: z
+          // A BM25 term, as Hindsight's tokenizer produces them: word chars
+          // plus the `. / -` that hold compound tokens (semvers, paths,
+          // hyphenated identifiers) together. Anything else could never match
+          // a token anyway, and the constraint keeps the value trivially safe
+          // to embed in the single-quoted start.sh export.
+          .array(z.string().min(1).regex(/^[\w./-]+$/))
+          .optional()
+          .describe(
+            "Extra terms dropped from the BM25 recall query, on top of the " +
+            "built-in English stopword list. For BANK-SPECIFIC " +
+            "high-document-frequency words a generic stoplist cannot know " +
+            "about: on `overlord`, `switchroom` matches 20% of the bank and " +
+            "`agent` another 20%, purely because that is what the corpus is " +
+            "about, and each such term drags tens of thousands of rows into " +
+            "the ranking. Defaults to [].",
+          ),
         request_timeout_seconds: z
           .number()
           .int()
           .min(1)
           .optional()
           .describe(
-            "Hard per-bank HTTP timeout (seconds) for a single recall " +
+            "Per-bank HTTP read timeout, in seconds, for one recall " +
             "request. Even parallelised, each bank carries its own deadline " +
             "so ONE hung bank returns empty instead of consuming the shared " +
-            "deadline and starving its siblings. Default 8. Clamped to stay " +
-            "at or under the effective parallel deadline.",
+            "deadline and starving its siblings. The plugin default is 12 " +
+            "(raised from a hardcoded 8 in #3757, which fired on 96.8% of " +
+            "one agent's own-bank recalls). Switchroom defaults it to the " +
+            "effective `parallel_deadline_seconds` instead — 10 at the " +
+            "shipped ceiling — because the shared fan-out deadline is " +
+            "already the tighter outer guard, so a per-bank value above it " +
+            "can never bind. An explicitly configured value above the " +
+            "effective deadline is clamped down to it, and the clamp is " +
+            "reported.",
           ),
         types: z
           .array(z.string())
@@ -2851,7 +2895,8 @@ const profileFields = {
           // tuned fleet-wide with per-agent overrides.
           hook_timeout_seconds: z.number().int().min(1).optional(),
           parallel_deadline_seconds: z.number().int().min(1).optional(),
-          request_timeout_seconds: z.number().int().min(1).optional(),
+          query_max_tokens: z.number().int().min(0).optional(),
+          query_stop_terms: z.array(z.string().min(1).regex(/^[\w./-]+$/)).optional(),          request_timeout_seconds: z.number().int().min(1).optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })

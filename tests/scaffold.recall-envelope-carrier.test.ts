@@ -73,7 +73,9 @@ describe("recall envelope: the start.sh env carrier", () => {
     // is left over from.
     const { startSh } = scaffold({} as AgentConfig);
     expect(startSh.match(DEADLINE_RE)?.[1]).toBe("10");
-    expect(startSh.match(REQUEST_RE)?.[1]).toBe("8");
+    // Derived, not the vendor literal (12): the per-bank timeout is the inner
+    // safety net and can never fire above the shared fan-out deadline.
+    expect(startSh.match(REQUEST_RE)?.[1]).toBe("10");
   });
 
   it("never renders an empty value (the silent handlebars-typo failure mode)", () => {

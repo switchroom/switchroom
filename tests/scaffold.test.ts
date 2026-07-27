@@ -16,7 +16,8 @@ function expectRelativePoolLink(linkPath: string, expectedPoolTarget: string): v
   expect(resolve(dirname(linkPath), stored)).toBe(resolve(expectedPoolTarget));
 }
 import { tmpdir } from "node:os";
-import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants, computeDesiredPermissionAllow } from "../src/agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants, computeDesiredPermissionAllow, HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT, HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT } from "../src/agents/scaffold.js";
+import { resolveHindsightRecallTunables } from "../src/setup/hindsight-recall-tunables.js";
 import { createVault, setStringSecret } from "../src/vault/vault.js";
 import { renderTemplate, renderProfileClaudeTemplate } from "../src/agents/profiles.js";
 import { cronScriptFilename, cronUnitName } from "../src/agents/cron-unit-name.js";
@@ -2665,6 +2666,124 @@ describe("reconcileAgent", () => {
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
     expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=0");
+  });
+
+  // #3757 — BM25 query shaping + per-request timeout must be OPERATOR-OWNED,
+  // not literals in the installed plugin. `switchroom apply` re-copies the
+  // plugin from vendor/, so a hand-edit of the installed scripts/recall.py is
+  // reverted on the next reconcile — which is exactly how the hardcoded 8s
+  // recall timeout came back on 2026-07-27 after being patched on 07-25.
+  // These tests pin the switchroom.yaml -> start.sh env path that makes the
+  // values survive an apply.
+  const memoryOn = (agentConfig: ReturnType<typeof makeAgentConfig>) =>
+    buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+
+  it("start.sh exports the #3757 recall knobs UNCONDITIONALLY, carrying the plugin defaults", () => {
+    // #3774 defect class. The plugin resolves
+    // DEFAULTS -> settings.json -> ~/.hindsight/claude-code.json -> env
+    // (vendor/hindsight-memory/scripts/lib/config.py:437-470). A knob that is
+    // not exported therefore lets a stale hand-written claude-code.json shadow
+    // the shipped default, silently and with every test still green. Exporting
+    // an EMPTY value does not help: `_cast_env("", int)` returns None and the
+    // assignment is skipped, so empty is indistinguishable from absent. The
+    // only shape that wins is a concrete value on every boot.
+    const agentConfig = makeAgentConfig();
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain(
+      `export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=${HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT}`,
+    );
+    expect(startSh).toContain(`export HINDSIGHT_RECALL_QUERY_STOP_TERMS='[]'`);
+    // The per-bank timeout is the INNER guard of the recall envelope, so the
+    // exported value is the resolved one, which derives from the shared
+    // fan-out deadline rather than taking the vendor literal outright
+    // (HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT is its ceiling). Assert
+    // against the resolver so the carrier and the envelope cannot drift apart.
+    const resolved = resolveHindsightRecallTunables(undefined);
+    expect(resolved.requestTimeoutSeconds).toBeLessThanOrEqual(
+      HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT,
+    );
+    expect(startSh).toContain(
+      `export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=${resolved.requestTimeoutSeconds}`,
+    );
+  });
+
+  it("the scaffold fallbacks match the hindsight plugin's own DEFAULTS", () => {
+    // The unconditional export above only produces correct behaviour while the
+    // value it carries IS the plugin default. Nothing at runtime reconciles the
+    // two, so read the Python source and fail on drift.
+    const configPy = readFileSync(
+      resolve(import.meta.dirname, "..", "vendor/hindsight-memory/scripts/lib/config.py"),
+      "utf-8",
+    );
+    const readDefault = (key: string): number => {
+      const match = configPy.match(new RegExp(`"${key}":\\s*(\\d+)`));
+      expect(match, `${key} not found in lib/config.py DEFAULTS`).toBeTruthy();
+      return Number(match![1]);
+    };
+    expect(readDefault("recallQueryMaxTokens")).toBe(HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT);
+    expect(readDefault("recallRequestTimeoutSeconds")).toBe(
+      HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT,
+    );
+  });
+
+  it("start.sh exports the #3757 recall knobs from memory.recall in switchroom.yaml", () => {
+    const agentConfig = makeAgentConfig({
+      memory: {
+        collection: "test-agent",
+        recall: {
+          query_max_tokens: 16,
+          query_stop_terms: ["switchroom", "agent"],
+          // Inside the shipped 10s fan-out deadline: a larger value is legal
+          // yaml but resolves through the envelope clamp (covered by
+          // scaffold.recall-tunables-survive-apply.test.ts), which would make
+          // this carrier assertion measure the clamp rather than the carry.
+          request_timeout_seconds: 9,
+        },
+      },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=16");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=9");
+    // JSON array, single-quoted so the double quotes survive the shell.
+    // Rendering is noEscape (src/agents/profiles.ts:158); if that ever
+    // changed, `&quot;` would reach the plugin as literal text and the list
+    // would silently parse as empty, so assert the rendered bytes.
+    expect(startSh).toContain(
+      `export HINDSIGHT_RECALL_QUERY_STOP_TERMS='["switchroom","agent"]'`,
+    );
+  });
+
+  it("start.sh exports HINDSIGHT_RECALL_QUERY_MAX_TOKENS=0 when the operator disables shaping", () => {
+    // 0 is the rollback lever ("send the query unshaped"). The export is
+    // unconditional, so the only thing that can break this is a `??`/`||`
+    // slip in the scaffold turning 0 back into the default.
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { query_max_tokens: 0 } },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=0");
+  });
+
+  it("start.sh exports an empty JSON array for HINDSIGHT_RECALL_QUERY_STOP_TERMS", () => {
+    // `[]` is a real value that `_cast_env` parses and assigns, so the env
+    // still beats a stale claude-code.json. Omitting the export would not.
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { query_stop_terms: [] } },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain(`export HINDSIGHT_RECALL_QUERY_STOP_TERMS='[]'`);
   });
 
   it("start.sh does NOT export HINDSIGHT_RECALL_CACHE_TTL_SECS by default (v0.13.22 — 0% measured hit rate)", () => {

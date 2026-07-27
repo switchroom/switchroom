@@ -39,14 +39,21 @@ Exit codes:
       stderr and non-zero exit. Existing behaviour.
 """
 
-import hashlib
-import json
-import os
-import re
-import socket
-import sys
 import time
-import urllib.error
+
+# Taken before anything else is imported, so `_IMPORT_ELAPSED_SECONDS` below
+# captures the real cost of loading this hook's dependencies. That spend is
+# charged against the UserPromptSubmit ceiling (see `HOOK_CEILING_SECONDS`) —
+# `recall_start_monotonic` is taken well into main() and cannot see it.
+_IMPORT_START_MONOTONIC = time.monotonic()
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import socket  # noqa: E402
+import sys  # noqa: E402
+import urllib.error  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -58,8 +65,10 @@ from lib.content import (
     compose_recall_query,
     format_current_time,
     format_memories,
+    shape_recall_query,
     strip_channel_envelope,
     strip_memory_tags,
+    tokenize_for_bm25,
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
@@ -72,6 +81,11 @@ from lib.directives import (
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.parallel_recall import run_parallel
 from lib.state import read_state, write_state
+
+# Cost of everything above, charged against the hook ceiling (see
+# `HOOK_CEILING_SECONDS`). Measured, not estimated: it is dominated by
+# `lib.client` pulling in urllib/ssl and by `lib.content` on cold page cache.
+_IMPORT_ELAPSED_SECONDS = time.monotonic() - _IMPORT_START_MONOTONIC
 
 LAST_RECALL_STATE = "last_recall.json"
 RECALL_CACHE_STATE = "recall_cache.json"
@@ -97,12 +111,6 @@ DIRECTIVES_SLOT = "__directives__"
 # typically resubmit identical prompts), but this trims redundant
 # recall traffic on session-resume re-processing and any retry paths.
 CACHE_ENV = "HINDSIGHT_RECALL_CACHE_TTL_SECS"
-
-# Fallback for the per-bank recall request timeout (seconds) when the config
-# value is absent or unusable. Mirrors lib/config.py's
-# DEFAULTS["recallRequestTimeoutSeconds"] — kept as a module constant so the
-# critical path never depends on the config dict having been populated.
-DEFAULT_RECALL_REQUEST_TIMEOUT = 8.0
 
 # Maximum number of cache entries kept per session before LRU eviction.
 # 100 is comfortably above the typical session size (~30 inbounds) and
@@ -592,8 +600,7 @@ def _is_timeout_error(exc: BaseException) -> bool:
     """True if `exc` is (or wraps) a network read/connect timeout.
 
     Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1). The recall
-    HTTP path is `urllib.request.urlopen(..., timeout=<recallRequestTimeoutSeconds>)`
-    (default 8s; a managed key, see DEFAULT_RECALL_REQUEST_TIMEOUT). On a hard timeout
+    HTTP path is `urllib.request.urlopen(..., timeout=8)`. On a hard timeout
     urlopen raises either a bare ``socket.timeout`` / ``TimeoutError`` or a
     ``urllib.error.URLError`` whose ``.reason`` is one of those. We classify
     both so the per-bank ``timed_out`` flag (and the derived ``deadline_hit``)
@@ -839,6 +846,42 @@ _FALLBACK_TELEMETRY_ZERO = {
     "truncated": False,
 }
 
+# The UserPromptSubmit timeout Claude Code enforces on THIS script, mirrored
+# from `hooks/hooks.json` (which ships in this same package, so the two cannot
+# be configured apart by an operator). `test_hook_ceiling_matches_hooks_json`
+# fails if they ever drift.
+#
+# Overrun is not a degraded recall — Claude Code kills the hook and the turn
+# loses memories, the fallback AND the directives, which is strictly worse than
+# the bug this PR fixes. So every optional tail-end spend is budgeted against
+# what is actually left of the ceiling rather than against a flat constant.
+HOOK_CEILING_SECONDS = 12.0
+# Held back for work this arithmetic cannot see: CPython interpreter boot
+# before our first statement runs, plus rendering the additionalContext
+# payload, the recall_log write and teardown after the last budgeted step.
+HOOK_TAIL_RESERVE_SECONDS = 0.75
+# Anchor for the budget arithmetic. Set at the top of main() rather than at
+# import, so a process that invokes the hook more than once (the test suite,
+# and any future in-process driver) budgets each invocation independently
+# instead of inheriting the whole process lifetime. Import cost is charged
+# explicitly via `_IMPORT_ELAPSED_SECONDS` so re-anchoring loses nothing.
+_hook_start_monotonic = None
+
+
+def _begin_hook_budget():
+    """(Re-)anchor the hook budget clock. Call once at the top of main()."""
+    global _hook_start_monotonic
+    _hook_start_monotonic = time.monotonic() - _IMPORT_ELAPSED_SECONDS
+
+
+def _remaining_hook_budget_seconds():
+    """Seconds left before this hook risks breaching its UserPromptSubmit ceiling."""
+    if _hook_start_monotonic is None:  # pragma: no cover - defensive only
+        return HOOK_CEILING_SECONDS - HOOK_TAIL_RESERVE_SECONDS
+    elapsed = time.monotonic() - _hook_start_monotonic
+    return HOOK_CEILING_SECONDS - HOOK_TAIL_RESERVE_SECONDS - elapsed
+
+
 _FALLBACK_BLOCK_PREAMBLE = (
     "No stored memories matched this query — the fact layer may not have "
     "reconciled this session yet (e.g. an abrupt session death before boot "
@@ -848,7 +891,7 @@ _FALLBACK_BLOCK_PREAMBLE = (
 )
 
 
-def _transcript_grep_fallback(transcript_path, query, config):
+def _transcript_grep_fallback(transcript_path, query, config, budget_ms=None):
     """Bounded transcript-grep fallback for the empty-fact-layer window (#3369).
 
     Reads the CURRENT session transcript's tail (bounded bytes), keeps the most
@@ -858,9 +901,22 @@ def _transcript_grep_fallback(transcript_path, query, config):
     (``recallTranscriptFallbackMaxBytes``), matched turns
     (``recallTranscriptFallbackMaxTurns``), emitted characters
     (``recallTranscriptFallbackMaxChars``), and grep wall-time
-    (``recallTranscriptFallbackDeadlineMs``). The caller only invokes this when
-    all banks returned zero AND no slot hit its deadline, so a timed-out bank can
-    never masquerade as a genuinely empty fact layer.
+    (``recallTranscriptFallbackDeadlineMs``, default 1500). The caller invokes
+    this when all banks returned zero and none ERRORED — a hard bank error can
+    masquerade as a genuinely empty fact layer, so it still suppresses the
+    fallback. A per-bank TIMEOUT no longer does (#3757): timing out was the
+    common case, and suppressing on it left the agent with neither memories nor
+    fallback.
+
+    That inversion removed the gate that INCIDENTALLY protected the hook
+    ceiling, so the grep wall-time bound is now
+    ``min(recallTranscriptFallbackDeadlineMs, remaining hook budget)`` rather
+    than a flat 1.5s (#3760 review, Major 4). A flat 1.5s after a fully-elapsed
+    10s recall left ~0.5s for interpreter startup, config load, the transcript
+    read and output formatting — and an overrun costs the turn its directives
+    too. ``budget_ms`` is that remaining-budget clamp, supplied by the caller;
+    ``<= 0`` means "no time left", and the fallback declines rather than
+    gambling the hook.
 
     Returns ``(block_or_None, telemetry)``. Failure-safe: any error path returns
     ``(None, zeroed-telemetry)`` so the fallback can never break recall.
@@ -882,6 +938,12 @@ def _transcript_grep_fallback(transcript_path, query, config):
     max_turns = _int_cfg("recallTranscriptFallbackMaxTurns", 6)
     max_chars = _int_cfg("recallTranscriptFallbackMaxChars", 2000)
     deadline_ms = _int_cfg("recallTranscriptFallbackDeadlineMs", 1500)
+    if budget_ms is not None:
+        # Never spend more than the hook has left, even when the configured
+        # bound is larger. A caller with no budget left gets nothing at all.
+        deadline_ms = min(deadline_ms, int(budget_ms))
+        if deadline_ms <= 0:
+            return None, telemetry
 
     if max_turns <= 0 or max_chars <= 0 or max_bytes <= 0:
         return None, telemetry
@@ -1240,6 +1302,7 @@ def degraded_recall_notice(bank_id, bank_timings) -> str:
 
 
 def main():
+    _begin_hook_budget()
     config = load_config()
 
     if not config.get("autoRecall"):
@@ -1544,7 +1607,35 @@ def main():
     if len(query) > recall_max_query_chars:
         query = query[:recall_max_query_chars]
 
-    debug_log(config, f"Recalling from bank '{bank_id}', query length: {len(query)}")
+    # Switchroom recall-latency fix (#3757) — bound the BM25 term count of the
+    # query we put on the wire. `recallMaxQueryChars` bounds CHARACTERS, which
+    # is not the cost driver: Hindsight OR-joins every token into one tsquery
+    # and Postgres native FTS ranks the whole matched set before the top-60
+    # heapsort, so cost tracks the number of DISTINCT TERMS. An 800-char
+    # composed query is ~96 distinct terms and matched 119,510 rows on the
+    # live `overlord` bank (14.0s for the 3-arm UNION, and up to 94s under
+    # load) — past the 8s client timeout, which is why 96.8% of that agent's
+    # own-bank recalls returned nothing. Shaped to 24 terms the same query
+    # matches 48,433 rows in 2.5-2.8s.
+    #
+    # `search_query` is what the SERVER sees. `query` (unshaped) stays the
+    # client-side lexical reference: the `recallMinOverlap` containment gate
+    # and the transcript-grep fallback both measure against the user's real
+    # words, so shaping cannot silently move their thresholds. `query_chars`
+    # telemetry also stays on the unshaped value for continuity with the
+    # existing recall_log history.
+    search_query = shape_recall_query(
+        query,
+        recall_query_text,
+        max_tokens=config.get("recallQueryMaxTokens", 24),
+        stop_terms=config.get("recallQueryStopTerms") or (),
+    )
+
+    debug_log(
+        config,
+        f"Recalling from bank '{bank_id}', query length: {len(query)}, "
+        f"search terms: {len(set(tokenize_for_bm25(search_query)))}",
+    )
 
     # Fetch active directives FIRST (independent of recall — even if recall
     # finds no memories, an agent with active directives still needs them
@@ -1578,30 +1669,18 @@ def main():
             ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
         )
 
-    # Per-bank hard request timeout. Was a bare `timeout=8` literal here until
-    # switchroom promoted it to a managed key (`recallRequestTimeoutSeconds` /
-    # HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS, stamped from
-    # `memory.recall.request_timeout_seconds`). Resolved ONCE outside the task
-    # factory so every bank in a fan-out shares one value.
-    #
-    # Defensive coercion: a malformed config value must not take recall down to
-    # a traceback on the critical path, and a non-positive timeout would mean
-    # "fail instantly, every turn" — the worst possible failure mode for a
-    # memory hook. Both fall back to the shipped default.
     try:
-        request_timeout = float(
-            config.get("recallRequestTimeoutSeconds", DEFAULT_RECALL_REQUEST_TIMEOUT)
-        )
+        recall_request_timeout = float(config.get("recallRequestTimeoutSeconds", 12))
     except (TypeError, ValueError):
-        request_timeout = DEFAULT_RECALL_REQUEST_TIMEOUT
-    if not request_timeout > 0:
-        request_timeout = DEFAULT_RECALL_REQUEST_TIMEOUT
+        recall_request_timeout = 12.0
+    if recall_request_timeout <= 0:
+        recall_request_timeout = 12.0
 
-    def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups):
+    def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups, timeout_override=None):
         def _bank_task():
             return client.recall(
                 bank_id=target_bank_id,
-                query=query,
+                query=search_query,
                 max_tokens=config.get("recallMaxTokens", 1024),
                 budget=config.get("recallBudget", "mid"),
                 types=config.get("recallTypes"),
@@ -1615,13 +1694,31 @@ def main():
                 # slots for denser coverage inside the same budget. On by default;
                 # operators can pin off via `recallPreferObservations: false`.
                 prefer_observations=config.get("recallPreferObservations", True),
-                # In-script per-request timeout (default 8s): even parallelised,
-                # each bank carries its own hard deadline so a single hung bank
-                # returns cleanly with no memories rather than sitting on the
-                # shared deadline. Tightened from 10s in v0.13.22 (2026-05-24
+                # Per-request in-script timeout: even parallelised, each bank
+                # carries its own hard deadline so a single hung bank returns
+                # cleanly with no memories rather than sitting on the shared
+                # deadline. Tightened from 10s to 8s in v0.13.22 (2026-05-24
                 # breach audit); the shared deadline below is the outer ceiling
-                # guard. Now a managed key — see `request_timeout` above.
-                timeout=request_timeout,
+                # guard.
+                #
+                # Switchroom #3757: no longer a hardcoded literal. It was the
+                # binding constraint on a slow bank (96.8% of overlord's
+                # own-bank recalls hit exactly 8s and returned NOTHING), and a
+                # hand-patch of the installed copy does not survive
+                # `switchroom apply` — the plugin dir is re-copied from
+                # `vendor/hindsight-memory` on every reconcile. Default raised
+                # to 12s, matching the UserPromptSubmit hook's own 12s budget
+                # (hooks/hooks.json). Note the SHARED multi-bank deadline
+                # (`recallParallelDeadlineSeconds`, default 10s) is the tighter
+                # outer bound in the default configuration, so at the default
+                # this timeout only binds when an operator raises that. SAFETY
+                # NET behind the query-shaping fix above, not the fix.
+                # Operator knob: `memory.recall.request_timeout_seconds`.
+                timeout=(
+                    recall_request_timeout
+                    if timeout_override is None
+                    else timeout_override
+                ),
             )
         return _bank_task
 
@@ -1744,6 +1841,14 @@ def main():
         # own-bank debug line, logs the directives block after the bank loop
         # rather than before, and __main__ still os._exit(0)s on completion.
         recall_mode = "serial"
+        # #3760 review, Major 4. This path has no outer deadline — bank
+        # latencies SUM — so raising the per-bank timeout 8s -> 12s would let
+        # two banks spend 24s against a 12s hook ceiling. Each bank is instead
+        # clamped to whatever the hook has left when its turn comes, so the
+        # serial path can no longer breach the ceiling no matter how many banks
+        # are configured. `deadline_budget_ms` stays None on the log row: this
+        # is a per-bank clamp, not the parallel path's shared deadline, and
+        # conflating them would corrupt the serial-vs-parallel comparison.
         deadline_budget_ms = None
         deadline_effective_ms = None
         _directives_start = time.monotonic()
@@ -1760,7 +1865,18 @@ def main():
             _bank_errored = False
             _bank_error = None
             try:
-                response = _make_bank_task(b_id, b_tags, b_tags_match, b_tag_groups)()
+                _bank_budget = _remaining_hook_budget_seconds()
+                if _bank_budget <= 0:
+                    raise TimeoutError(
+                        f"hook budget exhausted before bank '{b_id}' was queried"
+                    )
+                response = _make_bank_task(
+                    b_id,
+                    b_tags,
+                    b_tags_match,
+                    b_tag_groups,
+                    timeout_override=min(recall_request_timeout, _bank_budget),
+                )()
                 bank_results = response.get("results", []) if isinstance(response, dict) else []
                 if bank_results:
                     debug_log(config, f"Got {len(bank_results)} memories from bank '{b_id}'")
@@ -1928,18 +2044,29 @@ def main():
     # On by default; HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK=false is the rollback
     # lever. Mutually exclusive with memories_block by construction: a non-empty
     # memories_block requires results, which requires pre_filter_count > 0.
+    #
+    # Switchroom #3757 — `deadline_hit` NO LONGER SUPPRESSES the fallback.
+    # The original gate was written when a deadline meant "the fact layer is
+    # unknown, don't guess". In practice a timeout was the COMMON case (96.8%
+    # of overlord's own-bank recalls over the 7 days to 2026-07-27), and the
+    # gate meant a timed-out turn got neither memories NOR the fallback — the
+    # agent went in blind. A timeout and an outage are different: on a timeout
+    # the banks are healthy and reachable, we simply ran out of time, so the
+    # bounded transcript grep is strictly better than nothing. A hard bank
+    # ERROR still suppresses it (`bank_errored`), because that genuinely can
+    # masquerade as an empty fact layer while the store is down.
     transcript_fallback_block = None
     transcript_fallback_telemetry = dict(_FALLBACK_TELEMETRY_ZERO)
     if (
         config.get("recallTranscriptFallback", True)
         and pre_filter_count == 0
-        and not deadline_hit
         and not bank_errored
     ):
         transcript_fallback_block, transcript_fallback_telemetry = _transcript_grep_fallback(
             hook_input.get("transcript_path", ""),
             query,
             config,
+            budget_ms=_remaining_hook_budget_seconds() * 1000.0,
         )
         if transcript_fallback_block:
             debug_log(

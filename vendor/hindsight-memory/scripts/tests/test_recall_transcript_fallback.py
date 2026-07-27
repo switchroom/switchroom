@@ -12,10 +12,16 @@ Acceptance guarantees (outcomes, not code paths):
      suppresses the fallback entirely (no fallback block, log False) — the
      fact layer is not empty.
 
-  3. **Does NOT fire when a bank hit its deadline.** deadline_hit True (a bank
-     abandoned at the shared deadline) means the empty result set may be a
-     TIMEOUT, not a genuinely empty fact layer — the #3369 sequencing
-     constraint — so the fallback is suppressed even though results are empty.
+  3. **DOES fire when a bank hit its deadline** (switchroom #3757 — inverted
+     from the original #3369 gate). The original rule suppressed the fallback
+     on ``deadline_hit`` on the theory that a timeout leaves the fact layer
+     unknown. In production a timeout was the COMMON case (96.8% of the
+     `overlord` agent's own-bank recalls over the 7 days to 2026-07-27), so the
+     rule meant a timed-out turn got neither memories NOR fallback — the agent
+     went in blind. A timeout is not an outage: the banks are healthy, we just
+     ran out of time, and a bounded transcript grep beats nothing. A hard bank
+     ERROR still suppresses it (guarantee 3b) because an unreachable store CAN
+     masquerade as an empty fact layer.
 
   4. **Byte bound holds.** With a small ``…MaxBytes``, only the transcript TAIL
      is read: a query-matching line that lives only in the (discarded) HEAD is
@@ -249,8 +255,15 @@ class DoesNotFireWhenFactLayerNotEmpty(_Harness):
         self.assertEqual(e["result_count"], 1)
 
 
-class DoesNotFireWhenDeadlineHit(_Harness):
-    def test_timed_out_bank_suppresses_fallback(self):
+class FiresWhenDeadlineHit(_Harness):
+    """Switchroom #3757 — a TIMEOUT must not cost the turn its fallback too.
+
+    This is the exact inversion of the original #3369 gate. Before the fix a
+    timed-out recall produced neither memories nor fallback, which on the
+    fleet's large banks was the majority of turns.
+    """
+
+    def test_timed_out_bank_still_fires_fallback(self):
         transcript = self._write_transcript([
             _nested_line("user", "we should redo the auth flow with PKCE"),
         ])
@@ -268,10 +281,14 @@ class DoesNotFireWhenDeadlineHit(_Harness):
                 "recallParallelDeadlineSeconds": 0.5,
             },
         )
-        self.assertIsNone(context, "fallback must not fire when a bank timed out")
+        self.assertIsNotNone(
+            context, "a timed-out recall must still get the transcript fallback"
+        )
+        self.assertIn("<hindsight_transcript_fallback>", context)
+        self.assertIn("PKCE", context)
         e = self._read_log()[0]
         self.assertTrue(e["deadline_hit"])
-        self.assertFalse(e["transcript_fallback"])
+        self.assertTrue(e["transcript_fallback"])
 
 
 class DoesNotFireWhenBankErrored(_Harness):

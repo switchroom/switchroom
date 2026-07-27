@@ -148,7 +148,14 @@ describe("recall latency tunables are declarative and survive apply", () => {
     // promotion must not change what switchroom ships.
     expect(readHookTimeout()).toBe(12);
     expect(readSettings().recallParallelDeadlineSeconds).toBe(10);
-    expect(readSettings().recallRequestTimeoutSeconds).toBe(8);
+    // The per-bank timeout is the inner safety net, so unset it DERIVES from
+    // the fan-out deadline rather than taking the vendor literal (12): a
+    // per-bank value above the shared deadline can never fire, and stamping
+    // one would report a clamp on a config the operator never wrote.
+    expect(readSettings().recallRequestTimeoutSeconds).toBe(10);
+    expect(readSettings().recallRequestTimeoutSeconds).toBeLessThanOrEqual(
+      readSettings().recallParallelDeadlineSeconds as number,
+    );
   });
 
   it("leaves the vendor tree untouched", () => {
@@ -285,10 +292,17 @@ describe("resolveHindsightRecallTunables", () => {
   it("defaults match the literals the plugin shipped before promotion", () => {
     const t = resolveHindsightRecallTunables(undefined);
     expect(t.hookTimeoutSeconds).toBe(DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS);
-    expect(t.requestTimeoutSeconds).toBe(DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS);
     expect(t.parallelDeadlineSeconds).toBe(
       DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS - RECALL_DEADLINE_HEADROOM_SECONDS,
     );
+    // DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS is a CEILING on the derived
+    // per-bank default, not the default itself: the shared fan-out deadline is
+    // the tighter outer guard, so the resolved value is whichever is smaller.
+    expect(t.requestTimeoutSeconds).toBe(
+      Math.min(DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS, t.parallelDeadlineSeconds),
+    );
+    // ...and the shipped combination must resolve without reporting a clamp,
+    // or every stock agent gets a drift row for config it never wrote.
     expect(t.clamps).toEqual([]);
   });
 

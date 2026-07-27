@@ -98,9 +98,14 @@ class _Harness(unittest.TestCase):
 
 
 class PerBankTimeoutIsConfigured(_Harness):
-    def test_default_matches_the_historical_literal(self):
-        # Promotion to a managed key must not change what switchroom ships.
-        self.assertEqual(self._timeouts(), [8.0])
+    def test_default_matches_the_shipped_default(self):
+        # Promotion to a managed key must not change what switchroom ships:
+        # with the key absent from config, the value reaching the client is
+        # exactly DEFAULTS["recallRequestTimeoutSeconds"] — not the client
+        # library's own default, and not None.
+        self.assertEqual(
+            self._timeouts(), [float(DEFAULTS["recallRequestTimeoutSeconds"])]
+        )
 
     def test_configured_value_reaches_the_client(self):
         self.assertEqual(
@@ -131,7 +136,8 @@ class PerBankTimeoutIsConfigured(_Harness):
         for bad in ("not-a-number", None, 0, -3):
             with self.subTest(bad=bad):
                 self.assertEqual(
-                    self._timeouts({"recallRequestTimeoutSeconds": bad}), [8.0]
+                    self._timeouts({"recallRequestTimeoutSeconds": bad}),
+                    [float(DEFAULTS["recallRequestTimeoutSeconds"])],
                 )
 
 
@@ -140,19 +146,36 @@ class ManagedKeyIsWired(unittest.TestCase):
         # Both halves are required for the key to be settable declaratively:
         # the default is the shipped value, the env override is what lets
         # switchroom.yaml outrank a stale ~/.hindsight/claude-code.json.
-        self.assertEqual(DEFAULTS["recallRequestTimeoutSeconds"], 8)
+        # 12s, raised from the historical 8 by #3760 after measuring that 8s
+        # fired on 96.8% of one agent's own-bank recalls and returned nothing.
+        # Pinned as a literal on purpose: src/setup/hindsight-recall-tunables.ts
+        # carries the same number for the env export, which OUTRANKS this file,
+        # and hindsight-reranker-budget.test.ts fails CI if the two drift.
+        self.assertEqual(DEFAULTS["recallRequestTimeoutSeconds"], 12)
         self.assertIn("HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS", ENV_OVERRIDES)
         key, typ = ENV_OVERRIDES["HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS"]
         self.assertEqual(key, "recallRequestTimeoutSeconds")
-        self.assertIs(typ, float)
+        # int, matching the sibling HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS
+        # override and switchroom's zod schema, which declares
+        # `memory.recall.request_timeout_seconds` as `.int()`
+        # (src/config/schema.ts). A float cast here would accept a value the
+        # schema can never produce; an int cast against a float-typed schema
+        # would silently DROP the override (`_cast_env` returns None and the
+        # assignment is skipped), which is the exact silent-fallthrough this
+        # test class exists to prevent.
+        self.assertIs(typ, int)
 
     def test_env_override_wins_over_the_built_in_default(self):
         with patch.dict(
             os.environ,
-            {"HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS": "11.5"},
+            {"HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS": "11"},
             clear=False,
         ):
-            self.assertEqual(load_config()["recallRequestTimeoutSeconds"], 11.5)
+            self.assertEqual(load_config()["recallRequestTimeoutSeconds"], 11)
+            self.assertNotEqual(
+                load_config()["recallRequestTimeoutSeconds"],
+                DEFAULTS["recallRequestTimeoutSeconds"],
+            )
 
 
 class EnvBeatsTheUserConfigFile(unittest.TestCase):

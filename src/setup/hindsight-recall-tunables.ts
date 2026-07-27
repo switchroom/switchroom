@@ -79,8 +79,20 @@ export const RECALL_DEADLINE_HEADROOM_SECONDS = 2;
  */
 export const MIN_RECALL_HOOK_TIMEOUT_SECONDS = RECALL_DEADLINE_HEADROOM_SECONDS + 1;
 
-/** Vendor/shipped default for the per-bank recall HTTP timeout (seconds). */
-export const DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS = 8;
+/**
+ * Vendor/shipped default for the per-bank recall HTTP timeout (seconds), kept
+ * in lockstep with `lib/config.py`'s `DEFAULTS["recallRequestTimeoutSeconds"]`
+ * and pinned by hindsight-reranker-budget.test.ts. #3757 raised it from a
+ * hardcoded 8 after measuring that 8s fired on 96.8% of one agent's own-bank
+ * recalls and returned the model nothing.
+ *
+ * Note this is a CEILING on the derived default, not the derived default
+ * itself: with no operator config the request timeout resolves to the
+ * effective parallel deadline (see `resolveHindsightRecallTunables`), because
+ * the shared fan-out deadline is already the tighter outer guard and a
+ * per-bank value above it can never bind.
+ */
+export const DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS = 12;
 
 /** The resolved, mutually-consistent recall latency envelope for one agent. */
 export interface HindsightRecallTunables {
@@ -169,8 +181,16 @@ export function resolveHindsightRecallTunables(
     parallelDeadlineSeconds = maxDeadline;
   }
 
+  // Unset, the per-bank timeout DERIVES from the deadline rather than taking
+  // the vendor literal. The shared fan-out deadline is already the tighter
+  // outer guard (#3757), so a per-bank value above it can never fire — and
+  // taking the vendor's 12 against the shipped deadline of 10 would push every
+  // stock agent through the clamp below, reporting a "clamp" on a config the
+  // operator never wrote. Deriving keeps the stock resolution clamp-free while
+  // preserving the intent: per-bank is the safety net, not the budget.
   let requestTimeoutSeconds =
-    usable(recall?.request_timeout_seconds) ?? DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS;
+    usable(recall?.request_timeout_seconds) ??
+    Math.min(DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS, parallelDeadlineSeconds);
   if (requestTimeoutSeconds > parallelDeadlineSeconds) {
     clamps.push(
       `memory.recall.request_timeout_seconds ${requestTimeoutSeconds}s exceeds the ` +
