@@ -115,7 +115,18 @@ def compose_recall_query(
         if role == "user" and content == latest:
             continue
 
-        context_lines.append(f"{role}: {content}")
+        # Switchroom recall-latency fix (#3757): NO ``{role}: `` prefix.
+        # These labels were formatting scaffolding, never search terms, and
+        # they were the single most expensive thing this hook put on the wire.
+        # Hindsight's BM25 arm OR-joins every query token, so ``user`` and
+        # ``assistant`` widened the match set by the two highest-document-
+        # frequency terms in a mature bank (measured on bank ``overlord``,
+        # 135,443 rows: ``user`` = 67,363 rows = 50% of the bank,
+        # ``assistant`` = 29,942 = 22%). Dropping just these two labels cut a
+        # production-shaped 3-arm BM25 UNION from 119,510 ranked rows / 14.0s
+        # to 86,653 / 11.8s. Turn separation is preserved by the newline join,
+        # which is all the embedding arm needs.
+        context_lines.append(content)
 
     if not context_lines:
         return latest
@@ -179,6 +190,370 @@ def truncate_recall_query(query: str, latest_query: str, max_chars: int) -> str:
     if kept:
         return f"{context_marker}{chr(10).join(kept)}{suffix}"
     return latest_only
+
+
+# ---------------------------------------------------------------------------
+# Recall: search-query shaping (BM25 token budget)
+# ---------------------------------------------------------------------------
+#
+# Switchroom recall-latency fix (#3757). Hindsight's keyword arm OR-joins
+# EVERY token of the query into one `to_tsquery` disjunction, and Postgres
+# native FTS cannot top-k from the GIN index — it computes `ts_rank_cd` on
+# every matching row before the top-60 heapsort. So BM25 cost grows with the
+# size of the matched set, which grows with query length. Measured on the live
+# `overlord` bank (135,565 memory_units, 3 fact-type arms, LIMIT 60 each,
+# production-shaped composed query):
+#
+#     as shipped (96 distinct terms)     119,510 rows ranked    14.0 s
+#     role labels + header stripped      86,653 rows ranked     11.8 s
+#     + capped to 24 BM25 terms          48,433 rows ranked      2.7 s
+#
+# The 8s client timeout then fired on 96.8% of overlord's own-bank recalls
+# over the 7 days to 2026-07-27, so the agent got zero memories.
+#
+# We therefore shape the query into a bounded set of the most selective terms
+# before it goes on the wire. Only the SERVER-BOUND query is shaped; the
+# client-side lexical surfaces (the `recallMinOverlap` containment gate and the
+# transcript-grep fallback) keep the unshaped text, so this change cannot move
+# their thresholds.
+
+# Common English function words.
+#
+# MEASURED CAVEAT, so nobody over-credits this list: on the CURRENT backend
+# (Postgres native tsvector with the `english` configuration) these are already
+# stopped by Postgres itself — `to_tsquery('english', 'the | user | worktree')`
+# returns `'user' | 'worktre'`. Removing them client-side moved the matched set
+# by only 86,653 → ~86,300 rows on the `overlord` bank. Their real job here is
+# BUDGET: every function word we send would otherwise consume one of the
+# `max_tokens` slots that a content word needs. They also matter directly on
+# the non-native backends Hindsight supports (vchord / pgroonga / pg_search /
+# pg_textsearch), none of which strip English stopwords for us.
+#
+# Deliberately conservative: only closed-class words (determiners, pronouns,
+# prepositions, auxiliaries, conjunctions), never content words.
+BM25_STOPWORDS = frozenset(
+    """
+    a about above after again against all am an and any are aren as at
+    be because been before being below between both but by
+    can cannot could couldn
+    did didn do does doesn doing don down during
+    each few for from further
+    had hadn has hasn have haven having he her here hers herself him himself his
+    how
+    i if in into is isn it its itself
+    just
+    ll
+    me more most mustn my myself
+    no nor not now
+    of off on once only or other ought our ours ourselves out over own
+    re
+    s same shan she should shouldn so some such
+    t than that the their theirs them themselves then there these they this
+    those through to too
+    under until up
+    ve very
+    was wasn we were weren what when where which while who whom why will with
+    won would wouldn
+    you your yours yourself yourselves
+    """.split()
+)
+
+# Role labels this hook used to prefix onto context turns, plus the composed
+# query's own section header. Structural scaffolding, never search terms.
+_ROLE_LABEL_RE = re.compile(r"(?mi)^\s*(?:user|assistant|system|tool)\s*:[ \t]*")
+_CONTEXT_HEADER_RE = re.compile(r"(?mi)^\s*prior context\s*:[ \t]*$")
+
+# Mirrors the server's own BM25 tokenizer
+# (hindsight_api/engine/search/retrieval.py::tokenize_query): lowercase, strip
+# punctuation, split on whitespace, then APPEND intact "compound" tokens —
+# word-char runs joined by . / - (semvers, paths, hyphenated identifiers) —
+# because the server emits those alongside their fragments. Keeping the two in
+# sync is what makes the cap mean "N terms in the tsquery", not "N words we
+# happened to send".
+_COMPOUND_TOKEN_RE = re.compile(r"\w+(?:[./-]\w+)+")
+
+
+def tokenize_for_bm25(text: str) -> list:
+    """Tokenize ``text`` the way Hindsight's BM25 arm will.
+
+    Port of ``tokenize_query`` in the Hindsight engine. Returns the token list
+    (with duplicates, in order); the tsquery ORs the distinct values.
+    """
+    lowered = text.lower()
+    tokens = re.sub(r"[^\w\s]", " ", lowered).split()
+    if not tokens:
+        return []
+    for match in _COMPOUND_TOKEN_RE.finditer(lowered):
+        compound = match.group(0)
+        if compound not in tokens:
+            tokens.append(compound)
+    return tokens
+
+
+def strip_query_scaffolding(text: str) -> str:
+    """Remove role labels and the "Prior context:" header from a query.
+
+    Defence in depth for #3757: ``compose_recall_query`` no longer emits the
+    ``user:`` / ``assistant:`` prefixes, but a transcript turn can legitimately
+    *contain* such a line, and older composed strings may still reach here.
+    """
+    text = _CONTEXT_HEADER_RE.sub("", text)
+    return _ROLE_LABEL_RE.sub("", text)
+
+
+_ENGLISH_WORDS_FILE = os.path.join(os.path.dirname(__file__), "english_words.txt")
+_ENGLISH_WORDS_CACHE = None
+
+
+def common_english_words() -> frozenset:
+    """Lazily load the common-English demotion list (see english_words.txt).
+
+    Read once per process and cached. A missing or unreadable file degrades to
+    an empty set — shaping still works, it just loses the demotion signal — so
+    a packaging slip can never break recall on the critical path.
+    """
+    global _ENGLISH_WORDS_CACHE
+    if _ENGLISH_WORDS_CACHE is None:
+        words = set()
+        try:
+            with open(_ENGLISH_WORDS_FILE, encoding="utf-8") as handle:
+                for line in handle:
+                    word = line.strip()
+                    if word and not word.startswith("#"):
+                        words.add(word)
+        except OSError:
+            words = set()
+        _ENGLISH_WORDS_CACHE = frozenset(words)
+    return _ENGLISH_WORDS_CACHE
+
+
+# How much each signal is worth. Digit and compound are equal because both are
+# measured to predict the same thing (an identifier); the English demotion is
+# deliberately smaller than either, so a digit-bearing English word still wins.
+_SCORE_DIGIT = 3.0
+_SCORE_COMPOUND = 3.0
+_SCORE_NOT_COMMON_ENGLISH = 2.0
+# Recency is a WEIGHT, not a tier (#3760 review, Blocker 2). Sized below the
+# shape signals on purpose: a distinctive prior-context identifier (`nginx`,
+# score 2.0) must outrank a generic latest-turn English word (score 0.0 + 1.5),
+# but between two terms of equal merit the one the user just typed wins.
+_SCORE_RECENCY = 1.5
+
+
+def _selectivity_score(token: str) -> float:
+    """Deterministic proxy for how discriminating ``token`` is.
+
+    True per-token document frequency is not available client-side: Hindsight
+    exposes no term-stats endpoint, and one ``count(*)`` probe per token would
+    cost more than the query it is trying to speed up. Every signal below was
+    checked against real df, measured with ``ts_stat`` over the live `overlord`
+    bank (135,565 units) and five other topically-unrelated banks:
+
+      * carries a digit (+3.0) — versions, issue numbers, ids, dates. The one
+        shape that reliably predicts a low df: median df 0.000, and only 6.8%
+        of digit-bearing tokens exceed 1% of the bank, against 33-50% for every
+        other shape class.
+      * is a compound token (+3.0) — ``v0.19.17``, ``src/agents/scaffold.ts``.
+      * is NOT a common English word (+2.0) — see ``english_words.txt``. df
+        cannot separate contentless English from domain identifiers (both are
+        rare: `particularly` 0.022%, `situation` 0.018%, vs `npm` 1.38%,
+        `worktree` 1.85%), but English-word membership can, and it is exactly
+        the separation the budget needs.
+
+    LENGTH IS DELIBERATELY ABSENT. The previous revision added
+    ``min(len(token), 12) / 4.0``. Measured median `overlord` df by token
+    length is flat-to-RISING — len2 0.0022, len3 0.0032, len4 0.0042,
+    len5 0.0070, len6 0.0103, len7 0.0102, len9 0.0068, len11 0.0055,
+    len13 0.0093 — so length predicts nothing in either direction. Inverting
+    it would have been as unjustified as the original; it is dropped instead.
+    Case was checked too and also rejected: `Capitalised` tokens have the
+    HIGHEST rate of df > 1% (50.6%), and ALLCAPS the highest mean df (0.034).
+
+    Known limit: bank-specific high-df content words (`agent` and `switchroom`
+    each match ~20% of the `overlord` bank) still score normally. They are not
+    a cost problem — ``max_tokens`` bounds tsquery cost regardless of which
+    terms are chosen — only a slot-allocation one, and they remain the job of
+    the operator-set ``recallQueryStopTerms``.
+    """
+    score = 0.0
+    if any(ch.isdigit() for ch in token):
+        score += _SCORE_DIGIT
+    if _COMPOUND_TOKEN_RE.fullmatch(token):
+        score += _SCORE_COMPOUND
+    if token not in common_english_words():
+        score += _SCORE_NOT_COMMON_ENGLISH
+    return score
+
+
+def shape_recall_query(
+    query: str,
+    latest_query: str = "",
+    max_tokens: int = 24,
+    stop_terms=None,
+) -> str:
+    """Bound the BM25 cost of ``query`` by capping its distinct tsquery terms.
+
+    Returns a space-joined term string in the query's original word order (so
+    the embedding arm still sees the text's natural sequence, just with the
+    scaffolding and function words removed).
+
+    Selection is RESERVE-then-FILL, in three parts:
+
+      1. ``max_tokens // 3`` slots go to the highest-:func:`_selectivity_score`
+         terms in the whole window, recency deliberately excluded from that
+         score. The most discriminating terms present survive regardless of
+         which turn they came from.
+      2. ``max_tokens // 3`` slots go to the best terms of the latest turn, so
+         a prior turn dense in high-merit tokens (a pasted stack trace, a list
+         of ids) cannot cost the user the question they just asked.
+      3. Everything left is filled by ``_selectivity_score`` plus
+         ``_SCORE_RECENCY`` for terms appearing in ``latest_query``, ties broken
+         by first appearance.
+
+    Both reserves are CEILINGS, not allocations: a side with fewer terms simply
+    leaves its unused slots to the fill, and a window under ``max_tokens`` terms
+    is unaffected entirely.
+
+    Recency is therefore a WEIGHT, not an absolute tier (#3760 review, Blocker
+    2). It has to be preferred at all, because the composed query is
+    ``Prior context: <older turns> … <latest>`` and a naive truncation keeps
+    whichever turn comes FIRST — i.e. throws away the actual question and keeps
+    the stalest context. But making it absolute silently defeated
+    ``recallContextTurns``: any latest turn with ``>= max_tokens`` surviving
+    terms took EVERY slot, so a conversational follow-up whose subject lives
+    only in the prior turn ("is the thing we were discussing still broken?")
+    produced a query with no subject in it at all. Step 1 is the structural
+    guarantee against that; step 3 is where recency actually decides anything,
+    and in ordinary conversational text — where nearly every candidate scores
+    0.0 on shape — that is most of the budget.
+
+    A kept compound token costs its own slot PLUS a slot for each fragment the
+    server will shred it into, so the emitted string never expands past
+    ``max_tokens`` distinct tsquery terms.
+
+    ``max_tokens <= 0`` disables shaping and returns ``query`` unchanged (the
+    operator rollback lever, ``memory.recall.query_max_tokens: 0``).
+    """
+    # Defensive coercion: `max_tokens` reaches here from settings.json /
+    # env, so a string or None is a config error, not a crash on the recall
+    # critical path. Anything uninterpretable falls back to "do not shape".
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        return query
+    if max_tokens <= 0:
+        return query
+
+    cleaned = strip_query_scaffolding(query)
+    tokens = tokenize_for_bm25(cleaned)
+    if not tokens:
+        # Nothing tokenizable (e.g. a pure-punctuation prompt) — send the
+        # original so we never turn a real query into an empty one.
+        return query
+
+    stop = set(BM25_STOPWORDS)
+    # A bare string here (`"switchroom,agent"` mis-set in settings.json) would
+    # otherwise iterate CHARACTERS and stop-list half the alphabet.
+    if isinstance(stop_terms, str):
+        stop_terms = [t for t in re.split(r"[,\s]+", stop_terms) if t]
+    for term in stop_terms or ():
+        if isinstance(term, str) and term.strip():
+            stop.add(term.strip().lower())
+
+    latest_tokens = set(tokenize_for_bm25(strip_query_scaffolding(latest_query or "")))
+
+    first_seen = {}
+    for index, token in enumerate(tokens):
+        first_seen.setdefault(token, index)
+
+    candidates = [t for t in first_seen if len(t) > 1 and t not in stop]
+    if not candidates:
+        # Every term was a stopword. Fall back to the unfiltered token set so a
+        # short conversational prompt ("what did you say about it?") still
+        # searches for something.
+        candidates = [t for t in first_seen if len(t) > 1] or list(first_seen)
+
+    def weight(token):
+        score = _selectivity_score(token)
+        if token in latest_tokens:
+            score += _SCORE_RECENCY
+        return score
+
+    # MERIT RESERVE, then RECENCY FILL.
+    #
+    # `max_tokens // 3` slots are reserved for the highest-merit terms in the
+    # WHOLE window, scored with recency deliberately excluded, so the most
+    # discriminating terms present cannot be displaced by sheer latest-turn
+    # volume no matter which turn they came from. That is the Blocker 2
+    # guarantee, and it is structural: a conversational follow-up whose subject
+    # lives only in the prior turn ("is the thing we were discussing still
+    # broken?") keeps its subject.
+    #
+    # The remaining two thirds are filled by the recency-WEIGHTED score, which
+    # is where `_SCORE_RECENCY` earns its keep: between terms of equal merit —
+    # and after stopword removal most conversational terms are equal on merit —
+    # the one the user just typed wins, instead of the composed string's leading
+    # (i.e. STALEST) turn winning on `first_seen` alone.
+    #
+    # The reserve is a ceiling, not an allocation: any term it reserves that the
+    # recency fill would have chosen anyway costs nothing, and a window with
+    # fewer than `max_tokens` terms is unaffected entirely.
+    reserve_size = max(1, max_tokens // 3)
+    merit_ordered = sorted(candidates, key=lambda t: (-_selectivity_score(t), first_seen[t]))
+    reserved = merit_ordered[:reserve_size]
+    reserved_set = set(reserved)
+
+    # ...and a mirror-image LATEST-TURN reserve of the same size, because a
+    # merit reserve alone is one-sided. A prior turn dense in high-merit tokens
+    # (a pasted stack trace, a list of ids) outscores an ordinary question on
+    # every slot, which would cost the user the thing they actually just asked.
+    # Same shape as above: a ceiling of `max_tokens // 3`, never an allocation.
+    latest_reserve = sorted(
+        (t for t in candidates if t in latest_tokens and t not in reserved_set),
+        key=lambda t: (-weight(t), first_seen[t]),
+    )[:reserve_size]
+    reserved_set.update(latest_reserve)
+
+    filled = sorted(
+        (t for t in candidates if t not in reserved_set),
+        key=lambda t: (-weight(t), first_seen[t]),
+    )
+    candidates = reserved + latest_reserve + filled
+
+    kept = []
+    emitted = set()
+    for token in candidates:
+        # A compound token is emitted by the server ALONGSIDE its fragments;
+        # charge the budget for both so `max_tokens` is a true tsquery bound.
+        expansion = {token}
+        if _COMPOUND_TOKEN_RE.fullmatch(token):
+            expansion |= set(re.sub(r"[^\w\s]", " ", token).split())
+        new_terms = expansion - emitted
+        if len(emitted) + len(new_terms) > max_tokens:
+            continue
+        emitted |= new_terms
+        kept.append(token)
+
+    if not kept:
+        return query
+
+    kept.sort(key=lambda t: first_seen[t])
+    # Emit the ORIGINAL surface form of each survivor, not the lowercased
+    # token. BM25 lowercases and stems on the server either way, but the SAME
+    # string also feeds the embedding arm, and `Python` / `Coolify` / `PR`
+    # carry case a sentence-transformer legitimately uses.
+    surfaces = _surface_forms(cleaned)
+    return " ".join(surfaces.get(t, t) for t in kept)
+
+
+def _surface_forms(text: str) -> dict:
+    """Map each BM25 token to its first original-case spelling in ``text``."""
+    forms = {}
+    for word in re.sub(r"[^\w\s]", " ", text).split():
+        forms.setdefault(word.lower(), word)
+    for match in _COMPOUND_TOKEN_RE.finditer(text):
+        forms.setdefault(match.group(0).lower(), match.group(0))
+    return forms
 
 
 # ---------------------------------------------------------------------------

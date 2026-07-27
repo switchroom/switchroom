@@ -9,8 +9,10 @@ Two single-concern guarantees:
      the one recorded in ``recall_log.jsonl`` (acceptance: no ``<channel``
      substring in the logged query). The multi-turn fixture is a regression
      guard for the future ``recallContextTurns`` default flip (A2): it locks
-     in that the composed query — both its "Prior context:" lines and its
-     trailing latest-query segment — is envelope-free.
+     in that the composed query — both its prior-context turns and its
+     trailing latest-query segment — is envelope-free. Since #3757 the wire
+     query is additionally term-shaped, so these assert the hygiene invariant
+     (which terms may appear) rather than a byte-exact string.
 
   2. Telemetry — every non-cache recall log carries per-bank latency +
      timeout flags, directives-fetch latency, total critical-path wall time,
@@ -130,7 +132,14 @@ class SingleTurnEnvelopeStrip(unittest.TestCase):
         self.assertEqual(len(wrapped_client.queries), 1)
         self.assertEqual(len(bare_client.queries), 1)
         self.assertEqual(wrapped_client.queries[0], bare_client.queries[0])
-        self.assertEqual(wrapped_client.queries[0], BARE)
+        # #3757 shapes the wire query (drops stopwords, caps BM25 terms), so
+        # this is no longer byte-identical to BARE. The guarantee under test
+        # is envelope hygiene: every surviving term came from the inner text,
+        # and the question's content words are all still there.
+        terms = wrapped_client.queries[0].lower().split()
+        self.assertTrue(set(terms) <= set(BARE.split()), terms)
+        for word in ("decide", "auth", "flow"):
+            self.assertIn(word, terms)
 
     def test_no_channel_substring_or_attrs_in_query(self):
         client = _RecordingClient(memories=[_memory("m")])
@@ -212,8 +221,16 @@ class MultiTurnComposedEnvelopeStrip(unittest.TestCase):
             q = client.queries[0]
             self.assertNotIn("<channel", q)
             self.assertNotIn("chat_id", q)
-            self.assertIn("Prior context:", q)
-            self.assertTrue(q.rstrip().endswith(BARE))
+            # #3757: the "Prior context:" header is scaffolding, not content —
+            # it is no longer on the wire (it cost two BM25 terms and matched
+            # a large fraction of every bank). What must survive is the prior
+            # turns' CONTENT, which is what this test actually guards.
+            self.assertNotIn("Prior context:", q)
+            self.assertIn("ORCHID", q)
+            self.assertIn("ORCHID_PRIMARY", q)
+            # The latest turn's content words are the tail of the wire query
+            # (shaping preserves source order and drops only stopwords here).
+            self.assertTrue(q.rstrip().endswith("decide auth flow"), q)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

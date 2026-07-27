@@ -737,6 +737,40 @@ export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
 {{#if (isNumber hindsightRecallCacheTtlSecs)}}
 export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{/if}}
+# BM25 term budget for the recall query (#3757). The hook composes a query
+# from the last 2 turns and Hindsight OR-joins EVERY token into one
+# to_tsquery; Postgres native FTS cannot top-k from the GIN index, so it
+# ranks the entire matched set before the top-60 heapsort. Measured on the
+# live `overlord` bank (135,565 rows, 3 fact-type arms): 96 distinct terms
+# = 119,510 rows ranked = 14.0s, versus 24 terms = 48,433 rows = 2.7s.
+# memory.recall.query_max_tokens; 0 disables shaping (rollback lever).
+# Exported UNCONDITIONALLY with a concrete value — see the note on
+# HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS below for why an unexported or
+# empty knob is a silent-shadowing bug rather than a no-op.
+export HINDSIGHT_RECALL_QUERY_MAX_TOKENS={{hindsightRecallQueryMaxTokens}}
+# Bank-specific high-document-frequency terms to drop from the BM25 query
+# (#3757, memory.recall.query_stop_terms). Postgres' `english` config
+# already strips generic English stopwords; this is for words a generic
+# stoplist cannot know are useless in THIS bank — on `overlord`,
+# `switchroom` matched 27,075 rows (20%) and `agent` a similar share.
+# JSON array (the plugin also accepts a comma-separated string), single-
+# quoted so the JSON's double quotes reach the plugin intact. The schema
+# constrains each term to `[\w./-]+`, so it cannot contain a quote. Exported
+# unconditionally: with no operator override this is the literal `[]`, which
+# `_cast_env` parses to an empty list and assigns, so the env still wins over
+# a stale claude-code.json.
+export HINDSIGHT_RECALL_QUERY_STOP_TERMS='{{hindsightRecallQueryStopTermsJson}}'
+# Per-bank HTTP timeout for a single recall request (#3757). Was hardcoded
+# at 8s in the plugin, which fired on 96.8% of overlord's own-bank recalls
+# and returned the model nothing at all. Plugin default is now 12s; the
+# shared multi-bank deadline (recallParallelDeadlineSeconds, default 10s)
+# is normally the tighter bound, so this is the safety net, not the budget.
+# Exported UNCONDITIONALLY, always carrying a concrete value (#3774 defect
+# class). The plugin resolves DEFAULTS -> settings.json -> claude-code.json ->
+# env, so a knob left unexported — or exported empty, which `_cast_env` turns
+# into a skipped assignment — lets a stale hand-written claude-code.json shadow
+# the shipped default with every test still green.
+export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS={{hindsightRecallRequestTimeoutSeconds}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the

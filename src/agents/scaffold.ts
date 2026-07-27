@@ -39,6 +39,15 @@ import { VERSION as SWITCHROOM_VERSION } from "../build-info.js";
 // Repo root for referencing bin/ scripts in hooks
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
+// Switchroom #3757 / #3760 — mirrors of the hindsight plugin's own DEFAULTS
+// (`vendor/hindsight-memory/scripts/lib/config.py`). These exist because the
+// corresponding env vars must be exported UNCONDITIONALLY: an unexported (or
+// empty) knob lets a stale `~/.hindsight/claude-code.json` silently shadow the
+// shipped default. `tests/scaffold.test.ts` reads the Python DEFAULTS and
+// fails if either value drifts from it.
+export const HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT = 24;
+export const HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT = 12;
+
 /**
  * Primer the agent reads on every session boot so it knows it's running
  * in a switchroom container with `read_only: true` rootfs and a fixed
@@ -3436,6 +3445,20 @@ interface BuildWorkspaceContextArgs {
   hindsightApiBaseUrl: string;
   hindsightRecallMaxMemories: number | undefined;
   hindsightRecallCacheTtlSecs: number | undefined;
+  /**
+   * Switchroom #3757 — BM25 term cap for the recall query, the bank-specific
+   * stop-term list beside it, and the per-bank request timeout. These live in
+   * switchroom.yaml specifically so they SURVIVE `switchroom apply`: apply
+   * re-copies the plugin from `vendor/hindsight-memory`, so a hand-edit of the
+   * installed `scripts/recall.py` is reverted on the next reconcile — which is
+   * exactly how the hardcoded 8s timeout came back on 2026-07-27.
+   */
+  // Always concrete — these three are exported unconditionally (see the
+  // resolution site) so the env can never be shadowed by a stale
+  // ~/.hindsight/claude-code.json.
+  hindsightRecallQueryMaxTokens: number;
+  hindsightRecallQueryStopTermsJson: string;
+  hindsightRecallRequestTimeoutSeconds: number;
   // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
@@ -3480,6 +3503,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallQueryMaxTokens,
+    hindsightRecallQueryStopTermsJson,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -3563,6 +3589,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallQueryMaxTokens,
+    hindsightRecallQueryStopTermsJson,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -4472,6 +4501,29 @@ export function scaffoldAgent(
   // switchroom-managed default of 600s baked into start.sh.hbs."
   // Set to 0 in switchroom.yaml to disable caching for an agent.
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
+  // Switchroom #3757 — BM25 query shaping + per-request timeout. Resolved from
+  // the CASCADED config (defaults → profile → agent) like the sibling recall
+  // knobs, so a fleet-wide `defaults.memory.recall.*` is honoured.
+  //
+  // ALWAYS resolved to a concrete value, and start.sh exports all three
+  // UNCONDITIONALLY (#3774 defect class). The plugin's own precedence is
+  // DEFAULTS -> settings.json -> ~/.hindsight/claude-code.json -> env
+  // (`vendor/hindsight-memory/scripts/lib/config.py:437-470`), so a knob that
+  // is not exported lets a stale hand-written `claude-code.json` shadow the
+  // shipped default silently. Exporting an EMPTY string does not help either:
+  // `_cast_env("", int)` returns None and `config.py:466-468` then skips the
+  // assignment, so an empty export is indistinguishable from no export. The
+  // only shape that actually wins is a real number/JSON on every boot, which
+  // is why these fall back to the plugin's DEFAULTS values here.
+  // `tests/scaffold.test.ts` pins the fallbacks against `lib/config.py` so the
+  // two cannot drift.
+  const hindsightRecallQueryMaxTokens =
+    agentConfig.memory?.recall?.query_max_tokens ?? HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT;
+  const rawRecallQueryStopTerms = agentConfig.memory?.recall?.query_stop_terms;
+  const hindsightRecallQueryStopTermsJson = JSON.stringify(rawRecallQueryStopTerms ?? []);
+  const hindsightRecallRequestTimeoutSeconds =
+    agentConfig.memory?.recall?.request_timeout_seconds ??
+    HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -4546,6 +4598,9 @@ export function scaffoldAgent(
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallQueryMaxTokens,
+    hindsightRecallQueryStopTermsJson,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -6898,6 +6953,29 @@ function reconcileAgentInner(
     : HINDSIGHT_DEFAULT_API_BASE_URL;
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
+  // Switchroom #3757 — BM25 query shaping + per-request timeout. Resolved from
+  // the CASCADED config (defaults → profile → agent) like the sibling recall
+  // knobs, so a fleet-wide `defaults.memory.recall.*` is honoured.
+  //
+  // ALWAYS resolved to a concrete value, and start.sh exports all three
+  // UNCONDITIONALLY (#3774 defect class). The plugin's own precedence is
+  // DEFAULTS -> settings.json -> ~/.hindsight/claude-code.json -> env
+  // (`vendor/hindsight-memory/scripts/lib/config.py:437-470`), so a knob that
+  // is not exported lets a stale hand-written `claude-code.json` shadow the
+  // shipped default silently. Exporting an EMPTY string does not help either:
+  // `_cast_env("", int)` returns None and `config.py:466-468` then skips the
+  // assignment, so an empty export is indistinguishable from no export. The
+  // only shape that actually wins is a real number/JSON on every boot, which
+  // is why these fall back to the plugin's DEFAULTS values here.
+  // `tests/scaffold.test.ts` pins the fallbacks against `lib/config.py` so the
+  // two cannot drift.
+  const hindsightRecallQueryMaxTokens =
+    agentConfig.memory?.recall?.query_max_tokens ?? HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT;
+  const rawRecallQueryStopTerms = agentConfig.memory?.recall?.query_stop_terms;
+  const hindsightRecallQueryStopTermsJson = JSON.stringify(rawRecallQueryStopTerms ?? []);
+  const hindsightRecallRequestTimeoutSeconds =
+    agentConfig.memory?.recall?.request_timeout_seconds ??
+    HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -6996,6 +7074,9 @@ function reconcileAgentInner(
       hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
+      hindsightRecallQueryMaxTokens,
+      hindsightRecallQueryStopTermsJson,
+      hindsightRecallRequestTimeoutSeconds,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
@@ -7778,6 +7859,9 @@ function reconcileAgentInner(
       hindsightApiBaseUrl,
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
+      hindsightRecallQueryMaxTokens,
+      hindsightRecallQueryStopTermsJson,
+      hindsightRecallRequestTimeoutSeconds,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
