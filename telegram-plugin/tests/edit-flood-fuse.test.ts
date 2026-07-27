@@ -297,9 +297,18 @@ describe('edit-flood fuse — structural: installed where nothing can bypass it'
     expect(fuse.stats().dropped + fuse.stats().superseded).toBeGreaterThan(0)
   })
 
-  it('passes non-message methods straight through (getUpdates must never be paced)', async () => {
+  // #3855: this test used to be titled "passes non-message methods straight
+  // through" and stood for the ALLOWLIST — everything outside EDIT/SEND was
+  // free, which left 29% of real traffic unmetered. The exemption is now a
+  // one-entry list and this test guards exactly that entry, not a category.
+  it('getUpdates — the long-poll RECEIVE loop — is the one unmetered method', async () => {
     const clock = new FakeClock()
-    const fuse = createEditFloodFuse({ clock, perChatSendMaxPerWindow: 1, perChatWindowMs: 600_000 })
+    const fuse = createEditFloodFuse({
+      clock, perChatSendMaxPerWindow: 1, perChatWindowMs: 600_000,
+      // Deliberately brutal: if getUpdates were metered at all, the 2nd call
+      // would block forever on this clock.
+      perTokenMaxPerWindow: 1, perTokenWindowMs: 600_000,
+    })
     let calls = 0
     for (let i = 0; i < 100; i++) {
       await fuse.apply('getUpdates', {}, async () => { calls++; return [] })

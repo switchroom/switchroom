@@ -102,10 +102,61 @@
  *   3. **A shared per-chat budget with a reply reservation.** Telegram meters
  *      sends and edits against the SAME per-chat allowance, so separate
  *      edit/send windows could each be "in budget" while their sum was not.
- *      One `perChatTotalMaxPerWindow` window (default 20/60s) now counts
- *      every admitted call, and `perChatReplyReserve` (default 8) slots of it
+ *      One `perChatTotalMaxPerWindow` window (default 20/60s) counts every
+ *      chat-targeted call, and `perChatReplyReserve` (default 8) slots of it
  *      are unreachable by `cosmetic` traffic. A reply therefore cannot be
  *      starved by repaints even if a future call site is misclassified.
+ *
+ * ── 2026-07-28: the meter was reading ~58% of the traffic (#3855) ─────────
+ * Point 3 above USED to claim `perChatTotalMaxPerWindow` "counts every
+ * admitted call" and "matches Telegram's own per-chat metering". Both were
+ * false, and the gap is the reason a "20/60s" ceiling did not stop a ban.
+ * `apply` opened with `if (!isEdit && !isSend) return runObserved(next)` —
+ * an ALLOWLIST. Anything outside `EDIT_METHODS`/`SEND_METHODS` was entirely
+ * unmetered: it took no slot, and the ceiling therefore governed only the
+ * subset of traffic it happened to recognise.
+ *
+ * Measured on overlord's own gateway log (46791 `tg-post` lines), the
+ * unmetered share was 29% overall and 42% inside the 30 minutes before the
+ * 20:19:56 ban. By method:
+ *
+ *     sendChatAction      10457   ← unmetered, and up to 18/min on ONE DM
+ *     setMessageReaction   2098   ← unmetered
+ *     deleteMessage         370   ← unmetered
+ *     pinChatMessage        366   ← unmetered
+ *     unpinChatMessage      365   ← unmetered
+ *     answerCallbackQuery    31   ← unmetered (carries no chat_id)
+ *
+ * `sendChatAction` alone ran at Telegram's entire documented per-chat/minute
+ * allowance while the fuse counted none of it. So the fix is not a smaller
+ * number, it is an honest meter:
+ *
+ *   4. **DEFAULT-DENY metering.** Every method whose payload carries a
+ *      `chat_id` is charged to `perChatTotalMaxPerWindow`, whether or not this
+ *      file has heard of it. There is no per-chat exemption list to forget to
+ *      update — a new Bot API method, or one this gateway starts calling
+ *      tomorrow (`sendChecklist` is exactly that case: it carries `chat_id`,
+ *      creates a message, and was in neither set), is metered on arrival.
+ *      Methods that are neither edits nor sends are PACED and never dropped,
+ *      except `CHAT_ACTION_METHODS` — a typing indicator expires by itself in
+ *      ~5s and carries no content, so shedding one loses nothing.
+ *      The ceiling NUMBER is unchanged at 20/60s; what changed is that 20
+ *      admitted calls now means 20 on the wire rather than ~34.
+ *   5. **A per-BOT-TOKEN window.** Telegram's flood ban is scoped to the bot
+ *      token, not the chat, and enforces a global rate across all chats. A
+ *      second window keyed by the bot's PUBLIC numeric id (`perTokenWindowMs`
+ *      / `perTokenMaxPerWindow`, default 25 per 1000ms) is now charged for
+ *      EVERY outbound call — including the chat-less ones like
+ *      `answerCallbackQuery`, which the per-chat tier structurally cannot key.
+ *      A call is admitted only if BOTH windows have room.
+ *      LIMITATION, stated plainly: this window is per-PROCESS. Two agents
+ *      sharing one bot token run in separate containers with separate state
+ *      dirs, so neither sees the other's window. It is a real improvement on
+ *      the single process that actually floods and it is NOT full coverage
+ *      under a shared token; a cross-process view would need a token-keyed
+ *      store on a path both processes can write, which does not exist today.
+ *      Only the public bot id (the prefix before the `:`) is ever used as a
+ *      key, and it is never logged — see {@link deriveBotScopeKey}.
  *
  * Plus **escalating** backoff: a 429 used to apply ONE 0.5× tightening for a
  * flat 10 minutes, so a stream that took repeated small 429s re-tightened to
@@ -117,6 +168,8 @@
  * Every ceiling is operator-overridable via env — see
  * {@link editFloodFuseConfigFromEnv}. Previously none of them were.
  */
+
+import { createHash } from 'node:crypto'
 
 import type { Bot } from 'grammy'
 
@@ -158,6 +211,54 @@ const SEND_METHODS: ReadonlySet<string> = new Set([
   // 30s-preview draft is high-cadence by design and is not a persisted message.
   'sendRichMessage',
 ])
+
+/**
+ * Chat-targeted methods whose effect EXPIRES on its own and carries no content,
+ * so shedding one under pressure loses nothing a user would notice.
+ *
+ * `sendChatAction` is the entire set and the reason this tier exists: it was
+ * the single largest unmetered method in the incident log (10457 calls, up to
+ * 18/min on ONE DM — Telegram's whole documented per-chat/minute allowance),
+ * and the typing status it sets clears itself after ~5 seconds regardless.
+ * Every OTHER non-edit, non-send method with a `chat_id` (`deleteMessage`,
+ * `pinChatMessage`, `setMessageReaction`, …) has a durable, user-visible
+ * effect and is paced but never dropped.
+ */
+const CHAT_ACTION_METHODS: ReadonlySet<string> = new Set(['sendChatAction'])
+
+/**
+ * The ONLY methods exempt from metering entirely. Deliberately one entry.
+ *
+ * `getUpdates` is the long-poll RECEIVE loop, not outbound traffic: it is how
+ * inbound messages arrive at all. Pacing it would stall message delivery
+ * rather than protect anything, and it targets no chat, so it consumes no
+ * per-chat budget by construction.
+ *
+ * Nothing else is listed. The one-off administrative calls (`setMyCommands`,
+ * `deleteWebhook`, `getFile`, `getChat` — 37 calls TOTAL across a 46791-call
+ * log) are metered like everything else: at 25/second the cost is nil, and
+ * exempting them would mean asserting something about Telegram's accounting
+ * that this repo cannot verify from first-party evidence. Default-deny means
+ * the burden of proof is on the exemption.
+ */
+const UNMETERED_METHODS: ReadonlySet<string> = new Set(['getUpdates'])
+
+/**
+ * Reduce a bot token to a key safe to hold in memory.
+ *
+ * A Telegram token is `<bot_id>:<secret>`. The bot id is PUBLIC (it is the
+ * bot's user id, visible on every message it sends); the secret half is not.
+ * This returns the bot id alone when the token has that shape, so nothing
+ * secret is ever used as a map key, logged, or persisted. A token that does
+ * not match the shape falls back to a truncated SHA-256, which is stable
+ * across processes and irreversible.
+ */
+export function deriveBotScopeKey(token: string | undefined): string {
+  if (token == null || token === '') return 'unknown'
+  const id = token.slice(0, token.indexOf(':'))
+  if (/^\d+$/.test(id)) return id
+  return `h${createHash('sha256').update(token).digest('hex').slice(0, 16)}`
+}
 
 export interface EditFloodFuseConfig {
   /** Master switch. When false, `apply` is a pure passthrough. Default true. */
@@ -203,6 +304,28 @@ export interface EditFloodFuseConfig {
    */
   perChatReplyReserve?: number
   /**
+   * Ceiling on EVERY outbound call made with this bot token, across all chats
+   * and including the chat-less ones. Default 25 per `perTokenWindowMs`
+   * (1000ms), just under the ~30/second Telegram enforces at the token level.
+   * The flood ban is token-scoped, so this is the tier that matches the thing
+   * that actually gets banned. Per-PROCESS — see the docblock's point 5.
+   */
+  perTokenMaxPerWindow?: number
+  perTokenWindowMs?: number
+  /**
+   * Scope key for the token window: the bot's PUBLIC numeric id. Never pass a
+   * raw token — {@link installEditFloodFuse} derives this via
+   * {@link deriveBotScopeKey}. Default `'unknown'` (a single shared window,
+   * which is still correct for the one-bot-per-process case).
+   */
+  botScopeKey?: string
+  /**
+   * Longest a `CHAT_ACTION_METHODS` call may be held before it is shed.
+   * Default 3000ms — a typing indicator that arrives after the status it
+   * describes has already expired is worse than no typing indicator.
+   */
+  chatActionMaxDeferMs?: number
+  /**
    * Cap on COSMETIC edits that may be released late (over budget) because
    * nothing newer will repaint them — the bounded form of the R1 rule. Default
    * 2 per `perChatWindowMs`, so the worst-case sustained cosmetic rate is
@@ -247,6 +370,16 @@ export interface EditFloodFuseStats {
   cosmeticPerMessageCeiling: number
   /** Live COSMETIC per-chat ceiling (post-AIMD). */
   cosmeticPerChatCeiling: number
+  /**
+   * Chat-targeted calls charged by the DEFAULT-DENY rule — every one of these
+   * was completely unmetered before #3855. A non-zero value here is the direct
+   * measure of the hole this closed.
+   */
+  meteredByDefault: number
+  /** Calls with no `chat_id`, charged to the token window only. */
+  chatless: number
+  /** Live per-bot-token ceiling (post-AIMD). */
+  perTokenCeiling: number
 }
 
 export const EDIT_FLOOD_FUSE_DEFAULTS = {
@@ -275,6 +408,16 @@ export const EDIT_FLOOD_FUSE_DEFAULTS = {
   perChatTotalMaxPerWindow: 20,
   /** 8 of those 20 slots/min are unreachable by cosmetic traffic. */
   perChatReplyReserve: 8,
+  /**
+   * 25 per second across the whole bot token. Telegram enforces ~30/s at the
+   * token level and the ban it issues is token-scoped; 25 leaves headroom for
+   * traffic this process cannot see (a peer agent sharing the token, or a
+   * retry issued below the transformer stack).
+   */
+  perTokenMaxPerWindow: 25,
+  perTokenWindowMs: 1_000,
+  /** A typing indicator held longer than this is not worth sending. */
+  chatActionMaxDeferMs: 3_000,
   /** At most 2 cosmetic frames/min may exceed the ceiling as "lone" releases. */
   lateReleaseMaxPerWindow: 2,
   perChatWindowMs: 60_000,
@@ -309,6 +452,7 @@ export function editFloodFuseConfigFromEnv(
   assign('cosmeticPerChatMaxPerWindow', envInt(env.SWITCHROOM_FEED_EDIT_MAX_PER_CHAT_PER_MIN))
   assign('perChatTotalMaxPerWindow', envInt(env.SWITCHROOM_CHAT_TOTAL_MAX_PER_MIN))
   assign('perChatReplyReserve', envInt(env.SWITCHROOM_CHAT_REPLY_RESERVE))
+  assign('perTokenMaxPerWindow', envInt(env.SWITCHROOM_TOKEN_MAX_PER_SEC))
   assign('maxDeferMs', envInt(env.SWITCHROOM_EDIT_FUSE_MAX_DEFER_MS))
   return cfg
 }
@@ -356,6 +500,11 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     Math.max(0, config.perChatReplyReserve ?? D.perChatReplyReserve),
     Math.max(0, perChatTotalMax - 1),
   )
+  const perTokenMax = Math.max(1, config.perTokenMaxPerWindow ?? D.perTokenMaxPerWindow)
+  const perTokenWindowMs = Math.max(1, config.perTokenWindowMs ?? D.perTokenWindowMs)
+  // Only ever the PUBLIC bot id (or an irreversible hash) reaches this key.
+  const tokenKey = `g:${config.botScopeKey ?? 'unknown'}`
+  const chatActionMaxDeferMs = config.chatActionMaxDeferMs ?? D.chatActionMaxDeferMs
   const lateReleaseMax = Math.max(0, config.lateReleaseMaxPerWindow ?? D.lateReleaseMaxPerWindow)
   const maxDeferMs = config.maxDeferMs ?? D.maxDeferMs
   const tightenFactor = config.tightenFactor ?? D.tightenFactor
@@ -364,7 +513,14 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   const onTrip = config.onTrip
 
   const windows = new Map<string, Window>()
-  const counters = { deferred: 0, dropped: 0, superseded: 0, floodObserved: 0 }
+  const counters = {
+    deferred: 0, dropped: 0, superseded: 0, floodObserved: 0,
+    /** Chat-targeted calls charged by the DEFAULT-DENY rule that the old
+     *  allowlist would have let through unmetered (#3855 observability). */
+    meteredByDefault: 0,
+    /** Calls with no `chat_id`, charged to the token window only. */
+    chatless: 0,
+  }
   /**
    * Compounding 429 backoff. `tightenLevel` is the number of multiplicative
    * decreases currently in force; `tightenedUntil` is when the NEXT level
@@ -605,15 +761,13 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     next: () => Promise<R>,
   ): Promise<R> {
     if (!enabled) return next()
+    if (UNMETERED_METHODS.has(method)) return runObserved(next)
 
     const isEdit = EDIT_METHODS.has(method)
     const isSend = SEND_METHODS.has(method)
-    if (!isEdit && !isSend) return runObserved(next)
+    const isChatAction = CHAT_ACTION_METHODS.has(method)
 
     const { chat, msg } = payloadKeys(payload)
-    // Inline-message edits carry no chat/message id — nothing to key on, and
-    // they are not part of any card loop. Pass through (still observed).
-    if (chat == null) return runObserved(next)
 
     const now = clock.now()
     evict(now)
@@ -622,7 +776,21 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
 
     // The send gate's priority class, propagated through AsyncLocalStorage.
     // An untagged edit is COSMETIC by default — see `defaultOutboundClass`.
-    const cls = currentOutboundClass() ?? defaultOutboundClass(isEdit)
+    // A chat action is cosmetic too: it is a self-expiring status, not content.
+    const cls =
+      currentOutboundClass() ?? (isChatAction ? 'cosmetic' : defaultOutboundClass(isEdit))
+
+    // DEFAULT-DENY (#3855): a call the fuse cannot key to a chat — an inline
+    // edit, `answerCallbackQuery`, `getFile`, `setMyCommands` — is NOT free.
+    // It cannot take a per-chat slot (there is no chat to charge), but it does
+    // consume the bot token's global allowance, which is the thing Telegram
+    // actually bans. Charge it there and pass.
+    if (chat == null) {
+      counters.chatless++
+      await awaitRoom(tokenKey, perTokenWindowMs, perTokenMax, method, 'release', cls, undefined, deadline)
+      return runObserved(next)
+    }
+
     const totalKey = `t:${chat}`
     // Cosmetic traffic may only reach `perChatTotalMax - perChatReplyReserve`;
     // the remaining slots stay available to a real reply no matter how hot the
@@ -630,8 +798,13 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     const totalMaxFor = (c: OutboundClass): number =>
       c === 'cosmetic' ? Math.max(1, perChatTotalMax - perChatReplyReserve) : perChatTotalMax
 
-    if (isEdit) {
-      if (msg == null) return runObserved(next)
+    /** Final tier for every chat-targeted path: the token-scoped ceiling. */
+    const passToken = async (): Promise<R> => {
+      await awaitRoom(tokenKey, perTokenWindowMs, perTokenMax, method, 'release', cls, undefined, deadline)
+      return runObserved(next)
+    }
+
+    if (isEdit && msg != null) {
       const msgKey = `m:${chat}:${msg}`
       const mw = win(msgKey)
       // Counted BEFORE the first await so a frame that arrives while an older
@@ -670,18 +843,42 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
           cls === 'cosmetic' ? 'drop' : 'release', cls, dropGuard, deadline, lateKey,
         )
         if (totalSlot === null) { giveBack(); return DROPPED_RESULT as unknown as R }
-        return runObserved(next)
+        return passToken()
       } finally {
         mw.inflight--
       }
     }
 
-    // Sends create user-visible output and are NEVER dropped — only paced. The
-    // shared budget's reserve is what guarantees they still have room when the
-    // repaint surfaces are saturated.
-    await awaitRoom(`cs:${chat}`, perChatWindowMs, perChatSendMax, method, 'release', cls, undefined, deadline)
+    if (isSend) {
+      // Sends create user-visible output and are NEVER dropped — only paced.
+      // The shared budget's reserve is what guarantees they still have room
+      // when the repaint surfaces are saturated.
+      await awaitRoom(`cs:${chat}`, perChatWindowMs, perChatSendMax, method, 'release', cls, undefined, deadline)
+      await awaitRoom(totalKey, perChatWindowMs, totalMaxFor(cls), method, 'release', cls, undefined, deadline)
+      return passToken()
+    }
+
+    // DEFAULT-DENY (#3855). Everything else with a `chat_id` — `sendChatAction`,
+    // `setMessageReaction`, `deleteMessage`, `pinChatMessage`, `sendChecklist`,
+    // an inline edit that carries a chat but no message id, and any Bot API
+    // method added after this file was written — is charged to the SAME shared
+    // per-chat window. Previously all of it was free, which is how a "20/60s"
+    // ceiling admitted ~34 calls/60s on the wire.
+    counters.meteredByDefault++
+    if (isChatAction) {
+      // Self-expiring status: shed it rather than deliver it late. Its own
+      // short deadline also keeps a typing ping from occupying a 30s hold.
+      const actionDeadline = Math.min(deadline, now + chatActionMaxDeferMs)
+      const slot = await awaitRoom(
+        totalKey, perChatWindowMs, totalMaxFor(cls), method, 'drop', cls, undefined, actionDeadline,
+      )
+      if (slot === null) return DROPPED_RESULT as unknown as R
+      return passToken()
+    }
+    // Durable, user-visible effect (a deletion, a pin, a reaction): paced,
+    // never dropped — the same contract sends get.
     await awaitRoom(totalKey, perChatWindowMs, totalMaxFor(cls), method, 'release', cls, undefined, deadline)
-    return runObserved(next)
+    return passToken()
   }
 
   /** Run the downstream call, tightening the ceilings if it floods. */
@@ -714,6 +911,9 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       perMessageCeiling: ceiling(perMessageMax, now),
       cosmeticPerMessageCeiling: ceiling(cosmeticPerMessageMax, now),
       cosmeticPerChatCeiling: ceiling(cosmeticPerChatMax, now),
+      meteredByDefault: counters.meteredByDefault,
+      chatless: counters.chatless,
+      perTokenCeiling: ceiling(perTokenMax, now),
     }
   }
 
@@ -729,7 +929,13 @@ export type EditFloodFuse = ReturnType<typeof createEditFloodFuse>
 export type FuseInstallable = Bot
 
 export function installEditFloodFuse(bot: FuseInstallable, config: EditFloodFuseConfig = {}): EditFloodFuse {
-  const fuse = createEditFloodFuse(config)
+  // The token window is keyed by the bot's PUBLIC id only. `deriveBotScopeKey`
+  // never returns any part of the secret half, and the key is used solely as an
+  // in-memory Map key — never logged, never persisted.
+  const fuse = createEditFloodFuse({
+    botScopeKey: deriveBotScopeKey((bot as { token?: string }).token),
+    ...config,
+  })
   bot.api.config.use(async (prev, method, payload, signal) =>
     fuse.apply(method, payload, () => prev(method, payload, signal)))
   return fuse
