@@ -2973,6 +2973,30 @@ const profileFields = {
           "back to the per-profile default (klanker/coding 2.0, default 1.0, " +
           "lightweight 0.5).",
         ),
+      tmp_size: z
+        .string()
+        .regex(
+          /^\d+(\.\d+)?[kmgKMG]?$/,
+          "tmp_size must be a Docker size string like '1g', '4g', '512m'",
+        )
+        // Zero is syntactically a valid size string but semantically a
+        // foot-gun the other resource fields don't have: `mem_limit: 0`
+        // means "unlimited" to Docker, whereas a `size=0` tmpfs mounts a
+        // ZERO-byte /tmp and every write in the container fails.
+        .refine((v) => parseFloat(v) > 0, "tmp_size must be greater than zero")
+        .optional()
+        .describe(
+          "Size of the agent container's RAM-backed `/tmp` (Docker " +
+          "`tmpfs: - /tmp:size=<this>,mode=1777`). The container root FS is " +
+          "read-only, so /tmp is the only scratch space the agent and its " +
+          "sub-agents get for repo clones and toolchain caches (bunx/npx/pip) " +
+          "— a fan-out of several sub-agents exhausts the 1g default. A tmpfs " +
+          "only consumes host RAM for the pages actually written, so raising " +
+          "the ceiling costs nothing until it is used; those pages are still " +
+          "charged to the container's `memory` cap, so raise both together. " +
+          "Format: '1g', '4g', '512m'. Default when unset at every cascade " +
+          "layer: '1g'.",
+        ),
     })
     .optional()
     .describe(
@@ -3549,6 +3573,14 @@ export const AgentSchema = z.object({
         .optional(),
       pids_limit: z.number().int().positive().optional(),
       cpus: z.number().positive().optional(),
+      tmp_size: z
+        .string()
+        .regex(
+          /^\d+(\.\d+)?[kmgKMG]?$/,
+          "tmp_size must be a Docker size string like '1g', '4g', '512m'",
+        )
+        .refine((v) => parseFloat(v) > 0, "tmp_size must be greater than zero")
+        .optional(),
     })
     .optional(),
 }).superRefine((agent, ctx) => {

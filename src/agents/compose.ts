@@ -106,7 +106,32 @@ export interface ResourceDefaults {
   memReservation?: string;
   /** Optional — when set, emitted as `pids_limit` (cgroup pids.max). */
   pidsLimit?: number;
+  /**
+   * Size of the container's RAM-backed `/tmp`, emitted as
+   * `tmpfs: - /tmp:size=<this>,mode=1777`. Always resolved (falls back to
+   * `DEFAULT_TMP_SIZE`) by `resolveResourceDefaults`.
+   */
+  tmpSize: string;
 }
+
+/**
+ * Fleet-wide default size of the per-agent `/tmp` tmpfs — what every agent
+ * gets without a `resources.tmp_size` override at any cascade layer.
+ *
+ * Hard-coded at the emit site as `1g` until 2026-07-27, when the root-tier
+ * `overlord` container was measured at 90% of its 1.0 GiB `/tmp` (917M used,
+ * ~150M free) purely from concurrently-running sub-agents — 785M of it repo
+ * clones plus `bunx` toolchain caches (vitest, typescript). A fan-out of
+ * several workers/reviewers exhausts 1 GiB routinely, and a full /tmp fails
+ * clones and installs with confusing ENOSPC errors.
+ *
+ * 2 GiB is safe as a *default* because a tmpfs is a ceiling, not a
+ * reservation: it consumes host RAM only for pages actually written, so an
+ * idle agent's footprint is unchanged. Those pages are charged against the
+ * container's `mem_limit` cgroup, so an agent that raises this AND intends to
+ * fill it should raise `resources.memory` too.
+ */
+export const DEFAULT_TMP_SIZE = "2g";
 
 // Per-profile defaults. Settings:
 //   - memLimit       hard cap (cgroup memory.max)
@@ -123,6 +148,10 @@ export interface ResourceDefaults {
 //                    multiples of typical peak. klanker (the dedicated
 //                    test runner) gets the highest cap.
 //   - cpus           CPU quota (Docker `cpus`).
+//   - tmpSize        size of the RAM-backed /tmp. Uniform across profiles
+//                    today (DEFAULT_TMP_SIZE); per-profile values are
+//                    possible here, and `resources.tmp_size` overrides it
+//                    at any cascade layer.
 //
 // These are starting points; operators override per-agent via the
 // schema's `resources` block (PR #1190). memLimit is a hard cap
@@ -135,13 +164,20 @@ export interface ResourceDefaults {
 // host capacity; overlord and other per-agent overrides are set separately
 // in switchroom.yaml and are not reflected here.
 const RESOURCE_BY_PROFILE: Record<string, ResourceDefaults> = {
-  klanker: { memLimit: "8g", memReservation: "4g", pidsLimit: 2000, cpus: 2.0 },
+  klanker: {
+    memLimit: "8g",
+    memReservation: "4g",
+    pidsLimit: 2000,
+    cpus: 2.0,
+    tmpSize: DEFAULT_TMP_SIZE,
+  },
   // Conversational profiles — clerk, finn, carrie, coach, etc.
   conversational: {
     memLimit: "3g",
     memReservation: "256m",
     pidsLimit: 500,
     cpus: 1.0,
+    tmpSize: DEFAULT_TMP_SIZE,
   },
   // Lightweight profiles.
   lightweight: {
@@ -149,6 +185,7 @@ const RESOURCE_BY_PROFILE: Record<string, ResourceDefaults> = {
     memReservation: "128m",
     pidsLimit: 500,
     cpus: 0.5,
+    tmpSize: DEFAULT_TMP_SIZE,
   },
   // Coding/worker/researcher.
   coding: {
@@ -156,6 +193,7 @@ const RESOURCE_BY_PROFILE: Record<string, ResourceDefaults> = {
     memReservation: "512m",
     pidsLimit: 1000,
     cpus: 2.0,
+    tmpSize: DEFAULT_TMP_SIZE,
   },
   // Catch-all default.
   default: {
@@ -163,6 +201,7 @@ const RESOURCE_BY_PROFILE: Record<string, ResourceDefaults> = {
     memReservation: "256m",
     pidsLimit: 500,
     cpus: 1.0,
+    tmpSize: DEFAULT_TMP_SIZE,
   },
 };
 
@@ -177,6 +216,7 @@ export interface ResourceOverrides {
   memory_reservation?: string;
   pids_limit?: number;
   cpus?: number;
+  tmp_size?: string;
 }
 
 /**
@@ -242,6 +282,9 @@ export function resolveResourceDefaults(
     }
     if (overrides.pids_limit !== undefined) {
       merged.pidsLimit = overrides.pids_limit;
+    }
+    if (overrides.tmp_size !== undefined) {
+      merged.tmpSize = overrides.tmp_size;
     }
   }
   // Cron-session headroom — only when the operator left the field to defaults.
@@ -2109,7 +2152,9 @@ function emitAgentService(
     lines.push(`    read_only: true`);
   }
   lines.push(`    tmpfs:`);
-  lines.push(`      - /tmp:size=1g,mode=1777`);
+  // Size is operator-tunable via `resources.tmp_size` (defaults → profile →
+  // per-agent cascade); DEFAULT_TMP_SIZE when unset at every layer.
+  lines.push(`      - /tmp:size=${a.resources.tmpSize},mode=1777`);
   lines.push(`    depends_on:`);
   lines.push(`      vault-broker:`);
   lines.push(`        condition: service_started`);

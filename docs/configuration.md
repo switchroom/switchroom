@@ -14,7 +14,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 |---|---|---|
 | **Union** | `tools.allow`, `tools.deny`, `skills` | Combine across layers, dedup |
 | **Per-key merge** | `mcp_servers`, `bundled_skills`, `env`, `subagents` | Agent wins on key conflict |
-| **Per-field merge** | `soul`, `memory`, `session`, `channels` | Agent wins per sub-field |
+| **Per-field merge** | `soul`, `memory`, `session`, `channels`, `resources`, `experimental` | Agent wins per sub-field |
 | **Per-event concat** | `hooks` | Defaults first, then agent |
 | **Concatenate** | `schedule`, `system_prompt_append`, `claude_md_raw`, `cli_args` | Defaults prepended/joined |
 | **Override** | `model`, `extends`, `dangerous_mode`, all other scalars | Agent wins entirely |
@@ -72,6 +72,11 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `channels.telegram.voice_out.speed` | override | Kokoro playback speed, clamped 0.5–2.0. Default 1.1. Ignored by the OpenAI engine. |
 | `channels.telegram.voice_out.max_chars` | override | Per-voice-note chunk size for the OpenAI engine (chars). Default 600; clamped to the engine cap (1200). A longer reply is spoken across sequential notes, never truncated. The kokoro sidecar owns length and ignores this. |
 | `channels.telegram.voice_out.api_key` | override | OpenAI TTS key as a `vault:<key>` reference (only used when `engine='openai'`; default `vault:openai/api-key`). Resolved through the vault broker at use-time. |
+| `resources.memory` | per-field | Hard memory cap (Docker `mem_limit` → cgroup `memory.max`). Docker size string (`6g`, `1.5g`, `512m`). Unset at every layer → the per-profile default in `src/agents/compose.ts` (klanker 8g, coding 4g, conversational/default 3g, lightweight 1g). |
+| `resources.memory_reservation` | per-field | Soft memory floor (Docker `mem_reservation` → cgroup `memory.low`). Protects this much from reclaim under host-wide pressure. Must be ≤ `memory`. |
+| `resources.pids_limit` | per-field | Max processes in the cgroup (`pids.max`). Idle agent ≈ 30 PIDs; `npm test`-style workloads spike past 200. |
+| `resources.cpus` | per-field | CPU quota (Docker `cpus`), fractional OK. Unset at every layer → per-profile default (klanker/coding 2.0, default 1.0, lightweight 0.5). |
+| `resources.tmp_size` | per-field | Size of the container's RAM-backed `/tmp` (`tmpfs: - /tmp:size=<this>,mode=1777`). Docker size string (`4g`, `512m`). **Default `2g`.** The container root FS is read-only, so `/tmp` is the *only* scratch space the agent and its sub-agents get — repo clones, `bunx`/`npx`/`pip` toolchain caches. Raise it for agents that fan out several sub-agents at once (the earlier hard-coded 1g was measured 90% full on a busy root-tier agent, 785M of it concurrent sub-agent clones and caches). A tmpfs is a ceiling, not a reservation: it consumes host RAM only for pages actually written, so raising it costs nothing until used — but those pages count against `resources.memory`, so raise both together. Takes effect when the container is recreated (`switchroom apply`), not on a running one. |
 | `settings_raw` | deep merge | Escape hatch: raw settings.json overrides |
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
