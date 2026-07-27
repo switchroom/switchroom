@@ -151,7 +151,8 @@ scripts/                build.mjs + the lint guard scripts
 tests/                  vitest suite for src/;  tests/docker/ = docker e2e
 evals/                  Python eval harness (dataset.yaml + run_*.py)
 commands/               bundled slash commands (setup/start/status/stop)
-vendor/                 vendored upstream (hindsight-memory) — don't edit
+vendor/                 vendored upstream (hindsight-memory) — a snapshot,
+                        not the spec; read vendor/hindsight-memory/CLAUDE.md
 reference/              THE DESIGN CONTRACT (see below)
 docs/                   user/operator docs only — design lives in reference/
 ```
@@ -439,6 +440,36 @@ fragment. It binds work on THIS repo too — the five parts, condensed:
    `cron-session.sh` export `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=15`
    (below the CLI's own default of 20). Change that export and the
    dev-protocol prose together.
+
+## Third-party docs — the official site is the spec
+
+Authority order for any third-party dependency, highest first:
+
+1. **The vendor's official documentation site.** Search it first, before
+   concluding anything about what that dependency does or doesn't support.
+2. **context7 when the library is indexed** — `resolve-library-id` then
+   `query-docs`; wired for every agent by default (`docs/configuration.md`).
+3. **The OSS repo and our `vendor/` copy, last.** A vendored tree is an
+   implementation snapshot at one commit, not the specification.
+
+For Hindsight, which we vendor and run:
+
+- Docs root <https://hindsight.vectorize.io/>. Memory curation lives at
+  `/developer/api/memories`; see also `/developer/api/retain`,
+  `/developer/api/recall`, `/developer/observations`,
+  `/developer/configuration`, and the index at `/api-reference`. There is no
+  `/developer/` index page (it 404s) — enter from the root.
+- context7: prefer `/websites/hindsight_vectorize_io` (the docs site) over
+  `/vectorize-io/hindsight` (the OSS repo).
+
+**"No config path exists" / "not supported" / "not possible" are positive
+claims that need a check, not inferences from a failed local grep.** A worker
+tuning hindsight recall/consolidation told the operator no documented config
+path existed, because the running container ships no `/app/docs` and `vendor/`
+had no such knob — while the docs site documented the sanctioned answer the
+whole time: `PATCH /v1/default/banks/{bank}/memories/{id}` with
+`state: "invalidated"` soft-retires a duplicate, `state: "valid"` restores it.
+Absence of local documentation is not evidence that no documentation exists.
 
 ## Docker test discipline (HARD RULES)
 
