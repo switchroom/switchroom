@@ -3159,6 +3159,24 @@ function resolveHindsightRetainConfig(
 }
 
 /**
+ * Per-bank recall slot floors, switchroom's shipped defaults.
+ *
+ * Sized against the cap this fleet actually deploys — 6, from
+ * `defaults.memory.recall.max_memories` in switchroom.yaml, which cascades to
+ * HINDSIGHT_RECALL_MAX_MEMORIES and wins over the 8 stamped into the plugin's
+ * settings.json. recall.py bounds the two floors to half the cap between them
+ * (`_reservable_slots`), so 2 + 1 is the largest pair that is fully honoured at
+ * cap 6 while still leaving three slots to pure global relevance. Floors that
+ * summed to the cap would stop being floors and become a fixed quota.
+ *
+ * These are also the values exported to the environment unconditionally (see
+ * `start.sh.hbs`) so a stale `~/.hindsight/claude-code.json` — which loads
+ * AFTER the plugin's settings.json — cannot shadow them (#3774).
+ */
+const HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT = 2;
+const HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT = 1;
+
+/**
  * Merge switchroom-specific overrides into the vendored hindsight
  * plugin's `settings.json`. Idempotent — runs after every plugin
  * copy on every scaffold/reconcile/restart.
@@ -3170,6 +3188,8 @@ function resolveHindsightRetainConfig(
  *     transcript, re-consolidated per fire; paired with the vendor
  *     retain.py divergence)
  *   - `recallMaxMemories`: 12 → 8 (tighter prompt, less model noise)
+ *   - `recallOwnBankMinSlots` / `recallAdditionalBankMinSlots`: 0/0 → 2/1
+ *     (neither bank can take every slot of the deployed cap of 6)
  *
  * Future overrides go here, NOT in the vendor file. The vendor is
  * third-party code and must remain untouched for clean upstream
@@ -3267,6 +3287,38 @@ function renderHindsightSettingsOverrides(
   // in switchroom.yaml — start.sh exports HINDSIGHT_RECALL_TYPES only when
   // overridden, and the env value wins over this settings.json default.
   settings.recallTypes = ["world", "experience", "observation"];
+  // Per-bank slot FLOORS inside recallMaxMemories. The merged multi-bank set
+  // is sorted globally by `scores.final` and head-sliced, which is
+  // winner-take-all across banks: on a turn where both banks return more
+  // candidates than the cap, one bank's score distribution can fill every slot.
+  // The shared `ken-profile` bank is the side that wins in practice (short,
+  // dense, highly-rerankable statements), so the agent is handed a dossier
+  // about its operator and none of its own session memory.
+  //
+  // Scope, stated honestly: this fixes score-based crowd-out among results that
+  // DID return. It does NOT fix the own-bank timeout — a timed-out bank
+  // contributes no candidates, so reservation is a strict no-op there. Across
+  // 1,036 multi-bank non-cache recalls since 2026-07-20, both banks were alive
+  // on 15.1% of turns fleet-wide (6.4% for overlord); own-dead/profile-alive is
+  // 67.0% (83.5% for overlord). The telemetry shipped alongside this
+  // (`injected_own_bank_count`) is what makes THAT case legible — it is the
+  // field that would have caught the own-bank outage, since a fully timed-out
+  // own bank still logs a full `result_count`.
+  //
+  // 2/1 against the cap this fleet actually deploys — which is 6, not the 8
+  // stamped above: `defaults.memory.recall.max_memories: 6` in switchroom.yaml
+  // cascades to HINDSIGHT_RECALL_MAX_MEMORIES, and env wins over settings.json.
+  // FLOORS, not quotas, and enforced as such: recall.py bounds the two floors to
+  // HALF the cap between them (`_reservable_slots`), so at least three of six
+  // slots are always won on pure relevance and composition still moves with the
+  // scores. Floors that summed to the cap (4+2 at 6) would be a fixed quota with
+  // no score influence at all. Each side also gets its floor only if it returned
+  // that many, so a silent bank wastes nothing. Operators re-tune via
+  // memory.recall.own_bank_min_slots / .additional_bank_min_slots in
+  // switchroom.yaml (0/0 = the pre-fix head-slice). Vendor default is 0/0; this
+  // is the switchroom opt-in.
+  settings.recallOwnBankMinSlots = HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT;
+  settings.recallAdditionalBankMinSlots = HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
   // Phase 6a: on top of the ack-skip, skip recall on plausibly-stateless
   // trivial turns (time/date/day, bare greetings) — saves the ~1-2s
   // recall arm + up to ~1024 injected tokens on turns that never need
@@ -3459,6 +3511,10 @@ interface BuildWorkspaceContextArgs {
   hindsightRecallQueryMaxTokens: number;
   hindsightRecallQueryStopTermsJson: string;
   hindsightRecallRequestTimeoutSeconds: number;
+  // Always resolved (operator override ?? shipped default) — start.sh exports
+  // these unconditionally so a stale claude-code.json cannot shadow them.
+  hindsightRecallOwnBankMinSlots: number;
+  hindsightRecallAdditionalBankMinSlots: number;
   // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
@@ -3506,6 +3562,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallQueryMaxTokens,
     hindsightRecallQueryStopTermsJson,
     hindsightRecallRequestTimeoutSeconds,
+    hindsightRecallOwnBankMinSlots,
+    hindsightRecallAdditionalBankMinSlots,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -3592,6 +3650,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallQueryMaxTokens,
     hindsightRecallQueryStopTermsJson,
     hindsightRecallRequestTimeoutSeconds,
+    hindsightRecallOwnBankMinSlots,
+    hindsightRecallAdditionalBankMinSlots,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -4524,6 +4584,17 @@ export function scaffoldAgent(
   const hindsightRecallRequestTimeoutSeconds =
     agentConfig.memory?.recall?.request_timeout_seconds ??
     HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT;
+  // Per-bank slot floors inside the count cap. Same cascade, but resolved to
+  // the shipped default rather than left undefined: start.sh exports these
+  // UNCONDITIONALLY (#3774). `~/.hindsight/claude-code.json` survives an apply
+  // and loads AFTER the plugin's settings.json, so a conditional export lets a
+  // stale hand-edited value there shadow what switchroom stamps — silently, and
+  // permanently. Exporting the resolved effective value makes env authoritative.
+  const hindsightRecallOwnBankMinSlots =
+    agentConfig.memory?.recall?.own_bank_min_slots ?? HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT;
+  const hindsightRecallAdditionalBankMinSlots =
+    agentConfig.memory?.recall?.additional_bank_min_slots ??
+    HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -4601,6 +4672,8 @@ export function scaffoldAgent(
     hindsightRecallQueryMaxTokens,
     hindsightRecallQueryStopTermsJson,
     hindsightRecallRequestTimeoutSeconds,
+    hindsightRecallOwnBankMinSlots,
+    hindsightRecallAdditionalBankMinSlots,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -6976,6 +7049,17 @@ function reconcileAgentInner(
   const hindsightRecallRequestTimeoutSeconds =
     agentConfig.memory?.recall?.request_timeout_seconds ??
     HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT;
+  // Per-bank slot floors inside the count cap. Same cascade, but resolved to
+  // the shipped default rather than left undefined: start.sh exports these
+  // UNCONDITIONALLY (#3774). `~/.hindsight/claude-code.json` survives an apply
+  // and loads AFTER the plugin's settings.json, so a conditional export lets a
+  // stale hand-edited value there shadow what switchroom stamps — silently, and
+  // permanently. Exporting the resolved effective value makes env authoritative.
+  const hindsightRecallOwnBankMinSlots =
+    agentConfig.memory?.recall?.own_bank_min_slots ?? HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT;
+  const hindsightRecallAdditionalBankMinSlots =
+    agentConfig.memory?.recall?.additional_bank_min_slots ??
+    HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -7077,6 +7161,8 @@ function reconcileAgentInner(
       hindsightRecallQueryMaxTokens,
       hindsightRecallQueryStopTermsJson,
       hindsightRecallRequestTimeoutSeconds,
+      hindsightRecallOwnBankMinSlots,
+      hindsightRecallAdditionalBankMinSlots,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
@@ -7862,6 +7948,8 @@ function reconcileAgentInner(
       hindsightRecallQueryMaxTokens,
       hindsightRecallQueryStopTermsJson,
       hindsightRecallRequestTimeoutSeconds,
+      hindsightRecallOwnBankMinSlots,
+      hindsightRecallAdditionalBankMinSlots,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,

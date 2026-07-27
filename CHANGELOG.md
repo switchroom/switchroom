@@ -555,6 +555,83 @@ deployment failed **and** the OpenRouter hop did not rescue it. The new signal
 warns at ≥2 % and pages at ≥10 % of hindsight LLM calls failing outright
 (measured today: 0/800). No LiteLLM configuration was touched.
 
+### Recall reserves slots per bank, and injected bank composition is now logged
+
+Auto-recall fans out to the agent's own bank and the sender's profile bank,
+merges the results, sorts them globally by `scores.final` and head-slices at
+`recallMaxMemories` — **6 on this fleet**, from
+`defaults.memory.recall.max_memories` in `switchroom.yaml`, which cascades to
+`HINDSIGHT_RECALL_MAX_MEMORIES` and wins over the 8 stamped into the plugin's
+`settings.json`.
+
+That head-slice is winner-take-all across banks. On a turn where both banks
+return more candidates than the cap, nothing stops one bank's score
+distribution from filling every slot, and the agent is handed a dossier about
+its operator with none of its own session memory.
+
+**Scope, stated plainly: this fixes score-based crowd-out among results that
+did return. It does not fix the own-bank timeout.** A timed-out bank
+contributes zero candidates, so reservation is a strict no-op in exactly that
+case. Measured across 1,036 multi-bank non-cache `recall_log.jsonl` rows on this
+host since 2026-07-20: own-dead / profile-alive is 67.0% of turns (83.5% for
+overlord), own-dead / profile-dead 18.0%, and **both-alive — the only state
+where reservation can act at all — 15.1% fleet-wide, 6.4% for overlord** (6.8%
+once you also require more candidates than the cap). The own-bank timeout is a
+larger, separate defect.
+
+The half of this change that *does* address the majority case is the
+**telemetry**. A fully timed-out own bank still logs `result_count == 6`, which
+every existing dashboard reads as success — that is precisely why the own-bank
+timeout outage hid for weeks. Volume cannot see composition, so
+`recall_log.jsonl` now carries `injected_own_bank_count` and
+`injected_additional_bank_count` (always summing to `result_count`), plus
+`reserved_own_slots` / `reserved_additional_slots` for the slots the floors took
+from global relevance. A result with no stamped source bank counts as
+additional, so the own-bank number is never optimistic. This is the field that
+would have caught the outage.
+
+`recall.py` stamps each merged result with its source bank and reserves slot
+**floors** before the head-slice — `recallOwnBankMinSlots` /
+`recallAdditionalBankMinSlots`, cascading from
+`memory.recall.own_bank_min_slots` / `.additional_bank_min_slots`.
+Switchroom-managed agents get **2 own / 1 additional against the deployed cap of
+6**; the vendor default stays 0/0 (the pre-fix head-slice), which is also the
+rollback lever.
+
+Floors, not quotas — and enforced as such. Each side gets at most its floor,
+only if it returned that many, **and only up to half the cap between them**
+(`_reservable_slots`). The other half is always awarded on pure global
+relevance, so composition still moves with the scores in both directions: at cap
+6 with profile-favoured scores the split is 2 own / 4 profile, with own-favoured
+scores 5 own / 1 profile. Without that headroom the shipped floors would be a
+fixed quota — floors of 4 + 2 at a cap of 6 consume the cap exactly, the
+leftover-fill loop never runs, and `scores.final` has no influence on
+composition on any turn where both banks return. The clamp scales with the cap,
+so the invariant holds at 4, 8 or 12 as well. When the floors exceed that budget
+the own-bank floor is honoured first. Selection is re-sorted by relevance
+afterwards, so reservation changes *which* memories are injected, never the
+order they are presented in.
+
+Both env exports are written **unconditionally** (#3774): `~/.hindsight/
+claude-code.json` survives an apply and loads *after* the plugin's
+`settings.json`, so a conditional export would let a stale hand-edited value
+there shadow what switchroom stamps — silently and permanently. Writing the
+resolved effective value every boot makes the environment, applied last, the
+authority. Same resolution as #3759 / #3760.
+
+Not touched: the fan-out architecture itself. Every agent queries exactly two
+banks in parallel under one shared deadline, `additional_banks` is empty
+fleet-wide, and a slow bank cannot block a fast one. That design is sound; slot
+allocation was the only thing wrong with it.
+
+Tests assert composition, never volume, and the load-bearing ones are
+mutation-checked. Deleting the additional-bank floor, deleting the own-bank
+floor, removing the half-cap clamp, or hardcoding either `reserved_*_slots` to 0
+each fails the suite. The anchor cases pin that with floors off *either* bank
+takes all six slots depending on the score regime, that a fully timed-out own
+bank still logs `result_count == 6` while `injected_own_bank_count` reads 0, and
+that flipping the score regime changes the injected composition — the property
+that distinguishes a floor from a quota.
 
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
