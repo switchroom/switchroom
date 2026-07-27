@@ -1,5 +1,780 @@
 # Changelog
 
+## v0.19.27 — the Telegram flood-ban chain is closed end to end, one card layout core, and one status-pin path
+
+On 2026-07-27 an agent's bot token took a 15908-second (4.4 hour) Telegram flood
+ban, and it cut off every agent reply in that chat, not just the traffic that
+earned it. Six PRs in this release close that chain at each of the places it
+broke: the rate that earned the ban, the meter that could not see most of the
+traffic, the fuse that forgot the ban across a restart and answered a 4.4-hour
+penalty the same way it answered a 3-second nudge, the outbox sweep that
+re-issued an undeliverable send every 5 seconds for the whole ban, the absence
+of any warning that the escalation was coming, and — the last one — the
+interactive reply path silently destroying the agent's composed answer instead
+of queueing it.
+
+### A flood-blocked reply is queued, not destroyed (#3861)
+
+The durable-outbox work-loss guarantee held for the outbox-delivered paths and
+was **false for the interactive reply path**. During a multi-hour ban, the
+agent's actual answers to the operator were the one class of content silently
+lost.
+
+`retryApiCall` short-circuits before the wire when the persisted breaker reports
+a window longer than its in-process sleep ceiling, throwing the
+`FLOOD_WAIT_ACTIVE` marker (`telegram-plugin/retry-api-call.ts:198`, `:252`).
+That is correct for the wire — nothing can succeed while the ban is open — but
+it is a bare `throw`, and the reply path's chunk-loop catch only re-wrapped it
+as `reply failed after 0 of 1 chunk(s) sent: FLOOD_WAIT_ACTIVE`. The composed
+answer died in that string. Reproduced live on 2026-07-28 during a real ban: the
+reply tool returned exactly that, and the agent's outbox directory contained no
+record for it.
+
+New `telegram-plugin/gateway/flood-reply-queue.ts` writes the undelivered text
+into the same durable outbox the sweep drains, and returns a notice for the
+caller. It returns `null` — "not handled, caller throws" — for a non-flood
+error, for `cosmetic`, for empty text, or when the disk write failed, so a
+`null` can never be mistaken for "delivered".
+
+Two load-bearing choices:
+
+- **A content-derived nonce, not the turn nonce.** `writeOutboxRecordAtomic` is
+  idempotent per nonce and the delivered-keys journal is keyed by nonce, so a
+  content nonce gives caller-retry dedup *without* the turn nonce's failure
+  mode: an earlier successful reply in the same turn journals the turn id as
+  delivered, which would make a later flood-blocked answer queued under that
+  nonce `skip-journaled` — i.e. dropped. Never drop the answer.
+- **`cosmetic` is not queued.** A typing frame or a card edit that missed its
+  moment is worthless, and confusing, delivered hours later. `critical` /
+  `useful` / untagged are queued; the reply site is `critical`.
+
+On a partial failure only the chunks that never landed are queued, so the user
+does not get the delivered prefix twice, and the caller gets `reply QUEUED (not
+yet visible to the user) … Do NOT resend` instead of an exception. The sweep now
+delivers in capture order rather than `readdir` order, which on most Linux
+filesystems is hash order — harmless while the outbox held at most one stray
+handback per turn, not harmless once a multi-hour window can park a whole
+conversation's worth of queued replies.
+
+The end-to-end test opens a real 15908s window in `flood-wait.json`, issues a
+user-facing send, asserts the text is on disk, sweeps *while open* and asserts
+nothing reached the wire and the record is still pending, then closes the window
+and asserts the answer is sent once, verbatim. A source-level wiring guard is
+included on purpose: `sendReply` takes ~50 injected gateway deps and is not
+constructible in a unit test, so the one line that makes any of this reach
+production would otherwise be unguarded.
+
+**What this does not claim:** only the `sendReply` chunk loop is wired. Voice
+notes, file sends, cards and `sendOutbound` still throw on a flood rejection.
+The module is call-site-agnostic and ready for them; that is separate work.
+
+Also corrected here: the audit that prompted this characterised the obligation
+tracker as re-prompting "every few minutes with no exit condition and no
+backoff". That is wrong — `OBLIGATION_REPRESENT_MAX` is 2, enforced by the
+ledger and logged as `attempt=N/2`. What survives is smaller and real, and
+dissolves with this fix: while a window was open the tracker induced up to two
+*guaranteed-lossy* reply attempts per message, because each attempt destroyed
+the composed answer.
+
+### The edit-flood fuse is class-aware, so the activity feed can never again earn a flood ban (#3847)
+
+In the final 20 minutes before the ban the worker-activity narrator issued
+**326 `editMessageText` against 6 real replies** — about 54x more API traffic
+than answers. The 10-minute edit buckets leading in ran 58, 53, 41, 115, 78, 73,
+17, 25, **152, 174**: sustained 4-17 edits/min for hours.
+
+The post-mortem matters because both `edit-flood-fuse.ts` and
+`flood-circuit-breaker.ts` already existed, neither was disabled, and neither
+was unwired. The fuse installs as a grammY API transformer on the single `Bot`
+instance, so every edit in the process passed through it, and it already had a
+per-chat tier. It did not trip because **both ceilings sat above the banned rate
+by construction** (20/message and 30/chat per 60s, against an observed ~17.4/min)
+and because those numbers were sized against in-repo pacers rather than against
+Telegram: `send-gate.ts`'s 1500ms edit floor permits 40 edits/min/message, the
+feed's own 2500ms minimum permits 24/min, and the 6s heartbeat drives 10
+repaints/min/turn. A fuse at 20-30/min is a ceiling above the floor its own
+producers set.
+
+The reason it could not simply be tightened is class-blindness. A transformer
+sees only `(method, payload)`, so the fuse could not tell a liveness repaint
+from a streamed answer or an approval card, and any ceiling low enough to stop
+the feed would equally have throttled the answer path.
+
+So the fix is priority separation, not a smaller debounce. New
+`telegram-plugin/outbound-class.ts` carries the send gate's `priorityClass` down
+to the transformer via `AsyncLocalStorage` rather than smuggling a non-Bot-API
+field into the outbound payload; an untagged edit defaults to `cosmetic` (a new
+unkeyed call site is rate-limited by default instead of invisible until it earns
+a ban) and an untagged send to `critical`. A compile-time assertion locks
+`PriorityClass` and `OutboundClass` together, so adding a class to one and not
+the other fails `tsc`, not review.
+
+Cosmetic-only ceilings are **4/message/60s and 6/chat/60s**, chosen from the
+incident's own timeline: the ~4-6/min buckets ran for hours without a ban and
+the ~8-17/min ones earned one. A shared `t:${chat}` window at 20/60s meters
+sends and edits together — Telegram's documented per-group ceiling, and the only
+window that reflects the real budget — with **8 of those 20 slots reserved from
+cosmetic traffic**, so a reply is structurally unstarvable by repaints even if a
+future call site is misclassified. The flat single-step 429 tighten became AIMD
+with up to 4 compounding levels decaying one level per quiet interval, and one
+defer deadline is now shared across tiers (previously a call crossing three
+tiers could be held 3x `maxDeferMs`).
+
+Bounded R1 late-release is the subtle one. R1 says an over-budget edit that
+nothing newer will repaint must be released late rather than dropped, else the
+card freezes *and* the send gate records a never-painted payload as on-screen.
+Taken literally that has no ceiling: cosmetic edits to distinct message ids are
+all "lone" frames, which is how N concurrent worker cards walked past a per-chat
+ceiling one frame at a time. Late releases are now charged to a 2/min window,
+preserving R1 for the genuinely lone terminal recap.
+
+The only prior operator control was `SWITCHROOM_EDIT_FUSE=0`, which turns the
+entire failsafe off. There are now real knobs:
+`SWITCHROOM_FEED_EDIT_MAX_PER_MSG_PER_MIN`,
+`SWITCHROOM_FEED_EDIT_MAX_PER_CHAT_PER_MIN`,
+`SWITCHROOM_CHAT_TOTAL_MAX_PER_MIN`, `SWITCHROOM_CHAT_REPLY_RESERVE`,
+`SWITCHROOM_EDIT_FUSE_MAX_DEFER_MS`.
+
+### The fuse meters every chat-targeted call, and there is now a per-bot-token window (#3855)
+
+`apply` opened with `if (!isEdit && !isSend) return runObserved(next)` — so
+everything outside two hardcoded sets was **free**, while
+`perChatTotalMaxPerWindow`'s own docblock asserted it "counts every admitted
+call" and "matches Telegram's own per-chat metering". It did neither.
+
+Measured on a real gateway log (46791 `tg-post` lines), the unmetered share was
+**29% overall and 42% in the 30 minutes before the ban**. `sendChatAction` is
+the headline: 10457 calls, none metered, running at up to **18/min on one DM** —
+Telegram's entire documented per-chat/minute allowance on its own. A "20 per 60s"
+ceiling was admitting about 34 calls per 60s on the wire. Also unmetered:
+`setMessageReaction` (2098), `deleteMessage` (370), `pinChatMessage` (366),
+`unpinChatMessage` (365), `answerCallbackQuery` (31).
+
+**The fix is default-deny.** Every method whose payload carries a `chat_id` is
+charged to the shared per-chat window whether or not this file has heard of it.
+There is no per-chat exemption list to forget to update — `sendChecklist`, which
+was in neither set, is now metered without being listed anywhere.
+`answerCallbackQuery` carries no `chat_id` at all, so the per-chat tier
+structurally cannot key it; it is charged to the new token window instead.
+`getUpdates` is the one exemption, and it is justified rather than assumed: it is
+the long-poll receive loop, so pacing it stalls inbound delivery rather than
+protecting anything.
+
+Newly-metered traffic with a durable, user-visible effect (`deleteMessage`,
+`pinChatMessage`, `setMessageReaction`) is **paced, never dropped** — the same
+contract sends get. `sendChatAction` is the sole exception: a typing status
+clears itself after ~5s, so a stale one is worse than none and it is shed after
+3s.
+
+The flood ban is scoped to the **token**, not the chat, so N chats could each be
+in budget while the token was not. New `perTokenMaxPerWindow` /
+`perTokenWindowMs` (default 25 per 1000ms, under the ~30/s token-level limit)
+are charged for every outbound call including the chat-less ones, and a call is
+admitted only if both windows have room. `deriveBotScopeKey()` returns only the
+public bot id — the prefix before the `:`, visible on every message the bot
+sends — falling back to a truncated SHA-256 for an odd-shaped token; the key is
+an in-memory `Map` key and nothing else, and a test walks every prefix of the
+secret half ≥4 chars asserting none appears in the derived key.
+
+**Stated plainly, because overstated coverage is the exact failure being
+corrected: this window is per-process.** Two agents sharing one bot token run in
+separate containers with separate state dirs and neither sees the other's
+window. Persisting it through the existing breaker store does not reach — both
+`flood-wait.json` and `flood-windows.json` live under each agent's own state
+dir. So this bounds the single process that actually floods, and it is not full
+coverage under a shared token.
+
+The ceiling **numbers are unchanged**. The recalibration is that they now mean
+what they say: 20 admitted calls is 20 on the wire, not ~34.
+
+### The fuse survives a restart during a ban, and scales its response to the penalty (#3856)
+
+Two remaining holes, both of which the 2026-07-27 outage walked straight
+through.
+
+**`tightenLevel` and `tightenedUntil` were plain local variables.** A gateway
+restart during a flood ban — the single most likely thing to happen during a
+multi-hour outage, and exactly what happened — brought the fuse back fully
+untightened, at precisely the rate that earned the ban, while the window was
+still open on disk. Every other outbound path in the tree already consulted
+`flood-wait.json`; the fuse was the one that did not. `levelAt(now)` now reads
+the persisted window and reports `maxTightenLevel` while it is open. It is a
+**floor, not a latch** (the read does not mutate `tightenLevel`, so when the
+window closes the fuse drops back to what this process actually earned), it is
+**throttled** to at most one file read per second with the cached value decayed
+by elapsed wall time, and it **fails open** — a breaker that cannot read its own
+state must never gag the bot.
+
+**`noteFlood()` threw away the severity.** It always stepped one level and
+always held 10 minutes, so a 3-second "ease off" nudge and a 15908-second ban
+produced the identical response — which defeats the point of AIMD. Worse, 10
+minutes against a 4.4-hour ban means the tightening expired roughly 25 times
+over while the ban was still in force. The step now scales with the
+`retry_after` Telegram itself states: ≤5s → 1 level, ≤60s → 2, ≤600s → 3, and
+**>600s → straight to `maxTightenLevel`** (both real incidents, 3713s and
+15908s, are in that band; at that magnitude the rate that produced it is
+categorically wrong, and stepping down one level at a time spends the next
+window earning the next ban). The hold is now the base interval **plus** the
+stated penalty, so it can never expire before the ban does.
+
+`looksLikeFlood(): boolean` became `floodRetryAfterSec(): number | null`, which
+also recovers the magnitude from the message text when there is no `parameters`
+block. It is deliberately conservative in both directions: an *unquantified*
+flood returns 0 and is treated as the mildest case, because inflating an
+unmeasured signal into a maximal response would let one ambiguous error throttle
+the bot to 1/window.
+
+One 15908s ban now takes the per-message ceiling from 32 to **2** in a single
+429. On the pre-fix code it went 32 to 16 and the stream carried on at half rate
+into a four-hour outage.
+
+### The outbox sweep no longer amplifies a flood ban (#3854)
+
+`startOutboxSweep` built its retry policy as `createRetryApiCall({ log:
+deps.log })` — the **only** such wiring in the tree with neither breaker hook:
+no `floodWaitRemainingMs` to read the persisted window, no `onFloodWait` to
+write the ones it earned. Combined with a fixed 5s tick and a `catch` that
+released the claim with no backoff, the sweep re-issued a single undeliverable
+`sendMessage` every 5 seconds for the whole 4.4-hour ban. The production log
+carries **0** occurrences of `flood window still open` against **228**
+`outbox-sweep: send failed`, with one nonce re-issued every ~5s while
+`retry_after` counted down 12272 → 12267 → 12262. The breaker had the answer on
+disk the entire time.
+
+Both hooks are now wired, reusing the existing persisted state rather than
+building anything new. `sweepOutbox` probes the window first and returns early
+while it is open: no scan, no claim, no send. Records stay pending on disk and
+are re-scanned after the window closes, so this loses no delivery, and a
+throwing probe is treated as "no window" — a broken probe must never strand the
+outbox. `createSweepBackoff()` adds exponential 5s → 10s → 20s backoff capped at
+5 minutes, cleared by any sweep with zero send failures; a flood-deferred sweep
+is neither success nor failure, since it never reached the wire. The deferral is
+logged at most once a minute, because a 4.4-hour ban is ~3181 ticks and a line
+each would just move the flood from the wire to the disk. Across that ban the
+pacer now permits **fewer than 60** sweeps.
+
+New `scripts/check-retry-flood-hooks.mjs` fails lint if any
+`createRetryApiCall(` call site in non-test source omits either hook. It uses
+paren-balancing rather than regex, its one escape hatch requires a stated reason
+(a bare marker fails), and there are zero exemptions in the tree. It immediately
+earned its keep by finding a second unwired site the brief had listed as
+correctly wired: `nonEssentialApiCall` in `gateway.ts` had `onFloodWait` but not
+`floodWaitRemainingMs`.
+
+### 429 pressure is watched, so an escalating flood ban is seen coming (#3849)
+
+Nothing was watching the run-up. New `telegram-plugin/flood-429-ledger.ts` keeps
+a bounded on-disk record of every observed 429, folded into ban *episodes*, fed
+by one call added to `makeFloodWaitRecorder` — the single function every
+`onFloodWait` wiring funnels through, so no future call site can record a window
+without its history. `src/cli/doctor-flood-pressure.ts` surfaces it as a
+per-agent `switchroom doctor` section with WARN/FAIL tiers, silent when healthy.
+
+Log-scraping was rejected on evidence rather than preference: on the real file
+`grep -c 429` returns 804 hits of which only **101** are actual 429s, the rest
+being chat ids, message ids and byte counts that contain those digits.
+
+**This contradicted the dispatch brief and is reported rather than force-fit.**
+The brief's per-day counts (2 / 82 / 135 / 498 for Jul 24-27) came from that
+substring grep. The true counts are **0 / 4 / 4 / 93**, and 88 of the 93 on Jul
+27 are the ban itself. That changes the answer: a ">20 429s/day" rule fires on
+no day that could have warned.
+
+So the classifier keys on the **size** of `retry_after` and on repetition across
+days, not on event count — because raw count is actively misleading here. The
+highest-count benign day (14 429s, all `retry_after=3`) beats the day of a real
+62-minute ban (4 429s at `retry_after=3713`) fourteen to four. The tiers are
+`ban_open` (FAIL), `repeat_penalty` (FAIL, ≥2 penalty episodes in 7 days, with
+the detail line naming the growth explicitly as `3713s → 15908s`),
+`severe_penalty` (FAIL, one penalty ≥600s), `single_penalty` (WARN) and
+`trivial_pressure` (WARN, the only count-based tier). The benign/penalty split
+sits at 60s: across 170 real observations the largest benign `retry_after` is 5
+and the smallest belonging to a real ban is 282, so the threshold sits in a wide
+empty band rather than being fitted to a boundary case. The 7-day repeat window
+is calibrated too — the two real bans are 44 hours apart, so a 24h window would
+treat the second as a first offence.
+
+**Episodes, not observations.** The 4.4-hour ban was re-observed 88 times over
+41 minutes, each with a `retry_after` 5s lower. Storing raw observations would
+let one ban evict weeks of history and make any count-based rule explode during
+the outage it should have predicted. The write path folds on implied expiry, so
+the whole outage costs under 200 bytes of state.
+
+Replayed against all 170 real observations from 2026-07-12 to 2026-07-27, the
+doctor section prints a FAIL row naming the 3713s ban **20h 20m before** the
+4.4-hour outage, and first fires two minutes after that 62-minute ban — 44 hours
+of warning. It also fires 75 minutes before an earlier 27951s ban, and returns
+null on the quiet days and on the busiest benign day's traffic.
+
+A live push is deliberately not here. The right home is a `src/fleet-health/`
+sensor escalating into the priority ledger, which needs a job-spec mapping
+decision and is a separate concern.
+
+### The terminal worker-card frame is `useful`, not cosmetic (#3851, closes #3848)
+
+#3847 tagged **every** worker-feed edit `cosmetic`. That is right for a liveness
+repaint — dropping one costs nothing, the next render carries full state — and
+wrong for the **terminal** frame, which is the last frame the operator ever
+reads for that card with nothing newer coming to repaint it. Classing it
+cosmetic made the single frame carrying the finished state compete in the same
+starved budget as a heartbeat, so under sustained pressure it was the frame
+shed, leaving the card frozen mid-run permanently.
+
+The distinction already existed at the exact call site — `doRender`'s
+`terminalRecap != null`, supplied only when the finishing worker is the last live
+one in its group. It simply had no way to tell the transport. The feed now hands
+the adapter an out-of-band `WorkerFeedEditMeta { terminal }` as a **separate
+parameter, not a field on `opts`**, because `opts` is forwarded verbatim onto the
+wire and `outbound-class.ts` exists precisely so a priority signal never has to
+be smuggled into a Bot API payload.
+
+`useful`, not `critical`: it may be deferred under pressure but is not shed, and
+it does not spend the per-chat reply reservation that keeps the operator's real
+answer unstarvable. Intermediate repaints stay `cosmetic`, so #3847's flood
+defence is untouched. Two edits are promoted — the terminal recap and the
+superseded-card note on a rotated-out message, both last frames.
+
+`gateway.ts` is 24917 lines before and after, against ratchet 24867 plus 50
+slack — zero headroom, which is exactly why #3847 filed an issue instead of
+fixing it inline. Achieved strictly line-neutrally, because the class was
+already a one-line value.
+
+### One card layout core (#3853, closes #3844 and #3846)
+
+Card rendering forked three ways. `renderStatusCard` served the 🤖 agent card and
+the single-worker 🛠 card, but the 2+ worker `🛠 WORKERS` card built its own
+glance line and row headers instead of `renderActivityHeader`, and carried its
+own row-shrinking loop instead of `fitCardToBudget` — header composition and
+char-budget enforcement each existed **twice** and agreed only by hand (#3844).
+Separately, the just-dispatched `starting…` line was string-concatenated onto the
+card *after* `renderStatusCard` returned (#3846).
+
+New `telegram-plugin/card-layout.ts` is one layout core expressing a card as
+sections and rows. The title line lives in `renderCardTitleLine`, the metrics
+line in `metricsRun`, the step block (rolling window, `✓`/`→`, `+N earlier…`,
+placeholder) in `emitSection`, char-budget enforcement in `fitCardToBudget`, and
+line stacking in `stackCard`. The `🛠 WORKERS` card is now a `CardSpec`
+*configuration* of that core rather than a parallel implementation: each worker
+row is a `CardSection` with a step indent and a `'→ _starting…_'` placeholder,
+and the nested `↳` foreground-sub-agent block is the same `emitSection` with an
+empty done-mark. Both shrink ladders — the status card's drop-oldest and the
+combined card's drop-newest-row — are now `build(level) -> CardCandidate` ladders
+fed to the one `fitCardToBudget`. The `starting…` line became a normal section
+placeholder, so it picks up the same collapse-safe line joining as every other
+line instead of being appended outside the primitive.
+
+`WORKER_CARD_SUPERSEDED_BODY` deliberately stays a **constant** — it renders no
+live state, so there is nothing for a renderer to compute and wrapping it would
+be ceremony rather than centralisation — but its title line now comes from the
+shared `renderCardTitleLine`, so its chrome cannot drift from the live cards.
+
+**Output is byte-identical.** All 21 card variants were captured on `origin/main`
+and again on the branch and diffed; every card body is unchanged to the byte.
+
+Two new suites back it, neither a unit test of a render function. A golden suite
+renders all 21 variants through the real renderers and compares byte-for-byte,
+and asserts the golden covers exactly the catalogue so a variant cannot quietly
+stop being checked — now that every card flows through one core, a change made
+for one card can silently reshape the other twenty. A lifecycle suite drives the
+**real** feed manager with a fake bot and asserts the exact `sendMessage` /
+`editMessageText` bodies across dispatch, running trail, depth budget, two
+workers coalescing into one message, spill past `maxRows`, budget shrink, a
+worker finishing with survivors keeping their ordinals, done recap, failure
+recap and group-message supersede. The fixtures live in one catalogue imported
+by both the golden suite and the preview script, so the preview doc and the
+regression alarm cannot drift apart.
+
+### The worker card is flush again (#3843, closes #3842 and #3832)
+
+#3820/#3821 made the 🛠 worker card structurally subordinate to the 🤖 agent
+card: line 1 prefixed `└─ ` and every later line indented. Both objections were
+correct — the whole-card indent burns a level of horizontal space on a phone,
+and the worker card does not always sit below the agent card, so a card-level
+subordination marker asserts a relationship that is not always true.
+
+Everything shifts left by one level. The single-worker card is flush on every
+line; the `🛠 WORKERS` glance line, row headers and spill line are flush; step
+lines drop from two indent levels to one. Worker-vs-worker separation is now
+carried by the surviving step indent plus the numbered row titles — the only
+place indentation was earning its keep.
+
+### One status-pin path, and a guard that keeps it that way (#3857, closes #3831, #3809, #3810, #3811, #3812)
+
+The retarget expansion existed **twice**. `status-pin-driver.ts::reconcilePin`
+called `decidePinAction` itself and recursed on a `repin`;
+`gateway/status-pin-retarget.ts::runStatusPinReconcile` did the same expansion
+but wrapped each leg in `reconcileAndPersistStatusPin`. So which copy ran decided
+whether the durable `status-pins.json` row survived a retarget. The driver copy
+was unreachable from the gateway and had already drifted, and any future caller
+wiring `reconcilePin` directly would have silently inherited the weaker
+semantics.
+
+**Fixed by deletion, not abstraction.** `PinLegAction` (`noop | pin | unpin`) is
+a new type that *structurally cannot express a repin*; the driver takes that,
+no longer imports `decidePinAction`, and the recursive branch is gone. The
+compiler enforces what the comment could not. The single path is now
+`reconcileStatusPin()` → `runStatusPinReconcile()` (the only decider and the only
+retarget expansion) → `reconcileAndPersistStatusPin()` (persist-before-pin, the
+only store writer) → `executePinLeg()` (one already-decided leg) →
+`createStatusPinApi()` (the only raw pin/unpin surface).
+
+Four reaping bugs fall out of the same consolidation:
+
+- **#3809** — three parallel maps collapse into one `StatusPinClaim { messageId,
+  chatId, pinnedAt }`. A claim that lost its chat id was skipped by the
+  mid-session reaper on *every* pass **and** excluded from the store-orphan net,
+  making it permanently unreapable mid-session. A chat-less claim is now
+  unrepresentable.
+- **#3810** — `pinnedAt` is persisted (store envelope v3), so a store orphan is
+  TTL-reaped at its real age instead of being re-stamped `now` on every pass.
+  Pre-v3 rows keep the conservative stamp and self-heal after one restart.
+- **#3811** — `groupPinStatus` returns `'unknown'` for a null feed. The previous
+  `feed?.hasRunningInFeed(k) ? 'running' : 'terminal'` conflated "the feed says
+  done" with "there is no feed to ask", and `'terminal'` reaps at any age — so a
+  feed-null window could unpin a **live** group pin.
+- **#3812** — `clearActivitySummary` awaits the foreground release *before*
+  deleting the card, so a claim can no longer name a deleted message.
+
+The guard is `scripts/check-status-pin-single-path.mjs`, an architectural fitness
+function wired into `npm run lint` so it gates the `lint` required check. Six
+rules, each with a failure message naming the path to use instead: raw
+pin/unpin API outside a sanctioned file, `decidePinAction` outside the
+orchestrator, naming a `'repin'` anywhere else (i.e. the #3831 re-fork), claim
+registry mutation, raw store writes, and a second composition of orchestrator
+plus driver. Three of the six have **no escape at all**. Sanctioned files live in
+an allowlist where a reason is mandatory, inline markers likewise reject a
+rubber-stamp with no reason, and `.github/path-filters.yml` now includes the
+allowlist files so an allowlist-only edit cannot skip the guard it loosens. Each
+fork was reintroduced for real against the tree and the guard went red on every
+one.
+
+### A provider credit failure no longer reaches an end user as a raw API error (#3868)
+
+OpenRouter answers an exhausted balance with HTTP **402 `payment_required` /
+"insufficient credits"**. Every quota wording switchroom recognised was an
+*Anthropic* wording, so `classifyClaudeError` fell through to `unknown-4xx` —
+and `unknown-4xx` is not in `OPERATOR_ACTIONABLE_KINDS`, so the card was
+broadcast to **every allowlisted chat**. An end user was shown the raw vendor
+payload (`litellm.APIError: OpenrouterException - {"error":{"code":402,…`) under
+a **🔐 Reauth** button that could not have fixed it. An operator-actionable
+error must never surface to an end user, and this one did.
+
+The fix is a new pure module, `telegram-plugin/provider-credit.ts`: one data
+registry of paid third-party providers (OpenRouter, OpenAI, Perplexity — id,
+label, vault key **name**, console URL, remedy, attribution markers), the
+provider-agnostic credit wording list, and `detectProviderCreditExhaustion`.
+Adding a provider is a data edit, not a new conditional. A new operator-event
+kind `provider-credit-exhausted` joins `OPERATOR_ACTIONABLE_KINDS` and renders
+its own card, naming the provider, the vault key name (never a value) and the
+console — with no `/auth` recommendation and no Reauth button, because rotating
+an Anthropic slot buys zero OpenRouter tokens. The end user gets a
+diagnosis-free one-liner via `llm-error-present.ts`'s new `provider_credit`
+case, always-actionable so it is never dedup-silenced.
+
+**OpenAI is covered too**, and its shape is different: it reports an exhausted
+balance as HTTP **429 `insufficient_quota`**, so the new branch runs *before*
+the rate-limit branch — otherwise a billing wall would read as "will retry
+automatically", which is false. `resolveModelUnavailableFromOperatorEvent`
+returns `null` for the new kind, so a 402 can never fire `fireFleetAutoFallback`
+and bench a healthy Anthropic slot.
+
+Two things were deliberately not done. The new wordings are kept **out** of
+`detectModelUnavailable`'s `quotaSignals` — that list drives Anthropic
+account-slot failover, and teaching it OpenRouter wording would fire a bogus
+fleet failover on every 402. And a bare `'402'` substring is **not** a signal;
+model ids, token counts and request ids contain it, so HTTP 402 is honoured only
+as a structured status field. Six deliberate mutations were run against the new
+suite and each one turned it red.
+
+### Auto-recall gets a relevance floor (#3838, closes #3837)
+
+Auto-recall had no relevance floor: whatever the engine returned went into the
+prompt under "Relevant memories from past conversations", which the agent reads
+as ground truth. When a bank misses its deadline the engine still returns a full
+slate — just a worthless one. On the live fleet's `recall_log.jsonl`, turns that
+hit the deadline had a median best injected score of **0.0006** against 0.4663
+for turns that did not, and **276 of 454 turns (60.8%) injected six memories
+whose best score was under 0.01**.
+
+`memory.recall.min_score` (→ `HINDSIGHT_RECALL_MIN_SCORE`) adds a client-side
+score floor in `recall.py`, applied after ranking and before the
+`recallMaxMemories` slice. `memory.recall.min_score_scope` decides which turns it
+binds on. No timeout, deadline or candidate-cap value is touched — this only
+filters what gets injected.
+
+Both defaults are deliberate. **`min_score: 0` is OFF**, so behaviour is
+byte-identical on every host that does not set it. **`min_score_scope:
+degraded`** exists because `scores.final` is not calibrated across queries, so a
+single number is not universally safe: this repo's own measured distributions
+put 28.4% of *healthy*-turn results below 0.01 against 98.4% on degraded turns, so
+a fleet-wide 0.01 floor would discard roughly a quarter of healthy results, some
+of them real. A controlled single-bank probe found perfect separation (17/17
+targets at 0.9497-1.0043, 95/95 controls at 0.0000-0.0019), and that result is
+real but does not generalise — the scope default exists precisely because that
+separation cannot be assumed.
+
+If the floor empties a non-empty result set the hook injects **no memory
+content** — never an empty banner — and emits a notice saying N candidates all
+scored below the floor and that an absence of relevant memory means UNKNOWN, not
+"nothing was remembered". That notice is kept out of `context_message` and
+prepended at emit time, so a cache hit can never replay it.
+
+### The remaining auto-recall knobs are reachable from `switchroom.yaml` (#3841)
+
+`recall.py` reads about 25 `recall*` settings; ten had a `switchroom.yaml`
+surface. This adds the remaining fifteen — `budget`, `max_tokens`,
+`prefer_observations`, `context_turns`, `roles`, `prompt_preamble`,
+`max_query_chars`, `transcript_fallback`, `transcript_tail_bytes`, `tags`,
+`tags_match`, `tag_groups`, `tag_weights`, `additional_bank_filters` and
+`parallel` — following the #3838 shape exactly.
+
+Tuning any of these previously meant hand-editing the installed plugin, which
+`switchroom apply` reverts by rm'ing and re-copying the whole tree from
+`vendor/`: the operator's change disappears with no error and no log line while
+`switchroom.yaml` reads as though the host were tuned. Three of the keys had a
+config key and a `recall.py` read but **no `ENV_OVERRIDES` entry at all**, so
+there was no channel from `switchroom.yaml` even in principle.
+
+The exports are unconditional, because `~/.hindsight/claude-code.json` loads
+after switchroom's stamp and survives an apply — a knob switchroom does not
+export is a knob a stale hand-edit owns. Collection knobs export `[]`/`{}`
+rather than an empty string, because an empty export is indistinguishable from
+no export and hands authority straight back.
+
+**Zero behaviour change when unset, and it is enforced rather than asserted
+once:** the passthrough defaults are pinned by test against
+`vendor/hindsight-memory/settings.json` and `config.py`'s `DEFAULTS`, so a vendor
+bump that moves a default goes red here instead of silently re-tuning every
+agent. Validation is loud at scaffold time, rejecting a bad value with a
+`HINDSIGHT-RECALL-CONFIG` error naming the key — including an empty `roles` list
+and an empty `prompt_preamble`, which *do* cast cleanly and then respectively
+leave recall nothing to build a query from and strip the framing off injected
+memories. `_cast_env` is fail-open, so a bad knob has to fail the apply, not the
+recall.
+
+`recallAdditionalBanks` deliberately gets no env export: its effective value is
+composed inside `installHindsightPlugin` from the cascaded config *unioned* with
+the profile banks from `resolveUsers()`, so an export derived from the yaml key
+alone would outrank `settings.json` and silently drop those user banks.
+
+### The retain mission is tightened against tool exhaust, chosen by A/B (#3867)
+
+The 2026-07-25 retain-noise mission reached every live bank and still leaked:
+one agent's whole-shape tool-exhaust rate ran 1.12 / 1.18 / 0.69 units per 1k
+world+experience units over 2026-07-25/26/27, *above* its 0.00-0.83 per 1k over
+the preceding week.
+
+The replacement was chosen by A/B rather than by taste. Both arms ran offline and
+read-only against the real extraction path, POSTed to the same endpoint and the
+same local model the retain worker uses, over 52 real retain chunks sampled from
+windows that had actually leaked. Nothing was written to any bank. Hand-labelling
+all 143 extracted facts: the old mission produced 84 facts of which 42 (50.0%)
+were tool exhaust; the new one produced 59 of which 12 (**20.3%**) were. The
+durable count went **up**, 42 to 47, while the total fell — the new text is not
+simply extracting less. Caveats, stated because they bound the claim:
+single-rater labelling, n=52 chunks, one model.
+
+What changed in the text is a **subject test** up front ("A TOOL RESULT IS NOT A
+FACT… is the subject of this candidate a file path, a command/process/agent/
+session id, a temp directory, or the location where some output was written?"),
+because a small local model applies a subject test far more reliably than a
+category test and it generalises to exhaust shapes nobody enumerated; verbatim
+negative exemplars lifted from units the previous mission actually let through,
+not invented ones; and two new bullets for `/tmp`/scratchpad paths and slash
+commands. The positive counterweight sentence and the routine-chatter bullet are
+preserved verbatim, with a test pinning the latter so a future exhaust-focused
+reword cannot quietly reopen the 2026-07-25 revert finding.
+
+**One residual is named rather than papered over.** Half the remaining exhaust
+in the winning arm is a single class: Claude Code's own Bash-tool system
+reminder about the session working directory. 127 paraphrases of that one
+sentence already sit in live banks (hand-checked, 0/127 false positives). It
+survives because it is not false and does not read as narration. A prompt should
+not be expected to win that one; closing it wants a deterministic pre-retain
+filter.
+
+The outgoing default is appended to `SUPERSEDED_RETAIN_MISSIONS`, so banks
+carrying it are upgraded on the next apply while any operator customisation —
+even a whitespace difference — is left untouched.
+
+### A hindsight recreate can no longer silently drop GPU passthrough (#3839)
+
+`switchroom memory setup --recreate` relaunched the hindsight container
+**without `--gpus all`** on a GPU host, and said nothing. The local embedding
+model and the cross-encoder reranker moved to CPU on the interactive recall path,
+and the GPU-gated perf defaults went with them. `doctor` was green throughout. It
+was found by hand-diffing a `docker inspect` snapshot.
+
+The root cause is one swallowed errno: `loadHostCapabilities()` ended in a bare
+`catch { return null; }`, so **every** read failure collapsed to the same `null`
+as "no file", `hindsightGpuEnabled()` read that as false, and the flag was
+dropped. Two real triggers were hit in production — the verdict file written
+`root:root 0600` into a uid-1000 home, and a wrong `HOME` landing the state path
+somewhere that does not exist. There was also no operator lever of any kind to
+force the answer, so a host in this state had no recovery except fixing the file.
+
+Four changes. **The read reports how it went:** `readHostCapabilities()` returns
+a discriminated `ok` / `absent` / `unreadable` / `malformed` with path, errno and
+detail. `ENOENT` **only** maps to `absent` — `EACCES`/`EPERM`/`EISDIR`/`ENOTDIR`
+all mean something is at or in the way of that path and the read was *stopped*,
+which is a different fact and must not be filed under "never probed"; filing it
+under that is precisely this bug. A one-time stderr WARN names the path, the
+consequence, the explicit words "NOT because this host lacks a GPU", and the fix.
+**An explicit override wins in both directions:** a new `hindsight.gpu:
+true|false` yaml key and `--gpu`/`--no-gpu` on `memory setup`, resolved flag >
+yaml > autodetect, with `memory setup` now printing `GPU passthrough: ON/off —
+<reason>` on every run. **A drop guard on recreate** reads the live container's
+`HostConfig.DeviceRequests` and refuses by default if it has GPU and the new plan
+does not — an explicit `--no-gpu` is treated as consent and never refused, only
+an autodetected drop blocks, and an inspect failure returns null and never
+blocks. **A `doctor` row** (`host capabilities verdict`) fails on
+unreadable/malformed, downgraded to warn when `hindsight.gpu` already pins the
+answer, and is pushed to the top of the hindsight check and spread into both
+early returns so it still appears when hindsight is unreachable — exactly when an
+operator is reading doctor output.
+
+### A recreate reports the env it is about to drop (#3834)
+
+`switchroom memory setup --recreate` rebuilds the hindsight container's
+environment from scratch out of two sources only: the operator's `hindsight.env`
+block and switchroom's managed defaults in code. Anything live on the running
+container but declared in neither was dropped with no error, no warning and no
+diff. On 2026-07-28 a recreate on a real host dropped
+`HINDSIGHT_API_RERANKER_LOCAL_FP16=true` and
+`HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE=128`; without FP16 the local
+cross-encoder runs fp32, roughly 2x the time per candidate, on the interactive
+recall path — i.e. every turn. It was caught only because a `docker inspect`
+snapshot happened to have been taken minutes earlier.
+
+This is the **third** instance of the class. `switchroom.yaml` already carries
+two hand-written comment blocks memorialising the previous two. Two comment
+blocks pleading with a future operator is not a mechanism; a diff the tool prints
+itself is.
+
+The launcher's env derivation is extracted into `hindsightContainerEnvPairs()` so
+the env is a *value* that can be computed without launching anything — one
+derivation, not two, because a parallel copy would drift and report the wrong
+diff. New `src/setup/hindsight-env-drift.ts` diffs it against the live container,
+subtracting the image baseline so ~20 image-inherited vars are not reported every
+run while an *overridden* image var still is, and prints key **and** value plus a
+paste-ready `hindsight.env` block. Secret-shaped keys are redacted, because
+`ANTHROPIC_CUSTOM_HEADERS` embeds the LiteLLM API key. It is **not** auto-carried
+over on purpose: silently re-applying the stray vars would just move the
+invisibility somewhere else and the operator would never learn their live config
+had diverged. It warns by default and refuses only under `--strict-env`, because
+`switchroom update` drives this path and hard-failing mid-rollout would trade a
+perf regression for fleet memory being down; the refusal fires before the image
+pull and before the container is stopped, so it leaves the running container
+untouched.
+
+**A correction to the framing this was filed under:** the reported fix was "add
+the two reranker keys as managed defaults so they survive a recreate". They
+already are managed defaults — they are GPU-gated, and they were withheld because
+the host did not prove a usable GPU on that run, not because the keys were
+missing. Ungating them was considered and rejected: it would violate that
+module's documented gating rule and push FP16 and batch-128 onto CPU-only hosts,
+which upstream explicitly warns against. So this does not touch the defaults; it
+pins the true behaviour in tests and makes the withholding loud, which is the
+durable fix for the whole class rather than for two keys.
+
+### The hosted UAT unit tests have a runner, and the class is fenced (#3830)
+
+Five test files under `telegram-plugin/uat/` were executed by **neither** CI
+runner: vitest-excluded by the `**/telegram-plugin/uat/**` pattern and never
+named in the bun target list. One of them calls itself "the CI-verifiable floor"
+for the worker-feed matcher, and #3821 added assertions to it. No workflow ran a
+single one of them.
+
+The repo has two runners wired independently, and `check-bun-test-imports.mjs`
+enforced only one half of the contract (a `bun:test` import implies
+vitest-excluded). Nothing enforced the other half — vitest-excluded implies
+actually named by the bun job. New `scripts/check-test-runner-coverage.mjs` plus
+its allowlist closes that, wired into `npm run lint`: a deterministic mechanism,
+not prompt discipline.
+
+Two findings worth flagging beyond the headline. **`package.json`'s `test` /
+`test:bun` scripts are invoked by no workflow** — verified against every file in
+`.github/workflows/` — so the obvious fix of "add both files to `test:bun`"
+would not have put them in CI. The allowlist records the real extent: all 39
+`src/vault`, `src/drive`, `src/litellm` and vault-broker bun tests are in
+`test:bun` and run in no CI job, left as tracked debt. And **a `bun test`
+positional is a plain substring match on the path, not a directory selector**, so
+the bare `gateway` target also matched a live-Telegram UAT scenario, which the
+ordinary bun job has been pulling into its run set; it stayed harmless only
+because that scenario self-skips without credentials. Directory targets are now
+trailing-slashed, and a test asserts no scenario file is reachable from the
+target list.
+
+`ci-full.yml` now invokes `bun-test-ci.sh` instead of a hand-copied list, so the
+two jobs can no longer disagree about what "the bun tests" means.
+
+### Every agent commit records which agent and which model made it (#3869)
+
+Switchroom agents commit with the operator's git identity, and that stays — but
+it meant `git log` could not answer *which agent, on which model, produced
+this*. The only machine marker was a generic `Co-authored-by: Claude …` that
+names nobody.
+
+Two surfaces now sit over one source of truth. Commits carry standard git
+trailers — `Switchroom-Agent: <name>` and `Switchroom-Model: <model>`, readable
+with `git log --format='%(trailers:key=Switchroom-Agent,valueonly)'` or
+`git interpret-trailers` — and CI applies a matching **`agent:<name>` label** to
+the PR, filterable with `gh pr list --label agent:klanker`. The label is a
+*projection* of the trailers, recomputed on every push, so the two cannot
+disagree.
+
+It is a property of the environment, not a prompt rule, because a prompt rule is
+forgotten under compaction and never read by a sub-agent.
+`bin/git-agent-attribution-hook.sh` is baked into the agent image as a
+read-only `/opt/switchroom/git-hooks/prepare-commit-msg`, and `start.sh` sets
+`git config --global core.hooksPath` on every boot, so every repo an agent
+clones on demand is attributed with no per-repo setup. It is a
+`prepare-commit-msg` hook specifically because **`git commit --no-verify`
+bypasses `pre-commit` and `commit-msg` but not `prepare-commit-msg`** — and
+agents reach for `--no-verify` routinely. The name comes from
+`$SWITCHROOM_AGENT_NAME` and the model from `$SWITCHROOM_SESSION_MODEL` (so a
+`/model` override is reflected), falling back to a static value and then to
+`unknown`; the model never types either. The hook chains to any repo-local
+`prepare-commit-msg` it displaced and propagates its exit code.
+
+`scripts/check-agent-attribution-trailers.mjs` (wired into `npm run lint`)
+enforces it over `merge-base(base, HEAD)..HEAD` only. The rule is explicit: a
+commit is machine-authored **iff** it carries a `Co-authored-by:` matching
+`/claude|anthropic/i` or either `Switchroom-*` trailer — only those are
+inspected, so a commit made by hand on a laptop is never even looked at and
+cannot be blocked. `ci-lint.yml`'s checkout gains `fetch-depth: 0`, because
+under depth-1 the guard would `SKIP` and the required `lint` context would
+certify a guarantee it never checked.
+
+**Enforcement has a grace window until 2026-08-05.** The hook is inert until the
+agent image is rebuilt and agents restart, so enforcing from merge would red
+every agent PR during the rollout for a mechanism demonstrably not yet
+installed. It is a fixed instant, so it retires itself, and commits inside the
+window are reported as `N exempt` — never as "clean". Labelling failure is
+loud by design: any `gh` error aborts non-zero and reddens the PR rather than
+silently leaving a PR unlabelled. Backfill of existing history is deliberately
+out of scope. 39 tests across three files run the real hook, the real guard as a
+subprocess and the real labeller against a stub `gh`; 13 deliberate mutations
+were each killed.
+
+### The official docs site is the authority for vendored deps (#3866)
+
+A worker investigating hindsight recall tuning concluded "no documented config
+path exists" — because the running container ships no `/app/docs` tree and the
+vendored source had no such knob — and relayed that to the operator as fact. The
+official docs site had documented the sanctioned answer for that exact problem
+the whole time. Absence of local documentation is not evidence that no
+documentation exists.
+
+Root `CLAUDE.md` gains a "Third-party docs — the official site is the spec"
+section stating the authority order (official docs site → context7 → OSS or
+vendored source), the concrete URLs and context7 library ids, and the corollary
+that "not supported" / "no config path exists" / "not possible" are positive
+claims needing a check, not inferences from a failed local grep. A new
+`vendor/hindsight-memory/CLAUDE.md` warns that the tree is a vendored snapshot
+rather than the specification, and flags the practical trap that its
+`settings.json` is not what switchroom installs.
+
 ## v0.19.26 — the recall deadline envelope is declarative and drift-visible, and recall drops a duplicate ANN scan per fact type
 
 ### The recall deadline envelope is declarative, and drift makes an apply that reverts it visible
