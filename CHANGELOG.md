@@ -69,6 +69,97 @@ mirrored credential belonged to the fallback.
 builders derive `isActive` from it via `effectiveServingLabel`. `active` keeps
 its old meaning for anything that genuinely wants the pin, and a
 pre-`serving` broker degrades to the previous behaviour.
+
+### The Hindsight fork rebases onto upstream v0.8.5, and rolling it back is now documented as two ordered steps
+
+The pinned upstream base moves v0.8.4 → v0.8.5 to pick up `hindsight-admin
+repair-bank` (upstream #2645): per-`(bank, fact_type)` vector indexes never
+self-heal, so a bank populated outside the create-time path falls back to the
+global HNSW index plus a post-filter and under-returns recall candidates.
+Measured on this fleet at the production `hnsw.ef_search=200`, one bank
+returned 55 of 100 requested candidates with 143 rows removed by filter; after
+`repair-bank --all` the same query plans onto the per-bank index and returns
+100/100 with none removed.
+
+This is a fork rebase, not a version bump, so every `# switchroom:` patch block
+was replayed against a pristine 0.8.5 tree and re-classified. Eleven blocks
+become eight, roughly 950 lines lighter: the `max_turns`/ToolSearch fix, the
+`unit_entities` FK-race fix and the duplicate-ANN-scan fix are all retired
+because upstream now does the same thing natively — and upstream's FK-race fix
+is strictly better than ours, because it row-locks the surviving parents so the
+pruner blocks, where ours only resurrected the parent after the fact. The
+retired blocks are asserted **absent**, not merely deleted, so a future rebase
+cannot silently resurrect a patch upstream has adopted.
+
+**The rollback story is the part worth reading.** Bumping the base runs four
+alembic migrations against the persisted memory volume, and one of them drops
+`search_vector` from the `invalidated_memory_units` archive. 0.8.5 no longer
+reads that column — but 0.8.4 requires it: its archive round-trip excludes only
+`"embedding"`, and it carries no special-casing for `search_vector` anywhere.
+So reverting the pinned digest **on its own** is not a rollback. It is a
+rollback into a broken state, where every `invalidate_memory` and every revert
+of an invalidated memory fails with `column "search_vector" does not exist` —
+and the older image will not stop you at boot, because alembic logs "Database
+is at a newer migration revision than this code version knows about" and
+carries on.
+
+The order is: **alembic downgrade first, while the newer image is still
+running** (it is the only one that ships the down-revisions), **then** repoint
+the digest. `docs/operators/hindsight-memory.md` gains a runbook section with
+the exact commands, and the Dockerfile comment says so at the pin.
+
+It also documents what the ordered rollback still costs, because "correct" is
+not "lossless": the re-added column comes back empty — upstream's own migration
+says "comes back empty regardless" — and nothing backfills it. Every memory
+archived while the fleet ran on 0.8.5 therefore returns with a NULL
+`search_vector`, so reverting one out of the archive lands it back in
+`memory_units` silently absent from the BM25 arm of recall. If those memories
+matter, restore from a pre-upgrade dump rather than downgrading in place. The
+word "unused" is gone from every description of the column: it was true on the
+version you roll forward to and false on the version you roll back to, which is
+precisely the wording that made the broken rollback look safe.
+
+The MCP contract fixture moves with the pin rather than after it. The captured
+tool surface, its `_meta.hindsight_api_version` marker and the shim's cold-boot
+`FALLBACK_TOOL_TABLE` are all re-derived from the 0.8.5 image in this same
+commit — the delta is exactly additive and exactly three props
+(`list_memories.tags`, `list_memories.tags_match`,
+`create_mental_model.tags_match`); both wheels register the same 32 tools. The
+derivation was cross-validated by running it against the *previous* pinned
+digest, where it reproduces the committed 0.8.4 capture byte-for-byte. The
+version guard now binds in both directions: on 0.8.4 those props must be
+absent (advertising a prop the server silently ignores makes an agent believe a
+filter was applied), and on 0.8.5 they must be present, so bumping the marker
+without re-capturing the fixture is a red test rather than a green one.
+
+### `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP` is reachable, so the CE-damping patch's rollback knob exists
+
+Switchroom's cross-encoder saturation damping is an unconditional calibration
+change whose failure mode is a silent recall-quality regression with no
+telemetry behind it. The patch was written with that in mind: it reads its
+decisive gap from `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP`, so backing the change
+out is meant to be a container restart with one env var rather than an image
+rebuild.
+
+That knob did not work. The key was absent from `HINDSIGHT_PERF_ENV_KEYS`, and
+`resolveHindsightPerfOverrides` skips unmanaged keys silently, so a
+`hindsight.env` line for it never reached the container — and because the patch
+reads the var once at import, there was no runtime fallback to recover through.
+The documented escape hatch for the riskiest patch in the file was unreachable.
+Same defect class as #3732, #3745 and #3763, with the twist that this key is a
+switchroom-patch knob rather than an upstream one, so it carries no
+`HINDSIGHT_API_` prefix and the sweeps for that prefix never saw it.
+
+It joins `HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS` — managed, but with no shipped
+default, because emitting one would replace the patch's own derived gap with a
+hard-coded constant on every host. Unset still means exactly what it meant
+before. A value at or above ~0.65 clamps the damping exponent to 1.0, i.e.
+upstream ranking with the patch still baked in.
+
+The durable half: a test now derives the env-var name from the Dockerfile patch
+itself and asserts it is a member of the managed set, so a future knob
+documented in a patch block cannot ship unreachable.
+
 ### The lexical-overlap recall gate is removed
 
 Auto-recall ran a `recallMinOverlap` gate between the engine's reranker and the

@@ -2149,7 +2149,10 @@ export const HindsightConfigSchema = z.object({
       "(`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`: " +
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY — a per-deployment " +
       "`bank-pattern:priority,...` map; unset means upstream's flat " +
-      "created_at FIFO across banks), plus the " +
+      "created_at FIFO across banks; and " +
+      "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP — the rollback knob for " +
+      "switchroom's CE-saturation damping patch, a float; >= ~0.65 backs the " +
+      "damping out entirely, unset means the patch's own derived gap), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

@@ -42,7 +42,21 @@
 # and `tools=[]` on the standard claude_code call), both of which were
 # dropped in the same commit as this bump. Applying it runs 4 alembic
 # migrations (head b57a7c9e0d13 → d7b2f8a1c934), one of which drops the
-# unused `search_vector` column from the invalidated_memory_units archive.
+# `search_vector` column from the invalidated_memory_units archive. 0.8.5 no
+# longer reads that column — but 0.8.4 REQUIRES it (its archive round-trip
+# excludes only `"embedding"`, memory_engine.py:6579), so this migration is
+# what makes a naive rollback break. NOT "unused": unused on the version you
+# roll forward to, load-bearing on the one you roll back to.
+#
+# ROLLING BACK IS TWO ORDERED STEPS, NOT ONE: alembic downgrade FIRST (while
+# this image is still running — it is the only one that ships the
+# down-revisions), THEN repoint the digest. Reverting the digest alone leaves
+# every invalidate / revert-of-an-invalidate failing with
+# `column "search_vector" does not exist`, and the older image will NOT stop
+# you at boot — it logs "Database is at a newer migration revision …" and
+# carries on. Full runbook, including the empty-column caveat:
+# docs/operators/hindsight-memory.md § "Rolling the base image BACK".
+#
 # Prior history: v0.8.2→v0.8.4 merged divergent alembic heads and widened
 # bank_id columns; v0.7.1→v0.8.2 fixed the `batch_retain`
 # ForeignKeyViolation on `unit_entities` (switchroom #2392). NOTE: upstream

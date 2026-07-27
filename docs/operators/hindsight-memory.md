@@ -66,6 +66,101 @@ docker exec switchroom-hindsight sh -lc '
 switchroom agent restart test-harness --wait --force   # or: docker restart switchroom-hindsight
 ```
 
+## Rolling the base image BACK (schema first, then the digest)
+
+`docker/Dockerfile.hindsight` pins upstream Hindsight by digest, and a bump
+runs alembic migrations against the persisted `switchroom-hindsight-data`
+volume. **Rolling forward is one step; rolling back is two, in this order.**
+
+> **Reverting the pinned digest alone is not a rollback.** The older image
+> boots fine and then fails at runtime. Alembic's startup path upgrades to
+> `heads`, and when the database is at a revision the older code has never
+> heard of it logs `Database is at a newer migration revision than this code
+> version knows about … Skipping migrations` and carries on
+> (`hindsight_api/migrations.py`). So nothing stops you at boot; the damage
+> surfaces later, on whichever code path depends on a column the newer
+> schema dropped.
+
+### The order
+
+1. **Downgrade the schema first, while the newer image is still running.**
+   The newer image is the only one that has the down-revisions; the older one
+   cannot reverse migrations it does not ship.
+2. **Then repoint the digest** in `docker/Dockerfile.hindsight`, rebuild /
+   pull, and recreate the container.
+3. Take a `pg_dump` first (see "On-demand backup" above). A downgrade is not
+   guaranteed to be lossless — see the caveat below.
+
+### v0.8.5 → v0.8.4, concretely
+
+0.8.5 advances the head `b57a7c9e0d13` → `d7b2f8a1c934` over four
+migrations. The one that matters for a rollback is
+`e7c3a9f1b2d5_drop_archive_search_vector_column`, which does
+
+```sql
+ALTER TABLE invalidated_memory_units DROP COLUMN IF EXISTS search_vector
+```
+
+**0.8.4 requires that column.** Its archive round-trip builds the column list
+from `memory_units` and excludes only `"embedding"`
+(`engine/memory_engine.py:6579`), where 0.8.5 excludes `"embedding"` *and*
+`"search_vector"`. 0.8.4 has no special-casing for it at all
+(`grep -c search_vector` on 0.8.4's `memory_engine.py` → 0), so on 0.8.4
+against a 0.8.5 schema **every `invalidate_memory`, and every revert of an
+invalidated memory, fails with `column "search_vector" does not exist`.**
+
+Downgrade the whole 0.8.5 chain back to 0.8.4's head *before* repointing the
+digest:
+
+```bash
+docker exec switchroom-hindsight /app/api/.venv/bin/python - <<'PY'
+from pathlib import Path
+from alembic import command
+from alembic.config import Config
+import hindsight_api
+from hindsight_api.migrations import _set_alembic_main_option
+cfg = Config()
+_set_alembic_main_option(
+    cfg, "script_location", str(Path(hindsight_api.__file__).parent / "alembic"))
+_set_alembic_main_option(cfg, "sqlalchemy.url", "<the libpq URL for pg0>")
+command.downgrade(cfg, "b57a7c9e0d13")   # 0.8.4's head
+PY
+```
+
+The other three down-revisions in the chain only drop indexes and maintenance
+routines that 0.8.4 does not use, so the full downgrade is the clean target
+rather than a partial one.
+
+If you would rather not run alembic, the single statement that unblocks 0.8.4
+is the migration's own `_pg_downgrade` body, verbatim and idempotent:
+
+```bash
+docker exec switchroom-hindsight sh -lc '
+  PW=$(python3 -c "import json;print(json.load(open(\"/home/hindsight/.pg0/instances/hindsight/instance.json\"))[\"password\"])")
+  PGPASSWORD="$PW" /home/hindsight/.pg0/installation/*/bin/psql -U hindsight -h /tmp -d hindsight -c \
+    "ALTER TABLE invalidated_memory_units ADD COLUMN IF NOT EXISTS search_vector tsvector"
+'
+```
+
+That leaves `alembic_version` reading a revision 0.8.4 does not know, which
+0.8.4 tolerates (the skip above) — acceptable as an emergency unblock, but the
+alembic downgrade is the state you actually want.
+
+### The caveat: a correct rollback still loses BM25 coverage
+
+**The re-added column comes back empty.** Upstream says so in the migration
+itself — *"Re-added as the original tsvector creation type; comes back empty
+regardless"* — and nothing backfills it. Every memory archived while the fleet
+ran on 0.8.5 therefore has `search_vector IS NULL` after the downgrade. On
+0.8.4 those rows still round-trip, but when one is reverted out of the archive
+it lands back in `memory_units` with a NULL `search_vector`, i.e. **silently
+absent from the BM25 arm of recall** until something re-indexes it. Semantic
+and graph recall are unaffected.
+
+So: the ordered rollback restores *function*, not *fidelity*. If those
+archived memories matter, restore from a pre-upgrade `pg_dump` instead of
+downgrading in place.
+
 ## Self-maintenance (autovacuum + op retention)
 
 The same maintenance loop also, every tick (best-effort, idempotent):

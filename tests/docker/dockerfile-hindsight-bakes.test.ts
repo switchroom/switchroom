@@ -23,6 +23,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { HINDSIGHT_PERF_ENV_KEYS } from "../../src/setup/hindsight-perf-defaults.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dockerfile = readFileSync(
@@ -400,6 +401,22 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /HINDSIGHT_CE_DECISIVE_RELATIVE_GAP=<float>/,
     );
+
+    // …and the knob the image reads must be one switchroom can actually set.
+    // `resolveHindsightPerfOverrides` drops any key outside
+    // HINDSIGHT_PERF_ENV_KEYS silently, and the patch reads this var once at
+    // import, so an unmanaged name here is a documented escape hatch that
+    // cannot be reached from switchroom.yaml at all. Derive the name from the
+    // Dockerfile rather than restating it, so the two cannot drift apart.
+    const envName = dockerfile.match(
+      /_CE_DECISIVE_RELATIVE_GAP_ENV: str = "([A-Z0-9_]+)"/,
+    )?.[1];
+    expect(envName, "the patch must name its env knob").toBeDefined();
+    expect(
+      HINDSIGHT_PERF_ENV_KEYS.has(envName!),
+      `${envName} is read by the baked patch but is not in HINDSIGHT_PERF_ENV_KEYS, ` +
+        "so a hindsight.env line for it is discarded before it reaches the container",
+    ).toBe(true);
 
     // The exponent is derived ONCE PER CALL from the alphas alone. That is what
     // makes a candidate's score a pure function of its own fields — no

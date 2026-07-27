@@ -321,7 +321,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twenty-two keys, by name", () => {
+  it("is overridable on exactly these twenty-three keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -351,6 +351,10 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
+      // Not HINDSIGHT_API_* — a switchroom-patch knob (the CE-damping
+      // rollback hatch), read by the patched reranking module, never by
+      // upstream's config parser. Sorts last.
+      "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
     ]);
   });
 
@@ -438,6 +442,67 @@ describe("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY (override-only)", () 
     expect(runEnv(runArgs()).get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([
       MAP,
     ]);
+  });
+});
+
+// ── the CE-damping rollback hatch ─────────────────────────────────────────
+describe("HINDSIGHT_CE_DECISIVE_RELATIVE_GAP (override-only, patch rollback hatch)", () => {
+  const KEY = "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+  /** ≥ ~0.65 clamps the damping exponent to 1.0 — the full back-out value. */
+  const OFF = "1.0";
+
+  it("is managed, so a hindsight.env line for it is not silently discarded", () => {
+    // The bug: switchroom's CE-saturation damping patch documents this var as
+    // its rollback knob, but the key was absent from HINDSIGHT_PERF_ENV_KEYS
+    // and resolveHindsightPerfOverrides drops unmanaged keys without a word.
+    // The patch reads the var ONCE at import, so an unreached value has no
+    // runtime fallback: the documented escape hatch simply did not exist.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Override-only, not defaulted: shipping a value would replace the patch's
+    // own derived gap with a hard-coded one on every host.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: OFF }).get(KEY)).toBe(OFF);
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: OFF }).get(KEY)).toBe(OFF);
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted on any host when unset (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Unset ⇒ the patch's shipped derived gap. Emitting anything here would
+      // turn a rollback hatch into a permanent calibration override.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches the docker-run argv AND the compose snippet with the operator's value", () => {
+    // The outcome that matters: the value an operator writes in
+    // switchroom.yaml is actually in the argv that launches the container.
+    // Without the key in the managed set both of these are undefined.
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual([OFF]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // Cloud endpoint + no GPU: the harshest gating case. A rollback hatch that
+    // works only on GPU boxes is not a rollback hatch.
+    const perf = { env: { [KEY]: "0.7" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["0.7"]);
   });
 });
 
