@@ -1340,6 +1340,66 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     ).toBe(true)
   })
 
+  // ─── #3727: the F1 RESIDUAL cell, pinned as an ACCEPTED trade-off ───
+  //
+  // Corroborated `origin`/`quoted` + FOREIGN content + NO handback marker in the
+  // window. Both guards pass — the attribution is framework-corroborated, and
+  // nothing says a decoupled completion is outstanding — so the content gate is
+  // BYPASSED and the flushed answer is corrected in place. This is the accepted
+  // outcome, not an oversight, and these tests exist so it can never flip
+  // silently in either direction:
+  //
+  //   - it is NOT new reach. The identical reply reaches the identical outcome
+  //     today by omitting `origin_turn_id` / `reply_to` and landing on
+  //     `latest-ended` with the same turn (the zero-new-capability property,
+  //     swept exhaustively in `reply-owner-resolve.test.ts`).
+  //   - it IS the documented F1 residual: a genuinely decoupled completion that
+  //     fails to stamp the `subagent_handback` marker is indistinguishable from
+  //     the turn's own reworded answer, because rewording cannot be matched
+  //     textually. The MITIGATION is the marker itself — stamped at the single
+  //     buffer chokepoint via `stampsHandbackMarker` (see the F1 tests above,
+  //     which pin the marked case sending FRESH with the flush untouched).
+  //
+  // If a future tightening of the corroboration rule flips this cell to a fresh
+  // send, these go red — decide deliberately, don't drift into it.
+  for (const tier of ['origin', 'quoted'] as const) {
+    it(`#3727 (F1 residual, ACCEPTED): a corroborated \`${tier}\` reply with FOREIGN ` +
+      'content and NO handback marker bypasses the gate — the flushed answer is ' +
+      'edited in place, exactly one message survives', async () => {
+      const h = makeHarness()
+      const owner = makeFlushDeliveredEndedTurn()
+      seedRecord(h, owner)
+      // Corroborated: the model-supplied attribution names the SAME turn the
+      // framework-derived `latestEndedTurnId` resolves (ownerRes's default).
+      h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, tier)
+      // No decoupled completion anywhere in the chat — the residual F1 vector.
+      h.deps.getLastSubagentHandbackAt = () => null
+
+      // The content is genuinely FOREIGN: the gate would have declined it, so
+      // this test cannot pass by accident through `flushedAnswerMatchesReply`.
+      expect(flushedAnswerMatchesReply(FLUSHED_TEXT, HANDBACK)).toBe(false)
+
+      const res = await sendReply(h.deps, req(HANDBACK))
+
+      // OUTCOME: exactly one client-visible message — the flushed message A is
+      // edited into the foreign content; NO second bubble ships.
+      const edits = h.calls.filter((c) => c.method === 'editMessageText')
+      expect(edits).toHaveLength(1)
+      expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+      expect(edits[0]!.text).toContain('migration audit')
+      expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+      expect(res.content[0]!.text).toMatch(/^sent/)
+      // The flush record is CONSUMED — the provisional answer is gone, not
+      // merely shadowed.
+      expect(
+        h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+          liveTurnId: OWNER_TURN_ID,
+          now: Date.now(),
+        }).reason,
+      ).toBe('no-record')
+    })
+  }
+
   // A STALE framework candidate must not corroborate anything: the latest-ended
   // freshness bound (F2) is what stops an old turn inheriting deletion authority.
   it('a `origin` echo does NOT bypass when the framework latest-ended candidate ' +

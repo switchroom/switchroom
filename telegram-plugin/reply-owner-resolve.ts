@@ -210,6 +210,15 @@ export function decideContentGateBypass(input: {
   if (input.tier === 'live') return true
   if (input.tier === 'none') return false
   if (input.handbackCouldOwnReply) return false
+  // Total over degenerate input (#3726). TypeScript makes `candidates` mandatory
+  // and the one production caller (`resolveReplyOwnerTurn`) always builds it, so
+  // this cannot fire today — but this module is exported precisely so the
+  // decision can be exercised OUTSIDE the gateway's construction discipline.
+  // Every other defensive branch here fails CLOSED (keep the #3429 content
+  // gate); without this guard the missing-input case instead fails by THROWING
+  // out of the supersede path — a fail-open-by-crash. Matches the module's own
+  // precedent: `latestEndedAccepted` is total over null age/ttl/turnId.
+  if (input.candidates == null) return false
   if (!latestEndedAccepted(input.candidates)) return false
   return (
     input.resolvedTurnId != null &&
