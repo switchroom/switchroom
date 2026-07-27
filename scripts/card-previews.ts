@@ -3,7 +3,7 @@
  * Card preview harness — renders EVERY status/progress card variant through the
  * REAL renderers (no mockups) and writes `card-previews.md`.
  *
- * Run: bun scripts/card-previews.ts > /host/home/kenthompson/code/card-previews.md
+ * Run: bun scripts/card-previews.ts > card-previews.md
  *
  * Not a test; not wired into CI. Kept in-repo so the previews can be regenerated
  * verbatim whenever a card renderer changes.

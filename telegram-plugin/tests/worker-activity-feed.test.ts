@@ -76,7 +76,7 @@ describe('renderWorkerActivity', () => {
 
   it('renders the native header + running status + step feed', () => {
     const out = renderWorkerActivity(view())
-    // #3839: flush at the left margin — no `└─ ` card-level prefix.
+    // #3842: flush at the left margin — no `└─ ` card-level prefix.
     expect(out.startsWith('🛠 **WORKER** · _research competitors_')).toBe(true)
     // Unified header: running shows "<elapsed> · N tools" (no "running ·" word).
     expect(out).toContain('_10s · 3 tools_')
@@ -101,7 +101,7 @@ describe('renderWorkerActivity', () => {
 
   it('shows a "starting…" line when no step has run yet', () => {
     const out = renderWorkerActivity(view({ lastTool: null, latestSummary: '' }))
-    // #3839: flush at the left margin — no `└─ ` card-level prefix.
+    // #3842: flush at the left margin — no `└─ ` card-level prefix.
     expect(out.startsWith('🛠 **WORKER**')).toBe(true)
     expect(out).toContain('starting…')
     expect(out).not.toContain('→')

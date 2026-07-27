@@ -135,7 +135,7 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
   it('kills the exact artifacts from the report', () => {
     const collapsed = collapsePreview(body)
     // 1. the count/ordinal collision — glance line into row 1's ordinal. Since
-    //    #3839 the row header is FLUSH (the #3820 card-level indent is gone),
+    //    #3842 the row header is FLUSH (the #3820 card-level indent is gone),
     //    so the separator is the ONLY thing holding this seam apart.
     //    (The reported spelling was `3 running1.`; with the packed glance line
     //    the same seam now reads `… 512.3k tok` -> `1. Fix issue`, so assert on
@@ -151,7 +151,7 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
     expect(collapsed).not.toContain('opus 5✓')
     expect(collapsed).toContain(`opus 5${NB}${WORKER_STEP_INDENT}✓`)
     // 3. the step trail running into the next step, and into the next row's
-    //    header (post-#3839 that last seam is the separator alone).
+    //    header (post-#3842 that last seam is the separator alone).
     expect(collapsed).not.toContain('gateway.ts→')
     expect(collapsed).toContain(`gateway.ts${NB}${WORKER_STEP_INDENT}→`)
     expect(collapsed).not.toContain('search2.')
@@ -174,7 +174,7 @@ describe('combined worker card survives the pinned-bar collapse (#3666)', () => 
     // show the collapsed preview mashes again. Without this, the assertions
     // above could all be passing for reasons unrelated to the fix.
     //
-    // The control runs on the 🤖 AGENT card. Post-#3839 the single-worker card
+    // The control runs on the 🤖 AGENT card. Post-#3842 the single-worker card
     // is flush too, so either would isolate the separator's contribution; the
     // agent card is kept because it has no step indent on ANY line, so no
     // future indent change can quietly make this control vacuous.
@@ -221,7 +221,7 @@ describe('single-worker / agent status card survives the collapse too (#3666)', 
     expectNoMashedSeams(body)
     const collapsed = collapsePreview(body)
     expect(collapsed).not.toContain('toolsstarting')
-    // #3839: the single-worker card is flush, so the separator alone holds the
+    // #3842: the single-worker card is flush, so the separator alone holds the
     // hand-rolled `starting…` seam apart — nothing else masks a regression.
     expect(collapsed).toContain(`0 tools${NB}starting`)
   })

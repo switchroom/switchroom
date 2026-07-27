@@ -383,7 +383,7 @@ export interface StatusCardOpts {
  * newest-in-progress `→` bold else `✓` italic; NESTED_PREFIX for children) →
  * optional `✓ N steps` footer → optional result block → fitCardToBudget.
  *
- * Every card this primitive emits is FLUSH at the left margin (#3839). The
+ * Every card this primitive emits is FLUSH at the left margin (#3842). The
  * whole-card `└─ ` + one-level indent that #3820/#3821 put on the worker card
  * is gone: it cost horizontal space on a phone and claimed a parent/child
  * relationship that does not always hold. Intra-card nesting (the `↳` child
@@ -481,7 +481,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   const rawSteps = opts.steps.filter((s) => s != null)
   const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
   const hasChildren = rawChildren.length > 0
-  // No per-line nesting cost since #3839 removed whole-card subordination:
+  // No per-line nesting cost since #3842 removed whole-card subordination:
   // every line this function assembles is flush, so the arithmetic below
   // charges only the line's own bytes.
   const stack = (lines: string[]): string =>
@@ -798,7 +798,7 @@ function glanceLine(rows: CombinedWorkerRow[]): string {
  *      **→ {newest step}**
  *   _+M more working…_
  *
- * FLUSH (#3839): the card sits at the left margin like every other card. The
+ * FLUSH (#3842): the card sits at the left margin like every other card. The
  * whole-card `└─ ` + one-level indent from #3820/#3821 is gone — it burned a
  * level of horizontal phone width to assert a parent/child relationship with
  * the 🤖 agent card that does not always hold (this card is not always below
@@ -913,7 +913,7 @@ export function renderCombinedWorkerFeed(
     // substituted. Without the separator the glance line runs straight into
     // row 1's ordinal and every step glyph mashes into the previous line.
     //
-    // No whole-card nesting (#3839): `out` goes to the stacker as-is, so the
+    // No whole-card nesting (#3842): `out` goes to the stacker as-is, so the
     // glance / row-header / spill lines land flush and only the step lines
     // carry their WORKER_STEP_INDENT — one level of hierarchy, not two.
     return {

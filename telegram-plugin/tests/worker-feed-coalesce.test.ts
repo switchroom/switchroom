@@ -1287,7 +1287,7 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     // Load-bearing: the exact indent bytes. `WORKER_STEP_INDENT` is U+2800 ×3;
     // a plain-ASCII `'   '` indent fails this assertion, so does the U+00A0 run
     // #3662 shipped, and so does flat output with no prefix at all.
-    // #3839 removed the whole-card nesting #3820 added, so a step sits at
+    // #3842 removed the whole-card nesting #3820 added, so a step sits at
     // EXACTLY one WORKER_STEP_INDENT — not two — and its worker header sits
     // flush at the left margin. The RELATIVE one-level nesting this test guards
     // is unchanged; the whole block shifted back left.
@@ -1450,7 +1450,7 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     expect(ents.every((e) => !e.text.includes(NBSP))).toBe(true)
   })
 
-  it('the SINGLE-worker 🛠 card is entirely FLUSH — no card indent, no step indent (#3839)', () => {
+  it('the SINGLE-worker 🛠 card is entirely FLUSH — no card indent, no step indent (#3842)', () => {
     const single = renderWorkerActivity({
       workerId: 'w1',
       description: 'lone worker',
@@ -1463,7 +1463,7 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     expect(single).toContain('~~_✓ step a_~~')
     expect(single).toContain('**→ step b**')
     // The lone-worker card has no worker HEADER to nest steps under, so there is
-    // nothing for an indent to distinguish — and #3839 removed the whole-card
+    // nothing for an indent to distinguish — and #3842 removed the whole-card
     // nesting #3820 added, so EVERY line sits at the left margin. Asserted per
     // line on the leading edge rather than as "no U+2800 anywhere in the card",
     // because #3666 puts one TRAILING U+00A0 on every hard-broken line of every

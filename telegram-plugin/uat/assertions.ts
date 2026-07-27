@@ -29,7 +29,7 @@ import type { Driver, ObservedMessage, ObservedReaction } from "./driver.js";
  * inside `WORKERS` (no word boundary between `r` and `S`). Without the optional
  * `s` the whole 2+ worker surface was invisible to this predicate, so a
  * recall/reply scenario running with two live workers could latch onto the
- * combined card as the agent's answer. Found during the #3839 card audit.
+ * combined card as the agent's answer. Found during the #3842 card audit.
  */
 export const WORKER_FEED_RE = /🛠[️]?\s*Workers?\b|finished\s*·\s*(?:completed|failed)/i;
 
@@ -92,7 +92,7 @@ const LIVENESS_HEADER_L1_RE = /^(?:🤖|🛠[️]?|⚙[️]?)\s+\S/u;
  * Telegram's own left-trim; see WORKER_STEP_INDENT). Without this, a worker
  * card's body lines stop matching `ACTIVITY_BODY_LINE_RE`.
  *
- * #3839 removed the whole-card `└─ ` header prefix and the whole-card indent
+ * #3842 removed the whole-card `└─ ` header prefix and the whole-card indent
  * that #3820/#3821 put on worker cards, so this no longer has to strip a `└─ `.
  * The step indent is the only nesting a card emits now.
  */

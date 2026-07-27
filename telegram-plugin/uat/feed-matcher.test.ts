@@ -52,15 +52,15 @@ describe("isWorkerFeedMessage", () => {
     expect(WORKER_FEED_RE.test("🛠 Worker · x")).toBe(true);
   });
 
-  it("matches the FLUSH worker card as Telegram delivers it (#3839)", () => {
-    // #3839 removed the whole-card `└─ ` prefix and whole-card indent that
+  it("matches the FLUSH worker card as Telegram delivers it (#3842)", () => {
+    // #3842 removed the whole-card `└─ ` prefix and whole-card indent that
     // #3820/#3821 put on worker cards, so the single-worker card arrives flush.
     const flush = "🛠 WORKER · crawling changelog\n55s · 9 tools · opus 5";
     expect(isWorkerFeedMessage(feed(flush))).toBe(true);
   });
 });
 
-describe("#3839 the surviving step indent is transparent to the matchers", () => {
+describe("#3842 the surviving step indent is transparent to the matchers", () => {
   it("classifies a flush agent-shaped worker card as the liveness card, not an answer", () => {
     const flush =
       "🛠 WORKER · crawl\n12s · 3 tools\n✓ Reading CLAUDE.md\n→ Searching memory";
@@ -69,7 +69,7 @@ describe("#3839 the surviving step indent is transparent to the matchers", () =>
   });
 
   it("classifies a combined card whose step lines carry WORKER_STEP_INDENT", () => {
-    // The one indent that survives #3839: step lines under a worker row header
+    // The one indent that survives #3842: step lines under a worker row header
     // on the 2+ worker card. `String.trim()` does NOT remove U+2800 (category
     // So, not whitespace), so the matchers must normalise it explicitly or a
     // recall/reply scenario latches onto the combined card as an answer.

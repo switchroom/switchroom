@@ -1,5 +1,5 @@
 /**
- * #3839 — every status card is FLUSH at the left margin, and the only
+ * #3842 — every status card is FLUSH at the left margin, and the only
  * indentation any card carries is the step indent that separates one worker's
  * steps from the next worker's on the combined (2+ worker) card.
  *
@@ -13,7 +13,7 @@
  * plus the numbered row headers.
  *
  * These tests assert the RENDERED OUTPUT of the real renderers, and they fail
- * on the pre-#3839 shape (which put `└─ ` on line 1 and U+2800 on every other
+ * on the pre-#3842 shape (which put `└─ ` on line 1 and U+2800 on every other
  * line of both worker surfaces).
  *
  * What is NOT asserted here any more, deliberately: that no rendered line is
@@ -40,7 +40,7 @@ function lines(card: string): string[] {
 /** The exact scenario from #3820: parent narrating the task it delegated. */
 const STEPS = ['PR 2502 details', 'Commits since v0.8.5']
 
-/** The card-level chrome #3839 removed. Asserted absent, never re-emitted. */
+/** The card-level chrome #3842 removed. Asserted absent, never re-emitted. */
 const REMOVED_HEADER_PREFIX = '└─ '
 
 function agentCard(): string {
@@ -124,7 +124,7 @@ function everyWorkerSurface(): Array<{ name: string; card: string }> {
   ]
 }
 
-describe('#3839 every card is flush at the left margin', () => {
+describe('#3842 every card is flush at the left margin', () => {
   it('emits no `└─ ` header prefix on any surface', () => {
     for (const { name, card } of [{ name: 'agent', card: agentCard() }, ...everyWorkerSurface()]) {
       expect(card.includes(REMOVED_HEADER_PREFIX), `${name} card carries └─`).toBe(false)
@@ -132,7 +132,7 @@ describe('#3839 every card is flush at the left margin', () => {
   })
 
   it('leaves every line of the SINGLE-worker card unindented', () => {
-    // Pre-#3839 line 1 started `└─ ` and lines 2..n started with a U+2800 run.
+    // Pre-#3842 line 1 started `└─ ` and lines 2..n started with a U+2800 run.
     const surfaces = everyWorkerSurface()
     for (const name of [
       'running',
@@ -169,7 +169,7 @@ describe('#3839 every card is flush at the left margin', () => {
   })
 })
 
-describe('#3839 the combined card keeps exactly ONE level of indent', () => {
+describe('#3842 the combined card keeps exactly ONE level of indent', () => {
   it('puts the glance line and row headers flush', () => {
     const l = lines(combinedCard())
     expect(l[0]).toBe('🛠 **WORKERS** · _2 running · oldest 55s · 13 tools_')
@@ -184,7 +184,7 @@ describe('#3839 the combined card keeps exactly ONE level of indent', () => {
     expect(stepLines.length).toBeGreaterThan(0)
     for (const s of stepLines) {
       expect(s.startsWith(WORKER_STEP_INDENT)).toBe(true)
-      // The pre-#3839 double indent (SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT).
+      // The pre-#3842 double indent (SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT).
       expect(s.startsWith(WORKER_STEP_INDENT + WORKER_STEP_INDENT)).toBe(false)
     }
   })
@@ -204,7 +204,7 @@ describe('#3839 the combined card keeps exactly ONE level of indent', () => {
   })
 })
 
-describe('#3839 char-budget accounting matches the flush shape', () => {
+describe('#3842 char-budget accounting matches the flush shape', () => {
   it('keeps an oversized worker card under the wire budget', () => {
     // fitCardToBudget has its own line assembly + arithmetic. With the per-line
     // nest cost removed it must still land under the cap, and must not emit any
@@ -243,7 +243,7 @@ describe('#3839 char-budget accounting matches the flush shape', () => {
   })
 })
 
-describe('#3839 the surviving type cues', () => {
+describe('#3842 the surviving type cues', () => {
   it('uses a high-contrast caps type label on the worker card only', () => {
     const agent = agentCard()
     const worker = renderWorkerActivity(workerView())
@@ -261,14 +261,14 @@ describe('#3839 the surviving type cues', () => {
     expect(agent[0]).not.toBe(worker[0])
     expect(agent[0].startsWith('🤖 ')).toBe(true)
     expect(worker[0].startsWith('🛠 ')).toBe(true)
-    // The documented cost of #3839, pinned so a future change to it is visible:
+    // The documented cost of #3842, pinned so a future change to it is visible:
     // every line BELOW line 1 is now shared between the two cards.
     const overlap = agent.filter((a) => worker.includes(a))
     expect(overlap).toEqual(agent.slice(1))
   })
 })
 
-describe('#3839 the surviving step indent survives Telegram reality', () => {
+describe('#3842 the surviving step indent survives Telegram reality', () => {
   it('passes every card through the real outbound markdown guard byte-identical', () => {
     // richMessage() is the ONE adapter every `{ markdown }` wire send funnels
     // through (rich-send.ts) — it runs the line-start / heading / dollar-math

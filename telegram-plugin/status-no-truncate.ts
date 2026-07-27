@@ -83,7 +83,7 @@ export const NESTED_PREFIX = '   ↳ '
  * (2+ worker) card — three U+2800 BRAILLE PATTERN BLANK, written as escapes so
  * the bytes are visible in source.
  *
- * This is now the ONLY indent any card carries (#3839). #3820/#3821 also
+ * This is now the ONLY indent any card carries (#3842). #3820/#3821 also
  * indented the whole worker card by one level and prefixed line 1 with `└─ `,
  * which cost a level of horizontal space on a phone and asserted a
  * parent/child relationship that is not always true (the worker card does not

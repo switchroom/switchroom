@@ -181,7 +181,7 @@ export function repeatCountOf(line: string): number {
  *   ─────
  *   ✅ _{cleaned result paragraph}_
  *
- * FLUSH (#3839): this card sits at the left margin. #3820/#3821 indented the
+ * FLUSH (#3842): this card sits at the left margin. #3820/#3821 indented the
  * whole block and prefixed line 1 with `└─ ` to mark it subordinate to the 🤖
  * agent card; that was reverted because it burned a level of horizontal phone
  * width and because this card does not always sit below the agent card, so a
@@ -261,7 +261,7 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     // The collapse separator is carried here too (#3666) — this card is pinned,
     // and a hand-rolled seam would be the one boundary that still mashed in
     // Telegram's pinned bar.
-    // Flush like every other body line of this card (#3839) — the single-worker
+    // Flush like every other body line of this card (#3842) — the single-worker
     // card carries no indentation at all now.
     return `${card}${COLLAPSE_SAFE_SEPARATOR}  \n_starting…_`
   }
