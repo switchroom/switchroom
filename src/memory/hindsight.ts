@@ -284,30 +284,87 @@ export function isHindsightEnabled(
  * #3532 (profile-scoped retain missions) — a coding agent and a health coach
  * should not share one extraction mission, which is the durable fix that a
  * single global reword cannot be.
+ *
+ * 2026-07-28 (tool-exhaust pass — the text below). The 2026-07-25 mission
+ * shipped and reached every live bank, and it still leaked transcript exhaust.
+ * That is measured, not argued: the mission above was live on overlord from
+ * 2026-07-27 12:03, klanker from 2026-07-25 09:19 and finn/carrie from
+ * 2026-07-26 14:03, yet overlord's whole-shape tool-exhaust rate ran 1.12 /
+ * 1.18 / 0.69 units per 1k world+experience units on 2026-07-25 / -26 / -27,
+ * ABOVE its 0.00–0.83 per 1k over the preceding week.
+ *
+ * So this revision was chosen by A/B rather than by taste. The arms were run
+ * offline against the REAL extraction path — `fact_extraction`'s
+ * `_build_extraction_prompt_and_schema` + `_retain_mission_preamble` +
+ * `_build_user_message` + `_build_request_body`, POSTed to the same LiteLLM
+ * endpoint and the same local `gpt-oss:20b` the retain worker uses — over 52
+ * real retain chunks sampled from windows that had actually leaked. Nothing
+ * was written to any bank. Hand-labelled over all 143 extracted facts:
+ *
+ *   arm A (the 2026-07-25 mission): 84 facts, 42 tool exhaust (50.0%), 42 durable
+ *   arm B (this text):              59 facts, 12 tool exhaust (20.3%), 47 durable
+ *
+ * The durable count going UP while the total falls is the point: B is not
+ * simply extracting less. Caveats, stated because they bound the claim — the
+ * labelling is single-rater, n=52 chunks, one model.
+ *
+ * What changed, and why each part earns its bytes:
+ *  - The "A TOOL RESULT IS NOT A FACT" test up front. gpt-oss-20b applies a
+ *    subject test far more reliably than a category test; every remaining
+ *    bullet is a special case of it.
+ *  - Verbatim negative exemplars lifted from units the previous mission
+ *    actually let through, not invented ones. The 2026-07-25 note above is
+ *    right that small models need concrete negatives; it just did not have
+ *    enough of them, and the ones it had did not cover tool RESULTS.
+ *  - A /tmp-and-scratchpad-path bullet, and a slash-command bullet.
+ *  - The positive counterweight sentence is preserved unchanged and remains
+ *    load-bearing (see 2026-07-25 above).
+ *  - Bullet 7 ("greetings, acknowledgements...") is preserved verbatim: the
+ *    2026-07-25 revert finding above stands and was not re-litigated here.
+ *
+ * KNOWN RESIDUAL — this does not close the hole. B's 12 remaining exhaust
+ * facts are dominated by one class (6 of 12): Claude Code's own Bash-tool
+ * system reminder, "the session's current working directory remains <path>;
+ * directory changes made by backgrounded commands do not affect subsequent
+ * commands". 127 paraphrases of that single sentence already sit in live
+ * banks (overlord 84, klanker 39, finn 3, carrie 1, hand-checked, 0/127 false
+ * positives). It survives the mission because it is not false and does not
+ * look like narration — it reads as a durable system fact. A prompt cannot be
+ * expected to win that one; if it needs closing it wants a deterministic
+ * pre-retain filter, which is deliberately NOT in this PR.
  */
 export const DEFAULT_RETAIN_MISSION =
-  "Extract durable facts that will still be true and useful weeks from now: " +
-  "user preferences and standing rules, ongoing projects and recurring " +
-  "commitments, technical and architectural decisions with their rationale, " +
-  "and people/tool relationships. A preference revealed by a request is " +
-  "durable — record the preference (what the user likes, wants, or always " +
-  "does), not the request itself.\n\n" +
+  "Extract durable facts that will still be true and useful weeks from now: user preferences and standing rules, ongoing projects and recurring commitments, technical and architectural decisions with their rationale, and people/tool relationships. A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "\n" +
+  "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
+  "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
+  "the location where some output was written? If yes, drop it — it is transcript\n" +
+  "exhaust, not memory.\n" +
+  "\n" +
   "NEVER extract:\n" +
-  "- Agent tool-use traces or narration of what the assistant did (e.g. " +
-  '"the assistant used X to query Y", "ran a search", "sent the message").\n' +
-  "- In-flight workflow/process narration (a sub-task started, paused, or is " +
-  "still running) — retain the outcome only once the task completes or a " +
-  "decision is made.\n" +
-  "- Operation, request, batch or session IDs, UUIDs, hashes, or error codes.\n" +
-  "- Hindsight's own errors, retries, backlogs, or internal state — the " +
-  "memory system's self-reports are not memories.\n" +
+  "- Tool results verbatim or paraphrased. Concretely, never produce a fact whose\n" +
+  "  text resembles any of these: \"File created successfully at /path/to/file\",\n" +
+  "  \"A background command with ID bctz4yskm is running, and its output will be\n" +
+  "  written to /tmp/...\", \"Async agent a745598ba84e71df1 was launched successfully\n" +
+  "  and is running in the background\", \"User executed a Bash command to sleep for\n" +
+  "  200 seconds\", \"The assistant used grep to locate 'truncateSync' in src/foo.ts\".\n" +
+  "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
+  "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
+  "  running) — retain the outcome only once the task completes or a decision is made.\n" +
+  "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Slash commands the user typed and their effects (e.g. \"User issued /clear to\n" +
+  "  reset assistant state\").\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
+  "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
-  "- Transient state (unread counts, build status, what is running right now) " +
-  "unless the fact is explicitly dated, in which case record it as a dated " +
-  "observation.\n" +
-  "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
-  "If a candidate fact matches an exclusion, drop it rather than rewording " +
-  "it. If nothing durable remains, return an empty facts list.";
+  "- Transient state (unread counts, build status, what is running right now) unless\n" +
+  "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n" +
+  "\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
+  "nothing durable remains, return an empty facts list.";
 
 /**
  * Ordered registry of every retain mission switchroom has ever shipped as a
@@ -355,6 +412,31 @@ export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
     "including in-flight workflow/process narration (a sub-task started, " +
     "paused, or is still running) — only retain the outcome once a task " +
     "actually completes or a decision is made.",
+  // (2026-07-25 retain-noise pass) — first mission to enumerate negative
+  // exemplars. This is the text every live bank was carrying as of
+  // 2026-07-27, and the A arm of the A/B recorded on DEFAULT_RETAIN_MISSION.
+  "Extract durable facts that will still be true and useful weeks from now: " +
+  "user preferences and standing rules, ongoing projects and recurring " +
+  "commitments, technical and architectural decisions with their rationale, " +
+  "and people/tool relationships. A preference revealed by a request is " +
+  "durable — record the preference (what the user likes, wants, or always " +
+  "does), not the request itself.\n\n" +
+  "NEVER extract:\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. " +
+  '"the assistant used X to query Y", "ran a search", "sent the message").\n' +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is " +
+  "still running) — retain the outcome only once the task completes or a " +
+  "decision is made.\n" +
+  "- Operation, request, batch or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the " +
+  "memory system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) " +
+  "unless the fact is explicitly dated, in which case record it as a dated " +
+  "observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording " +
+  "it. If nothing durable remains, return an empty facts list.",
 ];
 
 /**

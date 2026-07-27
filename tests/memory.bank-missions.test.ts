@@ -74,7 +74,9 @@ describe("DEFAULT_RETAIN_MISSION", () => {
     // "User wants to identify pending/failed consolidation…"
     expect(DEFAULT_RETAIN_MISSION).toContain("Restatements of the user's current request");
     // "User has no unread mail" — stored with no timestamp, recalls forever.
-    expect(DEFAULT_RETAIN_MISSION).toMatch(/Transient state .* unless the fact is explicitly dated/);
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /Transient state[\s\S]*unless[\s\S]*the fact is explicitly dated/,
+    );
   });
 
   // The exclusions above are load-bearing but dangerous alone: an
@@ -84,6 +86,46 @@ describe("DEFAULT_RETAIN_MISSION", () => {
   it("keeps a positive counterweight so exclusions cannot starve extraction", () => {
     expect(DEFAULT_RETAIN_MISSION).toContain(
       "A preference revealed by a request is durable",
+    );
+  });
+
+  // Regression for the 2026-07-28 tool-exhaust pass. The 2026-07-25 mission
+  // above was live on every bank and STILL leaked transcript exhaust — measured,
+  // not argued: overlord's whole-shape tool-exhaust rate ran 1.12 / 1.18 / 0.69
+  // units per 1k world+experience on 2026-07-25/-26/-27, above its 0.00-0.83 per
+  // 1k the week before. In a 52-chunk A/B against the real extraction path and
+  // the real local gpt-oss:20b, hand-labelling all 143 extracted facts, this
+  // text cut tool exhaust from 42/84 (50.0%) to 12/59 (20.3%) while durable
+  // facts went 42 -> 47. Each assertion below pins the part that earned that.
+  it("gives the small extraction model a subject test and verbatim tool-result exemplars", () => {
+    // The subject test. Every bullet is a special case of it, and it is what
+    // generalizes to exhaust shapes nobody enumerated.
+    expect(DEFAULT_RETAIN_MISSION).toContain("A TOOL RESULT IS NOT A FACT");
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /is the subject of this[\s\S]*candidate a file path/,
+    );
+
+    // Verbatim exemplars, each lifted from a unit the PREVIOUS mission let
+    // through into a production bank — not invented ones.
+    expect(DEFAULT_RETAIN_MISSION).toContain("File created successfully at /path/to/file");
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /A background command with ID bctz4yskm is running/,
+    );
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/Async agent a745598ba84e71df1 was launched/);
+
+    // The two shapes the 2026-07-25 mission had no bullet for at all.
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /Anything mentioning a path under \/tmp, a scratchpad directory, or a \.tmp file/,
+    );
+    expect(DEFAULT_RETAIN_MISSION).toContain("Slash commands the user typed");
+  });
+
+  // The 2026-07-25 revert finding (see the hindsight.ts header) stands and was
+  // NOT re-litigated by the tool-exhaust pass: bullet 7 survives verbatim.
+  // Without this, a future exhaust-focused reword could quietly reopen it.
+  it("preserves the 2026-07-25 chatter bullet verbatim through the tool-exhaust pass", () => {
+    expect(DEFAULT_RETAIN_MISSION).toContain(
+      "- Greetings, acknowledgements, and routine operational chatter.",
     );
   });
 
@@ -169,8 +211,33 @@ describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
         "including in-flight workflow/process narration (a sub-task started, " +
         "paused, or is still running) — only retain the outcome once a task " +
         "actually completes or a decision is made.",
+      // (2026-07-25 retain-noise pass) — first mission to enumerate negative
+      // exemplars. The text every live bank was carrying as of 2026-07-27, and
+      // the A arm of the 2026-07-28 tool-exhaust A/B.
+      "Extract durable facts that will still be true and useful weeks from now: " +
+      "user preferences and standing rules, ongoing projects and recurring " +
+      "commitments, technical and architectural decisions with their rationale, " +
+      "and people/tool relationships. A preference revealed by a request is " +
+      "durable — record the preference (what the user likes, wants, or always " +
+      "does), not the request itself.\n\n" +
+      "NEVER extract:\n" +
+      "- Agent tool-use traces or narration of what the assistant did (e.g. " +
+      '"the assistant used X to query Y", "ran a search", "sent the message").\n' +
+      "- In-flight workflow/process narration (a sub-task started, paused, or is " +
+      "still running) — retain the outcome only once the task completes or a " +
+      "decision is made.\n" +
+      "- Operation, request, batch or session IDs, UUIDs, hashes, or error codes.\n" +
+      "- Hindsight's own errors, retries, backlogs, or internal state — the " +
+      "memory system's self-reports are not memories.\n" +
+      "- Restatements of the user's current request or the task in progress.\n" +
+      "- Transient state (unread counts, build status, what is running right now) " +
+      "unless the fact is explicitly dated, in which case record it as a dated " +
+      "observation.\n" +
+      "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
+      "If a candidate fact matches an exclusion, drop it rather than rewording " +
+      "it. If nothing durable remains, return an empty facts list.",
     ]);
-    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(3);
+    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(4);
   });
 
   it("carries the 2026-07-19 text every live bank was found holding on 2026-07-25", () => {
