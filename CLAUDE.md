@@ -60,7 +60,16 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
   in the latest assistant message cannot be modified`. It was FIXED in
   claude-code 2.1.156, so Opus 5 and the bare `opus` alias are deliberately not
   matched and the fleet runs `medium`. Don't re-add the Opus 5 arms, and don't
-  advise pinning `low` fleet-wide.
+  advise pinning `low` fleet-wide. **That narrowing is only sound while the
+  container is actually running a CLI at the floor**, so the residual risk is
+  covered by a second check, not by widening the first: doctor's
+  `Claude CLI floor (#1978)` section (`src/cli/doctor-claude-cli.ts`)
+  `docker exec`s each container, resolves `claude` through the same PATH prefix
+  `start.sh` exports (so a shadow install is seen, not the image binary), and
+  WARNs below the floor — naming the exposure when that agent is on an Opus
+  model at `medium`+. `CLAUDE_CLI_THINKING_MERGE_FIX_VERSION` in
+  `thinking-effort-risk.ts` is the single source of the floor; the production
+  pin stays in `docker/Dockerfile.base` and is read from there.
 - **Cron tiering keys off the model STRING — but only third**
   (`src/scheduler/cron-routing.ts`). Two gates decide before the model is
   consulted: `kind: action` returns `tier: "action"` at `:89` and is

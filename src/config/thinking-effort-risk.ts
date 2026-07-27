@@ -51,8 +51,58 @@
  * advisory, and be unit-tested directly.
  */
 
+/**
+ * The claude-code build that fixed the #1978 interleaved-streaming merge bug.
+ *
+ * This is the SINGLE source of truth for that floor. `isAdaptiveThinkingOpus()`
+ * was narrowed to `claude-opus-4*` *because* every container is expected to run
+ * a CLI at or above this version — so anything that re-states the floor
+ * (this module's operator-facing reason string, and the
+ * `<agent>: claude CLI floor` doctor check in `src/cli/doctor-claude-cli.ts`)
+ * must import it from here rather than re-typing "2.1.156".
+ *
+ * The floor is a LOWER bound, not the pin: the production pin lives in
+ * `docker/Dockerfile.base` (`ARG CLAUDE_CODE_VERSION`) and is read from that
+ * file at doctor time. `tests/doctor-claude-cli.test.ts` asserts the pin is
+ * still >= this floor so the two cannot drift apart silently.
+ */
+export const CLAUDE_CLI_THINKING_MERGE_FIX_VERSION = "2.1.156";
+
 /** Effort levels that produce enough adaptive thinking to risk the merge bug. */
 const RISKY_EFFORTS = new Set(["medium", "high", "xhigh", "max"]);
+
+/**
+ * True for an effort level high enough to emit the volume of adaptive
+ * thinking blocks that reproduced the #1978 merge 400.
+ *
+ * Unset is safe — the scaffold floors an unset `thinking_effort` at `low`
+ * (`SWITCHROOM_DEFAULT_THINKING_EFFORT`).
+ */
+export function isRiskyThinkingEffort(effort: string | undefined): boolean {
+  if (!effort) return false;
+  return RISKY_EFFORTS.has(effort.trim().toLowerCase());
+}
+
+/**
+ * True for any model that uses ADAPTIVE thinking, i.e. emits
+ * `thinking`/`redacted_thinking` blocks that the pre-2.1.156 CLI could
+ * mis-merge. That is the whole Opus family: the bare `opus` alias,
+ * `claude-opus-4*`, and `claude-opus-5*`.
+ *
+ * This is deliberately BROADER than `isAdaptiveThinkingOpus()`. The narrow
+ * predicate answers "should we warn about this config on a CURRENT CLI?"
+ * (answer: only legacy Opus 4.x, because the bug is fixed). This one answers
+ * "would this config have been exposed to the bug on a PRE-fix CLI?" — which
+ * is exactly the question the doctor CLI-floor check needs once it has
+ * observed that a container is in fact running a pre-fix CLI. Keeping them
+ * separate is the point: do not widen `isAdaptiveThinkingOpus()` to reach
+ * this, or the fleet's Opus 5 agents start warning again on a healthy CLI.
+ */
+export function emitsAdaptiveThinking(model: string | undefined): boolean {
+  if (!model) return false;
+  const m = model.trim().toLowerCase();
+  return m === "opus" || m.startsWith("claude-opus-");
+}
 
 /**
  * True for models whose adaptive thinking + switchroom's concurrent
@@ -89,8 +139,7 @@ export function assessThinkingEffortRisk(
   model: string | undefined,
   effort: string | undefined,
 ): ThinkingEffortRisk {
-  if (!effort) return { risky: false };
-  if (!RISKY_EFFORTS.has(effort.trim().toLowerCase())) return { risky: false };
+  if (!isRiskyThinkingEffort(effort)) return { risky: false };
   if (!isAdaptiveThinkingOpus(model)) return { risky: false };
   return {
     risky: true,
@@ -98,7 +147,7 @@ export function assessThinkingEffortRisk(
       `thinking_effort '${effort}' on pinned Opus 4.x model '${model}' could trigger ` +
       `'400 thinking/redacted_thinking blocks cannot be modified' errors when work runs ` +
       `through concurrent sub-agents (issue #1978). The upstream claude-CLI fix shipped in ` +
-      `2.1.156, but the Opus 4.x reproduction has not been re-tested since, so pin ` +
-      `'thinking_effort: low' or move the agent to a current Opus model.`,
+      `${CLAUDE_CLI_THINKING_MERGE_FIX_VERSION}, but the Opus 4.x reproduction has not been ` +
+      `re-tested since, so pin 'thinking_effort: low' or move the agent to a current Opus model.`,
   };
 }

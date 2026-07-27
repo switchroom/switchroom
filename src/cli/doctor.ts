@@ -19,7 +19,10 @@ import { createPublicKey, createPrivateKey } from "node:crypto";
 import { listSecrets, getStringSecret } from "../vault/vault.js";
 import { resolveAgentsDir, resolvePath } from "../config/loader.js";
 import { resolveAgentConfig } from "../config/merge.js";
-import { assessThinkingEffortRisk } from "../config/thinking-effort-risk.js";
+import {
+  assessThinkingEffortRisk,
+  CLAUDE_CLI_THINKING_MERGE_FIX_VERSION,
+} from "../config/thinking-effort-risk.js";
 import { resolveStatePath, LEGACY_STATE_DIR } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
@@ -64,6 +67,7 @@ import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
 import { runTimezoneChecks } from "./doctor-timezone.js";
 import { fixSessionModelCarrierDrift } from "./doctor-fix-session-model.js";
+import { runClaudeCliVersionChecks } from "./doctor-claude-cli.js";
 
 /**
  * Result of a single doctor check.
@@ -538,7 +542,8 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
         : "no risky model/effort combos",
     fix:
       effortRisks.length > 0
-        ? "Pin `thinking_effort: low` for pinned Opus 4.x agents, or move them to a current Opus model. medium+ could 400 on 'thinking blocks cannot be modified' with concurrent sub-agents (issue #1978); the upstream fix shipped in claude-code 2.1.156 but the Opus 4.x reproduction was never re-tested. Removing the field is NOT a fix (Opus defaults effort=high when unset)."
+        ? "Pin `thinking_effort: low` for pinned Opus 4.x agents, or move them to a current Opus model. medium+ could 400 on 'thinking blocks cannot be modified' with concurrent sub-agents (issue #1978); the upstream fix shipped in claude-code " +
+          `${CLAUDE_CLI_THINKING_MERGE_FIX_VERSION} but the Opus 4.x reproduction was never re-tested. Removing the field is NOT a fix (Opus defaults effort=high when unset).`
         : undefined,
   });
 
@@ -3601,6 +3606,15 @@ export function registerDoctorCommand(program: Command): void {
           {
             title: "Agent liveness (in-agent via hostd)",
             results: await runAgentSmokeChecks(config, { fast: opts.fast }),
+          },
+          {
+            // The half `thinking_effort × adaptive model` (above) cannot
+            // see. That guard's Opus 4.x-only scope is correct ONLY while
+            // the container is running claude-code >= 2.1.156; this reads
+            // the version the container is ACTUALLY executing rather than
+            // trusting the image pin. warn/skip only — never fails doctor.
+            title: "Claude CLI floor (#1978)",
+            results: runClaudeCliVersionChecks(config, { fast: opts.fast }),
           },
           {
             title: "Google Drive",
