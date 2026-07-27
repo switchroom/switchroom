@@ -685,10 +685,19 @@ unset CLAUDE_CODE_OAUTH_TOKEN
 # out its own sub-agents), so we restore the pre-2.1.217 behaviour. Depth 2
 # = main → sub-agent → grandchild, which covers the one extra level the
 # fleet actually uses; there is no evidence of deeper nesting, so we don't
-# raise it further. (The companion 2.1.217 change — CLAUDE_CODE_MAX_
-# CONCURRENT_SUBAGENTS defaulting to 20 — is already compatible: our fleet
-# self-caps at 15 parallel sub-agents, so the 20 default is left untouched.)
+# raise it further.
 export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="${CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH:-2}"
+# Fan-out width. The CLI's own default is 20 (2.1.217's companion change);
+# switchroom deliberately pins it LOWER, at 15, because the dev-protocol
+# fragment every agent boots with ("max 15 parallel sub-agents",
+# profiles/_shared/dev-protocol.md.hbs) is prompt text — a model can ignore
+# it, and nothing else caps the width. This export is the deterministic
+# mechanism behind that sentence: past 15 the CLI refuses the launch instead
+# of relying on the agent to count. 15 rather than 20 keeps a fully fanned-out
+# worker inside the per-container CPU/RAM envelope and leaves headroom for the
+# nested level that SPAWN_DEPTH=2 above permits. Override-able for a one-off
+# wide job; raise both this and the fragment together or they disagree.
+export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS="${CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS:-15}"
 export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 # SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identifier the
 # telegram-plugin reads to detect self-restart commands. We can't rely on
