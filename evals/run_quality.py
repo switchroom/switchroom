@@ -17,7 +17,7 @@ EVALS_DIR = Path(__file__).parent
 RESULTS_DIR = EVALS_DIR / "results"
 SKILLS_DIR = EVALS_DIR.parent / "skills"
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 
 def git_sha() -> str:

@@ -26,7 +26,7 @@ python evals/run_quality.py --ablation
 python evals/run_quality.py --parallel 10
 
 # Different model
-python evals/run_quality.py --model claude-opus-4-5
+python evals/run_quality.py --model claude-opus-5
 ```
 
 ## Trigger routing evals

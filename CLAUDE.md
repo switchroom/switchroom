@@ -59,16 +59,29 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
   interleaved-streaming merge bug (#1978): `400 messages.N.content.M: 'thinking'
   or 'redacted_thinking' blocks in the latest assistant message cannot be
   modified`. Pin `thinking_effort: low`.
-- **Cron tiering keys off the model STRING** (`src/scheduler/cron-routing.ts`):
-  `sonnet|haiku` ⇒ cheap Tier-1 fresh session; `opus` ⇒ Tier-2 live session; an
-  **unrecognised id also falls to Tier-2** with a `customModelDowngrade` warning
-  — a typo'd or newly-renamed cheap model silently costs full-session tokens.
+- **Cron tiering keys off the model STRING — but only third**
+  (`src/scheduler/cron-routing.ts`). Two gates decide before the model is
+  consulted: `kind: action` returns `tier: "action"` at `:89` and is
+  flag-independent (a zero-token verb has no Tier-2 fallback, so gating it would
+  silently drop the cron); and the `cheapCronEnabled` kill-switch
+  (`SWITCHROOM_CHEAP_CRON=0|false|off`) short-circuits **every** fire to
+  `{ tier: "main", session: "main" }` at `:97`, leaving `kind`/`model`/`context`
+  inert. Past those, an explicit **`context:` outranks model inference**
+  (`:107`) — only the `else` branch consults `isKnownCheapModel()` (`:109`),
+  where `sonnet|haiku` ⇒ cheap Tier-1 fresh session and `opus` ⇒ Tier-2 live
+  session. An **unrecognised id also falls to Tier-2** with a
+  `customModelDowngrade` warning — a typo'd or newly-renamed cheap model
+  silently costs full-session tokens.
 - **The `/model` override rides a consume-once carrier** whose shape gate is
-  byte-parity between `profiles/_base/start.sh.hbs` (~:1621) and `MODEL_ARG_RE`
-  in `telegram-plugin/gateway/model-command.ts:64`, pinned by
-  `tests/scaffold.session-model.test.ts`. A string failing the gate is dropped
-  to the configured default with a one-shot operator alert and is never retried.
-  Change one regex, change the other in the same PR.
+  byte-parity across **five** sites: four identical `grep -Eq` copies in
+  `profiles/_base/start.sh.hbs` (live-model :1478, last-known-good :1502,
+  migration :1551, carrier :1629) and `MODEL_ARG_RE` in
+  `telegram-plugin/gateway/model-command.ts:64`. A string failing the gate is
+  dropped to the configured default with a one-shot operator alert and is never
+  retried. Change one, change all five in the same PR —
+  `tests/scaffold.session-model.test.ts:194` scrapes every `{0,99}` pattern out
+  of the RENDERED `start.sh`, asserts they are byte-identical, and runs a shared
+  fixture table against both the shell pattern and the TS `isValidModelArg`.
 - **Never hard-code a token budget against an assumed context window** — derive
   it from a declared one (`src/setup/hindsight-context-budget.ts`, #3717). The
   `claude-code` / `anthropic` provider default is `200_000`.
