@@ -56,7 +56,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
       - name: Run lint
@@ -68,7 +68,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
       - name: Build dist/
@@ -94,7 +94,7 @@ jobs:
       VITEST_MAX_FORKS: "2"
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
         with:
@@ -119,7 +119,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
       - name: Bun test (telegram-plugin)
@@ -135,7 +135,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Run unittest discover (hindsight scripts)
         working-directory: vendor/hindsight-memory/scripts
         run: python3 -m unittest discover tests/
@@ -157,7 +157,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
       - name: Build dist/
@@ -228,7 +228,7 @@ jobs:
           - { name: voice,       file: docker/Dockerfile.voice,       dist: false, base-arg: false, cache: buildcache }
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Node (for dist/ bundling)
         if: matrix.image.dist

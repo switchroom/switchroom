@@ -109,7 +109,7 @@ jobs:
       # failure). See .github/MERGE-QUEUE.md.
       - name: Checkout
         if: github.event_name != 'merge_group'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Filter changed paths
         if: github.event_name != 'merge_group'
         id: filter
@@ -169,7 +169,7 @@ jobs:
       TELEGRAM_TEST_BOT_USERNAME: ${{ secrets.TELEGRAM_TEST_BOT_USERNAME }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # Runner guard (#3335): sweep stale `switchroom.wedged-*` remnants from the
       # persistent _work tree so a prior mid-checkout wedge (git clean -ffdx into
       # D-state on the slow uat-runner-state volume) doesn't accumulate as dead
@@ -264,7 +264,7 @@ jobs:
       TELEGRAM_TEST_BOT_USERNAME: ${{ secrets.TELEGRAM_TEST_BOT_USERNAME }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # Runner guard (#3335): sweep stale `switchroom.wedged-*` remnants — see
       # the uat-gate-run job above for rationale.
       - name: Reap stale wedged workdirs (runner guard)
