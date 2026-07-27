@@ -75,16 +75,22 @@ export interface HindsightToolSpec {
 }
 
 /**
- * The hindsight API version the committed contract was captured from, and the
- * FLOOR switchroom requires.
+ * The hindsight API version the committed MCP contract was captured from, and
+ * the FLOOR switchroom's tool/arg surface requires.
+ *
+ * This tracks `tests/fixtures/hindsight-tools-list.snapshot.json` and NOTHING
+ * ELSE. It is deliberately NOT the floor for any individual backend feature —
+ * see {@link HINDSIGHT_REPAIR_MIN_API_VERSION}. Conflating the two is what made
+ * an earlier revision of this branch ship a doctor row that was guaranteed red
+ * on the running fleet: the snapshot described 0.8.4, the constant claimed
+ * 0.8.5 because `repair-bank` needs 0.8.5, and every `switchroom doctor` run
+ * printed a failure the operator could do nothing about. A flagship check that
+ * is red by construction trains people to ignore it.
  *
  * A floor, not an equality pin, and the distinction is deliberate:
- *  - **Below it** is a hard problem. The snapshot (and therefore
+ *  - **Below it** is a hard problem: the snapshot (and therefore
  *    `EXPECTED_HINDSIGHT_TOOLS`, the shim's fallback manifest, and every arg
- *    the CLI sends) describes a surface the running server may not have, and
- *    `hindsight-admin repair-bank` — the only escape hatch for a bank with
- *    missing per-(bank, fact_type) vector-index coverage — does not exist
- *    before 0.8.5.
+ *    the CLI sends) describes a surface the running server may not have.
  *  - **Above it** is not an error, because upstream's MCP changes have been
  *    additive. It IS a staleness signal: a newer server may advertise tools and
  *    props the snapshot has never heard of, and a capability switchroom cannot
@@ -92,10 +98,26 @@ export interface HindsightToolSpec {
  *    snapshot sat weeks stale while hiding three whole tools.
  *
  * `tests/memory.hindsight-contract.fixture.test.ts` asserts this equals the
- * snapshot's `_meta.hindsight_api_version`, so the two cannot drift apart:
- * bumping one without re-capturing the other reds the suite.
+ * snapshot's `_meta.hindsight_api_version` (which in turn must equal the
+ * api_version `docker/Dockerfile.hindsight` pins), so the three cannot drift
+ * apart: bumping one without re-capturing the others reds the suite.
  */
-export const HINDSIGHT_MIN_API_VERSION = "0.8.5";
+export const HINDSIGHT_MIN_API_VERSION = "0.8.4";
+
+/**
+ * The hindsight version that first ships `hindsight-admin repair-bank`
+ * (vectorize-io/hindsight#2645) — the only supported way to rebuild a bank's
+ * missing per-(bank, fact_type) vector-index coverage.
+ *
+ * A FEATURE floor, separate from {@link HINDSIGHT_MIN_API_VERSION} on purpose.
+ * It gates exactly one thing — `switchroom memory repair`'s preflight, which
+ * turns typer's misleading `No such command 'repair-bank'` into the real
+ * sentence — and it deliberately does NOT gate the MCP contract or produce a
+ * standing doctor row. The image pin catches up in #3768; until then the
+ * operator learns about the gap at the moment they try to use the feature,
+ * which is the only moment the information is actionable.
+ */
+export const HINDSIGHT_REPAIR_MIN_API_VERSION = "0.8.5";
 
 /**
  * The hindsight MCP tools switchroom calls (TS callers, the prompt guidance,

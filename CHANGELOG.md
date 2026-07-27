@@ -373,6 +373,17 @@ backend capability nobody can reach is the same as not having it.
 - **Not a doctor auto-fix.** `doctor` stays read-only. `CREATE INDEX
   CONCURRENTLY` across every bank is a mutation on a live database and deserves
   explicit operator intent. Detection and repair stay split.
+- **A check that cannot fail is not a check.** `--dry-run` reports through the
+  exit code, and every "I could not confirm" path is non-zero: `0` coverage
+  confirmed complete, `3` indexes missing, `4` unverified (no summary line, or
+  **zero banks scanned** — a mistyped `--bank` used to print "✓ Coverage
+  complete … across 0 bank(s)" and exit 0, which `skills/switchroom-health`
+  reported as OK), `1` the check itself failed. The codes skip `2` because the
+  underlying admin CLI is a typer app whose usage error is `2`, and the child's
+  exit code is never re-emitted — a mistyped flag can no longer surface as
+  "coverage missing". The whole verdict is one pure function,
+  `classifyRepairOutcome`, so each of those false greens has a test that reds
+  if the fix is reverted.
 
 ### `switchroom doctor` now checks hindsight version skew
 
@@ -387,16 +398,26 @@ version the committed contract was captured from, and doctor compares it to
 the live `GET /version`:
 
 - **older → fail.** The tools and args switchroom sends may not exist here, and
-  `memory repair` is unavailable.
+  an unknown arg is dropped *silently* — the symptom is a wrong answer, not an
+  error.
 - **newer → warn.** Not an error (upstream's MCP changes are additive), but the
   contract is stale by definition and the drift is silent in both directions.
   The diff is the capability you are not yet using.
 - **unreachable → no row.** The `/health` check already owns "the backend is
   down"; a second red line for the same outage is noise.
 
-The fixture test asserts the constant equals the snapshot's
-`_meta.hindsight_api_version`, so bumping one without re-capturing the other
-reds the suite — the check cannot silently stop being a check.
+The floor tracks the **snapshot**, not any individual feature: it is `0.8.4`,
+the version `docker/Dockerfile.hindsight` actually pins. `repair-bank`'s `0.8.5`
+requirement lives in its own `HINDSIGHT_REPAIR_MIN_API_VERSION` and is enforced
+in the repair preflight, at the moment an operator tries to use it. Fusing the
+two would have shipped a flagship doctor check that was red by construction on
+every running fleet — which trains people to ignore precisely the check meant
+to catch the next outage.
+
+The fixture test chains constant → snapshot `_meta.hindsight_api_version` →
+the api-version marker in `docker/Dockerfile.hindsight`, so bumping any one
+without the others reds the suite — the check cannot silently stop being a
+check.
 
 ### Corrected: 0.8.4 does emit `consolidation.completed`
 

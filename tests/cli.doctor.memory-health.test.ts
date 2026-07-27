@@ -588,12 +588,33 @@ describe("hindsight version skew", () => {
     expect(r?.status).toBe("ok");
   });
 
-  it("FAILS on a server older than the contract, and says repair is unavailable", () => {
-    const r = classifyHindsightVersionSkew("0.8.4");
+  it("FAILS on a server older than the captured contract", () => {
+    const r = classifyHindsightVersionSkew("0.7.0");
     expect(r?.status).toBe("fail");
-    expect(r?.detail).toContain("0.8.4");
-    expect(r?.detail).toMatch(/repair/i);
+    expect(r?.detail).toContain("0.7.0");
     expect(r?.fix).toBeTruthy();
+  });
+
+  /**
+   * Mutation-guard for the "guaranteed-red flagship check" bug: an earlier
+   * revision set the contract floor to 0.8.5 because `repair-bank` needs
+   * 0.8.5, while the snapshot and docker/Dockerfile.hindsight were both 0.8.4 —
+   * so every `switchroom doctor` run on the actual fleet printed a red row the
+   * operator could not act on. The floor tracks the SNAPSHOT; feature floors
+   * are enforced where the feature is used.
+   */
+  it("does not fail on the api_version the shipped image pins", () => {
+    const dockerfile = readFileSync(
+      resolve(__dirname, "..", "docker", "Dockerfile.hindsight"),
+      "utf-8",
+    );
+    const marker = dockerfile.match(/^#\s*switchroom:hindsight-api-version=(\S+)\s*$/m);
+    expect(marker, "docker/Dockerfile.hindsight must carry the api-version marker").toBeTruthy();
+    const shipped = marker![1].trim();
+    expect(
+      classifyHindsightVersionSkew(shipped)?.status,
+      `doctor must not be red against the image this repo ships (${shipped})`,
+    ).toBe("ok");
   });
 
   it("WARNS on a server newer than the contract — a capability nobody can see", () => {
@@ -615,9 +636,10 @@ describe("hindsight version skew", () => {
 
   it("checkHindsightVersion probes /version and classifies it end to end", async () => {
     const impl = (async () =>
-      ({ ok: true, status: 200, json: async () => ({ api_version: "0.8.4" }) }) as unknown as Response) as unknown as typeof fetch;
+      ({ ok: true, status: 200, json: async () => ({ api_version: "0.7.0" }) }) as unknown as Response) as unknown as typeof fetch;
     const r = await checkHindsightVersion("http://127.0.0.1:18888/mcp/", { fetchImpl: impl });
     expect(r?.status).toBe("fail");
+    expect(r?.detail).toContain("0.7.0");
   });
 
   it("checkHindsightVersion returns null (not a throw) when hindsight is unreachable", async () => {

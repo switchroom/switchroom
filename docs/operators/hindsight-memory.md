@@ -358,15 +358,28 @@ only through prose:
 
 | Exit | Meaning |
 |------|---------|
-| `0` | Coverage complete — nothing to create. |
-| `2` | Indexes are **missing**. Recall on those banks is under-returning. |
+| `0` | Coverage **confirmed** complete — at least one bank scanned, nothing to create. |
+| `3` | Indexes are **missing**. Recall on those banks is under-returning. |
+| `4` | Coverage **could not be confirmed**: no summary line, or zero banks scanned (a mistyped `--bank`/`--schema` looks exactly like this). Nothing is known to be fine. |
 | `1` | The check/repair itself failed (see output; a re-run is the retry). |
+
+`4` is deliberately not `0`. "The command ran and I learned nothing" is the
+failure mode this whole feature exists to eliminate, so it is never reported as
+a pass. And the meaningful codes avoid `2` on purpose: the underlying admin CLI
+is a typer app that exits `2` on a **usage** error, and `switchroom memory
+repair` never re-emits the child's code — a mistyped flag is `1`, never
+"coverage missing".
 
 Notes:
 
-- **Requires hindsight ≥ 0.8.5.** Against an older server the verb refuses with
-  the reason (rather than the admin CLI's bare `No such command`), and
-  `switchroom doctor` shows a red `hindsight version` line.
+- **Requires hindsight ≥ 0.8.5** (`HINDSIGHT_REPAIR_MIN_API_VERSION`). Against
+  an older server the verb refuses with the reason, rather than the admin CLI's
+  bare `No such command`. This is a *feature* floor and is checked at the point
+  of use only — it deliberately does not make `switchroom doctor` red, because
+  the doctor row tracks the MCP-contract floor (`HINDSIGHT_MIN_API_VERSION`,
+  the version the committed tools/list snapshot was captured from). A standing
+  red row for a capability you are not trying to use just teaches people to
+  ignore doctor.
 - **It will not remove the legacy global index.** `idx_memory_units_embedding`
   survives on instances that predate the per-bank scheme, and `repair-bank`
   does not drop it. Removing it is a manual `DROP INDEX CONCURRENTLY` decision.

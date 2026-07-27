@@ -39,7 +39,7 @@
  * The argv builder and the output parser are pure so they can be tested
  * without a container.
  */
-import { HINDSIGHT_MIN_API_VERSION } from "./hindsight-tools.js";
+import { HINDSIGHT_REPAIR_MIN_API_VERSION } from "./hindsight-tools.js";
 
 /** Default name of the local hindsight container. */
 export const HINDSIGHT_CONTAINER_NAME = "switchroom-hindsight";
@@ -104,14 +104,51 @@ export function buildRepairBankArgv(opts: RepairBankOptions): string[] {
 }
 
 /**
- * Exit code for `switchroom memory repair --dry-run` when coverage IS missing.
+ * ## Exit codes for `switchroom memory repair`
  *
- * Distinct from 1 (the repair itself failed) so a health script can tell
- * "needs repair" from "repair broke". A dry run that found gaps must not exit
- * 0: the only other way to know is to read the prose, and prose being the only
- * signal is how three months of degraded recall went unnoticed.
+ * These are a contract — `skills/switchroom-health/SKILL.md` branches on them,
+ * and so will any operator cron. Three rules make them trustworthy:
+ *
+ *  1. **They never overlap with the child's.** `repair-bank` is a typer app, so
+ *     it exits 2 on a USAGE error (bad flag, unknown command). An earlier
+ *     revision propagated the child's code verbatim, which meant a typo'd flag
+ *     surfaced as this module's "coverage missing" — a wrong answer, in the
+ *     direction of a false alarm. Every child failure is now translated to
+ *     {@link REPAIR_FAILED_EXIT}, and the codes that carry meaning (3, 4) are
+ *     ones typer does not use.
+ *  2. **Unverified is not success.** "The command exited 0 but I could not
+ *     confirm coverage" gets its own non-zero code
+ *     ({@link REPAIR_UNVERIFIED_EXIT}) rather than falling through to 0. A
+ *     check that cannot fail is not a check, and the failure mode this whole
+ *     feature exists for is precisely a green light over a broken thing.
+ *  3. **Only a confirmed-complete scan of at least one bank exits 0.**
  */
-export const REPAIR_COVERAGE_MISSING_EXIT = 2;
+
+/** The repair (or the attempt to run it) failed. Also the code for a child
+ *  process failure of ANY kind, including typer's usage-error 2. */
+export const REPAIR_FAILED_EXIT = 1;
+
+/**
+ * Coverage IS missing: a `--dry-run` scan completed and found indexes to
+ * create. Distinct from {@link REPAIR_FAILED_EXIT} so a health script can tell
+ * "needs repair" from "repair broke", and distinct from 2 so it can never be
+ * confused with typer's usage error.
+ */
+export const REPAIR_COVERAGE_MISSING_EXIT = 3;
+
+/**
+ * Coverage could NOT be confirmed either way — the run produced no summary
+ * line, or it scanned zero banks (a typo'd `--bank`, a `--schema` that matches
+ * nothing, a backend with a single global index). Nothing is known to be
+ * broken and nothing is known to be fine.
+ *
+ * This exists because both of those cases previously printed reassuring-ish
+ * text and exited **0**, which `skills/switchroom-health/SKILL.md` mapped to
+ * "OK: vector index coverage complete". A scan of zero banks reporting
+ * coverage complete is the same class of false green the feature was written
+ * to eliminate.
+ */
+export const REPAIR_UNVERIFIED_EXIT = 4;
 
 /** Totals from repair-bank's final `Done:` line. */
 export interface RepairSummary {
@@ -216,16 +253,127 @@ export interface RepairPreflight {
  */
 export function classifyRepairPreflight(liveVersion: string | null): RepairPreflight {
   if (liveVersion === null) return { ok: true };
-  if (compareApiVersion(liveVersion, HINDSIGHT_MIN_API_VERSION) < 0) {
+  if (compareApiVersion(liveVersion, HINDSIGHT_REPAIR_MIN_API_VERSION) < 0) {
     return {
       ok: false,
       reason:
         `hindsight ${liveVersion} has no \`repair-bank\` command — it lands in ` +
-        `${HINDSIGHT_MIN_API_VERSION} (upstream #2645). Without it there is no ` +
+        `${HINDSIGHT_REPAIR_MIN_API_VERSION} (upstream #2645). Without it there is no ` +
         `supported way to rebuild a bank's vector-index coverage. Update the ` +
         `pinned image in docker/Dockerfile.hindsight and recreate the container ` +
         `with \`switchroom memory --update\`, then re-run this command.`,
     };
   }
   return { ok: true };
+}
+
+/** What the CLI should print and exit with after a repair-bank run. */
+export interface RepairOutcome {
+  /** Process exit code. See the exit-code contract above. */
+  exit: number;
+  /** Rendering hint: `ok` prints green, `fail` prints red on stderr. */
+  level: "ok" | "fail";
+  /** One-line verdict. */
+  headline: string;
+  /** Follow-up sentence: what it means and what to do. */
+  detail: string;
+}
+
+export interface RepairRunResult {
+  /** Exit code of the `docker exec … repair-bank` child. */
+  childExit: number;
+  /** Parsed summary line, or null when repair-bank never printed one. */
+  summary: RepairSummary | null;
+  /** Whether `--dry-run` was passed. */
+  dryRun: boolean;
+}
+
+/**
+ * Pure: turn a finished repair-bank run into an exit code and honest text.
+ *
+ * Pure and exported so the decision is testable without spawning docker. The
+ * action body that used to hold this logic inline was untestable, and it was
+ * wrong in two places at once — both of them false greens, in the feature whose
+ * entire purpose is to eliminate false greens:
+ *
+ *  - a typo'd `--bank` scanned **zero** banks and printed
+ *    "✓ Coverage complete … across 0 bank(s)", exit 0;
+ *  - a missing summary line printed "coverage was NOT confirmed" and *still*
+ *    exited 0, which the health skill mapped to "OK: coverage complete".
+ *
+ * Both now exit {@link REPAIR_UNVERIFIED_EXIT}. The ordering below is
+ * significant: every "I cannot confirm" case is checked BEFORE the success
+ * path, so adding a field to {@link RepairSummary} can never accidentally
+ * re-open a green path around them.
+ */
+export function classifyRepairOutcome(run: RepairRunResult): RepairOutcome {
+  if (run.childExit !== 0) {
+    return {
+      exit: REPAIR_FAILED_EXIT,
+      level: "fail",
+      headline: `repair-bank exited ${run.childExit}.`,
+      detail:
+        run.childExit === 2
+          ? "Exit 2 from the admin CLI is a usage error — check --bank / --schema spelling. " +
+            "Nothing was repaired and coverage is unknown."
+          : "Failed indexes are dropped, so a re-run is safe and is the documented retry.",
+    };
+  }
+
+  if (run.summary === null) {
+    return {
+      exit: REPAIR_UNVERIFIED_EXIT,
+      level: "fail",
+      headline: "repair-bank exited 0 but printed no summary — coverage was NOT confirmed.",
+      detail:
+        "Read its output above. This is not a pass: a backend with a single global " +
+        "index, an aborted scan, or an output-format change upstream all look like " +
+        "this, and none of them means coverage is complete.",
+    };
+  }
+
+  if (run.summary.banksScanned === 0) {
+    return {
+      exit: REPAIR_UNVERIFIED_EXIT,
+      level: "fail",
+      headline: "repair-bank scanned 0 bank(s) — nothing was checked.",
+      detail:
+        "A scan that examined no bank proves nothing about coverage. Usual cause is a " +
+        "--bank id or --schema name that matches nothing; `switchroom memory banks` " +
+        "lists the real ids.",
+    };
+  }
+
+  if (run.summary.failed > 0) {
+    return {
+      exit: REPAIR_FAILED_EXIT,
+      level: "fail",
+      headline: `${run.summary.failed} index(es) failed to build.`,
+      detail:
+        "Those banks still under-return on recall. Failed indexes are dropped, so " +
+        "re-running is safe and is the documented retry; if it repeats, the hindsight " +
+        "container logs carry the postgres error.",
+    };
+  }
+
+  if (run.dryRun && run.summary.toCreate > 0) {
+    return {
+      exit: REPAIR_COVERAGE_MISSING_EXIT,
+      level: "fail",
+      headline: `${run.summary.toCreate} vector index(es) missing across ${run.summary.banksScanned} bank(s).`,
+      detail:
+        "Recall on those banks silently under-returns. Re-run without --dry-run to fix.",
+    };
+  }
+
+  return {
+    exit: 0,
+    level: "ok",
+    headline: "repair-bank finished.",
+    detail: run.dryRun
+      ? `Coverage complete: ${run.summary.alreadyPresent} index(es) present across ` +
+        `${run.summary.banksScanned} bank(s), nothing to create.`
+      : `${run.summary.created} created, ${run.summary.alreadyPresent} already present ` +
+        `across ${run.summary.banksScanned} bank(s). Re-run \`switchroom doctor\` to confirm.`,
+  };
 }

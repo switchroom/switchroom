@@ -706,7 +706,14 @@ export function checkHindsightContainerHealth(
  * Three outcomes:
  *  - **older than the floor → fail.** The snapshot, the shim fallback manifest
  *    and the args every callsite sends describe a surface this server may not
- *    have, and `switchroom memory repair` is unavailable.
+ *    have.
+ *
+ * The floor is the version the SNAPSHOT was captured from — not the version any
+ * individual feature wants. Feature floors (e.g.
+ * `HINDSIGHT_REPAIR_MIN_API_VERSION`) are enforced at their own point of use,
+ * so this row never goes red over a capability the operator is not trying to
+ * use. A doctor row that is red by construction on the running fleet teaches
+ * people to skip doctor.
  *  - **equal → ok.**
  *  - **newer → warn.** Not an error (upstream's MCP changes are additive), but
  *    the contract is stale by definition and the drift is silent in both
@@ -732,8 +739,9 @@ export function classifyHindsightVersionSkew(live: string | null): CheckResult |
       status: "fail",
       detail:
         `api_version ${live} is OLDER than the ${HINDSIGHT_MIN_API_VERSION} contract ` +
-        `switchroom is pinned to — tools/args the CLI and agents send may not exist ` +
-        `on this server, and \`switchroom memory repair\` (vector-index coverage) is unavailable`,
+        `switchroom captured — tools and args the CLI and agents send may not exist ` +
+        `on this server, and an unknown arg is dropped SILENTLY (isError stays false), ` +
+        `so the symptom is a wrong answer rather than an error`,
       fix:
         "Update the pinned image in `docker/Dockerfile.hindsight` and recreate " +
         "the container with `switchroom memory --update` (a plain restart does " +

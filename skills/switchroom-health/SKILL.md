@@ -86,11 +86,15 @@ switchroom memory search "test" --agent assistant 2>/dev/null && echo "OK: memor
 # indexes, so recall falls back to a global index + post-filter and silently
 # UNDER-RETURNS — a search still "works", it just returns almost nothing.
 # This fleet ran that way for ~3 months. Check coverage, not just liveness.
-# Exit 0 = coverage complete, 2 = indexes missing, 1 = the check itself failed.
+# Exit codes are a contract (src/memory/hindsight-repair.ts): 0 = coverage
+# confirmed complete, 3 = indexes MISSING, 4 = coverage could NOT be confirmed
+# (no summary line, or zero banks scanned — a typo'd --bank looks like this),
+# 1 = the check itself failed. 4 is not "fine": it means nothing was verified.
 switchroom memory repair --all --dry-run >/tmp/sr-cov.txt 2>&1
 case $? in
   0) echo "OK: vector index coverage complete" ;;
-  2) echo "FAIL: vector index coverage MISSING — recall is under-returning; run 'switchroom memory repair --all'"; tail -2 /tmp/sr-cov.txt ;;
+  3) echo "FAIL: vector index coverage MISSING — recall is under-returning; run 'switchroom memory repair --all'"; tail -2 /tmp/sr-cov.txt ;;
+  4) echo "WARN: coverage NOT verified — the scan confirmed nothing (check the --bank/--schema names, or the hindsight backend)"; tail -2 /tmp/sr-cov.txt ;;
   *) echo "WARN: coverage check could not run (hindsight < 0.8.5, container down, or docker unavailable)"; tail -2 /tmp/sr-cov.txt ;;
 esac
 ```

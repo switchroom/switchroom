@@ -31,8 +31,9 @@ import {
   classifyRepairPreflight,
   fetchHindsightApiVersion,
   parseRepairSummary,
+  classifyRepairOutcome,
   HINDSIGHT_CONTAINER_NAME,
-  REPAIR_COVERAGE_MISSING_EXIT,
+  REPAIR_FAILED_EXIT,
 } from "../memory/hindsight-repair.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
 import { spawn } from "node:child_process";
@@ -862,7 +863,7 @@ export function registerMemoryCommand(program: Command): void {
             console.error(
               chalk.red("✗ Docker is not available — `memory repair` runs the admin CLI inside the hindsight container."),
             );
-            process.exit(1);
+            process.exit(REPAIR_FAILED_EXIT);
           }
 
           // Version preflight: against a pre-0.8.5 server the admin CLI answers
@@ -873,7 +874,7 @@ export function registerMemoryCommand(program: Command): void {
           const preflight = classifyRepairPreflight(await fetchHindsightApiVersion(apiUrl));
           if (!preflight.ok) {
             console.error(chalk.red(`✗ ${preflight.reason}`));
-            process.exit(1);
+            process.exit(REPAIR_FAILED_EXIT);
           }
 
           const target = bank ? `bank ${chalk.cyan(bank)}` : chalk.cyan("all banks");
@@ -900,50 +901,27 @@ export function registerMemoryCommand(program: Command): void {
             captured += chunk.toString();
             process.stdout.write(chunk);
           });
-          const code: number = await new Promise((resolve) => {
+          const childExit: number = await new Promise((resolve) => {
             child.on("error", () => resolve(127));
             child.on("close", (c) => resolve(c ?? 1));
           });
-          if (code !== 0) {
-            console.error(
-              chalk.red(`\n✗ repair-bank exited ${code}.`),
-              chalk.gray(
-                "Failed indexes are dropped, so a re-run is safe and is the documented retry.",
-              ),
-            );
-            process.exit(code);
-          }
 
-          const summary = parseRepairSummary(captured);
-          if (summary === null) {
-            // repair-bank exited 0 without a summary — e.g. a vector backend
-            // with a single global index ("nothing to repair"). Report the
-            // ambiguity instead of claiming coverage is fine.
-            console.log(
-              chalk.yellow("\n⚠ repair-bank exited 0 but printed no summary."),
-              chalk.gray("Read its output above — coverage was NOT confirmed."),
-            );
+          // Every verdict — including "I could not tell" — comes from one pure
+          // function so it is testable and so no branch can quietly reach a
+          // green exit. The child's own code is NEVER re-emitted: repair-bank
+          // is a typer app whose usage error is exit 2, and re-emitting it
+          // would collide with this command's own coverage codes.
+          const outcome = classifyRepairOutcome({
+            childExit,
+            summary: parseRepairSummary(captured),
+            dryRun: Boolean(opts.dryRun),
+          });
+          if (outcome.level === "ok") {
+            console.log(chalk.green(`\n✓ ${outcome.headline}`), chalk.gray(outcome.detail));
             return;
           }
-          if (opts.dryRun && summary.toCreate > 0) {
-            console.error(
-              chalk.red(
-                `\n✗ ${summary.toCreate} vector index(es) missing across ${summary.banksScanned} bank(s).`,
-              ),
-              chalk.gray(
-                "Recall on those banks silently under-returns. Re-run without --dry-run to fix.",
-              ),
-            );
-            process.exit(REPAIR_COVERAGE_MISSING_EXIT);
-          }
-          console.log(
-            chalk.green("\n✓ repair-bank finished."),
-            chalk.gray(
-              opts.dryRun
-                ? `Coverage complete: ${summary.alreadyPresent} index(es) present across ${summary.banksScanned} bank(s), nothing to create.`
-                : `${summary.created} created, ${summary.alreadyPresent} already present across ${summary.banksScanned} bank(s). Re-run \`switchroom doctor\` to confirm.`,
-            ),
-          );
+          console.error(chalk.red(`\n✗ ${outcome.headline}`), chalk.gray(outcome.detail));
+          process.exit(outcome.exit);
         },
       ),
     );

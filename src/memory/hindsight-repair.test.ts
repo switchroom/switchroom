@@ -7,9 +7,15 @@ import {
   fetchHindsightApiVersion,
   HINDSIGHT_ADMIN_BIN,
   HINDSIGHT_CONTAINER_NAME,
+  classifyRepairOutcome,
   REPAIR_COVERAGE_MISSING_EXIT,
+  REPAIR_UNVERIFIED_EXIT,
+  REPAIR_FAILED_EXIT,
 } from "./hindsight-repair.js";
-import { HINDSIGHT_MIN_API_VERSION } from "./hindsight-tools.js";
+import {
+  HINDSIGHT_MIN_API_VERSION,
+  HINDSIGHT_REPAIR_MIN_API_VERSION,
+} from "./hindsight-tools.js";
 
 describe("buildRepairBankArgv", () => {
   it("targets the named container and the admin CLI's real in-image path", () => {
@@ -152,11 +158,24 @@ describe("compareApiVersion", () => {
 });
 
 describe("classifyRepairPreflight", () => {
+  /**
+   * The feature floor must NOT be the MCP-contract floor. Fusing them is what
+   * made `switchroom doctor` red-by-construction on the running fleet: the
+   * contract was captured from 0.8.4 but the constant claimed 0.8.5 because
+   * repair-bank needs it. If someone re-fuses them, this reds.
+   */
+  it("uses the repair FEATURE floor, which is above the MCP contract floor", () => {
+    expect(compareApiVersion(HINDSIGHT_REPAIR_MIN_API_VERSION, HINDSIGHT_MIN_API_VERSION))
+      .toBeGreaterThan(0);
+    // The contract floor alone must not admit a server that lacks repair-bank.
+    expect(classifyRepairPreflight(HINDSIGHT_MIN_API_VERSION).ok).toBe(false);
+  });
+
   it("blocks a confirmed pre-0.8.5 server and names the real cause, not a typo", () => {
     const r = classifyRepairPreflight("0.8.4");
     expect(r.ok).toBe(false);
     expect(r.reason).toContain("0.8.4");
-    expect(r.reason).toContain(HINDSIGHT_MIN_API_VERSION);
+    expect(r.reason).toContain(HINDSIGHT_REPAIR_MIN_API_VERSION);
     expect(r.reason).toMatch(/repair-bank/);
   });
 
@@ -197,5 +216,121 @@ describe("fetchHindsightApiVersion", () => {
       throw new Error("ECONNREFUSED");
     }) as unknown as typeof fetch;
     expect(await fetchHindsightApiVersion("http://h/mcp/", { fetchImpl: boom })).toBeNull();
+  });
+});
+
+/**
+ * The verdict logic. Every case here was previously inline in the `memory
+ * repair` action body — untestable, and wrong in two places at once, both of
+ * them FALSE GREENS in the feature written to eliminate false greens.
+ */
+describe("classifyRepairOutcome", () => {
+  const summary = (over: Partial<{
+    schemas: number;
+    banksScanned: number;
+    alreadyPresent: number;
+    created: number;
+    toCreate: number;
+    failed: number;
+  }> = {}) => ({
+    schemas: 1,
+    banksScanned: 14,
+    alreadyPresent: 40,
+    created: 0,
+    toCreate: 0,
+    failed: 0,
+    ...over,
+  });
+
+  it("exits 0 only for a completed scan of at least one bank with nothing outstanding", () => {
+    const o = classifyRepairOutcome({ childExit: 0, summary: summary(), dryRun: true });
+    expect(o.exit).toBe(0);
+    expect(o.level).toBe("ok");
+  });
+
+  /**
+   * REGRESSION (false green #1): a typo'd `--bank` makes repair-bank scan
+   * nothing and print `Done: 1 schema(s), 0 bank(s) scanned, ...`. That used to
+   * render "✓ Coverage complete ... across 0 bank(s)" and exit 0, which the
+   * health skill reported as "OK: vector index coverage complete".
+   */
+  it("does NOT report coverage complete when zero banks were scanned", () => {
+    const o = classifyRepairOutcome({
+      childExit: 0,
+      summary: summary({ banksScanned: 0, alreadyPresent: 0 }),
+      dryRun: true,
+    });
+    expect(o.exit).toBe(REPAIR_UNVERIFIED_EXIT);
+    expect(o.exit).not.toBe(0);
+    expect(o.level).toBe("fail");
+    expect(o.headline).toMatch(/0 bank/);
+    expect(o.headline).not.toMatch(/complete/i);
+  });
+
+  /**
+   * REGRESSION (false green #2): no summary line printed "coverage was NOT
+   * confirmed" and then returned WITHOUT a non-zero exit, so the honest prose
+   * was invisible to every machine consumer.
+   */
+  it("exits non-zero when repair-bank printed no summary — unverified is not success", () => {
+    const o = classifyRepairOutcome({ childExit: 0, summary: null, dryRun: true });
+    expect(o.exit).toBe(REPAIR_UNVERIFIED_EXIT);
+    expect(o.exit).not.toBe(0);
+    expect(o.headline).toMatch(/NOT confirmed/);
+  });
+
+  it("reports missing coverage on a dry run with its own code", () => {
+    const o = classifyRepairOutcome({
+      childExit: 0,
+      summary: summary({ toCreate: 6 }),
+      dryRun: true,
+    });
+    expect(o.exit).toBe(REPAIR_COVERAGE_MISSING_EXIT);
+    expect(o.headline).toContain("6 vector index(es) missing");
+  });
+
+  it("does not treat a completed real repair as missing coverage", () => {
+    // Outside --dry-run, toCreate is not a gap: the indexes were built.
+    const o = classifyRepairOutcome({
+      childExit: 0,
+      summary: summary({ created: 6, toCreate: 0 }),
+      dryRun: false,
+    });
+    expect(o.exit).toBe(0);
+    expect(o.detail).toContain("6 created");
+  });
+
+  it("fails when indexes failed to build even though repair-bank exited 0", () => {
+    const o = classifyRepairOutcome({
+      childExit: 0,
+      summary: summary({ failed: 2 }),
+      dryRun: false,
+    });
+    expect(o.exit).toBe(REPAIR_FAILED_EXIT);
+    expect(o.headline).toContain("2 index(es) failed");
+  });
+
+  /**
+   * The exit-code collision. repair-bank is a typer app: exit 2 is a USAGE
+   * error. Propagating the child's code verbatim made a mistyped flag surface
+   * as this command's "coverage missing" signal.
+   */
+  it("never re-emits the child's exit code, so typer's usage-error 2 cannot read as 'coverage missing'", () => {
+    const o = classifyRepairOutcome({ childExit: 2, summary: null, dryRun: true });
+    expect(o.exit).toBe(REPAIR_FAILED_EXIT);
+    expect(o.exit).not.toBe(REPAIR_COVERAGE_MISSING_EXIT);
+    expect(o.detail).toMatch(/usage error/i);
+  });
+
+  it("keeps the meaningful codes off typer's reserved 2", () => {
+    expect(REPAIR_COVERAGE_MISSING_EXIT).not.toBe(2);
+    expect(REPAIR_UNVERIFIED_EXIT).not.toBe(2);
+    expect(new Set([0, REPAIR_FAILED_EXIT, REPAIR_COVERAGE_MISSING_EXIT, REPAIR_UNVERIFIED_EXIT]).size)
+      .toBe(4);
+  });
+
+  it("translates a spawn failure (127) into the failure code, not a coverage verdict", () => {
+    const o = classifyRepairOutcome({ childExit: 127, summary: null, dryRun: false });
+    expect(o.exit).toBe(REPAIR_FAILED_EXIT);
   });
 });
