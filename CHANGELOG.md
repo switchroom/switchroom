@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### The lexical-overlap recall gate is removed
+
+Auto-recall ran a `recallMinOverlap` gate between the engine's reranker and the
+`recallMaxMemories` head-slice: any candidate whose containment overlap
+`|Q ∩ M| / |M|` with the prompt fell under 0.10 was discarded. It is now gone
+outright, with **no replacement score floor**.
+
+The case against it is measured, not theoretical. On healthy production rows
+only — non-timeout, non-error, `ts >= 2026-07-20`, n=212 across the fleet — the
+gate discarded **6026 of 7549 post-reranker candidates (79.8%)**; 94.4% for
+overlord, 91.0% for klanker, 90.9% for carrie, 80.1% for marko. Replaying 330
+real logged queries against the live engine, it dropped **the engine's own
+top-ranked candidate on 31.2% of queries**. It was not behaving as a floor; it
+was behaving as a rival, worse ranker sitting downstream of a cross-encoder.
+
+And it bought nothing for that. Over the same replays the rate at which the
+best injected memory scored below 1e-3 was 27.0% *with* the gate and 28.2% with
+no gate at all — inside sampling noise. It cost roughly a third of top hits and
+filtered no measurable noise.
+
+The root cause is the tokenizer: `_overlap_tokens` keeps only alphabetic tokens
+of length > 1, so digits, identifiers, version numbers, PR numbers, file paths
+and short symbols are invisible to it. A memory whose only relationship to the
+prompt is `#3541` scores exactly 0.0. For a fleet that talks in identifiers
+that is close to worst case.
+
+**No floor replaced it, deliberately.** `scores.final` is not calibrated across
+queries — the engine's own documentation states a clearly-relevant match may
+score ~0.001 while ranked first, and freed slots are not backfilled. Measured
+over the same 330 replays, every candidate floor value had `top1lost%` exactly
+equal to `zero%`: a floor never trims a bad tail, it only empties the whole
+result set. A floor at 0.001 would take zero-result recalls from 5.8% to 28.2%;
+at 0.05, to 40.6%. That re-creates the #3541 empty-recall bug it was meant to
+prevent, so `min_scores` is left unset.
+
+Precision now rests where the evidence says it belongs: the engine's rerank
+ordering, the `scores.final` merge sort, and the `recallMaxMemories` head-slice.
+
+Removed: `recall.py`'s `containment_overlap` and `_filter_by_overlap`; the
+`recallMinOverlap` default and `HINDSIGHT_RECALL_MIN_OVERLAP` env override;
+`memory.recall.min_overlap` in `switchroom.yaml`; the `settings.json` pin of
+0.10; and the `overlap_dropped` field on `recall_log.jsonl` rows, which now
+measures a filter that does not exist and would read as permanent success on
+every dashboard. `_overlap_tokens` and `_OVERLAP_STOPWORDS` stay — the
+transcript fallback still uses them for its keyword match.
+
+A leftover `recallMinOverlap` key in an operator's `settings.json` is inert; a
+test pins that, since a removed knob coming back through stale config is the
+obvious regression.
+
 ### `switchroom doctor` detects banks with no per-bank vector index
 
 Hindsight creates one PARTIAL vector index per (bank, fact_type) — and creates
