@@ -16,12 +16,16 @@
  *     collapse; the latest snapshot lands floor-paced
  *   - the floor is per-message (stream A does not delay stream B)
  *   - the gate's no-op skip drops a repeat payload for the same message
- *   - an open flood window sheds draft edits with ZERO API calls, and the
- *     stream recovers with full state after the window closes
- *   - a shed draft is NOT recorded as delivered — a later flush of the
- *     SAME text (the completed answer) still lands
+ *   - an open flood window COALESCES draft edits with ZERO API calls, and the
+ *     newest state lands once the window closes (#3716 — cosmetic edits are
+ *     never shed; the last edit of a burst is the one still on screen, so
+ *     dropping it stranded the message on a stale body)
+ *   - a draft held through a window still renders the completed answer — a
+ *     later flush of the SAME text is then a benign no-op, not a loss
  *   - the finalize flush is `critical`: never shed; waits out a short
  *     window; fails fast (structured, logged) on a long one
+ *   - shed-honesty (F2+F3) remains wired for any `SEND_GATE_SHED` the retry
+ *     policy does return, pinned directly rather than through the gate
  *   - regression pin: the controller passes messageId / editPayload /
  *     priorityClass through the retry policy on every edit
  *
@@ -32,7 +36,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createStreamController, type RetryPolicy } from '../stream-controller.js'
-import { createSendGate, type Clock, type SendGateConfig } from '../send-gate.js'
+import { createSendGate, SEND_GATE_SHED, type Clock, type SendGateConfig } from '../send-gate.js'
 import { isFloodWaitActiveError } from '../retry-api-call.js'
 import { renderOutboundChunks } from '../render/rich-render.js'
 import { createMockBot, installBotResetHook } from './bot-api.harness.js'
@@ -221,7 +225,7 @@ describe('stream-controller × send gate (#3110)', () => {
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
   })
 
-  it('open flood window: draft edits shed with ZERO API calls; full state lands after it closes', async () => {
+  it('open flood window: draft edits COALESCE with ZERO API calls; newest state lands after it closes (#3716)', async () => {
     const { clock, gate, retry } = makeGatedRetry({ editFloorMs: 1500 })
     const stream = createStreamController({
       bot, chatId: '1', throttleMs: 250, retry, initialMessageId: 7777,
@@ -233,17 +237,24 @@ describe('stream-controller × send gate (#3110)', () => {
     await flush()
     void stream.update('draft b')
     await tick()
-    // Both drafts shed as cosmetic — nothing reached the API.
+    // Flood safety is unchanged — still ZERO API calls while the window is
+    // open. What changed is the mechanism: the drafts are HELD (last-write-
+    // wins), not discarded, so no state is lost.
     expect(bot.api.editMessageText).not.toHaveBeenCalled()
-    expect(gate.stats().global.shed).toBe(2)
+    expect(gate.stats().global.shed).toBe(0)
 
-    await clock.advance(30_000) // window closes
+    await clock.advance(30_000) // window closes → the held draft lands
     void stream.update('draft c — full state')
     await tick()
-    expect(editBodies()).toEqual(['draft c — full state'])
+    await clock.advance(1_500) // clear the per-message edit floor
+
+    // The guarantee is the newest state reaches the screen, never that some
+    // intermediate was dropped to get there.
+    expect(editBodies().at(-1)).toBe('draft c — full state')
+    expect(gate.stats().global.shed).toBe(0)
   })
 
-  it('a shed draft is NOT recorded as delivered: a later finalize of the SAME text still lands', async () => {
+  it('a draft held through a window still renders: the completed answer reaches the screen exactly once', async () => {
     const { clock, gate, retry } = makeGatedRetry({ editFloorMs: 1500 })
     const stream = createStreamController({
       bot, chatId: '1', throttleMs: 250, retry, initialMessageId: 7777,
@@ -253,12 +264,16 @@ describe('stream-controller × send gate (#3110)', () => {
     void stream.update('the completed answer')
     await flush()
     expect(bot.api.editMessageText).not.toHaveBeenCalled()
-    expect(gate.stats().global.shed).toBe(1)
+    expect(gate.stats().global.shed).toBe(0)
 
-    await clock.advance(30_000)
-    // stream_reply done=true with the same text → finalize(text). If the shed
-    // draft had been recorded as on-screen, draft-stream's dedupe would skip
-    // this flush and the completed answer would never render.
+    await clock.advance(30_000) // window closes → the held draft lands
+
+    // stream_reply done=true with the same text → finalize(text). Pre-#3716
+    // the draft was SHED here, and the guarantee was that the stream must not
+    // record it as on-screen so this flush could re-deliver it. Now the draft
+    // is never dropped, so it renders on its own and the identical finalize is
+    // a benign no-op. Either way the user sees the completed answer — and now
+    // it costs one API call instead of two.
     await stream.finalize('the completed answer')
     expect(editBodies()).toEqual(['the completed answer'])
   })
@@ -277,7 +292,7 @@ describe('stream-controller × send gate (#3110)', () => {
     gate.openFloodWindow('global', clock.now() + 30_000) // short: <= 60s fail-fast ceiling
     void stream.update('draft while banned')
     await flush()
-    expect(bot.api.editMessageText).not.toHaveBeenCalled() // draft shed
+    expect(bot.api.editMessageText).not.toHaveBeenCalled() // draft held, not sent
 
     const fin = stream.finalize('the answer')
     await flush()
@@ -286,9 +301,12 @@ describe('stream-controller × send gate (#3110)', () => {
 
     await clock.advance(30_000)
     await fin
+    // The critical finalize coalesced ONTO the held draft and upgraded its
+    // class, so the whole burst resolves as a single send carrying the final
+    // body — the draft is superseded rather than dropped.
     expect(editBodies()).toEqual(['the answer'])
     expect(editTimes).toEqual([30_000])
-    expect(gate.stats().global.shed).toBe(1) // only the draft
+    expect(gate.stats().global.shed).toBe(0) // nothing is shed any more
   })
 
   it('finalize under a LONG window fails fast (structured FLOOD_WAIT_ACTIVE, logged) — no API call, no hang', async () => {
@@ -314,6 +332,40 @@ describe('stream-controller × send gate (#3110)', () => {
     } catch (err) {
       expect(isFloodWaitActiveError(err)).toBe(true)
     }
+  })
+
+  /**
+   * REGRESSION PIN for the trap #3716 opened. Once cosmetic edits stopped
+   * shedding they began OCCUPYING the driver, and draft-stream serializes its
+   * own flushes — so a draft parked behind a 6h ban held the finalize upstream
+   * of the gate, where the fail-fast path could never see it. `failedFast` went
+   * to 0 and the reply path wedged for the length of the ban: the exact failure
+   * the gate was built to eliminate, reintroduced by the fix for a different
+   * one. The preceding test does NOT catch this — it finalizes with no draft in
+   * flight.
+   */
+  it('a draft parked behind a LONG window never wedges the finalize behind it (#3716)', async () => {
+    const { clock, gate, retry } = makeGatedRetry({ editFloorMs: 1500 })
+    const logs: string[] = []
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 250, retry, initialMessageId: 7777,
+      log: (m) => logs.push(m),
+    })
+
+    gate.openFloodWindow('global', clock.now() + 21_397_000) // the 2026-07-12 ban: ~5.9h
+    void stream.update('draft while banned')
+    await flush()
+    expect(gate.stats().global.shed).toBe(0) // held, not dropped
+
+    // The cosmetic draft settles its caller as soon as it is queued, so the
+    // finalize reaches the gate. If it did not, this await never returns.
+    const fin = stream.finalize('the answer')
+    await tick()
+    await fin
+
+    expect(gate.stats().global.failedFast).toBe(1)
+    expect(bot.api.editMessageText).not.toHaveBeenCalled()
+    expect(logs.some((m) => m.includes('FLOOD_WAIT_ACTIVE'))).toBe(true)
   })
 
   it('REGRESSION PIN: every edit passes messageId / editPayload / priorityClass to the retry policy', async () => {
@@ -474,7 +526,7 @@ describe('stream-controller × send gate (#3110)', () => {
     expect(bot.api.editMessageText.mock.calls.length).toBe(editCalls)
   })
 
-  it('a shed TAIL is not recorded as delivered: argument-less finalize() re-flushes and lands it (F2+F3)', async () => {
+  it('a TAIL suppressed by a msg-scoped window is HELD, not lost: the completed answer lands when it closes', async () => {
     const { clock, gate, retry } = makeGatedRetry({
       editFloorMs: 1500,
       globalPerSec: 1000, globalBurst: 100, perChatPerSec: 1000, perChatBurst: 100,
@@ -495,27 +547,81 @@ describe('stream-controller × send gate (#3110)', () => {
     const lastTailId = anchorId + pieceCount - 1
 
     // Flood window scoped to the LAST tail message only (H1 msg-edit scope):
-    // its edit sheds; the anchor and other pieces are unaffected.
+    // its edit is suppressed; the anchor and other pieces are unaffected.
     gate.openFloodWindow(`msg-edit:1:${lastTailId}`, clock.now() + 30_000)
 
     void stream.update(b2)
     await tick()
-    // The changed piece is the suppressed tail → shed, zero edits landed on
-    // it; the flush is reported shed and the snapshot preserved (F2), NOT
-    // recorded as delivered (F3).
+    // The changed piece is the suppressed tail → zero edits land on it while
+    // the window is open. Pre-#3716 it was SHED and the completed answer only
+    // survived because the stream refused to record it as delivered; now the
+    // edit is held by the gate, so the content is safe by construction.
     const tailEdits = () =>
       bot.api.editMessageText.mock.calls.filter(([, id]) => id === lastTailId)
     expect(tailEdits()).toHaveLength(0)
-    expect(gate.stats().global.shed).toBe(1)
-    expect(logs.some((m) => m.includes('shed by send gate'))).toBe(true)
+    expect(gate.stats().global.shed).toBe(0)
+    expect(logs.some((m) => m.includes('shed by send gate'))).toBe(false)
 
-    // Window closes; the gateway-style ARGUMENT-LESS finalize (the
-    // disconnect-flush / turn-end cleanup path) must re-deliver the shed
-    // snapshot — pre-F2 the content was silently lost here.
+    // Window closes → the held tail edit lands on its own. The gateway-style
+    // ARGUMENT-LESS finalize (disconnect-flush / turn-end cleanup) is then a
+    // no-op rather than a rescue.
     await clock.advance(31_000)
     await stream.finalize()
     expect(tailEdits()).toHaveLength(1)
     const [, , tailBody] = tailEdits()[0]
+    expect(String(tailBody)).toContain('tail v2')
+  })
+
+  /**
+   * #3716 removed the gate's cosmetic-EDIT shed, so no edit the stream makes
+   * can return `SEND_GATE_SHED` any more. The sentinel is still the contract
+   * for non-edit cosmetic sends, and the controller's F2/F3 shed-honesty
+   * handling is the guard if any edit path is ever re-tagged — so pin it
+   * directly against the retry seam instead of through the gate, where it
+   * would silently rot into an assertion about behaviour that cannot occur.
+   */
+  it('F2+F3 shed-honesty is still wired: a SHED tail is not recorded as delivered and re-flushes', async () => {
+    const base = ('a_b_c_d_e ').repeat(3000)
+    const b1 = `${base}tail v1`
+    const b2 = `${base}tail v2 — the completed answer`
+    const pieceCount = renderOutboundChunks(b1).length
+    expect(pieceCount).toBeGreaterThan(1)
+
+    // Shed exactly one message id, chosen after the first flush assigns ids.
+    let shedId: number | null = null
+    const retry: RetryPolicy = async (fn, opts) => {
+      if (shedId != null && opts?.messageId === shedId) {
+        return SEND_GATE_SHED as never
+      }
+      return await fn()
+    }
+
+    const logs: string[] = []
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 250, retry, log: (m) => logs.push(m),
+    })
+    void stream.update(b1)
+    await flush()
+    const anchorId = stream.getMessageId() as number
+    shedId = anchorId + pieceCount - 1
+
+    const tailEdits = () =>
+      bot.api.editMessageText.mock.calls.filter(([, id]) => id === shedId)
+
+    void stream.update(b2)
+    await tick()
+    expect(tailEdits()).toHaveLength(0)
+    expect(logs.some((m) => m.includes('shed by send gate'))).toBe(true)
+
+    // The shed piece must NOT have been recorded as on screen: an
+    // argument-less finalize re-delivers the preserved snapshot.
+    shedId = null
+    await stream.finalize()
+    const landed = bot.api.editMessageText.mock.calls.filter(
+      ([, id]) => id === anchorId + pieceCount - 1,
+    )
+    expect(landed).toHaveLength(1)
+    const [, , tailBody] = landed[0]
     expect(String(tailBody)).toContain('tail v2')
   })
 })

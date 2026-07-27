@@ -239,10 +239,10 @@ describe('activity card ↔ send gate (#3620)', () => {
     }
   })
 
-  it('a shed card edit is not treated as painted — the newest render survives for the next drain', async () => {
+  it('a card edit starved of tokens is HELD, not shed — the newest render still lands (#3716)', async () => {
     // A one-token-per-minute chat bucket: the card open consumes it, so the
-    // next COSMETIC card edit sheds.
-    const { lane, calls, clock } = makeGatedLane({ perChatPerSec: 1 / 60, perChatBurst: 1 })
+    // next COSMETIC card edit cannot be admitted.
+    const { lane, calls, clock, gate } = makeGatedLane({ perChatPerSec: 1 / 60, perChatBurst: 1 })
     const turn = makeLaneTurn(lane)
 
     lane.showNarrativeStep(turn, 'Opening the card')
@@ -250,17 +250,17 @@ describe('activity card ↔ send gate (#3620)', () => {
     await turn.activityInFlight
     expect(calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(1)
 
-    lane.showNarrativeStep(turn, 'A shed update')
+    lane.showNarrativeStep(turn, 'An update with no token available')
     await clock.advance(10)
     await turn.activityInFlight
-    // Shed → nothing hit the API, and the render is still PENDING (not
-    // mis-recorded as sent), so it is not silently lost.
+    // Nothing hits the API while the bucket is empty — unchanged. What changed
+    // is that the edit is now QUEUED rather than discarded, so the card can no
+    // longer be stranded on a stale body by a burst that ends under pressure.
     expect(calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
-    expect(turn.activityPendingRender).not.toBeNull()
-    expect(turn.activityPendingRender).not.toBe(turn.activityLastSentRender)
+    expect(gate.stats().global.shed).toBe(0)
 
     // Once the bucket refills, the next drain paints the NEWEST body — not the
-    // shed intermediate one.
+    // superseded intermediate one.
     lane.showNarrativeStep(turn, 'The newest update')
     await clock.advance(120_000)
     await turn.activityInFlight

@@ -478,6 +478,16 @@ interface MessageEditState {
    * edit budget. Bounded by the budget cap; empty when the backstop is disabled.
    */
   editWindowTs: number[]
+  /**
+   * Set by the driver while it waits out a NON-critical admission, and fired by
+   * `handleEdit` when a `critical` edit is queued for this message meanwhile
+   * (#3716). Since cosmetic edits stopped shedding they now occupy the driver,
+   * so without this a critical edit arriving one tick after the driver dequeued
+   * a cosmetic one would inherit its unbounded wait — re-introducing the
+   * multi-hour reply wedge the critical fail-fast path exists to prevent.
+   * Null whenever no interruptible wait is in flight.
+   */
+  criticalWake: (() => void) | null
 }
 
 function hashPayload(payload: unknown): string {
@@ -669,6 +679,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
         running: false,
         suppressedUntilMs: 0,
         editWindowTs: [],
+        criticalWake: null,
       }
       perMessage.set(key, state)
     }
@@ -826,9 +837,17 @@ export function createSendGate(config: SendGateConfig): SendGate {
    * without consuming if admission cannot happen before it — the caller drops
    * the call as stale (part3-design §2).
    */
-  async function admitLoop(buckets: TokenBucket[], deadline?: number): Promise<boolean> {
+  async function admitLoop(
+    buckets: TokenBucket[],
+    deadline?: number,
+    interrupt?: Interrupt,
+  ): Promise<boolean> {
     let counted = false
     for (;;) {
+      // Checked BEFORE the consume below so an interrupted admission never
+      // spends a token nobody uses (a leaked token would permanently shrink the
+      // bucket's effective rate).
+      if (interrupt?.fired) return false
       const now = clock.now()
       let wait = 0
       for (const b of buckets) wait = Math.max(wait, b.msUntilAvailable(now))
@@ -841,13 +860,17 @@ export function createSendGate(config: SendGateConfig): SendGate {
         counters.queued++
         counted = true
       }
-      await clock.sleep(deadline !== undefined ? Math.min(wait, deadline - now) : wait)
+      const nap = clock.sleep(deadline !== undefined ? Math.min(wait, deadline - now) : wait)
+      // An open flood window makes `wait` as long as the whole ban, so the nap
+      // must be raced rather than awaited outright — otherwise the interrupt is
+      // not observed until the ban has already elapsed.
+      await (interrupt ? Promise.race([nap, interrupt.promise]) : nap)
     }
   }
 
   /** Back-compat unbounded admission (used by the per-message edit driver). */
-  function admit(buckets: TokenBucket[]): Promise<boolean> {
-    return admitLoop(buckets)
+  function admit(buckets: TokenBucket[], interrupt?: Interrupt): Promise<boolean> {
+    return admitLoop(buckets, undefined, interrupt)
   }
 
   // Serializes `critical` sends that must probe the API during an open (short)
@@ -868,6 +891,36 @@ export function createSendGate(config: SendGateConfig): SendGate {
         release()
       }
     })()
+  }
+
+  /**
+   * One-shot abort handle for an in-flight admission wait (#3716). `fired` is
+   * the synchronous check (so the loop can bail before consuming a token) and
+   * `promise` is the async wake (so a nap covering a whole flood ban is cut
+   * short rather than run to completion).
+   */
+  interface Interrupt {
+    fired: boolean
+    promise: Promise<void>
+  }
+
+  /** Create an `Interrupt` plus the trigger that fires it exactly once. */
+  function makeInterrupt(): { interrupt: Interrupt; fire: () => void } {
+    let resolve!: () => void
+    const interrupt: Interrupt = {
+      fired: false,
+      promise: new Promise<void>((r) => {
+        resolve = r
+      }),
+    }
+    return {
+      interrupt,
+      fire: () => {
+        if (interrupt.fired) return
+        interrupt.fired = true
+        resolve()
+      },
+    }
   }
 
   type AdmitOutcome =
@@ -1038,7 +1091,24 @@ export function createSendGate(config: SendGateConfig): SendGate {
           }
           // outcome.result === 'ok' → admitPriority already consumed the buckets.
         } else {
-          await admit(bucketsFor(opts))
+          // #3716: this wait is UNBOUNDED, and since cosmetic edits stopped
+          // shedding it is now reachable for them too — so a `critical` edit
+          // arriving while we sit here must be able to jump the queue instead
+          // of inheriting a whole flood ban's worth of waiting. Yield to it and
+          // re-loop; `p` is superseded rather than dropped, so no state is lost
+          // and its callers ride the send that actually goes out.
+          const { interrupt, fire } = makeInterrupt()
+          state.criticalWake = fire
+          let admitted: boolean
+          try {
+            admitted = await admit(bucketsFor(opts), interrupt)
+          } finally {
+            state.criticalWake = null
+          }
+          if (!admitted) {
+            supersede(state, p)
+            continue
+          }
         }
         // Reserve the send-start time BEFORE awaiting the network so the floor
         // is measured from send start (matches the per-message serialization).
@@ -1084,6 +1154,70 @@ export function createSendGate(config: SendGateConfig): SendGate {
     }
   }
 
+  /**
+   * Hand a dequeued-but-unsent edit back to the queue after the driver yielded
+   * to a higher-priority one (#3716). `p` is by definition OLDER than whatever
+   * is queued now, so last-write-wins says its payload loses — but its callers
+   * must still settle, so they ride the newer edit's result exactly as if they
+   * had coalesced onto it in the first place. With nothing queued (the wake
+   * raced an empty slot) `p` simply goes back.
+   */
+  function supersede(state: MessageEditState, p: PendingEdit): void {
+    const next = state.pending
+    if (!next) {
+      state.pending = p
+      return
+    }
+    next.priorityClass = maxPriority(next.priorityClass, p.priorityClass)
+    next.promise.then(p.resolve, p.reject)
+  }
+
+  /**
+   * The condition that used to trigger the cosmetic-edit shed: no token in some
+   * bucket, or a window covering this message. Kept as the trigger — what
+   * changed in #3716 is the CONSEQUENCE (see `settleForCaller`).
+   */
+  function editUnderPressure(state: MessageEditState, opts: SendGateOpts, now: number): boolean {
+    if (state.suppressedUntilMs > now) return true
+    for (const b of bucketsFor(opts)) {
+      if (b.msUntilAvailable(now) > 0) return true
+    }
+    return false
+  }
+
+  /**
+   * What a queued edit returns to the caller that submitted it (#3716).
+   *
+   * Normally: the shared pending promise, settling with the coalesced send's
+   * outcome. Callers rely on that to pace their own painting, so this is the
+   * path whenever the gate is keeping up.
+   *
+   * Under pressure, a `cosmetic` edit instead settles its caller as soon as it
+   * is QUEUED. Callers serialize their own flushes, so a best-effort paint
+   * parked behind a flood ban would hold a subsequent critical edit hostage
+   * UPSTREAM of the gate — where the fail-fast path can never see it — wedging
+   * the reply path for the length of the ban. Releasing the caller keeps that
+   * path free while the edit itself stays queued and still lands carrying the
+   * newest payload. This is the same trigger the old shed used; the difference
+   * is that the state survives instead of being discarded.
+   */
+  function settleForCaller<T>(
+    state: MessageEditState,
+    pending: PendingEdit,
+    opts: SendGateOpts,
+    priority: PriorityClass,
+    now: number,
+  ): Promise<T> {
+    if (priority !== 'cosmetic' || !editUnderPressure(state, opts, now)) {
+      return pending.promise as Promise<T>
+    }
+    // Nobody may be left awaiting the shared promise, so absorb a rejection here
+    // to keep a failed background paint from surfacing as an unhandled rejection.
+    // (A later `critical`/`useful` coalesce still attaches its own handlers.)
+    void pending.promise.catch(() => {})
+    return Promise.resolve(undefined as unknown as T)
+  }
+
   function handleEdit<T>(fn: () => Promise<T>, opts: SendGateOpts): Promise<T> {
     const messageId = opts.messageId as number
     const key = messageKey(opts.chat_id, messageId)
@@ -1093,22 +1227,39 @@ export function createSendGate(config: SendGateConfig): SendGate {
     maybeEvict(now, existing === undefined)
     const state = existing ?? messageState(key)
 
-    // Cosmetic edits (part3-design §2) shed under pressure — a flood window
-    // covering the scope is open, or a bucket has no token free right now. A
-    // dropped edit costs nothing: the next edit carries the full state. Only an
-    // EXPLICITLY-cosmetic edit sheds; untagged edits keep PR 1's coalescing
-    // behaviour (default = useful), so this never changes an untagged caller.
-    if ((opts.priorityClass ?? 'useful') === 'cosmetic') {
-      let wait = 0
-      for (const b of bucketsFor(opts)) wait = Math.max(wait, b.msUntilAvailable(now))
-      const msgWait = state.suppressedUntilMs > now ? state.suppressedUntilMs - now : 0
-      if (wait > 0 || msgWait > 0) {
-        counters.shed++
-        // Distinguishable from the no-op drop below (undefined): a shed did
-        // NOT land, and edit-driving callers must be able to tell (F1).
-        return Promise.resolve(SEND_GATE_SHED as unknown as T)
-      }
-    }
+    // Cosmetic edits COALESCE under pressure; they are never shed (#3716).
+    //
+    // This previously dropped a cosmetic edit outright whenever a bucket had no
+    // free token or a flood window covered the scope, on the reasoning that "a
+    // dropped edit costs nothing: the next edit carries the full state". That
+    // holds for every edit in a burst EXCEPT the last one — and the last one is
+    // the only edit whose state is still on screen when the burst ends. Dropping
+    // it strands the card on a stale body indefinitely (a progress card frozen
+    // mid-run, a finished task still rendered as running). Pressure is exactly
+    // when bursts end, so the drop was biased toward stranding precisely the
+    // edits that mattered.
+    //
+    // Falling through to the last-write-wins coalescing below loses nothing and
+    // costs no extra flood budget: N queued edits collapse into ONE send that
+    // carries the newest payload, and the driver already paces that send against
+    // the token buckets, the per-message edit floor, and the rolling per-window
+    // cosmetic budget — which DEFERS an over-budget edit rather than dropping it.
+    // Flood safety comes from that pacing, never from discarding state.
+    //
+    // Cost of the change: under a long flood window a cosmetic edit now waits in
+    // the driver instead of resolving immediately as SEND_GATE_SHED. The pending
+    // slot is one-per-message and LRU-bounded by `maxMessageStates`, and the edit
+    // that eventually lands carries the newest state rather than a stale one.
+    // `SEND_GATE_SHED` remains the contract for NON-edit cosmetic sends (typing,
+    // reactions), which carry no state worth preserving.
+    //
+    // What that cost must NOT become is a wait the CALLER inherits. Callers
+    // serialize their own flushes (draft-stream awaits the in-flight paint before
+    // starting the next), so a cosmetic edit that blocked its caller for a whole
+    // flood ban would hold the critical finalize behind it — and the finalize
+    // would never reach the gate to fail fast, wedging the reply path for hours.
+    // That is precisely the failure the gate exists to prevent, so a cosmetic
+    // edit settles its caller as soon as it is QUEUED (see `settleForCaller`).
 
     // N1: the coalesce (last-write-wins) check runs BEFORE the no-op skip. When
     // a distinct edit is already queued, the newest payload always replaces it —
@@ -1135,7 +1286,10 @@ export function createSendGate(config: SendGateConfig): SendGate {
         state.pending.hash = hash
         state.pending.fn = fn as () => Promise<unknown>
       }
-      return state.pending.promise as Promise<T>
+      // The queued edit is critical now — cut short any non-critical admission
+      // the driver is waiting out for this message (#3716).
+      if (state.pending.priorityClass === 'critical') state.criticalWake?.()
+      return settleForCaller<T>(state, state.pending, opts, opts.priorityClass ?? 'useful', now)
     }
 
     // No edit queued → a repeat of the last payload we actually sent is a plain
@@ -1164,8 +1318,15 @@ export function createSendGate(config: SendGateConfig): SendGate {
       priorityClass: opts.priorityClass ?? 'useful',
     }
     state.pending = pending
-    if (!state.running) void drive(state, opts)
-    return promise as Promise<T>
+    if (state.running) {
+      // A driver is mid-flight. If it is waiting out a non-critical admission
+      // and THIS edit is critical, wake it so the critical work does not queue
+      // behind a cosmetic edit's unbounded wait (#3716).
+      if (pending.priorityClass === 'critical') state.criticalWake?.()
+    } else {
+      void drive(state, opts)
+    }
+    return settleForCaller<T>(state, pending, opts, pending.priorityClass, now)
   }
 
   async function gate<T>(fn: () => Promise<T>, opts?: SendGateOpts): Promise<T> {
