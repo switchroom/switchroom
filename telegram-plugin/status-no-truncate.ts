@@ -83,6 +83,16 @@ export const NESTED_PREFIX = '   ↳ '
  * (2+ worker) card — three U+2800 BRAILLE PATTERN BLANK, written as escapes so
  * the bytes are visible in source.
  *
+ * This is now the ONLY indent any card carries (#3842). #3820/#3821 also
+ * indented the whole worker card by one level and prefixed line 1 with `└─ `,
+ * which cost a level of horizontal space on a phone and asserted a
+ * parent/child relationship that is not always true (the worker card does not
+ * always sit below the agent card). That whole-card subordination is gone:
+ * every card is flush at the left margin, and this indent survives for the one
+ * job that genuinely needs it — telling one worker's step lines apart from the
+ * next worker's on the combined card, where the numbered row headers stay
+ * flush and their steps sit one level in.
+ *
  * ── Why not ASCII, and why not U+00A0 ────────────────────────────────
  * Card bodies reach Telegram as raw GFM markdown (`richMessage` →
  * `sendRichMessage` / `editMessageText({ markdown })`, #2669) and are parsed
@@ -125,51 +135,3 @@ export const NESTED_PREFIX = '   ↳ '
  */
 export const WORKER_STEP_INDENT = '\u2800\u2800\u2800'
 
-/**
- * Line-1 prefix that marks a card as structurally SUBORDINATE to the \ud83e\udd16 agent
- * card (#3820). Worker cards carry it; the agent card never does.
- *
- * `\u2514\u2500` (U+2514 BOX DRAWINGS LIGHT UP AND RIGHT + U+2500 BOX DRAWINGS LIGHT
- * HORIZONTAL) is ordinary ink to Telegram's server-side GFM parser: it is not
- * a line-start block trigger (`#`, `>`, `-`/`+`/`*`, `N.` \u2014 see
- * render/line-start-guard.ts for the full trigger set), so it can neither be
- * promoted to a list/quote/heading nor left-trimmed the way a leading
- * whitespace run is (the #3662 failure documented on WORKER_STEP_INDENT).
- *
- * LENGTH INVARIANT: exactly the same length as `SUBORDINATE_LINE_INDENT`, so
- * the char-budget arithmetic in `fitCardToBudget` charges one flat per-line
- * cost instead of special-casing line 1. `status-accent.test.ts` asserts it.
- */
-export const SUBORDINATE_HEADER_PREFIX = '\u2514\u2500 '
-
-/**
- * Left indent applied to EVERY line of a subordinate (worker) card after
- * line 1 \u2014 the whole card block sits one level in from the agent card's left
- * margin, so "parent vs child" is readable from the block's SHAPE at a glance
- * on a phone, not from reading its label (#3820).
- *
- * Same U+2800 run as `WORKER_STEP_INDENT` and for the same live-verified
- * reason (category So, not Zs \u2192 survives Telegram's inline left-trim; ASCII
- * spaces and U+00A0 both render flat). Aliased rather than re-declared so the
- * two indents can never drift to different glyphs.
- *
- * On the combined (2+ worker) card this composes with `WORKER_STEP_INDENT`:
- * chrome / row headers land at one level, their steps at two.
- */
-export const SUBORDINATE_LINE_INDENT = WORKER_STEP_INDENT
-
-/**
- * Apply subordinate-card nesting to a card's pre-rendered lines: line 1 gets
- * `SUBORDINATE_HEADER_PREFIX`, every later line gets `SUBORDINATE_LINE_INDENT`.
- *
- * Prefixes go OUTSIDE the markdown spans (lines arrive already wrapped in
- * `**` / `_` / `~~`), exactly like `renderStepFeed`'s `indent` parameter, so a
- * prefix can never land inside an emphasis run and break it.
- *
- * Pure; returns a new array. Empty in \u2192 empty out.
- */
-export function nestSubordinateCardLines(lines: string[]): string[] {
-  return lines.map((line, i) =>
-    i === 0 ? `${SUBORDINATE_HEADER_PREFIX}${line}` : `${SUBORDINATE_LINE_INDENT}${line}`,
-  )
-}

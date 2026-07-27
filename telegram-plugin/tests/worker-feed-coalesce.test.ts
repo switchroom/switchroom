@@ -6,12 +6,7 @@ import {
   type WorkerActivityView,
 } from '../worker-activity-feed.js'
 import { renderCombinedWorkerFeed, combinedHistoryDepth } from '../tool-activity-summary.js'
-import {
-  STATUS_CARD_CHAR_BUDGET,
-  WORKER_STEP_INDENT,
-  SUBORDINATE_HEADER_PREFIX,
-  SUBORDINATE_LINE_INDENT,
-} from '../status-no-truncate.js'
+import { STATUS_CARD_CHAR_BUDGET, WORKER_STEP_INDENT } from '../status-no-truncate.js'
 import { COLLAPSE_SAFE_SEPARATOR } from '../card-format.js'
 import { richMessage } from '../rich-send.js'
 import { parseRichEntities, validateRichMarkdown } from './rich-markdown-oracle.js'
@@ -1292,22 +1287,22 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     // Load-bearing: the exact indent bytes. `WORKER_STEP_INDENT` is U+2800 ×3;
     // a plain-ASCII `'   '` indent fails this assertion, so does the U+00A0 run
     // #3662 shipped, and so does flat output with no prefix at all.
-    // Since #3820 the whole card is nested one level under the 🤖 agent card,
-    // so a step sits at SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT while its
-    // worker header sits at SUBORDINATE_LINE_INDENT alone — the RELATIVE
-    // one-level nesting this test guards is unchanged, just shifted right.
+    // #3842 removed the whole-card nesting #3820 added, so a step sits at
+    // EXACTLY one WORKER_STEP_INDENT — not two — and its worker header sits
+    // flush at the left margin. The RELATIVE one-level nesting this test guards
+    // is unchanged; the whole block shifted back left.
     for (const l of stepLines) {
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT)).toBe(true)
+      expect(l.startsWith(WORKER_STEP_INDENT)).toBe(true)
+      expect(l.startsWith(WORKER_STEP_INDENT + WORKER_STEP_INDENT)).toBe(false)
       expect(l.startsWith(BLANK)).toBe(true)
       expect(l.startsWith(' ')).toBe(false)
       expect(l.startsWith(NBSP)).toBe(false)
     }
     // Workers stay one level ABOVE their steps so the nesting reads as nesting.
     for (const l of headerLines) {
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT)).toBe(true)
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT)).toBe(false)
+      expect(l.startsWith(WORKER_STEP_INDENT)).toBe(false)
     }
-    expect(lines[0].startsWith(`${SUBORDINATE_HEADER_PREFIX}🛠`)).toBe(true)
+    expect(lines[0].startsWith('🛠')).toBe(true)
   })
 
   it('golden body — each worker header is immediately followed by ITS indented steps', () => {
@@ -1317,8 +1312,8 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     // would still pass every one of them. This pins the full line ORDER, which
     // is the actual thing the fix is for: a step must sit under its own worker.
     const body = renderCombinedWorkerFeed(rowsFor(3), { maxRows: 8 })!
-    const I = SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT
-    const N = SUBORDINATE_LINE_INDENT
+    const I = WORKER_STEP_INDENT
+    const N = ''
     // `S` is the pinned-bar collapse separator (#3666): every line that is
     // followed by a hard break carries one trailing U+00A0 so the pinned-message
     // bar (which drops the newline and substitutes nothing) does not mash the
@@ -1327,7 +1322,7 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     // `WORKER_STEP_INDENT`, which is what this golden is really pinning.
     const S = COLLAPSE_SAFE_SEPARATOR
     expect(linesOf(body)).toEqual([
-      `${SUBORDINATE_HEADER_PREFIX}🛠 **WORKERS** · _3 running · oldest 3m00s · 9 tools_${S}`,
+      `🛠 **WORKERS** · _3 running · oldest 3m00s · 9 tools_${S}`,
       `${N}**1. worker task 1** _· 1m00s · 3 tools_${S}`,
       `${I}~~_✓ w1 step a_~~${S}`,
       `${I}**→ w1 step b**${S}`,
@@ -1455,7 +1450,7 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     expect(ents.every((e) => !e.text.includes(NBSP))).toBe(true)
   })
 
-  it('the SINGLE-worker 🛠 card nests ONE level (card-level only, no per-worker indent)', () => {
+  it('the SINGLE-worker 🛠 card is entirely FLUSH — no card indent, no step indent (#3842)', () => {
     const single = renderWorkerActivity({
       workerId: 'w1',
       description: 'lone worker',
@@ -1467,18 +1462,17 @@ describe('combined worker card — steps indent under their worker (U+2800)', ()
     })
     expect(single).toContain('~~_✓ step a_~~')
     expect(single).toContain('**→ step b**')
-    // The lone-worker card has no worker HEADER to nest steps under, so it must
-    // never carry the per-worker indent — but since #3820 the whole card nests
-    // ONE level under the 🤖 agent card, so its body lines sit at exactly
-    // SUBORDINATE_LINE_INDENT and never at two levels. Asserted per line on the
-    // leading edge rather than as "no U+00A0 anywhere in the card", because
-    // #3666 puts one TRAILING U+00A0 on every hard-broken line of every pinned
-    // card (this one included) as the collapse separator.
+    // The lone-worker card has no worker HEADER to nest steps under, so there is
+    // nothing for an indent to distinguish — and #3842 removed the whole-card
+    // nesting #3820 added, so EVERY line sits at the left margin. Asserted per
+    // line on the leading edge rather than as "no U+2800 anywhere in the card",
+    // because #3666 puts one TRAILING U+00A0 on every hard-broken line of every
+    // pinned card (this one included) as the collapse separator.
     const ls = single.split('\n')
-    expect(ls[0].startsWith(SUBORDINATE_HEADER_PREFIX)).toBe(true)
-    for (const l of ls.slice(1)) {
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT)).toBe(true)
-      expect(l.startsWith(SUBORDINATE_LINE_INDENT + WORKER_STEP_INDENT)).toBe(false)
+    expect(ls[0].startsWith('🛠 **WORKER**')).toBe(true)
+    for (const l of ls) {
+      expect(l.startsWith(WORKER_STEP_INDENT)).toBe(false)
+      expect(l.startsWith('└─')).toBe(false)
       expect(l.startsWith(NBSP)).toBe(false)
     }
   })

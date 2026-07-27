@@ -23,8 +23,15 @@ import type { Driver, ObservedMessage, ObservedReaction } from "./driver.js";
  *
  * Single source of truth; the worker-feed scenario asserts against this,
  * and recall/reply scenarios exclude it via {@link isWorkerFeedMessage}.
+ *
+ * `Workers?` is load-bearing, not cosmetic: the COMBINED (2+ worker) card's
+ * glance line reads `🛠 WORKERS · N running · …`, and `Worker\b` cannot match
+ * inside `WORKERS` (no word boundary between `r` and `S`). Without the optional
+ * `s` the whole 2+ worker surface was invisible to this predicate, so a
+ * recall/reply scenario running with two live workers could latch onto the
+ * combined card as the agent's answer. Found during the #3842 card audit.
  */
-export const WORKER_FEED_RE = /🛠[️]?\s*Worker\b|finished\s*·\s*(?:completed|failed)/i;
+export const WORKER_FEED_RE = /🛠[️]?\s*Workers?\b|finished\s*·\s*(?:completed|failed)/i;
 
 /**
  * True when `m` is a worker-activity-feed message rather than the agent's
@@ -74,22 +81,26 @@ const ACTIVITY_BODY_LINE_RE = /^[→✓↳]/u;
 const LIVENESS_HEADER_L1_RE = /^(?:🤖|🛠[️]?|⚙[️]?)\s+\S/u;
 
 /**
- * Leading chrome a SUBORDINATE (worker) card carries since #3820: the `└─ `
- * header prefix on line 1 and a `U+2800` indent run on every later line, which
- * together make the worker card readable as a child of the 🤖 agent card.
+ * Leading indent chrome a card line can carry: a `U+2800` run, applied by
+ * `WORKER_STEP_INDENT` to the step lines under each worker header on the
+ * combined (2+ worker) card so one worker's steps are visibly separated from
+ * the next worker's.
  *
  * Every line-shape matcher below must normalise it away first: Telegram
- * delivers both verbatim, and NEITHER is stripped by `String.trim()` — U+2800
- * is category So, not whitespace (that property is exactly why it survives
+ * delivers it verbatim and `String.trim()` does NOT remove it — U+2800 is
+ * category So, not whitespace (that property is exactly why it survives
  * Telegram's own left-trim; see WORKER_STEP_INDENT). Without this, a worker
- * card's header stops matching `LIVENESS_HEADER_L1_RE` and its body lines stop
- * matching `ACTIVITY_BODY_LINE_RE`.
+ * card's body lines stop matching `ACTIVITY_BODY_LINE_RE`.
+ *
+ * #3842 removed the whole-card `└─ ` header prefix and the whole-card indent
+ * that #3820/#3821 put on worker cards, so this no longer has to strip a `└─ `.
+ * The step indent is the only nesting a card emits now.
  */
-const SUBORDINATE_CARD_PREFIX_RE = /^(?:└─\s*|\u2800+)+/u;
+const CARD_INDENT_PREFIX_RE = /^\u2800+/u;
 
-/** A card line with its subordinate-card nesting chrome removed, trimmed. */
+/** A card line with its leading step-indent chrome removed, trimmed. */
 export function stripCardNesting(line: string): string {
-  return line.replace(SUBORDINATE_CARD_PREFIX_RE, "").trim();
+  return line.replace(CARD_INDENT_PREFIX_RE, "").trim();
 }
 const LIVENESS_ELAPSED = String.raw`(?:\d+m)?\d+s`;
 const LIVENESS_HEADER_L2_RE = new RegExp(

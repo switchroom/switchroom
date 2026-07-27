@@ -90,8 +90,6 @@ import {
   STATUS_LINE_MAX,
   NESTED_PREFIX,
   WORKER_STEP_INDENT,
-  SUBORDINATE_LINE_INDENT,
-  nestSubordinateCardLines,
 } from './status-no-truncate.js'
 import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
@@ -374,18 +372,6 @@ export interface StatusCardOpts {
    * full recent trail — see WORKER_HISTORY_MAX.
    */
   historyWindow?: number
-  /**
-   * Render this card as structurally SUBORDINATE to the 🤖 agent card (#3820):
-   * line 1 is prefixed with `└─ ` and every later line with
-   * `SUBORDINATE_LINE_INDENT`, so the whole block sits one level in from the
-   * agent card's left margin.
-   *
-   * This is what makes "my agent" vs "a background worker" answerable from the
-   * card's SHAPE without reading its label — the two cards were otherwise
-   * byte-for-byte the same layout, differing only by an emoji + one word.
-   * Worker surfaces pass `true`; the agent card never does.
-   */
-  subordinate?: boolean
 }
 
 /**
@@ -395,8 +381,13 @@ export interface StatusCardOpts {
  * Pipeline: header → escape+clip every raw step/child → rolling-window each
  * group with `+N earlier…` → wrap (parent done-styled when children present;
  * newest-in-progress `→` bold else `✓` italic; NESTED_PREFIX for children) →
- * optional `✓ N steps` footer → optional result block → subordinate nesting
- * (#3820, when `opts.subordinate`) → fitCardToBudget.
+ * optional `✓ N steps` footer → optional result block → fitCardToBudget.
+ *
+ * Every card this primitive emits is FLUSH at the left margin (#3842). The
+ * whole-card `└─ ` + one-level indent that #3820/#3821 put on the worker card
+ * is gone: it cost horizontal space on a phone and claimed a parent/child
+ * relationship that does not always hold. Intra-card nesting (the `↳` child
+ * block here, `WORKER_STEP_INDENT` on the combined card) is unaffected.
  */
 export function renderStatusCard(opts: StatusCardOpts): string | null {
   const { header, final = false, liveSuffix = '', stepCount, result } = opts
@@ -468,9 +459,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
   // collapseSafe (#3666): the agent status card and the single-worker card are
   // both PINNED, and Telegram's pinned bar shows them collapsed to one line
   // with the newlines dropped — the separator keeps that preview legible.
-  const joined = stackCardLines(opts.subordinate === true ? nestSubordinateCardLines(out) : out, {
-    collapseSafe: true,
-  })
+  const joined = stackCardLines(out, { collapseSafe: true })
   if (joined.length <= STATUS_CARD_CHAR_BUDGET) return joined
   return fitCardToBudget(opts, headerLines)
 }
@@ -492,15 +481,11 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   const rawSteps = opts.steps.filter((s) => s != null)
   const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
   const hasChildren = rawChildren.length > 0
-  const subordinate = opts.subordinate === true
-  // Subordinate nesting (#3820) costs a fixed prefix on EVERY line — the header
-  // prefix and the body indent are the same length by invariant (see
-  // SUBORDINATE_HEADER_PREFIX), so it is one flat per-line charge rather than a
-  // line-1 special case. Charged into the arithmetic below so the extreme
-  // single-oversized-bullet branch still lands under the wire cap.
-  const nestCost = subordinate ? SUBORDINATE_LINE_INDENT.length : 0
+  // No per-line nesting cost since #3842 removed whole-card subordination:
+  // every line this function assembles is flush, so the arithmetic below
+  // charges only the line's own bytes.
   const stack = (lines: string[]): string =>
-    stackCardLines(subordinate ? nestSubordinateCardLines(lines) : lines, { collapseSafe: true })
+    stackCardLines(lines, { collapseSafe: true })
 
   // Fixed footer/result lines (always kept).
   const footerLines: string[] = []
@@ -509,9 +494,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
     footerLines.push(WORKER_RESULT_RULE)
     footerLines.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
   }
-  const fixedCost =
-    [...headerLines, ...footerLines].join('\n').length +
-    (headerLines.length + footerLines.length) * nestCost
+  const fixedCost = [...headerLines, ...footerLines].join('\n').length
 
   // The active "body" group whose oldest bullets we drop: children when
   // present (parent collapses to a single "+N" marker), else parent steps.
@@ -544,11 +527,11 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   // escaping can expand the string (& → &amp;).
   const rawNewest = body.length > 0 ? stripMarkdown(body[body.length - 1]).replace(/\s+/g, ' ').trim() : ''
   const wrapperOverhead =
-    (final ? (prefix + '_✓ _').length : (prefix + '**→ **').length + liveSuffix.length) + nestCost
+    final ? (prefix + '_✓ _').length : (prefix + '**→ **').length + liveSuffix.length
   const headerFooterCost =
     fixedCost +
     (fixedCost > 0 ? 1 : 0) +
-    (parentMarker != null ? parentMarker.length + nestCost + 1 : 0)
+    (parentMarker != null ? parentMarker.length + 1 : 0)
   const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
   let raw = rawNewest.slice(0, Math.max(0, budget))
   let newest = escapeMarkdown(raw)
@@ -807,23 +790,26 @@ function glanceLine(rows: CombinedWorkerRow[]): string {
  * Render N≥1 live workers into ONE combined feed body (ready Telegram
  * markdown; callers send verbatim — do NOT re-escape). Layout:
  *
- *   └─ 🛠 **WORKERS** · _N running · oldest {elapsed} · {n} tools · {t} tok_
- *      **1. {desc1}** _· {elapsed} · {n} tools_
- *         ~~_✓ {earlier step}_~~
- *         **→ {newest step}**
- *      **2. {desc2}** _· {elapsed} · {n} tools_
- *         **→ {newest step}**
- *      _+M more working…_
+ *   🛠 **WORKERS** · _N running · oldest {elapsed} · {n} tools · {t} tok_
+ *   **1. {desc1}** _· {elapsed} · {n} tools_
+ *      ~~_✓ {earlier step}_~~
+ *      **→ {newest step}**
+ *   **2. {desc2}** _· {elapsed} · {n} tools_
+ *      **→ {newest step}**
+ *   _+M more working…_
  *
- * SUBORDINATION (#3820): line 1 carries `└─ ` and every later line carries
- * `SUBORDINATE_LINE_INDENT`, so the whole card reads as a child block of the
- * 🤖 agent card rather than a second top-level card with the same silhouette.
+ * FLUSH (#3842): the card sits at the left margin like every other card. The
+ * whole-card `└─ ` + one-level indent from #3820/#3821 is gone — it burned a
+ * level of horizontal phone width to assert a parent/child relationship with
+ * the 🤖 agent card that does not always hold (this card is not always below
+ * it).
  *
- * INDENT: every step line carries a leading `WORKER_STEP_INDENT` (a U+2800 run
- * — neither ASCII spaces nor U+00A0; Telegram left-trims BOTH, see the
- * constant's doc comment) so the steps nest under their worker header and the
- * per-worker blocks are scannable. Header and chrome lines stay at the left
- * margin.
+ * INDENT: exactly ONE level of indentation survives, and it is the level that
+ * earns its keep — every step line carries a leading `WORKER_STEP_INDENT` (a
+ * U+2800 run — neither ASCII spaces nor U+00A0; Telegram left-trims BOTH, see
+ * the constant's doc comment) so one worker's steps are visibly separated from
+ * the next worker's. The glance line, the numbered row headers and the spill
+ * line stay flush.
  *
  * NUMBERING (#3298): when the card tracks 2+ rows AND a row carries `ordinal`,
  * its header gets a stable `{ordinal}. ` prefix. Ordinals are assigned by the
@@ -927,14 +913,11 @@ export function renderCombinedWorkerFeed(
     // substituted. Without the separator the glance line runs straight into
     // row 1's ordinal and every step glyph mashes into the previous line.
     //
-    // Subordinate nesting (#3820) is applied LAST, over the finished line list:
-    // the glance line takes `└─ ` and every row header / step / spill line takes
-    // one `SUBORDINATE_LINE_INDENT`, so this card reads as a child block of the
-    // 🤖 agent card the same way the single-worker card does. Step lines already
-    // carry WORKER_STEP_INDENT, so they end up one level deeper than their row
-    // header — the intra-card hierarchy is preserved, just shifted right.
+    // No whole-card nesting (#3842): `out` goes to the stacker as-is, so the
+    // glance / row-header / spill lines land flush and only the step lines
+    // carry their WORKER_STEP_INDENT — one level of hierarchy, not two.
     return {
-      body: stackCardLines(nestSubordinateCardLines(out), { collapseSafe: true }),
+      body: stackCardLines(out, { collapseSafe: true }),
       bodyLines: bodyOut.length,
     }
   }
