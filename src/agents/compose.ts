@@ -1589,10 +1589,18 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // container too. Source files are pre-created (mode 0600,
   // owned by the agent UID) by `ensureHostMountSources` in
   // apply.ts so docker doesn't auto-create a root-owned directory
-  // here. Broker writes via root with CAP_DAC_OVERRIDE; a
-  // post-write chownSync (server.ts mint_grant) restores agent-UID
-  // ownership after every mint so the agent keeps being able to
-  // read the file from its own peercred identity.
+  // here. Broker writes via root with CAP_DAC_OVERRIDE.
+  //
+  // #3751 — CRITICAL for anything that writes this path from inside the
+  // broker container: because this is a BARE-FILE bind (not a directory
+  // bind), the destination is a MOUNTPOINT. `rename(2)` over it and
+  // `unlink(2)` of it both return EBUSY. mint_grant's tmp+rename publish
+  // therefore failed on every single mint until #3751 replaced it with an
+  // in-place O_TRUNC write (`vault/broker/write-token-file.ts`); the
+  // reaper hit the same wall in #3749 (`reap-token-file.ts`). In-place
+  // also preserves the inode, hence the agent-UID ownership and 0600 mode
+  // apply.ts set — so no post-write chown is needed on the rewrite path,
+  // and the agent keeps reading the file under its own peercred identity.
   for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/agents/${a.name}/.vault-token:/root/.switchroom/agents/${a.name}/.vault-token`,

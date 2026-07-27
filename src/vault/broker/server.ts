@@ -25,8 +25,9 @@
  */
 
 import * as net from "node:net";
-import { mkdirSync, chmodSync, chownSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
+import { mkdirSync, chmodSync, chownSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { allocateAgentUid } from "../../agents/compose.js";
+import { writeAgentTokenFile } from "./write-token-file.js";
 import { dirname, resolve, join, basename } from "node:path";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -2606,50 +2607,79 @@ export class VaultBroker {
         return;
       }
 
-      // Write token file atomically at ~/.switchroom/agents/<agent>/.vault-token
-      // (mode 0600).
+      // Publish the token at ~/.switchroom/agents/<agent>/.vault-token.
       //
-      // #225 review-fix: write-then-rename so a cron racing the mint
-      // never reads a partial token. The previous direct writeFileSync left
-      // a one-syscall window where the cron could open the file between
-      // creation and the bytes being committed. Rename is atomic on Linux
-      // for same-filesystem moves.
+      // #3751: this is an IN-PLACE O_TRUNC write, deliberately NOT the
+      // tmp+rename atomic-write pattern that #225 introduced here. The token
+      // file is bind-mounted into this container as a bare file (see the
+      // per-agent loop in src/agents/compose.ts), so it is a mountpoint:
+      // `rename(2)` over it returns EBUSY and the write failed on every
+      // single mint on the live fleet. In-place also preserves the inode,
+      // hence the agent-UID ownership and 0600 mode that a rename silently
+      // destroyed. Same constraint/remedy as the reaper in #3749. See
+      // write-token-file.ts for the full rationale.
+      //
+      // The write is load-bearing, not best-effort: if it fails we must NOT
+      // report a successful mint. A live grant row whose token never reached
+      // disk is the exact inconsistency that made the original EBUSY
+      // invisible for months, so roll the grant back and fail the RPC.
       try {
         const agentsDir = this.config
           ? resolveAgentsDir(this.config)
           : path.join(os.homedir(), ".switchroom", "agents");
-        const tokenDir = path.join(agentsDir, agent);
-        mkdirSync(tokenDir, { recursive: true });
-        const tokenPath = path.join(tokenDir, ".vault-token");
-        const tmpPath = `${tokenPath}.tmp.${process.pid}`;
-        writeFileSync(tmpPath, mintResult.token, { mode: 0o600 });
-        renameSync(tmpPath, tokenPath);
-        // Chown to the agent UID. Without this the file lands root:root
-        // (broker runs as root) — the agent's in-container
-        // `switchroom vault get` would then fall back to the peercred
-        // ACL with no token attached, hitting VAULT-BROKER-DENIED on
-        // every call. Pre-fix this gap was masked because the per-
-        // agent token files weren't bind-mounted into the broker at
-        // all and the write stranded inside the broker's ephemeral
-        // /root/.switchroom. CAP_CHOWN is granted to the broker (see
-        // compose.ts cap_add). Swallow EPERM on dev hosts without
-        // it — the broker still returns the token in the IPC
-        // response, just the on-disk mirror is owner-wrong.
-        try {
-          const uid = allocateAgentUid(agent);
-          chownSync(tokenPath, uid, uid);
-        } catch (chownErr) {
+        const { chownWarning } = writeAgentTokenFile({
+          agentsDir,
+          agent,
+          token: mintResult.token,
+        });
+        if (chownWarning !== null) {
+          // Non-fatal: only reachable on the create path (fresh agent / dev
+          // host without CAP_CHOWN). The bytes are on disk and the token is
+          // still returned over IPC; only the on-disk mirror is owner-wrong.
           process.stderr.write(
-            `[vault-broker] mint_grant: token written but chown failed for agent ${agent}: ` +
-            `${(chownErr as Error).message} (CAP_CHOWN missing?)\n`
+            `[vault-broker] mint_grant: ${chownWarning} (agent ${agent})\n`,
           );
         }
       } catch (err) {
-        // Non-fatal: the token is still returned. File write is best-effort.
+        const msg = err instanceof Error ? err.message : String(err);
+        // Compensating action: the grant row already exists, and its token
+        // was already handed to bcrypt-hashed storage. Revoke it so no live
+        // capability outlives the failed publish — validateGrant hard-denies
+        // a revoked token, so the pair (grant, token file) can never be left
+        // out of sync in the "grant usable, token missing" direction.
+        let rolledBack = false;
+        let rollbackErr: string | null = null;
+        try {
+          rolledBack = revokeGrant(this.grantsDb, mintResult.id);
+        } catch (revokeError) {
+          rollbackErr = revokeError instanceof Error ? revokeError.message : String(revokeError);
+        }
+        const rollbackNote = rolledBack
+          ? "grant rolled back (revoked)"
+          : `GRANT ROLLBACK FAILED — revoke ${mintResult.id} manually${rollbackErr ? `: ${rollbackErr}` : ""}`;
         process.stderr.write(
           `[vault-broker] mint_grant: failed to write token file for agent ${agent}: ` +
-          `${(err as Error).message}\n`
+          `${msg}; ${rollbackNote}\n`
         );
+        this.auditLogger.write({
+          ts: new Date().toISOString(),
+          op: "mint_grant",
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: `error:token-write-failed:${msg}`,
+          method: "grant",
+          grant_id: mintResult.id,
+        });
+        socket.write(
+          encodeResponse(
+            errorResponse(
+              "INTERNAL",
+              `Failed to write token file for agent ${agent}: ${msg} (${rollbackNote})`,
+            ),
+          ),
+        );
+        return;
       }
 
       this.auditLogger.write({

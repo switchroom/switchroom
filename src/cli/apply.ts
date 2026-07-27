@@ -1367,9 +1367,15 @@ export async function ensureHostMountSources(
   // auto-create a directory at this path on a fresh install) and
   // chown to the agent UID so the agent inside the container can
   // read it under its own peercred identity. The broker writes via
-  // CAP_DAC_OVERRIDE so its writes succeed regardless of ownership;
-  // a follow-up chownSync in mint_grant restores the agent UID after
-  // every write so subsequent reads from the agent keep working.
+  // CAP_DAC_OVERRIDE so its writes succeed regardless of ownership.
+  //
+  // #3751: this pre-creation is now load-bearing for ownership too, not
+  // just to stop docker auto-creating a directory here. mint_grant
+  // publishes the token with an IN-PLACE O_TRUNC write (never tmp+rename —
+  // the file is a bare-file bind mount in the broker container and rename
+  // over it is EBUSY), which preserves THIS inode and therefore the
+  // agent-UID ownership set below. The broker only chowns on the path
+  // where it had to create the file itself.
   for (const name of Object.keys(config.agents)) {
     const tokenPath = join(home, ".switchroom", "agents", name, ".vault-token");
     if (!existsSync(tokenPath)) {
