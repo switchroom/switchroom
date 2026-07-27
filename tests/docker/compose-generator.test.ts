@@ -31,6 +31,7 @@ import {
   AGENT_UID_MIN,
   AGENT_UID_MAX,
   describeAgents,
+  DEFAULT_TMP_SIZE,
   resolveConfigMountSource,
   CONTAINER_CONFIG_PATH,
 } from "../../src/agents/compose.js";
@@ -44,7 +45,13 @@ interface MakeConfigAgent {
   env?: Record<string, string>;
   model?: string;
   bind_mounts?: Array<{ source: string; target?: string; mode?: "ro" | "rw" }>;
-  resources?: { memory?: string; memory_reservation?: string; pids_limit?: number; cpus?: number };
+  resources?: {
+    memory?: string;
+    memory_reservation?: string;
+    pids_limit?: number;
+    cpus?: number;
+    tmp_size?: string;
+  };
   timezone?: string;
   network_isolation?: "host" | "strict";
   experimental?: { legacy_pty?: boolean; legacy_autoaccept_expect?: boolean };
@@ -475,6 +482,73 @@ describe("generateCompose", () => {
     });
     expect(out).toMatch(/agent-ziggy:[\s\S]*?cpus: 0\.3/); // toFixed(1) rounds
     expect(out).toMatch(/agent-ziggy:[\s\S]*?mem_limit: 1g/); // unchanged
+  });
+
+  // --- /tmp tmpfs sizing (resources.tmp_size) ---
+  //
+  // The size used to be hard-coded `1g` at the emit site with no way to
+  // change it short of hand-editing generated compose (which `apply`
+  // overwrites). It is now cascade-resolved, defaulting to
+  // DEFAULT_TMP_SIZE (2g).
+
+  it("emits DEFAULT_TMP_SIZE for an agent with no tmp_size anywhere", () => {
+    const out = generateCompose({ config: makeConfig({ coach: { extends: "conversational" } }) });
+    expect(out).toMatch(
+      new RegExp(`agent-coach:[\\s\\S]*?- /tmp:size=${DEFAULT_TMP_SIZE},mode=1777`),
+    );
+  });
+
+  it("the fleet-wide /tmp default is 2g (pin — a silent bump must fail here)", () => {
+    // Raised from 1g on 2026-07-27: overlord hit 90% of a 1.0 GiB /tmp
+    // (917M used) from concurrent sub-agent repo clones + bun caches.
+    expect(DEFAULT_TMP_SIZE).toBe("2g");
+    const out = generateCompose({ config: makeConfig({ solo: {} }) });
+    expect(out).toContain("- /tmp:size=2g,mode=1777");
+    expect(out).not.toContain("- /tmp:size=1g,mode=1777");
+  });
+
+  it("agent.resources.tmp_size overrides it for THAT agent only", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        big: { extends: "coding", resources: { tmp_size: "8g" } },
+        small: { extends: "coding" },
+      }),
+    });
+    expect(out).toMatch(/agent-big:[\s\S]*?- \/tmp:size=8g,mode=1777/);
+    // The non-overridden sibling still gets the default — proves the
+    // override is scoped, not a global mutation.
+    expect(out).toMatch(/agent-small:[\s\S]*?- \/tmp:size=2g,mode=1777/);
+    // Unrelated resource fields untouched by the new knob.
+    expect(out).toMatch(/agent-big:[\s\S]*?mem_limit: 4g/);
+  });
+
+  it("defaults.resources.tmp_size cascades, and per-agent wins over it", () => {
+    const config = makeConfig({
+      pinned: { resources: { tmp_size: "512m" } },
+      inherits: {},
+    });
+    config.defaults = { ...(config.defaults ?? {}), resources: { tmp_size: "4g" } };
+    const out = generateCompose({ config });
+    expect(out).toMatch(/agent-inherits:[\s\S]*?- \/tmp:size=4g,mode=1777/);
+    expect(out).toMatch(/agent-pinned:[\s\S]*?- \/tmp:size=512m,mode=1777/);
+  });
+
+  it("profile.resources.tmp_size cascades to agents extending it", () => {
+    const config = makeConfig({ alice: { extends: "roomy" } });
+    config.profiles = {
+      roomy: { resources: { tmp_size: "6g" } },
+    } as unknown as typeof config.profiles;
+    const out = generateCompose({ config });
+    expect(out).toMatch(/agent-alice:[\s\S]*?- \/tmp:size=6g,mode=1777/);
+  });
+
+  it("root-tier agents (no hardening block) still get the resolved tmp_size", () => {
+    // The root agent skips security_opt/cap_drop/read_only but NOT tmpfs;
+    // the emit site sits outside that `if (!a.root)` branch.
+    const out = generateCompose({
+      config: makeConfig({ overseer: { root: true, resources: { tmp_size: "16g" } } }),
+    });
+    expect(out).toMatch(/agent-overseer:[\s\S]*?- \/tmp:size=16g,mode=1777/);
   });
 
   it("strips cap_add and emits a warning", () => {
@@ -1037,7 +1111,7 @@ describe("generateCompose", () => {
       expect(block, `agent-${name} security_opt`).toContain('no-new-privileges:true');
       expect(block, `agent-${name} cap_drop`).toMatch(/cap_drop:\s*\n\s*-\s*"ALL"/);
       expect(block, `agent-${name} read_only`).toContain("read_only: true");
-      expect(block, `agent-${name} tmpfs`).toContain("/tmp:size=1g");
+      expect(block, `agent-${name} tmpfs`).toContain(`/tmp:size=${DEFAULT_TMP_SIZE}`);
     }
   });
 
@@ -3125,7 +3199,7 @@ describe("root-tier debugging agent (root: true)", () => {
     expect(block).not.toContain("read_only: true");
     expect(block).not.toMatch(/cap_drop:\s*\n\s*-\s*"ALL"/);
     // tmpfs /tmp is still present (RAM-backed, capped).
-    expect(block).toContain("/tmp:size=1g");
+    expect(block).toContain(`/tmp:size=${DEFAULT_TMP_SIZE}`);
   });
 
   it("mounts docker.sock, the whole ~/.switchroom tree, and the host root fs", () => {

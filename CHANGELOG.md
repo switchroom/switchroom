@@ -76,6 +76,46 @@ throws if that anchor moves.
 Deliberately not done: `recallMaxMemories` and `recallMinOverlap` were already
 declarative and are untouched.
 
+### `switchroom doctor` detects banks with no per-bank vector index
+
+Hindsight creates one PARTIAL vector index per (bank, fact_type) — and creates
+them exactly once, at bank creation, behind `if created:` on an
+`INSERT ... ON CONFLICT (bank_id) DO NOTHING RETURNING bank_id`
+(`engine/retain/bank_utils.py:254`, `engine/retain/fact_storage.py:163`).
+There is no backfill and no reconciliation anywhere, so a bank whose row
+predates the feature — or whose creation raced — never gets its indexes and
+nothing ever notices.
+
+It is invisible because it is not an error. Recall still returns rows, just the
+wrong ones, from a scan rather than a search, and only ever a truncated slice
+of the candidate pool. No exception, no log line, no failed request. On this
+fleet every bank created between 2026-04-14 and 2026-05-31 ran that way for
+roughly three months, with measured recall@100 bounded at 4% or less.
+
+The new `hindsight vector indexes` row asserts that every (bank, fact_type)
+pair at or above 10,000 embedding rows has an index that exists **and** is
+`indisvalid` — a `CREATE INDEX CONCURRENTLY` that failed part-way leaves an
+INVALID index behind that the planner will not use, so treating mere existence
+as sufficient would report that exact broken state as healthy.
+
+Index names are **derived**, not hardcoded, matching the engine's own
+`_bank_index_name`: strip hyphens from `banks.internal_id`, then take the first
+16 characters, as `idx_mu_emb_<worl|expr|obsv>_<uid>`. Doing it in the other
+order keeps two hyphens and yields a name that matches nothing, which would
+report every bank as broken.
+
+The 10,000 floor comes from measured behaviour: the planner stops preferring
+the per-bank partial index below roughly 12,000 rows per pair, so the floor
+sits deliberately underneath that so the row fires while the bank is still
+healthy. Verified against the live fleet — every pair at or above 9,250 rows
+has a valid index, and the largest unindexed pair is `gymbro/world` at 8,128
+rows and rising, which this catches on the day it crosses.
+
+**Detection only.** The repair path belongs upstream in Hindsight; a
+diagnostic command should not take a write lock on a live production table.
+The row's `fix` text says the indexes are never backfilled, because without
+that the natural response is "run apply again", which does nothing.
+
 ### `hindsight.env` can reach every perf knob, and a key it can't reach now fails loudly
 
 Eight Hindsight tuning knobs were emitted unconditionally on both launch paths
@@ -130,6 +170,44 @@ Two durable halves, because enumerating today's gaps does not stop the ninth:
   derives (port, provider, model, worker identity, MCP statelessness) or flow
   through the managed resolvers. Hard-pinning a new tuning knob now fails the
   suite and has to justify itself.
+
+### An agent's `/tmp` is now declarative, and the fleet default is 2 GiB
+
+Every agent container runs a read-only root filesystem, so the RAM-backed
+`/tmp` is the only scratch space it and its sub-agents get. Its size was
+hard-coded at `1g` in `src/agents/compose.ts` — one `lines.push()` with no
+config path to it at all. The only way to change it was to hand-edit the
+generated compose file, which the next `switchroom apply` overwrites. That is
+imperative state pretending to be config, and the same shape as #3732/#3745:
+a value that is a property of a deployment, shipped with no declarative
+channel.
+
+The measurement that forced it: the root-tier `overlord` container, fanning
+out concurrent sub-agents, sat at **90% of its 1.0 GiB `/tmp`** — 917M used,
+~150M free — and 785M of that was sub-agent working state, mostly repo clones
+plus `bunx` toolchain caches for vitest and typescript. Several workers each
+cloning a repo and installing a toolchain exhaust 1 GiB routinely, and the
+failure mode is bad: clones and installs die with a bare ENOSPC far from the
+cause, mid-task, with no signal that a *mount* is the constraint.
+
+So `resources.tmp_size` joins `memory`, `memory_reservation`, `pids_limit` and
+`cpus` in the existing `resources` block, through the same defaults → profile
+→ per-agent per-field cascade, validated at config-load with the same Docker
+size-string format as `memory` (`4g`, `512m`) rather than failing later at
+`docker compose up`. It is declared in **both** schema mirrors — the
+`profileFields` copy and the `AgentSchema` copy — because that zod object
+strips unknown keys, and a knob present in only one of them parses green and
+does nothing (#3773).
+
+**This changes behaviour on the next `switchroom apply`: an agent with no
+override goes from 1 GiB to 2 GiB.** That is safe as a default because a tmpfs
+is a ceiling, not a reservation — it consumes host RAM only for the pages
+actually written, so an idle agent's footprint is identical and the raise
+costs nothing until something uses it. Those pages are charged against the
+container's `mem_limit` cgroup, so an agent that raises `tmp_size` *and*
+intends to fill it should raise `resources.memory` alongside. Agents pick the
+new size up when their container is recreated; a running container keeps the
+mount it booted with.
 
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
