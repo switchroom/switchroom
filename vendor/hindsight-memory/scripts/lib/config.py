@@ -46,6 +46,20 @@ DEFAULTS = {
     # cap of 6 its fleet actually deploys.
     "recallOwnBankMinSlots": 0,
     "recallAdditionalBankMinSlots": 0,
+    # Switchroom #3837: absolute floor on a result's engine relevance score
+    # (`scores.final`) for it to be injected. 0.0 (default) DISABLES the floor
+    # — nothing is dropped and the injected set is byte-identical to the
+    # pre-#3837 behaviour. `recallMinScoreScope` decides which turns a
+    # non-zero floor binds on: "degraded" (default) = only turns where the
+    # agent's OWN bank timed out or was unreachable, which is the population
+    # where a below-floor score actually predicts noise (98.4% of degraded
+    # rows have a best injected score under 0.01, against 28.4% of healthy
+    # ones); "all" = every turn, which #3761's replay says empties ~28% of
+    # HEALTHY recalls at 0.01 and is not recommended as a fleet default. See
+    # the design note above `_filter_by_min_score` in recall.py. Env:
+    # HINDSIGHT_RECALL_MIN_SCORE / HINDSIGHT_RECALL_MIN_SCORE_SCOPE.
+    "recallMinScore": 0.0,
+    "recallMinScoreScope": "degraded",
     "recallTypes": ["world", "experience"],
     # Switchroom-local: when True (default; Ken-approved ON) recall biases
     # toward synthesized `observation`-tier facts. Escape hatch: pin off via
@@ -324,6 +338,12 @@ ENV_OVERRIDES = {
     # .additional_bank_min_slots (cascading through defaults). 0 = off.
     "HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS": ("recallOwnBankMinSlots", int),
     "HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS": ("recallAdditionalBankMinSlots", int),
+    # Switchroom #3837: absolute `scores.final` floor + the population it binds
+    # on. Set by start.sh from agents.<name>.memory.recall.min_score /
+    # .min_score_scope (cascading through defaults), exported only when the
+    # operator opted in. 0.0 = off (the default, and the shipped behaviour).
+    "HINDSIGHT_RECALL_MIN_SCORE": ("recallMinScore", float),
+    "HINDSIGHT_RECALL_MIN_SCORE_SCOPE": ("recallMinScoreScope", str),
     # Switchroom-local: recall fact types (comma-separated). Set by start.sh
     # from agents.<name>.memory.recall.types only when the operator overrode
     # the switchroom default (world,experience,observation) — i.e. the

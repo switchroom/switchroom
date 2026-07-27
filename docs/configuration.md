@@ -157,6 +157,53 @@ The cap applies to the *combined* result list across the primary bank and any `r
 
 Operationally: the cap is set via the `HINDSIGHT_RECALL_MAX_MEMORIES` env var that `start.sh` exports. The vendored plugin's `recall.py` slices results client-side before formatting (plugin v0.4.0 has no `recallTopK` setting on the Claude Code integration — only Openclaw exposes it).
 
+### Filtering noise recall — `memory.recall.min_score` / `min_score_scope`
+
+`max_memories` bounds *how many* memories are injected; it cannot tell a
+relevant memory from a worthless one. When a bank misses its recall deadline the
+hook still returns a full slate of near-zero-scoring results and injects them
+under the "Relevant memories from past conversations" banner, which reads to the
+agent as ground truth. `min_score` is a client-side relevance floor applied
+after ranking and **before** the `max_memories` slice: any result whose
+`scores.final` falls below the floor is dropped.
+
+```yaml
+agents:
+  overlord:
+    memory:
+      recall:
+        min_score: 0.01          # default 0 = OFF (no filtering)
+        min_score_scope: degraded  # default: only filter on a degraded turn
+```
+
+- **`min_score`** (number, default `0`) — the floor. `0` disables filtering
+  entirely and leaves recall behaviour byte-identical to a fleet without this
+  setting. A result carrying no usable score is always kept, never dropped.
+- **`min_score_scope`** (`degraded` | `all`, default `degraded`) —
+  `degraded` applies the floor only on turns where the agent's own bank timed
+  out or errored (the same condition that raises the degraded-recall notice);
+  `all` applies it on every turn.
+
+**Why the default scope is `degraded`.** `scores.final` is not calibrated across
+queries — on a healthy fleet the score distribution is wide (p10 ≈ 0.0005, p90 ≈
+0.9259) and ~28% of healthy-turn results already sit below 0.01, so a
+fleet-wide floor would discard genuinely useful low-scoring hits. On a degraded
+turn the population is different in kind: ~98% of results fall below 0.01. The
+`degraded` scope binds the floor to the population the evidence supports.
+Set `all` only after inspecting your own recall-log distribution.
+
+If the floor empties the result set the hook injects **no** memory content —
+never an empty banner — and instead discloses that candidates were withheld, so
+the agent treats missing memory as *unknown* rather than *nothing was
+remembered*. The existing degraded-recall notice still fires independently.
+
+Observability: each `recall_log.jsonl` row carries `min_score_floor`,
+`min_score_scope`, `min_score_applied`, and `dropped_below_min_score` next to
+the existing `injected_score_*` fields — inspect with `switchroom memory
+recall-log`. Operationally the values reach the plugin via the
+`HINDSIGHT_RECALL_MIN_SCORE` / `HINDSIGHT_RECALL_MIN_SCORE_SCOPE` env vars that
+`start.sh` exports unconditionally.
+
 ### Tuning auto-retain cadence — `memory.retain.every_n_turns` / `overlap_turns`
 
 The plugin's Stop hook consolidates recent conversation into the bank on a

@@ -2732,6 +2732,52 @@ describe("reconcileAgent", () => {
     expect(startSh).toContain("export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS=0");
   });
 
+  it("start.sh exports the #3837 score floor as OFF by default", () => {
+    // The floor must ship disabled: at 0 recall.py's `_filter_by_min_score`
+    // short-circuits and the injected set is unchanged fleet-wide. Exported
+    // unconditionally for the same #3774 reason as the slot floors above — a
+    // stale hand-edited `~/.hindsight/claude-code.json` loads AFTER
+    // settings.json, so without this line an operator's leftover
+    // `recallMinScore` would silently switch a recall FILTER on for an agent
+    // whose switchroom.yaml never asked for one.
+    const agentConfig = makeAgentConfig();
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    // Whole-line match, deliberately: `toContain("...MIN_SCORE=0")` also
+    // matches a rendered `=0.01`, so a non-zero default would sail through it.
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MIN_SCORE=0\n");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MIN_SCORE_SCOPE=degraded\n");
+    // Never an empty assignment: `_cast_env("", float)` returns None, the
+    // assignment is skipped, and claude-code.json wins again.
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_MIN_SCORE=\n");
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_MIN_SCORE_SCOPE=\n");
+  });
+
+  it("start.sh exports the #3837 score floor and scope when the operator opts in", () => {
+    const agentConfig = makeAgentConfig({
+      memory: {
+        collection: "test-agent",
+        recall: { min_score: 0.01, min_score_scope: "all" },
+      },
+    });
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MIN_SCORE=0.01");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MIN_SCORE_SCOPE=all");
+  });
+
   it("start.sh exports HINDSIGHT_RECALL_MAX_MEMORIES=0 when operator explicitly disables the cap", () => {
     // 0 is a meaningful sentinel ("uncapped"), not the same as unset.
     // The template uses an isNumber helper specifically so 0 still

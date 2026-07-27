@@ -825,6 +825,23 @@ export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS={{hindsightRecallRequestTimeoutS
 # Observe `injected_own_bank_count` via `switchroom memory recall-log <agent>`.
 export HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS={{hindsightRecallOwnBankMinSlots}}
 export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS={{hindsightRecallAdditionalBankMinSlots}}
+# Absolute relevance floor on an injected memory's engine score (#3837).
+# 0 = OFF, and 0 is what switchroom ships: at 0 recall.py drops nothing and the
+# injected set is exactly what it was before #3837.
+# It exists for the measured failure where the agent's own bank times out and
+# recall injects side-bank residue under the "relevant memories" banner —
+# 98.4% of degraded turns carry a best injected score below 0.01 against 28.4%
+# of healthy ones, and the agent cannot tell noise from recall. SCOPE decides
+# which turns a non-zero floor binds on: `degraded` (default) only when the own
+# bank timed out / was unreachable, `all` on every turn. `all` is NOT a
+# recommended fleet default — an unconditional 0.01 floor empties ~28% of
+# HEALTHY recalls (#3761), because `scores.final` is not calibrated across
+# queries. EXPORTED UNCONDITIONALLY for the #3774 reason above: a stale
+# hand-edited ~/.hindsight/claude-code.json must not be able to switch a recall
+# filter ON that switchroom ships OFF.
+# Observe `dropped_below_min_score` via `switchroom memory recall-log <agent>`.
+export HINDSIGHT_RECALL_MIN_SCORE={{hindsightRecallMinScore}}
+export HINDSIGHT_RECALL_MIN_SCORE_SCOPE={{hindsightRecallMinScoreScope}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the
