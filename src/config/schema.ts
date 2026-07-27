@@ -529,25 +529,6 @@ export const AgentMemorySchema = z
             "result instead of round-tripping to Hindsight. 0 disables. " +
             "Default is 600 (10 min) for switchroom-managed agents.",
           ),
-        min_overlap: z
-          .number()
-          .min(0)
-          .max(1)
-          .optional()
-          .describe(
-            "Minimum containment token overlap [0.0–1.0] between the user " +
-            "prompt and a memory's text for the memory to be injected. " +
-            "A cheap FLOOR that removes candidates with (near-)zero lexical " +
-            "relationship to the prompt — NOT a precision control: at the " +
-            "recommended 0.10 the gate is near-passthrough, and the " +
-            "effective precision control is the engine rerank plus the " +
-            "max_memories head-slice. 0.0 disables (default — current " +
-            "behaviour). Use 0.10; values at or above 0.20 measurably " +
-            "starve recall — on production replay 0.20 leaves ~41.9% of " +
-            "turns with NO memories at all, re-creating the bug #3541 " +
-            "fixed. Observe the `overlap_dropped` field via " +
-            "`switchroom memory recall-log`.",
-          ),
         types: z
           .array(z.string())
           .optional()
@@ -2818,7 +2799,6 @@ const profileFields = {
         .object({
           max_memories: z.number().int().min(0).optional(),
           cache_ttl_secs: z.number().int().min(0).optional(),
-          min_overlap: z.number().min(0).max(1).optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })
