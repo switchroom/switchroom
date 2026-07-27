@@ -12,6 +12,12 @@
  * already runs 19.4 % of retains past it, so no resolvable threshold
  * distinguishes healthy from sick. The full derivation is in
  * `thresholds.ts`, where the constant used to be.
+ *
+ * `recall-latency` was removed for the SAME reason and caught the same way,
+ * one signal-set later: the healthy fleet's recall p95 is 8037 ms against an
+ * 8000 ms per-bank budget, so the drafted 6000 ms page line sat below the
+ * healthy MEDIAN. Twice now the trap has been a latency threshold measured
+ * against an outage instead of against a working fleet.
  */
 export type SignalId =
   | "probe" // the watchdog itself could not see hindsight
@@ -23,12 +29,11 @@ export type SignalId =
   // Every signal above watches WRITES or liveness, and all of them were
   // green while the fleet's recall ran ~86 % broken for six weeks — because
   // a recall that fails is still a fast HTTP 200 with an empty body. These
-  // six watch the read path, from the telemetry `recall.py` writes itself.
+  // five watch the read path, from the telemetry `recall.py` writes itself.
   | "recall-own-bank-timeout" // the agent's own bank did not answer
   | "recall-zero-memory" // recall "succeeded" and injected nothing
   | "recall-candidate-floor" // the candidate pool itself is empty
   | "recall-injected-score" // what we DID inject scores like noise
-  | "recall-latency" // recall is pinned at its deadline
   | "consolidation-queue-age" // the async queue is not draining
   // ── the fallback that never fires ────────────────────────────────────
   | "llm-fallback-ineffective";
@@ -43,7 +48,6 @@ export const ALL_SIGNALS: SignalId[] = [
   "recall-zero-memory",
   "recall-candidate-floor",
   "recall-injected-score",
-  "recall-latency",
   "consolidation-queue-age",
   "llm-fallback-ineffective",
 ];
@@ -52,10 +56,17 @@ export const ALL_SIGNALS: SignalId[] = [
 export interface Sample {
   /** epoch ms of the probe */
   ts: number;
-  /** cumulative successful retain operations (`success="true"`) */
-  retainOk: number;
-  /** cumulative failed retain operations (`success="false"`) */
-  retainFail: number;
+  /**
+   * Cumulative successful retain operations (`success="true"`).
+   *
+   * OPTIONAL, and absent rather than zero when `/metrics` could not be
+   * buffered (an over-cap body — see `MetricsTooLargeError`). Zero would mean
+   * "no retains and no failures", which scores as a clean pass; absent makes
+   * `retain-failure-rate` report `no-data`, which is inert.
+   */
+  retainOk?: number;
+  /** cumulative failed retain operations (`success="false"`) — see `retainOk` */
+  retainFail?: number;
   /**
    * Live spooled retains across the fleet (`*.json`).
    *

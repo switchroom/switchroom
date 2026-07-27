@@ -114,8 +114,13 @@ function isSample(x: unknown): x is Sample {
   return (
     typeof s.ts === "number" &&
     Number.isFinite(s.ts) &&
-    typeof s.retainOk === "number" &&
-    typeof s.retainFail === "number" &&
+    // `retainOk`/`retainFail` are deliberately NOT required: a tick whose
+    // `/metrics` body was over the cap persists without them, and discarding
+    // that sample would also discard its recall block, which was fine. They
+    // are type-checked only when present — `evaluateFailureRate` skips any
+    // interval missing them rather than zero-filling.
+    (s.retainOk === undefined || typeof s.retainOk === "number") &&
+    (s.retainFail === undefined || typeof s.retainFail === "number") &&
     typeof s.pending === "number" &&
     typeof s.dead === "number" &&
     typeof s.evicted === "number" &&

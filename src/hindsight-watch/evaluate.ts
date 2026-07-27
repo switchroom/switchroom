@@ -20,8 +20,6 @@ import {
   RECALL_MIN_SAMPLES,
   RECALL_OWN_BANK_TIMEOUT_PAGE,
   RECALL_OWN_BANK_TIMEOUT_WARN,
-  RECALL_P95_PAGE_MS,
-  RECALL_P95_WARN_MS,
   RECALL_POOL_MEDIAN_PAGE,
   RECALL_POOL_MEDIAN_WARN,
   RECALL_SCORE_P50_PAGE,
@@ -48,14 +46,33 @@ function windowMinutes(ring: Sample[]): number {
  * straddling interval is re-based instead of the whole window reading
  * negative.
  */
-function windowRetainCounts(ring: Sample[]): { ok: number; fail: number } {
+function windowRetainCounts(ring: Sample[]): { ok: number; fail: number; intervals: number } {
   let ok = 0;
   let fail = 0;
+  let intervals = 0;
   for (let i = 1; i < ring.length; i++) {
-    ok += counterDelta(ring[i - 1].retainOk, ring[i].retainOk);
-    fail += counterDelta(ring[i - 1].retainFail, ring[i].retainFail);
+    const pOk = ring[i - 1].retainOk;
+    const nOk = ring[i].retainOk;
+    const pFail = ring[i - 1].retainFail;
+    const nFail = ring[i].retainFail;
+    // Skip, do not zero-fill. A tick whose `/metrics` body was over the cap
+    // carries no retain counters at all; treating the gap as 0-to-0 would
+    // add a clean interval that never happened and dilute the failure rate
+    // toward pass. `counterDelta(undefined, n)` would be NaN, and every
+    // `NaN >= threshold` is false — the same fail-open trap by another route.
+    if (
+      typeof pOk !== "number" ||
+      typeof nOk !== "number" ||
+      typeof pFail !== "number" ||
+      typeof nFail !== "number"
+    ) {
+      continue;
+    }
+    ok += counterDelta(pOk, nOk);
+    fail += counterDelta(pFail, nFail);
+    intervals++;
   }
-  return { ok, fail };
+  return { ok, fail, intervals };
 }
 
 /** S1 — retain failure rate over the rolling window. The storm signal. */
@@ -64,9 +81,17 @@ export function evaluateFailureRate(ring: Sample[]): Verdict {
   if (ring.length < 2) {
     return { signal, state: "no-data", detail: "only one sample so far — need two to compute a rate" };
   }
-  const { ok, fail } = windowRetainCounts(ring);
+  const { ok, fail, intervals } = windowRetainCounts(ring);
   const total = ok + fail;
   const mins = windowMinutes(ring);
+  if (intervals === 0) {
+    return {
+      signal,
+      state: "no-data",
+      detail: `no tick pair in the last ${mins}m carried retain counters — /metrics was unreadable throughout`,
+      measured: { windowMinutes: mins },
+    };
+  }
   if (total < MIN_RETAIN_SAMPLES) {
     return {
       signal,
@@ -313,6 +338,26 @@ function errorSuffix(r: { topError?: string | null }): string {
 }
 
 /**
+ * Render recall wall time as DM context, or "" when unavailable.
+ *
+ * There is deliberately no `recall-latency` SIGNAL — see the deletion note in
+ * `thresholds.ts`, where the healthy fleet's own p95 of 8037 ms is shown to
+ * leave no thresholdable band below the 8 s per-bank budget. The measurement
+ * is still worth SHOWING: it is what distinguishes "own-bank recall failed"
+ * meaning *timed out at the wall* from meaning *errored immediately*, which
+ * is the first question the operator asks and the cheapest one to pre-answer.
+ *
+ * Presentational only, exactly like `errorSuffix` — no threshold reads it, so
+ * it can never move a verdict.
+ */
+function latencySuffix(r: { elapsedP95Ms?: number | null; elapsedConsidered?: number }): string {
+  const p95 = r.elapsedP95Ms;
+  if (typeof p95 !== "number" || !Number.isFinite(p95)) return "";
+  const n = typeof r.elapsedConsidered === "number" ? r.elapsedConsidered : 0;
+  return `\n  recall wall time p95 ${Math.round(p95)}ms over ${n} fire(s) (not thresholded — the 8000ms per-bank budget leaves no healthy band below it)`;
+}
+
+/**
  * R1 — own-bank timeout rate.
  *
  * The agent's own bank is the one holding its memory. A recall that misses it
@@ -347,7 +392,8 @@ export function evaluateRecallOwnBankTimeout(ring: Sample[]): Verdict {
       `own-bank recall failed on ${pct(rate)} of fires ` +
       `(${r.ownBankDegraded}/${r.timeoutConsidered} across ${r.agents} agent(s)) ` +
       `— warn ${pct(RECALL_OWN_BANK_TIMEOUT_WARN)}, page ${pct(RECALL_OWN_BANK_TIMEOUT_PAGE)}` +
-      errorSuffix(r),
+      errorSuffix(r) +
+      latencySuffix(r),
     measured: {
       rate,
       degraded: r.ownBankDegraded,
@@ -469,43 +515,18 @@ export function evaluateRecallInjectedScore(ring: Sample[]): Verdict {
   };
 }
 
-/**
- * R5 — recall p95 wall time.
- *
- * The early warning for R1: latency drifts through the 4-6 s band for days
- * before enough requests cross the 8 s per-bank wall to move the timeout rate.
+/*
+ * There is no `evaluateRecallLatency`. `total_elapsed_ms` IS summarised (into
+ * `RecallSample.elapsedP95Ms`) and IS shown, via `latencySuffix` on R1 — it
+ * just carries no threshold, because the healthy fleet's own p95 is 8037 ms
+ * against an 8000 ms per-bank budget and there is no band left underneath it.
+ * The full derivation, including the bootstrap that breaches a 6000 ms line
+ * in 100 % of healthy draws, is in `thresholds.ts` where the constants would
+ * otherwise have lived.
  */
-export function evaluateRecallLatency(ring: Sample[]): Verdict {
-  const signal = "recall-latency" as const;
-  const r = latestRecall(ring);
-  if (r === null) return noRecallData(signal);
-  if (r.elapsedConsidered < RECALL_MIN_SAMPLES || r.elapsedP95Ms === null) {
-    return {
-      signal,
-      state: "no-data",
-      detail: `only ${r.elapsedConsidered} recall(s) reporting elapsed time — below the ${RECALL_MIN_SAMPLES}-row floor`,
-      measured: { considered: r.elapsedConsidered },
-    };
-  }
-  const { state, severity } = scoreHigherIsWorse(
-    r.elapsedP95Ms,
-    RECALL_P95_WARN_MS,
-    RECALL_P95_PAGE_MS,
-  );
-  return {
-    signal,
-    state,
-    severity,
-    detail:
-      `recall p95 ${r.elapsedP95Ms}ms over ${r.elapsedConsidered} fire(s) ` +
-      `— warn ≥${RECALL_P95_WARN_MS}ms, page ≥${RECALL_P95_PAGE_MS}ms ` +
-      `(the per-bank budget is 8000ms; a p95 at the budget means timing out, not slowness)`,
-    measured: { p95Ms: r.elapsedP95Ms, considered: r.elapsedConsidered },
-  };
-}
 
 /**
- * R6 — consolidation queue age.
+ * R5 — consolidation queue age.
  *
  * `docker/hindsight-maintenance.sh` already computes this every tick and
  * writes it to a container log. This is the same measurement with a
@@ -611,7 +632,6 @@ export function evaluateAll(ring: Sample[]): Verdict[] {
     evaluateRecallCandidateFloor(ring),
     evaluateRecallInjectedScore(ring),
     evaluateRecallZeroMemory(ring),
-    evaluateRecallLatency(ring),
     evaluateConsolidationQueueAge(ring),
     evaluateLlmFallback(ring),
   ];

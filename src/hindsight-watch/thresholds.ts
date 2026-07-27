@@ -346,11 +346,31 @@ export const DEFAULT_METRICS_URL = "http://127.0.0.1:18888/metrics";
 export const DEFAULT_CONTAINER = "switchroom-hindsight";
 
 /**
- * Hard cap on the `/metrics` body we will read. B8 measured the live body at
- * 258,741 B — 4× the ~60 KB recorded a day earlier, so this cap is sized for
- * the growth, not for today's reading: 4 MB is ~16× the current body.
+ * Hard cap on the `/metrics` body we will read.
+ *
+ * B8's "258,741 B, so 4 MB is ~16× the current body" is STALE by 7×.
+ * Re-measured on the live endpoint 2026-07-27: the body is **1,889,558 B**,
+ * which made the old 4 MB cap 2.1×, not 16×. And this change adds
+ * `HINDSIGHT_API_METRICS_INCLUDE_BANK_ID`, whose worst case is ~27 banks ×
+ * the 45,490 B `hindsight_operation_*` block ≈ 1.2 MB more, landing near
+ * 3.1 MB — 76 % of a 4 MB cap. One more metric family, or a fleet twice this
+ * size, crosses it.
+ *
+ * 16 MB restores an ~5× margin over the projected post-change body. The cap
+ * exists to stop an unbounded read, not to police growth; at 16 MB it still
+ * refuses a runaway exposition long before memory pressure matters.
+ *
+ * Sizing it correctly used to be far more load-bearing than it should have
+ * been, because the OVERRUN was fatal: `probe.ts` threw, the throw surfaced
+ * as a `ProbeError`, and that took out the retain and LLM signals too — a
+ * body one byte over the cap blinded every metrics-derived signal at once,
+ * and the recall signals with them. It now degrades: the metrics probe
+ * returns null and only the metrics-derived signals go `no-data` (see
+ * `probe.ts`). An overrun costs exactly the signals that cannot be computed
+ * and nothing else. The raised cap and the degrade are belt and braces,
+ * deliberately — a cap whose breach is silent is not a safety mechanism.
  */
-export const METRICS_MAX_BYTES = 4 * 1024 * 1024;
+export const METRICS_MAX_BYTES = 16 * 1024 * 1024;
 
 /** `/metrics` fetch timeout. The endpoint answers in single-digit ms. */
 export const METRICS_TIMEOUT_MS = 10_000;
@@ -371,6 +391,25 @@ export const METRICS_TIMEOUT_MS = 10_000;
 //
 // Each constant records BOTH the sick reading and the healthy one, because a
 // threshold justified only by the incident is a threshold nobody can retune.
+//
+// THE HEALTHY READING IS THE ONE THAT SETS THE LINE, and it has to be drawn
+// from the right population. The fleet reading above is measured DURING the
+// incident, so it says only "this is broken now" — it cannot say whether a
+// threshold survives the fix. The population that can is rows where no bank
+// timed out, errored, or hit the shared deadline: the best available proxy
+// for a repaired fleet. Over full log history that is n=183 across 9 agents:
+//
+//   own-bank timeout   0 %       (by construction — this is the conditioner)
+//   zero-memory        15.3 %    (warn 25 % → 1.6× headroom, the thinnest)
+//   candidate pool     median 41 (warn 8 → 5×, page 3 → 13×)
+//   injected score     p50 0.0850, but p10 0.0005 … p90 0.9259
+//   recall wall time   p50 6420 ms, p95 8037 ms  ← see RECALL_P95, deleted
+//
+// Two of the originally-proposed lines did NOT survive that test and were
+// re-derived (injected-score warn) or deleted (latency) rather than shipped.
+// A threshold is only calibrated once it has been checked against a fleet
+// that is WORKING; checking it against the outage only proves it can see the
+// outage, which is the easy half.
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -454,39 +493,93 @@ export const RECALL_POOL_MEDIAN_PAGE = 3;
  * memory scoring above 0.01, i.e. the strongest thing the agent was given was
  * indistinguishable from noise.
  *
- * Healthy agents measured 0.61 (reggie), 0.22 (gymbro) and 0.061 (ziggy) —
- * two orders of magnitude above the warn line. The degraded ones measured
- * 0.0005-0.0042. Today's fleet p50 is 0.0011 and pages.
+ * PAGE at 0.01 is the well-founded line. Conditioned on a healthy own bank
+ * (n=74) the p50 is 0.0850; conditioned on a degraded one (n=247) it is
+ * 0.0006 — a ~140× separation, and 98.4 % of degraded rows fall below 0.01
+ * against 28.4 % of healthy ones. A 3000-draw bootstrap of the fleet p50 over
+ * healthy rows fires at 0.01 in 0.0 % of draws at every window size tried.
+ *
+ * WARN was 0.05 and that was WRONG — it is the correction worth recording.
+ * The healthy distribution is not merely wide, it is bimodal, spanning p10
+ * 0.0005 to p90 0.9259: about 3.5 orders of magnitude, because the score is
+ * not calibrated across queries. Its p50 of 0.0850 sits only 1.7× above a
+ * 0.05 line, so bootstrapping the fleet p50 over healthy rows fires in
+ * **22.8 %** of 60-row draws and 15.1 % of 100-row draws — better than one
+ * healthy tick in seven. Hysteresis does not rescue that: consecutive ticks
+ * read overlapping 200-row / 24 h windows, so their breaches are correlated,
+ * not independent, and `BREACHES_TO_FIRE_LEVEL = 2` is close to a single
+ * draw. An earlier revision of this comment also claimed ziggy's healthy
+ * 0.061 was "two orders of magnitude above the warn line"; it is 1.2×, and
+ * ziggy is the number that GOVERNS, being among the lowest healthy readings.
+ * That arithmetic error is what let the line through.
+ *
+ * 0.02 is the re-derived warn: 0.8 % of 60-row healthy draws and 0.0 % at
+ * 100 rows and above, while 98.8 % of degraded rows still fall below it and
+ * it stays ~33× above the degraded p50. Healthy per-agent p50s: finn 0.7523,
+ * reggie 0.5861, gymbro 0.2221, overlord 0.0674, ziggy 0.0601, klanker
+ * 0.0226, marko 0.0182. The last two sit near the line — they are also the
+ * two whose recall was recovering during the sample, and both are far above
+ * the 0.0006 a degraded bank produces.
+ *
+ * The narrow 0.02 → 0.01 band is an honest limitation, not an oversight: on
+ * a bimodal distribution the p50 is a poor estimator, so a genuinely EARLY
+ * warning needs a different statistic, not a different constant. The measured
+ * candidate is the fraction of injected rows scoring below a fixed floor —
+ * healthy 28.4 % vs degraded 98.4 % at a 0.01 floor, which bootstraps to
+ * 0.00 % false-fire and 100 % detection anywhere in a 0.60-0.90 threshold
+ * band. Filed as follow-up #3793 rather than swapped in here, because changing
+ * the estimator changes what the signal MEANS and that deserves its own
+ * review, not a post-review substitution.
  *
  * NOTE the denominator: `injected_score_max` is null when nothing was
  * injected, so this SLI scores only rows that DID inject. That is on purpose
  * — the empty case is `recall-zero-memory`'s job, and folding it in here
  * would make one bad signal out of two good ones.
  */
-export const RECALL_SCORE_P50_WARN = 0.05;
+export const RECALL_SCORE_P50_WARN = 0.02;
 export const RECALL_SCORE_P50_PAGE = 0.01;
 
-/**
- * Recall p95 wall time: warn / page, in ms.
+/*
+ * THERE IS NO `RECALL_P95_WARN_MS` / `RECALL_P95_PAGE_MS`. A recall latency
+ * SLI was drafted at 4 s / 6 s and deleted before it shipped. Recording why,
+ * because the number looked reasonable and the reasoning is the point.
  *
- * `total_elapsed_ms` is the recall hook's whole critical path. The hook's own
- * budget is 12 s (`vendor/hindsight-memory/hooks/hooks.json`) and the
- * per-bank budget is 8 s, so a p95 near 8 000 ms means the tail is not slow —
- * it is *pinned at the deadline*, i.e. timing out. Today's fleet p50 is
- * 8023 ms and p95 is 8053 ms: the distribution has collapsed onto the budget.
+ * The draft justified 4 s / 6 s as sitting "above the 0.6-4.3 s an unloaded
+ * server answers in and below the 8 s wall". That band does not reproduce.
+ * Measured over the healthy-conditioned population — rows where no bank timed
+ * out, errored, or hit the shared deadline, n=183 across 9 agents:
  *
- * 4 s / 6 s sits above the 0.6-4.3 s an unloaded server answers in and below
- * the 8 s wall. It is deliberately CORRELATED with own-bank-timeout rather
- * than independent — at an 8 s per-bank budget, a p95 over 6 s essentially
- * means >5 % of recalls timed out. It earns its place by catching the
- * approach: latency degrades through the 4-6 s band for days before enough
- * requests cross 8 s to move the timeout rate, so this is the early warning
- * and the timeout rate is the confirmation. Both firing at once is expected
- * and is not double-paging a single fault by accident — it is a fault severe
- * enough to have crossed two independent lines.
+ *   FLEET      p50 6420 ms   p75 7566   p90 7935   p95 8037   p99 11426
+ *   per-agent healthy p95: 7816 (ziggy) … 11859 (overlord), every one of the
+ *   nine above 6000 ms; fastest healthy p50 is finn at 4321 ms, itself
+ *   already past the drafted WARN.
+ *
+ * So the PAGE line sat BELOW the healthy median. A 2000-draw bootstrap over
+ * healthy rows breaches 6000 ms in 100.0 % of draws. The failure mode is the
+ * one that matters most for a watchdog: the recall fixes land, timeouts go to
+ * 0 %, pool and scores recover — and this signal pages every 15 minutes
+ * forever on a fleet that is working, training the operator to ignore it.
+ *
+ * Raising it does not save it either. The per-bank budget is 8 s, so healthy
+ * traffic already reaches 8037 ms at p95; any line clear of that noise
+ * (≥12 s bootstraps to 0.0 %) can only ever mean "pinned at the deadline",
+ * which is exactly what `RECALL_OWN_BANK_TIMEOUT` already reports, from a
+ * cleaner instrument. The usable band between the healthy median and the
+ * budget wall is 6420-8000 ms — 1.25× — and no threshold separates healthy
+ * from degraded inside it before the timeout rate does.
+ *
+ * This is the same defect this file already articulates when deleting
+ * `RETAIN_P95_SECONDS` above: the healthy population sits past the threshold
+ * and the instrument saturates at a budget just beyond it. It was caught in
+ * review here rather than after six weeks of alert fatigue, which is the
+ * system working.
+ *
+ * `total_elapsed_ms` is still summarised into `RecallSample.elapsedP95Ms` and
+ * rendered as DIAGNOSTIC context on the own-bank-timeout DM — the datum is
+ * useful, it just cannot carry a threshold today. Restoring the signal needs
+ * a re-baseline against a fleet whose recall is actually fixed, gated on that
+ * measurement rather than on this one; filed as follow-up #3792.
  */
-export const RECALL_P95_WARN_MS = 4_000;
-export const RECALL_P95_PAGE_MS = 6_000;
 
 /**
  * Consolidation queue age: warn / page, in seconds.

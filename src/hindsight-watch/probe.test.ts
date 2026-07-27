@@ -2,7 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProbeError, probeSpool } from "./probe.js";
+import { MetricsTooLargeError, ProbeError, probeMetrics, probeSpool } from "./probe.js";
+import { evaluateFailureRate } from "./evaluate.js";
+import { METRICS_MAX_BYTES } from "./thresholds.js";
+import type { Sample } from "./types.js";
 
 let dir: string;
 
@@ -127,5 +130,80 @@ describe("probeSpool — #3599's loss channels are siblings, not queue entries",
     expect(s.evicted).toBe(1);
     expect(s.drops).toBe(2);
     expect(s.agents).toBe(0); // no readable queue dir
+  });
+});
+
+describe("an over-cap /metrics body degrades instead of blinding the tick", () => {
+  const EXPOSITION = [
+    "# TYPE hindsight_operation_operations_total counter",
+    'hindsight_operation_operations_total{operation="retain",source="api",success="true"} 100.0',
+    'hindsight_operation_operations_total{operation="retain",source="api",success="false"} 3.0',
+    "",
+  ].join("\n");
+
+  function respond(body: string): typeof fetch {
+    return (async () =>
+      new Response(new TextEncoder().encode(body), {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      })) as unknown as typeof fetch;
+  }
+
+  it("reads a normal body into retain counters", async () => {
+    const m = await probeMetrics("http://x/metrics", respond(EXPOSITION));
+    expect(m.retain).toEqual({ ok: 100, fail: 3 });
+  });
+
+  it("throws MetricsTooLargeError — not a bare ProbeError — past the cap", async () => {
+    const huge = `${EXPOSITION}# ${"x".repeat(METRICS_MAX_BYTES)}\n`;
+    await expect(probeMetrics("http://x/metrics", respond(huge))).rejects.toBeInstanceOf(
+      MetricsTooLargeError,
+    );
+  });
+
+  it("still throws a plain ProbeError on a non-200, which DOES blind the tick", async () => {
+    const bad = (async () => new Response("nope", { status: 503 })) as unknown as typeof fetch;
+    const err = await probeMetrics("http://x/metrics", bad).catch((e) => e);
+    expect(err).toBeInstanceOf(ProbeError);
+    expect(err).not.toBeInstanceOf(MetricsTooLargeError);
+  });
+});
+
+describe("evaluateFailureRate with missing retain counters", () => {
+  function tick(ts: number, counts: { retainOk?: number; retainFail?: number }): Sample {
+    return {
+      ts,
+      ...counts,
+      pending: 0,
+      dead: 0,
+      evicted: 0,
+      drops: 0,
+      restartCount: 0,
+      startedAt: "2026-07-27T00:00:00Z",
+      health: "healthy",
+    };
+  }
+
+  it("reports no-data, never ok, when NO tick carried counters", () => {
+    // The whole point of MetricsTooLargeError degrading rather than throwing:
+    // the retain signal must go inert, not clean. An `ok` here would report a
+    // healthy retain path that was never actually measured.
+    const v = evaluateFailureRate([tick(0, {}), tick(60_000, {}), tick(120_000, {})]);
+    expect(v.state).toBe("no-data");
+  });
+
+  it("scores the intervals it HAS and ignores the gap, without diluting the rate", () => {
+    // 0 → 1: 100 ok / 100 fail (a 50% storm). 1 → 2: no counters. 2 → 3: the
+    // counters resume at the same values, so the only measurable interval is
+    // the storm. Zero-filling the gap would halve the rate to 25% and pass.
+    const ring = [
+      tick(0, { retainOk: 0, retainFail: 0 }),
+      tick(60_000, { retainOk: 100, retainFail: 100 }),
+      tick(120_000, {}),
+      tick(180_000, { retainOk: 100, retainFail: 100 }),
+    ];
+    const v = evaluateFailureRate(ring);
+    expect(v.state).toBe("breach");
+    expect((v.measured as { rate: number }).rate).toBeCloseTo(0.5, 6);
   });
 });

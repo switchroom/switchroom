@@ -47,6 +47,35 @@ export class ProbeError extends Error {
   }
 }
 
+/**
+ * The `/metrics` body was larger than `METRICS_MAX_BYTES`.
+ *
+ * Its own class because it is the ONE metrics failure that is not evidence
+ * hindsight is unwell — the endpoint answered, promptly and correctly; we
+ * declined to buffer the answer. Treating it like an outage was a real
+ * defect: `probeOnce` aborts on any `ProbeError`, and `run.ts` then reports
+ * NOTHING ELSE ("a blind watchdog reports nothing else"), so a body one byte
+ * over the cap silenced the recall signals too — and those are read from
+ * local JSONL files that were perfectly readable. A self-imposed buffer limit
+ * must not be able to blind a signal it has nothing to do with.
+ *
+ * So this one degrades: the metrics-derived signals (`retain-failure-rate`,
+ * `llm-fallback-ineffective`) go `no-data`, which is inert and never a pass,
+ * and every other signal evaluates normally. It is NOT truncate-and-parse,
+ * deliberately — a truncated exposition losing the `success="false"` series
+ * would read as zero failures, which is fail-OPEN and precisely the bug class
+ * this whole change exists to remove.
+ */
+export class MetricsTooLargeError extends ProbeError {
+  constructor(
+    readonly bytes: number,
+    readonly cap: number,
+  ) {
+    super(`body ${bytes}B exceeds the ${cap}B cap — metrics-derived signals degrade to no-data`, "metrics");
+    this.name = "MetricsTooLargeError";
+  }
+}
+
 /** The `/metrics` slice one tick consumes. */
 export interface MetricsSample {
   retain: RetainSignals;
@@ -74,11 +103,19 @@ export async function probeMetrics(
   }
   if (!res.ok) throw new ProbeError(`GET ${url} returned HTTP ${res.status}`, "metrics");
   let body: string;
+  let buf: ArrayBuffer;
   try {
-    const buf = await res.arrayBuffer();
-    if (buf.byteLength > METRICS_MAX_BYTES) {
-      throw new Error(`body ${buf.byteLength}B exceeds ${METRICS_MAX_BYTES}B cap`);
-    }
+    buf = await res.arrayBuffer();
+  } catch (e) {
+    throw new ProbeError(`reading ${url}: ${(e as Error).message}`, "metrics");
+  }
+  // Thrown OUTSIDE the try above so it cannot be re-wrapped into a plain
+  // ProbeError — `probeOnce` distinguishes this case by class, and losing the
+  // class here would silently restore the old blind-the-whole-tick behaviour.
+  if (buf.byteLength > METRICS_MAX_BYTES) {
+    throw new MetricsTooLargeError(buf.byteLength, METRICS_MAX_BYTES);
+  }
+  try {
     body = new TextDecoder().decode(buf);
   } catch (e) {
     throw new ProbeError(`reading ${url}: ${(e as Error).message}`, "metrics");
@@ -340,7 +377,16 @@ export async function probeOnce(
 ): Promise<{ sample: Sample; spool: SpoolDepth; recall: RecallStats }> {
   const now = opts.now ?? Date.now;
   const ts = now();
-  const metrics = await probeMetrics(opts.metricsUrl, opts.fetchImpl);
+  // Only an over-cap body degrades. Every OTHER metrics failure — unreachable,
+  // non-200, unparseable — still throws and still blinds the tick, because
+  // those genuinely mean the watchdog cannot see hindsight.
+  let metrics: MetricsSample | null;
+  try {
+    metrics = await probeMetrics(opts.metricsUrl, opts.fetchImpl);
+  } catch (e) {
+    if (!(e instanceof MetricsTooLargeError)) throw e;
+    metrics = null;
+  }
   const container = probeContainer(opts.container, opts.run);
   const spool = probeSpool(opts.agentsDir);
   // `probeSpool` above already threw if the agents dir is unreadable, so this
@@ -357,10 +403,12 @@ export async function probeOnce(
   return {
     sample: {
       ts,
-      retainOk: metrics.retain.ok,
-      retainFail: metrics.retain.fail,
-      llmOk: metrics.llm?.ok,
-      llmFail: metrics.llm?.fail,
+      // Absent — not zero — when the exposition could not be buffered. A zero
+      // here would read as "no retains and no failures", which passes.
+      retainOk: metrics?.retain.ok,
+      retainFail: metrics?.retain.fail,
+      llmOk: metrics?.llm?.ok,
+      llmFail: metrics?.llm?.fail,
       pending: spool.pending,
       dead: spool.dead,
       evicted: spool.evicted,

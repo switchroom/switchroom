@@ -34,13 +34,12 @@ workers issue thousands.
 | `container` | `switchroom-hindsight` unhealthy, restarted, or recreated | edge |
 | `recall-own-bank-timeout` | >5 % (warn) / >15 % (page) of recalls had the agent's **own** bank time out or hard-error | level |
 | `recall-candidate-floor` | median candidate pool (`pre_cap_count + overlap_dropped`) ≤8 (warn) / ≤3 (page) | level |
-| `recall-injected-score` | p50 of `injected_score_max` ≤0.05 (warn) / ≤0.01 (page) | level |
+| `recall-injected-score` | p50 of `injected_score_max` ≤0.02 (warn) / ≤0.01 (page) | level |
 | `recall-zero-memory` | >25 % (warn) / >40 % (page) of recalls injected nothing | level |
-| `recall-latency` | recall p95 ≥4 s (warn) / ≥6 s (page) | level |
 | `consolidation-queue-age` | oldest pending `async_operations` row ≥2 h (warn) / ≥12 h (page) | level |
 | `llm-fallback-ineffective` | ≥2 % (warn) / ≥10 % (page) of hindsight LLM calls failed outright | level |
 
-The six recall signals read `recall_log.jsonl` — the hook's own telemetry —
+The five recall signals read `recall_log.jsonl` — the hook's own telemetry —
 because **every layer of the recall path fails open** and none of the metrics
 above can see it: `recall.py` exits 0 on a bank timeout (blocking the prompt
 would be worse), Claude Code swallows hook stderr on a zero exit, the agent is
@@ -54,6 +53,14 @@ most.** `doctor-recall-health.ts` deliberately does not score `result_count`
 (an empty match is legitimately common), which leaves one failure shape
 completely invisible: a recall that is fast, successful, and near-empty. Those
 two signals are the only things that see it.
+
+Both readings that set a recall threshold are recorded in
+`thresholds.ts`: the one taken during the incident, and — the one that
+actually decides the line — the one taken over rows where recall SUCCEEDED.
+A threshold checked only against the outage proves it can see the outage,
+which is the easy half; the hard half is not firing once the outage is over.
+Two drafted lines failed that second check and were re-derived (injected-score
+warn, 0.05 → 0.02) or deleted (recall latency) before shipping.
 
 Breaches now carry a **severity**: `warn` renders 🟠 "… degraded", `page`
 renders 🔴. Every pre-existing signal sets no severity and stays 🔴.
@@ -89,7 +96,21 @@ measurement in the doc comment. Summary:
   memories", so both are written as `⌈memories × 4.4⌉` in `thresholds.ts`
   (100 → 440, 20 → 88). Without this, five worst-case memories (17 parts
   each = 85 entries) would have paged under the pre-#3610 numbers.
-- **no p95 latency signal** — deliberately removed rather than retuned.
+- **no RECALL latency signal, either** — drafted at 4 s / 6 s and deleted in
+  review for the same reason as the retain one below. Measured over the
+  healthy-conditioned population (no bank timed out, errored, or hit the
+  shared deadline; n=183 across 9 agents) the fleet reads **p50 6420 ms, p95
+  8037 ms**, and every one of the nine agents' healthy p95 lands between
+  7816 ms and 11859 ms. The drafted page line of 6000 ms therefore sat *below
+  the healthy median*, and a resampling test puts its false-fire rate at
+  >90 % of healthy windows. Raising it above the noise does not rescue it
+  either: the per-bank budget is 8 s, so any line clear of healthy traffic can
+  only ever mean "pinned at the deadline", which `recall-own-bank-timeout`
+  already reports from a cleaner instrument. Wall time is still *shown* — it
+  rides along on the own-bank-timeout DM as diagnostic context — it just
+  carries no threshold until recall is repaired and the distribution can be
+  re-baselined.
+- **no RETAIN p95 latency signal** — deliberately removed rather than retuned.
   Hindsight's exposition tops out at a finite `le` of 120 s, and a *healthy*
   post-#3610 backend already runs 52 of 268 retains (19.4 %) past it, because
   #3610 sizes content so a max-size part lands ~276 s inside the 280 s client

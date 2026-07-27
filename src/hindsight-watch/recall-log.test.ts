@@ -7,7 +7,6 @@ import {
   evaluateAll,
   evaluateRecallCandidateFloor,
   evaluateRecallInjectedScore,
-  evaluateRecallLatency,
   evaluateRecallOwnBankTimeout,
   evaluateRecallZeroMemory,
 } from "./evaluate.js";
@@ -20,7 +19,12 @@ import {
   RECALL_MAX_ROW_AGE_MS,
   type RecallLogRow,
 } from "./recall-log.js";
-import { RECALL_MIN_SAMPLES } from "./thresholds.js";
+import {
+  RECALL_MIN_SAMPLES,
+  RECALL_SCORE_P50_PAGE,
+  RECALL_SCORE_P50_WARN,
+} from "./thresholds.js";
+import { HEALTHY_FLEET_ROWS } from "./healthy-fleet.fixture.js";
 import type { Sample } from "./types.js";
 
 /**
@@ -110,22 +114,34 @@ function incidentRows(n = 100): RecallLogRow[] {
   return out;
 }
 
-/** A fleet in the state everyone believed it was in. */
-function healthyRows(n = 100): RecallLogRow[] {
-  const out: RecallLogRow[] = [];
-  for (let i = 0; i < n; i++) {
-    out.push(
-      row({
-        ts: NOW - (n - i) * 60_000,
-        resultCount: i < 10 ? 0 : 6,
-        preCap: 30,
-        overlapDropped: 4,
-        score: HEALTHY_SCORE,
-        elapsedMs: 1100,
-      }),
-    );
-  }
-  return out;
+/**
+ * A healthy fleet — the REAL one, replayed from `healthy-fleet.fixture.ts`.
+ *
+ * Deliberately not synthesised. An earlier version of this helper built every
+ * row at `elapsedMs: 1100` and a constant score of 0.31, which made the
+ * "stays silent on a healthy fleet" test below unable to fail for any
+ * threshold in the drafted range — it asserted the thresholds pointed the
+ * right WAY, while its name promised they were SAFE. Two mis-set lines got
+ * through it. These rows carry the distribution's real tails (score p10
+ * 0.0005, wall time up to 11859 ms, pool as low as 3), so a threshold set
+ * inside healthy noise now fails here instead of on the fleet.
+ */
+function healthyRows(n = HEALTHY_FLEET_ROWS.length): RecallLogRow[] {
+  return HEALTHY_FLEET_ROWS.slice(0, n).map((r, i) => ({
+    // Spread the capture across the window so every row is in-window; the
+    // fixture's own timestamps are irrelevant to every SLI it feeds.
+    ts: new Date(NOW - (n - i) * 60_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    bank_id: r.bank_id,
+    result_count: r.result_count,
+    total_elapsed_ms: r.total_elapsed_ms,
+    deadline_hit: false,
+    pre_cap_count: r.pre_cap_count,
+    overlap_dropped: r.overlap_dropped,
+    injected_score_max: r.injected_score_max,
+    cache_hit: false,
+    error: null,
+    bank_timings: r.bank_timings,
+  })) as RecallLogRow[];
 }
 
 function ringOf(rows: RecallLogRow[]): Sample[] {
@@ -231,10 +247,13 @@ describe("recall signals fire at PAGE level on the real incident", () => {
     expect(v.severity).toBe("page");
   });
 
-  it("latency pages at a p95 pinned to the deadline", () => {
-    const v = evaluateRecallLatency(ring);
-    expect(v.state).toBe("breach");
-    expect(v.severity).toBe("page");
+  it("surfaces the deadline-pinned wall time as DM context, without thresholding it", () => {
+    // `recall-latency` is not a signal (see thresholds.ts), but the number is
+    // still what tells the operator "timed out at the wall" rather than
+    // "errored instantly", so it must reach the DM.
+    const detail = evaluateRecallOwnBankTimeout(ring).detail;
+    expect(detail).toContain("recall wall time p95");
+    expect(detail).toContain("not thresholded");
   });
 
   it("puts the reason, not just the rate, into the operator DM", () => {
@@ -242,19 +261,111 @@ describe("recall signals fire at PAGE level on the real incident", () => {
   });
 });
 
-describe("recall signals stay silent on a healthy fleet", () => {
-  const ring = ringOf(healthyRows());
+describe("recall signals stay silent on a REAL healthy fleet", () => {
+  const rows = healthyRows();
+  const ring = ringOf(rows);
 
-  it("no recall signal breaches", () => {
+  it("no recall signal breaches — not at warn, not at page", () => {
     for (const v of evaluateAll(ring)) {
       if (!v.signal.startsWith("recall-")) continue;
       expect(`${v.signal}=${v.state}`).toBe(`${v.signal}=ok`);
     }
   });
+
+  it("the fixture really is the live distribution, tails included", () => {
+    // Guards the fixture itself. If a regeneration ever flattens it back into
+    // comfortable constants, the safety tests above quietly stop testing
+    // safety — which is exactly how the mis-set thresholds got through. These
+    // are the measured properties recorded in the fixture header.
+    const stats = summarizeRecallRows(rows);
+    expect(stats.rows).toBe(183);
+    // Wall time reaches the 8 s per-bank budget on a HEALTHY fleet. This is
+    // the single number that killed the drafted `recall-latency` signal.
+    expect(stats.elapsedP95Ms).toBeGreaterThanOrEqual(8000);
+    // A bimodal score distribution with a real low tail, not one constant.
+    const scores = rows
+      .map((r) => r.injected_score_max)
+      .filter((s): s is number => typeof s === "number");
+    expect(scores.length).toBeGreaterThan(50);
+    expect(Math.min(...scores)).toBeLessThan(0.001);
+    expect(Math.max(...scores)).toBeGreaterThan(0.9);
+    expect(new Set(scores).size).toBeGreaterThan(50);
+  });
+
+  /**
+   * Resample the healthy fixture into tick-sized windows and measure how
+   * often a candidate threshold WOULD fire. This is the assertion with teeth.
+   *
+   * A single point estimate over all 183 rows is not enough, and the rejected
+   * injected-score warn of 0.05 is the proof: it sits BELOW the healthy p50
+   * of 0.0850, so the "stays silent" test above passes it and stays green —
+   * which is exactly how it survived to review. What condemns it is the
+   * SPREAD. A real tick reads roughly a 60-row window, and on a bimodal
+   * distribution spanning 3.5 orders of magnitude the window p50 swings far
+   * enough to cross 0.05 about a quarter of the time.
+   *
+   * So the safety property being claimed is a false-positive RATE, not an
+   * inequality, and this measures the rate. Seeded LCG rather than
+   * `Math.random` so a failure is a regression and never a flake.
+   */
+  function falseFireRate(
+    values: number[],
+    fires: (windowValues: number[]) => boolean,
+    { windowSize = 60, draws = 2000, seed = 0x5eed } = {},
+  ): number {
+    let s = seed >>> 0;
+    const next = () => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 0x1_0000_0000;
+    };
+    let fired = 0;
+    for (let d = 0; d < draws; d++) {
+      const w: number[] = [];
+      for (let i = 0; i < windowSize; i++) w.push(values[Math.floor(next() * values.length)]!);
+      if (fires(w)) fired++;
+    }
+    return fired / draws;
+  }
+
+  /** Nearest-rank quantile — the same rule `summarizeRecallRows` uses. */
+  function quantile(values: number[], p: number): number {
+    const s = [...values].sort((a, b) => a - b);
+    return s[Math.min(Math.max(1, Math.ceil(p * s.length)), s.length) - 1]!;
+  }
+
+  const healthyScores = rows
+    .map((r) => r.injected_score_max)
+    .filter((s): s is number => typeof s === "number");
+  const healthyLatencies = rows
+    .map((r) => r.total_elapsed_ms)
+    .filter((n): n is number => typeof n === "number");
+
+  it("the SHIPPED injected-score warn almost never fires on healthy traffic", () => {
+    const rate = falseFireRate(healthyScores, (w) => quantile(w, 0.5) <= RECALL_SCORE_P50_WARN);
+    expect(rate).toBeLessThan(0.05);
+    expect(RECALL_SCORE_P50_WARN).toBeGreaterThan(RECALL_SCORE_P50_PAGE);
+  });
+
+  it("the REJECTED injected-score warn of 0.05 fires on healthy traffic — MAJOR 2's evidence", () => {
+    // Restoring 0.05 must not be quietly green. The harm is asserted directly
+    // against real healthy rows, so the constant cannot drift back up without
+    // this stating what it costs.
+    expect(falseFireRate(healthyScores, (w) => quantile(w, 0.5) <= 0.05)).toBeGreaterThan(0.1);
+  });
+
+  it("no recall-latency line below the 8 s budget is safe — BLOCKER 1's evidence", () => {
+    // The drafted signal was warn 4000 / page 6000 ms. Both fire on
+    // essentially every healthy window; even 8000 ms, the per-bank budget
+    // itself, fires on a large fraction. There is no safe band beneath the
+    // budget, which is the entire argument for the signal not existing.
+    expect(falseFireRate(healthyLatencies, (w) => quantile(w, 0.95) >= 4000)).toBeGreaterThan(0.9);
+    expect(falseFireRate(healthyLatencies, (w) => quantile(w, 0.95) >= 6000)).toBeGreaterThan(0.9);
+    expect(falseFireRate(healthyLatencies, (w) => quantile(w, 0.95) >= 8000)).toBeGreaterThan(0.3);
+  });
 });
 
 describe("the fast-empty failure shape specifically", () => {
-  it("pages on pool+score while timeout, zero-memory and latency all read clean", () => {
+  it("pages on pool+score while timeout and zero-memory both read clean", () => {
     // Every bank answered, quickly, with a non-empty result — the exact shape
     // `doctor-recall-health.ts` cannot see, and the reason the candidate-floor
     // and injected-score signals exist.
@@ -275,7 +386,6 @@ describe("the fast-empty failure shape specifically", () => {
     const ring = ringOf(rows);
     expect(evaluateRecallOwnBankTimeout(ring).state).toBe("ok");
     expect(evaluateRecallZeroMemory(ring).state).toBe("ok");
-    expect(evaluateRecallLatency(ring).state).toBe("ok");
     expect(evaluateRecallCandidateFloor(ring).severity).toBe("page");
     expect(evaluateRecallInjectedScore(ring).severity).toBe("page");
   });
@@ -289,7 +399,6 @@ describe("fail-closed reduction", () => {
       evaluateRecallZeroMemory(ring),
       evaluateRecallCandidateFloor(ring),
       evaluateRecallInjectedScore(ring),
-      evaluateRecallLatency(ring),
     ]) {
       expect(`${v.signal}=${v.state}`).toBe(`${v.signal}=no-data`);
     }

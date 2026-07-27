@@ -264,7 +264,6 @@ describe("evaluateAll", () => {
       "llm-fallback-ineffective",
       "recall-candidate-floor",
       "recall-injected-score",
-      "recall-latency",
       "recall-own-bank-timeout",
       "recall-zero-memory",
       "retain-failure-rate",
