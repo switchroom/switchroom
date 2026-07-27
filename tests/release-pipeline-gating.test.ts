@@ -46,6 +46,8 @@ interface Job {
   steps?: Step[];
   env?: Record<string, unknown>;
   permissions?: Permissions;
+  with?: Record<string, unknown>;
+  strategy?: { matrix?: Record<string, unknown> };
   "continue-on-error"?: unknown;
 }
 interface Workflow {
@@ -110,10 +112,60 @@ function contentsScope(wf: Workflow, job: Job): string | null {
 }
 
 /**
+ * The body of every `if [[ … refs/tags/v* ]]` branch inside a `run:` block —
+ * i.e. exactly the lines that decide which image tags a `v*` TAG PUSH
+ * publishes. Comment lines are stripped: the branches carry prose about
+ * `:latest` that must not be mistaken for an assignment of it.
+ */
+function tagPushBranches(wf: Workflow): { job: string; step: string; body: string }[] {
+  const out: { job: string; step: string; body: string }[] = [];
+  for (const [id, job] of Object.entries(wf.jobs ?? {})) {
+    for (const s of stepsOf(job)) {
+      const lines = (s.run ?? "").split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i] as string;
+        if (!/refs\/tags\/v\*/.test(line) || !/^\s*(el)?if\b/.test(line)) continue;
+        const body: string[] = [];
+        for (let j = i + 1; j < lines.length; j++) {
+          if (/^\s*(elif|else|fi)\b/.test(lines[j] as string)) break;
+          if (/^\s*#/.test(lines[j] as string)) continue;
+          body.push(lines[j] as string);
+        }
+        out.push({ job: id, step: s.name ?? "?", body: body.join("\n") });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Every `switchroom-<name>` image docker-images.yml publishes on a tag push:
+ * the `merge-dependents` matrix, plus `base`, plus each standalone build job
+ * identified by its `file: docker/Dockerfile.<name>`.
+ */
+function dockerPublishedImages(docker: Workflow): string[] {
+  const set = new Set<string>(["base"]);
+  const md = docker.jobs?.["merge-dependents"];
+  for (const n of (md?.strategy?.matrix?.image as unknown[] | undefined) ?? []) set.add(String(n));
+  for (const job of Object.values(docker.jobs ?? {})) {
+    for (const s of stepsOf(job)) {
+      const m = /^docker\/Dockerfile\.([\w-]+)$/.exec(String((s as { with?: Record<string, unknown> }).with?.file ?? ""));
+      if (m) set.add(m[1] as string);
+    }
+  }
+  return [...set].sort();
+}
+
+/**
  * The whole rule set, as a list of human-readable problems. Empty = the
  * pipeline cannot half-ship.
  */
-export function auditGating(release: Workflow, npmPublish: Workflow): string[] {
+export function auditGating(
+  release: Workflow,
+  npmPublish: Workflow,
+  docker: Workflow,
+  promote: Workflow,
+): string[] {
   const problems: string[] = [];
   const releaseJobs = Object.entries(release.jobs ?? {});
 
@@ -205,6 +257,9 @@ export function auditGating(release: Workflow, npmPublish: Workflow): string[] {
   for (const [file, wf] of [
     ["release.yml", release],
     ["npm-publish.yml", npmPublish],
+    // promote.yml joined the chain with #3685 — release.yml calls it to
+    // move `:latest`, so the same swallow-nothing rule binds it.
+    ["promote.yml", promote],
   ] as const) {
     for (const [id, job] of Object.entries(wf.jobs ?? {})) {
       const cond = String(job.if ?? "");
@@ -251,6 +306,10 @@ export function auditGating(release: Workflow, npmPublish: Workflow): string[] {
   for (const [file, wf] of [
     ["release.yml", release],
     ["npm-publish.yml", npmPublish],
+    // promote.yml too, since #3685: it is on the release path and holds
+    // `packages: write`, and its `inputs.from` / `inputs.to` are
+    // operator-supplied strings on the workflow_dispatch path.
+    ["promote.yml", promote],
   ] as const) {
     for (const [id, job] of Object.entries(wf.jobs ?? {})) {
       for (const s of stepsOf(job)) {
@@ -361,16 +420,103 @@ export function auditGating(release: Workflow, npmPublish: Workflow): string[] {
     }
   }
 
+  // ── #3685: `:latest` must follow the RELEASE, not the tag push ────────
+  //
+  // docker-images.yml keeps its own `tags: ["v*"]` trigger and runs in
+  // parallel with this pipeline, with no dependency on the binary build,
+  // the release assets or npm. While it also moved `:latest` there, a tag
+  // whose `release` run went red still left `ghcr.io/<owner>/switchroom-*:
+  // latest` pointing at that version — the one half-ship #3654 explicitly
+  // left open. Same reason this file exists at all: none of it is
+  // observable on a PR, and the next time anyone finds out is a release.
+
+  // R12 — a `v*` tag push publishes the VERSION tag only.
+  const tagBranches = tagPushBranches(docker);
+  if (tagBranches.length < 4) {
+    problems.push(
+      `R12: docker-images.yml has ${tagBranches.length} \`refs/tags/v*\` tag-assignment branches; expected at ` +
+        "least 4 (merge-base, merge-dependents, build-hindsight, build-voice). The rule cannot be checked " +
+        "against branches that no longer exist — re-point it at whatever replaced them.",
+    );
+  }
+  for (const b of tagBranches) {
+    if (/latest/.test(b.body)) {
+      problems.push(
+        `R12: docker-images.yml job ${b.job} step "${b.step}" assigns \`:latest\` on a \`v*\` tag push — that ` +
+          "moves it on the TAG, not on the release succeeding, so a red release leaves :latest broken. " +
+          "release.yml's promote job owns :latest now.",
+      );
+    }
+    if (!/TAG_VERSION/.test(b.body)) {
+      problems.push(
+        `R12: docker-images.yml job ${b.job} step "${b.step}" no longer publishes the \`:vX.Y.Z\` version tag on a ` +
+          "tag push — release.yml's images-gate and the :latest promotion both depend on it existing.",
+      );
+    }
+  }
+
+  // R13 — and release.yml is what moves it, strictly after the release is
+  // published. `needs: <the un-draft job>` inherits the whole green chain
+  // (assets + images-gate + npm), so this one edge is the guarantee.
+  if (!promote.on || !Object.prototype.hasOwnProperty.call(promote.on, "workflow_call")) {
+    problems.push("R13: promote.yml has no `workflow_call` trigger — release.yml cannot invoke it.");
+  }
+  const latestEntry = releaseJobs.find(([, j]) => (j.uses ?? "").endsWith("promote.yml"));
+  if (!latestEntry) {
+    problems.push(
+      "R13: release.yml has no job that promotes the release's image tag to `:latest`. With R12 in force nothing " +
+        "else does, so `:latest` would freeze at the last main push forever.",
+    );
+  } else {
+    const [id, job] = latestEntry;
+    const to = String(job.with?.to ?? "");
+    const from = String(job.with?.from ?? "");
+    if (to !== "latest") {
+      problems.push(`R13: the promotion job (${id}) promotes to '${to}', not 'latest'.`);
+    }
+    if (!from.includes("github.ref_name")) {
+      problems.push(
+        `R13: the promotion job (${id}) promotes from '${from}' rather than this run's tag — :latest must land on ` +
+          "the image built for the tag being released.",
+      );
+    }
+    if (undraftEntry && !needsOf(job).includes(undraftEntry[0])) {
+      problems.push(
+        `R13: the promotion job (${id}) does not \`needs: ${undraftEntry[0]}\` — :latest could move for a release ` +
+          "that is still a draft, or whose npm/asset legs failed. That is the #3685 defect with a new owner.",
+      );
+    }
+  }
+
+  // R14 — promote.yml's matrix must cover every image docker-images
+  // publishes on a tag. An image missing from it is one whose `:latest`
+  // silently stops advancing at release time: nothing fails, the tag just
+  // never moves. `web` was exactly this — in docker-images' dependents
+  // matrix, absent from promote.yml — harmless while promote was
+  // dispatch-only, a real hole once the release path depends on it.
+  const expectedImages = dockerPublishedImages(docker);
+  const promoteImages = [
+    ...((promote.jobs?.promote?.strategy?.matrix?.image as unknown[] | undefined) ?? []).map(String),
+  ].sort();
+  const uncovered = expectedImages.filter((n) => !promoteImages.includes(n));
+  if (uncovered.length > 0) {
+    problems.push(
+      `R14: promote.yml's matrix omits [${uncovered.join(", ")}], which docker-images.yml publishes on a tag — ` +
+        "their `:latest` would silently stop advancing at release time.",
+    );
+  }
+
   return problems;
 }
 
 const RELEASE = load("release.yml");
 const NPM = load("npm-publish.yml");
 const DOCKER = load("docker-images.yml");
+const PROMOTE = load("promote.yml");
 
 describe("release pipeline gating — the real workflows", () => {
   it("has no gating problems", () => {
-    expect(auditGating(RELEASE, NPM)).toEqual([]);
+    expect(auditGating(RELEASE, NPM, DOCKER, PROMOTE)).toEqual([]);
   });
 
   it("keeps npm-publish unreachable from a tag push, and callable by release.yml", () => {
@@ -417,11 +563,13 @@ describe("release pipeline gating — the real workflows", () => {
 });
 
 /** Deep-clone the real workflows and weaken them the way a careless edit would. */
-function mutate(fn: (r: Workflow, n: Workflow) => void): string[] {
+function mutate(fn: (r: Workflow, n: Workflow, d: Workflow, p: Workflow) => void): string[] {
   const r = clone(RELEASE);
   const n = clone(NPM);
-  fn(r, n);
-  return auditGating(r, n);
+  const d = clone(DOCKER);
+  const p = clone(PROMOTE);
+  fn(r, n, d, p);
+  return auditGating(r, n, d, p);
 }
 
 describe("release pipeline gating — every rule is proved by mutation", () => {
@@ -671,6 +819,121 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
       jobDoing(r, "--draft=false")![1].permissions = { actions: "read" };
     });
     expect(p.join("\n")).toMatch(/R11: release\.yml job finalize .*`contents: none`/);
+  });
+
+  // ── R12/R13/R14: the #3685 defect, reproduced ──────────────────────────
+  //
+  // The pre-#3685 tree is the mutation that matters: putting `-t
+  // "${IMAGE}:latest"` back into docker-images' tag branch IS the bug, and
+  // R12 is the only rule that fires on it — which is also why it survived
+  // #3654 unnoticed.
+  it("R12: the pre-#3685 tree — docker-images moving `:latest` on a tag push — is caught", () => {
+    const p = mutate((_r, _n, d) => {
+      const step = stepsOf(d.jobs!["merge-base"]!).find((s) => (s.run ?? "").includes("refs/tags/v*"))!;
+      step.run = step.run!.replace(
+        'TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}")',
+        'TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")',
+      );
+    });
+    expect(p.join("\n")).toMatch(/R12: docker-images\.yml job merge-base .*assigns `:latest` on a `v\*` tag push/s);
+  });
+
+  it("R12: the same regression in the hindsight/voice `tags=` form is caught", () => {
+    const p = mutate((_r, _n, d) => {
+      const step = stepsOf(d.jobs!["build-voice"]!).find((s) => (s.run ?? "").includes("refs/tags/v*"))!;
+      step.run = step.run!.replace(
+        'echo "tags=${IMAGE}:${TAG_VERSION}" >> "$GITHUB_OUTPUT"',
+        'echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"',
+      );
+    });
+    expect(p.join("\n")).toMatch(/R12: docker-images\.yml job build-voice/);
+  });
+
+  it("R12: dropping the version tag from a tag push is caught too", () => {
+    // The over-correction: publishing nothing on a tag would starve both
+    // images-gate and the :latest promotion.
+    const p = mutate((_r, _n, d) => {
+      const step = stepsOf(d.jobs!["merge-dependents"]!).find((s) => (s.run ?? "").includes("refs/tags/v*"))!;
+      step.run = step.run!.replace('TAG_VERSION="${GITHUB_REF#refs/tags/}"', ":").replace(
+        'TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}")',
+        'TAG_ARGS=(-t "${IMAGE}:x")',
+      );
+    });
+    expect(p.join("\n")).toMatch(/R12: docker-images\.yml job merge-dependents .*no longer publishes/s);
+  });
+
+  it("R12: deleting the tag branches outright cannot vacuously pass", () => {
+    const p = mutate((_r, _n, d) => {
+      for (const job of Object.values(d.jobs!)) {
+        for (const s of stepsOf(job)) {
+          if (s.run) s.run = s.run.replace(/refs\/tags\/v\*/g, "refs/heads/nope");
+        }
+      }
+    });
+    expect(p.join("\n")).toMatch(/R12: docker-images\.yml has 0 `refs\/tags\/v\*` tag-assignment branches/);
+  });
+
+  it("R13: deleting the :latest promotion job is caught", () => {
+    const p = mutate((r) => {
+      const id = Object.entries(r.jobs!).find(([, j]) => (j.uses ?? "").endsWith("promote.yml"))![0];
+      delete r.jobs![id];
+    });
+    expect(p.join("\n")).toMatch(/R13: release\.yml has no job that promotes/);
+  });
+
+  it("R13: promoting :latest without waiting for the release to be published is caught", () => {
+    // The tempting "move it early so the fleet gets it sooner" edit — which
+    // reinstates #3685 inside release.yml instead of docker-images.yml.
+    const p = mutate((r) => {
+      const job = Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!;
+      job.needs = ["bundle"];
+    });
+    expect(p.join("\n")).toMatch(/R13: the promotion job \(images-latest\) does not `needs: finalize`/);
+  });
+
+  it("R13: promoting the wrong source or destination tag is caught", () => {
+    expect(
+      mutate((r) => {
+        Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!.with!.to = "rc";
+      }).join("\n"),
+    ).toMatch(/R13: the promotion job \(images-latest\) promotes to 'rc'/);
+    expect(
+      mutate((r) => {
+        Object.values(r.jobs!).find((j) => (j.uses ?? "").endsWith("promote.yml"))!.with!.from = "dev";
+      }).join("\n"),
+    ).toMatch(/R13: the promotion job \(images-latest\) promotes from 'dev'/);
+  });
+
+  it("R13: removing workflow_call from promote.yml is caught", () => {
+    const p = mutate((_r, _n, _d, pr) => {
+      delete (pr.on as Record<string, unknown>).workflow_call;
+    });
+    expect(p.join("\n")).toMatch(/R13: promote\.yml has no `workflow_call` trigger/);
+  });
+
+  it("R14: the `web` gap — an image docker-images tags but promote.yml does not — is caught", () => {
+    // promote.yml really did ship without `web` while docker-images'
+    // merge-dependents matrix had it. Dispatch-only, that was cosmetic;
+    // on the release path it means switchroom-web:latest stops advancing.
+    const p = mutate((_r, _n, _d, pr) => {
+      const m = pr.jobs!.promote!.strategy!.matrix as { image: string[] };
+      m.image = m.image.filter((i) => i !== "web");
+    });
+    expect(p.join("\n")).toMatch(/R14: promote\.yml's matrix omits \[web\]/);
+  });
+
+  it("R14: a new image in docker-images that promote.yml never learns about is caught", () => {
+    const p = mutate((_r, _n, d) => {
+      (d.jobs!["merge-dependents"]!.strategy!.matrix as { image: string[] }).image.push("newthing");
+    });
+    expect(p.join("\n")).toMatch(/R14: promote\.yml's matrix omits \[newthing\]/);
+  });
+
+  it("R8: interpolating an operator-supplied input into promote.yml's run body is caught", () => {
+    const p = mutate((_r, _n, _d, pr) => {
+      stepsOf(pr.jobs!.promote!)[1]!.run = 'echo "${{ inputs.from }}"';
+    });
+    expect(p.join("\n")).toMatch(/R8: promote\.yml/);
   });
 
   // Guards the rule against over-firing: GitHub really does inherit env from

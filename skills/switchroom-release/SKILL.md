@@ -100,7 +100,8 @@ The tag push triggers `docker-images` and `release`. `release` internally waits 
 
 ### Gate B — the release pipeline (`release.yml`)
 - `gh run list --workflow=release.yml --limit 1` — wait for `completed` / `success`. Expect ~25-30 minutes: four native build legs plus the wait on `docker-images`.
-- Its jobs, in order: `guard` (release exists + held out of `latest`) → `build` ×4 → `bundle` → `publish` (attach) → `images-gate` (wait on docker-images) → `npm` → `finalize` (un-draft). A red job anywhere leaves the release a **draft** and npm **unpublished** — which is the correct, recoverable state.
+- Its jobs, in order: `guard` (release exists + held out of `latest`) → `build` ×4 → `bundle` → `publish` (attach) → `images-gate` (wait on docker-images) → `npm` → `finalize` (un-draft) → `images-latest` (promote `:vX.Y.Z` → `:latest`). A red job anywhere leaves the release a **draft** and npm **unpublished** — which is the correct, recoverable state.
+- `images-latest` is why a tag push no longer moves the `:latest` image tag by itself (#3685). If that last job is the one that failed, every other leg shipped and only the image tag lags: re-run it with `gh workflow run promote.yml -f from=vX.Y.Z -f to=latest`. Don't roll the fleet off `:latest` until it is green — `docker manifest inspect ghcr.io/switchroom/switchroom-agent:latest` should report the same digest as `:vX.Y.Z`.
 - Verify the release page actually has assets **and is no longer a draft**:
   ```bash
   gh release view vX.Y.Z -R switchroom/switchroom --json isDraft,assets \

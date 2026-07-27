@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### `:latest` follows the release succeeding, not the tag push
+
+#3654 made a `v*` tag unable to half-ship for the two legs that cannot be
+walked back — npm lost its tag trigger, and the GitHub Release is held as a
+draft until every leg is green — and explicitly left the third: `docker-images`
+kept its own `tags: ["v*"]` trigger and moved `:latest` for every image on the
+tag push, with no dependency on the binary build, the release assets or npm. A
+tag whose `release` run went red still left `ghcr.io/switchroom/*:latest`
+pointing at that version.
+
+A tag push now publishes `:vX.Y.Z` only, and `release.yml` grew a terminal
+`images-latest` job that promotes `:vX.Y.Z` → `:latest` through `promote.yml`
+once every leg is green. The whole edit inside `docker-images.yml` is four
+tag-branch lines; its matrix, its PR / main-push / `merge_group` paths and the
+`images-ok` required check are untouched. That was the point — the issue's
+cleaner-looking option was to lift `:latest` promotion out of `docker-images`
+into a job `release.yml` calls, but `docker-images` also serves every PR and
+every main push, and restructuring it to gate the one leg that is *recoverable*
+inverts the cost/benefit that justified gating npm.
+
+`images-latest` runs **after** `finalize`, deliberately. Its failure mode is
+then `:latest` LAGGING the release — the previous good image keeps serving
+`switchroom update`, and `gh workflow run promote.yml -f from=vX.Y.Z -f
+to=latest` finishes the job. Running it before `finalize` would invert that
+into `:latest` leading a release that never got published, which is the failure
+being fixed wearing a different hat.
+
+Two things found while wiring it, both now load-bearing rather than incidental:
+
+- **`promote.yml`'s matrix was missing `web`** while `docker-images`'
+  `merge-dependents` matrix had it. Dispatch-only, that was cosmetic; on the
+  release path it means `switchroom-web:latest` silently stops advancing at
+  release time, with nothing failing. The matrix is now the full nine, and the
+  expected set is *derived from `docker-images.yml`* by the test rather than
+  restated, so the next image added cannot reopen the gap.
+- **`promote.yml` interpolated `${{ inputs.from }}` / `${{ inputs.to }}`
+  straight into `run:` bodies.** Those are operator-supplied strings on the
+  dispatch path, in a job holding `packages: write`; they go through `env:` now,
+  the same rule `release.yml` and `npm-publish.yml` already followed.
+
+None of this is observable on a pull request — `release.yml` and `promote.yml`
+have no PR trigger, and `docker-images`' tag branch runs only on a real tag —
+so it is pinned structurally instead. `tests/release-pipeline-gating.test.ts`
+gains R12 (a `v*` tag push publishes the version tag and nothing named
+`latest`), R13 (`release.yml` has a job promoting this run's tag to `:latest`,
+and it `needs:` the un-draft job, so it inherits the whole green chain) and R14
+(matrix coverage). Every rule is proved by mutation against the pre-#3685 tree:
+reconstructing it fires R12 on all four sites, R13 twice and R14 on `web`.
+
+Deliberately NOT done: `docker-images.yml` was not converted into a
+`workflow_call` callee, the `:dev` / `:rc` channels and `promote-to-dev` are
+untouched, and the rollout canary's `--version` assertion stays the guard
+against the `:latest` pull-race — it covers a different failure (a stale pull)
+than this one (a wrong tag).
+
 ### The hindsight LLM token budget is derived from a declared context window (#3717, #3730)
 
 Hindsight's retain / reflect / consolidation calls were sized by hand-tuned

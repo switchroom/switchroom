@@ -6,7 +6,10 @@ name: docker-images
 #   - push to main: build all images for linux/amd64 + linux/arm64,
 #     push as `:latest` and `:sha-<short>` to
 #     ghcr.io/<owner>/switchroom-<image>.
-#   - tag push v*: same matrix, push as `:<tag>` and `:latest`.
+#   - tag push v*: same matrix, push as `:<tag>` ONLY. `:latest` is NOT
+#     moved here — release.yml's `images-latest` job promotes
+#     `:vX.Y.Z` → `:latest` (via promote.yml) after every release leg is
+#     green. See #3685 and the tag-branch comment in merge-base.
 #   - pull_request: build only (no push) to validate Dockerfile changes.
 #
 # Pipelines (perf rework, follows #2807):
@@ -353,8 +356,17 @@ jobs:
             fi
           fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # #3685: a tag push publishes the VERSION tag only. Moving
+            # :latest here made it follow the TAG PUSH rather than the
+            # release's success — docker-images has no dependency on the
+            # binary build, the release assets or npm, so a red release
+            # still left ghcr.io/switchroom/*:latest on that version.
+            # release.yml's `images-latest` job promotes :vX.Y.Z ->
+            # :latest through promote.yml once every leg is green. The
+            # failure mode is now :latest lagging (recoverable by
+            # dispatching promote.yml) instead of :latest leading.
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
-            TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")
+            TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}")
           elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             # PR C: keep :latest as the canonical install per
             # docs/operators/install.md, BUT also publish :sha-<7> for
@@ -528,8 +540,9 @@ jobs:
             fi
           fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Version tag only on a tag push — see merge-base (#3685).
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
-            TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")
+            TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}")
           elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             TAG_ARGS=(-t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA_SHORT}")
           else
@@ -604,8 +617,9 @@ jobs:
             fi
           fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Version tag only on a tag push — see merge-base (#3685).
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
-            echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            echo "tags=${IMAGE}:${TAG_VERSION}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
@@ -704,8 +718,9 @@ jobs:
             fi
           fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Version tag only on a tag push — see merge-base (#3685).
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
-            echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            echo "tags=${IMAGE}:${TAG_VERSION}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event_name }}" == "merge_group" ]]; then

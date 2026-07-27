@@ -61,6 +61,10 @@ name: release
 #   images-gate ─────────────────────┬┴─▶ npm (workflow_call → npm-publish.yml)
 #   (waits for docker-images)        │            │
 #                                    └────────────┴──▶ finalize (un-draft)
+#                                                          │
+#                                                          └─▶ images-latest
+#                                                     (workflow_call → promote.yml,
+#                                                      :vX.Y.Z → :latest)
 #
 # Two invariants, both mechanical rather than procedural:
 #
@@ -83,11 +87,26 @@ name: release
 #      `/releases/latest` was v0.19.19, `draft: false`, `assets: []` — every
 #      `curl | sh` install on every platform was 404ing on the download.)
 #
-# NOT closed by this: docker-images still moves the `:latest` IMAGE tag on a
-# tag push regardless of the other legs. That is deliberate scope — image
-# tags are retaggable (promote.yml) where npm and `/releases/latest` are not,
-# and folding docker-images into this pipeline would mean restructuring the
-# workflow that also serves every PR and main push. Tracked in #3685.
+#   3. THE `:latest` IMAGE TAG FOLLOWS THE RELEASE, NOT THE TAG PUSH (#3685).
+#      docker-images.yml used to move `:latest` for every image on the tag
+#      push itself, with no dependency on the binary build, the assets or
+#      npm — so a red release left `ghcr.io/switchroom/*:latest` on that
+#      version. It now publishes `:vX.Y.Z` only, and `images-latest` below
+#      promotes `:vX.Y.Z` → `:latest` after `finalize`.
+#
+#      docker-images.yml was NOT folded into this pipeline via
+#      `workflow_call` — it also serves every PR and main push and carries
+#      the `images-ok` required check, so converting it would put the whole
+#      image pipeline at risk to gate one leg. Only the four tag-branch
+#      `imagetools`/`tags=` lines changed there; the matrix, the PR/main
+#      paths and `images-ok` are untouched.
+#
+#      `images-latest` runs LAST, after `finalize`, deliberately. Its
+#      failure mode is then `:latest` LAGGING the release (the previous
+#      good image keeps serving `switchroom update`), recoverable with
+#      `gh workflow run promote.yml -f from=vX.Y.Z -f to=latest`. Running
+#      it before `finalize` would invert that into `:latest` LEADING a
+#      release that never got published — the failure #3685 is about.
 
 on:
   push:
@@ -645,3 +664,39 @@ jobs:
             exit 1
           fi
           echo "Release $EXPECT_TAG is published with a complete asset bundle."
+
+  # #3685: move `ghcr.io/<owner>/switchroom-*:latest` onto this release —
+  # and only now, after every leg (binaries, assets, docker-images, npm,
+  # the un-drafted GitHub Release) is green.
+  #
+  # `needs: finalize` is the whole point of the job: `finalize` already
+  # `needs: [publish, images-gate, npm]`, so depending on it inherits the
+  # full chain. A plain `needs:` (no `always()`, no `!cancelled()`), like
+  # every other job here — R6 in tests/release-pipeline-gating.test.ts
+  # would fail the build otherwise.
+  #
+  # promote.yml does the work rather than an inline `imagetools create`
+  # loop: it already prechecks the source tag, retags without rebuilding
+  # (so the promoted `:latest` carries the same manifest digest and the
+  # signed provenance the tag build attached) and verifies digest equality
+  # afterwards. It stays the operator's hand-promotion surface too, so a
+  # failure here is re-run with
+  # `gh workflow run promote.yml -f from=<tag> -f to=latest`.
+  images-latest:
+    name: promote :vX.Y.Z to :latest
+    needs: finalize
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.dry_run == false &&
+       startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      # A caller job's block CAPS the called workflow's token (the R11
+      # lesson one axis over): promote.yml's own `packages: write` is a
+      # no-op unless it is granted here too.
+      contents: read
+      packages: write
+    uses: ./.github/workflows/promote.yml
+    with:
+      from: ${{ github.ref_name }}
+      to: latest
