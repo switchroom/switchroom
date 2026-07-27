@@ -90,18 +90,39 @@ export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
 
 /**
  * First-boot fallback tool manifest: tool name -> [required, allProps].
- * Derived from tests/fixtures/hindsight-tools-list.snapshot.json (captured
- * live from hindsight on 2026-06-07; upstream's tool surface is stable).
- * Schemas are deliberately permissive ({} per property) — the point is
- * that the tools EXIST at session start; the first successful live
- * tools/list replaces this with the backend's real schemas via the disk
- * cache. The "static fallback manifest" describe block in
- * tests/hindsight-mcp-shim.test.ts pins this table against the snapshot
- * fixture so the two can never drift silently.
+ * MUST mirror `tests/fixtures/hindsight-tools-list.snapshot.json` exactly:
+ * `tests/memory.hindsight-contract.fixture.test.ts` asserts the tool names,
+ * `required` sets and `props` sets are identical, so the two can never drift
+ * silently.
+ *
+ * Schemas are deliberately permissive ({} per property) — the point is that
+ * the tools EXIST at session start; the first successful live tools/list
+ * replaces this with the backend's real schemas via the disk cache.
+ *
+ * WHY THE EQUALITY IS PINNED (2026-07-27, hindsight 0.8.4 audit): this table
+ * was hand-copied from a 2026-06-07 capture and then never re-synced. By the
+ * time the fleet ran 0.8.4 it was missing THREE whole tools —
+ * `update_memory`, `invalidate_memory`, `clear_mental_model` — plus six
+ * accepted props. Those are exactly the tools `switchroom memory demote` and
+ * `switchroom vault-sweep` reach for, so on a first boot (or any boot where
+ * hindsight is unreachable and the shim serves the fallback) the agent's
+ * advertised memory surface silently omitted them. From inside the session a
+ * stale fallback is indistinguishable from an upstream removal — which is the
+ * exact failure mode this shim exists to prevent.
+ *
+ * OVER-REPORTING IS THE WORSE HALF, so this table must never run AHEAD of the
+ * pinned image either. Advertising a prop the server does not accept is not a
+ * harmless optimism: hindsight drops an unknown argument SILENTLY and answers
+ * isError:false, so an agent that reads `list_memories.tags` off this manifest
+ * and issues a tag-scoped query on 0.8.4 receives the UNFILTERED list and
+ * believes it was filtered (verified live). The snapshot is therefore a
+ * verbatim 0.8.4 capture with no forward-patch, and re-capturing it against
+ * 0.8.5 belongs with the image bump in #3768.
  */
 export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   cancel_operation: [["operation_id"], ["bank_id", "operation_id"]],
   clear_memories: [[], ["bank_id", "type"]],
+  clear_mental_model: [["mental_model_id"], ["bank_id", "mental_model_id"]],
   create_bank: [["bank_id"], ["bank_id", "mission", "name"]],
   create_directive: [["content", "name"], ["bank_id", "content", "is_active", "name", "priority", "tags"]],
   create_mental_model: [["name", "source_query"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "trigger_refresh_after_consolidation"]],
@@ -115,6 +136,7 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   get_memory: [["memory_id"], ["bank_id", "memory_id"]],
   get_mental_model: [["mental_model_id"], ["bank_id", "detail", "mental_model_id"]],
   get_operation: [["operation_id"], ["bank_id", "operation_id"]],
+  invalidate_memory: [["memory_id"], ["bank_id", "memory_id", "reason", "restore"]],
   list_banks: [[], []],
   list_directives: [[], ["active_only", "bank_id", "tags"]],
   list_documents: [[], ["bank_id", "limit", "q"]],
@@ -122,12 +144,13 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   list_mental_models: [[], ["bank_id", "detail", "tags"]],
   list_operations: [[], ["bank_id", "limit", "status"]],
   list_tags: [[], ["bank_id", "limit", "q"]],
-  recall: [["query"], ["bank_id", "budget", "max_tokens", "query", "query_timestamp", "tag_groups", "tags", "tags_match", "types"]],
-  reflect: [["query"], ["bank_id", "budget", "context", "max_tokens", "query", "response_schema", "tags", "tags_match"]],
+  recall: [["query"], ["bank_id", "budget", "max_tokens", "min_scores", "prefer_observations", "query", "query_timestamp", "tag_groups", "tags", "tags_match", "types"]],
+  reflect: [["query"], ["bank_id", "budget", "context", "include_based_on", "include_trace", "max_tokens", "query", "response_schema", "tags", "tags_match"]],
   refresh_mental_model: [["mental_model_id"], ["bank_id", "mental_model_id"]],
   retain: [["content"], ["bank_id", "content", "context", "document_id", "metadata", "strategy", "tags", "timestamp", "update_mode"]],
   sync_retain: [["content"], ["bank_id", "content", "context", "document_id", "metadata", "strategy", "tags", "timestamp"]],
   update_bank: [[], ["bank_id", "config_updates", "mission", "name"]],
+  update_memory: [["memory_id"], ["bank_id", "context", "entities", "fact_type", "memory_id", "occurred_end", "occurred_start", "text"]],
   update_mental_model: [["mental_model_id"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "trigger_refresh_after_consolidation"]],
 };
 

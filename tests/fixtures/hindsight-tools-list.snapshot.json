@@ -1,295 +1,336 @@
 {
-  "_meta": {
-    "captured_from": "http://127.0.0.1:18888/mcp/",
-    "server": "switchroom-hindsight",
-    "captured_at": "2026-06-07",
-    "count": 29
+ "_meta": {
+  "captured_from": "http://127.0.0.1:18888/mcp/",
+  "server": "switchroom-hindsight",
+  "captured_at": "2026-07-27",
+  "hindsight_api_version": "0.8.4",
+  "count": 32,
+  "note": "Verbatim live tools/list capture from the running hindsight backend (api_version 0.8.4 per GET /version), which is the version docker/Dockerfile.hindsight pins. NOT forward-patched: an earlier revision of this file described the 0.8.5 surface while the fleet ran 0.8.4, which made src/cli/hindsight-mcp-shim.ts's cold-boot fallback advertise three props the server does not accept (list_memories.tags, list_memories.tags_match, create_mental_model.tags_match). Hindsight drops an unknown argument SILENTLY (isError:false), so an agent issuing a tag-filtered list_memories on 0.8.4 gets the UNFILTERED list back and believes it was filtered — a silent wrong answer, which is exactly what this snapshot exists to prevent. The 0.8.5 delta is known and additive (those same three props; no tools added or removed, both wheels register 32) — re-capture this file against 0.8.5 and bump _meta.hindsight_api_version when #3768 bumps the image pin."
+ },
+ "tools": {
+  "retain": {
+   "required": [
+    "content"
+   ],
+   "props": [
+    "bank_id",
+    "content",
+    "context",
+    "document_id",
+    "metadata",
+    "strategy",
+    "tags",
+    "timestamp",
+    "update_mode"
+   ]
   },
-  "tools": {
-    "cancel_operation": {
-      "required": [
-        "operation_id"
-      ],
-      "props": [
-        "bank_id",
-        "operation_id"
-      ]
-    },
-    "clear_memories": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "type"
-      ]
-    },
-    "create_bank": {
-      "required": [
-        "bank_id"
-      ],
-      "props": [
-        "bank_id",
-        "mission",
-        "name"
-      ]
-    },
-    "create_directive": {
-      "required": [
-        "content",
-        "name"
-      ],
-      "props": [
-        "bank_id",
-        "content",
-        "is_active",
-        "name",
-        "priority",
-        "tags"
-      ]
-    },
-    "create_mental_model": {
-      "required": [
-        "name",
-        "source_query"
-      ],
-      "props": [
-        "bank_id",
-        "max_tokens",
-        "mental_model_id",
-        "name",
-        "source_query",
-        "tags",
-        "trigger_refresh_after_consolidation"
-      ]
-    },
-    "delete_bank": {
-      "required": [],
-      "props": [
-        "bank_id"
-      ]
-    },
-    "delete_directive": {
-      "required": [
-        "directive_id"
-      ],
-      "props": [
-        "bank_id",
-        "directive_id"
-      ]
-    },
-    "delete_document": {
-      "required": [
-        "document_id"
-      ],
-      "props": [
-        "bank_id",
-        "document_id"
-      ]
-    },
-    "delete_mental_model": {
-      "required": [
-        "mental_model_id"
-      ],
-      "props": [
-        "bank_id",
-        "mental_model_id"
-      ]
-    },
-    "get_bank": {
-      "required": [],
-      "props": [
-        "bank_id"
-      ]
-    },
-    "get_bank_stats": {
-      "required": [],
-      "props": [
-        "bank_id"
-      ]
-    },
-    "get_document": {
-      "required": [
-        "document_id"
-      ],
-      "props": [
-        "bank_id",
-        "document_id"
-      ]
-    },
-    "get_memory": {
-      "required": [
-        "memory_id"
-      ],
-      "props": [
-        "bank_id",
-        "memory_id"
-      ]
-    },
-    "get_mental_model": {
-      "required": [
-        "mental_model_id"
-      ],
-      "props": [
-        "bank_id",
-        "detail",
-        "mental_model_id"
-      ]
-    },
-    "get_operation": {
-      "required": [
-        "operation_id"
-      ],
-      "props": [
-        "bank_id",
-        "operation_id"
-      ]
-    },
-    "list_banks": {
-      "required": [],
-      "props": []
-    },
-    "list_directives": {
-      "required": [],
-      "props": [
-        "active_only",
-        "bank_id",
-        "tags"
-      ]
-    },
-    "list_documents": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "limit",
-        "q"
-      ]
-    },
-    "list_memories": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "limit",
-        "offset",
-        "q",
-        "type"
-      ]
-    },
-    "list_mental_models": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "detail",
-        "tags"
-      ]
-    },
-    "list_operations": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "limit",
-        "status"
-      ]
-    },
-    "list_tags": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "limit",
-        "q"
-      ]
-    },
-    "recall": {
-      "required": [
-        "query"
-      ],
-      "props": [
-        "bank_id",
-        "budget",
-        "max_tokens",
-        "query",
-        "query_timestamp",
-        "tag_groups",
-        "tags",
-        "tags_match",
-        "types"
-      ]
-    },
-    "reflect": {
-      "required": [
-        "query"
-      ],
-      "props": [
-        "bank_id",
-        "budget",
-        "context",
-        "max_tokens",
-        "query",
-        "response_schema",
-        "tags",
-        "tags_match"
-      ]
-    },
-    "refresh_mental_model": {
-      "required": [
-        "mental_model_id"
-      ],
-      "props": [
-        "bank_id",
-        "mental_model_id"
-      ]
-    },
-    "retain": {
-      "required": [
-        "content"
-      ],
-      "props": [
-        "bank_id",
-        "content",
-        "context",
-        "document_id",
-        "metadata",
-        "strategy",
-        "tags",
-        "timestamp",
-        "update_mode"
-      ]
-    },
-    "sync_retain": {
-      "required": [
-        "content"
-      ],
-      "props": [
-        "bank_id",
-        "content",
-        "context",
-        "document_id",
-        "metadata",
-        "strategy",
-        "tags",
-        "timestamp"
-      ]
-    },
-    "update_bank": {
-      "required": [],
-      "props": [
-        "bank_id",
-        "config_updates",
-        "mission",
-        "name"
-      ]
-    },
-    "update_mental_model": {
-      "required": [
-        "mental_model_id"
-      ],
-      "props": [
-        "bank_id",
-        "max_tokens",
-        "mental_model_id",
-        "name",
-        "source_query",
-        "tags",
-        "trigger_refresh_after_consolidation"
-      ]
-    }
+  "sync_retain": {
+   "required": [
+    "content"
+   ],
+   "props": [
+    "bank_id",
+    "content",
+    "context",
+    "document_id",
+    "metadata",
+    "strategy",
+    "tags",
+    "timestamp"
+   ]
+  },
+  "recall": {
+   "required": [
+    "query"
+   ],
+   "props": [
+    "bank_id",
+    "budget",
+    "max_tokens",
+    "min_scores",
+    "prefer_observations",
+    "query",
+    "query_timestamp",
+    "tag_groups",
+    "tags",
+    "tags_match",
+    "types"
+   ]
+  },
+  "reflect": {
+   "required": [
+    "query"
+   ],
+   "props": [
+    "bank_id",
+    "budget",
+    "context",
+    "include_based_on",
+    "include_trace",
+    "max_tokens",
+    "query",
+    "response_schema",
+    "tags",
+    "tags_match"
+   ]
+  },
+  "list_banks": {
+   "required": [],
+   "props": []
+  },
+  "create_bank": {
+   "required": [
+    "bank_id"
+   ],
+   "props": [
+    "bank_id",
+    "mission",
+    "name"
+   ]
+  },
+  "list_mental_models": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "detail",
+    "tags"
+   ]
+  },
+  "get_mental_model": {
+   "required": [
+    "mental_model_id"
+   ],
+   "props": [
+    "bank_id",
+    "detail",
+    "mental_model_id"
+   ]
+  },
+  "create_mental_model": {
+   "required": [
+    "name",
+    "source_query"
+   ],
+   "props": [
+    "bank_id",
+    "max_tokens",
+    "mental_model_id",
+    "name",
+    "source_query",
+    "tags",
+    "trigger_refresh_after_consolidation"
+   ]
+  },
+  "update_mental_model": {
+   "required": [
+    "mental_model_id"
+   ],
+   "props": [
+    "bank_id",
+    "max_tokens",
+    "mental_model_id",
+    "name",
+    "source_query",
+    "tags",
+    "trigger_refresh_after_consolidation"
+   ]
+  },
+  "delete_mental_model": {
+   "required": [
+    "mental_model_id"
+   ],
+   "props": [
+    "bank_id",
+    "mental_model_id"
+   ]
+  },
+  "refresh_mental_model": {
+   "required": [
+    "mental_model_id"
+   ],
+   "props": [
+    "bank_id",
+    "mental_model_id"
+   ]
+  },
+  "clear_mental_model": {
+   "required": [
+    "mental_model_id"
+   ],
+   "props": [
+    "bank_id",
+    "mental_model_id"
+   ]
+  },
+  "list_directives": {
+   "required": [],
+   "props": [
+    "active_only",
+    "bank_id",
+    "tags"
+   ]
+  },
+  "create_directive": {
+   "required": [
+    "content",
+    "name"
+   ],
+   "props": [
+    "bank_id",
+    "content",
+    "is_active",
+    "name",
+    "priority",
+    "tags"
+   ]
+  },
+  "delete_directive": {
+   "required": [
+    "directive_id"
+   ],
+   "props": [
+    "bank_id",
+    "directive_id"
+   ]
+  },
+  "list_memories": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "limit",
+    "offset",
+    "q",
+    "type"
+   ]
+  },
+  "get_memory": {
+   "required": [
+    "memory_id"
+   ],
+   "props": [
+    "bank_id",
+    "memory_id"
+   ]
+  },
+  "update_memory": {
+   "required": [
+    "memory_id"
+   ],
+   "props": [
+    "bank_id",
+    "context",
+    "entities",
+    "fact_type",
+    "memory_id",
+    "occurred_end",
+    "occurred_start",
+    "text"
+   ]
+  },
+  "invalidate_memory": {
+   "required": [
+    "memory_id"
+   ],
+   "props": [
+    "bank_id",
+    "memory_id",
+    "reason",
+    "restore"
+   ]
+  },
+  "list_documents": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "limit",
+    "q"
+   ]
+  },
+  "get_document": {
+   "required": [
+    "document_id"
+   ],
+   "props": [
+    "bank_id",
+    "document_id"
+   ]
+  },
+  "delete_document": {
+   "required": [
+    "document_id"
+   ],
+   "props": [
+    "bank_id",
+    "document_id"
+   ]
+  },
+  "list_operations": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "limit",
+    "status"
+   ]
+  },
+  "get_operation": {
+   "required": [
+    "operation_id"
+   ],
+   "props": [
+    "bank_id",
+    "operation_id"
+   ]
+  },
+  "cancel_operation": {
+   "required": [
+    "operation_id"
+   ],
+   "props": [
+    "bank_id",
+    "operation_id"
+   ]
+  },
+  "list_tags": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "limit",
+    "q"
+   ]
+  },
+  "get_bank": {
+   "required": [],
+   "props": [
+    "bank_id"
+   ]
+  },
+  "get_bank_stats": {
+   "required": [],
+   "props": [
+    "bank_id"
+   ]
+  },
+  "update_bank": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "config_updates",
+    "mission",
+    "name"
+   ]
+  },
+  "delete_bank": {
+   "required": [],
+   "props": [
+    "bank_id"
+   ]
+  },
+  "clear_memories": {
+   "required": [],
+   "props": [
+    "bank_id",
+    "type"
+   ]
   }
+ }
 }

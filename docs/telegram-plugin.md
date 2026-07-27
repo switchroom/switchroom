@@ -74,7 +74,7 @@ When the agent **materially changes what it remembers** during a turn — stores
 
 This makes memory honest and legible without being noisy. It is deliberately **sparse and material-only**:
 
-- Fires only on `mcp__hindsight__create_directive` (📌 remembered) and `mcp__hindsight__invalidate_memory` / the `switchroom memory demote` tag path (✂️ forgot).
+- Fires only on `mcp__hindsight__create_directive` (📌 remembered) and `mcp__hindsight__invalidate_memory` / the `switchroom memory demote` tag path (✂️ forgot). In practice only the `invalidate_memory` branch can fire today: hindsight (0.8.4 and 0.8.5) has no per-memory tag-write path (`update_memory` accepts no `tags`/`add_tags`, and silently drops the unknown argument rather than rejecting it), so the demote branch is dead-but-forward-compatible — it lights up unchanged if upstream adds one. See `docs/configuration.md` → "Demoting individual memories from auto-recall".
 - **Never** on ordinary recall, and **never** on routine consolidation — a per-turn "here's what I remember" line would itself be the "regurgitating old facts unprompted" anti-pattern the `remember-across-sessions` job forbids.
 
 Detection is a deterministic tool-call observation (no model call, no polling). The line is a **real message** in the originating topic (never the operator DM), so it's durable and observable.

@@ -18,10 +18,50 @@
  * This module pins the contract so drift becomes a CI-red test (offline) and a
  * doctor `fail` line (live), instead of a silent fleet-wide no-op. The live
  * server's full advertised surface is the golden snapshot at
- * `tests/fixtures/hindsight-tools-list.snapshot.json` (captured 2026-06-07,
- * v0.14.81); `EXPECTED_HINDSIGHT_TOOLS` covers only the tools switchroom
- * actually uses and is cross-checked against that snapshot by
- * `tests/memory.hindsight-contract.fixture.test.ts`.
+ * `tests/fixtures/hindsight-tools-list.snapshot.json`; `EXPECTED_HINDSIGHT_TOOLS`
+ * covers only the tools switchroom actually uses and is cross-checked against
+ * that snapshot by `tests/memory.hindsight-contract.fixture.test.ts`.
+ *
+ * ## 2026-07-27 re-audit against hindsight 0.8.5
+ *
+ * Incidents 2 and 3 above are now half stale, in opposite directions, and both
+ * halves were invisible because the snapshot had not been refreshed since
+ * 2026-06-07 (29 tools; the server has advertised 32 since at least 0.8.4):
+ *
+ *  - `invalidate_memory` and `update_memory` are REAL server tools, not
+ *    phantoms. vault-sweep already migrated to `invalidate_memory`; both are
+ *    now tracked here so the contract check actually covers them.
+ *  - `update_memory` still cannot write tags. Its accepted props are
+ *    text / context / occurred_start / occurred_end / fact_type / entities —
+ *    no `tags`, no `add_tags` — and no PER-MEMORY tag-mutation route exists on
+ *    the REST surface either (`PATCH .../memories/{memory_id}` takes the same
+ *    field set; `PATCH .../documents/{document_id}` DOES rewrite a document's
+ *    memory-unit tags, but it is document-scoped, replaces rather than appends,
+ *    needs a non-null document_id and re-triggers consolidation, so it cannot
+ *    demote a single memory — #3772). So `switchroom memory demote`'s
+ *    `add_tags` arg is unsupported, and the only way a memory acquires a demote
+ *    tag today is at retain time. Recorded structurally as
+ *    {@link HindsightCallsite.knownUnsupportedArgs} so the fixture test ASSERTS
+ *    the arg is still unsupported — the day upstream adds it the test goes red
+ *    and tells us to un-break demote.
+ *    See `addMemoryTag` in `src/memory/hindsight.ts`.
+ *
+ * ## An `isError` guard is NOT a silent-drop guard
+ *
+ * Worth stating plainly, because this repo asserted the opposite for a while:
+ * `result.isError` fires for an unknown TOOL, never for an unknown ARGUMENT.
+ * Probed live on 0.8.4, `update_memory{memory_id, add_tags}` and
+ * `update_memory{memory_id}` return byte-identical bodies, both isError:false;
+ * only a genuinely unknown tool name (`delete_memory`) yields isError:true.
+ * Application errors are invisible to it too — a missing memory answers
+ * isError:false with the body `{"error": "Memory '…' not found"}`.
+ *
+ * So a callsite that sends an arg listed in `knownUnsupportedArgs` cannot rely
+ * on the server to tell it anything. The only honest verification is to read
+ * the intended effect back out of the response body, which is what
+ * `addMemoryTag` does. The static guards here — the offline fixture test and
+ * the live doctor contract check — are what catch this drift; the MCP error
+ * envelope will not.
  */
 
 export interface HindsightToolSpec {
@@ -62,6 +102,12 @@ export const EXPECTED_HINDSIGHT_TOOLS: Record<string, HindsightToolSpec> = {
   refresh_mental_model: { required: ["mental_model_id"] },
   list_memories: { required: [] },
   get_memory: { required: ["memory_id"] },
+  // ── memory curation (src/memory/hindsight.ts addMemoryTag, src/cli/vault-sweep.ts) ──
+  // Both were mis-recorded as phantom tools in the 2026-06-07 audit; they are
+  // real and have been since at least 0.8.4. Tracking them here is what puts
+  // them under the live doctor contract check.
+  update_memory: { required: ["memory_id"] },
+  invalidate_memory: { required: ["memory_id"] },
 };
 
 export type HindsightCallSurface = "ts" | "hook" | "prompt";
@@ -79,6 +125,18 @@ export interface HindsightCallsite {
    *  until a rework. Excluded from "must be a real tool" so the suite stays
    *  green while still tracking it. */
   knownBrokenPhantom?: boolean;
+  /** Args this callsite sends that the server does NOT accept. The tool is
+   *  real, so the server SILENTLY DROPS the arg and answers isError:false —
+   *  an isError guard cannot detect this. A callsite listed here must verify
+   *  the intended effect out of the response body instead (see `addMemoryTag`),
+   *  or it will report success while doing nothing.
+   *
+   *  These are excluded from the "every sent arg is accepted" guard AND
+   *  asserted to be genuinely ABSENT from the snapshot, so the entry is
+   *  self-invalidating: when upstream adds the arg the fixture test goes red
+   *  and points at the feature waiting to be un-broken. A stale exemption
+   *  therefore cannot linger the way a bare comment can. */
+  knownUnsupportedArgs?: string[];
 }
 
 /**
@@ -94,6 +152,19 @@ export const HINDSIGHT_TS_CALLSITES: HindsightCallsite[] = [
   { where: "src/memory/hindsight.ts updateBankMissions", tool: "update_bank", argKeys: ["bank_id", "mission", "config_updates"], surface: "ts" },
   { where: "src/agents/status.ts probeHindsight", tool: "list_banks", argKeys: [], surface: "ts" },
   { where: "src/cli/vault-sweep.ts listMemories", tool: "list_memories", argKeys: ["bank_id", "limit", "offset"], surface: "ts" },
+  { where: "src/cli/vault-sweep.ts deleteMemory", tool: "invalidate_memory", argKeys: ["memory_id", "reason"], surface: "ts" },
+  // `add_tags` is not an accepted prop of `update_memory` on 0.8.4 (nor on
+  // 0.8.5). The server drops it silently and still answers isError:false, so
+  // `addMemoryTag` verifies by reading the tag back out of the returned memory
+  // unit; `switchroom memory demote` fails honestly on that read-back and
+  // cannot work until upstream grows a per-memory tag-write path (#3772).
+  {
+    where: "src/memory/hindsight.ts addMemoryTag",
+    tool: "update_memory",
+    argKeys: ["bank_id", "memory_id", "add_tags"],
+    surface: "ts",
+    knownUnsupportedArgs: ["add_tags"],
+  },
 ];
 
 /** Tools the agent model is INSTRUCTED to call (MEMORY_GUIDANCE + the fleet
