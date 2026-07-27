@@ -664,6 +664,65 @@ describe("checkConfig — default subagents check", () => {
   });
 });
 
+// The #1978 merge-400 was an upstream claude-CLI streaming-merge bug, fixed in
+// claude-code 2.1.156 (pinned by switchroom v0.14.8; docker/Dockerfile.base now
+// pins 2.1.219). The guard's scope is legacy pinned Opus 4.x only, so a modern
+// Opus 5 / `opus`-alias fleet at medium effort must NOT produce an operator warn.
+describe("checkConfig — thinking_effort × adaptive model", () => {
+  const CHECK = "thinking_effort × adaptive model";
+
+  function makeConfig(
+    defaults: Record<string, unknown>,
+    agents: Record<string, unknown>,
+  ): SwitchroomConfig {
+    return {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "-100" },
+      defaults,
+      agents,
+    } as unknown as SwitchroomConfig;
+  }
+
+  it("reports ok for the `opus` alias fleet at medium effort", () => {
+    const config = makeConfig(
+      { model: "opus", thinking_effort: "medium" },
+      { assistant: {}, sysadmin: {} },
+    );
+    const check = checkConfig(config, "/fake/switchroom.yaml").find(
+      (r) => r.name === CHECK,
+    );
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("ok");
+    expect(check!.detail).toBe("no risky model/effort combos");
+    expect(check!.fix).toBeUndefined();
+  });
+
+  it("reports ok for a pinned claude-opus-5 agent overriding to medium", () => {
+    const config = makeConfig(
+      { model: "opus", thinking_effort: "low" },
+      { assistant: {}, sysadmin: { model: "claude-opus-5", thinking_effort: "medium" } },
+    );
+    const check = checkConfig(config, "/fake/switchroom.yaml").find(
+      (r) => r.name === CHECK,
+    );
+    expect(check!.status).toBe("ok");
+  });
+
+  it("still warns for a pinned Opus 4.x agent above the low floor", () => {
+    const config = makeConfig(
+      { model: "opus", thinking_effort: "low" },
+      { assistant: {}, legacy: { model: "claude-opus-4-8", thinking_effort: "high" } },
+    );
+    const check = checkConfig(config, "/fake/switchroom.yaml").find(
+      (r) => r.name === CHECK,
+    );
+    expect(check!.status).toBe("warn");
+    expect(check!.detail).toContain("legacy");
+    expect(check!.detail).not.toContain("assistant");
+    expect(check!.fix).toContain("Opus 4.x");
+  });
+});
+
 describe("checkStartShStale", () => {
   let tempDir: string;
 

@@ -705,3 +705,28 @@ interleaved-streaming merge path. Re-test `thinking_effort: medium` on Opus
 #1978 reproduction shape) before relaxing either the yaml floor or the
 `isAdaptiveThinkingOpus` doctor guard. Until that test passes, the floor
 stays.
+
+### Resolution, 2026-07-27 — guard narrowed to Opus 4.x; the Opus 4.x floor stays
+
+The validation above is now partly discharged, for Opus 5 only:
+
+- The upstream fix shipped in claude-code **2.1.156** and switchroom pinned it
+  in **v0.14.8** (CHANGELOG, "Claude CLI pinned to `@2.1.156` (the 400-fix
+  build)"). `docker/Dockerfile.base` now pins **2.1.219**, 63 builds past it.
+- The field re-test happened on Opus 5, not Opus 4.x: klanker and overlord have
+  run `thinking_effort: medium` on the `opus` alias since 2026-07-25 with no
+  recurrence of the 400.
+- The scrubber theory is independently disproved, as this appendix already
+  says: `normalizePunctuation` runs only in the Telegram send path and never
+  rewrites the session `.jsonl`, so it cannot alter what is replayed to the API.
+
+So `isAdaptiveThinkingOpus()` was narrowed to **pinned `claude-opus-4*` ids
+only** — dropping the bare `opus` alias (which now resolves to Opus 5, so
+matching it flagged Opus 5 by proxy) and both `claude-opus-5` forms that #3525
+had added. Before the narrowing, `switchroom doctor` WARNed on a correct
+Opus 5 + `medium` config; that false positive is gone.
+
+What did NOT change: the `low` floor for **pinned Opus 4.x** agents. Nobody has
+re-run the #1978 reproduction on Opus 4.x under a post-2.1.156 CLI, so the
+guard keeps warning there. When that test passes, delete
+`src/config/thinking-effort-risk.ts` and its `doctor` check outright.
