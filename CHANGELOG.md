@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
 ### The `:latest` promotion job's `if:` is now pinned to the un-draft job's
 
