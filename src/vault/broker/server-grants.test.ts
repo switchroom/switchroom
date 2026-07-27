@@ -25,7 +25,7 @@ import {
 } from "./protocol.js";
 import type { VaultEntry } from "../vault.js";
 import { createAuditLogger, type AuditEntry } from "./audit-log.js";
-import { migrateGrantsSchema, mintGrant } from "../grants.js";
+import { listGrants, migrateGrantsSchema, mintGrant } from "../grants.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -186,6 +186,85 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
       const fileContent = fs.readFileSync(expectedPath, "utf8");
       expect(fileContent).toBe(resp.token);
     }
+  });
+
+  // ── mint_grant: token-file publish semantics (#3751) ──────────────────────
+
+  it("mint_grant: rewrites an existing token file IN PLACE, preserving the inode", async () => {
+    // `apply` pre-creates the mount source; on the live fleet that file is
+    // bind-mounted into the broker container as a BARE FILE, i.e. a
+    // mountpoint. rename(2) over it is EBUSY, so the publish must never
+    // replace the inode. Pin that here: same inode, new bytes.
+    const tokenPath = path.join(agentsDir, "myagent", ".vault-token");
+    fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+    fs.writeFileSync(tokenPath, "vg_oldold.0000", { mode: 0o600 });
+    const before = fs.statSync(tokenPath);
+
+    const resp = await rpc(socketPath, {
+      v: 1, op: "mint_grant", agent: "myagent", keys: ["foo"], ttl_seconds: null,
+    });
+
+    expect(resp.ok).toBe(true);
+    if (!resp.ok || !("token" in resp)) return;
+    const after = fs.statSync(tokenPath);
+    expect(after.ino).toBe(before.ino);
+    expect(fs.readFileSync(tokenPath, "utf8")).toBe(resp.token);
+    // A tmp+rename publish would leave a `.tmp.<pid>` sibling behind when
+    // the rename half fails.
+    expect(fs.readdirSync(path.dirname(tokenPath))).toEqual([".vault-token"]);
+  });
+
+  it("mint_grant: FAILS the RPC when the token file cannot be written", async () => {
+    // A directory at the token path is a real, un-mocked write failure of
+    // the same class as the EBUSY the live broker hits over the bind mount.
+    // Pre-fix the broker logged it and still answered ok:true with a live
+    // grant row — the inconsistency behind #3751.
+    const tokenPath = path.join(agentsDir, "myagent", ".vault-token");
+    fs.mkdirSync(tokenPath, { recursive: true });
+
+    const resp = await rpc(socketPath, {
+      v: 1, op: "mint_grant", agent: "myagent", keys: ["foo"], ttl_seconds: null,
+    });
+
+    expect(resp.ok).toBe(false);
+    if (resp.ok) return;
+    expect(resp.code).toBe("INTERNAL");
+    expect(resp.msg).toContain("Failed to write token file");
+    expect("token" in resp).toBe(false);
+  });
+
+  it("mint_grant: rolls the grant back (revoked) when the token write fails", async () => {
+    const tokenPath = path.join(agentsDir, "myagent", ".vault-token");
+    fs.mkdirSync(tokenPath, { recursive: true });
+
+    await rpc(socketPath, {
+      v: 1, op: "mint_grant", agent: "myagent", keys: ["foo"], ttl_seconds: null,
+    });
+
+    // No live capability may outlive a failed publish: the row stays for
+    // forensics but must be revoked, so listGrants (active only) is empty.
+    expect(listGrants(grantsDb)).toEqual([]);
+    const rows = grantsDb
+      .query<{ id: string; revoked_at: number | null }, []>(
+        "SELECT id, revoked_at FROM vault_grants",
+      )
+      .all();
+    expect(rows.length).toBe(1);
+    expect(rows[0].revoked_at).not.toBeNull();
+  });
+
+  it("mint_grant: audit-logs the token-write failure as an error, not 'allowed'", async () => {
+    const tokenPath = path.join(agentsDir, "myagent", ".vault-token");
+    fs.mkdirSync(tokenPath, { recursive: true });
+
+    await rpc(socketPath, {
+      v: 1, op: "mint_grant", agent: "myagent", keys: ["foo"], ttl_seconds: null,
+    });
+
+    const mintEntries = auditEntries.filter((e) => e.op === "mint_grant");
+    expect(mintEntries.length).toBe(1);
+    expect(mintEntries[0].result).toContain("error:token-write-failed");
+    expect(mintEntries[0].grant_id).toMatch(/^vg_/);
   });
 
   it("mint_grant: audit logs with method:grant and grant_id (no token in log)", async () => {
