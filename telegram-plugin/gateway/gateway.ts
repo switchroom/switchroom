@@ -489,7 +489,7 @@ import {
 import {
   resolveReplyOwnerTurnId,
   resolveReplyOwnerTier,
-  type ReplyOwnerTier,
+  type ReplyOwnerTier, type ReplyOwnerCandidates,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
 import { SubagentHandbackMarker } from './subagent-handback-marker.js'
@@ -4037,7 +4037,7 @@ function resolveReplyOwnerTurn(
   liveTurn: CurrentTurn | null,
   chatId: string,
   args: Record<string, unknown>,
-): { turn: CurrentTurn | null; tier: ReplyOwnerTier } {
+): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates } {
   const origin = findTurnByOriginId(args.origin_turn_id as string | undefined)
   const quoted = findTurnByQuotedMessageId(chatId, args.reply_to)
   const latestEnded = findLatestEndedTurnForChat(chatId)
@@ -4054,7 +4054,7 @@ function resolveReplyOwnerTurn(
   // fabricate one.
   const latestEndedAgeMs =
     latestEnded?.endedAt != null ? Date.now() - latestEnded.endedAt : null
-  const candidates = {
+  const candidates: ReplyOwnerCandidates = {
     liveTurnId: liveTurn?.turnId ?? null,
     originTurnId: origin?.turnId ?? null,
     quotedTurnId: quoted?.turnId ?? null,
@@ -4062,15 +4062,14 @@ function resolveReplyOwnerTurn(
     latestEndedAgeMs,
     latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
   }
-  // #3429 — the WINNING tier travels with the turn. A positive tier
-  // (live/origin/quoted) means the reply is this turn's own answer and the
-  // supersede fires regardless of text; the ambiguous `latest-ended` fallback
-  // keeps the content gate (it cannot tell a late own-reply from an async
-  // sub-agent handback). Both derive from the SAME candidates, so the id and the
-  // tier can never disagree.
+  // #3429 — the winning tier AND the candidate set it came from travel with the
+  // turn. Tier alone no longer decides the content-gate bypass: the
+  // model-steerable `origin`/`quoted` tiers must be CORROBORATED against the
+  // framework-derived `latestEndedTurnId` (`decideContentGateBypass`). All three
+  // derive from these SAME candidates, so they can never disagree.
   const tier = resolveReplyOwnerTier(candidates)
   const winnerId = resolveReplyOwnerTurnId(candidates)
-  return { turn: winnerId != null ? (byId.get(winnerId) ?? null) : null, tier }
+  return { turn: winnerId != null ? (byId.get(winnerId) ?? null) : null, tier, candidates }
 }
 
 /**

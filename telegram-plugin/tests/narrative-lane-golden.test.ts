@@ -35,6 +35,28 @@ import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
 import { BackstopDeliveryLedger } from '../gateway/backstop-delivery.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, NarrativeLaneDeps } from '../gateway/gateway.js'
+import type { ReplyOwnerTier } from '../reply-owner-resolve.js'
+
+/** The owner-resolution shape `resolveReplyOwnerTurn` returns, including the
+ *  candidate set the content-gate bypass corroborates against. These fixtures
+ *  never exercise the supersede path, so the candidates mirror the resolved turn
+ *  (the corroborated shape) with no override needed. */
+function ownerRes(turn: CurrentTurn | null, tier: ReplyOwnerTier) {
+  const id = turn?.turnId ?? null
+  return {
+    turn,
+    tier,
+    candidates: {
+      liveTurnId: tier === 'live' ? id : null,
+      originTurnId: null,
+      quotedTurnId: null,
+      latestEndedTurnId: id,
+      latestEndedAgeMs: 1_000,
+      latestEndedTtlMs: 60_000,
+    },
+  }
+}
+
 
 const CHAT = '1001'
 
@@ -371,7 +393,7 @@ function makeSendReplyDeps(dedup: OutboundDedupCache) {
     assertSendable: () => {},
     statusKey: key,
     streamKey: key,
-    resolveReplyOwnerTurn: () => ({ turn: null, tier: 'none' as const }),
+    resolveReplyOwnerTurn: () => ownerRes(null, 'none'),
     getLastSubagentHandbackAt: () => null,
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,

@@ -45,11 +45,50 @@ import {
   type VoiceOutPlan,
 } from '../gateway/outbound-send-path.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
-import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import {
+  FlushedTurnSupersedeRegistry,
+  DEFAULT_SUPERSEDE_TTL_MS,
+  flushedAnswerMatchesReply,
+} from '../flushed-turn-supersede.js'
+import type { ReplyOwnerTier, ReplyOwnerCandidates } from '../reply-owner-resolve.js'
 import { SubagentHandbackMarker, stampsHandbackMarker } from '../gateway/subagent-handback-marker.js'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, Access } from '../gateway/gateway.js'
+
+/**
+ * Build the owner-resolution result the gateway's `resolveReplyOwnerTurn`
+ * returns, INCLUDING the candidate set the content-gate bypass corroborates
+ * against (`decideContentGateBypass`).
+ *
+ * Default candidates model the CORROBORATED shape: the resolved turn is also the
+ * framework-derived `latestEndedTurnId`, fresh within the supersede TTL — what
+ * the real resolver produces for a late reply to the chat's most recent turn,
+ * whether or not the model also echoed `origin_turn_id` / `reply_to`. Pass
+ * `over` to model a model-STEERED attribution (an `origin`/`quoted` id pointing
+ * at a turn the framework would NOT have resolved) or a stale latest-ended.
+ */
+function ownerRes(
+  turn: CurrentTurn | null,
+  tier: ReplyOwnerTier,
+  over: Partial<ReplyOwnerCandidates> = {},
+): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates } {
+  const id = turn?.turnId ?? null
+  return {
+    turn,
+    tier,
+    candidates: {
+      liveTurnId: tier === 'live' ? id : null,
+      originTurnId: tier === 'origin' ? id : null,
+      quotedTurnId: tier === 'quoted' ? id : null,
+      latestEndedTurnId: id,
+      latestEndedAgeMs: 30_000,
+      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      ...over,
+    },
+  }
+}
+
 
 // ── fake bot API ──────────────────────────────────────────────────────────
 
@@ -211,7 +250,7 @@ function makeHarness(opts?: {
     assertSendable: () => {},
     statusKey: key,
     streamKey: key,
-    resolveReplyOwnerTurn: () => ({ turn: null, tier: 'none' as const }),
+    resolveReplyOwnerTurn: () => ownerRes(null, 'none'),
     getLastSubagentHandbackAt: () => null,
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
@@ -640,7 +679,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     // is the AMBIGUOUS fallback tier: the content gate applies here, so a
     // genuinely-new handback sends fresh while the turn's own contained answer
     // still supersedes.
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
   }
 
   it('CORE REGRESSION (red pre-fix): a handback with genuinely NEW content sends a ' +
@@ -712,7 +751,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const owner = makeFlushDeliveredEndedTurn()
     // NO registry record (the post-fire pre-record window); owner resolution
     // still recovers the ended flush-armed turn via the latest-ended tier.
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
 
     const res = await sendReply(h.deps, req(HANDBACK))
 
@@ -726,7 +765,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     'window is still suppressed (the #2996 Part 2 backstop holds)', async () => {
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
 
     const res = await sendReply(h.deps, req(FLUSHED_TEXT))
 
@@ -774,7 +813,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     // Late DM reply: latest-ended tier (the path the tier discriminator MISSES),
     // and crucially NO subagent_handback was enqueued for this chat after the
     // turn ended — so the reply is the flushed turn's OWN answer.
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
     h.deps.getLastSubagentHandbackAt = () => null
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
@@ -801,7 +840,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
     // A background sub-agent handback was enqueued for this chat AFTER the turn
     // ended (now-30s) and within the 60s TTL (now-15s) — this reply might BE it.
     h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
@@ -838,7 +877,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     // `quoted`. A handback IS in flight, so a positive tier must NOT override the
     // #3429 content gate — else the reworded handback text silently edits over
     // the flushed turn's DELIVERED answer (Telegram edits don't re-notify).
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'quoted')
     h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
@@ -865,7 +904,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'live' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'live')
     h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
@@ -910,7 +949,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
     // The gateway reads the marker the boot-replay stamped (chat-wide gate).
     h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAtInChat(chatId)
 
@@ -978,7 +1017,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     // The topic-A handback's reply is STEERED to topic B (message_thread_id=222)
     // and resolves topic B's ended turn chat-wide (latest-ended), carrying FOREIGN
     // content. The gate read is chat-wide, so the topic-A stamp is seen.
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner as CurrentTurn, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner as CurrentTurn, 'latest-ended')
     h.deps.getLastSubagentHandbackAt = (chatId) => marker.lastAtInChat(chatId)
 
     const res = await sendReply(
@@ -1018,7 +1057,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
       { turnId: (owner as CurrentTurn).turnId, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
       Date.now(),
     )
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner as CurrentTurn, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner as CurrentTurn, 'latest-ended')
     h.deps.getLastSubagentHandbackAt = () => null // no handback anywhere
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER, { message_thread_id: TOPIC }))
@@ -1050,7 +1089,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     // The reply resolves the flush-delivered ENDED turn via the ambiguous
     // latest-ended tier (no live turn, no positive attribution) and carries
     // FOREIGN content (a worker report, not this turn's answer nor a rewording).
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'latest-ended' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
     // A decoupled completion IS in the window (the marker stamped it) — so this
     // late reply might BE it. The invariant keeps the content gate.
     h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
@@ -1091,25 +1130,31 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     expect(stampsHandbackMarker(undefined)).toBe(false)
   })
 
-  // ─── MUST-FIX 1 (dup-audit / Fable): model-steerable tiers NEVER bypass ───
+  // ─── MUST-FIX 1 (dup-audit / Fable): an UNCORROBORATED steerable tier ───
   //
   // The `quoted`/`origin` tiers resolve from MODEL-supplied args (reply_to /
-  // origin_turn_id), so a reply can steer ITSELF onto a different ended turn's
-  // record. Marker-absence proves "own answer" only for the framework-derived
-  // latest-ended tier — a quoted/origin resolution with no marker is NOT
-  // ownership evidence. Fable executed this exact path (quoted tier, no marker,
-  // foreign content → editMessageText ×1 over the flushed answer). With the tier
-  // restriction, quoted/origin ALWAYS traverse the content gate → foreign content
-  // sends FRESH, the flushed answer untouched. RED on pre-fix code
-  // (replyIsOwnAnswer = tier==='live' || !handbackCouldOwnReply → quoted bypassed).
-  it('MUST-FIX 1: a quoted-tier reply with NO marker and FOREIGN content does NOT ' +
-    'bypass the content gate — FRESH send, flushed answer never edited/deleted', async () => {
+  // origin_turn_id), so a reply can steer ITSELF onto a DIFFERENT ended turn's
+  // record and — with the content gate bypassed — silently edit over that turn's
+  // delivered answer. Fable executed this exact path (quoted tier, no marker,
+  // foreign content → editMessageText ×1 over the flushed answer).
+  //
+  // What blocks it is CORROBORATION, not a blanket tier ban: the steered
+  // attribution points at a turn the FRAMEWORK-derived `latestEndedTurnId` does
+  // NOT resolve, so `decideContentGateBypass` declines and the content gate
+  // holds. The `latestEndedTurnId` override below is what makes this test model
+  // steering rather than a plain self-echo.
+  it('MUST-FIX 1: a quoted-tier reply STEERED onto a different turn than the ' +
+    'framework resolves, with NO marker and FOREIGN content, does NOT bypass the ' +
+    'content gate — FRESH send, flushed answer never edited/deleted', async () => {
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
-    // Model-steered `quoted` attribution to a DIFFERENT ended flushed turn, with
-    // NO decoupled completion anywhere in the chat (the residual F1 vector).
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    // Model-steered `quoted` attribution onto the flushed turn, while the
+    // framework's own latest-ended candidate is a DIFFERENT, newer turn — the
+    // divergence that proves the attribution is model-driven. No decoupled
+    // completion anywhere in the chat (the residual F1 vector).
+    h.deps.resolveReplyOwnerTurn = () =>
+      ownerRes(owner, 'quoted', { latestEndedTurnId: `${CHAT}:_#ended-99` })
     h.deps.getLastSubagentHandbackAt = () => null
 
     const res = await sendReply(h.deps, req(HANDBACK))
@@ -1140,7 +1185,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const h = makeHarness()
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
-    h.deps.resolveReplyOwnerTurn = () => ({ turn: owner, tier: 'quoted' })
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'quoted')
     h.deps.getLastSubagentHandbackAt = () => null
 
     const res = await sendReply(h.deps, req(CANONICAL_REPLY))
@@ -1150,5 +1195,168 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
     expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
     expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+
+  // ─── 2026-07-27 DM incident: a CORROBORATED `origin` echo must collapse ───
+  //
+  // The observed failure (a DM agent delivered two answers twice — a flushed
+  // copy plus a reworded `reply` copy, each time):
+  //
+  //   1. the answer-ready quiescence flush posted the turn's composed prose as
+  //      message A ("turn-flush firing — N chars without reply tool");
+  //   2. the silent-end Stop hook told the agent its answer had not reached the
+  //      user, so it fired `reply` with a RE-WORDED version of the same answer;
+  //   3. the agent also echoed `origin_turn_id` back — pointing at its OWN turn —
+  //      so owner resolution won on the `origin` tier, not `latest-ended`
+  //      (`reply-route ... via=origin late=true originTurn=<same turn>`);
+  //   4. `origin` was banned outright from the content-gate bypass, so the gate
+  //      ran, the rewording defeated both equality and containment, and the
+  //      gateway logged `flush supersede declined — new content (#3429)` and
+  //      shipped message B — a visible duplicate.
+  //
+  // Note what the incident was NOT: not a captured-prose delivery (this is the
+  // quiescence turn-flush path), and not a text-matcher failure that a smarter
+  // matcher would fix. Rewording is model-dependent and cannot be matched
+  // reliably; the deterministic signal is that the echoed turn is the SAME turn
+  // the framework's own `latestEndedTurnId` resolves. This test drives the REAL
+  // send path over that exact shape.
+  it('2026-07-27 REGRESSION: a reworded same-turn reply that ALSO echoes ' +
+    'origin_turn_id for its own turn collapses to ONE message (corroborated ' +
+    '`origin` tier bypasses the content gate)', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    // `origin` tier — the model echoed origin_turn_id — but pointing at the SAME
+    // turn the framework-derived latestEndedTurnId resolves (ownerRes's default),
+    // i.e. corroborated: the model gained nothing it couldn't have had by
+    // omitting the echo entirely.
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'origin')
+    // No decoupled completion in the window — the reply is this turn's own answer.
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    // The reworded answer defeats BOTH text paths the old gate relied on, so the
+    // test cannot pass by accident through `flushedAnswerMatchesReply`.
+    expect(flushedAnswerMatchesReply(FLUSHED_TEXT, REWORDED_SAME_TURN_ANSWER)).toBe(false)
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    // OUTCOME: exactly ONE client-visible message. The flushed message A is
+    // corrected in place into the reworded answer; NO second bubble ships.
+    // (Pre-fix this was sendRichMessage ×1 alongside the surviving flush = the
+    // two Telegram messages the user actually received.)
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(edits[0]!.text).toContain('every one of the twelve agents')
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+    // Record consumed — the flush is gone, not merely shadowed.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        now: Date.now(),
+      }).reason,
+    ).toBe('no-record')
+  })
+
+  // The behaviour the old "new content" check was really protecting: an agent
+  // that deliberately sends a SECOND, genuinely different message in the same
+  // turn must not have its first one deleted. This is structural, not textual —
+  // the registry CONSUMES the record on supersede, so the second reply finds
+  // 'no-record' and can never reach the first message. No reply counter needed.
+  it('PRESERVED: a deliberate SECOND reply in the same turn does NOT delete or ' +
+    'edit the first — both messages survive', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'origin')
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    // Reply #1 — the reworded answer; supersedes the flush (one message so far).
+    await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+    const afterFirst = h.calls.length
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(1)
+
+    // Reply #2 — a deliberate follow-up in the SAME turn, genuinely new content.
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    const later = h.calls.slice(afterFirst)
+    // It ships as its OWN fresh notifying message…
+    const fresh = later.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    // …and it neither deletes nor re-edits the message the first reply owns.
+    expect(later.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(later.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+
+  // Same corroboration rule on the other steerable tier, so a model that quotes
+  // instead of echoing gets the same collapse rather than a duplicate.
+  it('a reworded same-turn reply on a CORROBORATED `quoted` tier also collapses ' +
+    'to one message', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'quoted')
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+
+  // The corroboration must not resurrect the handback hazard: even a self-echoed
+  // `origin` attribution keeps the content gate while a decoupled completion is
+  // in the window, because the late reply might BE that completion.
+  it('a corroborated `origin` reply STILL keeps the content gate while a handback ' +
+    'is in the window — foreign content sends FRESH, flush untouched', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'origin')
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 15_000
+
+    const res = await sendReply(h.deps, req(HANDBACK))
+
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('migration audit')
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // The flushed answer stands — its record is intact for the turn's own replay.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        replyText: CANONICAL_REPLY,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  // A STALE framework candidate must not corroborate anything: the latest-ended
+  // freshness bound (F2) is what stops an old turn inheriting deletion authority.
+  it('a `origin` echo does NOT bypass when the framework latest-ended candidate ' +
+    'is STALE (past the supersede TTL) — content gate holds', async () => {
+    const h = makeHarness()
+    const owner = makeFlushDeliveredEndedTurn()
+    seedRecord(h, owner)
+    h.deps.resolveReplyOwnerTurn = () =>
+      ownerRes(owner, 'origin', { latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 1 })
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
+
+    // Gate held → fresh send, flushed message untouched.
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(1)
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
   })
 })
