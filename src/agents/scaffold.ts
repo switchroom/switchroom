@@ -2999,6 +2999,16 @@ export function installHindsightPlugin(
   agentName: string,
   agentDir: string,
   switchroomConfig: SwitchroomConfig | undefined,
+  /**
+   * The caller's ALREADY-CASCADED agent config (defaults → profile → agent) —
+   * the exact object the start.sh env exports are rendered from. Pass it
+   * whenever you have one: it is what makes the two channels for the recall
+   * envelope (env exports and plugin stamp) provably the same input rather than
+   * two independent re-derivations that can disagree. Both production callers
+   * (scaffoldAgent, reconcileAgentInner) thread it. See
+   * resolveHindsightRecallConfig for what the fallback can and cannot do.
+   */
+  resolvedAgentConfig?: AgentConfig,
 ): HindsightPluginInstall | null {
   if (!switchroomConfig) return null;
   const memory = switchroomConfig.memory;
@@ -3054,7 +3064,7 @@ export function installHindsightPlugin(
   // so `switchroom apply` RE-ASSERTS these values instead of reverting them —
   // see src/setup/hindsight-recall-tunables.ts for the full rationale.
   const recallTunables = resolveHindsightRecallTunables(
-    resolveHindsightRecallConfig(switchroomConfig, agentName),
+    resolveHindsightRecallConfig(switchroomConfig, agentName, resolvedAgentConfig),
   );
   const contentOverrides: Record<string, string> = {};
   try {
@@ -3193,14 +3203,30 @@ function resolveHindsightRetainConfig(
 export function resolveHindsightRecallConfig(
   switchroomConfig: SwitchroomConfig | undefined,
   agentName: string,
+  /**
+   * The caller's already-cascaded agent config, when it has one. Preferred over
+   * re-deriving, and not merely as an optimisation: `start.sh.hbs` claims the
+   * env exports and the plugin stamp "cannot diverge" because they share this
+   * resolver — but sharing a resolver only helps if it is fed the same INPUT.
+   * The env path reads the cascaded `agentConfig`; re-deriving here from
+   * `switchroomConfig.agents[name]` reads a different object whenever the
+   * caller's raw config is not literally that map entry.
+   */
+  resolvedAgentConfig?: AgentConfig,
 ): RecallTunableInput | undefined {
+  if (resolvedAgentConfig) {
+    return resolvedAgentConfig.memory?.recall as RecallTunableInput | undefined;
+  }
   if (!switchroomConfig) return undefined;
+  // Fallback for callers with no cascaded config (direct unit-test calls).
+  // NOTE the limit, because the previous comment here overstated it: an agent
+  // absent from the `agents` map carries no `extends:`, so an empty stand-in
+  // resolves the `defaults:` tier ONLY and silently drops any
+  // `profiles.<name>.memory.recall.*`. Both production callers thread their
+  // cascaded config above, so the live path never takes this branch.
   const resolved = resolveAgentConfig(
     switchroomConfig.defaults,
     switchroomConfig.profiles,
-    // Some scaffold paths install the plugin for an agent that isn't in the
-    // `agents` map yet (fresh scaffold); resolve against an empty agent so the
-    // defaults/profile tiers still apply.
     switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
   );
   return resolved?.memory?.recall as RecallTunableInput | undefined;
@@ -4939,7 +4965,7 @@ export function scaffoldAgent(
       // The vendored plugin's own hooks.json wires SessionStart /
       // UserPromptSubmit / Stop / SessionEnd via Claude Code's plugin
       // loader once start.sh passes --plugin-dir.
-      installHindsightPlugin(name, agentDir, switchroomConfig);
+      installHindsightPlugin(name, agentDir, switchroomConfig, agentConfig);
 
       // Disable Claude Code's built-in auto-memory so the model doesn't
       // get dueling instructions (write to local .md files vs use
@@ -7509,7 +7535,7 @@ function reconcileAgentInner(
     // installHindsightPlugin writes a misleading "check the npm tarball"
     // stderr line before returning null. See ReconcileOptions doc-comment.
     if (!options.skipProfileTemplates) {
-      installHindsightPlugin(name, agentDir, switchroomConfig);
+      installHindsightPlugin(name, agentDir, switchroomConfig, agentConfig);
     }
 
     // Disable Claude Code's built-in auto-memory when Hindsight is on.

@@ -53,12 +53,81 @@ function readParallelDeadlineSeconds(): number {
   return Number(m[1]);
 }
 
-/** The per-bank socket timeout passed to `client.recall`, from recall.py. */
-function readPerBankTimeoutSeconds(): number {
+/**
+ * The body of `_make_bank_task` in recall.py — the ONE factory both the
+ * parallel and serial recall paths go through.
+ *
+ * Anchoring matters more than it looks. This guard used to scan the whole file
+ * for `/^\s*timeout=([0-9.]+),\s*$/m`, which worked only while the per-bank
+ * timeout was the literal `timeout=8,`. When #3759 promoted it to a managed key
+ * the kwarg became `timeout=request_timeout,` and the file-wide regex silently
+ * fell through to the NEXT match — `timeout=5,` on a `subprocess.run()` call in
+ * the issue reporter, ~650 lines away. Every assertion below still passed
+ * (5 <= 10), so CI stayed green while the check measured an unrelated
+ * subprocess timeout. Slicing the factory first makes that failure loud: if the
+ * factory is renamed or the kwarg moves out of it, we throw instead of
+ * measuring the wrong thing.
+ */
+function readMakeBankTaskBody(): string {
   const raw = readFileSync(join(VENDOR, "scripts", "recall.py"), "utf8");
-  // The single live call site is the `timeout=` kwarg inside _make_bank_task.
-  const m = raw.match(/^\s*timeout=([0-9.]+),\s*$/m);
-  if (!m) throw new Error("per-bank timeout kwarg not found in recall.py");
+  const start = raw.indexOf("def _make_bank_task(");
+  if (start < 0) {
+    throw new Error(
+      "recall.py no longer defines _make_bank_task — this guard has lost its anchor "
+        + "and would otherwise silently measure some other `timeout=` in the file. "
+        + "Re-point it at the real per-bank recall call site.",
+    );
+  }
+  const end = raw.indexOf("return _bank_task", start);
+  if (end < 0) {
+    throw new Error("_make_bank_task in recall.py has no `return _bank_task` terminator");
+  }
+  return raw.slice(start, end);
+}
+
+/**
+ * The per-bank recall timeout DEFAULT, from recall.py.
+ *
+ * Since #3759 the kwarg is a managed key (`recallRequestTimeoutSeconds` /
+ * HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS), so the value at the call site is
+ * the symbol `request_timeout`, resolved from config with
+ * `DEFAULT_RECALL_REQUEST_TIMEOUT` as the fallback. The shipped default is what
+ * this budget check is about, so read the module constant — after proving the
+ * call site actually consumes it.
+ */
+function readPerBankTimeoutSeconds(): number {
+  const body = readMakeBankTaskBody();
+  const kwarg = body.match(/^\s*timeout=(\S+?),\s*$/m);
+  if (!kwarg) {
+    throw new Error("no `timeout=` kwarg inside recall.py's _make_bank_task");
+  }
+  const expr = kwarg[1];
+  // A literal here would mean the managed key was reverted — accept it, the
+  // budget assertions below are what matter.
+  if (/^[0-9.]+$/.test(expr)) return Number(expr);
+  if (expr !== "request_timeout") {
+    throw new Error(
+      `recall.py's per-bank timeout kwarg is \`timeout=${expr}\`, which this guard `
+        + "cannot resolve to a number. Update readPerBankTimeoutSeconds() so the budget "
+        + "check keeps measuring the real value.",
+    );
+  }
+  const raw = readFileSync(join(VENDOR, "scripts", "recall.py"), "utf8");
+  const m = raw.match(/^DEFAULT_RECALL_REQUEST_TIMEOUT\s*=\s*([0-9.]+)\s*$/m);
+  if (!m) {
+    throw new Error(
+      "recall.py's per-bank timeout is the managed key `request_timeout`, but its "
+        + "DEFAULT_RECALL_REQUEST_TIMEOUT module constant was not found",
+    );
+  }
+  return Number(m[1]);
+}
+
+/** The per-bank timeout default declared in lib/config.py's DEFAULTS. */
+function readConfiguredRequestTimeoutDefault(): number {
+  const raw = readFileSync(join(VENDOR, "scripts", "lib", "config.py"), "utf8");
+  const m = raw.match(/"recallRequestTimeoutSeconds":\s*([0-9.]+)/);
+  if (!m) throw new Error("recallRequestTimeoutSeconds default not found in lib/config.py");
   return Number(m[1]);
 }
 
@@ -93,6 +162,32 @@ describe("recall budget coherence", () => {
       perBank,
       `per-bank timeout=${perBank}s must not exceed the ${deadline}s shared deadline`,
     ).toBeLessThanOrEqual(deadline);
+  });
+
+  it("reads the per-bank timeout from _make_bank_task, not some other timeout= in the file", () => {
+    // The guard above is only as good as its anchor. recall.py carries other
+    // `timeout=` kwargs (e.g. the `subprocess.run()` issue reporter at ~:2356);
+    // a file-wide regex silently measured that one for the whole life of #3759
+    // and stayed green. Pin the anchor itself.
+    const body = readMakeBankTaskBody();
+    expect(body, "_make_bank_task must contain the client.recall() call").toContain(
+      "client.recall(",
+    );
+    expect(
+      body.match(/^\s*timeout=(\S+?),\s*$/m)?.[1],
+      "the per-bank timeout kwarg must live INSIDE _make_bank_task",
+    ).toBeTruthy();
+    // And the slice must be tight enough to exclude the issue-reporter call.
+    expect(body).not.toContain("subprocess.run");
+  });
+
+  it("keeps recall.py's fallback and lib/config.py's DEFAULTS on the same number", () => {
+    // Two independently-editable declarations of the same shipped default:
+    // recall.py's DEFAULT_RECALL_REQUEST_TIMEOUT (used when the config value is
+    // missing or unusable) and DEFAULTS["recallRequestTimeoutSeconds"] (used
+    // when it is present). If they drift, the effective per-bank timeout
+    // depends on whether config loading happened to succeed.
+    expect(readPerBankTimeoutSeconds()).toBe(readConfiguredRequestTimeoutDefault());
   });
 
   it("documents the hook ceiling that the vendored config comment cites", () => {

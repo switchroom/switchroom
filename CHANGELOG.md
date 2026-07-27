@@ -54,6 +54,25 @@ into subdirectories, so any stamped nested file made the up-to-date check
 permanently false and forced an rm-and-recopy of the whole plugin tree on every
 reconcile.
 
+The clamp enforces the same inequality the repo's own budget guard does:
+`parallel_deadline_seconds` must sit at least `RECALL_DEADLINE_HEADROOM_SECONDS`
+(2s) *below* the hook ceiling, not merely at or below it. At equality a
+deadline-abandoned fan-out has zero budget left to format its block, write the
+cache and flush stdout, so Claude Code SIGKILLs the hook mid-write and the turn
+loses both the memories and the `recall_log` row that would have explained why —
+which made `{hook_timeout_seconds: 12, parallel_deadline_seconds: 12}` resolve to
+a broken `12/12/8` with no clamp and no warning. `hindsight-reranker-budget.test.ts`
+could never have caught it: it reads only the vendored defaults, never operator
+yaml. A hook ceiling below 3s admits no coherent envelope at all and is now
+raised (and reported) rather than silently flattened.
+
+Also fixed: `hindsight-reranker-budget.test.ts` located the per-bank timeout with
+a file-wide `/^\s*timeout=([0-9.]+),$/` scan, which stopped matching the moment
+the value became a managed key — it fell through to an unrelated
+`subprocess.run(..., timeout=5)` in the issue reporter ~650 lines away and kept
+passing, measuring nothing. It is now anchored inside `_make_bank_task` and
+throws if that anchor moves.
+
 Deliberately not done: `recallMaxMemories` and `recallMinOverlap` were already
 declarative and are untouched.
 

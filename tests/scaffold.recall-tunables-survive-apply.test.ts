@@ -11,6 +11,7 @@ import {
   DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS,
   DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS,
   RECALL_DEADLINE_HEADROOM_SECONDS,
+  MIN_RECALL_HOOK_TIMEOUT_SECONDS,
 } from "../src/setup/hindsight-recall-tunables.js";
 import type { SwitchroomConfig, AgentConfig } from "../src/config/schema.js";
 
@@ -301,8 +302,47 @@ describe("resolveHindsightRecallTunables", () => {
       hook_timeout_seconds: 12,
       parallel_deadline_seconds: 40,
     });
-    expect(t.parallelDeadlineSeconds).toBe(12);
+    // Clamped to ceiling MINUS headroom, not to the ceiling itself: landing it
+    // ON the ceiling is the zero-headroom config hindsight-reranker-budget.test.ts
+    // fails CI over.
+    expect(t.parallelDeadlineSeconds).toBe(12 - RECALL_DEADLINE_HEADROOM_SECONDS);
     expect(t.clamps.join(" ")).toContain("parallel_deadline_seconds");
+  });
+
+  /**
+   * THE blocker regression. `{hook: 12, deadline: 12}` is schema-valid yaml and
+   * used to resolve to 12/12/8 with ZERO clamps and ZERO warnings — the exact
+   * inverted, silently-useless envelope this module exists to make
+   * inexpressible. The resolver enforced `deadline <= hook`, while the repo's
+   * own guard (src/setup/hindsight-reranker-budget.test.ts:66-85) enforces
+   * strictly-less with >=2s of headroom — and that guard reads only the
+   * vendored defaults, so it never sees operator yaml and cannot catch this.
+   */
+  it("refuses a deadline set EQUAL to the hook ceiling, and says so", () => {
+    const t = resolveHindsightRecallTunables({
+      hook_timeout_seconds: 12,
+      parallel_deadline_seconds: 12,
+    });
+    expect(t.parallelDeadlineSeconds).toBeLessThan(t.hookTimeoutSeconds);
+    expect(t.hookTimeoutSeconds - t.parallelDeadlineSeconds).toBeGreaterThanOrEqual(
+      RECALL_DEADLINE_HEADROOM_SECONDS,
+    );
+    expect(t.parallelDeadlineSeconds).toBe(10);
+    // Silence is the specific failure mode here: the old resolver landed on the
+    // broken boundary with an empty clamp list, so `switchroom doctor` stayed
+    // green and the operator had no signal at all.
+    expect(t.clamps.join(" ")).toContain("parallel_deadline_seconds");
+  });
+
+  it("raises a hook ceiling too small to carry any coherent envelope", () => {
+    // headroom+1 is the floor: below it there is no deadline that is both >=1s
+    // and >=headroom under the ceiling.
+    for (const hook of [1, 2]) {
+      const t = resolveHindsightRecallTunables({ hook_timeout_seconds: hook });
+      expect(t.hookTimeoutSeconds).toBe(MIN_RECALL_HOOK_TIMEOUT_SECONDS);
+      expect(t.parallelDeadlineSeconds).toBe(1);
+      expect(t.clamps.join(" ")).toContain("hook_timeout_seconds");
+    }
   });
 
   it("clamps a per-bank timeout that exceeds the shared deadline", () => {
@@ -314,18 +354,38 @@ describe("resolveHindsightRecallTunables", () => {
     expect(t.clamps.join(" ")).toContain("request_timeout_seconds");
   });
 
-  it("always yields a usable nesting: request <= deadline <= ceiling", () => {
+  /**
+   * This used to assert `deadline <= ceiling` — the WEAK invariant — so it
+   * stayed green on the equality bug forever. It now asserts the same
+   * strictly-less-plus-headroom relationship `hindsight-reranker-budget.test.ts`
+   * enforces on the vendored defaults, which is the only version of this test
+   * that can fail on an inverted operator config.
+   */
+  it("always yields a usable nesting: request <= deadline, deadline + headroom <= ceiling", () => {
     const cases = [
       { hook_timeout_seconds: 1 },
+      { hook_timeout_seconds: 2 },
+      { hook_timeout_seconds: 3 },
+      // The blocker's two reported inputs.
+      { hook_timeout_seconds: 12, parallel_deadline_seconds: 12 },
+      { hook_timeout_seconds: 10, parallel_deadline_seconds: 30 },
       { hook_timeout_seconds: 5, parallel_deadline_seconds: 99, request_timeout_seconds: 99 },
       { request_timeout_seconds: 60 },
       { hook_timeout_seconds: 3, request_timeout_seconds: 2 },
+      { hook_timeout_seconds: 4, parallel_deadline_seconds: 3 },
+      { hook_timeout_seconds: 0, parallel_deadline_seconds: 0, request_timeout_seconds: 0 },
+      undefined,
     ];
     for (const c of cases) {
       const t = resolveHindsightRecallTunables(c);
-      expect(t.requestTimeoutSeconds).toBeLessThanOrEqual(t.parallelDeadlineSeconds);
-      expect(t.parallelDeadlineSeconds).toBeLessThanOrEqual(t.hookTimeoutSeconds);
-      expect(t.requestTimeoutSeconds).toBeGreaterThan(0);
+      const label = JSON.stringify(c);
+      expect(t.requestTimeoutSeconds, label).toBeLessThanOrEqual(t.parallelDeadlineSeconds);
+      expect(t.parallelDeadlineSeconds, label).toBeLessThan(t.hookTimeoutSeconds);
+      expect(t.hookTimeoutSeconds - t.parallelDeadlineSeconds, label).toBeGreaterThanOrEqual(
+        RECALL_DEADLINE_HEADROOM_SECONDS,
+      );
+      expect(t.requestTimeoutSeconds, label).toBeGreaterThan(0);
+      expect(t.parallelDeadlineSeconds, label).toBeGreaterThan(0);
     }
   });
 

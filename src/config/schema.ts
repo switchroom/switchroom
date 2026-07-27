@@ -559,7 +559,10 @@ export const AgentMemorySchema = z
             "hooks/hooks.json, so it survives `switchroom apply` reinstalling " +
             "the plugin. Default 12. Raising it lets slow banks finish at the " +
             "cost of pre-turn dead air; `parallel_deadline_seconds` and " +
-            "`request_timeout_seconds` are both kept under it.",
+            "`request_timeout_seconds` are both kept under it. A value below " +
+            "3s is raised to 3s and reported: the fan-out deadline must be at " +
+            "least 1s AND still leave 2s of post-deadline headroom, so a " +
+            "lower ceiling admits no usable envelope at all.",
           ),
         parallel_deadline_seconds: z
           .number()
@@ -573,7 +576,11 @@ export const AgentMemorySchema = z
             "minus 2s of headroom for block formatting, cache write and " +
             "stdout flush, so a straggler bank can never push the hook past " +
             "its ceiling. Set explicitly to override that derivation; a value " +
-            "above the hook ceiling is clamped back under it.",
+            "that would leave less than 2s under the hook ceiling — including " +
+            "one set EQUAL to it — is clamped back to `hook_timeout_seconds` " +
+            "minus 2, and the clamp is reported. Equality is not allowed: at " +
+            "zero headroom the hook is killed mid-write and the turn loses " +
+            "both the memories and the recall_log row explaining why.",
           ),
         request_timeout_seconds: z
           .number()

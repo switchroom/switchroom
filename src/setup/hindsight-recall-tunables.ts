@@ -59,8 +59,25 @@ export const DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS = 12;
  * fan-out completes. A straggler bank that runs to the deadline must still
  * leave enough budget for recall to emit its block, or the work is thrown away
  * at the ceiling.
+ *
+ * This is a MINIMUM, not a suggestion: `src/setup/hindsight-reranker-budget.test.ts`
+ * fails CI when the vendored defaults violate `hook - deadline >= 2`, because at
+ * equality a deadline-abandoned fan-out has zero time left to format the block,
+ * write the cache, and flush stdout — Claude Code SIGKILLs the hook mid-write
+ * and the turn loses BOTH the memories and the `recall_log.jsonl` row that would
+ * have explained why. The resolver below enforces the same inequality on
+ * operator yaml, which that guard cannot see (it only reads `vendor/`).
  */
 export const RECALL_DEADLINE_HEADROOM_SECONDS = 2;
+
+/**
+ * The smallest hook ceiling that can carry a coherent envelope: the deadline
+ * must be at least 1s AND sit at least `RECALL_DEADLINE_HEADROOM_SECONDS` below
+ * the ceiling, so any ceiling below `headroom + 1` is unsatisfiable by
+ * construction. A configured ceiling under this floor is clamped UP (and
+ * reported) rather than silently producing a zero-headroom envelope.
+ */
+export const MIN_RECALL_HOOK_TIMEOUT_SECONDS = RECALL_DEADLINE_HEADROOM_SECONDS + 1;
 
 /** Vendor/shipped default for the per-bank recall HTTP timeout (seconds). */
 export const DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS = 8;
@@ -96,11 +113,19 @@ export interface RecallTunableInput {
  * where a config typo must not brick an agent's memory install.
  *
  * Derivation and clamping, in order:
- *   1. hook ceiling := config ?? 12
- *   2. parallel deadline := config ?? (ceiling - 2 headroom), floored at 1,
- *      then clamped to <= ceiling (a deadline past the ceiling is unreachable)
+ *   1. hook ceiling := config ?? 12, clamped UP to MIN_RECALL_HOOK_TIMEOUT_SECONDS
+ *      (a ceiling below headroom+1 admits no coherent deadline at all)
+ *   2. parallel deadline := config ?? (ceiling - 2 headroom), then clamped to
+ *      <= (ceiling - headroom). NOT merely <= ceiling: a deadline AT the
+ *      ceiling is the zero-headroom configuration
+ *      `hindsight-reranker-budget.test.ts` fails CI over — the hook is
+ *      SIGKILLed mid-write and the turn loses both the memories and the
+ *      telemetry row.
  *   3. per-bank timeout := config ?? 8, then clamped to <= parallel deadline
  *      (a per-bank timeout past the shared deadline can never fire)
+ *
+ * Post-condition, for EVERY input including the unusable ones:
+ *   0 < request <= deadline  &&  hook - deadline >= RECALL_DEADLINE_HEADROOM_SECONDS
  */
 export function resolveHindsightRecallTunables(
   recall: RecallTunableInput | undefined,
@@ -110,25 +135,38 @@ export function resolveHindsightRecallTunables(
   const usable = (v: number | undefined): number | undefined =>
     typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined;
 
-  const hookTimeoutSeconds =
+  let hookTimeoutSeconds =
     usable(recall?.hook_timeout_seconds) ?? DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS;
+  if (hookTimeoutSeconds < MIN_RECALL_HOOK_TIMEOUT_SECONDS) {
+    clamps.push(
+      `memory.recall.hook_timeout_seconds ${hookTimeoutSeconds}s is below the minimum ` +
+        `${MIN_RECALL_HOOK_TIMEOUT_SECONDS}s — raised to ${MIN_RECALL_HOOK_TIMEOUT_SECONDS}s ` +
+        `(the fan-out deadline must be at least 1s AND leave ` +
+        `${RECALL_DEADLINE_HEADROOM_SECONDS}s of post-deadline headroom, so a lower ` +
+        `ceiling admits no usable envelope at all)`,
+    );
+    hookTimeoutSeconds = MIN_RECALL_HOOK_TIMEOUT_SECONDS;
+  }
+
+  // The largest deadline that still leaves the hook enough budget to format its
+  // block, write the cache, and flush stdout after the fan-out is abandoned.
+  // Equality with the ceiling is NOT allowed — see RECALL_DEADLINE_HEADROOM_SECONDS.
+  const maxDeadline = hookTimeoutSeconds - RECALL_DEADLINE_HEADROOM_SECONDS;
 
   // Derived default keeps the ceiling/deadline coupling automatic: an operator
   // who raises ONLY the hook ceiling gets a proportionally larger fan-out
   // budget for free, which is the intuitive reading of that knob.
-  const derivedDeadline = Math.max(
-    1,
-    hookTimeoutSeconds - RECALL_DEADLINE_HEADROOM_SECONDS,
-  );
   let parallelDeadlineSeconds =
-    usable(recall?.parallel_deadline_seconds) ?? derivedDeadline;
-  if (parallelDeadlineSeconds > hookTimeoutSeconds) {
+    usable(recall?.parallel_deadline_seconds) ?? maxDeadline;
+  if (parallelDeadlineSeconds > maxDeadline) {
     clamps.push(
-      `memory.recall.parallel_deadline_seconds ${parallelDeadlineSeconds}s exceeds ` +
-        `hook_timeout_seconds ${hookTimeoutSeconds}s — clamped to ${hookTimeoutSeconds}s ` +
-        `(Claude Code kills the hook at the ceiling, so a longer deadline is unreachable)`,
+      `memory.recall.parallel_deadline_seconds ${parallelDeadlineSeconds}s leaves less ` +
+        `than ${RECALL_DEADLINE_HEADROOM_SECONDS}s under hook_timeout_seconds ` +
+        `${hookTimeoutSeconds}s — clamped to ${maxDeadline}s (Claude Code SIGKILLs the ` +
+        `hook at the ceiling, so a deadline at or past it loses both the memories and ` +
+        `the recall_log row that would have explained why)`,
     );
-    parallelDeadlineSeconds = hookTimeoutSeconds;
+    parallelDeadlineSeconds = maxDeadline;
   }
 
   let requestTimeoutSeconds =

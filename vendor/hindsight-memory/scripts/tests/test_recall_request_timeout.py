@@ -155,5 +155,64 @@ class ManagedKeyIsWired(unittest.TestCase):
             self.assertEqual(load_config()["recallRequestTimeoutSeconds"], 11.5)
 
 
+class EnvBeatsTheUserConfigFile(unittest.TestCase):
+    """The env export is the ONLY carrier that outranks ~/.hindsight/claude-code.json.
+
+    Load order (load_config, lib/config.py:398-455):
+
+        DEFAULTS -> plugin settings.json -> ~/.hindsight/claude-code.json -> env
+
+    Switchroom stamps the envelope into the plugin's settings.json too, but
+    claude-code.json sits ABOVE that stamp and SURVIVES `switchroom apply` — the
+    live fleet had exactly such a file pinning recallParallelDeadlineSeconds to a
+    stale 16. A settings-only stamp is therefore silently defeated, which is why
+    start.sh exports these two UNCONDITIONALLY. These tests pin that precedence
+    so a future "just make it conditional / drop the export" change fails loudly
+    instead of quietly handing authority back to a hand-edited file.
+    """
+
+    ENVELOPE = (
+        ("HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS", "recallParallelDeadlineSeconds", 17, 16),
+        ("HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS", "recallRequestTimeoutSeconds", 13, 99),
+    )
+
+    def setUp(self):
+        self._tmp_home = tempfile.mkdtemp(prefix="recall-envelope-home-")
+        os.makedirs(os.path.join(self._tmp_home, ".hindsight"), exist_ok=True)
+        # Point the plugin-root settings.json probe at an empty dir so only the
+        # two layers under test are in play.
+        self._tmp_plugin = tempfile.mkdtemp(prefix="recall-envelope-plugin-")
+        self._stale = {key: stale for _, key, _, stale in self.ENVELOPE}
+        with open(
+            os.path.join(self._tmp_home, ".hindsight", "claude-code.json"), "w"
+        ) as f:
+            json.dump(self._stale, f)
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp_home, ignore_errors=True)
+        shutil.rmtree(self._tmp_plugin, ignore_errors=True)
+
+    def _patched_env(self, extra):
+        env = {"HOME": self._tmp_home, "CLAUDE_PLUGIN_ROOT": self._tmp_plugin}
+        env.update(extra)
+        return patch.dict(os.environ, env, clear=False)
+
+    def test_a_stale_user_config_wins_when_nothing_is_exported(self):
+        # Establishes that the fixture is real: without the exports the stale
+        # hand-edit IS authoritative, so the next test proves something.
+        for env_name, key, _, stale in self.ENVELOPE:
+            with self.subTest(env_name=env_name), self._patched_env({}):
+                os.environ.pop(env_name, None)
+                self.assertEqual(load_config()[key], stale)
+
+    def test_the_exported_envelope_overrides_a_stale_user_config(self):
+        exports = {env_name: str(want) for env_name, _, want, _ in self.ENVELOPE}
+        with self._patched_env(exports):
+            config = load_config()
+        for _, key, want, stale in self.ENVELOPE:
+            self.assertEqual(config[key], want)
+            self.assertNotEqual(config[key], stale)
+
+
 if __name__ == "__main__":
     unittest.main()
