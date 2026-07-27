@@ -36,12 +36,17 @@ const updateKeyModels = vi.fn((...a: unknown[]) => {
   void a;
   return Promise.resolve({ kind: "ok" as const });
 });
+const updateKeyBudget = vi.fn((...a: unknown[]) => {
+  void a;
+  return Promise.resolve({ kind: "ok" as const });
+});
 vi.mock("../litellm/provision.js", () => ({
   ensureTeam: (...a: unknown[]) => ensureTeam(...a),
   ensureKey: (...a: unknown[]) => ensureKey(...a),
   validateKey: (...a: unknown[]) => validateKey(...a),
   bindKeyToTeam: (...a: unknown[]) => bindKeyToTeam(...a),
   updateKeyModels: (...a: unknown[]) => updateKeyModels(...a),
+  updateKeyBudget: (...a: unknown[]) => updateKeyBudget(...a),
 }));
 
 function makeConfig(): SwitchroomConfig {

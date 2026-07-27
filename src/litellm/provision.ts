@@ -49,6 +49,8 @@
  * `preconnect` that a test mock can't satisfy). Defaults to the global
  * `fetch`.
  */
+import type { KeyBudget } from "./budget.js";
+
 export type FetchFn = (
   url: string,
   init?: { method?: string; headers?: Record<string, string>; body?: string },
@@ -89,6 +91,14 @@ export interface EnsureKeyOpts {
   teamId?: string;
   /** Arbitrary metadata tags attached to the key. */
   metadata?: Record<string, string>;
+  /**
+   * Spend caps for this key (see `./budget.ts`). Omit ⇒ an UNCAPPED key, which
+   * is a bearer token for the whole upstream account balance. `soft_budget` is
+   * sent ONLY here: LiteLLM's `UpdateKeyRequest` does not carry it (verified
+   * against `litellm/proxy/_types.py`), so it can never be healed onto an
+   * existing key — only `max_budget` / `budget_duration` can (`updateKeyBudget`).
+   */
+  budget?: KeyBudget;
   /**
    * Optional structured logger for the orphaned-alias self-heal path (delete +
    * regenerate). Defaults to a no-op — the module stays quiet on the happy path.
@@ -320,6 +330,14 @@ async function generateKeyOnce(opts: EnsureKeyOpts, fetchFn: FetchFn): Promise<G
   if (opts.teamId) payload.team_id = opts.teamId;
   if (opts.metadata && Object.keys(opts.metadata).length > 0) {
     payload.metadata = opts.metadata;
+  }
+  // Spend caps. `budget_duration` is ALWAYS sent alongside `max_budget`:
+  // without it LiteLLM treats the cap as a LIFETIME budget that never resets,
+  // and the key dies permanently the first time it is hit.
+  if (opts.budget) {
+    payload.max_budget = opts.budget.maxBudget;
+    payload.budget_duration = opts.budget.budgetDuration;
+    if (opts.budget.softBudget != null) payload.soft_budget = opts.budget.softBudget;
   }
 
   let resp: Response;
@@ -731,4 +749,65 @@ async function safeText(resp: Response): Promise<string> {
   } catch {
     return "";
   }
+}
+
+export interface UpdateKeyBudgetOpts {
+  baseUrl: string;
+  masterKey: string;
+  /** The existing virtual key string to re-cap. */
+  key: string;
+  /** The caps to write. */
+  budget: KeyBudget;
+}
+
+/** Outcome of a budget-only /key/update. */
+export type UpdateKeyBudgetResult =
+  | { kind: "ok" }
+  | { kind: "error"; detail: string };
+
+/**
+ * Apply spend caps to an EXISTING virtual key in place via
+ * POST /key/update {key, max_budget, budget_duration}.
+ *
+ * Why this is needed: keys provisioned before spend caps existed are stored in
+ * the vault and are NOT regenerated on a later apply (the caller checks the
+ * vault first and short-circuits). Without this, every pre-existing key would
+ * stay uncapped forever and the feature would only protect new agents.
+ *
+ * Contract verified against LiteLLM `litellm/proxy/_types.py` (read 2026-07-28):
+ * `UpdateKeyRequest` extends `KeyRequestBase` → `GenerateRequestBase`, which
+ * carries `max_budget: Optional[float]` and `budget_duration: Optional[str]`.
+ *
+ * `soft_budget` is DELIBERATELY NOT SENT. It lives on `GenerateKeyRequest`, a
+ * SIBLING of `UpdateKeyRequest`, not an ancestor — so the update endpoint has
+ * no such field and would silently ignore it. Sending it would let the caller
+ * believe an advisory alert had been armed when none had. An existing key can
+ * only gain a soft budget by being regenerated.
+ *
+ * Best-effort + LOUD on failure: never throws, never deletes or regenerates the
+ * key — returns a structured error the caller surfaces as a warning.
+ */
+export async function updateKeyBudget(
+  opts: UpdateKeyBudgetOpts,
+  fetchFn: FetchFn = fetch,
+): Promise<UpdateKeyBudgetResult> {
+  const url = `${normalizeBase(opts.baseUrl)}/key/update`;
+  let resp: Response;
+  try {
+    resp = await fetchFn(url, {
+      method: "POST",
+      headers: authHeaders(opts.masterKey),
+      body: JSON.stringify({
+        key: opts.key,
+        max_budget: opts.budget.maxBudget,
+        // Always paired — a cap with no window is a permanent kill-switch.
+        budget_duration: opts.budget.budgetDuration,
+      }),
+    });
+  } catch (err) {
+    return { kind: "error", detail: (err as Error).message };
+  }
+  if (resp.ok) return { kind: "ok" };
+  const body = await safeText(resp);
+  return { kind: "error", detail: `HTTP ${resp.status}: ${body.slice(0, 200)}` };
 }
