@@ -585,8 +585,8 @@ describe("renderDevProtocolFragment", () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
     expect(fragment.toLowerCase()).toContain("ci is the full-suite authority");
-    expect(fragment).toContain("Blockers and mediums block the merge");
-    expect(fragment).toContain("Merge only on CI green");
+    expect(fragment).toContain("Blockers and majors block the merge");
+    expect(fragment.toLowerCase()).toContain("merge on ci green");
     expect(fragment.toLowerCase()).toContain("durable fixes over hack patches");
     expect(fragment.toLowerCase()).toContain("outcomes, not just code paths");
   });
@@ -594,14 +594,22 @@ describe("renderDevProtocolFragment", () => {
   // Ken 2026-07-26: the old rule ("fix ALL findings including lows, then
   // re-review the fix") was a loop generator by construction — an
   // adversarial reviewer always surfaces lows, fixing lows produces a new
-  // diff, and a new diff earned another re-review. These two tests pin the
-  // termination conditions that replaced it: a severity gate, and a
-  // behaviour-scoped re-review trigger.
+  // diff, and a new diff earned another re-review. #3707 replaced it with a
+  // severity gate plus a counted round cap.
+  //
+  // Ken 2026-07-27: the counted cap was itself the residual loop driver.
+  // Review policy was stated across five surfaces carrying three different
+  // round numbers, and explicit verification scaffolding ("prefix the fix
+  // commit", "two rounds is the cap") is precisely what Anthropic's Claude 5
+  // guidance names as inducing redundant self-verification on a model that
+  // already self-verifies. The fix is DELETION: the severity gate survives,
+  // every round number and re-review trigger is gone. These tests pin the
+  // single surviving statement and assert the scaffolding cannot creep back.
   it("bounds the review loop: lows are filed, not merge-blocking", async () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
     expect(fragment).toContain("lows don't");
-    expect(fragment.toLowerCase()).toContain("file a follow-up issue and merge");
+    expect(fragment.toLowerCase()).toContain("file a low as a follow-up issue");
     // Tracked, not waived — filing stays mandatory.
     expect(fragment.toLowerCase()).toContain("filing is mandatory");
     // The unbounded phrasing must be gone, not merely reworded around it.
@@ -609,15 +617,37 @@ describe("renderDevProtocolFragment", () => {
     expect(fragment).not.toContain("including lows");
   });
 
-  it("bounds the review loop: re-review only on a behavioural fix", async () => {
+  it("states review policy EXACTLY once and never counts rounds", async () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
-    expect(fragment).toContain("Re-review only a behavioural fix");
-    expect(fragment.toLowerCase()).toContain(
-      "docs/comment/log/test-only commit doesn't earn one",
-    );
     // Adversarial review itself must survive the change.
     expect(fragment).toContain("Adversarial review of the diff");
+    // The termination condition is stated positively, once.
+    expect(fragment.toLowerCase()).toContain("fix what blocks, then merge on ci green");
+    expect(fragment.toLowerCase()).toContain("do not count review rounds");
+    expect(fragment.toLowerCase()).toContain("do not run a mandatory re-review pass");
+    // NEGATIVE: the round-counting scaffolding is gone, not reworded. Every
+    // one of these matched the previous fragment verbatim, so this test fails
+    // on the bug it guards (a reintroduced counter / trigger / threshold).
+    expect(fragment).not.toContain("review-fix:");
+    expect(fragment).not.toContain("two rounds is the cap");
+    expect(fragment).not.toContain("CI enforces it");
+    expect(fragment).not.toContain("Re-review only a behavioural fix");
+    expect(fragment).not.toMatch(/\b(?:two|three|2|3)\s+rounds?\b/i);
+    // The merge gate is severity, never a round number.
+    expect(fragment).toContain("Blockers and majors block the merge");
+  });
+
+  it("tells the worker to fetch before branching (stale-checkout guard)", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    // A switchroom agent does not start in the repo it is coding in, so
+    // "branch off fresh main" with no fetch silently bases work on a stale
+    // checkout. The fetch must be explicit and ordered first.
+    expect(fragment).toContain("git fetch origin");
+    expect(fragment).toContain("origin/main");
+    // NEGATIVE: the bare phrasing that permitted a stale base is gone.
+    expect(fragment).not.toContain("Branch off fresh main.");
   });
 
   it("pins the communication rules: 30s watch cap and 15 sub-agent cap", async () => {
@@ -628,10 +658,15 @@ describe("renderDevProtocolFragment", () => {
     expect(fragment.toLowerCase()).toContain("consolidated messages");
   });
 
-  it("points at the bundled dev-protocol skill for the long form", async () => {
+  it("does NOT point at a `dev-protocol` skill (dangling fleet-wide)", async () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
-    expect(fragment).toContain("`dev-protocol` skill");
+    // `dev-protocol` does not match the `switchroom-*` auto-install prefix
+    // that scaffold.ts symlinks into <agentDir>/.claude/skills/, so no agent
+    // has ever had it registered. Telling every agent to "load it before
+    // starting" was an unresolvable instruction on every profile.
+    expect(fragment).not.toContain("`dev-protocol` skill");
+    expect(fragment).not.toContain("load it before starting");
   });
 
   it("is non-empty (file present and rendered)", async () => {

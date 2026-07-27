@@ -3249,15 +3249,23 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(cmd).toMatch(/plain punctuation/);
   });
 
-  it("turn-pacing directive carries the intent-narration carrier (thinking-redacted visibility)", () => {
-    // Option 2 of the thinking-visibility work: with extended-thinking
-    // text server-redacted for the current flagship models, the model's
-    // own plain-language intent narration is the ONLY compliant carrier
-    // for "what am I doing / why". The directive must instruct the model
-    // to drop a one-line intent (as ordinary working text, NOT a reply)
-    // before a silent tool stretch — and to distinguish it from the
-    // banned placeholder ack. It must stay inside the job's bad-list:
-    // no per-tool-call narration, no raw tool names, no debug dumps.
+  it("turn-pacing directive carries the work-labelling carrier without a reasoning-extraction hazard", () => {
+    // The user must still be able to tell what the agent is doing during a
+    // long silent stretch. The CARRIER changed: it is now a plain output
+    // requirement (a `description` on every tool call, plus one status line
+    // before a long stretch) instead of "your reasoning is hidden, so
+    // re-emit it as working text".
+    //
+    // Why the old shape had to go: naming the model's hidden reasoning and
+    // then instructing it to write that reasoning out as response text is
+    // the documented trigger shape for `reasoning_extraction` refusals. A
+    // refusal here can cause a silent model fallback, and an off-plan model
+    // call breaches the `subscription-honest` vision pillar ("zero off-plan
+    // callsites"). It also self-contradicted the reply rule ~55 lines later,
+    // which bans leaving unsent transcript text for the backstop to flush.
+    //
+    // Guardrails that must survive: no per-tool-call narration, no raw tool
+    // names, no debug dumps, still distinct from the banned placeholder ack.
     const agentConfig = makeAgentConfig({});
     const switchroomConfig: SwitchroomConfig = {
       switchroom: { version: 1, agents_dir: tmpDir },
@@ -3279,35 +3287,62 @@ describe("scaffoldAgent with global defaults cascade", () => {
     }>)
       .flatMap((g) => g.hooks)
       .find((h) => h.command.includes("turn-pacing"))!.command;
-    // The intent-narration carrier is present.
-    expect(cmd).toMatch(/NARRATE YOUR INTENT/);
-    expect(cmd).toMatch(/reasoning is NOT shown/);
-    // It is transcript text mirrored to the preview, NOT a reply.
-    expect(cmd).toMatch(/ordinary working text \(NOT a reply/);
+    // The work-labelling carrier is present, framed as an OUTPUT rule.
+    expect(cmd).toMatch(/LABEL THE WORK AS YOU DO IT/);
+    expect(cmd).toMatch(/plain-English `description`/);
+    // One status line before a long stretch — the visibility outcome kept.
+    expect(cmd).toMatch(/before a long stretch of work/);
     expect(cmd).toMatch(/live[\s\S]{0,40}preview/);
     // It respects the bad-list: no raw tool names, no debug dumps.
     expect(cmd).toMatch(/never raw tool names/);
     expect(cmd).toMatch(/never a debug dump/);
-    // Bash gets a plain-English description (the draft-mirror carrier).
-    expect(cmd).toMatch(/plain-English `description`/);
     // It is explicitly distinguished from the banned placeholder ack.
     expect(cmd).toMatch(/NOT the placeholder ack/);
+
+    // NEGATIVE — the reasoning-extraction hazard. Each pattern below matched
+    // the previous directive verbatim, so this block fails on the exact bug
+    // it guards. The emitted text must not claim the model's reasoning is
+    // hidden, nor instruct it to re-emit that reasoning as response text.
+    expect(cmd).not.toMatch(/reasoning is NOT shown/);
+    expect(cmd).not.toMatch(/cannot see your thinking/);
+    expect(cmd).not.toMatch(/NARRATE YOUR INTENT/);
+    expect(cmd).not.toMatch(/ordinary working text \(NOT a reply/);
+    // Generic backstops so a reworded reintroduction still trips.
+    expect(cmd).not.toMatch(/\b(?:reasoning|thinking)\b[^.]{0,80}\b(?:is|are)\s+(?:not|never)\s+(?:shown|visible|displayed)/i);
+    expect(cmd).not.toMatch(/\b(?:hidden|private|internal)\s+(?:reasoning|thinking)\b/i);
+
+    // The reply rule and the labelling rule must not contradict: the
+    // directive still bans leaving unsent transcript text for the backstop,
+    // and now routes the status line through a tool call instead.
+    expect(cmd).toMatch(/flushes unsent text after a delay/);
+    expect(cmd).toMatch(/user-facing text goes through a tool call/);
   });
 
-  it("TELEGRAM_GUIDANCE beat 2 carries the intent-narration trail", () => {
+  it("TELEGRAM_GUIDANCE beat 2 carries work-labelling, not reasoning narration", () => {
     // The static fleet-invariant block (shipped to every agent via
     // ~/.switchroom/fleet/switchroom-invariants.md, not just the per-turn
-    // hook) must also teach the intent-narration carrier, so agents that
-    // read the static block still get it. Beat 2 is where "go quiet and
-    // work" lives — the narration trail rides alongside it.
+    // hook) carried a SECOND copy of the same hazardous shape, so it needs
+    // the same fix — otherwise agents reading the static block still get
+    // "your private reasoning is never shown, so write it out". Beat 2 is
+    // where "go quiet and work" lives.
+    //
+    // NOTE: switchroom-invariants.md is generated and force-restored from
+    // this constant. Fix the generator only; never hand-edit the artifact.
     const invariants = renderFleetInvariants();
-    expect(invariants).toMatch(/leave a trail of intent/);
-    expect(invariants).toMatch(/private reasoning is never shown/);
-    expect(invariants).toMatch(/NOT a `reply` call/);
+    expect(invariants).toMatch(/label what you are doing/);
     expect(invariants).toMatch(/plain-English\s+`description`/);
+    expect(invariants).toMatch(/Before a long silent stretch/);
     // Bad-list guardrails travel with it (no per-tool spam / raw names).
     expect(invariants).toMatch(/never raw tool names/);
     expect(invariants).toMatch(/debug dumps/);
+
+    // NEGATIVE — same reasoning-extraction hazard, same assertions. These
+    // matched the previous beat 2 verbatim.
+    expect(invariants).not.toMatch(/private reasoning is never shown/);
+    expect(invariants).not.toMatch(/leave a trail of intent/);
+    expect(invariants).not.toMatch(/Write it as ordinary text, NOT a `reply` call/);
+    expect(invariants).not.toMatch(/\b(?:reasoning|thinking)\b[^.]{0,80}\b(?:is|are)\s+(?:not|never)\s+shown/i);
+    expect(invariants).not.toMatch(/\b(?:hidden|private|internal)\s+(?:reasoning|thinking)\b/i);
   });
 
   it("turn-pacing directive carries the decision-first turn-end shape (#2707)", () => {
