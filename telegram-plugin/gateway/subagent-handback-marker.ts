@@ -201,7 +201,7 @@ export class SubagentHandbackMarker {
    * Wall-clock ms of the most recent handback enqueue ANYWHERE in `chatId`
    * (across every topic lane), or null. This is what the content-gate read uses
    * (dup-audit MUST-FIX 2, Fable 2026-07-21): the owner-resolution latest-ended
-   * tier is CHAT-WIDE (`findLatestEndedTurnForChat` ignores thread), so a
+   * tier is CHAT-WIDE (`findLatestTurnForChat` ignores thread), so a
    * background handback in topic A can resolve — and supersede — topic B's
    * ended turn. A thread-SPECIFIC gate read (the F2 regression) let a reply
    * dodge that handback by carrying a different `message_thread_id`, silently

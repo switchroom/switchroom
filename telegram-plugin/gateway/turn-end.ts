@@ -436,7 +436,7 @@ function endCurrentTurnAtomic(
   // live feed never opened because its sends failed (the resume-400 signature).
   const turnEndedAt = Date.now()
   // 2026-07 double-reply-on-DM fix (F2) — stamp the turn's end time so the
-  // `findLatestEndedTurnForChat` supersede tier can be recency-bounded to the
+  // `latest-ended` supersede tier can be recency-bounded to the
   // supersede TTL (a stale latest-ended turn must not inherit deletion
   // authority over a newer turn's flush record). Set once; idempotent on the
   // deferRecord flush path (which calls this synchronously before its send).

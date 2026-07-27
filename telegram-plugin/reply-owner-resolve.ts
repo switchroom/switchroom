@@ -25,8 +25,8 @@
  *
  * The DECISIVE divergence: the gateway's *thread-routing* path DID recover the
  * owner turn for the same late reply — via `findTurnByQuotedMessageId` (the
- * framework-owned default quote target) and `findLatestEndedTurnForChat` (the
- * chat's most-recently-ended turn). The supersede resolver chain omitted BOTH
+ * framework-owned default quote target) and `findLatestTurnForChat` (the
+ * chat's most recent turn). The supersede resolver chain omitted BOTH
  * recoveries, so the two resolvers disagreed on who owned the reply. This module
  * unifies them onto ONE precedence so they can never diverge again.
  *
@@ -37,7 +37,7 @@
  * `decideCapturedProseDelivery` — is to extract the decision core into a pure,
  * unit-testable function and have the gateway run the EXACT code the regression
  * tests exercise. The gateway performs the four turn lookups (currentTurn,
- * findTurnByOriginId, findTurnByQuotedMessageId, findLatestEndedTurnForChat) and
+ * findTurnByOriginId, findTurnByQuotedMessageId, findLatestTurnForChat) and
  * feeds their resolved turnIds here; the precedence lives in one place.
  */
 
@@ -56,16 +56,25 @@ export interface ReplyOwnerCandidates {
   /** `findTurnByQuotedMessageId(chat_id, reply_to)` — the framework-owned
    *  quoted message id, resolved with NO model thread assertion. */
   quotedTurnId: string | null
-  /** `findLatestEndedTurnForChat(chat_id)` — the chat's most-recently-ended
-   *  turn. The deterministic late-reply fallback (the DM path's recovery). */
+  /** `findLatestTurnForChat(chat_id, {endedOnly:true})` — the chat's
+   *  most-recently-ENDED turn. The deterministic late-reply fallback (the DM
+   *  path's recovery). #3725: the gateway lookup skips turns that have not
+   *  ended, so this is never a still-running turn. */
   latestEndedTurnId: string | null
   /** Age (ms) of the latest-ended turn — `now - turn.endedAt`. The latest-ended
    *  tier carries DESTRUCTIVE authority (it drives supersede deletion), so it is
    *  honoured ONLY when the turn ended within `latestEndedTtlMs` (the supersede
    *  TTL). Without the bound, a late reply belonging to an OLDER turn could
    *  resolve its owner to a NEWER turn now sitting at the registry tail and
-   *  delete THAT turn's legit answer. Undefined/null ⇒ unbounded (back-compat:
-   *  callers that don't supply an age keep the pre-F2 behaviour). */
+   *  delete THAT turn's legit answer.
+   *
+   *  Two distinct absences (#3725):
+   *    - `undefined` (property omitted) ⇒ unbounded, the pre-F2 back-compat
+   *      escape for callers that don't supply an age at all;
+   *    - explicit `null` ⇒ the caller COMPUTED no age, i.e. its candidate turn
+   *      has no `endedAt` and has NOT ended. That cannot be TTL-bounded, so it
+   *      fails CLOSED (not accepted) rather than granting unbounded authority
+   *      to a turn that is still running. */
   latestEndedAgeMs?: number | null
   /** The supersede TTL bound applied to `latestEndedAgeMs`. Undefined ⇒
    *  unbounded. */
@@ -74,13 +83,17 @@ export interface ReplyOwnerCandidates {
 
 /**
  * Whether the latest-ended candidate is fresh enough to carry supersede
- * (deletion) authority. A missing age or TTL means unbounded (back-compat).
+ * (deletion) authority. An OMITTED age or TTL means unbounded (the pre-F2
+ * back-compat escape); an EXPLICIT null age fails closed (#3725 — the caller
+ * computed no age because its candidate turn has not ended, and an un-ended turn
+ * must be resolved by the `live` tier, never by this destructive fallback).
  */
 function latestEndedAccepted(candidates: ReplyOwnerCandidates): boolean {
   if (candidates.latestEndedTurnId == null) return false
   const age = candidates.latestEndedAgeMs
   const ttl = candidates.latestEndedTtlMs
-  if (age == null || ttl == null) return true
+  if (age === null) return false
+  if (age === undefined || ttl == null) return true
   return age <= ttl
 }
 
@@ -174,7 +187,11 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
  * FRAMEWORK would not have gone on its own. So `origin`/`quoted` bypass the
  * content gate IFF the turn they resolve is the SAME turn the framework-derived,
  * TTL-bounded `latest-ended` candidate resolves — a candidate computed from
- * `findLatestEndedTurnForChat` with no model input at all.
+ * `findLatestTurnForChat(chat_id, {endedOnly:true})` with no model input at all.
+ * "TTL-bounded" is enforced, not assumed (#3725): `latestEndedAccepted` demands
+ * an age within `latestEndedTtlMs`, and an anchor turn that has NOT ended (age
+ * explicitly null) is rejected outright rather than treated as unbounded — so a
+ * turn still running in another topic of the same chat can corroborate nothing.
  *
  * This grants ZERO new capability, which is the safety argument: any reply that
  * reaches the bypass via a corroborated `origin`/`quoted` attribution could
@@ -198,8 +215,9 @@ export function decideContentGateBypass(input: {
   resolvedTurnId: string | null
   /** The SAME candidate set both of the above were derived from — supplies the
    *  framework-derived `latestEndedTurnId` plus its freshness bound, so the
-   *  corroboration reuses the EXACT TTL rule `resolveReplyOwnerTier` applies
-   *  instead of duplicating it. */
+   *  corroboration reuses the EXACT rule `resolveReplyOwnerTier` applies
+   *  (`latestEndedAccepted`) instead of duplicating it: within the TTL, and —
+   *  since #3725 — not a turn that is still running. */
   candidates: ReplyOwnerCandidates
   /** True when a decoupled-completion inbound (`subagent_handback`) was enqueued
    *  in this chat AFTER the owner turn ended and within the supersede TTL — the

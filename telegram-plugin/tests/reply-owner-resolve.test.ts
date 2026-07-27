@@ -36,10 +36,12 @@ import {
   decideAnswerLatchSuppression,
   decideContentGateBypass,
   type ReplyOwnerCandidates,
+  type ReplyOwnerTier,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
 import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
+import { latestTurnForChat } from '../gateway/latest-turn-lookup.js'
 
 const NONE: ReplyOwnerCandidates = {
   liveTurnId: null,
@@ -961,9 +963,17 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     expect(r.bypasses).toBeGreaterThan(0)
     // …and specifically, many cases must win their bypass on the WIDENED,
     // model-steerable `origin`/`quoted` tiers — the thing being vouched for.
-    // Currently exactly 16 of the 486 cases do (no live turn, handback clear,
-    // a fresh-or-unbounded latest-ended id, and the steered id equal to it).
-    expect(r.modelTierBypasses).toBeGreaterThanOrEqual(16)
+    // Exactly 8 of the 486 cases do: no live turn, handback clear, a FRESH
+    // latest-ended id, and the steered id equal to it.
+    //
+    // This floor was 16 before #3725. The other 8 were the `latestEndedAgeMs
+    // == null` (unbounded) shapes, which corroborated a bypass off an anchor
+    // that had never ended. #3725 makes the latest-ended lookup `endedOnly`, so
+    // the age is always a real number and an explicit null age fails CLOSED —
+    // those 8 shapes are now correctly unreachable. Lowering the floor here is
+    // recording that narrowing, not conceding it: the property assertion above
+    // (`violations` empty) is unchanged and still passes.
+    expect(r.modelTierBypasses).toBeGreaterThanOrEqual(8)
   })
 
   // NON-VACUITY, asserted deterministically rather than demonstrated by hand:
@@ -1003,5 +1013,206 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     }
     const b = sweepZeroNewCapability(ignoresHandback)
     expect(b.violations.length).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * #3725 — the "framework-derived, TTL-bounded" supersede anchor was neither
+ * ended nor bounded.
+ *
+ * The gateway's `recentTurnsById` registry is populated at turn START, so its
+ * tail entry for a chat can be a turn that is STILL RUNNING (`endedAt: null`) —
+ * and because the registry is chat-wide and thread-agnostic, a turn running in
+ * another topic of the same chat lands there. The gateway then computed
+ * `latestEndedAgeMs = endedAt != null ? now - endedAt : null`, and
+ * `latestEndedAccepted` treated a null age as UNBOUNDED (its back-compat escape
+ * for callers that supply no age at all). Net effect: a still-running turn
+ * became a corroborating anchor with NO freshness bound, for the widened
+ * `origin`/`quoted` content-gate bypass #3719 leans on.
+ *
+ * The fix is two-layer and both layers fail CLOSED:
+ *   1. the gateway lookup skips turns with no `endedAt` (`latestTurnForChat`
+ *      with `endedOnly: true`), so the anchor is a genuinely ended turn — and
+ *      when the chat has no ended turn, there is NO anchor rather than a
+ *      running one;
+ *   2. `latestEndedAccepted` distinguishes an OMITTED age (undefined ⇒
+ *      back-compat unbounded) from a COMPUTED-null age (⇒ rejected).
+ */
+describe('#3725 — a still-running turn is not a supersede anchor', () => {
+  const CHAT = '12345'
+  const ENDED = 'turn-ENDED'
+  const RUNNING = 'turn-RUNNING'
+
+  interface RegistryTurn { turnId: string; sessionChatId: string; endedAt: number | null }
+
+  const NOW = 1_000_000
+
+  /**
+   * The gateway's candidate construction (`resolveReplyOwnerTurn`), mirrored
+   * here because `gateway.ts` is not importable in tests — the same convention
+   * the rest of this file uses. `scan` selects the FIXED lookup (`endedOnly`)
+   * or the PRE-FIX one (tail entry regardless of `endedAt`), giving the
+   * red-on-main contrast as an assertion rather than prose.
+   */
+  function gatewayCandidates(
+    turns: RegistryTurn[],
+    scan: 'fixed' | 'prefix',
+    over: Partial<ReplyOwnerCandidates> = {},
+  ): ReplyOwnerCandidates {
+    const latestEnded =
+      scan === 'fixed'
+        ? latestTurnForChat(turns, CHAT, { endedOnly: true })
+        : (turns.filter((t) => t.sessionChatId === CHAT).at(-1) ?? null)
+    return {
+      liveTurnId: null,
+      originTurnId: null,
+      quotedTurnId: null,
+      latestEndedTurnId: latestEnded?.turnId ?? null,
+      latestEndedAgeMs: latestEnded?.endedAt != null ? NOW - latestEnded.endedAt : null,
+      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      ...over,
+    }
+  }
+
+  /**
+   * The PRE-FIX resolver semantics, reproduced verbatim for the red-on-main
+   * contrast. BOTH layers of the defect are here: `latestEndedAccepted` treated
+   * a null age as unbounded (`age == null ⇒ true`), and the gateway's scan (the
+   * `'prefix'` mode above) handed it a turn that had not ended, whose age it
+   * therefore computed as null.
+   */
+  function preFixAccepted(c: ReplyOwnerCandidates): boolean {
+    if (c.latestEndedTurnId == null) return false
+    const age = c.latestEndedAgeMs
+    const ttl = c.latestEndedTtlMs
+    if (age == null || ttl == null) return true
+    return age <= ttl
+  }
+  function preFixTier(c: ReplyOwnerCandidates): ReplyOwnerTier {
+    if (c.liveTurnId != null) return 'live'
+    if (c.originTurnId != null) return 'origin'
+    if (c.quotedTurnId != null) return 'quoted'
+    if (preFixAccepted(c)) return 'latest-ended'
+    return 'none'
+  }
+  function preFixOwnerId(c: ReplyOwnerCandidates): string | null {
+    switch (preFixTier(c)) {
+      case 'live': return c.liveTurnId
+      case 'origin': return c.originTurnId
+      case 'quoted': return c.quotedTurnId
+      case 'latest-ended': return c.latestEndedTurnId
+      case 'none': return null
+    }
+  }
+  /** `decideContentGateBypass` as it stood before this fix (same rule, pre-fix
+   *  acceptance). */
+  function preFixBypass(c: ReplyOwnerCandidates): boolean {
+    const tier = preFixTier(c)
+    if (tier === 'live') return true
+    if (tier === 'none') return false
+    if (!preFixAccepted(c)) return false
+    const id = preFixOwnerId(c)
+    return id != null && id === c.latestEndedTurnId
+  }
+
+  /** A chat whose only ended turn is followed by a turn still running in
+   *  another topic — the registry tail is the RUNNING turn. */
+  const registry: RegistryTurn[] = [
+    { turnId: ENDED, sessionChatId: CHAT, endedAt: NOW - 10_000 },
+    { turnId: RUNNING, sessionChatId: CHAT, endedAt: null },
+  ]
+
+  it('the anchor is the ENDED turn, not the running tail entry (pre-fix scan ' +
+    'picked the running turn with a null — unbounded — age)', () => {
+    expect(gatewayCandidates(registry, 'fixed')).toMatchObject({
+      latestEndedTurnId: ENDED,
+      latestEndedAgeMs: 10_000,
+    })
+    expect(gatewayCandidates(registry, 'prefix')).toMatchObject({
+      latestEndedTurnId: RUNNING,
+      latestEndedAgeMs: null,
+    })
+  })
+
+  it('a model-steered `origin` echo of the RUNNING turn gets NO corroborated ' +
+    'bypass — pre-fix it did', () => {
+    const steered = { originTurnId: RUNNING }
+    const fixed = gatewayCandidates(registry, 'fixed', steered)
+    expect(
+      decideContentGateBypass({
+        tier: resolveReplyOwnerTier(fixed),
+        resolvedTurnId: resolveReplyOwnerTurnId(fixed),
+        candidates: fixed,
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(false)
+    // Red-on-main contrast: the same reply DID bypass the #3429 content gate
+    // before the fix, corroborated by a turn that had not even ended.
+    expect(preFixBypass(gatewayCandidates(registry, 'prefix', steered))).toBe(true)
+  })
+
+  it('a chat with ONLY a running turn yields NO owner and NO bypass (fail ' +
+    'closed), where pre-fix it yielded an unbounded latest-ended owner', () => {
+    const onlyRunning: RegistryTurn[] = [{ turnId: RUNNING, sessionChatId: CHAT, endedAt: null }]
+    const fixed = gatewayCandidates(onlyRunning, 'fixed')
+    expect(fixed.latestEndedTurnId).toBeNull()
+    expect(resolveReplyOwnerTier(fixed)).toBe('none')
+    expect(resolveReplyOwnerTurnId(fixed)).toBeNull()
+    expect(
+      decideContentGateBypass({
+        tier: 'none',
+        resolvedTurnId: null,
+        candidates: fixed,
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(false)
+
+    const prefix = gatewayCandidates(onlyRunning, 'prefix')
+    expect(preFixTier(prefix)).toBe('latest-ended')
+    expect(preFixOwnerId(prefix)).toBe(RUNNING)
+  })
+
+  it('layer 2: an EXPLICIT null age is rejected outright, while an OMITTED age ' +
+    'keeps the pre-F2 back-compat escape', () => {
+    const base: ReplyOwnerCandidates = {
+      liveTurnId: null,
+      originTurnId: null,
+      quotedTurnId: null,
+      latestEndedTurnId: ENDED,
+      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    }
+    // Computed-null (the caller's candidate turn has not ended) ⇒ closed.
+    expect(resolveReplyOwnerTier({ ...base, latestEndedAgeMs: null })).toBe('none')
+    expect(resolveReplyOwnerTurnId({ ...base, latestEndedAgeMs: null })).toBeNull()
+    expect(
+      decideContentGateBypass({
+        tier: 'origin',
+        resolvedTurnId: ENDED,
+        candidates: { ...base, originTurnId: ENDED, latestEndedAgeMs: null },
+        handbackCouldOwnReply: false,
+      }),
+    ).toBe(false)
+    // Property omitted entirely ⇒ unchanged pre-F2 behaviour.
+    expect(resolveReplyOwnerTier(base)).toBe('latest-ended')
+    expect(resolveReplyOwnerTurnId(base)).toBe(ENDED)
+  })
+
+  it('end-to-end: a late reply while another topic is still running cannot ' +
+    "delete a DIFFERENT turn's flush record", () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    // The still-running turn holds a fresh flush record of its own.
+    reg.record(CHAT, undefined, { turnId: RUNNING, messageIds: [9001], text: 'A' }, NOW)
+    // A late reply lands with no live turn, no echo, no quote. Pre-fix its owner
+    // resolved to the RUNNING turn (registry tail, unbounded) and the take()
+    // consumed that turn's record; with the fix the owner is the ENDED turn, so
+    // the running turn's record is untouched.
+    const onlyRunning: RegistryTurn[] = [
+      { turnId: ENDED, sessionChatId: CHAT, endedAt: NOW - 10_000 },
+      { turnId: RUNNING, sessionChatId: CHAT, endedAt: null },
+    ]
+    const ownerId = resolveReplyOwnerTurnId(gatewayCandidates(onlyRunning, 'fixed'))
+    expect(ownerId).toBe(ENDED)
+    expect(reg.take(CHAT, undefined, { liveTurnId: ownerId, now: NOW + 10 }).supersede).toBe(false)
+    expect(reg.peek(CHAT, undefined, { liveTurnId: RUNNING, now: NOW + 10 }).supersede).toBe(true)
   })
 })
