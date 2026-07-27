@@ -5,7 +5,7 @@ The bug: recall.py composed a query from the last 2 turns (up to
 ``recallMaxQueryChars`` = 800 chars, ~110 tokens) and Hindsight OR-joined every
 token into one ``to_tsquery``. Postgres native FTS cannot top-k from the GIN
 index, so it ranked the whole matched set before the top-60 heapsort. Measured
-on the live ``overlord`` bank (135,443 memory_units, 3 fact-type arms):
+on the live ``overlord`` bank (135,565 memory_units, 3 fact-type arms):
 
     as shipped                 96 terms   119,510 rows ranked   14.0 s
     role labels/header removed 93 terms    86,653 rows ranked   11.8 s

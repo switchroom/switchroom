@@ -85,7 +85,7 @@ DEFAULTS = {
     # and up to 94s under load, past the
     # per-bank client timeout, so the agent got NOTHING on 96.8% of its
     # own-bank recalls in the 7 days to 2026-07-27. 24 terms measures at
-    # 40,308 rows / 2.9s on the same bank while keeping the high-signal terms
+    # 48,433 rows / 2.7s on the same bank while keeping the high-signal terms
     # of the latest turn. Selection is recency-first (latest turn beats prior
     # context), then by a selectivity proxy — see lib/content.shape_recall_query.
     # 0 disables shaping entirely (rollback lever).

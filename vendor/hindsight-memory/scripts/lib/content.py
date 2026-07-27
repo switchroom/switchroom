@@ -201,12 +201,12 @@ def truncate_recall_query(query: str, latest_query: str, max_chars: int) -> str:
 # native FTS cannot top-k from the GIN index — it computes `ts_rank_cd` on
 # every matching row before the top-60 heapsort. So BM25 cost grows with the
 # size of the matched set, which grows with query length. Measured on the live
-# `overlord` bank (135,443 memory_units, 3 fact-type arms, LIMIT 60 each,
+# `overlord` bank (135,565 memory_units, 3 fact-type arms, LIMIT 60 each,
 # production-shaped composed query):
 #
 #     as shipped (96 distinct terms)     119,510 rows ranked    14.0 s
 #     role labels + header stripped      86,653 rows ranked     11.8 s
-#     + capped to 24 BM25 terms          40,308 rows ranked      2.9 s
+#     + capped to 24 BM25 terms          48,433 rows ranked      2.7 s
 #
 # The 8s client timeout then fired on 96.8% of overlord's own-bank recalls
 # over the 7 days to 2026-07-27, so the agent got zero memories.
