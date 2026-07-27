@@ -1,0 +1,180 @@
+#!/usr/bin/env node
+/**
+ * Check that every `*.test.ts` in the repo is executed by at least one CI
+ * runner.
+ *
+ * Why this script exists
+ * ----------------------
+ * The repo has two test runners and they are wired independently:
+ *
+ *   - vitest   — `bunx vitest run` (ci-tests-core.yml, ci-full.yml). Discovers
+ *                everything EXCEPT the `exclude` globs in `vitest.config.ts`.
+ *   - bun test — `telegram-plugin/scripts/bun-test-ci.sh` (ci-tests-plugin.yml,
+ *                ci-full.yml). Runs an EXPLICIT target list, from
+ *                `telegram-plugin/`.
+ *
+ * The failure mode (issue #3756): someone adds a file to vitest's `exclude` to
+ * unblock CI — usually because it imports `bun:sqlite` or `bun:test` — and
+ * never adds it to the bun list. The file then runs in NEITHER runner. It is
+ * silent by construction: nothing goes red, the file just stops being a test.
+ * `check-bun-test-imports.mjs` enforces the FIRST half of that contract
+ * (`bun:test` import ⇒ vitest-excluded); this script enforces the second half
+ * (vitest-excluded ⇒ actually named by the bun job).
+ *
+ * NOTE on `package.json`'s `test` / `test:bun` scripts: they are developer
+ * conveniences and are NOT invoked by any workflow (verified against
+ * `.github/workflows/*.yml`). Adding a file to `test:bun` does NOT put it in
+ * CI. Only `bun-test-ci.sh`'s target list does. This script deliberately reads
+ * the script, not package.json, so it can never certify a file as covered on
+ * the strength of a list CI ignores.
+ *
+ * Known-orphan debt lives in `scripts/check-test-runner-coverage-allowlist.txt`
+ * — one path per line, each with the issue that tracks it. The allowlist is a
+ * RATCHET: existing debt is visible and enumerable, and new debt fails lint.
+ *
+ * Run: `npm run lint:test-runner-coverage` (also part of `npm run lint`).
+ */
+
+import { execSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const repoRoot = resolve(__dirname, '..')
+
+const BUN_SCRIPT_REL = 'telegram-plugin/scripts/bun-test-ci.sh'
+const ALLOWLIST_REL = 'scripts/check-test-runner-coverage-allowlist.txt'
+
+/** Pull the `exclude: [...]` globs out of vitest.config.ts. */
+function loadVitestExcludes() {
+  const cfg = readFileSync(resolve(repoRoot, 'vitest.config.ts'), 'utf-8')
+  const excludeIdx = cfg.indexOf('exclude: [')
+  if (excludeIdx === -1) {
+    throw new Error('check-test-runner-coverage: could not find `exclude: [` in vitest.config.ts')
+  }
+  const tail = cfg.slice(excludeIdx)
+  const closeIdx = tail.search(/\n\s{0,8}\],/)
+  if (closeIdx === -1) {
+    throw new Error('check-test-runner-coverage: could not find the closing `]` for exclude array')
+  }
+  // Strip `//` comment lines first — several carry issue links and file paths
+  // in prose, and those must not be mistaken for glob entries.
+  const block = tail
+    .slice(0, closeIdx)
+    .split('\n')
+    .filter((l) => !l.trimStart().startsWith('//'))
+    .join('\n')
+  return Array.from(block.matchAll(/['"]([^'"\n]+)['"]/g), (m) => m[1])
+}
+
+/**
+ * Compile a vitest/picomatch-style glob to a RegExp over a repo-relative path.
+ * Only the subset the exclude list actually uses: `**` (any depth, and `**​/`
+ * may match zero segments) and `*` (within one segment).
+ */
+function globToRegExp(glob) {
+  const escaped = glob
+    .split('*')
+    .map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\u0000')
+  const body = escaped
+    .replace(/\u0000\u0000\//g, '(?:.*/)?') // `**/` — zero or more segments
+    .replace(/\u0000\u0000/g, '.*') // bare `**`
+    .replace(/\u0000/g, '[^/]*') // `*` — within one segment
+  return new RegExp(`^${body}$`)
+}
+
+/** Positional filter args from bun-test-ci.sh's default BUN_TEST_ARGS block. */
+function loadBunTargets() {
+  const sh = readFileSync(resolve(repoRoot, BUN_SCRIPT_REL), 'utf-8')
+  const m = sh.match(/BUN_TEST_ARGS=\(\n([\s\S]*?)\n\s*\)/)
+  if (m == null) {
+    throw new Error(`check-test-runner-coverage: could not find BUN_TEST_ARGS=( in ${BUN_SCRIPT_REL}`)
+  }
+  return m[1]
+    .split('\n')
+    .map((l) => l.replace(/#.*$/, '').trim())
+    .filter(Boolean)
+    .flatMap((l) => l.split(/\s+/))
+}
+
+function loadAllowlist() {
+  const raw = readFileSync(resolve(repoRoot, ALLOWLIST_REL), 'utf-8')
+  const globs = []
+  for (const line of raw.split('\n')) {
+    const t = line.replace(/#.*$/, '').trim()
+    if (t !== '') globs.push(t)
+  }
+  return globs
+}
+
+/**
+ * `bun test <filter>` matches a filter as a SUBSTRING of the test file path,
+ * resolved from the CWD the job uses — `telegram-plugin/`. So only files under
+ * telegram-plugin/ can be covered by the bun job at all.
+ */
+const PLUGIN_PREFIX = 'telegram-plugin/'
+
+/**
+ * Pure core, exported for `telegram-plugin/tests/test-runner-coverage.test.ts`.
+ * @returns {string[]} repo-relative paths executed by NEITHER CI runner.
+ */
+export function findOrphanTestFiles({ files, excludeGlobs, bunTargets, allowGlobs }) {
+  const excludeRes = excludeGlobs.map(globToRegExp)
+  const allowRes = allowGlobs.map(globToRegExp)
+  const runByBun = (file) => {
+    if (!file.startsWith(PLUGIN_PREFIX)) return false
+    const rel = file.slice(PLUGIN_PREFIX.length)
+    return bunTargets.some((t) => rel.includes(t))
+  }
+  return files.filter((file) => {
+    const runByVitest = !excludeRes.some((re) => re.test(file))
+    if (runByVitest || runByBun(file)) return false
+    return !allowRes.some((re) => re.test(file))
+  })
+}
+
+/** Read the three real inputs off disk. Exported so the test pins REAL config. */
+export function loadRepoInputs() {
+  return {
+    files: execSync('git ls-files "*.test.ts"', { cwd: repoRoot, encoding: 'utf-8' })
+      .trim()
+      .split('\n')
+      .filter((f) => f !== '' && !f.includes('node_modules/')),
+    excludeGlobs: loadVitestExcludes(),
+    bunTargets: loadBunTargets(),
+    allowGlobs: loadAllowlist(),
+  }
+}
+
+// Importing this module (the unit test does) must not run the check or exit.
+const isMain = process.argv[1] != null && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (isMain) {
+  const inputs = loadRepoInputs()
+  const orphans = findOrphanTestFiles(inputs)
+  if (orphans.length > 0) {
+    console.error('check-test-runner-coverage: test files run by NEITHER CI runner\n')
+    for (const f of orphans) console.error(`  ${f}`)
+    console.error(
+      [
+        '',
+        'Each file above is excluded from vitest (vitest.config.ts `exclude`) and is',
+        `not named by the bun CI job (${BUN_SCRIPT_REL}), so no`,
+        'workflow ever executes it. Adding it to package.json `test:bun` does NOT fix',
+        'this — no workflow runs that script.',
+        '',
+        'Fix one of:',
+        '  1. Drop / narrow the vitest exclude so vitest runs it again, or',
+        `  2. Name it in BUN_TEST_ARGS in ${BUN_SCRIPT_REL}, or`,
+        `  3. If it genuinely must not run in CI (needs live creds), add it to`,
+        `     ${ALLOWLIST_REL} with the issue that tracks it.`,
+        '',
+      ].join('\n'),
+    )
+    process.exit(1)
+  }
+  console.log(
+    `check-test-runner-coverage: OK — ${inputs.files.length} test file(s), every one has a runner`,
+  )
+}

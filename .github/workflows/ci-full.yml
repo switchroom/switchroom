@@ -114,7 +114,10 @@ jobs:
   # ─── Plugin bun tests (mirrors ci-tests-plugin.yml bun-test-run) ──
   bun-test-full:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # 15, matching ci-tests-plugin.yml's bun-test-run: this job now goes through
+    # the hang-watchdog wrapper, which may burn up to 3 × BUN_TEST_ATTEMPT_TIMEOUT
+    # (180s) before giving up. 8 would cancel a legitimate second retry.
+    timeout-minutes: 15
     env:
       TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
     steps:
@@ -123,11 +126,13 @@ jobs:
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
       - name: Bun test (telegram-plugin)
+        # Invoke the SAME script as ci-tests-plugin.yml rather than re-typing
+        # the target list. The two copies had already drifted apart in intent
+        # (both omitted the hosted uat/*.test.ts files), and a hand-copied list
+        # is exactly how a test file ends up in neither CI runner. One source of
+        # truth: telegram-plugin/scripts/bun-test-ci.sh.
         working-directory: telegram-plugin
-        run: |
-          bun test \
-            admin-commands gateway registry secret-detect tests \
-            channel-envelope-safety.test.ts
+        run: ./scripts/bun-test-ci.sh
 
   # ─── Python tests (mirrors ci-tests-python.yml unittest) ──────────
   python-full:
