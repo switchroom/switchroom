@@ -53,9 +53,9 @@ import {
   cleanWorkerResultParagraph,
   stripMarkdown,
   truncate,
-  COLLAPSE_SAFE_SEPARATOR,
 } from './card-format.js'
 import { WORKER_HISTORY_MAX } from './status-no-truncate.js'
+import { renderCardTitleLine } from './card-layout.js'
 import {
   renderStatusCard,
   formatStepSuffix,
@@ -286,9 +286,6 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     if (text.length > 0) result = { emoji: v.state === 'done' ? '✅' : '⚠️', text }
   }
 
-  // `renderStatusCard` always returns content when a header is supplied. When
-  // running with no steps it shows just the header — append a "starting…" line
-  // for parity with the prior behaviour.
   const card = renderStatusCard({
     header,
     steps,
@@ -298,21 +295,18 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     // Lone-worker card: window to the w=1 point of Ken's curve (6) so it shows
     // the full recent trail, not the 5-line agent-card default (#3349).
     historyWindow: workerHistoryDepth(1),
+    // A just-dispatched worker has no narrative yet. The placeholder is a normal
+    // BODY line of the shared spec now (#3846): it used to be concatenated onto
+    // this function's return value, which put a user-visible card line outside
+    // the primitive that owns hard-break stacking, the collapse-safe separator
+    // and the char budget, and made the seam the one boundary that could mash in
+    // Telegram's pinned bar. Only while RUNNING — a finished worker with no
+    // steps must not read as "starting…".
+    emptyPlaceholder: finished ? undefined : '_starting…_',
   })
   if (card == null) {
     // Unreachable (header always present) — defensive.
-    return '🛠 **WORKER** · _starting…_'
-  }
-  if (!finished && steps.length === 0) {
-    // Header-only running render → append the starting placeholder with a GFM
-    // hard break (`  \n`) so it stacks under the header instead of collapsing
-    // onto the header line in the rich-message renderer (matches stackCardLines).
-    // The collapse separator is carried here too (#3666) — this card is pinned,
-    // and a hand-rolled seam would be the one boundary that still mashed in
-    // Telegram's pinned bar.
-    // Flush like every other body line of this card (#3842) — the single-worker
-    // card carries no indentation at all now.
-    return `${card}${COLLAPSE_SAFE_SEPARATOR}  \n_starting…_`
+    return renderCardTitleLine('🛠', 'WORKER', 'starting…')
   }
   return card
 }
@@ -662,9 +656,17 @@ const COOLDOWN_JITTER_MS = 500
  *
  * Exported so the card-preview harness (`scripts/card-previews.ts`) renders the
  * real string rather than a copy that can drift from it.
+ *
+ * DELIBERATELY still a constant, not a card render (#3846). It shows no live
+ * state — no elapsed, no tool count, no steps — so there is nothing for a
+ * renderer to compose and no rolling window or char budget to enforce; routing
+ * it through `renderStatusCard` would mean inventing a state to render. What it
+ * DOES share with every other card is its type chrome, so line 1 comes from the
+ * one title composer (`renderCardTitleLine`): if the 🛠 / **WORKER** convention
+ * ever changes, this notice moves with it instead of being the one stale card.
  */
 export const WORKER_CARD_SUPERSEDED_BODY =
-  '🛠 **WORKER** · _continued_\n\n' +
+  `${renderCardTitleLine('🛠', 'WORKER', 'continued')}\n\n` +
   '_Live progress moved to a fresh card to stay pinned._'
 
 function extractRetryAfterSecs(err: unknown): number | null {
