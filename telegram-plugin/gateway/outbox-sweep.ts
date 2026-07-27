@@ -135,9 +135,27 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
   if (pending.length === 0) return summary
   const deliveredNonces = readDeliveredNonces(deps.stateDir)
 
-  for (const fileName of pending) {
-    const record = readOutboxRecord(fileName, deps.stateDir)
-    if (record == null) continue
+  // #3861 — deliver in CAPTURE order. `listPendingRecords` returns readdir
+  // order, which is filesystem-dependent (hash order on most Linux filesystems,
+  // i.e. effectively the nonce's hash). That was harmless while the outbox held
+  // at most one stray handback per turn; it is not harmless now that a
+  // multi-hour flood window can park a whole conversation's worth of queued
+  // replies, which would then land shuffled. Sort by `createdAt`, tie-broken by
+  // nonce so the order is total and deterministic.
+  const records = pending
+    .map((fileName) => readOutboxRecord(fileName, deps.stateDir))
+    .filter((r): r is OutboxRecord => r != null)
+    .sort((a, b) =>
+      a.createdAt !== b.createdAt
+        ? a.createdAt - b.createdAt
+        : a.turnNonce < b.turnNonce
+          ? -1
+          : a.turnNonce > b.turnNonce
+            ? 1
+            : 0,
+    )
+
+  for (const record of records) {
     summary.scanned++
 
     // Resolve destination (anchor → registry chain → per-session origin). Fails
