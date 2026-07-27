@@ -18,25 +18,37 @@ That edit is plausible rather than adversarial: the comment block above the job
 names `gh workflow run promote.yml -f from=vX.Y.Z -f to=latest` as the recovery
 lever, so the condition reads like it is *about* dispatch.
 
-R13 now requires the promotion job's `if:` to equal the un-draft job's, compared
-whitespace-insensitively and with both jobs resolved structurally, the same way
-R13 already found them. Equality rather than a literal expression, because the
-requirement is genuinely relative: `:latest` must move in exactly the cases the
-release is published in, no more (a dry run must not move it) and no less. It
-also catches drift in the other direction — change `finalize`'s gating and
-forget the promotion's, and this fires. Four mutations prove it: the narrowing
-above (which fires this rule and no other, which is the proof the hole was
-real), a deleted `if:`, one-sided drift, and a whitespace reflow that must stay
-clean.
+R13 now requires the promotion job's `if:` to equal the un-draft job's, with
+both jobs resolved structurally, the same way R13 already found them. Equality
+rather than a literal expression, because the requirement is genuinely
+relative: `:latest` must move in exactly the cases the release is published in,
+no more and no less. It also catches drift in the other direction — change
+`finalize`'s gating and forget the promotion's, and this fires.
+
+The comparison normalises two spellings GitHub treats as identical: folded-YAML
+whitespace, and the `${{ }}` wrapper (`if: ${{ expr }}` and `if: expr` are the
+same condition, and the wrapped form is what most actions linters write). A
+rule that reddened on a cosmetic edit would get silenced rather than fixed, so
+both have mutations asserting they stay clean.
+
+Six mutations in all: the narrowing above (which fires this rule and no other,
+which is the proof the hole was real), a deleted `if:`, both `if:`s deleted
+(which must blame `finalize` rather than tell you to copy a gate that isn't
+there), one-sided drift, and the two cosmetic edits that must not fire.
+
+Scope worth stating: the pin is relative, so it does not by itself assert that
+either job runs on a tag push at all. Setting *both* conditions to dispatch-only
+still passes — filed as #3742. That failure is loud (the release visibly stays a
+draft) where the one fixed here was silent, which is why it is a follow-up.
 
 Also corrected in the #3685 entry below: it claimed the mutation tests fire R12
 "on all four sites". They reconstruct the regression at three — `merge-base`,
 `merge-dependents` and `build-voice`; `build-hindsight` is never mutated. The
 rule itself iterates all four, so the guarantee held; only the prose overclaimed.
 
-The five remaining review findings are filed rather than fixed: #3736 (R12 only
+The remaining review findings are filed rather than fixed: #3736 (R12 only
 reads the interior of shell tag branches, so two realistic re-additions escape
-it), #3737, #3738, #3739 and #3740.
+it), #3737, #3738, #3739, #3740 and #3742.
 
 ### `:latest` follows the release succeeding, not the tag push
 
