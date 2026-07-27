@@ -774,6 +774,12 @@ import {
   loadUserConfig,
 } from "../setup/onboarding.js";
 import { HINDSIGHT_DEFAULT_MCP_URL, HINDSIGHT_DEFAULT_API_BASE_URL } from "../setup/hindsight.js";
+import {
+  resolveHindsightRecallTunables,
+  renderHindsightHooksOverrides,
+  type HindsightRecallTunables,
+  type RecallTunableInput,
+} from "../setup/hindsight-recall-tunables.js";
 import { ensureBareClone } from "../repos/bare-clone.js";
 import {
   ensureAgentWorktree,
@@ -2606,16 +2612,26 @@ export function writeFileSyncIfChanged(
  * hindsight plugin when nothing changed — see writeFileSyncIfChanged
  * for why unchanged content must not be rewritten.
  *
- * `topLevelOverrides` maps a top-level file name to the content the
- * DEST copy is expected to hold instead of the src bytes — used for
- * files switchroom rewrites after copy (the hindsight plugin's
+ * `contentOverrides` maps a POSIX-style path RELATIVE to `src` to the
+ * content the DEST copy is expected to hold instead of the src bytes —
+ * used for files switchroom rewrites after copy (the hindsight plugin's
  * settings.json gets switchroom overrides applied on top of the
  * vendor defaults, so the deployed file legitimately differs).
+ *
+ * Keys were once bare top-level file names and the map was DROPPED when
+ * recursing into subdirectories. That silently broke the moment a stamped
+ * file lived in a subdir: `hooks/hooks.json` is rewritten post-copy, so the
+ * dest never matches the vendor bytes, so this returned false on every
+ * reconcile and forced a needless rm+recopy of the whole plugin tree — which
+ * also demands write access into an untouched agent's 0700 per-UID state dir,
+ * the exact cost the fast path exists to avoid. Keys are now relative paths
+ * and are threaded through the recursion.
  */
 export function dirContentEquals(
   src: string,
   dest: string,
-  topLevelOverrides?: Record<string, string>,
+  contentOverrides?: Record<string, string>,
+  relBase = "",
 ): boolean {
   if (!existsSync(src) || !existsSync(dest)) return false;
   let srcEntries: string[];
@@ -2641,13 +2657,14 @@ export function dirContentEquals(
     } catch {
       return false;
     }
+    const rel = relBase === "" ? entry : `${relBase}/${entry}`;
     if (sStat.isDirectory() !== dStat.isDirectory()) return false;
     if (sStat.isDirectory()) {
-      if (!dirContentEquals(s, d)) return false;
+      if (!dirContentEquals(s, d, contentOverrides, rel)) return false;
     } else {
       if ((sStat.mode & 0o100) !== (dStat.mode & 0o100)) return false;
       try {
-        const expected = topLevelOverrides?.[entry];
+        const expected = contentOverrides?.[rel];
         if (expected !== undefined) {
           if (readFileSync(d, "utf-8") !== expected) return false;
         } else if (!readFileSync(s).equals(readFileSync(d))) {
@@ -3032,24 +3049,37 @@ export function installHindsightPlugin(
   // the stamped settings.json values below, so a switchroom.yaml
   // `memory.retain.*` override is authoritative and survives reconcile.
   const retainConfig = resolveHindsightRetainConfig(switchroomConfig, agentName);
-  let expectedSettings: string | null = null;
+  // Recall latency envelope (hook ceiling / parallel deadline / per-bank
+  // timeout) from the CASCADED config. Stamped onto the deployed plugin below
+  // so `switchroom apply` RE-ASSERTS these values instead of reverting them —
+  // see src/setup/hindsight-recall-tunables.ts for the full rationale.
+  const recallTunables = resolveHindsightRecallTunables(
+    resolveHindsightRecallConfig(switchroomConfig, agentName),
+  );
+  const contentOverrides: Record<string, string> = {};
   try {
     const vendorSettingsPath = join(sourcePath, "settings.json");
     if (existsSync(vendorSettingsPath)) {
-      expectedSettings = renderHindsightSettingsOverrides(
+      const expectedSettings = renderHindsightSettingsOverrides(
         readFileSync(vendorSettingsPath, "utf-8"),
         additionalBanks,
         retainConfig,
+        recallTunables,
       );
+      if (expectedSettings != null) contentOverrides["settings.json"] = expectedSettings;
+    }
+    const vendorHooksPath = join(sourcePath, "hooks", "hooks.json");
+    if (existsSync(vendorHooksPath)) {
+      const expectedHooks = renderHindsightHooksOverrides(
+        readFileSync(vendorHooksPath, "utf-8"),
+        recallTunables,
+      );
+      if (expectedHooks != null) contentOverrides["hooks/hooks.json"] = expectedHooks;
     }
   } catch {
     // Comparison aid only — a read failure just means we recopy.
   }
-  const upToDate = dirContentEquals(
-    sourcePath,
-    destPath,
-    expectedSettings != null ? { "settings.json": expectedSettings } : undefined,
-  );
+  const upToDate = dirContentEquals(sourcePath, destPath, contentOverrides);
   if (!upToDate) {
     if (existsSync(destPath)) {
       rmSync(destPath, { recursive: true, force: true });
@@ -3092,7 +3122,13 @@ export function installHindsightPlugin(
   // per-agent value. Now also folds in the `knows`-assigned user/bank profiles
   // (user concept, RFC reference/rfcs/user-concept.md); resolveUsers() handles
   // the cascade + union (defaults ∪ agent, generated ∪ explicit) itself.
-  applyHindsightSettingsOverrides(destPath, additionalBanks, retainConfig);
+  applyHindsightSettingsOverrides(destPath, additionalBanks, retainConfig, recallTunables);
+  // Stamp the UserPromptSubmit recall-hook ceiling into the deployed
+  // hooks/hooks.json. Claude Code reads this file directly and does NOT expand
+  // env vars in the `timeout` field, so unlike the settings.json knobs there is
+  // no env channel available — stamping the deployed copy is the only way to
+  // make this value declarative. See hindsight-recall-tunables.ts.
+  applyHindsightHooksOverrides(destPath, recallTunables);
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
   // The plugin's hooks expect HINDSIGHT_API_URL (the REST base), not the
@@ -3150,6 +3186,50 @@ function resolveHindsightRetainConfig(
 }
 
 /**
+ * Resolve the cascaded `memory.recall.*` block for an agent (defaults →
+ * profile → agent). Mirrors resolveHindsightRetainConfig; feeds the recall
+ * latency envelope resolver.
+ */
+export function resolveHindsightRecallConfig(
+  switchroomConfig: SwitchroomConfig | undefined,
+  agentName: string,
+): RecallTunableInput | undefined {
+  if (!switchroomConfig) return undefined;
+  const resolved = resolveAgentConfig(
+    switchroomConfig.defaults,
+    switchroomConfig.profiles,
+    // Some scaffold paths install the plugin for an agent that isn't in the
+    // `agents` map yet (fresh scaffold); resolve against an empty agent so the
+    // defaults/profile tiers still apply.
+    switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
+  );
+  return resolved?.memory?.recall as RecallTunableInput | undefined;
+}
+
+/**
+ * Stamp the managed UserPromptSubmit recall-hook ceiling into the deployed
+ * plugin's `hooks/hooks.json`. Idempotent — runs after every plugin copy on
+ * every scaffold/reconcile/restart, which is exactly what makes the value
+ * survive `switchroom apply` reinstalling the plugin tree.
+ */
+function applyHindsightHooksOverrides(
+  pluginDestPath: string,
+  tunables: HindsightRecallTunables,
+): void {
+  const hooksPath = join(pluginDestPath, "hooks", "hooks.json");
+  if (!existsSync(hooksPath)) return; // vendor structure changed; bail safely
+  let raw: string;
+  try {
+    raw = readFileSync(hooksPath, "utf-8");
+  } catch {
+    return;
+  }
+  const next = renderHindsightHooksOverrides(raw, tunables);
+  if (next == null) return; // malformed / no recall hook; don't make it worse
+  writeFileSyncIfChanged(hooksPath, next);
+}
+
+/**
  * Merge switchroom-specific overrides into the vendored hindsight
  * plugin's `settings.json`. Idempotent — runs after every plugin
  * copy on every scaffold/reconcile/restart.
@@ -3172,6 +3252,7 @@ function applyHindsightSettingsOverrides(
   pluginDestPath: string,
   additionalBanks: readonly string[],
   retainConfig: HindsightRetainConfig,
+  recallTunables: HindsightRecallTunables,
 ): void {
   const settingsPath = join(pluginDestPath, "settings.json");
   if (!existsSync(settingsPath)) return; // vendor structure changed; bail safely
@@ -3181,7 +3262,12 @@ function applyHindsightSettingsOverrides(
   } catch {
     return;
   }
-  const next = renderHindsightSettingsOverrides(raw, additionalBanks, retainConfig);
+  const next = renderHindsightSettingsOverrides(
+    raw,
+    additionalBanks,
+    retainConfig,
+    recallTunables,
+  );
   if (next == null) return; // malformed settings; don't make it worse
   writeFileSyncIfChanged(settingsPath, next);
 }
@@ -3198,6 +3284,7 @@ function renderHindsightSettingsOverrides(
   raw: string,
   additionalBanks: readonly string[],
   retainConfig: HindsightRetainConfig,
+  recallTunables: HindsightRecallTunables,
 ): string | null {
   let settings: Record<string, unknown>;
   try {
@@ -3256,6 +3343,22 @@ function renderHindsightSettingsOverrides(
   // collapses (45-60% of turns get nothing) above 0.10. Operators can
   // override via memory.recall.min_overlap in switchroom.yaml.
   settings.recallMinOverlap = 0.10;
+  // Recall latency envelope. Both of these were previously UNMANAGED:
+  // `recallParallelDeadlineSeconds` was readable from config but nothing in
+  // switchroom ever resolved it from switchroom.yaml, and the per-bank timeout
+  // was a bare `timeout=8` literal in recall.py with no config key at all. So
+  // the only way to tune either was to hand-edit the installed plugin, which
+  // the next `switchroom apply` reverted (three recorded times). Stamping them
+  // here from the cascaded config is what makes an apply RE-ASSERT the
+  // operator's value instead of throwing it away.
+  //
+  // The values are a nested set of deadlines (per-bank <= shared <= hook
+  // ceiling); resolveHindsightRecallTunables owns the derivation and clamping,
+  // and the hook ceiling half is stamped into hooks/hooks.json by
+  // applyHindsightHooksOverrides. Operators tune via
+  // memory.recall.{hook,parallel_deadline,request}_timeout_seconds.
+  settings.recallParallelDeadlineSeconds = recallTunables.parallelDeadlineSeconds;
+  settings.recallRequestTimeoutSeconds = recallTunables.requestTimeoutSeconds;
   // Phase 1 (RFC reference/rfcs/hindsight-synthesis-layers.md): consume
   // the synthesized `observation` tier at recall, not just raw
   // world/experience. Observations are deduped, dated, provenance-backed
@@ -3449,6 +3552,12 @@ interface BuildWorkspaceContextArgs {
   hindsightRecallMaxMemories: number | undefined;
   hindsightRecallCacheTtlSecs: number | undefined;
   hindsightRecallMinOverlap: number | undefined;
+  // Recall latency envelope — always defined (resolveHindsightRecallTunables
+  // supplies the shipped defaults), because start.sh exports these
+  // unconditionally so switchroom.yaml outranks a stale
+  // ~/.hindsight/claude-code.json. See the template comment.
+  hindsightRecallParallelDeadlineSeconds: number;
+  hindsightRecallRequestTimeoutSeconds: number;
   // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
@@ -3494,6 +3603,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightRecallParallelDeadlineSeconds,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -3578,6 +3689,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightRecallParallelDeadlineSeconds,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -4493,6 +4606,15 @@ export function scaffoldAgent(
   // Values at or above 0.20 measurably starve recall (~41.9% of turns
   // end up with no memories at all on production replay, #3541).
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
+  // Recall latency envelope, resolved (and mutually clamped) once here so the
+  // env exports and the plugin stamps cannot disagree.
+  const hindsightRecallTunables = resolveHindsightRecallTunables(
+    agentConfig.memory?.recall as RecallTunableInput | undefined,
+  );
+  const hindsightRecallParallelDeadlineSeconds =
+    hindsightRecallTunables.parallelDeadlineSeconds;
+  const hindsightRecallRequestTimeoutSeconds =
+    hindsightRecallTunables.requestTimeoutSeconds;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -4568,6 +4690,8 @@ export function scaffoldAgent(
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightRecallParallelDeadlineSeconds,
+    hindsightRecallRequestTimeoutSeconds,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -6921,6 +7045,15 @@ function reconcileAgentInner(
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
+  // Recall latency envelope, resolved (and mutually clamped) once here so the
+  // env exports and the plugin stamps cannot disagree.
+  const hindsightRecallTunables = resolveHindsightRecallTunables(
+    agentConfig.memory?.recall as RecallTunableInput | undefined,
+  );
+  const hindsightRecallParallelDeadlineSeconds =
+    hindsightRecallTunables.parallelDeadlineSeconds;
+  const hindsightRecallRequestTimeoutSeconds =
+    hindsightRecallTunables.requestTimeoutSeconds;
   // Phase 1 / 6a opt-out: undefined unless the operator overrode the
   // switchroom default (observations on, trivial-skip on). Exported only
   // when set (see start.sh.hbs), so an unset value leaves the on-by-default
@@ -7020,6 +7153,8 @@ function reconcileAgentInner(
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
       hindsightRecallMinOverlap,
+      hindsightRecallParallelDeadlineSeconds,
+      hindsightRecallRequestTimeoutSeconds,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
@@ -7803,6 +7938,8 @@ function reconcileAgentInner(
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
       hindsightRecallMinOverlap,
+      hindsightRecallParallelDeadlineSeconds,
+      hindsightRecallRequestTimeoutSeconds,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,

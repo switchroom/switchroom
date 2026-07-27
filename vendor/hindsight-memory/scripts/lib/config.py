@@ -203,7 +203,24 @@ DEFAULTS = {
     # for block formatting + cache write + stdout flush, so a straggler bank
     # can never push the hook past its ceiling. Slots still unfinished when the
     # deadline elapses are abandoned (daemon threads) and marked timed_out.
+    #
+    # Switchroom stamps this into the deployed settings.json from the cascaded
+    # `memory.recall.parallel_deadline_seconds` (defaulting to the hook ceiling
+    # minus RECALL_DEADLINE_HEADROOM_SECONDS), so the ceiling/deadline coupling
+    # above is maintained declaratively and survives `switchroom apply`.
     "recallParallelDeadlineSeconds": 10,
+    # Per-bank hard HTTP timeout (seconds) for a single recall request. Even
+    # parallelised, each bank carries its own deadline so ONE hung bank returns
+    # cleanly with no memories rather than sitting on the shared deadline above
+    # and starving its siblings. Tightened from 10s in v0.13.22 (2026-05-24
+    # breach audit).
+    #
+    # This was a bare `timeout=8` literal in recall.py until switchroom made it
+    # a managed key: an operator who needed a different value had to hand-edit
+    # the installed plugin, and the next `switchroom apply` silently reverted it
+    # (the reversion recorded three times over in switchroom.yaml's own
+    # comments). Set declaratively via `memory.recall.request_timeout_seconds`.
+    "recallRequestTimeoutSeconds": 8,
     # Switchroom hindsight-leverage E1 / PR8 (#3369) — bounded transcript-grep
     # fallback. Boot reconciliation (reconcile_tail.py) closes the crash-loss
     # window at the NEXT SessionStart, but between an abrupt kill and that boot,
@@ -313,6 +330,11 @@ ENV_OVERRIDES = {
     # lever; the deadline is the ceiling-minus-2s hard budget (see DEFAULTS).
     "HINDSIGHT_RECALL_PARALLEL": ("recallParallel", bool),
     "HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS": ("recallParallelDeadlineSeconds", int),
+    # Switchroom-local: per-bank recall HTTP timeout (seconds). Set by start.sh
+    # from agents.<name>.memory.recall.request_timeout_seconds (cascading through
+    # defaults). Float-typed so sub-second tuning is expressible; recall.py
+    # coerces and floors it defensively.
+    "HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS": ("recallRequestTimeoutSeconds", float),
     # Switchroom hindsight-leverage E1 / PR8 (#3369) — transcript-grep fallback
     # toggle + bounds. HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK=false is the rollback
     # lever; the others tune the byte / turn / char / time bounds.

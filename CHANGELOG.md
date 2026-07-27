@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+### The recall deadline envelope is declarative, and drift makes an apply that reverts it visible
+
+Three of the tunables that decide whether auto-recall returns anything at all
+lived as literals inside the vendored hindsight plugin tree — the tree
+`switchroom apply` rm's and re-copies. An operator who needed a different value
+had to hand-edit the installed plugin, and the next apply silently restored the
+shipped default while `switchroom.yaml` went on reading as though the host were
+tuned. The live fleet did exactly this three separate times; today's apply
+reinstated `hooks/hooks.json` `timeout: 12` and `recall.py` `timeout=8`, wiping
+the 2026-07-25 patches with no error and no log line.
+
+The three keys are one nested envelope, and inverting any pair yields a config
+that is silently useless:
+
+    hook ceiling (hooks.json timeout)
+      └── parallel fan-out deadline (recallParallelDeadlineSeconds)
+            └── per-bank HTTP timeout (recallRequestTimeoutSeconds)
+
+They are now resolved together in `src/setup/hindsight-recall-tunables.ts` from
+`memory.recall.{hook_timeout_seconds,parallel_deadline_seconds,request_timeout_seconds}`,
+with the envelope enforced by clamping rather than by documentation.
+`recall.py`'s bare `timeout=8` became the managed key
+`recallRequestTimeoutSeconds` (env `HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS`).
+
+**The shipped defaults are unchanged — 12 / 10 / 8 on every host that does not
+configure them.** This makes the keys settable; it does not change what
+switchroom ships.
+
+Each key travels by the only carrier that can actually win. The env exports in
+`start.sh` are authoritative and unconditional, because
+`~/.hindsight/claude-code.json` *survives* an apply and loads after
+`settings.json` — a settings-only stamp would be quietly defeated by exactly the
+stale hand-edit this change exists to retire, and env sits above both.
+`settings.json` is still stamped so the deployed file is coherent when read on
+its own. The hook ceiling has no env channel at all — Claude Code does not
+expand environment variables in a hook `timeout` — so the deployed
+`hooks/hooks.json` is rewritten post-copy on every reconcile, the same
+vendor-stays-pristine stamping `applyHindsightSettingsOverrides` already used.
+
+A new drift surface (`memory-tunables`, surface 7 in `src/agents/drift.ts`)
+recomputes the expected effective values and reports when the installed plugin
+disagrees, following the `.switchroom-drift.json` precedent rather than
+inventing a mechanism. It compares *values*, not file hashes, so an unrelated
+vendor bump does not trip it, and it also reports when a configured value was
+clamped to keep the envelope valid — otherwise the clamp is the next silent
+revert.
+
+Also fixed: `dirContentEquals` dropped its content-overrides map when recursing
+into subdirectories, so any stamped nested file made the up-to-date check
+permanently false and forced an rm-and-recopy of the whole plugin tree on every
+reconcile.
+
+Deliberately not done: `recallMaxMemories` and `recallMinOverlap` were already
+declarative and are untouched.
+
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
 ### The per-scope observation cap is an overridable managed key

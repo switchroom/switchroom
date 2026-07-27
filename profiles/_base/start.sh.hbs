@@ -750,6 +750,26 @@ export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{#if (isNumber hindsightRecallMinOverlap)}}
 export HINDSIGHT_RECALL_MIN_OVERLAP={{hindsightRecallMinOverlap}}
 {{/if}}
+# Recall latency envelope (memory.recall.parallel_deadline_seconds /
+# .request_timeout_seconds cascade). Exported UNCONDITIONALLY, unlike the
+# override-only knobs above, and that is deliberate.
+#
+# The plugin's config load order is: built-in defaults -> plugin settings.json
+# -> ~/.hindsight/claude-code.json -> environment. Switchroom stamps these two
+# into settings.json as well, but claude-code.json sits BETWEEN the two and
+# SURVIVES `switchroom apply`. A hand-written value left in that file (the
+# documented pre-promotion workaround — the live fleet had exactly this,
+# pinning recallParallelDeadlineSeconds to a stale 16) would therefore silently
+# defeat a settings.json-only stamp. Env is the top of the chain, so exporting
+# the resolved value unconditionally is what actually makes switchroom.yaml
+# authoritative. Both values come from the same resolver
+# (src/setup/hindsight-recall-tunables.ts), so the two channels cannot diverge.
+#
+# The third knob in this envelope — the UserPromptSubmit hook ceiling — has no
+# env channel at all (Claude Code does not expand env in hooks.json `timeout`),
+# so it is stamped into the deployed hooks/hooks.json instead.
+export HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS={{hindsightRecallParallelDeadlineSeconds}}
+export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS={{hindsightRecallRequestTimeoutSeconds}}
 # Recall fact types (memory.recall.types cascade). Switchroom default is
 # world,experience,observation (the synthesized `observation` tier is ON
 # by default, set in the plugin settings.json). Export only when the

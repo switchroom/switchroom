@@ -98,6 +98,12 @@ DIRECTIVES_SLOT = "__directives__"
 # recall traffic on session-resume re-processing and any retry paths.
 CACHE_ENV = "HINDSIGHT_RECALL_CACHE_TTL_SECS"
 
+# Fallback for the per-bank recall request timeout (seconds) when the config
+# value is absent or unusable. Mirrors lib/config.py's
+# DEFAULTS["recallRequestTimeoutSeconds"] — kept as a module constant so the
+# critical path never depends on the config dict having been populated.
+DEFAULT_RECALL_REQUEST_TIMEOUT = 8.0
+
 # Maximum number of cache entries kept per session before LRU eviction.
 # 100 is comfortably above the typical session size (~30 inbounds) and
 # well below any concern about state-file size growth.
@@ -757,7 +763,8 @@ def _is_timeout_error(exc: BaseException) -> bool:
     """True if `exc` is (or wraps) a network read/connect timeout.
 
     Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1). The recall
-    HTTP path is `urllib.request.urlopen(..., timeout=8)`. On a hard timeout
+    HTTP path is `urllib.request.urlopen(..., timeout=<recallRequestTimeoutSeconds>)`
+    (default 8s; a managed key, see DEFAULT_RECALL_REQUEST_TIMEOUT). On a hard timeout
     urlopen raises either a bare ``socket.timeout`` / ``TimeoutError`` or a
     ``urllib.error.URLError`` whose ``.reason`` is one of those. We classify
     both so the per-bank ``timed_out`` flag (and the derived ``deadline_hit``)
@@ -1680,6 +1687,25 @@ def main():
             ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
         )
 
+    # Per-bank hard request timeout. Was a bare `timeout=8` literal here until
+    # switchroom promoted it to a managed key (`recallRequestTimeoutSeconds` /
+    # HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS, stamped from
+    # `memory.recall.request_timeout_seconds`). Resolved ONCE outside the task
+    # factory so every bank in a fan-out shares one value.
+    #
+    # Defensive coercion: a malformed config value must not take recall down to
+    # a traceback on the critical path, and a non-positive timeout would mean
+    # "fail instantly, every turn" — the worst possible failure mode for a
+    # memory hook. Both fall back to the shipped default.
+    try:
+        request_timeout = float(
+            config.get("recallRequestTimeoutSeconds", DEFAULT_RECALL_REQUEST_TIMEOUT)
+        )
+    except (TypeError, ValueError):
+        request_timeout = DEFAULT_RECALL_REQUEST_TIMEOUT
+    if not request_timeout > 0:
+        request_timeout = DEFAULT_RECALL_REQUEST_TIMEOUT
+
     def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups):
         def _bank_task():
             return client.recall(
@@ -1698,12 +1724,13 @@ def main():
                 # slots for denser coverage inside the same budget. On by default;
                 # operators can pin off via `recallPreferObservations: false`.
                 prefer_observations=config.get("recallPreferObservations", True),
-                # 8s in-script per-request timeout: even parallelised, each bank
-                # carries its own hard deadline so a single hung bank returns
-                # cleanly with no memories rather than sitting on the shared
-                # deadline. Tightened from 10s in v0.13.22 (2026-05-24 breach
-                # audit); the shared deadline below is the outer ceiling guard.
-                timeout=8,
+                # In-script per-request timeout (default 8s): even parallelised,
+                # each bank carries its own hard deadline so a single hung bank
+                # returns cleanly with no memories rather than sitting on the
+                # shared deadline. Tightened from 10s in v0.13.22 (2026-05-24
+                # breach audit); the shared deadline below is the outer ceiling
+                # guard. Now a managed key — see `request_timeout` above.
+                timeout=request_timeout,
             )
         return _bank_task
 

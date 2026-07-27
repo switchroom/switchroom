@@ -548,6 +548,45 @@ export const AgentMemorySchema = z
             "fixed. Observe the `overlap_dropped` field via " +
             "`switchroom memory recall-log`.",
           ),
+        hook_timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Ceiling (seconds) Claude Code gives the UserPromptSubmit recall " +
+            "hook before killing it. Stamped into the installed plugin's " +
+            "hooks/hooks.json, so it survives `switchroom apply` reinstalling " +
+            "the plugin. Default 12. Raising it lets slow banks finish at the " +
+            "cost of pre-turn dead air; `parallel_deadline_seconds` and " +
+            "`request_timeout_seconds` are both kept under it.",
+          ),
+        parallel_deadline_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Shared deadline (seconds) for the whole parallel multi-bank " +
+            "recall fan-out. Slots unfinished when it elapses are abandoned " +
+            "and reported as timed out. Defaults to `hook_timeout_seconds` " +
+            "minus 2s of headroom for block formatting, cache write and " +
+            "stdout flush, so a straggler bank can never push the hook past " +
+            "its ceiling. Set explicitly to override that derivation; a value " +
+            "above the hook ceiling is clamped back under it.",
+          ),
+        request_timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Hard per-bank HTTP timeout (seconds) for a single recall " +
+            "request. Even parallelised, each bank carries its own deadline " +
+            "so ONE hung bank returns empty instead of consuming the shared " +
+            "deadline and starving its siblings. Default 8. Clamped to stay " +
+            "at or under the effective parallel deadline.",
+          ),
         types: z
           .array(z.string())
           .optional()
@@ -565,7 +604,8 @@ export const AgentMemorySchema = z
             "Extra Hindsight banks to recall from on every turn, merged into " +
             "the agent's own bank results — e.g. a shared operator/household " +
             "profile bank authored via `switchroom memory profile`. Each is " +
-            "recalled with an 8s timeout and is non-fatal on failure. Stays " +
+            "recalled with the `request_timeout_seconds` per-bank timeout " +
+            "(default 8s) and is non-fatal on failure. Stays " +
             "within the single tenant: all banks are the operator's data, in " +
             "the operator's Hindsight instance (see the `single-tenant` " +
             "invariant). Defaults to [] (no extra banks).",
@@ -2814,6 +2854,12 @@ const profileFields = {
           max_memories: z.number().int().min(0).optional(),
           cache_ttl_secs: z.number().int().min(0).optional(),
           min_overlap: z.number().min(0).max(1).optional(),
+          // Mirrors of AgentMemorySchema.recall.* — accepted at the
+          // defaults/profile tier too, so the recall latency envelope can be
+          // tuned fleet-wide with per-agent overrides.
+          hook_timeout_seconds: z.number().int().min(1).optional(),
+          parallel_deadline_seconds: z.number().int().min(1).optional(),
+          request_timeout_seconds: z.number().int().min(1).optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
         })
