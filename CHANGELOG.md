@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### The `/usage` card names the account that is actually serving
+
+The card marked `auth.active` — the configured PIN — as `(active)`, which is
+not the same thing as the account the fleet is running on. The soft-avoid
+proactive roll (#3031 PR 2) mirrors a fallback account's credentials onto
+every rider agent and deliberately leaves `auth.active` alone ("NO durable
+promote of `auth.active`", `src/auth/broker/server.ts`), and the
+exhaustion-blind fanout guard routes serving through `accountWithFailover` for
+the same reason. `list-state` only ever published the pin, so after any roll
+the card — and the `/auth` table, and quota-watch, everything built from
+`AccountSnapshot` — confidently named an account that had stopped serving
+hours earlier.
+
+Observed on this fleet: the pin sat at 99% on the 7-day window and had been
+rolled off at 15:36; the card still labelled it `(active)` while every agent's
+mirrored credential belonged to the fallback.
+
+`list-state` now publishes `serving` (the fleet's
+`accountWithFailover(auth.active)`) alongside `active`, and the snapshot
+builders derive `isActive` from it via `effectiveServingLabel`. `active` keeps
+its old meaning for anything that genuinely wants the pin, and a
+pre-`serving` broker degrades to the previous behaviour.
+
 ### `switchroom doctor` detects banks with no per-bank vector index
 
 Hindsight creates one PARTIAL vector index per (bank, fact_type) — and creates

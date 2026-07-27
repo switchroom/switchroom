@@ -39,6 +39,7 @@
 import type { QuotaUtilization } from './quota-check.js';
 import { refillNormalizedUtils, isProbeThin } from '../src/auth/quota.js';
 import type { AccountState, ListStateData } from '../src/auth/broker/client.js';
+import { effectiveServingLabel } from '../src/auth/broker/client.js';
 import { reviveLastQuota, recommendation, type AccountSnapshot } from './auth-snapshot-format.js';
 import { escapeMarkdown } from './card-format.js';
 import { maskEmail } from './demo-mask.js';
@@ -358,9 +359,11 @@ export function renderQuotaBarBlockFromListState(
   const exhaustedByLabel = new Map<string, boolean>(
     state.accounts.map((a: AccountState) => [a.label, a.exhausted]),
   );
+  // SERVING, not pinned — see effectiveServingLabel.
+  const serving = effectiveServingLabel(state);
   const snapshots: AccountSnapshot[] = state.accounts.map((acc: AccountState) => ({
     label: acc.label,
-    isActive: acc.label === state.active,
+    isActive: acc.label === serving,
     quota: reviveLastQuota(acc.last_quota ?? null),
     quotaError: acc.last_quota ? undefined : 'no cached quota (no probe since broker start)',
     expiresAtMs: acc.expiresAt,

@@ -261,7 +261,22 @@ export interface ConsumerState {
 }
 
 export interface ListStateData {
+  /**
+   * The CONFIGURED fleet pin (`auth.active`). Not necessarily what serves —
+   * see `serving`. Use this only when you mean "what is pinned".
+   */
   active: string;
+  /**
+   * The account the fleet is ACTUALLY served from right now
+   * (`accountWithFailover(auth.active)` broker-side). Diverges from `active`
+   * whenever the pin has been rolled off without a durable promote — the
+   * soft-avoid proactive roll (#3031 PR 2) and the exhaustion-blind fanout
+   * guard both do exactly that. Every "which account is live" renderer must
+   * read this, not `active`, or it names an account that stopped serving.
+   * Absent on pre-`serving` brokers — callers fall back to `active`
+   * (`effectiveServingLabel`).
+   */
+  serving?: string;
   fallback_order: string[];
   accounts: AccountState[];
   agents: AgentState[];
@@ -311,6 +326,22 @@ export interface ListStateData {
     earliest_reset?: number;
     at: number;
   } | null;
+}
+
+/**
+ * The account the fleet is actually served from, for any renderer that wants
+ * to say "this one is live". Prefers the broker's `serving` field and falls
+ * back to the configured pin (`active`) — so a pre-`serving` broker degrades
+ * to the old behaviour instead of rendering nothing as active.
+ *
+ * Never inline `state.active` for an "(active)" marker: the pin and the
+ * serving account diverge on every soft-avoid roll.
+ */
+export function effectiveServingLabel(
+  state: Pick<ListStateData, "active" | "serving">,
+): string {
+  const serving = state.serving;
+  return typeof serving === "string" && serving.length > 0 ? serving : state.active;
 }
 
 export interface SetActiveData {

@@ -2218,10 +2218,23 @@ export class AuthBroker {
     const active_overage_serving = this.isActiveOverageServing(
       this.callerAccount(identity),
     );
+    // The account the fleet is ACTUALLY served from right now. `auth.active`
+    // is the configured PIN, and the pin is not always what serves: the
+    // soft-avoid proactive roll (`softAvoidProbeRoll`, #3031 PR 2) mirrors a
+    // different account's credentials onto every rider agent while
+    // deliberately leaving `auth.active` alone ("NO durable promote of
+    // auth.active"), and the exhaustion-blind fanout guard routes serving
+    // through `accountWithFailover` for the same reason. Reporting only the
+    // pin made every "(active)" renderer name an account that had already
+    // been rolled off. Identity-independent: this is the FLEET's serving
+    // account (`accountWithFailover(auth.active)` — the very resolver
+    // `servingAccount` uses), not the caller's.
+    const serving = this.accountWithFailover(auth.active) ?? auth.active ?? "";
     this.audit({ op: "list-state", identity, ok: true });
     socket.write(
       encodeSuccess(id, {
         active: auth.active ?? "",
+        serving,
         fallback_order: auth.fallback_order ?? [],
         accounts,
         agents,

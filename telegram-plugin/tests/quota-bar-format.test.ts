@@ -485,3 +485,53 @@ describe('renderUsageCard', () => {
     expect(out).not.toContain('- top ');
   });
 });
+
+// ── serving vs pinned account ────────────────────────────────────────
+
+/**
+ * Operator report 2026-07-27: the /usage card named the CONFIGURED pin
+ * (`auth.active`) as "(active)" after the broker's soft-avoid roll had
+ * already moved the fleet onto a different account. The broker now publishes
+ * `serving` alongside `active`; every "(active)" marker must follow `serving`.
+ */
+describe('quota-bar "(active)" follows the SERVING account, not the pin', () => {
+  function stateWith(serving?: string): ListStateData {
+    const lq = {
+      fiveHourUtilizationPct: 0,
+      sevenDayUtilizationPct: 10,
+      fiveHourResetAt: new Date(NOW.getTime() + 60_000).toISOString(),
+      sevenDayResetAt: new Date(NOW.getTime() + 24 * 60 * 60_000).toISOString(),
+      representativeClaim: null,
+      overageStatus: null,
+      overageDisabledReason: null,
+      capturedAt: NOW.getTime(),
+    };
+    return {
+      active: 'pinned@example.com',
+      serving,
+      fallback_order: ['pinned@example.com', 'rolled-to@example.com'],
+      accounts: [
+        { label: 'pinned@example.com', exhausted: false, last_quota: lq },
+        { label: 'rolled-to@example.com', exhausted: false, last_quota: lq },
+      ],
+      agents: [],
+      consumers: [],
+    } as unknown as ListStateData;
+  }
+
+  it('marks the rolled-to account active and the rolled-off pin idle', () => {
+    const lines = renderQuotaBarBlockFromListState(stateWith('rolled-to@example.com'), {
+      now: NOW,
+    }).split('\n');
+    // The bug rendered exactly the inverse of these two assertions.
+    expect(lines).toContain('- **rolled-to@example.com** (active)');
+    expect(lines).toContain('- **pinned@example.com** (idle)');
+    expect(lines).not.toContain('- **pinned@example.com** (active)');
+  });
+
+  it('falls back to the pin when the broker publishes no serving field (pre-serving broker)', () => {
+    const lines = renderQuotaBarBlockFromListState(stateWith(undefined), { now: NOW }).split('\n');
+    expect(lines).toContain('- **pinned@example.com** (active)');
+    expect(lines).toContain('- **rolled-to@example.com** (idle)');
+  });
+});

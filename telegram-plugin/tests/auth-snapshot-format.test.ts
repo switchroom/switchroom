@@ -856,6 +856,48 @@ describe('buildSnapshotsFromState', () => {
     expect(snaps[2]!.quota).toBeNull();
     expect(snaps[2]!.quotaError).toBe('HTTP 401');
   });
+
+  /**
+   * Operator report 2026-07-27: the /usage card (which reaches the renderers
+   * through THIS builder — see gateway.ts) marked the configured pin active
+   * while the broker's soft-avoid roll had the fleet on another account.
+   */
+  it('marks the SERVING account active, not the pin, when the two diverge', () => {
+    const state = {
+      active: 'pinned@x',
+      serving: 'rolled-to@x',
+      fallback_order: ['pinned@x', 'rolled-to@x'],
+      accounts: [
+        { label: 'pinned@x', exhausted: false },
+        { label: 'rolled-to@x', exhausted: false },
+      ],
+      agents: [],
+      consumers: [],
+    } as unknown as ListStateData;
+    const snaps = buildSnapshotsFromState(state, [
+      { ok: true, data: quota({ sevenDayUtilizationPct: 96 }) },
+      { ok: true, data: quota({ sevenDayUtilizationPct: 10 }) },
+    ]);
+    expect(snaps.map((s) => s.isActive)).toEqual([false, true]);
+  });
+
+  it('falls back to the pin when the broker publishes no serving field', () => {
+    const state: ListStateData = {
+      active: 'pinned@x',
+      fallback_order: ['pinned@x', 'other@x'],
+      accounts: [
+        { label: 'pinned@x', exhausted: false },
+        { label: 'other@x', exhausted: false },
+      ],
+      agents: [],
+      consumers: [],
+    };
+    const snaps = buildSnapshotsFromState(state, [
+      { ok: true, data: quota({}) },
+      { ok: true, data: quota({}) },
+    ]);
+    expect(snaps.map((s) => s.isActive)).toEqual([true, false]);
+  });
 });
 
 // ── reviveLastQuota ──────────────────────────────────────────────────

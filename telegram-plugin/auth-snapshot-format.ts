@@ -21,6 +21,7 @@
 import type { QuotaResult, QuotaUtilization } from './quota-check.js';
 import { isProbeThin, refillNormalizedUtils } from '../src/auth/quota.js';
 import type { AccountState, LastQuotaSnapshot, ListStateData } from '../src/auth/broker/client.js';
+import { effectiveServingLabel } from '../src/auth/broker/client.js';
 import { maskEmail } from './demo-mask.js';
 import { escapeMarkdown, codeSpanSafe } from './card-format.js';
 
@@ -1152,12 +1153,16 @@ export function buildSnapshotsFromState(
   quotas: QuotaResult[],
 ): AccountSnapshot[] {
   const out: AccountSnapshot[] = [];
+  // `isActive` means SERVING, not pinned — see effectiveServingLabel. Reading
+  // `state.active` here marked the rolled-off pin as "(active)" on the /usage
+  // card after every soft-avoid roll.
+  const serving = effectiveServingLabel(state);
   for (let i = 0; i < state.accounts.length; i++) {
     const acc: AccountState = state.accounts[i]!;
     const q = quotas[i];
     out.push({
       label: acc.label,
-      isActive: acc.label === state.active,
+      isActive: acc.label === serving,
       quota: q && q.ok ? q.data : null,
       quotaError: q && !q.ok ? q.reason : undefined,
       expiresAtMs: acc.expiresAt,
@@ -1206,11 +1211,13 @@ export function reviveLastQuota(snap: LastQuotaSnapshot | null | undefined): Quo
 export function buildSnapshotsFromCachedState(
   state: ListStateData,
 ): AccountSnapshot[] {
+  // SERVING, not pinned — same contract as buildSnapshotsFromState.
+  const serving = effectiveServingLabel(state);
   return state.accounts.map((acc) => {
     const lq = acc.last_quota ?? null;
     return {
       label: acc.label,
-      isActive: acc.label === state.active,
+      isActive: acc.label === serving,
       quota: reviveLastQuota(lq),
       quotaError: lq ? undefined : 'no cached quota (no probe since broker start)',
       expiresAtMs: acc.expiresAt,
