@@ -38,6 +38,18 @@ export type OperatorEventKind =
    * never user-actionable — see {@link OPERATOR_ACTIONABLE_KINDS}.
    */
   | 'provider-credit-exhausted'
+  /**
+   * A paid MCP dependency (Perplexity, Eraser, Brevo, Postiz, Meta/Google Ads,
+   * Cloudflare …) is refusing work because its KEY is the problem — out of
+   * credit, rejected, or past a hard usage wall. Raised from the tool_result
+   * seam, not the LLM-error seam, because these providers never touch LiteLLM.
+   *
+   * Deliberately NOT raised for an ordinary tool failure (bad query, 404,
+   * timeout, transient 429) — see `classifyMcpFailure` in
+   * `mcp-credential-failure.ts`. Operator-actionable: only the operator can top
+   * up or re-issue a key.
+   */
+  | 'mcp-dependency-blocked'
   | 'quota-exhausted'
   | 'rate-limited'
   | 'agent-crashed'
@@ -378,6 +390,28 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
       }
     }
 
+    // A paid MCP dependency's KEY is blocked. `ev.detail` for this kind is
+    // built by `renderMcpFailureDetail` from registry constants, counts and
+    // sanitised agent slugs ONLY — no provider text and no user text ever
+    // reaches it — so it is rendered as Markdown VERBATIM (escaping it would
+    // mangle the `vault key` code span and the console URL). It names the
+    // provider, the vault key NAME (never a value), the affected agents and
+    // the action. Dismiss-only: `/auth` cannot fix a third-party MCP key.
+    case 'mcp-dependency-blocked':
+      return {
+        text: [
+          `🔌 **Paid dependency blocked**`,
+          stripRawErrorBytes(ev.detail),
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
+          ],
+        },
+      }
+
     case 'quota-exhausted':
       // Canonical quota-exhausted text (migrated from auto-fallback.ts).
       // auto-fallback.ts's buildSwitchedMessage / buildAllExhaustedMessage
@@ -611,6 +645,10 @@ export const OPERATOR_ACTIONABLE_KINDS: ReadonlySet<OperatorEventKind> = new Set
   // lose confidence. This membership is what routes it to the operator card and
   // hands the user the brief plain-language notice instead.
   'provider-credit-exhausted',
+  // A paid MCP dependency's key is blocked (Perplexity out of credit, a revoked
+  // Eraser key, …). Only the operator holds the vendor console and the vault —
+  // an end user shown "401 invalid api key" can do nothing with it.
+  'mcp-dependency-blocked',
   'proxy-misconfig',
 ])
 
