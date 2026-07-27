@@ -52,6 +52,7 @@ import {
 } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { journalExternalDelivery } from './outbox-sweep.js'
+import { queueFloodBlockedReply } from './flood-reply-queue.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
 import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
@@ -1960,6 +1961,41 @@ export async function sendReply(
     threadId = _sendResult.threadId
     previewMessageId = _sendResult.previewMessageId
   } catch (err) {
+    // #3857 — a flood-blocked reply is QUEUED, never discarded. Pre-fix this
+    // catch re-wrapped `FLOOD_WAIT_ACTIVE` into a string and threw the answer
+    // away: `retryApiCall` fails fast BEFORE the wire while a long window is
+    // open, so during a multi-hour ban EVERY answer the agent composed for the
+    // operator was lost — the one content class the durable outbox did not
+    // cover. The undelivered text goes into the same outbox the sweep drains
+    // (it defers while the window is open, #3854) under a content-derived
+    // nonce, so a caller retry cannot double-deliver. `cosmetic` sends are
+    // still dropped by `queueFloodBlockedReply`; this site is `critical`.
+    const queued = queueFloodBlockedReply({
+      err,
+      chatId: chat_id,
+      threadId: threadId ?? null,
+      // Partial failure: queue only the chunks that never landed, so the user
+      // does not receive the already-delivered prefix a second time.
+      text: sentIds.length === 0 ? text : chunks.slice(sentIds.length).join('\n\n'),
+      priorityClass: 'critical',
+      originChatId: turn?.sessionChatId ?? null,
+      originThreadId: turn?.sessionThreadId ?? null,
+    })
+    if (queued != null) {
+      process.stderr.write(
+        `telegram gateway: reply flood-deferred — queued to outbox nonce=${queued.turnNonce} ` +
+          `chat=${chat_id} chars=${text.length} sent=${sentIds.length}/${chunks.length}\n`,
+      )
+      // The obligation is DISCHARGED by the durable enqueue. Without this the
+      // obligation tracker keeps re-prompting the agent to reply every few
+      // minutes for the whole ban — dozens of forced turns it physically
+      // cannot satisfy (and pre-#3857 each attempt destroyed its own answer).
+      if (turn != null && isSubstantiveFinalReply({ text, disableNotification: modelDisableNotification })) {
+        closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
+      }
+      // (the `finally` below stops the typing loop on this return path too)
+      return { content: [{ type: 'text', text: queued.notice }] }
+    }
     const msg = err instanceof Error ? err.message : String(err)
     throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
   } finally {
