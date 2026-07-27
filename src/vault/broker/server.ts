@@ -55,6 +55,7 @@ import { createAuditLogger, callerFromPeer, type AuditLogger } from "./audit-log
 import { safeVaultPath } from "./test-isolation-guard.js";
 import { Database } from "bun:sqlite";
 import { mintGrant, validateGrant, validateGrantForWrite, revokeGrant, listGrants, migrateGrantsSchema } from "../grants.js";
+import { reapUnusableGrantToken } from "./reap-token-file.js";
 import { adminOnlyKeysBeingAdded } from "../admin-only-keys.js";
 import { openGrantsDb } from "../grants-db.js";
 import {
@@ -1406,6 +1407,29 @@ export class VaultBroker {
         // request still produces exactly one audit entry (preserves the
         // #1433 hash-chain). Mirrors the put precedent at the
         // validateGrantForWrite branch.
+        //
+        // …but DO garbage-collect the dead token file. The fall-through is
+        // exactly why an orphaned `.vault-token` is harmless, and also why
+        // nothing ever noticed one: pre-fix, a token whose grant row was
+        // gone (or whose TTL had lapsed) stayed on disk forever — reported
+        // by `switchroom doctor` as a permanent red on every run, and
+        // re-validated (bcrypt) on every single `vault get`. Truncating it
+        // here — at the one place a token is already proven unusable —
+        // makes the next call an honest no-token call and lets the fleet
+        // stop accreting orphans. Only grant-invalid / grant-expired are
+        // reaped; grant-key-not-allowed means the grant is ALIVE and must
+        // be kept. See reap-token-file.ts for why this truncates in place
+        // rather than unlinking (bare-file bind mount ⇒ EBUSY).
+        if (!grantResult.ok) {
+          reapUnusableGrantToken({
+            agentsDir: this.config
+              ? resolveAgentsDir(this.config)
+              : path.join(os.homedir(), ".switchroom", "agents"),
+            agent: agentName,
+            presentedToken: req.token,
+            reason: grantResult.reason,
+          });
+        }
       }
 
       // ── ACL path (no token) ─────────────────────────────────────────────

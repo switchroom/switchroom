@@ -21,7 +21,9 @@
  *     and the host file are the SAME inode (i.e. the bind mount
  *     is wired correctly). Pre-#1737 regression class: orphan
  *     `.vault-token` files referencing grants that no longer
- *     exist in a fresh ephemeral broker DB.
+ *     exist in a fresh ephemeral broker DB. (Such a token does not
+ *     deny the agent — see `probeOrphanVaultTokens` for what it
+ *     actually costs.)
  *   - "vault-audit.log inode-equality" — same pattern for the
  *     audit log. Missing mount → broker writes audit events to
  *     ephemeral container fs, invisible to `switchroom vault
@@ -342,6 +344,7 @@ export function runVaultBrokerDurabilityChecks(
     walStatBroker?: (p: string) => BrokerFileStat;
     grantIdExists?: (id: string) => boolean | null;
     readTokenId?: (agent: string, home: string) => string | null;
+    tokenMtimeMs?: (agent: string, home: string) => number | null;
   },
 ): CheckResult[] {
   const home = homedir();
@@ -371,6 +374,7 @@ export function runVaultBrokerDurabilityChecks(
       home,
       grantIdExists: opts?.grantIdExists,
       readTokenId: opts?.readTokenId,
+      tokenMtimeMs: opts?.tokenMtimeMs,
     }),
     formatBindMountResult(
       "vault-broker: vault-audit.log bind mount (#1025)",
@@ -611,11 +615,46 @@ export function probeGrantsWalDivergence(
 }
 
 /**
+ * The TTL the gateway's `vault_request_access` approval flow mints with
+ * (`telegram-plugin/gateway/callback-query-handlers.ts` — `ttl_seconds:
+ * 30 * 24 * 60 * 60`). Used as the age threshold below; see the TTL note on
+ * `probeOrphanVaultTokens`.
+ */
+const ASSUMED_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
  * Flag any agent `.vault-token` on disk whose grant id has NO matching row in
- * the grants DB — the exact #1737 / #3289 orphan-token symptom that appears
- * after a broker recreate wipes grants written to an ephemeral (unmounted or
- * un-checkpointed) DB. The token still authenticates format-wise but every
- * `vault get` DENIES because the grant it references is gone.
+ * the grants DB — the #1737 / #3289 orphan-token symptom that appears after a
+ * broker recreate wipes grants written to an ephemeral (unmounted or
+ * un-checkpointed) DB.
+ *
+ * ## What an orphan token actually costs (do not overstate it)
+ *
+ * It does NOT deny the agent's vault traffic. The broker's READ-path
+ * fall-through (`src/vault/broker/server.ts`, and pinned by
+ * `server-token-fallthrough.test.ts`) deliberately treats a token whose grant
+ * is missing or expired as *no token at all* and serves the request from the
+ * agent's standing config ACL — an unusable token must never be MORE
+ * restrictive than presenting none. Only `grant-revoked` hard-denies. So an
+ * agent with an orphan token still reads every key its `switchroom.yaml` ACL
+ * covers; `switchroom vault list` still returns those keys.
+ *
+ * What it DOES cost is real: the dynamic grant is gone, so any key that was
+ * reachable ONLY through that grant — the usual reason a grant gets minted at
+ * all — is no longer reachable by that agent.
+ *
+ * ## TTL recoverability (why this uses mtime)
+ *
+ * The orphaned grant's `expires_at` is NOT recoverable. The token file holds
+ * only `vg_<6 random hex>.<secret>` (`grants.ts` `generateId`) — no timestamp —
+ * and the row that carried `expires_at` is precisely what is missing. The only
+ * age signal left on the host is the token file's own mtime, which is a good
+ * proxy for mint time because the file is written exactly once per mint. So:
+ * mtime + `ASSUMED_GRANT_TTL_MS` past ⇒ the grant would have lapsed on its own
+ * and the file is litter (`warn`); still inside that window ⇒ the grant should
+ * have been alive and its disappearance is the genuine durability signal
+ * (`fail`). Unknown mtime is treated as litter — an unprovable age must not
+ * manufacture a red.
  *
  * @internal exported for testing
  */
@@ -625,6 +664,9 @@ export function probeOrphanVaultTokens(
     home?: string;
     readTokenId?: (agent: string, home: string) => string | null;
     grantIdExists?: (id: string) => boolean | null;
+    /** Token-file mtime in ms, or null when unreadable. Seam for tests. */
+    tokenMtimeMs?: (agent: string, home: string) => number | null;
+    now?: () => number;
   },
 ): CheckResult {
   const name = "vault-broker: no orphan .vault-token grants (#1737 / #3289)";
@@ -632,6 +674,8 @@ export function probeOrphanVaultTokens(
   const agents = Object.keys(config.agents ?? {});
   const readTokenId = opts?.readTokenId ?? defaultReadTokenId;
   const grantIdExists = opts?.grantIdExists ?? defaultGrantIdExists;
+  const tokenMtimeMs = opts?.tokenMtimeMs ?? defaultTokenMtimeMs;
+  const now = opts?.now ?? Date.now;
 
   const tokens: { agent: string; id: string }[] = [];
   for (const agent of agents) {
@@ -662,19 +706,70 @@ export function probeOrphanVaultTokens(
       detail: `${tokens.length} vault-token(s) all reference a live grant row`,
     };
   }
+
+  // Split by whether the vanished grant would still have been in its TTL
+  // window. Only the still-in-window ones are a durability failure.
+  const stale: string[] = [];
+  const durability: string[] = [];
+  for (const o of orphans) {
+    const mtime = tokenMtimeMs(o.agent, home);
+    const ageMs = mtime === null || !Number.isFinite(mtime) ? null : now() - mtime;
+    if (ageMs === null || ageMs > ASSUMED_GRANT_TTL_MS) {
+      stale.push(`${o.agent}=${o.id}`);
+    } else {
+      durability.push(`${o.agent}=${o.id}`);
+    }
+  }
+
+  const consequence =
+    `These agents have LOST the dynamic grant: the broker treats an unusable ` +
+    `token as no token and falls through to the standing config ACL (only ` +
+    `\`grant-revoked\` hard-denies), so config-ACL keys are still served — but ` +
+    `any key reachable ONLY via the dynamic grant is now unreachable for them.`;
+
+  if (durability.length === 0) {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `${stale.length} agent vault-token(s) reference a grant id absent from the ` +
+        `grants DB: ${stale.join(", ")}. Each is older than the ${ASSUMED_GRANT_TTL_MS /
+          86_400_000}d grant TTL (or has no readable mtime), so the grant would ` +
+        `have expired anyway — this is stale token litter, not a durability ` +
+        `failure. ${consequence}`,
+      fix:
+        "Safe to remove (`: > ~/.switchroom/agents/<agent>/.vault-token`), or let " +
+        "the broker's own reaper truncate it on the agent's next `vault get`. " +
+        "Re-mint only if that agent still needs a key its config ACL doesn't cover.",
+    };
+  }
+
+  const staleTail = stale.length
+    ? ` (plus ${stale.length} already past the assumed TTL — stale litter: ${stale.join(", ")})`
+    : "";
   return {
     name,
     status: "fail",
     detail:
-      `${orphans.length} agent vault-token(s) reference a grant id absent from the ` +
-      `grants DB: ${orphans.map((o) => `${o.agent}=${o.id}`).join(", ")}. ` +
-      `This is the classic broker-recreate grant-wipe: every \`vault get\` from ` +
-      `these agents DENIES because the grant no longer exists.`,
+      `${durability.length} agent vault-token(s) reference a grant id absent from ` +
+      `the grants DB while still inside the assumed ${ASSUMED_GRANT_TTL_MS /
+        86_400_000}d grant TTL: ${durability.join(", ")}${staleTail}. A grant that ` +
+      `should still be live has vanished — the classic broker-recreate grant-wipe. ` +
+      consequence,
     fix:
       "Re-mint the grants (`switchroom vault grant <agent> --keys …`). If this " +
       "recurs after a broker recreate, the grants directory bind mount is broken " +
       "— see the `vault-grants dir bind mount` probe above.",
   };
+}
+
+/** Token-file mtime in ms; null when the file is missing or unreadable. */
+function defaultTokenMtimeMs(agent: string, home: string): number | null {
+  try {
+    return statSync(join(home, ".switchroom", "agents", agent, ".vault-token")).mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 function defaultReadTokenId(agent: string, home: string): string | null {
