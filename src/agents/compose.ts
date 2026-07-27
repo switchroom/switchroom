@@ -2225,6 +2225,17 @@ function emitAgentService(
     // this is at worst a no-op — never a regression.
     CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
     SWITCHROOM_AGENT_NAME: a.name,
+    // Static fallback for the model half of the commit-attribution trailer
+    // pair (bin/git-agent-attribution-hook.sh). start.sh exports the more
+    // accurate SWITCHROOM_SESSION_MODEL — the model the session actually
+    // launched on, including a live `/model` override — but that export only
+    // reaches processes descended from `exec claude`. A bare
+    // `docker exec <container> git commit` inherits the CONTAINER env, not
+    // start.sh's, so without this the model trailer would read "unknown"
+    // there. Already resolved through resolveMainModel() upstream
+    // (compose.ts:930), so this is the same string the routing class below
+    // is baked from.
+    SWITCHROOM_AGENT_MODEL: a.model,
     // The agent's profile (its `extends:` value, defaulting to
     // "default"). Read by the LiteLLM `x-litellm-tags` header emitted
     // from start.sh.hbs / cron-session.sh.hbs as `profile:<value>` —

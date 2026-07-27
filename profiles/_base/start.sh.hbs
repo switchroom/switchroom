@@ -594,6 +594,30 @@ if [ ! -e "$HOME/.switchroom-config" ] || [ -L "$HOME/.switchroom-config" ]; the
 fi
 {{/if}}
 
+# --- Commit attribution: global git hooks path ---------------------------
+#
+# Every commit an agent makes is AUTHORED by the operator's GitHub account
+# (deliberate, and staying that way), which leaves `git log` unable to say
+# WHICH agent and WHICH model produced a change. The image ships a
+# `prepare-commit-msg` hook that stamps `Switchroom-Agent:` /
+# `Switchroom-Model:` trailers from $SWITCHROOM_AGENT_NAME and the launched
+# model — see bin/git-agent-attribution-hook.sh for the full rationale
+# (including why prepare-commit-msg, which `--no-verify` does NOT bypass).
+#
+# Set GLOBALLY, not per-repo: an agent clones repos on demand and a per-repo
+# install would mean every new clone starts out unattributed until someone
+# remembered to run a setup step. Repo-local `core.hooksPath` (husky et al)
+# still wins, and the hook chains to any displaced `.git/hooks` copy.
+#
+# Idempotent, and non-fatal: attribution must never be the reason a boot
+# fails. `git config --global` writes $HOME/.gitconfig, which lives on the
+# /state/agent bind mount and so persists — re-asserting it each boot is what
+# repairs an agent whose config was hand-edited.
+if command -v git >/dev/null 2>&1 && [ -x /opt/switchroom/git-hooks/prepare-commit-msg ]; then
+  git config --global core.hooksPath /opt/switchroom/git-hooks 2>/dev/null \
+    || echo "attribution: WARNING — could not set core.hooksPath; commits from this agent will not carry Switchroom-Agent/Switchroom-Model trailers and will fail the repo's attribution lint" >&2
+fi
+
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="$HOME/.bun/bin:$PATH"
@@ -1964,6 +1988,15 @@ esac
 # in-memory session-model state after this restart, keeping /status and the
 # welcome card honest. Overwrite (not consumed) — the gateway reads it at boot.
 printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.active-session-model" 2>/dev/null || true
+
+# Commit-attribution carrier for the model half of the trailer pair. Exported
+# here, from the SAME $_EFFECTIVE_MODEL the session is about to launch on, so a
+# `/model` override is reflected in the trailer rather than the configured
+# default. `exec claude` below inherits it, and so does every shell claude
+# spawns — which is where `git commit` actually runs.
+# Consumer: bin/git-agent-attribution-hook.sh (falls back to the static
+# SWITCHROOM_AGENT_MODEL that compose.ts writes, then to "unknown").
+export SWITCHROOM_SESSION_MODEL="$_EFFECTIVE_MODEL"
 
 # --- Routing-mode observability (.routing-mode, 2026-07-17 boot-race incident) ---
 #

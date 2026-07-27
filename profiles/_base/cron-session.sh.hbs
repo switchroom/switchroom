@@ -177,6 +177,14 @@ fi
 # claude in a detached pane that registers fine; a human can still
 # `tmux -L "$CRON_SOCKET" attach -t "$CRON_NAME"` later. The `-x/-y` give the
 # pane a size since there's no TTY to derive one from.
+#
+# Commit-attribution carrier for the model half of the trailer pair. The Tier-1
+# cron session runs a DIFFERENT model from the main session, so it exports its
+# own value — otherwise a commit made during a cron fire would be stamped with
+# the main session's model. Mirrors the export in start.sh; consumed by
+# bin/git-agent-attribution-hook.sh. ({{{cronModelQ}}} is already
+# shell-single-quoted by the scaffold, so it is assigned BARE.)
+export SWITCHROOM_SESSION_MODEL={{{cronModelQ}}}
 tmux -L "$CRON_SOCKET" \
   new-session -d -s "$CRON_NAME" -x 400 -y 50 \
   claude \

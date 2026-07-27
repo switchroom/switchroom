@@ -87,6 +87,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history. `check-agent-attribution-trailers.mjs` (part of
+          # `bun lint`) diffs `origin/<base>..HEAD`; under the default
+          # depth-1 checkout there is no base ref, so it SKIPs — a silent
+          # pass that would make the required `lint` context certify a
+          # guarantee it never actually checked.
+          fetch-depth: 0
 
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom

@@ -1,0 +1,89 @@
+name: agent-attribution
+
+# Which agent, on which model, produced this work?
+#
+# Two surfaces over ONE source of truth (the `Switchroom-Agent:` /
+# `Switchroom-Model:` commit trailers written by
+# `bin/git-agent-attribution-hook.sh` inside every agent container):
+#
+#   agent-trailers  the alarm — a model-written commit that does not name its
+#                   agent + model fails here.
+#   agent-label     the projection — `agent:<name>` on the PR, so the fleet is
+#                   filterable in the GitHub UI and via
+#                   `gh pr list --label agent:klanker`.
+#
+# NOT a required check in Ruleset 16470166. `agent-trailers` runs the same
+# script that `npm run lint` runs, and `lint` IS required — so the guarantee is
+# already gating there. This workflow exists because `lint-run` is path-gated:
+# a docs-only PR skips it entirely, and an unattributed agent commit would slip
+# through. This job has no path filter, so it always reports.
+#
+# Deliberately NO `merge_group:` trigger. A merge-queue ref must produce every
+# REQUIRED context and nothing that can wedge the queue; adding an unrequired
+# workflow there buys nothing and risks a 60-minute stall on a flake. See
+# .github/MERGE-QUEUE.md.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-attribution-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent-trailers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history: the guard diffs `origin/<base>..HEAD`, and the
+          # default depth-1 checkout has no base to diff against — it would
+          # SKIP, which is a silent pass.
+          fetch-depth: 0
+
+      - name: Check attribution trailers
+        run: node scripts/check-agent-attribution-trailers.mjs
+
+  agent-label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Labels are the issues API even on a PR.
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # A PR from a fork gets a read-only GITHUB_TOKEN, so every label write
+      # would 403 and the job would red for a reason the contributor cannot
+      # fix. Switchroom's own model is canonical-only (no forks — see
+      # CLAUDE.md "Dev flow"), so an agent PR always takes the labelling path;
+      # this guard only spares a drive-by external contributor.
+      - name: Apply agent label
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "no PR in context (workflow_dispatch) — nothing to label"
+            exit 0
+          fi
+          node scripts/agent-pr-label.mjs --repo "$TARGET_REPO" --pr "$PR_NUMBER"
+
+      - name: Note fork skip
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::notice::Fork PR — GITHUB_TOKEN is read-only, so no agent label was applied."

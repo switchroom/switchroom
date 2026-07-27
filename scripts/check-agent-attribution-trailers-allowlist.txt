@@ -1,0 +1,17 @@
+# check-agent-attribution-trailers allowlist
+#
+# Full 40-character commit SHAs that are exempt from the
+# `Switchroom-Agent:` / `Switchroom-Model:` trailer requirement, one per line,
+# each with a comment saying WHY. This is a ratchet: existing exceptions are
+# enumerable, and a new one is a deliberate, reviewable edit.
+#
+# Legitimate reasons:
+#   - an upstream patch replayed verbatim, where rewriting the message would
+#     lose the provenance of the original;
+#   - a commit imported from another repo by `git subtree`/`format-patch`.
+#
+# NOT a legitimate reason: "the hook did not run". Fix the hook — the guard's
+# failure message spells out how to re-stamp the commits with
+# `git rebase -i --exec 'git commit --amend --no-edit'`.
+#
+# (empty)
