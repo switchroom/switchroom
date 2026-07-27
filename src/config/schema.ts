@@ -674,7 +674,8 @@ export const AgentMemorySchema = z
             "the agent's own bank results — e.g. a shared operator/household " +
             "profile bank authored via `switchroom memory profile`. Each is " +
             "recalled with the `request_timeout_seconds` per-bank timeout " +
-            "(default 8s) and is non-fatal on failure. Stays " +
+            "(defaults to the effective `parallel_deadline_seconds`, 10s at " +
+            "the shipped ceiling) and is non-fatal on failure. Stays " +
             "within the single tenant: all banks are the operator's data, in " +
             "the operator's Hindsight instance (see the `single-tenant` " +
             "invariant). Defaults to [] (no extra banks).",
