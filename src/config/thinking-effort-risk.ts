@@ -1,7 +1,7 @@
 /**
  * Model-aware thinking-effort risk guard (#1978).
  *
- * Opus 4.x models use *adaptive thinking* — they emit
+ * Opus 4.x and Opus 5 models use *adaptive thinking* — they emit
  * `thinking`/`redacted_thinking` blocks. switchroom dispatches work to
  * concurrent sub-agents (worker/researcher/reviewer via the Task tool,
  * often `background: true`), and the bundled `claude` CLI can mis-merge
@@ -21,10 +21,11 @@
  * blocks to mis-merge) and is the safe floor; `medium`+ reliably
  * reproduces the 400. The scaffold defaults unset `thinking_effort` to
  * `low` (see SWITCHROOM_DEFAULT_THINKING_EFFORT), so an UNSET value is
- * safe — only an explicit `medium`/`high`/`xhigh`/`max` on an Opus 4.x
- * model is flagged.
+ * safe — only an explicit `medium`/`high`/`xhigh`/`max` on an Opus 4.x /
+ * Opus 5 model is flagged.
  *
- * Scope note: this guard intentionally only flags the Opus 4.x family.
+ * Scope note: this guard intentionally only flags the Opus family — 4.x and
+ * 5, plus the bare `opus` alias (see `isAdaptiveThinkingOpus` below).
  * Sonnet 5 also has adaptive thinking, but the fleet runs Sonnet
  * sub-agents at higher effort without hitting this, so flagging it would
  * be a false alarm. Revisit if the failure is observed on Sonnet.
@@ -64,9 +65,9 @@ export interface ThinkingEffortRisk {
  * Assess whether a (model, thinking_effort) combo risks the adaptive-
  * thinking merge 400. Safe (`risky: false`) when effort is unset (→
  * scaffold floor `low`), when effort is `low`, or when the model isn't an
- * Opus 4.x adaptive-thinking model.
+ * Opus 4.x / Opus 5 adaptive-thinking model.
  *
- * @param model   Resolved model — alias (`opus`) or full id (`claude-opus-4-8`).
+ * @param model   Resolved model — alias (`opus`) or full id (`claude-opus-5`).
  * @param effort  Resolved `thinking_effort` (may be undefined).
  */
 export function assessThinkingEffortRisk(
