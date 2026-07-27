@@ -2055,6 +2055,532 @@ ast.parse(t)
 print("switchroom hindsight perturbed-JSON-retry patch: invalid-JSON retries now bypass the proxy response cache and raise temperature instead of replaying the identical request")
 PYEOF
 
+# ── UPSTREAM CARRY: vectorize-io/hindsight PR #2968 ───────────────────────────
+# perf: eliminate redundant graph seed and UUID scans
+#   upstream PR:    https://github.com/vectorize-io/hindsight/pull/2968
+#   merge commit:   b475f5cc
+#   merged:         2026-07-27T10:12:30Z, to upstream `main`
+#   in a release:   NO. v0.8.5 (the digest pinned above) is upstream's tip
+#                   release and predates it.
+#
+# DELETE THIS BLOCK WHEN, and only when, the `FROM` digest above resolves to
+# upstream v0.8.6 or newer — the first release that contains b475f5cc natively.
+# At that point this patch's anchors will no longer match and the build will
+# fail loudly, which is the reminder. Re-assert its absence in
+# tests/docker/dockerfile-hindsight-bakes.test.ts the same way the retired
+# patches are, so it cannot double-apply on a later rebase.
+#
+# WHAT IT DOES — two independent wins in one upstream commit:
+#
+#   1. Graph seeds are derived from the semantic/BM25 over-fetch pool that
+#      `retrieve_semantic_bm25_combined` has ALREADY fetched, instead of each
+#      fact type issuing its own dedicated `ORDER BY embedding <=> $1::vector`
+#      through `_find_semantic_seeds`. A 3-fact-type recall did 4 ANN scans
+#      where 1 suffices. Upstream's production evidence: 302,602 calls /
+#      2,072s accumulated server-side load eliminated. On THIS fleet the same
+#      call rate is 708 recalls in 6h (`docker logs switchroom-hindsight`,
+#      2026-07-27) x 3 fact types ~= 8,500 dedicated ANN seed scans a day.
+#
+#   2. `fetch_unit_dates` compares `memory_units.id` as a UUID instead of
+#      casting the indexed column with `id::text = ANY($1)`, which forced a
+#      sequential scan. Upstream measured 120.049ms -> 0.240ms median (seq scan
+#      -> `pk_memory_units`) and 9.005ms -> 0.0795ms on a 100k-row bench.
+#      Non-canonical inputs (malformed, uppercase, braced, unhyphenated) were
+#      silently ignored by the old text comparison and are still ignored, by
+#      filtering them out BEFORE the cast — so behaviour is preserved, not
+#      merely "fixed".
+#
+# HISTORY YOU NEED BEFORE TOUCHING THIS. switchroom shipped its OWN version of
+# (1) as the `duplicate-ANN-scan` patch in #3699, and RETIRED it in #3768 when
+# bumping to v0.8.5, because 0.8.5 DELETED the `semantic_seeds` parameter our
+# patch depended on and documented the removal as deliberate ("Graph traversal
+# deliberately chooses its own bounded seeds ... reusing their results would
+# silently change graph-retrieval recall behavior"). #2968 is upstream
+# REVERSING that stance one day later, and it lands the correctness guard our
+# retired patch had to invent for itself: the shared pool is reusable only when
+# the semantic arm's SQL floor is at or below the graph seed threshold, so the
+# derived seed set can never be NARROWER than the dedicated query's. This is
+# therefore not a re-litigation of #3768 — it is upstream's own design, carried.
+# The retired switchroom-authored form must still never come back; the negative
+# guards in tests/docker/dockerfile-hindsight-bakes.test.ts target its unique
+# markers (`duplicate-ANN-scan`, `_graph_semantic_seeds`, `semantic_seeds=None`,
+# the leading-underscore `_GRAPH_SEED_*` constants), not the upstream names.
+#
+# DELIBERATE DIVERGENCE FROM THE UPSTREAM DIFF, and why. Upstream main reads the
+# graph seed floor from `get_config().graph_seed_min_similarity`. That config
+# key DOES NOT EXIST in v0.8.5 — the seed call site hardcodes
+# `limit=20, threshold=0.3`. So this carry introduces the two literals as named
+# module constants `GRAPH_SEED_LIMIT` / `GRAPH_SEED_MIN_SIMILARITY` and uses
+# them everywhere upstream uses the config value. That is byte-equivalent to
+# v0.8.5's behaviour. The block ASSERTS the config key is still absent: if a
+# future base adds it, this hardcoded 0.3 would silently ignore an operator's
+# setting, so the build must fail instead.
+#
+# EQUIVALENCE ARGUMENT (why the derived seeds are the same rows). Both queries
+# hit the same table with the same bank_id / fact_type / tags / tag_groups /
+# created-range filters and the same `ORDER BY embedding <=> $1::vector`. The
+# combined arm over-fetches `max(limit * 5, 100)` per fact type, i.e. always
+# >= 100 > GRAPH_SEED_LIMIT, so the top-20 above the seed floor are present in
+# the pool. `semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT)` stops the
+# Python trim from cutting a seed when `thinking_budget < 20`. And the reuse is
+# DECLINED outright, falling back to upstream's own dedicated query, whenever
+# `sem_min > GRAPH_SEED_MIN_SIMILARITY` (a per-request `min_scores.semantic`
+# above 0.3), because the pool would then be narrower than the seed query's.
+# LinkExpansion consumes seeds by id alone (`seed_ids = list({s.id for s in
+# all_seeds})`), so id-set equality is the whole equivalence relation.
+#
+# Row ORDER is trusted, not re-sorted — unlike the retired switchroom patch,
+# which sorted defensively. That is not a new assumption: v0.8.5's own semantic
+# trim already takes the FIRST `limit` rows per fact type out of the same
+# UNION ALL result, so if the row order were not similarity-ordered the
+# semantic arm would already be wrong.
+#
+# Self-verifying (every anchor is exact-once and every file is re-parsed with
+# `ast.parse`); guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
+# unpatched upstream / GREEN patched) by
+# tests/docker/hindsight-graph-seed-patch.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+BASE = pathlib.Path("/app/api/hindsight_api")
+TAG = "switchroom hindsight graph-seed-reuse carry (upstream #2968)"
+
+
+def apply(rel, edits):
+    """Exact-once anchored replacement, then re-parse. Fails loud on drift."""
+    f = BASE / rel
+    s = f.read_text()
+    for label, anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == 1, (
+            f"{TAG}: the {label!r} anchor was found {n}x (expected 1) in {rel}. "
+            "If the base image is now upstream v0.8.6 or newer, this whole patch "
+            "block is ADOPTED — delete it from docker/Dockerfile.hindsight and "
+            "assert its absence in tests/docker/dockerfile-hindsight-bakes.test.ts. "
+            "Otherwise upstream reformatted and the patch must be re-authored."
+        )
+        s = s.replace(anchor, repl, 1)
+    f.write_text(s)
+    ast.parse(s)
+    return s
+
+
+# ---- 0. the divergence guard ------------------------------------------------
+# Upstream main reads this floor from config; v0.8.5 hardcodes 0.3. If a future
+# base introduces the config key, the mirrored constant below would silently
+# ignore the operator's setting, so refuse to build rather than diverge.
+_cfg = (BASE / "config.py").read_text()
+assert "graph_seed_min_similarity" not in _cfg, (
+    f"{TAG}: config.py now defines `graph_seed_min_similarity`, but this patch "
+    "mirrors the v0.8.5 hardcoded 0.3 into GRAPH_SEED_MIN_SIMILARITY. Carrying it "
+    "unchanged would ignore the operator's configured floor — re-author against the "
+    "config value (or delete this block if the base already carries upstream #2968)."
+)
+
+
+# ---- 1. link_expansion_retrieval.py: accept preselected seeds ---------------
+le = apply("engine/search/link_expansion_retrieval.py", [
+    (
+        "seed constants",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "\n"
+        "async def _find_semantic_seeds(\n",
+
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# switchroom carry of upstream #2968. Upstream main names these\n"
+        "# GRAPH_SEED_LIMIT and config.graph_seed_min_similarity; v0.8.5 has no such\n"
+        "# config key and hardcodes limit=20/threshold=0.3 at the single call site\n"
+        "# below, so the literals are hoisted here unchanged and shared with\n"
+        "# search/retrieval.py, which needs the SAME numbers to derive an identical\n"
+        "# seed set from the combined semantic pool.\n"
+        "GRAPH_SEED_LIMIT = 20\n"
+        "GRAPH_SEED_MIN_SIMILARITY = 0.3\n"
+        "\n"
+        "\n"
+        "async def _find_semantic_seeds(\n",
+    ),
+    (
+        "retrieve() signature",
+        '        created_before: "datetime | None" = None,\n'
+        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n"
+        '        """\n'
+        "        Retrieve facts by expanding links from seeds.\n",
+
+        '        created_before: "datetime | None" = None,\n'
+        "        # switchroom carry of upstream #2968: graph entry points already\n"
+        "        # derived by the caller from the shared semantic candidate pool. An\n"
+        "        # EMPTY list is a real answer (no seeds cleared the floor) and must NOT\n"
+        "        # fall back to a second ANN scan; only None means 'not preselected'.\n"
+        "        preselected_semantic_seeds: list[RetrievalResult] | None = None,\n"
+        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n"
+        '        """\n'
+        "        Retrieve facts by expanding links from seeds.\n",
+    ),
+    (
+        "seed fetch",
+        "        async with acquire_with_retry(pool) as conn:\n"
+        "            # Graph traversal deliberately chooses its own bounded seeds. The semantic and temporal\n"
+        "            # retrieval arms have independent candidate limits and thresholds, so reusing their\n"
+        "            # results would silently change graph-retrieval recall behavior.\n"
+        "            seeds_start = time.time()\n"
+        "            all_seeds = await _find_semantic_seeds(\n"
+        "                conn,\n"
+        "                query_embedding_str,\n"
+        "                bank_id,\n"
+        "                fact_type,\n"
+        "                limit=20,\n"
+        "                threshold=0.3,\n"
+        "                tags=tags,\n"
+        "                tags_match=tags_match,\n"
+        "                tag_groups=tag_groups,\n"
+        "                created_after=created_after,\n"
+        "                created_before=created_before,\n"
+        "            )\n"
+        "            timings.seeds_time = time.time() - seeds_start\n",
+
+        "        async with acquire_with_retry(pool) as conn:\n"
+        "            if preselected_semantic_seeds is None:\n"
+        "                # switchroom carry of upstream #2968: the caller could not prove the\n"
+        "                # shared semantic pool covers this arm's threshold (a per-request\n"
+        "                # min_scores.semantic above GRAPH_SEED_MIN_SIMILARITY narrows it), so\n"
+        "                # keep graph retrieval's own query and result semantics. A silently\n"
+        "                # narrowed seed set is a quieter recall, which is worse than a slower one.\n"
+        "                seeds_start = time.time()\n"
+        "                all_seeds = await _find_semantic_seeds(\n"
+        "                    conn,\n"
+        "                    query_embedding_str,\n"
+        "                    bank_id,\n"
+        "                    fact_type,\n"
+        "                    limit=GRAPH_SEED_LIMIT,\n"
+        "                    threshold=GRAPH_SEED_MIN_SIMILARITY,\n"
+        "                    tags=tags,\n"
+        "                    tags_match=tags_match,\n"
+        "                    tag_groups=tag_groups,\n"
+        "                    created_after=created_after,\n"
+        "                    created_before=created_before,\n"
+        "                )\n"
+        "                timings.seeds_time = time.time() - seeds_start\n"
+        "            else:\n"
+        "                all_seeds = preselected_semantic_seeds\n",
+    ),
+])
+
+
+# ---- 2. graph_retrieval.py: the abstract signature --------------------------
+gr = apply("engine/search/graph_retrieval.py", [
+    (
+        "abstract retrieve() signature",
+        "        created_before: datetime | None = None,  # Only include memory_units created before this time\n"
+        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n",
+
+        "        created_before: datetime | None = None,  # Only include memory_units created before this time\n"
+        "        # switchroom carry of upstream #2968: graph entry points already fetched by\n"
+        "        # the caller from the shared semantic candidate pool (None = not preselected).\n"
+        "        preselected_semantic_seeds: list[RetrievalResult] | None = None,\n"
+        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n",
+    ),
+])
+
+
+# ---- 3. retrieval.py: derive the seeds from the pool already fetched --------
+rt = apply("engine/search/retrieval.py", [
+    (
+        "seed-constant import",
+        "from .link_expansion_retrieval import LinkExpansionRetriever\n",
+        "from .link_expansion_retrieval import (\n"
+        "    GRAPH_SEED_LIMIT,\n"
+        "    GRAPH_SEED_MIN_SIMILARITY,\n"
+        "    LinkExpansionRetriever,\n"
+        ")\n",
+    ),
+    (
+        "SemanticBm25Result dataclass",
+        "# Default graph retriever instance (can be overridden)\n",
+
+        "@dataclass\n"
+        "class SemanticBm25Result:\n"
+        '    """Per-fact-type candidates returned by the shared semantic/BM25 query.\n'
+        "\n"
+        "    switchroom carry of upstream #2968. ``graph_seeds`` is None — meaning the\n"
+        "    graph retriever must issue its own dedicated seed query — whenever the\n"
+        "    semantic arm's SQL floor is STRICTER than GRAPH_SEED_MIN_SIMILARITY, because\n"
+        "    the shared pool would then be narrower than the seed query's own result.\n"
+        '    """\n'
+        "\n"
+        "    semantic: list[RetrievalResult]\n"
+        "    bm25: list[RetrievalResult]\n"
+        "    graph_seeds: list[RetrievalResult] | None\n"
+        "\n"
+        "\n"
+        "# Default graph retriever instance (can be overridden)\n",
+    ),
+    (
+        "combined-retrieval signature",
+        "    min_keyword: float | None = None,\n"
+        ") -> dict[str, tuple[list[RetrievalResult], list[RetrievalResult]]]:\n",
+
+        "    min_keyword: float | None = None,\n"
+        "    # switchroom carry of upstream #2968: the graph arm's seed floor. Passing it\n"
+        "    # lets this query double as the graph seed query when its own floor is no\n"
+        "    # stricter; leaving it None preserves the pre-#2968 behaviour exactly.\n"
+        "    graph_seed_min_similarity: float | None = None,\n"
+        ") -> dict[str, SemanticBm25Result]:\n",
+    ),
+    (
+        "result_dict init",
+        "    Returns:\n"
+        "        Dict mapping fact_type -> (semantic_results, bm25_results)\n"
+        '    """\n'
+        "    result_dict: dict[str, tuple[list[RetrievalResult], list[RetrievalResult]]] = {ft: ([], []) for ft in fact_types}\n",
+
+        "    Returns:\n"
+        "        Candidate groups for each fact type. ``graph_seeds`` is ``None`` when\n"
+        "        the semantic query's threshold is too strict to cover graph entry points.\n"
+        '    """\n'
+        "    result_dict = {ft: SemanticBm25Result(semantic=[], bm25=[], graph_seeds=None) for ft in fact_types}\n",
+    ),
+    (
+        "grouping loop",
+        "    # Group results; trim semantic to limit (over-fetched for HNSW approximation).\n"
+        "    sem_counts: dict[str, int] = {ft: 0 for ft in fact_types}\n"
+        "    for r in rows:\n"
+        "        row = dict(r)\n"
+        '        source = row.pop("source")\n'
+        '        ft = row.get("fact_type")\n'
+        "        if ft not in result_dict:\n"
+        "            continue\n"
+        '        if source == "semantic":\n'
+        "            if sem_counts[ft] < limit:\n"
+        "                result_dict[ft][0].append(RetrievalResult.from_db_row(row))\n"
+        "                sem_counts[ft] += 1\n"
+        "        else:\n"
+        "            result_dict[ft][1].append(RetrievalResult.from_db_row(row))\n"
+        "\n"
+        "    return result_dict\n",
+
+        "    # Group results. The semantic SQL deliberately over-fetches for HNSW recall;\n"
+        "    # when that pool also covers the graph threshold, derive graph entry points\n"
+        "    # from the same ordered rows instead of issuing one duplicate ANN query per\n"
+        "    # fact type (switchroom carry of upstream #2968). Convert only the prefix\n"
+        "    # either consumer can observe, not the entire HNSW over-fetch pool.\n"
+        "    graph_seed_threshold = (\n"
+        "        graph_seed_min_similarity\n"
+        "        if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity\n"
+        "        else None\n"
+        "    )\n"
+        "    semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)\n"
+        "    semantic_candidates: dict[str, list[RetrievalResult]] = {ft: [] for ft in fact_types}\n"
+        "    for r in rows:\n"
+        "        row = dict(r)\n"
+        '        source = row.pop("source")\n'
+        '        ft = row.get("fact_type")\n'
+        "        if ft not in result_dict:\n"
+        "            continue\n"
+        '        if source == "semantic":\n'
+        "            if len(semantic_candidates[ft]) < semantic_candidate_limit:\n"
+        "                semantic_candidates[ft].append(RetrievalResult.from_db_row(row))\n"
+        "        else:\n"
+        "            result_dict[ft].bm25.append(RetrievalResult.from_db_row(row))\n"
+        "\n"
+        "    for ft, candidates in semantic_candidates.items():\n"
+        "        result_dict[ft].semantic.extend(candidates[:limit])\n"
+        "        if graph_seed_threshold is not None:\n"
+        "            result_dict[ft].graph_seeds = [\n"
+        "                candidate\n"
+        "                for candidate in candidates\n"
+        "                if candidate.similarity is not None and candidate.similarity >= graph_seed_threshold\n"
+        "            ][:GRAPH_SEED_LIMIT]\n"
+        "\n"
+        "    return result_dict\n",
+    ),
+    (
+        "combined-retrieval call site",
+        "            min_keyword=min_keyword,\n"
+        "        )\n"
+        "        semantic_bm25_time = time.time() - semantic_bm25_start\n",
+
+        "            min_keyword=min_keyword,\n"
+        "            # switchroom carry of upstream #2968: opt this query in to also\n"
+        "            # producing the graph arm's entry points. v0.8.5 has no\n"
+        "            # config.graph_seed_min_similarity, so the mirrored constant is passed.\n"
+        "            graph_seed_min_similarity=GRAPH_SEED_MIN_SIMILARITY,\n"
+        "        )\n"
+        "        semantic_bm25_time = time.time() - semantic_bm25_start\n",
+    ),
+    (
+        "graph retriever call site",
+        "            created_after=created_after,\n"
+        "            created_before=created_before,\n"
+        "        )\n"
+        "        return ft, results, time.time() - graph_start, graph_timing\n",
+
+        "            created_after=created_after,\n"
+        "            created_before=created_before,\n"
+        "            # switchroom carry of upstream #2968: None here means the shared pool\n"
+        "            # could not be proven to cover this arm's floor, and the retriever\n"
+        "            # falls back to its own dedicated ANN seed query.\n"
+        "            preselected_semantic_seeds=semantic_bm25_results[ft].graph_seeds,\n"
+        "        )\n"
+        "        return ft, results, time.time() - graph_start, graph_timing\n",
+    ),
+    (
+        "per-fact-type unpack",
+        "        semantic_results, bm25_results = semantic_bm25_results.get(ft, ([], []))\n",
+        "        semantic_results = semantic_bm25_results[ft].semantic\n"
+        "        bm25_results = semantic_bm25_results[ft].bm25\n",
+    ),
+])
+
+
+# ---- 4. consolidator.py: the other caller of the combined query -------------
+cons = apply("engine/consolidation/consolidator.py", [
+    (
+        "dedup probe unpack",
+        '    results = grouped.get("observation", ([], []))[0]\n',
+        "    # switchroom carry of upstream #2968: the combined query now returns a\n"
+        "    # SemanticBm25Result per requested fact type (always populated, so the\n"
+        "    # .get() default is dead). This caller passes no graph_seed_min_similarity,\n"
+        "    # so .graph_seeds is None and no extra work is done on its behalf.\n"
+        '    results = grouped["observation"].semantic\n',
+    ),
+])
+
+
+# ---- 5. ops_postgresql.py: index-served UUID lookup -------------------------
+# `id::text = ANY($1)` casts the INDEXED column and forces a sequential scan.
+# Filtering non-canonical inputs out BEFORE casting them to uuid preserves the
+# old predicate's tolerance (malformed / uppercase / braced / unhyphenated ids
+# matched nothing then and match nothing now) while letting pk_memory_units
+# serve the lookup. NOT an f-string here: the `{{8}}` braces are literal and
+# must survive into the module's own f-string quantifiers unchanged.
+ops = apply("engine/db/ops_postgresql.py", [
+    (
+        "fetch_unit_dates predicate",
+        "        return await conn.fetch(\n"
+        '            f"""\n'
+        "            SELECT id, event_date, fact_type\n"
+        "            FROM {mu_table}\n"
+        "            WHERE id::text = ANY($1)\n"
+        '            """,\n'
+        "            unit_ids,\n"
+        "        )\n",
+
+        "        # switchroom carry of upstream #2968: cast only canonical UUID text\n"
+        "        # inputs, never the indexed column. The old ``id::text`` predicate\n"
+        "        # silently ignored malformed, uppercase, braced, and unhyphenated\n"
+        "        # inputs; filtering before the cast preserves that behavior while\n"
+        "        # allowing the primary-key index to serve the lookup.\n"
+        "        return await conn.fetch(\n"
+        '            f"""\n'
+        "            SELECT id, event_date, fact_type\n"
+        "            FROM {mu_table}\n"
+        "            WHERE id = ANY(\n"
+        "                ARRAY(\n"
+        "                    SELECT input.unit_id::uuid\n"
+        "                    FROM unnest($1::text[]) AS input(unit_id)\n"
+        "                    WHERE input.unit_id ~ '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'\n"
+        "                )\n"
+        "            )\n"
+        '            """,\n'
+        "            unit_ids,\n"
+        "        )\n",
+    ),
+])
+
+
+# ---- verification ----------------------------------------------------------
+# Post-replace re-assertions. These are the ones that would catch a patch that
+# applied but landed inert, which the anchor counts above cannot.
+assert "GRAPH_SEED_LIMIT = 20" in le and "GRAPH_SEED_MIN_SIMILARITY = 0.3" in le, (
+    f"{TAG}: the mirrored seed constants are missing from link_expansion_retrieval.py"
+)
+assert "if preselected_semantic_seeds is None:" in le, (
+    f"{TAG}: LinkExpansionRetriever.retrieve does not branch on preselected seeds — "
+    "the dedicated ANN seed query is still unconditional"
+)
+assert "                all_seeds = preselected_semantic_seeds" in le, (
+    f"{TAG}: the preselected-seed branch does not actually use the caller's seeds"
+)
+assert le.count("await _find_semantic_seeds(") == 1, (
+    f"{TAG}: expected exactly one remaining _find_semantic_seeds call site (the fallback)"
+)
+assert "preselected_semantic_seeds: list[RetrievalResult] | None = None," in gr, (
+    f"{TAG}: the abstract GraphRetriever.retrieve signature does not accept preselected "
+    "seeds — a non-LinkExpansion retriever would TypeError at the call site"
+)
+assert "class SemanticBm25Result:" in rt, (
+    f"{TAG}: SemanticBm25Result is missing from search/retrieval.py"
+)
+assert "GRAPH_SEED_MIN_SIMILARITY," in rt, (
+    f"{TAG}: search/retrieval.py does not import the mirrored seed floor"
+)
+assert "graph_seed_min_similarity=GRAPH_SEED_MIN_SIMILARITY," in rt, (
+    f"{TAG}: retrieve_all_fact_types_parallel never opts the combined query in to "
+    "producing graph seeds — the patch would apply and do nothing"
+)
+assert "preselected_semantic_seeds=semantic_bm25_results[ft].graph_seeds," in rt, (
+    f"{TAG}: the graph retriever call site does not forward the derived seeds — "
+    "the duplicate ANN scan is still reachable"
+)
+# The GUARD, not just the derivation. Hard-coding graph_seed_threshold to a
+# non-None value would keep every other assertion here green while silently
+# narrowing the seed set whenever a caller passes min_scores.semantic > 0.3.
+assert (
+    "        if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity\n"
+) in rt, (
+    f"{TAG}: the seed-reuse guard no longer requires the semantic floor to be no "
+    "stricter than the graph floor — a per-request min_scores.semantic above 0.3 "
+    "would silently narrow the graph seed set"
+)
+# The trim must not be able to cut a seed out of the pool it feeds.
+assert (
+    "    semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)\n"
+) in rt, (
+    f"{TAG}: the semantic candidate limit no longer widens to GRAPH_SEED_LIMIT — a "
+    "thinking_budget below 20 would trim rows the dedicated seed query would have returned"
+)
+assert "result_dict[ft][0].append" not in rt and "result_dict[ft][1].append" not in rt, (
+    f"{TAG}: a tuple-shaped result_dict write survives in search/retrieval.py"
+)
+assert "semantic_bm25_results.get(ft, ([], []))" not in rt, (
+    f"{TAG}: a tuple-shaped unpack survives in retrieve_all_fact_types_parallel"
+)
+assert 'grouped.get("observation", ([], []))[0]' not in cons, (
+    f"{TAG}: the consolidation dedup probe still unpacks the old tuple shape — it would "
+    "raise AttributeError on every dedup adjudication"
+)
+assert "id::text = ANY($1)" not in ops, (
+    f"{TAG}: fetch_unit_dates still casts the indexed id column to text — the sequential "
+    "scan is still there"
+)
+assert "SELECT input.unit_id::uuid" in ops, (
+    f"{TAG}: the canonical-UUID pre-filter is missing from fetch_unit_dates"
+)
+# Every OTHER caller of the combined query must have been migrated: a missed one
+# is an AttributeError on a live recall path, not a build failure.
+_stale = []
+for _p in BASE.rglob("*.py"):
+    _t = _p.read_text()
+    if "retrieve_semantic_bm25_combined" not in _t:
+        continue
+    if "([], [])" in _t:
+        _stale.append(str(_p.relative_to(BASE)))
+assert not _stale, (
+    f"{TAG}: {_stale} still reference the old (semantic, bm25) tuple shape of "
+    "retrieve_semantic_bm25_combined — migrate them or the call raises at runtime"
+)
+print(
+    "switchroom hindsight graph-seed-reuse carry (upstream #2968): graph seeds now derive "
+    "from the shared semantic/BM25 over-fetch pool (falling back to the dedicated ANN query "
+    "whenever min_scores.semantic > 0.3), and fetch_unit_dates is served by pk_memory_units "
+    "instead of a sequential scan"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

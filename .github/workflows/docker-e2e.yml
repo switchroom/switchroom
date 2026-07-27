@@ -125,6 +125,7 @@ jobs:
               - 'tests/docker/hindsight-search-patches.test.ts'
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
+              - 'tests/docker/hindsight-graph-seed-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -341,10 +342,27 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-retry-perturbation-patches.test.ts
 
+      - name: Run the hindsight graph-seed-reuse probe (RED/GREEN, must not skip)
+        # Same contract again, for the TEMPORARY upstream #2968 carry (merge
+        # b475f5cc, landed on upstream main after v0.8.5 was cut). Delete this
+        # step together with the Dockerfile block and the test file when the
+        # base image reaches v0.8.6.
+        #
+        # The bakes test cannot cover the failure that matters here: a carry
+        # that applies but hard-codes graph_seed_threshold keeps every grepped
+        # literal in place while silently NARROWING the graph seed set on any
+        # recall with min_scores.semantic > 0.3. Only running the patched
+        # modules and comparing derived seed ids against the dedicated query's
+        # catches it (measured 2026-07-27 — that mutation, and dropping the
+        # candidate-limit widening, each go red here and nowhere else).
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-graph-seed-patch.test.ts
+
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

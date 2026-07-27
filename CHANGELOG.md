@@ -298,6 +298,57 @@ host with CI green.
 Deliberately not done: `recallMaxMemories` was already declarative and is
 untouched.
 
+### Recall stops issuing a duplicate ANN scan per fact type (temporary carry of upstream hindsight #2968)
+
+Every recall ran the same vector scan twice per fact type. Step 2
+(`retrieve_semantic_bm25_combined`) over-fetches semantic candidates for HNSW
+recall; Step 3 then handed the graph retriever no seeds, so
+`LinkExpansionRetriever.retrieve` issued its own
+`ORDER BY embedding <=> $1::vector` — once per fact type, serialized behind the
+connection block Step 2 had just closed. Separately, `fetch_unit_dates` compared
+`id::text = ANY($1)`, casting the indexed primary key and forcing a sequential
+scan.
+
+Upstream fixed both in `vectorize-io/hindsight` PR #2968 (merge `b475f5cc`,
+2026-07-27), citing 302,602 calls / 2,072s of accumulated load for the redundant
+seed query and 120.049ms → 0.240ms median for the id lookup once
+`pk_memory_units` served it. That merge landed **after** v0.8.5 was cut, and
+v0.8.5 is upstream's tip release, so there is nothing to upgrade to.
+`docker/Dockerfile.hindsight` therefore carries the diff as a build-time patch,
+using the same self-verifying mechanism as the existing patches.
+
+**This block is temporary and its removal condition is written into it: delete
+it — with `tests/docker/hindsight-graph-seed-patch.test.ts` and the matching CI
+step — the moment the pinned base reaches upstream v0.8.6.**
+
+Reuse is not unconditional, and that is the whole safety argument. The shared
+pool is only reused when the semantic arm's SQL floor is *no stricter* than the
+graph seed floor; a per-request `min_scores.semantic` above 0.3 makes the pool
+narrower than the dedicated query's result, so the retriever falls back to its
+own query rather than silently returning fewer graph entry points. A quieter
+recall is worse than a slower one.
+
+switchroom shipped its own version of this optimisation and retired it when
+0.8.5 deliberately deleted the parameter it depended on. This is not a
+re-litigation of that: #2968 is upstream reversing its own stance one day later
+and adding the correctness guard the retired patch had to invent for itself. The
+negative guard that keeps the switchroom-authored form dead still stands,
+retargeted to that form's own markers.
+
+One deliberate divergence from upstream's diff: upstream reads the seed floor
+from `config.graph_seed_min_similarity`, a key v0.8.5 does not have (it hardcodes
+`limit=20, threshold=0.3`). The carry mirrors those literals as named constants
+and **asserts the config key is still absent**, so a future base that introduces
+it fails the build instead of quietly ignoring an operator's setting.
+
+Not carried: upstream PR #2502 (`stop emitting unsupported maxItems`). It fixes
+AWS Bedrock Converse rejecting `maxItems` in a structured-output schema. Measured
+against the backend this fleet actually uses (Ollama behind the LiteLLM proxy),
+a consolidation-shaped `json_schema` request with `maxItems` of none / 5 / 100 /
+1000 returned HTTP 200 every time with no latency trend (0.386–0.520s across 12
+calls). `maxItems` is neither rejected nor expensive here, so carrying the patch
+would add a maintenance obligation for no effect.
+
 ### `switchroom doctor` detects banks with no per-bank vector index
 
 Hindsight creates one PARTIAL vector index per (bank, fact_type) — and creates
