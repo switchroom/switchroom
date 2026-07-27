@@ -2105,7 +2105,7 @@ export const HindsightConfigSchema = z.object({
       "src/setup/hindsight-perf-defaults.ts: RERANKER_LOCAL_FP16, " +
       "RERANKER_LOCAL_BATCH_SIZE, LLM_MAX_CONCURRENT, " +
       "RETAIN/CONSOLIDATION_LLM_MAX_CONCURRENT, LLM_STRICT_SCHEMA, " +
-      "LLM_MAX_RETRIES, " +
+      "LLM_MAX_RETRIES, CONSOLIDATION_LLM_PARALLELISM, " +
       "RECALL_MAX_CANDIDATES_PER_SOURCE, LINK_EXPANSION_PER_ENTITY_LIMIT, " +
       "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT), the override-only keys " +
       "switchroom manages but ships NO default for " +

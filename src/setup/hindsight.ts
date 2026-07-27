@@ -813,7 +813,10 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE =
   HINDSIGHT_CONSOLIDATION_BATCH_SIZE_CEILING;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
+// Re-exported, not defined here: the value now lives in hindsight-perf-defaults
+// so it is a MANAGED key an operator can override via `hindsight.env`. The
+// re-export keeps the existing import sites (and their tests) working.
+export { HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM } from "./hindsight-perf-defaults.js";
 
 /**
  * Per-round memory scope for one consolidation op (upstream default 1000;
@@ -1652,11 +1655,14 @@ export function startHindsight(
     // knobs with confusingly similar upstream names; see the constants above.
     // LLM_PARALLELISM stays at 2 so the subscription-path ceiling (MAX_SLOTS ×
     // LLM_PARALLELISM = 2 concurrent model calls, #2894) is unchanged for any
-    // operator still on `provider: claude-code`. (BATCH_SIZE is emitted above,
-    // by the context budget — a window decision, not a concurrency one.)
+    // operator still on `provider: claude-code`. It is emitted by the managed
+    // perf-defaults block below rather than pinned here, so an operator can
+    // raise it through `hindsight.env` — the ceiling is a DEFAULT, not a law,
+    // and a local backend with more slots should be able to say so.
+    // (BATCH_SIZE is emitted above, by the context budget — a window decision,
+    // not a concurrency one.)
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT=${HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT}`,
-    "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
     // Stable worker identity (see HINDSIGHT_DEFAULT_WORKER_ID). Must be on
     // the docker-run path — the entrypoint only fills the var with `:=` when
@@ -2216,11 +2222,12 @@ export function generateHindsightComposeSnippet(
     ...hindsightLlmBudgetEnv(llm).map(([k, v]) => `      - ${k}=${v}`),
     // Consolidation scheduling — compose twin of the docker-run block. Every
     // var here MUST also appear on that path (reserved floor, per-type
-    // ceiling, tag-group parallelism, per-round scope); a var on one path only
-    // is exactly the drift a `switchroom apply` silently drops.
+    // ceiling, per-round scope); a var on one path only is exactly the drift a
+    // `switchroom apply` silently drops. Tag-group parallelism moved to the
+    // managed perf-defaults block below, which is emitted on BOTH paths from
+    // the same resolver, so the twin property still holds for it.
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT=${HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT}`,
-    `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     `      - HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
     `      - HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
     // Capability-gated performance defaults — the compose twin of the
