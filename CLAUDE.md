@@ -424,7 +424,10 @@ fragment. It binds work on THIS repo too — the five parts, condensed:
    behavior; tests assert outcomes, not just code paths.
 5. **Communicate.** Consolidated messages, always-visible progress, no
    foreground watches over 30s (background + notification), max 15 parallel
-   sub-agents.
+   sub-agents — enforced, not merely advised: `start.sh` /
+   `cron-session.sh` export `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=15`
+   (below the CLI's own default of 20). Change that export and the
+   dev-protocol prose together.
 
 ## Docker test discipline (HARD RULES)
 

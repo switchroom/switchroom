@@ -74,6 +74,12 @@ export CLAUDE_CONFIG_DIR="$CRON_CONFIG_DIR"
 # (honouring any value already in the env). See start.sh.hbs for rationale.
 export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="${CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH:-2}"
 
+# Pin sub-agent fan-out width below the CLI's own default of 20 — the
+# deterministic half of the dev-protocol's "max 15 parallel sub-agents".
+# Normally inherited from start.sh's env; set here as a belt-and-braces default
+# (honouring any value already in the env). See start.sh.hbs for rationale.
+export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS="${CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS:-15}"
+
 # Defer the (now full) MCP schema set via tool-search so the cron session keeps
 # its low-context cost — the heavy servers load on demand; switchroom-telegram
 # + hindsight stay alwaysLoad. Normally inherited from start.sh's env; set here
