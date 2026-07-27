@@ -134,6 +134,64 @@ container's `mem_limit` cgroup, so an agent that raises `tmp_size` *and*
 intends to fill it should raise `resources.memory` alongside. Agents pick the
 new size up when their container is recreated; a running container keeps the
 mount it booted with.
+### The hindsight MCP contract is re-pinned to the 0.8.5 surface
+
+The golden tools/list snapshot had not been refreshed since 2026-06-07. It
+recorded **29** tools; the server has advertised **32** since at least 0.8.4.
+The three it never learned about are `update_memory`, `invalidate_memory` and
+`clear_mental_model` — which is to say, precisely the memory-curation tools
+`switchroom memory demote` and `switchroom vault-sweep` reach for.
+
+The snapshot is not decorative. Two things read it:
+
+- `src/cli/hindsight-mcp-shim.ts`'s `FALLBACK_TOOL_TABLE` is the manifest an
+  agent's `tools/list` returns when hindsight has never been reachable in that
+  session. A tool missing from it is a tool the agent cannot see, and from
+  inside the session that is indistinguishable from an upstream removal — the
+  exact failure the shim exists to prevent.
+- `switchroom doctor`'s live contract check diffs the server against
+  `EXPECTED_HINDSIGHT_TOOLS`, which likewise did not track either curation
+  tool, so neither was ever validated.
+
+The snapshot is now regenerated from a live `tools/list` capture, forward-
+patched with the three additive schema changes verified by diffing the
+`hindsight-api-slim` 0.8.4 and 0.8.5 wheels: `create_mental_model` gains
+`tags_match`, `list_memories` gains `tags` and `tags_match`. 0.8.5 adds no MCP
+tools and removes none. `recall`'s `min_scores` / `prefer_observations` and
+`reflect`'s `include_based_on` / `include_trace` — present on the server, absent
+from the fallback — are picked up too.
+
+Keeping the two in step is now mechanical rather than aspirational:
+`tests/memory.hindsight-contract.fixture.test.ts` asserts the fallback table's
+tool set, `required` sets and `props` sets are equal to the snapshot's. The old
+arrangement was a comment asking the next person to remember.
+
+### `update_memory` was never a phantom tool — and `memory demote` still cannot work
+
+The 2026-06-07 audit recorded `update_memory` as a phantom (no such tool), and
+`switchroom memory demote` was left failing on that basis. The diagnosis was
+wrong: `update_memory` is real and unconditionally registered. The audit was
+reading the stale 29-tool snapshot.
+
+The real gap is narrower and does not close on its own. `update_memory` accepts
+`text` / `context` / `occurred_start` / `occurred_end` / `fact_type` /
+`entities` — there is no `tags`, no `add_tags`, and the REST equivalent
+(`PATCH /v1/default/banks/{bank_id}/memories/{memory_id}`) takes the same field
+set. Hindsight 0.8.5 has **no tag-write path for an existing memory** at all;
+tags can only be attached at retain time. So `memory demote` cannot succeed
+until upstream grows one — and `docs/configuration.md` was meanwhile telling
+operators to call `update_memory(tags=[…])`, which never worked.
+
+Corrected: the doc now shows the two things that *do* work (tag at retain time,
+or retire the memory with `invalidate_memory` — reversible, but stronger, since
+it hides the memory from reflect and manual recall too), the CLI's failure
+message names the actual cause instead of blaming the operator's deployment,
+and the mis-diagnosis is corrected at each callsite comment that repeated it.
+
+The exemption is self-invalidating rather than a comment: the callsite is
+recorded with `knownUnsupportedArgs: ["add_tags"]`, and the fixture test asserts
+`add_tags` is still *absent* from the server's schema. The day upstream adds it,
+the test goes red and names the feature waiting to be un-broken.
 
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 

@@ -326,14 +326,26 @@ All four apply at **both** scaffold (fresh agents) and reconcile (`switchroom ap
 
 ### Demoting individual memories from auto-recall
 
-If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.
+A memory tagged `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work — is skipped by the auto-recall block while staying in the bank, so `mcp__hindsight__reflect` and manual recall can still find it. The filter runs before the `max_memories` cap, so demoting a noisy memory doesn't waste a slot.
+
+> **⚠️ Hindsight 0.8.5 cannot apply this tag to a memory that already exists.** The tag has to be present at **retain time**. `mcp__hindsight__update_memory` accepts only `text` / `context` / `occurred_start` / `occurred_end` / `fact_type` / `entities` — there is no `tags` or `add_tags` argument, and the REST equivalent (`PATCH /v1/default/banks/{bank_id}/memories/{memory_id}`) takes the same field set. There is no tag-write path anywhere on the 0.8.5 surface. Consequently `switchroom memory demote <agent> <memory-id>` fails — loudly, since it inspects the MCP `isError` envelope rather than the HTTP status — and cannot succeed until upstream adds one. Earlier revisions of this page showed an `update_memory(tags=[…])` call; that call never worked.
+
+To demote at write time, pass the tag on the retain:
+
+```
+mcp__hindsight__retain(content="…", tags=["[demote-from-recall]"])
+```
+
+To stop an *existing* memory surfacing today, retire it instead:
 
 ```
 # inside an agent, against its own bank
-mcp__hindsight__update_memory(memory_id="abc-123", tags=["[demote-from-recall]"])
+mcp__hindsight__invalidate_memory(memory_id="abc-123", reason="over-broad, noisy in recall")
+# reversible:
+mcp__hindsight__invalidate_memory(memory_id="abc-123", restore=true)
 ```
 
-The filter runs before the `max_memories` cap, so demoting a noisy memory doesn't waste a slot.
+Note this is *stronger* than a demote: an invalidated memory is excluded from recall, reflect, consolidation and graph maintenance (kept for audit, and reversible), whereas a demote only hides it from the automatic recall block.
 
 ### Inspecting auto-recall in production — `switchroom memory recall-log`
 

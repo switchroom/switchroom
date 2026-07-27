@@ -886,9 +886,18 @@ export async function ensureMentalModel(
           // guards that). Optional knobs (trigger_refresh_after_consolidation,
           // max_tokens) are added by the caller in `createArguments` only when
           // set. Do NOT add `types` — it is not in create_mental_model's schema
-          // (props: name, source_query, mental_model_id, tags, max_tokens,
-          // trigger_refresh_after_consolidation, bank_id); the server silently
-          // drops it and it reds memory.hindsight-contract.fixture.
+          // (props on 0.8.5: name, source_query, mental_model_id, tags,
+          // tags_match, max_tokens, trigger_refresh_after_consolidation,
+          // bank_id); the server silently drops it and it reds
+          // memory.hindsight-contract.fixture.
+          //
+          // `tags_match` (new in 0.8.5) only matters for a TAGGED model, and
+          // switchroom never passes `tags` here — declared models in
+          // `memory.mental_models[]` have no tags field. If that ever changes,
+          // note the upstream default: a tagged model with no explicit
+          // tags_match resolves to `all_strict`, i.e. a memory must carry EVERY
+          // one of the model's tags to be included. Pass "any" unless you mean
+          // that.
           arguments: createArguments,
         },
       }),
@@ -1406,16 +1415,25 @@ export async function addMemoryTag(
 
     // Step 2: call update_memory with `add_tags` to append the tag.
     //
-    // HONEST-FAILURE note (2026-06-07 audit): the live hindsight server has NO
-    // `update_memory` tool — it returns HTTP 200 with an MCP error envelope
-    // `{result:{isError:true, content:[{text:"Unknown tool: 'update_memory'"}]}}`.
-    // The prior code only checked `toolResponse.ok` (the HTTP status), so it
-    // returned `{ok:true}` and `switchroom memory demote` reported success while
-    // tagging nothing. We now inspect `result.isError` so the call fails
-    // honestly here AND stays forward-compatible: if a future hindsight build
-    // adds `update_memory`/`add_tags` it just works. (There is no single-memory
-    // tag path on the current MCP or REST surface; restoring demote needs a
-    // document-granularity rework — tracked separately.)
+    // HONEST-FAILURE note, CORRECTED 2026-07-27 against hindsight 0.8.5:
+    //
+    // The 2026-06-07 audit recorded `update_memory` as a phantom tool. That was
+    // wrong — it is a real, unconditionally-registered MCP tool (and has been
+    // since at least 0.8.4; the audit's snapshot was just stale). What is
+    // actually missing is the ARG: `update_memory` accepts only
+    // text / context / occurred_start / occurred_end / fact_type / entities
+    // (plus bank_id / memory_id). There is no `add_tags`, no `tags`, and the
+    // REST equivalent `PATCH /v1/default/banks/{bank}/memories/{id}` takes the
+    // same field set — so 0.8.5 has NO tag-write path for an existing memory.
+    // Tags can only be attached at retain time.
+    //
+    // The call therefore still cannot succeed, but it fails LOUDLY rather than
+    // silently: the server rejects the unknown argument and the `result.isError`
+    // inspection below surfaces it (the prior code checked only
+    // `toolResponse.ok`, so `switchroom memory demote` reported success while
+    // tagging nothing). The shape stays forward-compatible — the day upstream
+    // grows a tag-write arg this just works, and the `knownUnsupportedArgs`
+    // entry in src/memory/hindsight-tools.ts reds the fixture test to say so.
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
     const toolResponse = await fetchImpl(`${apiUrl}`, {
       method: "POST",

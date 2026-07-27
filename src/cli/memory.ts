@@ -923,9 +923,18 @@ export function registerMemoryCommand(program: Command): void {
           );
           console.error(
             chalk.gray(
-              "  The Hindsight MCP `update_memory` tool may not be exposed by your deployment, or the memory ID may be wrong. Try `switchroom memory recall-log " +
+              "  Hindsight 0.8.5 has no tag-write path for an existing memory: the\n" +
+                "  `update_memory` MCP tool (and the equivalent REST PATCH) accepts only\n" +
+                "  text / context / occurred_start / occurred_end / fact_type / entities —\n" +
+                "  there is no `add_tags` or `tags`. Tags can only be attached at retain\n" +
+                "  time, so this verb cannot succeed until upstream grows one.\n" +
+                "  To stop a memory surfacing right now, retire it instead:\n" +
+                "  `mcp__hindsight__invalidate_memory(memory_id=…, reason=…)` — reversible\n" +
+                "  via `restore: true`, but it also hides the memory from reflect and\n" +
+                "  manual recall, not just auto-recall.\n" +
+                "  If the ID itself is suspect: `switchroom memory recall-log " +
                 agent +
-                " --json` to confirm the ID surfaced recently.",
+                " --json`.",
             ),
           );
           process.exit(1);

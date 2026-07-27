@@ -26,6 +26,7 @@ import {
   HINDSIGHT_PROMPT_TOOLS,
   HINDSIGHT_HOOK_TOOLS,
 } from "../src/memory/hindsight-tools.js";
+import { FALLBACK_TOOL_TABLE } from "../src/cli/hindsight-mcp-shim.js";
 
 interface Snapshot {
   tools: Record<string, { required: string[]; props: string[] }>;
@@ -34,9 +35,12 @@ const snapshot = JSON.parse(
   readFileSync(resolve(__dirname, "fixtures", "hindsight-tools-list.snapshot.json"), "utf-8"),
 ) as Snapshot;
 
+/** Tool count on the hindsight surface switchroom targets (0.8.5). */
+const HINDSIGHT_TOOL_COUNT = 32;
+
 describe("hindsight contract — golden snapshot integrity", () => {
-  it("the snapshot captures all 29 server tools", () => {
-    expect(Object.keys(snapshot.tools).length).toBe(29);
+  it(`the snapshot captures all ${HINDSIGHT_TOOL_COUNT} server tools`, () => {
+    expect(Object.keys(snapshot.tools).length).toBe(HINDSIGHT_TOOL_COUNT);
   });
 
   it("EXPECTED_HINDSIGHT_TOOLS agrees with the captured server truth (required-args, no const/snapshot drift)", () => {
@@ -53,6 +57,41 @@ describe("hindsight contract — golden snapshot integrity", () => {
   });
 });
 
+/**
+ * The shim's first-boot fallback manifest is what an agent's tools/list returns
+ * when hindsight has never been reachable in that session. If it drifts below
+ * the real surface, the affected tools are INVISIBLE to the agent and the
+ * symptom is indistinguishable from an upstream removal.
+ *
+ * That is not hypothetical: the table shipped 29 tools against a 32-tool server
+ * for weeks, hiding `update_memory`, `invalidate_memory` and
+ * `clear_mental_model` — the tools `switchroom memory demote` and vault-sweep
+ * reach for — plus six accepted props. Byte-equality with the snapshot is the
+ * deterministic fix; a comment saying "keep these in sync" is not.
+ */
+describe("hindsight contract — the shim fallback manifest mirrors the snapshot", () => {
+  it("advertises exactly the snapshot's tool set (no missing tool, no phantom)", () => {
+    expect(Object.keys(FALLBACK_TOOL_TABLE).sort()).toEqual(
+      Object.keys(snapshot.tools).sort(),
+    );
+  });
+
+  for (const tool of Object.keys(snapshot.tools).sort()) {
+    it(`${tool}: fallback required+props match the snapshot exactly`, () => {
+      const [required, props] = FALLBACK_TOOL_TABLE[tool];
+      expect(
+        [...required].sort(),
+        `fallback '${tool}' required-args drifted from the snapshot`,
+      ).toEqual([...snapshot.tools[tool].required].sort());
+      expect(
+        [...props].sort(),
+        `fallback '${tool}' accepted props drifted from the snapshot — a prop ` +
+          `missing here is a capability the agent cannot see on first boot`,
+      ).toEqual([...snapshot.tools[tool].props].sort());
+    });
+  }
+});
+
 describe("hindsight contract — every TS callsite satisfies the tool schema", () => {
   for (const cs of HINDSIGHT_TS_CALLSITES) {
     it(`${cs.where} → ${cs.tool}(${cs.argKeys.join(",")}) is contract-valid`, () => {
@@ -66,14 +105,33 @@ describe("hindsight contract — every TS callsite satisfies the tool schema", (
           `${cs.where} omits required arg '${req}' of '${cs.tool}' → the call silently no-ops`,
         ).toContain(req);
       }
-      // (c) NO arg sent that the server doesn't accept (silently dropped).
+      // (c) NO arg sent that the server doesn't accept (silently dropped),
+      //     except args explicitly declared unsupported — those are asserted
+      //     separately below so the exemption self-invalidates.
+      const exempt = new Set(cs.knownUnsupportedArgs ?? []);
       for (const sent of cs.argKeys) {
+        if (exempt.has(sent)) continue;
         expect(
           real.props,
           `${cs.where} sends '${sent}' which '${cs.tool}' does NOT accept → SILENTLY DROPPED (isError can't catch this)`,
         ).toContain(sent);
       }
     });
+
+    if (cs.knownUnsupportedArgs?.length) {
+      it(`${cs.where} → ${cs.tool}: declared-unsupported args are still unsupported upstream`, () => {
+        const real = snapshot.tools[cs.tool];
+        expect(real).toBeDefined();
+        for (const arg of cs.knownUnsupportedArgs!) {
+          expect(
+            real.props,
+            `'${arg}' is now an accepted prop of '${cs.tool}' — the upstream gap ` +
+              `that broke ${cs.where} has CLOSED. Drop the knownUnsupportedArgs ` +
+              `exemption and un-break the feature it was blocking.`,
+          ).not.toContain(arg);
+        }
+      });
+    }
   }
 });
 
