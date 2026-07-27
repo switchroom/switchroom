@@ -76,6 +76,61 @@ throws if that anchor moves.
 Deliberately not done: `recallMaxMemories` and `recallMinOverlap` were already
 declarative and are untouched.
 
+### `hindsight.env` can reach every perf knob, and a key it can't reach now fails loudly
+
+Eight Hindsight tuning knobs were emitted unconditionally on both launch paths
+— the `docker run` argv and the compose snippet — from bare constants compiled
+into the CLI bundle, and were absent from `HINDSIGHT_PERF_ENV_KEYS`:
+
+    HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
+    HINDSIGHT_API_RERANKER_MAX_CANDIDATES
+    HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT
+    HINDSIGHT_API_RECALL_MAX_CONCURRENT
+    HINDSIGHT_API_REFLECT_WALL_TIMEOUT
+    HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS
+    HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT
+    HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND
+
+`resolveHindsightPerfOverrides` skips any key outside the managed set, so a
+`hindsight.env` line for one of these was discarded with no error and no
+warning. The operator committed a line, read it back in version control, and
+believed they had changed something they had not.
+
+This is the same defect as #3732 and #3745 fixed for
+`CONSOLIDATION_LLM_PARALLELISM` and `MAX_OBSERVATIONS_PER_SCOPE`, and the
+reranker block's own doc comment made it explicit — it named "editing the
+generated compose snippet or the `docker run -e ...` flags" as the recourse,
+i.e. it documented the exact imperative state the next `switchroom apply`
+throws away.
+
+They are also switchroom's *shipped defaults*, not local tuning, so anyone
+reading `switchroom.yaml` to understand why recall behaves as it does could not
+find them. All eight moved into `hindsight-perf-defaults.ts` as members of
+`HINDSIGHT_PERF_DEFAULTS_UNGATED`, with their rationale comments; `hindsight.ts`
+re-exports the names so existing import sites and their tests are untouched.
+Both hard-coded emissions are deleted, and the perf-defaults resolver emits
+them on both paths from one source, so the docker-run/compose twin property now
+holds by construction rather than by two hand-maintained lists.
+
+**Every shipped value is unchanged.** This makes the keys overridable; it does
+not change what switchroom ships. Ungated for the same reason the previous two
+were: the old emission was unconditional, so gating them would silently revert
+hosts to upstream's defaults and remove the rails themselves.
+
+Two durable halves, because enumerating today's gaps does not stop the ninth:
+
+- **A new `switchroom doctor` row, `hindsight env keys`, FAILs** when
+  `hindsight.env` names a key nothing reads — naming the offenders. FAIL rather
+  than WARN because there is no benign reading: the key is either a typo or a
+  knob the operator believes is applied, and both are silent without it. It
+  accepts the pg0 sizing keys too, so correct config does not raise a false
+  alarm.
+- **A guard test asserts the invariant**, not the instance: every
+  `HINDSIGHT_API_*` var emitted from `hindsight.ts` must either be one switchroom
+  derives (port, provider, model, worker identity, MCP statelessness) or flow
+  through the managed resolvers. Hard-pinning a new tuning knob now fails the
+  suite and has to justify itself.
+
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
 ### The per-scope observation cap is an overridable managed key

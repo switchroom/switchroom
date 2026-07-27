@@ -63,7 +63,7 @@ Route implementation work to cheaper models via sub-agents:
 
 ```yaml
 defaults:
-  model: claude-opus-4-8
+  model: opus
   subagents:
     worker:
       model: sonnet

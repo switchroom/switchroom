@@ -16,7 +16,7 @@ import yaml
 EVALS_DIR = Path(__file__).parent
 RESULTS_DIR = EVALS_DIR / "results"
 SKILLS_DIR = EVALS_DIR.parent / "skills"
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 # Skills exposed to the trigger router. Descriptions are loaded from each
 # SKILL.md frontmatter at runtime so the eval stays in sync with the real
