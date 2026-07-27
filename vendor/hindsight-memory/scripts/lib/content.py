@@ -301,34 +301,87 @@ def strip_query_scaffolding(text: str) -> str:
     return _ROLE_LABEL_RE.sub("", text)
 
 
+_ENGLISH_WORDS_FILE = os.path.join(os.path.dirname(__file__), "english_words.txt")
+_ENGLISH_WORDS_CACHE = None
+
+
+def common_english_words() -> frozenset:
+    """Lazily load the common-English demotion list (see english_words.txt).
+
+    Read once per process and cached. A missing or unreadable file degrades to
+    an empty set — shaping still works, it just loses the demotion signal — so
+    a packaging slip can never break recall on the critical path.
+    """
+    global _ENGLISH_WORDS_CACHE
+    if _ENGLISH_WORDS_CACHE is None:
+        words = set()
+        try:
+            with open(_ENGLISH_WORDS_FILE, encoding="utf-8") as handle:
+                for line in handle:
+                    word = line.strip()
+                    if word and not word.startswith("#"):
+                        words.add(word)
+        except OSError:
+            words = set()
+        _ENGLISH_WORDS_CACHE = frozenset(words)
+    return _ENGLISH_WORDS_CACHE
+
+
+# How much each signal is worth. Digit and compound are equal because both are
+# measured to predict the same thing (an identifier); the English demotion is
+# deliberately smaller than either, so a digit-bearing English word still wins.
+_SCORE_DIGIT = 3.0
+_SCORE_COMPOUND = 3.0
+_SCORE_NOT_COMMON_ENGLISH = 2.0
+# Recency is a WEIGHT, not a tier (#3760 review, Blocker 2). Sized below the
+# shape signals on purpose: a distinctive prior-context identifier (`nginx`,
+# score 2.0) must outrank a generic latest-turn English word (score 0.0 + 1.5),
+# but between two terms of equal merit the one the user just typed wins.
+_SCORE_RECENCY = 1.5
+
+
 def _selectivity_score(token: str) -> float:
     """Deterministic proxy for how discriminating ``token`` is.
 
     True per-token document frequency is not available client-side: Hindsight
     exposes no term-stats endpoint, and one ``count(*)`` probe per token would
-    cost more than the query it is trying to speed up. This proxy stands in for
-    it, ordered by how reliably each signal predicts a LOW df:
+    cost more than the query it is trying to speed up. Every signal below was
+    checked against real df, measured with ``ts_stat`` over the live `overlord`
+    bank (135,565 units) and five other topically-unrelated banks:
 
-      * carries a digit          — versions, issue numbers, ids, dates
-      * is a compound token      — ``v0.19.17``, ``src/agents/scaffold.ts``
-      * longer                   — mildly anti-correlated with df, capped so it
-                                   cannot dominate the two shape signals
+      * carries a digit (+3.0) — versions, issue numbers, ids, dates. The one
+        shape that reliably predicts a low df: median df 0.000, and only 6.8%
+        of digit-bearing tokens exceed 1% of the bank, against 33-50% for every
+        other shape class.
+      * is a compound token (+3.0) — ``v0.19.17``, ``src/agents/scaffold.ts``.
+      * is NOT a common English word (+2.0) — see ``english_words.txt``. df
+        cannot separate contentless English from domain identifiers (both are
+        rare: `particularly` 0.022%, `situation` 0.018%, vs `npm` 1.38%,
+        `worktree` 1.85%), but English-word membership can, and it is exactly
+        the separation the budget needs.
 
-    It is only the TIE-BREAK. Recency (latest turn vs prior context) dominates
-    it in :func:`shape_recall_query`, because the term the user just typed is a
-    better bet than any shape heuristic. What this proxy is really for is
-    choosing WITHIN one turn when that turn alone overflows the budget.
+    LENGTH IS DELIBERATELY ABSENT. The previous revision added
+    ``min(len(token), 12) / 4.0``. Measured median `overlord` df by token
+    length is flat-to-RISING — len2 0.0022, len3 0.0032, len4 0.0042,
+    len5 0.0070, len6 0.0103, len7 0.0102, len9 0.0068, len11 0.0055,
+    len13 0.0093 — so length predicts nothing in either direction. Inverting
+    it would have been as unjustified as the original; it is dropped instead.
+    Case was checked too and also rejected: `Capitalised` tokens have the
+    HIGHEST rate of df > 1% (50.6%), and ALLCAPS the highest mean df (0.034).
 
-    Known limit: it cannot see bank-specific high-df content words (``agent``
-    and ``switchroom`` each match ~20% of the `overlord` bank). Those are the
-    job of the operator-set ``recallQueryStopTerms``.
+    Known limit: bank-specific high-df content words (`agent` and `switchroom`
+    each match ~20% of the `overlord` bank) still score normally. They are not
+    a cost problem — ``max_tokens`` bounds tsquery cost regardless of which
+    terms are chosen — only a slot-allocation one, and they remain the job of
+    the operator-set ``recallQueryStopTerms``.
     """
     score = 0.0
     if any(ch.isdigit() for ch in token):
-        score += 3.0
+        score += _SCORE_DIGIT
     if _COMPOUND_TOKEN_RE.fullmatch(token):
-        score += 3.0
-    score += min(len(token), 12) / 4.0
+        score += _SCORE_COMPOUND
+    if token not in common_english_words():
+        score += _SCORE_NOT_COMMON_ENGLISH
     return score
 
 
@@ -344,17 +397,35 @@ def shape_recall_query(
     the embedding arm still sees the text's natural sequence, just with the
     scaffolding and function words removed).
 
-    Selection is by RECENCY FIRST, selectivity second:
+    Selection is RESERVE-then-FILL, in three parts:
 
-      * terms from ``latest_query`` (the turn the user actually just sent) are
-        always preferred over terms that came only from prior context;
-      * within each tier, terms are ranked by :func:`_selectivity_score`, ties
-        broken by first appearance.
+      1. ``max_tokens // 3`` slots go to the highest-:func:`_selectivity_score`
+         terms in the whole window, recency deliberately excluded from that
+         score. The most discriminating terms present survive regardless of
+         which turn they came from.
+      2. ``max_tokens // 3`` slots go to the best terms of the latest turn, so
+         a prior turn dense in high-merit tokens (a pasted stack trace, a list
+         of ids) cannot cost the user the question they just asked.
+      3. Everything left is filled by ``_selectivity_score`` plus
+         ``_SCORE_RECENCY`` for terms appearing in ``latest_query``, ties broken
+         by first appearance.
 
-    Recency-first matters because the composed query is
-    ``Prior context: <older turns> … <latest>``. A naive character/word
-    truncation keeps whichever turn happens to come FIRST — i.e. it throws away
-    the actual question and keeps the stalest context.
+    Both reserves are CEILINGS, not allocations: a side with fewer terms simply
+    leaves its unused slots to the fill, and a window under ``max_tokens`` terms
+    is unaffected entirely.
+
+    Recency is therefore a WEIGHT, not an absolute tier (#3760 review, Blocker
+    2). It has to be preferred at all, because the composed query is
+    ``Prior context: <older turns> … <latest>`` and a naive truncation keeps
+    whichever turn comes FIRST — i.e. throws away the actual question and keeps
+    the stalest context. But making it absolute silently defeated
+    ``recallContextTurns``: any latest turn with ``>= max_tokens`` surviving
+    terms took EVERY slot, so a conversational follow-up whose subject lives
+    only in the prior turn ("is the thing we were discussing still broken?")
+    produced a query with no subject in it at all. Step 1 is the structural
+    guarantee against that; step 3 is where recency actually decides anything,
+    and in ordinary conversational text — where nearly every candidate scores
+    0.0 on shape — that is most of the budget.
 
     A kept compound token costs its own slot PLUS a slot for each fragment the
     server will shred it into, so the emitted string never expands past
@@ -402,13 +473,55 @@ def shape_recall_query(
         # searches for something.
         candidates = [t for t in first_seen if len(t) > 1] or list(first_seen)
 
-    candidates.sort(
-        key=lambda t: (
-            0 if t in latest_tokens else 1,
-            -_selectivity_score(t),
-            first_seen[t],
+    def weight(token):
+        score = _selectivity_score(token)
+        if token in latest_tokens:
+            score += _SCORE_RECENCY
+        return score
+
+    # MERIT RESERVE, then RECENCY FILL.
+    #
+    # `max_tokens // 3` slots are reserved for the highest-merit terms in the
+    # WHOLE window, scored with recency deliberately excluded, so the most
+    # discriminating terms present cannot be displaced by sheer latest-turn
+    # volume no matter which turn they came from. That is the Blocker 2
+    # guarantee, and it is structural: a conversational follow-up whose subject
+    # lives only in the prior turn ("is the thing we were discussing still
+    # broken?") keeps its subject.
+    #
+    # The remaining two thirds are filled by the recency-WEIGHTED score, which
+    # is where `_SCORE_RECENCY` earns its keep: between terms of equal merit —
+    # and after stopword removal most conversational terms are equal on merit —
+    # the one the user just typed wins, instead of the composed string's leading
+    # (i.e. STALEST) turn winning on `first_seen` alone.
+    #
+    # The reserve is a ceiling, not an allocation: any term it reserves that the
+    # recency fill would have chosen anyway costs nothing, and a window with
+    # fewer than `max_tokens` terms is unaffected entirely.
+    reserve_size = max(1, max_tokens // 3)
+    merit_ordered = sorted(candidates, key=lambda t: (-_selectivity_score(t), first_seen[t]))
+    reserved = merit_ordered[:reserve_size]
+    reserved_set = set(reserved)
+
+    # ...and a mirror-image LATEST-TURN reserve of the same size, because a
+    # merit reserve alone is one-sided. A prior turn dense in high-merit tokens
+    # (a pasted stack trace, a list of ids) outscores an ordinary question on
+    # every slot, which would cost the user the thing they actually just asked.
+    # Same shape as above: a ceiling of `max_tokens // 3`, never an allocation.
+    latest_reserve = [
+        t
+        for t in sorted(
+            (t for t in candidates if t in latest_tokens and t not in reserved_set),
+            key=lambda t: (-weight(t), first_seen[t]),
         )
+    ][:reserve_size]
+    reserved_set.update(latest_reserve)
+
+    filled = sorted(
+        (t for t in candidates if t not in reserved_set),
+        key=lambda t: (-weight(t), first_seen[t]),
     )
+    candidates = reserved + latest_reserve + filled
 
     kept = []
     emitted = set()

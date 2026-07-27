@@ -58,7 +58,12 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import recall  # noqa: E402
-from lib.content import tokenize_for_bm25  # noqa: E402
+from lib.content import (  # noqa: E402
+    BM25_STOPWORDS,
+    _selectivity_score,
+    common_english_words,
+    tokenize_for_bm25,
+)
 
 # A prior turn plus a latest turn, together well past the term budget. Written
 # as real prose because the point is a production-shaped query, not a synthetic
@@ -187,11 +192,209 @@ class WireQueryIsTermCapped(_Harness):
 
     def test_latest_turn_survives_the_cap(self):
         # The cap must not cost the user the question they just asked.
+        #
+        # #3764: this deliberately asserts on ORDINARY English words from the
+        # latest turn, not on `v0.19.24`. A version string carries a digit AND
+        # is a compound, so it scores 6.0 before recency is considered and
+        # survives under every candidate ordering — asserting on it cannot fail
+        # on a recency regression. `recall` / `release` / `notes` score 0.0 on
+        # shape and are outnumbered by prior-context terms, so they are in the
+        # query only because recency is weighted.
         client = _Client()
-        self._run(client, config_extra={"recallQueryMaxTokens": 8})
+        self._run(client, config_extra={"recallQueryMaxTokens": 24})
         terms = self._wire_terms(client)
-        self.assertIn("v0.19.24", terms)
-        self.assertNotIn("orphaned", terms, "stale prior context outranked the question")
+        for word in ("recall", "release", "notes"):
+            self.assertIn(word, terms, f"latest-turn term {word!r} lost to prior context")
+
+
+class RecencyIsAWeightNotATier(_Harness):
+    """#3760 review, Blocker 2. Making recency an ABSOLUTE tier meant any latest
+    turn with >= max_tokens surviving terms took every slot, so a conversational
+    follow-up whose subject lives only in the prior turn produced a query with
+    no subject in it at all — a query about nothing, which BM25-matches a broad
+    near-random slice of the bank and embeds to a near-meaningless vector."""
+
+    # The reviewer's exact reproduction.
+    SUBJECT_PRIOR = (
+        "We were debugging the Coolify deploy for the webkite container and the "
+        "nginx TLS cert."
+    )
+    SUBJECT_LATEST = (
+        "Right, so continuing from where we left off, could you please have another "
+        "careful look and tell me whether the thing we were discussing previously is "
+        "actually still broken, because honestly the whole situation seems rather "
+        "confusing and I would really appreciate a clear explanation of what exactly "
+        "is happening underneath and whether anything changed recently."
+    )
+
+    def _write_transcript(self):
+        path = os.path.join(self._tmpdir, "transcript.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join([
+                _nested_line("user", self.SUBJECT_PRIOR),
+                _nested_line("user", self.SUBJECT_LATEST),
+            ]) + "\n")
+        return path
+
+    def test_subject_from_prior_turn_survives_a_long_latest_turn(self):
+        client = _Client()
+        self._run(client, prompt=self.SUBJECT_LATEST)
+        terms = self._wire_terms(client)
+        # The latest turn alone yields well over 24 content terms, so under the
+        # old absolute tier every one of these was dropped.
+        for word in ("coolify", "webkite", "nginx", "tls"):
+            self.assertIn(word, terms, f"subject term {word!r} was crowded out")
+
+    # A prior turn whose subject is ORDINARY ENGLISH — no identifier, no digit,
+    # no compound. The recency weight alone cannot save it (every term scores
+    # 0.0 against 1.5 for every latest-turn term), so only the reserve can. This
+    # is the general form of Blocker 2: with `recallContextTurns: 2` shipped on,
+    # any latest turn holding >= max_tokens terms took every slot.
+    PLAIN_PRIOR = (
+        "The landlord refused to return the bond after the final inspection and "
+        "the tribunal hearing was adjourned."
+    )
+
+    def test_all_english_prior_turn_is_still_represented(self):
+        path = os.path.join(self._tmpdir, "transcript.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join([
+                _nested_line("user", self.PLAIN_PRIOR),
+                _nested_line("user", self.SUBJECT_LATEST),
+            ]) + "\n")
+        self._write_transcript = lambda: path
+        client = _Client()
+        self._run(client, prompt=self.SUBJECT_LATEST)
+        terms = self._wire_terms(client)
+        prior_terms = set(tokenize_for_bm25(self.PLAIN_PRIOR)) & terms
+        self.assertGreaterEqual(
+            len(prior_terms),
+            24 // 3,
+            f"prior context was starved: only {sorted(prior_terms)} survived",
+        )
+
+    def test_reserve_scales_with_the_cap_and_never_starves_the_latest_turn(self):
+        client = _Client()
+        self._run(client, prompt=self.SUBJECT_LATEST, config_extra={"recallQueryMaxTokens": 24})
+        terms = self._wire_terms(client)
+        prior_terms = set(tokenize_for_bm25(self.SUBJECT_PRIOR)) & terms
+        latest_terms = set(tokenize_for_bm25(self.SUBJECT_LATEST)) & terms
+        # The reserve is a ceiling, not an allocation: prior context is
+        # guaranteed representation but must not take the majority of slots.
+        self.assertGreaterEqual(len(prior_terms), 4)
+        self.assertGreater(len(latest_terms), len(prior_terms))
+
+    # Two turns of ORDINARY English on both sides, the common conversational
+    # case: every candidate scores 0.0 on shape, so neither reserve can decide
+    # anything past its own third and the remaining budget is settled purely by
+    # the recency weight. Drop `_SCORE_RECENCY` and the tie falls back to
+    # `first_seen`, which orders by position in `Prior context: <old> … <new>`
+    # — i.e. the STALEST turn wins the leftover budget and the tail of the
+    # user's actual question is dropped. This is the fill stage, and it is where
+    # recency-as-a-weight (rather than as a tier) does its work.
+    FILL_PRIOR = (
+        "The removalists arrived before the inspection finished so the landlord "
+        "postponed the handover until the following afternoon and the neighbours "
+        "complained about the noise in the stairwell again."
+    )
+    FILL_LATEST = (
+        "Could you summarise whether the tribunal accepted the amended evidence "
+        "bundle and confirm the hearing date they eventually settled on."
+    )
+
+    def test_leftover_budget_goes_to_the_latest_turn_on_equal_merit(self):
+        path = os.path.join(self._tmpdir, "transcript.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join([
+                _nested_line("user", self.FILL_PRIOR),
+                _nested_line("user", self.FILL_LATEST),
+            ]) + "\n")
+        self._write_transcript = lambda: path
+        client = _Client()
+        self._run(client, prompt=self.FILL_LATEST, config_extra={"recallQueryMaxTokens": 24})
+        terms = self._wire_terms(client)
+        latest_terms = {
+            t for t in tokenize_for_bm25(self.FILL_LATEST)
+            if len(t) > 1 and t not in BM25_STOPWORDS
+        }
+        # The latest turn holds more terms than its own reserve (24 // 3 = 8),
+        # so the surplus can only be here because the fill stage preferred it.
+        self.assertGreater(len(latest_terms), 24 // 3)
+        missing = sorted(latest_terms - terms)
+        self.assertEqual(
+            missing, [], f"the latest turn lost the leftover budget to stale context: {missing}"
+        )
+
+
+class SelectivityRewardsIdentifiersNotLongWords(_Harness):
+    """#3760 review, Blocker 1. The previous revision scored `+min(len, 12)/4`,
+    so `understanding` (3.0) and `configuration` (3.0) tied the maximum awarded
+    to a compound or a digit while `pkce` (1.0) and `zod` (0.75) sat near the
+    floor. Measured median `overlord` df by token length is flat-to-rising, so
+    length predicts nothing; English-word membership does."""
+
+    IDENTIFIER_LATEST = (
+        "I have been thinking particularly carefully about this and essentially my "
+        "understanding of the currently shipped configuration documentation basically "
+        "describes something different from the implementation, so probably the "
+        "important information here is that generally, additionally, previously "
+        "mentioned considerations regarding authentication mechanisms suggest we "
+        "should use PKCE rather than something else entirely"
+    )
+
+    def test_short_identifier_beats_long_common_english(self):
+        client = _Client()
+        self._run(
+            client,
+            prompt=self.IDENTIFIER_LATEST,
+            with_transcript=False,
+            config_extra={"recallContextTurns": 1, "recallQueryMaxTokens": 6},
+        )
+        terms = self._wire_terms(client)
+        # Six slots for a 60-word turn. `pkce` is the last word of the sentence
+        # and the shortest content token in it, so under the old length rule
+        # (score 1.0, against 3.0 for every long abstract noun before it) it was
+        # dropped. It must now take the first slot on merit.
+        self.assertIn("pkce", terms, "the only identifier in the turn was dropped")
+        # The long English words are DEMOTED, not dropped — with six slots and
+        # nothing more selective competing, some of them legitimately fill the
+        # remainder. What must not happen is any of them outranking `pkce`.
+        for filler in ("understanding", "particularly", "configuration", "documentation"):
+            self.assertLess(
+                _selectivity_score(filler),
+                _selectivity_score("pkce"),
+                f"{filler!r} scores at or above an identifier",
+            )
+
+    def test_length_is_not_rewarded(self):
+        # The regression this guards: `score += min(len(token), 12) / 4.0`.
+        # Measured median `overlord` df by token length is flat-to-rising, so a
+        # longer common word is not more selective than a shorter one.
+        self.assertEqual(
+            _selectivity_score("configuration"), _selectivity_score("thing")
+        )
+        # ...and the same holds for two identifiers of very different length.
+        self.assertEqual(_selectivity_score("zod"), _selectivity_score("kubernetes"))
+
+    def test_compound_shape_is_rewarded_on_top_of_rarity(self):
+        # A path/version/module compound is worth MORE than a merely unknown
+        # word, and the compound bonus is what supplies that. Measured on the
+        # live `overlord` bank, `.`/`/`/`-` joined tokens are the second-most
+        # reliable low-df shape after digits — and unlike a bare rare word the
+        # server shreds a compound into its fragments too, so one kept compound
+        # buys several matching surfaces. `docs/setup` and `wibbleton` are BOTH
+        # absent from the dictionary, so the +2.0 rarity bonus cancels and only
+        # the compound bonus can separate them.
+        self.assertNotIn("docs/setup", common_english_words())
+        self.assertNotIn("wibbleton", common_english_words())
+        self.assertGreater(
+            _selectivity_score("docs/setup"),
+            _selectivity_score("wibbleton"),
+            "a compound scores no better than an unknown bare word",
+        )
+        # And it must still beat a compound-shaped token's own fragments, which
+        # are ordinary dictionary words on their own.
+        self.assertGreater(_selectivity_score("docs/setup"), _selectivity_score("setup"))
 
 
 class RoleLabelsNeverReachTheWire(_Harness):

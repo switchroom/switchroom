@@ -16,7 +16,7 @@ function expectRelativePoolLink(linkPath: string, expectedPoolTarget: string): v
   expect(resolve(dirname(linkPath), stored)).toBe(resolve(expectedPoolTarget));
 }
 import { tmpdir } from "node:os";
-import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants, computeDesiredPermissionAllow } from "../src/agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants, computeDesiredPermissionAllow, HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT, HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT } from "../src/agents/scaffold.js";
 import { createVault, setStringSecret } from "../src/vault/vault.js";
 import { renderTemplate, renderProfileClaudeTemplate } from "../src/agents/profiles.js";
 import { cronScriptFilename, cronUnitName } from "../src/agents/cron-unit-name.js";
@@ -2681,15 +2681,45 @@ describe("reconcileAgent", () => {
       config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
     });
 
-  it("start.sh omits the #3757 recall-shaping exports when the operator sets nothing", () => {
+  it("start.sh exports the #3757 recall knobs UNCONDITIONALLY, carrying the plugin defaults", () => {
+    // #3774 defect class. The plugin resolves
+    // DEFAULTS -> settings.json -> ~/.hindsight/claude-code.json -> env
+    // (vendor/hindsight-memory/scripts/lib/config.py:437-470). A knob that is
+    // not exported therefore lets a stale hand-written claude-code.json shadow
+    // the shipped default, silently and with every test still green. Exporting
+    // an EMPTY value does not help: `_cast_env("", int)` returns None and the
+    // assignment is skipped, so empty is indistinguishable from absent. The
+    // only shape that wins is a concrete value on every boot.
     const agentConfig = makeAgentConfig();
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
-    // Unset means "use the plugin's own settings.json default" (24 / [] / 12s).
-    expect(startSh).not.toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS");
-    expect(startSh).not.toContain("export HINDSIGHT_RECALL_QUERY_STOP_TERMS");
-    expect(startSh).not.toContain("export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS");
+    expect(startSh).toContain(
+      `export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=${HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT}`,
+    );
+    expect(startSh).toContain(`export HINDSIGHT_RECALL_QUERY_STOP_TERMS='[]'`);
+    expect(startSh).toContain(
+      `export HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS=${HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT}`,
+    );
+  });
+
+  it("the scaffold fallbacks match the hindsight plugin's own DEFAULTS", () => {
+    // The unconditional export above only produces correct behaviour while the
+    // value it carries IS the plugin default. Nothing at runtime reconciles the
+    // two, so read the Python source and fail on drift.
+    const configPy = readFileSync(
+      resolve(import.meta.dirname, "..", "vendor/hindsight-memory/scripts/lib/config.py"),
+      "utf-8",
+    );
+    const readDefault = (key: string): number => {
+      const match = configPy.match(new RegExp(`"${key}":\\s*(\\d+)`));
+      expect(match, `${key} not found in lib/config.py DEFAULTS`).toBeTruthy();
+      return Number(match![1]);
+    };
+    expect(readDefault("recallQueryMaxTokens")).toBe(HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT);
+    expect(readDefault("recallRequestTimeoutSeconds")).toBe(
+      HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT,
+    );
   });
 
   it("start.sh exports the #3757 recall knobs from memory.recall in switchroom.yaml", () => {
@@ -2718,8 +2748,9 @@ describe("reconcileAgent", () => {
   });
 
   it("start.sh exports HINDSIGHT_RECALL_QUERY_MAX_TOKENS=0 when the operator disables shaping", () => {
-    // 0 is the rollback lever ("send the query unshaped"), not the same as
-    // unset — so it must still emit, hence the isNumber guard.
+    // 0 is the rollback lever ("send the query unshaped"). The export is
+    // unconditional, so the only thing that can break this is a `??`/`||`
+    // slip in the scaffold turning 0 back into the default.
     const agentConfig = makeAgentConfig({
       memory: { collection: "test-agent", recall: { query_max_tokens: 0 } },
     });
@@ -2729,14 +2760,16 @@ describe("reconcileAgent", () => {
     expect(startSh).toContain("export HINDSIGHT_RECALL_QUERY_MAX_TOKENS=0");
   });
 
-  it("start.sh omits HINDSIGHT_RECALL_QUERY_STOP_TERMS for an empty list", () => {
+  it("start.sh exports an empty JSON array for HINDSIGHT_RECALL_QUERY_STOP_TERMS", () => {
+    // `[]` is a real value that `_cast_env` parses and assigns, so the env
+    // still beats a stale claude-code.json. Omitting the export would not.
     const agentConfig = makeAgentConfig({
       memory: { collection: "test-agent", recall: { query_stop_terms: [] } },
     });
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, memoryOn(agentConfig));
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
-    expect(startSh).not.toContain("export HINDSIGHT_RECALL_QUERY_STOP_TERMS");
+    expect(startSh).toContain(`export HINDSIGHT_RECALL_QUERY_STOP_TERMS='[]'`);
   });
 
   it("start.sh does NOT export HINDSIGHT_RECALL_CACHE_TTL_SECS by default (v0.13.22 — 0% measured hit rate)", () => {

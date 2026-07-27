@@ -39,14 +39,21 @@ Exit codes:
       stderr and non-zero exit. Existing behaviour.
 """
 
-import hashlib
-import json
-import os
-import re
-import socket
-import sys
 import time
-import urllib.error
+
+# Taken before anything else is imported, so `_IMPORT_ELAPSED_SECONDS` below
+# captures the real cost of loading this hook's dependencies. That spend is
+# charged against the UserPromptSubmit ceiling (see `HOOK_CEILING_SECONDS`) —
+# `recall_start_monotonic` is taken well into main() and cannot see it.
+_IMPORT_START_MONOTONIC = time.monotonic()
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import socket  # noqa: E402
+import sys  # noqa: E402
+import urllib.error  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -74,6 +81,11 @@ from lib.directives import (
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.parallel_recall import run_parallel
 from lib.state import read_state, write_state
+
+# Cost of everything above, charged against the hook ceiling (see
+# `HOOK_CEILING_SECONDS`). Measured, not estimated: it is dominated by
+# `lib.client` pulling in urllib/ssl and by `lib.content` on cold page cache.
+_IMPORT_ELAPSED_SECONDS = time.monotonic() - _IMPORT_START_MONOTONIC
 
 LAST_RECALL_STATE = "last_recall.json"
 RECALL_CACHE_STATE = "recall_cache.json"
@@ -834,6 +846,42 @@ _FALLBACK_TELEMETRY_ZERO = {
     "truncated": False,
 }
 
+# The UserPromptSubmit timeout Claude Code enforces on THIS script, mirrored
+# from `hooks/hooks.json` (which ships in this same package, so the two cannot
+# be configured apart by an operator). `test_hook_ceiling_matches_hooks_json`
+# fails if they ever drift.
+#
+# Overrun is not a degraded recall — Claude Code kills the hook and the turn
+# loses memories, the fallback AND the directives, which is strictly worse than
+# the bug this PR fixes. So every optional tail-end spend is budgeted against
+# what is actually left of the ceiling rather than against a flat constant.
+HOOK_CEILING_SECONDS = 12.0
+# Held back for work this arithmetic cannot see: CPython interpreter boot
+# before our first statement runs, plus rendering the additionalContext
+# payload, the recall_log write and teardown after the last budgeted step.
+HOOK_TAIL_RESERVE_SECONDS = 0.75
+# Anchor for the budget arithmetic. Set at the top of main() rather than at
+# import, so a process that invokes the hook more than once (the test suite,
+# and any future in-process driver) budgets each invocation independently
+# instead of inheriting the whole process lifetime. Import cost is charged
+# explicitly via `_IMPORT_ELAPSED_SECONDS` so re-anchoring loses nothing.
+_hook_start_monotonic = None
+
+
+def _begin_hook_budget():
+    """(Re-)anchor the hook budget clock. Call once at the top of main()."""
+    global _hook_start_monotonic
+    _hook_start_monotonic = time.monotonic() - _IMPORT_ELAPSED_SECONDS
+
+
+def _remaining_hook_budget_seconds():
+    """Seconds left before this hook risks breaching its UserPromptSubmit ceiling."""
+    if _hook_start_monotonic is None:  # pragma: no cover - defensive only
+        return HOOK_CEILING_SECONDS - HOOK_TAIL_RESERVE_SECONDS
+    elapsed = time.monotonic() - _hook_start_monotonic
+    return HOOK_CEILING_SECONDS - HOOK_TAIL_RESERVE_SECONDS - elapsed
+
+
 _FALLBACK_BLOCK_PREAMBLE = (
     "No stored memories matched this query — the fact layer may not have "
     "reconciled this session yet (e.g. an abrupt session death before boot "
@@ -843,7 +891,7 @@ _FALLBACK_BLOCK_PREAMBLE = (
 )
 
 
-def _transcript_grep_fallback(transcript_path, query, config):
+def _transcript_grep_fallback(transcript_path, query, config, budget_ms=None):
     """Bounded transcript-grep fallback for the empty-fact-layer window (#3369).
 
     Reads the CURRENT session transcript's tail (bounded bytes), keeps the most
@@ -858,9 +906,17 @@ def _transcript_grep_fallback(transcript_path, query, config):
     masquerade as a genuinely empty fact layer, so it still suppresses the
     fallback. A per-bank TIMEOUT no longer does (#3757): timing out was the
     common case, and suppressing on it left the agent with neither memories nor
-    fallback. The 1.5s bound is what keeps that safe — the shared recall
-    deadline is 10s and the UserPromptSubmit hook ceiling is 12s, so the
-    fallback still fits after a fully-elapsed recall.
+    fallback.
+
+    That inversion removed the gate that INCIDENTALLY protected the hook
+    ceiling, so the grep wall-time bound is now
+    ``min(recallTranscriptFallbackDeadlineMs, remaining hook budget)`` rather
+    than a flat 1.5s (#3760 review, Major 4). A flat 1.5s after a fully-elapsed
+    10s recall left ~0.5s for interpreter startup, config load, the transcript
+    read and output formatting — and an overrun costs the turn its directives
+    too. ``budget_ms`` is that remaining-budget clamp, supplied by the caller;
+    ``<= 0`` means "no time left", and the fallback declines rather than
+    gambling the hook.
 
     Returns ``(block_or_None, telemetry)``. Failure-safe: any error path returns
     ``(None, zeroed-telemetry)`` so the fallback can never break recall.
@@ -882,6 +938,12 @@ def _transcript_grep_fallback(transcript_path, query, config):
     max_turns = _int_cfg("recallTranscriptFallbackMaxTurns", 6)
     max_chars = _int_cfg("recallTranscriptFallbackMaxChars", 2000)
     deadline_ms = _int_cfg("recallTranscriptFallbackDeadlineMs", 1500)
+    if budget_ms is not None:
+        # Never spend more than the hook has left, even when the configured
+        # bound is larger. A caller with no budget left gets nothing at all.
+        deadline_ms = min(deadline_ms, int(budget_ms))
+        if deadline_ms <= 0:
+            return None, telemetry
 
     if max_turns <= 0 or max_chars <= 0 or max_bytes <= 0:
         return None, telemetry
@@ -1240,6 +1302,7 @@ def degraded_recall_notice(bank_id, bank_timings) -> str:
 
 
 def main():
+    _begin_hook_budget()
     config = load_config()
 
     if not config.get("autoRecall"):
@@ -1613,7 +1676,7 @@ def main():
     if recall_request_timeout <= 0:
         recall_request_timeout = 12.0
 
-    def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups):
+    def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups, timeout_override=None):
         def _bank_task():
             return client.recall(
                 bank_id=target_bank_id,
@@ -1651,7 +1714,11 @@ def main():
                 # this timeout only binds when an operator raises that. SAFETY
                 # NET behind the query-shaping fix above, not the fix.
                 # Operator knob: `memory.recall.request_timeout_seconds`.
-                timeout=recall_request_timeout,
+                timeout=(
+                    recall_request_timeout
+                    if timeout_override is None
+                    else timeout_override
+                ),
             )
         return _bank_task
 
@@ -1774,6 +1841,14 @@ def main():
         # own-bank debug line, logs the directives block after the bank loop
         # rather than before, and __main__ still os._exit(0)s on completion.
         recall_mode = "serial"
+        # #3760 review, Major 4. This path has no outer deadline — bank
+        # latencies SUM — so raising the per-bank timeout 8s -> 12s would let
+        # two banks spend 24s against a 12s hook ceiling. Each bank is instead
+        # clamped to whatever the hook has left when its turn comes, so the
+        # serial path can no longer breach the ceiling no matter how many banks
+        # are configured. `deadline_budget_ms` stays None on the log row: this
+        # is a per-bank clamp, not the parallel path's shared deadline, and
+        # conflating them would corrupt the serial-vs-parallel comparison.
         deadline_budget_ms = None
         deadline_effective_ms = None
         _directives_start = time.monotonic()
@@ -1790,7 +1865,18 @@ def main():
             _bank_errored = False
             _bank_error = None
             try:
-                response = _make_bank_task(b_id, b_tags, b_tags_match, b_tag_groups)()
+                _bank_budget = _remaining_hook_budget_seconds()
+                if _bank_budget <= 0:
+                    raise TimeoutError(
+                        f"hook budget exhausted before bank '{b_id}' was queried"
+                    )
+                response = _make_bank_task(
+                    b_id,
+                    b_tags,
+                    b_tags_match,
+                    b_tag_groups,
+                    timeout_override=min(recall_request_timeout, _bank_budget),
+                )()
                 bank_results = response.get("results", []) if isinstance(response, dict) else []
                 if bank_results:
                     debug_log(config, f"Got {len(bank_results)} memories from bank '{b_id}'")
@@ -1980,6 +2066,7 @@ def main():
             hook_input.get("transcript_path", ""),
             query,
             config,
+            budget_ms=_remaining_hook_budget_seconds() * 1000.0,
         )
         if transcript_fallback_block:
             debug_log(

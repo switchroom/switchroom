@@ -7,6 +7,7 @@ import pytest
 from lib.content import (
     _extract_text_content,
     _is_channel_message_tool,
+    _selectivity_score,
     compose_recall_query,
     format_current_time,
     format_memories,
@@ -739,15 +740,27 @@ class TestShapeRecallQuery:
 
     def test_prefers_latest_turn_over_prior_context(self):
         # A chronological truncation would keep the OLDEST context and throw
-        # away the question the user actually asked.
+        # away the question the user actually asked, so the latest turn takes
+        # the MAJORITY of the budget. But recency is a weight plus a bounded
+        # quota, not an absolute tier (#3760 review, Blocker 2): the subject of
+        # a conversation routinely sits in the turn BEFORE the one that refers
+        # to it as "it"/"that", and an absolute tier starves it every time.
         prior = " ".join(f"stalecontextword{i}" for i in range(60))
         latest = "why does the reaper skip orphaned worktrees"
         query = f"Prior context:\n\n{prior}\n\n{latest}"
-        # Budget = exactly the latest turn's content terms: prior context is
-        # what gets sacrificed, never the question.
-        tight = set(tokenize_for_bm25(shape_recall_query(query, latest, max_tokens=4)))
-        assert tight == {"reaper", "skip", "orphaned", "worktrees"}
-        assert not any(t.startswith("stalecontextword") for t in tight)
+        # Every prior token here is strictly MORE selective than anything in
+        # the question (they carry digits; the question is plain English), so
+        # pure merit ordering would hand prior context all four slots and the
+        # user would search for none of what they asked.
+        assert _selectivity_score("stalecontextword0") > _selectivity_score("worktrees")
+        # The latest-turn reserve is what stops that. At a punishing cap it is
+        # only `max_tokens // 3` slots — the question is represented, not
+        # preserved whole, which is the honest tradeoff when prior context is
+        # genuinely more discriminating.
+        tight = tokenize_for_bm25(shape_recall_query(query, latest, max_tokens=4))
+        from_question = set(tight) & {"reaper", "skip", "orphaned", "worktrees"}
+        assert len(from_question) >= max(1, 4 // 3)
+        assert len(set(tight)) <= 4
         # With slack, the latest turn is still fully present and the leftover
         # budget goes to context (which is the point of composing at all).
         loose = set(tokenize_for_bm25(shape_recall_query(query, latest, max_tokens=12)))
