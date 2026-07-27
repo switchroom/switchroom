@@ -57,6 +57,44 @@ Two durable halves, because enumerating today's gaps does not stop the ninth:
   through the managed resolvers. Hard-pinning a new tuning knob now fails the
   suite and has to justify itself.
 
+### An agent's `/tmp` is now declarative, and the fleet default is 2 GiB
+
+Every agent container runs a read-only root filesystem, so the RAM-backed
+`/tmp` is the only scratch space it and its sub-agents get. Its size was
+hard-coded at `1g` in `src/agents/compose.ts` — one `lines.push()` with no
+config path to it at all. The only way to change it was to hand-edit the
+generated compose file, which the next `switchroom apply` overwrites. That is
+imperative state pretending to be config, and the same shape as #3732/#3745:
+a value that is a property of a deployment, shipped with no declarative
+channel.
+
+The measurement that forced it: the root-tier `overlord` container, fanning
+out concurrent sub-agents, sat at **90% of its 1.0 GiB `/tmp`** — 917M used,
+~150M free — and 785M of that was sub-agent working state, mostly repo clones
+plus `bunx` toolchain caches for vitest and typescript. Several workers each
+cloning a repo and installing a toolchain exhaust 1 GiB routinely, and the
+failure mode is bad: clones and installs die with a bare ENOSPC far from the
+cause, mid-task, with no signal that a *mount* is the constraint.
+
+So `resources.tmp_size` joins `memory`, `memory_reservation`, `pids_limit` and
+`cpus` in the existing `resources` block, through the same defaults → profile
+→ per-agent per-field cascade, validated at config-load with the same Docker
+size-string format as `memory` (`4g`, `512m`) rather than failing later at
+`docker compose up`. It is declared in **both** schema mirrors — the
+`profileFields` copy and the `AgentSchema` copy — because that zod object
+strips unknown keys, and a knob present in only one of them parses green and
+does nothing (#3773).
+
+**This changes behaviour on the next `switchroom apply`: an agent with no
+override goes from 1 GiB to 2 GiB.** That is safe as a default because a tmpfs
+is a ceiling, not a reservation — it consumes host RAM only for the pages
+actually written, so an idle agent's footprint is identical and the raise
+costs nothing until something uses it. Those pages are charged against the
+container's `mem_limit` cgroup, so an agent that raises `tmp_size` *and*
+intends to fill it should raise `resources.memory` alongside. Agents pick the
+new size up when their container is recreated; a running container keeps the
+mount it booted with.
+
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
 ### The per-scope observation cap is an overridable managed key

@@ -1463,3 +1463,65 @@ describe("release.auto_update (KEN-131) — root-only opt-in", () => {
     expect(on.release?.auto_update).toBe(true);
   });
 });
+
+describe("resources.tmp_size — per-agent /tmp tmpfs sizing", () => {
+  const base = {
+    switchroom: { version: 1 },
+    telegram: { bot_token: "x", forum_chat_id: "1" },
+  };
+
+  it("survives AgentSchema parse (NOT stripped — the #3773 silent no-op class)", () => {
+    // The `resources` object is a plain z.object, which STRIPS unknown
+    // keys. If tmp_size is missing from the AgentSchema mirror the key
+    // vanishes at parse and the knob is a silent no-op, exactly the bug
+    // filed as #3773. Assert the resolved value, not the parse success.
+    const a = AgentSchema.parse({ topic_name: "ops", resources: { tmp_size: "4g" } });
+    expect(a.resources?.tmp_size).toBe("4g");
+  });
+
+  it("survives parse at the defaults layer (fleet-wide default)", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...base,
+      defaults: { resources: { tmp_size: "4g" } },
+      agents: {},
+    });
+    expect(cfg.defaults?.resources?.tmp_size).toBe("4g");
+  });
+
+  it("survives parse at the profile layer", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...base,
+      profiles: { roomy: { resources: { tmp_size: "6g" } } },
+      agents: {},
+    });
+    expect(cfg.profiles?.roomy?.resources?.tmp_size).toBe("6g");
+  });
+
+  it("accepts the docker size forms operators actually write", () => {
+    for (const v of ["512m", "1g", "2g", "4g", "1.5g", "1048576k", "2G", "512M"]) {
+      expect(AgentSchema.parse({ topic_name: "ops", resources: { tmp_size: v } }).resources?.tmp_size).toBe(v);
+    }
+  });
+
+  it("rejects garbage at config-load time, not at `docker compose up`", () => {
+    // "0"/"0g" parse as size strings but mount a ZERO-byte /tmp — every
+    // write in the container fails, so they are rejected too.
+    for (const bad of ["big", "4gb", "-1g", "4 g", "", "4gigs", "1e9", "0", "0g", "0.0m"]) {
+      expect(() => AgentSchema.parse({ topic_name: "ops", resources: { tmp_size: bad } })).toThrow();
+    }
+  });
+
+  it("rejects garbage at the defaults layer too", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...base,
+        defaults: { resources: { tmp_size: "lots" } },
+        agents: {},
+      }),
+    ).toThrow(/tmp_size must be a Docker size string/);
+  });
+
+  it("stays optional — an agent with no resources block still parses", () => {
+    expect(AgentSchema.parse({ topic_name: "ops" }).resources).toBeUndefined();
+  });
+});
