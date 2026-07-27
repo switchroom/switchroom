@@ -80,24 +80,18 @@ fixing lows produces a new diff, and a new diff earned another re-review. It
 produced PRs going four rounds where the last round's only finding was an
 inaccurate doc comment. So:
 
-- **Blockers and mediums block the merge.** Fix them.
-- **Lows do NOT block.** Fix a low inline only if it's a genuine one-liner;
-  otherwise **file a follow-up issue and merge**. Filing is mandatory — an
-  unfiled low is a dropped bug, and there is no human team to catch it later.
-- **A re-review is earned only by a behavioural fix.** A docs-, comment-,
-  log-, or test-only fix commit does not earn another pass.
-- **Two rounds is the cap.** Prefix every commit answering a review round
-  `review-fix:` — `scripts/check-review-rounds.mjs` counts them and the
-  `review-rounds` check fails past two, unless a `review-cap-override` label
-  is on the PR.
+- **Blockers and majors block the merge.** Fix them.
+- **Lows do NOT block.** File a low as a follow-up issue rather than fixing it
+  now. Filing is mandatory — an unfiled low is a dropped bug, and there is no
+  human team to catch it later.
+- **Fix what blocks, then merge on CI green.**
+- **Do not count review rounds, and do not run a mandatory re-review pass.**
+  Verifying your own fix is part of making it, not a separate step. Counting
+  rounds was itself a loop driver: it made the review process the subject of
+  the work instead of the change.
 
 If a finding is genuinely invalid, rebut it with evidence in writing; silence
 is not a rebuttal.
-
-When you do re-review, the verdict states per original finding: the finding
-ID, what changed (`file:line` of the fix), whether it fully resolves the
-finding (`RESOLVED` / `PARTIAL` / `REBUTTED` with evidence), and whether the
-fix introduced anything new. A bare "fixed" is not a verdict.
 
 ## 5. Non-obvious pipeline rules
 

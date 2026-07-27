@@ -133,10 +133,6 @@ obligation:
 `check-no-broadcast-delivery`, `check-stale-tool-descriptions`,
 `check-web-subscription-honest`, `check-litellm-config-guard`.
 
-`scripts/check-review-rounds.mjs` is deliberately NOT in `npm run lint` — it
-needs a PR range and PR labels, so it runs only in `ci-review-rounds.yml`.
-Its logic is unit-tested in `tests/review-rounds-gate.test.ts`.
-
 Traps that bite repeatedly:
 
 - **`check-no-pii-secrets` fails on real operator PII** — real Telegram
@@ -313,8 +309,7 @@ first.
 ## Development Protocol (fleet standard, Ken 2026-07-11)
 
 The fleet-wide protocol every agent gets via the `_shared/dev-protocol.md.hbs`
-fragment (long form: the bundled `dev-protocol` skill). It binds work on THIS
-repo too — the five parts, condensed:
+fragment. It binds work on THIS repo too — the five parts, condensed:
 
 1. **Orient/ground.** Validate, don't assume; never assert an unchecked fact.
    Verify root cause in real source (src/, not `dist/` or generated output).
@@ -326,15 +321,13 @@ repo too — the five parts, condensed:
 3. **Design-align on larger tasks.** Evidence-grounded design report to the
    user before implementation; adversarially red-team the plan (per-item
    verdicts with evidence); stage delivery as focused single-concern PRs.
-4. **Pipeline.** Branch off fresh main. Scoped tests + `npm run lint`
-   locally; CI is the full-suite authority. Adversarial review of the diff;
-   fix every blocker and medium before merge; lows don't block — inline only
-   if a genuine one-liner, otherwise file a follow-up issue and merge.
-   Re-review only when the fix changed behaviour (docs/comment/log/test-only
-   fix commits don't earn another pass). **Prefix every commit answering a
-   review round `review-fix:`** — `scripts/check-review-rounds.mjs` counts
-   them and the `review-rounds` check fails past 2 rounds unless a
-   `review-cap-override` label is on the PR. Merge only on CI green. Durable
+4. **Pipeline.** `git fetch origin`, then branch off `origin/main` — never
+   off the working copy as-is. Scoped tests + `npm run lint` locally; CI is
+   the full-suite authority. Adversarial review of the diff; blockers and
+   majors block the merge, lows get filed as follow-up issues rather than
+   fixed now (filing is mandatory). Fix what blocks, then merge on CI green.
+   **Do not count review rounds and do not run a mandatory re-review pass** —
+   verifying your own fix is part of making it, not a separate step. Durable
    fixes over hack patches; deterministic mechanisms over model-dependent
    behavior; tests assert outcomes, not just code paths.
 5. **Communicate.** Consolidated messages, always-visible progress, no

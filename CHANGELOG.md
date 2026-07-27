@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Review policy is stated once, and no longer counts rounds
+
+v0.19.23 bounded adversarial review with a severity gate plus a counted round
+cap (`review-fix:` prefixes, `scripts/check-review-rounds.mjs`,
+`ci-review-rounds.yml`). The cap worked as specified and still left agents
+re-reviewing 3-4x per shipped change, because the residual driver was not the
+absence of a bound — it was that review policy was stated across five surfaces
+carrying three different round numbers, and that explicit verification
+scaffolding induces redundant self-verification on a model that already
+self-verifies.
+
+Review policy is now stated **once**, in `_shared/dev-protocol.md.hbs`:
+blockers and majors block the merge, lows are filed as follow-up issues, fix
+what blocks then merge on CI green, do not count rounds and do not run a
+mandatory re-review pass. The severity gate — the part of #3707 doing real
+work — is kept. The counting mechanism is retired: `ci-review-rounds.yml`,
+`scripts/check-review-rounds.mjs` and `tests/review-rounds-gate.test.ts` are
+removed rather than left half-wired, since a counter reading `review-fix:`
+prefixes that agents are no longer told to write would have silently reported
+zero rounds forever.
+
+`git fetch origin` before branching is now explicit. "Branch off fresh main"
+appeared with no fetch step anywhere in the fleet, and a switchroom agent does
+not start in the repo it is coding in — checkouts on disk run many commits
+stale.
+
+### The turn-pacing directive no longer describes the model's own reasoning
+
+The intent-narration block told the model its reasoning was hidden from the
+user and instructed it to write that reasoning out as ordinary working text.
+That shape (naming hidden reasoning, then asking for it as response text) is
+the documented trigger for `reasoning_extraction` refusals, and a refusal there
+can cause a silent model fallback — an off-plan call, against the
+subscription-honest pillar's "zero off-plan callsites".
+
+Same operational outcome, restated as a plain output requirement: give every
+tool call a plain-English `description`, and post one short status line before
+a long stretch of work. This also removes a self-contradiction — the block
+asked for intent as unsent transcript text while the reply rule 55 lines later
+banned exactly that, because a framework backstop flushes unsent text late and
+out of order. Both copies are fixed at the generator (`scaffold.ts`);
+`fleet/switchroom-invariants.md` is generated and was not hand-edited.
+
 ## v0.19.23 — the retain queue drains and stops losing memories, capability-gated hindsight performance defaults, bounded adversarial review, a 22% smaller agent prompt
 
 ### The always-loaded agent prompt is ~22% smaller, and ratcheted (#3709)
