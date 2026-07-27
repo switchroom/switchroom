@@ -327,6 +327,36 @@ export const HINDSIGHT_DEFAULT_LLM_STRICT_SCHEMA = "true";
  */
 export const HINDSIGHT_DEFAULT_LLM_MAX_RETRIES = 2;
 
+/**
+ * Tag groups consolidated concurrently within ONE operation (upstream default
+ * `4`).
+ *
+ * Upstream's `config.py` justifies its 4 as "matches retain_max_concurrent" —
+ * i.e. the value is not absolute, it is pegged to how much LLM concurrency the
+ * deployment has granted. switchroom holds 2, chosen when a consolidation call
+ * was the heaviest thing on a single local backend.
+ *
+ * Moved here from a bare constant in `hindsight.ts` (2026-07-27). The value is
+ * unchanged; what changes is that it is now a MANAGED key, so an operator can
+ * override it through `hindsight.env`. Before this it was emitted
+ * unconditionally on both launch paths with no declarative channel, so a
+ * `hindsight.env` line for it was silently dropped — the exact failure this
+ * module exists to prevent. The right value tracks the host's local LLM slot
+ * count, which switchroom cannot know, so it must be overridable:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     # peg to RETAIN_LLM_MAX_CONCURRENT, per upstream's own rationale
+ *     HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM: 3
+ * ```
+ *
+ * Ungated: it assumes no hardware, and the previous emission was unconditional
+ * — putting it behind a capability gate would silently CHANGE the default on
+ * hosts that lack the gate.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -342,6 +372,10 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
     String(HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S),
   ],
   ["HINDSIGHT_API_LLM_REASONING_EFFORT", HINDSIGHT_DEFAULT_LLM_REASONING_EFFORT],
+  [
+    "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
+    String(HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM),
+  ],
 ];
 
 /** Emitted only when the container can reach a GPU. */

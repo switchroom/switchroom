@@ -173,6 +173,7 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
+      "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -320,6 +321,7 @@ describe("operator override wins", () => {
     // adding or dropping a managed key must fail here and force the doc update.
     expect([...HINDSIGHT_PERF_ENV_KEYS].sort()).toEqual([
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
       "HINDSIGHT_API_LLM_MAX_CONCURRENT",
@@ -418,6 +420,75 @@ describe("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY (override-only)", () 
     expect(runEnv(runArgs()).get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([
       MAP,
     ]);
+  });
+});
+
+// ── tag-group parallelism, moved into the managed set ─────────────────────
+describe("HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM (managed, was hard-coded)", () => {
+  const KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set, so a hindsight.env line is not silently dropped", () => {
+    // The bug this fixes: the key was emitted unconditionally from a bare
+    // constant in hindsight.ts and was NOT in HINDSIGHT_PERF_ENV_KEYS, so an
+    // operator's yaml line was discarded without a word — it read as durable
+    // config while doing nothing.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Defaulted, not override-only: the previous emission was unconditional,
+    // so dropping the default would be a silent behaviour change.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(false);
+  });
+
+  it.each(CAPS)(
+    "keeps the historical default of 2 on every host (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Ungated on purpose. Behind a capability gate this would silently drop
+      // to upstream's 4 on any host lacking the gate — a behaviour change
+      // smuggled in by a refactor.
+      expect(hindsightPerfEnv(caps)).toContainEqual([KEY, "2"]);
+    },
+  );
+
+  it("the operator's value REPLACES the default on BOTH launch paths", () => {
+    const perf = { env: { [KEY]: "3" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    // Exactly one value, not the default AND the override: a duplicate emission
+    // would be last-wins by luck on docker-run and ambiguous in compose.
+    expect(fromRun.get(KEY)).toEqual(["3"]);
+    expect(fromCompose.get(KEY)).toEqual(["3"]);
+  });
+
+  it("is emitted exactly once per path when NOT overridden", () => {
+    // Guards the specific regression of moving the key without deleting the
+    // old hard-coded emission: two `-e` flags for one var.
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, {
+      env: {},
+      processEnv: {},
+    });
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["2"]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, {
+          env: {},
+          processEnv: {},
+        }),
+      ).get(KEY),
+    ).toEqual(["2"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: "6" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["6"]);
   });
 });
 
