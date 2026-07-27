@@ -398,7 +398,7 @@ def _is_demoted_memory(memory) -> bool:
 
 # Tokenizer shared by the transcript fallback (`_build_transcript_fallback`).
 #
-# --- history: the removed lexical-overlap recall gate (#475, #3541, #3755) ---
+# --- history: the removed lexical-overlap recall gate (#475, #3541, #3761) ---
 #
 # These tokens used to feed a `recallMinOverlap` gate that ran between the
 # engine's reranker and the `recallMaxMemories` head-slice, dropping any
@@ -505,7 +505,7 @@ def _injected_score_stats(results) -> dict:
     Switchroom #3541 review finding — recall-quality telemetry.
     `recall_log.jsonl` records volume and plumbing only (`capped`,
     `pre_cap_count`, `memory_ids`, `deadline_hit`). With the lexical overlap
-    gate removed (#3755) 100% of precision rests on the engine's
+    gate removed (#3761) 100% of precision rests on the engine's
     `scores.final` plus the `recallMaxMemories` head-slice — and no volume
     field observes that. `result_count` rising to the cap reads as
     unambiguous success on every existing dashboard whether the reranker is
