@@ -2287,6 +2287,44 @@ export const LiteLLMConfigSchema = z
         "Extra key/value metadata tags attached to the provisioned LiteLLM " +
         "virtual key. Merged per-key across cascade layers (agent wins).",
       ),
+    max_budget: z
+      .number()
+      .positive()
+      .optional()
+      .describe(
+        "HARD spend cap in USD for this agent's virtual key over one " +
+        "`budget_duration` window. LiteLLM refuses the request once the key's " +
+        "tracked spend exceeds it, so a runaway loop costs at most this much " +
+        "before it is stopped. Defaults to " +
+        "DEFAULT_KEY_MAX_BUDGET_USD (see src/litellm/budget.ts) — deliberately " +
+        "conservative; raise it per-agent rather than removing it. Set 0 or " +
+        "omit `budget_duration` at your own risk: an uncapped key is only as " +
+        "bounded as the upstream account balance.",
+      ),
+    soft_budget: z
+      .number()
+      .positive()
+      .optional()
+      .describe(
+        "ADVISORY spend threshold in USD. LiteLLM keeps serving past it and " +
+        "raises a budget alert instead. Must be < max_budget. NOTE: LiteLLM " +
+        "accepts soft_budget only on POST /key/generate (GenerateKeyRequest); " +
+        "UpdateKeyRequest does NOT carry it, so changing this value only takes " +
+        "effect on a key that is (re)generated, not on an existing one.",
+      ),
+    budget_duration: z
+      .string()
+      .regex(
+        /^\d+(s|m|h|d|mo)$/,
+        "budget_duration must be a LiteLLM duration like '30d', '24h', '1mo'",
+      )
+      .optional()
+      .describe(
+        "Rolling window the budget resets on, in LiteLLM duration syntax " +
+        "('30d', '24h', '1mo'). Defaults to DEFAULT_KEY_BUDGET_DURATION. " +
+        "WITHOUT a duration LiteLLM treats max_budget as a LIFETIME cap that " +
+        "never resets — the key silently dies for good once it is hit.",
+      ),
   })
   .optional()
   .describe(

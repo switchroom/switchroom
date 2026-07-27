@@ -19,6 +19,7 @@ import { Option, type Command } from "commander";
 import chalk from "chalk";
 import { accessSync, chmodSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { writeConfigFileSync } from "../util/atomic.js";
+import { describeKeyBudget, resolveKeyBudget } from "../litellm/budget.js";
 import { mkdir } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
 import readline from "node:readline";
@@ -333,7 +334,7 @@ export async function provisionLiteLLMKeys(
   // Lazy imports — only paid for when at least one agent opts in or hindsight is wired.
   const [
     { getViaBrokerStructured, putViaBroker },
-    { ensureTeam, ensureKey, validateKey, bindKeyToTeam, updateKeyModels },
+    { ensureTeam, ensureKey, validateKey, bindKeyToTeam, updateKeyModels, updateKeyBudget },
     { addAgentSecret },
   ] =
     await Promise.all([
@@ -477,6 +478,9 @@ export async function provisionLiteLLMKeys(
     admin_key?: string;
     team?: string;
     small_fast_model?: string;
+    max_budget?: number;
+    soft_budget?: number;
+    budget_duration?: string;
   } }).litellm;
 
   // The fleet's active OAuth account (auth-broker single-active model) — used
@@ -510,6 +514,15 @@ export async function provisionLiteLLMKeys(
       const baseUrl = litellm.base_url ?? topLevel?.base_url;
       const team = litellm.team ?? topLevel?.team ?? "switchroom";
       const adminKeyRef = litellm.admin_key ?? topLevel?.admin_key;
+      // Spend cap for this agent's key. Per-agent overrides the top-level
+      // block; absent everywhere ⇒ the conservative default in budget.ts. An
+      // UNCAPPED virtual key is a bearer token for the whole upstream account
+      // balance, so the default is "capped", not "unlimited".
+      const budget = resolveKeyBudget({
+        max_budget: litellm.max_budget ?? topLevel?.max_budget,
+        soft_budget: litellm.soft_budget ?? topLevel?.soft_budget,
+        budget_duration: litellm.budget_duration ?? topLevel?.budget_duration,
+      });
       if (!baseUrl || !adminKeyRef) {
         failures.push({
           agent: name,
@@ -693,6 +706,37 @@ export async function provisionLiteLLMKeys(
           writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned (skipped)\n`));
         }
 
+        // Re-cap an EXISTING key. Keys provisioned before spend caps existed
+        // are never regenerated (the vault check above short-circuits), so
+        // without this heal every pre-existing agent would stay UNCAPPED
+        // forever and the feature would protect only new agents. Idempotent —
+        // LiteLLM accepts the same budget repeatedly.
+        //
+        // `soft_budget` is NOT healed: LiteLLM's UpdateKeyRequest does not
+        // carry it (see updateKeyBudget), so an existing key can only gain the
+        // advisory alert by being regenerated. Said plainly rather than
+        // silently pretended.
+        if (!driftReprovision && storedKey && masterKey && budget) {
+          const cap = await updateKeyBudget({ baseUrl, masterKey, key: storedKey, budget });
+          if (cap.kind === "ok") {
+            writeOut(
+              chalk.gray(
+                `  ~ litellm/${name}: spend ${describeKeyBudget(budget)}` +
+                `${budget.softBudget != null ? " (soft budget applies to newly generated keys only)" : ""}\n`,
+              ),
+            );
+          } else {
+            ctx.writeErr(
+              chalk.yellow(
+                `  ! litellm/${name}: could NOT apply the spend cap (${cap.detail}) — ` +
+                `this key remains UNCAPPED and can spend the whole upstream account ` +
+                `balance. Manual: POST ${baseUrl}/key/update ` +
+                `{"key":"<key>","max_budget":${budget.maxBudget},"budget_duration":"${budget.budgetDuration}"}.\n`,
+              ),
+            );
+          }
+        }
+
         if (!driftReprovision) {
           // Still ensure the read-ACL is granted (cheap, idempotent).
           if (configText !== null) {
@@ -741,6 +785,7 @@ export async function provisionLiteLLMKeys(
         alias,
         teamId,
         metadata,
+        ...(budget ? { budget } : {}),
         // Surface the orphaned-alias self-heal steps (delete + regenerate) so the
         // operator sees the recovery instead of a silent extra round-trip.
         log: (m) => ctx.writeErr(chalk.gray(`  ~ litellm/${name}: ${m}\n`)),
