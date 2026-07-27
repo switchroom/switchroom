@@ -34,6 +34,12 @@ import {
   parseResetTime,
 } from './model-unavailable.js'
 import { classify429Detail } from './throttle-tier.js'
+import {
+  PROVIDER_CREDIT_REGISTRY,
+  attributeProvider,
+  describeProviderCreditRemedy,
+  type ProviderCreditEntry,
+} from './provider-credit.js'
 import { classifyClaudeError } from './operator-events.js'
 import { stripRawErrorBytes, extractRequestId } from './raw-error-scrub.js'
 import { fmtLocalClock, tzAbbrev } from './shared/local-time.js'
@@ -48,10 +54,24 @@ export type LlmErrorKind =
   | 'quota_wall'
   | 'auth'
   | 'infra_misconfig'
+  /**
+   * A THIRD-PARTY model provider (OpenRouter / OpenAI / Perplexity) is out of
+   * credit. OPERATOR-actionable, never user-actionable — its `coreText` is a
+   * deliberately diagnosis-free one-liner and its recommendation names the
+   * vendor console, never `/auth`. Kept distinct from `quota_wall` (the
+   * Anthropic subscription window, which resets on a clock and is addressed by
+   * switching account slots); a vendor balance resets only when someone pays.
+   */
+  | 'provider_credit'
   | 'transient'
   | 'unknown'
 
-export type LlmErrorSource = 'anthropic' | 'litellm-local' | 'network'
+export type LlmErrorSource =
+  | 'anthropic'
+  | 'litellm-local'
+  /** A paid third-party model provider reached THROUGH the proxy (OpenRouter, OpenAI). */
+  | 'external-provider'
+  | 'network'
 
 export interface ParsedLlmError {
   kind: LlmErrorKind
@@ -65,6 +85,14 @@ export interface ParsedLlmError {
   model?: string
   /** Anthropic `request_id`, when present — the strongest dedup key. */
   requestId?: string
+  /**
+   * Registry id of the third-party provider the error was attributed to
+   * (`openrouter` / `openai` / `perplexity`), when `kind === 'provider_credit'`
+   * and the raw text named one. An ID only — never raw error text, never a
+   * credential — so the recommendation line can point at the right console
+   * without this struct ever carrying the raw string it was parsed from.
+   */
+  providerId?: string
   source: LlmErrorSource
   /** True when the harness is still retrying this error internally (mid-retry). */
   autoRetrying: boolean
@@ -96,7 +124,10 @@ const TRANSIENT_KINDS: ReadonlySet<LlmErrorKind> = new Set<LlmErrorKind>([
 
 /** The always-actionable kinds — NEVER silenced, even inside a collapse window. */
 export function isActionableKind(kind: LlmErrorKind): boolean {
-  return kind === 'auth' || kind === 'quota_wall'
+  // `provider_credit` joins the never-silenced set: an unpaid vendor balance
+  // does not clear on its own, so collapsing it inside a dedup window would
+  // hide the one signal that needs a human.
+  return kind === 'auth' || kind === 'quota_wall' || kind === 'provider_credit'
 }
 
 /**
@@ -118,6 +149,8 @@ export function parseLlmError(
     resetAt != null ? Math.max(0, resetAt.getTime() - Date.now()) : undefined
 
   const { kind, source } = classifyKindAndSource(text)
+  const providerId =
+    kind === 'provider_credit' ? (attributeProvider(text)?.id ?? undefined) : undefined
 
   // Retry / terminal semantics. Only the transient family can be mid-retry;
   // auth / quota_wall / model_unavailable are terminal by construction.
@@ -143,6 +176,7 @@ export function parseLlmError(
     ...(retryAfterMs != null ? { retryAfterMs } : {}),
     ...(model != null ? { model } : {}),
     ...(requestId != null ? { requestId } : {}),
+    ...(providerId != null ? { providerId } : {}),
     source,
     autoRetrying,
     terminal,
@@ -165,6 +199,15 @@ function classifyKindAndSource(text: string): { kind: LlmErrorKind; source: LlmE
 
   // 1. Auth — always terminal, always actionable.
   const claudeKind = classifyClaudeError({ message: text, type: text })
+  // 1b. THIRD-PARTY provider credit wall. Placed immediately after the auth
+  //     resolution and BEFORE isLitellmProxyLocal429 / detectModelUnavailable:
+  //     OpenAI reports an exhausted balance as HTTP 429 `insufficient_quota`,
+  //     and the 429 matchers below would otherwise swallow it as a transient
+  //     "retrying automatically" — the single most misleading thing to tell
+  //     someone whose provider has no money left.
+  if (claudeKind === 'provider-credit-exhausted') {
+    return { kind: 'provider_credit', source: 'external-provider' }
+  }
   if (claudeKind === 'proxy-misconfig') {
     return { kind: 'infra_misconfig', source: 'litellm-local' }
   }
@@ -216,6 +259,12 @@ function classifyKindAndSource(text: string): { kind: LlmErrorKind; source: LlmE
   return { kind: 'unknown', source: 'anthropic' }
 }
 
+/** Resolve a registry entry from a persisted `providerId`, or null. */
+function providerById(id: string | undefined): ProviderCreditEntry | null {
+  if (id == null) return null
+  return PROVIDER_CREDIT_REGISTRY.find(p => p.id === id) ?? null
+}
+
 function buildCoreText(kind: LlmErrorKind, source: LlmErrorSource): string {
   switch (kind) {
     case 'rate_limit':
@@ -230,6 +279,10 @@ function buildCoreText(kind: LlmErrorKind, source: LlmErrorSource): string {
       return 'Claude login needs re-authentication.'
     case 'infra_misconfig':
       return 'Local model-gateway auth misconfig (proxy fallback dropped the OAuth header).'
+    case 'provider_credit':
+      // Diagnosis-free by design — this string is the ceiling on what a
+      // non-operator may ever be told about a vendor billing wall.
+      return 'An upstream model provider is out of credit — the operator has been notified.'
     case 'transient':
       return source === 'network'
         ? "Couldn't reach Anthropic (network) — retrying automatically."
@@ -302,6 +355,10 @@ function buildRecommendation(parsed: ParsedLlmError, tz: string): string | undef
       // Operator-facing — NO re-auth wording (the login is fine). Points at the
       // real remedy: the local LiteLLM proxy fallback config.
       return '→ Fix the LiteLLM proxy fallback config (deployment missing OAuth passthrough).'
+    case 'provider_credit':
+      // Operator-facing. NO `/auth` wording: the credential is valid, the
+      // balance is empty, and rotating an Anthropic slot changes nothing.
+      return `→ ${describeProviderCreditRemedy(providerById(parsed.providerId))}`
     case 'quota_wall': {
       const reset = formatResetClock(parsed.resetAt, tz)
       return reset
@@ -377,6 +434,8 @@ function kindEmoji(kind: LlmErrorKind): string {
       return '🔑'
     case 'infra_misconfig':
       return '🛠️'
+    case 'provider_credit':
+      return '💳'
     case 'transient':
       return '🌐'
     case 'unknown':

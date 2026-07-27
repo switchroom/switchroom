@@ -15,6 +15,11 @@
 import { escapeMarkdown } from './format.js'
 import { stripRawErrorBytes } from './raw-error-scrub.js'
 import { isLitellmProxyAuthMisconfig } from './model-unavailable.js'
+import {
+  attributeProvider,
+  describeProviderCreditRemedy,
+  detectProviderCreditExhaustion,
+} from './provider-credit.js'
 
 // ─── Taxonomy ────────────────────────────────────────────────────────────────
 
@@ -23,6 +28,16 @@ export type OperatorEventKind =
   | 'credentials-invalid'
   | 'proxy-misconfig'
   | 'credit-exhausted'
+  /**
+   * A THIRD-PARTY model provider (OpenRouter / OpenAI / Perplexity) reports no
+   * credit remaining — HTTP 402 `payment_required`, "insufficient credits",
+   * OpenAI's `insufficient_quota`, etc. Distinct from `credit-exhausted`,
+   * which is the ANTHROPIC balance and whose remedy is `/auth use <slot>`:
+   * rotating an Anthropic account slot buys zero OpenRouter tokens, so the two
+   * must not share a card. Operator-actionable (top up in the vendor console),
+   * never user-actionable — see {@link OPERATOR_ACTIONABLE_KINDS}.
+   */
+  | 'provider-credit-exhausted'
   | 'quota-exhausted'
   | 'rate-limited'
   | 'agent-crashed'
@@ -134,14 +149,36 @@ function classifyInner(raw: unknown): OperatorEventKind {
     return 'credentials-invalid'
   }
 
+  // The full scan surface for the provider-credit decision — same
+  // type/code/message union isLitellmProxyAuthMisconfig uses, because LiteLLM
+  // stamps the upstream vendor's wording in whichever field it has room for.
+  const creditScanText = `${errorType}\n${errorCode}\n${sdkCode}\n${message}`
+
+  // ANTHROPIC credit wall. Guarded with `attributeProvider(...) == null` so an
+  // OpenRouter/OpenAI/Perplexity error that happens to say "credit balance"
+  // does NOT get the Anthropic card, whose remedy (`/auth use <slot>`) is
+  // useless against a third-party balance. Unattributed credit-balance wording
+  // keeps its historical Anthropic reading — that is where it has always come
+  // from, and the alternative (guessing a vendor) sends the operator to the
+  // wrong console.
   if (
-    errorType === 'credit_balance_too_low' ||
-    errorCode === 'credit_balance_too_low' ||
-    sdkCode === 'credit_balance_too_low' ||
-    message.toLowerCase().includes('credit_balance_too_low') ||
-    message.toLowerCase().includes('credit balance')
+    (errorType === 'credit_balance_too_low' ||
+      errorCode === 'credit_balance_too_low' ||
+      sdkCode === 'credit_balance_too_low' ||
+      message.toLowerCase().includes('credit_balance_too_low') ||
+      message.toLowerCase().includes('credit balance')) &&
+    attributeProvider(creditScanText) == null
   ) {
     return 'credit-exhausted'
+  }
+
+  // THIRD-PARTY provider credit wall — the OpenRouter 402 leak (#external-credit).
+  // Runs BEFORE the rate-limit branch on purpose: OpenAI signals an exhausted
+  // balance as HTTP *429* `insufficient_quota`, so a rate-limit-first ordering
+  // would classify a billing wall as a transient throttle and tell the operator
+  // to wait for a reset that will never come.
+  if (detectProviderCreditExhaustion(creditScanText, status) != null) {
+    return 'provider-credit-exhausted'
   }
 
   if (
@@ -315,6 +352,31 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
           ],
         },
       }
+
+    // A third-party provider's balance, NOT Anthropic's. Deliberately carries
+    // NO `/auth use` / `/auth add` language (those rotate Anthropic account
+    // slots and buy zero OpenRouter tokens) and NO "🔐 Reauth" button (the key
+    // is valid; it is out of money). The remedy names the provider, the VAULT
+    // KEY NAME — never a value — and the console to act in. Dismiss-only.
+    case 'provider-credit-exhausted': {
+      const provider = attributeProvider(ev.detail)
+      const who = provider != null ? escapeMarkdown(provider.label) : 'An upstream model provider'
+      return {
+        text: [
+          `💳 **${provider != null ? `${who} credit exhausted` : 'Upstream provider credit exhausted'}** — hit by **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          describeProviderCreditRemedy(provider),
+          `Anthropic account slots are unaffected — \`/auth use\` will NOT fix this.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
+          ],
+        },
+      }
+    }
 
     case 'quota-exhausted':
       // Canonical quota-exhausted text (migrated from auto-fallback.ts).
@@ -544,6 +606,11 @@ export const OPERATOR_ACTIONABLE_KINDS: ReadonlySet<OperatorEventKind> = new Set
   'credentials-expired',
   'credentials-invalid',
   'credit-exhausted',
+  // The OpenRouter/OpenAI/Perplexity 402 class. Only the operator can top up a
+  // vendor balance; an end user shown "insufficient credits" can do nothing but
+  // lose confidence. This membership is what routes it to the operator card and
+  // hands the user the brief plain-language notice instead.
+  'provider-credit-exhausted',
   'proxy-misconfig',
 ])
 
