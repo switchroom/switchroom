@@ -31,13 +31,55 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
 - Opt-in LiteLLM proxy carve-out exists (forwards the OAuth unchanged, fails
   open): `reference/invariants.md` § "Operator-controlled gateway carve-out".
 
+## Models
+
+- **Code default** when `model:` is absent or the literal `"default"` is
+  `claude-sonnet-5` (`SWITCHROOM_DEFAULT_MAIN_MODEL`, `src/agents/scaffold.ts:1509`;
+  `resolveMainModel()` at :1525). `"default"` deliberately does NOT mean the
+  *account* default — claude would pass it through and resolve it to a model
+  the account may not have, 4xx'ing every turn. The live fleet's
+  `defaults.model` lives in the operator's `switchroom.yaml`, not in this repo.
+- **Prefer the family aliases** `opus` / `sonnet` / `haiku` / `fable` over pinned
+  ids: an alias tracks the current flagship, a pinned id goes stale. `fable`
+  resolves ONLY through the LiteLLM proxy — `normalizeModelAlias()` folds
+  `claude-fable-5` → `fable`. **Adding a proxy-only model means editing the
+  repoint `case` in `profiles/_base/start.sh.hbs` (~:1772)** — that is where
+  routing actually moves. `src/agents/compose.ts` bakes `ANTHROPIC_BASE_URL` on
+  model CLASS, so `fable` (a Claude model) starts on the `/anthropic`
+  passthrough and start.sh repoints it to the router root at boot.
+  `declaredRoutingMode()` (`scaffold.ts:1546`) routes nothing: it only encodes
+  the POST-repoint intent so `.routing-mode` can compare landed vs declared.
+  Change the repoint case and that function together or a healthy boot fires a
+  spurious "Routing divergence" alert.
+- **Opus is covered by the adaptive-thinking risk check.**
+  `isAdaptiveThinkingOpus()` (`src/config/thinking-effort-risk.ts`) matches
+  `opus`, `claude-opus-4*`, `claude-opus-5`, `claude-opus-5-*`; `switchroom
+  doctor` WARNs on those with `thinking_effort` above the `low` floor
+  (`src/cli/doctor.ts:512`). The documented failure is the upstream claude-CLI
+  interleaved-streaming merge bug (#1978): `400 messages.N.content.M: 'thinking'
+  or 'redacted_thinking' blocks in the latest assistant message cannot be
+  modified`. Pin `thinking_effort: low`.
+- **Cron tiering keys off the model STRING** (`src/scheduler/cron-routing.ts`):
+  `sonnet|haiku` ⇒ cheap Tier-1 fresh session; `opus` ⇒ Tier-2 live session; an
+  **unrecognised id also falls to Tier-2** with a `customModelDowngrade` warning
+  — a typo'd or newly-renamed cheap model silently costs full-session tokens.
+- **The `/model` override rides a consume-once carrier** whose shape gate is
+  byte-parity between `profiles/_base/start.sh.hbs` (~:1621) and `MODEL_ARG_RE`
+  in `telegram-plugin/gateway/model-command.ts:64`, pinned by
+  `tests/scaffold.session-model.test.ts`. A string failing the gate is dropped
+  to the configured default with a one-shot operator alert and is never retried.
+  Change one regex, change the other in the same PR.
+- **Never hard-code a token budget against an assumed context window** — derive
+  it from a declared one (`src/setup/hindsight-context-budget.ts`, #3717). The
+  `claude-code` / `anthropic` provider default is `200_000`.
+
 ## Commands
 
 ```bash
 bun install                  # deps (bun.lock)
 bun run dev -- <args>        # run CLI from src/ via bin/switchroom.ts
 npm run build                # node scripts/build.mjs → dist/
-npm run lint                 # tsc --noEmit + 8 guard scripts (see Lint gates)
+npm run lint                 # tsc --noEmit + 16 guard scripts (see Lint gates)
 npm test                     # vitest run + bun test <explicit file list>
                              #   NOTE: pretest runs a full build first
 npm run test:vitest          # vitest only (src/ + tests/ + telegram-plugin non-bun)
@@ -67,7 +109,13 @@ src/                    switchroom CLI (TypeScript, ES modules, Node ≥20)
                         tabs; ui/ for frontend); separate compose project
   host-control/         hostd dispatch (self-restart verbs)
   worktree/             `switchroom worktree` claim/gc/reaper
+  setup/                first-run setup + hindsight provisioning/budgets
+  self-improve/         self-improvement proposal gating + tier routing
+  hindsight-watch/      memory-quality probe → metrics → thresholds
+  telegram/             CLI-side Telegram helpers (bot setup, access)
+  secret-detect/        secret detection + redaction shared by gateway/issues
   drive|microsoft|notion|linear|litellm|memory|...   integrations
+bin/                    switchroom.ts entry + the hook/boot shell scripts
 telegram-plugin/        the MCP Telegram plugin + gateway (own test suite)
   server.ts             MCP stdio entry;  gateway/ is the long-lived gateway
   tests/                mostly bun test; uat/ is the live mtcute harness
@@ -77,6 +125,9 @@ profiles/               agent profiles; _base/start.sh.hbs = container entry
 skills/                 bundled Claude Code skills
 scripts/                build.mjs + the lint guard scripts
 tests/                  vitest suite for src/;  tests/docker/ = docker e2e
+evals/                  Python eval harness (dataset.yaml + run_*.py)
+commands/               bundled slash commands (setup/start/status/stop)
+vendor/                 vendored upstream (hindsight-memory) — don't edit
 reference/              THE DESIGN CONTRACT (see below)
 docs/                   user/operator docs only — design lives in reference/
 ```
@@ -93,6 +144,14 @@ Bun natives — chiefly `bun:sqlite` (history, grants, approval-kernel,
 registry). `npm test` runs both; `npm run test:bun` is the explicit file
 list in `package.json`.
 
+**A third suite gates merges, outside `npm test`.** `ci-tests-python.yml` runs
+`python3 -m unittest discover` in `vendor/hindsight-memory/scripts` (`tests/`),
+`docker/voice-sidecar` and `docker/litellm-pacer`, reporting as the required
+`python-ok` sentinel — touching Python under those paths needs a local
+`unittest` run, not a vitest one. `tests/docker/` (the docker e2e suite) is
+likewise gated in CI by `docker-e2e.yml` → the required `e2e-ok` sentinel, and
+does not run under plain `npm test`.
+
 - **Never import `bun:test` or `bun:sqlite` in a vitest-run file** — vitest
   can't resolve them and the whole suite fails to load. This broke CI
   repeatedly before the `check-bun-test-imports` lint guard landed. If a file
@@ -105,7 +164,7 @@ list in `package.json`.
 **Local env noise vs real failures.** The full local suite has known
 environment-dependent failures: vault SQLite in sandboxes, the fake-binary
 harness, `/tmp` mounted noexec (set an exec-capable `TMPDIR`), socket/root
-container constraints, parallel port contention. The ~73 scenarios under
+container constraints, parallel port contention. The 89 scenarios under
 `telegram-plugin/uat/scenarios/` need live Telegram/mtcute creds and
 fail/skip locally by design.
 
@@ -128,10 +187,13 @@ obligation:
 `npm run lint` = `tsc --noEmit` plus these guard scripts (most have an
 `npm run lint:<name>` alias; see `package.json`):
 `check-plugin-references`, `check-bot-api-wrapping`,
-`check-bun-test-imports`, `check-no-pii-secrets`,
-`check-vault-test-hermeticity`, `check-auth-test-hermeticity`,
+`check-bun-test-imports`, `check-bun-module-mock-scope`,
+`check-no-pii-secrets`, `check-vault-test-hermeticity`,
+`check-auth-test-hermeticity`, `check-agent-state-dir-hermeticity`,
 `check-no-broadcast-delivery`, `check-stale-tool-descriptions`,
-`check-web-subscription-honest`, `check-litellm-config-guard`.
+`check-mcp-instructions-budget`, `check-web-subscription-honest`,
+`check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
+`check-litellm-config-guard`, `check-release-asset-names`.
 
 Traps that bite repeatedly:
 
@@ -172,27 +234,39 @@ Traps that bite repeatedly:
 
 GitHub Push Protection blocks token-shaped literals even in fixtures. Build
 fake tokens by runtime concatenation (`"sk-ant-" + "fake"`); pattern:
-`telegram-plugin/tests/secret-detect-secretlint.test.ts`.
+`telegram-plugin/tests/secret-detect-false-positives.test.ts` (~:86) and
+`telegram-plugin/tests/secret-detect-sanctum.test.ts` (~:18).
 
 ## CI
 
 GitHub Actions is primary and gating. `main` is protected by repository
-Ruleset `16470166` with **4 required checks**: `lint`, `bun-test`, `vitest`,
-`images-ok` (the docker-images sentinel — the individual build jobs are NOT
-required, so matrix/job renames there don't touch branch protection; keep
-`images-ok`'s `needs` list complete instead). Edits to the required list are
-Ruleset edits (`gh api repos/switchroom/switchroom/rulesets/16470166`), not
-classic branch protection.
+Ruleset `16470166` with **7 required checks**: `lint`, `bun-test`, `vitest`,
+`images-ok`, `uat-gate`, `e2e-ok`, `python-ok`. Every one is a *sentinel* —
+the individual heavy/build jobs are NOT required, so matrix/job renames there
+don't touch branch protection; keep each sentinel's `needs` list complete
+instead. Edits to the required list are Ruleset edits (`gh api
+repos/switchroom/switchroom/rulesets/16470166`), not classic branch
+protection.
 
-- **Sentinel pattern:** `lint` / `bun-test` / `vitest` / `uat-gate` are
-  always-running sentinel jobs that aggregate path-gated heavy runs
-  (`lint-run`, `bun-test-run`, `vitest-shard` ×4, `uat-gate-run`). A
-  path-filtered job reporting "skipping" is a PASS for that PR — **skipping
-  ≠ failing**. Don't chase skipped shards.
+- **Sentinel pattern:** all seven are always-running jobs that aggregate
+  path-gated heavy runs — `lint` (`ci-lint.yml` → `lint-run`), `vitest`
+  (`ci-tests-core.yml` → `vitest-shard` ×4), `bun-test`
+  (`ci-tests-plugin.yml` → `bun-test-run`), `python-ok`
+  (`ci-tests-python.yml` → `unittest`), `uat-gate` (`ci-uat.yml` →
+  `uat-gate-run`), `e2e-ok` (`docker-e2e.yml` → `e2e` + `hindsight-probe`),
+  `images-ok` (`docker-images.yml`). A path-filtered job reporting "skipping"
+  is a PASS for that PR — **skipping ≠ failing**. Don't chase skipped shards.
+- **The merge queue is ON** (a `merge_queue` rule on the same ruleset: SQUASH,
+  `ALLGREEN` grouping, 60-min `check_response_timeout`). GitHub pushes a
+  `gh-readonly-queue/...` ref and waits for all seven contexts to report **on
+  that ref**, so every one of those workflows carries a `merge_group:` trigger
+  — dropping one wedges `main`. Rules and invariants: `.github/MERGE-QUEUE.md`,
+  pinned by `tests/ci-merge-queue-triggers.test.ts`.
 - Governance (set 2026-05-17, deliberate): admin-bypass locked
   (`bypass_actors: []` — `gh pr merge --admin` cannot work), no required
-  human review, `strict` up-to-date OFF. Auto-merge repo-wide: `--auto
-  --squash` merges the moment required checks go green. CI recovery lever is
+  human review, `strict` up-to-date **ON** — a branch must be up to date with
+  `origin/main` before it can merge. Auto-merge repo-wide: `--auto --squash`
+  merges the moment required checks go green. CI recovery lever is
   `workflow_dispatch` re-trigger.
 - `gh pr checks <n>` is the source of truth. `mergeStateStatus`: `CLEAN`
   ready, `BLOCKED` pending/failed required check, `DIRTY` merge conflict,
@@ -210,12 +284,17 @@ vitest via `bun run --cwd telegram-plugin test:uat <name>`
 (`vitest.uat.config.ts`). Scenarios: `telegram-plugin/uat/scenarios/`,
 named `jtbd-<job>-{dm,channel}` / `fuzz-*`.
 
-- **`uat-gate` is a sentinel job, NOT ruleset-required** (`ci-uat.yml`; as
-  of 2026-07 it is absent from Ruleset 16470166's 11 required checks, so
-  `--auto --squash` WILL merge past a red `uat-gate` — check it yourself
-  before enabling auto-merge on plugin/agent-path PRs). The heavy `uat-gate-run`
-  fires on the self-hosted `uat-host` runner when plugin/agent paths change
-  and `UAT_GATE_ENABLED` is set; it runs three live scenarios:
+- **`uat-gate` IS a required check** (`ci-uat.yml:230`) — an always-on sentinel
+  in Ruleset 16470166's seven, so `--auto --squash` cannot merge past a red
+  one. It passes when `uat-gate-run` succeeded OR was legitimately skipped
+  (non-UAT PR / gate off), and fails on a real failure or a broken `changes`
+  filter. The heavy `uat-gate-run` fires on the self-hosted `uat-host` runner
+  only when plugin/agent paths change AND the repo var `UAT_GATE_ENABLED` is
+  `true` — **it has been `false` since 2026-07-04** (per-commit live UAT burns
+  subscription quota), so in practice the heavy run is `workflow_dispatch`
+  on-demand only and the sentinel passes on the skip path. It is also
+  deliberately never run on `merge_group` (single self-hosted runner would
+  stall the queue). When it does run, three live scenarios:
   `jtbd-fast-trivial-dm` (real DM round-trip, **hard reply-latency SLA of
   12s** — `HARD_TTFO_MS`), `inbound-no-drop` (rapid-fire no-drop, #2089),
   and `jtbd-rich-formatting-render-dm` (Bot API rich-entity render
@@ -384,12 +463,27 @@ published to npm because publish wasn't gated. Don't let that recur.
   A tag push starts exactly two workflows — `docker-images` and `release` —
   and `release` sequences everything else: attach the four static binaries →
   wait for `docker-images` to conclude `success` for that exact tag+commit →
-  `workflow_call` into `npm-publish.yml` → un-draft the GitHub Release.
-  **`npm-publish.yml` has NO tag trigger.** npm is the only irreversible leg,
-  so it runs last, and it re-proves both preconditions from inside its own
-  run — a hand `workflow_dispatch` cannot half-ship either. Any red leg
-  leaves the release a draft with npm unpublished, which is recoverable;
-  re-dispatch `release.yml --ref vX.Y.Z -f dry_run=false` to resume.
+  `workflow_call` into `npm-publish.yml` → un-draft the GitHub Release →
+  promote `:latest`. **`npm-publish.yml` has NO tag trigger.** npm is the only
+  irreversible leg, so it runs late, and it re-proves both preconditions from
+  inside its own run — a hand `workflow_dispatch` cannot half-ship either. Any
+  red leg leaves the release a draft with npm unpublished, which is
+  recoverable; re-dispatch `release.yml --ref vX.Y.Z -f dry_run=false` to
+  resume.
+- **`:latest` follows the RELEASE, not the tag push (#3735, issue #3685).** A
+  `v*` tag push makes `docker-images.yml` publish `:vX.Y.Z` **only** — it no
+  longer moves `:latest` (only a main push still tags `:latest` + `:sha-<7>`).
+  `release.yml`'s terminal `images-latest` job runs `needs: finalize` (so after
+  binaries, `images-gate`, npm and the un-draft are all green) and
+  `workflow_call`s `promote.yml` with `from: vX.Y.Z, to: latest`, which retags
+  by manifest copy across all 9 images and verifies digest equality. Failure
+  mode is therefore `:latest` **lagging** the release — the previous good image
+  keeps serving installs and `switchroom update` — never `:latest` leading a
+  half-shipped one. Manual recovery: `gh workflow run promote.yml -f
+  from=vX.Y.Z -f to=latest`. `promote.yml`'s matrix must cover every image
+  `docker-images.yml` publishes on a tag or that image's `:latest` silently
+  stops advancing; R14 in `tests/release-pipeline-gating.test.ts` derives the
+  expected set and fails on drift.
 - **The GitHub Release is created as a DRAFT and only `finalize` publishes
   it.** `install.sh` resolves the version from `/releases/latest`, which
   excludes drafts — so an in-flight or failed release leaves the previous

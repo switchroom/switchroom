@@ -82,7 +82,7 @@ describe("secret-detect — DOES still fire on actually-shaped secrets (regressi
   // Locking in so a future regex-tightening doesn't over-shoot.
   // Values constructed at runtime so the source file doesn't trip
   // GitHub Push Protection — same pattern as
-  // secret-detect-secretlint.test.ts:1.
+  // secret-detect-sanctum.test.ts:18 (CLAUDE.md § Secrets in tests).
   const fakeApiKey = `sk-ant-${"a1b2c3d4".repeat(4)}XYZ987`; // sk-ant- + 32 chars
   const fakeBearer = `${"abc123".repeat(8)}.${"def456".repeat(4)}`;
   const fakeRandom = `${"x9zM4kP3qR7sT2vW".repeat(2)}`; // 32 chars, high entropy
