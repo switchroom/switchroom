@@ -1467,6 +1467,150 @@ export function hindsightPgEnvPairs(
   return hindsightPgEnv(resolveHindsightPgOverrides(perf?.env, perf?.processEnv));
 }
 
+/**
+ * THE complete container environment `startHindsight` launches with — every
+ * `-e` pair, in argv order, derived from the same inputs.
+ *
+ * Extracted from `startHindsight`'s body (2026-07-28) so the env is a VALUE
+ * that can be computed without launching anything. The recreate path has to
+ * answer "what will this container's env be?" *before* it removes the running
+ * container, and the only honest answer is the one the launcher itself will
+ * use — a second, parallel derivation would drift and quietly report the wrong
+ * diff. See {@link diffDroppedHindsightEnv} for what consumes it.
+ *
+ * Pure: no docker calls, no filesystem writes. It does read the persisted
+ * host-capabilities verdict (through `hindsightPerfEnvPairs` →
+ * `hindsightGpuEnabled`) unless `gpu` is passed explicitly.
+ */
+export function hindsightContainerEnvPairs(opts: {
+  /** Host API port; also the in-container API port under `--network host`. */
+  apiPort: number;
+  litellm?: LiteLLMHindsightConfig;
+  llm?: HindsightLlmConfig;
+  /** GPU verdict override; omit in production. See {@link hindsightGpuEnabled}. */
+  gpu?: boolean;
+  perf?: HindsightPerfOptions;
+}): Array<[string, string]> {
+  const { apiPort, litellm, llm, gpu, perf } = opts;
+
+  // Effective LLM provider + model, applying the operator override
+  // (top-level `hindsight.llm` in switchroom.yaml) over the hard-coded
+  // subscription-honest fallbacks. With LiteLLM routing enabled and no
+  // explicit `hindsight.llm.model`, the model default shifts to a cheap
+  // OpenRouter model (HINDSIGHT_DEFAULT_LITELLM_MODEL) — see
+  // resolveHindsightLlm — since the proxy can translate a non-Claude name.
+  const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
+
+  // Per-op LLM overrides (retain / reflect / consolidation). Only the vars an
+  // operator actually configured are emitted; an unset op inherits the global
+  // HINDSIGHT_API_LLM_* in the engine, so we emit nothing for it.
+  const perOpLlm = resolveHindsightPerOpLlm(llm);
+
+  // Non-secret env stays on `-e` — provider name is configuration, not a
+  // secret. `HINDSIGHT_API_LLM_PROVIDER=claude-code` selects the
+  // subscription-honest path; `HINDSIGHT_API_LLM_MODEL` pins the memory-ops
+  // model (default HINDSIGHT_DEFAULT_MODEL, or the cheap LiteLLM default,
+  // operator-overridable via `hindsight.llm`). The per-scope observation cap
+  // is emitted by the managed perf-defaults block below, not pinned here, so
+  // an operator can raise it through `hindsight.env`.
+  const pairs: Array<[string, string]> = [
+    ["HINDSIGHT_API_LLM_PROVIDER", llmProvider],
+    ["HINDSIGHT_API_LLM_MODEL", llmModel],
+    // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
+    ...perOpLlm,
+    ["HINDSIGHT_API_MCP_STATELESS", String(HINDSIGHT_DEFAULT_MCP_STATELESS)],
+    // Reranker smart-defaults, the reflect wall timeout and the consolidation
+    // scheduling knobs are NOT pinned here any more — they are emitted by the
+    // managed perf-defaults block below, so `hindsight.env` can reach them.
+    // Their rationale moved with them to hindsight-perf-defaults.ts.
+    // Retain output cap + the DERIVED per-call deadline for every lane
+    // (interactive / reflect / retain / consolidation). Asserted consistent by
+    // hindsightLlmBudgetEnv() before it returns — against the token budget
+    // (the 767.6s runaway, see the constants above) AND against each lane's
+    // litellm routing chain (src/litellm/timeout-budget.ts).
+    // …and the CONTEXT budget: consolidation batch size + the two completion
+    // caps, derived from the declared window so a prompt cannot overflow the
+    // backend's slot (an overflow returns HTTP 200 + garbage, never an error).
+    ...hindsightLlmBudgetEnv(llm),
+    // Stable worker identity (see HINDSIGHT_DEFAULT_WORKER_ID). Must be on
+    // the docker-run path — the entrypoint only fills the var with `:=` when
+    // unset, which is fine, but an explicit pin makes the intent legible in
+    // `docker inspect` and survives operators who wrap start without the
+    // entrypoint default.
+    ["HINDSIGHT_API_WORKER_ID", HINDSIGHT_DEFAULT_WORKER_ID],
+    // Capability-gated performance defaults (recall p90 5.83s / reflect p90
+    // 122s vs upstream's published 100-600ms / 800-3000ms). Emitted through
+    // ONE resolver shared with the compose path; every gated group is omitted
+    // on a host that cannot prove the capability, and an operator value in
+    // `hindsight.env` replaces the default rather than being appended after
+    // it. See src/setup/hindsight-perf-defaults.ts.
+    ...hindsightPerfEnvPairs(llm, litellm, gpu, perf),
+    // Embedded-PostgreSQL (pg0) sizing, read by hindsight-entrypoint.sh's
+    // pre-start. pg0 bakes its tuning into the postgres child's ARGV, which
+    // outranks `ALTER SYSTEM`, so pre-starting the instance is the only route
+    // that can change it. Best-effort in the entrypoint: a pre-start that
+    // fails leaves pg0's own defaults in place rather than blocking boot.
+    // See src/setup/hindsight-pg-defaults.ts.
+    ...hindsightPgEnvPairs(perf),
+  ];
+
+  // The `claude-code` provider drives an underlying claude subprocess; pin
+  // `ANTHROPIC_MODEL` to the same model so the subprocess (and any LiteLLM
+  // proxy it routes through, below) targets it. Only meaningful for the
+  // claude-code path — other providers ignore it.
+  if (llmProvider === "claude-code") {
+    pairs.push(["ANTHROPIC_MODEL", llmModel]);
+  }
+
+  if (litellm) {
+    // Host-network mode: the container shares the host network stack so
+    // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
+    // agent containers work. Explicit port env vars preserve the same
+    // external ports (18888/19999) the operator is used to.
+    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
+    // Claude models ride the Anthropic pass-through (<root>/anthropic,
+    // raw byte-forward, OAuth) — the model-mapped route re-chunks the SSE
+    // stream and stalls long Claude responses mid-flight (the 2026-07-05
+    // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
+    // root instead — the pass-through only forwards to the real Anthropic
+    // API, so a non-Claude model_name there 404s / always fails open.
+    const anthropicBaseUrl = isClaudeModel(llmModel)
+      ? `${litellmRoot}/anthropic`
+      : litellmRoot;
+    pairs.push(
+      // HINDSIGHT_API_PORT is the only port knob the upstream config.py
+      // recognizes; the CP service has no equivalent env var override.
+      ["HINDSIGHT_API_PORT", String(apiPort)],
+      // In host-network mode the container shares the host's network stack,
+      // so the CP dashboard's dataplane calls resolve `localhost:<port>`
+      // against host-bound listeners. The image default for the dataplane
+      // URL is `http://localhost:8888`, but 8888 is where we MOVED OFF (it's
+      // squatted on this host by an unrelated container → the dashboard's
+      // data calls 502 while the API is healthy on the API port). Pin the CP
+      // dataplane URL to the SAME port the API actually binds so it tracks
+      // any auto-bump instead of the stale 8888 default.
+      ["HINDSIGHT_CP_DATAPLANE_API_URL", `http://localhost:${apiPort}`],
+      // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
+      // consolidation/reflect calls hit the proxy for spend tracking.
+      ["ANTHROPIC_BASE_URL", anthropicBaseUrl],
+      [
+        "ANTHROPIC_CUSTOM_HEADERS",
+        `x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
+      ],
+    );
+  } else if (hindsightNeedsHostNetwork(llm, litellm)) {
+    // When only per-op loopback bases forced host net (no full litellm cfg),
+    // still pin API/CP ports the way the litellm branch does — otherwise the
+    // image default 8888 binds on the shared host stack.
+    pairs.push(
+      ["HINDSIGHT_API_PORT", String(apiPort)],
+      ["HINDSIGHT_CP_DATAPLANE_API_URL", `http://localhost:${apiPort}`],
+    );
+  }
+
+  return pairs;
+}
+
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
@@ -1496,109 +1640,13 @@ export function startHindsight(
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
 
-  // Effective LLM provider + model, applying the operator override
-  // (top-level `hindsight.llm` in switchroom.yaml) over the hard-coded
-  // subscription-honest fallbacks. With LiteLLM routing enabled and no
-  // explicit `hindsight.llm.model`, the model default shifts to a cheap
-  // OpenRouter model (HINDSIGHT_DEFAULT_LITELLM_MODEL) — see
-  // resolveHindsightLlm — since the proxy can translate a non-Claude name.
-  const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
-
-  // Per-op LLM overrides (retain / reflect / consolidation). Only the vars an
-  // operator actually configured are emitted; an unset op inherits the global
-  // HINDSIGHT_API_LLM_* in the engine, so we emit nothing for it.
-  const perOpLlm = resolveHindsightPerOpLlm(llm);
-
-  // Non-secret env stays on `-e` — provider name is configuration, not a
-  // secret. `HINDSIGHT_API_LLM_PROVIDER=claude-code` selects the
-  // subscription-honest path; `HINDSIGHT_API_LLM_MODEL` pins the memory-ops
-  // model (default HINDSIGHT_DEFAULT_MODEL, or the cheap LiteLLM default,
-  // operator-overridable via `hindsight.llm`). The per-scope observation cap
-  // is emitted by the managed perf-defaults block below, not pinned here, so
-  // an operator can raise it through `hindsight.env`.
-  const envArgs: string[] = [
-    "-e", `HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
-    "-e", `HINDSIGHT_API_LLM_MODEL=${llmModel}`,
-    // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
-    ...perOpLlm.flatMap(([k, v]) => ["-e", `${k}=${v}`]),
-    "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
-    // Reranker smart-defaults, the reflect wall timeout and the consolidation
-    // scheduling knobs are NOT pinned here any more — they are emitted by the
-    // managed perf-defaults block below, so `hindsight.env` can reach them.
-    // Their rationale moved with them to hindsight-perf-defaults.ts.
-    // Retain output cap + the DERIVED per-call deadline for every lane
-    // (interactive / reflect / retain / consolidation). Asserted consistent by
-    // hindsightLlmBudgetEnv() before it returns — against the token budget
-    // (the 767.6s runaway, see the constants above) AND against each lane's
-    // litellm routing chain (src/litellm/timeout-budget.ts).
-    // …and the CONTEXT budget: consolidation batch size + the two completion
-    // caps, derived from the declared window so a prompt cannot overflow the
-    // backend's slot (an overflow returns HTTP 200 + garbage, never an error).
-    ...hindsightLlmBudgetEnv(llm).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
-    // Stable worker identity (see HINDSIGHT_DEFAULT_WORKER_ID). Must be on
-    // the docker-run path — the entrypoint only fills the var with `:=` when
-    // unset, which is fine, but an explicit pin makes the intent legible in
-    // `docker inspect` and survives operators who wrap start without the
-    // entrypoint default.
-    "-e", `HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
-    // Capability-gated performance defaults (recall p90 5.83s / reflect p90
-    // 122s vs upstream's published 100-600ms / 800-3000ms). Emitted through
-    // ONE resolver shared with the compose path; every gated group is omitted
-    // on a host that cannot prove the capability, and an operator value in
-    // `hindsight.env` replaces the default rather than being appended after
-    // it. See src/setup/hindsight-perf-defaults.ts.
-    ...hindsightPerfEnvPairs(llm, litellm, gpu, perf).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
-    // Embedded-PostgreSQL (pg0) sizing, read by hindsight-entrypoint.sh's
-    // pre-start. pg0 bakes its tuning into the postgres child's ARGV, which
-    // outranks `ALTER SYSTEM`, so pre-starting the instance is the only route
-    // that can change it. Best-effort in the entrypoint: a pre-start that
-    // fails leaves pg0's own defaults in place rather than blocking boot.
-    // See src/setup/hindsight-pg-defaults.ts.
-    ...hindsightPgEnvPairs(perf).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
-  ];
-
-  // The `claude-code` provider drives an underlying claude subprocess; pin
-  // `ANTHROPIC_MODEL` to the same model so the subprocess (and any LiteLLM
-  // proxy it routes through, below) targets it. Only meaningful for the
-  // claude-code path — other providers ignore it.
-  if (llmProvider === "claude-code") {
-    envArgs.push("-e", `ANTHROPIC_MODEL=${llmModel}`);
-  }
-
-  if (litellm) {
-    // Host-network mode: the container shares the host network stack so
-    // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
-    // agent containers work. Explicit port env vars preserve the same
-    // external ports (18888/19999) the operator is used to.
-    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
-    // Claude models ride the Anthropic pass-through (<root>/anthropic,
-    // raw byte-forward, OAuth) — the model-mapped route re-chunks the SSE
-    // stream and stalls long Claude responses mid-flight (the 2026-07-05
-    // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
-    // root instead — the pass-through only forwards to the real Anthropic
-    // API, so a non-Claude model_name there 404s / always fails open.
-    const anthropicBaseUrl = isClaudeModel(llmModel)
-      ? `${litellmRoot}/anthropic`
-      : litellmRoot;
-    envArgs.push(
-      // HINDSIGHT_API_PORT is the only port knob the upstream config.py
-      // recognizes; the CP service has no equivalent env var override.
-      "-e", `HINDSIGHT_API_PORT=${apiPort}`,
-      // In host-network mode the container shares the host's network stack,
-      // so the CP dashboard's dataplane calls resolve `localhost:<port>`
-      // against host-bound listeners. The image default for the dataplane
-      // URL is `http://localhost:8888`, but 8888 is where we MOVED OFF (it's
-      // squatted on this host by an unrelated container → the dashboard's
-      // data calls 502 while the API is healthy on ${apiPort}). Pin the CP
-      // dataplane URL to the SAME port the API actually binds so it tracks
-      // any auto-bump instead of the stale 8888 default.
-      "-e", `HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${apiPort}`,
-      // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
-      // consolidation/reflect calls hit the proxy for spend tracking.
-      "-e", `ANTHROPIC_BASE_URL=${anthropicBaseUrl}`,
-      "-e", `ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
-    );
-  }
+  const envArgs: string[] = hindsightContainerEnvPairs({
+    apiPort,
+    litellm,
+    llm,
+    gpu,
+    perf,
+  }).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
 
   const args = [
     "run", "-d",
@@ -1665,15 +1713,8 @@ export function startHindsight(
     // Host network: ports are published directly (no -p flags). Required so
     // loopback LiteLLM (127.0.0.1:4010) is reachable from the container.
     args.push("--network", "host");
-    // When only per-op loopback bases forced host net (no full litellm cfg),
-    // still pin API/CP ports the way the litellm branch does — otherwise the
-    // image default 8888 binds on the shared host stack.
-    if (!litellm) {
-      envArgs.push(
-        "-e", `HINDSIGHT_API_PORT=${apiPort}`,
-        "-e", `HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${apiPort}`,
-      );
-    }
+    // (The API/CP port pins that host-network mode needs are emitted by
+    // hindsightContainerEnvPairs — see its host-network branch.)
   } else {
     args.push(
       "-p", `127.0.0.1:${apiPort}:8888`,
@@ -1894,6 +1935,83 @@ function getHindsightPortsFromEnv(): { apiPort: number; uiPort: number } | null 
     readVar("HINDSIGHT_UI_PORT") ??
     (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
   return { apiPort, uiPort };
+}
+
+/**
+ * `Config.Env` of the RUNNING hindsight container, as a `["K=V", …]` array.
+ *
+ * Read before a `--recreate` removes the container, so the drift check can see
+ * what is about to be thrown away (see src/setup/hindsight-env-drift.ts).
+ * `{{json .Config.Env}}` rather than the bare `{{.Config.Env}}` used by
+ * {@link getHindsightPortsFromEnv}: the bracketed Go-list rendering is
+ * whitespace-delimited and this env DOES contain values with spaces and
+ * newlines (`ANTHROPIC_CUSTOM_HEADERS`), so a token split would corrupt them.
+ *
+ * Returns null when the container does not exist or is not inspectable — a
+ * first install has nothing to compare against, which is a no-op, not an error.
+ */
+export function getHindsightContainerEnv(): string[] | null {
+  return inspectEnv("switchroom-hindsight");
+}
+
+/**
+ * `Config.Env` of the IMAGE the running hindsight container was created from.
+ *
+ * The baseline the drift check subtracts, so image-inherited vars (`PATH`,
+ * `LANG`, `PYTHON_VERSION`, …) are not reported as drops. Resolved from the
+ * container's own `.Image` digest rather than from `hindsightImageRef()`: the
+ * live container may predate the tag this recreate is pulling, and the baseline
+ * has to describe the container we are actually replacing.
+ *
+ * Returns null when it can't be resolved; callers then use an empty baseline,
+ * which is noisier but never wrong in the unsafe direction.
+ */
+export function getHindsightImageEnv(): string[] | null {
+  let imageId: string;
+  try {
+    imageId = execFileSync(
+      "docker",
+      ["inspect", "--format", "{{.Image}}", "switchroom-hindsight"],
+      { stdio: "pipe", encoding: "utf-8" },
+    ).trim();
+  } catch {
+    return null;
+  }
+  if (!imageId) return null;
+  return inspectEnv(imageId);
+}
+
+/** Shared `docker inspect --format '{{json .Config.Env}}'` read. */
+function inspectEnv(ref: string): string[] | null {
+  try {
+    const out = execFileSync(
+      "docker",
+      ["inspect", "--format", "{{json .Config.Env}}", ref],
+      { stdio: "pipe", encoding: "utf-8" },
+    );
+    const parsed = JSON.parse(out.trim()) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((e): e is string => typeof e === "string");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The capability verdicts the next launch will actually use, exposed so the
+ * recreate path can EXPLAIN a dropped managed default rather than merely list
+ * it. Same single derivation `hindsightPerfEnvPairs` runs — not a second copy.
+ */
+export function hindsightResolvedCapabilities(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+  gpu?: boolean,
+  perf?: HindsightPerfOptions,
+): { gpu: boolean; localLlm: boolean } {
+  return {
+    gpu: hindsightGpuEnabled(gpu),
+    localLlm: hindsightLocalLlmEnabled(llm, litellm, perf?.localLlm),
+  };
 }
 
 /**

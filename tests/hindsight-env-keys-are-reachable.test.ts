@@ -75,12 +75,41 @@ describe("promoted container-env keys are reachable from switchroom.yaml", () =>
       "HINDSIGHT_API_LLM_MODEL",
       "HINDSIGHT_API_WORKER_ID",
       "HINDSIGHT_API_MCP_STATELESS",
+      // The asserted LLM budget (hindsightLlmBudgetEnv). Every one of these is
+      // COMPUTED from the declared context window / timeout chain and then
+      // cross-checked by assertHindsight*Budget before it is returned, so an
+      // operator override would break the assertion it exists to enforce.
+      // They were always allowed by this test's stated invariant ("… or the
+      // asserted LLM budget"); they only need naming now because the patterns
+      // below also see the `["KEY", value]` pair form they are written in.
+      "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
+      "HINDSIGHT_API_LLM_TIMEOUT",
+      "HINDSIGHT_API_REFLECT_LLM_TIMEOUT",
+      "HINDSIGHT_API_RETAIN_LLM_TIMEOUT",
+      "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT",
+      "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE",
+      "HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS",
+      "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS",
     ]);
 
+    // NOT derived, and NOT excused: a genuine pre-existing instance of this
+    // defect that the old pattern could not see (it is a bare string literal,
+    // never a template). Carved out rather than fixed here so this change stays
+    // single-concern, and named explicitly so it cannot be quietly forgotten.
+    const KNOWN_UNREACHABLE = new Set(["HINDSIGHT_API_METRICS_INCLUDE_BANK_ID"]);
+
     const pinned = new Set<string>();
+    // Two shapes, because the docker-run env is now built as `["KEY", value]`
+    // pairs (hindsightContainerEnvPairs) while the compose snippet still
+    // renders `- KEY=${value}` templates. Matching only the template form
+    // would leave the entire run path unguarded.
     for (const m of src.matchAll(/`(?:\s+- )?(HINDSIGHT_API_[A-Z0-9_]+)=\$\{/g)) {
       pinned.add(m[1]!);
     }
+    for (const m of src.matchAll(/\[\s*"(HINDSIGHT_API_[A-Z0-9_]+)"\s*,/g)) {
+      pinned.add(m[1]!);
+    }
+    for (const k of KNOWN_UNREACHABLE) pinned.delete(k);
 
     const offenders = [...pinned].filter((k) => !DERIVED.has(k)).sort();
     expect(
