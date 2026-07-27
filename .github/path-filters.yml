@@ -40,6 +40,10 @@ lint:
   - 'telegram-plugin/bun.lock'
   - 'scripts/check-*.mjs'
   - 'scripts/check-bot-api-wrapping.sh'
+  # Guard allowlists (check-status-pin-single-path, test-runner-coverage, the
+  # hermeticity checks). An allowlist edit is a deliberate loosening of a
+  # guard's scope and must re-run that guard, not skip it.
+  - 'scripts/check-*-allowlist.txt'
   # The release asset-name contract (#3633): install.sh and the parser +
   # verifier behind check-release-asset-names.mjs. install.sh matched NOTHING
   # here before, so a PR that only edited the installer skipped the very guard

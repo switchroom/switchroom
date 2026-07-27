@@ -7,7 +7,7 @@
  * claimed-but-never-painted pin, or (worse, Defect B's shape) a dropped claim
  * plus a deleted durable row for a message that is still pinned.
  *
- * The assertions below are OUTCOMES read off `reconcilePin`'s returned state
+ * The assertions below are OUTCOMES read off `executePinLeg`'s returned state
  * (does the gateway still hold a record of the pinned message?), not "was some
  * function called".
  */
@@ -20,7 +20,7 @@ import {
   type PinCapableBot,
 } from '../gateway/status-pin-api.js'
 import { SEND_GATE_SHED } from '../send-gate.js'
-import { reconcilePin } from '../status-pin-driver.js'
+import { executePinLeg } from '../status-pin-driver.js'
 
 /** A bot whose API always succeeds — so any failure below comes from the gate
  *  seam, never from Telegram. */
@@ -38,14 +38,14 @@ const shedRobust = async () => SEND_GATE_SHED as unknown
 describe('assertLanded — a shed send must not look like a landed one (#3664)', () => {
   it('a shed unpin does NOT drop the claim — the message is still pinned', async () => {
     const api = createStatusPinApi(liveBot, shedRobust)
-    const next = await reconcilePin({
+    const next = await executePinLeg({
       api,
       chatId: '-100123',
       prevState: { messageId: 715 },
-      desired: { pinned: false },
+      action: { kind: 'unpin', messageId: 715 },
       onError: () => {},
     })
-    // Without assertLanded the shed resolves success-shaped, reconcilePin
+    // Without assertLanded the shed resolves success-shaped, executePinLeg
     // returns null, and reconcileAndPersistStatusPin then DELETES the durable
     // row for a message that is provably still pinned — Defect B, reopened.
     expect(next).toEqual({ messageId: 715 })
@@ -53,11 +53,11 @@ describe('assertLanded — a shed send must not look like a landed one (#3664)',
 
   it('a shed pin does not claim the message', async () => {
     const api = createStatusPinApi(liveBot, shedRobust)
-    const next = await reconcilePin({
+    const next = await executePinLeg({
       api,
       chatId: '-100123',
       prevState: null,
-      desired: { pinned: true, messageId: 715 },
+      action: { kind: 'pin', messageId: 715 },
       onError: () => {},
     })
     // Claiming it would leave the gateway believing a pin exists that never
@@ -84,11 +84,11 @@ describe('assertLanded — a shed send must not look like a landed one (#3664)',
     const api = createStatusPinApi(liveBot, async () => undefined)
     await expect(api.unpinChatMessage('-100123', 715)).resolves.toBeUndefined()
 
-    const next = await reconcilePin({
+    const next = await executePinLeg({
       api,
       chatId: '-100123',
       prevState: { messageId: 715 },
-      desired: { pinned: false },
+      action: { kind: 'unpin', messageId: 715 },
       onError: () => {},
     })
     expect(next).toBeNull()
@@ -127,11 +127,11 @@ describe('assertBotReady — named backstop for a pre-ready caller (#3664)', () 
 
   it('a pre-ready unpin failure RETAINS the claim (it never reached Telegram)', async () => {
     const api = createStatusPinApi(() => undefined, passthrough)
-    const next = await reconcilePin({
+    const next = await executePinLeg({
       api,
       chatId: '-100123',
       prevState: { messageId: 715 },
-      desired: { pinned: false },
+      action: { kind: 'unpin', messageId: 715 },
       onError: () => {},
     })
     expect(next).toEqual({ messageId: 715 })

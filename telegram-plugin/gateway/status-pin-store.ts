@@ -70,6 +70,27 @@ export interface PersistedStatusPin {
    *  unpin fails (flood-wait exhausted / transient 5xx); the row is retained
    *  for retry until BOOT_UNPIN_MAX_ATTEMPTS, then forfeited. Absent = 0. */
   attempts?: number
+  /**
+   * Wall-clock ms the pin was FIRST claimed for this key+message (#3810).
+   *
+   * Why the store needs it: the mid-session `wk:` reaper folds in rows that
+   * exist on disk but have NO in-memory claim (`storeOnlyWorkerPinCandidates`).
+   * The store used to persist no timestamp, so those candidates were stamped
+   * `pinnedAt = now` on every pass — deliberately, to avoid a spurious unpin of
+   * a pin whose real age was unknown, but with the side effect that the TTL
+   * gate could NEVER fire for a store orphan. Combined with a `wk:<agentId>`
+   * whose turnsDb row is gone (verdict `'unknown'`, never `'terminal'`), such a
+   * row was never mid-session reaped AT ALL — it waited for the next boot, the
+   * exact "stale pin glued to the top of the chat" failure the reaper exists to
+   * prevent.
+   *
+   * Recording the real claim time removes the guess: a store orphan now ages
+   * honestly and the ordinary TTL applies. Optional so a v1/v2 snapshot still
+   * loads; a row without it keeps the old conservative `now` stamp (terminal-
+   * only reaping), which self-clears within one restart since every write from
+   * this version onward carries the field.
+   */
+  pinnedAt?: number
 }
 
 /** How many boots may retry a failing boot-cleanup unpin before the row is
@@ -80,12 +101,17 @@ export interface PersistedStatusPin {
 export const BOOT_UNPIN_MAX_ATTEMPTS = 5
 
 /** Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
- *  pin (pending undefined). v2 adds the optional `pending` flag. Both load
- *  fail-open — an unknown/newer version yields []. */
+ *  pin (pending undefined). v2 adds the optional `pending` flag. v3 adds the
+ *  optional `pinnedAt` claim timestamp (#3810). All load fail-open — an
+ *  unknown/newer version yields []. Every field added since v1 is optional, so
+ *  the versions are mutually readable and a downgrade degrades rather than
+ *  breaks. */
 interface SnapshotEnvelope {
-  v: 1 | 2
+  v: 1 | 2 | 3
   pins: PersistedStatusPin[]
 }
+
+const SNAPSHOT_VERSIONS = new Set([1, 2, 3])
 
 function isPinRow(x: unknown): x is PersistedStatusPin {
   if (x == null || typeof x !== 'object') return false
@@ -98,7 +124,8 @@ function isPinRow(x: unknown): x is PersistedStatusPin {
     typeof o.messageId === 'number' &&
     (o.pending === undefined || typeof o.pending === 'boolean') &&
     (o.expiresAt === undefined || typeof o.expiresAt === 'number') &&
-    (o.attempts === undefined || typeof o.attempts === 'number')
+    (o.attempts === undefined || typeof o.attempts === 'number') &&
+    (o.pinnedAt === undefined || typeof o.pinnedAt === 'number')
   )
 }
 
@@ -127,7 +154,7 @@ export function loadStatusPins(
   }
   if (parsed == null || typeof parsed !== 'object') return []
   const env = parsed as Record<string, unknown>
-  if ((env.v !== 1 && env.v !== 2) || !Array.isArray(env.pins)) return []
+  if (typeof env.v !== 'number' || !SNAPSHOT_VERSIONS.has(env.v) || !Array.isArray(env.pins)) return []
   return env.pins.filter(isPinRow)
 }
 
@@ -143,7 +170,7 @@ export function persistStatusPins(
   snapshot: readonly PersistedStatusPin[],
   log: (line: string) => void = (l) => process.stderr.write(l),
 ): void {
-  const env: SnapshotEnvelope = { v: 2, pins: [...snapshot] }
+  const env: SnapshotEnvelope = { v: 3, pins: [...snapshot] }
   const tmp = path + '.tmp'
   try {
     fs.writeFileSync(tmp, JSON.stringify(env))
@@ -427,16 +454,34 @@ export function reconcileAndPersistStatusPin(args: {
   /** Execute the real pin/unpin; returns the confirmed message id (pin) or
    *  null (cleared). Must never throw — API errors are swallowed inside. */
   applyPin: () => Promise<{ messageId: number } | null>
+  /** Clock for the `pinnedAt` stamp (#3810). Defaults to wall clock. */
+  now?: number
   log?: (line: string) => void
 }): Promise<{ messageId: number } | null> {
   const { path, fs, pinKey, chatId, op } = args
   const log = args.log ?? ((l: string) => process.stderr.write(l))
+  const now = args.now ?? Date.now()
+
+  /**
+   * The claim age to persist for `messageId`. Carried forward from the row
+   * already on disk when it names the SAME message (a steady-state re-write
+   * must not reset the age and hand a stale pin a fresh TTL lease); stamped
+   * `now` for a genuinely new pin. Mirrors the in-memory `pinnedAt` rule in
+   * `status-pin-retarget.ts` so disk and memory can't disagree about age.
+   */
+  const claimAge = (messageId: number): number => {
+    const existing = loadStatusPins(path, fs).find((p) => p.pinKey === pinKey)
+    return existing?.messageId === messageId && existing.pinnedAt != null
+      ? existing.pinnedAt
+      : now
+  }
 
   // Hold the per-path lock across the WHOLE op so no other writer (a banner
   // persist, or another key's reconcile) can rebuild/overwrite the file during
   // the applyPin await window and drop this key's pending/confirmed row.
   return withStoreLock(path, async () => {
     if (op.kind === 'pin') {
+      const pinnedAt = claimAge(op.messageId)
       // Persist INTENT first, marked pending — BEFORE the pin API call. If we
       // crash after the pin lands but before the confirm rewrite, this pending
       // record is what boot cleanup uses to unpin the orphan.
@@ -444,7 +489,7 @@ export function reconcileAndPersistStatusPin(args: {
         path,
         fs,
         pinKey,
-        { pinKey, chatId, messageId: op.messageId, pending: true },
+        { pinKey, chatId, messageId: op.messageId, pending: true, pinnedAt },
         log,
       )
       const next = await args.applyPin()
@@ -459,7 +504,7 @@ export function reconcileAndPersistStatusPin(args: {
         path,
         fs,
         pinKey,
-        { pinKey, chatId, messageId: next.messageId },
+        { pinKey, chatId, messageId: next.messageId, pinnedAt: claimAge(next.messageId) },
         log,
       )
       return next
@@ -488,11 +533,15 @@ export function reconcileAndPersistStatusPin(args: {
     if (next == null) {
       applyStatusPinRow(path, fs, pinKey, null, log)
     } else {
+      // Steady-state noop-clear (the worker feed calls syncPin on every edit):
+      // the pin is still up, so the row is preserved AND so is its original
+      // claim age — re-stamping it here would hand a genuinely old pin a fresh
+      // TTL lease on every feed edit and make it immortal (#3810).
       applyStatusPinRow(
         path,
         fs,
         pinKey,
-        { pinKey, chatId, messageId: next.messageId },
+        { pinKey, chatId, messageId: next.messageId, pinnedAt: claimAge(next.messageId) },
         log,
       )
     }

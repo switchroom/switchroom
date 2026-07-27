@@ -217,7 +217,8 @@ obligation:
 `check-no-broadcast-delivery`, `check-stale-tool-descriptions`,
 `check-mcp-instructions-budget`, `check-web-subscription-honest`,
 `check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
-`check-litellm-config-guard`, `check-release-asset-names`.
+`check-litellm-config-guard`, `check-release-asset-names`,
+`check-status-pin-single-path`.
 
 Traps that bite repeatedly:
 
@@ -260,6 +261,64 @@ GitHub Push Protection blocks token-shaped literals even in fixtures. Build
 fake tokens by runtime concatenation (`"sk-ant-" + "fake"`); pattern:
 `telegram-plugin/tests/secret-detect-false-positives.test.ts` (~:86) and
 `telegram-plugin/tests/secret-detect-sanctum.test.ts` (~:18).
+
+## Progress surfaces and pins — one path only
+
+Status pins (the foreground activity card, worker feeds, the slot banner, tool
+cards) are a **single-path subsystem**. There is exactly one implementation and
+you may not add a second, not even "temporarily" or "just for this one call
+site". #3831 is what happens otherwise: the retarget expansion existed twice —
+once in the orchestrator, once inside the driver — with *different* persistence
+semantics, the second copy unreachable in production and quietly drifting until
+someone wired it up.
+
+The path, top to bottom:
+
+```
+caller (narrative lane / worker feed / turn-end / reaper / boot sweep)
+  → gateway `reconcileStatusPin(pinKey, chatId, desired)`      gateway.ts
+    → runStatusPinReconcile()          gateway/status-pin-retarget.ts
+         the ONLY decider (decidePinAction) and retarget expansion
+      → reconcileAndPersistStatusPin() gateway/status-pin-store.ts
+           persist-BEFORE-pin; the ONLY writer of status-pins.json
+        → executePinLeg()              status-pin-driver.ts
+             executes ONE decided leg; its `PinLegAction` type cannot
+             express a repin, so the fork cannot grow back
+          → createStatusPinApi()       gateway/status-pin-api.ts
+               the ONLY raw pinChatMessage / unpinChatMessage surface
+```
+
+Rules, in the order you are most likely to trip them:
+
+- **Want something pinned or unpinned? Call `reconcileStatusPin`.** Never
+  `bot.api.pinChatMessage` / `unpinChatMessage` / `unpinAllChatMessages`
+  directly. Only that path keeps the in-memory claim, the durable
+  `status-pins.json` row and Telegram in agreement — which is what lets the
+  mid-session reaper and the boot sweep clean up after a crash.
+- **Never call `decidePinAction` yourself, and never name a `'repin'`** outside
+  `status-pin.ts` / `status-pin-retarget.ts`. That is the #3831 fork verbatim.
+- **Never mutate the claim registry** (`statusPinClaims.set/delete/clear`).
+  Read it freely; it is written only by handing it to `runStatusPinReconcile`.
+  Writing it out of band re-creates #3809 — a claim the reaper can never act on.
+- **Never write `status-pins.json` directly.** `reconcileAndPersistStatusPin`
+  owns the persist-BEFORE-pin ordering crash recovery depends on.
+- **Never compose the orchestrator + driver a second time.** One wiring, in
+  `gateway.ts`; a second composition is a second subsystem with its own claims.
+
+`scripts/check-status-pin-single-path.mjs` (in `npm run lint`, so it fails CI)
+enforces all five statically, with actionable failure messages. Sanctioned files
+live in `scripts/check-status-pin-single-path-allowlist.txt` — adding one is a
+deliberate, reviewable edit, which is the point; the raw-API and store-write
+rules also take an inline `// allow-raw-pin: <reason>` /
+`// allow-raw-pin-store: <reason>` escape (a reason is mandatory). The decider,
+expansion and claim-registry rules have **no escape at all**.
+
+Outcome coverage lives in `telegram-plugin/tests/status-pin-lifecycle.test.ts`,
+which drives the real modules with fakes only at the Telegram/fs boundary and
+asserts observable pin/unpin calls across claim → retarget → worker pin →
+restart-with-stale-claim → SIGTERM → bridge flap → done. Extend it rather than
+writing a unit test of a helper: this area regresses through *composition*, not
+through individual functions.
 
 ## CI
 

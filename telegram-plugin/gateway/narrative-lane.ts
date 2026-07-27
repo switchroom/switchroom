@@ -838,6 +838,20 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
           id,
         )
       }
+      // #3812 — release the status-pin claim BEFORE the message goes away,
+      // symmetric with the durable card-record drop above. `turn-end.ts` also
+      // unpins `fg:<statusKey>`, but that runs LATER: on the
+      // CLEAR_STATUS_ON_COMPLETION path the message is DELETED here, so by turn
+      // end the claim named a dead id and the unpin was a guaranteed-4xx API
+      // call every single turn. Worse, the durable status-pins.json row pointed
+      // at a deleted message for that whole window, so a crash there handed the
+      // next boot's sweep a row it would also fail to unpin — burning an
+      // attempt off the BOOT_UNPIN_MAX_ATTEMPTS forfeit ladder for nothing.
+      //
+      // AWAITED so the unpin (and its durable-row clear) is ordered strictly
+      // before the delete. turn-end stays the idempotent backstop: it no-ops
+      // once nothing is claimed for the key.
+      await reconcileStatusPin(`fg:${statusKey(chat, thread)}`, chat, { pinned: false })
       if (CLEAR_STATUS_ON_COMPLETION) {
         try {
           await robustApiCall(
