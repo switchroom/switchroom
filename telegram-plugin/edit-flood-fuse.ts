@@ -56,11 +56,12 @@
  *   - send gate `editFloorMs` = 1500ms          ⇒ up to 40 edits/min/message
  *   - send gate cosmetic budget 150 / 300s      ⇒ 30 edits/min/message
  *   - worker feed's own floor 2500ms            ⇒ 24 edits/min/message
+ *   - gateway `FEED_HEARTBEAT_TICK_MS` = 6000ms ⇒ 10 repaints/min/turn
  *
- * The per-message ceiling here is 20/60s, i.e. BELOW all three. That is
- * deliberate — Telegram's own per-group limit is ~20 messages/minute and
- * edits count against it, so the *legitimate* cadences are themselves above
- * what Telegram tolerates; that is precisely how `overlord` got banned while
+ * The fuse's cosmetic ceilings sit BELOW all of these. That is deliberate —
+ * Telegram's own per-group limit is ~20 messages/minute and edits count
+ * against it, so the *legitimate* cadences are themselves above what
+ * Telegram tolerates; that is precisely how `overlord` got banned while
  * every in-repo pacer believed it was behaving. The fuse is therefore the
  * BINDING constraint on a hot card, not a never-reached backstop.
  *
@@ -74,12 +75,58 @@
  *     RELEASED late instead of dropped. Dropping it would freeze the card
  *     mid-run AND return `true` to the send gate, which would then record a
  *     never-painted payload as on-screen and no-op-skip every retry.
+ *
+ * ── 2026-07-27: the fuse existed and the ban happened anyway ──────────────
+ * The ceilings above were sized against the in-repo pacers, not against what
+ * Telegram actually tolerates. Agent `overlord` then sustained ~17
+ * `editMessageText`/min on ONE DM chat for hours (326 edits against 6 real
+ * replies in the final 20 minutes) and took a **15908-second** flood ban that
+ * severed every outbound reply. Both original ceilings — 20 edits/60s per
+ * message, 30 edits/60s per chat — sat ABOVE that observed rate, so the fuse
+ * never bound once. Three structural changes follow, and each is a separate,
+ * independently-sufficient reason the same incident cannot recur:
+ *
+ *   1. **Class awareness.** The fuse now reads the send gate's priority class
+ *      off `outbound-class.ts` (AsyncLocalStorage). `cosmetic` traffic — every
+ *      activity/worker/liveness repaint — is governed by its own, much tighter
+ *      ceilings; `useful` / `critical` edits (approval cards, answers) are not
+ *      throttled by them. Previously the fuse was class-blind and had to pick
+ *      one number for both, which is why the number was too high.
+ *   2. **A hard cosmetic rate ceiling.** 4 edits/60s per message (one per 15s,
+ *      matching the worker feed's own `elapsedRefreshMs`) and 6 edits/60s per
+ *      chat across ALL cosmetic surfaces. 6/min is below the ~4-6/min band the
+ *      live chat survived for hours and far below the 15-17/min that earned
+ *      the ban. Coalescing (supersede) means the card still shows CURRENT
+ *      state at every permitted edit — the operator loses refresh frequency,
+ *      never accuracy.
+ *   3. **A shared per-chat budget with a reply reservation.** Telegram meters
+ *      sends and edits against the SAME per-chat allowance, so separate
+ *      edit/send windows could each be "in budget" while their sum was not.
+ *      One `perChatTotalMaxPerWindow` window (default 20/60s) now counts
+ *      every admitted call, and `perChatReplyReserve` (default 8) slots of it
+ *      are unreachable by `cosmetic` traffic. A reply therefore cannot be
+ *      starved by repaints even if a future call site is misclassified.
+ *
+ * Plus **escalating** backoff: a 429 used to apply ONE 0.5× tightening for a
+ * flat 10 minutes, so a stream that took repeated small 429s re-tightened to
+ * the same level forever and walked into the big ban. Tightening is now
+ * multiplicative PER 429 (`tightenFactor ^ level`, level capped by
+ * `maxTightenLevel`) and decays one level at a time, so sustained pressure
+ * ratchets the cosmetic rate down towards the floor of 1/window.
+ *
+ * Every ceiling is operator-overridable via env — see
+ * {@link editFloodFuseConfigFromEnv}. Previously none of them were.
  */
 
 import type { Bot } from 'grammy'
 
 import type { Clock } from './send-gate.js'
 import { systemClock } from './send-gate.js'
+import {
+  currentOutboundClass,
+  defaultOutboundClass,
+  type OutboundClass,
+} from './outbound-class.js'
 
 /** Methods that mutate an EXISTING message — droppable, coalescible. */
 const EDIT_METHODS: ReadonlySet<string> = new Set([
@@ -116,22 +163,68 @@ export interface EditFloodFuseConfig {
   /** Master switch. When false, `apply` is a pure passthrough. Default true. */
   enabled?: boolean
   clock?: Clock
-  /** Hard ceiling on edits to ONE message id. Default 20 per 60s. */
+  /**
+   * Hard ceiling on NON-cosmetic (`useful` / `critical`) edits to ONE message
+   * id. Default 20 per 60s. Approval cards and answer finalisations live here;
+   * they are low-cadence by nature, so this stays a backstop, not a pacer.
+   */
   perMessageMaxPerWindow?: number
   perMessageWindowMs?: number
-  /** Hard ceiling on edits to ONE chat across all messages. Default 30 per 60s. */
+  /** Hard ceiling on ALL edits to ONE chat across all messages. Default 30 per 60s. */
   perChatEditMaxPerWindow?: number
   /** Pacing ceiling on non-edit sends to ONE chat. Default 25 per 60s. */
   perChatSendMaxPerWindow?: number
+  /**
+   * ADDITIONAL ceiling applied to COSMETIC edits of ONE message id, on top of
+   * `perMessageMaxPerWindow` (the effective ceiling is the lower of the two).
+   * Default 4 per 60s — one per 15s, matching the worker feed's
+   * `elapsedRefreshMs`. This is the number that bounds a hot progress card.
+   */
+  cosmeticPerMessageMaxPerWindow?: number
+  /**
+   * ADDITIONAL ceiling applied to COSMETIC edits in ONE chat, summed across
+   * every cosmetic surface in it (lower of this and `perChatEditMaxPerWindow`
+   * binds). Default 6 per 60s. Without it, N concurrent cards each inside their
+   * own per-message ceiling still add up to a flood.
+   */
+  cosmeticPerChatMaxPerWindow?: number
+  /**
+   * Shared per-chat allowance counting EVERY admitted call — edits and sends,
+   * every class. Default 20 per 60s, matching Telegram's own per-chat/group
+   * metering (which does not separate the two). Sends and non-cosmetic edits
+   * are paced against it and never dropped.
+   */
+  perChatTotalMaxPerWindow?: number
+  /**
+   * Slots of `perChatTotalMaxPerWindow` that `cosmetic` traffic may NEVER
+   * consume. Default 8. This is the reply-starvation guarantee: whatever the
+   * repaint surfaces do, at least this many calls per window remain available
+   * to an actual answer.
+   */
+  perChatReplyReserve?: number
+  /**
+   * Cap on COSMETIC edits that may be released late (over budget) because
+   * nothing newer will repaint them — the bounded form of the R1 rule. Default
+   * 2 per `perChatWindowMs`, so the worst-case sustained cosmetic rate is
+   * `cosmeticPerChatMaxPerWindow + lateReleaseMaxPerWindow`.
+   */
+  lateReleaseMaxPerWindow?: number
   perChatWindowMs?: number
   /** Longest a call may be held before it is dropped (edit) / released (send). Default 30s. */
   maxDeferMs?: number
-  /** Multiplicative decrease applied to every ceiling after a 429. Default 0.5. */
+  /** Multiplicative decrease applied per observed 429. Default 0.5. */
   tightenFactor?: number
-  /** How long a tightened ceiling stays in force. Default 10 minutes. */
+  /** How long ONE level of tightening stays in force before decaying. Default 10 minutes. */
   tightenMs?: number
+  /** Cap on compounding 429 tightening levels. Default 4 (⇒ 0.5^4 = 1/16). */
+  maxTightenLevel?: number
   /** Observability hook; fired whenever the fuse binds. */
-  onTrip?: (info: { method: string; key: string; action: 'deferred' | 'dropped' | 'superseded' }) => void
+  onTrip?: (info: {
+    method: string
+    key: string
+    action: 'deferred' | 'dropped' | 'superseded'
+    cls: OutboundClass
+  }) => void
 }
 
 export interface EditFloodFuseStats {
@@ -146,8 +239,14 @@ export interface EditFloodFuseStats {
   floodObserved: number
   /** Whether a tightened ceiling is in force right now. */
   tightened: boolean
-  /** Live per-message ceiling (post-AIMD). */
+  /** Compounding 429 tightening level currently in force (0 = untightened). */
+  tightenLevel: number
+  /** Live NON-cosmetic per-message ceiling (post-AIMD). */
   perMessageCeiling: number
+  /** Live COSMETIC per-message ceiling (post-AIMD) — the incident-relevant one. */
+  cosmeticPerMessageCeiling: number
+  /** Live COSMETIC per-chat ceiling (post-AIMD). */
+  cosmeticPerChatCeiling: number
 }
 
 export const EDIT_FLOOD_FUSE_DEFAULTS = {
@@ -155,11 +254,64 @@ export const EDIT_FLOOD_FUSE_DEFAULTS = {
   perMessageWindowMs: 60_000,
   perChatEditMaxPerWindow: 30,
   perChatSendMaxPerWindow: 25,
+  /**
+   * 4/60s. One cosmetic repaint per 15s per card. Chosen to equal the worker
+   * feed's `elapsedRefreshMs` (15000) — the slowest cadence at which the feed
+   * itself considers a repaint worth making — so the fuse binds the runaway
+   * case without ever throttling the feed's own intended pace.
+   */
+  cosmeticPerMessageMaxPerWindow: 4,
+  /**
+   * 6/60s across every cosmetic surface in a chat. The incident's own timeline
+   * is the evidence: 10-minute buckets of 58/53/41 edits (≈4-6/min) ran for
+   * hours without a ban; 115/78/73 then 152/174 (≈8-17/min) earned one. 6/min
+   * sits at the top of the survived band and less than half the banned rate.
+   */
+  cosmeticPerChatMaxPerWindow: 6,
+  /**
+   * 20/60s. Telegram's documented per-group ceiling, and it meters sends and
+   * edits together — so this is the only window that reflects the real budget.
+   */
+  perChatTotalMaxPerWindow: 20,
+  /** 8 of those 20 slots/min are unreachable by cosmetic traffic. */
+  perChatReplyReserve: 8,
+  /** At most 2 cosmetic frames/min may exceed the ceiling as "lone" releases. */
+  lateReleaseMaxPerWindow: 2,
   perChatWindowMs: 60_000,
   maxDeferMs: 30_000,
   tightenFactor: 0.5,
   tightenMs: 600_000,
+  maxTightenLevel: 4,
 } as const
+
+/** Parse a positive integer from env, or undefined when unset/invalid. */
+function envInt(raw: string | undefined): number | undefined {
+  if (raw == null || raw.trim() === '') return undefined
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined
+}
+
+/**
+ * Operator config surface. Before the 2026-07-27 incident the fuse had exactly
+ * one knob — `SWITCHROOM_EDIT_FUSE=0`, which turns the whole failsafe OFF —
+ * so an operator whose chat was being flooded had no way to tighten it and no
+ * way to loosen it for a chat that could take more. Every ceiling is now
+ * overridable; unset values keep the defaults above.
+ */
+export function editFloodFuseConfigFromEnv(
+  env: Record<string, string | undefined>,
+): EditFloodFuseConfig {
+  const cfg: EditFloodFuseConfig = { enabled: env.SWITCHROOM_EDIT_FUSE !== '0' }
+  const assign = <K extends keyof EditFloodFuseConfig>(k: K, v: number | undefined): void => {
+    if (v !== undefined) (cfg[k] as number) = v
+  }
+  assign('cosmeticPerMessageMaxPerWindow', envInt(env.SWITCHROOM_FEED_EDIT_MAX_PER_MSG_PER_MIN))
+  assign('cosmeticPerChatMaxPerWindow', envInt(env.SWITCHROOM_FEED_EDIT_MAX_PER_CHAT_PER_MIN))
+  assign('perChatTotalMaxPerWindow', envInt(env.SWITCHROOM_CHAT_TOTAL_MAX_PER_MIN))
+  assign('perChatReplyReserve', envInt(env.SWITCHROOM_CHAT_REPLY_RESERVE))
+  assign('maxDeferMs', envInt(env.SWITCHROOM_EDIT_FUSE_MAX_DEFER_MS))
+  return cfg
+}
 
 /** grammY resolves an edit with `true` when there is nothing to return. */
 const DROPPED_RESULT = true
@@ -189,28 +341,63 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   const perMessageWindowMs = config.perMessageWindowMs ?? D.perMessageWindowMs
   const perChatEditMax = config.perChatEditMaxPerWindow ?? D.perChatEditMaxPerWindow
   const perChatSendMax = config.perChatSendMaxPerWindow ?? D.perChatSendMaxPerWindow
+  // Cosmetic tiers are an ADDITIONAL constraint on the same window keys, so the
+  // effective ceiling is the lower of the two. Folding them in here (rather
+  // than as extra tiers) keeps the admission path at the same number of awaits.
+  const cosmeticPerMessageMax = Math.min(
+    perMessageMax, config.cosmeticPerMessageMaxPerWindow ?? D.cosmeticPerMessageMaxPerWindow)
+  const cosmeticPerChatMax = Math.min(
+    perChatEditMax, config.cosmeticPerChatMaxPerWindow ?? D.cosmeticPerChatMaxPerWindow)
+  const perChatTotalMax = config.perChatTotalMaxPerWindow ?? D.perChatTotalMaxPerWindow
   const perChatWindowMs = config.perChatWindowMs ?? D.perChatWindowMs
+  // Clamped so a misconfigured reserve can never make the cosmetic allowance
+  // negative (deadlocking every card) or eat the whole budget.
+  const perChatReplyReserve = Math.min(
+    Math.max(0, config.perChatReplyReserve ?? D.perChatReplyReserve),
+    Math.max(0, perChatTotalMax - 1),
+  )
+  const lateReleaseMax = Math.max(0, config.lateReleaseMaxPerWindow ?? D.lateReleaseMaxPerWindow)
   const maxDeferMs = config.maxDeferMs ?? D.maxDeferMs
   const tightenFactor = config.tightenFactor ?? D.tightenFactor
   const tightenMs = config.tightenMs ?? D.tightenMs
+  const maxTightenLevel = Math.max(0, config.maxTightenLevel ?? D.maxTightenLevel)
   const onTrip = config.onTrip
 
   const windows = new Map<string, Window>()
   const counters = { deferred: 0, dropped: 0, superseded: 0, floodObserved: 0 }
-  /** Timestamp until which the AIMD tightening is in force (0 = untightened). */
+  /**
+   * Compounding 429 backoff. `tightenLevel` is the number of multiplicative
+   * decreases currently in force; `tightenedUntil` is when the NEXT level
+   * decays. A single flat tightening (the pre-2026-07-27 behaviour) let a
+   * stream that kept taking small 429s sit at 0.5× indefinitely and walk into
+   * a long ban; escalating means repeated 429s ratchet the rate down.
+   */
+  let tightenLevel = 0
   let tightenedUntil = 0
 
+  /** Decay one level per `tightenMs` of quiet, rather than a single cliff. */
+  function levelAt(now: number): number {
+    if (tightenLevel === 0) return 0
+    while (tightenLevel > 0 && tightenedUntil <= now) {
+      tightenLevel--
+      tightenedUntil = tightenLevel > 0 ? tightenedUntil + tightenMs : 0
+    }
+    return tightenLevel
+  }
+
   function isTightened(now: number): boolean {
-    return tightenedUntil > now
+    return levelAt(now) > 0
   }
 
   /**
-   * AIMD multiplicative decrease. Applied to every ceiling while tightened;
-   * floored at 1 so the fuse never deadlocks a surface completely.
+   * AIMD multiplicative decrease, compounding per observed 429. Applied to
+   * every ceiling while tightened; floored at 1 so the fuse never deadlocks a
+   * surface completely.
    */
   function ceiling(base: number, now: number): number {
-    if (!isTightened(now)) return base
-    return Math.max(1, Math.floor(base * tightenFactor))
+    const level = levelAt(now)
+    if (level === 0) return base
+    return Math.max(1, Math.floor(base * Math.pow(tightenFactor, level)))
   }
 
   function win(key: string): Window {
@@ -266,9 +453,13 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     return { chat, msg }
   }
 
-  /** Record a 429 (whatever shape it arrives in) and tighten. */
+  /** Record a 429 (whatever shape it arrives in) and tighten one more level. */
   function noteFlood(now: number): void {
     counters.floodObserved++
+    levelAt(now)
+    tightenLevel = Math.min(maxTightenLevel, tightenLevel + 1)
+    // Every level currently in force is re-armed for a full `tightenMs`; the
+    // decay clock restarts from the newest 429, not from the first.
     tightenedUntil = now + tightenMs
   }
 
@@ -311,7 +502,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
    * Returns the reserved timestamp, or null when the call must be dropped.
    */
   async function awaitRoom(
-    key: string, windowMs: number, max: number, method: string, mode: WaitMode,
+    key: string, windowMs: number, max: number, method: string, mode: WaitMode, cls: OutboundClass,
     /**
      * Consulted ONLY at the defer deadline for `mode: 'drop'`. Returning false
      * converts the drop into a late release: this call is the last thing that
@@ -319,10 +510,30 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
      * frame", it is freezing a card. Absent ⇒ drop unconditionally (the
      * pre-review behaviour).
      */
-    dropGuard?: () => boolean,
+    dropGuard: (() => boolean) | undefined,
+    /**
+     * Absolute deadline SHARED by every tier of one `apply` call. Each tier
+     * used to start its own `maxDeferMs`, so a call crossing three tiers could
+     * be held 3×`maxDeferMs` — an unbounded-in-practice hold that a caller's
+     * own timeout, not this fuse, would have to end. One deadline per call
+     * makes `maxDeferMs` mean what it says.
+     */
+    deadline: number,
+    /**
+     * Bounded overshoot budget for the R1 late-release path (cosmetic edits
+     * only). R1 says an over-budget edit that nothing newer will repaint must
+     * be RELEASED late rather than dropped, so a card cannot freeze mid-run.
+     * Taken literally that rule has no ceiling: a stream of cosmetic edits to
+     * DISTINCT message ids is a stream of "lone" frames, every one of which
+     * releases over budget — which is how 6 concurrent worker cards can sail
+     * past a 6/min chat ceiling. Charging each late release to a small extra
+     * window keeps R1's guarantee for the rare genuinely-lone frame (a
+     * worker's terminal recap) while capping the leak at `lateReleaseMax` per
+     * window. Absent ⇒ unbounded late release (sends, non-cosmetic edits).
+     */
+    lateReleaseKey?: string,
   ): Promise<number | null> {
     const w = win(key)
-    const deadline = clock.now() + maxDeferMs
     let counted = false
     for (;;) {
       const now = clock.now()
@@ -337,19 +548,32 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         // worse than a late one).
         if (mode !== 'release' && (dropGuard === undefined || dropGuard())) {
           counters.dropped++
-          onTrip?.({ method, key, action: 'dropped' })
+          onTrip?.({ method, key, action: 'dropped', cls })
           return null
         }
         // A send — or an edit that nothing newer will repaint — is released
         // rather than dropped, and still takes a slot so the window reflects
-        // what actually went out.
+        // what actually went out. Cosmetic late releases are additionally
+        // charged to the bounded overshoot budget; when that is exhausted the
+        // frame is dropped after all, so the ceiling cannot be walked past one
+        // "lone" frame at a time.
+        if (lateReleaseKey !== undefined) {
+          const lw = win(lateReleaseKey)
+          prune(lw, now, perChatWindowMs)
+          if (lw.ts.length >= ceiling(lateReleaseMax, now)) {
+            counters.dropped++
+            onTrip?.({ method, key, action: 'dropped', cls })
+            return null
+          }
+          lw.ts.push(now)
+        }
         w.ts.push(now)
         return now
       }
       if (!counted) {
         counters.deferred++
         counted = true
-        onTrip?.({ method, key, action: 'deferred' })
+        onTrip?.({ method, key, action: 'deferred', cls })
       }
       // Last-write-wins: a newer edit to the same message kills this one. Only
       // valid on the per-MESSAGE tier — on a per-chat key the "newer" edit is
@@ -364,7 +588,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         await Promise.race([clock.sleep(Math.min(wait, deadline - now)), superseded])
         if (killed) {
           counters.superseded++
-          onTrip?.({ method, key, action: 'superseded' })
+          onTrip?.({ method, key, action: 'superseded', cls })
           return null
         }
         w.waiter = null
@@ -393,6 +617,18 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
 
     const now = clock.now()
     evict(now)
+    // ONE deadline for the whole call, shared by every tier it crosses.
+    const deadline = now + maxDeferMs
+
+    // The send gate's priority class, propagated through AsyncLocalStorage.
+    // An untagged edit is COSMETIC by default — see `defaultOutboundClass`.
+    const cls = currentOutboundClass() ?? defaultOutboundClass(isEdit)
+    const totalKey = `t:${chat}`
+    // Cosmetic traffic may only reach `perChatTotalMax - perChatReplyReserve`;
+    // the remaining slots stay available to a real reply no matter how hot the
+    // repaint surfaces are. This reservation is the reply-starvation guarantee.
+    const totalMaxFor = (c: OutboundClass): number =>
+      c === 'cosmetic' ? Math.max(1, perChatTotalMax - perChatReplyReserve) : perChatTotalMax
 
     if (isEdit) {
       if (msg == null) return runObserved(next)
@@ -402,29 +638,49 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       // one is waiting is visible to that older one's `dropGuard`.
       mw.inflight++
       try {
-        const msgSlot = await awaitRoom(msgKey, perMessageWindowMs, perMessageMax, method, 'supersede')
+        const msgSlot = await awaitRoom(
+          msgKey, perMessageWindowMs,
+          cls === 'cosmetic' ? cosmeticPerMessageMax : perMessageMax,
+          method, 'supersede', cls, undefined, deadline,
+        )
         if (msgSlot === null) return DROPPED_RESULT as unknown as R
+        // R1: only drop while something newer for THIS message is still in
+        // flight to repaint it. `> 1` = this frame plus at least one newer.
+        const dropGuard = (): boolean => mw.inflight > 1
+        // Cosmetic frames share ONE overshoot budget per chat across both
+        // per-chat tiers, so a frame cannot late-release twice on its way out.
+        const lateKey = cls === 'cosmetic' ? `lr:${chat}` : undefined
+        const reserved: Array<[string, number]> = [[msgKey, msgSlot]]
+        const giveBack = (): void => { for (const [k, at] of reserved) unreserve(k, at) }
+
         const chatKey = `ce:${chat}`
         const chatSlot = await awaitRoom(
-          chatKey, perChatWindowMs, perChatEditMax, method, 'drop',
-          // R1: only drop while something newer for THIS message is still in
-          // flight to repaint it. `> 1` = this frame plus at least one newer.
-          () => mw.inflight > 1,
+          chatKey, perChatWindowMs,
+          cls === 'cosmetic' ? cosmeticPerChatMax : perChatEditMax,
+          method, 'drop', cls, dropGuard, deadline, lateKey,
         )
-        if (chatSlot === null) {
-          // Denied by the second tier — hand the first tier's slot back so a
-          // dropped edit never consumes budget it did not use.
-          unreserve(msgKey, msgSlot)
-          return DROPPED_RESULT as unknown as R
-        }
+        if (chatSlot === null) { giveBack(); return DROPPED_RESULT as unknown as R }
+        reserved.push([chatKey, chatSlot])
+
+        // Shared per-chat budget — the one that mirrors Telegram's real
+        // metering. A non-cosmetic edit is RELEASED late rather than dropped:
+        // an approval card or answer finalisation has no newer frame coming.
+        const totalSlot = await awaitRoom(
+          totalKey, perChatWindowMs, totalMaxFor(cls), method,
+          cls === 'cosmetic' ? 'drop' : 'release', cls, dropGuard, deadline, lateKey,
+        )
+        if (totalSlot === null) { giveBack(); return DROPPED_RESULT as unknown as R }
         return runObserved(next)
       } finally {
         mw.inflight--
       }
     }
 
-    const chatKey = `cs:${chat}`
-    await awaitRoom(chatKey, perChatWindowMs, perChatSendMax, method, 'release')
+    // Sends create user-visible output and are NEVER dropped — only paced. The
+    // shared budget's reserve is what guarantees they still have room when the
+    // repaint surfaces are saturated.
+    await awaitRoom(`cs:${chat}`, perChatWindowMs, perChatSendMax, method, 'release', cls, undefined, deadline)
+    await awaitRoom(totalKey, perChatWindowMs, totalMaxFor(cls), method, 'release', cls, undefined, deadline)
     return runObserved(next)
   }
 
@@ -454,7 +710,10 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       superseded: counters.superseded,
       floodObserved: counters.floodObserved,
       tightened: isTightened(now),
+      tightenLevel: levelAt(now),
       perMessageCeiling: ceiling(perMessageMax, now),
+      cosmeticPerMessageCeiling: ceiling(cosmeticPerMessageMax, now),
+      cosmeticPerChatCeiling: ceiling(cosmeticPerChatMax, now),
     }
   }
 

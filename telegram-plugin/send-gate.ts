@@ -73,6 +73,7 @@ import {
   makeFloodWaitActiveError,
   isFloodWaitActiveError,
 } from './retry-api-call.js'
+import { withOutboundClass, type OutboundClass } from './outbound-class.js'
 
 /** Injectable time source. Default binds to real wall clock + setTimeout. */
 export interface Clock {
@@ -111,6 +112,20 @@ export type ChatType = 'private' | 'group' | 'supergroup' | 'channel'
  * dropped — so their default is non-droppable already.)
  */
 export type PriorityClass = 'critical' | 'useful' | 'cosmetic'
+
+/**
+ * Compile-time lock: `PriorityClass` and `outbound-class.ts`'s `OutboundClass`
+ * must stay identical, because the gate publishes the former into the latter's
+ * AsyncLocalStorage so the edit-flood fuse (a grammY transformer, which sees
+ * only `(method, payload)`) can tell a repaint from a reply. Adding a class to
+ * one and not the other fails `tsc`, not review.
+ */
+type _ClassesMatch =
+  OutboundClass extends PriorityClass
+    ? PriorityClass extends OutboundClass ? true : never
+    : never
+const _classesMatch: _ClassesMatch = true
+void _classesMatch
 
 /**
  * Priority class an UNTAGGED non-edit send is admitted as. `critical` =
@@ -1130,7 +1145,13 @@ export function createSendGate(config: SendGateConfig): SendGate {
           // the fact that the only production caller is `robustApiCall`, whose
           // own request/retry timeouts bound every send — so `p.fn()` is
           // guaranteed to settle. No separate watchdog is needed here.
-          const res = await p.fn()
+          // Publish the class for the edit-flood fuse (a grammY transformer
+          // downstream of here, which otherwise cannot tell a cosmetic repaint
+          // from an approval-card edit). `p.priorityClass` is the COALESCED
+          // class — a cosmetic edit that a `useful` one superseded is sent as
+          // `useful`, which is exactly what should happen: the frame going out
+          // carries the higher-priority payload.
+          const res = await withOutboundClass(p.priorityClass, () => p.fn())
           // M1: only record the payload as on-screen AFTER a successful send,
           // so a FAILED edit can be retried with the same payload (not dropped
           // as a phantom no-op).
@@ -1363,7 +1384,8 @@ export function createSendGate(config: SendGateConfig): SendGate {
 
     try {
       // N4: count `sent` only AFTER a successful send, mirroring the edit path.
-      const res = await fn()
+      // Class published for the fuse — see the edit path's call above.
+      const res = await withOutboundClass(priority, () => fn())
       counters.sent++
       return res
     } catch (err) {
