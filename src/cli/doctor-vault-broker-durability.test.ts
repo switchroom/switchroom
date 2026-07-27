@@ -385,14 +385,81 @@ describe("probeOrphanVaultTokens — #1737 / #3289 orphan-token detector", () =>
     expect(r.detail).toContain("all reference a live grant");
   });
 
-  it("FAILS when a token references a grant id absent from the DB", () => {
+  it("FAILS on an orphan whose grant would still be inside its TTL", () => {
+    const NOW = 1_800_000_000_000;
     const r = probeOrphanVaultTokens(fakeConfig(["clerk"]), {
       readTokenId: () => "vg_5e1991",
       grantIdExists: (id) => id !== "vg_5e1991",
+      // minted 2 days ago — well inside the 30d assumed TTL
+      tokenMtimeMs: () => NOW - 2 * 86_400_000,
+      now: () => NOW,
     });
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("clerk=vg_5e1991");
-    expect(r.detail).toContain("DENIES");
+    expect(r.detail).toContain("still inside the assumed 30d grant TTL");
+  });
+
+  // The pre-fix probe asserted "every `vault get` from these agents DENIES".
+  // That is false: the broker's READ-path fall-through treats an unusable
+  // token as no token and serves the standing config ACL
+  // (server-token-fallthrough.test.ts). Guard the wording so the false claim
+  // can't come back, and pin the true consequence.
+  it("never claims the agent is denied — describes grant loss + ACL fall-through", () => {
+    const NOW = 1_800_000_000_000;
+    const fresh = probeOrphanVaultTokens(fakeConfig(["clerk"]), {
+      readTokenId: () => "vg_5e1991",
+      grantIdExists: () => false,
+      tokenMtimeMs: () => NOW - 86_400_000,
+      now: () => NOW,
+    });
+    const old = probeOrphanVaultTokens(fakeConfig(["clerk"]), {
+      readTokenId: () => "vg_5e1991",
+      grantIdExists: () => false,
+      tokenMtimeMs: () => NOW - 90 * 86_400_000,
+      now: () => NOW,
+    });
+    for (const r of [fresh, old]) {
+      expect(r.detail).not.toMatch(/DENIES|every `vault get`/);
+      expect(r.detail).toContain("falls through to the standing config ACL");
+      expect(r.detail).toContain("reachable ONLY via the dynamic grant");
+    }
+  });
+
+  it("WARNs (not fails) on an orphan whose grant TTL has already lapsed", () => {
+    const NOW = 1_800_000_000_000;
+    const r = probeOrphanVaultTokens(fakeConfig(["ziggy"]), {
+      readTokenId: () => "vg_b0c21c",
+      grantIdExists: () => false,
+      // minted 45 days ago — the 30d grant would have expired on its own
+      tokenMtimeMs: () => NOW - 45 * 86_400_000,
+      now: () => NOW,
+    });
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain("stale token litter");
+    expect(r.fix).toContain("Safe to remove");
+  });
+
+  it("WARNs (not fails) when the token mtime is unreadable", () => {
+    const r = probeOrphanVaultTokens(fakeConfig(["reggie"]), {
+      readTokenId: () => "vg_a6e428",
+      grantIdExists: () => false,
+      tokenMtimeMs: () => null,
+    });
+    expect(r.status).toBe("warn");
+  });
+
+  it("FAILs on a mixed set but still names the stale tokens", () => {
+    const NOW = 1_800_000_000_000;
+    const r = probeOrphanVaultTokens(fakeConfig(["fresh", "old"]), {
+      readTokenId: (agent) => (agent === "fresh" ? "vg_aaa111" : "vg_bbb222"),
+      grantIdExists: () => false,
+      tokenMtimeMs: (agent) =>
+        agent === "fresh" ? NOW - 86_400_000 : NOW - 90 * 86_400_000,
+      now: () => NOW,
+    });
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("fresh=vg_aaa111");
+    expect(r.detail).toContain("stale litter: old=vg_bbb222");
   });
 
   it("skips when the grants DB can't be read on the host", () => {
