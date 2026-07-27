@@ -4,6 +4,7 @@ import {
   isFrameworkFallbackText,
   isLivenessCardMessage,
   isWorkerFeedMessage,
+  stripCardNesting,
   WORKER_FEED_RE,
 } from "./assertions.js";
 
@@ -49,6 +50,34 @@ describe("isWorkerFeedMessage", () => {
 
   it("exposes the regex for scenarios that assert on the feed directly", () => {
     expect(WORKER_FEED_RE.test("🛠 Worker · x")).toBe(true);
+  });
+
+  it("still matches the #3820 SUBORDINATE worker card as Telegram delivers it", () => {
+    // Since #3820 the worker card leads with `└─ ` and indents every later line
+    // with a U+2800 run so it reads as a child of the 🤖 agent card. Telegram
+    // strips the bold/italic entities but delivers that chrome verbatim, and
+    // `String.trim()` removes neither (U+2800 is category So, not whitespace) —
+    // so every matcher here has to survive it or recall/reply scenarios start
+    // latching onto worker cards as answers.
+    const nested = "└─ 🛠 WORKER · crawling changelog\n⠀⠀⠀55s · 9 tools · opus 5";
+    expect(isWorkerFeedMessage(feed(nested))).toBe(true);
+  });
+});
+
+describe("#3820 subordinate-card nesting is transparent to the matchers", () => {
+  it("classifies a nested agent-shaped card as the liveness card, not an answer", () => {
+    const nested =
+      "└─ 🛠 WORKER · crawl\n⠀⠀⠀12s · 3 tools\n⠀⠀⠀✓ Reading CLAUDE.md\n⠀⠀⠀→ Searching memory";
+    expect(isLivenessCardMessage(feed(nested))).toBe(true);
+    expect(isActivityFeedMessage(feed(nested))).toBe(true);
+  });
+
+  it("strips the header prefix and the indent, and leaves ordinary prose alone", () => {
+    expect(stripCardNesting("└─ 🛠 WORKER · crawl")).toBe("🛠 WORKER · crawl");
+    expect(stripCardNesting("⠀⠀⠀→ Searching memory")).toBe("→ Searching memory");
+    expect(stripCardNesting("on it, pulling the logs now")).toBe(
+      "on it, pulling the logs now",
+    );
   });
 });
 

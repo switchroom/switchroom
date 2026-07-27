@@ -253,7 +253,7 @@ describe('prose-silent background worker — end-to-end visibility harness (PR 2
     expect(h.bot.sent).toHaveLength(1)
     expect(h.feed.messageIdOf(h.agentId)).not.toBeNull()
     expect(h.bot.sent[0].chatId).toBe('chat-42')
-    expect(h.bot.sent[0].text).toContain('🛠 **Worker**')
+    expect(h.bot.sent[0].text).toContain('└─ 🛠 **WORKER**')
 
     // (b) KEEPS UPDATING: later heartbeats edit the message with a climbing
     // `· Ns` suffix so the still-alive worker visibly advances.

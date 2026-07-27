@@ -46,6 +46,13 @@ close that gap so the user never has to ask.
   narrated in plain language, as it happens, in the conversation.
 - Sub-agent and background work is visible in the same thread. No separate
   surface to hunt for. True in a DM and in a forum channel alike.
+- When a worker card and the agent card are both live, "is this my agent or a
+  background worker?" is answerable from the cards' SHAPE, at phone-glance
+  distance, without reading them. The worker card is structurally subordinate:
+  a `└─ ` on line 1, its whole block indented under the agent card, and a
+  high-contrast `WORKER` type label. Two same-shaped cards differing only by an
+  emoji and one word is the failure (#3820) — worse when the parent narrates
+  the task it delegated, so the two step trails read as duplicates.
 - Failures, limits, crashes, and restarts are always spoken. The user is
   told what happened and what resumes. A worker orphaned by a restart is
   narrated in the worker feed — re-dispatched or named as lost — not silently
