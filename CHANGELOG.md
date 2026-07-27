@@ -2,7 +2,60 @@
 
 ## Unreleased
 
-### Consolidation throughput defaults, and the stale rationale behind them
+### The hindsight LLM token budget is derived from a declared context window (#3717, #3730)
+
+Hindsight's retain / reflect / consolidation calls were sized by hand-tuned
+constants that knew nothing about the backend's context window. Against a local
+llama.cpp slot that silently corrupts memory, and it does so invisibly:
+context-shift discards the oldest tokens and keeps only the first `--keep` (=4)
+— the system prompt and the JSON schema — so the model answers conversationally
+and still returns HTTP 200 with `finish_reason: stop`. Nothing in the stack
+errors.
+
+Measured over 24h of live traffic (`LiteLLM_SpendLogs`, `openai/gpt-oss:20b`,
+n=695) against a 32,768-token slot: p50 prompt 5,244 tok, p90 32,270 tok, max
+32,754 tok, **38% of calls over 16,384 prompt tokens**, and a malformed-response
+rate of 44%/47% on the two local boxes versus 2% for the same model on a 131k
+route.
+
+New `src/setup/hindsight-context-budget.ts` declares the window per lane
+(per-op > global > per-provider default, with a conservative 32,768 for
+anything that is not `claude-code`) and derives the consolidation batch size,
+the retain/consolidation max-completion caps and the reflect max-context cap so
+that worst-case prompt + completion cannot exceed it. 32k lands on batch 6 /
+8192 / 6144 / 20000; 131k and 200k keep the historical batch 12, so the budget
+only ever ratchets **down**. An over-budget configuration throws at preflight
+rather than launching.
+
+Three LOW findings from the adversarial review of that work are fixed in #3730:
+
+- **The 20% safety band was applied to consolidation and reflect but not to
+  retain**, and the lane-failure check compared every lane's worst case against
+  the RAW declared window. Retain's worst case pins at 11,072 (an 8,000 fixed
+  prompt estimate plus a 3,072 completion floor), so declared windows
+  11,072–13,838 passed preflight while eating into the band. Preflight now
+  compares against `usableTokens` for every lane, from a single
+  `usableContextTokens()` definition. No derived value changes; the minimum
+  admitted window moves 11,072 → 13,839.
+- **`reflCompletionAllowance` was not dead code** — it feeds `reflMaxContext`
+  and reflect's worst case. The defect was that it was *named* like an env var
+  switchroom fails to emit: verified against the shipped image, `config.py` has
+  `RETAIN_`/`CONSOLIDATION_MAX_COMPLETION_TOKENS` and **no reflect completion
+  knob at all**, so it can only ever be a reserve held back from the emitted
+  prompt cap. Renamed to `completionReserveTokens`, and the preflight now
+  documents that reflect's row is prompt-side only — a self-consistency check,
+  not an end-to-end bound.
+- **`defaultContextWindowForProvider` keyed off the provider NAME while
+  `hindsightLocalLlmEnabled` keyed off the base URL**, fail-safing in opposite
+  directions: `provider: anthropic` pointed at `http://127.0.0.1:4010` was
+  throttled as local *and* budgeted for a 200k window. The window default now
+  reads `(provider, base_url)` jointly, and a self-hosted base URL forces the
+  conservative 32,768.
+
+The live fleet emits identical values before and after the #3730 fixes (batch 6
+/ cons 8192 / retain 6144 / reflect 20000).
+
+### Consolidation throughput defaults, and the stale rationale behind them (#3728)
 
 The comment governing switchroom's consolidation knobs asserted that
 consolidation is "LLM-bound via the claude-code provider" where "every
@@ -57,6 +110,32 @@ ceiling on consolidation inference — it is a process-wide semaphore composed
 with the global cap, so worker slots and `LLM_PARALLELISM` pipeline the non-LLM
 stages but do not multiply concurrent LLM calls.
 
+### Consolidation tag-group parallelism is an overridable managed key (#3732)
+
+`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM` — how many tag groups are
+consolidated concurrently within one operation — was shipped as a bare
+constant in `hindsight.ts` and emitted unconditionally on both launch paths,
+outside the managed perf-defaults system. That is worse than simply not
+shipping a value: because the key was absent from `HINDSIGHT_PERF_ENV_KEYS`, an
+operator line in `hindsight.env` was **silently dropped** while reading in the
+yaml as durable configuration, and switchroom's own hard-coded 2 won every
+time.
+
+The constant moves into `hindsight-perf-defaults.ts` as an ungated *defaulted*
+key (not override-only — the previous emission was unconditional, so a default
+must survive) and both hard-coded emissions are deleted. The value is
+unchanged at 2; what changes is that `hindsight.env` can now raise it, which
+matters on a deployment that has moved consolidation onto local inference —
+upstream's own `config.py` pegs this knob to `retain_max_concurrent`, so a
+fleet running `RETAIN_LLM_MAX_CONCURRENT: 3` wants 3 here.
+
+The new tests pin the key in `HINDSIGHT_PERF_ENV_KEYS` and out of
+`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`, assert the default across all four
+capability combinations, assert an operator value replaces it on both paths,
+and assert it is **emitted exactly once per path** — which is the assertion
+that caught the duplicate emission during development, when the first attempt
+added the key to the managed system without removing the old constant.
+
 ### Review policy is stated once, and no longer counts rounds
 
 v0.19.23 bounded adversarial review with a severity gate plus a counted round
@@ -99,6 +178,125 @@ asked for intent as unsent transcript text while the reply rule 55 lines later
 banned exactly that, because a framework backstop flushes unsent text late and
 out of order. Both copies are fixed at the generator (`scaffold.ts`);
 `fleet/switchroom-invariants.md` is generated and was not hand-edited.
+
+### A self-echoed reply no longer duplicates the answer (#3719, #3729, #3731)
+
+A DM agent delivered two answers twice — a flushed copy plus a reworded `reply`
+copy — with the gateway logging `flush supersede declined — new content
+(#3429)` and correctly naming the turn. The sequence: the answer-ready
+quiescence flush posted the turn's composed prose, the silent-end Stop hook
+told the agent its answer had not reached the user, and the agent fired `reply`
+with a reworded version of the same answer.
+
+The root cause was not the text matcher. `decideSupersede` already bypasses the
+content gate for a reply positively attributable to the flushed turn's own
+answer — rewording is expected there. But the bypass was restricted to the
+`live` and `latest-ended` tiers, because `origin`/`quoted` resolve from
+MODEL-SUPPLIED args and a reply can steer itself onto a different ended turn
+and silently edit over that turn's delivered answer (#3429). Here the agent
+echoed `origin_turn_id` back pointing at **its own turn**, so the tier resolved
+`origin`, the blanket ban applied, and the rewording defeated both equality and
+containment. Had the agent simply omitted the echo, the identical reply would
+have landed on `latest-ended` and collapsed. **The ban punished the model for
+supplying more information.**
+
+The fix corroborates the steerable tier instead of banning it: `origin` /
+`quoted` bypass the content gate only when the turn they resolve is the same
+turn the framework-derived, TTL-bounded `latestEndedTurnId` resolves, and no
+decoupled completion is in the window. That grants zero new capability — any
+corroborated bypass was already reachable by dropping the model-supplied ids —
+so the silent-edit-over vector stays closed. The decline log now carries
+`tier=`, `latestEnded=` and `handbackInWindow=`; without them the incident read
+as a matcher failure and took a log-archive dig to attribute.
+
+**The corroboration anchor now has to be a turn that actually ended (#3731).**
+`findLatestEndedTurnForChat` returned the most-recently-*started* turn:
+`recentTurnsById` is populated at turn start with `endedAt: null` and the
+lookup had no filter, while a null age was treated as UNBOUNDED by the
+back-compat escape. So the "TTL-bounded" anchor the whole scheme leans on could
+be a turn that is **still running** with no freshness bound — and since the
+registry is chat-wide and thread-agnostic, a turn running in another topic of
+the same chat was a live route into that state. Two layers now fail closed: the
+scan moves to a pure `gateway/latest-turn-lookup.ts` with an explicit
+`endedOnly` mode (a chat with no ended turn gets *no* anchor rather than a
+running one; the non-destructive routing use keeps the old semantics), and
+`latestEndedAccepted` distinguishes an omitted age (back-compat unbounded) from
+a computed-null age (rejected). The five doc comments asserting a
+"framework-derived, TTL-bounded" anchor now describe what the code enforces.
+
+Three LOW follow-ups land in #3729, all verified against the code before being
+fixed:
+
+- **`decideContentGateBypass` was not total** — it dereferenced
+  `input.candidates` with no null guard, so an absent candidate set threw a
+  `TypeError` out of the supersede decision path. Production-unreachable today,
+  but the function is exported precisely so the decision can be exercised
+  outside the gateway, and a throw is fail-open-by-crash where every other
+  defensive branch fails closed.
+- **The "zero new capability" property test was nearly vacuous** — it hand-picked
+  four candidate shapes and guarded its assertion behind a conditional, so one
+  of the four asserted nothing, `handbackCouldOwnReply` was pinned false, and
+  `liveTurnId` never varied. It is replaced by an exhaustive sweep of the
+  candidate space (486 cases) that derives tier and resolved id from the real
+  resolvers and asserts coverage counters, plus a companion test that runs the
+  same sweep over two deliberate mutants and asserts it catches both — so
+  non-vacuity is a standing assertion rather than a one-off demonstration.
+- **The corroborated + foreign-content + no-handback cell was unpinned.** It is
+  PINNED, not changed: the behaviour is the documented residual, grants no new
+  reach, and its mitigation is the handback marker.
+
+### Cosmetic card and draft edits coalesce instead of being shed (#3718)
+
+The send gate dropped a `cosmetic` edit outright whenever a bucket had no free
+token or a flood window covered the scope, reasoning that "a dropped edit costs
+nothing: the next edit carries the full state". That holds for every edit in a
+burst **except the last one**, and the last one is the only edit whose state is
+still on screen when the burst ends. Pressure is exactly when bursts end, so
+the drop was biased toward stranding precisely the edits that mattered: a
+progress card frozen mid-run, a finished task still rendered as running. Worse,
+the shed short-circuited past the last-write-wins coalescing sitting directly
+below it in `handleEdit` — the mechanism that already solves this.
+
+The shed is deleted and the path falls through to coalescing, so N queued edits
+collapse into one send carrying the newest payload and no extra flood budget is
+spent. Flood safety never came from discarding state; it comes from the token
+buckets, the per-message edit floor and the rolling per-window budget, all of
+which **defer** an over-budget edit rather than drop it. `SEND_GATE_SHED`
+remains the contract for non-edit cosmetic sends (typing, reactions), which
+carry no state worth preserving.
+
+Two consequences had to be handled, both of which re-introduced the multi-hour
+reply wedge the gate exists to eliminate. Cosmetic edits now occupy the driver,
+so a `critical` edit arriving one tick after the driver dequeued a cosmetic one
+inherited its unbounded wait — non-critical admission is now interruptible, and
+the interrupt is checked before the token consume so an abandoned admission
+never leaks a token. And because callers serialize their own flushes, a
+cosmetic paint parked behind a ban held the finalize hostage *upstream* of the
+gate where the fail-fast path can never see it (verified: `failedFast` went to
+0 and the reply path wedged for the full ~6h ban) — under pressure a cosmetic
+edit now settles its caller as soon as it is queued.
+
+### The merge queue is live, and the docs no longer say otherwise (#3720)
+
+`.github/MERGE-QUEUE.md` and `tests/ci-merge-queue-triggers.test.ts` both still
+asserted the merge queue was OFF and that their invariants were a
+*precondition* for safely turning it back on. It has since been turned back on
+— verified live against ruleset 16470166 (SQUASH, ALLGREEN,
+`min_entries_to_merge` 1, 5-minute minimum wait, max build/merge 5, 60-minute
+check response timeout), with #3717 and #3718 merging through it on 2026-07-27
+and all seven required contexts reporting on the `gh-readonly-queue` ref. That
+stale framing is the dangerous kind: it told the next reader these invariants
+were hypothetical insurance, when breaking one now wedges `main` for everyone
+immediately.
+
+The agent-facing half matters more. `skills/dev-protocol/SKILL.md` described
+the pipeline as "merge on CI green" with no mention that `main` sits behind a
+queue at all, and an agent following it hits three surprises — all three
+observed while landing #3718: **`gh pr merge` exits 0 but only ENQUEUES** (the
+PR stays OPEN, so reporting "merged" off the exit code is a false claim),
+`--delete-branch` is rejected outright while the queue is on, and `--subject`
+is ignored because the queue builds the merge commit from the PR title. Section
+5 now covers all three plus the `AWAITING_CHECKS` signature.
 
 ## v0.19.23 — the retain queue drains and stops losing memories, capability-gated hindsight performance defaults, bounded adversarial review, a 22% smaller agent prompt
 
