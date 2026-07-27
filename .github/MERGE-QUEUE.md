@@ -1,14 +1,23 @@
 # Merge queue — how CI reports on `gh-readonly-queue/...` refs
 
-> **Current state (verified 2026-07-26 13:20 AEST):** the merge queue is
-> **OFF**. Ruleset **16470166** (`main branch protection`) carries only
-> `deletion`, `non_fast_forward` and `required_status_checks` — there is
-> no `merge_queue` rule, and `repository.mergeQueue(branch:"main")` is
-> `null`. It was enabled earlier that day, wedged `main` for the reason
-> below, and was switched back off to unblock merging. **This document
-> and the `merge_group:` triggers it describes are the prerequisite for
-> turning it back on safely** — they are inert while it is off, and they
-> are what stops the outage recurring when it is turned on.
+> **Current state (verified live 2026-07-27 12:50 AEST):** the merge queue
+> is **ON**. Ruleset **16470166** (`main branch protection`) carries a
+> `merge_queue` rule alongside `deletion`, `non_fast_forward` and
+> `required_status_checks`, and `repository.mergeQueue(branch:"main")` is
+> non-null. Configuration: `merge_method: SQUASH`,
+> `grouping_strategy: ALLGREEN`, `min_entries_to_merge: 1`,
+> `min_entries_to_merge_wait_minutes: 5`, `max_entries_to_build: 5`,
+> `max_entries_to_merge: 5`, `check_response_timeout_minutes: 60`.
+>
+> History: enabled 2026-07-26, wedged `main` for the reason below, switched
+> back off the same day to unblock merging. The `merge_group:` triggers this
+> document describes were then added, and the queue was re-enabled. PRs
+> #3717 and #3718 went through on 2026-07-27 with all seven contexts
+> reporting on the queue ref, so the design is confirmed end to end.
+>
+> **The invariants below are now live behaviour, not a precondition.**
+> Breaking one no longer merely makes it unsafe to re-enable the queue — it
+> wedges `main` for everyone, immediately.
 
 Ruleset **16470166** (`main branch protection`) requires exactly these
 status checks (verified live against the ruleset — if this table and the
@@ -31,7 +40,7 @@ When a PR is enqueued, GitHub pushes a temporary
 **on that ref**. A workflow that only triggers on `pull_request` + `push`
 never runs there, so the contexts are never produced and the entry sits in
 `AWAITING_CHECKS` until `check_response_timeout_minutes` **ejects** it
-(60 minutes as the queue was configured on 2026-07-26).
+(60 minutes, per the ruleset's `merge_queue` rule).
 
 Every workflow producing a required context therefore carries a
 `merge_group:` trigger. `tests/ci-merge-queue-triggers.test.ts` enforces
@@ -140,7 +149,7 @@ of bug as the #2816 non-main-dispatch follow-up. Queue builds tag
 ## Diagnosing a stuck queue
 
 ```bash
-# Is the queue even enabled? null == off (it is off as of 2026-07-26).
+# Is the queue even enabled? null == off (it is ON as of 2026-07-27).
 gh api graphql -f query='
   { repository(owner:"switchroom", name:"switchroom") {
       mergeQueue(branch:"main") { id configuration {
