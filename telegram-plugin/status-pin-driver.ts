@@ -86,6 +86,12 @@ export interface ReconcilePinArgs {
  *              success and on a TERMINAL failure (never leave state stuck
  *              pinned). A never-confirmed failure returns prevState so the
  *              still-pinned message keeps a record to retry from (#3664).
+ *   - `repin`: the wanted message CHANGED — unpins the stale claim then pins
+ *              the new message, both in this one call, returning the new
+ *              claim. A never-confirmed unpin aborts the pin leg and retains
+ *              the old claim (the old message is still up and must keep a
+ *              record). Single-shot callers depend on this: they never
+ *              reconcile the key a second time.
  *   - `noop` : returns prevState unchanged.
  */
 export async function reconcilePin(
@@ -94,6 +100,28 @@ export async function reconcilePin(
   const action = decidePinAction(args.prevState, args.desired)
 
   if (action.kind === 'noop') return args.prevState
+
+  if (action.kind === 'repin') {
+    // RETARGET: unpin the stale claim, then pin the new message — BOTH legs in
+    // this one call. Callers that reconcile a key exactly once (the foreground
+    // activity card) have no "next reconcile" to finish the job, so splitting
+    // it left nothing pinned. See the `repin` docblock in status-pin.ts.
+    const afterUnpin = await reconcilePin({
+      ...args,
+      desired: { pinned: false },
+    })
+    // A non-null result here means the unpin was NEVER CONFIRMED (#3664
+    // Defect B): the old message is provably still pinned and the claim was
+    // deliberately retained. Pinning the new one now would leave two pins with
+    // a record of only one. Keep the retained claim and let the next reconcile
+    // / the mid-session reaper / the boot sweep retry.
+    if (afterUnpin != null) return afterUnpin
+    return reconcilePin({
+      ...args,
+      prevState: null,
+      desired: { pinned: true, messageId: action.pinMessageId },
+    })
+  }
 
   if (action.kind === 'unpin') {
     // Skip the unpin API call in a chat the bot can't manage pins in — the

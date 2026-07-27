@@ -48,6 +48,29 @@ export type PinAction =
    *  or a TERMINAL failure; a never-confirmed failure keeps the claim so the
    *  still-pinned message can be retried (`isUnpinTerminalError`, #3664). */
   | { kind: 'unpin'; messageId: number }
+  /**
+   * RETARGET — the caller still wants something pinned for this key, but a
+   * DIFFERENT message than the one we claim (the surface was re-posted: an
+   * ack-first activity-card reopen, a worker-feed group-message rotation).
+   *
+   * This is ONE action, not two reconciles. It used to be reported as a plain
+   * `unpin`, on the assumption that "a subsequent desired-pin re-pins the new
+   * one on the next reconcile". That assumption holds only for callers that
+   * RE-DRIVE the reconcile (the worker feed's `syncPin`, called on every
+   * steady-state edit). The foreground activity card does not: it reconciles
+   * exactly once, when a card OPENs (`narrative-lane.ts` — the `else` branch
+   * only EDITs and never touches the pin). So a mid-turn card reopen (the
+   * ack-first path in `feed-reopen-gate.ts`, which nulls `activityMessageId`
+   * so a fresh card opens) unpinned the old card and left the NEW one
+   * unpinned for the rest of the turn — the pin vanished exactly when the
+   * turn still needed it.
+   *
+   * Executors MUST complete both legs: unpin `unpinMessageId`, then pin
+   * `pinMessageId`. `reconcilePin` owns the failure semantics (a
+   * never-confirmed unpin retains the OLD claim and skips the pin, so the last
+   * record of a provably-still-pinned message is never lost).
+   */
+  | { kind: 'repin'; unpinMessageId: number; pinMessageId: number }
 
 /**
  * Decide the single pin action for a key given the previously-claimed
@@ -71,10 +94,16 @@ export function decidePinAction(
   if (prev.messageId === desired.messageId) {
     return { kind: 'noop', reason: 'already pinned this message' }
   }
-  // The message we want pinned changed (the feed re-posted after a stale
-  // edit dropped its id). Unpin the old claim; a subsequent desired-pin
-  // re-pins the new one on the next reconcile.
-  return { kind: 'unpin', messageId: prev.messageId }
+  // The message we want pinned changed (the surface was re-posted). Report a
+  // RETARGET, not a bare unpin: the executor must drop the stale claim AND pin
+  // the new message in the same reconcile. Relying on "the next reconcile" to
+  // pin left every single-shot caller (the foreground activity card) with
+  // nothing pinned — see the `repin` docblock above.
+  return {
+    kind: 'repin',
+    unpinMessageId: prev.messageId,
+    pinMessageId: desired.messageId,
+  }
 }
 
 /** Extract a lowercased human description from any thrown value, preferring
