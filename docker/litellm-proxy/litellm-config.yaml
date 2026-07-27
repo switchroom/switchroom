@@ -94,26 +94,34 @@ router_settings:
   # 2026-07-09 (per Ken) because require_parameters made ~5% of steady
   # structured retains 404 on OpenRouter even while local was healthy.
   routing_strategy: simple-shuffle
-  # Down-fallback chain. HISTORICAL intent (per Ken 2026-07-14) was local Ollama
-  # FIRST, then OpenRouter, then Claude Sonnet as last resort, tried in list
-  # order. Neither of the other two tiers survives: claude-sonnet-5 was removed
-  # 2026-07-17 (see inline note) and the local tier is out of the group, so what
-  # remains below is a SINGLE hop.
-  # ⚠ NO-OP AS WRITTEN (audited 2026-07-25): gpt-oss-20b and gpt-oss-20b-openrouter
-  # now have functionally identical litellm_params — same model
-  # (openrouter/openai/gpt-oss-20b), same max_tokens (8192), same
-  # extra_body.provider.order (fireworks/together/deepinfra/novita). Failing over
-  # from OpenRouter to the same OpenRouter route with the same provider order
-  # buys no additional availability. Left in place deliberately (routing changes
-  # are Ken's call, not an audit's) — but if a genuine second tier is wanted,
-  # the fallback target needs to differ from the primary. See the note on the
-  # gpt-oss-20b-openrouter entry in model_list.
-  fallbacks:
-    # claude-sonnet-5 removed 2026-07-17: internal fallback re-dispatch cannot
-    # carry the client OAuth header (gpt-oss callers auth with a virtual key),
-    # so this hop always 401'd ("x-api-key header is required") and leaked bogus
-    # re-auth errors to users.
-    - gpt-oss-20b: ["gpt-oss-20b-openrouter"]
+  # NO FALLBACK CHAIN — deliberately empty. Do not re-add one without a
+  # genuinely DIFFERENT second tier.
+  #
+  # HISTORICAL intent (Ken 2026-07-14) was local Ollama first, then OpenRouter,
+  # then Claude Sonnet as a last resort. Neither of the other two tiers
+  # survives:
+  #   - claude-sonnet-5 was removed 2026-07-17: internal fallback re-dispatch
+  #     cannot carry the client OAuth header (gpt-oss callers auth with a
+  #     virtual key), so this hop always 401'd ("x-api-key header is required")
+  #     and leaked bogus re-auth errors to users.
+  #   - the local Ollama tier is no longer in the group.
+  #
+  # What remained — `gpt-oss-20b: ["gpt-oss-20b-openrouter"]` — was audited as a
+  # NO-OP on 2026-07-25 and REMOVED 2026-07-28. Both entries resolve to the same
+  # model (openrouter/openai/gpt-oss-20b), the same max_tokens (8192) and the
+  # same extra_body.provider.order (fireworks/together/deepinfra/novita), so
+  # failing over from OpenRouter to the identical OpenRouter route bought no
+  # availability whatsoever. It was deleted rather than left in place because a
+  # `fallbacks:` block in the config ADVERTISES resilience: an operator reading
+  # this file, or an incident responder reasoning about why a request failed,
+  # would reasonably assume a second tier existed. An empty section that tells
+  # the truth is better than a populated one that lies.
+  #
+  # Consequence, stated plainly: an OpenRouter outage or a spent OpenRouter
+  # balance takes the whole gpt-oss-20b group down with no automatic recovery.
+  # That was ALREADY the behaviour — this change only stops the config implying
+  # otherwise. Restoring real resilience is a routing decision (a different
+  # provider, a different account, or a local tier), and routing is Ken's call.
 
 litellm_settings:
   # Do NOT set forward_client_headers_to_llm_api here — it is a Boolean in

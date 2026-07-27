@@ -211,6 +211,56 @@ describe("repo-managed litellm-config.yaml (KEN-125)", () => {
     }
   });
 
+  it("has no SELF-REFERENTIAL fallback edge (a hop that buys no availability)", () => {
+    // 2026-07-25 audit / 2026-07-28 removal: `gpt-oss-20b` fell back to
+    // `gpt-oss-20b-openrouter`, and the two deployments had functionally
+    // IDENTICAL litellm_params — same model, same max_tokens, same
+    // extra_body.provider.order. Failing over from OpenRouter to the same
+    // OpenRouter route with the same provider order recovers nothing, while a
+    // populated `fallbacks:` block advertises resilience to anyone reading the
+    // config or debugging an incident. This asserts the OUTCOME: every fallback
+    // edge that exists must reach a MATERIALLY DIFFERENT deployment.
+    const deployments = parsed.model_list as Array<{
+      model_name: string;
+      litellm_params?: Record<string, unknown>;
+    }>;
+    // Only AVAILABILITY-relevant fields count. Two deployments that differ
+    // solely by `timeout` or `num_retries` are still the same upstream reached
+    // with the same credential over the same provider order — a shorter
+    // deadline is not a second tier. (That is precisely the shape the removed
+    // gpt-oss-20b edge had: identical model/key/provider order, timeout 90→60.)
+    const availabilityKeyFor = (group: string): string =>
+      JSON.stringify(
+        deployments
+          .filter((d) => d.model_name === group)
+          .map((d) => {
+            const p = (d.litellm_params ?? {}) as Record<string, unknown>;
+            const extra = (p.extra_body ?? {}) as Record<string, unknown>;
+            const provider = (extra.provider ?? {}) as Record<string, unknown>;
+            return JSON.stringify({
+              model: p.model ?? null,
+              api_base: p.api_base ?? null,
+              api_key: p.api_key ?? null,
+              provider_order: provider.order ?? null,
+            });
+          })
+          .sort(),
+      );
+
+    const fallbacks = (parsed.router_settings as Record<string, unknown> | undefined)
+      ?.fallbacks;
+    for (const edge of Array.isArray(fallbacks) ? fallbacks : []) {
+      for (const [src, targets] of Object.entries(edge as Record<string, string[]>)) {
+        for (const target of targets ?? []) {
+          expect(
+            availabilityKeyFor(src),
+            `fallback ${src} → ${target} is a NO-OP: both deployments reach the same model with the same credential over the same provider order, so the hop buys no availability. Point it at a genuinely different provider/account/tier, or delete the edge.`,
+          ).not.toBe(availabilityKeyFor(target));
+        }
+      }
+    }
+  });
+
   it("does NOT capture the Anthropic /anthropic pass-through (no pass_through_endpoints, no wildcard model)", () => {
     // 2026-07-05 incident: agent Claude traffic must stay on the URL-based
     // raw-byte pass-through, never the model-mapped route. The config must not
