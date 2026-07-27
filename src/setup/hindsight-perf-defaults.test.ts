@@ -174,6 +174,7 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
+      "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -312,7 +313,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twelve keys, by name", () => {
+  it("is overridable on exactly these thirteen keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -328,6 +329,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_LLM_MAX_RETRIES",
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
       "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+      "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
       "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
       "HINDSIGHT_API_RERANKER_LOCAL_FP16",
@@ -489,6 +491,76 @@ describe("HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM (managed, was hard-coded)"
     const perf = { env: { [KEY]: "6" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["6"]);
+  });
+});
+
+// ── per-scope observation cap, moved into the managed set ─────────────────
+describe("HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE (managed, was hard-coded)", () => {
+  const KEY = "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set, so a hindsight.env line is not silently dropped", () => {
+    // The bug this fixes: the key was emitted unconditionally from a bare
+    // constant in hindsight.ts and was NOT in HINDSIGHT_PERF_ENV_KEYS, so an
+    // operator's yaml line was discarded without a word — it read as durable
+    // config while doing nothing, and its own doc comment sent operators to
+    // `docker run -e …` instead, which the next `switchroom apply` discards.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Defaulted, not override-only: the previous emission was unconditional,
+    // so dropping the default would be a silent behaviour change.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(false);
+  });
+
+  it.each(CAPS)(
+    "keeps the shipped default of 1000 on every host (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Ungated on purpose. Behind a capability gate this would silently revert
+      // to upstream's -1 (unlimited) on any host lacking the gate — a behaviour
+      // change smuggled in by a refactor, and the removal of the rail itself.
+      expect(hindsightPerfEnv(caps)).toContainEqual([KEY, "1000"]);
+    },
+  );
+
+  it("the operator's value REPLACES the default on BOTH launch paths", () => {
+    const perf = { env: { [KEY]: "5000" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    // Exactly one value, not the default AND the override: a duplicate emission
+    // would be last-wins by luck on docker-run and ambiguous in compose.
+    expect(fromRun.get(KEY)).toEqual(["5000"]);
+    expect(fromCompose.get(KEY)).toEqual(["5000"]);
+  });
+
+  it("is emitted exactly once per path when NOT overridden", () => {
+    // Guards the specific regression of moving the key without deleting the
+    // old hard-coded emission: two `-e` flags for one var.
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, {
+      env: {},
+      processEnv: {},
+    });
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["1000"]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, {
+          env: {},
+          processEnv: {},
+        }),
+      ).get(KEY),
+    ).toEqual(["1000"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: "250" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["250"]);
   });
 });
 

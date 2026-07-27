@@ -2,6 +2,54 @@
 
 ## v0.19.24 — `:latest` follows the release, hindsight sizes its LLM calls to the real context window, and a self-echoed reply stops duplicating
 
+### The per-scope observation cap is an overridable managed key
+
+`HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE` was emitted unconditionally on both
+launch paths — the `docker run` argv and the compose snippet — from a bare
+constant in `src/setup/hindsight.ts`, and was not a member of
+`HINDSIGHT_PERF_ENV_KEYS`. So it shipped a default with no declarative channel:
+an operator's `hindsight.env` line for it was silently discarded by
+`resolveHindsightPerfOverrides` while reading, in yaml, as durable config.
+That is the same defect #3732 fixed for `CONSOLIDATION_LLM_PARALLELISM`, and
+this one was worse in one respect — its own doc comment told operators to stop
+the container and re-run `docker run -e …`, which is precisely the imperative
+state the next `switchroom apply` throws away. The documentation was advising
+the workaround instead of offering the channel.
+
+It matters because the right value is a property of a deployment, not of
+switchroom. The cap bounds observations per *tag scope*, and switchroom retains
+with `retainTags: ["{session_id}"]`, so a scope is roughly a session. How long
+sessions run, and how much consolidation a host can afford to keep doing for
+one, is something only the operator knows.
+
+The constant moved into `hindsight-perf-defaults.ts` as a member of
+`HINDSIGHT_PERF_DEFAULTS_UNGATED`; both hard-coded emissions are deleted, and
+`hindsight.ts` re-exports the name so existing import sites and their tests are
+untouched. The perf-defaults resolver emits it on both paths from one source,
+so the docker-run/compose twin property still holds.
+
+**The shipped default is unchanged at 1000 on every host.** This PR makes the
+key overridable; it does not change what switchroom ships. Ungated for the same
+reason it is defaulted rather than override-only: the previous emission was
+unconditional, so a capability gate — or dropping the default — would silently
+revert hosts to upstream's `-1` (unlimited) and remove the rail itself, a
+behaviour change smuggled in by a refactor.
+
+Deliberately not done: nothing about vectorize-io/hindsight#1284, the upstream
+unbounded-growth bug for whole-bank consolidation. This cap remains a companion
+safety rail, not a fix for that.
+
+Tests pin the key in the managed set and out of the override-only set; the
+default of 1000 across all four capability combinations; an operator value
+replacing it on both launch paths; and — the one that earns its keep — that it
+is emitted **exactly once per path** when not overridden. Verified by mutation:
+restoring the old docker-run emission alongside the new managed one reddens
+nine assertions, including the pre-existing "never emits a managed key twice"
+and run⇄compose parity guards. The two pinned key-list literals and the
+`hindsight.env` schema description are deliberate tripwires; all three fired
+and were updated. `docs/configuration.md` no longer documents the `docker run
+-e` workaround.
+
 ### The `:latest` promotion job's `if:` is now pinned to the un-draft job's
 
 #3735 asserted that `release.yml`'s `images-latest` job exists, promotes this

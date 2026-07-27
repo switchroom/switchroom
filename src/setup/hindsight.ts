@@ -61,29 +61,12 @@ export const HINDSIGHT_DEFAULT_MCP_URL = `http://127.0.0.1:${HINDSIGHT_DEFAULT_A
  */
 export const HINDSIGHT_DEFAULT_API_BASE_URL = HINDSIGHT_DEFAULT_MCP_URL.replace(/\/mcp\/?$/, "");
 
-/**
- * Default cap on observations per *tag scope*.
- *
- * Upstream Hindsight defaults `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE`
- * to `-1` (unlimited). Once a tag scope hits the cap, consolidation
- * stops creating new observations and only updates/deletes existing
- * ones — bounding the cost of consolidating a single long-running
- * scope. Tagless observations are unaffected.
- *
- * Switchroom retains with `retainTags: ["{session_id}"]` (vendored
- * plugin default), so a "tag scope" maps roughly to "one session." A
- * very long Telegram session that runs for weeks can accumulate
- * thousands of observations under one scope — that's the case 1000
- * targets. Most sessions are far below the cap, so for typical
- * agents this is defense-in-depth rather than an active limit.
- *
- * This is NOT a fix for vectorize-io/hindsight#1284 (the upstream
- * unbounded-growth bug for consolidation across a whole bank); it's a
- * companion safety rail until that lands. Operators who want a
- * different value can stop the container and re-run `docker run`
- * with `-e HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=N`.
- */
-export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
+// Re-exported, not defined here: the value now lives in hindsight-perf-defaults
+// so it is a MANAGED key an operator can override via `hindsight.env` (rather
+// than by re-running `docker run -e …`, which the next `switchroom apply`
+// discards). The re-export keeps the existing import sites (and their tests)
+// working. See that module for the rationale and the shipped default of 1000.
+export { HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE } from "./hindsight-perf-defaults.js";
 
 /**
  * Default consumer slug for the hindsight broker socket. Path-as-identity
@@ -1619,13 +1602,14 @@ export function startHindsight(
   // HINDSIGHT_API_LLM_* in the engine, so we emit nothing for it.
   const perOpLlm = resolveHindsightPerOpLlm(llm);
 
-  // Non-secret env stays on `-e` — provider name + observation cap are
-  // configuration, not secrets. `HINDSIGHT_API_LLM_PROVIDER=claude-code`
-  // selects the subscription-honest path; `HINDSIGHT_API_LLM_MODEL` pins the
-  // memory-ops model (default HINDSIGHT_DEFAULT_MODEL, or the cheap LiteLLM
-  // default, operator-overridable via `hindsight.llm`).
+  // Non-secret env stays on `-e` — provider name is configuration, not a
+  // secret. `HINDSIGHT_API_LLM_PROVIDER=claude-code` selects the
+  // subscription-honest path; `HINDSIGHT_API_LLM_MODEL` pins the memory-ops
+  // model (default HINDSIGHT_DEFAULT_MODEL, or the cheap LiteLLM default,
+  // operator-overridable via `hindsight.llm`). The per-scope observation cap
+  // is emitted by the managed perf-defaults block below, not pinned here, so
+  // an operator can raise it through `hindsight.env`.
   const envArgs: string[] = [
-    "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "-e", `HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
     "-e", `HINDSIGHT_API_LLM_MODEL=${llmModel}`,
     // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
@@ -2124,7 +2108,9 @@ export function generateHindsightComposeSnippet(
     ? buildLiteLlmAwareHealthPy(internalApiPort, probeUrl)
     : HINDSIGHT_HEALTHCHECK_PY;
   const environment = [
-    `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
+    // The per-scope observation cap moved to the managed perf-defaults block
+    // below, which is emitted on BOTH launch paths from the same resolver, so
+    // the docker-run/compose twin property still holds for it.
     `      - HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
     `      - HINDSIGHT_API_LLM_MODEL=${llmModel}`,
     // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).

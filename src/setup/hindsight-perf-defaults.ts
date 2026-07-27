@@ -357,6 +357,47 @@ export const HINDSIGHT_DEFAULT_LLM_MAX_RETRIES = 2;
  */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
 
+/**
+ * Cap on observations per *tag scope* (upstream default `-1`, unlimited).
+ *
+ * Once a tag scope hits the cap, consolidation stops creating new observations
+ * and only updates/deletes existing ones — bounding the cost of consolidating
+ * a single long-running scope. Tagless observations are unaffected.
+ *
+ * Switchroom retains with `retainTags: ["{session_id}"]` (vendored plugin
+ * default), so a "tag scope" maps roughly to "one session". A very long
+ * Telegram session that runs for weeks can accumulate thousands of
+ * observations under one scope — that is the case 1000 targets. Most sessions
+ * are far below the cap, so for typical agents this is defence-in-depth rather
+ * than an active limit.
+ *
+ * This is NOT a fix for vectorize-io/hindsight#1284 (the upstream
+ * unbounded-growth bug for consolidation across a whole bank); it is a
+ * companion safety rail until that lands.
+ *
+ * Moved here from a bare constant in `hindsight.ts` (2026-07-27). The value is
+ * unchanged; what changes is that it is now a MANAGED key, so an operator can
+ * override it declaratively through `hindsight.env`. Before this it was
+ * emitted unconditionally on both launch paths with no declarative channel, so
+ * a `hindsight.env` line for it was silently dropped and the documented
+ * recourse was to stop the container and re-run `docker run -e …` by hand —
+ * which the next `switchroom apply` throws away. How long a session runs, and
+ * how many observations that is worth keeping, are properties of one
+ * deployment, so the value must be overridable:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     # long-lived sessions on a host with room to consolidate them
+ *     HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE: 5000
+ * ```
+ *
+ * Ungated: it assumes no hardware, and the previous emission was
+ * unconditional — putting it behind a capability gate would silently revert
+ * hosts lacking that gate to upstream's unlimited default.
+ */
+export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -375,6 +416,10 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
   [
     "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
     String(HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM),
+  ],
+  [
+    "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
+    String(HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE),
   ],
 ];
 

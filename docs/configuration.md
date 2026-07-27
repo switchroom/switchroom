@@ -390,7 +390,13 @@ What this actually caps: per-*tag scope* observation count. Switchroom's vendore
 
 This is **not** a fix for vectorize-io/hindsight#1284 (the upstream unbounded-growth bug for whole-bank consolidation) — that's their work to do. It's a companion guardrail.
 
-You don't need to do anything to opt in. Override by stopping the bundled container and re-running `docker run` with a different `-e HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=N` value, or by editing the generated docker-compose snippet before applying it.
+You don't need to do anything to opt in. To change it, set the key under `hindsight.env` — it's a managed key, so your value replaces switchroom's default on both the `docker run` and `--compose` paths and survives the next `switchroom apply`:
+
+```yaml
+hindsight:
+  env:
+    HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE: 5000
+```
 
 If you run your own Hindsight container outside `switchroom memory --start` (e.g. you point `memory.config.url` at an external server), switchroom doesn't manage that container's env — set the cap on your own image.
 
