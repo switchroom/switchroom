@@ -597,11 +597,14 @@ describe("hindsight version skew", () => {
 
   /**
    * Mutation-guard for the "guaranteed-red flagship check" bug: an earlier
-   * revision set the contract floor to 0.8.5 because `repair-bank` needs
-   * 0.8.5, while the snapshot and docker/Dockerfile.hindsight were both 0.8.4 —
-   * so every `switchroom doctor` run on the actual fleet printed a red row the
-   * operator could not act on. The floor tracks the SNAPSHOT; feature floors
-   * are enforced where the feature is used.
+   * revision of this branch set the contract floor to 0.8.5 because
+   * `repair-bank` needs 0.8.5, while the snapshot and
+   * docker/Dockerfile.hindsight were both still 0.8.4 — so every `switchroom
+   * doctor` run on the actual fleet printed a red row the operator could not
+   * act on. The floor tracks the SNAPSHOT; feature floors are enforced where
+   * the feature is used. The marker is read from the Dockerfile rather than
+   * written down here, so this keeps guarding after the next image bump (it
+   * already survived #3768's 0.8.4 → 0.8.5 roll).
    */
   it("does not fail on the api_version the shipped image pins", () => {
     const dockerfile = readFileSync(

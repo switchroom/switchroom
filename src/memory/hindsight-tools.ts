@@ -85,7 +85,10 @@ export interface HindsightToolSpec {
  * on the running fleet: the snapshot described 0.8.4, the constant claimed
  * 0.8.5 because `repair-bank` needs 0.8.5, and every `switchroom doctor` run
  * printed a failure the operator could do nothing about. A flagship check that
- * is red by construction trains people to ignore it.
+ * is red by construction trains people to ignore it. The two values COINCIDE
+ * today (#3768 bumped the pinned image to 0.8.5, the version that first ships
+ * `repair-bank`) — that is a coincidence of the moment, not a licence to fuse
+ * them again. This one moves only when the snapshot is re-captured.
  *
  * A floor, not an equality pin, and the distinction is deliberate:
  *  - **Below it** is a hard problem: the snapshot (and therefore
@@ -102,7 +105,7 @@ export interface HindsightToolSpec {
  * api_version `docker/Dockerfile.hindsight` pins), so the three cannot drift
  * apart: bumping one without re-capturing the others reds the suite.
  */
-export const HINDSIGHT_MIN_API_VERSION = "0.8.4";
+export const HINDSIGHT_MIN_API_VERSION = "0.8.5";
 
 /**
  * The hindsight version that first ships `hindsight-admin repair-bank`
@@ -113,9 +116,10 @@ export const HINDSIGHT_MIN_API_VERSION = "0.8.4";
  * It gates exactly one thing — `switchroom memory repair`'s preflight, which
  * turns typer's misleading `No such command 'repair-bank'` into the real
  * sentence — and it deliberately does NOT gate the MCP contract or produce a
- * standing doctor row. The image pin catches up in #3768; until then the
- * operator learns about the gap at the moment they try to use the feature,
- * which is the only moment the information is actionable.
+ * standing doctor row. The image pin caught up in #3768, so on the fleet this
+ * floor is now satisfied; the separation stays because the NEXT feature floor
+ * will not be, and the operator should learn about a gap at the moment they
+ * try to use the feature — the only moment the information is actionable.
  */
 export const HINDSIGHT_REPAIR_MIN_API_VERSION = "0.8.5";
 

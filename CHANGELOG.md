@@ -406,13 +406,15 @@ the live `GET /version`:
 - **unreachable → no row.** The `/health` check already owns "the backend is
   down"; a second red line for the same outage is noise.
 
-The floor tracks the **snapshot**, not any individual feature: it is `0.8.4`,
-the version `docker/Dockerfile.hindsight` actually pins. `repair-bank`'s `0.8.5`
-requirement lives in its own `HINDSIGHT_REPAIR_MIN_API_VERSION` and is enforced
-in the repair preflight, at the moment an operator tries to use it. Fusing the
-two would have shipped a flagship doctor check that was red by construction on
-every running fleet — which trains people to ignore precisely the check meant
-to catch the next outage.
+The floor tracks the **snapshot**, not any individual feature: it is the
+version `docker/Dockerfile.hindsight` actually pins — `0.8.5` since #3768 moved
+the fork onto upstream 0.8.5. `repair-bank`'s own requirement lives in
+`HINDSIGHT_REPAIR_MIN_API_VERSION` and is enforced in the repair preflight, at
+the moment an operator tries to use it. The two constants coincide at `0.8.5`
+today; that is a coincidence of the current pin, not a merge. Fusing them
+shipped, in an earlier revision of this branch, a flagship doctor check that was
+red by construction on every running fleet — which trains people to ignore
+precisely the check meant to catch the next outage.
 
 The fixture test chains constant → snapshot `_meta.hindsight_api_version` →
 the api-version marker in `docker/Dockerfile.hindsight`, so bumping any one

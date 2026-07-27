@@ -17,6 +17,22 @@ import {
   HINDSIGHT_REPAIR_MIN_API_VERSION,
 } from "./hindsight-tools.js";
 
+/**
+ * The largest version strictly below `v`, so a floor test follows the constant
+ * instead of hard-coding the version that happens to be the floor today.
+ */
+function justBelow(v: string): string {
+  const parts = v.split(".").map((p) => Number(p));
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i] > 0) {
+      parts[i] -= 1;
+      for (let j = i + 1; j < parts.length; j++) parts[j] = 99;
+      return parts.join(".");
+    }
+  }
+  throw new Error(`no version below ${v}`);
+}
+
 describe("buildRepairBankArgv", () => {
   it("targets the named container and the admin CLI's real in-image path", () => {
     const argv = buildRepairBankArgv({ bank: "agent_overlord" });
@@ -159,16 +175,25 @@ describe("compareApiVersion", () => {
 
 describe("classifyRepairPreflight", () => {
   /**
-   * The feature floor must NOT be the MCP-contract floor. Fusing them is what
-   * made `switchroom doctor` red-by-construction on the running fleet: the
-   * contract was captured from 0.8.4 but the constant claimed 0.8.5 because
-   * repair-bank needs it. If someone re-fuses them, this reds.
+   * The feature floor and the MCP-contract floor are separate constants with
+   * separate sources of truth: `HINDSIGHT_MIN_API_VERSION` tracks the committed
+   * tools/list snapshot (chained to `docker/Dockerfile.hindsight` in
+   * tests/memory.hindsight-contract.fixture.test.ts), while
+   * `HINDSIGHT_REPAIR_MIN_API_VERSION` tracks upstream #2645. Fusing them is
+   * what made `switchroom doctor` red-by-construction while the fleet still ran
+   * 0.8.4. They happen to be EQUAL since #3768 pinned the 0.8.5 image, so the
+   * old `REPAIR > MIN` assertion no longer holds and would have been a false
+   * guard; the invariant that survives is directional (the feature floor is
+   * never BELOW the contract floor) plus the preflight being driven by the
+   * feature constant rather than a literal.
    */
-  it("uses the repair FEATURE floor, which is above the MCP contract floor", () => {
+  it("enforces the repair FEATURE floor at the preflight, whatever the contract floor is", () => {
     expect(compareApiVersion(HINDSIGHT_REPAIR_MIN_API_VERSION, HINDSIGHT_MIN_API_VERSION))
-      .toBeGreaterThan(0);
-    // The contract floor alone must not admit a server that lacks repair-bank.
-    expect(classifyRepairPreflight(HINDSIGHT_MIN_API_VERSION).ok).toBe(false);
+      .toBeGreaterThanOrEqual(0);
+    // Driven by the constant, not a hard-coded 0.8.5: raising the feature floor
+    // must keep the preflight refusing everything below the new value.
+    expect(classifyRepairPreflight(justBelow(HINDSIGHT_REPAIR_MIN_API_VERSION)).ok).toBe(false);
+    expect(classifyRepairPreflight(HINDSIGHT_REPAIR_MIN_API_VERSION).ok).toBe(true);
   });
 
   it("blocks a confirmed pre-0.8.5 server and names the real cause, not a typo", () => {
