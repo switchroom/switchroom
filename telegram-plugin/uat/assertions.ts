@@ -72,6 +72,25 @@ const ACTIVITY_BODY_LINE_RE = /^[→✓↳]/u;
  * Elapsed is `formatFeedElapsed`: `<N>s` under a minute, else `<M>m<SS>s`.
  */
 const LIVENESS_HEADER_L1_RE = /^(?:🤖|🛠[️]?|⚙[️]?)\s+\S/u;
+
+/**
+ * Leading chrome a SUBORDINATE (worker) card carries since #3820: the `└─ `
+ * header prefix on line 1 and a `U+2800` indent run on every later line, which
+ * together make the worker card readable as a child of the 🤖 agent card.
+ *
+ * Every line-shape matcher below must normalise it away first: Telegram
+ * delivers both verbatim, and NEITHER is stripped by `String.trim()` — U+2800
+ * is category So, not whitespace (that property is exactly why it survives
+ * Telegram's own left-trim; see WORKER_STEP_INDENT). Without this, a worker
+ * card's header stops matching `LIVENESS_HEADER_L1_RE` and its body lines stop
+ * matching `ACTIVITY_BODY_LINE_RE`.
+ */
+const SUBORDINATE_CARD_PREFIX_RE = /^(?:└─\s*|\u2800+)+/u;
+
+/** A card line with its subordinate-card nesting chrome removed, trimmed. */
+export function stripCardNesting(line: string): string {
+  return line.replace(SUBORDINATE_CARD_PREFIX_RE, "").trim();
+}
 const LIVENESS_ELAPSED = String.raw`(?:\d+m)?\d+s`;
 const LIVENESS_HEADER_L2_RE = new RegExp(
   `^(?:${LIVENESS_ELAPSED}\\s*·\\s*\\d+\\s+tools?` +
@@ -94,7 +113,7 @@ const LIVENESS_HEADER_L2_RE = new RegExp(
 export function isLivenessCardMessage(m: ObservedMessage): boolean {
   const lines = m.text
     .split("\n")
-    .map((l) => l.trim())
+    .map((l) => stripCardNesting(l))
     .filter((l) => l.length > 0);
   if (lines.length < 2) return false;
   if (!LIVENESS_HEADER_L1_RE.test(lines[0])) return false;
@@ -124,7 +143,7 @@ export function isLivenessCardMessage(m: ObservedMessage): boolean {
 export function isActivityFeedMessage(m: ObservedMessage): boolean {
   const lines = m.text
     .split("\n")
-    .map((l) => l.trim())
+    .map((l) => stripCardNesting(l))
     .filter((l) => l.length > 0);
   if (lines.length === 0) return false;
   if (lines.every((l) => ACTIVITY_FEED_LINE_RE.test(l))) return true;

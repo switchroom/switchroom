@@ -11,7 +11,11 @@
 
 import { describe, expect, it } from "vitest";
 import { spinUp } from "../harness.js";
-import { isActivityFeedMessage, isFrameworkFallbackText } from "../assertions.js";
+import {
+  isActivityFeedMessage,
+  isFrameworkFallbackText,
+  stripCardNesting,
+} from "../assertions.js";
 import type { ObservedMessage } from "../driver.js";
 
 const AGENT = "test-harness";
@@ -30,7 +34,10 @@ const NARRATED_WORK_PROMPT =
 function narratedBodyLines(text: string): string[] {
   return text
     .split("\n")
-    .map((l) => l.trim())
+    // strip the #3820 subordinate-card nesting (`└─ ` / U+2800 indent) first —
+    // `trim()` removes neither, and a worker card's header/body lines would
+    // otherwise read as model narration
+    .map((l) => stripCardNesting(l))
     .filter((l) => l.length > 0)
     .map((l) => l.replace(/^[→✓↳]+\s*/u, "").trim())
     .filter(
