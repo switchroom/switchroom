@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { scaffoldAgent } from "../src/agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent } from "../src/agents/scaffold.js";
 import {
   resolveHindsightRecallPassthrough,
   RECALL_PASSTHROUGH_DEFAULTS,
@@ -258,6 +258,74 @@ describe("recall passthrough (#3841)", () => {
       const nasty = `It's $(rm -rf /) \`backtick\` "quoted" $HOME`;
       const { startSh } = scaffold(withRecall({ prompt_preamble: nasty }));
       expect(shellValueOf(startSh, "HINDSIGHT_RECALL_PROMPT_PREAMBLE")).toBe(nasty);
+    });
+  });
+
+  describe("reconcile emits the same knobs as scaffold", () => {
+    // `reconcileAgentInner` hand-builds its own template context instead of
+    // going through buildWorkspaceContext. A knob wired into only one of them
+    // renders EMPTY on the other path — handlebars resolves an unknown path to
+    // "" rather than throwing — and an empty export is skipped by `_cast_env`,
+    // handing the knob back to ~/.hindsight/claude-code.json. Caught in CI on
+    // the first push of this feature, so it is not hypothetical.
+    it("renders byte-identical recall exports on both paths", () => {
+      const agentConfig = withRecall({
+        budget: "mid",
+        max_tokens: 2048,
+        prefer_observations: false,
+        context_turns: 3,
+        roles: ["user"],
+        prompt_preamble: "Past context — it's yours:",
+        tags: ["profile"],
+        tags_match: "all_strict",
+        tag_groups: { core: ["profile"] },
+        tag_weights: { lesson: 1.4 },
+        additional_bank_filters: { "ken-profile": { tags: ["profile"] } },
+        transcript_fallback: false,
+        transcript_tail_bytes: 4096,
+        max_query_chars: 400,
+        parallel: false,
+      });
+      const config = {
+        agents: { probe: agentConfig },
+        memory: { backend: "hindsight", config: { url: "http://localhost:18888/mcp/" } },
+        telegram,
+      } as unknown as SwitchroomConfig;
+
+      const res = scaffoldAgent("probe", agentConfig, tmpDir, telegram, config);
+      const startShPath = join(res.agentDir, "start.sh");
+      const scaffolded = readFileSync(startShPath, "utf-8");
+      reconcileAgent("probe", agentConfig, tmpDir, telegram, config);
+      const reconciled = readFileSync(startShPath, "utf-8");
+
+      const recallLines = (sh: string) =>
+        sh.split("\n").filter((l) => l.startsWith("export HINDSIGHT_RECALL_"));
+      // Named explicitly, so a knob that silently drops off BOTH paths still
+      // reds — an equality check alone would call two identical gaps a pass.
+      const names = (sh: string) =>
+        recallLines(sh).map((l) => l.slice("export ".length).split("=")[0]);
+      for (const name of [
+        "HINDSIGHT_RECALL_BUDGET",
+        "HINDSIGHT_RECALL_MAX_TOKENS",
+        "HINDSIGHT_RECALL_PREFER_OBSERVATIONS",
+        "HINDSIGHT_RECALL_CONTEXT_TURNS",
+        "HINDSIGHT_RECALL_ROLES",
+        "HINDSIGHT_RECALL_PROMPT_PREAMBLE",
+        "HINDSIGHT_RECALL_MAX_QUERY_CHARS",
+        "HINDSIGHT_RECALL_TRANSCRIPT_TAIL_BYTES",
+        "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK",
+        "HINDSIGHT_RECALL_TAGS",
+        "HINDSIGHT_RECALL_TAGS_MATCH",
+        "HINDSIGHT_RECALL_TAG_GROUPS",
+        "HINDSIGHT_RECALL_TAG_WEIGHTS",
+        "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS",
+        "HINDSIGHT_RECALL_PARALLEL",
+      ]) {
+        expect(names(scaffolded)).toContain(name);
+        expect(names(reconciled)).toContain(name);
+      }
+      expect(recallLines(reconciled)).toEqual(recallLines(scaffolded));
+      expect(recallLines(reconciled).some((l) => /=$/.test(l))).toBe(false);
     });
   });
 

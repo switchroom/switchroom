@@ -796,6 +796,7 @@ import {
 } from "../setup/hindsight-recall-tunables.js";
 import {
   resolveHindsightRecallPassthrough,
+  recallPassthroughTemplateFields,
   HINDSIGHT_RECALL_TAG_WEIGHT_SEED,
   type HindsightRecallPassthrough,
   type RecallPassthroughInput,
@@ -3838,25 +3839,13 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // preamble is free-form operator text and the JSON carries double quotes;
     // neither is safe bare). Never empty: an empty export is skipped by
     // `_cast_env` and hands authority back to ~/.hindsight/claude-code.json.
-    hindsightRecallPass: {
-      budget: hindsightRecallPassthrough.budget,
-      maxTokens: hindsightRecallPassthrough.maxTokens,
-      preferObservations: hindsightRecallPassthrough.preferObservations,
-      contextTurns: hindsightRecallPassthrough.contextTurns,
-      rolesQ: shellSingleQuote(hindsightRecallPassthrough.rolesJson),
-      promptPreambleQ: shellSingleQuote(hindsightRecallPassthrough.promptPreamble),
-      tagsQ: shellSingleQuote(hindsightRecallPassthrough.tagsJson),
-      tagsMatch: hindsightRecallPassthrough.tagsMatch,
-      tagGroupsQ: shellSingleQuote(hindsightRecallPassthrough.tagGroupsJson),
-      tagWeightsQ: shellSingleQuote(hindsightRecallPassthrough.tagWeightsJson),
-      additionalBankFiltersQ: shellSingleQuote(
-        hindsightRecallPassthrough.additionalBankFiltersJson,
-      ),
-      transcriptFallback: hindsightRecallPassthrough.transcriptFallback,
-      transcriptTailBytes: hindsightRecallPassthrough.transcriptTailBytes,
-      maxQueryChars: hindsightRecallPassthrough.maxQueryChars,
-      parallel: hindsightRecallPassthrough.parallel,
-    },
+    // Built by the shared helper, NOT inline: reconcileAgentInner hand-builds
+    // its own template context, and a second copy of this mapping is the
+    // init-vs-reconcile drift scaffold.memory-prompt.test.ts guards.
+    hindsightRecallPass: recallPassthroughTemplateFields(
+      hindsightRecallPassthrough,
+      shellSingleQuote,
+    ),
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
@@ -7421,7 +7410,16 @@ function reconcileAgentInner(
       hindsightRecallAdditionalBankMinSlots,
       hindsightRecallMinScore,
       hindsightRecallMinScoreScope,
-      hindsightRecallPassthrough,
+      // #3841 — the SAME builder buildWorkspaceContext uses. This context is
+      // hand-built, so passing the resolver object straight through would leave
+      // every `{{hindsightRecallPass.*}}` path unknown, and handlebars renders
+      // an unknown path as "" rather than throwing: reconcile would silently
+      // emit `export HINDSIGHT_RECALL_BUDGET=` and hand the knob back to
+      // ~/.hindsight/claude-code.json.
+      hindsightRecallPass: recallPassthroughTemplateFields(
+        hindsightRecallPassthrough,
+        shellSingleQuote,
+      ),
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,

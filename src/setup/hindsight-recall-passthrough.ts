@@ -204,6 +204,68 @@ export const RECALL_PASSTHROUGH_DEFAULTS = Object.freeze({
 /** Marker every validation failure carries, so operators can grep for it. */
 export const RECALL_PASSTHROUGH_ERROR_MARKER = "HINDSIGHT-RECALL-CONFIG";
 
+/**
+ * The `hindsightRecallPass.*` object `profiles/_base/start.sh.hbs` reads. Every
+ * structural value is already shell-quoted, so the template renders it with a
+ * triple-stash.
+ */
+export interface RecallPassthroughTemplateFields {
+  budget: string;
+  maxTokens: number;
+  preferObservations: string;
+  contextTurns: number;
+  rolesQ: string;
+  promptPreambleQ: string;
+  tagsQ: string;
+  tagsMatch: string;
+  tagGroupsQ: string;
+  tagWeightsQ: string;
+  additionalBankFiltersQ: string;
+  transcriptFallback: string;
+  transcriptTailBytes: number;
+  maxQueryChars: number;
+  parallel: string;
+}
+
+/**
+ * Build the template object, in ONE place.
+ *
+ * `scaffoldAgent` renders through `buildWorkspaceContext`; `reconcileAgentInner`
+ * hand-builds its own template context. Two hand-written copies of this mapping
+ * is precisely the init-vs-reconcile drift `tests/scaffold.memory-prompt.test.ts`
+ * exists to catch — and the failure is silent in the worst way, because
+ * handlebars renders an unknown path as the EMPTY STRING rather than throwing.
+ * An empty `export HINDSIGHT_RECALL_X=` then casts to `None`, `load_config()`
+ * skips the assignment, and a stale `~/.hindsight/claude-code.json` takes the
+ * knob back — the exact defect class (#3774) the unconditional export exists to
+ * close. So both callers go through this function.
+ *
+ * @param quote the shell single-quoter (passed in so this module stays free of
+ * scaffold.ts imports).
+ */
+export function recallPassthroughTemplateFields(
+  resolved: HindsightRecallPassthrough,
+  quote: (value: string) => string,
+): RecallPassthroughTemplateFields {
+  return {
+    budget: resolved.budget,
+    maxTokens: resolved.maxTokens,
+    preferObservations: resolved.preferObservations,
+    contextTurns: resolved.contextTurns,
+    rolesQ: quote(resolved.rolesJson),
+    promptPreambleQ: quote(resolved.promptPreamble),
+    tagsQ: quote(resolved.tagsJson),
+    tagsMatch: resolved.tagsMatch,
+    tagGroupsQ: quote(resolved.tagGroupsJson),
+    tagWeightsQ: quote(resolved.tagWeightsJson),
+    additionalBankFiltersQ: quote(resolved.additionalBankFiltersJson),
+    transcriptFallback: resolved.transcriptFallback,
+    transcriptTailBytes: resolved.transcriptTailBytes,
+    maxQueryChars: resolved.maxQueryChars,
+    parallel: resolved.parallel,
+  };
+}
+
 function fail(key: string, detail: string): never {
   throw new Error(
     `${RECALL_PASSTHROUGH_ERROR_MARKER}: memory.recall.${key} is invalid — ${detail}. ` +
