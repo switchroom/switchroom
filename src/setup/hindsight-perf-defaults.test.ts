@@ -38,6 +38,7 @@ import {
   HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
   HINDSIGHT_PERF_DEFAULTS_UNGATED,
   HINDSIGHT_PERF_ENV_KEYS,
+  HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS,
   HINDSIGHT_RECALL_SOURCE_COUNT,
   HINDSIGHT_RERANKER_MAX_CANDIDATES_FOR_DERIVATION,
   hindsightPerfEnv,
@@ -310,7 +311,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these eleven keys, by name", () => {
+  it("is overridable on exactly these twelve keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -329,6 +330,93 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
       "HINDSIGHT_API_RERANKER_LOCAL_FP16",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+    ]);
+  });
+
+  it("accepts the override-only bank-priority key even though it has no default", () => {
+    // Managed-but-defaultless: it is in HINDSIGHT_PERF_ENV_KEYS purely so an
+    // operator has a DECLARATIVE channel for it. Without that it could only be
+    // set imperatively on the container, which the next `switchroom apply`
+    // silently drops — the exact regression class this file guards.
+    const got = resolveHindsightPerfOverrides({
+      HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY: "big-bank:3,busy-bank:2,*:1",
+    });
+    expect(got.get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toBe(
+      "big-bank:3,busy-bank:2,*:1",
+    );
+  });
+});
+
+// ── the override-only key ─────────────────────────────────────────────────
+describe("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY (override-only)", () => {
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group", () => {
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+    )).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(
+        "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+      );
+    }
+    // …and every override-only key really is absent from every group, so the
+    // "no shipped default" property can't be broken by adding one later.
+    const defaulted = new Set(
+      [
+        ...HINDSIGHT_PERF_DEFAULTS_UNGATED,
+        ...HINDSIGHT_PERF_DEFAULTS_GPU,
+        ...HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+      ].map(([k]) => k),
+    );
+    for (const key of HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS) {
+      expect(defaulted.has(key), `${key} must not have a shipped default`).toBe(false);
+    }
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted on any host when unset (gpu=$gpu localLlm=$localLlm) — flat FIFO preserved",
+    (caps) => {
+      // Hard-coding one deployment's bank names into switchroom's shipped
+      // defaults would push this install's agent names onto every operator.
+      // Unset ⇒ upstream's flat `ORDER BY created_at`, i.e. no behaviour change.
+      const keys = hindsightPerfEnv(caps).map(([k]) => k);
+      expect(keys).not.toContain("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY");
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    const MAP = "big-bank:3,busy-bank:2,*:1";
+    const perf = { env: { HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY: MAP }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    // Both paths, or the value dies on whichever recreate the operator uses.
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([MAP]);
+    expect(fromCompose.get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([MAP]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // The key belongs to no capability group, so a gate-shaped regression that
+    // only emits grouped keys would silently drop it. Cloud endpoint + no GPU
+    // is the harshest gating case.
+    const MAP = "only-bank:2,*:1";
+    const perf = { env: { HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY: MAP }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([
+      MAP,
     ]);
   });
 });

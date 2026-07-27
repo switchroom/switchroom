@@ -218,9 +218,55 @@ export const HINDSIGHT_DEFAULT_LLM_REASONING_EFFORT = "low";
  * reflect always has headroom"), and it matches our load shape: 99.7% of
  * recall traffic is background consolidation, which must never crowd out an
  * interactive reflect.
+ *
+ * **Deliberately left at upstream's worked-example 4 rather than raised to a
+ * specific host's slot count.** The right value is exactly "how many
+ * concurrent slots does this operator's local endpoint expose", which is a
+ * property of the deployment, not of switchroom — 4 is the value upstream
+ * recommends when that number is unknown, and it is safe on the smallest
+ * plausible local box. An operator who has measured their pool raises it
+ * declaratively, and it survives `switchroom apply`:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_LLM_MAX_CONCURRENT: 6
+ * ```
+ *
+ * Note this is the GLOBAL cap. It does not by itself widen consolidation,
+ * which is separately pinned by
+ * {@link HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_MAX_CONCURRENT} below.
  */
 export const HINDSIGHT_DEFAULT_LLM_MAX_CONCURRENT = 4;
 export const HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT = 1;
+
+/**
+ * Per-op cap on consolidation LLM calls — and the ACTUAL ceiling on
+ * consolidation throughput.
+ *
+ * Worth stating plainly because it is easy to tune the wrong knob: the engine
+ * composes this with the global cap rather than replacing it — a consolidation
+ * call must acquire this semaphore AND {@link HINDSIGHT_DEFAULT_LLM_MAX_CONCURRENT}
+ * (`llm_wrapper._build_per_op_semaphores` / `_semaphores_for_scope`, "Per-op
+ * acquired first so contention queues on the narrower cap"). At 1 the process
+ * makes at most ONE consolidation LLM call at a time, no matter how many
+ * worker slots, banks or tag-groups are in flight. So raising worker slots
+ * (`HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT`), `LLM_PARALLELISM`, or the
+ * global cap pipelines the non-LLM stages and improves fairness, but only THIS
+ * value multiplies concurrent consolidation inference.
+ *
+ * Kept at 1 by default: it is the guarantee that background consolidation
+ * cannot crowd interactive recall/reflect off a shared local endpoint, which
+ * is upstream's stated reason for the worked example. Raising it is a real
+ * latency trade on the interactive lanes, so it is an operator decision made
+ * declaratively against a measured slot pool, not a shipped default:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT: 2
+ * ```
+ */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_MAX_CONCURRENT = 1;
 
 /**
@@ -323,19 +369,59 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
 ];
 
 /**
+ * Keys switchroom manages but ships NO default for — emitted only when the
+ * operator sets them in `hindsight.env` / the process environment.
+ *
+ * This is the right shape for a knob whose correct value is a property of one
+ * *deployment* rather than of the software. Baking such a value into a shipped
+ * default hard-codes one installation's facts into a general product; leaving
+ * the key out of the managed set entirely leaves the operator with no
+ * declarative channel at all, which is exactly how a value ends up set
+ * imperatively on a container and silently dropped by the next
+ * `switchroom apply`. Neither is acceptable, so: managed key, no default.
+ *
+ * ### `HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY`
+ *
+ * Upstream's consolidation claim query is a flat `ORDER BY created_at` across
+ * every bank unless a priority map is configured (`ops_postgresql.py`
+ * `claim_tasks`: "When *priority_map* is ``None``, uses the default
+ * ``ORDER BY created_at``"), so a bank with a 29k backlog gets no preference
+ * over one with 83. The map fixes that — but the fix *is* "which banks matter
+ * on this host", and bank names are per-deployment (they are agent names).
+ * Unset ⇒ upstream's flat FIFO, i.e. this key changes nothing for anyone who
+ * does not opt in.
+ *
+ * Format (`config.py` `_parse_bank_priority`): `pattern:priority,...`, higher
+ * priority claimed first, `*` is a wildcard inside a pattern, a bare `*` is
+ * the catch-all for unlisted banks, and every priority must be an integer
+ * `>= 1` — a malformed entry raises at container startup rather than being
+ * ignored, so a typo here fails loudly. Example:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY: "big-bank:3,busy-bank:2,*:1"
+ * ```
+ */
+export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
+  "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+]);
+
+/**
  * Every key this module manages — and therefore the exact set an operator may
  * override through `hindsight.env` / the process environment.
  *
  * Scoped on purpose: see the "operator override always wins" note at the top
  * of this file for why a blanket `HINDSIGHT_API_*` passthrough is worse.
  */
-export const HINDSIGHT_PERF_ENV_KEYS: ReadonlySet<string> = new Set(
-  [
+export const HINDSIGHT_PERF_ENV_KEYS: ReadonlySet<string> = new Set([
+  ...[
     ...HINDSIGHT_PERF_DEFAULTS_UNGATED,
     ...HINDSIGHT_PERF_DEFAULTS_GPU,
     ...HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
   ].map(([k]) => k),
-);
+  ...HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS,
+]);
 
 /**
  * Resolve the operator's overrides for the managed keys.
@@ -409,8 +495,11 @@ export function hindsightPerfEnv(
 
   // An operator override for a key whose capability group is OFF still has to
   // reach the container — otherwise "operator override wins" would silently
-  // mean "operator override is dropped on a GPU-less box". Append those in
-  // key order for determinism.
+  // mean "operator override is dropped on a GPU-less box". This is also the
+  // ONLY path by which a HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS member is emitted:
+  // it belongs to no defaults group, so it appears here exactly when the
+  // operator set it and is absent otherwise. Append in key order for
+  // determinism.
   for (const key of [...overrides.keys()].sort()) {
     if (emitted.has(key)) continue;
     emitted.add(key);

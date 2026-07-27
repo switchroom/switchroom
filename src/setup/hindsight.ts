@@ -701,36 +701,81 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
 }
 
 /**
- * Consolidation throughput knobs — throttled HARD for shared-quota safety.
- * Consolidation is LLM-bound via the claude-code provider (observed
- * ~510s/op), and every concurrent op is a live claude (Sonnet) subprocess
- * spending the subscription's quota.
+ * Consolidation throughput knobs.
  *
- * Since 2026-07-05 hindsight is UNPINNED (auth.consumers[hindsight] has no
- * `account:`) — it follows the fleet-active account and shares the SAME
- * live-turn quota the agents use. That makes the hard ceiling on concurrent
- * model calls (MAX_SLOTS × LLM_PARALLELISM) a direct tax on the fleet: on
- * 2026-07-06 an 18-way consolidation fan-out (3 × 6) across multiple banks
- * exhausted the shared account (429 rate-limit wall) and starved live agent
- * turns. Operator decision: hindsight keeps sharing the fleet's failover,
- * but consolidation must NEVER be able to exhaust the quota — so the
- * concurrency ceiling is throttled to 1 × 2 = 2 concurrent model calls
- * (was 18), and per-round scope is cut so an op can't monopolise a slot for
- * long.
+ * ## The binding constraint is LOCAL GPU SLOTS, not subscription quota
  *
- * - MAX_SLOTS 1: at most one bank consolidates at a time (no cross-bank
- *   fan-out — that fan-out is exactly what walled the account).
- * - LLM_PARALLELISM 2: at most two tag-groups in flight within that one op.
- *   1 × 2 = 2 concurrent claude subprocesses, ceiling.
- * - MAX_MEMORIES_PER_ROUND 100: bounded scope per op → faster slot release,
- *   more re-queue points where the fleet can reclaim the quota.
+ * These values used to be throttled to a hard ceiling of 2 concurrent model
+ * calls because consolidation ran on the Anthropic subscription. **That
+ * premise is no longer what this fleet runs.** `hindsight.llm.consolidation`
+ * in switchroom.yaml points the lane at `provider: litellm`, `model:
+ * openai/gpt-oss-20b-consolidation`, `base_url: http://127.0.0.1:4010/v1` —
+ * a loopback LiteLLM proxy routing to self-hosted Ollama boxes on the
+ * tailnet. On that path there is no shared Anthropic quota to exhaust and no
+ * marginal cash cost per call; a consolidation op is a request against a
+ * finite pool of local inference slots.
+ *
+ * The resource to protect changed shape entirely:
+ *
+ *   - OLD: a shared, fleet-wide, *rate-limited* budget where one bad fan-out
+ *     429s the live agents. The only safe answer was a hard low ceiling.
+ *   - NEW: a fixed local slot pool that queues rather than 429s. Over-issuing
+ *     costs latency for the *interactive* lanes (recall / reflect / retain)
+ *     sharing that pool; it cannot wall the fleet's Claude turns.
+ *
+ * Interactive-lane protection therefore lives elsewhere, and this is the knob
+ * to reach for first: `HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT`
+ * (src/setup/hindsight-perf-defaults.ts, default 1) is a process-wide
+ * semaphore on consolidation LLM calls — see the engine's
+ * `llm_wrapper._build_per_op_semaphores`, where a consolidation call must
+ * acquire the per-op semaphore AND the global one. Every knob in THIS block
+ * sits outside that semaphore, so raising them pipelines a consolidation op's
+ * non-LLM stages (recall, embedding, db_write) and improves cross-bank
+ * fairness — it does not multiply concurrent LLM calls.
+ *
+ * - MAX_SLOTS 1: the worker's reserved *floor* for consolidation — one bank
+ *   is always guaranteed a slot. Deliberately NOT the ceiling; see
+ *   {@link HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT}.
+ * - LLM_PARALLELISM 2: at most two tag-groups in flight within one op.
+ * - MAX_MEMORIES_PER_ROUND 500: a correctness knob as much as a throughput
+ *   one — see the constant's own note.
  * - LLM_BATCH_SIZE: **no longer a constant here.** Derived from the declared
  *   backend context window — see below and `hindsight-context-budget.ts`.
  *
- * Consolidation drains slower by design; that is the accepted trade for never
- * walling the live fleet. The concurrency values above remain
- * operator-overridable via the generated compose / -e (raise them only with a
- * dedicated isolated account pinned back on the consumer).
+ * MAX_SLOTS and LLM_PARALLELISM are LEFT at their throttled values. On the
+ * local-inference path they are not the binding constraint, and leaving them
+ * low keeps the subscription-path ceiling intact for any operator who has NOT
+ * moved consolidation off `claude-code` — still switchroom's shipped default
+ * provider ({@link HINDSIGHT_DEFAULT_MODEL} / `resolveHindsightLlm`).
+ *
+ * ## RESTORE CONDITION — before pointing consolidation back at Claude
+ *
+ * If `hindsight.llm.consolidation` (or the global `hindsight.llm`) is ever set
+ * back to `provider: claude-code`, consolidation is once again spending the
+ * fleet's shared subscription quota and **these values must go back down**:
+ * `MAX_MEMORIES_PER_ROUND` to 100 and
+ * {@link HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT} to 1, keeping
+ * MAX_SLOTS × LLM_PARALLELISM at 2. The failure mode that justifies the
+ * throttle is recorded immediately below and has happened for real.
+ *
+ * ## History — why the hard throttle existed (2026-07-06 incident)
+ *
+ * Kept, not deleted: it is the reason to be careful about the restore
+ * condition above.
+ *
+ * Consolidation was LLM-bound via the claude-code provider (observed
+ * ~510s/op), and every concurrent op was a live claude (Sonnet) subprocess
+ * spending the subscription's quota. Since 2026-07-05 hindsight is UNPINNED
+ * (auth.consumers[hindsight] has no `account:`) — it follows the fleet-active
+ * account and shares the SAME live-turn quota the agents use. That made the
+ * hard ceiling on concurrent model calls (MAX_SLOTS × LLM_PARALLELISM) a
+ * direct tax on the fleet: on 2026-07-06 an 18-way consolidation fan-out
+ * (3 × 6) across multiple banks exhausted the shared account (429 rate-limit
+ * wall) and starved live agent turns. Operator decision at the time:
+ * hindsight keeps sharing the fleet's failover, but consolidation must NEVER
+ * be able to exhaust the quota — so the concurrency ceiling was throttled to
+ * 1 × 2 = 2 concurrent model calls (was 18), and per-round scope was cut to
+ * 100 so an op could not monopolise a slot for long.
  *
  * ## LLM_BATCH_SIZE is a CONTEXT-WINDOW decision, not only a quota one
  *
@@ -768,7 +813,92 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE =
   HINDSIGHT_CONSOLIDATION_BATCH_SIZE_CEILING;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 100;
+
+/**
+ * Per-round memory scope for one consolidation op (upstream default 1000;
+ * switchroom held this at 100 from the 2026-07-06 quota throttle).
+ *
+ * ## This is a CORRECTNESS knob, not only a throughput one
+ *
+ * The engine SKIPS mental-model refresh entirely on any round that hits this
+ * limit — `engine/consolidation/consolidator.py`:
+ *
+ * ```python
+ * if hit_round_limit:
+ *     stats["mental_models_refreshed"] = 0
+ *     logger.info(f"[CONSOLIDATION] bank={bank_id} skipping mental model refresh "
+ *                 f"(round limit hit, re-queued)")
+ * ```
+ *
+ * That is deliberate upstream behaviour (the next round will handle it), but
+ * it composes badly with a low limit and a large backlog: a bank whose
+ * backlog never drops below the limit hits the limit on EVERY round and
+ * therefore NEVER refreshes its mental models. At 100 that described 4 of the
+ * 6 banks on this fleet (backlogs measured 2026-07-27: 29,625 / 6,238 / 328 /
+ * 165 / 96 / 83 — the top four are all above 100 and the largest was still
+ * rising round over round). Mental models are the standing-answer layer
+ * agents rely on, so "silently never refreshed" is a correctness failure, not
+ * a slow drain.
+ *
+ * 500 is a 5x scope bump with the same shape of bound — it is still a bound,
+ * so a runaway bank still re-queues rather than monopolising a slot, and the
+ * consolidation prompt size per LLM call is unchanged (that is
+ * `LLM_BATCH_SIZE`, derived from the context window). What it costs is a
+ * longer hold on a worker slot per round; what it buys is that a mid-sized
+ * bank now finishes a round and refreshes.
+ *
+ * Raising this was gated on consolidation leaving the shared Anthropic quota
+ * — see the RESTORE CONDITION in the block above.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 500;
+
+/**
+ * Per-type worker slot CEILING for consolidation — upstream
+ * `HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT`.
+ *
+ * ## Ceiling vs floor — two different knobs with confusingly similar names
+ *
+ * Upstream's own `config.py` warns about this, and switchroom has been
+ * silently inheriting the wrong one:
+ *
+ *   - {@link HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}
+ *     (`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS`, 1) is the RESERVED
+ *     FLOOR: slots consolidation is always guaranteed.
+ *   - THIS (`..._SLOT_LIMIT`) is the CEILING: the most slots consolidation may
+ *     hold at once, reserved and shared combined
+ *     (`WORKER_SLOT_LIMIT_TYPES` in `config.py`, whose consolidation entry
+ *     defaults to `4`).
+ *
+ * switchroom never emitted the ceiling, so every install has silently run on
+ * upstream's 4 — and on this fleet that ceiling was observed fully saturated
+ * (`consolidation=4/1(avail=0,cap=4)`, four banks consolidating with more
+ * queued) while only 5 of the worker's 10 total slots were in use. Five idle
+ * slots that consolidation was forbidden from touching.
+ *
+ * (The 4 default and the 10-slot worker pool are pinned by
+ * tests/docker/hindsight-recall-isolation-patches.test.ts, which also proves
+ * `validate()` rejects a ceiling above the pool or below this type's own
+ * reservation — so this value must sit between MAX_SLOTS and 10.)
+ *
+ * 6 of `DEFAULT_WORKER_MAX_SLOTS` = 10 leaves 4 slots for every other op type
+ * (retain, refresh_mental_model, graph_maintenance, import_documents — all
+ * uncapped upstream) while letting consolidation use the idle capacity.
+ *
+ * Be honest about what this buys: consolidation LLM calls are still
+ * serialised by the `CONSOLIDATION_LLM_MAX_CONCURRENT` semaphore (default 1),
+ * so 6 slots do NOT mean 6 concurrent LLM calls. What they mean is that six
+ * banks' non-LLM stages pipeline, and that a small bank is no longer stuck
+ * behind big ones — the claim query is a flat `ORDER BY created_at` across
+ * all banks unless a priority map is configured (`ops_postgresql.py`
+ * `claim_tasks`; see `HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY` in
+ * hindsight-perf-defaults.ts).
+ *
+ * Emitted explicitly rather than left to the upstream default so the value is
+ * legible in `docker inspect` and cannot move under us on an image bump.
+ * Subject to the RESTORE CONDITION above: back to 1 if consolidation returns
+ * to `provider: claude-code`.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT = 6;
 
 /**
  * Container resource caps (memory + pids only; CPU intentionally NOT capped).
@@ -1563,12 +1693,15 @@ export function startHindsight(
     // caps, derived from the declared window so a prompt cannot overflow the
     // backend's slot (an overflow returns HTTP 200 + garbage, never an error).
     ...hindsightLlmBudgetEnv(llm).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
-    // Consolidation concurrency: throttled by #2894 to a hard ceiling of
-    // MAX_SLOTS 1 × LLM_PARALLELISM 2 = 2 concurrent model calls (was 18), so
-    // consolidation can never exhaust the shared failover quota. Per-round
-    // scope 100 bounds tokens/scope per op. (BATCH_SIZE is emitted above, by
-    // the context budget — it is a window decision, not a concurrency one.)
+    // Consolidation scheduling. MAX_SLOTS is the reserved FLOOR (1) and
+    // SLOT_LIMIT the per-type CEILING (6 of the worker's 10) — two different
+    // knobs with confusingly similar upstream names; see the constants above.
+    // LLM_PARALLELISM stays at 2 so the subscription-path ceiling (MAX_SLOTS ×
+    // LLM_PARALLELISM = 2 concurrent model calls, #2894) is unchanged for any
+    // operator still on `provider: claude-code`. (BATCH_SIZE is emitted above,
+    // by the context budget — a window decision, not a concurrency one.)
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
+    "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT=${HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
     // Stable worker identity (see HINDSIGHT_DEFAULT_WORKER_ID). Must be on
@@ -2127,7 +2260,12 @@ export function generateHindsightComposeSnippet(
     // reflect context cap all come from here, so the two paths cannot
     // disagree about the token budget).
     ...hindsightLlmBudgetEnv(llm).map(([k, v]) => `      - ${k}=${v}`),
+    // Consolidation scheduling — compose twin of the docker-run block. Every
+    // var here MUST also appear on that path (reserved floor, per-type
+    // ceiling, tag-group parallelism, per-round scope); a var on one path only
+    // is exactly the drift a `switchroom apply` silently drops.
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
+    `      - HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT=${HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT}`,
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
     `      - HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
     `      - HINDSIGHT_API_WORKER_ID=${HINDSIGHT_DEFAULT_WORKER_ID}`,
