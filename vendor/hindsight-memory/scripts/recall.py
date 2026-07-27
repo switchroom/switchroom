@@ -853,9 +853,14 @@ def _transcript_grep_fallback(transcript_path, query, config):
     (``recallTranscriptFallbackMaxBytes``), matched turns
     (``recallTranscriptFallbackMaxTurns``), emitted characters
     (``recallTranscriptFallbackMaxChars``), and grep wall-time
-    (``recallTranscriptFallbackDeadlineMs``). The caller only invokes this when
-    all banks returned zero AND no slot hit its deadline, so a timed-out bank can
-    never masquerade as a genuinely empty fact layer.
+    (``recallTranscriptFallbackDeadlineMs``, default 1500). The caller invokes
+    this when all banks returned zero and none ERRORED — a hard bank error can
+    masquerade as a genuinely empty fact layer, so it still suppresses the
+    fallback. A per-bank TIMEOUT no longer does (#3757): timing out was the
+    common case, and suppressing on it left the agent with neither memories nor
+    fallback. The 1.5s bound is what keeps that safe — the shared recall
+    deadline is 10s and the UserPromptSubmit hook ceiling is 12s, so the
+    fallback still fits after a fully-elapsed recall.
 
     Returns ``(block_or_None, telemetry)``. Failure-safe: any error path returns
     ``(None, zeroed-telemetry)`` so the fallback can never break recall.
