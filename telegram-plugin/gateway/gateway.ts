@@ -5865,7 +5865,7 @@ const redactAuthCodeApi = {
  * flood sleep and added a pre-call gate for LONG open windows. This wrapper
  * pre-dates neither mechanism nor fights them — it sits under the emitter's own
  * flood gate, which short-circuits earlier still (a typing ping during a ban
- * never even reaches the retry layer). Defense in depth, in that order.
+ * never even reaches the retry layer; #3853 adds the READ hook here too).
  */
 // No `log` hook: retryApiCall's flood line reads "waiting Ns", which would be a
 // lie here — we never wait, we drop. And the error the caller finally sees names
@@ -5875,7 +5875,7 @@ const redactAuthCodeApi = {
 // the real value is still in hand.
 const recordTypingFloodWait = makeFloodWaitRecorder(FLOOD_STATE_PATH)
 const nonEssentialApiCall = createRetryApiCall({
-  maxRetries: 1,
+  maxRetries: 1, floodWaitRemainingMs: probeFloodWaitRemainingMs, // #3853 read side
   sleep: async () => {},
   onFloodWait: (retryAfterSec) => {
     recordTypingFloodWait(retryAfterSec)

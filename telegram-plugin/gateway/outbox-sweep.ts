@@ -45,6 +45,11 @@ import {
 import { isShownBlock } from '../shown-ledger.js'
 import { resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { createRetryApiCall, retryWithThreadFallback } from '../retry-api-call.js'
+import {
+  floodStatePath,
+  makeFloodWaitProbe,
+  makeFloodWaitRecorder,
+} from '../flood-circuit-breaker.js'
 
 export interface OutboxSweepDeps {
   /** Deliver `text` to the chat. Resolves to the primary message id (best-effort). */
@@ -67,12 +72,39 @@ export interface OutboxSweepDeps {
   now?: () => number
   log?: (line: string) => void
   quietMs?: number
+  /**
+   * Remaining ms of a KNOWN-OPEN Telegram flood window, or 0 when none — the
+   * SAME persisted breaker state (`flood-wait.json`) `robustApiCall` consults
+   * (`makeFloodWaitProbe`). When it reports an open window the sweep does not
+   * scan, claim, or send at all.
+   *
+   * Why the sweep needs its own check on top of the retry policy's: the retry
+   * policy only short-circuits windows LONGER than its in-process sleep ceiling
+   * (120s), and even then it does so per-CALL — it still costs a claim/release
+   * cycle and a log line every tick. The outbox is a safety net with no latency
+   * SLA; deferring the whole sweep while ANY window is open is strictly correct
+   * and is the only thing that makes "does not hit the wire" true.
+   *
+   * FAILS OPEN (a throwing probe ⇒ 0) for the same reason `makeFloodWaitProbe`
+   * does: a broken marker file must never permanently strand the outbox.
+   */
+  floodWaitRemainingMs?: () => number
 }
 
 export interface OutboxSweepSummary {
   scanned: number
   delivered: number
   skipped: number
+  /**
+   * Records whose send THREW this sweep (claim released, retried next tick).
+   * The tick-level backoff keys off this: a 5s fixed retry against a failing
+   * Telegram is how the 2026-07-27 sweep hit an open 4.4h ban 228 times.
+   */
+  sendFailures: number
+  /** True when the whole sweep was skipped because a flood window is open. */
+  floodDeferred?: boolean
+  /** Remaining ms of the window that caused `floodDeferred`. */
+  floodRemainingMs?: number
 }
 
 /**
@@ -81,7 +113,20 @@ export interface OutboxSweepSummary {
 export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSummary> {
   const now = deps.now?.() ?? Date.now()
   const log = deps.log ?? (() => {})
-  const summary: OutboxSweepSummary = { scanned: 0, delivered: 0, skipped: 0 }
+  const summary: OutboxSweepSummary = { scanned: 0, delivered: 0, skipped: 0, sendFailures: 0 }
+
+  // #3853 — do not sweep INTO a known-open flood window. Every record is
+  // preserved on disk and re-scanned on the next tick after the window closes,
+  // so this loses no delivery; issuing the send would only feed the ban.
+  const remainingMs = probeFloodWindow(deps.floodWaitRemainingMs)
+  if (remainingMs > 0) {
+    summary.floodDeferred = true
+    summary.floodRemainingMs = remainingMs
+    // NOT logged here: a 4.4h ban is ~3181 ticks, and one line per tick just
+    // moves the flood from the wire to the disk. `startOutboxSweep` logs the
+    // deferral at most once per DEFER_LOG_INTERVAL_MS.
+    return summary
+  }
 
   // Re-queue crashed claims first (claim-then-crash before send).
   reclaimStaleSending(deps.stateDir, now)
@@ -209,10 +254,22 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
       // preserved on disk; no loss.
       releaseClaim(record.turnNonce, deps.stateDir)
       summary.skipped++
+      summary.sendFailures++
       log(`outbox-sweep: send failed nonce=${record.turnNonce}: ${(err as Error).message} — will retry\n`)
     }
   }
   return summary
+}
+
+/** Read the flood probe, failing OPEN on any throw. */
+function probeFloodWindow(probe: (() => number) | undefined): number {
+  if (probe == null) return 0
+  try {
+    const ms = probe()
+    return Number.isFinite(ms) && ms > 0 ? ms : 0
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -229,6 +286,59 @@ export function chatFromTurnKey(turnKey: string): { chatId: string; threadId: nu
 
 /** How often the sweep ticks (aligned with the delivery-confirm sweep cadence). */
 export const OUTBOX_SWEEP_INTERVAL_MS = 5_000
+
+/** Ceiling on the exponential send-failure backoff. */
+export const OUTBOX_SWEEP_BACKOFF_MAX_MS = 5 * 60_000
+
+/**
+ * Minimum gap between two "flood window still open" log lines. A 4.4h ban is
+ * ~3181 ticks; logging each one just relocates the flood from the wire to the
+ * disk, so the deferral is reported once a minute instead.
+ */
+export const OUTBOX_SWEEP_DEFER_LOG_INTERVAL_MS = 60_000
+
+/**
+ * Exponential backoff over the fixed 5s sweep tick (#3853).
+ *
+ * The tick interval alone is not a retry policy. On 2026-07-27 the sweep held
+ * ONE undeliverable record and re-issued its `sendMessage` every 5s for the
+ * whole 4.4h ban — 228 requests into a window the breaker already knew was
+ * open, each one answered with the same counting-down `retry_after`. The flood
+ * probe (above) closes the case where the breaker HAS a window recorded; this
+ * closes the case where it does not — a persistent failure of any other kind
+ * must not be re-driven at 12 requests/minute forever.
+ *
+ * Pure and clock-injected so the schedule is asserted in tests rather than
+ * inferred from timer behaviour.
+ */
+export function createSweepBackoff(cfg: { baseMs?: number; maxMs?: number } = {}): {
+  ready: (now: number) => boolean
+  noteFailure: (now: number) => number
+  noteSuccess: () => void
+  failures: () => number
+} {
+  const baseMs = cfg.baseMs ?? OUTBOX_SWEEP_INTERVAL_MS
+  const maxMs = cfg.maxMs ?? OUTBOX_SWEEP_BACKOFF_MAX_MS
+  let failures = 0
+  let nextAllowedAt = 0
+  return {
+    ready: (now) => now >= nextAllowedAt,
+    noteFailure: (now) => {
+      failures++
+      // 5s, 10s, 20s, … capped. `failures - 1` so the FIRST failure still
+      // retries at the normal tick cadence — a one-off transient send error
+      // should not delay a real answer.
+      const delay = Math.min(maxMs, baseMs * Math.pow(2, failures - 1))
+      nextAllowedAt = now + delay
+      return delay
+    },
+    noteSuccess: () => {
+      failures = 0
+      nextAllowedAt = 0
+    },
+    failures: () => failures,
+  }
+}
 
 /**
  * Own the heartbeat-tick outbox sweep entirely, keeping the timer / chunking /
@@ -336,21 +446,43 @@ export function startOutboxSweep(deps: {
     text: string,
   ) => OutboxDeliveryMarkup | undefined
   log?: (line: string) => void
+  /** Test seam — override the flood probe (default: the persisted breaker). */
+  floodWaitRemainingMs?: () => number
+  /** Test seam — override the tick backoff. */
+  backoff?: ReturnType<typeof createSweepBackoff>
 }): ReturnType<typeof setInterval> | undefined {
   if (!deps.isGatewayMain || process.env.SWITCHROOM_TG_OUTBOX_DELIVERY === '0') return undefined
-  const retry = createRetryApiCall({ log: deps.log })
+  // #3853 — the sweep is a full outbound machine and must consult the SAME
+  // persisted flood breaker every other outbound path does. Before this it was
+  // the one `createRetryApiCall` wiring with neither hook: it could not see an
+  // open ban (no `floodWaitRemainingMs`) and could not record one it caused (no
+  // `onFloodWait`). `scripts/check-retry-flood-hooks.mjs` now fails lint if any
+  // wiring omits either.
+  const floodProbe =
+    deps.floodWaitRemainingMs ?? makeFloodWaitProbe(floodStatePath(deps.stateDir))
+  const recordFloodWait = makeFloodWaitRecorder(floodStatePath(deps.stateDir))
+  const retry = createRetryApiCall({
+    log: deps.log,
+    floodWaitRemainingMs: floodProbe,
+    onFloodWait: (retryAfterSec) => recordFloodWait(retryAfterSec),
+  })
   const send = createOutboxSend({
     getBot: deps.getBot,
     retry,
     ...(deps.resolveReplyMarkup != null ? { resolveReplyMarkup: deps.resolveReplyMarkup } : {}),
   })
+  const backoff = deps.backoff ?? createSweepBackoff()
+  let lastDeferLogAt = 0
   const tick = () => {
     const bot = deps.getBot()
     if (bot == null) return
+    const now = Date.now()
+    if (!backoff.ready(now)) return
     void sweepOutbox({
       stateDir: deps.stateDir,
       log: deps.log,
       send,
+      floodWaitRemainingMs: floodProbe,
       textAlreadyDelivered: (chatId, threadId, text) => deps.dedupCheck(chatId, threadId ?? undefined, text),
       registryChainLookup: (taskId) => {
         const db = deps.getTurnsDb()
@@ -358,7 +490,34 @@ export function startOutboxSweep(deps: {
         const turnKey = resolveSubagentOriginTurnKey(db, taskId)
         return turnKey == null ? null : chatFromTurnKey(turnKey)
       },
-    }).catch((err) => deps.log?.(`outbox-sweep: tick failed: ${(err as Error).message}\n`))
+    })
+      .then((summary) => {
+        // A flood-deferred sweep is neither success nor failure: it never
+        // reached the wire, so it must not clear a backoff earned by real
+        // failures, and it must not deepen one either.
+        if (summary.floodDeferred === true) {
+          const at = Date.now()
+          if (at - lastDeferLogAt >= OUTBOX_SWEEP_DEFER_LOG_INTERVAL_MS) {
+            lastDeferLogAt = at
+            deps.log?.(
+              `outbox-sweep: deferred — Telegram flood window still open for ` +
+                `${Math.ceil((summary.floodRemainingMs ?? 0) / 1000)}s; not issuing any ` +
+                `send (would feed the ban)\n`,
+            )
+          }
+          return
+        }
+        if (summary.sendFailures > 0) {
+          const delay = backoff.noteFailure(Date.now())
+          deps.log?.(
+            `outbox-sweep: ${summary.sendFailures} send failure(s) — backing off ` +
+              `${Math.round(delay / 1000)}s before the next sweep (attempt ${backoff.failures()})\n`,
+          )
+        } else {
+          backoff.noteSuccess()
+        }
+      })
+      .catch((err) => deps.log?.(`outbox-sweep: tick failed: ${(err as Error).message}\n`))
   }
   const timer = setInterval(tick, OUTBOX_SWEEP_INTERVAL_MS)
   timer.unref?.()
