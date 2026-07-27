@@ -717,9 +717,19 @@ describe("checkConfig — thinking_effort × adaptive model", () => {
       (r) => r.name === CHECK,
     );
     expect(check!.status).toBe("warn");
-    expect(check!.detail).toContain("legacy");
-    expect(check!.detail).not.toContain("assistant");
-    expect(check!.fix).toContain("Opus 4.x");
+    // Pin the full operator-facing string, not a substring: this is what the
+    // operator reads at `doctor`/`apply` time, and it must not drift from the
+    // Opus 4.x-only scope documented in docs/configuration.md and CLAUDE.md.
+    // Naming only `legacy` also proves the `assistant` agent (on the `opus`
+    // alias at the inherited `low`) is not swept in.
+    expect(check!.detail).toBe(
+      "1 agent(s) on pinned Opus 4.x with thinking_effort > low: legacy",
+    );
+    // The fix text is the operator's next step; assert the load-bearing parts
+    // (scope + the CLI build that fixed #1978) so a reword can't quietly
+    // reintroduce blanket "pin low on Opus" advice.
+    expect(check!.fix).toContain("pinned Opus 4.x");
+    expect(check!.fix).toContain("2.1.156");
   });
 });
 

@@ -202,8 +202,8 @@ Mechanism — **consume-once carrier** (no intent file):
   launched effort to `.active-session-effort` (sibling of
   `.active-session-model`) so the gateway re-hydrates the menu's live level
   after a queued-apply boot. The CONFIGURED `thinking_effort` resolution is
-  untouched — the fleet `low` pin (#1978, `thinking-effort-risk.ts`; see
-  Appendix A) resolves exactly as before.
+  untouched — the configured `thinking_effort` (#1978, `thinking-effort-risk.ts`;
+  see Appendix A) resolves exactly as before.
 - **#3178 preserved.** Instant ack, the durable receipt log + history row, the
   mid-turn queue-and-apply, and explicit failures are untouched; the queued
   apply persists a consume-once carrier at shutdown so it still applies as the
