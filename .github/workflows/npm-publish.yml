@@ -146,7 +146,7 @@ jobs:
           echo "Publishing switchroom@$ver (from tag $tag)"
 
       - name: Checkout the tag (full history for resolveVersion git describe)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Explicit ref, not the ambient one: a reusable workflow inherits
           # the caller's `github` context, and a hand dispatch can be on any

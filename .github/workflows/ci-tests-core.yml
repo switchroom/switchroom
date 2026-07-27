@@ -75,7 +75,7 @@ jobs:
       # See .github/MERGE-QUEUE.md.
       - name: Checkout
         if: github.event_name != 'merge_group'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Filter changed paths
         if: github.event_name != 'merge_group'
         id: filter
@@ -96,7 +96,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
@@ -137,7 +137,7 @@ jobs:
         # the merge-base against the PR's target branch. The default
         # shallow clone (depth: 1) breaks --changed silently — vitest
         # falls back to running everything, defeating the optimisation.
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
