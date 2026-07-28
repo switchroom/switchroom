@@ -59,6 +59,18 @@ jobs:
           filters: |
             relevant:
               - 'vendor/hindsight-memory/scripts/**'
+              # The sibling plugin suite. Ran nowhere until #3688, so a PR
+              # touching only it started no check at all — see the pytest
+              # step in `unittest` below.
+              - 'vendor/hindsight-memory/tests/**'
+              # The hooks manifest is INPUT to that suite, not just shipped
+              # config: `tests/test_manifest.py` reads
+              # `<integration root>/hooks/hooks.json` and asserts it parses
+              # strictly. Without this line a PR editing only `hooks/`
+              # (adding a hook, renaming a matcher) matched no filter, the
+              # sentinel skipped `unittest`, and a manifest that no longer
+              # matches the shipped hooks could merge green.
+              - 'vendor/hindsight-memory/hooks/**'
               - 'docker/voice-sidecar/**'
               - 'docker/litellm-pacer/**'
               - '.github/workflows/ci-tests-python.yml'
@@ -76,6 +88,28 @@ jobs:
       - name: Run unittest discover
         working-directory: vendor/hindsight-memory/scripts
         run: python3 -m unittest discover tests/
+
+      # The SIBLING plugin suite (`vendor/hindsight-memory/tests/`). Added by
+      # switchroom #3688: until then NO check ran it — the `unittest discover`
+      # step above runs `vendor/hindsight-memory/scripts/tests/`, a different
+      # directory — and an unrun suite rots into a liability rather than a
+      # gate. Proof, found by turning it on:
+      # `test_hooks.py::TestRecallHook::test_graceful_on_api_error` had been
+      # asserting the pre-#3619 silent-degradation behaviour and was red on
+      # `main` (fixed in the same PR).
+      #
+      # pytest, not `unittest discover`: `tests/conftest.py` is what puts
+      # `scripts/` on `sys.path`, the suite uses `monkeypatch`/`tmp_path`
+      # fixtures, and `tests/` has no `__init__.py` (discovery refuses it).
+      # pytest is the ONLY extra dependency — the suite is otherwise stdlib
+      # and needs no network. Same unpinned `pip install -q` shape as
+      # ci-evals.yml's `pyyaml`.
+      - name: Install pytest (the sibling suite is pytest-only)
+        run: pip install -q pytest
+
+      - name: Run vendored plugin tests (pytest)
+        working-directory: vendor/hindsight-memory
+        run: python3 -m pytest tests/ -q
 
       # Voice sidecar's stdlib-only tests (TTS speed clamp). server.py imports
       # kokoro lazily, so no ONNX runtime / model is needed here.

@@ -1099,8 +1099,28 @@ def _drain_backlog_impl(
     # the SessionStart drain's whole contract is a hard wall-clock ceiling
     # on hook latency. New duplicates cannot accumulate there anyway:
     # `pending.enqueue`'s filename-keyed guard stops those at the producer.
+    #
+    # GUARDED, because phase 0 runs BEFORE the phases that actually drain
+    # (#3688 review R1-M1). `iter_entries()` quarantines an unparsable entry
+    # precisely so no single corrupt file can make the whole queue immortal;
+    # an unguarded collapse re-creates that failure one level up, where a
+    # semantically-malformed-but-valid-JSON entry raises and takes phases 1
+    # and 2 with it — a strict regression against the pre-#3688 drain, where
+    # the same entry drains. A collapse failure costs duplicated work, never
+    # a memory, so it is logged and stepped over, exactly as every other
+    # phase treats a per-entry failure. `_attempt_count` closes the one
+    # measured raise; this guard is what keeps the NEXT one from being a
+    # fleet-wide drain stall.
     if not dry_run:
-        summary["collapsed"] = collapse_duplicates()
+        try:
+            summary["collapsed"] = collapse_duplicates()
+        except Exception as e:  # noqa: BLE001 — see comment above
+            _blog(
+                f"phase 0 FAILED ({type(e).__name__}: {e}) — continuing to the "
+                f"phases that actually drain. Nothing was lost: a collapse only "
+                f"ever MOVES a byte-identical copy into pending-duplicate/, so "
+                f"the cost of skipping it is duplicated work, not a memory."
+            )
         if summary["collapsed"]:
             _blog(
                 f"phase 0: collapsed {summary['collapsed']} duplicate entries "

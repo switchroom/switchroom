@@ -1,11 +1,19 @@
 """Queue eviction/dedupe + two-phase backlog drain (switchroom #3596).
 
-These live under ``scripts/tests/`` deliberately: that is the ONLY python
-test directory CI discovers (``ci-tests-python.yml:63`` and
-``ci-full.yml:140`` both run ``python3 -m unittest discover tests/`` with
-``working-directory: vendor/hindsight-memory/scripts``). The sibling suite
-at ``vendor/hindsight-memory/tests/`` is never executed by CI, so a
-regression test placed there would gate nothing.
+These live under ``scripts/tests/`` deliberately: it is the stdlib-only
+suite, discovered by ``python3 -m unittest discover tests/`` with
+``working-directory: vendor/hindsight-memory/scripts`` in both
+``ci-tests-python.yml`` and ``ci-full.yml``, and it needs no third-party
+package to gate a merge.
+
+Until switchroom #3688 it was also the ONLY python test directory CI ran at
+all: the sibling suite at ``vendor/hindsight-memory/tests/`` started no
+check, so a regression test placed there gated nothing. #3688 turned that
+suite on too (a ``pip install -q pytest`` step in the same two workflows --
+it is pytest-only because its ``conftest.py`` is what puts ``scripts/`` on
+``sys.path``), and turning it on immediately surfaced one test that had
+rotted red on ``main``. Both directories are now gates; prefer this one for
+anything that can be written against the stdlib.
 
 The behaviours pinned here are the ones a well-meaning refactor would
 otherwise undo:
@@ -816,6 +824,202 @@ class CollapseDuplicatesTest(_QueueTempDirMixin, unittest.TestCase):
             summary = drain_pending.drain_backlog(CONFIG, dry_run=True)
         self.assertEqual(summary["collapsed"], 0)
         self.assertEqual(pending.count(), 3)
+
+    # ---- #3688 review R1-M1: a broken phase 0 must not wedge the drain -----
+
+    def test_a_failing_phase_0_never_blocks_the_phases_that_drain(self):
+        """The module's own invariant, one level up.
+
+        ``iter_entries`` quarantines an unparsable entry precisely so that no
+        single corrupt file can make the whole queue immortal. Phase 0 runs
+        BEFORE the phases that drain, so an unguarded exception in it
+        re-creates that failure with a bigger blast radius: nothing drains,
+        ever, until a human intervenes — strictly worse than the pre-#3688
+        drain, where the same queue drains fine.
+
+        A collapse failure can only ever cost duplicated work (the pass just
+        MOVES byte-identical copies), so it is logged and stepped over.
+        """
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "one-memory")
+
+        def boom():
+            raise ValueError("invalid literal for int() with base 10: 'many'")
+
+        posted = []
+        with unittest.mock.patch.object(drain_pending, "collapse_duplicates", boom):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: bool(posted)
+            ):
+                with unittest.mock.patch.object(
+                    drain_pending,
+                    "_retry_one",
+                    lambda e, timeout: posted.append(e["document_id"]),
+                ):
+                    with redirect_stderr(io.StringIO()) as err:
+                        summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertEqual(summary["collapsed"], 0, "nothing was collapsed, honestly")
+        self.assertEqual(len(posted), 1, "phase 2 still ran")
+        self.assertEqual(pending.count(), 0, "the entry drained anyway")
+        self.assertIn("phase 0 FAILED", err.getvalue(), "and it was not silent")
+
+    def test_a_malformed_attempt_count_cannot_make_the_backlog_immortal(self):
+        """The concrete reproduction, end to end.
+
+        Two byte-identical entries, one carrying ``"attempt_count": "many"``
+        — valid JSON, so ``iter_entries`` hands it over rather than
+        quarantining it. Before #3688 review R1-M1/R1-L3 the ``int()`` in
+        survivor selection raised, phase 0 died and phases 1 and 2 never ran.
+        Both halves are fixed (``_attempt_count`` no longer raises, and the
+        phase is guarded regardless); this asserts the OUTCOME either way.
+        """
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", attempts=1)
+        self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "same", attempts="many")
+
+        posted = []
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: bool(posted)
+        ):
+            with unittest.mock.patch.object(
+                drain_pending,
+                "_retry_one",
+                lambda e, timeout: posted.append(e["document_id"]),
+            ):
+                with redirect_stderr(io.StringIO()):
+                    summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertEqual(summary["collapsed"], 1)
+        self.assertEqual(len(posted), 1, "the memory still reached the bank")
+        self.assertEqual(pending.count(), 0)
+
+    # ---- #3688 review R1-L3: what "lowest attempt_count" actually means ----
+
+    def test_a_never_attempted_copy_beats_a_once_attempted_older_one(self):
+        """``attempt_count: 0`` must WIN, not tie.
+
+        The rule is "the copy with the most retries left before
+        MAX_ATTEMPTS". ``int(x or 1)`` scored a 0 as a 1, so a
+        never-attempted copy tied with a once-attempted one and lost the
+        tie-break to it for being newer — backwards from the documented rule.
+        Latent today (``_build_entry`` seeds 1) and therefore exactly the
+        kind of thing nothing else would catch turning real.
+        """
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", attempts=1)
+        keep = self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "same", attempts=0)
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 1)
+
+        self.assertEqual(
+            [p for p, _ in pending.iter_entries()],
+            [keep],
+            "the copy with 5 retries left survives, not the one with 4",
+        )
+
+    def test_an_unparseable_attempt_count_is_never_preferred_as_survivor(self):
+        """Unknown burn count ⇒ scored as exhausted, never as fresh.
+
+        Costs nothing: every copy in a group is byte-identical and the loser
+        is archived, not deleted. The point is that it can neither win the
+        survivor slot on a lie nor raise.
+        """
+        keep = self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", attempts=2)
+        self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "same", attempts="many")
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 1)
+
+        self.assertEqual([p for p, _ in pending.iter_entries()], [keep])
+
+    # ---- #3688 re-review B3: the two unpinned `_attempt_count` branches ----
+    #
+    # Both mutations SURVIVED the suite: deleting the `isinstance(raw, bool)`
+    # branch (M6) and turning `raw is None: return 1` into
+    # `return MAX_ATTEMPTS` (M7). The logic is right; it was simply ungated,
+    # so a refactor could undo it with CI green.
+
+    def test_a_boolean_attempt_count_is_scored_as_UNPARSEABLE_not_as_one(self):
+        """``bool`` must be rejected BEFORE ``int()`` sees it.
+
+        #3688 re-review B3 / mutation M6. ``bool`` is an ``int`` subclass,
+        so ``int(True)`` is ``1`` — the score of a FRESH, never-retried
+        copy. Delete the ``isinstance(raw, bool)`` guard (it reads as
+        redundant next to the ``try``/``except``, which is exactly why a
+        future "simplification" would take it) and an entry carrying
+        ``"attempt_count": true`` becomes the most PREFERRED survivor in
+        its group: it wins the election, and every well-formed
+        byte-identical sibling is archived instead. Silent, and invisible
+        to the rest of the suite.
+
+        Scoring it ``MAX_ATTEMPTS`` makes it the LEAST preferred, which is
+        the honest reading — a garbage count tells us nothing about how
+        many retries are left, so it must never be trusted over a real one.
+        A raise would be wrong here for a different reason: this runs
+        inside ``collapse_duplicates``'s sort key over the whole queue, so
+        one malformed file would abort the collapse for every other entry.
+        """
+        self.assertEqual(
+            pending._attempt_count({"attempt_count": True}),
+            pending.MAX_ATTEMPTS,
+            "True is not one attempt — bool must take the unparseable branch",
+        )
+        self.assertEqual(
+            pending._attempt_count({"attempt_count": False}),
+            pending.MAX_ATTEMPTS,
+            "False is not zero attempts either",
+        )
+
+        # …and the consequence that actually costs a memory: the malformed
+        # copy must LOSE the survivor election to a well-formed sibling.
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", attempts=True)
+        keep = self._write_legacy("0000000002000-aaaaaaaaaaa1.json", "same", attempts=2)
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 1)
+
+        self.assertEqual(
+            [p for p, _ in pending.iter_entries()],
+            [keep],
+            "the well-formed copy survives; the boolean one is archived",
+        )
+        self.assertEqual(
+            self._duplicate_names(), ["0000000001000-aaaaaaaaaaa0.json"]
+        )
+
+    def test_a_missing_or_null_attempt_count_reads_as_FRESH_not_exhausted(self):
+        """Absent/``None`` scores ``1``, matching what ``_build_entry`` writes.
+
+        #3688 re-review B3 / mutation M7 (``return 1`` → ``return
+        MAX_ATTEMPTS`` survived). An entry from an older build that predates
+        the field has burned no *recorded* attempts; scoring it as exhausted
+        would systematically archive it in favour of a copy with a real,
+        HIGHER burn count — i.e. deliberately keep the copy closer to
+        ``.dead``, which is backwards from the durability-first rule
+        ``collapse_duplicates`` documents. This is the one malformed-ish
+        shape that is genuinely benign, and it must not be lumped in with
+        the garbage above.
+        """
+        self.assertEqual(pending._attempt_count({"attempt_count": None}), 1)
+        self.assertEqual(pending._attempt_count({}), 1, "absent reads the same")
+        self.assertLess(
+            pending._attempt_count({"attempt_count": None}),
+            pending._attempt_count({"attempt_count": 2}),
+            "a null count must be PREFERRED over a copy with 2 attempts burned",
+        )
+
+        self._write_legacy("0000000001000-aaaaaaaaaaa0.json", "same", attempts=2)
+        keep = self._write_legacy(
+            "0000000002000-aaaaaaaaaaa1.json", "same", attempts=None
+        )
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(pending.collapse_duplicates(), 1)
+
+        self.assertEqual(
+            [p for p, _ in pending.iter_entries()],
+            [keep],
+            "the null-count copy has 5 retries left; the other has 3",
+        )
 
 
 class DropLedgerTest(_QueueTempDirMixin, unittest.TestCase):
@@ -2075,6 +2279,267 @@ class TrimDirBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
         self.assertIn("trimmed 18 archived copies", msg)
         self.assertIn("+8 more", msg)
         self.assertLessEqual(msg.count("-x.json"), 10)
+
+    def test_a_copy_that_could_NOT_be_removed_is_never_reported_as_dropped(self):
+        """A failed ``os.remove`` must not produce a ``trimmed=`` line.
+
+        #3688 re-review B2. ``dropped.append`` and ``_log_archive_trim``
+        ran UNCONDITIONALLY after the ``try``, so a read-only mount or an
+        EACCES made ``_trim_dir`` return a drop count for files that were
+        all still on disk and write one durable ``trimmed=`` line per
+        phantom deletion. ``pending-evictions.log`` is the forensic record
+        an operator reads AFTER suspected loss; one that claims deletions
+        that never happened sends them hunting a payload that never left,
+        and is worse than no ledger at all.
+
+        Measured on the unfixed tree with three files and a cap of one:
+        ``dropped=2``, three files still present, two false ledger lines.
+        """
+        d = self._archive([10, 10, 10])
+        real_remove = os.remove
+
+        def denied(path, *a, **kw):
+            if os.path.dirname(os.path.abspath(path)) == os.path.abspath(d):
+                raise PermissionError(13, "Permission denied")
+            return real_remove(path, *a, **kw)
+
+        with unittest.mock.patch.object(os, "remove", denied):
+            with redirect_stderr(io.StringIO()) as err:
+                dropped = pending._trim_dir(d, max_entries=1, max_bytes=10**9)
+
+        self.assertEqual(dropped, 0, "nothing was deleted, so nothing was dropped")
+        self.assertEqual(
+            len(self._names_in(d)), 3, "fixture: every copy is still on disk"
+        )
+        self.assertEqual(
+            err.getvalue(), "", "no stderr line may name a file still present"
+        )
+        ledger = pending.evictions_log_path()
+        trimmed = 0
+        if os.path.exists(ledger):
+            with open(ledger, encoding="utf-8") as f:
+                trimmed = f.read().count("trimmed=")
+        self.assertEqual(
+            trimmed, 0, "the ledger must never claim a deletion that did not happen"
+        )
+
+    def test_a_partial_failure_ledgers_only_the_copies_actually_shed(self):
+        """The mixed case: one victim deletes, the next does not.
+
+        Pins that the guard is per-victim rather than an all-or-nothing
+        bail — the ledger and the returned count must both describe
+        exactly the copies that really left.
+        """
+        d = self._archive([10, 10, 10, 10])
+        victims = [f"{1000 + i:013d}-x.json" for i in range(4)]
+        real_remove = os.remove
+        allowed = {os.path.abspath(os.path.join(d, victims[0]))}
+
+        def selective(path, *a, **kw):
+            if os.path.dirname(os.path.abspath(path)) == os.path.abspath(d):
+                if os.path.abspath(path) not in allowed:
+                    raise PermissionError(13, "Permission denied")
+            return real_remove(path, *a, **kw)
+
+        with unittest.mock.patch.object(os, "remove", selective):
+            with redirect_stderr(io.StringIO()) as err:
+                dropped = pending._trim_dir(d, max_entries=1, max_bytes=10**9)
+
+        self.assertEqual(dropped, 1, "only the one that really went is counted")
+        self.assertEqual(
+            self._names_in(d), victims[1:], "the undeletable copies are still here"
+        )
+        with open(pending.evictions_log_path(), encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines() if "trimmed=" in ln]
+        self.assertEqual(len(lines), 1, "exactly one real deletion, one ledger line")
+        self.assertIn(victims[0], lines[0])
+        for name in victims[1:]:
+            self.assertNotIn(name, err.getvalue())
+
+
+class ArchiveTrimLedgerTest(_QueueTempDirMixin, unittest.TestCase):
+    """A payload must not leave an ARCHIVE without a durable trace either.
+
+    ``_evict_to_fit`` has had ``pending-evictions.log`` since #3599, so the
+    moment a memory leaves the live queue is on the record. The other end of
+    the same payload's life — ``_trim_dir`` deleting it out of
+    ``pending-evicted/``, ``pending-reconciled/`` or (since #3688)
+    ``pending-duplicate/`` — was stderr-only, and stderr is gone with the
+    process. #3688 review R1-M2.
+
+    Two properties, and the second is the one with teeth: the line must NOT
+    be countable as an eviction. ``switchroom doctor``'s in-container probe
+    counts ledger lines matching ``/evicted=/`` inside a 7-day window and
+    FAILS the pending-retains row on any hit (src/cli/doctor.ts,
+    ``buildPendingRetainsProbeScript``). A duplicate archive rolling over is
+    not memory loss — a byte-identical copy is still queued — so it must not
+    be able to turn that row red.
+    """
+
+    def _archive(self, name, n=4):
+        d = os.path.join(self._tmp, name)
+        os.makedirs(d, exist_ok=True)
+        for i in range(n):
+            with open(os.path.join(d, f"{1000 + i:013d}-x.json"), "w") as f:
+                f.write("x")
+        return d
+
+    def _ledger(self):
+        try:
+            with open(pending.evictions_log_path(), encoding="utf-8") as f:
+                return [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            return []
+
+    def test_every_bounded_archive_ledgers_the_copies_it_sheds(self):
+        for name in ("pending-evicted", "pending-reconciled", "pending-duplicate"):
+            d = self._archive(name)
+            with redirect_stderr(io.StringIO()):
+                pending._trim_dir(d, max_entries=1, max_bytes=10**9)
+
+        lines = self._ledger()
+        self.assertEqual(len(lines), 9, "3 archives x 3 shed copies, all ledgered")
+        for name in ("pending-evicted", "pending-reconciled", "pending-duplicate"):
+            got = [ln for ln in lines if f"archive={name}" in ln]
+            self.assertEqual(len(got), 3, f"{name} trims are on the record")
+            self.assertIn("trimmed=0000000001000-x.json", got[0], "oldest first")
+            self.assertIn("bytes=1", got[0], "and how much went with it")
+
+    def test_a_trim_can_never_be_counted_as_an_eviction_by_doctor(self):
+        """``trimmed=``, never ``evicted=`` — see ``buildPendingRetainsProbeScript``.
+
+        Renaming the token to ``evicted=`` would make every duplicate-archive
+        rollover fail the operator's pending-retains row, which is the check
+        that means "memory was actually shed".
+        """
+        d = self._archive("pending-duplicate", n=3)
+        with redirect_stderr(io.StringIO()):
+            pending._trim_dir(d, max_entries=1, max_bytes=10**9)
+
+        lines = self._ledger()
+        self.assertTrue(lines, "the trim was ledgered at all")
+        for ln in lines:
+            self.assertNotIn(
+                "evicted=", ln, "doctor counts /evicted=/ and FAILS the row on it"
+            )
+            self.assertIn("trimmed=", ln)
+            # doctor windows the ledger with `awk '$1 >= cutoff'`, so the
+            # first field has to stay a lexicographically-sortable UTC stamp.
+            self.assertRegex(ln.split()[0], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_a_collapsed_duplicate_that_rolls_out_of_the_archive_is_traceable(self):
+        """End to end: collapse → archive full → the copy is gone, on record.
+
+        This is the honest reading of "reversible": reversible until the
+        archive rolls, and when it rolls the operator can still see WHAT
+        rolled and WHEN.
+        """
+        prev = pending.DUPLICATE_MAX_ENTRIES
+        pending.DUPLICATE_MAX_ENTRIES = 1
+        try:
+            os.makedirs(self._dir, mode=0o700, exist_ok=True)
+            for i in range(4):
+                entry = dict(_payload(content="same"))
+                entry["attempt_count"] = 1
+                with open(
+                    os.path.join(self._dir, f"{1000 + i:013d}-aaaaaaaaaaa{i}.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(entry, f)
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(pending.collapse_duplicates(), 3)
+        finally:
+            pending.DUPLICATE_MAX_ENTRIES = prev
+
+        self.assertEqual(
+            len(os.listdir(pending.duplicate_dir())), 1, "the archive stayed bounded"
+        )
+        trims = [ln for ln in self._ledger() if "archive=pending-duplicate" in ln]
+        self.assertEqual(len(trims), 2, "the two shed copies are on the record")
+
+    def test_trim_noise_can_never_push_a_real_eviction_out_of_the_ledger(self):
+        """The cost of SHARING ``pending-evictions.log`` with ``_trim_dir``.
+
+        Before #3688 every line in this file was an eviction, so "keep the
+        newest ``EVICTIONS_LOG_KEEP_LINES`` lines" and "keep the newest 2,000
+        evictions" meant the same thing. Ledgering trims broke that
+        equivalence: one ``collapse_duplicates`` run over the measured
+        1,060-file backlog writes ~192 ``trimmed=`` lines, and a plain
+        tail-rotate would let that noise evict real ``evicted=`` lines from
+        the 7-day window ``switchroom doctor`` reads.
+
+        That failure mode is worth spelling out because it INVERTS the fix:
+        adding observability for the benign channel (a collapse) would have
+        removed it for the only channel that means memory is actually gone.
+        Rotation therefore fills its window evictions-first — inside the SAME
+        budget, so the file is no less bounded than it was before #3688.
+        """
+        keep = pending.EVICTIONS_LOG_KEEP_LINES
+        log = pending.evictions_log_path()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        # The oldest lines are the real evictions; everything after them is
+        # trim noise, deep enough to bury them past the tail window.
+        with open(log, "w", encoding="utf-8") as f:
+            for i in range(5):
+                f.write(
+                    "2026-07-20T00:00:%02dZ evicted=old-%d.json bytes=1 "
+                    "reason=count queue_depth=1 queue_bytes=1\n" % (i, i)
+                )
+            for i in range(keep + 50):
+                f.write(
+                    "2026-07-26T00:00:00Z trimmed=n-%d.json bytes=1 "
+                    "archive=pending-duplicate reason=archive-count "
+                    "archive_depth=0 archive_bytes=0\n" % i
+                )
+
+        # Force the rotate on the next append.
+        original = pending.EVICTIONS_LOG_MAX_BYTES
+        pending.EVICTIONS_LOG_MAX_BYTES = 1
+        try:
+            pending._append_ledger("2026-07-26T00:00:01Z trimmed=last.json bytes=1")
+        finally:
+            pending.EVICTIONS_LOG_MAX_BYTES = original
+
+        lines = self._ledger()
+        evictions = [ln for ln in lines if "evicted=" in ln]
+        self.assertEqual(len(evictions), 5, "every real eviction survived the rotate")
+        # …and the file is still BOUNDED, on the SAME budget as before
+        # #3688. Prioritising evictions must not raise the ceiling, or it
+        # trades a monitoring bug for the unbounded log #3599 bounded.
+        self.assertLessEqual(len(lines), keep)
+        # Chronological order is what doctor's `$1 >= cutoff` awk depends on.
+        self.assertEqual(
+            [ln.split()[0] for ln in lines],
+            sorted(ln.split()[0] for ln in lines),
+            "the rotate preserved timestamp order",
+        )
+
+    def test_the_rotate_still_sheds_trim_lines(self):
+        """The eviction rescue is a floor, not an excuse to keep everything.
+
+        Without this the previous test is satisfied by simply never
+        rotating, which would restore the unbounded ledger #3599 bounded.
+        """
+        keep = pending.EVICTIONS_LOG_KEEP_LINES
+        log = pending.evictions_log_path()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "w", encoding="utf-8") as f:
+            for i in range(keep + 500):
+                f.write(
+                    "2026-07-26T00:00:00Z trimmed=n-%d.json bytes=1 "
+                    "archive=pending-duplicate reason=archive-count "
+                    "archive_depth=0 archive_bytes=0\n" % i
+                )
+        original = pending.EVICTIONS_LOG_MAX_BYTES
+        pending.EVICTIONS_LOG_MAX_BYTES = 1
+        try:
+            pending._append_ledger("2026-07-26T00:00:01Z trimmed=last.json bytes=1")
+        finally:
+            pending.EVICTIONS_LOG_MAX_BYTES = original
+        lines = self._ledger()
+        self.assertEqual(len(lines), keep, "a pure-trim ledger tail-rotates")
+        self.assertIn("trimmed=last.json", lines[-1])
 
 
 class ClampAndEnvKnobBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
@@ -3715,6 +4180,112 @@ class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
         )
         self.assertEqual(summary["resplit"], 0)
         self.assertTrue(os.path.exists(path))
+
+
+class CorruptLedgerNeverStallsTheDrainTest(_QueueTempDirMixin, unittest.TestCase):
+    """A corrupt ``pending-evictions.log`` must not take the caller down.
+
+    #3688 re-review B1, and the reason it is a blocker rather than a nit:
+    the rotation now READS the ledger back (``open(log,
+    encoding="utf-8")`` + ``readlines()``) and ``UnicodeDecodeError`` is a
+    ``ValueError`` subclass, NOT an ``OSError``. Under a bare
+    ``except OSError`` guard the codec error escapes the "best-effort"
+    ledger entirely and propagates back out through every caller:
+
+      * ``archive_reconciled`` → ``_trim_dir`` → ``_log_archive_trim`` →
+        ``_append_ledger`` — and ``archive_reconciled`` is called from the
+        drain OUTSIDE the phase guard, so it reaches ``__main__`` and
+        exits 2;
+      * ``enqueue`` → ``_evict_to_fit`` → ``_log_eviction`` → the same —
+        i.e. a failed retain could no longer even be queued.
+
+    On the drain sidecar that is a SILENT permanent stall: the wrapper's
+    ``|| true`` swallows the exit code and the loop aborts identically on
+    every cycle, forever, which is precisely what these queue-hardening
+    changes exist to prevent. The trigger needs no exotic state — one
+    non-UTF-8 byte in a >1 MB ledger plus any archive over its cap. The
+    read-side surface is NOT new to the rotation, either: the pre-#3688
+    tail-rotate already called ``readlines()`` under ``except OSError``
+    (``lib/pending.py`` at 63182ce5), so this is a live latent bug on
+    ``main``, not one this change introduces.
+
+    The write side is the same bug through the other door: a filename
+    carrying a surrogate makes the ``print`` raise ``UnicodeEncodeError``,
+    also a ``ValueError``. ``except (OSError, ValueError)`` closes both.
+    """
+
+    def _corrupt_ledger(self):
+        """A >``EVICTIONS_LOG_MAX_BYTES`` ledger that is not valid UTF-8."""
+        log = pending.evictions_log_path()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "wb") as f:
+            f.write(b"\xff" * (pending.EVICTIONS_LOG_MAX_BYTES + 4096))
+        return log
+
+    def _fill_archive_over_cap(self, d, n):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        for i in range(n):
+            with open(os.path.join(d, f"{1000 + i:013d}-k-x.json"), "w") as f:
+                f.write("{}")
+
+    def test_archive_reconciled_survives_a_non_utf8_ledger(self):
+        """The drain path. Measured raising ``UnicodeDecodeError`` unfixed."""
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        self._fill_archive_over_cap(
+            pending.reconciled_dir(), pending.RECONCILED_MAX_ENTRIES + 2
+        )
+        self._corrupt_ledger()
+        entry = os.path.join(self._dir, "9999999999999-k-v.json")
+        with open(entry, "w", encoding="utf-8") as f:
+            json.dump(_payload(content="a real turn"), f)
+
+        with redirect_stderr(io.StringIO()):
+            dest = pending.archive_reconciled(entry)
+
+        self.assertIsNotNone(dest, "the retire itself must still succeed")
+        self.assertFalse(os.path.exists(entry), "entry moved out of the queue")
+        with open(dest, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["content"], "a real turn")
+
+    def test_enqueue_survives_a_non_utf8_ledger(self):
+        """The eviction path. A corrupt ledger must not block QUEUEING."""
+        pending.MAX_ENTRIES = 1
+        first = pending.enqueue(_payload(content="m0", doc="d0"), RuntimeError("x"))
+        self.assertIsNotNone(first, "fixture")
+        self._corrupt_ledger()
+
+        with redirect_stderr(io.StringIO()):
+            second = pending.enqueue(_payload(content="m1", doc="d1"), RuntimeError("x"))
+
+        self.assertIsNotNone(second, "a corrupt ledger must not refuse a memory")
+        with open(second, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["content"], "m1")
+
+    def test_a_surrogate_in_a_trimmed_name_does_not_raise(self):
+        """The WRITE-side twin: ``UnicodeEncodeError`` is a ``ValueError`` too."""
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        # A name straight off `os.listdir` on a filesystem holding
+        # undecodable bytes carries surrogate escapes (PEP 383).
+        pending._log_archive_trim(
+            "0000000001000-k-\udcff.json", 10, "count", "pending-duplicate", 1, 10
+        )
+
+    def test_a_corrupt_ledger_is_still_repaired_on_the_next_clean_write(self):
+        """Swallowing the codec error must not wedge the ledger forever.
+
+        The rotate is attempted again on every append, so once the file is
+        replaced (or truncated) by anything the ledger resumes recording —
+        the guard degrades observability for the corrupt file only, it does
+        not permanently disable the eviction record.
+        """
+        self._corrupt_ledger()
+        with redirect_stderr(io.StringIO()):
+            pending._log_eviction("aaaa.json", 10, "count", 1, 10)
+        # Corrupt bytes are still there (we never destroy an operator's
+        # file) but the new line was appended regardless.
+        with open(pending.evictions_log_path(), "rb") as f:
+            raw = f.read()
+        self.assertIn(b"evicted=aaaa.json", raw)
 
 
 if __name__ == "__main__":

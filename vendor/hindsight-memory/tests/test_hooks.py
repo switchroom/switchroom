@@ -104,9 +104,18 @@ class TestRecallHook:
             raise OSError("connection refused")
 
         hook_input = make_hook_input(prompt="What is my project about?")
-        # Should not raise — graceful degradation
+        # Should not raise — graceful degradation. Since switchroom #3619 that
+        # degradation is no longer SILENT: an unreachable OWN bank emits the
+        # degraded-recall disclosure, so the agent says "I could not check"
+        # rather than asserting there is no prior context. This case asserted
+        # the pre-#3619 silence and had been RED on main ever since. Nothing
+        # noticed because no CI job ran this file; #3688 wired the suite into
+        # ci-tests-python.yml, which is what surfaced it. The behaviour itself
+        # is pinned CI-side by scripts/tests/test_recall_degraded_notice.py.
         output = _run_hook("recall", hook_input, monkeypatch, tmp_path, urlopen_side_effect=raise_error)
-        assert output.strip() == ""
+        data = json.loads(output)
+        assert data["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+        assert "DEGRADED" in data["hookSpecificOutput"]["additionalContext"]
 
     def test_output_format_matches_claude_code_spec(self, monkeypatch, tmp_path):
         memory = make_memory("User prefers Python")
