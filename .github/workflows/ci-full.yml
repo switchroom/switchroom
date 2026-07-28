@@ -144,6 +144,14 @@ jobs:
       - name: Run unittest discover (hindsight scripts)
         working-directory: vendor/hindsight-memory/scripts
         run: python3 -m unittest discover tests/
+      # Mirrors ci-tests-python.yml (#3688) — the SIBLING plugin suite, which
+      # no check ran before. Kept in step with the twin deliberately; the
+      # pacer comment below is the standing record of what drift here costs.
+      - name: Install pytest (the sibling suite is pytest-only)
+        run: pip install -q pytest
+      - name: Run vendored plugin tests (pytest)
+        working-directory: vendor/hindsight-memory
+        run: python3 -m pytest tests/ -q
       - name: Run voice-sidecar unittests
         working-directory: docker/voice-sidecar
         run: python3 -m unittest discover -s . -p 'test_*.py'
