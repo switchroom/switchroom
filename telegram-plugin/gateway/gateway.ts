@@ -21955,7 +21955,7 @@ bot.on('callback_query:data', async ctx => {
     // ALREADY dispatched above (independently of this host round-trip)
     // so the turn never blocked — finalizeCallback here only edits the
     // card; no synthInbound (would double-fire the verdict).
-    await finalizeCallback(ctx, {
+    await finalizeCallback(ctx, { apiCall: robustApiCall,
       ackText: 'Rule applied for this session; saving durably in background…'.slice(0, 200),
       newText: baseText ? `${baseText}\n\n${interimLabel}` : interimLabel,
     })
@@ -22267,7 +22267,7 @@ bot.on('callback_query:data', async ctx => {
   // decision. Operator could re-tap and flip Deny → Allow after the
   // permission was already broadcast. Routing through finalizeCallback
   // strips the keyboard atomically with the status-line edit.
-  await finalizeCallback(ctx, {
+  await finalizeCallback(ctx, { apiCall: robustApiCall,
     ackText: ackText.slice(0, 200),
     newText: baseText ? `${baseText}\n\n${labelWithResume}` : labelWithResume,
     synthInbound: () => {

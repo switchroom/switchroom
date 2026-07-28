@@ -34,6 +34,7 @@ import {
   type AnyButton,
   type ButtonValidationError,
 } from './telegram-button-constraints.js'
+import type { RetryCallOpts } from './retry-api-call.js'
 
 /** Prefix used to namespace agent-emitted callback_data on the wire. */
 export const AGENT_CALLBACK_PREFIX = 'agent:'
@@ -496,6 +497,11 @@ export function validateAndWrapAgentKeyboard(
  * Minimal callback-context shape the helper needs. Real grammy
  * `Context` satisfies this; tests can implement a lightweight fake
  * without dragging the grammy types in.
+ *
+ * `editMessageReplyMarkup` / `reply` are REQUIRED (not optional) because
+ * they are the two rungs of the repaint-failure ladder (#3891). A context
+ * that cannot disarm its own keyboard is exactly the context that leaves
+ * the operator tapping a corpse, so the type refuses to construct one.
  */
 export interface FinalizeCallbackContext {
   answerCallbackQuery: (
@@ -505,7 +511,67 @@ export interface FinalizeCallbackContext {
     text: string | { markdown: string },
     opts?: Record<string, unknown>,
   ) => Promise<unknown>
+  /** Rung 2 of the ladder — strip `reply_markup` without touching the body. */
+  editMessageReplyMarkup: (
+    opts?: Record<string, unknown>,
+  ) => Promise<unknown>
+  /** Rung 3 of the ladder — a fresh in-channel message when the card is unfixable. */
+  reply: (
+    text: string,
+    opts?: Record<string, unknown>,
+  ) => Promise<unknown>
+  /**
+   * The raw `callback_query` update, typed `unknown` on purpose: this
+   * helper only reads `message.chat.id` off it (defensively, at runtime)
+   * to scope the retry policy's flood window, and a structural type here
+   * would have to track grammy's `MaybeInaccessibleMessage` union for no
+   * benefit. See {@link extractCallbackChatId}.
+   */
+  callbackQuery?: unknown
 }
+
+/**
+ * Best-effort `chat_id` for the retry policy's scope-precise flood window.
+ *
+ * Returns `undefined` rather than throwing on ANY unexpected shape — a
+ * missing scope degrades the 429 to a `global` window (still recorded, still
+ * respected), whereas a throw here would break the tap path outright.
+ */
+export function extractCallbackChatId(callbackQuery: unknown): string | undefined {
+  const msg = (callbackQuery as { message?: unknown } | null | undefined)?.message
+  const chat = (msg as { chat?: unknown } | null | undefined)?.chat
+  const id = (chat as { id?: unknown } | null | undefined)?.id
+  if (typeof id === 'number' && Number.isFinite(id)) return String(id)
+  if (typeof id === 'string' && id !== '') return id
+  return undefined
+}
+
+/**
+ * The retry/flood seam every leg of {@link finalizeCallback} transits.
+ *
+ * Structurally the gateway's `robustApiCall` (chat-lock → send gate →
+ * `createRetryApiCall`). Declared here rather than imported as
+ * `typeof robustApiCall` so this module keeps its zero-dependency-on-gateway
+ * shape and tests can hand in a counting fake.
+ */
+export type FinalizeApiCall = <T>(
+  fn: () => Promise<T>,
+  opts?: RetryCallOpts,
+) => Promise<T>
+
+/**
+ * Default notice posted when BOTH the body repaint and the keyboard strip
+ * fail — the card is still standing with live-looking buttons and the only
+ * honest thing left is to say so out loud, in the same chat.
+ *
+ * Deliberately a LITERAL plain string (no markdown, no entities): the most
+ * common cause of a repaint failure is Telegram rejecting the body's
+ * entities, so a rich fallback would be likely to fail the same way.
+ */
+export const DEAD_CARD_NOTICE =
+  '⚠️ Your tap was applied, but this card could not be updated. ' +
+  'The buttons on it are STALE — tapping them again will not change anything. ' +
+  'Scroll down for the outcome, or ask the agent to re-send the card.'
 
 export interface FinalizeCallbackOptions {
   /**
@@ -549,52 +615,167 @@ export interface FinalizeCallbackOptions {
    * actions that shell to the host CLI, operator-event dismiss, etc).
    */
   synthInbound?: () => void | Promise<void>
+  /**
+   * The retry/flood policy every Telegram call in this helper transits
+   * (#3891). REQUIRED — not optional-with-a-passthrough-default, because a
+   * passthrough default is exactly the bug: the tap path silently opted out
+   * of the one policy that records 429s, and nothing failed. Making it a
+   * mandatory field turns "did this call site wire the policy?" into a
+   * `tsc` error at all 8 call sites instead of a review checklist item.
+   *
+   * Pass the gateway's `robustApiCall`.
+   */
+  apiCall: FinalizeApiCall
   /** Logger seam for tests. Defaults to stderr. */
   log?: (line: string) => void
+}
+
+/**
+ * Rungs 2 and 3 of the repaint-failure ladder (#3891).
+ *
+ * Precondition: the body repaint already failed AFTER the retry policy had
+ * its go, so the card is standing with a live `reply_markup` over a decision
+ * that is already resolved. Getting the keyboard OFF is what matters here —
+ * the stale body text is cosmetic by comparison, an un-disarmed keyboard is
+ * an invitation to re-tap.
+ *
+ * Never throws. A throw would land back in `finalizeCallback` and could skip
+ * invariant 3 (the model wake-up), trading a confusing card for a wedged turn.
+ */
+async function disarmDeadCard(
+  ctx: FinalizeCallbackContext,
+  apiCall: FinalizeApiCall,
+  scope: RetryCallOpts,
+  log: (line: string) => void,
+): Promise<void> {
+  try {
+    await apiCall(
+      () => ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }),
+      { ...scope, verb: 'editMessageReplyMarkup' },
+    )
+    log(
+      'finalizeCallback: repaint failed but the keyboard was stripped — ' +
+        'the card shows stale text and is no longer tappable\n',
+    )
+    return
+  } catch (err) {
+    log(`finalizeCallback: editMessageReplyMarkup fallback failed: ${(err as Error).message}\n`)
+  }
+  // Rung 3 — the card cannot be changed at all. Say so out loud rather than
+  // leave a live-looking keyboard with no explanation behind it.
+  try {
+    await apiCall(
+      () => ctx.reply(DEAD_CARD_NOTICE, { link_preview_options: { is_disabled: true } }),
+      { ...scope, verb: 'sendMessage' },
+    )
+  } catch (err) {
+    log(`finalizeCallback: dead-card notice failed: ${(err as Error).message}\n`)
+  }
 }
 
 /**
  * Apply the three-invariant finalize pattern. See module docstring
  * above for design rationale.
  *
- * Order: ack → edit → synth. The ack is fired-and-forgotten (so a slow
- * Telegram API doesn't delay the visible state change), but the edit
- * is awaited so `synthInbound` doesn't race ahead of the operator's
- * visual confirmation. Each step's error is logged + swallowed —
- * partial success is preferred to "tap looked dead AND the model
- * stayed stuck" full failure.
+ * Order: ack → edit (→ disarm ladder on failure) → synth. The ack is
+ * fired-and-forgotten (so a slow Telegram API doesn't delay the visible
+ * state change), but the edit is awaited so `synthInbound` doesn't race
+ * ahead of the operator's visual confirmation. Each step's error is
+ * logged + swallowed — partial success is preferred to "tap looked dead
+ * AND the model stayed stuck" full failure.
+ *
+ * ── #3891: every leg goes through `opts.apiCall` ──────────────────────
+ * Both legs used to call grammy's CONTEXT methods raw. That bypassed
+ * `robustApiCall` / `createRetryApiCall` entirely, with two consequences
+ * observed together in one live incident:
+ *
+ *   1. A 429 earned on the tap path never reached `onFloodWait`, so it was
+ *      never folded into `429-ledger.json` and never opened a window in
+ *      `flood-windows.json`. Every consumer of that state — the send gate,
+ *      `switchroom doctor`'s flood-pressure classifier, the wedge-watchdog's
+ *      Esc suppression — was reasoning about the bot's 429 pressure from a
+ *      picture with the operator's own taps cut out of it.
+ *   2. With no retry, ONE transient failure at the edit left the card
+ *      holding its `reply_markup`: still live, still tappable, decision
+ *      already resolved. The operator taps a corpse and gets a bare
+ *      "doesn't want to proceed" with no explanation.
+ *
+ * Both legs are tagged `priorityClass: 'critical'` and carry no
+ * `messageId`/`editPayload`. That is deliberate: `critical` is the one
+ * class the send gate never SHEDS, and omitting the edit-coalescing keys
+ * keeps the gate from treating a finalize repaint as a droppable
+ * last-write-wins card edit. A finalize repaint is the operator's only
+ * visual confirmation that a human-in-the-loop decision resolved — shedding
+ * or coalescing it away IS the incident this fix exists to stop.
+ *
+ * ── The repaint-failure ladder ────────────────────────────────────────
+ * `robustApiCall` already swallows the two BENIGN edit failures
+ * (MESSAGE_NOT_MODIFIED, MESSAGE_TO_EDIT_NOT_FOUND → `undefined`) and
+ * retries transient ones. So anything reaching the catch below is a real,
+ * post-retry failure — and the card is still standing with live buttons.
+ * Three rungs, cheapest and most-likely-to-work first:
+ *
+ *   1. body repaint (`editMessageText`)      — the good outcome.
+ *   2. keyboard strip (`editMessageReplyMarkup`) — the body is what usually
+ *      breaks (entity/markdown parse, length); an empty-keyboard edit sends
+ *      no body at all, so it survives the failure mode that killed rung 1.
+ *      Card keeps stale TEXT but is no longer tappable.
+ *   3. plain-text notice (`reply`)           — the card is unfixable, so
+ *      say so in-channel rather than let it keep presenting as live.
+ *
+ * Every rung is best-effort and logged; none of them may block invariant 3.
+ * NOTE the ladder changes no approval semantics — it only repaints and
+ * narrates. The decision was resolved by the caller before we were called.
  */
 export async function finalizeCallback(
   ctx: FinalizeCallbackContext,
   opts: FinalizeCallbackOptions,
 ): Promise<void> {
   const log = opts.log ?? ((line: string) => process.stderr.write(line))
+  const apiCall = opts.apiCall
+  const chatId = extractCallbackChatId(ctx.callbackQuery)
+  const scope: RetryCallOpts = {
+    ...(chatId != null ? { chat_id: chatId } : {}),
+    priorityClass: 'critical',
+  }
   // Invariant 1 — toast. Fire-and-forget; we don't want a slow
   // answerCallbackQuery round-trip to delay the message edit.
-  void ctx.answerCallbackQuery({
-    text: opts.ackText,
-    ...(opts.alert ? { show_alert: true } : {}),
-  }).catch((err: unknown) => {
+  void apiCall(
+    () =>
+      ctx.answerCallbackQuery({
+        text: opts.ackText,
+        ...(opts.alert ? { show_alert: true } : {}),
+      }),
+    { ...scope, verb: 'answerCallbackQuery' },
+  ).catch((err: unknown) => {
     log(`finalizeCallback: answerCallbackQuery failed: ${(err as Error).message}\n`)
   })
   // Invariant 2 — strip keyboard + append status line, atomic edit.
+  let repainted = true
   try {
-    await ctx.editMessageText(
-      opts.literalText ? opts.newText : { markdown: opts.newText },
-      {
-        reply_markup: { inline_keyboard: [] },
-        // Default link_preview_options off — most finalized cards don't
-        // benefit from preview cards, and a stale preview survives the
-        // edit otherwise.
-        link_preview_options: { is_disabled: true },
-      },
+    await apiCall(
+      () =>
+        ctx.editMessageText(
+          opts.literalText ? opts.newText : { markdown: opts.newText },
+          {
+            reply_markup: { inline_keyboard: [] },
+            // Default link_preview_options off — most finalized cards don't
+            // benefit from preview cards, and a stale preview survives the
+            // edit otherwise.
+            link_preview_options: { is_disabled: true },
+          },
+        ),
+      { ...scope, verb: 'editMessageText' },
     )
   } catch (err) {
     // MESSAGE_NOT_MODIFIED (text didn't change) and MESSAGE_TO_EDIT_NOT_FOUND
-    // (operator already deleted the card) are both benign. Other failures
-    // log + continue — we still want synthInbound to run.
+    // (operator already deleted the card) are both benign AND are already
+    // swallowed inside the retry policy, so they never land here. Anything
+    // that does is a real failure that left the keyboard standing.
+    repainted = false
     log(`finalizeCallback: editMessageText failed: ${(err as Error).message}\n`)
   }
+  if (!repainted) await disarmDeadCard(ctx, apiCall, scope, log)
   // Invariant 3 — model wake-up (when applicable).
   if (opts.synthInbound != null) {
     try {

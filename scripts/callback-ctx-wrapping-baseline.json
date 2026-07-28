@@ -1,0 +1,22 @@
+{
+  "_readme": [
+    "Inventory of raw, UNWRAPPED grammy CONTEXT calls on the button-tap path:",
+    "ctx.answerCallbackQuery / ctx.editMessageText / ctx.editMessageReplyMarkup",
+    "(with or without the .api. infix), outside any robustApiCall-family wrapper.",
+    "Enforced by scripts/check-callback-ctx-wrapping.mjs as an EXACT match, both",
+    "directions: a new bypass fails CI, and removing one fails CI until you lower",
+    "the number here in the same PR. See switchroom#3891 for why these are not",
+    "harmless — a raw call's 429 never reaches the flood ledger, and a raw card",
+    "repaint that fails leaves a live-looking, tappable, already-resolved card.",
+    "These entries are a BACKLOG, not an allowance. Lower them; never raise them."
+  ],
+  "files": {
+    "telegram-plugin/gateway/agent-button-callback-handler.ts": 5,
+    "telegram-plugin/gateway/approval-callback.ts": 7,
+    "telegram-plugin/gateway/ask-callback-handler.ts": 5,
+    "telegram-plugin/gateway/callback-query-handlers.ts": 86,
+    "telegram-plugin/gateway/folder-picker-handler.ts": 11,
+    "telegram-plugin/gateway/gateway.ts": 34,
+    "telegram-plugin/gateway/voice-ondemand-callback-handler.ts": 4
+  }
+}
