@@ -2518,6 +2518,14 @@ export class HostdServer {
     };
     copyFileSync(composePath, bakPath);
     writeFileSync(composePath, bumped.yaml, "utf8");
+    // #3919: log HOW MANY hostd image lines were bumped. The compose has
+    // carried two since the hindsight-autoheal sidecar (#2910), and the bug
+    // that stranded that sidecar for three releases was invisible precisely
+    // because this step only ever reported the single hostd ref.
+    process.stderr.write(
+      `hostd: self-bump rewrote ${bumped.bumpedCount} switchroom-hostd ` +
+        `image line(s) → ${bumped.newImageRef}\n`,
+    );
     writeFileSync(markerPath, encodePendingRolloutMarker(marker), {
       mode: 0o600,
     });

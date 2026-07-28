@@ -52,6 +52,23 @@ import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
 import { getBuiltinDefaultSkillEntries } from "../memory/scaffold-integration.js";
 import { syncBundledSkills } from "./sync-bundled-skills.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
+import {
+  alreadySelfUpdated,
+  detectInstallKind,
+  fetchLatestReleaseTag,
+  performSelfUpdate,
+  planSelfUpdate,
+  releaseAssetName,
+  SELF_UPDATE_ENV_SENTINEL,
+  type SelfUpdateIO,
+} from "./self-update.js";
+import { defaultSelfUpdateIO } from "./self-update-io.js";
+import {
+  collectComponents,
+  detectComponentDrift,
+  formatComponentDrift,
+  type ExecFn,
+} from "./component-versions.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -156,6 +173,37 @@ interface UpdateOptions {
    * `true`/`false` explicitly to avoid touching the real process env.
    */
   hostdContext?: boolean;
+  /**
+   * Opt OUT of the host-CLI self-update step (#3919).
+   *
+   * DEFAULT IS ON, deliberately. `switchroom update`'s documented
+   * contract is "update switchroom on this host"; a version of it that
+   * silently leaves the CLI behind is the defect, not the feature. Making
+   * whole-host update opt-IN would preserve the current drift for every
+   * operator who never learns the flag — which is exactly how the CLI on
+   * the reference host reached three releases of skew. So the scope
+   * control is an opt-out, and `--check` names the step either way.
+   */
+  skipSelfUpdate?: boolean;
+  /** Test seam — replace the self-update side effects. */
+  selfUpdateIO?: SelfUpdateIO;
+  /** Test seam — override the resolved latest published release tag
+   *  (bypasses the GitHub round-trip). */
+  latestReleaseTagFn?: () => Promise<string | null>;
+  /** Test seam — override install-kind detection inputs. */
+  installProbe?: Parameters<typeof detectInstallKind>[0];
+  /** Test seam — exec used by the component-version inventory. */
+  componentExec?: ExecFn;
+  /**
+   * Mutable sink the self-update step writes to when it replaces the
+   * binary. `runUpdate` reads it and re-execs the NEW binary for the
+   * remaining steps. A shared holder (rather than a throw / process.exit
+   * inside the step) keeps `planUpdate` pure-ish and the re-exec
+   * decision in one place.
+   */
+  selfUpdateSink?: { replacedWith?: string; binaryPath?: string };
+  /** Test seam — replace the re-exec of the freshly installed binary. */
+  reexecFn?: (binaryPath: string, args: string[]) => { status: number };
 }
 
 interface UpdateStep {
@@ -171,7 +219,7 @@ interface UpdateStep {
    */
   isHostdDeferred?: boolean;
   /** Invoked when not in --check mode. Throws on failure. */
-  run: () => void;
+  run: () => void | Promise<void>;
 }
 
 const DEFAULT_COMPOSE_PATH = join(
@@ -393,6 +441,87 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   // end of runUpdate tells the server which steps were deferred.
   const hostdContext =
     typeof opts.hostdContext === "boolean" ? opts.hostdContext : isHostdContext();
+
+  // ── self-update-cli — FIRST, ahead of everything (#3919) ──────────────
+  //
+  // Ordering is the whole point of this step. `apply-config` renders every
+  // per-agent scaffold from Handlebars templates that ship INSIDE the
+  // installed CLI, so a CLI updated AFTER apply renders this run from the
+  // OLD templates and the new one sits unused until the next update — the
+  // drift, one release later. It also precedes persist-release-pin and the
+  // compose regen so the whole rest of the plan runs under the new code.
+  //
+  // Skipped (never failed) when the install is not a published static
+  // binary, when GitHub is unreachable, or when the operator opted out.
+  // Skipping is loud: the reason is printed and, in --check, listed.
+  steps.push({
+    name: "self-update-cli",
+    description:
+      "Replace the host operator CLI binary with the latest published release (checksum-verified, run-proved, atomic swap + versioned rollback copy), then re-exec the new binary for the remaining steps",
+    skipReason: opts.skipSelfUpdate
+      ? "--skip-self-update flag set"
+      : alreadySelfUpdated(process.env)
+        ? "already re-exec'd from a freshly installed binary in this run"
+        : undefined,
+    run: async () => {
+      const say = opts.stdout ?? ((t: string) => process.stdout.write(t));
+      const io = opts.selfUpdateIO ?? defaultSelfUpdateIO();
+      const detection = detectInstallKind(
+        opts.installProbe ?? {
+          bundleDir: import.meta.dirname,
+          execPath: process.execPath,
+          scriptPath: scriptPath,
+          inContainer:
+            process.env.SWITCHROOM_HOSTD_CONTEXT === "1" ||
+            existsSync("/.dockerenv"),
+        },
+      );
+      // Classify BEFORE any network I/O: a container / checkout / npm
+      // install can never be self-updated, so asking GitHub about it is a
+      // pointless round-trip (and would make every unit test that walks
+      // this step reach the network).
+      if (detection.kind !== "static-binary") {
+        say(chalk.gray(`  host CLI not self-updated: ${detection.reason}\n`));
+        return;
+      }
+      const latestTag = opts.latestReleaseTagFn
+        ? await opts.latestReleaseTagFn()
+        : await fetchLatestReleaseTag(io);
+      const plan = planSelfUpdate({
+        detection,
+        currentVersion: SWITCHROOM_VERSION,
+        latestTag,
+      });
+      if (plan.action === "skip") {
+        say(chalk.gray(`  host CLI not self-updated: ${plan.reason}\n`));
+        return;
+      }
+      if (plan.action === "current") {
+        say(chalk.gray(`  host CLI already on ${plan.version}\n`));
+        return;
+      }
+      const asset = releaseAssetName(process.platform, process.arch);
+      if (!asset) {
+        say(
+          chalk.gray(
+            `  host CLI not self-updated: no published binary for ${process.platform}/${process.arch}\n`,
+          ),
+        );
+        return;
+      }
+      const result = await performSelfUpdate({
+        plan,
+        assetName: asset,
+        io,
+        log: (s) => say(chalk.gray(`  ${s}\n`)),
+      });
+      if (result.replaced && opts.selfUpdateSink) {
+        opts.selfUpdateSink.replacedWith = result.newVersion;
+        opts.selfUpdateSink.binaryPath = result.binaryPath;
+      }
+      say(chalk.green(`  ${result.message}\n`));
+    },
+  });
 
   // When --channel / --pin is set, the resolved image tag in compose
   // needs to change BEFORE pull-images runs (so `docker compose pull`
@@ -1195,6 +1324,66 @@ function formatStatusReport(rep: StatusReport): string {
   return lines.join("\n");
 }
 
+/**
+ * Reconstruct this run's flags for the re-exec'd (new) binary, plus the
+ * two loop guards. Only flags that are still meaningful after the CLI has
+ * already been replaced are forwarded — `--check` and `--status` never
+ * reach here (they return before any step runs).
+ */
+export function buildReexecArgs(opts: UpdateOptions): string[] {
+  const args = ["update", "--skip-self-update"];
+  if (opts.skipImages) args.push("--skip-images");
+  if (opts.channel) args.push("--channel", opts.channel);
+  // self-update-cli runs BEFORE persist-release-pin, so this run has not
+  // persisted --pin yet. Forward it; the new binary does the persist.
+  if (opts.pin) args.push("--pin", opts.pin);
+  // --rebuild is deliberately NOT forwarded: it is refused on any
+  // published install, and a static binary (the only self-updatable
+  // shape) is by definition published.
+  return args;
+}
+
+function defaultReexec(binaryPath: string, args: string[]): { status: number } {
+  const r = spawnSync(binaryPath, args, {
+    stdio: "inherit",
+    env: { ...process.env, [SELF_UPDATE_ENV_SENTINEL]: "1" },
+  });
+  return { status: r.status ?? 1 };
+}
+
+/**
+ * Local, network-free component-version drift summary for `--check`.
+ *
+ * Never throws: an advisory block must not be able to break the dry-run
+ * an operator uses to decide whether to update.
+ */
+export function renderDriftPreamble(opts: UpdateOptions): string {
+  try {
+    const exec: ExecFn =
+      opts.componentExec ??
+      ((cmd, args) => {
+        const r = spawnSync(cmd, args, { encoding: "utf-8", timeout: 10_000 });
+        return { status: r.status ?? 1, stdout: r.stdout ?? "" };
+      });
+    let pin: string | undefined;
+    try {
+      pin = loadConfig().release?.pin ?? undefined;
+    } catch {
+      pin = undefined;
+    }
+    const report = detectComponentDrift(
+      collectComponents(SWITCHROOM_VERSION, exec),
+      pin,
+    );
+    const body = formatComponentDrift(report);
+    return report.behind.length > 0
+      ? `${body}\n\n${report.behind.length} component(s) BEHIND ${report.target} — this update targets them.\n`
+      : `${body}\n`;
+  } catch (err) {
+    return `Component versions: not checkable (${(err as Error).message})\n`;
+  }
+}
+
 async function runUpdate(opts: UpdateOptions): Promise<number> {
   const stdout = opts.stdout ?? ((s) => process.stdout.write(s));
   const stderr = opts.stderr ?? ((s) => process.stderr.write(s));
@@ -1238,10 +1427,19 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
     }
   }
 
-  const steps = planUpdate(opts);
+  // Sink the self-update step writes to when it swaps the binary, so the
+  // loop below knows it must re-exec the NEW code for the remaining steps.
+  const selfUpdateSink: { replacedWith?: string; binaryPath?: string } =
+    opts.selfUpdateSink ?? {};
+  const steps = planUpdate({ ...opts, selfUpdateSink });
 
   if (opts.check) {
     stdout(chalk.bold("switchroom update --check (dry-run)\n\n"));
+    // Report component drift up front (#3919). Local-only and
+    // deterministic — this is the standing answer to "is anything on this
+    // host behind?" that nobody had, which is why three components drifted
+    // across three releases with only transient warnings to show for it.
+    stdout(renderDriftPreamble(opts) + "\n");
     for (const step of steps) {
       const status = step.skipReason
         ? chalk.gray(`[skip] ${step.skipReason}`)
@@ -1259,7 +1457,31 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
     }
     stdout(chalk.bold(`▸ ${step.name}\n`));
     try {
-      step.run();
+      await step.run();
+      if (step.name === "self-update-cli" && selfUpdateSink.binaryPath) {
+        // The binary on $PATH is now the new release, but THIS process is
+        // still running the old code — a process cannot start executing a
+        // replacement of its own file. Hand the rest of the plan to the new
+        // binary and adopt its exit status. `--skip-self-update` plus the
+        // env sentinel make a re-exec loop impossible even if the new
+        // binary mis-reports its own version.
+        //
+        // This can never fire in a hostd-driven run: inside a container
+        // detectInstallKind() returns `container` and the step skips, so
+        // the UPDATE_RESULT sentinel line the server parses is always
+        // emitted by this process, never swallowed by a child.
+        const reexec = opts.reexecFn ?? defaultReexec;
+        stdout(
+          chalk.bold(
+            `\n▸ re-exec ${selfUpdateSink.binaryPath} (${selfUpdateSink.replacedWith}) for the remaining steps\n`,
+          ),
+        );
+        const r = reexec(
+          selfUpdateSink.binaryPath,
+          buildReexecArgs(opts),
+        );
+        return r.status;
+      }
     } catch (err) {
       stderr(
         chalk.red(`✗ ${step.name} failed: ${(err as Error).message}\n`),
@@ -1291,10 +1513,14 @@ export function registerUpdateCommand(program: Command): void {
   program
     .command("update")
     .description(
-      "Update switchroom on this host: pull images, refresh scaffolds, recreate containers. Wraps the full `pull && apply && up -d` flow.",
+      "Update EVERY switchroom component on this host — the operator CLI itself (first), images, scaffolds, the hostd / web / hindsight singletons, and the agent fleet. Wraps the full `self-update && pull && apply && up -d` flow.",
     )
     .option("--check", "Dry-run: print the steps that would execute, exit 0.")
     .option("--skip-images", "Skip the docker image pull (offline mode).")
+    .option(
+      "--skip-self-update",
+      "Do NOT replace the host operator CLI binary. By default `update` updates every switchroom component INCLUDING itself (and does it first, because `apply` renders scaffolds from templates shipped inside the CLI).",
+    )
     .option(
       "--rebuild",
       "Source-checkout / maintainer only: git pull + bun install + npm run build before applying. REFUSED on a published install — use `npm i -g switchroom@latest && switchroom update` there.",

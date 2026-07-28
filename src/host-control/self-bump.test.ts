@@ -77,6 +77,50 @@ describe("bumpHostdComposeImageTag", () => {
     expect(r!.yaml).toContain("switchroom-agent:v0.16.49");
     expect(r!.yaml).toContain("switchroom-hostd:v0.17.0");
   });
+
+  // #3919 regression: the hostd compose project has carried a SECOND
+  // service on the hostd image since #2910 (`hindsight-autoheal`). The
+  // original non-global regex rewrote only the first match, so every
+  // self-bump advanced `hostd` and left `hindsight-autoheal` on the prior
+  // tag — the exact split observed on the operator host (hostd v0.19.28,
+  // autoheal v0.19.26). Assert the OUTCOME: no stale tag survives anywhere.
+  it("bumps EVERY switchroom-hostd image line, including the hindsight-autoheal sidecar", () => {
+    const twoServices = [
+      "services:",
+      "  hostd:",
+      "    image: ghcr.io/switchroom/switchroom-hostd:v0.19.26",
+      "    volumes:",
+      "      - /var/run/docker.sock:/var/run/docker.sock",
+      "",
+      "  hindsight-autoheal:",
+      "    image: ghcr.io/switchroom/switchroom-hostd:v0.19.26",
+      "    container_name: switchroom-hindsight-autoheal",
+    ].join("\n");
+    const r = bumpHostdComposeImageTag(twoServices, "v0.19.28");
+    expect(r).not.toBeNull();
+    expect(r!.bumpedCount).toBe(2);
+    // No line anywhere is left on the prior tag.
+    expect(r!.yaml).not.toContain("v0.19.26");
+    expect(r!.yaml.match(/switchroom-hostd:v0\.19\.28/g)?.length).toBe(2);
+    // The blank line between the two services survives (a globalised
+    // `\s*$` tail would eat the trailing newlines).
+    expect(r!.yaml).toContain(
+      "      - /var/run/docker.sock:/var/run/docker.sock\n\n  hindsight-autoheal:",
+    );
+    expect(r!.yaml).toContain("container_name: switchroom-hindsight-autoheal");
+  });
+
+  it("preserves each line's own registry prefix when they differ", () => {
+    const mirrored = [
+      "  hostd:",
+      "    image: ghcr.io/switchroom/switchroom-hostd:v1.0.0",
+      "  hindsight-autoheal:",
+      "    image: registry.example.com/me/switchroom-hostd:v1.0.0",
+    ].join("\n");
+    const r = bumpHostdComposeImageTag(mirrored, "v1.1.0");
+    expect(r!.yaml).toContain("ghcr.io/switchroom/switchroom-hostd:v1.1.0");
+    expect(r!.yaml).toContain("registry.example.com/me/switchroom-hostd:v1.1.0");
+  });
 });
 
 describe("pending-rollout marker", () => {

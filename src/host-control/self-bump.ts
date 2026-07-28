@@ -105,27 +105,51 @@ export function needsSelfBump(
 }
 
 /**
- * Tag-bump the hostd compose yaml: rewrite the `image:` line that
+ * Tag-bump the hostd compose yaml: rewrite EVERY `image:` line that
  * references a `switchroom-hostd` image to the target pin, preserving the
  * registry/owner prefix as-is (forks / GHCR mirrors keep working).
  *
+ * ALL matches, not just the first (#3919). The hostd compose project has
+ * carried a SECOND service on the hostd image since #2910 — the
+ * `hindsight-autoheal` sidecar. The original implementation used a
+ * non-global regex with `String.replace`, which rewrites only the first
+ * match, so every self-bump advanced the `hostd` service and silently left
+ * `hindsight-autoheal` on the prior tag. Observed on the operator host:
+ * `switchroom-hostd` on v0.19.28 while `switchroom-hindsight-autoheal` was
+ * still on v0.19.26, two releases after the sidecar last saw a host-side
+ * `hostd install`. Nothing surfaced the split because the self-bump reports
+ * only the (correctly bumped) hostd ref.
+ *
  * Returns the rewritten yaml plus the old and new image refs, or null when
  * no such image line is found (hand-mangled compose — caller refuses and
- * points at host-side `hostd install`).
+ * points at host-side `hostd install`). `oldImageRef` is the ref of the
+ * FIRST matched line (the `hostd` service in a generated compose) so the
+ * caller's audit line is unchanged; `bumpedCount` reports how many lines
+ * were actually rewritten.
  */
 export function bumpHostdComposeImageTag(
   yaml: string,
   pin: string,
-): { yaml: string; oldImageRef: string; newImageRef: string } | null {
-  const re = /^(\s*image:\s*)(\S*switchroom-hostd):(\S+)\s*$/m;
-  const m = yaml.match(re);
-  if (!m) return null;
-  const oldImageRef = `${m[2]}:${m[3]}`;
-  const newImageRef = `${m[2]}:${pin}`;
+): {
+  yaml: string;
+  oldImageRef: string;
+  newImageRef: string;
+  bumpedCount: number;
+} | null {
+  const re = /^(\s*image:\s*)(\S*switchroom-hostd):(\S+)[ \t]*$/gm;
+  const matches = [...yaml.matchAll(re)];
+  if (matches.length === 0) return null;
+  const first = matches[0];
+  const oldImageRef = `${first[2]}:${first[3]}`;
+  const newImageRef = `${first[2]}:${pin}`;
   return {
-    yaml: yaml.replace(re, `$1${newImageRef}`),
+    // Rewrite every match, preserving each line's own registry/owner
+    // prefix — a fork could legitimately mirror the two services from
+    // different registries and we must not collapse them onto one.
+    yaml: yaml.replace(re, (_m, indent: string, repo: string) => `${indent}${repo}:${pin}`),
     oldImageRef,
     newImageRef,
+    bumpedCount: matches.length,
   };
 }
 

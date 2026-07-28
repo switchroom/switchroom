@@ -66,6 +66,7 @@ import { runOpenRouterCreditChecks, usesOpenRouter } from "./doctor-openrouter-c
 import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runFloodPressureChecks } from "./doctor-flood-pressure.js";
 import { runGeneratedSurfaceDriftChecks } from "./doctor-drift.js";
+import { runComponentVersionChecks } from "./doctor-component-versions.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
 import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
@@ -3978,6 +3979,26 @@ export function registerDoctorCommand(program: Command): void {
           // the fleet today — only agents the value-gate routes to a cron
           // session produce a line.
           { title: "Cron Session", results: runCronSessionChecks(config) },
+          {
+            // #3919: is every switchroom component — the host CLI included —
+            // on the same release? Three components drifted across three
+            // releases on the reference host because nothing held a standing
+            // answer to that question. warn-only; never changes exit code.
+            title: "Component versions (#3919)",
+            results: ((): CheckResult[] => {
+              try {
+                return runComponentVersionChecks(config);
+              } catch (err) {
+                return [
+                  {
+                    name: "component versions",
+                    status: "skip",
+                    detail: `not checkable: ${(err as Error)?.message ?? String(err)}`,
+                  },
+                ];
+              }
+            })(),
+          },
           {
             // KEN-130: every generated/synced surface (compose, hooks,
             // start.sh/CLAUDE.md/.mcp.json stamp, skills, image hook
