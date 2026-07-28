@@ -108,7 +108,13 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
     sr_ll_ok=""
     sr_ll_unreachable=""
     if [ -z "$sr_ll_key" ]; then
-      echo "litellm(outer): WARNING — no virtual key for agent '$SWITCHROOM_AGENT_NAME'; gateway falling back to direct Anthropic OAuth (untracked, unguarded)." >&2
+      # Say what to DO, not just what happened: the fail-open is a BOOT-TIME
+      # decision that is never re-evaluated, so provisioning the key later
+      # changes nothing until the agent is restarted. An operator who reads
+      # only "untracked" and provisions a key reasonably assumes it took
+      # effect; it did not. `switchroom doctor` carries the standing version
+      # of this signal (it reads .routing-mode) once the boot log has rotated.
+      echo "litellm(outer): WARNING — no virtual key for agent '$SWITCHROOM_AGENT_NAME'; gateway falling back to direct Anthropic OAuth (untracked, unguarded). FIX: re-run 'switchroom apply' to provision the key, then RESTART this agent — the fail-open is decided once at boot and is never re-evaluated for the life of the session." >&2
     elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
       # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack
       # co-boots, the litellm proxy's heavy Python app is often not yet healthy
@@ -1563,6 +1569,14 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
     echo "WARNING: no litellm virtual key for agent '$SWITCHROOM_AGENT_NAME'." >&2
     echo "WARNING: falling back to direct Anthropic OAuth (untracked, unguarded)" >&2
     echo "WARNING: — cannot authenticate to the proxy without a key." >&2
+    # Remediation, not just diagnosis. The fail-open is decided ONCE here and
+    # never re-evaluated, so a key provisioned mid-session is inert — an
+    # operator who is not told that will provision one and believe the agent
+    # healed. `switchroom doctor` reads .routing-mode for the standing version
+    # of this signal, since this banner only lives in a rotating boot log.
+    echo "WARNING: FIX: re-run 'switchroom apply' to provision the key, then" >&2
+    echo "WARNING: RESTART this agent — the fail-open is decided once at boot" >&2
+    echo "WARNING: and is never re-evaluated for the life of this session." >&2
     echo "==========================================================" >&2
   elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
     # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack

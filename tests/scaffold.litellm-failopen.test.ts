@@ -135,6 +135,14 @@ describe("scaffoldAgent: LiteLLM fail-open boot contract (#litellm)", () => {
     // MISSING-KEY branch is still logged LOUDLY (not silent).
     expect(innerBlock).toContain("no litellm virtual key for agent");
 
+    // …and ACTIONABLY: the banner must carry the remediation AND the fact that
+    // the fail-open is a boot-time decision. Without the latter an operator
+    // provisions the key, sees nothing change, and concludes the key was not
+    // the cause — the session stays untracked until an unrelated restart.
+    expect(innerBlock).toContain("FIX: re-run 'switchroom apply'");
+    expect(innerBlock).toContain("RESTART this agent");
+    expect(innerBlock).toContain("never re-evaluated for the life of this session");
+
     // Per-AGENT attribution headers, keyed off the agent name (unchanged path).
     expect(startSh).toContain("x-litellm-api-key: Bearer $sr_ll_key");
     expect(startSh).toContain("x-litellm-customer-id: $SWITCHROOM_AGENT_NAME");
