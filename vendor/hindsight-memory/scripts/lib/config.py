@@ -436,6 +436,59 @@ ENV_OVERRIDES = {
 }
 
 
+#: Switchroom-local: the `observation_scopes` values Hindsight accepts as a
+#: bare string (`MemoryItem.observation_scopes`, typed
+#: `Literal["per_tag","combined","all_combinations","shared"] | list[list[str]]
+#: | None` server-side). The explicit list-of-lists tag matrix is deliberately
+#: NOT exposed through switchroom config: unbounded, no safe fleet-wide
+#: default, no caller needs it. Paired with `OBSERVATION_SCOPES` in
+#: src/memory/observation-scopes.ts, which the zod enum reads — widening the
+#: set means widening BOTH.
+OBSERVATION_SCOPES_VALUES = ("per_tag", "combined", "all_combinations", "shared")
+
+
+def resolve_observation_scopes(config: dict):
+    """Return the validated per-row ``observation_scopes``, or ``None``.
+
+    ``None`` means "do not put the field on the wire at all" — the shipped
+    default, and byte-for-byte the pre-plumbing request body.
+
+    Raises ``ValueError`` on any value outside
+    :data:`OBSERVATION_SCOPES_VALUES`. This FAILS THE RETAIN rather than
+    quietly falling back to the engine default on purpose: a wrong scope is
+    invisible at write time and only shows up much later as a bank whose
+    observations never merged, so a typo must be noisy the FIRST time it fires.
+    The primary gate is upstream — the `memory.observation_scopes` zod enum
+    rejects a typo at `switchroom apply` — so reaching this raise means someone
+    hand-edited the installed plugin's settings.json or set the raw
+    HINDSIGHT_OBSERVATION_SCOPES env var, neither of which zod can see.
+
+    An empty/whitespace-only value is treated as UNSET, matching the plugin's
+    existing "an empty export hands authority back to the config file" idiom
+    (see ``_cast_env``): an absent knob, not a typo'd one.
+    """
+    raw = config.get("observationScopes")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            "observationScopes must be a string, one of "
+            f"{', '.join(OBSERVATION_SCOPES_VALUES)}; got {type(raw).__name__} ({raw!r}). "
+            "Set it via `memory.observation_scopes` in switchroom.yaml."
+        )
+    value = raw.strip()
+    if not value:
+        return None
+    if value not in OBSERVATION_SCOPES_VALUES:
+        raise ValueError(
+            f"observationScopes={raw!r} is not a valid Hindsight observation scope. "
+            f"Accepted values: {', '.join(OBSERVATION_SCOPES_VALUES)}. "
+            "Set it via `memory.observation_scopes` in switchroom.yaml "
+            "(a typo there is rejected at `switchroom apply`)."
+        )
+    return value
+
+
 def _cast_env(value: str, typ):
     """Cast environment variable string to target type. Returns None on failure."""
     try:

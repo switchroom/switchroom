@@ -34,7 +34,11 @@ if SCRIPTS_DIR not in sys.path:
 import drain_pending  # noqa: E402
 import retain  # noqa: E402
 from lib.client import HindsightClient  # noqa: E402
-from lib.config import load_config  # noqa: E402
+from lib.config import (  # noqa: E402
+    OBSERVATION_SCOPES_VALUES,
+    load_config,
+    resolve_observation_scopes,
+)
 from lib.retain_split import retain_content_limit  # noqa: E402
 
 
@@ -198,6 +202,80 @@ class DrainOfQueuedEntries(unittest.TestCase):
         entry = json.loads(json.dumps(dict(self._LEGACY, observation_scopes="shared")))
         drain_pending._retry_one(entry, timeout=15)
         self.assertEqual(self.calls[0]["observation_scopes"], "shared")
+
+
+class ValueValidation(unittest.TestCase):
+    """An off-list scope must FAIL, not fall through to the engine default.
+
+    The value is invisible after the write: a typo would keep retaining
+    happily, the engine would apply its own default scope, and the damage
+    (a bank whose observations never merged) surfaces only much later. The
+    `memory.observation_scopes` zod enum is the primary gate, but it cannot
+    see a hand-edited settings.json or a raw HINDSIGHT_OBSERVATION_SCOPES
+    export — which is why this second gate exists here.
+
+    These fail against a `config.get("observationScopes")` that passes the raw
+    value straight through.
+    """
+
+    _BASE = {"retainRoles": ["user", "assistant"], "retainContext": "claude-code"}
+
+    def _build(self, config_extra):
+        config = dict(self._BASE, **config_extra)
+        return retain.build_retain_payload(
+            config, "sess", _transcript(2), _transcript(2),
+            bank_id="bank", api_url="http://fake", api_token=None,
+        )["payload"]
+
+    def test_every_accepted_value_resolves_to_itself(self):
+        for value in OBSERVATION_SCOPES_VALUES:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    resolve_observation_scopes({"observationScopes": value}), value
+                )
+
+    def test_unset_and_empty_resolve_to_none(self):
+        # Empty is UNSET, not a typo — matches the plugin's "an empty export
+        # hands authority back to the config file" idiom.
+        self.assertIsNone(resolve_observation_scopes({}))
+        self.assertIsNone(resolve_observation_scopes({"observationScopes": None}))
+        self.assertIsNone(resolve_observation_scopes({"observationScopes": ""}))
+        self.assertIsNone(resolve_observation_scopes({"observationScopes": "   "}))
+
+    def test_typo_raises_and_names_the_accepted_set(self):
+        with self.assertRaises(ValueError) as ctx:
+            resolve_observation_scopes({"observationScopes": "shred"})
+        msg = str(ctx.exception)
+        self.assertIn("shred", msg)
+        for value in OBSERVATION_SCOPES_VALUES:
+            self.assertIn(value, msg)
+
+    def test_wrong_case_raises(self):
+        with self.assertRaises(ValueError):
+            resolve_observation_scopes({"observationScopes": "Shared"})
+
+    def test_non_string_raises(self):
+        with self.assertRaises(ValueError):
+            resolve_observation_scopes({"observationScopes": ["shared"]})
+
+    def test_a_typo_never_reaches_the_payload(self):
+        # The outcome that matters: no payload is produced at all, so nothing
+        # is POSTed and nothing is queued at the wrong scope.
+        with self.assertRaises(ValueError):
+            self._build({"observationScopes": "shred"})
+
+    def test_a_typo_never_reaches_the_wire(self):
+        client = _RecordingClient("http://fake")
+        with self.assertRaises(ValueError):
+            self._build({"observationScopes": "per-tag"})  # hyphen, not underscore
+        self.assertEqual(client.bodies, [])
+
+    def test_env_var_typo_is_caught_too(self):
+        # The env path bypasses zod entirely, so this is the only gate on it.
+        with mock.patch.dict(os.environ, {"HINDSIGHT_OBSERVATION_SCOPES": "shred"},
+                             clear=True):
+            with self.assertRaises(ValueError):
+                resolve_observation_scopes(load_config())
 
 
 if __name__ == "__main__":  # pragma: no cover

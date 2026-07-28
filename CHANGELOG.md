@@ -35,6 +35,22 @@ from the request body entirely — not sent as null. A test asserts the unset
 body is byte-identical to the pre-change one. No bank is switched to shared
 scope by this change.
 
+That includes the **session-handoff mirror**, which lives outside the vendored
+plugin entirely: on shutdown switchroom POSTs the handoff briefing into the
+agent's own bank directly from TypeScript, so no amount of plumbing inside
+`vendor/hindsight-memory/` reaches it. Left alone it would have been the one
+row written at the old scope on a pooled bank — the kind of single exception
+you only discover once the bank is already inconsistent.
+
+**A typo is rejected, not ignored.** The value is checked against the set the
+engine accepts (`per_tag`, `combined`, `all_combinations`, `shared`) at
+`switchroom apply`, and again inside the plugin for the paths `apply` cannot
+see — a hand-edited `settings.json`, a raw `HINDSIGHT_OBSERVATION_SCOPES`
+export. `observation_scopes: shred` fails loudly the first time it fires rather
+than retaining quietly at the engine default; the handoff mirror is skipped
+rather than written at a scope nobody asked for. This knob is invisible after
+the write, so the only cheap moment to catch a mistake is before it lands.
+
 ## v0.19.28 — private memories can no longer be shipped to a paid outside provider by accident
 
 **The headline, in plain language.** Every agent's memories are meant to be

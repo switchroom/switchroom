@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import watermark
 from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
-from lib.config import debug_log, load_config
+from lib.config import debug_log, load_config, resolve_observation_scopes
 from lib.content import (
     prepare_retention_transcript,
     slice_last_turns_by_user_boundary,
@@ -266,6 +266,11 @@ def build_retain_payload(
 
     Returns ``{payload, document_id, message_count, last_uuid, ordered_uuids,
     transcript}`` or ``None`` when the slice formats to nothing.
+
+    Raises ``ValueError`` when ``observationScopes`` holds a value outside the
+    accepted set — see ``lib.config.resolve_observation_scopes``. Every retain
+    producer builds its payload here, so validating at this one seam covers all
+    of them, and a typo can never reach the wire or the pending queue.
     """
     retain_roles = config.get("retainRoles", ["user", "assistant"])
     include_tool_calls = config.get("retainToolCalls", True)
@@ -373,8 +378,12 @@ def build_retain_payload(
         # HindsightClient._retain_one, so the default request body is unchanged.
         # Carried ON THE PAYLOAD so it survives the pending-retains queue: a
         # retain that fails and drains hours later must land in the SAME scope
-        # it would have landed in inline.
-        "observation_scopes": config.get("observationScopes"),
+        # it would have landed in inline. Resolved (not read raw) so an
+        # off-list value RAISES here rather than riding to the wire: this is
+        # the one seam every retain producer funnels through, so validating
+        # here covers the Stop hook, sidechain, boot reconcile and backfill at
+        # once. See lib.config.resolve_observation_scopes.
+        "observation_scopes": resolve_observation_scopes(config),
     }
     return {
         "payload": payload,

@@ -40,6 +40,18 @@
   `test_reconcile_durability.py`, `test_subagent_retain.py` and
   `test_backfill.py`.
 
+  An off-list value RAISES rather than reaching the wire
+  (`resolve_observation_scopes` in `scripts/lib/config.py`, called from
+  `build_retain_payload`). Switchroom's config schema is the primary gate, but
+  it cannot see a hand-edited `settings.json` or a raw
+  `HINDSIGHT_OBSERVATION_SCOPES` export — and a scope is invisible after the
+  write, so a value quietly ignored today reads as a bank whose observations
+  never merged months later. Empty/whitespace stays UNSET, matching the
+  existing "an empty export hands authority back to the config file" idiom.
+  The accepted tuple (`OBSERVATION_SCOPES_VALUES`) is paired with
+  `src/memory/observation-scopes.ts` on the switchroom side; widening the set
+  means widening both.
+
 ### Changed (switchroom divergence)
 
 - **`MAX_DIRECTIVES` 15 → 30, and truncation is no longer SILENT**

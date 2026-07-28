@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { OBSERVATION_SCOPES } from "../memory/observation-scopes.js";
 
 /**
  * A single entry in an agent's code_repos list.
@@ -332,6 +333,40 @@ export const AgentToolsSchema = z
   })
   .optional();
 
+/**
+ * `memory.observation_scopes` — the per-row `observation_scopes` switchroom
+ * stamps on every retained Hindsight MemoryItem.
+ *
+ * Declared once and reused by BOTH `AgentMemorySchema` and the
+ * defaults/profile-tier mirror, so the two tiers cannot drift into accepting
+ * different sets.
+ *
+ * An ENUM, not a free string: the value is invisible after the write. A typo
+ * (`shred`) would apply clean, go on the wire, and leave the engine falling
+ * back to its own default scope — surfacing months later as a bank whose
+ * observations never merged. `switchroom apply` is the cheap place to catch
+ * that; the plugin re-validates in `lib/config.resolve_observation_scopes` for
+ * a hand-edited settings.json or raw env var, which this schema cannot reach.
+ */
+const ObservationScopesSchema = z
+  .enum(OBSERVATION_SCOPES)
+  .optional()
+  .describe(
+    "Per-row observation scope stamped on every memory this agent " +
+    "retains. \"shared\" makes Hindsight's consolidation write the " +
+    "resulting observations into ONE global untagged scope instead of a " +
+    "scope per tag — what several agents pooling one bank need so their " +
+    "observations actually merge rather than sitting in parallel " +
+    "per-tag silos. OMITTED BY DEFAULT: unset means the field never goes " +
+    "on the wire and the engine's own default stands, which is the " +
+    "shipped behaviour. Applies to every retain path (Stop hook, " +
+    "sidechain, boot reconcile, queue drain, backfill, session-handoff " +
+    "mirror) and is carried on the queued payload, so a retain that fails " +
+    "now and drains later still lands in this scope. Accepted values: " +
+    `${OBSERVATION_SCOPES.join(", ")}. ` +
+    "Cascade: override (per-agent wins over default)."
+  );
+
 export const AgentMemorySchema = z
   .object({
     collection: z.string().describe("Hindsight collection name for this agent"),
@@ -506,24 +541,7 @@ export const AgentMemorySchema = z
         "silent hook-side write). Set false to disable per-agent. " +
         "Cascade: override (per-agent wins over default)."
       ),
-    observation_scopes: z
-      .string()
-      .min(1)
-      .optional()
-      .describe(
-        "Per-row observation scope stamped on every memory this agent " +
-        "retains. \"shared\" makes Hindsight's consolidation write the " +
-        "resulting observations into ONE global untagged scope instead of a " +
-        "scope per tag — what several agents pooling one bank need so their " +
-        "observations actually merge rather than sitting in parallel " +
-        "per-tag silos. OMITTED BY DEFAULT: unset means the field never goes " +
-        "on the wire and the engine's own default stands, which is the " +
-        "shipped behaviour. Applies to every retain path (Stop hook, " +
-        "sidechain, boot reconcile, queue drain, backfill) and is carried on " +
-        "the queued payload, so a retain that fails now and drains later " +
-        "still lands in this scope. Cascade: override (per-agent wins over " +
-        "default)."
-      ),
+    observation_scopes: ObservationScopesSchema,
     recall: z
       .object({
         max_memories: z
@@ -3242,7 +3260,7 @@ const profileFields = {
       // Mirror of AgentMemorySchema.observation_scopes — accepted at the
       // defaults/profile tier too, so `defaults.memory.observation_scopes:
       // shared` pools a whole fleet's observations with per-agent opt-out.
-      observation_scopes: z.string().min(1).optional(),
+      observation_scopes: ObservationScopesSchema,
       recall: z
         .object({
           max_memories: z.number().int().min(0).optional(),

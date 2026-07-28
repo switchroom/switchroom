@@ -35,6 +35,11 @@
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import {
+  OBSERVATION_SCOPES_ENV,
+  observationScopesHint,
+  resolveObservationScopeFromEnv,
+} from "../memory/observation-scopes.js";
 
 export const DEFAULT_MAX_TURNS = 50;
 export const TOPIC_MAX_CHARS = 117;
@@ -229,6 +234,13 @@ export type BuildHandoffOpts = {
   hindsightUrl?: string;
   hindsightBankId?: string;
   fetch?: typeof fetch;
+  /**
+   * Environment the per-row observation scope is read from. Defaults to
+   * `process.env`; start.sh exports HINDSIGHT_OBSERVATION_SCOPES only when the
+   * operator set `memory.observation_scopes`. Injectable so the tests can pin
+   * the body without mutating the process env.
+   */
+  env?: NodeJS.ProcessEnv;
 };
 
 /**
@@ -276,12 +288,35 @@ async function mirrorToHindsight(
   if (!url) return;
   const fetchFn = opts.fetch ?? fetch;
   const endpoint = `${url.replace(/\/$/, "")}/v1/default/banks/${encodeURIComponent(bankId)}/memories`;
+  // This mirror writes a real memory into the agent's OWN bank, so it must
+  // carry the same per-row observation scope every other retain path carries.
+  // It sits OUTSIDE the vendored plugin, so nothing in lib/client.py reaches
+  // it — left unthreaded, an agent set to `shared` would pool every memory
+  // except its session handoffs, and the odd one out is invisible until the
+  // bank is already inconsistent.
+  //
+  // Unset (the default) omits the field entirely: byte-for-byte the
+  // pre-plumbing body. An invalid value FAILS CLOSED — skip the mirror and say
+  // why, rather than writing this memory at a scope nobody asked for. The
+  // sidecars are already on disk by now, so the next session still reorients;
+  // only the recallable copy is skipped.
+  const scope = resolveObservationScopeFromEnv(opts.env ?? process.env);
+  if (scope.kind === "invalid") {
+    process.stderr.write(
+      `handoff: hindsight mirror SKIPPED — ${OBSERVATION_SCOPES_ENV}=` +
+        `${JSON.stringify(scope.raw)} is not a valid observation scope ` +
+        `(accepted: ${observationScopesHint()}). Fix ` +
+        `memory.observation_scopes in switchroom.yaml.\n`,
+    );
+    return;
+  }
   const body = {
     items: [
       {
         content: briefing,
         document_id: "session_handoff",
         tags: ["session_handoff", opts.agentName],
+        ...(scope.kind === "set" ? { observation_scopes: scope.scope } : {}),
       },
     ],
     async: true,

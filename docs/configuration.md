@@ -561,6 +561,10 @@ agents:
 
 It applies to *every* retain path — the Stop hook, sub-agent (sidechain) retains, the boot reconciler, the pending-queue drain and the historical backfill — and the value is carried on the queued payload, so a retain that fails now and drains hours later still lands in the scope it was written for. Changing the knob does **not** re-scope already-consolidated observations; it binds new retains only.
 
+Accepted values are `per_tag`, `combined`, `all_combinations` and `shared` — the set Hindsight accepts. Anything else is **rejected at `switchroom apply`**, and the plugin raises rather than retaining if a bad value reaches it some other way (a hand-edited `settings.json`, a raw `HINDSIGHT_OBSERVATION_SCOPES` export). A silently-ignored typo would keep retaining at the engine default and only surface months later as a bank whose observations never merged.
+
+It also covers the session-handoff mirror — the briefing switchroom writes into the agent's own bank on shutdown. If the value is invalid, that mirror is **skipped** rather than written at the wrong scope; the on-disk handoff sidecars are unaffected, so the next session still reorients.
+
 **Cascade: override** (per-agent wins over profile/defaults). `start.sh` exports `HINDSIGHT_OBSERVATION_SCOPES` only when you set it. Serves the `remember-across-sessions` job.
 
 ### Server-side caps on the Hindsight container
