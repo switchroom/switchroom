@@ -332,6 +332,47 @@ export function isHindsightEnabled(
  * look like narration — it reads as a durable system fact. A prompt cannot be
  * expected to win that one; if it needs closing it wants a deterministic
  * pre-retain filter, which is deliberately NOT in this PR.
+ *
+ * 2026-07-28 (volatile-state pass — the "Volatile state written as a timeless
+ * assertion" bullet). A SECOND failure class, distinct from tool exhaust and
+ * not addressed by the pass above: point-in-time state facts retained as bare
+ * timeless assertions, which nothing ever supersedes and which therefore recall
+ * forever as though still true.
+ *
+ * Measured on bank `klanker` (2026-07-28), not argued. The query "what version
+ * is the switchroom fleet running right now" returned 38 results. Top hit:
+ * `Switchroom fleet is running image version v0.18.19` — retained 2026-07-19
+ * and wrong by then — followed by v0.19.6, v0.19.8, v0.18.7 and v0.16.49. The
+ * correct current value did not appear at all. The same query surfaced FIVE
+ * near-identical copies of one "the repo is at <path>, version v0.19.5" fact,
+ * retained on different days.
+ *
+ * Note what this is NOT: not a consolidation failure (consolidation rewrites
+ * the observation when a new fact contradicts an old one, but the stale raw
+ * fact survives and still recalls), and not something the dedup threshold can
+ * reach (`_dedup_adjudicate` probes `["observation"]` only — see the note on
+ * the dedup threshold in src/setup/hindsight-perf-defaults.ts). The read-time
+ * lever is `prefer_observations`, already on by default. The retain-time lever
+ * is this bullet: stop creating the undated assertion in the first place.
+ *
+ * The existing "Transient state ... unless the fact is explicitly dated" bullet
+ * was live on klanker's bank from 2026-07-25 09:19 and did not stop any of the
+ * above, so it is kept (the 2026-07-25 finding that removing bullets regresses
+ * extraction stands) and a stronger bullet is added ABOVE it. The new bullet
+ * follows the shape the 2026-07-28 A/B proved out rather than inventing a new
+ * one: a subject test ("a version, count, size, backlog, status ... is true
+ * only at the instant it was said"), verbatim negative exemplars lifted from
+ * units that actually leaked into the live bank, and an explicit repair
+ * instruction (date it inline, else drop) so the model has somewhere to put a
+ * claim that IS worth keeping.
+ *
+ * HONESTLY BOUNDED — this bullet was NOT re-run through the 52-chunk offline
+ * A/B that chose the text above; it is justified by the live-bank measurement
+ * plus consistency with that pass's proven shape. It is additive (no existing
+ * bullet was removed or reworded), which bounds the regression risk to
+ * "extraction gets slightly more conservative", and the positive counterweight
+ * sentence is untouched. If it needs stronger evidence, re-run the A/B harness
+ * described above with this as arm C.
  */
 export const DEFAULT_RETAIN_MISSION =
   "Extract durable facts that will still be true and useful weeks from now: user preferences and standing rules, ongoing projects and recurring commitments, technical and architectural decisions with their rationale, and people/tool relationships. A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
@@ -359,6 +400,16 @@ export const DEFAULT_RETAIN_MISSION =
   "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
   "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
+  "- Volatile state written as a timeless assertion. A version, count, size,\n" +
+  "  backlog, status, or any \"X is running Y\" / \"X is at Y\" / \"X is currently Y\"\n" +
+  "  claim is true only at the instant it was said. Concretely, never produce a\n" +
+  "  fact whose text resembles any of these: \"Switchroom fleet is running image\n" +
+  "  version v0.18.19\", \"The switchroom repo is at /path/to/fleet, version\n" +
+  "  v0.19.5\", \"Bank overlord has 43155 pending consolidations\", \"The build is\n" +
+  "  currently green\". If the claim is worth keeping, put the date INSIDE the\n" +
+  "  fact text (\"As of 2026-07-19 the fleet was running v0.18.19\"); if you\n" +
+  "  cannot date it, drop it. An undated one is recalled forever as though it\n" +
+  "  were still true, which is worse than not remembering it at all.\n" +
   "- Transient state (unread counts, build status, what is running right now) unless\n" +
   "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
   "- Greetings, acknowledgements, and routine operational chatter.\n" +
@@ -437,6 +488,42 @@ export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
   "- Greetings, acknowledgements, and routine operational chatter.\n\n" +
   "If a candidate fact matches an exclusion, drop it rather than rewording " +
   "it. If nothing durable remains, return an empty facts list.",
+  // (2026-07-28 tool-exhaust pass, #3878) — the A/B-selected arm B. This is
+  // the text every live bank was carrying when the volatile-state bullet was
+  // added below it. Reproduced verbatim from the outgoing literal, line for
+  // line, so `isUpgradableRetainMission` still byte-matches a bank that has
+  // it and can upgrade rather than treating it as an operator customization.
+  "Extract durable facts that will still be true and useful weeks from now: user preferences and standing rules, ongoing projects and recurring commitments, technical and architectural decisions with their rationale, and people/tool relationships. A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "\n" +
+  "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
+  "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
+  "the location where some output was written? If yes, drop it — it is transcript\n" +
+  "exhaust, not memory.\n" +
+  "\n" +
+  "NEVER extract:\n" +
+  "- Tool results verbatim or paraphrased. Concretely, never produce a fact whose\n" +
+  "  text resembles any of these: \"File created successfully at /path/to/file\",\n" +
+  "  \"A background command with ID bctz4yskm is running, and its output will be\n" +
+  "  written to /tmp/...\", \"Async agent a745598ba84e71df1 was launched successfully\n" +
+  "  and is running in the background\", \"User executed a Bash command to sleep for\n" +
+  "  200 seconds\", \"The assistant used grep to locate 'truncateSync' in src/foo.ts\".\n" +
+  "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
+  "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
+  "  running) — retain the outcome only once the task completes or a decision is made.\n" +
+  "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Slash commands the user typed and their effects (e.g. \"User issued /clear to\n" +
+  "  reset assistant state\").\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
+  "  system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) unless\n" +
+  "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n" +
+  "\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
+  "nothing durable remains, return an empty facts list.",
 ];
 
 /**

@@ -568,6 +568,108 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT = 6;
 /** Reserved consolidation slot FLOOR — see SLOT_LIMIT above for floor-vs-ceiling. */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
 
+/**
+ * Age→freshness curve used by the reranker's recency boost (upstream default
+ * `"linear"`; validated set is `linear | exponential | none`, config.py:907).
+ *
+ * ## The failure this addresses
+ *
+ * Agent banks accumulate point-in-time state facts that nothing ever
+ * supersedes. Measured on bank `klanker` (2026-07-28): the query "what version
+ * is the switchroom fleet running right now" returned 38 results whose top hit
+ * was `Switchroom fleet is running image version v0.18.19` — retained
+ * 2026-07-19 and wrong by then — followed by v0.19.6, v0.19.8, v0.18.7 and
+ * v0.16.49. The correct current value did not appear at all. A confidently
+ * wrong answer is worse than an empty one.
+ *
+ * Under upstream's `linear` curve the recency signal decays to a 0.1 floor over
+ * `linear_window_days`, which defaults to **365**. Across the age range a real
+ * bank actually spans (days to a few months) that is a nearly flat line: at 9
+ * days the signal is 0.975 and at 90 days it is still 0.753. Recency is
+ * nominally enabled and practically absent.
+ *
+ * `exponential` is the right SHAPE for state facts, because its half-life is
+ * defined as the age at which the signal is exactly neutral — younger memories
+ * are boosted, older ones penalised, with a smooth asymptote and no hard cutoff
+ * (`compute_recency_decay`, reranking.py). Set the half-life to the age past
+ * which a "current state" claim should stop being presumed current, and the
+ * curve does the rest.
+ *
+ * ## HONEST MAGNITUDE — read this before claiming it fixes staleness
+ *
+ * It does not, on its own, and the reason is switchroom's OWN fork. The
+ * combined boost is damped by `_boost_authority` (reranking.py, marked
+ * `# switchroom:`), which raises the recency × temporal × proof_count product
+ * to an exponent derived from `_CE_DECISIVE_RELATIVE_GAP` (default `0.02`,
+ * overridable via `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP`):
+ *
+ *   combined_score = CE_normalized * (recency_boost * temporal_boost *
+ *                                     proof_count_boost) ** exponent
+ *
+ * At the shipped alphas (0.2 / 0.2 / 0.1) and gap 0.02 that exponent is
+ * **0.0395**. Computed against the container's own `compute_recency_decay`,
+ * the full freshest-vs-oldest recency spread is:
+ *
+ *   linear / 365d (upstream default)  1 day vs 400 days  →  +0.71%
+ *   exponential / 30d (this default)  1 day vs 400 days  →  +0.78%
+ *
+ * So this default moves the ranking by ~0.07 percentage points today. It is
+ * shipped because it is free, because it is the correct curve for the ages
+ * banks actually span, and because the moment the CE gap is revisited it is
+ * the difference between a working recency signal and a flat one — NOT because
+ * it fixes the measured symptom by itself. The binding constraint is the
+ * decisive-gap exponent, which reverses a deliberate switchroom decision made
+ * on measured cross-encoder saturation and therefore needs its own measured
+ * change rather than a guess bundled in here.
+ *
+ * That change already has a lever and a documented shape: raising
+ * `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP` to ~0.65 or above clamps the exponent to
+ * 1.0 and restores full upstream boost authority (see that key's entry under
+ * {@link HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS}), at which point the exponential/30d
+ * curve shipped here yields a ±21% freshest-vs-oldest spread instead of ±0.8%.
+ * Deliberately NOT done here.
+ *
+ * `compute_recency_decay` is reached from exactly one call site
+ * (`apply_combined_scoring`, memory_engine.py), so there is no undamped path
+ * where this default has more authority than the numbers above.
+ */
+export const HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION = "exponential";
+
+/**
+ * Exponential half-life in days (upstream default `90`).
+ *
+ * The half-life is the age at which the recency signal is exactly neutral, so
+ * it is a direct statement of "how long a current-state claim stays presumed
+ * current". 30 days: a fact retained this week is boosted, one from last month
+ * is neutral, one from last quarter is penalised (signal 0.125 at 90 days).
+ *
+ * Upstream's 90 puts the neutral point a full quarter out, which for a fleet
+ * whose version, backlog and status facts turn over weekly is indistinguishable
+ * from the flat linear curve this replaces.
+ *
+ * Note the pairing: this value is only read when the decay function is
+ * `exponential` (`compute_recency_decay` ignores it otherwise), and an operator
+ * who overrides only the function back to `linear` gets
+ * {@link HINDSIGHT_DEFAULT_RECENCY_DECAY_LINEAR_WINDOW_DAYS} instead.
+ */
+export const HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 30;
+
+/**
+ * `HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD` is deliberately LEFT at
+ * upstream's 0.97 and is NOT a managed key here.
+ *
+ * The duplicate-fact symptom that motivated this module's freshness defaults
+ * (five near-identical copies of one "repo is at <path>, version v0.19.5" fact
+ * on bank `klanker`, retained on different days) is a RAW-fact duplication, and
+ * this knob cannot touch it: `_dedup_adjudicate`
+ * (engine/consolidation/consolidator.py) probes
+ * `retrieve_semantic_bm25_combined(..., ["observation"], ...)` — observation
+ * against observation only. Lowering the threshold would merge more distinct
+ * *observations*, i.e. spend real precision for zero effect on the reported
+ * bug. Raw-fact duplication is handled at read time by `prefer_observations`
+ * instead (already on by default; see vendor/hindsight-memory/scripts/recall.py).
+ */
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -622,6 +724,14 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
   [
     "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
     String(HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND),
+  ],
+  [
+    "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
+    HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION,
+  ],
+  [
+    "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
+    String(HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS),
   ],
 ];
 
@@ -712,10 +822,26 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *   env:
  *     HINDSIGHT_CE_DECISIVE_RELATIVE_GAP: "1.0"   # damping off, patch inert
  * ```
+ *
+ * ### `HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS`
+ *
+ * Inert under the shipped decay function — {@link
+ * HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION} is `exponential`, and
+ * `compute_recency_decay` reads the linear window only on the `linear` branch.
+ * It is managed anyway because an operator who sets
+ * `HINDSIGHT_API_RECENCY_DECAY_FUNCTION: linear` in `hindsight.env` would
+ * reasonably set the window on the next line, and a key absent from {@link
+ * HINDSIGHT_PERF_ENV_KEYS} is silently discarded while reading, in yaml, as
+ * durable config — the exact trap this key set was scoped to prevent.
+ *
+ * Override-only rather than defaulted for the same reason as the two above:
+ * emitting upstream's own 365 would add a hard-coded value to every host's
+ * `docker inspect` for no behaviour change.
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
   "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
+  "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS",
 ]);
 
 /**

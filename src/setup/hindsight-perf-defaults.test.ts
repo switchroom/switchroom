@@ -21,6 +21,8 @@
  *      constant, so raising the budget can't silently invert the property.
  */
 
+import { readFileSync } from "node:fs";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { execFileSyncMock } = vi.hoisted(() => ({ execFileSyncMock: vi.fn() }));
@@ -33,6 +35,8 @@ import {
   HINDSIGHT_DEFAULT_LINK_EXPANSION_PER_ENTITY_LIMIT,
   HINDSIGHT_DEFAULT_LINK_EXPANSION_TIMEOUT_S,
   HINDSIGHT_DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE,
+  HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION,
+  HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS,
   HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT,
   HINDSIGHT_PERF_DEFAULTS_GPU,
   HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
@@ -183,6 +187,8 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
+      "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
+      "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -321,7 +327,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twenty-three keys, by name", () => {
+  it("is overridable on exactly these twenty-six keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -341,6 +347,9 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
       "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
+      "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
+      "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
+      "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS",
       "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
       "HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE",
       "HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING",
@@ -642,6 +651,249 @@ describe("HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE (managed, was hard-coded)", (
     const perf = { env: { [KEY]: "250" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["250"]);
+  });
+});
+
+// ── recall freshness: the recency decay curve ─────────────────────────────
+//
+// The failure these protect against, measured on bank `klanker` 2026-07-28:
+// "what version is the switchroom fleet running right now" returned 38 results
+// topped by `Switchroom fleet is running image version v0.18.19` — retained
+// 2026-07-19 and wrong by then — with the correct current value absent
+// entirely. Upstream's `linear` curve over a 365-day window is nearly flat
+// across the age range a real bank spans, so a nine-day-old state fact and
+// today's are effectively tied on recency.
+//
+// These assert the RANKING-RELEVANT OUTCOME (how far apart the curve puts two
+// facts a bank actually holds), not that a string got emitted, so they fail on
+// upstream's default rather than merely on a typo.
+
+/**
+ * Port of the container's `compute_recency_decay`
+ * (hindsight_api/engine/search/reranking.py) — age in days → freshness signal
+ * in [0, 1], neutral 0.5. Mirrored rather than imported because it is Python
+ * inside the hindsight image; the shapes are quoted from the upstream
+ * docstring in hindsight-perf-defaults.ts.
+ */
+function computeRecencyDecay(
+  daysAgo: number,
+  fn: string,
+  linearWindowDays: number,
+  halflifeDays: number,
+): number {
+  if (fn === "none") return 0.5;
+  if (fn === "exponential") {
+    if (halflifeDays <= 0) return 0.5;
+    return Math.min(1, 0.5 ** (daysAgo / halflifeDays));
+  }
+  const window = linearWindowDays > 0 ? linearWindowDays : 365;
+  return Math.max(0.1, Math.min(1, 1 - daysAgo / window));
+}
+
+describe("recency decay defaults — freshness the reranker can actually see", () => {
+  const FN_KEY = "HINDSIGHT_API_RECENCY_DECAY_FUNCTION";
+  const HALFLIFE_KEY = "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS";
+  const WINDOW_KEY = "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  // Upstream's shipped values (config.py DEFAULT_RECENCY_DECAY_*), i.e. exactly
+  // what a bank gets with no switchroom default — the buggy baseline.
+  const UPSTREAM_FN = "linear";
+  const UPSTREAM_WINDOW = 365;
+  const UPSTREAM_HALFLIFE = 90;
+
+  /** The curve switchroom actually emits, read back out of the generator. */
+  const shipped = () => {
+    const pairs = new Map(hindsightPerfEnv({ gpu: false, localLlm: false }));
+    return { fn: pairs.get(FN_KEY)!, halflife: Number(pairs.get(HALFLIFE_KEY)!) };
+  };
+
+  it.each(CAPS)(
+    "ships an exponential curve on every host (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Ungated: the right curve does not depend on hardware, and behind a gate
+      // this would silently fall back to upstream's flat linear window on any
+      // host lacking the gate.
+      const pairs = hindsightPerfEnv(caps);
+      expect(pairs).toContainEqual([FN_KEY, HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION]);
+      expect(pairs).toContainEqual([
+        HALFLIFE_KEY,
+        String(HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS),
+      ]);
+    },
+  );
+
+  it("only emits a curve name the container's validator accepts", () => {
+    // config.py RECENCY_DECAY_FUNCTIONS — an unrecognised name is logged and
+    // silently replaced with "linear", i.e. a typo here would ship as a no-op.
+    expect(["linear", "exponential", "none"]).toContain(
+      HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION,
+    );
+    expect(HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS).toBeGreaterThan(0);
+  });
+
+  // ── THE OUTCOME TEST ──
+  //
+  // Fails on the original bug: under upstream's linear/365 the two facts in the
+  // measured klanker case (today's correct version vs the 9-day-old wrong one)
+  // sit 0.022 apart on a [0,1] signal. Nothing downstream can recover a
+  // preference the curve never expressed.
+  it("separates a fresh state fact from a nine-day-old one, where upstream does not", () => {
+    const { fn, halflife } = shipped();
+    const fresh = 1;
+    const stale = 9; // v0.19.27 (today) vs v0.18.19 (retained 2026-07-19)
+
+    const shippedGap =
+      computeRecencyDecay(fresh, fn, UPSTREAM_WINDOW, halflife) -
+      computeRecencyDecay(stale, fn, UPSTREAM_WINDOW, halflife);
+    const upstreamGap =
+      computeRecencyDecay(fresh, UPSTREAM_FN, UPSTREAM_WINDOW, UPSTREAM_HALFLIFE) -
+      computeRecencyDecay(stale, UPSTREAM_FN, UPSTREAM_WINDOW, UPSTREAM_HALFLIFE);
+
+    // Absolute floor: the fresher fact must lead by a tenth of the signal
+    // range, not by rounding noise.
+    expect(shippedGap).toBeGreaterThan(0.1);
+    // And by a large multiple of what upstream expresses, so a half-life
+    // quietly raised back toward 90 fails here.
+    expect(shippedGap).toBeGreaterThan(upstreamGap * 5);
+    // Pin the baseline too, so this cannot start passing because the baseline
+    // moved rather than because our curve is good.
+    expect(upstreamGap).toBeLessThan(0.03);
+  });
+
+  it("puts the neutral point at the half-life, so it states how long state is presumed current", () => {
+    const { fn, halflife } = shipped();
+    // The half-life is defined as the age at which the signal is exactly
+    // neutral (no boost, no penalty) — that is what makes it a legible
+    // statement of policy rather than an opaque tuning constant.
+    expect(computeRecencyDecay(halflife, fn, UPSTREAM_WINDOW, halflife)).toBeCloseTo(0.5, 10);
+    // Older than that is actively penalised, not merely un-boosted.
+    expect(computeRecencyDecay(halflife * 3, fn, UPSTREAM_WINDOW, halflife)).toBeLessThan(0.2);
+  });
+
+  it("does not penalise a future-dated memory", () => {
+    // reranking.py clamps negative days_ago to maximum freshness; the
+    // exponential branch relies on its min(1.0, ...) clamp to do it. A curve
+    // returning >1 here would push a boost outside its documented range.
+    const { fn, halflife } = shipped();
+    expect(computeRecencyDecay(-30, fn, UPSTREAM_WINDOW, halflife)).toBe(1);
+  });
+
+  // ── HONESTY PIN ──
+  //
+  // The doc comment on HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION states plainly
+  // that this default is ~a no-op TODAY, because switchroom's own
+  // CE-saturation patch damps the boost product, and that the binding
+  // constraint is the decisive gap. If that stops being true the doc must be
+  // rewritten, so pin the arithmetic rather than trusting prose.
+  it("is damped to under 1% by the CE-saturation patch until the decisive gap moves", () => {
+    // Read the gap out of the patch source instead of duplicating it, so the
+    // two cannot drift.
+    const dockerfile = readFileSync(
+      new URL("../../docker/Dockerfile.hindsight", import.meta.url),
+      "utf-8",
+    );
+    const m = /_CE_DECISIVE_RELATIVE_GAP_DEFAULT: float = ([\d.]+)/.exec(dockerfile);
+    expect(m, "CE-saturation patch no longer declares a decisive-gap default").not.toBeNull();
+    const gap = Number(m![1]);
+
+    // Alphas as shipped by upstream reranking.py (recency, temporal, proof).
+    const alphas = [0.2, 0.2, 0.1];
+    let hi = 1;
+    let lo = 1;
+    for (const a of alphas) {
+      hi *= 1 + a / 2;
+      lo *= 1 - a / 2;
+    }
+    const exponent = Math.min(1, Math.log1p(gap) / Math.log(hi / lo));
+
+    const { fn, halflife } = shipped();
+    const damped = (r: number) => (1 + alphas[0] * (r - 0.5)) ** exponent;
+    const freshest = computeRecencyDecay(1, fn, UPSTREAM_WINDOW, halflife);
+    const oldest = computeRecencyDecay(400, fn, UPSTREAM_WINDOW, halflife);
+
+    // Under 1% end-to-end today. This is the number the doc comment quotes.
+    expect(damped(freshest) / damped(oldest)).toBeLessThan(1.01);
+    // Clamping the exponent to 1.0 (what raising the gap to ~0.65 does) unlocks
+    // it — proving the curve is not itself the limiter, which is the whole
+    // claim the doc comment makes.
+    const undamped =
+      (1 + alphas[0] * (freshest - 0.5)) / (1 + alphas[0] * (oldest - 0.5));
+    expect(undamped).toBeGreaterThan(1.2);
+  });
+
+  // ── OVERRIDABILITY ──
+
+  it("the operator's curve REPLACES the default on BOTH launch paths", () => {
+    const perf = { env: { [FN_KEY]: "linear", [WINDOW_KEY]: "120" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    // Exactly one value, not the default AND the override.
+    expect(fromRun.get(FN_KEY)).toEqual(["linear"]);
+    expect(fromCompose.get(FN_KEY)).toEqual(["linear"]);
+    // The linear window is override-only, so it appears only because the
+    // operator asked — and it MUST appear, or a `linear` override would
+    // silently take upstream's 365 back.
+    expect(fromRun.get(WINDOW_KEY)).toEqual(["120"]);
+    expect(fromCompose.get(WINDOW_KEY)).toEqual(["120"]);
+  });
+
+  it("an operator half-life survives and is not re-defaulted", () => {
+    const perf = { env: { [HALFLIFE_KEY]: "7" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(HALFLIFE_KEY)).toEqual(["7"]);
+  });
+
+  it("an operator value exported in switchroom's own environment also wins", () => {
+    const overrides = resolveHindsightPerfOverrides({}, { [FN_KEY]: "none" });
+    expect(
+      new Map(hindsightPerfEnv({ gpu: false, localLlm: false }, overrides)).get(FN_KEY),
+    ).toBe("none");
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [FN_KEY]: "none" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(FN_KEY)).toEqual(["none"]);
+  });
+
+  it("is emitted exactly once per path when NOT overridden", () => {
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, {
+      env: {},
+      processEnv: {},
+    });
+    expect(runEnv(runArgs()).get(FN_KEY)).toEqual([HINDSIGHT_DEFAULT_RECENCY_DECAY_FUNCTION]);
+    // The override-only linear window must NOT be emitted unasked — emitting
+    // upstream's own 365 would add a hard-coded value for no behaviour change.
+    expect(runEnv(runArgs()).get(WINDOW_KEY)).toBeUndefined();
+  });
+
+  it("keeps all three keys managed, so a hindsight.env line is never silently dropped", () => {
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(FN_KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(HALFLIFE_KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(WINDOW_KEY)).toBe(true);
+    // Curve + half-life are defaulted; the linear window is override-only.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(FN_KEY)).toBe(false);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(HALFLIFE_KEY)).toBe(false);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(WINDOW_KEY)).toBe(true);
+  });
+
+  it("leaves the consolidation dedup threshold alone", () => {
+    // Deliberate: `_dedup_adjudicate` probes ["observation"] only, so this knob
+    // cannot deduplicate the RAW-fact duplicates that motivated this work — it
+    // would only merge distinct observations more aggressively. Managing it
+    // here would imply we think it helps.
+    expect(
+      HINDSIGHT_PERF_ENV_KEYS.has("HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD"),
+    ).toBe(false);
   });
 });
 
