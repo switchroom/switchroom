@@ -126,6 +126,7 @@ jobs:
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
               - 'tests/docker/hindsight-graph-seed-patch.test.ts'
+              - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -359,10 +360,24 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-graph-seed-patch.test.ts
 
+      - name: Run the hindsight maxItems-grammar probe (RED/GREEN, must not skip)
+        # Same contract again, for the consolidation-maxItems-grammar patch.
+        # The bakes test cannot cover the failure that matters here: its
+        # assertions are unanchored substring matches, so raising the ceiling
+        # (or reinstating a clamp that still emits a four-digit maxItems) keeps
+        # every grepped literal green while the schema is once again
+        # uncompilable by a local GBNF backend — and every consolidation call on
+        # a large bank silently falls over to the metered provider, carrying
+        # private corpus text off-host. Only serialising the model and reading
+        # the emitted maxItems catches that.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-maxitems-grammar-patch.test.ts
+
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

@@ -2581,6 +2581,148 @@ print(
 )
 PYEOF
 
+# ── consolidation maxItems grammar patch ──────────────────────────────────────
+# Stop the consolidation response schema emitting a `maxItems` so large that a
+# local grammar-constrained backend cannot compile it — which is what silently
+# routes private corpus content to a METERED third party.
+#
+# THE DEFECT, in the real shipping source.
+# `_build_response_model()` (engine/consolidation/consolidator.py) constrains the
+# `creates` field with `PydanticField(default=[], max_length=clamped)`, which
+# pydantic serialises into the request's JSON schema as `"maxItems": <clamped>`.
+# Its only caller passes `max_creates=remaining_observation_slots` — the bank's
+# REMAINING OBSERVATION-SLOT COUNT (`remaining_observation_slots = max(max_obs -
+# current_count, 0)`), not a modelling constraint. On this fleet that number is
+# ~4,230 for a cohort of banks.
+#
+# llama.cpp/Ollama compile a JSON schema down to a GBNF grammar, and a
+# repetition count that large fails to build. Measured on this host
+# (2026-07-28), the consolidation deployment returns:
+#
+#   HTTP 400 {"error":{"code":400,"message":"Failed to initialize samplers:
+#            failed to parse grammar","type":"invalid_request_error"}}
+#
+# LiteLLM's router-level fallback then re-sends the SAME call — batch prompt and
+# all, up to `CONSOLIDATION_LLM_BATCH_SIZE` memories of verbatim private corpus
+# text — to the metered OpenRouter deployment. 56 such fallbacks are visible in
+# the proxy's log for `Received Model Group=gpt-oss-20b-consolidation`. It is
+# deterministic per bank: a bank with ~4,230 remaining slots fails EVERY time,
+# a bank with ~670 compiles fine (threshold measured between 672 and 4,223).
+# The fallback rule itself is deliberately NOT touched here — removing it before
+# this fix lands would convert a leak into hard consolidation failures.
+#
+# WHY OMIT RATHER THAN CLAMP. Clamping to a smaller number would move the
+# threshold and keep the class of bug; it would also assert a bound that is not
+# true. The cap is a RESOURCE GUARD, not something the model needs to see:
+#   * `CONSOLIDATION_LLM_BATCH_SIZE=6`, so one batch sees 6 memories and can
+#     never approach 4,230 — above a small ceiling the constraint cannot bind.
+#   * The slot cap is ALREADY enforced in Python after validation, regardless of
+#     the schema — consolidator.py's "Defensive truncation: some LLM providers
+#     may not enforce JSON schema max_length" trims `creates` to
+#     `remaining_observation_slots`. Nothing is lost by dropping the hint.
+#   * When the cap is genuinely tight the model is ALSO told in prose: the
+#     `observation_capacity_note` branch fires whenever
+#     `remaining_observation_slots <= len(memories)`.
+# So the constraint is kept exactly where it is real and compiles trivially
+# (<= 64, ~10x below the measured failure threshold) and omitted where it is
+# pure resource accounting. `maxItems` is then either a binding truth or absent.
+#
+# Self-verifying (exact-once anchors, re-asserted after the splice, `ast.parse`
+# on the result); guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
+# unpatched upstream / GREEN patched) by
+# tests/docker/hindsight-maxitems-grammar-patch.test.ts, which builds the schema
+# at the production-like 4,230 and asserts the emitted `maxItems`.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+BASE = pathlib.Path("/app/api/hindsight_api")
+TAG = "switchroom hindsight consolidation-maxItems-grammar patch"
+
+
+def apply(rel, edits):
+    f = BASE / rel
+    s = f.read_text()
+    for anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == 1, (
+            f"{TAG}: anchor found {n}x (expected 1) in {rel} — upstream "
+            "reformatted _build_response_model; re-author this patch in "
+            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+        )
+        s = s.replace(anchor, repl, 1)
+    f.write_text(s)
+    ast.parse(s)
+    return s
+
+
+new = apply("engine/consolidation/consolidator.py", [
+    (
+        "def _build_response_model(max_creates: int | None = None) -> type[_ConsolidationBatchResponse]:\n"
+        '    """Build a response model, optionally constraining max creates via JSON schema."""\n'
+        "    if max_creates is None or max_creates < 0:\n"
+        "        return _ConsolidationBatchResponse\n"
+        "\n"
+        "    from pydantic import Field as PydanticField\n",
+
+        "# switchroom: the largest `maxItems` this schema may emit. A local\n"
+        "# grammar-constrained backend (llama.cpp/Ollama) compiles the response schema\n"
+        "# into GBNF, and a repetition count in the thousands fails to build:\n"
+        '# HTTP 400 "Failed to initialize samplers: failed to parse grammar". LiteLLM\n'
+        "# then falls the call over to a METERED deployment, sending the batch's\n"
+        "# verbatim private corpus text off-host. 64 is ~10x below the measured\n"
+        "# failure threshold (672 compiles, 4,223 does not) and still an order of\n"
+        "# magnitude above anything one batch could emit\n"
+        "# (CONSOLIDATION_LLM_BATCH_SIZE=6).\n"
+        "SWITCHROOM_MAX_CREATES_SCHEMA_CEILING = 64\n"
+        "\n"
+        "\n"
+        "def _build_response_model(max_creates: int | None = None) -> type[_ConsolidationBatchResponse]:\n"
+        '    """Build a response model, optionally constraining max creates via JSON schema."""\n'
+        "    if max_creates is None or max_creates < 0:\n"
+        "        return _ConsolidationBatchResponse\n"
+        "\n"
+        "    # switchroom: omit the constraint entirely when it cannot bind. The caller\n"
+        "    # passes the bank's REMAINING OBSERVATION-SLOT COUNT, a resource guard\n"
+        "    # rather than a modelling constraint — above the ceiling it only breaks\n"
+        "    # grammar compilation. The cap is still enforced: the caller truncates\n"
+        "    # `creates` to remaining_observation_slots after validation regardless of\n"
+        "    # the schema, and a genuinely tight cap is also stated in prose via\n"
+        "    # observation_capacity_note.\n"
+        "    if max_creates > SWITCHROOM_MAX_CREATES_SCHEMA_CEILING:\n"
+        "        return _ConsolidationBatchResponse\n"
+        "\n"
+        "    from pydantic import Field as PydanticField\n",
+    ),
+])
+
+# The Python-side enforcement this patch relies on must still be there: without
+# it, omitting `maxItems` really would drop the cap.
+assert "creates = creates[:remaining_observation_slots]" in new, (
+    f"{TAG}: the post-validation truncation to remaining_observation_slots is gone "
+    "from consolidator.py — omitting maxItems would now DROP the observation cap. "
+    "Re-author this patch."
+)
+assert new.count("_build_response_model(max_creates=remaining_observation_slots)") == 1, (
+    f"{TAG}: _build_response_model is no longer called with "
+    "remaining_observation_slots — re-author this patch."
+)
+assert new.count("SWITCHROOM_MAX_CREATES_SCHEMA_CEILING") == 2, (
+    f"{TAG}: ceiling constant not spliced exactly once plus its use"
+)
+assert new.count("max_length=clamped") == 1, (
+    f"{TAG}: the constrained field vanished — the ceiling now guards nothing"
+)
+
+print(
+    "switchroom hindsight consolidation-maxItems-grammar patch: the consolidation "
+    "response schema now omits maxItems above 64 instead of emitting the bank's "
+    "remaining-slot count, so a local grammar backend can compile it and the call "
+    "no longer falls over to a metered provider"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in
