@@ -141,6 +141,10 @@ switchroom workspace status <agent>               # git status on the workspace
 switchroom debug turn <agent>                     # Dump the exact prompt layering from the last turn
 switchroom memory setup|search|stats|reflect      # Hindsight memory
 switchroom memory repair --all [--dry-run]        # Rebuild per-bank vector index coverage
+switchroom memory recall-log [agent] [-n <N>]     # Tail the per-turn auto-recall log
+switchroom memory demote <agent> <memory-id>      # Drop one memory out of auto-recall
+switchroom memory profile add|list <bank> ...     # Author + inspect operator profile banks
+switchroom memory docker-compose                  # Print a Hindsight compose snippet
 ```
 
 `memory repair` is the fix for a bank whose recall silently under-returns —
@@ -148,6 +152,19 @@ one that arrived already populated (restore, cross-version upgrade,
 vector-extension switch) and so never got its per-`(bank, fact_type)` vector
 indexes. Idempotent, `CREATE INDEX CONCURRENTLY`, safe on a live fleet;
 requires hindsight ≥ 0.8.5. See `docs/operators/hindsight-memory.md`.
+
+`memory profile` is the authoring path for the shared / per-user profile
+banks you point `memory.recall.additional_banks` at: `add` writes an
+operator-authored fact (creating the bank on first write), `list` shows what
+is in one. See
+[configuration.md § Shared / profile recall banks](configuration.md#shared--profile-recall-banks--memoryrecalladditional_banks).
+
+`memory recall-log` tails what auto-recall actually injected per turn, and
+`memory demote` tags a single memory out of auto-recall while leaving it
+queryable via `recall` / `reflect`. See
+[configuration.md § Inspecting auto-recall in production](configuration.md#inspecting-auto-recall-in-production--switchroom-memory-recall-log)
+and
+[§ Demoting individual memories from auto-recall](configuration.md#demoting-individual-memories-from-auto-recall).
 
 
 The progress-card driver also writes a per-agent `card-events.jsonl`
