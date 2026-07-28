@@ -57,6 +57,17 @@
  * `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` is deliberately untouched (150).
  * The rejection rationale is recorded at
  * src/setup/hindsight-reranker-budget.test.ts:111-118.
+ *
+ * `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` is NOT a default here and must
+ * not become one. It is *derived* from the declared context window by
+ * `resolveHindsightContextBudget()` (`hindsight-context-budget.ts`, the
+ * `batchSize = clamp(⌊(promptBudget − OVERHEAD) / PER_FACT⌋, 1, 12)` line) and
+ * emitted from that derivation by `hindsightLlmBudgetEnv()`
+ * (`hindsight.ts`). Adding a literal for it to any group in this module would
+ * make two emitters race for one key, and would break the preflight in
+ * `assertHindsightContextBudgetFits()` that proves prompt + completion fit the
+ * window. Batch size is a context-window decision; change the derivation, not
+ * this file.
  */
 
 import { HINDSIGHT_PG_ENV_KEYS } from "./hindsight-pg-defaults.js";
@@ -257,19 +268,100 @@ export const HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT = 1;
  * global cap pipelines the non-LLM stages and improves fairness, but only THIS
  * value multiplies concurrent consolidation inference.
  *
- * Kept at 1 by default: it is the guarantee that background consolidation
- * cannot crowd interactive recall/reflect off a shared local endpoint, which
- * is upstream's stated reason for the worked example. Raising it is a real
- * latency trade on the interactive lanes, so it is an operator decision made
- * declaratively against a measured slot pool, not a shipped default:
+ * ## Why this is DERIVED and not a literal any more
+ *
+ * A fixed 1 made the shipped default a hard throttle that no other knob could
+ * lift. Measured on the live fleet (2026-07-28, 60 minutes of logs): 168
+ * consolidation LLM calls averaging 29.4s consumed 4,936s of LLM wall time in
+ * one hour — **1.37 effective concurrency against 6 worker slots**, with the
+ * worker reporting `consolidation=6/3(avail=0,cap=6)` and per-batch logs
+ * showing `llm=160.9s` for calls the backend serves in ~30s. That gap is
+ * queueing on this semaphore and nothing else; `failed_consolidation` was 0 on
+ * every bank. The result was a backlog that only grows — 43,155 pending on the
+ * busiest bank, rising ~719 every 3 hours.
+ *
+ * Two failure modes rule out simply picking a bigger literal:
+ *
+ *  1. **A literal at or above the global cap is inert AND misleading.** The
+ *     semaphores compose, so a consolidation cap of 6 against a global cap of 4
+ *     permits 4, not 6. Shipping 6 would advertise a ceiling the engine cannot
+ *     honour — the same "knob set to a value that does nothing" defect this
+ *     module exists to remove.
+ *  2. **A literal cannot scale with the operator's endpoint.** The global cap
+ *     is deliberately left at upstream's worked-example 4 because only the
+ *     operator knows their slot count. Under a fixed consolidation literal, an
+ *     operator who measures their pool and raises the global cap gets *zero*
+ *     extra consolidation throughput — which is exactly the trap the fleet fell
+ *     into.
+ *
+ * So the default is a function of the caps around it:
+ *
+ * ```
+ *   consolidation = clamp(global − retain − 1, 1, global − 1)
+ * ```
+ *
+ * The `− 1` is upstream's own stated purpose for per-op caps, quoted in
+ * `llm_wrapper._build_per_op_semaphores`: "This lets operators reserve headroom
+ * in the global pool by capping individual operations (e.g. cap retain at 2 of
+ * 4 global slots so the live chat path always has 2 slots available)." Reflect
+ * and recall have no per-op cap, so their headroom is whatever the capped lanes
+ * leave. Subtracting the retain cap and one further slot guarantees that even
+ * with retain AND consolidation both fully saturated, an interactive reflect
+ * always has at least one global permit. Background consolidation therefore
+ * still cannot crowd the interactive lane off a shared local endpoint — the
+ * property the old literal 1 was protecting — while it stops being pinned to a
+ * single in-flight call.
+ *
+ * On switchroom's own defaults (global 4, retain 1) this lands on **2**, double
+ * the previous ceiling. On an operator who has raised the global cap to 10 with
+ * retain at 6 it lands on 3, and it keeps tracking further changes instead of
+ * needing a second yaml line.
+ *
+ * An explicit operator value still wins outright and is NOT clamped — the
+ * derivation only supplies the default:
  *
  * ```yaml
  * hindsight:
  *   env:
- *     HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT: 2
+ *     HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT: 4
  * ```
+ *
+ * RESTORE CONDITION (unchanged, inherited from the 2026-07-06 quota incident):
+ * if consolidation ever returns to `provider: claude-code`, every concurrent op
+ * is a live subprocess spending the subscription's quota and this must go back
+ * to a hard 1.
  */
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_MAX_CONCURRENT = 1;
+export function hindsightConsolidationLlmMaxConcurrentDefault(
+  globalMaxConcurrent: number = HINDSIGHT_DEFAULT_LLM_MAX_CONCURRENT,
+  retainMaxConcurrent: number = HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT,
+): number {
+  // Defensive: an operator override arrives as a string and may be junk. A
+  // non-finite or non-positive cap falls back to the shipped literal rather
+  // than deriving nonsense from it.
+  const globalCap =
+    Number.isFinite(globalMaxConcurrent) && globalMaxConcurrent >= 1
+      ? Math.floor(globalMaxConcurrent)
+      : HINDSIGHT_DEFAULT_LLM_MAX_CONCURRENT;
+  const retainCap =
+    Number.isFinite(retainMaxConcurrent) && retainMaxConcurrent >= 0
+      ? Math.floor(retainMaxConcurrent)
+      : HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT;
+
+  // Never exceed `globalCap - 1` (the reflect/recall reserve) and never fall
+  // below 1 (0 would be rejected by the engine: "must be a positive integer").
+  const headroomBound = Math.max(1, globalCap - 1);
+  return Math.min(headroomBound, Math.max(1, globalCap - retainCap - 1));
+}
+
+/**
+ * The derived consolidation cap on switchroom's own shipped caps — i.e. what a
+ * fresh install with no `hindsight.env` gets. Exported as the readable anchor
+ * for docs and tests; the emitted value is always
+ * {@link hindsightConsolidationLlmMaxConcurrentDefault} applied to the
+ * EFFECTIVE caps, so an operator who raises the global cap moves this too.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_MAX_CONCURRENT =
+  hindsightConsolidationLlmMaxConcurrentDefault();
 
 /**
  * Half-precision local reranking. Upstream default `false`, and upstream is
@@ -337,6 +429,27 @@ export const HINDSIGHT_DEFAULT_LLM_MAX_RETRIES = 2;
  * i.e. the value is not absolute, it is pegged to how much LLM concurrency the
  * deployment has granted. switchroom holds 2, chosen when a consolidation call
  * was the heaviest thing on a single local backend.
+ *
+ * ## READ THIS BEFORE TUNING IT: on most switchroom banks it does NOTHING
+ *
+ * This is a semaphore over *tag groups within one consolidation op*, not over
+ * LLM calls. `consolidator.py` only builds it at all under
+ * `if llm_parallelism > 1 and len(numbered_groups) > 1:` — with a single tag
+ * group there is one group, the `else` branch runs the groups serially, and the
+ * semaphore is never constructed. switchroom retains with
+ * `retainTags: ["{session_id}"]`, so a bank overwhelmingly resolves to ONE tag
+ * set and therefore one group. Confirmed live (2026-07-28): every consolidation
+ * batch on this fleet logs `1 llm calls`, at every value of this knob. Upstream
+ * tracks the general shape of this as vectorize-io/hindsight#1604.
+ *
+ * So it is not a throughput knob here and must not be reached for as one.
+ * {@link hindsightConsolidationLlmMaxConcurrentDefault} is the knob that
+ * actually multiplies concurrent consolidation inference.
+ *
+ * Left at 2 rather than dropped to 1: on a deployment that DOES tag across
+ * several scopes the fan-out is real, and pinning 1 would disable it for those
+ * installs to make one fleet's log line tidier. The misleading thing was this
+ * comment, not the value.
  *
  * Moved here from a bare constant in `hindsight.ts` (2026-07-27). The value is
  * unchanged; what changes is that it is now a MANAGED key, so an operator can
@@ -794,13 +907,36 @@ export function hindsightPerfEnv(
   if (caps.gpu === true) groups.push(HINDSIGHT_PERF_DEFAULTS_GPU);
   if (caps.localLlm === true) groups.push(HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM);
 
+  // The consolidation cap's default is derived from the EFFECTIVE global and
+  // retain caps, so an operator who raises the global cap widens consolidation
+  // with it instead of staying pinned to a literal the engine may not even be
+  // able to honour. See hindsightConsolidationLlmMaxConcurrentDefault. An
+  // explicit consolidation override still wins below, unclamped.
+  const effectiveCap = (key: string, fallback: number): number => {
+    const raw = overrides.get(key);
+    if (raw === undefined) return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback;
+  };
+  const derivedConsolidationCap = String(
+    hindsightConsolidationLlmMaxConcurrentDefault(
+      effectiveCap("HINDSIGHT_API_LLM_MAX_CONCURRENT", HINDSIGHT_DEFAULT_LLM_MAX_CONCURRENT),
+      effectiveCap(
+        "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
+        HINDSIGHT_DEFAULT_RETAIN_LLM_MAX_CONCURRENT,
+      ),
+    ),
+  );
+
   const out: Array<[string, string]> = [];
   const emitted = new Set<string>();
   for (const group of groups) {
     for (const [key, value] of group) {
       if (emitted.has(key)) continue;
       emitted.add(key);
-      out.push([key, overrides.get(key) ?? value]);
+      const shipped =
+        key === "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT" ? derivedConsolidationCap : value;
+      out.push([key, overrides.get(key) ?? shipped]);
     }
   }
 

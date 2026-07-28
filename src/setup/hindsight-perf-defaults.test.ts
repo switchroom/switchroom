@@ -242,7 +242,9 @@ describe("hindsightPerfEnv — capability gating", () => {
     const got = new Map(hindsightPerfEnv({ gpu: false, localLlm: true }));
     expect(got.get("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toBe("4");
     expect(got.get("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT")).toBe("1");
-    expect(got.get("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT")).toBe("1");
+    // Derived from global 4 / retain 1, reserving one global permit for the
+    // uncapped interactive lane: 4 - 1 - 1 = 2.
+    expect(got.get("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT")).toBe("2");
   });
 
   it("treats a non-boolean-true capability as NOT proven", () => {
@@ -503,6 +505,134 @@ describe("HINDSIGHT_CE_DECISIVE_RELATIVE_GAP (override-only, patch rollback hatc
     const perf = { env: { [KEY]: "0.7" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["0.7"]);
+  });
+});
+
+// ── the consolidation LLM concurrency ceiling ─────────────────────────────
+describe("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT (derived, was a literal 1)", () => {
+  const KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT";
+  const GLOBAL = "HINDSIGHT_API_LLM_MAX_CONCURRENT";
+  const RETAIN = "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT";
+  const LOCAL = { gpu: false, localLlm: true };
+
+  it("no longer pins a fresh install to a single in-flight consolidation call", () => {
+    // The regression this guards is the measured one: at 1 the process makes at
+    // most ONE consolidation LLM call at a time regardless of worker slots, so
+    // the backlog can only grow. Assert the OUTCOME (the emitted ceiling), and
+    // assert it is strictly greater than the old hard throttle.
+    const emitted = Number(new Map(hindsightPerfEnv(LOCAL)).get(KEY));
+    expect(emitted).toBe(2);
+    expect(emitted).toBeGreaterThan(1);
+  });
+
+  it("widens when the operator raises the global cap, without a second yaml line", () => {
+    // The trap the old literal created: an operator measures their slot pool,
+    // raises the global cap, and gets ZERO extra consolidation throughput.
+    const wide = new Map(hindsightPerfEnv(LOCAL, new Map([[GLOBAL, "10"]])));
+    // global 10, retain default 1 => 10 - 1 - 1 = 8.
+    expect(wide.get(KEY)).toBe("8");
+    expect(Number(wide.get(KEY))).toBeGreaterThan(
+      Number(new Map(hindsightPerfEnv(LOCAL)).get(KEY)),
+    );
+  });
+
+  it("yields to a raised retain cap so both lanes cannot oversubscribe the pool", () => {
+    // The live fleet's shape: global 10, retain 6. The derived consolidation cap
+    // must leave retain's reservation AND one interactive permit intact.
+    const got = new Map(
+      hindsightPerfEnv(
+        LOCAL,
+        new Map([
+          [GLOBAL, "10"],
+          [RETAIN, "6"],
+        ]),
+      ),
+    );
+    expect(got.get(KEY)).toBe("3");
+    expect(Number(got.get(KEY)) + 6).toBeLessThan(10);
+  });
+
+  it("NEVER derives a default above the global cap, across the whole matrix", () => {
+    // The load-bearing invariant. The engine composes the two semaphores
+    // (llm_wrapper._semaphores_for_scope: per-op acquired first, THEN global),
+    // so a consolidation cap at or above the global cap is inert and
+    // advertises a ceiling the engine cannot honour — and leaves the uncapped
+    // reflect/recall lane with no guaranteed permit at all.
+    for (const global of [1, 2, 3, 4, 6, 8, 10, 16, 32]) {
+      for (const retain of [0, 1, 2, 6, 9, 32]) {
+        const got = new Map(
+          hindsightPerfEnv(
+            LOCAL,
+            new Map([
+              [GLOBAL, String(global)],
+              [RETAIN, String(retain)],
+            ]),
+          ),
+        );
+        const cap = Number(got.get(KEY));
+        const emittedGlobal = Number(got.get(GLOBAL));
+        expect(cap, `global=${global} retain=${retain}`).toBeLessThanOrEqual(emittedGlobal);
+        // Positive: the engine raises ValueError on a per-op cap <= 0
+        // ("must be a positive integer"), which would refuse to boot.
+        expect(cap, `global=${global} retain=${retain}`).toBeGreaterThanOrEqual(1);
+        // Headroom: only a global cap of 1 can leave the interactive lane
+        // sharing consolidation's single permit.
+        if (emittedGlobal > 1) {
+          expect(cap, `global=${global} retain=${retain}`).toBeLessThan(emittedGlobal);
+        }
+      }
+    }
+  });
+
+  it("falls back to the shipped caps rather than deriving from junk", () => {
+    for (const junk of ["", "banana", "0", "-4", "3.9.1"]) {
+      const got = new Map(hindsightPerfEnv(LOCAL, new Map([[GLOBAL, junk]])));
+      expect(Number(got.get(KEY)), `global=${JSON.stringify(junk)}`).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it("an explicit operator value survives and is NOT clamped by the derivation", () => {
+    // Overridability is the hard requirement: these are defaults. An operator
+    // who has measured their endpoint may deliberately exceed our headroom
+    // reserve, and we must not quietly rewrite their number.
+    const got = new Map(
+      hindsightPerfEnv(
+        LOCAL,
+        new Map([
+          [GLOBAL, "10"],
+          [KEY, "9"],
+        ]),
+      ),
+    );
+    expect(got.get(KEY)).toBe("9");
+  });
+
+  it("the operator's value REPLACES the default on BOTH launch paths", () => {
+    const perf = { env: { [KEY]: "5" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    // Exactly one value per path — a duplicate emission would be last-wins by
+    // luck on docker-run and ambiguous in compose.
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["5"]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual(["5"]);
+  });
+
+  it("emits the derived default exactly once per path when NOT overridden", () => {
+    const perf = { env: {}, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["2"]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual(["2"]);
+  });
+
+  it("stays absent on a cloud endpoint — it is a local-slot-pool knob", () => {
+    expect(new Map(hindsightPerfEnv({ gpu: true, localLlm: false })).has(KEY)).toBe(false);
   });
 });
 
@@ -813,7 +943,8 @@ describe("startHindsight — performance defaults reach the container", () => {
     const fromRun = runEnv(runArgs());
     expect(fromRun.get("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toEqual(["4"]);
     expect(fromRun.get("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT")).toEqual(["1"]);
-    expect(fromRun.get("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT")).toEqual(["1"]);
+    // Derived from global 4 / retain 1 — see the consolidation-cap block below.
+    expect(fromRun.get("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT")).toEqual(["2"]);
     // ...and the compose twin reads the same argument the same way.
     const fromCompose = composeEnv(
       generateHindsightComposeSnippet(llm, undefined, undefined, false),

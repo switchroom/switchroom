@@ -13,6 +13,75 @@ of any warning that the escalation was coming, and — the last one — the
 interactive reply path silently destroying the agent's composed answer instead
 of queueing it.
 
+### Consolidation keeps up with what agents write, instead of falling permanently behind
+
+Agents' recent work becomes searchable in hours instead of never. The
+consolidated memory layer — the observations recall actually returns, and the
+mental models built on top of them — only reflects what consolidation has
+processed, and on the busiest banks it had stopped keeping up: 43,155 memories
+pending on one bank and rising ~719 every 3 hours, 5,997 on the next. Nothing
+was erroring (`failed_consolidation` was 0 on every bank); it was purely
+throughput.
+
+The binding constraint was `HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT`,
+shipped as a hard literal `1`. It is a process-wide semaphore that every
+consolidation LLM call must acquire, and the engine composes it with the global
+cap rather than replacing it (`llm_wrapper._semaphores_for_scope`: "Per-op
+acquired first so contention queues on the narrower cap"). So at 1 the process
+makes at most ONE consolidation LLM call at a time no matter how many worker
+slots, banks or tag groups are in flight — and every other consolidation knob
+only pipelines the non-LLM stages behind it. Measured over one hour on the live
+fleet: 168 consolidation LLM calls averaging 29.4s consumed 4,936s of LLM wall
+time — **1.37 effective concurrency against 6 worker slots**, with the worker
+reporting `consolidation=6/3(avail=0,cap=6)` and per-batch logs showing
+`llm=160.9s` for calls the backend serves in ~30s. That whole gap was queueing
+on this semaphore.
+
+The default is now **derived** rather than a literal:
+
+```
+consolidation = clamp(global − retain − 1, 1, global − 1)
+```
+
+Two reasons it could not simply be a bigger number. A literal at or above the
+global cap is **inert and misleading** — the semaphores compose, so a
+consolidation cap of 6 against a global cap of 4 permits 4, not 6, and would
+advertise a ceiling the engine cannot honour. And a literal **cannot scale with
+the operator's endpoint**: the global cap is deliberately left at upstream's
+worked-example 4 because only the operator knows their slot count, so under a
+fixed literal an operator who measures their pool and raises the global cap gets
+zero extra consolidation throughput. That is exactly the trap this fleet fell
+into.
+
+The `− 1` is upstream's own stated purpose for per-op caps, quoted verbatim in
+`llm_wrapper._build_per_op_semaphores`: they exist so operators can "reserve
+headroom in the global pool by capping individual operations". Reflect and
+recall have no per-op cap, so subtracting the retain cap and one further slot
+guarantees an interactive reflect always has at least one global permit even
+with retain AND consolidation fully saturated. Background consolidation still
+cannot crowd the interactive lane off a shared local endpoint — the property the
+old literal `1` was protecting — it just stops being pinned to a single
+in-flight call. On switchroom's own defaults this lands on 2, double the
+previous ceiling, and it now tracks the global cap instead of needing a second
+yaml line.
+
+An explicit `hindsight.env` value still wins outright and is **not** clamped by
+the derivation; a test asserts an operator value above the headroom reserve
+survives verbatim, and another proves the derived default never exceeds the
+global cap across a 54-case matrix.
+
+Two things deliberately NOT changed. `CONSOLIDATION_LLM_PARALLELISM` stays at 2:
+it is a semaphore over *tag groups within one op*, built only under
+`if llm_parallelism > 1 and len(numbered_groups) > 1:`, and switchroom's
+`retainTags: ["{session_id}"]` means a bank resolves to one group — every batch
+on this fleet logs `1 llm calls` at any value. Pinning it to 1 would disable a
+real fan-out for deployments that do tag across scopes, so the value stays and
+the misleading doc comment is corrected instead. And
+`CONSOLIDATION_LLM_BATCH_SIZE` is not touched here at all: it is derived from
+the declared context window by `hindsight-context-budget.ts`, so a literal in
+the perf-defaults module would make two emitters race for one key and break the
+preflight that proves prompt + completion fit the window.
+
 ### A flood-blocked reply is queued, not destroyed (#3861)
 
 The durable-outbox work-loss guarantee held for the outbox-delivered paths and
