@@ -2767,6 +2767,45 @@ class CliTest(unittest.TestCase):
             rc, _ = self._run(["--phase", "reconcile"])
         self.assertEqual(rc, 2)
 
+    # ---- #3895: a failed pre-drain phase must not be invisible ------------
+
+    def _run_with(self, summary, argv=("--backlog",)):
+        with unittest.mock.patch.object(
+            drain_pending, "drain", lambda *a, **kw: summary
+        ):
+            with unittest.mock.patch.object(drain_pending, "load_config", lambda: {}):
+                with redirect_stderr(io.StringIO()) as err:
+                    drain_pending.main(list(argv))
+        return err.getvalue()
+
+    def test_a_run_whose_phases_all_failed_does_not_look_like_a_clean_one(self):
+        """The whole reason the failure is in the SUMMARY, not only a log.
+
+        Every pre-drain counter reads 0 on a run where the phases blew up
+        and on a run over an empty, healthy queue — they are the same
+        numbers. `main()`'s report gate is `any(...)` over those counters,
+        so without `phase_failures` in it a permanently broken phase 0b/0c
+        prints, from the CLI, EXACTLY what a clean run prints: nothing.
+        Same failure shape `parked` was added to that gate for (#3893), one
+        stage earlier in the run. Pinned as a DIFFERENCE rather than a
+        substring, because "these two runs are indistinguishable" is the
+        defect.
+        """
+        clean = drain_pending._new_summary()
+        broken = drain_pending._new_summary()
+        broken["phase_failures"] = ["0b", "0c"]
+
+        self.assertEqual(self._run_with(clean), "", "a clean quiet run stays quiet")
+        out = self._run_with(broken)
+        self.assertNotEqual(out, "", "a run that lost both phases must report")
+        self.assertIn("phase_failures=0b,0c", out, "and it must name which")
+
+    def test_a_reported_run_with_no_phase_failure_says_so(self):
+        """The negative half: the field is present, not conditional noise."""
+        summary = drain_pending._new_summary()
+        summary["drained"] = 1
+        self.assertIn("phase_failures=none", self._run_with(summary))
+
 
 class StallGuardBoundaryTest(_QueueTempDirMixin, unittest.TestCase):
     """The stall guard counts CONSECUTIVE failures of the SAME class.
@@ -3327,6 +3366,61 @@ class DeadMarkersLeaveTheLiveQueueTest(_QueueTempDirMixin, unittest.TestCase):
 
         self.assertEqual(summary["dead_relocated"], 0)
         self.assertTrue(os.path.exists(legacy))
+
+    # ---- #3895: a broken phase 0b must not wedge the drain ----------------
+
+    def test_a_failing_phase_0b_never_blocks_the_phases_that_drain(self):
+        """Phase 0b's blast radius, pinned.
+
+        0b runs BEFORE the phases that actually drain, so an exception out
+        of it takes phases 1 and 2 with it and the whole backlog becomes
+        immortal — for every OTHER entry in the queue, none of which had
+        anything to do with the failure.
+
+        The raise is INJECTED here rather than provoked from queue data, and
+        that is an honest statement about this phase: unlike phase 0c,
+        `sweep_legacy_dead_markers` parses no entry — it walks filenames and
+        already catches `OSError` per marker (`shutil.Error` is an `OSError`
+        subclass, so a cross-device move is covered too). No queue state
+        reachable today makes it raise; several were tried. The guard is
+        therefore defence-in-depth on the CALLER contract, which is the part
+        that matters: nothing that runs before the drain may be able to stop
+        it, and any future line added inside that loop re-opens the hole
+        this pins shut.
+
+        A sweep only MOVES a marker out of the janitor's path, so skipping
+        it leaves the markers exactly where every earlier build left them.
+        """
+        path = pending.enqueue(_payload(content="a real memory"), RuntimeError("x"))
+        self.assertTrue(os.path.exists(path), "fixture")
+
+        def boom():
+            raise OSError(errno.EACCES, "Permission denied")
+
+        posted = []
+        with unittest.mock.patch.object(
+            drain_pending, "sweep_legacy_dead_markers", boom
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: bool(posted)
+            ):
+                with unittest.mock.patch.object(
+                    drain_pending,
+                    "_retry_one",
+                    lambda e, timeout: posted.append(e["document_id"]),
+                ):
+                    with redirect_stderr(io.StringIO()) as err:
+                        summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertEqual(len(posted), 1, "phase 2 still ran")
+        self.assertEqual(pending.count(), 0, "the entry drained anyway")
+        self.assertEqual(summary["dead_relocated"], 0, "nothing moved, honestly")
+        self.assertIn("phase 0b FAILED", err.getvalue(), "and it was not silent")
+        self.assertEqual(
+            summary["phase_failures"],
+            ["0b"],
+            "the failure must survive into the summary, not only into stderr",
+        )
 
 
 class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
@@ -4180,6 +4274,138 @@ class ResplitOverBoundEntriesTest(_QueueTempDirMixin, unittest.TestCase):
         )
         self.assertEqual(summary["resplit"], 0)
         self.assertTrue(os.path.exists(path))
+
+    # ---- #3895: a broken phase 0c must not wedge the drain ----------------
+
+    def test_a_non_dict_metadata_cannot_make_the_backlog_immortal(self):
+        """The concrete reproduction, end to end — measured, not imagined.
+
+        Phase 0c PARSES every queued entry, so a
+        semantically-malformed-but-valid-JSON entry reaches it.
+        `iter_entries()`' quarantine cannot help: the file is valid JSON, so
+        it is handed over rather than quarantined — that is the whole point
+        of the quarantine, and the whole reason this class of entry is the
+        dangerous one.
+
+        One entry with `"metadata": "nope"` (a string where a mapping
+        belongs) is enough: the payload rebuild inside `enqueue_parts`
+        raises `ValueError: dictionary update sequence element #0 has
+        length 1; 2 is required`. Unguarded, that ONE entry stops phases 1
+        and 2 for the WHOLE queue, on every run, forever.
+
+        The healthy entry is the assertion that matters: it has nothing to
+        do with the malformed one and must still reach the bank.
+        """
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "100000"
+        bad = pending.enqueue(
+            dict(_payload(content="m" * 40_000, doc=_cd_doc(1)), metadata="nope"),
+            RuntimeError("x"),
+        )
+        pending.enqueue(
+            _payload(content="a healthy memory", doc=_cd_doc(5)), RuntimeError("x")
+        )
+        self.assertEqual(pending.count(), 2, "fixture")
+        self.assertTrue(os.path.exists(bad), "fixture")
+        # The bound MOVES under the entry — exactly what a deadline change
+        # does — so phase 0c now has work to do and reaches the bad entry.
+        os.environ["HINDSIGHT_RETAIN_MAX_CONTENT_CHARS"] = "3000"
+
+        posted = []
+        with unittest.mock.patch.object(
+            drain_pending, "_document_state", lambda e, timeout=30: bool(posted)
+        ):
+            with unittest.mock.patch.object(
+                drain_pending,
+                "_retry_one",
+                lambda e, timeout: posted.append(e["document_id"]),
+            ):
+                with redirect_stderr(io.StringIO()) as err:
+                    summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertIn("phase 0c FAILED", err.getvalue(), "and it was not silent")
+        self.assertEqual(summary["phase_failures"], ["0c"])
+        self.assertEqual(summary["resplit"], 0, "nothing was re-split, honestly")
+        self.assertEqual(summary["resplit_parts"], 0)
+        self.assertIn(_cd_doc(5), posted, "the healthy memory still reached the bank")
+        self.assertEqual(pending.count(), 0, "and the queue drained")
+
+    def test_a_failing_phase_0c_never_blocks_the_phases_that_drain(self):
+        """The guard itself, independent of which raise provokes it.
+
+        The reproduction above pins ONE measured raise. This pins the
+        contract that outlives it: whatever `resplit_over_bound_entries`
+        raises, phases 1 and 2 still run. Skipping a re-split costs the
+        over-bound entries only — they stay as undrainable as they were
+        before phase 0c existed — and costs the rest of the queue nothing.
+        """
+        pending.enqueue(_payload(content="a real memory"), RuntimeError("x"))
+
+        def boom():
+            raise ValueError("invalid literal for int() with base 10: 'many'")
+
+        posted = []
+        with unittest.mock.patch.object(
+            drain_pending, "resplit_over_bound_entries", boom
+        ):
+            with unittest.mock.patch.object(
+                drain_pending, "_document_state", lambda e, timeout=30: bool(posted)
+            ):
+                with unittest.mock.patch.object(
+                    drain_pending,
+                    "_retry_one",
+                    lambda e, timeout: posted.append(e["document_id"]),
+                ):
+                    with redirect_stderr(io.StringIO()) as err:
+                        summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertEqual(len(posted), 1, "phase 2 still ran")
+        self.assertEqual(pending.count(), 0, "the entry drained anyway")
+        self.assertEqual(summary["resplit"], 0)
+        self.assertEqual(summary["resplit_parts"], 0)
+        self.assertIn("phase 0c FAILED", err.getvalue())
+        self.assertEqual(summary["phase_failures"], ["0c"])
+
+    def test_every_pre_drain_phase_can_fail_and_the_drain_still_completes(self):
+        """All three at once, and the summary names all three, in run order.
+
+        Phases 0, 0b and 0c share a block and a failure mode, so the
+        interesting case is not one of them breaking but the state where the
+        whole pre-drain stage is unusable. The drain must still be the thing
+        that runs, and the queue must still empty.
+
+        Phase 0 is included because #3894's guard now routes through the same
+        `_phase_failed` helper: this is the test that keeps the three of them
+        on ONE mechanism, rather than three `except` blocks that drift.
+        """
+        pending.enqueue(_payload(content="a real memory"), RuntimeError("x"))
+
+        def boom(*a, **kw):
+            raise RuntimeError("the pre-drain stage is unusable")
+
+        posted = []
+        with unittest.mock.patch.object(drain_pending, "collapse_duplicates", boom):
+            with unittest.mock.patch.object(
+                drain_pending, "sweep_legacy_dead_markers", boom
+            ):
+                with unittest.mock.patch.object(
+                    drain_pending, "resplit_over_bound_entries", boom
+                ):
+                    with unittest.mock.patch.object(
+                        drain_pending,
+                        "_document_state",
+                        lambda e, timeout=30: bool(posted),
+                    ):
+                        with unittest.mock.patch.object(
+                            drain_pending,
+                            "_retry_one",
+                            lambda e, timeout: posted.append(e["document_id"]),
+                        ):
+                            with redirect_stderr(io.StringIO()):
+                                summary = drain_pending.drain_backlog(CONFIG)
+
+        self.assertEqual(len(posted), 1, "phase 2 still ran")
+        self.assertEqual(pending.count(), 0)
+        self.assertEqual(summary["phase_failures"], ["0", "0b", "0c"])
 
 
 class CorruptLedgerNeverStallsTheDrainTest(_QueueTempDirMixin, unittest.TestCase):

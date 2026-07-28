@@ -793,6 +793,14 @@ def _new_summary() -> dict:
         "dead_relocated": 0,
         "resplit": 0,
         "resplit_parts": 0,
+        # Labels of the pre-drain phases ("0"/"0b"/"0c") that raised and were
+        # stepped over this run — see `_phase_failed`. A LIST, not a count,
+        # because which phase broke is what an operator needs. IN THE GATE,
+        # not only in the summary line, for exactly the reason `parked` is
+        # (see `main()`): every pre-drain counter reads 0 both on a run whose
+        # phases all blew up and on a clean, empty, healthy queue, so without
+        # this key the two runs are byte-identical from outside.
+        "phase_failures": [],
         "stalled": False,
         "budget_exceeded": False,
     }
@@ -844,6 +852,8 @@ def drain(
          "dead_relocated": int,  # legacy .dead markers moved out of the queue dir
          "resplit":   int, # over-bound entries split into drainable parts
          "resplit_parts": int,  # parts those entries became
+         "phase_failures": list[str],  # pre-drain phases that raised and
+                                       # were stepped over (backlog only)
          "stalled": bool,  # stall guard tripped
          "budget_exceeded": bool}
     """
@@ -1001,6 +1011,47 @@ def _blog(msg: str) -> None:
     print(f"[Hindsight] drain_pending(backlog): {msg}", file=sys.stderr)
 
 
+def _phase_failed(summary: dict, phase: str, e: BaseException, cost: str) -> None:
+    """Record a pre-drain phase that raised, and let the drain continue.
+
+    ONE mechanism for phases 0, 0b and 0c (#3894 / #3895). They sit in the same
+    ``if not dry_run:`` block and run BEFORE the phases that actually
+    drain, so a raise out of any of them takes phases 1 and 2 with it and
+    the backlog becomes immortal — for every OTHER entry too, none of
+    which had anything to do with the failure. Phases 0 and 0c PARSE
+    queued entries, so a semantically-malformed-but-valid-JSON entry
+    reaches both — precisely the class ``iter_entries``' quarantine cannot
+    catch. Phase 0b parses nothing and its guard is defence-in-depth on
+    the caller contract; the comment at its call site says so plainly.
+    None of the three is loss-bearing to skip — a collapse, a sweep and a
+    re-split only MOVE or REWRITE bytes already on disk, and none of them
+    deletes — so all three are logged and stepped over, not fatal.
+
+    Reported in TWO places on purpose. The stderr line is for whoever is
+    watching the run; ``summary["phase_failures"]`` is what makes the
+    failure survive into the return value, into ``main()``'s summary line,
+    and into its "anything to report?" gate. Without the second, a run
+    where every pre-drain phase blew up prints exactly what an empty,
+    healthy queue prints — every pre-drain counter is 0 either way — and a
+    permanently broken phase is invisible to anything not tailing stderr.
+    Same argument, same shape, as ``parked`` (#3893).
+
+    ``cost`` states what skipping this phase actually costs, in the same
+    voice as the phase's own log lines: the point of the message is that
+    the operator can tell at a glance that no memory was lost.
+
+    The message format is deliberately the one #3894 wrote inline for its
+    phase-0 guard, so folding that guard onto this helper changed no
+    output at all. Three hand-rolled ``except`` blocks in one block is
+    exactly the shape that drifts.
+    """
+    summary["phase_failures"].append(phase)
+    _blog(
+        f"phase {phase} FAILED ({type(e).__name__}: {e}) — continuing to the "
+        f"phases that actually drain. Nothing was lost: {cost}"
+    )
+
+
 def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
     """PHASE 1 — free pass: drop entries whose document already exists.
 
@@ -1115,11 +1166,13 @@ def _drain_backlog_impl(
         try:
             summary["collapsed"] = collapse_duplicates()
         except Exception as e:  # noqa: BLE001 — see comment above
-            _blog(
-                f"phase 0 FAILED ({type(e).__name__}: {e}) — continuing to the "
-                f"phases that actually drain. Nothing was lost: a collapse only "
-                f"ever MOVES a byte-identical copy into pending-duplicate/, so "
-                f"the cost of skipping it is duplicated work, not a memory."
+            _phase_failed(
+                summary,
+                "0",
+                e,
+                "a collapse only ever MOVES a byte-identical copy into "
+                "pending-duplicate/, so the cost of skipping it is duplicated "
+                "work, not a memory.",
             )
         if summary["collapsed"]:
             _blog(
@@ -1132,7 +1185,29 @@ def _drain_backlog_impl(
         # queue directory. Free, local, and an UPGRADE step: markers written
         # by an older build sit in the directory external janitors sweep, and
         # a marker is the only remaining copy of its memory.
-        moved = sweep_legacy_dead_markers()
+        #
+        # GUARDED (#3895) because it runs BEFORE the phases that drain, but
+        # be honest about WHY: unlike phase 0c this one parses no entry — it
+        # walks filenames — and it already catches `OSError` per marker,
+        # which covers `shutil.Error` too (an `OSError` subclass). No queue
+        # state reachable today makes it raise, and none was found looking.
+        # The guard is on the CALLER contract rather than a live defect:
+        # nothing running before the drain may be able to stop the drain,
+        # and any future line inside that loop re-opens the hole. Skipping
+        # the sweep is free — the markers stay exactly where every earlier
+        # build left them.
+        try:
+            moved = sweep_legacy_dead_markers()
+        except Exception as e:  # noqa: BLE001 — see `_phase_failed`
+            moved = 0
+            _phase_failed(
+                summary,
+                "0b",
+                e,
+                "a sweep only ever MOVES a `.dead` marker out of the live "
+                "queue directory, so the cost of skipping it is that the "
+                "markers stay where they already were, not a memory.",
+            )
         if moved:
             summary["dead_relocated"] = moved
             _blog(
@@ -1150,7 +1225,30 @@ def _drain_backlog_impl(
         # part drainable, which is the difference between a lost memory and a
         # slow one. Runs after the duplicate collapse so a duplicated
         # over-bound entry is split ONCE, not once per copy.
-        entries_split, parts_written = resplit_over_bound_entries()
+        #
+        # GUARDED (#3895), and this is the most exposed of the pre-drain
+        # phases: it PARSES every queued entry to measure it, so a
+        # semantically-malformed-but-valid-JSON entry — the exact class
+        # `iter_entries`' quarantine hands over rather than quarantines —
+        # reaches it. Measured: one entry whose `metadata` is a string
+        # instead of a mapping raises `ValueError` out of the payload
+        # rebuild. Unguarded, that ONE entry stops phases 1 and 2 for every
+        # other entry in the queue, on every run. Skipping the split costs
+        # the over-bound entries only: they stay exactly as undrainable as
+        # they were before phase 0c existed, and nothing is deleted.
+        try:
+            entries_split, parts_written = resplit_over_bound_entries()
+        except Exception as e:  # noqa: BLE001 — see `_phase_failed`
+            entries_split, parts_written = 0, 0
+            _phase_failed(
+                summary,
+                "0c",
+                e,
+                "a re-split only ever REWRITES an over-bound entry into "
+                "drainable parts and archives the original, so the cost of "
+                "skipping it is that those entries stay as undrainable as "
+                "they were before phase 0c existed. Nothing is deleted.",
+            )
         if entries_split:
             summary["resplit"] = entries_split
             summary["resplit_parts"] = parts_written
@@ -1388,6 +1486,12 @@ def main(argv: list[str] | None = None) -> int:
             # could not tell "parked by the circuit breaker, needs --force"
             # from "ordinary backlog, will drain on its own".
             "parked",
+            # Same argument as `parked` directly above, one stage earlier in
+            # the run (#3895). A run whose pre-drain phases all raised has
+            # every pre-drain counter at 0 — identical to a clean, empty
+            # queue — so without this key a permanently broken phase
+            # 0/0b/0c prints nothing at all from the CLI.
+            "phase_failures",
         )
     ):
         print(
@@ -1400,6 +1504,7 @@ def main(argv: list[str] | None = None) -> int:
             f"unknown={summary['unknown']} "
             f"archive_failed={summary['archive_failed']} "
             f"parked={summary['parked']} "
+            f"phase_failures={','.join(summary['phase_failures']) or 'none'} "
             f"stalled={summary['stalled']} budget_exceeded={summary['budget_exceeded']}",
             file=sys.stderr,
         )
