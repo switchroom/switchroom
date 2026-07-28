@@ -8,6 +8,10 @@ import {
   fetchBankRetainMission,
   resolveBankMissionExtras,
   PROFILE_MEMORY_DEFAULTS,
+  DEFAULT_OBSERVATIONS_MISSION,
+  SUPERSEDED_OBSERVATIONS_MISSIONS,
+  decideObservationsMissionUpgrade,
+  fetchBankObservationsMission,
 } from "../src/memory/hindsight.js";
 import {
   reconcileAgent,
@@ -344,6 +348,135 @@ describe("fetchBankRetainMission", () => {
   });
 });
 
+describe("decideObservationsMissionUpgrade", () => {
+  it("seeds the fleet default onto an unset bank (the live fleet-wide state)", () => {
+    // Verified live 2026-07-28: all 27 banks on switchroom-hindsight carried
+    // observations_mission: null, so this is the case that actually fires.
+    expect(decideObservationsMissionUpgrade(undefined, undefined, null)).toEqual({
+      action: "upgrade",
+      mission: DEFAULT_OBSERVATIONS_MISSION,
+    });
+  });
+
+  it("treats a whitespace-only mission as unset", () => {
+    expect(decideObservationsMissionUpgrade(undefined, undefined, "   ")).toEqual({
+      action: "upgrade",
+      mission: DEFAULT_OBSERVATIONS_MISSION,
+    });
+  });
+
+  it("never clobbers an operator hand-edit", () => {
+    expect(
+      decideObservationsMissionUpgrade(undefined, undefined, "only track cricket scores"),
+    ).toEqual({ action: "none" });
+  });
+
+  it("is a no-op once the bank already carries the current default", () => {
+    expect(
+      decideObservationsMissionUpgrade(undefined, undefined, DEFAULT_OBSERVATIONS_MISSION),
+    ).toEqual({ action: "none" });
+  });
+
+  it("operator yaml wins outright, even over a hand-edited bank value", () => {
+    expect(
+      decideObservationsMissionUpgrade("from yaml", "profile text", "hand-written"),
+    ).toEqual({ action: "config", mission: "from yaml" });
+  });
+
+  it("a profiled agent gets its PROFILE mission, not the generic fleet default", () => {
+    const profile = PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission!;
+    expect(decideObservationsMissionUpgrade(undefined, profile, null)).toEqual({
+      action: "upgrade",
+      mission: profile,
+    });
+  });
+
+  it("upgrades a bank already holding the generic default to its profile mission", () => {
+    // Ordering hazard: an agent scaffolded before its profile was assigned
+    // carries the generic default. That is switchroom-authored text, so it must
+    // stay upgradable rather than being frozen as if a human wrote it.
+    const profile = PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission!;
+    expect(
+      decideObservationsMissionUpgrade(undefined, profile, DEFAULT_OBSERVATIONS_MISSION),
+    ).toEqual({ action: "upgrade", mission: profile });
+  });
+
+  it("upgrades every superseded default to the current one", () => {
+    for (const old of SUPERSEDED_OBSERVATIONS_MISSIONS) {
+      expect(decideObservationsMissionUpgrade(undefined, undefined, old)).toEqual({
+        action: "upgrade",
+        mission: DEFAULT_OBSERVATIONS_MISSION,
+      });
+    }
+  });
+});
+
+describe("SUPERSEDED_OBSERVATIONS_MISSIONS registry", () => {
+  it("never contains the current default (that would make the no-op case an upgrade)", () => {
+    expect(SUPERSEDED_OBSERVATIONS_MISSIONS).not.toContain(DEFAULT_OBSERVATIONS_MISSION);
+  });
+
+  it("carries the health-coach profile default, so those banks stay upgradable", () => {
+    expect(SUPERSEDED_OBSERVATIONS_MISSIONS).toContain(
+      PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission,
+    );
+  });
+});
+
+describe("fetchBankObservationsMission", () => {
+  it("reads config.observations_mission off the same REST config surface", async () => {
+    let seen = "";
+    const fetchImpl = vi.fn(async (url: string) => {
+      seen = url;
+      return {
+        ok: true,
+        json: async () => ({ config: { observations_mission: "current text" } }),
+      } as any;
+    });
+    const r = await fetchBankObservationsMission("http://h:18888/mcp/", "a b", {
+      fetchImpl: fetchImpl as any,
+    });
+    expect(seen).toBe("http://h:18888/v1/default/banks/a%20b/config");
+    expect(r).toEqual({ ok: true, mission: "current text" });
+  });
+
+  it("reports failure — not 'unset' — on an unrecognised body", async () => {
+    // Same M1 posture as retain: null reads as upgradable, so an unrecognised
+    // shape must never be flattened to null or a rename upstream would push the
+    // default over every customized mission fleet-wide.
+    const shapes = [
+      {},
+      { config: null },
+      { config: { retain_mission: "x" } }, // observations_mission key absent
+      { config: { observations_mission: 42 } },
+    ];
+    for (const body of shapes) {
+      const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => body }) as any);
+      expect(
+        await fetchBankObservationsMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }),
+      ).toEqual({ ok: false, reason: "Unexpected shape" });
+    }
+  });
+
+  it("does not confuse the two fields — a null retain_mission is not a null observations_mission", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          json: async () => ({
+            config: { retain_mission: null, observations_mission: "obs text" },
+          }),
+        }) as any,
+    );
+    expect(
+      await fetchBankObservationsMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }),
+    ).toEqual({ ok: true, mission: "obs text" });
+    expect(
+      await fetchBankRetainMission("http://h/mcp/", "b", { fetchImpl: fetchImpl as any }),
+    ).toEqual({ ok: true, mission: null });
+  });
+});
+
 /**
  * End-to-end outcome test for review finding 1.
  *
@@ -466,6 +599,130 @@ describe("reconcileAgent — retain_mission upgrade on existing banks", () => {
     runReconcile(config);
     const args = await seen;
     expect((args.config_updates as Record<string, unknown>).retain_mission).toBe("operator text");
+  }, 15_000);
+});
+
+/**
+ * End-to-end outcome tests for the observations_mission seed.
+ *
+ * `switchroom apply` calls `scaffoldAgent` for every agent on every run, so
+ * scaffold — not reconcile — is the path that actually reaches live banks.
+ * These drive the real `scaffoldAgent` against a stubbed Hindsight and assert
+ * what goes out on the wire.
+ *
+ * Verified to bite: with the `resolveObservationsMissionPush` call removed from
+ * scaffold (i.e. the pre-change code, where observations_mission rode
+ * `resolveBankMissionExtras` and resolved to nothing for `extends: default`),
+ * "seeds the fleet default onto a bank with none" fails with the received value
+ * `undefined` — which is exactly the live fleet state measured on 2026-07-28.
+ */
+describe("scaffoldAgent — observations_mission seed", () => {
+  const telegramConfig: TelegramConfig = {
+    bot_token: "123456:ABC-DEF",
+    forum_chat_id: "-1001234567890",
+  };
+  const switchroomConfig: SwitchroomConfig = {
+    agents: {},
+    telegram: telegramConfig,
+    defaults: {},
+    memory: { backend: "hindsight", config: { url: "http://hindsight.test/mcp/" } },
+  } as unknown as SwitchroomConfig;
+
+  const realFetch = globalThis.fetch;
+  let tmpDir = "";
+
+  beforeEach(() => {
+    __resetPendingBankOpsForTests();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = "";
+  });
+
+  /**
+   * Stub Hindsight with a config surface that carries BOTH mission keys, so the
+   * observations reader sees a recognised shape. Resolves with the update_bank
+   * arguments once the fire-and-forget push lands.
+   */
+  function runScaffold(
+    currentObservations: string | null,
+    config: AgentConfig,
+    updateBankCalls: Record<string, unknown>[] = [],
+  ): Promise<Record<string, unknown>> {
+    tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-obs-mission-"));
+    let resolveArgs: (a: Record<string, unknown>) => void;
+    const seen = new Promise<Record<string, unknown>>((r) => (resolveArgs = r));
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith("/config")) {
+        return {
+          ok: true,
+          json: async () => ({
+            config: {
+              // Already current, so the retain half is a no-op and cannot be
+              // confused with the observations push under test.
+              retain_mission: DEFAULT_RETAIN_MISSION,
+              observations_mission: currentObservations,
+            },
+          }),
+        } as any;
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (body?.params?.name === "update_bank") {
+        updateBankCalls.push(body.params.arguments as Record<string, unknown>);
+        resolveArgs(body.params.arguments as Record<string, unknown>);
+      }
+      return {
+        ok: true,
+        headers: new Map(),
+        text: async () => JSON.stringify({ result: { isError: false, content: [] } }),
+      } as any;
+    }) as any;
+    scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    return seen;
+  }
+
+  function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+    return {
+      extends: "default",
+      topic_name: "Test Topic",
+      schedule: [],
+      ...overrides,
+    } as AgentConfig;
+  }
+
+  it("seeds the fleet default onto a bank with none", async () => {
+    const config = makeAgentConfig();
+    const seen = runScaffold(null, config);
+    const args = await seen;
+    expect((args.config_updates as Record<string, unknown>).observations_mission).toBe(
+      DEFAULT_OBSERVATIONS_MISSION,
+    );
+  }, 15_000);
+
+  it("does NOT clobber an operator hand-edited observations_mission", async () => {
+    // Both managed missions are left alone here (retain is already current,
+    // observations is hand-edited), so `missions` is empty and the emptiness
+    // guard suppresses update_bank entirely. Asserting "no update_bank call"
+    // is therefore the strongest available statement of "nothing was clobbered".
+    const config = makeAgentConfig();
+    const calls: Record<string, unknown>[] = [];
+    runScaffold("only track cricket scores", config, calls);
+    await flushPendingBankOps(10_000);
+    expect(calls).toEqual([]);
+  }, 15_000);
+
+  it("pushes the operator's yaml observations_mission verbatim when set", async () => {
+    const config = makeAgentConfig({
+      memory: { observations_mission: "operator obs text" },
+    } as Partial<AgentConfig>);
+    const seen = runScaffold(null, config);
+    const args = await seen;
+    expect((args.config_updates as Record<string, unknown>).observations_mission).toBe(
+      "operator obs text",
+    );
   }, 15_000);
 });
 
