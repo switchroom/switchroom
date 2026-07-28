@@ -329,7 +329,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twenty-six keys, by name", () => {
+  it("is overridable on exactly these twenty-seven keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -362,6 +362,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
+      "HINDSIGHT_API_WORKER_MAX_SLOTS",
       // Not HINDSIGHT_API_* — a switchroom-patch knob (the CE-damping
       // rollback hatch), read by the patched reranking module, never by
       // upstream's config parser. Sorts last.
@@ -453,6 +454,75 @@ describe("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY (override-only)", () 
     expect(runEnv(runArgs()).get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([
       MAP,
     ]);
+  });
+});
+
+describe("HINDSIGHT_API_WORKER_MAX_SLOTS (override-only)", () => {
+  const KEY = "HINDSIGHT_API_WORKER_MAX_SLOTS";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group", () => {
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — upstream's own default stands",
+    (caps) => {
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    // The regression: this exact line sat in switchroom.yaml while the
+    // container booted `max_slots=10`, because the key was outside
+    // HINDSIGHT_PERF_ENV_KEYS and resolveHindsightPerfOverrides skipped it.
+    // Asserting only membership in the key set would not catch a gate-shaped
+    // regression on the emit side, so assert the launch argv itself.
+    const perf = { env: { [KEY]: "16" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get(KEY)).toEqual(["16"]);
+    expect(fromCompose.get(KEY)).toEqual(["16"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: "16" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["16"]);
+  });
+
+  it("carries the slot policy's other two terms alongside it", () => {
+    // The point of managing this key at all: the reservation and the ceiling
+    // were already reachable, so an operator could set two of the three terms
+    // of one slot policy and silently lose the third. All three, or none.
+    const perf = {
+      env: {
+        [KEY]: "16",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "5",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT: "6",
+      },
+      processEnv: {},
+    };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    expect(fromRun.get(KEY)).toEqual(["16"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toEqual(["5"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
   });
 });
 

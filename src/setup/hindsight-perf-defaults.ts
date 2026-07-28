@@ -950,11 +950,45 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * Override-only rather than defaulted for the same reason as the two above:
  * emitting upstream's own 365 would add a hard-coded value to every host's
  * `docker inspect` for no behaviour change.
+ *
+ * ### `HINDSIGHT_API_WORKER_MAX_SLOTS`
+ *
+ * The total in-flight task budget for the worker poller — the pool that
+ * `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS` reserves out of and that
+ * every other operation type shares. switchroom already manages the
+ * reservation and the ceiling (both are in {@link
+ * HINDSIGHT_PERF_DEFAULTS_UNGATED}) but not the total they are carved from,
+ * so an operator could set two of the three terms of one slot policy and not
+ * the third.
+ *
+ * That gap is not theoretical. On the reference fleet this line sat in
+ * `hindsight.env` from 2026-07-27 with a measured rationale attached:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_WORKER_MAX_SLOTS: 16
+ * ```
+ *
+ * and the container ran `max_slots=10` — upstream's default — for the whole of
+ * the following day, because the key was outside this module's managed set and
+ * `resolveHindsightPerfOverrides` skipped it. The poller logs the value it
+ * actually booted with (`starting polling loop (max_slots=…)`), so the drop was
+ * observable, but nothing connected that line back to the yaml.
+ *
+ * Override-only rather than defaulted for the same reason as the three above:
+ * switchroom ships no opinion on the total slot budget, and emitting upstream's
+ * own 10 would add a hard-coded value to every host's `docker inspect` for no
+ * behaviour change. Note also that upstream validates the slot policy at boot
+ * (reservations must sum to <= this, and the consolidation ceiling must sit
+ * between the reservation and this), so an incoherent combination fails loudly
+ * in the container rather than silently here.
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
   "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
   "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS",
+  "HINDSIGHT_API_WORKER_MAX_SLOTS",
 ]);
 
 /**
