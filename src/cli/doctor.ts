@@ -53,6 +53,7 @@ import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnex
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
+import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js";
 import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
@@ -1673,6 +1674,14 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // and invisible everywhere else, which is how the whole fleet ran the
   // engine's stock consolidation mission unnoticed (see the function's doc).
   results.push(...(await checkBankObservationsMissions(config, url)));
+
+  // …and whether those scopes still have room to consolidate INTO. Hindsight
+  // caps observations per scope; past the cap the consolidator keeps running,
+  // keeps spending an extraction-model call, and silently drops every create
+  // (consolidator.py:1604-1613). The only signal is an INFO log with no metric
+  // attached, which is why a scope on this fleet sat at 1009/1000 for an
+  // unknown length of time and was found by a human reading `docker logs`.
+  results.push(await checkObservationScopeSaturation(config, url));
 
   // Auto-recall health (#3619). Reachability, ingest, and /health all stayed
   // green through the 2026-07 regression while the busiest agents lost their
