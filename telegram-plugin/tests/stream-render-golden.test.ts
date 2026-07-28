@@ -19,10 +19,14 @@
  * the duplicate. This is the exact duplicate-reply class the shared-singleton
  * injection (never a re-`new`) exists to kill.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { handleSessionEvent, type StreamRenderDeps } from '../gateway/stream-render.js'
+import {
+  handleSessionEvent,
+  __resetParkedTurnStartsForTest,
+  type StreamRenderDeps,
+} from '../gateway/stream-render.js'
 import {
   sendReply,
   type SendReplyGatewayDeps,
@@ -612,6 +616,9 @@ describe('structural — the singleton lives once in gateway, never in the modul
 // the assertion is the OUTCOME the user sees — chat actions on the wire — not
 // the call.
 describe('#3544 — turn-start typing is unconditional at the enqueue seam', () => {
+  // #3927's parked turn-start store is module-scope (one CLI session, one
+  // queue), so reset it between cases for determinism.
+  beforeEach(() => { __resetParkedTurnStartsForTest() })
   interface TypingRig {
     h: StreamHarness
     sent: Array<{ chatId: string; threadId: number | null }>
@@ -669,15 +676,23 @@ describe('#3544 — turn-start typing is unconditional at the enqueue seam', () 
 
   it('FLOOD GUARD: N turns arming on ONE chat inside the floor cost at most ONE chat action', () => {
     const rig = makeTypingRig({ adopts: false })
+    // #3927: a repeated bare `enqueue` no longer mints a turn — while one is
+    // live it PARKS, and the CLI's `dequeue` is what starts the next turn. This
+    // guard is about N turn STARTS coalescing, so drive real starts: the first
+    // enqueue mints (idle) and each later enqueue+dequeue pair mints one more.
+    const startTurn = () => {
+      handleSessionEvent(rig.h.deps, enqueue())
+      handleSessionEvent(rig.h.deps, { kind: 'dequeue' })
+    }
     // 12 arms on one chat inside a single floor window: a real-inbound arm
-    // (turn-start-surfaces) plus repeated enqueue seams / restarts.
+    // (turn-start-surfaces) plus repeated turn-start seams / restarts.
     rig.loop.start(CHAT, null) // stand-in for the real-inbound path's arm
-    for (let i = 0; i < 11; i++) handleSessionEvent(rig.h.deps, enqueue())
+    for (let i = 0; i < 11; i++) startTurn()
     expect(rig.sent).toHaveLength(1) // the floor coalesced all 12
     expect(rig.loop.activeCount()).toBe(1) // restart-safe: no interval pile-up
     // Crossing the floor lets exactly one more through, then the floor holds again.
     rig.clock.t += TYPING_FLOOR_MS
-    for (let i = 0; i < 5; i++) handleSessionEvent(rig.h.deps, enqueue())
+    for (let i = 0; i < 5; i++) startTurn()
     expect(rig.sent).toHaveLength(2)
     rig.loop.stopAll()
     rig.emitter.reset()

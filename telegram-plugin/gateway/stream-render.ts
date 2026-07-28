@@ -94,6 +94,487 @@ import * as pendingProgress from '../pending-work-progress.js'
 import * as signalTracker from '../turn-signal-tracker.js'
 import * as silencePoke from '../silence-poke.js'
 
+
+// ─── #3927: parked turn starts (FIX A) ────────────────────────────────────
+//
+// An `enqueue` transcript record is a QUEUE event, NOT a turn-start event. The
+// claude CLI writes it the moment a message lands on the queue, whether or not
+// a turn is already running. Ground truth from real transcripts (60 agent
+// sessions, 372 enqueues): every enqueue is terminated by exactly ONE of
+//
+//   • `dequeue` — the queue was drained into a NEW user turn. Always the
+//     immediately-preceding enqueue's terminal (199/200 dequeues are directly
+//     preceded by an enqueue); median gap 6 ms when the session was idle, but
+//     2–14 s when the message sat behind a running turn. THIS is turn start.
+//   • `remove`  — the queued item was folded into the ALREADY-RUNNING turn as a
+//     `queued_command` attachment. No new turn exists, and none ever will for
+//     that message. 161/372, and its `content` is byte-identical to its
+//     enqueue's (13/13 exact matches in the carrie session, 160/161 fleet-wide).
+//
+// Treating `enqueue` as turn start therefore minted a brand-new `CurrentTurn`
+// on top of a live one, which (a) froze the running turn's card and opened a
+// fresh one with reset stats, and (b) quoted the just-queued message on a card
+// that then streamed the STILL-RUNNING previous work into it.
+//
+// So: park the envelope while a turn is live and mint on the CLI's own
+// turn-start signal instead. Ordering is LIFO by evidence, not FIFO —
+// `dequeue` pairs with the MOST RECENT enqueue (max observed gap to the newest
+// parked envelope: 14.2 s; the gap to the oldest ran to hours). Popping the
+// oldest would mint a stale, long-since-folded message.
+//
+// BOUNDS (a parked envelope must never live forever — a `dequeue` that never
+// arrives, e.g. because the CLI died mid-turn, must not wedge the lane):
+//   • PARKED_TURN_START_MAX caps the store; the OLDEST is evicted on overflow
+//     (the newest message is the one the user is waiting on). An evicted
+//     envelope still reaches the model — the CLI owns the real queue — it just
+//     loses its own progress card.
+//   • PARKED_TURN_START_TTL_MS prunes on every touch, so a stale envelope can
+//     never be minted as a spurious turn later.
+const PARKED_TURN_START_MAX = 16
+const PARKED_TURN_START_TTL_MS = 30 * 60_000
+
+/** The `enqueue` envelope fields `beginTurn` needs — the SessionEvent minus its
+ *  discriminant. A parked entry additionally carries `parkedAt` for the TTL. */
+export interface TurnStartEnvelope {
+  chatId: string | null
+  messageId: string | null
+  threadId: string | null
+  rawContent: string
+}
+interface ParkedTurnStart extends TurnStartEnvelope {
+  parkedAt: number
+}
+
+/** Arrival-ordered (oldest first). Module-scope by design: it mirrors the ONE
+ *  claude CLI session's ONE queue, exactly like the `currentTurn` mirror. */
+const parkedTurnStarts: ParkedTurnStart[] = []
+
+function pruneParkedTurnStarts(now: number): void {
+  for (let i = parkedTurnStarts.length - 1; i >= 0; i--) {
+    if (now - parkedTurnStarts[i].parkedAt > PARKED_TURN_START_TTL_MS) {
+      const [dropped] = parkedTurnStarts.splice(i, 1)
+      process.stderr.write(
+        `telegram gateway: parked-turn-start expired chat=${dropped.chatId ?? '-'} ` +
+          `msg=${dropped.messageId ?? '-'} age_ms=${now - dropped.parkedAt}\n`,
+      )
+    }
+  }
+}
+
+function parkTurnStart(env: TurnStartEnvelope, now: number): void {
+  parkedTurnStarts.push({ ...env, parkedAt: now })
+  while (parkedTurnStarts.length > PARKED_TURN_START_MAX) {
+    const [dropped] = parkedTurnStarts.splice(0, 1)
+    process.stderr.write(
+      `telegram gateway: parked-turn-start evicted (cap ${PARKED_TURN_START_MAX}) ` +
+        `chat=${dropped.chatId ?? '-'} msg=${dropped.messageId ?? '-'}\n`,
+    )
+  }
+}
+
+/** Pop the MOST RECENTLY parked envelope — the one a `dequeue` pairs with. */
+function takeParkedTurnStart(): ParkedTurnStart | null {
+  return parkedTurnStarts.pop() ?? null
+}
+
+/** Drop the parked envelope a `remove` names (byte-identical `content`), newest
+ *  match first. A `remove` means "folded into the running turn" — that message
+ *  will never get a turn of its own, so leaving it parked would let a LATER
+ *  `dequeue` mint a spurious turn for an already-answered message. */
+function discardParkedTurnStart(rawContent: string): boolean {
+  for (let i = parkedTurnStarts.length - 1; i >= 0; i--) {
+    if (parkedTurnStarts[i].rawContent === rawContent) {
+      parkedTurnStarts.splice(i, 1)
+      return true
+    }
+  }
+  return false
+}
+
+/** Test seam: the parked store is module-scope (one CLI session, one queue), so
+ *  suites that drive `handleSessionEvent` need a deterministic reset. */
+export function __resetParkedTurnStartsForTest(): void {
+  parkedTurnStarts.length = 0
+}
+/** Test seam: parked-envelope count (bound / eviction assertions). */
+export function __parkedTurnStartCountForTest(): number {
+  return parkedTurnStarts.length
+}
+
+/**
+ * Mint the turn atom and open its surfaces. This is the ENTIRE pre-#3927
+ * `case 'enqueue'` body, relocated verbatim except for (a) the hoisted
+ * `ackDelivery` call (which acks RECEIPT and therefore stayed on the enqueue
+ * event) and (b) the FIX B supersession finalizer. Called from `enqueue` only
+ * when the session is idle, and otherwise from `dequeue`.
+ */
+function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
+  const {
+    HANDBACK_PRETURN_ENABLED,
+    STATE_DIR,
+    clearActivitySummary,
+    extractUserPromptPreview,
+    getCurrentTurn,
+    getPendingPtyPartial,
+    handbackPreturnSignal,
+    handlePtyPartial,
+    isDmChatId,
+    makeNarrativeGate,
+    pendingCrossTurnGate,
+    preambleSuppressor,
+    promoteQueuedStatus,
+    rememberRecentTurn,
+    scheduleEarlyLivenessOpen,
+    setCurrentTurn,
+    setPendingPtyPartial,
+    startTurnTypingLoop,
+    statusKey,
+    turnsDb,
+    typingWrapper,
+  } = deps
+  // Drain any orphaned typing-wrap entries left over from a crashed
+  // prior turn before resetting focus.
+  typingWrapper.drainAll()
+  if (ev.chatId) {
+    // #1445 cross-turn pending-async ambient — backstop for the
+    // `handleInbound` path's `clearPending('inbound')`. The
+    // inbound path covers real user messages, but synthesised
+    // wakes (subagent-handback channel turn, cron fires, vault
+    // grant resumes, restart markers) push directly to
+    // `pendingInboundBuffer` and bypass `handleInbound`. The
+    // `enqueue` session-event fires for EVERY fresh turn atom
+    // regardless of source — clearing here drops any prior turn's
+    // ambient before the new turn's `noteOutbound` lands. The
+    // call is idempotent so it's safe to fire in addition to the
+    // inbound-path clear (for the real-inbound case, this is a
+    // no-op because state was already deleted by then).
+    const enqThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
+    pendingProgress.clearPending(
+      statusKey(ev.chatId, enqThreadId),
+      'handback',
+    )
+  }
+  if (ev.chatId) {
+    // Issue #195: if a previous turn left an answer-lane stream open
+    // (rapid steer/queue), force it to a new generation so its in-flight
+    // edits don't mutate the new turn's message. Materialize is best-effort
+    // — we don't await here because turn_end on the prior turn should
+    // have already done it; this is a defensive supersession guard.
+    const prior = getCurrentTurn()
+    if (prior?.answerStream != null) {
+      prior.answerStream.forceNewMessage()
+      prior.answerStream.stop()
+      prior.answerStream = null
+    }
+    // Bounded-leak hardening (A5): clear the prior turn's orphaned-reply
+    // fuse before it is superseded. The fire callback re-reads currentTurn
+    // and no-ops on a stale turn, but proactively clearing the timer avoids
+    // a bounded pile-up of dangling timers across rapid steer/queue turns.
+    if (prior?.orphanedReplyTimeoutId != null) {
+      clearTimeout(prior.orphanedReplyTimeoutId)
+      prior.orphanedReplyTimeoutId = null
+    }
+    // Same bounded-leak class (early-paint 250ms setTimeout): the prior
+    // turn may have armed its narrative gate's early-paint timer before
+    // being superseded. Left untorn, ~250ms later it fires showNarrativeStep
+    // on the dead turn and can paint a stale narration card below the new
+    // turn's surface. Teardown is guard-safe and idempotent (no-op when never
+    // armed / already fired / already disarmed by the prior turn's turn_end).
+    prior?.narrativeGate?.teardown()
+    // FIX B (#3927) — NEVER ORPHAN A SUPERSEDED CARD. Reaching here means a
+    // fresh turn is being minted while `prior` is still the live turn atom.
+    // After FIX A that is rare (a real inbound now parks instead of
+    // preempting), but it is still reachable: a turn whose `turn_end` was
+    // never observed (bridge death, transcript gap, an unclean restart)
+    // leaves a live-looking atom in the slot, and the next genuine
+    // dequeue-driven turn start must not inherit its surfaces. Pre-fix, the
+    // teardown above dropped the answer stream, the orphaned-reply fuse and
+    // the narrative gate but NEVER touched the activity card — so the card
+    // froze on its last landed edit, kept the `fg:<statusKey>` status pin
+    // forever, and left NO `turn-lifecycle clear` line to explain it (carrie
+    // 2026-07-28, turn `-1004223464247:_#1078`). `clearActivitySummary`
+    // finalizes/deletes the card AND releases the pin; it is idempotent and
+    // no-ops when the turn never opened a card.
+    // `endedAt == null` narrows this to a turn that never ended: a turn that
+    // ended normally already ran its own `clearActivitySummary` + `clear`
+    // log, and `endCurrentTurnAtomic` nulls the mirror, so this is a
+    // belt-and-braces guard against double-finalizing / double-logging.
+    if (prior != null && prior.endedAt == null) {
+      clearActivitySummary(prior)
+      // The missing breadcrumb: a clobber must never again be invisible.
+      // Same field format as every other `turn-lifecycle clear`.
+      process.stderr.write(
+        `telegram gateway: ${formatTurnLifecycle('clear', 'superseded', prior, Date.now())}\n`,
+      )
+    }
+    // #1067: swap the entire turn atom in one assignment. Every
+    // handler captures `const turn = currentTurn` at entry, so a
+    // captured-then-awaited read can't reattribute to the new turn.
+    const startedAt = Date.now()
+    // Component 3 — stable per-turn identity. For a real inbound this
+    // matches the `origin_turn_id` stamped into the inbound meta at
+    // build time (same chat/thread/messageId). Synthetic turns (cron /
+    // handback — no messageId) get a unique startedAt-based fallback id
+    // that no reply will ever echo, so they correctly fall through to
+    // the live-turn routing in resolveAnswerThreadId.
+    const enqThreadIdNum = ev.threadId != null ? Number(ev.threadId) : undefined
+    const turnId =
+      deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
+      ?? `${chatKey(ev.chatId, enqThreadIdNum ?? null)}#synthetic-${startedAt}`
+    // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Consume any
+    // pending cross-turn gate `obligationSweep` armed for THIS exact turn
+    // when it pushed an `obligation_represent` inbound. The gate is keyed on
+    // the obligation's `originTurnId`, and the represent inbound reuses the
+    // original chat/thread/messageId, so this turn's `turnId` (derived just
+    // above) equals that key iff this turn IS the represent surface armed for.
+    // An unrelated foreground turn on the same chat/thread derives a
+    // different `turnId` → finds no entry → no gate → its card opens normally
+    // (correct). Consume-once: delete on read so the matched gate can't leak
+    // forward, and a never-matched stale gate can never suppress another turn.
+    const xTurnGateKey = turnId
+    const consumedCrossTurnGate = pendingCrossTurnGate.get(xTurnGateKey)
+    if (consumedCrossTurnGate != null) pendingCrossTurnGate.delete(xTurnGateKey)
+    const next: CurrentTurn = {
+      sessionChatId: ev.chatId,
+      sessionThreadId: enqThreadIdNum,
+      // Accept the inbound id as a reply anchor only when it is a plausible
+      // Telegram message id. Synthetic boot-resume inbounds fabricate a
+      // 13-digit Date.now() message_id (for ack-tracking); if that reached
+      // the activity-feed reply anchor it 400'd every feed send and darkened
+      // the live feed for the whole resume turn (2026-06-05). The ack-queue
+      // still keys on ev.messageId independently — only the anchor is gated.
+      sourceMessageId: parseSourceMessageId(ev.messageId),
+      startedAt,
+      gatewayReceiveAt: startedAt,
+      // #2527 — stamp the loop role once, from the enqueue envelope.
+      role: deriveTurnRole(ev.rawContent),
+      // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Only a
+      // synthetic represent/owed-reply turn carries this; a foreground turn
+      // leaves it undefined and the cross-turn card-OPEN gate is inert.
+      ...(consumedCrossTurnGate != null ? { crossTurnGate: consumedCrossTurnGate } : {}),
+      replyCalled: false,
+      finalAnswerDelivered: false,
+      finalAnswerSubstantive: false,
+      // Sticky latch — reset ONLY here (turn start), never by reopen.
+      finalAnswerEverDelivered: false,
+      // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race
+      // latch, reset at turn start alongside the other answer flags.
+      answerDelivered: false,
+      // #3429 — flushed-answer text for the content-vs-flush latch
+      // discrimination; stamped at flush arm, reset at turn start.
+      flushedAnswerText: null,
+      // 2026-07 double-reply-on-DM fix (F2) — stamped at turn end.
+      endedAt: null,
+      firstPingAt: null,
+      // Notification ownership (R8 / PR-2): no slot claimed yet, so the
+      // "claimer was substantive" flag starts false. Set atomically with
+      // firstPingAt at the over-ping decision site.
+      firstPingWasSubstantive: false,
+      silentAnchorMessageId: null,
+      silentAnchorText: '',
+      capturedText: [],
+      capturedBlockMeta: [],
+      orphanedReplyTimeoutId: null,
+      answerReadyFlushTimeoutId: null,
+      // Fresh liveness tracker: lastStreamEventAt seeded to the turn start
+      // so a turn that never streams still trips the fuse after windowMs.
+      liveness: new LivenessTracker(startedAt),
+      turnId,
+      registryKey: null,
+      noReplyDrainTimer: null,
+      lastAssistantMsgId: null,
+      lastAssistantDone: false,
+      toolCallCount: 0,
+      labeledToolCount: 0,
+      totalTokens: 0,
+      seenUsageMessageIds: new Set<string>(),
+      activityMessageId: null,
+      activityInFlight: null,
+      activityPendingRender: null,
+      activityLastSentRender: null,
+      activityEverOpened: false,
+      activityDrainFailures: 0,
+      mirrorLines: [],
+      // Assigned immediately after this literal via makeNarrativeGate(next) —
+      // the controller's SHOW/RETRACT effects close over the turn object, which
+      // can't reference itself inside its own initializer.
+      narrativeGate: undefined as unknown as NarrativeFlushController,
+      lastReplyText: '',
+      foregroundSubAgents: new Map(),
+      answerStream: null,
+      isDm: isDmChatId(ev.chatId),
+      // PR-4a — construct ONE emission-authority façade per turn, passing
+      // the chat/thread key in EXPLICITLY (the PR-4e seam; today equal to
+      // the singleton-sourced key). Per-turn: born with this turn literal,
+      // discarded with it — never persists across turns.
+      emissionAuthority: new EmissionAuthority(
+        statusKey(ev.chatId, enqThreadIdNum),
+      ),
+    }
+    // Wire the per-turn narrative gate now that `next` exists (its SHOW/RETRACT
+    // effects close over the turn). Born with this turn, torn down at turn end.
+    next.narrativeGate = makeNarrativeGate(next)
+    // Dead-air pre-turn signal — ADOPT by inbound identity (design lever 2).
+    // If a subagent-handback pre-turn signal was emitted for THIS exact turn
+    // (matched on `turnId`, not the bare topic key, so a racing user inbound
+    // can't mis-adopt), consume it. A card-bearing adoption seeds
+    // `activityMessageId` + `activityEverOpened` so `renderActivityFeed`
+    // EDITS the existing card instead of opening a second one, and so the
+    // turn's own end-of-turn `clearActivitySummary` finalizes it (lever 3).
+    if (HANDBACK_PRETURN_ENABLED) {
+      const handbackAdoption = handbackPreturnSignal.tryAdopt(turnId)
+      if (handbackAdoption != null) {
+        if (handbackAdoption.activityMessageId != null) {
+          next.activityMessageId = handbackAdoption.activityMessageId
+          next.activityEverOpened = true
+        }
+        // Observability (#3544): adoption is the rare, previously-silent
+        // branch — one line per adopted handback turn, not per turn.
+        process.stderr.write(
+          `telegram gateway: handback pre-turn adopted turnId=${turnId} ` +
+            `key=${handbackAdoption.statusKey} card=${handbackAdoption.activityMessageId ?? 'none'}\n`,
+        )
+      }
+    }
+    // #3544 — arm the turn-long `typing…` loop for EVERY minted turn,
+    // unconditionally. It used to hang off the handback ADOPTION above,
+    // which misses whenever the pre-turn entry was deduped (parallel
+    // workers on one topic), had no derivable turn id, or was already
+    // reaped — and the whole compose window went dark. Only the real-inbound
+    // path (`turn-start-surfaces.ts`) armed a loop, so a synthetic turn
+    // (handback / cron / wake) could have none at all. Unconditional is safe
+    // and costs nothing extra on the wire:
+    //   - `turnTypingLoop.start` is restart-safe (stops any prior loop on
+    //     the key first, so a real inbound's loop is replaced, not doubled);
+    //   - every send goes through the SHARED per-chat-key emitter floor
+    //     (`typing-emitter.ts`, TYPING_FLOOR_MS) so N arms on one chat still
+    //     cost at most one chat action per floor window — the 2026-07-11
+    //     flood-ban guard is what makes arming more loops free;
+    //   - `turn-end.ts` (`purgeReactionTracking → stopTurnTypingLoop`) is
+    //     already the single stop-owner for ALL turns, and a start is
+    //     self-healing anyway, so this cannot leak an interval.
+    startTurnTypingLoop(ev.chatId, enqThreadIdNum ?? null)
+    // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
+    // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
+    // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
+    // the SAME statusKey the ctor's façade was constructed with just above.
+    setCurrentTurn(next, statusKey(ev.chatId, enqThreadIdNum))
+    // (turn start already stamped the idle clock at the top of
+    // handleSessionEvent, along with every other session event — see the
+    // idle-clear block there.)
+    // Early-open the "Working…" liveness card at turn start so narration /
+    // thinking emitted BEFORE the first tool surfaces within ~a second
+    // instead of after the old 12 s threshold (the dead-air gap). Fires the
+    // SAME `openLivenessFeedIfDue` the 6 s heartbeat uses — a no-op if a
+    // tool/narrative already opened the card, and gated by `mayOpenActivityCard`
+    // (lever 1/4) so it never opens below a delivered answer. Scoped to real
+    // turns by construction: only the `enqueue` lifecycle event reaches here,
+    // and anonymous one-shot hook clients (recall.py) never emit it.
+    scheduleEarlyLivenessOpen(next)
+    // Status-surface observability: one line at every turn SET so a later
+    // dark card is traceable to which turn/topic key it belonged to.
+    process.stderr.write(
+      `telegram gateway: ${formatTurnLifecycle('set', 'enqueue', next, startedAt)}\n`,
+    )
+    // Component 3 — retain in the bounded recently-ended registry so a
+    // LATE reply (landing after currentTurn flips to a successor) can
+    // still resolve THIS turn's origin thread by its turnId.
+    rememberRecentTurn(next)
+    // Component 5 (Hook B) — this turn's topic had a queued placeholder
+    // from Hook A; promote it to "On it — replying now." (deleted later
+    // when the answer lands). No-op when there's no placeholder / DM.
+    promoteQueuedStatus(ev.chatId, enqThreadIdNum)
+    // PR3b-cutover: feed the authoritative turn-start to the delivery
+    // machine. `enqueue` fires for EVERY turn atom regardless of
+    // source — inbound, cron, subagent-handback, vault-resume,
+    // restart-marker — so it is the single chokepoint that captures
+    // the non-inbound turns the machine's own `inbound` event never
+    // sees (those bypass handleInbound). Without it the machine reads
+    // idle during a cron/handback turn and the gate would mis-deliver
+    // a concurrent inbound mid-turn (the #1556 composer wedge).
+    // Idempotent when already in_turn (turnStart only sets perKey).
+    shadowEmit({
+      kind: 'turnStart',
+      key: statusKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : undefined) as _ChatKey,
+      at: startedAt,
+    })
+    // #549 fix — fresh turn, reset preamble-suppression state.
+    preambleSuppressor.reset()
+    // Reset the silent-end retry budget for this chat. The stored
+    // turnKey is `chat:thread` shape (no per-instance suffix), so
+    // without an explicit per-turn clear, `writeSilentEndState`
+    // (silent-end.ts:114) inherits `retryCount` across turns
+    // whenever a prior turn for the same chat hit retryCount=1.
+    // The Stop hook then sees `retryCount >= MAX_RETRIES=1` on the
+    // very first silent-end of every subsequent turn and bails
+    // without re-prompting. finn hit this on 2026-05-25 with a
+    // stuck retryCount=1 file. A new turn invalidates any prior
+    // turn's retry budget by definition; clear it eagerly here.
+    // ev.threadId is `string | null` (Telegram's wire shape);
+    // statusKey wants `number | null` — same conversion as the
+    // registry-key branch a few lines down.
+    clearSilentEndState(statusKey(
+      ev.chatId,
+      ev.threadId != null ? Number(ev.threadId) : null,
+    ))
+    // Stage 3b: stamp turn-start in the registry. turn_key is
+    // chat:thread:startTs — unique per turn, distinct from the
+    // progress-card-driver's per-chat sequence number (these are two
+    // independent identifier schemes and don't need to align).
+    if (turnsDb != null) {
+      // ev.threadId is `string | null` (Telegram emits as string); convert
+      // to number for chatKeyWithSuffix. Number(null) = 0 which canonicalizes
+      // to '_' — same as the explicit `null` branch below.
+      const evThreadIdNum = ev.threadId != null ? Number(ev.threadId) : null
+      const turnKey = chatKeyWithSuffix(ev.chatId, evThreadIdNum, String(startedAt))
+      next.registryKey = turnKey
+      // Phase 1 of #332: capture first ~200 chars of the user's message.
+      const userPromptPreview = extractUserPromptPreview(ev.rawContent)
+      // Closes #472 finding #11. Pre-fix: this write was scheduled
+      // via setImmediate to "avoid stalling the turn handler" — but
+      // SQLite local writes are sub-millisecond, and the deferral
+      // opened a SIGTERM race window: a kill landing in the gap
+      // between scheduling and firing left a turn with no start
+      // row, invisible to the resume protocol (the user sent a
+      // message, the gateway lost it, no SWITCHROOM_PENDING_TURN
+      // env on next boot). Sibling writeTurnActiveMarker has always
+      // been synchronous here; this matches it.
+      try {
+        recordTurnStart(turnsDb, {
+          turnKey,
+          chatId: String(ev.chatId),
+          threadId: ev.threadId != null ? String(ev.threadId) : null,
+          lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
+          userPromptPreview,
+        })
+      } catch (err) {
+        process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
+      }
+      // #412: turn-active marker for the bridge-watchdog. File exists
+      // for the duration of the in-flight turn; mtime advances on
+      // every tool_use; deleted on turn_complete. The watchdog
+      // distinguishes wedged-mid-turn from healthy-idle by checking
+      // for this file's presence + mtime staleness.
+      writeTurnActiveMarker(STATE_DIR, {
+        turnKey,
+        chatId: String(ev.chatId),
+        threadId: ev.threadId != null ? String(ev.threadId) : null,
+        startedAt,
+      })
+    }
+    // (accessor-narrowing spelling: the pre-move body guarded the
+    // `pendingPtyPartial` variable then re-read it into `pending`; the
+    // injected accessor is a call expression TS can't narrow across, so
+    // capture once then guard the local — equivalent, no await between.)
+    const pending = getPendingPtyPartial()
+    if (pending != null) {
+      setPendingPtyPartial(null)
+      handlePtyPartial(pending)
+    }
+  }
+}
+
+
 export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): void {
   const {
     ANSWER_LANE,
@@ -209,241 +690,33 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
   }
   switch (ev.kind) {
     case 'enqueue': {
-      // Drain any orphaned typing-wrap entries left over from a crashed
-      // prior turn before resetting focus.
-      typingWrapper.drainAll()
+      // #3927 FIX A — an `enqueue` is a QUEUE event, not a turn START event
+      // (see the parked-turn-start block at the top of this module for the
+      // transcript evidence). Mint ONLY when the session is genuinely idle;
+      // otherwise park the envelope and let the CLI's own `dequeue` start the
+      // turn, or its `remove` discard it (the message was folded into the
+      // running turn and will never own a turn).
+      const enqThreadIdNum = ev.threadId != null ? Number(ev.threadId) : undefined
+      const now = Date.now()
       if (ev.chatId) {
-        // #1445 cross-turn pending-async ambient — backstop for the
-        // `handleInbound` path's `clearPending('inbound')`. The
-        // inbound path covers real user messages, but synthesised
-        // wakes (subagent-handback channel turn, cron fires, vault
-        // grant resumes, restart markers) push directly to
-        // `pendingInboundBuffer` and bypass `handleInbound`. The
-        // `enqueue` session-event fires for EVERY fresh turn atom
-        // regardless of source — clearing here drops any prior turn's
-        // ambient before the new turn's `noteOutbound` lands. The
-        // call is idempotent so it's safe to fire in addition to the
-        // inbound-path clear (for the real-inbound case, this is a
-        // no-op because state was already deleted by then).
-        const enqThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
-        pendingProgress.clearPending(
-          statusKey(ev.chatId, enqThreadId),
-          'handback',
-        )
-      }
-      if (ev.chatId) {
-        // Issue #195: if a previous turn left an answer-lane stream open
-        // (rapid steer/queue), force it to a new generation so its in-flight
-        // edits don't mutate the new turn's message. Materialize is best-effort
-        // — we don't await here because turn_end on the prior turn should
-        // have already done it; this is a defensive supersession guard.
-        const prior = getCurrentTurn()
-        if (prior?.answerStream != null) {
-          prior.answerStream.forceNewMessage()
-          prior.answerStream.stop()
-          prior.answerStream = null
-        }
-        // Bounded-leak hardening (A5): clear the prior turn's orphaned-reply
-        // fuse before it is superseded. The fire callback re-reads currentTurn
-        // and no-ops on a stale turn, but proactively clearing the timer avoids
-        // a bounded pile-up of dangling timers across rapid steer/queue turns.
-        if (prior?.orphanedReplyTimeoutId != null) {
-          clearTimeout(prior.orphanedReplyTimeoutId)
-          prior.orphanedReplyTimeoutId = null
-        }
-        // Same bounded-leak class (early-paint 250ms setTimeout): the prior
-        // turn may have armed its narrative gate's early-paint timer before
-        // being superseded. Left untorn, ~250ms later it fires showNarrativeStep
-        // on the dead turn and can paint a stale narration card below the new
-        // turn's surface. Teardown is guard-safe and idempotent (no-op when never
-        // armed / already fired / already disarmed by the prior turn's turn_end).
-        prior?.narrativeGate?.teardown()
-        // #1067: swap the entire turn atom in one assignment. Every
-        // handler captures `const turn = currentTurn` at entry, so a
-        // captured-then-awaited read can't reattribute to the new turn.
-        const startedAt = Date.now()
-        // Component 3 — stable per-turn identity. For a real inbound this
-        // matches the `origin_turn_id` stamped into the inbound meta at
-        // build time (same chat/thread/messageId). Synthetic turns (cron /
-        // handback — no messageId) get a unique startedAt-based fallback id
-        // that no reply will ever echo, so they correctly fall through to
-        // the live-turn routing in resolveAnswerThreadId.
-        const enqThreadIdNum = ev.threadId != null ? Number(ev.threadId) : undefined
-        const turnId =
-          deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
-          ?? `${chatKey(ev.chatId, enqThreadIdNum ?? null)}#synthetic-${startedAt}`
-        // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Consume any
-        // pending cross-turn gate `obligationSweep` armed for THIS exact turn
-        // when it pushed an `obligation_represent` inbound. The gate is keyed on
-        // the obligation's `originTurnId`, and the represent inbound reuses the
-        // original chat/thread/messageId, so this turn's `turnId` (derived just
-        // above) equals that key iff this turn IS the represent surface armed for.
-        // An unrelated foreground turn on the same chat/thread derives a
-        // different `turnId` → finds no entry → no gate → its card opens normally
-        // (correct). Consume-once: delete on read so the matched gate can't leak
-        // forward, and a never-matched stale gate can never suppress another turn.
-        const xTurnGateKey = turnId
-        const consumedCrossTurnGate = pendingCrossTurnGate.get(xTurnGateKey)
-        if (consumedCrossTurnGate != null) pendingCrossTurnGate.delete(xTurnGateKey)
-        const next: CurrentTurn = {
-          sessionChatId: ev.chatId,
-          sessionThreadId: enqThreadIdNum,
-          // Accept the inbound id as a reply anchor only when it is a plausible
-          // Telegram message id. Synthetic boot-resume inbounds fabricate a
-          // 13-digit Date.now() message_id (for ack-tracking); if that reached
-          // the activity-feed reply anchor it 400'd every feed send and darkened
-          // the live feed for the whole resume turn (2026-06-05). The ack-queue
-          // still keys on ev.messageId independently — only the anchor is gated.
-          sourceMessageId: parseSourceMessageId(ev.messageId),
-          startedAt,
-          gatewayReceiveAt: startedAt,
-          // #2527 — stamp the loop role once, from the enqueue envelope.
-          role: deriveTurnRole(ev.rawContent),
-          // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Only a
-          // synthetic represent/owed-reply turn carries this; a foreground turn
-          // leaves it undefined and the cross-turn card-OPEN gate is inert.
-          ...(consumedCrossTurnGate != null ? { crossTurnGate: consumedCrossTurnGate } : {}),
-          replyCalled: false,
-          finalAnswerDelivered: false,
-          finalAnswerSubstantive: false,
-          // Sticky latch — reset ONLY here (turn start), never by reopen.
-          finalAnswerEverDelivered: false,
-          // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race
-          // latch, reset at turn start alongside the other answer flags.
-          answerDelivered: false,
-          // #3429 — flushed-answer text for the content-vs-flush latch
-          // discrimination; stamped at flush arm, reset at turn start.
-          flushedAnswerText: null,
-          // 2026-07 double-reply-on-DM fix (F2) — stamped at turn end.
-          endedAt: null,
-          firstPingAt: null,
-          // Notification ownership (R8 / PR-2): no slot claimed yet, so the
-          // "claimer was substantive" flag starts false. Set atomically with
-          // firstPingAt at the over-ping decision site.
-          firstPingWasSubstantive: false,
-          silentAnchorMessageId: null,
-          silentAnchorText: '',
-          capturedText: [],
-          capturedBlockMeta: [],
-          orphanedReplyTimeoutId: null,
-          answerReadyFlushTimeoutId: null,
-          // Fresh liveness tracker: lastStreamEventAt seeded to the turn start
-          // so a turn that never streams still trips the fuse after windowMs.
-          liveness: new LivenessTracker(startedAt),
-          turnId,
-          registryKey: null,
-          noReplyDrainTimer: null,
-          lastAssistantMsgId: null,
-          lastAssistantDone: false,
-          toolCallCount: 0,
-          labeledToolCount: 0,
-          totalTokens: 0,
-          seenUsageMessageIds: new Set<string>(),
-          activityMessageId: null,
-          activityInFlight: null,
-          activityPendingRender: null,
-          activityLastSentRender: null,
-          activityEverOpened: false,
-          activityDrainFailures: 0,
-          mirrorLines: [],
-          // Assigned immediately after this literal via makeNarrativeGate(next) —
-          // the controller's SHOW/RETRACT effects close over the turn object, which
-          // can't reference itself inside its own initializer.
-          narrativeGate: undefined as unknown as NarrativeFlushController,
-          lastReplyText: '',
-          foregroundSubAgents: new Map(),
-          answerStream: null,
-          isDm: isDmChatId(ev.chatId),
-          // PR-4a — construct ONE emission-authority façade per turn, passing
-          // the chat/thread key in EXPLICITLY (the PR-4e seam; today equal to
-          // the singleton-sourced key). Per-turn: born with this turn literal,
-          // discarded with it — never persists across turns.
-          emissionAuthority: new EmissionAuthority(
-            statusKey(ev.chatId, enqThreadIdNum),
-          ),
-        }
-        // Wire the per-turn narrative gate now that `next` exists (its SHOW/RETRACT
-        // effects close over the turn). Born with this turn, torn down at turn end.
-        next.narrativeGate = makeNarrativeGate(next)
-        // Dead-air pre-turn signal — ADOPT by inbound identity (design lever 2).
-        // If a subagent-handback pre-turn signal was emitted for THIS exact turn
-        // (matched on `turnId`, not the bare topic key, so a racing user inbound
-        // can't mis-adopt), consume it. A card-bearing adoption seeds
-        // `activityMessageId` + `activityEverOpened` so `renderActivityFeed`
-        // EDITS the existing card instead of opening a second one, and so the
-        // turn's own end-of-turn `clearActivitySummary` finalizes it (lever 3).
-        if (HANDBACK_PRETURN_ENABLED) {
-          const handbackAdoption = handbackPreturnSignal.tryAdopt(turnId)
-          if (handbackAdoption != null) {
-            if (handbackAdoption.activityMessageId != null) {
-              next.activityMessageId = handbackAdoption.activityMessageId
-              next.activityEverOpened = true
-            }
-            // Observability (#3544): adoption is the rare, previously-silent
-            // branch — one line per adopted handback turn, not per turn.
-            process.stderr.write(
-              `telegram gateway: handback pre-turn adopted turnId=${turnId} ` +
-                `key=${handbackAdoption.statusKey} card=${handbackAdoption.activityMessageId ?? 'none'}\n`,
-            )
-          }
-        }
-        // #3544 — arm the turn-long `typing…` loop for EVERY minted turn,
-        // unconditionally. It used to hang off the handback ADOPTION above,
-        // which misses whenever the pre-turn entry was deduped (parallel
-        // workers on one topic), had no derivable turn id, or was already
-        // reaped — and the whole compose window went dark. Only the real-inbound
-        // path (`turn-start-surfaces.ts`) armed a loop, so a synthetic turn
-        // (handback / cron / wake) could have none at all. Unconditional is safe
-        // and costs nothing extra on the wire:
-        //   - `turnTypingLoop.start` is restart-safe (stops any prior loop on
-        //     the key first, so a real inbound's loop is replaced, not doubled);
-        //   - every send goes through the SHARED per-chat-key emitter floor
-        //     (`typing-emitter.ts`, TYPING_FLOOR_MS) so N arms on one chat still
-        //     cost at most one chat action per floor window — the 2026-07-11
-        //     flood-ban guard is what makes arming more loops free;
-        //   - `turn-end.ts` (`purgeReactionTracking → stopTurnTypingLoop`) is
-        //     already the single stop-owner for ALL turns, and a start is
-        //     self-healing anyway, so this cannot leak an interval.
-        startTurnTypingLoop(ev.chatId, enqThreadIdNum ?? null)
-        // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
-        // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
-        // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
-        // the SAME statusKey the ctor's façade was constructed with just above.
-        setCurrentTurn(next, statusKey(ev.chatId, enqThreadIdNum))
-        // (turn start already stamped the idle clock at the top of
-        // handleSessionEvent, along with every other session event — see the
-        // idle-clear block there.)
-        // Early-open the "Working…" liveness card at turn start so narration /
-        // thinking emitted BEFORE the first tool surfaces within ~a second
-        // instead of after the old 12 s threshold (the dead-air gap). Fires the
-        // SAME `openLivenessFeedIfDue` the 6 s heartbeat uses — a no-op if a
-        // tool/narrative already opened the card, and gated by `mayOpenActivityCard`
-        // (lever 1/4) so it never opens below a delivered answer. Scoped to real
-        // turns by construction: only the `enqueue` lifecycle event reaches here,
-        // and anonymous one-shot hook clients (recall.py) never emit it.
-        scheduleEarlyLivenessOpen(next)
-        // Status-surface observability: one line at every turn SET so a later
-        // dark card is traceable to which turn/topic key it belonged to.
-        process.stderr.write(
-          `telegram gateway: ${formatTurnLifecycle('set', 'enqueue', next, startedAt)}\n`,
-        )
-        // Component 3 — retain in the bounded recently-ended registry so a
-        // LATE reply (landing after currentTurn flips to a successor) can
-        // still resolve THIS turn's origin thread by its turnId.
-        rememberRecentTurn(next)
-        // Component 5 (Hook B) — this turn's topic had a queued placeholder
-        // from Hook A; promote it to "On it — replying now." (deleted later
-        // when the answer lands). No-op when there's no placeholder / DM.
-        promoteQueuedStatus(ev.chatId, enqThreadIdNum)
-        // Ack inbound delivery (the marko drop-wedge): claude actually started
-        // this turn, so its delivered inbound landed — stop tracking it for
-        // re-delivery. `enqueue` carries the same chat/thread the inbound was
-        // keyed on, so the key matches.
+        // Ack inbound delivery (the marko drop-wedge): the message reached
+        // claude's queue, so its delivered inbound landed — stop tracking it
+        // for re-delivery. `enqueue` carries the same chat/thread the inbound
+        // was keyed on, so the key matches.
+        //
+        // #3927: this ack stays on the ENQUEUE event and did NOT move into
+        // `beginTurn` with the rest of the old body. It asserts RECEIPT, not
+        // turn start — and receipt is exactly what an enqueue proves. A parked
+        // envelope whose terminal turns out to be `remove` (folded into the
+        // running turn) never reaches `beginTurn` at all, so acking there would
+        // leave that message tracked forever and the delivery machine would
+        // re-deliver it: a duplicate inbound.
         if (DELIVERY_CONFIRM_ENABLED) {
-          // Match on the source message id: `enqueue` fires for EVERY turn
-          // start (cron / subagent-handback / vault-resume / restart-marker
-          // too — see comment below), so a key-only ack would let a synthetic
-          // turn clear a real user message still waiting under the same key.
+          // Match on the source message id: `enqueue` fires for EVERY queued
+          // message regardless of source (cron / subagent-handback /
+          // vault-resume / restart-marker too), so a key-only ack would let a
+          // synthetic turn clear a real user message still waiting under the
+          // same key.
           ackDelivery(
             deliveryQueue,
             chatKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : null),
@@ -457,97 +730,81 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
             ev.rawContent,
           )
         }
-        // PR3b-cutover: feed the authoritative turn-start to the delivery
-        // machine. `enqueue` fires for EVERY turn atom regardless of
-        // source — inbound, cron, subagent-handback, vault-resume,
-        // restart-marker — so it is the single chokepoint that captures
-        // the non-inbound turns the machine's own `inbound` event never
-        // sees (those bypass handleInbound). Without it the machine reads
-        // idle during a cron/handback turn and the gate would mis-deliver
-        // a concurrent inbound mid-turn (the #1556 composer wedge).
-        // Idempotent when already in_turn (turnStart only sets perKey).
-        shadowEmit({
-          kind: 'turnStart',
-          key: statusKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : undefined) as _ChatKey,
-          at: startedAt,
-        })
-        // #549 fix — fresh turn, reset preamble-suppression state.
-        preambleSuppressor.reset()
-        // Reset the silent-end retry budget for this chat. The stored
-        // turnKey is `chat:thread` shape (no per-instance suffix), so
-        // without an explicit per-turn clear, `writeSilentEndState`
-        // (silent-end.ts:114) inherits `retryCount` across turns
-        // whenever a prior turn for the same chat hit retryCount=1.
-        // The Stop hook then sees `retryCount >= MAX_RETRIES=1` on the
-        // very first silent-end of every subsequent turn and bails
-        // without re-prompting. finn hit this on 2026-05-25 with a
-        // stuck retryCount=1 file. A new turn invalidates any prior
-        // turn's retry budget by definition; clear it eagerly here.
-        // ev.threadId is `string | null` (Telegram's wire shape);
-        // statusKey wants `number | null` — same conversion as the
-        // registry-key branch a few lines down.
-        clearSilentEndState(statusKey(
-          ev.chatId,
-          ev.threadId != null ? Number(ev.threadId) : null,
-        ))
-        // Stage 3b: stamp turn-start in the registry. turn_key is
-        // chat:thread:startTs — unique per turn, distinct from the
-        // progress-card-driver's per-chat sequence number (these are two
-        // independent identifier schemes and don't need to align).
-        if (turnsDb != null) {
-          // ev.threadId is `string | null` (Telegram emits as string); convert
-          // to number for chatKeyWithSuffix. Number(null) = 0 which canonicalizes
-          // to '_' — same as the explicit `null` branch below.
-          const evThreadIdNum = ev.threadId != null ? Number(ev.threadId) : null
-          const turnKey = chatKeyWithSuffix(ev.chatId, evThreadIdNum, String(startedAt))
-          next.registryKey = turnKey
-          // Phase 1 of #332: capture first ~200 chars of the user's message.
-          const userPromptPreview = extractUserPromptPreview(ev.rawContent)
-          // Closes #472 finding #11. Pre-fix: this write was scheduled
-          // via setImmediate to "avoid stalling the turn handler" — but
-          // SQLite local writes are sub-millisecond, and the deferral
-          // opened a SIGTERM race window: a kill landing in the gap
-          // between scheduling and firing left a turn with no start
-          // row, invisible to the resume protocol (the user sent a
-          // message, the gateway lost it, no SWITCHROOM_PENDING_TURN
-          // env on next boot). Sibling writeTurnActiveMarker has always
-          // been synchronous here; this matches it.
-          try {
-            recordTurnStart(turnsDb, {
-              turnKey,
-              chatId: String(ev.chatId),
-              threadId: ev.threadId != null ? String(ev.threadId) : null,
-              lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
-              userPromptPreview,
-            })
-          } catch (err) {
-            process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
-          }
-          // #412: turn-active marker for the bridge-watchdog. File exists
-          // for the duration of the in-flight turn; mtime advances on
-          // every tool_use; deleted on turn_complete. The watchdog
-          // distinguishes wedged-mid-turn from healthy-idle by checking
-          // for this file's presence + mtime staleness.
-          writeTurnActiveMarker(STATE_DIR, {
-            turnKey,
-            chatId: String(ev.chatId),
-            threadId: ev.threadId != null ? String(ev.threadId) : null,
-            startedAt,
-          })
-        }
-        // (accessor-narrowing spelling: the pre-move body guarded the
-        // `pendingPtyPartial` variable then re-read it into `pending`; the
-        // injected accessor is a call expression TS can't narrow across, so
-        // capture once then guard the local — equivalent, no await between.)
-        const pending = getPendingPtyPartial()
-        if (pending != null) {
-          setPendingPtyPartial(null)
-          handlePtyPartial(pending)
-        }
       }
+      pruneParkedTurnStarts(now)
+      // `enqueue` with no chat can never mint a turn (the whole mint block is
+      // `if (ev.chatId)`-gated); parking it would only pollute the store, so
+      // run the pre-turn drain path verbatim and stop.
+      if (!ev.chatId) {
+        beginTurn(deps, ev)
+        return
+      }
+      // The live-turn probe is the module's ONLY turn accessor: the
+      // most-recently-set turn mirror. Under the sequential-CLI invariant that
+      // IS the live turn, and `endedAt` (stamped in turn-end.ts) is the second
+      // guard for a mirror that outlived its turn. A non-empty parked store is
+      // equally disqualifying: the CLI's queue is not drained, so this message
+      // is queued BEHIND those and minting now would reorder them.
+      const live = getCurrentTurn()
+      const sessionBusy = live != null && live.endedAt == null
+      if (!sessionBusy && parkedTurnStarts.length === 0) {
+        beginTurn(deps, ev)
+        return
+      }
+      // PARKED. Deliberately NO surface work here — no `promoteQueuedStatus`
+      // ("On it — replying now" is a lie until the turn actually starts), no
+      // `typingWrapper.drainAll()` (that drains the LIVE turn's wraps), no card.
+      // The queued placeholder Hook A already posted is the honest surface, and
+      // its lifecycle stays owned by the existing reap machinery.
+      //
+      // UNIFORM ACROSS SOURCES — synthetic enqueues (cron fire, subagent
+      // handback, obligation-represent, vault-grant resume, wake inbound) park
+      // exactly like a real inbound and do NOT preempt. That is not a policy
+      // choice, it is what the CLI does: carrie's `obligation_represent`
+      // enqueue at 2026-07-28T18:19:07.032Z was terminated by a `remove` at
+      // 18:19:59.794Z (folded into the running turn as a `queued_command`
+      // attachment), never by a `dequeue`. Minting for it invented a turn the
+      // CLI never started. FIX B covers the residual case where a mint DOES
+      // land on top of a live atom.
+      parkTurnStart(
+        {
+          chatId: ev.chatId,
+          messageId: ev.messageId,
+          threadId: ev.threadId,
+          rawContent: ev.rawContent,
+        },
+        now,
+      )
+      process.stderr.write(
+        `telegram gateway: turn-start parked (session busy) chat=${ev.chatId} ` +
+          `thread=${enqThreadIdNum ?? '-'} msg=${ev.messageId ?? '-'} ` +
+          `parked=${parkedTurnStarts.length}\n`,
+      )
       return
     }
-    case 'dequeue': return
+    case 'dequeue': {
+      // #3927 FIX A — the CLI's authoritative TURN-START signal: the queue was
+      // drained into a new user turn. Carries no ids (session-tail.ts), so the
+      // pairing is positional — and the evidence says it pairs with the MOST
+      // RECENT enqueue, not the oldest. An empty store is the normal idle path
+      // (the enqueue ms earlier already minted) and a dequeue with no parked
+      // start at all is a no-op, exactly as before.
+      pruneParkedTurnStarts(Date.now())
+      const parked = takeParkedTurnStart()
+      if (parked == null) return
+      beginTurn(deps, parked)
+      return
+    }
+    case 'queue_remove': {
+      // #3927 FIX A — the queued message was folded into the ALREADY-RUNNING
+      // turn (a `queued_command` attachment); it will never own a turn. Drop
+      // its parked envelope so a later `dequeue` cannot mint a spurious turn
+      // for it. Content-matched: `remove` replays its enqueue's `content`
+      // byte-for-byte.
+      pruneParkedTurnStarts(Date.now())
+      discardParkedTurnStart(ev.rawContent)
+      return
+    }
     case 'model': {
       // Live model capture for the main turn. The session-tail projection
       // already filtered sentinels (`<synthetic>` compaction lines), so any

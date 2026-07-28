@@ -93,6 +93,13 @@ export function findActiveSessionFile(projectsDir: string): string | null {
 export type SessionEvent =
   | { kind: 'enqueue'; chatId: string | null; messageId: string | null; threadId: string | null; rawContent: string; isSync?: boolean }
   | { kind: 'dequeue' }
+  // #3927 — `queue-operation` op `remove`: the queued item was folded into the
+  // ALREADY-RUNNING turn as a `queued_command` attachment rather than drained
+  // into a new turn. It is the OTHER terminal of an `enqueue` (the CLI writes
+  // exactly one of `dequeue` / `remove` per enqueue), and unlike `dequeue` it
+  // REPLAYS the enqueue's `content` byte-for-byte — which is what lets the
+  // gateway discard the right parked turn-start by identity.
+  | { kind: 'queue_remove'; rawContent: string }
   | { kind: 'thinking' }
   // Live model in use for the MAIN session, extracted from `message.model` on
   // each `type:"assistant"` transcript line (the exact model that served that
@@ -565,6 +572,12 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     }
     if (op === 'dequeue') {
       return [{ kind: 'dequeue' }]
+    }
+    // #3927 — the enqueue's OTHER terminal. Previously dropped, which left the
+    // gateway unable to tell "queued message folded into the running turn"
+    // (`remove`) from "queue drained into a new turn" (`dequeue`).
+    if (op === 'remove') {
+      return [{ kind: 'queue_remove', rawContent: (obj.content as string | undefined) ?? '' }]
     }
     return []
   }
