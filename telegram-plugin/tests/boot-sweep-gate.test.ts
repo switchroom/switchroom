@@ -133,23 +133,23 @@ describe('createBootSweepGate (#3664 Defect A)', () => {
  * Per-step isolation (#3664 salvage S2).
  *
  * The steps used to be a bare sequential `await` chain in gateway.ts. A throw
- * from either card reaper skipped `dmPinSweepEligible = true`, which authorises
- * the DM unpin-all path for the WHOLE SESSION — so one throwing reaper silently
- * disabled DM stale-pin cleanup, including every later lazy first-inbound
+ * from either card reaper skipped `stalePinSweepEligible = true`, which
+ * authorises the stale-pin drain for the WHOLE SESSION — so one throwing reaper
+ * silently disabled stale-pin cleanup, including every later lazy first-inbound
  * sweep. That became newly reachable the moment #3664 made the sweep actually
  * run for the first time.
  *
- * The outcome asserted is "was the DM path enabled and were the DM chats
- * swept", not "was a wrapper called".
+ * The outcome asserted is "was the drain enabled and were the recorded
+ * (chat, thread) targets swept", not "was a wrapper called".
  */
 describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
   function deps(over: Partial<BootPinSweepSteps> = {}) {
     const order: string[] = []
     const logs: string[] = []
     const base: BootPinSweepSteps = {
-      scanDmChatIds: () => {
+      scanSweepTargets: () => {
         order.push('scan')
-        return ['12345']
+        return [{ chatId: '900000001' }]
       },
       statusPinCleanup: async () => {
         order.push('status-pins')
@@ -160,9 +160,9 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
       queuedCardReaper: async () => {
         order.push('queued-cards')
       },
-      enableDmSweep: () => order.push('enable-dm'),
-      sweepDm: async (id) => {
-        order.push(`dm:${id}`)
+      enableSweep: () => order.push('enable-sweep'),
+      sweepTarget: async (t) => {
+        order.push(`sweep:${t.chatId}:${t.threadId ?? '-'}`)
       },
       log: (l) => logs.push(l),
     }
@@ -177,8 +177,8 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
       'status-pins',
       'activity-cards',
       'queued-cards',
-      'enable-dm',
-      'dm:12345',
+      'enable-sweep',
+      'sweep:900000001:-',
     ])
   })
 
@@ -190,7 +190,13 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
     })
     await runBootPinSweepSteps(d.deps)
     // The DM path is still enabled and the recorded DM chat is still swept.
-    expect(d.order).toEqual(['scan', 'status-pins', 'queued-cards', 'enable-dm', 'dm:12345'])
+    expect(d.order).toEqual([
+      'scan',
+      'status-pins',
+      'queued-cards',
+      'enable-sweep',
+      'sweep:900000001:-',
+    ])
     expect(d.logs.join('')).toContain("step 'activity-card-reaper' failed: boom")
   })
 
@@ -204,32 +210,37 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
       queuedCardReaper: boom,
     })
     await runBootPinSweepSteps(d.deps)
-    expect(d.order).toEqual(['scan', 'enable-dm', 'dm:12345'])
+    expect(d.order).toEqual(['scan', 'enable-sweep', 'sweep:900000001:-'])
   })
 
   it('a failing store scan still lets the reapers and the DM enable run', async () => {
     const d = deps({
-      scanDmChatIds: () => {
+      scanSweepTargets: () => {
         throw new Error('ENOENT')
       },
     })
     await runBootPinSweepSteps(d.deps)
-    // No DM ids to sweep, but nothing behind the scan is stranded.
-    expect(d.order).toEqual(['status-pins', 'activity-cards', 'queued-cards', 'enable-dm'])
-    expect(d.logs.join('')).toContain("step 'dm-chat-scan' failed: ENOENT")
+    // No targets to sweep, but nothing behind the scan is stranded.
+    expect(d.order).toEqual(['status-pins', 'activity-cards', 'queued-cards', 'enable-sweep'])
+    expect(d.logs.join('')).toContain("step 'sweep-target-scan' failed: ENOENT")
   })
 
-  it('one failing DM chat does not block the next one', async () => {
+  it('one failing target does not block the next one, and topics stay distinct', async () => {
     const swept: string[] = []
     const d = deps({
-      scanDmChatIds: () => ['1', '2'],
-      sweepDm: async (id) => {
-        if (id === '1') throw new Error('kicked')
-        swept.push(id)
+      scanSweepTargets: () => [
+        { chatId: '-1009000000001', threadId: 5 },
+        { chatId: '-1009000000001', threadId: 9 },
+      ],
+      sweepTarget: async (t) => {
+        if (t.threadId === 5) throw new Error('kicked')
+        swept.push(`${t.chatId}:${t.threadId}`)
       },
     })
     await runBootPinSweepSteps(d.deps)
-    expect(swept).toEqual(['2'])
+    expect(swept).toEqual(['-1009000000001:9'])
+    // Each target gets its own named step, keyed by (chat, thread).
+    expect(d.logs.join('')).toContain("step 'stale-pin-sweep:-1009000000001:5' failed: kicked")
   })
 
   it('logs a non-Error throw honestly instead of "undefined"', async () => {
@@ -250,7 +261,7 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
     const order: string[] = []
     await expect(
       runBootPinSweepSteps({
-        scanDmChatIds: () => [],
+        scanSweepTargets: () => [],
         statusPinCleanup: async () => {
           throw new Error('boom')
         },
@@ -260,14 +271,14 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
         queuedCardReaper: async () => {
           order.push('queued-cards')
         },
-        enableDmSweep: () => order.push('enable-dm'),
-        sweepDm: async () => {},
+        enableSweep: () => order.push('enable-sweep'),
+        sweepTarget: async () => {},
         log: () => {
           throw new Error('EPIPE')
         },
       }),
     ).resolves.toBeUndefined()
-    expect(order).toEqual(['activity-cards', 'queued-cards', 'enable-dm'])
+    expect(order).toEqual(['activity-cards', 'queued-cards', 'enable-sweep'])
   })
 
   it('never rejects — the caller fire-and-forgets it', async () => {
@@ -276,16 +287,16 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
     }
     await expect(
       runBootPinSweepSteps({
-        scanDmChatIds: () => {
+        scanSweepTargets: () => {
           throw new Error('boom')
         },
         statusPinCleanup: boom,
         activityCardReaper: boom,
         queuedCardReaper: boom,
-        enableDmSweep: () => {
+        enableSweep: () => {
           throw new Error('boom')
         },
-        sweepDm: boom,
+        sweepTarget: boom,
         log: () => {},
       }),
     ).resolves.toBeUndefined()

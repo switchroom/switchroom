@@ -1,3 +1,6 @@
+import type { SweepTarget } from './stale-pin-sweep.js'
+import { sweepTargetKey } from './stale-pin-sweep-store.js'
+
 /**
  * boot-sweep-gate.ts — control flow for the boot pin sweep (#3664): WHEN it may
  * start (`createBootSweepGate`, the two-condition arming gate) and HOW its steps
@@ -5,7 +8,7 @@
  *
  * Why this exists
  * ---------------
- * The boot orphan sweep (`runBootPinCleanupAndDmSweep` → `statusPinBootCleanup`
+ * The boot orphan sweep (`runBootPinCleanupAndStalePinSweep` → `statusPinBootCleanup`
  * → `unpinChatMessage`) has TWO independent preconditions, and they are
  * satisfied at two different points of the gateway's boot:
  *
@@ -91,16 +94,16 @@ export function createBootSweepGate(args: {
 /** Dependencies of {@link runBootPinSweepSteps}. All side effects are injected
  *  so the sequencing contract is provable without a gateway. */
 export interface BootPinSweepSteps {
-  /** Pure fs scan for DM chat ids with a prior-session pin record. MUST run
-   *  BEFORE the reapers, which empty those same stores. */
-  scanDmChatIds: () => string[]
+  /** Pure fs scan for the `(chat, thread)` targets with a prior-session pin
+   *  record. MUST run BEFORE the reapers, which empty those same stores. */
+  scanSweepTargets: () => SweepTarget[]
   statusPinCleanup: () => Promise<unknown>
   activityCardReaper: () => Promise<unknown>
   queuedCardReaper: () => Promise<unknown>
-  /** Flips the flag authorising the DM unpin-all path — for this sweep AND for
+  /** Flips the flag authorising the stale-pin drain — for this sweep AND for
    *  later lazy first-inbound sweeps. */
-  enableDmSweep: () => void
-  sweepDm: (chatId: string) => Promise<unknown>
+  enableSweep: () => void
+  sweepTarget: (target: SweepTarget) => Promise<unknown>
   log?: (line: string) => void
 }
 
@@ -133,9 +136,9 @@ async function step(name: string, fn: () => Promise<unknown>, log: (line: string
  * bare sequential `await` chain. `runStatusPinBootCleanup` absorbs its own
  * per-row throws, but the two card reapers issue real Bot API calls and can
  * reject outright — and a rejection there did not merely skip the later
- * reapers, it skipped `enableDmSweep()`. That flag authorises the DM
- * unpin-all path for the WHOLE SESSION (the boot sweep AND every later lazy
- * first-inbound sweep), so one throwing reaper silently disabled DM stale-pin
+ * reapers, it skipped `enableSweep()`. That flag authorises the stale-pin
+ * drain for the WHOLE SESSION (the boot sweep AND every later lazy
+ * first-inbound sweep), so one throwing reaper silently disabled stale-pin
  * cleanup entirely.
  *
  * That was unreachable before #3664 only because the sweep never actually ran
@@ -149,9 +152,9 @@ async function step(name: string, fn: () => Promise<unknown>, log: (line: string
 export async function runBootPinSweepSteps(deps: BootPinSweepSteps): Promise<void> {
   const log = deps.log ?? ((l: string) => process.stderr.write(l))
 
-  let dmChatIds: string[] = []
-  await step('dm-chat-scan', async () => {
-    dmChatIds = deps.scanDmChatIds()
+  let targets: SweepTarget[] = []
+  await step('sweep-target-scan', async () => {
+    targets = deps.scanSweepTargets()
   }, log)
 
   await step('status-pin-cleanup', deps.statusPinCleanup, log)
@@ -159,6 +162,8 @@ export async function runBootPinSweepSteps(deps: BootPinSweepSteps): Promise<voi
   await step('queued-card-reaper', deps.queuedCardReaper, log)
 
   // Unconditional: reached even when every step above threw. See the docblock.
-  await step('enable-dm-sweep', async () => deps.enableDmSweep(), log)
-  for (const id of dmChatIds) await step(`dm-sweep:${id}`, () => deps.sweepDm(id), log)
+  await step('enable-sweep', async () => deps.enableSweep(), log)
+  for (const t of targets) {
+    await step(`stale-pin-sweep:${sweepTargetKey(t.chatId, t.threadId)}`, () => deps.sweepTarget(t), log)
+  }
 }

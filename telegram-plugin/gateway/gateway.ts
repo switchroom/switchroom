@@ -643,12 +643,9 @@ import { runStatusPinReconcile, type StatusPinClaim } from './status-pin-retarge
 import { createPeriodicSweepGuard } from './periodic-sweep-guard.js'
 import { withDeadline } from './with-deadline.js'
 import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './status-pin-api.js'
-import {
-  createDmPinSweeper,
-  collectDmChatIdsFromStores,
-  unexpiredStoreRepinIds,
-  type DmPinSweeper,
-} from './dm-pin-sweep.js'
+import { collectSweepTargets, type StalePinSweeper, type SweepTarget } from './stale-pin-sweep.js'
+import { createGatewayStalePinSweeper } from './stale-pin-sweep-wiring.js'
+import { atomicWriteFileSync } from '../../src/util/atomic.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
 import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
 
@@ -9104,6 +9101,10 @@ async function reconcileStatusPin(
   pinKey: string,
   chatId: string,
   desired: DesiredPin,
+  /** Forum topic the pinned message lives in, when the caller knows it. Keyed
+   *  into the claim + the durable row so a post-crash sweep can aim
+   *  `unpinAllForumTopicMessages` at the right topic. */
+  threadId?: number,
 ): Promise<void> {
   // Fire-and-forget hard boundary. Most callers invoke this as
   // `void reconcileStatusPin(...)` (auto status-pin is best-effort — it must
@@ -9121,7 +9122,7 @@ async function reconcileStatusPin(
     // Serialize per pinKey (F2): reconcileStatusPinInner reads `prev` from the
     // in-memory claim map at its top, so overlapping same-key reconciles must
     // run one-at-a-time or a stale `prev` clears the disk row under a live pin.
-    await withPinReconcileLock(pinKey, () => reconcileStatusPinInner(pinKey, chatId, desired))
+    await withPinReconcileLock(pinKey, () => reconcileStatusPinInner(pinKey, chatId, desired, threadId))
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     process.stderr.write(
@@ -9135,6 +9136,7 @@ async function reconcileStatusPinInner(
   pinKey: string,
   chatId: string,
   desired: DesiredPin,
+  threadId?: number,
 ): Promise<void> {
   if (!PIN_STATUS_WHILE_WORKING) return
   if (chatId.length === 0) return
@@ -9174,6 +9176,7 @@ async function reconcileStatusPinInner(
   await runStatusPinReconcile({
     pinKey,
     chatId,
+    threadId,
     prev,
     desired,
     // persist:null ⇒ no durable row (STATIC / feature-off).
@@ -9205,81 +9208,61 @@ async function unpinAllStatusPins(): Promise<void> {
   }
 }
 
-// ─── DM stale-pin sweep (#3026) ─────────────────────────────────────────────
-// In a user DM the Bot API skips the boot getChat() probe (positive chat IDs
-// return `400 chat not found` until the user messages) AND getChat() exposes
-// only the NEWEST pin — DMs STACK pins and there is no list-pins method, so
-// older orphan pins are invisible to the probe-based sweep forever. The durable
-// fix: once per DM chat per boot, `unpinAllChatMessages` (safe in a DM — every
-// pin is bot-authored) then re-pin the live tracked cards. Groups keep the
-// probe path (unpin-all there would nuke human pins).
+// ─── Stale-pin stack sweep ──────────────────────────────────────────────────
+// A Telegram chat holds a STACK of pins; `getChat().pinned_message` exposes only
+// the TOP and there is no list-pins method, so a probe-based cleanup never sees
+// the rest. Worse (verified live 2026-07-29): a bare `unpinChatMessage` on a
+// stale entry is a SILENT NO-OP that returns ok:true, so the gateway logged a
+// clean sweep on every boot while the stack grew unbounded — 37 orphans across
+// 5 agents, 21 in one chat. The drain, the rate gates and the durable
+// obligation cursor live in stale-pin-sweep.ts; this is just the binding.
 //
 // Eligibility mirrors statusPinBootCleanup's mutex gate: set true ONLY after
 // this gateway wins the startup lock, so a losing double-boot never clears the
 // live holder's pins.
-let dmPinSweepEligible = false
-const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
-  unpinAll: (chatId) =>
-    robustApiCall(() => lockedBot.api.unpinAllChatMessages(chatId), { // allow-raw-pin: DM-only boot sweep — clears pins this process cannot enumerate (pre-restart orphans) and immediately re-pins the live tracked ids below.
-      chat_id: chatId,
-      verb: 'dm-pin-sweep.unpin-all',
-    }),
-  pinSilent: (chatId, messageId) =>
-    robustApiCall(
-      () =>
-        lockedBot.api.pinChatMessage(chatId, messageId, { // allow-raw-pin: the re-pin half of the DM boot sweep — restores ids the sweep just cleared; the claims themselves are untouched.
-          disable_notification: true,
-        }),
-      { chat_id: chatId, verb: 'dm-pin-sweep.repin' },
-    ),
-  // Pins that must survive the unpin-all: live in-memory status-pin claims
-  // for this chat (fg:/wk:/tool:/banner: — non-empty for a first-inbound
-  // sweep landing mid-turn) UNIONED with the deliberately-retained store
-  // rows — unexpired `tool:` pins (#3001) survive statusPinBootCleanup by
-  // design and must survive this sweep too. Read LIVE from the store so
-  // both the boot sweep (in-memory maps still empty then) and a later
-  // first-inbound sweep see them. Best-effort: a store read failure
-  // degrades to in-memory-only. The sweeper dedupes.
-  liveTrackedMessageIds: (chatId) => {
-    const ids: number[] = []
-    for (const claim of statusPinClaims.values()) {
-      if (claim.chatId === chatId) ids.push(claim.messageId)
-    }
-    if (statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled) {
-      try {
-        ids.push(
-          ...unexpiredStoreRepinIds(
-            loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs),
-            chatId,
-            Date.now(),
-          ),
-        )
-      } catch (err) {
-        process.stderr.write(
-          `telegram gateway: dm-pin-sweep: store repin scan failed ` +
-            `(chat=${chatId}): ${(err as Error).message}\n`,
-        )
-      }
-    }
-    return ids
+let stalePinSweepEligible = false
+// Durable ledger: fsync'd tempfile + atomic rename, so a power cut leaves either
+// the previous complete ledger or the new one — never a truncated file that
+// forgets an in-flight drain.
+const STALE_PIN_SWEEP_STORE_PATH = join(STATE_DIR, 'stale-pin-sweep.json')
+const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
+  telegram: { handle: () => lockedBot, call: robustApiCall },
+  claims: () => statusPinClaims.values(),
+  loadPinRows: () =>
+    statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
+      ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+      : [],
+  eligible: () => stalePinSweepEligible,
+  store: {
+    path: STALE_PIN_SWEEP_STORE_PATH,
+    fs: {
+      readFileSync: (p) => readFileSync(p, 'utf-8'),
+      writeFileSync: (p, data) => atomicWriteFileSync(p, data, 0o600),
+      existsSync: (p) => existsSync(p),
+    },
   },
-  eligible: () => dmPinSweepEligible,
-  log: (line) => process.stderr.write(line),
+  // Per-deployment override only. UNSET (the normal case) means "take the
+  // standing policy", which lives in ONE place: SUPERGROUP_REPIN_UNATTENDED in
+  // stale-pin-sweep.ts. Set the env var to 1/0 to force it either way here.
+  allowSupergroupRepinLoop:
+    process.env.SWITCHROOM_PIN_SWEEP_SUPERGROUP == null
+      ? undefined
+      : process.env.SWITCHROOM_PIN_SWEEP_SUPERGROUP === '1',
 })
 
 /**
- * Boot-time pin cleanup + DM stale-pin sweep. Collects the DM chat IDs with a
- * prior-session pin record BEFORE the store reapers empty the stores, runs the
- * three boot reapers, marks the DM sweep eligible, then unpin-alls each
- * recorded DM chat. Ordering and per-step isolation live in
+ * Boot-time pin cleanup + stale-pin stack sweep. Collects the `(chat, thread)`
+ * targets with a prior-session pin record BEFORE the store reapers empty the
+ * stores, runs the three boot reapers, marks the sweep eligible, then drains
+ * each recorded target. Ordering and per-step isolation live in
  * `runBootPinSweepSteps` (boot-sweep-gate.ts) — a throwing reaper must not
- * strand `enableDmSweep`. Dispatched only via `bootPinSweepGate` below (mutex
+ * strand `enableSweep`. Dispatched only via `bootPinSweepGate` below (mutex
  * won AND `lockedBot` constructed); fire-and-forget — never blocks boot.
  */
-function runBootPinCleanupAndDmSweep(): Promise<void> {
+function runBootPinCleanupAndStalePinSweep(): Promise<void> {
   return runBootPinSweepSteps({
-    scanDmChatIds: () =>
-      collectDmChatIdsFromStores({
+    scanSweepTargets: () =>
+      collectSweepTargets({
         statusPins:
           statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
             ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
@@ -9294,19 +9277,19 @@ function runBootPinCleanupAndDmSweep(): Promise<void> {
     statusPinCleanup: statusPinBootCleanup,
     activityCardReaper: activityCardBootReaper,
     queuedCardReaper: queuedCardBootReaper,
-    // This gateway owns the shared pin state — enable the DM unpin-all path
-    // (this sweep AND lazy first-inbound sweeps).
-    enableDmSweep: () => {
-      dmPinSweepEligible = true
+    // This gateway owns the shared pin state — enable the drain (this sweep
+    // AND lazy first-inbound sweeps).
+    enableSweep: () => {
+      stalePinSweepEligible = true
     },
-    sweepDm: (id) => dmPinSweeper.sweep(id),
+    sweepTarget: (t: SweepTarget) => stalePinSweeper.sweepTarget(t),
     log: (line) => process.stderr.write(line),
   })
 }
 
 // #3664: needs BOTH the mutex (arm) and a constructed `lockedBot` (botReady,
 // end of initGatewayBot) before it may run — see boot-sweep-gate.ts.
-const bootPinSweepGate = createBootSweepGate({ run: runBootPinCleanupAndDmSweep, onError: (err) => process.stderr.write(`telegram gateway: boot pin cleanup / DM sweep failed: ${(err as Error).message}\n`) })
+const bootPinSweepGate = createBootSweepGate({ run: runBootPinCleanupAndStalePinSweep, onError: (err) => process.stderr.write(`telegram gateway: boot pin cleanup / stale-pin sweep failed: ${(err as Error).message}\n`) })
 
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
 // feed for every turn. The PreToolUse sidecar emits a `tool_label` per tool
@@ -14753,14 +14736,21 @@ export async function handleInbound(
   // #2862 — operator is back; re-offer any approvals that timed out meanwhile.
   maybePostMissedApprovalDigest('operator inbound')
 
-  // #3026 — first inbound from a DM after boot: clear any stale STACKED pins
-  // the boot getChat() probe can't see (DMs skip the probe AND getChat only
-  // exposes the newest pin). unpin-all once per DM chat per boot, then re-pin
-  // live tracked cards. once-guarded (dedups with the boot sweep); no-op for
-  // groups and until the startup mutex is won. Fire-and-forget.
+  // First inbound after boot: drain any stale STACKED pins in this exact
+  // (chat, thread) that the boot getChat() probe can't see (DMs skip the probe
+  // AND getChat exposes only the newest pin). The durable obligation cursor
+  // dedups with the boot sweep and with a prior drain of the same target; the
+  // rights precheck and rate gates apply as usual, and a non-forum supergroup
+  // is skipped. No-op until the startup mutex is won. Fire-and-forget.
   {
     const inboundChatId = ctx.chat?.id
-    if (inboundChatId != null) void dmPinSweeper.sweep(String(inboundChatId))
+    if (inboundChatId != null) {
+      void stalePinSweeper.sweepTarget({
+        chatId: String(inboundChatId),
+        threadId: ctx.message?.message_thread_id,
+        isForum: ctx.chat?.is_forum === true,
+      })
+    }
     // Outbox envelope-less routing (F2) is scoped to each record's OWN stamped
     // per-session origin chat (captured at Stop), not a gateway-global stamp.
   }
@@ -24052,11 +24042,11 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
               // (its claim still names that id), leaving live work unpinned. The
               // feed drives this: pin `wk:group:<feedKey>` when the group first
               // paints, unpin only when the group empties (messageId === null).
-              reconcilePin: ({ feedKey, chatId, messageId }) => {
+              reconcilePin: ({ feedKey, chatId, threadId, messageId }) => {
                 if (!PIN_STATUS_WHILE_WORKING) return
                 const key = `wk:group:${feedKey}`
                 if (messageId != null) {
-                  void reconcileStatusPin(key, chatId, { pinned: true, messageId })
+                  void reconcileStatusPin(key, chatId, { pinned: true, messageId }, threadId)
                 } else {
                   const unpinChat = chatId || statusPinClaims.get(key)?.chatId
                   if (unpinChat != null && unpinChat.length > 0) {

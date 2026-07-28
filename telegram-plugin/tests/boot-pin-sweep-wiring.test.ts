@@ -19,17 +19,17 @@ import { resolve } from 'node:path'
 const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
 
 describe('boot pin sweep wiring (#3664)', () => {
-  it('never dispatches runBootPinCleanupAndDmSweep() directly — only through the gate', () => {
+  it('never dispatches runBootPinCleanupAndStalePinSweep() directly — only through the gate', () => {
     // The original bug shape, verbatim: a fire-and-forget call at module-eval
     // time. Any direct invocation (voided or awaited) bypasses the bot-ready
     // half of the precondition.
     const directCalls =
-      gatewaySrc.match(/(?<!function\s)(?<![.\w])runBootPinCleanupAndDmSweep\s*\(/g) ?? []
+      gatewaySrc.match(/(?<!function\s)(?<![.\w])runBootPinCleanupAndStalePinSweep\s*\(/g) ?? []
     expect(directCalls).toEqual([])
   })
 
   it('passes the sweep to the gate as a reference, and arms it at both mutex sites', () => {
-    expect(gatewaySrc).toContain('createBootSweepGate({ run: runBootPinCleanupAndDmSweep')
+    expect(gatewaySrc).toContain('createBootSweepGate({ run: runBootPinCleanupAndStalePinSweep')
     // Both startup-lock outcomes (mutex acquired, and the non-atomic
     // writePidFile fallback) arm — neither may dispatch on its own.
     const armSites = gatewaySrc.match(/bootPinSweepGate\.arm\(\)/g) ?? []
@@ -63,15 +63,15 @@ describe('boot pin sweep wiring (#3664)', () => {
       expect(inlineAwaits).toEqual([])
     }
     // The DM-eligibility flip is what a throw used to strand, so it must live
-    // INSIDE the enableDmSweep step callback — not as a statement sequenced
+    // INSIDE the enableSweep step callback — not as a statement sequenced
     // after the reapers, where one rejection skips it for the whole session.
     const lines = gatewaySrc.split('\n')
     const flipIdxs = lines
       .map((l, i) => ({ l, i }))
-      .filter(({ l }) => /^\s*dmPinSweepEligible = true\s*$/.test(l))
+      .filter(({ l }) => /^\s*stalePinSweepEligible = true\s*$/.test(l))
       .map(({ i }) => i)
     expect(flipIdxs.length).toBe(1)
-    expect(lines[flipIdxs[0] - 1]).toContain('enableDmSweep: () => {')
+    expect(lines[flipIdxs[0] - 1]).toContain('enableSweep: () => {')
   })
 
   it('routes the pin API through the asserting seam, never a raw lockedBot.api pin', () => {

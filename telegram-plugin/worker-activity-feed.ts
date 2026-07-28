@@ -576,7 +576,7 @@ interface WorkerRow {
  * a 2+ worker group renders the combined `renderCombinedWorkerFeed` body.
  */
 interface FeedGroup {
-  /** Stable key `${chatId} ${threadId ?? ''}`. */
+  /** Stable `(chat, thread)` key — see `feedKeyOf`: `<chatId>:<threadId|->`. */
   feedKey: string
   chatId: string
   threadId?: number
@@ -730,7 +730,7 @@ export interface WorkerActivityFeed {
    *  re-post). Lets the gateway pin the EXISTING `🛠 Worker` message. Note:
    *  siblings sharing the chat/thread return the SAME id (one message). */
   messageIdOf(agentId: string): number | null
-  /** True while the feed group `feedKey` (`${chatId} ${threadId ?? ''}`) still
+  /** True while the feed group `feedKey` (see `feedKeyOf` — `<chatId>:<threadId|->`) still
    *  tracks live work — used by the gateway's `wk:group:` pin reaper to exempt
    *  a live group's pin from the stale-TTL sweep (#3207). */
   hasRunningInFeed(feedKey: string): boolean
@@ -817,7 +817,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     })
   const clearIntervalFn = opts.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
 
-  /** Feed groups keyed by `${chatId} ${threadId ?? ''}`. */
+  /** Feed groups keyed by `feedKeyOf(chatId, threadId)` — `<chatId>:<threadId|->`. */
   const groups = new Map<string, FeedGroup>()
   /** Reverse index agentId → feedKey, so the agentId-keyed public API resolves
    *  its group in O(1). Cleared when a worker's row is removed. */
@@ -844,8 +844,30 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   }
   let heartbeatTimer: unknown = null
 
+  /**
+   * The `(chat, thread)` identity of a feed group — and, prefixed with
+   * `wk:group:`, the pin key that gets PERSISTED into status-pins.json.
+   *
+   * The separator and the topic-less sentinel are both load-bearing. This used
+   * to be `` `${chatId} ${threadId ?? ''}` ``, which for a topic-less group
+   * rendered as `-1004223464247 ` — a key ending in a bare space. On disk that
+   * became `"pinKey": "wk:group:-1004223464247 "`: trailing whitespace that
+   * survives JSON round-trips, is invisible in every log line and grep, and
+   * cannot be distinguished by eye from the same chat WITH a topic. Any operator
+   * or tool reconciling rows by chat would silently treat the two as one.
+   *
+   * `<chatId>:<threadId|->` is unambiguous in both directions: the topic-less
+   * case is spelled explicitly (`-`), and a topic key can never be confused with
+   * a topic-less one. Note chat ids are negative, so the `-` sentinel and the
+   * sign of the id never occupy the same position.
+   *
+   * The value is opaque to every consumer (it round-trips through the pin key
+   * and back into `hasRunningInFeed`), so the format may change; a key written
+   * by an older build is work-scoped and is unpinned unconditionally by the next
+   * boot's cleanup, so there is nothing to migrate.
+   */
   function feedKeyOf(chatId: string, threadId?: number): string {
-    return `${chatId} ${threadId ?? ''}`
+    return `${chatId}:${threadId ?? '-'}`
   }
   function groupOfAgent(agentId: string): FeedGroup | undefined {
     const key = agentIndex.get(agentId)

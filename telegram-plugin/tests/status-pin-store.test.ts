@@ -117,8 +117,8 @@ describe("status-pin-store", () => {
   });
 
   it("fail-open: wrong envelope version / shape loads as []", () => {
-    // v4 is an unknown FUTURE version (v1–v3 are the supported set).
-    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 4, pins: [pin()] }) });
+    // v5 is an unknown FUTURE version (v1–v4 are the supported set).
+    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 5, pins: [pin()] }) });
     expect(loadStatusPins(PATH, f1)).toEqual([]);
     const { fs: f2 } = memFs({ [PATH]: JSON.stringify({ v: 1, pins: "nope" }) });
     expect(loadStatusPins(PATH, f2)).toEqual([]);
@@ -548,11 +548,32 @@ describe("status-pin-store — envelope version compat", () => {
     expect(loaded[0].messageId).toBe(715);
   });
 
-  it("round-trips a v2 pending flag and writes v3 envelopes", () => {
+  it("round-trips a v2 pending flag and writes v4 envelopes", () => {
     const { fs, files } = memFs();
     persistStatusPins(PATH, fs, [pin({ pending: true })]);
-    expect(JSON.parse(files.get(PATH)!).v).toBe(3);
+    expect(JSON.parse(files.get(PATH)!).v).toBe(4);
     expect(loadStatusPins(PATH, fs)[0].pending).toBe(true);
+  });
+
+  it("v4 persists the forum topic a pin lives in, so a later sweep can aim at it", () => {
+    // Telegram's pin stack is chat-wide and `unpinChatMessage` takes no
+    // message_thread_id, so `unpinAllForumTopicMessages(chat, thread)` is the
+    // only topic-scoped drain a bot has — and it needs this field. Without it a
+    // boot after a crash knows a forum chat has orphans but not where.
+    const { fs, files } = memFs();
+    persistStatusPins(PATH, fs, [pin({ threadId: 77 })]);
+    expect(JSON.parse(files.get(PATH)!).v).toBe(4);
+    expect(loadStatusPins(PATH, fs)[0].threadId).toBe(77);
+  });
+
+  it("drops a row with a non-numeric threadId", () => {
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 4,
+        pins: [pin({ messageId: 715 }), { pinKey: "k", chatId: "c", messageId: 1, threadId: "5" }],
+      }),
+    });
+    expect(loadStatusPins(PATH, fs)).toHaveLength(1);
   });
 
   it("#3810: a v3 row round-trips its pinnedAt claim age; a v1/v2 row loads without one", () => {
@@ -584,7 +605,7 @@ describe("status-pin-store — envelope version compat", () => {
   });
 
   it("rejects an unknown future envelope version (fail-open [])", () => {
-    const { fs } = memFs({ [PATH]: JSON.stringify({ v: 4, pins: [pin()] }) });
+    const { fs } = memFs({ [PATH]: JSON.stringify({ v: 5, pins: [pin()] }) });
     expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
