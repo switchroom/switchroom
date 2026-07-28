@@ -24,54 +24,77 @@
  *
  * ONE sweep path (`sweepTarget`) that owns eligibility, the rights precheck,
  * the rate gates, the circuit breaker, the cursor and the verification. It
- * branches on chat class only for the drain PRIMITIVE, because the three
- * classes genuinely have different Telegram semantics:
+ * branches on chat class only for the drain PRIMITIVE, because DMs and groups
+ * genuinely have different Telegram semantics — measured, not assumed, in the
+ * test supergroup on 2026-07-29 with the bot admin + `can_pin_messages`:
  *
- *   • DM (`dm`) — the only way to pop an entry is to RE-PIN it and then unpin
- *     it: `pinChatMessage(chat, id, disable_notification)` then
+ *   • DM (`dm`) — targeted `unpinChatMessage` does NOT pop a stale entry here;
+ *     the only sequence that does is RE-PIN then unpin:
+ *     `pinChatMessage(chat, id, disable_notification)` then
  *     `unpinChatMessage(chat, id)`. Loop until verified empty. A DM emits no
  *     service message for a pin, so the loop is invisible to the user.
  *
- *   • Forum topic (`forum-topic`) — `unpinAllForumTopicMessages(chat_id,
- *     message_thread_id)` is the ONE topic-scoped pin verb a bot has
- *     (`telegram-bot-api` Client.cpp resolves `get_forum_topic_id` for it;
- *     `pinChatMessage`/`unpinChatMessage` never do, which is why a bot cannot
- *     target a topic with them). It drains the topic in a single call and emits
- *     no service message. SINGLE ATTEMPT: see `unpinAllChatMessages` below.
+ *   • Any group (`supergroup` / `forum-topic`) — targeted
+ *     `unpinChatMessage(chat_id, message_id)` WORKS ON ANY STACK POSITION.
+ *     Observed: an entry sitting third from the top was unpinned directly and
+ *     vanished from the middle of the stack; the top then drained cleanly by
+ *     plain targeted unpins. So a group needs NO re-pin, and with the re-pin
+ *     goes the only thing that ever spams a group (see below).
  *
- *   • Non-forum supergroup (`supergroup`) — NOT swept unattended. Every
- *     `pinChatMessage` in a supergroup emits a visible "X pinned a message"
- *     service message (`disable_notification` suppresses only the PUSH, not the
- *     service message), so a 10-deep repin+unpin loop manufactures 10 lines of
- *     chat spam in the operator's team chat. That is a WORSE failure than the
- *     stale pins it fixes. Opt-in only, via `allowSupergroupRepinLoop`.
+ * ── We unpin BY ID, never "unpin all" ────────────────────────────────────────
  *
- * ── `unpinAllChatMessages` is a trap, and why we never loop on it ────────────
+ * This is a correctness rule, not a preference. `unpinAllChatMessages` works
+ * fine on a group stack — one call, silent, clears everything — and that is
+ * exactly the problem: "everything" includes OTHER PEOPLE'S pins. Measured, it
+ * destroyed a pre-existing pin that predated the test. In a real team chat that
+ * is unrecoverable data loss.
  *
- * On a deep stack it returns a permanently-pegged `429 retry_after: 3` with
- * ZERO progress. TDLib services it through
+ * The gateway already knows precisely which message ids it pinned
+ * (`status-pins.json`, plus the pinned activity cards). The group drain unpins
+ * exactly those and nothing else. A pin the gateway did not place is not its
+ * to remove.
+ *
+ * `unpinAllForumTopicMessages(chat_id, message_thread_id)` is genuinely
+ * topic-scoped (`telegram-bot-api` Client.cpp resolves `get_forum_topic_id` for
+ * it; `pinChatMessage`/`unpinChatMessage` never do) and needs only
+ * `can_pin_messages`, verified with `can_manage_topics: false`. But it is just
+ * as indiscriminate WITHIN the topic, so it is a LAST-RESORT REMEDY behind an
+ * explicit opt-in (`allowUnpinAllForumTopic`), never the default sweep. When it
+ * does run it runs ONCE: on a deep stack the unpin-all family can peg at `429
+ * retry_after: 3` with zero progress, because TDLib services it through
  * `run_affected_history_query_until_complete`, which re-issues the IDENTICAL
- * query while `!is_final_` — so it re-trips the same server-side flood wait
- * forever. Retrying it is not slow, it is non-terminating. Hence: at most one
- * attempt of any unpin-all verb per target per sweep, and a 429 there is a
- * give-up, not a backoff.
+ * query while `!is_final_`. Retrying that is not slow, it is non-terminating.
+ *
+ * ── Pinning is what costs; unpinning is free ─────────────────────────────────
+ *
+ * Id-gap probe in the test supergroup: control gap 1, pin gap 2 — a pin DOES
+ * emit a service message, and `disable_notification` does not suppress it (gap 2
+ * either way). Every unpin verb measured gap 1: `unpinChatMessage`,
+ * `unpinAllChatMessages` and `unpinAllForumTopicMessages` are all silent.
+ *
+ * Since the group drain is unpin-only, the group sweep emits nothing visible at
+ * all — which is why there is no "groups are manual-only" restriction here. The
+ * DM repin loop does pin, but a DM has no service messages.
  *
  * ── Rate gates ───────────────────────────────────────────────────────────────
  *
  * All gates are named constants (`DM_SWEEP_GATE` / `GROUP_SWEEP_GATE`), never
- * inline numbers, because they encode Telegram's real ceilings:
+ * inline numbers:
  *
- *   • In a GROUP the binding limit is 20 messages/minute = one per 3s, and every
- *     pop emits a service message. A 1.5s inter-call delay would run at ~40
- *     service messages/minute — DOUBLE the ceiling — so the group delay is 6s.
- *   • In a DM the rule is ~1 message/second/chat. 1500ms across a two-call pop
- *     is ~0.67 writes/sec, comfortably inside it.
+ *   • GROUP — measured headroom is large (~15 mutating calls at 2-3s spacing
+ *     plus `getChat` reads at 0.15-0.4s produced zero 429s and no `PEER_FLOOD`),
+ *     so 6000ms is a deliberately conservative default rather than a measured
+ *     ceiling; it costs nothing on the shallow stacks that are the common case.
+ *     There is NO per-chat pop ceiling in a group: the drain is bounded by the
+ *     id list, and with no service-message cost there is nothing to ration.
+ *   • DM — the rule is ~1 message/second/chat. 1500ms across a two-call pop is
+ *     ~0.67 writes/sec, comfortably inside it. The 40-pop cap bounds one blind
+ *     drain's blast radius (deepest stack observed: 21).
  *
- * The per-chat pop cap bounds one sweep's blast radius; the per-minute cap
- * bounds the BOT across all chats simultaneously (a fleet boot sweeping six
- * chats at once is what actually earns a flood wait). Anything not finished
- * inside the caps persists its cursor and yields to the next boot — which is
- * safe precisely because the obligation is durable.
+ * The per-minute cap bounds the BOT across all chats simultaneously (a fleet
+ * boot sweeping six chats at once is what actually earns a flood wait). Anything
+ * not finished inside the caps persists its cursor and yields to the next boot
+ * — which is safe precisely because the obligation is durable.
  *
  * Give-up and circuit-breaker rules are likewise constants: 3 consecutive 429s
  * or 2 identical `retry_after` values with zero observed progress abort THIS
@@ -100,7 +123,11 @@ import {
 export interface SweepGate {
   /** Minimum wall-clock gap between two pin/unpin writes in this class. */
   minCallDelayMs: number
-  /** Hard cap on pops for ONE chat in ONE sweep; the rest yields to next boot. */
+  /**
+   * Hard cap on pops for ONE chat in ONE sweep; the rest yields to next boot.
+   * `Infinity` for groups: the group drain is bounded by the recorded id list
+   * and emits nothing visible, so there is nothing to ration.
+   */
   maxPopsPerChatPerSweep: number
   /** Cap on pin ops for the whole BOT per minute in this class, all chats. */
   maxPinOpsPerMinute: number
@@ -118,15 +145,21 @@ export const DM_SWEEP_GATE: SweepGate = {
 }
 
 /**
- * Supergroup / forum gates. 6000ms because the binding group limit is 20
- * msgs/min = 1 per 3s and EVERY pop emits a visible service message; 1.5s here
- * would run at ~40 service msgs/min, double the ceiling. 10 pops per sweep
- * bounds the visible spam per boot — the remainder yields to the next boot via
- * the persisted cursor rather than being pushed through in one burst.
+ * Supergroup / forum gates.
+ *
+ * 6000ms is a CONSERVATIVE DEFAULT, not a measured ceiling: a live session of
+ * ~15 mutating calls at 2-3s spacing (plus `getChat` reads at 0.15-0.4s) drew
+ * zero 429s and no `PEER_FLOOD`, so there is large headroom. It is kept because
+ * it costs nothing on the shallow stacks that are the common case.
+ *
+ * NO per-chat pop ceiling: a group drain issues one targeted unpin per RECORDED
+ * id, so it is already bounded by that list, and unpinning emits no service
+ * message — the thing the old ceiling existed to ration does not exist. The
+ * per-minute budget still applies and still yields to the next boot.
  */
 export const GROUP_SWEEP_GATE: SweepGate = {
   minCallDelayMs: 6_000,
-  maxPopsPerChatPerSweep: 10,
+  maxPopsPerChatPerSweep: Number.POSITIVE_INFINITY,
   maxPinOpsPerMinute: 10,
 }
 
@@ -155,38 +188,42 @@ export const CIRCUIT_BREAKER_RETRY_AFTER_SEC = 60
 export const VERIFY_READ_GAP_MS = 1_800
 
 /**
- * THE non-forum-supergroup policy, in ONE place.
- *
- * `false` ⇒ a non-forum supergroup is never repin-loop drained unattended.
- *
- * Rationale, and the single fact it rests on: every `pinChatMessage` in a
- * supergroup is believed to emit a visible "X pinned a message" SERVICE
- * MESSAGE (`disable_notification` suppresses only the push, not the service
- * message). A pop is a re-pin plus an unpin, so a 10-deep drain manufactures 10
- * visible lines in the operator's team chat — a worse outcome than the stale
- * pins it clears.
- *
- * STATUS OF THAT FACT: inferred from `telegram-bot-api` behaviour, NOT yet
- * observed on a bot with `can_pin_messages` in a real supergroup. If an
- * id-gap probe shows a silent re-pin emits no service message, this constant
- * flips to `true` and the restriction disappears — that is deliberately a
- * ONE-LINE change plus the test below, which is why the whole policy is this
- * constant and {@link mayRepinLoopUnattended} rather than a condition spread
- * through the control flow.
+ * How many read PAIRS may be taken while chasing two agreeing values. More than
+ * one because the observed lie (`pinned_message: None` on a non-empty stack,
+ * ~0.15s after an unpin) settles within ~0.55s: the first pair straddles the
+ * transient and disagrees, the second reads the settled value. Bounded so an
+ * genuinely flapping chat degrades to "unknown" rather than spinning.
  */
-export const SUPERGROUP_REPIN_UNATTENDED = false
+export const VERIFY_READ_MAX_PAIRS = 3
 
 /**
- * May this chat class be repin-loop drained without a human watching?
+ * THE destructive-remedy policy, in ONE place.
  *
- * The ONLY place chat class gates the drain primitive on spam grounds.
- * `override` is the per-deployment escape hatch (`allowSupergroupRepinLoop`,
- * bound to `SWITCHROOM_PIN_SWEEP_SUPERGROUP=1`); when it is undefined the
+ * `false` ⇒ `unpinAllForumTopicMessages` is never used by the routine sweep.
+ *
+ * Rationale: it is genuinely topic-scoped (unlike every other pin verb a bot
+ * has) and it drains a topic in one silent call, which makes it tempting. But
+ * within that topic it is INDISCRIMINATE — measured, the unpin-all family
+ * destroyed a pre-existing pin that the gateway never placed. The routine
+ * remedy is therefore a targeted unpin of the ids the gateway recorded, and
+ * this verb stays behind an explicit per-deployment opt-in for the case where
+ * an operator knowingly wants a topic's pins cleared wholesale.
+ *
+ * Kept as one constant + {@link mayUnpinAllForumTopic} rather than a condition
+ * spread through the control flow, so the policy is auditable in one place.
+ */
+export const UNPIN_ALL_FORUM_TOPIC_ENABLED = false
+
+/**
+ * May this sweep use the wholesale topic drain?
+ *
+ * `override` is the per-deployment escape hatch (`allowUnpinAllForumTopic`,
+ * bound to `SWITCHROOM_PIN_SWEEP_UNPIN_ALL_TOPIC=1`); when it is undefined the
  * standing policy above decides.
  */
-export function mayRepinLoopUnattended(kind: SweepChatKind, override?: boolean): boolean {
-  if (kind !== 'supergroup') return true
-  return override ?? SUPERGROUP_REPIN_UNATTENDED
+export function mayUnpinAllForumTopic(kind: SweepChatKind, override?: boolean): boolean {
+  if (kind !== 'forum-topic') return false
+  return override ?? UNPIN_ALL_FORUM_TOPIC_ENABLED
 }
 
 /** Gates for a chat class. Forum topics ride the group gates — same chat. */
@@ -210,12 +247,12 @@ export function isDmChatId(chatId: string): boolean {
 /**
  * Classify a sweep target.
  *
- * `forum-topic` requires BOTH a forum chat and a known `threadId` — the
- * topic-scoped verb takes a `message_thread_id` and there is nothing else a bot
- * can aim at a topic. A forum chat whose orphans have no recorded thread falls
- * back to `supergroup` (i.e. manual-only), which is the honest answer: we know
- * there are orphans but not where, and blindly repin-looping a team chat is the
- * worse outcome.
+ * `forum-topic` requires BOTH a forum chat and a known `threadId`, because the
+ * only thing that distinction now buys is eligibility for the opt-in wholesale
+ * topic drain, whose verb takes a `message_thread_id`. Both group classes take
+ * the same routine path (targeted unpin of recorded ids), so a forum chat whose
+ * orphans have no recorded thread degrades to `supergroup` with no loss of
+ * capability.
  */
 export function classifyChatForSweep(args: {
   chatId: string
@@ -229,10 +266,23 @@ export function classifyChatForSweep(args: {
 
 // ─── Seeding the obligation set from the durable stores ─────────────────────
 
-/** The minimum a persisted row must expose to become a sweep target. */
+/**
+ * The minimum a persisted row must expose to become a sweep target.
+ *
+ * `messageId` / `activityMessageId` are read too, because the GROUP drain is
+ * not a blind stack walk — it unpins exactly the ids the gateway is on record
+ * as having pinned, and those ids must be captured at SCAN time, before the
+ * boot reapers empty the very stores they come from.
+ */
 export interface SweepCandidateRow {
   chatId: string
   threadId?: number | null
+  /** status-pin rows: the pinned message. */
+  messageId?: number
+  /** activity-card rows name it differently. */
+  activityMessageId?: number
+  /** activity-card rows: only a card that was actually pinned is on the stack. */
+  pinned?: boolean
 }
 
 /**
@@ -260,7 +310,16 @@ export function collectSweepTargets(input: {
       if (typeof r.chatId !== 'string' || r.chatId.length === 0) continue
       const threadId = r.threadId ?? undefined
       const key = sweepTargetKey(r.chatId, threadId)
-      if (!out.has(key)) out.set(key, { chatId: r.chatId, threadId })
+      let target = out.get(key)
+      if (target == null) {
+        target = { chatId: r.chatId, threadId, messageIds: [] }
+        out.set(key, target)
+      }
+      // An activity card that was never pinned is not on the pin stack, so its
+      // id must NOT join the unpin list: issuing an unpin for it would spend
+      // rate budget on a call that provably cannot pop anything.
+      const id = r.messageId ?? (r.pinned === true ? r.activityMessageId : undefined)
+      if (typeof id === 'number' && !target.messageIds!.includes(id)) target.messageIds!.push(id)
     }
   }
   add(input.statusPins)
@@ -393,6 +452,13 @@ export interface SweepTarget {
   threadId?: number
   /** Whether the chat is a forum supergroup, when the caller knows. */
   isForum?: boolean
+  /**
+   * Message ids the gateway is on record as having pinned here, captured at
+   * scan time. The GROUP drain unpins exactly these — a pin the gateway did not
+   * place is not its to remove. Unioned with `deps.recordedPinIds` so the lazy
+   * first-inbound caller, which has no scan snapshot, still gets a list.
+   */
+  messageIds?: number[]
 }
 
 export type SweepStatus =
@@ -402,8 +468,12 @@ export type SweepStatus =
   | 'skipped-not-eligible'
   /** Bot is not an admin with can_pin_messages here. Nothing was written. */
   | 'skipped-no-rights'
-  /** Non-forum supergroup with the repin loop not opted in. Nothing written. */
-  | 'skipped-supergroup-manual'
+  /**
+   * A GROUP target with no recorded pin ids. Nothing is owed and nothing may be
+   * done: the gateway only ever removes pins it placed, so with no record there
+   * is no safe action (an unpin-all would take other people's pins with it).
+   */
+  | 'skipped-nothing-recorded'
   /** Already discharged in a previous boot / earlier in this one. */
   | 'already-drained'
   /**
@@ -430,6 +500,14 @@ export interface SweepResult {
   /** Pops OBSERVED to have landed in THIS sweep (never counted from an API
    *  result — see the module docblock). */
   popped: number
+  /**
+   * Targeted unpins ISSUED in this sweep. Deliberately separate from `popped`:
+   * an unpin aimed at a mid-stack id has no observable effect on the only thing
+   * a bot can read (`getChat().pinned_message`, the top), so issuing one is not
+   * evidence it landed. Keeping the two apart is what stops the `ok:true`
+   * silent no-op from being laundered back into a success count.
+   */
+  issued?: number
   /** Detail for the log line. */
   detail?: string
 }
@@ -459,6 +537,12 @@ export interface StalePinSweepDeps {
    * `tool:` pins). Read at the START of the drain, restored at the end.
    */
   protectedMessageIds: (chatId: string) => number[]
+  /**
+   * Message ids the gateway is on record as having pinned in this target, read
+   * LIVE from the durable stores. Unioned with `SweepTarget.messageIds` so the
+   * lazy first-inbound sweep (which carries no boot scan) still has a list.
+   */
+  recordedPinIds: (chatId: string, threadId?: number) => number[]
   /** Gate: this gateway won the startup mutex and owns the shared pin state. */
   eligible: () => boolean
   sleep: (ms: number) => Promise<void>
@@ -466,11 +550,11 @@ export interface StalePinSweepDeps {
   /** Durable obligation ledger. */
   store: { path: string; fs: SweepStoreFsSeam }
   /**
-   * Per-deployment override of {@link SUPERGROUP_REPIN_UNATTENDED}. Leave
+   * Per-deployment override of {@link UNPIN_ALL_FORUM_TOPIC_ENABLED}. Leave
    * undefined to take the standing policy; `true` opts this deployment into the
-   * unattended repin loop in a non-forum supergroup.
+   * WHOLESALE topic drain, which also removes pins the gateway did not place.
    */
-  allowSupergroupRepinLoop?: boolean
+  allowUnpinAllForumTopic?: boolean
   log?: (line: string) => void
 }
 
@@ -551,26 +635,39 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
 
   /**
    * Two `getChat` reads separated by {@link VERIFY_READ_GAP_MS} that must
-   * AGREE. `getChat` is a cache that lies right after a mutation, so a single
-   * read — in either direction — is not an observation. A read that THROWS is
-   * "unknown", never "empty".
+   * AGREE, retried up to {@link VERIFY_READ_MAX_PAIRS} times. A read that
+   * THROWS is "unknown", never "empty".
+   *
+   * This exists because of a measured lie with a counter-intuitive shape: right
+   * after an unpin, `getChat` transiently reports `pinned_message: None` on a
+   * stack that is NOT empty. Tight sampling: at ~0.15s it read `None`; at
+   * ~0.55s and every read after, it read the next real pin. The transient value
+   * is the EMPTY one, not a stale id — the opposite of what you would guess —
+   * so a drain loop that terminates on a single `None` exits early and orphans
+   * the rest of the stack. Never treat one `None` as empty.
+   *
+   * Retrying (rather than giving up on the first disagreement) is what keeps the
+   * transient from ending an otherwise healthy drain: the second pair reads the
+   * settled value and the loop carries on.
    */
   const readTopVerified = async (chatId: string): Promise<{ top: number | null } | null> => {
-    let first: number | null
-    try {
-      first = await deps.getTopPinnedMessageId(chatId)
-    } catch {
-      return null
+    const read = async (): Promise<{ v: number | null } | null> => {
+      try {
+        return { v: await deps.getTopPinnedMessageId(chatId) }
+      } catch {
+        return null
+      }
     }
-    await deps.sleep(VERIFY_READ_GAP_MS)
-    let second: number | null
-    try {
-      second = await deps.getTopPinnedMessageId(chatId)
-    } catch {
-      return null
+    let prev = await read()
+    if (prev == null) return null
+    for (let i = 0; i < VERIFY_READ_MAX_PAIRS; i++) {
+      await deps.sleep(VERIFY_READ_GAP_MS)
+      const next = await read()
+      if (next == null) return null
+      if (next.v === prev.v) return { top: next.v }
+      prev = next
     }
-    if (first !== second) return null
-    return { top: second }
+    return null
   }
 
   /** Fold an error into a control decision shared by every drain primitive. */
@@ -736,9 +833,135 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
   }
 
   /**
-   * The forum-topic drain: ONE topic-scoped `unpinAllForumTopicMessages`, no
-   * loop. A 429 here is the pegged TDLib re-issue loop, so it is a give-up, not
-   * a backoff — see the module docblock.
+   * The GROUP drain: one targeted `unpinChatMessage` per RECORDED id.
+   *
+   * Measured, a targeted unpin in a supergroup works at ANY stack position — an
+   * entry third from the top vanished from the middle — so no re-pin is needed
+   * and nothing visible is emitted. It is deliberately scoped to ids the gateway
+   * placed: `unpinAllChatMessages` would clear the stack in one silent call and
+   * take other people's pins with it (measured, it destroyed a pre-existing
+   * pin), which in a real team chat is unrecoverable data loss.
+   *
+   * Because a mid-stack unpin is unobservable through `getChat` (which exposes
+   * only the top), `popped` — the OBSERVED count — is credited only from a top
+   * that actually moved. Every issued call is reported separately as `issued`.
+   */
+  const targetedUnpinDrain = async (
+    target: SweepTarget,
+    kind: SweepChatKind,
+    cursor: SweepCursor,
+    ids: readonly number[],
+  ): Promise<SweepResult> => {
+    const alreadyDone = new Set(cursor.doneIds ?? [])
+    const pending = ids.filter((id) => !alreadyDone.has(id))
+    if (pending.length === 0) {
+      return { status: 'drained', popped: 0, issued: 0, detail: 'every recorded id already unpinned' }
+    }
+
+    const before = await readTopVerified(target.chatId)
+    let issued = 0
+    let deferred: SweepResult | null = null
+
+    for (const id of pending) {
+      if (circuitOpen) {
+        deferred = { status: 'aborted-circuit-breaker', popped: 0, issued, detail: 'breaker open' }
+        break
+      }
+      if (!(await awaitWriteSlot(kind))) {
+        deferred = {
+          status: 'deferred-budget',
+          popped: 0,
+          issued,
+          detail: `per-minute pin-op budget spent with ${pending.length - issued} ids left`,
+        }
+        break
+      }
+      try {
+        // The RESULT is deliberately ignored: `unpinChatMessage` answers ok:true
+        // even when it pops nothing. Only the observed top below is evidence.
+        await deps.unpin(target.chatId, id)
+      } catch (err) {
+        const d = classify(err)
+        if (d.kind === 'breaker') {
+          circuitOpen = true
+          deferred = { status: 'aborted-circuit-breaker', popped: 0, issued, detail: d.detail }
+          break
+        }
+        if (d.kind === 'rights') {
+          deferred = { status: 'skipped-no-rights', popped: 0, issued }
+          break
+        }
+        if (d.kind === 'flood') {
+          deferred = {
+            status: 'deferred-flood',
+            popped: 0,
+            issued,
+            detail: `flood: retry_after=${d.seconds}s`,
+          }
+          break
+        }
+        if (!isNothingToUnpinError(err)) {
+          deferred = { status: 'error', popped: 0, issued, detail: d.detail }
+          break
+        }
+      }
+      issued++
+      // Durable resume point: a boot that dies here must not re-issue this id.
+      alreadyDone.add(id)
+      cursor.doneIds = [...alreadyDone]
+      cursor.updatedAt = deps.now()
+      commit(cursor)
+    }
+
+    const after = await readTopVerified(target.chatId)
+    if (after == null) {
+      return {
+        status: deferred?.status ?? 'incomplete',
+        popped: 0,
+        issued,
+        detail: 'pin-stack read unverifiable after the unpin pass',
+      }
+    }
+    // The whole stack is gone ⇒ every issued unpin demonstrably landed.
+    if (after.top == null) {
+      const popped = issued
+      cursor.popped += popped
+      commit(cursor)
+      return { status: 'drained', popped, issued }
+    }
+    if (deferred != null) return { ...deferred, popped: 0 }
+    const ours = new Set(ids)
+    if (ours.has(after.top)) {
+      // One of OUR ids is still on top after we unpinned it — the silent no-op,
+      // observed. Never call that drained.
+      return {
+        status: 'incomplete',
+        popped: 0,
+        issued,
+        detail: `recorded pin ${after.top} is still on top after a targeted unpin`,
+      }
+    }
+    // Top is a pin the gateway never placed. Ours were mid-stack, where the API
+    // gives no read-back, so this is the honest limit of what can be observed:
+    // the obligation is discharged, the effect is unverifiable. Tracked as
+    // `issued`, never as `popped`.
+    const popped = before != null && before.top !== after.top ? 1 : 0
+    cursor.popped += popped
+    commit(cursor)
+    return {
+      status: 'drained',
+      popped,
+      issued,
+      detail: `unpinned ${issued} recorded id(s); top ${after.top} is not ours and was left alone`,
+    }
+  }
+
+  /**
+   * The OPT-IN wholesale topic drain: ONE topic-scoped
+   * `unpinAllForumTopicMessages`, no loop. Removes pins the gateway did not
+   * place, which is why it is gated on {@link mayUnpinAllForumTopic}. A 429 here
+   * is the pegged TDLib re-issue loop, so it is a give-up, not a backoff — see
+   * the module docblock.
    */
   const forumTopicDrain = async (
     target: SweepTarget,
@@ -746,7 +969,7 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
   ): Promise<SweepResult> => {
     const threadId = target.threadId
     if (threadId == null) {
-      return { status: 'skipped-supergroup-manual', popped: 0, detail: 'no message_thread_id' }
+      return { status: 'skipped-nothing-recorded', popped: 0, detail: 'no message_thread_id' }
     }
     if (!(await awaitWriteSlot('forum-topic'))) {
       return { status: 'deferred-budget', popped: 0, detail: 'per-minute pin-op budget spent' }
@@ -798,21 +1021,6 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
       return { status: 'forfeited', popped: 0, detail: `${cursor.attempts} attempts exhausted` }
     }
 
-    // The one spam gate. Policy + rationale live in `mayRepinLoopUnattended` /
-    // SUPERGROUP_REPIN_UNATTENDED — do not re-derive it here.
-    if (!mayRepinLoopUnattended(kind, deps.allowSupergroupRepinLoop)) {
-      cursor.attempts++
-      cursor.lastStatus = 'skipped-supergroup-manual'
-      cursor.updatedAt = deps.now()
-      commit(cursor)
-      log(
-        `telegram gateway: stale-pin-sweep: chat=${target.chatId} is a non-forum ` +
-          `supergroup — skipping the repin loop (each pop emits a visible service ` +
-          `message). Drain manually or set allowSupergroupRepinLoop.\n`,
-      )
-      return { status: 'skipped-supergroup-manual', popped: 0 }
-    }
-
     // RIGHTS PRECHECK, before ANY write, in every group. A bot without
     // can_pin_messages is honestly rejected by Telegram, but burning a rejected
     // write per orphan against the flood ledger is pointless. DMs need no
@@ -842,24 +1050,55 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
 
     let result: SweepResult
     try {
-      result =
-        kind === 'forum-topic'
-          ? await forumTopicDrain(target, cursor)
-          : await repinUnpinLoop(target, kind, cursor)
+      if (kind === 'dm') {
+        // A DM is a blind drain: targeted unpin does not pop there, so the only
+        // primitive is repin+unpin against the observed top. It needs no id
+        // list, and there are no third-party pins in a DM to protect.
+        result = await repinUnpinLoop(target, kind, cursor)
+      } else if (mayUnpinAllForumTopic(kind, deps.allowUnpinAllForumTopic)) {
+        result = await forumTopicDrain(target, cursor)
+      } else {
+        // The routine group path: unpin exactly the ids we recorded, minus the
+        // ones we deliberately keep (unexpired `tool:` pins).
+        const keep = new Set(protectedIds)
+        const ids = [
+          ...new Set([
+            ...(target.messageIds ?? []),
+            ...deps.recordedPinIds(target.chatId, target.threadId),
+          ]),
+        ].filter((id) => !keep.has(id))
+        result =
+          ids.length === 0
+            ? {
+                status: 'skipped-nothing-recorded',
+                popped: 0,
+                issued: 0,
+                detail: 'no recorded pin ids for this target — nothing this gateway may remove',
+              }
+            : await targetedUnpinDrain(target, kind, cursor, ids)
+      }
     } catch (err) {
       result = { status: 'error', popped: 0, detail: (err as Error).message }
     }
 
-    if (result.status === 'drained') {
+    // `skipped-nothing-recorded` discharges the obligation too: there is no id
+    // this gateway may legitimately remove here, so re-attempting next boot can
+    // only burn the attempt budget until it forfeits.
+    if (result.status === 'drained' || result.status === 'skipped-nothing-recorded') {
       cursor.done = true
     }
     cursor.lastStatus = result.status
     cursor.updatedAt = deps.now()
     commit(cursor)
 
-    // Restore the deliberately-retained pins the drain cleared. Rate-gated like
-    // any other write; a failure is logged and never fatal.
-    if (result.status === 'drained' || result.popped > 0) {
+    // Restore the deliberately-retained pins the blind DM drain cleared.
+    // Rate-gated like any other write; a failure is logged and never fatal.
+    //
+    // DM ONLY, deliberately. The group path never removes a protected id in the
+    // first place (they are filtered out of the unpin list), so re-pinning there
+    // would double-pin — and a pin is the ONE group op that emits a visible
+    // service message, so it would also be the only spam this sweep produces.
+    if (kind === 'dm' && (result.status === 'drained' || result.popped > 0)) {
       for (const messageId of protectedIds) {
         if (circuitOpen) break
         if (!(await awaitWriteSlot(kind))) break
@@ -877,7 +1116,7 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
     log(
       `telegram gateway: stale-pin-sweep: chat=${target.chatId} ` +
         `thread=${target.threadId ?? '-'} kind=${kind} status=${result.status} ` +
-        `popped=${result.popped} total=${cursor.popped}` +
+        `popped=${result.popped} issued=${result.issued ?? 0} total=${cursor.popped}` +
         (result.detail != null ? ` (${result.detail})` : '') +
         `\n`,
     )

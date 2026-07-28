@@ -9242,12 +9242,13 @@ const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
     },
   },
   // Per-deployment override only. UNSET (the normal case) means "take the
-  // standing policy", which lives in ONE place: SUPERGROUP_REPIN_UNATTENDED in
-  // stale-pin-sweep.ts. Set the env var to 1/0 to force it either way here.
-  allowSupergroupRepinLoop:
-    process.env.SWITCHROOM_PIN_SWEEP_SUPERGROUP == null
+  // standing policy" — UNPIN_ALL_FORUM_TOPIC_ENABLED in stale-pin-sweep.ts,
+  // i.e. the WHOLESALE topic drain stays off because it also removes pins this
+  // gateway never placed. Set the env var to 1 to opt a deployment in.
+  allowUnpinAllForumTopic:
+    process.env.SWITCHROOM_PIN_SWEEP_UNPIN_ALL_TOPIC == null
       ? undefined
-      : process.env.SWITCHROOM_PIN_SWEEP_SUPERGROUP === '1',
+      : process.env.SWITCHROOM_PIN_SWEEP_UNPIN_ALL_TOPIC === '1',
 })
 
 /**

@@ -66,6 +66,18 @@ export interface SweepCursor {
    * budget on every boot for the rest of time.
    */
   attempts: number
+  /**
+   * Message ids this obligation has already issued a targeted unpin for.
+   *
+   * Load-bearing for the GROUP path, which is not a blind stack drain but a
+   * bounded pass over the ids the gateway is on record as having pinned. When a
+   * boot spends its per-minute budget half way through that list, this is what
+   * lets the next boot resume at the right place instead of re-issuing (and
+   * re-charging the flood ledger for) every unpin from the start.
+   *
+   * Unused by the DM path, which drains by observation and has no id list.
+   */
+  doneIds?: number[]
   /** Last terminal-ish reason, for operator forensics. Never load-bearing. */
   lastStatus?: string
   /** Wall-clock ms of the last write. */
@@ -74,9 +86,9 @@ export interface SweepCursor {
 
 /**
  * How many boots may attempt one obligation before it is forfeited. Generous
- * because a legitimate deep stack in a supergroup is deliberately spread over
- * several boots (10 pops per chat per sweep — see `GROUP_SWEEP_GATE`): 8 boots
- * covers an 80-deep stack, well past anything observed.
+ * because a legitimate deep stack is deliberately spread over several boots
+ * (the per-minute pin-op budget, and in a DM the 40-pop-per-chat cap): 8 boots
+ * covers far more than anything observed on the fleet.
  */
 export const SWEEP_MAX_ATTEMPTS = 8
 
@@ -113,6 +125,8 @@ function isCursorRow(x: unknown): x is SweepCursor {
     typeof o.popped === 'number' &&
     typeof o.done === 'boolean' &&
     typeof o.attempts === 'number' &&
+    (o.doneIds === undefined ||
+      (Array.isArray(o.doneIds) && o.doneIds.every((n) => typeof n === 'number'))) &&
     (o.lastStatus === undefined || typeof o.lastStatus === 'string') &&
     typeof o.updatedAt === 'number'
   )

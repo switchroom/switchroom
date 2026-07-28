@@ -69,9 +69,9 @@ export interface StalePinSweepWiring {
   /** Mutex-won AND bot-constructed. False ⇒ the drain must not write. */
   eligible: () => boolean
   store: { path: string; fs: SweepStoreFsSeam }
-  /** Per-deployment override of `SUPERGROUP_REPIN_UNATTENDED`; undefined =
-   *  take the standing policy. */
-  allowSupergroupRepinLoop?: boolean
+  /** Per-deployment override of `UNPIN_ALL_FORUM_TOPIC_ENABLED`; undefined =
+   *  take the standing policy (the wholesale topic drain stays OFF). */
+  allowUnpinAllForumTopic?: boolean
   log?: (line: string) => void
   now?: () => number
   sleep?: (ms: number) => Promise<void>
@@ -107,6 +107,28 @@ export function protectedPinIds(args: {
     )
   }
   return ids
+}
+
+/**
+ * The message ids the gateway is ON RECORD as having pinned in one
+ * `(chat, thread)` target — the only ids the group drain is allowed to unpin.
+ *
+ * Matched on the FULL target key, not the chat alone: the pin stack is
+ * chat-wide, but the obligation is per topic, and unpinning another topic's
+ * recorded pin while sweeping this one would clear a card that is still live.
+ */
+export function recordedPinIdsFor(
+  rows: readonly PersistedStatusPin[],
+  chatId: string,
+  threadId?: number,
+): number[] {
+  const out: number[] = []
+  for (const r of rows) {
+    if (r.chatId !== chatId) continue
+    if ((r.threadId ?? undefined) !== threadId) continue
+    if (typeof r.messageId === 'number' && !out.includes(r.messageId)) out.push(r.messageId)
+  }
+  return out
 }
 
 /** Assemble the gateway's stale-pin sweeper. */
@@ -158,6 +180,17 @@ export function createGatewayStalePinSweeper(w: StalePinSweepWiring): StalePinSw
       })) as { status?: string; can_pin_messages?: boolean } | undefined
       return member?.status === 'administrator' && member.can_pin_messages === true
     },
+    recordedPinIds: (chatId, threadId) => {
+      try {
+        return recordedPinIdsFor(w.loadPinRows(), chatId, threadId)
+      } catch (err) {
+        log(
+          `telegram gateway: stale-pin-sweep: recorded-pin scan failed ` +
+            `(chat=${chatId}): ${(err as Error).message}\n`,
+        )
+        return []
+      }
+    },
     protectedMessageIds: (chatId) =>
       protectedPinIds({
         chatId,
@@ -171,8 +204,8 @@ export function createGatewayStalePinSweeper(w: StalePinSweepWiring): StalePinSw
     now,
     store: w.store,
     // Passed through UNCOERCED: undefined means "take the standing policy"
-    // (SUPERGROUP_REPIN_UNATTENDED), which is not the same as an explicit false.
-    allowSupergroupRepinLoop: w.allowSupergroupRepinLoop,
+    // (UNPIN_ALL_FORUM_TOPIC_ENABLED), not the same as an explicit false.
+    allowUnpinAllForumTopic: w.allowUnpinAllForumTopic,
     log,
   })
 }
