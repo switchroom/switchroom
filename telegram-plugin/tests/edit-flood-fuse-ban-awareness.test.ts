@@ -106,7 +106,7 @@ describe('restart durability — the persisted window outranks process memory', 
 
   it('untightens once the window on disk closes — it is a floor, not a latch', async () => {
     const clock = new FakeClock()
-    let remaining = 60_000
+    let remaining = 12_247_000
     const fuse = createEditFloodFuse({
       clock, floodWaitRemainingMs: () => remaining,
       floodProbeIntervalMs: 0, // re-read every call, for determinism here
@@ -118,6 +118,63 @@ describe('restart durability — the persisted window outranks process memory', 
     // persisted window pins the level while open and never mutates it.
     expect(fuse.stats().tightenLevel).toBe(0)
     expect(fuse.stats().perMessageCeiling).toBe(20)
+  })
+
+  it('grades the persisted window by what REMAINS, not straight to maximum (#3885)', () => {
+    // `makeFloodWaitRecorder` writes `flood-wait.json` for EVERY 429, including
+    // a routine 3-second nudge. Pinning at `maxTightenLevel` for any open
+    // window therefore reintroduced on the persisted path the exact defect
+    // #3856 fixed on the in-memory one: a nudge and a 4.4h ban produced the
+    // same maximal response, collapsing a whole chat to 1 call/min over a
+    // transient blip. The severity ladder is the same one `noteFlood` uses.
+    const cases: [number, number][] = [
+      [3_000, 1],        // routine burst nudge
+      [45_000, 2],       // sustained overrate
+      [300_000, 3],      // a real ban
+      [12_247_000, 4],   // the 2026-07-27 magnitude — still straight to maximum
+    ]
+    for (const [remainingMs, expected] of cases) {
+      const fuse = createEditFloodFuse({
+        clock: new FakeClock(), floodWaitRemainingMs: () => remainingMs,
+        floodProbeIntervalMs: 0, maxTightenLevel: 4, tightenFactor: 0.5,
+      })
+      expect(fuse.stats().persistedFloodOpen).toBe(true)
+      expect(fuse.stats().tightenLevel).toBe(expected)
+    }
+  })
+
+  it('a single 3s 429 does not collapse the chat to 1 call/min (#3885)', async () => {
+    // The production regression, end to end: one transient 429 during a fleet
+    // restart both bumped the in-memory level AND wrote a 3-second marker that
+    // pinned the fuse at maximum, taking `perChatTotalMaxPerWindow: 20` down to
+    // an effective 1 for the whole chat.
+    const clock = new FakeClock()
+    const fuse = createEditFloodFuse({
+      clock, floodProbeIntervalMs: 0,
+      // The marker as the real recorder would write it for a 3s penalty.
+      floodWaitRemainingMs: () => Math.max(0, 3_000 - clock.now()),
+      perChatTotalMaxPerWindow: 20, perChatReplyReserve: 8, perChatSendMaxPerWindow: 25,
+      perTokenMaxPerWindow: 1_000, maxTightenLevel: 4, tightenFactor: 0.5,
+    })
+    await expect(
+      fuse.apply('sendMessage', { chat_id: CHAT, text: 'x' }, async () => { throw flood(3) }),
+    ).rejects.toThrow()
+
+    // One nudge is worth one level, on both paths — so the chat keeps half its
+    // budget, not one-twentieth of it.
+    expect(fuse.stats().tightenLevel).toBe(1)
+    expect(fuse.stats().criticalPerChatTotalCeiling).toBe(10)
+
+    // And it BINDS at that rate: 20 replies offered inside one window, ~half
+    // land promptly rather than one. 9 rather than 10 because the 429'd call
+    // above took a slot of the same window before it failed.
+    let landed = 0
+    const calls = Array.from({ length: 20 }, () =>
+      fuse.apply('sendMessage', { chat_id: CHAT, text: 'answer' }, async () => { landed++; return true }))
+    await clock.advance(1_000)
+    expect(landed).toBe(9)
+    await clock.advance(60_000)
+    await Promise.all(calls)
   })
 
   it('FAILS OPEN: an unreadable marker must never gag the bot', async () => {
