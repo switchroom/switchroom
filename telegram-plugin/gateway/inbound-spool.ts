@@ -460,14 +460,26 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
       // contents were never written — worse than not compacting at all.
       fs.fsyncFileSync(tmp)
       fs.renameSync(tmp, path)
-      // ...then fsync the containing DIRECTORY, which is what makes the
-      // rename itself survive a power cut.
-      fs.fsyncDirSync(dirname(path))
       log(`inbound-spool: compacted path=${path} live=${live.size}\n`)
     } catch (err) {
       // Compaction is opportunistic — a failure keeps the (larger but
       // correct) append-only log; never lose data trying to shrink it.
       log(`inbound-spool: compact FAILED path=${path}: ${(err as Error).message}\n`)
+      return
+    }
+    // ...then fsync the containing DIRECTORY, which is what makes the rename
+    // itself survive a power cut. Separate try: the rename has already
+    // landed, so this failing is a weaker durability claim, NOT a failed
+    // compaction — logging it as one would send an operator hunting a
+    // rewrite that actually worked.
+    try {
+      fs.fsyncDirSync(dirname(path))
+    } catch (err) {
+      log(
+        `inbound-spool: compact directory fsync FAILED path=${path}: ` +
+        `${(err as Error).message} — compacted log written but the rename ` +
+        `may not survive a power cut\n`,
+      )
     }
   }
 

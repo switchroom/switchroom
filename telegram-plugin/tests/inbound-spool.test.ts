@@ -522,6 +522,24 @@ describe('inbound-spool — power-cut durability (fsync)', () => {
     ])
   })
 
+  it('a failed compaction directory fsync is not reported as a failed compaction', () => {
+    // The rename already landed, so the compacted log IS on disk; only the
+    // power-cut upgrade is missing. Calling it "compact FAILED" would send an
+    // operator hunting a rewrite that actually worked.
+    const fs = fakeFs()
+    const logs: string[] = []
+    fs.fsyncDirSync = () => {
+      throw new Error('EIO: i/o error, fsync dir')
+    }
+    const s = createInboundSpool({ path: PATH, fs, compactAtBytes: 200, log: (l) => logs.push(l) })
+    for (let i = 1; i <= 10; i++) s.put('a', msg({ messageId: i, text: 'y'.repeat(50) }))
+    expect(logs.join('')).toContain('compact directory fsync FAILED')
+    expect(logs.join('')).toContain('compacted path=')
+    // And the compacted log is intact and readable — nothing was rolled back.
+    const s2 = createInboundSpool({ path: PATH, fs, log: () => {} })
+    expect(s2.liveCount()).toBe(10)
+  })
+
   it('an un-acked entry survives a POWER CUT, not just a process kill', () => {
     // Models the distinction the fsync exists for: `appendFileSync` returning
     // puts the bytes in the page cache (enough to survive SIGKILL — the
