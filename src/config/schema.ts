@@ -2507,7 +2507,11 @@ export const HindsightConfigSchema = z.object({
       "RERANKER_LOCAL_MAX_CONCURRENT, RECALL_MAX_CONCURRENT, " +
       "REFLECT_WALL_TIMEOUT, WORKER_CONSOLIDATION_MAX_SLOTS, " +
       "WORKER_CONSOLIDATION_SLOT_LIMIT, " +
-      "CONSOLIDATION_MAX_MEMORIES_PER_ROUND), the override-only keys " +
+      "CONSOLIDATION_MAX_MEMORIES_PER_ROUND, RECENCY_DECAY_FUNCTION, " +
+      "RECENCY_DECAY_HALFLIFE_DAYS — switchroom defaults recall's recency " +
+      "curve to `exponential` with a 30-day half-life so a fact retained " +
+      "today outranks a stale one, instead of upstream's near-flat " +
+      "linear/365-day window), the override-only keys " +
       "switchroom manages but ships NO default for " +
       "(`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`: " +
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY — a per-deployment " +
@@ -2515,7 +2519,10 @@ export const HindsightConfigSchema = z.object({
       "created_at FIFO across banks; and " +
       "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP — the rollback knob for " +
       "switchroom's CE-saturation damping patch, a float; >= ~0.65 backs the " +
-      "damping out entirely, unset means the patch's own derived gap), plus the " +
+      "damping out entirely, unset means the patch's own derived gap; and " +
+      "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS — only read when the " +
+      "decay function is `linear`, so switchroom ships no default for it but " +
+      "still honours an operator who flips the function back), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
