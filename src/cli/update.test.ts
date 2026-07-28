@@ -48,6 +48,10 @@ describe("planUpdate", () => {
         memoryBackendHindsight: false,
       });
       expect(steps.map((s) => s.name)).toEqual([
+        // self-update-cli is FIRST by design (#3919): apply-config renders
+        // scaffolds from templates shipped inside the CLI, so updating the
+        // CLI afterwards would render this run from the old templates.
+        "self-update-cli",
         "pull-images",
         "apply-config",
         "refresh-hostd",
@@ -263,6 +267,7 @@ describe("planUpdate", () => {
         memoryBackendHindsight: false,
       });
       expect(steps.map((s) => s.name)).toEqual([
+        "self-update-cli",
         "pull-images",
         "rebuild-source",
         "apply-config",
