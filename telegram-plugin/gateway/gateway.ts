@@ -19,6 +19,7 @@ import {
   statSync, renameSync, realpathSync, chmodSync, openSync, closeSync,
   existsSync, unlinkSync, appendFileSync,
 } from 'fs'
+import { fsyncPathSync } from '../../src/util/atomic.js'
 import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 
@@ -2838,6 +2839,7 @@ const obligationStoreFs = {
   writeFileSync: (p: string, d: string) => writeFileSync(p, d),
   renameSync: (a: string, b: string) => renameSync(a, b),
   existsSync: (p: string) => existsSync(p),
+  fsyncFileSync: fsyncPathSync, fsyncDirSync: fsyncPathSync,
 }
 const obligationLedger = new ObligationLedger(OBLIGATION_REPRESENT_MAX, {
   onChange:
@@ -9926,6 +9928,7 @@ if (isGatewayMain) inboundSpool = STATIC
         renameSync: (a, b) => renameSync(a, b),
         existsSync: (p) => existsSync(p),
         statSizeSync: (p) => statSync(p).size,
+        fsyncFileSync: fsyncPathSync, fsyncDirSync: fsyncPathSync,
       },
       // #2789 B: durability degradation must be visible, not silent. When
       // spool appends start failing we're back to in-memory-only — a

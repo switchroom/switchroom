@@ -41,6 +41,7 @@
  * gateway (mirrors the #1544/#1546/#1549 pure-seam idiom).
  */
 
+import { dirname } from 'node:path'
 import type { InboundMessage } from './ipc-protocol.js'
 
 /** Stable dedup id for an inbound. Real Telegram messages have a
@@ -161,6 +162,17 @@ export interface InboundSpoolFsSeam {
   renameSync: (from: string, to: string) => void
   existsSync: (path: string) => boolean
   statSizeSync: (path: string) => number
+  /** fsync the FILE at `path` — flush its bytes to stable storage.
+   *  `appendFileSync` returning only means the page cache took the write;
+   *  without this a host power cut loses the record even though every
+   *  syscall succeeded. */
+  fsyncFileSync: (path: string) => void
+  /** fsync the DIRECTORY at `path` — makes a completed `renameSync`
+   *  durable. rename(2) is atomic (never a torn file) but that is an
+   *  ordering guarantee, not a durability one: the new directory entry
+   *  lives in the parent's own cached metadata and can vanish in a power
+   *  cut. Call AFTER the rename. */
+  fsyncDirSync: (path: string) => void
 }
 
 export interface InboundSpoolOptions {
@@ -345,6 +357,13 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
   function appendRecord(rec: SpoolRecord): void {
     try {
       fs.appendFileSync(path, JSON.stringify(rec) + '\n')
+      // Durability barrier. The whole point of this file is that the
+      // record survives the process dying, and `appendFileSync` alone
+      // only guarantees the page cache holds it — enough for a SIGKILL,
+      // not for a host power cut. fsync before we report success, so a
+      // failure here is treated as the durability loss it is (latched
+      // `degraded`) rather than a silent downgrade to in-memory.
+      fs.fsyncFileSync(path)
       // #2789 B: a successful append after a failure run means the spool
       // is durable again — un-latch degraded state and surface recovery
       // so the health signal clears.
@@ -435,7 +454,15 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     const tmp = path + '.compact.tmp'
     try {
       fs.writeFileSync(tmp, lines.length ? lines.join('\n') + '\n' : '')
+      // fsync the tmp file BEFORE publishing it: rename orders the
+      // metadata, it does not put the DATA on the platter. Renaming an
+      // unsynced tmp over the log can leave the spool naming a file whose
+      // contents were never written — worse than not compacting at all.
+      fs.fsyncFileSync(tmp)
       fs.renameSync(tmp, path)
+      // ...then fsync the containing DIRECTORY, which is what makes the
+      // rename itself survive a power cut.
+      fs.fsyncDirSync(dirname(path))
       log(`inbound-spool: compacted path=${path} live=${live.size}\n`)
     } catch (err) {
       // Compaction is opportunistic — a failure keeps the (larger but

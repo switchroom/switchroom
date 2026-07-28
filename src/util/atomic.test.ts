@@ -24,7 +24,7 @@ vi.mock("node:fs", async () => {
   };
 });
 
-import { atomicWriteFileSync, atomicWriteJsonSync, writeConfigFileSync } from "./atomic.js";
+import { atomicWriteFileSync, atomicWriteJsonSync, fsyncPathSync, writeConfigFileSync } from "./atomic.js";
 
 describe("atomicWriteFileSync", () => {
   let dir: string;
@@ -241,5 +241,38 @@ describe("writeConfigFileSync (#2457 — EBUSY bind-mount fallback)", () => {
 
     fsyncSpy.mockRestore();
     closeSpy.mockRestore();
+  });
+});
+
+describe("fsyncPathSync", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(join(tmpdir(), "fsync-path-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("syncs a regular file without disturbing its contents", () => {
+    const p = join(dir, "spool.jsonl");
+    fs.writeFileSync(p, "line one\n");
+    expect(() => fsyncPathSync(p)).not.toThrow();
+    expect(fs.readFileSync(p, "utf-8")).toBe("line one\n");
+  });
+
+  it("syncs a DIRECTORY — the non-obvious half, and the one a rename needs", () => {
+    // A directory cannot be opened for writing, so a naive fsync helper that
+    // opens O_WRONLY throws EISDIR here and the rename-durability barrier is
+    // silently never taken.
+    fs.writeFileSync(join(dir, "obligations.json"), "{}");
+    expect(() => fsyncPathSync(dir)).not.toThrow();
+  });
+
+  it("throws on a missing path rather than silently skipping the barrier", () => {
+    // A swallowed fsync is exactly the bug this primitive exists to prevent;
+    // callers that want best-effort must wrap it themselves.
+    expect(() => fsyncPathSync(join(dir, "does-not-exist"))).toThrow(/ENOENT/);
   });
 });

@@ -64,6 +64,8 @@ function memStore(): { fs: ObligationStoreFsSeam } {
         files.delete(a);
       },
       existsSync: (p) => files.has(p),
+      fsyncFileSync: () => {},
+      fsyncDirSync: () => {},
     },
   };
 }

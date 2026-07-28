@@ -27,6 +27,12 @@ function memFs(seed: Record<string, string> = {}) {
       files.delete(a);
     },
     existsSync: (p) => files.has(p),
+    fsyncFileSync: (p) => {
+      calls.push(`fsyncFile:${p}`);
+    },
+    fsyncDirSync: (p) => {
+      calls.push(`fsyncDir:${p}`);
+    },
   };
   return { fs, files, calls };
 }
@@ -63,7 +69,12 @@ describe("obligation-store", () => {
   it("persists atomically: writes a sibling .tmp then renames over the path", () => {
     const { fs, calls, files } = memFs();
     persistObligations(PATH, fs, [ob("c:3#1")]);
-    expect(calls).toEqual([`write:${PATH}.tmp`, `rename:${PATH}.tmp->${PATH}`]);
+    expect(calls).toEqual([
+      `write:${PATH}.tmp`,
+      `fsyncFile:${PATH}.tmp`,
+      `rename:${PATH}.tmp->${PATH}`,
+      "fsyncDir:/state/agent/telegram",
+    ]);
     // The tmp is gone (renamed); only the real path remains.
     expect(files.has(PATH)).toBe(true);
     expect(files.has(`${PATH}.tmp`)).toBe(false);
@@ -170,8 +181,63 @@ describe("obligation-store", () => {
       },
       renameSync: () => {},
       existsSync: () => false,
+      fsyncFileSync: () => {},
+      fsyncDirSync: () => {},
     };
     expect(() => persistObligations(PATH, fs, [ob("c:3#1")], (l) => logs.push(l))).not.toThrow();
     expect(logs.join("")).toContain("persist FAILED");
+  });
+});
+
+describe("obligation-store — power-cut durability (fsync ordering)", () => {
+  it("fsyncs the tmp file BEFORE the rename and the directory AFTER it", () => {
+    const { fs, calls } = memFs();
+    persistObligations(PATH, fs, [ob("c:3#1")]);
+    // The exact sequence IS the guarantee: syncing the directory before the
+    // rename, or renaming before the tmp file's data is on stable storage,
+    // publishes a name that can point at bytes that were never written.
+    expect(calls).toEqual([
+      `write:${PATH}.tmp`,
+      `fsyncFile:${PATH}.tmp`,
+      `rename:${PATH}.tmp->${PATH}`,
+      "fsyncDir:/state/agent/telegram",
+    ]);
+  });
+
+  it("a failed tmp fsync aborts BEFORE the rename — the previous snapshot is left intact", () => {
+    // Publishing an unsynced tmp over a good snapshot would be strictly worse
+    // than not writing at all, so the rename must not happen.
+    const prior = JSON.stringify({ v: 1, obligations: [ob("c:3#1")] });
+    const { fs, files } = memFs({ [PATH]: prior });
+    const logs: string[] = [];
+    const failing: ObligationStoreFsSeam = {
+      ...fs,
+      fsyncFileSync: () => {
+        throw new Error("EIO: i/o error, fsync");
+      },
+    };
+    expect(() => persistObligations(PATH, failing, [ob("c:3#2")], (l) => logs.push(l))).not.toThrow();
+    expect(logs.join("")).toContain("persist FAILED");
+    expect(files.get(PATH)).toBe(prior);
+    expect(loadObligations(PATH, fs)[0]!.originTurnId).toBe("c:3#1");
+  });
+
+  it("a failed DIRECTORY fsync keeps the written snapshot and is not reported as a failed persist", () => {
+    // The rename already landed, so the snapshot is correct for a process
+    // crash; only the power-cut upgrade is missing. Mislabelling it
+    // "persist FAILED" would send an operator hunting a write that worked.
+    const { fs, files } = memFs();
+    const logs: string[] = [];
+    const failing: ObligationStoreFsSeam = {
+      ...fs,
+      fsyncDirSync: () => {
+        throw new Error("EIO: i/o error, fsync dir");
+      },
+    };
+    expect(() => persistObligations(PATH, failing, [ob("c:3#1")], (l) => logs.push(l))).not.toThrow();
+    expect(logs.join("")).toContain("directory fsync FAILED");
+    expect(logs.join("")).not.toContain("persist FAILED");
+    expect(files.has(PATH)).toBe(true);
+    expect(loadObligations(PATH, fs)).toHaveLength(1);
   });
 });
