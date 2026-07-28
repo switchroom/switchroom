@@ -177,8 +177,16 @@ class HindsightClient:
         tags: Optional[list] = None,
         timeout: int = 15,
         async_processing: bool = True,
+        observation_scopes: Optional[str] = None,
     ) -> dict:
         """Retain content into a bank's memory.
+
+        ``observation_scopes`` is a per-row Hindsight field controlling which
+        observation scope consolidation writes this item's observations into.
+        ``"shared"`` puts them in ONE global untagged scope instead of a scope
+        per tag. ``None`` (the default) omits the field entirely, so the
+        engine's own default stands and the wire body is byte-identical to a
+        pre-``observation_scopes`` client.
 
         By default posts with ``async=true`` so the server processes extraction
         in the background (a 200 is an ack-of-receipt, not proof of durable
@@ -253,6 +261,7 @@ class HindsightClient:
                 tags=tags,
                 timeout=part_timeout,
                 async_processing=async_processing,
+                observation_scopes=observation_scopes,
             )
         if total > 1 and isinstance(response, dict):
             response = dict(response)
@@ -269,6 +278,7 @@ class HindsightClient:
         tags: Optional[list],
         timeout: int,
         async_processing: bool,
+        observation_scopes: Optional[str] = None,
     ) -> dict:
         """POST exactly one retain item. Raises on any HTTP/transport error."""
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories"
@@ -281,6 +291,10 @@ class HindsightClient:
             item["context"] = context
         if tags:
             item["tags"] = tags
+        # Omitted entirely when unset — the engine default must stay in force
+        # and the body must match a pre-observation_scopes client byte for byte.
+        if observation_scopes:
+            item["observation_scopes"] = observation_scopes
         body = {
             "items": [item],
             "async": bool(async_processing),

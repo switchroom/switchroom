@@ -600,6 +600,10 @@ def _retry_one(entry: dict, timeout: int) -> None:
         tags=entry.get("tags"),
         timeout=timeout,
         async_processing=False,
+        # `.get` (not `[...]`): entries queued by a pre-#observation_scopes build
+        # are on disk RIGHT NOW and carry no such key. They must drain, not
+        # KeyError — a crash here loses the queue entry's only copy of a turn.
+        observation_scopes=entry.get("observation_scopes"),
     )
 
 

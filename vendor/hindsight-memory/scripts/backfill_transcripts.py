@@ -474,6 +474,7 @@ class Backfill:
                     tags=payload["tags"],
                     timeout=15,
                     async_processing=False,  # commit-before-ack (daemon contract 2)
+                    observation_scopes=payload.get("observation_scopes"),
                 )
             except Exception as e:
                 debug_log(self.config, f"backfill: POST failed for {built['document_id']}: {e}")

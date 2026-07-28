@@ -312,6 +312,7 @@ def _post_inline(
                 tags=payload["tags"],
                 timeout=15,
                 async_processing=False,
+                observation_scopes=payload.get("observation_scopes"),
             )
         except Exception as e:
             debug_log(config, f"reconcile_tail: inline POST failed, enqueuing: {e}")

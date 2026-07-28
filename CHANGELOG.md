@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+### Agents sharing a bank can pool their observations, instead of siloing them per tag
+
+Hindsight stores an `observation_scopes` field on each retained row. It decides
+where consolidation files that item's observations: the default puts them in a
+scope per tag, and `"shared"` puts them in one global untagged scope. On a bank
+several agents write into, per-tag scoping means each agent's observations
+consolidate on their own and never merge, so the shared bank never actually
+gets a shared picture.
+
+The engine has accepted and stored the field all along. The plugin could not
+send it — no callsite in `vendor/hindsight-memory/` mentioned it, so a bank
+could not be pooled from switchroom at all. This is the plumbing for it, end to
+end: `memory.observation_scopes` in `switchroom.yaml` (per-agent or under
+`defaults`) becomes `HINDSIGHT_OBSERVATION_SCOPES` in the agent's `start.sh`,
+which the plugin puts on every retain it POSTs.
+
+Every retain path carries it, not just the obvious one — the Stop hook, the
+sidechain (sub-agent) retain, the boot reconciler, the pending-queue drain and
+the historical backfill each hand-enumerate their `client.retain()` kwargs, and
+a path missed is a path that silently keeps writing per-tag. The scope is also
+carried ON the queued payload rather than re-read at drain time, so a retain
+that fails now and drains hours later lands in the scope it was written for.
+Queue entries written by an older build carry no such key and must keep
+draining; the drain reads it with `.get`, and a test pins that a pre-feature
+entry still posts (a `KeyError` there would strand the last on-disk copy of a
+turn).
+
+**Nothing changes unless you set it.** With the knob unset, `start.sh` emits no
+export, the plugin's `observationScopes` stays `None`, and the field is omitted
+from the request body entirely — not sent as null. A test asserts the unset
+body is byte-identical to the pre-change one. No bank is switched to shared
+scope by this change.
+
+That includes the **session-handoff mirror**, which lives outside the vendored
+plugin entirely: on shutdown switchroom POSTs the handoff briefing into the
+agent's own bank directly from TypeScript, so no amount of plumbing inside
+`vendor/hindsight-memory/` reaches it. Left alone it would have been the one
+row written at the old scope on a pooled bank — the kind of single exception
+you only discover once the bank is already inconsistent.
+
+**A typo is rejected where it can be, and never costs you a memory.** The value
+is checked against the set the engine accepts (`per_tag`, `combined`,
+`all_combinations`, `shared`). `observation_scopes: shred` is rejected outright
+at `switchroom apply` — that is the gate that matters, and the only one that
+stops the value before it exists anywhere.
+
+Past that gate the knob can still be wrong: a raw `HINDSIGHT_OBSERVATION_SCOPES`
+export, or a hand-edited installed `settings.json`, is invisible to `apply`.
+What happens then is deliberately **different on the two paths**, because they
+are not risking the same thing:
+
+- **Retains keep their memory.** The Stop hook, sub-agent retains, the boot
+  reconciler and the backfill drop the bad field, retain the turn at the
+  engine's own default scope — exactly what an unconfigured agent does — and
+  print the bad value to stderr. Failing the retain instead would have been the
+  worse bug: it deleted the turn. A wrong scope you can fix and re-consolidate;
+  a lost turn is gone.
+- **The session-handoff mirror is skipped, and says so where you'll see it.**
+  Here the on-disk handoff sidecars are already written, so the next session
+  still reorients and only the recallable copy is at stake — cheap enough to
+  fail closed rather than write one row at a scope nobody chose. `switchroom
+  handoff` exits non-zero, so `run-hook.sh` files a red `hook:handoff` issue
+  carrying the reason. That shows up in `switchroom issues` and on the Telegram
+  issues card, and clears itself on the next clean shutdown once you fix the
+  value.
+
+Being honest about the limit: a bad value that gets past `apply` does **not**
+stop a retain, does not reach `switchroom doctor`, and on the retain path is
+visible only as hook stderr. The design point is that it cannot destroy
+anything — `apply` is where a typo is meant to die.
+
 ## v0.19.28 — private memories can no longer be shipped to a paid outside provider by accident
 
 **The headline, in plain language.** Every agent's memories are meant to be

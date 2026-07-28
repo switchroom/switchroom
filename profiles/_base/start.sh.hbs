@@ -999,6 +999,15 @@ export HINDSIGHT_RECALL_SKIP_TRIVIAL={{hindsightRecallSkipTrivial}}
 {{#if hindsightDirectiveCaptureNudge}}
 export HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE={{hindsightDirectiveCaptureNudge}}
 {{/if}}
+# Per-row observation scope (memory.observation_scopes cascade). Stamped on
+# every retain — Stop hook, sidechain, boot reconcile, queue drain, backfill.
+# "shared" makes consolidation pool this agent's observations into ONE global
+# untagged scope instead of a scope per tag. Export ONLY when the operator set
+# it: unset means the field never goes on the wire and the engine default
+# stands, which is the shipped behaviour.
+{{#if hindsightObservationScopesQ}}
+export HINDSIGHT_OBSERVATION_SCOPES={{{hindsightObservationScopesQ}}}
+{{/if}}
 # PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
 # parsed by retain.py + recall.py to (a) stamp chat_id/thread_id/topic_alias
 # into retained memory metadata and (b) emit a "Current topic: …" preamble

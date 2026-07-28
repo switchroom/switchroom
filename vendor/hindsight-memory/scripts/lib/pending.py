@@ -41,11 +41,17 @@ Each entry is a JSON file ``<unix-ms>-<short-uuid>.json`` containing::
       "context":     "<retainContext>",
       "metadata":    {...},
       "tags":        [...] or null,
+      "observation_scopes": "<scope>" or null,
       "failed_at":   "<ISO-8601 UTC>",
       "error_class": "<exception class name>",
       "error_message": "<str(e)>",
       "attempt_count": 1
     }
+
+``observation_scopes`` is ABSENT from every entry queued by a build that
+predates it, and those entries are on disk right now. Readers must use
+``entry.get("observation_scopes")``, never ``entry[...]`` — a KeyError in
+``drain_pending._retry_one`` would strand the last on-disk copy of a turn.
 
 The file is written via ``write tmp + rename`` so concurrent agents
 sharing ``$HOME`` (legacy installs) never observe a half-written entry.

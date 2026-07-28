@@ -3741,6 +3741,9 @@ interface BuildWorkspaceContextArgs {
   // #2848 Stage B — directive-capture nudge opt-out. Stringified bool,
   // undefined unless the operator overrode the switchroom default (on).
   hindsightDirectiveCaptureNudge?: string;
+  // Per-row observation scope. undefined unless the operator set
+  // memory.observation_scopes; exported only when set.
+  hindsightObservationScopes?: string;
   // PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
   // injected as HINDSIGHT_TOPIC_ALIASES_JSON so retain.py can resolve
   // numeric thread_ids to human alias names in memory metadata.
@@ -3790,6 +3793,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
+    hindsightObservationScopes,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -3894,6 +3898,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
+    hindsightObservationScopesQ: hindsightObservationScopes
+      ? shellSingleQuote(hindsightObservationScopes)
+      : undefined,
     // PR6 — only emit the env-export blocks when we actually have a
     // value, so `{{#if hindsightTopicAliasesJsonQ}}` and friends are
     // false-y for fleet-shared / DM agents (the dominant case).
@@ -4877,6 +4884,12 @@ export function scaffoldAgent(
     agentConfig.memory?.directive_capture_nudge === undefined
       ? undefined
       : String(agentConfig.memory.directive_capture_nudge);
+  // Per-row observation scope (memory.observation_scopes cascade). undefined
+  // unless the operator set it — exported only when set (see start.sh.hbs), so
+  // the default retain body never carries the field and the engine default
+  // stands. Top-level memory.* knob: it stamps every retain path, not just the
+  // Stop-hook cadence under memory.retain.
+  const hindsightObservationScopes = agentConfig.memory?.observation_scopes;
 
   // PR6 — supergroup-mode topic tagging. Build the {alias: thread_id}
   // JSON for retain.py + recall.py to resolve numeric thread_ids to
@@ -4943,6 +4956,7 @@ export function scaffoldAgent(
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
+    hindsightObservationScopes,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -7384,6 +7398,12 @@ function reconcileAgentInner(
     agentConfig.memory?.directive_capture_nudge === undefined
       ? undefined
       : String(agentConfig.memory.directive_capture_nudge);
+  // Per-row observation scope (memory.observation_scopes cascade). undefined
+  // unless the operator set it — exported only when set (see start.sh.hbs), so
+  // the default retain body never carries the field and the engine default
+  // stands. Top-level memory.* knob: it stamps every retain path, not just the
+  // Stop-hook cadence under memory.retain.
+  const hindsightObservationScopes = agentConfig.memory?.observation_scopes;
   // PR6 — mirror scaffoldAgent's computation. Both paths feed
   // buildWorkspaceContext, so the template sees identical shape.
   const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
@@ -7483,6 +7503,9 @@ function reconcileAgentInner(
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
+      hindsightObservationScopesQ: hindsightObservationScopes
+        ? shellSingleQuote(hindsightObservationScopes)
+        : undefined,
       // PR6 — supergroup-mode topic tagging env vars. Same gate as
       // buildWorkspaceContext: only emit the shell-quoted JSON when
       // we actually have a topic_aliases map.
@@ -8274,6 +8297,7 @@ function reconcileAgentInner(
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
+      hindsightObservationScopes,
       hindsightTopicAliasesJson,
       hindsightSenderBanksJson,
       hindsightTopicFilterMode,

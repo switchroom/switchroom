@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+### Added (switchroom divergence)
+
+- **Per-row `observation_scopes` on every retain.** Hindsight accepts and
+  stores an `observation_scopes` field per retained item; `"shared"` makes
+  consolidation write that item's observations into ONE global untagged scope
+  instead of a scope per tag. The plugin had no way to send it, so a bank
+  several agents write into could not pool their observations. Added as an
+  explicit `observation_scopes` kwarg on `HindsightClient.retain()` /
+  `_retain_one()` (`scripts/lib/client.py`), sourced from the new
+  `observationScopes` config key (`scripts/lib/config.py`, default `None`,
+  overridable by `HINDSIGHT_OBSERVATION_SCOPES`, which switchroom's
+  `start.sh` exports only when the operator set
+  `memory.observation_scopes`).
+
+  `build_retain_payload` (`scripts/retain.py`) puts the resolved value on the
+  payload, and all five hand-enumerated `client.retain()` callsites forward it:
+  `retain.py` (Stop hook), `subagent_retain.py` (sidechain),
+  `reconcile_tail.py` (boot reconcile), `drain_pending.py` (queue drain) and
+  `backfill_transcripts.py`. Each enumerates kwargs rather than splatting the
+  payload, so a missed one silently keeps writing per-tag scopes — every path
+  is pinned by a test.
+
+  Two durability properties are load-bearing. The scope rides ON the queued
+  payload (`lib/pending` copies the payload wholesale), so a retain that fails
+  now and drains hours later lands in the scope it was written for rather than
+  whatever config says at drain time. And `drain_pending._retry_one` reads it
+  with `entry.get(...)`: entries queued by a build that predates this field are
+  on disk right now, and a `KeyError` there would strand the last on-disk copy
+  of a turn (the #3244 silent-loss shape).
+
+  Default behaviour is unchanged and asserted as such: with the config unset
+  the kwarg is `None` and `_retain_one` omits the key from the request body
+  entirely rather than sending a null, so the body is byte-identical to a
+  pre-change client. Split retains carry the same scope on every part.
+  Tests: `scripts/tests/test_observation_scopes.py`, plus per-path pins in
+  `test_reconcile_durability.py`, `test_subagent_retain.py` and
+  `test_backfill.py`.
+
+  An off-list value RAISES rather than reaching the wire
+  (`resolve_observation_scopes` in `scripts/lib/config.py`, called from
+  `build_retain_payload`). Switchroom's config schema is the primary gate, but
+  it cannot see a hand-edited `settings.json` or a raw
+  `HINDSIGHT_OBSERVATION_SCOPES` export — and a scope is invisible after the
+  write, so a value quietly ignored today reads as a bank whose observations
+  never merged months later. Empty/whitespace stays UNSET, matching the
+  existing "an empty export hands authority back to the config file" idiom.
+  The accepted tuple (`OBSERVATION_SCOPES_VALUES`) is paired with
+  `src/memory/observation-scopes.ts` on the switchroom side; widening the set
+  means widening both.
+
 ### Changed (switchroom divergence)
 
 - **`MAX_DIRECTIVES` 15 → 30, and truncation is no longer SILENT**

@@ -540,6 +540,37 @@ agents:
 
 **Cascade: override** (per-agent wins over profile/defaults). Omit the field to inherit the on-by-default. Operationally the knob threads the same way as the other recall tuning: the switchroom default is pinned in the plugin's `settings.json`, and `start.sh` exports `HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE` only when you override it (the env value wins at plugin load). Serves the `remember-across-sessions` job.
 
+### Pooling observations across agents — `memory.observation_scopes`
+
+Hindsight stamps every retained row with an **observation scope**, which decides where consolidation files the observations it derives from that row. The engine default is a scope **per tag**. Since switchroom tags retains per session, several agents writing into one shared bank end up in parallel per-tag silos: each agent's observations consolidate on their own and never merge, so the shared bank never builds a shared picture.
+
+Set `memory.observation_scopes: shared` to send an agent's retains into **one global untagged scope** instead:
+
+```yaml
+defaults:
+  memory:
+    observation_scopes: shared    # pool the whole fleet's observations
+
+agents:
+  clerk:
+    memory:
+      observation_scopes: shared  # or just the agents sharing a bank
+```
+
+**Omitted by default.** Leave it unset and the field never goes on the wire at all — the engine's own default stands and nothing about your retains changes. Only set it on agents that genuinely share a bank; on an agent with its own bank it buys nothing.
+
+It applies to *every* retain path — the Stop hook, sub-agent (sidechain) retains, the boot reconciler, the pending-queue drain and the historical backfill — and the value is carried on the queued payload, so a retain that fails now and drains hours later still lands in the scope it was written for. Changing the knob does **not** re-scope already-consolidated observations; it binds new retains only.
+
+Accepted values are `per_tag`, `combined`, `all_combinations` and `shared` — the set Hindsight accepts. Anything else is **rejected at `switchroom apply`**. That is the gate that matters: it is the only place a typo is stopped before it exists anywhere, and a silently-ignored one would keep retaining at the engine default and only surface months later as a bank whose observations never merged.
+
+A bad value can still reach the plugin by a path `apply` cannot see — a raw `HINDSIGHT_OBSERVATION_SCOPES` export, or a hand-edited installed `settings.json`. There, **the retain always wins over the scope**: the plugin drops the bad field, retains the turn at the engine's own default scope (exactly what an unconfigured agent does) and prints the offending value to the hook's stderr. It deliberately does *not* fail the retain — doing that would not "reject" the typo, it would delete the turn, and every producer would keep deleting turns for as long as the bad value sat in the config. A wrong scope you can fix and re-consolidate; a lost turn is gone.
+
+The session-handoff mirror — the briefing switchroom writes into the agent's own bank on shutdown — is the one path that fails closed instead, because it is risking less: the on-disk handoff sidecars are already written, so the next session still reorients and only the recallable copy is skipped. `switchroom handoff` exits non-zero in that case, which makes `run-hook.sh` file a red `hook:handoff` issue carrying the reason — visible in `switchroom issues` and on the Telegram issues card, and self-clearing on the next clean shutdown once the value is fixed.
+
+Be aware of the limit: past `apply`, a bad value on the **retain** path is visible only as hook stderr. It does not stop a retain and does not reach `switchroom doctor`. The guarantee is that it cannot destroy anything.
+
+**Cascade: override** (per-agent wins over profile/defaults). `start.sh` exports `HINDSIGHT_OBSERVATION_SCOPES` only when you set it. Serves the `remember-across-sessions` job.
+
 ### Server-side caps on the Hindsight container
 
 `switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. The same default is baked into the `--compose` snippet output.

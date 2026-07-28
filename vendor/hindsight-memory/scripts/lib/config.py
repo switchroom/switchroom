@@ -172,6 +172,15 @@ DEFAULTS = {
     "retainContext": "claude-code",
     "retainTags": [],
     "retainMetadata": {},
+    # Switchroom-local: per-row Hindsight `observation_scopes` on every retain.
+    # `"shared"` makes consolidation write this item's observations into ONE
+    # global untagged scope instead of a scope per tag — what a set of agents
+    # pooling one bank needs. `None` (the default) omits the field from the
+    # wire body entirely, leaving the engine's own default in force. Set by
+    # start.sh from `agents.<name>.memory.observation_scopes` (cascading
+    # through `defaults.memory.observation_scopes`) via
+    # HINDSIGHT_OBSERVATION_SCOPES, exported ONLY when the operator opted in.
+    "observationScopes": None,
     # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson & anti-pattern
     # tagging at retain time. When on (default), build_retain_payload scans the
     # formatted transcript slice for explicit lesson / anti-pattern markers and
@@ -319,6 +328,11 @@ ENV_OVERRIDES = {
     "HINDSIGHT_AUTO_RECALL": ("autoRecall", bool),
     "HINDSIGHT_AUTO_RETAIN": ("autoRetain", bool),
     "HINDSIGHT_RETAIN_MODE": ("retainMode", str),
+    # Switchroom-local: per-row observation scope on retains. Set by start.sh
+    # from agents.<name>.memory.observation_scopes (cascading through
+    # defaults.memory.observation_scopes) ONLY when the operator set it; unset
+    # leaves `observationScopes` None and the field off the wire entirely.
+    "HINDSIGHT_OBSERVATION_SCOPES": ("observationScopes", str),
     # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson/anti-pattern tagging
     # + recall demotion toggles and overrides.
     "HINDSIGHT_LESSON_TAGGING": ("lessonTagging", bool),
@@ -420,6 +434,83 @@ ENV_OVERRIDES = {
     "HINDSIGHT_LLM_MODEL": ("llmModel", str),
     "HINDSIGHT_DEBUG": ("debug", bool),
 }
+
+
+#: Switchroom-local: the `observation_scopes` values Hindsight accepts as a
+#: bare string (`MemoryItem.observation_scopes`, typed
+#: `Literal["per_tag","combined","all_combinations","shared"] | list[list[str]]
+#: | None` server-side). The explicit list-of-lists tag matrix is deliberately
+#: NOT exposed through switchroom config: unbounded, no safe fleet-wide
+#: default, no caller needs it. Paired with `OBSERVATION_SCOPES` in
+#: src/memory/observation-scopes.ts, which the zod enum reads — widening the
+#: set means widening BOTH.
+OBSERVATION_SCOPES_VALUES = ("per_tag", "combined", "all_combinations", "shared")
+
+
+def classify_observation_scopes(config: dict):
+    """Classify ``observationScopes`` WITHOUT raising: ``(value, error)``.
+
+    Exactly one of the two is non-``None``:
+
+    * ``(None, None)``   — unset. Do not put the field on the wire at all;
+      the shipped default, byte-for-byte the pre-plumbing request body.
+    * ``(value, None)``  — a valid member of :data:`OBSERVATION_SCOPES_VALUES`.
+    * ``(None, reason)`` — an off-list or non-string value, with a
+      human-readable reason naming the accepted set.
+
+    THIS FUNCTION MUST NEVER RAISE, and callers on the retain path must never
+    turn its ``error`` into one. A bad scope is a misconfiguration; losing the
+    turn is data loss. Those are not the same severity and must not share a
+    failure mode — see ``retain.build_retain_payload`` for the consequence
+    chain (a raise there propagated out of ``run_retain`` and past
+    ``retain.main``'s ``pending_enqueue``, so the turn was never queued,
+    the watermark never advanced, and the boot reconciler swallowed the same
+    raise into ``debug_log`` — the memory was gone, permanently and silently).
+    That is switchroom #3244's shape, which this very feature cites.
+
+    An empty/whitespace-only value is treated as UNSET, matching the plugin's
+    existing "an empty export hands authority back to the config file" idiom
+    (see ``_cast_env``): an absent knob, not a typo'd one.
+    """
+    raw = config.get("observationScopes")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str):
+        return None, (
+            "observationScopes must be a string, one of "
+            f"{', '.join(OBSERVATION_SCOPES_VALUES)}; got {type(raw).__name__} ({raw!r}). "
+            "Set it via `memory.observation_scopes` in switchroom.yaml."
+        )
+    value = raw.strip()
+    if not value:
+        return None, None
+    if value not in OBSERVATION_SCOPES_VALUES:
+        return None, (
+            f"observationScopes={raw!r} is not a valid Hindsight observation scope. "
+            f"Accepted values: {', '.join(OBSERVATION_SCOPES_VALUES)}. "
+            "Set it via `memory.observation_scopes` in switchroom.yaml "
+            "(a typo there is rejected at `switchroom apply`)."
+        )
+    return value, None
+
+
+def resolve_observation_scopes(config: dict):
+    """Strict form of :func:`classify_observation_scopes` — raises on a bad value.
+
+    ``None`` means "do not put the field on the wire at all".
+
+    Raises ``ValueError`` on any value outside
+    :data:`OBSERVATION_SCOPES_VALUES`. This is the VALIDATOR, for callers that
+    genuinely want to fail — a config check, a test, a hand-run script that
+    should stop before it writes anything. **It is deliberately NOT what the
+    retain path calls**: a retain must never be destroyed by a config typo, so
+    ``retain.build_retain_payload`` uses the non-raising classifier and shouts
+    instead. See ``classify_observation_scopes``.
+    """
+    value, error = classify_observation_scopes(config)
+    if error:
+        raise ValueError(error)
+    return value
 
 
 def _cast_env(value: str, typ):
