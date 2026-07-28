@@ -129,6 +129,30 @@ describe("start.sh: LiteLLM ANTHROPIC_CUSTOM_HEADERS hoisted before gateway fork
     expect(outerSlice).toContain("no virtual key for agent");
   });
 
+  it("outer missing-key warning is ACTIONABLE: names the fix and the restart requirement", () => {
+    const startSh = renderStartSh();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    const outerSlice = startSh.slice(startSh.indexOf(LITELLM_GATE), forkIdx);
+
+    // "untracked" alone is a diagnosis, not an instruction. The trap this
+    // closes: the strip is decided ONCE at boot, so an operator who
+    // provisions the key without restarting sees no change and reasonably
+    // concludes the key was not the problem.
+    expect(outerSlice).toContain("FIX: re-run 'switchroom apply'");
+    expect(outerSlice).toContain("RESTART this agent");
+    expect(outerSlice).toContain("never re-evaluated for the life of the session");
+
+    // The message is a DOUBLE-quoted shell string, so a backtick in it is
+    // command substitution executed at boot, not markup. Assert on the echo
+    // line itself (the surrounding block has backticks in comments, which are
+    // harmless).
+    const warnLine = outerSlice
+      .split("\n")
+      .find((l) => l.includes("no virtual key for agent"));
+    expect(warnLine, "outer missing-key warning line not found").toBeTruthy();
+    expect(warnLine).not.toContain("`");
+  });
+
   it("outer dispatch (executed): UNREACHABLE keeps routing env + HEADERS, MISSING KEY strips it", () => {
     const startSh = renderStartSh();
     // Extract JUST the outer dispatch (decision + scratch cleanup): from the

@@ -57,6 +57,7 @@ import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js"
 import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
+import { runRoutingModeChecks } from "./doctor-routing-mode.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
@@ -3868,6 +3869,18 @@ export function registerDoctorCommand(program: Command): void {
                 }
               },
             }),
+          },
+          {
+            // The half both LiteLLM sections above are blind to: they prove
+            // the PROXY is configured correctly, not that each agent's session
+            // actually rode it. start.sh's missing-key fail-open strips the
+            // routing env and boots UNTRACKED on direct Anthropic OAuth — loud
+            // in a rotating container log, and relayed to the operator only
+            // ONCE per (landed, declared) pair, so a persistently degraded
+            // agent goes quiet. This reads the per-boot `.routing-mode` record
+            // and gives that state a standing signal.
+            title: "LiteLLM boot routing",
+            results: runRoutingModeChecks(config),
           },
           { title: "Telegram", results: await checkTelegram(config) },
           {

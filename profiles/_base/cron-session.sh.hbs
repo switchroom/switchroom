@@ -127,7 +127,11 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
   sr_ll_ok=""
   sr_ll_unreachable=""
   if [ -z "$sr_ll_key" ]; then
-    echo "litellm(cron): no virtual key for '{{name}}' — falling back to direct OAuth (untracked, unguarded)" >&2
+    # Remediation, not just diagnosis. Unlike start.sh this block re-runs on
+    # EVERY fire, so no restart is needed — a provisioned key is picked up by
+    # the next fire on its own. Say that, so the operator does not bounce the
+    # agent chasing a cron-only problem.
+    echo "litellm(cron): no virtual key for '{{name}}' — falling back to direct OAuth (untracked, unguarded). FIX: re-run 'switchroom apply' to provision the key; the next fire picks it up (no restart needed)." >&2
   elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
     # Bounded retry probe — short budget for cron latency (3 attempts,
     # worst-case ~25s: 3×5s curl timeouts + 2×5s sleeps).

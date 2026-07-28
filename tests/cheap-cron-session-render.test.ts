@@ -177,6 +177,14 @@ describe("cron-session.sh LiteLLM routing — mirrors start.sh boot block", () =
     expect(out).toContain("falling back to direct OAuth");
   });
 
+  it("MISSING KEY log tells the operator what to DO, and that cron needs no restart", () => {
+    // Diagnosis without remediation leaves the operator guessing. Cron re-runs
+    // this block on every fire, so — unlike start.sh — the fix lands without a
+    // restart; saying so stops an operator bouncing the agent for nothing.
+    expect(out).toContain("FIX: re-run 'switchroom apply'");
+    expect(out).toContain("no restart needed");
+  });
+
   it("PROXY UNREACHABLE with key does NOT fail open — keeps routing + self-heals (ported from start.sh)", () => {
     // The pre-#2940 cron logic unset routing on unreachable → untracked direct
     // OAuth for the fire. The new contract keeps routing in place, loud-warns,
