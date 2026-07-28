@@ -28,10 +28,10 @@ import { execFileSync, spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
-import { createRetryApiCall } from '../retry-api-call.js'
+import { createRetryApiCall, classifyBenignTelegram400 } from '../retry-api-call.js'
 import { makeFloodWaitRecorder, makeFloodWaitProbe } from '../flood-circuit-breaker.js'
 import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
-import { shouldEmitTgPost } from './gw-trace-gate.js'
+import { shouldEmitTgPost, type TgPostStatus } from './gw-trace-gate.js'
 import { guardAccidentalFormatting } from '../rich-send.js'
 
 // ─── tg-post tag plumbing ─────────────────────────────────────────────────
@@ -81,6 +81,17 @@ function formatTgPostTags(tags: TgPostTags | undefined): string {
 // ─── tg-post observability transformer ────────────────────────────────────
 
 /**
+ * Sanitise a Telegram error description for single-line log output —
+ * collapse whitespace, strip newlines, cap at 80 chars, `-` when absent.
+ * PII-safe: Telegram error descriptions are server-generated and don't
+ * echo the request body.
+ */
+function shortDesc(raw: string | undefined): string {
+  if (!raw) return '-'
+  return raw.replace(/\s+/g, ' ').slice(0, 80).replace(/[\r\n]/g, ' ') || '-'
+}
+
+/**
  * Installs an API transformer on the bot that emits one stderr line per
  * outbound Telegram Bot API POST. This is the single catchment point for
  * correlating user-visible duplicate-message reports (switchroom #656,
@@ -91,7 +102,30 @@ function formatTgPostTags(tags: TgPostTags | undefined): string {
  *
  * Log shape (one line per POST, on both success and failure):
  *
- *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|err> err=<class-or--> code=<http-or--> desc=<short|-->
+ *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|benign|err> err=<class-or--> code=<http-or--> desc=<short|-->
+ *
+ * TRUTHFULNESS (#3927): grammY resolves the transformer chain with the raw
+ * `ApiResponse`, and only converts `{ok:false}` into a thrown `GrammyError`
+ * AFTER the chain returns — verified in the pinned grammy 1.44.0,
+ * `out/core/client.js:95-100`:
+ *
+ *     const data = await this.call(method, payload, signal)   // chain
+ *     if (data.ok) return data.result
+ *     else throw toGrammyError(data, method, payload)          // OUTSIDE
+ *
+ * So EVERY Telegram-level rejection (429 flood-wait, 400, 403) arrives here
+ * as a RESOLVED response, and the `catch` below only ever sees transport
+ * (`HttpError`) failures. Before this was fixed the logger reported every
+ * one of them as `status=ok err=- code=- desc=-` — a rate-limited
+ * `unpinAllChatMessages` logged as SUCCESS 3ms before the retry policy
+ * logged `429 rate limited, waiting 3s`. We therefore inspect the resolved
+ * body and report `status=err err=telegram_<code>` from it.
+ *
+ * The narrow set of benign 400s the retry policy already swallows
+ * ("message is not modified", "message to edit/delete not found" —
+ * classified by the shared `classifyBenignTelegram400`) gets `status=benign`
+ * instead, so promoting real rejections out of `status=ok` doesn't bury
+ * `grep status=err` under high-volume card-repaint no-ops.
  *
  * Body content is never logged — only its length and a 12-char sha1 prefix
  * so we can recognise repeated identical sends without leaking PII. The
@@ -115,16 +149,34 @@ export function installTgPostLogger(bot: Bot): void {
       ? createHash('sha1').update(text).digest('hex').slice(0, 12)
       : '-'
     const tagSuffix = formatTgPostTags(_getTgPostTags())
-    try {
-      const res = await prev(method, payload, signal)
+    const emit = (status: TgPostStatus, errClass: string, code: string, desc: string) => {
       // #3025: suppress zero-signal per-poll heartbeats (getUpdates/getMe
       // status=ok, one line per ~30s long-poll tick) unless the operator
       // set SWITCHROOM_GW_TRACE. Errors and all other methods still log.
-      if (shouldEmitTgPost(method, 'ok')) {
-        process.stderr.write(
-          `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=ok err=- code=- desc=-${tagSuffix}\n`,
+      if (!shouldEmitTgPost(method, status)) return
+      process.stderr.write(
+        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=${status} err=${errClass} code=${code} desc=${desc}${tagSuffix}\n`,
+      )
+    }
+    try {
+      const res = await prev(method, payload, signal)
+      // A RESOLVED response can still be a Telegram-level rejection — grammy
+      // converts `{ok:false}` to a thrown GrammyError only after this chain
+      // returns (see the docblock). Same defensive shape as the edit fuse's
+      // `runObserved` (edit-flood-fuse.ts).
+      const r = res as unknown as { ok?: boolean; error_code?: number; description?: string }
+      if (r != null && typeof r === 'object' && r.ok === false) {
+        const code = r.error_code
+        const benign = classifyBenignTelegram400(code, r.description)
+        emit(
+          benign !== null ? 'benign' : 'err',
+          `telegram_${code ?? 'unknown'}`,
+          code != null ? String(code) : '-',
+          shortDesc(r.description),
         )
+        return res
       }
+      emit('ok', '-', '-', '-')
       return res
     } catch (err) {
       const errClass = err instanceof GrammyError
@@ -134,15 +186,7 @@ export function installTgPostLogger(bot: Bot): void {
       const rawDesc = err instanceof GrammyError
         ? (err as GrammyError).description
         : (err instanceof Error ? err.message : '')
-      // Sanitise the description for single-line log output — collapse
-      // whitespace, strip newlines, cap at 80 chars. PII-safe: Telegram
-      // error descriptions are server-generated and don't echo body.
-      const desc = rawDesc
-        ? rawDesc.replace(/\s+/g, ' ').slice(0, 80).replace(/[\r\n]/g, ' ') || '-'
-        : '-'
-      process.stderr.write(
-        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=err err=${errClass} code=${code} desc=${desc}${tagSuffix}\n`,
-      )
+      emit('err', errClass, code, shortDesc(rawDesc))
       throw err
     }
   })

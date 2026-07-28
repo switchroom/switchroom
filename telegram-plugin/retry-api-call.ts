@@ -92,13 +92,49 @@ export interface RetryCallOpts {
   priorityClass?: 'critical' | 'useful' | 'cosmetic'
 }
 
+/**
+ * The three benign Telegram 400s this policy swallows (contract table above).
+ */
+export type BenignTelegram400Kind = 'not_modified' | 'message_not_found' | 'delete_not_found'
+
+/**
+ * Single source of truth for "is this Telegram 400 a benign no-op?".
+ *
+ * Benign here means exactly what the retry policy already treats as a
+ * non-event: the edit was a no-op because the content is identical, or the
+ * target message vanished before the edit/delete landed. Both are
+ * high-volume on a healthy agent (every coalesced card repaint can produce
+ * one) and neither means anything is wrong — so any surface that reports
+ * Telegram failures needs to tell them apart from a real rejection WITHOUT
+ * maintaining a second copy of the description list (#3927). The retry
+ * policy's own swallow branches call this, so there is one list.
+ *
+ * Returns the benign kind, or `null` for everything else — including 429,
+ * 403, and any 400 not on this deliberately narrow list. A new benign
+ * description belongs here, not in a caller.
+ */
+export function classifyBenignTelegram400(
+  errorCode: number | undefined,
+  description: string | undefined,
+): BenignTelegram400Kind | null {
+  if (errorCode !== 400) return null
+  const desc = (description ?? '').toLowerCase()
+  // "message is not modified" / "message was not modified" — Telegram's
+  // no-op-on-equal-text.
+  if (desc.includes('not modified')) return 'not_modified'
+  // "message to edit/delete not found" — the target vanished.
+  if (desc.includes('message to edit not found')) return 'message_not_found'
+  if (desc.includes('message to delete not found')) return 'delete_not_found'
+  return null
+}
+
 export interface RetryObserver {
   /** Fires just before sleeping for a retry. */
   onRetry?(info: { attempt: number; reason: 'flood_wait' | 'network'; delayMs: number }): void
   /** Fires when max retries is reached and the wrapper gives up. */
   onGiveUp?(info: { attempts: number; error: unknown }): void
   /** Fires for each benign error we swallowed (not-modified, not-found). */
-  onBenign?(info: { kind: 'not_modified' | 'message_not_found' | 'delete_not_found' }): void
+  onBenign?(info: { kind: BenignTelegram400Kind }): void
 }
 
 export interface RetryApiCallConfig {
@@ -399,26 +435,15 @@ export function createRetryApiCall(
           continue
         }
 
-        // Swallow "message is not modified" — Telegram's no-op-on-equal-text.
-        if (
-          isGrammyErr &&
-          (err as GrammyError).error_code === 400 &&
-          desc.includes('not modified')
-        ) {
-          observer?.onBenign?.({ kind: 'not_modified' })
-          return undefined as unknown as T
-        }
-
-        // Swallow "message to edit/delete not found" — target vanished.
-        if (
-          isGrammyErr &&
-          (err as GrammyError).error_code === 400 &&
-          (desc.includes('message to edit not found') ||
-            desc.includes('message to delete not found'))
-        ) {
-          observer?.onBenign?.({
-            kind: desc.includes('edit') ? 'message_not_found' : 'delete_not_found',
-          })
+        // Swallow the benign 400s — "message is not modified" (Telegram's
+        // no-op-on-equal-text) and "message to edit/delete not found" (the
+        // target vanished). Classification lives in `classifyBenignTelegram400`
+        // so the tg-post logger reports the same family identically (#3927).
+        const benignKind = isGrammyErr
+          ? classifyBenignTelegram400((err as GrammyError).error_code, desc)
+          : null
+        if (benignKind !== null) {
+          observer?.onBenign?.({ kind: benignKind })
           return undefined as unknown as T
         }
 

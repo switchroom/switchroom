@@ -58,6 +58,20 @@ export const gwTraceVerbose: boolean = computeGwTraceVerbose(
 const ZERO_SIGNAL_POLL_METHODS = new Set(['getUpdates', 'getMe'])
 
 /**
+ * The status tiers a `tg-post` line can carry.
+ *
+ * `benign` (#3927) is a REJECTED call that is nonetheless a non-event —
+ * the narrow set of 400s the retry policy already swallows ("message is
+ * not modified", "message to edit/delete not found"), classified by
+ * `classifyBenignTelegram400`. It exists so that promoting resolved
+ * `ok:false` responses out of `status=ok` doesn't drown the newly-truthful
+ * `status=err` signal in high-volume card-repaint no-ops: `grep status=err`
+ * stays a list of real failures, and the benign lines are still there,
+ * honestly labelled, for anyone who wants them.
+ */
+export type TgPostStatus = 'ok' | 'benign' | 'err'
+
+/**
  * Decide whether a `tg-post` line should be written.
  *
  * Suppressed (unless `SWITCHROOM_GW_TRACE` is set):
@@ -66,11 +80,13 @@ const ZERO_SIGNAL_POLL_METHODS = new Set(['getUpdates', 'getMe'])
  * Always emitted:
  *   - any `status=err` (real failures — the whole point of the log),
  *   - every other method's `ok` line (sendMessage/editMessageText/... are
- *     genuine outbound observability, #656/#657).
+ *     genuine outbound observability, #656/#657),
+ *   - `status=benign` on any non-poll method — same volume as the
+ *     `status=ok` line it replaces, just no longer mislabelled as success.
  */
 export function shouldEmitTgPost(
   method: string,
-  status: 'ok' | 'err',
+  status: TgPostStatus,
   verbose: boolean = gwTraceVerbose,
 ): boolean {
   if (verbose) return true
