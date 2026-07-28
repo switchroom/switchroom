@@ -1,5 +1,147 @@
 # Changelog
 
+## v0.19.28 — private memories can no longer be shipped to a paid outside provider by accident
+
+**The headline, in plain language.** Every agent's memories are meant to be
+processed on this machine, by the local GPU, and to never leave it. A bug in the
+memory service broke that guarantee. When the memory service asked the local
+model to tidy up a batch of memories, it attached a size limit to the request —
+and it filled that limit in with a number that could run into the thousands
+(how many free memory slots the agent's bank had left, which is not a limit the
+model needs to know at all). The local model turns that request into a grammar
+it has to compile before it can answer, and a repetition count in the thousands
+will not compile. The local model therefore rejected the whole request:
+
+```
+HTTP 400  Failed to initialize samplers: failed to parse grammar
+```
+
+The proxy in front of the models is configured to retry a failed request on a
+paid outside provider, which is exactly what you want when the local GPU is
+merely busy — and exactly what you do not want here. So the request was re-sent
+in full, **including the verbatim private memory text it carried**, to a metered
+third party. Up to `CONSOLIDATION_LLM_BATCH_SIZE` memories per request. It was
+deterministic rather than random: a bank with ~4,230 free slots failed every
+single time, a bank with ~670 compiled fine (the threshold was measured between
+672 and 4,223), so an affected bank leaked continuously and an unaffected one
+never did. 56 such hand-offs are visible in the proxy's own log.
+
+**The fix (#3905)** drops the size limit whenever it is too large to be a real
+constraint (above 64) instead of shrinking it, because shrinking it would only
+move the threshold and would still assert a bound that is not true. Nothing is
+lost: the memory service already trims the result to the real slot count *after*
+the model answers, regardless of what the schema said, and when the cap is
+genuinely tight the model is told so in prose as well. So the limit is now
+either a binding truth or absent.
+
+The fix lands in the `switchroom-hindsight` **image build**
+(`docker/Dockerfile.hindsight`), which is why it needs a released image rather
+than a config change — **the leak stays open on any deployment still running an
+older hindsight image.** The proxy's fallback rule is deliberately left alone:
+removing it before this fix landed would have turned a leak into hard
+consolidation failures. Guarded structurally by
+`tests/docker/dockerfile-hindsight-bakes.test.ts` and behaviourally — RED
+against unpatched upstream, GREEN patched — by
+`tests/docker/hindsight-maxitems-grammar-patch.test.ts`, which builds the schema
+at the production-like 4,230 and asserts what `maxItems` comes out.
+
+### Memory keeps up, and stops being taken down by one bad entry
+
+Five fixes to the consolidation and retain pipeline, all from live measurement
+on this fleet rather than from theory.
+
+- **The consolidation concurrency cap is now derived, not a literal (#3889).**
+  `HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT` shipped as a hard `1`. It is
+  a process-wide semaphore every consolidation LLM call must acquire, and the
+  engine composes it with the global cap rather than replacing it — so at 1 the
+  process made at most one consolidation call at a time no matter how many
+  worker slots were free. Measured over one hour on the live fleet: 168 calls
+  averaging 29.4s consumed 4,936s of LLM wall time, i.e. **1.37 effective
+  concurrency against 6 worker slots**, with 43,155 memories pending on the
+  busiest bank and rising ~719 every 3 hours while `failed_consolidation` was 0
+  everywhere. Nothing was erroring; it was purely throughput. The default is now
+  `clamp(global − retain − 1, 1, global − 1)`, which scales with the operator's
+  own endpoint instead of ignoring it, and cannot advertise a ceiling the engine
+  is unable to honour.
+- **`HINDSIGHT_API_WORKER_MAX_SLOTS` is actually settable (#3901).** A key
+  outside `HINDSIGHT_PERF_ENV_KEYS` was silently discarded from `hindsight.env`
+  — no error, no warning. This one was outside it, so an operator's measured
+  `16` sat in `switchroom.yaml` for a full day while the container booted
+  upstream's default `10`.
+- **One malformed queue entry no longer kills the whole drain (#3894).** Phase 0
+  of the pending-retain drain raised on a non-numeric `attempt_count` and took
+  phases 1 and 2 down with it, making the *entire* backlog immortal — fleet-wide
+  — because of one bad file. Fixed at source and at the guard.
+- **The same guard now covers phases 0b and 0c, and a failed phase is reported
+  (#3898).** Both sat in front of the phases that actually drain, with the same
+  fatal shape. One mechanism (`_phase_failed`) now covers all three, and a
+  failure names its phase instead of vanishing.
+- **Every drain path is serialised, and wedged entries get parked (#3893).**
+  `pending-retains` has three independent drain callers and only one of them
+  held the lock. The lock now lives inside `drain()` where every caller reaches
+  it, and a circuit breaker stops a permanently-wedged entry from being retried
+  forever.
+
+### Recall answers with what is true now
+
+- **Recall's recency curve defaults to exponential/30d, and retain dates
+  volatile state (#3887).** Asked "what version is the fleet running right now",
+  a bank returned a nine-month spread of contradictory answers — v0.18.19,
+  v0.19.6, v0.19.8, v0.16.49 — with the correct value absent entirely, because
+  every one of them had been written as a timeless fact. Volatile state is now
+  dated on the way in and decays on the way out.
+- **Every bank gets a default `observations_mission` (#3881).** A documented
+  Hindsight bank field with all the switchroom plumbing already in place, but the
+  only value that could ever reach a bank came from one non-default profile. All
+  27 live banks were verified carrying `observations_mission: null` — the knob
+  was effectively dead code and the whole fleet consolidated under the engine's
+  stock mission.
+- **Per-profile observations missions, and a doctor row that can see them
+  (#3897).** The gap above was invisible: the existing missions row reads yaml,
+  and this value is never in yaml on a default setup, so it was structurally
+  incapable of catching it. The new `checkBankObservationsMissions` reads the
+  bank itself, one row per bank.
+
+### Telegram: replies survive rate-limit pressure, and a late card is not a denial
+
+- **Replies and reactions no longer vanish under 429 pressure (#3886, fixes
+  #3885 — a v0.19.27 regression).** A 12-agent staggered restart that drew three
+  genuine 429s produced 792 fuse events in one hour against a 35–50 baseline: 221
+  dropped typing indicators (correct), 18 deferred reactions (the operator
+  noticed his reactions had stopped working), replies deferred past the reply
+  tool's 60s timeout so the agent retried and sent duplicates, and one ~1,900
+  character reply lost outright. The reply reserve now fires under tightening.
+- **Every `finalizeCallback` leg goes through the retry/flood policy (#3900,
+  closes #3891).** The helper behind *every* terminal approval / permission
+  button tap called grammy's context methods raw, bypassing the retry and flood
+  machinery — so 429s on the tap path were invisible to the circuit breaker and
+  to every consumer of that state.
+- **A merely-late permission card is no longer Esc-denied (#3892).** The operator
+  taps Approve and gets "the user doesn't want to proceed" — because the
+  wedge-watchdog had already sent Escape, a permanent deny, before the card ever
+  reached Telegram. The race is closed with the evidence trail from a live
+  incident on `clerk`.
+
+### Cost and credit: bounded blast radius, honest warnings
+
+- **A conservative spend cap on every per-agent LiteLLM virtual key (#3879).** An
+  uncapped per-agent key is a bearer token for the entire upstream account
+  balance, so one runaway loop takes down *every other agent*. Configurable in
+  `switchroom.yaml`, and healed onto keys that already exist.
+- **The OpenRouter credit shortfall is seen coming (#3880).** The reactive half
+  (not leaking a raw 402 to an end user) shipped in #3868; this is the proactive
+  half — and it is honest about the case that actually bites this fleet, where
+  the endpoint returns `null` limits and carries no account-balance field at all.
+- **A hard operator warning when a paid MCP dependency's key is blocked (#3875).**
+  Perplexity, Eraser, Brevo, Postiz, Meta/Google Ads and Cloudflare reach
+  switchroom over the MCP tool surface, never through LiteLLM, so the operator-
+  event path never saw them. An expired key died as a transient red step in the
+  feed and the one person who could fix it was the one person not told.
+- **The no-op `gpt-oss-20b` fallback edge is deleted, with a guard against
+  re-adding one (#3876).** Both sides of the edge pointed at the same provider
+  with the same key and the same routing; only the timeout differed. A test now
+  fails if an equivalent no-op edge reappears.
+
 ## v0.19.27 — the Telegram flood-ban chain is closed end to end, one card layout core, and one status-pin path
 
 On 2026-07-27 an agent's bot token took a 15908-second (4.4 hour) Telegram flood
