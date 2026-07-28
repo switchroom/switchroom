@@ -915,6 +915,7 @@ import {
   TURN_ACTIVE_IDLE_SWEEP_MS,
 } from './turn-active-marker.js'
 import { startGatewayHeartbeat } from './gateway-heartbeat.js'
+import { attachBootBeacon } from './boot-beacon.js'
 import { startOutboxSweep } from './outbox-sweep.js'
 import {
   VERSION,
@@ -2346,7 +2347,8 @@ function checkApprovals(): void {
     )
   }
 }
-if (isGatewayMain && !STATIC) setInterval(checkApprovals, 5000).unref()
+// attachBootBeacon rides this EXISTING 5s tick (no second timer) — see boot-beacon.ts.
+if (isGatewayMain && !STATIC) setInterval(attachBootBeacon(STATE_DIR, checkApprovals), 5000).unref()
 // Gateway liveness heartbeat — touches `<STATE_DIR>/gateway-heartbeat` while
 // the gateway lives so the silent-end Stop hook's single-writer election can
 // confirm the gateway is alive (and WILL run its turn_end delivery) before
