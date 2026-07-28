@@ -3,11 +3,16 @@
  *
  * The behaviour under test is the one that matters to the operator: an agent
  * whose boot landed on untracked direct-OAuth while its declared routing says
- * it must ride the proxy produces a FAIL row that names the agent and the
+ * it must ride the proxy produces a WARN row that names the agent and the
  * remediation. The record shape asserted here is the one start.sh actually
  * writes — `tests/scaffold.routing-mode.test.ts` pins the writer.
+ *
+ * The severity is load-bearing, not cosmetic: `warn` is the operator's ruling
+ * (2026-07-29) and it is what keeps `switchroom doctor` from exiting non-zero
+ * over a deliberate fail-open. The "exit status" block at the bottom pins that
+ * against doctor's REAL counter, so a silent flip back to `fail` cannot pass.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import {
   classifyRoutingMode,
@@ -15,6 +20,7 @@ import {
   routingModePath,
   runRoutingModeChecks,
 } from "./doctor-routing-mode.js";
+import { printSection } from "./doctor.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 const AGENTS_DIR = "/nonexistent-test-agents";
@@ -95,7 +101,7 @@ describe("parseRoutingModeRecord", () => {
 });
 
 describe("classifyRoutingMode", () => {
-  it("FAILs when a passthrough-declared agent landed on direct-oauth", () => {
+  it("WARNs when a passthrough-declared agent landed on direct-oauth", () => {
     const v = classifyRoutingMode({
       mode: "direct-oauth",
       base: "direct",
@@ -104,11 +110,23 @@ describe("classifyRoutingMode", () => {
       declared: "passthrough",
       ts: "2026-07-28T18:59:32Z",
     });
-    expect(v?.status).toBe("fail");
+    expect(v?.status).toBe("warn");
     expect(v?.detail).toContain("UNTRACKED");
   });
 
-  it("FAILs for a router-root-declared agent too (fable / sr-* models)", () => {
+  it("never returns `fail` — the untracked landing is a warn, by ruling", () => {
+    const v = classifyRoutingMode({
+      mode: "direct-oauth",
+      base: "direct",
+      model: "opus",
+      litellmOk: "0",
+      declared: "passthrough",
+      ts: "2026-07-28T18:59:32Z",
+    });
+    expect(v?.status).not.toBe("fail");
+  });
+
+  it("WARNs for a router-root-declared agent too (fable / sr-* models)", () => {
     const v = classifyRoutingMode({
       mode: "direct-oauth",
       base: "direct",
@@ -117,7 +135,7 @@ describe("classifyRoutingMode", () => {
       declared: "router-root",
       ts: "",
     });
-    expect(v?.status).toBe("fail");
+    expect(v?.status).toBe("warn");
   });
 
   it("is silent when LiteLLM was never configured (declared=direct-oauth)", () => {
@@ -135,7 +153,7 @@ describe("classifyRoutingMode", () => {
 
   it("is silent for a non-untracked divergence — router-root declared, landed passthrough", () => {
     // Still on the proxy, still metered. That divergence is the
-    // .session-model-alert relay's business, not a standing doctor FAIL.
+    // .session-model-alert relay's business, not a standing doctor row.
     expect(
       classifyRoutingMode({
         mode: "passthrough",
@@ -187,7 +205,7 @@ describe("runRoutingModeChecks", () => {
     expect(results).toEqual([]);
   });
 
-  it("FAILs the stripped agent, names it, and leaves its healthy peers silent", () => {
+  it("WARNs the stripped agent, names it, and leaves its healthy peers silent", () => {
     const results = runRoutingModeChecks(config("alpha", "beta", "gamma"), {
       agentsDir: AGENTS_DIR,
       readFile: reader({
@@ -205,7 +223,7 @@ describe("runRoutingModeChecks", () => {
 
     expect(results).toHaveLength(1);
     const [row] = results;
-    expect(row.status).toBe("fail");
+    expect(row.status).toBe("warn");
     expect(row.name).toBe("litellm routing: beta");
     expect(row.detail).toContain("direct-oauth");
     expect(row.detail).toContain("UNTRACKED");
@@ -268,5 +286,58 @@ describe("runRoutingModeChecks", () => {
     } finally {
       if (saved !== undefined) process.env.SWITCHROOM_AGENTS_DIR = saved;
     }
+  });
+});
+
+describe("exit status — an untracked boot must NOT make doctor exit non-zero", () => {
+  /**
+   * `switchroom doctor` exits 1 iff the `fails` counted by `printSection`
+   * across every section sum to > 0 (src/cli/doctor.ts — `totalFail > 0` →
+   * `process.exit(1)`). So the only honest way to pin "this row does not turn
+   * the build red" is to push the real rows through doctor's real counter and
+   * assert the fail tally is zero. Asserting `status === "warn"` alone would
+   * be re-stating the implementation; this asserts the CONSEQUENCE the
+   * operator ruled on.
+   */
+  function count(results: Parameters<typeof printSection>[1]) {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      return printSection("LiteLLM boot routing", results);
+    } finally {
+      logSpy.mockRestore();
+    }
+  }
+
+  it("counts the stripped agent as a warn and contributes zero fails", () => {
+    const results = runRoutingModeChecks(config("beta"), {
+      agentsDir: AGENTS_DIR,
+      readFile: reader({
+        [path("beta")]: record({
+          mode: "direct-oauth",
+          base: "direct",
+          litellmOk: "0",
+          declared: "passthrough",
+        }),
+      }),
+    });
+
+    // Guard: if the row ever stops being emitted the tally below goes to zero
+    // for the wrong reason, and this test would pass while the check is dead.
+    expect(results).toHaveLength(1);
+    expect(count(results)).toEqual({ oks: 0, warns: 1, fails: 0, skips: 0 });
+  });
+
+  it("contributes zero fails even with a whole fleet stripped at once", () => {
+    const results = runRoutingModeChecks(config("beta", "delta", "epsilon"), {
+      agentsDir: AGENTS_DIR,
+      readFile: reader({
+        [path("beta")]: record({ mode: "direct-oauth", declared: "passthrough" }),
+        [path("delta")]: record({ mode: "direct-oauth", declared: "router-root" }),
+        [path("epsilon")]: record({ mode: "direct-oauth", declared: "passthrough" }),
+      }),
+    });
+
+    expect(results).toHaveLength(3);
+    expect(count(results)).toEqual({ oks: 0, warns: 3, fails: 0, skips: 0 });
   });
 });

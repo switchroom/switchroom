@@ -14,7 +14,7 @@
  * fixture strings.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename, dirname, join } from "node:path";
@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 
 import { scaffoldAgent } from "../src/agents/scaffold.js";
 import { runRoutingModeChecks } from "../src/cli/doctor-routing-mode.js";
+import { printSection } from "../src/cli/doctor.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 
 const telegramConfig: TelegramConfig = {
@@ -121,6 +122,20 @@ describe("untracked-boot signal: rendered start.sh → switchroom doctor", () =>
     );
   }
 
+  /**
+   * Push rows through doctor's REAL section counter. `switchroom doctor` exits
+   * 1 iff the summed `fails` is > 0 (src/cli/doctor.ts), so a zero `fails`
+   * tally here is the actual "does not turn the build red" assertion.
+   */
+  function counts(results: ReturnType<typeof doctor>) {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      return printSection("LiteLLM boot routing", results);
+    } finally {
+      logSpy.mockRestore();
+    }
+  }
+
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "switchroom-doctor-routing-"));
   });
@@ -129,7 +144,7 @@ describe("untracked-boot signal: rendered start.sh → switchroom doctor", () =>
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("FAILs doctor after a real missing-key boot lands on untracked direct OAuth", () => {
+  it("WARNs doctor after a real missing-key boot lands on untracked direct OAuth", () => {
     scaffold("claude-sonnet-5"); // declares passthrough
     bootStripped();
 
@@ -141,20 +156,34 @@ describe("untracked-boot signal: rendered start.sh → switchroom doctor", () =>
 
     const results = doctor();
     expect(results).toHaveLength(1);
-    expect(results[0].status).toBe("fail");
+    expect(results[0].status).toBe("warn");
     expect(results[0].name).toContain(AGENT);
     expect(results[0].detail).toContain("UNTRACKED");
     expect(results[0].fix).toContain("switchroom apply");
   });
 
-  it("FAILs doctor for a stripped router-root agent (fable) too", () => {
+  it("does NOT make doctor exit non-zero — real shell boot → real fail tally", () => {
+    // The end-to-end version of the operator's 2026-07-29 ruling: a REAL
+    // rendered start.sh really stripping the routing env must leave a standing
+    // row, and that row must contribute ZERO to the counter doctor exits on.
+    scaffold("claude-sonnet-5");
+    bootStripped();
+    expect(readFileSync(join(agentDir, ".routing-mode"), "utf-8")).toContain("mode=direct-oauth");
+
+    const results = doctor();
+    expect(results).toHaveLength(1); // the row is really there…
+    expect(counts(results)).toEqual({ oks: 0, warns: 1, fails: 0, skips: 0 }); // …and costs 0 fails
+  });
+
+  it("WARNs doctor for a stripped router-root agent (fable) too", () => {
     scaffold("fable"); // declares router-root
     bootStripped();
     expect(readFileSync(join(agentDir, ".routing-mode"), "utf-8")).toContain("declared=router-root");
 
     const results = doctor();
     expect(results).toHaveLength(1);
-    expect(results[0].status).toBe("fail");
+    expect(results[0].status).toBe("warn");
+    expect(counts(results).fails).toBe(0);
   });
 
   it("stays silent after a real healthy boot on the passthrough", () => {

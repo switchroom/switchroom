@@ -50,7 +50,7 @@
  * `direct-oauth` — i.e. routing was stripped. Other divergences (declared
  * `router-root`, landed `passthrough`) still ride the proxy and are still
  * metered, so they are the `.session-model-alert` relay's business, not a
- * standing doctor FAIL. `declared=direct-oauth` means LiteLLM was never
+ * standing doctor row. `declared=direct-oauth` means LiteLLM was never
  * configured for that agent and there is no invariant to breach.
  */
 
@@ -129,9 +129,15 @@ export function parseRoutingModeRecord(text: string): RoutingModeRecord | null {
 /**
  * Verdict for one boot record, or null when there is nothing to report.
  *
- * FAILs (non-zero exit) rather than warns: an agent metering nothing while the
- * operator believes the fleet is fully metered is a breached invariant with a
- * concrete remediation, not a thing to glance at.
+ * WARNs rather than FAILs (operator ruling, 2026-07-29). The condition is a
+ * real breached invariant and earns a permanent, named row with a concrete
+ * remediation — but the thing it reports is a DELIBERATE availability trade:
+ * start.sh chose to boot rather than refuse, and the agent is degraded, not
+ * broken. `fail` sets `switchroom doctor`'s exit non-zero (doctor.ts sums
+ * `fails` across sections and exits 1 when the total is > 0), which would put
+ * a red build on a state the operator consciously accepted and teach them to
+ * ignore the exit code. `warn` keeps the row loud and standing without that.
+ * The exit-code contract is pinned by test, not by this comment.
  */
 export function classifyRoutingMode(
   rec: RoutingModeRecord,
@@ -141,7 +147,7 @@ export function classifyRoutingMode(
 
   const when = rec.ts ? ` at its last boot (${rec.ts})` : "";
   return {
-    status: "fail",
+    status: "warn",
     detail:
       `landed on direct-oauth${when} but its declared routing is ` +
       `\`${rec.declared}\` — start.sh's missing-key fail-open stripped the ` +
