@@ -523,6 +523,9 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
     const res = await runWedgeWatchdog({
       agentName: "carrie",
       permissionPromptPolls: 3,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
       // isolate the permission-prompt branch.
       rateLimitSignature: null,
       confirmModalSignature: null,
@@ -553,6 +556,9 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
     const res = await runWedgeWatchdog({
       agentName: "carrie",
       permissionPromptPolls: 3,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
@@ -574,6 +580,9 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
     const res = await runWedgeWatchdog({
       agentName: "carrie",
       permissionPromptPolls: 3,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
@@ -612,6 +621,9 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
     const res = await runWedgeWatchdog({
       agentName: "carrie",
       permissionPromptPolls: 3,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
@@ -641,6 +653,9 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
     const res = await runWedgeWatchdog({
       agentName: "carrie",
       permissionPromptPolls: 3,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
@@ -662,13 +677,17 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
     expect(res.permissionPromptDeferrals).toBe(0);
   });
 
-  it("Escs on gateway reporting no pending permission (card-less prompt)", async () => {
+  it("Escs on gateway reporting no pending permission (card-less prompt), but only after the LONGER card-less streak", async () => {
     const { send, calls } = recordSend();
     const queryPendingPermission = async () =>
       ({ ok: true, pending: false }) as const;
-    const res = await runWedgeWatchdog({
+    const base = {
       agentName: "carrie",
       permissionPromptPolls: 3,
+      permissionCardlessPolls: 6,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null as null,
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
@@ -676,18 +695,20 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
-      maxPolls: 3,
-      capture: captureFlicker([
-        PERMISSION_PROMPT_A,
-        PERMISSION_PROMPT_B,
-        PERMISSION_PROMPT_A,
-      ]),
-      send,
-    });
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+    };
+    // At the OLD threshold (3 polls) the card-less prompt is now held, not Esc'd.
+    const early = await runWedgeWatchdog({ ...base, maxPolls: 5, send });
+    expect(calls).toEqual([]);
+    expect(early.permissionPromptFires).toBe(0);
+    expect(early.permissionPromptCardlessHolds).toBe(3); // polls 3,4,5
+    // Past the card-less streak it still fires — a genuinely wedged prompt is
+    // never left to hang.
+    const late = await runWedgeWatchdog({ ...base, maxPolls: 6, send });
     expect(calls).toEqual([["Escape"]]);
-    expect(res.fires).toBe(1);
-    expect(res.permissionPromptFires).toBe(1);
-    expect(res.permissionPromptDeferrals).toBe(0);
+    expect(late.fires).toBe(1);
+    expect(late.permissionPromptFires).toBe(1);
+    expect(late.permissionPromptDeferrals).toBe(0);
   });
 
   it("Escs when queryPendingPermission THROWS (soft-fail, defence-in-depth)", async () => {
@@ -698,6 +719,9 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
     const res = await runWedgeWatchdog({
       agentName: "carrie",
       permissionPromptPolls: 3,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
@@ -728,6 +752,11 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
       await runWedgeWatchdog({
         agentName: "carrie",
         permissionPromptPolls: 3,
+        permissionCardlessPolls: 3,
+        floodPressure: null,
+      // Flood-awareness off: these cases assert the non-flood behaviour and
+      // must never read the real on-disk flood state.
+      floodPressure: null,
         rateLimitSignature: null,
         confirmModalSignature: null,
         manifestStallSignature: null,
@@ -747,6 +776,171 @@ describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () =>
         expect(keys).toEqual(["Escape"]);
       }
     }
+  });
+});
+
+// ─── Flood-aware permission gate (the Esc-before-the-card race) ───────────────
+//
+// clerk, 2026-07-28. Telegram 429'd chat 12345; the gateway's
+// edit-flood-fuse deferred the approval card
+// (`edit-flood-fuse deferred method=sendRichMessage key=t:12345
+// class=critical`); the watchdog asked the gateway, was told
+// `{ok:true, pending:false}` because the card did not exist YET, and Esc'd —
+// a permanent deny — ~15s in. The card then landed still looking tappable and
+// the operator tapped Approve into a dead prompt.
+//
+// Outcome contract asserted here: while the flood state says Telegram is
+// throttling this agent, a card-less permission prompt gets NO keystroke; with
+// no flood pressure, a genuinely wedged one is still denied.
+
+describe("runWedgeWatchdog — flood-aware permission gate", () => {
+  const cardless = async () => ({ ok: true, pending: false }) as const;
+
+  it("does NOT Esc a card-less prompt while a flood window is open", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "clerk",
+      permissionPromptPolls: 3,
+      permissionCardlessPolls: 6,
+      permissionFloodMaxPolls: 100,
+      // The flood-ban state says chat:12345 is throttled.
+      floodPressure: () => ({
+        active: true,
+        reason: "open flood window chat:12345 (3s left, src=429)",
+      }),
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission: cardless,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 40,
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+      send,
+    });
+    // The whole point: no keystroke of any kind reached the TUI.
+    expect(calls).toEqual([]);
+    expect(res.fires).toBe(0);
+    expect(res.permissionPromptFires).toBe(0);
+    expect(res.permissionPromptFloodHolds).toBe(38); // polls 3..40
+  });
+
+  it("still Escs a genuinely wedged card-less prompt when there is NO flood window", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "clerk",
+      permissionPromptPolls: 3,
+      permissionCardlessPolls: 6,
+      permissionFloodMaxPolls: 100,
+      floodPressure: () => ({ active: false, reason: "" }),
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission: cardless,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 6,
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+      send,
+    });
+    expect(calls).toEqual([["Escape"]]);
+    expect(res.permissionPromptFires).toBe(1);
+    expect(res.permissionPromptFloodHolds).toBe(0);
+  });
+
+  it("Escs once the flood ceiling is reached — patience is bounded, never infinite", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "clerk",
+      permissionPromptPolls: 3,
+      permissionCardlessPolls: 6,
+      // A 4.4h ban would otherwise hold forever; the ceiling ends it.
+      permissionFloodMaxPolls: 10,
+      floodPressure: () => ({ active: true, reason: "429 episode 3x peak=15908s" }),
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission: cardless,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 10,
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+      send,
+    });
+    expect(calls).toEqual([["Escape"]]);
+    expect(res.permissionPromptFires).toBe(1);
+    expect(res.permissionPromptFloodHolds).toBe(7); // polls 3..9, then poll 10 fires
+  });
+
+  it("withholds Esc under flood pressure even when the gateway is UNREACHABLE", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "clerk",
+      permissionPromptPolls: 3,
+      permissionFloodMaxPolls: 100,
+      floodPressure: () => ({ active: true, reason: "open flood window global" }),
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission: async () => ({ ok: false, reason: "timeout" }) as const,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 8,
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+      send,
+    });
+    expect(calls).toEqual([]);
+    expect(res.permissionPromptFires).toBe(0);
+  });
+
+  it("never sends anything but Escape under flood pressure (safety boundary)", async () => {
+    for (const active of [true, false]) {
+      const { send, calls } = recordSend();
+      await runWedgeWatchdog({
+        agentName: "clerk",
+        permissionPromptPolls: 3,
+        permissionCardlessPolls: 4,
+        permissionFloodMaxPolls: 6,
+        floodPressure: () => ({ active, reason: "r" }),
+        rateLimitSignature: null,
+        confirmModalSignature: null,
+        manifestStallSignature: null,
+        queryPendingPermission: cardless,
+        pollIntervalMs: 0,
+        now: () => 0,
+        sleep: () => {},
+        maxPolls: 8,
+        capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+        send,
+      });
+      for (const keys of calls) expect(keys).toEqual(["Escape"]);
+    }
+  });
+
+  it("clamps a mis-set card-less streak so it can never be SHORTER than the base streak", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "clerk",
+      permissionPromptPolls: 5,
+      permissionCardlessPolls: 1, // nonsense — must clamp up to 5
+      floodPressure: null,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission: cardless,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 4,
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+      send,
+    });
+    expect(calls).toEqual([]);
+    expect(res.permissionPromptFires).toBe(0);
   });
 });
 
