@@ -850,11 +850,10 @@ import { listRecords as listWorktreeRecords, touchHeartbeat as touchWorktreeHear
 import { makeWorktreeWatchProvider } from '../worktree-watch-cwds.js'
 import {
   startBootCard,
-  resolvePersonaName,
-  type BootCardHandle,
+  resolvePersonaName, shouldSkipDuplicateBootCard,
+  type BootCardHandle, type RestartReason,
 } from './boot-card.js'
 import { determineRestartReason } from './boot-reason.js'
-import { shouldSkipDuplicateBootCard, type RestartReason } from './boot-card.js'
 import { maybeRenderUpdateAnnouncement } from './update-announce.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
@@ -915,6 +914,7 @@ import {
   TURN_ACTIVE_IDLE_SWEEP_MS,
 } from './turn-active-marker.js'
 import { startGatewayHeartbeat } from './gateway-heartbeat.js'
+import { attachBootBeacon } from './boot-beacon.js'
 import { startOutboxSweep } from './outbox-sweep.js'
 import {
   VERSION,
@@ -2346,7 +2346,7 @@ function checkApprovals(): void {
     )
   }
 }
-if (isGatewayMain && !STATIC) setInterval(checkApprovals, 5000).unref()
+if (isGatewayMain && !STATIC) setInterval(attachBootBeacon(STATE_DIR, checkApprovals), 5000).unref() // beacon rides this EXISTING tick — boot-beacon.ts
 // Gateway liveness heartbeat — touches `<STATE_DIR>/gateway-heartbeat` while
 // the gateway lives so the silent-end Stop hook's single-writer election can
 // confirm the gateway is alive (and WILL run its turn_end delivery) before

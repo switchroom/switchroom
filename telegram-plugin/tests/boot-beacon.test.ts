@@ -1,0 +1,462 @@
+/**
+ * Gateway boot beacon — the write-only forensic record a later boot-cause
+ * classifier will read.
+ *
+ * Two things are pinned here, and they are the two that can silently break:
+ *
+ *  1. **Graceful degradation.** Every cgroup / `/proc` read is optional. A
+ *     cgroup v1 host, a kernel with no `random/boot_id`, a truncated or
+ *     garbage file — each must OMIT that one field and still produce a
+ *     usable beacon. This module runs on a 5s tick inside every gateway in
+ *     the fleet; a throw here would crash-loop every agent on rollout, so the
+ *     malformed-input cases assert "no throw + field absent", not just a
+ *     happy-path parse.
+ *
+ *  2. **The absent/unlimited distinction.** `memory.max` of the literal
+ *     `max` (unlimited cgroup) must survive as `'max'`, NOT collapse to the
+ *     same "field missing" shape as an unreadable file. The classifier needs
+ *     to tell "a limit-triggered OOM was impossible" from "we don't know".
+ */
+
+import { describe, it, expect } from 'vitest'
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import {
+  attachBootBeacon,
+  BOOT_BEACON_FILE,
+  BOOT_BEACON_INTERVAL_MS,
+  buildBootBeacon,
+  parseHostBootId,
+  parseMemoryBytes,
+  parseMemoryMax,
+  parseOomKillCount,
+  sampleBeaconHost,
+  serializeBootBeacon,
+  tickBootBeacon,
+  writeBootBeaconFile,
+  type BootBeacon,
+} from '../gateway/boot-beacon.js'
+
+const REAL_MEMORY_EVENTS = 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 7\noom_group_kill 0\n'
+
+describe('boot-beacon parsers', () => {
+  describe('parseHostBootId', () => {
+    it('extracts the boot_id uuid from the /proc file contents', () => {
+      expect(parseHostBootId('8917e33b-05c6-4509-8b4b-7e39d98c4c7f\n'))
+        .toBe('8917e33b-05c6-4509-8b4b-7e39d98c4c7f')
+    })
+
+    it('returns undefined for a missing file (null read), empty, or blank contents', () => {
+      expect(parseHostBootId(null)).toBeUndefined()
+      expect(parseHostBootId(undefined)).toBeUndefined()
+      expect(parseHostBootId('')).toBeUndefined()
+      expect(parseHostBootId('   \n ')).toBeUndefined()
+    })
+
+    it('rejects multi-token junk rather than poisoning the host-reboot comparison', () => {
+      // A garbage boot_id is WORSE than an absent one: the classifier compares
+      // this value across boots to decide "host rebooted" vs "our process was
+      // killed". Junk that happens to differ between reads would fabricate a
+      // host reboot, so anything unexpected must degrade to absent.
+      expect(parseHostBootId('<html>not a boot id</html>')).toBeUndefined()
+      expect(parseHostBootId('abc def')).toBeUndefined()
+      expect(parseHostBootId('x'.repeat(500))).toBeUndefined()
+    })
+  })
+
+  describe('parseOomKillCount', () => {
+    it('reads oom_kill out of a real cgroup v2 memory.events table', () => {
+      expect(parseOomKillCount(REAL_MEMORY_EVENTS)).toBe(7)
+    })
+
+    it('reads oom_kill, not oom — reclaim-resolved OOM events are not kills', () => {
+      expect(parseOomKillCount('oom 42\noom_kill 0\n')).toBe(0)
+    })
+
+    it('tolerates oom_group_kill sharing the oom_kill prefix', () => {
+      expect(parseOomKillCount('oom_group_kill 9\noom_kill 3\n')).toBe(3)
+    })
+
+    it('returns undefined when the key is absent (older kernel) or the file is unreadable', () => {
+      expect(parseOomKillCount('low 0\nhigh 0\n')).toBeUndefined()
+      expect(parseOomKillCount(null)).toBeUndefined()
+      expect(parseOomKillCount('')).toBeUndefined()
+    })
+
+    it('returns undefined for a malformed value instead of NaN or a throw', () => {
+      expect(parseOomKillCount('oom_kill notanumber\n')).toBeUndefined()
+      expect(parseOomKillCount('oom_kill -1\n')).toBeUndefined()
+      expect(parseOomKillCount('oom_kill\n')).toBeUndefined()
+      expect(parseOomKillCount('oom_kill 1 2\n')).toBeUndefined()
+      // Binary garbage (a cgroup v1 host serving something else at this path).
+      expect(() => parseOomKillCount('\x00\x01\x02')).not.toThrow()
+      expect(parseOomKillCount('\x00\x01\x02')).toBeUndefined()
+    })
+  })
+
+  describe('parseMemoryBytes', () => {
+    it('parses memory.current', () => {
+      expect(parseMemoryBytes('2846650368\n')).toBe(2846650368)
+      expect(parseMemoryBytes('0')).toBe(0)
+    })
+
+    it('degrades to undefined for unreadable / non-numeric / non-integer contents', () => {
+      expect(parseMemoryBytes(null)).toBeUndefined()
+      expect(parseMemoryBytes('')).toBeUndefined()
+      expect(parseMemoryBytes('max')).toBeUndefined()
+      expect(parseMemoryBytes('12.5')).toBeUndefined()
+      expect(parseMemoryBytes('-5')).toBeUndefined()
+      // Beyond Number.MAX_SAFE_INTEGER — a lossy parse is worse than absent.
+      expect(parseMemoryBytes('99999999999999999999')).toBeUndefined()
+    })
+  })
+
+  describe('parseMemoryMax', () => {
+    it('parses a byte limit', () => {
+      expect(parseMemoryMax('17179869184\n')).toBe(17179869184)
+    })
+
+    it('preserves the literal "max" — unlimited is NOT the same as unknown', () => {
+      expect(parseMemoryMax('max\n')).toBe('max')
+      // An unreadable file omits the field; an unlimited cgroup reports 'max'.
+      expect(parseMemoryMax(null)).toBeUndefined()
+      expect(parseMemoryMax('garbage')).toBeUndefined()
+    })
+  })
+})
+
+describe('buildBootBeacon', () => {
+  it('carries every field through when the full host sample is available', () => {
+    const beacon = buildBootBeacon({
+      bootId: 'boot-1',
+      pid: 4242,
+      wallMs: 1_700_000_000_000,
+      monotonicMs: 12_345,
+      sample: {
+        hostBootId: 'host-1',
+        oomKillCount: 7,
+        memCurrent: 100,
+        memMax: 200,
+      },
+    })
+    expect(beacon).toEqual({
+      bootId: 'boot-1',
+      pid: 4242,
+      wallMs: 1_700_000_000_000,
+      monotonicMs: 12_345,
+      hostBootId: 'host-1',
+      oomKillCount: 7,
+      memCurrent: 100,
+      memMax: 200,
+    })
+  })
+
+  it('OMITS unavailable fields rather than emitting undefined/null keys', () => {
+    // A non-cgroup-v2 host degrades to the process-local core. "Absent" must
+    // be one unambiguous shape for the future reader, so the keys must not
+    // exist at all.
+    const beacon = buildBootBeacon({
+      bootId: 'boot-1',
+      pid: 1,
+      wallMs: 5,
+      monotonicMs: 6,
+      sample: {},
+    })
+    expect(beacon).toEqual({ bootId: 'boot-1', pid: 1, wallMs: 5, monotonicMs: 6 })
+    expect(Object.keys(beacon).sort()).toEqual(['bootId', 'monotonicMs', 'pid', 'wallMs'])
+    expect(JSON.parse(serializeBootBeacon(beacon))).not.toHaveProperty('hostBootId')
+    expect(JSON.parse(serializeBootBeacon(beacon))).not.toHaveProperty('oomKillCount')
+  })
+
+  it('keeps a zero oomKillCount — 0 is a real reading the classifier diffs against', () => {
+    const beacon = buildBootBeacon({
+      bootId: 'b', pid: 1, wallMs: 1, monotonicMs: 1,
+      sample: { oomKillCount: 0, memCurrent: 0 },
+    })
+    expect(beacon.oomKillCount).toBe(0)
+    expect(beacon.memCurrent).toBe(0)
+    expect(serializeBootBeacon(beacon)).toContain('"oomKillCount":0')
+  })
+
+  it('serialises to one JSON line with a trailing newline', () => {
+    const text = serializeBootBeacon(buildBootBeacon({
+      bootId: 'b', pid: 1, wallMs: 2, monotonicMs: 3,
+    }))
+    expect(text.endsWith('\n')).toBe(true)
+    expect(text.trimEnd().includes('\n')).toBe(false)
+    expect(JSON.parse(text)).toEqual({ bootId: 'b', pid: 1, wallMs: 2, monotonicMs: 3 })
+  })
+})
+
+describe('sampleBeaconHost', () => {
+  it('reads a cgroup v2 layout end to end from injected paths', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-cg-'))
+    try {
+      writeFileSync(join(dir, 'boot_id'), 'host-boot-abc\n')
+      writeFileSync(join(dir, 'memory.events'), REAL_MEMORY_EVENTS)
+      writeFileSync(join(dir, 'memory.current'), '2846650368\n')
+      writeFileSync(join(dir, 'memory.max'), '17179869184\n')
+      expect(sampleBeaconHost({
+        hostBootId: join(dir, 'boot_id'),
+        memoryEvents: join(dir, 'memory.events'),
+        memoryCurrent: join(dir, 'memory.current'),
+        memoryMax: join(dir, 'memory.max'),
+      })).toEqual({
+        hostBootId: 'host-boot-abc',
+        oomKillCount: 7,
+        memCurrent: 2846650368,
+        memMax: 17179869184,
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('degrades to an empty sample when NOTHING is readable (cgroup v1 host)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-cg1-'))
+    try {
+      const missing = {
+        hostBootId: join(dir, 'nope-boot_id'),
+        memoryEvents: join(dir, 'nope-memory.events'),
+        memoryCurrent: join(dir, 'nope-memory.current'),
+        memoryMax: join(dir, 'nope-memory.max'),
+      }
+      let sample: ReturnType<typeof sampleBeaconHost> | undefined
+      expect(() => { sample = sampleBeaconHost(missing) }).not.toThrow()
+      expect(sample).toEqual({})
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('degrades PER FIELD — one unreadable file does not take the others down', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-partial-'))
+    try {
+      writeFileSync(join(dir, 'boot_id'), 'host-boot-abc\n')
+      // memory.events missing entirely; memory.current garbage; memory.max unlimited.
+      writeFileSync(join(dir, 'memory.current'), 'not-a-number\n')
+      writeFileSync(join(dir, 'memory.max'), 'max\n')
+      const sample = sampleBeaconHost({
+        hostBootId: join(dir, 'boot_id'),
+        memoryEvents: join(dir, 'memory.events'),
+        memoryCurrent: join(dir, 'memory.current'),
+        memoryMax: join(dir, 'memory.max'),
+      })
+      expect(sample).toEqual({ hostBootId: 'host-boot-abc', memMax: 'max' })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not throw when a cgroup path resolves to a DIRECTORY (EISDIR)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-eisdir-'))
+    try {
+      expect(() => sampleBeaconHost({
+        hostBootId: dir,
+        memoryEvents: dir,
+        memoryCurrent: dir,
+        memoryMax: dir,
+      })).not.toThrow()
+      expect(sampleBeaconHost({ hostBootId: dir, memoryEvents: dir, memoryCurrent: dir, memoryMax: dir }))
+        .toEqual({})
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('writeBootBeaconFile', () => {
+  const beacon: BootBeacon = {
+    bootId: 'boot-1', pid: 99, wallMs: 1234, monotonicMs: 56, hostBootId: 'host-1',
+  }
+
+  it('writes the beacon under the state dir, creating the dir 0700 if needed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'beacon-w-'))
+    try {
+      const stateDir = join(root, 'nested', 'state')
+      expect(writeBootBeaconFile(stateDir, beacon)).toBe(true)
+      const path = join(stateDir, BOOT_BEACON_FILE)
+      expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual(beacon)
+      // STATE_DIR also holds access.json / .env. A 5s tick that recreated it
+      // at a default mode would loosen permissions on all of that.
+      expect(statSync(stateDir).mode & 0o777).toBe(0o700)
+      expect(statSync(path).mode & 0o777).toBe(0o600)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves no tmp file behind after a successful write (rename, not copy)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-w-'))
+    try {
+      writeBootBeaconFile(dir, beacon)
+      expect(existsSync(join(dir, `${BOOT_BEACON_FILE}.tmp-${process.pid}`))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('overwrites the previous beacon in place on the next tick', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-w-'))
+    try {
+      writeBootBeaconFile(dir, beacon)
+      writeBootBeaconFile(dir, { ...beacon, wallMs: 9999, oomKillCount: 3 })
+      const read = JSON.parse(readFileSync(join(dir, BOOT_BEACON_FILE), 'utf-8'))
+      expect(read.wallMs).toBe(9999)
+      expect(read.oomKillCount).toBe(3)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns false instead of throwing when the state dir cannot be created', () => {
+    const root = mkdtempSync(join(tmpdir(), 'beacon-bad-'))
+    try {
+      // A regular FILE where the state dir should be — mkdirSync throws ENOTDIR.
+      const notADir = join(root, 'occupied')
+      writeFileSync(notADir, 'i am a file')
+      let result: boolean | undefined
+      expect(() => { result = writeBootBeaconFile(join(notADir, 'state'), beacon) }).not.toThrow()
+      expect(result).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('tickBootBeacon', () => {
+  it('writes a well-formed beacon carrying this process pid and the given boot id', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-tick-'))
+    try {
+      expect(tickBootBeacon(dir, 'boot-under-test')).toBe(true)
+      const read = JSON.parse(readFileSync(join(dir, BOOT_BEACON_FILE), 'utf-8')) as BootBeacon
+      expect(read.bootId).toBe('boot-under-test')
+      expect(read.pid).toBe(process.pid)
+      expect(read.wallMs).toBeGreaterThan(1_700_000_000_000)
+      expect(read.monotonicMs).toBeGreaterThanOrEqual(0)
+      // Host/cgroup fields are environment-dependent: assert TYPE when present,
+      // and that their absence is a clean omission, never null/NaN.
+      if ('hostBootId' in read) expect(typeof read.hostBootId).toBe('string')
+      if ('oomKillCount' in read) expect(Number.isInteger(read.oomKillCount)).toBe(true)
+      if ('memCurrent' in read) expect(Number.isInteger(read.memCurrent)).toBe(true)
+      if ('memMax' in read) expect(['number', 'string']).toContain(typeof read.memMax)
+      for (const value of Object.values(read)) expect(value).not.toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('advances wallMs across ticks so the next boot can bound the time of death', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-tick-'))
+    try {
+      tickBootBeacon(dir, 'b')
+      const first = JSON.parse(readFileSync(join(dir, BOOT_BEACON_FILE), 'utf-8')) as BootBeacon
+      await new Promise(resolve => setTimeout(resolve, 25))
+      tickBootBeacon(dir, 'b')
+      const second = JSON.parse(readFileSync(join(dir, BOOT_BEACON_FILE), 'utf-8')) as BootBeacon
+      expect(second.wallMs).toBeGreaterThanOrEqual(first.wallMs)
+      expect(second.monotonicMs).toBeGreaterThan(first.monotonicMs)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('never throws on an unwritable state dir — a tick failure must not reach the gateway interval', () => {
+    const root = mkdtempSync(join(tmpdir(), 'beacon-tick-bad-'))
+    try {
+      const notADir = join(root, 'occupied')
+      writeFileSync(notADir, 'i am a file')
+      let result: boolean | undefined
+      expect(() => { result = tickBootBeacon(join(notADir, 'state'), 'b') }).not.toThrow()
+      expect(result).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+})
+
+describe('attachBootBeacon', () => {
+  it('writes a beacon IMMEDIATELY, before the first interval elapses', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-attach-'))
+    try {
+      attachBootBeacon(dir, () => {})
+      // Not "after the returned tick runs" — at attach time. A gateway that
+      // dies in its first 5s must still have recorded this host's boot_id.
+      expect(existsSync(join(dir, BOOT_BEACON_FILE))).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refreshes the beacon and runs the host tick, beacon first', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-attach-'))
+    try {
+      const order: string[] = []
+      const tick = attachBootBeacon(dir, () => {
+        order.push(`next:${JSON.parse(readFileSync(join(dir, BOOT_BEACON_FILE), 'utf-8')).bootId}`)
+      })
+      // Stamp a sentinel over the attach-time beacon so "the tick refreshed it"
+      // is observable without depending on the clock advancing between writes.
+      writeFileSync(join(dir, BOOT_BEACON_FILE), '{"bootId":"stale-sentinel"}\n')
+      tick()
+      const after = JSON.parse(readFileSync(join(dir, BOOT_BEACON_FILE), 'utf-8')) as BootBeacon
+      expect(after.bootId).not.toBe('stale-sentinel')
+      expect(after.pid).toBe(process.pid)
+      // The host tick observed the ALREADY-refreshed beacon — proving the
+      // beacon write precedes it, so a throw from `next` cannot starve it.
+      expect(order).toEqual([`next:${after.bootId}`])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not swallow the host tick\'s errors — existing behaviour is unchanged', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'beacon-attach-'))
+    try {
+      const tick = attachBootBeacon(dir, () => { throw new Error('host tick blew up') })
+      expect(() => tick()).toThrow('host tick blew up')
+      // …and the beacon still landed, because it is written first.
+      expect(existsSync(join(dir, BOOT_BEACON_FILE))).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still runs the host tick when the beacon write fails', () => {
+    // The beacon is forensic garnish; it must never gate the tick it rides on.
+    const root = mkdtempSync(join(tmpdir(), 'beacon-attach-bad-'))
+    try {
+      const notADir = join(root, 'occupied')
+      writeFileSync(notADir, 'i am a file')
+      let ran = false
+      const tick = attachBootBeacon(join(notADir, 'state'), () => { ran = true })
+      expect(() => tick()).not.toThrow()
+      expect(ran).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('gateway wiring', () => {
+  // Source-scrape rather than booting the 24k-line gateway module (which has
+  // load-bearing module-eval ordering — see the #3392 TDZ scar). The outcome
+  // that matters is that the beacon is actually DRIVEN: an unwired writer is
+  // an empty forensic record, and nothing else in the tree would go red.
+  const gatewaySrc = readFileSync(
+    new URL('../gateway/gateway.ts', import.meta.url), 'utf-8',
+  )
+
+  it('rides the existing shared 5s approval tick rather than adding a timer', () => {
+    expect(gatewaySrc).toContain("import { attachBootBeacon } from './boot-beacon.js'")
+    expect(gatewaySrc).toContain(
+      'setInterval(attachBootBeacon(STATE_DIR, checkApprovals), 5000)',
+    )
+    // Exactly one wiring site, and it is the pre-existing interval — a second
+    // `attachBootBeacon` call would mean a second beacon writer.
+    expect(gatewaySrc.match(/attachBootBeacon\(STATE_DIR/g)?.length).toBe(1)
+    expect(BOOT_BEACON_INTERVAL_MS).toBe(5_000)
+  })
+})
