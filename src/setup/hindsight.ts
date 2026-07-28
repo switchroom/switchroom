@@ -706,7 +706,8 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
  *
  * Interactive-lane protection therefore lives elsewhere, and this is the knob
  * to reach for first: `HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT`
- * (src/setup/hindsight-perf-defaults.ts, default 1) is a process-wide
+ * (src/setup/hindsight-perf-defaults.ts — DERIVED from the effective global and
+ * retain caps, landing on 2 with switchroom's own defaults) is a process-wide
  * semaphore on consolidation LLM calls — see the engine's
  * `llm_wrapper._build_per_op_semaphores`, where a consolidation call must
  * acquire the per-op semaphore AND the global one. Every knob in THIS block
