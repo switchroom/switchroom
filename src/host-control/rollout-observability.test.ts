@@ -208,11 +208,27 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("Done");
     expect(out).toContain("rolled 2/2 agent(s) in 8m 12s");
     expect(out).toContain("`test-harness`, `clerk`");
-    // Deferred host-side components with their exact update commands.
-    expect(out).toContain("Deferred");
-    expect(out).toContain("switchroom webd install --tag v1.2.3");
+    // What is genuinely still host-side, with its exact command.
+    expect(out).toContain("Still host-side");
     expect(out).toContain("sudo npm i -g switchroom@1.2.3");
     expect(out).toContain("switchroom hostd install --tag v1.2.3");
+  });
+
+  it("a ✅ card no longer claims switchroom-web is stale (#3928)", () => {
+    // `refresh-web` is in the plan on both paths and `verify-components`
+    // FAILS the roll when web is behind — so a completed card telling the
+    // operator to go run `webd install` host-side is both false and the
+    // exact "go open a shell" instruction the managed path exists to
+    // eliminate.
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "completed",
+      rolled: ["test-harness", "clerk"],
+      m: 2,
+    });
+    expect(out).not.toContain("switchroom webd install");
+    expect(out).not.toContain("still on the prior version");
+    expect(out).toContain("Verified on v1.2.3");
   });
 
   it("renders the ❌ terminal-error summary with the failed step + agent", () => {
@@ -234,6 +250,42 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("after 1m 5s");
     // A failed roll must NOT advertise the deferred-update commands.
     expect(out).not.toContain("Deferred");
+  });
+
+  it("renders residual component drift as INCOMPLETE, naming what is behind (#3928)", () => {
+    // The operator reads THIS in Telegram and has no host shell, so the
+    // card must distinguish "the roll stopped, agents may be split" from
+    // "every agent is on target, two components are not" — and must not
+    // suggest re-rolling, which cannot fix it.
+    const out = renderRolloutStatus({
+      target: "v0.19.30",
+      terminal: "error",
+      failedStep: "verify-components",
+      drifted: ["switchroom-web", "switchroom-hindsight-autoheal"],
+      rolled: ["test-harness", "klanker"],
+      m: 2,
+      elapsedMs: 492_000,
+    });
+    expect(out.startsWith("⚠️")).toBe(true);
+    expect(out).toContain("INCOMPLETE");
+    expect(out).toContain("2/2 agent(s) reached v0.19.30");
+    expect(out).toContain("`switchroom-web`");
+    expect(out).toContain("`switchroom-hindsight-autoheal`");
+    expect(out).toContain("Re-running the roll will NOT fix this");
+    // Not the generic STOPPED wording, and no "everything is done" claim.
+    expect(out).not.toContain("STOPPED");
+    expect(out).not.toContain("Deferred");
+  });
+
+  it("still renders an INCOMPLETE card when the drift list did not survive", () => {
+    const out = renderRolloutStatus({
+      target: "v0.19.30",
+      terminal: "error",
+      failedStep: "verify-components",
+      rolled: ["klanker"],
+    });
+    expect(out).toContain("INCOMPLETE");
+    expect(out).toContain("see the roll's warnings");
   });
 
   it("code-spans agent names everywhere (underscores must not italicize in GFM)", () => {

@@ -370,6 +370,19 @@ export interface StatusEntry {
   failed_step?: string;
   /** Agent that failed the version assert (when failed_step is restart). */
   failed_agent?: string;
+  /**
+   * Components still BEHIND the target after the roll (#3928). Set only
+   * when `failed_step === "verify-components"` — the roll's own terminal
+   * convergence proof failed, i.e. every agent reached the target but a
+   * component the roll was answerable for (`switchroom-web`,
+   * `switchroom-hindsight-autoheal`, …) did not.
+   *
+   * Carried as structured data rather than left in the stderr tail so an
+   * operator reading `get_status` from TELEGRAM is told exactly which
+   * components are stranded — the whole point of the managed path is that
+   * they never have to open a host shell to find out.
+   */
+  drifted?: string[];
   /** Actual version detected on failed_agent (null = unreachable). BONUS #2458 got-field gap. */
   got?: string | null;
   /**
@@ -4175,6 +4188,11 @@ export class HostdServer {
           entry.rolled = parsed.rolled;
           if (parsed.failedStep) entry.failed_step = parsed.failedStep;
           if (parsed.failedAgent) entry.failed_agent = parsed.failedAgent;
+          // #3928 — the components the roll left behind. Lifted out of the
+          // sentinel so the Telegram-side `get_status` names them.
+          if (parsed.drifted && parsed.drifted.length > 0) {
+            entry.drifted = parsed.drifted;
+          }
           // BONUS (#2458 got-field gap): the sentinel carries `got` (the
           // actual version detected on the failed agent, or null when
           // unreachable). Preserve it so get_status readers can surface the
@@ -4307,13 +4325,29 @@ export class HostdServer {
     entry: StatusEntry,
     priorPin: string | undefined,
   ): Promise<void> {
-    const notes: string[] = [
-      `Unattended auto-update roll to ${entry.pin ?? "?"} FAILED at ` +
-        `${entry.failed_step ?? "unknown step"}` +
-        `${entry.failed_agent ? ` (agent ${entry.failed_agent})` : ""}. ` +
-        `Unattended retries of this version are disabled; fix the cause, ` +
-        `then roll manually (\`switchroom rollout --pin ${entry.pin ?? "vX.Y.Z"}\`).`,
-    ];
+    // #3928 — a residual-drift failure is a DIFFERENT operator instruction
+    // from a stopped-partway failure. The agents reached the target; what
+    // did not converge is a named component. Telling the operator to
+    // "re-run the roll" here would be wrong (it would not touch the stale
+    // component), so name the components instead.
+    const drifted = entry.drifted ?? [];
+    const notes: string[] =
+      entry.failed_step === "verify-components"
+        ? [
+            `Unattended auto-update roll to ${entry.pin ?? "?"} rolled ` +
+              `${(entry.rolled ?? []).length} agent(s) but did NOT converge the ` +
+              `whole host: ${drifted.join(", ") || "one or more components"} ` +
+              `still behind. Re-running the roll will not fix this — run the ` +
+              `per-component install named in the rollout warnings, then ` +
+              `\`switchroom update --check\` to confirm.`,
+          ]
+        : [
+            `Unattended auto-update roll to ${entry.pin ?? "?"} FAILED at ` +
+              `${entry.failed_step ?? "unknown step"}` +
+              `${entry.failed_agent ? ` (agent ${entry.failed_agent})` : ""}. ` +
+              `Unattended retries of this version are disabled; fix the cause, ` +
+              `then roll manually (\`switchroom rollout --pin ${entry.pin ?? "vX.Y.Z"}\`).`,
+          ];
     try {
       notes.push(...(await this.recoverFailedAutoRollout(entry, priorPin)));
     } catch (e) {
@@ -4360,6 +4394,21 @@ export class HostdServer {
   ): Promise<string[]> {
     const notes: string[] = [];
     const rolledCount = (entry.rolled ?? []).length;
+    // #3928 — residual component drift is NOT a partially-applied roll, and
+    // both generic branches below would misdescribe it: the agent fleet is
+    // uniformly on the target (not "mixed"), and the change DID land (not
+    // "nothing to revert"). Rolling back here would be actively wrong — it
+    // would drag a converged fleet backwards to fix a stale singleton.
+    if (entry.failed_step === "verify-components") {
+      notes.push(
+        `No automatic rollback: the agent fleet reached ` +
+          `${entry.pin ?? "the target"} and the pin is committed — the gap is ` +
+          `${(entry.drifted ?? []).join(", ") || "a component"}, not the fleet. ` +
+          `Rolling back would move working agents backwards; converge the ` +
+          `named component(s) forward instead.`,
+      );
+      return notes;
+    }
     const beforeAnyAgent =
       entry.failed_step === "apply" ||
       (entry.failed_step === "restart-agent" && rolledCount === 0);
@@ -4481,6 +4530,9 @@ export class HostdServer {
         ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
         ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
         ...(entry.got !== undefined ? { got: entry.got } : {}),
+        ...(entry.drifted && entry.drifted.length > 0
+          ? { drifted: entry.drifted }
+          : {}),
       });
       this.opts.rolloutRelay.postTerminal({
         requestId: entry.request_id,
@@ -4597,6 +4649,9 @@ export class HostdServer {
       ...(row.agent ? { agent: row.agent } : {}),
       ...(row.failed_step ? { failedStep: row.failed_step } : {}),
       ...(row.failed_agent ? { failedAgent: row.failed_agent } : {}),
+      // #3928 — same field the live path emits, so a reader gets the
+      // stranded component names whether the entry is live or replayed.
+      ...(row.drifted && row.drifted.length > 0 ? { drifted: row.drifted } : {}),
       ...(row.pin ? { pin: row.pin } : {}),
       ...(row.prior_pin ? { prior_pin: row.prior_pin } : {}),
     });
@@ -4641,6 +4696,11 @@ export class HostdServer {
             ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
             // BONUS (#2458 got-field gap): include `got` when present.
             ...(entry.got !== undefined ? { got: entry.got } : {}),
+            // #3928 — components left behind by the roll. Structured so a
+            // Telegram `get_status` can name them without a host shell.
+            ...(entry.drifted && entry.drifted.length > 0
+              ? { drifted: entry.drifted }
+              : {}),
             ...(entry.pin ? { pin: entry.pin } : {}),
             // Prior-pin (#2492) surfaced structurally too, so a rollback-aware
             // reader gets it from get_status, not only the durable terminal row.
@@ -4843,6 +4903,9 @@ export class HostdServer {
       ...(entry.rolled ? { rolled: entry.rolled } : {}),
       ...(entry.failed_step ? { failed_step: entry.failed_step } : {}),
       ...(entry.failed_agent ? { failed_agent: entry.failed_agent } : {}),
+      // #3928 — components left behind. Durable so `rolloutStatusFromLog`
+      // can still name them after the in-memory entry is evicted.
+      ...(entry.drifted && entry.drifted.length > 0 ? { drifted: entry.drifted } : {}),
       // BONUS (#2458 got-field gap): version detected on failed agent.
       ...(entry.got !== undefined ? { got: entry.got } : {}),
       // Update-apply deferral result (#2458) — only on update_apply rows.

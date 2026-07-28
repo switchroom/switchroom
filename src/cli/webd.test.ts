@@ -194,4 +194,28 @@ describe("resolveWebHostHome (SWITCHROOM_HOST_HOME preference + /host-home poiso
     ).toThrow(/SWITCHROOM_HOST_HOME/);
     expect(() => resolveWebHostHome({}, "/host-home/sub")).toThrow(/host bind source/);
   });
+
+  it("REFUSES every in-container prefix, not just /host-home (#3928)", () => {
+    // #3928 made the operator uid resolvable under root, which is what
+    // lets an agent/hostd container run `webd install` at all — and that
+    // newly reaches call sites whose homedir() is an AGENT state dir
+    // (`/state/agent/home`), not `/host-home`. Before, a two-prefix check
+    // would have waved those through and generated a compose file binding
+    // a path that does not exist on the host. The refusal now delegates to
+    // the SHARED list (`CONTAINER_ROOT_PREFIXES`, src/agents/compose.ts),
+    // so a prefix added there is covered here for free.
+    for (const poison of [
+      "/state/agent/home",
+      "/state",
+      "/run/whatever",
+      "/host-home",
+    ]) {
+      expect(() => resolveWebHostHome({}, poison)).toThrow(/refusing to generate/);
+      expect(() =>
+        resolveWebHostHome({ SWITCHROOM_HOST_HOME: poison }, "/home/operator"),
+      ).toThrow(/refusing to generate/);
+    }
+    // …and a real host home still passes.
+    expect(resolveWebHostHome({}, "/home/operator")).toBe("/home/operator");
+  });
 });

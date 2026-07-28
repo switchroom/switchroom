@@ -411,3 +411,43 @@ describe("parseAuditLine — prior_pin capture (#2492)", () => {
     expect(e!.prior_pin).toBeUndefined();
   });
 });
+
+describe("parseAuditLine — drifted components (#3928)", () => {
+  const base = {
+    ts: "2026-07-29T00:00:00.000Z",
+    op: "rollout",
+    phase: "terminal",
+    caller: { kind: "operator" },
+    request_id: "roll-3928",
+    result: "error",
+    exit_code: 1,
+    duration_ms: 492_000,
+    failed_step: "verify-components",
+  };
+
+  it("round-trips drifted so a get_status served from the LOG still names them", () => {
+    // The in-memory status entry is evicted after a while; the durable log
+    // is then the only place the component names exist. Dropping them here
+    // would leave the operator with "the roll failed" and nothing to fix.
+    const e = parseAuditLine(
+      JSON.stringify({
+        ...base,
+        drifted: ["switchroom-web", "switchroom-hindsight-autoheal"],
+      }),
+    );
+    expect(e!.failed_step).toBe("verify-components");
+    expect(e!.drifted).toEqual([
+      "switchroom-web",
+      "switchroom-hindsight-autoheal",
+    ]);
+  });
+
+  it("drops a malformed drifted field instead of trusting it", () => {
+    expect(parseAuditLine(JSON.stringify({ ...base, drifted: "web" }))!.drifted)
+      .toBeUndefined();
+    expect(
+      parseAuditLine(JSON.stringify({ ...base, drifted: ["web", 7] }))!.drifted,
+    ).toBeUndefined();
+    expect(parseAuditLine(JSON.stringify(base))!.drifted).toBeUndefined();
+  });
+});

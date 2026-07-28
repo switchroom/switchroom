@@ -43,6 +43,8 @@ import {
   type RolloutPhase,
   type RolloutResult,
   type RolloutStep,
+  VERIFY_COMPONENTS_STEP,
+  evaluateRolloutDrift,
   createRolloutDeps,
   isSpawnTimeout,
   ROLLOUT_RUN_TIMEOUT_MS,
@@ -58,6 +60,7 @@ import {
   recoverPinJournal,
   PIN_JOURNAL_MAX_AGE_MS,
 } from "./rollout-pin-journal.js";
+import type { ComponentVersion } from "./component-versions.js";
 import { getReleasePinFromConfig } from "./release-yaml.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
@@ -96,7 +99,7 @@ describe("orderAgentsCanaryFirst", () => {
 });
 
 describe("planRollout", () => {
-  it("orders apply → restarts (canary-first) → web → hostd → hindsight → sweep", () => {
+  it("orders apply → restarts (canary-first) → web → hostd → hindsight → sweep → verify", () => {
     const steps = planRollout(["clerk", "test-harness"]);
     expect(steps.map((s) => (s.kind === "restart-agent" ? `r:${s.agent}` : s.kind))).toEqual([
       "apply",
@@ -106,6 +109,7 @@ describe("planRollout", () => {
       "refresh-hostd",
       "refresh-hindsight",
       "sweep",
+      "verify-components",
     ]);
   });
 
@@ -117,8 +121,26 @@ describe("planRollout", () => {
 
   it("drops web + hostd + hindsight when skipWeb is set", () => {
     const kinds = planRollout(["clerk"], { skipWeb: true }).map((s) => s.kind);
-    expect(kinds).toEqual(["apply", "restart-agent", "sweep"]);
+    expect(kinds).toEqual(["apply", "restart-agent", "sweep", "verify-components"]);
     expect(kinds).not.toContain("refresh-hindsight");
+  });
+
+  it("ALWAYS ends with verify-components — including under --skip-web (#3928)", () => {
+    // The convergence gate derives its scope FROM the steps present, so it
+    // must run even on a reduced plan: with --skip-web it still proves the
+    // agents converged, and demotes the skipped singletons to named
+    // warnings rather than dropping them silently.
+    for (const opts of [
+      undefined,
+      { skipWeb: true },
+      { hostdContext: true },
+      { hostdContext: true, skipWeb: true },
+      { pinToPersist: "v9.9.9" },
+    ]) {
+      const kinds = planRollout(["clerk"], opts).map((s) => s.kind);
+      expect(kinds[kinds.length - 1]).toBe("verify-components");
+      expect(kinds.filter((k) => k === "verify-components")).toHaveLength(1);
+    }
   });
 
   it("does NOT emit a singleton step (first restart self-heals them, #2170)", () => {
@@ -154,6 +176,13 @@ function harness(opts: {
    *  Defaults to the roll target shape being unknown (null → probe skipped
    *  by the isVersionAssertable gate never fires a warning). */
   webImageTag?: string | null;
+  /**
+   * Component inventory the terminal `verify-components` gate reads
+   * (#3928). Defaults to an EMPTY host — nothing behind, so the gate
+   * passes and every pre-existing test keeps its meaning. Tests that
+   * exercise the gate inject a real inventory.
+   */
+  components?: ComponentVersion[];
 }): {
   deps: RolloutDeps;
   runs: string[][];
@@ -182,6 +211,7 @@ function harness(opts: {
     },
     hindsightExists: () => opts.hindsightExists ?? false,
     webImageTag: () => opts.webImageTag ?? null,
+    collectComponents: () => opts.components ?? [],
   };
   return { deps, runs, runEnvs, logs, persisted, phases };
 }
@@ -395,7 +425,7 @@ describe("planRollout — hostd context (#2487)", () => {
       s.kind === "restart-agent" ? `r:${s.agent}` : s.kind,
     );
     // apply → canary (test-harness) → persist-pin → rest → refresh-web →
-    // refresh-hindsight → sweep.
+    // refresh-hindsight → sweep → verify-components.
     expect(kinds).toEqual([
       "apply",
       "r:test-harness",
@@ -404,6 +434,7 @@ describe("planRollout — hostd context (#2487)", () => {
       "refresh-web",
       "refresh-hindsight",
       "sweep",
+      "verify-components",
     ]);
     // persist-pin comes strictly AFTER the canary restart.
     const persistIdx = kinds.indexOf("persist-pin");
@@ -751,6 +782,258 @@ describe("rollout structured-result sentinel (#2487)", () => {
 
   it("returns null when no sentinel line is present (child died early)", () => {
     expect(parseRolloutResultLine("Rolling 3 agents…\napply\n")).toBeNull();
+  });
+
+  it("round-trips `drifted` so hostd can name the stranded components (#3928)", () => {
+    // hostd learns the roll's outcome ONLY from this line. If `drifted`
+    // does not survive the round-trip, the Telegram card can say "failed"
+    // but never say WHAT is still behind — which is the whole point.
+    const parsed = parseRolloutResultLine(
+      encodeRolloutResultLine({
+        ok: false,
+        rolled: ["test-harness", "klanker"],
+        failedStep: VERIFY_COMPONENTS_STEP,
+        warnings: ["switchroom webd install --tag v0.19.30"],
+        drifted: ["switchroom-web", "switchroom-hindsight-autoheal"],
+      }),
+    );
+    expect(parsed).toMatchObject({
+      ok: false,
+      failedStep: "verify-components",
+      drifted: ["switchroom-web", "switchroom-hindsight-autoheal"],
+    });
+  });
+});
+
+// ── #3928: a roll that leaves a component behind must NOT exit green ──────
+
+/**
+ * The #3928 regression suite.
+ *
+ * On 2026-07-28 `switchroom rollout` rolled the fleet to v0.19.30 and
+ * exited **0** while `switchroom-web` and `switchroom-hindsight-autoheal`
+ * stayed on v0.19.26 — and `switchroom update --check`, reading the same
+ * host, correctly named both as targets. Every test below is written
+ * against that exact inventory, and every one of them FAILS on the
+ * pre-fix executor (which had no terminal convergence check at all, so
+ * `r.ok` was `true`).
+ */
+describe("executeRollout — terminal component-drift gate (#3928)", () => {
+  const TARGET = "v0.19.30";
+
+  /** The reference host's inventory, mid-#3928. */
+  function referenceHost(opts: { webBehind?: boolean } = {}): ComponentVersion[] {
+    const at = (v: string, repo: string) =>
+      `ghcr.io/switchroom/switchroom-${repo}:${v}`;
+    return [
+      {
+        name: "switchroom-klanker",
+        kind: "container",
+        version: "v0.19.30",
+        imageRef: at("v0.19.30", "agent"),
+      },
+      {
+        name: "switchroom-test-harness",
+        kind: "container",
+        version: "v0.19.30",
+        imageRef: at("v0.19.30", "agent"),
+      },
+      {
+        name: "switchroom-hostd",
+        kind: "container",
+        version: "v0.19.30",
+        imageRef: at("v0.19.30", "hostd"),
+      },
+      {
+        // The escapee: hostd's compose project, hostd's IMAGE, a name no
+        // scope allowlist ever carried.
+        name: "switchroom-hindsight-autoheal",
+        kind: "container",
+        version: "v0.19.26",
+        imageRef: at("v0.19.26", "hostd"),
+      },
+      {
+        name: "switchroom-web",
+        kind: "container",
+        version: opts.webBehind === false ? "v0.19.30" : "v0.19.26",
+        imageRef: at(opts.webBehind === false ? "v0.19.30" : "v0.19.26", "web"),
+      },
+    ];
+  }
+
+  it("FAILS the roll and names both stranded components — the exact #3928 host", () => {
+    const steps = planRollout(["test-harness", "klanker"]);
+    const { deps, logs } = harness({
+      versions: { "test-harness": "0.19.30", klanker: "0.19.30" },
+      components: referenceHost(),
+    });
+
+    const r = executeRollout(steps, TARGET, deps);
+
+    // THE assertion #3928 is about: this roll exited 0 before the fix.
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe(VERIFY_COMPONENTS_STEP);
+    expect(r.drifted?.sort()).toEqual([
+      "switchroom-hindsight-autoheal",
+      "switchroom-web",
+    ]);
+
+    // Every agent it DID roll is still reported — the operator must be able
+    // to tell "nothing happened" from "the fleet moved, two components did
+    // not".
+    expect(r.rolled).toEqual(["test-harness", "klanker"]);
+
+    // And the failure carries the command that actually fixes each one,
+    // identical to the string `switchroom doctor` prints.
+    const warned = r.warnings.join("\n");
+    expect(warned).toContain(`switchroom webd install --tag ${TARGET}`);
+    expect(warned).toContain(`switchroom hostd install --tag ${TARGET}`);
+    expect(logs.join("\n")).toContain("verify-components");
+  });
+
+  it("exits green when the same host has actually converged", () => {
+    const steps = planRollout(["test-harness", "klanker"]);
+    const { deps } = harness({
+      versions: { "test-harness": "0.19.30", klanker: "0.19.30" },
+      components: referenceHost().map((c) =>
+        c.version === "v0.19.26"
+          ? {
+              ...c,
+              version: "v0.19.30",
+              imageRef: c.imageRef?.replace("v0.19.26", "v0.19.30"),
+            }
+          : c,
+      ),
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.drifted).toBeUndefined();
+  });
+
+  it("gates the autoheal sidecar on the HOSTD-DRIVEN path too, where refresh-hostd is absent", () => {
+    // The #3928 roll was driven from hostd. Its plan deliberately omits
+    // `refresh-hostd` (recreating hostd would SIGKILL the in-flight roll),
+    // so a scope derived from "steps present" alone would exempt the
+    // sidecar and reproduce the bug on the very path that hit it.
+    const steps = planRollout(["test-harness", "klanker"], {
+      hostdContext: true,
+    });
+    expect(steps.some((s) => s.kind === "refresh-hostd")).toBe(false);
+
+    const { deps } = harness({
+      versions: { "test-harness": "0.19.30", klanker: "0.19.30" },
+      components: referenceHost({ webBehind: false }),
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(false);
+    expect(r.drifted).toEqual(["switchroom-hindsight-autoheal"]);
+  });
+
+  it("does NOT revert the durable pin when only the drift gate failed", () => {
+    // The fleet DID reach the target. Reverting the pin here would drag
+    // every later `agent restart` / reconcile back onto the old build —
+    // strictly worse than the bug being fixed. The gate therefore sits
+    // AFTER commitPin and returns a plain failure instead of calling
+    // `fail()`.
+    const steps = planRollout(["test-harness"], { pinToPersist: TARGET });
+    const { deps, persisted } = harness({
+      versions: { "test-harness": "0.19.30" },
+      components: referenceHost(),
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe(VERIFY_COMPONENTS_STEP);
+    expect(persisted).toEqual([TARGET]);
+  });
+
+  it("reports an out-of-scope component as a WARNING, not a failure", () => {
+    // `--skip-web` is an explicit opt-out, so web must not fail the roll —
+    // but "you skipped it and it is behind" is information the operator
+    // still needs, so it is a named warning carrying the fix command.
+    const steps = planRollout(["klanker"], { skipWeb: true });
+    const { deps } = harness({
+      versions: { klanker: "0.19.30" },
+      components: referenceHost().filter(
+        (c) => c.name !== "switchroom-hindsight-autoheal",
+      ),
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.join("\n")).toContain("switchroom-web");
+    expect(r.warnings.join("\n")).toContain(
+      `switchroom webd install --tag ${TARGET}`,
+    );
+  });
+
+  it("does not blame a roll for an agent it was never asked to touch", () => {
+    const steps = planRollout(["klanker"]);
+    const { deps } = harness({
+      versions: { klanker: "0.19.30" },
+      components: [
+        {
+          name: "switchroom-klanker",
+          kind: "container",
+          version: "v0.19.30",
+          imageRef: "ghcr.io/switchroom/switchroom-agent:v0.19.30",
+        },
+        {
+          name: "switchroom-somebody-else",
+          kind: "container",
+          version: "v0.19.26",
+          imageRef: "ghcr.io/switchroom/switchroom-agent:v0.19.26",
+        },
+      ],
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.join("\n")).toContain("switchroom-somebody-else");
+  });
+
+  it("WARNS LOUDLY rather than passing silently when no collector is wired", () => {
+    // A missing inventory must never read as "converged". This is the
+    // fail-open hole that would quietly restore #3928.
+    const steps = planRollout(["klanker"]);
+    const { deps } = harness({ versions: { klanker: "0.19.30" } });
+    delete (deps as { collectComponents?: unknown }).collectComponents;
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    // A WARNING, not just a log line: warnings ride the result sentinel to
+    // hostd and onto the Telegram card, so the operator learns the roll was
+    // unproven even when nobody reads the child's stdout.
+    const warned = r.warnings.join("\n");
+    expect(warned).toContain("did not prove the host converged");
+    expect(warned).toContain("switchroom update --check");
+  });
+
+  it("survives a docker-less host: a THROWING collector warns, never crashes the roll", () => {
+    const steps = planRollout(["klanker"]);
+    const { deps } = harness({ versions: { klanker: "0.19.30" } });
+    deps.collectComponents = () => {
+      throw new Error("docker: command not found");
+    };
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.join("\n")).toContain("docker: command not found");
+  });
+});
+
+describe("evaluateRolloutDrift (#3928, pure)", () => {
+  it("normalizes a bare target so a `0.19.30` roll is not read as drift", () => {
+    const verdict = evaluateRolloutDrift(
+      [
+        {
+          name: "switchroom-web",
+          kind: "container",
+          version: "v0.19.30",
+          imageRef: "ghcr.io/switchroom/switchroom-web:v0.19.30",
+        },
+      ],
+      "0.19.30",
+      planRollout(["klanker"]),
+      false,
+    );
+    expect(verdict.gated).toEqual([]);
+    expect(verdict.exempt).toEqual([]);
   });
 });
 
