@@ -131,9 +131,17 @@ describe('#3927 FIX A — a mid-turn enqueue parks; the turn mints on dequeue', 
 
   it('a parked start expires after its TTL, so a dequeue that never arrives can ' +
     'never mint a stale turn later', () => {
+    // RUNNER-AGNOSTIC CLOCK. This file dual-runs (vitest + `bun test`), and
+    // bun's vitest shim does NOT implement `vi.setSystemTime` — calling it
+    // threw `TypeError: vi.setSystemTime is not a function` and made bun-test
+    // deterministically red. The TTL is a pure elapsed-time comparison
+    // (`now - parkedAt > PARKED_TURN_START_TTL_MS`), so the absolute wall
+    // clock is irrelevant; only the 31-minute JUMP matters. `useFakeTimers()`
+    // + `advanceTimersByTime()` moves `Date.now()` by exactly that delta on
+    // BOTH runners (same insight as races.test.ts:275-281), so the assertion
+    // below really executes under bun instead of being guarded away.
     vi.useFakeTimers()
     try {
-      vi.setSystemTime(new Date('2026-07-28T18:00:00Z'))
       const h = makeHarness()
       handleSessionEvent(h.deps, enqueue('1201'))
       const turnA = h.current()!
@@ -141,7 +149,7 @@ describe('#3927 FIX A — a mid-turn enqueue parks; the turn mints on dequeue', 
       expect(__parkedTurnStartCountForTest()).toBe(1)
 
       // The CLI died mid-turn: neither `dequeue` nor `remove` ever arrives.
-      vi.setSystemTime(new Date('2026-07-28T18:31:00Z')) // TTL is 30 min
+      vi.advanceTimersByTime(31 * 60_000) // TTL is 30 min
       turnA.endedAt = Date.now()
       handleSessionEvent(h.deps, { kind: 'dequeue' })
 
