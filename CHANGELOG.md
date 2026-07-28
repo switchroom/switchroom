@@ -1,5 +1,98 @@
 # Changelog
 
+## v0.19.30 — `switchroom update` updates every component, including the CLI running it
+
+### The host CLI now updates itself, and it goes first
+
+`switchroom update` updated every switchroom component **except the one running
+the update**, and nothing anywhere reported the resulting skew. The reference
+host carried three simultaneous drifts against a v0.19.28 fleet: the host CLI
+on 0.19.23 (nothing on a host ever updated it), `switchroom-hindsight-autoheal`
+on v0.19.26, and `switchroom-web` on v0.19.26. Three unrelated causes, one
+shared signature — a component quietly left behind. They survived three
+releases not because each failure was invisible (two logged a warning at the
+time) but because nothing held a standing, checkable answer to "is every
+component on the same version?". A warning scrolls past once; a deterministic
+check fires every time you look.
+
+`self-update-cli` runs **ahead of** the release pin, the compose regen and
+`apply-config`, because `apply-config` renders every per-agent scaffold from
+Handlebars templates that ship *inside the installed CLI*. A merged feature
+that adds a template variable is invisible on a host whose CLI is stale, no
+matter how current the images are — the CLI is the compiler, the images are the
+output (#3919, #3922).
+
+The update fetches the same GitHub release asset `install.sh` publishes,
+verifies SHA256 against `switchroom-checksums.txt`, and **proves the candidate
+runs** (`<candidate> version`, exit 0 and a parseable version) before any swap.
+The outgoing binary is archived to `<installDir>/.switchroom-versions/` — inside
+the install dir specifically so the swap is two same-filesystem atomic
+`rename(2)`s rather than a copy with a torn-file window — and rollback is one
+printed `cp`.
+
+It is **swap-then-re-exec**, not swap-in-place and not a detached helper: a
+process cannot begin executing a replacement of its own file, so the new binary
+is handed the remaining plan and its exit status is adopted, loop-guarded by
+`--skip-self-update` plus `SWITCHROOM_SELF_UPDATED=1`.
+
+**Non-static installs are detected and skipped, never clobbered** — a source
+checkout, an npm global install and an in-container CLI each get the correct
+remediation printed, and the classification happens before any network I/O.
+
+It is **on by default, with `--skip-self-update` as the opt-out.** Opt-in would
+have preserved the drift for every operator who never learns the flag — which
+is exactly how this host reached three releases of skew.
+
+Every failure mode leaves the installed CLI byte-identical: a failed or
+truncated download removes the temp file and fails the update, a checksum
+mismatch refuses, a candidate that will not run is refused *before* the swap,
+and a rollback copy that cannot be made refuses to swap. An interruption
+between the swap and `apply-config` is benign — a new CLI with un-applied
+config, which the next `switchroom update` converges. That is strictly better
+than the reverse order, which would render scaffolds from templates the
+operator has already replaced.
+
+### The stranded autoheal sidecar, root-caused
+
+`bumpHostdComposeImageTag` used a **non-global** regex with `String.replace`,
+which rewrites only the first match. The hostd compose has carried a second
+`switchroom-hostd` image line since the `hindsight-autoheal` sidecar (#2910), so
+every self-bump advanced `hostd` and silently left the sidecar behind. It now
+rewrites every line, preserving each line's own registry prefix (a fork
+mirroring the two services from different registries must not collapse onto
+one), and logs `bumpedCount` so a future split is observable. The regression
+tests were verified to fail against the pre-fix implementation.
+
+### Version drift is reported deterministically
+
+A new enumerative, pure, network-free component inventory backs two surfaces:
+
+- A **warn-only** `switchroom doctor` section — skew is a real finding but not a
+  broken install, so it must not change doctor's exit code — with a
+  per-component remediation.
+- A **drift preamble on `switchroom update --check`** naming every component
+  behind the target.
+
+The inventory comes from `docker ps`, **not a hardcoded list**: a hardcoded list
+is how the autoheal sidecar escaped notice, and a component added tomorrow is
+covered the day it ships. Inclusion is keyed on the image repo path
+(`…/switchroom-<x>`), so third-party images running under switchroom-prefixed
+container names (`switchroom-hostd-docker-proxy`, `switchroom-grafana-fwd`) and
+locally-built dev images are excluded while every published component is
+covered. The target is `release.pin` when set — the operator's declared intent,
+and what compose, `webd install` and `hostd install` all resolve from —
+otherwise the highest deployed version. It stays network-free so `doctor`
+remains fast and offline-safe.
+
+Being honest about the limits: `switchroom-web` drift (#3920) has a separate
+root cause — `webd install` inside hostd exits non-zero against a hostd compose
+that predates `SWITCHROOM_HOSTD_OPERATOR_UID`, and the rollout treats that as
+non-fatal. This release does not fix it; it makes the resulting drift
+permanently visible with the correct host-side fix string. `rebuildRefusalMessage`
+still tells operators to `npm i -g switchroom@latest`, which is wrong for the
+static-binary shape `install.sh` publishes (#3921), and is left to its own
+change.
+
 ## v0.19.29 — a shared bank can actually be shared, and the retain lane can hold a floor
 
 ### Agents sharing a bank can pool their observations, instead of siloing them per tag
