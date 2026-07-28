@@ -556,6 +556,112 @@ def _dir_bytes(d: str, names) -> int:
     return total
 
 
+def _append_ledger(line: str) -> None:
+    """Append one line to ``pending-evictions.log``, rotating at its cap.
+
+    Split out of ``_log_eviction`` (#3688 review R1-M2) so the OTHER way a
+    payload leaves this module for good — ``_trim_dir`` shedding an archived
+    copy — can be ledgered on exactly the same terms instead of leaving no
+    durable trace at all. Best-effort: a ledger that cannot be written *or
+    read back* must never take the caller down with it — hence the guard
+    catches ``ValueError`` as well as ``OSError`` (see there).
+
+    ROTATION PRIORITISES ``evicted=`` INSIDE THE SAME BUDGET, and that is a
+    direct consequence of sharing the file. Before #3688 every line here
+    was an eviction, so "keep the newest ``EVICTIONS_LOG_KEEP_LINES``
+    lines" and "keep the newest 2,000 evictions" were the same sentence.
+    They are not any more: a single ``collapse_duplicates`` run over the
+    measured 1,060-file backlog writes ~192 ``trimmed=`` lines, and a plain
+    tail-rotate would let that noise push real ``evicted=`` lines out of
+    the 7-day window ``switchroom doctor`` reads — i.e. adding
+    observability for the BENIGN channel would have removed it for the one
+    channel that means memory is actually gone.
+
+    So the keep window is filled evictions-first and only then topped up
+    with the newest remaining lines. The budget is unchanged at
+    ``EVICTIONS_LOG_KEEP_LINES`` lines TOTAL — a ledger of nothing but
+    evictions rotates exactly as it did before #3688 — and chronological
+    order is preserved because the selection is by index over the original
+    lines, which ``switchroom doctor``'s ``$1 >= cutoff`` awk depends on.
+    """
+    log = evictions_log_path()
+    try:
+        with open(log, "a", encoding="utf-8") as f:
+            print(line, file=f)
+        # Bounded, not append-forever. `switchroom doctor` windows this by
+        # timestamp so a single legitimate eviction can't turn the row red
+        # permanently, but the FILE still needs a ceiling of its own.
+        if os.path.getsize(log) > EVICTIONS_LOG_MAX_BYTES:
+            with open(log, encoding="utf-8") as f:
+                lines = f.readlines()
+            evictions = [i for i, ln in enumerate(lines) if "evicted=" in ln]
+            others = [i for i, ln in enumerate(lines) if "evicted=" not in ln]
+            keep_idx = set(evictions[-EVICTIONS_LOG_KEEP_LINES:])
+            room = EVICTIONS_LOG_KEEP_LINES - len(keep_idx)
+            if room > 0:
+                keep_idx.update(others[-room:])
+            kept = [ln for i, ln in enumerate(lines) if i in keep_idx]
+            tmp = log + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, log)
+    except (OSError, ValueError):
+        # ValueError, not just OSError, because BOTH codec errors are
+        # ValueError subclasses and neither is an OSError (#3688 re-review
+        # B1). The rotate READS the ledger back (``readlines()`` above) —
+        # something no revision before #3688 did — so a ledger holding one
+        # non-UTF-8 byte raises ``UnicodeDecodeError`` here, and a name
+        # carrying a surrogate raises ``UnicodeEncodeError`` at the
+        # ``print`` above. Under a bare ``except OSError`` both escape this
+        # "best-effort" guard: ``_trim_dir`` → ``_log_archive_trim`` → here
+        # runs inside ``archive_reconciled``/``enqueue``, so one corrupt
+        # ledger byte would take down every drain — on the sidecar,
+        # identically, every 900s forever. A ledger that cannot be written
+        # must never take the caller down with it, and that has to include
+        # the codec.
+        pass
+
+
+def _log_archive_trim(
+    name: str, size: int, reason: str, archive: str, depth: int, nbytes: int
+) -> None:
+    """Ledger ONE archived copy shed by ``_trim_dir``.
+
+    Until #3688 review R1-M2 a trim was stderr-only: an entry could enter
+    ``pending-duplicate/`` (or ``pending-evicted/``, or
+    ``pending-reconciled/``) and then be deleted from it with no durable
+    record anywhere, while an *eviction* — the other end of the same
+    payload's life — has had ``pending-evictions.log`` since #3599. stderr
+    is gone with the process; the ledger is what an operator can still read
+    a week later. Same file, because it answers one question ("what left
+    this agent's queue, and when").
+
+    THE FIRST TOKEN IS DELIBERATELY ``trimmed=``, NOT ``evicted=``.
+    ``switchroom doctor``'s probe counts eviction ledger lines with
+    ``awk '$1 >= cutoff && /evicted=/'`` (src/cli/doctor.ts, see
+    ``buildPendingRetainsProbeScript``), and that count FAILS the
+    pending-retains row. A trim is not an eviction — nothing was shed from
+    the live queue and, for ``pending-duplicate/``, a byte-identical copy is
+    still queued — so a trim must not be able to turn that row red. No field
+    on this line may ever be formatted such that ``evicted=`` appears in it;
+    ``ArchiveTrimLedgerTest`` pins that.
+    """
+    _append_ledger(
+        "%s trimmed=%s bytes=%d archive=%s reason=archive-%s "
+        "archive_depth=%d archive_bytes=%d"
+        % (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            name,
+            size,
+            archive,
+            reason,
+            depth,
+            nbytes,
+        )
+    )
+
+
 def _trim_dir(a: str, max_entries: int, max_bytes: int) -> int:
     """Keep ``a`` under its count/byte caps, deleting OLDEST first.
 
@@ -610,6 +716,21 @@ def _trim_dir(a: str, max_entries: int, max_bytes: int) -> int:
     ``pending-evicted/`` is a different story again — see ``_evict_to_fit``:
     an entry only reaches it through the ledgered eviction path, and under
     sustained ENOSPC it may not reach it at all.
+
+    EVERY DROP IS LEDGERED, AND ONLY A DROP (#3688 review R1-M2, tightened
+    by re-review B2). One ``trimmed=… archive=…`` line per shed copy goes
+    to ``pending-evictions.log`` via ``_log_archive_trim``, so the trim
+    horizon above is observable after the fact and not only in a stderr
+    stream nobody kept. That line is deliberately NOT counted as an
+    eviction by doctor — see ``_log_archive_trim``.
+
+    A victim whose ``os.remove`` FAILS (EACCES, read-only mount) is neither
+    ledgered nor counted nor named on stderr: it is still on disk, so a
+    ``trimmed=`` line for it would be a false claim of deletion in exactly
+    the record an operator consults after suspected loss, and the returned
+    count is what callers report as "copies shed". ``TrimDirBoundaryTest``
+    pins that a failed remove yields ``0``, no ledger line, and every file
+    still present.
     """
     # `.json` ONLY, and that is load-bearing beyond "skip stray files": a
     # `.dead` marker is named `<entry>.json.dead`, so it can never be
@@ -622,14 +743,35 @@ def _trim_dir(a: str, max_entries: int, max_bytes: int) -> int:
     except OSError:
         return 0
     dropped = []
-    while names and (
-        len(names) > max_entries or _dir_bytes(a, names) > max_bytes
-    ):
+    label = os.path.basename(a.rstrip("/"))
+    nbytes = _dir_bytes(a, names)
+    while names and (len(names) > max_entries or nbytes > max_bytes):
+        reason = "count" if len(names) > max_entries else "bytes"
+        victim = names.pop(0)
+        vpath = os.path.join(a, victim)
         try:
-            os.remove(os.path.join(a, names[0]))
+            vsize = os.path.getsize(vpath)
         except OSError:
-            pass
-        dropped.append(names.pop(0))
+            vsize = 0
+        try:
+            os.remove(vpath)
+        except OSError:
+            # The copy is still on disk, so the running total would drift.
+            # Re-measure rather than assume — this preserves the original
+            # recompute-every-iteration semantics on the one path where a
+            # decrement would be wrong (EACCES / read-only mount).
+            nbytes = _dir_bytes(a, names)
+            # NOT counted and NOT ledgered (#3688 re-review B2). The ledger
+            # is the forensic record an operator reads AFTER suspected data
+            # loss; a `trimmed=` line for a copy still sitting on disk sends
+            # them hunting a payload that never left, and the returned count
+            # (and the stderr line below) would name files that were not
+            # dropped. A ledger that claims deletions which never happened
+            # is worse than no ledger.
+            continue
+        nbytes -= vsize
+        dropped.append(victim)
+        _log_archive_trim(victim, vsize, reason, label, len(names), nbytes)
     if dropped:
         shown = ", ".join(dropped[:10])
         if len(dropped) > 10:
@@ -736,6 +878,47 @@ def archive_duplicate(path: str) -> Optional[str]:
     return dest
 
 
+def _attempt_count(entry: dict) -> int:
+    """How many retries this copy has BURNED, for survivor selection.
+
+    Not ``int(entry.get("attempt_count", 1) or 1)`` (#3688 review R1-L3).
+    That expression had two defects, both latent rather than reachable
+    today — ``_build_entry`` seeds ``1`` and ``update_attempt`` only ever
+    increments — which is exactly why they need pinning rather than
+    ignoring: nothing would have caught them turning real.
+
+    * ``0 or 1`` is ``1``, so a NEVER-ATTEMPTED copy scored the same as one
+      that had already burned an attempt, and lost the tie-break to it if
+      it happened to be the newer file. That is backwards from the rule
+      ``collapse_duplicates`` documents ("the copy with the most retries
+      left before ``MAX_ATTEMPTS`` wins") — a 0 must beat a 1.
+    * ``int("many")`` RAISES. A single semantically-malformed entry — valid
+      JSON, so ``iter_entries`` hands it over rather than quarantining it —
+      took the whole collapse pass down with it, and with it (before the
+      guard in ``drain_pending._drain_backlog_impl``) the whole drain.
+      Unparseable now scores ``MAX_ATTEMPTS``: we cannot tell how many
+      attempts it has left, so it is never PREFERRED as the survivor, but
+      it is never the reason a collapse fails either. Losing it costs
+      nothing anyway — every copy in a group is byte-identical, and the
+      loser is archived, not deleted.
+
+    A missing or ``None`` count reads as ``1``, matching what
+    ``_build_entry`` writes, so an entry from an older build that predates
+    the field is treated as freshly queued rather than exhausted.
+    """
+    raw = entry.get("attempt_count", 1)
+    if raw is None:
+        return 1
+    # bool is an int subclass; True would silently score 1. Neither True nor
+    # False is an attempt count, so both take the unparseable branch.
+    if isinstance(raw, bool):
+        return MAX_ATTEMPTS
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return MAX_ATTEMPTS
+
+
 def collapse_duplicates() -> int:
     """Collapse entries sharing ``(bank_id, part_position, sha256(content))``.
 
@@ -754,7 +937,8 @@ def collapse_duplicates() -> int:
     memory; the one with the most attempts left is the one most likely to
     get there before ``MAX_ATTEMPTS`` promotes it to ``.dead``. Picking the
     oldest outright would systematically keep the most-attempted copy —
-    exactly backwards.
+    exactly backwards. ``_attempt_count`` defines "lowest", including what
+    a ``0`` and what a malformed count are worth.
 
     An entry whose key is ``None`` (no ``content``) is never grouped: its
     identity cannot be established, so it is always kept.
@@ -773,10 +957,7 @@ def collapse_duplicates() -> int:
     for key, members in groups.items():
         if len(members) < 2:
             continue
-        survivor = min(
-            members,
-            key=lambda m: (int(m[2].get("attempt_count", 1) or 1), m[0]),
-        )
+        survivor = min(members, key=lambda m: (_attempt_count(m[2]), m[0]))
         for member in members:
             if member is survivor:
                 continue
@@ -1047,23 +1228,7 @@ def _log_eviction(name: str, size: int, reason: str, depth: int, nbytes: int) ->
         depth,
         nbytes,
     )
-    log = evictions_log_path()
-    try:
-        with open(log, "a", encoding="utf-8") as f:
-            print(line, file=f)
-        # Bounded, not append-forever. `switchroom doctor` windows this by
-        # timestamp so a single legitimate eviction can't turn the row red
-        # permanently, but the FILE still needs a ceiling of its own.
-        if os.path.getsize(log) > EVICTIONS_LOG_MAX_BYTES:
-            with open(log, encoding="utf-8") as f:
-                kept = f.readlines()[-(EVICTIONS_LOG_KEEP_LINES):]
-            tmp = log + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.writelines(kept)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, log)
-    except OSError:
-        pass
+    _append_ledger(line)
     print(
         "[Hindsight] pending-retains FULL - evicted OLDEST entry to keep the "
         "newest memory: %s (%d bytes, %s; queue now %d entries / %d bytes). "
