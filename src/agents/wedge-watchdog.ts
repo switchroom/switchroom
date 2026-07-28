@@ -34,6 +34,7 @@ import {
   queryPendingPermission as defaultQueryPendingPermission,
   type PendingPermissionQueryResult,
 } from "./permission-pending-query.js";
+import { readFloodPressure, type FloodPressure } from "./flood-pressure-probe.js";
 
 /**
  * Blocking-modal footer signature. Deliberately strict: requires BOTH
@@ -355,6 +356,48 @@ const DEFAULT_MANIFEST_STALL_POLLS = 60;
 // @ 5s — a wedged permission prompt never clears on its own (no human),
 // so even a short streak is conclusive while staying clear of a transient.
 const DEFAULT_PERMISSION_PROMPT_POLLS = 3;
+// The card-LESS streak: how many consecutive polls a permission prompt must be
+// present before Esc when the gateway has affirmatively answered
+// `{ ok: true, pending: false }` ("no approval card exists for this agent").
+//
+// This is deliberately MUCH longer than DEFAULT_PERMISSION_PROMPT_POLLS,
+// because `pending: false` has two very different meanings that the answer
+// itself cannot distinguish:
+//
+//   1. genuinely card-less — the bridge is down, or the tool is
+//      `requiresUserInteraction`, so no card will EVER exist. Esc is correct.
+//   2. not card-less YET — Claude Code emitted the `permission_request`
+//      channel notification, but the gateway has not managed to POST the card
+//      to Telegram, because a 429 flood window / the edit-flood-fuse is
+//      holding it (`edit-flood-fuse deferred method=sendRichMessage
+//      key=t:<chat> class=critical`). A card IS coming. Esc is a permanent
+//      deny of a request the operator is about to approve.
+//
+// Before this split, both shared the 3-poll (~15s) gate and case 2 lost the
+// race routinely (clerk, 2026-07-28: three separate `dismissing stuck per-tool
+// permission prompt … gateway reports no pending permission` lines at 3, 3 and
+// 15 polls, interleaved with `has live card … deferring` lines for the same
+// agent minutes apart).
+//
+// 24 polls ≈ 120s @ 5s. Chosen to comfortably exceed a realistic flood-wait
+// plus card-post latency: the flood ledger's calibration data (16 days of live
+// gateway logs, `flood-429-ledger.ts`) puts EVERY benign `retry_after` at
+// ≤ 5s and classifies anything ≤ 60s as a rate nudge that `retryApiCall`
+// simply sleeps and retries — so 120s is 2x the top of the entire
+// sleep-and-succeed band, on top of which the observed edit-flood-fuse defer
+// tail for the clerk incident was ~47s. It is also still an order of magnitude
+// below the #2724 card TTL, so a genuinely wedged card-less prompt is denied
+// in ~2 minutes rather than hanging.
+const DEFAULT_PERMISSION_CARDLESS_POLLS = 24;
+// Absolute ceiling on flood-pressure suppression: once a permission prompt has
+// been present for this many consecutive polls, Esc fires even if Telegram is
+// still throttling. 120 polls ≈ 10 min @ 5s.
+//
+// Bounded patience is a hard requirement — a multi-hour flood ban (the
+// 2026-07-27 `retry_after=15908` incident) must not park a wedged turn
+// forever. At that point the card cannot realistically reach the operator in
+// time anyway, and Esc is the safe DENY.
+const DEFAULT_PERMISSION_FLOOD_MAX_POLLS = 120;
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -457,6 +500,37 @@ export interface WedgeWatchdogOptions {
    */
   permissionPromptPolls?: number;
   /**
+   * Consecutive polls a permission prompt must be PRESENT before Esc **when
+   * the gateway affirmatively reports no pending card** (`{ok:true,
+   * pending:false}`). Substantially longer than `permissionPromptPolls`
+   * because that answer cannot distinguish "no card will ever exist" from
+   * "the card has not been POSTED yet" — see
+   * `DEFAULT_PERMISSION_CARDLESS_POLLS`. Default
+   * `SWITCHROOM_WEDGE_PERMISSION_CARDLESS_POLLS` or 24 (~120s @ 5s). Clamped
+   * to at least `permissionPromptPolls`.
+   */
+  permissionCardlessPolls?: number;
+  /**
+   * Flood-pressure probe: "is Telegram currently throttling this agent's
+   * outbound path?". While it reports `active`, the permission branch does
+   * NOT send Esc — the approval card may simply be stuck behind a 429 window
+   * / the edit-flood-fuse rather than absent.
+   *
+   * Consumes the flood-ban work's existing on-disk state only
+   * (`flood-windows.json` + `429-ledger.json` via
+   * `src/agents/flood-pressure-probe.ts`); it never records anything.
+   * `undefined` (default) wires the real probe; `null` disables
+   * flood-awareness entirely (kill switch / rollback).
+   */
+  floodPressure?: ((now: number) => FloodPressure) | null;
+  /**
+   * Absolute ceiling (in consecutive present-polls) on flood-pressure
+   * suppression. Past this the prompt is Esc'd regardless of an open window,
+   * so a multi-hour ban can never park a wedged turn forever. Default
+   * `SWITCHROOM_WEDGE_PERMISSION_FLOOD_MAX_POLLS` or 120 (~10 min @ 5s).
+   */
+  permissionFloodMaxPolls?: number;
+  /**
    * Issue #2971 — card-aware gate for the permission-prompt branch. Once
    * `permissionPromptPolls` shape-persistence is reached, the watchdog calls
    * this BEFORE ever sending Esc, to ask the gateway whether a live Telegram
@@ -534,6 +608,15 @@ export interface WedgeWatchdogResult {
    *  LIVE pending-permission card, so the watchdog deferred (no Esc) rather
    *  than racing the card/TTL reaper. Disjoint from `permissionPromptFires`. */
   permissionPromptDeferrals: number;
+  /** Count of polls where Esc was withheld because Telegram was throttling
+   *  this agent's outbound path (an approval card may be en route but stuck
+   *  behind a 429 window / the edit-flood-fuse). Disjoint from
+   *  `permissionPromptFires`. */
+  permissionPromptFloodHolds: number;
+  /** Count of polls where Esc was withheld because a card-LESS gateway answer
+   *  had not yet reached the longer `permissionCardlessPolls` streak.
+   *  Disjoint from `permissionPromptFires`. */
+  permissionPromptCardlessHolds: number;
   /** #2471 — count of manifest-stall escalations (kill + handoff restart). */
   restartEscalations: number;
   /** Total polls executed (bounded only in tests via maxPolls). */
@@ -595,6 +678,25 @@ export async function runWedgeWatchdog(
   const permissionPromptPolls =
     opts.permissionPromptPolls ??
     envInt("SWITCHROOM_WEDGE_PERMISSION_POLLS", DEFAULT_PERMISSION_PROMPT_POLLS);
+  // The card-LESS branch gets its OWN, longer streak. Clamped so a
+  // mis-set env can never make the card-less path FASTER than the
+  // wedged/unreachable path it is supposed to be more patient than.
+  const permissionCardlessPolls = Math.max(
+    permissionPromptPolls,
+    opts.permissionCardlessPolls ??
+      envInt("SWITCHROOM_WEDGE_PERMISSION_CARDLESS_POLLS", DEFAULT_PERMISSION_CARDLESS_POLLS),
+  );
+  // Flood-awareness. `null` disables; `undefined` → the real on-disk probe.
+  const floodPressure =
+    opts.floodPressure === null
+      ? null
+      : (opts.floodPressure ?? ((n: number) => readFloodPressure(n)));
+  // Absolute ceiling on flood suppression — bounded patience, never infinite.
+  const permissionFloodMaxPolls = Math.max(
+    permissionCardlessPolls,
+    opts.permissionFloodMaxPolls ??
+      envInt("SWITCHROOM_WEDGE_PERMISSION_FLOOD_MAX_POLLS", DEFAULT_PERMISSION_FLOOD_MAX_POLLS),
+  );
   const manifestStallSignature =
     opts.manifestStallSignature === null
       ? null
@@ -621,6 +723,8 @@ export async function runWedgeWatchdog(
   let confirmModalFires = 0;
   let permissionPromptFires = 0;
   let permissionPromptDeferrals = 0;
+  let permissionPromptFloodHolds = 0;
+  let permissionPromptCardlessHolds = 0;
   let restartEscalations = 0;
   let polls = 0;
   // #2471 — shape-persistence counters (independent of the byte-stable
@@ -635,6 +739,10 @@ export async function runWedgeWatchdog(
   let lastManifestKey: string | null = null;
   let confirmCooldownUntil = 0;
   let permissionCooldownUntil = 0;
+  // Log throttle for the two new "holding off on Esc" paths. They are
+  // evaluated EVERY poll (deliberately — that is how we notice the moment the
+  // card lands), so their log lines must not be.
+  let lastPermissionHoldLogAt = Number.NEGATIVE_INFINITY;
 
   while (polls < maxPolls) {
     polls++;
@@ -905,33 +1013,89 @@ export async function runWedgeWatchdog(
           permissionPromptDeferrals++;
           permissionCooldownUntil = now() + cooldownMs;
         } else {
-          const reason =
-            queryPendingPermission == null
-              ? "card-aware check disabled"
-              : status && status.ok
-                ? "gateway reports no pending permission (card-less prompt)"
-                : `gateway unreachable/no answer within budget${status && !status.ok ? ` (${status.reason})` : ""}`;
-          console.error(
-            `[wedge-watchdog] ${opts.agentName}: dismissing stuck per-tool ` +
-              `permission prompt (Esc == decline == safe DENY) after ` +
-              `${permissionPromptPresent} polls present ` +
-              `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — ${reason}`,
-          );
-          // Esc ONLY — Claude Code treats Esc as "user declined", which is the
-          // safe DENY for a non-pre-approved verb. It can NEVER land on option
-          // 1/2 ("Yes" / "Yes, and don't ask again"), so the human-in-the-loop
-          // boundary for the hostd verbs is preserved. Never send Enter/numeric.
-          try {
-            send(opts.agentName, ["Escape"]);
-          } catch (err) {
-            console.error(
-              `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+          // ── Two independent gates now sit between "no live card" and Esc. ──
+          //
+          // Esc is a PERMANENT deny. Before this, the single
+          // `permissionPromptPolls` streak fed both the live-card defer path
+          // above and this one, so a card that was merely LATE (Telegram 429
+          // → the gateway's edit-flood-fuse deferring `sendRichMessage`) got
+          // the exact same ~15s of patience as a genuinely wedged card-less
+          // prompt, and lost the race. The operator then tapped Approve on a
+          // card whose prompt was already Esc-denied.
+          const held = now();
+          const pressure = floodPressure ? floodPressure(held) : null;
+          const logHold = (line: string) => {
+            if (held - lastPermissionHoldLogAt < cooldownMs) return;
+            lastPermissionHoldLogAt = held;
+            console.error(line);
+          };
+
+          // Gate 1 — Telegram is throttling this agent RIGHT NOW. Whatever the
+          // gateway just said about pending cards, a card may be queued behind
+          // the flood window / fuse, so no keystroke. Bounded by
+          // `permissionFloodMaxPolls` so a multi-hour ban cannot park a
+          // genuinely wedged turn forever.
+          const floodHold =
+            pressure?.active === true &&
+            permissionPromptPresent < permissionFloodMaxPolls;
+          // Gate 2 — the gateway affirmatively said "no card" but we have not
+          // yet waited the longer card-LESS streak. `pending: false` cannot
+          // distinguish "never will have a card" from "not posted yet".
+          const cardless = status != null && status.ok && !status.pending;
+          const cardlessHold =
+            !floodHold && cardless && permissionPromptPresent < permissionCardlessPolls;
+          if (floodHold) {
+            permissionPromptFloodHolds++;
+            logHold(
+              `[wedge-watchdog] ${opts.agentName}: permission prompt present ` +
+                `${permissionPromptPresent} polls ` +
+                `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) but ` +
+                `Telegram is flood-throttling this agent (${pressure.reason}) — ` +
+                `an approval card may be deferred, NOT sending Esc ` +
+                `(ceiling ${permissionFloodMaxPolls} polls)`,
             );
+          } else if (cardlessHold) {
+            permissionPromptCardlessHolds++;
+            logHold(
+              `[wedge-watchdog] ${opts.agentName}: gateway reports no pending ` +
+                `permission after ${permissionPromptPresent} polls ` +
+                `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — ` +
+                `holding Esc until the card-less streak of ${permissionCardlessPolls} polls ` +
+                `(~${Math.round((permissionCardlessPolls * pollIntervalMs) / 1000)}s), ` +
+                `in case the card is merely late`,
+            );
+          } else {
+            const reason =
+              queryPendingPermission == null
+                ? "card-aware check disabled"
+                : status && status.ok
+                  ? `gateway reports no pending permission (card-less prompt) for ${permissionCardlessPolls}+ polls`
+                  : `gateway unreachable/no answer within budget${status && !status.ok ? ` (${status.reason})` : ""}`;
+            const floodNote = pressure?.active
+              ? ` [flood ceiling ${permissionFloodMaxPolls} polls reached while ${pressure.reason}]`
+              : "";
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: dismissing stuck per-tool ` +
+                `permission prompt (Esc == decline == safe DENY) after ` +
+                `${permissionPromptPresent} polls present ` +
+                `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — ${reason}${floodNote}`,
+            );
+            // Esc ONLY — Claude Code treats Esc as "user declined", which is the
+            // safe DENY for a non-pre-approved verb. It can NEVER land on option
+            // 1/2 ("Yes" / "Yes, and don't ask again"), so the human-in-the-loop
+            // boundary for the hostd verbs is preserved. Never send Enter/numeric.
+            try {
+              send(opts.agentName, ["Escape"]);
+            } catch (err) {
+              console.error(
+                `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+              );
+            }
+            fires++;
+            permissionPromptFires++;
+            permissionCooldownUntil = now() + cooldownMs;
+            permissionPromptPresent = 0;
           }
-          fires++;
-          permissionPromptFires++;
-          permissionCooldownUntil = now() + cooldownMs;
-          permissionPromptPresent = 0;
         }
       }
     } else if (isConfirmModal) {
@@ -1017,6 +1181,8 @@ export async function runWedgeWatchdog(
     confirmModalFires,
     permissionPromptFires,
     permissionPromptDeferrals,
+    permissionPromptFloodHolds,
+    permissionPromptCardlessHolds,
     restartEscalations,
     polls,
     reason: "max-polls",

@@ -114,12 +114,22 @@ async function main(): Promise<void> {
   // SWITCHROOM_PERMISSION_CARD_AWARE=0 restores the old unconditional-Esc
   // behaviour (useful if this ever needs a fast rollback).
   const permissionCardAware = process.env.SWITCHROOM_PERMISSION_CARD_AWARE !== "0";
+  // Flood-aware permission gate: default ON. While Telegram is 429-throttling
+  // this agent's outbound path, an approval card the gateway has ALREADY
+  // decided to post may still be sitting behind the flood window / the
+  // edit-flood-fuse — so `{ok:true, pending:false}` does not mean "no card is
+  // coming". The watchdog reads the flood-ban work's own on-disk state
+  // (`flood-windows.json` + `429-ledger.json`) and withholds Esc while that
+  // state says the channel is throttled, up to a bounded ceiling. Kill switch
+  // SWITCHROOM_WEDGE_FLOOD_AWARE=0 restores the flood-blind behaviour.
+  const permissionFloodAware = process.env.SWITCHROOM_WEDGE_FLOOD_AWARE !== "0";
   try {
     console.error(
       `[autoaccept-poll] ${agentName}: entering wedge-watchdog (continuous)` +
         (rateLimitDetect ? " +rate-limit-detect" : " (rate-limit-detect OFF)") +
         (overageSelect ? " +overage-carveout" : "") +
-        (permissionCardAware ? " +permission-card-aware" : " (permission-card-aware OFF)"),
+        (permissionCardAware ? " +permission-card-aware" : " (permission-card-aware OFF)") +
+        (permissionFloodAware ? " +permission-flood-aware" : " (permission-flood-aware OFF)"),
     );
     // Runs until the container stops (maxPolls defaults to Infinity).
     const res = await runWedgeWatchdog({
@@ -140,9 +150,11 @@ async function main(): Promise<void> {
       // #2971 — `undefined` wires the real gateway query (default export's
       // own default); `null` disables the card-aware check entirely.
       queryPendingPermission: permissionCardAware ? undefined : null,
+      // `undefined` wires the real on-disk flood probe; `null` disables it.
+      floodPressure: permissionFloodAware ? undefined : null,
     });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} permissionPromptDeferrals=${res.permissionPromptDeferrals} restartEscalations=${res.restartEscalations}`,
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} permissionPromptDeferrals=${res.permissionPromptDeferrals} permissionPromptFloodHolds=${res.permissionPromptFloodHolds} permissionPromptCardlessHolds=${res.permissionPromptCardlessHolds} restartEscalations=${res.restartEscalations}`,
     );
   } catch (err) {
     console.error(
