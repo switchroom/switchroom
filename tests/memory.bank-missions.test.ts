@@ -12,6 +12,7 @@ import {
   SUPERSEDED_OBSERVATIONS_MISSIONS,
   decideObservationsMissionUpgrade,
   fetchBankObservationsMission,
+  type BankMissionExtras,
 } from "../src/memory/hindsight.js";
 import {
   reconcileAgent,
@@ -22,7 +23,7 @@ import {
 } from "../src/agents/scaffold.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 import { AgentMemorySchema } from "../src/config/schema.js";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -523,10 +524,174 @@ describe("SUPERSEDED_OBSERVATIONS_MISSIONS registry", () => {
     expect(SUPERSEDED_OBSERVATIONS_MISSIONS).not.toContain(DEFAULT_OBSERVATIONS_MISSION);
   });
 
-  it("carries the health-coach profile default, so those banks stay upgradable", () => {
+  it("carries the RETIRED health-coach profile default, so those banks stay upgradable", () => {
+    // The original one-line health-coach mission. It is no longer the profile
+    // default (rewritten in consolidation voice), so it must be listed here or
+    // a bank still carrying it would be mistaken for an operator hand-edit.
     expect(SUPERSEDED_OBSERVATIONS_MISSIONS).toContain(
+      "Synthesise the person's wellbeing patterns, motivations, and emotional " +
+        "context — how habits, setbacks, and encouragement connect over time.",
+    );
+    expect(SUPERSEDED_OBSERVATIONS_MISSIONS).not.toContain(
       PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission,
     );
+  });
+});
+
+/**
+ * Per-profile `observations_mission` defaults.
+ *
+ * These assert the properties that make a consolidation mission correct for its
+ * profile — not merely that some string is present. The ephemeral-override
+ * assertions are the load-bearing ones: the engine's `_DECISION_GUIDE` says
+ * "Purely ephemeral facts → omit them unless the MISSION explicitly targets
+ * such data" (`prompts.py:90`, verified 2026-07-28 against
+ * `ghcr.io/switchroom/switchroom-hindsight:v0.19.26`). For an engineering or
+ * assistant bank the operational state IS the durable knowledge, so the mission
+ * must override that rule AND ask for the date inline, since a consolidated
+ * observation is otherwise a timeless assertion. For a coaching bank the same
+ * override would be wrong, and its absence is asserted rather than assumed.
+ */
+describe("PROFILE_MEMORY_DEFAULTS observations missions", () => {
+  const profilesDir = resolve(import.meta.dirname, "../profiles");
+  const builtInProfiles = readdirSync(profilesDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && !d.name.startsWith("_"))
+    .map((d) => d.name);
+
+  it("covers every built-in profile except `default` (which takes the fleet default)", () => {
+    expect(builtInProfiles.length).toBeGreaterThan(1);
+    for (const profile of builtInProfiles) {
+      if (profile === "default") {
+        // A `default` entry would only duplicate DEFAULT_OBSERVATIONS_MISSION.
+        expect(PROFILE_MEMORY_DEFAULTS[profile]?.observations_mission).toBeUndefined();
+        continue;
+      }
+      expect(
+        PROFILE_MEMORY_DEFAULTS[profile]?.observations_mission,
+        `profile "${profile}" has no observations_mission default`,
+      ).toBeTruthy();
+    }
+  });
+
+  it("keeps every mission inside the per-batch prompt budget", () => {
+    // Rides the per-request user message of every consolidation batch,
+    // uncached. ~1700 chars ≈ 400 tokens, the order of the unconditional
+    // _PROCESSING_RULES block it sits beside.
+    for (const [profile, defaults] of Object.entries(PROFILE_MEMORY_DEFAULTS)) {
+      const mission = defaults.observations_mission;
+      if (!mission) continue;
+      expect(mission.length, `${profile} mission is ${mission.length} chars`).toBeLessThanOrEqual(
+        1700,
+      );
+    }
+  });
+
+  it("writes in consolidation terms: every mission steers observation granularity", () => {
+    // The engine delegates aggregation to the mission, so a mission that only
+    // lists topics leaves the most consequential knob unset.
+    for (const [profile, defaults] of Object.entries(PROFILE_MEMORY_DEFAULTS)) {
+      const mission = defaults.observations_mission;
+      if (!mission) continue;
+      expect(mission, `${profile} mission says nothing about granularity`).toMatch(
+        /Granularity: one observation per/,
+      );
+      expect(mission, `${profile} mission says nothing about aggregating`).toMatch(/[Aa]ggregate/);
+    }
+  });
+
+  it("overrides the engine's ephemeral-omit rule ONLY where operational state is the knowledge", () => {
+    for (const profile of ["coding", "executive-assistant"]) {
+      const mission = PROFILE_MEMORY_DEFAULTS[profile].observations_mission!;
+      expect(mission, `${profile} must override the ephemeral-omit rule`).toMatch(
+        /IS durable knowledge here, not ephemeral chatter/,
+      );
+      expect(mission, `${profile} must say not to drop it as ephemeral`).toMatch(
+        /[Dd]o not drop (them|it) as ephemeral/,
+      );
+      // Consolidated observations are timeless assertions; without an inline
+      // date a later reader cannot judge staleness.
+      expect(mission, `${profile} must ask for the date inline`).toMatch(
+        /embed the date inside the observation text/,
+      );
+    }
+
+    // A single day's reading genuinely IS ephemeral for a coaching bank — the
+    // durable unit is the pattern. Carrying the ops override here would be the
+    // one-size-fits-all failure this per-profile split exists to avoid.
+    const coach = PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission!;
+    expect(coach).not.toMatch(/not ephemeral chatter/);
+    expect(coach).not.toMatch(/[Dd]o not drop (them|it) as ephemeral/);
+    expect(coach).toMatch(/is evidence, not an observation/);
+  });
+
+  it("never contradicts the PROCESSING RULES it outranks (says nothing about merge-vs-create)", () => {
+    // The MISSION takes priority over the PROCESSING RULES, so a mission that
+    // opined on UPDATE-vs-CREATE could silently disable the engine's dedup.
+    for (const [profile, defaults] of Object.entries(PROFILE_MEMORY_DEFAULTS)) {
+      const mission = defaults.observations_mission;
+      if (!mission) continue;
+      expect(mission, `${profile} mission touches merge mechanics`).not.toMatch(
+        /\bUPDATE\b|\bCREATE\b|\bDELETE\b/,
+      );
+    }
+  });
+});
+
+/**
+ * Never-clobber, across profiles.
+ *
+ * The four live banks carrying hand-authored observations missions (verified
+ * 2026-07-28 via `GET /v1/default/banks/<id>/config`: 1691, 1667, 1594 and
+ * 1565 chars) are why this matters — shipping profile defaults must not put a
+ * single one of them at risk. The fixture reproduces their shape.
+ */
+describe("observations_mission never-clobber under profile defaults", () => {
+  const HAND_AUTHORED =
+    "You consolidate the memory of an agent working directly with the operator.\n\n" +
+    "Retain durably:\n- Fleet and infrastructure state, and WHY each is set as it is.\n" +
+    "- Investigations and their findings, including negative results.\n";
+
+  it("leaves an operator hand-authored mission alone under EVERY profile default", () => {
+    for (const defaults of [...Object.values(PROFILE_MEMORY_DEFAULTS), {} as BankMissionExtras]) {
+      expect(
+        decideObservationsMissionUpgrade(undefined, defaults.observations_mission, HAND_AUTHORED),
+      ).toEqual({ action: "none" });
+    }
+  });
+
+  it("upgrades an UNSET bank to its profile mission, not the fleet default", () => {
+    for (const [profile, defaults] of Object.entries(PROFILE_MEMORY_DEFAULTS)) {
+      const mission = defaults.observations_mission;
+      if (!mission) continue;
+      expect(decideObservationsMissionUpgrade(undefined, mission, null), profile).toEqual({
+        action: "upgrade",
+        mission,
+      });
+    }
+  });
+
+  it("frees a bank left holding another profile's mission after an `extends` change", () => {
+    // Ordering hazard, mirrored from the generic-default case: an agent moved
+    // OFF `extends: coding` still carries the coding mission. That is
+    // switchroom-authored text, so it must stay upgradable rather than freezing
+    // there forever as if a human had written it.
+    const coding = PROFILE_MEMORY_DEFAULTS.coding.observations_mission!;
+    expect(decideObservationsMissionUpgrade(undefined, undefined, coding)).toEqual({
+      action: "upgrade",
+      mission: DEFAULT_OBSERVATIONS_MISSION,
+    });
+    const coach = PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission!;
+    expect(decideObservationsMissionUpgrade(undefined, coach, coding)).toEqual({
+      action: "upgrade",
+      mission: coach,
+    });
+  });
+
+  it("is a no-op once a profiled bank already carries its own profile mission", () => {
+    const coding = PROFILE_MEMORY_DEFAULTS.coding.observations_mission!;
+    expect(decideObservationsMissionUpgrade(undefined, coding, coding)).toEqual({
+      action: "none",
+    });
   });
 });
 
@@ -830,6 +995,39 @@ describe("scaffoldAgent — observations_mission seed", () => {
     expect((args.config_updates as Record<string, unknown>).observations_mission).toBe(
       "operator obs text",
     );
+  }, 15_000);
+
+  // The outcome the per-profile defaults exist for: a bank on a profile that
+  // HAS an observations default must end up carrying that profile's mission on
+  // the wire, not the generic fleet default. Verified to bite by deleting
+  // `observations_mission` from PROFILE_MEMORY_DEFAULTS.coding — the received
+  // value falls back to DEFAULT_OBSERVATIONS_MISSION and this fails.
+  it("seeds the PROFILE mission onto a profiled agent's bank", async () => {
+    const config = makeAgentConfig({ extends: "coding" });
+    const args = await runScaffold(null, config);
+    expect((args.config_updates as Record<string, unknown>).observations_mission).toBe(
+      PROFILE_MEMORY_DEFAULTS.coding.observations_mission,
+    );
+  }, 15_000);
+
+  it("upgrades a profiled agent's bank off the generic fleet default", async () => {
+    const config = makeAgentConfig({ extends: "executive-assistant" });
+    const args = await runScaffold(DEFAULT_OBSERVATIONS_MISSION, config);
+    expect((args.config_updates as Record<string, unknown>).observations_mission).toBe(
+      PROFILE_MEMORY_DEFAULTS["executive-assistant"].observations_mission,
+    );
+  }, 15_000);
+
+  it("still leaves a hand-authored mission alone on a PROFILED agent", async () => {
+    const config = makeAgentConfig({ extends: "health-coach" });
+    const calls: Record<string, unknown>[] = [];
+    runScaffold("You consolidate the memory of a coach. Retain durably: …", config, calls);
+    await flushPendingBankOps(10_000);
+    expect(
+      calls.some(
+        (c) => (c.config_updates as Record<string, unknown> | undefined)?.observations_mission,
+      ),
+    ).toBe(false);
   }, 15_000);
 });
 

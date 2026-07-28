@@ -8,7 +8,12 @@ import {
   recentUnextracted,
   ageDays,
 } from "../src/memory/bank-health.js";
-import { checkBankIngestHealth } from "../src/cli/doctor.js";
+import { checkBankIngestHealth, checkBankObservationsMissions } from "../src/cli/doctor.js";
+import {
+  DEFAULT_OBSERVATIONS_MISSION,
+  SUPERSEDED_OBSERVATIONS_MISSIONS,
+  PROFILE_MEMORY_DEFAULTS,
+} from "../src/memory/hindsight.js";
 import { handleGetMemoryHealth } from "../src/web/api.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
 
@@ -557,5 +562,140 @@ describe("handleGetMemoryHealth (dashboard)", () => {
     });
     expect(health.reachable).toBe(false);
     expect(health.banks).toEqual([]);
+  });
+});
+
+/**
+ * `observations_mission` doctor row.
+ *
+ * Why a LIVE-read check rather than a yaml one: `observations_mission` is
+ * pushed by scaffold/reconcile and is never set in yaml on a default setup, so
+ * a yaml-shaped check is structurally incapable of seeing the failure. The
+ * failure it must see was measured on 2026-07-28 — all 27 live banks read
+ * `observations_mission: null`, i.e. the whole fleet consolidating under
+ * Hindsight's stock mission, with every other memory row green.
+ */
+describe("checkBankObservationsMissions (doctor)", () => {
+  /** Serves GET /v1/default/banks/<id>/config from a per-bank fixture. */
+  function fakeConfigFetch(
+    banks: Record<string, { observations_mission?: string | null; failWith?: number }>,
+  ): typeof fetch {
+    return (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const m = url.match(/\/v1\/default\/banks\/([^/?]+)\/config/);
+      if (!m) return new Response("not found", { status: 404 });
+      const fixture = banks[decodeURIComponent(m[1])];
+      if (!fixture) return new Response("no bank", { status: 404 });
+      if (fixture.failWith) return new Response("err", { status: fixture.failWith });
+      return new Response(
+        JSON.stringify({
+          config: { retain_mission: null, observations_mission: fixture.observations_mission ?? null },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+  }
+
+  it("WARNS on the measured fleet state — an unset mission means the engine's stock mission", async () => {
+    const results = await checkBankObservationsMissions(
+      minimalConfig({ ziggy: {} }),
+      "http://x/mcp/",
+      { fetchImpl: fakeConfigFetch({ ziggy: { observations_mission: null } }) },
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].name).toBe("bank ziggy observations_mission");
+    expect(results[0].status).toBe("warn");
+    expect(results[0].detail).toContain("unset");
+    expect(results[0].fix).toBe("Run: switchroom agent reconcile ziggy");
+  });
+
+  it("passes a bank carrying the current fleet default", async () => {
+    const results = await checkBankObservationsMissions(
+      minimalConfig({ ziggy: {} }),
+      "http://x/mcp/",
+      {
+        fetchImpl: fakeConfigFetch({
+          ziggy: { observations_mission: DEFAULT_OBSERVATIONS_MISSION },
+        }),
+      },
+    );
+    expect(results[0].status).toBe("ok");
+    expect(results[0].detail).toBe("switchroom fleet default");
+  });
+
+  it("passes an operator hand-authored mission — the never-clobber rule is not a defect", async () => {
+    const results = await checkBankObservationsMissions(
+      minimalConfig({ overlord: {} }),
+      "http://x/mcp/",
+      {
+        fetchImpl: fakeConfigFetch({
+          overlord: { observations_mission: "You consolidate the memory of overlord…" },
+        }),
+      },
+    );
+    expect(results[0].status).toBe("ok");
+    expect(results[0].detail).toContain("operator-authored");
+  });
+
+  it("warns that a superseded switchroom default is waiting on reconcile", async () => {
+    const results = await checkBankObservationsMissions(
+      minimalConfig({ gymbro: {} }),
+      "http://x/mcp/",
+      {
+        fetchImpl: fakeConfigFetch({
+          gymbro: { observations_mission: SUPERSEDED_OBSERVATIONS_MISSIONS[0] },
+        }),
+      },
+    );
+    expect(results[0].status).toBe("warn");
+    expect(results[0].detail).toContain("superseded");
+    expect(results[0].fix).toContain("reconcile gymbro");
+  });
+
+  it("reads the profile default for a profiled agent, and passes when the bank matches", async () => {
+    const config = {
+      memory: { backend: "hindsight", config: { url: "http://x/mcp/" } },
+      agents: { dev: { extends: "coding" } },
+    } as unknown as SwitchroomConfig;
+    const coding = PROFILE_MEMORY_DEFAULTS.coding.observations_mission!;
+
+    const matching = await checkBankObservationsMissions(config, "http://x/mcp/", {
+      fetchImpl: fakeConfigFetch({ dev: { observations_mission: coding } }),
+    });
+    expect(matching[0].status).toBe("ok");
+    expect(matching[0].detail).toBe("switchroom coding-profile default");
+
+    // The generic fleet default on a coding bank is an UPGRADE pending, not ok.
+    const generic = await checkBankObservationsMissions(config, "http://x/mcp/", {
+      fetchImpl: fakeConfigFetch({ dev: { observations_mission: DEFAULT_OBSERVATIONS_MISSION } }),
+    });
+    expect(generic[0].status).toBe("warn");
+  });
+
+  it("reports a failed read as unknown, never as unset", async () => {
+    const results = await checkBankObservationsMissions(
+      minimalConfig({ ziggy: {} }),
+      "http://x/mcp/",
+      { fetchImpl: fakeConfigFetch({ ziggy: { failWith: 503 } }) },
+    );
+    expect(results[0].status).toBe("warn");
+    expect(results[0].detail).toContain("could not read");
+    expect(results[0].detail).not.toContain("unset");
+    // No remediation: reconciling does not fix an unreachable backend, and the
+    // push path refuses to treat a failed read as upgradable either.
+    expect(results[0].fix).toBeUndefined();
+  });
+
+  it("dedupes agents sharing one bank and labels them", async () => {
+    const results = await checkBankObservationsMissions(
+      minimalConfig({
+        clerk: { memory: { collection: "assistant" } },
+        helper: { memory: { collection: "assistant" } },
+      }),
+      "http://x/mcp/",
+      { fetchImpl: fakeConfigFetch({ assistant: { observations_mission: null } }) },
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].name).toBe("bank assistant observations_mission (clerk, helper)");
   });
 });
