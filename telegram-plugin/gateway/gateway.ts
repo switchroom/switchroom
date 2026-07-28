@@ -14742,6 +14742,11 @@ export async function handleInbound(
   // dedups with the boot sweep and with a prior drain of the same target; the
   // rights precheck and rate gates apply as usual, and a non-forum supergroup
   // is skipped. No-op until the startup mutex is won. Fire-and-forget.
+  //
+  // This runs on EVERY inbound; `sweepTarget` is at-most-once per target per
+  // process (and coalesces concurrent callers), so a busy chat cannot
+  // re-attempt a partial drain once per message. That guard lives in the
+  // sweeper, not here, so the boot caller inherits it too.
   {
     const inboundChatId = ctx.chat?.id
     if (inboundChatId != null) {

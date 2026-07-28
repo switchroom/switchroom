@@ -504,6 +504,48 @@ describe('stale-pin sweep — eligibility and durable resume', () => {
     expect(final?.attempts).toBe(2)
   })
 
+  it('attempts a target AT MOST ONCE per process, however often it is called', async () => {
+    // The lazy first-inbound caller fires on EVERY inbound. A target whose
+    // drain did not finish must not be re-attempted per message: that burns the
+    // 8-boot attempt budget in 8 messages and hammers the flood ledger.
+    const h = harness({ stack: [261, 262, 263], unpinIsSilentNoop: true })
+    const sweeper = createStalePinSweeper(h.deps)
+
+    const first = await sweeper.sweepTarget({ chatId: DM })
+    expect(first.status).toBe('incomplete')
+    const callsAfterFirst = h.fake.calls.length
+
+    for (let i = 0; i < 12; i++) {
+      expect((await sweeper.sweepTarget({ chatId: DM })).status).toBe('already-attempted')
+    }
+    expect(h.fake.calls.length).toBe(callsAfterFirst) // zero further API traffic
+    expect(h.cursors().find((c) => c.chatId === DM)?.attempts).toBe(1)
+  })
+
+  it('coalesces concurrent callers for the same target onto one drain', async () => {
+    const h = harness({ stack: [271, 272] })
+    const sweeper = createStalePinSweeper(h.deps)
+    const [a, b] = await Promise.all([
+      sweeper.sweepTarget({ chatId: DM }),
+      sweeper.sweepTarget({ chatId: DM }),
+    ])
+    expect(a).toBe(b) // literally the same promise result
+    expect(h.fake.calls.filter((c) => c.startsWith('pin:'))).toHaveLength(2)
+  })
+
+  it('an ineligible call does not consume the one allowed attempt', async () => {
+    // The lazy first-inbound path can fire before the startup mutex is won; the
+    // boot sweep must still get its turn afterwards.
+    let eligible = false
+    const h = harness({ stack: [281] })
+    h.deps.eligible = () => eligible
+    const sweeper = createStalePinSweeper(h.deps)
+
+    expect((await sweeper.sweepTarget({ chatId: DM })).status).toBe('skipped-not-eligible')
+    eligible = true
+    expect((await sweeper.sweepTarget({ chatId: DM })).status).toBe('drained')
+  })
+
   it('does not re-drain a discharged obligation', async () => {
     const h = harness({ stack: [201] })
     upsertSweepCursor(h.path, h.fs, {

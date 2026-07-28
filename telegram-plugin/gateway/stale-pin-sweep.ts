@@ -406,6 +406,12 @@ export type SweepStatus =
   | 'skipped-supergroup-manual'
   /** Already discharged in a previous boot / earlier in this one. */
   | 'already-drained'
+  /**
+   * This process already attempted this target. NOT an error: a re-attempt in
+   * the same process reads the same state through the same gates and can only
+   * burn the attempt budget and the flood ledger.
+   */
+  | 'already-attempted'
   /** Attempt budget exhausted (SWEEP_MAX_ATTEMPTS boots). Never retried. */
   | 'forfeited'
   /** Hit the per-chat pop cap or the per-minute budget. Cursor persisted. */
@@ -469,7 +475,15 @@ export interface StalePinSweepDeps {
 }
 
 export interface StalePinSweeper {
-  /** Sweep one `(chat, thread)` target to completion or to a gate. */
+  /**
+   * Sweep one `(chat, thread)` target to completion or to a gate.
+   *
+   * AT MOST ONCE PER TARGET PER PROCESS. The lazy first-inbound caller fires on
+   * every inbound message, so without this a busy chat whose drain did not
+   * finish would re-attempt on every message — burning the 8-boot attempt
+   * budget in 8 messages and running overlapping drains against the same chat.
+   * Concurrent callers for the same target share the in-flight promise.
+   */
   sweepTarget: (target: SweepTarget) => Promise<SweepResult>
   /** True once the breaker tripped — every later target short-circuits. */
   isCircuitOpen: () => boolean
@@ -769,7 +783,7 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
     return { status: 'drained', popped: 1, detail: 'topic drained; chat-wide stack may hold other topics' }
   }
 
-  const sweepTarget = async (target: SweepTarget): Promise<SweepResult> => {
+  const sweepOnce = async (target: SweepTarget): Promise<SweepResult> => {
     if (!deps.eligible()) return { status: 'skipped-not-eligible', popped: 0 }
     if (circuitOpen) {
       return { status: 'aborted-circuit-breaker', popped: 0, detail: 'breaker already open' }
@@ -868,6 +882,25 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
         `\n`,
     )
     return result
+  }
+
+  // At-most-once-per-process, plus in-flight coalescing. See StalePinSweeper.
+  const attempted = new Set<string>()
+  const inFlight = new Map<string, Promise<SweepResult>>()
+
+  const sweepTarget = (target: SweepTarget): Promise<SweepResult> => {
+    const key = sweepTargetKey(target.chatId, target.threadId)
+    const running = inFlight.get(key)
+    if (running != null) return running
+    // Not eligible yet ⇒ nothing was attempted, so do NOT consume the one
+    // allowed attempt: the boot sweep must still get its turn once the mutex
+    // is won.
+    if (!deps.eligible()) return Promise.resolve({ status: 'skipped-not-eligible', popped: 0 })
+    if (attempted.has(key)) return Promise.resolve({ status: 'already-attempted', popped: 0 })
+    attempted.add(key)
+    const p = sweepOnce(target).finally(() => inFlight.delete(key))
+    inFlight.set(key, p)
+    return p
   }
 
   return { sweepTarget, isCircuitOpen: () => circuitOpen }

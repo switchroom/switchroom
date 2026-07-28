@@ -122,21 +122,22 @@ export function createGatewayStalePinSweeper(w: StalePinSweepWiring): StalePinSw
       })) as { pinned_message?: { message_id?: number } } | undefined
       return chat?.pinned_message?.message_id ?? null
     },
+    // The RE-PIN half of the only sequence that actually pops a stack entry (a
+    // bare unpin on a stale entry is a silent no-op). An orphan pin has no
+    // claim to reconcile through, so the unified path cannot express it.
     pinSilent: (chatId, messageId) =>
       call(
-        () =>
-          // allow-raw-pin: the RE-PIN half of the only sequence that actually
-          // pops a stack entry (a bare unpin on a stale entry is a silent
-          // no-op). An orphan pin has no claim to reconcile through.
-          // allow-raw-bot-api: already inside the gateway's robustApiCall envelope.
-          bot().api.pinChatMessage(chatId, messageId, { disable_notification: true }),
+        // allow-raw-pin: orphan repin — see above. allow-raw-bot-api: already
+        // inside the gateway's robustApiCall envelope.
+        () => bot().api.pinChatMessage(chatId, messageId, { disable_notification: true }),
         { chat_id: chatId, verb: 'stale-pin-sweep.repin' },
       ),
+    // The UNPIN half of the pop. Its result is deliberately ignored — ok:true
+    // proves nothing; progress is read back from getChat.
     unpin: (chatId, messageId) =>
       call(
-        // allow-raw-pin: the UNPIN half of the pop. Its result is deliberately
-        // ignored — ok:true proves nothing; progress is read back from getChat.
-        // allow-raw-bot-api: already inside the gateway's robustApiCall envelope.
+        // allow-raw-pin: orphan unpin — see above. allow-raw-bot-api: already
+        // inside the gateway's robustApiCall envelope.
         () => bot().api.unpinChatMessage(chatId, messageId),
         { chat_id: chatId, verb: 'stale-pin-sweep.unpin' },
       ),
