@@ -1,5 +1,220 @@
 # Changelog
 
+## v0.19.31 — a surface that reports success it did not achieve is worse than no surface
+
+Ten changes, one recurring shape: a cleanup, a roll, a log line or a card that
+reported the happy path while the thing it was reporting on had not happened.
+Each is closed by concluding from **observed state**, not from a return value.
+
+### The boot pin cleanup swept nothing and logged a clean sweep every time
+
+A Telegram chat holds a **stack** of pinned messages. `getChat().pinned_message`
+exposes only the top, there is no list-pins method, and — verified live on the
+fleet — a bare `unpinChatMessage` against a stale entry is a **silent no-op that
+returns `{"ok":true}`**. The control proves the response carries no information:
+unpinning a never-pinned message returns `ok:true` too. So boot cleanup logged a
+clean sweep every boot while the stack grew without bound: **37 orphaned pins
+across 5 agents, 21 of them in one chat.**
+
+`gateway/stale-pin-sweep.ts` is now the one sweep path, owning eligibility, the
+rights precheck, the rate gates, the circuit breaker, the cursor and the
+verification, and branching on chat class only for the drain *primitive* (DM:
+re-pin then unpin, the only sequence that actually pops an entry; forum topic:
+one `unpinAllForumTopicMessages`, never looped; non-forum supergroup: not swept
+unattended). Drain progress is concluded **only from two agreeing `getChat`
+reads 1.8s apart** — never from an API result. A durable per-(chat, thread)
+obligation ledger means a restart mid-drain resumes rather than forgetting, and
+`status-pins.json` v4 persists `threadId` so a boot after a crash knows which
+topic to aim a topic-scoped drain at. The old `dm-pin-sweep.ts`, whose entire
+mechanism was one `unpinAllChatMessages` per DM per boot, is deleted — it pegged
+`429 retry_after:3` with zero progress.
+
+### Every Telegram rejection was logged `status=ok`
+
+grammY resolves its API transformer chain with the raw `ApiResponse` and only
+converts `{ok:false}` into a thrown `GrammyError` *after* the chain returns
+(grammy 1.44.0, `core/client.js` `callApi`). So every Telegram-level rejection —
+429 flood-wait, 400, 403 — reached `installTgPostLogger` as a **resolved** value
+and was logged `status=ok err=- code=- desc=-`. Only transport `HttpError`s ever
+reached the `catch` that logs `status=err`. Wire evidence from one agent's
+gateway log, the same call 3ms apart:
+
+```
+tg-post method=unpinAllChatMessages ... status=ok err=- code=- desc=-
+telegram gateway: 429 rate limited, waiting 3s
+```
+
+The logger now inspects the resolved body and reports
+`status=err err=telegram_<code> code=<code> desc=<description>`. To avoid
+trading a false-success log for a false-failure one, the narrow set of benign
+400s the retry policy already swallows gets its own `status=benign` tier —
+and the description list is not duplicated, `classifyBenignTelegram400` is
+extracted so there is exactly one.
+
+### A rollout that left two components behind still exited 0
+
+`switchroom rollout` rolled the fleet to v0.19.30 and exited **0** while
+`switchroom-web` and `switchroom-hindsight-autoheal` sat on v0.19.26 — and
+`switchroom update --check`, reading the same host, correctly named both as
+targets. Two commands, two derivations of "what is in scope", and a third
+private copy inside `doctor`'s remediation ladder.
+
+`src/cli/component-scope.ts` is now the single source of truth for which
+mechanism owns a component and what command converges it. Classification is
+keyed on the **image repo, never a container-name allowlist** — that is exactly
+how `switchroom-hindsight-autoheal` (which runs the hostd *image*) escaped every
+previous scope check. `doctor` calls `remediationFor()` instead of its private
+ladder, so the two commands can no longer name different fixes for the same
+component.
+
+Every rollout plan now ends with a `verify-components` step that re-reads the
+same inventory `update --check` uses and returns `ok:false` /
+`failedStep: "verify-components"` / `drifted[]` if anything this roll was
+answerable for is still behind. It deliberately runs **after** `commitPin` and
+does not go through `fail()`: the agents did reach the target and the durable pin
+is correct, so reverting it would turn "one singleton is stale" into a fleet-wide
+downgrade on the next reconcile. Nothing needs rolling back; a named component
+needs finishing forward. Scope comes from the plan's own steps, so `--agents`
+is not blamed for agents nobody asked it to roll, and `--skip-web` exempts but
+still reports what it skipped.
+
+### Deliberate edit-flood drops were counted as turn failures
+
+`edit-flood-fuse.ts` is a grammY transformer, so its return contract is the raw
+`ApiResponse` **envelope**. `DROPPED_RESULT` was the bare `true` — the *result*,
+envelope omitted — and `(true).ok` is `undefined`, so **every deliberate fuse
+drop** took grammY's `else` branch and was raised as
+`GrammyError: Call to 'editMessageText' failed! (undefined: undefined)`. The
+activity-summary drain caught it, found nothing matching in its transport
+allowlist, and incremented `turn.activityDrainFailures` — the counter that flags
+a turn DEGRADED at turn-end. A healthy turn whose progress card was correctly
+rate-limited was reported as broken (observed `failures=8` on a single turn).
+
+`DROPPED_RESULT` is now `{ok:true, result:true}`, so a dropped call resolves as
+the benign no-op the file's own docblock already promised, and `isTransport`
+needs no new entry because nothing is thrown. Separately, `awaitRoom`'s
+`dropGuard` — "only drop while something newer for this message is still in
+flight to repaint it" — was wired into the two per-chat tiers only; the
+per-message tier passed `undefined`, read as "drop unconditionally at the
+deadline", so a lone terminal `finalize` was droppable there regardless of
+priority class, freezing the card on "→ in-progress". It now late-releases.
+
+### Two new standing signals in `switchroom doctor`
+
+**Untracked LiteLLM boots.** All agent traffic is meant to ride the LiteLLM
+proxy; `start.sh` breaks that on purpose in one place — when the per-agent
+virtual key cannot be fetched from the vault it strips the routing env and boots
+direct against Anthropic, untracked, rather than refusing to start. That trade is
+right, but it is only safe if the operator finds out, and both existing signals
+expire: the `>&2` banner goes to a rotating container log, and the
+`.routing-mode` divergence line is relayed once per pair, so a persistently
+degraded agent goes quiet after its first alert. A new `LiteLLM boot routing`
+section reads the per-boot `.routing-mode` record `start.sh` already writes and
+**warns** when a declared LiteLLM mode landed on `direct-oauth` — warn, not fail,
+because the condition is a deliberate availability trade and a non-zero exit for
+a consciously accepted state is how an exit code gets trained into noise. An
+unreadable or malformed record warns too: "cannot see the evidence" must never
+render identically to "verified healthy". The fail-open message is now actionable
+in all three emitters, and says the decisive part — the strip is a boot-time
+decision that is never re-evaluated, so provisioning the key without a restart
+changes nothing.
+
+**Hindsight observation-scope saturation.** A scope at its cap is a silent
+production failure: the consolidator does not stop, it recalls, spends a full
+extraction-model call, then tells the model it may only issue updates and
+deletes. The only signal was a `logger.info` with no metric attached. On this
+fleet a scope sat at 1009/1000 and was found only because a human ran
+`docker logs`. The new row warns above 80% of the cap and fails at or above it,
+naming the bank, the scope and the real numbers. It counts the way the **engine**
+counts — by tag *containment*, not the exact-set match `GET /observations/scopes`
+reports, and the difference is not academic: one agent's worst scope reads 792
+exact (below the warn line) against an engine-visible 1413. `/stats` is fetched
+only for a bank that already has a saturated scope, so a healthy fleet pays
+nothing for it. Banks carrying `observation_scope_limits`, banks with
+observations disabled, and the untagged global scope are deliberately not judged;
+unreachable banks are reported, never failed.
+
+### Crash-recovery state now survives a power cut, not just a container death
+
+The turn registry, the inbound spool, the obligation snapshot and the handoff
+sidecars were all written **atomically but not durably**. Each survives SIGKILL,
+OOM or a rollout recreate because the kernel still holds the page cache; none
+reliably survives the host losing power — which is the case they exist for. The
+record that says "a turn was in flight" can be the exact thing that is lost.
+
+Four sites, one class: the registry's WAL moves to `synchronous = FULL` (NORMAL
+syncs at checkpoint, so a power cut can drop the last commits including a whole
+turn row); the inbound spool fsyncs per record and latches its existing
+`degraded` health signal on a failing fsync; the obligation store and the handoff
+summarizer follow the full write tmp → fsync(tmp) → rename → fsync(dir)
+sequence, because `rename(2)` orders the metadata but does not put the data on
+the platter. No behaviour change. Cost was measured, not assumed — 3000
+autocommits on this fleet's NVMe volume: NORMAL ~91,500 commits/s, FULL ~1,150
+commits/s, against a production steady state of ~330 commits/day and a ~4
+commits/s peak during worker fan-out.
+
+### A boot beacon, so the next boot can tell why we died
+
+Every open turn that is not classified as a hang is blanket-stamped
+`ended_via='restart'`, so an OOM kill, a bare SIGKILL, an operator restart and a
+host power loss are indistinguishable — and the user gets told "the
+hang-watchdog killed it" for what was actually a power cut. The gateway now
+writes `<STATE_DIR>/gateway-beacon.json` every 5s, riding the existing
+approval-poll interval rather than adding a timer, plus one immediate write at
+attach so a gateway that dies inside the first interval still leaves a record.
+This is deliberately **write-only** — nothing reads the beacon yet, so the change
+carries zero behaviour risk and can be verified on its own. Every `/proc` and
+cgroup read is individually guarded and every field independently optional: this
+runs in every agent in the fleet, so it must never throw into the tick.
+
+### The 🤖 agent card now closes like the 🛠 worker card
+
+#3844 unified the card *body*; what stayed forked was the terminal result
+footer, whose derivation — clean the summary, pick ✅ vs ⚠️ from the state, omit
+on empty, never emit one for `incomplete` — lived inline in `renderWorkerActivity`
+and was unreachable from the agent surface. `deriveCardResult(state, summary)` is
+now the one derivation, `renderActivityFeed` and `renderActivityFeedWithNested`
+funnel through one private `renderAgentCard` (they previously carried two
+byte-copies of the same header literal), and the gateway's narrative lane
+supplies the answer the turn actually delivered on final renders only. No reply
+text, no block — nothing is fabricated. `deriveCardResult` also runs `redact()`:
+status cards go out via `sendRichMessage` and bypass the outbound redact
+chokepoint, and the agent summary is pre-redaction reply text, so without this
+the change would have opened a new leak surface.
+
+### Memory docs corrected, and template skill references are now pinned by a test
+
+`docs/cli-reference.md` was missing four shipped `switchroom memory` verbs —
+`recall-log`, `demote`, `profile add|list` and `docker-compose` — so the tail of
+what auto-recall actually injected per turn, and the way to drop one memory out
+of auto-recall while leaving it queryable, were undocumented. `docs/configuration.md`
+described Hindsight's observation-scope default as "a scope **per tag**"; the
+engine default is **`combined`** — one consolidation pass over all the tags on
+the retain together. Switchroom stamps exactly one tag per retain
+(`retainTags: ["{session_id}"]`), and because a session id never repeats, each
+session creates a fresh observation rather than growing an existing one. The
+observed symptom (parallel silos in a shared bank) was right; the stated
+mechanism was not.
+
+The third reported defect — a profile template naming a `mental-model-curator`
+skill that "does not exist in any tier" — was a **misdiagnosis**, and neither
+proposed fix was applied. The skill ships (`skills/mental-model-curator/SKILL.md`),
+is a declared builtin default, is packaged, and is pinned live by an existing
+test; the reporting host's bundled-skill pool was simply stale. Authoring it
+would have been a no-op and deleting the references would have been an active
+regression, removing the only documented remedy for `MAX_DIRECTIVES=30`
+truncation from a template while four other surfaces kept pointing at it.
+
+What landed instead closes the class. `tests/profile-template-skill-references.test.ts`
+requires every skill named in `profiles/**/*.hbs` to both **ship**
+(`skills/<name>/SKILL.md` exists in the package) and **be installed** (be in
+`getBuiltinDefaultSkillEntries()`, which is what symlinks it into the agent's
+`.claude/skills/`) — a template renders for every agent using that profile, so
+naming an on-demand or foreman-only skill leaves most agents with a dead
+instruction. It carries an anti-vacuity ratchet: an extractor that silently
+stops matching would otherwise pass on an empty set and take the whole guard
+quiet with it.
+
 ## v0.19.30 — `switchroom update` updates every component, including the CLI running it
 
 ### The host CLI now updates itself, and it goes first
