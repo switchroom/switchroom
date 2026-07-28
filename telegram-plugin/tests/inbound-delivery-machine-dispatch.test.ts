@@ -245,6 +245,8 @@ describe('dispatchEffects — inbound-routing effects (PR3c wiring)', () => {
       },
       existsSync: (p: string) => files.has(p),
       statSizeSync: (p: string) => Buffer.byteLength(files.get(p) ?? ''),
+      fsyncFileSync: () => {},
+      fsyncDirSync: () => {},
     }
     const spool = createInboundSpool({ path: spoolPath, fs, log: () => {} })
     const buffer = createPendingInboundBuffer({ spool, log: () => {} })

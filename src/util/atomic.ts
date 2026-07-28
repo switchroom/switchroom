@@ -130,6 +130,45 @@ export function atomicWriteFileSync(
   }
 }
 
+/**
+ * fsync whatever inode lives at `path` — a file OR a directory.
+ *
+ * Two distinct durability jobs need this, and both are real:
+ *
+ *   - **File**: `writeFileSync`/`appendFileSync` return once the bytes are in
+ *     the page cache. They are NOT on stable storage, so a host power cut
+ *     loses them even though every syscall succeeded. fsync is the barrier.
+ *   - **Directory**: `rename(2)` is atomic — a crash leaves either the old or
+ *     the new file, never a torn one — but atomicity is an *ordering*
+ *     guarantee, not a durability one. The new directory entry itself lives
+ *     in the parent directory's own (also cached) metadata, so after a power
+ *     cut the rename can be missing entirely. fsync'ing the parent directory
+ *     is what makes the rename survive.
+ *
+ * Hence the standard tmp+rename durability sequence, which callers must
+ * follow in this order: write tmp → fsync(tmp) → rename(tmp, dest) →
+ * fsync(dirname(dest)). Syncing the directory before the rename, or skipping
+ * the tmp fsync, publishes a name that may point at unwritten data.
+ *
+ * Implementation note: `fsync(2)` on an O_RDONLY fd is valid on Linux (and
+ * macOS) and flushes the inode's dirty pages regardless of the fd's access
+ * mode; a directory can only be opened O_RDONLY, so one code path serves
+ * both. On macOS full device-level durability would additionally need
+ * `F_FULLFSYNC`; the fleet runs Linux containers, where fsync is sufficient.
+ *
+ * Throws on failure (ENOENT, EIO). Callers that treat durability as
+ * best-effort must wrap it — this primitive never swallows an error, because
+ * a silently-skipped fsync is the exact bug it exists to prevent.
+ */
+export function fsyncPathSync(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function atomicWriteJsonSync(
   destPath: string,
   value: unknown,

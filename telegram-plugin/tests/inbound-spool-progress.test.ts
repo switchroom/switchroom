@@ -60,6 +60,8 @@ function fakeFs(): InboundSpoolFsSeam {
     },
     existsSync: (p) => files.has(p),
     statSizeSync: (p) => Buffer.byteLength(files.get(p) ?? ''),
+    fsyncFileSync: () => {},
+    fsyncDirSync: () => {},
   }
 }
 

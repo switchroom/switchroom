@@ -33,20 +33,33 @@ function msg(over: Partial<InboundMessage> = {}): InboundMessage {
 }
 
 /** In-memory fake fs keyed by path. Models append, full rewrite, and
- *  atomic rename (so the tmp→rename compaction path is exercised). */
-function fakeFs(): InboundSpoolFsSeam & { dump(p?: string): string } {
+ *  atomic rename (so the tmp→rename compaction path is exercised).
+ *  `ops` records the mutating/durability calls in order, so tests can pin
+ *  the fsync ORDERING the crash-durability guarantee depends on. */
+function fakeFs(): InboundSpoolFsSeam & { dump(p?: string): string; ops: string[] } {
   const files = new Map<string, string>()
+  const ops: string[] = []
   return {
-    appendFileSync: (p, d) => files.set(p, (files.get(p) ?? '') + d),
+    appendFileSync: (p, d) => {
+      ops.push(`append:${p}`)
+      files.set(p, (files.get(p) ?? '') + d)
+    },
     readFileSync: (p) => files.get(p) ?? '',
-    writeFileSync: (p, d) => files.set(p, d),
+    writeFileSync: (p, d) => {
+      ops.push(`write:${p}`)
+      files.set(p, d)
+    },
     renameSync: (from, to) => {
+      ops.push(`rename:${from}->${to}`)
       files.set(to, files.get(from) ?? '')
       files.delete(from)
     },
     existsSync: (p) => files.has(p),
     statSizeSync: (p) => Buffer.byteLength(files.get(p) ?? ''),
+    fsyncFileSync: (p) => ops.push(`fsyncFile:${p}`),
+    fsyncDirSync: (p) => ops.push(`fsyncDir:${p}`),
     dump: (p = PATH) => files.get(p) ?? '',
+    ops,
   }
 }
 
@@ -478,6 +491,92 @@ describe('inbound-spool — robustness', () => {
   })
 })
 
+describe('inbound-spool — power-cut durability (fsync)', () => {
+  it('fsyncs the spool file on every appended record', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs, log: () => {} })
+    s.put('a', msg({ messageId: 1 }))
+    s.ack(msg({ messageId: 1 }))
+    // Both the put record and the ack tombstone are durability-critical:
+    // an un-synced ack replays an already-answered message after a power
+    // cut, an un-synced put loses it entirely.
+    expect(fs.ops).toEqual([
+      `append:${PATH}`,
+      `fsyncFile:${PATH}`,
+      `append:${PATH}`,
+      `fsyncFile:${PATH}`,
+    ])
+  })
+
+  it('compaction fsyncs the tmp file BEFORE the rename and the directory AFTER', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs, compactAtBytes: 200, log: () => {} })
+    for (let i = 1; i <= 10; i++) s.put('a', msg({ messageId: i, text: 'y'.repeat(50) }))
+    // The bound triggers several compactions across the 10 puts; each one
+    // must follow the same four-step sequence, so pin the last.
+    expect(fs.ops.slice(-4)).toEqual([
+      `write:${PATH}.compact.tmp`,
+      `fsyncFile:${PATH}.compact.tmp`,
+      `rename:${PATH}.compact.tmp->${PATH}`,
+      'fsyncDir:/state/agent/telegram',
+    ])
+  })
+
+  it('a failed compaction directory fsync is not reported as a failed compaction', () => {
+    // The rename already landed, so the compacted log IS on disk; only the
+    // power-cut upgrade is missing. Calling it "compact FAILED" would send an
+    // operator hunting a rewrite that actually worked.
+    const fs = fakeFs()
+    const logs: string[] = []
+    fs.fsyncDirSync = () => {
+      throw new Error('EIO: i/o error, fsync dir')
+    }
+    const s = createInboundSpool({ path: PATH, fs, compactAtBytes: 200, log: (l) => logs.push(l) })
+    for (let i = 1; i <= 10; i++) s.put('a', msg({ messageId: i, text: 'y'.repeat(50) }))
+    expect(logs.join('')).toContain('compact directory fsync FAILED')
+    expect(logs.join('')).toContain('compacted path=')
+    // And the compacted log is intact and readable — nothing was rolled back.
+    const s2 = createInboundSpool({ path: PATH, fs, log: () => {} })
+    expect(s2.liveCount()).toBe(10)
+  })
+
+  it('an un-acked entry survives a POWER CUT, not just a process kill', () => {
+    // Models the distinction the fsync exists for: `appendFileSync` returning
+    // puts the bytes in the page cache (enough to survive SIGKILL — the
+    // process dies, the kernel still holds them), but only fsync puts them on
+    // stable storage. `powerCut()` discards everything not fsync'd, which is
+    // what a host power loss actually does.
+    const cache = new Map<string, string>()
+    const platter = new Map<string, string>()
+    const fs: InboundSpoolFsSeam = {
+      appendFileSync: (p, d) => cache.set(p, (cache.get(p) ?? '') + d),
+      readFileSync: (p) => cache.get(p) ?? '',
+      writeFileSync: (p, d) => cache.set(p, d),
+      renameSync: (from, to) => {
+        cache.set(to, cache.get(from) ?? '')
+        cache.delete(from)
+      },
+      existsSync: (p) => cache.has(p),
+      statSizeSync: (p) => Buffer.byteLength(cache.get(p) ?? ''),
+      fsyncFileSync: (p) => {
+        if (cache.has(p)) platter.set(p, cache.get(p)!)
+      },
+      fsyncDirSync: () => {},
+    }
+    const powerCut = (): void => {
+      cache.clear()
+      for (const [p, d] of platter) cache.set(p, d)
+    }
+
+    const s = createInboundSpool({ path: PATH, fs, log: () => {} })
+    s.put('a', msg({ messageId: 7, text: 'answer me' }))
+    powerCut()
+
+    const rebooted = createInboundSpool({ path: PATH, fs, log: () => {} })
+    expect(rebooted.liveEntries().map((e) => e.msg.messageId)).toEqual([7])
+  })
+})
+
 describe('inbound-spool — #2789 C: multi-message drop notice reports the real count', () => {
   it('passes the true per-chat dropped count to the coalesced notice', () => {
     const fs = fakeFs()
@@ -549,10 +648,14 @@ describe('inbound-spool — #2789 B: spool write failure surfaces a health signa
   // An fs whose appendFileSync can be toggled to fail, modelling a full /
   // unwritable persistent volume. The append swallows the error (delivery
   // must not break) but the degradation must be SURFACED, not silent.
-  function toggleableFs(): InboundSpoolFsSeam & { fail: boolean } {
+  function toggleableFs(): InboundSpoolFsSeam & { fail: boolean; failFsync: boolean } {
     const files = new Map<string, string>()
     const seam = {
       fail: false,
+      // A failing fsync is its own degradation mode: the bytes reached the
+      // page cache but NOT stable storage, so the durable promise is gone
+      // even though appendFileSync returned cleanly.
+      failFsync: false,
       appendFileSync(p: string, d: string) {
         if (seam.fail) throw new Error('ENOSPC: no space left on device')
         files.set(p, (files.get(p) ?? '') + d)
@@ -565,6 +668,10 @@ describe('inbound-spool — #2789 B: spool write failure surfaces a health signa
       },
       existsSync: (p: string) => files.has(p),
       statSizeSync: (p: string) => Buffer.byteLength(files.get(p) ?? ''),
+      fsyncFileSync: (_p: string) => {
+        if (seam.failFsync) throw new Error('EIO: i/o error, fsync')
+      },
+      fsyncDirSync: (_p: string) => {},
     }
     return seam
   }
@@ -586,6 +693,28 @@ describe('inbound-spool — #2789 B: spool write failure surfaces a health signa
     expect(s.appendFailureCount()).toBe(1)
     // Latched: exactly one transition event on entering degraded.
     expect(events).toEqual([{ degraded: true, consecutiveFailures: 1 }])
+  })
+
+  it('a failing fsync degrades too — a cached-but-unsynced append is NOT durable', () => {
+    // The subtle one: appendFileSync succeeds, so the old code would have
+    // reported a healthy spool while the record was one power cut from gone.
+    const fs = toggleableFs()
+    const events: { degraded: boolean }[] = []
+    const logs: string[] = []
+    const s = createInboundSpool({
+      path: PATH,
+      fs,
+      log: (l) => logs.push(l),
+      onDegraded: (info) => events.push({ degraded: info.degraded }),
+    })
+    fs.failFsync = true
+    expect(() => s.put('a', msg({ messageId: 1, ts: 1 }))).not.toThrow()
+    expect(s.isDegraded()).toBe(true)
+    expect(events).toEqual([{ degraded: true }])
+    expect(logs.join('')).toContain('durability degraded')
+    // Live delivery is unaffected — degradation is a durability claim, not a
+    // delivery failure.
+    expect(s.liveCount()).toBe(1)
   })
 
   it('does not re-fire the degraded signal on every failing append (latched)', () => {

@@ -25,6 +25,7 @@
  * unbounded. PURE w.r.t. the injected fs seam ⇒ unit-testable.
  */
 
+import { dirname } from 'node:path'
 import type { Obligation } from './obligation-ledger.js'
 
 export interface ObligationStoreFsSeam {
@@ -34,6 +35,14 @@ export interface ObligationStoreFsSeam {
    *  the snapshot. */
   renameSync: (from: string, to: string) => void
   existsSync: (path: string) => boolean
+  /** fsync the FILE at `path`. Atomicity ≠ durability: rename orders the
+   *  metadata, it does not put the tmp file's DATA on stable storage. Call
+   *  on the tmp file BEFORE the rename. */
+  fsyncFileSync: (path: string) => void
+  /** fsync the DIRECTORY at `path`, AFTER the rename — the new directory
+   *  entry lives in the parent's own cached metadata and is otherwise lost
+   *  in a power cut. */
+  fsyncDirSync: (path: string) => void
 }
 
 interface SnapshotEnvelope {
@@ -133,11 +142,30 @@ export function persistObligations(
   const tmp = path + '.tmp'
   try {
     fs.writeFileSync(tmp, JSON.stringify(env))
+    // Order matters: fsync the tmp file's DATA, THEN publish it by rename.
+    // Renaming first would let a power cut leave the snapshot path pointing
+    // at an inode whose bytes never reached the platter — a zero-length or
+    // stale snapshot that reads as "no open obligations", which is exactly
+    // the silent-drop this store exists to prevent.
+    fs.fsyncFileSync(tmp)
     fs.renameSync(tmp, path)
   } catch (err) {
     log(
       `obligation-store: persist FAILED path=${path}: ${(err as Error).message} — ` +
         `durability degraded to in-memory\n`,
+    )
+    return
+  }
+  // The rename landed, so the snapshot is already correct for a process
+  // crash; this last barrier only upgrades it to survive a power cut. Kept
+  // in its own try so a directory-fsync failure isn't mislabelled as a
+  // failed persist — the data IS written, just not provably on the platter.
+  try {
+    fs.fsyncDirSync(dirname(path))
+  } catch (err) {
+    log(
+      `obligation-store: directory fsync FAILED path=${path}: ${(err as Error).message} — ` +
+        `snapshot written but the rename may not survive a power cut\n`,
     )
   }
 }

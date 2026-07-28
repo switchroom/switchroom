@@ -240,7 +240,27 @@ const PHASE4_MIGRATIONS = [
 
 function applySchema(db: SqliteDatabase): void {
   db.exec('PRAGMA journal_mode = WAL')
-  db.exec('PRAGMA synchronous = NORMAL')
+  // FULL, not NORMAL. This registry is the crash-recovery ledger: the turn row
+  // is what tells the boot-time resume protocol that a turn was in flight when
+  // the process died. Under WAL, `synchronous = NORMAL` deliberately does NOT
+  // fsync the WAL on commit — it syncs only at checkpoint — so a container kill
+  // is survived but a HOST POWER CUT can lose the last commits, including the
+  // whole turn row. The interrupted turn then becomes invisible to resume:
+  // silently unrecoverable, which is exactly the case this ledger exists for.
+  //
+  // Cost is bounded and measured, not assumed: on this fleet's ext4/NVMe volume
+  // a FULL commit costs ~0.87ms mean (p99 1.7ms) vs ~0.011ms at NORMAL, i.e. a
+  // ~1150 commits/s ceiling. Steady state is ~330 commits/day, and the hot path
+  // is `bumpSubagentActivity` (subagents-schema.ts) at ~1Hz per running worker
+  // — ~4 commits/s during fan-out, a ~0.35% duty cycle.
+  //
+  // `synchronous` is per-connection and NOT persisted in the DB file (unlike
+  // `journal_mode`), so it binds only connections that set it. The PreToolUse
+  // subagent tracker (`hooks/subagent-tracker-pretool.mjs`) opens this same
+  // registry.db without the pragma and has therefore been running at SQLite's
+  // default FULL on the tool-call hot path since it shipped; the gateway's
+  // NORMAL was the outlier.
+  db.exec('PRAGMA synchronous = FULL')
   // Concurrency: multiple writers contend on this registry (the PreToolUse
   // subagent-tracker hook, the gateway's subagent-watcher backfill, the turns
   // writer) — especially when several sub-agents dispatch at once. Without a

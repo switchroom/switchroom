@@ -35,6 +35,7 @@
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fsyncPathSync } from "../util/atomic.js";
 import {
   OBSERVATION_SCOPES_ENV,
   observationScopesHint,
@@ -238,8 +239,24 @@ export function writeSidecarsAtomic(
   const topicTmp = topicPath + ".tmp";
   writeFileSync(handoffTmp, briefing, "utf-8");
   writeFileSync(topicTmp, topic, "utf-8");
+  // Atomic ≠ durable. rename(2) guarantees a reader never sees a torn file,
+  // but it does not put the tmp file's BYTES on stable storage — so a host
+  // power cut can leave `.handoff.md` naming an inode that was never written,
+  // and the next boot reorients from an empty or stale briefing. fsync each
+  // tmp file BEFORE publishing it, then fsync the containing DIRECTORY after
+  // both renames so the directory entries themselves survive.
+  fsyncPathSync(handoffTmp);
+  fsyncPathSync(topicTmp);
   renameSync(handoffTmp, handoffPath);
   renameSync(topicTmp, topicPath);
+  // Best-effort: the renames have already landed, so a failure here only
+  // means we can't prove the entries survive a power cut. Never fail the
+  // handoff write over it.
+  try {
+    fsyncPathSync(agentDir);
+  } catch {
+    /* durability barrier only; the sidecars are written either way */
+  }
 }
 
 // ─── Pipeline ─────────────────────────────────────────────────────────────────
