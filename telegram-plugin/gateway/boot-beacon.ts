@@ -73,7 +73,7 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
-  writeSync,
+  writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
 
@@ -293,9 +293,16 @@ export function writeBootBeaconFile(stateDir: string, beacon: BootBeacon): boole
   const tmp = `${path}.tmp-${process.pid}`
   let fd: number | undefined
   try {
-    mkdirSync(stateDir, { recursive: true })
+    // mode 0o700 matters: STATE_DIR also holds access.json / .env, and the
+    // gateway creates it 0o700 at boot. If it were ever missing here, a
+    // default-mode recreate by this 5s tick would silently loosen the
+    // permissions on that whole directory.
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
     fd = openSync(tmp, 'w', 0o600)
-    writeSync(fd, serializeBootBeacon(beacon))
+    // writeFileSync (not writeSync) on the fd: it loops internally, so a short
+    // write can't leave a truncated beacon that we then fsync and rename into
+    // place as if it were whole.
+    writeFileSync(fd, serializeBootBeacon(beacon))
     fsyncSync(fd)
     closeSync(fd)
     fd = undefined
