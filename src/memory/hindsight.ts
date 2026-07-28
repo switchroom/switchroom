@@ -476,12 +476,174 @@ export function decideRetainMissionUpgrade(
   configured: string | undefined | null,
   current: string | null,
 ): { action: "config" | "upgrade" | "none"; mission?: string } {
+  return decideMissionUpgrade(
+    configured,
+    current,
+    DEFAULT_RETAIN_MISSION,
+    SUPERSEDED_RETAIN_MISSIONS,
+  );
+}
+
+/**
+ * Field-agnostic form of {@link decideRetainMissionUpgrade}.
+ *
+ * The never-clobber rule is the whole point, and it is identical for every
+ * mission-shaped bank config field: switchroom may seed and upgrade its OWN
+ * defaults, and must never overwrite text a human wrote. Encoding it once means
+ * a second managed mission field (`observations_mission`, below) cannot drift
+ * into a weaker rule by being implemented separately.
+ *
+ * @param configured Operator yaml value, if any. Wins outright, needs no read.
+ * @param current    The bank's live value; null ONLY when the read SUCCEEDED
+ *                   and the field is genuinely unset. A FAILED read must not be
+ *                   passed here at all — see `decideRetainMissionUpgrade`'s doc.
+ * @param desired    The default switchroom wants the bank to carry.
+ * @param shipped    Every OTHER value switchroom has ever shipped as a default
+ *                   for this field. Membership is byte-equality, so any
+ *                   hand-edit (even whitespace) matches nothing and is left
+ *                   alone.
+ */
+export function decideMissionUpgrade(
+  configured: string | undefined | null,
+  current: string | null,
+  desired: string,
+  shipped: readonly string[],
+): { action: "config" | "upgrade" | "none"; mission?: string } {
   if (configured) return { action: "config", mission: configured };
-  if (current === DEFAULT_RETAIN_MISSION) return { action: "none" };
-  if (isUpgradableRetainMission(current)) {
-    return { action: "upgrade", mission: DEFAULT_RETAIN_MISSION };
+  if (current === desired) return { action: "none" };
+  if (current == null || current.trim() === "" || shipped.includes(current)) {
+    return { action: "upgrade", mission: desired };
   }
   return { action: "none" };
+}
+
+/**
+ * Recommended default `observations_mission` for every switchroom-managed bank
+ * — the consolidation-side counterpart to {@link DEFAULT_RETAIN_MISSION}.
+ *
+ * ## The divergence this closes
+ *
+ * `observations_mission` is a documented Hindsight bank config field: "Defines
+ * what this bank should synthesise into durable observations"
+ * (<https://hindsight.vectorize.io/> bank configuration reference). Switchroom
+ * already had every piece of plumbing for it — `BankMissionExtras`,
+ * `resolveBankMissionExtras`, the `config_updates` write path — but the only
+ * value that ever reached a bank was
+ * `PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission`, keyed on
+ * `agents.<name>.extends`. Verified live 2026-07-28 against
+ * switchroom-hindsight (`GET /v1/default/banks/<id>/config` for every bank):
+ * all 27 banks carried `observations_mission: null`, including the
+ * health-coach agent's, because every live agent runs `extends: default`. The
+ * whole fleet therefore ran the engine's stock mission and the profile knob was
+ * dead code in practice.
+ *
+ * The stock mission is `_DEFAULT_MISSION` in
+ * `hindsight_api/engine/consolidation/prompts.py:10` — "Track anything notable
+ * in the new facts — names, numbers, dates, places, events, decisions, claims,
+ * relationships, and recurring patterns." It is deliberately maximal, and it is
+ * the wrong shape for a switchroom bank for two reasons that are checkable
+ * rather than aesthetic:
+ *
+ *  - **The observation tier is PREFERRED at recall.** `memory.recall.types`
+ *    defaults to `["world","experience","observation"]` and
+ *    `prefer_observations` defaults to true (`src/config/schema.ts`). So
+ *    switchroom biases the injected block toward observations while telling the
+ *    consolidator to synthesise "anything notable".
+ *  - **The raw fact layer leaks exactly what "anything notable" preserves.**
+ *    `DEFAULT_RETAIN_MISSION` above records the measured tool-exhaust leak (A/B
+ *    over 52 real retain chunks; 20.3% residual exhaust in the shipped arm),
+ *    and consolidation reads those leaked facts. Scoping the consolidation step
+ *    is the second line of defence on the SAME failure, at the tier recall
+ *    prefers.
+ *
+ * ## Blast radius — narrower than the docs claim
+ *
+ * The bank-config doc page says `observations_mission` "replaces the built-in
+ * consolidation rules entirely". That overstates it, and the difference is why
+ * this change is low-risk. In the deployed engine
+ * (`ghcr.io/switchroom/switchroom-hindsight:v0.19.26`, read 2026-07-28)
+ * `build_batch_consolidation_prompt` (`prompts.py:159`) substitutes this text
+ * for the `## MISSION` block ONLY; `_PROCESSING_RULES` (prefer-update-over-
+ * create, one-facet-per-observation, match-by-entity, state-change cascade),
+ * `_DECISION_GUIDE` and `_OUTPUT_SECTION` are concatenated unconditionally on
+ * every call. So this text scopes WHAT is synthesised and cannot disable
+ * merge/dedup behaviour.
+ *
+ * The engine does state its own precedence — "If anything in this MISSION
+ * conflicts with the PROCESSING RULES ... the MISSION takes priority"
+ * (`prompts.py:15`). The text below is therefore written purely in scope terms
+ * (what to keep, what to drop) and says nothing about merge-vs-create, so it
+ * never contradicts the rules it outranks.
+ *
+ * ## Why this text
+ *
+ * It keeps the stock mission's positive coverage — the consolidator must still
+ * be told it may record decisions, relationships and patterns. An
+ * exclusion-only mission produced degenerate empty output against this same
+ * small local extraction model in the retain-mission work above, which is why
+ * the positive clause leads and the exclusions follow.
+ */
+export const DEFAULT_OBSERVATIONS_MISSION =
+  "Synthesise durable, standing knowledge about the people, projects, and systems this agent works with: preferences and standing rules, roles and relationships, skills and recurring patterns, technical and operational decisions with their rationale, and the state of long-running work once it lands.\n" +
+  "\n" +
+  "The test is durability, not notability: an observation must still be worth reading weeks from now. A single dated event belongs in an observation only when it establishes or changes a standing fact.\n" +
+  "\n" +
+  "Do NOT synthesise observations from:\n" +
+  "- Transcript exhaust — tool calls and their results, file paths, temp or scratchpad directories, where some output was written, or narration of what an assistant did.\n" +
+  "- Identifiers with no standing meaning: session, agent, request, batch or command IDs, UUIDs, hashes, error codes.\n" +
+  "- In-flight process narration — a task started, paused, or still running. Record the outcome once it lands, not the running state.\n" +
+  "- The memory system's own errors, retries, backlogs, or internal state.\n" +
+  "- Transient state (what is running right now, unread counts, build status) unless the fact is explicitly dated, in which case record it as dated.\n" +
+  "\n" +
+  "If the new facts contain nothing durable, record nothing rather than synthesising a weak observation.";
+
+/**
+ * Ordered registry of every `observations_mission` switchroom has shipped as a
+ * DEFAULT, oldest first — the `observations_mission` analogue of
+ * {@link SUPERSEDED_RETAIN_MISSIONS}, consumed the same way by
+ * {@link decideMissionUpgrade}. Append the OUTGOING text when
+ * {@link DEFAULT_OBSERVATIONS_MISSION} changes; never edit an entry.
+ *
+ * Seeded with the `health-coach` profile default, which is the only
+ * observations mission switchroom has ever pushed. Listing it here is what lets
+ * an existing health-coach bank carrying it be recognised as switchroom-authored
+ * and upgradable, rather than mistaken for an operator hand-edit and frozen.
+ */
+export const SUPERSEDED_OBSERVATIONS_MISSIONS: readonly string[] = [
+  // PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission, shipped since
+  // the Phase 2 bank-specialisation work.
+  "Synthesise the person's wellbeing patterns, motivations, and emotional " +
+    "context — how habits, setbacks, and encouragement connect over time.",
+];
+
+/**
+ * Reconcile-time `observations_mission` decision (pure).
+ *
+ * Precedence: operator yaml > built-in profile default > the fleet default. The
+ * profile default is the DESIRED value for a profiled agent rather than a mere
+ * fallback, so a health-coach bank keeps its wellbeing mission instead of being
+ * flattened to the generic one.
+ *
+ * @param configured     `agents.<name>.memory.observations_mission` from yaml.
+ * @param profileDefault `PROFILE_MEMORY_DEFAULTS[<profile>].observations_mission`.
+ * @param current        The bank's live value; null ONLY on a SUCCESSFUL read of
+ *                       an unset field (see {@link decideMissionUpgrade}).
+ */
+export function decideObservationsMissionUpgrade(
+  configured: string | undefined | null,
+  profileDefault: string | undefined,
+  current: string | null,
+): { action: "config" | "upgrade" | "none"; mission?: string } {
+  const desired = profileDefault ?? DEFAULT_OBSERVATIONS_MISSION;
+  // Every text switchroom has ever shipped as a default for this field is
+  // upgradable, INCLUDING the current fleet default — otherwise a profiled
+  // agent whose bank was seeded generically could never reach its profile
+  // mission. `desired` itself is excluded so the "already current" short-circuit
+  // in decideMissionUpgrade stays the one that fires.
+  const shipped = [...SUPERSEDED_OBSERVATIONS_MISSIONS, DEFAULT_OBSERVATIONS_MISSION].filter(
+    (m) => m !== desired,
+  );
+  return decideMissionUpgrade(configured, current, desired, shipped);
 }
 
 /**
@@ -509,6 +671,39 @@ export async function fetchBankRetainMission(
   bankId: string,
   opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
 ): Promise<{ ok: true; mission: string | null } | { ok: false; reason: string }> {
+  return fetchBankMissionField(apiUrl, bankId, "retain_mission", opts);
+}
+
+/**
+ * Read a bank's current `observations_mission` from Hindsight. Same contract,
+ * timeouts and unrecognised-shape posture as {@link fetchBankRetainMission} —
+ * see that doc comment; only the config key differs.
+ */
+export async function fetchBankObservationsMission(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<{ ok: true; mission: string | null } | { ok: false; reason: string }> {
+  return fetchBankMissionField(apiUrl, bankId, "observations_mission", opts);
+}
+
+/**
+ * Shared reader behind {@link fetchBankRetainMission} and
+ * {@link fetchBankObservationsMission}.
+ *
+ * The unrecognised-shape posture is the load-bearing part and is why this is
+ * one function rather than two: a 200 whose body lacks `config`, or whose
+ * `config` lacks the requested KEY, is `{ ok: false }` and NOT "unset". The
+ * upgrade decision treats null as upgradable, so mapping an unrecognised shape
+ * to null would push a default over every customized mission fleet-wide the day
+ * Hindsight renests or renames a field (2026-07-25 re-review M1).
+ */
+async function fetchBankMissionField(
+  apiUrl: string,
+  bankId: string,
+  field: "retain_mission" | "observations_mission",
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<{ ok: true; mission: string | null } | { ok: false; reason: string }> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const timeoutMs = opts?.timeoutMs ?? 5000;
   const base = apiUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
@@ -520,20 +715,20 @@ export async function fetchBankRetainMission(
     clearTimeout(timeout);
     if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
     const body = (await resp.json()) as {
-      config?: { retain_mission?: string | null } | null;
+      config?: Record<string, unknown> | null;
     };
     const config = body?.config;
     if (config == null || typeof config !== "object") {
       return { ok: false, reason: "Unexpected shape" };
     }
-    if (!("retain_mission" in config)) {
+    if (!(field in config)) {
       return { ok: false, reason: "Unexpected shape" };
     }
-    const mission = config.retain_mission;
+    const mission = config[field];
     if (mission != null && typeof mission !== "string") {
       return { ok: false, reason: "Unexpected shape" };
     }
-    return { ok: true, mission: mission ?? null };
+    return { ok: true, mission: (mission as string | undefined) ?? null };
   } catch (err) {
     clearTimeout(timeout);
     if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };

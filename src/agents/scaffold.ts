@@ -772,7 +772,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade, PROFILE_MEMORY_DEFAULTS, fetchBankObservationsMission, decideObservationsMissionUpgrade } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -1953,6 +1953,51 @@ async function resolveRetainMissionPush(
   if (decision.action === "upgrade") {
     console.log(
       `  ${chalk.green("✓")} Upgrading superseded default retain_mission for ${label}`,
+    );
+  }
+  return decision.mission;
+}
+
+/**
+ * `observations_mission` counterpart of {@link resolveRetainMissionPush}, and
+ * deliberately the same shape: read the bank's current value, and push only
+ * when it is unset or byte-equals a mission switchroom itself shipped. Returns
+ * `undefined` for "push nothing".
+ *
+ * Before this existed, `observations_mission` reached `updateBankMissions`
+ * straight out of `resolveBankMissionExtras` and was therefore pushed
+ * UNCONDITIONALLY on every `switchroom apply` — the same clobber hazard the
+ * retain path was fixed for (2026-07-25 re-review H1). It never bit only
+ * because the sole value that could be produced came from a profile no live
+ * agent uses. Now that a fleet default makes this path hot, it goes through the
+ * read-first decision.
+ *
+ * A FAILED read pushes nothing: "unknown" must never be treated as
+ * "upgradable", or a Hindsight hiccup would overwrite an operator's mission.
+ */
+async function resolveObservationsMissionPush(
+  apiUrl: string,
+  bankId: string,
+  configured: string | undefined,
+  profileName: string,
+  label: string,
+): Promise<string | undefined> {
+  // Config wins outright and needs no read — push it regardless.
+  if (configured) return configured;
+
+  const profileDefault = PROFILE_MEMORY_DEFAULTS[profileName]?.observations_mission;
+  const current = await fetchBankObservationsMission(apiUrl, bankId, { timeoutMs: 5000 });
+  if (!current.ok) {
+    console.warn(
+      `  ${chalk.yellow("⚠")} Could not read current observations_mission for ${label} (${current.reason}) — leaving it untouched`,
+    );
+    return undefined;
+  }
+
+  const decision = decideObservationsMissionUpgrade(configured, profileDefault, current.mission);
+  if (decision.action === "upgrade") {
+    console.log(
+      `  ${chalk.green("✓")} Seeding default observations_mission for ${label}`,
     );
   }
   return decision.mission;
@@ -5996,6 +6041,21 @@ export function scaffoldAgent(
       if (seededRetainMission) {
         missions.retain_mission = seededRetainMission;
       }
+
+      // observations_mission does NOT ride `extras` straight through: like
+      // retain_mission it is a switchroom-managed default, so it goes through a
+      // read-first decision that never clobbers an operator's hand-edit.
+      delete missions.observations_mission;
+      const seededObservationsMission = await resolveObservationsMissionPush(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.observations_mission,
+        agentConfig.extends ?? DEFAULT_PROFILE,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
+      if (seededObservationsMission) {
+        missions.observations_mission = seededObservationsMission;
+      }
       if (userBankMission) {
         missions.bank_mission = userBankMission;
       }
@@ -8407,6 +8467,18 @@ function reconcileAgentInner(
         formatAgentBankLabel(name, hindsightBankId),
       );
       if (retainMission) missions.retain_mission = retainMission;
+
+      // Same read-first treatment for observations_mission — see
+      // `resolveObservationsMissionPush`.
+      delete missions.observations_mission;
+      const observationsMission = await resolveObservationsMissionPush(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.observations_mission,
+        agentConfig.extends ?? DEFAULT_PROFILE,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
+      if (observationsMission) missions.observations_mission = observationsMission;
 
       if (Object.keys(missions).length > 0) {
         await updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
