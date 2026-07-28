@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.19.32 — a queue event is not a turn start
+
+### A message sent mid-turn no longer forks the progress card (#3927)
+
+`case 'enqueue'` in `stream-render.ts` treated the claude CLI's
+`{"type":"queue-operation","operation":"enqueue"}` transcript record as a
+**turn-start** event. The CLI writes that record at QUEUE time, whether or not a
+turn is already running, so a message the operator sent mid-turn unconditionally
+minted a fresh `CurrentTurn` and swapped it into the per-topic slot. Two
+operator-visible bugs fell out of that: the live progress card froze on its last
+edit while a brand-new card appeared with reset stats (`startedAt`,
+`toolCallCount`, `mirrorLines`, `activityMessageId`), and that new card quoted
+the just-queued message via `reply_parameters` and then streamed the
+**still-running previous turn's** tool labels into it.
+
+**Minting now happens on the CLI's own turn-start signal.** The whole mint block
+is extracted verbatim into `beginTurn()`; `enqueue` calls it only when the
+session is genuinely idle, otherwise it parks the envelope and `dequeue` mints
+from the park. Ground truth from 60 real agent transcripts (372 enqueues)
+corrected two points of the original plan:
+
+- **A third operation exists and was unparsed: `remove` (161/372).** An enqueue
+  terminated by `remove` is folded into the already-running turn as a
+  `queued_command` attachment and never owns a turn, so parking without handling
+  it would leave a dead envelope for a later `dequeue` to mint as a spurious turn
+  against an already-answered message. `session-tail.ts` now projects it as
+  `queue_remove`, carrying the enqueue's byte-identical `content`, and
+  stream-render discards the matching parked envelope.
+- **Pairing is LIFO, not FIFO.** 199/200 dequeues are directly preceded by their
+  own enqueue; the gap to the newest pending enqueue has median 6 ms and max
+  14.2 s, while the gap to the oldest runs to hours. The most recent envelope is
+  popped, and an envelope is parked whenever the store is non-empty even if the
+  session is idle, so ordering cannot invert.
+
+Synthetic enqueues (cron, subagent handback, obligation-represent, wake) park
+uniformly and do **not** preempt — that is what the CLI does, not a policy call.
+`ackDelivery` deliberately stays on the `enqueue` event rather than moving into
+`beginTurn`: it asserts RECEIPT, and a parked-then-`remove`d message would
+otherwise never be acked and would be re-delivered as a duplicate inbound. The
+park store is bounded — 16 entries, oldest evicted, plus a 30-minute TTL pruned
+on every touch — so a `dequeue` that never arrives can neither mint a stale turn
+nor grow the store. An evicted envelope still reaches the model through the CLI's
+own queue; it only loses its progress card.
+
+**A superseded turn's card is finalized instead of orphaned.** The supersession
+teardown dropped `answerStream`, the orphaned-reply fuse and `narrativeGate`, but
+never called `clearActivitySummary(prior)`. A clobbered turn's card was therefore
+never finalized: it kept its `fg:<statusKey>` status pin forever, froze on its
+last edit, and left no `turn-lifecycle clear` line to explain it. `beginTurn` now
+finalizes a prior turn whose `endedAt` is still null and logs `turn-lifecycle
+clear reason=superseded` in the existing field format.
+
+Both fixes are covered by tests that drive the real `handleSessionEvent` through
+the extracted-module golden harness rather than a reimplementation; with the
+fixes reverted in place, 6 of 10 fail, including both target cases. The TTL case
+uses `vi.advanceTimersByTime` rather than `vi.setSystemTime`, because the file
+dual-runs under vitest and bun and bun's vitest shim does not implement
+`setSystemTime` — the assertion depends on the 31-minute jump, never on the
+absolute wall clock.
+
 ## v0.19.31 — a surface that reports success it did not achieve is worse than no surface
 
 Ten changes, one recurring shape: a cleanup, a roll, a log line or a card that
