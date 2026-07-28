@@ -31,8 +31,18 @@ import { reconcileAgent } from "../agents/scaffold.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
+import { DEFAULT_PROFILE } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
-import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
+import {
+  probeHindsight,
+  isHindsightEnabled,
+  fetchHindsightToolsList,
+  collectProfileBanks,
+  fetchBankObservationsMission,
+  decideObservationsMissionUpgrade,
+  DEFAULT_OBSERVATIONS_MISSION,
+  PROFILE_MEMORY_DEFAULTS,
+} from "../memory/hindsight.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import {
   readHostCapabilities,
@@ -1264,6 +1274,121 @@ function probeAuthBrokerSocket(
 }
 
 /**
+ * Per-agent bank `observations_mission` health. One CheckResult per agent bank.
+ *
+ * Why this row exists: `observations_mission` is pushed by scaffold/reconcile,
+ * never by the operator's yaml on a default setup, and nothing rendered its
+ * live value. That is how a bank could sit for months on the engine's stock
+ * consolidation mission ("Track anything notable in the new facts…") with every
+ * other memory row green — the exact fleet state measured on 2026-07-28, when
+ * all 27 live banks read `observations_mission: null`. A yaml-only check cannot
+ * see this: the value lives in the bank, so this reads the bank.
+ *
+ * - warn: unset (running the engine's stock mission), or a switchroom-shipped
+ *         default that reconcile has not pushed the current text over yet.
+ *         Both are fixed by `switchroom agent reconcile <agent>`.
+ * - warn: the read itself failed — reported as unknown, never as "unset"
+ *         (same posture as the push path, which refuses to treat a failed read
+ *         as upgradable).
+ * - ok:   carrying the mission switchroom intends, or an operator-authored text
+ *         that the never-clobber rule deliberately leaves alone.
+ *
+ * Exported for tests.
+ */
+export async function checkBankObservationsMissions(
+  config: SwitchroomConfig,
+  url: string,
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<CheckResult[]> {
+  // Dedupe by bank the same way checkBankIngestHealth does — several agents may
+  // share one `memory.collection`. Profile banks are deliberately NOT swept:
+  // switchroom's push path only manages agent banks, so a warn row on one would
+  // point at a remediation that does not apply.
+  const banks = new Map<string, { agents: string[]; config: AgentConfig }>();
+  for (const [agentName, agentConfig] of Object.entries(config.agents)) {
+    // Resolve through defaults + profiles, exactly as the push path does — an
+    // `extends` or `memory.observations_mission` inherited from `defaults:`
+    // must produce the same verdict here as it produces on the wire.
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    const bankId = resolved.memory?.collection ?? agentName;
+    const existing = banks.get(bankId);
+    if (existing) existing.agents.push(agentName);
+    else banks.set(bankId, { agents: [agentName], config: resolved });
+  }
+
+  const inspected = await Promise.all(
+    [...banks].map(
+      async ([bankId, entry]) =>
+        [
+          bankId,
+          entry,
+          await fetchBankObservationsMission(url, bankId, { fetchImpl: opts?.fetchImpl }),
+        ] as const,
+    ),
+  );
+
+  return inspected.map(([bankId, entry, read]) => {
+    const label =
+      `bank ${bankId} observations_mission` +
+      (entry.agents[0] !== bankId ? ` (${entry.agents.join(", ")})` : "");
+    const firstAgent = entry.agents[0];
+
+    if (!read.ok) {
+      return {
+        name: label,
+        status: "warn" as const,
+        detail: `could not read observations_mission: ${read.reason}`,
+      };
+    }
+
+    const profileDefault =
+      PROFILE_MEMORY_DEFAULTS[entry.config.extends ?? DEFAULT_PROFILE]?.observations_mission;
+    const decision = decideObservationsMissionUpgrade(
+      entry.config.memory?.observations_mission,
+      profileDefault,
+      read.mission,
+    );
+
+    if (decision.action === "upgrade") {
+      return {
+        name: label,
+        status: "warn" as const,
+        detail:
+          read.mission == null || read.mission.trim() === ""
+            ? "unset — this bank consolidates under Hindsight's stock mission, not switchroom's"
+            : "carrying a superseded switchroom default",
+        fix: `Run: switchroom agent reconcile ${firstAgent}`,
+      };
+    }
+
+    if (decision.action === "config") {
+      // Operator yaml wins outright and needs no read, so the push is
+      // unconditional — a live value that differs is simply not pushed yet.
+      return read.mission === decision.mission
+        ? { name: label, status: "ok" as const, detail: "set from switchroom.yaml" }
+        : {
+            name: label,
+            status: "warn" as const,
+            detail: "switchroom.yaml sets a different observations_mission than the bank carries",
+            fix: `Run: switchroom agent reconcile ${firstAgent}`,
+          };
+    }
+
+    const isSwitchroomDefault =
+      read.mission === (profileDefault ?? DEFAULT_OBSERVATIONS_MISSION);
+    return {
+      name: label,
+      status: "ok" as const,
+      detail: isSwitchroomDefault
+        ? profileDefault != null
+          ? `switchroom ${entry.config.extends ?? DEFAULT_PROFILE}-profile default`
+          : "switchroom fleet default"
+        : "operator-authored (left untouched by the never-clobber rule)",
+    };
+  });
+}
+
+/**
  * Per-agent bank ingest health. One CheckResult per agent bank:
  *
  * - fail: recent documents (≤30d) stored with ZERO extracted facts — the
@@ -1542,6 +1667,11 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // keeps "remembering" nothing and no surface goes red. Inspect each bank's
   // REST surface for unextracted documents and stale mental models.
   results.push(...(await checkBankIngestHealth(config, url, { includeConsolidationBacklog: true })));
+
+  // What each bank actually consolidates under. Pushed by scaffold/reconcile
+  // and invisible everywhere else, which is how the whole fleet ran the
+  // engine's stock consolidation mission unnoticed (see the function's doc).
+  results.push(...(await checkBankObservationsMissions(config, url)));
 
   // Auto-recall health (#3619). Reachability, ingest, and /health all stayed
   // green through the 2026-07 regression while the busiest agents lost their

@@ -461,6 +461,25 @@ the shipped profiles (health-coach leans empathy-high; coding /
 executive-assistant lean skeptical + literal). Operator config overrides per
 key.
 
+`observations_mission` is the one switchroom seeds and keeps current itself.
+Precedence is **operator yaml > profile default > fleet default**:
+
+- `coding`, `executive-assistant` and `health-coach` each ship their own
+  consolidation mission. The two work profiles deliberately tell the
+  consolidator that operational state (versions, open work, outstanding
+  obligations) is durable knowledge and must be recorded with the date inline —
+  it would otherwise be dropped by the engine's "purely ephemeral facts → omit"
+  rule. `health-coach` deliberately does not, because a single day's reading
+  genuinely is ephemeral there.
+- Any other profile, including `default`, gets `DEFAULT_OBSERVATIONS_MISSION`.
+
+Seeding is read-first and never clobbers: switchroom pushes only when the bank's
+value is unset or byte-equals a text switchroom itself shipped, so a mission you
+wrote through the Hindsight API is left alone forever. `switchroom doctor` shows
+each bank's live value as a `bank <id> observations_mission` row, and warns when
+one is unset (that bank is consolidating under Hindsight's stock mission) or is
+waiting on a `switchroom agent reconcile <agent>`.
+
 ### Curated mental models + the curator skill (Phase 5)
 
 Mental models are pinned, named, self-refreshing reflections over a bank. Two

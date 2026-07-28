@@ -691,14 +691,20 @@ export const DEFAULT_OBSERVATIONS_MISSION =
  * {@link decideMissionUpgrade}. Append the OUTGOING text when
  * {@link DEFAULT_OBSERVATIONS_MISSION} changes; never edit an entry.
  *
- * Seeded with the `health-coach` profile default, which is the only
- * observations mission switchroom has ever pushed. Listing it here is what lets
- * an existing health-coach bank carrying it be recognised as switchroom-authored
- * and upgradable, rather than mistaken for an operator hand-edit and frozen.
+ * PROFILE defaults belong here too when they are retired: an outgoing
+ * `PROFILE_MEMORY_DEFAULTS[<profile>].observations_mission` is a text
+ * switchroom shipped, and listing it is what lets a bank still carrying it be
+ * recognised as switchroom-authored and upgradable rather than mistaken for an
+ * operator hand-edit and frozen forever. (The CURRENT profile defaults do not
+ * need an entry — {@link decideObservationsMissionUpgrade} reads them straight
+ * off `PROFILE_MEMORY_DEFAULTS`.)
  */
 export const SUPERSEDED_OBSERVATIONS_MISSIONS: readonly string[] = [
-  // PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission, shipped since
-  // the Phase 2 bank-specialisation work.
+  // The original PROFILE_MEMORY_DEFAULTS["health-coach"].observations_mission,
+  // shipped from the Phase 2 bank-specialisation work until it was rewritten in
+  // consolidation voice. A one-line scoping sentence with no exclusions and no
+  // granularity guidance; superseded, not retired — health-coach still has a
+  // profile default, it is just different text now.
   "Synthesise the person's wellbeing patterns, motivations, and emotional " +
     "context — how habits, setbacks, and encouragement connect over time.",
 ];
@@ -723,13 +729,20 @@ export function decideObservationsMissionUpgrade(
 ): { action: "config" | "upgrade" | "none"; mission?: string } {
   const desired = profileDefault ?? DEFAULT_OBSERVATIONS_MISSION;
   // Every text switchroom has ever shipped as a default for this field is
-  // upgradable, INCLUDING the current fleet default — otherwise a profiled
-  // agent whose bank was seeded generically could never reach its profile
-  // mission. `desired` itself is excluded so the "already current" short-circuit
-  // in decideMissionUpgrade stays the one that fires.
-  const shipped = [...SUPERSEDED_OBSERVATIONS_MISSIONS, DEFAULT_OBSERVATIONS_MISSION].filter(
-    (m) => m !== desired,
-  );
+  // upgradable, INCLUDING the current fleet default and the CURRENT profile
+  // defaults — otherwise a profiled agent whose bank was seeded generically
+  // could never reach its profile mission, and (symmetrically) an agent moved
+  // OFF a profile would have its stale profile mission mistaken for an operator
+  // hand-edit and frozen there forever. `desired` itself is excluded so the
+  // "already current" short-circuit in decideMissionUpgrade stays the one that
+  // fires.
+  const shipped = [
+    ...SUPERSEDED_OBSERVATIONS_MISSIONS,
+    DEFAULT_OBSERVATIONS_MISSION,
+    ...Object.values(PROFILE_MEMORY_DEFAULTS)
+      .map((d) => d.observations_mission)
+      .filter((m): m is string => m != null),
+  ].filter((m) => m !== desired);
   return decideMissionUpgrade(configured, current, desired, shipped);
 }
 
@@ -859,21 +872,98 @@ export interface BankMissionExtras {
  *
  * Only `disposition` + `observations_mission` are defaulted here; the
  * persona statement (`reflect_mission` / `bank_mission`) stays operator-driven
- * so there is no code-vs-yaml persona conflict. Profiles not listed inherit
- * the engine default (all traits 3, no observations mission).
+ * so there is no code-vs-yaml persona conflict. Profiles not listed (notably
+ * `default`) inherit the engine disposition (all traits 3) and
+ * {@link DEFAULT_OBSERVATIONS_MISSION} — a `default` entry here would only
+ * duplicate the fleet default.
+ *
+ * ## Why the observations missions below are written the way they are
+ *
+ * Each one is a CONSOLIDATION mission, not an extraction mission: it addresses
+ * the two things `build_batch_consolidation_prompt` actually delegates to the
+ * `## MISSION` block — WHAT is worth an observation, and how much to aggregate
+ * into one ("how many observations to create and how much to aggregate is
+ * driven by the MISSION"; verified 2026-07-28 against `prompts.py` in
+ * `ghcr.io/switchroom/switchroom-hindsight:v0.19.26`). None of them says
+ * anything about merge-vs-create mechanics, which `_PROCESSING_RULES` owns and
+ * which the MISSION outranks — so none can contradict a rule it beats.
+ *
+ * The `coding` and `executive-assistant` missions **explicitly override the
+ * engine's ephemeral-omit rule** ("Purely ephemeral facts → omit them unless
+ * the MISSION explicitly targets such data", `_DECISION_GUIDE`,
+ * `prompts.py:90`). For an engineering or assistant bank the operational state
+ * IS the durable knowledge — a version, a failing gate, an outstanding
+ * obligation — so each instructs that the date be embedded in the observation
+ * text, because a consolidated observation is otherwise a timeless assertion
+ * with no way for a later reader to judge staleness.
+ *
+ * `health-coach` deliberately does NOT carry that override: for a coaching bank
+ * a single day's weight reading or skipped session genuinely is ephemeral, and
+ * the durable unit is the pattern it belongs to. One string for all three
+ * profiles is exactly the failure this avoids.
+ *
+ * Cost: this rides in the per-request user message of every consolidation
+ * batch (batch size 8) and is not prompt-cached, so each is kept under ~1700
+ * characters — roughly 400 tokens per batch, the same order as the
+ * unconditional `_PROCESSING_RULES` block it sits beside.
  */
 export const PROFILE_MEMORY_DEFAULTS: Record<string, BankMissionExtras> = {
   "health-coach": {
     disposition: { skepticism: 2, literalism: 2, empathy: 5 },
     observations_mission:
-      "Synthesise the person's wellbeing patterns, motivations, and emotional " +
-      "context — how habits, setbacks, and encouragement connect over time.",
+      "You consolidate the memory of a health and fitness coach working with one person. This bank records how that person actually lives and trains.\n" +
+      "\n" +
+      "Synthesise into durable observations:\n" +
+      "- Goals, targets, and the plan currently in force, with the reasoning behind each.\n" +
+      "- Training, nutrition, sleep, and alcohol patterns as they hold over weeks — what the person reliably does, not what they did once.\n" +
+      "- Constraints that shape the plan: injuries, medical guidance, schedule, equipment, foods and sessions they refuse.\n" +
+      "- Motivations, and what actually helps or backfires when they slip.\n" +
+      "- Trends in the numbers: direction and range over time, not any single reading.\n" +
+      "- Corrections to earlier beliefs, recorded explicitly as corrections.\n" +
+      "\n" +
+      "A single day's log, weight reading, or session is evidence, not an observation. Record one only when it establishes or changes a standing pattern, target, or constraint — then fold it into the observation for that pattern and say what changed and roughly when.\n" +
+      "\n" +
+      "Granularity: one observation per habit, target, constraint, or trend. Aggregate repeated daily evidence into the observation for that pattern rather than creating one per day, and keep training, nutrition, and sleep as separate observations.\n" +
+      "\n" +
+      "Word observations as the person's own pattern and framing, never as a verdict on them.",
   },
   "executive-assistant": {
     disposition: { skepticism: 4, literalism: 4, empathy: 3 },
+    observations_mission:
+      "You consolidate the memory of an executive assistant working for one person. This bank records that person's commitments, people, and standing arrangements.\n" +
+      "\n" +
+      "Synthesise into durable observations:\n" +
+      "- Standing rules and preferences: how they want things scheduled, written, and filed, and when they want to be interrupted.\n" +
+      "- People and organisations, and the relationship: who they are, what they are involved in, how to reach them.\n" +
+      "- Recurring commitments and routines, and the constraints around them.\n" +
+      "- Obligations and their state: what was promised to whom, the deadline, and what is still outstanding.\n" +
+      "- Decisions made and decisions deferred, with the reasoning and the trade accepted.\n" +
+      "- Corrections to earlier beliefs, recorded explicitly as corrections.\n" +
+      "\n" +
+      "Live commitment state IS durable knowledge here, not ephemeral chatter. An outstanding obligation, a travel window, an unanswered request, a \"currently X\" arrangement — these are precisely what this agent must recall later. Keep them, and embed the date inside the observation text so a later reader can judge staleness. Do not drop them as ephemeral.\n" +
+      "\n" +
+      "Granularity: one observation per person, arrangement, or obligation. Aggregate repeated mentions into that observation rather than creating siblings; never merge two different people or two different commitments into one.\n" +
+      "\n" +
+      "Do not synthesise from transcript exhaust: tool calls and their results, message or event identifiers, or narration of what the assistant did.",
   },
   coding: {
     disposition: { skepticism: 4, literalism: 5, empathy: 2 },
+    observations_mission:
+      "You consolidate the memory of a software-engineering agent. This bank records real work on real codebases.\n" +
+      "\n" +
+      "Synthesise into durable observations:\n" +
+      "- Architecture and design decisions, each with its rationale and the trade accepted.\n" +
+      "- Root causes, with the evidence chain, and negative results — what was ruled out matters as much as what was found.\n" +
+      "- How the repository works: build, test, and lint commands, conventions, CI gates, and where things live.\n" +
+      "- Outcomes of code work: issue and PR numbers, what changed, whether it merged, what review found.\n" +
+      "- The user's standing rules, preferences, and corrections to this agent's behaviour.\n" +
+      "- Corrections to earlier beliefs, recorded explicitly as corrections.\n" +
+      "\n" +
+      "Repository and service state IS durable knowledge here, not ephemeral chatter. Versions, a failing gate, an open PR, a measured number, a \"currently X\" claim — these are precisely what this agent must recall later. Keep them, and embed the date inside the observation text so a later reader can judge staleness. Do not drop them as ephemeral.\n" +
+      "\n" +
+      "Granularity: one observation per distinct decision, cause, convention, or work item. Aggregate repeated evidence about the same one into that observation rather than creating siblings; never merge two separate decisions into a single summary.\n" +
+      "\n" +
+      "Do not synthesise from transcript exhaust: tool calls and their results, scratch paths, session or request identifiers, or narration of what the agent did. Prefer specific and falsifiable — naming the file, the number, the commit, or the decision beats summarising the topic.",
   },
 };
 
