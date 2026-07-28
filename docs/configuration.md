@@ -542,7 +542,7 @@ agents:
 
 ### Pooling observations across agents — `memory.observation_scopes`
 
-Hindsight stamps every retained row with an **observation scope**, which decides where consolidation files the observations it derives from that row. The engine default is a scope **per tag**. Since switchroom tags retains per session, several agents writing into one shared bank end up in parallel per-tag silos: each agent's observations consolidate on their own and never merge, so the shared bank never builds a shared picture.
+Hindsight stamps every retained row with an **observation scope**, which decides where consolidation files the observations it derives from that row. The engine default is **`combined`**: one consolidation pass using all the tags on the retain together, producing an observation tagged with that full set. Switchroom stamps exactly one tag per retain (`retainTags: ["{session_id}"]`), so that single pass is scoped to a single session. Because a session id never repeats, each session creates a fresh observation rather than growing an existing one. Several agents writing into one shared bank therefore end up in parallel per-session silos: each agent's observations consolidate on their own and never merge, so the shared bank never builds a shared picture.
 
 Set `memory.observation_scopes: shared` to send an agent's retains into **one global untagged scope** instead:
 
