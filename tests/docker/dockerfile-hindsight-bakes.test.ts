@@ -937,6 +937,62 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(/^    ast\.parse\(s\)$/m);
   });
 
+  it("keeps the consolidation-maxItems-grammar fix (assert-guarded, fail-loud)", () => {
+    // `_build_response_model()` constrained `creates` with
+    // `PydanticField(max_length=clamped)` where `clamped` is the bank's
+    // REMAINING OBSERVATION-SLOT COUNT, so the request schema carried
+    // `"maxItems": 4230` on this fleet. llama.cpp/Ollama compile that to GBNF
+    // and a repetition count that large fails to build — HTTP 400 "Failed to
+    // initialize samplers: failed to parse grammar" — after which LiteLLM's
+    // router fallback re-sent the whole batch, verbatim private corpus text
+    // included, to the METERED OpenRouter deployment (56 such fallbacks logged
+    // for `Received Model Group=gpt-oss-20b-consolidation`, 2026-07-28).
+    //
+    // SCOPE: this test is structural, not behavioural. Every assertion below is
+    // an unanchored substring match, so it proves the patch is PRESENT, never
+    // that the number it emits is compilable — raising the ceiling to 100_000
+    // keeps all of them green. The behavioural gate is
+    // tests/docker/hindsight-maxitems-grammar-patch.test.ts, which applies this
+    // block to the pinned image and reads the `maxItems` pydantic actually
+    // serialises at a production-like 4,230. Do not treat this file as
+    // sufficient.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight consolidation-maxItems-grammar patch/,
+    );
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: anchor found \{n\}x \(expected 1\) in \{rel\} — upstream "/,
+    );
+    // The ceiling, and the branch that omits the constraint above it. Omitting
+    // beats clamping: a clamp moves the threshold and asserts a bound that is
+    // not true, so `maxItems` would still be a number nobody can compile at
+    // some other bank size.
+    expect(dockerfile).toMatch(/SWITCHROOM_MAX_CREATES_SCHEMA_CEILING = 64\\n/);
+    expect(dockerfile).toMatch(
+      /if max_creates > SWITCHROOM_MAX_CREATES_SCHEMA_CEILING:\\n/,
+    );
+    // The premise that makes omission safe: the cap is still enforced in
+    // Python after validation. If upstream ever drops that truncation, this
+    // patch must fail the build rather than silently uncap observations.
+    expect(dockerfile).toMatch(
+      /assert "creates = creates\[:remaining_observation_slots\]" in new,/,
+    );
+    // The caller contract the whole defect hangs on.
+    expect(dockerfile).toMatch(
+      /assert new\.count\("_build_response_model\(max_creates=remaining_observation_slots\)"\) == 1,/,
+    );
+    // Post-replace re-assertions (verification-on-build): a patch that applied
+    // but landed inert must fail the build.
+    expect(dockerfile).toMatch(
+      /assert new\.count\("SWITCHROOM_MAX_CREATES_SCHEMA_CEILING"\) == 2,/,
+    );
+    expect(dockerfile).toMatch(/assert new\.count\("max_length=clamped"\) == 1,/);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight consolidation-maxItems-grammar patch: the consolidation /,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
