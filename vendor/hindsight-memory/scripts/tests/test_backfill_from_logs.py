@@ -53,12 +53,16 @@ class FakeDaemon:
     def __init__(self):
         self.docs = {}
         self.posts = []
+        # switchroom: the observation_scopes kwarg each POST carried.
+        self.observation_scopes_seen = []
         self.max_inflight_seen = 0
         self._inflight = 0
         self.membership_error = False
 
     def retain(self, bank_id, content, document_id="conversation", context=None,
-               metadata=None, tags=None, timeout=15, async_processing=True):
+               metadata=None, tags=None, timeout=15, async_processing=True,
+               observation_scopes=None):
+        self.observation_scopes_seen.append(observation_scopes)
         self._inflight += 1
         self.max_inflight_seen = max(self.max_inflight_seen, self._inflight)
         try:

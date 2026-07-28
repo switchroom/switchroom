@@ -443,6 +443,7 @@ def run_subagent_retain(hook_input: dict) -> dict:
                 tags=payload["tags"],
                 timeout=15,
                 async_processing=False,
+                observation_scopes=payload.get("observation_scopes"),
             )
         except Exception as e:
             print(f"[Hindsight] Sidechain retain failed: {e}", file=sys.stderr)

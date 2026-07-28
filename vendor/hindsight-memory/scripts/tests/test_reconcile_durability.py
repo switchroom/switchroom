@@ -41,12 +41,16 @@ class FakeDaemon:
 
     def __init__(self):
         self.docs = {}          # document_id -> {content, metadata, async}
+        # switchroom: the observation_scopes kwarg each POST carried.
+        self.observation_scopes_seen = []
         self.posts = []         # [(document_id, async_processing)]
         self.fail = False
         self.drop_async = False
 
     def retain(self, bank_id, content, document_id="conversation", context=None,
-               metadata=None, tags=None, timeout=15, async_processing=True):
+               metadata=None, tags=None, timeout=15, async_processing=True,
+               observation_scopes=None):
+        self.observation_scopes_seen.append(observation_scopes)
         self.posts.append((document_id, async_processing))
         if self.fail:
             raise RuntimeError("simulated daemon failure")
@@ -388,6 +392,85 @@ class TestSidechainSkip(DurabilityTestBase):
         # ... while the genuine parent session WAS reconciled.
         for i in range(4):
             self.assertIn(f"user turn {i}", blob)
+
+
+class TestObservationScopes(DurabilityTestBase):
+    """switchroom — the per-row observation scope on the LIVE retain paths.
+
+    Asserts the OUTCOME on the wire: what scope the Stop hook, the boot
+    reconciler, and the pending-queue drain actually POST with. Each of those
+    is a separate hand-enumerated kwarg list, so each needs its own pin — a
+    miss on any one silently drops that path back to per-tag scopes.
+    """
+
+    def _hook(self, session="scopesess", n=5):
+        tpath = os.path.join(self.transcripts, f"{session}.jsonl")
+        _write_transcript(tpath, n, session_prefix=session)
+        return {"session_id": session, "transcript_path": tpath, "cwd": "/x"}
+
+    def _set_scope(self, value):
+        os.environ["HINDSIGHT_OBSERVATION_SCOPES"] = value
+        self.addCleanup(os.environ.pop, "HINDSIGHT_OBSERVATION_SCOPES", None)
+
+    # -- default: nothing changes -------------------------------------------
+    def test_unconfigured_stop_retain_posts_no_scope(self):
+        hook = self._hook("plainsess")
+        with mock.patch("retain.increment_turn_count", return_value=3), \
+             mock.patch("sys.stdin", _stdin(hook)):
+            retain.main()
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
+
+    # -- Stop hook (retain.py) ----------------------------------------------
+    def test_configured_stop_retain_posts_the_scope(self):
+        self._set_scope("shared")
+        hook = self._hook("livesess")
+        with mock.patch("retain.increment_turn_count", return_value=3), \
+             mock.patch("sys.stdin", _stdin(hook)):
+            retain.main()
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s == "shared" for s in self.daemon.observation_scopes_seen))
+
+    # -- boot reconciler (reconcile_tail.py) --------------------------------
+    def test_configured_boot_reconcile_posts_the_scope(self):
+        self._set_scope("shared")
+        hook = self._hook("reconsess")
+        reconcile_tail.reconcile(self._config(), hook_input=hook)
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s == "shared" for s in self.daemon.observation_scopes_seen))
+
+    # -- durability: the scope survives the pending queue --------------------
+    def test_scope_survives_failure_enqueue_and_drain(self):
+        self._set_scope("shared")
+        hook = self._hook("failsess")
+
+        # The daemon refuses, so the Stop retain is ENQUEUED rather than landed.
+        self.daemon.fail = True
+        with mock.patch("retain.increment_turn_count", return_value=3), \
+             mock.patch("sys.stdin", _stdin(hook)):
+            retain.main()
+        entries = self._pending_entries()
+        self.assertEqual(len(entries), 1)
+        _path, entry = entries[0]
+        # The queued entry carries the scope, so the drain does not have to
+        # re-resolve config that may have changed since.
+        self.assertEqual(entry["observation_scopes"], "shared")
+
+        # Drain it hours later: it lands in the SAME scope.
+        import drain_pending
+        seen = []
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            def retain(self, **kwargs):
+                seen.append(kwargs.get("observation_scopes"))
+                return {"ok": True}
+
+        with mock.patch.object(drain_pending, "HindsightClient", _Client):
+            drain_pending._retry_one(entry, timeout=15)
+        self.assertEqual(seen, ["shared"])
 
 
 def _stdin(obj):

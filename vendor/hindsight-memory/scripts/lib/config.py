@@ -172,6 +172,15 @@ DEFAULTS = {
     "retainContext": "claude-code",
     "retainTags": [],
     "retainMetadata": {},
+    # Switchroom-local: per-row Hindsight `observation_scopes` on every retain.
+    # `"shared"` makes consolidation write this item's observations into ONE
+    # global untagged scope instead of a scope per tag — what a set of agents
+    # pooling one bank needs. `None` (the default) omits the field from the
+    # wire body entirely, leaving the engine's own default in force. Set by
+    # start.sh from `agents.<name>.memory.observation_scopes` (cascading
+    # through `defaults.memory.observation_scopes`) via
+    # HINDSIGHT_OBSERVATION_SCOPES, exported ONLY when the operator opted in.
+    "observationScopes": None,
     # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson & anti-pattern
     # tagging at retain time. When on (default), build_retain_payload scans the
     # formatted transcript slice for explicit lesson / anti-pattern markers and
@@ -319,6 +328,11 @@ ENV_OVERRIDES = {
     "HINDSIGHT_AUTO_RECALL": ("autoRecall", bool),
     "HINDSIGHT_AUTO_RETAIN": ("autoRetain", bool),
     "HINDSIGHT_RETAIN_MODE": ("retainMode", str),
+    # Switchroom-local: per-row observation scope on retains. Set by start.sh
+    # from agents.<name>.memory.observation_scopes (cascading through
+    # defaults.memory.observation_scopes) ONLY when the operator set it; unset
+    # leaves `observationScopes` None and the field off the wire entirely.
+    "HINDSIGHT_OBSERVATION_SCOPES": ("observationScopes", str),
     # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson/anti-pattern tagging
     # + recall demotion toggles and overrides.
     "HINDSIGHT_LESSON_TAGGING": ("lessonTagging", bool),

@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Agents sharing a bank can pool their observations, instead of siloing them per tag
+
+Hindsight stores an `observation_scopes` field on each retained row. It decides
+where consolidation files that item's observations: the default puts them in a
+scope per tag, and `"shared"` puts them in one global untagged scope. On a bank
+several agents write into, per-tag scoping means each agent's observations
+consolidate on their own and never merge, so the shared bank never actually
+gets a shared picture.
+
+The engine has accepted and stored the field all along. The plugin could not
+send it — no callsite in `vendor/hindsight-memory/` mentioned it, so a bank
+could not be pooled from switchroom at all. This is the plumbing for it, end to
+end: `memory.observation_scopes` in `switchroom.yaml` (per-agent or under
+`defaults`) becomes `HINDSIGHT_OBSERVATION_SCOPES` in the agent's `start.sh`,
+which the plugin puts on every retain it POSTs.
+
+Every retain path carries it, not just the obvious one — the Stop hook, the
+sidechain (sub-agent) retain, the boot reconciler, the pending-queue drain and
+the historical backfill each hand-enumerate their `client.retain()` kwargs, and
+a path missed is a path that silently keeps writing per-tag. The scope is also
+carried ON the queued payload rather than re-read at drain time, so a retain
+that fails now and drains hours later lands in the scope it was written for.
+Queue entries written by an older build carry no such key and must keep
+draining; the drain reads it with `.get`, and a test pins that a pre-feature
+entry still posts (a `KeyError` there would strand the last on-disk copy of a
+turn).
+
+**Nothing changes unless you set it.** With the knob unset, `start.sh` emits no
+export, the plugin's `observationScopes` stays `None`, and the field is omitted
+from the request body entirely — not sent as null. A test asserts the unset
+body is byte-identical to the pre-change one. No bank is switched to shared
+scope by this change.
+
 ## v0.19.28 — private memories can no longer be shipped to a paid outside provider by accident
 
 **The headline, in plain language.** Every agent's memories are meant to be

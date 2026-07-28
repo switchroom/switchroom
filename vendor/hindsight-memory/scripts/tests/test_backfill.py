@@ -35,6 +35,8 @@ class FakeDaemon:
 
     def __init__(self):
         self.docs = {}                 # document_id -> {content, ...}
+        # switchroom: the observation_scopes kwarg each POST carried.
+        self.observation_scopes_seen = []
         self.posts = []                # [(document_id, async_processing)]
         self.mission_patches = []      # set_bank_mission calls (must stay empty)
         self.fail = False
@@ -42,7 +44,9 @@ class FakeDaemon:
         self._inflight = 0
 
     def retain(self, bank_id, content, document_id="conversation", context=None,
-               metadata=None, tags=None, timeout=15, async_processing=True):
+               metadata=None, tags=None, timeout=15, async_processing=True,
+               observation_scopes=None):
+        self.observation_scopes_seen.append(observation_scopes)
         self._inflight += 1
         self.max_inflight_seen = max(self.max_inflight_seen, self._inflight)
         try:
@@ -166,6 +170,24 @@ class TestBackfill(BackfillTestBase):
         # Every durability POST is commit-before-ack.
         self.assertTrue(self.daemon.posts)
         self.assertTrue(all(async_flag is False for _, async_flag in self.daemon.posts))
+
+    # -- switchroom: per-row observation scope on the backfill path ---------
+    def test_backfill_omits_the_scope_when_unconfigured(self):
+        self._transcript("clerk", "sess-plain", 4)
+        bf.Backfill(self._config(), commit=True, delay_ms=0).run()
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
+
+    def test_backfill_posts_the_configured_scope(self):
+        # The backfill enumerates its own retain kwargs; a miss here would
+        # scatter every recovered historical slice into per-tag scopes while
+        # live retains pooled into the shared one.
+        os.environ["HINDSIGHT_OBSERVATION_SCOPES"] = "shared"
+        self.addCleanup(os.environ.pop, "HINDSIGHT_OBSERVATION_SCOPES", None)
+        self._transcript("clerk", "sess-scoped", 4)
+        bf.Backfill(self._config(), commit=True, delay_ms=0).run()
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s == "shared" for s in self.daemon.observation_scopes_seen))
 
     # -- Dedups against a pre-existing document with the same deterministic id
     def test_dedups_against_preexisting_document_id(self):

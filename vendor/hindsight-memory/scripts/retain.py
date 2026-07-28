@@ -368,6 +368,13 @@ def build_retain_payload(
         "context": config.get("retainContext", "claude-code"),
         "metadata": metadata,
         "tags": tags,
+        # Per-row observation scope (switchroom). None unless the operator set
+        # memory.observation_scopes — and a None is dropped at the wire by
+        # HindsightClient._retain_one, so the default request body is unchanged.
+        # Carried ON THE PAYLOAD so it survives the pending-retains queue: a
+        # retain that fails and drains hours later must land in the SAME scope
+        # it would have landed in inline.
+        "observation_scopes": config.get("observationScopes"),
     }
     return {
         "payload": payload,
@@ -573,6 +580,7 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
                 tags=payload["tags"],
                 timeout=15,
                 async_processing=False,
+                observation_scopes=payload.get("observation_scopes"),
             )
         except Exception as e:
             print(f"[Hindsight] Retain failed: {e}", file=sys.stderr)

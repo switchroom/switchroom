@@ -506,6 +506,24 @@ export const AgentMemorySchema = z
         "silent hook-side write). Set false to disable per-agent. " +
         "Cascade: override (per-agent wins over default)."
       ),
+    observation_scopes: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-row observation scope stamped on every memory this agent " +
+        "retains. \"shared\" makes Hindsight's consolidation write the " +
+        "resulting observations into ONE global untagged scope instead of a " +
+        "scope per tag — what several agents pooling one bank need so their " +
+        "observations actually merge rather than sitting in parallel " +
+        "per-tag silos. OMITTED BY DEFAULT: unset means the field never goes " +
+        "on the wire and the engine's own default stands, which is the " +
+        "shipped behaviour. Applies to every retain path (Stop hook, " +
+        "sidechain, boot reconcile, queue drain, backfill) and is carried on " +
+        "the queued payload, so a retain that fails now and drains later " +
+        "still lands in this scope. Cascade: override (per-agent wins over " +
+        "default)."
+      ),
     recall: z
       .object({
         max_memories: z
@@ -3221,6 +3239,10 @@ const profileFields = {
       // defaults/profile tier too, so `defaults.memory.directive_capture_nudge:
       // false` can disable the #2848 nudge fleet-wide (per-agent `true` opt-in).
       directive_capture_nudge: z.boolean().optional(),
+      // Mirror of AgentMemorySchema.observation_scopes — accepted at the
+      // defaults/profile tier too, so `defaults.memory.observation_scopes:
+      // shared` pools a whole fleet's observations with per-agent opt-out.
+      observation_scopes: z.string().min(1).optional(),
       recall: z
         .object({
           max_memories: z.number().int().min(0).optional(),

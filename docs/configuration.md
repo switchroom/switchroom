@@ -540,6 +540,29 @@ agents:
 
 **Cascade: override** (per-agent wins over profile/defaults). Omit the field to inherit the on-by-default. Operationally the knob threads the same way as the other recall tuning: the switchroom default is pinned in the plugin's `settings.json`, and `start.sh` exports `HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE` only when you override it (the env value wins at plugin load). Serves the `remember-across-sessions` job.
 
+### Pooling observations across agents — `memory.observation_scopes`
+
+Hindsight stamps every retained row with an **observation scope**, which decides where consolidation files the observations it derives from that row. The engine default is a scope **per tag**. Since switchroom tags retains per session, several agents writing into one shared bank end up in parallel per-tag silos: each agent's observations consolidate on their own and never merge, so the shared bank never builds a shared picture.
+
+Set `memory.observation_scopes: shared` to send an agent's retains into **one global untagged scope** instead:
+
+```yaml
+defaults:
+  memory:
+    observation_scopes: shared    # pool the whole fleet's observations
+
+agents:
+  clerk:
+    memory:
+      observation_scopes: shared  # or just the agents sharing a bank
+```
+
+**Omitted by default.** Leave it unset and the field never goes on the wire at all — the engine's own default stands and nothing about your retains changes. Only set it on agents that genuinely share a bank; on an agent with its own bank it buys nothing.
+
+It applies to *every* retain path — the Stop hook, sub-agent (sidechain) retains, the boot reconciler, the pending-queue drain and the historical backfill — and the value is carried on the queued payload, so a retain that fails now and drains hours later still lands in the scope it was written for. Changing the knob does **not** re-scope already-consolidated observations; it binds new retains only.
+
+**Cascade: override** (per-agent wins over profile/defaults). `start.sh` exports `HINDSIGHT_OBSERVATION_SCOPES` only when you set it. Serves the `remember-across-sessions` job.
+
 ### Server-side caps on the Hindsight container
 
 `switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. The same default is baked into the `--compose` snippet output.

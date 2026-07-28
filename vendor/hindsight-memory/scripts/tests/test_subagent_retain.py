@@ -289,7 +289,7 @@ class BoundedRead(unittest.TestCase):
 
 
 class RunSubagentRetain(unittest.TestCase):
-    def _run(self, hook_input):
+    def _run(self, hook_input, config_extra=None):
         captured = {}
 
         class _Client:
@@ -300,7 +300,8 @@ class RunSubagentRetain(unittest.TestCase):
                 captured.update(kwargs)
                 return {"ok": True}
 
-        with mock.patch("subagent_retain.load_config", return_value=dict(CONFIG)), \
+        config = dict(CONFIG, **(config_extra or {}))
+        with mock.patch("subagent_retain.load_config", return_value=config), \
                 mock.patch("subagent_retain.get_api_url", return_value="http://x"), \
                 mock.patch("subagent_retain.ensure_bank_mission"), \
                 mock.patch("subagent_retain.derive_bank_id", return_value="agentbank"), \
@@ -335,6 +336,43 @@ class RunSubagentRetain(unittest.TestCase):
         # Distinct provenance context.
         self.assertEqual(captured["context"], "claude-code-sidechain")
         self.assertEqual(captured["metadata"]["parent_session_id"], "parentsess")
+
+    def test_sidechain_retain_omits_the_scope_when_unconfigured(self):
+        # switchroom — default behaviour must be byte-identical: the sidechain
+        # POST carries no scope, so the engine default stands.
+        with tempfile.TemporaryDirectory() as d:
+            sc = os.path.join(d, "agent-af5.jsonl")
+            _write_sidechain(sc, 8, chars_per_msg=400)
+            hook_input = {
+                "session_id": "parentsess",
+                "agent_id": "af5",
+                "agent_transcript_path": sc,
+                "transcript_path": os.path.join(d, "parentsess.jsonl"),
+                "cwd": d,
+            }
+            result, captured = self._run(hook_input)
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(captured["observation_scopes"])
+
+    def test_sidechain_retain_posts_the_configured_scope(self):
+        # switchroom — sidechain retains are their own hand-enumerated kwarg
+        # list; without this pin they would silently keep per-tag scopes while
+        # the parent session's retains moved to the shared one.
+        with tempfile.TemporaryDirectory() as d:
+            sc = os.path.join(d, "agent-af5.jsonl")
+            _write_sidechain(sc, 8, chars_per_msg=400)
+            hook_input = {
+                "session_id": "parentsess",
+                "agent_id": "af5",
+                "agent_transcript_path": sc,
+                "transcript_path": os.path.join(d, "parentsess.jsonl"),
+                "cwd": d,
+            }
+            result, captured = self._run(
+                hook_input, config_extra={"observationScopes": "shared"}
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(captured["observation_scopes"], "shared")
 
     def test_document_id_is_stable_across_refires(self):
         with tempfile.TemporaryDirectory() as d:
