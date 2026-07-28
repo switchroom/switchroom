@@ -16,6 +16,8 @@ import { finalizeCallback, type FinalizeCallbackContext } from '../inline-keyboa
 interface Capture {
   acks: Array<{ text?: string; show_alert?: boolean }>
   edits: Array<{ text: string | { markdown: string }; opts: Record<string, unknown> }>
+  markupEdits: Array<Record<string, unknown>>
+  replies: string[]
   ackThrows?: Error
   editThrows?: Error
 }
@@ -32,13 +34,30 @@ function mkCtx(cap: Capture): FinalizeCallbackContext {
       if (cap.editThrows) throw cap.editThrows
       return { message_id: 1 }
     },
+    editMessageReplyMarkup: async (opts) => {
+      cap.markupEdits.push(opts ?? {})
+      return true
+    },
+    reply: async (text) => {
+      cap.replies.push(text)
+      return { message_id: 2 }
+    },
   }
 }
 
+/**
+ * Passthrough stand-in for the gateway's `robustApiCall` (#3891). The helper
+ * now REQUIRES the retry/flood seam; these three-invariant cases are about the
+ * invariants, not the policy, so they hand in a transparent one. The policy's
+ * own outcomes are pinned in `finalize-callback-flood-policy.test.ts`.
+ */
+const passthrough = <T>(fn: () => Promise<T>): Promise<T> => fn()
+
 describe('finalizeCallback — three-invariant contract', () => {
   it('invariant 1: acks the callback with the supplied toast text', async () => {
-    const cap: Capture = { acks: [], edits: [] }
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'Approved',
       newText: 'Original prompt\n\n✓ Approved by @op',
     })
@@ -48,8 +67,9 @@ describe('finalizeCallback — three-invariant contract', () => {
   })
 
   it('invariant 1: alert=true renders as full modal (show_alert: true)', async () => {
-    const cap: Capture = { acks: [], edits: [] }
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'Vault grant revoked',
       alert: true,
       newText: '...',
@@ -58,8 +78,9 @@ describe('finalizeCallback — three-invariant contract', () => {
   })
 
   it('invariant 2: strips reply_markup AND rich-edits the body in one atomic call', async () => {
-    const cap: Capture = { acks: [], edits: [] }
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'Approved',
       newText: '**✓ Approved**\n\nGrant minted at 22:38 UTC',
     })
@@ -75,8 +96,8 @@ describe('finalizeCallback — three-invariant contract', () => {
   })
 
   it('invariant 2: literalText edits a plain string (no rich wrapper, no parse_mode)', async () => {
-    const cap: Capture = { acks: [], edits: [] }
-    await finalizeCallback(mkCtx(cap), { ackText: 'ok', newText: 'plain', literalText: true })
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
+    await finalizeCallback(mkCtx(cap), { ackText: 'ok', newText: 'plain', literalText: true, apiCall: passthrough })
     expect(cap.edits[0]?.text).toBe('plain')
     expect(cap.edits[0]?.opts.parse_mode).toBeUndefined()
   })
@@ -91,8 +112,11 @@ describe('finalizeCallback — three-invariant contract', () => {
         order.push('edit-end')
         return { message_id: 1 }
       },
+      editMessageReplyMarkup: async () => { order.push('markup'); return true },
+      reply: async () => { order.push('reply'); return { message_id: 2 } },
     }
     await finalizeCallback(ctx, {
+      apiCall: passthrough,
       ackText: 'ok',
       newText: '...',
       synthInbound: () => { order.push('synth') },
@@ -108,8 +132,9 @@ describe('finalizeCallback — three-invariant contract', () => {
 
   it('invariant 3: async synthInbound is awaited', async () => {
     let synthResolved = false
-    const cap: Capture = { acks: [], edits: [] }
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'ok',
       newText: '...',
       synthInbound: async () => {
@@ -122,9 +147,10 @@ describe('finalizeCallback — three-invariant contract', () => {
 
   it('invariant 3: synthInbound errors are caught + logged, never propagated', async () => {
     const logs: string[] = []
-    const cap: Capture = { acks: [], edits: [] }
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
     await expect(
       finalizeCallback(mkCtx(cap), {
+        apiCall: passthrough,
         ackText: 'ok',
         newText: '...',
         synthInbound: () => { throw new Error('inject_inbound IPC closed') },
@@ -143,9 +169,12 @@ describe('finalizeCallback — three-invariant contract', () => {
     const cap: Capture = {
       acks: [],
       edits: [],
+      markupEdits: [],
+      replies: [],
       editThrows: new Error('Bad Request: message to edit not found'),
     }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'Approved',
       newText: '...',
       synthInbound: () => { synthFired = true },
@@ -163,9 +192,12 @@ describe('finalizeCallback — three-invariant contract', () => {
     const cap: Capture = {
       acks: [],
       edits: [],
+      markupEdits: [],
+      replies: [],
       ackThrows: new Error('query is too old'),
     }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'Approved',
       newText: 'edited body',
       synthInbound: () => { synthFired = true },
@@ -181,8 +213,9 @@ describe('finalizeCallback — three-invariant contract', () => {
   })
 
   it('synthInbound is optional — surfaces with no model in the loop just ack + edit', async () => {
-    const cap: Capture = { acks: [], edits: [] }
+    const cap: Capture = { acks: [], edits: [], markupEdits: [], replies: [] }
     await finalizeCallback(mkCtx(cap), {
+      apiCall: passthrough,
       ackText: 'Dismissed',
       newText: '✗ Dismissed',
     })

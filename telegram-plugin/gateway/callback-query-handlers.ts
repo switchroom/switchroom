@@ -766,6 +766,7 @@ async function handleVaultRecentDenialCallback(ctx: Context, data: string): Prom
     `(grant \`${id}\`). ` +
     `Re-run /vault audit to act on remaining denials.`
   await finalizeCallback(ctx, {
+    apiCall: robustApiCall,
     ackText: '✅ Grant minted',
     newText: baseText ? `${baseText}${statusLine}` : statusLine,
     // No synthInbound — operator-only flow. The granted agent picks
@@ -1909,6 +1910,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       `\n\n✏️ **Rename mode** — send the new key name as your next message. ` +
       `The current proposed key is \`${pending.key}\`.`
     await finalizeCallback(ctx, {
+      apiCall: robustApiCall,
       ackText: 'Send the new key name as your next message.',
       newText: baseText ? `${baseText}${statusLine}` : statusLine,
     })
@@ -2512,6 +2514,7 @@ async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<P
   const successText = `✅ Grant \`${id}\` created. Written to \`~/.switchroom/agents/${escapeHtmlForTg(state.agent!)}/.vault-token\``
   if (msgId != null) {
     await finalizeCallback(ctx, {
+      apiCall: robustApiCall,
       ackText: '✅ Grant created',
       newText: successText,
       // No synthInbound — operator-only flow.
@@ -2933,6 +2936,7 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
       // scrollback shows the dismissal.
       const status = `\n\n✗ _Dismissed by operator._`
       await finalizeCallback(ctx, {
+        apiCall: robustApiCall,
         ackText: 'Dismissed',
         newText: sourceMsgText ? `${sourceMsgText}${status}` : status,
         // No synthInbound — dismiss is operator-only, no model in loop.
@@ -2947,6 +2951,7 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
         // status line is the announcement, no separate reply needed.
         const status = `\n\n🔄 _**${escapeHtmlForTg(agent)}** restart requested by operator._`
         await finalizeCallback(ctx, {
+          apiCall: robustApiCall,
           ackText: `Restarting ${agent}…`,
           newText: sourceMsgText ? `${sourceMsgText}${status}` : status,
         })
@@ -2973,6 +2978,7 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
       // collapsed card.
       const status = `\n\n🔐 _Reauth started for **${escapeHtmlForTg(agent)}** — follow the login URL below._`
       await finalizeCallback(ctx, {
+        apiCall: robustApiCall,
         ackText: `Starting reauth for ${agent}…`,
         newText: sourceMsgText ? `${sourceMsgText}${status}` : status,
         synthInbound: async () => {

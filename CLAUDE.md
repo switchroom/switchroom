@@ -219,7 +219,8 @@ obligation:
 `check-mcp-instructions-budget`, `check-web-subscription-honest`,
 `check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
 `check-litellm-config-guard`, `check-release-asset-names`,
-`check-status-pin-single-path`, `check-agent-attribution-trailers`.
+`check-status-pin-single-path`, `check-agent-attribution-trailers`,
+`check-callback-ctx-wrapping`.
 
 Traps that bite repeatedly:
 
@@ -232,6 +233,16 @@ Traps that bite repeatedly:
   `git config --global core.hooksPath /opt/switchroom/git-hooks`, then
   re-stamp with
   `git rebase -i --exec 'git commit --amend --no-edit' <base>`.
+
+- **`check-callback-ctx-wrapping` ratchets the button-tap path** (#3891). Raw
+  `ctx.answerCallbackQuery` / `ctx.editMessageText` / `ctx.editMessageReplyMarkup`
+  bypass `robustApiCall`, so their 429s never reach the flood ledger and a failed
+  card repaint leaves an already-resolved approval card live and tappable. The
+  guard requires `apiCall` on every `finalizeCallback(` call site and holds the
+  remaining raw sites to an EXACT per-file inventory in
+  `scripts/callback-ctx-wrapping-baseline.json` — adding one fails, and removing
+  one fails until you lower the number in the same PR. Escape hatch (reason
+  mandatory): `// allow-raw-callback-ctx: <reason>` on the preceding line.
 
 - **`check-no-pii-secrets` fails on real operator PII** — real Telegram
   chat/user IDs, emails, hostnames pasted into tests or docs. Use synthetic
