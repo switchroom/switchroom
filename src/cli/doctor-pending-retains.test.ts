@@ -232,6 +232,91 @@ describe("checkPendingRetainsQueues (#1071/#1094)", () => {
     expect(fix).toMatch(/millisecond integer on stdout/);
   });
 
+  // ADJACENCY, not mere presence. The assertions above — and the two #3689
+  // ones below — are all substring checks, and a substring check cannot see
+  // a splice: when a block of serialisation prose was inserted INTO the
+  // middle of this sentence, the operator-facing text read "(must print a
+  // SAFE ALONGSIDE THE `hindsight-drain` SIDECAR …" and picked the sentence
+  // back up nine lines later with "…to replay them. millisecond integer on
+  // stdout; unset = no backoff)." Both fragments still existed, so every
+  // touching test stayed green while the remediation was incoherent at
+  // exactly the point it explains the backoff contract. Green tests
+  // asserting the wrong thing are worse than no test, so assert the sentence
+  // is CONTIGUOUS.
+  it("warn: the p95 backoff sentence is contiguous, not two fragments", () => {
+    const r = checkPendingRetainsQueues(cfg(["ziggy"]), {
+      probe: probeFrom({ ziggy: backlog(400) }),
+    });
+    const fix = r.fix ?? "";
+    expect(
+      fix,
+      "the backoff contract must read as one sentence, start to finish",
+    ).toContain("(must print a millisecond integer on stdout; unset = no backoff).");
+    // …and nothing may be wedged between its two halves. Asserted separately
+    // from the substring above so a failure names WHICH property broke.
+    const opener = fix.indexOf("(must print a");
+    const contract = fix.indexOf("millisecond integer on stdout");
+    expect(opener, "the sentence opener is missing entirely").toBeGreaterThan(-1);
+    expect(contract, "the contract clause is missing entirely").toBeGreaterThan(-1);
+    expect(
+      fix.slice(opener + "(must print a".length, contract),
+      "text was spliced into the middle of the p95 backoff sentence",
+    ).toBe(" ");
+  });
+
+  // The reciprocal: the block that was spliced IN must itself stay whole, so
+  // a future re-anchor of some other paragraph cannot cut this one in half
+  // the same way and still pass on substrings.
+  it("warn: the serialisation and circuit-breaker guidance is contiguous too", () => {
+    const r = checkPendingRetainsQueues(cfg(["ziggy"]), {
+      probe: probeFrom({ ziggy: backlog(400) }),
+    });
+    const fix = r.fix ?? "";
+    expect(fix).toContain(
+      "SAFE ALONGSIDE THE `hindsight-drain` SIDECAR and a session booting " +
+        "underneath you: drain_pending.py takes an exclusive lock on " +
+        "`$HOME/.hindsight/drain-pending.lock` for the whole run",
+    );
+    expect(fix).toContain(
+      "Entries past the attempt ceiling (HINDSIGHT_DRAIN_ATTEMPT_CEILING, " +
+        "default 20) are PARKED and reported rather than retried forever; add " +
+        "`--force` once the upstream is fixed to replay them.",
+    );
+  });
+
+  // #3689: this command is now one of THREE drain paths into the same queue
+  // (the others being the SessionStart hook and the `hindsight-drain`
+  // sidecar). An operator running it cannot know whether one of the others is
+  // mid-run, and two drains on one queue means one memory POSTed twice
+  // against a 4-lane fleet-wide pool. The serialisation lives inside
+  // drain_pending.py precisely so this documented command inherits it -- but
+  // the operator still has to be told, and told NOT to add an `flock` of
+  // their own on that path, which would hold the lock the script then asks
+  // for and turn the drain into a silent no-op.
+  it("warn: the remediation says the documented drain is serialised, and how not to break it", () => {
+    const r = checkPendingRetainsQueues(cfg(["ziggy"]), {
+      probe: probeFrom({ ziggy: backlog(400) }),
+    });
+    const fix = r.fix ?? "";
+    expect(fix).toContain("drain-pending.lock");
+    expect(fix).toMatch(/exclusive lock/i);
+    expect(fix, "the operator must be told not to wrap it").toMatch(
+      /Do NOT wrap this in `flock`/i,
+    );
+  });
+
+  // A parked entry is queue depth that will never go down on its own. An
+  // operator staring at that depth needs the escape hatch named, or the
+  // circuit breaker reads as the drain being broken.
+  it("warn: the remediation names the attempt ceiling and the --force replay", () => {
+    const r = checkPendingRetainsQueues(cfg(["ziggy"]), {
+      probe: probeFrom({ ziggy: backlog(400) }),
+    });
+    const fix = r.fix ?? "";
+    expect(fix).toContain("HINDSIGHT_DRAIN_ATTEMPT_CEILING");
+    expect(fix).toContain("--force");
+  });
+
   it("ok: zero drops and zero evictions never mention either", () => {
     const r = checkPendingRetainsQueues(cfg(["clerk"]), {
       probe: probeFrom({ clerk: ok() }),

@@ -1942,7 +1942,36 @@ export function checkPendingRetainsQueues(
     `request_duration_ms)) from \\"LiteLLM_SpendLogs\\" where \\"startTime\\" > now() ` +
     `- interval '10 minutes' and metadata->>'user_api_key_alias' like 'hindsight-%' and ` +
     `status='success' and request_duration_ms is not null), -1)"\` (must print a ` +
-    `millisecond integer on stdout; unset = no backoff). Fix the upstream first (bank ` +
+    `millisecond integer on stdout; unset = no backoff). ` +
+    // ANCHOR — a SENTENCE BOUNDARY, and that is the whole requirement.
+    // This block belongs beside the documented `--backlog` command it
+    // qualifies, but the sentences immediately under that command were being
+    // rewritten in parallel by #3688, so sitting there guaranteed a conflict
+    // between two PRs meant to land in either order. Moving it was right;
+    // where it landed was not. It went into the MIDDLE of the p95 sentence,
+    // and the operator-facing text became "…-1)\"` (must print a SAFE
+    // ALONGSIDE THE `hindsight-drain` SIDECAR…", picking the sentence back
+    // up nine lines later at "…to replay them. millisecond integer on
+    // stdout; unset = no backoff)." — incoherent at exactly the point it
+    // explains the backoff contract. Every touching test stayed GREEN,
+    // because each asserted a substring that still existed somewhere in the
+    // string.
+    //
+    // So: the p95 sentence now ends at "no backoff)." above, the next one
+    // starts at "Fix the upstream first" below, and this block sits between
+    // two whole sentences. `warn: the p95 backoff sentence is contiguous,
+    // not two fragments` asserts adjacency rather than presence, so the next
+    // re-anchor that splices FAILS instead of passing.
+    `SAFE ALONGSIDE THE \`hindsight-drain\` SIDECAR and a session booting underneath ` +
+    `you: drain_pending.py takes an exclusive lock on ` +
+    `\`$HOME/.hindsight/drain-pending.lock\` for the whole run, so whichever drain ` +
+    `starts second prints "another drain holds ..." and exits without touching the ` +
+    `queue. Do NOT wrap this in \`flock\` on that path yourself — you would hold the ` +
+    `lock the script then asks for, and it would skip every time. Entries past the ` +
+    `attempt ceiling (HINDSIGHT_DRAIN_ATTEMPT_CEILING, default 20) are PARKED and ` +
+    `reported rather than retried forever; add \`--force\` once the upstream is fixed ` +
+    `to replay them. ` +
+    `Fix the upstream first (bank ` +
     `health rows above), or every retry just ages entries toward .dead. Entries the ` +
     `drain retires are MOVED to \`.hindsight/pending-reconciled/\` (bounded, so they ` +
     `expire), never deleted — every retire rests on an HTTP 200, which is an ack and ` +
