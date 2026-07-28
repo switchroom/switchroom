@@ -119,17 +119,17 @@ describe('activity-card durability wiring', () => {
 
   it('the boot reaper runs ONLY after the startup mutex is won (never at import time)', () => {
     // #3026: the reaper is now invoked via the mutex-gated orchestrator
-    // runBootPinCleanupAndDmSweep() (which runs it alongside
-    // statusPinBootCleanup + queuedCardBootReaper, then runs the DM
-    // stale-pin sweep). Invariant unchanged: reachable only post-lock.
+    // runBootPinCleanupAndStalePinSweep() (which runs it alongside
+    // statusPinBootCleanup + queuedCardBootReaper, then runs the stale-pin
+    // stack sweep). Invariant unchanged: reachable only post-lock.
     // (1) The orchestrator runs the reaper. Since the #3664 S2 salvage the
     // steps are INJECTED into runBootPinSweepSteps (each individually
-    // absorbed, so a throwing reaper cannot strand the DM sweep behind it)
+    // absorbed, so a throwing reaper cannot strand the sweep behind it)
     // instead of being awaited inline — so the marker is the step binding.
     const orchestrator = between(
       gatewaySrc,
-      'function runBootPinCleanupAndDmSweep()',
-      'dmPinSweepEligible = true',
+      'function runBootPinCleanupAndStalePinSweep()',
+      'stalePinSweepEligible = true',
     )
     expect(orchestrator).toMatch(/activityCardReaper: activityCardBootReaper,/)
     // (2) Both orchestrator invocation sites (mutex-won + mutex-fallback)
@@ -146,7 +146,7 @@ describe('activity-card durability wiring', () => {
     // statusPinBootCleanup documents.
     const beforeMain = gatewaySrc.split('await acquireStartupLock({')[0] ?? ''
     expect(beforeMain).not.toMatch(/^\s*void activityCardBootReaper\(\)/m)
-    expect(beforeMain).not.toMatch(/^\s*void runBootPinCleanupAndDmSweep\(\)/m)
+    expect(beforeMain).not.toMatch(/^\s*void runBootPinCleanupAndStalePinSweep\(\)/m)
     expect(beforeMain).not.toMatch(/^\s*bootPinSweepGate\.(arm|botReady)\(\)/m)
   })
 

@@ -311,7 +311,7 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
 
   it("every boot pin-cleanup call site follows the won-lock check", () => {
     // #3026: boot cleanup is now invoked via the mutex-gated orchestrator
-    // runBootPinCleanupAndDmSweep(), which awaits statusPinBootCleanup()
+    // runBootPinCleanupAndStalePinSweep(), which awaits statusPinBootCleanup()
     // (+ the other reapers) and then runs the DM stale-pin sweep. The
     // invariant is unchanged: cleanup must only run after the lock is won.
     const lines = gatewaySrc.split("\n");
@@ -344,7 +344,7 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
     );
     expect(declIdx).toBeGreaterThan(-1);
     const orchestratorIdx = lines.findIndex((l) =>
-      /function runBootPinCleanupAndDmSweep/.test(l),
+      /function runBootPinCleanupAndStalePinSweep/.test(l),
     );
     expect(orchestratorIdx).toBeGreaterThan(-1);
     const invocationIdxs = lines
@@ -365,7 +365,7 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
 
   it("the blocked (losing) boot exits before reaching cleanup", () => {
     // In the mutex block, `outcome.status === 'blocked'` must lead to
-    // process.exit(1) BEFORE the winner's runBootPinCleanupAndDmSweep() call
+    // process.exit(1) BEFORE the winner's runBootPinCleanupAndStalePinSweep() call
     // in that block — so a loser never touches the shared store.
     const blockedIdx = gatewaySrc.indexOf("outcome.status === 'blocked'");
     expect(blockedIdx).toBeGreaterThan(-1);

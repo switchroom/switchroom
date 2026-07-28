@@ -55,6 +55,23 @@ export interface StatusPinStoreFsSeam {
 export interface PersistedStatusPin {
   pinKey: string
   chatId: string
+  /**
+   * Forum topic the pinned message lives in, when the caller knows it.
+   *
+   * The durable claim is keyed by `(chat, thread)`, not by chat alone. Telegram's
+   * pin stack is CHAT-WIDE — a "topic pin" is a chat-level pin whose message
+   * happens to sit in that thread, and `pinChatMessage`/`unpinChatMessage` take
+   * no `message_thread_id` at all. So the thread is NOT needed to unpin one
+   * known message; it is needed to DRAIN a topic, because the only topic-scoped
+   * pin verb a bot has is `unpinAllForumTopicMessages(chat_id, message_thread_id)`.
+   *
+   * Without this field a row records "there were orphan pins in forum chat X"
+   * and nothing more, so a boot after a crash cannot aim the one verb that would
+   * clear them — which is how a chat-wide stack grows on every restart. Optional
+   * so a v1–v3 snapshot still loads; a row without it degrades to the
+   * chat-level path.
+   */
+  threadId?: number
   messageId: number
   /** True while the pin API call is in-flight / unconfirmed (see above). */
   pending?: boolean
@@ -102,16 +119,17 @@ export const BOOT_UNPIN_MAX_ATTEMPTS = 5
 
 /** Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
  *  pin (pending undefined). v2 adds the optional `pending` flag. v3 adds the
- *  optional `pinnedAt` claim timestamp (#3810). All load fail-open — an
- *  unknown/newer version yields []. Every field added since v1 is optional, so
- *  the versions are mutually readable and a downgrade degrades rather than
- *  breaks. */
+ *  optional `pinnedAt` claim timestamp (#3810). v4 adds the optional `threadId`
+ *  so the claim is keyed by (chat, thread) and a forum topic can be drained
+ *  after a crash. All load fail-open — an unknown/newer version yields [].
+ *  Every field added since v1 is optional, so the versions are mutually
+ *  readable and a downgrade degrades rather than breaks. */
 interface SnapshotEnvelope {
-  v: 1 | 2 | 3
+  v: 1 | 2 | 3 | 4
   pins: PersistedStatusPin[]
 }
 
-const SNAPSHOT_VERSIONS = new Set([1, 2, 3])
+const SNAPSHOT_VERSIONS = new Set([1, 2, 3, 4])
 
 function isPinRow(x: unknown): x is PersistedStatusPin {
   if (x == null || typeof x !== 'object') return false
@@ -121,6 +139,7 @@ function isPinRow(x: unknown): x is PersistedStatusPin {
     o.pinKey.length > 0 &&
     typeof o.chatId === 'string' &&
     o.chatId.length > 0 &&
+    (o.threadId === undefined || typeof o.threadId === 'number') &&
     typeof o.messageId === 'number' &&
     (o.pending === undefined || typeof o.pending === 'boolean') &&
     (o.expiresAt === undefined || typeof o.expiresAt === 'number') &&
@@ -170,7 +189,7 @@ export function persistStatusPins(
   snapshot: readonly PersistedStatusPin[],
   log: (line: string) => void = (l) => process.stderr.write(l),
 ): void {
-  const env: SnapshotEnvelope = { v: 3, pins: [...snapshot] }
+  const env: SnapshotEnvelope = { v: 4, pins: [...snapshot] }
   const tmp = path + '.tmp'
   try {
     fs.writeFileSync(tmp, JSON.stringify(env))
@@ -450,6 +469,9 @@ export function reconcileAndPersistStatusPin(args: {
   fs: StatusPinStoreFsSeam
   pinKey: string
   chatId: string
+  /** Forum topic the pinned message lives in, when known — persisted so a boot
+   *  after a crash can aim `unpinAllForumTopicMessages` at the right topic. */
+  threadId?: number
   op: StatusPinPersistOp
   /** Execute the real pin/unpin; returns the confirmed message id (pin) or
    *  null (cleared). Must never throw — API errors are swallowed inside. */
@@ -458,7 +480,7 @@ export function reconcileAndPersistStatusPin(args: {
   now?: number
   log?: (line: string) => void
 }): Promise<{ messageId: number } | null> {
-  const { path, fs, pinKey, chatId, op } = args
+  const { path, fs, pinKey, chatId, threadId, op } = args
   const log = args.log ?? ((l: string) => process.stderr.write(l))
   const now = args.now ?? Date.now()
 
@@ -489,7 +511,7 @@ export function reconcileAndPersistStatusPin(args: {
         path,
         fs,
         pinKey,
-        { pinKey, chatId, messageId: op.messageId, pending: true, pinnedAt },
+        { pinKey, chatId, threadId, messageId: op.messageId, pending: true, pinnedAt },
         log,
       )
       const next = await args.applyPin()
@@ -504,7 +526,7 @@ export function reconcileAndPersistStatusPin(args: {
         path,
         fs,
         pinKey,
-        { pinKey, chatId, messageId: next.messageId, pinnedAt: claimAge(next.messageId) },
+        { pinKey, chatId, threadId, messageId: next.messageId, pinnedAt: claimAge(next.messageId) },
         log,
       )
       return next
@@ -541,7 +563,7 @@ export function reconcileAndPersistStatusPin(args: {
         path,
         fs,
         pinKey,
-        { pinKey, chatId, messageId: next.messageId, pinnedAt: claimAge(next.messageId) },
+        { pinKey, chatId, threadId, messageId: next.messageId, pinnedAt: claimAge(next.messageId) },
         log,
       )
     }

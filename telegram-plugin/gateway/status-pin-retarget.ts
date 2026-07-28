@@ -79,6 +79,15 @@ export interface StatusPinClaim {
   messageId: number
   /** Chat the pin lives in. Never empty — the reconcile refuses an empty chat. */
   chatId: string
+  /**
+   * Forum topic the pinned message lives in, when known.
+   *
+   * The claim is keyed by `(chat, thread)`. It is NOT needed to unpin this one
+   * message (`unpinChatMessage` takes no `message_thread_id`), but it is the
+   * only thing that lets a sweep aim `unpinAllForumTopicMessages` at the right
+   * topic when a crash leaves a chat-wide stack of orphans behind.
+   */
+  threadId?: number
   /** Wall-clock ms the claim was FIRST taken (survives a same-id re-pin). */
   pinnedAt: number
 }
@@ -86,6 +95,9 @@ export interface StatusPinClaim {
 export interface StatusPinReconcileArgs {
   pinKey: string
   chatId: string
+  /** Forum topic the pinned message lives in, when the caller knows it. Carried
+   *  into both the in-memory claim and the durable row (see StatusPinClaim). */
+  threadId?: number
   /** The claim held for this key when the reconcile started. */
   prev: PinState | null
   /** What the caller wants pinned for this key now. */
@@ -116,7 +128,7 @@ export interface StatusPinReconcileArgs {
  * is read once by the caller and both legs run inside that critical section.
  */
 export async function runStatusPinReconcile(args: StatusPinReconcileArgs): Promise<void> {
-  const { pinKey, chatId, prev, desired, persist, runPin, claims } = args
+  const { pinKey, chatId, threadId, prev, desired, persist, runPin, claims } = args
   const now = args.now ?? Date.now
 
   // Publish a leg's outcome into the single claim registry. `pinnedAt` is
@@ -128,7 +140,7 @@ export async function runStatusPinReconcile(args: StatusPinReconcileArgs): Promi
       return
     }
     const pinnedAt = claims.get(pinKey)?.pinnedAt ?? now()
-    claims.set(pinKey, { messageId: next.messageId, chatId, pinnedAt })
+    claims.set(pinKey, { messageId: next.messageId, chatId, threadId, pinnedAt })
   }
 
   // One leg, with the persist ordering its action requires. Only a fresh `pin`
@@ -152,6 +164,7 @@ export async function runStatusPinReconcile(args: StatusPinReconcileArgs): Promi
       fs: persist.fs,
       pinKey,
       chatId,
+      threadId,
       op,
       applyPin: () => runPin(legAction, from),
       now: now(),

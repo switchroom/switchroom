@@ -217,6 +217,36 @@ function makePersistingPinHarness(path: string) {
 describe('worker-feed pin persistence — durable status-pins.json survives steady-state edits (F1)', () => {
   const PATH = '/state/agent/telegram/status-pins.json'
 
+  it('writes an UNAMBIGUOUS (chat, thread) pin key — no trailing-space topic slot', async () => {
+    // The key is persisted verbatim into status-pins.json. It used to be
+    // `${chatId} ${threadId ?? ''}`, so a topic-less group wrote
+    // `"pinKey": "wk:group:-100123 "` — trailing whitespace that survives a
+    // JSON round-trip and is invisible in every log and grep.
+    const bot = makeFakeBot()
+    const pin = makePersistingPinHarness(PATH)
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+      reconcilePin: pin.reconcilePinFn,
+    })
+
+    clock = 1000
+    await feed.update('w-topicless', '-100123', view({ elapsedMs: 1000, toolCount: 1 }))
+    await flush()
+    clock = 2000
+    await feed.update('w-topic', '-100123', view({ elapsedMs: 1000, toolCount: 1 }), 7)
+    await flush()
+
+    const keys = pin.rows().map((r) => r.pinKey).sort()
+    expect(keys).toEqual(['wk:group:-100123:-', 'wk:group:-100123:7'])
+    // Same chat, different topic ⇒ genuinely different rows, and no key can be
+    // mistaken for another by an operator or a tool reconciling by chat.
+    for (const k of keys) expect(k).toBe(k.trim())
+  })
+
   it('preserves the wk:group row across many steady-state edits (noop-clear must NOT delete it)', async () => {
     const bot = makeFakeBot()
     const pin = makePersistingPinHarness(PATH)
