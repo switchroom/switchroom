@@ -69,12 +69,16 @@
  * lost". Two rules follow, and both are load-bearing:
  *   - per-MESSAGE over-budget edits SUPERSEDE (newest wins, older frame is
  *     discarded) — safe, because the frame that killed it will paint;
- *   - per-CHAT over-budget edits may only be DROPPED while a NEWER frame for
- *     that same message is still in flight to repaint it. When the waiting
- *     frame is the only one for its card (a turn-final `finalize`, say) it is
- *     RELEASED late instead of dropped. Dropping it would freeze the card
- *     mid-run AND return `true` to the send gate, which would then record a
- *     never-painted payload as on-screen and no-op-skip every retry.
+ *   - an over-budget edit may only be DROPPED AT THE DEFER DEADLINE while a
+ *     NEWER frame for that same message is still in flight to repaint it. When
+ *     the waiting frame is the only one for its card (a turn-final `finalize`,
+ *     say) it is RELEASED late instead of dropped. Dropping it would freeze the
+ *     card mid-run AND return `true` to the send gate, which would then record a
+ *     never-painted payload as on-screen and no-op-skip every retry. This rule
+ *     (`dropGuard`) binds on ALL THREE tiers — per-message included. It was
+ *     originally wired into the two per-chat tiers only, which left the
+ *     per-message tier dropping a lone terminal frame unconditionally at
+ *     `maxDeferMs` and freezing the card by exactly the route R1 forbids.
  *
  * ── 2026-07-27: the fuse existed and the ban happened anyway ──────────────
  * The ceilings above were sized against the in-repo pacers, not against what
@@ -599,8 +603,35 @@ export function editFloodFuseConfigFromEnv(
   return cfg
 }
 
-/** grammY resolves an edit with `true` when there is nothing to return. */
-const DROPPED_RESULT = true
+/**
+ * What a DROPPED call resolves to.
+ *
+ * `apply` is a grammY **transformer**, and a transformer's contract is the raw
+ * `ApiResponse` ENVELOPE (`{ok: true, result}` / `{ok: false, error_code,
+ * description}`) — not the unwrapped result. grammY's `Api.callApi` does:
+ *
+ * ```js
+ * const data = await this.call(method, payload, signal)
+ * if (data.ok) return data.result
+ * else throw toGrammyError(data, method, payload)
+ * ```
+ * (grammy `out/core/client.js`)
+ *
+ * This constant used to be the bare `true` — the *result* an edit resolves to,
+ * with the envelope omitted. `(true).ok` is `undefined`, so every deliberate
+ * fuse drop took the `else` branch and surfaced as
+ * `GrammyError: Call to 'editMessageText' failed! (undefined: undefined)`
+ * (`err.error_code` / `err.description` are both absent on a boolean). Callers
+ * then counted the fuse's INTENDED rate-limiting as a transport failure — which
+ * is how a healthy turn reached `activityDrainFailures=8` and was flagged
+ * DEGRADED for behaving exactly as designed (narrative-lane.ts drain catch).
+ *
+ * Wrapping it in the envelope restores the contract the rest of this file
+ * already documents: a dropped call resolves as the benign no-op described in
+ * the header ("A superseded or over-deferred edit is DROPPED (resolved as a
+ * benign no-op)") and returns `true` to the send gate, as the R1 note assumes.
+ */
+const DROPPED_RESULT = { ok: true as const, result: true }
 
 interface Window {
   ts: number[]
@@ -961,11 +992,15 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     maxFor: (now: number) => number,
     method: string, mode: WaitMode, cls: OutboundClass,
     /**
-     * Consulted ONLY at the defer deadline for `mode: 'drop'`. Returning false
-     * converts the drop into a late release: this call is the last thing that
-     * will ever paint its message, so losing it is not "shedding a stale
-     * frame", it is freezing a card. Absent ⇒ drop unconditionally (the
-     * pre-review behaviour).
+     * Consulted ONLY at the defer deadline, for every non-`release` mode
+     * (`drop` AND `supersede`). Returning false converts the drop into a late
+     * release: this call is the last thing that will ever paint its message, so
+     * losing it is not "shedding a stale frame", it is freezing a card. Absent
+     * ⇒ drop unconditionally (the pre-review behaviour).
+     *
+     * Note this is the DEADLINE guard only. In `supersede` mode a genuinely
+     * newer frame still kills a waiter outright via `w.waiter.kill()` — that is
+     * last-write-wins and is unaffected by this guard.
      */
     dropGuard: (() => boolean) | undefined,
     /**
@@ -1118,21 +1153,36 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       // Counted BEFORE the first await so a frame that arrives while an older
       // one is waiting is visible to that older one's `dropGuard`.
       mw.inflight++
+      // R1: only drop while something newer for THIS message is still in
+      // flight to repaint it. `> 1` = this frame plus at least one newer.
+      const dropGuard = (): boolean => mw.inflight > 1
+      // Cosmetic frames share ONE overshoot budget per chat across the
+      // per-message and per-chat tiers, so a frame cannot late-release twice on
+      // its way out.
+      const lateKey = cls === 'cosmetic' ? `lr:${chat}` : undefined
       try {
+        // R1 applies to the per-MESSAGE tier too. `supersede` mode still lets a
+        // genuinely-newer frame kill this one mid-wait (last-write-wins, the
+        // `killed` path), but at the DEFER DEADLINE this tier used to pass
+        // `dropGuard: undefined`, which `awaitRoom` reads as "drop
+        // unconditionally". A LONE frame — the terminal `finalize` of a card,
+        // whose whole job is to replace "→ in-progress" with the done state and
+        // which by definition has nothing newer coming — was therefore dropped
+        // here after `maxDeferMs`, freezing the card mid-step. That is the exact
+        // failure R1 was written to prevent; it was only ever wired into the two
+        // per-chat tiers. Passing the same guard makes a lone frame LATE-RELEASE
+        // instead, bounded for cosmetic traffic by the shared `lateKey`
+        // overshoot budget (non-cosmetic edits — finalize, approval cards — are
+        // low-cadence by nature and already late-release unbounded on both
+        // per-chat tiers, so this adds no new class of overshoot).
         const msgSlot = await awaitRoom(
           msgKey, perMessageWindowMs,
           cls === 'cosmetic'
             ? (t) => ceiling(cosmeticPerMessageMax, t)
             : (t) => classCeiling(perMessageMax, cls, t),
-          method, 'supersede', cls, undefined, deadline,
+          method, 'supersede', cls, dropGuard, deadline, lateKey,
         )
         if (msgSlot === null) return DROPPED_RESULT as unknown as R
-        // R1: only drop while something newer for THIS message is still in
-        // flight to repaint it. `> 1` = this frame plus at least one newer.
-        const dropGuard = (): boolean => mw.inflight > 1
-        // Cosmetic frames share ONE overshoot budget per chat across both
-        // per-chat tiers, so a frame cannot late-release twice on its way out.
-        const lateKey = cls === 'cosmetic' ? `lr:${chat}` : undefined
         const reserved: Array<[string, number]> = [[msgKey, msgSlot]]
         const giveBack = (): void => { for (const [k, at] of reserved) unreserve(k, at) }
 
