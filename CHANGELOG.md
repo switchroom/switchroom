@@ -68,6 +68,17 @@ on this fleet rather than from theory.
   — no error, no warning. This one was outside it, so an operator's measured
   `16` sat in `switchroom.yaml` for a full day while the container booted
   upstream's default `10`.
+- **The `retain` lane can be given a reserved floor (#3907).** Same silent drop,
+  the other side of the same slot policy:
+  `HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS` was outside the managed key set, so an
+  operator could not reserve any worker slots for memory writes. Upstream
+  defaults that floor to `0`, and switchroom is the reason that matters —
+  consolidation is the one lane switchroom widens (ceiling raised to 6) and the
+  one that holds a slot longest, while retain, the write path, holds no floor at
+  all. The reference fleet's poller boots
+  `reservations=[consolidation=5], shared_pool=11` with `retain` absent
+  entirely. Now settable; still unset by default, so nothing moves for anyone
+  who does not ask for it.
 - **One malformed queue entry no longer kills the whole drain (#3894).** Phase 0
   of the pending-retain drain raised on a non-numeric `attempt_count` and took
   phases 1 and 2 down with it, making the *entire* backlog immortal — fleet-wide

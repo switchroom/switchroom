@@ -983,12 +983,61 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * (reservations must sum to <= this, and the consolidation ceiling must sit
  * between the reservation and this), so an incoherent combination fails loudly
  * in the container rather than silently here.
+ *
+ * ### `HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS`
+ *
+ * The reserved slot FLOOR for the `retain` lane — the same slot policy as the
+ * key above, from the other side. Upstream's `WORKER_SLOT_RESERVATION_TYPES`
+ * (`config.py`) gives `retain` a default of **0**, i.e. no floor at all: every
+ * retain competes for the shared pool that is left after the reservations are
+ * carved out.
+ *
+ * That asymmetry is switchroom's own doing. Consolidation is the one lane
+ * switchroom deliberately widens — {@link
+ * HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT} raises its ceiling to 6 — and it
+ * is the lane that holds a slot longest, because a round runs up to {@link
+ * HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND} memories through an
+ * LLM. Retain is the lane that must not wait: it is the write path, and the
+ * agent-side queue in front of it (`pending-retains`) is bounded and evicts
+ * under pressure. Widening the slowest lane's ceiling while the write lane
+ * holds no floor is the wrong shape, and the reference fleet is running exactly
+ * that — the poller's own boot line on 2026-07-28 reads:
+ *
+ * ```
+ * starting polling loop (max_slots=16, reservations=[consolidation=5],
+ *   shared_pool=11, ceilings=[consolidation<=6])
+ * ```
+ *
+ * `retain` does not appear in `reservations` because its floor is 0. An
+ * operator who wants one has no way to say so: the key is outside {@link
+ * HINDSIGHT_PERF_ENV_KEYS}, so a `hindsight.env` line for it is discarded by
+ * `resolveHindsightPerfOverrides` with no error and no warning — the same
+ * silent drop that cost `HINDSIGHT_API_WORKER_MAX_SLOTS` a full day above.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_WORKER_MAX_SLOTS: 16
+ *     HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: 2
+ * ```
+ *
+ * Override-only rather than defaulted for the same reason as the four above:
+ * only the operator knows their slot budget, and a floor is only meaningful
+ * against a total switchroom deliberately ships no opinion on — emitting a
+ * number here would move every install off upstream's 0 for no measured
+ * reason. Unset ⇒ upstream's 0 ⇒ no behaviour change. And as with
+ * `WORKER_MAX_SLOTS`, upstream validates the whole slot policy at boot
+ * (reservations must sum to <= `WORKER_MAX_SLOTS`, and a type's ceiling — where
+ * one is set at all — must sit between that type's own reservation and
+ * `WORKER_MAX_SLOTS`), so an incoherent combination fails loudly in the
+ * container rather than silently here.
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
   "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
   "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS",
   "HINDSIGHT_API_WORKER_MAX_SLOTS",
+  "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
 ]);
 
 /**
