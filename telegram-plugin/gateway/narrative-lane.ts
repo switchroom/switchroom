@@ -133,6 +133,15 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
       // The parent's OWN running token total → `· N tok` on the metrics line.
       // 0 → tokenSegment omits it (clean, same as the worker feed).
       totalTokens: turn.totalTokens,
+      // Terminal `✅ <summary>` footer, rendered through the SAME
+      // `deriveCardResult` the 🛠 worker card uses. The agent's analogue of the
+      // worker's `latestSummary` is the answer it actually delivered this turn
+      // (`lastReplyText`, stamped on the reply/stream_reply tool_use just
+      // before the first-reply `clearActivitySummary` hand-off). Only supplied
+      // on a FINAL render; empty (a turn that finalised before any reply — the
+      // foreground handoff-clear path — or a genuinely silent turn) → the
+      // shared derivation omits the block, exactly as the worker card does.
+      resultText: final ? turn.lastReplyText : undefined,
     }
     return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount, header)
   }
@@ -892,6 +901,9 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
         const livenessHeader: SessionActivityHeader = {
           label: 'Agent', elapsedMs: livenessElapsed, toolCount: turn.labeledToolCount, state: 'done',
           model: turn.currentModel,
+          // Same terminal `✅ <summary>` footer as the normal final render —
+          // this liveness-only card is still a FINAL agent card.
+          resultText: turn.lastReplyText,
         }
         finalHtml = renderActivityFeedWithNested(['Working…'], [], true, '', undefined, livenessHeader)
       }
