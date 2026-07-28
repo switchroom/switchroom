@@ -91,7 +91,8 @@ import {
   NESTED_PREFIX,
   WORKER_STEP_INDENT,
 } from './status-no-truncate.js'
-import { escapeMarkdown, truncate } from './card-format.js'
+import { cleanWorkerResultParagraph, escapeMarkdown, truncate } from './card-format.js'
+import { redact } from './secret-detect/redact.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
 // The card layout core. Header composition (`metricsRun` /
 // `renderActivityHeader`), the per-line escape pipeline (`escapeStepLine`), the
@@ -158,6 +159,15 @@ export interface SessionActivityHeader {
    *  line via `tokenSegment`. Omitted (0/undefined) → no token segment, same
    *  clean-omit behavior as the worker feed. */
   totalTokens?: number
+  /**
+   * RAW final-summary text for the terminal `✅ <summary>` footer — the agent
+   * card's analogue of the worker card's `latestSummary` (the gateway passes
+   * the turn's delivered answer, `turn.lastReplyText`). Rendered ONLY on a
+   * final render, through the SHARED `deriveCardResult` the worker card uses,
+   * so both surfaces clean/cap/emoji it identically. Absent or empty → no
+   * footer block (the worker card's own fallback), never a fabricated line.
+   */
+  resultText?: string
 }
 
 /**
@@ -456,32 +466,71 @@ const WORKER_RESULT_RULE = '─────'
 const WORKER_RESULT_MAX = 320
 
 /**
- * Render the accumulated feed as ready Telegram HTML — one action per line,
- * newest last. The current (newest) step is bold with a `→`; finished steps
- * are italic with a `✓`. Capped to the last STATUS_ROLLING_LINES with a dim
- * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
- * Callers send the result verbatim — do NOT re-escape or re-wrap it.
+ * The ONE derivation of a card's terminal `✅/⚠️ <summary>` footer block, shared
+ * by the 🤖 agent card and the 🛠 worker card (#3844 unified the card BODY; the
+ * footer stayed forked until this landed — the agent card silently had no
+ * result block at all, so it ended on `✓ N steps` while the worker card ended
+ * on the green tick + summary sentence).
  *
- * Thin adapter over `renderStatusCard` (emoji 🤖, label 'Agent').
+ * Contract (the worker card's long-standing behaviour, now the spec for both):
+ *   - `running`     → no block. The card is not finished.
+ *   - `incomplete`  → NEVER a block, whatever `summary` carries. Truthful-no-
+ *                     result invariant: a reaped/abandoned unit produced no
+ *                     result, so it must not render a `⚠️`-prefixed paragraph
+ *                     out of stray summary text. Enforced HERE (deterministic
+ *                     mechanism) rather than left to caller discipline.
+ *   - `done`        → `✅` + the cleaned paragraph.
+ *   - `failed`      → `⚠️` + the cleaned paragraph.
+ *   - empty/absent summary, or one that cleans to nothing → no block. Omitting
+ *     is the fallback; the card never fabricates a sentence.
  *
- * `stepCount` (optional): when `final=true` and `stepCount > 0`, appends a
- * `✓ N steps` footer line.
+ * `summary` is RAW model-authored text (markdown, multi-line). It is scrubbed
+ * with `redact()` and cleaned with `cleanWorkerResultParagraph`;
+ * `renderStatusCard` does the final truncate + escape when it emits the block.
  *
- * `header` (optional): when provided, the two-line activity header carries
- * elapsed + tool count.
+ * The `redact()` is load-bearing, not belt-and-braces: status cards are sent
+ * via `sendRichMessage` and BYPASS the outbound redact chokepoint
+ * (`normalizeOutboundBody` → `redact`, outbound-send-path.ts:192) that scrubs
+ * every ordinary reply — the same gap `emitGatewayOperatorEvent` closes in
+ * gateway.ts. The agent card's summary is the turn's delivered answer text
+ * taken PRE-redaction, so scrubbing here is what keeps a token smuggled into a
+ * summary from reaching Telegram verbatim. It runs BEFORE markdown stripping /
+ * escaping, which is the order the outbound pipeline requires (redacting
+ * already-escaped text lets url-query-param secrets slip past url-redact).
  */
-export function renderActivityFeed(
+export function deriveCardResult(
+  state: CardState,
+  summary: string | undefined,
+): { emoji: string; text: string } | undefined {
+  if (state !== 'done' && state !== 'failed') return undefined
+  const text = cleanWorkerResultParagraph(redact(summary ?? ''))
+  if (text.length === 0) return undefined
+  return { emoji: state === 'done' ? '✅' : '⚠️', text }
+}
+
+/** Leading emoji for the main-session (🤖 Agent) card. */
+const AGENT_CARD_EMOJI = '🤖'
+
+/**
+ * The single 🤖-agent-card configuration of `renderStatusCard`. Both public
+ * agent-card entrypoints (`renderActivityFeed`, `renderActivityFeedWithNested`)
+ * funnel through this so the header mapping, the empty-guard, and the terminal
+ * result footer cannot drift between the flat and nested renders — they used
+ * to be two byte-copies of the same object literal.
+ */
+function renderAgentCard(
   lines: string[],
-  final = false,
-  liveSuffix = "",
-  stepCount?: number,
-  header?: SessionActivityHeader,
+  children: string[],
+  final: boolean,
+  liveSuffix: string,
+  stepCount: number | undefined,
+  header: SessionActivityHeader | undefined,
 ): string | null {
-  if (lines.length === 0 && header == null) return null;
+  if (lines.length === 0 && children.length === 0 && header == null) return null
   return renderStatusCard({
     header: header != null
       ? {
-          emoji: '🤖',
+          emoji: AGENT_CARD_EMOJI,
           label: header.label,
           elapsedMs: header.elapsedMs,
           toolCount: header.toolCount,
@@ -491,10 +540,44 @@ export function renderActivityFeed(
         }
       : undefined,
     steps: lines,
+    ...(children.length > 0 ? { childSteps: children } : {}),
     final,
     liveSuffix,
     stepCount,
+    // Same footer derivation the 🛠 worker card uses — one code path, so the
+    // two surfaces cannot drift apart again. Only a FINAL render can carry a
+    // result; a live render passes 'running' through and gets undefined.
+    result: final && header != null
+      ? deriveCardResult(header.state, header.resultText)
+      : undefined,
   })
+}
+
+/**
+ * Render the accumulated feed as ready Telegram HTML — one action per line,
+ * newest last. The current (newest) step is bold with a `→`; finished steps
+ * are italic with a `✓`. Capped to the last STATUS_ROLLING_LINES with a dim
+ * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
+ * Callers send the result verbatim — do NOT re-escape or re-wrap it.
+ *
+ * Thin adapter over `renderStatusCard` (emoji 🤖, label 'Agent') via the shared
+ * `renderAgentCard` configuration.
+ *
+ * `stepCount` (optional): when `final=true` and `stepCount > 0`, appends a
+ * `✓ N steps` footer line.
+ *
+ * `header` (optional): when provided, the two-line activity header carries
+ * elapsed + tool count — and, on a final render, `header.resultText` supplies
+ * the terminal `✅ <summary>` footer (identical derivation to the worker card).
+ */
+export function renderActivityFeed(
+  lines: string[],
+  final = false,
+  liveSuffix = "",
+  stepCount?: number,
+  header?: SessionActivityHeader,
+): string | null {
+  return renderAgentCard(lines, [], final, liveSuffix, stepCount, header)
 }
 
 // ─── Foreground sub-agent nesting (Model A) ─────────────────────────────────
@@ -519,7 +602,8 @@ export const NESTED_MAX_LINES = 4;
  * a `↳ +N earlier…` header when it overflows. Returns ready Telegram HTML
  * (callers must NOT re-escape) or null when there is nothing to show.
  *
- * Thin adapter over `renderStatusCard` (emoji 🤖, label 'Agent', childSteps).
+ * Thin adapter over `renderStatusCard` (emoji 🤖, label 'Agent', childSteps) via
+ * the shared `renderAgentCard` configuration.
  */
 export function renderActivityFeedWithNested(
   lines: string[],
@@ -530,25 +614,7 @@ export function renderActivityFeedWithNested(
   header?: SessionActivityHeader,
 ): string | null {
   const children = childLines.map((s) => s.trim()).filter((s) => s.length > 0);
-  if (children.length === 0) return renderActivityFeed(lines, final, liveSuffix, stepCount, header);
-  return renderStatusCard({
-    header: header != null
-      ? {
-          emoji: '🤖',
-          label: header.label,
-          elapsedMs: header.elapsedMs,
-          toolCount: header.toolCount,
-          state: header.state,
-          model: header.model,
-          totalTokens: header.totalTokens,
-        }
-      : undefined,
-    steps: lines,
-    childSteps: children,
-    final,
-    liveSuffix,
-    stepCount,
-  })
+  return renderAgentCard(lines, children, final, liveSuffix, stepCount, header)
 }
 
 // ─── Combined multi-worker feed (coalesced one-message-per-chat) ────────────

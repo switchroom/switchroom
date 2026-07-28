@@ -211,6 +211,34 @@ describe('narrative-lane golden — SHOW path opens then edits ONE feed card', (
     expect(final!).toMatch(/3 steps/)
     expect(live!).not.toMatch(/3 steps/)
   })
+
+  it('composeTurnActivity: the FINAL render ends with the ✅ + delivered-answer footer', () => {
+    // Parity with the 🛠 worker card, which has always closed on `✅ <summary>`.
+    // The agent card's analogue of the worker's `latestSummary` is the answer
+    // the turn actually delivered (`turn.lastReplyText`); the lane threads it
+    // into the header as `resultText` and the SHARED `deriveCardResult` renders
+    // it. Fails on the pre-fix lane, which passed no result text at all.
+    const { lane } = makeLane()
+    const turn = makeLaneTurn(lane, { labeledToolCount: 2 })
+    turn.mirrorLines.push('Read the file', 'Ran the tests')
+    turn.lastReplyText = 'Standing by for the background merge waiter to complete.'
+    const live = lane.composeTurnActivity(turn)
+    const final = lane.composeTurnActivity(turn, true)
+    expect(final!).toContain('─────')
+    expect(final!.endsWith('✅ _Standing by for the background merge waiter to complete._')).toBe(true)
+    // The LIVE render must not leak the footer — the turn is not finished.
+    expect(live!).not.toContain('✅')
+  })
+
+  it('composeTurnActivity: a turn that delivered no answer renders NO footer (no fabrication)', () => {
+    const { lane } = makeLane()
+    const turn = makeLaneTurn(lane, { labeledToolCount: 2 })
+    turn.mirrorLines.push('Read the file', 'Ran the tests')
+    turn.lastReplyText = ''
+    const final = lane.composeTurnActivity(turn, true)
+    expect(final!).not.toContain('─────')
+    expect(final!).not.toContain('✅')
+  })
 })
 
 describe('narrative-lane golden — the narrative-dedup gate at turn end', () => {
