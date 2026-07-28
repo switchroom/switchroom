@@ -21,6 +21,8 @@ on the kwargs a callsite hands ``client.retain()``:
 Stdlib-only; runs under ``python3 -m unittest discover tests/``.
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -205,7 +207,7 @@ class DrainOfQueuedEntries(unittest.TestCase):
 
 
 class ValueValidation(unittest.TestCase):
-    """An off-list scope must FAIL, not fall through to the engine default.
+    """An off-list scope must not reach the wire — and must not cost a memory.
 
     The value is invisible after the write: a typo would keep retaining
     happily, the engine would apply its own default scope, and the damage
@@ -214,8 +216,14 @@ class ValueValidation(unittest.TestCase):
     see a hand-edited settings.json or a raw HINDSIGHT_OBSERVATION_SCOPES
     export — which is why this second gate exists here.
 
-    These fail against a `config.get("observationScopes")` that passes the raw
-    value straight through.
+    TWO different obligations, and they are not the same severity:
+
+    * `resolve_observation_scopes` is the strict VALIDATOR and RAISES. Callers
+      that can safely stop (a config check, a hand-run script) use it.
+    * the retain path uses the non-raising classifier, drops the bad field and
+      shouts. A misconfigured scope is recoverable; a deleted turn is not, and
+      raising at the build seam deleted turns — see
+      `test_a_typo_never_reaches_the_payload_BUT_the_memory_survives`.
     """
 
     _BASE = {"retainRoles": ["user", "assistant"], "retainContext": "claude-code"}
@@ -258,17 +266,52 @@ class ValueValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_observation_scopes({"observationScopes": ["shared"]})
 
-    def test_a_typo_never_reaches_the_payload(self):
-        # The outcome that matters: no payload is produced at all, so nothing
-        # is POSTed and nothing is queued at the wrong scope.
-        with self.assertRaises(ValueError):
-            self._build({"observationScopes": "shred"})
+    def test_a_typo_never_reaches_the_payload_BUT_the_memory_survives(self):
+        # Two outcomes, and the second is the load-bearing one.
+        #
+        # (a) The bad value does not ride to the wire — `observation_scopes` is
+        #     None, so `HindsightClient._retain_one` omits the key and the
+        #     engine's own default scope stands. That is the pre-feature
+        #     behaviour, and it is a *recoverable* misconfiguration.
+        #
+        # (b) The PAYLOAD IS STILL BUILT. `build_retain_payload` raising here
+        #     was a far worse bug than the one it fixed: the raise unwound past
+        #     `retain.main`'s `pending_enqueue`, so the turn was never POSTed,
+        #     never queued and never re-derivable — permanent silent memory
+        #     loss for as long as the typo sat in the config. A config typo
+        #     must never be able to delete a memory. End-to-end coverage of
+        #     the same guarantee lives in
+        #     tests/test_reconcile_durability.py::TestObservationScopes.
+        payload = self._build({"observationScopes": "shred"})
+        self.assertIsNone(payload["observation_scopes"])
+        self.assertIn("user turn 0", payload["content"])
+        self.assertTrue(payload["document_id"])
 
     def test_a_typo_never_reaches_the_wire(self):
         client = _RecordingClient("http://fake")
-        with self.assertRaises(ValueError):
-            self._build({"observationScopes": "per-tag"})  # hyphen, not underscore
-        self.assertEqual(client.bodies, [])
+        payload = self._build({"observationScopes": "per-tag"})  # hyphen, not underscore
+        client.retain(
+            payload["bank_id"],
+            payload["content"],
+            document_id=payload["document_id"],
+            observation_scopes=payload["observation_scopes"],
+        )
+        self.assertEqual(len(client.bodies), 1)
+        # ABSENT, not null: the request body is the pre-feature one.
+        self.assertNotIn("observation_scopes", client.bodies[0]["items"][0])
+
+    def test_a_typo_is_shouted_about_rather_than_swallowed(self):
+        # A silent downgrade to the engine default is the ORIGINAL defect this
+        # feature exists to prevent. Degrading quietly would just reintroduce
+        # it, so the build seam must say so on stderr every time it fires.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._build({"observationScopes": "shred"})
+        msg = err.getvalue()
+        self.assertIn("shred", msg)
+        self.assertIn("observation_scopes", msg)
+        for value in OBSERVATION_SCOPES_VALUES:
+            self.assertIn(value, msg)
 
     def test_env_var_typo_is_caught_too(self):
         # The env path bypasses zod entirely, so this is the only gate on it.

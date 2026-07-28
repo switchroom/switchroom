@@ -12,6 +12,8 @@ single deterministic id), 6 (watermark monotonicity + uuid-not-found), 7
 bound ENQUEUES the remainder).
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -471,6 +473,80 @@ class TestObservationScopes(DurabilityTestBase):
         with mock.patch.object(drain_pending, "HindsightClient", _Client):
             drain_pending._retry_one(entry, timeout=15)
         self.assertEqual(seen, ["shared"])
+
+    # -- a typo must never destroy a memory ---------------------------------
+    #
+    # These are the regression tests for the worst bug the validation
+    # introduced. `build_retain_payload` used to RAISE on an off-list value.
+    # It is called from `run_retain`, which `retain.main` calls WITHOUT a
+    # try/except before its `pending_enqueue` — so the raise unwound past the
+    # enqueue: nothing POSTed, nothing queued, watermark not advanced, the turn
+    # gone. `session_end.py` caught it but had no payload to queue, and
+    # `session_start.py` swallowed the same raise into `debug_log` and aborted
+    # the reconcile loop that would have re-derived it. Every producer lost its
+    # memory outright, permanently and silently, for as long as the bad value
+    # sat in the config — switchroom #3244's shape, which this feature cites.
+    #
+    # A misconfigured scope is recoverable. A deleted turn is not. So a bad
+    # value degrades to the PRE-FEATURE behaviour (no field on the wire, the
+    # engine's own default scope) and is shouted about on stderr.
+
+    def test_a_typo_does_not_destroy_the_live_stop_retain(self):
+        self._set_scope("shred")  # not "shared"
+        hook = self._hook("typolivesess")
+        err = io.StringIO()
+        with mock.patch("retain.increment_turn_count", return_value=3), \
+             mock.patch("sys.stdin", _stdin(hook)), \
+             contextlib.redirect_stderr(err):
+            retain.main()
+
+        # OUTCOME 1: the memory LANDED. Not "an exception was caught" — the
+        # turns are in the bank.
+        # (chunked mode with retainEveryNTurns=3 slices the last 3 turns)
+        blob = self.daemon.content_blob()
+        self.assertIn("user turn 4", blob)
+        # OUTCOME 2: at the engine's own default scope (field omitted), which
+        # is exactly what an unconfigured agent does.
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
+        # OUTCOME 3: and it was loud. A silent downgrade would be the original
+        # "typo ignored forever" defect.
+        self.assertIn("shred", err.getvalue())
+        self.assertIn("observation_scopes", err.getvalue())
+
+    def test_a_typo_does_not_destroy_a_FAILED_stop_retain(self):
+        # The reviewer's reproduction: with the raise in place this enqueued 0
+        # entries and left the watermark unmoved, so the turn was lost for good.
+        self._set_scope("shred")
+        hook = self._hook("typofailsess")
+
+        self.daemon.fail = True
+        with mock.patch("retain.increment_turn_count", return_value=3), \
+             mock.patch("sys.stdin", _stdin(hook)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            retain.main()
+
+        # OUTCOME: the payload was still built and still ENQUEUED, so the next
+        # SessionStart drain replays it. This is the assertion that matters —
+        # the memory has a durable on-disk copy.
+        entries = self._pending_entries()
+        self.assertEqual(len(entries), 1)
+        _path, entry = entries[0]
+        self.assertIn("user turn 4", entry["content"])
+        self.assertIsNone(entry["observation_scopes"])
+
+    def test_a_typo_does_not_destroy_the_boot_reconcile(self):
+        # session_start.py swallows a reconcile raise into debug_log AND aborts
+        # the loop on the first bad payload, so the recovery path that would
+        # re-derive lost turns did nothing either.
+        self._set_scope("shred")
+        hook = self._hook("typoreconsess")
+        with contextlib.redirect_stderr(io.StringIO()):
+            reconcile_tail.reconcile(self._config(), hook_input=hook)
+        blob = self.daemon.content_blob()
+        self.assertIn("user turn 0", blob)
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
 
 
 def _stdin(obj):

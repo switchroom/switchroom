@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import watermark
 from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
-from lib.config import debug_log, load_config, resolve_observation_scopes
+from lib.config import classify_observation_scopes, debug_log, load_config
 from lib.content import (
     prepare_retention_transcript,
     slice_last_turns_by_user_boundary,
@@ -267,10 +267,13 @@ def build_retain_payload(
     Returns ``{payload, document_id, message_count, last_uuid, ordered_uuids,
     transcript}`` or ``None`` when the slice formats to nothing.
 
-    Raises ``ValueError`` when ``observationScopes`` holds a value outside the
-    accepted set — see ``lib.config.resolve_observation_scopes``. Every retain
-    producer builds its payload here, so validating at this one seam covers all
-    of them, and a typo can never reach the wire or the pending queue.
+    NEVER raises on a bad ``observationScopes``. Every retain producer builds
+    its payload here, so this seam sees the typo — but it is also the seam the
+    memory itself is made at, and a config typo must not be able to destroy
+    one. An off-list value is dropped from the payload (so the engine's own
+    default stands, exactly as before this feature existed) and shouted about
+    on stderr; the memory is still built, still POSTed, still queued on
+    failure. See ``lib.config.classify_observation_scopes``.
     """
     retain_roles = config.get("retainRoles", ["user", "assistant"])
     include_tool_calls = config.get("retainToolCalls", True)
@@ -364,6 +367,36 @@ def build_retain_payload(
     except Exception:
         pass
 
+    # Per-row observation scope (switchroom). None unless the operator set
+    # memory.observation_scopes — and a None is dropped at the wire by
+    # HindsightClient._retain_one, so the default request body is unchanged.
+    # Carried ON THE PAYLOAD so it survives the pending-retains queue: a retain
+    # that fails and drains hours later must land in the SAME scope it would
+    # have landed in inline.
+    #
+    # CLASSIFIED, NOT VALIDATED. This is the one seam every retain producer
+    # funnels through, which makes it the tempting place to reject a typo — and
+    # the worst possible place to raise from. Raising here does not "fail the
+    # retain", it DELETES the turn: the exception propagates out of run_retain,
+    # past retain.main's pending_enqueue (so nothing is queued and the
+    # watermark never advances), session_end.py catches it with no payload to
+    # queue, and session_start.py's reconciler swallows it into debug_log and
+    # aborts the loop that would have re-derived it. Every producer loses its
+    # memory outright, silently, for as long as the bad value sits in the
+    # config — switchroom #3244's exact shape.
+    #
+    # So a bad value degrades to the PRE-FEATURE behaviour (field omitted, the
+    # engine's own default scope stands) and is shouted about on stderr. Wrong
+    # scope is recoverable; a lost turn is not.
+    scope, scope_error = classify_observation_scopes(config)
+    if scope_error:
+        print(
+            f"[Hindsight] observation_scopes IGNORED for this retain: {scope_error} "
+            "The memory is being retained at the engine's default scope rather "
+            "than dropped — fix the value, then `switchroom apply` and restart "
+            "the agent.",
+            file=sys.stderr,
+        )
     payload = {
         "api_url": api_url,
         "api_token": api_token,
@@ -373,17 +406,7 @@ def build_retain_payload(
         "context": config.get("retainContext", "claude-code"),
         "metadata": metadata,
         "tags": tags,
-        # Per-row observation scope (switchroom). None unless the operator set
-        # memory.observation_scopes — and a None is dropped at the wire by
-        # HindsightClient._retain_one, so the default request body is unchanged.
-        # Carried ON THE PAYLOAD so it survives the pending-retains queue: a
-        # retain that fails and drains hours later must land in the SAME scope
-        # it would have landed in inline. Resolved (not read raw) so an
-        # off-list value RAISES here rather than riding to the wire: this is
-        # the one seam every retain producer funnels through, so validating
-        # here covers the Stop hook, sidechain, boot reconcile and backfill at
-        # once. See lib.config.resolve_observation_scopes.
-        "observation_scopes": resolve_observation_scopes(config),
+        "observation_scopes": scope,
     }
     return {
         "payload": payload,

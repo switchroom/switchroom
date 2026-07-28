@@ -447,21 +447,26 @@ ENV_OVERRIDES = {
 OBSERVATION_SCOPES_VALUES = ("per_tag", "combined", "all_combinations", "shared")
 
 
-def resolve_observation_scopes(config: dict):
-    """Return the validated per-row ``observation_scopes``, or ``None``.
+def classify_observation_scopes(config: dict):
+    """Classify ``observationScopes`` WITHOUT raising: ``(value, error)``.
 
-    ``None`` means "do not put the field on the wire at all" — the shipped
-    default, and byte-for-byte the pre-plumbing request body.
+    Exactly one of the two is non-``None``:
 
-    Raises ``ValueError`` on any value outside
-    :data:`OBSERVATION_SCOPES_VALUES`. This FAILS THE RETAIN rather than
-    quietly falling back to the engine default on purpose: a wrong scope is
-    invisible at write time and only shows up much later as a bank whose
-    observations never merged, so a typo must be noisy the FIRST time it fires.
-    The primary gate is upstream — the `memory.observation_scopes` zod enum
-    rejects a typo at `switchroom apply` — so reaching this raise means someone
-    hand-edited the installed plugin's settings.json or set the raw
-    HINDSIGHT_OBSERVATION_SCOPES env var, neither of which zod can see.
+    * ``(None, None)``   — unset. Do not put the field on the wire at all;
+      the shipped default, byte-for-byte the pre-plumbing request body.
+    * ``(value, None)``  — a valid member of :data:`OBSERVATION_SCOPES_VALUES`.
+    * ``(None, reason)`` — an off-list or non-string value, with a
+      human-readable reason naming the accepted set.
+
+    THIS FUNCTION MUST NEVER RAISE, and callers on the retain path must never
+    turn its ``error`` into one. A bad scope is a misconfiguration; losing the
+    turn is data loss. Those are not the same severity and must not share a
+    failure mode — see ``retain.build_retain_payload`` for the consequence
+    chain (a raise there propagated out of ``run_retain`` and past
+    ``retain.main``'s ``pending_enqueue``, so the turn was never queued,
+    the watermark never advanced, and the boot reconciler swallowed the same
+    raise into ``debug_log`` — the memory was gone, permanently and silently).
+    That is switchroom #3244's shape, which this very feature cites.
 
     An empty/whitespace-only value is treated as UNSET, matching the plugin's
     existing "an empty export hands authority back to the config file" idiom
@@ -469,23 +474,42 @@ def resolve_observation_scopes(config: dict):
     """
     raw = config.get("observationScopes")
     if raw is None:
-        return None
+        return None, None
     if not isinstance(raw, str):
-        raise ValueError(
+        return None, (
             "observationScopes must be a string, one of "
             f"{', '.join(OBSERVATION_SCOPES_VALUES)}; got {type(raw).__name__} ({raw!r}). "
             "Set it via `memory.observation_scopes` in switchroom.yaml."
         )
     value = raw.strip()
     if not value:
-        return None
+        return None, None
     if value not in OBSERVATION_SCOPES_VALUES:
-        raise ValueError(
+        return None, (
             f"observationScopes={raw!r} is not a valid Hindsight observation scope. "
             f"Accepted values: {', '.join(OBSERVATION_SCOPES_VALUES)}. "
             "Set it via `memory.observation_scopes` in switchroom.yaml "
             "(a typo there is rejected at `switchroom apply`)."
         )
+    return value, None
+
+
+def resolve_observation_scopes(config: dict):
+    """Strict form of :func:`classify_observation_scopes` — raises on a bad value.
+
+    ``None`` means "do not put the field on the wire at all".
+
+    Raises ``ValueError`` on any value outside
+    :data:`OBSERVATION_SCOPES_VALUES`. This is the VALIDATOR, for callers that
+    genuinely want to fail — a config check, a test, a hand-run script that
+    should stop before it writes anything. **It is deliberately NOT what the
+    retain path calls**: a retain must never be destroyed by a config typo, so
+    ``retain.build_retain_payload`` uses the non-raising classifier and shouts
+    instead. See ``classify_observation_scopes``.
+    """
+    value, error = classify_observation_scopes(config)
+    if error:
+        raise ValueError(error)
     return value
 
 

@@ -42,14 +42,36 @@ agent's own bank directly from TypeScript, so no amount of plumbing inside
 row written at the old scope on a pooled bank — the kind of single exception
 you only discover once the bank is already inconsistent.
 
-**A typo is rejected, not ignored.** The value is checked against the set the
-engine accepts (`per_tag`, `combined`, `all_combinations`, `shared`) at
-`switchroom apply`, and again inside the plugin for the paths `apply` cannot
-see — a hand-edited `settings.json`, a raw `HINDSIGHT_OBSERVATION_SCOPES`
-export. `observation_scopes: shred` fails loudly the first time it fires rather
-than retaining quietly at the engine default; the handoff mirror is skipped
-rather than written at a scope nobody asked for. This knob is invisible after
-the write, so the only cheap moment to catch a mistake is before it lands.
+**A typo is rejected where it can be, and never costs you a memory.** The value
+is checked against the set the engine accepts (`per_tag`, `combined`,
+`all_combinations`, `shared`). `observation_scopes: shred` is rejected outright
+at `switchroom apply` — that is the gate that matters, and the only one that
+stops the value before it exists anywhere.
+
+Past that gate the knob can still be wrong: a raw `HINDSIGHT_OBSERVATION_SCOPES`
+export, or a hand-edited installed `settings.json`, is invisible to `apply`.
+What happens then is deliberately **different on the two paths**, because they
+are not risking the same thing:
+
+- **Retains keep their memory.** The Stop hook, sub-agent retains, the boot
+  reconciler and the backfill drop the bad field, retain the turn at the
+  engine's own default scope — exactly what an unconfigured agent does — and
+  print the bad value to stderr. Failing the retain instead would have been the
+  worse bug: it deleted the turn. A wrong scope you can fix and re-consolidate;
+  a lost turn is gone.
+- **The session-handoff mirror is skipped, and says so where you'll see it.**
+  Here the on-disk handoff sidecars are already written, so the next session
+  still reorients and only the recallable copy is at stake — cheap enough to
+  fail closed rather than write one row at a scope nobody chose. `switchroom
+  handoff` exits non-zero, so `run-hook.sh` files a red `hook:handoff` issue
+  carrying the reason. That shows up in `switchroom issues` and on the Telegram
+  issues card, and clears itself on the next clean shutdown once you fix the
+  value.
+
+Being honest about the limit: a bad value that gets past `apply` does **not**
+stop a retain, does not reach `switchroom doctor`, and on the retain path is
+visible only as hook stderr. The design point is that it cannot destroy
+anything — `apply` is where a typo is meant to die.
 
 ## v0.19.28 — private memories can no longer be shipped to a paid outside provider by accident
 

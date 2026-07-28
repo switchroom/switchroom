@@ -47,7 +47,7 @@ export type ObservationScopeResolution =
   | { kind: "invalid"; raw: string };
 
 /**
- * Read the configured scope out of an environment.
+ * Classify one raw scope value.
  *
  * Absent or empty is `unset` — start.sh emits no export at all when the
  * operator set nothing, and an empty export is the plugin's existing idiom for
@@ -55,13 +55,47 @@ export type ObservationScopeResolution =
  * `invalid` rather than coerced, so the caller can fail closed instead of
  * silently writing at a scope nobody asked for.
  */
-export function resolveObservationScopeFromEnv(
-  env: NodeJS.ProcessEnv = process.env,
+export function classifyObservationScope(
+  raw: string | undefined,
 ): ObservationScopeResolution {
-  const raw = env[OBSERVATION_SCOPES_ENV];
   if (raw === undefined) return { kind: "unset" };
   const value = raw.trim();
   if (!value) return { kind: "unset" };
   if (!isObservationScope(value)) return { kind: "invalid", raw };
   return { kind: "set", scope: value };
+}
+
+/**
+ * Resolve the scope for a caller that already holds the agent's CONFIG.
+ *
+ * The config wins outright; the env var is only the fallback for a caller that
+ * has no config to read. That order matters: `switchroom handoff <agent>` is
+ * registered as a Stop hook inside the container (where start.sh has exported
+ * the var) but is ALSO runnable from the host, from `hostd agent_exec`, and by
+ * hand while debugging — none of which inherit that export. Reading the env
+ * first, or only, means those invocations see "unset" for an agent that is
+ * configured to `shared` and POST the briefing at the engine default: one row
+ * written at the wrong scope, invisible until the bank is inconsistent. Which
+ * is the exact defect the per-row scope exists to prevent, relocated one level
+ * out.
+ *
+ * `configured` is the value from `memory.observation_scopes` AFTER the
+ * defaults/profile cascade (`resolveAgentConfig`), so a fleet-wide
+ * `defaults.memory.observation_scopes` is honoured too. `undefined` means the
+ * caller could not load the config at all (the sandboxed-container path, where
+ * switchroom.yaml is not mounted) — only then does the env var speak.
+ */
+export function resolveObservationScope(
+  configured: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): ObservationScopeResolution {
+  if (configured !== undefined) return classifyObservationScope(configured);
+  return classifyObservationScope(env[OBSERVATION_SCOPES_ENV]);
+}
+
+/** Read the configured scope out of an environment. Config-free callers only. */
+export function resolveObservationScopeFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): ObservationScopeResolution {
+  return classifyObservationScope(env[OBSERVATION_SCOPES_ENV]);
 }

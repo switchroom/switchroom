@@ -38,8 +38,26 @@ import { join } from "node:path";
 import {
   OBSERVATION_SCOPES_ENV,
   observationScopesHint,
-  resolveObservationScopeFromEnv,
+  resolveObservationScope,
 } from "../memory/observation-scopes.js";
+
+/**
+ * `buildHandoff` status meaning "the sidecars are on disk, but the recallable
+ * Hindsight copy was deliberately NOT written because the configured
+ * observation scope is invalid".
+ *
+ * It is a DISTINCT status, not a variant of `"ok"`, because that is the whole
+ * of its operator visibility. `switchroom handoff` is registered as a Stop
+ * hook through `bin/run-hook.sh` (`buildSettingsHooksBlock`), which records an
+ * issue — severity error, source `hook:handoff`, with the stderr tail attached
+ * — on a NON-ZERO exit and auto-resolves it on the next clean one. A skipped
+ * mirror that still exits 0 writes to stderr and stops there: the Stop hook is
+ * async so claude discards the code, and start.sh's own `switchroom handoff`
+ * call sends stderr to /dev/null outright. Returning this status lets the CLI
+ * exit non-zero, which is what puts the failure on `switchroom issues` and the
+ * Telegram issues card.
+ */
+export const HANDOFF_STATUS_MIRROR_SKIPPED = "mirror-skipped-invalid-scope";
 
 export const DEFAULT_MAX_TURNS = 50;
 export const TOPIC_MAX_CHARS = 117;
@@ -235,7 +253,16 @@ export type BuildHandoffOpts = {
   hindsightBankId?: string;
   fetch?: typeof fetch;
   /**
-   * Environment the per-row observation scope is read from. Defaults to
+   * The agent's resolved `memory.observation_scopes`, AFTER the
+   * defaults/profile cascade. This is the authority: the caller
+   * (`src/cli/handoff.ts`) already loads switchroom.yaml, so the scope must
+   * come from there rather than from an env var that only exists inside the
+   * container. `undefined` means "no config available" (the sandboxed
+   * container path) and hands authority to `env`.
+   */
+  observationScopes?: string;
+  /**
+   * Environment the per-row observation scope FALLS BACK to. Defaults to
    * `process.env`; start.sh exports HINDSIGHT_OBSERVATION_SCOPES only when the
    * operator set `memory.observation_scopes`. Injectable so the tests can pin
    * the body without mutating the process env.
@@ -268,8 +295,8 @@ export async function buildHandoff(opts: BuildHandoffOpts): Promise<string> {
     return "write-error";
   }
 
-  await mirrorToHindsight(briefing, opts).catch(() => {});
-  return "ok";
+  const mirrored = await mirrorToHindsight(briefing, opts).catch(() => true);
+  return mirrored ? "ok" : HANDOFF_STATUS_MIRROR_SKIPPED;
 }
 
 function errMsg(err: unknown): string {
@@ -279,13 +306,20 @@ function errMsg(err: unknown): string {
   return String(err);
 }
 
+/**
+ * Returns `false` ONLY when the mirror was deliberately skipped because the
+ * configured observation scope is invalid — the one outcome that must reach an
+ * operator. Every other path (no URL configured, a network failure, a non-2xx)
+ * returns `true`: those are the pre-existing best-effort cases and turning them
+ * into a red issue card would make every offline shutdown look like a defect.
+ */
 async function mirrorToHindsight(
   briefing: string,
   opts: BuildHandoffOpts,
-): Promise<void> {
+): Promise<boolean> {
   const url = opts.hindsightUrl ?? process.env.HINDSIGHT_API_URL;
   const bankId = opts.hindsightBankId ?? process.env.HINDSIGHT_BANK_ID ?? "default";
-  if (!url) return;
+  if (!url) return true;
   const fetchFn = opts.fetch ?? fetch;
   const endpoint = `${url.replace(/\/$/, "")}/v1/default/banks/${encodeURIComponent(bankId)}/memories`;
   // This mirror writes a real memory into the agent's OWN bank, so it must
@@ -299,16 +333,29 @@ async function mirrorToHindsight(
   // pre-plumbing body. An invalid value FAILS CLOSED — skip the mirror and say
   // why, rather than writing this memory at a scope nobody asked for. The
   // sidecars are already on disk by now, so the next session still reorients;
-  // only the recallable copy is skipped.
-  const scope = resolveObservationScopeFromEnv(opts.env ?? process.env);
+  // only the recallable copy is skipped, and the non-`ok` status turns that
+  // skip into a red `hook:handoff` issue via bin/run-hook.sh.
+  //
+  // The CONFIG is the authority and the env var is only the fallback — see
+  // resolveObservationScope. Reading the env alone made `switchroom handoff`
+  // run from anywhere but inside the container (host shell, hostd agent_exec,
+  // a debugging run) see "unset" for a configured agent and POST at the engine
+  // default.
+  const scope = resolveObservationScope(
+    opts.observationScopes,
+    opts.env ?? process.env,
+  );
   if (scope.kind === "invalid") {
     process.stderr.write(
-      `handoff: hindsight mirror SKIPPED — ${OBSERVATION_SCOPES_ENV}=` +
-        `${JSON.stringify(scope.raw)} is not a valid observation scope ` +
+      `handoff: hindsight mirror SKIPPED — observation scope ` +
+        `${JSON.stringify(scope.raw)} is not valid ` +
         `(accepted: ${observationScopesHint()}). Fix ` +
-        `memory.observation_scopes in switchroom.yaml.\n`,
+        `memory.observation_scopes in switchroom.yaml (or the ` +
+        `${OBSERVATION_SCOPES_ENV} export), then \`switchroom apply\` and ` +
+        `restart the agent. The on-disk handoff sidecars were written ` +
+        `normally; only the recallable Hindsight copy was skipped.\n`,
     );
-    return;
+    return false;
   }
   const body = {
     items: [
@@ -332,6 +379,7 @@ async function mirrorToHindsight(
       `handoff: hindsight mirror failed — ${errMsg(err)}\n`,
     );
   }
+  return true;
 }
 
 /**
