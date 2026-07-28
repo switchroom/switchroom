@@ -23,6 +23,49 @@ memory" from degrading into "never drain anything" — the drain is
 sequential and oldest-first, so without the demotion three chronically
 failing entries sit at the head and end every run at zero progress.
 
+Serialisation
+-------------
+``drain()`` takes an EXCLUSIVE, non-blocking lock (``_exclusive_drain``,
+``_drain_lock_path``) for the whole run and returns a zero summary with
+``skipped_locked=True`` if another drain already holds it. That lives HERE,
+not in a caller, because the queue has several independent drain paths and a
+guarantee that depends on every caller remembering to wrap itself in
+``flock`` is not a guarantee:
+
+* the SessionStart hook (``session_start.py`` imports ``drain`` directly),
+* the ``hindsight-drain`` sidecar in ``profiles/_base/start.sh.hbs``,
+* the operator's out-of-band replay, which ``switchroom doctor`` documents
+  as a bare ``docker exec … drain_pending.py --backlog``.
+
+Two of those overlapping means two processes iterate the same queue and
+re-POST the same entry — ~168s of a 4-slot fleet-wide LLM lane, twice, for
+one memory. The lock is ``fcntl.flock``, so the kernel releases it if the
+process dies; there is no stale-lock recovery to get wrong.
+
+The lock file is ``drain-pending.lock``, deliberately NOT the ``drain.lock``
+that the interim host cron wraps its ``docker exec`` in. Same-path would
+mean that wrapper's outer ``flock`` starves the ``drain_pending.py`` it just
+launched — a silent no-op, i.e. the drain quietly stops. With a distinct
+name an external ``flock`` wrapper on the historical path is redundant but
+harmless, and this module's guarantee holds no matter who calls it.
+
+Circuit breaker
+---------------
+Demotion (above) bounds head-of-line blocking, but not TOTAL work: a
+chronically failing entry is retried on every run forever. That was
+tolerable when the only drains were a 4-second hook and a supervised manual
+sweep. It is not tolerable for the unattended sidecar, whose backlog budget
+is 3600s against a 900s cooldown — a wedged agent would spend ~80% of
+wall-clock re-POSTing the same unsaveable entries into a shared lane, for
+good. So an entry past ``_attempt_ceiling()`` (default ``MAX_ATTEMPTS`` x 4
+= 20 attempts, ``HINDSIGHT_DRAIN_ATTEMPT_CEILING``) is PARKED: skipped by
+the retain pass, counted in ``summary["parked"]``, still on disk, still
+swept for free by the reconcile pass, and still retried in full under
+``--force``. Parking destroys nothing; it stops paying for the same failure
+without end. HOW MUCH WALL-CLOCK 20 ATTEMPTS BUYS IS QUEUE-SIZE DEPENDENT,
+and is shorter than it looks — the measured table is at
+``ATTEMPT_CEILING_MULTIPLE``, and the trade it records is deliberate.
+
 Boundaries
 ----------
 * Per-entry HTTP timeout: ``HINDSIGHT_DRAIN_TIMEOUT`` (default 5s), but
@@ -118,6 +161,8 @@ Standalone usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import os
 import subprocess
 import sys
@@ -136,6 +181,7 @@ from lib.pending import (
     is_permanent_failure,
     iter_entries,
     mark_dead,
+    pending_dir,
     resplit_over_bound_entries,
     sweep_legacy_dead_markers,
     update_attempt,
@@ -144,6 +190,179 @@ from lib.retain_split import retain_client_deadline, retain_content_limit
 
 
 STALL_THRESHOLD = 3
+
+#: Attempt ceiling, as a multiple of ``MAX_ATTEMPTS`` — see ``_attempt_ceiling``
+#: and the "Circuit breaker" section of the module docstring. 4 x 5 = 20
+#: attempts.
+#:
+#: HOW LONG THAT BUYS IS QUEUE-SIZE DEPENDENT, which is the non-obvious part
+#: and the reason an earlier revision of this comment was wrong (it claimed 20
+#: attempts was "most of a day … far past any transient upstream outage"). A
+#: drain run attempts each live entry at most once, and ``pending.enqueue``
+#: already records attempt 1, so the FLOOR is 19 further runs — on the
+#: sidecar's 900s cooldown, **under 5 hours**, not most of a day. Above that
+#: floor the only thing that slows parking down is ``STALL_THRESHOLD`` (3),
+#: and it stops applying exactly when it would start to help: past
+#: ``MAX_ATTEMPTS`` an entry abstains from the stall guard (``_over_budget``),
+#: so once a queue is uniformly over budget EVERY entry is attempted on EVERY
+#: run.
+#:
+#: Measured against this module by ``CeilingArithmeticTest`` — total upstream
+#: outage, every attempt failing, counting drain runs until the whole queue is
+#: parked:
+#:
+#: ====  ====  ==============
+#: queue runs  at 900s
+#: ====  ====  ==============
+#: 1     20    5.0 h
+#: 4     24    6.0 h
+#: 13    36    9.0 h
+#: 30    56    14.0 h
+#: ====  ====  ==============
+#:
+#: So the guarantee runs BACKWARDS from the intuition: the SMALLER and
+#: healthier the queue, the SOONER a single overnight outage parks it whole.
+#: A 4-entry queue is gone in 6 hours. That is a real cost and it is accepted
+#: rather than papered over by a bigger number, because:
+#:
+#: * the ceiling is the ONLY bound on unattended lane waste, and it is a
+#:   per-run bound of ``len(queue)`` x ~168s once the stall guard abstains
+#:   (the n=30 run above retries all 30 entries every run for 14 hours).
+#:   Sizing the ceiling to survive a 24h outage means ~100 attempts, i.e.
+#:   5x that window — weakening the very mechanism this change adds;
+#: * parking destroys nothing. The entry stays on disk, the free reconcile
+#:   pass still sweeps it, ``--force`` replays it in full, and since the
+#:   summary-line fix below it is REPORTED on every drain path rather than
+#:   only the backlog one;
+#: * no attempt count can make a wall-clock promise anyway. Attempts convert
+#:   to hours only via the queue size, so a larger constant would restate the
+#:   same category error with a different number. Stating the conversion is
+#:   the durable fix.
+#:
+#: An operator who knows the upstream will be down longer than the table
+#: allows raises ``HINDSIGHT_DRAIN_ATTEMPT_CEILING`` for the duration, and
+#: replays with ``--force`` afterwards; ``switchroom doctor``'s backlog
+#: remediation names both.
+ATTEMPT_CEILING_MULTIPLE = 4
+
+#: Basename of the drain lock, inside the same directory that holds
+#: ``pending-retains/``. NOT ``drain.lock`` — see the module docstring:
+#: the interim host cron wraps its ``docker exec`` in ``flock -n
+#: $HOME/.hindsight/drain.lock``, and sharing that path would make that
+#: wrapper starve the very ``drain_pending.py`` it launches.
+DRAIN_LOCK_BASENAME = "drain-pending.lock"
+
+
+def _drain_lock_path() -> str:
+    """Absolute path of the per-agent drain lock.
+
+    Derived from ``pending_dir()`` rather than ``$HOME`` so it follows the
+    queue it protects: one lock per queue, including under
+    ``HINDSIGHT_PENDING_DIR``. In production that resolves to
+    ``$HOME/.hindsight/drain-pending.lock``.
+    """
+    override = os.environ.get("HINDSIGHT_DRAIN_LOCK")
+    if override:
+        return override
+    return os.path.join(
+        os.path.dirname(os.path.abspath(pending_dir())), DRAIN_LOCK_BASENAME
+    )
+
+
+@contextlib.contextmanager
+def _exclusive_drain():
+    """Hold the drain lock for the duration of a run.
+
+    Yields ``True`` if this process owns the drain, ``False`` if another
+    drain already holds the lock (caller must do nothing).
+
+    ``fcntl.flock`` and not a pidfile: the kernel releases it when the fd
+    closes OR the process dies, so a SIGKILLed drain cannot wedge the queue
+    and there is no stale-lock reaper to get wrong. ``LOCK_NB`` and not a
+    blocking wait, because every caller has somewhere better to be — the
+    SessionStart hook has a ~9s budget, and the sidecar has another tick in
+    900s.
+
+    FAILING TO OPEN the lock file is NOT contention and must not stop the
+    drain: an unwritable ``.hindsight/`` (read-only mount, ENOSPC) would
+    otherwise silently disable memory replay altogether, which is strictly
+    worse than an unserialised drain. That path warns and proceeds.
+    """
+    path = _drain_lock_path()
+    fd = None
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        if fd is not None:
+            os.close(fd)
+        print(
+            f"[Hindsight] drain_pending: cannot open drain lock {path} ({e}); "
+            f"draining WITHOUT serialisation",
+            file=sys.stderr,
+        )
+        yield True
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _attempt_ceiling() -> int:
+    """Attempts after which an entry is PARKED rather than retried again.
+
+    Floored at ``MAX_ATTEMPTS``: a ceiling below the attempt budget would
+    park entries the demotion logic is still trying to drain normally.
+    """
+    return _env_num(
+        "HINDSIGHT_DRAIN_ATTEMPT_CEILING",
+        MAX_ATTEMPTS * ATTEMPT_CEILING_MULTIPLE,
+        int,
+        lo=MAX_ATTEMPTS,
+    )
+
+
+def _circuit_broken(entry: dict) -> bool:
+    """Has this entry failed so many times that retrying it is just waste?"""
+    try:
+        return int(entry.get("attempt_count", 0)) >= _attempt_ceiling()
+    except (TypeError, ValueError):
+        # Same rule as ``_over_budget``: a corrupt counter must never decide
+        # policy and must never raise on the drain path. Treat it as live.
+        return False
+
+
+def _park_broken(
+    entries: list[tuple[str, dict]], summary: dict, force: bool
+) -> list[tuple[str, dict]]:
+    """Drop circuit-broken entries from a RETAIN pass, recording the count.
+
+    Applied to the POST paths only. The free reconcile pass
+    (``_reconcile_phase``) still sweeps every entry on disk, so a parked
+    entry whose document did land is still retired without a POST — parking
+    withholds the expensive retry, not the cheap proof.
+    """
+    if force:
+        return entries
+    live: list[tuple[str, dict]] = []
+    parked = 0
+    for path, entry in entries:
+        if _circuit_broken(entry):
+            parked += 1
+        else:
+            live.append((path, entry))
+    summary["parked"] = parked
+    return live
 
 
 def _clamp(timeout: int, budget: float, started: float) -> int:
@@ -552,6 +771,14 @@ def _new_summary() -> dict:
         "drained": 0,
         "retried": 0,
         "dead": 0,
+        # Entries past `_attempt_ceiling()` — skipped by the retain pass so an
+        # unattended sidecar cannot spend a shared LLM lane re-POSTing the same
+        # unsaveable entry forever. Still queued, still reconciled for free,
+        # still drained in full under `--force`. See the module docstring.
+        "parked": 0,
+        # True when another drain already held the lock, so THIS run did
+        # nothing at all. Distinguishes "no work" from "did not run".
+        "skipped_locked": False,
         "reconciled": 0,
         "unknown": 0,
         # Presence WAS established, but the entry could not be moved into
@@ -587,17 +814,28 @@ def drain(
     backlog: bool = False,
     phase: str = "both",
     dry_run: bool = False,
+    force: bool = False,
 ) -> dict:
     """Walk the pending-retains directory and retry each entry.
 
     ``backlog=False`` (default) is the bounded in-hook drain.
     ``backlog=True`` is the operator backlog replay — see ``drain_backlog()``.
+    ``force=True`` ignores the per-entry circuit breaker (module docstring).
+
+    THE SERIALISATION POINT for every drain path — the SessionStart hook, the
+    `hindsight-drain` sidecar and the operator's out-of-band replay all reach
+    the queue through this function, so the lock is taken here rather than in
+    any one caller. A run that finds the lock held does NOTHING and returns a
+    zero summary with ``skipped_locked=True``; it never queues behind the
+    holder, because every caller has a next tick and none has time to wait.
 
     Returns a summary dict::
 
         {"drained": int,   # successful retries (entries archived)
          "retried": int,   # failures kept for next session
          "dead":    int,   # entries promoted to .dead this run
+         "parked":  int,   # past the attempt ceiling: not retried this run
+         "skipped_locked": bool,  # another drain held the lock; did nothing
          "reconciled": int,# already durable, archived without a POST
          "unknown": int,   # presence unknown, left queued
          "archive_failed": int,  # durable, but the archive was unwritable
@@ -610,8 +848,26 @@ def drain(
          "budget_exceeded": bool}
     """
     config = config or load_config()
-    if backlog:
-        return _drain_backlog_impl(config, phase=phase, dry_run=dry_run)
+    with _exclusive_drain() as acquired:
+        if not acquired:
+            summary = _new_summary()
+            summary["skipped_locked"] = True
+            print(
+                f"[Hindsight] drain_pending: another drain holds "
+                f"{_drain_lock_path()} — skipping this run so the same entry "
+                f"is not retained twice.",
+                file=sys.stderr,
+            )
+            return summary
+        if backlog:
+            return _drain_backlog_impl(
+                config, phase=phase, dry_run=dry_run, force=force
+            )
+        return _drain_inhook_impl(config, force=force)
+
+
+def _drain_inhook_impl(config: dict, force: bool = False) -> dict:
+    """The bounded SessionStart drain. The caller holds the drain lock."""
     timeout = _per_entry_timeout()
     budget = _budget_seconds()
     started = time.monotonic()
@@ -622,9 +878,12 @@ def drain(
     # behind them — see ``_drain_order``. Matters even more here than in the
     # backlog drain: the in-hook budget is ~4s, so a single entry at the head
     # that always burns its clamped timeout consumes the entire run.
-    entries = _drain_order(iter_entries())
+    entries = _park_broken(_drain_order(iter_entries()), summary, force)
     if not entries:
-        debug_log(config, "drain_pending: queue empty")
+        debug_log(
+            config,
+            f"drain_pending: nothing to retry (parked={summary['parked']})",
+        )
         return summary
 
     debug_log(config, f"drain_pending: {len(entries)} entries to retry")
@@ -822,7 +1081,7 @@ def _wait_for_upstream(backoff_ms: int, started: float, budget: float) -> bool:
 
 
 def _drain_backlog_impl(
-    config: dict, phase: str = "both", dry_run: bool = False
+    config: dict, phase: str = "both", dry_run: bool = False, force: bool = False
 ) -> dict:
     """Concurrent-capable, long-budget, three-phase backlog replay."""
     summary = _new_summary()
@@ -897,8 +1156,18 @@ def _drain_backlog_impl(
 
     # See ``_drain_order``: without this, three budget-exhausted entries at the
     # head trip the stall guard on every run forever and the drain never makes
-    # progress again.
-    entries = _drain_order(iter_entries())
+    # progress again. Then the CIRCUIT BREAKER: demotion bounds head-of-line
+    # blocking but not total work, and this pass is the unattended one — a
+    # 3600s budget every 900s means a wedged agent would otherwise re-POST the
+    # same unsaveable entries into a 4-slot shared lane indefinitely.
+    entries = _park_broken(_drain_order(iter_entries()), summary, force)
+    if summary["parked"]:
+        _blog(
+            f"parked {summary['parked']} entries past the attempt ceiling "
+            f"({_attempt_ceiling()} attempts) — still queued and still "
+            f"reconciled for free, but not retained again. `--force` to retry "
+            f"them anyway."
+        )
     if not entries:
         _blog("phase 2: nothing left to retain")
         return summary
@@ -1045,6 +1314,13 @@ def _parse_args(argv: list[str] | None):
         action="store_true",
         help="with --backlog: report what would happen, issue no writes",
     )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="retry entries past the attempt ceiling too (they are skipped by "
+        "default so an unattended drain cannot spend the shared retain lane "
+        "on the same permanently-failing entry forever)",
+    )
     return ap.parse_args(argv)
 
 
@@ -1058,7 +1334,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     config = load_config()
     summary = drain(
-        config, backlog=args.backlog, phase=args.phase, dry_run=args.dry_run
+        config,
+        backlog=args.backlog,
+        phase=args.phase,
+        dry_run=args.dry_run,
+        force=args.force,
     )
     if any(
         summary[k]
@@ -1072,6 +1352,22 @@ def main(argv: list[str] | None = None) -> int:
             "reconciled",
             "unknown",
             "archive_failed",
+            # PARKED IS IN THE GATE, not only in the line below. A run whose
+            # entire queue is past the attempt ceiling parks everything and
+            # does nothing else, so every other counter is 0 — without this
+            # key the gate stays shut and the run is completely silent: rc=0,
+            # empty stdout, empty stderr, byte-identical to "queue empty".
+            #
+            # The backlog path narrates its own parking (`_drain_backlog_impl`
+            # logs "parked N entries past the attempt ceiling"). The IN-HOOK
+            # path only `debug_log`s it, so it says nothing unless debug is on
+            # — and that is the path that runs on every session boot. Nothing
+            # else can supply the signal either: `switchroom doctor` reads the
+            # queue DIRECTORY, where a parked entry and a backlogged entry are
+            # the same file. An operator watching a queue that will not shrink
+            # could not tell "parked by the circuit breaker, needs --force"
+            # from "ordinary backlog, will drain on its own".
+            "parked",
         )
     ):
         print(
@@ -1083,6 +1379,7 @@ def main(argv: list[str] | None = None) -> int:
             f"retried={summary['retried']} dead={summary['dead']} "
             f"unknown={summary['unknown']} "
             f"archive_failed={summary['archive_failed']} "
+            f"parked={summary['parked']} "
             f"stalled={summary['stalled']} budget_exceeded={summary['budget_exceeded']}",
             file=sys.stderr,
         )

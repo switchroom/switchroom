@@ -2259,8 +2259,10 @@ class CliTest(unittest.TestCase):
     def _run(self, argv):
         seen = {}
 
-        def fake_drain(config=None, backlog=False, phase="both", dry_run=False):
-            seen.update(backlog=backlog, phase=phase, dry_run=dry_run)
+        def fake_drain(
+            config=None, backlog=False, phase="both", dry_run=False, force=False
+        ):
+            seen.update(backlog=backlog, phase=phase, dry_run=dry_run, force=force)
             return drain_pending._new_summary()
 
         with unittest.mock.patch.object(drain_pending, "drain", fake_drain):
@@ -2284,6 +2286,16 @@ class CliTest(unittest.TestCase):
         _, seen = self._run(["--backlog", "--phase", "reconcile", "--dry-run"])
         self.assertEqual(seen["phase"], "reconcile")
         self.assertTrue(seen["dry_run"])
+
+    def test_force_is_plumbed_and_defaults_off(self):
+        # `--force` overrides the circuit breaker. Parsed-but-dropped would
+        # leave the operator's explicit "retry the parked entries" silently
+        # doing nothing, which is exactly the class of bug this file exists
+        # for (a flag accepted and ignored).
+        _, seen = self._run(["--backlog", "--force"])
+        self.assertTrue(seen["force"])
+        _, seen = self._run(["--backlog"])
+        self.assertFalse(seen["force"])
 
     def test_phase_without_backlog_is_refused(self):
         with redirect_stderr(io.StringIO()):
