@@ -29,6 +29,7 @@ import {
   type ComponentVersion,
   type ExecFn,
 } from "./component-versions.js";
+import { classifyComponent, remediationFor } from "./component-scope.js";
 
 export interface ComponentVersionCheckOpts {
   /** Test seam — replace the `docker ps` shellout. */
@@ -42,18 +43,17 @@ const defaultExec: ExecFn = (cmd, args) => {
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 };
 
-/** The remediation for a given drifted component. */
+/**
+ * The remediation for a given drifted component.
+ *
+ * Delegates to the SHARED owner→command mapping (#3928). It used to be a
+ * private name-keyed `if` ladder here, which meant doctor and `rollout`
+ * each carried their own idea of which mechanism owns which component —
+ * the duplication that let `switchroom-hindsight-autoheal` sit outside
+ * the roll's scope while doctor knew perfectly well how to fix it.
+ */
 function fixFor(c: ComponentVersion, target: string): string {
-  if (c.kind === "cli") {
-    return `switchroom update  (self-updates the host CLI to ${target} first, then everything else)`;
-  }
-  if (c.name === "switchroom-web") {
-    return `switchroom webd install --tag ${target}  (run host-side: webd install fails inside hostd when the hostd compose predates SWITCHROOM_HOSTD_OPERATOR_UID)`;
-  }
-  if (c.name === "switchroom-hindsight-autoheal" || c.name === "switchroom-hostd") {
-    return `switchroom hostd install --tag ${target}  (regenerates the hostd compose project — both hostd and the autoheal sidecar)`;
-  }
-  return `switchroom update`;
+  return remediationFor(classifyComponent(c), target);
 }
 
 export function runComponentVersionChecks(

@@ -45,6 +45,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { getConfig, withConfigError } from "./helpers.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import { assertPlausibleHostHome } from "../agents/compose.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { checkDowngrade } from "./deploy-version-guard.js";
 import { removeStaleContainerIfNeeded } from "./singleton-stale-cleanup.js";
@@ -86,7 +87,17 @@ export function resolveWebImageTag(
  * as a bind SOURCE would make Docker auto-create empty `/host-home/...` dirs
  * on the host: the receiver would see no webhook secrets, no web-token, no
  * per-agent webhook.sock — silent total breakage. The backstop refuses to
- * ever emit a `/host-home` source — fail loud with the recovery path.
+ * ever emit an in-container source — fail loud with the recovery path.
+ *
+ * #3928 — the refusal set is now the SHARED one. This used to hardcode a
+ * single `/host-home` literal, which was enough while `webd install` was
+ * only reachable from the host shell or from hostd (whose HOME *is*
+ * `/host-home`). Making the operator uid resolvable under root (see
+ * `resolveOperatorUidFromOwnership`) makes this command reachable from an
+ * agent container too, whose HOME is `/state/agent/home` — a path the old
+ * literal check waved straight through. `assertPlausibleHostHome` owns the
+ * full in-container prefix list (`/host-home`, `/state`, `/run`) for the
+ * agent-fleet generator; deferring to it means webd cannot drift from it.
  */
 export function resolveWebHostHome(
   env: NodeJS.ProcessEnv = process.env,
@@ -94,14 +105,16 @@ export function resolveWebHostHome(
 ): string {
   const fromEnv = env.SWITCHROOM_HOST_HOME?.trim();
   const resolved = fromEnv && fromEnv.length > 0 ? fromEnv : home;
-  if (resolved === "/host-home" || resolved.startsWith("/host-home/")) {
+  try {
+    assertPlausibleHostHome(resolved);
+  } catch {
     throw new Error(
       `switchroom webd install: refusing to generate — the host home resolved to ` +
-        `"${resolved}", the in-container mount point of the operator home (never a ` +
-        `valid host bind source). Emitting it would make Docker create empty ` +
-        `/host-home dirs on the host and break every webhook forward + secret read.\n\n` +
-        `Recovery: run \`switchroom webd install\` from the HOST shell, or set ` +
-        `SWITCHROOM_HOST_HOME to the real host home first.`,
+        `"${resolved}", an in-container path (never a valid host bind source). ` +
+        `Emitting it would make Docker create empty dirs on the host and break ` +
+        `every webhook forward + secret read.\n\n` +
+        `Recovery: set SWITCHROOM_HOST_HOME to the real host home, or drive the ` +
+        `install from hostd / the host shell (both set it).`,
     );
   }
   return resolved;
@@ -288,14 +301,32 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   // or with an unknown uid — a root-mode forward is silently 503'd by
   // every agent gateway, which is the exact silent-breakage class this
   // migration exists to kill.
+  //
+  // #3928 amendment — this used to tell the operator to "open a shell as
+  // the operator user", which is the one thing switchroom's design says
+  // they should never have to do: the fleet is driven from Telegram, and
+  // an agent/hostd container is root with no SUDO_UID by construction, so
+  // the refusal made `switchroom-web` UNUPDATEABLE from the managed path.
+  // `resolveOperatorUid` now derives the uid from the owner of the
+  // switchroom home when the env/syscall tiers come up empty, so this
+  // branch is reached only when the uid genuinely cannot be determined —
+  // and the recovery it names is a CONFIG fix, not a shell.
   const operatorUid = resolveOperatorUid();
   if (operatorUid === undefined) {
     console.error(
       chalk.red(
-        "Could not resolve the operator uid (no SUDO_UID and getuid() is 0 or unavailable).\n" +
+        "Could not resolve the operator uid.\n" +
           "The web container must run as the operator uid so its webhook forwards pass\n" +
-          "each agent gateway's peercred ACL. Run `switchroom webd install` as the\n" +
-          "operator user (not root), or under `sudo` from the operator's shell.",
+          "each agent gateway's peercred ACL; running as root would be silently 503'd.\n" +
+          "\n" +
+          "Tried, in order: SUDO_UID, this process's own uid (non-root only),\n" +
+          "SWITCHROOM_HOSTD_OPERATOR_UID, and the owner of ~/.switchroom.\n" +
+          "\n" +
+          "Recovery (no shell required): re-run `switchroom hostd install` so the\n" +
+          "hostd container carries SWITCHROOM_HOSTD_OPERATOR_UID, or make\n" +
+          "~/.switchroom owned by the operator account (`chown -R <operator>:<operator>\n" +
+          "~/.switchroom`) so it can be derived. If neither is possible, set\n" +
+          "SWITCHROOM_HOSTD_OPERATOR_UID to the operator's numeric uid.",
       ),
     );
     process.exit(1);

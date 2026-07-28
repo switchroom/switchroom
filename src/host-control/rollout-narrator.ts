@@ -329,6 +329,12 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
         ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
         ...(entry.got !== undefined ? { got: entry.got } : {}),
+        // #3928 — the narration card is the operator's live view of the roll;
+        // without this it would freeze on a bare "STOPPED at
+        // verify-components" and never name what is actually stale.
+        ...(entry.drifted && entry.drifted.length > 0
+          ? { drifted: entry.drifted }
+          : {}),
         ...(st.agents.length > 0 ? { agents: st.agents } : {}),
         ...(st.render.m !== undefined ? { m: st.render.m } : {}),
         requestId: entry.request_id,

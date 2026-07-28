@@ -296,6 +296,32 @@ describe("LogTailRolloutNarrator", () => {
     expect(t).toContain("test-harness");
   });
 
+  it("carries the drifted component names onto the Telegram card (#3928)", async () => {
+    // End-to-end for the operator-facing half of #3928: the roll's
+    // `drifted[]` must survive sentinel → StatusEntry → narrator → render,
+    // because Telegram is the only surface the operator has.
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry();
+    n.onPhase(entry, phase("canary-start", { agent: "test-harness", n: 1, m: 2 }));
+    await vi.runAllTimersAsync();
+
+    n.onTerminal(
+      makeEntry({
+        result: "error",
+        rolled: ["test-harness", "klanker"],
+        failed_step: "verify-components",
+        drifted: ["switchroom-web", "switchroom-hindsight-autoheal"],
+      }),
+    );
+    await vi.runAllTimersAsync();
+    const t = relay.edits.at(-1)!.text;
+    expect(t).toContain("INCOMPLETE");
+    expect(t).toContain("switchroom-web");
+    expect(t).toContain("switchroom-hindsight-autoheal");
+    expect(t).toContain("Re-running the roll will NOT fix this");
+  });
+
   it("terminal before any phase still posts the final message", async () => {
     const relay = makeRelay(100);
     const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });

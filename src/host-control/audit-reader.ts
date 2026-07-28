@@ -61,6 +61,9 @@ export interface AuditEntry {
   failed_step?: string;
   /** Agent that failed the version assert (rollout rows). */
   failed_agent?: string;
+  /** Components still behind the target after the roll (#3928). Present on
+   *  rollout terminal rows with `failed_step === "verify-components"`. */
+  drifted?: string[];
   // ─── Rollout phase rows (#2726) ────────────────────────────────────
   /** Agent named in a per-phase rollout row (agent-start/-done, canary-*). */
   agent?: string;
@@ -317,6 +320,11 @@ export function parseAuditLine(line: string): AuditEntry | null {
   }
   if (typeof o.failed_step === "string") entry.failed_step = o.failed_step;
   if (typeof o.failed_agent === "string") entry.failed_agent = o.failed_agent;
+  // #3928 — components the roll left behind, so a `get_status` served from
+  // the durable log (in-memory entry evicted) still names them.
+  if (Array.isArray(o.drifted) && o.drifted.every((x) => typeof x === "string")) {
+    entry.drifted = o.drifted as string[];
+  }
   // Rollout phase rows (#2726) — per-phase agent/n/m context.
   if (typeof o.agent === "string") entry.agent = o.agent;
   if (typeof o.n === "number") entry.n = o.n;

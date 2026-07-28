@@ -405,7 +405,12 @@ export const TOOLS = [
       "The web + hindsight singletons are refreshed in-plan on this path " +
       "(only the hostd template regen + host operator CLI stay host-side; " +
       "the terminal warnings name exactly what is still on the prior " +
-      "version and the commands to finish). By default downgrade pins " +
+      "version and the commands to finish). The roll ENDS by re-reading " +
+      "the same component inventory `update --check` uses and FAILS if " +
+      "any in-scope component is still behind the target (#3928), so a " +
+      "`completed` result means the host actually converged — never just " +
+      "the agents. On that failure get_status returns " +
+      "`failedStep: \"verify-components\"` plus `drifted[]`. By default downgrade pins " +
       "are rejected — pass `allow_downgrade: true` for the operator-approved " +
       "rollback path to a known-good earlier tag; all other safety rails " +
       "(canary order, version-assert, stop-on-mismatch) apply unchanged. " +
@@ -539,6 +544,11 @@ export const TOOLS = [
       "carries the current phase, n/m counters, rolled[] agents, " +
       "failedStep/failedAgent and pin, and it keeps working across a " +
       "hostd self-bump/restart via the durable audit-log fallback. " +
+      "When `failedStep` is `verify-components` the payload also " +
+      "carries `drifted[]` — the components that are STILL behind the " +
+      "target after the roll. Report those names verbatim: re-running " +
+      "the roll will not fix them, the named component's own install " +
+      "must be run. " +
       "This is the tool the `rollout` description tells you to poll " +
       "with the returned request_id. Without `request_id`, falls back " +
       "to reading the most recent terminal `update_apply` audit row " +

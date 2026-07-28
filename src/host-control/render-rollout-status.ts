@@ -19,6 +19,13 @@
  * summary incl. elapsed total and the deferred host-side components.
  */
 
+// Imported, not re-declared: the renderer branches on this exact step
+// label, and a local copy would be one more place for "what does rollout
+// call this" to drift — the class of bug this whole change exists to kill
+// (#3928). cli/rollout.js does not import host-control, so no cycle; both
+// runtime consumers of this renderer already load it.
+import { VERIFY_COMPONENTS_STEP as VERIFY_COMPONENTS_FAILED_STEP } from "../cli/rollout.js";
+
 /** Per-agent progress an accumulator (the narrator) feeds the renderer. */
 export type AgentRollStatus = "pending" | "running" | "done" | "failed";
 
@@ -69,6 +76,16 @@ export interface RolloutRenderState {
   failedAgent?: string;
   /** Version detected on the failed agent (null = unreachable). */
   got?: string | null;
+  /**
+   * Components still BEHIND the target after the roll (#3928), set with
+   * `failedStep === "verify-components"`. Rendered as its own terminal
+   * shape: the agents DID roll, so "STOPPED — rolled before stop" would
+   * misdescribe it and send the operator to re-run a roll that cannot fix
+   * the stale component. This is the Telegram-side answer to "what is
+   * still behind?", which is the only place the operator is supposed to
+   * need to look.
+   */
+  drifted?: string[];
 }
 
 /** Human-readable one-liner for the current phase. */
@@ -186,13 +203,28 @@ function etaLine(s: RolloutRenderState): string | null {
   return `~${formatDurationMs(meanMs * remaining)} left (rough est.)`;
 }
 
-/** What stays on the prior version after an agent-invoked (hostd) roll, and
- *  the host-side commands that update each. */
+/**
+ * What genuinely stays behind after a COMPLETED roll, and the host-side
+ * command for each.
+ *
+ * #3928 — this used to list `switchroom-web` as "still on the prior
+ * version — run host-side". That claim is now provably false on a
+ * completed roll: `refresh-web` is in the plan on BOTH paths, and the
+ * terminal `verify-components` gate FAILS the roll if web is still
+ * behind — so a ✅ card means web converged. Leaving the line in would
+ * send an operator who has no host shell (the entire premise of the
+ * managed path) to run a command that is already done.
+ *
+ * What remains is only what no roll can converge: the operator's own
+ * host CLI (`npm i -g`, nothing in the plan touches it), and a hostd
+ * TEMPLATE regen, which matters only when a release changes hostd's
+ * mounts/env — the image tag itself is advanced by the self-bump.
+ */
 function deferredLines(target: string): string[] {
   const bare = target.trim().replace(/^v/, "");
   return [
-    `**Deferred (still on the prior version — run host-side):**`,
-    `- \`switchroom-web\` — \`switchroom webd install --tag ${target}\``,
+    `**Verified on ${target}** — every component this roll owned passed \`verify-components\`, so this is host convergence, not just the agents. Anything the roll was told to skip is named in its warnings.`,
+    `**Still host-side (nothing in a roll can do these):**`,
     `- host operator CLI — \`sudo npm i -g switchroom@${bare}\``,
     `- hostd template regen (only if the release changed hostd mounts/env) — \`switchroom hostd install --tag ${target}\``,
   ];
@@ -233,6 +265,35 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
     if (s.deferred !== false) parts.push("", ...deferredLines(s.target));
+    return parts.join("\n");
+  }
+
+  // #3928 — residual component drift. Distinct from "STOPPED": every agent
+  // reached the target and the pin is committed; a component the roll owned
+  // did not converge. Name it, and name the fact that re-rolling is not the
+  // remedy — the operator reads this in Telegram and has no host shell.
+  if (s.terminal === "error" && s.failedStep === VERIFY_COMPONENTS_FAILED_STEP) {
+    const drifted = s.drifted ?? [];
+    const parts = [headerLine(s, "⚠️")];
+    let summary =
+      `**INCOMPLETE** — ${rolledCount}${s.m !== undefined ? `/${s.m}` : ""} ` +
+      `agent(s) reached ${s.target}`;
+    if (elapsedMs !== undefined) summary += ` in ${formatDurationMs(elapsedMs)}`;
+    summary += `, but the host did NOT fully converge.`;
+    parts.push(summary);
+    parts.push(
+      "",
+      `**Still behind ${s.target}:** ` +
+        (drifted.length > 0
+          ? drifted.map((d) => `\`${d}\``).join(", ")
+          : "one or more components (see the roll's warnings)"),
+    );
+    parts.push(
+      "",
+      `Re-running the roll will NOT fix this — the agents are already on ` +
+        `target. Finish the stale component(s), then \`switchroom update --check\`.`,
+    );
+    if (checklist.length > 0) parts.push("", ...checklist);
     return parts.join("\n");
   }
 

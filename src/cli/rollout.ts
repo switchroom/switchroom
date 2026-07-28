@@ -67,6 +67,18 @@ import {
 import { isHindsightContainerExists } from "../setup/hindsight.js";
 import { deployedImageTag, type DockerRunner } from "./deploy-version-guard.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
+import {
+  collectComponents as collectHostComponents,
+  detectComponentDrift,
+  type ComponentVersion,
+  type ExecFn,
+} from "./component-versions.js";
+import {
+  classifyComponent,
+  gatedOwners,
+  partitionDrift,
+  remediationFor,
+} from "./component-scope.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -76,7 +88,16 @@ export type RolloutStep =
   | { kind: "refresh-web" }
   | { kind: "refresh-hostd" }
   | { kind: "refresh-hindsight" }
-  | { kind: "sweep" };
+  | { kind: "sweep" }
+  | { kind: "verify-components" };
+
+/**
+ * `failedStep` label for a roll that converged its agents but left an
+ * in-scope component behind the target (#3928). Distinct from every
+ * other failure label because the recovery is different: nothing needs
+ * rolling BACK — a named component needs finishing forward.
+ */
+export const VERIFY_COMPONENTS_STEP = "verify-components";
 
 export interface RolloutPlanOpts {
   /** Skip the web + hostd + hindsight refresh (step 3). */
@@ -199,6 +220,9 @@ export function planRollout(
     // self-guards via hindsightExists().
     steps.push({ kind: "refresh-hindsight" });
     steps.push({ kind: "sweep" });
+    // Terminal drift gate (#3928) — read-only, and LAST so it sees the
+    // host every preceding step has finished mutating.
+    steps.push({ kind: "verify-components" });
     return steps;
   }
 
@@ -215,6 +239,11 @@ export function planRollout(
     steps.push({ kind: "refresh-hindsight" });
   }
   steps.push({ kind: "sweep" });
+  // Terminal drift gate (#3928). Emitted even under --skip-web: the gate's
+  // SCOPE is derived from the steps present (see gatedOwners), so skipping
+  // the refresh steps exempts those components rather than dropping the
+  // check for everything else.
+  steps.push({ kind: "verify-components" });
   return steps;
 }
 
@@ -248,6 +277,12 @@ export function formatRolloutPlan(
         break;
       case "sweep":
         lines.push(`  ${n}. sweep — print per-agent version table`);
+        break;
+      case "verify-components":
+        lines.push(
+          `  ${n}. verify-components — assert EVERY in-scope component is on ${target} ` +
+            `(same inventory \`switchroom update --check\` uses); non-zero exit if any is behind`,
+        );
         break;
     }
   }
@@ -472,6 +507,18 @@ export interface RolloutDeps {
    * when absent the skew check is skipped.
    */
   webImageTag?(): string | null;
+  /**
+   * Enumerate every switchroom component on this host and the version it
+   * is running — the SAME inventory `switchroom update --check` and
+   * `switchroom doctor` consume (`component-versions.ts`). Drives the
+   * terminal `verify-components` gate (#3928).
+   *
+   * Optional ONLY as a test seam. Production always wires it in
+   * `createRolloutDeps`, and the executor treats an unwired collector as a
+   * loud warning rather than a silent pass — an un-gated roll must never
+   * look like a converged one.
+   */
+  collectComponents?(): ComponentVersion[];
 }
 
 export interface RolloutResult {
@@ -493,6 +540,16 @@ export interface RolloutResult {
    * the PRIOR (working) version.
    */
   pinReverted?: boolean;
+  /**
+   * Components still BEHIND the target when the roll finished, and in
+   * this roll's scope (#3928). Non-empty ⇒ `ok` is false.
+   *
+   * Structured (not just prose in `warnings`) because the operator reads
+   * this outcome through Telegram — hostd lifts it onto the status entry
+   * so `get_status` names the stranded components without anyone grepping
+   * a truncated stderr tail.
+   */
+  drifted?: string[];
   /** Non-fatal warnings (e.g. web/hostd refresh failures). */
   warnings: string[];
 }
@@ -599,6 +656,9 @@ export function encodeRolloutResultLine(result: RolloutResult): string {
       ...(result.got !== undefined ? { got: result.got } : {}),
       ...(result.timedOut ? { timedOut: true } : {}),
       ...(result.pinReverted ? { pinReverted: true } : {}),
+      ...(result.drifted && result.drifted.length > 0
+        ? { drifted: result.drifted }
+        : {}),
       warnings: result.warnings,
     })
   );
@@ -617,6 +677,7 @@ export function parseRolloutResultLine(
   got?: string | null;
   timedOut?: boolean;
   pinReverted?: boolean;
+  drifted?: string[];
   warnings: string[];
 } | null {
   const lines = stdout.split("\n");
@@ -659,6 +720,55 @@ export interface RolloutExecOpts {
   allowDowngrade?: boolean;
 }
 
+/** Outcome of the terminal drift gate (#3928). Pure data. */
+export interface RolloutDriftVerdict {
+  /** Behind the target AND in this roll's scope. Non-empty ⇒ roll fails. */
+  gated: ComponentVersion[];
+  /**
+   * Behind the target but NOT this roll's responsibility — an agent the
+   * operator didn't ask to roll, or a singleton whose refresh step
+   * `--skip-web` removed. Reported, never silently dropped.
+   */
+  exempt: ComponentVersion[];
+  /** Version the inventory was compared against (normalized `vX.Y.Z`). */
+  target: string | null;
+}
+
+/**
+ * Compare the live component inventory against the roll target, and split
+ * the drift into what this roll must answer for and what it must not.
+ *
+ * Pure: inventory in, verdict out. THE point of this function is that its
+ * inputs are the same inventory `switchroom update --check` reads
+ * (`collectComponents`) and the same bucketing it applies
+ * (`detectComponentDrift`) — so `rollout` and `update --check` cannot
+ * disagree about what is in scope, which is exactly what they did in
+ * #3928 (`update --check` named `switchroom-web` and
+ * `switchroom-hindsight-autoheal` as targets; the roll that had just
+ * "succeeded" had never considered them).
+ *
+ * Scope is derived from the PLAN, not from flags — see `gatedOwners`.
+ */
+export function evaluateRolloutDrift(
+  components: readonly ComponentVersion[],
+  target: string,
+  steps: readonly RolloutStep[],
+  hostdContext: boolean,
+): RolloutDriftVerdict {
+  // `detectComponentDrift` resolves its target from a release-pin-shaped
+  // string, so normalize the roll target to the canonical `vX.Y.Z` first.
+  const report = detectComponentDrift(components, `v${normalizeVersion(target)}`);
+  const owners = gatedOwners(
+    steps.map((s) => s.kind),
+    hostdContext,
+  );
+  const rolledAgents = new Set(
+    steps.flatMap((s) => (s.kind === "restart-agent" ? [s.agent] : [])),
+  );
+  const { gated, exempt } = partitionDrift(report.behind, { owners, rolledAgents });
+  return { gated, exempt, target: report.target };
+}
+
 export function executeRollout(
   steps: RolloutStep[],
   target: string,
@@ -682,6 +792,13 @@ export function executeRollout(
   // just failed to boot, because every later restart/reconcile/`compose up`
   // reads that pin and converges the rest of the fleet onto it.
   let pinPersisted = false;
+
+  /**
+   * Verdict of the terminal `verify-components` gate (#3928). Computed
+   * inside the step loop (it is read-only), ACTED ON after the loop —
+   * see the gate below the pin commit for why the ordering matters.
+   */
+  let driftVerdict: RolloutDriftVerdict | null = null;
 
   /**
    * Single exit point for every stop-the-roll failure. Reverting the pin
@@ -1100,6 +1217,62 @@ export function executeRollout(
           }
           break;
         }
+        case "verify-components": {
+          // #3928 — the roll's own convergence proof. Read-only: one
+          // `docker ps` through the same collector `switchroom update
+          // --check` uses, so the two commands cannot disagree about what
+          // was in scope. Everything this step finds is decided AFTER the
+          // loop (see the gate below the pin commit).
+          deps.log(
+            `ROLL_STEP verify-components — asserting every in-scope component is on ${target}`,
+          );
+          if (!deps.collectComponents) {
+            // Never a silent pass: an un-gated roll must not be
+            // indistinguishable from a proven one.
+            warnings.push(
+              `verify-components ran with NO component collector wired, so this ` +
+                `roll did not prove the host converged. Confirm with ` +
+                `\`switchroom update --check\` — anything still BEHIND ${target} ` +
+                `was NOT caught here.`,
+            );
+            break;
+          }
+          let inventory: ComponentVersion[];
+          try {
+            inventory = deps.collectComponents();
+          } catch (e) {
+            // Deliberately caught HERE rather than left to the step loop's
+            // catch: that path routes through `fail()`, which reverts the
+            // provisional `release.pin`. A read-only inventory probe that
+            // could not run is not evidence the build is bad, and reverting
+            // the pin of an otherwise-proven roll would drag the whole fleet
+            // back on the next reconcile.
+            warnings.push(
+              `verify-components could not read the component inventory ` +
+                `(${(e as Error).message}), so this roll did not prove the host ` +
+                `converged. Confirm with \`switchroom update --check\`.`,
+            );
+            break;
+          }
+          driftVerdict = evaluateRolloutDrift(
+            inventory,
+            target,
+            steps,
+            execOpts.hostdContext === true,
+          );
+          for (const c of driftVerdict.exempt) {
+            // Behind, but this plan never owned it (a `--agents` subset, or
+            // a refresh step `--skip-web` removed). Say so — an explicit
+            // opt-out earns a named warning, not silence.
+            warnings.push(
+              `${c.name} is on ${c.version ?? "an unreadable version"}, behind ` +
+                `${target}, but was OUTSIDE this roll's scope (no step in this ` +
+                `plan owns it). Finish it: ` +
+                `${remediationFor(classifyComponent(c), `v${normalizeVersion(target)}`)}`,
+            );
+          }
+          break;
+        }
       }
     }
   } catch (e) {
@@ -1156,6 +1329,52 @@ export function executeRollout(
           `journal may cause a later boot to revert it — verify host-side.`,
       );
     }
+  }
+  // #3928 — the convergence gate. A roll that leaves an IN-SCOPE component
+  // behind the target does not exit 0. Before this, `switchroom rollout`
+  // rolled the fleet to v0.19.30 and exited green while `switchroom update
+  // --check` on the same host still reported `switchroom-web` and
+  // `switchroom-hindsight-autoheal` on v0.19.26 — the refresh steps had
+  // degraded their failures to warnings and nobody checked afterwards.
+  // Silent partial success is the deeper defect: it is what let the drift
+  // survive three releases.
+  //
+  // TWO deliberate differences from every other failure in this function:
+  //
+  //   1. It runs AFTER `commitPin`, and does NOT go through `fail()`. Every
+  //      agent came back on the target and the durable pin is CORRECT;
+  //      reverting it would drag the converged fleet back to the prior
+  //      version on the next reconcile — turning a "one singleton is stale"
+  //      finding into a fleet-wide downgrade. Nothing here needs rolling
+  //      BACK; a named component needs finishing FORWARD.
+  //   2. `rolled` is reported in full, so hostd's unattended-failure path
+  //      (`recoverFailedAutoRollout`) sees a past-canary failure and
+  //      correctly declines to auto-roll-back, alerting the operator with
+  //      the component names instead.
+  if (driftVerdict && driftVerdict.gated.length > 0) {
+    const normalizedTarget = `v${normalizeVersion(target)}`;
+    for (const c of driftVerdict.gated) {
+      deps.log(
+        `  ✗ ${c.name} → ${c.version ?? "<unreadable>"} (expected ${target}) — STILL BEHIND`,
+      );
+      warnings.push(
+        `${c.name} is STILL on ${c.version ?? "an unreadable version"} after ` +
+          `the roll to ${target} — it was in this roll's scope and did not ` +
+          `converge. Finish it: ` +
+          `${remediationFor(classifyComponent(c), normalizedTarget)}`,
+      );
+    }
+    deps.log(
+      `  ✗ verify-components FAILED — ${driftVerdict.gated.length} component(s) ` +
+        `still behind ${target}: ${driftVerdict.gated.map((c) => c.name).join(", ")}`,
+    );
+    return {
+      ok: false,
+      rolled,
+      warnings,
+      failedStep: VERIFY_COMPONENTS_STEP,
+      drifted: driftVerdict.gated.map((c) => c.name),
+    };
   }
   return { ok: true, rolled, warnings };
 }
@@ -1565,6 +1784,20 @@ export function createRolloutDeps(params: {
         const r = dockerRun(args);
         return r.ok ? r.stdout : null;
       }),
+    // #3928 — the terminal drift gate's inventory. Threaded through the
+    // SAME bounded `dockerRun` as the other in-process docker calls: this
+    // runs inside `executeRollout`, and an unbounded `docker ps` against an
+    // unresponsive daemon would strand hostd's fleet-mutation latch exactly
+    // like the probes above.
+    collectComponents: () =>
+      collectHostComponents(SWITCHROOM_VERSION, ((cmd, args) => {
+        // `collectContainerComponents` only ever calls `docker`; asserting
+        // it keeps a future caller from silently shelling out to something
+        // else through this seam.
+        if (cmd !== "docker") return { status: 1, stdout: "" };
+        const r = dockerRun(args);
+        return { status: r.ok ? 0 : 1, stdout: r.stdout };
+      }) satisfies ExecFn),
     persistPin: (pin) => {
       const before = readFileSync(configPath, "utf8");
       const after = setReleasePinInConfig(before, pin);
@@ -1851,6 +2084,27 @@ export function registerRolloutCommand(program: Command): void {
       // (rolled[]/failedStep/failedAgent) instead of a flattened tail.
       if (hostdCtx) {
         process.stdout.write(encodeRolloutResultLine(result) + "\n");
+      }
+
+      // #3928 — a residual-drift failure is NOT a "stopped partway" failure
+      // and must not be narrated as one. The agents ARE on the target and
+      // the pin IS committed; what failed is convergence of a component the
+      // roll was answerable for. Saying "Rolled before stop" here would send
+      // the operator to re-run the agent roll, which is already done and
+      // would not touch the component that is actually behind. Name the
+      // components and the per-component remediation instead — the warnings
+      // printed above carry the exact command for each.
+      if (!result.ok && result.failedStep === VERIFY_COMPONENTS_STEP) {
+        process.stderr.write(
+          `\n✗ Rollout INCOMPLETE — ${(result.drifted ?? []).length} component(s) ` +
+            `still behind ${target}: ${(result.drifted ?? []).join(", ") || "unknown"}.\n` +
+            `  ${result.rolled.length} agent(s) DID reach ${target} and the pin is ` +
+            `committed — re-running the agent roll will not fix this.\n` +
+            `  Run the per-component command named in the warning(s) above, then ` +
+            `\`switchroom update --check\` to confirm the host is converged.\n`,
+        );
+        process.exitCode = 1;
+        return;
       }
 
       if (!result.ok) {
