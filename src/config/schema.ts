@@ -2561,7 +2561,11 @@ export const HindsightConfigSchema = z.object({
       "still honours an operator who flips the function back; and " +
       "HINDSIGHT_API_WORKER_MAX_SLOTS — the worker poller's TOTAL in-flight " +
       "task budget, the pool WORKER_CONSOLIDATION_MAX_SLOTS reserves out of; " +
-      "unset means upstream's own default), plus the " +
+      "unset means upstream's own default; and " +
+      "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS — the reserved slot FLOOR for the " +
+      "retain (memory write) lane, carved from that same total; unset means " +
+      "upstream's own 0, i.e. no floor and retain competes for the shared " +
+      "pool), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

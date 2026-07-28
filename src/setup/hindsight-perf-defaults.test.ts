@@ -329,7 +329,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twenty-seven keys, by name", () => {
+  it("is overridable on exactly these twenty-eight keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -363,6 +363,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
       "HINDSIGHT_API_WORKER_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
       // Not HINDSIGHT_API_* — a switchroom-patch knob (the CE-damping
       // rollback hatch), read by the patched reranking module, never by
       // upstream's config parser. Sorts last.
@@ -521,6 +522,91 @@ describe("HINDSIGHT_API_WORKER_MAX_SLOTS (override-only)", () => {
     startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
     const fromRun = runEnv(runArgs());
     expect(fromRun.get(KEY)).toEqual(["16"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toEqual(["5"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
+  });
+});
+
+describe("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS (override-only)", () => {
+  const KEY = "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group", () => {
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: "2" }).get(KEY)).toBe("2");
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: "2" }).get(KEY)).toBe("2");
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — upstream's own 0 stands",
+    (caps) => {
+      // No floor is upstream's default and switchroom ships no opinion on the
+      // slot budget a floor would be carved from. Emitting anything here would
+      // move every install off `retain: 0` for no measured reason.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    // The outcome that matters. Without the key in the managed set both of
+    // these are undefined — `resolveHindsightPerfOverrides` drops an unmanaged
+    // key silently, so the operator's line reads as durable config in yaml and
+    // never reaches the container. Membership alone would not catch a
+    // gate-shaped regression on the emit side, so assert the launch argv.
+    const perf = { env: { [KEY]: "2" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get(KEY)).toEqual(["2"]);
+    expect(fromCompose.get(KEY)).toEqual(["2"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // It belongs to no capability group, so a gate-shaped regression that only
+    // emits grouped keys would drop it. Cloud endpoint + no GPU is the harshest
+    // gating case.
+    const perf = { env: { [KEY]: "2" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["2"]);
+  });
+
+  it("carries the whole slot policy — total, both reservations, and the ceiling", () => {
+    // The retain floor is only meaningful against the total it is carved from
+    // and the consolidation terms it competes with. All four reach the
+    // container together, or an operator sets a coherent policy and loses part
+    // of it silently. Upstream validates the combination at boot; it can only
+    // do that for the terms it is actually handed.
+    const perf = {
+      env: {
+        [KEY]: "2",
+        HINDSIGHT_API_WORKER_MAX_SLOTS: "16",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "5",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT: "6",
+      },
+      processEnv: {},
+    };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    expect(fromRun.get(KEY)).toEqual(["2"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_MAX_SLOTS")).toEqual(["16"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toEqual(["5"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
   });
