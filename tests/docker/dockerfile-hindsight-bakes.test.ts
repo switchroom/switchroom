@@ -993,6 +993,68 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the reflect-directive-isolation fix (assert-guarded, fail-loud)", () => {
+    // `reflect_async` loaded its directives with `isolation_mode=True`, and
+    // `list_directives` turns that flag into a hard
+    // `tags IS NULL OR tags = '{}'` filter whenever the caller supplied no
+    // tags — so an untagged reflect (the common case) silently dropped every
+    // directive carrying at least one tag, from the system prompt AND from
+    // `directives_applied` in the trace. Measured on this fleet 2026-07-29:
+    // 172 active directives, 94 untagged; 45% of the operator's standing rules
+    // never reached a reflect prompt. switchroom #3967, upstream
+    // vectorize-io/hindsight#1269 / #3031.
+    //
+    // SCOPE: structural, not behavioural. Every assertion below is an
+    // unanchored substring match, so it proves the patch is PRESENT, never that
+    // it LANDED. The behavioural gate is
+    // tests/docker/hindsight-reflect-directives-patch.test.ts, which loads real
+    // directives out of a real database with the kwargs reflect actually passes
+    // and reads which ones reach the trace and the prompt. Do not treat this
+    // file as sufficient.
+
+    // The exact-once anchor guard (fail-loud on upstream drift), and the
+    // instruction a future maintainer needs when it fires.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight reflect-directive-isolation patch/,
+    );
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: anchor found \{n\}x \(expected 1\) in engine\/memory_engine\.py — upstream "/,
+    );
+    expect(dockerfile).toMatch(
+      /"reformatted reflect's directive fetch; re-author this patch in "/,
+    );
+    // The splice itself: the flag reflect passes, and the now-inverted upstream
+    // comment that would otherwise sit directly above it.
+    expect(dockerfile).toMatch(/"            isolation_mode=True,\\n"/);
+    expect(dockerfile).toMatch(/"            isolation_mode=False,\\n"/);
+    expect(dockerfile).toMatch(
+      /# Use isolation_mode=True to prevent tag-scoped directives from leaking into untagged operations\\n/,
+    );
+    // The premise that makes the flip NARROW: the flag is consulted only on the
+    // no-tags path. If upstream widens that condition, flipping it would start
+    // changing TAGGED reflects too, and the build must fail rather than ship it.
+    expect(dockerfile).toMatch(
+      /assert "if not tags and not tag_groups and isolation_mode:" in t,/,
+    );
+    // Post-replace re-assertions (verification-on-build): a patch that applied
+    // but landed inert must fail the build.
+    expect(dockerfile).toMatch(/assert "isolation_mode=True," not in t,/);
+    expect(dockerfile).toMatch(
+      /assert t\.count\("            isolation_mode=False,\\n        \)\\n"\) == 1,/,
+    );
+    // The scoping the flag is NOT replacing: a tagged reflect must still be
+    // scoped by the untagged-OR-matching clauses.
+    expect(dockerfile).toMatch(
+      /assert t\.count\("f\\"\(\(tags IS NULL OR tags = '\{\{\}\}'\) OR \(\{scoped_clause\}\)\)\\""\) == 2,/,
+    );
+    // The patched file is re-parsed, so a bad splice fails the build rather
+    // than the container.
+    expect(dockerfile).toMatch(/^ast\.parse\(s\)$/m);
+    expect(dockerfile).toMatch(
+      /switchroom hindsight reflect-directive-isolation patch: reflect now loads TAGGED /,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

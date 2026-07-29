@@ -127,6 +127,7 @@ jobs:
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
               - 'tests/docker/hindsight-graph-seed-patch.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
+              - 'tests/docker/hindsight-reflect-directives-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -374,10 +375,24 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-maxitems-grammar-patch.test.ts
 
+      - name: Run the hindsight reflect-directives probe (RED/GREEN, must not skip)
+        # Same contract again, for the reflect-directive-isolation patch
+        # (switchroom #3967, upstream vectorize-io/hindsight#1269 / #3031).
+        # The bakes test cannot cover the failure that matters here: its
+        # assertions are unanchored substring matches, so reverting the spliced
+        # value to True — a single token — leaves them green while every tagged
+        # directive is again silently dropped from synthesis (45% of this
+        # fleet's active directives). Only loading real directives out of a real
+        # database with the kwargs reflect actually passes, and reading which
+        # ones reach directives_applied and the system prompt, catches it.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-reflect-directives-patch.test.ts
+
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done
