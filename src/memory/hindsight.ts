@@ -374,8 +374,53 @@ export function isHindsightEnabled(
  * sentence is untouched. If it needs stronger evidence, re-run the A/B harness
  * described above with this as arm C.
  */
+/*
+ * 2026-07-29 (durability-gate pass, live-text reconciliation). This revision
+ * did NOT originate here: it was applied out-of-band directly to the `klanker`
+ * and `overlord` banks through the Hindsight REST config surface and never
+ * landed in the repo. Read back verbatim off `GET /v1/default/banks/klanker/
+ * config` on 2026-07-29 (3460 chars) and pinned here so the repo is once again
+ * the source of truth and the guarded upgrade path can converge the rest of
+ * the fleet.
+ *
+ * What it adds over the outgoing default (now SUPERSEDED_RETAIN_MISSIONS[5]):
+ *  - A DURABILITY GATE naming the five admissible classes (PREFERENCE,
+ *    DECISION, FINDING, OUTCOME, RELATIONSHIP) with an explicit "fits none of
+ *    the five -> drop it, do not reword it into one". This is a positive
+ *    whitelist in front of the negative bullets, which the exclusion list
+ *    alone never gave the small extraction model.
+ *  - Inside DECISION, a carve-out for process decisions ("which worker to
+ *    dispatch, which branch to rebase, which PR to merge now") — the dominant
+ *    residual noise class on the agent banks.
+ *  - A delegation bullet ("the act of delegating, dispatching, spawning,
+ *    launching, steering or merging work") in NEVER extract.
+ *  - A stand-alone-sentence instruction ("name the thing, the number, and the
+ *    date") covering the same undated-claim failure the volatile-state bullet
+ *    targeted.
+ *
+ * KNOWN DIVERGENCE, stated rather than papered over: this text is a SIBLING of
+ * the outgoing default, not a descendant. Both were derived from
+ * SUPERSEDED_RETAIN_MISSIONS[4] (the 2026-07-28 A/B arm B) independently, so
+ * adopting it DROPS the "Volatile state written as a timeless assertion"
+ * bullet and its verbatim exemplars documented in the 2026-07-28 volatile-state
+ * note below. The stand-alone-sentence instruction plus the retained
+ * "Transient state ... unless the fact is explicitly dated" bullet cover part
+ * of that ground, but not the verbatim exemplars. Reconciling the two texts is
+ * deliberately NOT in this change — this change only lands what is already
+ * running and re-arms the guarded upgrade path.
+ */
 export const DEFAULT_RETAIN_MISSION =
-  "Extract durable facts that will still be true and useful weeks from now: user preferences and standing rules, ongoing projects and recurring commitments, technical and architectural decisions with their rationale, and people/tool relationships. A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "Extract durable facts that will still be true and useful weeks from now, once this session is forgotten.\n" +
+  "\n" +
+  "DURABILITY GATE. Emit a candidate ONLY if it is one of these five classes:\n" +
+  "- PREFERENCE — what the user likes, wants, or always does; a standing rule or correction.\n" +
+  "- DECISION — a settled choice that changes how future work is done, including a choice NOT to do something. A decision about the mechanics of the CURRENT task (which worker to dispatch, which branch to rebase, which PR to merge now, what to do next) is process narration, not a durable decision — drop it unless it establishes a standing rule or permanently changes a system.\n" +
+  "- FINDING — a root cause, a measurement, or verified behaviour of a system. Include the number.\n" +
+  "- OUTCOME — a completed result that changed the world: what shipped, what a thing turned out to be. Not the act of shipping it.\n" +
+  "- RELATIONSHIP — who a person is, what a project or tool is, and how they connect.\n" +
+  "If a candidate fits none of the five, it is not a memory. Drop it; do not reword it into one.\n" +
+  "\n" +
+  "A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
   "\n" +
   "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
   "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
@@ -392,6 +437,9 @@ export const DEFAULT_RETAIN_MISSION =
   "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
   "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
   "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- The act of delegating, dispatching, spawning, launching, steering or merging\n" +
+  "  work — including when it succeeded. \"X was dispatched and completed\" is the\n" +
+  "  session describing itself. Record only what the work LEARNED or CHANGED.\n" +
   "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
   "  running) — retain the outcome only once the task completes or a decision is made.\n" +
   "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
@@ -400,22 +448,16 @@ export const DEFAULT_RETAIN_MISSION =
   "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
   "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
-  "- Volatile state written as a timeless assertion. A version, count, size,\n" +
-  "  backlog, status, or any \"X is running Y\" / \"X is at Y\" / \"X is currently Y\"\n" +
-  "  claim is true only at the instant it was said. Concretely, never produce a\n" +
-  "  fact whose text resembles any of these: \"Switchroom fleet is running image\n" +
-  "  version v0.18.19\", \"The switchroom repo is at /path/to/fleet, version\n" +
-  "  v0.19.5\", \"Bank overlord has 43155 pending consolidations\", \"The build is\n" +
-  "  currently green\". If the claim is worth keeping, put the date INSIDE the\n" +
-  "  fact text (\"As of 2026-07-19 the fleet was running v0.18.19\"); if you\n" +
-  "  cannot date it, drop it. An undated one is recalled forever as though it\n" +
-  "  were still true, which is worse than not remembering it at all.\n" +
   "- Transient state (unread counts, build status, what is running right now) unless\n" +
   "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
   "- Greetings, acknowledgements, and routine operational chatter.\n" +
   "\n" +
+  "Write each fact so it stands alone: name the thing, the number, and the date. A\n" +
+  "sentence that only makes sense while reading this transcript is not durable.\n" +
+  "\n" +
   "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
-  "nothing durable remains, return an empty facts list.";
+  "nothing durable remains, return an empty facts list.\n" +
+  "";
 
 /**
  * Ordered registry of every retain mission switchroom has ever shipped as a
@@ -518,6 +560,53 @@ export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
   "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
   "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) unless\n" +
+  "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n" +
+  "\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
+  "nothing durable remains, return an empty facts list.",
+  // (2026-07-28 volatile-state pass) — the outgoing repo default, superseded
+  // by the 2026-07-29 live text above. No live bank was ever observed carrying
+  // it (the fleet read on 2026-07-29 found 21 banks on entry [3], 2 on the new
+  // default, 6 unset), but it shipped as a DEFAULT, so it is recorded here
+  // append-only like every other one: a bank that does pick it up must stay
+  // upgradable rather than be mistaken for an operator customization.
+  "Extract durable facts that will still be true and useful weeks from now: user preferences and standing rules, ongoing projects and recurring commitments, technical and architectural decisions with their rationale, and people/tool relationships. A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "\n" +
+  "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
+  "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
+  "the location where some output was written? If yes, drop it — it is transcript\n" +
+  "exhaust, not memory.\n" +
+  "\n" +
+  "NEVER extract:\n" +
+  "- Tool results verbatim or paraphrased. Concretely, never produce a fact whose\n" +
+  "  text resembles any of these: \"File created successfully at /path/to/file\",\n" +
+  "  \"A background command with ID bctz4yskm is running, and its output will be\n" +
+  "  written to /tmp/...\", \"Async agent a745598ba84e71df1 was launched successfully\n" +
+  "  and is running in the background\", \"User executed a Bash command to sleep for\n" +
+  "  200 seconds\", \"The assistant used grep to locate 'truncateSync' in src/foo.ts\".\n" +
+  "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
+  "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
+  "  running) — retain the outcome only once the task completes or a decision is made.\n" +
+  "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Slash commands the user typed and their effects (e.g. \"User issued /clear to\n" +
+  "  reset assistant state\").\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
+  "  system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Volatile state written as a timeless assertion. A version, count, size,\n" +
+  "  backlog, status, or any \"X is running Y\" / \"X is at Y\" / \"X is currently Y\"\n" +
+  "  claim is true only at the instant it was said. Concretely, never produce a\n" +
+  "  fact whose text resembles any of these: \"Switchroom fleet is running image\n" +
+  "  version v0.18.19\", \"The switchroom repo is at /path/to/fleet, version\n" +
+  "  v0.19.5\", \"Bank overlord has 43155 pending consolidations\", \"The build is\n" +
+  "  currently green\". If the claim is worth keeping, put the date INSIDE the\n" +
+  "  fact text (\"As of 2026-07-19 the fleet was running v0.18.19\"); if you\n" +
+  "  cannot date it, drop it. An undated one is recalled forever as though it\n" +
+  "  were still true, which is worse than not remembering it at all.\n" +
   "- Transient state (unread counts, build status, what is running right now) unless\n" +
   "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
   "- Greetings, acknowledgements, and routine operational chatter.\n" +
