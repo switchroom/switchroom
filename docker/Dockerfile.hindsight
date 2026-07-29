@@ -1936,6 +1936,145 @@ print(
 )
 PYEOF
 
+# Let `reflect` see the TAGGED directives too (switchroom #3967, upstream
+# vectorize-io/hindsight#1269 / #3031).
+#
+# THE DEFECT, in the real shipping source. `reflect_async` loads its directives
+# with `isolation_mode=True` (engine/memory_engine.py ~:9390), and
+# `list_directives` turns that flag into a hard filter whenever the caller
+# supplied no tags (~:11655):
+#
+#     if not tags and not tag_groups and isolation_mode:
+#         # Isolation mode: only include directives with empty/null tags
+#         filters.append("(tags IS NULL OR tags = '{}')")
+#
+# So an untagged reflect — the common case, and the only one switchroom's
+# `reflect` tool issues — silently drops every directive that carries at least
+# one tag. It is absent from the system prompt's DIRECTIVES (MANDATORY) section
+# AND from `directives_applied` in the trace, and the engine's own
+# `[REFLECT …] Loaded N directives` line reports the post-filter count as though
+# it were the whole set.
+#
+# Measured on this fleet 2026-07-29: 172 active directives, 94 untagged. 45% of
+# the operator's standing rules never reached a reflect prompt. Per bank
+# (reaching reflect / active): reggie 3/20, test-harness 2/19, gymbro 4/11,
+# overlord 10/22, `default` 0/9.
+#
+# WHY THE FLAG IS WRONG HERE RATHER THAN THE FILTER. `isolation_mode` is a
+# MEMORY-scoping concept — don't let tag-scoped content leak into an untagged
+# operation. Directives have their own documented semantics, stated by upstream
+# in the branch immediately above the one quoted: "Untagged directives always
+# apply regardless of reflect tags; tagged directives only apply when the reflect
+# operation includes matching tags". Under that rule a no-tags reflect has no tag
+# context to leak ACROSS, so the isolation branch only ever subtracts. Fixing it
+# at the call site rather than in `list_directives` keeps the public
+# `GET /directives` behaviour and every other caller byte-for-byte upstream.
+#
+# BLAST RADIUS, by construction: the flag is consulted ONLY inside
+# `if not tags and not tag_groups and isolation_mode`. A tagged reflect never
+# reaches it — its directives are still scoped by the tags/tag_groups branches
+# (untagged OR matching), which this patch does not touch. Only the no-tags path
+# changes, and only by ceasing to subtract.
+#
+# The RECALL side of switchroom already worked around this client-side
+# (vendor/hindsight-memory/scripts/lib/directives.py, recall.py:1918-1949), which
+# is why the same bank's directives read complete on the recall hook and 45%
+# short in reflect. This closes that inconsistency at the source.
+#
+# Self-verifying (exact-once anchor, re-asserted after the splice, `ast.parse` on
+# the result); guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
+# unpatched upstream / GREEN patched) by
+# tests/docker/hindsight-reflect-directives-patch.test.ts, which loads directives
+# from a REAL database with the kwargs reflect actually passes and asserts which
+# ones reach `directives_applied` and the system prompt.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+TAG = "switchroom hindsight reflect-directive-isolation patch"
+f = pathlib.Path("/app/api/hindsight_api/engine/memory_engine.py")
+s = f.read_text()
+
+
+def apply(source, anchor, repl):
+    n = source.count(anchor)
+    assert n == 1, (
+        f"{TAG}: anchor found {n}x (expected 1) in engine/memory_engine.py — upstream "
+        "reformatted reflect's directive fetch; re-author this patch in "
+        f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+    )
+    return source.replace(anchor, repl, 1)
+
+
+# ---- 1. the comment that states the (now inverted) intent ----
+# Left alone it would sit directly above `isolation_mode=False` telling the next
+# maintainer the opposite of what the code does.
+s = apply(
+    s,
+    "        # Use isolation_mode=True to prevent tag-scoped directives from leaking into untagged operations\n",
+    "        # switchroom #3967 / upstream vectorize-io/hindsight#1269, #3031: NOT\n"
+    "        # isolation_mode. It filters this fetch down to `tags IS NULL OR tags = '{}'`\n"
+    "        # whenever the caller supplied no tags, which silently drops EVERY tagged\n"
+    "        # directive from synthesis — 45% of this fleet's active directives, measured\n"
+    "        # 2026-07-29. There is nothing to isolate on a no-tags reflect: directives\n"
+    "        # carry their own scoping rule one branch up in list_directives ('untagged\n"
+    "        # always apply; tagged apply only on a matching reflect'), so with no tag\n"
+    "        # context the isolation branch only ever subtracts.\n",
+)
+
+# ---- 2. the flag itself ----
+s = apply(
+    s,
+    "            active_only=True,\n"
+    "            request_context=request_context,\n"
+    "            isolation_mode=True,\n"
+    "        )\n",
+    "            active_only=True,\n"
+    "            request_context=request_context,\n"
+    "            # switchroom: scoped to THIS call site — every other list_directives\n"
+    "            # caller, including the public GET /directives, keeps upstream behaviour.\n"
+    "            isolation_mode=False,\n"
+    "        )\n",
+)
+
+f.write_text(s)
+ast.parse(s)
+
+t = f.read_text()
+# The premise this patch depends on: `isolation_mode` is only ever consulted on
+# the no-tags path. If upstream ever widens that condition, flipping the flag
+# would start changing TAGGED reflects too — fail the build instead.
+assert "if not tags and not tag_groups and isolation_mode:" in t, (
+    f"{TAG}: the isolation branch in list_directives is no longer gated on "
+    "`not tags and not tag_groups` — flipping the reflect call site would now also "
+    "change TAGGED reflects. Re-author this patch."
+)
+# The patch must have LANDED, not merely applied: no `isolation_mode=True` may
+# survive as an ARGUMENT anywhere in the engine, and the reflect fetch must read
+# False. (The prose in list_directives' own docstring still says
+# `isolation_mode=True`, correctly, and is deliberately not matched here.)
+assert "isolation_mode=True," not in t, (
+    f"{TAG}: an isolation_mode=True argument survived in engine/memory_engine.py — "
+    "the reflect directive fetch still drops tagged directives"
+)
+assert t.count("            isolation_mode=False,\n        )\n") == 1, (
+    f"{TAG}: reflect's directive fetch does not read isolation_mode=False exactly once"
+)
+# The scoping the flag replaces must still exist, or reflect would now load
+# directives that a TAGGED reflect is supposed to exclude.
+assert t.count("f\"((tags IS NULL OR tags = '{{}}') OR ({scoped_clause}))\"") == 2, (
+    f"{TAG}: the untagged-OR-matching tag scoping in list_directives is gone — a "
+    "tagged reflect would no longer be scoped at all. Re-author this patch."
+)
+
+print(
+    "switchroom hindsight reflect-directive-isolation patch: reflect now loads TAGGED "
+    "directives too (isolation_mode=False on its fetch only); a tagged reflect is "
+    "unchanged because the flag is consulted only when no tags are supplied"
+)
+PYEOF
+
 # Perturbed JSON retry: upstream's `except json.JSONDecodeError` handler in
 # `LiteLLMLLM.call()` (litellm_llm.py:50, :216) sleeps and then re-issues the
 # SAME `call_kwargs` — a byte-identical request. Behind a caching LiteLLM
