@@ -375,15 +375,28 @@ export function isHindsightEnabled(
  * described above with this as arm C.
  */
 /*
- * 2026-07-29 (durability-gate pass, live-text reconciliation). This revision
- * did NOT originate here: it was applied out-of-band directly to the `klanker`
- * and `overlord` banks through the Hindsight REST config surface and never
- * landed in the repo. Read back verbatim off `GET /v1/default/banks/klanker/
- * config` on 2026-07-29 (3460 chars) and pinned here so the repo is once again
- * the source of truth and the guarded upgrade path can converge the rest of
- * the fleet.
+ * 2026-07-29 (durability-gate pass — a MERGE of two siblings, not an adoption).
  *
- * What it adds over the outgoing default (now SUPERSEDED_RETAIN_MISSIONS[5]):
+ * This text is assembled from two parents, and neither one alone was correct:
+ *
+ *  A. The LIVE text (SUPERSEDED_RETAIN_MISSIONS[6], 3460 chars). It did NOT
+ *     originate here — it was applied out-of-band directly to the `klanker` and
+ *     `overlord` banks through the Hindsight REST config surface and never
+ *     landed in the repo. Read back verbatim off
+ *     `GET /v1/default/banks/klanker/config` on 2026-07-29. It contributes
+ *     EVERYTHING here except the volatile-state bullet, byte-for-byte.
+ *  B. The outgoing repo default (SUPERSEDED_RETAIN_MISSIONS[5], 3007 chars). It
+ *     contributes exactly one thing: the 742-char "Volatile state written as a
+ *     timeless assertion" bullet, spliced back in verbatim.
+ *
+ * Result: 4202 chars = 3460 + 742. A and B were SIBLINGS — both derived
+ * independently from SUPERSEDED_RETAIN_MISSIONS[4] (the 2026-07-28 A/B arm B) —
+ * so adopting A wholesale would have silently DROPPED B's volatile-state
+ * material. That material is the most on-target section for the failure class
+ * currently doing the most damage (a snapshot written as a timeless assertion),
+ * so losing it to gain A's gate was a net regression. Hence the union.
+ *
+ * From A (the live text) — what it adds over the outgoing default:
  *  - A DURABILITY GATE naming the five admissible classes (PREFERENCE,
  *    DECISION, FINDING, OUTCOME, RELATIONSHIP) with an explicit "fits none of
  *    the five -> drop it, do not reword it into one". This is a positive
@@ -394,20 +407,38 @@ export function isHindsightEnabled(
  *    residual noise class on the agent banks.
  *  - A delegation bullet ("the act of delegating, dispatching, spawning,
  *    launching, steering or merging work") in NEVER extract.
- *  - A stand-alone-sentence instruction ("name the thing, the number, and the
- *    date") covering the same undated-claim failure the volatile-state bullet
- *    targeted.
+ *  - A closing stand-alone-fact instruction ("name the thing, the number, and
+ *    the date").
  *
- * KNOWN DIVERGENCE, stated rather than papered over: this text is a SIBLING of
- * the outgoing default, not a descendant. Both were derived from
- * SUPERSEDED_RETAIN_MISSIONS[4] (the 2026-07-28 A/B arm B) independently, so
- * adopting it DROPS the "Volatile state written as a timeless assertion"
- * bullet and its verbatim exemplars documented in the 2026-07-28 volatile-state
- * note below. The stand-alone-sentence instruction plus the retained
- * "Transient state ... unless the fact is explicitly dated" bullet cover part
- * of that ground, but not the verbatim exemplars. Reconciling the two texts is
- * deliberately NOT in this change — this change only lands what is already
- * running and re-arms the guarded upgrade path.
+ * From B (the 2026-07-28 volatile-state pass) — the spliced bullet, kept whole:
+ *  - The subject test ("a version, count, size, backlog, status ... is true
+ *    only at the instant it was said").
+ *  - Its four verbatim negative exemplars, lifted from units that actually
+ *    leaked into live banks ("Switchroom fleet is running image version
+ *    v0.18.19", the repeated "repo is at <path>, version v0.19.5", "Bank
+ *    overlord has 43155 pending consolidations", "The build is currently
+ *    green").
+ *  - The repair instruction — put the date INSIDE the fact text — plus its
+ *    reason, so the rule generalizes past the enumerated exemplars.
+ *
+ * MERGE MECHANICS, so a reviewer can check this cheaply rather than trusting
+ * it: the block is inserted at its ORIGINAL position, inside NEVER extract,
+ * immediately above the "- Transient state (unread counts ...)" bullet and
+ * below "- Restatements of the user's current request ...". Both bullets are
+ * kept: the 2026-07-25 finding that removing or narrowing a bullet regresses
+ * extraction stands, and the 2026-07-28 pass deliberately put the stronger
+ * concrete bullet above the weaker general one. NOTHING else in A was
+ * reworded, tightened, reordered, or dropped — no line is duplicated between
+ * the two parents, so no de-duplication was needed and nothing was discarded
+ * to make them fit. `DEFAULT_RETAIN_MISSION.replace(block, "")` reproduces A
+ * exactly; there is a test that asserts precisely that.
+ *
+ * The one near-overlap, kept on purpose: A's closing "name the thing, the
+ * number, and the date" and B's "put the date INSIDE the fact text" both push
+ * toward dating a claim, but they are different instructions — A is a general
+ * self-containment rule for every fact, B is a specific repair for a volatile
+ * claim that would otherwise be dropped. B is the more specific of the two and
+ * is the one that carries the exemplars, so both stay.
  */
 export const DEFAULT_RETAIN_MISSION =
   "Extract durable facts that will still be true and useful weeks from now, once this session is forgotten.\n" +
@@ -448,6 +479,16 @@ export const DEFAULT_RETAIN_MISSION =
   "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
   "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
+  "- Volatile state written as a timeless assertion. A version, count, size,\n" +
+  "  backlog, status, or any \"X is running Y\" / \"X is at Y\" / \"X is currently Y\"\n" +
+  "  claim is true only at the instant it was said. Concretely, never produce a\n" +
+  "  fact whose text resembles any of these: \"Switchroom fleet is running image\n" +
+  "  version v0.18.19\", \"The switchroom repo is at /path/to/fleet, version\n" +
+  "  v0.19.5\", \"Bank overlord has 43155 pending consolidations\", \"The build is\n" +
+  "  currently green\". If the claim is worth keeping, put the date INSIDE the\n" +
+  "  fact text (\"As of 2026-07-19 the fleet was running v0.18.19\"); if you\n" +
+  "  cannot date it, drop it. An undated one is recalled forever as though it\n" +
+  "  were still true, which is worse than not remembering it at all.\n" +
   "- Transient state (unread counts, build status, what is running right now) unless\n" +
   "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
   "- Greetings, acknowledgements, and routine operational chatter.\n" +
@@ -456,8 +497,7 @@ export const DEFAULT_RETAIN_MISSION =
   "sentence that only makes sense while reading this transcript is not durable.\n" +
   "\n" +
   "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
-  "nothing durable remains, return an empty facts list.\n" +
-  "";
+  "nothing durable remains, return an empty facts list.\n";
 
 /**
  * Ordered registry of every retain mission switchroom has ever shipped as a
@@ -613,6 +653,59 @@ export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
   "\n" +
   "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
   "nothing durable remains, return an empty facts list.",
+  // (2026-07-29 durability-gate pass) — the text applied OUT-OF-BAND to the
+  // `klanker` and `overlord` banks and read back verbatim on 2026-07-29. Never a
+  // repo default, but a switchroom-authored one in the sense that matters here:
+  // two live banks carry it, and without this entry they would be stranded on
+  // the exact text DEFAULT_RETAIN_MISSION now supersedes. Note the TRAILING
+  // NEWLINE — it is present on the bank and membership is byte-equality.
+  "Extract durable facts that will still be true and useful weeks from now, once this session is forgotten.\n" +
+  "\n" +
+  "DURABILITY GATE. Emit a candidate ONLY if it is one of these five classes:\n" +
+  "- PREFERENCE — what the user likes, wants, or always does; a standing rule or correction.\n" +
+  "- DECISION — a settled choice that changes how future work is done, including a choice NOT to do something. A decision about the mechanics of the CURRENT task (which worker to dispatch, which branch to rebase, which PR to merge now, what to do next) is process narration, not a durable decision — drop it unless it establishes a standing rule or permanently changes a system.\n" +
+  "- FINDING — a root cause, a measurement, or verified behaviour of a system. Include the number.\n" +
+  "- OUTCOME — a completed result that changed the world: what shipped, what a thing turned out to be. Not the act of shipping it.\n" +
+  "- RELATIONSHIP — who a person is, what a project or tool is, and how they connect.\n" +
+  "If a candidate fits none of the five, it is not a memory. Drop it; do not reword it into one.\n" +
+  "\n" +
+  "A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "\n" +
+  "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
+  "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
+  "the location where some output was written? If yes, drop it — it is transcript\n" +
+  "exhaust, not memory.\n" +
+  "\n" +
+  "NEVER extract:\n" +
+  "- Tool results verbatim or paraphrased. Concretely, never produce a fact whose\n" +
+  "  text resembles any of these: \"File created successfully at /path/to/file\",\n" +
+  "  \"A background command with ID bctz4yskm is running, and its output will be\n" +
+  "  written to /tmp/...\", \"Async agent a745598ba84e71df1 was launched successfully\n" +
+  "  and is running in the background\", \"User executed a Bash command to sleep for\n" +
+  "  200 seconds\", \"The assistant used grep to locate 'truncateSync' in src/foo.ts\".\n" +
+  "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
+  "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- The act of delegating, dispatching, spawning, launching, steering or merging\n" +
+  "  work — including when it succeeded. \"X was dispatched and completed\" is the\n" +
+  "  session describing itself. Record only what the work LEARNED or CHANGED.\n" +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
+  "  running) — retain the outcome only once the task completes or a decision is made.\n" +
+  "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Slash commands the user typed and their effects (e.g. \"User issued /clear to\n" +
+  "  reset assistant state\").\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
+  "  system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) unless\n" +
+  "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n" +
+  "\n" +
+  "Write each fact so it stands alone: name the thing, the number, and the date. A\n" +
+  "sentence that only makes sense while reading this transcript is not durable.\n" +
+  "\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
+  "nothing durable remains, return an empty facts list.\n",
 ];
 
 /**

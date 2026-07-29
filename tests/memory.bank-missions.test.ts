@@ -195,23 +195,80 @@ describe("DEFAULT_RETAIN_MISSION", () => {
     );
   });
 
-  // KNOWN DIVERGENCE, asserted so it cannot be forgotten rather than hidden.
-  // The live text is a SIBLING of the outgoing 2026-07-28 default, not a
-  // descendant: both derive from SUPERSEDED_RETAIN_MISSIONS[4] independently,
-  // so adopting it drops the volatile-state bullet. See the hindsight.ts
-  // header. This test documents the state of the world; flipping it is the
-  // deliberate, visible act of reconciling the two texts.
-  it("documents that adopting the live text drops the 2026-07-28 volatile-state bullet", () => {
-    expect(DEFAULT_RETAIN_MISSION).not.toContain("Volatile state written as a timeless assertion");
-    // ...and the bullet is preserved verbatim in the registry, so nothing about
-    // that pass is lost from the repo's history.
-    const outgoing = SUPERSEDED_RETAIN_MISSIONS[5];
-    expect(outgoing).toContain("Volatile state written as a timeless assertion");
-    expect(outgoing).toMatch(
+  // THE MERGE, asserted rather than assumed. The 2026-07-29 live text and the
+  // outgoing 2026-07-28 default were SIBLINGS — both derived independently from
+  // SUPERSEDED_RETAIN_MISSIONS[4] — so simply adopting the live text would have
+  // DROPPED the volatile-state material. That material is the most on-target
+  // section for the snapshot-written-as-timeless failure class, so the default
+  // is the union: the live text verbatim, with the volatile-state bullet spliced
+  // back in at its natural position. These assertions are what stop a future
+  // "just take what's live" pass from silently regressing it again.
+  it("carries the 2026-07-28 volatile-state bullet merged into the live text", () => {
+    // The subject test, in the shape the 2026-07-28 A/B proved gpt-oss-20b
+    // actually applies (a test on the CANDIDATE'S SUBJECT, not a category).
+    expect(DEFAULT_RETAIN_MISSION).toContain("Volatile state written as a timeless assertion");
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
       /A version, count, size,\n\s*backlog, status, or any "X is running Y" \/ "X is at Y" \/ "X is currently Y"/,
     );
-    expect(outgoing).toMatch(/true only at the instant it was said/);
-    expect(outgoing).toMatch(/put the date INSIDE the\n\s*fact text/);
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/true only at the instant it was said/);
+  });
+
+  it("keeps the verbatim leaked-unit exemplars that earned the volatile bullet", () => {
+    // Lifted from live bank content, not invented — the 2026-07-25 finding is
+    // that this small model needs concrete negatives, and the 2026-07-28 A/B
+    // is that they must be the ones that actually leaked.
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /Switchroom fleet is running image\n\s*version v0\.18\.19/,
+    );
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /The switchroom repo is at \/path\/to\/fleet, version\n\s*v0\.19\.5/,
+    );
+    expect(DEFAULT_RETAIN_MISSION).toContain("pending consolidations");
+  });
+
+  it("keeps the date-inside-the-fact repair instruction, not only a prohibition", () => {
+    // An exclusion-only bullet is the 2026-07-25 degenerate-extraction failure
+    // mode. A claim worth keeping needs somewhere to go: date it inline.
+    expect(DEFAULT_RETAIN_MISSION).toMatch(/put the date INSIDE the\n\s*fact text/);
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /"As of 2026-07-19 the fleet was running v0\.18\.19"/,
+    );
+    // And the reason, so the rule generalizes past the enumerated exemplars.
+    expect(DEFAULT_RETAIN_MISSION).toMatch(
+      /recalled forever as though it\n\s*were still true/,
+    );
+  });
+
+  it("splices the volatile bullet in ABOVE the dated-transient one, not bolted on the end", () => {
+    // Position is load-bearing: the 2026-07-28 pass put the stronger, concrete
+    // bullet above the weaker general one deliberately, and both are kept (the
+    // 2026-07-25 finding that removing bullets regresses extraction stands).
+    const volatileAt = DEFAULT_RETAIN_MISSION.indexOf("- Volatile state written as");
+    const transientAt = DEFAULT_RETAIN_MISSION.indexOf("- Transient state (unread counts");
+    const restatementsAt = DEFAULT_RETAIN_MISSION.indexOf("- Restatements of the user's");
+    expect(volatileAt).toBeGreaterThan(-1);
+    expect(volatileAt).toBeGreaterThan(restatementsAt);
+    expect(transientAt).toBeGreaterThan(volatileAt);
+    // It lands inside NEVER extract, not after the closing instruction.
+    expect(volatileAt).toBeLessThan(
+      DEFAULT_RETAIN_MISSION.indexOf("If a candidate fact matches an exclusion"),
+    );
+  });
+
+  // The merge is only honest if the live half is byte-identical. This proves
+  // the default is exactly SUPERSEDED[6] (the live text) with exactly the
+  // volatile block inserted — no reword, no reorder, no quiet tightening.
+  it("is the live text verbatim plus exactly the volatile block, nothing else", () => {
+    const liveText = SUPERSEDED_RETAIN_MISSIONS[6];
+    expect(liveText).toHaveLength(3460);
+    const priorDefault = SUPERSEDED_RETAIN_MISSIONS[5];
+    const vStart = priorDefault.indexOf("- Volatile state written as a timeless assertion.");
+    const vEnd = priorDefault.indexOf("- Transient state (unread counts");
+    const block = priorDefault.slice(vStart, vEnd);
+    expect(block).toHaveLength(742);
+    // Removing the block from the default yields the live text, unmodified.
+    expect(DEFAULT_RETAIN_MISSION.replace(block, "")).toBe(liveText);
+    expect(DEFAULT_RETAIN_MISSION).toHaveLength(liveText.length + block.length);
   });
 
   // Drift guard: the vendored plugin pushes settings.json's `retainMission`
@@ -318,6 +375,63 @@ const OUTGOING_2026_07_28_DEFAULT =
   "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
   "nothing durable remains, return an empty facts list.";
 
+/**
+ * The text read verbatim off the live `klanker` bank on 2026-07-29 — applied
+ * out-of-band, never a repo default, and carried by `klanker` and `overlord`.
+ * It is parent A of the current DEFAULT_RETAIN_MISSION (the merge), and it is a
+ * verbatim pin for the same reason every other registry entry is: a byte-level
+ * edit here stops matching those two banks and strands them as "customized".
+ * The TRAILING NEWLINE is real and present on the bank — do not trim it.
+ */
+const LIVE_2026_07_29_TEXT =
+  "Extract durable facts that will still be true and useful weeks from now, once this session is forgotten.\n" +
+  "\n" +
+  "DURABILITY GATE. Emit a candidate ONLY if it is one of these five classes:\n" +
+  "- PREFERENCE — what the user likes, wants, or always does; a standing rule or correction.\n" +
+  "- DECISION — a settled choice that changes how future work is done, including a choice NOT to do something. A decision about the mechanics of the CURRENT task (which worker to dispatch, which branch to rebase, which PR to merge now, what to do next) is process narration, not a durable decision — drop it unless it establishes a standing rule or permanently changes a system.\n" +
+  "- FINDING — a root cause, a measurement, or verified behaviour of a system. Include the number.\n" +
+  "- OUTCOME — a completed result that changed the world: what shipped, what a thing turned out to be. Not the act of shipping it.\n" +
+  "- RELATIONSHIP — who a person is, what a project or tool is, and how they connect.\n" +
+  "If a candidate fits none of the five, it is not a memory. Drop it; do not reword it into one.\n" +
+  "\n" +
+  "A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "\n" +
+  "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
+  "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
+  "the location where some output was written? If yes, drop it — it is transcript\n" +
+  "exhaust, not memory.\n" +
+  "\n" +
+  "NEVER extract:\n" +
+  "- Tool results verbatim or paraphrased. Concretely, never produce a fact whose\n" +
+  "  text resembles any of these: \"File created successfully at /path/to/file\",\n" +
+  "  \"A background command with ID bctz4yskm is running, and its output will be\n" +
+  "  written to /tmp/...\", \"Async agent a745598ba84e71df1 was launched successfully\n" +
+  "  and is running in the background\", \"User executed a Bash command to sleep for\n" +
+  "  200 seconds\", \"The assistant used grep to locate 'truncateSync' in src/foo.ts\".\n" +
+  "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
+  "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- The act of delegating, dispatching, spawning, launching, steering or merging\n" +
+  "  work — including when it succeeded. \"X was dispatched and completed\" is the\n" +
+  "  session describing itself. Record only what the work LEARNED or CHANGED.\n" +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
+  "  running) — retain the outcome only once the task completes or a decision is made.\n" +
+  "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Slash commands the user typed and their effects (e.g. \"User issued /clear to\n" +
+  "  reset assistant state\").\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
+  "  system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) unless\n" +
+  "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n" +
+  "\n" +
+  "Write each fact so it stands alone: name the thing, the number, and the date. A\n" +
+  "sentence that only makes sense while reading this transcript is not durable.\n" +
+  "\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
+  "nothing durable remains, return an empty facts list.\n";
+
 describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
   it("never contains the current default (that would make every apply a no-op decision)", () => {
     expect(SUPERSEDED_RETAIN_MISSIONS).not.toContain(DEFAULT_RETAIN_MISSION);
@@ -407,39 +521,55 @@ describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
       // (2026-07-28 volatile-state pass) — the default this repo shipped
       // immediately before the 2026-07-29 live-text reconciliation.
       OUTGOING_2026_07_28_DEFAULT,
+      // (2026-07-29) — the out-of-band live text, parent A of the merge that
+      // replaced it. Registered so `klanker` and `overlord`, which carry it,
+      // are upgradable to the merged default rather than stranded on it.
+      LIVE_2026_07_29_TEXT,
     ]);
-    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(6);
+    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(7);
   });
 
-  // The whole point of appending: a bank still carrying the outgoing default
-  // must be UPGRADABLE, not mistaken for an operator customization that
+  // The whole point of appending: a bank still carrying a shipped default must
+  // be UPGRADABLE, not mistaken for an operator customization that
   // `decideRetainMissionUpgrade` refuses to touch. Forgetting the append is
-  // silent — every live bank simply never gets the new text.
-  it("makes a bank still carrying the outgoing 2026-07-28 default upgradable", () => {
-    const outgoing = SUPERSEDED_RETAIN_MISSIONS[SUPERSEDED_RETAIN_MISSIONS.length - 1];
-    expect(outgoing).toBe(OUTGOING_2026_07_28_DEFAULT);
-    expect(outgoing).toContain("A TOOL RESULT IS NOT A FACT");
-    expect(outgoing).toContain("Volatile state written as a timeless assertion");
-    // It is the PRIOR default, not the current one — a self-superseding
-    // mission would make decideRetainMissionUpgrade oscillate forever.
-    expect(outgoing).not.toBe(DEFAULT_RETAIN_MISSION);
-    expect(isUpgradableRetainMission(outgoing)).toBe(true);
+  // silent — those banks simply never get the new text.
+  it("makes BOTH merge parents upgradable, and neither one the current default", () => {
+    for (const parent of [OUTGOING_2026_07_28_DEFAULT, LIVE_2026_07_29_TEXT]) {
+      expect(parent).toContain("A TOOL RESULT IS NOT A FACT");
+      expect(isUpgradableRetainMission(parent)).toBe(true);
+      // A parent is the PRIOR text, never the current one — a self-superseding
+      // mission would make decideRetainMissionUpgrade oscillate forever.
+      expect(parent).not.toBe(DEFAULT_RETAIN_MISSION);
+    }
+    // Each parent contributed the half the other lacked.
+    expect(OUTGOING_2026_07_28_DEFAULT).toContain("Volatile state written as a timeless assertion");
+    expect(OUTGOING_2026_07_28_DEFAULT).not.toContain("DURABILITY GATE");
+    expect(LIVE_2026_07_29_TEXT).toContain("DURABILITY GATE");
+    expect(LIVE_2026_07_29_TEXT).not.toContain("Volatile state written as a timeless assertion");
+    // ...and the merged default carries both halves.
+    expect(DEFAULT_RETAIN_MISSION).toContain("Volatile state written as a timeless assertion");
+    expect(DEFAULT_RETAIN_MISSION).toContain("DURABILITY GATE");
     expect(isUpgradableRetainMission(DEFAULT_RETAIN_MISSION)).toBe(false);
   });
 
   // Outcome test for the 2026-07-29 defect: 21 of 29 live banks were stranded
   // on entry [3] because the text actually running on `klanker`/`overlord` was
   // never in the repo, so the guarded path had nothing to converge them TO.
-  // These are the two byte-equalities the convergence depends on.
-  it("converges a bank on the 2026-07-25 text that 21 live banks were stranded on", () => {
+  // These are the byte-equalities the convergence depends on.
+  it("converges every stranded live bank on the merged default", () => {
+    // 21 banks (assistant, carrie, clerk, finn, gamma, ...) — read live 2026-07-29.
     const stranded = SUPERSEDED_RETAIN_MISSIONS[3];
     expect(stranded).toHaveLength(1321);
-    expect(decideRetainMissionUpgrade(undefined, stranded)).toEqual({
-      action: "upgrade",
-      mission: DEFAULT_RETAIN_MISSION,
-    });
-    // And the destination is the text read off the live klanker bank.
-    expect(DEFAULT_RETAIN_MISSION).toHaveLength(3460);
+    // 2 banks (klanker, overlord) — the out-of-band text this PR supersedes.
+    expect(LIVE_2026_07_29_TEXT).toHaveLength(3460);
+    for (const current of [stranded, LIVE_2026_07_29_TEXT]) {
+      expect(decideRetainMissionUpgrade(undefined, current)).toEqual({
+        action: "upgrade",
+        mission: DEFAULT_RETAIN_MISSION,
+      });
+    }
+    // And the destination is the merge: live text + the 742-char volatile block.
+    expect(DEFAULT_RETAIN_MISSION).toHaveLength(4202);
   });
 
   it("carries the 2026-07-19 text every live bank was found holding on 2026-07-25", () => {
