@@ -1,5 +1,141 @@
 # Changelog
 
+## v0.19.33 — the shipped binary can roll the fleet, and a standing rule actually reaches the model
+
+### `switchroom rollout` was dead on arrival in the published static binary (#3963, #3965)
+
+The exact artifact `install.sh` puts on every operator's host stopped at step 1
+with zero agents rolled: `error: unknown command
+'/$bunfs/root/switchroom-linux-amd64'`. Six call sites re-invoked switchroom as a
+subprocess as `spawn(process.execPath, [process.argv[1], ...])` — correct for a JS
+install (interpreter + real `dist/cli/switchroom.js`), wrong for a `bun build
+--compile` executable, where `process.execPath` IS the binary and `process.argv[1]`
+is the virtual bundle path. The bunfs path was handed to the binary as its first
+argument and commander parsed it as the subcommand. The hostd container ships the
+JS entrypoint, which is why the same roll worked through hostd and hid the bug.
+
+New `src/cli/self-invoke.ts` owns the one rule — a compiled binary is its own
+entrypoint, so spawn `execPath` with the subcommand and no script argument — and
+all six call sites (`rollout`, `update` ×6, `apply` self-elevate, `skill push`,
+the detached vault broker) route through it. Detection is the `/$bunfs` (and
+Windows `B:\~BUN\`) argv[1] prefix, the same discriminator `self-update.ts`
+already uses, not a filesystem probe, because the bunfs root is virtual. A
+structural guard fails the build if any src file spells
+`spawn(process.execPath, …)` again, so a seventh call site cannot reintroduce it.
+
+### Rollback stopped being a no-op: `prior_pin` comes from the running fleet (#3968)
+
+`rollout` stamps `prior_pin` on its terminal audit row so a later `rollout
+--allow-downgrade` can default its target to the last good version. It was read
+from `release.pin` in `switchroom.yaml` — the field the roll's own `persist-pin`
+step overwrites — so whenever the pin was already set to the target before the
+roll, `prior_pin` came out equal to `pin` and rollback resolved a target identical
+to what was already deployed. Observed on the operator host: a completed row with
+`pin` and `prior_pin` both `v0.19.32` while every agent was actually on v0.19.30.
+
+`prior_pin` is now derived from the versions the fleet's agent containers are
+ACTUALLY running when the roll starts, through the same enumerative `docker ps`
+inventory `update --check`, `doctor` and the roll's own `verify-components` gate
+use. Two invariants in `src/host-control/prior-pin.ts`: the target is filtered out
+of the candidate set before a value is chosen, so the no-op-rollback shape is
+structurally unreachable (all-on-target records no prior pin); and a mixed-version
+fleet is recorded honestly, with the full observed set in `prior_pin_observed` and
+the single value picked by one documented rule — the lowest observed version, the
+only choice that is not an upgrade for some in-scope agent. An unreadable
+inventory records no `prior_pin` rather than falling back to the config, since
+that fallback is the defect.
+
+### `reflect` was silently dropping 45% of the operator's standing directives (#3967, #3969)
+
+`reflect_async` loads directives with `isolation_mode=True`, and `list_directives`
+turns that flag into a hard `tags IS NULL OR tags = '{}'` filter when the caller
+supplies no tags. An untagged reflect — the only shape switchroom's `reflect` tool
+issues — therefore dropped every directive carrying at least one tag, from the
+system prompt AND from `directives_applied` in the trace. Measured on the fleet:
+172 active directives, 94 untagged, so 45% of standing rules never reached a
+reflect prompt. The recall path already worked around this client-side, so the
+same bank's directives read complete on the recall hook and 45% short in reflect.
+
+Closed at the source with one more self-verifying patch in
+`docker/Dockerfile.hindsight`, flipping the flag to `False` on reflect's directive
+fetch only. Blast radius is narrow by construction — the flag is consulted only
+inside `if not tags and not tag_groups and isolation_mode` — and the patch
+asserts that premise after the splice and fails the build if upstream widens the
+condition. A new RED/GREEN docker-e2e probe boots the bundled postgres inside the
+digest-pinned upstream image, runs the real migrations, and asserts which
+directives reach the trace and the prompt.
+
+### The retain mission the repo ships is now the one the fleet runs (#3972)
+
+The retain mission actually running on two banks had been applied out-of-band
+through the Hindsight REST config surface and never landed in the repo; a read of
+all 29 live banks found 21 stranded on a superseded 1321-char text, 2 on a
+3460-char text absent from the repo, and 6 unset. No bank was ever observed
+carrying the repo default at all. `DEFAULT_RETAIN_MISSION` is now the union of
+both live parents — the 3460-char text byte-for-byte, plus the 2026-07-28
+volatile-state block spliced back at its original position inside NEVER extract.
+The two texts turned out to be siblings, not ancestor and descendant, so adopting
+the live text wholesale would have dropped the bullet covering the failure class
+currently doing the most damage: a snapshot written as a timeless assertion, which
+nothing supersedes and which recalls forever as though still true.
+
+Both outgoing texts are appended to `SUPERSEDED_RETAIN_MISSIONS` (append-only, as
+the registry requires) so no bank is stranded on the exact text this replaces.
+Push semantics are unchanged: `decideMissionUpgrade` still upgrades only an unset
+or byte-equal-to-a-known-default mission, operator yaml still wins outright, and
+nothing was written to any bank — the 21 converge on their next
+scaffold/reconcile.
+
+### The sidechain retain header stopped soliciting ephemera (#3971)
+
+`SIDECHAIN_MISSION_HEADER` is prepended into the content the extractor reads on
+every SubagentStop retain, and its text asked for "PROCESS facts: files/paths
+touched, commands that worked, decisions made, dead ends hit and why" — three of
+the classes the bank-level mission enumerates under NEVER extract. Sitting inside
+the content, it read as a local override and countermanded the bank mission on the
+whole sidechain path. The retain API has no per-call mission, so the header is the
+only lever. Reworded to reinforce rather than contradict: it keeps the durable
+half (decisions and their reasoning, non-obvious technique, STRUCTURAL dead ends
+as distinct from incidental retries), adds an explicit exclusion clause for
+in-flight work status, PR/issue/CI state, changing counts and versions, runtime
+snapshots, file/command narration, scratchpad paths and session IDs, and states
+the bar: would this still be worth knowing in a month? Text change only.
+
+### Hindsight has room to hold its working set (#3970)
+
+The `switchroom-hindsight` container sat at 99.5% of its 8 GiB cap and thrashed:
+~24.5 GB/hour re-read from disk and 7,400+ reclaim events, with ~2.2 GiB of the
+cgroup taken by non-reclaimable anon. It was not OOMing — it was paying disk
+latency to hold a working set it very nearly fit. Four constants move together in
+one commit so the cap and the buffer pool cannot drift: the container limit 8g →
+16g, the derivation input 8192 → 16384 MiB, `shared_buffers` 1536 → 3072 MiB, and
+`effective_cache_size` 4096 → 7168 MiB. `shared_buffers` is 3072 rather than the
+4096 the widened ceiling would permit because the budget arithmetic covers only
+the pinned pool, not the per-backend worst case. A new swap-cushion invariant test
+asserts neither launch path emits a `memory-swap` equal to the memory limit —
+disabling swap while pinning 1.5 GiB more unreclaimable shared memory would
+convert graceful degradation into a hard OOM kill of the memory backend for the
+whole fleet.
+
+### One meaning per sweep counter, and a pin-store reader that degrades (#3955, #3956, #3957, #3964)
+
+Three low-severity follow-ups in the pin subsystem. The forum-topic drain credited
+`cursor.popped` once per call with no read-back, making it a call counter on one
+branch and an observation counter on every other; it now takes a verified read
+before and after and credits a pop only when the chat-wide top demonstrably moved.
+The DM repin+unpin loop dropped a resolved unpin from the accounting when the
+verifying read went dark, so every branch now reports both counters — `issued` the
+moment a removal goes out, `popped` only from an observation — and `issued -
+popped` is the honest "went out, could not be verified" figure. And
+`loadStatusPins` failed open to `[]` on an unrecognised envelope version, so a
+rollback discarded every persisted pin row and turned each pin the newer build had
+taken into a permanent orphan — the exact bug the subsystem exists to prevent.
+Both pin stores are now version-TOLERANT and structurally strict: an unknown `v`
+is read row by row through the same validator. The v0.19.31 → v0.19.30 hop cannot
+be fixed retroactively and is documented as a known-lossy downgrade in
+CONTRIBUTING. Also adds an operator guide for orphan pins the sweep cannot touch
+(#3960).
+
 ## v0.19.32 — a queue event is not a turn start
 
 ### A message sent mid-turn no longer forks the progress card (#3927)
