@@ -911,3 +911,182 @@ describe("unvalidatedIdCaveat — immediate fail-fast warn on free-text claude-*
     expect(alias.text).not.toContain("can't be validated before launch");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Short `/model` spellings for pinned Claude ids (CLAUDE_MODEL_ALIASES).
+//
+// Every assertion here FAILS on the pre-change code: `opus48` / `opus-4-8` were
+// passed through verbatim to the carrier (claude would 4xx or silently serve the
+// fallback), were refused by the offline-trust gate, and were not reachable from
+// the picker. The negative block pins the design constraint that made this a
+// separate map from SR_MODEL_ALIASES: these are Anthropic OAuth-passthrough
+// models and must NEVER be classified as external/OpenRouter routes.
+// ---------------------------------------------------------------------------
+import {
+  CLAUDE_MODEL_ALIASES,
+  expandClaudeAlias,
+  expandModelAlias,
+  buildModelMenu as buildModelMenuForAliases,
+} from "../gateway/model-command.js";
+
+const OPUS_48 = "claude-opus-4-8";
+
+describe("CLAUDE_MODEL_ALIASES — short spellings for a pinned Claude id", () => {
+  it("both requested spellings expand to the canonical id", () => {
+    expect(expandModelAlias("opus48")).toBe(OPUS_48);
+    expect(expandModelAlias("opus-4-8")).toBe(OPUS_48);
+    expect(expandClaudeAlias("opus48")).toBe(OPUS_48);
+    expect(expandClaudeAlias("opus-4-8")).toBe(OPUS_48);
+  });
+
+  it("expansion is case-insensitive", () => {
+    for (const spelling of ["OPUS48", "Opus48", "OPUS-4-8", "Opus-4-8"]) {
+      expect(expandModelAlias(spelling)).toBe(OPUS_48);
+    }
+  });
+
+  it("leaves every other token alone (sr aliases still expand, ids pass through)", () => {
+    expect(expandModelAlias("opus")).toBe("opus");
+    expect(expandModelAlias("default")).toBe("default");
+    expect(expandModelAlias("flash")).toBe("sr-gemini-2.5-flash");
+    expect(expandModelAlias("sr-glm-5")).toBe("sr-glm-5");
+    expect(expandModelAlias(OPUS_48)).toBe(OPUS_48);
+    // The Claude map must not swallow an sr-* shortcut, nor vice versa.
+    expect(expandClaudeAlias("flash")).toBe("flash");
+    expect(expandSrAlias("opus48")).toBe("opus48");
+  });
+
+  it("every target is a full claude-* id and a legal model arg", () => {
+    for (const target of Object.values(CLAUDE_MODEL_ALIASES)) {
+      expect(target.startsWith("claude-")).toBe(true);
+      expect(isValidModelArg(target)).toBe(true);
+    }
+  });
+
+  it("typed `/model opus48` relaunches on the canonical id, not the shortcut", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    const reply = await handleModelCommand({ kind: "set", model: "opus48" }, deps);
+    expect(relaunchCalls).toEqual([
+      { model: OPUS_48, reason: `user: /model ${OPUS_48} (session-only relaunch)` },
+    ]);
+    expect(reply.text).toContain(OPUS_48);
+    // The raw shortcut must never reach the carrier / `claude --model`.
+    expect(relaunchCalls[0].model).not.toBe("opus48");
+  });
+
+  it("typed `/model opus-4-8` relaunches on the canonical id", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    await handleModelCommand({ kind: "set", model: "opus-4-8" }, deps);
+    expect(relaunchCalls).toEqual([
+      { model: OPUS_48, reason: `user: /model ${OPUS_48} (session-only relaunch)` },
+    ]);
+  });
+
+  it("typed `/model OPUS48` (mixed case) relaunches on the canonical id", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    await handleModelCommand({ kind: "set", model: "OPUS48" }, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+  });
+
+  it("a mid-turn `/model opus48` QUEUES the expanded id (start.sh never sees the shortcut)", () => {
+    const busy = { currentTurnActive: true, turnInFlight: false, menuEnabled: true };
+    expect(planModelCommand({ kind: "set", model: "opus48" }, busy)).toEqual({
+      kind: "queue",
+      target: OPUS_48,
+    });
+    expect(planModelCommand({ kind: "set", model: "opus-4-8" }, busy)).toEqual({
+      kind: "queue",
+      target: OPUS_48,
+    });
+  });
+
+  it("a queued shortcut survives a boot: both the KEY and the TARGET are offline-trusted", () => {
+    expect(isOfflineTrustedModelToken("opus48")).toBe(true);
+    expect(isOfflineTrustedModelToken("opus-4-8")).toBe(true);
+    expect(isOfflineTrustedModelToken("OPUS48")).toBe(true);
+    expect(isOfflineTrustedModelToken(OPUS_48)).toBe(true);
+    // Still refuses an arbitrary hand-typed pinned id.
+    expect(isOfflineTrustedModelToken("claude-opus-4-9")).toBe(false);
+  });
+
+  it("the parser accepts both spellings as a set", () => {
+    expect(parseModelCommand("/model opus48")).toEqual({ kind: "set", model: "opus48" });
+    expect(parseModelCommand("/model opus-4-8")).toEqual({ kind: "set", model: "opus-4-8" });
+  });
+
+  it("NEGATIVE: the shortcuts are Claude, never external / sr-*", () => {
+    for (const token of ["opus48", "opus-4-8", "OPUS48", OPUS_48]) {
+      expect(isSrModel(token)).toBe(false);
+      expect(isClaudeModel(token)).toBe(true);
+    }
+    // Not in the external map, in either direction.
+    for (const key of Object.keys(CLAUDE_MODEL_ALIASES)) {
+      expect(key in SR_MODEL_ALIASES).toBe(false);
+      expect(Object.values(SR_MODEL_ALIASES)).not.toContain(key);
+    }
+    for (const target of Object.values(CLAUDE_MODEL_ALIASES)) {
+      expect(Object.values(SR_MODEL_ALIASES)).not.toContain(target);
+      expect(SR_MODEL_LABELS[target]).toBeUndefined();
+    }
+    // And never rendered on the 🌐 External keyboard page.
+    const external = externalModelNames(["sr-gpt-oss-20b"]);
+    for (const token of [...Object.keys(CLAUDE_MODEL_ALIASES), ...Object.values(CLAUDE_MODEL_ALIASES)]) {
+      expect(external).not.toContain(token);
+    }
+  });
+
+  it("NEGATIVE: expansion happens before classification — no external ack copy", async () => {
+    const { deps } = makeDeps();
+    const reply = await handleModelCommand({ kind: "set", model: "opus48" }, deps);
+    expect(reply.text).not.toContain("sr-");
+    expect(reply.text).not.toContain("billed separately");
+  });
+
+  it("selectable: the pinned id is a main-page keyboard button", async () => {
+    const { deps } = makeMenuDeps();
+    const menu = await buildModelMenuForAliases(deps);
+    const buttons = (menu.keyboard ?? []).flat();
+    expect(buttons.some((b) => b.callback_data === `${MODEL_CALLBACK_ALIAS}${OPUS_48}`)).toBe(true);
+    expect(buttons.some((b) => b.text === "Opus 4.8")).toBe(true);
+  });
+
+  it("selectable mid-turn too: the static quick list carries the same button", async () => {
+    const { deps } = makeMenuDeps({ isBusy: () => true });
+    const menu = await buildModelMenuForAliases(deps);
+    const buttons = (menu.keyboard ?? []).flat();
+    expect(buttons.some((b) => b.callback_data === `${MODEL_CALLBACK_ALIAS}${OPUS_48}`)).toBe(true);
+  });
+
+  it("tapping the button relaunches on the canonical id", async () => {
+    const { deps, relaunchCalls } = makeMenuDeps();
+    await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}${OPUS_48}`, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+  });
+
+  it("a shortcut arriving on a callback is expanded, not rejected as unrecognized", async () => {
+    const { deps, relaunchCalls } = makeMenuDeps();
+    await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}opus48`, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+  });
+
+  it("discoverable: help and the dashboard both name every spelling", async () => {
+    const { deps } = makeDeps();
+    const help = await handleModelCommand({ kind: "help" }, deps);
+    const show = await handleModelCommand({ kind: "show" }, deps);
+    for (const spelling of Object.keys(CLAUDE_MODEL_ALIASES)) {
+      expect(help.text).toContain(spelling);
+      expect(show.text).toContain(`/model ${spelling}`);
+    }
+    expect(help.text).toContain(OPUS_48);
+    expect(show.text).toContain(OPUS_48);
+  });
+
+  it("a curated target carries no 'can't be validated' caveat (it is offline-trusted)", async () => {
+    const { deps } = makeDeps();
+    const reply = await handleModelCommand({ kind: "set", model: "opus48" }, deps);
+    expect(reply.text).not.toContain("can't be validated before launch");
+    // An UNcurated pinned id still does.
+    const other = await handleModelCommand({ kind: "set", model: "claude-opus-4-9" }, deps);
+    expect(other.text).toContain("can't be validated before launch");
+  });
+});

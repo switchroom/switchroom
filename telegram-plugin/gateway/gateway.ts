@@ -564,7 +564,7 @@ import {
   MODEL_CALLBACK_PAGE_EXTERNAL,
   MODEL_CALLBACK_PAGE_MAIN,
   srFriendlyLabel,
-  expandSrAlias,
+  expandModelAlias,
   isSrModel,
   isBusyRefusalText,
   isOfflineTrustedModelToken,
@@ -17259,7 +17259,7 @@ function persistQueuedCommandForRestart(action: ShutdownResolutionAction): strin
         const configured =
           readConfiguredDefaultModel(agentDir) ?? resolveMainModel(undefined)
         // Consume-once carrier: applied by the next boot, then reverts.
-        writeSessionModelFile(agentDir, expandSrAlias(action.arg), configured)
+        writeSessionModelFile(agentDir, expandModelAlias(action.arg), configured)
         break
       }
       case 'clear-model':

@@ -51,6 +51,34 @@ import {
 export const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable', 'default'] as const
 
 /**
+ * Short SWITCHROOM-side spellings for pinned **Anthropic** model ids. These are
+ * expanded to the full `claude-*` id on the `/model` path BEFORE any
+ * Claude-vs-external classification runs, so what reaches the `.session-model`
+ * carrier (and therefore `claude --model`) is always the canonical id — the CLI
+ * never sees the short spelling.
+ *
+ * Deliberately NOT `SR_MODEL_ALIASES`: that map means "external / OpenRouter /
+ * the Anthropic OAuth header is NOT forwarded". These targets are Anthropic
+ * OAuth-passthrough models, so putting them there would flip the
+ * header-forwarding + external-billing classification and surface them under the
+ * "🌐 External models" keyboard page with an `srFriendlyLabel`.
+ *
+ * Also NOT `MODEL_ALIASES`: that list is the aliases the claude CLI resolves
+ * *itself*, and its members double as FAMILY tokens in `modelFamilyToken` /
+ * `canonicalClaudeToken` / `servedModelMatchesRequested`. A pinned-id shortcut
+ * is neither.
+ *
+ * NB the repo prefers family aliases over pinned ids (an alias tracks the
+ * current flagship, a pinned id goes stale) — these exist because an operator
+ * sometimes wants a specific pinned Opus, and typing `claude-opus-4-8` on a
+ * phone is hostile. Keys are matched case-insensitively.
+ */
+export const CLAUDE_MODEL_ALIASES: Record<string, string> = {
+  opus48: 'claude-opus-4-8',
+  'opus-4-8': 'claude-opus-4-8',
+}
+
+/**
  * Shape gate for the model argument. This string is typed literally
  * into the agent's tmux pane, so the gate is strict by construction:
  * one token, alphanumeric start, then alphanumerics plus the chars
@@ -76,11 +104,15 @@ export function isSrModel(name: string): boolean {
  * True when `name` is a Claude model — either a well-known alias or a
  * full `claude-*` id (including `[1m]` variants). This is intentionally
  * broader than MODEL_ALIASES: any `claude-…` string from claude's own
- * picker (e.g. `claude-opus-4-8`) qualifies.
+ * picker (e.g. `claude-opus-4-8`) qualifies, as does a switchroom-side short
+ * spelling of a pinned Claude id (CLAUDE_MODEL_ALIASES, e.g. `opus48`) — those
+ * name an Anthropic OAuth-passthrough model, so a classification consumer must
+ * never mistake one for an external/OpenRouter route.
  */
 export function isClaudeModel(name: string): boolean {
   const lower = name.toLowerCase()
   if ((MODEL_ALIASES as readonly string[]).includes(lower)) return true
+  if (lower in CLAUDE_MODEL_ALIASES) return true
   return lower.startsWith('claude-')
 }
 
@@ -621,7 +653,7 @@ export function planModelCommand(
 ): ModelCommandDisposition {
   if (parsed.kind === 'show' && ctx.menuEnabled) return { kind: 'menu' }
   if (parsed.kind === 'set' && isModelCommandBusy(ctx)) {
-    return { kind: 'queue', target: expandSrAlias(parsed.model) }
+    return { kind: 'queue', target: expandModelAlias(parsed.model) }
   }
   return { kind: 'apply', parsed }
 }
@@ -721,14 +753,34 @@ export interface ModelCommandReply {
 const PERSIST_NOTE =
   '_A `/model` switch relaunches the session (~30s) on the chosen model. Session-only — reverts to the configured \`model:\` on the next restart. \`/model default\` reverts now. Live scrollback is replaced by a fresh session; memory and the handoff briefing carry the context. To change the default permanently, set \`model:\` in switchroom.yaml._'
 
+/**
+ * Discoverability line for CLAUDE_MODEL_ALIASES, grouped by target so several
+ * spellings of one id read as one entry (`opus48` · `opus-4-8` → `claude-opus-4-8`).
+ * Derived from the map, never hand-listed, so a new shortcut shows up in the
+ * help and dashboard text for free.
+ */
+function claudeAliasHints(prefix: string): string {
+  const byTarget = new Map<string, string[]>()
+  for (const [alias, target] of Object.entries(CLAUDE_MODEL_ALIASES)) {
+    const spellings = byTarget.get(target) ?? []
+    spellings.push(alias)
+    byTarget.set(target, spellings)
+  }
+  return [...byTarget]
+    .map(([target, spellings]) => `${spellings.map(a => `\`${prefix}${a}\``).join(' · ')} → \`${target}\``)
+    .join('; ')
+}
+
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
   const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`${a}\``).join(' · ')
+  const claudeAliasExamples = claudeAliasHints('')
   const lines: string[] = []
   if (reason) lines.push(`⚠️ ${deps.escapeHtml(reason)}`)
   lines.push(
     '**/model** — show or switch the Claude model',
     '\`/model\` — show the configured model',
     `\`/model <name>\` — switch the live session (${MODEL_ALIASES.map(a => `\`${a}\``).join(' · ')} or a full model id)`,
+    `_Pinned Claude shortcuts:_ ${claudeAliasExamples}`,
     `_OpenRouter shortcuts:_ ${srAliasExamples}`,
     '_Every switch relaunches the session (~30s) on the chosen model — Claude and OpenRouter (sr-\\*) alike._',
     PERSIST_NOTE,
@@ -751,6 +803,7 @@ export async function handleModelCommand(
         `**Model — ${deps.escapeHtml(deps.getAgentName())}**`,
         `Configured: \`${deps.escapeHtml(shown)}\``,
         `Switch the live session: ${MODEL_ALIASES.map(a => `\`/model ${a}\``).join(' · ')}`,
+        `Pinned Claude shortcuts: ${claudeAliasHints('/model ')}`,
         `OpenRouter shortcuts: ${srAliasExamples}`,
         'or \`/model <full-model-id>\`',
         PERSIST_NOTE,
@@ -765,8 +818,9 @@ export async function handleModelCommand(
     return helpText(deps, `not a valid model name: ${parsed.model}`)
   }
 
-  // Expand short aliases: `flash` → `sr-gemini-2.5-flash`, `codex` → `sr-codex-5.5`, etc.
-  const model = expandSrAlias(parsed.model)
+  // Expand short aliases BEFORE any Claude-vs-external decision below:
+  // `opus48`/`opus-4-8` → `claude-opus-4-8`, `flash` → `sr-gemini-2.5-flash`, etc.
+  const model = expandModelAlias(parsed.model)
 
   // Busy gate: a switch RELAUNCHES the session, which is unsafe mid-turn (it
   // would tear down the live turn). The gateway's mid-turn path ACKs + queues +
@@ -822,13 +876,20 @@ function relaunchErrorReply(
  * silently serves the fallback. Say so IMMEDIATELY in the switch ack, and
  * point at the first-reply tripwire that will catch it. Aliases and sr-* ids
  * are vouched by their own gates (MODEL_ALIASES / the LiteLLM route probe),
- * so only typed `claude-*` ids carry the caveat. Exported for tests.
+ * so only typed `claude-*` ids carry the caveat — and a CLAUDE_MODEL_ALIASES
+ * TARGET is vouched by the same curation gate that makes it offline-trustable
+ * (isOfflineTrustedModelToken), so it is exempt too; warning "can't be
+ * validated" on a shortcut switchroom itself curates would contradict that.
+ * The first-reply divergence tripwire still covers it either way.
+ * Exported for tests.
  */
 export function unvalidatedIdCaveat(
   deps: Pick<ModelCommandDeps, 'escapeHtml'>,
   model: string,
 ): string | null {
-  if (!model.trim().toLowerCase().startsWith('claude-')) return null
+  const lower = model.trim().toLowerCase()
+  if (!lower.startsWith('claude-')) return null
+  if (Object.values(CLAUDE_MODEL_ALIASES).includes(lower)) return null
   return `_\`${deps.escapeHtml(model)}\` can't be validated before launch — if it isn't a real Claude model id, claude will silently serve the configured fallback model instead. I check the first reply and will warn if that happens._`
 }
 
@@ -943,6 +1004,11 @@ export type ModelMenuPage = 'main' | 'external'
  */
 export const EXTRA_CLAUDE_ALIASES: ReadonlyArray<{ alias: string; label: string }> = [
   { alias: 'fable', label: 'Fable' },
+  // Pinned Opus 4.8. The button carries the CANONICAL id (not the `opus48`
+  // shortcut) so the tap needs no expansion to be recognized by an older
+  // gateway, and so `canonicalClaudeToken` resolves it directly. Typed
+  // `/model opus48` / `/model opus-4-8` land on the same target.
+  { alias: 'claude-opus-4-8', label: 'Opus 4.8' },
 ]
 
 /**
@@ -1039,11 +1105,39 @@ export function isOfflineTrustedModelToken(token: string): boolean {
   const lower = token.toLowerCase()
   if ((MODEL_ALIASES as readonly string[]).includes(lower)) return true
   if (lower in SR_MODEL_ALIASES) return true
-  return Object.values(SR_MODEL_ALIASES).includes(lower)
+  if (Object.values(SR_MODEL_ALIASES).includes(lower)) return true
+  // Curated pinned-Claude shortcuts and their targets. Both spellings are
+  // trustable for the same reason the sr-* alias TARGETS are: the id is
+  // switchroom-curated, not a hand-typed guess. A queue that already expanded
+  // (planModelCommand) persists the VALUE, an alias tap persists the KEY — so
+  // both sides must be accepted or `/model opus48` would survive a boot only
+  // on one of the two paths.
+  if (lower in CLAUDE_MODEL_ALIASES) return true
+  return Object.values(CLAUDE_MODEL_ALIASES).includes(lower)
 }
 
 export function expandSrAlias(arg: string): string {
   return SR_MODEL_ALIASES[arg.toLowerCase()] ?? arg
+}
+
+/** Expand a short pinned-Claude spelling (case-insensitive) to its full `claude-*` id. */
+export function expandClaudeAlias(arg: string): string {
+  return CLAUDE_MODEL_ALIASES[arg.toLowerCase()] ?? arg
+}
+
+/**
+ * The ONE expansion every `/model` argument goes through, on every path that
+ * consumes a user-supplied token (typed apply, mid-turn queue, menu tap,
+ * queued-across-restart persist). Claude shortcuts resolve first, then sr-*
+ * shortcuts; the two key sets are disjoint by construction (a Claude shortcut
+ * never expands to an `sr-*` id and vice versa), so order only documents intent.
+ *
+ * Expanding HERE — before `isClaudeModel` / `isSrModel` / `externalModelNames`
+ * ever see the token — is what keeps a pinned-Claude shortcut on the Anthropic
+ * OAuth passthrough instead of being misread as an external route.
+ */
+export function expandModelAlias(arg: string): string {
+  return expandSrAlias(expandClaudeAlias(arg))
 }
 
 export function srFriendlyLabel(srName: string): string {
@@ -1160,6 +1254,13 @@ function busyStaticMenu(
       text: alias.charAt(0).toUpperCase() + alias.slice(1),
       callback_data: `${MODEL_CALLBACK_ALIAS}${alias}`,
     }])
+  }
+  // Same extra Claude rows the live keyboard renders (Fable, pinned Opus 4.8),
+  // minus any already covered by a MODEL_ALIASES row above — otherwise a model
+  // is selectable when idle but vanishes from the mid-turn quick list.
+  for (const { alias, label } of EXTRA_CLAUDE_ALIASES) {
+    if ((MODEL_ALIASES as readonly string[]).includes(alias.toLowerCase())) continue
+    rows.push([{ text: label, callback_data: `${MODEL_CALLBACK_ALIAS}${alias}` }])
   }
   rows.push([{ text: 'Default (configured)', callback_data: `${MODEL_CALLBACK_ALIAS}default` }])
   if (externalNames.length > 0) {
@@ -1434,6 +1535,10 @@ export async function handleModelMenuCallback(
       token = data.slice(MODEL_CALLBACK_SELECT.length)
       label = token
     }
+    // Same expansion the typed path applies, before the recognition gate: a
+    // callback minted by an older gateway (or a hand-crafted `mdl:alias:opus48`)
+    // must resolve to the canonical id rather than be rejected as unrecognized.
+    token = expandModelAlias(token)
     if (!isValidModelArg(token)) {
       return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
     }
