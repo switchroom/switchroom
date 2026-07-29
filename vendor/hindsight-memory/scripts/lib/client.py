@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from .retain_split import part_document_id, part_metadata, split_retain_content
+from .secret_redact import redact, redact_metadata, redact_retain_fields
 
 DEFAULT_TIMEOUT = 15  # seconds
 HEALTH_CHECK_RETRIES = 3
@@ -80,8 +81,50 @@ class HindsightClient:
             headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
 
+    @staticmethod
+    def _is_memory_write(method: str, path: str) -> bool:
+        """True for a request that CREATES memory rows.
+
+        `POST .../memories` is the write; `POST .../memories/recall` is a
+        read that happens to be a POST, and must not be rewritten.
+        """
+        if method.upper() != "POST":
+            return False
+        base = path.split("?", 1)[0].rstrip("/")
+        return base.endswith("/memories")
+
+    @staticmethod
+    def _redact_write_body(body: Optional[dict]) -> Optional[dict]:
+        """Structural backstop — mask secrets in a memory-write body.
+
+        `retain()` already redacts BEFORE splitting (which is where a
+        secret straddling a chunk boundary is still whole). This second
+        pass exists so a future caller that reaches `_request` without
+        going through `retain()` cannot write a raw credential into a
+        bank: every memory row this client creates is emitted from here.
+        Redaction is mask-in-place and stable on already-masked text, so
+        running it twice is a no-op on the second pass.
+        """
+        if not isinstance(body, dict):
+            return body
+        items = body.get("items")
+        if not isinstance(items, list):
+            return body
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("content"), str):
+                item["content"] = redact(item["content"])
+            if isinstance(item.get("context"), str):
+                item["context"] = redact(item["context"])
+            if isinstance(item.get("metadata"), dict):
+                item["metadata"] = redact_metadata(item["metadata"])
+        return body
+
     def _request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = DEFAULT_TIMEOUT) -> dict:
         timeout = self._resolve_timeout(timeout)
+        if self._is_memory_write(method, path):
+            body = self._redact_write_body(body)
         url = f"{self.api_url}{path}"
         data = json.dumps(body).encode() if body else None
         req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
@@ -232,6 +275,21 @@ class HindsightClient:
         ``backfill_transcripts.py`` logs and backs off. The parts already
         committed are upserted on the next attempt, not duplicated.
         """
+        # ── Secret redaction, BEFORE splitting ────────────────────────
+        #
+        # Every retain in this plugin (Stop-hook auto-retain, SubagentStop
+        # sidechain retain, the pending-backlog drainer, boot
+        # reconciliation, transcript backfill) funnels through this one
+        # method, so this is the intake chokepoint for memory content —
+        # the same property `retain_split` relies on.
+        #
+        # It runs BEFORE `split_retain_content` on purpose: a credential
+        # straddling a 3000-char part boundary is only whole here. The
+        # second pass in `_request` is the structural backstop for any
+        # caller that never reaches this method.
+        content, context, metadata = redact_retain_fields(
+            content, context, metadata
+        )
         parts = split_retain_content(content)
         total = len(parts)
         response = None

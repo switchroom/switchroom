@@ -30,7 +30,8 @@
  * scrub-coverage PR. Gitleaks TOML is loaded via `gitleaks-loader.ts`.
  */
 import { ALL_PATTERNS } from './patterns.js'
-import { scanKeyValue, type RawHit } from './kv-scanner.js'
+import { scanKeyValue, scanMemorablePasswords, type RawHit } from './kv-scanner.js'
+import { scanDbUris } from './db-uri.js'
 import { scanGenericSecrets } from './generic-entropy.js'
 import { shannonEntropy } from './entropy.js'
 import { chunk } from './chunker.js'
@@ -123,6 +124,16 @@ export function detectSecrets(text: string): Detection[] {
     // KV heuristic scanner runs per window too.
     const kvHits = scanKeyValue(win.text)
     for (const h of kvHits) {
+      raw.push({ ...h, start: h.start + win.offset, end: h.end + win.offset })
+    }
+    // Connection-URI credentials (`postgres://user:pass@host`) — the
+    // scheme-agnostic shape url-redact.ts cannot see.
+    for (const h of scanDbUris(win.text)) {
+      raw.push({ ...h, start: h.start + win.offset, end: h.end + win.offset })
+    }
+    // Human-memorable passwords behind an explicit `password` label — the
+    // shape the Shannon-entropy gate above is structurally blind to.
+    for (const h of scanMemorablePasswords(win.text)) {
       raw.push({ ...h, start: h.start + win.offset, end: h.end + win.offset })
     }
     // Generic bare-high-entropy fallback (ambiguous). Catches standalone

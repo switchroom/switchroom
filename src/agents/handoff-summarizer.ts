@@ -36,6 +36,7 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fsyncPathSync } from "../util/atomic.js";
+import { redactMemoryWriteBody } from "../memory/hindsight-write-redaction.js";
 import {
   OBSERVATION_SCOPES_ENV,
   observationScopesHint,
@@ -374,7 +375,11 @@ async function mirrorToHindsight(
     );
     return false;
   }
-  const body = {
+  // The briefing is a raw transcript tail, so it is the highest-risk
+  // credential carrier of any write path here: anything the operator pasted
+  // or a tool printed in the last turns lands in it verbatim. Redact before
+  // serialization — see src/memory/hindsight-write-redaction.ts.
+  const body = redactMemoryWriteBody({
     items: [
       {
         content: briefing,
@@ -384,7 +389,7 @@ async function mirrorToHindsight(
       },
     ],
     async: true,
-  };
+  });
   try {
     await fetchFn(endpoint, {
       method: "POST",
