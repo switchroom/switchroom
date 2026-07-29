@@ -829,7 +829,30 @@ export { HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM } from "./hindsight-per
 // ~600m of headroom under the old 4g cap, and the consolidation-throughput
 // bump above (LLM_PARALLELISM 4→6 = more in-flight synthesis) pushes it
 // higher. 8g gives comfortable headroom on the 60g host. Reservation 2g→4g.
-export const HINDSIGHT_DEFAULT_MEM_LIMIT = "8g";
+//
+// 8g→16g (2026-07-29): the 8g cap stopped being headroom and became a
+// treadmill. Live cgroup on `switchroom-hindsight`: `memory.current` pinned
+// at 99.5% of the 8 GiB ceiling with ~2.2 GiB of that anon (the API process,
+// the embedder, the cross-encoder, next-server) — leaving the working set of
+// a ~12 GB bank to fight over the remainder as reclaimable page cache. The
+// symptom is not an OOM kill, it is churn: ~24.5 GB/hour re-read from disk
+// and 7,400+ reclaim events, i.e. the container is paying disk latency to
+// hold a set it very nearly fits. 16g on the 60g host buys the page cache
+// room to stop thrashing, and `shared_buffers` moves WITH it in the same
+// commit (hindsight-pg-defaults.ts) so the cap and the buffer pool can never
+// drift — `hindsight-pg-defaults.test.ts` pins them equal.
+//
+// **`--memory-swap` is deliberately NOT emitted, on either launch path.**
+// When it is omitted Docker sets MemorySwap = 2 × Memory, so the container
+// keeps a swap cushion equal to its RAM cap (live: Memory=8g/MemorySwap=16g,
+// with ~900 MiB actually in swap — which is why 7,400 reclaim events have
+// produced zero OOM kills). Setting `--memory-swap` EQUAL to `--memory`
+// disables swap entirely; doing that in the same change that pins ~1.5 GiB
+// more unreclaimable shared memory converts graceful degradation into a hard
+// OOM kill that takes memory down for the whole fleet. Never emit a
+// memory-swap equal to the memory limit — `tests/setup/hindsight.test.ts`
+// asserts the invariant on BOTH the run-args and compose paths.
+export const HINDSIGHT_DEFAULT_MEM_LIMIT = "16g";
 export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "4g";
 export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
 
@@ -843,7 +866,7 @@ export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
  * segment ... No space left on device` and ALL memory writes/queries die
  * (2026-06-06 fleet outage). 2g gives comfortable headroom over the
  * observed peak while staying well under `HINDSIGHT_DEFAULT_MEM_LIMIT`
- * (8g) so shm can't starve the app. Applies to BOTH the standalone
+ * (16g) so shm can't starve the app. Applies to BOTH the standalone
  * `docker run` path and the compose snippet below — keep them in sync.
  */
 export const HINDSIGHT_DEFAULT_SHM_SIZE = "2g";

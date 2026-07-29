@@ -82,7 +82,7 @@
  *
  * @see import("./hindsight.js").HINDSIGHT_DEFAULT_MEM_LIMIT
  */
-export const HINDSIGHT_PG_MEM_LIMIT_MIB_FOR_DERIVATION = 8 * 1024;
+export const HINDSIGHT_PG_MEM_LIMIT_MIB_FOR_DERIVATION = 16 * 1024;
 
 /**
  * Non-reclaimable anonymous working set of everything ELSE in the container,
@@ -112,7 +112,11 @@ export const HINDSIGHT_PG_PAGE_CACHE_FLOOR_MIB = 2048;
  *
  * Derived, not picked: whatever is left of the memory ceiling once the app's
  * anonymous working set and the page-cache floor are accounted for.
- * 8192 − 2560 − 2048 = 3584 MiB.
+ * 16384 − 2560 − 2048 = 11776 MiB.
+ *
+ * This is a CEILING, not a target. It is what the arithmetic permits; what
+ * {@link HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB} actually takes is bounded
+ * far below it by the worst-case per-backend memory model, not by this number.
  */
 export const HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB =
   HINDSIGHT_PG_MEM_LIMIT_MIB_FOR_DERIVATION -
@@ -125,10 +129,25 @@ export const HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB =
  * 256MB against a 12 GB database is ~2% of the bank — every graph traversal
  * that misses is a kernel round-trip, which is exactly the bimodal
  * cold/hot distribution measured on `link_expansion` (p50 24ms, p90 1.412s).
- * 1536MB is 6x that, and 19% of the container's 8 GiB ceiling — under the
- * conventional "25% of available memory" guidance and comfortably inside
- * {@link HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB} (3584 MiB), which a test
- * pins.
+ * 1536MB was 6x that, and 19% of the container's original 8 GiB ceiling.
+ *
+ * 1536→3072 (2026-07-29), moved in the SAME commit that raised
+ * `HINDSIGHT_DEFAULT_MEM_LIMIT` 8g→16g, because these two are one decision:
+ * a bigger cap that leaves the buffer pool where it was just buys more page
+ * cache for data Postgres should have been holding itself. 3072 MiB is 19% of
+ * the new 16 GiB ceiling — the same fraction, deliberately, so the sizing
+ * stays inside the conventional "25% of available memory" guidance and well
+ * inside {@link HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB} (11776 MiB), which a
+ * test pins.
+ *
+ * **Why 3072 and not 4096**, which the budget ceiling would now permit: the
+ * budget arithmetic only accounts for the buffer pool itself. The per-backend
+ * side is not in it — `work_mem` is applied live per role,
+ * `hash_mem_multiplier=2` doubles it for hash nodes, and a parallel plan
+ * multiplies that again across workers. Stacking a 4 GiB pinned pool on top of
+ * that worst case does not fit under a 16 GiB cap alongside the ~2.5 GiB app
+ * anon set and the page-cache floor. 3072 leaves the pool a real 2x increase
+ * with the tail still covered.
  *
  * **This does NOT require an `shm_size` change**, contrary to the assumption
  * this work started from. That assumption is that `shared_buffers` is a POSIX
@@ -139,7 +158,7 @@ export const HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB =
  * `HINDSIGHT_DEFAULT_SHM_SIZE` was raised for (observed peak ~533MB), so 2g
  * stays correct and is deliberately left alone.
  */
-export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 1536;
+export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 3072;
 
 /**
  * `effective_cache_size` (pg0 default `1GB`).
@@ -151,16 +170,23 @@ export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 1536;
  *
  * 1GB is a ~5x under-declaration of what this container measurably holds: the
  * live cgroup was carrying 5212 MiB of page cache on top of the 256MB buffer
- * pool. 4096 MiB is the conservative reading of that — `shared_buffers`
- * (1536) plus a page-cache assumption (2560) well below the 5212 measured —
- * so the planner is told the truth without being told to expect cache the
- * container cannot hold under pressure.
+ * pool. 4096 MiB was the conservative reading of that under the 8 GiB cap.
+ *
+ * 4096→7168 (2026-07-29), moved with the cap and the buffer pool. Sized to
+ * what the container can actually hold AFTER this change, not to the size of
+ * the database: `shared_buffers` (3072) plus a page-cache assumption of 4096,
+ * against a 16 GiB ceiling that still has to carry the ~2.5 GiB app anon set.
+ * The temptation is to declare something near the 12 GB bank size so the
+ * planner "knows" the data is cacheable — don't. `effective_cache_size` is
+ * the term that prices index scans against sequential ones, so over-declaring
+ * it does not make the container hold more, it flips plan shapes on the
+ * strength of cache that does not exist under pressure.
  *
  * Honest scope: see the module header. On the link-expansion query this moved
  * total cost ~12% at 300 seeds and changed no plan shape. It is the cheap,
  * zero-memory half of the change, not the whole fix.
  */
-export const HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB = 4096;
+export const HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB = 7168;
 
 /** Format a MiB integer the way Postgres wants it on the command line. */
 export function pgMib(mib: number): string {
