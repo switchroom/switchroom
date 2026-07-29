@@ -77,6 +77,11 @@ export interface AuditEntry {
    *  `rollout --allow-downgrade` to default its target to the last good
    *  version without the operator having to recall the tag. */
   prior_pin?: string;
+  /** Every distinct version observed across the in-scope fleet when the
+   *  roll started, highest first. Present only when the fleet was mixed. */
+  prior_pin_observed?: string[];
+  /** How `prior_pin` was derived — see `PriorPinSource` in prior-pin.ts. */
+  prior_pin_source?: string;
 }
 
 export interface AuditFilters {
@@ -331,6 +336,15 @@ export function parseAuditLine(line: string): AuditEntry | null {
   if (typeof o.m === "number") entry.m = o.m;
   // Prior-pin capture (#2492) — present only on completed rollout terminal rows.
   if (typeof o.prior_pin === "string") entry.prior_pin = o.prior_pin;
+  if (
+    Array.isArray(o.prior_pin_observed) &&
+    o.prior_pin_observed.every((v) => typeof v === "string")
+  ) {
+    entry.prior_pin_observed = o.prior_pin_observed as string[];
+  }
+  if (typeof o.prior_pin_source === "string") {
+    entry.prior_pin_source = o.prior_pin_source;
+  }
   return entry;
 }
 

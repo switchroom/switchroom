@@ -32,6 +32,7 @@ import {
 } from "./config-degraded.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
+import { dockerFleetComponents } from "./prior-pin.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
 import { SocketRolloutRelay } from "./rollout-relay.js";
 import { SocketRolloutNarrationRelay } from "./rollout-narration-relay.js";
@@ -203,6 +204,11 @@ async function main(): Promise<void> {
   const server = new HostdServer({
     homeDir: homedir(),
     agentUids,
+    // The sole production wiring of the running-fleet inventory. `prior_pin`
+    // (the rollback target stamped on every completed roll) is derived from
+    // it; drop this and rollback degrades to "no target recorded". Asserted
+    // by tests/host-control/hostd-fleet-components-callsite.test.ts.
+    fleetComponents: () => dockerFleetComponents(),
     config: {
       agents: Object.fromEntries(
         // `root: true` (the root-tier debugging agent) is strictly above
