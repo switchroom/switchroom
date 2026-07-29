@@ -5,6 +5,7 @@ import {
   HINDSIGHT_MCP_TOOLS,
   HINDSIGHT_MENTAL_MODEL_WRITE_TOOLS,
 } from "../src/agents/scaffold.js";
+import { SYNTHESIZED_TOOL_NAMES } from "../src/cli/hindsight-mcp-shim.js";
 
 /**
  * Pins the pre-approved Hindsight MCP permission surface (Fix 1.2, #2903).
@@ -38,6 +39,7 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__cancel_operation",
       "mcp__hindsight__create_bank",
       "mcp__hindsight__create_directive",
+      "mcp__hindsight__deactivate_directive",
       "mcp__hindsight__delete_document",
       "mcp__hindsight__get_bank",
       "mcp__hindsight__get_bank_stats",
@@ -52,6 +54,7 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__list_mental_models",
       "mcp__hindsight__list_operations",
       "mcp__hindsight__list_tags",
+      "mcp__hindsight__reactivate_directive",
       "mcp__hindsight__recall",
       "mcp__hindsight__reflect",
       "mcp__hindsight__retain",
@@ -92,14 +95,55 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
     ]);
   });
 
-  it("every pre-approved tool corresponds to a real tool in the engine surface", () => {
+  /**
+   * The carve-out, stated as an assertion rather than a comment.
+   *
+   * Every pre-approved name must be EITHER a real backend tool OR a
+   * shim-synthesized one — nothing else. A typo'd or hallucinated tool name
+   * still fails here, which is the property the original test bought; the only
+   * thing that changed is that a synthesized name is a legal second bucket,
+   * and the buckets are proven disjoint below so the exemption can't be used
+   * to smuggle a backend tool in unreviewed.
+   */
+  it("every pre-approved tool is either a real engine tool or an explicitly synthesized one", () => {
     for (const t of HINDSIGHT_MCP_TOOLS) {
       const bare = t.replace("mcp__hindsight__", "");
       expect(
-        allEngineTools,
-        `${bare} not present in the captured 29-tool surface`,
-      ).toContain(bare);
+        allEngineTools.includes(bare) || SYNTHESIZED_TOOL_NAMES.includes(bare),
+        `${bare} is neither in the captured engine surface nor in the shim's ` +
+          `SYNTHESIZED_TOOL_TABLE — a pre-approved tool that nothing implements`,
+      ).toBe(true);
     }
+  });
+
+  it("the synthesized names are not engine tools (the exemption cannot shadow a real one)", () => {
+    for (const bare of SYNTHESIZED_TOOL_NAMES) {
+      expect(
+        allEngineTools,
+        `'${bare}' is now a real hindsight tool — retire the shim synthesis ` +
+          `rather than shadowing the backend's implementation`,
+      ).not.toContain(bare);
+    }
+  });
+
+  /**
+   * The #2911 reversal is scoped to DEACTIVATION. This asserts the scope in
+   * both directions so a later "while we're here" edit cannot quietly widen
+   * it: deactivate/reactivate pre-approved, delete still gated.
+   */
+  it("deactivation is pre-approved but deletion is NOT (the #2911 reversal is scoped)", () => {
+    expect(HINDSIGHT_MCP_TOOLS).toContain(
+      "mcp__hindsight__deactivate_directive",
+    );
+    expect(HINDSIGHT_MCP_TOOLS).toContain(
+      "mcp__hindsight__reactivate_directive",
+    );
+    expect(
+      HINDSIGHT_MCP_TOOLS,
+      "delete_directive destroys a guardrail irrecoverably (no directive " +
+        "history table upstream) — it must keep its per-call approval card. " +
+        "Deactivation being pre-approved is not a precedent for deletion.",
+    ).not.toContain("mcp__hindsight__delete_directive");
   });
 
   it("read-only mental-model tools ARE pre-approved (get/list), writes are not", () => {

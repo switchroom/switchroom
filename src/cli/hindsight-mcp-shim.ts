@@ -31,6 +31,21 @@
  *     forwarded transparently when the backend is up, and answered with a
  *     JSON-RPC error when it is down.
  *
+ * ## The one place the shim is not a pure proxy (#directive-retirement)
+ *
+ * It also SYNTHESIZES two tools that no backend version registers —
+ * `deactivate_directive` and `reactivate_directive` (see
+ * {@link SYNTHESIZED_TOOL_TABLE}). Hindsight's MCP surface can create, list
+ * and delete a directive but cannot flip `is_active`; only the REST API can,
+ * so without this the only retirement path was hand-rolled curl. These two are
+ * answered locally by {@link DirectiveAdmin} against the REST base derived
+ * from `HINDSIGHT_MCP_URL`, with the bank pinned to `HINDSIGHT_BANK_ID`, and
+ * are never forwarded upstream.
+ *
+ * That pin is a usability and provenance boundary, NOT a security one — the
+ * REST API is unauthenticated and raw curl bypasses the shim entirely. See the
+ * header of `src/memory/hindsight-directive-admin.ts` for the full statement.
+ *
  * Escape hatch: `memory.config.mcp_transport: "http"` in switchroom.yaml
  * reverts the scaffolded entry to the old direct `type: "http"` form (see
  * generateHindsightMcpConfig in src/memory/hindsight.ts).
@@ -40,7 +55,9 @@
  * inputs are threaded via the entry's `env` block):
  *
  *   HINDSIGHT_MCP_URL         backend Streamable HTTP endpoint
- *   HINDSIGHT_BANK_ID         X-Bank-Id header value (agent's collection)
+ *   HINDSIGHT_BANK_ID         X-Bank-Id header value (agent's collection),
+ *                             and the PINNED bank for the synthesized
+ *                             directive tools
  *   HINDSIGHT_SHIM_CACHE_DIR  where the cached tools/list manifest lives
  */
 
@@ -51,6 +68,10 @@ import { createInterface } from "node:readline";
 
 import type { Command } from "commander";
 
+import {
+  DirectiveAdmin,
+  DirectivePairInconsistentError,
+} from "../memory/hindsight-directive-admin.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 
 // ─── Protocol constants ───────────────────────────────────────────────────
@@ -163,6 +184,122 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   update_mental_model: [["mental_model_id"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "trigger_refresh_after_consolidation"]],
 };
 
+// ─── Shim-synthesized tools (the documented carve-out) ────────────────────
+
+/**
+ * Tools the SHIM implements itself and never forwards upstream.
+ *
+ * ## Why this does not violate "OVER-REPORTING IS THE WORSE HALF"
+ *
+ * Read that rule above before adding anything here. It exists because
+ * hindsight drops an unknown ARGUMENT silently and answers `isError:false`, so
+ * advertising a prop the server does not accept makes an agent believe a
+ * filter applied when it did not. The harm is entirely a property of tools
+ * whose calls are FORWARDED to the backend.
+ *
+ * These two are not. `toolsCall()` intercepts them by name before any upstream
+ * request exists and answers them locally over REST, so there is no server to
+ * mis-describe and no argument that can be silently dropped: an unknown
+ * argument here is rejected loudly by {@link HindsightShim.synthesizedCall}.
+ * Advertising them is therefore accurate, not optimistic — the shim really
+ * does provide them, backend up or down.
+ *
+ * What the rule DOES still bind: `FALLBACK_TOOL_TABLE` must continue to
+ * describe the pinned image byte-for-byte. That is why these live in a
+ * separate table rather than being added to it, and why
+ * `tests/memory.hindsight-contract.fixture.test.ts` still asserts
+ * `FALLBACK_TOOL_TABLE` ≡ the snapshot, plus a new assertion that these names
+ * do NOT appear in the snapshot — so if a future image bump registers real
+ * `deactivate_directive` / `reactivate_directive` tools, the test reds and the
+ * synthesis gets retired rather than silently shadowing them.
+ *
+ * NOTE the deliberate absence of a `bank_id` property. The bank is pinned from
+ * `HINDSIGHT_BANK_ID`; a caller cannot name one. That is a usability and
+ * provenance boundary, not a security one — see
+ * `src/memory/hindsight-directive-admin.ts`.
+ */
+export const SYNTHESIZED_TOOL_TABLE: Record<
+  string,
+  { description: string; required: string[]; props: Record<string, unknown> }
+> = {
+  deactivate_directive: {
+    description:
+      "Retire one of YOUR OWN standing directives by setting is_active=false, " +
+      "so it stops being injected as a hard rule. Reversible with " +
+      "reactivate_directive; the directive and its text are preserved. Pass " +
+      "superseded_by when another directive replaces this one — both get " +
+      "provenance tags recording the supersession. Operates only on your own " +
+      "memory bank and changes nothing but the active flag and those tags.",
+    required: ["name"],
+    props: {
+      name: {
+        type: "string",
+        description: "Exact name of the directive to deactivate.",
+      },
+      superseded_by: {
+        type: "string",
+        description:
+          "Optional exact name of the directive that replaces this one. " +
+          "Records 'superseded-by:<winner>' on this directive and " +
+          "'supersedes:<this>' on the winner.",
+      },
+    },
+  },
+  reactivate_directive: {
+    description:
+      "Restore one of YOUR OWN previously deactivated directives by setting " +
+      "is_active=true, so it is injected as a hard rule again. Operates only " +
+      "on your own memory bank and changes nothing but the active flag.",
+    required: ["name"],
+    props: {
+      name: {
+        type: "string",
+        description: "Exact name of the directive to reactivate.",
+      },
+    },
+  },
+};
+
+/** Names of the shim-synthesized tools (never forwarded upstream). */
+export const SYNTHESIZED_TOOL_NAMES = Object.keys(SYNTHESIZED_TOOL_TABLE);
+
+/** Materialize the synthesized tools in MCP tools/list shape. */
+export function buildSynthesizedToolsList(): ToolDef[] {
+  return Object.entries(SYNTHESIZED_TOOL_TABLE).map(
+    ([name, { description, required, props }]) => ({
+      name,
+      description,
+      inputSchema: {
+        type: "object" as const,
+        properties: props,
+        required,
+      },
+    }),
+  );
+}
+
+/**
+ * Append the synthesized tools to a manifest, dropping any same-named backend
+ * tool first.
+ *
+ * The drop is the retirement seam: if hindsight ever registers a real
+ * `deactivate_directive`, the shim's bank-pinned version keeps winning at
+ * runtime (so behaviour never silently widens to accept a `bank_id`) while the
+ * contract test reds and forces a deliberate decision.
+ */
+export function withSynthesizedTools(result: { tools: ToolDef[] }): {
+  tools: ToolDef[];
+} {
+  const synthesized = new Set(SYNTHESIZED_TOOL_NAMES);
+  return {
+    ...result,
+    tools: [
+      ...result.tools.filter((t) => !synthesized.has(t.name)),
+      ...buildSynthesizedToolsList(),
+    ],
+  };
+}
+
 /** Materialize the static fallback manifest in MCP tools/list shape. */
 export function buildFallbackToolsList(): { tools: ToolDef[] } {
   const tools = Object.entries(FALLBACK_TOOL_TABLE).map(
@@ -179,7 +316,7 @@ export function buildFallbackToolsList(): { tools: ToolDef[] } {
       },
     }),
   );
-  return { tools };
+  return withSynthesizedTools({ tools });
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -207,6 +344,13 @@ export interface ShimOptions {
   bankId: string;
   /** Directory for the persisted tools/list cache. Created on demand. */
   cacheDir: string;
+  /**
+   * REST base for the synthesized directive tools (no trailing slash).
+   * Defaults to `url` with the trailing `/mcp/` stripped — the same
+   * derivation `HINDSIGHT_DEFAULT_API_BASE_URL` uses, so the port lives in
+   * exactly one place.
+   */
+  apiBaseUrl?: string;
   /** Test seams — timeouts in ms. */
   toolsListTimeoutMs?: number;
   toolsCallTimeoutMs?: number;
@@ -592,11 +736,14 @@ export class HindsightShim {
       if (res.error) throw new Error(res.error.message);
       const result = res.result as { tools?: ToolDef[] };
       if (Array.isArray(result?.tools)) {
+        // Cache the BACKEND's manifest verbatim — the cache is a record of
+        // upstream truth, so the synthesized tools are layered on at serve
+        // time (below and in the catch) rather than baked into the file.
         this.writeCache(result);
         // The client is receiving the LIVE manifest right now — its view
         // is fresh, no recovery notification needed.
         this.staleManifestServed = false;
-        return result;
+        return withSynthesizedTools(result as { tools: ToolDef[] });
       }
       throw new Error("upstream tools/list returned no tools array");
     } catch (err) {
@@ -605,12 +752,112 @@ export class HindsightShim {
           "cached/fallback manifest",
       );
       this.staleManifestServed = true;
-      return this.readCache() ?? buildFallbackToolsList();
+      const cached = this.readCache();
+      // The synthesized directive tools do not depend on the backend at all,
+      // so they are advertised identically on every path — cold boot, cached,
+      // or live. An agent must never lose the retirement path just because
+      // memory is briefly down.
+      return cached ? withSynthesizedTools(cached) : buildFallbackToolsList();
+    }
+  }
+
+  /** Lazily built REST client for the synthesized directive tools. */
+  private directiveAdminCache: DirectiveAdmin | null = null;
+
+  private get directiveAdmin(): DirectiveAdmin {
+    if (!this.directiveAdminCache) {
+      this.directiveAdminCache = new DirectiveAdmin({
+        apiBaseUrl:
+          this.opts.apiBaseUrl ?? this.opts.url.replace(/\/mcp\/?$/, ""),
+        // PINNED. There is no parameter path from a tool call to this value.
+        bankId: this.opts.bankId,
+        ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
+      });
+    }
+    return this.directiveAdminCache;
+  }
+
+  /**
+   * Answer a shim-synthesized tool locally. Never touches the upstream MCP
+   * session.
+   *
+   * Argument handling is deliberately strict: an argument the tool does not
+   * declare is REJECTED rather than ignored. Silently ignoring `bank_id`
+   * would leave a caller believing it had targeted another bank when it had
+   * in fact edited its own — exactly the silent-drop failure mode the
+   * fallback-manifest rules above exist to prevent.
+   */
+  private async synthesizedCall(
+    name: string,
+    rawArgs: unknown,
+  ): Promise<unknown> {
+    const fail = (text: string) => ({
+      content: [{ type: "text", text }],
+      isError: true,
+    });
+    const spec = SYNTHESIZED_TOOL_TABLE[name];
+    const args = (rawArgs ?? {}) as Record<string, unknown>;
+    const allowed = new Set(Object.keys(spec.props));
+    const unknown = Object.keys(args).filter((k) => !allowed.has(k));
+    if (unknown.length > 0) {
+      return fail(
+        `${name} does not accept ${unknown.map((u) => `'${u}'`).join(", ")}. ` +
+          `Accepted arguments: ${[...allowed].join(", ")}. ` +
+          (unknown.includes("bank_id")
+            ? "This tool always operates on your own memory bank; there is no " +
+              "way to target another agent's bank through it."
+            : ""),
+      );
+    }
+    // Every declared arg is a string; an empty one is rejected rather than
+    // coerced away — silently treating `superseded_by: ""` as "no
+    // supersession" would drop the provenance the caller asked for without
+    // saying so.
+    for (const key of Object.keys(args)) {
+      if (typeof args[key] !== "string" || (args[key] as string).length === 0) {
+        return fail(`${name}: '${key}' must be a non-empty string.`);
+      }
+    }
+    for (const req of spec.required) {
+      if (args[req] === undefined) {
+        return fail(`${name} requires '${req}'.`);
+      }
+    }
+    if (!this.opts.bankId) {
+      return fail(
+        `${name} is unavailable: this agent has no HINDSIGHT_BANK_ID, so ` +
+          "there is no bank to pin the change to.",
+      );
+    }
+    try {
+      const text =
+        name === "deactivate_directive"
+          ? await this.directiveAdmin.deactivate({
+              name: args.name as string,
+              ...(typeof args.superseded_by === "string"
+                ? { supersededBy: args.superseded_by }
+                : {}),
+            })
+          : await this.directiveAdmin.reactivate({
+              name: args.name as string,
+            });
+      return { content: [{ type: "text", text }], isError: false };
+    } catch (err) {
+      if (err instanceof DirectivePairInconsistentError) {
+        this.log(`[hindsight-shim] ${err.message}`);
+      }
+      return fail(`${name} failed: ${String(err)}`);
     }
   }
 
   /** tools/call: lazy connect + bounded timeout + one retry; isError on down. */
   private async toolsCall(params: unknown): Promise<unknown> {
+    const called = (params as { name?: string; arguments?: unknown } | undefined);
+    // Synthesized tools are answered here and NEVER forwarded — the upstream
+    // MCP surface has no directive-update tool to forward them to.
+    if (called?.name && SYNTHESIZED_TOOL_NAMES.includes(called.name)) {
+      return this.synthesizedCall(called.name, called.arguments);
+    }
     try {
       const res = await this.upstream.request(
         "tools/call",

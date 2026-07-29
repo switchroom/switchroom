@@ -27,7 +27,11 @@ import {
   HINDSIGHT_HOOK_TOOLS,
   HINDSIGHT_MIN_API_VERSION,
 } from "../src/memory/hindsight-tools.js";
-import { FALLBACK_TOOL_TABLE } from "../src/cli/hindsight-mcp-shim.js";
+import {
+  FALLBACK_TOOL_TABLE,
+  SYNTHESIZED_TOOL_NAMES,
+  buildFallbackToolsList,
+} from "../src/cli/hindsight-mcp-shim.js";
 
 interface Snapshot {
   _meta?: { count?: number; hindsight_api_version?: string };
@@ -172,6 +176,40 @@ describe("hindsight contract — the shim fallback manifest mirrors the snapshot
   it("advertises exactly the snapshot's tool set (no missing tool, no phantom)", () => {
     expect(Object.keys(FALLBACK_TOOL_TABLE).sort()).toEqual(
       Object.keys(snapshot.tools).sort(),
+    );
+  });
+
+  /**
+   * The shim-synthesized carve-out, asserted rather than asserted-away.
+   *
+   * `FALLBACK_TOOL_TABLE` remains a byte-faithful description of the pinned
+   * image (test above) — the synthesized directive tools deliberately are NOT
+   * in it. What they DO ride in on is the served manifest, so these two
+   * assertions pin the boundary:
+   *
+   *  1. the synthesized names must not exist upstream. If an image bump
+   *     registers a real `deactivate_directive`, this reds and the synthesis
+   *     gets retired instead of silently shadowing the backend's version
+   *     (which would accept a `bank_id` the shim's deliberately does not).
+   *  2. the served manifest must be exactly snapshot ∪ synthesized. A tool
+   *     added to either table without review changes that set and reds here,
+   *     which is what stops "over-reporting" creeping back in under the
+   *     synthesis banner.
+   */
+  it("the synthesized directive tools are NOT tools the pinned image registers", () => {
+    for (const name of SYNTHESIZED_TOOL_NAMES) {
+      expect(
+        Object.keys(snapshot.tools),
+        `'${name}' now exists upstream — the shim must stop synthesizing it ` +
+          `(a synthesized tool shadowing a real one hides the real schema)`,
+      ).not.toContain(name);
+    }
+  });
+
+  it("the served cold-boot manifest is exactly the snapshot plus the synthesized tools", () => {
+    const served = buildFallbackToolsList().tools.map((t) => t.name).sort();
+    expect(served).toEqual(
+      [...Object.keys(snapshot.tools), ...SYNTHESIZED_TOOL_NAMES].sort(),
     );
   });
 

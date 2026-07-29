@@ -20,6 +20,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { HINDSIGHT_PROMPT_TOOLS } from "../src/memory/hindsight-tools.js";
+import { SYNTHESIZED_TOOL_NAMES } from "../src/cli/hindsight-mcp-shim.js";
 
 const repo = (p: string) => readFileSync(resolve(__dirname, "..", p), "utf-8");
 
@@ -122,11 +123,20 @@ describe("B. prompt-carrier guard — instructed tools are real", () => {
     expect(named.size).toBeGreaterThan(0);
   });
 
-  it("every mcp__hindsight__<tool> named in a prompt carrier is a real server tool (incident #4)", () => {
+  it("every mcp__hindsight__<tool> named in a prompt carrier is implemented (incident #4)", () => {
     for (const tool of named) {
+      // "Implemented" is the snapshot's server tools PLUS the shim-synthesized
+      // ones (src/cli/hindsight-mcp-shim.ts SYNTHESIZED_TOOL_TABLE), which the
+      // shim answers itself and never forwards. The incident-#4 property is
+      // intact: a hallucinated or renamed tool name is in neither set and
+      // still reds. The two sets are asserted disjoint in
+      // tests/memory.hindsight-contract.fixture.test.ts, so this exemption
+      // cannot be used to shadow a real server tool.
       expect(
-        snapshot.tools[tool] !== undefined,
-        `a prompt carrier instructs the model to call mcp__hindsight__${tool}, which is NOT a real server tool`,
+        snapshot.tools[tool] !== undefined ||
+          SYNTHESIZED_TOOL_NAMES.includes(tool),
+        `a prompt carrier instructs the model to call mcp__hindsight__${tool}, ` +
+          `which is neither a real server tool nor a shim-synthesized one`,
       ).toBe(true);
     }
   });
