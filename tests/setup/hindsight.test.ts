@@ -676,18 +676,106 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND).toBeLessThanOrEqual(1000);
   });
 
-  it("raises the memory limit to give the throughput bump headroom (8g, was 4g)", async () => {
+  it("raises the memory limit to give the throughput bump headroom (16g, was 8g)", async () => {
     const h = await import("../../src/setup/hindsight.js");
     // Baseline RSS ~3.4g; 4g was tight, and more in-flight consolidation
-    // raises it. Both emit paths must carry the bumped limit.
+    // raises it. 8g then went to 16g when the live cgroup sat at 99.5% of the
+    // ceiling re-reading ~24.5 GB/hour of evicted page cache. Both emit paths
+    // must carry the bumped limit.
     const m = /^(\d+)g$/.exec(h.HINDSIGHT_DEFAULT_MEM_LIMIT);
     expect(m, "mem limit should be N gigabytes").not.toBeNull();
-    expect(Number(m![1])).toBeGreaterThanOrEqual(8);
+    expect(Number(m![1])).toBeGreaterThanOrEqual(16);
     startHindsight({ apiPort: 8888, uiPort: 9999 });
     expect(findRunArgs()).toContain(`--memory=${h.HINDSIGHT_DEFAULT_MEM_LIMIT}`);
     expect(h.generateHindsightComposeSnippet()).toMatch(
       new RegExp(`mem_limit:\\s*${h.HINDSIGHT_DEFAULT_MEM_LIMIT}\\b`),
     );
+  });
+
+  // ── the swap cushion ───────────────────────────────────────────────────
+  //
+  // Docker's rule: when `--memory-swap` is OMITTED it defaults to 2 × memory,
+  // so the container gets a swap cushion the size of its RAM cap. Setting it
+  // EQUAL to `--memory` means "no swap at all". Those two look like the same
+  // kind of tidying edit and are opposites.
+  //
+  // On the live container that cushion is load-bearing, not theoretical:
+  // Memory=8g / MemorySwap=16g with ~900 MiB actually resident in swap, and
+  // 7,400+ reclaim events with ZERO OOM kills. Zeroing it in the same change
+  // that pins ~1.5 GiB more unreclaimable shared memory turns a slow
+  // degradation into a hard kill of the memory backend for the whole fleet.
+  //
+  // So the invariant is: emit no swap flag at all (inherit 2x), or emit one
+  // that is STRICTLY GREATER than the memory limit. Never equal, never less.
+  // Asserted on BOTH launch paths, because compose is what actually creates
+  // the container on a fleet host.
+  it("never emits a memory-swap equal to (or below) the memory limit — the OOM cushion", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+
+    /** Docker size string (`16g`, `512m`, `2G`, `1024`) → MiB. */
+    const toMib = (size: string): number => {
+      const m = /^(\d+(?:\.\d+)?)\s*([kmgKMG])?[bB]?$/.exec(size.trim());
+      expect(m, `unparseable docker size: ${size}`).not.toBeNull();
+      const n = Number(m![1]);
+      switch ((m![2] ?? "m").toLowerCase()) {
+        case "k":
+          return n / 1024;
+        case "g":
+          return n * 1024;
+        default:
+          return n;
+      }
+    };
+
+    /**
+     * Pull `--memory` / `--memory-swap` out of a docker-run argv, accepting
+     * both the single-token (`--memory=16g`) and split (`--memory 16g`) forms
+     * so the assertion cannot be dodged by a formatting change.
+     */
+    const runFlag = (args: string[], flag: string): string | null => {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === flag) return (args[i + 1] as string) ?? null;
+        if (a.startsWith(`${flag}=`)) return a.slice(flag.length + 1);
+      }
+      return null;
+    };
+
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+
+    const runMemory = runFlag(args, "--memory");
+    expect(runMemory, "docker run must cap memory").not.toBeNull();
+    const runSwap = runFlag(args, "--memory-swap");
+    if (runSwap !== null) {
+      expect(
+        toMib(runSwap),
+        `--memory-swap=${runSwap} must be STRICTLY greater than --memory=${runMemory}; ` +
+          "equal disables swap and removes the cushion that has kept this " +
+          "container OOM-free through 7,400+ reclaim events",
+      ).toBeGreaterThan(toMib(runMemory!));
+    }
+
+    // Compose twin. `memswap_limit` is compose's spelling of --memory-swap;
+    // omitted, the daemon applies the same 2x default.
+    const snippet = h.generateHindsightComposeSnippet();
+    const memLine = /^\s*mem_limit:\s*(\S+)\s*$/m.exec(snippet);
+    expect(memLine, "compose snippet must carry mem_limit").not.toBeNull();
+    const swapLine = /^\s*memswap_limit:\s*(\S+)\s*$/m.exec(snippet);
+    if (swapLine) {
+      expect(
+        toMib(swapLine[1]),
+        `memswap_limit: ${swapLine[1]} must be STRICTLY greater than ` +
+          `mem_limit: ${memLine![1]} — equal disables swap entirely`,
+      ).toBeGreaterThan(toMib(memLine![1]));
+    }
+
+    // Guard the guard: if BOTH paths silently stopped emitting a memory cap,
+    // every branch above would be vacuous. Pin that the caps are still there
+    // and that the two paths agree, so this test can never pass by emitting
+    // nothing at all.
+    expect(runMemory).toBe(h.HINDSIGHT_DEFAULT_MEM_LIMIT);
+    expect(memLine![1]).toBe(h.HINDSIGHT_DEFAULT_MEM_LIMIT);
   });
 
   it("enables stateless MCP (HINDSIGHT_API_MCP_STATELESS=true) so a hindsight bounce doesn't strand agent-side MCP sessions", () => {
