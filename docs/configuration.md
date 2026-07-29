@@ -589,6 +589,30 @@ hindsight:
 
 If you run your own Hindsight container outside `switchroom memory --start` (e.g. you point `memory.config.url` at an external server), switchroom doesn't manage that container's env — set the cap on your own image.
 
+### Logging in to the Hindsight dashboard (`hindsight.cp_access_key`)
+
+The Hindsight container also serves a **control-plane dashboard** (Next.js, host port 9999) alongside the memory API. That dashboard's login is armed by exactly one thing — upstream's `HINDSIGHT_CP_ACCESS_KEY`. When the variable is unset the access-key middleware short-circuits and lets every request through: the dashboard is not weakly protected, it has **no authentication at all**.
+
+Switchroom therefore treats an unset key as fail-closed, not as a default:
+
+```yaml
+hindsight:
+  cp_access_key: vault:hindsight_cp_access_key
+```
+
+Store the secret first (`switchroom vault set hindsight_cp_access_key`), then reference it. A literal string works too, but a `vault:` reference is the supported shape — it is read through the broker at container-launch time, the same path `litellm.admin_key` and `hindsight.llm.<op>.api_key` take.
+
+| `hindsight.cp_access_key` | Dashboard login | Where the dashboard listens |
+| --- | --- | --- |
+| set (literal, or a resolvable `vault:` ref) | armed — the access-key page guards every protected route | `0.0.0.0:9999` — reachable from the LAN and your tailnet |
+| unset, blank, or an unresolvable `vault:` ref | none | `HINDSIGHT_CP_HOSTNAME=127.0.0.1` — **host only**, plus a warning on every launch |
+
+The loopback pin is mechanical, not advisory: it is the same containment the tokenless memory API gets from `HINDSIGHT_API_HOST`, and it exists because `--network host` makes Docker ignore `-p` publishing entirely, so the process's own bind address is the only control left. Both launch paths — `switchroom memory --start` and the `switchroom memory docker-compose` snippet — derive it from one place, so they cannot disagree.
+
+An unresolvable vault reference counts as "no key" on purpose. A denied grant or a down broker must not degrade into serving an open dashboard to the network.
+
+Changing this takes effect on the next container recreate (`switchroom memory setup --recreate`), not live.
+
 ### GPU passthrough for the Hindsight container
 
 The local embedding model and the cross-encoder reranker run on the GPU when the container can see one. Switchroom decides that by reading `~/.switchroom/host-capabilities.json`, the verdict `switchroom setup` writes after probing the host: `--gpus all` is added only when that file proves **both** a GPU and the nvidia container toolkit. It has to be gated — `docker run --gpus all` hard-fails container create on a host without the toolkit.
