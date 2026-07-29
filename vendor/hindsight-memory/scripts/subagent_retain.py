@@ -90,14 +90,37 @@ SIDECHAIN_MAX_READ_BYTES = 8 * 1024 * 1024
 SIDECHAIN_SCAN_FRESH_WINDOW_S = 300
 
 # Extraction-framing header prepended to the retained content. The retain API
-# has no per-call mission (mission is bank-level), so we bias the consolidation
-# engine toward PROCESS facts with a short in-content note. Deterministic text —
-# it does not change the document_id (that is computed from the raw slice before
-# this is prepended).
+# has no per-call mission (mission is bank-level), so the only lever available
+# here is a short in-content note. Deterministic text — it does not change the
+# document_id (that is computed from the raw slice before this is prepended).
+#
+# 2026-07-29 rewrite. The original text asked the extractor for "PROCESS facts:
+# files/paths touched, commands that worked, ..." — i.e. it explicitly SOLICITED
+# the exact classes the bank-level mission (`DEFAULT_RETAIN_MISSION` in
+# src/memory/hindsight.ts) enumerates as NEVER-extract: file paths, tool-result
+# exhaust, narration of what the assistant did, volatile state. Because this
+# header sits inside the content the extractor reads, it read as a local
+# override and countermanded the bank mission on the sidechain path. The header
+# now REINFORCES the bank mission instead of fighting it: it keeps the genuinely
+# durable half of the old wording (decisions with their rationale, non-obvious
+# technique, structural dead ends) and names the ephemera to drop.
+# Governing test: would this still be worth knowing in a month?
 SIDECHAIN_MISSION_HEADER = (
-    "[sidechain sub-agent work log — extract PROCESS facts: files/paths touched, "
-    "commands that worked, decisions made, dead ends hit and why. Ignore the "
-    "restated mission prose and routine tool chatter.]"
+    "[sidechain sub-agent work log. Apply the bank's retain mission unchanged; "
+    "this is raw work exhaust and most of it is NOT memorable. Extract only "
+    "durable knowledge — something that would still be worth knowing in a month: "
+    "decisions made and the reasoning behind them; a non-obvious technique or "
+    "constraint that would save the next agent real time; a STRUCTURAL dead end "
+    "(\"X cannot work because Y\") as opposed to an incidental one (\"the command "
+    "failed so I retried\"). "
+    "Do NOT extract: the status of in-flight or unfinished work; PR, issue, "
+    "branch, review or CI state; counts, metrics, versions, sizes or any other "
+    "value that changes; container, process or runtime snapshots; narration of "
+    "what the agent did, including lists of the files, paths or commands it "
+    "touched; paths under /tmp or a scratchpad directory; session, agent, "
+    "request or operation IDs; the restated mission prose; routine tool chatter. "
+    "Anything whose truth expires when this session does is not a memory. "
+    "If nothing durable remains, extract nothing.]"
 )
 
 

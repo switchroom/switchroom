@@ -331,8 +331,10 @@ class RunSubagentRetain(unittest.TestCase):
         self.assertIn("agent_type:worker", captured["tags"])
         # Deterministic id in a DISTINCT namespace from parent retains.
         self.assertTrue(captured["document_id"].startswith("parentsess-sub-af5-r"))
-        # Process-fact framing header is prepended.
-        self.assertIn("extract PROCESS facts", captured["content"])
+        # Durable-knowledge framing header is prepended, verbatim and first.
+        self.assertTrue(
+            captured["content"].startswith(subagent_retain.SIDECHAIN_MISSION_HEADER)
+        )
         # Distinct provenance context.
         self.assertEqual(captured["context"], "claude-code-sidechain")
         self.assertEqual(captured["metadata"]["parent_session_id"], "parentsess")
@@ -457,6 +459,102 @@ class RunSubagentRetain(unittest.TestCase):
         # Payload is enqueue-shaped (matches lib.pending expectations).
         for k in ("bank_id", "content", "document_id", "context", "metadata", "tags"):
             self.assertIn(k, result["payload"])
+
+
+class SidechainMissionHeader(unittest.TestCase):
+    """The header must REINFORCE the bank-level retain mission, not countermand it.
+
+    The header is prepended into the retained content, where the extractor reads
+    it as a local instruction — so anything it solicits is written to memory even
+    when `DEFAULT_RETAIN_MISSION` (src/memory/hindsight.ts) lists that same class
+    under NEVER extract. The pre-2026-07-29 text asked for "PROCESS facts:
+    files/paths touched, commands that worked, ...", which is that exact
+    contradiction. These tests pin the fix: the solicit half asks only for
+    durable knowledge, and the ephemeral classes appear ONLY as exclusions.
+    """
+
+    SPLIT = "Do NOT extract"
+
+    def _halves(self):
+        header = subagent_retain.SIDECHAIN_MISSION_HEADER
+        self.assertIn(
+            self.SPLIT,
+            header,
+            "header must carry an explicit exclusion clause",
+        )
+        solicit, _, exclude = header.partition(self.SPLIT)
+        return header, solicit, exclude
+
+    def test_header_does_not_solicit_ephemeral_classes(self):
+        """Ephemera may be named as exclusions, never in the 'extract X' half."""
+        header = subagent_retain.SIDECHAIN_MISSION_HEADER
+        # The pre-fix solicitations, banned anywhere in the header — there is no
+        # phrasing of these that is a request for durable knowledge.
+        for gone in ("PROCESS facts", "files/paths touched", "commands that worked"):
+            self.assertNotIn(
+                gone,
+                header,
+                f"header still asks for {gone!r}, which the bank mission forbids",
+            )
+        _, solicit, _ = self._halves()
+        lowered = solicit.lower()
+        for banned in (
+            "process fact",
+            "files/paths",
+            "paths touched",
+            "commands that worked",
+            "/tmp",
+            "status",
+            "session id",
+            "container",
+            "metric",
+        ):
+            self.assertNotIn(
+                banned,
+                lowered,
+                f"header solicits ephemeral class {banned!r}: {solicit!r}",
+            )
+
+    def test_header_excludes_every_expiring_class(self):
+        _, _, exclude = self._halves()
+        lowered = exclude.lower()
+        for required in (
+            "in-flight",
+            "pr,",  # PR / issue / branch / CI state
+            "ci state",
+            "counts",
+            "versions",
+            "container",
+            "narration",
+            "/tmp",
+            "scratchpad",
+            "session, agent, request or operation ids",
+        ):
+            self.assertIn(
+                required,
+                lowered,
+                f"header fails to exclude {required!r}",
+            )
+
+    def test_header_still_solicits_decisions_with_rationale(self):
+        """The single most valuable sub-agent output must survive the rewrite."""
+        _, solicit, _ = self._halves()
+        lowered = solicit.lower()
+        self.assertIn("decisions made", lowered)
+        self.assertTrue(
+            any(w in lowered for w in ("reasoning", "rationale", "why")),
+            f"decisions are solicited without their rationale: {solicit!r}",
+        )
+        # And the other two durable classes the old wording earned.
+        self.assertIn("dead end", lowered)
+        self.assertIn("structural", lowered)
+
+    def test_header_states_the_durability_bar(self):
+        header, solicit, _ = self._halves()
+        self.assertIn("durable", solicit.lower())
+        self.assertIn("worth knowing in a month", solicit.lower())
+        # Bounded: this is prepended to every sidechain retain payload.
+        self.assertLess(len(header), 1500)
 
 
 class HookRegistration(unittest.TestCase):
