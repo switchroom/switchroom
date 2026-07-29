@@ -1,5 +1,96 @@
 # Changelog
 
+## v0.19.34 — the memory API and its dashboard stop answering unauthenticated on the LAN
+
+**Security release. This release closes an unauthenticated LAN/tailnet exposure
+of the Hindsight memory API and a loginless Hindsight control-plane dashboard.**
+Every fleet host running Hindsight under `--network host` on v0.19.33 or earlier
+served all of its agents' memory banks, and the control-plane UI, to anything
+that could reach the host's LAN or tailnet address. Roll the fleet onto this
+release; a rollout on v0.19.33 recreates the Hindsight container with the
+exposure intact.
+
+### The tokenless memory API now binds loopback under `--network host` (#3976)
+
+The hindsight API is tokenless — 0 securitySchemes, 0/57 paths carrying
+`security` — so switchroom's containment for it has always been "publish on host
+loopback only". That containment was expressed ONLY as `-p 127.0.0.1:<port>:8888`,
+and docker **ignores `-p` under `--network host`**. Nothing replaced it on the
+host-network path: both host-network branches of `hindsightContainerEnvPairs`
+pinned `HINDSIGHT_API_PORT` and `HINDSIGHT_CP_DATAPLANE_API_URL` but never
+`HINDSIGHT_API_HOST`, so the image default `0.0.0.0` won and every agent's memory
+bank answered unauthenticated on the host's LAN and tailnet addresses.
+
+`HINDSIGHT_API_HOST=127.0.0.1` is now pinned so the application binds loopback
+directly, emitted from one helper (`hindsightHostNetworkBindEnvPairs`) driven by
+the single `hindsightNeedsHostNetwork` test. That replaces three parallel
+derivations — the two env branches plus the compose emitter's own copy — with
+one, so no launch path can take host networking without also taking the bind, and
+the fix cannot be present on one path and forgotten on another.
+
+### The control-plane dashboard login is armed, and fails closed when it isn't (#3979)
+
+The Hindsight control-plane dashboard on 9999 has no login unless
+`HINDSIGHT_CP_ACCESS_KEY` is set. That is not weak auth — it is no auth: the
+shipped edge middleware reads `let t=process.env.HINDSIGHT_CP_ACCESS_KEY` and
+returns `next()` outright when it is falsy, so every request passes. Switchroom
+never emitted that variable on any launch path, and under `--network host` docker
+ignores `-p`, so the dashboard answered unauthenticated on the host's LAN and
+tailnet addresses.
+
+`hindsight.cp_access_key` is now a config field (a `vault:` reference resolved
+through the existing broker path — no new mechanism, no direct vault file IO) and
+is emitted from ONE helper, `hindsightCpAuthEnvPairs`, consumed by
+`hindsightContainerEnvPairs` and `generateHindsightComposeSnippet` alike.
+
+It **fails closed when the key is absent**: `start-all.sh` does
+`export HOSTNAME="${HINDSIGHT_CP_HOSTNAME:-0.0.0.0}"`, so on the host-network
+path `HINDSIGHT_CP_HOSTNAME=127.0.0.1` is pinned when there is no key, and opened
+to `0.0.0.0` only when there is. Unconfigured therefore means "loopback only",
+not "loginless on the LAN"; configuring the key is what opens it up. On bridge,
+`-p 127.0.0.1:<uiPort>:9999` is already the containment and an in-netns loopback
+bind would break docker-proxy, so the bind is emitted only on the host-network
+path. A warning prints on `memory start`, `setup`, and `memory docker-compose`
+(stderr, so stdout stays a clean snippet).
+
+Tests assert the outcome, not the code path: they resolve real docker argv and
+the real compose snippet, then compute an exposure verdict from them and assert
+the invariant `!exposedBeyondLoopback || loginArmed`, on host-network, bridge and
+compose.
+
+### Sanctioned directive retirement: `deactivate_directive` / `reactivate_directive` (#3975)
+
+Two pre-approved, shim-synthesized MCP tools flip a directive's `is_active` flag
+in the agent's OWN memory bank, plus supersession provenance tagging.
+`delete_directive` gating is unchanged. Hindsight's MCP surface could create,
+list and delete a directive but had no directive-update tool, so flipping
+`is_active` was only reachable by hand-rolled curl from an agent's Bash —
+undiscoverable, unaudited, and unbounded (that same curl can rewrite `content` or
+target a peer's bank). Measured baseline: 149 active directives across 11
+non-empty banks, `is_active:true` on 149 of 149 — zero deactivations fleet-wide,
+because nobody knew they could.
+
+- `src/memory/hindsight-directive-admin.ts` is a REST client with a PATCH-body
+  whitelist of `is_active` + `tags`. `name`, `content` and `priority` are absent
+  from the body type, so no path can rewrite a guardrail's text.
+- Supersession stamps `supersedes:<A>` on the winner FIRST (non-destructive),
+  then deactivates A with `superseded-by:<B>`. On failure the winner's tags are
+  restored exactly; if the rollback also fails it throws
+  `DirectivePairInconsistentError` naming both directives and the repair. No path
+  returns success on a half-written pair.
+- The two tools live in `SYNTHESIZED_TOOL_TABLE`, not `FALLBACK_TOOL_TABLE`,
+  which stays byte-equal to the pinned image's snapshot. They are never forwarded
+  and reject unknown args loudly. A contract test reds if a future image
+  registers either name.
+- The list query pins `active_only=false&limit=1000`: upstream defaults
+  `active_only` to TRUE, which would make `reactivate_directive` permanently
+  unable to see the directives it exists to restore.
+
+This is a usability and audit fix, **not** a security boundary — the REST API
+underneath remains unauthenticated, so raw curl still bypasses the tool's bank
+pin. It makes the sanctioned path safe; it does not make the unsanctioned path
+unavailable.
+
 ## v0.19.33 — the shipped binary can roll the fleet, and a standing rule actually reaches the model
 
 ### `switchroom rollout` was dead on arrival in the published static binary (#3963, #3965)
