@@ -70,6 +70,19 @@ function makeServer(
     // High selfVersion so needsSelfBump never triggers in these tests.
     selfVersion: "v99.0.0",
     allowNonLinux: true,
+    // The fleet these rolls START from. `prior_pin` — which the
+    // unattended-failure recovery below uses as its compose-restore /
+    // canary-restart target — is derived from the RUNNING fleet, not from
+    // `release.pin`, so the fixture has to state what is actually running.
+    // Wiring the seam also keeps the suite hermetic: without it the daemon
+    // runs a real `docker ps` and reads whatever containers the host has.
+    fleetComponents: () =>
+      ["test-harness", "overlord", "clerk"].map((name) => ({
+        name: `switchroom-${name}`,
+        kind: "container" as const,
+        version: PRIOR_PIN,
+        imageRef: `ghcr.io/switchroom/switchroom-agent:${PRIOR_PIN}`,
+      })),
     rolloutRelay: {
       postTerminal: (n) => {
         posted.push(n);

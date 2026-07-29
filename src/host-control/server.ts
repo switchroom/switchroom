@@ -93,6 +93,11 @@ import {
   type PendingRolloutMarker,
 } from "./self-bump.js";
 import { parseUpdateResultLine } from "../cli/update.js";
+import type { ComponentVersion } from "../cli/component-versions.js";
+import {
+  resolvePriorPinFromFleet,
+  type PriorPinSource,
+} from "./prior-pin.js";
 import { parseAuditLine, latestRolloutRowForRequest } from "./audit-reader.js";
 import {
   validateConfigEdit,
@@ -231,6 +236,18 @@ export interface ServerOptions {
    * to enumerate refs from the operator's compose file.
    */
   imageRefsForDigests?: () => string[];
+  /**
+   * The running-container inventory the `prior_pin` derivation reads —
+   * REQUIRED in production, and injected rather than defaulted.
+   *
+   * `main.ts` wires `dockerFleetComponents`: one `docker ps` through the
+   * same collector `switchroom update --check` and `doctor` use, so the
+   * three cannot disagree about what the fleet is running. Left unset,
+   * the daemon sees an EMPTY fleet and records no `prior_pin` — which is
+   * exactly what keeps a unit-test server from reading the host's real
+   * containers.
+   */
+  fleetComponents?: () => ComponentVersion[];
   /**
    * Path to the live `switchroom.yaml` the config-edit validator (PR 1b)
    * reads when checking that a proposed unified diff applies cleanly
@@ -408,7 +425,19 @@ export interface StatusEntry {
   // intentionally absent on error rows. Enables `rollout --allow-downgrade`
   // to default its target to "the last good one" without the operator
   // having to remember the version string.
+  //
+  // DERIVED FROM THE RUNNING FLEET, not from `release.pin` — the roll
+  // rewrites that field, so the config pin is the TARGET whenever it was
+  // already set ahead of the roll, and rollback becomes a no-op. See
+  // `prior-pin.ts`.
   prior_pin?: string;
+  /** Every distinct version observed across the in-scope fleet, highest
+   *  first. Present only when the fleet was NOT uniform — a mixed fleet
+   *  is recorded honestly rather than collapsed to one silent pick. */
+  prior_pin_observed?: string[];
+  /** How `prior_pin` was arrived at — distinguishes "no prior version
+   *  existed" (`all-on-target`) from "we could not look" (`unobserved`). */
+  prior_pin_source?: PriorPinSource;
 }
 
 /**
@@ -2372,19 +2401,19 @@ export class HostdServer {
     // begins. Used to stamp `prior_pin` on the completed terminal row so
     // a subsequent `rollout --allow-downgrade` can default its target to
     // "the last good one" without the operator having to recall the tag.
-    // Best-effort: read the durable release.pin from config (the version
-    // last pinned by a prior completed rollout). If the config has no
-    // version-assertable pin we record nothing — `prior_pin` is optional.
-    let priorPin: string | undefined;
-    try {
-      const cfg = loadConfig(this.opts.configPath);
-      const cfgPin = (cfg as { release?: { pin?: string } }).release?.pin;
-      if (cfgPin && isVersionAssertable(cfgPin)) {
-        priorPin = cfgPin.startsWith("v") ? cfgPin : `v${cfgPin}`;
-      }
-    } catch {
-      // loadConfig throws on a malformed yaml; proceed without prior_pin.
-    }
+    //
+    // Read from the RUNNING FLEET, never from `release.pin` in the config
+    // file — this roll's own `persist-pin` step writes that field, so a
+    // config pin that was already set to the target makes `prior_pin` the
+    // target and turns rollback into a no-op. See `prior-pin.ts` for the
+    // full account and the two invariants. Fail-soft: an unreadable
+    // inventory yields no `prior_pin` (it is optional) rather than falling
+    // back to the config, which is the defect.
+    const priorPin = resolvePriorPinFromFleet(
+      this.fleetComponents(),
+      args.pin,
+      args.agents,
+    );
 
     const entry: StatusEntry = {
       request_id,
@@ -2401,7 +2430,11 @@ export class HostdServer {
         install_type: installCtx.install_type,
         detected_at: installCtx.detected_at,
       },
-      ...(priorPin ? { prior_pin: priorPin } : {}),
+      ...(priorPin.prior_pin ? { prior_pin: priorPin.prior_pin } : {}),
+      ...(priorPin.prior_pin_observed
+        ? { prior_pin_observed: priorPin.prior_pin_observed }
+        : {}),
+      prior_pin_source: priorPin.prior_pin_source,
     };
     this.recordStatus(entry);
     this.fleetMutationInFlight = {
@@ -4032,6 +4065,28 @@ export class HostdServer {
    * in-flight call.
    */
   /**
+   * The running switchroom containers and the version each is on — the
+   * source `prior_pin` is derived from.
+   *
+   * INJECTED, never self-serviced. The daemon does not reach for `docker`
+   * on its own: production wires {@link dockerFleetComponents} at the sole
+   * composition root (`main.ts`), and a server built without it sees an
+   * EMPTY fleet, which the resolver records as
+   * `prior_pin_source: "unobserved"` — an honest "could not look", never a
+   * fallback to the config pin.
+   *
+   * The asymmetry is deliberate. A self-servicing default would make every
+   * unit test's `prior_pin` depend on whichever containers the host running
+   * the suite happens to have — the same host-vs-container divergence
+   * `vitest.config.ts` scrubs env vars to prevent. The wiring is asserted
+   * by `tests/host-control/hostd-fleet-components-callsite.test.ts`, so
+   * dropping it fails CI instead of silently degrading rollback.
+   */
+  private fleetComponents(): ComponentVersion[] {
+    return this.opts.fleetComponents ? this.opts.fleetComponents() : [];
+  }
+
+  /**
    * Enumerate the docker image refs the digest resolver should look up.
    * In production, shells out to `docker compose config --images` so
    * the resolver targets exactly the images the running compose file
@@ -4214,9 +4269,13 @@ export class HostdServer {
         // prior_pin is only meaningful on COMPLETED rows (#2492): a failed
         // canary roll does NOT change the running pin, so recording a
         // prior_pin on an error row would mislead subsequent --allow-downgrade
-        // defaulting logic into thinking the roll succeeded. Strip it on failure.
+        // defaulting logic into thinking the roll succeeded. Strip it on
+        // failure — together with the corroborating fields, so an error row
+        // never carries a half-populated prior-pin story.
         if (entry.result !== "completed") {
           delete entry.prior_pin;
+          delete entry.prior_pin_observed;
+          delete entry.prior_pin_source;
         }
       })
       .catch((err) => {
@@ -4225,6 +4284,8 @@ export class HostdServer {
         entry.finished_at = Date.now();
         entry.error = (err as Error).message;
         delete entry.prior_pin;
+        delete entry.prior_pin_observed;
+        delete entry.prior_pin_source;
       })
       .finally(() => {
         // Crash net for the durable pin, GATED ON THE OUTCOME.
@@ -4430,9 +4491,10 @@ export class HostdServer {
     }
     if (!priorPin) {
       notes.push(
-        `No automatic rollback: no prior version-assertable release.pin was ` +
-          `recorded before this roll. Verify compose host-side ` +
-          `(\`switchroom apply\`).`,
+        `No automatic rollback: no prior version could be read off the running ` +
+          `fleet when this roll started (every agent was already on the target, ` +
+          `or no agent container reported a semver tag), so there is no restore ` +
+          `target to name. Verify compose host-side (\`switchroom apply\`).`,
       );
       return notes;
     }
