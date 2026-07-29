@@ -179,9 +179,12 @@ model_group_settings:
     forward_client_headers_to_llm_api: true
   claude-opus-4-8:
     forward_client_headers_to_llm_api: true
-  # Retired/older opus version ids alias to current opus so a client that
-  # still sends an old id (e.g. hindsight's claude CLI default) doesn't 400
-  # on version drift.
+  # 2026-07-30: these two are NO LONGER drift aliases. claude-opus-4-8 and
+  # claude-opus-4-7 now route to their OWN upstream models (see the model_list
+  # block for the evidence and the reason). Both are Active per Anthropic's
+  # model-status table, so they are ordinary Anthropic OAuth-passthrough groups
+  # and keep the forwarded Authorization header (invariant I1) — nothing about
+  # the I1 scoping changed here, only the upstream target.
   claude-opus-4-7:
     forward_client_headers_to_llm_api: true
   claude-sonnet-4-6:
@@ -234,16 +237,39 @@ model_list:
   - model_name: opus
     litellm_params:
       model: anthropic/claude-opus-5
-  # Version-drift aliases: clients still sending the retired claude-opus-4-8 /
-  # claude-opus-4-7 ids (e.g. hindsight's claude CLI default) are routed to
-  # current Opus 5 instead of pinning to a stale version — same pattern as the
-  # claude-sonnet-4-6 -> claude-sonnet-5 drift alias below.
+  # 2026-07-30 (per Ken, via klanker): claude-opus-4-8 now routes to the REAL
+  # Opus 4.8 instead of drift-aliasing to Opus 5. The previous comment here
+  # claimed 4.8 was "retired" — that was FALSE. Anthropic's model-status table
+  # (platform.claude.com/docs/en/about-claude/model-deprecations) lists
+  # `claude-opus-4-8` as Active with retirement "not sooner than May 28, 2027"
+  # (4-7: not sooner than April 16, 2027). The drift alias was therefore
+  # advertising a model name and silently serving a DIFFERENT model, which is
+  # worse than not offering it: `/model claude-opus-4-8` appeared to work while
+  # actually running Opus 5.
+  #
+  # Blast radius when this was changed: ZERO. 48h of proxy logs contained no
+  # request for either id — the only occurrences were the startup model-list
+  # printout. Nothing in the fleet pins these names (the sole fleet model
+  # setting is `defaults.model: opus` in switchroom.yaml, an alias to the
+  # CURRENT Opus flagship, deliberately unversioned; there are no per-agent
+  # model pins).
+  #
+  # Both keep their model_group_settings forward_client_headers_to_llm_api
+  # entries above (invariant I1) — they are Anthropic models on the OAuth
+  # passthrough, so the client's Authorization header must still be forwarded.
+  #
+  # NOTE the `opus` alias is UNAFFECTED and still tracks the latest Opus. Do
+  # NOT "fix" this back into a drift alias: pinning a bare codename is only
+  # dangerous when the codename is RETIRED (that is what 4xx'd the fleet on
+  # 2026-06-13 with claude-fable-5). These two are active for ~9 more months,
+  # and when they do retire the correct action is to delete these entries, not
+  # to silently redirect them.
   - model_name: claude-opus-4-8
     litellm_params:
-      model: anthropic/claude-opus-5
+      model: anthropic/claude-opus-4-8
   - model_name: claude-opus-4-7
     litellm_params:
-      model: anthropic/claude-opus-5
+      model: anthropic/claude-opus-4-7
   # Version-drift alias (2026-07-05, per Ken: "sonnet must be the latest"):
   # clients still sending claude-sonnet-4-6 (older switchroom sub-agent /
   # cron defaults) are routed to current Sonnet 5 — same pattern as the
