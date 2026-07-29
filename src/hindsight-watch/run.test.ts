@@ -538,3 +538,145 @@ describe("formatFiring — severity in the notification shade", () => {
     expect(out.startsWith("🔴 hindsight: retain-failure-rate\n")).toBe(true);
   });
 });
+
+// ── the 2026-07-29 consolidation outage, end to end ─────────────────────
+//
+// The regression this whole file section exists to pin: on 2026-07-29 the
+// `overlord` bank's consolidation failed on ~every run for 2.5 h while the
+// watchdog's `consolidation-queue-age` signal read "consolidation queue
+// empty" — because the failing path marks the row `failed` in milliseconds,
+// so it never appears in the `pending`/`processing` set that signal reads.
+//
+// These tests construct that EXACT condition — N consecutive failed ops with
+// an empty pending queue — and assert an operator DM is actually sent. They
+// fail against the pre-#3982 build for the right reason: nothing there reads
+// `status='failed'`, so nothing fires.
+
+/**
+ * A docker runner that answers each of the four calls a tick makes, keyed on
+ * the shell text so it cannot silently answer the wrong probe.
+ */
+function dockerIncident(opts: {
+  /** `(bank, op_type, streak, newest_failure_age_s)` rows */
+  streaks?: Array<[string, string, number, number]>;
+  /** `(bank, pending_consolidation)` rows */
+  pending?: Array<[string, number]>;
+  /** async_operations rows in `pending`/`processing` — the OLD signal's input */
+  queueDepth?: number;
+  queueOldestAgeS?: number;
+  /** HNSW indexes that raised, as `name=error` */
+  corruptIndexes?: string[];
+  probedIndexes?: number;
+}): (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string } {
+  const ok = (stdout: string) => ({ status: 0, stdout, stderr: "" });
+  return (_cmd, args) => {
+    if (args[0] === "inspect") return ok("0\t2026-07-29T04:00:00Z\thealthy\n");
+    const sh = args[args.length - 1] ?? "";
+    if (sh.includes("VECIDX")) {
+      const bad = opts.corruptIndexes ?? [];
+      const probed = opts.probedIndexes ?? 89;
+      return ok(`NOTICE:  VECIDX|${probed}|${bad.length}|${bad.map((b) => `${b};`).join("")}\n`);
+    }
+    if (sh.includes("'S|'||")) {
+      const lines = [
+        ...(opts.streaks ?? []).map(([b, t, n, age]) => `S|${b}|${t}|${n}|${age}`),
+        ...(opts.pending ?? [["overlord", 0]] as Array<[string, number]>).map(
+          ([b, n]) => `P|${b}|${n}`,
+        ),
+      ];
+      return ok(lines.join("\n") + "\n");
+    }
+    if (sh.includes("status IN ('pending','processing')")) {
+      return ok(`${opts.queueDepth ?? 0}|${opts.queueOldestAgeS ?? 0}\n`);
+    }
+    return { status: 1, stdout: "", stderr: "unexpected docker call" };
+  };
+}
+
+describe("tick — the 2026-07-29 silent consolidation outage", () => {
+  it("DMs the operator while consolidation-queue-age still reads EMPTY", async () => {
+    const sent: Sent = { texts: [] };
+    spool(0);
+    const t0 = Date.parse("2026-07-29T05:00:00Z");
+    const run = dockerIncident({
+      // The live shape, read off the production database during the incident:
+      // `overlord | consolidation | 103 | 668`. Nothing else in the fleet.
+      streaks: [["overlord", "consolidation", 103, 668]],
+      pending: [["overlord", 38130], ["carrie", 45]],
+      // …and the pending/processing queue is EMPTY at the same instant. This
+      // is the whole bug: the old signal's input says the fleet is healthy.
+      queueDepth: 0,
+    });
+    const base = { statePath, agentsDir, notify: makeNotify(sent), run };
+
+    const r = await tick({
+      ...base,
+      fetchImpl: fakeFetch(metricsBody(1000, 10)),
+      nowFn: () => t0,
+    });
+
+    // The blind signal, in the same tick, on the same data: still "ok".
+    const age = r.outcomes.find((o) => o.verdict.signal === "consolidation-queue-age")!;
+    expect(age.verdict.state).toBe("ok");
+    expect(age.verdict.detail).toContain("consolidation queue empty");
+
+    // The new one fires on the FIRST tick — it is an edge signal, because a
+    // streak of 3+ is already its own debounce.
+    const streak = r.outcomes.find((o) => o.verdict.signal === "consolidation-failure-streak")!;
+    expect(streak.verdict.state).toBe("breach");
+    expect(streak.verdict.severity).toBe("page");
+    expect(streak.transition).toBe("fired");
+    expect(r.exitCode).toBe(10);
+
+    // The outcome that matters: a human was told, and told WHICH bank.
+    const dm = sent.texts.find((t) => t.includes("consolidation-failure-streak"));
+    expect(dm).toBeDefined();
+    expect(dm).toContain("overlord");
+    expect(dm).toContain("103 consecutive FAILED consolidation");
+  });
+
+  it("stays silent on a fleet with no failure streak at all — the live healthy shape", async () => {
+    const sent: Sent = { texts: [] };
+    spool(0);
+    const t0 = Date.parse("2026-07-29T05:00:00Z");
+    // Measured live 2026-07-29: 0 streak rows, largest healthy per-bank
+    // unconsolidated depth 45, 89 HNSW indexes clean.
+    const run = dockerIncident({
+      streaks: [],
+      pending: [["carrie", 45], ["switchroom-dev", 12], ["klanker", 0]],
+    });
+    const base = { statePath, agentsDir, notify: makeNotify(sent), run };
+    for (let i = 0; i <= 4; i++) {
+      const r = await tick({
+        ...base,
+        fetchImpl: fakeFetch(metricsBody(1000 + i * 40, 10)),
+        nowFn: () => t0 + i * 900_000,
+      });
+      expect(r.exitCode).toBe(0);
+    }
+    expect(sent.texts).toEqual([]);
+  });
+
+  it("DMs on a corrupt HNSW index, naming the index and the fix", async () => {
+    const sent: Sent = { texts: [] };
+    spool(0);
+    const t0 = Date.parse("2026-07-29T05:00:00Z");
+    const run = dockerIncident({
+      probedIndexes: 88,
+      corruptIndexes: ["idx_mu_emb_obsv_81cef5f6a42e4b4d=different vector dimensions 384 and 0"],
+    });
+    const r = await tick({
+      statePath,
+      agentsDir,
+      notify: makeNotify(sent),
+      run,
+      fetchImpl: fakeFetch(metricsBody(1000, 10)),
+      nowFn: () => t0,
+    });
+    expect(r.exitCode).toBe(10);
+    const dm = sent.texts.find((t) => t.includes("vector-index-corruption"));
+    expect(dm).toBeDefined();
+    expect(dm).toContain("idx_mu_emb_obsv_81cef5f6a42e4b4d");
+    expect(dm).toContain("REINDEX");
+  });
+});

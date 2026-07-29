@@ -18,7 +18,13 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { MAX_SAMPLE_AGE_MS, RING_MAX } from "./thresholds.js";
-import { emptyState, type Sample, type WatchState } from "./types.js";
+import {
+  emptyState,
+  type BankFailureStreak,
+  type BankPendingConsolidation,
+  type Sample,
+  type WatchState,
+} from "./types.js";
 
 /** Default state-file path, honouring `SWITCHROOM_HOME` like the rest of the CLI. */
 export function defaultStatePath(
@@ -44,6 +50,8 @@ export function loadState(path: string): WatchState {
       ...sample,
       recall: normalizeRecallSample(sample.recall),
       consolidation: normalizeConsolidationSample(sample.consolidation),
+      banks: normalizeBankSample(sample.banks),
+      vectorIndex: normalizeVectorIndexSample(sample.vectorIndex),
     }))
     .slice(-RING_MAX);
   const signals = typeof s.signals === "object" && s.signals !== null ? s.signals : {};
@@ -106,6 +114,47 @@ export function normalizeConsolidationSample(x: unknown): Sample["consolidation"
   const c = x as Record<string, unknown>;
   if (!isCount(c.pending) || !isCount(c.oldestAgeS)) return null;
   return x as Sample["consolidation"];
+}
+
+/**
+ * Validate a persisted per-bank consolidation block, or drop it to `null`.
+ *
+ * All-or-nothing per ROW, wholesale for the block: a row missing a field is
+ * dropped, but only after the block's two arrays are confirmed to be arrays.
+ * A partially-parsed block is still honest — every row it keeps was fully
+ * validated — and dropping the whole block because one row was malformed
+ * would turn a cosmetic defect into blindness on the signal that exists to
+ * end blindness.
+ */
+export function normalizeBankSample(x: unknown): Sample["banks"] {
+  if (x === null || typeof x !== "object") return null;
+  const b = x as Record<string, unknown>;
+  if (!Array.isArray(b.streaks) || !Array.isArray(b.pending)) return null;
+  const streaks = b.streaks.filter((r): r is BankFailureStreak => {
+    if (typeof r !== "object" || r === null) return false;
+    const s = r as Record<string, unknown>;
+    return (
+      typeof s.bank === "string" &&
+      typeof s.operationType === "string" &&
+      isCount(s.streak) &&
+      isCount(s.newestFailureAgeS)
+    );
+  });
+  const pending = b.pending.filter((r): r is BankPendingConsolidation => {
+    if (typeof r !== "object" || r === null) return false;
+    const p = r as Record<string, unknown>;
+    return typeof p.bank === "string" && isCount(p.pending);
+  });
+  return { streaks, pending };
+}
+
+/** Validate a persisted HNSW canary block, or drop it to `null`. */
+export function normalizeVectorIndexSample(x: unknown): Sample["vectorIndex"] {
+  if (x === null || typeof x !== "object") return null;
+  const v = x as Record<string, unknown>;
+  if (!isCount(v.probed)) return null;
+  if (!Array.isArray(v.corrupt) || !v.corrupt.every((s) => typeof s === "string")) return null;
+  return { probed: v.probed, corrupt: v.corrupt as string[] };
 }
 
 function isSample(x: unknown): x is Sample {

@@ -37,6 +37,9 @@ workers issue thousands.
 | `recall-injected-score` | p50 of `injected_score_max` ≤0.02 (warn) / ≤0.01 (page) | level |
 | `recall-zero-memory` | >25 % (warn) / >40 % (page) of recalls injected nothing | level |
 | `consolidation-queue-age` | oldest pending `async_operations` row ≥2 h (warn) / ≥12 h (page) | level |
+| `consolidation-failure-streak` | ≥3 (warn) / ≥10 (page) consecutive **failed** `async_operations` for one `(bank, operation_type)` pair, newest within 2 h | edge |
+| `pending-consolidation-depth` | one bank's unconsolidated memories ≥500 **and** grew by ≥max(500, 50 %) across the window (≥5 000 pages) | level |
+| `vector-index-corruption` | a nearest-neighbour probe against an HNSW index raises | edge |
 | `llm-fallback-ineffective` | ≥2 % (warn) / ≥10 % (page) of hindsight LLM calls failed outright | level |
 
 The five recall signals read `recall_log.jsonl` — the hook's own telemetry —
@@ -61,6 +64,38 @@ A threshold checked only against the outage proves it can see the outage,
 which is the easy half; the hard half is not firing once the outage is over.
 Two drafted lines failed that second check and were re-derived (injected-score
 warn, 0.05 → 0.02) or deleted (recall latency) before shipping.
+
+**The three consolidation signals exist because `consolidation-queue-age` is
+inverted.** Its probe selects `FROM async_operations WHERE status IN
+('pending','processing')`, so an operation that has FAILED is no longer in the
+set being measured — and `evaluateConsolidationQueueAge` reports
+`"consolidation queue empty"` when that count is zero. The more reliably a
+bank's consolidator fails, the healthier it reads. On 2026-07-29 the `overlord`
+bank's consolidation failed on ~every run from 04:28 to 07:09 UTC and the API
+reported `pending_operations: 0, failed_operations: 96, pending_consolidation:
+37 711` **simultaneously**, for 2.5 h, with every watchdog signal green. It was
+found because an operator happened to ask.
+
+`consolidation-failure-streak` is the one that closes that. It counts
+consecutive `failed` rows *since the last `completed` one*, keyed on the
+`(bank, operation_type)` **pair** — not the bank, because during the incident
+`overlord` completed 3 753 retains while its consolidation failed 112 times,
+and a bank-wide streak would have been broken by every successful retain and
+never reached 3. It is deliberately error-string-agnostic: it catches any
+deterministic non-retryable consolidation failure, not one incident's message.
+
+`pending-consolidation-depth` scores **growth**, not absolute depth, because
+some banks legitimately run deep (the fleet holds 676 720 memory units; one
+bank carries 202 549) and an absolute line would be either noise or useless.
+
+`vector-index-corruption` exists because `amcheck` has no HNSW support — a
+nearest-neighbour probe is the only available verifier for these indexes. Note
+the shape in `probe.ts`: the aggregate must be over the correlated subquery's
+**result** (`count(nn)`, not `count(*)`), or the planner elides the SubPlan and
+the probe silently passes without touching the index. The partial-index
+predicate is likewise spliced verbatim from `pg_get_expr(indpred, indrelid)` —
+a correlated column reference cannot prove a partial predicate, so the planner
+falls back to the single global index and leaves all 88 partial ones unprobed.
 
 Breaches now carry a **severity**: `warn` renders 🟠 "… degraded", `page`
 renders 🔴. Every pre-existing signal sets no severity and stays 🔴.
@@ -173,6 +208,40 @@ Notes on the reduction, all of which are fail-CLOSED by design:
   `success="false"` therefore means the local deployment failed **and** the
   OpenRouter hop did not rescue it — which is the question worth alerting on.
   A fallback that never fires can no longer read as clean.
+
+### Consolidation thresholds
+
+Measured read-only against the live fleet on 2026-07-29, shortly after the
+incident was repaired (baseline block **B9** in `thresholds.ts`):
+
+| Constant | Value | Measurement that set it |
+|---|---|---|
+| `CONSOLIDATION_FAILURE_STREAK_WARN` | 3 | The streak query returned exactly one row across all 20 banks — `overlord \| consolidation \| 103 \| 668`. Every other `(bank, op)` pair read 0. A healthy fleet's floor is 0, so 3 is three consecutive terminal failures above a population with none, and fires ~15 min into an incident. |
+| `CONSOLIDATION_FAILURE_STREAK_PAGE` | 10 | ~2.5 consecutive 15-min ticks of total failure. The incident reached 103. |
+| `CONSOLIDATION_STREAK_RECENCY_S` | 2 h | A streak is defined *relative to the last completed op*, so a bank that is fixed but then goes idle keeps its streak for ever. Without this the signal would never resolve. |
+| `PENDING_CONSOLIDATION_FLOOR` | 500 | Healthy per-bank depth: `overlord` 38 130 (sick) · `carrie` 45 · `switchroom-dev` 12 · every other bank 0, over 676 720 memory units. |
+| `PENDING_CONSOLIDATION_GROWTH_FRACTION` / `_WARN_ABS` / `_PAGE_ABS` | 50 % / 500 / 5 000 | Same "deep **and** rising" conjunction as `retain-queue-growth`, so a draining backlog stays silent. The incident's window growth was ~38 000. |
+| `VECTOR_INDEX_SAMPLE_ROWS` | 3 | 89 HNSW indexes swept in **0.45 s** at this sample size. |
+
+Two honest caveats on the canary:
+
+- **The corruption was already repaired when this was built** (last failed row
+  07:08:55 UTC, probe run 07:18), so the live sweep returned `VECIDX|89|0|` and
+  the raise could not be reproduced end-to-end. What *is* proven is the
+  mechanism: `EXPLAIN` over `count(nn)` shows `Index Scan using
+  idx_mu_emb_obsv_81cef5f6a42e4b4d` with `SubPlan 1` (9.6 ms), while the same
+  query as `count(*)` shows a bare `Aggregate` with no `SubPlan` and no index
+  scan (0.8 ms). `probeVectorIndexes` refuses to run — returning `no-data`, not
+  `ok` — if the generated SQL ever stops containing `count(nn)`.
+- The damage is **inside the index, not the data**: the column is `vector(384)`
+  and a full scan found zero off-dimension rows, which is why a nearest-
+  neighbour probe (and not a column check) is the detector.
+
+`pending_consolidation` is read in the same psql round trip as the streak
+rather than through the `/stats` HTTP endpoint. Same predicate
+(`consolidated_at IS NULL AND fact_type IN ('experience','world')`, per
+`doctor-observation-scopes.ts`), 0.284 s for the whole fleet against the
+1.4–2.1 s **per bank** that endpoint costs.
 
 ## Exit codes
 

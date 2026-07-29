@@ -10,10 +10,17 @@ import { counterDelta } from "./metrics.js";
 import {
   CONSOLIDATION_AGE_PAGE_S,
   CONSOLIDATION_AGE_WARN_S,
+  CONSOLIDATION_FAILURE_STREAK_PAGE,
+  CONSOLIDATION_FAILURE_STREAK_WARN,
+  CONSOLIDATION_STREAK_RECENCY_S,
   LLM_FAILURE_RATE_PAGE,
   LLM_FAILURE_RATE_WARN,
   LLM_MIN_SAMPLES,
   MIN_RETAIN_SAMPLES,
+  PENDING_CONSOLIDATION_FLOOR,
+  PENDING_CONSOLIDATION_GROWTH_FRACTION,
+  PENDING_CONSOLIDATION_GROWTH_PAGE_ABS,
+  PENDING_CONSOLIDATION_GROWTH_WARN_ABS,
   QUEUE_FLOOR,
   QUEUE_GROWTH_FRACTION,
   QUEUE_GROWTH_MIN_ABS,
@@ -28,7 +35,13 @@ import {
   RECALL_ZERO_MEMORY_WARN,
   RETAIN_FAILURE_RATE,
 } from "./thresholds.js";
-import type { RecallSample, Sample, SignalId, Verdict } from "./types.js";
+import type {
+  BankFailureStreak,
+  RecallSample,
+  Sample,
+  SignalId,
+  Verdict,
+} from "./types.js";
 
 function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`;
@@ -571,6 +584,224 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
 }
 
 /**
+ * R6 — CONSECUTIVE terminal consolidation failures for one bank.
+ *
+ * The signal above, `consolidation-queue-age`, structurally cannot raise on
+ * this. Its only SQL is `... WHERE status IN ('pending','processing')` and the
+ * failing path calls `_mark_operation_failed` within milliseconds, so a
+ * deterministically failing bank empties that set and reads as
+ * `"consolidation queue empty"`. On 2026-07-29 the API reported
+ * `pending_operations: 0, failed_operations: 96, pending_consolidation: 37711`
+ * at the same instant, for 2.5 h, with every watchdog signal green.
+ *
+ * This reads the set nothing else in this module reads — `status='failed'` —
+ * and scores its CONSECUTIVENESS rather than its rate. Consecutiveness is what
+ * separates "a flake" from "this will fail again the same way", and it covers
+ * the whole class of deterministic non-retryable consolidation faults rather
+ * than one error string.
+ *
+ * `no-data` when the block is missing, never a pass — the same rule the recall
+ * signals live by.
+ */
+export function evaluateConsolidationFailureStreak(ring: Sample[]): Verdict {
+  const signal = "consolidation-failure-streak" as const;
+  if (ring.length === 0) return { signal, state: "no-data", detail: "no samples" };
+  const banks = ring[ring.length - 1].banks ?? null;
+  if (banks === null) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        "per-bank consolidation not probed this tick (no psql client, no pg descriptor, " +
+        "or the container is down) — the `container` signal covers the last of those",
+    };
+  }
+  // A streak whose newest failure is old is not evidence of an ONGOING fault:
+  // a streak is defined relative to the last COMPLETED op, so a fixed-but-idle
+  // bank would otherwise hold its historical streak — and alert on it — for
+  // ever.
+  const live = banks.streaks.filter((s) => s.newestFailureAgeS <= CONSOLIDATION_STREAK_RECENCY_S);
+  let worst: BankFailureStreak | null = null;
+  for (const s of live) if (worst === null || s.streak > worst.streak) worst = s;
+  if (worst === null || worst.streak < CONSOLIDATION_FAILURE_STREAK_WARN) {
+    const observed = worst?.streak ?? 0;
+    return {
+      signal,
+      state: "ok",
+      detail:
+        `longest live consolidation-failure streak ${observed} across ` +
+        `${banks.streaks.length} bank/op pair(s) — warn ≥${CONSOLIDATION_FAILURE_STREAK_WARN}, ` +
+        `page ≥${CONSOLIDATION_FAILURE_STREAK_PAGE}`,
+      measured: { streak: observed, pairs: banks.streaks.length },
+    };
+  }
+  const { state, severity } = scoreHigherIsWorse(
+    worst.streak,
+    CONSOLIDATION_FAILURE_STREAK_WARN,
+    CONSOLIDATION_FAILURE_STREAK_PAGE,
+  );
+  const breaching = live.filter((s) => s.streak >= CONSOLIDATION_FAILURE_STREAK_WARN);
+  const others = breaching
+    .filter((s) => s !== worst)
+    .map((s) => `${s.bank}/${s.operationType}×${s.streak}`);
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `bank "${worst.bank}": ${worst.streak} consecutive FAILED ${worst.operationType} ` +
+      `operation(s) with no completion in between, newest ` +
+      `${Math.round(worst.newestFailureAgeS / 60)}m ago — ` +
+      `warn ≥${CONSOLIDATION_FAILURE_STREAK_WARN}, page ≥${CONSOLIDATION_FAILURE_STREAK_PAGE}. ` +
+      "The pending/processing queue reads EMPTY while this holds, so " +
+      "`consolidation-queue-age` cannot see it." +
+      (others.length > 0 ? `\n  also breaching: ${others.join(", ")}` : ""),
+    measured: {
+      streak: worst.streak,
+      bank: worst.bank,
+      operationType: worst.operationType,
+      newestFailureAgeS: worst.newestFailureAgeS,
+      breachingPairs: breaching.length,
+    },
+  };
+}
+
+/**
+ * R7 — per-bank unconsolidated depth RISING.
+ *
+ * The corroborating signal, and the one that catches the failure mode R6
+ * cannot: a consolidator that never ENQUEUES anything produces no failed
+ * operations at all, so there is no streak to count — but the memories still
+ * pile up unconsolidated and recall against that bank degrades identically.
+ *
+ * Growth, not absolute depth, for the same reason `retain-queue-growth` is
+ * growth: some banks legitimately run deep (`klanker` holds 202,549 units), so
+ * an absolute line is either noise or useless. Deliberately the same
+ * "deep AND rising" conjunction as `evaluateQueueGrowth`, applied per bank.
+ *
+ * The window ends are the oldest and newest samples that CARRY a bank block,
+ * not the ends of the ring: a tick whose psql probe was unavailable must not
+ * silently shorten the comparison to two samples minutes apart, which would
+ * read almost any real growth as flat.
+ */
+export function evaluatePendingConsolidationDepth(ring: Sample[]): Verdict {
+  const signal = "pending-consolidation-depth" as const;
+  const withBanks = ring.filter((s) => (s.banks ?? null) !== null);
+  if (withBanks.length < 2) {
+    return {
+      signal,
+      state: "no-data",
+      detail: `only ${withBanks.length} tick(s) carried a per-bank block — need two to see a trend`,
+      measured: { samples: withBanks.length },
+    };
+  }
+  const first = new Map(withBanks[0].banks!.pending.map((p) => [p.bank, p.pending]));
+  const last = withBanks[withBanks.length - 1].banks!.pending;
+  const mins = windowMinutes(withBanks);
+  let worst: { bank: string; from: number; to: number; growth: number; need: number } | null = null;
+  for (const p of last) {
+    const from = first.get(p.bank);
+    // A bank absent at the window start has no trend — a brand-new bank's
+    // first thousand memories are ingest, not a stall.
+    if (from === undefined) continue;
+    const growth = p.pending - from;
+    const need = Math.max(
+      PENDING_CONSOLIDATION_GROWTH_WARN_ABS,
+      Math.ceil(PENDING_CONSOLIDATION_GROWTH_FRACTION * from),
+    );
+    if (p.pending < PENDING_CONSOLIDATION_FLOOR || growth < need) continue;
+    if (worst === null || growth > worst.growth) {
+      worst = { bank: p.bank, from, to: p.pending, growth, need };
+    }
+  }
+  if (worst === null) {
+    return {
+      signal,
+      state: "ok",
+      detail:
+        `no bank's unconsolidated depth is both ≥${PENDING_CONSOLIDATION_FLOOR} and rising ` +
+        `over ${mins}m (${last.length} bank(s))`,
+      measured: { banks: last.length, windowMinutes: mins },
+    };
+  }
+  const { state, severity } = scoreHigherIsWorse(
+    worst.growth,
+    PENDING_CONSOLIDATION_GROWTH_WARN_ABS,
+    PENDING_CONSOLIDATION_GROWTH_PAGE_ABS,
+  );
+  const perHour = mins > 0 ? Math.round((worst.growth * 60) / mins) : worst.growth;
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `bank "${worst.bank}": unconsolidated memories ${worst.from} → ${worst.to} ` +
+      `(+${worst.growth}, ≈${perHour}/h) over ${mins}m — fires at ` +
+      `≥${PENDING_CONSOLIDATION_FLOOR} deep AND +${worst.need} growth, pages at ` +
+      `+${PENDING_CONSOLIDATION_GROWTH_PAGE_ABS}. Rising depth with no failed operations ` +
+      `means consolidation is not being attempted at all.`,
+    measured: {
+      bank: worst.bank,
+      pending: worst.to,
+      growth: worst.growth,
+      growthPerHour: perHour,
+      growthNeeded: worst.need,
+      windowMinutes: mins,
+    },
+  };
+}
+
+/**
+ * R8 — an HNSW index raises on a nearest-neighbour probe.
+ *
+ * The root-cause canary under R6/R7: on 2026-07-29 every failed consolidation
+ * carried `different vector dimensions 384 and 0`, raised out of an index
+ * scan. `amcheck` has no HNSW support, so scanning one IS the verifier — there
+ * is no cheaper check and no data-level check at all (the column is
+ * `vector(384)` and the table held zero off-dimension rows throughout).
+ *
+ * Always `page`, and edge-triggered in `run.ts`. Index corruption does not
+ * flap, does not resolve itself, and fails every write path that touches the
+ * index — there is no "degraded" reading of it.
+ */
+export function evaluateVectorIndexCorruption(ring: Sample[]): Verdict {
+  const signal = "vector-index-corruption" as const;
+  if (ring.length === 0) return { signal, state: "no-data", detail: "no samples" };
+  const v = ring[ring.length - 1].vectorIndex ?? null;
+  if (v === null) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        "vector-index canary did not run this tick (no psql client, no pg descriptor, " +
+        "or the container is down) — the `container` signal covers the last of those",
+    };
+  }
+  if (v.corrupt.length === 0) {
+    return {
+      signal,
+      state: "ok",
+      detail: `${v.probed} HNSW index(es) answered a nearest-neighbour probe cleanly`,
+      measured: { probed: v.probed, corrupt: 0 },
+    };
+  }
+  const shown = v.corrupt.slice(0, 5).join("\n  ");
+  const more = v.corrupt.length > 5 ? `\n  …and ${v.corrupt.length - 5} more` : "";
+  return {
+    signal,
+    state: "breach",
+    severity: "page",
+    detail:
+      `${v.corrupt.length} of ${v.probed + v.corrupt.length} HNSW index(es) RAISED on a ` +
+      `nearest-neighbour probe — the index is corrupt, and every consolidation or recall ` +
+      `that touches it fails:\n  ${shown}${more}\n` +
+      `Fix: REINDEX the named index(es). amcheck cannot verify HNSW, so this probe is the ` +
+      `only detector.`,
+    measured: { probed: v.probed, corrupt: v.corrupt.length, first: v.corrupt[0] },
+  };
+}
+
+/**
  * F1 — the LLM lane's fallback is not absorbing local failures.
  *
  * Stated positively on purpose. LiteLLM's fallback runs INSIDE the client
@@ -633,6 +864,9 @@ export function evaluateAll(ring: Sample[]): Verdict[] {
     evaluateRecallInjectedScore(ring),
     evaluateRecallZeroMemory(ring),
     evaluateConsolidationQueueAge(ring),
+    evaluateConsolidationFailureStreak(ring),
+    evaluatePendingConsolidationDepth(ring),
+    evaluateVectorIndexCorruption(ring),
     evaluateLlmFallback(ring),
   ];
 }

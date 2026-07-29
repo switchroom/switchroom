@@ -35,6 +35,18 @@ export type SignalId =
   | "recall-candidate-floor" // the candidate pool itself is empty
   | "recall-injected-score" // what we DID inject scores like noise
   | "consolidation-queue-age" // the async queue is not draining
+  // ── consolidation: the half `consolidation-queue-age` cannot see ─────
+  // `consolidation-queue-age` reads ONLY `status IN ('pending','processing')`,
+  // and the failing path calls `_mark_operation_failed` within milliseconds —
+  // so a bank whose consolidation fails on every attempt leaves that set
+  // instantly and the signal reports "consolidation queue empty". The metric
+  // is inverted: the more RELIABLY a bank fails, the healthier it reads.
+  // Observed live 2026-07-29, `overlord` bank: the API reported
+  // `pending_operations: 0, failed_operations: 96, pending_consolidation:
+  // 37711` simultaneously, for 2.5 h, with every watchdog signal green.
+  | "consolidation-failure-streak" // consecutive terminal failures for one bank
+  | "pending-consolidation-depth" // unconsolidated memories piling up per bank
+  | "vector-index-corruption" // an HNSW index raises on a nearest-neighbour probe
   // ── the fallback that never fires ────────────────────────────────────
   | "llm-fallback-ineffective";
 
@@ -49,6 +61,9 @@ export const ALL_SIGNALS: SignalId[] = [
   "recall-candidate-floor",
   "recall-injected-score",
   "consolidation-queue-age",
+  "consolidation-failure-streak",
+  "pending-consolidation-depth",
+  "vector-index-corruption",
   "llm-fallback-ineffective",
 ];
 
@@ -116,6 +131,20 @@ export interface Sample {
    * legitimate off-host).
    */
   consolidation?: ConsolidationSample | null;
+  /**
+   * Per-bank consolidation facts — terminal-failure streaks and
+   * unconsolidated depth — or `null` when the psql probe was unavailable.
+   *
+   * Optional on the wire for the same reason `recall` is: a state file written
+   * by an older build must still load rather than being discarded wholesale,
+   * which would re-baseline every signal on upgrade.
+   */
+  banks?: BankSample | null;
+  /**
+   * Result of the HNSW nearest-neighbour canary, or `null` when the psql
+   * probe was unavailable.
+   */
+  vectorIndex?: VectorIndexSample | null;
   /** cumulative successful hindsight LLM calls across every lane */
   llmOk?: number;
   /** cumulative failed hindsight LLM calls across every lane */
@@ -158,6 +187,68 @@ export interface ConsolidationSample {
   pending: number;
   /** age of the oldest such row, in seconds */
   oldestAgeS: number;
+}
+
+/**
+ * One `(bank_id, operation_type)` pair's CONSECUTIVE terminal-failure streak:
+ * the `status='failed'` rows newer than that pair's most recent
+ * `status='completed'` row.
+ *
+ * Keyed on the pair, not on the bank, because a bank whose consolidation is
+ * wedged goes on completing `retain` and `batch_retain` ops the whole time —
+ * observed live during the 2026-07-29 incident, where `overlord` held 3,753
+ * completed retains against 112 failed consolidations. A bank-wide streak
+ * would have been broken by every successful retain and never reached 3.
+ */
+export interface BankFailureStreak {
+  bank: string;
+  operationType: string;
+  /** consecutive `failed` rows since the last `completed` one for this pair */
+  streak: number;
+  /** seconds since the NEWEST failure in the streak — the staleness guard */
+  newestFailureAgeS: number;
+}
+
+/** One bank's unconsolidated-memory depth. */
+export interface BankPendingConsolidation {
+  bank: string;
+  /**
+   * `memory_units` rows with `consolidated_at IS NULL AND fact_type IN
+   * ('experience','world')` — byte-for-byte the definition the API's
+   * `get_bank_freshness` uses for the `pending_consolidation` field it
+   * publishes on `/v1/default/banks/{bank}/stats`
+   * (`engine/memory_engine.py`, verified live 2026-07-29). Computed in the
+   * same psql pass rather than over N HTTP calls: one grouped aggregate over
+   * 676,720 rows measured 0.284 s, against the ~1.4-2.1 s per bank that
+   * `doctor-observation-scopes.ts` pays for the `/stats` endpoint.
+   */
+  pending: number;
+}
+
+/** The per-bank consolidation block one tick reads. */
+export interface BankSample {
+  /** every pair with at least one live failure streak; empty is healthy */
+  streaks: BankFailureStreak[];
+  /** every bank with at least one memory unit */
+  pending: BankPendingConsolidation[];
+}
+
+/**
+ * The HNSW canary's result for one tick.
+ *
+ * `amcheck` has no HNSW support, so a nearest-neighbour probe is the only
+ * available verifier for these indexes: a corrupt one raises
+ * `different vector dimensions 384 and 0` when the scan walks the damaged
+ * node. The damage is INSIDE the index, not in the data — `memory_units.
+ * embedding` is `vector(384)`, so a zero-dimension row cannot exist in the
+ * table (verified live: 0 rows with `vector_dims(embedding) <> 384`), which
+ * is why no data-level check can see it either.
+ */
+export interface VectorIndexSample {
+  /** HNSW indexes the probe successfully scanned */
+  probed: number;
+  /** `<indexname>=<sqlerrm>` for every index whose probe raised */
+  corrupt: string[];
 }
 
 /** Per-signal hysteresis state. */

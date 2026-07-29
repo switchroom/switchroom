@@ -207,3 +207,118 @@ describe("evaluateFailureRate with missing retain counters", () => {
     expect((v.measured as { rate: number }).rate).toBeCloseTo(0.5, 6);
   });
 });
+
+// ── the per-bank consolidation and HNSW probes ──────────────────────────
+
+import { probeBankConsolidation, probeVectorIndexes } from "./probe.js";
+import type { Runner } from "./probe.js";
+
+/** A runner that answers every `docker exec` with one canned stdout. */
+function psql(stdout: string, status = 0): Runner {
+  return () => ({ status, stdout, stderr: "" });
+}
+
+describe("probeBankConsolidation", () => {
+  it("parses the live incident output into streaks and per-bank depth", () => {
+    const out = probeBankConsolidation(
+      "c",
+      psql("S|overlord|consolidation|103|668\nP|overlord|38130\nP|carrie|45\nP|klanker|0\n"),
+    );
+    expect(out).toEqual({
+      streaks: [{ bank: "overlord", operationType: "consolidation", streak: 103, newestFailureAgeS: 668 }],
+      pending: [
+        { bank: "overlord", pending: 38130 },
+        { bank: "carrie", pending: 45 },
+        { bank: "klanker", pending: 0 },
+      ],
+    });
+  });
+
+  it("returns null — not an empty, healthy-looking block — when psql fails", () => {
+    expect(probeBankConsolidation("c", psql("", 1))).toBeNull();
+  });
+
+  it("returns null when NOTHING parsed: a live fleet always has ≥1 bank", () => {
+    // The dangerous shape: the query changed shape / the container answered
+    // with a banner. `{streaks: [], pending: []}` would evaluate as a clean
+    // pass on both signals for ever.
+    expect(probeBankConsolidation("c", psql("psql: could not connect\n"))).toBeNull();
+  });
+
+  it("skips a malformed row but keeps the rows it understood", () => {
+    const out = probeBankConsolidation(
+      "c",
+      psql("S|weird|bank|with|pipes|x|9\nS|overlord|consolidation|7|30\nP|overlord|12\n"),
+    );
+    expect(out?.streaks).toEqual([
+      { bank: "overlord", operationType: "consolidation", streak: 7, newestFailureAgeS: 30 },
+    ]);
+    expect(out?.pending).toEqual([{ bank: "overlord", pending: 12 }]);
+  });
+
+  it("rejects a negative or non-numeric count rather than trusting it", () => {
+    expect(probeBankConsolidation("c", psql("S|b|consolidation|-1|30\nP|b|4\n"))?.streaks).toEqual([]);
+    expect(probeBankConsolidation("c", psql("S|b|consolidation|NaN|30\nP|b|4\n"))?.streaks).toEqual([]);
+  });
+});
+
+describe("probeVectorIndexes", () => {
+  const notice = (probed: number, bad: string[]) =>
+    `NOTICE:  VECIDX|${probed}|${bad.length}|${bad.map((b) => b + ";").join("")}\n`;
+
+  it("parses the measured healthy sweep", () => {
+    expect(probeVectorIndexes("c", psql(notice(89, [])))).toEqual({ probed: 89, corrupt: [] });
+  });
+
+  it("parses a corrupt index, preserving the name and the error", () => {
+    const out = probeVectorIndexes(
+      "c",
+      psql(notice(88, ["idx_mu_emb_obsv_81cef5f6a42e4b4d=different vector dimensions 384 and 0"])),
+    );
+    expect(out?.probed).toBe(88);
+    expect(out?.corrupt).toEqual(["idx_mu_emb_obsv_81cef5f6a42e4b4d=different vector dimensions 384 and 0"]);
+  });
+
+  it("keeps an error that contains a pipe — the tail is re-joined, not truncated", () => {
+    const out = probeVectorIndexes("c", psql(notice(88, ["idx_a=bad tuple a|b"])));
+    expect(out?.corrupt).toEqual(["idx_a=bad tuple a|b"]);
+  });
+
+  it("returns null — never `ok` — when the count and the parsed list disagree", () => {
+    // Fail-closed: if we cannot read the answer we say so. `{probed, corrupt: []}`
+    // here would report a corrupt fleet as clean.
+    expect(probeVectorIndexes("c", psql("NOTICE:  VECIDX|88|2|idx_a=boom;\n"))).toBeNull();
+  });
+
+  it("returns null when the NOTICE never arrived", () => {
+    expect(probeVectorIndexes("c", psql("\n"))).toBeNull();
+    expect(probeVectorIndexes("c", psql(notice(89, []), 1))).toBeNull();
+  });
+
+  it("actually asks the database — the generated SQL carries the count(nn) shape", () => {
+    // The elision guard from probe.ts: aggregate over `*` and the planner
+    // drops the correlated subquery, so the sweep touches no index and passes
+    // on a corrupt one. Assert the shipped statement over the wire.
+    let sql = "";
+    probeVectorIndexes("c", (_cmd, args) => {
+      sql = args[args.length - 1] ?? "";
+      return { status: 0, stdout: notice(1, []), stderr: "" };
+    });
+    expect(sql).toContain("count(nn)");
+    expect(sql).not.toContain("count(*)");
+    expect(sql).toContain("pg_get_expr(i.indpred, i.indrelid)");
+    expect(sql).toContain("amname = 'hnsw'");
+  });
+
+  it("clamps the sample size to a positive integer before splicing it", () => {
+    let sql = "";
+    const cap: Runner = (_c, args) => {
+      sql = args[args.length - 1] ?? "";
+      return { status: 0, stdout: notice(1, []), stderr: "" };
+    };
+    probeVectorIndexes("c", cap, 3.9);
+    expect(sql).toContain("r.tbl, r.pred, 3)");
+    probeVectorIndexes("c", cap, -5);
+    expect(sql).toContain("r.tbl, r.pred, 1)");
+  });
+});

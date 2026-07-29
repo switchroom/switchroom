@@ -31,7 +31,21 @@ import {
  * happened — waiting for a second observation would just delay the news, and
  * they cannot flap the way a rate can.
  */
-const EDGE_SIGNALS = new Set<SignalId>(["retain-loss", "container"]);
+const EDGE_SIGNALS = new Set<SignalId>([
+  "retain-loss",
+  "container",
+  // Both of these carry their own debounce INSIDE the measurement, so the
+  // two-tick level debounce would only delay the news by one cadence:
+  //
+  //  - `consolidation-failure-streak` fires at ≥3 CONSECUTIVE terminal
+  //    failures with no completion in between. Three of those is not a flake;
+  //    requiring a second tick would put detection of the 2026-07-29 incident
+  //    at ~30 min instead of ~15.
+  //  - `vector-index-corruption` is an error RAISED by an index scan. A
+  //    corrupt HNSW index does not intermittently become valid.
+  "consolidation-failure-streak",
+  "vector-index-corruption",
+]);
 
 function breachesToFire(signal: SignalId): number {
   return EDGE_SIGNALS.has(signal) ? BREACHES_TO_FIRE_EDGE : BREACHES_TO_FIRE_LEVEL;
