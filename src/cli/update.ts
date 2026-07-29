@@ -63,6 +63,7 @@ import {
   type SelfUpdateIO,
 } from "./self-update.js";
 import { defaultSelfUpdateIO } from "./self-update-io.js";
+import { resolveSelfInvocation } from "./self-invoke.js";
 import {
   collectComponents,
   detectComponentDrift,
@@ -113,8 +114,13 @@ interface UpdateOptions {
   /** Compose-file override for tests. */
   composePath?: string;
   /** Test seam — override the running-script path used by the
-   *  `--rebuild` source-checkout guard (default: process.argv[1]). */
+   *  `--rebuild` source-checkout guard and by the self-invocation
+   *  resolver (default: process.argv[1]). */
   scriptPath?: string;
+  /** Test seam — override `process.execPath` for the self-invocation
+   *  resolver, so the compiled-binary spawn shape (#3963) is assertable
+   *  without a real static binary. */
+  execPath?: string;
   /** stdout/stderr writers for tests. */
   stdout?: (s: string) => void;
   stderr?: (s: string) => void;
@@ -434,6 +440,15 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   const composePath = opts.composePath ?? DEFAULT_COMPOSE_PATH;
   const runner = opts.runner ?? defaultRunner;
   const scriptPath = opts.scriptPath ?? process.argv[1] ?? "";
+  // #3963: every self-invoking step below must NOT pass a compiled
+  // binary's bunfs bundle path as argv[1] — the binary is its own
+  // entrypoint and commander would parse the path as the subcommand.
+  // See ./self-invoke.ts.
+  const self = resolveSelfInvocation({
+    execPath: opts.execPath ?? process.execPath,
+    scriptPath,
+  });
+  const selfArgv = (...args: string[]): string[] => [...self.prefixArgs, ...args];
   const steps: UpdateStep[] = [];
   // Resolve whether we are running inside the hostd container. When true,
   // refresh-hostd and refresh-web are deferred (cannot recreate the very
@@ -555,13 +570,12 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       description:
         "Regenerate compose with the --channel/--pin override so pull-images grabs the right tag",
       run: () => {
-        const r = runner(process.execPath, [
-          scriptPath,
+        const r = runner(self.command, selfArgv(
           "apply",
           "--compose-only",
           "--non-interactive",
           ...releaseOverrideArgs,
-        ]);
+        ));
         if (r.status !== 0) {
           throw new Error("regen-compose-for-release-override failed");
         }
@@ -627,13 +641,12 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       // update has its own doctor step at position 5; running it
       // twice would produce identical output ~3s apart and read as
       // a broken pipeline.
-      const r = runner(process.execPath, [
-        scriptPath,
+      const r = runner(self.command, selfArgv(
         "apply",
         "--non-interactive",
         "--no-doctor",
         ...releaseOverrideArgs,
-      ]);
+      ));
       if (r.status !== 0) throw new Error("switchroom apply failed");
     },
   });
@@ -680,7 +693,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
           : undefined,
     isHostdDeferred: hostControlEnabled && !opts.skipImages && hostdContext,
     run: () => {
-      const r = runner(process.execPath, [scriptPath, "hostd", "install"]);
+      const r = runner(self.command, selfArgv("hostd", "install"));
       if (r.status !== 0) throw new Error("switchroom hostd install failed");
     },
   });
@@ -724,7 +737,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
           : undefined,
     isHostdDeferred: webServiceManaged && !opts.skipImages && hostdContext,
     run: () => {
-      const r = runner(process.execPath, [scriptPath, "webd", "install"]);
+      const r = runner(self.command, selfArgv("webd", "install"));
       if (r.status !== 0) throw new Error("switchroom webd install failed");
     },
   });
@@ -780,7 +793,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       const pinTag = resolveHindsightPinTag(opts);
       const setupArgs = ["memory", "setup", "--recreate"];
       if (pinTag) setupArgs.push("--tag", pinTag);
-      const r = runner(process.execPath, [scriptPath, ...setupArgs]);
+      const r = runner(self.command, selfArgv(...setupArgs));
       if (r.status !== 0) throw new Error("switchroom memory setup --recreate failed");
     },
   });
@@ -992,7 +1005,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       // Doctor returns non-zero on findings; don't propagate that as
       // an update failure (the update succeeded; the diagnostics are
       // informational). Just print and continue.
-      runner(process.execPath, [scriptPath, "doctor"]);
+      runner(self.command, selfArgv("doctor"));
     },
   });
 
