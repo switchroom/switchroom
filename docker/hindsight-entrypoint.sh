@@ -103,6 +103,16 @@ PG0_INSTANCE="${SWITCHROOM_HINDSIGHT_PG0_INSTANCE:-/home/hindsight/.pg0/instance
 # case) is the operator's per-knob opt-out.
 PG_EFFECTIVE_CACHE_SIZE="${SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE:-}"
 PG_SHARED_BUFFERS="${SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS:-}"
+# --- pg0 durability pre-start ------------------------------------------------
+# `on` (the default) makes the pre-start append `-c fsync=on`; `off` omits the
+# flag and leaves pg0's own `-F` (fsync OFF) standing.
+#
+# Unlike the two sizing knobs above this one defaults ON *here*, not only in
+# src/setup/hindsight-pg-defaults.ts, and deliberately: durability must not
+# depend on a new-enough switchroom CLI having emitted the env var. An operator
+# running an older `switchroom apply`, or `docker run`-ing the image by hand,
+# still gets a crash-safe database.
+PG_FSYNC="${SWITCHROOM_HINDSIGHT_PG_FSYNC:-on}"
 # pg0 CLI. The python wheel bundles it; the venv's python minor version is not
 # guaranteed stable, so glob rather than hard-code. Overridable for tests.
 PG0_BIN="${SWITCHROOM_HINDSIGHT_PG0_BIN:-}"
@@ -257,7 +267,7 @@ reap_stale_processing_when_ready() {
 }
 
 # ---------------------------------------------------------------------------
-# pg0 sizing pre-start (#3706)
+# pg0 sizing + durability pre-start (#3706)
 #
 # Hindsight's embedded PostgreSQL is pg0, and pg0 bakes its tuning into the
 # `postgres` child's ARGV:
@@ -278,6 +288,23 @@ reap_stale_processing_when_ready() {
 # `-c effective_cache_size=4GB -c shared_buffers=1536MB` kept pg0's work_mem,
 # maintenance_work_mem, max_parallel_maintenance_workers and logging flags).
 #
+# DURABILITY. Note the `-F` in that argv: pg0 starts PostgreSQL with fsync
+# DISABLED, which means a crash can leave a torn or stale page that
+# `data_checksums` still validates (a lost write, not a corrupt one). `-F` is a
+# positional flag pg0 always emits immediately after `-D`/`-p`, BEFORE the
+# merged `-c` block, and postgres applies command-line options in order — so a
+# later `-c fsync=on` wins. Verified on a throwaway pg0 instance from the same
+# image (2026-07-29):
+#
+#   pg0 start --name probeA … -c fsync=on
+#   argv:  postgres -D …/probeA/data -F -p 5432 … -c fsync=on …
+#   SELECT name, setting, source FROM pg_settings WHERE name='fsync'
+#     →  fsync | on | command line
+#
+# The order of the `-c` flags among themselves is NOT stable (pg0 iterates a
+# map), so this only holds because `-F` is positional and there is exactly one
+# fsync `-c`. Do not add a second one.
+#
 # BEST-EFFORT BY CONSTRUCTION. Every failure path returns 0 and leaves pg0
 # unstarted, so hindsight_api starts it exactly as it does today with pg0's own
 # defaults. A sizing change can never be why the container fails to boot.
@@ -295,8 +322,18 @@ prestart_pg0() {
   case "$(printf '%s' "${PG_SHARED_BUFFERS}" | tr '[:upper:]' '[:lower:]')" in
     off) PG_SHARED_BUFFERS="" ;;
   esac
+  # fsync is a tri-state collapsed to a boolean: only the literal `on` (any
+  # case) applies the flag. `off`, empty, and any typo all fall through to
+  # "omit it", which restores pg0's `-F` — the pre-change behaviour. A typo can
+  # therefore never hand postgres an unparseable `fsync=` value and turn a
+  # durability change into a boot failure.
+  case "$(printf '%s' "${PG_FSYNC}" | tr '[:upper:]' '[:lower:]')" in
+    on) PG_FSYNC="on" ;;
+    *) PG_FSYNC="" ;;
+  esac
   # Nothing to apply ⇒ do not touch pg0 at all (pre-#3706 behaviour).
-  [ -n "${PG_EFFECTIVE_CACHE_SIZE}" ] || [ -n "${PG_SHARED_BUFFERS}" ] || return 0
+  [ -n "${PG_EFFECTIVE_CACHE_SIZE}" ] || [ -n "${PG_SHARED_BUFFERS}" ] ||
+    [ -n "${PG_FSYNC}" ] || return 0
 
   # Only the embedded-pg0 database is ours to pre-start. An operator pointing
   # hindsight at an external postgres (or a differently-named/ported pg0
@@ -345,9 +382,12 @@ EOF
   if [ -n "${PG_SHARED_BUFFERS}" ]; then
     set -- "$@" -c "shared_buffers=${PG_SHARED_BUFFERS}"
   fi
+  if [ -n "${PG_FSYNC}" ]; then
+    set -- "$@" -c "fsync=${PG_FSYNC}"
+  fi
 
   if _out="$("${_pg0}" "$@" 2>&1)"; then
-    log "pg0 pre-start ok: name=${PG0_NAME} effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-<pg0-default>} shared_buffers=${PG_SHARED_BUFFERS:-<pg0-default>}"
+    log "pg0 pre-start ok: name=${PG0_NAME} effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-<pg0-default>} shared_buffers=${PG_SHARED_BUFFERS:-<pg0-default>} fsync=${PG_FSYNC:-<pg0-default:off>}"
     return 0
   fi
 

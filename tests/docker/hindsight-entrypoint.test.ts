@@ -506,8 +506,17 @@ describe("hindsight-entrypoint.sh (#1245)", () => {
       expect(stderr).toMatch(/credential refresh loop started/);
       // The reaper fired (REFRESH_S=1) but found no pg → silent no-op:
       // no reset log, and crucially no leaked psql/python crash.
+      //
+      // The pg0 pre-start's own "skipped: pg0 binary not found" line is
+      // expected on a host with no pg0 (fsync defaults ON, so the pre-start
+      // always runs now) and is stripped before the crash-signature check —
+      // otherwise a deliberate log would satisfy the `not found` guard.
+      const reaperNoise = stderr.replace(
+        /^switchroom-hindsight-entrypoint: pg0 pre-start .*$/gm,
+        "",
+      );
       expect(stderr).not.toMatch(/stale-claim reaper reset/);
-      expect(stderr).not.toMatch(/Traceback|psql:|not found/);
+      expect(reaperNoise).not.toMatch(/Traceback|psql:|not found/);
     } finally {
       try { child.kill("SIGKILL"); } catch { /* ignore */ }
     }
@@ -805,8 +814,10 @@ exit ${code}
     // The flags themselves — the whole point of the change.
     expect(argv).toContain("effective_cache_size=4096MB");
     expect(argv).toContain("shared_buffers=1536MB");
+    // ...plus the durability flag, which defaults ON inside the entrypoint.
+    expect(argv).toContain("fsync=on");
     // ...each introduced by its own `-c`, which is pg0's flag syntax.
-    expect(argv.filter((a) => a === "-c").length).toBe(2);
+    expect(argv.filter((a) => a === "-c").length).toBe(3);
     // The instance identity hindsight_api will look for, or it won't adopt ours.
     expect(argv[argv.indexOf("--name") + 1]).toBe("hindsight");
     // Ordering matters: pre-start must happen BEFORE the exec, otherwise
@@ -815,9 +826,10 @@ exit ${code}
     expect(existsSync(marker)).toBe(true);
   }, 20_000);
 
-  it("does NOT touch pg0 at all when neither knob is set (pre-#3706 behaviour)", async () => {
-    // An older switchroom, or an operator who cleared both, must get exactly
-    // today's boot: hindsight_api starts pg0 itself.
+  it("still pre-starts for fsync alone when BOTH sizing knobs are cleared", async () => {
+    // An older switchroom that emits neither sizing var must STILL get a
+    // crash-safe database — durability cannot be contingent on a CLI version.
+    // Pre-#3706 this case skipped the pre-start entirely; it no longer can.
     stopBroker = await startFakeBroker(socketPath);
     const log = join(dir, "pg0-argv-none.log");
     const r = await runWithEnv({
@@ -826,8 +838,59 @@ exit ${code}
       SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "",
     });
     expect(r.status).toBe(0);
+    const argv = argvOf(log);
+    expect(argv).toContain("fsync=on");
+    // ...and nothing else: clearing a sizing knob must still clear it.
+    expect(argv.filter((a) => a === "-c")).toEqual(["-c"]);
+    expect(argv.some((a) => a.startsWith("shared_buffers="))).toBe(false);
+    expect(argv.some((a) => a.startsWith("effective_cache_size="))).toBe(false);
+    expect(r.stderr).toMatch(/pg0 pre-start ok/);
+  }, 20_000);
+
+  it("does NOT touch pg0 at all when every knob is opted out", async () => {
+    // The full pre-#3706 escape hatch: an operator who explicitly turns all
+    // three off gets exactly hindsight_api starting pg0 itself.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-alloff.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "",
+      SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "",
+      SWITCHROOM_HINDSIGHT_PG_FSYNC: "off",
+    });
+    expect(r.status).toBe(0);
     expect(argvOf(log)).toEqual([]);
     expect(r.stderr).not.toMatch(/pg0 pre-start ok/);
+  }, 20_000);
+
+  it("never hands postgres a non-boolean fsync value", async () => {
+    // `fsync` is applied only for the exact token `on`. A typo must degrade to
+    // pg0's own `-F` rather than becoming `-c fsync=oon`, which would make the
+    // server refuse to start and turn a durability change into a boot failure.
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-fsync-typo.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "4096MB",
+      SWITCHROOM_HINDSIGHT_PG_FSYNC: "oon",
+    });
+    expect(r.status).toBe(0);
+    const argv = argvOf(log);
+    expect(argv).toContain("effective_cache_size=4096MB");
+    expect(argv.some((a) => a.startsWith("fsync="))).toBe(false);
+  }, 20_000);
+
+  it("accepts an upper-case ON, like the other knobs' sentinels", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const log = join(dir, "pg0-argv-fsync-upper.log");
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(log),
+      SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE: "",
+      SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: "",
+      SWITCHROOM_HINDSIGHT_PG_FSYNC: "ON",
+    });
+    expect(r.status).toBe(0);
+    expect(argvOf(log)).toContain("fsync=on");
   }, 20_000);
 
   it("`off` opts out ONE knob and leaves the other applied", async () => {
