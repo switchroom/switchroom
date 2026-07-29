@@ -68,6 +68,37 @@ When the canonical `switchroom/switchroom:main` is ready to ship:
 
 npm publishes come from the canonical repo only.
 
+#### Rolling a release back — on-disk state the newer build already wrote
+
+Rolling back the code does not roll back the JSON state files a running fleet
+has already written. Before downgrading a fleet, check whether the version you
+are leaving bumped an on-disk envelope, because a reader that cannot make sense
+of a file **loses whatever that file was remembering**.
+
+The pair that bites is the Telegram gateway's pin state, under
+`~/.switchroom/agents/<name>/telegram/`:
+
+- `status-pins.json` — the only record of which messages the gateway pinned.
+  Lose it and every pin the newer build took becomes a permanent orphan that
+  boot cleanup can never see again (#3957).
+- `stale-pin-sweep.json` — the durable sweep obligation ledger. Same hazard.
+
+Rules:
+
+- **Envelope bumps stay additive.** Every field added after `v: 1` is optional,
+  so a build that does not know the version can still validate rows
+  structurally — and both readers are deliberately version-TOLERANT: an unknown
+  `v` is read row by row, never discarded. A change that ever needs to be
+  non-additive must change the **filename**, not just `v`.
+- **One known-lossy hop exists and cannot be fixed retroactively:**
+  **v0.19.31+ → v0.19.30 or older.** `v: 4` was added by #3953 (shipped in
+  v0.19.31) and readers up to v0.19.30 only know v1–v3, so they fail open to
+  `[]` and drop every pin row. Version tolerance landed after v0.19.32, so it
+  protects the NEXT bump, not that one. If you must make that hop, drain the
+  pins first — stop the fleet on the newer build, let boot cleanup run, confirm
+  the file reads `{"v":4,"pins":[]}` — or expect to clear a handful of stale
+  pins by hand afterwards.
+
 ### 3. Local deploy (optional)
 
 If you maintain your own fleet of switchroom-managed agents on a personal

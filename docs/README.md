@@ -31,6 +31,7 @@ operators jump to **Operating**; contributors and reviewers use
 | [operators/rollback-v0.7.12.md](operators/rollback-v0.7.12.md) | Rollback runbook: v0.7.12 → v0.7.11. |
 | [scheduling.md](scheduling.md) | Scheduled tasks via the in-container scheduler sibling. |
 | [crash-reports.md](crash-reports.md) | What the watchdog records when it kills an agent. |
+| [operators/stale-pin-cleanup.md](operators/stale-pin-cleanup.md) | Clearing orphaned bot pins the automatic sweep deliberately cannot touch. |
 | [status-ask-cause-classes.md](status-ask-cause-classes.md) | Cause-class catalog for driving the status-ask rate to zero. |
 | [session-optimization.md](session-optimization.md) | Managing context/tokens in long-running agents. |
 | [sub-agents.md](sub-agents.md) | Sub-agent delegation ("Opus plans, Sonnet implements"). |

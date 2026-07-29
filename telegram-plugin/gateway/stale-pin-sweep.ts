@@ -20,6 +20,22 @@
  *     Drain progress is only ever concluded from OBSERVED STATE, never from an
  *     API result.
  *
+ * ── Two counters, one meaning each, on EVERY branch ──────────────────────────
+ *
+ * That invariant is only enforceable if the accounting keeps the two apart, so
+ * `SweepResult` carries both and every drain primitive populates both:
+ *
+ *   • `issued` — removal calls that went out unrejected. A claim. Credited
+ *     immediately, before any observation.
+ *   • `popped` — a `getChat` top that DEMONSTRABLY MOVED. Evidence. A LOWER
+ *     BOUND, credited only from an observation, never from a call.
+ *
+ * Neither branch is allowed its own dialect: a call-counted `popped` on one
+ * path and an observation-counted `popped` on another is how the next reader
+ * ends up trusting a number that was never evidence (#3955, #3956). `issued -
+ * popped` is the honest "went out, could not be verified" figure everywhere,
+ * and undercounting `popped` can only make the sweeper do less work.
+ *
  * ── The drain primitives, per chat class ─────────────────────────────────────
  *
  * ONE sweep path (`sweepTarget`) that owns eligibility, the rights precheck,
@@ -497,15 +513,38 @@ export type SweepStatus =
 
 export interface SweepResult {
   status: SweepStatus
-  /** Pops OBSERVED to have landed in THIS sweep (never counted from an API
-   *  result — see the module docblock). */
+  /**
+   * Pops OBSERVED to have landed in THIS sweep — never counted from an API
+   * result (see the module docblock).
+   *
+   * It is a LOWER BOUND, deliberately, and it means the same thing on EVERY
+   * drain branch: "a `getChat` top that demonstrably moved". Two structural
+   * reasons it can undercount, both safe:
+   *
+   *   • a removal aimed at a MID-STACK id changes nothing a bot can read, so it
+   *     is never creditable however well it worked (#3959);
+   *   • a sweep that exits between a removal and the read that would have
+   *     verified it (an unverifiable `getChat`) leaves that removal uncredited
+   *     rather than guessing (#3956).
+   *
+   * Undercounting can only make the sweeper do LESS work — `popped` drives the
+   * per-chat pop cap and telemetry, nothing else — whereas overcounting would
+   * launder the `ok:true` silent no-op into a success. Use {@link issued} for
+   * "how many removals went out"; the two are never the same number by design.
+   */
   popped: number
   /**
-   * Targeted unpins ISSUED in this sweep. Deliberately separate from `popped`:
-   * an unpin aimed at a mid-stack id has no observable effect on the only thing
-   * a bot can read (`getChat().pinned_message`, the top), so issuing one is not
-   * evidence it landed. Keeping the two apart is what stops the `ok:true`
-   * silent no-op from being laundered back into a success count.
+   * Pin-removal calls that WENT OUT and were not rejected — the DM repin+unpin
+   * loop's unpins, the group drain's targeted unpins, and the opt-in wholesale
+   * topic drain's single call. (Telegram's honest `message to unpin not found`
+   * counts too: it settles the id, it just does not move the top.)
+   * Deliberately separate from `popped`: a resolved call is a claim, not
+   * evidence — `unpinChatMessage` answers `ok:true` on a silent no-op, and a
+   * mid-stack removal has no read-back at all.
+   *
+   * Every branch populates it, so `issued - popped` is the honest "removals we
+   * could not verify" figure on any branch, and the two counters can never be
+   * conflated by a future reader.
    */
   issued?: number
   /** Detail for the log line. */
@@ -693,7 +732,10 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
   /**
    * The DM / opted-in-supergroup drain: RE-PIN the top then UNPIN it, which is
    * the only sequence that actually pops an entry, and re-read the observed top
-   * to decide whether anything moved. A resolved unpin is never counted.
+   * to decide whether anything moved. A resolved unpin is never counted as a
+   * pop — but it IS counted as `issued` the instant it resolves, so an exit
+   * taken before the verifying read reports "one removal, none verified"
+   * instead of silently reporting nothing at all (#3956).
    */
   const repinUnpinLoop = async (
     target: SweepTarget,
@@ -702,6 +744,7 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
   ): Promise<SweepResult> => {
     const gate = gateFor(kind)
     let popped = 0
+    let issued = 0
     let consecutiveFloods = 0
     let lastRetryAfter: number | null = null
     let noProgressAtSameRetryAfter = 0
@@ -710,6 +753,16 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
     // decided whether it actually did anything". A resolved unpin is a CLAIM,
     // never a pop.
     let unverifiedPop = false
+
+    /**
+     * EVERY exit from this loop goes through here, so the issued-vs-observed
+     * accounting cannot be dropped on any of its many early-return paths (#3956).
+     * A resolved unpin is credited to `issued` the moment it resolves; whether
+     * it also becomes a `popped` depends on a later observation that an
+     * interrupted sweep may never get to make. Reporting both is what keeps the
+     * unverified one visible instead of vanishing.
+     */
+    const out = (r: Omit<SweepResult, 'issued'>): SweepResult => ({ ...r, issued })
 
     /** Count a pop ONLY once the observed top has moved. */
     const creditPop = (): void => {
@@ -721,35 +774,35 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
 
     for (let i = 0; i < gate.maxPopsPerChatPerSweep; i++) {
       if (circuitOpen) {
-        return { status: 'aborted-circuit-breaker', popped, detail: 'breaker open' }
+        return out({ status: 'aborted-circuit-breaker', popped, detail: 'breaker open' })
       }
       const observed = await readTopVerified(target.chatId)
       if (observed == null) {
         // Ambiguous read (disagreeing reads or a throw). Not a drain, and NOT
         // an empty stack. Defer rather than assert either way.
-        return { status: 'incomplete', popped, detail: 'pin-stack read unverifiable' }
+        return out({ status: 'incomplete', popped, detail: 'pin-stack read unverifiable' })
       }
       if (unverifiedPop) {
         // THE bug this module exists for: `unpinChatMessage` resolves ok:true on
         // a stale entry and pops NOTHING. The same id still on top after a full
         // repin+unpin is proof the pop did not land, whatever the API answered.
         if (observed.top != null && observed.top === lastObservedTop) {
-          return {
+          return out({
             status: 'incomplete',
             popped,
             detail: `no progress: message ${observed.top} still on top after a repin+unpin`,
-          }
+          })
         }
         creditPop()
         unverifiedPop = false
       }
       if (observed.top == null) {
-        return { status: 'drained', popped }
+        return out({ status: 'drained', popped })
       }
       lastObservedTop = observed.top
 
       if (!(await awaitWriteSlot(kind))) {
-        return { status: 'deferred-budget', popped, detail: 'per-minute pin-op budget spent' }
+        return out({ status: 'deferred-budget', popped, detail: 'per-minute pin-op budget spent' })
       }
       try {
         await deps.pinSilent(target.chatId, observed.top)
@@ -757,9 +810,9 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
         const d = classify(err)
         if (d.kind === 'breaker') {
           circuitOpen = true
-          return { status: 'aborted-circuit-breaker', popped, detail: d.detail }
+          return out({ status: 'aborted-circuit-breaker', popped, detail: d.detail })
         }
-        if (d.kind === 'rights') return { status: 'skipped-no-rights', popped }
+        if (d.kind === 'rights') return out({ status: 'skipped-no-rights', popped })
         if (d.kind === 'flood') {
           consecutiveFloods++
           if (lastRetryAfter === d.seconds) noProgressAtSameRetryAfter++
@@ -769,22 +822,22 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
             consecutiveFloods >= MAX_CONSECUTIVE_FLOOD_WAITS ||
             noProgressAtSameRetryAfter >= MAX_IDENTICAL_RETRY_AFTER_NO_PROGRESS
           ) {
-            return {
+            return out({
               status: 'deferred-flood',
               popped,
               detail: `flood: ${consecutiveFloods} consecutive 429s, retry_after=${d.seconds}s`,
-            }
+            })
           }
           // Honour retry_after, then double it for the next one (3→6→12→24).
           await deps.sleep(d.seconds * 1000 * Math.pow(FLOOD_BACKOFF_FACTOR, consecutiveFloods - 1))
           continue
         }
-        return { status: 'error', popped, detail: d.detail }
+        return out({ status: 'error', popped, detail: d.detail })
       }
       // The unpin's RESULT is deliberately ignored — it resolves ok:true on a
       // silent no-op. Only the next observed top decides whether this popped.
       if (!(await awaitWriteSlot(kind))) {
-        return { status: 'deferred-budget', popped, detail: 'per-minute pin-op budget spent' }
+        return out({ status: 'deferred-budget', popped, detail: 'per-minute pin-op budget spent' })
       }
       try {
         await deps.unpin(target.chatId, observed.top)
@@ -792,10 +845,10 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
         const d = classify(err)
         if (d.kind === 'breaker') {
           circuitOpen = true
-          return { status: 'aborted-circuit-breaker', popped, detail: d.detail }
+          return out({ status: 'aborted-circuit-breaker', popped, detail: d.detail })
         }
-        if (d.kind === 'rights') return { status: 'skipped-no-rights', popped }
-        if (isNothingToUnpinError(err)) return { status: 'drained', popped }
+        if (d.kind === 'rights') return out({ status: 'skipped-no-rights', popped })
+        if (isNothingToUnpinError(err)) return out({ status: 'drained', popped })
         if (d.kind === 'flood') {
           consecutiveFloods++
           if (lastRetryAfter === d.seconds) noProgressAtSameRetryAfter++
@@ -805,18 +858,23 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
             consecutiveFloods >= MAX_CONSECUTIVE_FLOOD_WAITS ||
             noProgressAtSameRetryAfter >= MAX_IDENTICAL_RETRY_AFTER_NO_PROGRESS
           ) {
-            return {
+            return out({
               status: 'deferred-flood',
               popped,
               detail: `flood: ${consecutiveFloods} consecutive 429s, retry_after=${d.seconds}s`,
-            }
+            })
           }
           await deps.sleep(d.seconds * 1000 * Math.pow(FLOOD_BACKOFF_FACTOR, consecutiveFloods - 1))
           continue
         }
-        return { status: 'error', popped, detail: d.detail }
+        return out({ status: 'error', popped, detail: d.detail })
       }
       consecutiveFloods = 0
+      // The removal went out. It is `issued` NOW — unconditionally, before the
+      // observation that may or may not turn it into a `popped`. That ordering
+      // is the fix for #3956: an exit taken before the next verified read can
+      // no longer make this call disappear from the accounting.
+      issued++
       unverifiedPop = true
     }
 
@@ -824,12 +882,12 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
     // is the ONLY thing allowed to report `drained`.
     const finalRead = await readTopVerified(target.chatId)
     if (unverifiedPop && finalRead != null && finalRead.top !== lastObservedTop) creditPop()
-    if (finalRead != null && finalRead.top == null) return { status: 'drained', popped }
-    return {
+    if (finalRead != null && finalRead.top == null) return out({ status: 'drained', popped })
+    return out({
       status: 'deferred-budget',
       popped,
       detail: `hit the ${gate.maxPopsPerChatPerSweep}-pop cap for this chat; yielding to next boot`,
-    }
+    })
   }
 
   /**
@@ -962,6 +1020,16 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
    * place, which is why it is gated on {@link mayUnpinAllForumTopic}. A 429 here
    * is the pegged TDLib re-issue loop, so it is a give-up, not a backoff — see
    * the module docblock.
+   *
+   * Counting is the SAME contract as every other branch (#3955): the resolved
+   * call is one `issued`, and `popped` is credited only from a `getChat` top
+   * that demonstrably moved between the before- and after-reads. It is not a
+   * distinction without a difference here — the verb is topic-scoped while the
+   * only readable state is the CHAT-wide top, so a drained topic in a chat whose
+   * top belongs to another topic legitimately moves nothing. That is still a
+   * discharged obligation (`drained`), it is just not an observed pop, and
+   * crediting one would make this branch's `popped` a call counter wearing a
+   * pop counter's name.
    */
   const forumTopicDrain = async (
     target: SweepTarget,
@@ -969,10 +1037,22 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
   ): Promise<SweepResult> => {
     const threadId = target.threadId
     if (threadId == null) {
-      return { status: 'skipped-nothing-recorded', popped: 0, detail: 'no message_thread_id' }
+      return {
+        status: 'skipped-nothing-recorded',
+        popped: 0,
+        issued: 0,
+        detail: 'no message_thread_id',
+      }
     }
+    // Read BEFORE the write, so "did the top move?" is answerable afterwards.
+    const before = await readTopVerified(target.chatId)
     if (!(await awaitWriteSlot('forum-topic'))) {
-      return { status: 'deferred-budget', popped: 0, detail: 'per-minute pin-op budget spent' }
+      return {
+        status: 'deferred-budget',
+        popped: 0,
+        issued: 0,
+        detail: 'per-minute pin-op budget spent',
+      }
     }
     try {
       await deps.unpinAllForumTopicMessages(target.chatId, threadId)
@@ -980,9 +1060,9 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
       const d = classify(err)
       if (d.kind === 'breaker') {
         circuitOpen = true
-        return { status: 'aborted-circuit-breaker', popped: 0, detail: d.detail }
+        return { status: 'aborted-circuit-breaker', popped: 0, issued: 0, detail: d.detail }
       }
-      if (d.kind === 'rights') return { status: 'skipped-no-rights', popped: 0 }
+      if (d.kind === 'rights') return { status: 'skipped-no-rights', popped: 0, issued: 0 }
       if (d.kind === 'flood') {
         // DO NOT retry. `run_affected_history_query_until_complete` re-issues
         // the identical query while `!is_final_`, re-tripping the same server
@@ -990,35 +1070,60 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
         return {
           status: 'deferred-flood',
           popped: 0,
+          issued: 0,
           detail: `unpinAllForumTopicMessages pegged at retry_after=${d.seconds}s; not looping`,
         }
       }
-      return { status: 'error', popped: 0, detail: d.detail }
+      return { status: 'error', popped: 0, issued: 0, detail: d.detail }
     }
-    cursor.popped++
-    cursor.updatedAt = deps.now()
-    commit(cursor)
+    // The call resolved: that is exactly ONE issued removal, and — per the
+    // module invariant — no evidence of anything at all. Only the read below
+    // may credit a pop, and only the durable counter it credits is `popped`.
     const observed = await readTopVerified(target.chatId)
-    if (observed != null && observed.top == null) return { status: 'drained', popped: 1 }
+    const topMoved =
+      before != null && observed != null && observed.top !== before.top ? 1 : 0
+    if (topMoved > 0) {
+      cursor.popped += topMoved
+      cursor.updatedAt = deps.now()
+      commit(cursor)
+    }
+    if (observed != null && observed.top == null) {
+      return { status: 'drained', popped: topMoved, issued: 1 }
+    }
     // The chat-wide stack may legitimately still hold pins belonging to OTHER
     // topics — the topic-scoped verb only drains this one. That is a success
     // for this obligation, not an incomplete drain.
-    return { status: 'drained', popped: 1, detail: 'topic drained; chat-wide stack may hold other topics' }
+    return {
+      status: 'drained',
+      popped: topMoved,
+      issued: 1,
+      detail: 'topic drained; chat-wide stack may hold other topics',
+    }
   }
 
   const sweepOnce = async (target: SweepTarget): Promise<SweepResult> => {
-    if (!deps.eligible()) return { status: 'skipped-not-eligible', popped: 0 }
+    if (!deps.eligible()) return { status: 'skipped-not-eligible', popped: 0, issued: 0 }
     if (circuitOpen) {
-      return { status: 'aborted-circuit-breaker', popped: 0, detail: 'breaker already open' }
+      return {
+        status: 'aborted-circuit-breaker',
+        popped: 0,
+        issued: 0,
+        detail: 'breaker already open',
+      }
     }
     const kind = classifyChatForSweep(target)
     const cursor = loadCursor(target, kind)
-    if (cursor.done) return { status: 'already-drained', popped: 0 }
+    if (cursor.done) return { status: 'already-drained', popped: 0, issued: 0 }
     // Attempt budget exhausted: a permanently-undrainable chat (bot kicked,
     // rights revoked, a chat that flood-waits forever) must not re-burn the pop
     // budget on every boot for the rest of time.
     if (cursor.attempts >= SWEEP_MAX_ATTEMPTS) {
-      return { status: 'forfeited', popped: 0, detail: `${cursor.attempts} attempts exhausted` }
+      return {
+        status: 'forfeited',
+        popped: 0,
+        issued: 0,
+        detail: `${cursor.attempts} attempts exhausted`,
+      }
     }
 
     // RIGHTS PRECHECK, before ANY write, in every group. A bot without
@@ -1037,7 +1142,7 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
         cursor.lastStatus = 'skipped-no-rights'
         cursor.updatedAt = deps.now()
         commit(cursor)
-        return { status: 'skipped-no-rights', popped: 0 }
+        return { status: 'skipped-no-rights', popped: 0, issued: 0 }
       }
     }
 
@@ -1078,7 +1183,7 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
             : await targetedUnpinDrain(target, kind, cursor, ids)
       }
     } catch (err) {
-      result = { status: 'error', popped: 0, detail: (err as Error).message }
+      result = { status: 'error', popped: 0, issued: 0, detail: (err as Error).message }
     }
 
     // `skipped-nothing-recorded` discharges the obligation too: there is no id
@@ -1134,8 +1239,12 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
     // Not eligible yet ⇒ nothing was attempted, so do NOT consume the one
     // allowed attempt: the boot sweep must still get its turn once the mutex
     // is won.
-    if (!deps.eligible()) return Promise.resolve({ status: 'skipped-not-eligible', popped: 0 })
-    if (attempted.has(key)) return Promise.resolve({ status: 'already-attempted', popped: 0 })
+    if (!deps.eligible()) {
+      return Promise.resolve({ status: 'skipped-not-eligible', popped: 0, issued: 0 })
+    }
+    if (attempted.has(key)) {
+      return Promise.resolve({ status: 'already-attempted', popped: 0, issued: 0 })
+    }
     attempted.add(key)
     const p = sweepOnce(target).finally(() => inFlight.delete(key))
     inFlight.set(key, p)

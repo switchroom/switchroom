@@ -117,19 +117,43 @@ export interface PersistedStatusPin {
  *  re-fail on every boot forever. */
 export const BOOT_UNPIN_MAX_ATTEMPTS = 5
 
-/** Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
- *  pin (pending undefined). v2 adds the optional `pending` flag. v3 adds the
- *  optional `pinnedAt` claim timestamp (#3810). v4 adds the optional `threadId`
- *  so the claim is keyed by (chat, thread) and a forum topic can be drained
- *  after a crash. All load fail-open — an unknown/newer version yields [].
- *  Every field added since v1 is optional, so the versions are mutually
- *  readable and a downgrade degrades rather than breaks. */
+/**
+ * Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
+ * pin (pending undefined). v2 adds the optional `pending` flag. v3 adds the
+ * optional `pinnedAt` claim timestamp (#3810). v4 adds the optional `threadId`
+ * so the claim is keyed by (chat, thread) and a forum topic can be drained
+ * after a crash.
+ *
+ * ── The bump rule, which the reader depends on (#3957) ───────────────────────
+ *
+ * EVERY field added since v1 is OPTIONAL, and every future bump must keep that
+ * property. That is what makes the versions mutually readable in both
+ * directions, and {@link loadStatusPins} now cashes it in: an envelope whose
+ * version this build does not know is still READ, row by row, through the same
+ * structural validator. Rows it cannot validate are dropped; rows it can are
+ * kept.
+ *
+ * Why that matters more than it looks: this file is the boot cleanup's only
+ * record of which messages the gateway pinned. A reader that discarded the
+ * whole file on an unfamiliar version turned every pin taken by the newer build
+ * into a permanent orphan the moment an operator rolled back — manufacturing
+ * exactly the bug this subsystem exists to prevent. Degrading (keep what
+ * validates) is strictly safer than failing open to `[]` here, because the
+ * fail-open outcome is not "do nothing", it is "forget an obligation".
+ *
+ * A bump that ever needs to be NON-additive — a field whose absence changes the
+ * meaning of a row — must therefore change the FILENAME, not just `v`, so old
+ * readers see "no file" rather than misreading rows. Do not quietly break the
+ * additive rule and leave `v` to carry it.
+ */
 interface SnapshotEnvelope {
-  v: 1 | 2 | 3 | 4
+  v: number
   pins: PersistedStatusPin[]
 }
 
-const SNAPSHOT_VERSIONS = new Set([1, 2, 3, 4])
+/** The version THIS build writes. Reading is deliberately version-tolerant
+ *  (see above); only the writer is pinned. */
+const SNAPSHOT_VERSION = 4
 
 function isPinRow(x: unknown): x is PersistedStatusPin {
   if (x == null || typeof x !== 'object') return false
@@ -153,6 +177,13 @@ function isPinRow(x: unknown): x is PersistedStatusPin {
  * file (fail-open to empty: a corrupt snapshot must never crash boot — worst
  * case an orphaned pin isn't cleaned up this boot, strictly no worse than the
  * pre-persistence behaviour).
+ *
+ * An UNRECOGNISED envelope version is NOT malformed and does not fail open
+ * (#3957). Any positive-integer `v` with an array of `pins` is read, and each
+ * row is kept iff {@link isPinRow} can structurally validate it. A row written
+ * by a newer build therefore survives a downgrade instead of being discarded
+ * into a permanent orphan — see the {@link SnapshotEnvelope} bump rule for the
+ * additive-fields property this relies on.
  */
 export function loadStatusPins(
   path: string,
@@ -173,7 +204,9 @@ export function loadStatusPins(
   }
   if (parsed == null || typeof parsed !== 'object') return []
   const env = parsed as Record<string, unknown>
-  if (typeof env.v !== 'number' || !SNAPSHOT_VERSIONS.has(env.v) || !Array.isArray(env.pins)) return []
+  // Version-TOLERANT, structurally strict: an unknown `v` still yields the rows
+  // that validate. Only a shape that is not an envelope at all fails open.
+  if (!Number.isInteger(env.v) || (env.v as number) < 1 || !Array.isArray(env.pins)) return []
   return env.pins.filter(isPinRow)
 }
 
@@ -189,7 +222,7 @@ export function persistStatusPins(
   snapshot: readonly PersistedStatusPin[],
   log: (line: string) => void = (l) => process.stderr.write(l),
 ): void {
-  const env: SnapshotEnvelope = { v: 4, pins: [...snapshot] }
+  const env: SnapshotEnvelope = { v: SNAPSHOT_VERSION, pins: [...snapshot] }
   const tmp = path + '.tmp'
   try {
     fs.writeFileSync(tmp, JSON.stringify(env))

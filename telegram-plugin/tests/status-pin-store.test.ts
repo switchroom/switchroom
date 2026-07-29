@@ -116,12 +116,15 @@ describe("status-pin-store", () => {
     expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
-  it("fail-open: wrong envelope version / shape loads as []", () => {
-    // v5 is an unknown FUTURE version (v1–v4 are the supported set).
-    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 5, pins: [pin()] }) });
+  it("fail-open: a shape that is not an envelope at all loads as []", () => {
+    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 1, pins: "nope" }) });
     expect(loadStatusPins(PATH, f1)).toEqual([]);
-    const { fs: f2 } = memFs({ [PATH]: JSON.stringify({ v: 1, pins: "nope" }) });
+    const { fs: f2 } = memFs({ [PATH]: JSON.stringify({ pins: [pin()] }) });
     expect(loadStatusPins(PATH, f2)).toEqual([]);
+    const { fs: f3 } = memFs({ [PATH]: JSON.stringify({ v: "4", pins: [pin()] }) });
+    expect(loadStatusPins(PATH, f3)).toEqual([]);
+    const { fs: f4 } = memFs({ [PATH]: JSON.stringify({ v: 0, pins: [pin()] }) });
+    expect(loadStatusPins(PATH, f4)).toEqual([]);
   });
 
   it("drops malformed rows but keeps valid ones", () => {
@@ -604,8 +607,61 @@ describe("status-pin-store — envelope version compat", () => {
     expect(loadStatusPins(PATH, fs)).toHaveLength(1);
   });
 
-  it("rejects an unknown future envelope version (fail-open [])", () => {
-    const { fs } = memFs({ [PATH]: JSON.stringify({ v: 5, pins: [pin()] }) });
+  /**
+   * #3957 — a DOWNGRADE must degrade, not discard.
+   *
+   * The pre-#3953 reader has already shipped, so the v3→v4 case can never be
+   * retroactively fixed; this pins the forward-looking half so the NEXT bump
+   * behaves. A build that does not know the envelope version still reads every
+   * row it can structurally validate — because for THIS file "discard" is not
+   * "do nothing", it is "forget which messages we pinned", which turns every
+   * pin the newer build took into a permanent orphan.
+   */
+  it("reads an unknown FUTURE envelope version, keeping every row it can validate", () => {
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 99,
+        pins: [
+          // A future row: known fields valid, plus a field this build has never
+          // heard of. Kept — unknown fields are additive by the bump rule.
+          { ...pin({ messageId: 715 }), someFutureField: "v99" },
+          { pinKey: "k", chatId: "c", messageId: "not-a-number" }, // still dropped
+        ],
+      }),
+    });
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].messageId).toBe(715);
+  });
+
+  it("a rolled-back build still UNPINS the orphans a newer build recorded (#3957)", async () => {
+    // The outcome that matters: not "the rows parse" but "the boot cleanup can
+    // still reach them". Against the fail-open reader this unpins nothing.
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 99,
+        pins: [
+          { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, unknownV99: 1 },
+          { pinKey: "wk:agent-x", chatId: "-100999", messageId: 42 },
+        ],
+      }),
+    });
+
+    const unpinned: Array<[string, number]> = [];
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async (chatId, messageId) => {
+        unpinned.push([chatId, messageId]);
+      },
+      log: () => {},
+    });
+
+    expect(unpinned).toEqual([
+      ["-100123", 715],
+      ["-100999", 42],
+    ]);
+    expect(res.cleared).toBe(2);
     expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
