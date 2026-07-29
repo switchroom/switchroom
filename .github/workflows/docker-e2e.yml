@@ -120,8 +120,16 @@ jobs:
             # "No test files found". Without this entry the structural
             # anchor/negative guards would be skipped for exactly the change
             # they exist to police. The hindsight-probe job runs them.
+            #
+            # hindsight-pg-fsync-probe.test.ts boots the REAL entrypoint in the
+            # real image, so its inputs are the entrypoint and the module that
+            # supplies its env — both listed, or a PR that turned fsync back off
+            # would get no probe run until the merge queue.
             hindsight:
               - 'docker/Dockerfile.hindsight'
+              - 'docker/hindsight-entrypoint.sh'
+              - 'src/setup/hindsight-pg-defaults.ts'
+              - 'tests/docker/hindsight-pg-fsync-probe.test.ts'
               - 'tests/docker/hindsight-search-patches.test.ts'
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
@@ -389,10 +397,26 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-reflect-directives-patch.test.ts
 
+      - name: Run the embedded-postgres fsync probe (RED/GREEN, must not skip)
+        # NOT a patch probe: this one boots the REAL docker/hindsight-entrypoint.sh
+        # inside the pinned image and reads `SHOW fsync` off the server it
+        # started. pg0 launches postgres with `-F` (fsync OFF), which is how an
+        # HNSW index on memory_units silently corrupted on 2026-07-29 after one
+        # of the container's 6-20 daily unclean shutdowns — data_checksums
+        # cannot see a lost write. The entrypoint overrides it with a trailing
+        # `-c fsync=on`, and whether postgres HONOURS that over pg0's earlier
+        # `-F` is a property of a pinned third-party binary, not of this repo:
+        # every unit-level test stays green if pg0 reorders its argv or starts
+        # writing postgresql.conf. Only this step sees it. Both arms run, so a
+        # probe that stopped observing the real server cannot pass.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-pg-fsync-probe.test.ts
+
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

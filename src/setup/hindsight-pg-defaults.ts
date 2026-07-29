@@ -1,5 +1,6 @@
 /**
- * Embedded-PostgreSQL (pg0) sizing defaults for the hindsight container.
+ * Embedded-PostgreSQL (pg0) sizing and durability defaults for the hindsight
+ * container.
  *
  * ## Why this file exists
  *
@@ -32,6 +33,14 @@
  * before `exec`ing the upstream CMD, and hindsight_api adopts the running,
  * tuned instance. This module is the single, testable source of the values
  * that entrypoint receives.
+ *
+ * Note the `-F` in that argv — pg0 runs PostgreSQL with **fsync disabled**.
+ * That is a durability defect rather than a tuning choice, and it is fixed
+ * through the same mechanism; see {@link HINDSIGHT_PG_DEFAULT_FSYNC}. `-F` is
+ * positional and always precedes the merged `-c` block, and postgres applies
+ * command-line options in order, so a later `-c fsync=on` wins — verified on a
+ * throwaway pg0 instance from the same image (2026-07-29):
+ * `pg_settings` reported `fsync | on | command line`.
  *
  * Verified live that pg0 **merges** operator `-c` flags over its own defaults
  * rather than replacing them: a probe instance started with
@@ -204,14 +213,69 @@ export const HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE_ENV =
 export const HINDSIGHT_PG_SHARED_BUFFERS_ENV = "SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS";
 
 /**
- * The pg0 sizing defaults, in the order the entrypoint receives them.
+ * Env var carrying `fsync`. Only the literal `on` (any case) applies the flag;
+ * anything else — including `off` — leaves pg0's `-F` standing.
+ */
+export const HINDSIGHT_PG_FSYNC_ENV = "SWITCHROOM_HINDSIGHT_PG_FSYNC";
+
+/**
+ * `fsync` — pg0's default is **off**, via the positional `-F` it bakes into
+ * the `postgres` argv.
+ *
+ * ## Why this is not a tuning knob
+ *
+ * The other two values in this module are performance trade-offs. This one is
+ * a correctness property that pg0's default silently gives away.
+ *
+ * With `fsync=off` PostgreSQL never forces WAL or data pages to stable
+ * storage, so an unclean stop can leave a page that was never actually
+ * written while the WAL believes it was. `data_checksums` does not catch
+ * that: the stale page checksums *correctly*. It is a lost write, not a
+ * corrupt one. Recovery completes, the server reports healthy, and the damage
+ * is silent.
+ *
+ * ## The observed failure
+ *
+ * The live `switchroom-hindsight` container logs 6–20 "database system was not
+ * properly shut down; automatic recovery in progress" events per day
+ * (`postgresql-2026-07-2[6789].log`: 8 / 20 / 6 / 6). On 2026-07-29 one of
+ * them — `04:14:29 performing immediate shutdown because data directory lock
+ * file is invalid` — preceded, by ~13 minutes, silent corruption of an HNSW
+ * vector index on `memory_units` in the `overlord` bank. Consolidation for
+ * that bank wedged for ~2.5 hours behind ~38,000 queued memories, and
+ * `data_checksums` (which is on) reported nothing — exactly as the mechanism
+ * above predicts. `REINDEX INDEX CONCURRENTLY` repaired it.
+ *
+ * **This addresses the loss, not the restarts.** What is stopping PostgreSQL
+ * that often is a separate question, tracked separately; `fsync=on` only makes
+ * those stops survivable.
+ *
+ * ## Cost
+ *
+ * Measured on a throwaway pg0 instance from the same image against a
+ * `memory_units`-shaped table (220k rows, 384-dim vectors, 88 partial HNSW
+ * indexes) under a retain+consolidate pgbench workload: 30–55% fewer
+ * transactions per second depending on concurrency. Real, and paid against a
+ * workload whose measured demand is single-digit writes per second, which the
+ * fsync=on arm clears by more than an order of magnitude.
+ */
+export const HINDSIGHT_PG_DEFAULT_FSYNC = "on";
+
+/**
+ * The pg0 pre-start defaults, in the order the entrypoint receives them.
  *
  * Deliberately NOT capability-gated. Unlike the GPU / local-LLM knobs in
- * hindsight-perf-defaults.ts, these two are sized against
+ * hindsight-perf-defaults.ts, the two sizing values are derived from
  * `HINDSIGHT_DEFAULT_MEM_LIMIT` — a value switchroom itself sets on every
- * host — so the "capability" is already proven by construction. The runtime
- * safety property is the entrypoint's fallback instead: a pre-start that
- * cannot apply the values leaves the container running pg0's own defaults.
+ * host — so the "capability" is already proven by construction, and `fsync`
+ * has no capability to gate on at all. The runtime safety property is the
+ * entrypoint's fallback instead: a pre-start that cannot apply the values
+ * leaves the container running pg0's own defaults.
+ *
+ * `fsync` also carries a hard-coded `on` default *inside the entrypoint*, so
+ * durability does not depend on this array having been emitted by a new-enough
+ * switchroom. The entry here exists so an operator has a documented,
+ * overridable key, and so the compose file states the property explicitly.
  */
 export const HINDSIGHT_PG_DEFAULTS: ReadonlyArray<readonly [string, string]> = [
   [
@@ -219,6 +283,7 @@ export const HINDSIGHT_PG_DEFAULTS: ReadonlyArray<readonly [string, string]> = [
     pgMib(HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB),
   ],
   [HINDSIGHT_PG_SHARED_BUFFERS_ENV, pgMib(HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB)],
+  [HINDSIGHT_PG_FSYNC_ENV, HINDSIGHT_PG_DEFAULT_FSYNC],
 ];
 
 /**

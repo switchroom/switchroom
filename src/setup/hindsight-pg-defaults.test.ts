@@ -34,8 +34,10 @@ import {
   HINDSIGHT_PG_APP_ANON_MIB,
   HINDSIGHT_PG_DEFAULTS,
   HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB,
+  HINDSIGHT_PG_DEFAULT_FSYNC,
   HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB,
   HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE_ENV,
+  HINDSIGHT_PG_FSYNC_ENV,
   HINDSIGHT_PG_ENV_KEYS,
   HINDSIGHT_PG_MEM_LIMIT_MIB_FOR_DERIVATION,
   HINDSIGHT_PG_PAGE_CACHE_FLOOR_MIB,
@@ -250,13 +252,14 @@ describe("resolveHindsightPgOverrides", () => {
 
 // ── the emitted pairs ─────────────────────────────────────────────────────
 describe("hindsightPgEnv", () => {
-  it("emits both knobs, in MB form, with switchroom's defaults", () => {
+  it("emits every knob, in MB form, with switchroom's defaults", () => {
     expect(hindsightPgEnv()).toEqual([
       [
         HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE_ENV,
         pgMib(HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB),
       ],
       [HINDSIGHT_PG_SHARED_BUFFERS_ENV, pgMib(HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB)],
+      [HINDSIGHT_PG_FSYNC_ENV, HINDSIGHT_PG_DEFAULT_FSYNC],
     ]);
   });
 
@@ -367,11 +370,45 @@ describe("pg0 sizing reaches the container on both launch paths", () => {
     // rename on either side is a silent no-op tuning change, which is the
     // worst failure mode available here — everything still boots, nothing is
     // tuned. Assert the contract on the real script text.
+    //
+    // `:-` with ANY word is accepted because the entrypoint carries its own
+    // default for fsync (`${…:-on}`) — see the fsync test below, which pins
+    // that default rather than leaving it to this pattern.
     const script = readFileSync(ENTRYPOINT, "utf-8");
     for (const key of HINDSIGHT_PG_ENV_KEYS) {
-      expect(script, `${key} is emitted but never read by the entrypoint`).toContain(
-        `\${${key}:-}`,
+      expect(script, `${key} is emitted but never read by the entrypoint`).toMatch(
+        new RegExp(`\\$\\{${key}:-[a-z]*\\}`),
       );
     }
+  });
+
+  // ── fsync: a correctness property, not a tuning knob ────────────────────
+  //
+  // pg0 starts postgres with `-F` (fsync OFF). Under that setting an unclean
+  // stop can lose a write that `data_checksums` still validates, which is how
+  // an HNSW index on `memory_units` silently corrupted on 2026-07-29 (see the
+  // HINDSIGHT_PG_DEFAULT_FSYNC docblock). The effective-outcome guard is
+  // tests/docker/hindsight-pg-fsync-probe.test.ts, which boots the real image
+  // and reads `SHOW fsync`; these two pin the halves that feed it.
+
+  it("ships fsync=on by default on BOTH launch paths", () => {
+    startHindsight();
+    expect(runEnv(runArgs()).get(HINDSIGHT_PG_FSYNC_ENV)).toEqual(["on"]);
+    expect(composeEnv(generateHindsightComposeSnippet()).get(HINDSIGHT_PG_FSYNC_ENV)).toEqual([
+      "on",
+    ]);
+    // Pinned literally as well as by reference: the entrypoint only applies
+    // the flag for the exact token `on`, so renaming the constant's value to
+    // anything else silently reverts to pg0's `-F`.
+    expect(HINDSIGHT_PG_DEFAULT_FSYNC).toBe("on");
+  });
+
+  it("the entrypoint defaults fsync ON even when switchroom emits nothing", () => {
+    // Durability must not depend on a new-enough switchroom CLI: an operator
+    // on an older `switchroom apply`, or running the image by hand, still has
+    // to get a crash-safe database. That is why the entrypoint carries its
+    // own `:-on`, unlike the two sizing knobs which default to empty.
+    const script = readFileSync(ENTRYPOINT, "utf-8");
+    expect(script).toContain(`PG_FSYNC="\${${HINDSIGHT_PG_FSYNC_ENV}:-on}"`);
   });
 });
