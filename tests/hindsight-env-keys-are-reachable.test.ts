@@ -71,6 +71,13 @@ describe("promoted container-env keys are reachable from switchroom.yaml", () =>
     // stated reason the resolvers are scoped rather than a blanket passthrough.
     const DERIVED = new Set([
       "HINDSIGHT_API_PORT",
+      // The `--network host` bind address (hindsightHostNetworkBindEnvPairs).
+      // Deliberately NOT an operator knob: the hindsight API is tokenless, so
+      // this loopback pin is the only thing keeping every agent's memory bank
+      // off the LAN and the tailnet under host networking, where `-p` is inert.
+      // A `hindsight.env` line that could set it to 0.0.0.0 would be a
+      // footgun with no legitimate use on a single-host fleet.
+      "HINDSIGHT_API_HOST",
       "HINDSIGHT_API_LLM_PROVIDER",
       "HINDSIGHT_API_LLM_MODEL",
       "HINDSIGHT_API_WORKER_ID",
