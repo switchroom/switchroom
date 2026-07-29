@@ -76,6 +76,7 @@ import { renderFleetDefaultsClaudeMd } from "../agents/fleet-defaults.js";
 import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
 import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
+import { resolveSelfInvocation, type SelfInvokeProbe } from "./self-invoke.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { LITELLM_MASTER_KEY_STATE_BASENAME } from "../litellm/external-spend.js";
 import { writeComposeFile, computeComposeContent, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
@@ -2686,14 +2687,21 @@ export const SELF_ELEVATE_PRESERVED_ENV = [
  *   - process.execPath is the absolute path to bun/node, so sudo's
  *     secure PATH doesn't matter for the interpreter.
  *   - process.argv[1] is the absolute path to dist/cli/switchroom.js
- *     under both `bun run dev` and a global install.
+ *     under both `bun run dev` and a global install — but NOT under a
+ *     `bun build --compile` static binary, where it is the virtual
+ *     `/$bunfs/root/...` bundle path and process.execPath is the binary
+ *     itself. Forwarding the bunfs path there makes sudo run
+ *     `switchroom /$bunfs/root/switchroom-linux-amd64 apply` and
+ *     commander rejects it as an unknown command (#3963). The split is
+ *     resolved by {@link resolveSelfInvocation}.
  */
-export function buildSelfElevateArgv(): string[] {
+export function buildSelfElevateArgv(probe: SelfInvokeProbe = {}): string[] {
   const passthrough = process.argv.slice(2);
+  const self = resolveSelfInvocation(probe);
   return [
     `--preserve-env=${SELF_ELEVATE_PRESERVED_ENV.join(",")}`,
-    process.execPath,
-    process.argv[1] ?? "",
+    self.command,
+    ...self.prefixArgs,
     ...passthrough,
     "--skip-self-elevate",
   ];

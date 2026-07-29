@@ -55,6 +55,7 @@ import {
   recoverPinJournal,
 } from "./rollout-pin-journal.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import { resolveSelfInvocation } from "./self-invoke.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
@@ -1602,6 +1603,9 @@ export function createRolloutDeps(params: {
   configPath: string;
   scriptPath: string;
   hostdCtx: boolean;
+  /** `process.execPath`. Injected in tests so the compiled-binary
+   *  self-invocation shape (#3963) is assertable without a real binary. */
+  execPath?: string;
   /** Injected in tests; defaults to node's `spawnSync`. */
   spawn?: RolloutSpawnSync;
   /** Injected in tests; defaults to process.stderr. */
@@ -1610,6 +1614,14 @@ export function createRolloutDeps(params: {
   const { configPath, scriptPath, hostdCtx } = params;
   const spawn = (params.spawn ?? (spawnSync as unknown as RolloutSpawnSync));
   const warn = params.warn ?? ((line: string) => process.stderr.write(line));
+  // #3963: a `bun build --compile` binary is its OWN entrypoint — passing
+  // its bunfs bundle path as argv[1] makes commander read it as the
+  // subcommand and every step of the roll dies with `unknown command
+  // '/$bunfs/root/switchroom-linux-amd64'`. See ./self-invoke.ts.
+  const self = resolveSelfInvocation({
+    execPath: params.execPath ?? process.execPath,
+    scriptPath,
+  });
 
   /**
    * One-shot `docker …` bounded by {@link ROLLOUT_PROBE_TIMEOUT_MS}.
@@ -1708,7 +1720,7 @@ export function createRolloutDeps(params: {
 
   return {
     run: (args, opts) => {
-      const r = spawn(process.execPath, [scriptPath, ...args], {
+      const r = spawn(self.command, [...self.prefixArgs, ...args], {
         stdio: "inherit",
         // #3333 amendment C: layer the per-invocation env (the scoped-sweep
         // flag on the canary spawn) onto the inherited environment.
@@ -2025,7 +2037,11 @@ export function registerRolloutCommand(program: Command): void {
       }
 
       const configPath = getConfigPath(program);
-      const scriptPath = process.argv[1] ?? "switchroom";
+      // Empty (not "switchroom") on the degenerate no-argv[1] path:
+      // resolveSelfInvocation then falls back to a bare `switchroom` on
+      // $PATH instead of passing the literal string as argv[1] to the
+      // interpreter, which could never have worked.
+      const scriptPath = process.argv[1] ?? "";
       const deps = createRolloutDeps({ configPath, scriptPath, hostdCtx });
 
       process.stdout.write(

@@ -68,6 +68,7 @@ import {
 } from "./skill-common.js";
 import { loadConfig } from "../config/loader.js";
 import { withConfigError } from "./helpers.js";
+import { selfInvokeArgv } from "./self-invoke.js";
 import chalk from "chalk";
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -654,13 +655,12 @@ export function registerSkillCommand(program: Command): void {
         // Run switchroom apply to materialise symlinks for opt-in agents.
         // Best-effort: failure here doesn't roll back the write (the file
         // is in the pool; the operator can re-run apply manually).
-        const applyBin = process.argv[1] ?? "switchroom";
+        // #3963: a compiled static binary is its own entrypoint — argv[1]
+        // is a virtual `/$bunfs/root/...` path there, and process.argv0 is
+        // not a reliable interpreter path either. See ./self-invoke.ts.
+        const self = selfInvokeArgv(["apply", "--non-interactive"]);
         console.log(chalk.gray(`Running \`switchroom apply --non-interactive\`...`));
-        const r = spawnSync(
-          process.argv0,
-          [applyBin, "apply", "--non-interactive"],
-          { stdio: "inherit" },
-        );
+        const r = spawnSync(self.command, self.argv, { stdio: "inherit" });
         if (r.status !== 0) {
           console.error(
             chalk.yellow(

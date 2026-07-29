@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { loadConfig } from "../config/loader.js";
 import { resolvePath } from "../config/loader.js";
+import { resolveSelfInvocation } from "./self-invoke.js";
 import {
   statusViaBroker,
   lockViaBroker,
@@ -242,11 +243,14 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
       } else {
         // Detached mode (v0.6 host/systemd): spawn a background
         // process and exit.
-        const self = process.argv[1];
         const args = ["vault", "broker", "start", "--foreground"];
         if (parentOpts.config) args.unshift("--config", parentOpts.config);
 
-        const child = spawn(process.execPath, [self, ...args], {
+        // #3963: under a compiled static binary the entrypoint is the
+        // binary itself — argv[1] is a virtual bunfs path that commander
+        // would read as the subcommand. See ./self-invoke.ts.
+        const self = resolveSelfInvocation();
+        const child = spawn(self.command, [...self.prefixArgs, ...args], {
           detached: true,
           stdio: "ignore",
         });
