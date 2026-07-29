@@ -73,6 +73,15 @@ interface FakeOpts {
   pinErrors?: (unknown | null)[]
   /** Errors to throw from `unpinAllForumTopicMessages`, consumed in order. */
   unpinAllErrors?: (unknown | null)[]
+  /**
+   * Ids `unpinAllForumTopicMessages` removes. Undefined = the whole stack.
+   *
+   * The verb is TOPIC-scoped while `getChat` exposes the CHAT-wide top, so a
+   * successful topic drain routinely leaves pins belonging to other topics —
+   * including the one on top — untouched. That is exactly the case where a
+   * call-counted `popped` and an observation-counted `popped` disagree.
+   */
+  unpinAllTopicRemoves?: number[]
   canPin?: boolean
   /** Throws from `getChat`, consumed in order (null = normal read). */
   getChatErrors?: (unknown | null)[]
@@ -114,7 +123,14 @@ function fakeChat(o: FakeOpts) {
       calls.push(`unpinAllTopic:${threadId}`)
       const err = unpinAllErrors.shift()
       if (err != null) throw err
-      stack.length = 0
+      if (o.unpinAllTopicRemoves == null) {
+        stack.length = 0
+      } else {
+        for (const id of o.unpinAllTopicRemoves) {
+          const at = stack.indexOf(id)
+          if (at >= 0) stack.splice(at, 1)
+        }
+      }
       return { ok: true }
     },
     canPinInChat: async () => {
@@ -268,6 +284,32 @@ describe('stale-pin sweep — draining a stacked chat', () => {
     const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
     expect(res.status).toBe('incomplete')
     expect(h.fake.stack).toEqual([41])
+  })
+
+  it('does not lose an unpin that landed after the verifying read went dark (#3956)', async () => {
+    // Sequence: read/read agree on 61 → repin 61 → unpin 61 (it really pops) →
+    // the read that WOULD have verified it throws, so the sweep exits early.
+    //
+    // `popped` must stay 0 — the module never credits an unobserved pop — but
+    // the removal must not vanish from the accounting either: it is reported as
+    // one `issued`, which is what makes the ledger's "went out, unverified"
+    // figure honest instead of silently short by one.
+    const h = harness({ stack: [61, 62], getChatErrors: [null, null, new Error('ETIMEDOUT')] })
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
+
+    expect(res.status).toBe('incomplete')
+    // The pop DID happen in the chat — this is not a hypothetical loss.
+    expect(h.fake.stack).toEqual([62])
+    expect(res.popped).toBe(0)
+    expect(res.issued).toBe(1)
+  })
+
+  it('reports issued alongside popped on a clean DM drain', async () => {
+    const h = harness({ stack: [71, 72] })
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
+    expect(res.status).toBe('drained')
+    expect(res.popped).toBe(2)
+    expect(res.issued).toBe(2)
   })
 
   it('accepts Telegram\'s honest empty-stack signal from unpin', async () => {
@@ -446,6 +488,38 @@ describe('stale-pin sweep — forum topics', () => {
     expect(res.status).toBe('deferred-flood')
     expect(h.fake.calls.filter((c) => c === 'unpinAllTopic:77')).toHaveLength(1)
     expect(h.sleeps).not.toContain(3000) // it did not even back off — it gave up
+  })
+
+  it('credits the wholesale drain a POP only when the observed top moved (#3955)', async () => {
+    // A real, ordinary shape: the topic drain clears THIS topic's pins (202)
+    // while the chat-wide top (201) belongs to another topic and survives. The
+    // obligation IS discharged, but nothing observable moved — so this is one
+    // `issued`, zero `popped`. Counting the call as a pop would give the forum
+    // branch a different meaning for `popped` than every other branch has.
+    const h = harness({
+      stack: [201, 202],
+      allowUnpinAllForumTopic: true,
+      unpinAllTopicRemoves: [202],
+    })
+    const res = await createStalePinSweeper(h.deps).sweepTarget(topic)
+
+    expect(h.fake.calls.filter((c) => c === 'unpinAllTopic:77')).toHaveLength(1)
+    expect(res.status).toBe('drained')
+    expect(res.issued).toBe(1)
+    expect(res.popped).toBe(0)
+    // …and the durable counter did not inherit the call count either.
+    expect(h.cursors()[0].popped).toBe(0)
+  })
+
+  it('credits the wholesale drain a pop when the top DID move', async () => {
+    const h = harness({ stack: [211, 212], allowUnpinAllForumTopic: true })
+    const res = await createStalePinSweeper(h.deps).sweepTarget(topic)
+
+    expect(h.fake.stack).toEqual([])
+    expect(res.status).toBe('drained')
+    expect(res.issued).toBe(1)
+    expect(res.popped).toBe(1)
+    expect(h.cursors()[0].popped).toBe(1)
   })
 
   it('routes the wholesale-drain policy through ONE predicate', () => {
@@ -702,6 +776,37 @@ describe('stale-pin sweep — eligibility and durable resume', () => {
     h.fs.files.set(h.path, '{ not json')
     const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
     expect(res.status).toBe('drained')
+  })
+
+  it('still honours an obligation written by a NEWER build (#3957)', async () => {
+    // Downgrade case. A ledger the running build does not recognise must not be
+    // silently thrown away: for an obligation ledger, "discard" means "forget
+    // an obligation", which re-creates the orphan the sweep exists to clear.
+    // Here the newer build already discharged this target — a version-
+    // intolerant reader would re-drain a chat it had no business touching.
+    const h = harness({ stack: [241] })
+    h.fs.files.set(
+      h.path,
+      JSON.stringify({
+        v: 99,
+        cursors: [
+          {
+            chatId: DM,
+            kind: 'dm',
+            popped: 3,
+            done: true,
+            attempts: 1,
+            updatedAt: 1,
+            futureFieldFromV99: 'x',
+          },
+        ],
+      }),
+    )
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
+
+    expect(res.status).toBe('already-drained')
+    expect(h.fake.calls.filter((c) => c.startsWith('unpin:'))).toHaveLength(0)
+    expect(h.fake.stack).toEqual([241])
   })
 
   it('never lets a failing ledger write break the sweep', async () => {

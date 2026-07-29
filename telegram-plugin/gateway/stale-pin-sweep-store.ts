@@ -102,12 +102,20 @@ export interface SweepStoreFsSeam {
   existsSync: (path: string) => boolean
 }
 
+/**
+ * Envelope. Same bump rule as `status-pin-store.ts` (#3957): every field added
+ * after v1 is OPTIONAL, and the reader is version-TOLERANT so a row written by
+ * a newer build survives a downgrade rather than being discarded. Discarding is
+ * not "do nothing" for an obligation ledger — it forgets an obligation, which
+ * is precisely the orphaned-pin failure this module exists to close.
+ */
 interface SweepEnvelope {
-  v: 1
+  v: number
   cursors: SweepCursor[]
 }
 
-const SWEEP_ENVELOPE_VERSIONS = new Set([1])
+/** The version THIS build writes. Only the writer is pinned; see above. */
+const SWEEP_ENVELOPE_VERSION = 1
 
 /** Stable identity of a sweep target: chat plus topic (topic-less = `-`). */
 export function sweepTargetKey(chatId: string, threadId?: number): string {
@@ -153,11 +161,9 @@ export function loadSweepCursors(path: string, fs: SweepStoreFsSeam): SweepCurso
   }
   if (parsed == null || typeof parsed !== 'object') return []
   const env = parsed as Record<string, unknown>
-  if (
-    typeof env.v !== 'number' ||
-    !SWEEP_ENVELOPE_VERSIONS.has(env.v) ||
-    !Array.isArray(env.cursors)
-  ) {
+  // Version-TOLERANT, structurally strict — see {@link SweepEnvelope}. An
+  // unknown `v` still yields the cursor rows that validate.
+  if (!Number.isInteger(env.v) || (env.v as number) < 1 || !Array.isArray(env.cursors)) {
     return []
   }
   return env.cursors.filter(isCursorRow)
@@ -174,7 +180,7 @@ export function persistSweepCursors(
   cursors: readonly SweepCursor[],
   log: (line: string) => void = (l) => process.stderr.write(l),
 ): void {
-  const env: SweepEnvelope = { v: 1, cursors: [...cursors] }
+  const env: SweepEnvelope = { v: SWEEP_ENVELOPE_VERSION, cursors: [...cursors] }
   try {
     fs.writeFileSync(path, JSON.stringify(env))
   } catch (err) {
