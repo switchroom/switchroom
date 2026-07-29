@@ -1316,6 +1316,53 @@ export function hindsightNeedsHostNetwork(
 }
 
 /**
+ * Address the hindsight API binds under `--network host`.
+ *
+ * The hindsight API is **TOKENLESS** — no auth, no securitySchemes, every
+ * bank readable and writable by anyone who can open the socket. On the bridge
+ * path that is contained by publishing `127.0.0.1:<port>:8888`, but
+ * `--network host` makes docker ignore `-p` entirely, so the `-p` flags are
+ * not a control there: the only thing standing between the fleet's memory and
+ * the LAN/tailnet is the address the application itself binds. The image
+ * defaults to `0.0.0.0`.
+ */
+export const HINDSIGHT_HOST_NETWORK_BIND_ADDR = "127.0.0.1";
+
+/**
+ * THE bind pins every `--network host` hindsight launch must carry.
+ *
+ * Under host networking the container has no netns of its own, so the
+ * listener's address and port are host-visible facts rather than
+ * container-internal ones, and `-p` publishing (the bridge path's loopback
+ * containment) is silently ignored by docker. Every host-network path —
+ * `startHindsight`'s docker-run argv and the compose snippet alike — takes
+ * its bind from here so the containment cannot be present on one and
+ * forgotten on the other. Emitting it from the branches themselves is exactly
+ * how the API ended up answering unauthenticated on `0.0.0.0:18888`.
+ */
+export function hindsightHostNetworkBindEnvPairs(
+  apiPort: number,
+): Array<[string, string]> {
+  return [
+    // Bind loopback only. See HINDSIGHT_HOST_NETWORK_BIND_ADDR: the API has no
+    // auth, so a 0.0.0.0 bind on the host stack publishes every agent's memory
+    // bank to the LAN and the tailnet.
+    ["HINDSIGHT_API_HOST", HINDSIGHT_HOST_NETWORK_BIND_ADDR],
+    // HINDSIGHT_API_PORT is the only port knob the upstream config.py
+    // recognizes; the CP service has no equivalent env var override. Without
+    // it the image default 8888 binds on the shared host stack.
+    ["HINDSIGHT_API_PORT", String(apiPort)],
+    // The CP dashboard's dataplane calls resolve `localhost:<port>` against
+    // host-bound listeners. The image default is `http://localhost:8888`, but
+    // 8888 is where we MOVED OFF (squatted by an unrelated container → the
+    // dashboard's data calls 502 while the API is healthy on the API port).
+    // Pin it to the SAME port the API actually binds so it tracks any
+    // auto-bump instead of the stale 8888 default.
+    ["HINDSIGHT_CP_DATAPLANE_API_URL", `http://localhost:${apiPort}`],
+  ];
+}
+
+/**
  * Whether hindsight's LLM traffic terminates on a self-hosted endpoint.
  *
  * The capability gate for the LLM concurrency caps (see
@@ -1784,11 +1831,18 @@ export function hindsightContainerEnvPairs(opts: {
     pairs.push(["ANTHROPIC_MODEL", llmModel]);
   }
 
+  // Host-network mode: the container shares the host network stack so
+  // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how agent
+  // containers work — and, because `--network host` makes docker IGNORE `-p`,
+  // the listener's address and port become the container's own business. Both
+  // come from ONE helper, emitted from the single `hindsightNeedsHostNetwork`
+  // test, so no launch path can pick up host networking without also picking
+  // up the loopback bind. See {@link hindsightHostNetworkBindEnvPairs}.
+  if (hindsightNeedsHostNetwork(llm, litellm)) {
+    pairs.push(...hindsightHostNetworkBindEnvPairs(apiPort));
+  }
+
   if (litellm) {
-    // Host-network mode: the container shares the host network stack so
-    // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
-    // agent containers work. Explicit port env vars preserve the same
-    // external ports (18888/19999) the operator is used to.
     const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
     // Claude models ride the Anthropic pass-through (<root>/anthropic,
     // raw byte-forward, OAuth) — the model-mapped route re-chunks the SSE
@@ -1800,18 +1854,6 @@ export function hindsightContainerEnvPairs(opts: {
       ? `${litellmRoot}/anthropic`
       : litellmRoot;
     pairs.push(
-      // HINDSIGHT_API_PORT is the only port knob the upstream config.py
-      // recognizes; the CP service has no equivalent env var override.
-      ["HINDSIGHT_API_PORT", String(apiPort)],
-      // In host-network mode the container shares the host's network stack,
-      // so the CP dashboard's dataplane calls resolve `localhost:<port>`
-      // against host-bound listeners. The image default for the dataplane
-      // URL is `http://localhost:8888`, but 8888 is where we MOVED OFF (it's
-      // squatted on this host by an unrelated container → the dashboard's
-      // data calls 502 while the API is healthy on the API port). Pin the CP
-      // dataplane URL to the SAME port the API actually binds so it tracks
-      // any auto-bump instead of the stale 8888 default.
-      ["HINDSIGHT_CP_DATAPLANE_API_URL", `http://localhost:${apiPort}`],
       // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
       // consolidation/reflect calls hit the proxy for spend tracking.
       ["ANTHROPIC_BASE_URL", anthropicBaseUrl],
@@ -1819,14 +1861,6 @@ export function hindsightContainerEnvPairs(opts: {
         "ANTHROPIC_CUSTOM_HEADERS",
         `x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
       ],
-    );
-  } else if (hindsightNeedsHostNetwork(llm, litellm)) {
-    // When only per-op loopback bases forced host net (no full litellm cfg),
-    // still pin API/CP ports the way the litellm branch does — otherwise the
-    // image default 8888 binds on the shared host stack.
-    pairs.push(
-      ["HINDSIGHT_API_PORT", String(apiPort)],
-      ["HINDSIGHT_CP_DATAPLANE_API_URL", `http://localhost:${apiPort}`],
     );
   }
 
@@ -1932,12 +1966,20 @@ export function startHindsight(
   ];
 
   if (hindsightNeedsHostNetwork(llm, litellm)) {
-    // Host network: ports are published directly (no -p flags). Required so
-    // loopback LiteLLM (127.0.0.1:4010) is reachable from the container.
+    // Host network: ports are published directly (no -p flags — docker ignores
+    // them under `--network host`). Required so loopback LiteLLM
+    // (127.0.0.1:4010) is reachable from the container.
     args.push("--network", "host");
-    // (The API/CP port pins that host-network mode needs are emitted by
-    // hindsightContainerEnvPairs — see its host-network branch.)
+    // Because `-p` is inert here, the loopback containment the bridge branch
+    // below gets from `-p 127.0.0.1:...` has to come from the application's
+    // own bind address instead: HINDSIGHT_API_HOST=127.0.0.1, emitted with the
+    // API/CP port pins by hindsightContainerEnvPairs →
+    // hindsightHostNetworkBindEnvPairs. Without it the TOKENLESS API answers
+    // on 0.0.0.0 across the LAN and tailnet.
   } else {
+    // Bridge: bind to 127.0.0.1 on the host side only — the hindsight API is
+    // TOKENLESS, so publishing on 0.0.0.0 would expose the unauthenticated
+    // MCP/REST surface to the network.
     args.push(
       "-p", `127.0.0.1:${apiPort}:8888`,
       "-p", `127.0.0.1:${uiPort}:9999`,
@@ -2345,14 +2387,15 @@ export function generateHindsightComposeSnippet(
     // Mirror of the docker-run path: with the claude-code provider, pin
     // ANTHROPIC_MODEL to the same model for the underlying claude subprocess.
     ...(llmProvider === "claude-code" ? [`      - ANTHROPIC_MODEL=${llmModel}`] : []),
-    // Host-network: API binds HINDSIGHT_API_PORT on the shared host stack
-    // (and CP dataplane must track it so it doesn't hit squatted 8888).
-    // Bridge: API binds image-default 8888 inside the container netns.
+    // Host-network: the API binds HINDSIGHT_API_HOST:HINDSIGHT_API_PORT on the
+    // shared host stack (and CP dataplane must track the port so it doesn't hit
+    // squatted 8888). Taken from the SAME helper the docker-run path uses so
+    // the tokenless API cannot end up loopback-bound on one launch path and
+    // 0.0.0.0-bound on the other.
+    // Bridge: the API binds image-default 8888 inside the container netns, and
+    // the `ports:` mapping below is what confines it to host loopback.
     ...(hostNetwork
-      ? [
-          `      - HINDSIGHT_API_PORT=${apiPort}`,
-          `      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${apiPort}`,
-        ]
+      ? hindsightHostNetworkBindEnvPairs(apiPort).map(([k, v]) => `      - ${k}=${v}`)
       : [`      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888`]),
   ];
   // Optional LiteLLM proxy env (ANTHROPIC_BASE_URL + spend-tag headers) —
