@@ -24,6 +24,7 @@ import {
   FALLBACK_TOOL_TABLE,
   TOOLS_CACHE_FILENAME,
   SHIM_SUPPORTED_PROTOCOL_VERSIONS,
+  SYNTHESIZED_TOOL_NAMES,
   type ShimOptions,
 } from "../src/cli/hindsight-mcp-shim.js";
 
@@ -205,7 +206,15 @@ describe("tools/list with backend down", () => {
 
     const res = await shim.handle(rpc(3, "tools/list") as never);
     expect(res?.error).toBeUndefined();
-    expect(res?.result).toEqual(cached);
+    // The cached BACKEND manifest is served verbatim; the shim-synthesized
+    // directive tools ride on top. They don't depend on the backend at all, so
+    // an agent must not lose the retirement path just because memory is down.
+    const { tools } = res?.result as { tools: { name: string }[] };
+    expect(tools.map((t) => t.name)).toEqual([
+      "recall",
+      ...SYNTHESIZED_TOOL_NAMES,
+    ]);
+    expect(tools[0]).toEqual(cached.tools[0]);
   });
 
   it("serves the static fallback manifest on first boot (no cache)", async () => {
@@ -218,7 +227,12 @@ describe("tools/list with backend down", () => {
     for (const required of ["recall", "retain", "sync_retain", "reflect", "create_directive"]) {
       expect(names).toContain(required);
     }
-    expect(tools.length).toBe(Object.keys(FALLBACK_TOOL_TABLE).length);
+    for (const synthesized of SYNTHESIZED_TOOL_NAMES) {
+      expect(names).toContain(synthesized);
+    }
+    expect(tools.length).toBe(
+      Object.keys(FALLBACK_TOOL_TABLE).length + SYNTHESIZED_TOOL_NAMES.length,
+    );
   });
 });
 
@@ -298,8 +312,14 @@ describe("with the backend up", () => {
 
     const res = await shim.handle(rpc(5, "tools/list") as never);
     const { tools } = res?.result as { tools: { name: string }[] };
-    expect(tools.map((t) => t.name)).toEqual(["fresh_tool"]);
+    expect(tools.map((t) => t.name)).toEqual([
+      "fresh_tool",
+      ...SYNTHESIZED_TOOL_NAMES,
+    ]);
 
+    // The CACHE is a record of upstream truth only — the synthesized tools are
+    // layered on at serve time, never baked into the file, so a later shim
+    // version that retires them can't be haunted by a stale cache.
     const persisted = JSON.parse(
       readFileSync(join(cacheDir, TOOLS_CACHE_FILENAME), "utf-8"),
     ) as { tools: { name: string }[] };
