@@ -9,6 +9,11 @@
  * whole transcripts, p50 ~98 KB. At the recommended 15-minute cadence that
  * is 4 requests an hour against a backend whose own workers issue thousands
  * — the watchdog cannot itself become the load.
+ *
+ * Plus three read-only `docker exec` psql calls (measured live 2026-07-29):
+ * the consolidation queue depth, the per-bank consolidation block (0.284 s for
+ * a grouped aggregate over 676,720 memory units), and the HNSW canary (0.45 s
+ * across all 89 indexes). None of the three writes anything.
  */
 
 import { spawnSync } from "node:child_process";
@@ -28,8 +33,16 @@ import {
   DEFAULT_METRICS_URL,
   METRICS_MAX_BYTES,
   METRICS_TIMEOUT_MS,
+  VECTOR_INDEX_SAMPLE_ROWS,
 } from "./thresholds.js";
-import type { ConsolidationSample, Sample } from "./types.js";
+import type {
+  BankFailureStreak,
+  BankPendingConsolidation,
+  BankSample,
+  ConsolidationSample,
+  Sample,
+  VectorIndexSample,
+} from "./types.js";
 
 /**
  * A probe failed in a way that means the watchdog CANNOT SEE hindsight. It
@@ -325,7 +338,7 @@ export interface ProbeOptions {
  * container's own environment and never crosses back out — the only thing
  * this returns is two integers.
  */
-const CONSOLIDATION_QUEUE_SH = `
+const PSQL_BOOTSTRAP_SH = `
 set -e
 B="$(ls -d /home/hindsight/.pg0/installation/*/bin 2>/dev/null | head -1)"
 PSQL="$(command -v psql 2>/dev/null || echo "\${B:-/nonexistent}/psql")"
@@ -342,9 +355,150 @@ d=json.load(open(sys.argv[1]))
 q=lambda k,dflt: shlex.quote(str(d.get(k) or dflt))
 print("U=%s DB=%s P=%s PW=%s"%(q("username","hindsight"),q("database","hindsight"),q("port",5432),q("password","")))' "$D")"
 [ -n "$PW" ] || exit 0
+`;
+
+const CONSOLIDATION_QUEUE_SH = `${PSQL_BOOTSTRAP_SH}
 PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
   "SELECT count(*)||'|'||coalesce(max(extract(epoch from (now()-created_at)))::bigint,0) FROM async_operations WHERE status IN ('pending','processing')"
 `;
+
+/**
+ * Per-bank consolidation facts: terminal-failure STREAKS and unconsolidated
+ * DEPTH, in one psql pass.
+ *
+ * Two tagged sections on stdout, so one round trip answers both signals:
+ *
+ *   `S|<bank>|<operation_type>|<streak>|<newest_failure_age_seconds>`
+ *   `P|<bank>|<pending_consolidation>`
+ *
+ * ### The streak query
+ *
+ * A streak is the `status='failed'` rows NEWER than that
+ * `(bank_id, operation_type)` pair's most recent `status='completed'` row.
+ * Three properties, each load-bearing:
+ *
+ *  - **`completed` breaks a streak; `pending`/`processing` do not.** A row
+ *    that has not reached a terminal state is not evidence the fault is over,
+ *    and letting an in-flight attempt clear the streak would blind the signal
+ *    for exactly as long as the next attempt takes to fail.
+ *  - **Grouped by the PAIR, not the bank.** During the incident `overlord`
+ *    completed 3,753 retains while its consolidation failed 112 times; a
+ *    bank-wide streak would have been reset by every one of them.
+ *  - **`-infinity` for a pair that has never completed.** `coalesce` to a
+ *    finite date would silently window the count; a pair whose very first
+ *    op failed must still register a streak.
+ *
+ * ### The depth query
+ *
+ * `count(*) FILTER (WHERE consolidated_at IS NULL AND fact_type IN
+ * ('experience','world'))` per bank — the same predicate the API's
+ * `get_bank_freshness` uses for the `pending_consolidation` field it
+ * publishes on `/v1/default/banks/{bank}/stats`. Computed here rather than
+ * fetched over N HTTP calls: measured 0.284 s for the whole fleet, against
+ * ~1.4-2.1 s PER BANK for the `/stats` endpoint.
+ */
+const BANK_CONSOLIDATION_SH = `${PSQL_BOOTSTRAP_SH}
+PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
+  "SELECT 'S|'||a.bank_id||'|'||a.operation_type||'|'||count(*)||'|'||extract(epoch from (now()-max(a.created_at)))::bigint
+     FROM async_operations a
+    WHERE a.status = 'failed'
+      AND a.created_at > coalesce((SELECT max(b.created_at) FROM async_operations b
+                                    WHERE b.bank_id = a.bank_id
+                                      AND b.operation_type = a.operation_type
+                                      AND b.status = 'completed'), '-infinity'::timestamptz)
+    GROUP BY a.bank_id, a.operation_type
+    UNION ALL
+   SELECT 'P|'||m.bank_id||'|'||count(*) FILTER (WHERE m.consolidated_at IS NULL AND m.fact_type IN ('experience','world'))
+     FROM memory_units m
+    GROUP BY m.bank_id"
+`;
+
+/**
+ * The HNSW nearest-neighbour canary.
+ *
+ * ### Why a NN probe is the only option
+ *
+ * `amcheck` has no HNSW support, so there is no verifier for these indexes
+ * short of scanning one. A corrupt index raises `different vector dimensions
+ * 384 and 0` when the scan reaches the damaged node — and nothing else in the
+ * system notices, because `memory_units.embedding` is `vector(384)` and the
+ * table itself is clean (0 rows with `vector_dims(embedding) <> 384`).
+ *
+ * ### THE GOTCHA — `count(nn)`, never `count(*)`
+ *
+ * The probe aggregates over the correlated subquery's RESULT. Aggregate over
+ * `*` instead and the planner elides the subquery entirely: the probe then
+ * costs nothing, touches no index, raises nothing, and PASSES. Verified live
+ * on the production database, same statement both ways:
+ *
+ *   count(nn) → `Index Scan using idx_mu_emb_obsv_81cef5f6a42e4b4d`,
+ *               `SubPlan 1`, 9.6 ms
+ *   count(*)  → bare `Aggregate`, no `SubPlan`, no index scan, 0.8 ms
+ *
+ * `probeVectorIndexes` re-asserts this on the SQL text before running it, so
+ * the elision cannot be reintroduced by an edit that still type-checks.
+ *
+ * ### Why the predicate is spliced verbatim
+ *
+ * The per-bank partial indexes are `WHERE fact_type = '…' AND bank_id = '…'`.
+ * The planner will only choose a partial index when it can prove the
+ * predicate, which it cannot do against a correlated column reference — the
+ * first draft of this probe correlated `m2.bank_id = s.bank_id` and the
+ * planner silently fell back to the single global index, leaving all 88
+ * partial ones unprobed. Splicing `pg_get_expr(indpred, indrelid)` — the
+ * predicate Postgres itself stores — is what makes the probe hit the index it
+ * names. It is not user input: it comes out of the catalog.
+ *
+ * ### Why a DO block
+ *
+ * One subtransaction per index, each with its own `EXCEPTION` handler, so a
+ * corrupt index is REPORTED BY NAME and the sweep continues to the next one
+ * instead of aborting at the first fault. The result comes back as a single
+ * `RAISE NOTICE` (psql writes notices to stderr, so the call redirects
+ * `2>&1`) because a `DO` block cannot return rows.
+ *
+ * Prints one `VECIDX|<probed>|<corrupt_count>|<name=err;…>` line.
+ */
+function vectorIndexSh(sampleRows: number): string {
+  // The only caller-controlled value that reaches the SQL text. Clamped to a
+  // positive integer so it can only ever be a `LIMIT` operand — the index
+  // names and predicates around it come from the catalog, not from input.
+  const limit = Math.max(1, Math.floor(Number.isFinite(sampleRows) ? sampleRows : 1));
+  return `${PSQL_BOOTSTRAP_SH}
+PGPASSWORD="$PW" PGOPTIONS='-c client_min_messages=notice' \\
+  "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc "
+DO \\$\\$
+DECLARE r record; bad text := ''; n int := 0; probed int := 0;
+BEGIN
+  FOR r IN
+    SELECT c.relname AS idx,
+           i.indrelid::regclass::text AS tbl,
+           coalesce(pg_get_expr(i.indpred, i.indrelid), 'true') AS pred
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_am am ON am.oid = c.relam
+     WHERE am.amname = 'hnsw'
+     ORDER BY c.relname
+  LOOP
+    BEGIN
+      EXECUTE format(
+        'SELECT count(nn) FROM (SELECT (SELECT m2.ctid FROM %1\\$s m2 WHERE %2\\$s ORDER BY m2.embedding <=> s.embedding LIMIT 1) AS nn FROM (SELECT embedding FROM %1\\$s s0 WHERE %2\\$s AND embedding IS NOT NULL LIMIT %3\\$s) s) t',
+        r.tbl, r.pred, ${limit});
+      probed := probed + 1;
+    EXCEPTION WHEN others THEN
+      n := n + 1;
+      -- Both delimiters are stripped from the message BEFORE it is appended.
+      -- ';' separates entries and a newline would split the NOTICE line, so an
+      -- SQLERRM containing either would desynchronise the parsed list from n,
+      -- and probeVectorIndexes rejects a mismatched block as unreadable —
+      -- turning a real corruption into a silent no-data.
+      bad := bad || r.idx || '=' || translate(SQLERRM, ';' || chr(10) || chr(13), ',  ') || ';';
+    END;
+  END LOOP;
+  RAISE NOTICE 'VECIDX|%|%|%', probed, n, bad;
+END \\$\\$;" 2>&1
+`;
+}
 
 /**
  * Read the `async_operations` backlog, or null when it cannot be read.
@@ -369,6 +523,93 @@ export function probeConsolidationQueue(
   if (!Number.isFinite(pending) || !Number.isFinite(oldestAgeS)) return null;
   if (pending < 0 || oldestAgeS < 0) return null;
   return { pending, oldestAgeS };
+}
+
+/**
+ * Read the per-bank consolidation block, or null when it cannot be read.
+ *
+ * Soft-fails for the same reason `probeConsolidationQueue` does: psql and the
+ * pg descriptor legitimately do not exist off-host, and throwing would make
+ * the whole watchdog unrunnable in CI or on a laptop. Null degrades exactly
+ * the two per-bank signals to `no-data` — inert, visible, never a pass.
+ *
+ * A single unparseable LINE is skipped rather than nulling the block: a
+ * bank id containing a `|` would otherwise take the whole signal down. A
+ * block with NO parseable line at all is null, because "the query returned
+ * nothing we understood" is not the same as "the fleet is clean".
+ */
+export function probeBankConsolidation(
+  container: string = DEFAULT_CONTAINER,
+  run: Runner = defaultRunner,
+): BankSample | null {
+  const r = run("docker", ["exec", container, "sh", "-c", BANK_CONSOLIDATION_SH]);
+  if (r.status !== 0) return null;
+  const streaks: BankFailureStreak[] = [];
+  const pending: BankPendingConsolidation[] = [];
+  let parsedAny = false;
+  for (const line of r.stdout.split("\n")) {
+    const t = line.trim();
+    if (t === "") continue;
+    const f = t.split("|");
+    if (f[0] === "S" && f.length === 5) {
+      const streak = Number(f[3]);
+      const age = Number(f[4]);
+      if (!Number.isFinite(streak) || !Number.isFinite(age) || streak < 0 || age < 0) continue;
+      streaks.push({ bank: f[1], operationType: f[2], streak, newestFailureAgeS: age });
+      parsedAny = true;
+    } else if (f[0] === "P" && f.length === 3) {
+      const n = Number(f[2]);
+      if (!Number.isFinite(n) || n < 0) continue;
+      pending.push({ bank: f[1], pending: n });
+      parsedAny = true;
+    }
+  }
+  // A live fleet always has at least one bank, so zero parseable rows means
+  // the query did not run the way we think it did — report blindness, not
+  // health.
+  if (!parsedAny) return null;
+  return { streaks, pending };
+}
+
+/**
+ * Scan every HNSW index with a nearest-neighbour probe. Null when it could
+ * not run — soft-fail, exactly like the two probes above.
+ *
+ * The `count(nn)` assertion below is a DETERMINISTIC guard, not a comment: an
+ * edit that switches the aggregate back to `count(*)` makes the planner elide
+ * the correlated subquery, and the probe would then pass on a corrupt index
+ * forever with no observable difference. Refusing to run at all is loud;
+ * running and silently checking nothing is the failure mode this whole PR
+ * exists to remove.
+ */
+export function probeVectorIndexes(
+  container: string = DEFAULT_CONTAINER,
+  run: Runner = defaultRunner,
+  sampleRows: number = VECTOR_INDEX_SAMPLE_ROWS,
+): VectorIndexSample | null {
+  const sh = vectorIndexSh(sampleRows);
+  if (!sh.includes("count(nn)")) return null;
+  const r = run("docker", ["exec", container, "sh", "-c", sh]);
+  if (r.status !== 0) return null;
+  const line = r.stdout.split("\n").find((l) => l.includes("VECIDX|"));
+  if (line === undefined) return null;
+  const f = line.slice(line.indexOf("VECIDX|")).trim().split("|");
+  if (f.length < 4) return null;
+  const probed = Number(f[1]);
+  const count = Number(f[2]);
+  if (!Number.isFinite(probed) || !Number.isFinite(count) || probed < 0 || count < 0) return null;
+  // Re-join the tail: an SQLERRM can itself contain `|`.
+  const corrupt = f
+    .slice(3)
+    .join("|")
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  // The reported count and the parsed list must agree, or we do not know what
+  // we are looking at. Trust the COUNT — it is what the database said — and
+  // treat a mismatch as unreadable rather than under-reporting corruption.
+  if (corrupt.length !== count) return null;
+  return { probed, corrupt };
 }
 
 /** Run every probe into one sample. A core-probe failure throws a ProbeError. */
@@ -400,6 +641,8 @@ export async function probeOnce(
     throw new ProbeError(`reading recall logs: ${(e as Error).message}`, "spool");
   }
   const consolidation = probeConsolidationQueue(opts.container, opts.run);
+  const banks = probeBankConsolidation(opts.container, opts.run);
+  const vectorIndex = probeVectorIndexes(opts.container, opts.run);
   return {
     sample: {
       ts,
@@ -418,6 +661,8 @@ export async function probeOnce(
       health: container.health,
       recall,
       consolidation,
+      banks,
+      vectorIndex,
     },
     spool,
     recall,

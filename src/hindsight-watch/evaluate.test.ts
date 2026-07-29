@@ -259,9 +259,11 @@ describe("evaluateAll", () => {
   it("returns one verdict per level/edge signal", () => {
     const verdicts = evaluateAll([sample(0), sample(1)]);
     expect(verdicts.map((v) => v.signal).sort()).toEqual([
+      "consolidation-failure-streak",
       "consolidation-queue-age",
       "container",
       "llm-fallback-ineffective",
+      "pending-consolidation-depth",
       "recall-candidate-floor",
       "recall-injected-score",
       "recall-own-bank-timeout",
@@ -269,6 +271,7 @@ describe("evaluateAll", () => {
       "retain-failure-rate",
       "retain-loss",
       "retain-queue-growth",
+      "vector-index-corruption",
     ]);
   });
 
@@ -383,5 +386,166 @@ describe("evaluateLlmFallback", () => {
 
   it("reports no-data when the exposition carries no LLM counter at all", () => {
     expect(evaluateLlmFallback([sample(0), sample(1)]).state).toBe("no-data");
+  });
+});
+
+// ── the three signals added for the 2026-07-29 consolidation outage ──────
+
+import {
+  evaluateConsolidationFailureStreak,
+  evaluatePendingConsolidationDepth,
+  evaluateVectorIndexCorruption,
+} from "./evaluate.js";
+import {
+  CONSOLIDATION_FAILURE_STREAK_PAGE,
+  CONSOLIDATION_FAILURE_STREAK_WARN,
+  CONSOLIDATION_STREAK_RECENCY_S,
+  PENDING_CONSOLIDATION_FLOOR,
+} from "./thresholds.js";
+import type { BankSample } from "./types.js";
+
+function banks(over: Partial<BankSample> = {}): BankSample {
+  return { streaks: [], pending: [], ...over };
+}
+
+describe("evaluateConsolidationFailureStreak — the signal that was missing", () => {
+  it("FIRES on the live incident shape: 103 consecutive failures, EMPTY pending queue", () => {
+    // The exact row read off production during the incident:
+    //   overlord | consolidation | 103 | 668
+    // …while `consolidation` (pending/processing) was 0.
+    const ring = [
+      sample(0, {
+        consolidation: { pending: 0, oldestAgeS: 0 },
+        banks: banks({ streaks: [{ bank: "overlord", operationType: "consolidation", streak: 103, newestFailureAgeS: 668 }] }),
+      }),
+    ];
+    const v = evaluateConsolidationFailureStreak(ring);
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("page");
+    expect(v.measured?.bank).toBe("overlord");
+    expect(v.measured?.streak).toBe(103);
+
+    // …and the pre-existing signal, on the SAME window, reports health. If
+    // this ever stops being true the blind spot was fixed elsewhere and this
+    // test should be re-derived, not deleted.
+    const old = evaluateConsolidationQueueAge(ring);
+    expect(old.state).toBe("ok");
+    expect(old.detail).toContain("consolidation queue empty");
+  });
+
+  it("warns at the threshold and pages at the page line", () => {
+    const at = (streak: number) =>
+      evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({ streaks: [{ bank: "b", operationType: "consolidation", streak, newestFailureAgeS: 60 }] }),
+        }),
+      ]);
+    expect(at(CONSOLIDATION_FAILURE_STREAK_WARN - 1).state).toBe("ok");
+    expect(at(CONSOLIDATION_FAILURE_STREAK_WARN).state).toBe("breach");
+    expect(at(CONSOLIDATION_FAILURE_STREAK_WARN).severity).toBe("warn");
+    expect(at(CONSOLIDATION_FAILURE_STREAK_PAGE).severity).toBe("page");
+  });
+
+  it("scores the PAIR, not the bank — successful retains must not mask a wedged consolidator", () => {
+    // During the incident `overlord` completed 3,753 retains while its
+    // consolidation failed 112 times. A bank-wide streak would read 0.
+    const v = evaluateConsolidationFailureStreak([
+      sample(0, {
+        banks: banks({
+          streaks: [
+            { bank: "overlord", operationType: "consolidation", streak: 112, newestFailureAgeS: 90 },
+            // `retain` has no streak at all — it keeps completing.
+          ],
+        }),
+      }),
+    ]);
+    expect(v.state).toBe("breach");
+    expect(v.measured?.operationType).toBe("consolidation");
+  });
+
+  it("ignores a STALE streak — a fixed-but-idle bank must not alert for ever", () => {
+    const v = evaluateConsolidationFailureStreak([
+      sample(0, {
+        banks: banks({
+          streaks: [
+            {
+              bank: "overlord",
+              operationType: "consolidation",
+              streak: 500,
+              newestFailureAgeS: CONSOLIDATION_STREAK_RECENCY_S + 1,
+            },
+          ],
+        }),
+      }),
+    ]);
+    expect(v.state).toBe("ok");
+  });
+
+  it("reports no-data — never a pass — when the per-bank block is missing", () => {
+    expect(evaluateConsolidationFailureStreak([sample(0)]).state).toBe("no-data");
+    expect(evaluateConsolidationFailureStreak([sample(0, { banks: null })]).state).toBe("no-data");
+  });
+});
+
+describe("evaluatePendingConsolidationDepth — growth, not absolute depth", () => {
+  const window = (from: Array<[string, number]>, to: Array<[string, number]>) => [
+    sample(0, { banks: banks({ pending: from.map(([b, n]) => ({ bank: b, pending: n })) }) }),
+    sample(8, { banks: banks({ pending: to.map(([b, n]) => ({ bank: b, pending: n })) }) }),
+  ];
+
+  it("FIRES and PAGES on the incident's growth (0 → 38,130 in one window)", () => {
+    const v = evaluatePendingConsolidationDepth(window([["overlord", 0]], [["overlord", 38130]]));
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("page");
+    expect(v.measured?.bank).toBe("overlord");
+    expect(v.measured?.growth).toBe(38130);
+  });
+
+  it("stays quiet on a bank that legitimately runs DEEP but is not growing", () => {
+    // The reason this signal is a growth rate: klanker holds 202,549 units.
+    // A flat — or draining — deep bank is healthy, and an absolute threshold
+    // would have paged on it every tick.
+    expect(evaluatePendingConsolidationDepth(window([["klanker", 40000]], [["klanker", 40000]])).state).toBe("ok");
+    expect(evaluatePendingConsolidationDepth(window([["klanker", 40000]], [["klanker", 1000]])).state).toBe("ok");
+  });
+
+  it("stays quiet below the depth floor however fast it grew", () => {
+    const to = PENDING_CONSOLIDATION_FLOOR - 1;
+    expect(evaluatePendingConsolidationDepth(window([["b", 0]], [["b", to]])).state).toBe("ok");
+  });
+
+  it("ignores a bank that did not exist at the window start — ingest is not a stall", () => {
+    expect(evaluatePendingConsolidationDepth(window([["old", 0]], [["brand-new", 9000]])).state).toBe("ok");
+  });
+
+  it("reports no-data with fewer than two ticks carrying a per-bank block", () => {
+    expect(evaluatePendingConsolidationDepth([sample(0), sample(1)]).state).toBe("no-data");
+  });
+});
+
+describe("evaluateVectorIndexCorruption — the HNSW canary", () => {
+  it("FIRES, pages, and names the index on the incident's error", () => {
+    const v = evaluateVectorIndexCorruption([
+      sample(0, {
+        vectorIndex: {
+          probed: 88,
+          corrupt: ["idx_mu_emb_obsv_81cef5f6a42e4b4d=different vector dimensions 384 and 0"],
+        },
+      }),
+    ]);
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("page");
+    expect(v.detail).toContain("idx_mu_emb_obsv_81cef5f6a42e4b4d");
+    expect(v.detail).toContain("REINDEX");
+  });
+
+  it("passes on the measured healthy sweep (89 indexes, 0 corrupt)", () => {
+    const v = evaluateVectorIndexCorruption([sample(0, { vectorIndex: { probed: 89, corrupt: [] } })]);
+    expect(v.state).toBe("ok");
+    expect(v.measured?.probed).toBe(89);
+  });
+
+  it("reports no-data — never a pass — when the canary did not run", () => {
+    expect(evaluateVectorIndexCorruption([sample(0)]).state).toBe("no-data");
   });
 });

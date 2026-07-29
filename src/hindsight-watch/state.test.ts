@@ -70,7 +70,13 @@ describe("loadState", () => {
     // compute a NaN comparison that silently passes.
     expect(loadState(p)).toEqual({
       ...s,
-      ring: s.ring.map((r) => ({ ...r, recall: null, consolidation: null })),
+      ring: s.ring.map((r) => ({
+        ...r,
+        recall: null,
+        consolidation: null,
+        banks: null,
+        vectorIndex: null,
+      })),
     });
   });
 });

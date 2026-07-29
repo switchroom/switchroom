@@ -606,6 +606,123 @@ export const CONSOLIDATION_AGE_WARN_S = 2 * 60 * 60;
 export const CONSOLIDATION_AGE_PAGE_S = 12 * 60 * 60;
 
 /**
+ * ── B9. The 2026-07-29 consolidation outage, and why the signal above could
+ *        not see it ──────────────────────────────────────────────────────
+ *
+ * The `overlord` bank's consolidation job failed on ~every attempt from 04:28
+ * to 07:09 UTC on 2026-07-29, backing up 38,000 unconsolidated memories. No
+ * signal fired. It was found because the operator happened to ask.
+ *
+ * `CONSOLIDATION_AGE_*` above is measured against `status IN ('pending',
+ * 'processing')` (`probeConsolidationQueue`), and the failing path calls
+ * `_mark_operation_failed` immediately — so a failed row leaves that set
+ * within milliseconds. `evaluateConsolidationQueueAge` then reads `pending
+ * === 0` and returns `state: "ok"`, detail `"consolidation queue empty"`.
+ * The measurement is INVERTED: the more reliably a bank fails, the healthier
+ * it reads. That is not a threshold set too high; it is a set the evidence
+ * cannot enter.
+ *
+ * Live measurements taken on the production host, read-only, 2026-07-29
+ * 07:1x UTC (the incident's tail, ~10 min after the corrupt index was
+ * rebuilt), and used to set every constant below:
+ *
+ *  B9a  Streak query — `failed` rows newer than the pair's last `completed`
+ *       row, grouped by `(bank_id, operation_type)`:
+ *         overlord | consolidation | 103 | 668 s
+ *       and NOTHING else across 20 banks. One row, one bank, one op type:
+ *       the healthy floor for this measurement is literally zero.
+ *  B9b  Same window, `(bank, op_type, status)` census: `overlord` held 3,753
+ *       COMPLETED retains and 3,753 completed batch_retains against those
+ *       112 failed consolidations. A bank-wide streak is therefore useless —
+ *       every successful retain would reset it.
+ *  B9c  Per-bank `pending_consolidation` across the fleet:
+ *         overlord 38,130 · carrie 45 · switchroom-dev 12 · every other
+ *         bank 0 (n = 20 banks, 676,720 memory units).
+ *       The largest HEALTHY reading is 45. Absolute depth is still the wrong
+ *       threshold — a bank mid-ingest legitimately runs deep and the number
+ *       is unbounded — but it bounds the floor below which growth is not
+ *       worth looking at.
+ *  B9d  Every `failed` row carried `different vector dimensions 384 and 0`,
+ *       raised out of an HNSW index scan. `memory_units.embedding` is
+ *       `vector(384)` and 0 rows have `vector_dims(embedding) <> 384`, so the
+ *       damage is inside the index structure, not in the data.
+ *  B9e  Canary cost: 89 HNSW indexes probed in 0.45 s wall (one `docker
+ *       exec`), 0 corrupt at the time of measurement.
+ */
+
+/**
+ * Consecutive terminal consolidation failures for one `(bank, operation_type)`
+ * pair: warn / page.
+ *
+ * **3** to warn because the healthy fleet's streak is 0 (B9a) — there is no
+ * band of "a few failures are normal" to sit above. Three consecutive
+ * failures with no completion in between is already the signature of a
+ * deterministic, non-retryable fault rather than a flake, and at the
+ * 15-minute cron cadence the incident's failure rate (112 failures over
+ * 2.7 h ≈ one per 87 s) clears 3 inside the FIRST tick after onset.
+ *
+ * **10** to page: a fault that has survived ten attempts is not going to
+ * retry its way out, and the bank has been unconsolidated long enough that
+ * recall against it is already degraded.
+ *
+ * Deliberately NOT keyed on the incident's error string. Any deterministic
+ * non-retryable consolidation failure — a corrupt index, a poisoned row, a
+ * schema drift, an LLM contract change — produces the same shape, and the
+ * shape is what is thresholded.
+ */
+export const CONSOLIDATION_FAILURE_STREAK_WARN = 3;
+export const CONSOLIDATION_FAILURE_STREAK_PAGE = 10;
+
+/**
+ * How fresh the newest failure in a streak must be for the streak to count.
+ *
+ * Without this the signal never resolves: a streak is defined relative to the
+ * last COMPLETED op, so a bank that is fixed but idle (no new consolidation
+ * demand) keeps its historical streak forever and alerts forever. Two hours
+ * bounds the post-fix tail while still being several times the observed
+ * inter-failure gap during the incident (87 s), so an ongoing fault cannot
+ * age itself out mid-incident.
+ */
+export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
+
+/**
+ * Per-bank unconsolidated depth: the floor below which GROWTH is not worth
+ * scoring, and the growth thresholds themselves.
+ *
+ * Growth, not absolute depth, because absolute depth has no defensible line:
+ * `klanker` holds 202,549 memory units and a bank mid-ingest legitimately
+ * carries thousands of unconsolidated ones, so any absolute threshold is
+ * either noise or useless (B9c). What is NOT legitimate is a depth that only
+ * ever goes up.
+ *
+ * The shape deliberately mirrors {@link QUEUE_FLOOR} /
+ * {@link QUEUE_GROWTH_FRACTION} / {@link QUEUE_GROWTH_MIN_ABS} — the same
+ * "deep AND rising" conjunction, applied per bank instead of to one fleet
+ * series — so there is one growth idiom in this file, not two.
+ *
+ *  - **500 floor**: an order of magnitude above the largest healthy reading
+ *    (45, B9c), so an ordinary ingest burst never reaches the conjunction.
+ *  - **50 % fraction / +500 absolute** to warn over the ~2 h window
+ *    (`RING_MAX` × 15 min).
+ *  - **+5000 absolute** to page. The incident grew ~38,000 in 2.7 h ≈
+ *    14,000/h ≈ 28,000 per window: it pages on the first full window.
+ */
+export const PENDING_CONSOLIDATION_FLOOR = 500;
+export const PENDING_CONSOLIDATION_GROWTH_FRACTION = 0.5;
+export const PENDING_CONSOLIDATION_GROWTH_WARN_ABS = 500;
+export const PENDING_CONSOLIDATION_GROWTH_PAGE_ABS = 5000;
+
+/**
+ * Rows the HNSW canary samples per index.
+ *
+ * Each sampled row costs one nearest-neighbour search. 3 is enough that the
+ * probe walks the graph rather than getting lucky on an entry point, and the
+ * whole sweep — 89 indexes — measured 0.45 s (B9e). Raising it multiplies the
+ * only cost this probe has.
+ */
+export const VECTOR_INDEX_SAMPLE_ROWS = 3;
+
+/**
  * Minimum scored rows before a recall SLI is trusted.
  *
  * Below this a single bad recall dominates the rate and the signal would flap
