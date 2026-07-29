@@ -29,6 +29,8 @@ import {
   getHindsightDeviceRequests,
   hindsightGpuDecision,
   resolveHindsightGpuOverride,
+  resolveHindsightCpAccessKey,
+  HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
   type LiteLLMHindsightConfig,
@@ -728,6 +730,10 @@ export function registerMemoryCommand(program: Command): void {
               // The SAME GPU answer the launch will use, passed as a value.
               gpu: gpuDecision.enabled,
               perf: driftPerf,
+              // The SAME CP access key the launch below resolves — otherwise
+              // the drift report reads HINDSIGHT_CP_ACCESS_KEY as "about to be
+              // dropped" on every recreate of a protected dashboard.
+              cpAccessKey: await resolveHindsightCpAccessKey(driftConfig),
             });
             const dropped = diffDroppedHindsightEnv(
               liveEnv,
@@ -915,6 +921,8 @@ export function registerMemoryCommand(program: Command): void {
       try {
         const hindsightConfig = getConfig(program);
         const litellmCfg = await resolveLiteLLMForHindsight(hindsightConfig);
+        const cpAccessKey = await resolveHindsightCpAccessKey(hindsightConfig);
+        if (!cpAccessKey) console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
         startHindsight(
           ports,
           litellmCfg,
@@ -928,6 +936,9 @@ export function registerMemoryCommand(program: Command): void {
           gpuDecision.enabled,
           // Operator overrides for the capability-gated performance defaults.
           { env: hindsightConfig.hindsight?.env },
+          // Resolved `hindsight.cp_access_key`. Absent ⇒ the CP dashboard has
+          // no login, so hindsightCpAuthEnvPairs pins it to loopback.
+          cpAccessKey,
         );
         if (litellmCfg) {
           console.log(chalk.gray("  LiteLLM routing enabled for hindsight (--network host)."));
@@ -964,10 +975,19 @@ export function registerMemoryCommand(program: Command): void {
   memory
     .command("docker-compose")
     .description("Output a docker-compose snippet for Hindsight (broker-fed mode)")
-    .action(() => {
+    // Async now that the CP access key is resolved through the vault broker;
+    // withConfigError keeps a bad switchroom.yaml a friendly message rather
+    // than an unhandled rejection (the sibling `memory` subcommands' shape).
+    .action(withConfigError(async () => {
       console.log(chalk.bold("\n# Add this to your docker-compose.yml:\n"));
       {
         const snippetConfig = getConfig(program);
+        // Same resolve + same warning as the docker-run path: a compose
+        // deployment must not be the one that quietly serves an open dashboard.
+        const cpAccessKey = await resolveHindsightCpAccessKey(snippetConfig);
+        if (!cpAccessKey) {
+          console.error(chalk.yellow(`# ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
+        }
         console.log(
           generateHindsightComposeSnippet(
             snippetConfig.hindsight?.llm,
@@ -980,11 +1000,12 @@ export function registerMemoryCommand(program: Command): void {
               resolveHindsightGpuOverride({ config: snippetConfig.hindsight?.gpu }),
             ).enabled,
             { env: snippetConfig.hindsight?.env },
+            cpAccessKey,
           ),
         );
       }
       console.log();
-    });
+    }));
 
   // switchroom memory repair — reachability for hindsight 0.8.5's
   // `hindsight-admin repair-bank`. A bank that arrived already populated

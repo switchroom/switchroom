@@ -2463,6 +2463,23 @@ export const HindsightConfigSchema = z.object({
       "turn a GPU container into a CPU one). `--gpu`/`--no-gpu` on `memory " +
       "setup` override this for a single run.",
     ),
+  cp_access_key: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Access key for the hindsight control-plane DASHBOARD (upstream " +
+      "`HINDSIGHT_CP_ACCESS_KEY`, port 9999). Literal or — strongly preferred " +
+      "— a `vault:` reference such as `vault:hindsight_cp_access_key`, read " +
+      "through the broker at container-launch time. This is the ONLY thing " +
+      "that arms the dashboard's login: upstream's middleware short-circuits " +
+      "to `next()` when the var is unset, so an unset key means the dashboard " +
+      "has no authentication at all, not weak authentication. Because of that, " +
+      "leaving it unset is FAIL-CLOSED: switchroom pins " +
+      "`HINDSIGHT_CP_HOSTNAME=127.0.0.1` so the loginless dashboard is " +
+      "reachable only from the host, and warns. Set this to serve the " +
+      "dashboard on the LAN/tailnet.",
+    ),
   llm: z
     .object({
       provider: z

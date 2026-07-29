@@ -1363,6 +1363,115 @@ export function hindsightHostNetworkBindEnvPairs(
 }
 
 /**
+ * Address the CP dashboard (Next.js, port 9999) binds under `--network host`
+ * when NO access key is configured.
+ *
+ * Upstream `start-all.sh` exports `HOSTNAME="${HINDSIGHT_CP_HOSTNAME:-0.0.0.0}"`
+ * before `node server.js`, so absent this pin the dashboard listens on every
+ * host address. That is only safe when the access-key middleware is armed —
+ * and the middleware is a NO-OP when `HINDSIGHT_CP_ACCESS_KEY` is unset
+ * (verified in the shipped edge bundle: the handler reads the var and
+ * short-circuits to `next()` when it is falsy, so no protected route is
+ * enforced at all). "Unauthenticated service on 0.0.0.0 under host
+ * networking" is the same exposure shape the API had before
+ * {@link HINDSIGHT_HOST_NETWORK_BIND_ADDR}, so it gets the same containment:
+ * no key ⇒ loopback only.
+ */
+export const HINDSIGHT_CP_UNAUTHENTICATED_BIND_ADDR = "127.0.0.1";
+
+/** Bind the CP dashboard on every host address (upstream's own default). */
+export const HINDSIGHT_CP_AUTHENTICATED_BIND_ADDR = "0.0.0.0";
+
+/**
+ * Operator-facing warning every launch path emits when the CP dashboard is
+ * started without an access key. Exported so the docker-run CLI and the
+ * compose emitter cannot word it differently — or forget it.
+ */
+export const HINDSIGHT_CP_NO_ACCESS_KEY_WARNING =
+  "hindsight: no `hindsight.cp_access_key` configured — the control-plane " +
+  "dashboard has NO login (the access-key middleware is inert when " +
+  "HINDSIGHT_CP_ACCESS_KEY is unset), so it is pinned to " +
+  `${HINDSIGHT_CP_UNAUTHENTICATED_BIND_ADDR} and will NOT be reachable from ` +
+  "the LAN or tailnet. Set `hindsight.cp_access_key: vault:<key>` in " +
+  "switchroom.yaml to arm the login and open it up.";
+
+/**
+ * THE control-plane auth env every hindsight launch path must carry.
+ *
+ * Two coupled facts, which is why they are derived together and in ONE place:
+ *
+ *  1. `HINDSIGHT_CP_ACCESS_KEY` is what arms the CP login middleware. Absent,
+ *     the middleware passes every request through — the dashboard is not
+ *     "weakly protected", it is unprotected.
+ *  2. `HINDSIGHT_CP_HOSTNAME` is what decides who can reach it. Under
+ *     `--network host` docker ignores `-p`, so this env var is the only
+ *     containment (exactly like the API's `HINDSIGHT_API_HOST`). On bridge the
+ *     `-p 127.0.0.1:<uiPort>:9999` publish already confines it, and pinning
+ *     the in-netns bind to loopback there would break the publish outright —
+ *     so the bind is emitted on the host-network path only.
+ *
+ * The verdict: a dashboard reachable off-host REQUIRES a key. With a key we
+ * bind `0.0.0.0` (the operator asked for LAN/tailnet, and the middleware is
+ * now armed); without one we fail CLOSED to loopback rather than silently
+ * serving an open dashboard to the LAN. Emitted from here by
+ * {@link startHindsight}'s docker-run argv AND
+ * {@link generateHindsightComposeSnippet} so the two can never disagree.
+ */
+export function hindsightCpAuthEnvPairs(opts: {
+  /** Resolved access key (post-`vault:` lookup). Blank/absent ⇒ no login. */
+  accessKey?: string;
+  /** Whether this launch takes `--network host` / `network_mode: host`. */
+  hostNetwork: boolean;
+}): Array<[string, string]> {
+  const key = opts.accessKey?.trim();
+  const pairs: Array<[string, string]> = [];
+  if (key) pairs.push(["HINDSIGHT_CP_ACCESS_KEY", key]);
+  if (opts.hostNetwork) {
+    pairs.push([
+      "HINDSIGHT_CP_HOSTNAME",
+      key ? HINDSIGHT_CP_AUTHENTICATED_BIND_ADDR : HINDSIGHT_CP_UNAUTHENTICATED_BIND_ADDR,
+    ]);
+  }
+  return pairs;
+}
+
+/**
+ * Resolve the operator's `hindsight.cp_access_key` to the actual secret.
+ *
+ * A literal is returned as-is; a `vault:<key>` reference is read through the
+ * broker — the same shape `hindsight.llm.<op>.api_key` and `litellm.admin_key`
+ * take (`resolveConfigSecret` in src/cli/apply.ts). NEVER read the vault file
+ * directly: from inside a container it isn't mounted, and on the host the
+ * broker is the audited path.
+ *
+ * Returns `undefined` when there is no config value OR when the reference
+ * cannot be resolved. Both collapse to "no key", which is deliberately the
+ * fail-CLOSED input to {@link hindsightCpAuthEnvPairs}: an unresolvable vault
+ * ref must not silently produce an open dashboard. Callers warn with
+ * {@link HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}.
+ */
+export async function resolveHindsightCpAccessKey(
+  config: { hindsight?: { cp_access_key?: string } } | undefined,
+  deps: {
+    getViaBrokerStructured?: typeof import("../vault/broker/client.js").getViaBrokerStructured;
+  } = {},
+): Promise<string | undefined> {
+  const ref = config?.hindsight?.cp_access_key?.trim();
+  if (!ref) return undefined;
+  const { isVaultReference, parseVaultReference } = await import("../vault/resolver.js");
+  if (!isVaultReference(ref)) return ref;
+  const get =
+    deps.getViaBrokerStructured ??
+    (await import("../vault/broker/client.js")).getViaBrokerStructured;
+  const resolved = await get(parseVaultReference(ref)).catch(() => null);
+  if (!resolved || resolved.kind !== "ok" || resolved.entry.kind !== "string") {
+    return undefined;
+  }
+  const value = resolved.entry.value.trim();
+  return value.length > 0 ? value : undefined;
+}
+
+/**
  * Whether hindsight's LLM traffic terminates on a self-hosted endpoint.
  *
  * The capability gate for the LLM concurrency caps (see
@@ -1759,8 +1868,14 @@ export function hindsightContainerEnvPairs(opts: {
   /** GPU verdict override; omit in production. See {@link hindsightGpuEnabled}. */
   gpu?: boolean;
   perf?: HindsightPerfOptions;
+  /**
+   * Resolved control-plane access key (operator's `hindsight.cp_access_key`,
+   * post-`vault:` lookup). Absent ⇒ the dashboard has no login and is pinned
+   * to loopback. See {@link hindsightCpAuthEnvPairs}.
+   */
+  cpAccessKey?: string;
 }): Array<[string, string]> {
-  const { apiPort, litellm, llm, gpu, perf } = opts;
+  const { apiPort, litellm, llm, gpu, perf, cpAccessKey } = opts;
 
   // Effective LLM provider + model, applying the operator override
   // (top-level `hindsight.llm` in switchroom.yaml) over the hard-coded
@@ -1842,6 +1957,18 @@ export function hindsightContainerEnvPairs(opts: {
     pairs.push(...hindsightHostNetworkBindEnvPairs(apiPort));
   }
 
+  // Control-plane dashboard auth. Emitted on EVERY path (not just host
+  // network): the access key arms the CP login middleware regardless of
+  // networking, and the loopback fallback for a keyless launch is decided
+  // inside the helper off the same `hindsightNeedsHostNetwork` verdict.
+  // See {@link hindsightCpAuthEnvPairs}.
+  pairs.push(
+    ...hindsightCpAuthEnvPairs({
+      accessKey: cpAccessKey,
+      hostNetwork: hindsightNeedsHostNetwork(llm, litellm),
+    }),
+  );
+
   if (litellm) {
     const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
     // Claude models ride the Anthropic pass-through (<root>/anthropic,
@@ -1892,6 +2019,13 @@ export function startHindsight(
    * overrides. See {@link HindsightPerfOptions}.
    */
   perf?: HindsightPerfOptions,
+  /**
+   * Resolved control-plane access key — the operator's
+   * `hindsight.cp_access_key` after any `vault:` reference is read through the
+   * broker. Absent ⇒ the dashboard comes up with no login and is confined to
+   * loopback rather than served open. See {@link hindsightCpAuthEnvPairs}.
+   */
+  cpAccessKey?: string,
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
@@ -1900,6 +2034,7 @@ export function startHindsight(
     apiPort,
     litellm,
     llm,
+    cpAccessKey,
     gpu,
     perf,
   }).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
@@ -2359,6 +2494,13 @@ export function generateHindsightComposeSnippet(
    * overrides, mirroring {@link startHindsight}'s `perf` param.
    */
   perf?: HindsightPerfOptions,
+  /**
+   * Resolved control-plane access key, mirroring {@link startHindsight}'s
+   * `cpAccessKey` param. Emitted through the SAME
+   * {@link hindsightCpAuthEnvPairs} helper so a compose deployment cannot end
+   * up with an open dashboard while the docker-run path is protected.
+   */
+  cpAccessKey?: string,
 ): string {
   const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
   const perOpLlm = resolveHindsightPerOpLlm(llm);
@@ -2397,6 +2539,14 @@ export function generateHindsightComposeSnippet(
     ...(hostNetwork
       ? hindsightHostNetworkBindEnvPairs(apiPort).map(([k, v]) => `      - ${k}=${v}`)
       : [`      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888`]),
+    // CP dashboard login + (host-network only) its bind address, from the
+    // SAME helper the docker-run path uses. Without this the compose
+    // deployment served an unauthenticated dashboard on 0.0.0.0:9999 while
+    // docker-run was protected — the exact one-path-fixed shape #3976 removed
+    // for the API.
+    ...hindsightCpAuthEnvPairs({ accessKey: cpAccessKey, hostNetwork }).map(
+      ([k, v]) => `      - ${k}=${v}`,
+    ),
   ];
   // Optional LiteLLM proxy env (ANTHROPIC_BASE_URL + spend-tag headers) —
   // same shape startHindsight emits when litellm is configured. Requires the

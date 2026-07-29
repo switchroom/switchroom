@@ -38,7 +38,9 @@ import {
   hindsightConsumerMirrorDir,
   stopHindsight,
   ensureHindsightConsumer,
+  resolveHindsightCpAccessKey,
   HINDSIGHT_CONSUMER_NAME,
+  HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
   pickHindsightPorts,
   preflightHindsightPorts,
@@ -1290,6 +1292,10 @@ export async function stepMemoryBackend(
   const spin = spinner("Starting Hindsight Docker container...");
   try {
     const litellmCfg = await resolveLiteLLMForHindsight(config);
+    const cpAccessKey = await resolveHindsightCpAccessKey(config);
+    if (!cpAccessKey) {
+      console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
+    }
     const startContainer = deps.startContainer ?? startHindsight;
     startContainer(
       ports,
@@ -1297,6 +1303,13 @@ export async function stepMemoryBackend(
       undefined,
       config.hindsight?.llm,
       hindsightConsumerMirrorDir(config),
+      // gpu: omitted ⇒ hindsightGpuEnabled() reads the persisted verdict.
+      undefined,
+      // perf: omitted ⇒ the managed defaults, same as before.
+      undefined,
+      // Resolved `hindsight.cp_access_key` — absent ⇒ loginless dashboard,
+      // pinned to loopback by hindsightCpAuthEnvPairs.
+      cpAccessKey,
     );
     if (litellmCfg) {
       console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
