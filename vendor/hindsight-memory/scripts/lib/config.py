@@ -18,11 +18,16 @@ OBSERVATION_SCOPE_STRATEGIES = ("curated", "shared", "combined", "off")
 
 #: Tag patterns treated as VOLATILE per-session provenance by ``curated``:
 #: ``parent_session:<id>`` and a bare RFC-4122 UUID (what the ``{session_id}``
-#: retain tag resolves to). A tag matching ANY of these is dropped from the
+#: retain tag resolves to on the parent path). The UUID pattern also matches
+#: the sidechain-derived ``<uuid>-sub-<agent_id>`` form, because
+#: ``subagent_retain.py`` sets ``sub_session_id = f"{session_id}-sub-{agent_id}"``
+#: and the ``{session_id}`` retain tag resolves to that — a per-invocation-unique
+#: value that, if left in scope, defeats cross-session dedup on the dominant
+#: (sidechain) observation path. A tag matching ANY of these is dropped from the
 #: consolidation scope but LEFT on the source fact.
 DEFAULT_VOLATILE_SCOPE_PATTERNS = (
     r"^parent_session:",
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(-sub-.+)?$",
 )
 
 DEFAULTS = {

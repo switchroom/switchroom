@@ -393,6 +393,19 @@ class ComputeCuratedScopes(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(value, [["lesson"]])
 
+    def test_curated_strips_sidechain_sub_session_tag(self):
+        # The dominant observation path: subagent_retain sets
+        # `sub_session_id = f"{session_id}-sub-{agent_id}"`, and `retainTags:
+        # ["{session_id}"]` resolves to `<parent-uuid>-sub-<agent_id>`. That is
+        # per-invocation-unique, so if it survives into the scope every sidechain
+        # retain gets its own island and never dedups. It must be treated as
+        # volatile (like the bare UUID it derives from) and stripped, while the
+        # stable semantic tags stay in scope.
+        sub_tag = f"{self._UUID}-sub-af5fba739c0ee6b38"
+        value, err = self._compute([sub_tag, "sidechain", "agent_type:worker"])
+        self.assertIsNone(err)
+        self.assertEqual(value, [["agent_type:worker", "sidechain"]])
+
     def test_curated_all_volatile_falls_back_to_shared(self):
         # A retain tagged ONLY with volatile provenance has no stable scope, so
         # it pools into the one bank-wide untagged scope instead of an island.
