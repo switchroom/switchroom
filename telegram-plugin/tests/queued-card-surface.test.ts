@@ -20,7 +20,8 @@ import {
   __resetParkedTurnStartsForTest,
   __parkedTurnStartCountForTest,
 } from '../gateway/stream-render.js'
-import { makeHarness, enqueue, type Harness } from './turn-mint-harness.js'
+import { makeHarness, enqueue, CHAT, type Harness } from './turn-mint-harness.js'
+import { deriveTurnId } from '../gateway/derive-turn-id.js'
 
 interface SendRec { chatId: string; markdown: string; opts: Record<string, unknown>; id: number }
 interface EditRec { chatId: string; messageId: number; markdown: string }
@@ -157,5 +158,100 @@ describe('Part B — queued card is finalized, never frozen', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+/**
+ * Regression for the handback-while-busy MAJOR (adversarial review of #4040).
+ *
+ * The COMMON worker-handoff case: a worker hands back while the parent session
+ * is busy → the handback pre-turn signal arms a card for that turn → the same
+ * handback inbound parks → (before the fix) the park posted a SECOND "⏳ Queued"
+ * card unconditionally → on dequeue the handback `tryAdopt` won the surface, so
+ * the Part B `activityMessageId == null` guard was false and the queued card was
+ * neither adopted nor finalized → TWO cards for one message, the queued one
+ * FROZEN forever.
+ *
+ * The shared harness hardcodes `HANDBACK_PRETURN_ENABLED:false` +
+ * `tryAdopt:()=>null`, so it never exercised this; here we turn the signal ON
+ * with a card-bearing `tryAdopt`, matching prod. Both tests fail on the current
+ * HEAD (a queued card is posted and then frozen) and pass after the fix.
+ */
+const HANDBACK_CARD_ID = 7777
+
+/** Turn the handback pre-turn signal ON for message `msgId`'s turn. `pendingAtPark`
+ *  models whether `noteHandbackRelease` has already armed the entry by the time the
+ *  message parks (true = the common case; false = the sub-second race the beginTurn
+ *  safety net covers). `tryAdopt` always returns the handback card for that turn. */
+function withHandbackFor(h: Harness, msgId: string, pendingAtPark: boolean) {
+  const tid = deriveTurnId(CHAT, null, msgId)!
+  const d = h.deps as unknown as {
+    HANDBACK_PRETURN_ENABLED: boolean
+    handbackPreturnSignal: {
+      hasPendingForTurnId: (t: string) => boolean
+      tryAdopt: (t: string) => { activityMessageId: number | null; statusKey: string } | null
+    }
+  }
+  d.HANDBACK_PRETURN_ENABLED = true
+  d.handbackPreturnSignal = {
+    hasPendingForTurnId: (t: string) => pendingAtPark && t === tid,
+    tryAdopt: (t: string) =>
+      t === tid ? { activityMessageId: HANDBACK_CARD_ID, statusKey: `${CHAT}:main` } : null,
+  }
+  return tid
+}
+
+describe('Part B — handback-while-busy: exactly one card, never a frozen "Queued"', () => {
+  it('SUPPRESSES the queued card at park when a handback signal already owns the turn (common case)', async () => {
+    const h = makeHarness()
+    const rec = withRecordingBot(h)
+    withHandbackFor(h, '502', /* pendingAtPark */ true)
+
+    // Turn A mints on an idle session.
+    handleSessionEvent(h.deps, enqueue('501'))
+    const turnA = h.current()!
+
+    // The handback inbound (502) parks while A is busy. The handback signal
+    // already owns 502's surface → NO queued card is posted.
+    handleSessionEvent(h.deps, enqueue('502', 'handback: worker done'))
+    await settle()
+    expect(rec.sends).toHaveLength(0) // ← fails on HEAD (a 2nd card was posted)
+
+    // A ends → 502 dequeues → adopts the HANDBACK card as its one surface.
+    turnA.endedAt = Date.now()
+    handleSessionEvent(h.deps, { kind: 'dequeue' })
+    const turnB = h.current()!
+    expect(turnB.activityMessageId).toBe(HANDBACK_CARD_ID)
+    // No queued card was ever posted, edited, or left frozen.
+    expect(rec.sends).toHaveLength(0)
+    expect(rec.edits).toHaveLength(0)
+    expect(rec.deletes).toHaveLength(0)
+  })
+
+  it('DELETES the orphaned queued card at dequeue when the handback armed after park (the race)', async () => {
+    const h = makeHarness()
+    const rec = withRecordingBot(h)
+    withHandbackFor(h, '502', /* pendingAtPark */ false)
+
+    handleSessionEvent(h.deps, enqueue('501'))
+    const turnA = h.current()!
+
+    // 502 parks BEFORE the handback entry armed → the queued card is posted.
+    handleSessionEvent(h.deps, enqueue('502', 'handback: worker done'))
+    await settle()
+    expect(rec.sends).toHaveLength(1)
+    const queuedCardId = rec.sends[0]!.id
+
+    // A ends → 502 dequeues → the handback adoption WINS the surface, and the
+    // now-orphaned queued card is DELETED so it never freezes on "⏳ Queued".
+    turnA.endedAt = Date.now()
+    handleSessionEvent(h.deps, { kind: 'dequeue' })
+    const turnB = h.current()!
+    expect(turnB.activityMessageId).toBe(HANDBACK_CARD_ID) // handback card is the surface
+    expect(rec.deletes).toHaveLength(1) // ← fails on HEAD (no cleanup, card frozen)
+    expect(rec.deletes[0]!.messageId).toBe(queuedCardId)
+    // One live card total: the handback card. The queued card was removed, not
+    // left as a frozen "Queued" and not finalized as folded/timed-out.
+    expect(rec.edits).toHaveLength(0)
   })
 })

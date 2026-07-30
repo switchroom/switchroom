@@ -246,6 +246,15 @@ export interface HandbackPreturnSignal {
    *  re-keyed to the real `statusKey` so the turn's end-of-turn
    *  `clearActivitySummary` finalizes it. Cancels the debounce/self-reap. */
   tryAdopt: (turnId: string) => HandbackAdoption | null
+  /** True IFF a live (un-consumed) pre-turn entry is armed whose adopting turn
+   *  is `turnId`. Consulted by the queued-card surface (stream-render Part B) at
+   *  PARK time: when a handback pre-turn signal already owns the surface for the
+   *  turn this parked message will mint, the queued card must NOT be posted —
+   *  otherwise the same message ends up with two cards (the handback card the
+   *  turn adopts, plus a queued card that then freezes). Turn-scoped, NOT
+   *  key-scoped, so an unrelated user message parked on the same topic (a
+   *  DIFFERENT adoptTurnId) is not wrongly suppressed. */
+  hasPendingForTurnId: (turnId: string) => boolean
   /** True IFF `turnKey` is a synthetic pre-turn record key. */
   isPreTurnRecord: (turnKey: string) => boolean
   /** Reap hook for the gateway's mid-session / boot card reapers: stop the
@@ -514,6 +523,13 @@ export function createHandbackPreturnSignal(
       }
       dropEntry(entry)
       return adoption
+    },
+
+    hasPendingForTurnId(turnId) {
+      for (const e of byKey.values()) {
+        if (e.adoptTurnId === turnId && !e.consumed) return true
+      }
+      return false
     },
 
     isPreTurnRecord(turnKey) {

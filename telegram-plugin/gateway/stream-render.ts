@@ -586,6 +586,26 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
       process.stderr.write(
         `telegram gateway: queued card adopted turnId=${turnId} card=${ev.queuedCardMessageId}\n`,
       )
+    } else if (
+      QUEUED_CARD_ENABLED &&
+      ev.queuedCardMessageId != null &&
+      ev.chatId != null &&
+      next.activityMessageId != null &&
+      next.activityMessageId !== ev.queuedCardMessageId
+    ) {
+      // Part B safety net — the handback adoption above WON the surface (its card
+      // is now `activityMessageId`) yet this envelope ALSO carries a queued card:
+      // the park raced ahead of `noteHandbackRelease`, so the park-time
+      // suppression missed and a queued card got posted. It is now a pure
+      // duplicate that would otherwise FREEZE on "⏳ Queued" beneath the adopted
+      // handback card (the MAJOR). Delete it — the handback card is the one
+      // surface; a delete (not a "folded" edit) is right because there is no
+      // separate message to explain, just a stray duplicate to remove.
+      deleteQueuedCard(deps, ev.chatId, ev.queuedCardMessageId)
+      process.stderr.write(
+        `telegram gateway: queued card superseded by handback adoption turnId=${turnId} ` +
+          `queued=${ev.queuedCardMessageId} adopted=${next.activityMessageId}\n`,
+      )
     }
     // #3544 — arm the turn-long `typing…` loop for EVERY minted turn,
     // unconditionally. It used to hang off the handback ADOPTION above,
@@ -939,7 +959,29 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // Post the queued card, reply-anchored to the parked message, and store its
       // id back on the envelope so `beginTurn` can adopt+edit it on dequeue. One
       // card per envelope (multiple queued messages each get their own).
-      if (QUEUED_CARD_ENABLED) {
+      //
+      // SUPPRESS when a handback pre-turn signal already owns this turn's surface
+      // (the common worker-handoff-while-busy case): `noteHandbackRelease` fired
+      // at buffer drain BEFORE this injected handback inbound reached park, so an
+      // entry armed for THIS message's turnId is already live. That entry paints
+      // (and the dequeued turn adopts) its OWN card, so a queued card here would
+      // be a second card that then freezes on "⏳ Queued" (the MAJOR this fixes).
+      // Turn-scoped, not key-scoped: an unrelated user message parked on the same
+      // topic derives a different turnId and is NOT suppressed. beginTurn carries
+      // a belt-and-suspenders cleanup for the residual race where the queued card
+      // was already posted before the handback entry armed.
+      const parkTurnId = deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
+      const handbackOwnsSurface =
+        HANDBACK_PRETURN_ENABLED &&
+        parkTurnId != null &&
+        handbackPreturnSignal.hasPendingForTurnId(parkTurnId)
+      if (handbackOwnsSurface) {
+        process.stderr.write(
+          `telegram gateway: queued card suppressed (handback owns surface) ` +
+            `turnId=${parkTurnId} msg=${ev.messageId ?? '-'}\n`,
+        )
+      }
+      if (QUEUED_CARD_ENABLED && !handbackOwnsSurface) {
         const cardChatId = ev.chatId
         const replyToRaw = ev.messageId != null ? Number(ev.messageId) : null
         const replyTo = replyToRaw != null && Number.isFinite(replyToRaw) ? replyToRaw : null
