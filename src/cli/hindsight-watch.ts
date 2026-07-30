@@ -206,6 +206,57 @@ function runInstallCron(cronUser?: string): number {
 }
 
 /**
+ * The fleet's root/admin debugging agent. hindsight-watch is a host process
+ * with no chat of its own, so it relays its single operator DM through
+ * whichever live agent gateway socket answers first (see
+ * `postOperatorNoticeViaGateways`, which is first-success-wins over the
+ * candidate order). Left in raw alphabetical order the relay always came out
+ * of the alphabetically-first live gateway, so every watch alert appeared to
+ * be sent by an unrelated agent's bot. The operator wants these host-monitor
+ * alerts attributed to the root debugging agent instead.
+ *
+ * This is a COSMETIC delivery preference only: if this agent's gateway is
+ * down, delivery falls back to the remaining agents in alphabetical order
+ * (see `orderRelayCandidates`), so an alert is never dropped for attribution.
+ *
+ * A bare constant — rather than reading the full config cascade to discover
+ * which agent is admin/root — is deliberate: hindsight-watch is a zero-model
+ * host cron that must stay cheap and dependency-light, and walking config per
+ * tick to answer a purely cosmetic question isn't worth it.
+ */
+export const PREFERRED_RELAY_AGENT = "overlord";
+
+/**
+ * Reorder relay candidates so `preferred` is tried first when present,
+ * preserving the relative order (alphabetical, as built by the caller) of the
+ * rest as fallback. Pure; no IO. A candidate is only present here when its
+ * gateway socket is live, so a missing/down preferred agent simply leaves the
+ * alphabetical fallback list untouched.
+ */
+export function orderRelayCandidates(
+  candidates: GatewayCandidate[],
+  preferred: string = PREFERRED_RELAY_AGENT,
+): GatewayCandidate[] {
+  const first = candidates.filter((c) => c.agent === preferred);
+  const rest = candidates.filter((c) => c.agent !== preferred);
+  return [...first, ...rest];
+}
+
+/**
+ * Walk the agents dir, collect every agent whose Telegram gateway socket is
+ * live, and return them ordered with {@link PREFERRED_RELAY_AGENT} first. May
+ * throw if the dir is unreadable — callers wrap this in try/catch.
+ */
+export function collectRelayCandidates(agentsDir: string): GatewayCandidate[] {
+  const candidates: GatewayCandidate[] = [];
+  for (const name of readdirSync(agentsDir).sort()) {
+    const sock = resolve(agentsDir, name, "telegram", "gateway.sock");
+    if (existsSync(sock)) candidates.push({ agent: name, sock });
+  }
+  return orderRelayCandidates(candidates);
+}
+
+/**
  * Deliver one plain operator DM through the first agent gateway socket that
  * accepts it. Identical transport to hostd's degraded-boot notice; the
  * gateway fences delivery to its own operator chat, so this cannot address a
@@ -216,12 +267,9 @@ async function notifyOperator(
   text: string,
   log: (msg: string) => void,
 ): Promise<boolean> {
-  const candidates: GatewayCandidate[] = [];
+  let candidates: GatewayCandidate[] = [];
   try {
-    for (const name of readdirSync(agentsDir).sort()) {
-      const sock = resolve(agentsDir, name, "telegram", "gateway.sock");
-      if (existsSync(sock)) candidates.push({ agent: name, sock });
-    }
+    candidates = collectRelayCandidates(agentsDir);
   } catch (e) {
     log(`hindsight-watch: agents dir unreadable (${(e as Error).message})`);
   }
