@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## v0.19.38 — Honest handback orphan-reaping, a live recall deadline in watch alerts, and root-agent-first alert relay
+
+Three focused correctness fixes to the Telegram handback lifecycle and the
+hindsight-watch operator alerts.
+
+### Handback orphan reap gated on queue state, not a flat 30s timeout (#4027)
+
+The pre-turn handback signal armed a flat 30s "orphan reap": if the parent turn
+did not adopt the pre-turn card within 30s, the reap finalized it to a "may need
+a nudge" card. That timeout could not tell a genuine orphan (bridge died, or
+released but never enqueued) from a handback that is correctly enqueued and just
+waiting behind a long in-flight parent turn — so a parent turn running many
+minutes tripped false "needs a nudge" cards on every queued handback. The reap
+now consults the authoritative single-bridge `isClaudeBusy()` / `isMachineInTurn()`
+read and defers while a turn is in flight, finalizing only once claude is idle
+AND the handback still has not been adopted — the genuine bridge-death case. The
+15-min mid-session card reaper gets the same gate so the false positive isn't
+merely moved from 30s to 15min.
+
+### hindsight-watch reports the live 10s recall deadline, not the retired 8000ms budget (#4028)
+
+The recall-own-bank-timeout alert hardcoded an 8000ms per-bank budget in the
+operator-facing text and rationale — a wall retired by #3759, which made the
+recall deadline a declarative envelope (a 10s shared parallel deadline). The
+wall is now sourced from the declarative tunable via a new `RECALL_WALL_MS`
+constant so it tracks the envelope instead of going stale, and every
+operator-facing suffix and rationale comment is corrected to the 10s wall.
+
+### hindsight-watch relays operator alerts through the root agent first (#4024)
+
+hindsight-watch has no chat of its own and relays operator DMs through the first
+live agent gateway socket; candidates were built in raw alphabetical order with
+first-success-wins, so alerts came out of an unrelated agent's bot. A
+`PREFERRED_RELAY_AGENT` ordering now tries the root/admin agent first when its
+gateway socket is live, with all other agents kept as alphabetical fallback so
+delivery never regresses when that agent's gateway is down.
+
 ## v0.19.37 — Telegram formatting guidance realigned to the single GFM render path, and reversible Hindsight writes stop the permission-card flood
 
 A focused cleanup that makes the agent-facing formatting docs match what the
