@@ -50,6 +50,7 @@ function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
   const deps: ModelCommandDeps = {
     getAgentName: () => "klanker",
     getConfiguredModel: () => "claude-sonnet-5",
+    getConfiguredEffort: () => "low",
     escapeHtml: (s) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),
     preBlock: (s) => `<pre>${s}</pre>`,
@@ -241,7 +242,7 @@ import {
   MODEL_CALLBACK_PAGE_EXTERNAL,
   SR_MODEL_LABELS,
   SR_MODEL_ALIASES,
-  EXTRA_CLAUDE_ALIASES,
+  EXTRA_CLAUDE_MENU_TOKENS,
   expandSrAlias,
   externalModelNames,
   type ModelMenuDeps,
@@ -496,14 +497,14 @@ describe("classifyDiscoveredOptions", () => {
   });
 });
 
-describe("externalModelNames / SR_MODEL_LABELS / EXTRA_CLAUDE_ALIASES", () => {
+describe("externalModelNames / SR_MODEL_LABELS / EXTRA_CLAUDE_MENU_TOKENS", () => {
   it("seeds from the curated alias targets and merges discovered sr-*", () => {
     const names = externalModelNames(["sr-gpt-oss-20b"]);
     expect(names).toContain("sr-gemini-2.5-flash");
     expect(names).toContain("sr-gpt-oss-20b");
   });
-  it("Fable is offered as an extra Claude alias", () => {
-    expect(EXTRA_CLAUDE_ALIASES.some((a) => a.alias === "fable")).toBe(true);
+  it("Fable is offered as an extra Claude menu token", () => {
+    expect(EXTRA_CLAUDE_MENU_TOKENS.some((t) => t.token === "fable")).toBe(true);
   });
   it("labels are display-only strings", () => {
     expect(SR_MODEL_LABELS["sr-glm-5"]).toBeTypeOf("string");
@@ -909,5 +910,415 @@ describe("unvalidatedIdCaveat — immediate fail-fast warn on free-text claude-*
     expect(full.text).toContain("fallback");
     const alias = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(alias.text).not.toContain("can't be validated before launch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Short `/model` spellings for pinned Claude ids (CLAUDE_MODEL_ALIASES).
+//
+// Every assertion here FAILS on the pre-change code: `opus48` / `opus-4-8` were
+// passed through verbatim to the carrier (claude would 4xx or silently serve the
+// fallback), were refused by the offline-trust gate, and were not reachable from
+// the picker. The negative block pins the design constraint that made this a
+// separate map from SR_MODEL_ALIASES: these are Anthropic OAuth-passthrough
+// models and must NEVER be classified as external/OpenRouter routes.
+// ---------------------------------------------------------------------------
+import { readFileSync } from "node:fs";
+import {
+  CLAUDE_MODEL_ALIASES,
+  canonicalModelToken,
+  expandClaudeAlias,
+  expandModelAlias,
+  thinkingEffortCaveat,
+  buildModelMenu as buildModelMenuForAliases,
+} from "../gateway/model-command.js";
+
+const OPUS_48 = "claude-opus-4-8";
+
+describe("CLAUDE_MODEL_ALIASES — short spellings for a pinned Claude id", () => {
+  it("both requested spellings expand to the canonical id", () => {
+    expect(expandModelAlias("opus48")).toBe(OPUS_48);
+    expect(expandModelAlias("opus-4-8")).toBe(OPUS_48);
+    expect(expandClaudeAlias("opus48")).toBe(OPUS_48);
+    expect(expandClaudeAlias("opus-4-8")).toBe(OPUS_48);
+  });
+
+  it("expansion is case-insensitive", () => {
+    for (const spelling of ["OPUS48", "Opus48", "OPUS-4-8", "Opus-4-8"]) {
+      expect(expandModelAlias(spelling)).toBe(OPUS_48);
+    }
+  });
+
+  it("leaves every other token alone (sr aliases still expand, ids pass through)", () => {
+    expect(expandModelAlias("opus")).toBe("opus");
+    expect(expandModelAlias("default")).toBe("default");
+    expect(expandModelAlias("flash")).toBe("sr-gemini-2.5-flash");
+    expect(expandModelAlias("sr-glm-5")).toBe("sr-glm-5");
+    expect(expandModelAlias(OPUS_48)).toBe(OPUS_48);
+    // The Claude map must not swallow an sr-* shortcut, nor vice versa.
+    expect(expandClaudeAlias("flash")).toBe("flash");
+    expect(expandSrAlias("opus48")).toBe("opus48");
+  });
+
+  it("every target is a full claude-* id and a legal model arg", () => {
+    for (const target of Object.values(CLAUDE_MODEL_ALIASES)) {
+      expect(target.startsWith("claude-")).toBe(true);
+      expect(isValidModelArg(target)).toBe(true);
+    }
+  });
+
+  it("typed `/model opus48` relaunches on the canonical id, not the shortcut", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    const reply = await handleModelCommand({ kind: "set", model: "opus48" }, deps);
+    expect(relaunchCalls).toEqual([
+      { model: OPUS_48, reason: `user: /model ${OPUS_48} (session-only relaunch)` },
+    ]);
+    expect(reply.text).toContain(OPUS_48);
+    // The raw shortcut must never reach the carrier / `claude --model`.
+    expect(relaunchCalls[0].model).not.toBe("opus48");
+  });
+
+  it("typed `/model opus-4-8` relaunches on the canonical id", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    await handleModelCommand({ kind: "set", model: "opus-4-8" }, deps);
+    expect(relaunchCalls).toEqual([
+      { model: OPUS_48, reason: `user: /model ${OPUS_48} (session-only relaunch)` },
+    ]);
+  });
+
+  it("typed `/model OPUS48` (mixed case) relaunches on the canonical id", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    await handleModelCommand({ kind: "set", model: "OPUS48" }, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+  });
+
+  it("a mid-turn `/model opus48` QUEUES the expanded id (start.sh never sees the shortcut)", () => {
+    const busy = { currentTurnActive: true, turnInFlight: false, menuEnabled: true };
+    expect(planModelCommand({ kind: "set", model: "opus48" }, busy)).toEqual({
+      kind: "queue",
+      target: OPUS_48,
+    });
+    expect(planModelCommand({ kind: "set", model: "opus-4-8" }, busy)).toEqual({
+      kind: "queue",
+      target: OPUS_48,
+    });
+  });
+
+  it("a queued shortcut survives a boot: both the KEY and the TARGET are offline-trusted", () => {
+    expect(isOfflineTrustedModelToken("opus48")).toBe(true);
+    expect(isOfflineTrustedModelToken("opus-4-8")).toBe(true);
+    expect(isOfflineTrustedModelToken("OPUS48")).toBe(true);
+    expect(isOfflineTrustedModelToken(OPUS_48)).toBe(true);
+    // Still refuses an arbitrary hand-typed pinned id.
+    expect(isOfflineTrustedModelToken("claude-opus-4-9")).toBe(false);
+  });
+
+  it("parser → expansion round-trip: both spellings reach the canonical id", () => {
+    // The parser alone is not the contract (it tokenizes anything shape-legal —
+    // `opus_4_8` parses too and expands to nothing, see the near-miss issue).
+    // What must hold is the PIPELINE: parse, then the one expansion every
+    // `/model` path applies, lands on the canonical id.
+    for (const text of ["/model opus48", "/model opus-4-8", "/model OPUS48"]) {
+      const parsed = parseModelCommand(text);
+      expect(parsed?.kind).toBe("set");
+      expect(expandModelAlias((parsed as { model: string }).model)).toBe(OPUS_48);
+    }
+  });
+
+  it("NEGATIVE: the shortcuts are Claude, never external / sr-*", () => {
+    for (const token of ["opus48", "opus-4-8", "OPUS48", OPUS_48]) {
+      expect(isSrModel(token)).toBe(false);
+      expect(isClaudeModel(token)).toBe(true);
+    }
+    // Not in the external map, in either direction.
+    for (const key of Object.keys(CLAUDE_MODEL_ALIASES)) {
+      expect(key in SR_MODEL_ALIASES).toBe(false);
+      expect(Object.values(SR_MODEL_ALIASES)).not.toContain(key);
+    }
+    for (const target of Object.values(CLAUDE_MODEL_ALIASES)) {
+      expect(Object.values(SR_MODEL_ALIASES)).not.toContain(target);
+      expect(SR_MODEL_LABELS[target]).toBeUndefined();
+    }
+    // And never rendered on the 🌐 External keyboard page.
+    const external = externalModelNames(["sr-gpt-oss-20b"]);
+    for (const token of [...Object.keys(CLAUDE_MODEL_ALIASES), ...Object.values(CLAUDE_MODEL_ALIASES)]) {
+      expect(external).not.toContain(token);
+    }
+  });
+
+  it("the ACK names the canonical id and never echoes the raw shortcut back", async () => {
+    // Renamed from a "NEGATIVE: … no external ack copy" assertion that was
+    // vacuous: `sr-` / `billed separately` are equally absent from the
+    // pre-change ack, so it could not fail on the bug it claimed to guard.
+    // (The real external-classification constraint is pinned by the
+    // "NEGATIVE: the shortcuts are Claude, never external / sr-*" case above,
+    // which DOES fail without the expansion.) What is genuinely discriminating
+    // here is that the operator is told the id they actually got.
+    const { deps } = makeDeps();
+    const reply = await handleModelCommand({ kind: "set", model: "opus48" }, deps);
+    expect(reply.text).toContain(OPUS_48);
+    expect(reply.text).not.toMatch(/\bopus48\b/);
+    expect(reply.text).not.toContain("billed separately");
+  });
+
+  it("selectable: the pinned id is a main-page keyboard button", async () => {
+    const { deps } = makeMenuDeps();
+    const menu = await buildModelMenuForAliases(deps);
+    const buttons = (menu.keyboard ?? []).flat();
+    expect(buttons.some((b) => b.callback_data === `${MODEL_CALLBACK_ALIAS}${OPUS_48}`)).toBe(true);
+    expect(buttons.some((b) => b.text === "Opus 4.8")).toBe(true);
+  });
+
+  it("selectable mid-turn too: the static quick list carries the same button", async () => {
+    const { deps } = makeMenuDeps({ isBusy: () => true });
+    const menu = await buildModelMenuForAliases(deps);
+    const buttons = (menu.keyboard ?? []).flat();
+    expect(buttons.some((b) => b.callback_data === `${MODEL_CALLBACK_ALIAS}${OPUS_48}`)).toBe(true);
+  });
+
+  it("end-to-end: the RENDERED 'Opus 4.8' button's own payload relaunches on the canonical id", async () => {
+    // Drive the payload the keyboard actually mints rather than a hand-typed
+    // `mdl:alias:claude-opus-4-8` — the latter is recognized on the pre-change
+    // code too, so it could not fail on the bug it guards. Rendering first ties
+    // the button's existence and its payload together in one assertion.
+    const { deps, relaunchCalls } = makeMenuDeps();
+    const menu = await buildModelMenuForAliases(deps);
+    const button = (menu.keyboard ?? []).flat().find((b) => b.text === "Opus 4.8");
+    expect(button).toBeDefined();
+    await handleModelMenuCallback(button!.callback_data, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+  });
+
+  it("a shortcut arriving on a callback is expanded, not rejected as unrecognized", async () => {
+    const { deps, relaunchCalls } = makeMenuDeps();
+    await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}opus48`, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+  });
+
+  it("discoverable: help and the dashboard both name every spelling", async () => {
+    const { deps } = makeDeps();
+    const help = await handleModelCommand({ kind: "help" }, deps);
+    const show = await handleModelCommand({ kind: "show" }, deps);
+    for (const spelling of Object.keys(CLAUDE_MODEL_ALIASES)) {
+      expect(help.text).toContain(spelling);
+      expect(show.text).toContain(`/model ${spelling}`);
+    }
+    expect(help.text).toContain(OPUS_48);
+    expect(show.text).toContain(OPUS_48);
+  });
+
+  it("the exemption itself: a curated TARGET carries no 'can't be validated' caveat", async () => {
+    // The riskiest line in the change is the
+    // `Object.values(CLAUDE_MODEL_ALIASES).includes(lower)` early return in
+    // `unvalidatedIdCaveat`. Driving `/model opus48` does NOT exercise it: on
+    // the pre-change code `opus48` doesn't start with `claude-`, so the caveat
+    // is null for an unrelated reason. Test the full canonical id directly.
+    const deps = { escapeHtml: (s: string) => s, getConfiguredEffort: () => "low" };
+    for (const target of Object.values(CLAUDE_MODEL_ALIASES)) {
+      expect(unvalidatedIdCaveat(deps, target)).toBeNull();
+    }
+    // …and via the ack, on the full-id spelling as well as the shortcut.
+    const { deps: cmdDeps } = makeDeps();
+    for (const spelling of ["opus48", "opus-4-8", OPUS_48]) {
+      const reply = await handleModelCommand({ kind: "set", model: spelling }, cmdDeps);
+      expect(reply.text).not.toContain("can't be validated before launch");
+    }
+    // An UNcurated pinned id still warns — the exemption is not a blanket
+    // silencing of the caveat.
+    const other = await handleModelCommand({ kind: "set", model: "claude-opus-4-9" }, cmdDeps);
+    expect(other.text).toContain("can't be validated before launch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MAJOR-1: expansion and the caveat exemption must agree on ONE canonical form.
+//
+// Pre-fix, `expandModelAlias` emitted its argument VERBATIM on a map miss (no
+// lowercase, no trim) while `unvalidatedIdCaveat` lowercased before comparing.
+// So `/model CLAUDE-OPUS-4-8` (phone autocapitalize) was launched as the
+// uncanonical token `CLAUDE-OPUS-4-8` — an id claude cannot resolve, hence a
+// silent `--fallback-model` serve — under a clean green ack, because the
+// exemption matched the lowercased form. Both halves are asserted here.
+// ---------------------------------------------------------------------------
+describe("canonicalization — one form reaches `claude --model` and the caveat gate", () => {
+  it("canonicalModelToken lowercases claude-* ids, trims everything, touches nothing else", () => {
+    expect(canonicalModelToken("CLAUDE-OPUS-4-8")).toBe(OPUS_48);
+    expect(canonicalModelToken("Claude-Opus-4-8")).toBe(OPUS_48);
+    expect(canonicalModelToken(`  ${OPUS_48}  `)).toBe(OPUS_48);
+    expect(canonicalModelToken("Claude-Opus-4-9")).toBe("claude-opus-4-9");
+    // Non-claude tokens keep their case — sr-* ids are not ours to rewrite.
+    expect(canonicalModelToken("sr-GLM-5")).toBe("sr-GLM-5");
+    expect(canonicalModelToken(" sr-glm-5 ")).toBe("sr-glm-5");
+    expect(canonicalModelToken("opus")).toBe("opus");
+  });
+
+  it("expandModelAlias emits the canonical form on a MISS, not the raw argument", () => {
+    expect(expandModelAlias("CLAUDE-OPUS-4-8")).toBe(OPUS_48);
+    expect(expandModelAlias("Claude-Opus-4-8")).toBe(OPUS_48);
+    expect(expandModelAlias("Claude-Opus-4-9")).toBe("claude-opus-4-9");
+    // …and trims, matching what `unvalidatedIdCaveat` has always done.
+    expect(expandModelAlias(" opus48 ")).toBe(OPUS_48);
+    expect(expandModelAlias(` ${OPUS_48} `)).toBe(OPUS_48);
+  });
+
+  it("a mixed-case pinned id is LAUNCHED canonical, not verbatim", async () => {
+    for (const spelling of ["CLAUDE-OPUS-4-8", "Claude-Opus-4-8"]) {
+      const { deps, relaunchCalls } = makeDeps();
+      const reply = await handleModelCommand({ kind: "set", model: spelling }, deps);
+      expect(relaunchCalls).toEqual([
+        { model: OPUS_48, reason: `user: /model ${OPUS_48} (session-only relaunch)` },
+      ]);
+      // The uncanonical token must not survive anywhere the operator can see
+      // it either — the ack names what actually boots.
+      expect(reply.text).not.toContain(spelling);
+      expect(reply.text).toContain(OPUS_48);
+    }
+  });
+
+  it("an UNCURATED mixed-case pinned id is canonicalized AND still warned about", async () => {
+    const { deps, relaunchCalls } = makeDeps();
+    const reply = await handleModelCommand({ kind: "set", model: "CLAUDE-OPUS-4-9" }, deps);
+    expect(relaunchCalls[0].model).toBe("claude-opus-4-9");
+    expect(reply.text).toContain("can't be validated before launch");
+  });
+
+  it("the caveat exemption agrees with expansion across the whole casing matrix", () => {
+    const deps = { escapeHtml: (s: string) => s, getConfiguredEffort: () => "low" };
+    for (const spelling of [
+      OPUS_48,
+      "CLAUDE-OPUS-4-8",
+      "Claude-Opus-4-8",
+      `  ${OPUS_48}  `,
+      " CLAUDE-OPUS-4-8 ",
+    ]) {
+      // Exempt (curated target) …
+      expect(unvalidatedIdCaveat(deps, spelling)).toBeNull();
+      // … and that is only sound because expansion emits the SAME form.
+      expect(expandModelAlias(spelling)).toBe(OPUS_48);
+    }
+    for (const spelling of ["claude-opus-4-9", "CLAUDE-OPUS-4-9", "Claude-Sonnet-9"]) {
+      expect(unvalidatedIdCaveat(deps, spelling)).not.toBeNull();
+    }
+  });
+
+  it("the callback shape gate still runs on the RAW payload (trim must not widen it)", async () => {
+    const { deps, relaunchCalls } = makeMenuDeps();
+    // `expandModelAlias` trims; the shape gate exists to guarantee a single
+    // whitespace-free token reaches the tmux pane, so a padded payload must
+    // still be refused rather than trimmed into legality.
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS} ${OPUS_48} `, deps);
+    expect(out.answer).toBe("Invalid model name");
+    expect(relaunchCalls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MAJOR-2: the #1978 adaptive-thinking risk must surface at SWITCH time.
+//
+// `assessThinkingEffortRisk` had exactly one consumer — `switchroom doctor`,
+// which reads the CONFIGURED `model:` out of switchroom.yaml. A `/model` switch
+// is session-scoped, so every route onto a pinned Opus 4.x id (typed, shortcut,
+// or the one-tap "Opus 4.8" button this change adds) reached the exact
+// (pinned Opus 4.x, effort > low) combination doctor exists to warn about with
+// no warning anywhere. These fail on BOTH the pre-change code and the
+// pre-fix PR head.
+// ---------------------------------------------------------------------------
+const MERGE_400_MARKER = "issue #1978";
+
+describe("thinking_effort × pinned Opus 4.x — surfaced when the switch is made", () => {
+  it("typed switch onto a pinned Opus 4.x at medium effort warns in the ack", async () => {
+    const { deps } = makeDeps({ getConfiguredEffort: () => "medium" });
+    const reply = await handleModelCommand({ kind: "set", model: OPUS_48 }, deps);
+    expect(reply.text).toContain(MERGE_400_MARKER);
+    expect(reply.text).toContain("medium");
+  });
+
+  it("the SHORTCUT spelling warns too — the risk follows the expanded target", async () => {
+    const { deps } = makeDeps({ getConfiguredEffort: () => "high" });
+    const reply = await handleModelCommand({ kind: "set", model: "opus48" }, deps);
+    expect(reply.text).toContain(MERGE_400_MARKER);
+  });
+
+  it("the one-tap 'Opus 4.8' BUTTON warns too — the easiest route into the combo", async () => {
+    const { deps } = makeMenuDeps({ getConfiguredEffort: () => "medium" });
+    const menu = await buildModelMenuForAliases(deps);
+    const button = (menu.keyboard ?? []).flat().find((b) => b.text === "Opus 4.8");
+    const out = await handleModelMenuCallback(button!.callback_data, deps);
+    expect(out.reply.text).toContain(MERGE_400_MARKER);
+  });
+
+  it("NEGATIVE: safe combos stay quiet — low effort, Opus 5, the bare alias, sonnet", async () => {
+    const atLow = makeDeps({ getConfiguredEffort: () => "low" });
+    expect(
+      (await handleModelCommand({ kind: "set", model: OPUS_48 }, atLow.deps)).text,
+    ).not.toContain(MERGE_400_MARKER);
+
+    const atMedium = makeDeps({ getConfiguredEffort: () => "medium" });
+    for (const safe of ["opus", "claude-opus-5-20260601", "sonnet", "sr-glm-5"]) {
+      const reply = await handleModelCommand({ kind: "set", model: safe }, atMedium.deps);
+      expect(reply.text).not.toContain(MERGE_400_MARKER);
+    }
+  });
+
+  it("NEGATIVE: an unreadable effort never blocks or fails the switch", async () => {
+    const { deps, relaunchCalls } = makeDeps({
+      getConfiguredEffort: () => { throw new Error("agent list unavailable"); },
+    });
+    const reply = await handleModelCommand({ kind: "set", model: OPUS_48 }, deps);
+    expect(relaunchCalls).toEqual([expect.objectContaining({ model: OPUS_48 })]);
+    expect(reply.text).not.toContain(MERGE_400_MARKER);
+
+    const unset = makeDeps({ getConfiguredEffort: () => null });
+    expect(
+      (await handleModelCommand({ kind: "set", model: OPUS_48 }, unset.deps)).text,
+    ).not.toContain(MERGE_400_MARKER);
+  });
+
+  it("thinkingEffortCaveat is advisory only — it never rewrites the effort", () => {
+    const escapeHtml = (s: string) => s;
+    expect(thinkingEffortCaveat({ escapeHtml, getConfiguredEffort: () => "max" }, OPUS_48))
+      .toContain(MERGE_400_MARKER);
+    expect(thinkingEffortCaveat({ escapeHtml, getConfiguredEffort: () => "low" }, OPUS_48))
+      .toBeNull();
+    expect(thinkingEffortCaveat({ escapeHtml, getConfiguredEffort: () => "max" }, "opus"))
+      .toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The queued-across-restart persist path (gateway.ts). `persistQueuedCommandForRestart`
+// is module-local in a ~25k-line file that cannot be imported into a unit test,
+// so this is a source ratchet in the style of
+// `tests/scaffold.session-model.test.ts`: it pins the ONE line that decides
+// which token survives a restart. Pre-change that call used `expandSrAlias`, so
+// a queued `/model opus48` was persisted as the raw shortcut and start.sh
+// launched a token claude cannot resolve.
+// ---------------------------------------------------------------------------
+describe("gateway persist path uses the shared expansion, not the sr-only one", () => {
+  const gatewaySrc = readFileSync(
+    new URL("../gateway/gateway.ts", import.meta.url),
+    "utf-8",
+  );
+
+  it("the `.session-model` carrier write expands through expandModelAlias", () => {
+    expect(gatewaySrc).toContain(
+      "writeSessionModelFile(agentDir, expandModelAlias(action.arg), configured)",
+    );
+    expect(gatewaySrc).not.toContain("writeSessionModelFile(agentDir, expandSrAlias(");
+    // …and the symbol is actually imported, so the above is live code.
+    expect(gatewaySrc).toMatch(/^\s*expandModelAlias,$/m);
+  });
+
+  it("the MODEL deps wire the configured effort for the switch-time guard", () => {
+    // Anchored on the model deps' own `getConfiguredModel` reader — the effort
+    // reader already existed on the EFFORT deps (`buildEffortDeps`), so a bare
+    // substring match would pass without the model side being wired at all.
+    const lines = gatewaySrc.split("\n");
+    const anchor = lines.findIndex((l) =>
+      l.includes("return data?.agents?.find(a => a.name === getMyAgentName())?.model ?? null"),
+    );
+    expect(anchor).toBeGreaterThan(-1);
+    const window = lines.slice(anchor, anchor + 15).join("\n");
+    expect(window).toContain("getConfiguredEffort: () => getConfiguredEffortForPersist(),");
   });
 });

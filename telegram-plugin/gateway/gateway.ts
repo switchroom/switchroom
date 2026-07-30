@@ -564,7 +564,7 @@ import {
   MODEL_CALLBACK_PAGE_EXTERNAL,
   MODEL_CALLBACK_PAGE_MAIN,
   srFriendlyLabel,
-  expandSrAlias,
+  expandModelAlias,
   isSrModel,
   isBusyRefusalText,
   isOfflineTrustedModelToken,
@@ -16961,6 +16961,9 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
       return data?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
     },
+    // Feeds the switch-time #1978 assessment (thinkingEffortCaveat); see the
+    // ModelCommandDeps.getConfiguredEffort doc for why doctor can't make it.
+    getConfiguredEffort: () => getConfiguredEffortForPersist(),
     escapeHtml: escapeHtmlForTg,
     preBlock,
     /**
@@ -17259,7 +17262,7 @@ function persistQueuedCommandForRestart(action: ShutdownResolutionAction): strin
         const configured =
           readConfiguredDefaultModel(agentDir) ?? resolveMainModel(undefined)
         // Consume-once carrier: applied by the next boot, then reverts.
-        writeSessionModelFile(agentDir, expandSrAlias(action.arg), configured)
+        writeSessionModelFile(agentDir, expandModelAlias(action.arg), configured)
         break
       }
       case 'clear-model':
