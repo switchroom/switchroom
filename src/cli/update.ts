@@ -70,6 +70,7 @@ import {
   formatComponentDrift,
   type ExecFn,
 } from "./component-versions.js";
+import { reconcileCron } from "../hindsight-watch/install-cron.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -210,6 +211,10 @@ interface UpdateOptions {
   selfUpdateSink?: { replacedWith?: string; binaryPath?: string };
   /** Test seam — replace the re-exec of the freshly installed binary. */
   reexecFn?: (binaryPath: string, args: string[]) => { status: number };
+  /** Test seam — override the /etc/cron.d/hindsight-watch path the
+   *  `reconcile-hindsight-watch-cron` step reconciles (default: the real
+   *  `CRON_PATH`). Lets the step be exercised against a temp file. */
+  watchCronPath?: string;
 }
 
 interface UpdateStep {
@@ -648,6 +653,72 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         ...releaseOverrideArgs,
       ));
       if (r.status !== 0) throw new Error("switchroom apply failed");
+    },
+  });
+
+  // reconcile-hindsight-watch-cron: re-assert the hindsight-watch cron
+  // definition on every update so an already-armed host can't drift.
+  //
+  // The watchdog cron (`/etc/cron.d/hindsight-watch`) pins the binary path,
+  // schedule, flags and PATH when it is armed, but nothing re-asserted it
+  // afterwards — so a definition change, or a binary that moved out from under
+  // the fragment, would persist silently until someone re-ran
+  // `--install-cron` by hand. This step folds that reconcile into `update`,
+  // right after apply-config where the rest of the host's generated surfaces
+  // are refreshed.
+  //
+  // It is REPAIR, not ARM: `reconcileCron` is a no-op when the fragment is
+  // absent (arming stays the explicit `hindsight-watch --install-cron` opt-in,
+  // and `switchroom doctor` FAILs while unarmed), and idempotent when present
+  // and already correct. The operator's chosen `--cron-user` is preserved.
+  //
+  // Deferred in hostd-context: `/etc/cron.d` lives on the host, not inside the
+  // hostd container, so writing it from there would land in the wrong
+  // filesystem. Never fatal — a failed reconcile warns and continues; the
+  // update itself succeeded.
+  steps.push({
+    name: "reconcile-hindsight-watch-cron",
+    description:
+      "Reconcile /etc/cron.d/hindsight-watch (binary path / schedule / flags) on already-armed hosts — idempotent; no-op when unarmed or already current",
+    skipReason: hostdContext
+      ? "deferred (hostd-context): /etc/cron.d is on the host, not in the hostd container — finish host-side with `switchroom hindsight-watch --install-cron`"
+      : undefined,
+    isHostdDeferred: hostdContext,
+    run: () => {
+      const say = opts.stdout ?? ((t: string) => process.stdout.write(t));
+      const binary = process.env.SWITCHROOM_BINARY ?? "/usr/local/bin/switchroom";
+      const fallbackUser =
+        process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME;
+      let res: ReturnType<typeof reconcileCron>;
+      try {
+        res = reconcileCron({
+          binary,
+          fallbackUser,
+          ...(opts.watchCronPath ? { path: opts.watchCronPath } : {}),
+        });
+      } catch (e) {
+        // Non-fatal: the update succeeded; a cron we couldn't reconcile is a
+        // diagnostic, not an update failure. `switchroom doctor` carries the
+        // standing signal.
+        say(
+          chalk.yellow(
+            `  hindsight-watch cron not reconciled: ${(e as Error).message}\n`,
+          ),
+        );
+        return;
+      }
+      if (res.status === "absent") {
+        say(
+          chalk.gray(
+            "  hindsight-watch cron not armed — skipping reconcile " +
+              "(arm with `switchroom hindsight-watch --install-cron`; doctor FAILs while unarmed)\n",
+          ),
+        );
+      } else if (res.status === "reconciled") {
+        say(chalk.green(`  hindsight-watch cron reconciled at ${res.path}\n`));
+      } else {
+        say(chalk.gray(`  hindsight-watch cron already current at ${res.path}\n`));
+      }
     },
   });
 
