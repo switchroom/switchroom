@@ -36,7 +36,7 @@ function fakeRunner() {
 }
 
 describe("planUpdate", () => {
-  it("produces 10 steps in default mode (no --rebuild)", () => {
+  it("produces 11 steps in default mode (no --rebuild)", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-plan-"));
     try {
       const composePath = join(tmp, "docker-compose.yml");
@@ -54,6 +54,7 @@ describe("planUpdate", () => {
         "self-update-cli",
         "pull-images",
         "apply-config",
+        "reconcile-hindsight-watch-cron",
         "refresh-hostd",
         "refresh-web",
         "refresh-hindsight",
@@ -66,6 +67,70 @@ describe("planUpdate", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  describe("reconcile-hindsight-watch-cron step (#silent-cli-drift)", () => {
+    const OLD_ENV = { ...process.env };
+    function stepFor(opts: Parameters<typeof planUpdate>[0]) {
+      return planUpdate({ composePath: "unused", ...opts }).find(
+        (s) => s.name === "reconcile-hindsight-watch-cron",
+      )!;
+    }
+
+    it("REWRITES the cron when it differs, then is a NO-OP when identical", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "update-cron-"));
+      try {
+        process.env.SWITCHROOM_BINARY = "/usr/local/bin/switchroom";
+        const cronPath = join(tmp, "hindsight-watch");
+        // Armed earlier as `ada` at a STALE binary path.
+        writeFileSync(
+          cronPath,
+          [
+            "# switchroom hindsight-watch — model-free memory watchdog.",
+            "# Managed by `switchroom hindsight-watch --install-cron`; edits are overwritten.",
+            "# Exit 0 = clean, 10 = a signal is firing (DM sent), 1 = the check could not complete.",
+            "SHELL=/bin/sh",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "*/15 * * * * ada /usr/bin/flock -n /run/lock/hindsight-watch.lock /opt/old/switchroom hindsight-watch >> /var/log/hindsight-watch.log 2>&1",
+            "",
+          ].join("\n"),
+        );
+        const before = readFileSync(cronPath, "utf8");
+
+        // First run: the stale binary path is corrected → file changes.
+        stepFor({ watchCronPath: cronPath }).run();
+        const after = readFileSync(cronPath, "utf8");
+        expect(after).not.toBe(before);
+        expect(after).toContain("/usr/local/bin/switchroom hindsight-watch");
+        expect(after).not.toContain("/opt/old/switchroom");
+        // The operator's chosen user is preserved, not overwritten to root.
+        expect(after).toContain("*/15 * * * * ada ");
+
+        // Second run: definition already current → byte-identical no-op.
+        stepFor({ watchCronPath: cronPath }).run();
+        expect(readFileSync(cronPath, "utf8")).toBe(after);
+      } finally {
+        process.env = { ...OLD_ENV };
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("is a NO-OP when the host was never armed (no fragment present)", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "update-cron-absent-"));
+      try {
+        const cronPath = join(tmp, "hindsight-watch");
+        // Must not throw and must not create the file — arming stays opt-in.
+        expect(() => stepFor({ watchCronPath: cronPath }).run()).not.toThrow();
+        expect(existsSync(cronPath)).toBe(false);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("is deferred (skipReason) in hostd-context — /etc/cron.d is on the host", () => {
+      expect(stepFor({ hostdContext: true }).skipReason).toMatch(/hostd-context/);
+      expect(stepFor({ hostdContext: false }).skipReason).toBeUndefined();
+    });
   });
 
   it("refresh-hindsight runs when memory.backend is hindsight, skips otherwise / on --skip-images", () => {
@@ -271,6 +336,7 @@ describe("planUpdate", () => {
         "pull-images",
         "rebuild-source",
         "apply-config",
+        "reconcile-hindsight-watch-cron",
         "refresh-hostd",
         "refresh-web",
         "refresh-hindsight",

@@ -114,3 +114,92 @@ export function installCron(
   renameSync(tmp, path);
   return { status: "installed", path, content };
 }
+
+/**
+ * Parse the unix user field out of an existing cron fragment.
+ *
+ * `/etc/cron.d` lines are `MIN HOUR DOM MON DOW USER COMMAND` — the sixth
+ * whitespace-delimited field. We match the managed line (the one that invokes
+ * `hindsight-watch`) rather than any comment/`SHELL=`/`PATH=` line, and return
+ * that user so a reconcile PRESERVES the operator's chosen `--cron-user`
+ * instead of guessing it from the reconciling process's environment (which,
+ * under `sudo switchroom update`, would be `root` — the exact value
+ * `--install-cron` refuses).
+ *
+ * Returns null when no managed schedule line is found (empty/foreign/malformed
+ * fragment), so the caller can fall back or decline to touch it.
+ */
+export function parseCronUser(content: string): string | null {
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (!trimmed.includes("hindsight-watch")) continue;
+    // MIN HOUR DOM MON DOW USER … — the user is the 6th field.
+    const fields = trimmed.split(/\s+/);
+    if (fields.length >= 7) return fields[5];
+  }
+  return null;
+}
+
+export interface ReconcileResult {
+  /**
+   * `absent`     — the fragment is not present; the host never armed the
+   *                watchdog, so reconcile does nothing (arming stays the
+   *                explicit opt-in, and `switchroom doctor` FAILs while
+   *                unarmed).
+   * `reconciled` — the fragment existed but drifted (stale binary path,
+   *                schedule, flags, or PATH) and was rewritten to match.
+   * `unchanged`  — the fragment existed and already matched — a true no-op.
+   */
+  status: "absent" | "reconciled" | "unchanged";
+  path: string;
+  content?: string;
+}
+
+/**
+ * Reconcile an ALREADY-ARMED hindsight-watch cron to the current definition.
+ *
+ * ## Why this is separate from {@link installCron}
+ *
+ * `installCron` ARMS — it writes the fragment whether or not one exists. That
+ * is the opt-in `--install-cron` verb's job. `reconcileCron` REPAIRS — it only
+ * touches a fragment that already exists, so `switchroom update` can keep every
+ * armed host's cron definition current (the binary path, schedule, flags and
+ * PATH) without silently arming a host that deliberately never opted in.
+ *
+ * This closes the drift that let a stale cron survive an update: the fragment's
+ * `binary` path is pinned when written, but nothing re-asserted it, so a
+ * definition change (or a moved binary) would persist until someone re-ran
+ * `--install-cron` by hand.
+ *
+ * Idempotent: re-running changes nothing once the fragment matches. The user
+ * field is preserved from the existing fragment (see {@link parseCronUser}),
+ * falling back to `fallbackUser` only when the existing line is unparseable.
+ */
+export function reconcileCron(opts: {
+  binary: string;
+  path?: string;
+  fallbackUser?: string;
+}): ReconcileResult {
+  const path = opts.path ?? CRON_PATH;
+  if (!existsSync(path)) return { status: "absent", path };
+  let user = opts.fallbackUser;
+  try {
+    user = parseCronUser(readFileSync(path, "utf8")) ?? opts.fallbackUser;
+  } catch {
+    // Unreadable — fall back to the provided user and let installCron rewrite.
+  }
+  if (!user) {
+    // No user to render with and none parseable: refuse to write a fragment
+    // with an empty/invalid user field rather than break the cron.
+    throw new Error(
+      `cannot reconcile ${path}: no cron-user parseable from the existing fragment and no fallback user available`,
+    );
+  }
+  const r = installCron({ user, binary: opts.binary, path });
+  return {
+    status: r.status === "installed" ? "reconciled" : "unchanged",
+    path,
+    content: r.content,
+  };
+}
