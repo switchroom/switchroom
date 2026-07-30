@@ -14,7 +14,7 @@
  *   • remove  → the card is finalized as "folded into the current task".
  *   • TTL     → the card is finalized as timed-out, never left frozen.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import {
   handleSessionEvent,
   __resetParkedTurnStartsForTest,
@@ -131,33 +131,38 @@ describe('Part B — queued card is finalized, never frozen', () => {
   })
 
   it('finalizes the card as timed-out on TTL expiry (a dequeue that never arrives)', async () => {
-    vi.useFakeTimers()
+    // Runner-agnostic: the TTL prune reads wall-clock `Date.now()` (it is NOT a
+    // scheduled setTimeout), so we drive it by advancing `Date.now` around the
+    // dequeue rather than a vitest-only fake-timer API (`vi.runAllTimersAsync`
+    // is absent under bun — the same reason handback-preturn-signal.test.ts
+    // injects its own scheduler). `parkedAt` is stamped with the REAL clock at
+    // park; only the prune's `now` is advanced, so the entry ages past the TTL.
+    const h = makeHarness()
+    const rec = withRecordingBot(h)
+
+    handleSessionEvent(h.deps, enqueue('1201'))
+    const turnA = h.current()!
+    handleSessionEvent(h.deps, enqueue('1202'))
+    await settle() // real microtask/macrotask flush → the card id lands on the entry
+    expect(rec.sends).toHaveLength(1)
+    const cardId = rec.sends[0]!.id
+
+    // 31 minutes pass with neither dequeue nor remove; a stray dequeue prunes it.
+    const realNow = Date.now
+    Date.now = () => realNow() + 31 * 60_000
     try {
-      const h = makeHarness()
-      const rec = withRecordingBot(h)
-
-      handleSessionEvent(h.deps, enqueue('1201'))
-      const turnA = h.current()!
-      handleSessionEvent(h.deps, enqueue('1202'))
-      // Under fake timers the send still resolves on a real microtask flush.
-      await vi.runAllTimersAsync()
-      expect(rec.sends).toHaveLength(1)
-      const cardId = rec.sends[0]!.id
-
-      // 31 minutes pass with neither dequeue nor remove; a stray dequeue prunes it.
-      vi.advanceTimersByTime(31 * 60_000)
       turnA.endedAt = Date.now()
       handleSessionEvent(h.deps, { kind: 'dequeue' })
-      await vi.runAllTimersAsync()
-
-      expect(__parkedTurnStartCountForTest()).toBe(0)
-      expect(h.current()).toBe(turnA) // 1202 was NOT minted 31 min late
-      expect(rec.edits).toHaveLength(1)
-      expect(rec.edits[0]!.messageId).toBe(cardId)
-      expect(rec.edits[0]!.markdown).toContain('timed out')
     } finally {
-      vi.useRealTimers()
+      Date.now = realNow
     }
+    await settle()
+
+    expect(__parkedTurnStartCountForTest()).toBe(0)
+    expect(h.current()).toBe(turnA) // 1202 was NOT minted 31 min late
+    expect(rec.edits).toHaveLength(1)
+    expect(rec.edits[0]!.messageId).toBe(cardId)
+    expect(rec.edits[0]!.markdown).toContain('timed out')
   })
 })
 
