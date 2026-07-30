@@ -1,10 +1,13 @@
 # Changelog
 
-## Unreleased — Telegram formatting guidance realigned to the single GFM render path
+## Unreleased
 
-Ships in v0.19.37. A focused cleanup that makes the agent-facing formatting
-docs match what the runtime actually does, and closes three small correctness
-gaps in the deterministic send-time normalizers.
+## v0.19.37 — Telegram formatting guidance realigned to the single GFM render path, and reversible Hindsight writes stop the permission-card flood
+
+A focused cleanup that makes the agent-facing formatting docs match what the
+runtime actually does and closes three small correctness gaps in the
+deterministic send-time normalizers, plus a memory fix that stops correction-heavy
+workloads from drowning the operator in approval cards.
 
 ### Reply-tool `format` docs described deleted engines
 
@@ -42,6 +45,20 @@ as a footnote — rare, since real regex/index literals live in masked code span
   rewrites to `- ` at send time; the example now uses canonical `- `.
 - The floor card and depth reference now note the expandable-blockquote `**>`
   opener must be at line start (column 0) — never indented — or it won't parse.
+
+### Reversible Hindsight writes no longer flood the operator with cards (#4020)
+
+Every `mcp__hindsight__invalidate_memory` / `mcp__hindsight__update_memory` call
+raised a fresh Telegram permission card, so a correction-heavy workload (e.g. 73
+`invalidate_memory` calls) produced 73 approval taps. Both tools are
+**reversible** writes — `invalidate_memory` soft-retires with a `restore` path,
+`update_memory` edits fields in place — but neither was in the agent scaffold's
+enumerated `HINDSIGHT_MCP_TOOLS` pre-approval seed, so each fell through to a
+per-call prompt. They are now pre-approved alongside the existing reversible
+writes. The permanently-destructive tools (`clear_memories`, `delete_bank`,
+`delete_directive`, and the mental-model write tools) stay gated — a wildcard
+grant is deliberately banned here so mental-model writes can't ride in ungated,
+and a test asserts the destructive tools remain behind their approval card.
 
 ## v0.19.36 — credit exhaustion fails loudly, an honest model-switch card, memory redaction at intake, and Telegram keeps its headings
 
