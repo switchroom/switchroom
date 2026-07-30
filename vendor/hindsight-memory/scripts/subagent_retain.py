@@ -3,10 +3,23 @@
 
 Delegated (sub-agent / Task-tool) work is the biggest systematic memory hole:
 the main-session Stop retain only ever reads the parent ``transcript_path``, so
-a worker's hours of process work — the paths it touched, the commands that
-worked, the dead ends — reach memory only as the terse final report the parent
+a worker's hours of reasoning — the constraints it discovered, the structural
+dead ends it ruled out — reach memory only as the terse final report the parent
 transcript captures. This hook closes that hole by retaining a bounded window of
 the *sidechain* transcript when a sub-agent terminates.
+
+Scope (Ken, 2026-07-29): LEARNINGS, not raw transcripts and tools. The window is
+retained on the TEXT-ONLY formatting path (``run_subagent_retain`` forces
+``retainToolCalls = False`` on its config copy), so what reaches memory is the
+sub-agent's own prose — reasoning, findings, final report — and NOT tool_use
+inputs, tool_result bodies, file contents or diffs.
+
+The text-only path cannot format to nothing here: the volume gate already
+requires ``MIN_HUMAN_TURNS`` GENUINE human turns (tool_result-only user messages
+are explicitly not counted, ``count_human_turns``), and every such turn is a
+plain-string user message that ``_extract_text_content`` returns verbatim. So a
+window that clears the gate always carries at least its instruction turns, and
+``build_retain_payload`` never returns None on this path for volume reasons.
 
 Probe result (Claude Code 2.1.215, PR5 Task 0 — recorded in the PR body):
 the ``SubagentStop`` hook input carries BOTH the parent ``transcript_path`` AND
@@ -62,8 +75,11 @@ from lib.pacing import inflight_lock
 # stays byte-identical to the main path where it matters (dedup ids, formatting).
 from retain import build_retain_payload, read_transcript
 
-# Retain the last N human turns of the sidechain. Tool-result bodies inside the
-# window are truncated by _extract_message_blocks (content.py) already.
+# Retain the last N human turns of the sidechain. The window is formatted on the
+# TEXT-ONLY path (``retainToolCalls`` is forced False for the sidechain — see
+# ``run_subagent_retain``), so tool_use inputs and tool_result bodies are dropped
+# entirely rather than passed through / truncated. ``_extract_message_blocks`` is
+# still imported here, but only for the volume gate's char count.
 SIDECHAIN_WINDOW_TURNS = 40
 
 # Volume gate floors — SubagentStop fires for every Task, so skip trivial forks.
@@ -256,6 +272,14 @@ def non_tool_result_char_count(messages: list, stop_at: int | None = None) -> in
     the floor even if it emitted a large tool_result, while a real worker's
     commands and decisions count.
 
+    KNOWN MISMATCH (accepted, tracked as a follow-up): this counts ``tool_use``
+    inputs, but those are no longer RETAINED — the sidechain payload is built on
+    the text-only path. So the gate can clear on tool volume that contributes
+    nothing to the stored memory. It cannot produce an EMPTY retain (the
+    ``MIN_HUMAN_TURNS`` floor guarantees prose-bearing user turns — see the
+    module docstring), so this is a precision issue in the gate, not a
+    correctness bug. Tightening it to count only text is a separate change.
+
     ``stop_at`` (review finding 4 — early short-circuit): return as soon as the
     running total reaches this many chars. The gate only needs to know whether
     the floor is CLEARED, not the exact size — so on a large worker transcript
@@ -396,9 +420,32 @@ def run_subagent_retain(hook_input: dict) -> dict:
     # main-session retains: reuse retain.py's ``slice_document_id`` recipe via a
     # composite session key so (a) re-fires of the SAME sub-agent window upsert
     # server-side, and (b) it never collides with the parent's own
-    # ``{session_id}-r...`` documents. Client-side diffing against the parent's
-    # final-report retain is deliberately NOT attempted — overlap is fine, and
-    # hindsight's consolidation dedups (design item 4).
+    # ``{session_id}-r...`` documents.
+    #
+    # Client-side diffing against the parent's final-report retain is still NOT
+    # attempted, but NOT because "hindsight's consolidation dedups" — the
+    # original claim here (design item 4) was FALSE and is the assumption that
+    # licensed the sidechain volume. Verified against the engine source
+    # (upstream image ``ghcr.io/vectorize-io/hindsight``):
+    #   * The only SEMANTIC dedup lives in
+    #     ``hindsight_api/engine/consolidation/consolidator.py`` and is a guard
+    #     on the consolidator's OWN OUTPUT: ``_dedup_adjudicate`` probes a newly
+    #     created/updated ``observation`` against existing ones, passing the
+    #     literal fact-type list ``["observation"]`` to
+    #     ``retrieve_semantic_bm25_combined``.
+    #   * ``world`` and ``experience`` are the raw extracted facts that FEED the
+    #     consolidator (it selects ``fact_type IN ('experience', 'world')`` for
+    #     unconsolidated rows) — they never traverse the observation dedup path.
+    #   * Grepping ``hindsight_api/engine/retain/*.py`` for dedup finds only
+    #     content-hash CHUNK dedup (``chunk_storage.compute_chunk_hash``), i.e.
+    #     byte-identical-chunk skipping. There is no semantic dedup on the
+    #     retain path at all.
+    # So overlap between a sidechain retain and the parent's own retain persists
+    # as extra ``world``/``experience`` rows forever. Volume control has to come
+    # from retaining LESS (see ``retainToolCalls`` below), not from a downstream
+    # dedup that does not exist. Diffing is still skipped here because the
+    # deterministic document_id already makes re-fires of the SAME window upsert,
+    # which is the duplicate class this path can actually create.
     sub_session_id = f"{session_id}-sub-{agent_id}"
 
     # Sidechain tags + a topic-friendly parent link. Reuse the config-driven tag
@@ -407,6 +454,55 @@ def run_subagent_retain(hook_input: dict) -> dict:
     # (recallTagWeights); ``parent_session:<id>`` lets a fresh session pull a
     # worker's process facts by parent.
     sub_config = dict(config)
+
+    # Learnings, not raw transcripts and tools (Ken, 2026-07-29): "I don't want
+    # sub-agents' transcripts but definitely their learnings should be captured
+    # but not raw transcripts and tools."
+    #
+    # With ``retainToolCalls`` on, ``build_retain_payload`` formats the window
+    # via ``_prepare_json_transcript`` → ``_extract_message_blocks``, which emits
+    # every ``tool_use.input`` verbatim (an entire ``Write.content``, a full
+    # ``Edit`` diff, a full ``Bash.command``) plus every ``tool_result`` at up to
+    # 2,000 chars per block.
+    #
+    # The cost mechanism is DOCUMENT FAN-OUT, not one oversized payload: a large
+    # payload is not truncated, it is CAPPED and SPLIT by
+    # ``lib.retain_split.split_retain_content`` at ``retain_content_limit()``
+    # (33,000 chars on the shipped inputs) into ``{base}-p{i}of{n}`` parts
+    # (``client.py`` ~:235). Real sidechain retains have been observed splitting
+    # into 38 parts / 1,022 messages, and every part is separately chunked and
+    # LLM-extracted into ``world``/``experience`` rows. Shrinking the content is
+    # therefore the lever that reduces rows.
+    #
+    # Forcing it OFF for the sidechain path routes the window through
+    # ``_prepare_text_transcript`` → ``_extract_text_content``, keeping assistant
+    # ``text`` blocks and channel-message tool_use text. Measured on real fleet
+    # sidechains: 5.5x smaller over 30 sampled transcripts (2,012,376 → 367,796
+    # chars), and independently 6.4x over the 84 most recent GATE-PASSING ones
+    # (26,278,261 → 4,085,678 chars) — of which 0 formatted to empty and 0 came
+    # out under 500 chars.
+    #
+    # ACCEPTED LOSS — this is not a clean "tool noise only" filter.
+    # ``_extract_text_content`` also drops image blocks, ALL ``tool_result``
+    # content, and sub-agent Task report bodies. So a fact that existed ONLY in
+    # tool output is unrecoverable: if a query returned ``43442`` and the agent
+    # merely replied "checked, it's the backlog", the number is gone. That trade
+    # is deliberate and is what Ken asked for; sub-agent prose was separately
+    # measured to carry durable learnings at essentially the main-session rate
+    # (5.24% vs 6.87%), so the learnings themselves survive.
+    #
+    # Mid-session safety: ``slice_document_id`` derives the BASE id from the
+    # slice's first/last uuids, not from the formatted text, so a re-fire of the
+    # same window still targets the same base id. Note the part SUFFIX embeds the
+    # part total, so a document that used to split into n parts and now splits
+    # into m < n leaves parts m+1..n in place — they are not overwritten and not
+    # duplicated. Historical sidechain rows are untouched by this change; this
+    # fixes INTAKE going forward only.
+    #
+    # Deliberately set on the COPY, not on ``config``: the parent session's own
+    # Stop retain keeps whatever the operator configured.
+    sub_config["retainToolCalls"] = False
+
     base_tags = list(config.get("retainTags") or [])
     extra_tags = ["sidechain", f"parent_session:{session_id}"]
     if agent_type:
