@@ -149,14 +149,27 @@ export const HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB =
  * inside {@link HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB} (11776 MiB), which a
  * test pins.
  *
- * **Why 3072 and not 4096**, which the budget ceiling would now permit: the
- * budget arithmetic only accounts for the buffer pool itself. The per-backend
- * side is not in it — `work_mem` is applied live per role,
- * `hash_mem_multiplier=2` doubles it for hash nodes, and a parallel plan
- * multiplies that again across workers. Stacking a 4 GiB pinned pool on top of
- * that worst case does not fit under a 16 GiB cap alongside the ~2.5 GiB app
- * anon set and the page-cache floor. 3072 leaves the pool a real 2x increase
- * with the tail still covered.
+ * **Why 3072 and not 4096** (the reading that held 2026-07-29): the budget
+ * arithmetic only accounts for the buffer pool itself. The per-backend side is
+ * not in it — `work_mem` is applied live per role, `hash_mem_multiplier=2`
+ * doubles it for hash nodes, and a parallel plan multiplies that again across
+ * workers. Stacking a large pinned pool on top of that worst case was judged
+ * not to fit under a 16 GiB cap alongside the ~2.5 GiB app anon set and the
+ * page-cache floor.
+ *
+ * **3072→6144 (2026-07-31).** Promoted to the durable default alongside a
+ * round of DB housekeeping on the hot tables (a full `VACUUM` plus
+ * autovacuum-threshold tuning), applied and verified live on
+ * `switchroom-hindsight` before being baked here. The housekeeping is what
+ * makes the larger pool safe against the per-backend caution above: reclaiming
+ * dead tuples shrinks the hot working set and the per-backend spill pressure
+ * that the 4096 argument was sized against, so a 6144 MiB pool no longer stacks
+ * against the same worst case. 6144 is 38% of the 16 GiB cap and stays well
+ * inside {@link HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB} (11776 MiB), which a
+ * test still pins — the arithmetic ceiling is unchanged, only the target moved.
+ * These relief values land on the live fleet only after this change ships and
+ * the operator runs a host `switchroom apply`; a live container recreate ahead
+ * of that would just reintroduce config-vs-runtime drift, so it is deferred.
  *
  * **This does NOT require an `shm_size` change**, contrary to the assumption
  * this work started from. That assumption is that `shared_buffers` is a POSIX
@@ -167,7 +180,7 @@ export const HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB =
  * `HINDSIGHT_DEFAULT_SHM_SIZE` was raised for (observed peak ~533MB), so 2g
  * stays correct and is deliberately left alone.
  */
-export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 3072;
+export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 6144;
 
 /**
  * `effective_cache_size` (pg0 default `1GB`).
@@ -181,10 +194,13 @@ export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 3072;
  * live cgroup was carrying 5212 MiB of page cache on top of the 256MB buffer
  * pool. 4096 MiB was the conservative reading of that under the 8 GiB cap.
  *
- * 4096→7168 (2026-07-29), moved with the cap and the buffer pool. Sized to
- * what the container can actually hold AFTER this change, not to the size of
- * the database: `shared_buffers` (3072) plus a page-cache assumption of 4096,
- * against a 16 GiB ceiling that still has to carry the ~2.5 GiB app anon set.
+ * 4096→7168 (2026-07-29), moved with the cap and the buffer pool. 7168→12288
+ * (2026-07-31), moved again with the buffer-pool bump above and verified live
+ * with it. Sized to what the container can actually hold AFTER these changes,
+ * not to the size of the database: `shared_buffers` (6144) plus a page-cache
+ * assumption of ~6144, against a 16 GiB ceiling that still has to carry the
+ * ~2.5 GiB app anon set. It allocates nothing (a pure planner hint), so a test
+ * pins only that it never exceeds the container's own memory ceiling.
  * The temptation is to declare something near the 12 GB bank size so the
  * planner "knows" the data is cacheable — don't. `effective_cache_size` is
  * the term that prices index scans against sequential ones, so over-declaring
@@ -195,7 +211,7 @@ export const HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB = 3072;
  * total cost ~12% at 300 seeds and changed no plan shape. It is the cheap,
  * zero-memory half of the change, not the whole fix.
  */
-export const HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB = 7168;
+export const HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB = 12288;
 
 /** Format a MiB integer the way Postgres wants it on the command line. */
 export function pgMib(mib: number): string {

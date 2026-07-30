@@ -202,6 +202,24 @@ describe("hindsightPerfEnv — capability gating", () => {
     }
   });
 
+  it("emits the 2026-07-31 relief default of 250 memories per consolidation round", () => {
+    // Outcome, not presence: the relief pass halved this 500 -> 250 to shorten
+    // the per-round worker-slot hold under multi-bank contention (paired with
+    // the pg buffer-pool resize and the DB housekeeping). Assert the VALUE the
+    // container actually receives, on every host, with no operator override —
+    // a revert to 500 or drift to any other value fails here. This is not gated
+    // on caps, so it must hold for both extremes.
+    for (const caps of [
+      { gpu: false, localLlm: false },
+      { gpu: true, localLlm: true },
+    ] as const) {
+      expect(hindsightPerfEnv(caps)).toContainEqual([
+        "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
+        "250",
+      ]);
+    }
+  });
+
   it("declares exactly the gated knobs this PR ships, by name", () => {
     // Same anti-vacuity discipline for the two gated groups: the GPU group
     // must be FP16 plus the CUDA rerank batch size and nothing else, and the
