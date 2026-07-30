@@ -550,6 +550,9 @@ import {
   handleModelCommand,
   classifyModelSwitchConfirmation,
   formatModelRelaunchDiagLog,
+  parseModelSwitchTarget,
+  resolveSessionModelResolutionTimeoutMs,
+  waitForSessionModelResolution,
   servedModelMatchesRequested,
   buildServedModelDivergenceHandler,
   deliverModelSwitchBootNotice,
@@ -23665,23 +23668,26 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
           }
         } catch {}
 
-        // ─── Session-model re-hydration + LiteLLM-down alert (session relaunch) ───
-        //
-        // start.sh writes the EFFECTIVE launched model to `.active-session-model`
-        // on every boot (the model actually passed to `claude --model`). Re-hydrate
-        // the in-memory session-model override from it so `/status` and the welcome
-        // card stay honest after a session-relaunch restart. Only treat it as an
-        // override when it differs from the configured/default model — a plain boot
-        // on the configured model leaves the override null.
-        //
-        // Also consume the `.session-model-alert` sentinel: start.sh drops it when
-        // it had to DROP an sr-* override because LiteLLM was unreachable at boot
-        // (booting on the configured default instead of 4xx-ing against Anthropic).
-        // We turn it into a loud Telegram message to the operator, then delete it.
+        // Rehydrate only after start.sh publishes this boot's resolved outputs.
         try {
           const smAgentDir = resolveAgentDirFromEnv()
           if (smAgentDir) {
-            const activePath = join(smAgentDir, '.active-session-model')
+            const resolutionTimeoutMs = resolveSessionModelResolutionTimeoutMs(
+              process.env.SWITCHROOM_SESSION_MODEL_RESOLUTION_TIMEOUT_MS,
+            )
+            const resolved = await waitForSessionModelResolution({
+              barrierExists: () => existsSync(join(smAgentDir, '.session-model-resolved')),
+              timeoutMs: resolutionTimeoutMs,
+            })
+            if (!resolved) {
+              const target = modelSwitchReason == null
+                ? '(none)'
+                : (parseModelSwitchTarget(modelSwitchReason) ?? '(unknown)')
+              process.stderr.write(
+                `telegram gateway: gw /model relaunch UNRESOLVED agent=${getMyAgentName()} target=${target} (barrier timeout after ${resolutionTimeoutMs}ms)\n`,
+              )
+            } else {
+              const activePath = join(smAgentDir, '.active-session-model')
             if (existsSync(activePath)) {
               try {
                 const launched = readFileSync(activePath, 'utf8').trim()
@@ -23697,21 +23703,9 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   // a phantom session override.
                   return resolveMainModel(raw ?? undefined)
                 })()
-                // `launched !== configured` is the DETERMINISTIC "a model switch
-                // landed" signal (F1): the carrier is consume-once, so a launched
-                // model that differs from the configured default only ever
-                // happens on a genuine apply-boot. Seed the in-memory override
-                // from it — this is the ONLY success reporting, sourced from the
-                // real post-boot signal (`.active-session-model`), never from a
-                // scraped pane or an optimistic record.
+                // A launched model differing from configured is a genuine apply boot.
                 const isApplyBoot = launched.length > 0 && launched !== configured
-                // { verify: true } (#3427 item 4 / H1): ONLY this site arms the
-                // requested-vs-served tripwire — `launched` IS the token of the
-                // session now serving. Command-time setOverride never arms.
                 sessionModelSource.setOverride(isApplyBoot ? launched : null, { verify: true })
-                // Boot /model cards (#3427): the divergence tripwire warn and
-                // the switch confirmation share one deps surface; the card
-                // logic lives in model-command.ts (#2996 ratchet).
                 const modelBootCardDeps: ModelBootCardDeps = {
                   agent: getMyAgentName(),
                   chat: modelSwitchMarkerChat,
@@ -23722,8 +23716,6 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 if (isApplyBoot) {
                   sessionModelSource.setDivergenceHandler(buildServedModelDivergenceHandler(modelBootCardDeps))
                 }
-                // F1/N4: classify + log + one confirmation card. Formatters live
-                // in model-command.ts so this file does not inflate (#2996 ratchet).
                 const confirmation = modelSwitchReason != null
                   ? classifyModelSwitchConfirmation({
                       reason: modelSwitchReason,
@@ -23792,6 +23784,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 }
                 process.stderr.write(`telegram gateway: session-model: LiteLLM-down override drop — ${alertText}\n`)
               }
+            }
             }
           }
         } catch (err) {

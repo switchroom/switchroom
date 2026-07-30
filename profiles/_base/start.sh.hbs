@@ -390,6 +390,10 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   # ephemeral). Refresh-or-remove every boot so a stale snapshot can never
   # re-apply a consumed override on a later restart.
   rm -f "{{agentDir}}/.session-model.boot-snapshot" "{{agentDir}}/.session-model-boot-attempts.boot-snapshot"
+  # Resolution runs later, after the bounded LiteLLM probe. Remove the prior
+  # boot's completion barrier before forking the gateway so it cannot consume
+  # stale active-model/effort/alert files while this boot is still resolving.
+  rm -f "{{agentDir}}/.session-model-resolved"
   if [ -f "{{agentDir}}/.session-model" ]; then
     # A failed copy (ENOSPC, perms) must not be a SILENT drop — the resolution
     # block still falls back to the live carrier, but the gateway may consume
@@ -2080,23 +2084,25 @@ export SWITCHROOM_SESSION_MODEL="$_EFFECTIVE_MODEL"
 #
 # Deterministic record of WHERE this boot actually landed, written immediately
 # before exec claude (overwrite-per-boot, one line). Consumers: the gateway
-# boot card's "routing" row and any operator shell. _DECLARED_ROUTING is baked
-# at render time by declaredRoutingMode() — the POST-REPOINT mode this boot is
-# meant to land on (fable/claude-fable-5/sr-* declare router-root because the
-# repoint case below moves them there; only non-fable Claude models declare
-# passthrough) — the apply-time INTENT the landed mode is compared against.
+# boot card's "routing" row and any operator shell. _DECLARED_ROUTING is derived
+# from the runtime-resolved effective model, so a legitimate session override
+# is compared against its own POST-REPOINT intent rather than the configured
+# default's render-time model class.
 # Divergence (landed ≠ declared) appends a consume-once .session-model-alert
 # line the gateway relays to the operator, but ONLY when the (landed, declared)
 # PAIR differs from the PREVIOUS boot's pair — a persistently degraded agent
 # alerts once, not on every restart, yet a declared-only flip (operator changes
 # the configured model class while the agent stays stuck on the same wrong
 # landed mode) still re-alerts.
-_DECLARED_ROUTING={{{declaredRoutingQ}}}
-# When LiteLLM was never configured for this agent (no SWITCHROOM_LITELLM at
-# boot entry, captured before any strip), compose injects NO routing env — the
-# declared intent genuinely IS direct-oauth, not the model-class bake. This
-# keeps non-LiteLLM fleets from false-alerting divergence on every boot.
-if [ -z "${SWITCHROOM_LITELLM_DECLARED:-}" ]; then _DECLARED_ROUTING="direct-oauth"; fi
+if [ -z "${SWITCHROOM_LITELLM_DECLARED:-}" ]; then
+  # No LiteLLM routing was configured for this agent at boot entry.
+  _DECLARED_ROUTING="direct-oauth"
+else
+  case "$_EFFECTIVE_MODEL" in
+    sr-*|fable|claude-fable-5) _DECLARED_ROUTING="router-root" ;;
+    *) _DECLARED_ROUTING="passthrough" ;;
+  esac
+fi
 case "${ANTHROPIC_BASE_URL:-}" in
   "") _ROUTING_MODE="direct-oauth" ;;
   */anthropic) _ROUTING_MODE="passthrough" ;;
@@ -2115,6 +2121,16 @@ if [ "$_ROUTING_MODE" != "$_DECLARED_ROUTING" ] && { [ "$_ROUTING_MODE" != "$_pr
   printf 'Routing divergence: this agent landed on `%s` (base `%s`, model `%s`) but its declared routing is `%s`. Check `%s/.routing-mode` and the boot log for the cause (LiteLLM key/provision or proxy reachability).\n' "$_ROUTING_MODE" "${ANTHROPIC_BASE_URL:-direct}" "$_EFFECTIVE_MODEL" "$_DECLARED_ROUTING" "{{agentDir}}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
 fi
 unset _prev_routing_mode _prev_declared_routing _routing_line
+
+# Publish completion only after every boot-resolution output is final: active
+# model, active effort, routing mode, and any alert append. Atomic rename keeps
+# the gateway from observing a partially-written barrier.
+_session_model_resolved_tmp="{{agentDir}}/.session-model-resolved.tmp.$$"
+if printf '%s\n' "$$" > "$_session_model_resolved_tmp" 2>/dev/null; then
+  mv -f "$_session_model_resolved_tmp" "{{agentDir}}/.session-model-resolved" 2>/dev/null || true
+fi
+rm -f "$_session_model_resolved_tmp"
+unset _session_model_resolved_tmp
 
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then

@@ -21,6 +21,8 @@ import {
   classifyModelSwitchConfirmation,
   formatModelRelaunchDiagLog,
   resolveModelSwitchBootNotice,
+  resolveSessionModelResolutionTimeoutMs,
+  waitForSessionModelResolution,
 } from '../gateway/model-command.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -147,6 +149,39 @@ describe('gateway: the live callback dispatcher routes every switch tap to the h
 })
 
 describe('gateway boot: session-model re-hydration + confirmation + alert relay', () => {
+  it('does not classify stale previous-boot state before the resolution barrier', async () => {
+    const staleLaunched = 'claude-opus-4-8'
+    const configured = 'claude-opus-4-8'
+    const reason = 'user: /model fable (session-only relaunch, menu)'
+    const resolved = await waitForSessionModelResolution({
+      barrierExists: () => false,
+      timeoutMs: 0,
+    })
+    const confirmation = resolved
+      ? classifyModelSwitchConfirmation({ reason, launched: staleLaunched, configured })
+      : null
+    expect(resolved).toBe(false)
+    expect(confirmation).toBeNull()
+  })
+
+  it('waits asynchronously until the resolution barrier appears', async () => {
+    let checks = 0
+    const resolved = await waitForSessionModelResolution({
+      barrierExists: () => ++checks >= 2,
+      timeoutMs: 1_000,
+      sleep: async () => {},
+    })
+    expect(resolved).toBe(true)
+    expect(checks).toBe(2)
+  })
+
+  it('uses a safe default for absent or invalid barrier timeout overrides', () => {
+    expect(resolveSessionModelResolutionTimeoutMs(undefined)).toBe(180_000)
+    expect(resolveSessionModelResolutionTimeoutMs('not-a-number')).toBe(180_000)
+    expect(resolveSessionModelResolutionTimeoutMs('-1')).toBe(180_000)
+    expect(resolveSessionModelResolutionTimeoutMs('2500')).toBe(2_500)
+  })
+
   it('re-hydrates the override from .active-session-model (launched !== configured)', () => {
     const idx = GATEWAY_SRC.indexOf("join(smAgentDir, '.active-session-model')")
     expect(idx).toBeGreaterThan(0)
@@ -295,9 +330,12 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
   })
 
   it('wires the pipeline into the boot rehydration (gateway calls classify → diag log → notice)', () => {
-    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
+    const idx = GATEWAY_SRC.indexOf('const resolutionTimeoutMs = resolveSessionModelResolutionTimeoutMs(')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 4200)
+    const win = GATEWAY_SRC.slice(idx, idx + 7000)
+    expect(win).toContain('waitForSessionModelResolution({')
+    expect(win).toContain('if (!resolved) {')
+    expect(win).toContain('gw /model relaunch UNRESOLVED')
     expect(win).toContain('classifyModelSwitchConfirmation({')
     expect(win).toContain('formatModelRelaunchDiagLog')
     expect(win).toContain('if (confirmation != null)')

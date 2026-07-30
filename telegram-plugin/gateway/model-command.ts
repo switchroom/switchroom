@@ -96,6 +96,40 @@ export function isValidModelArg(arg: string): boolean {
   return MODEL_ARG_RE.test(arg)
 }
 
+export const DEFAULT_SESSION_MODEL_RESOLUTION_TIMEOUT_MS = 180_000
+export const SESSION_MODEL_RESOLUTION_POLL_MS = 250
+
+/** Parse the bounded boot-resolution wait without allowing NaN/negative hangs. */
+export function resolveSessionModelResolutionTimeoutMs(raw: string | undefined): number {
+  if (raw == null || raw.trim() === '') return DEFAULT_SESSION_MODEL_RESOLUTION_TIMEOUT_MS
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0
+    ? value
+    : DEFAULT_SESSION_MODEL_RESOLUTION_TIMEOUT_MS
+}
+
+/**
+ * Asynchronously wait until start.sh atomically publishes this boot's resolved
+ * session-model outputs. The deadline is checked on every iteration, including
+ * timeout=0, so a missing barrier can never hang gateway startup indefinitely.
+ */
+export async function waitForSessionModelResolution(input: {
+  barrierExists: () => boolean
+  timeoutMs: number
+  pollMs?: number
+  sleep?: (ms: number) => Promise<void>
+}): Promise<boolean> {
+  const pollMs = input.pollMs ?? SESSION_MODEL_RESOLUTION_POLL_MS
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const startedAt = Date.now()
+  for (;;) {
+    if (input.barrierExists()) return true
+    const remaining = input.timeoutMs - (Date.now() - startedAt)
+    if (remaining <= 0) return false
+    await sleep(Math.min(pollMs, remaining))
+  }
+}
+
 /** True when `name` is an sr-* (LiteLLM/OpenRouter) model identifier. */
 export function isSrModel(name: string): boolean {
   return name.startsWith('sr-')
