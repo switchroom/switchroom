@@ -1,10 +1,11 @@
 # Changelog
 
-## v0.19.36 — credit exhaustion fails loudly, an honest model-switch card, and memory redaction at intake
+## v0.19.36 — credit exhaustion fails loudly, an honest model-switch card, memory redaction at intake, and Telegram keeps its headings
 
 Provider credit exhaustion can no longer die in silence, the boot-time
-`/model` confirmation stops crying wolf, and credentials are masked before they
-ever reach a memory bank.
+`/model` confirmation stops crying wolf, credentials are masked before they
+ever reach a memory bank, and the outbound over-bold tripwire stops flattening
+section headings out of structured replies.
 
 ### Provider credit exhaustion fails loudly again (#4013)
 
@@ -57,6 +58,28 @@ shim, and the two direct REST writers. `retain()` redacts **before** content is
 chunked, so a credential that would otherwise be split across two chunks is
 masked while still whole. This is write-path only — no stored row is modified;
 cleaning existing rows is separate, later work.
+
+### Telegram keeps section headings when stripping excess bold (#4016)
+
+The outbound over-bold tripwire (`stripExcessBold` in `telegram-plugin/format.ts`)
+silently flattened structured replies. A bold-dense digest built from many short
+`**Section**` pseudo-headings tripped the **global >30% bold-ratio rule**, which
+called `unbold()` on the *entire* message and stripped **every** bold marker —
+headings included — with no signal at all. The per-block rule already exempted a
+single short standalone bolded line as a heading, but the global rule ignored
+that carve-out.
+
+The heading definition is now factored into a single `isPseudoHeadingBlock` /
+`PSEUDO_HEADING_MAX_CHARS` source of truth reused by both rules: when the >0.3
+ratio fires, standalone short pseudo-heading blocks keep their bold and
+everything else still flattens. The ratio maths and denominator are unchanged,
+so a genuinely over-bolded message still trips — it just keeps its section
+headings — and a multi-line bolded paragraph can never be mislabelled a heading.
+The tripwire also stopped being invisible: `stripExcessBold` now takes an
+optional `onStrip` sink, invoked exactly once when bold is actually removed, and
+the call site emits a single tagged `telegram gateway: strip-excess-bold: …`
+stderr line carrying the rule (`global` vs `per-block`) and the measured ratio.
+No message content is logged.
 
 ## v0.19.35 — sub-agent memory keeps the learnings and drops the exhaust
 
