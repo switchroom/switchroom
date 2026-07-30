@@ -182,9 +182,16 @@ File:line citations are against the v0.17.11 tree.
   not this repo; switchroom steers it only via env, and the spawned `claude`
   subprocess inherits `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS`.
 
-`isClaudeModel` (`telegram-plugin/gateway/model-command.ts:79`) is a pure
-model-token test — a known alias or a `claude-` prefix — which is why the
-routing decision keys off the model string alone.
+`isClaudeModel` (`telegram-plugin/gateway/model-command.ts:113`) is a pure
+model-token test — it matches a `MODEL_ALIASES` family alias, a
+`CLAUDE_MODEL_ALIASES` switchroom-side short spelling of a pinned Anthropic id
+(e.g. `opus48` → `claude-opus-4-8`), or a `claude-` prefix — which is why the
+routing decision keys off the model string alone. All three name an Anthropic
+OAuth-passthrough target, so the credential-vs-proxy invariant is unchanged by
+the shortcut arm; it exists so a shortcut is never mistaken for an external
+(`sr-*`) route. The `/model` path additionally expands shortcuts to the
+canonical id (`expandModelAlias`) *before* any classifier sees the token, so a
+short spelling never reaches a routing consumer in the first place.
 
 ## Known Gaps / Follow-ups
 

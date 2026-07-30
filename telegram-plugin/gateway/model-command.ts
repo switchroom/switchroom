@@ -33,6 +33,7 @@ import {
   type DiscoverResult,
   type ModelPickerOption,
 } from '../../src/agents/model-picker.js'
+import { assessThinkingEffortRisk } from '../../src/config/thinking-effort-risk.js'
 
 /**
  * Aliases the claude CLI resolves natively (`claude --help`: "an alias for
@@ -694,6 +695,24 @@ export interface ModelCommandDeps {
    * rendered as "default".
    */
   getConfiguredModel: () => string | null
+  /**
+   * The agent's cascade-resolved `thinking_effort` from `switchroom agent list`
+   * — the value start.sh bakes into `--effort` on the relaunch this command is
+   * about to schedule. Null when unset / unreadable (treated as the scaffold
+   * floor `low`, i.e. safe).
+   *
+   * Needed because a `/model` switch is SESSION-scoped and therefore invisible
+   * to `switchroom doctor`, whose `thinking_effort × adaptive model` check
+   * (`src/cli/doctor.ts:572`) reads the CONFIGURED `model:` out of
+   * switchroom.yaml. Switching the live session onto a pinned Opus 4.x id — by
+   * typing it, by a `CLAUDE_MODEL_ALIASES` shortcut, or by tapping the
+   * "Opus 4.8" button — lands the exact (pinned Opus 4.x, effort > low)
+   * combination doctor exists to warn about, with doctor none the wiser. So the
+   * assessment is re-run HERE, at switch time, against the effort the relaunch
+   * will actually use. A relaunch writes no `.session-effort` carrier, so any
+   * live `/effort` override is shed and the configured value is the right input.
+   */
+  getConfiguredEffort: () => string | null
   escapeHtml: (s: string) => string
   preBlock: (s: string) => string
   /**
@@ -880,17 +899,64 @@ function relaunchErrorReply(
  * TARGET is vouched by the same curation gate that makes it offline-trustable
  * (isOfflineTrustedModelToken), so it is exempt too; warning "can't be
  * validated" on a shortcut switchroom itself curates would contradict that.
- * The first-reply divergence tripwire still covers it either way.
+ *
+ * The exemption compares `canonicalModelToken(model)` — the SAME form
+ * `expandModelAlias` emits — so the token that reaches `claude --model` and the
+ * token this gate judges can never disagree. Comparing a lowercased form against
+ * a verbatim-emitted one is exactly how `/model CLAUDE-OPUS-4-8` used to launch
+ * an uncanonical id under a clean green ack.
+ *
+ * What the exemption costs, stated honestly: the ONLY remaining signal that an
+ * exempted target silently fell back is the first-reply divergence tripwire
+ * (`servedModelMatchesRequested`). The post-boot confirmation card is NOT a
+ * second signal for a pinned id whose FAMILY equals the configured default's:
+ * `modelFamilyToken('claude-opus-4-8')` is `'opus'`, so on an `opus`-default
+ * agent `classifyModelSwitchConfirmation` returns `default`, not `not-applied`
+ * (see #4001 — a pre-existing property of the family reduction, reachable
+ * before this map existed by typing the full id).
  * Exported for tests.
  */
 export function unvalidatedIdCaveat(
   deps: Pick<ModelCommandDeps, 'escapeHtml'>,
   model: string,
 ): string | null {
-  const lower = model.trim().toLowerCase()
+  const lower = canonicalModelToken(model).toLowerCase()
   if (!lower.startsWith('claude-')) return null
   if (Object.values(CLAUDE_MODEL_ALIASES).includes(lower)) return null
   return `_\`${deps.escapeHtml(model)}\` can't be validated before launch — if it isn't a real Claude model id, claude will silently serve the configured fallback model instead. I check the first reply and will warn if that happens._`
+}
+
+/**
+ * Switch-time surfacing of the #1978 adaptive-thinking risk (`thinking_effort`
+ * above `low` on a PINNED Opus 4.x id).
+ *
+ * `assessThinkingEffortRisk` had exactly ONE consumer — `switchroom doctor`
+ * (`src/cli/doctor.ts:572`) — which reads the CONFIGURED `model:` from
+ * switchroom.yaml. A `/model` switch is session-scoped and never touches that
+ * file, so every route onto a pinned Opus 4.x (typed full id, a
+ * `CLAUDE_MODEL_ALIASES` shortcut, or the one-tap "Opus 4.8" button) reached the
+ * risky combination with no warning anywhere. This is the second consumer, on
+ * the path that actually creates the combination.
+ *
+ * Advisory only — it never rewrites anyone's effort. Returns null when the combo
+ * is safe (effort unset/`low`, or any non-Opus-4.x model, including Opus 5 and
+ * the bare `opus` alias).
+ */
+export function thinkingEffortCaveat(
+  deps: Pick<ModelCommandDeps, 'escapeHtml' | 'getConfiguredEffort'>,
+  model: string,
+): string | null {
+  let effort: string | null
+  try {
+    effort = deps.getConfiguredEffort()
+  } catch {
+    // The effort probe shells out to `switchroom agent list`; a transient
+    // failure must never block or fail the switch it is only annotating.
+    return null
+  }
+  const risk = assessThinkingEffortRisk(model, effort ?? undefined)
+  if (!risk.risky || !risk.reason) return null
+  return `⚠️ _${deps.escapeHtml(risk.reason)}_`
 }
 
 /** Schedule a carrier relaunch onto `model`, returning the deterministic ack. */
@@ -905,8 +971,14 @@ async function scheduleRelaunchReply(
     return relaunchErrorReply(deps, model, err)
   }
   const caveat = unvalidatedIdCaveat(deps, model)
+  const effortRisk = thinkingEffortCaveat(deps, model)
   return {
-    text: [switchingLine(deps, model), ...(caveat ? [caveat] : []), PERSIST_NOTE].join('\n'),
+    text: [
+      switchingLine(deps, model),
+      ...(caveat ? [caveat] : []),
+      ...(effortRisk ? [effortRisk] : []),
+      PERSIST_NOTE,
+    ].join('\n'),
     html: true,
   }
 }
@@ -995,20 +1067,28 @@ export const MODEL_CALLBACK_PAGE_MAIN = 'mdl:page:main'
 export type ModelMenuPage = 'main' | 'external'
 
 /**
- * Static Claude aliases appended to the scraped Claude group. The claude CLI's
- * own `/model` picker (deps.discover) does NOT list `fable`, but the CLI
- * resolves the alias natively, so we render it as an extra button that switches
- * via the carrier relaunch (MODEL_CALLBACK_ALIAS → scheduleModelRelaunch, rev
- * 5). Extend this list to surface further CLI-resolvable aliases the picker
- * omits.
+ * Static Claude `--model` TOKENS appended to the scraped Claude group — extra
+ * keyboard rows for targets the claude CLI's own `/model` picker (deps.discover)
+ * does not list. Each renders as a button that switches via the carrier relaunch
+ * (MODEL_CALLBACK_ALIAS → scheduleModelRelaunch, rev 5).
+ *
+ * NB "token", not "alias": members are not required to be CLI-resolvable aliases
+ * and are treated opaquely by both call sites (they are only concatenated onto
+ * the `mdl:alias:` callback prefix, whose wire format predates this list). The
+ * two kinds present today:
+ *   - `fable` — a genuine alias the CLI resolves itself; the picker just omits
+ *     it. Boots via the LiteLLM router repoint in start.sh (see the fable case).
+ *   - `claude-opus-4-8` — a full PINNED id, not an alias. Rendered because the
+ *     picker doesn't offer it and typing it on a phone is hostile.
+ * Extend with either kind; a member only has to be a legal `claude --model` arg.
  */
-export const EXTRA_CLAUDE_ALIASES: ReadonlyArray<{ alias: string; label: string }> = [
-  { alias: 'fable', label: 'Fable' },
+export const EXTRA_CLAUDE_MENU_TOKENS: ReadonlyArray<{ token: string; label: string }> = [
+  { token: 'fable', label: 'Fable' },
   // Pinned Opus 4.8. The button carries the CANONICAL id (not the `opus48`
   // shortcut) so the tap needs no expansion to be recognized by an older
   // gateway, and so `canonicalClaudeToken` resolves it directly. Typed
   // `/model opus48` / `/model opus-4-8` land on the same target.
-  { alias: 'claude-opus-4-8', label: 'Opus 4.8' },
+  { token: 'claude-opus-4-8', label: 'Opus 4.8' },
 ]
 
 /**
@@ -1120,9 +1200,35 @@ export function expandSrAlias(arg: string): string {
   return SR_MODEL_ALIASES[arg.toLowerCase()] ?? arg
 }
 
+/**
+ * The ONE canonical form of a model token — what `claude --model` is handed and
+ * what every downstream gate compares against.
+ *
+ * Two normalizations, both narrow:
+ *   - **trim** — unconditional. `unvalidatedIdCaveat` already trimmed while
+ *     expansion did not, so the two disagreed on a padded token.
+ *   - **lowercase, `claude-*` ONLY.** Every real Anthropic model id is lowercase
+ *     and a phone autocapitalizes, so `/model Claude-Opus-4-8` used to be launched
+ *     VERBATIM as an unvalidated id while the caveat exemption (which lowercases)
+ *     suppressed the warning — a clean green ack for a token the caveat was
+ *     written for. Non-`claude-` tokens are left alone: `sr-*` ids are matched
+ *     case-insensitively by their own maps, and rewriting an arbitrary external
+ *     id's case is not ours to do.
+ *
+ * Applied by `expandModelAlias`, so canonicalization happens on every `/model`
+ * path (typed apply, mid-turn queue, menu tap, queued-across-restart persist)
+ * whether or not the token hit a shortcut map — one canonical form flows to
+ * `claude --model`, and `unvalidatedIdCaveat` sees exactly that form.
+ */
+export function canonicalModelToken(arg: string): string {
+  const trimmed = arg.trim()
+  const lower = trimmed.toLowerCase()
+  return lower.startsWith('claude-') ? lower : trimmed
+}
+
 /** Expand a short pinned-Claude spelling (case-insensitive) to its full `claude-*` id. */
 export function expandClaudeAlias(arg: string): string {
-  return CLAUDE_MODEL_ALIASES[arg.toLowerCase()] ?? arg
+  return CLAUDE_MODEL_ALIASES[arg.trim().toLowerCase()] ?? arg
 }
 
 /**
@@ -1131,13 +1237,15 @@ export function expandClaudeAlias(arg: string): string {
  * queued-across-restart persist). Claude shortcuts resolve first, then sr-*
  * shortcuts; the two key sets are disjoint by construction (a Claude shortcut
  * never expands to an `sr-*` id and vice versa), so order only documents intent.
+ * The result is `canonicalModelToken`-normalized, so a miss can no longer emit a
+ * verbatim mixed-case `claude-*` id that the caveat exemption then mis-matches.
  *
  * Expanding HERE — before `isClaudeModel` / `isSrModel` / `externalModelNames`
  * ever see the token — is what keeps a pinned-Claude shortcut on the Anthropic
  * OAuth passthrough instead of being misread as an external route.
  */
 export function expandModelAlias(arg: string): string {
-  return expandSrAlias(expandClaudeAlias(arg))
+  return canonicalModelToken(expandSrAlias(expandClaudeAlias(arg)))
 }
 
 export function srFriendlyLabel(srName: string): string {
@@ -1258,9 +1366,9 @@ function busyStaticMenu(
   // Same extra Claude rows the live keyboard renders (Fable, pinned Opus 4.8),
   // minus any already covered by a MODEL_ALIASES row above — otherwise a model
   // is selectable when idle but vanishes from the mid-turn quick list.
-  for (const { alias, label } of EXTRA_CLAUDE_ALIASES) {
-    if ((MODEL_ALIASES as readonly string[]).includes(alias.toLowerCase())) continue
-    rows.push([{ text: label, callback_data: `${MODEL_CALLBACK_ALIAS}${alias}` }])
+  for (const { token, label } of EXTRA_CLAUDE_MENU_TOKENS) {
+    if ((MODEL_ALIASES as readonly string[]).includes(token.toLowerCase())) continue
+    rows.push([{ text: label, callback_data: `${MODEL_CALLBACK_ALIAS}${token}` }])
   }
   rows.push([{ text: 'Default (configured)', callback_data: `${MODEL_CALLBACK_ALIAS}default` }])
   if (externalNames.length > 0) {
@@ -1331,16 +1439,16 @@ function mainPageKeyboard(
     }])
   }
 
-  // Static Claude aliases the CLI picker omits (e.g. Fable). Deduped: if the
-  // scraped Claude options already include a matching row, don't render the
-  // static one too.
-  for (const { alias, label } of EXTRA_CLAUDE_ALIASES) {
+  // Static Claude tokens the CLI picker omits (Fable, pinned Opus 4.8).
+  // Deduped: if the scraped Claude options already include a matching row,
+  // don't render the static one too.
+  for (const { token, label } of EXTRA_CLAUDE_MENU_TOKENS) {
     const already = claudeOptions.some(
       (o) => o.label.toLowerCase() === label.toLowerCase() ||
-        o.label.toLowerCase() === alias.toLowerCase(),
+        o.label.toLowerCase() === token.toLowerCase(),
     )
     if (already) continue
-    rows.push([{ text: label, callback_data: `${MODEL_CALLBACK_ALIAS}${alias}` }])
+    rows.push([{ text: label, callback_data: `${MODEL_CALLBACK_ALIAS}${token}` }])
   }
 
   if (hasExternal) {
@@ -1535,13 +1643,17 @@ export async function handleModelMenuCallback(
       token = data.slice(MODEL_CALLBACK_SELECT.length)
       label = token
     }
+    // Shape gate FIRST, on the RAW callback payload. `expandModelAlias` trims,
+    // so gating after it would let a whitespace-padded payload through a regex
+    // that exists precisely to guarantee one whitespace-free token reaches the
+    // tmux pane. Order: shape → expand → recognition.
+    if (!isValidModelArg(token)) {
+      return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
+    }
     // Same expansion the typed path applies, before the recognition gate: a
     // callback minted by an older gateway (or a hand-crafted `mdl:alias:opus48`)
     // must resolve to the canonical id rather than be rejected as unrecognized.
     token = expandModelAlias(token)
-    if (!isValidModelArg(token)) {
-      return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
-    }
     // N1: reject a token we don't recognize (a stale OLD-gateway `mdl:s:<hex>`
     // callback, an unmapped SELECT row, or garbage). Relaunching onto it would
     // write a carrier claude silently falls back from (--fallback-model). Re-render
@@ -1603,11 +1715,16 @@ async function menuRelaunchOutcome(
     }
   }
   const friendly = isDefault ? 'the configured default' : label
+  // Same #1978 switch-time guard the typed path carries — the one-tap
+  // "Opus 4.8" button is the EASIEST route into (pinned Opus 4.x, effort > low)
+  // and doctor cannot see a session-scoped switch. `/model default` reverts to
+  // the configured model, which doctor already covers, so it is not assessed.
+  const effortRisk = isDefault ? null : thinkingEffortCaveat(deps, token)
   return {
     answer: `Switching to ${isDefault ? 'default' : label} — relaunching (~30s)`,
     reply: await menuWithBannerStatic(
       deps,
-      `🔄 Switching session to **${deps.escapeHtml(friendly)}** — relaunching (~30s).\n${PERSIST_NOTE}`,
+      `🔄 Switching session to **${deps.escapeHtml(friendly)}** — relaunching (~30s).${effortRisk ? `\n${effortRisk}` : ''}\n${PERSIST_NOTE}`,
     ),
   }
 }

@@ -16961,6 +16961,9 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
       return data?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
     },
+    // Feeds the switch-time #1978 assessment (thinkingEffortCaveat); see the
+    // ModelCommandDeps.getConfiguredEffort doc for why doctor can't make it.
+    getConfiguredEffort: () => getConfiguredEffortForPersist(),
     escapeHtml: escapeHtmlForTg,
     preBlock,
     /**
