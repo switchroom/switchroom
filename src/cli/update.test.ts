@@ -55,6 +55,7 @@ describe("planUpdate", () => {
         "pull-images",
         "apply-config",
         "reconcile-hindsight-watch-cron",
+        "install-self-heal-timer",
         "refresh-hostd",
         "refresh-web",
         "refresh-hindsight",
@@ -128,6 +129,88 @@ describe("planUpdate", () => {
     });
 
     it("is deferred (skipReason) in hostd-context — /etc/cron.d is on the host", () => {
+      expect(stepFor({ hostdContext: true }).skipReason).toMatch(/hostd-context/);
+      expect(stepFor({ hostdContext: false }).skipReason).toBeUndefined();
+    });
+  });
+
+  describe("install-self-heal-timer step (#host-cli-converge)", () => {
+    function stepFor(opts: Parameters<typeof planUpdate>[0]) {
+      return planUpdate({ composePath: "unused", ...opts }).find(
+        (s) => s.name === "install-self-heal-timer",
+      )!;
+    }
+
+    it("systemd present + privileged: writes both units (non-root User=) and enables the timer", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "update-selfheal-"));
+      try {
+        const servicePath = join(tmp, "switchroom-self-heal.service");
+        const timerPath = join(tmp, "switchroom-self-heal.timer");
+        const calls: string[][] = [];
+        const step = stepFor({
+          selfHealTimerDeps: {
+            env: { SUDO_USER: "alice", SWITCHROOM_BINARY: "/usr/local/bin/switchroom" },
+            systemdBooted: () => true,
+            geteuid: () => 0,
+            homeForUser: () => "/home/alice",
+            runner: (cmd, args) => {
+              calls.push([cmd, ...args]);
+              return { status: 0 };
+            },
+            servicePath,
+            timerPath,
+          },
+        });
+        step.run();
+
+        const svc = readFileSync(servicePath, "utf8");
+        expect(svc).toContain("User=alice");
+        expect(svc).not.toContain("User=root");
+        expect(svc).toContain("ExecStart=/usr/local/bin/switchroom update --skip-images");
+        expect(readFileSync(timerPath, "utf8")).toContain("OnUnitActiveSec=30min");
+        expect(calls).toEqual([
+          ["systemctl", "daemon-reload"],
+          ["systemctl", "enable", "--now", "switchroom-self-heal.timer"],
+        ]);
+
+        // Second run: byte-identical no-op — units unchanged, still idempotently enabled.
+        const before = readFileSync(servicePath, "utf8");
+        step.run();
+        expect(readFileSync(servicePath, "utf8")).toBe(before);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("no systemd: writes NOTHING and does not throw (manual fallback emitted)", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "update-selfheal-nosd-"));
+      try {
+        const servicePath = join(tmp, "switchroom-self-heal.service");
+        const timerPath = join(tmp, "switchroom-self-heal.timer");
+        const calls: string[][] = [];
+        const step = stepFor({
+          selfHealTimerDeps: {
+            env: { SUDO_USER: "alice", SWITCHROOM_BINARY: "/usr/local/bin/switchroom" },
+            systemdBooted: () => false,
+            geteuid: () => 0,
+            runner: (cmd, args) => {
+              calls.push([cmd, ...args]);
+              return { status: 0 };
+            },
+            servicePath,
+            timerPath,
+          },
+        });
+        expect(() => step.run()).not.toThrow();
+        expect(existsSync(servicePath)).toBe(false);
+        expect(existsSync(timerPath)).toBe(false);
+        expect(calls).toEqual([]);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("is deferred (skipReason) in hostd-context — /etc/systemd/system is on the host", () => {
       expect(stepFor({ hostdContext: true }).skipReason).toMatch(/hostd-context/);
       expect(stepFor({ hostdContext: false }).skipReason).toBeUndefined();
     });
@@ -337,6 +420,7 @@ describe("planUpdate", () => {
         "rebuild-source",
         "apply-config",
         "reconcile-hindsight-watch-cron",
+        "install-self-heal-timer",
         "refresh-hostd",
         "refresh-web",
         "refresh-hindsight",

@@ -13,6 +13,17 @@ every update — but "loud" still needs a human to look. This timer makes the ho
 binary **self-heal** without one: it re-runs `switchroom update --skip-images` on
 a cadence, so a behind host CLI is corrected within one interval.
 
+> **Installed automatically.** As of the change that shipped this doc's timer,
+> `switchroom update` **installs and enables this timer for you** whenever it
+> runs on a **systemd-booted host with root privilege and a resolvable non-root
+> operator user** (the `install-self-heal-timer` step). So one host-context
+> `switchroom update` is enough to arm perpetual self-heal — you do not need to
+> run the manual steps below. They are kept as the **fallback** for a host
+> *without* systemd, without root, or where no operator user resolves: on such a
+> host the step writes nothing, never fails the update, and prints these exact
+> unit files plus the two `systemctl` commands so you can install it by hand.
+> Re-running `switchroom update` once the timer exists is a byte-identical no-op.
+
 ## What the tick does (and does not do)
 
 `ExecStart` runs `switchroom update --skip-images`:
@@ -102,7 +113,11 @@ WantedBy=timers.target
 > is a fine, lighter alternative; anything much longer re-opens the multi-hour
 > drift window this unit exists to close.
 
-## Install and enable
+## Install and enable (manual fallback)
+
+> You only need this on a host where `switchroom update` **could not** install
+> the timer itself (no systemd, no root, or no resolvable operator user). On a
+> normal systemd host the `install-self-heal-timer` step already did all of this.
 
 ```bash
 # 1. Drop the two unit files in place (edit OPERATOR / the binary path first).
@@ -135,10 +150,18 @@ sudo rm /etc/systemd/system/switchroom-self-heal.{service,timer}
 sudo systemctl daemon-reload
 ```
 
-## Why this is not wired into `install.sh`
+## Where the auto-install lives (and why not `install.sh`)
+
+The auto-install is a step in **`switchroom update`** (`install-self-heal-timer`,
+right after the `hindsight-watch` cron reconcile), **not** in `install.sh`.
 
 `install.sh` is a `curl | sh` one-shot that must work on hosts **without**
-systemd or root (it falls back to `~/.local/bin`). Auto-installing and enabling a
-system-wide timer from it would fail or surprise those hosts, and it cannot know
-the operator username or the intended cadence. So this stays an explicit,
-operator-installed artifact rather than an installer side effect.
+systemd or root (it falls back to `~/.local/bin`), and it cannot know the
+operator username — so arming a system-wide timer from it would fail or surprise
+those hosts. `switchroom update` is the right seam: it already self-elevates,
+already resolves the operator, and is the host-context path that converges the
+rest of the host. The step is guarded (systemd-booted **and** root **and** a
+non-root operator user) and degrades to the manual fallback above on any host
+that fails a guard, so it is safe to run unconditionally. It is deferred in
+hostd-context because `/etc/systemd/system` lives on the host, not inside the
+hostd container.

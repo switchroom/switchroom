@@ -71,6 +71,10 @@ import {
   type ExecFn,
 } from "./component-versions.js";
 import { reconcileCron } from "../hindsight-watch/install-cron.js";
+import {
+  installSelfHealTimer,
+  type InstallTimerDeps,
+} from "../host-cli-self-heal/install-timer.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -215,6 +219,10 @@ interface UpdateOptions {
    *  `reconcile-hindsight-watch-cron` step reconciles (default: the real
    *  `CRON_PATH`). Lets the step be exercised against a temp file. */
   watchCronPath?: string;
+  /** Test seam — override the self-heal timer install for the
+   *  `install-self-heal-timer` step (systemd/privilege/user/path shims).
+   *  Default: the real host detection + `/etc/systemd/system` writes. */
+  selfHealTimerDeps?: InstallTimerDeps;
 }
 
 interface UpdateStep {
@@ -718,6 +726,80 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         say(chalk.green(`  hindsight-watch cron reconciled at ${res.path}\n`));
       } else {
         say(chalk.gray(`  hindsight-watch cron already current at ${res.path}\n`));
+      }
+    },
+  });
+
+  // install-self-heal-timer: arm the systemd timer that makes a shipped release
+  // converge the HOST binary automatically — the last convergence gap.
+  //
+  // A release auto-converges every container image, but the host operator binary
+  // (`/usr/local/bin/switchroom`) and the hindsight-watch cron converge only when
+  // a human runs `switchroom update` on the host, because self-update-cli and the
+  // cron reconcile are host-context work that skips inside the hostd/agent
+  // container a rollout runs from. This timer re-runs `switchroom update
+  // --skip-images` on the host every ~30 min, so a behind host CLI self-heals
+  // within one interval with no human in the loop (the v0.19.38 12h drift could
+  // not recur). `--skip-images` still runs self-update-cli (only --skip-self-update
+  // skips that, see the self-update-cli step above) — it just doesn't pull images
+  // on a healthy tick.
+  //
+  // ARM, not just repair: unlike the cron (opt-in, doctor FAILs while unarmed),
+  // this timer IS the mechanism the PR ships, so the host update path installs it
+  // whenever it safely can. It writes nothing and never fails when the host is
+  // not systemd-booted, the process is unprivileged, or no non-root operator user
+  // resolves — it prints the unit contents + the two systemctl commands as the
+  // manual fallback instead. Idempotent: a re-run once installed is a no-op.
+  //
+  // Deferred in hostd-context: /etc/systemd/system lives on the host, not inside
+  // the hostd container, so writing it from there would land in the wrong
+  // filesystem. Never fatal — a failed install warns and continues.
+  steps.push({
+    name: "install-self-heal-timer",
+    description:
+      "Install + enable the switchroom-self-heal systemd timer so a shipped release converges the host binary automatically — graceful no-op without systemd/privilege",
+    skipReason: hostdContext
+      ? "deferred (hostd-context): /etc/systemd/system is on the host, not in the hostd container — finish host-side by re-running `switchroom update` on the host"
+      : undefined,
+    isHostdDeferred: hostdContext,
+    run: () => {
+      const say = opts.stdout ?? ((t: string) => process.stdout.write(t));
+      let res: ReturnType<typeof installSelfHealTimer>;
+      try {
+        res = installSelfHealTimer(opts.selfHealTimerDeps ?? {});
+      } catch (e) {
+        // Non-fatal: the update succeeded; a timer we couldn't enable is a
+        // diagnostic, not an update failure. `switchroom doctor` carries the
+        // standing host-CLI-drift signal.
+        say(
+          chalk.yellow(
+            `  self-heal timer not installed: ${(e as Error).message}\n`,
+          ),
+        );
+        return;
+      }
+      if (res.status === "installed") {
+        say(
+          chalk.green(
+            `  self-heal timer installed + enabled (${res.servicePath}, ${res.timerPath})\n`,
+          ),
+        );
+      } else if (res.status === "unchanged") {
+        say(chalk.gray(`  self-heal timer already current + enabled at ${res.timerPath}\n`));
+      } else {
+        // Graceful skip — print the exact units + the two systemctl commands so
+        // the operator can install it by hand on a non-systemd / unprivileged host.
+        say(
+          chalk.gray(
+            `  self-heal timer not installed automatically: ${res.reason}\n`,
+          ) +
+            chalk.gray("  Install it by hand:\n") +
+            chalk.gray(`    # ${res.servicePath}\n`) +
+            res.serviceContent!.replace(/^/gm, chalk.gray("    ")) +
+            chalk.gray(`    # ${res.timerPath}\n`) +
+            res.timerContent!.replace(/^/gm, chalk.gray("    ")) +
+            res.manualCommands.map((c) => chalk.gray(`    ${c}\n`)).join(""),
+        );
       }
     },
   });
