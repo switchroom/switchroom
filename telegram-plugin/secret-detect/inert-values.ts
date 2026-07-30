@@ -24,16 +24,22 @@
  */
 
 export const INERT_VALUE_RE = [
-  /^\[REDACTED/i, // our own marker (idempotence)
+  // Our own marker (idempotence). `maskToken` only ever emits
+  // `[REDACTED]` or `[REDACTED:<rule_id>]`, so the closing bracket is
+  // part of the shape.
+  /^\[REDACTED(?::[A-Za-z0-9_]+)?\]$/i,
   /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/, // $PASSWORD, ${DB_PASSWORD}
   // `.` is spelled out: JS `.` and Python `.` exclude different line
   // terminators, and the two engines must agree byte for byte.
   /^\{\{[^\n\r\u2028\u2029]*\}\}$/, // {{ handlebars }}
-  /^<[^>]*>$/, // <your-password-here>
+  /^<[^<>\n\r\u2028\u2029]*>$/, // <your-password-here>
   /^%[A-Za-z_][A-Za-z0-9_]*%$/, // %PASSWORD% (Windows)
-  /^vault:/i, // switchroom vault reference
+  /^vault:[A-Za-z0-9_./-]*$/i, // switchroom vault reference
   /^[*x•.]+$/i, // ***, xxxx, ••••
-  /^(?:process\.env|import\.meta\.env|os\.environ)\b/, // code reference
+  // Code reference — `process.env.FOO`, `import.meta.env.VITE_X`,
+  // `os.environ["FOO"]`. The member path is PART OF THE SHAPE: a bare
+  // prefix followed by anything else is not a reference.
+  /^(?:process\.env|import\.meta\.env|os\.environ)(?:\.[A-Za-z_$][A-Za-z0-9_$]*|\[["']?[A-Za-z_$][A-Za-z0-9_$]*["']?\])*$/,
   // Well-known "fill this in" values. A live credential never begins
   // with the word telling you to replace it.
   /^(?:changeme|change-me|replaceme|replace-me|placeholder|todo|tbd|yourkey|your-key|yourpassword|your-password|yoursecret|your-secret|yourtoken|your-token)(?:[-_][A-Za-z0-9-]+)?$/i,
@@ -42,9 +48,54 @@ export const INERT_VALUE_RE = [
   /^[a-z]+(?: [a-z]+){2,}$/,
 ]
 
+/**
+ * An unbroken run of `[A-Za-z0-9]` long enough to BE a credential.
+ *
+ * Placeholder text is words joined by separators (`your-password-here`,
+ * `generate-with-openssl-rand`, `pg/password`, `ANTHROPIC_API_KEY`) — the
+ * longest alphanumeric run in every value this list is meant to protect
+ * sits well under this floor (9 at the time of writing). A credential is
+ * the opposite shape: one dense run.
+ *
+ * 12 is `ENV_KV_MIN_LEN` — the length below which the env scanner already
+ * declines to call something a secret.
+ */
+const CREDENTIAL_RUN_RE = /[A-Za-z0-9]{12,}/g
+
+function runIsCredentialShaped(run: string): boolean {
+  // Two of {lower, upper, digit} inside one 12+ run. `yourtokenhere` and
+  // the segments of `YOUR_TOKEN_HERE` are single-class; hex, base62 and
+  // CamelCase-with-digits tokens are two or three.
+  let classes = 0
+  if (/[a-z]/.test(run)) classes++
+  if (/[A-Z]/.test(run)) classes++
+  if (/[0-9]/.test(run)) classes++
+  return classes >= 2
+}
+
+/**
+ * True when `value` carries a credential-shaped run anywhere inside it.
+ *
+ * #3982 review, MAJOR 7. The inert SHAPES above are necessary but not
+ * sufficient: `<a8f3…40 hex…>` and `{{tok_…}}` are legal instances of the
+ * `<…>` / `{{…}}` shapes, and a wrapper left behind after someone filled
+ * the value in (`vault:pg/password<secret>`, `[REDACTED]<secret>`,
+ * `changeme-<secret>`) turned a false-positive fix into a bypass of
+ * already-shipped coverage. "Inert shape AND carries no credential" is
+ * the property actually wanted; end-anchoring alone is not enough,
+ * because `<secret>` is a well-formed instance of the shape.
+ */
+export function hasCredentialShapedRun(value: string): boolean {
+  for (const run of value.match(CREDENTIAL_RUN_RE) ?? []) {
+    if (runIsCredentialShaped(run)) return true
+  }
+  return false
+}
+
 /** True when `value` is a placeholder / reference rather than a secret. */
 export function isInertValue(value: string): boolean {
-  return INERT_VALUE_RE.some((re) => re.test(value))
+  if (!INERT_VALUE_RE.some((re) => re.test(value))) return false
+  return !hasCredentialShapedRun(value)
 }
 
 /**

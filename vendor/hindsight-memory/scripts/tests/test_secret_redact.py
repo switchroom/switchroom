@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.client import HindsightClient  # noqa: E402
 from lib.secret_redact import (  # noqa: E402
     REDACTED_MARKER,
+    is_inert_value,
     redact,
     redact_metadata,
 )
@@ -213,15 +214,80 @@ class RedactorBehaviourTests(unittest.TestCase):
                 self.assertEqual(redact(line), line)
 
     def test_inert_gate_does_not_smuggle_a_real_value_through(self):
+        """#3982 review, MAJOR 7 — the gate must require the WHOLE value.
+
+        Five of the inert patterns used to be un-anchored or to accept an
+        arbitrary payload, so a labelled slot whose value merely CARRIED
+        an inert-looking wrapper was skipped entirely and stored verbatim
+        — a regression against coverage already shipped on ``main``. The
+        bare cases below are the easy half; the wrapped ones are the
+        property that actually broke.
+        """
         token = "zQ7x" + "Vb2n" + "Kd9w" + "Rt4y"
-        for line in (
-            "POSTGRES_PASSWORD: " + token,
-            "ANTHROPIC_API_KEY=" + token,
-            '{"token": "' + token + '"}',
-            "--token " + token,
+        hexish = "a8f3c1d2" + "e4b50f6a" + "9c7d3e81" + "b2f45a6c" + "d90e17bb"
+        wrappers = (
+            lambda v: v,  # bare
+            lambda v: "<" + v + ">",
+            lambda v: "{{" + v + "}}",
+            lambda v: "vault:pg/password" + v,
+            lambda v: "vault:pg/" + v,
+            lambda v: "[REDACTED]" + v,
+            lambda v: "[REDACTED:env_key_value]" + v,
+            lambda v: "process.env." + v,
+            lambda v: "changeme-" + v,
+            lambda v: "todo_" + v,
+            lambda v: "${" + v + "}",
+            lambda v: "%" + v + "%",
+        )
+        slots = (
+            "POSTGRES_PASSWORD: {}",
+            "ANTHROPIC_API_KEY={}",
+            '{{"token": "{}"}}',
+            "--token {}",
+        )
+        for secret in (token, hexish):
+            for wrap in wrappers:
+                for slot in slots:
+                    line = slot.format(wrap(secret))
+                    with self.subTest(line=line):
+                        self.assertNotIn(secret, redact(line))
+
+    def test_inert_values_are_still_skipped(self):
+        """#3982 review, MAJOR 5 must stay closed.
+
+        The MAJOR 7 anchoring above tightens the same list, so the
+        false-positive relief it was added for is asserted here in the
+        opposite direction: every value below is documentation, and
+        redacting it destroys information while protecting nothing.
+        """
+        for value in (
+            "vault:pg/password",
+            "vault:anthropic/api_key",
+            "[REDACTED]",
+            "[REDACTED:memorable_password]",
+            "process.env.ANTHROPIC_API_KEY",
+            'os.environ["ANTHROPIC_API_KEY"]',
+            "import.meta.env.VITE_API_KEY",
+            "<your-password-here>",
+            "<generate-with-openssl-rand>",
+            "{{ db_password }}",
+            "${DB_PASSWORD}",
+            "%API_TOKEN%",
+            "changeme-in-production",
+            "todo-before-launch",
+            "****",
+            "the bearer token to use",
         ):
-            with self.subTest(line):
-                self.assertNotIn(token, redact(line))
+            with self.subTest(value):
+                self.assertTrue(is_inert_value(value), value)
+
+    def test_inert_anchors_do_not_match_past_a_trailing_newline(self):
+        """Python ``$`` matches before a final newline; JavaScript ``$``
+        (without ``/m``) does not. Every anchored entry in the inert list
+        is spelled with ``\\Z`` so the two engines cannot fork here."""
+        for value in ("<value>\n", "{{token}}\n", "${DB_PASSWORD}\n"):
+            with self.subTest(value):
+                self.assertFalse(is_inert_value(value), repr(value))
 
     def test_authorization_headers_are_masked_case_insensitively(self):
         """#3982 review, MAJOR 6 — HTTP/2 lowercases header names."""

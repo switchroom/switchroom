@@ -210,23 +210,34 @@ _DB_URI_RE = _compile(
 # and for a `vault:` reference it deletes exactly the key NAME an agent
 # is supposed to remember. Mirrors INERT_VALUE_RE in
 # telegram-plugin/secret-detect/inert-values.ts.
+# ``$`` is spelled ``\Z`` throughout: Python's ``$`` also matches BEFORE a
+# final newline, JavaScript's (without ``/m``) does not. Every entry here
+# is end-anchored, so that difference would be a live cross-engine fork.
 _INERT_VALUE_RES = [
-    _compile(r"^\[REDACTED", re.I),
-    _compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$"),
-    _compile(r"^\{\{[^\n\r\u2028\u2029]*\}\}$"),
-    _compile(r"^<[^>]*>$"),
-    _compile(r"^%[A-Za-z_][A-Za-z0-9_]*%$"),
-    _compile(r"^vault:", re.I),
-    _compile(r"^[*x\u2022.]+$", re.I),
-    _compile(r"^(?:process\.env|import\.meta\.env|os\.environ)\b"),
+    _compile(r"^\[REDACTED(?::[A-Za-z0-9_]+)?\]\Z", re.I),
+    _compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\Z"),
+    _compile(r"^\{\{[^\n\r\u2028\u2029]*\}\}\Z"),
+    _compile(r"^<[^<>\n\r\u2028\u2029]*>\Z"),
+    _compile(r"^%[A-Za-z_][A-Za-z0-9_]*%\Z"),
+    _compile(r"^vault:[A-Za-z0-9_./-]*\Z", re.I),
+    _compile(r"^[*x\u2022.]+\Z", re.I),
+    _compile(
+        r"^(?:process\.env|import\.meta\.env|os\.environ)"
+        r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*"
+        r"|\[[\"']?[A-Za-z_$][A-Za-z0-9_$]*[\"']?\])*\Z"
+    ),
     _compile(
         r"^(?:changeme|change-me|replaceme|replace-me|placeholder|todo|tbd"
         r"|yourkey|your-key|yourpassword|your-password|yoursecret|your-secret"
-        r"|yourtoken|your-token)(?:[-_][A-Za-z0-9-]+)?$",
+        r"|yourtoken|your-token)(?:[-_][A-Za-z0-9-]+)?\Z",
         re.I,
     ),
-    _compile(r"^[a-z]+(?: [a-z]+){2,}$"),
+    _compile(r"^[a-z]+(?: [a-z]+){2,}\Z"),
 ]
+
+# An unbroken run of ``[A-Za-z0-9]`` long enough to BE a credential.
+# Mirrors CREDENTIAL_RUN_RE / hasCredentialShapedRun in inert-values.ts.
+_CREDENTIAL_RUN_RE = _compile(r"[A-Za-z0-9]{12,}")
 
 # Trailing punctuation an English sentence puts AFTER a value. The value
 # classes are `[^\s"']`-shaped, so a sentence-final `.` or a list comma
@@ -239,8 +250,37 @@ def _strip_trailing_punctuation(value: str) -> str:
     return _TRAILING_PUNCT_RE.sub("", value)
 
 
+def _run_is_credential_shaped(run: str) -> bool:
+    classes = 0
+    if re.search(r"[a-z]", run):
+        classes += 1
+    if re.search(r"[A-Z]", run):
+        classes += 1
+    if re.search(r"[0-9]", run):
+        classes += 1
+    return classes >= 2
+
+
+def has_credential_shaped_run(value: str) -> bool:
+    """True when ``value`` carries a credential-shaped run anywhere inside.
+
+    #3982 review, MAJOR 7. The inert SHAPES are necessary but not
+    sufficient: ``<a8f3...>`` and ``{{tok_...}}`` are legal instances of
+    the ``<...>`` / ``{{...}}`` shapes, and a wrapper left behind after
+    someone filled the value in (``vault:pg/password<secret>``,
+    ``[REDACTED]<secret>``, ``changeme-<secret>``) turned a
+    false-positive fix into a bypass of already-shipped coverage.
+    """
+    return any(
+        _run_is_credential_shaped(m.group(0))
+        for m in _CREDENTIAL_RUN_RE.finditer(value)
+    )
+
+
 def is_inert_value(value: str) -> bool:
-    return any(r.search(value) for r in _INERT_VALUE_RES)
+    if not any(r.search(value) for r in _INERT_VALUE_RES):
+        return False
+    return not has_credential_shaped_run(value)
 
 
 # Rules whose captured value is a LABELLED slot: an inert placeholder in

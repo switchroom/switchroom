@@ -29,6 +29,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { redact } from "../secret-detect/redact.js";
+import { isInertValue } from "../secret-detect/inert-values.js";
 import { scanDbUris, DB_URI_RULE_ID } from "../secret-detect/db-uri.js";
 import {
   looksLikeMemorablePassword,
@@ -286,6 +287,81 @@ describe("inert values are not credentials (MAJOR 5)", () => {
       "--token " + token,
     ]) {
       expect(redact(line)).not.toContain(token);
+    }
+  });
+
+  // #3982 review, MAJOR 7. Five of the inert patterns were either not
+  // end-anchored (`/^vault:/`, `/^\[REDACTED/`, the `process.env` rule)
+  // or accepted any payload (`/^<[^>]*>$/`, `/^\{\{…\}\}$/`), so a value
+  // that merely CARRIED an inert-looking wrapper skipped the three gated
+  // rules and was stored verbatim — a regression against coverage
+  // already shipped on main, in the very mechanism added to harden it.
+  const WRAPPERS: Array<(v: string) => string> = [
+    (v) => v,
+    (v) => `<${v}>`,
+    (v) => `{{${v}}}`,
+    (v) => `vault:pg/password${v}`,
+    (v) => `vault:pg/${v}`,
+    (v) => `[REDACTED]${v}`,
+    (v) => `[REDACTED:env_key_value]${v}`,
+    (v) => `process.env.${v}`,
+    (v) => `changeme-${v}`,
+    (v) => `todo_${v}`,
+    (v) => `\${${v}}`,
+    (v) => `%${v}%`,
+  ];
+  const SLOTS: Array<(v: string) => string> = [
+    (v) => `POSTGRES_PASSWORD: ${v}`,
+    (v) => `ANTHROPIC_API_KEY=${v}`,
+    (v) => `{"token": "${v}"}`,
+    (v) => `--token ${v}`,
+  ];
+
+  it("does not let an inert WRAPPER smuggle a real value through", () => {
+    const token = "zQ7x" + "Vb2n" + "Kd9w" + "Rt4y";
+    const hexish =
+      "a8f3c1d2" + "e4b50f6a" + "9c7d3e81" + "b2f45a6c" + "d90e17bb";
+    for (const secret of [token, hexish]) {
+      for (const wrap of WRAPPERS) {
+        for (const slot of SLOTS) {
+          const line = slot(wrap(secret));
+          expect(redact(line), line).not.toContain(secret);
+        }
+      }
+    }
+  });
+
+  it("keeps skipping values that are inert END TO END", () => {
+    // The other direction of MAJOR 7: anchoring must not re-open the
+    // false positives MAJOR 5 closed.
+    for (const value of [
+      "vault:pg/password",
+      "vault:anthropic/api_key",
+      "[REDACTED]",
+      "[REDACTED:memorable_password]",
+      "process.env.ANTHROPIC_API_KEY",
+      'os.environ["ANTHROPIC_API_KEY"]',
+      "import.meta.env.VITE_API_KEY",
+      "<your-password-here>",
+      "<generate-with-openssl-rand>",
+      "{{ db_password }}",
+      "${DB_PASSWORD}",
+      "%API_TOKEN%",
+      "changeme-in-production",
+      "todo-before-launch",
+      "****",
+      "the bearer token to use",
+    ]) {
+      expect(isInertValue(value), value).toBe(true);
+    }
+  });
+
+  it("does not treat a trailing newline as end-of-value", () => {
+    // Python `$` also matches BEFORE a final newline, JavaScript `$`
+    // (no /m) does not; the Python mirror spells every anchor `\Z` so
+    // the engines cannot fork here. Asserted on both sides.
+    for (const value of ["<value>\n", "{{token}}\n", "${DB_PASSWORD}\n"]) {
+      expect(isInertValue(value), JSON.stringify(value)).toBe(false);
     }
   });
 });
