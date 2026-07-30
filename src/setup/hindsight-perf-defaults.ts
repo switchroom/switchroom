@@ -618,17 +618,27 @@ export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
  * agents rely on, so "silently never refreshed" is a correctness failure, not
  * a slow drain.
  *
- * 500 is a 5x scope bump with the same shape of bound — it is still a bound,
- * so a runaway bank still re-queues rather than monopolising a slot, and the
- * consolidation prompt size per LLM call is unchanged (that is
- * `LLM_BATCH_SIZE`, derived from the context window). What it costs is a
- * longer hold on a worker slot per round; what it buys is that a mid-sized
- * bank now finishes a round and refreshes.
+ * 500 was a 5x scope bump over the 100 floor, with the same shape of bound —
+ * still a bound, so a runaway bank re-queues rather than monopolising a slot,
+ * and the consolidation prompt size per LLM call is unchanged (that is
+ * `LLM_BATCH_SIZE`, derived from the context window). What it cost was a longer
+ * hold on a worker slot per round; what it bought was that a mid-sized bank
+ * finishes a round and refreshes.
  *
- * Raising this was gated on consolidation leaving the shared Anthropic quota
- * — see the RESTORE CONDITION in the block above.
+ * **500→250 (2026-07-31).** Halved as part of the same relief pass that resized
+ * the pg buffer pool, and gated the same way — verified live before promotion.
+ * 500 held a worker slot too long per round when several banks consolidated at
+ * once, which is exactly the contention the DB housekeeping (VACUUM +
+ * autovacuum tuning on the hot tables) was addressing from the storage side.
+ * 250 is still a 2.5x scope over the old 100 floor, so the correctness property
+ * above (a mid-sized bank finishes a round and refreshes its mental models)
+ * still holds — the top-heavy banks that never dropped below 100 clear 250 in
+ * two rounds instead of one, at a shorter per-round slot hold. It lands on the
+ * live fleet only after this ships and the operator runs a host
+ * `switchroom apply`; recreating the container ahead of that would just
+ * reintroduce config-vs-runtime drift, so it is deferred.
  */
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 500;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 250;
 
 /**
  * Per-type worker slot CEILING for consolidation — upstream

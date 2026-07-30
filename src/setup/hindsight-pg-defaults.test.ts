@@ -158,6 +158,16 @@ describe("pg0 memory budget derivation", () => {
     );
   });
 
+  it("pins shared_buffers at the 2026-07-31 relief default of 6144 MiB", () => {
+    // Outcome guard, not a range: the relief pass raised this 3072 -> 6144
+    // alongside the DB housekeeping (VACUUM + autovacuum tuning) and a matching
+    // effective_cache_size bump. A revert to 3072 — or drift to any other
+    // value — is exactly the regression this pin exists to catch. It stays
+    // inside the derived budget ceiling, which the range tests above still
+    // enforce independently.
+    expect(HINDSIGHT_PG_DEFAULT_SHARED_BUFFERS_MIB).toBe(6144);
+  });
+
   it("declares effective_cache_size at or above shared_buffers", () => {
     // effective_cache_size counts shared_buffers PLUS the OS page cache, so a
     // value below the buffer pool is incoherent — it would tell the planner
@@ -185,6 +195,13 @@ describe("pg0 memory budget derivation", () => {
     expect(HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB).toBeGreaterThanOrEqual(
       3 * PG0_OWN_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB,
     );
+  });
+
+  it("pins effective_cache_size at the 2026-07-31 relief default of 12288 MiB", () => {
+    // Outcome guard: moved 7168 -> 12288 with the buffer-pool bump. A pure
+    // planner hint, so the ceiling test above bounds it against the container
+    // memory limit; this pins the exact target so a revert is caught.
+    expect(HINDSIGHT_PG_DEFAULT_EFFECTIVE_CACHE_SIZE_MIB).toBe(12288);
   });
 
   it("leaves shm_size alone — shared_buffers is mmap here, not /dev/shm", () => {
