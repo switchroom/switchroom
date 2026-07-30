@@ -1231,6 +1231,20 @@ export const HINDSIGHT_MCP_TOOLS = [
   // Memories.
   "mcp__hindsight__get_memory",
   "mcp__hindsight__list_memories",
+  // Reversible memory writes — pre-approved. Both are SHIM-SYNTHESIZED
+  // (src/cli/hindsight-mcp-shim.ts) and REVERSIBLE, which is why they ride
+  // with the read/retain surface rather than behind a per-call card:
+  //   • invalidate_memory — soft-retire (is_active:false). It has a `restore`
+  //     path that reactivates the exact memory (shim SYNTHESIZED_TOOL_TABLE,
+  //     `restore` arg), so nothing is destroyed.
+  //   • update_memory — edits an existing memory's fields in place.
+  // The agent uses these autonomously for user corrections / "actually it's X"
+  // amendments (an automated-flow dependency, same shape as delete_document
+  // above), and every uncurated call otherwise raises a fresh Telegram
+  // permission card — a flood on high-frequency correction workloads. The
+  // PERMANENTLY-destructive memory tool, clear_memories, stays gated below.
+  "mcp__hindsight__invalidate_memory",
+  "mcp__hindsight__update_memory",
   // Documents.
   "mcp__hindsight__get_document",
   "mcp__hindsight__list_documents",
