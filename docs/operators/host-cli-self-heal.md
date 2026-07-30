@@ -1,0 +1,144 @@
+# Host CLI self-heal (systemd timer)
+
+`switchroom update` updates the fleet **and** the host operator binary
+(`self-update-cli`, #3919). But nothing *re-runs* it on a schedule, so if the
+host binary is left behind after a roll it stays behind until a human runs
+`switchroom update` again. That is exactly what happened once: after **v0.19.38**
+rolled to every container, `/usr/local/bin/switchroom` stayed on **v0.19.33** and
+the `hindsight-watch` cron ran retired code for **12 hours**.
+
+Two standing checks already make that drift *loud* — `switchroom doctor` now
+FAILs on a behind host CLI, and the `hindsight-watch` cron is reconciled on
+every update — but "loud" still needs a human to look. This timer makes the host
+binary **self-heal** without one: it re-runs `switchroom update --skip-images` on
+a cadence, so a behind host CLI is corrected within one interval.
+
+## What the tick does (and does not do)
+
+`ExecStart` runs `switchroom update --skip-images`:
+
+- **Does** run `self-update-cli` — the checksum-verified, atomic host-binary
+  swap (this flag does **not** skip self-update; only `--skip-self-update`
+  does). This is the self-heal.
+- **Does** reconcile the `hindsight-watch` cron and regenerate the per-agent
+  scaffolds/compose (`apply-config`) — both idempotent.
+- **Does NOT** pull GHCR images or refresh hostd/web on every tick
+  (`--skip-images`), so each run is cheap and offline-safe apart from the
+  GitHub release check the self-update performs.
+- The final `docker compose up -d` is a **no-op when nothing changed** — it does
+  not restart the fleet on a healthy tick.
+
+Deliberate container rolls stay the operator's explicit, un-skipped
+`switchroom update`. This unit's only job is keeping the **host binary** current.
+
+## Requirements
+
+- **systemd** on the host.
+- The service runs as the **operator** user whose `~/.switchroom` holds the
+  fleet config — *not* root. `switchroom update` reads `$HOME/.switchroom` and
+  the operator's compose; running it as root would read root's empty home.
+- `self-update-cli` replaces the binary **in place** with an atomic
+  `rename(2)` in the binary's own directory, so **that directory must be
+  writable by the service user**. Two easy ways:
+  - Install to a user-writable dir (`SWITCHROOM_INSTALL_DIR=$HOME/.local/bin`,
+    the installer's fallback) and point `ExecStart` at it, **or**
+  - keep it in `/usr/local/bin` and `sudo chown <operator> /usr/local/bin/switchroom`
+    plus make the dir writable, **or** drop the binary in a dedicated
+    operator-owned dir on `PATH`.
+
+## The unit files
+
+Replace `OPERATOR` with the operator username (e.g. the output of `id -un`) and
+adjust the `switchroom` path if you did not install to `/usr/local/bin`.
+
+### `/etc/systemd/system/switchroom-self-heal.service`
+
+```ini
+[Unit]
+Description=Switchroom host CLI self-heal (re-run `switchroom update` so the host binary can't silently trail the fleet)
+Documentation=https://github.com/switchroom/switchroom/blob/main/docs/operators/host-cli-self-heal.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Run as the operator whose ~/.switchroom holds the fleet config — NOT root.
+User=OPERATOR
+Environment=HOME=/home/OPERATOR
+# --skip-images keeps each tick cheap: it still runs self-update-cli (the host
+# binary swap) and reconciles the hindsight-watch cron, but does not pull GHCR
+# images or touch running containers on a healthy tick.
+ExecStart=/usr/local/bin/switchroom update --skip-images
+# Self-heal must never wedge the host: bound the run, run at low priority, and
+# do not retry-storm — the next tick will pick it up.
+TimeoutStartSec=600
+Nice=10
+```
+
+### `/etc/systemd/system/switchroom-self-heal.timer`
+
+```ini
+[Unit]
+Description=Run the Switchroom host CLI self-heal every 30 minutes
+Documentation=https://github.com/switchroom/switchroom/blob/main/docs/operators/host-cli-self-heal.md
+
+[Timer]
+# First run shortly after boot, then every 30 minutes. A behind host binary is
+# corrected within one interval (the 12h drift incident could not recur).
+OnBootSec=5min
+OnUnitActiveSec=30min
+# Jitter so a fleet of hosts does not hit the GitHub release API in lockstep.
+RandomizedDelaySec=2min
+# Fire a missed run (host was off) on next boot rather than waiting a full
+# interval.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+> **Cadence.** 30 minutes bounds worst-case host-binary drift to one interval
+> while keeping the GitHub release round-trip infrequent. Hourly (`OnUnitActiveSec=1h`)
+> is a fine, lighter alternative; anything much longer re-opens the multi-hour
+> drift window this unit exists to close.
+
+## Install and enable
+
+```bash
+# 1. Drop the two unit files in place (edit OPERATOR / the binary path first).
+sudo install -m 0644 switchroom-self-heal.service /etc/systemd/system/
+sudo install -m 0644 switchroom-self-heal.timer   /etc/systemd/system/
+
+# 2. Reload systemd and enable the timer (starts it now + on every boot).
+sudo systemctl daemon-reload
+sudo systemctl enable --now switchroom-self-heal.timer
+
+# 3. Verify it is scheduled and that a manual run is clean.
+systemctl list-timers switchroom-self-heal.timer
+sudo systemctl start switchroom-self-heal.service   # run once, now
+journalctl -u switchroom-self-heal.service -n 50 --no-pager
+```
+
+## Verify it is working
+
+- `systemctl list-timers switchroom-self-heal.timer` shows a `NEXT` fire time.
+- After a tick, `switchroom doctor` shows the `component versions` section
+  **green** for `cli (host)` (it FAILs while the host binary is behind).
+- `journalctl -u switchroom-self-heal.service` shows either
+  `host CLI already on vX.Y.Z` (healthy no-op) or the self-update swap message.
+
+## Disable
+
+```bash
+sudo systemctl disable --now switchroom-self-heal.timer
+sudo rm /etc/systemd/system/switchroom-self-heal.{service,timer}
+sudo systemctl daemon-reload
+```
+
+## Why this is not wired into `install.sh`
+
+`install.sh` is a `curl | sh` one-shot that must work on hosts **without**
+systemd or root (it falls back to `~/.local/bin`). Auto-installing and enabling a
+system-wide timer from it would fail or surprise those hosts, and it cannot know
+the operator username or the intended cadence. So this stays an explicit,
+operator-installed artifact rather than an installer side effect.
