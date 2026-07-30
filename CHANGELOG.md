@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased — Telegram formatting guidance realigned to the single GFM render path
+
+Ships in v0.19.37. A focused cleanup that makes the agent-facing formatting
+docs match what the runtime actually does, and closes three small correctness
+gaps in the deterministic send-time normalizers.
+
+### Reply-tool `format` docs described deleted engines
+
+Since the Bot API 10.1 migration (#2669) there is exactly ONE render path —
+raw GFM markdown. But the `reply` / `edit_message` `format` param still claimed
+`'html'` "converts markdown to Telegram HTML" and `'markdownv2'` gave
+"MarkdownV2 with auto-escaping". Both are false: nothing converts to HTML,
+nothing auto-escapes, and the gateway routes everything non-`'text'` through the
+same rich path. The descriptions now tell the truth — default renders rich GFM
+markdown, `'text'` sends verbatim, and `'html'`/`'markdownv2'` are accepted
+legacy aliases onto the one rich path. The enum values are unchanged, so
+existing callers keep working. `ask_user`'s "Plain text or HTML" question hint
+was corrected the same way.
+
+### Dash normalization no longer rewrites quoted text
+
+`normalizePunctuation` rewrote ` — ` to `, ` everywhere, including inside `>`
+blockquotes, which are reserved for VERBATIM quoted text — silently corrupting
+an author's quotation. Blockquote lines (including the `**>` expandable-quote
+opener) are now exempt from the dash rewrite; code spans and link hrefs stay
+masked as before.
+
+### Footnote repair widened beyond digits
+
+The send-time footnote guard only matched `[^1]` (digits), so `[^note]` /
+`[^ref]` shipped as literal bracket noise. It now matches short alphanumeric
+ids (`\[\^[A-Za-z0-9]{1,10}\]`), keeping regex-literal negated char classes
+like `[^/]` / `[^a-z]` intact (they contain punctuation). Tradeoff: a
+pure-alphanumeric negated class in BARE prose (`array[^index]`) is now treated
+as a footnote — rare, since real regex/index literals live in masked code spans.
+
+### Guidance fixes (docs)
+
+- The house "make it scannable" example taught `• ` bullets, which the runtime
+  rewrites to `- ` at send time; the example now uses canonical `- `.
+- The floor card and depth reference now note the expandable-blockquote `**>`
+  opener must be at line start (column 0) — never indented — or it won't parse.
+
 ## v0.19.36 — credit exhaustion fails loudly, an honest model-switch card, memory redaction at intake, and Telegram keeps its headings
 
 Provider credit exhaustion can no longer die in silence, the boot-time

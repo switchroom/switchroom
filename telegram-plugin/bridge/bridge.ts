@@ -94,7 +94,7 @@ const TOOL_SCHEMAS = [
       // client and this detail was being silently truncated away.
       'FORUM TOPICS: a reply is auto-routed back to the topic the question came from, so do NOT pass message_thread_id on a normal reply — pass the inbound\'s origin_turn_id instead, so the answer lands in the right topic even if a message from another topic arrived while you were working. message_thread_id is only for deliberately posting into a topic that is not the one you were asked in. ' +
       // Format modes: likewise moved out of the truncated instructions string.
-      'FORMAT: the default format is "html" — write natural markdown and it is auto-converted to Telegram HTML (bold, italic, code, links, code blocks). Pass format: "markdownv2" for MarkdownV2 with auto-escaping, or "text" for plain text sent verbatim.',
+      'FORMAT: by default your text is rendered as rich GFM markdown (Bot API 10.1) — write natural markdown (bold, italic, code, links, code blocks, lists, tables) and it renders as-is. Pass format: "text" to send plain text verbatim with no rendering. "html" and "markdownv2" are accepted legacy aliases that route through the exact same single rich GFM path — there is no separate HTML engine and no auto-escaping.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -105,7 +105,7 @@ const TOOL_SCHEMAS = [
         message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message in the same chat if not specified.' },
         origin_turn_id: { type: 'string', description: 'In a forum supergroup, pass back the origin_turn_id attribute from the <channel> message you are answering. It pins the reply to that message\'s topic even if another topic\'s turn started meanwhile. Omit in DMs / single-topic chats.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Absolute file paths to attach. Images send as photos; other types as documents. Max 50MB each. Telegram rejects photos with extreme dimensions (aspect ratio over ~10:1, width+height over 10000px, or over 10MB) — very tall images like full-page screenshots are auto-rerouted as documents; crop or split them first if the user should see them inline as photos.' },
-        format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML." },
+        format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. Default renders your text as rich GFM markdown (Bot API 10.1). 'text' sends plain text verbatim. 'html' and 'markdownv2' are legacy aliases that route through the same single rich GFM path — no separate HTML engine, no auto-escaping." },
         disable_web_page_preview: { type: 'boolean', description: 'Disable link preview thumbnails. Default: true.' },
         protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
         quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
@@ -180,7 +180,7 @@ const TOOL_SCHEMAS = [
         chat_id: { type: 'string' },
         message_id: { type: 'string' },
         text: { type: 'string' },
-        format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML." },
+        format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. Default renders your text as rich GFM markdown (Bot API 10.1). 'text' sends plain text verbatim. 'html' and 'markdownv2' are legacy aliases that route through the same single rich GFM path — no separate HTML engine, no auto-escaping." },
       },
       required: ['chat_id', 'message_id', 'text'],
     },
@@ -341,7 +341,7 @@ const TOOL_SCHEMAS = [
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Chat that should receive the question. Pass from inbound meta.' },
-        question: { type: 'string', description: 'The question text. Plain text or HTML. Keep it short — buttons render below.' },
+        question: { type: 'string', description: 'The question text. Plain text or GFM markdown (rendered through the same rich path as replies). Keep it short — buttons render below.' },
         options: {
           type: 'array',
           items: { type: 'string' },

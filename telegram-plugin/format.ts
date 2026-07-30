@@ -718,21 +718,37 @@ export function normalizePunctuation(text: string): string {
   const restoreLinks = (s: string): string =>
     s.replace(linkRestoreRe, (_m, idx: string) => linkMasks[Number(idx)] ?? _m)
 
+  // The dash rewrite runs per line so blockquote lines can be exempted:
+  // `>` blockquotes are reserved for VERBATIM quoted text, and rewriting an
+  // author's ` — ` to `, ` inside a quotation would corrupt what they quoted.
+  // The expandable-blockquote opener `**>` is a blockquote line too even though
+  // isBlockquoteLine (which keys on a leading `>`) doesn't catch the `**`
+  // prefix, so exempt it explicitly. Code spans and link hrefs stay masked
+  // throughout, so their dashes are already protected on every line.
+  const rewriteDashes = (line: string): string =>
+    line
+      // 1. Space-flanked em/en dash. Numeric range keeps a hyphen. The right
+      //    flank is a LOOKAHEAD (captured, not consumed) so consecutive spaced
+      //    dashes ("a — b — c") all normalize in one pass — a consumed \S would
+      //    swallow the char that anchors the next match.
+      .replace(/(\S)[ \t][—–][ \t](?=(\S))/g, (_m, a: string, b: string) =>
+        /\d/.test(a) && /\d/.test(b) ? `${a}-` : `${a}, `,
+      )
+      // 2. Bare em-dash between word chars. Numeric range keeps a hyphen.
+      //    Right flank is a lookahead for the same consecutive-match reason.
+      .replace(/(\w)—(?=(\w))/g, (_m, a: string, b: string) =>
+        /\d/.test(a) && /\d/.test(b) ? `${a}-` : `${a}, `,
+      )
+      // 3. Bare en-dash between word chars → hyphen (ranges: 2019–2024).
+      .replace(/(\w)–(?=\w)/g, '$1-')
+
+  const isQuotedLine = (line: string): boolean =>
+    isBlockquoteLine(line) || line.trimStart().startsWith('**>')
+
   let out = maskedAutolinks
-    // 1. Space-flanked em/en dash. Numeric range keeps a hyphen. The right
-    //    flank is a LOOKAHEAD (captured, not consumed) so consecutive spaced
-    //    dashes ("a — b — c") all normalize in one pass — a consumed \S would
-    //    swallow the char that anchors the next match.
-    .replace(/(\S)[ \t][—–][ \t](?=(\S))/g, (_m, a: string, b: string) =>
-      /\d/.test(a) && /\d/.test(b) ? `${a}-` : `${a}, `,
-    )
-    // 2. Bare em-dash between word chars. Numeric range keeps a hyphen.
-    //    Right flank is a lookahead for the same consecutive-match reason.
-    .replace(/(\w)—(?=(\w))/g, (_m, a: string, b: string) =>
-      /\d/.test(a) && /\d/.test(b) ? `${a}-` : `${a}, `,
-    )
-    // 3. Bare en-dash between word chars → hyphen (ranges: 2019–2024).
-    .replace(/(\w)–(?=\w)/g, '$1-')
+    .split('\n')
+    .map((line) => (isQuotedLine(line) ? line : rewriteDashes(line)))
+    .join('\n')
 
   // Restore link hrefs now that the dash passes are done — before the bullet
   // pass and the code restore.

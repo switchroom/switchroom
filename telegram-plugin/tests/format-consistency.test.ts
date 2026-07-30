@@ -245,6 +245,24 @@ describe('normalizePunctuation', () => {
     expect(normalizePunctuation('<not—a—url>')).toBe('<not, a, url>')
   })
 
+  test('does NOT rewrite a dash inside a `>` blockquote (verbatim quote)', () => {
+    // `>` blockquotes hold quoted text the author is reproducing verbatim;
+    // rewriting their em-dash to `, ` corrupts the quotation.
+    expect(normalizePunctuation('> she said — plainly — no')).toBe(
+      '> she said — plainly — no',
+    )
+    // Indented blockquote line is still a blockquote.
+    expect(normalizePunctuation('  > quoted — text')).toBe('  > quoted — text')
+    // The expandable-blockquote opener `**>` is a blockquote line too.
+    expect(normalizePunctuation('**> first — line\n> continues — here')).toBe(
+      '**> first — line\n> continues — here',
+    )
+    // Prose OUTSIDE the quote still normalizes; only the quoted line is spared.
+    expect(normalizePunctuation('intro — here\n> quote — verbatim\nafter — end')).toBe(
+      'intro, here\n> quote — verbatim\nafter, end',
+    )
+  })
+
   test('idempotent', () => {
     const once = normalizePunctuation('a — b\n• c\nd—e\n1–2')
     expect(normalizePunctuation(once)).toBe(once)

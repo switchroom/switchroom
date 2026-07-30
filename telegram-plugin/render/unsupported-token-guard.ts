@@ -59,12 +59,16 @@ import { splitProtectedSegments } from "./code-segments.js";
  *  `a^2+b^2=c^2`, `2^8`, and `x^n` all pass through untouched. */
 const CARET_PAIR = /\^([A-Za-z0-9]+)\^/g;
 
-/** Footnote reference marker `[^N]` (digits only) NOT immediately followed by
- *  `:` (which would make it a footnote DEFINITION line we leave intact). Removed
- *  entirely. Restricting the id to digits keeps this off in-prose bracket
- *  literals like `array[^index]` and regex-ish `[^/]`, which are NOT footnotes
- *  and would otherwise be silently eaten. */
-const FOOTNOTE_MARKER = /\[\^\d+\](?!:)/g;
+/** Footnote reference marker `[^id]` where the id is a short alphanumeric run
+ *  (`[^1]`, `[^note]`, `[^ref]`) NOT immediately followed by `:` (which would
+ *  make it a footnote DEFINITION line we leave intact). Removed entirely.
+ *  Requiring the id to be 1–10 ALPHANUMERIC chars keeps this off regex-ish
+ *  literals like `[^/]`, `[^\s]`, `[^-a-z]`, whose bodies contain punctuation
+ *  and so never match. In-prose subscript-ish `array[^i]` outside a code span
+ *  is a rare theoretical false positive (an `i` id matches); code spans are
+ *  masked upstream by splitProtectedSegments so real code is safe, and prose
+ *  that writes a literal `[^i]` reads as footnote noise anyway. */
+const FOOTNOTE_MARKER = /\[\^[A-Za-z0-9]{1,10}\](?!:)/g;
 
 /** `<details>…</details>` with an optional leading `<summary>…</summary>`.
  *  Dot-all via `[\s\S]`; non-greedy so adjacent blocks don't merge. */
