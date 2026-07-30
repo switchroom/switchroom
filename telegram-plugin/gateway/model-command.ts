@@ -912,7 +912,7 @@ function relaunchErrorReply(
  * second signal for a pinned id whose FAMILY equals the configured default's:
  * `modelFamilyToken('claude-opus-4-8')` is `'opus'`, so on an `opus`-default
  * agent `classifyModelSwitchConfirmation` returns `default`, not `not-applied`
- * (see #4001 — a pre-existing property of the family reduction, reachable
+ * (see #4005 — a pre-existing property of the family reduction, reachable
  * before this map existed by typing the full id).
  * Exported for tests.
  */
