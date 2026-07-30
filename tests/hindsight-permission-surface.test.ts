@@ -47,6 +47,7 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__get_memory",
       "mcp__hindsight__get_mental_model",
       "mcp__hindsight__get_operation",
+      "mcp__hindsight__invalidate_memory",
       "mcp__hindsight__list_banks",
       "mcp__hindsight__list_directives",
       "mcp__hindsight__list_documents",
@@ -60,6 +61,7 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__retain",
       "mcp__hindsight__sync_retain",
       "mcp__hindsight__update_bank",
+      "mcp__hindsight__update_memory",
     ]);
   });
 
@@ -80,6 +82,16 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
     // delete_document STAYS pre-approved: MEMORY_GUIDANCE instructs the agent
     // to call it autonomously for corrections / "forget that" (automated flow).
     expect(HINDSIGHT_MCP_TOOLS).toContain("mcp__hindsight__delete_document");
+  });
+
+  it("pre-approves the REVERSIBLE memory writes but NOT the permanent memory wipe", () => {
+    // invalidate_memory (soft-retire with a `restore` path) and update_memory
+    // (in-place edit) are reversible, so they ride with the read/retain surface
+    // instead of raising a per-call Telegram card on every correction. The
+    // permanently-destructive clear_memories stays gated.
+    expect(HINDSIGHT_MCP_TOOLS).toContain("mcp__hindsight__invalidate_memory");
+    expect(HINDSIGHT_MCP_TOOLS).toContain("mcp__hindsight__update_memory");
+    expect(HINDSIGHT_MCP_TOOLS).not.toContain("mcp__hindsight__clear_memories");
   });
 
   it("NEVER pre-approves a mental-model write tool (they route through the propose card)", () => {
