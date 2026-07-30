@@ -14,10 +14,14 @@
  * `thresholds.ts`, where the constant used to be.
  *
  * `recall-latency` was removed for the SAME reason and caught the same way,
- * one signal-set later: the healthy fleet's recall p95 is 8037 ms against an
- * 8000 ms per-bank budget, so the drafted 6000 ms page line sat below the
- * healthy MEDIAN. Twice now the trap has been a latency threshold measured
- * against an outage instead of against a working fleet.
+ * one signal-set later: the drafted 6000 ms page line sat below the healthy
+ * MEDIAN (p50 6420 ms), and the only healthy p95 ever measured (8037 ms) was
+ * right-censored at the then-8 s per-bank wall — retired by #3759, which made
+ * the recall deadline a 10 s declarative envelope. Against that 10 s wall the
+ * band is STILL not thresholdable, and re-deriving it needs a re-baseline on a
+ * fixed fleet (follow-up #3792); the full argument lives in `thresholds.ts`.
+ * Twice now the trap has been a latency threshold measured against an outage
+ * instead of against a working fleet.
  */
 export type SignalId =
   | "probe" // the watchdog itself could not see hindsight

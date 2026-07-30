@@ -5,7 +5,9 @@ import {
   QUEUE_FLOOR_MEMORIES,
   QUEUE_GROWTH_MIN_ABS,
   QUEUE_GROWTH_MIN_ABS_MEMORIES,
+  RECALL_WALL_MS,
 } from "./thresholds.js";
+import { resolveHindsightRecallTunables } from "../setup/hindsight-recall-tunables.js";
 
 describe("the #3610 memories → parts conversion", () => {
   // These two numbers are what the operator sees in `--json` and in every
@@ -44,5 +46,25 @@ describe("the #3610 memories → parts conversion", () => {
     // worst single entry in the live 2026-07-26 backlog re-split at the
     // post-#3693 33,000 bound (it was 17 at 45,000, B6).
     expect(5 * 23).toBeLessThan(QUEUE_GROWTH_MIN_ABS);
+  });
+});
+
+describe("RECALL_WALL_MS — the recall latency wall the diagnostic p95 reads against", () => {
+  // The wall the watchdog reports MUST track the live #3759 declarative
+  // envelope, not the retired hardcoded 8 s per-bank timeout. Every assertion
+  // here fails on the stale 8000 the alert used to state.
+  it("is sourced from the declarative recall envelope, not a literal", () => {
+    // The same resolver scaffold/reconcile stamp onto the deployed plugin,
+    // called with no operator overrides = the stock fleet envelope.
+    const stock = resolveHindsightRecallTunables(undefined);
+    expect(RECALL_WALL_MS).toBe(stock.parallelDeadlineSeconds * 1000);
+  });
+
+  it("resolves to the post-#3759 10 s envelope (12 s hook − 2 s headroom)", () => {
+    expect(RECALL_WALL_MS).toBe(10_000);
+  });
+
+  it("is the raised wall, not the retired 8000 ms per-bank budget", () => {
+    expect(RECALL_WALL_MS).toBeGreaterThan(8000);
   });
 });

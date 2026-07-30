@@ -6,14 +6,16 @@ import {
   evaluateFailureRate,
   evaluateLlmFallback,
   evaluateQueueGrowth,
+  evaluateRecallOwnBankTimeout,
   evaluateRetainLoss,
 } from "./evaluate.js";
 import {
   PARTS_PER_MEMORY,
   QUEUE_FLOOR,
   QUEUE_GROWTH_MIN_ABS,
+  RECALL_WALL_MS,
 } from "./thresholds.js";
-import type { Sample } from "./types.js";
+import type { RecallSample, Sample } from "./types.js";
 
 const T0 = Date.parse("2026-07-25T09:00:00Z");
 const INTERVAL = 15 * 60_000;
@@ -296,6 +298,45 @@ describe("evaluateAll", () => {
   it("reports no-data everywhere on a single sample — never a false all-clear", () => {
     const verdicts = evaluateAll([sample(0)]);
     expect(verdicts.filter((v) => v.signal !== "container").every((v) => v.state === "no-data")).toBe(true);
+  });
+});
+
+describe("evaluateRecallOwnBankTimeout — the diagnostic latency suffix", () => {
+  function recallSample(over: Partial<RecallSample> = {}): RecallSample {
+    return {
+      rows: 100,
+      agents: 1,
+      timeoutConsidered: 100,
+      ownBankDegraded: 0,
+      zeroConsidered: 100,
+      zeroResult: 0,
+      poolConsidered: 100,
+      poolMedian: 40,
+      scoreConsidered: 100,
+      scoreP50: 0.5,
+      elapsedConsidered: 100,
+      elapsedP95Ms: 7000,
+      ...over,
+    };
+  }
+
+  function ringWith(r: RecallSample): Sample[] {
+    return [sample(0, { recall: r }), sample(1, { recall: r })];
+  }
+
+  // The alert text used to hardcode "the 8000ms per-bank budget"; #3759 raised
+  // the live recall deadline to a 10 s declarative envelope. The operator-facing
+  // wall MUST report the live envelope, not the retired 8 s number.
+  it("reports the live 10 s recall deadline, never the retired 8000ms budget", () => {
+    const v = evaluateRecallOwnBankTimeout(ringWith(recallSample()));
+    expect(RECALL_WALL_MS).toBe(10_000);
+    expect(v.detail).toContain(`${RECALL_WALL_MS}ms recall deadline`);
+    expect(v.detail).not.toContain("8000ms per-bank budget");
+  });
+
+  it("renders the measured p95 alongside the wall it is read against", () => {
+    const v = evaluateRecallOwnBankTimeout(ringWith(recallSample({ elapsedP95Ms: 7421 })));
+    expect(v.detail).toContain("recall wall time p95 7421ms");
   });
 });
 

@@ -25,9 +25,12 @@
  *   pool         p10 10      p50 41      min 3
  *   zero-memory  28/183 = 15.3 %
  *
- * The latency figures are why `recall-latency` is not a signal: a healthy
- * fleet's p95 sits at the 8 s per-bank budget. The score p10 is why the
- * injected-score warn moved from 0.05 to 0.02.
+ * The latency figures are why `recall-latency` is not a signal: this p95 sits
+ * at the 8 s per-bank wall it was captured under, RIGHT-CENSORED there. #3759
+ * later moved the wall to a 10 s declarative envelope, but a censored 8 s
+ * sample cannot describe the 8-10 s band, so the band is still not
+ * thresholdable — see the deletion note in `thresholds.ts` (RECALL_WALL_MS).
+ * The score p10 is why the injected-score warn moved from 0.05 to 0.02.
  *
  * Content: numeric telemetry only. Bank ids are remapped to `agent-NN` /
  * `side-NN` — no query text, no memory content, and no agent identity is
