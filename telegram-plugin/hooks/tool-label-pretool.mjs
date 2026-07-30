@@ -15,7 +15,9 @@
  * If $TELEGRAM_STATE_DIR is unset → silent skip (renderer just falls back
  * to its existing precedence ladder). If session_id or tool_use_id is
  * missing → skip (the row could never be joined anyway). If the rule
- * table doesn't produce a label for the tool → skip.
+ * table doesn't produce a label for the tool → skip. If the call is a
+ * SIDECHAIN (sub-agent) tool call → skip (see isSubagentToolCall / #cross-
+ * contamination below).
  *
  * Tools intentionally NOT labeled here (handled by existing description
  * / TodoWrite / sub-agent panels in the renderer):
@@ -364,6 +366,56 @@ export function computeLabel(toolName, input) {
   return 'Working…'
 }
 
+/**
+ * True IFF this PreToolUse payload is for a SIDECHAIN (sub-agent) tool call,
+ * i.e. one made inside a Task/worker/Explore/Plan sub-agent rather than the
+ * top-level thread.
+ *
+ * WHY THIS EXISTS — the cross-contamination bug. Claude Code fires PreToolUse
+ * hooks for sub-agent tool calls too, and (as of 2.1.x) passes the PARENT
+ * `session_id` in that payload. The sidecar JSONL is keyed by `session_id`
+ * (`tool-labels-<session_id>.jsonl`), so a still-running background worker's
+ * labels were being appended into the PARENT session's sidecar. The gateway's
+ * real-time draft-mirror tails that file and emits a main-tier `tool_label`
+ * event per line, which the renderer binds to whatever turn is live — so a
+ * worker dispatched by turn N streamed its Bash step labels into an unrelated
+ * turn N+1's progress card. The worker's OWN activity is already surfaced by
+ * the worker-feed (sub_agent_tool_use events tailed from the sub-agent's own
+ * transcript), so the correct fix is to never write sub-agent labels to the
+ * parent sidecar in the first place — the cheapest, at-source link.
+ *
+ * DISCRIMINATOR — the payload carries sidechain identity. The PreToolUse hook
+ * input is built by the CLI's base `Kf(...)` helper, which includes
+ * `agent_id` and `agent_type`. The CLI's own top-level predicate is
+ * `agentType === "main"` (its `hb()` seeds the main thread as
+ * `{ agentType: "main", agentId: <sessionId> }`), while every sub-agent
+ * carries a concrete non-"main" `agent_type` ("worker", "general-purpose",
+ * "Explore", "Plan", a custom agent name, …). So:
+ *   - a concrete `agent_type` other than "main" ⇒ sub-agent (drop), and
+ *   - as a corroborating signal, a sidechain's `agent_id` differs from the
+ *     (parent) `session_id`, whereas the main thread's `agent_id` equals its
+ *     session id.
+ * An ABSENT `agent_type` (or one equal to "main") is treated as main-tier and
+ * KEPT — the safe default. A genuine sub-agent always carries a concrete
+ * agent_type (the Task tool requires a subagent_type), so this never drops a
+ * real sub-agent while risking a main-tier drop.
+ */
+export function isSubagentToolCall(event) {
+  if (!event || typeof event !== 'object') return false
+  const at = event.agent_type
+  if (typeof at === 'string' && at.length > 0 && at !== 'main') return true
+  const aid = event.agent_id
+  const sid = event.session_id
+  if (
+    typeof aid === 'string' && aid.length > 0 &&
+    typeof sid === 'string' && sid.length > 0 &&
+    aid !== sid
+  ) {
+    return true
+  }
+  return false
+}
+
 function main() {
   const raw = readStdin().trim()
   if (!raw) process.exit(0)
@@ -382,6 +434,13 @@ function main() {
   const toolUseId = event.tool_use_id
   const toolName = event.tool_name
   if (!sessionId || !toolUseId || !toolName) process.exit(0)
+
+  // Sidechain (sub-agent) tool calls arrive here with the PARENT session_id,
+  // so writing their label to `tool-labels-<sessionId>.jsonl` pollutes the
+  // parent session's sidecar and cross-contaminates an unrelated turn's card.
+  // Drop them: the worker-feed already surfaces sub-agent activity. See
+  // isSubagentToolCall for the full rationale + discriminator.
+  if (isSubagentToolCall(event)) process.exit(0)
 
   let label
   try {
