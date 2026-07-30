@@ -32,6 +32,7 @@
 import { ALL_PATTERNS } from './patterns.js'
 import { scanKeyValue, scanMemorablePasswords, type RawHit } from './kv-scanner.js'
 import { scanDbUris } from './db-uri.js'
+import { INERT_GATED_RULES, isInertValue } from './inert-values.js'
 import { scanGenericSecrets } from './generic-entropy.js'
 import { shannonEntropy } from './entropy.js'
 import { chunk } from './chunker.js'
@@ -88,6 +89,17 @@ export function detectSecrets(text: string): Detection[] {
         const globalEnd = globalStart + cap.length
         // For env_key_value (captureIndex=3), the LHS is group 1.
         const keyName = p.rule_id === 'env_key_value' ? m[1] : undefined
+        // Inert VALUE gate. `PASSWORD: ${DB_PASSWORD}`,
+        // `POSTGRES_PASSWORD: vault:pg/password`,
+        // `JWT_SECRET=<generate-with-openssl-rand>` and `--token <value>`
+        // are documentation, not credentials — and a vault key NAME is
+        // exactly what an agent is meant to remember, so masking it
+        // deletes information and keeps none. Until #3982's review this
+        // list applied only inside the memorable-password rule, so letter
+        // case decided the outcome: `password: ${DB_PASSWORD}` survived
+        // and `PASSWORD: ${DB_PASSWORD}` was destroyed. See
+        // inert-values.ts.
+        if (INERT_GATED_RULES.has(p.rule_id) && isInertValue(cap)) continue
         // 2026-05-12: shape gate on env_key_value — the pattern matches
         // any value after an ALLCAPS *_KEY/_TOKEN/_SECRET/_PASSWORD
         // identifier, which previously fired on casual chat like

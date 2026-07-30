@@ -34,15 +34,26 @@ import type { RawHit } from './kv-scanner.js'
  * - scheme: RFC 3986 shape, at least two chars so a Windows drive letter
  *   (`c://`) can't anchor a match.
  * - user: no `/`, `@`, `:` or whitespace.
- * - password: no `/`, `@` or whitespace — one or more bytes. `@` is
- *   excluded so the match stops at the FIRST `@`, and a password
- *   containing a literal `@` (which must be percent-encoded in a valid
- *   URI) cannot swallow the host.
+ * - password: anything up to an authority TERMINATOR (`/`, `?`, `#` or
+ *   whitespace) — `@` deliberately INCLUDED. Greedy matching then backs
+ *   off to the LAST `@` in the authority, which is where the host
+ *   actually starts.
+ *
+ *   #3982 review, MAJOR 3: excluding `@` (so the match stopped at the
+ *   FIRST one) looked conservative and was the opposite. An unencoded
+ *   `@` in a pasted DSN is common, and
+ *   `postgres://appuser:p@ssW0rd123@db.internal:5432/prod` masked one
+ *   byte and stored the other ten in clear —
+ *   `postgres://appuser:[REDACTED:db_uri_password]@ssW0rd123@db.internal…`
+ *   — while also telling a reader exactly how long the masked prefix
+ *   was. `url-redact.ts` already did this right for http(s) by taking
+ *   `lastIndexOf('@')` over the authority; this is the same rule for the
+ *   non-HTTP schemes.
  * - host: at least one non-delimiter byte, so `user:pass@` with nothing
  *   after it is not a connection string.
  */
 const DB_URI_RE =
-  /\b([a-zA-Z][a-zA-Z0-9+.-]+):\/\/([^\s:/@]+):([^\s/@]+)@([^\s/@]+)/g
+  /\b([a-zA-Z][a-zA-Z0-9+.-]+):\/\/([^\s:/@]+):([^\s/?#]+)@([^\s/@?#]+)/g
 
 export const DB_URI_RULE_ID = 'db_uri_password'
 

@@ -49,7 +49,35 @@ class SharedVectorTests(unittest.TestCase):
     def test_vectors_file_is_present_and_non_trivial(self):
         with open(VECTORS_PATH, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
-        self.assertGreaterEqual(len(doc["vectors"]), 20)
+        self.assertGreaterEqual(len(doc["vectors"]), 50)
+
+    def test_vectors_cover_the_generated_pattern_table(self):
+        """#3982 review, MAJOR 4.
+
+        The vectors originally shipped exercised only the two hand-ported
+        imperative rules plus the URL pass — ZERO of the ~60 GENERATED
+        patterns. That is exactly the gap that let a Unicode word-boundary
+        fork inside the generated table ship past a green CI.
+        """
+        with open(VECTORS_PATH, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        expected = "".join(v["expected"] for v in doc["vectors"])
+        for marker in (
+            "[REDACTED:anthropic_api_key]",
+            "[REDACTED:jwt]",
+            "[REDACTED:aws_access_key]",
+            "[REDACTED:pem_private_key]",
+            "[REDACTED:bearer_auth_header]",
+            "[REDACTED:basic_auth_header]",
+        ):
+            with self.subTest(marker):
+                self.assertIn(marker, expected)
+        non_ascii = [
+            v
+            for v in doc["vectors"]
+            if any(ord(c) > 127 for c in v["input"]) and "[REDACTED" in v["expected"]
+        ]
+        self.assertGreaterEqual(len(non_ascii), 4)
 
     def test_every_shared_vector_matches(self):
         with open(VECTORS_PATH, "r", encoding="utf-8") as fh:
@@ -84,6 +112,169 @@ class RedactorBehaviourTests(unittest.TestCase):
         ):
             with self.subTest(prose):
                 self.assertEqual(redact(prose), prose)
+
+    def test_sentence_final_prose_is_untouched(self):
+        """#3982 review, BLOCKER 2.
+
+        The value class is ``[^\\s"']``, so the sentence terminator was
+        captured INTO the value and the ``.`` itself supplied the second
+        character class the gate asks for. Every string here redacted as a
+        credential on the shipped code, and sentence-final is the MOST
+        common position for these words — the suite's original
+        mid-sentence cases were tests chosen to pass.
+        """
+        for prose in (
+            "The password is required.",
+            "The password is incorrect.",
+            "The password is unchanged.",
+            "The password is different.",
+            "The password is protected.",
+            "Ken confirmed the password is unchanged.",
+            "password: required, minimum twelve characters, mixed case",
+            "The passphrase is unchanged; rotate it next quarter.",
+        ):
+            with self.subTest(prose):
+                self.assertEqual(redact(prose), prose)
+
+    def test_real_password_ending_a_sentence_is_masked_whole(self):
+        password = "Mango" + "TreeHouse77"
+        self.assertEqual(
+            redact("The wifi password is " + password + "."),
+            "The wifi password is [REDACTED:memorable_password]",
+        )
+        # A password whose LAST byte is punctuation keeps that byte masked.
+        self.assertEqual(
+            redact("password: " + "Fluffy" + "Barnaby" + "1998!"),
+            "password: [REDACTED:memorable_password]",
+        )
+
+    def test_dsn_password_with_unencoded_at_sign_is_fully_masked(self):
+        """#3982 review, MAJOR 3 — 9 of 11 password bytes were stored."""
+        password = "p" + "@" + "ssW0rd123"
+        out = redact("postgres://appuser:" + password + "@db.internal:5432/prod")
+        self.assertEqual(
+            out, "postgres://appuser:[REDACTED:db_uri_password]@db.internal:5432/prod"
+        )
+        for i in range(0, len(password) - 3):
+            self.assertNotIn(password[i : i + 4], out)
+
+    def test_comma_joined_dsn_list_masks_each_uri_separately(self):
+        """Adversarial case for the MAJOR-3 fix.
+
+        The password class now INCLUDES ``@`` so greedy matching backs off
+        to the LAST ``@``. The hazard that introduces is one match
+        swallowing two DSNs and hiding the first host; it does not,
+        because ``/`` terminates the authority.
+        """
+        a = "Ab" + "3xQ" + "9zK"
+        b = "Zt" + "7wM" + "2vR"
+        out = redact(
+            "postgres://u1:" + a + "@h1.internal:5432/a,"
+            "postgres://u2:" + b + "@h2.internal:5432/b"
+        )
+        self.assertEqual(
+            out,
+            "postgres://u1:[REDACTED:db_uri_password]@h1.internal:5432/a,"
+            "postgres://u2:[REDACTED:db_uri_password]@h2.internal:5432/b",
+        )
+
+    def test_dsn_password_stops_at_query_and_fragment_delimiters(self):
+        pw = "Ab" + "3xQ" + "9zK"
+        self.assertEqual(
+            redact("mysql://u:" + pw + "@host/db?opt=x@y"),
+            "mysql://u:[REDACTED:db_uri_password]@host/db?opt=x@y",
+        )
+        self.assertEqual(
+            redact("redis://u:" + pw + "@host#frag@z"),
+            "redis://u:[REDACTED:db_uri_password]@host#frag@z",
+        )
+
+    def test_inert_values_survive_regardless_of_case(self):
+        """#3982 review, MAJOR 5.
+
+        The inert-value list applied ONLY to the new memorable_password
+        rule, so LETTER CASE decided whether a vault reference survived.
+        A vault key NAME is exactly what an agent is supposed to remember.
+        """
+        for line in (
+            "POSTGRES_PASSWORD: vault:pg/password",
+            "postgres_password: vault:pg/password",
+            "ANTHROPIC_API_KEY: vault:anthropic/api_key",
+            "PASSWORD: ${DB_PASSWORD}",
+            "password: ${DB_PASSWORD}",
+            "API_TOKEN=%API_TOKEN%",
+            "JWT_SECRET=<generate-with-openssl-rand>",
+            "DB_PASSWORD=changeme-in-production",
+            "const API_KEY = process.env.ANTHROPIC_API_KEY",
+            '{"token": "the bearer token to use"}',
+            "--token <value>   the API token",
+        ):
+            with self.subTest(line):
+                self.assertEqual(redact(line), line)
+
+    def test_inert_gate_does_not_smuggle_a_real_value_through(self):
+        token = "zQ7x" + "Vb2n" + "Kd9w" + "Rt4y"
+        for line in (
+            "POSTGRES_PASSWORD: " + token,
+            "ANTHROPIC_API_KEY=" + token,
+            '{"token": "' + token + '"}',
+            "--token " + token,
+        ):
+            with self.subTest(line):
+                self.assertNotIn(token, redact(line))
+
+    def test_authorization_headers_are_masked_case_insensitively(self):
+        """#3982 review, MAJOR 6 — HTTP/2 lowercases header names."""
+        token = "AAAABBBB" + "CCCCDDDD" + "EEEEFFFF"
+        for line in (
+            "Authorization: Bearer " + token,
+            "authorization: bearer " + token,
+            "AUTHORIZATION: BEARER " + token,
+        ):
+            with self.subTest(line):
+                out = redact(line)
+                self.assertNotIn(token, out)
+                self.assertIn("[REDACTED:bearer_auth_header]", out)
+        creds = "YWxpY2U6" + "c3VwZXJzZWNyZXQ="
+        for line in (
+            "Authorization: Basic " + creds,
+            "authorization: basic " + creds,
+        ):
+            with self.subTest(line):
+                out = redact(line)
+                self.assertNotIn(creds, out)
+                self.assertIn("[REDACTED:basic_auth_header]", out)
+
+    def test_token_adjacent_to_non_ascii_text_is_masked(self):
+        """#3982 review, BLOCKER 1 — the Unicode word-boundary fork.
+
+        Python ``re`` treats ``\\b`` as Unicode-aware for ``str``
+        patterns; JavaScript ``RegExp`` without ``/u`` treats it as
+        ASCII-only. Every generated rule is ``\\b``-anchored, so a token
+        abutting CJK / Cyrillic / accented-Latin text was masked by the
+        TypeScript engine and stored VERBATIM by this one. CJK has no
+        word spacing, so this is the ordinary case.
+        """
+        token = "sk-" + "ant-" + "api03-" + ("A" * 40)
+        for neighbour in ("К", "中", "é", "ก", "あ"):
+            with self.subTest(neighbour):
+                out = redact("note" + neighbour + token + neighbour + "end")
+                self.assertNotIn(token, out)
+                self.assertIn("[REDACTED", out)
+
+    def test_unicode_whitespace_separator_still_masks(self):
+        """The other half of the semantics bridge.
+
+        JS ``\\s`` is Unicode-aware even without ``/u``, so a bare
+        ``re.ASCII`` port would narrow Python's ``\\s`` BELOW the JS one
+        and re-open the fork on the separator instead of the boundary.
+        """
+        token = "zQ7x" + "Vb2n" + "Kd9w" + "Rt4y"
+        for space in (" ", "\u3000", "\u00a0", "\ufeff"):
+            with self.subTest(repr(space)):
+                out = redact("API_TOKEN:" + space + token)
+                self.assertNotIn(token, out)
+                self.assertIn("[REDACTED", out)
 
     def test_prefixed_provider_token_is_removed(self):
         token = "sk-" + "ant-" + "oat01-" + ("A" * 60)

@@ -94,19 +94,39 @@ export const STRUCTURED_PATTERNS: PatternDef[] = [
     captureIndex: 2,
     slugHint: 'cli_flag',
   },
-  // Authorization: Bearer token (form 1 — explicit Authorization header)
+  // Authorization: Bearer token (form 1 — explicit Authorization header).
+  //
+  // CASE-INSENSITIVE since #3982's review: HTTP/2 and HTTP/3 lowercase
+  // every header name on the wire, so `authorization: bearer <token>` is
+  // what an agent actually pastes out of a curl trace or a proxy log —
+  // and it sailed through both engines unmasked. RFC 9110 makes the
+  // header name case-insensitive and the auth SCHEME token
+  // case-insensitive too, so matching case-sensitively was simply wrong.
   {
     rule_id: 'bearer_auth_header',
-    regex: /Authorization\s*[:=]\s*Bearer\s+([A-Za-z0-9._\-+=]+)/g,
+    regex: /Authorization\s*[:=]\s*Bearer\s+([A-Za-z0-9._\-+=]+)/gi,
     captureIndex: 1,
     slugHint: 'bearer_token',
   },
-  // Bare "Bearer XYZ" (length-gated to cut false positives on the word "Bearer")
+  // Bare "Bearer XYZ" (length-gated to cut false positives on the word
+  // "Bearer"). The 18-char floor is what keeps the now case-insensitive
+  // match off prose like "the bearer token to use".
   {
     rule_id: 'bearer_loose',
-    regex: /\bBearer\s+([A-Za-z0-9._\-+=]{18,})\b/g,
+    regex: /\bBearer\s+([A-Za-z0-9._\-+=]{18,})\b/gi,
     captureIndex: 1,
     slugHint: 'bearer_token',
+  },
+  // Authorization: Basic <base64(user:password)>. Base64 is an encoding,
+  // not a cipher — a Basic header is a plaintext credential with extra
+  // steps, and it reached agent memory unmasked (#3982 review, MAJOR 6).
+  // Anchored on the header + scheme, so a bare base64 blob elsewhere in
+  // the text is untouched (that stays a documented gap).
+  {
+    rule_id: 'basic_auth_header',
+    regex: /Authorization\s*[:=]\s*Basic\s+([A-Za-z0-9+/=]{8,})/gi,
+    captureIndex: 1,
+    slugHint: 'basic_auth',
   },
   // PEM private key block — single greedy capture, non-overlapping.
   {

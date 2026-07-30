@@ -21,8 +21,16 @@ The regex table is NOT written here. It is loaded from
 ``telegram-plugin/secret-detect/patterns.ts`` by
 ``scripts/gen-secret-patterns.ts`` and pinned by the ``bun lint`` guard
 ``scripts/check-secret-pattern-parity.ts``. A pattern added once therefore
-covers the Telegram gate, the issues pipeline AND memory intake; the two
-engines cannot silently diverge.
+covers the Telegram gate, the issues pipeline AND memory intake.
+
+That byte-compare proves the SOURCES match. It does not prove the
+BEHAVIOUR matches — identical regex source means different things to
+``re`` and to ``RegExp`` (see the semantics bridge below), which is how
+the ``\b``-boundary fork shipped past a green CI in the first place.
+Behaviour parity is a separate, weaker guarantee, held up by the shared
+vectors in ``secret_redaction_vectors.json`` and by the differential test
+``telegram-plugin/tests/secret-detect-cross-engine.test.ts``, which runs
+BOTH engines over the same corpus and compares their output.
 
 The three rules that need imperative gates rather than a bare regex —
 the KEY=VALUE entropy heuristic, connection-URI credentials and
@@ -61,6 +69,85 @@ REDACTED_MARKER = "[REDACTED]"
 
 _PATTERNS_FILE = os.path.join(os.path.dirname(__file__), "secret_patterns.json")
 
+# ─── JS/Python regex semantics bridge ─────────────────────────────────
+#
+# The pattern SOURCES are byte-identical across the two engines (that is
+# what `check-secret-pattern-parity` proves), but identical source is not
+# identical behaviour: `re` and `RegExp` disagree on what the shorthand
+# classes MEAN.
+#
+#   `\b`, `\w`, `\d`, and case-folding under `re.I`
+#       Python `str` patterns are UNICODE-aware by default, JavaScript
+#       `RegExp` without the `u` flag is ASCII-only. Every anchored rule
+#       here is `\b`-delimited, so `sk-ant-...<CJK char>` was a word
+#       boundary in JS (masked) and NOT one in Python (stored verbatim).
+#       Fixed by compiling with `re.ASCII`.
+#
+#       Note the flag arithmetic below: `re.UNICODE` is implicit on `str`
+#       patterns and `flags | re.ASCII` alone raises
+#       `ValueError: ASCII and UNICODE flags are incompatible`.
+#
+#   `\s` / `\S`
+#       This one runs the OTHER way. JavaScript `\s` is Unicode-aware
+#       even without the `u` flag (NBSP, ideographic space, BOM all
+#       match), so plain `re.ASCII` would narrow Python's `\s` below
+#       JS's and re-open the fork on the separator instead of the
+#       boundary. `_js_compat_source` therefore rewrites `\s`/`\S` to an
+#       explicit class carrying exactly the ECMAScript WhiteSpace +
+#       LineTerminator set, so the two agree under `re.ASCII`.
+#
+# The rewrite happens HERE rather than in the codegen on purpose: keeping
+# `secret_patterns.json` a faithful mirror of `patterns.ts` is what makes
+# the byte-compare guard readable, and the semantics bridge is a property
+# of the Python engine, not of the shared table.
+
+# ECMAScript WhiteSpace + LineTerminator (what JS `\s` matches).
+_JS_WS = (
+    " \\t\\n\\x0b\\x0c\\r"
+    "\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff"
+)
+
+
+def _js_compat_source(src: str) -> str:
+    """Rewrite `\\s`/`\\S` so they mean under `re.ASCII` what they mean to
+    a JavaScript `RegExp` without the `u` flag.
+
+    `[\\s\\S]` (the "any character including newlines" idiom) is left
+    alone: `\\S` cannot be expressed inside a character class, and the
+    union is every character in either engine regardless of flags.
+    """
+    out: List[str] = []
+    i = 0
+    n = len(src)
+    in_class = False
+    while i < n:
+        ch = src[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = src[i + 1]
+            if nxt == "s":
+                out.append(_JS_WS if in_class else "[" + _JS_WS + "]")
+                i += 2
+                continue
+            if nxt == "S" and not in_class:
+                out.append("[^" + _JS_WS + "]")
+                i += 2
+                continue
+            out.append(src[i : i + 2])
+            i += 2
+            continue
+        if ch == "[" and not in_class:
+            in_class = True
+        elif ch == "]" and in_class:
+            in_class = False
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _compile(source: str, flags: int = 0) -> "re.Pattern[str]":
+    """Compile with JavaScript-compatible shorthand-class semantics."""
+    return re.compile(_js_compat_source(source), flags & ~re.UNICODE | re.ASCII)
+
 
 def _load_patterns() -> List[dict]:
     with open(_PATTERNS_FILE, "r", encoding="utf-8") as fh:
@@ -78,7 +165,7 @@ def _load_patterns() -> List[dict]:
         compiled.append(
             {
                 "rule_id": p["rule_id"],
-                "regex": re.compile(p["source"], flags),
+                "regex": _compile(p["source"], flags),
                 "capture_index": int(p.get("capture_index", 0)),
             }
         )
@@ -97,31 +184,70 @@ KV_ENTROPY_THRESHOLD = 4.0
 # kv-scanner.ts — MEMORABLE_PW_MIN_CLASSES.
 MEMORABLE_PW_MIN_CLASSES = 2
 
-_KV_RE = re.compile(
+_KV_RE = _compile(
     r"\b([A-Za-z_][A-Za-z0-9_-]*(?:password|passwd|token|secret|key|api[_-]?key))"
     r"\s*[:=]\s*[\"']?([^\s\"'\\]{8,})[\"']?",
     re.I,
 )
 
-_MEMORABLE_PW_RE = re.compile(
+_MEMORABLE_PW_RE = _compile(
     r"\b([A-Za-z0-9_-]*(?:password|passwd|passphrase|pwd))\b"
     r"\s*(?:[:=]\s*|\s+is\s+)([\"']?)([^\s\"']{8,64})\2",
     re.I,
 )
 
-_DB_URI_RE = re.compile(
-    r"\b([a-zA-Z][a-zA-Z0-9+.-]+)://([^\s:/@]+):([^\s/@]+)@([^\s/@]+)"
+# `<scheme>://<user>:<password>@<host>` — see db-uri.ts for the shape
+# rationale. The password class deliberately ADMITS `@` and stops only at
+# an authority terminator (`/`, `?`, `#`, whitespace); greedy matching
+# then backs off to the LAST `@`, so an unencoded `@` inside the password
+# cannot leave the tail of the password outside the masked span.
+_DB_URI_RE = _compile(
+    r"\b([a-zA-Z][a-zA-Z0-9+.-]+)://([^\s:/@]+):([^\s/?#]+)@([^\s/@?#]+)"
 )
 
-_INERT_PW_RES = [
-    re.compile(r"^\[REDACTED", re.I),
-    re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$"),
-    re.compile(r"^\{\{.*\}\}$"),
-    re.compile(r"^<[^>]*>$"),
-    re.compile(r"^%[A-Za-z_][A-Za-z0-9_]*%$"),
-    re.compile(r"^vault:", re.I),
-    re.compile(r"^[*x\u2022.]+$", re.I),
+# Placeholders, variable references and already-masked text. Redacting
+# these buys nothing and destroys the meaning of the surrounding line —
+# and for a `vault:` reference it deletes exactly the key NAME an agent
+# is supposed to remember. Mirrors INERT_VALUE_RE in
+# telegram-plugin/secret-detect/inert-values.ts.
+_INERT_VALUE_RES = [
+    _compile(r"^\[REDACTED", re.I),
+    _compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$"),
+    _compile(r"^\{\{[^\n\r\u2028\u2029]*\}\}$"),
+    _compile(r"^<[^>]*>$"),
+    _compile(r"^%[A-Za-z_][A-Za-z0-9_]*%$"),
+    _compile(r"^vault:", re.I),
+    _compile(r"^[*x\u2022.]+$", re.I),
+    _compile(r"^(?:process\.env|import\.meta\.env|os\.environ)\b"),
+    _compile(
+        r"^(?:changeme|change-me|replaceme|replace-me|placeholder|todo|tbd"
+        r"|yourkey|your-key|yourpassword|your-password|yoursecret|your-secret"
+        r"|yourtoken|your-token)(?:[-_][A-Za-z0-9-]+)?$",
+        re.I,
+    ),
+    _compile(r"^[a-z]+(?: [a-z]+){2,}$"),
 ]
+
+# Trailing punctuation an English sentence puts AFTER a value. The value
+# classes are `[^\s"']`-shaped, so a sentence-final `.` or a list comma
+# is captured as part of the value; stripping it before the shape gates
+# is what keeps "The password is required." out of the redactor.
+_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?)\]}]+$")
+
+
+def _strip_trailing_punctuation(value: str) -> str:
+    return _TRAILING_PUNCT_RE.sub("", value)
+
+
+def is_inert_value(value: str) -> bool:
+    return any(r.search(value) for r in _INERT_VALUE_RES)
+
+
+# Rules whose captured value is a LABELLED slot: an inert placeholder in
+# that slot is documentation, not a credential. See MAJOR 5 of the #3982
+# review — `POSTGRES_PASSWORD: vault:pg/password` was being destroyed
+# while the lowercase spelling of the same line was left alone.
+_INERT_GATED_RULES = frozenset({"env_key_value", "json_secret_field", "cli_flag"})
 
 # url-redact.ts — SENSITIVE_PARAMS.
 _SENSITIVE_PARAMS = {
@@ -139,7 +265,7 @@ _SENSITIVE_PARAMS = {
     "signature",
 }
 
-_URL_RE = re.compile(r"\b(?:https?|wss?|ftp)://[^\s<>\"']+", re.I)
+_URL_RE = _compile(r"\b(?:https?|wss?|ftp)://[^\s<>\"']+", re.I)
 
 
 def shannon_entropy(value: str) -> float:
@@ -171,13 +297,17 @@ def _char_class_count(value: str) -> int:
 
 
 def _looks_like_memorable_password(value: str) -> bool:
-    if len(value) < 8 or len(value) > 64:
+    """Port of looksLikeMemorablePassword() in kv-scanner.ts."""
+    if is_inert_value(value):
         return False
-    if any(r.search(value) for r in _INERT_PW_RES):
+    core = _strip_trailing_punctuation(value)
+    if len(core) < 8 or len(core) > 64:
         return False
-    if len(set(value)) < 4:
+    if is_inert_value(core):
         return False
-    return _char_class_count(value) >= MEMORABLE_PW_MIN_CLASSES
+    if len(set(core)) < 4:
+        return False
+    return _char_class_count(core) >= MEMORABLE_PW_MIN_CLASSES
 
 
 # ─── URL credential scrub (port of url-redact.ts) ─────────────────────
@@ -258,6 +388,8 @@ def _pattern_hits(text: str) -> List[_Hit]:
             start = m.start(0) if idx == 0 else m.start(idx)
             if start < 0:
                 continue
+            if p["rule_id"] in _INERT_GATED_RULES and is_inert_value(cap):
+                continue
             if p["rule_id"] == "env_key_value":
                 if len(cap) < ENV_KV_MIN_LEN:
                     continue
@@ -273,6 +405,10 @@ def _kv_hits(text: str) -> List[_Hit]:
         value = m.group(2)
         if not value:
             continue
+        # Mirrors scanKeyValue() in kv-scanner.ts — placeholders and code
+        # references are not credentials.
+        if is_inert_value(value):
+            continue
         if shannon_entropy(value) < KV_ENTROPY_THRESHOLD:
             continue
         hits.append(_Hit("kv_entropy", m.start(2), m.end(2)))
@@ -283,7 +419,9 @@ def _db_uri_hits(text: str) -> List[_Hit]:
     hits: List[_Hit] = []
     for m in _DB_URI_RE.finditer(text):
         password = m.group(3)
-        if password.startswith("[REDACTED") or re.fullmatch(r"[*x]+", password, re.I):
+        if password.startswith("[REDACTED") or re.fullmatch(
+            r"[*x]+", password, re.I | re.A
+        ):
             continue
         hits.append(_Hit("db_uri_password", m.start(3), m.end(3)))
     return hits
@@ -295,6 +433,11 @@ def _memorable_password_hits(text: str) -> List[_Hit]:
         value = m.group(3)
         if not value or not _looks_like_memorable_password(value):
             continue
+        # The WHOLE captured value is masked, trailing punctuation
+        # included: once the gates have decided this is a credential, a
+        # trailing `!` is far more likely to be the last byte of the
+        # password than the end of a sentence, and losing a period from
+        # inside an already-redacted span costs nothing.
         hits.append(_Hit("memorable_password", m.start(3), m.end(3)))
     return hits
 
