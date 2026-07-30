@@ -15,7 +15,9 @@
  * If $TELEGRAM_STATE_DIR is unset → silent skip (renderer just falls back
  * to its existing precedence ladder). If session_id or tool_use_id is
  * missing → skip (the row could never be joined anyway). If the rule
- * table doesn't produce a label for the tool → skip.
+ * table doesn't produce a label for the tool → skip. If the call is a
+ * SIDECHAIN (sub-agent) tool call → skip (see isSubagentToolCall / #cross-
+ * contamination below).
  *
  * Tools intentionally NOT labeled here (handled by existing description
  * / TodoWrite / sub-agent panels in the renderer):
@@ -364,6 +366,98 @@ export function computeLabel(toolName, input) {
   return 'Working…'
 }
 
+/**
+ * True IFF this PreToolUse payload is for a SIDECHAIN (sub-agent) tool call,
+ * i.e. one made inside a Task/worker/Explore/Plan sub-agent rather than the
+ * top-level thread.
+ *
+ * WHY THIS EXISTS — the cross-contamination bug. Claude Code fires PreToolUse
+ * hooks for sub-agent tool calls too, and (as of 2.1.x) passes the PARENT
+ * `session_id` in that payload. The sidecar JSONL is keyed by `session_id`
+ * (`tool-labels-<session_id>.jsonl`), so a still-running background worker's
+ * labels were being appended into the PARENT session's sidecar. The gateway's
+ * real-time draft-mirror tails that file and emits a main-tier `tool_label`
+ * event per line, which the renderer binds to whatever turn is live — so a
+ * worker dispatched by turn N streamed its Bash step labels into an unrelated
+ * turn N+1's progress card. The worker's OWN activity is already surfaced by
+ * the worker-feed (sub_agent_tool_use events tailed from the sub-agent's own
+ * transcript), so the correct fix is to never write sub-agent labels to the
+ * parent sidecar in the first place — the cheapest, at-source link.
+ *
+ * DISCRIMINATOR — the payload carries sidechain identity. The PreToolUse hook
+ * input is built by the CLI's base `Kf(...)` helper, whose real 2.1.219 field
+ * shape (verified against the installed binary — see
+ * tests/fixtures/pretool-*.json) is:
+ *   { session_id, transcript_path, cwd, prompt_id?, permission_mode,
+ *     agent_id, agent_type, effort?, hook_event_name, tool_name, tool_input,
+ *     tool_use_id }
+ * The CLI's own top-level predicate is `agentType === "main"` (its `hb()`
+ * seeds the main thread as `{ agentType: "main", agentId: <sessionId> }`),
+ * while every sub-agent carries a concrete non-"main" `agent_type` ("worker",
+ * "general-purpose", "Explore", "Plan", a custom agent name, …).
+ *
+ * AUTHORITY ORDER (this matters for correctness, not just style):
+ *   1. `agent_type` is AUTHORITATIVE whenever it is a non-empty string:
+ *        - "main"        ⇒ top-level thread (KEEP), full stop, and
+ *        - anything else ⇒ concrete sub-agent (DROP).
+ *      Making "main" short-circuit is what prevents the SYMMETRIC false
+ *      positive: a (hypothetical future) main-tier payload whose `agent_id`
+ *      no longer equals `session_id` must STILL be kept — the identity
+ *      corroboration below must never override an explicit "main".
+ *   2. Only when `agent_type` is ABSENT/empty (unknown / a legacy CLI) do we
+ *      fall back to identity corroboration: a sidechain carries the PARENT
+ *      `session_id` but its OWN `agent_id`, so `agent_id !== session_id`
+ *      ⇒ sub-agent (DROP). Equal (or either missing) ⇒ main-tier (KEEP).
+ *
+ * A genuine sub-agent always carries a concrete agent_type (the Task tool
+ * requires a subagent_type), so this never drops a real sub-agent while
+ * risking a main-tier drop. See `hasAttributionSignal` for the fail-loud
+ * guard that fires if a FUTURE CLI drops BOTH identity fields (which would
+ * silently revert this whole fix — the drift the canary + warning defend).
+ */
+export function isSubagentToolCall(event) {
+  if (!event || typeof event !== 'object') return false
+  const at = event.agent_type
+  // (1) agent_type is authoritative when present: "main" ⇒ keep, else ⇒ drop.
+  if (typeof at === 'string' && at.length > 0) return at !== 'main'
+  // (2) agent_type absent/empty — corroborate via identity. A sidechain carries
+  // the parent session_id but its own agent_id.
+  const aid = event.agent_id
+  const sid = event.session_id
+  return (
+    typeof aid === 'string' && aid.length > 0 &&
+    typeof sid === 'string' && sid.length > 0 &&
+    aid !== sid
+  )
+}
+
+/**
+ * True IFF the payload carries AT LEAST ONE sidechain-attribution field
+ * (`agent_type` or `agent_id`) that `isSubagentToolCall` can key on.
+ *
+ * DRIFT CANARY (runtime half). On CC 2.1.219 EVERY PreToolUse payload carries
+ * both `agent_id` and `agent_type` (the base `Kf` builder). If a future CLI
+ * renamed/dropped BOTH (e.g. `agent_type`→`agentType`), `isSubagentToolCall`
+ * would silently return false for real sub-agents and the cross-turn
+ * contamination bug would return with NO test catching it (a frozen fixture
+ * can't see the live CLI change). So `main()` emits a one-line stderr WARNING
+ * — captured by plugin-logger — when a real tool call arrives with neither
+ * field, making the drift LOUD instead of silent. We warn rather than drop:
+ * dropping every label on drift would dark-out the whole live feed (a worse,
+ * feed-wide regression), whereas a warning lets an operator re-point the
+ * predicate at the renamed field. The committed fixtures
+ * (tests/fixtures/pretool-*.json) are the compile-time half of the canary.
+ */
+export function hasAttributionSignal(event) {
+  if (!event || typeof event !== 'object') return false
+  const at = event.agent_type
+  const aid = event.agent_id
+  return (
+    (typeof at === 'string' && at.length > 0) ||
+    (typeof aid === 'string' && aid.length > 0)
+  )
+}
+
 function main() {
   const raw = readStdin().trim()
   if (!raw) process.exit(0)
@@ -382,6 +476,30 @@ function main() {
   const toolUseId = event.tool_use_id
   const toolName = event.tool_name
   if (!sessionId || !toolUseId || !toolName) process.exit(0)
+
+  // DRIFT CANARY (runtime half). On 2.1.219 a real PreToolUse payload ALWAYS
+  // carries agent_type + agent_id. If a future CLI dropped/renamed BOTH, the
+  // sidechain discriminator below would silently fail open and the cross-turn
+  // contamination bug would return unnoticed. Warn LOUDLY (plugin-logger tails
+  // stderr) so the drift is visible; we do NOT drop here — dropping every label
+  // on drift would dark-out the whole live feed. See hasAttributionSignal.
+  if (!hasAttributionSignal(event)) {
+    try {
+      process.stderr.write(
+        `[tool-label-pretool] WARNING: PreToolUse payload carries neither ` +
+          `agent_type nor agent_id — the sidechain-attribution invariant may be ` +
+          `broken by a Claude Code schema change; sub-agent labels may be ` +
+          `mis-attributed to the parent session (tool_use_id=${toolUseId}).\n`,
+      )
+    } catch { /* never block */ }
+  }
+
+  // Sidechain (sub-agent) tool calls arrive here with the PARENT session_id,
+  // so writing their label to `tool-labels-<sessionId>.jsonl` pollutes the
+  // parent session's sidecar and cross-contaminates an unrelated turn's card.
+  // Drop them: the worker-feed already surfaces sub-agent activity. See
+  // isSubagentToolCall for the full rationale + discriminator.
+  if (isSubagentToolCall(event)) process.exit(0)
 
   let label
   try {
