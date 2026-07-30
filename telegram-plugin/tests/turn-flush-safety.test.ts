@@ -294,7 +294,7 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
 
     const start = moduleSrc.indexOf('export function normalizeOutboundBody(')
     const redactIdx = moduleSrc.indexOf('redact(text, site)', start)
-    const normIdx = moduleSrc.indexOf('stripExcessBold(normalizePunctuation(text))', start)
+    const normIdx = moduleSrc.indexOf('stripExcessBold(normalizePunctuation(text),', start)
     const scrubIdx = moduleSrc.indexOf('scrubVoice(text)', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
@@ -322,7 +322,7 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
     // Parity, structurally: after consolidation the reply and turn_flush sites
     // share ONE normalization implementation — the punctuation/bold wrapper
     // lives only inside normalizeOutboundBody, and both sites invoke it.
-    expect(replyModuleSrc).toContain('stripExcessBold(normalizePunctuation(text))')
+    expect(replyModuleSrc).toContain('stripExcessBold(normalizePunctuation(text),')
     expect(streamSrc).toContain('normalizeOutboundBody(')
     expect(streamSrc).toContain(`'turn_flush',`)
   })

@@ -761,6 +761,35 @@ function isFullyBolded(fragment: string): boolean {
   return /^\*\*[^*]+\*\*[.,:;!?]?$/.test(fragment.trim())
 }
 
+/**
+ * Max length (markers included) of a standalone fully-bolded line that is
+ * treated as a legitimate pseudo-heading (`**Section**`) rather than an
+ * over-bolded paragraph. Single source of truth for BOTH the per-block rule
+ * and the global-ratio heading exemption.
+ */
+const PSEUDO_HEADING_MAX_CHARS = 48
+
+/**
+ * True when a blank-line-delimited block is a single-line pseudo-heading: one
+ * non-empty line that is a single fully-bolded span of ≤PSEUDO_HEADING_MAX_CHARS
+ * characters (`**Summary**`, `**Next steps:**`). Multi-line blocks are never
+ * headings, so this can never mislabel a bolded paragraph as exempt.
+ */
+function isPseudoHeadingBlock(block: string): boolean {
+  const lines = block.split('\n').filter((l) => l.trim() !== '')
+  if (lines.length !== 1) return false
+  const t = lines[0].trim()
+  return t.length <= PSEUDO_HEADING_MAX_CHARS && isFullyBolded(t)
+}
+
+/** Diagnostic emitted when the over-bold tripwire actually removes bold. */
+export interface ExcessBoldStripDiagnostic {
+  /** Which rule fired: the whole-message ratio, or per-block flattening. */
+  rule: 'global' | 'per-block'
+  /** Measured bold ratio: bold chars / visible (non-code) chars. */
+  ratio: number
+}
+
 /** Strip `**bold**` markers from a fragment, keeping the text. */
 function unbold(fragment: string): string {
   return fragment.replace(/\*\*([^*]+)\*\*/g, '$1')
@@ -778,16 +807,24 @@ function unbold(fragment: string): string {
  * Deliberately conservative:
  *   - Messages under 100 non-code characters are exempt (a short reply whose
  *     one key fact is bolded is exactly the house style).
- *   - A single-line fully-bolded paragraph of ≤48 chars is treated as a
- *     pseudo-heading (the "**Section**" label the fleet style encourages) and
- *     is NOT stripped by the per-block rule (it still counts toward the
- *     global ratio).
+ *   - A single-line fully-bolded paragraph of ≤PSEUDO_HEADING_MAX_CHARS chars
+ *     is treated as a pseudo-heading (the "**Section**" label the fleet style
+ *     encourages) and is NOT stripped — neither by the per-block rule NOR by
+ *     the global-ratio rule (it still counts toward the global ratio, so a
+ *     genuinely over-bolded message still trips, but its section headings
+ *     survive instead of the whole reply going plain).
  *   - A list with any non-fully-bolded item is left alone.
  *
  * Code spans/fences are masked (maskCodeRegions) and never counted or
  * modified. Idempotent: stripped output has no `**` spans left to trip on.
+ *
+ * `onStrip` is an optional diagnostic sink invoked exactly once, only when
+ * bold is actually removed, carrying which rule fired and the measured ratio.
  */
-export function stripExcessBold(text: string): string {
+export function stripExcessBold(
+  text: string,
+  onStrip?: (d: ExcessBoldStripDiagnostic) => void,
+): string {
   if (!text.includes('**')) return text
 
   const nonce = Math.random().toString(36).slice(2)
@@ -800,14 +837,24 @@ export function stripExcessBold(text: string): string {
 
   let boldChars = 0
   for (const m of visible.matchAll(/\*\*([^*]+)\*\*/g)) boldChars += m[1].length
+  const ratio = boldChars / visible.length
 
-  if (boldChars / visible.length > 0.3) {
-    // Clearly over-bolded — strip every bold span, keep the text.
-    return restore(unbold(masked))
+  // Blank-line-delimited blocks of the masked text (shared by both rules).
+  const blocks = masked.split(/\n{2,}/)
+
+  if (ratio > 0.3) {
+    // Clearly over-bolded — strip every bold span, keeping the text, EXCEPT
+    // standalone short pseudo-heading blocks (`**Section**`), which stay bold
+    // so a bold-dense digest keeps its section headings.
+    const rebuilt = blocks.map((block) =>
+      isPseudoHeadingBlock(block) ? block : unbold(block),
+    )
+    const out = rejoinBlocks(masked, rebuilt)
+    if (out !== masked) onStrip?.({ rule: 'global', ratio })
+    return restore(out)
   }
 
-  // Per-block check on blank-line-delimited blocks of the masked text.
-  const blocks = masked.split(/\n{2,}/)
+  // Per-block check on the same blocks.
   const rebuilt = blocks.map((block) => {
     const lines = block.split('\n').filter((l) => l.trim() !== '')
     if (lines.length === 0 || !block.includes('**')) return block
@@ -824,17 +871,25 @@ export function stripExcessBold(text: string): string {
     const isProseBlock = lines.every((l) => !isMarkerLine(l, placeholder))
     if (!isProseBlock) return block
     if (!lines.every((l) => isFullyBolded(l))) return block
-    if (lines.length === 1 && lines[0].trim().length <= 48) return block
+    if (isPseudoHeadingBlock(block)) return block
     return unbold(block)
   })
 
-  // Rejoin with the original gap shapes: split() lost them, so re-split the
-  // masked text capturing the separators and interleave.
+  const out = rejoinBlocks(masked, rebuilt)
+  if (out !== masked) onStrip?.({ rule: 'per-block', ratio })
+  return restore(out)
+}
+
+/**
+ * Rejoin blocks produced by `masked.split(/\n{2,}/)` after per-block mapping,
+ * restoring the ORIGINAL blank-gap shapes (split() drops the separators, so
+ * re-capture them from the masked source and interleave).
+ */
+function rejoinBlocks(masked: string, rebuilt: string[]): string {
   const seps = masked.match(/\n{2,}/g) ?? []
   let out = rebuilt[0] ?? ''
   for (let i = 1; i < rebuilt.length; i++) out += (seps[i - 1] ?? '\n\n') + rebuilt[i]
-
-  return restore(out)
+  return out
 }
 
 // ---------------------------------------------------------------------------

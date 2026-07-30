@@ -334,4 +334,97 @@ describe('stripExcessBold', () => {
     const once = stripExcessBold(input)
     expect(stripExcessBold(once)).toBe(once)
   })
+
+  // ── Heading exemption in the GLOBAL (>30%) rule ──────────────────────────
+  // A bold-dense digest tripped the global ratio and lost EVERY bold marker,
+  // including its section headings, with no signal. Short standalone
+  // pseudo-heading blocks must now survive the global strip.
+
+  const boldDenseBody =
+    '**alpha** **bravo** **charlie** **delta** **echo** **foxtrot** **golf** ' +
+    '**hotel** **india** **juliet** **kilo** **lima** plus a short plain tail here.'
+
+  test('global strip keeps a short standalone bold heading, strips the rest', () => {
+    const input = `**Section One**\n\n${boldDenseBody}`
+    const out = stripExcessBold(input)
+    // Heading survives.
+    expect(out).toContain('**Section One**')
+    // Non-heading inline bold is flattened.
+    expect(out).toContain('alpha')
+    expect(out).not.toContain('**alpha**')
+    expect(out).not.toContain('**golf**')
+  })
+
+  test('global strip preserves EVERY heading in a multi-section digest', () => {
+    const input =
+      `**Overview**\n\n${boldDenseBody}\n\n` +
+      `**Next steps:**\n\n**one** **two** **three** **four** **five** **six** ` +
+      'plus a plain closing clause long enough to matter here.'
+    const out = stripExcessBold(input)
+    expect(out).toContain('**Overview**')
+    expect(out).toContain('**Next steps:**')
+    expect(out).not.toContain('**one**')
+    expect(out).not.toContain('**six**')
+  })
+
+  test('regression: global strip with NO headings still fully strips', () => {
+    const input = `${boldDenseBody}`
+    const out = stripExcessBold(input)
+    expect(out).not.toContain('**')
+    expect(out).toContain('alpha')
+  })
+
+  test('regression: under-threshold message keeps all bold (incl. headings)', () => {
+    const input = `**Summary**\n\n${filler} The key fact is **42**.`
+    expect(stripExcessBold(input)).toBe(input)
+  })
+
+  test('48/49-char pseudo-heading boundary honoured under global strip', () => {
+    // Heading length is measured WITH the `**` markers. 44 inner chars → 48
+    // total (exempt); 45 inner chars → 49 total (stripped).
+    const heading48 = '**' + 'H'.repeat(44) + '**' // length 48
+    const heading49 = '**' + 'H'.repeat(45) + '**' // length 49
+    expect(heading48.length).toBe(48)
+    expect(heading49.length).toBe(49)
+
+    const out48 = stripExcessBold(`${heading48}\n\n${boldDenseBody}`)
+    expect(out48).toContain(heading48)
+
+    const out49 = stripExcessBold(`${heading49}\n\n${boldDenseBody}`)
+    expect(out49).not.toContain(heading49)
+    expect(out49).toContain('H'.repeat(45))
+  })
+
+  test('multi-line fully-bolded block is NOT mislabelled a heading (global)', () => {
+    // Two bolded lines in one block must be flattened, not exempted — the
+    // heading exemption is single-line only.
+    const input = `**First bold line here**\n**Second bold line here**\n\n${boldDenseBody}`
+    const out = stripExcessBold(input)
+    expect(out).not.toContain('**First bold line here**')
+    expect(out).toContain('First bold line here')
+  })
+
+  // ── Observability ────────────────────────────────────────────────────────
+  test('onStrip fires with rule=global + ratio when global rule strips', () => {
+    const calls: Array<{ rule: string; ratio: number }> = []
+    stripExcessBold(`**Section One**\n\n${boldDenseBody}`, (d) => calls.push(d))
+    expect(calls).toHaveLength(1)
+    expect(calls[0].rule).toBe('global')
+    expect(calls[0].ratio).toBeGreaterThan(0.3)
+  })
+
+  test('onStrip fires with rule=per-block when only a block is flattened', () => {
+    const calls: Array<{ rule: string; ratio: number }> = []
+    const input = `${filler}\n\n**This whole paragraph is bold.**\n**Every single line of it.**`
+    stripExcessBold(input, (d) => calls.push(d))
+    expect(calls).toHaveLength(1)
+    expect(calls[0].rule).toBe('per-block')
+    expect(calls[0].ratio).toBeLessThanOrEqual(0.3)
+  })
+
+  test('onStrip does NOT fire when nothing is stripped', () => {
+    const calls: Array<{ rule: string; ratio: number }> = []
+    stripExcessBold(`**Summary**\n\n${filler} The key fact is **42**.`, (d) => calls.push(d))
+    expect(calls).toHaveLength(0)
+  })
 })
