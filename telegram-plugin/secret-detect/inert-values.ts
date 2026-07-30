@@ -53,24 +53,38 @@ export const INERT_VALUE_RE = [
  *
  * Placeholder text is words joined by separators (`your-password-here`,
  * `generate-with-openssl-rand`, `pg/password`, `ANTHROPIC_API_KEY`) — the
- * longest alphanumeric run in every value this list is meant to protect
- * sits well under this floor (9 at the time of writing). A credential is
- * the opposite shape: one dense run.
- *
- * 12 is `ENV_KV_MIN_LEN` — the length below which the env scanner already
- * declines to call something a secret.
+ * longest alphanumeric run across every value this list protects is 10
+ * (`production`). A credential is the opposite shape: one dense run.
  */
 const CREDENTIAL_RUN_RE = /[A-Za-z0-9]{12,}/g
 
+/**
+ * Mixed-class floor — `ENV_KV_MIN_LEN`, the length below which the env
+ * scanner already declines to call something a secret. Must not exceed
+ * `CREDENTIAL_RUN_RE`'s own floor.
+ */
+const MIXED_CLASS_RUN_MIN = 12
+
+/**
+ * Single-class floor. A run of only letters or only digits is far more
+ * likely to be an English word than a credential (`authentication`,
+ * `configuration`), so it gets more rope — but not unlimited rope:
+ * `abcdefghijklmnop` and a 40-`x` filler are values `main` masked, and no
+ * word in the protected corpus reaches 16.
+ */
+const SINGLE_CLASS_RUN_MIN = 16
+
 function runIsCredentialShaped(run: string): boolean {
-  // Two of {lower, upper, digit} inside one 12+ run. `yourtokenhere` and
-  // the segments of `YOUR_TOKEN_HERE` are single-class; hex, base62 and
-  // CamelCase-with-digits tokens are two or three.
+  // Classes present among {lower, upper, digit}. Hex, base62 and
+  // CamelCase-with-digits tokens are two or three; `yourtokenhere` and
+  // the segments of `YOUR_TOKEN_HERE` are one.
   let classes = 0
   if (/[a-z]/.test(run)) classes++
   if (/[A-Z]/.test(run)) classes++
   if (/[0-9]/.test(run)) classes++
-  return classes >= 2
+  return (
+    run.length >= (classes >= 2 ? MIXED_CLASS_RUN_MIN : SINGLE_CLASS_RUN_MIN)
+  )
 }
 
 /**

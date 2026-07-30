@@ -321,7 +321,11 @@ describe("inert values are not credentials (MAJOR 5)", () => {
     const token = "zQ7x" + "Vb2n" + "Kd9w" + "Rt4y";
     const hexish =
       "a8f3c1d2" + "e4b50f6a" + "9c7d3e81" + "b2f45a6c" + "d90e17bb";
-    for (const secret of [token, hexish]) {
+    // A SINGLE-character-class run is the other half: it clears no
+    // entropy gate, but `main` masked it and a 16-letter passphrase is a
+    // real credential, so the run floor has to catch it too.
+    const flat = "abcdefgh" + "ijklmnop";
+    for (const secret of [token, hexish, flat]) {
       for (const wrap of WRAPPERS) {
         for (const slot of SLOTS) {
           const line = slot(wrap(secret));

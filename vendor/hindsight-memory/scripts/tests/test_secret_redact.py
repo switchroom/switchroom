@@ -225,6 +225,9 @@ class RedactorBehaviourTests(unittest.TestCase):
         """
         token = "zQ7x" + "Vb2n" + "Kd9w" + "Rt4y"
         hexish = "a8f3c1d2" + "e4b50f6a" + "9c7d3e81" + "b2f45a6c" + "d90e17bb"
+        # A SINGLE-character-class run clears no entropy gate, but ``main``
+        # masked it and a 16-letter passphrase is a real credential.
+        flat = "abcdefgh" + "ijklmnop"
         wrappers = (
             lambda v: v,  # bare
             lambda v: "<" + v + ">",
@@ -245,7 +248,7 @@ class RedactorBehaviourTests(unittest.TestCase):
             '{{"token": "{}"}}',
             "--token {}",
         )
-        for secret in (token, hexish):
+        for secret in (token, hexish, flat):
             for wrap in wrappers:
                 for slot in slots:
                     line = slot.format(wrap(secret))

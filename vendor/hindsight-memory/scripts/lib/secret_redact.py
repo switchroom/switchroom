@@ -238,6 +238,11 @@ _INERT_VALUE_RES = [
 # An unbroken run of ``[A-Za-z0-9]`` long enough to BE a credential.
 # Mirrors CREDENTIAL_RUN_RE / hasCredentialShapedRun in inert-values.ts.
 _CREDENTIAL_RUN_RE = _compile(r"[A-Za-z0-9]{12,}")
+# Mixed-class floor = ENV_KV_MIN_LEN. Single-class runs (only letters or
+# only digits) are far more likely to be English words, so they get more
+# rope -- but not unlimited: no word in the protected corpus reaches 16.
+_MIXED_CLASS_RUN_MIN = 12
+_SINGLE_CLASS_RUN_MIN = 16
 
 # Trailing punctuation an English sentence puts AFTER a value. The value
 # classes are `[^\s"']`-shaped, so a sentence-final `.` or a list comma
@@ -258,7 +263,8 @@ def _run_is_credential_shaped(run: str) -> bool:
         classes += 1
     if re.search(r"[0-9]", run):
         classes += 1
-    return classes >= 2
+    floor = _MIXED_CLASS_RUN_MIN if classes >= 2 else _SINGLE_CLASS_RUN_MIN
+    return len(run) >= floor
 
 
 def has_credential_shaped_run(value: str) -> bool:
