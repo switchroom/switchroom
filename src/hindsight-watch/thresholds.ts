@@ -116,6 +116,8 @@
  *      and the largest finite `le` is still 120.0 (B4 holds).
  */
 
+import { resolveHindsightRecallTunables } from "../setup/hindsight-recall-tunables.js";
+
 /** How many samples the rolling window keeps (8 × 15 min = 2 h). */
 export const RING_MAX = 8;
 
@@ -386,7 +388,8 @@ export const METRICS_TIMEOUT_MS = 10_000;
 //   zero-memory        46.6 %  (983/2109 rows carrying result_count)
 //   candidate pool     median 18   (per-agent: 0 for finn/klanker/overlord)
 //   injected score     p50 0.0011  (n=284; gymbro 0.22, reggie 0.61 healthy)
-//   recall p95         8053 ms     (p50 8023 ms — pinned at the 8 s budget)
+//   recall p95         8053 ms     (p50 8023 ms — pinned at the then-8 s wall,
+//                                    retired by #3759; see RECALL_WALL_MS)
 //   consolidation      77 pending, oldest 3.98 h
 //
 // Each constant records BOTH the sick reading and the healthy one, because a
@@ -539,46 +542,71 @@ export const RECALL_POOL_MEDIAN_PAGE = 3;
 export const RECALL_SCORE_P50_WARN = 0.02;
 export const RECALL_SCORE_P50_PAGE = 0.01;
 
+/**
+ * The recall wall-time wall the diagnostic p95 is read against, in ms.
+ *
+ * NOT a fresh literal. #3759 made the recall deadline a DECLARATIVE envelope
+ * (`src/setup/hindsight-recall-tunables.ts`), exported fleet-wide via
+ * `HINDSIGHT_RECALL_*` (`src/agents/scaffold.ts`) — the highest-precedence
+ * layer of hindsight's config load order. The shared parallel fan-out deadline
+ * that bounds `total_elapsed_ms` is resolved there; taking it from the resolver
+ * (no operator overrides = the stock envelope) means this number tracks the
+ * envelope automatically instead of going stale the way the retired hardcoded
+ * `8000` did. The stock resolution is 12 s hook ceiling − 2 s headroom = 10 s
+ * (10000 ms), and the per-bank request timeout derives to the same 10 s — so
+ * whichever way you read "the wall", it is this one number now, not 8 s.
+ */
+export const RECALL_WALL_MS =
+  resolveHindsightRecallTunables(undefined).parallelDeadlineSeconds * 1000;
+
 /*
  * THERE IS NO `RECALL_P95_WARN_MS` / `RECALL_P95_PAGE_MS`. A recall latency
- * SLI was drafted at 4 s / 6 s and deleted before it shipped. Recording why,
- * because the number looked reasonable and the reasoning is the point.
+ * SLI was drafted at 4 s / 6 s, deleted before it shipped, and is STILL not
+ * re-derivable after #3759 moved the wall — recording why against the CURRENT
+ * envelope, because the number looked reasonable and the reasoning is the point.
  *
- * The draft justified 4 s / 6 s as sitting "above the 0.6-4.3 s an unloaded
- * server answers in and below the 8 s wall". That band does not reproduce.
- * Measured over the healthy-conditioned population — rows where no bank timed
- * out, errored, or hit the shared deadline, n=183 across 9 agents:
+ * The wall is no longer 8 s. #3759 made the recall deadline the declarative
+ * envelope above ({@link RECALL_WALL_MS}, 10 s by default = 12 s hook ceiling
+ * − 2 s headroom), and the per-bank request timeout now derives to the same
+ * 10 s rather than the old hardcoded 8 s. The healthy readings below cannot set
+ * a line against that 10 s wall, for two reasons that COMPOUND:
  *
- *   FLEET      p50 6420 ms   p75 7566   p90 7935   p95 8037   p99 11426
- *   per-agent healthy p95: 7816 (ziggy) … 11859 (overlord), every one of the
- *   nine above 6000 ms; fastest healthy p50 is finn at 4321 ms, itself
- *   already past the drafted WARN.
+ *   1. They are CENSORED at the retired 8 s wall. Every p95 here was measured
+ *      while the per-bank timeout was 8 s, so the distribution is right-clipped
+ *      at ~8 s ("pinned at the 8 s budget", baseline block above). The true
+ *      healthy p95 under a 10 s wall is unknown and can only be HIGHER, because
+ *      recalls that were cut off at 8 s now run on — so 8037 ms is a FLOOR on
+ *      healthy p95, not an estimate of it. Measured over the healthy-conditioned
+ *      population (rows where no bank timed out, errored, or hit the shared
+ *      deadline), n=183 across 9 agents, all under the 8 s wall:
  *
- * So the PAGE line sat BELOW the healthy median. A 2000-draw bootstrap over
- * healthy rows breaches 6000 ms in 100.0 % of draws. The failure mode is the
- * one that matters most for a watchdog: the recall fixes land, timeouts go to
- * 0 %, pool and scores recover — and this signal pages every 15 minutes
- * forever on a fleet that is working, training the operator to ignore it.
+ *        FLEET  p50 6420 ms  p75 7566  p90 7935  p95 8037  p99 11426
  *
- * Raising it does not save it either. The per-bank budget is 8 s, so healthy
- * traffic already reaches 8037 ms at p95; any line clear of that noise
- * (≥12 s bootstraps to 0.0 %) can only ever mean "pinned at the deadline",
- * which is exactly what `RECALL_OWN_BANK_TIMEOUT` already reports, from a
- * cleaner instrument. The usable band between the healthy median and the
- * budget wall is 6420-8000 ms — 1.25× — and no threshold separates healthy
- * from degraded inside it before the timeout rate does.
+ *      The p99 already sat at 11426 ms — PAST the new 10 s wall — so the healthy
+ *      tail extends beyond the wall and any warn line below it fires on healthy
+ *      traffic. Per-agent healthy p95 ran 7816 (ziggy) … 11859 (overlord).
+ *   2. Even taking 8037 ms at face value, the band between it and the 10 s wall
+ *      is 8037-10000 ms ≈ 1.24× — indistinguishable in width from the
+ *      6420-8000 ms (1.25×) band this signal was already rejected over — and
+ *      the degraded case inside it is already reported by `RECALL_OWN_BANK_
+ *      TIMEOUT` from a cleaner instrument (a bank that misses its deadline),
+ *      not from a percentile of a censored wall-time. A 2000-draw bootstrap
+ *      over healthy rows still breaches the drafted 6000 ms line in 100.0 % of
+ *      draws; the PAGE sat below the healthy median then and does now.
  *
- * This is the same defect this file already articulates when deleting
- * `RETAIN_P95_SECONDS` above: the healthy population sits past the threshold
- * and the instrument saturates at a budget just beyond it. It was caught in
- * review here rather than after six weeks of alert fatigue, which is the
- * system working.
+ * So moving the wall 8 s → 10 s did not open a thresholdable band; it widened
+ * the region of IGNORANCE (8-10 s) that the old, censored measurement cannot
+ * describe. This is the same defect this file articulates when deleting
+ * `RETAIN_P95_SECONDS` above: the healthy population sits at/past the threshold
+ * and the instrument saturates at a deadline just beyond it.
  *
  * `total_elapsed_ms` is still summarised into `RecallSample.elapsedP95Ms` and
- * rendered as DIAGNOSTIC context on the own-bank-timeout DM — the datum is
- * useful, it just cannot carry a threshold today. Restoring the signal needs
- * a re-baseline against a fleet whose recall is actually fixed, gated on that
- * measurement rather than on this one; filed as follow-up #3792.
+ * rendered as DIAGNOSTIC context on the own-bank-timeout DM (against
+ * {@link RECALL_WALL_MS}) — the datum is useful, it just cannot carry a
+ * threshold today. Restoring the signal needs a re-baseline against a fleet
+ * whose recall is BOTH fixed AND running the 10 s envelope, gated on that
+ * measurement rather than on this one; filed as follow-up #3792. Until then a
+ * latency line here would be calibrated against a wall that no longer exists.
  */
 
 /**

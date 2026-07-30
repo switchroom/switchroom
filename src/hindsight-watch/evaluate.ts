@@ -31,6 +31,7 @@ import {
   RECALL_POOL_MEDIAN_WARN,
   RECALL_SCORE_P50_PAGE,
   RECALL_SCORE_P50_WARN,
+  RECALL_WALL_MS,
   RECALL_ZERO_MEMORY_PAGE,
   RECALL_ZERO_MEMORY_WARN,
   RETAIN_FAILURE_RATE,
@@ -354,9 +355,11 @@ function errorSuffix(r: { topError?: string | null }): string {
  * Render recall wall time as DM context, or "" when unavailable.
  *
  * There is deliberately no `recall-latency` SIGNAL — see the deletion note in
- * `thresholds.ts`, where the healthy fleet's own p95 of 8037 ms is shown to
- * leave no thresholdable band below the 8 s per-bank budget. The measurement
- * is still worth SHOWING: it is what distinguishes "own-bank recall failed"
+ * `thresholds.ts`, where the 8037 ms healthy p95 (right-censored at the retired
+ * 8 s wall) is shown to leave no thresholdable band below the 10 s recall
+ * deadline the #3759 declarative envelope resolves to ({@link RECALL_WALL_MS}).
+ * The measurement is still worth SHOWING: it is what distinguishes "own-bank
+ * recall failed"
  * meaning *timed out at the wall* from meaning *errored immediately*, which
  * is the first question the operator asks and the cheapest one to pre-answer.
  *
@@ -367,7 +370,7 @@ function latencySuffix(r: { elapsedP95Ms?: number | null; elapsedConsidered?: nu
   const p95 = r.elapsedP95Ms;
   if (typeof p95 !== "number" || !Number.isFinite(p95)) return "";
   const n = typeof r.elapsedConsidered === "number" ? r.elapsedConsidered : 0;
-  return `\n  recall wall time p95 ${Math.round(p95)}ms over ${n} fire(s) (not thresholded — the 8000ms per-bank budget leaves no healthy band below it)`;
+  return `\n  recall wall time p95 ${Math.round(p95)}ms over ${n} fire(s) (not thresholded — the ${RECALL_WALL_MS}ms recall deadline leaves no healthy band below it)`;
 }
 
 /**
@@ -531,11 +534,13 @@ export function evaluateRecallInjectedScore(ring: Sample[]): Verdict {
 /*
  * There is no `evaluateRecallLatency`. `total_elapsed_ms` IS summarised (into
  * `RecallSample.elapsedP95Ms`) and IS shown, via `latencySuffix` on R1 — it
- * just carries no threshold, because the healthy fleet's own p95 is 8037 ms
- * against an 8000 ms per-bank budget and there is no band left underneath it.
- * The full derivation, including the bootstrap that breaches a 6000 ms line
- * in 100 % of healthy draws, is in `thresholds.ts` where the constants would
- * otherwise have lived.
+ * just carries no threshold, because the only healthy p95 ever measured
+ * (8037 ms) is right-censored at the retired 8 s wall, and against the 10 s
+ * recall deadline the #3759 declarative envelope resolves to ({@link
+ * RECALL_WALL_MS}) there is still no band left underneath it. The full
+ * derivation, including the bootstrap that breaches a 6000 ms line in 100 % of
+ * healthy draws, is in `thresholds.ts` where the constants would otherwise have
+ * lived.
  */
 
 /**
