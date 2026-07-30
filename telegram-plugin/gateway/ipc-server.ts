@@ -25,6 +25,7 @@ import type {
   ToolCallResult,
 } from "./ipc-protocol.js";
 import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
+import { OPERATOR_EVENT_KINDS } from "../operator-events.js";
 
 export interface IpcServerOptions {
   socketPath: string;
@@ -196,21 +197,23 @@ type SocketData = { clientId: string; buffer: string };
  *  data without newline delimiters, which would cause unbounded memory growth. */
 const MAX_BUFFER_SIZE = 1024 * 1024;
 
-/** Allowlist of OperatorEventKind values that can arrive over IPC. Mirrors
- *  the union in `telegram-plugin/operator-events.ts` — kept as a literal Set
- *  here so the validator has zero cross-package type dependencies. If the
- *  taxonomy grows, update both places. */
-const VALID_OPERATOR_KINDS = new Set([
-  "credentials-expired",
-  "credentials-invalid",
-  "credit-exhausted",
-  "quota-exhausted",
-  "rate-limited",
-  "agent-crashed",
-  "agent-restarted-unexpectedly",
-  "unknown-4xx",
-  "unknown-5xx",
-]);
+/** Allowlist of OperatorEventKind values that can arrive over IPC. DERIVED
+ *  from the canonical `OPERATOR_EVENT_KINDS` array in
+ *  `telegram-plugin/operator-events.ts` — the single source of truth for the
+ *  taxonomy — so the validator can NEVER drift out of sync with it again.
+ *
+ *  History: this used to be a hand-maintained literal Set that missed the
+ *  `provider-credit-exhausted` / `mcp-dependency-blocked` / `proxy-misconfig`
+ *  kinds after they were added to the union. The bridge forwarded a
+ *  `provider-credit-exhausted` operator_event; this validator rejected it as an
+ *  "invalid IPC message shape" and dropped it, so an OpenRouter/LiteLLM 402
+ *  credit wall produced NO loud Telegram card (the 2026-07-30 incident).
+ *  Deriving from the canonical array closes that drift class structurally.
+ *
+ *  `operator-events.ts` is a pure module (its only imports are the pure
+ *  `format` / `raw-error-scrub` / `model-unavailable` / `provider-credit`
+ *  leaves), so importing it here introduces no cycle back into the gateway. */
+const VALID_OPERATOR_KINDS = new Set<string>(OPERATOR_EVENT_KINDS);
 
 /** Same regex as `assertSafeAgentName` and the op:* callback handler in
  *  gateway.ts — keeps every entry-point that touches an agent name on the
