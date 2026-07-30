@@ -258,8 +258,8 @@ into your system prompt every session; this is the conversational summary.
   Kicking off a worker to crawl the changelog.
 
   **What it'll do**
-  • pull every entry since v0.14
-  • flag anything user-facing
+  - pull every entry since v0.14
+  - flag anything user-facing
 
   **Back in** ~2 min with a synthesized summary.
 - Use backtick-wrapped \`inline code\` for filenames, commands, and
@@ -534,7 +534,8 @@ You're writing for a phone screen in Telegram. Every reply renders as rich Markd
   fenced code blocks ALWAYS with a language
   hint (\`\`\`diff, \`\`\`json, \`\`\`bash — bare fence only for non-code fixed-width output);
   and the flagship — the **expandable blockquote** \`**> first line\` + \`> continuation\`
-  for a long quote, stack trace, or detailed aside the reader can collapse. Use it
+  for a long quote, stack trace, or detailed aside the reader can collapse. The \`**>\`
+  opener must be at the line start (column 0) — never indented — or it won't parse. Use it
   whenever a bulky supporting block would otherwise dominate the message.
 
 Renders wrong on this path — never emit: underline (\`__x__\` renders as bold),

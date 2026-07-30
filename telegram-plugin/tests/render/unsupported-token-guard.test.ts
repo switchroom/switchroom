@@ -71,15 +71,46 @@ describe("guardUnsupportedTokens — deterministic send-time repair", () => {
     expect(guardUnsupportedTokens("x^2^ metres")).toBe("x2 metres");
   });
 
-  it("leaves in-prose bracket literals intact, repairs real numeric footnotes", () => {
-    // `array[^index]` is a negated-char-class / index literal, not a footnote.
-    expect(guardUnsupportedTokens("array[^index] lookup")).toBe(
-      "array[^index] lookup",
+  it("repairs alphanumeric footnote markers, not just numeric", () => {
+    // POLISH-4: widened from digits-only so `[^note]`/`[^ref]` no longer ship
+    // as literal bracket noise. Each would survive UNTOUCHED on origin/main.
+    expect(guardUnsupportedTokens("see the note[^note] here")).toBe(
+      "see the note here",
     );
+    expect(guardUnsupportedTokens("as shown[^ref] above")).toBe(
+      "as shown above",
+    );
+    expect(guardUnsupportedTokens("point[^fn1] made")).toBe("point made");
+    // A single-letter id is a footnote too.
+    expect(guardUnsupportedTokens("claim[^a] holds")).toBe("claim holds");
+    // Definition lines with an alphanumeric id are still left intact (`(?!:)`).
+    expect(guardUnsupportedTokens("[^note]: the definition")).toBe(
+      "[^note]: the definition",
+    );
+  });
+
+  it("leaves regex-literal negated char classes intact", () => {
+    // Real negated char classes contain punctuation / ranges / escapes, so the
+    // alphanumeric-only id requirement excludes them — these stay verbatim.
     expect(guardUnsupportedTokens("use [^/] to match")).toBe(
       "use [^/] to match",
     );
-    // A real numeric footnote marker is still stripped.
+    expect(guardUnsupportedTokens("strip [^a-z] chars")).toBe(
+      "strip [^a-z] chars",
+    );
+    expect(guardUnsupportedTokens('match [^"] here')).toBe('match [^"] here');
+    // Accepted tradeoff (task POLISH-4): a PURE-alphanumeric negated class in
+    // BARE prose like `array[^index]` is now treated as a footnote and stripped.
+    // This is rare — regex/index literals in real prose live in code spans,
+    // which splitProtectedSegments masks (see code-span test below).
+    expect(guardUnsupportedTokens("array[^index] lookup")).toBe("array lookup");
+    // …but inside a code span the same literal is untouched.
+    expect(guardUnsupportedTokens("`array[^index]` lookup")).toBe(
+      "`array[^index]` lookup",
+    );
+  });
+
+  it("repairs a real numeric footnote marker", () => {
     expect(guardUnsupportedTokens("see the note[^1] here")).toBe(
       "see the note here",
     );

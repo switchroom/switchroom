@@ -162,8 +162,15 @@ describe("moved instruction content landed in tool descriptions", () => {
 
   it("format modes landed in the reply description", () => {
     expect(bridgeCode).toContain("FORMAT:");
-    expect(bridgeCode).toMatch(/default format is "html"/);
+    // The description must describe the ONE real render path (rich GFM), and
+    // still name the legacy aliases so the enum values stay documented. It must
+    // NOT resurrect the deleted-engine claims (html→HTML conversion, MarkdownV2
+    // auto-escaping) — those are false at HEAD (single GFM path, no escaping).
+    expect(bridgeCode).toMatch(/rich GFM markdown/);
     expect(bridgeCode).toContain("markdownv2");
+    expect(bridgeCode).not.toMatch(/default format is "html"/);
+    expect(bridgeCode).not.toMatch(/auto-converted to Telegram HTML/);
+    expect(bridgeCode).not.toMatch(/MarkdownV2 with auto-escaping/);
   });
 
   it("history-buffer rationale landed in get_recent_messages", () => {
