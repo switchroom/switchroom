@@ -1,0 +1,15 @@
+{
+  "session_id": "e2c9a4f0-1b3d-4c8a-9f21-parent000000",
+  "transcript_path": "/home/agent/.claude/projects/-home-agent-work/e2c9a4f0-1b3d-4c8a-9f21-parent000000.jsonl",
+  "cwd": "/home/agent/work",
+  "permission_mode": "default",
+  "agent_id": "e2c9a4f0-1b3d-4c8a-9f21-parent000000",
+  "agent_type": "main",
+  "effort": "medium",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/home/agent/work/src/index.ts"
+  },
+  "tool_use_id": "toolu_01MainReadCall4z"
+}

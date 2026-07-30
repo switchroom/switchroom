@@ -1,0 +1,16 @@
+{
+  "session_id": "e2c9a4f0-1b3d-4c8a-9f21-parent000000",
+  "transcript_path": "/home/agent/.claude/projects/-home-agent-work/e2c9a4f0-1b3d-4c8a-9f21-parent000000.jsonl",
+  "cwd": "/home/agent/work",
+  "permission_mode": "default",
+  "agent_id": "7a1b9c3d-4e5f-6071-8293-subagentownid0",
+  "agent_type": "general-purpose",
+  "effort": "medium",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "npm run build",
+    "description": "Build the worker output"
+  },
+  "tool_use_id": "toolu_01SubAgentBashCall9x"
+}
