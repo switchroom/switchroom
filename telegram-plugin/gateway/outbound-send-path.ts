@@ -191,7 +191,18 @@ export function normalizeOutboundBody(
   if (!literalText) text = normalizeParagraphBreaks(text)
   text = redact(text, site)
   if (!literalText) {
-    let formatted = stripExcessBold(normalizePunctuation(text))
+    let formatted = stripExcessBold(normalizePunctuation(text), (d) => {
+      // Observability: the over-bold tripwire silently flattened formatting.
+      // Emit one diagnostic line naming the rule + measured ratio so a lost
+      // reply is traceable (it previously vanished with no signal).
+      try {
+        process.stderr.write(
+          `telegram gateway: strip-excess-bold: fired site=${site} rule=${d.rule} ratio=${d.ratio.toFixed(3)}\n`,
+        )
+      } catch {
+        // stderr write must never break the send path. Swallow.
+      }
+    })
     if (addSpacers) formatted = addParagraphSpacers(formatted)
     text = formatted
     // Temporal normalization (#3501): UTC/Zulu → local wall clock, then

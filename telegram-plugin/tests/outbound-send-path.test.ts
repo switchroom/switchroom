@@ -379,7 +379,7 @@ describe('outbound-send-path — temporal pass wiring (#3501)', () => {
   it('temporal runs AFTER punctuation/bold and BEFORE scrubVoice (structural pin)', () => {
     const src = readFileSync(new URL('../gateway/outbound-send-path.ts', import.meta.url), 'utf8')
     const start = src.indexOf('export function normalizeOutboundBody(')
-    const boldIdx = src.indexOf('stripExcessBold(normalizePunctuation(text))', start)
+    const boldIdx = src.indexOf('stripExcessBold(normalizePunctuation(text),', start)
     const temporalIdx = src.indexOf('normalizeTemporal(text, tz, nowMs)', start)
     const scrubIdx = src.indexOf('scrubVoice(text)', start)
     expect(boldIdx).toBeGreaterThan(start)
