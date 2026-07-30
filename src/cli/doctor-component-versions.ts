@@ -12,10 +12,22 @@
  * `component-versions.ts` for the inventory + comparison rules; this
  * module is only the doctor row mapping.
  *
- * Status contract: `warn` for a behind component, `ok` when converged,
- * `skip` when nothing is comparable. Never `fail` — version skew is a
- * real finding but it is not a broken install, and this section must not
- * change doctor's exit code for an otherwise-healthy host.
+ * Status contract: `warn` for a behind CONTAINER, `ok` when converged,
+ * `skip` when nothing is comparable. Container skew is a real finding but
+ * not a broken install — and containers legitimately sit behind `target`
+ * transiently mid-roll (release.pin is bumped before every container has
+ * advanced), so failing on any container-behind would turn doctor RED for
+ * a healthy host during a normal roll. Those stay `warn`.
+ *
+ * The ONE exception is the host CLI binary itself (`cli (host)`): it is a
+ * single artifact that `switchroom update` converges in-band, so a
+ * *behind* host binary is never a transient mid-roll state — it is the
+ * exact silent-drift bug this module exists to catch (v0.19.38 rolled to
+ * every container while `/usr/local/bin/switchroom` stayed on v0.19.33 and
+ * the hindsight-watch cron ran retired code for 12 h). That single case
+ * is `fail`, so doctor goes RED and the drift can no longer hide behind a
+ * warning. A current or ahead host CLI stays green. See
+ * `hostCliBehindStatus()` for the scoped rule.
  */
 
 import { spawnSync } from "node:child_process";
@@ -56,6 +68,18 @@ function fixFor(c: ComponentVersion, target: string): string {
   return remediationFor(classifyComponent(c), target);
 }
 
+/**
+ * The status for a *behind* component. Scoped-fail rule (see the module
+ * header): only the host CLI binary drifting behind `target` is a `fail`;
+ * every containerised component stays `warn` because it can legitimately
+ * lag mid-roll. Keyed on `kind === "cli"`, the field `collectComponents`
+ * stamps on the host entry — never on a container — so a container can
+ * never trip the fail path even if its name were to change.
+ */
+export function hostCliBehindStatus(c: ComponentVersion): "fail" | "warn" {
+  return c.kind === "cli" ? "fail" : "warn";
+}
+
 export function runComponentVersionChecks(
   config: SwitchroomConfig,
   opts: ComponentVersionCheckOpts = {},
@@ -89,10 +113,14 @@ export function runComponentVersionChecks(
     });
   }
   for (const c of report.behind) {
+    const status = hostCliBehindStatus(c);
     results.push({
       name: `component behind: ${c.name}`,
-      status: "warn",
-      detail: `on ${c.version}, expected ${report.target} (${src})`,
+      status,
+      detail:
+        status === "fail"
+          ? `on ${c.version}, expected ${report.target} (${src}) — the host CLI must never trail the fleet; it self-heals in-band via \`switchroom update\``
+          : `on ${c.version}, expected ${report.target} (${src})`,
       fix: fixFor(c, report.target),
     });
   }

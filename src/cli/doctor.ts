@@ -4005,7 +4005,11 @@ export function registerDoctorCommand(program: Command): void {
             // #3919: is every switchroom component — the host CLI included —
             // on the same release? Three components drifted across three
             // releases on the reference host because nothing held a standing
-            // answer to that question. warn-only; never changes exit code.
+            // answer to that question. Container skew is warn-only (it lags
+            // legitimately mid-roll); a *behind* host CLI binary is FAIL —
+            // that is the silent-drift bug (v0.19.38 fleet vs v0.19.33 host
+            // CLI running a retired cron for 12h), and it self-heals in-band
+            // so it is never a transient state. See doctor-component-versions.
             title: "Component versions (#3919)",
             results: ((): CheckResult[] => {
               try {
