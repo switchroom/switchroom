@@ -6,7 +6,24 @@ variable overrides. Full config schema matching Openclaw's 30+ options.
 
 import json
 import os
+import re
 import sys
+
+#: Switchroom-local: strategies for the per-row curated observation scope.
+#: ``curated`` (default) strips volatile provenance tags from the consolidation
+#: scope, keeping stable semantic ones; ``shared`` pools every retain into one
+#: bank-wide untagged scope; ``combined`` / ``off`` emit no per-row scope (the
+#: pre-feature engine default). See ``compute_observation_scopes``.
+OBSERVATION_SCOPE_STRATEGIES = ("curated", "shared", "combined", "off")
+
+#: Tag patterns treated as VOLATILE per-session provenance by ``curated``:
+#: ``parent_session:<id>`` and a bare RFC-4122 UUID (what the ``{session_id}``
+#: retain tag resolves to). A tag matching ANY of these is dropped from the
+#: consolidation scope but LEFT on the source fact.
+DEFAULT_VOLATILE_SCOPE_PATTERNS = (
+    r"^parent_session:",
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+)
 
 DEFAULTS = {
     # Recall
@@ -181,6 +198,37 @@ DEFAULTS = {
     # through `defaults.memory.observation_scopes`) via
     # HINDSIGHT_OBSERVATION_SCOPES, exported ONLY when the operator opted in.
     "observationScopes": None,
+    # Switchroom hindsight-leverage — CURATED observation scopes (default ON).
+    # `combined` (the pre-feature engine default) makes consolidation dedup an
+    # observation only against others carrying the IDENTICAL tag set. Because
+    # switchroom stamps volatile per-session provenance on every retain
+    # (`{session_id}` → a bare UUID tag, and `parent_session:<uuid>` /
+    # `sidechain` / `agent_type:*` on sub-agent retains), that turns every
+    # session into its own dedup island — cross-session dedup never happens.
+    #
+    # `curated` (default) strips ONLY the volatile provenance tags
+    # (`observationScopeVolatilePatterns`) from the CONSOLIDATION scope, keeping
+    # the stable semantic ones (`lesson`, `anti-pattern`, `agent_type:*`,
+    # `sidechain`, entities). The stripped tags STAY on the source fact (still
+    # queryable / recall-filterable) — only the observation's dedup scope is
+    # narrowed. Non-empty stable set → the explicit scope `[[stable…]]`; empty
+    # stable set (e.g. a retain tagged only with a session id) → `"shared"`,
+    # one bank-wide untagged scope. This preserves recall tag-weighting on the
+    # observation layer (the kept tags still ride the observation) while giving
+    # cross-session dedup. Docs: https://hindsight.vectorize.io/developer/api/retain
+    # ("shared") and /developer/observations (scope isolation via all_strict).
+    #
+    # Opt-out: set `observationScopeStrategy` to `combined` (or `off`) — both
+    # emit no per-row scope, restoring the exact pre-feature engine default. A
+    # manually-pinned `observationScopes` (memory.observation_scopes) STILL wins
+    # over the strategy, so operators who set `per_tag` / `all_combinations` /
+    # `shared` keep that behaviour unchanged.
+    "observationScopeStrategy": "curated",
+    # Tag patterns treated as VOLATILE (stripped from the curated scope, kept on
+    # the source fact). Defaults: `parent_session:<id>` and a bare RFC-4122
+    # UUID (what `{session_id}` resolves to). Overridable via settings.json /
+    # ~/.hindsight/claude-code.json for a bank with an unusual provenance tag.
+    "observationScopeVolatilePatterns": list(DEFAULT_VOLATILE_SCOPE_PATTERNS),
     # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson & anti-pattern
     # tagging at retain time. When on (default), build_retain_payload scans the
     # formatted transcript slice for explicit lesson / anti-pattern markers and
@@ -333,6 +381,11 @@ ENV_OVERRIDES = {
     # defaults.memory.observation_scopes) ONLY when the operator set it; unset
     # leaves `observationScopes` None and the field off the wire entirely.
     "HINDSIGHT_OBSERVATION_SCOPES": ("observationScopes", str),
+    # Opt-out / override the curated default. `combined` or `off` restore the
+    # pre-feature engine default; `curated` (the shipped default) / `shared`
+    # select the computed strategies. Off-list values fall back to `curated`
+    # (shouted, never raised) — see compute_observation_scopes.
+    "HINDSIGHT_OBSERVATION_SCOPE_STRATEGY": ("observationScopeStrategy", str),
     # Switchroom hindsight-leverage E2 / PR9 (#398) — lesson/anti-pattern tagging
     # + recall demotion toggles and overrides.
     "HINDSIGHT_LESSON_TAGGING": ("lessonTagging", bool),
@@ -511,6 +564,99 @@ def resolve_observation_scopes(config: dict):
     if error:
         raise ValueError(error)
     return value
+
+
+def _volatile_scope_matchers(config: dict):
+    """Compile ``observationScopeVolatilePatterns`` to regexes, skipping bad ones.
+
+    NEVER raises: a malformed pattern is dropped (and shouted about) rather than
+    allowed to kill a retain. Falls back to the built-in defaults when the
+    config value is absent or not a list.
+    """
+    raw = config.get("observationScopeVolatilePatterns")
+    if not isinstance(raw, (list, tuple)):
+        raw = DEFAULT_VOLATILE_SCOPE_PATTERNS
+    matchers = []
+    for pat in raw:
+        if not isinstance(pat, str):
+            continue
+        try:
+            matchers.append(re.compile(pat))
+        except re.error as e:
+            print(
+                f"[Hindsight] observationScopeVolatilePatterns entry {pat!r} is not "
+                f"a valid regex ({e}); ignoring it for scope curation.",
+                file=sys.stderr,
+            )
+    return matchers
+
+
+def _is_volatile_scope_tag(tag: str, matchers) -> bool:
+    return any(m.search(tag) for m in matchers)
+
+
+def compute_observation_scopes(tags, config: dict):
+    """Resolve the per-row ``observation_scopes`` value for one retain.
+
+    Returns ``(value, error)`` — exactly like :func:`classify_observation_scopes`
+    — and MUST NEVER RAISE (a bad config must degrade the SCOPE, never lose the
+    turn; see ``retain.build_retain_payload``). ``value`` is what goes on the
+    wire: ``None`` (omit the field entirely → engine default), a bare string
+    (``"shared"`` / an operator-pinned Hindsight scope), or an explicit
+    ``list[list[str]]`` tag matrix. The wire body is byte-identical to the
+    pre-feature client whenever ``value`` is ``None``.
+
+    Precedence:
+
+    1. A manually-pinned ``observationScopes`` (``memory.observation_scopes``)
+       WINS — its classified value (or its degrade-to-None-with-error on a typo)
+       is returned unchanged, so existing operator overrides keep working.
+    2. Otherwise ``observationScopeStrategy`` decides:
+
+       * ``combined`` / ``off`` → ``None`` (pre-feature engine default; opt-out).
+       * ``shared``             → ``"shared"`` uniformly.
+       * ``curated`` (default)  → strip volatile provenance tags from the scope
+         (keeping them on the source fact); non-empty stable set → ``[[stable…]]``
+         (deterministically sorted), empty stable set → ``"shared"``.
+       * anything else          → treated as ``curated`` and shouted about.
+
+    Docs: https://hindsight.vectorize.io/developer/api/retain (``shared`` == the
+    explicit ``[[]]`` scope; a custom ``list[list[str]]`` is consolidated with
+    ``all_strict`` matching so scopes stay isolated) and /developer/observations.
+    """
+    # 1. Operator-pinned scope wins (back-compat). Only fall through to the
+    #    strategy when observationScopes is genuinely UNSET — a typo'd pin
+    #    degrades to the engine default WITH its error, never silently curated.
+    manual, manual_error = classify_observation_scopes(config)
+    if manual is not None or manual_error is not None:
+        return manual, manual_error
+
+    strategy_raw = config.get("observationScopeStrategy")
+    strategy = strategy_raw.strip().lower() if isinstance(strategy_raw, str) else ""
+    if not strategy:
+        strategy = "curated"
+
+    error = None
+    if strategy not in OBSERVATION_SCOPE_STRATEGIES:
+        error = (
+            f"observationScopeStrategy={strategy_raw!r} is not one of "
+            f"{', '.join(OBSERVATION_SCOPE_STRATEGIES)}; using 'curated'."
+        )
+        strategy = "curated"
+
+    if strategy in ("combined", "off"):
+        return None, error
+    if strategy == "shared":
+        return "shared", error
+
+    # curated
+    matchers = _volatile_scope_matchers(config)
+    stable = sorted(
+        {t for t in (tags or []) if isinstance(t, str) and t and not _is_volatile_scope_tag(t, matchers)}
+    )
+    if stable:
+        return [stable], error
+    return "shared", error
 
 
 def _cast_env(value: str, typ):

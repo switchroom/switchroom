@@ -339,9 +339,31 @@ class RunSubagentRetain(unittest.TestCase):
         self.assertEqual(captured["context"], "claude-code-sidechain")
         self.assertEqual(captured["metadata"]["parent_session_id"], "parentsess")
 
-    def test_sidechain_retain_omits_the_scope_when_unconfigured(self):
-        # switchroom — default behaviour must be byte-identical: the sidechain
-        # POST carries no scope, so the engine default stands.
+    def test_sidechain_retain_omits_the_scope_when_opted_out(self):
+        # switchroom — opt-out (observationScopeStrategy=combined) must be
+        # byte-identical to the pre-feature body: the sidechain POST carries no
+        # scope, so the engine default stands.
+        with tempfile.TemporaryDirectory() as d:
+            sc = os.path.join(d, "agent-af5.jsonl")
+            _write_sidechain(sc, 8, chars_per_msg=400)
+            hook_input = {
+                "session_id": "parentsess",
+                "agent_id": "af5",
+                "agent_transcript_path": sc,
+                "transcript_path": os.path.join(d, "parentsess.jsonl"),
+                "cwd": d,
+            }
+            result, captured = self._run(
+                hook_input, config_extra={"observationScopeStrategy": "combined"}
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(captured["observation_scopes"])
+
+    def test_sidechain_retain_curates_the_scope_by_default(self):
+        # switchroom default ON: the volatile `parent_session:*` tag is STRIPPED
+        # from the consolidation scope so sidechain observations dedup across
+        # parent sessions, while the stable `sidechain` tag is KEPT on the scope
+        # (so recall's sidechain:0.8 demotion still fires on the observation).
         with tempfile.TemporaryDirectory() as d:
             sc = os.path.join(d, "agent-af5.jsonl")
             _write_sidechain(sc, 8, chars_per_msg=400)
@@ -354,7 +376,13 @@ class RunSubagentRetain(unittest.TestCase):
             }
             result, captured = self._run(hook_input)
         self.assertEqual(result["status"], "ok")
-        self.assertIsNone(captured["observation_scopes"])
+        scope = captured["observation_scopes"]
+        self.assertIsInstance(scope, list)
+        scope_tags = {t for group in scope for t in group}
+        self.assertIn("sidechain", scope_tags)
+        self.assertNotIn("parent_session:parentsess", scope_tags)
+        # The source-fact tags are untouched — the stripped tag stays queryable.
+        self.assertIn("parent_session:parentsess", captured["tags"])
 
     def test_sidechain_retain_posts_the_configured_scope(self):
         # switchroom — sidechain retains are their own hand-enumerated kwarg
