@@ -72,6 +72,7 @@ import {
   DirectiveAdmin,
   DirectivePairInconsistentError,
 } from "../memory/hindsight-directive-admin.js";
+import { redact } from "../secret-detect/redact.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 
 // ─── Protocol constants ───────────────────────────────────────────────────
@@ -298,6 +299,69 @@ export function withSynthesizedTools(result: { tools: ToolDef[] }): {
       ...buildSynthesizedToolsList(),
     ],
   };
+}
+
+// ─── Write-path secret redaction ──────────────────────────────────────
+
+/**
+ * Tools whose arguments are a QUERY, not content to be persisted. Their
+ * arguments are forwarded verbatim: masking a search string would change
+ * which memories come back, for no security gain (nothing is stored).
+ *
+ * Everything NOT on this list is treated as a write and redacted. That
+ * default is the point — when hindsight registers a new tool that
+ * persists text, it is covered on the day it appears, with no change
+ * here. Adding a name to this list is the deliberate, reviewable act.
+ */
+export const READ_ONLY_TOOL_NAMES = new Set([
+  "recall",
+  "reflect",
+  "search",
+  "list_memories",
+  "list_directives",
+  "list_mental_models",
+  "get_mental_model",
+  "get_memory",
+  "get_bank",
+]);
+
+/**
+ * Mask secrets in the string leaves of a tool-call argument object.
+ *
+ * `mcp__hindsight__retain` is an agent-driven write into a memory bank
+ * that never passes through the Python plugin, so `lib/client.py`'s
+ * chokepoint cannot see it. This is the equivalent chokepoint for the MCP
+ * surface: every forwarded non-read tool call is rewritten here, before
+ * the upstream request is built.
+ *
+ * Keys are left alone (they are structural) and non-string leaves pass
+ * through unchanged.
+ */
+export function redactToolArguments(value: unknown): unknown {
+  if (typeof value === "string") return redact(value);
+  if (Array.isArray(value)) return value.map(redactToolArguments);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = redactToolArguments(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Apply {@link redactToolArguments} to a `tools/call` params object. */
+export function redactToolCallParams(params: unknown): unknown {
+  const called = params as
+    | { name?: string; arguments?: unknown }
+    | undefined
+    | null;
+  if (!called || typeof called !== "object") return params;
+  if (called.arguments === undefined || called.arguments === null) return params;
+  if (typeof called.name === "string" && READ_ONLY_TOOL_NAMES.has(called.name)) {
+    return params;
+  }
+  return { ...called, arguments: redactToolArguments(called.arguments) };
 }
 
 /** Materialize the static fallback manifest in MCP tools/list shape. */
@@ -858,10 +922,17 @@ export class HindsightShim {
     if (called?.name && SYNTHESIZED_TOOL_NAMES.includes(called.name)) {
       return this.synthesizedCall(called.name, called.arguments);
     }
+    // Secret redaction chokepoint for the MCP write path. Every
+    // `mcp__hindsight__*` call an agent makes is forwarded from HERE, so
+    // masking the arguments here covers retain / update_memory /
+    // create_directive / mental-model writes with one seam, and covers any
+    // tool the backend adds later without a code change (see
+    // READ_ONLY_TOOL_NAMES — the allowlist is the reads, not the writes).
+    const forwarded = redactToolCallParams(params);
     try {
       const res = await this.upstream.request(
         "tools/call",
-        params,
+        forwarded,
         this.opts.toolsCallTimeoutMs ?? TOOLS_CALL_TIMEOUT_MS,
       );
       // Any answer at all proves the backend is reachable again.

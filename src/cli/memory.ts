@@ -8,6 +8,7 @@ import {
   DEMOTE_FROM_RECALL_TAG,
 } from "../memory/hindsight.js";
 import { searchMemory, getMemoryStats, reflectAcrossAgents } from "../memory/search.js";
+import { redactMemoryWriteBody } from "../memory/hindsight-write-redaction.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import {
   isDockerAvailable,
@@ -1347,14 +1348,30 @@ export function registerMemoryCommand(program: Command): void {
           const timeoutMs = Math.max(1000, parseInt(opts.timeout, 10) || 60000);
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), timeoutMs);
+          // Operator-authored, but a profile bank is recalled into every
+          // agent that lists it — a credential pasted here spreads further
+          // than anywhere else. Mask it, and SAY SO rather than silently
+          // rewriting what the operator typed.
+          const payload = redactMemoryWriteBody({
+            items: [{ content, tags: ["operator-authored", "profile"] }],
+            async: false,
+          });
+          const stored = payload.items[0].content as string;
+          if (stored !== content) {
+            console.error(
+              chalk.yellow(
+                "⚠ Credential-shaped text in this fact was replaced with a\n" +
+                  "  [REDACTED] marker before it was stored. Put secrets in the\n" +
+                  "  vault (`switchroom vault set <key>`) and reference them as\n" +
+                  "  `vault:<key>` instead.",
+              ),
+            );
+          }
           try {
             const res = await fetch(url, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                items: [{ content, tags: ["operator-authored", "profile"] }],
-                async: false,
-              }),
+              body: JSON.stringify(payload),
               signal: ctrl.signal,
             });
             if (!res.ok) {
@@ -1365,7 +1382,10 @@ export function registerMemoryCommand(program: Command): void {
               process.exit(1);
             }
             console.log(chalk.green(`✓ Added to profile bank "${bank}"`));
-            console.log(chalk.gray(`  ${content}`));
+            // Echo what was STORED, not what was typed — the confirmation
+            // line would otherwise reprint the credential into the operator's
+            // scrollback and shell history.
+            console.log(chalk.gray(`  ${stored}`));
             console.log(
               chalk.gray(
                 "  (fact extraction runs in the background — `profile list` may lag a few seconds)",

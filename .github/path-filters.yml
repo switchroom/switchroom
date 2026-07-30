@@ -51,6 +51,15 @@ lint:
   - 'install.sh'
   - 'scripts/release-assets.mjs'
   - 'scripts/verify-release-bundle.mjs'
+  # The GENERATED secret-pattern table read by the Python write-path redactor.
+  # It is produced from telegram-plugin/secret-detect/patterns.ts and byte-
+  # compared by check-secret-pattern-parity. A hand-edit here is exactly the
+  # fork that guard exists to catch, and it matches no other lint path — so
+  # without this line the one PR shape that can silently desync the two
+  # redactors is the one that skips the check.
+  - 'vendor/hindsight-memory/scripts/lib/secret_patterns.json'
+  # Shared TS/Python behaviour vectors: both suites assert the same file.
+  - 'vendor/hindsight-memory/scripts/lib/secret_redaction_vectors.json'
   - '.github/actions/setup-switchroom/**'
   - '.github/workflows/ci-lint.yml'
   - *ws9f1-security
