@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.19.35 — sub-agent memory keeps the learnings and drops the exhaust
+
+Background work stops polluting the memory bank. Sub-agents now retain what they
+*learned* instead of dumping their raw transcript and every tool call, `/model`
+takes short spellings for the pinned Opus 4.8, agents pinned to `claude-opus-4-8`
+actually get that model, and the memory database stops losing writes on an
+unclean stop.
+
+### Sub-agent memory carries learnings, not raw transcripts and tool calls (#3993)
+
+When a sub-agent finished, its whole transcript — thinking blocks, every tool
+call, every tool result — went into the memory bank. That is exhaust, not
+knowledge: it buried the actual findings under noise, and the payloads were big
+enough that the write frequently could not finish inline and got deferred.
+
+Sidechain retains now go through the text path instead of the JSON one, which
+keeps the assistant's own words and channel messages and excludes thinking,
+operational `tool_use`, and `tool_result` entirely. Two practical wins: recall
+surfaces the conclusion rather than the plumbing that produced it, and the
+smaller payload means the write far more often completes inline instead of
+deferring.
+
+This is scoped to the sidechain. The flip is applied to the config *copy* the
+sidechain path already makes, so a parent session's own retain behaviour is
+untouched and whatever the operator configured there still holds.
+
+### `/model` takes short spellings for the pinned Opus 4.8 (#3997)
+
+`/model opus48` and `/model opus-4-8` both resolve to `claude-opus-4-8`, and the
+pinned id is now tappable in the model picker — both the live keyboard and the
+mid-turn quick list — instead of being reachable only as free text. Typing the
+full id on a phone was hostile; it worked, but nobody wanted to.
+
+The shortcuts live in their own Claude-model alias map rather than the
+external/OpenRouter one, so `claude-opus-4-8` keeps its OAuth-passthrough
+classification: the subscription header is still forwarded and it does not
+appear on the external-models page as if it were separately billed. Alias
+expansion now happens in one place, before any Claude-vs-external
+classification, so every `/model` argument takes the same path.
+
+### Agents pinned to `claude-opus-4-8` get Opus 4.8, not Opus 5 (#3996)
+
+The LiteLLM proxy config mapped both `claude-opus-4-8` and `claude-opus-4-7` to
+Opus 5, described in a comment as "version-drift aliases" for retired models.
+They are not retired. Anyone who deliberately pinned 4.8 or 4.7 was silently
+served a different model. Both now route to their real upstreams, and the stale
+comment that made the wrong claim is replaced in both the repo and live copies
+so they converge rather than drift further apart.
+
+### The memory database no longer loses writes on an unclean stop (#3990)
+
+The embedded PostgreSQL behind Hindsight was running with `fsync` **off** — an
+upstream default switchroom had never overridden. With fsync off, the database
+never forces writes to stable storage, so an unclean stop can leave a page that
+was never actually written while the write-ahead log believes it was. Page
+checksums cannot catch this: the stale page checksums correctly, recovery
+completes, and the server reports healthy while the data is gone.
+
+This was live, not theoretical — the container was logging 6–20 unclean
+shutdowns a day. `fsync` is now on, with a real-container guard so it cannot
+regress silently.
+
+### Internal hardening — consolidation failures are now visible to monitoring (#3987)
+
+Internal reliability work; no user-facing surface. The `hindsight-watch` queue
+signal was inverted: it measured only pending and processing operations, so a
+failed consolidation *left* the set being measured and a bank whose consolidator
+failed on every run read as perfectly healthy. Three model-free signals now
+cover that blind half — a consecutive-failure streak per bank, unconsolidated
+backlog depth with a growth requirement, and a nearest-neighbour probe that
+pages on vector-index corruption.
+
 ## v0.19.34 — the memory API and its dashboard stop answering unauthenticated on the LAN
 
 **Security release. This release closes an unauthenticated LAN/tailnet exposure
