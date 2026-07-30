@@ -13,18 +13,13 @@
 
 import { describe, it, expect } from 'vitest'
 import { validateClientMessage } from '../gateway/ipc-server.js'
+import { OPERATOR_EVENT_KINDS } from '../operator-events.js'
 
-const VALID_KINDS = [
-  'credentials-expired',
-  'credentials-invalid',
-  'credit-exhausted',
-  'quota-exhausted',
-  'rate-limited',
-  'agent-crashed',
-  'agent-restarted-unexpectedly',
-  'unknown-4xx',
-  'unknown-5xx',
-]
+// Drift-proof: iterate the CANONICAL taxonomy the validator now derives its
+// allowlist from, not a hand-copied literal. A kind added to
+// OPERATOR_EVENT_KINDS is automatically covered here; a validator that fails
+// to accept any canonical kind fails this test.
+const VALID_KINDS = OPERATOR_EVENT_KINDS
 
 function base() {
   return {
@@ -40,6 +35,20 @@ describe('validateClientMessage — operator_event', () => {
   it('accepts every taxonomy kind', () => {
     for (const kind of VALID_KINDS) {
       expect(validateClientMessage({ ...base(), kind })).toBe(true)
+    }
+  })
+
+  // Regression for the 2026-07-30 silent-out-of-credits incident: these three
+  // kinds were added to the OperatorEventKind union but NOT to the gateway IPC
+  // validator's hand-maintained allowlist. The bridge forwarded a
+  // `provider-credit-exhausted` operator_event; the validator rejected it as an
+  // "invalid IPC message shape" and dropped it, so an OpenRouter/LiteLLM 402
+  // credit wall produced NO loud Telegram card. Named explicitly (not just via
+  // the canonical-list loop above) so the failure message points straight at
+  // the incident if the allowlist ever regresses to a hand-maintained literal.
+  it('accepts the operator-actionable kinds forwarded by the bridge over IPC', () => {
+    for (const kind of ['provider-credit-exhausted', 'mcp-dependency-blocked', 'proxy-misconfig']) {
+      expect(validateClientMessage({ ...base(), kind }), kind).toBe(true)
     }
   })
 

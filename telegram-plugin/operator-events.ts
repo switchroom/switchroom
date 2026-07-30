@@ -23,11 +23,32 @@ import {
 
 // ─── Taxonomy ────────────────────────────────────────────────────────────────
 
-export type OperatorEventKind =
-  | 'credentials-expired'
-  | 'credentials-invalid'
-  | 'proxy-misconfig'
-  | 'credit-exhausted'
+/**
+ * The CANONICAL runtime list of every operator-event kind — the SINGLE source
+ * of truth for the taxonomy. The `OperatorEventKind` type is derived from it
+ * (below), and every other place that needs the set at RUNTIME (notably the
+ * gateway IPC validator's `VALID_OPERATOR_KINDS` in `gateway/ipc-server.ts`)
+ * imports THIS array rather than re-declaring a hand-maintained literal.
+ *
+ * WHY THIS IS AN ARRAY, NOT JUST A TYPE (the drift this closes)
+ * ------------------------------------------------------------
+ * A TypeScript union erases at compile time, so a runtime allowlist could only
+ * mirror it by hand — and it drifted: `ipc-server.ts` shipped a 9-entry Set
+ * that never gained `provider-credit-exhausted` / `mcp-dependency-blocked` /
+ * `proxy-misconfig` when those kinds were added here. The bridge forwarded a
+ * `provider-credit-exhausted` operator_event; the gateway validator rejected it
+ * as an "invalid IPC message shape" and DROPPED it — so a real OpenRouter/
+ * LiteLLM 402 credit wall produced NO loud Telegram card at all (the 2026-07-30
+ * incident). Deriving both the type and the runtime allowlist from this one
+ * array makes that class of silent drop structurally impossible.
+ *
+ * Order is not significant. Adding a kind is a one-line edit HERE.
+ */
+export const OPERATOR_EVENT_KINDS = [
+  'credentials-expired',
+  'credentials-invalid',
+  'proxy-misconfig',
+  'credit-exhausted',
   /**
    * A THIRD-PARTY model provider (OpenRouter / OpenAI / Perplexity) reports no
    * credit remaining — HTTP 402 `payment_required`, "insufficient credits",
@@ -37,7 +58,7 @@ export type OperatorEventKind =
    * must not share a card. Operator-actionable (top up in the vendor console),
    * never user-actionable — see {@link OPERATOR_ACTIONABLE_KINDS}.
    */
-  | 'provider-credit-exhausted'
+  'provider-credit-exhausted',
   /**
    * A paid MCP dependency (Perplexity, Eraser, Brevo, Postiz, Meta/Google Ads,
    * Cloudflare …) is refusing work because its KEY is the problem — out of
@@ -49,16 +70,19 @@ export type OperatorEventKind =
    * `mcp-credential-failure.ts`. Operator-actionable: only the operator can top
    * up or re-issue a key.
    */
-  | 'mcp-dependency-blocked'
-  | 'quota-exhausted'
-  | 'rate-limited'
-  | 'agent-crashed'
-  | 'agent-restarted-unexpectedly'
-  | 'unknown-4xx'
-  | 'unknown-5xx'
-  | 'config-warning'
-  | 'always-allow-persist-failed'
-  | 'mental-model-persist-failed'
+  'mcp-dependency-blocked',
+  'quota-exhausted',
+  'rate-limited',
+  'agent-crashed',
+  'agent-restarted-unexpectedly',
+  'unknown-4xx',
+  'unknown-5xx',
+  'config-warning',
+  'always-allow-persist-failed',
+  'mental-model-persist-failed',
+] as const
+
+export type OperatorEventKind = (typeof OPERATOR_EVENT_KINDS)[number]
 
 export interface OperatorEvent {
   kind: OperatorEventKind
