@@ -38,6 +38,8 @@ import retain  # noqa: E402
 from lib.client import HindsightClient  # noqa: E402
 from lib.config import (  # noqa: E402
     OBSERVATION_SCOPES_VALUES,
+    OBSERVATION_SCOPE_STRATEGIES,
+    compute_observation_scopes,
     load_config,
     resolve_observation_scopes,
 )
@@ -134,6 +136,18 @@ class ConfigResolution(unittest.TestCase):
                              clear=True):
             self.assertEqual(load_config().get("observationScopes"), "shared")
 
+    def test_strategy_default_is_curated(self):
+        # switchroom ships curated ON out of the box — a fresh install with no
+        # settings.json key and no env override still gets the curated scope.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(load_config().get("observationScopeStrategy"), "curated")
+
+    def test_strategy_env_override_opts_out(self):
+        with mock.patch.dict(
+            os.environ, {"HINDSIGHT_OBSERVATION_SCOPE_STRATEGY": "combined"}, clear=True
+        ):
+            self.assertEqual(load_config().get("observationScopeStrategy"), "combined")
+
 
 class PayloadBuild(unittest.TestCase):
     """``build_retain_payload`` is the single producer for every retain path."""
@@ -147,10 +161,33 @@ class PayloadBuild(unittest.TestCase):
             bank_id="bank", api_url="http://fake", api_token=None,
         )["payload"]
 
-    def test_payload_carries_none_when_unconfigured(self):
-        self.assertIsNone(self._build({})["observation_scopes"])
+    def test_payload_omits_scope_when_opted_out(self):
+        # Opt-out (strategy=combined) is byte-identical to the pre-feature body:
+        # no scope on the payload, so the engine default stands.
+        self.assertIsNone(
+            self._build({"observationScopeStrategy": "combined"})["observation_scopes"]
+        )
 
-    def test_payload_carries_the_configured_scope(self):
+    def test_payload_curates_the_scope_by_default(self):
+        # No strategy key at all → the shipped default (curated) fires, so a
+        # scope IS carried. A retain carrying only volatile/no stable tags
+        # curates down to the bank-wide "shared" scope.
+        self.assertEqual(self._build({})["observation_scopes"], "shared")
+
+    def test_payload_curates_stable_tags_into_an_explicit_scope(self):
+        # A stable semantic tag survives onto the consolidation scope as an
+        # explicit list-of-lists, while a volatile session-id tag is stripped.
+        payload = self._build(
+            {"retainTags": ["team:acme", "{session_id}"]}
+        )
+        # {session_id} → "sess" (not a UUID / parent_session:*), so it is NOT
+        # volatile here and rides the scope alongside the stable tag.
+        self.assertEqual(
+            sorted(payload["observation_scopes"][0]), ["sess", "team:acme"]
+        )
+
+    def test_payload_carries_the_manually_pinned_scope(self):
+        # A hand-pinned observationScopes still wins over the strategy.
         self.assertEqual(
             self._build({"observationScopes": "shared"})["observation_scopes"],
             "shared",
@@ -204,6 +241,16 @@ class DrainOfQueuedEntries(unittest.TestCase):
         entry = json.loads(json.dumps(dict(self._LEGACY, observation_scopes="shared")))
         drain_pending._retry_one(entry, timeout=15)
         self.assertEqual(self.calls[0]["observation_scopes"], "shared")
+
+    def test_curated_list_scope_survives_the_queue_round_trip(self):
+        # The curated default emits a list[list[str]] scope. A retain that fails
+        # inline and drains hours later must land in the SAME curated scope, so
+        # the list value has to survive JSON on disk and reach client.retain
+        # intact — otherwise a retried turn shards away from its inline siblings.
+        scope = [["agent_type:worker", "sidechain"]]
+        entry = json.loads(json.dumps(dict(self._LEGACY, observation_scopes=scope)))
+        drain_pending._retry_one(entry, timeout=15)
+        self.assertEqual(self.calls[0]["observation_scopes"], scope)
 
 
 class ValueValidation(unittest.TestCase):
@@ -319,6 +366,148 @@ class ValueValidation(unittest.TestCase):
                              clear=True):
             with self.assertRaises(ValueError):
                 resolve_observation_scopes(load_config())
+
+
+class ComputeCuratedScopes(unittest.TestCase):
+    """``compute_observation_scopes`` — the curated-default resolver, asserted as
+    exact (input tags, config) → emitted ``observation_scopes`` value mappings.
+
+    This is the load-bearing new behaviour: which tags survive onto the
+    consolidation scope and which are stripped as volatile provenance. The
+    function NEVER raises — a bad config degrades the scope, never the turn.
+    """
+
+    _UUID = "0291c461-864d-4284-b2b3-3fba9bf3142c"
+
+    def _compute(self, tags, **config):
+        return compute_observation_scopes(tags, config)
+
+    # --- default (curated) ------------------------------------------------
+    def test_curated_strips_parent_session_keeps_stable(self):
+        value, err = self._compute(["parent_session:abc", "sidechain", "agent_type:worker"])
+        self.assertIsNone(err)
+        self.assertEqual(value, [["agent_type:worker", "sidechain"]])  # sorted, stripped
+
+    def test_curated_strips_bare_uuid_session_tag(self):
+        value, err = self._compute([self._UUID, "lesson"])
+        self.assertIsNone(err)
+        self.assertEqual(value, [["lesson"]])
+
+    def test_curated_strips_sidechain_sub_session_tag(self):
+        # The dominant observation path: subagent_retain sets
+        # `sub_session_id = f"{session_id}-sub-{agent_id}"`, and `retainTags:
+        # ["{session_id}"]` resolves to `<parent-uuid>-sub-<agent_id>`. That is
+        # per-invocation-unique, so if it survives into the scope every sidechain
+        # retain gets its own island and never dedups. It must be treated as
+        # volatile (like the bare UUID it derives from) and stripped, while the
+        # stable semantic tags stay in scope.
+        sub_tag = f"{self._UUID}-sub-af5fba739c0ee6b38"
+        value, err = self._compute([sub_tag, "sidechain", "agent_type:worker"])
+        self.assertIsNone(err)
+        self.assertEqual(value, [["agent_type:worker", "sidechain"]])
+
+    def test_curated_all_volatile_falls_back_to_shared(self):
+        # A retain tagged ONLY with volatile provenance has no stable scope, so
+        # it pools into the one bank-wide untagged scope instead of an island.
+        value, err = self._compute([self._UUID, "parent_session:xyz"])
+        self.assertIsNone(err)
+        self.assertEqual(value, "shared")
+
+    def test_curated_no_tags_is_shared(self):
+        self.assertEqual(self._compute([])[0], "shared")
+        self.assertEqual(self._compute(None)[0], "shared")
+
+    def test_curated_scope_is_deterministically_sorted(self):
+        # Same tag set in any order → identical scope (so it dedups, not shards).
+        a, _ = self._compute(["z:1", "a:2", "m:3"])
+        b, _ = self._compute(["m:3", "z:1", "a:2"])
+        self.assertEqual(a, b)
+        self.assertEqual(a, [["a:2", "m:3", "z:1"]])
+
+    def test_curated_dedups_repeated_tags(self):
+        value, _ = self._compute(["lesson", "lesson", "sidechain"])
+        self.assertEqual(value, [["lesson", "sidechain"]])
+
+    # --- opt-out ----------------------------------------------------------
+    def test_combined_emits_no_scope(self):
+        self.assertEqual(
+            self._compute(["lesson"], observationScopeStrategy="combined"), (None, None)
+        )
+
+    def test_off_emits_no_scope(self):
+        self.assertEqual(
+            self._compute(["lesson"], observationScopeStrategy="off"), (None, None)
+        )
+
+    def test_shared_strategy_is_uniform(self):
+        value, err = self._compute(["lesson", "sidechain"], observationScopeStrategy="shared")
+        self.assertIsNone(err)
+        self.assertEqual(value, "shared")
+
+    # --- precedence / robustness -----------------------------------------
+    def test_manual_pin_wins_over_strategy(self):
+        # An operator who pinned per_tag keeps it even though curated is default.
+        value, err = self._compute(
+            ["lesson"], observationScopes="per_tag", observationScopeStrategy="curated"
+        )
+        self.assertIsNone(err)
+        self.assertEqual(value, "per_tag")
+
+    def test_manual_pin_typo_degrades_to_none_with_error_not_curated(self):
+        # A typo'd pin must NOT silently fall through to curated — it degrades to
+        # the engine default (None) and carries an error, exactly like the
+        # pre-strategy behaviour, so the misconfiguration stays visible.
+        value, err = self._compute(["lesson"], observationScopes="shred")
+        self.assertIsNone(value)
+        self.assertIsNotNone(err)
+        self.assertIn("shred", err)
+
+    def test_unknown_strategy_degrades_to_curated_with_error(self):
+        value, err = self._compute(["lesson"], observationScopeStrategy="curatd")
+        self.assertEqual(value, [["lesson"]])
+        self.assertIsNotNone(err)
+        self.assertIn("curatd", err)
+        for s in OBSERVATION_SCOPE_STRATEGIES:
+            self.assertIn(s, err)
+
+    def test_empty_strategy_string_is_curated(self):
+        # An empty export hands authority back to the default, same idiom as
+        # the bare-string scope path.
+        self.assertEqual(self._compute(["lesson"], observationScopeStrategy="")[0], [["lesson"]])
+        self.assertEqual(self._compute(["lesson"], observationScopeStrategy="   ")[0], [["lesson"]])
+
+    def test_strategy_is_case_insensitive(self):
+        self.assertEqual(
+            self._compute(["lesson"], observationScopeStrategy="COMBINED"), (None, None)
+        )
+
+    def test_custom_volatile_patterns_override_defaults(self):
+        # An operator can declare a bank-specific provenance tag volatile.
+        value, err = self._compute(
+            ["run:42", "lesson"],
+            observationScopeVolatilePatterns=[r"^run:"],
+        )
+        self.assertIsNone(err)
+        self.assertEqual(value, [["lesson"]])
+
+    def test_bad_volatile_pattern_is_skipped_not_fatal(self):
+        # A malformed regex must not kill the retain — it is dropped and the
+        # remaining (valid) matchers still curate.
+        err_out = io.StringIO()
+        with contextlib.redirect_stderr(err_out):
+            value, err = self._compute(
+                [self._UUID, "lesson"],
+                observationScopeVolatilePatterns=["(", r"^parent_session:",
+                                                   r"^[0-9a-fA-F-]{36}$"],
+            )
+        self.assertIsNone(err)
+        self.assertEqual(value, [["lesson"]])
+
+    def test_never_raises_on_junk_tags(self):
+        # Non-string tags in the list must be ignored, not explode.
+        value, err = self._compute(["lesson", None, 42, "", "sidechain"])
+        self.assertIsNone(err)
+        self.assertEqual(value, [["lesson", "sidechain"]])
 
 
 if __name__ == "__main__":  # pragma: no cover

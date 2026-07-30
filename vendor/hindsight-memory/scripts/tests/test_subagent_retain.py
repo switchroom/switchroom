@@ -339,9 +339,10 @@ class RunSubagentRetain(unittest.TestCase):
         self.assertEqual(captured["context"], "claude-code-sidechain")
         self.assertEqual(captured["metadata"]["parent_session_id"], "parentsess")
 
-    def test_sidechain_retain_omits_the_scope_when_unconfigured(self):
-        # switchroom — default behaviour must be byte-identical: the sidechain
-        # POST carries no scope, so the engine default stands.
+    def test_sidechain_retain_omits_the_scope_when_opted_out(self):
+        # switchroom — opt-out (observationScopeStrategy=combined) must be
+        # byte-identical to the pre-feature body: the sidechain POST carries no
+        # scope, so the engine default stands.
         with tempfile.TemporaryDirectory() as d:
             sc = os.path.join(d, "agent-af5.jsonl")
             _write_sidechain(sc, 8, chars_per_msg=400)
@@ -352,9 +353,61 @@ class RunSubagentRetain(unittest.TestCase):
                 "transcript_path": os.path.join(d, "parentsess.jsonl"),
                 "cwd": d,
             }
-            result, captured = self._run(hook_input)
+            result, captured = self._run(
+                hook_input, config_extra={"observationScopeStrategy": "combined"}
+            )
         self.assertEqual(result["status"], "ok")
         self.assertIsNone(captured["observation_scopes"])
+
+    def test_sidechain_retain_curates_the_scope_by_default(self):
+        # switchroom default ON: every VOLATILE per-session provenance tag is
+        # STRIPPED from the consolidation scope so sidechain observations dedup
+        # across parent sessions, while the stable semantic tags (`sidechain`,
+        # `agent_type:*`) are KEPT on the scope (so recall's sidechain:0.8
+        # demotion still fires on the observation).
+        #
+        # Two volatile tags must be stripped, and the second is the one the
+        # Fable review caught leaking:
+        #   1. `parent_session:<uuid>` — the explicit parent link.
+        #   2. `<uuid>-sub-<agent_id>` — what `retainTags: ["{session_id}"]`
+        #      resolves to on the sidechain path, since subagent_retain sets
+        #      `sub_session_id = f"{session_id}-sub-{agent_id}"`. This is
+        #      per-invocation-unique; if it survives into the scope, sidechain
+        #      retains (the dominant observation volume) never dedup and the
+        #      feature silently fails on its primary path.
+        #
+        # The session_id is a real RFC-4122 UUID here (not a synthetic slug)
+        # precisely because the strip is anchored on the UUID shape — a slug
+        # would not exercise the volatile pattern and the test would pass on the
+        # pre-fix code. Assert EXACT scope equality so the test fails on the bug
+        # it guards, not merely on a membership check.
+        session_id = "a1b2c3d4-e5f6-4a8b-9c0d-1e2f3a4b5c6d"
+        with tempfile.TemporaryDirectory() as d:
+            sc = os.path.join(d, "agent-af5.jsonl")
+            _write_sidechain(sc, 8, chars_per_msg=400)
+            hook_input = {
+                "session_id": session_id,
+                "agent_id": "af5",
+                "agent_type": "worker",
+                "agent_transcript_path": sc,
+                "transcript_path": os.path.join(d, f"{session_id}.jsonl"),
+                "cwd": d,
+            }
+            result, captured = self._run(hook_input)
+        self.assertEqual(result["status"], "ok")
+        scope = captured["observation_scopes"]
+        # EXACT curated scope: only the stable semantic tags survive, sorted.
+        self.assertEqual(scope, [["agent_type:worker", "sidechain"]])
+
+        # And the specific volatile tags are provably gone from the scope.
+        scope_tags = {t for group in scope for t in group}
+        sub_session_tag = f"{session_id}-sub-af5"
+        self.assertNotIn(f"parent_session:{session_id}", scope_tags)
+        self.assertNotIn(sub_session_tag, scope_tags)
+
+        # The source-fact tags are untouched — the stripped tags stay queryable.
+        self.assertIn(f"parent_session:{session_id}", captured["tags"])
+        self.assertIn(sub_session_tag, captured["tags"])
 
     def test_sidechain_retain_posts_the_configured_scope(self):
         # switchroom — sidechain retains are their own hand-enumerated kwarg

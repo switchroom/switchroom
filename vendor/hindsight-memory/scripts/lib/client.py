@@ -220,15 +220,18 @@ class HindsightClient:
         tags: Optional[list] = None,
         timeout: int = 15,
         async_processing: bool = True,
-        observation_scopes: Optional[str] = None,
+        observation_scopes: Optional[object] = None,
     ) -> dict:
         """Retain content into a bank's memory.
 
         ``observation_scopes`` is a per-row Hindsight field controlling which
         observation scope consolidation writes this item's observations into.
         ``"shared"`` puts them in ONE global untagged scope instead of a scope
-        per tag. ``None`` (the default) omits the field entirely, so the
-        engine's own default stands and the wire body is byte-identical to a
+        per tag; an explicit ``list[list[str]]`` (e.g. ``[["lesson"]]``, what
+        the ``curated`` strategy emits) declares the exact scope(s) to
+        consolidate into, JSON-serialised onto the wire as a nested array.
+        ``None`` (a falsy value) omits the field entirely, so the engine's own
+        default stands and the wire body is byte-identical to a
         pre-``observation_scopes`` client.
 
         By default posts with ``async=true`` so the server processes extraction
@@ -336,7 +339,7 @@ class HindsightClient:
         tags: Optional[list],
         timeout: int,
         async_processing: bool,
-        observation_scopes: Optional[str] = None,
+        observation_scopes: Optional[object] = None,
     ) -> dict:
         """POST exactly one retain item. Raises on any HTTP/transport error."""
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories"

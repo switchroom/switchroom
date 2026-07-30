@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import watermark
 from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
-from lib.config import classify_observation_scopes, debug_log, load_config
+from lib.config import compute_observation_scopes, debug_log, load_config
 from lib.content import (
     prepare_retention_transcript,
     slice_last_turns_by_user_boundary,
@@ -267,13 +267,13 @@ def build_retain_payload(
     Returns ``{payload, document_id, message_count, last_uuid, ordered_uuids,
     transcript}`` or ``None`` when the slice formats to nothing.
 
-    NEVER raises on a bad ``observationScopes``. Every retain producer builds
-    its payload here, so this seam sees the typo — but it is also the seam the
-    memory itself is made at, and a config typo must not be able to destroy
-    one. An off-list value is dropped from the payload (so the engine's own
-    default stands, exactly as before this feature existed) and shouted about
-    on stderr; the memory is still built, still POSTed, still queued on
-    failure. See ``lib.config.classify_observation_scopes``.
+    NEVER raises on a bad ``observationScopes`` / ``observationScopeStrategy``.
+    Every retain producer builds its payload here, so this seam sees the typo —
+    but it is also the seam the memory itself is made at, and a config typo must
+    not be able to destroy one. An off-list value degrades the SCOPE (the
+    engine's own default stands for a bad pin; ``curated`` stands for a bad
+    strategy) and is shouted about on stderr; the memory is still built, still
+    POSTed, still queued on failure. See ``lib.config.compute_observation_scopes``.
     """
     retain_roles = config.get("retainRoles", ["user", "assistant"])
     include_tool_calls = config.get("retainToolCalls", True)
@@ -367,12 +367,16 @@ def build_retain_payload(
     except Exception:
         pass
 
-    # Per-row observation scope (switchroom). None unless the operator set
-    # memory.observation_scopes — and a None is dropped at the wire by
-    # HindsightClient._retain_one, so the default request body is unchanged.
-    # Carried ON THE PAYLOAD so it survives the pending-retains queue: a retain
-    # that fails and drains hours later must land in the SAME scope it would
-    # have landed in inline.
+    # Per-row observation scope (switchroom). Default `curated`: volatile
+    # per-session provenance tags are stripped from the CONSOLIDATION scope
+    # (kept on the source fact) so observations dedup across sessions instead of
+    # per-session — a non-empty stable tag set yields an explicit `[[stable…]]`
+    # scope, an all-volatile/empty set yields `"shared"`. A None (opt-out via
+    # observationScopeStrategy=combined/off, or a manual observationScopes typo)
+    # is dropped at the wire by HindsightClient._retain_one, so that request
+    # body is byte-identical to the pre-feature default. Carried ON THE PAYLOAD
+    # so it survives the pending-retains queue: a retain that fails and drains
+    # hours later must land in the SAME scope it would have landed in inline.
     #
     # CLASSIFIED, NOT VALIDATED. This is the one seam every retain producer
     # funnels through, which makes it the tempting place to reject a typo — and
@@ -388,7 +392,7 @@ def build_retain_payload(
     # So a bad value degrades to the PRE-FEATURE behaviour (field omitted, the
     # engine's own default scope stands) and is shouted about on stderr. Wrong
     # scope is recoverable; a lost turn is not.
-    scope, scope_error = classify_observation_scopes(config)
+    scope, scope_error = compute_observation_scopes(tags, config)
     if scope_error:
         print(
             f"[Hindsight] observation_scopes IGNORED for this retain: {scope_error} "

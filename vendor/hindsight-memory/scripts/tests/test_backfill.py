@@ -172,11 +172,24 @@ class TestBackfill(BackfillTestBase):
         self.assertTrue(all(async_flag is False for _, async_flag in self.daemon.posts))
 
     # -- switchroom: per-row observation scope on the backfill path ---------
-    def test_backfill_omits_the_scope_when_unconfigured(self):
+    def test_backfill_omits_the_scope_when_opted_out(self):
+        # The curated default now emits a scope on every path; the opt-out
+        # (observationScopeStrategy=combined) must stay byte-identical to the
+        # pre-feature body — no scope on the wire, engine default in force.
+        os.environ["HINDSIGHT_OBSERVATION_SCOPE_STRATEGY"] = "combined"
+        self.addCleanup(os.environ.pop, "HINDSIGHT_OBSERVATION_SCOPE_STRATEGY", None)
         self._transcript("clerk", "sess-plain", 4)
         bf.Backfill(self._config(), commit=True, delay_ms=0).run()
         self.assertTrue(self.daemon.observation_scopes_seen)
         self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
+
+    def test_backfill_curates_the_scope_by_default(self):
+        # Default ON: every recovered slice carries a curated scope; a miss here
+        # would silently drop the backfill path back to the pre-feature default.
+        self._transcript("clerk", "sess-plain", 4)
+        bf.Backfill(self._config(), commit=True, delay_ms=0).run()
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s is not None for s in self.daemon.observation_scopes_seen))
 
     def test_backfill_posts_the_configured_scope(self):
         # The backfill enumerates its own retain kwargs; a miss here would

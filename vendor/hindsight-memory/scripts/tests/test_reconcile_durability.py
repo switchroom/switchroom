@@ -414,14 +414,30 @@ class TestObservationScopes(DurabilityTestBase):
         os.environ["HINDSIGHT_OBSERVATION_SCOPES"] = value
         self.addCleanup(os.environ.pop, "HINDSIGHT_OBSERVATION_SCOPES", None)
 
-    # -- default: nothing changes -------------------------------------------
-    def test_unconfigured_stop_retain_posts_no_scope(self):
+    def _set_strategy(self, value):
+        os.environ["HINDSIGHT_OBSERVATION_SCOPE_STRATEGY"] = value
+        self.addCleanup(os.environ.pop, "HINDSIGHT_OBSERVATION_SCOPE_STRATEGY", None)
+
+    # -- opt-out: byte-identical to pre-feature -----------------------------
+    def test_opted_out_stop_retain_posts_no_scope(self):
+        # observationScopeStrategy=combined restores the pre-feature body: no
+        # scope on the wire so the engine default stands.
+        self._set_strategy("combined")
         hook = self._hook("plainsess")
         with mock.patch("retain.increment_turn_count", return_value=3), \
              mock.patch("sys.stdin", _stdin(hook)):
             retain.main()
         self.assertTrue(self.daemon.observation_scopes_seen)
         self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
+
+    # -- default ON: a curated scope reaches the Stop-hook POST --------------
+    def test_default_stop_retain_posts_a_curated_scope(self):
+        hook = self._hook("plainsess")
+        with mock.patch("retain.increment_turn_count", return_value=3), \
+             mock.patch("sys.stdin", _stdin(hook)):
+            retain.main()
+        self.assertTrue(self.daemon.observation_scopes_seen)
+        self.assertTrue(all(s is not None for s in self.daemon.observation_scopes_seen))
 
     # -- Stop hook (retain.py) ----------------------------------------------
     def test_configured_stop_retain_posts_the_scope(self):
