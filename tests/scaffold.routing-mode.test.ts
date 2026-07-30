@@ -289,14 +289,34 @@ describe("rendered start.sh: routing-mode observability + fable cause split", ()
     expect(startSh).not.toContain("LiteLLM was unreachable at boot, so the configured model");
   });
 
-  it("bakes _DECLARED_ROUTING from the POST-REPOINT mode (passthrough only for non-fable Claude; router-root for fable + sr-*)", () => {
+  it("derives declared= from the POST-REPOINT mode (passthrough only for non-fable Claude; router-root for fable + sr-*)", () => {
+    // _DECLARED_ROUTING is computed at runtime from $_DECLARED_MODEL (the
+    // resolved model snapshotted before any missing-key demotion), not baked
+    // into the script at render time — so assert on the actual written
+    // .routing-mode record for each model class, healthy-boot per class.
     scaffold("claude-sonnet-5");
-    expect(startSh).toContain("_DECLARED_ROUTING='passthrough'");
+    runBlock({ litellmOk: "1" });
+    expect(routingFile()).toContain("declared=passthrough");
+
     scaffold("sr-glm-5");
-    expect(startSh).toContain("_DECLARED_ROUTING='router-root'");
+    runBlock({ litellmOk: "1", baseUrl: ROUTER_ROOT });
+    expect(routingFile()).toContain("declared=router-root");
+
     // fable is a Claude-class model but start.sh repoints it to the router
     // root, so its DECLARED intent must be router-root, not passthrough.
     scaffold("fable");
-    expect(startSh).toContain("_DECLARED_ROUTING='router-root'");
+    runBlock({ litellmOk: "1" });
+    expect(routingFile()).toContain("declared=router-root");
+  });
+
+  it("missing-key fable demotion (opus) still declares router-root — the divergence stays visible", () => {
+    // Regression guard for the bug this fix closes: computing _DECLARED_
+    // ROUTING from the POST-demotion $_EFFECTIVE_MODEL would read "opus" and
+    // conclude declared=passthrough, masking the exact divergence
+    // (fable -> opus on a missing key) this file exists to catch.
+    scaffold("fable");
+    const { out } = runBlock({ litellmOk: "", litellmUnreachable: "" });
+    expect(out).toContain("EFFECTIVE=opus");
+    expect(routingFile()).toContain("declared=router-root");
   });
 });

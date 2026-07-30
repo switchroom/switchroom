@@ -1958,6 +1958,13 @@ rm -f "{{agentDir}}/.session-model.boot-snapshot" "{{agentDir}}/.session-model-b
 # this guard covers only the configured default, which the live-config read
 # above makes a mainline path (pinning `model: fable` in yaml is the normal
 # way to run Fable).
+#
+# Snapshot the resolved model BEFORE this guard can rewrite it. _DECLARED_
+# ROUTING (below) must reflect this boot's actual INTENT — the resolved
+# override or configured default — not a post-demotion landing, or the exact
+# divergence this file exists to catch (missing key silently demoting
+# fable → opus) becomes invisible to the check built to catch it.
+_DECLARED_MODEL="$_EFFECTIVE_MODEL"
 case "$_EFFECTIVE_MODEL" in
   fable|claude-fable-5)
     if [ -z "$_LITELLM_OK" ]; then
@@ -2085,9 +2092,11 @@ export SWITCHROOM_SESSION_MODEL="$_EFFECTIVE_MODEL"
 # Deterministic record of WHERE this boot actually landed, written immediately
 # before exec claude (overwrite-per-boot, one line). Consumers: the gateway
 # boot card's "routing" row and any operator shell. _DECLARED_ROUTING is derived
-# from the runtime-resolved effective model, so a legitimate session override
-# is compared against its own POST-REPOINT intent rather than the configured
-# default's render-time model class.
+# from $_DECLARED_MODEL (the resolved override/default snapshotted BEFORE the
+# missing-key opus demotion above), so a legitimate session override is
+# compared against its own POST-REPOINT intent rather than the configured
+# default's render-time model class — and a missing-key demotion still reads
+# as a genuine divergence instead of chasing its own landed model.
 # Divergence (landed ≠ declared) appends a consume-once .session-model-alert
 # line the gateway relays to the operator, but ONLY when the (landed, declared)
 # PAIR differs from the PREVIOUS boot's pair — a persistently degraded agent
@@ -2098,7 +2107,7 @@ if [ -z "${SWITCHROOM_LITELLM_DECLARED:-}" ]; then
   # No LiteLLM routing was configured for this agent at boot entry.
   _DECLARED_ROUTING="direct-oauth"
 else
-  case "$_EFFECTIVE_MODEL" in
+  case "$_DECLARED_MODEL" in
     sr-*|fable|claude-fable-5) _DECLARED_ROUTING="router-root" ;;
     *) _DECLARED_ROUTING="passthrough" ;;
   esac
@@ -2120,7 +2129,7 @@ echo "routing: $_routing_line" >&2
 if [ "$_ROUTING_MODE" != "$_DECLARED_ROUTING" ] && { [ "$_ROUTING_MODE" != "$_prev_routing_mode" ] || [ "$_DECLARED_ROUTING" != "$_prev_declared_routing" ]; }; then
   printf 'Routing divergence: this agent landed on `%s` (base `%s`, model `%s`) but its declared routing is `%s`. Check `%s/.routing-mode` and the boot log for the cause (LiteLLM key/provision or proxy reachability).\n' "$_ROUTING_MODE" "${ANTHROPIC_BASE_URL:-direct}" "$_EFFECTIVE_MODEL" "$_DECLARED_ROUTING" "{{agentDir}}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
 fi
-unset _prev_routing_mode _prev_declared_routing _routing_line
+unset _prev_routing_mode _prev_declared_routing _routing_line _DECLARED_MODEL
 
 # Publish completion only after every boot-resolution output is final: active
 # model, active effort, routing mode, and any alert append. Atomic rename keeps
