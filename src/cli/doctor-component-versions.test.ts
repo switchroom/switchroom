@@ -20,14 +20,16 @@ const REFERENCE_HOST = [
 ];
 
 describe("doctor: component versions (#3919)", () => {
-  it("WARNs once per stale component and names a remediation for each", () => {
+  it("WARNs once per stale CONTAINER and names a remediation for each", () => {
     const rows = runComponentVersionChecks(config("v0.19.28"), {
       exec: ps(REFERENCE_HOST),
       cliVersion: "0.19.23",
     });
     const warns = rows.filter((r) => r.status === "warn");
+    // Containers that lag are warn-only (they can trail legitimately
+    // mid-roll). The host CLI is NOT in this set — it is a fail, asserted
+    // separately below.
     expect(warns.map((r) => r.name).sort()).toEqual([
-      "component behind: cli (host)",
       "component behind: switchroom-hindsight-autoheal",
       "component behind: switchroom-web",
     ]);
@@ -38,17 +40,32 @@ describe("doctor: component versions (#3919)", () => {
     expect(
       warns.find((r) => r.name.endsWith("switchroom-hindsight-autoheal"))?.fix,
     ).toContain("hostd install --tag v0.19.28");
-    expect(warns.find((r) => r.name.endsWith("cli (host)"))?.fix).toContain(
-      "switchroom update",
-    );
   });
 
-  it("never FAILs — version skew must not change doctor's exit code", () => {
+  it("FAILs when the host CLI binary trails the target — the silent-drift bug", () => {
+    // The regression: fleet on v0.19.28, host binary left on an older
+    // release running a retired cron. This is the case that must turn
+    // doctor RED (non-zero exit), not merely warn.
     const rows = runComponentVersionChecks(config("v0.19.28"), {
       exec: ps(REFERENCE_HOST),
       cliVersion: "0.19.23",
     });
+    const hostCli = rows.find((r) => r.name === "component behind: cli (host)");
+    expect(hostCli?.status).toBe("fail");
+    expect(hostCli?.fix).toContain("switchroom update");
+    expect(rows.some((r) => r.status === "fail")).toBe(true);
+  });
+
+  it("does NOT fail when the host CLI is on target even while CONTAINERS lag", () => {
+    // A current host binary with containers mid-roll must stay green
+    // (no fail): container skew alone never changes doctor's exit code.
+    const rows = runComponentVersionChecks(config("v0.19.28"), {
+      exec: ps(REFERENCE_HOST),
+      cliVersion: "0.19.28",
+    });
     expect(rows.some((r) => r.status === "fail")).toBe(false);
+    // The lagging containers are still surfaced, as warnings.
+    expect(rows.some((r) => r.status === "warn")).toBe(true);
   });
 
   it("reports a single ok row on a converged host", () => {
@@ -80,5 +97,17 @@ describe("doctor: component versions (#3919)", () => {
       "component ahead: switchroom-klanker",
     ]);
     expect(ahead.every((r) => r.status === "warn")).toBe(true);
+  });
+
+  it("does NOT fail when the host CLI is AHEAD of a stale pin", () => {
+    // An ahead host binary (operator bumped ahead of release.pin, or the
+    // pin is stale) is not the drift bug — only *behind* fails.
+    const rows = runComponentVersionChecks(config("v0.19.26"), {
+      exec: ps(REFERENCE_HOST.map((l) => l.replace(/v0\.19\.2[68]/g, "v0.19.26"))),
+      cliVersion: "0.19.28",
+    });
+    const hostCli = rows.find((r) => r.name.includes("cli (host)"));
+    expect(hostCli?.status).not.toBe("fail");
+    expect(rows.some((r) => r.status === "fail")).toBe(false);
   });
 });
