@@ -8909,10 +8909,14 @@ async function runMidSessionCardReaper(): Promise<void> {
       const { finalized, vanished, total } = await runActivityCardMidSessionReaper({
         path: ACTIVITY_CARD_STORE_PATH,
         fs: activityCardStoreFs,
-        // A synthetic pre-turn record's key is never a live topic key, so it is
-        // correctly seen as ownerless here (the seam's own age-based self-reap is
-        // the fast path; this is the crash / long-lived backstop).
-        isLive: (record) => topicKeys.has(record.turnKey),
+        // A synthetic pre-turn key reads as ownerless here (self-reap is the fast
+        // path; this is the crash backstop). EXCEPTION: a pre-turn handback still
+        // enqueued behind an in-flight turn is NOT an orphan — keep it live while
+        // claude is busy, else this 15-min backstop re-posts the false nudge the
+        // self-reap gate removed. (Boot reaper stays ungated: boot is never mid-turn.)
+        isLive: (record) =>
+          topicKeys.has(record.turnKey) ||
+          (handbackPreturnSignal.isPreTurnRecord(record.turnKey) && isMachineInTurn()),
         ttlMs: MID_SESSION_CARD_REAPER_TTL_MS,
         now,
         finalizeCard: (record) => {
@@ -13827,6 +13831,10 @@ const handbackPreturnSignal = createHandbackPreturnSignal({
     // dark-indicator bug). Flag-ON is already per-key; the check is a no-op there.
     return statusKey(live.sessionChatId, live.sessionThreadId) === key
   },
+  // Queue-state gate for the orphan reap (see the signal's `isClaudeBusy` doc):
+  // while a turn is in flight the handback is enqueued behind it, not orphaned.
+  // False for both `bridge_alive_idle` and `bridge_dead` → genuine orphan reaps.
+  isClaudeBusy: () => isMachineInTurn(),
 })
 
 /**
