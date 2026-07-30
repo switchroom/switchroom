@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.19.36 — credit exhaustion fails loudly, an honest model-switch card, and memory redaction at intake
+
+Provider credit exhaustion can no longer die in silence, the boot-time
+`/model` confirmation stops crying wolf, and credentials are masked before they
+ever reach a memory bank.
+
+### Provider credit exhaustion fails loudly again (#4013)
+
+An OpenRouter/LiteLLM `402 Insufficient credits` wall could kill a turn
+**silently** — no Telegram card, no user-visible message. The loud-credit
+classification and surfacing already existed (#3868 / #3880); the break was one
+layer lower and was pure kind-drift.
+
+The gateway's IPC server gated incoming `operator_event` messages against a
+**hand-maintained** `VALID_OPERATOR_KINDS` set that was never updated when
+`provider-credit-exhausted`, `mcp-dependency-blocked`, and `proxy-misconfig`
+joined the `OperatorEventKind` union. The agent classified the 402 correctly and
+forwarded it, but the gateway rejected it as an "invalid IPC message shape" and
+dropped it — so the loud credit card never rendered.
+
+The taxonomy is now a single canonical runtime array `OPERATOR_EVENT_KINDS`, and
+**both** the `OperatorEventKind` type and the gateway's `VALID_OPERATOR_KINDS`
+are derived from it. The two lists cannot drift apart again, because there is
+only one list.
+
+### The boot `/model` confirmation card stops crying wolf (#4012)
+
+`/model <name>` switches applied correctly, but the Telegram gateway could
+report a false "didn't apply" (or the mirror-image false "applied") on the
+*next* boot, from a boot-ordering race: the gateway sidecar forks early and
+rehydrated its confirmation state from `.active-session-model` before the much
+later session-model resolution block had written the new value, so on a fast
+boot it read the previous boot's stale value.
+
+The fix is a deterministic barrier rather than a longer sleep: `start.sh` clears
+a `.session-model-resolved` marker before the gateway fork and writes it
+atomically once resolution completes, and the gateway gates its confirmation
+read on that marker instead of reading a possibly-stale file. A secondary bug —
+a spurious routing-divergence alert whenever a legitimate session override was
+in play, because the declared routing was baked from the *configured* model
+instead of the runtime effective one — is fixed in the same change.
+
+### Secrets are redacted on every Hindsight write path (#3982)
+
+Credentials could be stored in agent memory banks in plaintext. A memory row is
+not a log line: it is recalled into later sessions, folded into mental models,
+and copied into consolidations, so a credential written once keeps resurfacing
+long after it is rotated.
+
+Redaction now runs at **intake** on every in-repo Hindsight write path, reusing
+the existing `secret-detect` engine, applied at the chokepoints every writer
+funnels through rather than at each callsite: the Python `retain()` (with a
+`_request()` backstop on any `POST .../memories`), the `mcp__hindsight__*` tool
+shim, and the two direct REST writers. `retain()` redacts **before** content is
+chunked, so a credential that would otherwise be split across two chunks is
+masked while still whole. This is write-path only — no stored row is modified;
+cleaning existing rows is separate, later work.
+
 ## v0.19.35 — sub-agent memory keeps the learnings and drops the exhaust
 
 Background work stops polluting the memory bank. Sub-agents now retain what they
