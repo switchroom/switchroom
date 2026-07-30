@@ -300,6 +300,73 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     expect(h.signal.pendingCount()).toBe(0) // map empty
   })
 
+  // ── queued-behind-a-long-turn is NOT an orphan (the 3-cards-in-4-min bug) ──
+  // A handback released while the parent is mid-turn on a long task is delivered
+  // into claude's single input queue and mints its adopting turn only when the
+  // parent turn ends. The flat 30 s reap could not tell "enqueued and waiting"
+  // from "bridge died, never enqueued" and finalized a false "handback never
+  // started — needs a nudge" card. With the queue-state gate (`isClaudeBusy`)
+  // the reap DEFERS while claude is busy and the late adoption finalizes the
+  // card honestly. This test FAILS on the pre-fix flat-30 s behaviour: without
+  // the gate the reap fires at 30 s, finalizes the orphan text, and consumes the
+  // entry so the later adoption returns null.
+  it('does NOT finalize a handback whose turn adopts late because the parent was busy', async () => {
+    let busy = false
+    const h = makeHarness({ isClaudeBusy: () => busy })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatBusy', messageId: 700 }))
+    await h.sched.advance(700) // debounce: card painted, reap armed
+    const resolvedId = await h.openCard.mock.results[0]!.value
+    expect(h.records.size).toBe(1)
+
+    // The parent turn is now in flight (a long Wave-2 assembly). The handback is
+    // enqueued behind it.
+    busy = true
+
+    // Two full reap intervals elapse — well beyond the flat 30 s. The reap must
+    // DEFER each time: no false orphan card, entry still live, typing still lit.
+    await h.sched.advance(30_000)
+    await h.sched.advance(30_000)
+    expect(h.finalizedIds).toEqual([]) // NEVER posted the "never started" nudge
+    expect(h.signal.pendingCount()).toBe(1) // still queued, not reaped
+    expect(h.typing.activeCount()).toBe(1) // indicator kept while queued
+
+    // The parent turn finally ends and the handback mints its own turn: it
+    // adopts the SAME card (an edit, not a second send / not an orphan finalize).
+    busy = false
+    const turnId = deriveTurnId('chatBusy', null, 700)!
+    const adoption = h.signal.tryAdopt(turnId)
+    expect(adoption).not.toBeNull()
+    expect(adoption!.activityMessageId).toBe(resolvedId)
+    expect(h.finalizedIds).toEqual([]) // adopted, never finalized as orphan
+    expect(h.openCard).toHaveBeenCalledTimes(1) // no double-send
+    expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  // The deferred reap is not a leak: once claude goes idle and the handback has
+  // STILL not been adopted (genuine bridge-death / dropped inbound), the re-armed
+  // reap finalizes honestly — the degenerate case the reap exists for.
+  it('finalizes a genuine orphan once claude goes idle, even after deferring while busy', async () => {
+    let busy = true
+    const h = makeHarness({ isClaudeBusy: () => busy })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatIdleOrphan', messageId: 710 }))
+    await h.sched.advance(700)
+    const resolvedId = await h.openCard.mock.results[0]!.value
+
+    // Busy: the first reap defers.
+    await h.sched.advance(30_000)
+    expect(h.finalizedIds).toEqual([])
+    expect(h.signal.pendingCount()).toBe(1)
+
+    // Claude goes idle but NO adopting turn ever mints (the inbound was dropped).
+    // The re-armed reap now finalizes the genuine orphan.
+    busy = false
+    await h.sched.advance(30_000)
+    expect(h.finalizedIds).toEqual([resolvedId])
+    expect(h.typing.activeCount()).toBe(0)
+    expect(h.records.size).toBe(0)
+    expect(h.signal.pendingCount()).toBe(0)
+  })
+
   it('identity race: a user inbound on the same topic never mis-adopts the handback, no double-send', async () => {
     const h = makeHarness()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatE', messageId: 200 }))

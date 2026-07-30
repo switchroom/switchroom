@@ -54,9 +54,23 @@
  *     On adoption the durable record is re-keyed from its synthetic pre-turn key
  *     to the real `statusKey` so that teardown matches.
  *
- *   • NEVER-ADOPTED ORPHAN REAP. A degenerate case (bridge death after release,
- *     no enqueue ever arrives) would leave a frozen card + a forever `typing…`
- *     loop. The pre-turn card is persisted as a COMPLETE `ActivityCardRecord`
+ *   • NEVER-ADOPTED ORPHAN REAP — GATED ON A GLOBAL-BUSY QUEUE CHECK. A
+ *     degenerate case (bridge death after release, no enqueue ever arrives)
+ *     would leave a frozen card + a forever `typing…` loop. But the reap must
+ *     fire ONLY for that genuine orphan, never for a handback that is correctly
+ *     enqueued and simply waiting behind a long in-flight turn: claude has ONE
+ *     bridge / ONE input queue, so a released handback mints its adopting turn
+ *     only when claude next goes idle. A flat age-based reap cannot tell the two
+ *     apart and (before this gate) posted a false "never started — needs a
+ *     nudge" card every time a parent turn out-ran the timeout (the 3-cards-in-
+ *     4-min incident). The reap therefore consults `isClaudeBusy()` — the
+ *     machine-level "a turn is in flight right now" signal — and DEFERS
+ *     (re-arms for another `adoptTimeoutMs`) while claude is busy, finalizing
+ *     only once claude is idle AND the handback still has not been adopted. That
+ *     idle-with-no-adoption state is the genuine bridge-death / dropped-inbound
+ *     degenerate case. Lengthening the flat timeout would merely move the false
+ *     positive; the queue-state gate removes it. The pre-turn card is persisted
+ *     as a COMPLETE `ActivityCardRecord`
  *     under a SYNTHETIC `turnKey` (`preturn:<statusKey>:<startedAt>`) — synthetic
  *     so a sibling REAL turn on the same topic key can neither upsert-clobber it
  *     nor keep it "live" (the mid-session reaper's `isLive` keys on live topic
@@ -171,6 +185,22 @@ export interface HandbackPreturnSignalDeps {
    *  canonical turn-end owns the stop. Optional; defaults to "no live turn"
    *  (the pre-#3544 behaviour). */
   hasLiveTurn?: (statusKey: string) => boolean
+  /** True IFF claude is CURRENTLY producing a turn (ANY topic — the machine has
+   *  ONE bridge / ONE input queue). Consulted by the orphan reap: a released
+   *  handback is delivered into that single queue and only mints its adopting
+   *  turn when claude next goes idle, so while claude is busy the handback is
+   *  NOT orphaned — it is correctly enqueued BEHIND the in-flight turn (a long
+   *  parent turn can run many minutes). Finalizing it as an orphan in that
+   *  window posts a false "never started — needs a nudge" card. The reap
+   *  therefore DEFERS (re-arms) while this is true and finalizes only once
+   *  claude is idle and the handback still has not been adopted — the genuine
+   *  bridge-death / dropped-inbound degenerate case the reap exists for.
+   *  Distinct from `hasLiveTurn`, which is PER-KEY and only governs the
+   *  typing-loop stop; this is the GLOBAL busy signal because the handback
+   *  queues behind whatever turn is running, regardless of topic. Optional;
+   *  defaults to "not busy" (immediate reap — the pre-fix behaviour), so the
+   *  genuine-orphan path is unchanged. */
+  isClaudeBusy?: () => boolean
   now?: () => number
   /** Debounce before painting the pre-turn card (kills sub-second flicker). */
   debounceMs?: number
@@ -349,6 +379,25 @@ export function createHandbackPreturnSignal(
   function reap(entry: PreTurnEntry): void {
     entry.reapTimer = null
     if (entry.consumed) return
+    // PRIMARY GATE (queue state, not a flat timeout): a released handback is
+    // delivered into claude's SINGLE input queue and mints its adopting turn
+    // only when claude next goes idle. If claude is STILL in a turn, this
+    // handback is not orphaned — it is correctly enqueued behind the in-flight
+    // turn (a long parent turn can run many minutes). Finalizing now would post
+    // a false "never started — needs a nudge" card (the 3-cards-in-4-min
+    // incident). Defer: re-arm and re-check. We finalize only once claude is
+    // idle AND the handback still has not been adopted (the genuine bridge-
+    // death / dropped-inbound case). This cannot loop forever on a healthy
+    // agent: claude processes its queue FIFO, so the handback is either adopted
+    // (cancelling the reap) or claude eventually goes idle (letting it fire).
+    if (deps.isClaudeBusy?.() === true) {
+      log(
+        `handback-preturn-signal: reap deferred key=${entry.statusKey} ` +
+          `(claude busy — handback enqueued behind an in-flight turn, not orphaned)\n`,
+      )
+      entry.reapTimer = setTimer(() => reap(entry), adoptTimeoutMs)
+      return
+    }
     entry.consumed = true
     // Stop the forever-running typing loop and finalize the frozen card.
     stopTypingUnlessTurnLive(entry, 'orphan reap')
