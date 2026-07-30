@@ -56,10 +56,9 @@ const BLOCK_HEADER = "# --- Session model resolution";
 
 function extractBlock(startSh: string): string {
   const start = startSh.indexOf(BLOCK_HEADER);
-  // The block ends at the `.active-session-model` write (NOT the earlier
-  // `.configured-default-model` write, which is also a printf of
-  // $_EFFECTIVE_MODEL).
-  const anchor = startSh.indexOf('.active-session-model"');
+  // Include every published resolution output through the atomic completion
+  // barrier, but stop before exec claude.
+  const anchor = startSh.indexOf("unset _session_model_resolved_tmp", start);
   const end = startSh.indexOf("\n", anchor);
   expect(start).toBeGreaterThan(-1);
   expect(anchor).toBeGreaterThan(start);
@@ -97,7 +96,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
    * from. The live-read branch has its own suite below.
    */
   function runBlock(litellmOk: string): string {
-    const script = `set -e\nunset SWITCHROOM_CONFIG\n_LITELLM_OK=${JSON.stringify(litellmOk)}\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"`;
+    const script = `set -e\nunset SWITCHROOM_CONFIG ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED\n_LITELLM_OK=${JSON.stringify(litellmOk)}\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"`;
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
     const m = out.match(/EFFECTIVE=(.*)/);
     return m ? m[1].trim() : "";
@@ -111,6 +110,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
       "unset SWITCHROOM_CONFIG",
       `export ANTHROPIC_BASE_URL=${JSON.stringify(PASSTHROUGH)}`,
       `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
+      "export SWITCHROOM_LITELLM_DECLARED=1",
       `_LITELLM_OK=${JSON.stringify(litellmOk)}`,
       block,
       'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
@@ -382,16 +382,34 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(attemptCount()).toBe("1");
   });
 
-  it("rendered start.sh takes the pre-fork snapshot BEFORE the gateway fork (ordering is the whole fix)", () => {
+  it("clears the completion barrier before the gateway fork and publishes it after every resolution output", () => {
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
-    const snapIdx = startSh.indexOf(".session-model.boot-snapshot");
+    const clearIdx = startSh.indexOf('rm -f "' + agentDir + '/.session-model-resolved"');
     const forkIdx = startSh.indexOf("_switchroom_supervise gateway");
-    const resolveIdx = startSh.indexOf(BLOCK_HEADER);
-    expect(snapIdx).toBeGreaterThan(-1);
-    expect(forkIdx).toBeGreaterThan(-1);
-    expect(resolveIdx).toBeGreaterThan(-1);
-    expect(snapIdx).toBeLessThan(forkIdx);
-    expect(forkIdx).toBeLessThan(resolveIdx);
+    const activeModelIdx = startSh.indexOf('.active-session-model"');
+    const activeEffortIdx = startSh.indexOf('.active-session-effort"');
+    const routingIdx = startSh.indexOf('.routing-mode"');
+    const finalAlertIdx = startSh.lastIndexOf('.session-model-alert"');
+    const barrierTmpIdx = startSh.indexOf('.session-model-resolved.tmp.$$');
+    const barrierMoveIdx = startSh.indexOf('mv -f "$_session_model_resolved_tmp"');
+    expect(clearIdx).toBeGreaterThan(-1);
+    expect(clearIdx).toBeLessThan(forkIdx);
+    expect(barrierTmpIdx).toBeGreaterThan(activeModelIdx);
+    expect(barrierTmpIdx).toBeGreaterThan(activeEffortIdx);
+    expect(barrierTmpIdx).toBeGreaterThan(routingIdx);
+    expect(barrierTmpIdx).toBeGreaterThan(finalAlertIdx);
+    expect(barrierMoveIdx).toBeGreaterThan(barrierTmpIdx);
+  });
+
+  it("runtime session override declares routing from the effective model (not the configured default bake)", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("fable"));
+    runBlockRouting("1");
+    const routing = readFileSync(join(agentDir, ".routing-mode"), "utf-8");
+    expect(routing).toContain("model=fable");
+    expect(routing).toContain("mode=router-root");
+    expect(routing).toContain("declared=router-root");
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-resolved"))).toBe(true);
   });
 
   // ── invalidation branches (all consume + alert) ──────────────────────────
@@ -529,7 +547,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     return `${JSON.stringify({ level, configuredDefaultAtWrite: cfg, ts })}\n`;
   }
   function runBlockEffort(): { model: string; effortArg: string } {
-    const script = `set -e\nunset SWITCHROOM_CONFIG\n_LITELLM_OK=1\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"\necho "EFFORTARG=$_EFFORT_ARG"`;
+    const script = `set -e\nunset SWITCHROOM_CONFIG ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED\n_LITELLM_OK=1\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"\necho "EFFORTARG=$_EFFORT_ARG"`;
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
     return {
       model: out.match(/EFFECTIVE=(.*)/)?.[1].trim() ?? "",
@@ -702,6 +720,10 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
       "set -e",
       `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
       `export SWITCHROOM_CONFIG=${JSON.stringify(cfgPath)}`,
+      "unset ANTHROPIC_BASE_URL",
+      "export SWITCHROOM_LITELLM_DECLARED=1",
+      "export ANTHROPIC_BASE_URL=http://127.0.0.1:4010/anthropic",
+      "export SWITCHROOM_LITELLM_BASE=http://127.0.0.1:4010",
       `_LITELLM_OK=${JSON.stringify(litellmOk)}`,
       block,
       'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
@@ -804,7 +826,7 @@ if [ -f "$marker" ]; then echo claude-opus-4-8; else touch "$marker"; echo "mang
     const script = [
       "set -e",
       `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
-      "unset SWITCHROOM_CONFIG",
+      "unset SWITCHROOM_CONFIG ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
       '_LITELLM_OK="1"',
       block,
       'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
