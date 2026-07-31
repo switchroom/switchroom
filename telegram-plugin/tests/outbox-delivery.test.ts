@@ -119,7 +119,8 @@ describe('sweepOutbox — end to end (exactly-once, siblings, dedup)', () => {
       sent,
       send: async (chatId: string, threadId: number | null, text: string) => {
         sent.push({ chatId, threadId, text })
-        return sent.length
+        const id = sent.length
+        return { messageId: id, chunks: [{ messageId: id, text }] }
       },
     }
   }
@@ -134,6 +135,42 @@ describe('sweepOutbox — end to end (exactly-once, siblings, dedup)', () => {
     expect(s.sent).toHaveLength(1)
     expect(readDeliveredNonces(dir).has('n1')).toBe(true)
     expect(listPendingRecords(dir)).toHaveLength(0)
+  })
+
+  it('persist parity: recordOutbound fires ONCE with the delivered message_id(s) + text after a successful sweep', async () => {
+    // The safety-net delivery must land in history.db, exactly like the reply
+    // path and the turn-flush backstop. Pre-fix the sweep never called
+    // recordOutbound, so every net-delivered handback was silently absent from
+    // history — this asserts the recorder fires with the ACTUAL delivered ids +
+    // text, and exactly once across repeated (idempotent) sweeps.
+    writeOutboxRecordAtomic(rec({ turnNonce: 'p1', chatId: '444', text: 'the recovered final answer', createdAt: 0 }), dir)
+    const s = sink()
+    const recorded: Array<{ chatId: string; threadId: number | null; messageIds: number[]; texts: string[] }> = []
+    const deps = {
+      ...s,
+      recordOutbound: (chatId: string, threadId: number | null, messageIds: number[], texts: string[]) => {
+        recorded.push({ chatId, threadId, messageIds, texts })
+      },
+      textAlreadyDelivered: () => false,
+      stateDir: dir,
+      now: () => 10_000,
+    }
+    await sweepOutbox(deps)
+    await sweepOutbox(deps) // journal suppresses — recorder must NOT fire again
+    await sweepOutbox(deps)
+    expect(s.sent).toHaveLength(1)
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0].chatId).toBe('444')
+    expect(recorded[0].messageIds).toEqual([1])
+    expect(recorded[0].texts).toEqual(['the recovered final answer'])
+  })
+
+  it('persist parity: a missing recordOutbound never throws (safety-net stays intact)', async () => {
+    // The recorder is optional; a sweep with no recorder wired must still deliver.
+    writeOutboxRecordAtomic(rec({ turnNonce: 'p2', chatId: '444', text: 'no recorder wired', createdAt: 0 }), dir)
+    const s = sink()
+    await sweepOutbox({ ...s, textAlreadyDelivered: () => false, stateDir: dir, now: () => 10_000 })
+    expect(s.sent).toHaveLength(1)
   })
 
   it('two concurrent sibling handbacks with distinct nonces both deliver, no clobber', async () => {

@@ -2663,6 +2663,8 @@ export async function deliverCapturedProse(
     const plainChunks = splitMarkdownChunks(plain, RICH_MESSAGE_MAX_CHARS)
     try {
       let liveThreadId: number | undefined = threadId
+      const plainSentIds: number[] = []
+      const plainSentTexts: string[] = []
       for (const c of plainChunks) {
         // Plain sendMessage — NO parse_mode / rich rendering — so a markdown
         // construct that made sendRichMessage 400 is sent verbatim instead.
@@ -2676,6 +2678,8 @@ export async function deliverCapturedProse(
             ),
           { threadId: liveThreadId, chat_id: chatId, verb: 'captured-prose-plain-fallback.sendMessage' },
         )
+        const sentId = (sent as { message_id?: number }).message_id
+        if (sentId != null) { plainSentIds.push(sentId); plainSentTexts.push(c) }
         if (liveThreadId != null && (sent as { message_thread_id?: number }).message_thread_id == null) {
           liveThreadId = undefined
         }
@@ -2683,6 +2687,22 @@ export async function deliverCapturedProse(
       // The real answer reached the user via plain text — record it so a late
       // reply-tool retry with the same content is deduped at its send site.
       outboundDedup.record(chatId, threadId, text, Date.now(), registryKey)
+      // Persist parity: the recovered answer reached the user, so it must land in
+      // history.db too (mirrors the canonical persist above at the recordOutbound
+      // reply site). Without this the plain-text-recovered answer is silently
+      // absent from get_recent_messages / handoff briefings / the represent
+      // guard's outbound counting. Best-effort — the delivery already succeeded.
+      if (HISTORY_ENABLED && plainSentIds.length > 0) {
+        try {
+          recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: plainSentIds, texts: plainSentTexts })
+        } catch (histErr) {
+          process.stderr.write(
+            `telegram gateway: history recordOutbound (captured-prose plain fallback) failed: ${
+              histErr instanceof Error ? histErr.message : String(histErr)
+            }\n`,
+          )
+        }
+      }
       process.stderr.write(
         `telegram gateway: captured-prose recovered via plain-text fallback ` +
           `(chat=${chatId} origin=${originTurnId})\n`,

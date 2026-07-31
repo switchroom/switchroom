@@ -61,7 +61,7 @@ describe('outbox sweep vs an open flood window', () => {
 
   it('does not hit the wire while a flood window is open, and keeps the record', async () => {
     writeOutboxRecordAtomic(rec(), dir)
-    const send = vi.fn(async () => 1)
+    const send = vi.fn(async () => ({ messageId: 1, chunks: [{ messageId: 1, text: rec().text }] }))
     const log = vi.fn()
 
     const summary = await sweepOutbox({
@@ -90,7 +90,7 @@ describe('outbox sweep vs an open flood window', () => {
 
   it('delivers the SAME record once the window closes', async () => {
     writeOutboxRecordAtomic(rec(), dir)
-    const send = vi.fn(async () => 42)
+    const send = vi.fn(async () => ({ messageId: 42, chunks: [{ messageId: 42, text: rec().text }] }))
     let remaining = 12_247_000
 
     const deferred = await sweepOutbox({
@@ -120,7 +120,7 @@ describe('outbox sweep vs an open flood window', () => {
 
   it('sweeps normally when no window is open', async () => {
     writeOutboxRecordAtomic(rec(), dir)
-    const send = vi.fn(async () => 7)
+    const send = vi.fn(async () => ({ messageId: 7, chunks: [{ messageId: 7, text: rec().text }] }))
     const summary = await sweepOutbox({
       stateDir: dir,
       send,
@@ -135,7 +135,7 @@ describe('outbox sweep vs an open flood window', () => {
 
   it('FAILS OPEN: a throwing probe must never strand the outbox', async () => {
     writeOutboxRecordAtomic(rec(), dir)
-    const send = vi.fn(async () => 7)
+    const send = vi.fn(async () => ({ messageId: 7, chunks: [{ messageId: 7, text: rec().text }] }))
     const summary = await sweepOutbox({
       stateDir: dir,
       send,

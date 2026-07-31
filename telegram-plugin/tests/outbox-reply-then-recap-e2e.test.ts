@@ -268,7 +268,7 @@ async function runTurn(opts: {
       send: async (_chatId, _threadId, text) => {
         delivered.push({ via: 'sweep', text })
         sentLog.push({ text, at: now })
-        return 500
+        return { messageId: 500, chunks: [{ messageId: 500, text }] }
       },
       // Mirrors the gateway's TTL-bounded exact-text `outboundDedup` cache:
       // anything sent (reply or sweep) within the TTL dedups; older evicts.

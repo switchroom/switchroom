@@ -43,6 +43,8 @@ import {
   type OutboxRecord,
 } from '../outbox.js'
 import { isShownBlock } from '../shown-ledger.js'
+import { richMessage, isParseEntitiesError } from '../rich-send.js'
+import { splitMarkdownChunks } from '../format.js'
 import { resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { createRetryApiCall, retryWithThreadFallback } from '../retry-api-call.js'
 import {
@@ -51,13 +53,46 @@ import {
   makeFloodWaitRecorder,
 } from '../flood-circuit-breaker.js'
 
+/**
+ * What a sweep `send` reports back. The primary (last) landed message id is the
+ * journal's `tgMessageId`; the per-chunk `chunks` are what {@link sweepOutbox}
+ * hands to `recordOutbound` so the history row is aligned to the ACTUAL sends
+ * (a markdown-aware split can land >1 chunk), exactly like the backstop uses
+ * `ledger.entries` (`backstop-delivery.ts`).
+ */
+export interface OutboxSendResult {
+  /** Primary (last) landed message id, or `undefined` when nothing was sent. */
+  messageId: number | undefined
+  /** Every landed chunk in delivery order: its message id + the delivered text. */
+  chunks: Array<{ messageId: number; text: string }>
+}
+
 export interface OutboxSweepDeps {
-  /** Deliver `text` to the chat. Resolves to the primary message id (best-effort). */
+  /**
+   * Deliver `text` to the chat. Resolves to the landed message id(s) + their
+   * texts (best-effort) — see {@link OutboxSendResult}. A long body is chunked
+   * inside the sender, so more than one message may land.
+   */
   send: (
     chatId: string,
     threadId: number | null,
     text: string,
-  ) => Promise<number | undefined>
+  ) => Promise<OutboxSendResult>
+  /**
+   * Persist the sweep-delivered final answer to history (role='assistant'),
+   * the SAME `recordOutbound` the reply path (`outbound-send-path.ts`) and the
+   * turn-flush backstop (`backstop-delivery.ts`) call. Without it every
+   * net-delivered handback / task-notification answer is silently absent from
+   * `history.db`, degrading `get_recent_messages`, the handoff briefing, and the
+   * represent-guard's outbound counting. OPTIONAL and called DEFENSIVELY (a
+   * missing recorder or a throw never breaks the safety-net delivery).
+   */
+  recordOutbound?: (
+    chatId: string,
+    threadId: number | null,
+    messageIds: number[],
+    texts: string[],
+  ) => void
   /** Has this exact text already been delivered to this chat/thread recently? */
   textAlreadyDelivered: (chatId: string, threadId: number | null, text: string) => boolean
   /**
@@ -241,7 +276,7 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
     const resolvedChat = resolved! // routable implies non-null
 
     try {
-      const messageId = await deps.send(
+      const sendResult = await deps.send(
         resolvedChat.chatId,
         resolvedChat.threadId,
         decision.text ?? record.text,
@@ -250,7 +285,7 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
         {
           turnNonce: record.turnNonce,
           textSha256: record.textSha256,
-          tgMessageId: messageId,
+          tgMessageId: sendResult.messageId,
           ts: now,
           // #3510 instrumentation: a sweep delivery journals its machine and the
           // record's capture-time reply-already-delivered flag, so a duplicate
@@ -261,6 +296,22 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
         },
         deps.stateDir,
       )
+      // Persist parity (mirrors outbound-send-path.ts + backstop-delivery.ts):
+      // record the delivered chunk ids + texts to history so a net-delivered
+      // answer is not silently absent from history.db. Best-effort — a missing
+      // recorder or a throw must never break this safety-net delivery.
+      if (deps.recordOutbound != null && sendResult.chunks.length > 0) {
+        try {
+          deps.recordOutbound(
+            resolvedChat.chatId,
+            resolvedChat.threadId,
+            sendResult.chunks.map((c) => c.messageId),
+            sendResult.chunks.map((c) => c.text),
+          )
+        } catch {
+          /* best-effort — the delivery already landed; never throw here */
+        }
+      }
       removeClaimed(record.turnNonce, deps.stateDir)
       summary.delivered++
       log(
@@ -380,7 +431,9 @@ export type OutboxDeliveryMarkup = {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
 }
 
-/** Minimal bot-api surface the sweep needs to deliver text. */
+/** Minimal bot-api surface the sweep needs to deliver text. `sendRichMessage`
+ *  is the canonical rendered path (raw GFM markdown → entities); `sendMessage`
+ *  is the plain parse-reject fallback. */
 type OutboxSendBot = {
   api: {
     sendMessage: (
@@ -388,6 +441,40 @@ type OutboxSendBot = {
       text: string,
       opts: object,
     ) => Promise<{ message_id?: number }>
+    sendRichMessage: (
+      chatId: string,
+      body: { markdown: string },
+      opts: object,
+    ) => Promise<{ message_id?: number }>
+  }
+}
+
+/**
+ * Send ONE chunk with RENDER PARITY: ship raw GFM markdown through the shared
+ * `richMessage` → `sendRichMessage` path — the SAME renderer the reply path
+ * uses (`outbound-send-path.ts`) — so a net-delivered answer is formatted
+ * identically to a normally-delivered one (no more literal `**bold**`). On a
+ * markdown PARSE-REJECT, resend the same chunk as PLAIN text (the raw markdown
+ * source is itself readable prose), mirroring the reply path's plaintext
+ * fallback (`outbound-send-path.ts`). A length / thread / flood error is NOT
+ * caught here — it propagates so `retryWithThreadFallback` and the sweep's
+ * claim-release retry handle it, exactly as before.
+ */
+async function sendChunkRich(
+  bot: OutboxSendBot,
+  chatId: string,
+  chunk: string,
+  opts: object,
+): Promise<{ message_id?: number }> {
+  try {
+    // allow-raw-bot-api: caller (createOutboxSend) invokes this inside retryWithThreadFallback + createRetryApiCall
+    return await bot.api.sendRichMessage(chatId, richMessage(chunk), opts)
+  } catch (err) {
+    if (isParseEntitiesError(err)) {
+      // allow-raw-bot-api: parse-reject plain fallback, still inside the sweep's retryWithThreadFallback wrapper
+      return await bot.api.sendMessage(chatId, chunk, opts)
+    }
+    throw err
   }
 }
 
@@ -419,19 +506,21 @@ export function createOutboxSend(deps: {
     // so sending one chunk of '' would throw every tick and wedge the sweep in
     // a permanent retry (the record never journals → never clears). Return
     // early, matching the pre-refactor loop's zero-chunk behaviour.
-    if (text.length === 0) return undefined
+    if (text.length === 0) return { messageId: undefined, chunks: [] }
     // Resolve the Listen button / keyboard ONCE from the full answer text; it
     // rides only on the final chunk below.
     const replyMarkup = deps.resolveReplyMarkup?.(chatId, threadId, text)
-    // Chunk to Telegram's 4096-char ceiling; each chunk goes through the
-    // standard retry / flood-wait / thread-fallback wrapper. A thrown send
-    // propagates so the sweep releases the claim and retries next tick (the
-    // record is never journaled → never lost).
-    let lastId: number | undefined
-    const chunkCount = Math.ceil(text.length / 4000)
-    for (let i = 0, idx = 0; i < text.length; i += 4000, idx++) {
-      const chunk = text.slice(i, i + 4000)
-      const isLast = idx === chunkCount - 1
+    // Chunk with the markdown-boundary-aware splitter the reply path uses
+    // (`splitMarkdownChunks`), NOT a blind fixed-char slice — a raw slice can
+    // bisect an inline entity (`**bold**`) and force a parse-reject. Each chunk
+    // goes through the standard retry / flood-wait / thread-fallback wrapper. A
+    // thrown send propagates so the sweep releases the claim and retries next
+    // tick (the record is never journaled → never lost).
+    const landed: Array<{ messageId: number; text: string }> = []
+    const chunks = splitMarkdownChunks(text)
+    for (let idx = 0; idx < chunks.length; idx++) {
+      const chunk = chunks[idx]
+      const isLast = idx === chunks.length - 1
       const res = await retryWithThreadFallback(
         deps.retry,
         (tid) => {
@@ -439,13 +528,17 @@ export function createOutboxSend(deps: {
           // Button on the LAST chunk only (final visible message).
           const opts =
             isLast && replyMarkup != null ? { ...base, reply_markup: replyMarkup } : base
-          return bot.api.sendMessage(chatId, chunk, opts)
+          return sendChunkRich(bot, chatId, chunk, opts)
         },
         { threadId: threadId ?? undefined, chat_id: chatId, verb: 'outbox-sweep.sendMessage' },
       )
-      lastId = res?.message_id
+      const id = res?.message_id
+      if (id != null) landed.push({ messageId: id, text: chunk })
     }
-    return lastId
+    return {
+      messageId: landed.length > 0 ? landed[landed.length - 1]!.messageId : undefined,
+      chunks: landed,
+    }
   }
 }
 
@@ -463,6 +556,10 @@ export function startOutboxSweep(deps: {
     threadId: number | null,
     text: string,
   ) => OutboxDeliveryMarkup | undefined
+  /** Persist a sweep-delivered answer to history — forwarded to {@link sweepOutbox}
+   *  as {@link OutboxSweepDeps.recordOutbound}. Wired by the gateway to the shared
+   *  `recordOutbound` (history.ts). Absent → no history row (legacy behaviour). */
+  recordOutbound?: OutboxSweepDeps['recordOutbound']
   log?: (line: string) => void
   /** Test seam — override the flood probe (default: the persisted breaker). */
   floodWaitRemainingMs?: () => number
@@ -500,6 +597,7 @@ export function startOutboxSweep(deps: {
       stateDir: deps.stateDir,
       log: deps.log,
       send,
+      ...(deps.recordOutbound != null ? { recordOutbound: deps.recordOutbound } : {}),
       floodWaitRemainingMs: floodProbe,
       textAlreadyDelivered: (chatId, threadId, text) => deps.dedupCheck(chatId, threadId ?? undefined, text),
       registryChainLookup: (taskId) => {
