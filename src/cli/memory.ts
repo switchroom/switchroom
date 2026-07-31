@@ -8,6 +8,11 @@ import {
   DEMOTE_FROM_RECALL_TAG,
 } from "../memory/hindsight.js";
 import { searchMemory, getMemoryStats, reflectAcrossAgents } from "../memory/search.js";
+import {
+  planBankCleanup,
+  formatCleanupPlan,
+  type BankCleanupPlan,
+} from "../memory/observation-scope-cleanup.js";
 import { redactMemoryWriteBody } from "../memory/hindsight-write-redaction.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import {
@@ -1294,6 +1299,108 @@ export function registerMemoryCommand(program: Command): void {
             ),
           );
           process.exit(1);
+        },
+      ),
+    );
+
+  // switchroom memory cleanup-scopes — AUDIT + DRY-RUN for legacy
+  // observation-scope fragmentation left by banks that retained before #4035
+  // (curated scopes by default). It only READS `/observations/scopes` and
+  // prints what a curated re-home WOULD change; it never writes. Live execution
+  // is not wired: Hindsight has no per-memory tag-write (#3772) and no per-scope
+  // delete, so healing is not mechanizable through the REST surface today —
+  // `--execute` refuses and explains, keeping this a diagnostic only.
+  memory
+    .command("cleanup-scopes [agent]")
+    .description(
+      "Dry-run audit of legacy pre-#4035 observation-scope fragmentation " +
+        "(per-session UUID islands, stale agent-<hex> scopes). Reads only; " +
+        "prints the blast radius of a curated re-home. Pass an agent, or --all.",
+    )
+    .option("--all", "Audit every agent bank and profile bank")
+    .option(
+      "--retire-stale",
+      "Also fold stale agent-<hex> producer scopes into shared (opt-in; not part of the #4035 heal)",
+    )
+    .option("--execute", "(refused) live mutation is not supported — see the printed reason")
+    .option("--json", "Emit the plans as JSON")
+    .action(
+      withConfigError(
+        async (
+          agent: string | undefined,
+          opts: { all?: boolean; retireStale?: boolean; execute?: boolean; json?: boolean },
+        ) => {
+          const config = getConfig(program);
+          const apiUrl =
+            (config.memory?.config?.url as string | undefined) ?? HINDSIGHT_DEFAULT_MCP_URL;
+
+          if (opts.execute) {
+            console.error(
+              chalk.red("✗ --execute is not supported: legacy-scope healing is not mechanizable"),
+            );
+            console.error(
+              chalk.gray(
+                "  Hindsight exposes no per-memory tag-write (update_memory / PATCH memories/{id}\n" +
+                  "  silently drop a `tags` argument, #3772) and no per-scope delete (DELETE\n" +
+                  "  .../observations clears the WHOLE bank). So an observation's scope cannot be\n" +
+                  "  edited in place, and this tool stays a read-only audit. A live heal needs an\n" +
+                  "  upstream tag-write path or a deliberate, operator-approved enumerate-and-\n" +
+                  "  invalidate pass — neither is run from here.",
+              ),
+            );
+            process.exit(1);
+          }
+
+          // Resolve the bank set. One agent, or the whole fleet + profile banks.
+          const banks = new Set<string>();
+          if (agent) {
+            if (!config.agents[agent]) {
+              console.error(chalk.red(`Agent "${agent}" is not defined in switchroom.yaml`));
+              process.exit(1);
+            }
+            banks.add(getCollectionForAgent(agent, config));
+          } else if (opts.all) {
+            for (const name of Object.keys(config.agents)) {
+              banks.add(getCollectionForAgent(name, config));
+            }
+            for (const bank of collectProfileBanks(config)) banks.add(bank);
+          } else {
+            console.error(chalk.red("Pass an agent name, or --all to audit every bank."));
+            process.exit(1);
+          }
+
+          const plans: BankCleanupPlan[] = await Promise.all(
+            [...banks].map((bankId) =>
+              planBankCleanup(apiUrl, bankId, { retireStale: opts.retireStale }),
+            ),
+          );
+          plans.sort((a, b) => b.affectedObservations - a.affectedObservations);
+
+          if (opts.json) {
+            console.log(JSON.stringify(plans, null, 2));
+            return;
+          }
+
+          console.log(chalk.bold("\nObservation-scope cleanup — DRY RUN (no writes)\n"));
+          console.log(chalk.gray(`  api=${apiUrl}  retireStale=${Boolean(opts.retireStale)}\n`));
+          for (const plan of plans) {
+            console.log(formatCleanupPlan(plan));
+            console.log();
+          }
+          const totalObs = plans.reduce((n, p) => n + p.affectedObservations, 0);
+          const totalScopes = plans.reduce((n, p) => n + p.scopeReduction, 0);
+          console.log(
+            chalk.cyan(
+              `Fleet total (would change): ${totalObs.toLocaleString()} observations re-homed, ` +
+                `${totalScopes.toLocaleString()} scopes removed.`,
+            ),
+          );
+          console.log(
+            chalk.gray(
+              "Nothing was written. Live execution is not supported from this tool " +
+                "(--execute prints why).",
+            ),
+          );
         },
       ),
     );
