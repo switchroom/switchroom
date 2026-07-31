@@ -66,7 +66,7 @@ import { getReleasePinFromConfig } from "./release-yaml.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
 describe("normalizeVersion", () => {
-  it("strips a leading v and trims so config pin == in-container version", () => {
+  it("strips a leading v and trims so config pin == in-container version", async () => {
     expect(normalizeVersion("v0.15.18")).toBe("0.15.18");
     expect(normalizeVersion(" 0.15.18 ")).toBe("0.15.18");
     expect(normalizeVersion("v0.15.18")).toBe(normalizeVersion("0.15.18"));
@@ -74,12 +74,12 @@ describe("normalizeVersion", () => {
 });
 
 describe("isVersionAssertable", () => {
-  it("accepts a semver tag with or without the v prefix", () => {
+  it("accepts a semver tag with or without the v prefix", async () => {
     expect(isVersionAssertable("v0.15.18")).toBe(true);
     expect(isVersionAssertable("0.15.18")).toBe(true);
     expect(isVersionAssertable(" v0.15.18 ")).toBe(true);
   });
-  it("rejects a sha-pin (valid release.pin, but not version-assertable)", () => {
+  it("rejects a sha-pin (valid release.pin, but not version-assertable)", async () => {
     expect(isVersionAssertable("sha-18e9d152")).toBe(false);
     expect(isVersionAssertable("latest")).toBe(false);
     expect(isVersionAssertable("v0.15")).toBe(false);
@@ -87,18 +87,18 @@ describe("isVersionAssertable", () => {
 });
 
 describe("orderAgentsForRoll", () => {
-  it("puts test-harness first, preserving the rest's order", () => {
+  it("puts test-harness first, preserving the rest's order", async () => {
     expect(orderAgentsForRoll(["clerk", "test-harness", "marko"])).toEqual([
       "test-harness",
       "clerk",
       "marko",
     ]);
   });
-  it("is a no-op when test-harness is absent and no priority agents roll", () => {
+  it("is a no-op when test-harness is absent and no priority agents roll", async () => {
     expect(orderAgentsForRoll(["clerk", "marko"])).toEqual(["clerk", "marko"]);
   });
 
-  it("orders canary, then overlord → carrie → finn, then the rest in config order", () => {
+  it("orders canary, then overlord → carrie → finn, then the rest in config order", async () => {
     // Config order deliberately scrambles the priority agents so this test
     // FAILS on the old canary-only ordering (which preserved config order
     // for everything after test-harness).
@@ -114,7 +114,7 @@ describe("orderAgentsForRoll", () => {
     ).toEqual(["test-harness", "overlord", "carrie", "finn", "clerk", "marko"]);
   });
 
-  it("applies the priority prefix even when the canary is absent", () => {
+  it("applies the priority prefix even when the canary is absent", async () => {
     expect(orderAgentsForRoll(["clerk", "carrie", "overlord"])).toEqual([
       "overlord",
       "carrie",
@@ -122,31 +122,59 @@ describe("orderAgentsForRoll", () => {
     ]);
   });
 
-  it("skips priority agents not present in the roll (a --agents subset)", () => {
+  it("skips priority agents not present in the roll (a --agents subset)", async () => {
     expect(orderAgentsForRoll(["marko", "finn"])).toEqual(["finn", "marko"]);
   });
 
-  it("pins the priority list itself — overlord, then carrie, then finn", () => {
+  it("pins the priority list itself — overlord, then carrie, then finn", async () => {
     expect(ROLLOUT_PRIORITY_AGENTS).toEqual(["overlord", "carrie", "finn"]);
   });
 });
 
 describe("planRollout", () => {
-  it("orders apply → restarts (canary-first) → web → hostd → hindsight → sweep → verify", () => {
+  it("orders apply → hindsight → restarts (canary-first) → web → hostd → sweep → ensure-banks → verify", async () => {
+    // Ordering fix: refresh-hindsight now precedes the restart loop so the
+    // memory backend is healthy while each agent's own reconcile creates its
+    // bank; ensure-banks is the terminal backstop after every restart.
     const steps = planRollout(["clerk", "test-harness"]);
     expect(steps.map((s) => (s.kind === "restart-agent" ? `r:${s.agent}` : s.kind))).toEqual([
       "apply",
+      "refresh-hindsight",
       "r:test-harness",
       "r:clerk",
       "refresh-web",
       "refresh-hostd",
-      "refresh-hindsight",
       "sweep",
+      "ensure-banks",
       "verify-components",
     ]);
   });
 
-  it("restarts canary → overlord → carrie → finn → rest, in the step list", () => {
+  it("puts refresh-hindsight BEFORE the first restart-agent on the host-shell path", async () => {
+    const kinds = planRollout(["clerk", "marko"]).map((s) => s.kind);
+    const hindsightIdx = kinds.indexOf("refresh-hindsight");
+    const firstRestartIdx = kinds.indexOf("restart-agent");
+    expect(hindsightIdx).toBeGreaterThanOrEqual(0);
+    expect(firstRestartIdx).toBeGreaterThan(hindsightIdx);
+  });
+
+  it("puts refresh-hindsight BEFORE the first restart-agent on the hostd path", async () => {
+    const kinds = planRollout(["clerk", "marko"], { hostdContext: true }).map((s) => s.kind);
+    const hindsightIdx = kinds.indexOf("refresh-hindsight");
+    const firstRestartIdx = kinds.indexOf("restart-agent");
+    expect(hindsightIdx).toBeGreaterThanOrEqual(0);
+    expect(firstRestartIdx).toBeGreaterThan(hindsightIdx);
+  });
+
+  it("places ensure-banks after sweep and immediately before verify-components (both paths)", async () => {
+    for (const opts of [undefined, { hostdContext: true }]) {
+      const kinds = planRollout(["clerk"], opts).map((s) => s.kind);
+      expect(kinds.indexOf("ensure-banks")).toBe(kinds.indexOf("sweep") + 1);
+      expect(kinds.indexOf("verify-components")).toBe(kinds.indexOf("ensure-banks") + 1);
+    }
+  });
+
+  it("restarts canary → overlord → carrie → finn → rest, in the step list", async () => {
     const steps = planRollout([
       "clerk",
       "finn",
@@ -166,19 +194,19 @@ describe("planRollout", () => {
     ]);
   });
 
-  it("places refresh-hindsight immediately after refresh-hostd", () => {
+  it("places refresh-hindsight immediately after apply (before the restart loop)", async () => {
     const kinds = planRollout(["clerk"]).map((s) => s.kind);
     expect(kinds).toContain("refresh-hindsight");
-    expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("refresh-hostd") + 1);
+    expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("apply") + 1);
   });
 
-  it("drops web + hostd + hindsight when skipWeb is set", () => {
+  it("drops web + hostd + hindsight when skipWeb is set (ensure-banks stays as a self-guarded backstop)", async () => {
     const kinds = planRollout(["clerk"], { skipWeb: true }).map((s) => s.kind);
-    expect(kinds).toEqual(["apply", "restart-agent", "sweep", "verify-components"]);
+    expect(kinds).toEqual(["apply", "restart-agent", "sweep", "ensure-banks", "verify-components"]);
     expect(kinds).not.toContain("refresh-hindsight");
   });
 
-  it("ALWAYS ends with verify-components — including under --skip-web (#3928)", () => {
+  it("ALWAYS ends with verify-components — including under --skip-web (#3928)", async () => {
     // The convergence gate derives its scope FROM the steps present, so it
     // must run even on a reduced plan: with --skip-web it still proves the
     // agents converged, and demotes the skipped singletons to named
@@ -196,14 +224,14 @@ describe("planRollout", () => {
     }
   });
 
-  it("does NOT emit a singleton step (first restart self-heals them, #2170)", () => {
+  it("does NOT emit a singleton step (first restart self-heals them, #2170)", async () => {
     const kinds = planRollout(["clerk"]).map((s) => s.kind);
     expect(kinds).not.toContain("refresh-singletons");
   });
 });
 
 describe("formatRolloutPlan", () => {
-  it("names the target, every step, and the stop-on-mismatch contract", () => {
+  it("names the target, every step, and the stop-on-mismatch contract", async () => {
     const out = formatRolloutPlan(planRollout(["clerk"]), "v0.15.18");
     expect(out).toContain("v0.15.18");
     expect(out).toContain("apply");
@@ -236,6 +264,15 @@ function harness(opts: {
    * exercise the gate inject a real inventory.
    */
   components?: ComponentVersion[];
+  /**
+   * Behaviour of the injected `ensureBank` hook (the ensure-banks backstop
+   * seam). Defaults to "every bank is present" so pre-existing tests keep
+   * their meaning. Tests exercising the backstop inject a per-agent verdict
+   * (a missing bank, an "Unreachable" degrade, or a hard create failure).
+   * When set to `null`, NO ensureBank is wired at all (exercises the
+   * unwired-seam warning path).
+   */
+  ensureBank?: ((agent: string) => { ok: true } | { ok: false; reason: string }) | null;
 }): {
   deps: RolloutDeps;
   runs: string[][];
@@ -243,12 +280,14 @@ function harness(opts: {
   logs: string[];
   persisted: string[];
   phases: RolloutPhase[];
+  ensureBankCalls: string[];
 } {
   const runs: string[][] = [];
   const runEnvs: Array<Record<string, string> | undefined> = [];
   const logs: string[] = [];
   const persisted: string[] = [];
   const phases: RolloutPhase[] = [];
+  const ensureBankCalls: string[] = [];
   const deps: RolloutDeps = {
     run: (args, runOpts) => {
       runs.push(args);
@@ -265,19 +304,30 @@ function harness(opts: {
     hindsightExists: () => opts.hindsightExists ?? false,
     webImageTag: () => opts.webImageTag ?? null,
     collectComponents: () => opts.components ?? [],
+    // Wired unless the test explicitly passes `ensureBank: null`. The default
+    // reports every bank present; a custom verdict drives the backstop's
+    // degrade/fail branches.
+    ...(opts.ensureBank === null
+      ? {}
+      : {
+          ensureBank: (agent: string) => {
+            ensureBankCalls.push(agent);
+            return Promise.resolve(opts.ensureBank ? opts.ensureBank(agent) : { ok: true as const });
+          },
+        }),
   };
-  return { deps, runs, runEnvs, logs, persisted, phases };
+  return { deps, runs, runEnvs, logs, persisted, phases, ensureBankCalls };
 }
 
 describe("executeRollout", () => {
   const TARGET = "v0.15.18";
 
-  it("happy path: rolls every agent, then refreshes web + hostd", () => {
+  it("happy path: rolls every agent, then refreshes web + hostd", async () => {
     const steps = planRollout(["clerk", "marko"]);
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18", marko: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.rolled).toEqual(["clerk", "marko"]);
     // apply ran first (always bare — pin is persisted, not passed one-shot),
@@ -288,12 +338,12 @@ describe("executeRollout", () => {
     expect(runs).toContainEqual(["hostd", "install", "--tag", TARGET]);
   });
 
-  it("injects the scoped-sweep env into ONLY the canary restart spawn (#3333 amendment C)", () => {
+  it("injects the scoped-sweep env into ONLY the canary restart spawn (#3333 amendment C)", async () => {
     const steps = planRollout(["clerk", "marko", "nadia"]);
     const { deps, runs, runEnvs } = harness({
       versions: { clerk: "0.15.18", marko: "0.15.18", nadia: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
 
     // Correlate each restart spawn with the env it was given.
@@ -316,29 +366,29 @@ describe("executeRollout", () => {
     }
   });
 
-  it("persists the pin BEFORE a bare apply when pinToPersist is set", () => {
+  it("persists the pin BEFORE a bare apply when pinToPersist is set", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
     // persist-pin is the very first step.
     expect(steps[0]).toEqual({ kind: "persist-pin", pin: TARGET });
     const { deps, runs, persisted } = harness({ versions: { clerk: "0.15.18" } });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(persisted).toEqual([TARGET]); // persisted exactly once
     expect(runs[0]).toEqual(["apply"]); // apply is bare — no one-shot --pin
   });
 
-  it("does NOT persist (no persist-pin step) when target came from config", () => {
+  it("does NOT persist (no persist-pin step) when target came from config", async () => {
     const steps = planRollout(["clerk"]); // no pinToPersist
     expect(steps.find((s) => s.kind === "persist-pin")).toBeUndefined();
     const { deps, persisted } = harness({ versions: { clerk: "0.15.18" } });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     expect(persisted).toEqual([]);
   });
 
-  it("warns (does not crash) if a persist-pin step has no persist hook", () => {
+  it("warns (does not crash) if a persist-pin step has no persist hook", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
     const runs: string[][] = [];
-    const r = executeRollout(steps, TARGET, {
+    const r = await executeRollout(steps, TARGET, {
       run: (a) => { runs.push(a); return { status: 0 }; },
       probeVersion: () => "0.15.18",
       log: () => {},
@@ -348,7 +398,7 @@ describe("executeRollout", () => {
     expect(r.warnings.some((w) => w.includes("NOT durable"))).toBe(true);
   });
 
-  it("STOPS at the first agent that comes back on the wrong version", () => {
+  it("STOPS at the first agent that comes back on the wrong version", async () => {
     // NOTE: neutral (non-priority) agent names — the roll order for
     // priority agents (overlord/carrie/finn) is pinned by the
     // orderAgentsForRoll tests above.
@@ -356,7 +406,7 @@ describe("executeRollout", () => {
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18", marko: "0.15.17" /* stale! */, quill: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("restart-agent");
     expect(r.failedAgent).toBe("marko");
@@ -367,45 +417,45 @@ describe("executeRollout", () => {
     expect(runs).not.toContainEqual(["webd", "install", "--tag", TARGET]);
   });
 
-  it("STOPS when an agent is unreachable (probe returns null)", () => {
+  it("STOPS when an agent is unreachable (probe returns null)", async () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({ versions: { clerk: null } });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedAgent).toBe("clerk");
     expect(r.rolled).toEqual([]);
   });
 
-  it("aborts before any restart if apply fails", () => {
+  it("aborts before any restart if apply fails", async () => {
     const steps = planRollout(["clerk"]);
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18" },
       runStatus: (args) => (args[0] === "apply" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("apply");
     expect(r.rolled).toEqual([]);
     expect(runs).not.toContainEqual(["agent", "restart", "clerk", "--wait", "--force"]);
   });
 
-  it("treats a web/hostd refresh failure as a non-fatal warning (agents already rolled)", () => {
+  it("treats a web/hostd refresh failure as a non-fatal warning (agents already rolled)", async () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({
       versions: { clerk: "0.15.18" },
       runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.rolled).toEqual(["clerk"]);
     expect(r.warnings.length).toBe(2);
   });
 
-  it("compares versions normalized (v-prefix vs bare)", () => {
+  it("compares versions normalized (v-prefix vs bare)", async () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({ versions: { clerk: "0.15.18" } });
     // target carries the v-prefix; in-container version does not.
-    const r = executeRollout(steps, "v0.15.18", deps);
+    const r = await executeRollout(steps, "v0.15.18", deps);
     expect(r.ok).toBe(true);
   });
 });
@@ -415,29 +465,29 @@ describe("executeRollout", () => {
 describe("executeRollout — refresh-hindsight (#2752)", () => {
   const TARGET = "v0.15.18";
 
-  it("no-ops cleanly when no hindsight container exists (never runs memory setup)", () => {
+  it("no-ops cleanly when no hindsight container exists (never runs memory setup)", async () => {
     const steps = planRollout(["clerk"]);
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: false,
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(runs.some((a) => a[0] === "memory")).toBe(false);
   });
 
-  it("Fix 1: passes --tag <target> so the recreate pulls the PINNED image, not :latest", () => {
+  it("Fix 1: passes --tag <target> so the recreate pulls the PINNED image, not :latest", async () => {
     const steps = planRollout(["clerk"]);
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: true,
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(runs).toContainEqual(["memory", "setup", "--recreate", "--tag", TARGET]);
   });
 
-  it("Fix 2: a recreate FAILURE is FATAL — flips ok:false and stops the roll", () => {
+  it("Fix 2: a recreate FAILURE is FATAL — flips ok:false and stops the roll", async () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({
       versions: { clerk: "0.15.18" },
@@ -445,25 +495,171 @@ describe("executeRollout — refresh-hindsight (#2752)", () => {
       // Only the hindsight recreate fails; agent restart + apply succeed.
       runStatus: (args) => (args[0] === "memory" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("refresh-hindsight");
     // NOT folded into the generic non-fatal web/hostd warning string.
     expect(r.warnings.some((w) => /hindsight refresh failed \(non-fatal\)/.test(w))).toBe(false);
-    // The agent was already rolled before the fatal memory-backend failure.
-    expect(r.rolled).toEqual(["clerk"]);
+    // Ordering fix: refresh-hindsight now runs BEFORE the restart loop, so a
+    // fatal recreate failure aborts the roll with NO agent touched — strictly
+    // better than the old terminal position, which stopped the memory backend
+    // only AFTER every agent had already restarted against it.
+    expect(r.rolled).toEqual([]);
   });
 
-  it("a web/hostd failure stays non-fatal even while hindsight recreate succeeds", () => {
+  it("a web/hostd failure stays non-fatal even while hindsight recreate succeeds", async () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: true,
       runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.warnings.length).toBe(2); // web + hostd only; hindsight succeeded
+  });
+});
+
+// ── ensure-banks backstop — the bank-creation ordering hole ────────────────
+//
+// The ordering fix moves refresh-hindsight before the restart loop so each
+// agent's own reconcile can create its bank against a healthy backend. The
+// terminal ensure-banks step is the backstop: it re-runs the idempotent
+// createBank for every rolled agent, and a bank that STILL cannot be created
+// is a structured, roll-failing residue — NOT a host-CLI `agent reconcile`
+// instruction.
+describe("executeRollout — ensure-banks backstop", () => {
+  const TARGET = "v0.15.18";
+
+  it("retries every rolled agent's bank and passes when all are present", async () => {
+    const steps = planRollout(["clerk", "marko"]);
+    const { deps, ensureBankCalls } = harness({
+      versions: { clerk: "0.15.18", marko: "0.15.18" },
+      hindsightExists: true,
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    // Every rolled agent's bank was (idempotently) ensured.
+    expect(ensureBankCalls.sort()).toEqual(["clerk", "marko"]);
+  });
+
+  it("a simulated skipped/missing bank is retried by ensure-banks and ends present", async () => {
+    // Model the exact hole: `marko`'s in-container reconcile ran while
+    // hindsight was down, so its bank was skipped and is MISSING the first
+    // time ensure-banks asks — then the idempotent create makes it present.
+    const seen: Record<string, number> = {};
+    const steps = planRollout(["clerk", "marko"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18", marko: "0.15.18" },
+      hindsightExists: true,
+      ensureBank: (agent) => {
+        seen[agent] = (seen[agent] ?? 0) + 1;
+        // marko is missing until the create runs; createBank is idempotent and
+        // succeeds — so the step reports it present.
+        return { ok: true as const };
+      },
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.failedStep).toBeUndefined();
+    // The backstop actually asked about the at-risk agent.
+    expect(seen["marko"]).toBe(1);
+  });
+
+  it("a bank that STAYS missing after retry FAILS the roll structurally (not a CLI instruction)", async () => {
+    const steps = planRollout(["clerk", "marko"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18", marko: "0.15.18" },
+      hindsightExists: true,
+      // marko's bank cannot be created even after the retry.
+      ensureBank: (agent) =>
+        agent === "marko"
+          ? { ok: false as const, reason: "create_bank returned error: schema mismatch" }
+          : { ok: true as const },
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    // Structured failure — the SAME class as verify-components drift.
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("ensure-banks");
+    // The residue is the agent name(s), carried on `drifted[]` — the structured
+    // surface, NOT a free-text `agent reconcile marko` instruction.
+    expect(r.drifted).toEqual(["marko"]);
+    expect(r.warnings.join(" ")).not.toMatch(/agent reconcile/);
+    // The agents DID reach the target — this is a forward-fix residue, not a
+    // "stopped partway" stop, so `rolled` is reported in full.
+    expect(r.rolled).toEqual(["clerk", "marko"]);
+  });
+
+  it("an UNREACHABLE probe degrades to a warning, not a roll failure", async () => {
+    const steps = planRollout(["clerk"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      ensureBank: () => ({ ok: false as const, reason: "Unreachable" }),
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    // A transient probe miss is not proof the bank is absent — each agent's own
+    // reconcile already had its chance — so the roll still SUCCEEDS with a
+    // named warning rather than a false-negative structural failure.
+    expect(r.ok).toBe(true);
+    expect(r.drifted).toBeUndefined();
+    expect(r.warnings.join(" ")).toMatch(/could not reach Hindsight/);
+  });
+
+  it("a TIMEOUT probe also degrades to a warning (couldn't verify, not a rejection)", async () => {
+    const steps = planRollout(["clerk"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      // createBank normalizes an aborted probe to reason "Timeout".
+      ensureBank: () => ({ ok: false as const, reason: "Timeout" }),
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.drifted).toBeUndefined();
+    expect(r.warnings.join(" ")).toMatch(/could not reach Hindsight/);
+  });
+
+  it("no-ops (never calls ensureBank) when no hindsight container exists", async () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, ensureBankCalls } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: false,
+      // Would FAIL every bank — but the step must not run at all without a
+      // hindsight container, so this is never consulted.
+      ensureBank: () => ({ ok: false as const, reason: "should not be called" }),
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(ensureBankCalls).toEqual([]);
+  });
+
+  it("warns (does not silently pass) when hindsight exists but the ensureBank hook is unwired", async () => {
+    const steps = planRollout(["clerk"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      ensureBank: null, // no hook wired
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.join(" ")).toMatch(/NO bank-ensure hook wired/);
+  });
+
+  it("runs ensure-banks on the hostd path too, failing structurally on a stuck bank", async () => {
+    const steps = planRollout(["clerk", "test-harness"], { hostdContext: true });
+    const { deps } = harness({
+      versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
+      hindsightExists: true,
+      ensureBank: (agent) =>
+        agent === "clerk"
+          ? { ok: false as const, reason: "create_bank returned error: boom" }
+          : { ok: true as const },
+    });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("ensure-banks");
+    expect(r.drifted).toEqual(["clerk"]);
   });
 });
 
@@ -472,7 +668,7 @@ describe("executeRollout — refresh-hindsight (#2752)", () => {
 describe("planRollout — hostd context (#2487)", () => {
   const TARGET = "v0.15.18";
 
-  it("persists the pin AFTER the canary, not before", () => {
+  it("persists the pin AFTER the canary, not before", async () => {
     const steps = planRollout(["clerk", "test-harness"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -480,25 +676,30 @@ describe("planRollout — hostd context (#2487)", () => {
     const kinds = steps.map((s) =>
       s.kind === "restart-agent" ? `r:${s.agent}` : s.kind,
     );
-    // apply → canary (test-harness) → persist-pin → rest → refresh-web →
-    // refresh-hindsight → sweep → verify-components.
+    // apply → refresh-hindsight → canary (test-harness) → persist-pin → rest →
+    // refresh-web → sweep → ensure-banks → verify-components.
+    // (Ordering fix: hindsight recreated BEFORE any restart; persist-pin still
+    // strictly after the canary; ensure-banks the terminal backstop.)
     expect(kinds).toEqual([
       "apply",
+      "refresh-hindsight",
       "r:test-harness",
       "persist-pin",
       "r:clerk",
       "refresh-web",
-      "refresh-hindsight",
       "sweep",
+      "ensure-banks",
       "verify-components",
     ]);
     // persist-pin comes strictly AFTER the canary restart.
     const persistIdx = kinds.indexOf("persist-pin");
     const canaryIdx = kinds.indexOf("r:test-harness");
     expect(persistIdx).toBeGreaterThan(canaryIdx);
+    // refresh-hindsight comes strictly BEFORE the canary (ordering fix).
+    expect(kinds.indexOf("refresh-hindsight")).toBeLessThan(canaryIdx);
   });
 
-  it("DROPS the hostd refresh step (deferred — would SIGKILL itself) but KEEPS refresh-web", () => {
+  it("DROPS the hostd refresh step (deferred — would SIGKILL itself) but KEEPS refresh-web", async () => {
     const kinds = planRollout(["clerk", "marko"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -511,19 +712,23 @@ describe("planRollout — hostd context (#2487)", () => {
     expect(kinds).toContain("refresh-web");
   });
 
-  it("refresh-web lands AFTER all agent restarts and BEFORE refresh-hindsight", () => {
+  it("refresh-web lands AFTER all agent restarts; refresh-hindsight lands BEFORE the first", async () => {
     const steps = planRollout(["clerk", "marko", "test-harness"], {
       pinToPersist: TARGET,
       hostdContext: true,
     });
     const kinds = steps.map((s) => s.kind);
     const webIdx = kinds.indexOf("refresh-web");
+    const firstRestartIdx = kinds.indexOf("restart-agent");
     const lastRestartIdx = kinds.lastIndexOf("restart-agent");
     expect(webIdx).toBeGreaterThan(lastRestartIdx);
-    expect(webIdx).toBeLessThan(kinds.indexOf("refresh-hindsight"));
+    // Ordering fix: hindsight is recreated up front, before the restart loop —
+    // so it is now BEFORE the first restart and BEFORE refresh-web.
+    expect(kinds.indexOf("refresh-hindsight")).toBeLessThan(firstRestartIdx);
+    expect(kinds.indexOf("refresh-hindsight")).toBeLessThan(webIdx);
   });
 
-  it("skipWeb drops refresh-web on the hostd path too", () => {
+  it("skipWeb drops refresh-web on the hostd path too", async () => {
     const kinds = planRollout(["clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -534,7 +739,7 @@ describe("planRollout — hostd context (#2487)", () => {
     expect(kinds).toContain("refresh-hindsight");
   });
 
-  it("RECREATES the hindsight singleton (standalone docker run — hostd can recreate it)", () => {
+  it("RECREATES the hindsight singleton (standalone docker run — hostd can recreate it)", async () => {
     const steps = planRollout(["clerk", "marko"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -544,11 +749,12 @@ describe("planRollout — hostd context (#2487)", () => {
     // socket — it must be rolled so the memory backend isn't left a version
     // behind (unlike refresh-hostd, which stays host-side/self-bump).
     expect(kinds).toContain("refresh-hindsight");
-    // ...and it lands immediately before the final sweep.
-    expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("sweep") - 1);
+    // ...and (ordering fix) it lands immediately after apply, before the
+    // restart loop — so the memory backend is healthy while agents reconcile.
+    expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("apply") + 1);
   });
 
-  it("host-shell path is unchanged — persist FIRST, web/hostd present", () => {
+  it("host-shell path is unchanged — persist FIRST, web/hostd present", async () => {
     const kinds = planRollout(["clerk", "test-harness"], {
       pinToPersist: TARGET,
     }).map((s) => s.kind);
@@ -561,7 +767,7 @@ describe("planRollout — hostd context (#2487)", () => {
 describe("executeRollout — hostd context (#2487)", () => {
   const TARGET = "v0.15.18";
 
-  it("apply uses one-shot --pin + --compose-only --non-interactive (pin not yet persisted; scaffold unwritable under hostd)", () => {
+  it("apply uses one-shot --pin + --compose-only --non-interactive (pin not yet persisted; scaffold unwritable under hostd)", async () => {
     const steps = planRollout(["clerk", "test-harness"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -569,7 +775,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     // #2745: a version roll only regenerates compose (image tags +
     // compose-level env + healthcheck). It must NOT run the per-agent
@@ -579,7 +785,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     expect(runs[0]).toEqual(["apply", "--pin", TARGET, "--compose-only", "--non-interactive"]);
   });
 
-  it("surfaces a WARNING that per-agent template changes need a host-side apply (compose-only tradeoff)", () => {
+  it("surfaces a WARNING that per-agent template changes need a host-side apply (compose-only tradeoff)", async () => {
     const steps = planRollout(["clerk", "test-harness"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -587,17 +793,17 @@ describe("executeRollout — hostd context (#2487)", () => {
     const { deps } = harness({
       versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     expect(r.warnings.some((w) => /compose-only/.test(w) && /host-side/.test(w))).toBe(true);
   });
 
-  it("host-shell path keeps the bare apply — no --compose-only, no tradeoff warning", () => {
+  it("host-shell path keeps the bare apply — no --compose-only, no tradeoff warning", async () => {
     const steps = planRollout(["clerk", "test-harness"], { pinToPersist: TARGET });
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, {});
+    const r = await executeRollout(steps, TARGET, deps, {});
     expect(r.ok).toBe(true);
     // bare apply reads the already-persisted pin; a privileged host shell
     // CAN scaffold, so no compose-only downgrade and no tradeoff warning.
@@ -605,7 +811,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     expect(r.warnings.some((w) => /compose-only/.test(w))).toBe(false);
   });
 
-  it("does NOT persist the pin when the canary FAILS its version assert", () => {
+  it("does NOT persist the pin when the canary FAILS its version assert", async () => {
     const steps = planRollout(["test-harness", "clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -614,7 +820,7 @@ describe("executeRollout — hostd context (#2487)", () => {
       // canary (test-harness) comes back stale → roll STOPS before persist.
       versions: { "test-harness": "0.15.17", clerk: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(false);
     expect(r.failedAgent).toBe("test-harness");
     expect(r.rolled).toEqual([]);
@@ -624,7 +830,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     expect(runs).not.toContainEqual(["agent", "restart", "clerk", "--wait", "--force"]);
   });
 
-  it("persists the pin once the canary is GREEN, then rolls the rest", () => {
+  it("persists the pin once the canary is GREEN, then rolls the rest", async () => {
     const steps = planRollout(["test-harness", "clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -632,7 +838,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     const { deps, persisted } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     expect(r.rolled).toEqual(["test-harness", "clerk"]);
     expect(persisted).toEqual([TARGET]); // persisted exactly once, after canary
@@ -643,7 +849,7 @@ describe("executeRollout — hostd context (#2487)", () => {
   // `agent restart` so the in-restart compose regeneration uses the TARGET
   // image tag and not the stale release.pin still in switchroom.yaml (the
   // durable persist-pin step runs AFTER the canary on this path).
-  it("restart-agent passes --pin <target> on the hostd path (#2558 regression)", () => {
+  it("restart-agent passes --pin <target> on the hostd path (#2558 regression)", async () => {
     const steps = planRollout(["test-harness", "clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -651,7 +857,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     const { deps, runs } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     // Every restart-agent invocation on the hostd path must carry --pin.
     const restartRuns = runs.filter((a) => a[0] === "agent" && a[1] === "restart");
     expect(restartRuns.length).toBeGreaterThan(0);
@@ -665,7 +871,7 @@ describe("executeRollout — hostd context (#2487)", () => {
   // apply, so bare restart reads the correct pin from config. Passing --pin
   // there is harmless, but the contract is bare restart (no --pin flag) so
   // the operator's PATH is unaffected.
-  it("restart-agent does NOT pass --pin on the host-shell path (pin already persisted)", () => {
+  it("restart-agent does NOT pass --pin on the host-shell path (pin already persisted)", async () => {
     const steps = planRollout(["test-harness", "clerk"], {
       pinToPersist: TARGET,
       // hostdContext NOT set → host-shell path
@@ -673,7 +879,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     const { deps, runs } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
     });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     const restartRuns = runs.filter((a) => a[0] === "agent" && a[1] === "restart");
     expect(restartRuns.length).toBeGreaterThan(0);
     for (const run of restartRuns) {
@@ -685,7 +891,7 @@ describe("executeRollout — hostd context (#2487)", () => {
   // separate compose project with no parent/child relation to hostd, so the
   // recreate cannot SIGKILL the in-flight roll). Assert the executor really
   // invokes `webd install --tag <target>` on this path.
-  it("runs `webd install --tag <target>` on the hostd path (web no longer left stale)", () => {
+  it("runs `webd install --tag <target>` on the hostd path (web no longer left stale)", async () => {
     const steps = planRollout(["test-harness", "clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -693,7 +899,7 @@ describe("executeRollout — hostd context (#2487)", () => {
     const { deps, runs } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
     // ...and hostd install is NOT run (deferred — would SIGKILL itself).
@@ -703,13 +909,13 @@ describe("executeRollout — hostd context (#2487)", () => {
   // Rollback rolls must FORWARD --allow-downgrade to the singleton
   // installers: their downgrade guard otherwise guard-skips with exit 0 and
   // web/hostd silently stay on the NEWER tag (silent staleness, inverted).
-  it("forwards --allow-downgrade to webd install on a downgrade roll (hostd path)", () => {
+  it("forwards --allow-downgrade to webd install on a downgrade roll (hostd path)", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18" },
       webImageTag: TARGET,
     });
-    const r = executeRollout(steps, TARGET, deps, {
+    const r = await executeRollout(steps, TARGET, deps, {
       hostdContext: true,
       allowDowngrade: true,
     });
@@ -723,24 +929,24 @@ describe("executeRollout — hostd context (#2487)", () => {
     ]);
   });
 
-  it("forwards --allow-downgrade to webd + hostd install on the host-shell path", () => {
+  it("forwards --allow-downgrade to webd + hostd install on the host-shell path", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18" },
       webImageTag: TARGET,
     });
-    executeRollout(steps, TARGET, deps, { allowDowngrade: true });
+    await executeRollout(steps, TARGET, deps, { allowDowngrade: true });
     expect(runs).toContainEqual(["webd", "install", "--tag", TARGET, "--allow-downgrade"]);
     expect(runs).toContainEqual(["hostd", "install", "--tag", TARGET, "--allow-downgrade"]);
   });
 
-  it("does NOT pass --allow-downgrade on a normal (non-rollback) roll", () => {
+  it("does NOT pass --allow-downgrade on a normal (non-rollback) roll", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18" },
       webImageTag: TARGET,
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
     expect(runs.some((a) => a.includes("--allow-downgrade"))).toBe(false);
   });
@@ -748,7 +954,7 @@ describe("executeRollout — hostd context (#2487)", () => {
   // Belt-and-braces: webd install exits 0 on a downgrade-guard skip, so the
   // executor probes the RUNNING web tag after the install and warns loudly
   // on any skew from the roll target.
-  it("warns LOUDLY when web is left on a different version despite exit 0 (guard.skip)", () => {
+  it("warns LOUDLY when web is left on a different version despite exit 0 (guard.skip)", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
     const { deps } = harness({
       versions: { clerk: "0.15.18" },
@@ -756,35 +962,35 @@ describe("executeRollout — hostd context (#2487)", () => {
       // a rollback where the flag wasn't honored.
       webImageTag: "v0.15.19",
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     const w = r.warnings.find((x) => /running v0\.15\.19, NOT the roll target/.test(x));
     expect(w).toBeTruthy();
     expect(w).toContain(`switchroom webd install --tag ${TARGET} --allow-downgrade`);
   });
 
-  it("no skew warning when web lands on the target (or the probe is unavailable)", () => {
+  it("no skew warning when web lands on the target (or the probe is unavailable)", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
     const onTarget = harness({ versions: { clerk: "0.15.18" }, webImageTag: TARGET });
-    const r1 = executeRollout(steps, TARGET, onTarget.deps, { hostdContext: true });
+    const r1 = await executeRollout(steps, TARGET, onTarget.deps, { hostdContext: true });
     expect(r1.warnings.some((w) => /NOT the roll target/.test(w))).toBe(false);
     // Probe null (web absent/unreadable) → no false-positive warning.
     const noProbe = harness({ versions: { clerk: "0.15.18" }, webImageTag: null });
-    const r2 = executeRollout(steps, TARGET, noProbe.deps, { hostdContext: true });
+    const r2 = await executeRollout(steps, TARGET, noProbe.deps, { hostdContext: true });
     expect(r2.warnings.some((w) => /NOT the roll target/.test(w))).toBe(false);
   });
 
-  it("emits a web-refresh phase so narration doesn't go silent during the recreate", () => {
+  it("emits a web-refresh phase so narration doesn't go silent during the recreate", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
     const { deps, phases } = harness({
       versions: { clerk: "0.15.18" },
       webImageTag: TARGET,
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(phases.some((p) => p.phase === "web-refresh" && p.target === TARGET)).toBe(true);
   });
 
-  it("a failed web refresh on the hostd path stays NON-FATAL and names the host-side command", () => {
+  it("a failed web refresh on the hostd path stays NON-FATAL and names the host-side command", async () => {
     const steps = planRollout(["clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -793,7 +999,7 @@ describe("executeRollout — hostd context (#2487)", () => {
       versions: { clerk: "0.15.18" },
       runStatus: (args) => (args[0] === "webd" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true); // agents already rolled — stale web isn't fatal
     const w = r.warnings.find((x) => /web refresh FAILED/.test(x));
     expect(w).toBeTruthy();
@@ -802,7 +1008,7 @@ describe("executeRollout — hostd context (#2487)", () => {
 });
 
 describe("rollout structured-result sentinel (#2487)", () => {
-  it("round-trips a successful result through encode/parse", () => {
+  it("round-trips a successful result through encode/parse", async () => {
     const result: RolloutResult = {
       ok: true,
       rolled: ["test-harness", "clerk"],
@@ -818,7 +1024,7 @@ describe("rollout structured-result sentinel (#2487)", () => {
     });
   });
 
-  it("round-trips a FAILED result with failedAgent/failedStep", () => {
+  it("round-trips a FAILED result with failedAgent/failedStep", async () => {
     const result: RolloutResult = {
       ok: false,
       rolled: ["test-harness"],
@@ -836,11 +1042,11 @@ describe("rollout structured-result sentinel (#2487)", () => {
     });
   });
 
-  it("returns null when no sentinel line is present (child died early)", () => {
+  it("returns null when no sentinel line is present (child died early)", async () => {
     expect(parseRolloutResultLine("Rolling 3 agents…\napply\n")).toBeNull();
   });
 
-  it("round-trips `drifted` so hostd can name the stranded components (#3928)", () => {
+  it("round-trips `drifted` so hostd can name the stranded components (#3928)", async () => {
     // hostd learns the roll's outcome ONLY from this line. If `drifted`
     // does not survive the round-trip, the Telegram card can say "failed"
     // but never say WHAT is still behind — which is the whole point.
@@ -917,14 +1123,14 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
     ];
   }
 
-  it("FAILS the roll and names both stranded components — the exact #3928 host", () => {
+  it("FAILS the roll and names both stranded components — the exact #3928 host", async () => {
     const steps = planRollout(["test-harness", "klanker"]);
     const { deps, logs } = harness({
       versions: { "test-harness": "0.19.30", klanker: "0.19.30" },
       components: referenceHost(),
     });
 
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
 
     // THE assertion #3928 is about: this roll exited 0 before the fix.
     expect(r.ok).toBe(false);
@@ -947,7 +1153,7 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
     expect(logs.join("\n")).toContain("verify-components");
   });
 
-  it("exits green when the same host has actually converged", () => {
+  it("exits green when the same host has actually converged", async () => {
     const steps = planRollout(["test-harness", "klanker"]);
     const { deps } = harness({
       versions: { "test-harness": "0.19.30", klanker: "0.19.30" },
@@ -961,12 +1167,12 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
           : c,
       ),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.drifted).toBeUndefined();
   });
 
-  it("gates the autoheal sidecar on the HOSTD-DRIVEN path too, where refresh-hostd is absent", () => {
+  it("gates the autoheal sidecar on the HOSTD-DRIVEN path too, where refresh-hostd is absent", async () => {
     // The #3928 roll was driven from hostd. Its plan deliberately omits
     // `refresh-hostd` (recreating hostd would SIGKILL the in-flight roll),
     // so a scope derived from "steps present" alone would exempt the
@@ -980,12 +1186,12 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
       versions: { "test-harness": "0.19.30", klanker: "0.19.30" },
       components: referenceHost({ webBehind: false }),
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(false);
     expect(r.drifted).toEqual(["switchroom-hindsight-autoheal"]);
   });
 
-  it("does NOT revert the durable pin when only the drift gate failed", () => {
+  it("does NOT revert the durable pin when only the drift gate failed", async () => {
     // The fleet DID reach the target. Reverting the pin here would drag
     // every later `agent restart` / reconcile back onto the old build —
     // strictly worse than the bug being fixed. The gate therefore sits
@@ -996,13 +1202,13 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
       versions: { "test-harness": "0.19.30" },
       components: referenceHost(),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe(VERIFY_COMPONENTS_STEP);
     expect(persisted).toEqual([TARGET]);
   });
 
-  it("reports an out-of-scope component as a WARNING, not a failure", () => {
+  it("reports an out-of-scope component as a WARNING, not a failure", async () => {
     // `--skip-web` is an explicit opt-out, so web must not fail the roll —
     // but "you skipped it and it is behind" is information the operator
     // still needs, so it is a named warning carrying the fix command.
@@ -1013,7 +1219,7 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
         (c) => c.name !== "switchroom-hindsight-autoheal",
       ),
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.warnings.join("\n")).toContain("switchroom-web");
     expect(r.warnings.join("\n")).toContain(
@@ -1021,7 +1227,7 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
     );
   });
 
-  it("does not blame a roll for an agent it was never asked to touch", () => {
+  it("does not blame a roll for an agent it was never asked to touch", async () => {
     const steps = planRollout(["klanker"]);
     const { deps } = harness({
       versions: { klanker: "0.19.30" },
@@ -1040,18 +1246,18 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
         },
       ],
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.warnings.join("\n")).toContain("switchroom-somebody-else");
   });
 
-  it("WARNS LOUDLY rather than passing silently when no collector is wired", () => {
+  it("WARNS LOUDLY rather than passing silently when no collector is wired", async () => {
     // A missing inventory must never read as "converged". This is the
     // fail-open hole that would quietly restore #3928.
     const steps = planRollout(["klanker"]);
     const { deps } = harness({ versions: { klanker: "0.19.30" } });
     delete (deps as { collectComponents?: unknown }).collectComponents;
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     // A WARNING, not just a log line: warnings ride the result sentinel to
     // hostd and onto the Telegram card, so the operator learns the roll was
@@ -1061,20 +1267,20 @@ describe("executeRollout — terminal component-drift gate (#3928)", () => {
     expect(warned).toContain("switchroom update --check");
   });
 
-  it("survives a docker-less host: a THROWING collector warns, never crashes the roll", () => {
+  it("survives a docker-less host: a THROWING collector warns, never crashes the roll", async () => {
     const steps = planRollout(["klanker"]);
     const { deps } = harness({ versions: { klanker: "0.19.30" } });
     deps.collectComponents = () => {
       throw new Error("docker: command not found");
     };
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.warnings.join("\n")).toContain("docker: command not found");
   });
 });
 
 describe("evaluateRolloutDrift (#3928, pure)", () => {
-  it("normalizes a bare target so a `0.19.30` roll is not read as drift", () => {
+  it("normalizes a bare target so a `0.19.30` roll is not read as drift", async () => {
     const verdict = evaluateRolloutDrift(
       [
         {
@@ -1098,31 +1304,31 @@ describe("evaluateRolloutDrift (#3928, pure)", () => {
 describe("shouldRefuseDowngrade (#2487 PR2)", () => {
   const CURRENT = "v0.15.18";
 
-  it("refuses a concrete downgrade when hostdCtx=true and flag is absent", () => {
+  it("refuses a concrete downgrade when hostdCtx=true and flag is absent", async () => {
     expect(shouldRefuseDowngrade(true, "v0.15.16", CURRENT, undefined)).toBe(true);
   });
 
-  it("allows the same downgrade when allow_downgrade=true (operator approved)", () => {
+  it("allows the same downgrade when allow_downgrade=true (operator approved)", async () => {
     expect(shouldRefuseDowngrade(true, "v0.15.16", CURRENT, true)).toBe(false);
   });
 
-  it("never refuses an upgrade (newer pin)", () => {
+  it("never refuses an upgrade (newer pin)", async () => {
     expect(shouldRefuseDowngrade(true, "v0.15.20", CURRENT, undefined)).toBe(false);
   });
 
-  it("never refuses when compareReleaseTags returns null (sha/channel pins)", () => {
+  it("never refuses when compareReleaseTags returns null (sha/channel pins)", async () => {
     // sha pin — compareReleaseTags returns null → guard never fires
     expect(shouldRefuseDowngrade(true, "sha-abc1234", CURRENT, undefined)).toBe(false);
     // channel/floating — also returns null
     expect(shouldRefuseDowngrade(true, "latest", CURRENT, undefined)).toBe(false);
   });
 
-  it("host-shell path (hostdCtx=false) is never gated regardless of pin vs current", () => {
+  it("host-shell path (hostdCtx=false) is never gated regardless of pin vs current", async () => {
     expect(shouldRefuseDowngrade(false, "v0.15.16", CURRENT, undefined)).toBe(false);
     expect(shouldRefuseDowngrade(false, "v0.15.16", CURRENT, false)).toBe(false);
   });
 
-  it("never refuses when pin is absent (target comes from config, not --pin)", () => {
+  it("never refuses when pin is absent (target comes from config, not --pin)", async () => {
     expect(shouldRefuseDowngrade(true, undefined, CURRENT, undefined)).toBe(false);
   });
 });
@@ -1130,43 +1336,43 @@ describe("shouldRefuseDowngrade (#2487 PR2)", () => {
 // ── shouldRefuseStaleCli — driving CLI older than the target (#2542) ────────
 
 describe("shouldRefuseStaleCli (#2542)", () => {
-  it("refuses when the driving CLI is strictly older than the target", () => {
+  it("refuses when the driving CLI is strictly older than the target", async () => {
     // The exact incident: hostd CLI 0.15.48 driving a roll to v0.15.59.
     expect(shouldRefuseStaleCli("0.15.48", "v0.15.59")).toBe(true);
   });
 
-  it("normalizes the v-prefix on both sides (build-info has no v, --pin does)", () => {
+  it("normalizes the v-prefix on both sides (build-info has no v, --pin does)", async () => {
     expect(shouldRefuseStaleCli("v0.15.48", "v0.15.59")).toBe(true);
     expect(shouldRefuseStaleCli("0.15.48", "0.15.59")).toBe(true);
   });
 
-  it("allows when the CLI is the same version as the target", () => {
+  it("allows when the CLI is the same version as the target", async () => {
     expect(shouldRefuseStaleCli("0.15.59", "v0.15.59")).toBe(false);
   });
 
-  it("allows when the CLI is NEWER than the target (a downgrade — other guard's job)", () => {
+  it("allows when the CLI is NEWER than the target (a downgrade — other guard's job)", async () => {
     expect(shouldRefuseStaleCli("0.15.59", "v0.15.48")).toBe(false);
   });
 
-  it("never fires when either side is unorderable (dev/sha/channel/garbage)", () => {
+  it("never fires when either side is unorderable (dev/sha/channel/garbage)", async () => {
     expect(shouldRefuseStaleCli("sha-abc1234", "v0.15.59")).toBe(false);
     expect(shouldRefuseStaleCli("0.15.48", "latest")).toBe(false);
     expect(shouldRefuseStaleCli("dev", "v0.15.59")).toBe(false);
     expect(shouldRefuseStaleCli("not-a-version", "v0.15.59")).toBe(false);
   });
 
-  it("never fires when the CLI version is missing", () => {
+  it("never fires when the CLI version is missing", async () => {
     expect(shouldRefuseStaleCli(undefined, "v0.15.59")).toBe(false);
     expect(shouldRefuseStaleCli("", "v0.15.59")).toBe(false);
   });
 
-  it("compares across minor/major boundaries, not lexically", () => {
+  it("compares across minor/major boundaries, not lexically", async () => {
     expect(shouldRefuseStaleCli("0.9.9", "v0.15.0")).toBe(true); // 0.9 < 0.15 (not string compare)
     expect(shouldRefuseStaleCli("0.15.9", "v0.15.10")).toBe(true); // patch 9 < 10
     expect(shouldRefuseStaleCli("1.0.0", "v0.15.59")).toBe(false); // major 1 > 0
   });
 
-  it("the refusal step label is the stable structured-status value", () => {
+  it("the refusal step label is the stable structured-status value", async () => {
     expect(PREFLIGHT_STALE_CLI_STEP).toBe("preflight-stale-cli");
   });
 });
@@ -1176,41 +1382,41 @@ describe("shouldRefuseStaleCli (#2542)", () => {
 describe("executeRollout — ROLL_STEP greppable step markers (#2459)", () => {
   const TARGET = "v0.15.18";
 
-  it("emits ROLL_STEP apply on the apply step", () => {
+  it("emits ROLL_STEP apply on the apply step", async () => {
     const steps = planRollout(["clerk"]);
     const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     const applyLog = logs.find((l) => l.startsWith("ROLL_STEP apply"));
     expect(applyLog).toBeTruthy();
   });
 
-  it("emits ROLL_STEP restart-agent on each restart step", () => {
+  it("emits ROLL_STEP restart-agent on each restart step", async () => {
     const steps = planRollout(["clerk", "marko"]);
     const { deps, logs } = harness({ versions: { clerk: "0.15.18", marko: "0.15.18" } });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     const restartLogs = logs.filter((l) => l.startsWith("ROLL_STEP restart-agent"));
     expect(restartLogs.length).toBe(2);
   });
 
-  it("emits ROLL_STEP refresh-web and ROLL_STEP refresh-hostd", () => {
+  it("emits ROLL_STEP refresh-web and ROLL_STEP refresh-hostd", async () => {
     const steps = planRollout(["clerk"]);
     const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     expect(logs.some((l) => l.startsWith("ROLL_STEP refresh-web"))).toBe(true);
     expect(logs.some((l) => l.startsWith("ROLL_STEP refresh-hostd"))).toBe(true);
   });
 
-  it("emits ROLL_STEP sweep on the sweep step", () => {
+  it("emits ROLL_STEP sweep on the sweep step", async () => {
     const steps = planRollout(["clerk"]);
     const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     expect(logs.some((l) => l.startsWith("ROLL_STEP sweep"))).toBe(true);
   });
 
-  it("emits ROLL_STEP persist-pin when a pinToPersist step is present", () => {
+  it("emits ROLL_STEP persist-pin when a pinToPersist step is present", async () => {
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
     const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     expect(logs.some((l) => l.startsWith("ROLL_STEP persist-pin"))).toBe(true);
   });
 });
@@ -1247,7 +1453,7 @@ describe("resolveRollbackTarget (#2492)", () => {
     });
   }
 
-  it("returns the prior_pin from the most-recent completed rollout terminal row", () => {
+  it("returns the prior_pin from the most-recent completed rollout terminal row", async () => {
     const logContent =
       completedRolloutLine("v0.15.16", "roll-1") +
       "\n" +
@@ -1261,7 +1467,7 @@ describe("resolveRollbackTarget (#2492)", () => {
     expect(result).toBe("v0.15.17");
   });
 
-  it("skips error rows (no prior_pin) and finds the last completed row", () => {
+  it("skips error rows (no prior_pin) and finds the last completed row", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
     const logPath = join(tmp, "audit.log");
     const logContent =
@@ -1276,18 +1482,18 @@ describe("resolveRollbackTarget (#2492)", () => {
     expect(result).toBe("v0.15.16");
   });
 
-  it("returns null when no completed rollout rows exist", () => {
+  it("returns null when no completed rollout rows exist", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
     const logPath = join(tmp, "audit.log");
     writeFileSync(logPath, failedRolloutLine() + "\n");
     expect(resolveRollbackTarget(logPath)).toBeNull();
   });
 
-  it("returns null when the audit log does not exist", () => {
+  it("returns null when the audit log does not exist", async () => {
     expect(resolveRollbackTarget("/nonexistent/path/audit.log")).toBeNull();
   });
 
-  it("returns null when the log is empty", () => {
+  it("returns null when the log is empty", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
     const logPath = join(tmp, "audit.log");
     writeFileSync(logPath, "");
@@ -1298,7 +1504,7 @@ describe("resolveRollbackTarget (#2492)", () => {
 // ── #2726 — per-phase emission + phase sentinel (durable observability) ──────
 
 describe("rollout phase sentinel", () => {
-  it("PHASE and RESULT sentinels are lexically disjoint (neither prefixes the other)", () => {
+  it("PHASE and RESULT sentinels are lexically disjoint (neither prefixes the other)", async () => {
     // The terminal parser keys on `startsWith(ROLLOUT_RESULT_SENTINEL)`; the
     // phase parser keys on `startsWith(ROLLOUT_PHASE_SENTINEL)`. If either were
     // a prefix of the other, a line could cross-match. Assert disjointness.
@@ -1306,14 +1512,14 @@ describe("rollout phase sentinel", () => {
     expect(ROLLOUT_RESULT_SENTINEL.startsWith(ROLLOUT_PHASE_SENTINEL)).toBe(false);
   });
 
-  it("a phase line does NOT parse as the terminal RESULT sentinel", () => {
+  it("a phase line does NOT parse as the terminal RESULT sentinel", async () => {
     const phaseLine = encodeRolloutPhaseLine({ phase: "apply", target: "v1.2.3" });
     // The terminal parser must return null for a phase line — a phase row can
     // never be mistaken for the terminal sentinel.
     expect(parseRolloutResultLine(phaseLine)).toBeNull();
   });
 
-  it("the terminal RESULT line does NOT parse as a phase sentinel", () => {
+  it("the terminal RESULT line does NOT parse as a phase sentinel", async () => {
     const resultLine = encodeRolloutResultLine({
       ok: true,
       rolled: ["clerk"],
@@ -1322,7 +1528,7 @@ describe("rollout phase sentinel", () => {
     expect(parseRolloutPhaseLine(resultLine)).toBeNull();
   });
 
-  it("adversarial embed: a phase field value carrying a newline + RESULT sentinel does NOT corrupt the terminal parse", () => {
+  it("adversarial embed: a phase field value carrying a newline + RESULT sentinel does NOT corrupt the terminal parse", async () => {
     // The no-terminal-parse-corruption property is safe TODAY because
     // RolloutPhase has no free-text field. This test LOCKS it: if a future
     // field ever carried attacker/free-text and someone embedded the terminal
@@ -1350,7 +1556,7 @@ describe("rollout phase sentinel", () => {
     }
   });
 
-  it("round-trips a phase with agent/n/m", () => {
+  it("round-trips a phase with agent/n/m", async () => {
     const phase: RolloutPhase = {
       phase: "agent-start",
       target: "v1.2.3",
@@ -1362,7 +1568,7 @@ describe("rollout phase sentinel", () => {
     expect(parsed).toEqual(phase);
   });
 
-  it("rejects malformed JSON and unknown phase names", () => {
+  it("rejects malformed JSON and unknown phase names", async () => {
     expect(parseRolloutPhaseLine(ROLLOUT_PHASE_SENTINEL + "{not json")).toBeNull();
     expect(
       parseRolloutPhaseLine(ROLLOUT_PHASE_SENTINEL + JSON.stringify({ phase: "bogus", target: "v1" })),
@@ -1375,7 +1581,7 @@ describe("rollout phase sentinel", () => {
     expect(parseRolloutPhaseLine("just a log line")).toBeNull();
   });
 
-  it("tolerates surrounding whitespace on the line", () => {
+  it("tolerates surrounding whitespace on the line", async () => {
     const line = "  " + encodeRolloutPhaseLine({ phase: "persist-pin", target: "v9.9.9" }) + "  ";
     expect(parseRolloutPhaseLine(line)?.phase).toBe("persist-pin");
   });
@@ -1384,12 +1590,12 @@ describe("rollout phase sentinel", () => {
 describe("executeRollout — phase emission", () => {
   const TARGET = "v0.15.18";
 
-  it("emits apply → canary-start/pass → agent-start/done with n/m", () => {
+  it("emits apply → canary-start/pass → agent-start/done with n/m", async () => {
     const steps = planRollout(["test-harness", "clerk", "marko"]);
     const { deps, phases } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.18", marko: "0.15.18" },
     });
-    executeRollout(steps, TARGET, deps);
+    await executeRollout(steps, TARGET, deps);
     const names = phases.map((p) => p.phase);
     expect(names).toContain("apply");
     // test-harness is the canary (first restart) → canary-start/canary-pass.
@@ -1406,13 +1612,13 @@ describe("executeRollout — phase emission", () => {
     expect(lastDone).toMatchObject({ agent: "marko", n: 3, m: 3 });
   });
 
-  it("emits canary-fail (not agent-done) when the canary mismatches and STOPS", () => {
+  it("emits canary-fail (not agent-done) when the canary mismatches and STOPS", async () => {
     const steps = planRollout(["test-harness", "clerk"]);
     const { deps, phases } = harness({
       // Canary comes back on the WRONG version → stop.
       versions: { "test-harness": "0.15.17", clerk: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     const names = phases.map((p) => p.phase);
     expect(names).toContain("canary-start");
@@ -1422,12 +1628,12 @@ describe("executeRollout — phase emission", () => {
     expect(names).not.toContain("agent-start");
   });
 
-  it("emits agent-done (per-agent stop) when a NON-canary agent mismatches", () => {
+  it("emits agent-done (per-agent stop) when a NON-canary agent mismatches", async () => {
     const steps = planRollout(["test-harness", "clerk"]);
     const { deps, phases } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.17" }, // clerk bad
     });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     const names = phases.map((p) => p.phase);
     expect(names).toContain("canary-pass"); // canary was fine
@@ -1436,62 +1642,64 @@ describe("executeRollout — phase emission", () => {
     expect(clerkDone.length).toBe(1);
   });
 
-  it("emits singleton phases: web-refresh → web-refresh-done, hindsight-refresh → -done", () => {
+  it("emits singleton phases: hindsight-refresh → -done (before restarts), web-refresh → -done (after)", async () => {
     const steps = planRollout(["clerk"], { hostdContext: true });
     const { deps, phases } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: true,
       webImageTag: "v0.15.18", // matches target → observed success
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     const names = phases.map((p) => p.phase);
-    // The card's singleton section is fed by these — order matters.
-    expect(names.indexOf("web-refresh")).toBeGreaterThanOrEqual(0);
-    expect(names.indexOf("web-refresh-done")).toBeGreaterThan(names.indexOf("web-refresh"));
-    expect(names.indexOf("hindsight-refresh")).toBeGreaterThan(names.indexOf("web-refresh-done"));
+    // The card's singleton section is fed by these — order matters. Ordering
+    // fix: hindsight is now refreshed up front (before the restart loop), and
+    // web after it, so hindsight-refresh precedes web-refresh.
+    expect(names.indexOf("hindsight-refresh")).toBeGreaterThanOrEqual(0);
     expect(names.indexOf("hindsight-refresh-done")).toBeGreaterThan(
       names.indexOf("hindsight-refresh"),
     );
+    expect(names.indexOf("web-refresh")).toBeGreaterThan(names.indexOf("hindsight-refresh-done"));
+    expect(names.indexOf("web-refresh-done")).toBeGreaterThan(names.indexOf("web-refresh"));
     expect(names).not.toContain("hindsight-skipped");
   });
 
-  it("emits hindsight-skipped (not -done) when no hindsight container exists", () => {
+  it("emits hindsight-skipped (not -done) when no hindsight container exists", async () => {
     const steps = planRollout(["clerk"], { hostdContext: true });
     const { deps, phases } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: false,
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     const names = phases.map((p) => p.phase);
     expect(names).toContain("hindsight-skipped");
     expect(names).not.toContain("hindsight-refresh");
     expect(names).not.toContain("hindsight-refresh-done");
   });
 
-  it("does NOT emit web-refresh-done when the skew probe disproves the target", () => {
+  it("does NOT emit web-refresh-done when the skew probe disproves the target", async () => {
     const steps = planRollout(["clerk"], { hostdContext: true });
     const { deps, phases } = harness({
       versions: { clerk: "0.15.18" },
       webImageTag: "v0.15.17", // downgrade-guard skip left web behind
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     const names = phases.map((p) => p.phase);
     expect(names).toContain("web-refresh");
     expect(names).not.toContain("web-refresh-done"); // never a fabricated ✓
   });
 
-  it("does NOT emit web-refresh-done when webd install fails", () => {
+  it("does NOT emit web-refresh-done when webd install fails", async () => {
     const steps = planRollout(["clerk"], { hostdContext: true });
     const { deps, phases } = harness({
       versions: { clerk: "0.15.18" },
       runStatus: (args) => (args[0] === "webd" ? 1 : 0),
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(phases.map((p) => p.phase)).not.toContain("web-refresh-done");
   });
 
-  it("does NOT emit web-refresh-done when the web tag probe reads nothing (exit 0 proves nothing)", () => {
+  it("does NOT emit web-refresh-done when the web tag probe reads nothing (exit 0 proves nothing)", async () => {
     // `webd install` exits 0 on a downgrade-guard skip, so a clean exit with
     // an unreadable tag is NOT an observation of success — the terminal
     // verify-components gate resolves it instead.
@@ -1500,14 +1708,14 @@ describe("executeRollout — phase emission", () => {
       versions: { clerk: "0.15.18" },
       webImageTag: null,
     });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
     const names = phases.map((p) => p.phase);
     expect(names).toContain("web-refresh");
     expect(names).not.toContain("web-refresh-done");
   });
 
-  it("round-trips every singleton phase through the sentinel parser", () => {
+  it("round-trips every singleton phase through the sentinel parser", async () => {
     for (const p of [
       "web-refresh-done",
       "hindsight-refresh",
@@ -1521,7 +1729,7 @@ describe("executeRollout — phase emission", () => {
     }
   });
 
-  it("emits a persist-pin phase on the hostd path", () => {
+  it("emits a persist-pin phase on the hostd path", async () => {
     const steps = planRollout(["test-harness", "clerk"], {
       hostdContext: true,
       pinToPersist: TARGET,
@@ -1529,11 +1737,11 @@ describe("executeRollout — phase emission", () => {
     const { deps, phases } = harness({
       versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
     });
-    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    await executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(phases.map((p) => p.phase)).toContain("persist-pin");
   });
 
-  it("does not throw when emitPhase is omitted (older callers)", () => {
+  it("does not throw when emitPhase is omitted (older callers)", async () => {
     const steps = planRollout(["clerk"]);
     const runs: string[][] = [];
     const deps: RolloutDeps = {
@@ -1545,7 +1753,7 @@ describe("executeRollout — phase emission", () => {
       log: () => {},
       // no emitPhase
     };
-    expect(() => executeRollout(steps, TARGET, deps)).not.toThrow();
+    await expect(executeRollout(steps, TARGET, deps)).resolves.toBeDefined();
   });
 });
 
@@ -1634,7 +1842,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
 
-  it("REVERTS the pin when a non-canary agent fails past a green canary (hostd path)", () => {
+  it("REVERTS the pin when a non-canary agent fails past a green canary (hostd path)", async () => {
     // Canary + 2 agents green, then agent 4 comes back on the OLD version.
     const h = pinHarness({
       versions: {
@@ -1651,7 +1859,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
       steps.findIndex((s) => s.kind === "restart-agent" && s.agent === "nadia"),
     );
 
-    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, h.deps, { hostdContext: true });
 
     expect(r.ok).toBe(false);
     expect(r.failedAgent).toBe("nadia");
@@ -1664,7 +1872,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.warnings.join(" ")).toMatch(/REVERTED to the prior version/);
   });
 
-  it("REVERTS the pin when a non-canary restart TIMES OUT past a green canary", () => {
+  it("REVERTS the pin when a non-canary restart TIMES OUT past a green canary", async () => {
     // The timed-out-restart branch (#3605) is a stop-the-roll failure that did
     // not exist when the provisional-pin design was written, and it returned
     // its own result literal rather than going through `fail()`. That made the
@@ -1688,7 +1896,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
           : h.deps.run(args, opts),
     };
 
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     expect(r.ok).toBe(false);
     expect(r.timedOut).toBe(true);
@@ -1700,7 +1908,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.warnings.join(" ")).toMatch(/REVERTED to the prior version/);
   });
 
-  it("createRolloutDeps' persistPin JOURNALS to disk before it writes the pin", () => {
+  it("createRolloutDeps' persistPin JOURNALS to disk before it writes the pin", async () => {
     // The production wiring, exercised directly rather than through a harness
     // that mirrors it. Three separate production lines live here and nothing
     // else covers them: the `beginPinPersist` call itself, its ORDERING
@@ -1746,7 +1954,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
 
-  it("createRolloutDeps' persistPin PRESERVES the config's permission bits", () => {
+  it("createRolloutDeps' persistPin PRESERVES the config's permission bits", async () => {
     // `writeConfigPreservingOwnership` takes the mode as an ARGUMENT, and both
     // supply sites read it off the file being replaced — `persistPin` here
     // (`statSync(configPath).mode & 0o777`) and `rollbackPinPersist`, which
@@ -1785,7 +1993,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
 
-  it("createRolloutDeps' revertPin restores the pin through the ownership-preserving writer", () => {
+  it("createRolloutDeps' revertPin restores the pin through the ownership-preserving writer", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "rollout-revert-state-"));
     process.env.SWITCHROOM_PIN_JOURNAL_DIR = stateDir;
     const dir = mkdtempSync(join(tmpdir(), "rollout-revert-"));
@@ -1832,7 +2040,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
   });
 
-  it("createRolloutDeps' commitPin RETURNS the error, not just warns it", () => {
+  it("createRolloutDeps' commitPin RETURNS the error, not just warns it", async () => {
     // The executor can only promote a failed commit into RolloutResult.warnings
     // if the real deps factory hands the error back. The suite's own harness
     // only MIRRORS that wiring, so without this the production line is covered
@@ -1871,7 +2079,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(warned.join(" ")).toMatch(/FAILED to clear/);
   });
 
-  it("REVERTS the pin when the host-shell path (persist FIRST) fails at apply", () => {
+  it("REVERTS the pin when the host-shell path (persist FIRST) fails at apply", async () => {
     // Worst case called out in the bug report: persist-pin is step 1, so a
     // failed apply used to leave a broken pin with ZERO agents rolled.
     const h = pinHarness({
@@ -1881,7 +2089,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const steps = planRollout(FLEET, { pinToPersist: TARGET });
     expect(steps[0]).toEqual({ kind: "persist-pin", pin: TARGET });
 
-    const r = executeRollout(steps, TARGET, h.deps);
+    const r = await executeRollout(steps, TARGET, h.deps);
 
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("apply");
@@ -1890,7 +2098,13 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.pinReverted).toBe(true);
   });
 
-  it("REVERTS the pin when the hindsight refresh fails after every agent rolled", () => {
+  it("hindsight refresh failure aborts BEFORE persist-pin — no pin to revert, no agent rolled (ordering fix)", async () => {
+    // Ordering fix: on the hostd path refresh-hindsight now runs after `apply`
+    // but BEFORE the canary restart and its persist-pin. A fatal recreate
+    // therefore stops the roll before any provisional pin is written and
+    // before any agent restarts — strictly better than the old terminal
+    // position, which failed AFTER persist-pin (forcing a revert) and AFTER
+    // every agent had already restarted against a now-dead memory backend.
     const h = pinHarness({
       versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
       runStatus: (args) => (args[0] === "memory" ? 1 : 0),
@@ -1898,21 +2112,26 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const deps: RolloutDeps = { ...h.deps, hindsightExists: () => true };
     const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
 
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("refresh-hindsight");
+    // The config still names the prior pin — because it was never rewritten,
+    // not because a provisional write was reverted.
     expect(h.pin()).toBe("v0.19.3");
-    expect(r.pinReverted).toBe(true);
+    // No provisional pin was ever persisted, so nothing was reverted.
+    expect(r.pinReverted).toBeUndefined();
+    // And no agent was touched.
+    expect(r.rolled).toEqual([]);
   });
 
-  it("COMMITS the pin (and clears the journal) only when the whole roll succeeds", () => {
+  it("COMMITS the pin (and clears the journal) only when the whole roll succeeds", async () => {
     const h = pinHarness({
       versions: Object.fromEntries(FLEET.map((a) => [a, "0.19.4"])),
     });
     const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
 
-    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, h.deps, { hostdContext: true });
 
     expect(r.ok).toBe(true);
     expect(r.rolled).toEqual(FLEET);
@@ -1922,7 +2141,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(h.journalled()).toBe(false);
   });
 
-  it("surfaces a commit that could NOT clear the journal in the structured warnings", () => {
+  it("surfaces a commit that could NOT clear the journal in the structured warnings", async () => {
     // A journal surviving a SUCCESSFUL commit is the exact input that makes a
     // later recovery pass revert a PROVEN pin. It used to go only to the
     // `warn` sink (child stderr), which is invisible on the hostd path — the
@@ -1945,7 +2164,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
       },
     };
 
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     // The roll itself SUCCEEDED and the pin is correct…
     expect(r.ok).toBe(true);
@@ -1956,7 +2175,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(r.warnings.join(" ")).toMatch(/The roll SUCCEEDED/);
   });
 
-  it("leaves the journal in place when a crash beats both commit and revert", () => {
+  it("leaves the journal in place when a crash beats both commit and revert", async () => {
     // Model the SIGKILL case: the pin was persisted, then the process died —
     // executeRollout never returned, so neither commit nor revert ran.
     const h = pinHarness({ versions: {} });
@@ -1979,7 +2198,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(h.pin()).toBe("v0.19.3");
   });
 
-  it("does not touch the pin when the roll never persisted one", () => {
+  it("does not touch the pin when the roll never persisted one", async () => {
     // Target came from config.release.pin — nothing to persist, nothing to
     // revert. A failure must not spuriously rewrite the config.
     const h = pinHarness({
@@ -1989,14 +2208,14 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const steps = planRollout(["test-harness"], { hostdContext: true });
     expect(steps.some((s) => s.kind === "persist-pin")).toBe(false);
 
-    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, h.deps, { hostdContext: true });
 
     expect(r.ok).toBe(false);
     expect(r.pinReverted).toBeUndefined();
     expect(h.pin()).toBe(TARGET);
   });
 
-  it("does NOT commit a journal it never wrote", () => {
+  it("does NOT commit a journal it never wrote", async () => {
     // `commitPin` unlinks the journal for this config. A roll that persisted
     // NOTHING (target came from `config.release.pin`) must therefore leave it
     // alone: the journal on disk belongs to an earlier roll that crashed
@@ -2012,7 +2231,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const steps = planRollout(["test-harness"], { hostdContext: true });
     expect(steps.some((s) => s.kind === "persist-pin")).toBe(false);
 
-    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, h.deps, { hostdContext: true });
 
     expect(r.ok).toBe(true);
     expect(h.journalled()).toBe(true);
@@ -2020,7 +2239,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(readPinJournal(h.configPath)?.priorPin).toBe(TARGET);
   });
 
-  it("does NOT commit a journal it never wrote when persist-pin NO-OPS", () => {
+  it("does NOT commit a journal it never wrote when persist-pin NO-OPS", async () => {
     // The narrower — and far likelier — shape of the same defect. Here the
     // plan DOES carry a `persist-pin` step (`--pin` was passed, which hostd
     // always does), but production `persistPin` returns early without
@@ -2045,7 +2264,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     // …and production really does report the no-op.
     expect(h.deps.persistPin?.(TARGET)).toBe(false);
 
-    const r = executeRollout(steps, TARGET, h.deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, h.deps, { hostdContext: true });
 
     expect(r.ok).toBe(true);
     expect(h.pin()).toBe(TARGET);
@@ -2055,7 +2274,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(readPinJournal(h.configPath)?.pin).toBe(TARGET);
   });
 
-  it("warns loudly when the pin was persisted but no revert hook is wired", () => {
+  it("warns loudly when the pin was persisted but no revert hook is wired", async () => {
     const deps: RolloutDeps = {
       run: () => ({ status: 0 }),
       probeVersion: () => "0.0.1",
@@ -2063,12 +2282,12 @@ describe("executeRollout — durable pin is provisional until the roll is proven
       persistPin: () => true,
     };
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.warnings.join(" ")).toMatch(/no revert hook was wired/);
   });
 
-  it("REPORTS a step that THREW instead of dying without a result", () => {
+  it("REPORTS a step that THREW instead of dying without a result", async () => {
     // `beginPinPersist` THROWS by contract when a live roll already holds the
     // journal, and nothing between it and the commander caught that. The
     // exception escaped `executeRollout`, so `encodeRolloutResultLine` never
@@ -2086,10 +2305,15 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
     expect(steps[0]).toEqual({ kind: "persist-pin", pin: TARGET });
 
+    // executeRollout is async and swallows a step's throw internally (routing
+    // it through fail()), so it RESOLVES with a structured failure rather than
+    // rejecting — assert it does not reject, then read the result.
     let r: RolloutResult | undefined;
-    expect(() => {
-      r = executeRollout(steps, TARGET, deps);
-    }).not.toThrow();
+    await expect(
+      (async () => {
+        r = await executeRollout(steps, TARGET, deps);
+      })(),
+    ).resolves.toBeUndefined();
 
     // A structured result exists, so the sentinel gets emitted and the status
     // row names the step instead of reading "error, no detail".
@@ -2103,7 +2327,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(h.pin()).toBe("v0.19.3");
   });
 
-  it("names the AGENT when a restart step throws past a persisted pin", () => {
+  it("names the AGENT when a restart step throws past a persisted pin", async () => {
     // The same catch must preserve the two fields the terminal row and the
     // operator narration key off — and, unlike the `persist-pin` throw above,
     // this one IS past the provisional write, so it must revert.
@@ -2119,10 +2343,14 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     };
     const steps = planRollout(FLEET, { pinToPersist: TARGET, hostdContext: true });
 
+    // Resolves (does not reject) with a structured failure — see the
+    // persist-pin throw test above for why the throw is swallowed internally.
     let r: RolloutResult | undefined;
-    expect(() => {
-      r = executeRollout(steps, TARGET, deps, { hostdContext: true });
-    }).not.toThrow();
+    await expect(
+      (async () => {
+        r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
+      })(),
+    ).resolves.toBeUndefined();
 
     expect(r?.ok).toBe(false);
     expect(r?.failedStep).toBe("restart-agent");
@@ -2134,7 +2362,7 @@ describe("executeRollout — durable pin is provisional until the roll is proven
     expect(h.journalled()).toBe(false);
   });
 
-  it("carries pinReverted + timedOut across the hostd result sentinel", () => {
+  it("carries pinReverted + timedOut across the hostd result sentinel", async () => {
     const line = encodeRolloutResultLine({
       ok: false,
       rolled: ["clerk"],
@@ -2170,7 +2398,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
     return { calls, spawn };
   }
 
-  it("passes a positive timeout + SIGKILL to the subcommand spawn", () => {
+  it("passes a positive timeout + SIGKILL to the subcommand spawn", async () => {
     const { calls, spawn } = spy();
     const deps = createRolloutDeps({
       configPath: "/nope/switchroom.yaml",
@@ -2186,7 +2414,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
     expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
   });
 
-  it("passes a positive timeout + SIGKILL to the docker version probe", () => {
+  it("passes a positive timeout + SIGKILL to the docker version probe", async () => {
     const { calls, spawn } = spy();
     const deps = createRolloutDeps({
       configPath: "/nope/switchroom.yaml",
@@ -2202,7 +2430,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
     expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
   });
 
-  it("reports a timed-out subcommand as a clean non-zero failure, not a hang", () => {
+  it("reports a timed-out subcommand as a clean non-zero failure, not a hang", async () => {
     const warns: string[] = [];
     const deps = createRolloutDeps({
       configPath: "/nope/switchroom.yaml",
@@ -2223,7 +2451,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
     expect(warned).toMatch(/grandchildren are NOT killed/);
   });
 
-  it("treats an ETIMEDOUT-flavoured timeout the same way", () => {
+  it("treats an ETIMEDOUT-flavoured timeout the same way", async () => {
     const deps = createRolloutDeps({
       configPath: "/nope/switchroom.yaml",
       scriptPath: "switchroom",
@@ -2235,7 +2463,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
     expect(deps.run(["apply"]).timedOut).toBe(true);
   });
 
-  it("a wedged container's version probe returns null instead of blocking", () => {
+  it("a wedged container's version probe returns null instead of blocking", async () => {
     const warns: string[] = [];
     const deps = createRolloutDeps({
       configPath: "/nope/switchroom.yaml",
@@ -2248,7 +2476,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
     expect(warns.join(" ")).toMatch(/wedged/);
   });
 
-  it("isSpawnTimeout does NOT misread an ordinary non-zero exit as a timeout", () => {
+  it("isSpawnTimeout does NOT misread an ordinary non-zero exit as a timeout", async () => {
     expect(isSpawnTimeout({ status: 1, signal: null }, "SIGKILL")).toBe(false);
     expect(isSpawnTimeout({ status: 0, signal: null }, "SIGKILL")).toBe(false);
     // A DIFFERENT signal (e.g. an operator's SIGTERM) is not our timeout kill.
@@ -2259,7 +2487,7 @@ describe("createRolloutDeps — every subprocess is bounded", () => {
 describe("executeRollout — a timed-out step stops the roll cleanly", () => {
   const TARGET = "v0.19.4";
 
-  it("returns ok:false with timedOut set (the executor never blocks)", () => {
+  it("returns ok:false with timedOut set (the executor never blocks)", async () => {
     // The whole point: the executor RETURNS. A returned failure is what lets
     // hostd's `.finally()` run and release `fleetMutationInFlight` — the
     // latch that a hung spawnSync stranded forever.
@@ -2277,7 +2505,7 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
       hostdContext: true,
     });
 
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     expect(r.ok).toBe(false);
     expect(r.timedOut).toBe(true);
@@ -2286,14 +2514,14 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
     expect(r.warnings.join(" ")).toMatch(/wedged/);
   });
 
-  it("marks an apply timeout as timedOut and stops before any restart", () => {
+  it("marks an apply timeout as timedOut and stops before any restart", async () => {
     const h = pinHarness({ versions: {} });
     const deps: RolloutDeps = {
       ...h.deps,
       run: (args) => (args[0] === "apply" ? { status: 1, timedOut: true } : { status: 0 }),
     };
     const steps = planRollout(["clerk"], { pinToPersist: TARGET });
-    const r = executeRollout(steps, TARGET, deps);
+    const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("apply");
     expect(r.timedOut).toBe(true);
@@ -2301,10 +2529,10 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
     expect(h.pin()).toBe("v0.19.3");
   });
 
-  it("a timed-out apply stops the roll BEFORE any agent is restarted", () => {
+  it("a timed-out apply stops the roll BEFORE any agent is restarted", async () => {
     const { deps } = harness({ versions: {} });
     const runs: string[][] = [];
-    const r = executeRollout(planRollout(["clerk"]), TARGET, {
+    const r = await executeRollout(planRollout(["clerk"]), TARGET, {
       ...deps,
       run: (args) => {
         runs.push(args);
@@ -2318,7 +2546,7 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
     expect(runs.map((a) => a[0])).toEqual(["apply"]);
   });
 
-  it("carries timedOut across the hostd result sentinel", () => {
+  it("carries timedOut across the hostd result sentinel", async () => {
     // The executor runs in a CHILD process on the hostd path; the only
     // channel back to hostd is the stdout sentinel. If `timedOut` doesn't
     // survive encode→parse, hostd records a bare "exit 1" and the operator
@@ -2330,7 +2558,7 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
       run: (args) => (args[0] === "agent" ? { status: 1, timedOut: true } : { status: 0 }),
     };
     const steps = planRollout(["test-harness"], { pinToPersist: TARGET, hostdContext: true });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     const round = parseRolloutResultLine(
       "some noise\n" + encodeRolloutResultLine(r) + "\nmore noise\n",
@@ -2340,9 +2568,9 @@ describe("executeRollout — a timed-out step stops the roll cleanly", () => {
     expect(round?.failedAgent).toBe("test-harness");
   });
 
-  it("omits timedOut from the sentinel for an ordinary (non-timeout) failure", () => {
+  it("omits timedOut from the sentinel for an ordinary (non-timeout) failure", async () => {
     const { deps: base } = harness({ versions: {} });
-    const r = executeRollout(planRollout(["clerk"]), TARGET, {
+    const r = await executeRollout(planRollout(["clerk"]), TARGET, {
       ...base,
       run: (args) => (args[0] === "apply" ? { status: 1 } : { status: 0 }),
     });
@@ -2376,7 +2604,7 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
     });
   }
 
-  it("webImageTag's docker inspect carries a positive timeout + SIGKILL", () => {
+  it("webImageTag's docker inspect carries a positive timeout + SIGKILL", async () => {
     const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
     const deps = depsWith((cmd, args, opts) => {
       calls.push({ cmd, args, opts: opts as unknown as Record<string, unknown> });
@@ -2395,7 +2623,7 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
     expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
   });
 
-  it("hindsightExists' docker ps carries a positive timeout + SIGKILL", () => {
+  it("hindsightExists' docker ps carries a positive timeout + SIGKILL", async () => {
     const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
     const deps = depsWith((cmd, args, opts) => {
       calls.push({ cmd, args, opts: opts as unknown as Record<string, unknown> });
@@ -2412,7 +2640,7 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
     expect(calls[0]!.opts.killSignal).toBe("SIGKILL");
   });
 
-  it("a timed-out docker inspect yields an unknown tag (no throw, no hang)", () => {
+  it("a timed-out docker inspect yields an unknown tag (no throw, no hang)", async () => {
     const warns: string[] = [];
     const deps = depsWith(() => ({ status: null, signal: "SIGKILL", stdout: "" }), (l) =>
       warns.push(l),
@@ -2423,7 +2651,7 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
     expect(warns.join(" ")).toMatch(/did not answer within \d+ms and was killed/);
   });
 
-  it("a timed-out docker ps reports hindsight as absent rather than hanging", () => {
+  it("a timed-out docker ps reports hindsight as absent rather than hanging", async () => {
     const deps = depsWith(() => ({ status: null, signal: "SIGKILL", stdout: "" }));
     // Fails closed: refresh-hindsight no-ops instead of blocking forever.
     expect(deps.hindsightExists?.()).toBe(false);
@@ -2437,7 +2665,7 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
   // so a throw would escape `executeRollout` mid-roll — AFTER every agent has
   // already restarted. spawnSync reports failures on `r.error` rather than
   // throwing (ENOENT included), so this is parity insurance, not a live bug.
-  it("a THROWING docker spawn still fails closed for hindsightExists", () => {
+  it("a THROWING docker spawn still fails closed for hindsightExists", async () => {
     const deps = depsWith(() => {
       throw new Error("spawnSync exploded");
     });
@@ -2445,7 +2673,7 @@ describe("createRolloutDeps — the in-process docker probes are bounded too", (
     expect(deps.hindsightExists?.()).toBe(false);
   });
 
-  it("a THROWING docker spawn yields an unknown web tag rather than escaping", () => {
+  it("a THROWING docker spawn yields an unknown web tag rather than escaping", async () => {
     const deps = depsWith(() => {
       throw new Error("spawnSync exploded");
     });
@@ -2478,9 +2706,9 @@ describe("executeRollout — a timed-out web/hostd refresh names the timeout", (
     };
   }
 
-  it("refresh-web: the warning says TIMED OUT and to sweep strays BEFORE re-running", () => {
+  it("refresh-web: the warning says TIMED OUT and to sweep strays BEFORE re-running", async () => {
     const deps = timedOutRefreshDeps("webd");
-    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    const r = await executeRollout(planRollout(["clerk"]), TARGET, deps);
     // Still non-fatal — agents already rolled.
     expect(r.ok).toBe(true);
     const w = r.warnings.find((x) => /web refresh/.test(x));
@@ -2491,9 +2719,9 @@ describe("executeRollout — a timed-out web/hostd refresh names the timeout", (
     expect(w).toContain(`switchroom webd install --tag ${TARGET}`);
   });
 
-  it("refresh-hostd: the warning says TIMED OUT and to sweep strays BEFORE re-running", () => {
+  it("refresh-hostd: the warning says TIMED OUT and to sweep strays BEFORE re-running", async () => {
     const deps = timedOutRefreshDeps("hostd");
-    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    const r = await executeRollout(planRollout(["clerk"]), TARGET, deps);
     expect(r.ok).toBe(true);
     const w = r.warnings.find((x) => /hostd refresh/.test(x));
     expect(w).toBeTruthy();
@@ -2503,12 +2731,12 @@ describe("executeRollout — a timed-out web/hostd refresh names the timeout", (
     expect(w).toContain(`switchroom hostd install --tag ${TARGET}`);
   });
 
-  it("an ordinary non-zero refresh exit keeps the plain wording (shapes stay disjoint)", () => {
+  it("an ordinary non-zero refresh exit keeps the plain wording (shapes stay disjoint)", async () => {
     const { deps } = harness({
       versions: { clerk: "0.19.4" },
       runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
     });
-    const r = executeRollout(planRollout(["clerk"]), TARGET, deps);
+    const r = await executeRollout(planRollout(["clerk"]), TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.warnings.join(" ")).not.toMatch(/TIMED OUT/);
     expect(r.warnings.some((w) => /web refresh FAILED/.test(w))).toBe(true);
@@ -2524,7 +2752,7 @@ describe("createRolloutDeps — a timeout can never be reported as success", () 
   // the roll would have marched on. We could not produce that shape on node
   // v22.23.1, but the JSDoc asserted it as an invariant the code did not
   // enforce. Now it does.
-  it("forces a non-zero status when a zero-status result is flagged as a timeout", () => {
+  it("forces a non-zero status when a zero-status result is flagged as a timeout", async () => {
     const deps = createRolloutDeps({
       configPath: "/nope/switchroom.yaml",
       scriptPath: "switchroom",
@@ -2572,14 +2800,14 @@ describe("executeRollout — a timed-out restart stops even when the probe PASSE
     };
   }
 
-  it("returns ok:false + timedOut even though the agent reports the target version", () => {
+  it("returns ok:false + timedOut even though the agent reports the target version", async () => {
     const { deps, runs } = timedOutRestartDeps(TARGET);
     const steps = planRollout(["test-harness", "clerk"], {
       pinToPersist: TARGET,
       hostdContext: true,
     });
 
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     // The probe agrees the container is on the target …
     expect(deps.probeVersion("test-harness")).toBe(TARGET);
@@ -2598,22 +2826,22 @@ describe("executeRollout — a timed-out restart stops even when the probe PASSE
     expect(r.warnings.join(" ")).toMatch(/HALF-APPLIED/);
   });
 
-  it("survives the hostd result sentinel so get_status shows the timeout", () => {
+  it("survives the hostd result sentinel so get_status shows the timeout", async () => {
     const { deps } = timedOutRestartDeps(TARGET);
     const steps = planRollout(["test-harness"], { pinToPersist: TARGET, hostdContext: true });
-    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, deps, { hostdContext: true });
     const round = parseRolloutResultLine(encodeRolloutResultLine(r));
     expect(round?.ok).toBe(false);
     expect(round?.timedOut).toBe(true);
     expect(round?.failedAgent).toBe("test-harness");
   });
 
-  it("does NOT flag timedOut when the restart exits on its own with a bad version", () => {
+  it("does NOT flag timedOut when the restart exits on its own with a bad version", async () => {
     // The disjointness that makes `timedOut` meaningful to hostd: a plain
     // version-assert failure must not look like a killed-mid-flight restart.
     const { deps: base } = harness({ versions: { "test-harness": "v0.19.3" } });
     const steps = planRollout(["test-harness"], { pinToPersist: TARGET, hostdContext: true });
-    const r = executeRollout(steps, TARGET, base, { hostdContext: true });
+    const r = await executeRollout(steps, TARGET, base, { hostdContext: true });
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("restart-agent");
     expect(r.timedOut).toBeUndefined();
