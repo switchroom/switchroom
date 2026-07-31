@@ -1436,6 +1436,91 @@ describe("executeRollout — phase emission", () => {
     expect(clerkDone.length).toBe(1);
   });
 
+  it("emits singleton phases: web-refresh → web-refresh-done, hindsight-refresh → -done", () => {
+    const steps = planRollout(["clerk"], { hostdContext: true });
+    const { deps, phases } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      webImageTag: "v0.15.18", // matches target → observed success
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    const names = phases.map((p) => p.phase);
+    // The card's singleton section is fed by these — order matters.
+    expect(names.indexOf("web-refresh")).toBeGreaterThanOrEqual(0);
+    expect(names.indexOf("web-refresh-done")).toBeGreaterThan(names.indexOf("web-refresh"));
+    expect(names.indexOf("hindsight-refresh")).toBeGreaterThan(names.indexOf("web-refresh-done"));
+    expect(names.indexOf("hindsight-refresh-done")).toBeGreaterThan(
+      names.indexOf("hindsight-refresh"),
+    );
+    expect(names).not.toContain("hindsight-skipped");
+  });
+
+  it("emits hindsight-skipped (not -done) when no hindsight container exists", () => {
+    const steps = planRollout(["clerk"], { hostdContext: true });
+    const { deps, phases } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: false,
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const names = phases.map((p) => p.phase);
+    expect(names).toContain("hindsight-skipped");
+    expect(names).not.toContain("hindsight-refresh");
+    expect(names).not.toContain("hindsight-refresh-done");
+  });
+
+  it("does NOT emit web-refresh-done when the skew probe disproves the target", () => {
+    const steps = planRollout(["clerk"], { hostdContext: true });
+    const { deps, phases } = harness({
+      versions: { clerk: "0.15.18" },
+      webImageTag: "v0.15.17", // downgrade-guard skip left web behind
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const names = phases.map((p) => p.phase);
+    expect(names).toContain("web-refresh");
+    expect(names).not.toContain("web-refresh-done"); // never a fabricated ✓
+  });
+
+  it("does NOT emit web-refresh-done when webd install fails", () => {
+    const steps = planRollout(["clerk"], { hostdContext: true });
+    const { deps, phases } = harness({
+      versions: { clerk: "0.15.18" },
+      runStatus: (args) => (args[0] === "webd" ? 1 : 0),
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(phases.map((p) => p.phase)).not.toContain("web-refresh-done");
+  });
+
+  it("does NOT emit web-refresh-done when the web tag probe reads nothing (exit 0 proves nothing)", () => {
+    // `webd install` exits 0 on a downgrade-guard skip, so a clean exit with
+    // an unreadable tag is NOT an observation of success — the terminal
+    // verify-components gate resolves it instead.
+    const steps = planRollout(["clerk"], { hostdContext: true });
+    const { deps, phases } = harness({
+      versions: { clerk: "0.15.18" },
+      webImageTag: null,
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    const names = phases.map((p) => p.phase);
+    expect(names).toContain("web-refresh");
+    expect(names).not.toContain("web-refresh-done");
+  });
+
+  it("round-trips every singleton phase through the sentinel parser", () => {
+    for (const p of [
+      "web-refresh-done",
+      "hindsight-refresh",
+      "hindsight-refresh-done",
+      "hindsight-skipped",
+    ] as const) {
+      const parsed = parseRolloutPhaseLine(
+        encodeRolloutPhaseLine({ phase: p, target: "v1.2.3" }),
+      );
+      expect(parsed).toEqual({ phase: p, target: "v1.2.3" });
+    }
+  });
+
   it("emits a persist-pin phase on the hostd path", () => {
     const steps = planRollout(["test-harness", "clerk"], {
       hostdContext: true,

@@ -48,7 +48,47 @@ import {
   renderRolloutStatus,
   type AgentRollProgress,
   type RolloutRenderState,
+  type SingletonRollProgress,
 } from "./render-rollout-status.js";
+
+/**
+ * Display names for the singleton / shared-service checklist rows. Stable
+ * strings — the narrator keys row updates on them.
+ */
+export const SINGLETON_WEB = "switchroom-web";
+export const SINGLETON_HINDSIGHT = "hindsight";
+export const SINGLETON_HOSTD = "hostd";
+export const SINGLETON_SHARED =
+  "shared services (approval-kernel · auth-broker · vault-broker · voice)";
+
+/**
+ * Initial singleton checklist for a narrated roll. The narrator only exists
+ * on the hostd/agent-invoked path (hostd tails its own child's phases), so
+ * the initial states encode that path's plan truthfully:
+ *   - web + hindsight are in-plan refresh steps → pending until their phase;
+ *   - hostd is ALWAYS deferred there (an agent-invoked roll cannot recreate
+ *     its own hostd mid-roll) — refined to "updated" only if a self-bump is
+ *     actually observed;
+ *   - the shared fleet singletons self-heal on the first `agent restart`
+ *     (#2170) and are only individually OBSERVED by the terminal
+ *     verify-components gate, so they start pending with that stated.
+ */
+function initialSingletons(): SingletonRollProgress[] {
+  return [
+    { name: SINGLETON_WEB, status: "pending" },
+    { name: SINGLETON_HINDSIGHT, status: "pending" },
+    {
+      name: SINGLETON_HOSTD,
+      status: "deferred",
+      detail: "host-side (agent-invoked roll cannot recreate its own hostd)",
+    },
+    {
+      name: SINGLETON_SHARED,
+      status: "pending",
+      detail: "self-heal with the first agent restart",
+    },
+  ];
+}
 
 /**
  * The transport the narrator drives — a live gateway relay that can POST the
@@ -123,6 +163,8 @@ interface NarrationState {
   render: RolloutRenderState;
   /** Per-agent checklist progress, in roll order (fed into render.agents). */
   agents: AgentRollProgress[];
+  /** Singleton / shared-service checklist (fed into render.singletons). */
+  singletons: SingletonRollProgress[];
   /** Frozen once the terminal row is applied — no later edit may un-finalize. */
   frozen: boolean;
   /** Pending debounce timer for a trailing-edge edit. */
@@ -197,6 +239,85 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
     }
   }
 
+  /** Patch one singleton row in place (rows are fixed at ensureState). */
+  private static patchSingleton(
+    st: NarrationState,
+    name: string,
+    patch: Partial<SingletonRollProgress>,
+  ): void {
+    const row = st.singletons.find((g) => g.name === name);
+    if (row) Object.assign(row, patch);
+  }
+
+  /**
+   * Fold a phase into the singleton / shared-service checklist. Every
+   * transition mirrors a REAL emitted phase (rollout.ts emits `…-done` only
+   * on an observed success), so no row ever shows a ✓ the roll didn't see.
+   */
+  private trackSingletonProgress(st: NarrationState, phase: RolloutPhase): void {
+    const patch = LogTailRolloutNarrator.patchSingleton;
+    switch (phase.phase) {
+      case "canary-pass":
+      case "agent-done": {
+        // #2170 — the fleet's shared singletons are recreated by the FIRST
+        // agent restart. Mark the mechanism as having run; "updated" waits
+        // for the terminal row (the verify-components gate is what actually
+        // observes them).
+        const shared = st.singletons.find((g) => g.name === SINGLETON_SHARED);
+        if (shared && shared.status === "pending") {
+          shared.status = "updating";
+          shared.detail =
+            "recreated with the first agent restart — verified at roll end";
+        }
+        break;
+      }
+      case "web-refresh":
+        patch(st, SINGLETON_WEB, { status: "updating", detail: "webd install…" });
+        break;
+      case "web-refresh-done":
+        patch(st, SINGLETON_WEB, { status: "updated", detail: undefined });
+        break;
+      case "hindsight-refresh":
+        patch(st, SINGLETON_HINDSIGHT, {
+          status: "updating",
+          detail: "memory setup --recreate…",
+        });
+        break;
+      case "hindsight-refresh-done":
+        patch(st, SINGLETON_HINDSIGHT, { status: "updated", detail: undefined });
+        break;
+      case "hindsight-skipped":
+        patch(st, SINGLETON_HINDSIGHT, {
+          status: "skipped",
+          detail: "no hindsight container on this host",
+        });
+        break;
+      case "self-bump":
+        patch(st, SINGLETON_HOSTD, {
+          status: "updating",
+          detail: "self-bump to the target…",
+        });
+        break;
+      case "self-bump-done":
+        patch(st, SINGLETON_HOSTD, {
+          status: "updated",
+          detail: "self-bump; template regen stays host-side",
+        });
+        break;
+      case "hostd-web-deferred": {
+        // Don't downgrade an observed self-bump back to "deferred".
+        const hostd = st.singletons.find((g) => g.name === SINGLETON_HOSTD);
+        if (hostd && hostd.status !== "updated") {
+          hostd.status = "deferred";
+          hostd.detail = "host-side";
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
   /**
    * Monotonic sequence for a phase, so out-of-order / duplicate phases drop.
    * hostd feeds phases in stdout order; this is defense-in-depth.
@@ -236,9 +357,17 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       case "agent-done":
         return 2 * (phase.n ?? 1) + 1;
       case "web-refresh":
+      case "web-refresh-done":
         // In-plan web singleton refresh — after every agent restart, before
-        // the deferral note. Anchored just below hostd-web-deferred.
-        return Number.MAX_SAFE_INTEGER - 2;
+        // the hindsight refresh. Equal-seq: -done REFINES -start (the
+        // executor emits them strictly in order on one stdout).
+        return Number.MAX_SAFE_INTEGER - 4;
+      case "hindsight-refresh":
+      case "hindsight-refresh-done":
+      case "hindsight-skipped":
+        // After the web refresh, before the deferral note. Same equal-seq
+        // refine-only shape as web above.
+        return Number.MAX_SAFE_INTEGER - 3;
       case "hostd-web-deferred":
         return Number.MAX_SAFE_INTEGER - 1; // near the end, before terminal
       default:
@@ -266,8 +395,10 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       if (seq < st.lastAppliedSeq) return; // stale — drop.
       st.lastAppliedSeq = seq;
 
-      // Fold the phase into the per-agent checklist (✓/⏳/·/✗ + durations).
+      // Fold the phase into the per-agent checklist (✓/⏳/·/✗ + durations)
+      // and the singleton / shared-service checklist.
       this.trackAgentProgress(st, phase);
+      this.trackSingletonProgress(st, phase);
 
       // #2726 fix — during the roll, `entry.rolled` is still empty: hostd only
       // parses the child's result sentinel into `entry.rolled` AFTER the whole
@@ -295,6 +426,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         ...(phase.agent !== undefined ? { agent: phase.agent } : {}),
         rolled: rolledSoFar,
         agents: st.agents,
+        singletons: st.singletons,
         requestId: entry.request_id,
         ...(entry.prior_pin ? { fromVersion: entry.prior_pin } : {}),
         startedAtMs: entry.started_at,
@@ -321,6 +453,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
           a.status = "pending";
         }
       }
+      this.reconcileSingletonsAtTerminal(st, entry);
       // Terminal wins unconditionally and FREEZES the surface.
       st.render = {
         target: entry.pin ?? st.render.target,
@@ -336,6 +469,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
           ? { drifted: entry.drifted }
           : {}),
         ...(st.agents.length > 0 ? { agents: st.agents } : {}),
+        ...(st.singletons.length > 0 ? { singletons: st.singletons } : {}),
         ...(st.render.m !== undefined ? { m: st.render.m } : {}),
         requestId: entry.request_id,
         ...(entry.prior_pin ?? st.render.fromVersion
@@ -363,6 +497,94 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
     }
   }
 
+  /**
+   * Reconcile the singleton checklist against the TERMINAL row — the only
+   * point where the roll has actually OBSERVED the singletons as a set (the
+   * verify-components gate: a `completed` terminal means every in-scope
+   * component passed it; a drifted list names exactly what did not).
+   */
+  private reconcileSingletonsAtTerminal(
+    st: NarrationState,
+    entry: StatusEntry,
+  ): void {
+    const completed = entry.result === "completed";
+    const drifted = new Set(entry.drifted ?? []);
+    const driftedHits = (row: string): string[] => {
+      switch (row) {
+        case SINGLETON_WEB:
+          return [...drifted].filter((d) => d === "switchroom-web");
+        case SINGLETON_HINDSIGHT:
+          return [...drifted].filter((d) => d === "switchroom-hindsight");
+        case SINGLETON_HOSTD:
+          // The autoheal sidecar runs the hostd image in the hostd compose
+          // project (component-scope.ts) — its drift is hostd's to fix.
+          return [...drifted].filter(
+            (d) => d === "switchroom-hostd" || d === "switchroom-hindsight-autoheal",
+          );
+        case SINGLETON_SHARED:
+          return [...drifted].filter(
+            (d) =>
+              d.includes("broker") || d.includes("kernel") || d.includes("voice"),
+          );
+        default:
+          return [];
+      }
+    };
+    for (const g of st.singletons) {
+      const hits = driftedHits(g.name);
+      if (hits.length > 0) {
+        // The terminal drift gate NAMED it still behind — that observation
+        // outranks any in-flight phase (incl. a web-refresh-done whose
+        // install was later disproven).
+        g.status = "failed";
+        g.detail = `still behind (${hits.join(", ")}) — see the roll's warnings`;
+        continue;
+      }
+      if (entry.failed_step === "refresh-hindsight" && g.name === SINGLETON_HINDSIGHT) {
+        g.status = "failed";
+        g.detail =
+          "recreate FAILED — memory backend down; run `switchroom memory setup`";
+        continue;
+      }
+      if (!completed) {
+        // A stopped roll: leave each row's last honest state (pending rows
+        // simply never got reached; "updating" without an outcome phase is
+        // unproven, so say so rather than claim either way).
+        if (g.status === "updating" && g.name !== SINGLETON_SHARED) {
+          g.detail = "outcome unknown — the roll stopped; see warnings";
+        }
+        continue;
+      }
+      // Completed roll: the verify-components gate passed with this row's
+      // components in scope wherever their plan step ran.
+      switch (g.name) {
+        case SINGLETON_WEB:
+        case SINGLETON_HINDSIGHT:
+          if (g.status === "updated") break;
+          if (g.status === "updating") {
+            // Its -done phase never arrived (lost line / older CLI), but the
+            // terminal gate proved convergence.
+            g.status = "updated";
+            g.detail = "verified by the end-of-roll component check";
+          } else if (g.status === "pending") {
+            // The roll finished without this narrator seeing its refresh
+            // phase — --skip-web, a plan without the step, or a narration
+            // restart mid-roll. Not a failure; not a ✓ either.
+            g.status = "skipped";
+            g.detail = "no refresh observed in this roll — see warnings";
+          }
+          break;
+        case SINGLETON_SHARED:
+          g.status = "updated";
+          g.detail =
+            "self-healed with the first agent restart; end-of-roll check passed";
+          break;
+        default:
+          break; // hostd keeps its deferred / self-bump state — that IS the truth.
+      }
+    }
+  }
+
   private ensureState(entry: StatusEntry): NarrationState {
     let st = this.states.get(entry.request_id);
     if (!st) {
@@ -377,6 +599,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         postFailed: false,
         render: { target: entry.pin ?? "" },
         agents: [],
+        singletons: initialSingletons(),
         frozen: false,
         timer: null,
         pendingEditAfterPost: false,
