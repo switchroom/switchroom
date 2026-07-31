@@ -25,7 +25,8 @@ import { Command } from "commander";
 import {
   normalizeVersion,
   isVersionAssertable,
-  orderAgentsCanaryFirst,
+  orderAgentsForRoll,
+  ROLLOUT_PRIORITY_AGENTS,
   planRollout,
   formatRolloutPlan,
   executeRollout,
@@ -85,16 +86,48 @@ describe("isVersionAssertable", () => {
   });
 });
 
-describe("orderAgentsCanaryFirst", () => {
+describe("orderAgentsForRoll", () => {
   it("puts test-harness first, preserving the rest's order", () => {
-    expect(orderAgentsCanaryFirst(["clerk", "test-harness", "marko"])).toEqual([
+    expect(orderAgentsForRoll(["clerk", "test-harness", "marko"])).toEqual([
       "test-harness",
       "clerk",
       "marko",
     ]);
   });
-  it("is a no-op when test-harness is absent", () => {
-    expect(orderAgentsCanaryFirst(["clerk", "marko"])).toEqual(["clerk", "marko"]);
+  it("is a no-op when test-harness is absent and no priority agents roll", () => {
+    expect(orderAgentsForRoll(["clerk", "marko"])).toEqual(["clerk", "marko"]);
+  });
+
+  it("orders canary, then overlord → carrie → finn, then the rest in config order", () => {
+    // Config order deliberately scrambles the priority agents so this test
+    // FAILS on the old canary-only ordering (which preserved config order
+    // for everything after test-harness).
+    expect(
+      orderAgentsForRoll([
+        "clerk",
+        "finn",
+        "test-harness",
+        "marko",
+        "overlord",
+        "carrie",
+      ]),
+    ).toEqual(["test-harness", "overlord", "carrie", "finn", "clerk", "marko"]);
+  });
+
+  it("applies the priority prefix even when the canary is absent", () => {
+    expect(orderAgentsForRoll(["clerk", "carrie", "overlord"])).toEqual([
+      "overlord",
+      "carrie",
+      "clerk",
+    ]);
+  });
+
+  it("skips priority agents not present in the roll (a --agents subset)", () => {
+    expect(orderAgentsForRoll(["marko", "finn"])).toEqual(["finn", "marko"]);
+  });
+
+  it("pins the priority list itself — overlord, then carrie, then finn", () => {
+    expect(ROLLOUT_PRIORITY_AGENTS).toEqual(["overlord", "carrie", "finn"]);
   });
 });
 
@@ -110,6 +143,26 @@ describe("planRollout", () => {
       "refresh-hindsight",
       "sweep",
       "verify-components",
+    ]);
+  });
+
+  it("restarts canary → overlord → carrie → finn → rest, in the step list", () => {
+    const steps = planRollout([
+      "clerk",
+      "finn",
+      "test-harness",
+      "overlord",
+      "carrie",
+    ]);
+    const restarts = steps.flatMap((s) =>
+      s.kind === "restart-agent" ? [s.agent] : [],
+    );
+    expect(restarts).toEqual([
+      "test-harness",
+      "overlord",
+      "carrie",
+      "finn",
+      "clerk",
     ]);
   });
 
@@ -296,9 +349,12 @@ describe("executeRollout", () => {
   });
 
   it("STOPS at the first agent that comes back on the wrong version", () => {
-    const steps = planRollout(["clerk", "marko", "finn"]);
+    // NOTE: neutral (non-priority) agent names — the roll order for
+    // priority agents (overlord/carrie/finn) is pinned by the
+    // orderAgentsForRoll tests above.
+    const steps = planRollout(["clerk", "marko", "quill"]);
     const { deps, runs } = harness({
-      versions: { clerk: "0.15.18", marko: "0.15.17" /* stale! */, finn: "0.15.18" },
+      versions: { clerk: "0.15.18", marko: "0.15.17" /* stale! */, quill: "0.15.18" },
     });
     const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
@@ -306,8 +362,8 @@ describe("executeRollout", () => {
     expect(r.failedAgent).toBe("marko");
     expect(r.got).toBe("0.15.17");
     expect(r.rolled).toEqual(["clerk"]); // only the one before the failure
-    // finn was never restarted; web/hostd never refreshed.
-    expect(runs).not.toContainEqual(["agent", "restart", "finn", "--wait", "--force"]);
+    // quill was never restarted; web/hostd never refreshed.
+    expect(runs).not.toContainEqual(["agent", "restart", "quill", "--wait", "--force"]);
     expect(runs).not.toContainEqual(["webd", "install", "--tag", TARGET]);
   });
 
