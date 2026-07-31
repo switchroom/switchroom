@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+## v0.19.41 — Three operator-facing reliability fixes: the rollout card survives a self-bump, no more false stall/no-op cards, and checklists degrade instead of 400ing
+
+Three fixes an operator feels directly. A fleet rollout that self-bumps hostd
+no longer freezes its progress card and spawns a second one — the same durable
+marker that carries the roll now carries the card's message id, so the resumed
+process adopts and keeps editing the original card. The nightly fleet-health
+detector stops firing false sev-3 "silent no-op" cards for turns that actually
+completed and delivered their answer via the flush backstop. And `send_checklist`
+stops 400ing on every use — it now degrades to a formatted text message in the
+ordinary bot chats this fleet runs, instead of failing against a Business-only
+Bot API.
+
+### The rollout card stays live across a hostd self-bump (#4063)
+
+During a fleet roll, when hostd self-bumps — recreating itself onto the new CLI
+to satisfy the stale-CLI preflight — the Telegram rollout progress card stopped
+updating and a second fresh card appeared further down the chat: two cards, one
+frozen, for a single roll. The narration card's `message_id` lived only in the
+old process's memory, so when the new hostd resumed the roll from the on-disk
+`pending-rollout` marker its narrator had no id and posted a new card, stranding
+the original. The fix persists the learned `message_id` through the same durable
+`pending-rollout` marker that already carries the roll: an `onMessageId` sink
+writes it into the marker atomically (`.tmp` + `rename`) the moment the first
+post lands, and the resumed narrator is seeded with the carried id before its
+first phase so it takes the edit branch and reuses the card. A malformed id
+drops only that field, never nulling the marker, so a bad id can never block the
+resume; a kill before the id is learned degrades to today's fresh-post
+behaviour — strictly no regression.
+
+### No false "silent no-op" cards for flush-recovered turns (#4064)
+
+The nightly fleet-health detector fired a sev-3 `silent-no-op-candidate` for
+turns that had actually completed and delivered their answer — operators saw
+these as false "no output for N min — stalled turn" cards (agent `klanker`
+alone accumulated ~131 of them). A turn can complete honestly with zero tools:
+the agent answers in terminal prose, the reply tool is bypassed, and a
+flush / outbox-sweep backstop delivers the answer. The turns.jsonl row carried
+no delivery route, so the detector could not tell a flush-recovered turn (answer
+reached the user) from a genuine silent no-op (nothing reached the user). The
+fix records an honest `route` on every turn record — derived from the same
+resolved delivery state the status computation already reads — and splits the
+detector on it: `flush` becomes a low-severity informational `flush-recovered-turn`
+signal, `none` keeps the sev-3 escalation (rare by construction, so a nonzero
+count means a real delivery invariant broke), and `reply`/`stream` produce no
+finding. Pre-route legacy rows are aged out by a fixed ship-timestamp so the
+stale backlog is suppressed while a future regression that drops the field still
+surfaces.
+
+### send_checklist degrades to text instead of a raw Telegram 400 (#4062)
+
+`send_checklist` failed fleet-wide with `400: Bad Request: parameter "checklist"
+is required`. Two compounding defects: the payload was flat when the Bot API
+wants `title`/`tasks` nested inside a single `checklist` object with integer task
+ids, and native checklists are a Telegram Business feature that also require a
+`business_connection_id` — so even a correct payload can never work in the
+ordinary bot DMs and groups this fleet actually uses. A new deps-injected
+`checklist-fallback` module fixes both: when a business connection is configured
+it builds the correct nested Bot API 9.1 payload, and otherwise — every current
+deployment — it renders the checklist as a formatted text message (bold title,
+`✅`/`⬜` task lines) through the standard send path, with the tool result marked
+`degraded: "text"` so the agent knows the tasks are not tappable. No raw 400 can
+escape: a failed native send falls back to text and a failed edit returns a
+structured result. `update_checklist` patches a per-message state store and
+re-renders in the sent mode, degrading to a structured hint when that state is
+lost to a restart.
+
 ## v0.19.40 — Telegram delivery gets honest: formatted, exactly-once, and no false stall cards — plus an observation-scope config surface and a smarter rollout order
 
 The headline is three Telegram delivery fixes an operator actually feels. A
