@@ -1018,6 +1018,16 @@ export HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE={{hindsightDirectiveCaptureNudge}}
 {{#if hindsightObservationScopesQ}}
 export HINDSIGHT_OBSERVATION_SCOPES={{{hindsightObservationScopesQ}}}
 {{/if}}
+# Per-retain observation-scope STRATEGY (memory.observation_scope_strategy
+# cascade). Selects curated-vs-not: "curated" (plugin default) strips volatile
+# per-session provenance tags so observations dedup across sessions; "shared"
+# forces the one global untagged scope; "combined"/"off" opt out (no per-row
+# scope on the wire, pre-feature engine default). Export ONLY when the operator
+# set it: unset leaves the plugin's on-by-default `curated` in force. A pinned
+# per-row scope (memory.observation_scopes) still wins over this in the resolver.
+{{#if hindsightObservationScopeStrategyQ}}
+export HINDSIGHT_OBSERVATION_SCOPE_STRATEGY={{{hindsightObservationScopeStrategyQ}}}
+{{/if}}
 # PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
 # parsed by retain.py + recall.py to (a) stamp chat_id/thread_id/topic_alias
 # into retained memory metadata and (b) emit a "Current topic: …" preamble

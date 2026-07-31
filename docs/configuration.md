@@ -597,6 +597,33 @@ Be aware of the limit: past `apply`, a bad value on the **retain** path is visib
 
 **Cascade: override** (per-agent wins over profile/defaults). `start.sh` exports `HINDSIGHT_OBSERVATION_SCOPES` only when you set it. Serves the `remember-across-sessions` job.
 
+### Choosing the observation-scope strategy — `memory.observation_scope_strategy`
+
+The pin above forces one Hindsight scope on every retain. The **strategy** is the other lever: it decides how switchroom *computes* the scope when no pin is set. Since #4035 the strategy ships on-by-default as **`curated`**, and this is the first-class knob for it — before it existed, the only ways to change the strategy were a raw `HINDSIGHT_OBSERVATION_SCOPE_STRATEGY` env var in the agent's `env:` map or pinning `memory.observation_scopes`, neither discoverable from the schema.
+
+```yaml
+defaults:
+  memory:
+    observation_scope_strategy: combined   # opt the whole fleet out of curated
+
+agents:
+  clerk:
+    memory:
+      observation_scope_strategy: curated  # per-agent opt back in
+```
+
+Accepted values (`OBSERVATION_SCOPE_STRATEGIES` in the plugin's `lib/config.py`):
+
+| value | effect |
+|---|---|
+| `curated` | **default.** For each retain, strip the volatile per-session provenance tags (a bare session UUID, `parent_session:*`) from the *consolidation* scope while keeping them on the source fact — so observations dedup and merge across sessions instead of pocketing one-per-session. A non-empty stable tag set becomes an explicit `[[stable…]]` scope; an all-volatile retain goes to `shared`. |
+| `shared` | Send *every* retain to the one global untagged scope — the whole bank pools into a single belief set. |
+| `combined` / `off` | **Opt out.** Emit no per-row scope at all, restoring the pre-#4035 engine default (per-session islands). Byte-identical wire body to an unconfigured pre-feature client. |
+
+**Omitted by default.** Leave it unset and `start.sh` emits no `HINDSIGHT_OBSERVATION_SCOPE_STRATEGY` export, so the plugin's own `curated` default stands. A manual `memory.observation_scopes` pin **wins over the strategy** — set the pin only when you need to force a specific Hindsight scope regardless of tags; otherwise use the strategy. Off-list values are **rejected at `switchroom apply`**, the same cheap gate as the pin; a raw env / hand-edited `settings.json` value that slips past falls back to `curated` (shouted on stderr, never raised — a typo cannot lose a turn).
+
+**Cascade: override** (per-agent wins over profile/defaults). `start.sh` exports `HINDSIGHT_OBSERVATION_SCOPE_STRATEGY` only when you set it, and the resolver (`lib/config.compute_observation_scopes`) reads it. Serves the `remember-across-sessions` job.
+
 ### Server-side caps on the Hindsight container
 
 `switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. The same default is baked into the `--compose` snippet output.

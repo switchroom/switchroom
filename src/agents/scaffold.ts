@@ -3801,6 +3801,9 @@ interface BuildWorkspaceContextArgs {
   // Per-row observation scope. undefined unless the operator set
   // memory.observation_scopes; exported only when set.
   hindsightObservationScopes?: string;
+  // Per-retain observation-scope strategy selector. undefined unless the
+  // operator set memory.observation_scope_strategy; exported only when set.
+  hindsightObservationScopeStrategy?: string;
   // PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
   // injected as HINDSIGHT_TOPIC_ALIASES_JSON so retain.py can resolve
   // numeric thread_ids to human alias names in memory metadata.
@@ -3851,6 +3854,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
     hindsightObservationScopes,
+    hindsightObservationScopeStrategy,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -3957,6 +3961,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightDirectiveCaptureNudge,
     hindsightObservationScopesQ: hindsightObservationScopes
       ? shellSingleQuote(hindsightObservationScopes)
+      : undefined,
+    hindsightObservationScopeStrategyQ: hindsightObservationScopeStrategy
+      ? shellSingleQuote(hindsightObservationScopeStrategy)
       : undefined,
     // PR6 — only emit the env-export blocks when we actually have a
     // value, so `{{#if hindsightTopicAliasesJsonQ}}` and friends are
@@ -4947,6 +4954,12 @@ export function scaffoldAgent(
   // stands. Top-level memory.* knob: it stamps every retain path, not just the
   // Stop-hook cadence under memory.retain.
   const hindsightObservationScopes = agentConfig.memory?.observation_scopes;
+  // Per-retain observation-scope strategy (memory.observation_scope_strategy
+  // cascade). undefined unless the operator set it — exported only when set
+  // (see start.sh.hbs), so an unset value leaves the plugin's on-by-default
+  // `curated` strategy in force. Selects curated-vs-not; the pin above wins.
+  const hindsightObservationScopeStrategy =
+    agentConfig.memory?.observation_scope_strategy;
 
   // PR6 — supergroup-mode topic tagging. Build the {alias: thread_id}
   // JSON for retain.py + recall.py to resolve numeric thread_ids to
@@ -5014,6 +5027,7 @@ export function scaffoldAgent(
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
     hindsightObservationScopes,
+    hindsightObservationScopeStrategy,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -7461,6 +7475,12 @@ function reconcileAgentInner(
   // stands. Top-level memory.* knob: it stamps every retain path, not just the
   // Stop-hook cadence under memory.retain.
   const hindsightObservationScopes = agentConfig.memory?.observation_scopes;
+  // Per-retain observation-scope strategy (memory.observation_scope_strategy
+  // cascade). undefined unless the operator set it — exported only when set
+  // (see start.sh.hbs), so an unset value leaves the plugin's on-by-default
+  // `curated` strategy in force. Selects curated-vs-not; the pin above wins.
+  const hindsightObservationScopeStrategy =
+    agentConfig.memory?.observation_scope_strategy;
   // PR6 — mirror scaffoldAgent's computation. Both paths feed
   // buildWorkspaceContext, so the template sees identical shape.
   const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
@@ -7562,6 +7582,9 @@ function reconcileAgentInner(
       hindsightDirectiveCaptureNudge,
       hindsightObservationScopesQ: hindsightObservationScopes
         ? shellSingleQuote(hindsightObservationScopes)
+        : undefined,
+      hindsightObservationScopeStrategyQ: hindsightObservationScopeStrategy
+        ? shellSingleQuote(hindsightObservationScopeStrategy)
         : undefined,
       // PR6 — supergroup-mode topic tagging env vars. Same gate as
       // buildWorkspaceContext: only emit the shell-quoted JSON when
@@ -8355,6 +8378,7 @@ function reconcileAgentInner(
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
       hindsightObservationScopes,
+      hindsightObservationScopeStrategy,
       hindsightTopicAliasesJson,
       hindsightSenderBanksJson,
       hindsightTopicFilterMode,

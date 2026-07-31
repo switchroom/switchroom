@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { OBSERVATION_SCOPES } from "../memory/observation-scopes.js";
+import {
+  OBSERVATION_SCOPES,
+  OBSERVATION_SCOPE_STRATEGIES,
+} from "../memory/observation-scopes.js";
 
 /**
  * A single entry in an agent's code_repos list.
@@ -374,6 +377,43 @@ const ObservationScopesSchema = z
     "Cascade: override (per-agent wins over default)."
   );
 
+/**
+ * `memory.observation_scope_strategy` — the per-retain SELECTOR that decides
+ * how switchroom computes each row's `observation_scopes` when no pin is set.
+ * This is the first-class surface for the plugin's `observationScopeStrategy`
+ * knob (shipped on-by-default in #4035): `curated` (default) strips volatile
+ * per-session provenance tags so cross-session dedup happens; `shared` forces
+ * the one global untagged scope; `combined` / `off` opt out entirely,
+ * restoring the pre-feature engine default. A manual `observation_scopes` pin
+ * still wins over the strategy outright.
+ *
+ * Declared once and reused by BOTH `AgentMemorySchema` and the
+ * defaults/profile-tier mirror, so the two tiers cannot drift. Same enum
+ * rationale as the pin: a typo is invisible after the write, so rejecting it
+ * at `switchroom apply` is the cheap catch; the plugin re-validates
+ * (`lib/config.compute_observation_scopes`) for a raw env / settings.json
+ * value this schema cannot reach.
+ */
+const ObservationScopeStrategySchema = z
+  .enum(OBSERVATION_SCOPE_STRATEGIES)
+  .optional()
+  .describe(
+    "Per-retain strategy that decides how the observation scope is " +
+    "computed when no `observation_scopes` pin is set. \"curated\" " +
+    "(the default since #4035) strips volatile per-session provenance " +
+    "tags from each retain's consolidation scope — keeping the stable " +
+    "semantic ones on the source fact — so an agent's observations dedup " +
+    "and merge across sessions instead of pocketing one-per-session. " +
+    "\"shared\" sends every retain to the one global untagged scope. " +
+    "\"combined\" / \"off\" opt OUT: no per-row scope goes on the wire, " +
+    "restoring the pre-feature engine default (byte-identical to an " +
+    "unconfigured client). OMITTED BY DEFAULT: unset leaves the plugin's " +
+    "own default (`curated`) in force. A manual `observation_scopes` pin " +
+    "wins over this strategy. Accepted values: " +
+    `${OBSERVATION_SCOPE_STRATEGIES.join(", ")}. ` +
+    "Cascade: override (per-agent wins over default)."
+  );
+
 export const AgentMemorySchema = z
   .object({
     collection: z.string().describe("Hindsight collection name for this agent"),
@@ -549,6 +589,7 @@ export const AgentMemorySchema = z
         "Cascade: override (per-agent wins over default)."
       ),
     observation_scopes: ObservationScopesSchema,
+    observation_scope_strategy: ObservationScopeStrategySchema,
     recall: z
       .object({
         max_memories: z
@@ -3289,6 +3330,11 @@ const profileFields = {
       // defaults/profile tier too, so `defaults.memory.observation_scopes:
       // shared` pools a whole fleet's observations with per-agent opt-out.
       observation_scopes: ObservationScopesSchema,
+      // Mirror of AgentMemorySchema.observation_scope_strategy — accepted at
+      // the defaults/profile tier too, so `defaults.memory.
+      // observation_scope_strategy: combined` opts a whole fleet out of the
+      // curated default with per-agent opt-in.
+      observation_scope_strategy: ObservationScopeStrategySchema,
       recall: z
         .object({
           max_memories: z.number().int().min(0).optional(),
