@@ -547,6 +547,53 @@ describe('deliverCapturedProse — silent-end recovery (routed into the send mod
     expect(h.calls).toHaveLength(0)
   })
 
+  it('PERSIST PARITY: the exhausted-boundary plain-text fallback records the recovered answer to history', async () => {
+    // #3228 exhausted-boundary: the rich send fails on the attempt where the
+    // re-prompt budget is already spent, so deliverCapturedProse delivers the
+    // real answer as PLAIN text. Pre-fix that plain-text delivery recorded only
+    // to the in-memory dedup and NEVER called recordOutbound — so the recovered
+    // answer reached the user but was silently absent from history.db. This
+    // asserts recordOutbound now fires once with the delivered message_id + the
+    // recovered text.
+    const dedup = new OutboundDedupCache()
+    // Rich send parse-rejects (one chunk → one queued failure); the plain
+    // sendMessage fallback succeeds.
+    const { api, calls } = makeFakeBot({ sendRichMessage: [grammy400("can't parse entities")] })
+    const recorded: Array<{ chat_id: string; thread_id: number | null; message_ids: number[]; texts: string[] }> = []
+    const text = 'The exhausted-boundary recovered answer.'
+    const deps: DeliverCapturedProseDeps = {
+      outboundDedup: dedup,
+      bot: { api } as unknown as DeliverCapturedProseDeps['bot'],
+      robustApiCall: (fn) => fn(),
+      redactOutboundText: (t) => redact(t),
+      recordOutbound: (rec) => recorded.push({ chat_id: rec.chat_id, thread_id: rec.thread_id, message_ids: rec.message_ids, texts: rec.texts }),
+      HISTORY_ENABLED: true,
+      OBLIGATION_LEDGER_ENABLED: true,
+      obligationLedger: { close: () => {} },
+      clearSilentEndState: () => {},
+      // Budget already spent → the fallback path fires.
+      recordUndeliveredTurnEnd: () => ({ exhausted: true }),
+      hasOutboundDeliveredSince: () => false,
+    }
+    await deliverCapturedProse(deps, {
+      chatId: CHAT,
+      threadId: undefined,
+      statusKeyStr: `${CHAT}:main`,
+      registryKey: null,
+      originTurnId: 'turn-45',
+      text,
+    })
+    // The plain-text fallback actually delivered.
+    const plainSends = calls.filter((c) => c.method === 'sendMessage')
+    expect(plainSends).toHaveLength(1)
+    expect(plainSends[0]!.text).toBe(text)
+    // …and it was persisted to history exactly once with the delivered id + text.
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0]!.chat_id).toBe(CHAT)
+    expect(recorded[0]!.message_ids).toEqual([plainSends[0]!.message_id])
+    expect(recorded[0]!.texts).toEqual([text])
+  })
+
   it('already-deduped content settles bookkeeping WITHOUT a wire send', async () => {
     const dedup = new OutboundDedupCache()
     const text = 'Already went out earlier via the stream.'
