@@ -13,6 +13,8 @@
  * touches the network.
  */
 
+import { ROUTE_FIELD_SHIP_TS } from "../../telegram-plugin/gateway/turn-record-status.js";
+
 /** Tuned hang threshold: >6 min (live data p99 = 303 s). Load-bearing —
  *  do not casually change (see RFC "Tuned constants"). */
 export const HANG_MS = 360_000;
@@ -41,6 +43,12 @@ export interface DetectOptions {
    *  this are NOT flagged as silent-no-ops. Defaults to `SILENT_NOOP_FLOOR_TS`.
    *  Tests pass `0` to assert detector LOGIC independent of the calendar. */
   silentNoopFloorTs?: number;
+  /** Unix-seconds cutoff for the honest-`route` field. A row LACKING `route`
+   *  whose `ts` is below this predates the field and is aged out of the sev-3
+   *  silent-no-op finding (it cannot be classified). A row lacking `route` at/
+   *  after this is treated as `route: 'none'` so a regression that drops the
+   *  field still surfaces. Defaults to `ROUTE_FIELD_SHIP_TS`. */
+  routeFieldShipTs?: number;
 }
 
 /** One row of `turns.jsonl` — the structured per-turn oracle. */
@@ -51,6 +59,13 @@ export interface TurnRecord {
   tools?: number;
   status?: string;
   turn_id?: string;
+  /** The honest delivery route the gateway stamped (`reply` | `stream` |
+   *  `flush` | `none`; see `turn-record-status.ts` `computeTurnRoute`). Absent
+   *  on legacy rows written before the field shipped — the detector ages those
+   *  out via `ROUTE_FIELD_SHIP_TS` rather than mistaking them for silent
+   *  no-ops. Lets the silent-no-op check tell a flush-recovered turn
+   *  (`route: 'flush'`) from a genuine silent no-op (`route: 'none'`). */
+  route?: string;
   /** #3702 — landed backstop message ids the read-back probe never
    *  corroborated (absent on an ordinary row). A `complete` turn carrying this
    *  was called delivered on the Bot API's ack alone. Counted, NOT escalated:
@@ -66,6 +81,12 @@ export type TurnSignal =
   | "killed-incomplete-turn"
   | "hang-long-stalled"
   | "silent-no-op-candidate"
+  // A turn that completed with zero tools BUT whose answer was honestly
+  // delivered by a turn-flush / outbox-sweep backstop (route `flush`) after the
+  // reply tool was bypassed. Informational (LOW sev) — NOT a silent no-op: the
+  // user did receive the answer. This split is what stops the ~131 false
+  // sev-3 "silent no-op" flags on flush-recovered turns.
+  | "flush-recovered-turn"
   // A turn-flush/backstop send that failed or only partially delivered
   // (turns.jsonl status `send_failed`, new in gateway PR B). Distinct from
   // `killed-incomplete-turn` (process killed mid-run): here the run finished
@@ -232,6 +253,7 @@ export function detectTurnFindings(
 ): Finding[] {
   const findings: Finding[] = [];
   const silentNoopFloorTs = opts.silentNoopFloorTs ?? SILENT_NOOP_FLOOR_TS;
+  const routeFieldShipTs = opts.routeFieldShipTs ?? ROUTE_FIELD_SHIP_TS;
   for (const t of ownedTurns(agent, turns)) {
     // Same unvalidated-JSON hazard as `ownedTurns`: `turn_id` is typed
     // `string | undefined` but a row on disk can carry any JSON value, and
@@ -242,6 +264,7 @@ export function detectTurnFindings(
     const tl = typeof t.tools === "number" ? t.tools : 0;
     const dur = typeof t.duration_ms === "number" ? t.duration_ms : 0;
     const synthetic = tid.includes("synthetic-"); // gateway-injected, not a real job
+    const route = typeof t.route === "string" ? t.route : undefined;
     const ts = isoFromTs(t.ts);
 
     // send_failed (gateway PR B): the run finished but the answer did not fully
@@ -274,10 +297,11 @@ export function detectTurnFindings(
         ts,
       });
     }
-    // silent no-op: completed, zero tools, real (non-synthetic). Windowed to
-    // turns at/after the fixed floor so stale pre-fix backlog stops scoring.
-    // Rows lacking a `ts` are dropped from this finding (real gateway rows
-    // always carry `ts` — turn-record-status.ts writes it unconditionally).
+    // completed, zero tools, real (non-synthetic), inside the fixed window.
+    // This shape used to ALL score as `silent-no-op-candidate` (sev-3). The
+    // honest `route` field now splits it: a flush-recovered turn (the answer
+    // reached the user via a backstop) is NOT a silent no-op. Rows lacking a
+    // `ts` are dropped (real gateway rows always carry `ts`).
     if (
       st === "complete" &&
       tl === 0 &&
@@ -285,13 +309,43 @@ export function detectTurnFindings(
       t.ts != null &&
       t.ts >= silentNoopFloorTs
     ) {
-      findings.push({
-        signal: "silent-no-op-candidate",
-        agent,
-        turn_id: tid,
-        log_pointer: `turns.jsonl:${tid} tools=0`,
-        ts,
-      });
+      if (route === "flush") {
+        // Answer delivered by a turn-flush / outbox-sweep backstop after the
+        // reply tool was bypassed. Informational (LOW sev) — the user got it.
+        findings.push({
+          signal: "flush-recovered-turn",
+          agent,
+          turn_id: tid,
+          log_pointer: `turns.jsonl:${tid} tools=0 route=flush`,
+          ts,
+        });
+      } else if (route === "reply" || route === "stream") {
+        // Delivered honestly via reply/stream — not a no-op, no finding.
+      } else if (route === "none") {
+        // Nothing reached the user. Genuine silent no-op — by construction rare;
+        // a nonzero count means a real delivery invariant broke. sev-3.
+        findings.push({
+          signal: "silent-no-op-candidate",
+          agent,
+          turn_id: tid,
+          log_pointer: `turns.jsonl:${tid} tools=0 route=none`,
+          ts,
+        });
+      } else {
+        // Legacy row: no `route` field. Age out the stale pre-route backlog
+        // (predates the field) so it stops scoring sev-3; but a field-less row
+        // AT/AFTER the ship epoch is a regression (the gateway dropped the
+        // field) — treat it as `none` so it still surfaces.
+        if (t.ts >= routeFieldShipTs) {
+          findings.push({
+            signal: "silent-no-op-candidate",
+            agent,
+            turn_id: tid,
+            log_pointer: `turns.jsonl:${tid} tools=0`,
+            ts,
+          });
+        }
+      }
     }
   }
   return findings;

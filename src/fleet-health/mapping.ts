@@ -54,6 +54,17 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "know-what-my-agent-is-doing",
     signature: "silent-no-op:completed-zero-tools",
   },
+  "flush-recovered-turn": {
+    // A zero-tool turn whose answer WAS delivered via a turn-flush / outbox
+    // backstop (route `flush`). It is the honest counterpart to
+    // `silent-no-op-candidate` on the same job — the operator wants to know it
+    // happened (the reply tool was bypassed), but the user did receive the
+    // answer, so it is informational, not a delivery failure. severity 1.
+    failure_mode: "drift",
+    severity: 1,
+    job_spec: "know-what-my-agent-is-doing",
+    signature: "flush-recovered:completed-zero-tools-route-flush",
+  },
   "duplicate-delivery-represent": {
     failure_mode: "duplicate",
     severity: 2,

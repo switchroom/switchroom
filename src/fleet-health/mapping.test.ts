@@ -32,6 +32,13 @@ describe("signal → job-spec mapping", () => {
     expect(m.severity).toBe(3);
   });
 
+  it("routes a flush-recovered turn to the same job, informational severity 1", () => {
+    const m = SIGNAL_MAP["flush-recovered-turn"];
+    expect(m.job_spec).toBe("know-what-my-agent-is-doing");
+    expect(m.failure_mode).toBe("drift");
+    expect(m.severity).toBe(1);
+  });
+
   it("builds a stable dedup key <job_spec>:<signature>", () => {
     const f: Finding = {
       signal: "duplicate-delivery-represent",
