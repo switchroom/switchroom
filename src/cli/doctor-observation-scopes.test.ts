@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   OBSERVATION_SCOPE_CHECK_NAME,
   OBSERVATION_SCOPE_WARN_RATIO,
+  OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT,
   checkObservationScopeSaturation,
   classifyObservationScopeSaturation,
   computeScopeSaturation,
@@ -52,6 +53,7 @@ const report = (over: Partial<BankScopeReport> & { bankId: string }): BankScopeR
   observationsEnabled: true,
   hasScopeLimitRules: false,
   scopeCount: 0,
+  untaggedCount: 0,
   saturated: [],
   pendingConsolidation: null,
   ...over,
@@ -68,6 +70,8 @@ const reportFor = (
     bankId,
     cap,
     scopeCount: scopes.length,
+    // Mirror inspectBankScopes: the untagged scope is tracked, never saturated.
+    untaggedCount: scopes.filter((s) => s.tags.length === 0).reduce((n, s) => n + s.count, 0),
     saturated: computeScopeSaturation(scopes, cap).filter((s) => s.status !== "ok"),
     pendingConsolidation,
   });
@@ -171,16 +175,22 @@ describe("counting the way the engine counts", () => {
     expect(child?.status).toBe("ok");
   });
 
-  it("never counts the untagged scope, which the engine does not cap", () => {
+  it("never counts the untagged scope toward the per-scope cap saturation", () => {
     // consolidator.py:1605 guards with `if max_obs >= 0 and fact_tags:`, and
     // _count_observations_for_scope documents "Observations with no tags are
-    // not counted". A bank whose global scope is huge is behaving as designed;
-    // reporting it would be a permanent false FAIL.
+    // not counted". The untagged scope must never appear as a cap FAIL —
+    // reporting it as saturated would be a permanent false FAIL on a bank
+    // behaving exactly as designed. (Its uncapped GROWTH is watched separately;
+    // see the "untagged global scope growth watch" block below.)
     const sat = computeScopeSaturation([scope([], 50_000), scope(["a"], 10)], 1000);
     expect(sat.some((s) => s.tags.length === 0)).toBe(false);
-    expect(classifyObservationScopeSaturation([
+    // No tagged scope is over its cap, so the cap dimension is clean — the only
+    // reason this bank is not `ok` is the growth watch, never a saturation fail.
+    const result = classifyObservationScopeSaturation([
       reportFor("bank", [scope([], 50_000), scope(["a"], 10)]),
-    ]).status).toBe("ok");
+    ]);
+    expect(result.detail).not.toContain("at or over the cap");
+    expect(result.detail).not.toContain("50,000/");
   });
 
   it("is order-insensitive across scopes that share tags", () => {
@@ -235,6 +245,64 @@ describe("thresholds", () => {
     // 1164 > 1009, so the containment-heavy scope leads.
     expect(firstListed).toBeGreaterThanOrEqual(0);
     expect(firstListed).toBeLessThan(secondListed as number);
+  });
+});
+
+describe("untagged global scope growth watch", () => {
+  // Since #4035 the `curated` strategy sends every all-volatile retain (a bare
+  // session UUID, `parent_session:*`) to the UNTAGGED scope, which the engine
+  // never caps. It is the one scope that grows without a wall, so the row must
+  // WARN on it before the pool is a drag — a fresh dimension from cap saturation.
+  const bigUntagged = OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT + 1;
+
+  it("WARNS when a bank's untagged scope crosses the watch line, and names it", () => {
+    const result = classifyObservationScopeSaturation([
+      reportFor("klanker", [scope([], bigUntagged), scope(["s"], 10)]),
+    ]);
+    expect(result.status).toBe("warn");
+    expect(result.detail).toContain("klanker");
+    expect(result.detail).toContain(bigUntagged.toLocaleString());
+    expect(result.detail).toContain("growth watch");
+  });
+
+  it("stays ok one observation below the watch line", () => {
+    const result = classifyObservationScopeSaturation([
+      reportFor("klanker", [scope([], OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT - 1), scope(["s"], 10)]),
+    ]);
+    expect(result.status).toBe("ok");
+    expect(result.detail).not.toContain("growth watch");
+  });
+
+  it("keeps a cap FAIL as fail but still reports the growing untagged scope", () => {
+    // A saturated tagged scope is the more urgent problem (output is being
+    // discarded), so it wins the status — but the growth note must still ride
+    // along so the operator sees both.
+    const result = classifyObservationScopeSaturation([
+      reportFor("busy", [scope(["s"], 1000), scope([], bigUntagged)], 1000, 5_000),
+    ]);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toContain("at or over the cap");
+    expect(result.detail).toContain("growth watch");
+    expect(result.detail).toContain("busy " + bigUntagged.toLocaleString());
+  });
+
+  it("does not watch the untagged scope of a bank with observations disabled", () => {
+    const result = classifyObservationScopeSaturation([
+      report({ bankId: "off", observationsEnabled: false, untaggedCount: bigUntagged, scopeCount: 1 }),
+    ]);
+    expect(result.status).toBe("skip");
+    expect(result.detail).not.toContain("growth watch");
+  });
+
+  it("warns on a growing sink even when no bank can be cap-judged", () => {
+    // observation_scope_limits makes the bank uncap-judgeable, but the untagged
+    // growth watch is independent of the cap, so it must not be swallowed.
+    const result = classifyObservationScopeSaturation([
+      report({ bankId: "ruled", hasScopeLimitRules: true, untaggedCount: bigUntagged, scopeCount: 1 }),
+    ]);
+    expect(result.status).toBe("warn");
+    expect(result.detail).toContain("growth watch");
+    expect(result.detail).toContain("ruled");
   });
 });
 

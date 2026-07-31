@@ -540,30 +540,56 @@ agents:
 
 **Cascade: override** (per-agent wins over profile/defaults). Omit the field to inherit the on-by-default. Operationally the knob threads the same way as the other recall tuning: the switchroom default is pinned in the plugin's `settings.json`, and `start.sh` exports `HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE` only when you override it (the env value wins at plugin load). Serves the `remember-across-sessions` job.
 
-### Pooling observations across agents — `memory.observation_scopes`
+### Observation scopes — curated by default
 
-Hindsight stamps every retained row with an **observation scope**, which decides where consolidation files the observations it derives from that row. The engine default is **`combined`**: one consolidation pass using all the tags on the retain together, producing an observation tagged with that full set. Switchroom stamps exactly one tag per retain (`retainTags: ["{session_id}"]`), so that single pass is scoped to a single session. Because a session id never repeats, each session creates a fresh observation rather than growing an existing one. Several agents writing into one shared bank therefore end up in parallel per-session silos: each agent's observations consolidate on their own and never merge, so the shared bank never builds a shared picture.
+Hindsight stamps every retained row with an **observation scope**, which decides which other observations consolidation will dedup and merge this row against. Two things set that scope: switchroom's per-retain **strategy** (`observationScopeStrategy`, curated by default) and an optional **operator pin** (`memory.observation_scopes`, which overrides the strategy).
 
-Set `memory.observation_scopes: shared` to send an agent's retains into **one global untagged scope** instead:
+**Why a strategy exists.** Switchroom stamps volatile per-session provenance on every retain: the `{session_id}` retain tag resolves to a bare UUID, and sub-agent (sidechain) retains add `parent_session:<uuid>` and a `<uuid>-sub-<agent>` id. Under Hindsight's engine default (`combined`) an observation only dedups against others carrying the *identical* tag set, so those volatile tags turn every session into its own dedup island and cross-session merging never happens — measured at 99.5% of observations pocketed one-per-session on the live overlord bank before this shipped (#4035).
+
+**What `curated` does (the default, since #4035).** For each retain it strips the volatile provenance tags from the *consolidation scope* while **leaving them on the source fact** (so they are still queryable and recall-filterable), then:
+
+- **non-empty stable tag set** → an explicit `[[stable…]]` scope. Stable semantic tags (`lesson`, `sidechain`, `agent_type:*`, entities) ride the scope, so recall tag-weighting still fires on the observation layer and observations that share real meaning consolidate together across sessions.
+- **all-volatile / empty** → `shared`, i.e. the one global untagged scope.
+
+The volatile patterns are `parent_session:*` and a bare RFC-4122 UUID (including the `<uuid>-sub-<agent>` sidechain form) — `DEFAULT_VOLATILE_SCOPE_PATTERNS` in the plugin's `lib/config.py`. A curated retain never raises: a bad strategy degrades to `curated`, a bad pin degrades to the engine default, both shouted on stderr — a config typo can never lose a turn.
+
+**Choosing the strategy — `observationScopeStrategy`.** Four values (`lib/config.py:OBSERVATION_SCOPE_STRATEGIES`):
+
+| value | effect |
+|---|---|
+| `curated` | **default.** Strip volatile provenance tags, keep stable ones (above). |
+| `shared` | Send *every* retain to the one global untagged scope — the whole bank pools into a single belief set. What agents deliberately sharing one bank want. |
+| `combined` / `off` | Opt out: emit no per-row scope at all, restoring the pre-#4035 engine default (`combined`, per-session islands). Byte-identical wire body to an unconfigured pre-feature client. |
+
+There is **no dedicated `memory.observation_scope_strategy` knob in `switchroom.yaml` yet.** Today you select a non-default strategy in one of two ways:
+
+1. **Raw env** on the agent — set `HINDSIGHT_OBSERVATION_SCOPE_STRATEGY` in the agent's `env:` map (it is propagated into the container and read by the plugin, `lib/config.py` `ENV_MAPPINGS`):
+
+   ```yaml
+   agents:
+     clerk:
+       env:
+         HINDSIGHT_OBSERVATION_SCOPE_STRATEGY: shared   # or combined / off
+   ```
+
+2. **Pin the scope** with `memory.observation_scopes` (below), which wins over the strategy outright.
+
+**Pinning a scope — `memory.observation_scopes`.** A pin is an operator override that takes precedence over the strategy for every retain. Use it to force one Hindsight scope regardless of tags:
 
 ```yaml
-defaults:
-  memory:
-    observation_scopes: shared    # pool the whole fleet's observations
-
 agents:
   clerk:
     memory:
-      observation_scopes: shared  # or just the agents sharing a bank
+      observation_scopes: shared     # force the global untagged scope
 ```
 
-**Omitted by default.** Leave it unset and the field never goes on the wire at all — the engine's own default stands and nothing about your retains changes. Only set it on agents that genuinely share a bank; on an agent with its own bank it buys nothing.
+Accepted pin values are `per_tag`, `combined`, `all_combinations` and `shared` — the set Hindsight accepts as a bare string. **`combined` is the pin form of opting out** (restores the pre-feature engine default). Anything off that list is **rejected at `switchroom apply`** — the only place a typo is stopped before it exists anywhere; a silently-ignored one would keep retaining at the wrong scope and surface months later as a bank whose observations never merged.
 
-It applies to *every* retain path — the Stop hook, sub-agent (sidechain) retains, the boot reconciler, the pending-queue drain and the historical backfill — and the value is carried on the queued payload, so a retain that fails now and drains hours later still lands in the scope it was written for. Changing the knob does **not** re-scope already-consolidated observations; it binds new retains only.
+A pin (or a raw strategy env) can still carry a bad value by a path `apply` cannot see — a raw `HINDSIGHT_OBSERVATION_SCOPES` export, or a hand-edited installed `settings.json`. There, **the retain always wins over the scope**: the plugin drops the bad field, retains the turn at the engine's own default scope (exactly what an unconfigured agent does) and prints the offending value to the hook's stderr. It deliberately does *not* fail the retain — that would delete the turn, and every producer would keep deleting turns for as long as the bad value sat in the config. A wrong scope you can fix and re-consolidate; a lost turn is gone.
 
-Accepted values are `per_tag`, `combined`, `all_combinations` and `shared` — the set Hindsight accepts. Anything else is **rejected at `switchroom apply`**. That is the gate that matters: it is the only place a typo is stopped before it exists anywhere, and a silently-ignored one would keep retaining at the engine default and only surface months later as a bank whose observations never merged.
+Both the strategy and the pin apply to *every* retain path — the Stop hook, sub-agent (sidechain) retains, the boot reconciler, the pending-queue drain and the historical backfill — and the resolved scope is carried on the queued payload, so a retain that fails now and drains hours later still lands in the scope it was written for. Changing either does **not** re-scope already-consolidated observations; it binds new retains only.
 
-A bad value can still reach the plugin by a path `apply` cannot see — a raw `HINDSIGHT_OBSERVATION_SCOPES` export, or a hand-edited installed `settings.json`. There, **the retain always wins over the scope**: the plugin drops the bad field, retains the turn at the engine's own default scope (exactly what an unconfigured agent does) and prints the offending value to the hook's stderr. It deliberately does *not* fail the retain — doing that would not "reject" the typo, it would delete the turn, and every producer would keep deleting turns for as long as the bad value sat in the config. A wrong scope you can fix and re-consolidate; a lost turn is gone.
+**The untagged global scope is now the uncapped default sink.** Under `curated`, every all-volatile retain lands in the `shared` (untagged) scope, and the engine deliberately does **not** cap the untagged scope (`max_observations_per_scope` only guards tagged scopes). So that one scope grows without a wall. `switchroom doctor` watches its size — the `hindsight observation scopes` row WARNs when a bank's untagged scope crosses 10,000 observations (`OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT` in `src/cli/doctor-observation-scopes.ts`), well before the pool is large enough to drag consolidation. Nothing is discarded (unlike a saturated *tagged* scope, which is a FAIL) — it is a growth signal.
 
 The session-handoff mirror — the briefing switchroom writes into the agent's own bank on shutdown — is the one path that fails closed instead, because it is risking less: the on-disk handoff sidecars are already written, so the next session still reorients and only the recallable copy is skipped. `switchroom handoff` exits non-zero in that case, which makes `run-hook.sh` file a red `hook:handoff` issue carrying the reason — visible in `switchroom issues` and on the Telegram issues card, and self-clearing on the next clean shutdown once the value is fixed.
 
@@ -575,9 +601,9 @@ Be aware of the limit: past `apply`, a bad value on the **retain** path is visib
 
 `switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. The same default is baked into the `--compose` snippet output.
 
-What this actually caps: per-*tag scope* observation count. Switchroom's vendored plugin retains with `retainTags: ["{session_id}"]`, so each session becomes its own scope and the cap bounds a single very-long session at 1000 observations. Most sessions stay well below 1000 — this is a safety rail for the worst case (a Telegram session running uninterrupted for weeks), not an active limit on most agents. Tagless observations are unaffected.
+What this actually caps: per-*tag scope* observation count. Under the default `curated` strategy (above) retains consolidate into stable-tag scopes (`lesson`, `sidechain`, `agent_type:*`, entities) that persist across sessions, so this cap now bounds a *durable* scope's growth rather than a single session's — a busy stable scope on a shared bank is the one to watch, and `switchroom doctor`'s `hindsight observation scopes` row reports any scope past 80% of the cap (counting by containment, the way the engine does). **Tagless/untagged observations are not capped at all** — the engine skips them (`if max_obs >= 0 and fact_tags:`), which is exactly why the untagged `shared` sink needs its own growth watch (see "Observation scopes" above).
 
-This is **not** a fix for vectorize-io/hindsight#1284 (the upstream unbounded-growth bug for whole-bank consolidation) — that's their work to do. It's a companion guardrail.
+This is **not** a fix for vectorize-io/hindsight#1284 (the upstream unbounded-growth bug for whole-bank consolidation) — that's their work to do. It's a companion guardrail, and the untagged-scope growth watch in `switchroom doctor` is the visibility half.
 
 You don't need to do anything to opt in. To change it, set the key under `hindsight.env` — it's a managed key, so your value replaces switchroom's default on both the `docker run` and `--compose` paths and survives the next `switchroom apply`:
 
