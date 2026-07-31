@@ -457,7 +457,7 @@ import {
   type SendReplyGatewayDeps,
   type DeliverCapturedProseDeps,
 } from './outbound-send-path.js'
-import { handleSessionEvent as handleSessionEventCore } from './stream-render.js'
+import { handleSessionEvent as handleSessionEventCore, drainParkedTurnStartsForChat } from './stream-render.js'
 import { createNarrativeLane } from './narrative-lane.js'
 import {
   parseAgentCallback,
@@ -9669,14 +9669,14 @@ function gatewayLivenessWiringDeps() {
     turnLiveForItsTopic,
     endCurrentTurnForKey,
     // Getter, not an eager read: `pendingInboundBuffer` (const) is declared
-    // LATER in this module (~9863) than the module-load `startTimer` call that
-    // invokes this builder (isGatewayMain path). A by-value capture here is a
-    // temporal-dead-zone ReferenceError that crash-loops every gateway boot
-    // (#3392 regression). Deferring to a getter — matching getInboundSpool /
-    // getTurnsDb / ipcServer — means the binding is only read when the
-    // fallback actually fires, well after module eval.
+    // LATER than the module-load `startTimer` call that invokes this builder,
+    // so a by-value capture is a temporal-dead-zone ReferenceError that
+    // crash-loops boot (#3392). A getter (matching getInboundSpool / getTurnsDb
+    // / ipcServer) is read only when the fallback fires, well after module eval.
     getPendingInboundBuffer: () => pendingInboundBuffer,
     trackRedeliveredInbound,
+    // Two-state desync unwedge (#3927): drain the parked store the fallback else leaves latched — see liveness-wiring + stream-render drainParkedTurnStartsForChat.
+    drainParkedTurnStarts: (chatId: string, threadId: number | null): number => drainParkedTurnStartsForChat(gatewayStreamRenderDeps(), chatId, threadId != null ? String(threadId) : null).length,
     closeActivityLane,
     closeProgressLane,
     // Stage B: escalate a mid-tool + marker-stale fallback to a real restart.

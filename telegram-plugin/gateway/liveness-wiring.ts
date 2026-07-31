@@ -62,6 +62,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     endCurrentTurnForKey,
     getPendingInboundBuffer,
     trackRedeliveredInbound,
+    drainParkedTurnStarts,
     closeActivityLane,
     closeProgressLane,
     hangRestart,
@@ -593,6 +594,16 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       getInboundSpool(),
       trackRedeliveredInbound,
     )
+    // Two-state desync unwedge. `pendingInboundBuffer` (above) is NOT where a
+    // wedge-behind-a-dead-lock message sits: an already-`enqueue`d message lives
+    // in stream-render's `parkedTurnStarts`, and the busy park gate stays latched
+    // while that store is non-empty. A hung REPL never emits the `dequeue`/
+    // `remove` that drain it, so drain it HERE, scoped to the wedged chat/thread,
+    // routing each envelope back through the real `dequeue` turn-start path. The
+    // count joins the `drained_buffered` field below so the log stops reading a
+    // misleading `0/0` while real user messages were stranded. Guarded getter:
+    // absent (older deps) → 0, so the fallback degrades to its prior behaviour.
+    const fbDrainedParked = drainParkedTurnStarts?.(fbChatId, fbThreadId ?? null) ?? 0
     process.stderr.write(
       `telegram gateway: silence-poke framework-fallback ended wedged turn ` +
       `chat=${fbChatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
@@ -601,6 +612,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       // keyed liveness check skipped the teardown, so the field lied.
       `currentTurn_nulled=${tearsDownLiveTurn} ` +
       `drained_buffered=${fbRedeliver.redelivered}/${fbRedeliver.drained}` +
+      `${fbDrainedParked > 0 ? ` drained_parked=${fbDrainedParked}` : ''}` +
       `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}` +
       `${fbExtraPurge.purged.length > 0 ? ` extra_keys_purged=${fbExtraPurge.purged.length}` : ''}\n`,
     )

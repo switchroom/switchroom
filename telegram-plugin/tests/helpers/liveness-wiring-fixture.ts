@@ -154,6 +154,9 @@ export function makeLivenessFixture(
     purgeReactionTracking: () => {},
     getPendingInboundBuffer: () => ({ drain: () => [] }),
     trackRedeliveredInbound: () => {},
+    // Default: no parked store wired (returns 0). Tests exercising the parked
+    // drain override this with the real `drainParkedTurnStartsForChat`.
+    drainParkedTurnStarts: (_chatId: string, _threadId: number | null) => 0,
     closeActivityLane: () => {},
     closeProgressLane: () => {},
     hangRestart: null,
