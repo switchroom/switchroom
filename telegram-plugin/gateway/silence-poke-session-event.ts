@@ -12,6 +12,7 @@ import type { SessionEvent } from '../session-tail.js'
 import { isTelegramSurfaceTool } from '../tool-names.js'
 import { toolLabel } from '../tool-labels.js'
 import { applyBackgroundShellLiveness } from './background-shell-liveness.js'
+import { removeCompactionMarker, resolveTelegramStateDir } from './compaction-marker.js'
 
 /** The silence-poke module namespace (kept as `typeof` so no surface drift). */
 type SilencePoke = typeof import('../silence-poke.js')
@@ -83,6 +84,18 @@ export function applySilencePokeSessionEvent(
     if (ev.toolUseId != null && ev.toolUseId.length > 0) {
       silencePoke.noteToolEnd(key, ev.toolUseId, Date.now())
     }
+  } else if (ev.kind === 'compact_boundary') {
+    // #4058 — mid-turn compaction ENDED (the transcript's compact_boundary
+    // record only exists once compaction is done). Two effects:
+    //   1. Clear the PreCompact marker so the compaction defer stops holding
+    //      the 300s fallback (a post-compaction wedge fires on schedule).
+    //   2. Count the boundary as PRODUCTION: the silence clock ran the whole
+    //      compaction, so without a reset the fallback would fire on the very
+    //      next tick — before the resumed model's first output can land. The
+    //      transcript resuming IS observable progress; a turn that stays
+    //      silent AFTER compaction still fires one full window later.
+    removeCompactionMarker(resolveTelegramStateDir())
+    silencePoke.noteProduction(key, Date.now())
   }
   // #3519 sharpen: feed background-shell liveness (ALIVE/DEAD) to silence-poke — see background-shell-liveness.ts.
   applyBackgroundShellLiveness(silencePoke, key, ev)

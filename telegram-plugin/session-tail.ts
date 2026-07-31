@@ -158,6 +158,12 @@ export type SessionEvent =
    * ~300s wedge recovery once the launching bash is no longer running.
    */
   | { kind: 'task_notification'; taskId: string; status: string }
+  // #4058 — system compact_boundary: the CLI finished compacting the session
+  // mid-turn (the record is written at compaction END — it embeds the
+  // compaction's own durationMs). Consumed by silence-poke wiring to clear
+  // the PreCompact "compaction in flight" marker and count the boundary as
+  // production so the resumed turn gets a fresh silence window.
+  | { kind: 'compact_boundary'; trigger: string | null; compactDurationMs: number | null }
   // `reason` is set ONLY by an internal gateway-synthesized turn_end (never by
   // the JSONL projection). `answer-ready-quiescence` (PR A) marks the positive
   // deterministic quiescence-flush signal, which — unlike the orphaned-reply
@@ -700,6 +706,20 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     return [
       { kind: 'turn_end', durationMs: (obj.durationMs as number | undefined) ?? 0 },
     ]
+  }
+
+  // #4058 — system compact_boundary: written when a mid-turn (auto or manual)
+  // compaction FINISHES. Real shape observed in live transcripts:
+  //   { type:"system", subtype:"compact_boundary", content:"Conversation
+  //     compacted", compactMetadata:{ trigger:"auto", preTokens, postTokens,
+  //     durationMs, ... } }
+  if (type === 'system' && obj.subtype === 'compact_boundary') {
+    const meta = obj.compactMetadata as { trigger?: unknown; durationMs?: unknown } | undefined
+    return [{
+      kind: 'compact_boundary',
+      trigger: typeof meta?.trigger === 'string' ? meta.trigger : null,
+      compactDurationMs: typeof meta?.durationMs === 'number' ? meta.durationMs : null,
+    }]
   }
 
   return []

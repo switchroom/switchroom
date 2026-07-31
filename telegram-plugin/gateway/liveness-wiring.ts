@@ -25,6 +25,7 @@ import { logStreamingEvent } from '../streaming-metrics.js'
 import { clearSilentEndState } from '../silent-end.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { removeTurnActiveMarker, readTurnActiveMarkerAgeMs } from './turn-active-marker.js'
+import { readCompactionMarkerAgeMs } from './compaction-marker.js'
 import { decideHangRestart } from './hang-restart-decision.js'
 import { recordTurnEnd } from '../registry/turns-schema.js'
 import { hostdGetStatusOnce } from './hostd-dispatch.js'
@@ -70,6 +71,20 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
   thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS, floor: SILENCE_FLOOR_MS },
   deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
   isLegitimatelyWorking: (key) => isLegitimatelyWorking(key),
+  // #4058 — mid-turn auto-compaction defer. The PreCompact hook writes the
+  // compaction marker at compaction START (the transcript only records the
+  // END, via `compact_boundary`); while the marker is present AND younger
+  // than the fallback hard ceiling, silence-poke defers the 300s fallback the
+  // same way it does for an in-flight tool. The age bound makes a marker
+  // leaked by a crash (boundary never observed) self-heal: it can never hold
+  // a future genuine wedge past one ceiling window. The marker is process-
+  // wide, not keyed — the gateway runs ONE Claude session, so a compaction
+  // belongs to whichever turn is live (same accepted trade-off as
+  // `toolFlightTracker` in gateway.ts `isLegitimatelyWorking`).
+  isCompactionInFlight: () => {
+    const ageMs = readCompactionMarkerAgeMs(STATE_DIR)
+    return ageMs != null && ageMs >= 0 && ageMs < SILENCE_FALLBACK_HARD_MS
+  },
   // #3552 — orphan-state reaper predicate. Deliberately the SAME condition the
   // `onFrameworkFallback` late-fire guard below uses: no `activeTurnStartedAt`
   // entry AND no current turn ⇒ the turn this state belongs to is over. Note
