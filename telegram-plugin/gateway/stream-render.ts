@@ -232,6 +232,63 @@ export function __parkedTurnStartCountForTest(): number {
   return parkedTurnStarts.length
 }
 
+/**
+ * Silence-fallback unwedge for the parked store (the two-state desync fix).
+ *
+ * The park gate in `case 'enqueue'` treats the session as busy while EITHER a
+ * live `currentTurn` exists OR `parkedTurnStarts` is non-empty. The 300 s
+ * framework-fallback (`liveness-wiring.ts` onFrameworkFallback) that recovers a
+ * hung turn nulls `currentTurn` and redelivers `pendingInboundBuffer` — but
+ * before this it NEVER touched `parkedTurnStarts`. When the claude REPL hangs
+ * mid-turn the CLI's own `dequeue` / `remove` events (the only real drains of
+ * this store) never arrive, so a leftover parked envelope latches the busy gate
+ * permanently and every later inbound parks unseen until a manual container
+ * restart (gymbro parked msgs 4502→4504 behind a dead lock until SIGTERM). The
+ * `drained_buffered=0/0` fallback log was honest-but-misleading: it counted the
+ * empty `pendingInboundBuffer`, not this store, where the real messages sat.
+ *
+ * This drains the parked envelopes for ONE chat/thread — scoped, never global,
+ * so a fallback fired for chat A cannot release chat B's queued messages — and
+ * hands each back into turn processing through the EXACT `beginTurn` path a real
+ * `dequeue` uses. Envelopes are re-begun in arrival order (oldest first) so the
+ * NEWEST, the message the user is actually waiting on, ends up the live turn and
+ * the older ones are cleanly superseded (never silently dropped). The store is
+ * kept module-encapsulated: callers get a function, not the array. Returns the
+ * drained envelopes so the caller can log an honest count. Idempotent w.r.t. a
+ * late CLI event: once drained, a subsequent `dequeue` finds an empty store and
+ * `takeParkedTurnStart` returns null, so a message can never be double-started.
+ */
+export function drainParkedTurnStartsForChat(
+  deps: StreamRenderDeps,
+  chatId: string | null,
+  threadId: string | null,
+): TurnStartEnvelope[] {
+  const wantThread = envThreadIdNum(threadId)
+  const drained: ParkedTurnStart[] = []
+  // Splice out the matching entries, preserving arrival order (oldest first).
+  for (let i = 0; i < parkedTurnStarts.length; ) {
+    const entry = parkedTurnStarts[i]!
+    if (entry.chatId === chatId && envThreadIdNum(entry.threadId) === wantThread) {
+      drained.push(entry)
+      parkedTurnStarts.splice(i, 1)
+    } else {
+      i++
+    }
+  }
+  for (const env of drained) {
+    process.stderr.write(
+      `telegram gateway: parked-turn-start drained on silence-fallback ` +
+        `chat=${env.chatId ?? '-'} thread=${envThreadIdNum(env.threadId) ?? '-'} ` +
+        `msg=${env.messageId ?? '-'}\n`,
+    )
+    // Reuse the dequeue turn-start path verbatim — beginTurn adopts the parked
+    // envelope's queued card (Part B) so the frozen "⏳ Queued" surface becomes
+    // the live progress card rather than lingering.
+    beginTurn(deps, env)
+  }
+  return drained
+}
+
 // ─── Queued-turn card send / finalize (Part B) ───────────────────────────────
 // These use the ALREADY-injected `bot` + `robustApiCall` deps, so the whole
 // feature lives in stream-render.ts with zero new wiring in gateway.ts. No
