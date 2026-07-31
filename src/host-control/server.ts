@@ -388,16 +388,18 @@ export interface StatusEntry {
   /** Agent that failed the version assert (when failed_step is restart). */
   failed_agent?: string;
   /**
-   * Components still BEHIND the target after the roll (#3928). Set only
-   * when `failed_step === "verify-components"` — the roll's own terminal
-   * convergence proof failed, i.e. every agent reached the target but a
-   * component the roll was answerable for (`switchroom-web`,
-   * `switchroom-hindsight-autoheal`, …) did not.
+   * Structured residue names carried on a roll that converged its agents but
+   * left something behind — a forward-fix, not a rollback. Two producers:
+   *   - `failed_step === "verify-components"` (#3928): component(s) still
+   *     BEHIND the target (`switchroom-web`, `switchroom-hindsight-autoheal`, …).
+   *   - `failed_step === "ensure-banks"`: agent(s) whose Hindsight bank could
+   *     not be created during the roll (the recovery is restarting that agent,
+   *     never a rollback).
    *
    * Carried as structured data rather than left in the stderr tail so an
-   * operator reading `get_status` from TELEGRAM is told exactly which
-   * components are stranded — the whole point of the managed path is that
-   * they never have to open a host shell to find out.
+   * operator reading `get_status` from TELEGRAM is told exactly what is
+   * stranded — the whole point of the managed path is that they never have to
+   * open a host shell to find out.
    */
   drifted?: string[];
   /** Actual version detected on failed_agent (null = unreachable). BONUS #2458 got-field gap. */
@@ -4402,7 +4404,19 @@ export class HostdServer {
               `per-component install named in the rollout warnings, then ` +
               `\`switchroom update --check\` to confirm.`,
           ]
-        : [
+        : entry.failed_step === "ensure-banks"
+          ? // Same class as verify-components: the agents reached the target and
+            // the pin is committed — the residue is a named agent whose Hindsight
+            // bank could not be created. Restarting that agent re-runs its bank
+            // creation; re-running the whole roll would not help.
+            [
+              `Unattended auto-update roll to ${entry.pin ?? "?"} rolled ` +
+                `${(entry.rolled ?? []).length} agent(s) but could NOT create the ` +
+                `Hindsight bank for: ${drifted.join(", ") || "one or more agents"}. ` +
+                `Re-running the roll will not fix this — restart the named agent(s) ` +
+                `to re-run bank creation now that Hindsight is back up.`,
+            ]
+          : [
             `Unattended auto-update roll to ${entry.pin ?? "?"} FAILED at ` +
               `${entry.failed_step ?? "unknown step"}` +
               `${entry.failed_agent ? ` (agent ${entry.failed_agent})` : ""}. ` +
@@ -4467,6 +4481,19 @@ export class HostdServer {
           `${(entry.drifted ?? []).join(", ") || "a component"}, not the fleet. ` +
           `Rolling back would move working agents backwards; converge the ` +
           `named component(s) forward instead.`,
+      );
+      return notes;
+    }
+    // ensure-banks is the same forward-fix class: the fleet is on the target
+    // and the pin is committed; a rollback would drag working agents backwards
+    // to fix a missing bank. Restart the named agent(s) instead.
+    if (entry.failed_step === "ensure-banks") {
+      notes.push(
+        `No automatic rollback: the agent fleet reached ` +
+          `${entry.pin ?? "the target"} and the pin is committed — the gap is a ` +
+          `missing Hindsight bank for ${(entry.drifted ?? []).join(", ") || "an agent"}, ` +
+          `not the fleet. Restart the named agent(s) to re-create the bank; do ` +
+          `not roll back.`,
       );
       return notes;
     }

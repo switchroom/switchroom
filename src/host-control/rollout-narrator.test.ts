@@ -549,9 +549,12 @@ describe("LogTailRolloutNarrator", () => {
         persisted.push(pin);
         return true;
       },
+      // Hermetic: refresh-hindsight now runs BEFORE the canary restart, so pin
+      // the probe to false rather than letting it shell out to a real docker.
+      hindsightExists: () => false,
     };
 
-    const result = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    const result = await executeRollout(steps, TARGET, deps, { hostdContext: true });
 
     // Executor aborted at the canary, before rolling anyone or persisting.
     expect(result.ok).toBe(false);

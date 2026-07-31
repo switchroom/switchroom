@@ -61,8 +61,10 @@ export interface AuditEntry {
   failed_step?: string;
   /** Agent that failed the version assert (rollout rows). */
   failed_agent?: string;
-  /** Components still behind the target after the roll (#3928). Present on
-   *  rollout terminal rows with `failed_step === "verify-components"`. */
+  /** Structured residue names on a converged-but-incomplete roll. Present on
+   *  rollout terminal rows with `failed_step === "verify-components"` (#3928,
+   *  component names) or `failed_step === "ensure-banks"` (agent names whose
+   *  Hindsight bank could not be created). */
   drifted?: string[];
   // ─── Rollout phase rows (#2726) ────────────────────────────────────
   /** Agent named in a per-phase rollout row (agent-start/-done, canary-*). */

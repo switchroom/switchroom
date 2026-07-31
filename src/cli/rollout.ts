@@ -65,7 +65,8 @@ import {
   readAuditRaw,
   auditReadFullWindowBytes,
 } from "../host-control/audit-reader.js";
-import { isHindsightContainerExists } from "../setup/hindsight.js";
+import { isHindsightContainerExists, HINDSIGHT_DEFAULT_API_BASE_URL } from "../setup/hindsight.js";
+import { createBank, isHindsightEnabled } from "../memory/hindsight.js";
 import { deployedImageTag, type DockerRunner } from "./deploy-version-guard.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 import {
@@ -90,6 +91,7 @@ export type RolloutStep =
   | { kind: "refresh-hostd" }
   | { kind: "refresh-hindsight" }
   | { kind: "sweep" }
+  | { kind: "ensure-banks" }
   | { kind: "verify-components" };
 
 /**
@@ -99,6 +101,19 @@ export type RolloutStep =
  * rolling BACK — a named component needs finishing forward.
  */
 export const VERIFY_COMPONENTS_STEP = "verify-components";
+
+/**
+ * `failedStep` label for a roll that converged its agents but could not
+ * create a brand-new agent's Hindsight bank (the ordering-fix backstop).
+ *
+ * Same recovery CLASS as {@link VERIFY_COMPONENTS_STEP}: nothing needs
+ * rolling BACK — every agent came back on the target and the pin is
+ * committed. A named agent's bank needs finishing FORWARD. Surfaced as a
+ * structured `drifted[]`-style failure (the agent names), NOT an
+ * `agent reconcile <name>` host-CLI instruction string, so the operator
+ * recovers through the same tappable surface as every other roll outcome.
+ */
+export const ENSURE_BANKS_STEP = "ensure-banks";
 
 export interface RolloutPlanOpts {
   /** Skip the web + hostd + hindsight refresh (step 3). */
@@ -220,6 +235,20 @@ export function planRollout(
     // The bare `apply` reads the env-passed one-shot target, so the canary
     // rolls on the target image WITHOUT a durable pin write first.
     steps.push({ kind: "apply" });
+    // Refresh hindsight BEFORE any agent restarts, not after (ordering fix).
+    // Agent bank creation (`createBank`) runs ONLY inside each agent's
+    // in-container restart-reconcile; if hindsight is unreachable/stale during
+    // the restart window — which it is, when the terminal refresh was the only
+    // thing that recreated it — every agent's `createBank` is silently
+    // skipped, and a brand-new agent then hits a raw FK violation on its first
+    // retain. Recreating hindsight up front means the memory backend is
+    // healthy and on the target tag while agents restart, so each agent's own
+    // createBank can succeed. refresh-hindsight is FATAL on failure and now
+    // runs BEFORE persist-pin (which follows the canary), so a hindsight
+    // failure aborts fail-fast, before any agent is touched, with no pin to
+    // revert — strictly better than the old terminal position. The executor's
+    // refresh-hindsight case still self-guards via hindsightExists().
+    steps.push({ kind: "refresh-hindsight" });
     const [canary, ...rest] = ordered;
     if (canary !== undefined) {
       steps.push({ kind: "restart-agent", agent: canary });
@@ -248,13 +277,14 @@ export function planRollout(
     if (!opts.skipWeb) {
       steps.push({ kind: "refresh-web" });
     }
-    // Recreate the hindsight singleton so a hostd/agent-driven roll doesn't
-    // leave the memory backend a version behind (refresh-hostd stays
-    // host-side; hindsight is a standalone `docker run` hostd can recreate
-    // via the docker socket). The executor's refresh-hindsight case
-    // self-guards via hindsightExists().
-    steps.push({ kind: "refresh-hindsight" });
     steps.push({ kind: "sweep" });
+    // Backstop for the ordering fix: after every agent has restarted (and its
+    // own restart-reconcile has ensured its bank against the now-healthy
+    // hindsight), re-create any bank that still slipped through. Idempotent,
+    // needs only bank_id + apiUrl (no container reconcile). Gated on
+    // hindsightExists() in the executor. A bank that STILL can't be created is
+    // a structured `drifted[]`-style failure, not an `agent reconcile` string.
+    steps.push({ kind: "ensure-banks" });
     // Terminal drift gate (#3928) — read-only, and LAST so it sees the
     // host every preceding step has finished mutating.
     steps.push({ kind: "verify-components" });
@@ -265,15 +295,29 @@ export function planRollout(
   // the web + hostd refresh — unchanged, deliberate.
   if (opts.pinToPersist) steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
   steps.push({ kind: "apply" });
+  // Refresh hindsight BEFORE the restart loop (ordering fix — see the hostd
+  // path above for the full rationale): the memory backend must be healthy and
+  // on the target tag while agents restart so each agent's own in-container
+  // createBank can succeed, instead of being silently skipped against a stale/
+  // absent backend and leaving a brand-new agent to hit a raw FK violation.
+  // Still gated by --skip-web on this path (skip-web here also skips the hostd
+  // + hindsight refresh, per the flag's contract).
+  if (!opts.skipWeb) {
+    steps.push({ kind: "refresh-hindsight" });
+  }
   for (const agent of ordered) {
     steps.push({ kind: "restart-agent", agent });
   }
   if (!opts.skipWeb) {
     steps.push({ kind: "refresh-web" });
     steps.push({ kind: "refresh-hostd" });
-    steps.push({ kind: "refresh-hindsight" });
   }
   steps.push({ kind: "sweep" });
+  // Backstop for the ordering fix (see the hostd path above): re-create any
+  // agent bank that still slipped through, after every restart. Gated on
+  // hindsightExists() in the executor; a bank that stays missing is a
+  // structured failure, not an `agent reconcile` host-CLI string.
+  steps.push({ kind: "ensure-banks" });
   // Terminal drift gate (#3928). Emitted even under --skip-web: the gate's
   // SCOPE is derived from the steps present (see gatedOwners), so skipping
   // the refresh steps exempts those components rather than dropping the
@@ -312,6 +356,12 @@ export function formatRolloutPlan(
         break;
       case "sweep":
         lines.push(`  ${n}. sweep — print per-agent version table`);
+        break;
+      case "ensure-banks":
+        lines.push(
+          `  ${n}. ensure-banks — create any missing agent Hindsight bank ` +
+            `(idempotent backstop; structured failure if one stays missing)`,
+        );
         break;
       case "verify-components":
         lines.push(
@@ -541,6 +591,32 @@ export interface RolloutDeps {
    * when a pin was actually reverted (for the operator-facing warning).
    */
   revertPin?(): boolean;
+  /**
+   * Create (idempotently) the Hindsight memory bank for a rolled agent — the
+   * injectable seam behind the terminal `ensure-banks` backstop step.
+   *
+   * Why this exists: agent bank creation (`createBank`) otherwise runs ONLY
+   * inside each agent's in-container restart-reconcile. If Hindsight is
+   * unreachable during the agent-restart window, that create is silently
+   * skipped; harmless for an existing bank (the pg volume persists it) but a
+   * real hole for a brand-new agent, whose bank is then never created and
+   * whose first `retain` hits a raw FK violation. `ensure-banks` re-runs the
+   * create for every rolled agent AFTER `refresh-hindsight` has recreated the
+   * container, closing that window deterministically instead of leaving the
+   * only recovery to a host-CLI `agent reconcile`.
+   *
+   * Production wires this to `createBank(apiUrl, bankIdFor(agent))` — needs
+   * only a bank id + api url, no container reconcile — and it is idempotent.
+   * Tests inject a fake that reports a bank present or missing. A false result
+   * whose `reason` is "Unreachable" degrades to a warning (each agent's own
+   * restart-reconcile already had its chance); any other failure is a
+   * structural, roll-failing residue (verify-components-class), NOT an
+   * operator instruction to run a host command.
+   *
+   * Optional — when unwired (no hindsight, or a test that never reaches the
+   * step) the `ensure-banks` step is a clean no-op.
+   */
+  ensureBank?(agent: string): Promise<{ ok: true } | { ok: false; reason: string }>;
   /**
    * Probe whether the standalone `switchroom-hindsight` container exists on
    * this host (the `refresh-hindsight` step no-ops cleanly when it doesn't).
@@ -821,12 +897,12 @@ export function evaluateRolloutDrift(
   return { gated, exempt, target: report.target };
 }
 
-export function executeRollout(
+export async function executeRollout(
   steps: RolloutStep[],
   target: string,
   deps: RolloutDeps,
   execOpts: RolloutExecOpts = {},
-): RolloutResult {
+): Promise<RolloutResult> {
   const targetNorm = normalizeVersion(target);
   const rolled: string[] = [];
   const warnings: string[] = [];
@@ -851,6 +927,15 @@ export function executeRollout(
    * see the gate below the pin commit for why the ordering matters.
    */
   let driftVerdict: RolloutDriftVerdict | null = null;
+
+  /**
+   * Agents whose Hindsight bank could NOT be ensured by the terminal
+   * `ensure-banks` backstop (collected in the step, acted on after the loop
+   * alongside the drift gate). A non-"Unreachable" failure here is a
+   * structural, roll-failing residue — the SAME class as a `verify-components`
+   * drift — not a host-CLI instruction. Populated only when the step runs.
+   */
+  const bankEnsureFailed: string[] = [];
 
   /**
    * Single exit point for every stop-the-roll failure. Reverting the pin
@@ -1289,6 +1374,70 @@ export function executeRollout(
           }
           break;
         }
+        case "ensure-banks": {
+          // Terminal backstop for the bank-creation hole this PR closes.
+          // `refresh-hindsight` has already run (reordered to BEFORE the
+          // agent-restart loop), so the container is up and reachable — but a
+          // brand-new agent whose in-container reconcile ran while hindsight
+          // was still down never got its bank created, and its first `retain`
+          // would hit a raw FK violation. Re-run the idempotent create for
+          // EVERY rolled agent so a missing bank is created here rather than
+          // left to a host-CLI `agent reconcile`.
+          const hindsightExists = deps.hindsightExists ?? isHindsightContainerExists;
+          if (!hindsightExists()) {
+            deps.log(`ROLL_STEP ensure-banks — no hindsight container on this host; skipping`);
+            break;
+          }
+          if (!deps.ensureBank) {
+            // Unwired seam (no hindsight api/bank-id resolvable). Never a
+            // silent pass — say the backstop did not run so a missing bank
+            // isn't mistaken for a verified one.
+            warnings.push(
+              `ensure-banks ran with NO bank-ensure hook wired, so brand-new ` +
+                `agents' Hindsight banks were NOT verified. If an agent's first ` +
+                `\`retain\` fails with a foreign-key error, its bank was never ` +
+                `created — recreate it by restarting that agent.`,
+            );
+            break;
+          }
+          deps.log(
+            `ROLL_STEP ensure-banks — creating any missing agent bank (idempotent) for ${rolled.length} agent(s)`,
+          );
+          for (const a of rolled) {
+            let res: { ok: true } | { ok: false; reason: string };
+            try {
+              res = await deps.ensureBank(a);
+            } catch (e) {
+              res = { ok: false, reason: (e as Error).message };
+            }
+            if (res.ok) {
+              deps.log(`  ${a}: bank present`);
+              continue;
+            }
+            if (/unreachable|timeout/i.test(res.reason)) {
+              // Degrade, do NOT fail: the hindsight endpoint was momentarily
+              // unreachable from the roll process, or the probe timed out
+              // (createBank normalizes ECONNREFUSED/undici-connect to
+              // "Unreachable" and an abort to "Timeout"). Neither is proof the
+              // bank is absent — each agent's own restart-reconcile already had
+              // its chance to create it (and did, for every existing agent, off
+              // the persistent pg volume). Only a DEFINITIVE create rejection
+              // (an HTTP error or an MCP isError envelope) fails the roll;
+              // "couldn't reach it to check" is a warning, not a false-negative
+              // residue that drags a converged fleet backwards.
+              deps.log(`  ${a}: bank check ${res.reason.toLowerCase()} (degraded to warning)`);
+              warnings.push(
+                `ensure-banks could not reach Hindsight to verify ${a}'s bank ` +
+                  `(${res.reason}). If ${a} is brand-new and its first \`retain\` ` +
+                  `fails with a foreign-key error, restart it to recreate the bank.`,
+              );
+              continue;
+            }
+            deps.log(`  ✗ ${a}: bank could NOT be created — ${res.reason}`);
+            bankEnsureFailed.push(a);
+          }
+          break;
+        }
         case "verify-components": {
           // #3928 — the roll's own convergence proof. Read-only: one
           // `docker ps` through the same collector `switchroom update
@@ -1401,6 +1550,37 @@ export function executeRollout(
           `journal may cause a later boot to revert it — verify host-side.`,
       );
     }
+  }
+  // ensure-banks gate — a rolled agent whose Hindsight bank still could not
+  // be created after `refresh-hindsight` recreated the container is a
+  // structural residue, NOT a host-CLI instruction. Same two deliberate
+  // properties as the drift gate below: it runs AFTER `commitPin` and does
+  // NOT go through `fail()` (every agent came back on the target and the
+  // durable pin is correct — nothing needs rolling BACK; a bank needs
+  // creating FORWARD), and `rolled` is reported in full so hostd's
+  // unattended-failure path sees a past-canary failure and declines to
+  // auto-roll-back, surfacing the agent names instead. "Unreachable" probe
+  // misses were already degraded to warnings in the step and are absent here.
+  if (bankEnsureFailed.length > 0) {
+    for (const a of bankEnsureFailed) {
+      warnings.push(
+        `${a}'s Hindsight bank could NOT be created during the roll — its ` +
+          `first \`retain\` will fail with a foreign-key error until the bank ` +
+          `exists. Restart ${a} to re-run its bank creation now that Hindsight ` +
+          `is back up.`,
+      );
+    }
+    deps.log(
+      `  ✗ ensure-banks FAILED — ${bankEnsureFailed.length} agent bank(s) ` +
+        `could not be created: ${bankEnsureFailed.join(", ")}`,
+    );
+    return {
+      ok: false,
+      rolled,
+      warnings,
+      failedStep: ENSURE_BANKS_STEP,
+      drifted: bankEnsureFailed,
+    };
   }
   // #3928 — the convergence gate. A roll that leaves an IN-SCOPE component
   // behind the target does not exit 0. Before this, `switchroom rollout`
@@ -1681,6 +1861,19 @@ export function createRolloutDeps(params: {
   spawn?: RolloutSpawnSync;
   /** Injected in tests; defaults to process.stderr. */
   warn?: (line: string) => void;
+  /**
+   * Hindsight HTTP API base (no trailing `/mcp/`). Set ONLY when the fleet
+   * uses the hindsight memory backend — it is what wires the `ensureBank`
+   * hook for the `ensure-banks` backstop. When absent, `ensureBank` is left
+   * unwired and the step no-ops.
+   */
+  hindsightApiUrl?: string;
+  /**
+   * Map an agent name to its Hindsight bank id (`memory.collection ?? name`),
+   * resolved from the loaded config. Paired with `hindsightApiUrl` to wire
+   * `ensureBank`.
+   */
+  resolveBankId?: (agent: string) => string;
 }): RolloutDeps {
   const { configPath, scriptPath, hostdCtx } = params;
   const spawn = (params.spawn ?? (spawnSync as unknown as RolloutSpawnSync));
@@ -1927,6 +2120,20 @@ export function createRolloutDeps(params: {
       }
       return outcome.reverted;
     },
+    // ensure-banks backstop. Wired ONLY when the fleet runs the hindsight
+    // backend (both hindsightApiUrl + resolveBankId present) — otherwise
+    // left undefined so the step is a clean no-op. `createBank` is
+    // idempotent and needs only a bank id + api url, no container reconcile,
+    // and reports {ok:false, reason:"Unreachable"} on a refused connection
+    // (which the executor degrades to a warning rather than a roll failure).
+    ...(params.hindsightApiUrl && params.resolveBankId
+      ? {
+          ensureBank: (agent: string) =>
+            createBank(params.hindsightApiUrl as string, (params.resolveBankId as (a: string) => string)(agent), {
+              timeoutMs: 5000,
+            }),
+        }
+      : {}),
   };
 }
 
@@ -2113,12 +2320,34 @@ export function registerRolloutCommand(program: Command): void {
       // $PATH instead of passing the literal string as argv[1] to the
       // interpreter, which could never have worked.
       const scriptPath = process.argv[1] ?? "";
-      const deps = createRolloutDeps({ configPath, scriptPath, hostdCtx });
+      // Wire the ensure-banks backstop ONLY when this fleet runs the hindsight
+      // memory backend. The bank id is `memory.collection ?? <agent name>`
+      // (the SAME derivation scaffold.ts uses at reconcile), and the api base
+      // is the fleet's configured hindsight url with the `/mcp/` suffix
+      // stripped, defaulting to the standard loopback endpoint. Left undefined
+      // for a non-hindsight fleet so the step no-ops.
+      let hindsightApiUrl: string | undefined;
+      let resolveBankId: ((agent: string) => string) | undefined;
+      if (isHindsightEnabled(config)) {
+        const rawUrl = (config.memory?.config as { url?: string } | undefined)?.url;
+        hindsightApiUrl = rawUrl
+          ? rawUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "")
+          : HINDSIGHT_DEFAULT_API_BASE_URL;
+        resolveBankId = (agent: string) =>
+          (config.agents?.[agent]?.memory as { collection?: string } | undefined)?.collection ?? agent;
+      }
+      const deps = createRolloutDeps({
+        configPath,
+        scriptPath,
+        hostdCtx,
+        hindsightApiUrl,
+        resolveBankId,
+      });
 
       process.stdout.write(
         `${opts.allowDowngrade ? "Rolling back" : "Rolling"} ${requested.length} agent(s) to ${target}…\n`,
       );
-      const result = executeRollout(steps, target, deps, {
+      const result = await executeRollout(steps, target, deps, {
         hostdContext: hostdCtx,
         // Forwarded to the singleton installers (webd/hostd install) so a
         // rollback roll doesn't get silently guard-skipped there.
@@ -2189,6 +2418,28 @@ export function registerRolloutCommand(program: Command): void {
             `committed — re-running the agent roll will not fix this.\n` +
             `  Run the per-component command named in the warning(s) above, then ` +
             `\`switchroom update --check\` to confirm the host is converged.\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      // ensure-banks residue: the agents reached the target and the pin is
+      // committed, but a brand-new agent's Hindsight bank could not be created
+      // during the roll. Like the drift residue above, this is a FORWARD fix,
+      // not a "stopped partway" stop — re-running the agent roll won't help;
+      // the named agent(s) need a restart to re-run bank creation now that
+      // hindsight is back up. Named here so it is not narrated as a mid-roll
+      // stop that sends the operator to re-run everything.
+      if (!result.ok && result.failedStep === ENSURE_BANKS_STEP) {
+        process.stderr.write(
+          `\n✗ Rollout INCOMPLETE — ${(result.drifted ?? []).length} agent(s) ` +
+            `reached ${target} but their Hindsight bank could NOT be created: ` +
+            `${(result.drifted ?? []).join(", ") || "unknown"}.\n` +
+            `  The pin is committed and the agents ARE on the target — re-running ` +
+            `the agent roll will not fix this.\n` +
+            `  Restart the named agent(s) to re-run bank creation now that ` +
+            `Hindsight is back up (their first \`retain\` fails with a foreign-key ` +
+            `error until the bank exists).\n`,
         );
         process.exitCode = 1;
         return;
