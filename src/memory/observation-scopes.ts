@@ -32,6 +32,40 @@ export type ObservationScope = (typeof OBSERVATION_SCOPES)[number];
 /** Env var start.sh exports the scope through, when the operator set one. */
 export const OBSERVATION_SCOPES_ENV = "HINDSIGHT_OBSERVATION_SCOPES";
 
+/**
+ * The `observationScopeStrategy` values the plugin's per-retain resolver
+ * accepts — the selector that decides curated-vs-not, distinct from the pin
+ * above. `curated` (the shipped default since #4035) strips volatile
+ * provenance tags from each retain's consolidation scope; `shared` forces the
+ * one global untagged scope; `combined` / `off` opt out entirely (emit no
+ * per-row scope, restoring the pre-feature engine default). A manual
+ * `observation_scopes` pin still wins over the strategy.
+ *
+ * Paired copy of `OBSERVATION_SCOPE_STRATEGIES` in
+ * `vendor/hindsight-memory/scripts/lib/config.py` — that resolver runs in the
+ * agent container with no access to this module, so widening the set means
+ * widening BOTH. Same enum rationale as the pin: a typo is invisible after the
+ * write, so `switchroom apply` rejecting it is the cheap catch.
+ */
+export const OBSERVATION_SCOPE_STRATEGIES = [
+  "curated",
+  "shared",
+  "combined",
+  "off",
+] as const;
+
+export type ObservationScopeStrategy =
+  (typeof OBSERVATION_SCOPE_STRATEGIES)[number];
+
+/** Env var start.sh exports the strategy through, when the operator set one. */
+export const OBSERVATION_SCOPE_STRATEGY_ENV =
+  "HINDSIGHT_OBSERVATION_SCOPE_STRATEGY";
+
+/** Human-readable accepted set, for error messages. */
+export function observationScopeStrategiesHint(): string {
+  return OBSERVATION_SCOPE_STRATEGIES.join(", ");
+}
+
 export function isObservationScope(value: unknown): value is ObservationScope {
   return typeof value === "string" && (OBSERVATION_SCOPES as readonly string[]).includes(value);
 }
