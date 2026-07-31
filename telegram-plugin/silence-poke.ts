@@ -265,6 +265,25 @@ export interface SilencePokeDeps {
    * exactly as before.
    */
   isTurnLive?: (key: string) => boolean
+  /**
+   * #4058 — mid-turn auto-compaction defer predicate. Returns true while the
+   * Claude CLI is compacting the session for `key`'s turn (the PreCompact hook
+   * wrote the compaction marker and the `compact_boundary` transcript record
+   * hasn't landed / the marker isn't stale — see gateway/compaction-marker.ts).
+   *
+   * Why: during compaction the model emits ZERO output and runs ZERO tools
+   * for minutes, so every other work signal (`isLegitimatelyWorking`,
+   * in-flight tools, alive shells) is false and the 300s fallback fired on a
+   * healthy turn — a spurious "framework ended that stalled turn" card + a
+   * harmless re-ask, recurring on any session near the context ceiling.
+   *
+   * Semantics mirror the #1292/#3519 defers exactly: the silence CLOCK is
+   * never reset here; the terminal unwedge is DEFERRED (`continue` without
+   * setting fallbackFired) and remains bounded by `fallbackHardCeiling`, so
+   * a genuinely-wedged compaction still unwedges at the ceiling. Optional:
+   * absent (legacy fixtures) ⇒ behaviour unchanged.
+   */
+  isCompactionInFlight?: (key: string) => boolean
 }
 
 const state = new Map<string, SilencePokeState>()
@@ -773,6 +792,15 @@ function tick(now: number): void {
       const ceiling = thresholds.fallbackHardCeiling ?? Number.POSITIVE_INFINITY
       const underCeiling = silence < ceiling
       if (underCeiling) {
+        // #4058 — mid-turn auto-compaction: the CLI is summarizing the
+        // session, so the model provably CANNOT produce output or tool
+        // events; the silence is healthy, not a wedge. Defer exactly like
+        // the in-flight-tool paths below (clock untouched, fallbackFired
+        // unset, re-checked next tick) and stay bounded by the same hard
+        // ceiling via the enclosing `underCeiling` guard. Deliberately NOT
+        // gated by SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 — that flag
+        // scopes the TOOL defers; compaction has no tool in flight.
+        if (activeDeps.isCompactionInFlight?.(key) === true) continue
         const forceDisable = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '0'
         if (!forceDisable && activeDeps.isLegitimatelyWorking != null) {
           if (activeDeps.isLegitimatelyWorking(key)) continue
