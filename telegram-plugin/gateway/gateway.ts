@@ -5003,7 +5003,7 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
             startedAt: turn.startedAt,
             toolCallCount: turn.toolCallCount ?? 0,
             turnId: turn.turnId,
-            finalAnswerDelivered: turn.finalAnswerDelivered,
+            finalAnswerDelivered: turn.finalAnswerDelivered, replyCalled: turn.replyCalled, // replyCalled: honest delivery-route signal (turn-record-status.ts computeTurnRoute)
             deliveryOutcome: turn.deliveryOutcome, landedUnconfirmed: turn.landedUnconfirmed,
           },
           endedAt,

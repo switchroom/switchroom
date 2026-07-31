@@ -7,6 +7,7 @@ import {
   HANG_MS,
   SILENT_NOOP_FLOOR_TS,
 } from "./detect.js";
+import { ROUTE_FIELD_SHIP_TS } from "../../telegram-plugin/gateway/turn-record-status.js";
 
 /**
  * Pins the model-free L0 detector port (from the validated `spec_audit_l0.py`):
@@ -41,7 +42,9 @@ describe("detectTurnFindings", () => {
     // Fixture base ts (1_782_600_000 ≈ 2026-06-27) is BELOW the default
     // SILENT_NOOP_FLOOR_TS (2026-07-13), so pass floor:0 to assert the detector
     // LOGIC independent of the calendar window.
-    const turns = parseTurns(turn(10, { tools: 0 }));
+    // A genuine go-forward silent no-op carries route:'none' (nothing reached
+    // the user). route is what makes it a silent no-op vs a flush-recovery.
+    const turns = parseTurns(turn(10, { tools: 0, route: "none" }));
     const f = detectTurnFindings("alpha", turns, { silentNoopFloorTs: 0 });
     expect(f.map((x) => x.signal)).toContain("silent-no-op-candidate");
   });
@@ -58,7 +61,7 @@ describe("detectTurnFindings", () => {
     // A post-fix turn (ts at the 2026-07-13 floor) is still a real signal — the
     // windowing must not swallow go-forward silent no-ops.
     const turns = parseTurns(
-      turn(10, { tools: 0, ts: SILENT_NOOP_FLOOR_TS + 100 }),
+      turn(10, { tools: 0, route: "none", ts: SILENT_NOOP_FLOOR_TS + 100 }),
     );
     const f = detectTurnFindings("alpha", turns);
     expect(f.map((x) => x.signal)).toContain("silent-no-op-candidate");
@@ -112,6 +115,55 @@ describe("detectTurnFindings", () => {
     expect(
       detectTurnFindings("alpha", productive).map((x) => x.signal),
     ).not.toContain("hang-long-stalled");
+  });
+});
+
+describe("honest route splits silent-no-op from flush-recovery", () => {
+  // All fixtures are complete/tools:0 at/after ROUTE_FIELD_SHIP_TS — the exact
+  // shape that used to ALL score sev-3 silent-no-op. The `route` field is what
+  // now tells them apart.
+  const routed = (route: string | undefined, over: Record<string, unknown> = {}) =>
+    parseTurns(
+      turn(20, {
+        tools: 0,
+        ts: ROUTE_FIELD_SHIP_TS + 100,
+        ...(route === undefined ? {} : { route }),
+        ...over,
+      }),
+    );
+
+  it("THE FALSIFIER: a flush-recovered turn yields ZERO silent-no-op and exactly ONE flush-recovered-turn", () => {
+    const f = detectTurnFindings("alpha", routed("flush"));
+    const signals = f.map((x) => x.signal);
+    expect(signals.filter((s) => s === "silent-no-op-candidate")).toHaveLength(0);
+    expect(signals.filter((s) => s === "flush-recovered-turn")).toHaveLength(1);
+  });
+
+  it("route:none still escalates as sev-3 silent-no-op-candidate", () => {
+    const signals = detectTurnFindings("alpha", routed("none")).map((x) => x.signal);
+    expect(signals).toContain("silent-no-op-candidate");
+    expect(signals).not.toContain("flush-recovered-turn");
+  });
+
+  it("route:reply and route:stream produce no silent-no-op finding", () => {
+    for (const r of ["reply", "stream"]) {
+      const signals = detectTurnFindings("alpha", routed(r)).map((x) => x.signal);
+      expect(signals).not.toContain("silent-no-op-candidate");
+      expect(signals).not.toContain("flush-recovered-turn");
+    }
+  });
+
+  it("legacy row (no route) BELOW the ship epoch is aged out — no sev-3", () => {
+    const legacy = parseTurns(
+      turn(21, { tools: 0, ts: ROUTE_FIELD_SHIP_TS - 100 }),
+    );
+    const signals = detectTurnFindings("alpha", legacy).map((x) => x.signal);
+    expect(signals).not.toContain("silent-no-op-candidate");
+  });
+
+  it("field-less row AT/AFTER the ship epoch is treated as none (regression still surfaces)", () => {
+    const signals = detectTurnFindings("alpha", routed(undefined)).map((x) => x.signal);
+    expect(signals).toContain("silent-no-op-candidate");
   });
 });
 
@@ -234,6 +286,7 @@ describe("cross-attributed rows never count as this agent's drift", () => {
       turn_id: `${CHAT}:_#3`,
       status: "complete",
       tools: 0,
+      route: "none",
       duration_ms: 1000,
     });
     const findings = detectTurnFindings("alpha", parseTurns(own));
@@ -246,6 +299,7 @@ describe("cross-attributed rows never count as this agent's drift", () => {
       turn_id: `${CHAT}:_#4`,
       status: "complete",
       tools: 0,
+      route: "none",
       duration_ms: 1000,
     });
     expect(detectTurnFindings("alpha", parseTurns(legacy))).toHaveLength(1);
@@ -276,6 +330,7 @@ describe("the attribution filter is TOTAL — one junk row cannot erase an agent
       turn_id: `${CHAT}:_#${seq}`,
       status: "complete",
       tools: 0,
+      route: "none",
       duration_ms: 1000,
     });
 

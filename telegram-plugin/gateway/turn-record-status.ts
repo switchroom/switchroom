@@ -28,6 +28,38 @@ export type DeliveryOutcome = 'delivered' | 'failed' | 'suppressed'
 export type TurnStatus = 'complete' | 'no_reply' | 'send_failed'
 
 /**
+ * How this turn's answer actually reached (or failed to reach) the user — the
+ * honest delivery route, recorded alongside `status` so the fleet-health
+ * detector can tell a flush-recovered turn apart from a genuine silent no-op.
+ *
+ * - `reply`  — the reply tool delivered the answer (the normal path), OR the
+ *              flush short-circuited because reply had already delivered.
+ * - `stream` — the answer landed via the streaming/draft path without a reply
+ *              tool call (final answer delivered, `replyCalled` false).
+ * - `flush`  — a turn-flush / outbox-sweep backstop delivered the answer after
+ *              the reply tool was bypassed (terminal prose, `tools:0`). This is
+ *              the case that used to masquerade as a silent no-op.
+ * - `none`   — nothing reached the user (send failed, or a genuine no-reply).
+ */
+export type TurnRoute = 'reply' | 'stream' | 'flush' | 'none'
+
+/**
+ * Epoch of when the honest `route` field shipped on turns.jsonl rows — a FIXED
+ * literal cutoff the fleet-health detector uses to age out the pre-route legacy
+ * backlog (rows written before this field existed carry no `route`, so the
+ * detector cannot classify them and must not escalate them as silent no-ops).
+ *
+ * UNIX SECONDS, not milliseconds: turns.jsonl `ts` is written as
+ * `Math.floor(endedAt / 1000)` (see `buildTurnRecord`), and the detector
+ * compares this constant against that seconds-valued `ts`. It intentionally
+ * mirrors the units of `SILENT_NOOP_FLOOR_TS` in `src/fleet-health/detect.ts`.
+ *
+ * Value = 2026-07-31T00:00:00Z (`date -u -d @1785456000`). Fixed, not rolling:
+ * a rolling window would hide a genuine ongoing regression that drops the field.
+ */
+export const ROUTE_FIELD_SHIP_TS = 1_785_456_000
+
+/**
  * Derive the recorded turn status from the turn's flags.
  *
  * `deliveryOutcome` (when present) is authoritative — it reflects the REAL send
@@ -55,6 +87,41 @@ export function computeTurnStatus(turn: {
       return turn.finalAnswerDelivered ? 'complete' : 'no_reply'
     default:
       return turn.finalAnswerDelivered ? 'complete' : 'no_reply'
+  }
+}
+
+/**
+ * Derive the honest delivery `route` from the SAME resolved delivery state
+ * `computeTurnStatus` reads — never speculative. `deliveryOutcome` (when
+ * present) is authoritative; when absent we fall back to the legacy
+ * `finalAnswerDelivered` / `replyCalled` reading, exactly as `computeTurnStatus`
+ * does for `status`.
+ *
+ *   failed              → none    (nothing reached the user)
+ *   delivered           → flush   (a backstop send delivered the answer)
+ *   suppressed          → reply   (flush short-circuited; reply already delivered)
+ *   undefined (legacy)  → finalAnswerDelivered
+ *                            ? (replyCalled ? reply : stream)
+ *                            : none
+ */
+export function computeTurnRoute(turn: {
+  finalAnswerDelivered: boolean
+  replyCalled: boolean
+  deliveryOutcome?: DeliveryOutcome
+}): TurnRoute {
+  switch (turn.deliveryOutcome) {
+    case 'failed':
+      return 'none'
+    case 'delivered':
+      return 'flush'
+    case 'suppressed':
+      return 'reply'
+    default:
+      return turn.finalAnswerDelivered
+        ? turn.replyCalled
+          ? 'reply'
+          : 'stream'
+        : 'none'
   }
 }
 
@@ -149,6 +216,13 @@ export interface TurnRecordRow {
   status: TurnStatus
   turn_id: string
   /**
+   * The honest delivery route for this turn (see `TurnRoute`). Recorded on every
+   * row so the fleet-health detector can distinguish a flush-recovered turn
+   * (`route: 'flush'`, answer delivered by a backstop after the reply tool was
+   * bypassed) from a genuine silent no-op (`route: 'none'`). Always emitted.
+   */
+  route: TurnRoute
+  /**
    * How many landed message ids of this turn's backstop delivery the read-back
    * probe never corroborated (`sentIds` minus the confirmed subset). OMITTED
    * when zero, so an ordinary row is byte-identical to before.
@@ -178,6 +252,7 @@ export function buildTurnRecord(
     toolCallCount: number
     turnId: string
     finalAnswerDelivered: boolean
+    replyCalled?: boolean
     deliveryOutcome?: DeliveryOutcome
     landedUnconfirmed?: number
   },
@@ -190,6 +265,11 @@ export function buildTurnRecord(
     tools: turn.toolCallCount ?? 0,
     status: computeTurnStatus(turn),
     turn_id: turn.turnId,
+    route: computeTurnRoute({
+      finalAnswerDelivered: turn.finalAnswerDelivered,
+      replyCalled: turn.replyCalled ?? false,
+      deliveryOutcome: turn.deliveryOutcome,
+    }),
     // Emitted ONLY when non-zero (see `TurnRecordRow.landed_unconfirmed`).
     ...(turn.landedUnconfirmed != null && turn.landedUnconfirmed > 0
       ? { landed_unconfirmed: turn.landedUnconfirmed }

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   computeTurnStatus,
+  computeTurnRoute,
   backstopSendOutcome,
   finalizeBackstopSend,
   buildTurnRecord,
@@ -36,6 +37,67 @@ describe('computeTurnStatus — recorded turn status reflects real outcome', () 
     expect(computeTurnStatus({ finalAnswerDelivered: false, deliveryOutcome: undefined })).toBe(
       'no_reply',
     )
+  })
+})
+
+/**
+ * Honest delivery ROUTE. Derived from the SAME resolved delivery state
+ * `computeTurnStatus` reads, so the fleet-health detector can tell a
+ * flush-recovered turn (answer delivered by a backstop after the reply tool was
+ * bypassed) apart from a genuine silent no-op. These assert the mapping OUTCOME,
+ * not merely that a branch ran.
+ */
+describe('computeTurnRoute — honest delivery route from resolved state', () => {
+  it('deliveryOutcome delivered → flush (backstop delivered the answer)', () => {
+    expect(
+      computeTurnRoute({ finalAnswerDelivered: true, replyCalled: false, deliveryOutcome: 'delivered' }),
+    ).toBe('flush')
+  })
+
+  it('deliveryOutcome suppressed → reply (flush short-circuited; reply delivered)', () => {
+    expect(
+      computeTurnRoute({ finalAnswerDelivered: true, replyCalled: true, deliveryOutcome: 'suppressed' }),
+    ).toBe('reply')
+  })
+
+  it('deliveryOutcome failed → none (nothing reached the user)', () => {
+    expect(
+      computeTurnRoute({ finalAnswerDelivered: true, replyCalled: true, deliveryOutcome: 'failed' }),
+    ).toBe('none')
+  })
+
+  it('undefined outcome + finalAnswer + replyCalled → reply (synchronous reply tail)', () => {
+    expect(
+      computeTurnRoute({ finalAnswerDelivered: true, replyCalled: true, deliveryOutcome: undefined }),
+    ).toBe('reply')
+  })
+
+  it('undefined outcome + finalAnswer + NOT replyCalled → stream', () => {
+    expect(
+      computeTurnRoute({ finalAnswerDelivered: true, replyCalled: false, deliveryOutcome: undefined }),
+    ).toBe('stream')
+  })
+
+  it('undefined outcome + no final answer → none (genuine no-reply)', () => {
+    expect(
+      computeTurnRoute({ finalAnswerDelivered: false, replyCalled: false, deliveryOutcome: undefined }),
+    ).toBe('none')
+  })
+
+  it('buildTurnRecord stamps route on the row (flush for a delivered backstop send)', () => {
+    const rec = buildTurnRecord(
+      {
+        agent: 'test-agent',
+        startedAt: 1_700_000_495_000,
+        toolCallCount: 0,
+        turnId: 'turn-route',
+        finalAnswerDelivered: true,
+        replyCalled: false,
+        deliveryOutcome: 'delivered',
+      },
+      1_700_000_500_000,
+    )
+    expect(rec.route).toBe('flush')
   })
 })
 
