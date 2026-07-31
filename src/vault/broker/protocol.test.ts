@@ -85,6 +85,62 @@ describe("encodeResponse / decodeResponse roundtrip", () => {
   }
 });
 
+// ─── Response union ordering (#4069) ───────────────────────────────────────
+//
+// ResponseSchema is a plain z.union: first match wins and zod objects strip
+// unknown keys. OkApprovalConsumeResponse is a structural prefix of
+// OkApprovalConsumeRecordResponse, so if Consume is ordered before
+// ConsumeRecord, an approval_consume_record reply matches the Consume schema
+// and `decision_id` is silently stripped — the gateway then false-toasts
+// "kernel record failed" on every approval tap. These tests go through the
+// REAL decodeResponse (the kernel tests use raw JSON.parse and missed this).
+
+describe("response union ordering: approval_consume_record vs approval_consume (#4069)", () => {
+  it("preserves decision_id on a consume_record reply", () => {
+    const wire = JSON.stringify({
+      ok: true,
+      consumed: true,
+      decision_id: "dec-123",
+      agent_unit: "clerk",
+      scope: "ms365:calendar:write",
+      action: "update-calendar-event",
+      why: null,
+    });
+    const decoded = decodeResponse(wire) as Record<string, unknown>;
+    expect(decoded.ok).toBe(true);
+    expect(decoded.consumed).toBe(true);
+    // The load-bearing assertion: decision_id must survive the union.
+    expect(decoded.decision_id).toBe("dec-123");
+    expect(decoded.scope).toBe("ms365:calendar:write");
+  });
+
+  it("still decodes a plain consume reply (no decision_id) losslessly", () => {
+    const resp = {
+      ok: true,
+      consumed: true,
+      agent_unit: "clerk",
+      scope: "drive:file:read",
+      action: "read",
+      why: "user asked",
+    };
+    const decoded = decodeResponse(JSON.stringify(resp));
+    expect(decoded).toEqual(resp);
+  });
+
+  it("still decodes a consumed:false reply (burned/expired nonce)", () => {
+    const decoded = decodeResponse(JSON.stringify({ ok: true, consumed: false }));
+    expect(decoded).toEqual({ ok: true, consumed: false });
+  });
+
+  it("still routes a plain approval_record reply to its own schema", () => {
+    // {ok, decision_id} lacks `consumed`, so it must NOT be swallowed
+    // (or rejected) by the ConsumeRecord schema ordered ahead of it.
+    const resp = { ok: true, decision_id: "dec-456" };
+    const decoded = decodeResponse(JSON.stringify(resp));
+    expect(decoded).toEqual(resp);
+  });
+});
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 describe("errorResponse helper", () => {

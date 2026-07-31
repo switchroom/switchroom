@@ -643,11 +643,21 @@ export const ResponseSchema = z.union([
   OkRevokeGrantResponseSchema,
   OkApprovalRequestResponseSchema,
   OkApprovalLookupResponseSchema,
+  // ORDER MATTERS: ConsumeRecord MUST precede Consume. This is a plain
+  // z.union (first-match wins) and zod objects strip unknown keys, so if
+  // Consume came first it would match a consume_record reply (Consume's
+  // shape is a structural prefix) and silently strip `decision_id` —
+  // the gateway then false-toasts "kernel record failed" on every
+  // approval tap (#4069). The reverse order is safe: ConsumeRecord's
+  // only extra field (`decision_id`) is optional, so a plain consume
+  // reply still parses losslessly; and a plain approval_record reply
+  // ({ok, decision_id}) lacks the required `consumed`, so it falls
+  // through to OkApprovalRecordResponseSchema as before.
+  OkApprovalConsumeRecordResponseSchema,
   OkApprovalConsumeResponseSchema,
   OkApprovalRevokeResponseSchema,
   OkApprovalListResponseSchema,
   OkApprovalRecordResponseSchema,
-  OkApprovalConsumeRecordResponseSchema,
   ErrorResponseSchema,
 ]);
 
