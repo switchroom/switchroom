@@ -3,9 +3,14 @@
  *
  * Server-side `MemoryItem.observation_scopes` is typed
  * `Literal["per_tag","combined","all_combinations","shared"] | list[list[str]]
- * | None`. The explicit list-of-lists tag matrix is deliberately NOT exposed
- * through switchroom config: it is an unbounded per-memory matrix with no safe
- * fleet-wide default and no caller here needs it.
+ * | None`. The explicit list-of-lists tag matrix is deliberately NOT exposed as
+ * a `switchroom.yaml` *pin* value: it is an unbounded per-memory matrix with no
+ * safe fleet-wide default. It IS emitted on the wire — but computed per retain
+ * by the plugin's `curated` strategy (`compute_observation_scopes`,
+ * `vendor/hindsight-memory/scripts/lib/config.py`), which strips volatile
+ * provenance tags and produces a `[[stable…]]` scope from the retain's own
+ * tags. This enum is only the operator PIN surface, whose values override the
+ * strategy; the matrix has no place there.
  *
  * This is the single TS source of truth, consumed by the zod enum in
  * `src/config/schema.ts` (both the per-agent and defaults/profile tiers) and by

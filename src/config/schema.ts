@@ -334,8 +334,14 @@ export const AgentToolsSchema = z
   .optional();
 
 /**
- * `memory.observation_scopes` — the per-row `observation_scopes` switchroom
- * stamps on every retained Hindsight MemoryItem.
+ * `memory.observation_scopes` — an operator PIN for the per-row
+ * `observation_scopes` switchroom stamps on every retained Hindsight MemoryItem.
+ *
+ * This is an override, not the default path. Since #4035 the default is the
+ * plugin's `curated` strategy (`observationScopeStrategy`), which computes a
+ * scope per retain; a pin here wins over that strategy outright. `combined` is
+ * the pin form of opting out (restores the pre-feature engine default). See
+ * `docs/configuration.md` § "Observation scopes".
  *
  * Declared once and reused by BOTH `AgentMemorySchema` and the
  * defaults/profile-tier mirror, so the two tiers cannot drift into accepting
@@ -352,14 +358,15 @@ const ObservationScopesSchema = z
   .enum(OBSERVATION_SCOPES)
   .optional()
   .describe(
-    "Per-row observation scope stamped on every memory this agent " +
-    "retains. \"shared\" makes Hindsight's consolidation write the " +
-    "resulting observations into ONE global untagged scope instead of a " +
-    "scope per tag — what several agents pooling one bank need so their " +
-    "observations actually merge rather than sitting in parallel " +
-    "per-tag silos. OMITTED BY DEFAULT: unset means the field never goes " +
-    "on the wire and the engine's own default stands, which is the " +
-    "shipped behaviour. Applies to every retain path (Stop hook, " +
+    "Operator PIN for the per-row observation scope, overriding the " +
+    "default `curated` strategy (see docs/configuration.md). \"shared\" " +
+    "forces Hindsight's consolidation to write EVERY observation into ONE " +
+    "global untagged scope — what several agents pooling one bank want so " +
+    "their observations merge rather than sitting in parallel silos. " +
+    "\"combined\" is the pin form of opting out (restores the pre-#4035 " +
+    "engine default). UNSET does NOT mean 'nothing on the wire': the " +
+    "`curated` strategy still computes a scope per retain. Applies to " +
+    "every retain path (Stop hook, " +
     "sidechain, boot reconcile, queue drain, backfill, session-handoff " +
     "mirror) and is carried on the queued payload, so a retain that fails " +
     "now and drains later still lands in this scope. Accepted values: " +

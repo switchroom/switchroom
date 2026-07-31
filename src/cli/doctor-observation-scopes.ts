@@ -102,6 +102,29 @@ export const OBSERVATION_SCOPE_WARN_RATIO = 0.8;
 /** How many saturated scopes are named in the detail before it elides. */
 export const OBSERVATION_SCOPE_MAX_LISTED = 6;
 
+/**
+ * Observation count at which the UNTAGGED global scope is reported as `warn`.
+ *
+ * The tagged-scope machinery above deliberately never judges the untagged
+ * scope: the engine skips it (`if max_obs >= 0 and fact_tags:`,
+ * consolidator.py:1605) so it has no cap to breach. Since #4035 that same scope
+ * is the *default consolidation sink* — the `curated` strategy sends every
+ * all-volatile retain (a bare session UUID, `parent_session:*`) to `shared`,
+ * which is the untagged scope. It therefore grows without a cap while every
+ * other scope is bounded, and upstream vectorize-io/hindsight#1284 (whole-bank
+ * unbounded consolidation growth) is acknowledged unfixed. A pool that only
+ * grows eventually makes every consolidation pass recall a larger set for the
+ * same output, so it needs a watch even though it has no wall to hit.
+ *
+ * 10k is ten times the historical per-scope cap of 1000: far past any single
+ * tagged scope's ceiling, quiet on a healthy bank (the live klanker global
+ * scope carried 188 observations on 2026-07-31), and early enough that an
+ * operator can act — raise consolidation cadence, prune, or split the bank —
+ * long before the pool is a drag. This is a WARN, never a FAIL: nothing is
+ * being discarded, unlike a saturated tagged scope; it is a growth signal.
+ */
+export const OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT = 10_000;
+
 /** One `{tags, count}` entry as `GET /observations/scopes` returns it. */
 export interface ObservationScope {
   tags: string[];
@@ -245,6 +268,14 @@ export interface BankScopeReport {
   hasScopeLimitRules: boolean;
   /** Distinct scopes in the bank, including the untagged one. */
   scopeCount: number;
+  /**
+   * Observations in the UNTAGGED global scope (`tags: []`). This scope is the
+   * `curated`-strategy default sink and is never capped by the engine, so it is
+   * tracked separately from {@link saturated} and watched by
+   * {@link OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT} rather than by the per-scope
+   * cap. 0 when the bank has no untagged observations.
+   */
+  untaggedCount: number;
   /** Scopes at `warn` or `fail`, worst first. */
   saturated: ScopeSaturation[];
   /**
@@ -267,7 +298,9 @@ function describeScope(bankId: string, s: ScopeSaturation): string {
  *   cost of a full extraction-model call each time. This is deliberately not a
  *   warning: the 2026-07 incident was a warning-shaped log line nobody read.
  * - `warn` — at least one scope is past {@link OBSERVATION_SCOPE_WARN_RATIO} of
- *   its cap and still writable.
+ *   its cap and still writable, OR a bank's untagged global scope has grown past
+ *   {@link OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT} (the uncapped `curated` sink —
+ *   nothing is discarded, but the pool only grows, so it is watched).
  * - `skip` — nothing could be read, or every readable bank is one this check
  *   cannot judge honestly (glob scope-limit rules, or observations disabled).
  * - `ok`   — every scope on every reachable bank has room.
@@ -287,6 +320,27 @@ export function classifyObservationScopeSaturation(
 
   const unreadable = reports.filter((r) => !r.ok);
   const readable = reports.filter((r) => r.ok);
+
+  // The untagged global scope grows uncapped and is the `curated` default sink
+  // (see OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT). It is independent of the
+  // per-scope cap and the glob rules, so it is judged for every readable bank
+  // that still writes observations, not only the cap-judged ones. Worst first.
+  const growing = readable
+    .filter((r) => r.observationsEnabled && r.untaggedCount >= OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT)
+    .sort((a, b) => b.untaggedCount - a.untaggedCount);
+  const growthNote =
+    growing.length > 0
+      ? `${growing.length} bank(s) with an untagged global scope over ` +
+        `${OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT.toLocaleString()} observations ` +
+        `(uncapped curated sink, growth watch): ` +
+        growing
+          .slice(0, OBSERVATION_SCOPE_MAX_LISTED)
+          .map((r) => `${r.bankId} ${r.untaggedCount.toLocaleString()}`)
+          .join(", ") +
+        (growing.length > OBSERVATION_SCOPE_MAX_LISTED
+          ? `; +${growing.length - OBSERVATION_SCOPE_MAX_LISTED} more`
+          : "")
+      : "";
 
   if (readable.length === 0) {
     return {
@@ -326,8 +380,15 @@ export function classifyObservationScopeSaturation(
     );
   }
   const suffix = notes.length > 0 ? ` · ${notes.join(" · ")}` : "";
+  const growthSuffix = growthNote ? ` · ${growthNote}` : "";
 
   if (judged.length === 0) {
+    // Nothing can be judged against the per-scope cap, but the untagged growth
+    // watch is independent of it — surface a growing sink as a warn rather than
+    // swallowing it in a skip.
+    if (growing.length > 0) {
+      return { name, status: "warn", detail: `${growthNote}${suffix}` };
+    }
     return { name, status: "skip", detail: `no bank could be judged${suffix}` };
   }
 
@@ -403,23 +464,27 @@ export function classifyObservationScopeSaturation(
         `output is being discarded on them right now: ${list(failing)}` +
         (warning.length > 0 ? ` · ${warning.length} more above ${Math.round(OBSERVATION_SCOPE_WARN_RATIO * 100)}%` : "") +
         backlog([...failing, ...warning]) +
+        growthSuffix +
         suffix,
       fix,
     };
   }
 
-  if (warning.length > 0) {
-    return {
-      name,
-      status: "warn",
-      detail:
-        `${warning.length} observation scope(s) above ` +
-        `${Math.round(OBSERVATION_SCOPE_WARN_RATIO * 100)}% of the cap and still writable: ` +
-        `${list(warning)}` +
-        backlog(warning) +
-        suffix,
-      fix,
-    };
+  if (warning.length > 0 || growing.length > 0) {
+    // Either a tagged scope is past its warn ratio, or the untagged sink has
+    // grown past its watch line (or both). Both are writable-but-worth-seeing.
+    const scopeClause =
+      warning.length > 0
+        ? `${warning.length} observation scope(s) above ` +
+          `${Math.round(OBSERVATION_SCOPE_WARN_RATIO * 100)}% of the cap and still writable: ` +
+          `${list(warning)}` +
+          backlog(warning)
+        : "";
+    const detail =
+      warning.length > 0
+        ? scopeClause + growthSuffix + suffix
+        : `${growthNote}${suffix}`;
+    return { name, status: "warn", detail, ...(warning.length > 0 ? { fix } : {}) };
   }
 
   const totalScopes = capped.reduce((n, r) => n + r.scopeCount, 0);
@@ -500,6 +565,7 @@ export async function inspectBankScopes(
     observationsEnabled: false,
     hasScopeLimitRules: false,
     scopeCount: 0,
+    untaggedCount: 0,
     saturated: [],
     pendingConsolidation: null,
   });
@@ -538,6 +604,12 @@ export async function inspectBankScopes(
   }
 
   const saturated = computeScopeSaturation(scopes, rawCap).filter((s) => s.status !== "ok");
+  // The untagged global scope: never in `saturated` (the engine skips it), but
+  // it is the `curated` default sink and grows uncapped, so its size is tracked
+  // and watched separately (OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT).
+  const untaggedCount = scopes
+    .filter((s) => s.tags.length === 0)
+    .reduce((n, s) => n + s.count, 0);
 
   // The backlog number is what makes the row legible ("overlord is sitting on
   // 43,734 pending memories" beats a bare uuid), but /stats is the expensive
@@ -562,6 +634,7 @@ export async function inspectBankScopes(
     observationsEnabled,
     hasScopeLimitRules,
     scopeCount: scopes.length,
+    untaggedCount,
     saturated,
     pendingConsolidation,
   };
