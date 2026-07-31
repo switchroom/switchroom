@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+## v0.19.40 — Telegram delivery gets honest: formatted, exactly-once, and no false stall cards — plus an observation-scope config surface and a smarter rollout order
+
+The headline is three Telegram delivery fixes an operator actually feels. A
+background-work handback no longer arrives as stripped `**markdown**` or
+goes missing from history; a turn's final answer arrives exactly once instead
+of being echoed 5-30s later by the outbox sweep; and a session that is merely
+auto-compacting mid-turn no longer trips a spurious "no output for 5 min —
+stalled turn" card. Around them, the observation-scope work from v0.19.39 gets
+a real config surface plus a dry-run cleanup planner, and the fleet rollout
+learns a better restart order and a more honest progress card.
+
+### Handback and safety-net deliveries keep their formatting and land in history (#4042)
+
+The outbox sweep is the guaranteed-final-message safety net for handbacks and
+task-notifications the gateway never sees a turn for, but its deliveries were
+second-class. It sent raw markdown with no parse mode, so operators saw literal
+`**bold**`; it never recorded what it sent, so those net-delivered final answers
+were silently absent from history (degrading `get_recent_messages`, the handoff
+briefing, and the represent-guard). Both are fixed: sweep deliveries now go
+through the same rich renderer and markdown-boundary-aware chunker as the normal
+reply path, and every delivered chunk is persisted. The captured-prose plain-text
+fallback got the same persist gap closed, so a recovered answer also lands in
+history.
+
+### A turn's final answer arrives exactly once (#4057)
+
+A gateway-visible turn ending in unsent trailing prose was occasionally delivered
+twice: the turn-flush backstop sent the answer immediately, but its durable
+exactly-once claim ran only after a cosmetic read-back probe that could block up
+to ~30s. In that 5-30s gap the outbox sweep saw no claim and — because the
+captured text differed in length from the flush text — sent a second copy. The
+fix claims the delivery nonce at send-ack, the instant every chunk lands, before
+the read-back probe, so the sweep sees the claim inside its 5s window and never
+double-sends. No-loss is preserved: the claim only fires when all chunks genuinely
+acked.
+
+### No spurious "stalled turn" card during mid-turn auto-compaction (#4059)
+
+During mid-turn auto-compaction the model emits zero output for minutes, so the
+300s silence fallback read pure silence and fired a false "⚠️ no output for 5 min"
+teardown on a perfectly healthy turn (observed: ~1m50s of tools then ~3m25s
+compacting = 304s). A new PreCompact hook marks compaction-in-flight, and the
+silence tick now defers in the same branch as the existing in-flight-tool defers.
+A genuinely wedged compaction is still caught at the hard ceiling, and a wedge
+with no compaction still fires as before.
+
+### Observation scopes: corrected docs, a dry-run cleanup planner, and a switchroom.yaml knob (#4053, #4054, #4056)
+
+Follow-through on the curated `observation_scopes` default that shipped in
+v0.19.39. The docs, schema help, and code comments are corrected to describe the
+curated-default-ON behaviour (they still described the pre-feature engine
+default), and doctor gains an untagged-scope growth watch since curated made the
+untagged global scope the uncapped consolidation sink (#4053). A new dry-run
+planner, `switchroom memory cleanup-scopes [agent]`, audits banks that
+consolidated before the fix and reports what a consolidation would re-home from
+their hundreds of legacy per-session scopes — read-only, since Hindsight exposes
+no per-scope write, so a live heal stays operator-gated (#4054). And the strategy
+is now a first-class `memory.observation_scope_strategy` field
+(`curated | shared | combined | off`) in switchroom.yaml at both the per-agent and
+defaults tiers, with apply-time validation, replacing the undiscoverable raw env
+var (#4056).
+
+### Rollout: primary agents right after the canary, an honest singleton status row, and banks before restarts (#4045, #4046, #4047)
+
+Three improvements to the fleet roll. A single editable `ROLLOUT_PRIORITY_AGENTS`
+list now rolls overlord, carrie, and finn immediately after the sanctioned canary
+— early enough to pick up a new build promptly, but deliberately still behind the
+canary gate so the operator's primary agents never absorb a bad build ungated
+(#4045). The rollout progress card gains a "Singletons / shared" section reporting
+a truthful state per row (updated / updating / deferred / pending / skipped /
+failed) for switchroom-web, hindsight, hostd, and the shared fleet singletons,
+with no fabricated checkmarks (#4046). And `refresh-hindsight` now runs before the
+agent-restart loop instead of last, with a terminal `ensure-banks` backstop, so a
+brand-new agent's Hindsight bank is reliably created — closing a hole where an
+unreachable hindsight container during restarts left an agent's first `retain`
+hitting a foreign-key violation (#4047).
+
 ## v0.19.39 — Cross-session memory dedup on by default, a host CLI that self-heals after a roll, and honest mid-turn Telegram cards
 
 The headline is a memory fix: curated `observation_scopes` are now on by
