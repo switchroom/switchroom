@@ -2312,6 +2312,10 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           let sentIds: number[] = []
           let chunkCount = 0
           let delivered = false
+          // Set by the send-ack claim callback below once the durable
+          // delivered-keys journal has been written at ACK time — so the finally
+          // block does not journal the same nonce a second time.
+          let earlyJournaled = false
           try {
             // #3276 — the ONE delivery primitive. deliverAnswer routes through
             // `sendReplyChunks` (the same send core executeReply uses) and posts
@@ -2330,6 +2334,33 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               // S4 — anchor the flushed answer to the inbound it answers
               // (null for synthesized turns, which send bare as before).
               replyToMessageId: turn.sourceMessageId,
+              // Duplicate-message race fix — write the DURABLE delivered-keys
+              // journal at SEND-ACK, BEFORE deliverAnswer's read-back probe (which
+              // the cosmetic-edit flood-fuse can defer ~30s). Without this the
+              // journal write happened only in the finally below, AFTER `await
+              // deliverAnswer` returned, so the outbox sweep — which waits just
+              // OUTBOX_QUIET_MS (5s) before checking `deliveredNonces` — saw no
+              // entry and sent a SECOND copy of this answer. Journaling under the
+              // SAME nonce (turn.turnId == the Stop-hook record's turnNonce) makes
+              // the sweep skip-journaled and clears any captured record.
+              onAckClaim: (ackIds) => {
+                try {
+                  journalExternalDelivery(
+                    {
+                      turnNonce: turn.turnId,
+                      text: capturedText,
+                      tgMessageId: ackIds.length > 0 ? ackIds[0] : undefined,
+                      deliverySource: 'flush',
+                    },
+                    STATE_DIR,
+                  )
+                  earlyJournaled = true
+                } catch (err) {
+                  process.stderr.write(
+                    `telegram gateway: turn-flush send-ack journal write failed (non-fatal): ${(err as Error).message}\n`,
+                  )
+                }
+              },
             })
             sentIds = delivery.sentIds
             chunkCount = delivery.chunkCount
@@ -2433,7 +2464,14 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               // between this send and the next process's backstop. Journal ONLY on
               // a receipt-gated `delivered` success. Best-effort: a journal-write
               // failure must never demote the successful delivery.
-              if (delivered) {
+              //
+              // Duplicate-message race fix: skip when the send-ack claim
+              // (`onAckClaim`) already journaled this nonce at ACK time. That
+              // path is the primary writer now (it runs before the read-back
+              // probe); this finally write only covers the case where the claim
+              // never fired — e.g. a card-only delivery where every chunk landed
+              // but no fresh receipt gated the claim, yet `delivered` still held.
+              if (delivered && !earlyJournaled) {
                 try {
                   journalExternalDelivery(
                     {
