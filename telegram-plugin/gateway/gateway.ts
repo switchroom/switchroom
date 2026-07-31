@@ -2463,7 +2463,7 @@ async function deliverAnswer(args: {
   replyToMessageId: number | null
   /** #3282 captured-answer RESUME (see captured-answer-resume.ts): re-deliver the SAME byte-identical chunks + pre-hydrate the ledger (unsent tail only; a landed chunk is re-probed, never re-sent). */
   resume?: { snapshot: CapturedDeliverySnapshot; hydrate: (ledger: BackstopDeliveryLedger, turnId: string) => void }
-}): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean; landedUnconfirmed: number }> {
+  /** Duplicate-message race fix — forwarded to `runBackstopDelivery` as `onAckClaim` (claims the nonce at send-ack, before the read-back probe; see backstop-delivery.ts). */ onAckClaim?: (sentIds: number[]) => void }): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean; landedUnconfirmed: number }> {
   const { chatId, turnId } = args
   // Spacers into `\n\n` gaps then split (as executeReply); a resume re-delivers the EXACT captured chunks (byte-stable, no re-split).
   const chunks = args.resume
@@ -2574,7 +2574,7 @@ async function deliverAnswer(args: {
     args.resume ? null : args.cardMessageId,
     {
       sendChunk,
-      readBack,
+      readBack, onAckClaim: args.onAckClaim,
       recordOutbound: HISTORY_ENABLED
         ? (messageIds, texts) => {
             try {

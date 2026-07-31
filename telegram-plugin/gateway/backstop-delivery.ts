@@ -322,6 +322,28 @@ export interface BackstopDeliveryDeps {
     messageIds: readonly number[],
     text: string,
   ) => Promise<ReadBackResult>
+  /**
+   * Exactly-once SEND-ACK claim (duplicate-message race fix). Fired EXACTLY ONCE,
+   * the first moment every chunk has landed a fresh non-card receipt — i.e. the
+   * same condition that makes {@link BackstopDeliveryResult.delivered} true — and
+   * crucially BEFORE the read-back probe (step 2 below) is awaited.
+   *
+   * Why before the probe: the probe is issued at COSMETIC priority and, when the
+   * edit-flood-fuse is deferring cosmetic edits, `await deps.readBack` can block
+   * ~30s. The caller's durable exactly-once claim (`journalExternalDelivery`)
+   * used to run only in its post-`await deliverAnswer` bookkeeping, i.e. AFTER
+   * that probe resolved. The out-of-band outbox sweep only waits `OUTBOX_QUIET_MS`
+   * (5s) before checking the delivered-keys journal, so during that 5–30s gap it
+   * saw no journal entry and sent a SECOND copy of the same answer. Claiming here,
+   * at send-ack, closes that window deterministically regardless of probe timing.
+   *
+   * A later `absent` read-back (positive silent-drop) is recovered by THIS
+   * orchestrator's own in-process re-send below — the nonce is NEVER reopened to
+   * the sweep, so a possibly-delivered answer is never handed to a second sender.
+   * `sentIds` is the landed fresh-receipt set at claim time. Best-effort; a throw
+   * is swallowed and never demotes the delivery.
+   */
+  onAckClaim?: (sentIds: number[]) => void
   /** Optional stderr sink for progress/resume logging. */
   stderr?: (s: string) => void
 }
@@ -406,6 +428,8 @@ export async function runBackstopDelivery(
   const stderr = deps.stderr ?? (() => {})
   const chunkCount = chunks.length
   let attempts = 0
+  // Fires the send-ack claim (see BackstopDeliveryDeps.onAckClaim) at most once.
+  let ackClaimed = false
 
   for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt++) {
     attempts = attempt
@@ -434,6 +458,30 @@ export async function runBackstopDelivery(
           `telegram gateway: backstop delivery attempt ${attempt}/${maxAttempts} failed: ` +
           `${err instanceof Error ? err.message : String(err)}\n`,
         )
+      }
+    }
+
+    // 1b. EXACTLY-ONCE SEND-ACK CLAIM (duplicate-message race fix). The instant
+    //     every chunk has landed a fresh non-card receipt, fire the caller's
+    //     claim — BEFORE the read-back probe below, which can be deferred ~30s
+    //     by the edit-flood-fuse (cosmetic priority). This is the same predicate
+    //     as the final `delivered` verdict (all-landed + fresh receipt); the only
+    //     way `delivered` can subsequently go false is a POSITIVE `absent` probe
+    //     demoting a chunk, which this orchestrator re-sends in-process (never
+    //     reopening the nonce to the out-of-band sweep). See onAckClaim.
+    if (!ackClaimed && deps.onAckClaim != null) {
+      const allLandedNow =
+        chunkCount > 0 && ledger.unsentIndices(turnId, chunkCount).length === 0
+      if (allLandedNow && backstopReceiptIds(ledger.sentIds(turnId), cardMessageId).length > 0) {
+        ackClaimed = true
+        try {
+          deps.onAckClaim(ledger.sentIds(turnId))
+        } catch (err) {
+          stderr(
+            `telegram gateway: backstop send-ack claim callback threw for turn ${turnId} ` +
+            `(non-fatal): ${err instanceof Error ? err.message : String(err)}\n`,
+          )
+        }
       }
     }
 
