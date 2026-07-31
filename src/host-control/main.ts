@@ -198,7 +198,15 @@ async function main(): Promise<void> {
       resolveGatewaySocket,
       log: (m) => process.stderr.write(`hostd: rollout-narration — ${m}\n`),
     }),
-    { log: (m) => process.stderr.write(`hostd: rollout-narration — ${m}\n`) },
+    {
+      log: (m) => process.stderr.write(`hostd: rollout-narration — ${m}\n`),
+      // Late-bound: the narrator is built before `server` exists, but this
+      // sink only fires when a post lands (well after `server` is assigned).
+      // Persist the learned card id into the pending-rollout marker so a hostd
+      // self-bump can hand it back and the resumed roll edits the same card
+      // instead of stranding it and re-posting (#4062-adjacent).
+      onMessageId: (rid, mid) => server?.persistNarrationMessageId(rid, mid),
+    },
   );
 
   const server = new HostdServer({

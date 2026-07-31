@@ -329,6 +329,14 @@ export interface RolloutNarrator {
    * final entry. Freezes the surface: no later edit may un-finalize it.
    */
   onTerminal(entry: StatusEntry): void;
+  /**
+   * Seed a resumed narrator with the message_id of the card the PRE-self-bump
+   * hostd already posted (carried across the recreate in the pending-rollout
+   * marker), so the resumed roll EDITS that card rather than posting a new one
+   * and stranding the original. Optional — a narrator without it degrades to
+   * the pre-fix re-post behaviour.
+   */
+  seedPostedMessage?(requestId: string, agentName: string, messageId: number): void;
 }
 
 /**
@@ -2723,6 +2731,40 @@ export class HostdServer {
    * Runs BEFORE the sockets bind (no request can race the lock) and
    * BEFORE the orphan sweep (a resumable roll isn't an orphan).
    */
+  /**
+   * Persist the rollout narration card's Telegram message_id into the pending-
+   * rollout marker, so a hostd self-bump can hand it to the resumed narrator
+   * (which then EDITs the same card instead of re-posting a fresh one and
+   * stranding the frozen original). Wired from main.ts as the narrator's
+   * `onMessageId` sink.
+   *
+   * No-op when the marker is gone (the common case: most rolls never self-bump,
+   * so no marker exists). Atomic (`.tmp` + rename) so a SIGKILL mid-write can
+   * never leave a torn marker that would block the resume — the worst case is
+   * the id simply isn't persisted and the resume degrades to a re-post.
+   * Best-effort throughout: every failure is swallowed.
+   */
+  persistNarrationMessageId(requestId: string, messageId: number): void {
+    try {
+      if (!Number.isInteger(messageId) || messageId <= 0) return;
+      const markerPath = join(this.hostdDirPath(), SELF_BUMP_MARKER_FILENAME);
+      if (!existsSync(markerPath)) return; // no self-bump in flight — nothing to carry.
+      const marker = parsePendingRolloutMarker(readFileSync(markerPath, "utf8"));
+      if (!marker) return; // torn/foreign marker — leave it for the resume path to judge.
+      if (marker.request_id !== requestId) return; // marker is for a different roll.
+      const updated: PendingRolloutMarker = {
+        ...marker,
+        narration_message_id: messageId,
+      };
+      const tmp = `${markerPath}.tmp`;
+      writeFileSync(tmp, encodePendingRolloutMarker(updated), { mode: 0o600 });
+      renameSync(tmp, markerPath);
+    } catch {
+      // Best-effort: a failure here only means the card may re-post after a
+      // self-bump (pre-fix behaviour), never a broken roll.
+    }
+  }
+
   private async resumePendingSelfBumpRollout(): Promise<void> {
     const markerPath = join(this.hostdDirPath(), SELF_BUMP_MARKER_FILENAME);
     if (!existsSync(markerPath)) return;
@@ -2822,6 +2864,21 @@ export class HostdServer {
       caller,
       Date.now(),
     );
+    // Adopt the card the PRE-self-bump hostd posted, if we carried its id, so
+    // the resumed roll EDITS that card instead of stranding it and posting a
+    // fresh one. MUST seed BEFORE feeding the first phase below, or that phase
+    // would see a null message_id and re-post. Best-effort: absent id (helper
+    // was SIGKILLed before the reply landed) degrades to the pre-fix re-post.
+    if (
+      marker.narration_message_id !== undefined &&
+      caller.kind === "agent"
+    ) {
+      this.rolloutNarrator?.seedPostedMessage?.(
+        marker.request_id,
+        caller.name,
+        marker.narration_message_id,
+      );
+    }
     this.onRolloutPhase(entry, { phase: "self-bump-done", target: marker.pin });
   }
 

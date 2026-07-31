@@ -188,6 +188,12 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       log?: (m: string) => void;
       /** Clock seam for tests; defaults to Date.now. */
       now?: () => number;
+      /**
+       * Called once the first post lands with a real Telegram message_id, so a
+       * caller can durably persist it (into the pending-rollout marker) and let
+       * a post-self-bump resume EDIT the same card instead of re-posting.
+       */
+      onMessageId?: (requestId: string, messageId: number) => void;
     } = {},
   ) {}
 
@@ -585,28 +591,63 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
     }
   }
 
+  private freshState(agentName: string, target: string): NarrationState {
+    return {
+      agentName,
+      lastAppliedSeq: -1,
+      messageId: null,
+      posting: false,
+      postAttempts: 0,
+      postFailed: false,
+      render: { target },
+      agents: [],
+      singletons: initialSingletons(),
+      frozen: false,
+      timer: null,
+      pendingEditAfterPost: false,
+    };
+  }
+
   private ensureState(entry: StatusEntry): NarrationState {
     let st = this.states.get(entry.request_id);
     if (!st) {
       const agentName =
         entry.caller.kind === "agent" ? entry.caller.name : "";
-      st = {
-        agentName,
-        lastAppliedSeq: -1,
-        messageId: null,
-        posting: false,
-        postAttempts: 0,
-        postFailed: false,
-        render: { target: entry.pin ?? "" },
-        agents: [],
-        singletons: initialSingletons(),
-        frozen: false,
-        timer: null,
-        pendingEditAfterPost: false,
-      };
+      st = this.freshState(agentName, entry.pin ?? "");
       this.states.set(entry.request_id, st);
     }
     return st;
+  }
+
+  /**
+   * Seed a narration state that already has a posted message_id — used after a
+   * hostd self-bump so the RESUMED narrator adopts the card the OLD hostd
+   * posted (message_id carried across the recreate via the pending-rollout
+   * marker) and its first `onPhase` takes the EDIT branch instead of posting a
+   * fresh card and stranding the original. Idempotent: if a state already
+   * exists for this request (e.g. onPhase raced ahead), only backfill a still-
+   * null messageId rather than clobbering live progress.
+   */
+  seedPostedMessage(
+    requestId: string,
+    agentName: string,
+    messageId: number,
+  ): void {
+    const existing = this.states.get(requestId);
+    if (existing) {
+      if (existing.messageId === null) {
+        existing.messageId = messageId;
+        existing.posting = false;
+        existing.postFailed = false;
+        if (existing.postAttempts < 1) existing.postAttempts = 1;
+        existing.pendingEditAfterPost = false;
+      }
+      return;
+    }
+    const st = this.freshState(agentName, "");
+    st.messageId = messageId;
+    st.postAttempts = 1;
+    this.states.set(requestId, st);
   }
 
   /** Post the first message (once), then debounce edits for subsequent phases. */
@@ -671,6 +712,15 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         }
         st.messageId = mid;
         st.postFailed = false;
+        // Surface the learned id so it can be persisted for a post-self-bump
+        // resume (best-effort; a throwing sink must not break narration).
+        try {
+          this.opts.onMessageId?.(requestId, mid);
+        } catch (e) {
+          this.opts.log?.(
+            `onMessageId sink threw (non-fatal): ${(e as Error).message}`,
+          );
+        }
         // If phases arrived while we were posting, apply the latest now.
         if (st.pendingEditAfterPost) {
           st.pendingEditAfterPost = false;

@@ -95,6 +95,57 @@ describe("LogTailRolloutNarrator", () => {
     expect(relay.edits.at(-1)!.text).toContain("canary");
   });
 
+  it("a seeded (post-self-bump) narrator EDITs the carried card and NEVER re-posts", async () => {
+    // Regression for the self-bump card bug: when hostd recreates itself onto
+    // the new CLI, the old process's in-memory message_id was lost, so the
+    // resumed narrator re-posted a fresh card and stranded the original frozen.
+    // Seeding the carried message_id must make the resumed roll take the EDIT
+    // branch on its very first phase — post() must never fire.
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 1000 });
+    const entry = makeEntry();
+
+    // Old hostd had already posted card 4242; the new hostd carries the id.
+    n.seedPostedMessage("ro-1", "overlord", 4242);
+
+    // First phase after the self-bump.
+    n.onPhase(entry, phase("self-bump-done"));
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // Subsequent agent phases through to a converged terminal.
+    n.onPhase(entry, phase("agent-start", { agent: "a", n: 1, m: 2 }));
+    n.onPhase(entry, phase("agent-done", { agent: "a", n: 1, m: 2 }));
+    await vi.advanceTimersByTimeAsync(1000);
+    n.onTerminal(makeEntry({ result: "completed", rolled: ["a", "b"] }));
+    await vi.runAllTimersAsync();
+
+    // The card was NEVER re-posted — the whole point of the fix.
+    expect(relay.posts).toHaveLength(0);
+    // Every edit landed on the carried card id, including the converged render.
+    expect(relay.edits.length).toBeGreaterThanOrEqual(1);
+    expect(relay.edits.every((e) => e.messageId === 4242)).toBe(true);
+    expect(relay.edits.at(-1)!.messageId).toBe(4242);
+    expect(relay.edits.at(-1)!.text).toContain("✅");
+  });
+
+  it("surfaces the learned message_id to the onMessageId sink exactly once on first post", async () => {
+    const relay = makeRelay(777);
+    const seen: { requestId: string; messageId: number }[] = [];
+    const n = new LogTailRolloutNarrator(relay, {
+      debounceMs: 1000,
+      onMessageId: (requestId, messageId) => seen.push({ requestId, messageId }),
+    });
+    const entry = makeEntry();
+
+    n.onPhase(entry, phase("apply"));
+    await vi.runAllTimersAsync();
+    n.onPhase(entry, phase("agent-start", { agent: "a", n: 1, m: 2 }));
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // Fired once, on the post that learned the id — not on later edits.
+    expect(seen).toEqual([{ requestId: "ro-1", messageId: 777 }]);
+  });
+
   it("debounces multiple rapid phases into a single trailing-edge edit", async () => {
     const relay = makeRelay(100);
     const n = new LogTailRolloutNarrator(relay, { debounceMs: 1000 });

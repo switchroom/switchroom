@@ -141,6 +141,36 @@ describe("pending-rollout marker", () => {
     );
   });
 
+  it("round-trips the narration_message_id (the card carried across a self-bump)", () => {
+    const withId: PendingRolloutMarker = {
+      ...marker,
+      narration_message_id: 4242,
+    };
+    const parsed = parsePendingRolloutMarker(encodePendingRolloutMarker(withId));
+    expect(parsed).toEqual(withId);
+    expect(parsed!.narration_message_id).toBe(4242);
+  });
+
+  it.each([
+    ["non-integer", 4242.5],
+    ["zero", 0],
+    ["negative", -1],
+    ["string", "4242"],
+    ["NaN", Number.NaN],
+    ["null", null],
+  ])(
+    "drops a malformed narration_message_id (%s) WITHOUT nulling the marker — must not block resume",
+    (_label, badId) => {
+      const raw = JSON.stringify({ ...marker, narration_message_id: badId });
+      const parsed = parsePendingRolloutMarker(raw);
+      // The marker still parses — a bad id can never strand the resume.
+      expect(parsed).not.toBeNull();
+      // ...but the bad field is dropped rather than carried forward.
+      expect(parsed).toEqual(marker);
+      expect(parsed!.narration_message_id).toBeUndefined();
+    },
+  );
+
   it("round-trips the minimal (no-optionals, operator) shape", () => {
     const min: PendingRolloutMarker = {
       v: 1,
