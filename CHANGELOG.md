@@ -2,6 +2,154 @@
 
 ## Unreleased
 
+## v0.19.39 — Cross-session memory dedup on by default, a host CLI that self-heals after a roll, and honest mid-turn Telegram cards
+
+The headline is a memory fix: curated `observation_scopes` are now on by
+default, so consolidation dedups an observation across sessions instead of
+pocketing one copy per session. Around it, a cluster of self-heal work makes a
+shipped release actually converge the host binary and the hindsight-watch cron
+after a roll — the gap that let a host CLI trail the fleet by five versions for
+half a day — plus a Postgres/consolidation perf promotion and two Telegram
+progress-card correctness fixes.
+
+### Curated observation_scopes by default — cross-session memory dedup (#4035)
+
+switchroom stamps volatile per-session provenance on every retain — the
+`{session_id}` retain tag resolves to a bare UUID, and sub-agent retains add
+`parent_session:<uuid>`. Under the engine default (`combined`), consolidation
+only dedups an observation against others carrying the IDENTICAL tag set, so
+those volatile tags turned every session into its own dedup island and
+cross-session dedup never happened (measured: 99.5% of observations pocketed
+one-per-session on the live overlord bank).
+
+A curated per-row `observation_scopes` strategy is now ON by default for any
+install. `compute_observation_scopes(tags, config)` strips volatile provenance
+tags (`parent_session:*` and bare RFC-4122 UUIDs) from the CONSOLIDATION scope
+while leaving them on the source fact, so the fact stays queryable and
+recall-filterable; stable semantic tags (`lesson`, `sidechain`, `agent_type:*`,
+entities) ride the scope so recall tag-weighting still fires. A non-empty stable
+set yields an explicit `[[stable...]]` scope; an all-volatile/empty set folds to
+`"shared"`. The `observationScopeStrategy` config (`curated` default, `shared`,
+`combined`/`off` opt-out) and `HINDSIGHT_OBSERVATION_SCOPE_STRATEGY` env expose
+the knob. Precedence is preserved: a manually pinned `observationScopes` still
+wins. It NEVER raises — a bad strategy degrades to curated, a bad pin to the
+engine default, both shouted on stderr. The scope is threaded through every
+retain producer (Stop, sub-agent, reconcile, backfill) and the pending-retry
+drain, so a retain that fails inline and drains hours later still lands in the
+same scope. A follow-up fix in the same PR extends the anchored UUID pattern to
+strip the sidechain-derived `<uuid>-sub-<agent_id>` session tag too — sidechain
+is the dominant observation volume, so without it the feature silently failed on
+its primary path.
+
+### Postgres buffer-pool + consolidation relief values promoted to defaults (#4036)
+
+The DB-relief settings applied and verified live are now baked into the shipped
+defaults, so a `switchroom apply` converges on them instead of reverting to the
+pre-relief values. `shared_buffers` goes 3072 → 6144 MiB and
+`effective_cache_size` 7168 → 12288 MiB (promoted alongside the hot-table VACUUM
++ autovacuum tuning that makes the larger pool safe; 6144 stays inside the
+derived 11776 MiB budget ceiling the test pins). Consolidation
+`max_memories_per_round` drops 500 → 250, shortening the per-round worker-slot
+hold under multi-bank contention while staying 2.5x over the old 100 floor so
+mental-model refresh still completes. All three are honoured keys with no live
+override, so the shipped constant is authoritative; exact-value revert-catcher
+tests replace the prior range checks.
+
+### doctor fails on host-CLI drift so it can't silently trail the fleet (#4032)
+
+The v0.19.38 roll advanced every container while the host binary at
+`/usr/local/bin/switchroom` stayed on v0.19.33, so the hindsight-watch cron ran
+retired code for 12h. Nothing turned RED: the component-version section was
+warn-only, and a warning scrolls past during a roll. The fix is scoped to the
+actual failure mode. Container skew stays a warning — containers legitimately
+trail `target` mid-roll — but the host CLI is the one component `switchroom
+update` converges in-band, so a *behind* host binary is never transient: it is
+exactly this bug. That single case is now a `fail`, so `switchroom doctor` exits
+non-zero and the drift can no longer hide. Blast radius is bounded: doctor's
+exit code is consumed only by interactive operator runs and `switchroom update`'s
+(informational) doctor step, and no CI workflow gates on it. A current or ahead
+host CLI stays green.
+
+### switchroom update reconciles the hindsight-watch cron on every run (#4033)
+
+`switchroom update` refreshed every host surface EXCEPT the hindsight-watch
+cron. The fragment at `/etc/cron.d/hindsight-watch` pins the binary path,
+schedule, flags and PATH when armed, but nothing re-asserted it — so a
+definition change or a moved binary persisted silently until someone re-ran
+`hindsight-watch --install-cron` by hand. A new `reconcile-hindsight-watch-cron`
+step in the apply-config phase repairs this. It is REPAIR, not ARM: it is a
+no-op when the fragment is ABSENT (arming stays the explicit `--install-cron`
+opt-in), idempotent once the fragment matches, and PRESERVES the operator's
+chosen `--cron-user` rather than overwriting it to the reconciling process's
+root env. Deferred in hostd-context and never fatal — a failed reconcile warns
+and continues.
+
+### Operator systemd timer that self-heals the host CLI (#4034)
+
+`switchroom update` self-updates the host binary but nothing re-ran it on a
+schedule, so a host CLI left behind after a roll stayed behind until a human
+acted — the same v0.19.38-vs-v0.19.33 drift that ran a retired cron for 12h.
+This ships an operator-installed systemd service + timer that runs `switchroom
+update --skip-images` every 30 min, so the host binary self-heals within one
+interval. `--skip-images` keeps each tick cheap: it still runs the atomic binary
+swap and reconciles the cron, but does not pull GHCR images or restart the fleet
+on a healthy tick. Documents the run-as-operator + writable-binary-dir
+requirements, cadence rationale, install/verify/disable steps, and why it is not
+wired into the `curl | sh` installer.
+
+### switchroom update installs the self-heal timer automatically (#4037)
+
+#4034 documented the `switchroom-self-heal` timer but installed nothing. This
+wires the install: a new `install-self-heal-timer` step in `switchroom update`
+(right after the cron reconcile) writes
+`/etc/systemd/system/switchroom-self-heal.{service,timer}`, `daemon-reload`s and
+`enable --now`s the timer — but only when the host is systemd-booted AND
+privileged (euid 0) AND a non-root operator user resolves (SUDO_USER → USER →
+LOGNAME, root refused). It mirrors the `install-cron` idioms: tmp+rename mode
+0644, idempotent byte-compare, absolute-binary guard. On a non-systemd or
+unprivileged host, or when no operator user resolves, it writes NOTHING, never
+fails the update, and prints the exact unit contents plus the two `systemctl`
+commands as the manual fallback. The timer's tick heals the binary because
+`self-update-cli` is skipped only by `--skip-self-update`, not `--skip-images`.
+
+### Telegram: drop sidechain tool labels at the PreToolUse hook (#4038)
+
+A new turn's progress card was showing step rows belonging to a still-running
+background worker dispatched by the PREVIOUS turn. Root cause: Claude Code fires
+PreToolUse hooks for sidechain (sub-agent) tool calls too and passes the PARENT
+session_id, so a worker's Bash labels were appended into the parent session's
+`tool-labels-<parentSession>.jsonl`; session-tail's draft-mirror then emitted a
+main-tier `tool_label` event per line, which the renderer bound to whatever turn
+was live — streaming the worker's steps into an unrelated new turn's card,
+inflating its `labeledToolCount` and re-arming its orphaned-reply fuse. Fixed at
+source: the installed Claude Code (2.1.219) PreToolUse payload carries sidechain
+identity (`agent_type` / `agent_id`), so the hook now drops any call whose
+`agent_type` is a concrete non-"main" value, corroborated by `agent_id !=
+session_id`; an absent `agent_type` is treated as main-tier and kept. A hardening
+follow-up in the same PR makes the filter authoritative on `agent_type` when
+present (fixing a latent false-positive that dropped a main-tier payload whose
+`agent_id` diverged), and adds a two-part canary — committed real-2.1.219 shape
+fixtures plus a loud runtime WARNING — so a future schema drift that dropped both
+identity fields can no longer silently reopen the bug.
+
+### Telegram: surface a card for genuinely-queued mid-turn messages (#4040)
+
+Since #3927 a mid-turn message that got PARKED (session busy) had no surface at
+all until it dequeued — the user got silence between sending and the turn
+actually starting. A single honest "⏳ Queued" card is now posted at park time,
+reply-anchored to the parked message, and on dequeue `beginTurn` seeds it as the
+turn's `activityMessageId` so the SAME card is EDITED IN PLACE into the live
+progress card — one continuous lifecycle finalized by the normal turn end. A
+`queue_remove` finalizes it as "folded into the current task"; TTL expiry / cap
+eviction finalizes it as timed-out, so it never freezes on "Queued". It lives
+entirely in `stream-render.ts` (gateway.ts untouched), with a
+`SWITCHROOM_QUEUED_CARD=0` kill switch. A review follow-up fixes the
+handback-while-busy case: when a handback pre-turn signal already owns the
+surface for the turn, the queued card is suppressed at park (turn-scoped, so an
+unrelated parked message is not wrongly suppressed), and a sub-second race that
+posted the card first deletes the now-orphaned card at dequeue — so the
+worker-handoff case can never double-card or freeze a Queued card.
+
 ## v0.19.38 — Honest handback orphan-reaping, a live recall deadline in watch alerts, and root-agent-first alert relay
 
 Three focused correctness fixes to the Telegram handback lifecycle and the
