@@ -158,14 +158,48 @@ export function isVersionAssertable(target: string): boolean {
 }
 
 /**
- * Order agents canary-first: `test-harness` (the sanctioned canary) goes
- * first if present, so a bad build fails on it before touching the rest
- * (stop-on-first-mismatch turns this into an automatic canary gate).
+ * Priority prefix for the agent roll order, AFTER the canary (operator
+ * request, 2026-07-31): the operator's primary agents get the new build
+ * as early as possible instead of waiting behind the rest of the fleet.
+ *
+ * Maintainable by edit: add/remove/reorder names here — `orderAgentsForRoll`
+ * applies whatever this list says, skipping names not present in the roll.
+ *
+ * Deliberately AFTER `test-harness`, not before it: the first restarted
+ * agent IS the canary gate (stop-on-first-mismatch, persist-pin-after-canary
+ * on the hostd path, the #3333 scoped-sweep staging, and hostd's
+ * canary-fail auto-rollback all key off restart position 1). Putting
+ * `overlord` literally first would make the operator's primary agent the
+ * agent that eats a bad build with no gate in front of it — the exact
+ * exposure the sanctioned canary exists to absorb.
  */
-export function orderAgentsCanaryFirst(agents: string[]): string[] {
+export const ROLLOUT_PRIORITY_AGENTS: readonly string[] = [
+  "overlord",
+  "carrie",
+  "finn",
+];
+
+/**
+ * Order agents for a roll: canary first, then the priority prefix, then
+ * everything else in its incoming (config) order.
+ *
+ *   1. `test-harness` (the sanctioned canary) goes first if present, so a
+ *      bad build fails on it before touching the rest
+ *      (stop-on-first-mismatch turns this into an automatic canary gate).
+ *   2. {@link ROLLOUT_PRIORITY_AGENTS}, in that list's order, for those
+ *      present in the roll.
+ *   3. All remaining agents, preserving their incoming order.
+ */
+export function orderAgentsForRoll(agents: string[]): string[] {
   const canary = agents.filter((a) => a === "test-harness");
-  const rest = agents.filter((a) => a !== "test-harness");
-  return [...canary, ...rest];
+  const priority = ROLLOUT_PRIORITY_AGENTS.filter(
+    (p) => p !== "test-harness" && agents.includes(p),
+  );
+  const prioritySet = new Set(priority);
+  const rest = agents.filter(
+    (a) => a !== "test-harness" && !prioritySet.has(a),
+  );
+  return [...canary, ...priority, ...rest];
 }
 
 /**
@@ -178,7 +212,7 @@ export function planRollout(
   opts: RolloutPlanOpts = {},
 ): RolloutStep[] {
   const steps: RolloutStep[] = [];
-  const ordered = orderAgentsCanaryFirst(agents);
+  const ordered = orderAgentsForRoll(agents);
 
   if (opts.hostdContext) {
     // hostd/MCP path (#2487): persist the pin AFTER the canary confirms,
