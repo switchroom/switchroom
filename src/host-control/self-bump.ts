@@ -80,6 +80,14 @@ export interface PendingRolloutMarker {
   created_at: string;
   /** The OLD hostd's own CLI version, for the audit trail. */
   prior_hostd_version: string;
+  /**
+   * Telegram message_id of the rollout progress ("narration") card the OLD
+   * hostd already posted, so the resumed narrator EDITS the same card instead
+   * of stranding it and re-posting. Optional / best-effort: if the OLD hostd
+   * was SIGKILLed before it learned the posted id, this is absent and the
+   * resume degrades to a fresh post (today's behaviour — strictly no worse).
+   */
+  narration_message_id?: number;
 }
 
 const SEMVER_PIN_RE = /^v\d+\.\d+\.\d+$/;
@@ -202,6 +210,12 @@ export function parsePendingRolloutMarker(
   if (o.allow_downgrade !== undefined && typeof o.allow_downgrade !== "boolean") {
     return null;
   }
+  // Best-effort field: a malformed narration id must NEVER null the whole
+  // marker (that would block the resume). Drop only this field and keep going.
+  const narrationIdValid =
+    typeof o.narration_message_id === "number" &&
+    Number.isInteger(o.narration_message_id) &&
+    o.narration_message_id > 0;
   return {
     v: 1,
     request_id: o.request_id,
@@ -210,6 +224,9 @@ export function parsePendingRolloutMarker(
     ...(o.skip_web !== undefined ? { skip_web: o.skip_web as boolean } : {}),
     ...(o.allow_downgrade !== undefined
       ? { allow_downgrade: o.allow_downgrade as boolean }
+      : {}),
+    ...(narrationIdValid
+      ? { narration_message_id: o.narration_message_id as number }
       : {}),
     caller:
       caller.kind === "agent"
