@@ -268,7 +268,7 @@ const TOOL_SCHEMAS = [
   {
     name: 'send_checklist',
     description:
-      'Send a native Telegram checklist (interactive task list) to a chat. Users can tick tasks directly in the Telegram app. Returns the message_id of the created checklist. The bot is notified when tasks are ticked — these arrive as channel events with kind="checklist_task_changed". Limit: 30 tasks per checklist.',
+      'Send a checklist (task list) to a chat. Native interactive Telegram checklists require a Business-account connection, which most deployments do not have — in that normal case the checklist is sent as a formatted TEXT message (bold title + ✅/⬜ task lines) and the result carries degraded:"text": tasks are NOT tappable, and you tick them yourself via update_checklist (task ids are 1..N in send order). With a Business connection configured, the checklist is sent natively and tick events arrive as channel events with kind="checklist_task_changed". Returns JSON with message_id and mode. Limit: 30 tasks.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -357,7 +357,7 @@ const TOOL_SCHEMAS = [
   {
     name: 'update_checklist',
     description:
-      'Patch an existing native Telegram checklist. Supports updating the title, adding new tasks, removing tasks, or marking tasks done/undone. Tasks with an id target existing items; tasks without an id are appended. Preserves existing task ids across edits.',
+      'Patch a checklist previously sent with send_checklist: update the title, append tasks, or mark tasks done/undone. Tasks with an id target existing items (ids are 1..N in send order for text-mode checklists); tasks without an id are appended. Removal is not supported. The edit re-renders in the mode the checklist was sent in (text for most deployments). Returns JSON { ok, ... }; after a gateway restart the stored task state may be gone — then it returns ok:false with reason "unknown_checklist" unless you pass a full replacement (title + every task\'s text).',
     inputSchema: {
       type: 'object',
       properties: {
