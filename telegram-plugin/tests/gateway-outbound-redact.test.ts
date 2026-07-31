@@ -114,21 +114,25 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(sendIdx).toBeGreaterThan(redactIdx) // mask BEFORE the question is sent
   })
 
-  it('send_checklist: redacts title + task text BEFORE rawSendChecklist', () => {
-    // F2 — checklist title + task strings were sent unredacted.
+  it('send_checklist: redacts title + task text BEFORE the send orchestration', () => {
+    // F2 — checklist title + task strings were sent unredacted. The send now
+    // routes through performSendChecklist (native OR text fallback), so the
+    // scrub must land before that orchestration call — both paths receive
+    // only redacted strings.
     const start = src.indexOf('async function executeSendChecklist(')
     const redactIdx = src.indexOf('redactChecklistFields(', start)
-    const sendIdx = src.indexOf('rawSendChecklist({', start)
+    const sendIdx = src.indexOf('performSendChecklist({', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
     expect(sendIdx).toBeGreaterThan(redactIdx) // mask BEFORE the send
   })
 
-  it('update_checklist: redacts title + task text BEFORE rawEditMessageChecklist', () => {
-    // F2 sibling — update_checklist shares the identical leak class.
+  it('update_checklist: redacts title + task text BEFORE the edit orchestration', () => {
+    // F2 sibling — update_checklist shares the identical leak class; the edit
+    // routes through performUpdateChecklist (native OR text fallback).
     const start = src.indexOf('async function executeUpdateChecklist(')
     const redactIdx = src.indexOf('redactChecklistFields(', start)
-    const editIdx = src.indexOf('rawEditMessageChecklist({', start)
+    const editIdx = src.indexOf('performUpdateChecklist({', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
     expect(editIdx).toBeGreaterThan(redactIdx) // mask BEFORE the edit

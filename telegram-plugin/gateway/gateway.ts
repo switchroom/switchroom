@@ -35,6 +35,7 @@ import {
   type AskUserOutcome,
 } from '../ask-user.js'
 import { redactAskUserFields, redactChecklistFields } from '../outbound-field-redact.js'
+import { createChecklistStore, checklistStoreKey, performSendChecklist, performUpdateChecklist, sendChecklistToolText, updateChecklistToolText } from './checklist-fallback.js'
 import { parseInterruptMarker } from '../interrupt-marker.js'
 import {
   ToolFlightTracker,
@@ -1383,65 +1384,29 @@ let _rawEditMessageChecklist: unknown
 /** True when the connected Telegram Bot API supports native checklists. Set in initGatewayBot() (#2996 P0b). */
 let CHECKLIST_API_AVAILABLE = false
 
-/**
- * Send a native Telegram checklist message.
- * Wraps bot.api.raw.sendChecklist with string→number coercion (chat_id) and
- * a 30-task cap enforced before the API call.
- */
-async function rawSendChecklist(args: {
-  chat_id: string
-  title: string
-  tasks: Array<{ text: string; done?: boolean }>
-  message_thread_id?: number
-  reply_to_message_id?: number
-  protect_content?: boolean
-}): Promise<{ message_id: number }> {
-  if (!CHECKLIST_API_AVAILABLE) {
-    throw new Error('sendChecklist is not available in this grammY/Telegram Bot API version')
-  }
-  const MAX_TASKS = 30
-  if (args.tasks.length > MAX_TASKS) {
-    throw new Error(`checklist exceeds ${MAX_TASKS}-task limit (got ${args.tasks.length})`)
-  }
-  const result = await (_rawSendChecklist as (p: Record<string, unknown>) => Promise<{ message_id: number }>)({
-    chat_id: Number(args.chat_id),
-    title: args.title,
-    tasks: args.tasks.map(t => ({ text: t.text, ...(t.done != null ? { is_completed: t.done } : {}) })),
-    ...(args.message_thread_id != null ? { message_thread_id: args.message_thread_id } : {}),
-    ...(args.reply_to_message_id != null ? { reply_to_message_id: args.reply_to_message_id } : {}),
-    ...(args.protect_content === true ? { protect_content: true } : {}),
-  })
+/** bot.api.raw.sendChecklist with a payload pre-built by checklist-fallback.ts
+ *  (nested `checklist` object, per-task integer ids, business_connection_id —
+ *  the old flat shape got `400: parameter "checklist" is required`). */
+async function rawSendChecklist(payload: Record<string, unknown>): Promise<{ message_id: number }> {
+  if (!CHECKLIST_API_AVAILABLE) throw new Error('sendChecklist is not available in this grammY/Telegram Bot API version')
+  const result = await (_rawSendChecklist as (p: Record<string, unknown>) => Promise<{ message_id: number }>)(payload)
   return { message_id: result.message_id }
 }
 
-/**
- * Edit (patch) an existing Telegram checklist message.
- * Supports updating title, adding/removing tasks, and marking tasks done/undone.
- * Task objects with an `id` field target existing tasks; those without are added.
- */
-async function rawEditMessageChecklist(args: {
-  chat_id: string
-  message_id: string
-  title?: string
-  tasks?: Array<{ id?: string; text?: string; done?: boolean }>
-}): Promise<void> {
-  if (!CHECKLIST_API_AVAILABLE) {
-    throw new Error('editMessageChecklist is not available in this grammY/Telegram Bot API version')
-  }
-  await (_rawEditMessageChecklist as (p: Record<string, unknown>) => Promise<unknown>)({
-    chat_id: Number(args.chat_id),
-    message_id: Number(args.message_id),
-    ...(args.title != null ? { title: args.title } : {}),
-    ...(args.tasks != null
-      ? {
-          tasks: args.tasks.map(t => ({
-            ...(t.id != null ? { id: Number(t.id) } : {}),
-            ...(t.text != null ? { text: t.text } : {}),
-            ...(t.done != null ? { is_completed: t.done } : {}),
-          })),
-        }
-      : {}),
-  })
+/** bot.api.raw.editMessageChecklist with a pre-built payload (the native edit REPLACES the whole checklist, so checklist-fallback.ts sends full state). */
+async function rawEditMessageChecklist(payload: Record<string, unknown>): Promise<void> {
+  if (!CHECKLIST_API_AVAILABLE) throw new Error('editMessageChecklist is not available in this grammY/Telegram Bot API version')
+  await (_rawEditMessageChecklist as (p: Record<string, unknown>) => Promise<unknown>)(payload)
+}
+
+/** Per-message checklist state — update_checklist re-renders from it (process-local; post-restart updates degrade gracefully). */
+const checklistStore = createChecklistStore()
+
+/** Native checklists are Telegram-Business-only (sendChecklist REQUIRES a business_connection_id).
+ *  No fleet config plumbing exists yet; this env var is the opt-in — unset (the normal case) means text fallback. */
+function resolveBusinessConnectionId(): string | undefined {
+  const v = process.env.SWITCHROOM_TELEGRAM_BUSINESS_CONNECTION_ID?.trim()
+  return v ? v : undefined
 }
 
 const chatLock = createChatLock()
@@ -12083,17 +12048,35 @@ async function executeSendChecklist(args: Record<string, unknown>): Promise<{ co
     (t) => redactOutboundText(t, 'send_checklist'),
   )
 
-  const sent = await rawSendChecklist({
-    chat_id,
-    title: redactedTitle!,
-    tasks: redactedTasks!,
+  // Graceful degradation: native sendChecklist is Business-account-only, so
+  // ordinary chats (the fleet norm) get a formatted text render instead of a
+  // raw Telegram 400 (rationale + orchestration in checklist-fallback.ts).
+  const literal = (loadAccess().parseMode ?? 'html') === 'text'
+  const sendOpts = {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
-    ...(replyTo != null ? { reply_to_message_id: replyTo } : {}),
+    ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
     ...(protectContent ? { protect_content: true } : {}),
-  })
+  }
+  const result = await performSendChecklist({
+    businessConnectionId: resolveBusinessConnectionId(),
+    nativeAvailable: CHECKLIST_API_AVAILABLE,
+    sendNative: rawSendChecklist,
+    sendText: (text) => robustApiCall(
+      (): Promise<{ message_id: number }> =>
+        literal
+          // allow-raw-bot-api: literal checklist text-fallback send routed through robustApiCall
+          ? lockedBot.api.sendMessage(chat_id, text, sendOpts as never)
+          // allow-raw-bot-api: checklist text-fallback send routed through robustApiCall
+          : lockedBot.api.sendRichMessage(chat_id, richMessage(text), sendOpts as never),
+      { verb: 'sendMessage', chat_id, threadId },
+    ),
+    literalText: literal,
+    log: (l) => process.stderr.write(`telegram gateway: ${l}`),
+  }, { title: redactedTitle!, tasks: redactedTasks!, chatId: Number(chat_id), replyToMessageId: replyTo, protectContent })
 
-  process.stderr.write(`telegram gateway: send_checklist: sent chatId=${chat_id} messageId=${sent.message_id} tasks=${tasks.length}\n`)
-  return { content: [{ type: 'text', text: `checklist sent (id: ${sent.message_id})` }] }
+  checklistStore.set(checklistStoreKey(chat_id, result.message_id), result.state)
+  process.stderr.write(`telegram gateway: send_checklist: sent chatId=${chat_id} messageId=${result.message_id} tasks=${tasks.length} mode=${result.mode}\n`)
+  return { content: [{ type: 'text', text: sendChecklistToolText(result) }] }
 }
 
 /**
@@ -12180,10 +12163,27 @@ async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ 
     (t) => redactOutboundText(t, 'update_checklist'),
   )
 
-  await rawEditMessageChecklist({ chat_id, message_id, title: redactedTitle, tasks: redactedTasks })
+  // Graceful degradation (checklist-fallback.ts): the patch is applied to the
+  // stored per-message state and the message re-rendered in the mode it was
+  // sent in. Failures come back structured, never as a raw Telegram 400.
+  const literal = (loadAccess().parseMode ?? 'html') === 'text'
+  const key = checklistStoreKey(chat_id, message_id)
+  const result = await performUpdateChecklist({
+    state: checklistStore.get(key),
+    businessConnectionId: resolveBusinessConnectionId(),
+    nativeAvailable: CHECKLIST_API_AVAILABLE,
+    editNative: rawEditMessageChecklist,
+    // allow-raw-bot-api: checklist text-fallback edit routed through robustApiCall
+    editText: async (text) => { await robustApiCall(() => lockedBot.api.editMessageText(chat_id, Number(message_id), literal ? text : richMessage(text))) },
+    literalText: literal,
+    log: (l) => process.stderr.write(`telegram gateway: ${l}`),
+    chatId: Number(chat_id),
+    messageId: Number(message_id),
+  }, { title: redactedTitle, tasks: redactedTasks })
 
-  process.stderr.write(`telegram gateway: update_checklist: updated chatId=${chat_id} messageId=${message_id}\n`)
-  return { content: [{ type: 'text', text: `checklist updated (id: ${message_id})` }] }
+  if (result.ok) checklistStore.set(key, result.state)
+  process.stderr.write(`telegram gateway: update_checklist: ${result.ok ? `updated mode=${result.mode}` : `failed reason=${result.reason}`} chatId=${chat_id} messageId=${message_id}\n`)
+  return { content: [{ type: 'text', text: updateChecklistToolText(result, Number(message_id)) }] }
 }
 
 /**

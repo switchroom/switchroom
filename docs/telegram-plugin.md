@@ -21,8 +21,8 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 | `send_typing` | Show typing indicator during long operations (5s auto-expire). |
 | `download_attachment` | Fetch files attached to inbound messages. |
 | `get_recent_messages` | Query the local SQLite history buffer with pagination and thread filtering. |
-| `send_checklist` | Native Telegram checklist message — fixed-order items with per-item state. Returns a checklist id usable with `update_checklist` (#272). |
-| `update_checklist` | Patch the state of items on a previously sent checklist (e.g. mark item 2 done) without re-sending the whole message. |
+| `send_checklist` | Checklist message — fixed-order items with per-item state. Native Telegram checklists are Business-account-only, so without a business connection (the normal case) it renders as a formatted ✅/⬜ text message and the result carries `degraded: "text"`. Returns a message id usable with `update_checklist` (#272). |
+| `update_checklist` | Patch the state of items on a previously sent checklist (e.g. mark item 2 done) without re-sending the whole message. Re-renders in the mode the checklist was sent in. |
 
 ### Status accent headers
 
