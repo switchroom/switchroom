@@ -322,6 +322,107 @@ describe("LogTailRolloutNarrator", () => {
     expect(t).toContain("Re-running the roll will NOT fix this");
   });
 
+  it("renders a truthful singleton/shared section that tracks the singleton phases", async () => {
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry();
+
+    // From the FIRST post the card must answer for the singletons, not just
+    // the agents: web/hindsight pending, hostd honestly deferred (the
+    // agent-invoked path cannot recreate its own hostd), shared services
+    // named with their self-heal mechanism.
+    n.onPhase(entry, phase("apply"));
+    await vi.runAllTimersAsync();
+    const first = relay.posts[0]!.text;
+    expect(first).toContain("**Singletons / shared:**");
+    expect(first).toContain("- · `switchroom-web`");
+    expect(first).toContain("- · `hindsight`");
+    expect(first).toContain("- ⧗ `hostd` — host-side");
+    expect(first).toContain("self-heal with the first agent restart");
+
+    // First agent done → the shared singletons' self-heal ran (⏳, verified
+    // at end — never a bare ✓ mid-roll).
+    n.onPhase(entry, phase("canary-start", { agent: "test-harness", n: 1, m: 2 }));
+    n.onPhase(entry, phase("canary-pass", { agent: "test-harness", n: 1, m: 2 }));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain(
+      "recreated with the first agent restart — verified at roll end",
+    );
+
+    // web refresh: ⏳ on -start, ✓ only on the observed -done.
+    n.onPhase(entry, phase("web-refresh"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain("- ⏳ `switchroom-web` — webd install…");
+    n.onPhase(entry, phase("web-refresh-done"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain("- ✓ `switchroom-web`");
+
+    // hindsight skip renders as an honest ○, not a ✓.
+    n.onPhase(entry, phase("hindsight-skipped"));
+    await vi.advanceTimersByTimeAsync(500);
+    const t = relay.edits.at(-1)!.text;
+    expect(t).toContain("- ○ `hindsight` — no hindsight container on this host");
+  });
+
+  it("terminal ✅ reconciles the singleton rows from the verify-components outcome", async () => {
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry();
+    n.onPhase(entry, phase("canary-start", { agent: "a", n: 1, m: 1 }));
+    n.onPhase(entry, phase("canary-pass", { agent: "a", n: 1, m: 1 }));
+    await vi.runAllTimersAsync();
+    // NO web/hindsight phases arrived (e.g. --skip-web) — a completed roll
+    // must render them as skipped, never as a fabricated ✓.
+    n.onTerminal(makeEntry({ result: "completed", rolled: ["a"] }));
+    await vi.runAllTimersAsync();
+    const final = relay.edits.at(-1)!.text;
+    expect(final).toContain("- ○ `switchroom-web` — no refresh observed in this roll");
+    expect(final).toContain("- ○ `hindsight` — no refresh observed in this roll");
+    // Shared services: the end-of-roll component check passed with them in
+    // scope (gatedOwners always gates "fleet"), so ✓ is an observation.
+    expect(final).toContain(
+      "- ✓ `shared services (approval-kernel · auth-broker · vault-broker · voice)`",
+    );
+    expect(final).toContain("end-of-roll check passed");
+    // hostd stays the deferral truth.
+    expect(final).toContain("- ⧗ `hostd`");
+  });
+
+  it("terminal drift (#3928) marks the named singleton ✗ — even past a web-refresh-done", async () => {
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry();
+    n.onPhase(entry, phase("web-refresh"));
+    n.onPhase(entry, phase("web-refresh-done"));
+    await vi.runAllTimersAsync();
+    n.onTerminal(
+      makeEntry({
+        result: "error",
+        failed_step: "verify-components",
+        rolled: ["a"],
+        drifted: ["switchroom-web"],
+      }),
+    );
+    await vi.runAllTimersAsync();
+    const final = relay.edits.at(-1)!.text;
+    expect(final).toContain("- ✗ `switchroom-web` — still behind (switchroom-web)");
+  });
+
+  it("terminal refresh-hindsight failure marks hindsight ✗ with the recovery command", async () => {
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry();
+    n.onPhase(entry, phase("hindsight-refresh"));
+    await vi.runAllTimersAsync();
+    n.onTerminal(
+      makeEntry({ result: "error", failed_step: "refresh-hindsight", rolled: ["a"] }),
+    );
+    await vi.runAllTimersAsync();
+    const final = relay.edits.at(-1)!.text;
+    expect(final).toContain("- ✗ `hindsight`");
+    expect(final).toContain("switchroom memory setup");
+  });
+
   it("terminal before any phase still posts the final message", async () => {
     const relay = makeRelay(100);
     const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });

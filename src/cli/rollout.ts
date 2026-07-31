@@ -319,6 +319,19 @@ export type RolloutPhaseName =
   // In-plan web singleton refresh (webd install) — emitted just before the
   // spawn so a slow pull/recreate isn't a silent gap in the narration.
   | "web-refresh"
+  // Emitted only when `webd install` exited 0 AND the belt-and-braces image
+  // tag probe did not detect a version skew — i.e. the roll actually
+  // OBSERVED web on the target (or could not disprove it after a clean
+  // install). Absent on failure/skew so the narration surface never shows a
+  // fabricated ✓.
+  | "web-refresh-done"
+  // Hindsight singleton refresh (memory setup --recreate): start / observed
+  // success / no-container skip. A FAILED recreate emits no -done phase —
+  // the roll stops with failedStep=refresh-hindsight and the terminal row
+  // carries the truth.
+  | "hindsight-refresh"
+  | "hindsight-refresh-done"
+  | "hindsight-skipped"
   | "hostd-web-deferred"
   // #2645 — hostd self-bump. Emitted by the DAEMON directly (never via the
   // child's stdout sentinel): "self-bump" when the old hostd hands its own
@@ -392,6 +405,10 @@ export function parseRolloutPhaseLine(line: string): RolloutPhase | null {
     "agent-done",
     "persist-pin",
     "web-refresh",
+    "web-refresh-done",
+    "hindsight-refresh",
+    "hindsight-refresh-done",
+    "hindsight-skipped",
     "hostd-web-deferred",
     "self-bump",
     "self-bump-done",
@@ -1138,6 +1155,23 @@ export function executeRollout(
                 `skipped the install). Finish it host-side: \`switchroom webd ` +
                 `install --tag ${target} --allow-downgrade\`.`,
             );
+            // No web-refresh-done phase: the probe just DISPROVED "web is on
+            // the target", so the narration surface must not show a ✓.
+            break;
+          }
+          if (
+            webTag !== undefined &&
+            webTag !== null &&
+            isVersionAssertable(webTag) &&
+            normalizeVersion(webTag) === targetNorm
+          ) {
+            // OBSERVED success: install exited 0 AND the running container's
+            // image tag equals the target. Only this earns the ✓ phase —
+            // `webd install` exits 0 on a downgrade-guard skip, so exit
+            // status alone observes nothing; when the tag probe can't read a
+            // tag the card stays on ⏳ and the terminal verify-components
+            // gate resolves it.
+            emit({ phase: "web-refresh-done", target });
           }
           break;
         }
@@ -1180,6 +1214,7 @@ export function executeRollout(
           const hindsightExists = deps.hindsightExists ?? isHindsightContainerExists;
           if (!hindsightExists()) {
             deps.log(`ROLL_STEP refresh-hindsight — no hindsight container on this host; skipping`);
+            emit({ phase: "hindsight-skipped", target });
             break;
           }
           // Thread the pinned rollout target through as `--tag <target>` so the
@@ -1189,6 +1224,7 @@ export function executeRollout(
           deps.log(
             `ROLL_STEP refresh-hindsight — memory setup --recreate --tag ${target} (pull ${target} + recreate)`,
           );
+          emit({ phase: "hindsight-refresh", target });
           const r = deps.run(["memory", "setup", "--recreate", "--tag", target]);
           if (r.status !== 0) {
             // FATAL, not a soft warning (#2752 fix 2): `memory setup --recreate`
@@ -1208,6 +1244,7 @@ export function executeRollout(
               ...(r.timedOut ? { timedOut: true } : {}),
             });
           }
+          emit({ phase: "hindsight-refresh-done", target });
           break;
         }
         case "sweep": {

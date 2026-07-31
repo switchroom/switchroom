@@ -40,6 +40,37 @@ export interface AgentRollProgress {
   startedAtMs?: number;
 }
 
+/**
+ * Truthful per-singleton state on the narration card. Every value maps to a
+ * REAL observation (or a real deferral) — the narrator never invents a ✓:
+ *   - "pending"   — this roll owns it but hasn't reached it yet;
+ *   - "updating"  — its refresh phase started and no outcome phase yet;
+ *   - "updated"   — an observed success (a `…-done` phase, or the terminal
+ *                   `verify-components` gate proving convergence);
+ *   - "deferred"  — deliberately left to a host-side run (hostd on the
+ *                   agent-invoked path);
+ *   - "skipped"   — not refreshed in this roll (no container / --skip-web /
+ *                   the roll never reached it);
+ *   - "failed"    — its refresh step failed (roll stopped there, or the
+ *                   terminal drift gate named it still behind).
+ */
+export type SingletonRollStatus =
+  | "pending"
+  | "updating"
+  | "updated"
+  | "deferred"
+  | "skipped"
+  | "failed";
+
+export interface SingletonRollProgress {
+  /** Display name (container-ish: `switchroom-web`, `hindsight`, `hostd`,
+   *  or the shared-services group row). */
+  name: string;
+  status: SingletonRollStatus;
+  /** Short truthful qualifier rendered after the name (e.g. "host-side"). */
+  detail?: string;
+}
+
 /** The rollout progress state a renderer needs — a projection of the latest
  *  durable rollout row / status payload. */
 export interface RolloutRenderState {
@@ -60,6 +91,13 @@ export interface RolloutRenderState {
   agent?: string;
   /** Per-agent checklist state, in roll order (accumulated by the narrator). */
   agents?: AgentRollProgress[];
+  /**
+   * Singleton / shared-service checklist (accumulated by the narrator from
+   * the singleton phases + the terminal row). Rendered as its own section so
+   * the card answers "what about web / hindsight / hostd / the shared
+   * services", not just the agents.
+   */
+  singletons?: SingletonRollProgress[];
   /** ms since epoch the roll started (for the elapsed line). */
   startedAtMs?: number;
   /** ms since epoch "now" at render time (clock seam — keeps the fn pure). */
@@ -107,6 +145,14 @@ function phaseLine(s: RolloutRenderState): string {
       return "persisting pin";
     case "web-refresh":
       return "refreshing web dashboard (webd install)";
+    case "web-refresh-done":
+      return "web dashboard refreshed";
+    case "hindsight-refresh":
+      return "refreshing hindsight (memory backend recreate)";
+    case "hindsight-refresh-done":
+      return "hindsight refreshed";
+    case "hindsight-skipped":
+      return "hindsight — no container on this host; skipped";
     case "hostd-web-deferred":
       // Legacy phase name: since the in-plan refresh-web step landed, only
       // the hostd self-refresh is actually deferred on the agent path.
@@ -190,6 +236,44 @@ function checklistLines(s: RolloutRenderState, compact: boolean): string[] {
   return lines;
 }
 
+/** Glyph per singleton state — consistent with the agent checklist glyphs
+ *  (✓ / ⏳ / ✗), plus ⧗ for a deliberate host-side deferral and ○ for a
+ *  skip. */
+function singletonGlyph(status: SingletonRollStatus): string {
+  switch (status) {
+    case "updated":
+      return "✓";
+    case "updating":
+      return "⏳";
+    case "deferred":
+      return "⧗";
+    case "skipped":
+      return "○";
+    case "failed":
+      return "✗";
+    default:
+      return "·";
+  }
+}
+
+/**
+ * The singleton / shared-service section: a header plus one checklist line
+ * per tracked singleton. Kept in BOTH full and compact renders — it is a
+ * fixed handful of rows, unlike the per-agent list, so it can't blow the
+ * size ceiling; folding it would drop exactly the information the section
+ * exists to add.
+ */
+function singletonLines(s: RolloutRenderState): string[] {
+  const singletons = s.singletons ?? [];
+  if (singletons.length === 0) return [];
+  const lines = ["**Singletons / shared:**"];
+  for (const g of singletons) {
+    const detail = g.detail ? ` — ${g.detail}` : "";
+    lines.push(`- ${singletonGlyph(g.status)} \`${g.name}\`${detail}`);
+  }
+  return lines;
+}
+
 /** Rough ETA from the mean per-agent duration so far. */
 function etaLine(s: RolloutRenderState): string | null {
   if (s.m === undefined) return null;
@@ -251,6 +335,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
   const rolled = s.rolled ?? [];
   const rolledCount = rolled.length;
   const checklist = checklistLines(s, compact);
+  const singletons = singletonLines(s);
   const elapsedMs =
     s.elapsedMs ??
     (s.startedAtMs !== undefined && s.nowMs !== undefined
@@ -264,6 +349,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     summary += compact ? "." : `: ${rolledList(rolled, compact)}.`;
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
+    if (singletons.length > 0) parts.push("", ...singletons);
     if (s.deferred !== false) parts.push("", ...deferredLines(s.target));
     return parts.join("\n");
   }
@@ -294,6 +380,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
         `target. Finish the stale component(s), then \`switchroom update --check\`.`,
     );
     if (checklist.length > 0) parts.push("", ...checklist);
+    if (singletons.length > 0) parts.push("", ...singletons);
     return parts.join("\n");
   }
 
@@ -307,12 +394,14 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     summary += `. Rolled before stop: ${rolledList(rolled, compact)}.`;
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
+    if (singletons.length > 0) parts.push("", ...singletons);
     return parts.join("\n");
   }
 
   // In-flight.
   const parts = [headerLine(s, "⏳"), `**Phase:** ${phaseLine(s)}`];
   if (checklist.length > 0) parts.push("", ...checklist);
+  if (singletons.length > 0) parts.push("", ...singletons);
   const footer: string[] = [];
   if (s.m !== undefined) footer.push(`${rolledCount}/${s.m} rolled`);
   else if (rolledCount > 0) footer.push(`${rolledCount} rolled`);
