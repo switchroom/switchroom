@@ -101,6 +101,10 @@ describe("runScan (I/O) — defensive over a synthetic fleet tree", () => {
           turn_id: `${CHAT}:_#1`,
           status: "complete",
           tools: 0,
+          // A genuine silent no-op used as an observable: route:'none' (nothing
+          // reached the user) makes it a silent no-op vs a flush-recovery, and
+          // lets it flag regardless of the route ship epoch (detect.ts).
+          route: "none",
           // Real gateway rows always carry `ts`; the silent-no-op guard now
           // requires it (detect.ts). ~2026-07-02, matching the gw log line and
           // the scenario clock (below the fixed floor — see silentNoopFloorTs:0).
