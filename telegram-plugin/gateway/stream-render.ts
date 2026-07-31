@@ -133,6 +133,21 @@ import * as silencePoke from '../silence-poke.js'
 const PARKED_TURN_START_MAX = 16
 const PARKED_TURN_START_TTL_MS = 30 * 60_000
 
+// ─── Queued-turn card (#3927 follow-up) ──────────────────────────────────────
+// Since #3927 a genuinely-queued mid-turn message is parked with NO surface at
+// all until it dequeues — the user gets silence between sending and the turn
+// starting. We post an immediate, clearly-marked "queued" card at park time,
+// reply-anchored to the parked message, and store its id on the envelope. On
+// dequeue → `beginTurn` seeds it as the turn's `activityMessageId` (mirroring
+// the handback-card adoption) so the SAME card is EDITED IN PLACE into the live
+// progress card — one lifecycle, finalized by the normal turn end. A `remove`
+// (folded into the running turn) or a TTL expiry finalizes it so it never
+// freezes. Kill switch: SWITCHROOM_QUEUED_CARD=0.
+const QUEUED_CARD_ENABLED = process.env.SWITCHROOM_QUEUED_CARD !== '0'
+const QUEUED_CARD_HTML = '⏳ Queued — waiting for the current task to finish…'
+const QUEUED_CARD_FOLDED_HTML = '✅ Folded into the current task.'
+const QUEUED_CARD_EXPIRED_HTML = '⚠️ This queued message timed out before it could start.'
+
 /** The `enqueue` envelope fields `beginTurn` needs — the SessionEvent minus its
  *  discriminant. A parked entry additionally carries `parkedAt` for the TTL. */
 export interface TurnStartEnvelope {
@@ -140,6 +155,10 @@ export interface TurnStartEnvelope {
   messageId: string | null
   threadId: string | null
   rawContent: string
+  /** Message id of the "queued" card posted at park time (Part B). Seeded as the
+   *  turn's `activityMessageId` on dequeue so the card is edited in place into
+   *  the live progress card. Absent on the idle-mint path (no parking, no card). */
+  queuedCardMessageId?: number | null
 }
 interface ParkedTurnStart extends TurnStartEnvelope {
   parkedAt: number
@@ -149,7 +168,9 @@ interface ParkedTurnStart extends TurnStartEnvelope {
  *  claude CLI session's ONE queue, exactly like the `currentTurn` mirror. */
 const parkedTurnStarts: ParkedTurnStart[] = []
 
-function pruneParkedTurnStarts(now: number): void {
+/** `onDrop` (Part B) fires for every removed entry so the caller can finalize a
+ *  posted queued card. Best-effort — never throws into the prune loop. */
+function pruneParkedTurnStarts(now: number, onDrop?: (entry: ParkedTurnStart) => void): void {
   for (let i = parkedTurnStarts.length - 1; i >= 0; i--) {
     if (now - parkedTurnStarts[i].parkedAt > PARKED_TURN_START_TTL_MS) {
       const [dropped] = parkedTurnStarts.splice(i, 1)
@@ -157,19 +178,29 @@ function pruneParkedTurnStarts(now: number): void {
         `telegram gateway: parked-turn-start expired chat=${dropped.chatId ?? '-'} ` +
           `msg=${dropped.messageId ?? '-'} age_ms=${now - dropped.parkedAt}\n`,
       )
+      try { onDrop?.(dropped) } catch { /* never let card cleanup break the prune */ }
     }
   }
 }
 
-function parkTurnStart(env: TurnStartEnvelope, now: number): void {
-  parkedTurnStarts.push({ ...env, parkedAt: now })
+/** Returns the freshly-parked entry so the caller can attach a queued-card id to
+ *  it asynchronously. `onEvict` (Part B) fires for a cap-evicted entry. */
+function parkTurnStart(
+  env: TurnStartEnvelope,
+  now: number,
+  onEvict?: (entry: ParkedTurnStart) => void,
+): ParkedTurnStart {
+  const entry: ParkedTurnStart = { ...env, parkedAt: now }
+  parkedTurnStarts.push(entry)
   while (parkedTurnStarts.length > PARKED_TURN_START_MAX) {
     const [dropped] = parkedTurnStarts.splice(0, 1)
     process.stderr.write(
       `telegram gateway: parked-turn-start evicted (cap ${PARKED_TURN_START_MAX}) ` +
         `chat=${dropped.chatId ?? '-'} msg=${dropped.messageId ?? '-'}\n`,
     )
+    try { onEvict?.(dropped) } catch { /* never let card cleanup break parking */ }
   }
+  return entry
 }
 
 /** Pop the MOST RECENTLY parked envelope — the one a `dequeue` pairs with. */
@@ -181,14 +212,14 @@ function takeParkedTurnStart(): ParkedTurnStart | null {
  *  match first. A `remove` means "folded into the running turn" — that message
  *  will never get a turn of its own, so leaving it parked would let a LATER
  *  `dequeue` mint a spurious turn for an already-answered message. */
-function discardParkedTurnStart(rawContent: string): boolean {
+function discardParkedTurnStart(rawContent: string): ParkedTurnStart | null {
   for (let i = parkedTurnStarts.length - 1; i >= 0; i--) {
     if (parkedTurnStarts[i].rawContent === rawContent) {
-      parkedTurnStarts.splice(i, 1)
-      return true
+      const [dropped] = parkedTurnStarts.splice(i, 1)
+      return dropped
     }
   }
-  return false
+  return null
 }
 
 /** Test seam: the parked store is module-scope (one CLI session, one queue), so
@@ -199,6 +230,111 @@ export function __resetParkedTurnStartsForTest(): void {
 /** Test seam: parked-envelope count (bound / eviction assertions). */
 export function __parkedTurnStartCountForTest(): number {
   return parkedTurnStarts.length
+}
+
+// ─── Queued-turn card send / finalize (Part B) ───────────────────────────────
+// These use the ALREADY-injected `bot` + `robustApiCall` deps, so the whole
+// feature lives in stream-render.ts with zero new wiring in gateway.ts. No
+// streaming is structurally possible before dequeue (no CurrentTurn exists),
+// so this card is a single static line until the turn adopts + edits it.
+
+/** Minimal deps the queued-card helpers need. */
+type QueuedCardDeps = Pick<StreamRenderDeps, 'bot' | 'robustApiCall'>
+
+/** Post the "queued" card, reply-anchored to the parked message. Resolves to the
+ *  sent message id, or null when the send failed / was suppressed (best-effort —
+ *  a null just means no card, so nothing to adopt or finalize). Forum topics use
+ *  the envelope's OWN thread id. */
+async function openQueuedCard(
+  deps: QueuedCardDeps,
+  chatId: string,
+  threadId: number | null,
+  replyToMessageId: number | null,
+): Promise<number | null> {
+  try {
+    const sent = await deps.robustApiCall(
+      // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+      () =>
+        deps.bot.api.sendRichMessage(chatId, richMessage(QUEUED_CARD_HTML), {
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+          ...(replyToMessageId != null
+            ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } }
+            : {}),
+          // Status surface, not the user's answer — never ping the device.
+          disable_notification: true,
+        }),
+      {
+        chat_id: chatId,
+        ...(threadId != null ? { threadId } : {}),
+        verb: 'queued-card.send',
+      },
+    )
+    return sent?.message_id ?? null
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: queued card send failed: ${(err as Error).message}\n`,
+    )
+    return null
+  }
+}
+
+/** Finalize (single honest edit) a queued card that will NOT become a live turn:
+ *  folded into the running turn (`remove`) or timed out (TTL). Best-effort. */
+function finalizeQueuedCard(
+  deps: QueuedCardDeps,
+  chatId: string,
+  threadId: number | null,
+  messageId: number,
+  html: string,
+): void {
+  void deps
+    .robustApiCall(
+      // allow-raw-bot-api: editMessageText routed through robustApiCall
+      () => deps.bot.api.editMessageText(chatId, messageId, richMessage(html), {}),
+      {
+        chat_id: chatId,
+        ...(threadId != null ? { threadId } : {}),
+        verb: 'queued-card.finalize',
+      },
+    )
+    .catch(() => undefined)
+}
+
+/** Delete a queued card that lost its race (the entry left the store before its
+ *  card id was stored, so `beginTurn` couldn't adopt it — a fresh progress card
+ *  will open instead). Best-effort. */
+function deleteQueuedCard(
+  deps: QueuedCardDeps,
+  chatId: string,
+  messageId: number,
+): void {
+  void deps
+    .robustApiCall(
+      // allow-raw-bot-api: deleteMessage routed through robustApiCall
+      () => deps.bot.api.deleteMessage(chatId, messageId),
+      { chat_id: chatId, verb: 'queued-card.delete-orphan' },
+    )
+    .catch(() => undefined)
+}
+
+/** Numeric thread id from an envelope's string thread id (null/invalid → null). */
+function envThreadIdNum(threadId: string | null): number | null {
+  if (threadId == null) return null
+  const n = Number(threadId)
+  return Number.isFinite(n) ? n : null
+}
+
+/** Finalize a queued card carried by a parked entry that is being dropped
+ *  (folded via `remove`, cap-evicted, or TTL-expired). No-op when the entry
+ *  never got a card. */
+function finalizeParkedEntryCard(
+  deps: QueuedCardDeps,
+  entry: ParkedTurnStart,
+  html: string,
+): void {
+  if (!QUEUED_CARD_ENABLED) return
+  if (entry.queuedCardMessageId == null || entry.chatId == null) return
+  finalizeQueuedCard(deps, entry.chatId, envThreadIdNum(entry.threadId), entry.queuedCardMessageId, html)
 }
 
 /**
@@ -435,6 +571,41 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
             `key=${handbackAdoption.statusKey} card=${handbackAdoption.activityMessageId ?? 'none'}\n`,
         )
       }
+    }
+    // Part B — ADOPT the queued card. A parked envelope reaching `beginTurn`
+    // (via `dequeue`) carries the id of the "queued" card posted at park time.
+    // Seed it exactly as the handback adoption does so `renderActivityFeed`
+    // EDITS that same message into the live progress card instead of opening a
+    // second one, and the turn's own end-of-turn `clearActivitySummary`
+    // finalizes it — one continuous lifecycle. Guarded on `activityMessageId`
+    // still being null so a card-bearing handback adoption (mutually exclusive
+    // in practice) is never clobbered.
+    if (QUEUED_CARD_ENABLED && ev.queuedCardMessageId != null && next.activityMessageId == null) {
+      next.activityMessageId = ev.queuedCardMessageId
+      next.activityEverOpened = true
+      process.stderr.write(
+        `telegram gateway: queued card adopted turnId=${turnId} card=${ev.queuedCardMessageId}\n`,
+      )
+    } else if (
+      QUEUED_CARD_ENABLED &&
+      ev.queuedCardMessageId != null &&
+      ev.chatId != null &&
+      next.activityMessageId != null &&
+      next.activityMessageId !== ev.queuedCardMessageId
+    ) {
+      // Part B safety net — the handback adoption above WON the surface (its card
+      // is now `activityMessageId`) yet this envelope ALSO carries a queued card:
+      // the park raced ahead of `noteHandbackRelease`, so the park-time
+      // suppression missed and a queued card got posted. It is now a pure
+      // duplicate that would otherwise FREEZE on "⏳ Queued" beneath the adopted
+      // handback card (the MAJOR). Delete it — the handback card is the one
+      // surface; a delete (not a "folded" edit) is right because there is no
+      // separate message to explain, just a stray duplicate to remove.
+      deleteQueuedCard(deps, ev.chatId, ev.queuedCardMessageId)
+      process.stderr.write(
+        `telegram gateway: queued card superseded by handback adoption turnId=${turnId} ` +
+          `queued=${ev.queuedCardMessageId} adopted=${next.activityMessageId}\n`,
+      )
     }
     // #3544 — arm the turn-long `typing…` loop for EVERY minted turn,
     // unconditionally. It used to hang off the handback ADOPTION above,
@@ -731,7 +902,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           )
         }
       }
-      pruneParkedTurnStarts(now)
+      pruneParkedTurnStarts(now, (e) => finalizeParkedEntryCard(deps, e, QUEUED_CARD_EXPIRED_HTML))
       // `enqueue` with no chat can never mint a turn (the whole mint block is
       // `if (ev.chatId)`-gated); parking it would only pollute the store, so
       // run the pre-turn drain path verbatim and stop.
@@ -751,11 +922,13 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         beginTurn(deps, ev)
         return
       }
-      // PARKED. Deliberately NO surface work here — no `promoteQueuedStatus`
-      // ("On it — replying now" is a lie until the turn actually starts), no
-      // `typingWrapper.drainAll()` (that drains the LIVE turn's wraps), no card.
-      // The queued placeholder Hook A already posted is the honest surface, and
-      // its lifecycle stays owned by the existing reap machinery.
+      // PARKED. No `promoteQueuedStatus` ("On it — replying now" is a lie until
+      // the turn actually starts) and no `typingWrapper.drainAll()` (that drains
+      // the LIVE turn's wraps). Part B DOES post one honest, clearly-marked
+      // "queued" card here: on the machine-authoritative path (the default) the
+      // legacy Hook A placeholder never fires — it lives in the buffer-until-idle
+      // branch that returns BEFORE the machine enqueues — so before Part B a
+      // parked envelope had no surface at all until it dequeued.
       //
       // UNIFORM ACROSS SOURCES — synthetic enqueues (cron fire, subagent
       // handback, obligation-represent, vault-grant resume, wake inbound) park
@@ -766,7 +939,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // attachment), never by a `dequeue`. Minting for it invented a turn the
       // CLI never started. FIX B covers the residual case where a mint DOES
       // land on top of a live atom.
-      parkTurnStart(
+      const parkedEntry = parkTurnStart(
         {
           chatId: ev.chatId,
           messageId: ev.messageId,
@@ -774,12 +947,57 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           rawContent: ev.rawContent,
         },
         now,
+        // Cap-evicted (oldest lost its slot) → finalize its card as expired so
+        // it never freezes on "⏳ Queued".
+        (evicted) => finalizeParkedEntryCard(deps, evicted, QUEUED_CARD_EXPIRED_HTML),
       )
       process.stderr.write(
         `telegram gateway: turn-start parked (session busy) chat=${ev.chatId} ` +
           `thread=${enqThreadIdNum ?? '-'} msg=${ev.messageId ?? '-'} ` +
           `parked=${parkedTurnStarts.length}\n`,
       )
+      // Post the queued card, reply-anchored to the parked message, and store its
+      // id back on the envelope so `beginTurn` can adopt+edit it on dequeue. One
+      // card per envelope (multiple queued messages each get their own).
+      //
+      // SUPPRESS when a handback pre-turn signal already owns this turn's surface
+      // (the common worker-handoff-while-busy case): `noteHandbackRelease` fired
+      // at buffer drain BEFORE this injected handback inbound reached park, so an
+      // entry armed for THIS message's turnId is already live. That entry paints
+      // (and the dequeued turn adopts) its OWN card, so a queued card here would
+      // be a second card that then freezes on "⏳ Queued" (the MAJOR this fixes).
+      // Turn-scoped, not key-scoped: an unrelated user message parked on the same
+      // topic derives a different turnId and is NOT suppressed. beginTurn carries
+      // a belt-and-suspenders cleanup for the residual race where the queued card
+      // was already posted before the handback entry armed.
+      const parkTurnId = deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
+      const handbackOwnsSurface =
+        HANDBACK_PRETURN_ENABLED &&
+        parkTurnId != null &&
+        handbackPreturnSignal.hasPendingForTurnId(parkTurnId)
+      if (handbackOwnsSurface) {
+        process.stderr.write(
+          `telegram gateway: queued card suppressed (handback owns surface) ` +
+            `turnId=${parkTurnId} msg=${ev.messageId ?? '-'}\n`,
+        )
+      }
+      if (QUEUED_CARD_ENABLED && !handbackOwnsSurface) {
+        const cardChatId = ev.chatId
+        const replyToRaw = ev.messageId != null ? Number(ev.messageId) : null
+        const replyTo = replyToRaw != null && Number.isFinite(replyToRaw) ? replyToRaw : null
+        void openQueuedCard(deps, cardChatId, enqThreadIdNum ?? null, replyTo).then((cardId) => {
+          if (cardId == null) return
+          // Still parked → adopt on the next dequeue. Otherwise the entry already
+          // dequeued/removed/expired before the async send resolved (a sub-second
+          // race), so `beginTurn` ran without the id — delete the orphan card so
+          // no frozen duplicate lingers below the turn's own fresh card.
+          if (parkedTurnStarts.includes(parkedEntry)) {
+            parkedEntry.queuedCardMessageId = cardId
+          } else {
+            deleteQueuedCard(deps, cardChatId, cardId)
+          }
+        })
+      }
       return
     }
     case 'dequeue': {
@@ -789,7 +1007,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // RECENT enqueue, not the oldest. An empty store is the normal idle path
       // (the enqueue ms earlier already minted) and a dequeue with no parked
       // start at all is a no-op, exactly as before.
-      pruneParkedTurnStarts(Date.now())
+      pruneParkedTurnStarts(Date.now(), (e) => finalizeParkedEntryCard(deps, e, QUEUED_CARD_EXPIRED_HTML))
       const parked = takeParkedTurnStart()
       if (parked == null) return
       beginTurn(deps, parked)
@@ -801,8 +1019,11 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // its parked envelope so a later `dequeue` cannot mint a spurious turn
       // for it. Content-matched: `remove` replays its enqueue's `content`
       // byte-for-byte.
-      pruneParkedTurnStarts(Date.now())
-      discardParkedTurnStart(ev.rawContent)
+      pruneParkedTurnStarts(Date.now(), (e) => finalizeParkedEntryCard(deps, e, QUEUED_CARD_EXPIRED_HTML))
+      // Part B — finalize the removed envelope's queued card as "folded into the
+      // current task" so it never freezes on "⏳ Queued".
+      const removed = discardParkedTurnStart(ev.rawContent)
+      if (removed != null) finalizeParkedEntryCard(deps, removed, QUEUED_CARD_FOLDED_HTML)
       return
     }
     case 'model': {
