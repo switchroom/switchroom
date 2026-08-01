@@ -280,11 +280,8 @@ import { REPLY_TOOLS } from '../narrative-dedup.js'
 import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrative-flush.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
-import {
-  createHandbackPreturnSignal,
-  type PreTurnCardRecord,
-  type HandbackOrphanEscalation,
-} from './handback-preturn-signal.js'
+import { createHandbackPreturnSignal } from './handback-preturn-signal.js'
+import { createHandbackOrphanRecovery } from './handback-orphan-recovery.js'
 import { deriveTurnId } from './derive-turn-id.js'
 import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -13773,24 +13770,20 @@ async function openHandbackPreTurnCard(
   }
 }
 
-// DELETE (not edit) a genuinely-orphaned pre-turn card. The old behaviour
-// rewrote the card to an operator-facing string asking the human to manually
-// recover a system that must recover itself. That string is removed; we now
-// delete the frozen card outright, and the orphan is re-injected through the
-// pending-inbound buffer (see the seam's reap) so the machine re-processes it,
-// with no stale message left behind.
-function deleteHandbackPreTurnCard(record: PreTurnCardRecord): Promise<void> {
-  return robustApiCall(
-    () => bot.api.deleteMessage(record.chatId, record.activityMessageId),
-    {
-      chat_id: record.chatId,
-      ...(record.threadId != null ? { threadId: record.threadId } : {}),
+// Deterministic recovery for a genuinely-orphaned handback: delete the frozen
+// pre-turn card, re-inject the handback through the pending-inbound buffer, and
+// past the retry cap emit fleet-health telemetry — never an operator-facing
+// "needs a nudge" card. See handback-orphan-recovery.ts.
+const handbackOrphanRecovery = createHandbackOrphanRecovery({
+  deleteMessage: (chatId, messageId, threadId) =>
+    robustApiCall(() => bot.api.deleteMessage(chatId, messageId), {
+      chat_id: chatId,
+      ...(threadId != null ? { threadId } : {}),
       verb: 'handback-preturn.orphan-delete',
-    },
-  )
-    .then(() => undefined)
-    .catch(() => undefined)
-}
+    }),
+  pushInbound: (inbound) =>
+    pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', inbound),
+})
 
 const handbackPreturnSignal = createHandbackPreturnSignal({
   chatKey: (chatId, threadId) => chatKey(chatId, threadId) as string,
@@ -13798,25 +13791,9 @@ const handbackPreturnSignal = createHandbackPreturnSignal({
   startTypingLoop: (chatId, threadId) => startTurnTypingLoop(chatId, threadId),
   stopTypingLoop: (chatId, threadId) => stopTurnTypingLoop(chatId, threadId),
   openCard: openHandbackPreTurnCard,
-  deleteCard: deleteHandbackPreTurnCard,
-  // Deterministic recovery on a genuine orphan: re-inject the handback through
-  // the same pending-inbound buffer the live synthesis + boot-replay use, so the
-  // idle-drain re-delivers it and the machine re-processes it itself (no operator
-  // nudge). `noteHandbackRelease` re-fires on the redelivery, re-arming the seam.
-  reinjectHandback: (inbound) => {
-    pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', inbound)
-  },
-  // Retries exhausted → fleet-health telemetry, NEVER an operator-facing card.
-  // A structured stderr line lands in the gateway log the nightly fleet-health
-  // sensor reads (src/fleet-health/scan.ts); the `handback orphan escalation`
-  // marker is greppable and carries the join key for correlation.
-  escalateOrphan: (esc: HandbackOrphanEscalation) => {
-    process.stderr.write(
-      `telegram gateway: handback orphan escalation key=${esc.statusKey} ` +
-        `turnId=${esc.adoptTurnId} reinjects=${esc.reinjectCount} ageMs=${esc.ageMs} ` +
-        `— deterministic recovery exhausted, no operator nudge issued\n`,
-    )
-  },
+  deleteCard: handbackOrphanRecovery.deleteCard,
+  reinjectHandback: handbackOrphanRecovery.reinjectHandback,
+  escalateOrphan: handbackOrphanRecovery.escalateOrphan,
   writeCardRecord: (record) => {
     if (!activityCardPersistEnabled) return
     writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, record)
