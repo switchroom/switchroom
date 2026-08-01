@@ -47,6 +47,55 @@ describe("validateClientMessage — rollout_status_post", () => {
       validateClientMessage({ ...post, text: "x".repeat(RICH_MESSAGE_MAX_CHARS + 1) }),
     ).toBe(false);
   });
+
+  // #4048 — the optional tap-to-restart keyboard.
+  it("accepts a well-formed inlineKeyboard (tap-to-restart card)", () => {
+    expect(
+      validateClientMessage({
+        ...post,
+        inlineKeyboard: [
+          [{ text: "🔄 Restart clerk", callback_data: "op:restart:clerk" }],
+          [{ text: "🔄 Restart scout", callback_data: "op:restart:scout" }],
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a malformed inlineKeyboard", () => {
+    // Not an array.
+    expect(validateClientMessage({ ...post, inlineKeyboard: "nope" })).toBe(false);
+    // Row not an array.
+    expect(validateClientMessage({ ...post, inlineKeyboard: [{}] })).toBe(false);
+    // Empty row.
+    expect(validateClientMessage({ ...post, inlineKeyboard: [[]] })).toBe(false);
+    // Button missing callback_data.
+    expect(
+      validateClientMessage({ ...post, inlineKeyboard: [[{ text: "x" }]] }),
+    ).toBe(false);
+    // Button with empty text.
+    expect(
+      validateClientMessage({
+        ...post,
+        inlineKeyboard: [[{ text: "", callback_data: "op:restart:x" }]],
+      }),
+    ).toBe(false);
+    // Over-long callback_data.
+    expect(
+      validateClientMessage({
+        ...post,
+        inlineKeyboard: [[{ text: "x", callback_data: "y".repeat(65) }]],
+      }),
+    ).toBe(false);
+    // Too many rows.
+    expect(
+      validateClientMessage({
+        ...post,
+        inlineKeyboard: Array.from({ length: 9 }, () => [
+          { text: "x", callback_data: "op:restart:x" },
+        ]),
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("validateClientMessage — rollout_status_edit", () => {

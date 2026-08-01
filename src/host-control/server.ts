@@ -410,6 +410,16 @@ export interface StatusEntry {
    * open a host shell to find out.
    */
   drifted?: string[];
+  /**
+   * Non-fatal warnings the roll accumulated (e.g. web/hostd refresh misses,
+   * skipped components, degraded steps). #3944 — `encodeRolloutResultLine`
+   * has always put these on the sentinel wire (`warnings: result.warnings`),
+   * but hostd's sentinel-lift dropped them: they never reached `get_status`
+   * or the narration card, so the operator — who has no host shell on the
+   * managed path — could not see what the roll flagged. Lifted here so the
+   * structured status and the terminal card both surface them.
+   */
+  warnings?: string[];
   /** Actual version detected on failed_agent (null = unreachable). BONUS #2458 got-field gap. */
   got?: string | null;
   /**
@@ -4307,6 +4317,13 @@ export class HostdServer {
           if (parsed.drifted && parsed.drifted.length > 0) {
             entry.drifted = parsed.drifted;
           }
+          // #3944 — the roll's non-fatal warnings. `encodeRolloutResultLine`
+          // puts them on the wire (`warnings: result.warnings`) but this lift
+          // used to skip them, so they never reached get_status or the
+          // narration card. Surface them alongside the other structured fields.
+          if (parsed.warnings && parsed.warnings.length > 0) {
+            entry.warnings = parsed.warnings;
+          }
           // BONUS (#2458 got-field gap): the sentinel carries `got` (the
           // actual version detected on the failed agent, or null when
           // unreachable). Preserve it so get_status readers can surface the
@@ -4649,6 +4666,46 @@ export class HostdServer {
    * gateway. No-op when no relay is wired or the caller isn't an agent (the
    * relay routes through the caller agent's gateway, like the approval card).
    */
+  /**
+   * #4048 — turn an `ensure-banks` failure residue into a tap-to-restart
+   * inline keyboard. The recovery for an agent whose Hindsight bank could not
+   * be created during a roll is to RESTART that agent (its boot re-runs bank
+   * creation) — never a rollback. Until now that recovery was PROSE only: the
+   * terminal card told the operator to "restart the named agent(s)" but gave
+   * them no button, and the hostd result path constructed no `inline_keyboard`
+   * anywhere. This emits one `🔄 Restart <agent>` button per drifted agent,
+   * carrying the SAME `op:restart:<encoded-agent>` callback the operator-event
+   * cards already use (handled in callback-query-handlers.ts →
+   * triggerSelfRestart), so the tap reuses the proven restart path.
+   *
+   * Only ensure-banks residue gets a keyboard: verify-components drift is a
+   * forward-fix of a stale singleton (no per-agent restart converges it), and
+   * a stopped/failed roll's recovery is not "restart these agents". Returns
+   * undefined when there is nothing to offer.
+   *
+   * Bounded to TELEGRAM_MAX_BUTTON_ROWS rows so a large drifted set can't build
+   * an over-tall keyboard Telegram would reject; the card body still names
+   * every drifted agent, and get_status carries the full list.
+   */
+  static buildDriftRestartKeyboard(entry: {
+    failed_step?: string;
+    drifted?: string[];
+  }): Array<Array<{ text: string; callback_data: string }>> | undefined {
+    if (entry.failed_step !== "ensure-banks") return undefined;
+    const drifted = entry.drifted ?? [];
+    if (drifted.length === 0) return undefined;
+    const TELEGRAM_MAX_BUTTON_ROWS = 8;
+    return drifted.slice(0, TELEGRAM_MAX_BUTTON_ROWS).map((agent) => [
+      {
+        text: `🔄 Restart ${agent}`,
+        // Same encoding as operator-events.ts: agent names are URL-encoded so
+        // the callback stays within Telegram's 64-byte budget and parses
+        // cleanly server-side (`op:restart:` is 11 bytes; names ≤ 50).
+        callback_data: `op:restart:${encodeURIComponent(agent)}`,
+      },
+    ]);
+  }
+
   private pushRolloutTerminal(entry: StatusEntry, extraNotes?: string[]): void {
     if (!this.opts.rolloutRelay) return;
     // Relay routing: an agent-invoked roll pings through the CALLER agent's
@@ -4679,7 +4736,14 @@ export class HostdServer {
         ...(entry.drifted && entry.drifted.length > 0
           ? { drifted: entry.drifted }
           : {}),
+        // #3944 — surface the roll's non-fatal warnings on the terminal card.
+        ...(entry.warnings && entry.warnings.length > 0
+          ? { warnings: entry.warnings }
+          : {}),
       });
+      // #4048 — an ensure-banks residue attaches a tap-to-restart keyboard so
+      // the operator can trigger the recovery restart directly from the card.
+      const keyboard = HostdServer.buildDriftRestartKeyboard(entry);
       this.opts.rolloutRelay.postTerminal({
         requestId: entry.request_id,
         agentName: relayAgent,
@@ -4687,6 +4751,7 @@ export class HostdServer {
           extraNotes && extraNotes.length > 0
             ? text + "\n\n" + extraNotes.map((n) => `- ${n}`).join("\n")
             : text,
+        ...(keyboard ? { inlineKeyboard: keyboard } : {}),
       });
     } catch (e) {
       process.stderr.write(
@@ -4824,6 +4889,11 @@ export class HostdServer {
       (entry.rolled !== undefined ||
         entry.failed_step !== undefined ||
         entry.failed_agent !== undefined ||
+        // #3944 — a roll can succeed with warnings and NO other structured
+        // field set (all agents rolled, but web/hostd refresh flagged a
+        // non-fatal miss). Emit the payload on warnings alone so those don't
+        // silently vanish from get_status on an otherwise-clean roll.
+        (entry.warnings !== undefined && entry.warnings.length > 0) ||
         // #2726 point 2 — un-blind an IN-FLIGHT rollout too: a live phase (no
         // rolled[]/failed_step yet) is enough to emit a payload so a
         // get_status poll mid-roll shows the current phase, not a bare "started".
@@ -4846,6 +4916,11 @@ export class HostdServer {
             // Telegram `get_status` can name them without a host shell.
             ...(entry.drifted && entry.drifted.length > 0
               ? { drifted: entry.drifted }
+              : {}),
+            // #3944 — the roll's non-fatal warnings, surfaced structurally so a
+            // Telegram get_status reader sees them without a host shell.
+            ...(entry.warnings && entry.warnings.length > 0
+              ? { warnings: entry.warnings }
               : {}),
             ...(entry.pin ? { pin: entry.pin } : {}),
             // Prior-pin (#2492) surfaced structurally too, so a rollback-aware

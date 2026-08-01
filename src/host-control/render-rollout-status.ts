@@ -124,6 +124,14 @@ export interface RolloutRenderState {
    * need to look.
    */
   drifted?: string[];
+  /**
+   * Non-fatal warnings the roll accumulated (#3944) — web/hostd refresh
+   * misses, skipped components, degraded steps. Rendered as a terminal
+   * section so the operator sees, in the chat, exactly what the roll flagged
+   * without opening a host shell. The wire always carried these; hostd used
+   * to drop them before the render ever saw them.
+   */
+  warnings?: string[];
 }
 
 /** Human-readable one-liner for the current phase. */
@@ -315,6 +323,23 @@ function deferredLines(target: string): string[] {
 }
 
 /**
+ * The roll's non-fatal warnings (#3944), rendered as their own terminal
+ * section. Empty ⇒ no section. Bounded so a pathological warning flood can't
+ * blow the message-size ceiling — the full set still lives on the durable
+ * audit row and in `get_status`.
+ */
+function warningLines(warnings: string[] | undefined): string[] {
+  if (!warnings || warnings.length === 0) return [];
+  const MAX_SHOWN = 8;
+  const shown = warnings.slice(0, MAX_SHOWN);
+  const lines = ["**Warnings:**", ...shown.map((w) => `- ⚠️ ${w}`)];
+  if (warnings.length > MAX_SHOWN) {
+    lines.push(`- …and ${warnings.length - MAX_SHOWN} more (see \`get_status\`).`);
+  }
+  return lines;
+}
+
+/**
  * Defensive size ceiling for the rendered message. Telegram caps message text
  * at 4096 chars, and the gateway's edit path deliberately swallows failures
  * (incl. MESSAGE_TOO_LONG) — an oversized render would therefore freeze the
@@ -336,6 +361,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
   const rolledCount = rolled.length;
   const checklist = checklistLines(s, compact);
   const singletons = singletonLines(s);
+  const warnings = warningLines(s.warnings);
   const elapsedMs =
     s.elapsedMs ??
     (s.startedAtMs !== undefined && s.nowMs !== undefined
@@ -350,6 +376,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
     if (singletons.length > 0) parts.push("", ...singletons);
+    if (warnings.length > 0) parts.push("", ...warnings);
     if (s.deferred !== false) parts.push("", ...deferredLines(s.target));
     return parts.join("\n");
   }
@@ -381,6 +408,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     );
     if (checklist.length > 0) parts.push("", ...checklist);
     if (singletons.length > 0) parts.push("", ...singletons);
+    if (warnings.length > 0) parts.push("", ...warnings);
     return parts.join("\n");
   }
 
@@ -395,6 +423,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
     if (singletons.length > 0) parts.push("", ...singletons);
+    if (warnings.length > 0) parts.push("", ...warnings);
     return parts.join("\n");
   }
 

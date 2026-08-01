@@ -11424,10 +11424,17 @@ if (isGatewayMain) ipcServer = createIpcServer({
       return
     }
     try {
+      // #4048 — an ensure-banks residue post carries a tap-to-restart keyboard.
+      // Attach it as reply_markup so the operator can trigger the recovery
+      // restart directly from the card (op:restart:<agent> callback). Absent on
+      // every other terminal — those stay plain progress lines.
+      const richOpts = msg.inlineKeyboard
+        ? { reply_markup: { inline_keyboard: msg.inlineKeyboard } }
+        : {}
       const sent = await robustApiCall(
         () =>
           // allow-raw-bot-api: rich progress line, routed through robustApiCall.
-          bot.api.sendRichMessage(operator, richMessage(msg.text), {}),
+          bot.api.sendRichMessage(operator, richMessage(msg.text), richOpts),
         { chat_id: String(operator), verb: 'rollout-status-post' },
       )
       const messageId = (sent as { message_id: number }).message_id
