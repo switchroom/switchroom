@@ -2432,7 +2432,7 @@ export const LiteLLMConfigSchema = z
  * container also inherits `ANTHROPIC_MODEL=<model>` so the underlying claude
  * subprocess (and any LiteLLM proxy it routes through) targets the same model.
  */
-const HindsightPerOpLlmSchema = z
+export const HindsightPerOpLlmSchema = z
   .object({
     model: z
       .string()
@@ -2569,6 +2569,28 @@ export const HindsightConfigSchema = z.object({
           "drops the system prompt and the model answers conversationally " +
           "with HTTP 200 — so this value is what makes the failure " +
           "detectable at setup time instead of never.",
+        ),
+      base_url: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "GLOBAL LLM base URL (upstream `HINDSIGHT_API_LLM_BASE_URL`). The " +
+          "default endpoint every op inherits absent a per-op " +
+          "`hindsight.llm.<op>.base_url`. Optional passthrough; unset → the " +
+          "engine's provider default. When this points at host loopback the " +
+          "hindsight container is forced onto host networking, same as a " +
+          "per-op base URL, so the endpoint stays reachable (#3687).",
+        ),
+      api_key: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "GLOBAL LLM API key (upstream `HINDSIGHT_API_LLM_API_KEY`). Literal " +
+          "or `vault:` reference. The default credential every op inherits " +
+          "absent a per-op `hindsight.llm.<op>.api_key`; the engine reads it as " +
+          "a plain env fallback. Optional passthrough (#3687).",
         ),
       retain: HindsightPerOpLlmSchema.optional().describe(
         "Per-op override for the `retain` LLM op (memory ingestion). Emits " +
@@ -3392,6 +3414,44 @@ const profileFields = {
           parallel: z.boolean().optional(),
           additional_banks: z.array(z.string()).optional(),
           sender_banks: z.record(z.string(), z.string()).optional(),
+          // Mirrors of AgentMemorySchema.recall.{types,skip_trivial,
+          // topic_filter_mode} (#3779) — accepted at the defaults/profile tier
+          // too so they cascade fleet-wide like their siblings. Without these
+          // the keys were stripped at parse (unknown key) — the #3773 silent
+          // no-op class. Descriptions live on AgentMemorySchema.recall above.
+          types: z.array(z.string()).optional(),
+          skip_trivial: z.boolean().optional(),
+          topic_filter_mode: z.enum(["soft-preamble", "hard-filter"]).optional(),
+        })
+        .optional(),
+      // Mirror of AgentMemorySchema.retain (#3909) — accepted at the
+      // defaults/profile tier too so the auto-retain cadence can be tuned
+      // fleet-wide with per-agent overrides. merge.ts one-level-deep merges
+      // this per-key exactly like `recall`; without the mirror the keys were
+      // stripped at parse AND the merge clause was a silent no-op. Descriptions
+      // live on AgentMemorySchema.retain.
+      retain: z
+        .object({
+          every_n_turns: z.number().int().min(1).optional(),
+          overlap_turns: z.number().int().min(0).optional(),
+        })
+        .optional(),
+      // Mirrors of AgentMemorySchema.{bank_mission,reflect_mission,
+      // retain_mission,observations_mission,disposition} — accepted at the
+      // defaults/profile tier too so a bank's mission framing and disposition
+      // cascade fleet-wide (per-key merge for `disposition`, override for the
+      // missions). mental_models is DELIBERATELY not mirrored: it is per-agent
+      // only by design (see AgentMemorySchema.mental_models) so a model can
+      // never be fleet-seeded. Descriptions live on AgentMemorySchema.
+      bank_mission: z.string().optional(),
+      reflect_mission: z.string().optional(),
+      retain_mission: z.string().optional(),
+      observations_mission: z.string().optional(),
+      disposition: z
+        .object({
+          skepticism: z.number().int().min(1).max(5).optional(),
+          literalism: z.number().int().min(1).max(5).optional(),
+          empathy: z.number().int().min(1).max(5).optional(),
         })
         .optional(),
     })
