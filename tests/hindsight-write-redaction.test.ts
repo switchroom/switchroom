@@ -8,19 +8,21 @@
  * called": a test of the latter shape would still pass if redaction were a
  * no-op.
  *
- * Three paths are covered here (the fourth, the Python plugin retain, is
- * pinned by vendor/hindsight-memory/scripts/tests/test_secret_redact.py):
+ * Two paths are covered here (the third, the Python plugin retain, is
+ * pinned by vendor/hindsight-memory/scripts/tests/test_secret_redact.py).
+ * The session-handoff mirror is gone entirely: buildHandoff no longer writes
+ * to Hindsight at all (memory-poisoning fix — see
+ * src/agents/handoff-summarizer.ts and handoff-summarizer.test.ts):
  *
  *   1. `redactMemoryWriteBody` itself   — the shared REST helper
- *   2. the session-handoff mirror        — src/agents/handoff-summarizer.ts
- *   3. the MCP shim's tools/call seam    — src/cli/hindsight-mcp-shim.ts
+ *   2. the MCP shim's tools/call seam   — src/cli/hindsight-mcp-shim.ts
  *
  * Every credential-shaped literal below is synthetic and assembled at runtime
  * so nothing token-shaped is committed to the repo.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,7 +35,6 @@ import {
   READ_ONLY_TOOL_NAMES,
   redactToolCallParams,
 } from "../src/cli/hindsight-mcp-shim.js";
-import { buildHandoff } from "../src/agents/handoff-summarizer.js";
 
 /** Synthetic DSN. Assembled at runtime — never a literal in the source. */
 function pgDsn(password: string): string {
@@ -97,7 +98,7 @@ describe("redactMemoryWriteBody", () => {
 
   it("still writes a row whose content is entirely credential", () => {
     // Dropping the write would silently break the durability contract the
-    // callers rely on (handoff mirror, watermark advance). A row saying a
+    // callers rely on (watermark advance). A row saying a
     // secret was here beats a missing row.
     const out = redactMemoryWriteBody({ items: [{ content: pgDsn(DB_PASSWORD) }] });
     expect(out.items).toHaveLength(1);
@@ -119,60 +120,6 @@ describe("redactMemoryWriteBody", () => {
   it("never rewrites object KEYS", () => {
     const out = redactJsonStrings({ "password: SparrowKettle31": "value" });
     expect(Object.keys(out as object)).toEqual(["password: SparrowKettle31"]);
-  });
-});
-
-describe("handoff mirror", () => {
-  let tmp: string;
-  beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), "handoff-redact-"));
-  });
-  afterEach(() => {
-    rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("does not POST a credential from the transcript tail", async () => {
-    // The tail is a RAW transcript: whatever the operator pasted or a tool
-    // printed in the last turns is mirrored verbatim into the bank. This runs
-    // the real `buildHandoff` and asserts on the serialized request body.
-    const jsonlPath = join(tmp, "turns.jsonl");
-    writeFileSync(
-      jsonlPath,
-      [
-        JSON.stringify({
-          type: "queue-operation",
-          operation: "enqueue",
-          content: "the dsn is " + pgDsn(DB_PASSWORD),
-        }),
-        JSON.stringify({
-          type: "assistant",
-          message: { content: [{ type: "text", text: "Noted the dsn." }] },
-        }),
-      ].join("\n") + "\n",
-    );
-
-    const bodies: string[] = [];
-    const fakeFetch = (async (_url: string, init: { body: string }) => {
-      bodies.push(init.body);
-      return new Response("{}", { status: 200 });
-    }) as unknown as typeof fetch;
-
-    const status = await buildHandoff({
-      jsonlPath,
-      agentDir: tmp,
-      agentName: "test",
-      hindsightUrl: "http://127.0.0.1:9",
-      hindsightBankId: "bank",
-      fetch: fakeFetch,
-      env: {},
-    });
-
-    expect(status).toBe("ok");
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0]).not.toContain(DB_PASSWORD);
-    expect(bodies[0]).toContain("[REDACTED:db_uri_password]");
-    // The surrounding transcript survives — only the credential goes.
-    expect(bodies[0]).toContain("Noted the dsn.");
   });
 });
 

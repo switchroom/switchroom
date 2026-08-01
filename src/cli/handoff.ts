@@ -6,7 +6,6 @@ import {
   buildHandoff,
   findLatestSessionJsonl,
   DEFAULT_MAX_TURNS,
-  HANDOFF_STATUS_MIRROR_SKIPPED,
 } from "../agents/handoff-summarizer.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import {
@@ -33,15 +32,11 @@ import {
  * cwd. So on `ConfigError` we warn and fall back to defaults rather
  * than exit 1, which used to fire a red issue card on every turn-end.
  *
- * The ONE deliberate non-zero exit is an invalid `memory.observation_scopes`
- * (`HANDOFF_STATUS_MIRROR_SKIPPED`). That is a misconfiguration the operator
- * has to fix, and a red `hook:handoff` issue — via `bin/run-hook.sh`, which
- * wraps this command in the Stop hook and attaches the stderr tail — is the
- * only surface it reaches: the hook is async so claude discards the code, and
- * start.sh's own `switchroom handoff` call sends stderr to /dev/null. The
- * sidecars are already written by then, so this never costs the next session
- * its reorientation, and `run-hook.sh` auto-resolves the issue on the next
- * clean exit once the value is fixed.
+ * This command writes ONLY the on-disk sidecars. It used to also mirror
+ * the transcript tail into Hindsight (`document_id: "session_handoff"`);
+ * that mirror was removed because it re-ingested the assistant's own
+ * prior output as extractable facts — memory poisoning (see the module
+ * header in `src/agents/handoff-summarizer.ts`).
  */
 export function registerHandoffCommand(program: Command): void {
   program
@@ -63,7 +58,7 @@ export function registerHandoffCommand(program: Command): void {
           // containers the file isn't mounted — fall back to defaults
           // rather than failing the Stop hook (#1745). Anything other
           // than ConfigError still propagates.
-          let agentConfig: { session_continuity?: { enabled?: boolean; max_turns_in_briefing?: number; session_retention_max_count?: number; session_retention_max_age_days?: number }; memory?: { observation_scopes?: string } } | undefined;
+          let agentConfig: { session_continuity?: { enabled?: boolean; max_turns_in_briefing?: number; session_retention_max_count?: number; session_retention_max_age_days?: number } } | undefined;
           let agentDir: string;
           try {
             const config = getConfig(program);
@@ -74,12 +69,9 @@ export function registerHandoffCommand(program: Command): void {
               );
               return;
             }
-            // Through the cascade, not the raw entry: `memory.observation_scopes`
-            // is an override-cascade key accepted at the defaults/profile tier
-            // too, so reading `config.agents[name]` directly would miss a
-            // fleet-wide `defaults.memory.observation_scopes` and mirror the
-            // briefing at the engine default while every other retain path used
-            // the configured scope.
+            // Through the cascade, not the raw entry: `session_continuity.*`
+            // keys are accepted at the defaults/profile tier too, so reading
+            // `config.agents[name]` directly would miss a fleet-wide value.
             agentConfig = resolveAgentConfig(
               config.defaults,
               config.profiles,
@@ -123,19 +115,8 @@ export function registerHandoffCommand(program: Command): void {
             agentDir,
             agentName,
             maxTurns: cappedMaxTurns,
-            // The config we already hold is the authority for the per-row
-            // observation scope; `undefined` (the ConfigError path above) hands
-            // it back to HINDSIGHT_OBSERVATION_SCOPES.
-            observationScopes: agentConfig?.memory?.observation_scopes,
           });
           process.stderr.write(`handoff: ${status}\n`);
-          if (status === HANDOFF_STATUS_MIRROR_SKIPPED) {
-            // The only non-zero exit this command has. run-hook.sh turns it
-            // into a red `hook:handoff` issue carrying the stderr tail, which
-            // is the operator-visible surface. Set the code rather than
-            // returning early so retention still runs.
-            process.exitCode = 1;
-          }
 
           // Session-JSONL retention (#2792). Runs after the briefing is
           // built so the newest transcript — the handoff source — is

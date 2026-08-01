@@ -34,7 +34,7 @@
  *
  * A memory whose content redacts to nothing but markers is still POSTed. The
  * alternative — dropping the write — would silently break the durability
- * contract callers rely on (handoff mirrors, watermark advance), and "a row
+ * contract callers rely on (watermark advance), and "a row
  * that says a secret was here" is more useful than a missing row.
  */
 
