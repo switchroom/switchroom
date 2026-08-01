@@ -1,6 +1,5 @@
 /**
- * PR-06 (#3944, #4048) — rollout warnings end-to-end + the ensure-banks
- * tap-to-restart card.
+ * PR-06 (#3944) — rollout warnings end-to-end.
  *
  * #3944: `encodeRolloutResultLine` has always put the roll's non-fatal
  * `warnings` on the sentinel wire, and `parseRolloutResultLine` parses them —
@@ -8,13 +7,6 @@
  * never reached the status entry, so `get_status` and the narration card were
  * blind to them. These tests assert the warnings ROUND-TRIP: sentinel → child
  * stdout → lifted onto the status entry → surfaced in the get_status payload.
- *
- * #4048: an `ensure-banks` failure leaves a structured residue
- * (`{failedStep:'ensure-banks', drifted:[agents]}`) whose recovery is to
- * RESTART the named agent(s). That recovery used to be prose only — the hostd
- * result path built no `inline_keyboard` anywhere. `buildDriftRestartKeyboard`
- * translates the residue into a tap-to-restart keyboard naming the drifted
- * agents.
  *
  * The spawnRollout harness mirrors rollout-timeout-latch.test.ts: a real
  * `node -e` child emits the result sentinel and exits, so the lift runs against
@@ -170,64 +162,5 @@ describe("#3944 — the narration card renders the roll's warnings", () => {
       rolled: ["clerk"],
     });
     expect(out).not.toContain("Warnings:");
-  });
-});
-
-describe("#4048 — ensure-banks residue produces a tap-to-restart keyboard", () => {
-  it("builds one op:restart button per drifted agent, naming each agent", () => {
-    const kb = HostdServer.buildDriftRestartKeyboard({
-      failed_step: "ensure-banks",
-      drifted: ["clerk", "scout"],
-    });
-
-    expect(kb).toBeDefined();
-    expect(kb).toHaveLength(2);
-    // Each drifted agent is named in a button label AND carries the proven
-    // op:restart callback the gateway already dispatches.
-    expect(kb![0]![0]!.text).toContain("clerk");
-    expect(kb![0]![0]!.callback_data).toBe("op:restart:clerk");
-    expect(kb![1]![0]!.text).toContain("scout");
-    expect(kb![1]![0]!.callback_data).toBe("op:restart:scout");
-  });
-
-  it("URL-encodes agent names in the callback (matching operator-events.ts)", () => {
-    // Agent names are [a-z0-9_-]; underscores are safe but the encoding is the
-    // shared convention and must round-trip through decodeURIComponent.
-    const kb = HostdServer.buildDriftRestartKeyboard({
-      failed_step: "ensure-banks",
-      drifted: ["my_agent-1"],
-    });
-    expect(kb![0]![0]!.callback_data).toBe(`op:restart:${encodeURIComponent("my_agent-1")}`);
-    expect(decodeURIComponent(kb![0]![0]!.callback_data.slice("op:restart:".length))).toBe("my_agent-1");
-  });
-
-  it("returns undefined for a non-ensure-banks failure (no keyboard offered)", () => {
-    expect(
-      HostdServer.buildDriftRestartKeyboard({
-        failed_step: "verify-components",
-        drifted: ["switchroom-web"],
-      }),
-    ).toBeUndefined();
-    expect(
-      HostdServer.buildDriftRestartKeyboard({
-        failed_step: "restart-agent",
-        drifted: [],
-      }),
-    ).toBeUndefined();
-  });
-
-  it("returns undefined when ensure-banks left no drifted agents", () => {
-    expect(
-      HostdServer.buildDriftRestartKeyboard({ failed_step: "ensure-banks", drifted: [] }),
-    ).toBeUndefined();
-    expect(
-      HostdServer.buildDriftRestartKeyboard({ failed_step: "ensure-banks" }),
-    ).toBeUndefined();
-  });
-
-  it("caps the keyboard at Telegram's row budget for a large drifted set", () => {
-    const drifted = Array.from({ length: 20 }, (_, i) => `agent${i}`);
-    const kb = HostdServer.buildDriftRestartKeyboard({ failed_step: "ensure-banks", drifted });
-    expect(kb!.length).toBeLessThanOrEqual(8);
   });
 });

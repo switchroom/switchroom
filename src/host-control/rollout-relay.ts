@@ -24,13 +24,6 @@ export interface RolloutTerminalNotice {
   agentName: string;
   /** Fully-rendered message body (already safe plain/markdown text). */
   text: string;
-  /**
-   * #4048 — optional tap-to-restart inline keyboard. Present only on an
-   * ensure-banks residue terminal (one `🔄 Restart <agent>` button per drifted
-   * agent, `op:restart:<encoded>` callback). Fire-and-forget like the text: a
-   * gateway that can't render buttons still gets the prose body.
-   */
-  inlineKeyboard?: Array<Array<{ text: string; callback_data: string }>>;
 }
 
 export interface RolloutRelay {
@@ -91,9 +84,6 @@ export class SocketRolloutRelay implements RolloutRelay {
               requestId: notice.requestId,
               agentName: notice.agentName,
               text: notice.text,
-              ...(notice.inlineKeyboard
-                ? { inlineKeyboard: notice.inlineKeyboard }
-                : {}),
             }) + "\n",
           );
           // Fire-and-forget: end the write side immediately. We do NOT wait for

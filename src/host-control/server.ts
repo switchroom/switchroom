@@ -4666,46 +4666,6 @@ export class HostdServer {
    * gateway. No-op when no relay is wired or the caller isn't an agent (the
    * relay routes through the caller agent's gateway, like the approval card).
    */
-  /**
-   * #4048 — turn an `ensure-banks` failure residue into a tap-to-restart
-   * inline keyboard. The recovery for an agent whose Hindsight bank could not
-   * be created during a roll is to RESTART that agent (its boot re-runs bank
-   * creation) — never a rollback. Until now that recovery was PROSE only: the
-   * terminal card told the operator to "restart the named agent(s)" but gave
-   * them no button, and the hostd result path constructed no `inline_keyboard`
-   * anywhere. This emits one `🔄 Restart <agent>` button per drifted agent,
-   * carrying the SAME `op:restart:<encoded-agent>` callback the operator-event
-   * cards already use (handled in callback-query-handlers.ts →
-   * triggerSelfRestart), so the tap reuses the proven restart path.
-   *
-   * Only ensure-banks residue gets a keyboard: verify-components drift is a
-   * forward-fix of a stale singleton (no per-agent restart converges it), and
-   * a stopped/failed roll's recovery is not "restart these agents". Returns
-   * undefined when there is nothing to offer.
-   *
-   * Bounded to TELEGRAM_MAX_BUTTON_ROWS rows so a large drifted set can't build
-   * an over-tall keyboard Telegram would reject; the card body still names
-   * every drifted agent, and get_status carries the full list.
-   */
-  static buildDriftRestartKeyboard(entry: {
-    failed_step?: string;
-    drifted?: string[];
-  }): Array<Array<{ text: string; callback_data: string }>> | undefined {
-    if (entry.failed_step !== "ensure-banks") return undefined;
-    const drifted = entry.drifted ?? [];
-    if (drifted.length === 0) return undefined;
-    const TELEGRAM_MAX_BUTTON_ROWS = 8;
-    return drifted.slice(0, TELEGRAM_MAX_BUTTON_ROWS).map((agent) => [
-      {
-        text: `🔄 Restart ${agent}`,
-        // Same encoding as operator-events.ts: agent names are URL-encoded so
-        // the callback stays within Telegram's 64-byte budget and parses
-        // cleanly server-side (`op:restart:` is 11 bytes; names ≤ 50).
-        callback_data: `op:restart:${encodeURIComponent(agent)}`,
-      },
-    ]);
-  }
-
   private pushRolloutTerminal(entry: StatusEntry, extraNotes?: string[]): void {
     if (!this.opts.rolloutRelay) return;
     // Relay routing: an agent-invoked roll pings through the CALLER agent's
@@ -4741,9 +4701,6 @@ export class HostdServer {
           ? { warnings: entry.warnings }
           : {}),
       });
-      // #4048 — an ensure-banks residue attaches a tap-to-restart keyboard so
-      // the operator can trigger the recovery restart directly from the card.
-      const keyboard = HostdServer.buildDriftRestartKeyboard(entry);
       this.opts.rolloutRelay.postTerminal({
         requestId: entry.request_id,
         agentName: relayAgent,
@@ -4751,7 +4708,6 @@ export class HostdServer {
           extraNotes && extraNotes.length > 0
             ? text + "\n\n" + extraNotes.map((n) => `- ${n}`).join("\n")
             : text,
-        ...(keyboard ? { inlineKeyboard: keyboard } : {}),
       });
     } catch (e) {
       process.stderr.write(

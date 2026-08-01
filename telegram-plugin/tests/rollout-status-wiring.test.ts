@@ -13,10 +13,6 @@
  *      (swallowingApiCall) — fire-and-forget, never a raw bot.api call.
  *   4. NEITHER handler pins a message — this is in-chat narration, not the
  *      retired pinned card (chat-is-the-single-source-of-truth).
- *   5. (#4048) the POST handler may attach a tap-to-restart inline keyboard,
- *      but ONLY the one hostd forwarded on the message (msg.inlineKeyboard) —
- *      it never invents a pinned card. The keyboard is an ordinary message's
- *      reply_markup, still narration, still un-pinned.
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
@@ -57,15 +53,10 @@ describe("onRolloutStatusPost — gateway handler invariants", () => {
     expect(handler).toMatch(/rollout_status_posted/);
     expect(handler).toMatch(/messageId/);
   });
-  it("does NOT pin the message (narration, not the retired pinned card)", () => {
+  it("does NOT pin the message and renders NO inline-keyboard card (narration, not the retired card)", () => {
     expect(handler).not.toMatch(/pinChatMessage/);
-  });
-  it("#4048 — attaches a tap-to-restart keyboard ONLY when hostd forwarded one", () => {
-    // The keyboard is the ensure-banks recovery card. It rides on the message
-    // hostd sent (msg.inlineKeyboard) — the gateway never fabricates one, and
-    // absent it the post stays a plain progress line.
-    expect(handler).toMatch(/msg\.inlineKeyboard/);
-    expect(handler).toMatch(/reply_markup:\s*\{\s*inline_keyboard:\s*msg\.inlineKeyboard\s*\}/);
+    expect(handler).not.toMatch(/reply_markup/);
+    expect(handler).not.toMatch(/InlineKeyboard/);
   });
 });
 

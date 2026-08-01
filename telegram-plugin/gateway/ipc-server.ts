@@ -475,24 +475,6 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (typeof m.text !== "string"
         || (m.text as string).length === 0
         || (m.text as string).length > RICH_MESSAGE_MAX_CHARS) return false;
-      // #4048 — optional tap-to-restart keyboard. Wire-shape only: rows of
-      // { text, callback_data } buttons. Bounded so a malformed/oversized
-      // keyboard is rejected rather than forwarded to Telegram. The callback
-      // itself is re-validated in the op:restart handler on tap.
-      if (m.inlineKeyboard !== undefined) {
-        if (!Array.isArray(m.inlineKeyboard) || m.inlineKeyboard.length > 8) return false;
-        for (const row of m.inlineKeyboard as unknown[]) {
-          if (!Array.isArray(row) || row.length === 0 || row.length > 8) return false;
-          for (const btn of row as unknown[]) {
-            if (typeof btn !== "object" || btn === null) return false;
-            const b = btn as Record<string, unknown>;
-            if (typeof b.text !== "string" || b.text.length === 0 || b.text.length > 64) return false;
-            if (typeof b.callback_data !== "string"
-              || b.callback_data.length === 0
-              || b.callback_data.length > 64) return false;
-          }
-        }
-      }
       return true;
     }
     case "rollout_status_edit": {

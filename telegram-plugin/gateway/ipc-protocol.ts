@@ -562,14 +562,6 @@ export interface RolloutStatusPostMessage {
   agentName: string;
   /** Fully-rendered message body. */
   text: string;
-  /**
-   * #4048 — optional tap-to-restart inline keyboard. Present only on an
-   * ensure-banks residue terminal post: one `🔄 Restart <agent>` button per
-   * drifted agent, each carrying the `op:restart:<encoded-agent>` callback the
-   * gateway's operator-event handler already dispatches. The gateway fences
-   * the chat to its own operator; the callback is re-validated on tap.
-   */
-  inlineKeyboard?: Array<Array<{ text: string; callback_data: string }>>;
 }
 
 /**
