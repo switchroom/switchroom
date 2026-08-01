@@ -493,6 +493,72 @@ describe('stripExcessBold', () => {
     expect(out).toContain('Deploy status')
   })
 
+  // ── #4114: a code-only block is NOT body for the all-heading guard ───────
+  // #4108's short-circuit tested `blocks.every(isPseudoHeadingBlock)` on every
+  // non-blank block. A masked code block satisfies neither side, so ONE code
+  // fence in an all-headings digest flipped `every(...)` to false, re-exempted
+  // every heading, and reproduced #4017 exactly: 100% bold, onStrip silent.
+  // Decision pinned here: masked code is not body — it is invisible to every
+  // other measurement in stripExcessBold (it is stripped before the ratio is
+  // taken), so it does not buy the headings an exemption either.
+
+  const HEADINGS = ['**Deploy status**', '**Open incidents**', '**Merged today**']
+  const TAIL = ['**Blocked on review**', '**Rollout window tomorrow**', '**Next steps:**']
+
+  test.each([
+    ['fenced code block', '```\nswitchroom agent restart klanker\n```'],
+    ['inline code span', '`switchroom agent restart klanker`'],
+    ['fenced block with a language tag', '```bash\nswitchroom agent restart klanker\n```'],
+    ['several inline spans on one line', '`alpha` `beta` `gamma` `delta` `epsilon`'],
+  ])('all-heading guard: headings + a code-only block (%s) still strips', (_name, code) => {
+    const input = [...HEADINGS, code, ...TAIL].join('\n\n')
+    expect(input.length).toBeGreaterThan(100)
+
+    const calls: Array<{ rule: string; ratio: number }> = []
+    const out = stripExcessBold(input, (d) => calls.push(d))
+
+    // Outcome 1: no bold survives — this is the assertion that fails on the
+    // real bug, where `out` was the input verbatim.
+    expect(out).not.toContain('**')
+    expect(out).toContain('Deploy status')
+    expect(out).toContain('Next steps:')
+    // Outcome 2: the code block itself is preserved byte-for-byte.
+    expect(out).toContain(code)
+    expect(out).toBe(input.replace(/\*\*/g, ''))
+    // Outcome 3: the strip is logged (the #4017 silence is what made this
+    // class of bug invisible in the first place).
+    expect(calls).toHaveLength(1)
+    expect(calls[0].rule).toBe('global')
+    expect(calls[0].ratio).toBeGreaterThan(0.3)
+  })
+
+  test('all-heading guard: real prose body CONTAINING inline code keeps headings', () => {
+    // The counterpart that stops the #4114 fix from over-correcting: a block
+    // with visible text around its code span IS body, so the headings keep
+    // their bold. Only blocks that are *nothing but* code are skipped.
+    const input = [
+      ...HEADINGS,
+      'Run `switchroom agent restart klanker` now, then check the gateway log for errors.',
+      ...TAIL,
+    ].join('\n\n')
+
+    const calls: Array<{ rule: string; ratio: number }> = []
+    const out = stripExcessBold(input, (d) => calls.push(d))
+
+    expect(out).toContain('**Deploy status**')
+    expect(out).toContain('**Next steps:**')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('all-heading guard: a code-only block does not rescue a headings-only digest', () => {
+    // Degenerate shape: the code block is the ONLY non-heading block and sits
+    // last. Same verdict, so the rule does not depend on block position.
+    const input = [...HEADINGS, ...TAIL, '```\nok\n```'].join('\n\n')
+    const out = stripExcessBold(input)
+    expect(out).not.toContain('**')
+    expect(out).toContain('```\nok\n```')
+  })
+
   test('multi-line fully-bolded block is NOT mislabelled a heading (global)', () => {
     // Two bolded lines in one block must be flattened, not exempted — the
     // heading exemption is single-line only.
