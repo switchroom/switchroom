@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.19.45 — the session-handoff Hindsight mirror is gone (memory poisoning), and the reply supersede window turns identity-gated
+
+### Stop mirroring the session-handoff transcript tail into Hindsight (#4187)
+
+The Stop hook's handoff builder mirrored the raw transcript tail — assistant
+prose plus truncated `[tool result]` fragments — into the agent's own
+Hindsight bank as document_id `session_handoff` on every Stop. Fact
+extraction then re-minted the model's own hallucinations as first-class
+world facts with clean event_dates, and the next session's recall served
+them back as ground truth (verified live 2026-08-02 in bank `carrie`). The
+mirror was also a pure duplicate of the vendored plugin's own Stop-hook
+retain, which carries provenance tags (#4164), redaction, watermarks, dedup,
+oversized splitting and commit-before-ack — none of which the mirror had —
+and its fixed document_id forced a full re-ingest on every Stop.
+
+- The mirror is removed entirely: `buildHandoff` now writes only the
+  on-disk sidecars. The observation-scope plumbing and the mirror-skipped
+  exit path existed solely to serve the mirror and go with it.
+- A regression test proves `buildHandoff` performs no network call even
+  with `HINDSIGHT_API_URL`/`HINDSIGHT_BANK_ID` exported (fails RED on the
+  pre-fix code, verified by mutation run).
+
+### Telegram: supersede window = turn-completion signal + caller-identity gate (#4166, #4167)
+
+The 2026-08-01 duplicate-reply incident: a quiescence flush delivered the
+composed answer, a proactive `/compact` ran, and the canonical reworded
+reply landed 143 s later — past every layer keyed on the 60 s supersede
+TTL, so a second bubble shipped. A naive widening of the TTL was rejected
+in review because it also held the destructive edit-over window open for
+foreign late repliers (a cheap-cron digest editing over a flushed answer).
+
+- The supersede window is now anchored on the turn-completion signal and
+  gated on caller identity, instead of a wall-clock constant: only the
+  same ended turn that produced the flushed answer may supersede it.
+- Outcome tests replay the incident timeline through the pure decision
+  cores AND the real `sendReply` path.
+
 ## v0.19.44 — The installed CLI can finally scaffold: profiles, skills, vendor and ui ship with the release
 
 ### The `curl | sh` install gets its assets (#4162, #4183)
