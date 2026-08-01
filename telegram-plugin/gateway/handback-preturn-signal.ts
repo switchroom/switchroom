@@ -105,6 +105,29 @@ import type { InboundMessage } from './ipc-protocol.js'
  *  the seam's `handleReaped` hook (stop typing loop + drop map entry). */
 export const PRETURN_TURNKEY_PREFIX = 'preturn:'
 
+/** `meta` key carrying the deterministic-recovery re-injection counter across a
+ *  re-injected handback's round trip through the pending-inbound buffer. Stamped
+ *  on the inbound just before it is re-injected on a genuine orphan; read back
+ *  when that same inbound is released again, so the retry cap survives the
+ *  drop-and-recreate of the per-topic pre-turn entry. `meta` is
+ *  `Record<string,string>`, so the count is stored as a decimal string. */
+export const HANDBACK_REINJECT_COUNT_META_KEY = 'handbackReinjectCount'
+
+/** Emitted (NOT to chat) when a genuine orphan has exhausted its re-injection
+ *  retries — the deterministic-recovery escalation surface. The gateway routes
+ *  this to fleet-health telemetry (a structured log line the nightly sensor
+ *  reads), never to an operator-facing card: the system must recover itself, not
+ *  ask a human to nudge it. */
+export interface HandbackOrphanEscalation {
+  statusKey: string
+  chatId: string
+  threadId: number | null
+  adoptTurnId: string
+  reinjectCount: number
+  /** Age (ms) of the handback at escalation — release → escalation. */
+  ageMs: number
+}
+
 /** True IFF `source` is the load-bearing subagent-handback source string. Kept
  *  here next to the seam so a source-string regression is caught by this
  *  module's own test, not only the inbound-builder's. */
@@ -162,9 +185,21 @@ export interface HandbackPreturnSignalDeps {
    *  when the send failed / was suppressed (best-effort — a null just means no
    *  card was painted, so nothing to adopt or reap). */
   openCard: (chatId: string, threadId: number | null) => Promise<number | null>
-  /** Finalize (single honest edit) a frozen never-adopted pre-turn card on
-   *  orphan self-reap. Best-effort; failures swallowed by the caller. */
-  finalizeCard: (record: PreTurnCardRecord) => void | Promise<void>
+  /** DELETE (not edit) a never-adopted pre-turn card. Used on the genuine-orphan
+   *  reap so the frozen card is removed rather than rewritten to a stale
+   *  user-facing "needs a nudge" message, and on the rare emit-race teardown of a
+   *  card the adopting turn already owns. Best-effort; failures swallowed by the
+   *  caller. */
+  deleteCard: (record: PreTurnCardRecord) => void | Promise<void>
+  /** Re-inject a genuinely-orphaned handback back through the pending-inbound
+   *  buffer so the machine recovers itself — the deterministic alternative to
+   *  asking the operator to nudge. The gateway's `pendingInboundBuffer.push`. The
+   *  seam stamps `HANDBACK_REINJECT_COUNT_META_KEY` on `inbound.meta` first so the
+   *  retry cap survives the round trip. */
+  reinjectHandback: (inbound: InboundMessage) => void
+  /** Escalate a genuine orphan that has exhausted its re-injection retries to
+   *  fleet-health telemetry (NOT a chat card). */
+  escalateOrphan: (escalation: HandbackOrphanEscalation) => void
   /** Persist the durable card record (the gateway's `writeActivityCardRecord`,
    *  scoped by `turnKey`). */
   writeCardRecord: (record: PreTurnCardRecord) => void
@@ -190,16 +225,18 @@ export interface HandbackPreturnSignalDeps {
    *  handback is delivered into that single queue and only mints its adopting
    *  turn when claude next goes idle, so while claude is busy the handback is
    *  NOT orphaned — it is correctly enqueued BEHIND the in-flight turn (a long
-   *  parent turn can run many minutes). Finalizing it as an orphan in that
-   *  window posts a false "never started — needs a nudge" card. The reap
-   *  therefore DEFERS (re-arms) while this is true and finalizes only once
-   *  claude is idle and the handback still has not been adopted — the genuine
-   *  bridge-death / dropped-inbound degenerate case the reap exists for.
-   *  Distinct from `hasLiveTurn`, which is PER-KEY and only governs the
-   *  typing-loop stop; this is the GLOBAL busy signal because the handback
-   *  queues behind whatever turn is running, regardless of topic. Optional;
-   *  defaults to "not busy" (immediate reap — the pre-fix behaviour), so the
-   *  genuine-orphan path is unchanged. */
+   *  parent turn can run many minutes). Reaping it as an orphan in that window
+   *  used to post a false "never started — needs a nudge" card (the 3-cards-in-
+   *  4-min incident). The reap therefore DEFERS (re-arms) while this is true —
+   *  and, complementarily, while the handback was delivered but its turn has not
+   *  started streaming yet (`deliveredAwaitingTurnStart`, the #4027 coverage
+   *  gap) — recovering only once claude is idle AND the delivered window has
+   *  elapsed AND the handback still has not been adopted (the genuine bridge-
+   *  death / dropped-inbound case). Recovery is deterministic (delete the frozen
+   *  card + re-inject, then escalate), never an operator nudge. Distinct from
+   *  `hasLiveTurn`, which is PER-KEY and only governs the typing-loop stop; this
+   *  is the GLOBAL busy signal because the handback queues behind whatever turn
+   *  is running, regardless of topic. Optional; defaults to "not busy". */
   isClaudeBusy?: () => boolean
   now?: () => number
   /** Debounce before painting the pre-turn card (kills sub-second flicker). */
@@ -207,6 +244,17 @@ export interface HandbackPreturnSignalDeps {
   /** Age after emit at which a never-adopted card self-reaps. Independent of
    *  topic liveness. */
   adoptTimeoutMs?: number
+  /** TTL (ms) for the delivered-but-not-yet-streaming window. A released
+   *  handback has been DELIVERED into claude's queue but its adopting turn may
+   *  not have started streaming yet — the false-orphan window #4027 left open
+   *  (idle machine + un-adopted = looked like an orphan). While within this TTL
+   *  the reap DEFERS (`deliveredAwaitingTurnStart`); past it a truly-stuck
+   *  delivery finally reaps for deterministic recovery rather than hanging
+   *  forever. Defaults to 5 min. */
+  deliveredTtlMs?: number
+  /** Max deterministic re-injections of a genuine orphan before escalating to
+   *  fleet-health telemetry. Defaults to 2. */
+  maxReinjects?: number
   /** Injected scheduler (mirrors bridge-dead-watchdog.ts): defaults to
    *  setTimeout/clearTimeout. Injected so a runner-agnostic test can drive the
    *  debounce + self-reap deterministically WITHOUT any vitest-only fake-timer
@@ -224,6 +272,18 @@ interface PreTurnEntry {
   adoptTurnId: string
   syntheticTurnKey: string
   startedAt: number
+  /** When the handback was RELEASED/DELIVERED for delivery (stamped at
+   *  `noteHandbackRelease`). Drives `deliveredAwaitingTurnStart`: the reap must
+   *  not treat a delivered-but-not-yet-streaming handback as an orphan within
+   *  the delivered TTL. Equal to `startedAt` (release is the delivery point). */
+  deliveredAt: number
+  /** How many times this handback has already been deterministically re-injected
+   *  (carried across the buffer round trip via `HANDBACK_REINJECT_COUNT_META_KEY`
+   *  on the inbound). Governs the retry cap before fleet-health escalation. */
+  reinjectCount: number
+  /** The released handback inbound itself — retained so a genuine orphan can be
+   *  re-injected through the pending-inbound buffer (deterministic recovery). */
+  inbound: InboundMessage
   pinned: boolean
   debounceTimer: unknown | null
   reapTimer: unknown | null
@@ -273,6 +333,8 @@ export function createHandbackPreturnSignal(
   const now = deps.now ?? (() => Date.now())
   const debounceMs = deps.debounceMs ?? 700
   const adoptTimeoutMs = deps.adoptTimeoutMs ?? 30_000
+  const deliveredTtlMs = deps.deliveredTtlMs ?? 300_000
+  const maxReinjects = deps.maxReinjects ?? 2
   const setTimer =
     deps.setTimer ??
     ((fn: () => void, ms: number) => {
@@ -333,9 +395,9 @@ export function createHandbackPreturnSignal(
         if (messageId == null) return // no card painted; the reap timer cleans up
         if (entry.consumed) {
           // Adopted/reaped while the send was in flight: the card is now the
-          // turn's (adoption seeds a null id it can't use) — finalize+clear so
-          // it never dangles. Rare; the debounce makes it unlikely.
-          void deps.finalizeCard({
+          // turn's (adoption seeds a null id it can't use) — DELETE it so it
+          // never dangles. Rare; the debounce makes it unlikely.
+          void deps.deleteCard({
             turnKey: entry.syntheticTurnKey,
             chatId: entry.chatId,
             threadId: entry.threadId,
@@ -385,30 +447,52 @@ export function createHandbackPreturnSignal(
     deps.stopTypingLoop(entry.chatId, entry.threadId)
   }
 
+  /**
+   * The delivered-but-not-yet-streaming window (#4027 coverage gap). A released
+   * handback has been DELIVERED into claude's single input queue, but its
+   * adopting turn may not have started streaming yet — and in that stretch the
+   * machine reads as idle (`isClaudeBusy()` false) with the entry un-adopted,
+   * which looked exactly like a genuine orphan and produced the false "needs a
+   * nudge" card even after #4027 gated on `isMachineInTurn`. While the handback
+   * is within the delivered TTL and its turn has not started (we are in `reap`,
+   * so the entry is un-consumed = no adopting turn minted), it is NOT orphaned —
+   * defer. Past the TTL a truly-stuck delivery finally reaps rather than hanging
+   * forever, handing off to deterministic recovery.
+   */
+  function deliveredAwaitingTurnStart(entry: PreTurnEntry): boolean {
+    return now() - entry.deliveredAt < deliveredTtlMs
+  }
+
   function reap(entry: PreTurnEntry): void {
     entry.reapTimer = null
     if (entry.consumed) return
     // PRIMARY GATE (queue state, not a flat timeout): a released handback is
     // delivered into claude's SINGLE input queue and mints its adopting turn
-    // only when claude next goes idle. If claude is STILL in a turn, this
-    // handback is not orphaned — it is correctly enqueued behind the in-flight
-    // turn (a long parent turn can run many minutes). Finalizing now would post
-    // a false "never started — needs a nudge" card (the 3-cards-in-4-min
-    // incident). Defer: re-arm and re-check. We finalize only once claude is
-    // idle AND the handback still has not been adopted (the genuine bridge-
-    // death / dropped-inbound case). This cannot loop forever on a healthy
-    // agent: claude processes its queue FIFO, so the handback is either adopted
-    // (cancelling the reap) or claude eventually goes idle (letting it fire).
-    if (deps.isClaudeBusy?.() === true) {
+    // only when claude next goes idle. If claude is STILL in a turn, OR the
+    // handback was delivered and its turn has simply not started streaming yet
+    // (within the delivered TTL — the #4027 coverage gap), the handback is NOT
+    // orphaned. Reaping now would have posted a false "never started — needs a
+    // nudge" card (the 3-cards-in-4-min incident). Defer: re-arm and re-check.
+    // We proceed to recovery only once claude is idle AND the delivered window
+    // has elapsed AND the handback still has not been adopted (the genuine
+    // bridge-death / dropped-inbound case). This cannot loop forever: claude
+    // processes its queue FIFO (adoption cancels the reap), and the delivered
+    // TTL is bounded, so a stuck delivery eventually recovers deterministically.
+    if (deps.isClaudeBusy?.() === true || deliveredAwaitingTurnStart(entry)) {
       log(
         `handback-preturn-signal: reap deferred key=${entry.statusKey} ` +
-          `(claude busy — handback enqueued behind an in-flight turn, not orphaned)\n`,
+          `(${deps.isClaudeBusy?.() === true ? 'claude busy' : 'delivered, turn not yet streaming'}` +
+          ` — not orphaned)\n`,
       )
       entry.reapTimer = setTimer(() => reap(entry), adoptTimeoutMs)
       return
     }
     entry.consumed = true
-    // Stop the forever-running typing loop and finalize the frozen card.
+    // GENUINE ORPHAN. Recover DETERMINISTICALLY — never ask the operator to
+    // nudge. Stop the forever-running typing loop, DELETE the frozen card (do
+    // not leave a stale "needs a nudge" message), then re-inject the handback so
+    // the machine re-processes it itself. Cap the re-injections; past the cap
+    // escalate to fleet-health telemetry (NOT a chat card).
     stopTypingUnlessTurnLive(entry, 'orphan reap')
     if (entry.activityMessageId != null) {
       const record: PreTurnCardRecord = {
@@ -419,17 +503,61 @@ export function createHandbackPreturnSignal(
         startedAt: entry.startedAt,
         pinned: entry.pinned,
       }
-      // Clear the durable record BEFORE the finalizing edit (at-most-once
-      // idempotency guard, mirroring the activity-card-store reapers).
+      // Clear the durable record BEFORE the delete (at-most-once idempotency
+      // guard, mirroring the activity-card-store reapers).
       deps.clearCardRecord(entry.syntheticTurnKey, entry.activityMessageId)
-      void Promise.resolve(deps.finalizeCard(record)).catch((err) => {
+      void Promise.resolve(deps.deleteCard(record)).catch((err) => {
         log(
-          `handback-preturn-signal: orphan finalize failed key=${entry.statusKey}: ` +
+          `handback-preturn-signal: orphan card delete failed key=${entry.statusKey}: ` +
             `${err instanceof Error ? err.message : String(err)}\n`,
         )
       })
     }
+    // Drop the entry from the topic map BEFORE re-injecting so a redelivery that
+    // re-enters `noteHandbackRelease` (production: async buffer drain; possible
+    // synchronously) is not swallowed by the per-topic dedupe guard. The entry
+    // object stays valid for the captured re-inject below.
     dropEntry(entry)
+    if (entry.reinjectCount < maxReinjects) {
+      const nextCount = entry.reinjectCount + 1
+      // Stamp the counter on the inbound so it survives the buffer round trip
+      // (the re-injected inbound re-enters `noteHandbackRelease`, which reads it
+      // back — the retry cap outlives the drop-and-recreate of this entry).
+      entry.inbound.meta[HANDBACK_REINJECT_COUNT_META_KEY] = String(nextCount)
+      log(
+        `handback-preturn-signal: orphan reap key=${entry.statusKey} ` +
+          `turnId=${entry.adoptTurnId} — re-injecting handback (attempt ${nextCount}/${maxReinjects})\n`,
+      )
+      try {
+        deps.reinjectHandback(entry.inbound)
+      } catch (err) {
+        log(
+          `handback-preturn-signal: orphan re-inject failed key=${entry.statusKey}: ` +
+            `${err instanceof Error ? err.message : String(err)}\n`,
+        )
+      }
+    } else {
+      log(
+        `handback-preturn-signal: orphan reap key=${entry.statusKey} ` +
+          `turnId=${entry.adoptTurnId} — re-injection cap (${maxReinjects}) exhausted, ` +
+          `escalating to fleet-health telemetry\n`,
+      )
+      try {
+        deps.escalateOrphan({
+          statusKey: entry.statusKey,
+          chatId: entry.chatId,
+          threadId: entry.threadId,
+          adoptTurnId: entry.adoptTurnId,
+          reinjectCount: entry.reinjectCount,
+          ageMs: now() - entry.deliveredAt,
+        })
+      } catch (err) {
+        log(
+          `handback-preturn-signal: orphan escalation failed key=${entry.statusKey}: ` +
+            `${err instanceof Error ? err.message : String(err)}\n`,
+        )
+      }
+    }
   }
 
   return {
@@ -466,6 +594,12 @@ export function createHandbackPreturnSignal(
       )
       const startedAt = now()
       const syntheticTurnKey = `${PRETURN_TURNKEY_PREFIX}${statusKey}:${startedAt}`
+      // Carry the re-injection counter across the buffer round trip: a genuine
+      // orphan re-injects this inbound, which re-enters here with the counter
+      // stamped on `meta`, so the retry cap survives the entry's recreate.
+      const rawReinject = inbound.meta?.[HANDBACK_REINJECT_COUNT_META_KEY]
+      const parsedReinject = rawReinject != null ? Number.parseInt(rawReinject, 10) : 0
+      const reinjectCount = Number.isFinite(parsedReinject) && parsedReinject > 0 ? parsedReinject : 0
       const entry: PreTurnEntry = {
         statusKey,
         chatId,
@@ -473,6 +607,10 @@ export function createHandbackPreturnSignal(
         adoptTurnId,
         syntheticTurnKey,
         startedAt,
+        // Release IS the delivery point (this is the buffer-drain chokepoint).
+        deliveredAt: startedAt,
+        reinjectCount,
+        inbound,
         pinned: false,
         debounceTimer: null,
         reapTimer: null,

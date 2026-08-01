@@ -1,9 +1,13 @@
+import { readFileSync } from 'node:fs'
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createHandbackPreturnSignal,
   isHandbackInbound,
+  HANDBACK_REINJECT_COUNT_META_KEY,
   PRETURN_TURNKEY_PREFIX,
+  type HandbackOrphanEscalation,
   type HandbackPreturnSignalDeps,
   type PreTurnCardRecord,
 } from '../gateway/handback-preturn-signal.js'
@@ -136,9 +140,13 @@ interface Harness {
   sched: ReturnType<typeof makeScheduler>
   sendChatAction: ReturnType<typeof vi.fn>
   openCard: ReturnType<typeof vi.fn>
-  finalizeCard: ReturnType<typeof vi.fn>
+  deleteCard: ReturnType<typeof vi.fn>
+  reinjectHandback: ReturnType<typeof vi.fn>
+  escalateOrphan: ReturnType<typeof vi.fn>
   records: Map<string, PreTurnCardRecord>
-  finalizedIds: number[]
+  deletedIds: number[]
+  reinjected: InboundMessage[]
+  escalations: HandbackOrphanEscalation[]
 }
 
 const harnesses: Harness[] = []
@@ -168,9 +176,19 @@ function makeHarness(overrides: Partial<HandbackPreturnSignalDeps> = {}): Harnes
     if (cur != null && cur.activityMessageId === activityMessageId) records.delete(turnKey)
   }
 
-  const finalizedIds: number[] = []
-  const finalizeCard = vi.fn<(r: PreTurnCardRecord) => void>((r) => {
-    finalizedIds.push(r.activityMessageId)
+  const deletedIds: number[] = []
+  const deleteCard = vi.fn<(r: PreTurnCardRecord) => void>((r) => {
+    deletedIds.push(r.activityMessageId)
+  })
+
+  const reinjected: InboundMessage[] = []
+  const reinjectHandback = vi.fn<(m: InboundMessage) => void>((m) => {
+    reinjected.push(m)
+  })
+
+  const escalations: HandbackOrphanEscalation[] = []
+  const escalateOrphan = vi.fn<(e: HandbackOrphanEscalation) => void>((e) => {
+    escalations.push(e)
   })
 
   const signal = createHandbackPreturnSignal({
@@ -179,7 +197,9 @@ function makeHarness(overrides: Partial<HandbackPreturnSignalDeps> = {}): Harnes
     startTypingLoop: (c, t) => typing.start(c, t),
     stopTypingLoop: (c, t) => typing.stop(c, t),
     openCard,
-    finalizeCard,
+    deleteCard,
+    reinjectHandback,
+    escalateOrphan,
     writeCardRecord,
     clearCardRecord,
     now: sched.now,
@@ -187,10 +207,28 @@ function makeHarness(overrides: Partial<HandbackPreturnSignalDeps> = {}): Harnes
     clearTimer: sched.clearTimer,
     debounceMs: 700,
     adoptTimeoutMs: 30_000,
+    // Default the delivered-window TTL to 0 so tests that exercise the reap
+    // MECHANICS (idle-orphan, #3544 typing, isClaudeBusy gate) see the reap fire
+    // at the adopt timeout exactly as before this fix. Tests that specifically
+    // assert the delivered-but-not-yet-streaming deferral opt into a real TTL.
+    deliveredTtlMs: 0,
     ...overrides,
   })
 
-  const h: Harness = { signal, typing, sched, sendChatAction, openCard, finalizeCard, records, finalizedIds }
+  const h: Harness = {
+    signal,
+    typing,
+    sched,
+    sendChatAction,
+    openCard,
+    deleteCard,
+    reinjectHandback,
+    escalateOrphan,
+    records,
+    deletedIds,
+    reinjected,
+    escalations,
+  }
   harnesses.push(h)
   return h
 }
@@ -283,7 +321,7 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     expect(h.signal.pendingCount()).toBe(0)
   })
 
-  it('never-adopted handback self-reaps its frozen card past the TTL', async () => {
+  it('never-adopted handback self-reaps: DELETES the frozen card and re-injects (deterministic recovery, no nudge)', async () => {
     const h = makeHarness()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatD', messageId: 77 }))
     await h.sched.advance(700)
@@ -291,10 +329,15 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     expect(h.typing.activeCount()).toBe(1)
     expect(h.records.size).toBe(1)
 
-    // No enqueue ever arrives. Past the adopt TTL the orphan self-reaps.
+    // No enqueue ever arrives. Past the adopt TTL the orphan self-reaps into
+    // deterministic recovery: the frozen card is DELETED (never rewritten to a
+    // user-facing "needs a nudge" string) and the handback is re-injected.
     await h.sched.advance(30_000)
 
-    expect(h.finalizedIds).toEqual([resolvedId]) // finalized exactly THAT card
+    expect(h.deletedIds).toEqual([resolvedId]) // deleted exactly THAT card
+    expect(h.reinjected).toHaveLength(1) // re-injected for the machine to recover itself
+    expect(h.reinjected[0]!.meta[HANDBACK_REINJECT_COUNT_META_KEY]).toBe('1')
+    expect(h.escalations).toEqual([]) // first orphan → recover, do NOT escalate
     expect(h.typing.activeCount()).toBe(0) // typing stopped
     expect(h.records.size).toBe(0) // durable record cleared (at-most-once)
     expect(h.signal.pendingCount()).toBe(0) // map empty
@@ -326,18 +369,20 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     // DEFER each time: no false orphan card, entry still live, typing still lit.
     await h.sched.advance(30_000)
     await h.sched.advance(30_000)
-    expect(h.finalizedIds).toEqual([]) // NEVER posted the "never started" nudge
+    expect(h.deletedIds).toEqual([]) // NEVER reaped: card intact
+    expect(h.reinjected).toEqual([]) // NEVER re-injected while enqueued
     expect(h.signal.pendingCount()).toBe(1) // still queued, not reaped
     expect(h.typing.activeCount()).toBe(1) // indicator kept while queued
 
     // The parent turn finally ends and the handback mints its own turn: it
-    // adopts the SAME card (an edit, not a second send / not an orphan finalize).
+    // adopts the SAME card (an edit, not a second send / not an orphan reap).
     busy = false
     const turnId = deriveTurnId('chatBusy', null, 700)!
     const adoption = h.signal.tryAdopt(turnId)
     expect(adoption).not.toBeNull()
     expect(adoption!.activityMessageId).toBe(resolvedId)
-    expect(h.finalizedIds).toEqual([]) // adopted, never finalized as orphan
+    expect(h.deletedIds).toEqual([]) // adopted, never reaped as orphan
+    expect(h.reinjected).toEqual([])
     expect(h.openCard).toHaveBeenCalledTimes(1) // no double-send
     expect(h.signal.pendingCount()).toBe(0)
   })
@@ -345,7 +390,7 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
   // The deferred reap is not a leak: once claude goes idle and the handback has
   // STILL not been adopted (genuine bridge-death / dropped inbound), the re-armed
   // reap finalizes honestly — the degenerate case the reap exists for.
-  it('finalizes a genuine orphan once claude goes idle, even after deferring while busy', async () => {
+  it('recovers a genuine orphan once claude goes idle, even after deferring while busy', async () => {
     let busy = true
     const h = makeHarness({ isClaudeBusy: () => busy })
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatIdleOrphan', messageId: 710 }))
@@ -354,17 +399,167 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
 
     // Busy: the first reap defers.
     await h.sched.advance(30_000)
-    expect(h.finalizedIds).toEqual([])
+    expect(h.deletedIds).toEqual([])
+    expect(h.reinjected).toEqual([])
     expect(h.signal.pendingCount()).toBe(1)
 
     // Claude goes idle but NO adopting turn ever mints (the inbound was dropped).
-    // The re-armed reap now finalizes the genuine orphan.
+    // The re-armed reap now recovers the genuine orphan: delete + re-inject.
     busy = false
     await h.sched.advance(30_000)
-    expect(h.finalizedIds).toEqual([resolvedId])
+    expect(h.deletedIds).toEqual([resolvedId])
+    expect(h.reinjected).toHaveLength(1)
     expect(h.typing.activeCount()).toBe(0)
     expect(h.records.size).toBe(0)
     expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  // ── #4027 coverage gap: delivered-but-not-yet-streaming is NOT an orphan ──
+  // A handback that WAS delivered into claude's queue but whose adopting turn
+  // has not started streaming yet reads as idle (`isClaudeBusy()` false) + un-
+  // adopted — which #4027 still finalized as a false "needs a nudge" card. The
+  // `deliveredAwaitingTurnStart` gate DEFERS the reap for the whole delivered
+  // TTL. This test FAILS on revert of the gate: without it the reap fires at the
+  // 30 s adopt timeout (idle, un-adopted) and reaps a healthy delivery.
+  it('does NOT reap a delivered-but-not-yet-streaming handback within the delivered TTL', async () => {
+    // Real delivered TTL, no busy signal — the ONLY thing that can defer the
+    // reap here is the delivered-window gate.
+    const h = makeHarness({ deliveredTtlMs: 300_000 })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatDeliv', messageId: 800 }))
+    await h.sched.advance(700)
+    const resolvedId = await h.openCard.mock.results[0]!.value
+    expect(h.records.size).toBe(1)
+
+    // Well past the 30 s adopt timeout but comfortably within the 5 min TTL: the
+    // reap must DEFER every tick — no delete, no re-inject, entry still live,
+    // typing still lit. (Pre-fix this fired a false orphan at 30 s.)
+    await h.sched.advance(120_000)
+    expect(h.deletedIds).toEqual([])
+    expect(h.reinjected).toEqual([])
+    expect(h.escalations).toEqual([])
+    expect(h.signal.pendingCount()).toBe(1)
+    expect(h.typing.activeCount()).toBe(1)
+
+    // The turn finally starts streaming and adopts the SAME card — an edit, not
+    // an orphan reap, and no double-send.
+    const turnId = deriveTurnId('chatDeliv', null, 800)!
+    const adoption = h.signal.tryAdopt(turnId)
+    expect(adoption).not.toBeNull()
+    expect(adoption!.activityMessageId).toBe(resolvedId)
+    expect(h.deletedIds).toEqual([])
+    expect(h.reinjected).toEqual([])
+    expect(h.openCard).toHaveBeenCalledTimes(1)
+    expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  it('reaps a delivered handback ONCE the delivered TTL elapses (deterministic recovery, still no nudge)', async () => {
+    const h = makeHarness({ deliveredTtlMs: 300_000 })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatStuck', messageId: 801 }))
+    await h.sched.advance(700)
+    const resolvedId = await h.openCard.mock.results[0]!.value
+
+    // Within the TTL: deferred.
+    await h.sched.advance(120_000)
+    expect(h.deletedIds).toEqual([])
+
+    // Past the TTL a truly-stuck delivery finally reaps into recovery rather than
+    // hanging forever — delete + re-inject, never a nudge card.
+    await h.sched.advance(210_000)
+    expect(h.deletedIds).toEqual([resolvedId])
+    expect(h.reinjected).toHaveLength(1)
+    expect(h.escalations).toEqual([])
+    expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  // ── deterministic-recovery retry cap: re-inject up to 2×, THEN escalate ──
+  // A genuine orphan whose re-injections keep coming back orphaned must not loop
+  // forever, and must NEVER fall back to a chat nudge. After `maxReinjects` it
+  // escalates to fleet-health telemetry (the `escalateOrphan` sink). The retry
+  // counter rides `HANDBACK_REINJECT_COUNT_META_KEY` on the inbound across the
+  // buffer round trip, so the cap survives the drop-and-recreate of the entry.
+  it('re-injects a persistently-orphaned handback up to the cap, then escalates (never a nudge)', async () => {
+    const sched = makeScheduler()
+    const sendChatAction = vi.fn<(c: string, t: number | null) => void>()
+    const typing = createTurnTypingLoop({
+      sendChatAction,
+      chatKey: (c, t) => chatKey(c, t),
+      refreshMs: 4000,
+    })
+    let msgSeq = 5000
+    const deletedIds: number[] = []
+    const reinjectedCounts: (string | undefined)[] = []
+    const escalations: HandbackOrphanEscalation[] = []
+    const records = new Map<string, PreTurnCardRecord>()
+
+    // eslint-disable-next-line prefer-const
+    let signal: ReturnType<typeof createHandbackPreturnSignal>
+    signal = createHandbackPreturnSignal({
+      chatKey: (c, t) => chatKey(c, t),
+      deriveTurnId,
+      startTypingLoop: (c, t) => typing.start(c, t),
+      stopTypingLoop: (c, t) => typing.stop(c, t),
+      openCard: async () => ++msgSeq,
+      deleteCard: (r) => {
+        deletedIds.push(r.activityMessageId)
+      },
+      // Simulate the buffer round trip: a re-injected orphan comes straight back
+      // through the release chokepoint carrying its stamped retry counter.
+      reinjectHandback: (m) => {
+        reinjectedCounts.push(m.meta[HANDBACK_REINJECT_COUNT_META_KEY])
+        signal.noteHandbackRelease(m)
+      },
+      escalateOrphan: (e) => {
+        escalations.push(e)
+      },
+      writeCardRecord: (r) => {
+        records.set(r.turnKey, r)
+      },
+      clearCardRecord: (turnKey, id) => {
+        const cur = records.get(turnKey)
+        if (cur != null && cur.activityMessageId === id) records.delete(turnKey)
+      },
+      now: sched.now,
+      setTimer: sched.setTimer,
+      clearTimer: sched.clearTimer,
+      debounceMs: 700,
+      adoptTimeoutMs: 30_000,
+      deliveredTtlMs: 0, // no delivered-window deferral: exercise the retry cap directly
+      maxReinjects: 2,
+    })
+
+    try {
+      signal.noteHandbackRelease(handbackInbound({ chatId: 'chatCap', messageId: 802 }))
+      // Drive several reap cycles: each orphan deletes its card, re-injects (up
+      // to the cap), which re-arms the seam via the simulated round trip.
+      await sched.advance(200_000)
+
+      // Exactly 2 re-injections, stamped 1 then 2, then a single escalation.
+      expect(reinjectedCounts).toEqual(['1', '2'])
+      expect(escalations).toHaveLength(1)
+      expect(escalations[0]!.reinjectCount).toBe(2)
+      // One card deleted per orphan cycle (initial + 2 re-injected), never edited
+      // to a "needs a nudge" string.
+      expect(deletedIds).toHaveLength(3)
+      expect(signal.pendingCount()).toBe(0)
+    } finally {
+      typing.stopAll()
+    }
+  })
+
+  // ── the user-facing "needs a nudge" string is GONE from the gateway source ──
+  // Part A of the fix removed the operator-facing card text entirely; the orphan
+  // path now deletes + re-injects. This is a durable regression guard: it FAILS
+  // if the string is reintroduced anywhere in the gateway source.
+  it('the "may need a nudge" user-facing string is absent from the gateway source', () => {
+    const gatewaySrc = readFileSync(
+      new URL('../gateway/gateway.ts', import.meta.url),
+      'utf8',
+    )
+    // The literal user-facing phrase must not appear as a rendered string. (The
+    // only surviving mentions are historical CODE COMMENTS explaining the removal
+    // — assert the load-bearing card fragment is gone from any send/edit call.)
+    expect(gatewaySrc).not.toContain('it may need a nudge')
+    expect(gatewaySrc).not.toContain('HANDBACK_PRETURN_ORPHAN_HTML')
   })
 
   it('identity race: a user inbound on the same topic never mis-adopts the handback, no double-send', async () => {

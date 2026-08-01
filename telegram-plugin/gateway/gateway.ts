@@ -283,6 +283,7 @@ import { createTurnTypingLoop } from './turn-typing-loop.js'
 import {
   createHandbackPreturnSignal,
   type PreTurnCardRecord,
+  type HandbackOrphanEscalation,
 } from './handback-preturn-signal.js'
 import { deriveTurnId } from './derive-turn-id.js'
 import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
@@ -13743,8 +13744,6 @@ if (isGatewayMain && !STATIC && FEED_HEARTBEAT_ENABLED) {
 // closes. Kill switch: SWITCHROOM_HANDBACK_PRETURN=0.
 const HANDBACK_PRETURN_ENABLED = !STATIC && process.env.SWITCHROOM_HANDBACK_PRETURN !== '0'
 const HANDBACK_PRETURN_HTML = '🤝 Reading the worker’s results…'
-const HANDBACK_PRETURN_ORPHAN_HTML =
-  '🤝 A background worker finished, but the handback never started — it may need a nudge.'
 
 async function openHandbackPreTurnCard(
   chatId: string,
@@ -13774,19 +13773,19 @@ async function openHandbackPreTurnCard(
   }
 }
 
-function finalizeHandbackPreTurnCard(record: PreTurnCardRecord): Promise<void> {
+// DELETE (not edit) a genuinely-orphaned pre-turn card. The old behaviour
+// rewrote the card to an operator-facing string asking the human to manually
+// recover a system that must recover itself. That string is removed; we now
+// delete the frozen card outright, and the orphan is re-injected through the
+// pending-inbound buffer (see the seam's reap) so the machine re-processes it,
+// with no stale message left behind.
+function deleteHandbackPreTurnCard(record: PreTurnCardRecord): Promise<void> {
   return robustApiCall(
-    () =>
-      bot.api.editMessageText(
-        record.chatId,
-        record.activityMessageId,
-        richMessage(HANDBACK_PRETURN_ORPHAN_HTML),
-        {},
-      ),
+    () => bot.api.deleteMessage(record.chatId, record.activityMessageId),
     {
       chat_id: record.chatId,
       ...(record.threadId != null ? { threadId: record.threadId } : {}),
-      verb: 'handback-preturn.orphan-finalize',
+      verb: 'handback-preturn.orphan-delete',
     },
   )
     .then(() => undefined)
@@ -13799,7 +13798,25 @@ const handbackPreturnSignal = createHandbackPreturnSignal({
   startTypingLoop: (chatId, threadId) => startTurnTypingLoop(chatId, threadId),
   stopTypingLoop: (chatId, threadId) => stopTurnTypingLoop(chatId, threadId),
   openCard: openHandbackPreTurnCard,
-  finalizeCard: finalizeHandbackPreTurnCard,
+  deleteCard: deleteHandbackPreTurnCard,
+  // Deterministic recovery on a genuine orphan: re-inject the handback through
+  // the same pending-inbound buffer the live synthesis + boot-replay use, so the
+  // idle-drain re-delivers it and the machine re-processes it itself (no operator
+  // nudge). `noteHandbackRelease` re-fires on the redelivery, re-arming the seam.
+  reinjectHandback: (inbound) => {
+    pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', inbound)
+  },
+  // Retries exhausted → fleet-health telemetry, NEVER an operator-facing card.
+  // A structured stderr line lands in the gateway log the nightly fleet-health
+  // sensor reads (src/fleet-health/scan.ts); the `handback orphan escalation`
+  // marker is greppable and carries the join key for correlation.
+  escalateOrphan: (esc: HandbackOrphanEscalation) => {
+    process.stderr.write(
+      `telegram gateway: handback orphan escalation key=${esc.statusKey} ` +
+        `turnId=${esc.adoptTurnId} reinjects=${esc.reinjectCount} ageMs=${esc.ageMs} ` +
+        `— deterministic recovery exhausted, no operator nudge issued\n`,
+    )
+  },
   writeCardRecord: (record) => {
     if (!activityCardPersistEnabled) return
     writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, record)
