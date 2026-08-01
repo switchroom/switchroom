@@ -1277,16 +1277,10 @@ export function splitMarkdownChunks(text: string, maxLen = RICH_MESSAGE_MAX_CHAR
       cut = spaceIdx
     }
 
-    // Back off so the cut doesn't fall inside an open ``` fence.
-    cut = backOffOpenFence(rest, cut)
-    // Back off so the cut doesn't bisect a table row (a line with `|`).
-    cut = backOffTableRow(rest, cut)
-    // Back off so the cut doesn't bisect an inline entity (`**bold**`,
-    // `` `code` ``, `_italic_`, `[label](href)`), which would leave an unclosed
-    // delimiter in the emitted chunk (Telegram then parse-rejects it to
-    // plaintext, or mis-renders the continuation). Runs LAST so it also cleans
-    // up a boundary the fence/table back-offs landed on.
-    cut = backOffOpenInline(rest, cut)
+    // Back the cut off any markdown entity it would bisect — fenced block,
+    // table row, inline span. One shared mechanism (`safeMarkdownCut`), also
+    // used by the card fitter's last-resort clip (#4116).
+    cut = safeMarkdownCut(rest, cut)
 
     if (cut <= 0) {
       // Could not find a safe boundary below maxLen — the region is one
@@ -1403,7 +1397,136 @@ const INLINE_SPAN_PATTERNS: readonly RegExp[] = [
   /__[^_\n]+__/g, // underline
   /(?<![\w*])_[^_\n]+_(?![\w*])/g, // italic (snake_case-guarded)
   /\[[^\]\n]*\]\([^)\n]*\)/g, // link [label](href)
+  /~~[^~\n]+~~/g, // strikethrough
+  /\|\|[^|\n]+\|\|/g, // spoiler
 ]
+
+/** Characters that form multi-character markdown delimiter runs (`**`, `~~`, `||`, ` ``` `). */
+const DELIMITER_RUN_CHARS = new Set(['*', '_', '`', '~', '|'])
+
+/**
+ * The opening delimiter of every entity kind {@link safeMarkdownCut} can
+ * retreat past, anchored at the head of a string. Used ONLY by
+ * {@link truncateMarkdownSafe}'s repair step — see the doc there for why
+ * dropping an opener is the right repair. Kept adjacent to
+ * `INLINE_SPAN_PATTERNS` so the two marker vocabularies stay in step.
+ */
+const FENCE_OPENER_AT_HEAD = /^(\n?)(?:`{3,}|~{3,})[^\n]*/
+const INLINE_OPENER_AT_HEAD = /^(?:\*{1,3}|_{1,3}|`+|~~|\|\||\[)/
+const TABLE_ROW_OPENER_AT_HEAD = /^(\n?[ \t]*)\|/
+
+/**
+ * Bound on {@link truncateMarkdownSafe}'s opener-drop repair loop. Each pass
+ * removes at least one character, so this only caps a pathologically nested
+ * head (`***` + `` ` `` + `[` …); eight is far past anything a card produces.
+ */
+const MAX_OPENER_REPAIRS = 8
+
+/**
+ * The largest index `<= cut` at which `text` can be split without bisecting a
+ * markdown entity — the ONE place "where is it safe to cut markdown?" is
+ * answered.
+ *
+ * Composes the three back-offs in the order the chunker has always applied
+ * them (fenced block → table row → inline span; the inline pass runs last so
+ * it also cleans a boundary the first two landed on), then refuses to split a
+ * surrogate pair so the result is always valid UTF-16 as well as valid
+ * markdown.
+ *
+ * Returns `0` when NO safe boundary exists at or below `cut` — i.e. an entity
+ * that starts at index 0 swallows the whole window. Callers must handle that
+ * case; see {@link truncateMarkdownSafe}.
+ */
+export function safeMarkdownCut(text: string, cut: number): number {
+  if (cut <= 0) return 0
+  if (cut >= text.length) return text.length
+  let safe = backOffOpenFence(text, cut)
+  safe = backOffTableRow(text, safe)
+  safe = backOffOpenInline(text, safe)
+  // Never cut INSIDE a delimiter run: `**bold**` cut between the two closing
+  // stars emits one lone `*` (odd marker count → parse-reject), and the span
+  // back-off above cannot see it because the run's first half is a complete
+  // span's tail, not a straddle. Retreat to the run's start.
+  while (safe > 0 && DELIMITER_RUN_CHARS.has(text[safe]) && text[safe - 1] === text[safe]) safe--
+  if (safe <= 0) return 0
+  // Never leave a lone high surrogate by cutting through an astral character.
+  const prev = text.charCodeAt(safe - 1)
+  const here = text.charCodeAt(safe)
+  if (prev >= 0xd800 && prev <= 0xdbff && here >= 0xdc00 && here <= 0xdfff) safe -= 1
+  return safe
+}
+
+/**
+ * Truncate `text` to at most `budget` characters such that the RESULT IS
+ * ALWAYS PARSEABLE MARKDOWN — no half-open `**`/`_`/`` ` ``/`~~`/`||` run, no
+ * unclosed fence, no bisected link or table row, no split surrogate pair.
+ *
+ * Why this exists (#4116): the card fitter's last-resort clip used to slice
+ * the raw markdown by character count. A cut landing between a `**` pair
+ * yields a body Telegram parse-REJECTS — so the code path that exists
+ * specifically to guarantee delivery within the char budget could itself make
+ * the send fail. A clipped card beats no card, but only if it can be sent.
+ *
+ * Two steps, in order:
+ *
+ *  1. **Back off** to the nearest safe boundary ({@link safeMarkdownCut}).
+ *     This is the normal case and it preserves formatting exactly: an entity
+ *     that straddles the limit simply doesn't make the cut.
+ *
+ *  2. **Drop the opener** when backing off would keep less than HALF the
+ *     window. That happens when a single entity is longer than the window —
+ *     `**<40k-char description>**`, the #3682 repro — and a back-off would
+ *     return a near-empty card, which is no better than the dropped card the
+ *     clip exists to prevent. The entity cannot render anyway (its closing
+ *     delimiter is past the window), so we drop its OPENING delimiter and ask
+ *     again: the text survives as literal prose, the markdown stays balanced,
+ *     and the card is delivered.
+ *
+ * The window END IS HELD FIXED IN SOURCE TERMS across a repair (`end` shrinks
+ * by exactly the characters removed). Letting the window slide forward by the
+ * dropped opener's width would pull the entity's CLOSING delimiter into the
+ * output — an orphan closer, unbalanced again. That is a real defect this
+ * function had before its property test swept every offset.
+ *
+ * The repair loop is bounded (each pass removes at least one character; at
+ * most `MAX_OPENER_REPAIRS` passes) so a pathological body cannot spin.
+ */
+export function truncateMarkdownSafe(text: string, budget: number): string {
+  if (budget <= 0) return ''
+  if (text.length <= budget) return text
+  let t = text
+  let end = budget
+  for (let pass = 0; pass <= MAX_OPENER_REPAIRS; pass++) {
+    const safe = safeMarkdownCut(t, end)
+    // A back-off that keeps at least half the window is the good outcome: the
+    // straddling entity is dropped whole and everything before it renders as
+    // authored.
+    if (safe * 2 >= end) return t.slice(0, safe)
+    const repaired = dropLeadingOpener(t.slice(safe))
+    // No opener to drop (unreachable in principle — every back-off above
+    // retreats TO one). Prefer the short-but-valid back-off over a slice that
+    // cannot be parsed.
+    if (repaired == null) return t.slice(0, safe)
+    end -= t.length - safe - repaired.length
+    t = t.slice(0, safe) + repaired
+  }
+  return t.slice(0, Math.max(0, safeMarkdownCut(t, end)))
+}
+
+/**
+ * Remove the opening delimiter of the entity that begins at the head of
+ * `rest`, preserving any leading newline so line structure survives. Returns
+ * `null` when the head is not an entity opener.
+ */
+function dropLeadingOpener(rest: string): string | null {
+  const fence = FENCE_OPENER_AT_HEAD.exec(rest)
+  if (fence != null) return fence[1] + rest.slice(fence[0].length)
+  const inline = INLINE_OPENER_AT_HEAD.exec(rest)
+  if (inline != null) return rest.slice(inline[0].length)
+  const row = TABLE_ROW_OPENER_AT_HEAD.exec(rest)
+  if (row != null) return row[1] + rest.slice(row[0].length)
+  return null
+}
 
 function backOffOpenInline(text: string, cut: number): number {
   if (cut <= 0 || cut >= text.length) return cut

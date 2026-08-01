@@ -53,6 +53,7 @@ import {
   AGENT_LIVE_POLL_INTERVAL_MS,
 } from './boot-probes.js'
 import { escapeMarkdown, stackCardLines } from '../card-format.js'
+import { NESTED_PREFIX } from '../status-no-truncate.js'
 import {
   loadCache as loadBootIssueCache,
   diffProbes as diffBootProbes,
@@ -540,7 +541,11 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     const tailCmd = process.env.SWITCHROOM_RUNTIME === 'docker'
       ? `docker logs --tail 100 switchroom-${agentSlug}`
       : `journalctl --user -u switchroom-${agentSlug} -n 100`
-    degradedRows.push(`    ↳ Tail logs: \`${tailCmd}\``)
+    // One indent idiom, repo-wide (#4115): NESTED_PREFIX, not ASCII spaces.
+    // Telegram left-trims a leading ASCII-whitespace run off a content line,
+    // so the ASCII-space indent this row used to carry rendered FLAT on a
+    // phone — the #3668 failure, live-verified 2026-07-26.
+    degradedRows.push(`${NESTED_PREFIX}Tail logs: \`${tailCmd}\``)
   }
 
   // Probe rows — only those that surfaced as degraded/fail. Healthy
@@ -569,7 +574,7 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
       // user does or doesn't see across consecutive boots.
       degradedRows.push(`${dot} **${PROBE_LABELS[key]}**  ${escapeMarkdown(r.detail)}`)
       if (r.nextStep) {
-        degradedRows.push(`    ↳ ${renderNextStep(r.nextStep)}`)
+        degradedRows.push(`${NESTED_PREFIX}${renderNextStep(r.nextStep)}`)
       }
     }
   }
