@@ -105,7 +105,7 @@ The model-free sensor's explicit, documented mapping (source of truth:
 |---|---|---|---|
 | `silent-no-op-candidate` (complete, 0 tools, real turn) | silent-no-op | 3 | `know-what-my-agent-is-doing` |
 | `duplicate-delivery-represent` (`represent duplicate-send`) | duplicate | 2 | `talk-to-agents-from-anywhere` |
-| `reply-delivery-failure` (`sendRichMessage … status=err`) | success-theater | 3 | `talk-to-agents-from-anywhere` |
+| `reply-delivery-failure` (`sendRichMessage … status=err` — terminal only; a retried attempt logs `status=retry`, #3931) | success-theater | 3 | `talk-to-agents-from-anywhere` |
 | `hang-long-stalled` (>6 min AND ≤2 tools) | partial | 2 | `steer-or-queue-mid-flight` |
 | `killed-incomplete-turn` (status ∉ complete/no_reply) | missed-trigger | 3 | `steer-or-queue-mid-flight` |
 | `represent-escalation` (`obligation escalation`) | drift | 1 | `feel-like-a-colleague` |

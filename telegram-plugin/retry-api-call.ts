@@ -27,6 +27,96 @@
  */
 
 import { GrammyError } from 'grammy'
+import { AsyncLocalStorage } from 'async_hooks'
+
+// ─── retry-attempt context (#3931) ────────────────────────────────────────
+
+/**
+ * What the retry policy knows about the attempt currently on the wire.
+ *
+ * Published so the layer BELOW the policy — the `tg-post` observability
+ * transformer in `shared/bot-runtime.ts`, which runs inside `fn()` and
+ * therefore sees a failure *before* the policy decides what to do with it —
+ * can label a doomed-but-non-terminal attempt honestly instead of as a
+ * delivery failure. Without it, a 429 that the policy sleeps and retries
+ * SUCCESSFULLY still wrote `status=err` to the gateway log, and fleet-health's
+ * per-line `reply-delivery-failure` detector escalated a delivered reply
+ * (#3931).
+ */
+export interface TgAttemptContext {
+  /** 0-based index of the attempt currently executing. */
+  attempt: number
+  /** Total attempts this policy will make. */
+  maxRetries: number
+  /** Longest 429 `retry_after` the policy will sleep in-process. */
+  maxFloodSleepMs: number
+}
+
+const attemptStore = new AsyncLocalStorage<TgAttemptContext>()
+
+/** The attempt context of the enclosing `retryApiCall`, or undefined outside one. */
+export function _getTgAttemptContext(): TgAttemptContext | undefined {
+  return attemptStore.getStore()
+}
+
+/** Run `fn` with `ctx` visible to `_getTgAttemptContext()` for its whole async chain. */
+function withAttemptContext<T>(ctx: TgAttemptContext, fn: () => Promise<T>): Promise<T> {
+  return attemptStore.run(ctx, fn)
+}
+
+/**
+ * The transient network-error classifier the retry loop uses. Exported so the
+ * "will this be retried?" predicate cannot drift from the loop's own decision.
+ */
+export function isTransientNetworkMessage(msg: string): boolean {
+  return (
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('fetch failed') ||
+    msg.includes('ENOTFOUND')
+  )
+}
+
+/** The parts of a Telegram failure that decide retryability. */
+export interface TgFailureShape {
+  /** Telegram `error_code`, or null/undefined for a transport-level error. */
+  errorCode?: number | null
+  /** Telegram `parameters.retry_after`, seconds. */
+  retryAfterSec?: number | null
+  /** Transport-level error message (only consulted when `errorCode` is absent). */
+  message?: string | null
+}
+
+/**
+ * Will the enclosing retry policy issue ANOTHER attempt after this failure?
+ *
+ * `true` means the failure is non-terminal: a later attempt may still deliver,
+ * so it must not be logged (or detected) as a delivery failure. `false` means
+ * either there is no retry policy above this call, or this attempt is the last
+ * one, or the error class is not retryable — i.e. the failure IS the outcome.
+ *
+ * Mirrors `createRetryApiCall`'s loop exactly:
+ *   - no enclosing policy                           ⇒ terminal
+ *   - last attempt (`attempt >= maxRetries-1`)      ⇒ terminal (loop falls through)
+ *   - 429 with `retry_after` over the sleep ceiling ⇒ terminal (FLOOD_WAIT_ACTIVE)
+ *   - 429 under the ceiling                         ⇒ retried
+ *   - transient transport error                     ⇒ retried
+ *   - anything else                                 ⇒ terminal (rethrown)
+ */
+export function willRetryTelegramFailure(
+  failure: TgFailureShape,
+  ctx: TgAttemptContext | undefined = _getTgAttemptContext(),
+): boolean {
+  if (ctx == null) return false
+  if (ctx.attempt >= ctx.maxRetries - 1) return false
+  if (failure.errorCode === 429) {
+    const retryAfter = Number(failure.retryAfterSec ?? 5)
+    const delayMs = (Number.isFinite(retryAfter) ? retryAfter : 5) * 1000
+    return delayMs <= ctx.maxFloodSleepMs
+  }
+  if (failure.errorCode != null) return false
+  return isTransientNetworkMessage(failure.message ?? '')
+}
 
 export interface RetryCallOpts {
   /**
@@ -379,7 +469,10 @@ export function createRetryApiCall(
         throw gated
       }
       try {
-        return await fn()
+        // #3931 — publish the attempt context for the duration of the wire
+        // call so the `tg-post` transformer underneath can tell a retried
+        // failure from a terminal one.
+        return await withAttemptContext({ attempt, maxRetries, maxFloodSleepMs }, fn)
       } catch (err) {
         const isGrammyErr = err instanceof GrammyError
         const msg = err instanceof Error ? err.message : String(err)
@@ -459,13 +552,7 @@ export function createRetryApiCall(
         }
 
         // Network-level transient errors — exponential backoff, bounded.
-        if (
-          !isGrammyErr &&
-          (msg.includes('ECONNRESET') ||
-            msg.includes('ETIMEDOUT') ||
-            msg.includes('fetch failed') ||
-            msg.includes('ENOTFOUND'))
-        ) {
+        if (!isGrammyErr && isTransientNetworkMessage(msg)) {
           if (attempt < maxRetries - 1) {
             const delayMs = Math.pow(2, attempt) * 1000
             log?.(

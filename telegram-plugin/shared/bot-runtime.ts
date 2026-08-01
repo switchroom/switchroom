@@ -5,8 +5,8 @@
  * standalone foreman bot before its retirement.
  *
  * What lives here:
- *   - `createRobustApiCall` — thin re-export of createRetryApiCall pre-wired
- *     with stderr logging (mirrors how gateway.ts constructs `robustApiCall`).
+ *   - `installTgPostLogger` / `installRichMarkdownGuard` — the grammy API
+ *     transformers every outbound call transits.
  *   - `makeSwitchroomExec` / `makeSwitchroomExecCombined` — factory fns for
  *     the switchroom CLI exec helpers (callers pass their own CLI path / config
  *     env so each process can be configured independently).
@@ -28,8 +28,7 @@ import { execFileSync, spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
-import { createRetryApiCall, classifyBenignTelegram400 } from '../retry-api-call.js'
-import { makeFloodWaitRecorder, makeFloodWaitProbe } from '../flood-circuit-breaker.js'
+import { classifyBenignTelegram400, willRetryTelegramFailure } from '../retry-api-call.js'
 import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { shouldEmitTgPost, type TgPostStatus } from './gw-trace-gate.js'
 import { guardAccidentalFormatting } from '../rich-send.js'
@@ -102,7 +101,7 @@ function shortDesc(raw: string | undefined): string {
  *
  * Log shape (one line per POST, on both success and failure):
  *
- *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|benign|err> err=<class-or--> code=<http-or--> desc=<short|-->
+ *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|benign|retry|err> err=<class-or--> code=<http-or--> desc=<short|-->
  *
  * TRUTHFULNESS (#3927): grammY resolves the transformer chain with the raw
  * `ApiResponse`, and only converts `{ok:false}` into a thrown `GrammyError`
@@ -126,6 +125,17 @@ function shortDesc(raw: string | undefined): string {
  * classified by the shared `classifyBenignTelegram400`) gets `status=benign`
  * instead, so promoting real rejections out of `status=ok` doesn't bury
  * `grep status=err` under high-volume card-repaint no-ops.
+ *
+ * ATTEMPT vs OUTCOME (#3931): this transformer runs INSIDE `fn()`, i.e. below
+ * the retry policy, so it sees each attempt separately. A 429 that
+ * `createRetryApiCall` sleeps and then retries successfully is not a delivery
+ * failure — but it used to write `status=err`, and fleet-health's
+ * `reply-delivery-failure` detector (`src/fleet-health/detect.ts`) matches per
+ * LINE, so every retried-and-DELIVERED reply raised a severity-3 alert. The
+ * retry policy now publishes its attempt context (`_getTgAttemptContext`), and
+ * a failure the policy is about to retry is logged `status=retry` instead.
+ * `status=err` is therefore an OUTCOME: the logical send is over and nothing
+ * landed. Nothing is hidden — the retry lines are still emitted verbatim.
  *
  * Body content is never logged — only its length and a 12-char sha1 prefix
  * so we can recognise repeated identical sends without leaking PII. The
@@ -164,12 +174,27 @@ export function installTgPostLogger(bot: Bot): void {
       // converts `{ok:false}` to a thrown GrammyError only after this chain
       // returns (see the docblock). Same defensive shape as the edit fuse's
       // `runObserved` (edit-flood-fuse.ts).
-      const r = res as unknown as { ok?: boolean; error_code?: number; description?: string }
+      const r = res as unknown as {
+        ok?: boolean
+        error_code?: number
+        description?: string
+        parameters?: { retry_after?: number }
+      }
       if (r != null && typeof r === 'object' && r.ok === false) {
         const code = r.error_code
         const benign = classifyBenignTelegram400(code, r.description)
+        // #3931 — an attempt the enclosing retry policy is about to repeat is
+        // not an outcome; label it `retry` so it is never read as a delivery
+        // failure. Terminal rejections keep `status=err`.
+        const retrying =
+          benign === null &&
+          willRetryTelegramFailure({
+            errorCode: code ?? null,
+            retryAfterSec: r.parameters?.retry_after ?? null,
+            message: r.description ?? null,
+          })
         emit(
-          benign !== null ? 'benign' : 'err',
+          benign !== null ? 'benign' : retrying ? 'retry' : 'err',
           `telegram_${code ?? 'unknown'}`,
           code != null ? String(code) : '-',
           shortDesc(r.description),
@@ -186,7 +211,18 @@ export function installTgPostLogger(bot: Bot): void {
       const rawDesc = err instanceof GrammyError
         ? (err as GrammyError).description
         : (err instanceof Error ? err.message : '')
-      emit('err', errClass, code, shortDesc(rawDesc))
+      // #3931 — same attempt-vs-outcome rule as the resolved-rejection branch
+      // above. This branch carries the transport (`HttpError`) failures, whose
+      // transient members the retry policy backs off and repeats.
+      const retrying = willRetryTelegramFailure({
+        errorCode: err instanceof GrammyError ? (err as GrammyError).error_code : null,
+        retryAfterSec:
+          err instanceof GrammyError
+            ? ((err as GrammyError).parameters?.retry_after ?? null)
+            : null,
+        message: err instanceof Error ? err.message : String(err ?? ''),
+      })
+      emit(retrying ? 'retry' : 'err', errClass, code, shortDesc(rawDesc))
       throw err
     }
   })
@@ -248,32 +284,23 @@ export function installRichMarkdownGuard(bot: Bot): void {
   })
 }
 
-// ─── robustApiCall factory ────────────────────────────────────────────────
-
-/**
- * Creates a robust API call wrapper pre-wired with stderr logging.
- * This is exactly how gateway.ts constructs its `robustApiCall`.
- *
- * Usage:
- *   const robustApiCall = createRobustApiCall()
- */
-export function createRobustApiCall(opts: { floodStatePath?: string } = {}) {
-  return createRetryApiCall({
-    log: (line) => process.stderr.write(line),
-    // #2923: persist every observed 429 flood-wait window so a restart during
-    // the ban can suppress non-essential sends (boot cards) instead of feeding
-    // the per-bot flood counter and prolonging the ban.
-    // #3084: and refuse to issue a call while that window is still open —
-    // otherwise the card heartbeats re-drive a request into the ban every
-    // few seconds once the policy stops sleeping long waits.
-    ...(opts.floodStatePath
-      ? {
-          onFloodWait: makeFloodWaitRecorder(opts.floodStatePath),
-          floodWaitRemainingMs: makeFloodWaitProbe(opts.floodStatePath),
-        }
-      : {}),
-  })
-}
+// ─── robustApiCall factory: REMOVED (#3863) ───────────────────────────────
+//
+// `createRobustApiCall` used to live here as a second `createRetryApiCall`
+// wiring "pre-wired with stderr logging", kept for a standalone foreman bot
+// that was retired. It had ZERO production callers, and its breaker hooks were
+// OPTIONAL (`floodStatePath` defaulted to absent), so the one thing a second
+// wiring must never be — a send path blind to the shared flood window — was
+// its default. Docblocks in `flood-circuit-breaker.ts` and `flood-429-ledger.ts`
+// cited it as a live wiring, which is how a dead function became load-bearing
+// documentation for the breaker's completeness argument.
+//
+// There is one retry wiring per process, built at its own callsite with both
+// breaker hooks (`gateway.ts`'s `robustApiCall`, `outbox-sweep.ts`'s sweep
+// caller) and enforced by `scripts/check-retry-flood-hooks.mjs`. Do not
+// reintroduce a convenience factory here: it re-creates the hook-optional
+// default this deletion removed. `tests/no-robust-api-call-factory.test.ts`
+// guards that.
 
 // ─── Markdown escape helpers (#2669) ──────────────────────────────────────
 

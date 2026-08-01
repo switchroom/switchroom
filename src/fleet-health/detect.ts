@@ -149,12 +149,24 @@ export interface AgentScanResult {
  * Precise gateway log signatures. Precision-filtered so a `getUpdates` network
  * blip never counts as a delivery failure — the reply-delivery pattern matches
  * ONLY a `sendRichMessage` non-ok status. Regex sources match the reference
- * detector's `grep -E` patterns exactly.
+ * detector's `grep -E` patterns exactly, except where noted below.
+ *
+ * #3931 — `reply-delivery-failure` is an OUTCOME signal, not an attempt signal.
+ * The `tg-post` transformer runs below the retry policy and logs one line per
+ * POST attempt, so a 429 that was slept and retried SUCCESSFULLY used to emit a
+ * matching `status=err` line and escalate a reply the operator had already
+ * received — a severity-3 alert on a delivered message. The transformer now
+ * labels a failure the policy is about to retry `status=retry`
+ * (`telegram-plugin/shared/bot-runtime.ts`, `willRetryTelegramFailure` in
+ * `telegram-plugin/retry-api-call.ts`), so only terminal failures carry
+ * `status=err`. The `(?![a-z])` guard makes that structural rather than
+ * incidental: it pins the match to the exact token `err`, so no future
+ * `err<suffix>` tier can silently re-enter this signal.
  */
 export const GATEWAY_SIGNATURES: Record<GatewaySignal, RegExp> = {
   "duplicate-delivery-represent": /represent duplicate-send/,
   "represent-escalation": /obligation escalation/,
-  "reply-delivery-failure": /tg-post method=sendRichMessage[^\n]*status=err/,
+  "reply-delivery-failure": /tg-post method=sendRichMessage[^\n]*status=err(?![a-z])/,
 };
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
