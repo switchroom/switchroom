@@ -649,8 +649,8 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 250;
  * Upstream's own `config.py` warns about this, and switchroom has been
  * silently inheriting the wrong one:
  *
- *   - {@link HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}
- *     (`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS`, 1) is the RESERVED
+ *   - {@link HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS}
+ *     (`HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS`, 1) is the RESERVED
  *     FLOOR: slots consolidation is always guaranteed.
  *   - THIS (`..._SLOT_LIMIT`) is the CEILING: the most slots consolidation may
  *     hold at once, reserved and shared combined
@@ -666,7 +666,7 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 250;
  * (The 4 default and the 10-slot worker pool are pinned by
  * tests/docker/hindsight-recall-isolation-patches.test.ts, which also proves
  * `validate()` rejects a ceiling above the pool or below this type's own
- * reservation — so this value must sit between MAX_SLOTS and 10.)
+ * reservation — so this value must sit between RESERVED_SLOTS and 10.)
  *
  * 6 of `DEFAULT_WORKER_MAX_SLOTS` = 10 leaves 4 slots for every other op type
  * (retain, refresh_mental_model, graph_maintenance, import_documents — all
@@ -688,8 +688,81 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 250;
  */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT = 6;
 
-/** Reserved consolidation slot FLOOR — see SLOT_LIMIT above for floor-vs-ceiling. */
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
+/**
+ * Reserved consolidation slot FLOOR — see SLOT_LIMIT above for floor-vs-ceiling.
+ *
+ * Emitted as `HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS`. Upstream
+ * v0.8.6 (#3016) renamed the per-type key from `..._MAX_SLOTS`, which never
+ * meant a maximum, to `..._RESERVED_SLOTS`. The old name still works as a
+ * DEPRECATED ALIAS, but setting BOTH names for the same operation type is a
+ * hard boot `ValueError` — so switchroom accepts the legacy name as input
+ * (see {@link HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES}) and never emits it.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS = 1;
+
+/**
+ * Similarity floor for graph-traversal SEEDS — upstream
+ * `HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY` (config.py:468, upstream default
+ * 0.3 at config.py:926).
+ *
+ * ## Why emit a value identical to upstream's default
+ *
+ * Because 0.3 here is a deliberate BEHAVIOUR PIN, not an inherited default.
+ * Until v0.8.6 the seed floor was a hardcoded literal at the call site, and
+ * switchroom carried upstream PR #2968 as a patch in
+ * `docker/Dockerfile.hindsight` that mirrored that literal into a named module
+ * constant precisely so the value could not move. v0.8.6 lands #2968 natively
+ * and makes the floor configurable, so the carry is retired — but retiring it
+ * without emitting the key would convert a pinned constant into "whatever the
+ * next image bump decides", which is exactly the silent-drift failure the
+ * carry existed to prevent.
+ *
+ * It is also cheap and legible: one line in `docker inspect` that states the
+ * graph-recall floor this fleet was tuned against. If upstream changes its
+ * default, recall behaviour on this fleet does not move, and the divergence
+ * becomes a visible decision rather than an invisible one.
+ *
+ * Raising it narrows graph expansion (fewer, tighter seeds); lowering it
+ * widens it. Override through `hindsight.env` like any other managed key.
+ */
+export const HINDSIGHT_DEFAULT_GRAPH_SEED_MIN_SIMILARITY = 0.3;
+
+/**
+ * Whether the structured-output backend tolerates the JSON Schema `maxItems`
+ * keyword — upstream `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS` (config.py:173,
+ * upstream default `true` at config.py:858).
+ *
+ * ## `false`, and this is a data-egress control, not a tuning knob
+ *
+ * Consolidation builds its response model with
+ * `PydanticField(default=[], max_length=remaining_observation_slots)`
+ * (`engine/consolidation/consolidator.py` `_build_response_model`), which
+ * pydantic serialises as `"maxItems": <n>`. `n` is the bank's REMAINING
+ * OBSERVATION-SLOT COUNT, not a modelling constraint — measured ~4,230 for a
+ * cohort of banks on this fleet. llama.cpp/Ollama compile the schema to a GBNF
+ * grammar, and a repetition count that large fails to build:
+ *
+ *     HTTP 400 {"error":{"code":400,"message":"Failed to initialize samplers:
+ *              failed to parse grammar","type":"invalid_request_error"}}
+ *
+ * LiteLLM's router-level fallback then re-sent the SAME call — up to
+ * `CONSOLIDATION_LLM_BATCH_SIZE` memories of verbatim private corpus text — to
+ * the METERED OpenRouter deployment. 56 such fallbacks were visible in the
+ * proxy log (`Received Model Group=gpt-oss-20b-consolidation`), deterministic
+ * per bank: ~4,230 remaining slots failed every time, ~670 compiled fine.
+ *
+ * switchroom used to fix this by patching the image (the `consolidation
+ * maxItems grammar patch`). v0.8.6 makes it configurable, so the patch is
+ * retired and this key carries the fix. Setting it false omits the schema hint
+ * entirely; the observation cap is still enforced in Python after validation
+ * ("Defensive truncation: some LLM providers may not enforce JSON schema
+ * max_length") and the prose `observation_capacity_note` still fires when the
+ * cap is tight, so nothing is lost but the hint.
+ *
+ * Gated on the local-LLM capability because that is where GBNF compilation
+ * happens; a hosted structured-output backend can keep upstream's default.
+ */
+export const HINDSIGHT_DEFAULT_LLM_SUPPORTS_MAX_ITEMS = "false";
 
 /**
  * Age→freshness curve used by the reranker's recency boost (upstream default
@@ -837,8 +910,8 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
     String(HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S),
   ],
   [
-    "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
-    String(HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS),
+    "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS",
+    String(HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS),
   ],
   [
     "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
@@ -855,6 +928,10 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
   [
     "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
     String(HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS),
+  ],
+  [
+    "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
+    String(HINDSIGHT_DEFAULT_GRAPH_SEED_MIN_SIMILARITY),
   ],
 ];
 
@@ -880,6 +957,7 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
   ],
   ["HINDSIGHT_API_LLM_STRICT_SCHEMA", HINDSIGHT_DEFAULT_LLM_STRICT_SCHEMA],
   ["HINDSIGHT_API_LLM_MAX_RETRIES", String(HINDSIGHT_DEFAULT_LLM_MAX_RETRIES)],
+  ["HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS", HINDSIGHT_DEFAULT_LLM_SUPPORTS_MAX_ITEMS],
 ];
 
 /**
@@ -964,7 +1042,7 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * ### `HINDSIGHT_API_WORKER_MAX_SLOTS`
  *
  * The total in-flight task budget for the worker poller — the pool that
- * `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS` reserves out of and that
+ * `HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS` reserves out of and that
  * every other operation type shares. switchroom already manages the
  * reservation and the ceiling (both are in {@link
  * HINDSIGHT_PERF_DEFAULTS_UNGATED}) but not the total they are carved from,
@@ -994,13 +1072,20 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * between the reservation and this), so an incoherent combination fails loudly
  * in the container rather than silently here.
  *
- * ### `HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS`
+ * ### `HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS`
  *
  * The reserved slot FLOOR for the `retain` lane — the same slot policy as the
- * key above, from the other side. Upstream's `WORKER_SLOT_RESERVATION_TYPES`
- * (`config.py`) gives `retain` a default of **0**, i.e. no floor at all: every
- * retain competes for the shared pool that is left after the reservations are
- * carved out.
+ * key above, from the other side. Upstream's `WORKER_SLOT_TYPE_DEFAULTS`
+ * (`config.py`; pre-0.8.6 `WORKER_SLOT_RESERVATION_TYPES`) gives `retain` a
+ * default of **0**, i.e. no floor at all: every retain competes for the shared
+ * pool that is left after the reservations are carved out.
+ *
+ * NAME CHANGE IN v0.8.6 (upstream #3016): this key was
+ * `HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS`, which never meant a maximum. The old
+ * name is still accepted as a deprecated alias, but setting BOTH names for one
+ * operation type is a hard boot `ValueError`, so switchroom normalises the alias
+ * to the canonical name on the way in and emits only the canonical name — see
+ * {@link HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES}.
  *
  * That asymmetry is switchroom's own doing. Consolidation is the one lane
  * switchroom deliberately widens — {@link
@@ -1028,7 +1113,7 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * hindsight:
  *   env:
  *     HINDSIGHT_API_WORKER_MAX_SLOTS: 16
- *     HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: 2
+ *     HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS: 2
  * ```
  *
  * Override-only rather than defaulted for the same reason as the four above:
@@ -1125,8 +1210,10 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * `engine/reflect/agent.py` blocks). Upstream defines this knob but it was
  * dead in the production path — no agentic reflect call site passed
  * `temperature`, so the provider default (~1.0) applied; the patch threads
- * the resolved value into all 7 agentic reflect call sites and lowers the
+ * the resolved value into all 6 agentic reflect call sites and lowers the
  * baked default to 0.1 (factual synthesis, matching the retain default).
+ * (7 before the v0.8.6 base bump: upstream #3013's reflect rework deleted the
+ * mid-loop budget-rewrite call site.)
  *
  * Unlike the key above this IS an upstream env var, parsed by upstream's
  * own `_resolve_operation_temperature`. Accepted values: a float (per-op
@@ -1151,17 +1238,118 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_API_LLM_TEMPERATURE_REFLECT: "none"   # provider default, patch's
  *                                                     # threading still in place
  * ```
+ *
+ * ### `HINDSIGHT_API_RETAIN_WALL_TIMEOUT`
+ *
+ * NEW IN v0.8.6 (`config.py:738`, default `3600` seconds at `config.py:1224`);
+ * it does not exist on 0.8.5. Adopted as override-only, and deliberately not
+ * defaulted, for two reasons:
+ *
+ *  1. SYMMETRY. `HINDSIGHT_API_REFLECT_WALL_TIMEOUT` is already a managed
+ *     default here, so without this entry the retain-side counterpart would be
+ *     the one wall timeout an operator cannot reach — and an unreachable key is
+ *     worse than an absent one, because a `hindsight.env` line for it is
+ *     DISCARDED silently rather than rejected (that is the exact defect
+ *     `tests/hindsight-env-keys-are-reachable.test.ts` exists to guard).
+ *  2. NO OPINION TO BAKE. Unlike reflect — whose 600s default was chosen
+ *     against measured local-LLM latency — nothing on this fleet has ever hit a
+ *     retain wall timeout, so there is no evidence for moving it off upstream's
+ *     3600. Emitting a default here would be inventing a number, and a second
+ *     copy of upstream's number is just something to drift.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_RETAIN_WALL_TIMEOUT: "7200"   # a bank whose retains are
+ *                                                 # genuinely long-running
+ * ```
+ *
+ * ### DELIBERATELY NOT ADOPTED from v0.8.6
+ *
+ * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
+ *   `..._POLL_INTERVAL_MS` (`config.py:536-538`). Default-on, log-only event-loop
+ *   stall diagnostic. There is nothing to tune without first seeing a stall log,
+ *   and switchroom taking ownership of a diagnostic's thresholds before it has
+ *   read one of its outputs would be cargo cult.
+ * - `HINDSIGHT_API_{RETAIN,REFLECT,CONSOLIDATION}_LLM_REASONING_EFFORT`
+ *   (`config.py:317, :340, :352`, each unset ⇒ falls back to the global
+ *   `HINDSIGHT_API_LLM_REASONING_EFFORT`, default `"low"` at `config.py:865`).
+ *   Per-op reasoning effort is a quality/latency trade with no measurement
+ *   behind it here; picking values blind would be an unfalsifiable opinion baked
+ *   into every fleet. Filed as a follow-up to benchmark rather than guessed at.
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
   "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
   "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS",
   "HINDSIGHT_API_WORKER_MAX_SLOTS",
-  "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
+  "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS",
   "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
   "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
   "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
+  "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
 ]);
+
+/**
+ * The upstream operation types that have a per-type worker slot reservation.
+ *
+ * Mirrors `WORKER_SLOT_TYPE_DEFAULTS` in upstream `config.py`. The image build
+ * asserts this roster against the container's own module
+ * (`docker/Dockerfile.hindsight`, the worker-slot CEILING block prints
+ * `worker slot roster ok: [...]`), so a type upstream adds or removes fails the
+ * build rather than drifting silently against this list.
+ */
+export const HINDSIGHT_WORKER_SLOT_TYPES: readonly string[] = [
+  "consolidation",
+  "file_convert_retain",
+  "graph_maintenance",
+  "import_documents",
+  "refresh_mental_model",
+  "retain",
+];
+
+/**
+ * Deprecated per-type slot env names → the canonical v0.8.6 name.
+ *
+ * ## Why this map exists rather than a bare rename
+ *
+ * Upstream v0.8.6 (#3016) renamed `HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS` to
+ * `HINDSIGHT_API_WORKER_<TYPE>_RESERVED_SLOTS`, because the old name never
+ * meant a maximum — it is the reserved FLOOR. The old name survives as a
+ * deprecated alias, and **setting both names for the same operation type is a
+ * hard boot `ValueError`** (verified live against the pinned 0.8.6 digest).
+ *
+ * A bare rename in this file would therefore have been silently destructive:
+ * an existing `switchroom.yaml` carrying
+ * `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: 20` would fall outside
+ * {@link HINDSIGHT_PERF_ENV_KEYS}, `resolveHindsightPerfOverrides` would drop
+ * it, and the container would silently run on switchroom's default instead of
+ * the operator's value. (`findUnmanagedHindsightEnvKeys` would surface it as a
+ * `switchroom doctor` FAIL — but only after the value had already stopped
+ * applying.) So the legacy name is accepted as INPUT, normalised to the
+ * canonical name, and the canonical name is what is emitted.
+ *
+ * Two invariants, both asserted in the tests:
+ *   1. The alias is NEVER emitted — only the canonical name reaches the
+ *      container, so the both-names boot failure is unreachable by
+ *      construction rather than by operator discipline.
+ *   2. If an operator sets BOTH in `hindsight.env`, the CANONICAL value wins
+ *      and the alias is discarded. Preferring the new name is what makes a
+ *      migration (add the new line, delete the old one later) safe in either
+ *      order.
+ *
+ * NOTE the global `HINDSIGHT_API_WORKER_MAX_SLOTS` is deliberately NOT in this
+ * map. It has no per-type segment, upstream did not rename it, and aliasing it
+ * to `HINDSIGHT_API_WORKER_RESERVED_SLOTS` would invent a key that does not
+ * exist. This map is keyed on the six known operation types explicitly for
+ * exactly that reason — a regex on `_MAX_SLOTS$` would have caught it.
+ */
+export const HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES: ReadonlyMap<string, string> = new Map(
+  HINDSIGHT_WORKER_SLOT_TYPES.map((type) => [
+    `HINDSIGHT_API_WORKER_${type.toUpperCase()}_MAX_SLOTS`,
+    `HINDSIGHT_API_WORKER_${type.toUpperCase()}_RESERVED_SLOTS`,
+  ]),
+);
 
 /**
  * Every key this module manages — and therefore the exact set an operator may
@@ -1177,6 +1365,14 @@ export const HINDSIGHT_PERF_ENV_KEYS: ReadonlySet<string> = new Set([
     ...HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
   ].map(([k]) => k),
   ...HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS,
+  // Every per-type slot reservation, under BOTH the canonical v0.8.6 name and
+  // the deprecated pre-0.8.6 alias. The alias must be *accepted* here or an
+  // existing switchroom.yaml line stops applying the moment this repo renames
+  // the key; it is normalised to the canonical name by
+  // `resolveHindsightPerfOverrides` and is therefore never emitted. See
+  // {@link HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES}.
+  ...HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.keys(),
+  ...HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.values(),
 ]);
 
 /**
@@ -1198,18 +1394,50 @@ export function resolveHindsightPerfOverrides(
   configEnv?: Record<string, string | number | boolean> | undefined,
   processEnv: NodeJS.ProcessEnv = process.env,
 ): Map<string, string> {
+  // Alias-normalised writes. A deprecated `..._MAX_SLOTS` name is stored under
+  // its canonical `..._RESERVED_SLOTS` name, so the alias can never be emitted
+  // and the "both names set = boot ValueError" trap is unreachable. Within one
+  // precedence tier the canonical name wins: an alias must not overwrite a
+  // canonical value already recorded from the same tier, regardless of object
+  // key order.
+  const canonicalNames = new Set(HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.values());
+  const set = (
+    out: Map<string, string>,
+    seenCanonical: Set<string>,
+    key: string,
+    value: string,
+  ): void => {
+    const canonical = HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.get(key);
+    if (canonical === undefined) {
+      if (canonicalNames.has(key)) seenCanonical.add(key);
+      out.set(key, value);
+      return;
+    }
+    if (seenCanonical.has(canonical)) return;
+    out.set(canonical, value);
+  };
+
   const out = new Map<string, string>();
+  const seenProcess = new Set<string>();
   for (const key of HINDSIGHT_PERF_ENV_KEYS) {
     const fromProcess = processEnv[key];
     if (typeof fromProcess === "string" && fromProcess.trim() !== "") {
-      out.set(key, fromProcess.trim());
+      set(out, seenProcess, key, fromProcess.trim());
     }
   }
-  for (const [key, raw] of Object.entries(configEnv ?? {})) {
+  const seenConfig = new Set<string>();
+  // Canonical names first, so a legacy alias in the same `hindsight.env` can
+  // never overwrite the value written under the name upstream actually wants.
+  const configEntries = Object.entries(configEnv ?? {}).sort(
+    (a, b) =>
+      Number(HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.has(a[0])) -
+      Number(HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.has(b[0])),
+  );
+  for (const [key, raw] of configEntries) {
     if (!HINDSIGHT_PERF_ENV_KEYS.has(key)) continue;
     const value = String(raw).trim();
     if (value === "") continue;
-    out.set(key, value);
+    set(out, seenConfig, key, value);
   }
   return out;
 }

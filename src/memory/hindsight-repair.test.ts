@@ -181,15 +181,26 @@ describe("classifyRepairPreflight", () => {
    * tests/memory.hindsight-contract.fixture.test.ts), while
    * `HINDSIGHT_REPAIR_MIN_API_VERSION` tracks upstream #2645. Fusing them is
    * what made `switchroom doctor` red-by-construction while the fleet still ran
-   * 0.8.4. They happen to be EQUAL since #3768 pinned the 0.8.5 image, so the
-   * old `REPAIR > MIN` assertion no longer holds and would have been a false
-   * guard; the invariant that survives is directional (the feature floor is
-   * never BELOW the contract floor) plus the preflight being driven by the
-   * feature constant rather than a literal.
+   * 0.8.4: the snapshot described 0.8.4, the constant claimed 0.8.5 because
+   * `repair-bank` needs 0.8.5, and every doctor run printed a failure the
+   * operator could do nothing about.
+   *
+   * THE DIRECTION THAT ACTUALLY GUARDS THAT BUG is `REPAIR <= CONTRACT`: a
+   * feature floor ABOVE the version this repo ships is unsatisfiable by
+   * definition, because the contract floor IS the pinned image. The reverse —
+   * a feature that landed in some EARLIER release than the one we pin — is the
+   * normal, healthy case and must not be an error.
+   *
+   * A previous revision asserted `>= 0` instead. That was only ever satisfied
+   * by the accident of the two constants being equal on 0.8.5, and it inverted
+   * the guard: it would have gone green on exactly the red-by-construction
+   * arrangement it was written to prevent. The v0.8.6 base bump separated them
+   * (contract 0.8.6, feature floor still 0.8.5, where `repair-bank` shipped)
+   * and surfaced it.
    */
-  it("enforces the repair FEATURE floor at the preflight, whatever the contract floor is", () => {
+  it("keeps the repair FEATURE floor satisfiable — never above the version this repo pins", () => {
     expect(compareApiVersion(HINDSIGHT_REPAIR_MIN_API_VERSION, HINDSIGHT_MIN_API_VERSION))
-      .toBeGreaterThanOrEqual(0);
+      .toBeLessThanOrEqual(0);
     // Driven by the constant, not a hard-coded 0.8.5: raising the feature floor
     // must keep the preflight refusing everything below the new value.
     expect(classifyRepairPreflight(justBelow(HINDSIGHT_REPAIR_MIN_API_VERSION)).ok).toBe(false);

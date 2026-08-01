@@ -1,22 +1,17 @@
 /**
- * Behavioural proof for the consolidation-maxItems-grammar patch that
- * `docker/Dockerfile.hindsight` bakes into the pinned upstream Hindsight image.
- *
- * `dockerfile-hindsight-bakes.test.ts` pins the *shape* of that patch block
- * (grep-on-file, runs everywhere). This file proves the *outcome*: it builds
- * the real consolidation response model at a production-like remaining-slot
- * count and reads the `maxItems` pydantic actually emits into the request
- * schema — RED against unpatched upstream, GREEN with the patch applied.
+ * Behavioural proof that switchroom's `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS=false`
+ * emission REPLACES the retired consolidation-maxItems-grammar Dockerfile patch,
+ * outcome for outcome, on the pinned v0.8.6 image.
  *
  * THE DEFECT, in the real shipping source.
- * `_build_response_model()` (`engine/consolidation/consolidator.py`) constrains
- * `creates` with `PydanticField(default=[], max_length=clamped)`, which pydantic
- * serialises as `"maxItems": <clamped>`. Its one caller passes
- * `max_creates=remaining_observation_slots` — the bank's remaining
- * observation-slot count, not a modelling constraint. Measured on this host
- * 2026-07-28 against the running `switchroom-hindsight` container:
- * `_build_response_model(max_creates=4230).model_json_schema()` yields
- * `{"maxItems": 4230, ...}` for `creates`.
+ * `_build_response_model()` (`engine/consolidation/consolidator.py:693`)
+ * constrains `creates` with `PydanticField(default=[], max_length=clamped)`,
+ * which pydantic serialises as `"maxItems": <clamped>`. Its one caller
+ * (`consolidator.py:2272`) passes `max_creates=remaining_observation_slots` —
+ * the bank's remaining observation-slot count, not a modelling constraint.
+ * Measured on this host 2026-07-28 against the running `switchroom-hindsight`
+ * container: `_build_response_model(max_creates=4230).model_json_schema()`
+ * yields `{"maxItems": 4230, ...}` for `creates`.
  *
  * Local llama.cpp/Ollama compile that schema into a GBNF grammar and a
  * repetition count that large fails to build, so the deployment answers
@@ -28,18 +23,35 @@
  * ~4,230 remaining slots fails every time, ~670 compiles (threshold measured
  * between 672 and 4,223).
  *
- * WHY THIS PROBE AND NOT A GREP. The bakes test's assertions are unanchored
- * substring matches: raising the ceiling to 100_000, or reintroducing a clamp
- * that still emits a four-digit `maxItems`, keeps every literal it greps for in
- * place while the schema is once again uncompilable. Only serialising the model
- * and reading the emitted number catches that, which is what this file does.
+ * WHAT CHANGED IN v0.8.6, AND WHY THE PATCH IS GONE. Upstream added
+ * `supports_max_items: bool = True` to `_build_response_model` and wired it to
+ * `config.llm_supports_max_items` (`consolidator.py:2273`), driven by
+ * `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS` (`config.py:173`, default True at
+ * `config.py:858`). The defect is now fixable by CONFIGURATION, so carrying a
+ * source patch for it would be a second, drifting opinion about a behaviour
+ * upstream owns. switchroom emits the key on the local-LLM path
+ * (`HINDSIGHT_DEFAULT_LLM_SUPPORTS_MAX_ITEMS`, src/setup/hindsight-perf-defaults.ts).
  *
- * It drives the REAL `_build_response_model` from the image and asserts on
- * `model_json_schema()` — the same call path pydantic takes when the schema is
- * handed to the provider — rather than re-implementing the model here. It
- * applies the patch by `docker exec` (not `docker build`) so it runs on daemons
- * without buildx, and it never touches the production `switchroom-hindsight`
- * container.
+ * WHY THIS FILE STILL EXISTS RATHER THAN BEING DELETED WITH THE PATCH.
+ * "We deleted an egress control and set an env var instead" is a claim, and
+ * `hindsight-perf-defaults.test.ts` can only prove the STRING is emitted. This
+ * file proves the string BUYS the outcome the patch bought, by driving the real
+ * `_build_response_model` inside the pinned image with the env var actually set
+ * — the same call path pydantic takes when the schema is handed to the provider
+ * — and asserting on the emitted `maxItems`. The two arms are now DEFAULT (env
+ * unset ⇒ RED, the defect reproduced on 0.8.6) and CONFIGURED (env=false ⇒
+ * GREEN). If upstream ever renames the key, drops the parameter, or stops
+ * threading it from config, the RED arm stays red and the GREEN arm goes red
+ * too — which is the loud failure the deleted build-time assert used to give us.
+ *
+ * ONE DELIBERATE BEHAVIOUR DIFFERENCE from the retired patch: the patch kept the
+ * hint when the cap was genuinely tight (<= 64, compilable) and dropped it only
+ * above that ceiling. Upstream's flag is all-or-nothing, so with the flag off a
+ * tight cap is no longer stated to the model either. That is safe — and asserted
+ * here — because the cap is still enforced after validation in Python
+ * (`creates = creates[:remaining_observation_slots]`, `consolidator.py:2323`)
+ * and still stated in the prompt capacity note. Probe assertion 6 pins that
+ * truncation, so the premise cannot silently disappear.
  *
  * SKIP DISCIPLINE: identical to `hindsight-retry-perturbation-patches.test.ts`.
  * Locally, with no docker or no cached image, this skips (never pull a 6.4GB
@@ -73,26 +85,24 @@ const UPSTREAM_IMAGE = (() => {
   return m[1];
 })();
 
-/** The patch this file proves, named by its unique in-block marker. */
-const PATCH_NAME = "consolidation-maxItems-grammar patch";
+/** The retired patch, named by the unique in-block marker it used to carry. */
+const RETIRED_PATCH_NAME = "consolidation-maxItems-grammar patch";
+
+/** The env key that replaced it, emitted by src/setup/hindsight-perf-defaults.ts. */
+const ENV_KEY = "HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS";
 
 /**
- * The patch block under test, pulled out of the Dockerfile's
- * `RUN python3 - <<'PYEOF' ... PYEOF` heredocs by its unique patch name.
+ * The patch really is gone from the shipping Dockerfile.
+ *
+ * Asserted rather than assumed: if someone re-adds the block on a rebase it
+ * would stack on top of upstream's own fix, and the DEFAULT arm below would
+ * stop being red — turning this file into a probe that proves nothing.
  */
-function patchBlocks(): string[] {
+function retiredPatchBlockCount(): number {
   const blocks = [
     ...dockerfile.matchAll(/^RUN python3 - <<'PYEOF'\n([\s\S]*?)^PYEOF$/gm),
   ].map((m) => m[1]);
-  const hits = blocks.filter((b) => b.includes(PATCH_NAME));
-  if (hits.length !== 1) {
-    throw new Error(
-      `Dockerfile.hindsight contains ${hits.length} "${PATCH_NAME}" RUN blocks ` +
-        `(expected exactly 1) — if the patch was deliberately removed, delete ` +
-        `this test with it.`,
-    );
-  }
-  return hits;
+  return blocks.filter((b) => b.includes(RETIRED_PATCH_NAME)).length;
 }
 
 /**
@@ -122,8 +132,19 @@ PRODUCTION_SLOTS = 4230
 COMPILABLE_CEILING = 64
 
 
+# Read the flag out of the REAL config loader rather than passing the kwarg
+# by hand — the thing under test is the env var switchroom emits, so the
+# env -> config -> call-site thread is part of what must hold. A rename of
+# HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS upstream reds this probe instead of
+# silently reverting us to the defect.
+from hindsight_api.config import HindsightConfig
+
+SUPPORTS = HindsightConfig.from_env().llm_supports_max_items
+print("CONFIG_SUPPORTS_MAX_ITEMS", SUPPORTS)
+
+
 def creates_schema(max_creates):
-    model = _build_response_model(max_creates=max_creates)
+    model = _build_response_model(max_creates=max_creates, supports_max_items=SUPPORTS)
     return model.model_json_schema()["properties"]["creates"]
 
 
@@ -163,11 +184,16 @@ for n, v in sorted(band.items()):
 # The constraint is real there (2 slots left really does mean at most 2
 # creates), it compiles trivially, and dropping it would make the model emit
 # creates the caller then silently truncates.
+# Upstream's flag is all-or-nothing, so with it OFF the tight caps lose the
+# hint too. That is the one deliberate behaviour difference from the retired
+# patch, and it is recorded here rather than asserted away — assertion 6 is
+# what makes it safe.
 tight = {n: max_items(n) for n in (0, 1, 2, 6, 64)}
 print("MAXITEMS_TIGHT", json.dumps({str(k): v for k, v in sorted(tight.items())}))
 for n, v in sorted(tight.items()):
-    if v != n:
-        fail("slots=" + str(n) + " should still emit maxItems=" + str(n) + ", got " + repr(v))
+    want = None if not SUPPORTS else n
+    if v != want:
+        fail("slots=" + str(n) + " should emit maxItems=" + repr(want) + ", got " + repr(v))
 
 # ── 4. upstream's own no-constraint contract is untouched ─────────────────
 for sentinel in (None, -1):
@@ -178,7 +204,9 @@ print("MAXITEMS_UNCONSTRAINED", json.dumps([max_items(None), max_items(-1)]))
 
 # ── 5. omitting maxItems must not change anything else about the field ────
 # Same shape as the unconstrained model, so the only delta is the cap.
-base = _build_response_model(max_creates=None).model_json_schema()["properties"]["creates"]
+base = _build_response_model(
+    max_creates=None, supports_max_items=SUPPORTS
+).model_json_schema()["properties"]["creates"]
 prod_schema = creates_schema(PRODUCTION_SLOTS)
 print("SCHEMA_PRODUCTION", json.dumps(prod_schema, sort_keys=True))
 if {k: v for k, v in prod_schema.items() if k != "title"} != {
@@ -239,9 +267,15 @@ const imageOk = dockerOk && hasImage(UPSTREAM_IMAGE);
 
 type ProbeResult = { status: number; stdout: string };
 
-/** Run the probe in a throwaway container, optionally patching first. */
-function runProbe(patched: boolean): ProbeResult {
-  const name = `sr-hs-maxitems-${patched ? "patched" : "upstream"}-${RUN_ID.slice(
+/**
+ * Run the probe in a throwaway container, with the switchroom env emission
+ * either applied (`configured`) or absent (upstream's default).
+ *
+ * The env var is set on the CONTAINER, not injected into the probe source, so
+ * what runs is the same `HindsightConfig.from_env()` path the real server takes.
+ */
+function runProbe(configured: boolean): ProbeResult {
+  const name = `sr-hs-maxitems-${configured ? "configured" : "default"}-${RUN_ID.slice(
     0,
     8,
   )}`;
@@ -261,24 +295,13 @@ function runProbe(patched: boolean): ProbeResult {
         "root",
         "--network",
         "none",
+        ...(configured ? ["-e", `${ENV_KEY}=false`] : []),
         UPSTREAM_IMAGE,
         "sleep",
         "300",
       ],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
-
-    if (patched) {
-      for (const block of patchBlocks()) {
-        // The block is self-verifying: it asserts its upstream anchor exists
-        // exactly once and re-asserts the result, so a non-zero exit here means
-        // upstream drifted and the patch must be re-authored.
-        execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
-          input: block,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-      }
-    }
 
     const res = execFileSync(
       "docker",
@@ -301,13 +324,27 @@ function runProbe(patched: boolean): ProbeResult {
   }
 }
 
-describe("Dockerfile.hindsight maxItems-grammar probe is real, not a silent skip", () => {
+describe("hindsight maxItems-grammar successor probe is real, not a silent skip", () => {
   it("pins the upstream image by digest so the probe tests the exact shipping bytes", () => {
     expect(UPSTREAM_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
   });
 
-  it("extracts exactly the one patch block it claims to prove", () => {
-    expect(patchBlocks()).toHaveLength(1);
+  it("the source patch it replaced is really gone from the shipping Dockerfile", () => {
+    // If this ever goes to 1 again the DEFAULT arm below stops being red and
+    // the probe silently stops proving anything.
+    expect(retiredPatchBlockCount()).toBe(0);
+  });
+
+  it("the env key under test is the one switchroom actually emits", () => {
+    // Read out of the emitter rather than duplicated as a second literal: a
+    // rename there without a rename here would leave this probe green while
+    // the fleet ships the defect.
+    const emitter = readFileSync(
+      resolve(root, "src/setup/hindsight-perf-defaults.ts"),
+      "utf8",
+    );
+    expect(emitter).toContain(`"${ENV_KEY}"`);
+    expect(emitter).toContain("HINDSIGHT_DEFAULT_LLM_SUPPORTS_MAX_ITEMS = \"false\"");
   });
 
   it("hard-fails rather than skipping when CI demands a real run", () => {
@@ -335,7 +372,7 @@ describe("Dockerfile.hindsight maxItems-grammar probe is real, not a silent skip
 });
 
 describe.skipIf(!dockerOk || !imageOk)(
-  "Dockerfile.hindsight consolidation-maxItems-grammar patch changes real behaviour",
+  "HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS=false changes real behaviour on the pinned image",
   () => {
     afterAll(() => {
       // Label-scoped teardown belt (never an unlabelled bulk removal).
@@ -354,7 +391,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("unpatched upstream is RED — the schema carries the bank's raw slot count", () => {
+    it("upstream's DEFAULT is RED — the schema carries the bank's raw slot count", () => {
       const { status, stdout } = runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
@@ -363,6 +400,9 @@ describe.skipIf(!dockerOk || !imageOk)(
 
       // The defect, driven: the emitted schema states maxItems: 4230, which is
       // exactly what a local GBNF backend refuses to compile.
+      // The flag really did default to on — i.e. this arm is red for the
+      // reason claimed, not because the probe failed to load config.
+      expect(stdout).toContain("CONFIG_SUPPORTS_MAX_ITEMS True");
       expect(stdout).toContain("MAXITEMS_PRODUCTION 4230");
       expect(stdout).toContain(
         'MAXITEMS_BAND {"673": 673, "1000": 1000, "4223": 4223, "4230": 4230, "100000": 100000}',
@@ -378,7 +418,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("PYTHON_TRUNCATION_PRESENT True");
     }, 240_000);
 
-    it("upstream + the baked patch block is GREEN — maxItems is absent above the ceiling", () => {
+    it(`upstream + ${ENV_KEY}=false is GREEN — maxItems is absent entirely`, () => {
       const { status, stdout } = runProbe(true);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
@@ -386,15 +426,20 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(status, `probe failed:\n${stdout}`).toBe(0);
       expect(stdout).toContain("FAILURES []");
 
+      // The env var actually reached config — without this, "no maxItems"
+      // could equally mean the probe never built a constrained model.
+      expect(stdout).toContain("CONFIG_SUPPORTS_MAX_ITEMS False");
+
       // 1./2. no uncompilable repetition count survives, anywhere in the band.
       expect(stdout).toContain("MAXITEMS_PRODUCTION null");
       expect(stdout).toContain(
         'MAXITEMS_BAND {"673": null, "1000": null, "4223": null, "4230": null, "100000": null}',
       );
-      // 3. a cap that is genuinely tight is still stated to the model, so this
-      // is an omission of a non-binding guard rather than a blanket removal.
+      // 3. THE DELIBERATE DIFFERENCE from the retired patch, asserted rather
+      // than hidden: upstream's flag is all-or-nothing, so tight caps lose the
+      // hint too. Safe only because of 6 below.
       expect(stdout).toContain(
-        'MAXITEMS_TIGHT {"0": 0, "1": 1, "2": 2, "6": 6, "64": 64}',
+        'MAXITEMS_TIGHT {"0": null, "1": null, "2": null, "6": null, "64": null}',
       );
       // 4. upstream's None/-1 contract is untouched.
       expect(stdout).toContain("MAXITEMS_UNCONSTRAINED [null, null]");

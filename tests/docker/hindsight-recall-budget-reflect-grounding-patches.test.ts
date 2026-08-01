@@ -112,9 +112,16 @@ function patchBlocks(): string[] {
  *    selection, and measures the tokens of the payload the tool RETURNS —
  *    both branches (bank_id-param string and single-bank dict);
  *  - fix 2 asserts the resolved config default, upstream's env resolver
- *    (override + `none` sentinel), that all 7 reflect-scope LLM call sites in
+ *    (override + `none` sentinel), that all 6 reflect-scope LLM call sites in
  *    the shipping module pass the configured temperature (AST of the real
- *    module — 0/7 on upstream), and that the litellm provider forwards it.
+ *    module — 0/6 on upstream), and that the litellm provider forwards it.
+ *
+ * v0.8.6 RE-ANCHORING (upstream #3013). The reflect rework DELETED the mid-loop
+ * budget-rewrite call site that used to sit at 24-space indent, so the site
+ * count dropped from 7 to 6 (5x scope="reflect" + the reflect_tool_call kwargs).
+ * The count is asserted EXACTLY rather than as a floor: a site added upstream
+ * and left at the provider default is the exact failure this probe exists to
+ * catch, and ">= 6" would not catch it.
  */
 const PROBE = String.raw`
 import asyncio
@@ -392,9 +399,9 @@ V().visit(tree)
 n_total = len(sites)
 n_wired = sum(1 for _, t in sites if t is not None and "llm_temperature_reflect" in t)
 print("REFLECT_CALL_SITES", n_total, "WIRED", n_wired)
-if n_total != 7:
+if n_total != 6:
     failures.append(
-        "expected 7 reflect-scope LLM call sites in engine/reflect/agent.py, found %d - "
+        "expected 6 reflect-scope LLM call sites in engine/reflect/agent.py, found %d - "
         "re-audit the temperature threading" % n_total
     )
 if n_wired != n_total:
@@ -591,7 +598,7 @@ describe.skipIf(!dockerOk || !imageOk)(
 
       // Defect 2 — the knob resolves to 0.9 and reaches zero call sites.
       expect(stdout).toContain("REFLECT_TEMP_DEFAULT 0.9");
-      expect(stdout).toContain("REFLECT_CALL_SITES 7 WIRED 0");
+      expect(stdout).toContain("REFLECT_CALL_SITES 6 WIRED 0");
       expect(stdout).toContain(
         "the knob is (still) dead on the agentic path",
       );
@@ -626,7 +633,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       // temperature, and the provider forwards/omits correctly.
       expect(stdout).toContain("REFLECT_TEMP_DEFAULT 0.1");
       expect(stdout).toContain("RESOLVED 0.1 0.3 None");
-      expect(stdout).toContain("REFLECT_CALL_SITES 7 WIRED 7");
+      expect(stdout).toContain("REFLECT_CALL_SITES 6 WIRED 6");
       expect(stdout).toContain("PROVIDER_FORWARDS 0.1 OMITS_WHEN_NONE True");
     }, 240_000);
   },

@@ -17,7 +17,7 @@
  *     p50 pinned at exactly 8.02s, with per-agent timeout rates of 97.5%,
  *     95.8% and 73.9%.
  *  2. There is no per-operation-type worker slot CEILING. The
- *     HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS knobs are reservations, i.e. a
+ *     HINDSIGHT_API_WORKER_<TYPE>_RESERVED_SLOTS knobs are reservations, i.e. a
  *     FLOOR: `WorkerPoller._get_available_slots` documents that "when an
  *     operation type's in-flight count exceeds its reservation, the excess
  *     tasks are considered to be using shared pool slots". So consolidation
@@ -566,7 +566,7 @@ print("CEILING_CLAIMED", n_consolidation, "MARKED_PROCESSING", len(conn.claimed)
 if n_consolidation > 4:
     fail(
         f"consolidation claimed {n_consolidation} worker slots under a ceiling of 4 - no "
-        "per-type CEILING exists, only the ..._MAX_SLOTS reservation FLOOR"
+        "per-type CEILING exists, only the ..._RESERVED_SLOTS reservation FLOOR"
     )
 if len(conn.claimed) != len(rows):
     fail("claim_tasks marked a different number of rows processing than it returned")
@@ -712,14 +712,64 @@ else:
     if over is not None:
         fail("a ceiling above worker_max_slots was accepted")
 
+    # Canonical v0.8.6 spelling. Upstream #3016 renamed the per-type reservation
+    # HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS -> ..._RESERVED_SLOTS and kept the old
+    # name as a deprecated alias; switchroom emits only the canonical one.
     under, _ = cfg_with(
         HINDSIGHT_API_WORKER_MAX_SLOTS=10,
-        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=5,
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=5,
         HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT=2,
     )
     print("REJECTS_CEILING_BELOW_RESERVATION", under is None)
     if under is not None:
         fail("a ceiling below the type's own reservation was accepted - the floor is unsatisfiable")
+
+    # ── upstream #3016: the rename, and the trap it laid ──────────────────
+    # The deprecated alias still resolves, so an operator's pre-0.8.6 yaml is
+    # not silently dropped...
+    alias, alias_err = cfg_with(
+        HINDSIGHT_API_WORKER_MAX_SLOTS=10,
+        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=3,
+    )
+    print(
+        "ALIAS_RESERVATION",
+        None if alias is None else alias.worker_slot_reservations.get("consolidation"),
+    )
+    if alias is None or alias.worker_slot_reservations.get("consolidation") != 3:
+        fail(f"the deprecated ..._MAX_SLOTS alias no longer resolves: {alias_err}")
+
+    canon, canon_err = cfg_with(
+        HINDSIGHT_API_WORKER_MAX_SLOTS=10,
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=3,
+    )
+    print(
+        "CANONICAL_RESERVATION",
+        None if canon is None else canon.worker_slot_reservations.get("consolidation"),
+    )
+    if canon is None or canon.worker_slot_reservations.get("consolidation") != 3:
+        fail(f"the canonical ..._RESERVED_SLOTS name does not resolve: {canon_err}")
+
+    # ...but setting BOTH is a hard boot failure. This is the premise behind
+    # HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES in src/setup/hindsight-perf-defaults.ts,
+    # which normalises to the canonical name so both can never be emitted at once.
+    # Asserted here rather than assumed: if upstream ever demoted this to a
+    # warning the emitter's alias machinery would be over-engineering, and if the
+    # emitter regressed this is the crash the fleet would take at boot.
+    both, both_err = cfg_with(
+        HINDSIGHT_API_WORKER_MAX_SLOTS=10,
+        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=3,
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=3,
+    )
+    # Each spelling ALONE is accepted just above with the same value, so the
+    # rejection here can only be the both-names conflict - not some unrelated
+    # validation tripping and making this look like a pass.
+    print("REJECTS_BOTH_SLOT_SPELLINGS", both is None)
+    print("BOTH_SPELLINGS_ERROR_NAMES_CONFLICT", both_err is not None and "RESERVED_SLOTS" in str(both_err) and "MAX_SLOTS" in str(both_err))
+    if both is not None:
+        fail(
+            "setting both ..._MAX_SLOTS and ..._RESERVED_SLOTS was accepted - "
+            "upstream #3016's conflict check is gone"
+        )
 
     off, _ = cfg_with(HINDSIGHT_API_WORKER_MAX_SLOTS=10, HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT="")
     print("CEILING_OPT_OUT", off is not None and not off.worker_slot_limits)
@@ -1055,7 +1105,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("CEILING_CLAIMED 10 MARKED_PROCESSING 10");
       expect(stdout).toContain(
         "consolidation claimed 10 worker slots under a ceiling of 4 - no " +
-          "per-type CEILING exists, only the ..._MAX_SLOTS reservation FLOOR"
+          "per-type CEILING exists, only the ..._RESERVED_SLOTS reservation FLOOR"
       );
       expect(stdout).toContain("POLLER_CEILINGS None");
       expect(stdout).toContain("CONFIG_HAS_SLOT_LIMITS False");
@@ -1158,6 +1208,15 @@ describe.skipIf(!dockerOk || !imageOk)(
       // Defaults and boot validation, driven through the real from_env().
       expect(stdout).toContain("DEFAULT_CEILINGS [('consolidation', 4)]");
       expect(stdout).toContain("REJECTS_CEILING_ABOVE_MAX_SLOTS True");
+
+      // upstream #3016's rename, driven against the real config loader: both
+      // spellings resolve alone, and setting BOTH is a hard boot failure. That
+      // last one is what makes the emitter's alias normalisation load-bearing
+      // rather than decorative (src/setup/hindsight-perf-defaults.ts).
+      expect(stdout).toContain("ALIAS_RESERVATION 3");
+      expect(stdout).toContain("CANONICAL_RESERVATION 3");
+      expect(stdout).toContain("REJECTS_BOTH_SLOT_SPELLINGS True");
+      expect(stdout).toContain("BOTH_SPELLINGS_ERROR_NAMES_CONFLICT True");
       expect(stdout).toContain("REJECTS_CEILING_BELOW_RESERVATION True");
       expect(stdout).toContain("REJECTS_ZERO_CEILING True");
       // An operator can switch the default cap off without rebuilding.

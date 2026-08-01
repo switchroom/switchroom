@@ -27,6 +27,9 @@ import {
   SYNTHESIZED_TOOL_NAMES,
   guardAndClampToolCall,
   DEFAULT_RECALL_MAX_TOKENS,
+  isReflectToolCallFailure,
+  REFLECT_TOOL_CALL_RETRIES,
+  REFLECT_NO_TOOL_CALL_SIGNATURE,
   type ShimOptions,
 } from "../src/cli/hindsight-mcp-shim.js";
 
@@ -63,6 +66,15 @@ async function startMockBackend(
     sse?: boolean;
     /** Never answer tools/call — request is DELIVERED but hangs (slow backend). */
     hangToolsCall?: boolean;
+    /**
+     * Override the tools/call answer per attempt. `callIndex` is 1-based over
+     * tools/call requests only. Return undefined to fall through to the
+     * default success payload.
+     */
+    onToolsCall?: (
+      callIndex: number,
+      name?: string,
+    ) => { result?: unknown; error?: unknown } | undefined;
   } = {},
 ): Promise<MockBackend> {
   const tools = opts.tools ?? [
@@ -114,8 +126,20 @@ async function startMockBackend(
         case "tools/list":
           reply({ tools });
           return;
-        case "tools/call":
+        case "tools/call": {
           if (opts.hangToolsCall) return; // delivered, never answered
+          const callIndex = requests.filter(
+            (r) => r.method === "tools/call",
+          ).length;
+          const custom = opts.onToolsCall?.(callIndex, msg.params?.name);
+          if (custom) {
+            res.writeHead(200, {
+              "content-type": "application/json",
+              "mcp-session-id": "sess-1",
+            });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...custom }));
+            return;
+          }
           reply({
             content: [
               { type: "text", text: `called:${msg.params?.name}` },
@@ -123,6 +147,7 @@ async function startMockBackend(
             isError: false,
           });
           return;
+        }
         default:
           reply({});
       }
@@ -736,5 +761,143 @@ describe("tools/call clamp + rejection through the live shim", () => {
     expect(result.content[0].text).toContain("max_tokens");
     // The silent-drop is prevented: no tools/call was forwarded at all.
     expect(backend.requests.some((r) => r.method === "tools/call")).toBe(false);
+  });
+});
+
+
+// ─── reflect re-roll (upstream ReflectToolCallError, hindsight v0.8.6) ─────
+
+/** Verbatim shape of upstream's ReflectToolCallError message. */
+const REFLECT_ERR =
+  "Reflect requires a tool-calling model, but litellm/gpt-oss-20b produced " +
+  "no usable tool call (the transport may not support function calling). " +
+  "Response: 'Current article ...'";
+
+describe("isReflectToolCallFailure (unit)", () => {
+  it("matches the isError tool-result shape", () => {
+    expect(
+      isReflectToolCallFailure("reflect", {
+        result: { isError: true, content: [{ type: "text", text: REFLECT_ERR }] },
+      }),
+    ).toBe(true);
+  });
+
+  it("matches the JSON-RPC protocol-error shape", () => {
+    expect(
+      isReflectToolCallFailure("reflect", {
+        error: { message: REFLECT_ERR },
+      }),
+    ).toBe(true);
+  });
+
+  it("is scoped to reflect — the same failure on a WRITE is never retried", () => {
+    // The double-execution guard's whole point: retain must not run twice.
+    expect(
+      isReflectToolCallFailure("retain", {
+        result: { isError: true, content: [{ type: "text", text: REFLECT_ERR }] },
+      }),
+    ).toBe(false);
+  });
+
+  it("does not match an unrelated reflect failure", () => {
+    expect(
+      isReflectToolCallFailure("reflect", {
+        result: { isError: true, content: [{ type: "text", text: "bank not found" }] },
+      }),
+    ).toBe(false);
+  });
+
+  it("does not match a SUCCESSFUL reflect that merely quotes the phrase", () => {
+    // isError:false — a synthesised answer discussing tool calls is an answer.
+    expect(
+      isReflectToolCallFailure("reflect", {
+        result: {
+          isError: false,
+          content: [{ type: "text", text: `the model ${REFLECT_NO_TOOL_CALL_SIGNATURE}` }],
+        },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("reflect re-roll through the live shim", () => {
+  let cacheDir: string;
+  beforeEach(() => {
+    cacheDir = mkdtempSync(join(tmpdir(), "shim-reflect-"));
+  });
+  afterEach(() => {
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  it("re-issues reflect on ReflectToolCallError and returns the retry's answer", async () => {
+    const calls: number[] = [];
+    const backend = await startMockBackend({
+      tools: [{ name: "reflect", inputSchema: { type: "object" } }],
+      onToolsCall: (i) => {
+        calls.push(i);
+        return i === 1
+          ? {
+              result: {
+                isError: true,
+                content: [{ type: "text", text: REFLECT_ERR }],
+              },
+            }
+          : undefined; // second attempt succeeds
+      },
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    const res = (await shim.handle(
+      rpc(1, "tools/call", { name: "reflect", arguments: { query: "q" } }),
+    )) as { result?: { isError?: boolean; content?: { text?: string }[] } };
+
+    expect(calls).toEqual([1, 2]); // exactly one re-roll, not more
+    expect(res.result?.isError).toBe(false);
+    expect(res.result?.content?.[0]?.text).toBe("called:reflect");
+    await backend.close();
+  });
+
+  it("gives up after REFLECT_TOOL_CALL_RETRIES and surfaces upstream's real error", async () => {
+    let n = 0;
+    const backend = await startMockBackend({
+      tools: [{ name: "reflect", inputSchema: { type: "object" } }],
+      onToolsCall: () => {
+        n++;
+        return {
+          result: { isError: true, content: [{ type: "text", text: REFLECT_ERR }] },
+        };
+      },
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    const res = (await shim.handle(
+      rpc(1, "tools/call", { name: "reflect", arguments: { query: "q" } }),
+    )) as { result?: { isError?: boolean; content?: { text?: string }[] } };
+
+    // 1 initial attempt + REFLECT_TOOL_CALL_RETRIES re-rolls, then stop.
+    expect(n).toBe(1 + REFLECT_TOOL_CALL_RETRIES);
+    expect(res.result?.isError).toBe(true);
+    // The agent sees upstream's diagnostic text, not a shim-invented one.
+    expect(res.result?.content?.[0]?.text).toContain(
+      REFLECT_NO_TOOL_CALL_SIGNATURE,
+    );
+    await backend.close();
+  });
+
+  it("never re-issues a WRITE that fails with the same message", async () => {
+    let n = 0;
+    const backend = await startMockBackend({
+      tools: [{ name: "retain", inputSchema: { type: "object" } }],
+      onToolsCall: () => {
+        n++;
+        return {
+          result: { isError: true, content: [{ type: "text", text: REFLECT_ERR }] },
+        };
+      },
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(
+      rpc(1, "tools/call", { name: "retain", arguments: { content: "x" } }),
+    );
+    expect(n).toBe(1);
+    await backend.close();
   });
 });

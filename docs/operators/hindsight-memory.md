@@ -97,6 +97,42 @@ volume. **Rolling forward is one step; rolling back is two, in this order.**
 3. Take a `pg_dump` first (see "On-demand backup" above). A downgrade is not
    guaranteed to be lossless — see the caveat below.
 
+### v0.8.6 → v0.8.5, concretely
+
+**This one is safe to roll back by repointing the digest alone** — and that is
+a statement about this single revision, not a relaxation of the rule above.
+
+0.8.6 advances the head `d7b2f8a1c934` → `c7d1e9a4b3f2`
+(`c7d1e9a4b3f2_add_archive_causal_links`) over exactly one migration, which
+does
+
+```sql
+ALTER TABLE invalidated_memory_units
+  ADD COLUMN causal_links JSONB NOT NULL DEFAULT '[]'
+```
+
+Three properties make the rollback clean, all of them checked rather than
+assumed:
+
+- **It is additive.** Nothing is dropped or retyped, so no column 0.8.5 needs
+  goes missing — the inverse of the `search_vector` situation below.
+- **0.8.5 never sees the new column.** Its archive round-trip builds the column
+  list by introspecting `memory_units` (`_memory_unit_columns`,
+  `engine/memory_engine.py:6638-6652`), and the new column is on
+  `invalidated_memory_units` — the archive table — only.
+- **The migration is metadata-only on PG 11+** (a non-volatile default is not a
+  table rewrite), so the forward step is cheap: measured at **5.5 ms** on a
+  fleet-sized bank.
+
+The alembic `downgrade` is a clean `DROP COLUMN` if you want the schema back at
+0.8.5's head exactly; it drops archived causal-link data, which 0.8.5 cannot
+read anyway.
+
+> **Do NOT generalise this.** It happens to be true of
+> `c7d1e9a4b3f2` because that revision is additive and archive-scoped. The
+> next bump's revision has to be read on its own terms — the ordered,
+> schema-first procedure above remains the default.
+
 ### v0.8.5 → v0.8.4, concretely
 
 0.8.5 advances the head `b57a7c9e0d13` → `d7b2f8a1c934` over four

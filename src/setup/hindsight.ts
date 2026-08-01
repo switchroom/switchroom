@@ -84,7 +84,7 @@ export {
   HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT,
   HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT,
   HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S,
-  HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS,
+  HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS,
   HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT,
   HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND,
 } from "./hindsight-perf-defaults.js";
@@ -643,7 +643,7 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
     // Consolidation token budget — DERIVED from the declared context window,
     // not hand-set. Batch size is the number of facts stuffed into one prompt,
     // so it is the dominant term in prompt size and therefore a context
-    // decision (see the block above HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS).
+    // decision (see the block above HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS).
     // Upstream's `consolidation_max_completion_tokens` default is None (no
     // cap at all), which is exactly the unbounded half of the overflow.
     ["HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE", String(contextBudget.consolidation.batchSize)],
@@ -715,7 +715,8 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
  * non-LLM stages (recall, embedding, db_write) and improves cross-bank
  * fairness — it does not multiply concurrent LLM calls.
  *
- * - MAX_SLOTS 1: the worker's reserved *floor* for consolidation — one bank
+ * - RESERVED_SLOTS 1: the worker's reserved *floor* for consolidation — one
+ *   bank
  *   is always guaranteed a slot. Deliberately NOT the ceiling; see
  *   {@link HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT}.
  * - LLM_PARALLELISM 2: at most two tag-groups in flight within one op.
@@ -724,7 +725,7 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
  * - LLM_BATCH_SIZE: **no longer a constant here.** Derived from the declared
  *   backend context window — see below and `hindsight-context-budget.ts`.
  *
- * MAX_SLOTS and LLM_PARALLELISM are LEFT at their throttled values. On the
+ * RESERVED_SLOTS and LLM_PARALLELISM are LEFT at their throttled values. On the
  * local-inference path they are not the binding constraint, and leaving them
  * low keeps the subscription-path ceiling intact for any operator who has NOT
  * moved consolidation off `claude-code` — still switchroom's shipped default
@@ -737,7 +738,7 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
  * fleet's shared subscription quota and **these values must go back down**:
  * `MAX_MEMORIES_PER_ROUND` to 100 and
  * {@link HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT} to 1, keeping
- * MAX_SLOTS × LLM_PARALLELISM at 2. The failure mode that justifies the
+ * RESERVED_SLOTS × LLM_PARALLELISM at 2. The failure mode that justifies the
  * throttle is recorded immediately below and has happened for real.
  *
  * ## History — why the hard throttle existed (2026-07-06 incident)

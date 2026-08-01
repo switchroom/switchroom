@@ -43,6 +43,8 @@ import {
   HINDSIGHT_PERF_DEFAULTS_UNGATED,
   HINDSIGHT_PERF_ENV_KEYS,
   HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS,
+  HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES,
+  HINDSIGHT_WORKER_SLOT_TYPES,
   HINDSIGHT_RECALL_SOURCE_COUNT,
   HINDSIGHT_RERANKER_MAX_CANDIDATES_FOR_DERIVATION,
   hindsightPerfEnv,
@@ -184,11 +186,12 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
       "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
       "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
-      "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
       "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
       "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
+      "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -236,6 +239,7 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_LLM_STRICT_SCHEMA",
       "HINDSIGHT_API_LLM_MAX_RETRIES",
+      "HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS",
     ]);
   });
 
@@ -347,7 +351,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these thirty-one keys, by name", () => {
+  it("is overridable on exactly these forty-four keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -358,12 +362,14 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
+      "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
       "HINDSIGHT_API_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_LLM_MAX_RETRIES",
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
       "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+      "HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS",
       "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
@@ -378,12 +384,26 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
       "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
+      // Both spellings of every per-type slot reservation are ACCEPTED as
+      // input (see HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES); only the
+      // canonical ..._RESERVED_SLOTS name is ever emitted.
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
+      "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS",
+      "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS",
+      "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
+      "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS",
       // Not HINDSIGHT_API_* — switchroom-patch knobs (the CE-damping and MCP
       // recall-budget rollback hatches), read by the patched modules, never
       // by upstream's config parser. Sort last.
@@ -535,7 +555,7 @@ describe("HINDSIGHT_API_WORKER_MAX_SLOTS (override-only)", () => {
     const perf = {
       env: {
         [KEY]: "16",
-        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "5",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS: "5",
         HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT: "6",
       },
       processEnv: {},
@@ -543,13 +563,13 @@ describe("HINDSIGHT_API_WORKER_MAX_SLOTS (override-only)", () => {
     startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
     const fromRun = runEnv(runArgs());
     expect(fromRun.get(KEY)).toEqual(["16"]);
-    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toEqual(["5"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toEqual(["5"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
   });
 });
 
-describe("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS (override-only)", () => {
-  const KEY = "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS";
+describe("HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS (override-only)", () => {
+  const KEY = "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS";
   const CAPS = [
     { gpu: false, localLlm: false },
     { gpu: true, localLlm: false },
@@ -619,7 +639,7 @@ describe("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS (override-only)", () => {
       env: {
         [KEY]: "2",
         HINDSIGHT_API_WORKER_MAX_SLOTS: "16",
-        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "5",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS: "5",
         HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT: "6",
       },
       processEnv: {},
@@ -628,7 +648,7 @@ describe("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS (override-only)", () => {
     const fromRun = runEnv(runArgs());
     expect(fromRun.get(KEY)).toEqual(["2"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_MAX_SLOTS")).toEqual(["16"]);
-    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toEqual(["5"]);
+    expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toEqual(["5"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
   });
 });
@@ -1769,6 +1789,156 @@ describe("run ⇄ compose parity for the performance defaults", () => {
     for (const [key, value] of expected) {
       expect(fromRun.get(key)).toEqual([value]);
       expect(fromCompose.get(key)).toEqual([value]);
+    }
+  });
+});
+
+// ─── Per-type worker slot reservations: MAX_SLOTS -> RESERVED_SLOTS ─────────
+//
+// Upstream v0.8.6 (#3016) renamed HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS to
+// ..._RESERVED_SLOTS and kept the old name as a deprecated alias. Setting BOTH
+// names for the same operation type is a HARD BOOT ValueError in the engine —
+// verified live against the pinned 0.8.6 digest — so "never emit both" is not a
+// style preference, it is the difference between a hindsight container that
+// boots and one that does not.
+//
+// These tests assert the OUTCOME (what reaches the container), not that a
+// helper was called. Each one fails on a specific, plausible implementation
+// mistake: a bare rename (drops the operator's value), a regex-based alias rule
+// (eats the unrelated global HINDSIGHT_API_WORKER_MAX_SLOTS), or emitting the
+// alias alongside the canonical name (bricks the boot).
+describe("worker slot reservation env rename (upstream #3016)", () => {
+  const CAPS = { gpu: false, localLlm: false } as const;
+
+  it("NEVER emits both spellings for the same operation type", () => {
+    // The load-bearing one. Both names present in hindsight.env is exactly the
+    // shape an operator lands on mid-migration, and it is the shape that must
+    // not be forwarded: the engine rejects it at boot.
+    for (const type of HINDSIGHT_WORKER_SLOT_TYPES) {
+      const legacy = `HINDSIGHT_API_WORKER_${type.toUpperCase()}_MAX_SLOTS`;
+      const canonical = `HINDSIGHT_API_WORKER_${type.toUpperCase()}_RESERVED_SLOTS`;
+      for (const configEnv of [
+        { [legacy]: "3", [canonical]: "7" },
+        { [canonical]: "7", [legacy]: "3" },
+        { [legacy]: "3" },
+        { [canonical]: "7" },
+      ]) {
+        const emitted = hindsightPerfEnv(CAPS, resolveHindsightPerfOverrides(configEnv, {}));
+        const names = emitted.map(([k]) => k);
+        expect(
+          names.includes(legacy),
+          `${legacy} must never be emitted (input ${JSON.stringify(configEnv)})`,
+        ).toBe(false);
+        expect(
+          names.filter((k) => k === canonical).length,
+          `${canonical} must be emitted exactly once`,
+        ).toBe(1);
+      }
+    }
+  });
+
+  it("keeps the operator's legacy value instead of silently dropping it", () => {
+    // The regression a bare rename would have shipped: this fleet's
+    // switchroom.yaml carries HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: 20.
+    // Unmanaged => resolveHindsightPerfOverrides skips it => the container runs
+    // on switchroom's default 1 while the yaml says 20.
+    const overrides = resolveHindsightPerfOverrides(
+      { HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "20" },
+      {},
+    );
+    expect(overrides.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toBe("20");
+    const emitted = new Map(hindsightPerfEnv(CAPS, overrides));
+    expect(emitted.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toBe("20");
+  });
+
+  it("prefers the canonical name when both are set, in either yaml order", () => {
+    for (const configEnv of [
+      {
+        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "3",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS: "7",
+      },
+      {
+        HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS: "7",
+        HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "3",
+      },
+    ]) {
+      const emitted = new Map(hindsightPerfEnv(CAPS, resolveHindsightPerfOverrides(configEnv, {})));
+      expect(emitted.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toBe("7");
+    }
+  });
+
+  it("does NOT alias the global HINDSIGHT_API_WORKER_MAX_SLOTS", () => {
+    // A regex on /_MAX_SLOTS$/ would rewrite the worker's TOTAL slot budget to
+    // a key upstream does not define, silently reverting the pool to its
+    // default. The alias map is keyed on the six operation types for this
+    // reason.
+    expect(HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.has("HINDSIGHT_API_WORKER_MAX_SLOTS")).toBe(false);
+    const emitted = new Map(
+      hindsightPerfEnv(CAPS, resolveHindsightPerfOverrides({ HINDSIGHT_API_WORKER_MAX_SLOTS: "16" }, {})),
+    );
+    expect(emitted.get("HINDSIGHT_API_WORKER_MAX_SLOTS")).toBe("16");
+    expect(emitted.has("HINDSIGHT_API_WORKER_RESERVED_SLOTS")).toBe(false);
+  });
+
+  it("emits the consolidation reservation under the canonical name by default", () => {
+    const emitted = new Map(hindsightPerfEnv(CAPS));
+    expect(emitted.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toBe("1");
+    expect(emitted.has("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toBe(false);
+  });
+});
+
+// ─── Keys that replaced retired image patches ──────────────────────────────
+describe("keys that replaced retired Dockerfile patches (v0.8.6)", () => {
+  it("pins the graph seed floor rather than inheriting upstream's default", () => {
+    // The retired #2968 carry hardcoded 0.3 and asserted upstream had no config
+    // key for it. v0.8.6 adds the key, so the pin has to move here or the value
+    // becomes "whatever the next image bump decides".
+    const emitted = new Map(hindsightPerfEnv({ gpu: false, localLlm: false }));
+    expect(emitted.get("HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY")).toBe("0.3");
+  });
+
+  it("disables the maxItems schema hint on a local (GBNF) backend only", () => {
+    // This is the data-egress control that replaced the maxItems grammar patch:
+    // an uncompilable grammar made LiteLLM fall back to a METERED provider with
+    // verbatim private corpus text. A hosted structured-output backend has no
+    // GBNF step, so it keeps upstream's default.
+    const local = new Map(hindsightPerfEnv({ gpu: false, localLlm: true }));
+    expect(local.get("HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS")).toBe("false");
+    const hosted = new Map(hindsightPerfEnv({ gpu: false, localLlm: false }));
+    expect(hosted.has("HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS")).toBe(false);
+  });
+});
+
+describe("newly adopted v0.8.6 keys", () => {
+  /**
+   * The reachability half, which is the whole point of adopting an
+   * override-only key: an unmanaged `hindsight.env` line is DISCARDED silently
+   * (no error, no warning), so before this adoption an operator raising the
+   * retain wall timeout in yaml would have believed they had changed something
+   * they had not.
+   */
+  it("makes HINDSIGHT_API_RETAIN_WALL_TIMEOUT reachable from switchroom.yaml", () => {
+    expect(
+      resolveHindsightPerfOverrides({
+        HINDSIGHT_API_RETAIN_WALL_TIMEOUT: "7200",
+      }).get("HINDSIGHT_API_RETAIN_WALL_TIMEOUT"),
+    ).toBe("7200");
+  });
+
+  it("does NOT bake a default for it — upstream's 3600 stands unless overridden", () => {
+    // Reflect's counterpart IS defaulted (600s, chosen against measured local-LLM
+    // latency). Retain's has no measurement behind it, so emitting a number here
+    // would be a second copy of upstream's opinion, free to drift from it.
+    for (const opts of [
+      { gpu: false, localLlm: false },
+      { gpu: false, localLlm: true },
+      { gpu: true, localLlm: true },
+    ]) {
+      const emitted = new Map(hindsightPerfEnv(opts));
+      expect(emitted.has("HINDSIGHT_API_RETAIN_WALL_TIMEOUT")).toBe(false);
+      // The asymmetry is deliberate, not an oversight — pin the contrast so
+      // "we forgot retain" and "we decided about retain" stay distinguishable.
+      expect(emitted.get("HINDSIGHT_API_REFLECT_WALL_TIMEOUT")).toBe("600");
     }
   });
 });
