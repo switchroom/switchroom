@@ -706,6 +706,11 @@ class Backfill:
             "sessions_gap_incomplete": 0,
             "slices_gap_filled": 0,
             "slices_gap_present": 0,
+            # Convergence visibility (#3291 self-heal): sessions that STILL are
+            # not fully recovered after this run (a restore or gap-completion
+            # POST failed). Non-zero ⇒ another run is needed; surfaced so a
+            # non-converging session can never be a SILENT permanent trap.
+            "sessions_incomplete": 0,
             "turns_recovered": 0,
             "posts_ok": 0,
             "posts_failed": 0,
@@ -949,8 +954,26 @@ class Backfill:
                 self.progress.record(agent, session, "done", slices=total, turns=n_turns)
             else:
                 session_entry["action"] = "restore_failed"
+                ar["sessions_incomplete"] += 1
                 self.progress.record(agent, session, "failed")
             ar["sessions"].append(session_entry)
+
+        # Convergence visibility: if any session is still short after this run,
+        # tell the operator plainly (and how to converge it) so a session that
+        # keeps failing can never be a silent permanent trap. The mechanism
+        # guarantees forward progress — each re-run posts only what is still
+        # missing — but a persistently-unpostable session needs a human.
+        if self.commit and ar["sessions_incomplete"] > 0:
+            stuck = [s.get("session") for s in ar["sessions"]
+                     if s.get("action") in ("restore_failed", "gap_incomplete")]
+            print(
+                f"[Hindsight] backfill(from-logs): {agent} — "
+                f"{ar['sessions_incomplete']} session(s) still INCOMPLETE after this "
+                f"run (POST failures): {', '.join(str(s) for s in stuck)}. Re-run "
+                f"`--from-logs --commit --agent {agent}` to fill the remaining "
+                f"slices (gap-completion posts ONLY what is still missing).",
+                file=sys.stderr,
+            )
 
     def _gap_complete_session(self, agent, session, bank_id, path, info, ar) -> None:
         """Fill the missing slices of a backfill-sole-writer session left
@@ -1042,6 +1065,7 @@ class Backfill:
             # gap-completion path (never the membership skip) and fills whatever
             # remains. Convergent: each run strictly reduces the missing set.
             ar["sessions_gap_incomplete"] += 1
+            ar["sessions_incomplete"] += 1
             session_entry["action"] = "gap_incomplete"
             self.progress.record(agent, session, "failed")
         ar["sessions"].append(session_entry)
@@ -1062,6 +1086,11 @@ class Backfill:
             "sessions_already_done": 0,
             "sessions_restored": 0,
             "slices_restored": 0,
+            "sessions_gap_completed": 0,
+            "sessions_gap_incomplete": 0,
+            "slices_gap_filled": 0,
+            "slices_gap_present": 0,
+            "sessions_incomplete": 0,
             "turns_recovered": 0,
             "posts_ok": 0,
             "posts_failed": 0,
@@ -1076,6 +1105,8 @@ class Backfill:
                 "unmatched_turns", "sessions_has_documents", "sessions_total_loss",
                 "sessions_membership_error", "sessions_active_skipped",
                 "sessions_already_done", "sessions_restored", "slices_restored",
+                "sessions_gap_completed", "sessions_gap_incomplete",
+                "slices_gap_filled", "slices_gap_present", "sessions_incomplete",
                 "turns_recovered", "posts_ok", "posts_failed",
             ):
                 roll[k] += ar.get(k, 0)
@@ -1132,11 +1163,15 @@ def format_report_from_logs(report: dict) -> str:
             f"already_done={ar['sessions_already_done']} "
             f"restored={ar['sessions_restored']} "
             f"slices_restored={ar['slices_restored']} "
+            f"gap_completed={ar.get('sessions_gap_completed', 0)} "
+            f"gap_filled={ar.get('slices_gap_filled', 0)} "
+            f"incomplete={ar.get('sessions_incomplete', 0)} "
             f"turns={ar['turns_recovered']} "
             f"posts_ok={ar['posts_ok']} posts_failed={ar['posts_failed']}"
         )
         for s in ar.get("sessions", []):
-            if s.get("class") in ("total_loss", "membership_error", "ambiguous"):
+            if s.get("class") in ("total_loss", "gap_completion",
+                                  "membership_error", "ambiguous"):
                 lines.append(
                     f"      - {s.get('session', s.get('turn_key'))} [{s.get('class')}] "
                     f"join={s.get('join', '-')} "
@@ -1154,9 +1189,21 @@ def format_report_from_logs(report: dict) -> str:
         f"membership_err={roll.get('sessions_membership_error', 0)} "
         f"restored={roll.get('sessions_restored', 0)} "
         f"slices_restored={roll.get('slices_restored', 0)} "
+        f"gap_completed={roll.get('sessions_gap_completed', 0)} "
+        f"gap_filled={roll.get('slices_gap_filled', 0)} "
+        f"incomplete={roll.get('sessions_incomplete', 0)} "
         f"turns_would_recover={roll.get('turns_recovered', 0)} "
         f"posts_ok={roll.get('posts_ok', 0)} posts_failed={roll.get('posts_failed', 0)}"
     )
+    incomplete = roll.get("sessions_incomplete", 0)
+    if incomplete:
+        lines.append(
+            f"  ⚠ CONVERGENCE: {incomplete} session(s) still INCOMPLETE (a POST "
+            f"failed). Re-run `--from-logs --commit` — gap-completion posts ONLY "
+            f"the still-missing slices, so each run strictly reduces the gap. A "
+            f"count that never reaches 0 across runs means a persistently-"
+            f"unpostable session that needs a human."
+        )
     lines.append("  NOTE: recovers only ZERO-document (total-loss) sessions. "
                  "Partial-tail recovery within a populated session is OUT OF SCOPE "
                  "on legacy epoch-ms banks (needs the -r{uuid} id scheme deployed).")
