@@ -22,19 +22,37 @@
  * blocks on it, and a gateway that predates this reply simply times out
  * hostd-side and behaves exactly as before.
  *
- * Why this call is tagged `priorityClass: 'critical'`
- * ---------------------------------------------------
- * The wiring in gateway.ts tags the `rollout-status-edit` `robustApiCall`
- * EXPLICITLY rather than inheriting the untagged default
- * (`UNTAGGED_SEND_CLASS`, today `'critical'` — never shed). The handler below
- * infers success from the ABSENCE of a throw, and a shed send does not throw:
- * the send gate returns `SEND_GATE_SHED` without ever calling Telegram. So if
- * a future change to the untagged default made this call sheddable, this
- * handler would reply `ok:true` for an edit that never happened, and hostd
- * would record the operator's card as live and current while it sat frozen —
- * the same silent-inertness class of bug as the dropped reply that
- * tests/rollout-narration-edit-socket.test.ts now pins. Tagging the class at
- * the call site makes that impossible to change by accident.
+ * Why this call opts out of TWO swallows
+ * --------------------------------------
+ * This handler infers edit success from the ABSENCE of a throw. That inference
+ * is only sound if every "the edit did not land" path actually throws — and
+ * the production stack has two layers that RESOLVE instead. Both are opted out
+ * of explicitly at the `robustApiCall` call site in gateway.ts, because either
+ * one alone is enough to make `gone` — the entire reason this module exists —
+ * unreachable in production.
+ *
+ *  1. `priorityClass: 'critical'` — never inherit the untagged default
+ *     (`UNTAGGED_SEND_CLASS`, today `'critical'`). A SHED send does not throw:
+ *     the send gate returns `SEND_GATE_SHED` without ever calling Telegram. If
+ *     a future change to that default made this call sheddable, the handler
+ *     would reply `ok:true` for an edit that never happened.
+ *
+ *  2. `rethrowBenign400: true` — the retry policy's benign-400 swallow
+ *     (`classifyBenignTelegram400`, retry-api-call.ts) treats
+ *     `400 "message to edit not found"` as a non-event and resolves
+ *     `undefined`. That description is EXACTLY the deleted-card case, i.e. the
+ *     primary trigger for `gone`. Without the opt-out the seeded-resume
+ *     scenario this module was written for — carried `narration_message_id`,
+ *     operator deleted the card — threw nothing at all, so the handler replied
+ *     `ok:true` and hostd recorded a frozen card as live. That is WORSE than
+ *     pre-fix: hostd positively believes the card is fine.
+ *
+ * Both failures are silent by construction — green tests over an inert
+ * feature — so neither is pinned by inspection alone.
+ * `tests/rollout-status-edit-retry-policy.test.ts` drives the REAL retry
+ * policy + send gate with a REAL `GrammyError` and asserts a deleted card
+ * produces a re-post; `tests/rollout-narration-edit-socket.test.ts` pins the
+ * transport that carries the reply back to hostd.
  */
 
 import type {
@@ -96,7 +114,16 @@ export interface RolloutStatusEditDeps {
   selfAgentName: string | undefined
   /** Operator chat (`allowFrom[0]`), or undefined when access is unconfigured. */
   operatorChatId: () => string | number | undefined
-  /** Perform the edit. MUST already be wrapped in the retry policy. */
+  /**
+   * Perform the edit.
+   *
+   * CONTRACT — resolve IFF the edit landed, reject otherwise. This handler has
+   * no other channel: it reads success from the absence of a throw. So the
+   * implementation must be wrapped in the retry policy AND must opt out of
+   * every layer that turns a failed edit into a resolved promise —
+   * `priorityClass: 'critical'` (no shed) and `rethrowBenign400: true` (no
+   * benign-400 swallow). See the "TWO swallows" note at the top of this file.
+   */
   editMessage: (chatId: string | number, messageId: number, text: string) => Promise<unknown>
   log: (line: string) => void
 }

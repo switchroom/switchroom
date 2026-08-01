@@ -92,6 +92,17 @@ describe("onRolloutStatusEdit — gateway handler invariants", () => {
     expect(handler).toMatch(/robustApiCall\(/);
     expect(handler).toMatch(/bot\.api\.editMessageText\(chatId, messageId/);
   });
+  // Routing through robustApiCall is necessary but NOT sufficient, and pinning
+  // only that enshrines the bug it hides: the retry policy's benign-400 swallow
+  // resolves `400 "message to edit not found"` instead of throwing, and this
+  // handler reads success from the absence of a throw. Both opt-outs are what
+  // make the wrapped path safe here, so both are pinned. The BEHAVIOUR lives in
+  // tests/rollout-status-edit-retry-policy.test.ts (real retry policy, real
+  // GrammyError, asserts the re-post); this is the structural backstop.
+  it("opts out of BOTH inertness layers — send-gate shed and benign-400 swallow", () => {
+    expect(handler).toMatch(/priorityClass: 'critical'/);
+    expect(handler).toMatch(/rethrowBenign400: true/);
+  });
   it("reports the edit outcome back to hostd (#4065 — no more edit-into-void)", () => {
     expect(editModule).toMatch(/rollout_status_edited/);
     expect(editModule).toMatch(/gone: cls === 'gone'/);

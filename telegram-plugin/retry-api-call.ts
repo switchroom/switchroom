@@ -24,6 +24,11 @@
  *   | GrammyError 400 "thread not found" (w/ opts)  | throw `THREAD_NOT_FOUND` wrapper          |
  *   | Network error (fetch failed / ECONN…)         | exponential backoff retry, 3 attempts     |
  *   | Anything else                                 | rethrow immediately                       |
+ *
+ * The three "swallow" rows are the DEFAULT, not the law: a call site whose
+ * contract is "did the target message survive?" sets `rethrowBenign400: true`
+ * and gets the original `GrammyError` instead, so it can classify the failure
+ * itself. See that option's docblock for the #4065 inertness bug it exists for.
  */
 
 import { GrammyError } from 'grammy'
@@ -90,6 +95,42 @@ export interface RetryCallOpts {
    * the authoritative statement.
    */
   priorityClass?: 'critical' | 'useful' | 'cosmetic'
+  /**
+   * Opt OUT of the benign-400 swallow for this one call (#4065 follow-up).
+   *
+   * By default `retryApiCall` treats the benign 400s
+   * (`classifyBenignTelegram400`: not-modified / message-to-edit-not-found /
+   * message-to-delete-not-found) as non-events and RESOLVES `undefined`. That
+   * is right for fire-and-forget card repaints, and wrong — silently, and in
+   * the worst direction — for any caller whose contract is "tell me whether
+   * the target message still exists".
+   *
+   * The concrete failure this exists for: the rollout narration card's edit
+   * relay (`gateway/rollout-status-edit.ts`) infers edit success from the
+   * ABSENCE of a throw and reports it to hostd. A seeded-resume narrator
+   * holding a carried `narration_message_id` for a card the operator deleted
+   * gets `400 "message to edit not found"` — which the default swallow turns
+   * into a resolved promise, so the handler replies `{ok:true}` and hostd
+   * records a frozen card as live and never re-posts. The `gone` signal — the
+   * whole reason that feature exists — is unreachable on the production path
+   * for its primary trigger. Classification has to happen where the error
+   * still exists, so the call site asks for the error instead of a
+   * lie-shaped success.
+   *
+   * When true, a benign 400 is RETHROWN unchanged (still `GrammyError`, with
+   * its `description` intact) after `observer.onBenign` fires, so the caller
+   * classifies it itself. Everything else — 429 handling, the flood breaker,
+   * network retries, `THREAD_NOT_FOUND` — is untouched. Default `false`:
+   * every existing call site keeps today's exact behaviour.
+   *
+   * Note this covers BOTH benign kinds deliberately. `not modified` also
+   * resolves `undefined` today, which coincidentally matches the intended
+   * semantics for an edit relay (the live card already carries this body =
+   * success) — but "coincidentally right" is not a contract. Rethrowing both
+   * puts ONE classifier in charge (the caller's), so the two kinds can never
+   * drift apart on the swallow boundary.
+   */
+  rethrowBenign400?: boolean
 }
 
 /**
@@ -133,7 +174,12 @@ export interface RetryObserver {
   onRetry?(info: { attempt: number; reason: 'flood_wait' | 'network'; delayMs: number }): void
   /** Fires when max retries is reached and the wrapper gives up. */
   onGiveUp?(info: { attempts: number; error: unknown }): void
-  /** Fires for each benign error we swallowed (not-modified, not-found). */
+  /**
+   * Fires for each benign 400 we CLASSIFIED (not-modified, not-found) —
+   * whether it was then swallowed (the default) or rethrown because the call
+   * set `rethrowBenign400`. The Telegram-side event is the same either way, so
+   * counting it must not depend on the disposition.
+   */
   onBenign?(info: { kind: BenignTelegram400Kind }): void
 }
 
@@ -444,6 +490,11 @@ export function createRetryApiCall(
           : null
         if (benignKind !== null) {
           observer?.onBenign?.({ kind: benignKind })
+          // #4065 follow-up: a caller whose contract is "does the target
+          // message still exist?" opts out of the swallow, because a resolved
+          // promise is indistinguishable from a landed edit. Rethrow the
+          // ORIGINAL error so the caller classifies off `description`.
+          if (opts?.rethrowBenign400) throw err
           return undefined as unknown as T
         }
 

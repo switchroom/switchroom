@@ -11460,10 +11460,12 @@ if (isGatewayMain) ipcServer = createIpcServer({
             () =>
               // allow-raw-bot-api: in-place edit of the ordinary status message.
               bot.api.editMessageText(chatId, messageId, richMessage(text), {}),
-            // priorityClass EXPLICIT, never inherited from the untagged
-            // default — a shed edit would reply a false ok:true. See the
-            // "Why this call is tagged critical" note in rollout-status-edit.ts.
-            { chat_id: String(chatId), verb: 'rollout-status-edit', priorityClass: 'critical' },
+            // BOTH opt-outs are load-bearing — see "TWO swallows" in
+            // rollout-status-edit.ts. A SHED edit and a SWALLOWED benign
+            // `400 message to edit not found` each resolve WITHOUT throwing,
+            // and the handler reads success from the absence of a throw.
+            { chat_id: String(chatId), verb: 'rollout-status-edit',
+              priorityClass: 'critical', rethrowBenign400: true },
           ),
         log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
       },
