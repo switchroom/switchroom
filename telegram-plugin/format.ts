@@ -782,8 +782,16 @@ function isFullyBolded(fragment: string): boolean {
  * treated as a legitimate pseudo-heading (`**Section**`) rather than an
  * over-bolded paragraph. Single source of truth for BOTH the per-block rule
  * and the global-ratio heading exemption.
+ *
+ * 64, not 48: at 48 a legitimate long section label
+ * (`**Deployment status across all three regions:**` — 50 chars with markers)
+ * was read as an over-bolded paragraph and flattened. 64 still bounds the
+ * exemption to something that reads as a label on a phone; the alternative of
+ * exempting any fully-bold line ending in `:` regardless of length was
+ * rejected because an arbitrarily long bolded paragraph that happens to end
+ * in a colon would then escape the tripwire entirely.
  */
-const PSEUDO_HEADING_MAX_CHARS = 48
+const PSEUDO_HEADING_MAX_CHARS = 64
 
 /**
  * True when a blank-line-delimited block is a single-line pseudo-heading: one
@@ -828,7 +836,10 @@ function unbold(fragment: string): string {
  *     encourages) and is NOT stripped — neither by the per-block rule NOR by
  *     the global-ratio rule (it still counts toward the global ratio, so a
  *     genuinely over-bolded message still trips, but its section headings
- *     survive instead of the whole reply going plain).
+ *     survive instead of the whole reply going plain). The one exception:
+ *     when EVERY block of the message is such a heading there is no body to
+ *     preserve contrast against, so the global rule strips them all rather
+ *     than leaving a 100%-bold message untouched.
  *   - A list with any non-fully-bolded item is left alone.
  *
  * Code spans/fences are masked (maskCodeRegions) and never counted or
@@ -862,8 +873,17 @@ export function stripExcessBold(
     // Clearly over-bolded — strip every bold span, keeping the text, EXCEPT
     // standalone short pseudo-heading blocks (`**Section**`), which stay bold
     // so a bold-dense digest keeps its section headings.
+    //
+    // The exemption only makes sense when there is body text for the headings
+    // to stand out FROM. A message whose every block is a pseudo-heading has
+    // no body: exempting all of them leaves a 100%-bold message untouched and
+    // unlogged. In that case the exemption is dropped and the whole message is
+    // stripped, which is what the ratio rule says.
+    const contentBlocks = blocks.filter((b) => b.trim() !== '')
+    const allHeadings =
+      contentBlocks.length > 0 && contentBlocks.every(isPseudoHeadingBlock)
     const rebuilt = blocks.map((block) =>
-      isPseudoHeadingBlock(block) ? block : unbold(block),
+      !allHeadings && isPseudoHeadingBlock(block) ? block : unbold(block),
     )
     const out = rejoinBlocks(masked, rebuilt)
     if (out !== masked) onStrip?.({ rule: 'global', ratio })
