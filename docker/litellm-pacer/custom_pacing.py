@@ -35,6 +35,17 @@ LiteLLM v3's per-key reject-based limiter):
     PACE_LEASE_TTL_S — no leaked permanent slots).
   * Bounded global RATE: rolling 60s cap (PACE_MAX_RPM) + rolling 1s burst
     smoother (PACE_MAX_RPS).
+  * EXPLICIT LEASE RELEASE on the passthrough path. litellm exposes no
+    callback that fires on a passthrough stream, and the one
+    post_call_success_hook call site on the non-streaming passthrough path is
+    nested under a guardrails condition that is false with no passthrough
+    guardrails configured. So every passthrough request used to leak its
+    lease and only age out by TTL, which made the concurrency counter
+    meaningless and admission control fail-open in practice. Two narrow,
+    idempotent, install-once wrappers fix that — see
+    _install_streaming_release_patch / _install_nonstreaming_release_patch at
+    the bottom of this file. The lease id rides on the per-request logging
+    object because metadata is popped off the body before the upstream call.
   * ADAPTIVE 429 cooldown: async_post_call_failure_hook watches for upstream
     429s carrying Retry-After and parks a fleet-wide `pace:cooldown_until`
     in Redis. While cooling, pre_call paces harder — honoring Anthropic's
@@ -66,6 +77,7 @@ import os
 import random
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Optional
 
 from litellm._logging import verbose_proxy_logger
@@ -136,8 +148,10 @@ class _Cfg:
     # Hard ceiling on how long a single request will wait in the pacer
     # before failing open and proceeding regardless.
     MAX_WAIT_S = _float_env("PACE_MAX_WAIT_S", 20.0)
-    # A concurrency lease auto-expires after this many seconds so a missed
-    # release (crash / streaming edge) cannot permanently consume a slot.
+    # A concurrency lease auto-expires after this many seconds. This is a
+    # BACKSTOP ONLY — since the streaming/non-streaming release patches landed
+    # the explicit release is the load-bearing mechanism, and the TTL only
+    # covers a proxy crash mid-stream. Do not remove it.
     LEASE_TTL_S = _int_env("PACE_LEASE_TTL_S", 300)
     # Cap on how long a Retry-After-driven cooldown can park the fleet.
     MAX_COOLDOWN_S = _float_env("PACE_MAX_COOLDOWN_S", 60.0)
@@ -253,11 +267,37 @@ return 1
 """
 
 
+# Attribute/key name the lease id is pinned under, on every carrier that can
+# survive to a terminal path (request metadata, litellm_params.metadata, and
+# the per-request LiteLLMLoggingObj).
+_PACE_ATTR = "_pace_id"
+# Bound on the per-worker already-released LRU. Purely a Redis-round-trip
+# saver — ZREM is idempotent on its own — so any bound works; this one keeps
+# the dict trivially small for a long-lived proxy worker.
+_RELEASED_LRU_MAX = 4096
+
+
 class FleetPacer(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
         self._redis = None
         self._redis_init_failed = False
+        # Bounded LRU of already-released lease ids, so the several terminal
+        # paths that can fire for one request (streaming wrapper, success
+        # handler, failure hook) don't each pay a Redis round-trip.
+        self._released: "OrderedDict[str, None]" = OrderedDict()
+        # Strong refs to fire-and-forget release tasks so the event loop
+        # cannot GC them mid-flight.
+        self._pending_tasks: set = set()
+
+    # ----- idempotency -------------------------------------------------
+    def _already_released(self, pace_id: str) -> bool:
+        if pace_id in self._released:
+            return True
+        self._released[pace_id] = None
+        while len(self._released) > _RELEASED_LRU_MAX:
+            self._released.popitem(last=False)
+        return False
 
     # ----- redis -------------------------------------------------------
     async def _get_redis(self):
@@ -340,7 +380,12 @@ class FleetPacer(CustomLogger):
             return True
 
     async def _release(self, pace_id: Optional[str]) -> None:
+        """Release a concurrency lease. IDEMPOTENT: ZREM of an absent member
+        is a no-op in Redis, and the per-worker LRU short-circuits repeat
+        calls, so it is safe for several terminal paths to race here."""
         if not pace_id:
+            return
+        if self._already_released(pace_id):
             return
         r = await self._get_redis()
         if r is None:
@@ -349,6 +394,22 @@ class FleetPacer(CustomLogger):
             await r.zrem(_INFLIGHT_KEY, pace_id)
         except Exception:
             pass
+
+    def _release_soon(self, pace_id: Optional[str]) -> None:
+        """Schedule a release without blocking the caller. Used from the
+        streaming wrapper's `finally`, which may be running under
+        GeneratorExit during a client disconnect — awaiting there is legal,
+        but stream teardown must never hang on Redis."""
+        if not pace_id:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._release(pace_id))
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
+        except Exception as e:  # no running loop / loop closing
+            verbose_proxy_logger.debug(
+                "custom_pacing: release_soon failed (TTL backstop): %s", e
+            )
 
     # ----- gating ------------------------------------------------------
     @staticmethod
@@ -460,23 +521,77 @@ class FleetPacer(CustomLogger):
         except Exception as e:
             verbose_proxy_logger.debug("custom_pacing: pre_call error (fail open): %s", e)
 
-        # Stash id so post hooks can release the concurrency lease. Even if
-        # this is lost, the lease self-heals via LEASE_TTL_S.
+        # Stash id so terminal paths can release the concurrency lease. Even
+        # if every carrier is lost, the lease self-heals via LEASE_TTL_S.
         if admitted:
-            try:
-                meta = data.setdefault("metadata", {})
-                if isinstance(meta, dict):
-                    meta["_pace_id"] = pace_id
-            except Exception:
-                pass
+            self._stash_pace_id(data, pace_id)
         return data
 
-    def _extract_pace_id(self, data: Any) -> Optional[str]:
+    @staticmethod
+    def _stash_pace_id(data: Any, pace_id: str) -> None:
+        """Pin the lease id on every carrier that can survive to a terminal
+        path.
+
+        `data["metadata"]` alone is NOT enough: litellm's
+        `_init_kwargs_for_pass_through_endpoint` pops every key in
+        `all_litellm_params` (which includes "metadata") off the parsed body
+        before the upstream call, so by the time a post hook runs the key is
+        gone from the body — it survives only INTO
+        `kwargs["litellm_params"]["metadata"]`, which the failure path
+        re-attaches. The per-request logging object is the durable handle: it
+        is passed BY REFERENCE into the streaming chunk processor, which is
+        the only terminal point the passthrough streaming path has.
+        """
+        if not isinstance(data, dict):
+            return
         try:
-            if isinstance(data, dict):
-                meta = data.get("metadata")
-                if isinstance(meta, dict):
-                    return meta.get("_pace_id")
+            meta = data.setdefault("metadata", {})
+            if isinstance(meta, dict):
+                meta[_PACE_ATTR] = pace_id
+        except Exception:
+            pass
+        try:
+            lobj = data.get("litellm_logging_obj")
+            if lobj is not None:
+                setattr(lobj, _PACE_ATTR, pace_id)
+                mcd = getattr(lobj, "model_call_details", None)
+                if isinstance(mcd, dict):
+                    mcd[_PACE_ATTR] = pace_id
+        except Exception:
+            pass
+
+    @staticmethod
+    def _pace_id_from_logging_obj(lobj: Any) -> Optional[str]:
+        if lobj is None:
+            return None
+        try:
+            pid = getattr(lobj, _PACE_ATTR, None)
+            if isinstance(pid, str):
+                return pid
+            mcd = getattr(lobj, "model_call_details", None)
+            if isinstance(mcd, dict):
+                pid = mcd.get(_PACE_ATTR)
+                if isinstance(pid, str):
+                    return pid
+        except Exception:
+            pass
+        return None
+
+    def _extract_pace_id(self, data: Any) -> Optional[str]:
+        """Best-effort recovery of the lease id from whatever shape of
+        request payload a terminal hook happens to hand us."""
+        try:
+            if not isinstance(data, dict):
+                return None
+            meta = data.get("metadata")
+            if isinstance(meta, dict) and isinstance(meta.get(_PACE_ATTR), str):
+                return meta[_PACE_ATTR]
+            lp = data.get("litellm_params")
+            if isinstance(lp, dict):
+                lp_meta = lp.get("metadata")
+                if isinstance(lp_meta, dict) and isinstance(lp_meta.get(_PACE_ATTR), str):
+                    return lp_meta[_PACE_ATTR]
+            return self._pace_id_from_logging_obj(data.get("litellm_logging_obj"))
         except Exception:
             pass
         return None
@@ -544,3 +659,201 @@ class FleetPacer(CustomLogger):
 # LiteLLM loads the callback by importing this module and resolving the
 # dotted path "custom_pacing.pacer_instance" to this singleton.
 pacer_instance = FleetPacer()
+
+
+# ---------------------------------------------------------------------------
+# Streaming lease release for the passthrough path.
+#
+# WHY A PATCH AND NOT A HOOK: litellm v1.91.0 offers no callback on the
+# passthrough streaming path. Verified in the installed package:
+#   * pass_through_endpoints.py:1075 and :1134 both `return StreamingResponse(
+#     PassThroughStreamingHandler.chunk_processor(...))` — the
+#     post_call_success_hook call at :1175 is unreachable for streams.
+#   * async_post_call_streaming_hook / async_post_call_streaming_iterator_hook
+#     are only ever invoked from proxy/common_request_processing.py:2465 and
+#     :2476, i.e. the managed /chat/completions + /v1/messages request
+#     processor — never from the passthrough router.
+# chunk_processor's own `finally:` is litellm's own chosen terminal point for
+# the same reason (it is where they schedule spend logging so a client
+# disconnect still records usage). We attach the lease release to that same
+# guaranteed point. Claude Code always streams, so before this every agent
+# request leaked its lease and only ever aged out by TTL.
+#
+# Terminal outcomes covered by the wrapper's `finally`:
+#   success (generator exhausts) / client disconnect (GeneratorExit raised
+#   into the generator by starlette) / upstream or parse exception.
+# Not covered: upstream failing BEFORE the StreamingResponse is constructed
+# (raise_for_status at :1057/:1126) — that raises out to the outer handler,
+# which calls post_call_failure_hook at :1367 with a payload carrying
+# litellm_logging_obj, so async_post_call_failure_hook releases it. And a
+# proxy crash mid-stream, which is what LEASE_TTL_S remains a backstop for.
+#
+# The patch is install-once, fails open (any error leaves litellm untouched),
+# and never changes the bytes yielded to the client.
+# ---------------------------------------------------------------------------
+
+_PATCH_FLAG = "_switchroom_pace_patched"
+
+
+def _install_streaming_release_patch() -> bool:
+    try:
+        from litellm.proxy.pass_through_endpoints.streaming_handler import (
+            PassThroughStreamingHandler,
+        )
+    except Exception as e:  # pragma: no cover - version drift
+        verbose_proxy_logger.error(
+            "custom_pacing: cannot import PassThroughStreamingHandler — streaming "
+            "leases will only expire by TTL (%ss). Error: %s",
+            _Cfg.LEASE_TTL_S,
+            e,
+        )
+        return False
+
+    original = getattr(PassThroughStreamingHandler, "chunk_processor", None)
+    if original is None:
+        verbose_proxy_logger.error(
+            "custom_pacing: PassThroughStreamingHandler.chunk_processor missing — "
+            "streaming leases will only expire by TTL (%ss).",
+            _Cfg.LEASE_TTL_S,
+        )
+        return False
+    if getattr(original, _PATCH_FLAG, False):
+        return True  # already installed (module re-imported)
+
+    async def _paced_chunk_processor(*args, **kwargs):
+        pace_id: Optional[str] = None
+        try:
+            # Call site uses keywords exclusively (pass_through_endpoints.py
+            # :1076-1084, :1135-1143); positional is handled defensively.
+            lobj = kwargs.get("litellm_logging_obj")
+            if lobj is None and len(args) >= 3:
+                lobj = args[2]
+            pace_id = FleetPacer._pace_id_from_logging_obj(lobj)
+            if pace_id is None:
+                body = kwargs.get("request_body")
+                if body is None and len(args) >= 2:
+                    body = args[1]
+                pace_id = pacer_instance._extract_pace_id(body)
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "custom_pacing: stream pace_id lookup failed: %s", e
+            )
+
+        try:
+            async for chunk in original(*args, **kwargs):
+                yield chunk
+        finally:
+            # Runs on success, GeneratorExit (client disconnect) and
+            # exception. Scheduled rather than awaited so stream teardown
+            # never blocks on Redis; release itself is idempotent.
+            try:
+                pacer_instance._release_soon(pace_id)
+            except Exception:
+                pass
+
+    setattr(_paced_chunk_processor, _PATCH_FLAG, True)
+    setattr(_paced_chunk_processor, "__wrapped__", original)
+    PassThroughStreamingHandler.chunk_processor = staticmethod(_paced_chunk_processor)
+    verbose_proxy_logger.info(
+        "custom_pacing: streaming lease-release patch installed on "
+        "PassThroughStreamingHandler.chunk_processor"
+    )
+    return True
+
+
+def _install_streaming_release_patch_safe() -> bool:
+    """Import-time invocation must be TOTAL: this module is imported by the
+    proxy at startup, so an unexpected throw in here (a litellm layout change,
+    a logger without .error) would take the whole proxy down rather than
+    degrade to the TTL backstop."""
+    try:
+        return _install_streaming_release_patch()
+    except Exception:
+        return False
+
+
+_STREAMING_PATCH_OK = _install_streaming_release_patch_safe()
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming passthrough release.
+#
+# The non-streaming passthrough path DOES reach a post_call_success_hook call
+# site (pass_through_endpoints.py:1175) — but it is nested inside
+# `if response_body is not None and guardrails_to_run:` at :1160. With no
+# passthrough guardrails configured (our case) the hook never runs, so the
+# non-streaming leases leaked too. Measured on a throwaway proxy: 10
+# non-streaming /anthropic requests left 10 leases held.
+#
+# The one thing that IS unconditional on every non-streaming passthrough
+# success is the enqueue of
+# PassThroughEndpointLogging.pass_through_async_success_handler at :1252,
+# which receives the same logging object we pinned the lease id to. We wrap it
+# the same way. Failures on this path still go to post_call_failure_hook.
+#
+# Residual gap (documented, TTL-covered): if GLOBAL_LOGGING_WORKER ever drops
+# the enqueued coroutine, that lease falls back to LEASE_TTL_S. That is the
+# same reliability litellm itself accepts for spend logging on this path.
+# ---------------------------------------------------------------------------
+
+
+def _install_nonstreaming_release_patch() -> bool:
+    try:
+        from litellm.proxy.pass_through_endpoints.success_handler import (
+            PassThroughEndpointLogging,
+        )
+    except Exception as e:  # pragma: no cover - version drift
+        verbose_proxy_logger.error(
+            "custom_pacing: cannot import PassThroughEndpointLogging — non-streaming "
+            "leases will only expire by TTL (%ss). Error: %s",
+            _Cfg.LEASE_TTL_S,
+            e,
+        )
+        return False
+
+    original = getattr(
+        PassThroughEndpointLogging, "pass_through_async_success_handler", None
+    )
+    if original is None or getattr(original, _PATCH_FLAG, False):
+        return original is not None
+
+    async def _paced_success_handler(self, *args, **kwargs):
+        pace_id: Optional[str] = None
+        try:
+            lobj = kwargs.get("logging_obj")
+            pace_id = FleetPacer._pace_id_from_logging_obj(lobj)
+            if pace_id is None:
+                pace_id = pacer_instance._extract_pace_id(kwargs.get("request_body"))
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "custom_pacing: non-stream pace_id lookup failed: %s", e
+            )
+        try:
+            return await original(self, *args, **kwargs)
+        finally:
+            try:
+                await pacer_instance._release(pace_id)
+            except Exception:
+                pacer_instance._release_soon(pace_id)
+
+    setattr(_paced_success_handler, _PATCH_FLAG, True)
+    setattr(_paced_success_handler, "__wrapped__", original)
+    PassThroughEndpointLogging.pass_through_async_success_handler = (
+        _paced_success_handler
+    )
+    verbose_proxy_logger.info(
+        "custom_pacing: non-streaming lease-release patch installed on "
+        "PassThroughEndpointLogging.pass_through_async_success_handler"
+    )
+    return True
+
+
+def _install_nonstreaming_release_patch_safe() -> bool:
+    """Total for the same reason as the streaming sibling above."""
+    try:
+        return _install_nonstreaming_release_patch()
+    except Exception:
+        return False
+
+
+_NONSTREAMING_PATCH_OK = _install_nonstreaming_release_patch_safe()

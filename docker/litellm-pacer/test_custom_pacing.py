@@ -23,6 +23,7 @@ Run: python3 -m unittest discover -s docker/litellm-pacer -p 'test_*.py'
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import random
@@ -52,6 +53,18 @@ def _install_litellm_stubs() -> None:
             pass
 
         def debug(self, *a, **k):
+            pass
+
+        # The lease-release patch installers log at .error (litellm layout
+        # drift) and .info (patch installed) at IMPORT time. A stub missing
+        # either would raise AttributeError during `import custom_pacing` —
+        # which is exactly the failure mode the installers' _safe() wrappers
+        # exist to contain, so the stub must be complete enough that these
+        # tests exercise the real path rather than the swallow.
+        def error(self, *a, **k):
+            pass
+
+        def info(self, *a, **k):
             pass
 
     logging_mod.verbose_proxy_logger = _SilentLogger()
@@ -93,6 +106,7 @@ class FakeRedis:
         self.eval_raises = eval_raises
         self.set_calls: list = []
         self.eval_calls = 0
+        self.zrem_calls: list = []
 
     async def ping(self):
         return True
@@ -112,6 +126,9 @@ class FakeRedis:
         return self.eval_result
 
     async def zrem(self, *args, **kwargs):
+        # Records every lease-release round trip so the release tests can
+        # assert BOTH that a release happened and that it happened once.
+        self.zrem_calls.append(args)
         return 0
 
 
@@ -720,6 +737,425 @@ class RouterCooldownHoldsTests(_CfgPatchMixin, unittest.IsolatedAsyncioTestCase)
         self.assertLessEqual(
             elapsed, custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S + 0.4
         )
+
+
+# --- Lease release on the passthrough path -----------------------------------
+#
+# THE BUG THESE GUARD (switchroom#3549): a lease taken in the pre-call hook was
+# only ever released by `async_post_call_success_hook` /
+# `async_post_call_failure_hook`. Neither fires on the passthrough STREAMING
+# path (litellm returns a StreamingResponse before any post hook), and the one
+# non-streaming call site is nested under a guardrails condition that is false
+# with no passthrough guardrails configured. So on the /anthropic passthrough
+# route — the route the entire fleet uses — every lease leaked and only expired
+# by LEASE_TTL_S. Concurrency drifted to a standstill under sustained load, and
+# the live mitigation was to raise PACE_MAX_CONCURRENCY 16 -> 64, which bought
+# headroom without fixing the leak.
+#
+# These are CORRECTNESS tests, not latency tests: the assertion is that a lease
+# is actually released on every terminal outcome, and released at most once.
+
+
+def _fake_logging_obj(pace_id=None):
+    """Stand-in for LiteLLMLoggingObj: an object the pacer can pin an attribute
+    to, carrying the `model_call_details` dict litellm really has."""
+
+    class _LObj:
+        pass
+
+    lobj = _LObj()
+    lobj.model_call_details = {}
+    if pace_id is not None:
+        setattr(lobj, custom_pacing._PACE_ATTR, pace_id)
+    return lobj
+
+
+class StashAndExtractPaceIdTests(unittest.TestCase):
+    """The lease id must survive to a terminal path. `data["metadata"]` alone
+    does not: litellm's `_init_kwargs_for_pass_through_endpoint` pops every key
+    in `all_litellm_params` (which includes "metadata") off the parsed body
+    before the upstream call. The logging object is the durable carrier."""
+
+    def test_stash_pins_the_id_on_metadata_and_the_logging_obj(self):
+        lobj = _fake_logging_obj()
+        data = {"litellm_logging_obj": lobj}
+        custom_pacing.FleetPacer._stash_pace_id(data, "pace-1")
+
+        self.assertEqual(data["metadata"][custom_pacing._PACE_ATTR], "pace-1")
+        self.assertEqual(getattr(lobj, custom_pacing._PACE_ATTR), "pace-1")
+        self.assertEqual(lobj.model_call_details[custom_pacing._PACE_ATTR], "pace-1")
+
+    def test_id_is_recoverable_after_metadata_is_popped(self):
+        """The regression in one assertion: simulate litellm stripping
+        `metadata` off the body, and require the id still be found."""
+        lobj = _fake_logging_obj()
+        data = {"litellm_logging_obj": lobj}
+        custom_pacing.FleetPacer._stash_pace_id(data, "pace-2")
+
+        data.pop("metadata")  # what _init_kwargs_for_pass_through_endpoint does
+
+        pacer = custom_pacing.FleetPacer()
+        self.assertEqual(pacer._extract_pace_id(data), "pace-2")
+
+    def test_extract_reads_litellm_params_metadata(self):
+        """The failure path re-attaches metadata under litellm_params."""
+        pacer = custom_pacing.FleetPacer()
+        data = {"litellm_params": {"metadata": {custom_pacing._PACE_ATTR: "pace-3"}}}
+        self.assertEqual(pacer._extract_pace_id(data), "pace-3")
+
+    def test_extract_never_raises_on_junk(self):
+        pacer = custom_pacing.FleetPacer()
+        for junk in (None, "", 42, [], {"metadata": "not-a-dict"}, {"litellm_params": 7}):
+            self.assertIsNone(pacer._extract_pace_id(junk))
+
+    def test_stash_never_raises_on_junk(self):
+        for junk in (None, "", 42, []):
+            custom_pacing.FleetPacer._stash_pace_id(junk, "pace-x")  # must not raise
+
+
+class ReleaseIdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    """Several terminal paths can fire for one request (streaming wrapper,
+    success handler, failure hook). Releasing twice must not double-free a
+    future lease that reuses the id, and must not cost a Redis round trip."""
+
+    async def test_release_issues_one_zrem(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        pacer._redis = r
+        await pacer._release("pace-a")
+        self.assertEqual(len(r.zrem_calls), 1)
+        self.assertIn("pace-a", r.zrem_calls[0])
+
+    async def test_repeat_release_is_a_no_op(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        pacer._redis = r
+        for _ in range(5):
+            await pacer._release("pace-a")
+        self.assertEqual(len(r.zrem_calls), 1)
+
+    async def test_release_of_empty_id_is_a_no_op(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        pacer._redis = r
+        await pacer._release(None)
+        await pacer._release("")
+        self.assertEqual(r.zrem_calls, [])
+
+    async def test_release_survives_a_redis_error(self):
+        """Release must never propagate — a throwing Redis on the teardown path
+        would surface as an error mid-stream."""
+
+        class _BoomRedis(FakeRedis):
+            async def zrem(self, *a, **k):
+                raise RuntimeError("redis down")
+
+        pacer = custom_pacing.FleetPacer()
+        pacer._redis = _BoomRedis()
+        await pacer._release("pace-a")  # must not raise
+
+    async def test_released_lru_stays_bounded(self):
+        """The idempotency cache must not grow without bound in a long-lived
+        proxy worker."""
+        pacer = custom_pacing.FleetPacer()
+        pacer._redis = FakeRedis()
+        for i in range(custom_pacing._RELEASED_LRU_MAX + 250):
+            await pacer._release(f"pace-{i}")
+        self.assertLessEqual(
+            len(pacer._released), custom_pacing._RELEASED_LRU_MAX
+        )
+
+    async def test_release_soon_actually_releases(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        pacer._redis = r
+        pacer._release_soon("pace-b")
+        # Fire-and-forget: yield to the loop so the scheduled task runs.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(len(r.zrem_calls), 1)
+
+    async def test_release_soon_keeps_a_strong_ref(self):
+        """Without a strong ref the loop can GC the task mid-flight and the
+        release silently never happens (falling back to the TTL)."""
+        pacer = custom_pacing.FleetPacer()
+        pacer._redis = FakeRedis()
+        pacer._release_soon("pace-c")
+        self.assertEqual(len(pacer._pending_tasks), 1)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(len(pacer._pending_tasks), 0)  # discarded when done
+
+    def test_release_soon_outside_a_loop_does_not_raise(self):
+        """Sync context, no running loop: degrade to the TTL backstop, quietly."""
+        pacer = custom_pacing.FleetPacer()
+        pacer._redis = FakeRedis()
+        pacer._release_soon("pace-d")  # must not raise
+
+
+class StreamingReleasePatchTests(unittest.IsolatedAsyncioTestCase):
+    """Installs the streaming patch against a fake
+    PassThroughStreamingHandler and asserts the lease is released on EVERY way
+    a stream can end: normal completion, client disconnect, upstream error."""
+
+    def setUp(self):
+        self._saved = {
+            k: v for k, v in sys.modules.items()
+            if k.startswith("litellm.proxy.pass_through_endpoints")
+        }
+        self.chunks_seen = []
+
+        handler_mod = types.ModuleType(
+            "litellm.proxy.pass_through_endpoints.streaming_handler"
+        )
+        outer = self
+
+        class PassThroughStreamingHandler:
+            @staticmethod
+            async def chunk_processor(*args, **kwargs):
+                mode = kwargs.get("_test_mode", "ok")
+                for i in range(3):
+                    if mode == "raise" and i == 1:
+                        raise RuntimeError("upstream blew up")
+                    outer.chunks_seen.append(i)
+                    yield i
+
+        handler_mod.PassThroughStreamingHandler = PassThroughStreamingHandler
+        self.handler_cls = PassThroughStreamingHandler
+
+        pkg = types.ModuleType("litellm.proxy.pass_through_endpoints")
+        proxy = sys.modules.get("litellm.proxy") or types.ModuleType("litellm.proxy")
+        sys.modules["litellm.proxy"] = proxy
+        sys.modules["litellm.proxy.pass_through_endpoints"] = pkg
+        sys.modules[
+            "litellm.proxy.pass_through_endpoints.streaming_handler"
+        ] = handler_mod
+
+        self.assertTrue(custom_pacing._install_streaming_release_patch())
+
+        self.pacer = custom_pacing.pacer_instance
+        self.redis = FakeRedis()
+        self._saved_redis = self.pacer._redis
+        self._saved_released = self.pacer._released
+        self.pacer._redis = self.redis
+        self.pacer._released = type(self.pacer._released)()
+
+    def tearDown(self):
+        self.pacer._redis = self._saved_redis
+        self.pacer._released = self._saved_released
+        for k in list(sys.modules):
+            if k.startswith("litellm.proxy.pass_through_endpoints"):
+                del sys.modules[k]
+        sys.modules.update(self._saved)
+
+    async def _drain(self, gen, stop_after=None):
+        n = 0
+        async for _ in gen:
+            n += 1
+            if stop_after is not None and n >= stop_after:
+                break
+        return n
+
+    async def _settle(self):
+        # _release_soon schedules; give the loop turns to run it.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def test_lease_released_on_normal_stream_completion(self):
+        lobj = _fake_logging_obj("pace-stream-ok")
+        gen = self.handler_cls.chunk_processor(litellm_logging_obj=lobj)
+        await self._drain(gen)
+        await self._settle()
+        self.assertEqual(len(self.redis.zrem_calls), 1)
+        self.assertIn("pace-stream-ok", self.redis.zrem_calls[0])
+
+    async def test_lease_released_on_client_disconnect(self):
+        """Abandoning the generator mid-stream throws GeneratorExit into the
+        wrapper's finally. This is the dominant real-world case — a user
+        stopping a long completion — and the one the TTL used to paper over."""
+        lobj = _fake_logging_obj("pace-stream-disconnect")
+        gen = self.handler_cls.chunk_processor(litellm_logging_obj=lobj)
+        await self._drain(gen, stop_after=1)
+        await gen.aclose()
+        await self._settle()
+        self.assertEqual(len(self.redis.zrem_calls), 1)
+        self.assertIn("pace-stream-disconnect", self.redis.zrem_calls[0])
+
+    async def test_lease_released_when_the_stream_raises(self):
+        lobj = _fake_logging_obj("pace-stream-boom")
+        gen = self.handler_cls.chunk_processor(
+            litellm_logging_obj=lobj, _test_mode="raise"
+        )
+        with self.assertRaises(RuntimeError):
+            await self._drain(gen)
+        await self._settle()
+        self.assertEqual(len(self.redis.zrem_calls), 1)
+
+    async def test_chunks_still_flow_through_the_wrapper(self):
+        """The patch must be transparent: same chunks, same order."""
+        lobj = _fake_logging_obj("pace-stream-passthru")
+        gen = self.handler_cls.chunk_processor(litellm_logging_obj=lobj)
+        out = []
+        async for c in gen:
+            out.append(c)
+        self.assertEqual(out, [0, 1, 2])
+
+    async def test_id_recovered_from_the_request_body_when_the_lobj_is_bare(self):
+        lobj = _fake_logging_obj()  # no pinned attribute
+        body = {"metadata": {custom_pacing._PACE_ATTR: "pace-from-body"}}
+        gen = self.handler_cls.chunk_processor(
+            litellm_logging_obj=lobj, request_body=body
+        )
+        await self._drain(gen)
+        await self._settle()
+        self.assertIn("pace-from-body", self.redis.zrem_calls[0])
+
+    async def test_no_lease_id_means_no_release_call(self):
+        gen = self.handler_cls.chunk_processor(litellm_logging_obj=_fake_logging_obj())
+        await self._drain(gen)
+        await self._settle()
+        self.assertEqual(self.redis.zrem_calls, [])
+
+    def test_patch_is_not_installed_twice(self):
+        """Module re-import must not stack wrappers (each layer would release
+        again and the chunk path would nest)."""
+        first = self.handler_cls.chunk_processor
+        self.assertTrue(custom_pacing._install_streaming_release_patch())
+        self.assertIs(self.handler_cls.chunk_processor, first)
+
+
+class NonStreamingReleasePatchTests(unittest.IsolatedAsyncioTestCase):
+    """The non-streaming passthrough success hook is nested under
+    `if response_body is not None and guardrails_to_run:` — false for us — so
+    these leases leaked too. We wrap the one unconditional success handler."""
+
+    def setUp(self):
+        self._saved = {
+            k: v for k, v in sys.modules.items()
+            if k.startswith("litellm.proxy.pass_through_endpoints")
+        }
+        self.calls = []
+        outer = self
+
+        mod = types.ModuleType(
+            "litellm.proxy.pass_through_endpoints.success_handler"
+        )
+
+        class PassThroughEndpointLogging:
+            async def pass_through_async_success_handler(self, *args, **kwargs):
+                outer.calls.append(kwargs)
+                if kwargs.get("_test_mode") == "raise":
+                    raise RuntimeError("handler blew up")
+                return "handled"
+
+        mod.PassThroughEndpointLogging = PassThroughEndpointLogging
+        self.cls = PassThroughEndpointLogging
+
+        pkg = types.ModuleType("litellm.proxy.pass_through_endpoints")
+        proxy = sys.modules.get("litellm.proxy") or types.ModuleType("litellm.proxy")
+        sys.modules["litellm.proxy"] = proxy
+        sys.modules["litellm.proxy.pass_through_endpoints"] = pkg
+        sys.modules["litellm.proxy.pass_through_endpoints.success_handler"] = mod
+
+        self.assertTrue(custom_pacing._install_nonstreaming_release_patch())
+
+        self.pacer = custom_pacing.pacer_instance
+        self.redis = FakeRedis()
+        self._saved_redis = self.pacer._redis
+        self._saved_released = self.pacer._released
+        self.pacer._redis = self.redis
+        self.pacer._released = type(self.pacer._released)()
+
+    def tearDown(self):
+        self.pacer._redis = self._saved_redis
+        self.pacer._released = self._saved_released
+        for k in list(sys.modules):
+            if k.startswith("litellm.proxy.pass_through_endpoints"):
+                del sys.modules[k]
+        sys.modules.update(self._saved)
+
+    async def test_lease_released_on_success(self):
+        inst = self.cls()
+        out = await inst.pass_through_async_success_handler(
+            logging_obj=_fake_logging_obj("pace-ns-ok")
+        )
+        self.assertEqual(out, "handled")  # return value preserved
+        self.assertEqual(len(self.redis.zrem_calls), 1)
+        self.assertIn("pace-ns-ok", self.redis.zrem_calls[0])
+
+    async def test_lease_released_when_the_handler_raises(self):
+        inst = self.cls()
+        with self.assertRaises(RuntimeError):
+            await inst.pass_through_async_success_handler(
+                logging_obj=_fake_logging_obj("pace-ns-boom"), _test_mode="raise"
+            )
+        self.assertEqual(len(self.redis.zrem_calls), 1)
+
+    async def test_the_wrapped_handler_still_receives_its_kwargs(self):
+        inst = self.cls()
+        lobj = _fake_logging_obj("pace-ns-args")
+        await inst.pass_through_async_success_handler(logging_obj=lobj, url="/x")
+        self.assertEqual(self.calls[0]["url"], "/x")
+        self.assertIs(self.calls[0]["logging_obj"], lobj)
+
+    def test_patch_is_not_installed_twice(self):
+        first = self.cls.pass_through_async_success_handler
+        self.assertTrue(custom_pacing._install_nonstreaming_release_patch())
+        self.assertIs(self.cls.pass_through_async_success_handler, first)
+
+
+class PatchInstallFailOpenTests(unittest.TestCase):
+    """This module is imported by the proxy at startup. A litellm layout change
+    must degrade to the TTL backstop, never take the proxy down."""
+
+    def _without_passthrough_modules(self):
+        saved = {
+            k: v for k, v in sys.modules.items()
+            if k.startswith("litellm.proxy.pass_through_endpoints")
+        }
+        for k in saved:
+            del sys.modules[k]
+        # Block re-import: a bare ModuleType with no submodules makes the
+        # `from ... import` raise, which is the drift case.
+        return saved
+
+    def _restore(self, saved):
+        for k in list(sys.modules):
+            if k.startswith("litellm.proxy.pass_through_endpoints"):
+                del sys.modules[k]
+        sys.modules.update(saved)
+
+    def test_streaming_installer_returns_false_when_litellm_is_absent(self):
+        saved = self._without_passthrough_modules()
+        try:
+            self.assertFalse(custom_pacing._install_streaming_release_patch())
+        finally:
+            self._restore(saved)
+
+    def test_nonstreaming_installer_returns_false_when_litellm_is_absent(self):
+        saved = self._without_passthrough_modules()
+        try:
+            self.assertFalse(custom_pacing._install_nonstreaming_release_patch())
+        finally:
+            self._restore(saved)
+
+    def test_safe_wrappers_swallow_everything(self):
+        """Total-ness is the load-bearing property: even a logger without
+        .error (an older litellm) must not escape as an import-time crash."""
+        saved_logger = custom_pacing.verbose_proxy_logger
+
+        class _BrokenLogger:
+            def __getattr__(self, name):
+                raise AttributeError(name)
+
+        custom_pacing.verbose_proxy_logger = _BrokenLogger()
+        saved = self._without_passthrough_modules()
+        try:
+            self.assertFalse(custom_pacing._install_streaming_release_patch_safe())
+            self.assertFalse(custom_pacing._install_nonstreaming_release_patch_safe())
+        finally:
+            self._restore(saved)
+            custom_pacing.verbose_proxy_logger = saved_logger
 
 
 if __name__ == "__main__":
