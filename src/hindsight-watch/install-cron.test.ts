@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,10 +8,14 @@ import {
   CRON_LOG_PATH,
   CRON_PATH,
   CRON_SCHEDULE,
+  LOGROTATE_PATH,
+  ensureLogFile,
   installCron,
+  installLogrotate,
   parseCronUser,
   reconcileCron,
   renderCron,
+  renderLogrotate,
 } from "./install-cron.js";
 
 /**
@@ -100,6 +104,138 @@ describe("installCron", () => {
     // branch got there.
     expect(installCron({ ...OPTS, path }).status).toBe("installed");
     expect(readFileSync(path, "utf8")).toBe(renderCron(OPTS));
+  });
+});
+
+describe("ensureLogFile — #3991 the redirection target the cron user can append to", () => {
+  // A resolver that never shells out to `id`, so these tests are hermetic and
+  // never actually chown (which would need root and a real uid). We assert the
+  // FILE-creation outcome; the chown target is covered by the resolver call.
+  const resolveIds: () => { uid: number; gid: number } = () => ({ uid: 12345, gid: 12345 });
+
+  it("creates an empty mode-0644 file when absent (so `>>` succeeds without /var/log write)", () => {
+    const path = join(dir, "hindsight-watch.log");
+    const res = ensureLogFile({ user: "kenthompson", path, resolveIds });
+    expect(res.status).toBe("created");
+    expect(res.path).toBe(path);
+    expect(readFileSync(path, "utf8")).toBe("");
+    expect(statSync(path).mode & 0o777).toBe(0o644);
+  });
+
+  it("is idempotent and NEVER truncates an existing log — accumulated ticks survive", () => {
+    const path = join(dir, "hindsight-watch.log");
+    writeFileSync(path, "tick 1\ntick 2\n");
+    const res = ensureLogFile({ user: "kenthompson", path, resolveIds });
+    expect(res.status).toBe("unchanged");
+    // The content is untouched — a truncate here would throw away real history.
+    expect(readFileSync(path, "utf8")).toBe("tick 1\ntick 2\n");
+  });
+
+  it("resolves the cron user's ids exactly once, only on the create path", () => {
+    const path = join(dir, "hindsight-watch.log");
+    let calls = 0;
+    const counting = (u: string) => {
+      calls++;
+      expect(u).toBe("ada");
+      return { uid: 999, gid: 999 };
+    };
+    ensureLogFile({ user: "ada", path, resolveIds: counting });
+    expect(calls).toBe(1);
+    // Second call short-circuits on existsSync before resolving ids.
+    ensureLogFile({ user: "ada", path, resolveIds: counting });
+    expect(calls).toBe(1);
+  });
+
+  // The chown is BEST-EFFORT (#4081): the file existing is what lets the cron's
+  // `>>` append; ownership only matters when `/var/log` is unwritable by the
+  // cron user, and only root can chown to another uid. A non-root caller (or a
+  // restricted mount) must still get a created file, never a fatal EPERM that
+  // aborts the arm after the fragment was already written.
+  it("does NOT chown and does NOT throw when the process is not root — the file still exists to append to", () => {
+    const path = join(dir, "hindsight-watch.log");
+    // Force the non-root branch deterministically, independent of the test
+    // runner's real uid (CI shards run non-root; a local run may be root).
+    const getuidSpy = vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(1000);
+    try {
+      expect(() => ensureLogFile({ user: "kenthompson", path, resolveIds })).not.toThrow();
+    } finally {
+      getuidSpy.mockRestore();
+    }
+    expect(existsSync(path)).toBe(true);
+    // chown was skipped: ownership is the CREATING process's uid, never the
+    // resolved 12345. If the fix is reverted this fails — as root the file
+    // becomes uid 12345, as non-root the unconditional chown throws EPERM.
+    expect(statSync(path).uid).not.toBe(12345);
+  });
+
+  it("tolerates EPERM from chown on the root path — file exists, arm is not aborted", () => {
+    const path = join(dir, "hindsight-watch.log");
+    // Force the root branch so the chown is attempted; a non-root runner then
+    // yields a real EPERM that the fix must swallow. On a root runner the chown
+    // simply succeeds — either way the file exists and nothing throws.
+    const getuidSpy = vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(0);
+    try {
+      expect(() => ensureLogFile({ user: "kenthompson", path, resolveIds })).not.toThrow();
+    } finally {
+      getuidSpy.mockRestore();
+    }
+    expect(existsSync(path)).toBe(true);
+  });
+});
+
+describe("renderLogrotate — #3992 exact bytes of the drop-in", () => {
+  const out = renderLogrotate({ logPath: "/var/log/hindsight-watch.log", user: "ada" });
+
+  it("uses copytruncate — the only scheme that does not strand the inode for a writer-less log", () => {
+    expect(out).toContain("\n  copytruncate\n");
+  });
+
+  it("rotates as the cron user that owns the file, not root", () => {
+    expect(out).toContain("\n  su ada ada\n");
+  });
+
+  it("bounds retention (weekly / rotate 8) and tolerates a missing/empty log", () => {
+    expect(out).toContain("\n  weekly\n");
+    expect(out).toContain("\n  rotate 8\n");
+    expect(out).toContain("\n  missingok\n");
+    expect(out).toContain("\n  notifempty\n");
+  });
+
+  it("targets the given log path and is a complete stanza ending in a newline", () => {
+    expect(out.startsWith("/var/log/hindsight-watch.log {\n")).toBe(true);
+    expect(out.endsWith("}\n")).toBe(true);
+  });
+});
+
+describe("installLogrotate", () => {
+  const OPTS_LR = { user: "kenthompson", logPath: "/var/log/hindsight-watch.log" };
+
+  it("writes mode 0644 with the rendered content", () => {
+    const path = join(dir, "hindsight-watch");
+    const res = installLogrotate({ ...OPTS_LR, path });
+    expect(res.status).toBe("installed");
+    expect(statSync(path).mode & 0o777).toBe(0o644);
+    expect(readFileSync(path, "utf8")).toBe(renderLogrotate(OPTS_LR));
+  });
+
+  it("is idempotent: a second call reports unchanged", () => {
+    const path = join(dir, "hindsight-watch");
+    expect(installLogrotate({ ...OPTS_LR, path }).status).toBe("installed");
+    expect(installLogrotate({ ...OPTS_LR, path }).status).toBe("unchanged");
+  });
+
+  it("overwrites a stale/foreign drop-in and leaves no .tmp behind", () => {
+    const path = join(dir, "hindsight-watch");
+    writeFileSync(path, "/var/log/other.log { daily }\n");
+    expect(installLogrotate({ ...OPTS_LR, path }).status).toBe("installed");
+    expect(readFileSync(path, "utf8")).toBe(renderLogrotate(OPTS_LR));
+    expect(() => statSync(`${path}.${process.pid}.tmp`)).toThrow();
+  });
+
+  it("defaults to the production LOGROTATE_PATH and CRON_LOG_PATH", () => {
+    const content = renderLogrotate({ logPath: CRON_LOG_PATH, user: "ada" });
+    expect(content).toContain(CRON_LOG_PATH);
+    expect(LOGROTATE_PATH).toBe("/etc/logrotate.d/hindsight-watch");
   });
 });
 

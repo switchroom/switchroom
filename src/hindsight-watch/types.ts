@@ -43,8 +43,10 @@ export type SignalId =
   // `consolidation-queue-age` reads ONLY `status IN ('pending','processing')`,
   // and the failing path calls `_mark_operation_failed` within milliseconds —
   // so a bank whose consolidation fails on every attempt leaves that set
-  // instantly and the signal reports "consolidation queue empty". The metric
-  // is inverted: the more RELIABLY a bank fails, the healthier it reads.
+  // instantly and the signal reads OK (its detail no longer claims
+  // "consolidation queue empty" — corrected in #3989 — but it still cannot
+  // raise here). The metric is inverted: the more RELIABLY a bank fails, the
+  // healthier `consolidation-queue-age` reads.
   // Observed live 2026-07-29, `overlord` bank: the API reported
   // `pending_operations: 0, failed_operations: 96, pending_consolidation:
   // 37711` simultaneously, for 2.5 h, with every watchdog signal green.
@@ -113,6 +115,22 @@ export interface Sample {
    * exact tally (the ledger's own read-modify-write is unlocked).
    */
   drops: number;
+  /**
+   * Entries in each agent's `pending-duplicate/` archive — the redundant
+   * copies `collapse_duplicates()` retired (`lib/pending.py:archive_duplicate`)
+   * because a byte-identical entry was already queued. NOT a loss channel: the
+   * surviving copy stays queued and the collapsed one is redundant by
+   * construction, so `retain-loss` never counts it. Carried only so a large
+   * collapse pass reads as a spool drain WITH a cause rather than as
+   * unexplained memory loss (#3896).
+   *
+   * OPTIONAL on the wire — absent, not zero, in a state file written before
+   * this field shipped, so `loadState`/`isSample` still accept that sample
+   * instead of discarding it (which would re-baseline every signal on
+   * upgrade). Absent ⇒ the collapsed-duplicate note is omitted, never shown
+   * as 0.
+   */
+  duplicates?: number;
   /** docker `RestartCount` */
   restartCount: number;
   /** docker `State.StartedAt` — a change means restart/recreate */

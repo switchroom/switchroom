@@ -8,7 +8,14 @@ import {
   postOperatorNoticeViaGateways,
   type GatewayCandidate,
 } from "../host-control/config-degraded.js";
-import { CRON_PATH, CRON_SCHEDULE, installCron } from "../hindsight-watch/install-cron.js";
+import {
+  CRON_LOG_PATH,
+  CRON_PATH,
+  CRON_SCHEDULE,
+  ensureLogFile,
+  installCron,
+  installLogrotate,
+} from "../hindsight-watch/install-cron.js";
 import { tick } from "../hindsight-watch/run.js";
 import { defaultStatePath } from "../hindsight-watch/state.js";
 import {
@@ -196,10 +203,49 @@ function runInstallCron(cronUser?: string): number {
     return 1;
   }
 
+  // Provision the log file the cron redirects into, owned by the cron user
+  // (#3991). Without this the `>> /var/log/hindsight-watch.log` redirection
+  // fails "Permission denied" before switchroom is exec'd — every tick dies
+  // and doctor FAILs forever with "the watchdog has never completed a tick".
+  // A failure here is FATAL, not a warning: an armed cron that cannot write
+  // its log is the exact silent-monitoring failure this verb exists to close.
+  let logStatus: string;
+  try {
+    const logRes = ensureLogFile({ user });
+    logStatus =
+      logRes.status === "created"
+        ? `created ${logRes.path} (owned by ${user})`
+        : `${logRes.path} already present`;
+  } catch (e) {
+    process.stderr.write(
+      chalk.red(`hindsight-watch: could not provision the log file: ${(e as Error).message}\n`) +
+        `  The cron redirects into ${CRON_LOG_PATH} and would die at ` +
+        "the redirection every tick.\n  This path needs root; re-run under sudo with " +
+        "`--cron-user <operator>`.\n",
+    );
+    return 1;
+  }
+
+  // Bound the log with a logrotate drop-in (#3992). Best-effort: a missing
+  // logrotate config only means unbounded growth, not a broken tick, so a
+  // failure here WARNs rather than aborting the arm.
+  let rotateStatus: string;
+  try {
+    const rotateRes = installLogrotate({ user });
+    rotateStatus =
+      rotateRes.status === "installed"
+        ? `installed ${rotateRes.path}`
+        : `${rotateRes.path} already up to date`;
+  } catch (e) {
+    rotateStatus = chalk.yellow(`logrotate drop-in NOT written (${(e as Error).message}) — log growth is unbounded`);
+  }
+
   const verb = res.status === "installed" ? "installed" : "already up to date";
   process.stdout.write(
     `${chalk.green("✓")} hindsight-watch cron ${verb} at ${res.path} ` +
       `(${CRON_SCHEDULE}, as ${user})\n` +
+      `  log: ${logStatus}\n` +
+      `  logrotate: ${rotateStatus}\n` +
       `  Verify with: switchroom doctor  |  switchroom hindsight-watch --dry-run\n`,
   );
   return 0;
