@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.19.44 — The installed CLI can finally scaffold: profiles, skills, vendor and ui ship with the release
+
+### The `curl | sh` install gets its assets (#4162, #4183)
+
+Through v0.19.43 the release shipped four binaries and a checksums file and
+nothing else. The compiled SEA binary carries no `profiles/`, `skills/`,
+`vendor/hindsight-memory/` or web `ui/` on disk, so `switchroom apply` from an
+installed binary failed on every host with `Profile not found: default` — the
+installer produced a CLI that could not scaffold a single agent.
+
+- One shared resolver, `src/util/shipped-assets.ts`, replaces the three
+  independent `import.meta.dirname`-relative asset expressions that resolve to
+  `/$bunfs/root` inside the SEA build, and probes the installed share
+  directory instead (#4160, #4161, #4162).
+- The release pipeline now builds and publishes `switchroom-assets.tar.gz` —
+  `profiles/`, `skills/`, `vendor/hindsight-memory/`, `ui/` plus a
+  `switchroom-assets.json` manifest naming its release — and hashes it into
+  the same `switchroom-checksums.txt` as the binaries. `install.sh` downloads,
+  verifies and unpacks it; a release that forgets the payload fails the
+  release gate instead of shipping a CLI with no templates (#4163, #4183).
+
+### Memory honesty defaults (#4164, #4169)
+
+- Auto-retained transcript memories are tagged as transcript-derived, so the
+  agent's own synthesized output is identifiable in the bank instead of being
+  laundered into permanent world facts (#4164).
+- Every agent's Hindsight bank gets a fleet skepticism floor
+  (`skepticism: 4`) and a seeded `no-confabulation` directive — say "I don't
+  know" rather than compose an answer retrieval does not support. Both are
+  zero-config defaults, overridable per profile or in `switchroom.yaml`,
+  and neither can clobber an operator's explicit setting (#4169).
+
+### Operator-facing fixes
+
+- The agent-config MCP server no longer reports a *successful* schedule write
+  as `CLI exit 1`: the CLI child gets a timeout that accommodates the full
+  cron-only reconcile, timeout kills are reported as timeouts (not masked
+  exit codes), and the JSON result is parsed out of the reconcile's progress
+  noise instead of a strict whole-buffer parse (#4181, #4182).
+- `switchroom doctor`'s recall-health window is bounded by a 72h age cap as
+  well as the 200-row cap, so a quiet agent is no longer scored on
+  days-old rows from an already-fixed outage; the window is visible in the
+  detail line (#4176).
+- `HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT` is operator-reachable
+  through `hindsight.env` (override-only, validated at boot) instead of being
+  silently discarded (#4178, #4179).
+
 ## v0.19.43 — hindsight 0.8.6, Telegram delivery honesty, and live `thinking_effort`
 
 ### Hindsight base image v0.8.5 → v0.8.6, and two patch blocks retired into config
