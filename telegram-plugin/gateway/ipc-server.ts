@@ -152,12 +152,14 @@ export interface IpcServerOptions {
   ) => Promise<void>;
   /**
    * #2726 Part 2 — hostd asks the gateway to EDIT a previously-posted rollout
-   * status message as later phases arrive. Best-effort, no reply. Optional.
+   * status message as later phases arrive. Optional. #4065: the handler replies
+   * with a `rollout_status_edited` outcome so hostd can tell an applied edit
+   * from an edit into a deleted card; the roll never blocks on that reply.
    */
   onRolloutStatusEdit?: (
     client: IpcClient,
     msg: RolloutStatusEditMessage,
-  ) => void;
+  ) => void | Promise<void>;
   log?: (msg: string) => void;
   /**
    * How long (in ms) to wait without a heartbeat before force-closing the
@@ -813,14 +815,21 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
       case "rollout_status_edit":
         if (onRolloutStatusEdit) {
           try {
-            onRolloutStatusEdit(client, msg as RolloutStatusEditMessage);
+            void Promise.resolve(
+              onRolloutStatusEdit(client, msg as RolloutStatusEditMessage),
+            ).catch((err) => {
+              log(
+                `rollout_status_edit handler rejected (client=${client.id}): ${(err as Error).message}`,
+              );
+            });
           } catch (err) {
             log(
               `rollout_status_edit handler threw (client=${client.id}): ${(err as Error).message}`,
             );
           }
         }
-        // Fire-and-forget; no reply.
+        // The handler replies `rollout_status_edited` (#4065) when it can; an
+        // unwired gateway sends nothing and hostd's bounded wait expires.
         break;
       case "update_placeholder":
         // Legacy recall.py IPC — placeholder UX was removed in #553 PR 5.

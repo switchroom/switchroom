@@ -9,6 +9,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   LogTailRolloutNarrator,
+  type RolloutCardEscalation,
+  type RolloutEditOutcome,
   type RolloutNarrationRelay,
 } from "./rollout-narrator.js";
 import type { StatusEntry } from "./server.js";
@@ -40,6 +42,11 @@ interface FakeRelay extends RolloutNarrationRelay {
   edits: { messageId: number; text: string }[];
   /** message_id the next post resolves to; null to simulate a failed post. */
   nextMessageId: number | null;
+  /**
+   * #4065 — outcome an edit resolves to, as a function of the target
+   * message_id. Defaults to success (the pre-#4065 happy path).
+   */
+  editOutcome: (messageId: number) => RolloutEditOutcome;
   /** Resolve all pending posts (they resolve on a microtask). */
 }
 
@@ -50,12 +57,14 @@ function makeRelay(nextMessageId: number | null = 100): FakeRelay {
     posts,
     edits,
     nextMessageId,
+    editOutcome: () => ({ ok: true }),
     async post(args) {
       posts.push({ requestId: args.requestId, text: args.text });
       return relay.nextMessageId;
     },
-    edit(args) {
+    async edit(args) {
       edits.push({ messageId: args.messageId, text: args.text });
+      return relay.editOutcome(args.messageId);
     },
   };
   return relay;
@@ -126,6 +135,119 @@ describe("LogTailRolloutNarrator", () => {
     expect(relay.edits.every((e) => e.messageId === 4242)).toBe(true);
     expect(relay.edits.at(-1)!.messageId).toBe(4242);
     expect(relay.edits.at(-1)!.text).toContain("✅");
+  });
+
+  // ── #4065: a seeded-resume edit into a card that is GONE ───────────────────
+  // The operator outcome under test: a roll always ends on a truthful card. A
+  // seeded narrator holds a message_id it never posted; if that card is gone
+  // (operator deleted it, or it is no longer editable) the pre-#4065 code
+  // edited into the void for the REST of the roll and the operator saw no
+  // terminal ✅/❌ at all.
+
+  it("re-posts exactly ONCE when a seeded card is gone, and the terminal card lands", async () => {
+    const relay = makeRelay(5555); // the re-post lands as card 5555
+    // Card 4242 (carried across the self-bump) was deleted; 5555 is editable.
+    relay.editOutcome = (messageId) =>
+      messageId === 4242
+        ? { ok: false, gone: true, reason: "message to edit not found" }
+        : { ok: true };
+    const escalations: RolloutCardEscalation[] = [];
+    const n = new LogTailRolloutNarrator(relay, {
+      debounceMs: 1000,
+      escalate: (e) => escalations.push(e),
+    });
+    const entry = makeEntry();
+
+    n.seedPostedMessage("ro-1", "overlord", 4242);
+    n.onPhase(entry, phase("self-bump-done"));
+    await vi.runAllTimersAsync();
+
+    // The dead card was answered with exactly one fresh post.
+    expect(relay.posts).toHaveLength(1);
+
+    // The roll continues on the NEW card, terminal included.
+    n.onPhase(entry, phase("agent-start", { agent: "a", n: 1, m: 2 }));
+    n.onPhase(entry, phase("agent-done", { agent: "a", n: 1, m: 2 }));
+    await vi.runAllTimersAsync();
+    n.onTerminal(makeEntry({ result: "completed", rolled: ["a", "b"] }));
+    await vi.runAllTimersAsync();
+
+    // Still exactly one re-post (no post-per-phase storm), and the operator
+    // ends up looking at a live card carrying the terminal outcome.
+    expect(relay.posts).toHaveLength(1);
+    expect(relay.edits.at(-1)!.messageId).toBe(5555);
+    expect(relay.edits.at(-1)!.text).toContain("✅");
+    // A restored card is not a failure — nothing escalated.
+    expect(escalations).toEqual([]);
+  });
+
+  it("escalates to telemetry (never a second card) when the one re-post also fails", async () => {
+    const relay = makeRelay(null); // every post fails
+    relay.editOutcome = () => ({
+      ok: false,
+      gone: true,
+      reason: "message to edit not found",
+    });
+    const escalations: RolloutCardEscalation[] = [];
+    const n = new LogTailRolloutNarrator(relay, {
+      debounceMs: 1000,
+      escalate: (e) => escalations.push(e),
+    });
+    const entry = makeEntry();
+
+    n.seedPostedMessage("ro-1", "overlord", 4242);
+    n.onPhase(entry, phase("self-bump-done"));
+    await vi.runAllTimersAsync();
+
+    // Keep the roll going: a looping implementation would post (or edit-then-
+    // post) once per phase from here on.
+    for (let i = 1; i <= 6; i++) {
+      n.onPhase(entry, phase("agent-start", { agent: `a${i}`, n: i, m: 6 }));
+      n.onPhase(entry, phase("agent-done", { agent: `a${i}`, n: i, m: 6 }));
+      await vi.runAllTimersAsync();
+    }
+    n.onTerminal(makeEntry({ result: "completed", rolled: [] }));
+    await vi.runAllTimersAsync();
+
+    // Exactly ONE re-post attempt, ever — no storm.
+    expect(relay.posts).toHaveLength(1);
+    // And exactly one telemetry escalation carrying the stale id.
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toMatchObject({
+      requestId: "ro-1",
+      agentName: "overlord",
+      staleMessageId: 4242,
+      reason: "repost-failed",
+    });
+  });
+
+  it("does NOT re-post on a transient edit failure (no duplicate card)", async () => {
+    // A 429 past the gateway's retries / a socket blip leaves a perfectly good
+    // card in the chat. Re-posting would duplicate it.
+    const relay = makeRelay(5555);
+    relay.editOutcome = () => ({
+      ok: false,
+      gone: false,
+      reason: "timed out",
+    });
+    const escalations: RolloutCardEscalation[] = [];
+    const n = new LogTailRolloutNarrator(relay, {
+      debounceMs: 1000,
+      escalate: (e) => escalations.push(e),
+    });
+    const entry = makeEntry();
+
+    n.seedPostedMessage("ro-1", "overlord", 4242);
+    n.onPhase(entry, phase("self-bump-done"));
+    await vi.runAllTimersAsync();
+    n.onPhase(entry, phase("agent-start", { agent: "a", n: 1, m: 2 }));
+    await vi.runAllTimersAsync();
+    n.onTerminal(makeEntry({ result: "completed", rolled: ["a"] }));
+    await vi.runAllTimersAsync();
+
+    expect(relay.posts).toHaveLength(0);
+    expect(relay.edits.every((e) => e.messageId === 4242)).toBe(true);
+    expect(escalations).toEqual([]);
   });
 
   it("surfaces the learned message_id to the onMessageId sink exactly once on first post", async () => {

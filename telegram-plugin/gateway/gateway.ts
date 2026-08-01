@@ -652,6 +652,7 @@ import { startWebhookIngestServer } from './webhook-ingest-server.js'
 import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
+import { handleRolloutStatusEdit } from './rollout-status-edit.js'
 import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
@@ -11445,28 +11446,26 @@ if (isGatewayMain) ipcServer = createIpcServer({
     }
   },
 
-  // #2726 Part 2 — edit the previously-posted rollout status message in place as
-  // later phases arrive. Fire-and-forget: an edit failure (incl. Telegram 429)
-  // is swallowed here and NEVER surfaced back toward the roll. hostd owns the
-  // debounce + 429 retry cadence; this handler is a thin edit relay.
-  onRolloutStatusEdit(_client: IpcClient, msg: RolloutStatusEditMessage) {
-    const self = process.env.SWITCHROOM_AGENT_NAME
-    if (self && msg.agentName !== self) {
-      process.stderr.write(
-        `telegram gateway: rollout_status_edit rejected — agent mismatch (${msg.agentName} != ${self})\n`,
-      )
-      return
-    }
-    const operator = loadAccess().allowFrom[0]
-    if (operator === undefined) {
-      process.stderr.write(`telegram gateway: rollout_status_edit — no operator chat (allowFrom empty)\n`)
-      return
-    }
-    void swallowingApiCall(
-      () =>
-        // allow-raw-bot-api: in-place edit of the ordinary status message.
-        bot.api.editMessageText(operator, msg.messageId, richMessage(msg.text), {}),
-      { chat_id: String(operator), verb: 'rollout-status-edit' },
+  // #2726 Part 2 / #4065 — edit the previously-posted rollout status message in
+  // place as later phases arrive, and REPLY with the outcome so hostd can tell
+  // an applied edit from an edit into a deleted card (see rollout-status-edit.ts).
+  // Still fire-and-forget toward the roll: hostd never blocks on the reply.
+  onRolloutStatusEdit(client: IpcClient, msg: RolloutStatusEditMessage) {
+    return handleRolloutStatusEdit(
+      {
+        selfAgentName: process.env.SWITCHROOM_AGENT_NAME,
+        operatorChatId: () => loadAccess().allowFrom[0],
+        editMessage: (chatId, messageId, text) =>
+          robustApiCall(
+            () =>
+              // allow-raw-bot-api: in-place edit of the ordinary status message.
+              bot.api.editMessageText(chatId, messageId, richMessage(text), {}),
+            { chat_id: String(chatId), verb: 'rollout-status-edit' },
+          ),
+        log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
+      },
+      client,
+      msg,
     )
   },
 
