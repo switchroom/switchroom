@@ -471,36 +471,80 @@ type OutboxSendBot = {
  * wire. A trailing `reply_markup` (the Listen button) rides the FINAL piece
  * only, exactly as it rides the final chunk.
  */
+/**
+ * Resume state for ONE chunk, owned by the caller and therefore SURVIVING a
+ * re-invocation of the send closure.
+ *
+ * The caller wraps this whole function — the multi-send plain-fallback loop
+ * included — in `retryWithThreadFallback(deps.retry, …)`, and
+ * `createRetryApiCall` re-invokes the closure it was given after a flood wait
+ * (`../retry-api-call.ts`). Without resume state, a 429 on plain piece 4 of 5
+ * meant the retry re-ran the closure from the top: the rich send
+ * DETERMINISTICALLY parse-rejects again and pieces 1-3 are re-delivered to the
+ * user's chat — repeating every attempt until the whole loop happens to
+ * succeed. A mid-loop 429 is likely precisely in the flood conditions the
+ * sweep runs under, so this is the common case, not the exotic one.
+ *
+ * Carrying landed-piece state (rather than wrapping each `sendMessage` in its
+ * own nested `deps.retry`) is what makes the send IDEMPOTENT under ANY
+ * re-invocation — the retry policy's flood re-drive AND
+ * `retryWithThreadFallback`'s thread-drop re-drive — instead of only the one
+ * we thought of. Nesting a retry inside the outer retry would instead multiply
+ * the attempt and flood-sleep budgets (maxRetries²) at exactly the moment the
+ * policy exists to issue LESS, and would still re-send pieces 1-3 whenever the
+ * inner budget was exhausted and the error bubbled to the outer wrapper.
+ */
+interface ChunkSendState {
+  /** The rich send already parse-rejected — skip straight to the plain loop. */
+  parseRejected: boolean
+  /** Plain pieces already ON THE WIRE, in order. Never re-sent. */
+  landed: Array<{ message_id?: number; text: string }>
+}
+
+function newChunkSendState(): ChunkSendState {
+  return { parseRejected: false, landed: [] }
+}
+
 async function sendChunkRich(
   bot: OutboxSendBot,
   chatId: string,
   chunk: string,
   opts: object,
+  state: ChunkSendState = newChunkSendState(),
 ): Promise<Array<{ message_id?: number; text: string }>> {
-  try {
-    // allow-raw-bot-api: caller (createOutboxSend) invokes this inside retryWithThreadFallback + createRetryApiCall
-    const sent = await bot.api.sendRichMessage(chatId, richMessage(chunk), opts)
-    return [{ message_id: sent?.message_id, text: chunk }]
-  } catch (err) {
-    if (isParseEntitiesError(err)) {
-      const pieces = splitPlainTextToCap(chunk)
-      const withoutMarkup = { ...(opts as Record<string, unknown>) }
-      delete withoutMarkup.reply_markup
-      const landed: Array<{ message_id?: number; text: string }> = []
-      for (let p = 0; p < pieces.length; p++) {
-        const isFinalPiece = p === pieces.length - 1
-        // allow-raw-bot-api: parse-reject plain fallback, still inside the sweep's retryWithThreadFallback wrapper
-        const sent = await bot.api.sendMessage(
-          chatId,
-          pieces[p],
-          isFinalPiece ? opts : withoutMarkup,
-        )
-        landed.push({ message_id: sent?.message_id, text: pieces[p] })
-      }
-      return landed
+  // A re-invocation after the rich send already parse-rejected must NOT
+  // re-issue it: the reject is deterministic (same body, same renderer), so
+  // the only thing another attempt buys is one more 400 against a
+  // flood-sensitive endpoint.
+  if (!state.parseRejected) {
+    try {
+      // allow-raw-bot-api: caller (createOutboxSend) invokes this inside retryWithThreadFallback + createRetryApiCall
+      const sent = await bot.api.sendRichMessage(chatId, richMessage(chunk), opts)
+      return [{ message_id: sent?.message_id, text: chunk }]
+    } catch (err) {
+      if (!isParseEntitiesError(err)) throw err
+      state.parseRejected = true
     }
-    throw err
   }
+
+  const pieces = splitPlainTextToCap(chunk)
+  const withoutMarkup = { ...(opts as Record<string, unknown>) }
+  delete withoutMarkup.reply_markup
+  // Resume at the first piece that has NOT landed. On a first invocation
+  // `landed` is empty and this is the plain 0..n loop.
+  for (let p = state.landed.length; p < pieces.length; p++) {
+    const isFinalPiece = p === pieces.length - 1
+    // allow-raw-bot-api: parse-reject plain fallback, still inside the sweep's retryWithThreadFallback wrapper
+    const sent = await bot.api.sendMessage(
+      chatId,
+      pieces[p],
+      isFinalPiece ? opts : withoutMarkup,
+    )
+    // Recorded BEFORE the next iteration can throw, so a mid-loop failure
+    // leaves the state pointing at the first UNSENT piece.
+    state.landed.push({ message_id: sent?.message_id, text: pieces[p] })
+  }
+  return state.landed
 }
 
 /**
@@ -546,6 +590,10 @@ export function createOutboxSend(deps: {
     for (let idx = 0; idx < chunks.length; idx++) {
       const chunk = chunks[idx]
       const isLast = idx === chunks.length - 1
+      // Per-chunk resume state, OUTSIDE the closure the retry policy
+      // re-invokes: a flood wait mid plain-fallback loop must resume at the
+      // first unsent piece, not re-deliver the ones already in the chat.
+      const chunkState = newChunkSendState()
       const res = await retryWithThreadFallback(
         deps.retry,
         (tid) => {
@@ -553,7 +601,7 @@ export function createOutboxSend(deps: {
           // Button on the LAST chunk only (final visible message).
           const opts =
             isLast && replyMarkup != null ? { ...base, reply_markup: replyMarkup } : base
-          return sendChunkRich(bot, chatId, chunk, opts)
+          return sendChunkRich(bot, chatId, chunk, opts, chunkState)
         },
         { threadId: threadId ?? undefined, chat_id: chatId, verb: 'outbox-sweep.sendMessage' },
       )

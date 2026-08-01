@@ -423,14 +423,37 @@ export async function sendReplyChunks(
     // endpoint, which caps at 4096. Without a re-cap, the rescue send itself
     // 400s with `message is too long` and the answer vanishes — the exact
     // failure the fallback exists to prevent. Re-cap at safe boundaries first.
+    //
+    // Per-piece trailers: `opts` was built for ONE message, so shipping it
+    // verbatim to every piece duplicates the MESSAGE-scoped params.
+    //   - `reply_markup` (an inline keyboard) would render a LIVE button on
+    //     every piece. `single_use` only strips the keyboard from the message
+    //     that was tapped, so the user can fire the same action N times. It
+    //     rides the FINAL piece only — the same treatment the sweep's own
+    //     fallback applies (`outbox-sweep.ts` `sendChunkRich`/`withoutMarkup`),
+    //     and the same message the caller attached it to (the last chunk).
+    //   - `reply_parameters` would quote-reply from every piece. Only the
+    //     FIRST piece quotes, matching the caller's `replyMode !== 'all'`
+    //     rule that quotes chunk 0 only.
+    // Thread / link-preview / protect_content / disable_notification are
+    // per-message policy and correctly ride every piece, unchanged.
     const sendChunkPlainText = async (opts: Record<string, unknown>): Promise<void> => {
       const plain =
         chunks[i].length > 0
           ? chunks[i]
           : '⚠️ (a fragment could not be rendered for Telegram)'
       const pieces = splitPlainTextToCap(plain)
+      const pieceOpts = (p: number): Record<string, unknown> => {
+        // Single piece ⇒ it is both first and final; pass `opts` through
+        // byte-identically so the non-split path stays exactly as it was.
+        if (pieces.length === 1) return opts
+        const o = { ...opts }
+        if (p !== pieces.length - 1) delete o.reply_markup
+        if (p !== 0) delete o.reply_parameters
+        return o
+      }
       for (let p = 0; p < pieces.length; p++) {
-        const sent = await deps.sendLiteralRaw(opts, pieces[p])
+        const sent = await deps.sendLiteralRaw(pieceOpts(p), pieces[p])
         sentIds.push(sent.message_id)
         deps.logOutbound(
           'reply',

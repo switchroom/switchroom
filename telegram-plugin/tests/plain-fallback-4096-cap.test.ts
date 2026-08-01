@@ -40,6 +40,7 @@ import {
   type DeliverCapturedProseDeps,
 } from '../gateway/outbound-send-path.js'
 import { createOutboxSend } from '../gateway/outbox-sweep.js'
+import { createRetryApiCall } from '../retry-api-call.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 
 const CHAT = '100200300'
@@ -231,6 +232,226 @@ describe('#4043 site 2 — outbox sweep parse-reject fallback (createOutboxSend)
 
     await send(CHAT, null, longBody(20_000))
 
+    const withMarkup = bot.plainSends.filter((s) => s.opts.reply_markup != null)
+    expect(withMarkup).toHaveLength(1)
+    expect(bot.plainSends[bot.plainSends.length - 1]!.opts.reply_markup).toEqual(markup)
+  })
+})
+
+describe('reply-path plain fallback — message-scoped trailers ride ONE piece', () => {
+  /**
+   * MAJOR 1. `buildSendOpts` builds opts for ONE message: `reply_markup` on the
+   * LAST chunk, `reply_parameters` on the quoting chunk. `sendChunkPlainText`
+   * then re-caps that chunk into N plain pieces — and used to hand the SAME
+   * opts object to every one of them. Outcome the user sees: N copies of the
+   * inline keyboard (a `single_use` keyboard only clears off the message that
+   * was tapped, so the action can be double-fired) and N quote-replies.
+   *
+   * The sweep path already got this right for the button
+   * (`outbox-sweep.ts` `withoutMarkup`); this is the reply path's version.
+   */
+  const markup = {
+    inline_keyboard: [[{ text: 'Approve', callback_data: 'approve:42' }]],
+    single_use: true,
+  }
+  const replyParams = { message_id: 77, quote: { text: 'the question', position: 0 } }
+
+  function makeDeps() {
+    const plainSends: Array<{ text: string; opts: Record<string, unknown> }> = []
+    let id = 600
+    const deps: ReplyChunkSendDeps = {
+      sendRich: () => Promise.reject(parseRejectError('sendRichMessage')),
+      sendLiteral: () => Promise.reject(parseRejectError('sendMessage')),
+      sendLiteralRaw: (opts, text) => {
+        if (text.length > PLAIN_TEXT_MAX_CHARS) return Promise.reject(tooLongError())
+        plainSends.push({ text, opts: opts as Record<string, unknown> })
+        return Promise.resolve({ message_id: id++ })
+      },
+      sendRichRaw: () => Promise.reject(parseRejectError('sendRichMessage')),
+      editPreview: () => Promise.resolve({}),
+      richMessage: (s) => ({ markdown: s }),
+      logOutbound: () => {},
+      deleteStalePreview: () => Promise.resolve(),
+      stderr: () => {},
+    }
+    return { deps, plainSends }
+  }
+
+  /** Mirrors the live `buildSendOpts` (gateway/outbound-send-path.ts): quote on
+   *  the first chunk, keyboard on the last, thread on every one. */
+  const buildSendOpts = (i: number, isLastChunk: boolean) => ({
+    ...(i === 0 ? { reply_parameters: replyParams } : {}),
+    message_thread_id: 9,
+    ...(isLastChunk ? { reply_markup: markup } : {}),
+  })
+
+  it('an oversized keyboard-bearing reply: ONE keyboard (final piece), ONE quote (first piece)', async () => {
+    const body = longBody(20_000)
+    const chunks = computeReplyChunks({
+      effectiveText: body,
+      literalText: false,
+      limit: RICH_MESSAGE_MAX_CHARS,
+      chunkMode: 'newline',
+    })
+    // One rich chunk that is BOTH the first (quotes) and the last (keyboard).
+    expect(chunks).toHaveLength(1)
+
+    const { deps, plainSends } = makeDeps()
+    const sentIds: number[] = []
+    await sendReplyChunks(deps, {
+      chatId: CHAT,
+      chunks,
+      literalText: false,
+      suppressText: false,
+      threadId: 9,
+      previewMessageId: null,
+      sentIds,
+      buildSendOpts,
+      buildPreviewEditOpts: () => ({}),
+    })
+
+    // It really did split — otherwise the assertions below are vacuous.
+    expect(plainSends.length).toBeGreaterThan(1)
+
+    // Exactly ONE live keyboard, and it is on the LAST message the user sees.
+    const withMarkup = plainSends.filter((s) => s.opts.reply_markup != null)
+    expect(withMarkup).toHaveLength(1)
+    expect(plainSends[plainSends.length - 1]!.opts.reply_markup).toEqual(markup)
+
+    // Exactly ONE quote-reply, and it is on the FIRST message.
+    const withQuote = plainSends.filter((s) => s.opts.reply_parameters != null)
+    expect(withQuote).toHaveLength(1)
+    expect(plainSends[0]!.opts.reply_parameters).toEqual(replyParams)
+
+    // Per-message policy params still ride EVERY piece.
+    for (const s of plainSends) expect(s.opts.message_thread_id).toBe(9)
+
+    // And the answer itself is intact.
+    expect(plainSends.map((s) => s.text).join('').replace(/\s+/g, '')).toBe(
+      body.replace(/\s+/g, ''),
+    )
+  })
+
+  it('a single-piece fallback still carries both trailers on its one message', async () => {
+    const { deps, plainSends } = makeDeps()
+    const sentIds: number[] = []
+    await sendReplyChunks(deps, {
+      chatId: CHAT,
+      chunks: ['a short answer'],
+      literalText: false,
+      suppressText: false,
+      threadId: 9,
+      previewMessageId: null,
+      sentIds,
+      buildSendOpts,
+      buildPreviewEditOpts: () => ({}),
+    })
+    expect(plainSends).toHaveLength(1)
+    expect(plainSends[0]!.opts.reply_markup).toEqual(markup)
+    expect(plainSends[0]!.opts.reply_parameters).toEqual(replyParams)
+  })
+})
+
+describe('outbox sweep plain fallback — a mid-loop 429 does not re-deliver landed pieces', () => {
+  /**
+   * MAJOR 2. `createOutboxSend` wraps the WHOLE `sendChunkRich` — its
+   * multi-piece plain-fallback loop included — in
+   * `retryWithThreadFallback(deps.retry, …)`, and `createRetryApiCall`
+   * re-invokes that closure after a flood wait (`retry-api-call.ts`). So a 429
+   * on piece 4 of 5 re-ran the closure from the top: the rich send
+   * deterministically parse-rejects again and pieces 1-3 were re-sent into the
+   * user's chat. A mid-loop 429 is likely precisely in the flood conditions the
+   * sweep runs under.
+   *
+   * Asserted as the USER OUTCOME: every piece appears on the wire exactly once.
+   */
+  function floodError(retryAfter: number): GrammyError {
+    return new GrammyError(
+      'Call to sendMessage failed!',
+      {
+        ok: false,
+        error_code: 429,
+        description: 'Too Many Requests: retry after ' + retryAfter,
+        parameters: { retry_after: retryAfter },
+      },
+      'sendMessage',
+      {} as never,
+    )
+  }
+
+  /** Fake wire: rich always parse-rejects; the Nth plain send 429s ONCE. */
+  function fakeBot(floodOnCall: number) {
+    const plainSends: Array<{ text: string; opts: Record<string, unknown> }> = []
+    let richCalls = 0
+    let plainCalls = 0
+    let flooded = false
+    let id = 900
+    return {
+      plainSends,
+      richCalls: () => richCalls,
+      api: {
+        sendRichMessage: async () => {
+          richCalls++
+          throw parseRejectError('sendRichMessage')
+        },
+        sendMessage: async (_chatId: string, text: string, opts: Record<string, unknown>) => {
+          plainCalls++
+          if (text.length > PLAIN_TEXT_MAX_CHARS) throw tooLongError()
+          if (!flooded && plainCalls === floodOnCall) {
+            flooded = true
+            // Telegram rejected it — nothing landed for this piece.
+            throw floodError(1)
+          }
+          plainSends.push({ text, opts })
+          return { message_id: id++ }
+        },
+      },
+    }
+  }
+
+  it('resumes at the failed piece instead of re-sending pieces 1-3', async () => {
+    const bot = fakeBot(4)
+    // The REAL retry policy (which is what re-invokes the closure), with sleep
+    // stubbed so the flood wait costs no wall-clock time.
+    const retry = createRetryApiCall({ sleep: async () => {} })
+    const send = createOutboxSend({ getBot: () => bot as never, retry })
+    const body = longBody(20_000)
+
+    const res = await send(CHAT, null, body)
+
+    const expected = splitPlainTextToCap(body)
+    expect(expected.length).toBeGreaterThanOrEqual(5) // a real mid-loop failure
+
+    // Every piece delivered EXACTLY once, in order — no duplicate prefix.
+    expect(bot.plainSends.map((s) => s.text)).toEqual(expected)
+    // Bookkeeping matches the wire (no phantom / double-counted messages).
+    expect(res.chunks.map((c) => c.text)).toEqual(expected)
+    expect(res.chunks).toHaveLength(expected.length)
+    // The deterministic parse-reject is not re-issued on the retry either.
+    expect(bot.richCalls()).toBe(1)
+    // And nothing was lost.
+    expect(bot.plainSends.map((s) => s.text).join('').replace(/\s+/g, '')).toBe(
+      body.replace(/\s+/g, ''),
+    )
+  })
+
+  it('a 429 on the FINAL keyboard-bearing piece re-sends only that piece', async () => {
+    const body = longBody(20_000)
+    const expected = splitPlainTextToCap(body)
+    // Flood the LAST plain send — the piece that carries the button.
+    const bot = fakeBot(expected.length)
+    const markup = { inline_keyboard: [[{ text: '🔊 Listen', callback_data: 'voice:1' }]] }
+    const retry = createRetryApiCall({ sleep: async () => {} })
+    const send = createOutboxSend({
+      getBot: () => bot as never,
+      retry,
+      resolveReplyMarkup: () => markup,
+    })
+
+    await send(CHAT, null, body)
+
+    // The whole prefix is NOT re-delivered: one message per piece, no more.
+    expect(bot.plainSends.map((s) => s.text)).toEqual(expected)
     const withMarkup = bot.plainSends.filter((s) => s.opts.reply_markup != null)
     expect(withMarkup).toHaveLength(1)
     expect(bot.plainSends[bot.plainSends.length - 1]!.opts.reply_markup).toEqual(markup)
