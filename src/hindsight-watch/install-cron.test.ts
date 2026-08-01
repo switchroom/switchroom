@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -144,6 +144,42 @@ describe("ensureLogFile — #3991 the redirection target the cron user can appen
     // Second call short-circuits on existsSync before resolving ids.
     ensureLogFile({ user: "ada", path, resolveIds: counting });
     expect(calls).toBe(1);
+  });
+
+  // The chown is BEST-EFFORT (#4081): the file existing is what lets the cron's
+  // `>>` append; ownership only matters when `/var/log` is unwritable by the
+  // cron user, and only root can chown to another uid. A non-root caller (or a
+  // restricted mount) must still get a created file, never a fatal EPERM that
+  // aborts the arm after the fragment was already written.
+  it("does NOT chown and does NOT throw when the process is not root — the file still exists to append to", () => {
+    const path = join(dir, "hindsight-watch.log");
+    // Force the non-root branch deterministically, independent of the test
+    // runner's real uid (CI shards run non-root; a local run may be root).
+    const getuidSpy = vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(1000);
+    try {
+      expect(() => ensureLogFile({ user: "kenthompson", path, resolveIds })).not.toThrow();
+    } finally {
+      getuidSpy.mockRestore();
+    }
+    expect(existsSync(path)).toBe(true);
+    // chown was skipped: ownership is the CREATING process's uid, never the
+    // resolved 12345. If the fix is reverted this fails — as root the file
+    // becomes uid 12345, as non-root the unconditional chown throws EPERM.
+    expect(statSync(path).uid).not.toBe(12345);
+  });
+
+  it("tolerates EPERM from chown on the root path — file exists, arm is not aborted", () => {
+    const path = join(dir, "hindsight-watch.log");
+    // Force the root branch so the chown is attempted; a non-root runner then
+    // yields a real EPERM that the fix must swallow. On a root runner the chown
+    // simply succeeds — either way the file exists and nothing throws.
+    const getuidSpy = vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(0);
+    try {
+      expect(() => ensureLogFile({ user: "kenthompson", path, resolveIds })).not.toThrow();
+    } finally {
+      getuidSpy.mockRestore();
+    }
+    expect(existsSync(path)).toBe(true);
   });
 });
 

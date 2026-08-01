@@ -24,7 +24,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { chownSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chownSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 /** Where the cron fragment lands. */
@@ -171,7 +171,34 @@ export function ensureLogFile(
   // "skip if exists" guard's race-freeness for no gain — this file is created
   // once and appended to thereafter, never rewritten.
   writeFileSync(path, "", { mode: 0o644, flag: "a" });
-  chownSync(path, uid, gid);
+  // Ownership is BEST-EFFORT — the goal that closes #3991 is that the file
+  // EXISTS so the cron's `>>` redirection can append; the chown only makes the
+  // append work when `/var/log` itself is not writable by the cron user. Only
+  // root can chown to another uid, and install-cron is normally invoked under
+  // `sudo … --cron-user <operator>`, so:
+  //   • skip the chown entirely when we are NOT root (a non-root caller would
+  //     get EPERM), or when the file is already owned by the target ids; and
+  //   • even on the root path, tolerate an EPERM (unusual mounts, restricted
+  //     containers) rather than aborting the arm — mirroring installLogrotate's
+  //     WARN-not-fatal stance. The file is already created; ownership is a
+  //     nice-to-have, not the guarantee this function exists to make.
+  const isRoot = process.getuid?.() === 0;
+  let alreadyOwned = false;
+  try {
+    const st = statSync(path);
+    alreadyOwned = st.uid === uid && st.gid === gid;
+  } catch {
+    // stat failure is non-fatal here; fall through to attempt the chown.
+  }
+  if (isRoot && !alreadyOwned) {
+    try {
+      chownSync(path, uid, gid);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EPERM") throw e;
+      // EPERM tolerated: the log file exists and is mode-0644; the cron can
+      // still create/append to it. Ownership stays with the creating user.
+    }
+  }
   return { status: "created", path };
 }
 
