@@ -60,8 +60,15 @@ import {
   planSelfUpdate,
   releaseAssetName,
   SELF_UPDATE_ENV_SENTINEL,
+  type InstallKind,
   type SelfUpdateIO,
 } from "./self-update.js";
+import {
+  SKILLS_ASSET,
+  describeShippedAssetSearch,
+  resolveShippedAsset,
+  type ShippedAssetProbe,
+} from "../util/shipped-assets.js";
 import { defaultSelfUpdateIO } from "./self-update-io.js";
 import { resolveSelfInvocation } from "./self-invoke.js";
 import {
@@ -203,6 +210,11 @@ interface UpdateOptions {
   latestReleaseTagFn?: () => Promise<string | null>;
   /** Test seam — override install-kind detection inputs. */
   installProbe?: Parameters<typeof detectInstallKind>[0];
+  /** Test seam — override the layout probe `sync-bundled-skills` uses to
+   *  find the shipped `skills/` payload. Lets a test simulate the SEA
+   *  layout (bunfs bundle dir + no on-disk payload), which is otherwise
+   *  unreachable from a vitest run. */
+  shippedSkillsProbe?: ShippedAssetProbe;
   /** Test seam — exec used by the component-version inventory. */
   componentExec?: ExecFn;
   /**
@@ -213,6 +225,14 @@ interface UpdateOptions {
    * decision in one place.
    */
   selfUpdateSink?: { replacedWith?: string; binaryPath?: string };
+  /**
+   * Mutable sink for NON-FATAL step warnings. Same shared-holder pattern
+   * as `selfUpdateSink`: a step that completed but could not do its whole
+   * job pushes an operator-facing line here, and `runUpdate` reprints the
+   * lot in the final summary. A degraded step must not look identical to
+   * a clean one in the transcript (#4161).
+   */
+  warningSink?: string[];
   /** Test seam — replace the re-exec of the freshly installed binary. */
   reexecFn?: (binaryPath: string, args: string[]) => { status: number };
   /** Test seam — override the /etc/cron.d/hindsight-watch path the
@@ -247,6 +267,21 @@ const DEFAULT_COMPOSE_PATH = join(
   "compose",
   "docker-compose.yml",
 );
+
+/**
+ * Install kinds where the shipped asset payloads (`skills/`, `profiles/`,
+ * `vendor/`) are part of the artifact itself. If one is missing on these,
+ * the artifact is broken — the update must fail rather than tick a step
+ * green it could not perform (#4161). `source-checkout` and `unknown` are
+ * deliberately absent: a local layout without an adjacent `skills/` is
+ * unusual but not a shipping defect, so those degrade to a surfaced
+ * warning instead.
+ */
+const PACKAGED_INSTALL_KINDS: ReadonlySet<InstallKind> = new Set<InstallKind>([
+  "static-binary",
+  "npm-global",
+  "container",
+]);
 
 /**
  * Detect whether the running CLI lives inside a git checkout (so
@@ -453,6 +488,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   const composePath = opts.composePath ?? DEFAULT_COMPOSE_PATH;
   const runner = opts.runner ?? defaultRunner;
   const scriptPath = opts.scriptPath ?? process.argv[1] ?? "";
+  const warningSink = opts.warningSink ?? [];
   // #3963: every self-invoking step below must NOT pass a compiled
   // binary's bunfs bundle path as argv[1] — the binary is its own
   // entrypoint and commander would parse the path as the subcommand.
@@ -989,21 +1025,65 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         opts.syncBundledSkillsFn();
         return;
       }
-      // SOURCE: the skills/ directory shipped alongside the running
-      // CLI bundle. `import.meta.dirname` is dist/cli/ at runtime; the
-      // skills/ payload lives two levels up beside dist/ (see package
-      // .json "files" — skills/ is shipped). This is the only place
-      // the legacy `resolve(import.meta.dirname, "../../skills")`
-      // expression is still correct, because here it really IS the
-      // source for the copy.
-      const source = resolve(import.meta.dirname, "../../skills");
+      // SOURCE: the shipped skills/ payload. Resolved through the SAME
+      // probe as profiles/ and vendor/ (src/util/shipped-assets.ts) —
+      // the old bare `resolve(import.meta.dirname, "../../skills")`
+      // became `/skills` inside a `bun build --compile` binary, where
+      // `import.meta.dirname` is the bunfs virtual root, so this step
+      // silently no-op'd on every published-binary host while still
+      // being ticked green (#4161).
+      const resolution = resolveShippedAsset(
+        SKILLS_ASSET,
+        opts.shippedSkillsProbe ?? {
+          bundleDir: import.meta.dirname,
+          execPath: process.execPath,
+        },
+      );
       const dest = join(homedir(), ".switchroom", "skills", "_bundled");
-      if (!existsSync(source)) {
-        process.stderr.write(
-          `switchroom update: sync-bundled-skills — CLI bundle has no adjacent skills/ at ${source}; skipping.\n`,
+      if (resolution.path === null) {
+        // A step that cannot do its job must NOT report success. On a
+        // PACKAGED install (published binary / npm / container image)
+        // the skills payload is part of the artifact, so its absence is
+        // a packaging defect: fail the step and stop the update rather
+        // than leave the pool stale and every agent's CLAUDE.md
+        // pointing at default skills that never reach it.
+        //
+        // A source checkout (or an install we cannot classify) is the
+        // one case where "no adjacent skills/" can be a legitimate
+        // local layout, so that stays a warning — but a warning the
+        // final summary reprints, not a lone stderr line buried in a
+        // long log.
+        const detection = detectInstallKind(
+          opts.installProbe ?? {
+            bundleDir: import.meta.dirname,
+            execPath: process.execPath,
+            scriptPath,
+            inContainer:
+              process.env.SWITCHROOM_HOSTD_CONTEXT === "1" ||
+              existsSync("/.dockerenv"),
+          },
         );
+        const detail =
+          `no shipped skills/ payload found for this install ` +
+          `(${detection.kind}; ${describeShippedAssetSearch(resolution)})`;
+        if (PACKAGED_INSTALL_KINDS.has(detection.kind)) {
+          throw new Error(
+            `sync-bundled-skills: ${detail}. Every packaged switchroom ` +
+              `artifact ships skills/, so this is a packaging defect, not an ` +
+              `operator opt-out — the bundled pool at ${dest} cannot be ` +
+              `repaired by re-running \`switchroom update\`. Stage the payload ` +
+              `at /usr/local/share/switchroom/skills (or point ` +
+              `${SKILLS_ASSET.envVar} at a checkout's skills/) and re-run.`,
+          );
+        }
+        const warning =
+          `sync-bundled-skills SKIPPED — ${detail}. The bundled pool at ` +
+          `${dest} was NOT refreshed; default skills may be missing or stale.`;
+        process.stderr.write(`switchroom update: ${warning}\n`);
+        warningSink.push(warning);
         return;
       }
+      const source = resolution.path;
       try {
         mkdirSync(dirname(dest), { recursive: true });
         // Manifest-owned ADDITIVE sync (footgun B): copies/updates every
@@ -1597,7 +1677,19 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
   // loop below knows it must re-exec the NEW code for the remaining steps.
   const selfUpdateSink: { replacedWith?: string; binaryPath?: string } =
     opts.selfUpdateSink ?? {};
-  const steps = planUpdate({ ...opts, selfUpdateSink });
+  // Non-fatal degradations a step reports. Reprinted in the summary so a
+  // partially-working run never reads like a clean one (#4161).
+  const warningSink: string[] = opts.warningSink ?? [];
+  const steps = planUpdate({ ...opts, selfUpdateSink, warningSink });
+  const renderWarnings = (): void => {
+    if (warningSink.length === 0) return;
+    stdout(
+      chalk.yellow(
+        `\n⚠ ${warningSink.length} step(s) completed WITHOUT doing their full job:\n`,
+      ),
+    );
+    for (const w of warningSink) stdout(chalk.yellow(`  • ${w}\n`));
+  };
 
   if (opts.check) {
     stdout(chalk.bold("switchroom update --check (dry-run)\n\n"));
@@ -1652,6 +1744,7 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
       stderr(
         chalk.red(`✗ ${step.name} failed: ${(err as Error).message}\n`),
       );
+      renderWarnings();
       // Even on failure, emit the sentinel if any deferred steps exist so
       // the server can record which steps were left pending (#2458).
       const deferredOnFailure = steps
@@ -1663,7 +1756,12 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
       return 1;
     }
   }
-  stdout(chalk.green("\n✓ update complete\n"));
+  renderWarnings();
+  stdout(
+    warningSink.length > 0
+      ? chalk.yellow(`\n✓ update complete (with ${warningSink.length} warning(s))\n`)
+      : chalk.green("\n✓ update complete\n"),
+  );
   // Emit the structured sentinel when any steps were deferred so the server
   // can populate StatusEntry.deferred without parsing human output (#2458).
   const deferred = steps

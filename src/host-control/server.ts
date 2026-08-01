@@ -1959,13 +1959,13 @@ export class HostdServer {
   /**
    * Apply-asset preflight. `apply` / `update_apply` shell out to the
    * bundled `switchroom` CLI, which resolves profiles + the vendored
-   * hindsight plugin RELATIVE TO ITSELF (no path arg):
-   *   profiles.ts:  resolve(import.meta.dirname,"../../profiles")
-   *   scaffold.ts:  resolve(import.meta.dirname,"../../vendor/hindsight-memory")
-   * The `update` flow ALSO resolves a package-relative asset the same
-   * way — `sync-bundled-skills` mirrors the shipped `skills/` payload
-   * into the host pool:
-   *   update.ts:  resolve(import.meta.dirname,"../../skills")
+   * hindsight plugin RELATIVE TO ITSELF (no path arg). Those three
+   * assets — `profiles/`, `vendor/hindsight-memory/` (scaffold.ts) and
+   * `skills/` (update.ts's `sync-bundled-skills`) — now share one probe,
+   * `resolveShippedAsset` in src/util/shipped-assets.ts (#4160/#4161).
+   * Inside the hostd image its FIRST candidate is the npm-shaped
+   * `<bundleDir>/../../<asset>` = `/opt/switchroom/<asset>`, which is
+   * exactly what the `root` below reproduces.
    * If the hostd image was built without those (the klanker incident
    * for profiles/vendor; the ghost-skills incident #3492-follow-up for
    * skills/), `update_apply` pulls images then either dies at

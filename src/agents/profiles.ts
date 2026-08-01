@@ -1,6 +1,12 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, copyFileSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, join, sep as pathSep } from "node:path";
 import Handlebars from "handlebars";
+import {
+  PROFILES_ASSET,
+  describeShippedAssetSearch,
+  resolveShippedAsset,
+  type ShippedAssetResolution,
+} from "../util/shipped-assets.js";
 
 /**
  * Resolve the root of the filesystem profiles directory (project-level).
@@ -10,46 +16,35 @@ import Handlebars from "handlebars";
  * (start.sh.hbs, settings.json.hbs) that every agent uses regardless
  * of their `extends:` choice.
  *
- * The bundle can live in two layouts and the profiles dir sits in a
- * DIFFERENT relative spot in each — a single hardcoded relative path
- * only works for one and silently breaks the other (#3346):
+ * The bundle ships in three layouts and the profiles dir sits in a
+ * DIFFERENT place in each. The candidate probe lives in
+ * `src/util/shipped-assets.ts` so `profiles/`, `skills/` and
+ * `vendor/hindsight-memory/` cannot drift apart again (#3346, #3492,
+ * #4160). `SWITCHROOM_PROFILES_ROOT` still wins outright.
  *
- *   - npm / dev layout: bundle at `<pkg>/dist/cli/switchroom.js`, so
- *     profiles are two dirs up at `<pkg>/profiles` (`../../profiles`).
- *   - agent Docker image: bundle at `/opt/switchroom/switchroom.js`,
- *     so `../../profiles` resolves to `/profiles` — a path the image
- *     never shipped, which broke every in-container `rollout`/`apply`
- *     with `Profile not found: default (searched /profiles)`. The
- *     Dockerfile now COPYs profiles to `/opt/switchroom/profiles`, i.e.
- *     `./profiles` relative to the bundle dir.
- *
- * Rather than hardcode one relative path, probe an ordered list of
- * candidates and pick the first that actually exists on disk. The
- * `SWITCHROOM_PROFILES_ROOT` env override wins for tests and operator
- * escape hatches. If none exist we fall back to the npm-layout path so
- * the downstream "Profile not found" error still names a sensible root.
+ * If nothing exists we return the npm-layout path so the historical
+ * error shape survives — but the error now also names EVERY candidate
+ * (`PROFILES_ROOT_SEARCH`). "searched /profiles" named a path no
+ * install has ever used, which is why #4160 read as a mystery.
  */
-export function resolveProfilesRoot(): string {
-  const envOverride = process.env.SWITCHROOM_PROFILES_ROOT?.trim();
-  if (envOverride) {
-    return resolve(envOverride);
-  }
-  const candidates = [
-    // npm / dev layout: <pkg>/dist/cli -> <pkg>/profiles
-    resolve(import.meta.dirname, "../../profiles"),
-    // agent Docker image: /opt/switchroom -> /opt/switchroom/profiles
-    resolve(import.meta.dirname, "profiles"),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  // Preserve the historical default so error messages stay meaningful.
-  return candidates[0];
+export function resolveProfilesRootDetailed(): ShippedAssetResolution {
+  return resolveShippedAsset(PROFILES_ASSET, {
+    bundleDir: import.meta.dirname,
+    execPath: process.execPath,
+  });
 }
 
-export const PROFILES_ROOT = resolveProfilesRoot();
+export function resolveProfilesRoot(): string {
+  const resolution = resolveProfilesRootDetailed();
+  return resolution.path ?? resolution.candidates[0];
+}
+
+const PROFILES_RESOLUTION = resolveProfilesRootDetailed();
+export const PROFILES_ROOT =
+  PROFILES_RESOLUTION.path ?? PROFILES_RESOLUTION.candidates[0];
+/** Every path probed while resolving PROFILES_ROOT — for error messages. */
+export const PROFILES_ROOT_SEARCH: readonly string[] =
+  PROFILES_RESOLUTION.candidates;
 
 /**
  * Resolve the filesystem path for a named profile. Falls back to
@@ -93,7 +88,15 @@ export function getProfilePath(profileName: string): string {
   if (existsSync(fallback)) {
     return fallback;
   }
-  throw new Error(`Profile not found: ${profileName} (searched ${PROFILES_ROOT})`);
+  // Name EVERY path that was probed. When PROFILES_ROOT itself is the
+  // "nothing existed" fall-through (the SEA case, #4160), reporting only
+  // it tells the operator switchroom looked somewhere it never could
+  // have found anything.
+  const searched =
+    PROFILES_RESOLUTION.path === null
+      ? describeShippedAssetSearch(PROFILES_RESOLUTION)
+      : PROFILES_ROOT;
+  throw new Error(`Profile not found: ${profileName} (searched ${searched})`);
 }
 
 function hasProfileFiles(dir: string): boolean {

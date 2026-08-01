@@ -25,6 +25,12 @@ import { CRON_SCRIPT_BASENAME_RE, LEGACY_CRON_SCRIPT_BASENAME_RE } from "./cron-
 import { expandModelAlias } from "./model-aliases.js";
 import { atomicWriteFileSync } from "../util/atomic.js";
 import {
+  HINDSIGHT_VENDOR_ASSET,
+  describeShippedAssetSearch,
+  resolveShippedAsset,
+  type ShippedAssetResolution,
+} from "../util/shipped-assets.js";
+import {
   alignAgentTreeOwnershipIfRoot,
   findAgentUnreadablePaths,
   scopedAssertCandidates,
@@ -3098,11 +3104,19 @@ Thumbs.db
 }
 
 /**
- * Vendored hindsight-memory plugin location inside the switchroom repo.
- * Pinned to the version we ship; updated by `switchroom update`.
+ * Vendored hindsight-memory plugin location. Pinned to the version we
+ * ship; updated by `switchroom update`.
+ *
+ * Shares the shipped-asset probe with profiles/ and skills/ (#4160) —
+ * the bare `resolve(import.meta.dirname, "../../vendor/hindsight-memory")`
+ * resolved to `/vendor/hindsight-memory` inside a `bun build --compile`
+ * binary, where `import.meta.dirname` is the bunfs virtual root.
  */
-function resolveHindsightVendorPath(): string {
-  return resolve(import.meta.dirname, "../../vendor/hindsight-memory");
+function resolveHindsightVendorResolution(): ShippedAssetResolution {
+  return resolveShippedAsset(HINDSIGHT_VENDOR_ASSET, {
+    bundleDir: import.meta.dirname,
+    execPath: process.execPath,
+  });
 }
 
 /**
@@ -3170,8 +3184,8 @@ export function installHindsightPlugin(
     return null;
   }
 
-  const sourcePath = resolveHindsightVendorPath();
-  if (!existsSync(sourcePath)) {
+  const vendorResolution = resolveHindsightVendorResolution();
+  if (vendorResolution.path === null) {
     // Loud about it: a missing vendor dir means the npm tarball was
     // packed without the `vendor/` entry (regression of the bug fixed
     // in this PR — `files` array in package.json must include
@@ -3179,12 +3193,14 @@ export function installHindsightPlugin(
     // never refreshing the hindsight plugin tree on existing agents,
     // forcing manual sed workarounds across 9 agents.
     process.stderr.write(
-      `installHindsightPlugin: vendor source missing at ${sourcePath} ` +
+      `installHindsightPlugin: vendor source missing ` +
+        `(${describeShippedAssetSearch(vendorResolution)}) ` +
         `— hindsight plugin NOT installed for ${agentName}. ` +
         `Likely a packaging regression: check the npm tarball's files array.\n`,
     );
     return null;
   }
+  const sourcePath = vendorResolution.path;
 
   // Copy the vendored plugin into the agent's .claude/plugins dir.
   // Force overwrite on every reconcile so plugin updates from
