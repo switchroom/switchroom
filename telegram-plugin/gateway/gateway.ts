@@ -11460,7 +11460,10 @@ if (isGatewayMain) ipcServer = createIpcServer({
             () =>
               // allow-raw-bot-api: in-place edit of the ordinary status message.
               bot.api.editMessageText(chatId, messageId, richMessage(text), {}),
-            { chat_id: String(chatId), verb: 'rollout-status-edit' },
+            // priorityClass EXPLICIT, never inherited from the untagged
+            // default — a shed edit would reply a false ok:true. See the
+            // "Why this call is tagged critical" note in rollout-status-edit.ts.
+            { chat_id: String(chatId), verb: 'rollout-status-edit', priorityClass: 'critical' },
           ),
         log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
       },

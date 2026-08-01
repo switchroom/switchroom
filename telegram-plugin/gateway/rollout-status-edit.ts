@@ -21,6 +21,20 @@
  * Still fire-and-forget toward the ROLL: the reply is advisory, hostd never
  * blocks on it, and a gateway that predates this reply simply times out
  * hostd-side and behaves exactly as before.
+ *
+ * Why this call is tagged `priorityClass: 'critical'`
+ * ---------------------------------------------------
+ * The wiring in gateway.ts tags the `rollout-status-edit` `robustApiCall`
+ * EXPLICITLY rather than inheriting the untagged default
+ * (`UNTAGGED_SEND_CLASS`, today `'critical'` — never shed). The handler below
+ * infers success from the ABSENCE of a throw, and a shed send does not throw:
+ * the send gate returns `SEND_GATE_SHED` without ever calling Telegram. So if
+ * a future change to the untagged default made this call sheddable, this
+ * handler would reply `ok:true` for an edit that never happened, and hostd
+ * would record the operator's card as live and current while it sat frozen —
+ * the same silent-inertness class of bug as the dropped reply that
+ * tests/rollout-narration-edit-socket.test.ts now pins. Tagging the class at
+ * the call site makes that impossible to change by accident.
  */
 
 import type {

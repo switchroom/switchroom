@@ -213,6 +213,10 @@ export default defineConfig({
       // ipc-server-check-pre-approved.test.ts (#2975 Stage 2) drives a real
       // createIpcServer (Bun.listen) over a tmp UDS — run via test:bun.
       "**/telegram-plugin/tests/ipc-server-check-pre-approved.test.ts",
+      // rollout-narration-edit-socket.test.ts (#4065) drives a real
+      // createIpcServer (Bun.listen) over a tmp UDS against the real hostd
+      // narration relay — Bun.listen is a bun built-in, so run via bun.
+      "**/telegram-plugin/tests/rollout-narration-edit-socket.test.ts",
       "**/telegram-plugin/tests/gateway-bridge.test.ts",
       "**/telegram-plugin/tests/gateway-startup-mutex.test.ts",
       "**/telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",

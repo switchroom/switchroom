@@ -204,9 +204,18 @@ export class SocketRolloutNarrationRelay implements RolloutNarrationRelay {
               text: args.text,
             }) + "\n",
           );
-          // Half-close: nothing more to write, but the socket stays readable
-          // for the `rollout_status_edited` reply.
-          client.end();
+          // NO half-close here. `client.end()` would send a FIN, and the
+          // gateway's IPC server is `Bun.listen`, which tears the connection
+          // down on the peer FIN (~5ms) rather than keeping it readable — its
+          // `socket.write` for the reply then returns -1 and `IpcClientImpl.send`
+          // does not check that, so the reply is dropped SILENTLY. The reply
+          // only exists after a Telegram round-trip (hundreds of ms), so a
+          // half-close loses it every single time and this whole feature
+          // degrades to `{ok:false, gone:false, reason:"no edit reply"}` — a
+          // frozen card, exactly the pre-fix behaviour. Instead we mirror
+          // `post()` above: hold the socket open and let `finish()` destroy it
+          // once the reply lands, the timeout fires, or the peer closes.
+          // Pinned by tests/rollout-narration-edit-socket.test.ts.
         } catch (e) {
           log(`narration edit write failed: ${(e as Error).message}`);
           finish({ ok: false, gone: false, reason: (e as Error).message });
