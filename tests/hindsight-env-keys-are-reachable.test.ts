@@ -33,7 +33,11 @@ const PROMOTED = [
   ["HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT", "2"],
   ["HINDSIGHT_API_RECALL_MAX_CONCURRENT", "16"],
   ["HINDSIGHT_API_REFLECT_WALL_TIMEOUT", "900"],
-  ["HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS", "2"],
+  // Canonical v0.8.6 name. The pre-0.8.6 alias
+  // (HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS) is still reachable, and
+  // normalises to this key — see the rename tests in
+  // src/setup/hindsight-perf-defaults.test.ts.
+  ["HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS", "2"],
   ["HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT", "8"],
   ["HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND", "1000"],
 ] as const;

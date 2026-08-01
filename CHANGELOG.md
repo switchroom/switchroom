@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Hindsight base image v0.8.5 → v0.8.6, and two patch blocks retired into config
+
+The pinned `vectorize-io/hindsight` base moves to v0.8.6
+(`sha256:ffa391a7…`, image revision `08995e30`), taking
+`docker/Dockerfile.hindsight` from thirteen build-time patch blocks to eleven.
+
+**Retired, because upstream now ships the behaviour:**
+
+- The TEMPORARY upstream #2968 graph-seed-reuse carry. v0.8.6 lands it natively
+  and adds `HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY`. switchroom now emits that
+  key explicitly at `0.3` rather than inheriting the default — inheriting would
+  turn a deliberate pin into "whatever the next base bump decides".
+- The consolidation-`maxItems`-grammar patch, replaced by
+  `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS`, emitted `false` on the local-LLM path
+  only (a hosted structured-output backend has no GBNF step to break). One
+  deliberate behaviour difference: the patch suppressed `maxItems` only above a
+  64-item threshold, the env key is all-or-nothing. Safe because the Python-side
+  truncation is unchanged, and pinned by the probe rather than assumed.
+
+Neither probe was deleted with its block. Both were rewritten as successor
+probes that assert the patch is really gone AND that the replacement mechanism
+buys the same outcome in the running image — deleting the only test that ever
+asserted a behaviour is how a retirement becomes a silent regression.
+
+**Re-anchored, because upstream restructured underneath them:** the worker-slot
+CEILING block (upstream #3016 deleted the `WORKER_SLOT_RESERVATION_TYPES` dict
+it anchored on; the ceiling table's key set is now asserted equal to upstream's
+`WORKER_SLOT_TYPE_DEFAULTS`, so an op type added or dropped upstream fails the
+BUILD instead of silently becoming uncappable), the reflect synthesis-temperature
+block, and the reflect-grounding block — whose wired call-site count legitimately
+drops 7 → 6 because upstream #3013 deleted the mid-loop budget-rewrite call site.
+
+**Kept deliberately:** the reflect-directive-isolation block. v0.8.6 adds an
+`apply_all_directives` flag, but it defaults to `False` and the default branch is
+byte-identical to the old defective fetch, so retiring the patch would silently
+regress directive scoping. The opt-in branch is left byte-for-byte upstream and
+the probe now asserts that structurally, via the AST, rather than by substring.
+
+**Config rename with a migration path (upstream #3016):**
+`HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS` → `..._RESERVED_SLOTS`. Setting both
+names for one type is a hard boot `ValueError`, so switchroom accepts the legacy
+name as *input*, normalises it, and emits only the canonical name — an existing
+`switchroom.yaml` keeps working and the boot failure is unreachable by
+construction. `HINDSIGHT_API_RETAIN_WALL_TIMEOUT` becomes reachable as an
+override-only key (no baked default).
+
+**Operator note:** `switchroom doctor`'s "hindsight version" row reads FAIL
+between installing this release and recreating the container, because the
+contract floor moves to 0.8.6 while the running container is still 0.8.5. It
+clears on `switchroom memory --update`. The migration is one additive,
+metadata-only revision (`c7d1e9a4b3f2`, measured 5.5 ms), and unlike the
+0.8.4→0.8.5 bump a rollback to 0.8.5 is a digest repoint alone — see
+`docs/operators/hindsight-memory.md`, which spells out why that is true of this
+revision specifically and must not be generalised.
+
 ## v0.19.42 — Memory-system reliability: config single-sourcing, honest health gauges, and total-loss self-heal
 
 Seventeen fixes, most of them in the hindsight memory stack. The theme is

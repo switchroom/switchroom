@@ -360,8 +360,12 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).not.toMatch(/switchroom hindsight duplicate-ANN-scan patch/);
     expect(dockerfile).not.toMatch(/def _graph_semantic_seeds\(/);
     expect(dockerfile).not.toMatch(/semantic_seeds=_graph_semantic_seeds\(/);
-    expect(dockerfile).not.toMatch(/_GRAPH_SEED_LIMIT/);
-    expect(dockerfile).not.toMatch(/_GRAPH_SEED_MIN_SIMILARITY/);
+    // Anchored on the LEADING underscore of the switchroom constant names, so
+    // they cannot be satisfied-by-accident by upstream's own
+    // HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY (v0.8.6+), which legitimately
+    // appears in this file now that the #2968 carry is retired.
+    expect(dockerfile).not.toMatch(/(?<![A-Za-z0-9])_GRAPH_SEED_LIMIT/);
+    expect(dockerfile).not.toMatch(/(?<![A-Za-z0-9])_GRAPH_SEED_MIN_SIMILARITY/);
     expect(dockerfile).not.toMatch(/temporal_seeds/);
   });
 
@@ -844,153 +848,51 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
-  it("keeps the upstream #2968 graph-seed-reuse carry (assert-guarded, fail-loud)", () => {
-    // TEMPORARY CARRY. Upstream merged b475f5cc to `main` on 2026-07-27, after
-    // v0.8.5 (the digest pinned in this Dockerfile) was cut, so there is no
-    // release to upgrade to. DELETE the block — and flip this test into a
-    // `does NOT carry` guard alongside the other retired patches — the moment
-    // the FROM digest resolves to v0.8.6 or newer.
+  it("does NOT carry the retired upstream #2968 graph-seed-reuse carry", () => {
+    // RETIRED in the v0.8.5 -> v0.8.6 base bump. v0.8.6 contains upstream merge
+    // b475f5cc natively, so the carry's own stated exit condition ("DELETE THIS
+    // BLOCK WHEN ... the FROM digest resolves to v0.8.6 or newer") is met. It
+    // self-detected the bump: its `graph_seed_min_similarity not in _cfg`
+    // assertion fired against the 0.8.6 image, exactly as designed.
     //
-    // SCOPE: structural, not behavioural. Every assertion here is a substring
-    // match, so it proves the patch is PRESENT, never that it RUNS. The
-    // behavioural gate is tests/docker/hindsight-graph-seed-patch.test.ts,
-    // which applies this block to the pinned image and asserts the derived
-    // seed ids equal the dedicated query's. Do not treat this file as
-    // sufficient.
+    // Asserted ABSENT rather than merely deleted: re-adding it on a later
+    // rebase would double-apply on top of the native implementation.
+    expect(dockerfile).not.toMatch(/# ── UPSTREAM CARRY: vectorize-io\/hindsight PR #2968/);
+    expect(dockerfile).not.toMatch(/merge commit: {3}b475f5cc/);
+    expect(dockerfile).not.toMatch(/preselected_semantic_seeds/);
+    expect(dockerfile).not.toMatch(/assert "graph_seed_min_similarity" not in _cfg,/);
+    expect(dockerfile).not.toMatch(/GRAPH_SEED_LIMIT = /);
 
-    // The provenance header must survive edits: without the merge SHA and the
-    // deletion condition, a future rebaser cannot tell an adopted carry from a
-    // switchroom-original patch.
-    expect(dockerfile).toMatch(
-      /# ── UPSTREAM CARRY: vectorize-io\/hindsight PR #2968 ─+/,
-    );
-    expect(dockerfile).toMatch(/#   merge commit:   b475f5cc/);
-    expect(dockerfile).toMatch(
-      /# DELETE THIS BLOCK WHEN, and only when, the `FROM` digest above resolves to\n# upstream v0\.8\.6 or newer/,
-    );
-
-    // The exact-once anchor guard (fail-loud on upstream drift). Shared by all
-    // five patched files via apply().
-    expect(dockerfile).toMatch(
-      /the \{label!r\} anchor was found \{n\}x \(expected 1\) in \{rel\}\./,
-    );
-
-    // The divergence guard. v0.8.5 hardcodes the graph seed floor; upstream
-    // main reads it from config. If a future base introduces the config key,
-    // the mirrored 0.3 would silently ignore the operator's setting, so the
-    // build must fail rather than diverge.
-    expect(dockerfile).toMatch(
-      /assert "graph_seed_min_similarity" not in _cfg,/,
-    );
-
-    // The load-bearing derivation, both halves.
-    expect(dockerfile).toMatch(
-      / +graph_seed_min_similarity=GRAPH_SEED_MIN_SIMILARITY,\\n"/,
-    );
-    expect(dockerfile).toMatch(
-      / +preselected_semantic_seeds=semantic_bm25_results\[ft\]\.graph_seeds,\\n"/,
-    );
-
-    // The CORRECTNESS GUARD is the reason this carry is safe at all: reuse is
-    // declined whenever the semantic arm's floor is stricter than the graph
-    // seed floor, because the shared pool would then be NARROWER than the
-    // dedicated query's result. Hard-coding the threshold would keep every
-    // other assertion green while silently quieting recall.
-    expect(dockerfile).toMatch(
-      /if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity/,
-    );
-    // ...and the trim must not be able to cut a seed out of the pool it feeds
-    // (thinking_budget below GRAPH_SEED_LIMIT).
-    expect(dockerfile).toMatch(
-      /semantic_candidate_limit = max\(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0\)/,
-    );
-    // An EMPTY preselected list must NOT re-trigger the scan; only None does.
-    expect(dockerfile).toMatch(/"            if preselected_semantic_seeds is None:\\n"/);
-
-    // The index-served UUID lookup, and the tolerance it must preserve:
-    // non-canonical ids matched nothing under `id::text` and must still match
-    // nothing, so they are filtered out BEFORE the ::uuid cast (which would
-    // otherwise raise 22P02 for the whole query).
-    expect(dockerfile).toMatch(/"            WHERE id = ANY\(\\n"/);
-    expect(dockerfile).toMatch(/SELECT input\.unit_id::uuid/);
-    expect(dockerfile).toMatch(
-      /WHERE input\.unit_id ~ '\^\[0-9a-f\]\{\{8\}\}-/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "id::text = ANY\(\$1\)" not in ops,/,
-    );
-
-    // Post-replace re-assertions (verification-on-build): a patch that applied
-    // but landed inert must fail the build.
-    expect(dockerfile).toMatch(
-      /assert le\.count\("await _find_semantic_seeds\("\) == 1,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert 'grouped\.get\("observation", \(\[\], \[\]\)\)\[0\]' not in cons,/,
-    );
-    // The repo-wide sweep: a missed caller of the reshaped combined query is an
-    // AttributeError on a live recall path, so it must be a build failure.
-    expect(dockerfile).toMatch(/for _p in BASE\.rglob\("\*\.py"\):/);
-    expect(dockerfile).toMatch(/assert not _stale,/);
-    // Every patched file is re-parsed, so a bad splice fails the build rather
-    // than the container.
-    expect(dockerfile).toMatch(/^    ast\.parse\(s\)$/m);
+    // The behaviour the carry pinned must NOT become "whatever upstream's
+    // default is". The carry mirrored v0.8.5's hardcoded 0.3; switchroom now
+    // emits the key explicitly instead (src/setup/hindsight-perf-defaults.ts,
+    // HINDSIGHT_DEFAULT_GRAPH_SEED_MIN_SIMILARITY), and the retirement note in
+    // the Dockerfile has to say so or the next reader cannot tell an adopted
+    // carry from an abandoned one.
+    expect(dockerfile).toMatch(/# ── RETIRED IN THE v0\.8\.5 -> v0\.8\.6 BASE BUMP/);
+    expect(dockerfile).toMatch(/HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY/);
   });
 
-  it("keeps the consolidation-maxItems-grammar fix (assert-guarded, fail-loud)", () => {
-    // `_build_response_model()` constrained `creates` with
-    // `PydanticField(max_length=clamped)` where `clamped` is the bank's
-    // REMAINING OBSERVATION-SLOT COUNT, so the request schema carried
-    // `"maxItems": 4230` on this fleet. llama.cpp/Ollama compile that to GBNF
-    // and a repetition count that large fails to build — HTTP 400 "Failed to
-    // initialize samplers: failed to parse grammar" — after which LiteLLM's
-    // router fallback re-sent the whole batch, verbatim private corpus text
-    // included, to the METERED OpenRouter deployment (56 such fallbacks logged
-    // for `Received Model Group=gpt-oss-20b-consolidation`, 2026-07-28).
+  it("does NOT carry the retired consolidation-maxItems-grammar patch", () => {
+    // RETIRED in the v0.8.5 -> v0.8.6 base bump. v0.8.6 adds
+    // `_build_response_model(..., supports_max_items: bool = True)` driven by
+    // HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS, which omits the `maxItems` schema
+    // hint entirely when false — so the GBNF-compilation failure that pushed
+    // verbatim private corpus text to a METERED provider is now fixable by
+    // configuration. switchroom emits the key on the local-LLM path; see
+    // HINDSIGHT_DEFAULT_LLM_SUPPORTS_MAX_ITEMS.
     //
-    // SCOPE: this test is structural, not behavioural. Every assertion below is
-    // an unanchored substring match, so it proves the patch is PRESENT, never
-    // that the number it emits is compilable — raising the ceiling to 100_000
-    // keeps all of them green. The behavioural gate is
-    // tests/docker/hindsight-maxitems-grammar-patch.test.ts, which applies this
-    // block to the pinned image and reads the `maxItems` pydantic actually
-    // serialises at a production-like 4,230. Do not treat this file as
-    // sufficient.
+    // Asserted ABSENT: the patch's anchor no longer exists on 0.8.6 (verified —
+    // it fails with `anchor found 0x`), so re-adding it would break the build,
+    // and its ceiling constant would be a second, drifting opinion about a
+    // behaviour upstream now owns.
+    expect(dockerfile).not.toMatch(/switchroom hindsight consolidation-maxItems-grammar patch/);
+    expect(dockerfile).not.toMatch(/SWITCHROOM_MAX_CREATES_SCHEMA_CEILING/);
+    expect(dockerfile).not.toMatch(/max_length=clamped/);
 
-    // The exact-once anchor guard (fail-loud on upstream drift).
-    expect(dockerfile).toMatch(
-      /switchroom hindsight consolidation-maxItems-grammar patch/,
-    );
-    expect(dockerfile).toMatch(
-      /f"\{TAG\}: anchor found \{n\}x \(expected 1\) in \{rel\} — upstream "/,
-    );
-    // The ceiling, and the branch that omits the constraint above it. Omitting
-    // beats clamping: a clamp moves the threshold and asserts a bound that is
-    // not true, so `maxItems` would still be a number nobody can compile at
-    // some other bank size.
-    expect(dockerfile).toMatch(/SWITCHROOM_MAX_CREATES_SCHEMA_CEILING = 64\\n/);
-    expect(dockerfile).toMatch(
-      /if max_creates > SWITCHROOM_MAX_CREATES_SCHEMA_CEILING:\\n/,
-    );
-    // The premise that makes omission safe: the cap is still enforced in
-    // Python after validation. If upstream ever drops that truncation, this
-    // patch must fail the build rather than silently uncap observations.
-    expect(dockerfile).toMatch(
-      /assert "creates = creates\[:remaining_observation_slots\]" in new,/,
-    );
-    // The caller contract the whole defect hangs on.
-    expect(dockerfile).toMatch(
-      /assert new\.count\("_build_response_model\(max_creates=remaining_observation_slots\)"\) == 1,/,
-    );
-    // Post-replace re-assertions (verification-on-build): a patch that applied
-    // but landed inert must fail the build.
-    expect(dockerfile).toMatch(
-      /assert new\.count\("SWITCHROOM_MAX_CREATES_SCHEMA_CEILING"\) == 2,/,
-    );
-    expect(dockerfile).toMatch(/assert new\.count\("max_length=clamped"\) == 1,/);
-    expect(dockerfile).toMatch(
-      /switchroom hindsight consolidation-maxItems-grammar patch: the consolidation /,
-    );
+    // The replacement has to be named where the patch used to be, or the next
+    // reader sees a deleted egress control and no successor.
+    expect(dockerfile).toMatch(/HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS/);
   });
 
   it("keeps the reflect-directive-isolation fix (assert-guarded, fail-loud)", () => {
@@ -1025,10 +927,16 @@ describe("Dockerfile.hindsight shape", () => {
     );
     // The splice itself: the flag reflect passes, and the now-inverted upstream
     // comment that would otherwise sit directly above it.
-    expect(dockerfile).toMatch(/"            isolation_mode=True,\\n"/);
-    expect(dockerfile).toMatch(/"            isolation_mode=False,\\n"/);
+    expect(dockerfile).toMatch(/"                isolation_mode=True,\\n"/);
+    expect(dockerfile).toMatch(/"                isolation_mode=False,\\n"/);
+    // v0.8.6 wrapped the fetch in `if apply_all_directives: / else:`. This
+    // patch flips the ELSE (default) branch only; the opt-in branch is left
+    // byte-for-byte upstream, and the build asserts it still exists.
     expect(dockerfile).toMatch(
-      /# Use isolation_mode=True to prevent tag-scoped directives from leaking into untagged operations\\n/,
+      /# Scope directives like memories: untagged directives always apply, tagged\\n/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "        if apply_all_directives:\\n" in t,/,
     );
     // The premise that makes the flip NARROW: the flag is consulted only on the
     // no-tags path. If upstream widens that condition, flipping it would start
@@ -1040,7 +948,7 @@ describe("Dockerfile.hindsight shape", () => {
     // but landed inert must fail the build.
     expect(dockerfile).toMatch(/assert "isolation_mode=True," not in t,/);
     expect(dockerfile).toMatch(
-      /assert t\.count\("            isolation_mode=False,\\n        \)\\n"\) == 1,/,
+      /assert t\.count\("                isolation_mode=False,\\n            \)\\n"\) == 2,/,
     );
     // The scoping the flag is NOT replacing: a tagged reflect must still be
     // scoped by the untagged-OR-matching clauses.
@@ -1141,12 +1049,15 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /DEFAULT_LLM_TEMPERATURE_REFLECT = 0\.1 {2}# reflect: factual synthesis \(switchroom\)/,
     );
-    // Post-replace re-assertions: exactly 7 wired call sites (6x reflect + the
+    // Post-replace re-assertions: exactly 6 wired call sites (5x reflect + the
     // reflect_tool_call kwargs), the site count itself pinned, the structured
     // -extraction non-goal untouched, and the provider still forwarding.
-    expect(dockerfile).toMatch(/assert n_temp == 7,/);
+    // v0.8.6 deleted the mid-loop budget-rewrite call site, so both counts
+    // dropped by one; they are asserted exactly so the next upstream change
+    // fails the build instead of leaving a site at the provider default.
+    expect(dockerfile).toMatch(/assert n_temp == 6,/);
     expect(dockerfile).toMatch(
-      /assert t\.count\('scope="reflect",'\) == 6,/,
+      /assert t\.count\('scope="reflect",'\) == 5,/,
     );
     expect(dockerfile).toMatch(
       /assert 'scope="reflect_structured",' in t,/,

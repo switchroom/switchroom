@@ -7,6 +7,16 @@
  * same probe against unpatched upstream (must be RED) and against upstream +
  * the patch block applied (must be GREEN).
  *
+ * v0.8.6 RE-ANCHORING (upstream #3013). The reflect rework wrapped this fetch in
+ * an `if apply_all_directives: / else:` pair (memory_engine.py:10145-10167) and
+ * exposed a per-request `apply_all_directives` flag on MCP (mcp_tools.py:1023,
+ * :1118) and HTTP (api/http.py:959). The flag DEFAULTS TO FALSE and the
+ * else-branch is the old fetch byte-for-byte, so the defect below is unchanged
+ * — which is why the patch was re-anchored rather than retired. This probe now
+ * selects the else-branch structurally and additionally asserts the opt-in
+ * branch stays untouched, so "the patch leaked into the opt-in path" is a red
+ * test rather than a silent widening.
+ *
  * THE DEFECT. `reflect_async` loads its directives with `isolation_mode=True`,
  * and `list_directives` turns that flag into a hard
  * `tags IS NULL OR tags = '{}'` filter whenever the caller supplied no tags. So
@@ -143,23 +153,77 @@ from hindsight_api.models import RequestContext
 # unpatched upstream and GREEN once patched.
 # =====================================================================
 tree = ast.parse(textwrap.dedent(inspect.getsource(MemoryEngine.reflect_async)))
-calls = [
-    n
-    for n in ast.walk(tree)
-    if isinstance(n, ast.Call)
-    and isinstance(n.func, ast.Attribute)
-    and n.func.attr == "list_directives"
-]
-if len(calls) != 1:
+
+
+def _directive_calls(nodes):
+    return [
+        n
+        for n in nodes
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "list_directives"
+    ]
+
+
+calls = _directive_calls(ast.walk(tree))
+if len(calls) != 2:
     fail(
-        f"expected exactly 1 list_directives call in reflect_async, found {len(calls)} "
-        "- re-author the patch and this probe together"
+        f"expected exactly 2 list_directives calls in reflect_async, found {len(calls)} "
+        "- v0.8.6 (upstream #3013) split the fetch into an "
+        "if apply_all_directives: / else: pair; re-author the patch and this probe together"
     )
     print("PROBE_EXECUTED")
     print("FAILURES", failures)
     raise SystemExit(1)
 
-call = calls[0]
+# The DEFAULT branch is the one under test. apply_all_directives is a
+# per-request opt-in that defaults to False (mcp_tools.py:1023/:1118,
+# api/http.py:959), so the else-branch is what every ordinary reflect takes —
+# and it is byte-for-byte the pre-0.8.6 defective fetch. Selected structurally
+# from the if/else rather than by index, so a reordering upstream cannot
+# silently point this probe at the opt-in branch.
+branch = [
+    n
+    for n in ast.walk(tree)
+    if isinstance(n, ast.If)
+    and isinstance(n.test, ast.Name)
+    and n.test.id == "apply_all_directives"
+    and _directive_calls(ast.walk(n))
+]
+if len(branch) != 1:
+    fail(
+        f"expected exactly 1 if-apply_all_directives guarding the directive fetch, "
+        f"found {len(branch)} - upstream restructured the reflect directive fetch again"
+    )
+    print("PROBE_EXECUTED")
+    print("FAILURES", failures)
+    raise SystemExit(1)
+
+default_calls = _directive_calls(ast.walk(ast.Module(body=branch[0].orelse, type_ignores=[])))
+optin_calls = _directive_calls(ast.walk(ast.Module(body=branch[0].body, type_ignores=[])))
+if len(default_calls) != 1 or len(optin_calls) != 1:
+    fail(
+        f"expected 1 directive fetch per branch, found opt-in={len(optin_calls)} "
+        f"default={len(default_calls)}"
+    )
+    print("PROBE_EXECUTED")
+    print("FAILURES", failures)
+    raise SystemExit(1)
+
+# THE OPT-IN BRANCH MUST STAY UPSTREAM'S. The patch deliberately touches only
+# the else-branch: apply_all_directives=True explicitly means "ignore tag
+# scope entirely", which is strictly wider than what this fix does. If the
+# patch ever bled into this branch, the two would become indistinguishable and
+# the flag would stop meaning anything.
+optin_kwargs = sorted(kw.arg for kw in optin_calls[0].keywords)
+print("OPTIN_DIRECTIVE_KWARGS", optin_kwargs)
+if optin_kwargs != ["active_only", "bank_id", "isolation_mode", "request_context"]:
+    fail(
+        "the apply_all_directives=True branch is no longer upstream's untouched "
+        f"no-tag fetch: {optin_kwargs}"
+    )
+
+call = default_calls[0]
 kwarg_names = [kw.arg for kw in call.keywords]
 print("REFLECT_DIRECTIVE_KWARGS", kwarg_names)
 

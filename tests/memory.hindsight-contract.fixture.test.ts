@@ -41,8 +41,8 @@ const snapshot = JSON.parse(
   readFileSync(resolve(__dirname, "fixtures", "hindsight-tools-list.snapshot.json"), "utf-8"),
 ) as Snapshot;
 
-/** Tool count on the hindsight surface switchroom targets (0.8.4; 0.8.5 adds
- *  and removes none — both wheels register 32). */
+/** Tool count on the hindsight surface switchroom targets (0.8.4; 0.8.5 and
+ *  0.8.6 add and remove none — all three wheels register 32). */
 const HINDSIGHT_TOOL_COUNT = 32;
 
 /**
@@ -131,6 +131,36 @@ describe("hindsight contract — golden snapshot integrity", () => {
             "cold-boot manifest promise a filter the server silently ignores",
       ).toBe(shouldHaveTagProps);
     }
+  });
+
+  /**
+   * The 0.8.5 → 0.8.6 delta, pinned by name in BOTH directions.
+   *
+   * `reflect.apply_all_directives` (upstream #3013) is the ENTIRE tool-surface
+   * difference between the 0.8.5 and 0.8.6 wheels — derived by dumping
+   * `create_mcp_server(memory, multi_bank=True)`'s registration surface inside
+   * each pinned digest, with the 0.8.5 run reproducing this fixture's previous
+   * revision byte-for-byte before the 0.8.6 run was trusted.
+   *
+   * Pinned both ways for the same reason the 0.8.4→0.8.5 assertion above is:
+   *  - on a pre-0.8.6 pin, advertising it would make an agent send an argument
+   *    the server drops SILENTLY (isError:false) while believing directive
+   *    scope was widened — and, because FALLBACK_TOOL_TABLE doubles as the
+   *    tools/CALL allowlist, would wave that argument through the guard;
+   *  - on the 0.8.6 pin it must actually BE captured, so bumping the version
+   *    marker without re-capturing the fixture cannot pass.
+   */
+  it("carries reflect.apply_all_directives exactly when the pinned wheel registers it", () => {
+    const pinned = pinnedHindsightApiVersion();
+    const shouldHaveFlag = pinned !== "0.8.4" && pinned !== "0.8.5";
+    expect(
+      (snapshot.tools["reflect"]?.props as string[]).includes("apply_all_directives"),
+      shouldHaveFlag
+        ? "reflect.apply_all_directives exists on " + pinned + " but is missing from the " +
+          "snapshot — the marker was bumped without re-capturing the fixture from the pinned image"
+        : "reflect.apply_all_directives does not exist on " + pinned + "; advertising it makes " +
+          "the shim's cold-boot manifest promise a directive-scope switch the server ignores",
+    ).toBe(shouldHaveFlag);
   });
 
   it("HINDSIGHT_MIN_API_VERSION names the version this snapshot was captured from", () => {

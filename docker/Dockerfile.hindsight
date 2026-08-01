@@ -31,34 +31,43 @@
 # from another org; an upstream repoint would otherwise flow into the
 # published hindsight image undetected. Dependabot tracks bumps.
 #
-# Pinned to vectorize-io/hindsight v0.8.5 (digest below; label
-# org.opencontainers.image.version=0.8.5, image revision 705757f3, built
-# 2026-07-22). Bumped from v0.8.4 (sha256:2c60f233…) to pick up
-# `hindsight-admin repair-bank` — upstream #2645: per-(bank, fact_type)
-# vector indexes never self-heal, so banks populated outside the create-time
-# path fall back to the global HNSW + post-filter and silently under-return
-# recall candidates. 0.8.5 ALSO lands natively two fixes switchroom used to
-# carry as patches in this file (the unit_entities FK-race, upstream #2662,
-# and `tools=[]` on the standard claude_code call), both of which were
-# dropped in the same commit as this bump. Applying it runs 4 alembic
-# migrations (head b57a7c9e0d13 → d7b2f8a1c934), one of which drops the
-# `search_vector` column from the invalidated_memory_units archive. 0.8.5 no
-# longer reads that column — but 0.8.4 REQUIRES it (its archive round-trip
-# excludes only `"embedding"`, memory_engine.py:6579), so this migration is
-# what makes a naive rollback break. NOT "unused": unused on the version you
-# roll forward to, load-bearing on the one you roll back to.
+# Pinned to vectorize-io/hindsight v0.8.6 (digest below; label
+# org.opencontainers.image.version=0.8.6, image revision 08995e30, built
+# 2026-07-29). Bumped from v0.8.5 (sha256:0710076c…) to pick up, natively,
+# three things switchroom either carried as a patch or could not configure:
+#   * upstream #2968 (graph seed reuse + the fetch_unit_dates UUID cast) —
+#     this file carried it as an UPSTREAM CARRY block; now retired.
+#   * upstream `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS` — makes the consolidation
+#     `maxItems` grammar patch a config toggle; that block is now retired too.
+#   * upstream #3016 — the per-type worker slot env vars are renamed
+#     `HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS` → `..._RESERVED_SLOTS`. THE OLD
+#     NAME IS A DEPRECATED ALIAS AND SETTING BOTH NAMES FOR THE SAME TYPE IS A
+#     HARD BOOT ValueError (verified live against this digest). switchroom's
+#     emitter therefore accepts the old name as INPUT and always emits the
+#     canonical one, never both — see src/setup/hindsight-perf-defaults.ts.
 #
-# ROLLING BACK IS TWO ORDERED STEPS, NOT ONE: alembic downgrade FIRST (while
-# this image is still running — it is the only one that ships the
-# down-revisions), THEN repoint the digest. Reverting the digest alone leaves
-# every invalidate / revert-of-an-invalidate failing with
-# `column "search_vector" does not exist`, and the older image will NOT stop
-# you at boot — it logs "Database is at a newer migration revision …" and
-# carries on. Full runbook, including the empty-column caveat:
+# MIGRATION COST: exactly ONE new alembic revision, c7d1e9a4b3f2
+# (head d7b2f8a1c934 → c7d1e9a4b3f2), adding `causal_links JSONB NOT NULL
+# DEFAULT '[]'` to the invalidated_memory_units archive so revert-of-an-
+# invalidate can rematerialize causal edges. `ADD COLUMN … DEFAULT` is
+# metadata-only on PG 11+; measured 5.5 ms on this fleet's volume.
+#
+# ROLLING BACK to 0.8.5 is, for THIS revision only, safe without a downgrade:
+# the column is additive, defaulted, lives on the archive alone, and 0.8.5
+# discovers the archive column list by introspecting `memory_units` (not the
+# archive) in `_memory_unit_columns` (memory_engine.py:6638-6652), so it never
+# sees the new column. That is the opposite of the 0.8.4→0.8.5 bump, where a
+# DROP COLUMN made a naive rollback break. Do NOT generalise it: the ordered
+# two-step (alembic downgrade FIRST while this image still runs, THEN repoint
+# the digest) remains the rule for any bump that drops or narrows a column,
+# because an older image does not stop you at boot — it logs "Database is at a
+# newer migration revision …" and carries on. Full runbook:
 # docs/operators/hindsight-memory.md § "Rolling the base image BACK".
 #
-# Prior history: v0.8.2→v0.8.4 merged divergent alembic heads and widened
-# bank_id columns; v0.7.1→v0.8.2 fixed the `batch_retain`
+# Prior history: v0.8.4→v0.8.5 picked up `hindsight-admin repair-bank`
+# (upstream #2645) and dropped `search_vector` from the archive, which is what
+# made THAT rollback a two-step; v0.8.2→v0.8.4 merged divergent alembic heads
+# and widened bank_id columns; v0.7.1→v0.8.2 fixed the `batch_retain`
 # ForeignKeyViolation on `unit_entities` (switchroom #2392). NOTE: upstream
 # publishes only `:latest` (no `:vX.Y.Z` tag in ghcr), so the digest IS the
 # version pin. A bump runs DB migrations on the persisted memory volume —
@@ -73,8 +82,8 @@
 # the pinned image makes the shim's cold-boot fallback advertise props the
 # server silently drops, and the agent then believes a filter applied when it
 # did not.
-# switchroom:hindsight-api-version=0.8.5
-FROM ghcr.io/vectorize-io/hindsight:latest@sha256:0710076cd1539b4f89537d2e5b0ea1e4d179885bc12809a56cf748c538c8c4fb
+# switchroom:hindsight-api-version=0.8.6
+FROM ghcr.io/vectorize-io/hindsight:latest@sha256:ffa391a77284e49f6b55e32c86f33529ac4257831407b14038a72b6a0a232039
 
 USER root
 
@@ -946,8 +955,8 @@ PYEOF
 
 # A real per-operation-type worker slot CEILING.
 #
-# HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS is a FLOOR despite the name: see
-# config.WORKER_SLOT_RESERVATION_TYPES and WorkerPoller._get_available_slots,
+# `HINDSIGHT_API_WORKER_<TYPE>_RESERVED_SLOTS` is a FLOOR, not a cap: see
+# config._parse_worker_slot_reservations and WorkerPoller._get_available_slots,
 # "when an operation type's in-flight count exceeds its reservation, the excess
 # tasks are considered to be using shared pool slots". So a worker log reading
 # `consolidation=6/1(avail=0)` is documented behaviour, not an overrun. The real
@@ -964,8 +973,29 @@ PYEOF
 # are never transitioned out of 'pending', so their locks drop with the
 # transaction and they are claimed on a later poll.
 #
-# The misleading ..._MAX_SLOTS name is deliberately NOT changed here (renaming a
-# shipped env var is a breaking config change); it is filed upstream instead.
+# RE-AUTHORED FOR v0.8.6 (upstream #3016). 0.8.5 exposed the reservations as a
+# module-level `WORKER_SLOT_RESERVATION_TYPES` dict of
+# `op_type -> (env_var, default)`, which this patch both anchored on and reused
+# for its error messages. 0.8.6 replaced it with `WORKER_SLOT_TYPE_DEFAULTS`
+# (`op_type -> default`) plus `_parse_worker_slot_reservations()`, which DERIVES
+# the env var name as `HINDSIGHT_API_WORKER_<TYPE>_RESERVED_SLOTS` and accepts
+# the old `..._MAX_SLOTS` spelling as a deprecated alias. Three consequences,
+# all handled below:
+#   * the ceiling table is now anchored after `_parse_worker_slot_reservations`
+#     rather than inside a dict literal that no longer exists;
+#   * the reservation env var in the "ceiling below its own reservation" error
+#     is derived the same way upstream derives it, instead of read out of the
+#     deleted dict;
+#   * WORKER_SLOT_LIMIT_TYPES is the ONLY remaining hard-coded per-type table in
+#     this patch, so the verification below asserts its key set still equals
+#     upstream's WORKER_SLOT_TYPE_DEFAULTS. An op type upstream adds (or drops)
+#     therefore fails the BUILD rather than silently becoming uncappable.
+#
+# Upstream's rename is a rename of the RESERVATION knob only — 0.8.6 still has
+# no ceiling of any kind (worker/poller.py `_get_available_slots` is unchanged
+# from 0.8.5), so this patch is still needed in full. Our own ceiling key,
+# `HINDSIGHT_API_WORKER_<TYPE>_SLOT_LIMIT`, is switchroom-authored and collides
+# with nothing upstream.
 #
 # ORDER-COUPLED WITH THE recall-admission-split BLOCK ABOVE — DO NOT SWAP THEM.
 # Both append a validation clause to config.py at the same
@@ -998,25 +1028,35 @@ def apply(rel, edits, expect=1):
 
 
 # ---- 1. config.py: WORKER_SLOT_LIMIT_TYPES (a real CEILING) + boot validation ----
+#
+# switchroom (v0.8.6 re-anchor): upstream #3016 deleted the
+# WORKER_SLOT_RESERVATION_TYPES dict this used to append to. The ceiling table is
+# now appended after `_parse_worker_slot_reservations`, whose closing
+# `return reservations` is the anchor.
 cfg_new = apply("config.py", [
     (
-        '    "import_documents": ("HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_MAX_SLOTS", 0),\n'
-        "}\n",
+        "        if reserved > 0:\n"
+        "            reservations[op_type] = reserved\n"
+        "    return reservations\n",
 
-        '    "import_documents": ("HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_MAX_SLOTS", 0),\n'
-        "}\n"
+        "        if reserved > 0:\n"
+        "            reservations[op_type] = reserved\n"
+        "    return reservations\n"
+        "\n"
         "\n"
         "# switchroom: per-operation-type slot CEILINGS.\n"
         "#\n"
-        "# WORKER_SLOT_RESERVATION_TYPES above is a FLOOR, despite the ..._MAX_SLOTS\n"
-        "# names. A reservation guarantees a type that much capacity but does NOT stop\n"
-        "# it from ALSO taking the shared pool: see WorkerPoller._get_available_slots,\n"
-        '# "when an operation type\'s in-flight count exceeds its reservation, the excess\n'
-        '# tasks are considered to be using shared pool slots". That is why the worker\n'
-        "# progress log can read `consolidation=6/1(avail=0)` — six consolidation tasks\n"
-        "# against a reservation of one. Documented behaviour, not a bug; but nothing in\n"
-        "# upstream stopped consolidation occupying all DEFAULT_WORKER_MAX_SLOTS and\n"
-        "# starving every other operation type.\n"
+        "# A reservation (WORKER_SLOT_TYPE_DEFAULTS /\n"
+        "# HINDSIGHT_API_WORKER_<TYPE>_RESERVED_SLOTS, above) is a FLOOR. It guarantees a\n"
+        "# type that much capacity but does NOT stop it from ALSO taking the shared pool:\n"
+        '# see WorkerPoller._get_available_slots, "when an operation type\'s in-flight\n'
+        '# count exceeds its reservation, the excess tasks are considered to be using\n'
+        '# shared pool slots". That is why the worker progress log can read\n'
+        "# `consolidation=6/1(avail=0)` — six consolidation tasks against a reservation\n"
+        "# of one. Documented behaviour, not a bug; but nothing in upstream stops\n"
+        "# consolidation occupying all DEFAULT_WORKER_MAX_SLOTS and starving every other\n"
+        "# operation type. Upstream #3016 renamed the reservation knob; it did not add a\n"
+        "# ceiling.\n"
         "#\n"
         "# These entries are the missing ceiling: a hard cap on how many slots one\n"
         "# operation type may hold at once, reserved and shared combined. Each maps an\n"
@@ -1068,21 +1108,13 @@ cfg_new = apply("config.py", [
         "    worker_slot_reservations: dict[str, int]\n",
         "    worker_slot_reservations: dict[str, int]\n"
         "    # switchroom: per-type CEILINGS (see WORKER_SLOT_LIMIT_TYPES). Absent key =\n"
-        "    # uncapped. This is the cap the ..._MAX_SLOTS reservations above are NOT.\n"
+        "    # uncapped. This is the cap the ..._RESERVED_SLOTS reservations above are NOT.\n"
         "    worker_slot_limits: dict[str, int]\n",
     ),
     (
-        "            worker_slot_reservations={\n"
-        "                op_type: int(os.getenv(env_var, str(default)))\n"
-        "                for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()\n"
-        "                if int(os.getenv(env_var, str(default))) > 0\n"
-        "            },\n",
+        "            worker_slot_reservations=worker_slot_reservations,\n",
 
-        "            worker_slot_reservations={\n"
-        "                op_type: int(os.getenv(env_var, str(default)))\n"
-        "                for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()\n"
-        "                if int(os.getenv(env_var, str(default))) > 0\n"
-        "            },\n"
+        "            worker_slot_reservations=worker_slot_reservations,\n"
         "            worker_slot_limits=_parse_worker_slot_limits(\n"
         "                os.getenv, int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS)))\n"
         "            ),\n",
@@ -1116,7 +1148,11 @@ cfg_new = apply("config.py", [
         '                    f"Per-operation slot limit for {op_type!r} ({limit}) is below its own slot "\n'
         '                    f"RESERVATION ({reserved}) — the reservation could never be filled. Raise '
         '{env_var} "\n'
-        '                    f"or lower {WORKER_SLOT_RESERVATION_TYPES.get(op_type, (op_type, 0))[0]}."\n'
+        "                    # switchroom (v0.8.6): upstream #3016 deleted\n"
+        "                    # WORKER_SLOT_RESERVATION_TYPES. Derive the reservation env var the\n"
+        "                    # same way _parse_worker_slot_reservations does, so the remedy this\n"
+        "                    # error names is the name an operator actually sets.\n"
+        '                    f"or lower HINDSIGHT_API_WORKER_{op_type.upper()}_RESERVED_SLOTS."\n'
         "                )\n",
     ),
 ])
@@ -1750,6 +1786,41 @@ assert "WORKER_SLOT_LIMIT_TYPES: dict[str, tuple[str, int | None]]" in cfg_new, 
 assert "worker_slot_limits: dict[str, int]" in cfg_new, (
     "switchroom hindsight worker-slot-ceiling patch: config field missing after patch"
 )
+# switchroom (v0.8.6): WORKER_SLOT_LIMIT_TYPES is the last per-type table this
+# patch hard-codes. Upstream owns the roster (WORKER_SLOT_TYPE_DEFAULTS); if it
+# adds or removes an operation type, a type would silently become uncappable —
+# or we would ship a ceiling for a type that no longer exists. Compare the key
+# sets by EXECUTING the patched module, not by regex, so a reformat cannot fool
+# it. Import the package (not the bare file) because config.py uses relative
+# imports.
+import subprocess
+import sys
+
+_keys_probe = subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        "from hindsight_api.config import WORKER_SLOT_TYPE_DEFAULTS, WORKER_SLOT_LIMIT_TYPES\n"
+        "up = sorted(WORKER_SLOT_TYPE_DEFAULTS)\n"
+        "ours = sorted(WORKER_SLOT_LIMIT_TYPES)\n"
+        "assert up == ours, (\n"
+        "    'switchroom hindsight worker-slot-ceiling patch: operation-type roster drifted. '\n"
+        "    f'upstream WORKER_SLOT_TYPE_DEFAULTS={up} but switchroom WORKER_SLOT_LIMIT_TYPES={ours}. '\n"
+        "    'Update WORKER_SLOT_LIMIT_TYPES in docker/Dockerfile.hindsight — a type missing from it '\n"
+        "    'is silently uncappable.'\n"
+        ")\n"
+        "print('worker slot roster ok:', ours)",
+    ],
+    cwd="/app/api",
+    capture_output=True,
+    text=True,
+)
+assert _keys_probe.returncode == 0, (
+    "switchroom hindsight worker-slot-ceiling patch: operation-type roster check failed:\n"
+    + _keys_probe.stdout
+    + _keys_probe.stderr
+)
+print(_keys_probe.stdout.strip())
 assert "worker_slot_limits=_parse_worker_slot_limits(" in cfg_new, (
     "switchroom hindsight worker-slot-ceiling patch: from_env wiring missing after patch"
 )
@@ -1940,9 +2011,9 @@ PYEOF
 # vectorize-io/hindsight#1269 / #3031).
 #
 # THE DEFECT, in the real shipping source. `reflect_async` loads its directives
-# with `isolation_mode=True` (engine/memory_engine.py ~:9390), and
+# with `isolation_mode=True` (engine/memory_engine.py ~:10166 on 0.8.6), and
 # `list_directives` turns that flag into a hard filter whenever the caller
-# supplied no tags (~:11655):
+# supplied no tags (~:12531):
 #
 #     if not tags and not tag_groups and isolation_mode:
 #         # Isolation mode: only include directives with empty/null tags
@@ -1981,6 +2052,23 @@ PYEOF
 # is why the same bank's directives read complete on the recall hook and 45%
 # short in reflect. This closes that inconsistency at the source.
 #
+# v0.8.6 RE-ANCHORING — AND WHY THIS PATCH IS NOT RETIRED. Upstream #3013's
+# reflect rework wrapped the directive fetch in an `if apply_all_directives: /
+# else:` pair (memory_engine.py:10145-10167) and exposed a new per-request
+# `apply_all_directives` flag on both MCP tools (mcp_tools.py:1023, :1118) and
+# HTTP (api/http.py:959). The DEFAULT is False, and the else-branch is the old
+# `isolation_mode=True` fetch byte-for-byte — so the defect above is unchanged in
+# 0.8.6 and every reflect that does not explicitly opt in still drops 45% of this
+# fleet's directives. The flag is a per-call opt-in, not a server default, so it
+# could only be exercised client-side; switchroom's own MCP shim
+# (src/cli/hindsight-mcp-shim.ts) could inject it, but that path is bypassed
+# whenever `memory.config.mcp_transport: "http"` is set, and it cannot cover the
+# HTTP/CLI callers at all. Patching the else-branch keeps the fix
+# transport-independent and keeps a build-time assert that fails LOUDLY on drift,
+# which a client-side injection cannot. The `apply_all_directives=True` branch is
+# deliberately left byte-for-byte upstream: an explicit opt-in still means "ignore
+# tag scope entirely", which is a strictly wider request than this patch makes.
+#
 # Self-verifying (exact-once anchor, re-asserted after the splice, `ast.parse` on
 # the result); guarded structurally by
 # tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
@@ -2008,34 +2096,44 @@ def apply(source, anchor, repl):
 
 
 # ---- 1. the comment that states the (now inverted) intent ----
-# Left alone it would sit directly above `isolation_mode=False` telling the next
-# maintainer the opposite of what the code does.
+# This is the ELSE branch of upstream 0.8.6's `if apply_all_directives:` — the
+# default path every reflect takes unless the caller explicitly opts out of tag
+# scoping. Left alone the comment would sit directly above `isolation_mode=False`
+# telling the next maintainer the opposite of what the code does.
 s = apply(
     s,
-    "        # Use isolation_mode=True to prevent tag-scoped directives from leaking into untagged operations\n",
-    "        # switchroom #3967 / upstream vectorize-io/hindsight#1269, #3031: NOT\n"
-    "        # isolation_mode. It filters this fetch down to `tags IS NULL OR tags = '{}'`\n"
-    "        # whenever the caller supplied no tags, which silently drops EVERY tagged\n"
-    "        # directive from synthesis — 45% of this fleet's active directives, measured\n"
-    "        # 2026-07-29. There is nothing to isolate on a no-tags reflect: directives\n"
-    "        # carry their own scoping rule one branch up in list_directives ('untagged\n"
-    "        # always apply; tagged apply only on a matching reflect'), so with no tag\n"
-    "        # context the isolation branch only ever subtracts.\n",
+    "            # Scope directives like memories: untagged directives always apply, tagged\n"
+    "            # ones only when the reflect tags match. isolation_mode keeps tag-scoped\n"
+    "            # directives from leaking into an untagged reflect. Use the same tags_match\n"
+    "            # as the reflect request so directives respect the same scoping rules.\n",
+    "            # Scope directives like memories: untagged directives always apply, tagged\n"
+    "            # ones only when the reflect tags match. Use the same tags_match as the\n"
+    "            # reflect request so directives respect the same scoping rules.\n"
+    "            #\n"
+    "            # switchroom #3967 / upstream vectorize-io/hindsight#1269, #3031: NOT\n"
+    "            # isolation_mode. It filters this fetch down to `tags IS NULL OR tags = '{}'`\n"
+    "            # whenever the caller supplied no tags, which silently drops EVERY tagged\n"
+    "            # directive from synthesis — 45% of this fleet's active directives, measured\n"
+    "            # 2026-07-29. There is nothing to isolate on a no-tags reflect: directives\n"
+    "            # carry their own scoping rule one branch up in list_directives ('untagged\n"
+    "            # always apply; tagged apply only on a matching reflect'), so with no tag\n"
+    "            # context the isolation branch only ever subtracts. The sibling\n"
+    "            # `apply_all_directives=True` branch above is left upstream-exact.\n",
 )
 
 # ---- 2. the flag itself ----
 s = apply(
     s,
-    "            active_only=True,\n"
-    "            request_context=request_context,\n"
-    "            isolation_mode=True,\n"
-    "        )\n",
-    "            active_only=True,\n"
-    "            request_context=request_context,\n"
-    "            # switchroom: scoped to THIS call site — every other list_directives\n"
-    "            # caller, including the public GET /directives, keeps upstream behaviour.\n"
-    "            isolation_mode=False,\n"
-    "        )\n",
+    "                active_only=True,\n"
+    "                request_context=request_context,\n"
+    "                isolation_mode=True,\n"
+    "            )\n",
+    "                active_only=True,\n"
+    "                request_context=request_context,\n"
+    "                # switchroom: scoped to THIS call site — every other list_directives\n"
+    "                # caller, including the public GET /directives, keeps upstream behaviour.\n"
+    "                isolation_mode=False,\n"
+    "            )\n",
 )
 
 f.write_text(s)
@@ -2058,8 +2156,37 @@ assert "isolation_mode=True," not in t, (
     f"{TAG}: an isolation_mode=True argument survived in engine/memory_engine.py — "
     "the reflect directive fetch still drops tagged directives"
 )
-assert t.count("            isolation_mode=False,\n        )\n") == 1, (
-    f"{TAG}: reflect's directive fetch does not read isolation_mode=False exactly once"
+# The TAG-SCOPED (default) branch must be the one that now reads False, with its
+# tag kwargs intact. Matching the whole call — not just the flag line — is what
+# makes this assertion RED against unpatched upstream: on stock 0.8.6 this exact
+# block ends in `isolation_mode=True`.
+assert (
+    t.count(
+        "            directives_raw = await self.list_directives(\n"
+        "                bank_id=bank_id,\n"
+        "                tags=tags,\n"
+        "                tags_match=tags_match,\n"
+        "                tag_groups=tag_groups,\n"
+        "                active_only=True,\n"
+        "                request_context=request_context,\n"
+    )
+    == 1
+), (
+    f"{TAG}: reflect's tag-scoped directive fetch no longer has its expected kwargs — "
+    "upstream reshaped the call; re-author this patch."
+)
+# Exactly two isolation_mode=False call sites in reflect: upstream's own
+# `apply_all_directives=True` branch, and the else branch this patch flips. If
+# upstream ever drops its opt-in branch this count falls to 1 and the build fails
+# rather than silently changing what this patch means.
+assert "        if apply_all_directives:\n" in t, (
+    f"{TAG}: upstream's apply_all_directives branch is gone — the patched else "
+    "branch no longer means what this patch documents. Re-author this patch."
+)
+assert t.count("                isolation_mode=False,\n            )\n") == 2, (
+    f"{TAG}: expected exactly 2 isolation_mode=False directive fetches in reflect "
+    "(upstream's apply_all_directives branch + switchroom's scoped branch), found "
+    f"{t.count(chr(32) * 16 + 'isolation_mode=False,' + chr(10) + chr(32) * 12 + ')' + chr(10))}"
 )
 # The scoping the flag replaces must still exist, or reflect would now load
 # directives that a TAGGED reflect is supposed to exclude.
@@ -2194,673 +2321,49 @@ ast.parse(t)
 print("switchroom hindsight perturbed-JSON-retry patch: invalid-JSON retries now bypass the proxy response cache and raise temperature instead of replaying the identical request")
 PYEOF
 
-# ── UPSTREAM CARRY: vectorize-io/hindsight PR #2968 ───────────────────────────
-# perf: eliminate redundant graph seed and UUID scans
-#   upstream PR:    https://github.com/vectorize-io/hindsight/pull/2968
-#   merge commit:   b475f5cc
-#   merged:         2026-07-27T10:12:30Z, to upstream `main`
-#   in a release:   NO. v0.8.5 (the digest pinned above) is upstream's tip
-#                   release and predates it.
+# ── RETIRED IN THE v0.8.5 -> v0.8.6 BASE BUMP ────────────────────────
 #
-# DELETE THIS BLOCK WHEN, and only when, the `FROM` digest above resolves to
-# upstream v0.8.6 or newer — the first release that contains b475f5cc natively.
-# At that point this patch's anchors will no longer match and the build will
-# fail loudly, which is the reminder. Re-assert its absence in
-# tests/docker/dockerfile-hindsight-bakes.test.ts the same way the retired
-# patches are, so it cannot double-apply on a later rebase.
+# Two blocks stood here and are gone because upstream v0.8.6 does the same thing
+# natively. Both are asserted ABSENT in
+# tests/docker/dockerfile-hindsight-bakes.test.ts so they cannot silently return
+# on a later rebase and double-apply.
 #
-# WHAT IT DOES — two independent wins in one upstream commit:
+#   1. UPSTREAM CARRY of vectorize-io/hindsight PR #2968 (graph seed reuse +
+#      the fetch_unit_dates UUID cast). v0.8.6 contains b475f5cc natively, and
+#      the block's own exit condition ("DELETE THIS BLOCK WHEN the FROM digest
+#      resolves to upstream v0.8.6 or newer") is met. It self-detected the bump:
+#      its `assert "graph_seed_min_similarity" not in _cfg` fired on 0.8.6,
+#      exactly as designed, because upstream now reads the seed floor from
+#      config (config.py:468, ENV HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY,
+#      default 0.3 at config.py:926) where the carry hardcoded the v0.8.5
+#      literal 0.3. Upstream's default equals the value the carry pinned, so
+#      recall behaviour is unchanged by the retirement. switchroom now emits the
+#      key EXPLICITLY (src/setup/hindsight-perf-defaults.ts) rather than relying
+#      on that default: the literal was a deliberate behaviour pin, and an
+#      upstream default change should not move this fleet's graph recall
+#      silently.
 #
-#   1. Graph seeds are derived from the semantic/BM25 over-fetch pool that
-#      `retrieve_semantic_bm25_combined` has ALREADY fetched, instead of each
-#      fact type issuing its own dedicated `ORDER BY embedding <=> $1::vector`
-#      through `_find_semantic_seeds`. A 3-fact-type recall did 4 ANN scans
-#      where 1 suffices. Upstream's production evidence: 302,602 calls /
-#      2,072s accumulated server-side load eliminated. On THIS fleet the same
-#      call rate is 708 recalls in 6h (`docker logs switchroom-hindsight`,
-#      2026-07-27) x 3 fact types ~= 8,500 dedicated ANN seed scans a day.
+#   2. consolidation maxItems grammar patch. v0.8.6 adds
+#      `_build_response_model(..., supports_max_items: bool = True)`
+#      (engine/consolidation/consolidator.py:693-716) driven by
+#      HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS (config.py:173, default True at
+#      :858), which omits the `maxItems` schema hint entirely when false. The
+#      leak this fleet measured (a ~4,230 maxItems failing GBNF compilation,
+#      HTTP 400 "failed to parse grammar", LiteLLM then re-sending verbatim
+#      private corpus text to a METERED provider) is therefore fixable by
+#      configuration, so switchroom emits
+#      HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS=false
+#      (src/setup/hindsight-perf-defaults.ts) for the llama.cpp/GBNF backend.
 #
-#   2. `fetch_unit_dates` compares `memory_units.id` as a UUID instead of
-#      casting the indexed column with `id::text = ANY($1)`, which forced a
-#      sequential scan. Upstream measured 120.049ms -> 0.240ms median (seq scan
-#      -> `pk_memory_units`) and 9.005ms -> 0.0795ms on a 100k-row bench.
-#      Non-canonical inputs (malformed, uppercase, braced, unhyphenated) were
-#      silently ignored by the old text comparison and are still ignored, by
-#      filtering them out BEFORE the cast — so behaviour is preserved, not
-#      merely "fixed".
-#
-# HISTORY YOU NEED BEFORE TOUCHING THIS. switchroom shipped its OWN version of
-# (1) as the `duplicate-ANN-scan` patch in #3699, and RETIRED it in #3768 when
-# bumping to v0.8.5, because 0.8.5 DELETED the `semantic_seeds` parameter our
-# patch depended on and documented the removal as deliberate ("Graph traversal
-# deliberately chooses its own bounded seeds ... reusing their results would
-# silently change graph-retrieval recall behavior"). #2968 is upstream
-# REVERSING that stance one day later, and it lands the correctness guard our
-# retired patch had to invent for itself: the shared pool is reusable only when
-# the semantic arm's SQL floor is at or below the graph seed threshold, so the
-# derived seed set can never be NARROWER than the dedicated query's. This is
-# therefore not a re-litigation of #3768 — it is upstream's own design, carried.
-# The retired switchroom-authored form must still never come back; the negative
-# guards in tests/docker/dockerfile-hindsight-bakes.test.ts target its unique
-# markers (`duplicate-ANN-scan`, `_graph_semantic_seeds`, `semantic_seeds=None`,
-# the leading-underscore `_GRAPH_SEED_*` constants), not the upstream names.
-#
-# DELIBERATE DIVERGENCE FROM THE UPSTREAM DIFF, and why. Upstream main reads the
-# graph seed floor from `get_config().graph_seed_min_similarity`. That config
-# key DOES NOT EXIST in v0.8.5 — the seed call site hardcodes
-# `limit=20, threshold=0.3`. So this carry introduces the two literals as named
-# module constants `GRAPH_SEED_LIMIT` / `GRAPH_SEED_MIN_SIMILARITY` and uses
-# them everywhere upstream uses the config value. That is byte-equivalent to
-# v0.8.5's behaviour. The block ASSERTS the config key is still absent: if a
-# future base adds it, this hardcoded 0.3 would silently ignore an operator's
-# setting, so the build must fail instead.
-#
-# EQUIVALENCE ARGUMENT (why the derived seeds are the same rows). Both queries
-# hit the same table with the same bank_id / fact_type / tags / tag_groups /
-# created-range filters and the same `ORDER BY embedding <=> $1::vector`. The
-# combined arm over-fetches `max(limit * 5, 100)` per fact type, i.e. always
-# >= 100 > GRAPH_SEED_LIMIT, so the top-20 above the seed floor are present in
-# the pool. `semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT)` stops the
-# Python trim from cutting a seed when `thinking_budget < 20`. And the reuse is
-# DECLINED outright, falling back to upstream's own dedicated query, whenever
-# `sem_min > GRAPH_SEED_MIN_SIMILARITY` (a per-request `min_scores.semantic`
-# above 0.3), because the pool would then be narrower than the seed query's.
-# LinkExpansion consumes seeds by id alone (`seed_ids = list({s.id for s in
-# all_seeds})`), so id-set equality is the whole equivalence relation.
-#
-# Row ORDER is trusted, not re-sorted — unlike the retired switchroom patch,
-# which sorted defensively. That is not a new assumption: v0.8.5's own semantic
-# trim already takes the FIRST `limit` rows per fact type out of the same
-# UNION ALL result, so if the row order were not similarity-ordered the
-# semantic arm would already be wrong.
-#
-# Self-verifying (every anchor is exact-once and every file is re-parsed with
-# `ast.parse`); guarded structurally by
-# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
-# unpatched upstream / GREEN patched) by
-# tests/docker/hindsight-graph-seed-patch.test.ts.
-RUN python3 - <<'PYEOF'
-import ast
-import pathlib
-
-BASE = pathlib.Path("/app/api/hindsight_api")
-TAG = "switchroom hindsight graph-seed-reuse carry (upstream #2968)"
-
-
-def apply(rel, edits):
-    """Exact-once anchored replacement, then re-parse. Fails loud on drift."""
-    f = BASE / rel
-    s = f.read_text()
-    for label, anchor, repl in edits:
-        n = s.count(anchor)
-        assert n == 1, (
-            f"{TAG}: the {label!r} anchor was found {n}x (expected 1) in {rel}. "
-            "If the base image is now upstream v0.8.6 or newer, this whole patch "
-            "block is ADOPTED — delete it from docker/Dockerfile.hindsight and "
-            "assert its absence in tests/docker/dockerfile-hindsight-bakes.test.ts. "
-            "Otherwise upstream reformatted and the patch must be re-authored."
-        )
-        s = s.replace(anchor, repl, 1)
-    f.write_text(s)
-    ast.parse(s)
-    return s
-
-
-# ---- 0. the divergence guard ------------------------------------------------
-# Upstream main reads this floor from config; v0.8.5 hardcodes 0.3. If a future
-# base introduces the config key, the mirrored constant below would silently
-# ignore the operator's setting, so refuse to build rather than diverge.
-_cfg = (BASE / "config.py").read_text()
-assert "graph_seed_min_similarity" not in _cfg, (
-    f"{TAG}: config.py now defines `graph_seed_min_similarity`, but this patch "
-    "mirrors the v0.8.5 hardcoded 0.3 into GRAPH_SEED_MIN_SIMILARITY. Carrying it "
-    "unchanged would ignore the operator's configured floor — re-author against the "
-    "config value (or delete this block if the base already carries upstream #2968)."
-)
-
-
-# ---- 1. link_expansion_retrieval.py: accept preselected seeds ---------------
-le = apply("engine/search/link_expansion_retrieval.py", [
-    (
-        "seed constants",
-        "logger = logging.getLogger(__name__)\n"
-        "\n"
-        "\n"
-        "async def _find_semantic_seeds(\n",
-
-        "logger = logging.getLogger(__name__)\n"
-        "\n"
-        "# switchroom carry of upstream #2968. Upstream main names these\n"
-        "# GRAPH_SEED_LIMIT and config.graph_seed_min_similarity; v0.8.5 has no such\n"
-        "# config key and hardcodes limit=20/threshold=0.3 at the single call site\n"
-        "# below, so the literals are hoisted here unchanged and shared with\n"
-        "# search/retrieval.py, which needs the SAME numbers to derive an identical\n"
-        "# seed set from the combined semantic pool.\n"
-        "GRAPH_SEED_LIMIT = 20\n"
-        "GRAPH_SEED_MIN_SIMILARITY = 0.3\n"
-        "\n"
-        "\n"
-        "async def _find_semantic_seeds(\n",
-    ),
-    (
-        "retrieve() signature",
-        '        created_before: "datetime | None" = None,\n'
-        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n"
-        '        """\n'
-        "        Retrieve facts by expanding links from seeds.\n",
-
-        '        created_before: "datetime | None" = None,\n'
-        "        # switchroom carry of upstream #2968: graph entry points already\n"
-        "        # derived by the caller from the shared semantic candidate pool. An\n"
-        "        # EMPTY list is a real answer (no seeds cleared the floor) and must NOT\n"
-        "        # fall back to a second ANN scan; only None means 'not preselected'.\n"
-        "        preselected_semantic_seeds: list[RetrievalResult] | None = None,\n"
-        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n"
-        '        """\n'
-        "        Retrieve facts by expanding links from seeds.\n",
-    ),
-    (
-        "seed fetch",
-        "        async with acquire_with_retry(pool) as conn:\n"
-        "            # Graph traversal deliberately chooses its own bounded seeds. The semantic and temporal\n"
-        "            # retrieval arms have independent candidate limits and thresholds, so reusing their\n"
-        "            # results would silently change graph-retrieval recall behavior.\n"
-        "            seeds_start = time.time()\n"
-        "            all_seeds = await _find_semantic_seeds(\n"
-        "                conn,\n"
-        "                query_embedding_str,\n"
-        "                bank_id,\n"
-        "                fact_type,\n"
-        "                limit=20,\n"
-        "                threshold=0.3,\n"
-        "                tags=tags,\n"
-        "                tags_match=tags_match,\n"
-        "                tag_groups=tag_groups,\n"
-        "                created_after=created_after,\n"
-        "                created_before=created_before,\n"
-        "            )\n"
-        "            timings.seeds_time = time.time() - seeds_start\n",
-
-        "        async with acquire_with_retry(pool) as conn:\n"
-        "            if preselected_semantic_seeds is None:\n"
-        "                # switchroom carry of upstream #2968: the caller could not prove the\n"
-        "                # shared semantic pool covers this arm's threshold (a per-request\n"
-        "                # min_scores.semantic above GRAPH_SEED_MIN_SIMILARITY narrows it), so\n"
-        "                # keep graph retrieval's own query and result semantics. A silently\n"
-        "                # narrowed seed set is a quieter recall, which is worse than a slower one.\n"
-        "                seeds_start = time.time()\n"
-        "                all_seeds = await _find_semantic_seeds(\n"
-        "                    conn,\n"
-        "                    query_embedding_str,\n"
-        "                    bank_id,\n"
-        "                    fact_type,\n"
-        "                    limit=GRAPH_SEED_LIMIT,\n"
-        "                    threshold=GRAPH_SEED_MIN_SIMILARITY,\n"
-        "                    tags=tags,\n"
-        "                    tags_match=tags_match,\n"
-        "                    tag_groups=tag_groups,\n"
-        "                    created_after=created_after,\n"
-        "                    created_before=created_before,\n"
-        "                )\n"
-        "                timings.seeds_time = time.time() - seeds_start\n"
-        "            else:\n"
-        "                all_seeds = preselected_semantic_seeds\n",
-    ),
-])
-
-
-# ---- 2. graph_retrieval.py: the abstract signature --------------------------
-gr = apply("engine/search/graph_retrieval.py", [
-    (
-        "abstract retrieve() signature",
-        "        created_before: datetime | None = None,  # Only include memory_units created before this time\n"
-        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n",
-
-        "        created_before: datetime | None = None,  # Only include memory_units created before this time\n"
-        "        # switchroom carry of upstream #2968: graph entry points already fetched by\n"
-        "        # the caller from the shared semantic candidate pool (None = not preselected).\n"
-        "        preselected_semantic_seeds: list[RetrievalResult] | None = None,\n"
-        "    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:\n",
-    ),
-])
-
-
-# ---- 3. retrieval.py: derive the seeds from the pool already fetched --------
-rt = apply("engine/search/retrieval.py", [
-    (
-        "seed-constant import",
-        "from .link_expansion_retrieval import LinkExpansionRetriever\n",
-        "from .link_expansion_retrieval import (\n"
-        "    GRAPH_SEED_LIMIT,\n"
-        "    GRAPH_SEED_MIN_SIMILARITY,\n"
-        "    LinkExpansionRetriever,\n"
-        ")\n",
-    ),
-    (
-        "SemanticBm25Result dataclass",
-        "# Default graph retriever instance (can be overridden)\n",
-
-        "@dataclass\n"
-        "class SemanticBm25Result:\n"
-        '    """Per-fact-type candidates returned by the shared semantic/BM25 query.\n'
-        "\n"
-        "    switchroom carry of upstream #2968. ``graph_seeds`` is None — meaning the\n"
-        "    graph retriever must issue its own dedicated seed query — whenever the\n"
-        "    semantic arm's SQL floor is STRICTER than GRAPH_SEED_MIN_SIMILARITY, because\n"
-        "    the shared pool would then be narrower than the seed query's own result.\n"
-        '    """\n'
-        "\n"
-        "    semantic: list[RetrievalResult]\n"
-        "    bm25: list[RetrievalResult]\n"
-        "    graph_seeds: list[RetrievalResult] | None\n"
-        "\n"
-        "\n"
-        "# Default graph retriever instance (can be overridden)\n",
-    ),
-    (
-        "combined-retrieval signature",
-        "    min_keyword: float | None = None,\n"
-        ") -> dict[str, tuple[list[RetrievalResult], list[RetrievalResult]]]:\n",
-
-        "    min_keyword: float | None = None,\n"
-        "    # switchroom carry of upstream #2968: the graph arm's seed floor. Passing it\n"
-        "    # lets this query double as the graph seed query when its own floor is no\n"
-        "    # stricter; leaving it None preserves the pre-#2968 behaviour exactly.\n"
-        "    graph_seed_min_similarity: float | None = None,\n"
-        ") -> dict[str, SemanticBm25Result]:\n",
-    ),
-    (
-        "result_dict init",
-        "    Returns:\n"
-        "        Dict mapping fact_type -> (semantic_results, bm25_results)\n"
-        '    """\n'
-        "    result_dict: dict[str, tuple[list[RetrievalResult], list[RetrievalResult]]] = {ft: ([], []) for ft in fact_types}\n",
-
-        "    Returns:\n"
-        "        Candidate groups for each fact type. ``graph_seeds`` is ``None`` when\n"
-        "        the semantic query's threshold is too strict to cover graph entry points.\n"
-        '    """\n'
-        "    result_dict = {ft: SemanticBm25Result(semantic=[], bm25=[], graph_seeds=None) for ft in fact_types}\n",
-    ),
-    (
-        "grouping loop",
-        "    # Group results; trim semantic to limit (over-fetched for HNSW approximation).\n"
-        "    sem_counts: dict[str, int] = {ft: 0 for ft in fact_types}\n"
-        "    for r in rows:\n"
-        "        row = dict(r)\n"
-        '        source = row.pop("source")\n'
-        '        ft = row.get("fact_type")\n'
-        "        if ft not in result_dict:\n"
-        "            continue\n"
-        '        if source == "semantic":\n'
-        "            if sem_counts[ft] < limit:\n"
-        "                result_dict[ft][0].append(RetrievalResult.from_db_row(row))\n"
-        "                sem_counts[ft] += 1\n"
-        "        else:\n"
-        "            result_dict[ft][1].append(RetrievalResult.from_db_row(row))\n"
-        "\n"
-        "    return result_dict\n",
-
-        "    # Group results. The semantic SQL deliberately over-fetches for HNSW recall;\n"
-        "    # when that pool also covers the graph threshold, derive graph entry points\n"
-        "    # from the same ordered rows instead of issuing one duplicate ANN query per\n"
-        "    # fact type (switchroom carry of upstream #2968). Convert only the prefix\n"
-        "    # either consumer can observe, not the entire HNSW over-fetch pool.\n"
-        "    graph_seed_threshold = (\n"
-        "        graph_seed_min_similarity\n"
-        "        if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity\n"
-        "        else None\n"
-        "    )\n"
-        "    semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)\n"
-        "    semantic_candidates: dict[str, list[RetrievalResult]] = {ft: [] for ft in fact_types}\n"
-        "    for r in rows:\n"
-        "        row = dict(r)\n"
-        '        source = row.pop("source")\n'
-        '        ft = row.get("fact_type")\n'
-        "        if ft not in result_dict:\n"
-        "            continue\n"
-        '        if source == "semantic":\n'
-        "            if len(semantic_candidates[ft]) < semantic_candidate_limit:\n"
-        "                semantic_candidates[ft].append(RetrievalResult.from_db_row(row))\n"
-        "        else:\n"
-        "            result_dict[ft].bm25.append(RetrievalResult.from_db_row(row))\n"
-        "\n"
-        "    for ft, candidates in semantic_candidates.items():\n"
-        "        result_dict[ft].semantic.extend(candidates[:limit])\n"
-        "        if graph_seed_threshold is not None:\n"
-        "            result_dict[ft].graph_seeds = [\n"
-        "                candidate\n"
-        "                for candidate in candidates\n"
-        "                if candidate.similarity is not None and candidate.similarity >= graph_seed_threshold\n"
-        "            ][:GRAPH_SEED_LIMIT]\n"
-        "\n"
-        "    return result_dict\n",
-    ),
-    (
-        "combined-retrieval call site",
-        "            min_keyword=min_keyword,\n"
-        "        )\n"
-        "        semantic_bm25_time = time.time() - semantic_bm25_start\n",
-
-        "            min_keyword=min_keyword,\n"
-        "            # switchroom carry of upstream #2968: opt this query in to also\n"
-        "            # producing the graph arm's entry points. v0.8.5 has no\n"
-        "            # config.graph_seed_min_similarity, so the mirrored constant is passed.\n"
-        "            graph_seed_min_similarity=GRAPH_SEED_MIN_SIMILARITY,\n"
-        "        )\n"
-        "        semantic_bm25_time = time.time() - semantic_bm25_start\n",
-    ),
-    (
-        "graph retriever call site",
-        "            created_after=created_after,\n"
-        "            created_before=created_before,\n"
-        "        )\n"
-        "        return ft, results, time.time() - graph_start, graph_timing\n",
-
-        "            created_after=created_after,\n"
-        "            created_before=created_before,\n"
-        "            # switchroom carry of upstream #2968: None here means the shared pool\n"
-        "            # could not be proven to cover this arm's floor, and the retriever\n"
-        "            # falls back to its own dedicated ANN seed query.\n"
-        "            preselected_semantic_seeds=semantic_bm25_results[ft].graph_seeds,\n"
-        "        )\n"
-        "        return ft, results, time.time() - graph_start, graph_timing\n",
-    ),
-    (
-        "per-fact-type unpack",
-        "        semantic_results, bm25_results = semantic_bm25_results.get(ft, ([], []))\n",
-        "        semantic_results = semantic_bm25_results[ft].semantic\n"
-        "        bm25_results = semantic_bm25_results[ft].bm25\n",
-    ),
-])
-
-
-# ---- 4. consolidator.py: the other caller of the combined query -------------
-cons = apply("engine/consolidation/consolidator.py", [
-    (
-        "dedup probe unpack",
-        '    results = grouped.get("observation", ([], []))[0]\n',
-        "    # switchroom carry of upstream #2968: the combined query now returns a\n"
-        "    # SemanticBm25Result per requested fact type (always populated, so the\n"
-        "    # .get() default is dead). This caller passes no graph_seed_min_similarity,\n"
-        "    # so .graph_seeds is None and no extra work is done on its behalf.\n"
-        '    results = grouped["observation"].semantic\n',
-    ),
-])
-
-
-# ---- 5. ops_postgresql.py: index-served UUID lookup -------------------------
-# `id::text = ANY($1)` casts the INDEXED column and forces a sequential scan.
-# Filtering non-canonical inputs out BEFORE casting them to uuid preserves the
-# old predicate's tolerance (malformed / uppercase / braced / unhyphenated ids
-# matched nothing then and match nothing now) while letting pk_memory_units
-# serve the lookup. NOT an f-string here: the `{{8}}` braces are literal and
-# must survive into the module's own f-string quantifiers unchanged.
-ops = apply("engine/db/ops_postgresql.py", [
-    (
-        "fetch_unit_dates predicate",
-        "        return await conn.fetch(\n"
-        '            f"""\n'
-        "            SELECT id, event_date, fact_type\n"
-        "            FROM {mu_table}\n"
-        "            WHERE id::text = ANY($1)\n"
-        '            """,\n'
-        "            unit_ids,\n"
-        "        )\n",
-
-        "        # switchroom carry of upstream #2968: cast only canonical UUID text\n"
-        "        # inputs, never the indexed column. The old ``id::text`` predicate\n"
-        "        # silently ignored malformed, uppercase, braced, and unhyphenated\n"
-        "        # inputs; filtering before the cast preserves that behavior while\n"
-        "        # allowing the primary-key index to serve the lookup.\n"
-        "        return await conn.fetch(\n"
-        '            f"""\n'
-        "            SELECT id, event_date, fact_type\n"
-        "            FROM {mu_table}\n"
-        "            WHERE id = ANY(\n"
-        "                ARRAY(\n"
-        "                    SELECT input.unit_id::uuid\n"
-        "                    FROM unnest($1::text[]) AS input(unit_id)\n"
-        "                    WHERE input.unit_id ~ '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'\n"
-        "                )\n"
-        "            )\n"
-        '            """,\n'
-        "            unit_ids,\n"
-        "        )\n",
-    ),
-])
-
-
-# ---- verification ----------------------------------------------------------
-# Post-replace re-assertions. These are the ones that would catch a patch that
-# applied but landed inert, which the anchor counts above cannot.
-assert "GRAPH_SEED_LIMIT = 20" in le and "GRAPH_SEED_MIN_SIMILARITY = 0.3" in le, (
-    f"{TAG}: the mirrored seed constants are missing from link_expansion_retrieval.py"
-)
-assert "if preselected_semantic_seeds is None:" in le, (
-    f"{TAG}: LinkExpansionRetriever.retrieve does not branch on preselected seeds — "
-    "the dedicated ANN seed query is still unconditional"
-)
-assert "                all_seeds = preselected_semantic_seeds" in le, (
-    f"{TAG}: the preselected-seed branch does not actually use the caller's seeds"
-)
-assert le.count("await _find_semantic_seeds(") == 1, (
-    f"{TAG}: expected exactly one remaining _find_semantic_seeds call site (the fallback)"
-)
-assert "preselected_semantic_seeds: list[RetrievalResult] | None = None," in gr, (
-    f"{TAG}: the abstract GraphRetriever.retrieve signature does not accept preselected "
-    "seeds — a non-LinkExpansion retriever would TypeError at the call site"
-)
-assert "class SemanticBm25Result:" in rt, (
-    f"{TAG}: SemanticBm25Result is missing from search/retrieval.py"
-)
-assert "GRAPH_SEED_MIN_SIMILARITY," in rt, (
-    f"{TAG}: search/retrieval.py does not import the mirrored seed floor"
-)
-assert "graph_seed_min_similarity=GRAPH_SEED_MIN_SIMILARITY," in rt, (
-    f"{TAG}: retrieve_all_fact_types_parallel never opts the combined query in to "
-    "producing graph seeds — the patch would apply and do nothing"
-)
-assert "preselected_semantic_seeds=semantic_bm25_results[ft].graph_seeds," in rt, (
-    f"{TAG}: the graph retriever call site does not forward the derived seeds — "
-    "the duplicate ANN scan is still reachable"
-)
-# The GUARD, not just the derivation. Hard-coding graph_seed_threshold to a
-# non-None value would keep every other assertion here green while silently
-# narrowing the seed set whenever a caller passes min_scores.semantic > 0.3.
-assert (
-    "        if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity\n"
-) in rt, (
-    f"{TAG}: the seed-reuse guard no longer requires the semantic floor to be no "
-    "stricter than the graph floor — a per-request min_scores.semantic above 0.3 "
-    "would silently narrow the graph seed set"
-)
-# The trim must not be able to cut a seed out of the pool it feeds.
-assert (
-    "    semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)\n"
-) in rt, (
-    f"{TAG}: the semantic candidate limit no longer widens to GRAPH_SEED_LIMIT — a "
-    "thinking_budget below 20 would trim rows the dedicated seed query would have returned"
-)
-assert "result_dict[ft][0].append" not in rt and "result_dict[ft][1].append" not in rt, (
-    f"{TAG}: a tuple-shaped result_dict write survives in search/retrieval.py"
-)
-assert "semantic_bm25_results.get(ft, ([], []))" not in rt, (
-    f"{TAG}: a tuple-shaped unpack survives in retrieve_all_fact_types_parallel"
-)
-assert 'grouped.get("observation", ([], []))[0]' not in cons, (
-    f"{TAG}: the consolidation dedup probe still unpacks the old tuple shape — it would "
-    "raise AttributeError on every dedup adjudication"
-)
-assert "id::text = ANY($1)" not in ops, (
-    f"{TAG}: fetch_unit_dates still casts the indexed id column to text — the sequential "
-    "scan is still there"
-)
-assert "SELECT input.unit_id::uuid" in ops, (
-    f"{TAG}: the canonical-UUID pre-filter is missing from fetch_unit_dates"
-)
-# Every OTHER caller of the combined query must have been migrated: a missed one
-# is an AttributeError on a live recall path, not a build failure.
-_stale = []
-for _p in BASE.rglob("*.py"):
-    _t = _p.read_text()
-    if "retrieve_semantic_bm25_combined" not in _t:
-        continue
-    if "([], [])" in _t:
-        _stale.append(str(_p.relative_to(BASE)))
-assert not _stale, (
-    f"{TAG}: {_stale} still reference the old (semantic, bm25) tuple shape of "
-    "retrieve_semantic_bm25_combined — migrate them or the call raises at runtime"
-)
-print(
-    "switchroom hindsight graph-seed-reuse carry (upstream #2968): graph seeds now derive "
-    "from the shared semantic/BM25 over-fetch pool (falling back to the dedicated ANN query "
-    "whenever min_scores.semantic > 0.3), and fetch_unit_dates is served by pk_memory_units "
-    "instead of a sequential scan"
-)
-PYEOF
-
-# ── consolidation maxItems grammar patch ──────────────────────────────────────
-# Stop the consolidation response schema emitting a `maxItems` so large that a
-# local grammar-constrained backend cannot compile it — which is what silently
-# routes private corpus content to a METERED third party.
-#
-# THE DEFECT, in the real shipping source.
-# `_build_response_model()` (engine/consolidation/consolidator.py) constrains the
-# `creates` field with `PydanticField(default=[], max_length=clamped)`, which
-# pydantic serialises into the request's JSON schema as `"maxItems": <clamped>`.
-# Its only caller passes `max_creates=remaining_observation_slots` — the bank's
-# REMAINING OBSERVATION-SLOT COUNT (`remaining_observation_slots = max(max_obs -
-# current_count, 0)`), not a modelling constraint. On this fleet that number is
-# ~4,230 for a cohort of banks.
-#
-# llama.cpp/Ollama compile a JSON schema down to a GBNF grammar, and a
-# repetition count that large fails to build. Measured on this host
-# (2026-07-28), the consolidation deployment returns:
-#
-#   HTTP 400 {"error":{"code":400,"message":"Failed to initialize samplers:
-#            failed to parse grammar","type":"invalid_request_error"}}
-#
-# LiteLLM's router-level fallback then re-sends the SAME call — batch prompt and
-# all, up to `CONSOLIDATION_LLM_BATCH_SIZE` memories of verbatim private corpus
-# text — to the metered OpenRouter deployment. 56 such fallbacks are visible in
-# the proxy's log for `Received Model Group=gpt-oss-20b-consolidation`. It is
-# deterministic per bank: a bank with ~4,230 remaining slots fails EVERY time,
-# a bank with ~670 compiles fine (threshold measured between 672 and 4,223).
-# The fallback rule itself is deliberately NOT touched here — removing it before
-# this fix lands would convert a leak into hard consolidation failures.
-#
-# WHY OMIT RATHER THAN CLAMP. Clamping to a smaller number would move the
-# threshold and keep the class of bug; it would also assert a bound that is not
-# true. The cap is a RESOURCE GUARD, not something the model needs to see:
-#   * `CONSOLIDATION_LLM_BATCH_SIZE=6`, so one batch sees 6 memories and can
-#     never approach 4,230 — above a small ceiling the constraint cannot bind.
-#   * The slot cap is ALREADY enforced in Python after validation, regardless of
-#     the schema — consolidator.py's "Defensive truncation: some LLM providers
-#     may not enforce JSON schema max_length" trims `creates` to
-#     `remaining_observation_slots`. Nothing is lost by dropping the hint.
-#   * When the cap is genuinely tight the model is ALSO told in prose: the
-#     `observation_capacity_note` branch fires whenever
-#     `remaining_observation_slots <= len(memories)`.
-# So the constraint is kept exactly where it is real and compiles trivially
-# (<= 64, ~10x below the measured failure threshold) and omitted where it is
-# pure resource accounting. `maxItems` is then either a binding truth or absent.
-#
-# Self-verifying (exact-once anchors, re-asserted after the splice, `ast.parse`
-# on the result); guarded structurally by
-# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
-# unpatched upstream / GREEN patched) by
-# tests/docker/hindsight-maxitems-grammar-patch.test.ts, which builds the schema
-# at the production-like 4,230 and asserts the emitted `maxItems`.
-RUN python3 - <<'PYEOF'
-import ast
-import pathlib
-
-BASE = pathlib.Path("/app/api/hindsight_api")
-TAG = "switchroom hindsight consolidation-maxItems-grammar patch"
-
-
-def apply(rel, edits):
-    f = BASE / rel
-    s = f.read_text()
-    for anchor, repl in edits:
-        n = s.count(anchor)
-        assert n == 1, (
-            f"{TAG}: anchor found {n}x (expected 1) in {rel} — upstream "
-            "reformatted _build_response_model; re-author this patch in "
-            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
-        )
-        s = s.replace(anchor, repl, 1)
-    f.write_text(s)
-    ast.parse(s)
-    return s
-
-
-new = apply("engine/consolidation/consolidator.py", [
-    (
-        "def _build_response_model(max_creates: int | None = None) -> type[_ConsolidationBatchResponse]:\n"
-        '    """Build a response model, optionally constraining max creates via JSON schema."""\n'
-        "    if max_creates is None or max_creates < 0:\n"
-        "        return _ConsolidationBatchResponse\n"
-        "\n"
-        "    from pydantic import Field as PydanticField\n",
-
-        "# switchroom: the largest `maxItems` this schema may emit. A local\n"
-        "# grammar-constrained backend (llama.cpp/Ollama) compiles the response schema\n"
-        "# into GBNF, and a repetition count in the thousands fails to build:\n"
-        '# HTTP 400 "Failed to initialize samplers: failed to parse grammar". LiteLLM\n'
-        "# then falls the call over to a METERED deployment, sending the batch's\n"
-        "# verbatim private corpus text off-host. 64 is ~10x below the measured\n"
-        "# failure threshold (672 compiles, 4,223 does not) and still an order of\n"
-        "# magnitude above anything one batch could emit\n"
-        "# (CONSOLIDATION_LLM_BATCH_SIZE=6).\n"
-        "SWITCHROOM_MAX_CREATES_SCHEMA_CEILING = 64\n"
-        "\n"
-        "\n"
-        "def _build_response_model(max_creates: int | None = None) -> type[_ConsolidationBatchResponse]:\n"
-        '    """Build a response model, optionally constraining max creates via JSON schema."""\n'
-        "    if max_creates is None or max_creates < 0:\n"
-        "        return _ConsolidationBatchResponse\n"
-        "\n"
-        "    # switchroom: omit the constraint entirely when it cannot bind. The caller\n"
-        "    # passes the bank's REMAINING OBSERVATION-SLOT COUNT, a resource guard\n"
-        "    # rather than a modelling constraint — above the ceiling it only breaks\n"
-        "    # grammar compilation. The cap is still enforced: the caller truncates\n"
-        "    # `creates` to remaining_observation_slots after validation regardless of\n"
-        "    # the schema, and a genuinely tight cap is also stated in prose via\n"
-        "    # observation_capacity_note.\n"
-        "    if max_creates > SWITCHROOM_MAX_CREATES_SCHEMA_CEILING:\n"
-        "        return _ConsolidationBatchResponse\n"
-        "\n"
-        "    from pydantic import Field as PydanticField\n",
-    ),
-])
-
-# The Python-side enforcement this patch relies on must still be there: without
-# it, omitting `maxItems` really would drop the cap.
-assert "creates = creates[:remaining_observation_slots]" in new, (
-    f"{TAG}: the post-validation truncation to remaining_observation_slots is gone "
-    "from consolidator.py — omitting maxItems would now DROP the observation cap. "
-    "Re-author this patch."
-)
-assert new.count("_build_response_model(max_creates=remaining_observation_slots)") == 1, (
-    f"{TAG}: _build_response_model is no longer called with "
-    "remaining_observation_slots — re-author this patch."
-)
-assert new.count("SWITCHROOM_MAX_CREATES_SCHEMA_CEILING") == 2, (
-    f"{TAG}: ceiling constant not spliced exactly once plus its use"
-)
-assert new.count("max_length=clamped") == 1, (
-    f"{TAG}: the constrained field vanished — the ceiling now guards nothing"
-)
-
-print(
-    "switchroom hindsight consolidation-maxItems-grammar patch: the consolidation "
-    "response schema now omits maxItems above 64 instead of emitting the bank's "
-    "remaining-slot count, so a local grammar backend can compile it and the call "
-    "no longer falls over to a metered provider"
-)
-PYEOF
+#      ONE DELIBERATE BEHAVIOUR DIFFERENCE: the retired patch KEPT the hint when
+#      it was small enough to compile and genuinely binding (<= 64) and omitted
+#      it only when it was pure resource accounting. Upstream's flag is
+#      all-or-nothing, so with it false the hint is now always absent. That is
+#      safe for the same reason the patch gave: the observation cap is enforced
+#      in Python after validation ("Defensive truncation: some LLM providers may
+#      not enforce JSON schema max_length"), and the prose
+#      `observation_capacity_note` still fires whenever the cap is tight. The
+#      schema hint was an optimisation, not the enforcement.
 
 # ── MCP recall token-budget honesty patch ─────────────────────────────────────
 #
@@ -3064,7 +2567,7 @@ PYEOF
 #
 # THE FIX, two halves:
 #   1. Thread `temperature=get_config().llm_temperature_reflect` into every
-#      reflect-scope call in the agentic path (6x scope="reflect" + the
+#      reflect-scope call in the agentic path (5x scope="reflect" + the
 #      scope="reflect_tool_call" kwargs), so the existing knob is live.
 #   2. Set the default LOW for factual synthesis: 0.1, matching
 #      DEFAULT_LLM_TEMPERATURE_RETAIN (fact extraction) — near-greedy without
@@ -3080,6 +2583,13 @@ PYEOF
 # DELIBERATELY not touched: it is a different operation with its own
 # strict-schema handling, and changing two behaviours under one flag would
 # make the knob ambiguous.
+#
+# v0.8.6 RE-ANCHORING. Upstream's reflect rework (#3013) deleted the mid-loop
+# budget-rewrite call that used to sit at 24-space indent, leaving 5 scope="reflect"
+# call sites (agent.py:658, :723, :866, :944 at 16-space indent and :1290 at
+# 12-space) plus the unchanged `reflect_tool_call` ct_kwargs at :809. The counts
+# below are asserted exactly, so if upstream adds or removes a reflect call site
+# again the build fails instead of leaving a site at the provider default.
 #
 # Self-verifying; guarded structurally by
 # tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally by
@@ -3117,7 +2627,6 @@ ag = pathlib.Path("/app/api/hindsight_api/engine/reflect/agent.py")
 s = ag.read_text()
 
 TEMP16 = "                temperature=get_config().llm_temperature_reflect,\n"
-TEMP24 = "                        temperature=get_config().llm_temperature_reflect,\n"
 TEMP12 = "            temperature=get_config().llm_temperature_reflect,\n"
 
 EDITS = (
@@ -3126,12 +2635,6 @@ EDITS = (
         '                scope="reflect",\n                max_completion_tokens=max_tokens,\n',
         '                scope="reflect",\n' + TEMP16 + "                max_completion_tokens=max_tokens,\n",
         4,
-    ),
-    # The mid-loop budget-rewrite call (24-space indent).
-    (
-        '                        scope="reflect",\n                        max_completion_tokens=max_tokens,\n',
-        '                        scope="reflect",\n' + TEMP24 + "                        max_completion_tokens=max_tokens,\n",
-        1,
     ),
     # The trailing budget-rewrite call (12-space indent).
     (
@@ -3172,11 +2675,11 @@ ast.parse(s)
 
 t = ag.read_text()
 n_temp = t.count("temperature=get_config().llm_temperature_reflect,")
-assert n_temp == 7, (
-    f"{TAG}: expected the reflect temperature threaded into exactly 7 call sites "
-    f"(6x scope=reflect + 1x reflect_tool_call kwargs), found {n_temp}"
+assert n_temp == 6, (
+    f"{TAG}: expected the reflect temperature threaded into exactly 6 call sites "
+    f"(5x scope=reflect + 1x reflect_tool_call kwargs), found {n_temp}"
 )
-assert t.count('scope="reflect",') == 6, (
+assert t.count('scope="reflect",') == 5, (
     f"{TAG}: the number of scope=reflect call sites changed — re-count and re-author"
 )
 # Deliberate non-goal guard: the structured-extraction call keeps its own behaviour.
@@ -3190,7 +2693,7 @@ assert "if temperature is not None:" in prov, (
 )
 print(
     "switchroom hindsight reflect-temperature patch: llm_temperature_reflect is now "
-    "passed on all 7 agentic reflect call sites and defaults to 0.1 (was a dead knob "
+    "passed on all 6 agentic reflect call sites and defaults to 0.1 (was a dead knob "
     "defaulting to 0.9 with provider ~1.0 actually applied); env-overridable via "
     "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT (value 'none' restores provider default)"
 )

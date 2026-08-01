@@ -151,11 +151,14 @@ export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
  * both directions AND flows straight into call-time validation — do not
  * hand-write a second accepted-prop list anywhere.
  *
- * This table now describes 0.8.5, which the image pins: 0.8.5 registers the
- * same 32 tools as 0.8.4 plus exactly three props — `list_memories.tags`,
- * `list_memories.tags_match` and `create_mental_model.tags_match` (derived by
- * dumping `create_mcp_server(...)`'s registration surface inside each pinned
- * digest). Byte-equality with
+ * This table now describes 0.8.6, which the image pins: 0.8.6 registers the
+ * same 32 tools as 0.8.5 plus exactly ONE prop — `reflect.apply_all_directives`
+ * (upstream #3013) — derived by dumping `create_mcp_server(...)`'s registration
+ * surface inside each pinned digest, a method cross-validated by reproducing
+ * the committed 0.8.5 capture byte-for-byte before trusting the 0.8.6 one.
+ * Advertising it is deliberate: it is a real accepted prop, and because this
+ * table is also the tools/CALL allowlist, omitting it would make
+ * {@link guardAndClampToolCall} REJECT a legitimate upstream argument. Byte-equality with
  * tests/fixtures/hindsight-tools-list.snapshot.json is asserted per tool in
  * tests/memory.hindsight-contract.fixture.test.ts, so this table cannot drift
  * in either direction without a red test.
@@ -186,7 +189,7 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   list_operations: [[], ["bank_id", "limit", "status"]],
   list_tags: [[], ["bank_id", "limit", "q"]],
   recall: [["query"], ["bank_id", "budget", "max_tokens", "min_scores", "prefer_observations", "query", "query_timestamp", "tag_groups", "tags", "tags_match", "types"]],
-  reflect: [["query"], ["bank_id", "budget", "context", "include_based_on", "include_trace", "max_tokens", "query", "response_schema", "tags", "tags_match"]],
+  reflect: [["query"], ["apply_all_directives", "bank_id", "budget", "context", "include_based_on", "include_trace", "max_tokens", "query", "response_schema", "tags", "tags_match"]],
   refresh_mental_model: [["mental_model_id"], ["bank_id", "mental_model_id"]],
   retain: [["content"], ["bank_id", "content", "context", "document_id", "metadata", "strategy", "tags", "timestamp", "update_mode"]],
   sync_retain: [["content"], ["bank_id", "content", "context", "document_id", "metadata", "strategy", "tags", "timestamp"]],

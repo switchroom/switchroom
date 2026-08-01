@@ -641,7 +641,7 @@ describe("hindsight broker-fed mode (#1245)", () => {
     // it cannot catch a silent value regression — which is precisely the class
     // of drift this file exists to prevent.
     const expected: Array<[string, string]> = [
-      ["HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS", "1"],
+      ["HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS", "1"],
       ["HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT", "6"],
       ["HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM", "2"],
       ["HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND", "250"],
@@ -660,7 +660,7 @@ describe("hindsight broker-fed mode (#1245)", () => {
     }
     // …and the constants really are what the literals above claim, so the
     // exported API and the emitted env can't disagree.
-    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS).toBe(1);
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS).toBe(1);
     expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBe(6);
     expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM).toBe(2);
     expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND).toBe(250);
@@ -676,7 +676,7 @@ describe("hindsight broker-fed mode (#1245)", () => {
     // NOT moved consolidation onto local inference must keep that ceiling —
     // this pins it at ≤2 so a regression that re-raises slots/parallelism trips.
     expect(
-      h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS *
+      h.HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS *
         h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM,
     ).toBeLessThanOrEqual(2);
   });
@@ -693,7 +693,7 @@ describe("hindsight broker-fed mode (#1245)", () => {
     //     refuse to start. Asserted against the same rules pinned in
     //     tests/docker/hindsight-recall-isolation-patches.test.ts.
     expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBeGreaterThanOrEqual(
-      h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS,
+      h.HINDSIGHT_DEFAULT_CONSOLIDATION_RESERVED_SLOTS,
     );
     expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_SLOT_LIMIT).toBeLessThanOrEqual(
       UPSTREAM_WORKER_MAX_SLOTS,

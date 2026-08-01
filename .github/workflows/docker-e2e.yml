@@ -133,8 +133,9 @@ jobs:
               - 'tests/docker/hindsight-search-patches.test.ts'
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
-              - 'tests/docker/hindsight-graph-seed-patch.test.ts'
+              - 'tests/docker/hindsight-graph-seed-retirement.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
+              - 'src/setup/hindsight-perf-defaults.ts'
               - 'tests/docker/hindsight-reflect-directives-patch.test.ts'
               - 'tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
@@ -353,33 +354,36 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-retry-perturbation-patches.test.ts
 
-      - name: Run the hindsight graph-seed-reuse probe (RED/GREEN, must not skip)
-        # Same contract again, for the TEMPORARY upstream #2968 carry (merge
-        # b475f5cc, landed on upstream main after v0.8.5 was cut). Delete this
-        # step together with the Dockerfile block and the test file when the
-        # base image reaches v0.8.6.
+      - name: Run the hindsight graph-seed RETIREMENT probe (RED/GREEN, must not skip)
+        # The v0.8.5 upstream #2968 carry was retired in the v0.8.6 base bump —
+        # upstream ships the behaviour natively and exposes
+        # HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY. This step did NOT go away with
+        # it: deleting the only probe that ever asserted the behaviour would
+        # leave nobody checking the behaviour SURVIVED the retirement.
         #
-        # The bakes test cannot cover the failure that matters here: a carry
-        # that applies but hard-codes graph_seed_threshold keeps every grepped
-        # literal in place while silently NARROWING the graph seed set on any
-        # recall with min_scores.semantic > 0.3. Only running the patched
-        # modules and comparing derived seed ids against the dedicated query's
-        # catches it (measured 2026-07-27 — that mutation, and dropping the
-        # candidate-limit widening, each go red here and nowhere else).
+        # It now proves the successor mechanism live — that the native seed reuse
+        # is present in the pinned image AND that switchroom's explicit floor
+        # emission is what the engine resolves. That second half is why the
+        # bakes test cannot replace this: a deleted emission still leaves a
+        # working image (upstream defaults to 0.3), so only booting the config
+        # with an OFF-DEFAULT floor and reading it back can go red on it.
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
-        run: npx vitest run tests/docker/hindsight-graph-seed-patch.test.ts
+        run: npx vitest run tests/docker/hindsight-graph-seed-retirement.test.ts
 
-      - name: Run the hindsight maxItems-grammar probe (RED/GREEN, must not skip)
-        # Same contract again, for the consolidation-maxItems-grammar patch.
-        # The bakes test cannot cover the failure that matters here: its
-        # assertions are unanchored substring matches, so raising the ceiling
-        # (or reinstating a clamp that still emits a four-digit maxItems) keeps
-        # every grepped literal green while the schema is once again
-        # uncompilable by a local GBNF backend — and every consolidation call on
-        # a large bank silently falls over to the metered provider, carrying
-        # private corpus text off-host. Only serialising the model and reading
-        # the emitted maxItems catches that.
+      - name: Run the hindsight maxItems-grammar SUCCESSOR probe (RED/GREEN, must not skip)
+        # The consolidation-maxItems-grammar patch was retired in the v0.8.6 base
+        # bump in favour of HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS. Same reasoning
+        # as the step above: the probe stays, re-pointed at the successor.
+        #
+        # The failure that matters is unchanged and the bakes test still cannot
+        # cover it: if the env key stops reaching the container, the schema is
+        # once again uncompilable by a local GBNF backend, and every
+        # consolidation call on a large bank silently falls over to the metered
+        # provider, carrying private corpus text off-host. Only serialising the
+        # model out of the running image and reading the emitted maxItems
+        # catches that — and the DEFAULT arm is deliberately the RED one, so a
+        # probe that stopped configuring anything cannot pass.
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-maxitems-grammar-patch.test.ts
@@ -430,7 +434,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

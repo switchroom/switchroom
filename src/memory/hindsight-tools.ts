@@ -104,8 +104,13 @@ export interface HindsightToolSpec {
  * snapshot's `_meta.hindsight_api_version` (which in turn must equal the
  * api_version `docker/Dockerfile.hindsight` pins), so the three cannot drift
  * apart: bumping one without re-capturing the others reds the suite.
+ *
+ * 2026-08-01: moved to 0.8.6 with the base bump, alongside a re-capture of the
+ * snapshot from the new digest. The two values no longer coincide with
+ * {@link HINDSIGHT_REPAIR_MIN_API_VERSION} (still 0.8.5, where `repair-bank`
+ * first shipped) — which is the separation working as designed, not drift.
  */
-export const HINDSIGHT_MIN_API_VERSION = "0.8.5";
+export const HINDSIGHT_MIN_API_VERSION = "0.8.6";
 
 /**
  * The hindsight version that first ships `hindsight-admin repair-bank`

@@ -2640,9 +2640,10 @@ export const HindsightConfigSchema = z.object({
       "LINK_EXPANSION_TIMEOUT, LLM_REASONING_EFFORT, " +
       "RERANKER_LOCAL_BUCKET_BATCHING, RERANKER_MAX_CANDIDATES, " +
       "RERANKER_LOCAL_MAX_CONCURRENT, RECALL_MAX_CONCURRENT, " +
-      "REFLECT_WALL_TIMEOUT, WORKER_CONSOLIDATION_MAX_SLOTS, " +
+      "REFLECT_WALL_TIMEOUT, WORKER_CONSOLIDATION_RESERVED_SLOTS, " +
       "WORKER_CONSOLIDATION_SLOT_LIMIT, " +
-      "CONSOLIDATION_MAX_MEMORIES_PER_ROUND, RECENCY_DECAY_FUNCTION, " +
+      "CONSOLIDATION_MAX_MEMORIES_PER_ROUND, GRAPH_SEED_MIN_SIMILARITY, " +
+      "LLM_SUPPORTS_MAX_ITEMS, RECENCY_DECAY_FUNCTION, " +
       "RECENCY_DECAY_HALFLIFE_DAYS — switchroom defaults recall's recency " +
       "curve to `exponential` with a 30-day half-life so a fact retained " +
       "today outranks a stale one, instead of upstream's near-flat " +
@@ -2659,12 +2660,17 @@ export const HindsightConfigSchema = z.object({
       "decay function is `linear`, so switchroom ships no default for it but " +
       "still honours an operator who flips the function back; and " +
       "HINDSIGHT_API_WORKER_MAX_SLOTS — the worker poller's TOTAL in-flight " +
-      "task budget, the pool WORKER_CONSOLIDATION_MAX_SLOTS reserves out of; " +
+      "task budget, the pool WORKER_CONSOLIDATION_RESERVED_SLOTS reserves out of; " +
       "unset means upstream's own default; and " +
-      "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS — the reserved slot FLOOR for the " +
+      "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS — the reserved slot FLOOR for the " +
       "retain (memory write) lane, carved from that same total; unset means " +
       "upstream's own 0, i.e. no floor and retain competes for the shared " +
       "pool; and " +
+      "the pre-0.8.6 name HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS is still " +
+      "accepted for every operation type and normalised to " +
+      "..._RESERVED_SLOTS on the way in, because setting both names for " +
+      "one type is a hard boot failure in the engine and switchroom " +
+      "therefore emits only the canonical name; and " +
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY — the cosine-similarity floor a " +
       "candidate must reach to be returned by the semantic retrieval arm at " +
       "all (0..1); unset means upstream's own 0.3, and where it should sit " +
