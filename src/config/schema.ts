@@ -2664,7 +2664,12 @@ export const HindsightConfigSchema = z.object({
       "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS — the reserved slot FLOOR for the " +
       "retain (memory write) lane, carved from that same total; unset means " +
       "upstream's own 0, i.e. no floor and retain competes for the shared " +
-      "pool), plus the " +
+      "pool; and " +
+      "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY — the cosine-similarity floor a " +
+      "candidate must reach to be returned by the semantic retrieval arm at " +
+      "all (0..1); unset means upstream's own 0.3, and where it should sit " +
+      "depends on the bank's embedding model and phrasing diversity, so " +
+      "switchroom ships no opinion), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

@@ -347,7 +347,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twenty-eight keys, by name", () => {
+  it("is overridable on exactly these twenty-nine keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -377,6 +377,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
       "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
+      "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
@@ -627,6 +628,69 @@ describe("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS (override-only)", () => {
     expect(fromRun.get("HINDSIGHT_API_WORKER_MAX_SLOTS")).toEqual(["16"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS")).toEqual(["5"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
+  });
+});
+
+describe("HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY (override-only)", () => {
+  const KEY = "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group", () => {
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: "0.2" }).get(KEY)).toBe("0.2");
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: "0.2" }).get(KEY)).toBe("0.2");
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — upstream's own 0.3 stands",
+    (caps) => {
+      // Override-only means REACHABLE, not changed: a host that sets nothing
+      // keeps upstream's 0.3 floor byte-for-byte. Emitting a value here would
+      // change retrieval behaviour on every install to fix a symptom measured
+      // on one.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    // The outcome that matters. Before this key entered the managed set, both
+    // of these were undefined: resolveHindsightPerfOverrides drops an
+    // unmanaged key silently, so the operator's line read as durable config in
+    // yaml and never reached the container — the floor stayed at 0.3 and the
+    // phrasing-sensitive semantic recall misses it causes stayed unfixable.
+    const perf = { env: { [KEY]: "0.2" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get(KEY)).toEqual(["0.2"]);
+    expect(fromCompose.get(KEY)).toEqual(["0.2"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // It belongs to no capability group, so a gate-shaped regression that only
+    // emits grouped keys would drop it. Cloud endpoint + no GPU is the
+    // harshest gating case.
+    const perf = { env: { [KEY]: "0.25" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["0.25"]);
   });
 });
 
