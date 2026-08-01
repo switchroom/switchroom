@@ -109,9 +109,11 @@ export interface StreamReplyArgs {
   disable_notification?: boolean
   /**
    * Optional surgical quote text. When set along with `reply_to`, the initial
-   * send includes `reply_parameters: { message_id, quote: { text, position: 0 } }`
-   * so Telegram highlights the specific quoted sentence rather than the whole
-   * referenced message. Ignored when `reply_to` is absent.
+   * send includes `reply_parameters: { message_id, quote }` — `quote` is a Bot
+   * API String (see `reply-quote.ts`) — so Telegram highlights the specific
+   * quoted sentence rather than the whole referenced message. It must be an
+   * exact substring of the referenced message; one Telegram cannot find is
+   * dropped and the send retried unquoted. Ignored when `reply_to` is absent.
    */
   quote_text?: string
   /**
