@@ -77,6 +77,10 @@ afterEach(() => {
 })
 
 describe('tg-post logger — resolved ok:false responses (#3927)', () => {
+  // These calls are made directly on `bot.api.*` with NO enclosing retry
+  // policy, so every rejection here IS the outcome and stays `status=err`.
+  // The `status=retry` tier (#3931) only applies inside `createRetryApiCall`
+  // — see `tg-post-retry-attribution.test.ts`.
   it('logs a 429 flood-wait as status=err code=429 (FAILS before the fix: logged status=ok)', async () => {
     const lines = await tgPostLinesFor({
       ok: false,

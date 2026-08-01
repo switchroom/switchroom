@@ -36,7 +36,7 @@ import {
   floodQueueNonce,
   FLOOD_QUEUED_SOURCE,
 } from '../gateway/flood-reply-queue.js'
-import { sweepOutbox } from '../gateway/outbox-sweep.js'
+import { sweepOutbox, type OutboxSendResult } from '../gateway/outbox-sweep.js'
 import { listPendingRecords, resolveOutboxDir, type OutboxRecord } from '../outbox.js'
 import {
   floodStatePath,
@@ -58,6 +58,32 @@ function floodWaitActiveError(retryAfterSec: number): Error {
 /** The reply path's own partial-failure wrapper around the marker. */
 function wrappedReplyFailure(): Error {
   return new Error('reply failed after 0 of 1 chunk(s) sent: FLOOD_WAIT_ACTIVE')
+}
+
+/**
+ * A sweep `send` stub with the REAL {@link OutboxSendResult} shape (#4044).
+ *
+ * These tests used to stub `send` as `async () => 4242` — a bare number, the
+ * pre-#3510 contract. `sweepOutbox` has read `.messageId` / `.chunks` off the
+ * result since, so the stub was silently lying: it journalled
+ * `tgMessageId: undefined` and would have THROWN on `.chunks.length` had the
+ * test wired `recordOutbound` — which the sweep's catch turns into a
+ * `sendFailure` and a re-send on the next tick, i.e. a duplicate delivery of
+ * the very answer this file exists to protect. The `journals the landed message id`
+ * test below asserts that outcome; this helper is what makes it representable.
+ */
+function makeSendStub(firstMessageId = 4242) {
+  let next = firstMessageId
+  return vi.fn(
+    async (
+      _chatId: string,
+      _threadId: number | null,
+      text: string,
+    ): Promise<OutboxSendResult> => {
+      const messageId = next++
+      return { messageId, chunks: [{ messageId, text }] }
+    },
+  )
 }
 
 function readRecords(dir: string): OutboxRecord[] {
@@ -280,7 +306,7 @@ describe('end-to-end: queued during the window, delivered after it closes', () =
 
     // 4. Sweeping WHILE the window is open must not touch the wire, and must
     //    not lose the record.
-    const send = vi.fn(async () => 4242)
+    const send = makeSendStub(4242)
     const during = await sweepOutbox({
       stateDir: dir,
       send,
@@ -318,6 +344,65 @@ describe('end-to-end: queued during the window, delivered after it closes', () =
     expect(listPendingRecords(dir)).toHaveLength(0)
   })
 
+  it('journals the landed message id and records history parity — not a send failure (#4044)', async () => {
+    // Regression for the stale `send` stub. `sweepOutbox` reads `.messageId`
+    // and `.chunks` off its `send` result (`OutboxSendResult`, outbox-sweep.ts
+    // :63-80). While these tests stubbed `send` as a bare number the contract
+    // was unguarded, and a stub-shaped production sender would (a) journal
+    // `tgMessageId: undefined`, losing the pointer to the delivered message,
+    // and (b) throw on `sendResult.chunks.length` — which the sweep's catch
+    // converts into `sendFailures++` and a claim RELEASE, so the next tick
+    // re-sends the operator's answer a second time. This asserts the outcome:
+    // delivered once, journalled with the REAL id, mirrored to history.
+    const answer = 'the answer that must land exactly once'
+    const t0 = 1_000_000
+    queueFloodBlockedReply({
+      err: floodWaitActiveError(30),
+      chatId: '777',
+      threadId: null,
+      text: answer,
+      priorityClass: 'critical',
+      stateDir: dir,
+      createdAt: t0,
+    })
+
+    const send = makeSendStub(9001)
+    const recorded: Array<[string, number | null, number[], string[]]> = []
+    const summary = await sweepOutbox({
+      stateDir: dir,
+      send,
+      recordOutbound: (chatId, threadId, messageIds, texts) => {
+        recorded.push([chatId, threadId, messageIds, texts])
+      },
+      textAlreadyDelivered: () => false,
+      now: () => t0 + 10_000,
+    })
+
+    // Delivered — and NOT counted as a send failure.
+    expect(summary.delivered).toBe(1)
+    expect(summary.sendFailures).toBe(0)
+    expect(send).toHaveBeenCalledTimes(1)
+
+    // The journal carries the id the wire actually returned, so a duplicate is
+    // provable from the journal alone (#3510).
+    const journal = readFileSync(join(resolveOutboxDir(dir), 'delivered.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.trim() !== '')
+      .map((l) => JSON.parse(l) as { tgMessageId?: number; deliverySource?: string })
+    expect(journal).toHaveLength(1)
+    expect(journal[0]!.tgMessageId).toBe(9001)
+    expect(journal[0]!.deliverySource).toBe('sweep')
+
+    // And history got the landed ids + their delivered texts.
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0]![0]).toBe('777')
+    expect(recorded[0]![2]).toEqual([9001])
+    expect(recorded[0]![3]!.join('')).toContain(answer)
+
+    // Nothing left to re-send.
+    expect(listPendingRecords(dir)).toHaveLength(0)
+  })
+
   it('does not double-deliver when the caller retries after the window closed', async () => {
     const answer = 'the one answer'
     const t0 = 1_000_000
@@ -331,7 +416,7 @@ describe('end-to-end: queued during the window, delivered after it closes', () =
       createdAt: t0,
     })
 
-    const send = vi.fn(async () => 1)
+    const send = makeSendStub(1)
     await sweepOutbox({
       stateDir: dir,
       send,
@@ -381,7 +466,7 @@ describe('end-to-end: queued during the window, delivered after it closes', () =
       })
     })
 
-    const send = vi.fn(async () => 1)
+    const send = makeSendStub(1)
     await sweepOutbox({
       stateDir: dir,
       send,
