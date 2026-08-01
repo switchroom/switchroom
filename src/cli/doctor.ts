@@ -50,7 +50,7 @@ import {
   type HostCapabilitiesRead,
 } from "../setup/host-capabilities.js";
 import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
-import { findUnknownMemoryKeys } from "../config/memory-key-drift.js";
+import { findUnknownMemoryKeys, type MemoryTier } from "../config/memory-key-drift.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
@@ -599,7 +599,7 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
 }
 
 /**
- * WARN when `memory` / `memory.recall` / `memory.retain` in switchroom.yaml
+ * FAIL when `memory` / `memory.recall` / `memory.retain` in switchroom.yaml
  * carries a key the schema does not declare.
  *
  * The memory zod objects are non-strict, so an unrecognized key is dropped at
@@ -611,16 +611,22 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
  * configured it. {@link findUnknownMemoryKeys} attaches a specific message to
  * such retired keys.
  *
- * WARN, not FAIL: the issue explicitly rejects turning an unknown key into a
- * hard config-parse boot failure on every agent (which is what `.strict()`
- * would do). A dropped knob is a defect worth a loud row, but not one worth
- * refusing to boot the fleet over.
+ * FAIL, not WARN — mirroring the sibling `checkHindsightEnvKeysAreManaged` row
+ * for the identical class: there is no benign reading of the state. A key here
+ * is either a typo or a knob the operator believes is applied; both are
+ * defects, and both are silent without this row. A FAIL row only makes
+ * `switchroom doctor` exit non-zero; it does NOT turn an unknown key into a
+ * boot/parse failure (which is what `.strict()` would do and which #3773
+ * explicitly rejects) — the config still parses and the fleet still boots.
  *
  * Reads the RAW yaml — the parsed `SwitchroomConfig` has already had the
  * unknown keys stripped by zod, so a parsed config would always look clean,
- * which is exactly the silent bug. Best-effort: an unreadable/unparseable file
- * is a no-op here (the earlier `switchroom.yaml loaded` row already owns that
- * failure).
+ * which is exactly the silent bug. Each memory block is diffed against the
+ * schema for ITS tier: `agents.*` against `AgentMemorySchema`, `defaults` /
+ * `profiles.*` against the narrower `profileFields` mirror — so a key valid
+ * per-agent but stripped by the mirror is still caught, not falsely cleared.
+ * Best-effort: an unreadable/unparseable file is a no-op here (the earlier
+ * `switchroom.yaml loaded` row already owns that failure).
  *
  * @internal exported for testing
  */
@@ -647,31 +653,40 @@ export function checkMemoryKeysAreKnown(configPath: string): CheckResult {
   // Every raw memory object in the file, labelled by the tier/agent it sits
   // under so the WARNING names WHERE the dead key lives. `defaults`, each
   // `profiles.<name>`, and each `agents.<name>` can each carry a `memory:`.
-  const sources: Array<{ label: string; memory: unknown }> = [];
+  // Each raw memory object is tagged with the TIER whose schema parses it:
+  // `defaults` / `profiles.*` are parsed by the narrower inline mirror inside
+  // `profileFields`, while `agents.*` are parsed by AgentMemorySchema. Diffing
+  // the mirror tiers against the per-agent key set would falsely clear a key
+  // that is valid per-agent but stripped by the mirror (e.g. `mental_models`),
+  // so the tier must ride along to `findUnknownMemoryKeys`.
+  const sources: Array<{ label: string; memory: unknown; tier: MemoryTier }> = [];
   const asObj = (v: unknown): Record<string, unknown> | undefined =>
     typeof v === "object" && v !== null && !Array.isArray(v)
       ? (v as Record<string, unknown>)
       : undefined;
 
   const defaults = asObj(root.defaults);
-  if (defaults?.memory !== undefined) sources.push({ label: "defaults", memory: defaults.memory });
+  if (defaults?.memory !== undefined)
+    sources.push({ label: "defaults", memory: defaults.memory, tier: "mirror" });
 
   const profiles = asObj(root.profiles);
   for (const [pname, pval] of Object.entries(profiles ?? {})) {
     const p = asObj(pval);
-    if (p?.memory !== undefined) sources.push({ label: `profile ${pname}`, memory: p.memory });
+    if (p?.memory !== undefined)
+      sources.push({ label: `profile ${pname}`, memory: p.memory, tier: "mirror" });
   }
 
   const agents = asObj(root.agents);
   for (const [aname, aval] of Object.entries(agents ?? {})) {
     const a = asObj(aval);
-    if (a?.memory !== undefined) sources.push({ label: aname, memory: a.memory });
+    if (a?.memory !== undefined)
+      sources.push({ label: aname, memory: a.memory, tier: "agent" });
   }
 
   const lines: string[] = [];
   let retiredCount = 0;
-  for (const { label, memory } of sources) {
-    for (const finding of findUnknownMemoryKeys(memory)) {
+  for (const { label, memory, tier } of sources) {
+    for (const finding of findUnknownMemoryKeys(memory, tier)) {
       if (finding.replacement) {
         retiredCount++;
         lines.push(`${label}: \`${finding.scope}.${finding.key}\` — ${finding.replacement}`);
@@ -689,7 +704,7 @@ export function checkMemoryKeysAreKnown(configPath: string): CheckResult {
 
   return {
     name,
-    status: "warn",
+    status: "fail",
     detail:
       `${lines.length} unrecognized \`memory\` key(s)` +
       (retiredCount > 0 ? ` (${retiredCount} removed knob(s))` : "") +

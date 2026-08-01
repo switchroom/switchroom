@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentMemorySchema } from "./schema.js";
+import { AgentMemorySchema, ProfileSchema } from "./schema.js";
 
 /**
  * Unknown / retired keys under `memory` (and its `recall` / `retain`
@@ -38,7 +38,9 @@ import { AgentMemorySchema } from "./schema.js";
  * a knob added to `AgentMemorySchema` is automatically "known" here, so this
  * check can never false-fire on a key the schema itself accepts.
  */
-function objectShapeKeys(schema: z.ZodTypeAny | undefined): Set<string> {
+function unwrapObjectNode(
+  schema: z.ZodTypeAny | undefined,
+): { shape?: Record<string, z.ZodTypeAny> } | undefined {
   let s: unknown = schema;
   // Peel ZodOptional / ZodNullable / ZodDefault (innerType) and ZodEffects
   // (schema) wrappers until the underlying ZodObject — the node that exposes a
@@ -47,11 +49,11 @@ function objectShapeKeys(schema: z.ZodTypeAny | undefined): Set<string> {
   // discriminator, which differs across zod 3.x internals.
   for (let i = 0; s && i < 10; i++) {
     const node = s as {
-      shape?: Record<string, unknown>;
+      shape?: Record<string, z.ZodTypeAny>;
       _def?: { innerType?: unknown; schema?: unknown };
     };
     if (node.shape && typeof node.shape === "object") {
-      return new Set(Object.keys(node.shape));
+      return node;
     }
     if (node._def?.innerType) {
       s = node._def.innerType;
@@ -63,29 +65,79 @@ function objectShapeKeys(schema: z.ZodTypeAny | undefined): Set<string> {
     }
     break;
   }
-  return new Set();
+  return undefined;
 }
 
-function memoryChildSchema(child: "recall" | "retain"): z.ZodTypeAny | undefined {
-  const memoryObj = (
-    AgentMemorySchema as unknown as {
-      _def?: { innerType?: { shape?: Record<string, z.ZodTypeAny> } };
-    }
-  )._def?.innerType;
-  return memoryObj?.shape?.[child];
+function objectShapeKeys(schema: z.ZodTypeAny | undefined): Set<string> {
+  const node = unwrapObjectNode(schema);
+  return node?.shape ? new Set(Object.keys(node.shape)) : new Set();
 }
 
-const MEMORY_SHAPE = objectShapeKeys(AgentMemorySchema);
-const MEMORY_RECALL_SHAPE = objectShapeKeys(memoryChildSchema("recall"));
-const MEMORY_RETAIN_SHAPE = objectShapeKeys(memoryChildSchema("retain"));
+function memoryChildSchema(
+  memorySchema: z.ZodTypeAny | undefined,
+  child: "recall" | "retain",
+): z.ZodTypeAny | undefined {
+  return unwrapObjectNode(memorySchema)?.shape?.[child];
+}
 
 /**
- * The keys `memory` / `memory.recall` / `memory.retain` currently declare.
- * Derived from the schema at module load so they cannot drift out of sync.
+ * The set of keys accepted under `memory` / `memory.recall` / `memory.retain`,
+ * derived per TIER from the schema that actually parses that tier — so the
+ * known set can never drift as knobs are added.
+ *
+ * Two tiers, two DISTINCT schemas:
+ *
+ *  - `agent` — a per-agent `agents.<name>.memory` block, parsed by
+ *    {@link AgentMemorySchema}.
+ *  - `mirror` — a `defaults.memory` / `profiles.<name>.memory` block, parsed by
+ *    the SEPARATE inline mirror object inside `profileFields` (reached here via
+ *    `ProfileSchema.shape.memory`). The mirror is DELIBERATELY narrower — e.g.
+ *    `mental_models` is per-agent only and is not mirrored — so a key that is
+ *    valid per-agent can still be silently stripped at the defaults/profile
+ *    tier. Diffing that tier against the per-agent set would falsely clear it;
+ *    we must diff against the mirror's own declared keys.
  */
-export const KNOWN_MEMORY_KEYS: ReadonlySet<string> = MEMORY_SHAPE;
-export const KNOWN_MEMORY_RECALL_KEYS: ReadonlySet<string> = MEMORY_RECALL_SHAPE;
-export const KNOWN_MEMORY_RETAIN_KEYS: ReadonlySet<string> = MEMORY_RETAIN_SHAPE;
+export type MemoryTier = "agent" | "mirror";
+
+interface TierKnownKeys {
+  readonly memory: ReadonlySet<string>;
+  readonly recall: ReadonlySet<string>;
+  readonly retain: ReadonlySet<string>;
+}
+
+function tierKnownKeys(memorySchema: z.ZodTypeAny | undefined): TierKnownKeys {
+  return {
+    memory: objectShapeKeys(memorySchema),
+    recall: objectShapeKeys(memoryChildSchema(memorySchema, "recall")),
+    retain: objectShapeKeys(memoryChildSchema(memorySchema, "retain")),
+  };
+}
+
+const AGENT_KNOWN = tierKnownKeys(AgentMemorySchema);
+// `ProfileSchema.shape.memory` is the inline `profileFields.memory` mirror —
+// the exact schema the defaults/profile tier is parsed by.
+const MIRROR_KNOWN = tierKnownKeys(ProfileSchema.shape.memory);
+
+const KNOWN_BY_TIER: Readonly<Record<MemoryTier, TierKnownKeys>> = {
+  agent: AGENT_KNOWN,
+  mirror: MIRROR_KNOWN,
+};
+
+/**
+ * The keys the PER-AGENT `memory` / `memory.recall` / `memory.retain` declare.
+ * Derived from the schema at module load so they cannot drift out of sync.
+ * (Mirror-tier sets are on {@link KNOWN_BY_TIER}.)
+ */
+export const KNOWN_MEMORY_KEYS: ReadonlySet<string> = AGENT_KNOWN.memory;
+export const KNOWN_MEMORY_RECALL_KEYS: ReadonlySet<string> = AGENT_KNOWN.recall;
+export const KNOWN_MEMORY_RETAIN_KEYS: ReadonlySet<string> = AGENT_KNOWN.retain;
+
+/** Mirror-tier (defaults / profiles.*) declared key sets. */
+export const KNOWN_MIRROR_MEMORY_KEYS: ReadonlySet<string> = MIRROR_KNOWN.memory;
+export const KNOWN_MIRROR_MEMORY_RECALL_KEYS: ReadonlySet<string> =
+  MIRROR_KNOWN.recall;
+export const KNOWN_MIRROR_MEMORY_RETAIN_KEYS: ReadonlySet<string> =
+  MIRROR_KNOWN.retain;
 
 /**
  * Keys the schema once declared and no longer does. Value = the specific
@@ -138,33 +190,47 @@ function diffScope(
 
 /**
  * Diff a RAW (pre-zod-parse) `memory` object's keys — and those of its
- * `recall` / `retain` sub-objects — against the schema's declared keys.
+ * `recall` / `retain` sub-objects — against the declared keys of the schema
+ * that ACTUALLY parses this tier.
+ *
+ * `tier` selects that schema (default `"agent"`):
+ *  - `"agent"` for a per-agent `agents.<name>.memory` block ({@link AgentMemorySchema}).
+ *  - `"mirror"` for a `defaults.memory` / `profiles.<name>.memory` block, which
+ *    is parsed by the narrower inline mirror inside `profileFields`. Passing the
+ *    wrong tier is the false-all-clear bug this parameter exists to prevent: a
+ *    key valid per-agent but absent from the mirror (e.g. `mental_models`) is
+ *    silently stripped at the defaults/profile tier, and diffing it against the
+ *    per-agent set would wrongly report it clean.
  *
  * Pure and total: takes the raw parsed-yaml `memory` value, returns the
  * offending keys (empty when everything is recognized), sorted scope-then-key
- * for stable output. Retired keys carry their specific `replacement` message.
- * The caller (`switchroom doctor` / `apply`) decides how loud to be; per the
- * issue it is a WARNING, never a hard fail.
+ * for stable output. Retired keys carry their specific `replacement` message
+ * regardless of tier (a removed knob is dead at every tier). The caller decides
+ * how loud to be.
  *
  * MUST be fed the raw yaml object, not a parsed `SwitchroomConfig.memory`:
  * zod has already stripped the unknown keys off the latter, so a parsed config
  * would always report clean — which is precisely the silent bug.
  */
-export function findUnknownMemoryKeys(memory: unknown): UnknownMemoryKey[] {
+export function findUnknownMemoryKeys(
+  memory: unknown,
+  tier: MemoryTier = "agent",
+): UnknownMemoryKey[] {
   if (!isPlainObject(memory)) return [];
+  const known = KNOWN_BY_TIER[tier];
   const out: UnknownMemoryKey[] = [];
-  diffScope(memory, "memory", KNOWN_MEMORY_KEYS, RETIRED_MEMORY_KEYS, out);
+  diffScope(memory, "memory", known.memory, RETIRED_MEMORY_KEYS, out);
   diffScope(
     memory.recall,
     "memory.recall",
-    KNOWN_MEMORY_RECALL_KEYS,
+    known.recall,
     RETIRED_MEMORY_RECALL_KEYS,
     out,
   );
   diffScope(
     memory.retain,
     "memory.retain",
-    KNOWN_MEMORY_RETAIN_KEYS,
+    known.retain,
     RETIRED_MEMORY_RETAIN_KEYS,
     out,
   );
