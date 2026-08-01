@@ -1169,7 +1169,8 @@ export interface BankMissionExtras {
  * Only `disposition` + `observations_mission` are defaulted here; the
  * persona statement (`reflect_mission` / `bank_mission`) stays operator-driven
  * so there is no code-vs-yaml persona conflict. Profiles not listed (notably
- * `default`) inherit the engine disposition (all traits 3) and
+ * `default`) inherit {@link FLEET_DEFAULT_DISPOSITION} for the traits it sets,
+ * the engine disposition (3) for the rest, and
  * {@link DEFAULT_OBSERVATIONS_MISSION} — a `default` entry here would only
  * duplicate the fleet default.
  *
@@ -1203,6 +1204,42 @@ export interface BankMissionExtras {
  * characters — roughly 400 tokens per batch, the same order as the
  * unconditional `_PROCESSING_RULES` block it sits beside.
  */
+/**
+ * The FLEET-WIDE disposition floor — what every managed bank gets with zero
+ * yaml, under the profile defaults and under operator config.
+ *
+ * Only `skepticism` is set, and only to 4. The reasoning, and the reason the
+ * other two traits are deliberately left at the engine default of 3:
+ *
+ * - **Why skepticism at all.** Disposition steers reflect (and observation
+ *   synthesis). The failure this fleet actually hits is a bank asserting
+ *   something it cannot support — a date, a decision — because the
+ *   synthesiser fills a gap rather than reporting one. Hindsight documents
+ *   skepticism as how much the bank doubts unverified claims and flags
+ *   contradictions, which is precisely the dial for that.
+ *
+ * - **Why 4 and not 5.** Every specialist profile that already sets a
+ *   disposition on purpose sits at skepticism 4 (`coding` 4/5/2,
+ *   `executive-assistant` 4/4/3); the published common profiles agree (code
+ *   review 4/5/1, research assistant 4/4/2) and reserve 5 for the medical
+ *   profile. Shipping 5 fleet-wide would make every ordinary bank more
+ *   doubting than any profile a human chose. 4 is the value the codebase and
+ *   the vendor docs independently converged on; it also means agents on the
+ *   `default` profile stop being the ONLY ones left at 3.
+ *
+ * - **Why not literalism / empathy.** Both are genuinely persona-shaped: the
+ *   right literalism for a code reviewer (5) is wrong for a coach (2), and
+ *   empathy runs 1→5 across the published profiles. There is no defensible
+ *   fleet-wide value, and picking one would quietly override the engine
+ *   default for every bank in service of nothing. Defaults do the right thing;
+ *   complexity is opt-in — so these stay opt-in.
+ *
+ * Overriding: per-key, no new syntax. `memory.disposition.skepticism: 3` at
+ * the agent, profile, or `defaults` tier wins, because
+ * {@link resolveBankMissionExtras} merges fleet → profile → config per trait.
+ */
+export const FLEET_DEFAULT_DISPOSITION: BankDisposition = { skepticism: 4 };
+
 export const PROFILE_MEMORY_DEFAULTS: Record<string, BankMissionExtras> = {
   "health-coach": {
     disposition: { skepticism: 2, literalism: 2, empathy: 5 },
@@ -1300,10 +1337,138 @@ export function resolveBankMissionExtras(
   const observations = memory?.observations_mission ?? pd.observations_mission;
   if (observations != null) out.observations_mission = observations;
 
-  const disposition = mergeDisposition(pd.disposition, memory?.disposition);
+  // Three tiers, merged per-trait: fleet floor → profile → operator config.
+  // A profile that sets skepticism on purpose (health-coach at 2) overrides
+  // the fleet floor, and operator yaml overrides both — including back DOWN to
+  // the engine default, since the merge is per-key rather than
+  // all-or-nothing.
+  const disposition = mergeDisposition(
+    mergeDisposition(FLEET_DEFAULT_DISPOSITION, pd.disposition),
+    memory?.disposition,
+  );
   if (disposition) out.disposition = disposition;
 
   return out;
+}
+
+/**
+ * The engine's own default for every disposition trait when the bank leaves it
+ * null (confirmed against `/v1/bank-template-schema`: integers 1-5, default 3).
+ */
+export const ENGINE_DEFAULT_DISPOSITION_TRAIT = 3;
+
+/**
+ * Which traits of the resolved disposition came ONLY from
+ * {@link FLEET_DEFAULT_DISPOSITION} — i.e. neither the profile nor operator
+ * yaml said anything about them.
+ *
+ * This is the distinction {@link decideDispositionPush} needs. A trait a human
+ * chose (yaml) or a specialist profile pinned is authoritative and is pushed;
+ * a trait that exists only because switchroom picked a fleet-wide floor is a
+ * DEFAULT, and a default must never overwrite a value somebody set on the bank
+ * itself. Without this split, shipping a fleet floor would silently rewrite
+ * every hand-tuned bank in the fleet on the next apply.
+ */
+export function fleetOnlyDispositionTraits(
+  memory: { disposition?: BankDisposition } | undefined,
+  profileName: string,
+): (keyof BankDisposition)[] {
+  const pd = PROFILE_MEMORY_DEFAULTS[profileName]?.disposition ?? {};
+  const cfg = memory?.disposition ?? {};
+  return (Object.keys(FLEET_DEFAULT_DISPOSITION) as (keyof BankDisposition)[]).filter(
+    (t) => pd[t] === undefined && cfg[t] === undefined,
+  );
+}
+
+/**
+ * Decide which disposition traits to actually PUT on the wire.
+ *
+ * Two jobs, both outcomes an operator can see:
+ *
+ * 1. **Silence the no-op.** A trait the bank already carries is dropped. In
+ *    post-upgrade steady state the whole object drops out, so `switchroom
+ *    apply` sends no `update_bank` and prints no success line for a call that
+ *    changed nothing (the PR #3529 N1 regression, which a fleet default would
+ *    otherwise reintroduce for every agent on every apply).
+ *
+ * 2. **Never clobber a hand-tuned bank.** For a trait that came only from the
+ *    fleet floor, the push is skipped unless the bank is unset or still sitting
+ *    on the engine default — the same rule the managed missions use, expressed
+ *    per-trait because disposition has no text to byte-compare.
+ *
+ * A FAILED read must not reach here: pass nothing and push nothing, exactly as
+ * `resolveRetainMissionPush` does, or a Hindsight hiccup becomes a fleet-wide
+ * disposition rewrite.
+ */
+export function decideDispositionPush(
+  desired: BankDisposition | undefined,
+  current: BankDisposition,
+  fleetOnly: readonly (keyof BankDisposition)[],
+): BankDisposition | undefined {
+  if (!desired) return undefined;
+  const out: BankDisposition = {};
+  for (const [k, v] of Object.entries(desired) as [keyof BankDisposition, number][]) {
+    if (v === undefined) continue;
+    const live = current[k];
+    if (live === v) continue; // already there
+    if (
+      fleetOnly.includes(k) &&
+      live != null &&
+      live !== ENGINE_DEFAULT_DISPOSITION_TRAIT
+    ) {
+      continue; // somebody tuned this bank; a fleet default does not outrank them
+    }
+    out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Read a bank's live disposition. Same contract and unrecognised-shape posture
+ * as {@link fetchBankRetainMission}: a 200 whose body has no `config` object is
+ * `{ ok: false }`, NOT "everything unset" — mapping an unrecognised shape to
+ * unset would make every trait look pushable.
+ *
+ * Absent traits come back as `undefined` (the bank is on the engine default),
+ * which is distinct from a failed read.
+ */
+export async function fetchBankDisposition(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<{ ok: true; disposition: BankDisposition } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+  const base = apiUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  const url = `${base}/v1/default/banks/${encodeURIComponent(bankId)}/config`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchImpl(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
+    const body = (await resp.json()) as { config?: Record<string, unknown> | null };
+    const config = body?.config;
+    if (config == null || typeof config !== "object") {
+      return { ok: false, reason: "Unexpected shape" };
+    }
+    const read = (field: string): number | undefined => {
+      const v = config[field];
+      return typeof v === "number" ? v : undefined;
+    };
+    const disposition: BankDisposition = {};
+    const skepticism = read("disposition_skepticism");
+    const literalism = read("disposition_literalism");
+    const empathy = read("disposition_empathy");
+    if (skepticism !== undefined) disposition.skepticism = skepticism;
+    if (literalism !== undefined) disposition.literalism = literalism;
+    if (empathy !== undefined) disposition.empathy = empathy;
+    return { ok: true, disposition };
+  } catch (err) {
+    clearTimeout(timeout);
+    if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
+    return { ok: false, reason: String((err as Error).message ?? err) };
+  }
 }
 
 /**
