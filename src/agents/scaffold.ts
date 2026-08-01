@@ -3159,7 +3159,16 @@ export function installHindsightPlugin(
   if (!memory) return null;
 
   const agentMemory = switchroomConfig.agents[agentName]?.memory;
-  if (agentMemory?.auto_recall === false) return null;
+  // auto_recall from the CASCADED config (defaults → profile → agent), NOT the
+  // raw per-agent map entry: a fleet-wide `defaults.memory.auto_recall: false`
+  // or a profile-tier opt-out must disable the plugin too. Reading the raw
+  // `agents[name].memory.auto_recall` here silently dropped both tiers (#3914),
+  // installing the plugin for an agent the operator had turned recall off for.
+  // resolveHindsightRecallConfig documents why re-deriving from the raw entry is
+  // not equivalent to the caller's already-cascaded config.
+  if (resolveHindsightAutoRecall(switchroomConfig, agentName, resolvedAgentConfig) === false) {
+    return null;
+  }
 
   const sourcePath = resolveHindsightVendorPath();
   if (!existsSync(sourcePath)) {
@@ -3193,7 +3202,25 @@ export function installHindsightPlugin(
   // in the env-export path (see resolveHindsightRetainConfig). These drive
   // the stamped settings.json values below, so a switchroom.yaml
   // `memory.retain.*` override is authoritative and survives reconcile.
-  const retainConfig = resolveHindsightRetainConfig(switchroomConfig, agentName);
+  const retainConfig = resolveHindsightRetainConfig(
+    switchroomConfig,
+    agentName,
+    resolvedAgentConfig,
+  );
+  // Per-row observation scope + per-retain strategy, from the CASCADED config.
+  // These MUST be mirrored into the deployed settings.json (below), not left to
+  // the start.sh env export alone: start.sh only exports HINDSIGHT_OBSERVATION_*
+  // into the supervised claude session, so a docker-exec'd backfill/drain that
+  // does NOT inherit that env falls back to the vendor settings.json default
+  // (scope None / strategy "curated") and silently retains under the WRONG scope
+  // (#3915). Stamping settings.json makes the supervised and exec'd processes
+  // resolve identically — config.py reads settings.json first, env overrides it
+  // with the same value in the supervised case.
+  const observationScopeSettings = resolveHindsightObservationScopeSettings(
+    switchroomConfig,
+    agentName,
+    resolvedAgentConfig,
+  );
   // Recall latency envelope (hook ceiling / parallel deadline / per-bank
   // timeout) from the CASCADED config. Stamped onto the deployed plugin below
   // so `switchroom apply` RE-ASSERTS these values instead of reverting them —
@@ -3210,6 +3237,7 @@ export function installHindsightPlugin(
         additionalBanks,
         retainConfig,
         recallTunables,
+        observationScopeSettings,
       );
       if (expectedSettings != null) contentOverrides["settings.json"] = expectedSettings;
     }
@@ -3267,7 +3295,13 @@ export function installHindsightPlugin(
   // per-agent value. Now also folds in the `knows`-assigned user/bank profiles
   // (user concept, RFC reference/rfcs/user-concept.md); resolveUsers() handles
   // the cascade + union (defaults ∪ agent, generated ∪ explicit) itself.
-  applyHindsightSettingsOverrides(destPath, additionalBanks, retainConfig, recallTunables);
+  applyHindsightSettingsOverrides(
+    destPath,
+    additionalBanks,
+    retainConfig,
+    recallTunables,
+    observationScopeSettings,
+  );
   // Stamp the UserPromptSubmit recall-hook ceiling into the deployed
   // hooks/hooks.json. Claude Code reads this file directly and does NOT expand
   // env vars in the `timeout` field, so unlike the settings.json knobs there is
@@ -3312,21 +3346,90 @@ interface HindsightRetainConfig {
 function resolveHindsightRetainConfig(
   switchroomConfig: SwitchroomConfig | undefined,
   agentName: string,
+  /**
+   * The caller's already-cascaded agent config, when it has one. Preferred over
+   * re-deriving for the SAME reason as resolveHindsightRecallConfig: the fallback
+   * below resolves the `defaults:` tier ONLY (an empty stand-in carries no
+   * `extends:`), so re-deriving there silently drops any
+   * `profiles.<name>.memory.retain.*`. Both production callers thread it (#3914).
+   */
+  resolvedAgentConfig?: AgentConfig,
 ): HindsightRetainConfig {
-  const resolved = switchroomConfig
-    ? resolveAgentConfig(
-        switchroomConfig.defaults,
-        switchroomConfig.profiles,
-        // Some scaffold paths install the plugin for an agent that isn't in
-        // the `agents` map yet (fresh scaffold); resolve against an empty
-        // agent so the defaults/profile tiers still apply.
-        switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
-      )
-    : undefined;
-  const retain = resolved?.memory?.retain;
+  const retain = resolvedAgentConfig
+    ? resolvedAgentConfig.memory?.retain
+    : switchroomConfig
+      ? resolveAgentConfig(
+          switchroomConfig.defaults,
+          switchroomConfig.profiles,
+          // Some scaffold paths install the plugin for an agent that isn't in
+          // the `agents` map yet (fresh scaffold); resolve against an empty
+          // agent so the defaults tier still applies.
+          switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
+        )?.memory?.retain
+      : undefined;
   return {
     everyNTurns: retain?.every_n_turns ?? HINDSIGHT_DEFAULT_RETAIN_EVERY_N_TURNS,
     overlapTurns: retain?.overlap_turns ?? HINDSIGHT_DEFAULT_RETAIN_OVERLAP_TURNS,
+  };
+}
+
+/**
+ * Resolve the effective `memory.auto_recall` for an agent, honouring the full
+ * cascade (defaults → profile → agent). Mirrors resolveHindsightRecallConfig:
+ * prefer the caller's already-cascaded config; fall back to re-deriving for
+ * config-free callers (whose fallback resolves the `defaults:` tier only — an
+ * empty stand-in carries no `extends:`).
+ */
+function resolveHindsightAutoRecall(
+  switchroomConfig: SwitchroomConfig | undefined,
+  agentName: string,
+  resolvedAgentConfig?: AgentConfig,
+): boolean | undefined {
+  if (resolvedAgentConfig) return resolvedAgentConfig.memory?.auto_recall;
+  if (!switchroomConfig) return undefined;
+  return resolveAgentConfig(
+    switchroomConfig.defaults,
+    switchroomConfig.profiles,
+    switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
+  )?.memory?.auto_recall;
+}
+
+/**
+ * The per-row observation scope pin (`memory.observation_scopes`) and the
+ * per-retain strategy (`memory.observation_scope_strategy`), resolved from the
+ * CASCADED config. `undefined` for a field means "operator set nothing" — the
+ * stamp leaves the vendor default in place, exactly as start.sh emits no env
+ * export in that case.
+ */
+interface HindsightObservationScopeSettings {
+  observationScopes?: string;
+  observationScopeStrategy?: string;
+}
+
+/**
+ * Resolve the observation-scope settings for an agent, honouring the cascade
+ * (defaults → profile → agent). Same prefer-cascaded / fallback-re-derive shape
+ * as resolveHindsightRetainConfig; feeds the settings.json mirror so a
+ * docker-exec'd retain resolves the same scope the supervised session does
+ * (#3915).
+ */
+function resolveHindsightObservationScopeSettings(
+  switchroomConfig: SwitchroomConfig | undefined,
+  agentName: string,
+  resolvedAgentConfig?: AgentConfig,
+): HindsightObservationScopeSettings {
+  const memory = resolvedAgentConfig
+    ? resolvedAgentConfig.memory
+    : switchroomConfig
+      ? resolveAgentConfig(
+          switchroomConfig.defaults,
+          switchroomConfig.profiles,
+          switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
+        )?.memory
+      : undefined;
+  return {
+    observationScopes: memory?.observation_scopes,
+    observationScopeStrategy: memory?.observation_scope_strategy,
   };
 }
 
@@ -3452,6 +3555,7 @@ function applyHindsightSettingsOverrides(
   additionalBanks: readonly string[],
   retainConfig: HindsightRetainConfig,
   recallTunables: HindsightRecallTunables,
+  observationScopeSettings: HindsightObservationScopeSettings,
 ): void {
   const settingsPath = join(pluginDestPath, "settings.json");
   if (!existsSync(settingsPath)) return; // vendor structure changed; bail safely
@@ -3466,6 +3570,7 @@ function applyHindsightSettingsOverrides(
     additionalBanks,
     retainConfig,
     recallTunables,
+    observationScopeSettings,
   );
   if (next == null) return; // malformed settings; don't make it worse
   writeFileSyncIfChanged(settingsPath, next);
@@ -3484,6 +3589,7 @@ function renderHindsightSettingsOverrides(
   additionalBanks: readonly string[],
   retainConfig: HindsightRetainConfig,
   recallTunables: HindsightRecallTunables,
+  observationScopeSettings: HindsightObservationScopeSettings,
 ): string | null {
   let settings: Record<string, unknown>;
   try {
@@ -3653,6 +3759,31 @@ function renderHindsightSettingsOverrides(
   // recall to specific tags), currently dormant"; an operator who has such a
   // taxonomy in their own bank can now express it in switchroom.yaml instead of
   // hand-editing the installed plugin, and one who does not is unaffected.
+  // Per-row observation scope pin + per-retain strategy (#3915). Mirror the
+  // CASCADED config into the deployed settings.json so a docker-exec'd retain —
+  // a `backfill_transcripts.py` / consolidation drain that does NOT inherit the
+  // supervised session's start.sh env exports — resolves the SAME scope the
+  // supervised session does. config.py loads settings.json first and lets the
+  // HINDSIGHT_OBSERVATION_* env override it, so in the supervised case the two
+  // channels carry the identical value; in the exec'd case settings.json is the
+  // only channel, and before this it silently fell back to the vendor default
+  // (scope None / strategy "curated") — retaining under the wrong scope.
+  //
+  // Stamp ONLY when the operator set the value, byte-for-byte matching start.sh's
+  // "export only when set" semantics: an unset field leaves the vendor default
+  // (config.py: observationScopes None, observationScopeStrategy "curated"), so
+  // an agent that configured neither is unchanged and the field never reaches
+  // the wire. No re-validation here — the schema already rejects off-list values
+  // at parse time, and matching start.sh's raw passthrough is what keeps the two
+  // channels provably identical.
+  const observationScopes = observationScopeSettings.observationScopes;
+  if (typeof observationScopes === "string" && observationScopes.length > 0) {
+    settings.observationScopes = observationScopes;
+  }
+  const observationScopeStrategy = observationScopeSettings.observationScopeStrategy;
+  if (typeof observationScopeStrategy === "string" && observationScopeStrategy.length > 0) {
+    settings.observationScopeStrategy = observationScopeStrategy;
+  }
   return JSON.stringify(settings, null, 2) + "\n";
 }
 
@@ -5290,9 +5421,12 @@ export function scaffoldAgent(
       // get dueling instructions (write to local .md files vs use
       // Hindsight). The settings flag gates the memory system-prompt
       // block at the source.
-      const hindsightOn = isHindsightEnabled(switchroomConfig)
-        && switchroomConfig.agents[name]?.memory?.auto_recall !== false;
-      if (hindsightOn) {
+      // Use the CASCADED gate computed above, not a re-read of the raw
+      // `agents[name].memory.auto_recall`: this and installHindsightPlugin must
+      // agree, or an agent with a defaults/profile-tier `auto_recall: false`
+      // would get the plugin skipped (correct) yet keep Claude Code's built-in
+      // auto-memory disabled here (wrong) — the exact split #3914 is about.
+      if (hindsightAutoRecallEnabled) {
         settings.autoMemoryEnabled = false;
       }
 
