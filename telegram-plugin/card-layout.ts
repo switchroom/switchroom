@@ -313,6 +313,13 @@ export interface CardCandidate {
  * an oversized newest bullet), while the combined card drops its newest worker
  * row into `+M more working…`. The MECHANISM — render, measure, accept or go
  * deeper — exists only here.
+ *
+ * The return is UNCONDITIONALLY within `STATUS_CARD_CHAR_BUDGET` (#3833). The
+ * loop used to return the deepest render unmeasured, so a card whose FIXED
+ * chrome/footer alone exceeds the budget (a 40k-char worker description — the
+ * #3682 repro) escaped over the wire limit and the send failed. No shrink level
+ * can rescue that case by construction — every level keeps the chrome — so the
+ * last resort hard-truncates. A clipped card beats no card.
  */
 export function fitCardToBudget(
   build: (level: number) => CardCandidate,
@@ -324,5 +331,48 @@ export function fitCardToBudget(
     text = renderCardSpec(candidate.spec)
     if (candidate.overflow !== true && text.length <= STATUS_CARD_CHAR_BUDGET) return text
   }
-  return text
+  return hardTruncateCard(text)
+}
+
+/**
+ * Last-resort clip for a rendered card that no shrink level could fit — the
+ * only place a card's text is cut without going through a spec.
+ *
+ * Keeps as many WHOLE lines as fit, so the survivors' markdown spans stay
+ * balanced and only a single over-budget line is ever sliced mid-text. The tail
+ * is then cleaned of the stack's own break chrome (hard-break spaces /
+ * `COLLAPSE_SAFE_SEPARATOR`) and of a dangling lone surrogate, so the wire
+ * string is never invalid UTF-16.
+ *
+ * Exported for the budget tests; production callers go through
+ * {@link fitCardToBudget}.
+ */
+export function hardTruncateCard(
+  text: string,
+  budget: number = STATUS_CARD_CHAR_BUDGET,
+): string {
+  if (text.length <= budget) return text
+  // The break chrome is measured on the KEPT prefix, not on the final line:
+  // a line that is followed by a break carries `  \n` (+ separator) which is
+  // stripped once it becomes the last line, so a prefix can fit after the
+  // strip even when its raw length is a few chars over.
+  let kept = ''
+  for (const line of text.split('\n')) {
+    const next = kept.length === 0 ? line : `${kept}\n${line}`
+    if (trimBreakChrome(next).length > budget) break
+    kept = next
+  }
+  let out = trimBreakChrome(kept)
+  // A first line longer than the budget keeps nothing; slice it rather than
+  // emit a blank card.
+  if (out.length === 0) out = text.slice(0, budget)
+  if (out.length > budget) out = out.slice(0, budget)
+  // Finally, never leave a lone high surrogate from slicing through an astral
+  // character.
+  return /[\uD800-\uDBFF]$/.test(out) ? out.slice(0, -1) : out
+}
+
+/** Strip a stacked card's trailing hard-break spaces / collapse separator. */
+function trimBreakChrome(text: string): string {
+  return text.replace(/[ \t\r\u00A0]+$/, '')
 }

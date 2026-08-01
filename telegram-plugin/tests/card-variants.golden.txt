@@ -29,9 +29,9 @@ _1m35s · 12 tools · 41.2k tok · opus 4.8_ 
 ~~_✓ Searching memory for card render paths_~~   
 ~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
 ~~_✓ Reading telegram-plugin/worker-activity-feed.ts_~~   
-   ↳ ~~_Reading the repo conventions_~~   
-   ↳ ~~_Running the scoped test suite_~~   
-   ↳ **→ Summarising findings · 24s**
+⠀⠀⠀↳ ~~_Reading the repo conventions_~~   
+⠀⠀⠀↳ ~~_Running the scoped test suite_~~   
+⠀⠀⠀↳ **→ Summarising findings · 24s**
 
 ===== CARD ===== Agent card — liveness early-open (no tools yet)
 🤖 **Agent**   
@@ -203,9 +203,9 @@ _✓ +9 earlier…_ 
 _1m35s · 12 tools · 41.2k tok · opus 4.8_   
 ~~_✓ Searching memory for card render paths_~~   
 ~~_✓ Reading telegram-plugin/tool-activity-summary.ts_~~   
-   ↳ _+6 earlier…_   
-   ↳ ~~_Child step 7_~~   
-   ↳ ~~_Child step 8_~~   
-   ↳ ~~_Child step 9_~~   
-   ↳ ~~_Child step 10_~~   
-   ↳ **→ Child step 11**
+⠀⠀⠀↳ _+6 earlier…_   
+⠀⠀⠀↳ ~~_Child step 7_~~   
+⠀⠀⠀↳ ~~_Child step 8_~~   
+⠀⠀⠀↳ ~~_Child step 9_~~   
+⠀⠀⠀↳ ~~_Child step 10_~~   
+⠀⠀⠀↳ **→ Child step 11**
