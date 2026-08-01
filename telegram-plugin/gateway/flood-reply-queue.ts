@@ -145,6 +145,11 @@ export function queueFloodBlockedReply(input: FloodQueueInput): FloodQueueResult
     textSha256: sha256Hex(text),
     createdAt,
     source: FLOOD_QUEUED_SOURCE,
+    // W1-d (#3865): a flood-deferred record is a reply the agent ALREADY chose
+    // to send to this chat — its audience is never in question. Stamped
+    // explicitly rather than relying on the legacy default, so this producer
+    // stays correct if that default is ever revisited.
+    audience: 'user',
     ...(input.originChatId != null ? { originChatId: input.originChatId } : {}),
     ...(input.originThreadId != null ? { originThreadId: input.originThreadId } : {}),
   }

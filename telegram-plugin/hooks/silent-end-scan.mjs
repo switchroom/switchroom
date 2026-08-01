@@ -917,7 +917,7 @@ function resolveSessionOriginChat(lines) {
  *
  * @param {string} jsonl
  * @param {number} [now]
- * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string, replyAlreadyDeliveredThisTurn: boolean, deliveredReplySha256: string|null }}
+ * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string, replyAlreadyDeliveredThisTurn: boolean, deliveredReplySha256: string|null, replyToolThrewThisTurn: boolean }}
  */
 export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const lines = jsonl.split('\n')
@@ -925,12 +925,34 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const { envelope } = anchor
 
   const blocks = []
+  // W1-d (#3865): ids of reply-tool `tool_use` blocks seen this turn, and the
+  // ids whose `tool_result` came back `is_error: true`. Their intersection is
+  // the "did the reply tool throw this turn" signal.
+  const replyToolUseIds = new Set()
+  const erroredToolUseIds = new Set()
   for (let i = anchor.startIdx + 1; i < lines.length; i++) {
     const line = lines[i]
     if (!line || line[0] !== '{') continue
     let obj
     try { obj = JSON.parse(line) } catch { continue }
     if (obj?.isSidechain === true) continue
+    // W1-d (#3865): tool RESULT lines are how a reply-tool THROW becomes
+    // visible. Claude Code writes the result of a `tool_use` as a `user`-type
+    // line whose content array carries `{type:'tool_result', tool_use_id,
+    // is_error}`. Nothing in this scanner read those before, which is exactly
+    // why an errored reply was indistinguishable from a delivered one — the
+    // transcript shape is otherwise identical.
+    if (obj?.type === 'user') {
+      const rc = obj?.message?.content
+      if (!Array.isArray(rc)) continue
+      for (const r of rc) {
+        if (r?.type !== 'tool_result') continue
+        if (r?.is_error !== true) continue
+        if (typeof r.tool_use_id !== 'string') continue
+        erroredToolUseIds.add(r.tool_use_id)
+      }
+      continue
+    }
     if (obj?.type !== 'assistant') continue
     const content = obj?.message?.content
     if (!Array.isArray(content)) continue
@@ -971,6 +993,12 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
         }
         continue
       }
+      // W1-d (#3865): remember EVERY reply-tool call's id, not just the
+      // qualifying-final-answer ones. An interim ack that threw is still a
+      // reply-tool throw, and the #3861 shape (reply raises, agent then writes
+      // trailing working notes) does not require the errored call to have been
+      // a qualifying final answer.
+      if (typeof c.id === 'string') replyToolUseIds.add(c.id)
       const input = c.input ?? {}
       const text = String(input.text ?? '')
       if (SILENT_MARKER_RE.test(text.trim()) || endsWithSilentMarker(text)) {
@@ -1081,5 +1109,10 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     originThreadId: origin.threadId,
     replyAlreadyDeliveredThisTurn,
     deliveredReplySha256,
+    // W1-d (#3865): one of this turn's reply-tool calls came back an error.
+    // Reported as a raw SIGNAL, not a verdict — `decideCaptureAudience` in
+    // `audience-classify.mjs` combines it with the obligation state (which
+    // this pure transcript scanner cannot see) to decide the audience.
+    replyToolThrewThisTurn: [...replyToolUseIds].some((id) => erroredToolUseIds.has(id)),
   }
 }

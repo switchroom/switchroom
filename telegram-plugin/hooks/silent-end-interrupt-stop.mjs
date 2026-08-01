@@ -69,6 +69,11 @@ import {
   isCapturedProseDeliveryEnabledEnv,
   isGatewayHeartbeatFresh,
 } from './silent-end-scan.mjs'
+import {
+  decideCaptureAudience,
+  resolveOpenObligation,
+  AUDIENCE_INTERNAL,
+} from './audience-classify.mjs'
 
 // MUST stay in sync with SILENT_END_MAX_RETRIES in telegram-plugin/silent-end.ts
 // (this hook is a standalone .mjs and can't import the TS module).
@@ -157,12 +162,44 @@ function outboxAlreadyDelivered(outboxDir, nonce) {
 }
 
 /**
+ * W1-d (#3865): classify WHO the captured prose is for, at capture time — the
+ * only point in the pipeline that can still see the turn.
+ *
+ * The obligation snapshot is read here (impure) and the verdict is computed by
+ * the shared pure classifier, so the hook and the gateway run the identical
+ * predicate. Any failure resolves to `'user'` via `resolveOpenObligation`'s
+ * `'unknown'` → the record delivers exactly as it does today.
+ *
+ * @param {string} stateDir
+ * @param {{ chatId: string|null, originChatId?: string|null, replyToolThrewThisTurn?: boolean }} capture
+ * @returns {'user' | 'internal'}
+ */
+function classifyCaptureAudience(stateDir, capture) {
+  let snapshotRaw = null
+  try {
+    const p = join(stateDir, 'obligations.json')
+    if (existsSync(p)) snapshotRaw = readFileSync(p, 'utf8')
+  } catch {
+    /* unreadable ⇒ null ⇒ 'unknown' ⇒ 'user' (fail-safe toward delivering) */
+  }
+  return decideCaptureAudience({
+    replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
+    openInboundObligation: resolveOpenObligation({
+      snapshotRaw,
+      // Same chat the sweep will route to: the envelope chat when present,
+      // else this session's origin chat (`resolveOutboxChat`'s F2 fallback).
+      chatId: capture.chatId ?? capture.originChatId ?? null,
+    }),
+  })
+}
+
+/**
  * Write the durable outbox record for a captured undelivered final answer
  * (atomic tmp+rename), mirroring `writeOutboxRecordAtomic` in `../outbox.ts`.
  * The gateway heartbeat sweep is the single deliverer. Best-effort; never
  * throws. Returns true when a record exists on disk for the nonce afterward.
  */
-function writeOutboxRecord(stateDir, capture) {
+function writeOutboxRecord(stateDir, capture, audience) {
   const outboxDir = join(stateDir, 'outbox')
   try {
     mkdirSync(outboxDir, { recursive: true })
@@ -187,6 +224,11 @@ function writeOutboxRecord(stateDir, capture) {
       // journal alone. Driven by the SAME boolean that gates capture-vs-election
       // in main() — fix and telemetry cannot drift.
       replyAlreadyDeliveredThisTurn: capture.replyAlreadyDeliveredThisTurn === true,
+      // W1-d (#3865): WHO this text is for. Always stamped explicitly (never
+      // left implicit) so a post-change record is self-describing and the
+      // sweep's gate never has to infer. `'user'` is byte-for-byte the
+      // pre-change behaviour.
+      audience: audience === AUDIENCE_INTERNAL ? AUDIENCE_INTERNAL : 'user',
     }
     const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
     writeFileSync(tmpPath, JSON.stringify(record), 'utf8')
@@ -267,11 +309,16 @@ function main() {
             `deferring to single-writer election (#3510)\n`,
         )
       } else {
-        writeOutboxRecord(stateDir, capture)
+        const audience = classifyCaptureAudience(stateDir, capture)
+        writeOutboxRecord(stateDir, capture, audience)
         process.stderr.write(
           `[silent-end-interrupt] captured undelivered final answer to outbox ` +
             `(nonce=${capture.turnNonce} source=${capture.source} chars=${capture.text.length} ` +
-            `replyAlreadyDeliveredThisTurn=false) — sweep will deliver; allowing stop\n`,
+            `replyAlreadyDeliveredThisTurn=false audience=${audience} ` +
+            `replyToolThrewThisTurn=${capture.replyToolThrewThisTurn === true}) — ` +
+            `${audience === AUDIENCE_INTERNAL
+              ? 'internal prose: journaled for inspection, sweep will NOT deliver'
+              : 'sweep will deliver'}; allowing stop\n`,
         )
         process.exit(0)
       }
