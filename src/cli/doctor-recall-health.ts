@@ -91,6 +91,47 @@ export const RECALL_HEALTH_MIN_SAMPLE = 20;
 export const RECALL_HEALTH_WINDOW_ROWS = 200;
 
 /**
+ * Maximum age of a row that still counts toward the rate.
+ *
+ * `RECALL_HEALTH_WINDOW_ROWS` alone is a *volume* bound, not a *recency* one,
+ * and on a quiet agent the two diverge badly. Measured on the 2026-08-02 host,
+ * the trailing 200 rows reached back:
+ *
+ *   gymbro 13d · marko 10d · reggie 9d · carrie 8d · clerk 8d · finn 5d
+ *
+ * The fleet ran a real own-bank timeout regression that ended 2026-07-28.
+ * Days later `doctor` was still scoring those agents on rows from *during* it
+ * and reporting the resolved outage as current health:
+ *
+ *   agent     200-row window   last 72h   verdict(200-row) -> verdict(72h)
+ *   carrie           23.5%       2.9%     warn -> ok
+ *   marko            23.0%       0.0%     warn -> ok
+ *   clerk            31.0%       0.9%     fail -> ok
+ *   gymbro           36.7%       0.0%     fail -> ok
+ *   reggie           37.5%        n/a     fail -> ok (under the sample floor)
+ *   klanker          17.0%      15.7%     warn -> warn  (genuinely degraded)
+ *   overlord         14.0%       9.5%     warn -> warn  (genuinely degraded)
+ *
+ * That is not a cosmetic mislabel. Those false FAILs were read as a live
+ * fleet-wide outage and drove remediation work against a bug that was already
+ * fixed, while the two agents that *are* degraded sat in the same undiffer-
+ * entiated pile. A health check whose window predates its own subject is worse
+ * than no check, because it is believed.
+ *
+ * 72h is the smallest window that keeps every *active* agent above
+ * `RECALL_HEALTH_MIN_SAMPLE` on that host (klanker 287, overlord 317, finn
+ * 133, clerk 107, marko 39, carrie 35, gymbro 33) while excluding the resolved
+ * regression. An agent quieter than 20 rows / 72h falls under the sample floor
+ * and reports `ok` with its count — the safe direction, and already the
+ * documented behaviour for a low-traffic agent.
+ *
+ * The row cap still applies FIRST (it is the IO bound); this is an additional
+ * filter, so a busy agent is scored on its most recent 200 rows and a quiet one
+ * on however many of those are actually recent.
+ */
+export const RECALL_HEALTH_WINDOW_MAX_AGE_MS = 72 * 60 * 60 * 1000;
+
+/**
  * Byte cap on the tail read, sized to comfortably contain
  * `RECALL_HEALTH_WINDOW_ROWS` rows.
  *
@@ -105,6 +146,15 @@ export const RECALL_HEALTH_MAX_TAIL_BYTES = 1024 * 1024;
 
 /** One parsed `recall_log.jsonl` row, narrowed to the fields we classify on. */
 export interface RecallLogRow {
+  /**
+   * ISO-8601 UTC stamp written by `recall.py` on every row
+   * (`time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())`).
+   *
+   * Load-bearing since the recency window: a row we cannot date cannot be
+   * proven recent, so it is excluded rather than assumed current — see
+   * `filterRecentRecallRows`.
+   */
+  ts?: string;
   bank_id?: string;
   result_count?: number;
   total_elapsed_ms?: number;
@@ -138,6 +188,16 @@ export interface RecallHealthStats {
   ownBankErrors: number;
   /** Median `total_elapsed_ms` across rows that reported it, or null. */
   medianElapsedMs: number | null;
+  /**
+   * Rows dropped from the window for being older than
+   * `RECALL_HEALTH_WINDOW_MAX_AGE_MS` (or undateable).
+   *
+   * Surfaced in the detail line so the operator can see that the window is
+   * narrower than the row cap. Without it, "3/107 failed" and "3/107 failed,
+   * 93 older rows excluded" look identical, and the second is the one that
+   * explains why yesterday's FAIL is today's ok.
+   */
+  staleDropped: number;
 }
 
 /**
@@ -147,7 +207,45 @@ export interface RecallHealthStats {
  * and the threshold logic can be tested independently — the 2026-07 regression
  * was invisible partly because the two were never separable.
  */
-export function summarizeRecallRows(rows: RecallLogRow[]): RecallHealthStats {
+/**
+ * Pure: keep only rows recent enough to describe the agent's CURRENT health.
+ *
+ * A row is in-window iff it carries a parseable `ts` no older than `maxAgeMs`.
+ * An undateable row is EXCLUDED, deliberately: the whole failure this guards
+ * against is stale data being scored as current, and "keep what we cannot
+ * date" reintroduces it verbatim for exactly the oldest rows. Every row
+ * `recall.py` has written since the `bank_timings` schema landed carries `ts`
+ * (verified: 0 of 10,627 rows across klanker/carrie/overlord/gymbro lack it on
+ * the 2026-08-02 host), so in practice this drops only pre-schema rows, which
+ * `summarizeRecallRows` already cannot score.
+ *
+ * Dropping too much is safe and dropping too little is not: an over-filtered
+ * window falls under `RECALL_HEALTH_MIN_SAMPLE` and reports `ok` *with its
+ * count*, which is visibly "not enough data", whereas an under-filtered one
+ * reports a confident wrong verdict.
+ *
+ * Exported and `now`-injected so the window logic is testable without clocks.
+ */
+export function filterRecentRecallRows(
+  rows: RecallLogRow[],
+  maxAgeMs: number = RECALL_HEALTH_WINDOW_MAX_AGE_MS,
+  now: number = Date.now(),
+): RecallLogRow[] {
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) return rows;
+  const cutoff = now - maxAgeMs;
+  return rows.filter((r) => {
+    if (typeof r.ts !== "string") return false;
+    const t = Date.parse(r.ts);
+    // A future-dated row (host clock skew) is kept: it is certainly not stale,
+    // and silently discarding it would under-report a live degradation.
+    return Number.isFinite(t) && t >= cutoff;
+  });
+}
+
+export function summarizeRecallRows(
+  rows: RecallLogRow[],
+  staleDropped = 0,
+): RecallHealthStats {
   const withTimings = rows.filter(
     (r) => Array.isArray(r.bank_timings) && r.bank_timings.length > 0,
   );
@@ -175,6 +273,7 @@ export function summarizeRecallRows(rows: RecallLogRow[]): RecallHealthStats {
     ownBankTimeouts,
     ownBankErrors,
     medianElapsedMs,
+    staleDropped,
   };
 }
 
@@ -191,6 +290,15 @@ export function classifyRecallHealth(
 ): CheckResult {
   const name = `${agentName} auto-recall`;
   const { rowsSeen, considered, ownBankTimeouts, ownBankErrors, medianElapsedMs } = stats;
+  const staleDropped = stats.staleDropped ?? 0;
+  const windowHours = Math.round(RECALL_HEALTH_WINDOW_MAX_AGE_MS / 3_600_000);
+  // Always name the window, and name what it excluded. The 2026-08 misdiagnosis
+  // happened because the detail line said "the last recalls" while meaning
+  // "some of them from eight days ago".
+  const windowNote =
+    staleDropped > 0
+      ? ` [window: last ${windowHours}h; ${staleDropped} older rows excluded]`
+      : ` [window: last ${windowHours}h]`;
 
   if (considered === 0) {
     if (rowsSeen > 0) {
@@ -204,7 +312,21 @@ export function classifyRecallHealth(
         detail:
           `${rowsSeen} recall rows in the window, none carrying bank_timings ` +
           "(pre-A3 telemetry schema) — own-bank health not scoreable until the " +
-          "agent fires a recall on the current hook",
+          "agent fires a recall on the current hook" +
+          windowNote,
+      };
+    }
+    if (staleDropped > 0) {
+      // The log is not empty — every row in it is simply older than the window.
+      // Saying "agent idle, or plugin not yet fired" here would send the
+      // operator hunting a dead plugin on an agent that just hasn't been
+      // spoken to in three days.
+      return {
+        name,
+        status: "ok",
+        detail:
+          `no recall in the last ${windowHours}h (${staleDropped} older rows ` +
+          "outside the window) — agent quiet, not scored",
       };
     }
     return {
@@ -219,15 +341,39 @@ export function classifyRecallHealth(
   const pct = (rate * 100).toFixed(1);
   const med = medianElapsedMs === null ? "n/a" : `${medianElapsedMs}ms`;
   const detail =
-    `${degraded}/${considered} of the last recalls failed to read the agent's own bank ` +
-    `(${pct}%; ${ownBankTimeouts} timed out, ${ownBankErrors} errored), median recall ${med}`;
+    `${degraded}/${considered} recalls failed to read the agent's own bank ` +
+    `(${pct}%; ${ownBankTimeouts} timed out, ${ownBankErrors} errored), median recall ${med}` +
+    windowNote;
 
+  // Diagnosis corrected 2026-08-02. This text used to send the operator at the
+  // cross-encoder rerank stage. Measured against the live container that is
+  // the wrong stage by an order of magnitude: over 44,342 recalls in 24h,
+  // server-side recall WORK is p50 1.12s / p99 4.09s, while the wait for a
+  // recall admission slot is p50 11.59s / p90 30.0s / max 74.0s — ~90% of
+  // observed latency is queueing, and only 0.04% of recalls spend >9s doing
+  // actual work. Rerank tuning cannot buy back a 12s queue.
+  //
+  // The queue is `HINDSIGHT_API_RECALL_MAX_CONCURRENT` (8 slots), shared
+  // between latency-critical interactive auto-recall (10s deadline) and
+  // background consolidation, which issues its own unbounded recalls
+  // (13-26s per batch) while grinding five-figure backlogs. Interactive
+  // recall queues behind batch work that has no deadline at all.
+  //
+  // Do NOT "fix" this by raising the recall deadline. That was tried on the
+  // live fleet 2026-07-26/27 (16s vs 10s) and made every agent worse, not
+  // better — finn 3.5% -> 65.9%, clerk 21.5% -> 83.8%, carrie 40.7% -> 55.4%
+  // — which is what a fixed-slot queue does when clients become more patient.
   const fix =
-    "Auto-recall is silently degraded — the agent runs with little or no memory " +
-    "while looking healthy. Check hindsight server latency first " +
-    "(`switchroom doctor` hindsight rows, then the recall stage trace); the " +
-    "cross-encoder rerank stage dominates recall latency and is tuned by " +
-    "HINDSIGHT_API_RERANKER_MAX_CANDIDATES in src/setup/hindsight.ts.";
+    "Auto-recall is degraded — the agent runs with little or no memory. The " +
+    "agent IS told (recall.py emits the #3619 DEGRADED notice), so this is a " +
+    "capacity problem, not a visibility one. Measured cause is admission " +
+    "queueing, not ranking cost: check the `waits: sem=` field on the " +
+    "container's [RECALL ...] Complete log lines against the recall work time " +
+    "on the same line. If sem-wait dominates, the lever is recall admission " +
+    "capacity (HINDSIGHT_API_RECALL_MAX_CONCURRENT) and keeping background " +
+    "consolidation recalls off the interactive path — NOT the rerank stage, " +
+    "and NOT a longer deadline (raising it 10s->16s on 2026-07-26 made every " +
+    "agent's timeout rate worse).";
 
   if (considered < RECALL_HEALTH_MIN_SAMPLE) {
     // Too few rows to score, but still worth surfacing the raw counts so a
@@ -334,7 +480,17 @@ export function checkAgentRecallHealth(
   agentName: string,
   agentDir: string,
   windowRows: number = RECALL_HEALTH_WINDOW_ROWS,
+  maxAgeMs: number = RECALL_HEALTH_WINDOW_MAX_AGE_MS,
+  now: number = Date.now(),
 ): CheckResult {
+  // Two bounds, applied in this order and for different reasons: `windowRows`
+  // caps IO cost, `maxAgeMs` makes the verdict about the present. Only the
+  // second was missing, and its absence is what let a resolved regression keep
+  // reporting as a live one for days.
   const rows = readRecallLogTail(recallLogPath(agentDir), windowRows);
-  return classifyRecallHealth(agentName, summarizeRecallRows(rows));
+  const recent = filterRecentRecallRows(rows, maxAgeMs, now);
+  return classifyRecallHealth(
+    agentName,
+    summarizeRecallRows(recent, rows.length - recent.length),
+  );
 }

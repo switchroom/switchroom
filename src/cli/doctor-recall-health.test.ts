@@ -23,14 +23,26 @@ import {
   type RecallLogRow,
   checkAgentRecallHealth,
   classifyRecallHealth,
+  filterRecentRecallRows,
   readRecallLogTail,
   recallLogPath,
   summarizeRecallRows,
 } from "./doctor-recall-health.js";
 
+/**
+ * `ts` as `recall.py` writes it. Every real row carries one (verified: 0 of
+ * 10,627 live rows lack it), and since the recency window it is load-bearing —
+ * a row the check cannot date is a row it cannot prove is current. Fixtures
+ * default to "just now" so they describe present health.
+ */
+function isoAgo(msAgo = 0, now = Date.now()): string {
+  return new Date(now - msAgo).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 /** A healthy row: own bank answered inside budget. */
 function healthyRow(bank: string, elapsedMs = 3000): RecallLogRow {
   return {
+    ts: isoAgo(),
     bank_id: bank,
     result_count: 6,
     total_elapsed_ms: elapsedMs,
@@ -48,8 +60,9 @@ function healthyRow(bank: string, elapsedMs = 3000): RecallLogRow {
  * this is the masking case that made the outage look survivable in
  * result-count-only telemetry.
  */
-function ownBankTimedOutRow(bank: string, resultCount = 0): RecallLogRow {
+function ownBankTimedOutRow(bank: string, resultCount = 0, msAgo = 0): RecallLogRow {
   return {
+    ts: isoAgo(msAgo),
     bank_id: bank,
     result_count: resultCount,
     total_elapsed_ms: 8023,
@@ -63,6 +76,7 @@ function ownBankTimedOutRow(bank: string, resultCount = 0): RecallLogRow {
 
 function ownBankErroredRow(bank: string): RecallLogRow {
   return {
+    ts: isoAgo(),
     bank_id: bank,
     result_count: 0,
     total_elapsed_ms: 15,
@@ -352,5 +366,145 @@ describe("checkAgentRecallHealth", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * Regression guard for the 2026-08 STALE-WINDOW misdiagnosis.
+ *
+ * `RECALL_HEALTH_WINDOW_ROWS` bounds volume, not age. On a quiet agent the
+ * trailing 200 rows reached back 8-13 days on the live host, so after the
+ * 2026-07-28 own-bank-timeout fix landed, `doctor` kept scoring agents on rows
+ * from *during* the outage: carrie/marko warn, clerk/gymbro/reggie FAIL, while
+ * their actual last-72h rates were 2.9% / 0.0% / 0.9% / 0.0% / n/a. Those
+ * false reds were believed and drove remediation against an already-fixed bug.
+ *
+ * These tests assert the OUTCOME on fleet-shaped telemetry: a resolved outage
+ * must read `ok`, and a live one must still read `fail`. A test that only
+ * exercised `filterRecentRecallRows` in isolation would not have caught this —
+ * the defect was in what `checkAgentRecallHealth` composed, so the load-bearing
+ * assertions below go through the real read+filter+classify path on a real file.
+ */
+describe("recall-health window recency (2026-08 stale-window regression)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  function writeLog(dir: string, rows: RecallLogRow[]): void {
+    const p = recallLogPath(dir);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, rows.map((r) => JSON.stringify(r)).join("\n"));
+  }
+
+  function withAgent(fn: (dir: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "recall-recency-"));
+    try {
+      fn(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("does not report a RESOLVED outage as current health", () => {
+    withAgent((dir) => {
+      // clerk's real shape: a wall of outage rows, then the fix, then a
+      // healthy-but-quiet tail. Pre-fix this scored 31.0% -> fail.
+      writeLog(dir, [
+        ...Array.from({ length: 150 }, () => ownBankTimedOutRow("clerk", 0, 6 * DAY)),
+        ...Array.from({ length: 40 }, () => healthyRow("clerk")),
+      ]);
+      const result = checkAgentRecallHealth("clerk", dir);
+      expect(result.status).toBe("ok");
+      // And it must say WHY the number moved, not just move it.
+      expect(result.detail).toMatch(/150 older rows excluded/);
+      expect(result.detail).toMatch(/window: last 72h/);
+    });
+  });
+
+  it("still fails an agent that is degraded RIGHT NOW", () => {
+    withAgent((dir) => {
+      // The mutation check for the test above: same stale wall, but the recent
+      // rows are degraded too. Excluding stale data must not blunt a live red.
+      writeLog(dir, [
+        ...Array.from({ length: 150 }, () => ownBankTimedOutRow("klanker", 0, 6 * DAY)),
+        ...Array.from({ length: 40 }, () => ownBankTimedOutRow("klanker")),
+      ]);
+      const result = checkAgentRecallHealth("klanker", dir);
+      expect(result.status).toBe("fail");
+      expect(result.fix).toBeDefined();
+    });
+  });
+
+  it("does not let stale HEALTHY rows dilute a live degradation", () => {
+    withAgent((dir) => {
+      // The opposite masking direction, and the reason a row cap alone is not
+      // a safe approximation of recency in either direction: 160 old healthy
+      // rows + 40 fresh degraded ones averages to 25% (a borderline verdict on
+      // the whole tail) but the agent's CURRENT rate is 100%.
+      writeLog(dir, [
+        ...Array.from({ length: 160 }, () => ({
+          ...healthyRow("overlord"),
+          ts: isoAgo(9 * DAY),
+        })),
+        ...Array.from({ length: 40 }, () => ownBankTimedOutRow("overlord")),
+      ]);
+      const result = checkAgentRecallHealth("overlord", dir);
+      expect(result.status).toBe("fail");
+      expect(result.detail).toMatch(/40\/40/);
+    });
+  });
+
+  it("reports a quiet agent as unscored rather than inventing a verdict", () => {
+    withAgent((dir) => {
+      // reggie: every row predates the window. Pre-fix this scored 37.5% ->
+      // fail on 9-day-old rows. It must not silently become "no telemetry
+      // yet" either — that sends the operator hunting a dead plugin.
+      writeLog(dir, Array.from({ length: 24 }, () => ownBankTimedOutRow("reggie", 0, 9 * DAY)));
+      const result = checkAgentRecallHealth("reggie", dir);
+      expect(result.status).toBe("ok");
+      expect(result.detail).toMatch(/no recall in the last 72h/);
+      expect(result.detail).toMatch(/24 older rows outside the window/);
+      expect(result.detail).not.toMatch(/plugin not yet fired/);
+    });
+  });
+
+  it("keeps the row cap as the outer bound for a busy agent", () => {
+    withAgent((dir) => {
+      // All rows recent, more than the cap: the age filter must not widen the
+      // window past `RECALL_HEALTH_WINDOW_ROWS` (that cap is the IO bound).
+      writeLog(dir, [
+        ...Array.from({ length: 400 }, () => healthyRow("finn")),
+        ...Array.from({ length: 200 }, () => ownBankTimedOutRow("finn")),
+      ]);
+      const result = checkAgentRecallHealth("finn", dir);
+      // Scored on the last 200 rows only — all degraded — not on all 600.
+      expect(result.status).toBe("fail");
+      expect(result.detail).toMatch(new RegExp(`/${RECALL_HEALTH_WINDOW_ROWS}\\b`));
+    });
+  });
+
+  describe("filterRecentRecallRows", () => {
+    it("excludes a row it cannot date rather than assuming it is current", () => {
+      // The pre-schema row is exactly the one most likely to be ancient.
+      const undateable: RecallLogRow = { bank_id: "a", bank_timings: [] };
+      expect(filterRecentRecallRows([undateable], DAY, Date.now())).toHaveLength(0);
+    });
+
+    it("keeps a future-dated row (clock skew must not hide a live failure)", () => {
+      const now = Date.now();
+      const skewed: RecallLogRow = { ts: new Date(now + 60_000).toISOString() };
+      expect(filterRecentRecallRows([skewed], DAY, now)).toHaveLength(1);
+    });
+
+    it("is inclusive exactly at the cutoff", () => {
+      const now = Date.now();
+      const atCutoff: RecallLogRow = { ts: new Date(now - DAY).toISOString() };
+      const justPast: RecallLogRow = { ts: new Date(now - DAY - 1000).toISOString() };
+      expect(filterRecentRecallRows([atCutoff], DAY, now)).toHaveLength(1);
+      expect(filterRecentRecallRows([justPast], DAY, now)).toHaveLength(0);
+    });
+
+    it("disables the filter on a non-positive age, rather than dropping everything", () => {
+      const rows = [{ bank_id: "a" }, { ts: isoAgo(99 * DAY) }];
+      expect(filterRecentRecallRows(rows, 0, Date.now())).toHaveLength(2);
+    });
   });
 });
