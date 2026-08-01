@@ -8,7 +8,11 @@ import {
   recentUnextracted,
   ageDays,
 } from "../src/memory/bank-health.js";
-import { checkBankIngestHealth, checkBankObservationsMissions } from "../src/cli/doctor.js";
+import {
+  checkBankIngestHealth,
+  checkBankObservationsMissions,
+  checkBankConfigApiReachable,
+} from "../src/cli/doctor.js";
 import {
   DEFAULT_OBSERVATIONS_MISSION,
   SUPERSEDED_OBSERVATIONS_MISSIONS,
@@ -329,6 +333,49 @@ function minimalConfig(agents: Record<string, { memory?: { collection?: string }
   } as unknown as SwitchroomConfig;
 }
 
+describe("checkBankConfigApiReachable (#3538)", () => {
+  /** Serve one bank's /config with a chosen body. */
+  const configFetch = (body: unknown, status = 200): typeof fetch =>
+    (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/config$/.test(url)) {
+        return new Response(status === 200 ? JSON.stringify(body) : "err", { status });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+  it("OK when the bank's /config carries a retain_mission key", async () => {
+    const results = await checkBankConfigApiReachable(minimalConfig({ marko: {} }), "http://x/mcp/", {
+      fetchImpl: configFetch({ config: { retain_mission: "Extract durable facts." } }),
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe("ok");
+    expect(results[0].name).toBe("hindsight bank-config API");
+  });
+
+  it("FAILS when /config returns 200 without a retain_mission key (API disabled / renamed)", async () => {
+    const results = await checkBankConfigApiReachable(minimalConfig({ marko: {} }), "http://x/mcp/", {
+      fetchImpl: configFetch({ config: { some_other_field: 1 } }),
+    });
+    expect(results[0].status).toBe("fail");
+    expect(results[0].fix).toMatch(/HINDSIGHT_API_ENABLE_BANK_CONFIG_API/);
+  });
+
+  it("WARNs (not FAIL) when the config surface is unreachable", async () => {
+    const results = await checkBankConfigApiReachable(minimalConfig({ marko: {} }), "http://x/mcp/", {
+      fetchImpl: configFetch(null, 503),
+    });
+    expect(results[0].status).toBe("warn");
+  });
+
+  it("emits no row when there is no agent bank to probe", async () => {
+    const results = await checkBankConfigApiReachable(minimalConfig({}), "http://x/mcp/", {
+      fetchImpl: configFetch({ config: {} }),
+    });
+    expect(results).toHaveLength(0);
+  });
+});
+
 describe("checkBankIngestHealth (doctor)", () => {
   it("fails the bank with recent unextracted documents and carries the reprocess fix", async () => {
     const results = await checkBankIngestHealth(
@@ -440,7 +487,7 @@ describe("checkBankIngestHealth (doctor)", () => {
     expect(ok.some((r) => r.name === "bank marko directives")).toBe(false);
   });
 
-  it("omits the fleet consolidation-backlog row unless opted in (#2903 fix 5.3)", async () => {
+  it("omits the fleet queue rows unless opted in (#2903 fix 5.3)", async () => {
     const BACKLOGGED = {
       stats: { total_documents: 5, total_nodes: 50, pending_operations: 250 },
       documents: { items: [{ id: "d1", created_at: "2026-06-09T00:00:00Z", text_length: 100, memory_unit_count: 2 }] },
@@ -449,19 +496,74 @@ describe("checkBankIngestHealth (doctor)", () => {
     const cfg = minimalConfig({ marko: {} });
     const fetchImpl = fakeFetchFor({ marko: BACKLOGGED });
 
-    // Default: per-bank rows only, no backlog aggregate (protects the contract
+    // Default: per-bank rows only, no aggregate rows (protects the contract
     // the other tests in this file assert exact lengths against).
     const bare = await checkBankIngestHealth(cfg, "http://x/mcp/", { fetchImpl, now: NOW });
-    expect(bare.some((r) => /backlog/i.test(r.name))).toBe(false);
+    expect(bare.some((r) => /backlog|op queue/i.test(r.name))).toBe(false);
 
-    // Opted in (as the CLI doctor does): the aggregate row is appended last.
+    // Opted in (as the CLI doctor does): BOTH aggregate rows are appended.
     const withBacklog = await checkBankIngestHealth(cfg, "http://x/mcp/", {
       fetchImpl,
       now: NOW,
       includeConsolidationBacklog: true,
     });
-    expect(withBacklog.length).toBe(bare.length + 1);
-    expect(/backlog/i.test(withBacklog[withBacklog.length - 1].name)).toBe(true);
+    expect(withBacklog.length).toBe(bare.length + 2);
+    expect(withBacklog.some((r) => r.name === "hindsight async op queue")).toBe(true);
+    expect(withBacklog.some((r) => r.name === "hindsight consolidation backlog")).toBe(true);
+  });
+
+  it("#3949: a deep async op queue does NOT masquerade as a consolidation backlog", async () => {
+    // The 2026-07 blind spot: pending_operations reads shallow while
+    // pending_consolidation runs to tens of thousands. Here the OPPOSITE input —
+    // a deep op queue (250) with a SHALLOW consolidation backlog (5) — must
+    // FAIL the op-queue row and leave the consolidation row OK. The old code
+    // summed pending_operations and CALLED it the consolidation backlog, which
+    // would have (a) failed the wrong row and (b) shown green through the real
+    // stall. Both rows now read their own /stats field.
+    const cfg = minimalConfig({ marko: {} });
+    const fetchImpl = fakeFetchFor({
+      marko: {
+        stats: {
+          total_documents: 5,
+          total_nodes: 50,
+          pending_operations: 250,
+          pending_consolidation: 5,
+        },
+        documents: { items: [{ id: "d1", created_at: "2026-06-09T00:00:00Z", text_length: 100, memory_unit_count: 2 }] },
+        models: { items: [] },
+      },
+    });
+    const results = await checkBankIngestHealth(cfg, "http://x/mcp/", {
+      fetchImpl,
+      now: NOW,
+      includeConsolidationBacklog: true,
+    });
+    const opQueue = results.find((r) => r.name === "hindsight async op queue");
+    const consolidation = results.find((r) => r.name === "hindsight consolidation backlog");
+    expect(opQueue?.status).toBe("fail");
+    expect(consolidation?.status).toBe("ok");
+
+    // ...and the inverse: a shallow op queue with a 44k consolidation backlog
+    // (the actual incident shape) fails the CONSOLIDATION row, not the op queue.
+    const stallFetch = fakeFetchFor({
+      marko: {
+        stats: {
+          total_documents: 5,
+          total_nodes: 50,
+          pending_operations: 5,
+          pending_consolidation: 44_000,
+        },
+        documents: { items: [{ id: "d1", created_at: "2026-06-09T00:00:00Z", text_length: 100, memory_unit_count: 2 }] },
+        models: { items: [] },
+      },
+    });
+    const stall = await checkBankIngestHealth(cfg, "http://x/mcp/", {
+      fetchImpl: stallFetch,
+      now: NOW,
+      includeConsolidationBacklog: true,
+    });
+    expect(stall.find((r) => r.name === "hindsight async op queue")?.status).toBe("ok");
+    expect(stall.find((r) => r.name === "hindsight consolidation backlog")?.status).toBe("fail");
   });
 });
 

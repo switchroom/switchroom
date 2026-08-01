@@ -39,6 +39,7 @@ import {
   fetchHindsightToolsList,
   collectProfileBanks,
   fetchBankObservationsMission,
+  fetchBankRetainMission,
   decideObservationsMissionUpgrade,
   DEFAULT_OBSERVATIONS_MISSION,
   PROFILE_MEMORY_DEFAULTS,
@@ -50,7 +51,7 @@ import {
 } from "../setup/host-capabilities.js";
 import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyAsyncOpQueue, classifyDirectiveCount, classifyBankConfigReachability } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js";
@@ -1392,6 +1393,35 @@ export async function checkBankObservationsMissions(
 }
 
 /**
+ * Bank-config API reachability (#3538). Retain-mission seeding went fail-closed
+ * in #3529: it reads the bank's mission via `GET .../config` and seeds nothing
+ * on a failed read (so a transient 5xx can't clobber an operator's mission).
+ * The exposure: if that API is disabled
+ * (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API=false`) or the field is renamed, every
+ * read fails, apply seeds NO agent, and still exits 0 — a silent regression the
+ * old fail-open code would have masked. One probe of one representative bank
+ * turns that into a doctor row. Returns `[]` when there is no bank to probe.
+ */
+export async function checkBankConfigApiReachable(
+  config: SwitchroomConfig,
+  url: string,
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<CheckResult[]> {
+  // One representative agent bank is enough: the flag / field-shape is a
+  // deployment-wide property of the Hindsight server, not per-bank. Resolve
+  // through defaults+profiles exactly as the seed path does.
+  let bankId: string | undefined;
+  for (const [agentName, agentConfig] of Object.entries(config.agents)) {
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    bankId = resolved.memory?.collection ?? agentName;
+    break;
+  }
+  if (bankId === undefined) return [];
+  const read = await fetchBankRetainMission(url, bankId, { fetchImpl: opts?.fetchImpl });
+  return [classifyBankConfigReachability(read, bankId)];
+}
+
+/**
  * Per-agent bank ingest health. One CheckResult per agent bank:
  *
  * - fail: recent documents (≤30d) stored with ZERO extracted facts — the
@@ -1431,23 +1461,38 @@ export async function checkBankIngestHealth(
     ),
   );
 
-  // Fleet-wide consolidation backlog (#2903 fix 5.3): sum the pending-op
-  // count across every reachable bank so `switchroom doctor` shows the queue
-  // depth the #2894 throttle can silently build. Oldest-pending age isn't on
-  // the REST /stats surface (measurement follow-up: #2847), so age is unknown.
-  // Gated off by default so the per-bank ingest contract stays clean for
-  // callers/tests that only want bank rows; the CLI doctor opts in below.
-  let backlogRow: CheckResult | undefined;
+  // Fleet-wide queue health (#2903 fix 5.3, corrected in #3949): two SEPARATE
+  // gauges, summed across every reachable bank, because they measure different
+  // things and drift apart under a stall —
+  //   * async op queue    → `/stats.pending_operations` (the TASK queue: catches
+  //                          a stuck reaper / claim stall).
+  //   * consolidation      → `/stats.pending_consolidation` (unconsolidated
+  //     backlog              `memory_units`: the REAL "is memory reaching
+  //                          recall" gauge). During the 2026-07 drain the op
+  //                          queue read ~5 while this ran to ~44k, so summing
+  //                          the op queue and CALLING it the consolidation
+  //                          backlog (the old code) showed green through the
+  //                          stall.
+  // Oldest-pending age isn't on the REST /stats surface (measurement follow-up:
+  // #2847), so age is unknown. Gated off by default so the per-bank ingest
+  // contract stays clean for callers/tests that only want bank rows; the CLI
+  // doctor opts in below.
+  const backlogRows: CheckResult[] = [];
   if (opts?.includeConsolidationBacklog) {
-    let totalPending = 0;
+    let totalPendingOps = 0;
+    let totalPendingConsolidation = 0;
     let anyBankReachable = false;
     for (const [, , h] of inspected) {
       if (h.ok) {
         anyBankReachable = true;
-        totalPending += h.pendingOperations;
+        totalPendingOps += h.pendingOperations;
+        totalPendingConsolidation += h.pendingConsolidation;
       }
     }
-    if (anyBankReachable) backlogRow = classifyConsolidationBacklog(totalPending);
+    if (anyBankReachable) {
+      backlogRows.push(classifyAsyncOpQueue(totalPendingOps));
+      backlogRows.push(classifyConsolidationBacklog(totalPendingConsolidation));
+    }
   }
 
   for (const [bankId, agents, h] of inspected) {
@@ -1534,7 +1579,7 @@ export async function checkBankIngestHealth(
     }
     results.push({ name: label, status: "ok", detail: summary });
   }
-  if (backlogRow) results.push(backlogRow);
+  results.push(...backlogRows);
   return results;
 }
 
@@ -1675,6 +1720,12 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // and invisible everywhere else, which is how the whole fleet ran the
   // engine's stock consolidation mission unnoticed (see the function's doc).
   results.push(...(await checkBankObservationsMissions(config, url)));
+
+  // The bank-config API those missions are seeded through must actually be
+  // reachable: since #3529 retain-mission seeding is fail-closed, so a disabled
+  // HINDSIGHT_API_ENABLE_BANK_CONFIG_API or a renamed field silently skips
+  // seeding for every agent and still exits 0 (#3538).
+  results.push(...(await checkBankConfigApiReachable(config, url)));
 
   // …and whether those scopes still have room to consolidate INTO. Hindsight
   // caps observations per scope; past the cap the consolidator keeps running,
