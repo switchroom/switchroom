@@ -2669,7 +2669,16 @@ export const HindsightConfigSchema = z.object({
       "candidate must reach to be returned by the semantic retrieval arm at " +
       "all (0..1); unset means upstream's own 0.3, and where it should sit " +
       "depends on the bank's embedding model and phrasing diversity, so " +
-      "switchroom ships no opinion), plus the " +
+      "switchroom ships no opinion; and " +
+      "HINDSIGHT_MCP_RECALL_BUDGET_MODE — the rollback knob for switchroom's " +
+      "mcp-recall-token-budget image patch; `legacy` restores upstream's " +
+      "exact pre-patch recall returns, anything else or unset is the " +
+      "honest-envelope mode; and " +
+      "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT — upstream's own per-op reflect " +
+      "temperature knob, made live by switchroom's reflect-temperature image " +
+      "patch; a float, or `none` to omit the kwarg (provider default, " +
+      "upstream's accidental pre-patch behaviour); unset means the image's " +
+      "baked default 0.1), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

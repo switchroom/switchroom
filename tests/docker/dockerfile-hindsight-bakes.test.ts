@@ -1055,6 +1055,110 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the mcp-recall-token-budget fix (assert-guarded, fail-loud)", () => {
+    // The MCP recall tool serialized with `model_dump_json(indent=2)` and no
+    // `exclude_none`, while the engine's token budget costs only fact TEXT —
+    // measured live, 6,079 bytes of fact text became 40,857 bytes on the wire
+    // (6.7x), so `max_tokens: 1500` delivered ~3.5k tokens.
+    //
+    // SCOPE: structural, not behavioural. Every assertion below is an
+    // unanchored substring match, so it proves the patch is PRESENT, never
+    // that the payload actually fits the budget. The behavioural gate is
+    // tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts,
+    // which drives the real registered MCP tool and measures the tokens it
+    // returns. Do not treat this file as sufficient.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight mcp-recall-token-budget patch/,
+    );
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: \{name\} anchor found \{n\}x \(expected 1\) in mcp_tools\.py — upstream "/,
+    );
+    // The helper, its rollback knob, and both recall branches routed through it.
+    expect(dockerfile).toMatch(/def _recall_payload_within_budget\(/);
+    expect(dockerfile).toMatch(
+      /_MCP_RECALL_BUDGET_MODE_ENV = "HINDSIGHT_MCP_RECALL_BUDGET_MODE"/,
+    );
+    expect(dockerfile).toMatch(
+      /assert t\.count\("_recall_payload_within_budget\(recall_result, max_tokens\)"\) == 2,/,
+    );
+    // The legacy branch must keep upstream's exact returns on BOTH branches
+    // (the restart-level rollback): model_dump_json(indent=2) on the
+    // bank_id-param branch, model_dump() python objects — no JSON round-trip —
+    // on the single-bank branch …
+    expect(dockerfile).toMatch(
+      /assert "recall_result\.model_dump_json\(indent=2\)" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "return recall_result\.model_dump\(\)" in t,/,
+    );
+    // … the trim must prune source_facts by the retained results'
+    // source_fact_ids (source_facts is keyed by SOURCE FACT id — a disjoint
+    // id space from result ids; keying on result ids deletes the source facts
+    // of RETAINED observations) …
+    expect(dockerfile).toMatch(
+      /assert "for fid in \(r\.source_fact_ids or \[\]\)" in t,/,
+    );
+    // … and the LOAD-BEARING scope guards: the reflect tool and — above all —
+    // the ENGINE's text-only selector stay untouched, because the per-turn
+    // auto-recall hook injects only fact text and an envelope-costed shared
+    // selector would silently shrink every auto-recall across the fleet.
+    expect(dockerfile).toMatch(
+      /assert "reflect_result\.model_dump_json\(indent=2\)" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "text_tokens = len\(encoding\.encode\(text\)\)" in me,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight mcp-recall-token-budget patch: MCP recall now serializes /,
+    );
+  });
+
+  it("keeps the reflect-temperature fix (assert-guarded, fail-loud)", () => {
+    // `DEFAULT_LLM_TEMPERATURE_REFLECT = 0.9` existed but NO agentic reflect
+    // call site passed `temperature`, and the litellm provider omits the kwarg
+    // when None — so factual synthesis sampled at the provider default (~1.0).
+    // A 20B model at ~1.0 was observed inventing dates its own cited memory
+    // contradicts.
+    //
+    // SCOPE: structural, not behavioural. The behavioural gate is
+    // tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts,
+    // which counts the wired call sites in the shipping module's AST (0/7 on
+    // upstream) and resolves the config default. Do not treat this file as
+    // sufficient.
+
+    // The exact-once anchor guards (fail-loud on upstream drift) for both
+    // halves: the config default and the call-site threading.
+    expect(dockerfile).toMatch(/switchroom hindsight reflect-temperature patch/);
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: reflect-temperature default anchor found \{n\}x \(expected 1\) in config\.py — "/,
+    );
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: anchor found \{n\}x \(expected \{expect\}\) in engine\/reflect\/agent\.py — "/,
+    );
+    // The new default, low for factual synthesis, still env-overridable.
+    expect(dockerfile).toMatch(
+      /DEFAULT_LLM_TEMPERATURE_REFLECT = 0\.1 {2}# reflect: factual synthesis \(switchroom\)/,
+    );
+    // Post-replace re-assertions: exactly 7 wired call sites (6x reflect + the
+    // reflect_tool_call kwargs), the site count itself pinned, the structured
+    // -extraction non-goal untouched, and the provider still forwarding.
+    expect(dockerfile).toMatch(/assert n_temp == 7,/);
+    expect(dockerfile).toMatch(
+      /assert t\.count\('scope="reflect",'\) == 6,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert 'scope="reflect_structured",' in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "if temperature is not None:" in prov,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight reflect-temperature patch: llm_temperature_reflect is now /,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

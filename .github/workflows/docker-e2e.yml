@@ -136,6 +136,7 @@ jobs:
               - 'tests/docker/hindsight-graph-seed-patch.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'tests/docker/hindsight-reflect-directives-patch.test.ts'
+              - 'tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -397,6 +398,19 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-reflect-directives-patch.test.ts
 
+      - name: Run the hindsight recall-budget/reflect-grounding probe (RED/GREEN, must not skip)
+        # Same contract, for the mcp-recall-token-budget and
+        # reflect-temperature patches. The bakes test cannot cover the
+        # failures that matter here: its assertions are unanchored substring
+        # matches, so a helper that exists but is never routed through, or a
+        # temperature that is resolved but reaches zero call sites, both stay
+        # green there. Only driving the real registered MCP tool (and
+        # measuring the tokens it returns) and the shipping module's call
+        # sites catches them.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts
+
       - name: Run the embedded-postgres fsync probe (RED/GREEN, must not skip)
         # NOT a patch probe: this one boots the REAL docker/hindsight-entrypoint.sh
         # inside the pinned image and reads `SHOW fsync` off the server it
@@ -416,7 +430,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-patch hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

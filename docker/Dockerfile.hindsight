@@ -2862,6 +2862,340 @@ print(
 )
 PYEOF
 
+# ── MCP recall token-budget honesty patch ─────────────────────────────────────
+#
+# THE DEFECT. `MemoryEngine._filter_by_token_budget` (engine/memory_engine.py)
+# costs ONLY `result["text"]` via tiktoken, but the MCP `recall` tool then
+# returns `recall_result.model_dump_json(indent=2)` (mcp_tools.py) —
+# pretty-printed AND without `exclude_none`, so every one of MemoryFact's many
+# None fields is emitted as an explicit `"field": null` line. Measured live on
+# this fleet: 6,079 bytes of fact text became 40,857 bytes on the wire (6.7x),
+# so a caller asking for `max_tokens: 1500` received ~3.5k tokens. The budget
+# the API promises is not the budget the caller pays.
+#
+# THE FIX, at the MCP serialization point ONLY:
+#   1. Serialize compact (no `indent=2`) with `exclude_none=True` — roughly a
+#      2x saving with zero semantic change (a missing key and an explicit null
+#      deserialize identically for these optional fields).
+#   2. Enforce `max_tokens` over the SERIALIZED payload: if the compact
+#      envelope still exceeds the budget, drop results from the tail (the
+#      lowest-ranked; the engine returns them ranked) and prune the
+#      `source_facts` entries that belonged to dropped results, until it fits.
+#
+# SCOPE — DELIBERATELY MCP-ONLY, THE LOAD-BEARING CONSTRAINT. The per-turn
+# auto-recall hook (vendor/hindsight-memory/scripts/recall.py ->
+# format_memories) goes through the HTTP API and injects ONLY each fact's
+# text, so for that path upstream's text-only costing is already correct.
+# Making `_filter_by_token_budget` globally envelope-costed would silently
+# shrink every auto-recall across the fleet. The shared selector is therefore
+# left byte-for-byte untouched (asserted below) and the honest accounting
+# lives in the MCP layer, where the envelope is real.
+#
+# ROLLBACK is a container restart, not a rebuild:
+# `HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy` restores upstream's exact
+# pre-patch returns on BOTH recall branches — `model_dump_json(indent=2)` on
+# the bank_id-param branch, `model_dump()` (python objects, no JSON
+# round-trip) on the single-bank branch — with the patch still baked in.
+# Any other value (or unset) means the honest-envelope mode.
+#
+# Self-verifying; guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED
+# against unpatched upstream / GREEN patched) by
+# tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+TAG = "switchroom hindsight mcp-recall-token-budget patch"
+f = pathlib.Path("/app/api/hindsight_api/mcp_tools.py")
+s = f.read_text()
+
+HELPER = '''
+# switchroom: make MCP recall's max_tokens an honest budget over the payload
+# the caller actually receives. The engine's _filter_by_token_budget costs only
+# fact TEXT (correct for the auto-recall hook, which injects only text); the
+# MCP tool then serialized with indent=2 and explicit nulls, measured live at
+# 6.7x the text cost. See docker/Dockerfile.hindsight for the full rationale.
+_MCP_RECALL_BUDGET_MODE_ENV = "HINDSIGHT_MCP_RECALL_BUDGET_MODE"
+
+
+def _mcp_recall_budget_mode() -> str:
+    """Rollback knob, read per call so flipping it is a container restart.
+
+    "legacy" restores upstream's exact pre-patch returns on both recall
+    branches (model_dump_json(indent=2) on the bank_id-param branch;
+    model_dump() at the single-bank call site, which short-circuits before
+    this helper); anything else (including unset) is the honest-envelope mode.
+    """
+    import os
+
+    raw = os.environ.get(_MCP_RECALL_BUDGET_MODE_ENV, "").strip().lower()
+    return "legacy" if raw == "legacy" else "envelope"
+
+
+def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
+    """Serialize a RecallResult compactly and enforce max_tokens on the result.
+
+    Compact + exclude_none first (pure encoding win, no information loss).
+    If the serialized envelope still exceeds the caller's budget, drop results
+    from the tail — the engine returns them ranked, so the lowest-ranked go
+    first — pruning source_facts entries owned by dropped results, until the
+    payload fits. Worst case (envelope alone exceeds the budget with zero
+    results left) returns the minimal envelope rather than failing the call.
+    """
+    if _mcp_recall_budget_mode() == "legacy":
+        return recall_result.model_dump_json(indent=2)
+
+    from hindsight_api.engine.token_encoding import get_token_encoding
+
+    encoding = get_token_encoding()
+
+    payload = recall_result.model_dump_json(exclude_none=True)
+    if len(encoding.encode(payload)) <= max_tokens:
+        return payload
+
+    results = list(recall_result.results)
+    while results:
+        results.pop()
+        recall_result.results = results
+        if recall_result.source_facts:
+            # source_facts is keyed by SOURCE FACT id (response_models:
+            # "keyed by fact ID"), referenced from observation results via
+            # source_fact_ids -- a DISJOINT id space from result ids. Keep
+            # the union of the retained results' source_fact_ids; keying on
+            # result ids would delete the source facts of RETAINED results.
+            keep = {fid for r in results for fid in (r.source_fact_ids or [])}
+            recall_result.source_facts = {
+                k: v for k, v in recall_result.source_facts.items() if k in keep
+            } or None
+        payload = recall_result.model_dump_json(exclude_none=True)
+        if len(encoding.encode(payload)) <= max_tokens:
+            return payload
+    return payload
+
+
+'''
+
+ANCHOR_DEF = (
+    "def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:\n"
+    '    """Register the recall tool."""\n'
+)
+ANCHOR_JSON = "                return recall_result.model_dump_json(indent=2)\n"
+ANCHOR_DICT = "                return recall_result.model_dump()\n"
+
+for name, anchor in (("register", ANCHOR_DEF), ("json-return", ANCHOR_JSON), ("dict-return", ANCHOR_DICT)):
+    n = s.count(anchor)
+    assert n == 1, (
+        f"{TAG}: {name} anchor found {n}x (expected 1) in mcp_tools.py — upstream "
+        "reformatted the recall tool; re-author this patch in docker/Dockerfile.hindsight"
+    )
+
+s = s.replace(ANCHOR_DEF, HELPER + ANCHOR_DEF, 1)
+s = s.replace(ANCHOR_JSON, "                return _recall_payload_within_budget(recall_result, max_tokens)\n", 1)
+s = s.replace(
+    ANCHOR_DICT,
+    # Legacy on THIS branch must be upstream's exact return VALUE, not a JSON
+    # round-trip of it: upstream returned model_dump() python objects, and a
+    # dict[str, Any] field like `trace` can carry values (datetimes, tuples)
+    # that json.loads(model_dump_json(...)) coerces to strings/lists.
+    '                if _mcp_recall_budget_mode() == "legacy":\n'
+    "                    return recall_result.model_dump()\n"
+    "                return json.loads(_recall_payload_within_budget(recall_result, max_tokens))\n",
+    1,
+)
+f.write_text(s)
+ast.parse(s)
+
+t = f.read_text()
+assert "def _recall_payload_within_budget(" in t, f"{TAG}: helper missing after patch"
+assert "recall_result.model_dump_json(indent=2)" in t, (
+    f"{TAG}: the legacy-mode branch lost upstream's exact serialization — the rollback knob is dead"
+)
+assert "return recall_result.model_dump()" in t, (
+    f"{TAG}: the single-bank legacy branch lost upstream's exact model_dump() return — "
+    "legacy would hand back a JSON round-trip (datetimes/tuples coerced) instead of "
+    "upstream's python objects"
+)
+assert t.count("_recall_payload_within_budget(recall_result, max_tokens)") == 2, (
+    f"{TAG}: expected BOTH recall branches (bank_id-param and single-bank) to route "
+    "through the budget helper (2 call sites; the def line spells max_tokens: int)"
+)
+assert "for fid in (r.source_fact_ids or [])" in t, (
+    f"{TAG}: source_facts pruning no longer keys on the retained results' "
+    "source_fact_ids — keying on result ids deletes the source facts of RETAINED "
+    "observations (source_facts is keyed by source fact id, a disjoint id space)"
+)
+# Deliberate scope guards — these must stay untouched:
+assert "reflect_result.model_dump_json(indent=2)" in t, (
+    f"{TAG}: the reflect tool's serialization changed — this patch is scoped to recall only"
+)
+me = pathlib.Path("/app/api/hindsight_api/engine/memory_engine.py").read_text()
+assert "text_tokens = len(encoding.encode(text))" in me, (
+    f"{TAG}: the ENGINE's _filter_by_token_budget no longer costs only fact text — "
+    "an envelope-costed shared selector silently shrinks every per-turn auto-recall "
+    "across the fleet (the hook injects only text). Keep the honest accounting in the "
+    "MCP layer; re-author this patch."
+)
+print(
+    "switchroom hindsight mcp-recall-token-budget patch: MCP recall now serializes "
+    "compact with exclude_none and enforces max_tokens over the serialized payload "
+    "(tail-trim of ranked results); the shared engine selector and the reflect tool "
+    "are untouched; HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy restores upstream's exact "
+    "returns on both branches"
+)
+PYEOF
+
+# ── reflect synthesis-temperature patch ───────────────────────────────────────
+#
+# A REAL UPSTREAM BUG: the temperature knob for reflect exists but is dead in
+# the production path. config.py defines DEFAULT_LLM_TEMPERATURE_REFLECT = 0.9
+# and resolves it into `llm_temperature_reflect`, but the agentic reflect path
+# NEVER passes `temperature` — every `llm_config.call(..., scope="reflect")`
+# in engine/reflect/agent.py and the `call_with_tools` kwargs omit the kwarg,
+# and providers/litellm_llm.py only sends temperature `if temperature is not
+# None`. So the provider default (~1.0) applies. `llm_temperature_reflect` is
+# consumed only by the legacy standalone path engine/search/think_utils.py —
+# dead code for production reflect.
+#
+# Consequence on this fleet: gpt-oss-20b at reasoning effort LOW and sampling
+# temperature ~1.0 doing factual synthesis. Observed: reflect reported publish
+# dates of 16 and 18 June when the source memory says 14 and 18 June — the
+# wrong date was sampled, not retrieved.
+#
+# THE FIX, two halves:
+#   1. Thread `temperature=get_config().llm_temperature_reflect` into every
+#      reflect-scope call in the agentic path (6x scope="reflect" + the
+#      scope="reflect_tool_call" kwargs), so the existing knob is live.
+#   2. Set the default LOW for factual synthesis: 0.1, matching
+#      DEFAULT_LLM_TEMPERATURE_RETAIN (fact extraction) — near-greedy without
+#      the degenerate repetition some local backends exhibit at exactly 0.0.
+#
+# Still env-overridable through upstream's own resolver:
+# HINDSIGHT_API_LLM_TEMPERATURE_REFLECT=<float> per-op,
+# HINDSIGHT_API_LLM_TEMPERATURE=<float> global, value `none` omits the kwarg
+# entirely (provider default — i.e. upstream's accidental behaviour, should an
+# operator genuinely want it back). Rollback is a container restart.
+#
+# scope="reflect_structured" (the post-answer JSON extraction call) is
+# DELIBERATELY not touched: it is a different operation with its own
+# strict-schema handling, and changing two behaviours under one flag would
+# make the knob ambiguous.
+#
+# Self-verifying; guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally by
+# tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+TAG = "switchroom hindsight reflect-temperature patch"
+
+# ---- 1. config.py: a factual-synthesis default ----
+cfg = pathlib.Path("/app/api/hindsight_api/config.py")
+s = cfg.read_text()
+OLD_DEFAULT = 'DEFAULT_LLM_TEMPERATURE_REFLECT = 0.9  # reflect "thinking"\n'
+NEW_DEFAULT = (
+    "# switchroom: reflect is factual synthesis over retrieved memories, not creative\n"
+    "# writing. Upstream's 0.9 never even reached the agentic path (no call site\n"
+    "# passed temperature -> provider default ~1.0 applied); a 20B model at ~1.0 was\n"
+    "# observed inventing dates its own cited memory contradicts. 0.1 matches the\n"
+    "# retain (fact extraction) default. Override: HINDSIGHT_API_LLM_TEMPERATURE_REFLECT.\n"
+    "DEFAULT_LLM_TEMPERATURE_REFLECT = 0.1  # reflect: factual synthesis (switchroom)\n"
+)
+n = s.count(OLD_DEFAULT)
+assert n == 1, (
+    f"{TAG}: reflect-temperature default anchor found {n}x (expected 1) in config.py — "
+    "upstream changed the default; re-evaluate and re-author this patch in "
+    "docker/Dockerfile.hindsight"
+)
+s = s.replace(OLD_DEFAULT, NEW_DEFAULT, 1)
+cfg.write_text(s)
+ast.parse(s)
+
+# ---- 2. engine/reflect/agent.py: make the knob LIVE ----
+ag = pathlib.Path("/app/api/hindsight_api/engine/reflect/agent.py")
+s = ag.read_text()
+
+TEMP16 = "                temperature=get_config().llm_temperature_reflect,\n"
+TEMP24 = "                        temperature=get_config().llm_temperature_reflect,\n"
+TEMP12 = "            temperature=get_config().llm_temperature_reflect,\n"
+
+EDITS = (
+    # The four final-synthesis calls (16-space indent).
+    (
+        '                scope="reflect",\n                max_completion_tokens=max_tokens,\n',
+        '                scope="reflect",\n' + TEMP16 + "                max_completion_tokens=max_tokens,\n",
+        4,
+    ),
+    # The mid-loop budget-rewrite call (24-space indent).
+    (
+        '                        scope="reflect",\n                        max_completion_tokens=max_tokens,\n',
+        '                        scope="reflect",\n' + TEMP24 + "                        max_completion_tokens=max_tokens,\n",
+        1,
+    ),
+    # The trailing budget-rewrite call (12-space indent).
+    (
+        '            scope="reflect",\n            max_completion_tokens=max_tokens,\n',
+        '            scope="reflect",\n' + TEMP12 + "            max_completion_tokens=max_tokens,\n",
+        1,
+    ),
+    # The agent tool-calling loop: temperature joins the kwargs dict.
+    (
+        "            ct_kwargs: dict[str, Any] = dict(\n"
+        "                messages=messages,\n"
+        "                tools=tools,\n"
+        '                scope="reflect_tool_call",\n'
+        "                tool_choice=iter_tool_choice,\n"
+        "            )\n",
+        "            ct_kwargs: dict[str, Any] = dict(\n"
+        "                messages=messages,\n"
+        "                tools=tools,\n"
+        '                scope="reflect_tool_call",\n'
+        + TEMP16
+        + "                tool_choice=iter_tool_choice,\n"
+        "            )\n",
+        1,
+    ),
+)
+
+for anchor, repl, expect in EDITS:
+    n = s.count(anchor)
+    assert n == expect, (
+        f"{TAG}: anchor found {n}x (expected {expect}) in engine/reflect/agent.py — "
+        "upstream reformatted the reflect LLM call sites; re-author this patch in "
+        f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+    )
+    s = s.replace(anchor, repl, expect)
+
+ag.write_text(s)
+ast.parse(s)
+
+t = ag.read_text()
+n_temp = t.count("temperature=get_config().llm_temperature_reflect,")
+assert n_temp == 7, (
+    f"{TAG}: expected the reflect temperature threaded into exactly 7 call sites "
+    f"(6x scope=reflect + 1x reflect_tool_call kwargs), found {n_temp}"
+)
+assert t.count('scope="reflect",') == 6, (
+    f"{TAG}: the number of scope=reflect call sites changed — re-count and re-author"
+)
+# Deliberate non-goal guard: the structured-extraction call keeps its own behaviour.
+assert 'scope="reflect_structured",' in t, (
+    f"{TAG}: scope=reflect_structured call site disappeared — re-audit this patch"
+)
+# The provider must still forward a non-None temperature, or the knob is dead again.
+prov = pathlib.Path("/app/api/hindsight_api/engine/providers/litellm_llm.py").read_text()
+assert "if temperature is not None:" in prov, (
+    f"{TAG}: litellm provider no longer forwards temperature conditionally — re-audit"
+)
+print(
+    "switchroom hindsight reflect-temperature patch: llm_temperature_reflect is now "
+    "passed on all 7 agentic reflect call sites and defaults to 0.1 (was a dead knob "
+    "defaulting to 0.9 with provider ~1.0 actually applied); env-overridable via "
+    "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT (value 'none' restores provider default)"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

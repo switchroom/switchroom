@@ -1083,6 +1083,74 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     # widen the semantic arm on a bank with paraphrase-heavy queries
  *     HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY: "0.2"
  * ```
+ *
+ * ### `HINDSIGHT_MCP_RECALL_BUDGET_MODE`
+ *
+ * The documented rollback knob for switchroom's mcp-recall-token-budget patch
+ * (`docker/Dockerfile.hindsight`, the `mcp_tools.py` block). That patch makes
+ * the MCP recall tool's `max_tokens` an honest budget over the serialized
+ * payload the caller actually receives (compact + `exclude_none`, tail-trim of
+ * ranked results when the envelope still exceeds the budget); its failure mode
+ * would be a silent recall-shape regression, so the patch deliberately reads
+ * this env var per call — backing the change out is meant to be a container
+ * restart with one env var, not an image rebuild. Accepted values: `legacy`
+ * restores upstream's exact pre-patch returns on both recall branches
+ * (`model_dump_json(indent=2)` on the bank_id-param branch, `model_dump()` on
+ * the single-bank branch) with the patch still baked in; any other value, or
+ * unset, is the honest-envelope mode.
+ *
+ * Note the name: this is a switchroom-patch knob, not an upstream one, so it
+ * carries NO `HINDSIGHT_API_` prefix and upstream's config parser never sees
+ * it. Only the patched module reads it.
+ *
+ * It is here because an escape hatch that cannot be reached is not an escape
+ * hatch — the same defect `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP` fixed for the
+ * CE-damping patch. Absent from this set, `resolveHindsightPerfOverrides`
+ * skipped it, so the `hindsight.env` line the patch's own comments told the
+ * operator to write never reached the container. Override-only rather than
+ * defaulted: unset ⇒ the honest-envelope mode the patch ships, and emitting a
+ * value here would hard-code a mode into every host's `docker inspect` for no
+ * behaviour change.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_MCP_RECALL_BUDGET_MODE: "legacy"   # upstream wire shape, patch inert
+ * ```
+ *
+ * ### `HINDSIGHT_API_LLM_TEMPERATURE_REFLECT`
+ *
+ * The documented rollback/tuning knob for switchroom's reflect-temperature
+ * patch (`docker/Dockerfile.hindsight`, the `config.py` +
+ * `engine/reflect/agent.py` blocks). Upstream defines this knob but it was
+ * dead in the production path — no agentic reflect call site passed
+ * `temperature`, so the provider default (~1.0) applied; the patch threads
+ * the resolved value into all 7 agentic reflect call sites and lowers the
+ * baked default to 0.1 (factual synthesis, matching the retain default).
+ *
+ * Unlike the key above this IS an upstream env var, parsed by upstream's
+ * own `_resolve_operation_temperature`. Accepted values: a float (per-op
+ * sampling temperature for reflect), or the documented sentinel `none`, which
+ * omits the temperature kwarg entirely — the provider default, i.e.
+ * upstream's accidental pre-patch behaviour, should an operator genuinely
+ * want it back. `HINDSIGHT_API_LLM_TEMPERATURE` (the global knob) is the
+ * blunter fallback and is deliberately NOT managed here — the per-op key is
+ * the patch's own rollback hatch, and rollback should not move retain's
+ * temperature too.
+ *
+ * It is here for the same reason as the key above: the patch's comments
+ * document this env var as the rollback, and a rollback line in
+ * `hindsight.env` that `resolveHindsightPerfOverrides` silently drops is not
+ * a rollback. Override-only rather than defaulted: the 0.1 default is baked
+ * into the image where the patch lives, and emitting it here too would create
+ * a second copy of the same opinion to drift.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_LLM_TEMPERATURE_REFLECT: "none"   # provider default, patch's
+ *                                                     # threading still in place
+ * ```
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
@@ -1091,6 +1159,8 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_MAX_SLOTS",
   "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
   "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
+  "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
+  "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
 ]);
 
 /**
