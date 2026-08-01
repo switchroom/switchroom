@@ -273,60 +273,65 @@ describe("buildHandoff pipeline", () => {
     expect(readFileSync(join(tmp, ".handoff-topic"), "utf-8")).toBe("deploy the worker");
   });
 
-  it("mirrors the tail to Hindsight when a URL is provided", async () => {
+  it("NEVER writes the tail into Hindsight — even with HINDSIGHT_API_URL set (memory-poisoning regression)", async () => {
+    // Regression for the session_handoff memory-poisoning defect (verified
+    // live 2026-08-02): the Stop hook used to POST the raw transcript tail —
+    // the assistant's own prior output, tool-result fragments included — to
+    // Hindsight's retain API as document_id "session_handoff". Fact
+    // extraction then re-minted the model's hallucinations (a guessed date,
+    // a wrong issue id) as first-class world facts, and the next session's
+    // recall served them back as ground truth. buildHandoff must therefore
+    // perform NO network call at all, even in the exact environment the
+    // container runs it in (HINDSIGHT_API_URL + HINDSIGHT_BANK_ID exported).
+    // This test FAILS on the pre-fix code, which read those env vars and
+    // called global fetch.
     const jsonlPath = join(tmp, "turns.jsonl");
     writeFileSync(
       jsonlPath,
       makeJsonl([
         {
           type: "assistant",
-          message: { content: [{ type: "text", text: "hi" }] },
+          message: {
+            content: [
+              {
+                type: "text",
+                text: "Article 1 (Ken-ID KEN146) published on June 19, 2026",
+              },
+            ],
+          },
         },
       ]),
     );
+    const savedUrl = process.env.HINDSIGHT_API_URL;
+    const savedBank = process.env.HINDSIGHT_BANK_ID;
+    process.env.HINDSIGHT_API_URL = "http://127.0.0.1:9";
+    process.env.HINDSIGHT_BANK_ID = "carrie";
     const fetchCalls: string[] = [];
-    const fakeFetch = (async (url: string) => {
-      fetchCalls.push(url);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown) => {
+      fetchCalls.push(String(url));
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
-    const status = await buildHandoff({
-      jsonlPath,
-      agentDir: tmp,
-      agentName: "test",
-      hindsightUrl: "http://localhost:9999",
-      hindsightBankId: "mybank",
-      fetch: fakeFetch,
-    });
-    expect(status).toBe("ok");
-    expect(fetchCalls).toEqual([
-      "http://localhost:9999/v1/default/banks/mybank/memories",
-    ]);
-  });
-
-  it("skips the Hindsight mirror when no URL is configured", async () => {
-    const jsonlPath = join(tmp, "turns.jsonl");
-    writeFileSync(
-      jsonlPath,
-      makeJsonl([
-        {
-          type: "assistant",
-          message: { content: [{ type: "text", text: "hi" }] },
-        },
-      ]),
-    );
-    const fetchCalls: string[] = [];
-    const fakeFetch = (async (url: string) => {
-      fetchCalls.push(url);
-      return new Response("{}", { status: 200 });
-    }) as typeof fetch;
-    const status = await buildHandoff({
-      jsonlPath,
-      agentDir: tmp,
-      agentName: "test",
-      fetch: fakeFetch,
-    });
-    expect(status).toBe("ok");
-    expect(fetchCalls).toEqual([]);
+    try {
+      const status = await buildHandoff({
+        jsonlPath,
+        agentDir: tmp,
+        agentName: "carrie",
+      });
+      expect(status).toBe("ok");
+      // The sidecar is still written — session continuity is unaffected.
+      expect(readFileSync(join(tmp, ".handoff.md"), "utf-8")).toContain(
+        "KEN146",
+      );
+      // ...but nothing left the process: no retain POST, no ingestion path.
+      expect(fetchCalls).toEqual([]);
+    } finally {
+      globalThis.fetch = realFetch;
+      if (savedUrl === undefined) delete process.env.HINDSIGHT_API_URL;
+      else process.env.HINDSIGHT_API_URL = savedUrl;
+      if (savedBank === undefined) delete process.env.HINDSIGHT_BANK_ID;
+      else process.env.HINDSIGHT_BANK_ID = savedBank;
+    }
   });
 });
 

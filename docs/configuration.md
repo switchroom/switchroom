@@ -670,8 +670,6 @@ Both the strategy and the pin apply to *every* retain path — the Stop hook, su
 
 **The untagged global scope is now the uncapped default sink.** Under `curated`, every all-volatile retain lands in the `shared` (untagged) scope, and the engine deliberately does **not** cap the untagged scope (`max_observations_per_scope` only guards tagged scopes). So that one scope grows without a wall. `switchroom doctor` watches its size — the `hindsight observation scopes` row WARNs when a bank's untagged scope crosses 10,000 observations (`OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT` in `src/cli/doctor-observation-scopes.ts`), well before the pool is large enough to drag consolidation. Nothing is discarded (unlike a saturated *tagged* scope, which is a FAIL) — it is a growth signal.
 
-The session-handoff mirror — the briefing switchroom writes into the agent's own bank on shutdown — is the one path that fails closed instead, because it is risking less: the on-disk handoff sidecars are already written, so the next session still reorients and only the recallable copy is skipped. `switchroom handoff` exits non-zero in that case, which makes `run-hook.sh` file a red `hook:handoff` issue carrying the reason — visible in `switchroom issues` and on the Telegram issues card, and self-clearing on the next clean shutdown once the value is fixed.
-
 Be aware of the limit: past `apply`, a bad value on the **retain** path is visible only as hook stderr. It does not stop a retain and does not reach `switchroom doctor`. The guarantee is that it cannot destroy anything.
 
 **Cascade: override** (per-agent wins over profile/defaults). `start.sh` exports `HINDSIGHT_OBSERVATION_SCOPES` only when you set it. Serves the `remember-across-sessions` job.

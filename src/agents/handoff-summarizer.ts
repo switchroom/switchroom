@@ -25,41 +25,35 @@
  * See `reference/rfcs/eliminate-claude-p.md`.
  *
  * Both writes are atomic (tmpfile + rename) so the telegram plugin
- * never reads a half-written file. The tail is also mirrored to
- * Hindsight as a tagged memory so older handoffs remain recallable.
+ * never reads a half-written file.
  *
- * Best-effort at every step — missing JSONL, Hindsight unreachable:
- * warn to stderr, resolve cleanly. The Stop hook must never block
- * agent shutdown.
+ * **The tail is DELIBERATELY NOT written into Hindsight.** Earlier
+ * releases mirrored the briefing to the retain API as a
+ * `document_id: "session_handoff"` memory "so older handoffs remain
+ * recallable" — and Hindsight ran fact extraction over it. The tail is
+ * raw model output (assistant prose plus truncated `[tool result]`
+ * fragments), so any hallucination the assistant printed in the prior
+ * session — a guessed date, a wrong issue id quoted inside a tool
+ * result — was re-extracted as a first-class `world` fact with a clean
+ * `event_date`, and the next session's recall served it back as ground
+ * truth (the KEN146/"June 19" poisoning, verified live 2026-08-02). It
+ * was also a pure duplicate: the vendored hindsight plugin's own Stop
+ * hook (`vendor/hindsight-memory/scripts/retain.py`) already retains
+ * the same transcript window with provenance tags (`source:transcript`,
+ * #4164), redaction, watermarks, dedup, oversized-content splitting and
+ * commit-before-ack — none of which the mirror had. Removing the mirror
+ * closes the unmarked ingestion path deterministically; the sidecars on
+ * disk remain the sole product of this module. Do not reintroduce a
+ * Hindsight write here — route any future retention need through the
+ * plugin's retain path so provenance and extraction guardrails apply.
+ *
+ * Best-effort at every step — missing JSONL: warn to stderr, resolve
+ * cleanly. The Stop hook must never block agent shutdown.
  */
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fsyncPathSync } from "../util/atomic.js";
-import { redactMemoryWriteBody } from "../memory/hindsight-write-redaction.js";
-import {
-  OBSERVATION_SCOPES_ENV,
-  observationScopesHint,
-  resolveObservationScope,
-} from "../memory/observation-scopes.js";
-
-/**
- * `buildHandoff` status meaning "the sidecars are on disk, but the recallable
- * Hindsight copy was deliberately NOT written because the configured
- * observation scope is invalid".
- *
- * It is a DISTINCT status, not a variant of `"ok"`, because that is the whole
- * of its operator visibility. `switchroom handoff` is registered as a Stop
- * hook through `bin/run-hook.sh` (`buildSettingsHooksBlock`), which records an
- * issue — severity error, source `hook:handoff`, with the stderr tail attached
- * — on a NON-ZERO exit and auto-resolves it on the next clean one. A skipped
- * mirror that still exits 0 writes to stderr and stops there: the Stop hook is
- * async so claude discards the code, and start.sh's own `switchroom handoff`
- * call sends stderr to /dev/null outright. Returning this status lets the CLI
- * exit non-zero, which is what puts the failure on `switchroom issues` and the
- * Telegram issues card.
- */
-export const HANDOFF_STATUS_MIRROR_SKIPPED = "mirror-skipped-invalid-scope";
 
 export const DEFAULT_MAX_TURNS = 50;
 export const TOPIC_MAX_CHARS = 117;
@@ -267,31 +261,16 @@ export type BuildHandoffOpts = {
   agentDir: string;
   agentName: string;
   maxTurns?: number;
-  hindsightUrl?: string;
-  hindsightBankId?: string;
-  fetch?: typeof fetch;
-  /**
-   * The agent's resolved `memory.observation_scopes`, AFTER the
-   * defaults/profile cascade. This is the authority: the caller
-   * (`src/cli/handoff.ts`) already loads switchroom.yaml, so the scope must
-   * come from there rather than from an env var that only exists inside the
-   * container. `undefined` means "no config available" (the sandboxed
-   * container path) and hands authority to `env`.
-   */
-  observationScopes?: string;
-  /**
-   * Environment the per-row observation scope FALLS BACK to. Defaults to
-   * `process.env`; start.sh exports HINDSIGHT_OBSERVATION_SCOPES only when the
-   * operator set `memory.observation_scopes`. Injectable so the tests can pin
-   * the body without mutating the process env.
-   */
-  env?: NodeJS.ProcessEnv;
 };
 
 /**
  * Full pipeline: extract turns → format the transcript tail → derive
- * the topic → atomic sidecar write → Hindsight mirror. Resolves with a
- * status string (for logging); never throws.
+ * the topic → atomic sidecar write. Resolves with a status string (for
+ * logging); never throws.
+ *
+ * NO Hindsight write happens here — see the module header. The tail is
+ * the assistant's own prior output, and ingesting it re-mints model
+ * hallucinations as recallable facts (memory poisoning).
  */
 export async function buildHandoff(opts: BuildHandoffOpts): Promise<string> {
   const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
@@ -313,8 +292,7 @@ export async function buildHandoff(opts: BuildHandoffOpts): Promise<string> {
     return "write-error";
   }
 
-  const mirrored = await mirrorToHindsight(briefing, opts).catch(() => true);
-  return mirrored ? "ok" : HANDOFF_STATUS_MIRROR_SKIPPED;
+  return "ok";
 }
 
 function errMsg(err: unknown): string {
@@ -322,86 +300,6 @@ function errMsg(err: unknown): string {
     return String((err as { message: unknown }).message);
   }
   return String(err);
-}
-
-/**
- * Returns `false` ONLY when the mirror was deliberately skipped because the
- * configured observation scope is invalid — the one outcome that must reach an
- * operator. Every other path (no URL configured, a network failure, a non-2xx)
- * returns `true`: those are the pre-existing best-effort cases and turning them
- * into a red issue card would make every offline shutdown look like a defect.
- */
-async function mirrorToHindsight(
-  briefing: string,
-  opts: BuildHandoffOpts,
-): Promise<boolean> {
-  const url = opts.hindsightUrl ?? process.env.HINDSIGHT_API_URL;
-  const bankId = opts.hindsightBankId ?? process.env.HINDSIGHT_BANK_ID ?? "default";
-  if (!url) return true;
-  const fetchFn = opts.fetch ?? fetch;
-  const endpoint = `${url.replace(/\/$/, "")}/v1/default/banks/${encodeURIComponent(bankId)}/memories`;
-  // This mirror writes a real memory into the agent's OWN bank, so it must
-  // carry the same per-row observation scope every other retain path carries.
-  // It sits OUTSIDE the vendored plugin, so nothing in lib/client.py reaches
-  // it — left unthreaded, an agent set to `shared` would pool every memory
-  // except its session handoffs, and the odd one out is invisible until the
-  // bank is already inconsistent.
-  //
-  // Unset (the default) omits the field entirely: byte-for-byte the
-  // pre-plumbing body. An invalid value FAILS CLOSED — skip the mirror and say
-  // why, rather than writing this memory at a scope nobody asked for. The
-  // sidecars are already on disk by now, so the next session still reorients;
-  // only the recallable copy is skipped, and the non-`ok` status turns that
-  // skip into a red `hook:handoff` issue via bin/run-hook.sh.
-  //
-  // The CONFIG is the authority and the env var is only the fallback — see
-  // resolveObservationScope. Reading the env alone made `switchroom handoff`
-  // run from anywhere but inside the container (host shell, hostd agent_exec,
-  // a debugging run) see "unset" for a configured agent and POST at the engine
-  // default.
-  const scope = resolveObservationScope(
-    opts.observationScopes,
-    opts.env ?? process.env,
-  );
-  if (scope.kind === "invalid") {
-    process.stderr.write(
-      `handoff: hindsight mirror SKIPPED — observation scope ` +
-        `${JSON.stringify(scope.raw)} is not valid ` +
-        `(accepted: ${observationScopesHint()}). Fix ` +
-        `memory.observation_scopes in switchroom.yaml (or the ` +
-        `${OBSERVATION_SCOPES_ENV} export), then \`switchroom apply\` and ` +
-        `restart the agent. The on-disk handoff sidecars were written ` +
-        `normally; only the recallable Hindsight copy was skipped.\n`,
-    );
-    return false;
-  }
-  // The briefing is a raw transcript tail, so it is the highest-risk
-  // credential carrier of any write path here: anything the operator pasted
-  // or a tool printed in the last turns lands in it verbatim. Redact before
-  // serialization — see src/memory/hindsight-write-redaction.ts.
-  const body = redactMemoryWriteBody({
-    items: [
-      {
-        content: briefing,
-        document_id: "session_handoff",
-        tags: ["session_handoff", opts.agentName],
-        ...(scope.kind === "set" ? { observation_scopes: scope.scope } : {}),
-      },
-    ],
-    async: true,
-  });
-  try {
-    await fetchFn(endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (err) {
-    process.stderr.write(
-      `handoff: hindsight mirror failed — ${errMsg(err)}\n`,
-    );
-  }
-  return true;
 }
 
 /**
