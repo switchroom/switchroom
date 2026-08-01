@@ -41,6 +41,11 @@
  * feeds their resolved turnIds here; the precedence lives in one place.
  */
 
+// The one cross-module import this pure module takes — a sibling PURE module's
+// constant, so the two consumers of the turn-completion window (#4173) can
+// never disagree on the default replay grace.
+import { SUPERSEDE_COMPLETED_GRACE_MS } from './flushed-turn-supersede.js'
+
 /**
  * The four owner-turn candidate ids, in the gateway's resolution precedence.
  * Each is the `turnId` of the turn a given lookup resolved, or null when that
@@ -63,38 +68,75 @@ export interface ReplyOwnerCandidates {
   latestEndedTurnId: string | null
   /** Age (ms) of the latest-ended turn — `now - turn.endedAt`. The latest-ended
    *  tier carries DESTRUCTIVE authority (it drives supersede deletion), so it is
-   *  honoured ONLY when the turn ended within `latestEndedTtlMs` (the supersede
-   *  TTL). Without the bound, a late reply belonging to an OLDER turn could
-   *  resolve its owner to a NEWER turn now sitting at the registry tail and
-   *  delete THAT turn's legit answer.
+   *  honoured ONLY within the turn-completion window (#4173 — see
+   *  `latestEndedRealEndAgeMs`). Without a bound, a late reply belonging to an
+   *  OLDER turn could resolve its owner to a NEWER turn now sitting at the
+   *  registry tail and delete THAT turn's legit answer.
    *
    *  Two distinct absences (#3725):
-   *    - `undefined` (property omitted) ⇒ unbounded, the pre-F2 back-compat
-   *      escape for callers that don't supply an age at all;
+   *    - `undefined` (property omitted) ⇒ no age supplied at all — fails
+   *      CLOSED since #4175 (the pre-F2 "unbounded" escape granted unbounded
+   *      destructive authority exactly when the wiring was DROPPED, the
+   *      dangerous direction);
    *    - explicit `null` ⇒ the caller COMPUTED no age, i.e. its candidate turn
-   *      has no `endedAt` and has NOT ended. That cannot be TTL-bounded, so it
+   *      has no `endedAt` and has NOT ended. That cannot be bounded, so it
    *      fails CLOSED (not accepted) rather than granting unbounded authority
    *      to a turn that is still running. */
   latestEndedAgeMs?: number | null
-  /** The supersede TTL bound applied to `latestEndedAgeMs`. Undefined ⇒
-   *  unbounded. */
+  /** Bound applied to `latestEndedAgeMs` while the turn's completion window is
+   *  OPEN (#4173): for a flush-ended turn whose REAL turn_end has not been
+   *  observed yet, this is the crash-backstop cap
+   *  (`SUPERSEDE_OPEN_WINDOW_CAP_MS`). Undefined ⇒ fails closed (#4175). */
   latestEndedTtlMs?: number
+  /** #4173 — the turn-completion signal, ms since the candidate turn's REAL
+   *  turn_end was observed (`turn.realEndObservedAt`):
+   *    - `null` ⇒ the real turn_end has NOT been observed (a flush ended this
+   *      turn synthetically and the session is still composing) — the OPEN
+   *      phase; acceptance falls to `latestEndedAgeMs <= latestEndedTtlMs`
+   *      (the crash backstop), so a 20-minute compaction still resolves.
+   *    - a number ⇒ the session stopped that long ago — the COMPLETED phase;
+   *      accepted only within `latestEndedCompletedGraceMs` (the bounded
+   *      tool-call-replay window). For a normally-ended turn the real end IS
+   *      `endedAt`, so this equals `latestEndedAgeMs` and the tier keeps its
+   *      original tight ~60 s bound.
+   *    - `undefined` ⇒ legacy caller shape (no completion signal wired):
+   *      falls back to the plain `age <= ttl` rule. */
+  latestEndedRealEndAgeMs?: number | null
+  /** COMPLETED-phase bound for `latestEndedRealEndAgeMs`. Undefined ⇒ the
+   *  module default (`SUPERSEDE_COMPLETED_GRACE_MS`). */
+  latestEndedCompletedGraceMs?: number
 }
 
 /**
  * Whether the latest-ended candidate is fresh enough to carry supersede
- * (deletion) authority. An OMITTED age or TTL means unbounded (the pre-F2
- * back-compat escape); an EXPLICIT null age fails closed (#3725 — the caller
- * computed no age because its candidate turn has not ended, and an un-ended turn
- * must be resolved by the `live` tier, never by this destructive fallback).
+ * (deletion) authority — the turn-completion-window rule (#4173, three phases
+ * documented on `latestEndedRealEndAgeMs` above).
+ *
+ * An EXPLICIT null age fails closed (#3725 — the caller computed no age
+ * because its candidate turn has not ended, and an un-ended turn must be
+ * resolved by the `live` tier, never by this destructive fallback). An OMITTED
+ * age or TTL also fails closed (#4175): the old "omitted ⇒ unbounded"
+ * back-compat escape meant DROPPING the gateway's bound wiring silently
+ * granted unbounded destructive authority — failing toward silent edit-over.
+ * Now dropped wiring degrades to "tier never accepted" — a visible duplicate,
+ * the safe direction.
  */
 function latestEndedAccepted(candidates: ReplyOwnerCandidates): boolean {
   if (candidates.latestEndedTurnId == null) return false
   const age = candidates.latestEndedAgeMs
   const ttl = candidates.latestEndedTtlMs
-  if (age === null) return false
-  if (age === undefined || ttl == null) return true
-  return age <= ttl
+  if (age == null || ttl == null) return false
+  const realEndAge = candidates.latestEndedRealEndAgeMs
+  if (realEndAge === undefined || realEndAge === null) {
+    // Legacy caller (no completion signal) or OPEN window (real turn_end not
+    // yet observed): the plain age-vs-cap rule. For an open window `ttl` is
+    // the generous crash backstop, so a long compaction still resolves.
+    return age <= ttl
+  }
+  // COMPLETED: the session stopped `realEndAge` ago — only the bounded
+  // tool-call-replay grace remains.
+  const grace = candidates.latestEndedCompletedGraceMs ?? SUPERSEDE_COMPLETED_GRACE_MS
+  return realEndAge <= grace
 }
 
 /**
@@ -207,6 +249,21 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
  * `live` keeps its unconditional bypass: `currentTurn` is framework-owned, and
  * `decideSupersede`'s same-turnId requirement already bars it from reaching a
  * DIFFERENT ended turn's record. `none` never bypasses (nothing to attribute).
+ *
+ * ## The second ambiguity: a live sub-agent (#4176)
+ *
+ * `handbackCouldOwnReply` covers the sub-agent completion that the gateway
+ * SYNTHESIZED as an inbound. It does not cover a background sub-agent calling
+ * `reply` DIRECTLY, mid-run: that call rides the same main bridge as the parent
+ * loop (so the #4172 caller-identity gate cannot see it) and never traverses
+ * `pendingInboundBuffer.push` (so no marker is stamped). Marker-absence is only
+ * evidence of "the turn's own answer" if nothing else on the session could have
+ * emitted this reply — which is exactly what `subagentCouldOwnReply` reports,
+ * from gateway-observed `sub_agent_*` liveness. When it is true the content gate
+ * is KEPT on every non-`live` tier: a reply that IS the flushed answer still
+ * collapses, a sub-agent's foreign content sends fresh. See
+ * `gateway/subagent-reply-authority.ts` for the ordering argument and the
+ * failure directions.
  */
 export function decideContentGateBypass(input: {
   /** The winning owner tier (`resolveReplyOwnerTier`). */
@@ -216,18 +273,36 @@ export function decideContentGateBypass(input: {
   /** The SAME candidate set both of the above were derived from — supplies the
    *  framework-derived `latestEndedTurnId` plus its freshness bound, so the
    *  corroboration reuses the EXACT rule `resolveReplyOwnerTier` applies
-   *  (`latestEndedAccepted`) instead of duplicating it: within the TTL, and —
-   *  since #3725 — not a turn that is still running. */
+   *  (`latestEndedAccepted`) instead of duplicating it: within the
+   *  turn-completion window (#4173), and — since #3725 — not a turn that is
+   *  still running. */
   candidates: ReplyOwnerCandidates
   /** True when a decoupled-completion inbound (`subagent_handback`) was enqueued
-   *  in this chat AFTER the owner turn ended and within the supersede TTL — the
-   *  ambiguous window where the late reply might BE that handback rather than
-   *  the turn's own answer. Keeps the content gate on every non-`live` tier. */
+   *  in this chat AFTER the owner turn ended and within the handback recency
+   *  window (`HANDBACK_RECENCY_WINDOW_MS`, #4174) — the ambiguous window where
+   *  the late reply might BE that handback rather than the turn's own answer.
+   *  Keeps the content gate on every non-`live` tier. */
   handbackCouldOwnReply: boolean
+  /** #4176 — true when a sub-agent is LIVE on this session
+   *  (`subagentReplyAuthority`, gateway/subagent-reply-authority.ts). A
+   *  background `Task` sub-agent calls `reply` over the SAME main bridge as the
+   *  parent loop, so the #4172 caller-identity gate cannot see it and — because
+   *  a DIRECT tool call never traverses `pendingInboundBuffer.push` — it stamps
+   *  no handback marker either. Marker-absence therefore does NOT prove "the
+   *  turn's own answer" while a sub-agent is live: the reply might be the
+   *  sub-agent's, and bypassing the content gate would silently EDIT OVER the
+   *  flushed answer. Typed REQUIRED and evaluated FAIL-CLOSED (anything but an
+   *  explicit `false` keeps the gate): `telegram-plugin/` is not covered by
+   *  `tsc --noEmit`, so the type alone cannot stop a caller from dropping the
+   *  wiring — and the #4175 precedent is that a dropped bound fails closed,
+   *  never open. */
+  subagentCouldOwnReply: boolean
 }): boolean {
   if (input.tier === 'live') return true
   if (input.tier === 'none') return false
   if (input.handbackCouldOwnReply) return false
+  // Fail-CLOSED on an omitted flag (see the field doc): `!== false`, not truthiness.
+  if (input.subagentCouldOwnReply !== false) return false
   // Total over degenerate input (#3726). TypeScript makes `candidates` mandatory
   // and the one production caller (`resolveReplyOwnerTurn`) always builds it, so
   // this cannot fire today — but this module is exported precisely so the
@@ -260,16 +335,17 @@ export function decideContentGateBypass(input: {
  * handback pattern (#3426): the parent turn's interim ack (a substantive
  * `reply`) armed the latch, the turn ended, and the sub-agent completion
  * handback — a genuinely NEW answer arriving with no live gateway turn —
- * resolved the ended turn as owner (latest-ended tier, inside the 60 s
- * supersede TTL), saw the stale latch, and was silently dropped with a false
+ * resolved the ended turn as owner (latest-ended tier, inside the — then 60 s —
+ * supersede window), saw the stale latch, and was silently dropped with a false
  * "deduped" success. Tagging the source lets the suppression fire ONLY for the
  * flush races it exists for; byte-identical replays of a reply-delivered
  * answer remain covered by the content-keyed outbound dedup (#546).
  *
  * Honest bound on that dedup cover: the #546 TTL (60 s) is anchored at reply
- * RECORD time, while the latest-ended owner tier's 60 s is anchored at the
- * turn's `endedAt` — later by the reply→turn_end gap. A byte-identical replay
- * landing >60 s after record but ≤60 s after endedAt is evicted from dedup yet
+ * RECORD time, while the latest-ended owner tier's bound is the turn-completion
+ * window (#4173) anchored at the turn's OBSERVED real end — later by the
+ * reply→turn_end gap. A byte-identical replay landing >60 s after record but
+ * still inside the completion window is evicted from dedup yet
  * still resolves the ended turn, so it DELIVERS as a duplicate message. That
  * is a conscious trade: this fix also drops the weak "reworded/bridge-replayed
  * duplicate" suppression the reply-armed boolean latch used to provide —

@@ -18,9 +18,9 @@
  *     #1177/#1182/#1201 double-sent).
  *   - CASE B — a background handback attributed to that ended turn. A
  *     `subagent_handback` WAS enqueued after the turn ended and within the
- *     supersede TTL, so the late reply might BE it → keep the #3429 content gate
- *     and send fresh (two messages), never silently edit/delete the flushed
- *     answer.
+ *     handback recency window (`HANDBACK_RECENCY_WINDOW_MS` below, #4174), so
+ *     the late reply might BE it → keep the #3429 content gate and send fresh
+ *     (two messages), never silently edit/delete the flushed answer.
  *
  * ## Why thread-keyed (F2, dup-audit 2026-07-21)
  *
@@ -65,12 +65,30 @@
  *     reply with NO live gateway turn of its own (a background worker completion),
  *     so its reply resolves a DIFFERENT, already-ended turn via the latest-ended
  *     tier. It is the F1 vector.
- *   - Every OTHER synthesized source (cron, resume_*, reaction, vault_*, …) lands
- *     as its OWN live inbound turn, so its reply resolves the `live` tier for its
- *     own turnId and structurally cannot supersede a different ended turn's flush
- *     record (`decideSupersede` requires `record.turnId === liveTurnId`). Those
- *     must NOT stamp — stamping them would needlessly hold the content gate open
- *     for an unrelated own-reply in the window (a safe but avoidable visible dup).
+ *   - Every OTHER synthesized source that traverses THIS chokepoint (resume_*,
+ *     reaction, vault_*, Tier-2 cron, …) lands as its OWN live inbound turn, so
+ *     its reply resolves the `live` tier for its own turnId and structurally
+ *     cannot supersede a different ended turn's flush record (`decideSupersede`
+ *     requires `record.turnId === liveTurnId`). Those must NOT stamp — stamping
+ *     them would needlessly hold the content gate open for an unrelated
+ *     own-reply in the window (a safe but avoidable visible dup).
+ *
+ * ## What this chokepoint CANNOT see (#4172 — the caller-identity gate)
+ *
+ * The invariant above only covers sources delivered through
+ * `pendingInboundBuffer.push`. A Tier-1 CHEAP-CRON fire is delivered via
+ * `sendToAgent` to the derived `<agent>-cron` bridge and never traverses the
+ * buffer — AND its session events are dropped for the cron identity in
+ * `onSessionEvent`, so it never mints a live gateway turn either. Its `reply`
+ * therefore arrives decoupled (turn == null) with foreign content and NO
+ * marker — exactly the shape marker-absence was claimed to disprove. The same
+ * holds for any reply arriving on a connection that is not the main agent
+ * bridge. That class is closed at a DIFFERENT chokepoint: the reply send path
+ * (`outbound-send-path.ts`) refuses supersede/bypass/latch authority to any
+ * caller that is not the main agent bridge (`replyCallerIsForeignSession`,
+ *  cron-session.ts) — identity, not marker stamping, is the deterministic
+ * signal there. Setting `cron: { decoupledCompletion: true }` below would NOT
+ * work: a Tier-1 fire never reaches this registry's write site.
  *
  * This predicate is therefore the SINGLE point of extension: any future feature
  * that synthesizes an inbound which can land as a DECOUPLED late reply (no live
@@ -114,6 +132,12 @@ export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion
   // Everything below lands as its OWN live inbound turn (live tier), so its reply
   // resolves the live tier for its own turnId and structurally cannot supersede a
   // different ended turn's record → not a decoupled-completion vector, must not stamp.
+  //
+  // cron: `false` covers the TIER-2 (main-bridge, `context:'agent'`) fire, which
+  // does land as its own live turn through this chokepoint. The TIER-1 cheap-cron
+  // fire never traverses this chokepoint AT ALL (see "What this chokepoint
+  // CANNOT see" above) — it is closed by the caller-identity gate in the reply
+  // send path (#4172), and flipping this to `true` would not reach it.
   cron: { decoupledCompletion: false },
   reaction: { decoupledCompletion: false },
   subagent_progress: { decoupledCompletion: false },
@@ -167,6 +191,22 @@ export function stampsHandbackMarker(source: string | null | undefined): boolean
   if (known == null) return true // fail-safe: unknown synthesized source stamps
   return known.decoupledCompletion
 }
+
+/**
+ * #4174 — how long after a `subagent_handback` enqueue the content gate stays
+ * held for late replies attributed to an ended turn (`handbackCouldOwnReply`,
+ * outbound-send-path.ts). This deliberately does NOT follow the supersede
+ * window's bounds (#4173): the gate-hold is CHAT-WIDE (the latest-ended owner
+ * tier is chat-wide, so the read must be too — MUST-FIX 2 above), which means
+ * every in-window handback re-opens the reworded-own-answer visible-duplicate
+ * class for EVERY topic in the chat for the window's length. 60 s — the
+ * originally shipped bound — covers the enqueue→decoupled-reply gap the marker
+ * exists for, while keeping the chat-wide dup exposure per handback small. In
+ * a delegation-heavy agent, tying this to a minutes-long supersede bound would
+ * hold the gate almost continuously — re-opening the exact duplicate class the
+ * supersede machinery closes.
+ */
+export const HANDBACK_RECENCY_WINDOW_MS = 60_000
 
 /** Sentinel thread key for the no-thread (DM / bare-chat) lane. */
 const MAIN_THREAD_KEY = '<main>'

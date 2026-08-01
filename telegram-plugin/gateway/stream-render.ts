@@ -73,6 +73,8 @@ import { logStreamingEvent } from '../streaming-metrics.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { decideTurnFlush } from '../turn-flush-safety.js'
+import { FlushCompletionTracker } from '../flushed-turn-supersede.js'
+import { subagentReplyAuthority } from './subagent-reply-authority.js'
 import { decideTerminalReason, deriveTurnRole } from '../turn-liveness-floor.js'
 import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 import { deriveTurnId } from './derive-turn-id.js'
@@ -220,6 +222,38 @@ function discardParkedTurnStart(rawContent: string): ParkedTurnStart | null {
     }
   }
   return null
+}
+
+/**
+ * #4173 — the ONE turn-completion tracker for flush-ended turns (module-scope
+ * like `parkedTurnStarts`: one CLI session per gateway process). The
+ * quiescence flush ends a turn SYNTHETICALLY while the claude session is still
+ * composing; this holds that turn's atom pending until the session's REAL
+ * turn_end (or a proxy: a new turn minting, the bridge dying) is observed,
+ * then stamps `realEndObservedAt` — the signal that flips the supersede
+ * machinery from the unbounded OPEN phase to the ~60 s replay grace. See the
+ * `flushed-turn-supersede.ts` module header for the full three-phase model.
+ */
+export const flushCompletionTracker = new FlushCompletionTracker()
+
+/**
+ * #4173 — a turn-completion signal was observed: close every open flush
+ * window. Stamps the pending atoms (`flushCompletionTracker`) AND starts the
+ * replay grace on the registry's records (`completeAll`) in one call, so the
+ * two surfaces (latest-ended owner tier / supersede record) can never observe
+ * different phases. Called from the real-turn_end path, the new-turn mint, and
+ * the gateway's bridge-death sweep. Returns how many atom windows closed.
+ */
+export function closeFlushCompletionWindows(
+  // Optional-shaped on purpose: several test harnesses drive `beginTurn` /
+  // `handleSessionEvent` with a partial deps object that carries no supersede
+  // registry. The production deps builder always injects the real one.
+  registry: { completeAll?: (now: number) => void } | null | undefined,
+  now: number,
+): number {
+  const closed = flushCompletionTracker.closeAll(now)
+  registry?.completeAll?.(now)
+  return closed
 }
 
 /** Test seam: the parked store is module-scope (one CLI session, one queue), so
@@ -558,6 +592,9 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
       flushedAnswerText: null,
       // 2026-07 double-reply-on-DM fix (F2) — stamped at turn end.
       endedAt: null,
+      // #4173 — the turn-completion signal, stamped at turn end (or later, for
+      // a flush-ended turn, when the real turn_end is observed).
+      realEndObservedAt: null,
       firstPingAt: null,
       // Notification ownership (R8 / PR-2): no slot claimed yet, so the
       // "claimer was substantive" flag starts false. Set atomically with
@@ -682,6 +719,12 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
     //     already the single stop-owner for ALL turns, and a start is
     //     self-healing anyway, so this cannot leak an interval.
     startTurnTypingLoop(ev.chatId, enqThreadIdNum ?? null)
+    // #4173 — a new turn minting on the serial claude session is a completion
+    // PROXY for any still-open flush window: the session has moved on, so a
+    // prior flushed turn's own late reply can now only arrive as a bounded
+    // replay (the grace). Closing here is the SAFE direction — a window closed
+    // too early costs at most a visible duplicate, never an edit-over.
+    closeFlushCompletionWindows(deps.flushedTurnSupersede, Date.now())
     // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
     // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
     // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
@@ -916,6 +959,16 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
     const durationMs = ev.kind === 'turn_end' ? ev.durationMs : undefined
     idleTracker.noteEvent(ev.kind, Date.now(), durationMs)
   }
+  // #4176 — sub-agent liveness, fed from the SAME whole-stream position as the
+  // idle clock above and for the same reason: `sub_agent_*` events arrive with
+  // or without a live gateway turn, and the reply send path must know whether a
+  // background sub-agent could be the author of a decoupled reply (a sub-agent
+  // calls `reply` over the parent's OWN bridge, so neither the caller-identity
+  // gate nor the handback marker can see it). Deliberately BEFORE the switch:
+  // the `sub_agent_tool_use` case below early-returns when `getCurrentTurn()` is
+  // null, which is exactly the post-flush state this gate exists for. See
+  // gateway/subagent-reply-authority.ts.
+  subagentReplyAuthority.noteSessionEvent(ev as { kind: string; agentId?: string })
   switch (ev.kind) {
     case 'enqueue': {
       // #3927 FIX A — an `enqueue` is a QUEUE event, not a turn START event
@@ -1724,6 +1777,17 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           return
         }
       }
+      // #4173 — every turn_end that PROCEEDS (a real turn_end always; a
+      // synthetic one only past the suppression guard above) is a completion
+      // signal for any flush window still open from an EARLIER turn: the
+      // serial session has reached a stop, so that turn's own late reply can
+      // now only arrive as a bounded replay. Close them BEFORE this event's
+      // own processing — the quiescence-flush branch below may OPEN a new
+      // window for THIS turn right after. The common case this serves: the
+      // flush's synthetic turn_end tore the atom down, so when the REAL
+      // turn_end for that same turn lands here it finds no live atom and
+      // otherwise no-ops — this close is how that real turn_end is observed.
+      closeFlushCompletionWindows(flushedTurnSupersede, Date.now())
       // #2094 finding 1 — turn_end gate-wedge backstop. Capture the turn
       // BEFORE the body runs (the body re-reads currentTurn as `turn`, then
       // nulls it via endCurrentTurnAtomic on every clean branch). The guarded
@@ -2244,6 +2308,22 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // #1556 wedge-safety reasons. `backstopTurnEndedAt` is null iff the
         // atom was already torn down elsewhere (no record to emit).
         const backstopTurnEndedAt = endCurrentTurnAtomic(turn, { deferRecord: true, deferObligationClose: true })
+        // #4173 — the ANSWER-READY QUIESCENCE variant of this branch ends the
+        // turn SYNTHETICALLY (durationMs === -1): the claude session is still
+        // composing and its REAL turn_end arrives later. Re-open the atom's
+        // completion window (endCurrentTurnAtomic just stamped
+        // `realEndObservedAt` with the default "ended = really ended" rule) and
+        // hold it pending, so the supersede window for this flush stays
+        // claimable until the real turn_end — or a proxy — is observed. This is
+        // what makes a same-session reply landing after a 20-minute /compact
+        // still collapse onto the flushed message (#4166), without holding the
+        // window open for even a second once the session actually stops.
+        // The TURN-END BACKSTOP variant (durationMs >= 0) fires ON the real
+        // turn_end: the session already stopped, so its window is born
+        // completed (grace-bounded) — it must NOT be re-opened.
+        if (ev.durationMs === -1) {
+          flushCompletionTracker.open(turn)
+        }
         // #549 fix — turn-flush takes ownership of the captured-text
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
@@ -2446,7 +2526,17 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               flushedTurnSupersede.record(
                 backstopChatId,
                 backstopThreadId,
-                { turnId: turn.turnId, messageIds: sentIds, text: capturedText },
+                // #4173 — inherit the atom's completion state: the async send
+                // above can outlast the real turn_end (a close that ran while
+                // we awaited stamped `realEndObservedAt`), and a window closed
+                // before its record existed must be born completed
+                // (grace-bounded), never resurrected as open.
+                {
+                  turnId: turn.turnId,
+                  messageIds: sentIds,
+                  text: capturedText,
+                  completedAt: turn.realEndObservedAt,
+                },
                 Date.now(),
               )
             }

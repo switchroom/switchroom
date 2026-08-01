@@ -36,6 +36,37 @@ export function baseAgent(name: string): string {
 }
 
 /**
+ * #4172 — is a `reply` tool call arriving on this IPC client identity a
+ * FOREIGN-SESSION reply, i.e. one that can NEVER be the main claude session's
+ * own (possibly late/reworded) answer to a turn the gateway attributed?
+ *
+ * The whole flushed-turn supersede/bypass/latch machinery
+ * (`outbound-send-path.ts`) rests on the premise that a decoupled late reply
+ * resolving an ended turn is that turn's own answer unless a handback marker
+ * says otherwise. That premise only holds for replies from the MAIN agent
+ * bridge — the one whose session the turns belong to. A Tier-1 cheap-cron
+ * fire's reply arrives on the derived `<agent>-cron` bridge: it never mints a
+ * gateway turn (its session events are dropped in `onSessionEvent`), never
+ * traverses `pendingInboundBuffer.push` (so it cannot stamp the handback
+ * marker), and lands decoupled with foreign content — the measured #4172
+ * failure was such a reply EDITING OVER a flushed answer (double loss: the
+ * flushed answer destroyed, the cron digest delivered as a silent edit).
+ * Identity is the one deterministic signal that separates it.
+ *
+ * Returns true (foreign — refuse supersede/bypass/latch authority, always
+ * send fresh) for:
+ *   - a cron-session identity (`<agent>-cron`);
+ *   - a null/absent identity (an unregistered client — it owns no session,
+ *     so fail SAFE: a visible fresh message, never destructive authority).
+ * Returns false only for a registered non-cron agent bridge — the main
+ * session.
+ */
+export function replyCallerIsForeignSession(name: string | null | undefined): boolean {
+  if (name == null || name === "") return true;
+  return isCronIdentity(name);
+}
+
+/**
  * True iff an inject_inbound fire is a scheduled cron fire — Tier-1 cheap-cron
  * (`meta.session='cron'`, routed to the derived `<agent>-cron` bridge) OR a
  * Tier-2 full-session cron (`meta.source='cron'`, lands on the main bridge).

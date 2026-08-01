@@ -85,7 +85,9 @@ import {
   type TelegraphAccount,
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
-import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import { resolveReplyOwnerTurnWith, SUPERSEDE_OPEN_CAP_MS, SUPERSEDE_GRACE_MS } from './reply-owner-wiring.js'
+import { subagentReplyAuthority } from './subagent-reply-authority.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   splitCoalescedAttachments,
@@ -455,7 +457,7 @@ import {
   type SendReplyGatewayDeps,
   type DeliverCapturedProseDeps,
 } from './outbound-send-path.js'
-import { handleSessionEvent as handleSessionEventCore, drainParkedTurnStartsForChat } from './stream-render.js'
+import { handleSessionEvent as handleSessionEventCore, drainParkedTurnStartsForChat, closeFlushCompletionWindows } from './stream-render.js'
 import { createNarrativeLane } from './narrative-lane.js'
 import {
   parseAgentCallback,
@@ -488,8 +490,6 @@ import {
   FLUSH_SUBSTANTIVE_MIN_CHARS,
 } from '../turn-flush-safety.js'
 import {
-  resolveReplyOwnerTurnId,
-  resolveReplyOwnerTier,
   type ReplyOwnerTier, type ReplyOwnerCandidates,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
@@ -657,7 +657,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
-import { isCronIdentity, isCronInjectFire, deliverInjectWithFallback } from './cron-session.js'
+import { isCronIdentity, isCronInjectFire, deliverInjectWithFallback, replyCallerIsForeignSession } from './cron-session.js'
 import {
   ObligationLedger,
   obligationEscalationText,
@@ -2377,7 +2377,12 @@ const outboundDedup = new OutboundDedupCache()
 // a second message. Keyed on the per-turn `turnId` nonce, NOT on text — so it
 // catches the containment case the exact-text `outboundDedup` misses (a
 // `narration\n\nanswer` flush never equals the clean `answer`-only reply).
-const flushedTurnSupersede = new FlushedTurnSupersedeRegistry()
+// #4173/#4175 — window bounds (env kill-switch + rationale) live in
+// reply-owner-wiring.ts so this ctor and the owner-tier candidates share them.
+const flushedTurnSupersede = new FlushedTurnSupersedeRegistry({
+  openCapMs: SUPERSEDE_OPEN_CAP_MS,
+  completedGraceMs: SUPERSEDE_GRACE_MS,
+})
 // #3276 — the turn-flush backstop's per-turn delivery latch + per-chunk
 // idempotency ledger. The latch (keyed on `turnId`) is the deterministic
 // arbiter of backstop-vs-reply; the chunk ledger lets a retry after a partial
@@ -3457,12 +3462,18 @@ export type CurrentTurn = {
   // The `latest-ended` supersede tier carries DESTRUCTIVE authority (it drives
   // message deletion), so `resolveReplyOwnerTurn` only honours a latest-ended
   // turn whose `endedAt` is non-null (#3725 — the registry is populated at turn
-  // START, so the tail entry may still be RUNNING) AND within the supersede TTL —
-  // otherwise a late reply belonging to an OLDER turn could resolve its owner to
-  // a NEWER turn at the registry tail and delete that turn's legit answer. The
-  // unbounded ROUTING use (`endedOnly: false`) is unaffected: it only picks a
-  // topic to deliver into and deletes nothing.
+  // START, so the tail entry may still be RUNNING) AND within the
+  // turn-completion window (#4173) — otherwise a late reply belonging to an
+  // OLDER turn could resolve its owner to a NEWER turn at the registry tail and
+  // delete that turn's legit answer. The unbounded ROUTING use
+  // (`endedOnly: false`) is unaffected: it only picks a topic to deliver into
+  // and deletes nothing.
   endedAt: number | null
+  // #4173 — the turn-completion signal: ms the SESSION's real stop was
+  // observed, or null while the window is OPEN (a flush-ended turn still
+  // composing). Stamped in turn-end.ts / closed by stream-render's hooks;
+  // full three-phase model in flushed-turn-supersede.ts.
+  realEndObservedAt: number | null
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
@@ -3985,60 +3996,21 @@ function findLatestTurnForChat(chatId: string, opts: { endedOnly: boolean }): Cu
   return latestTurnForChat(recentTurnsById.values(), chatId, opts)
 }
 
-/**
- * 2026-07 double-reply-on-DM fix (Part 1). Resolve the turn that OWNS a landing
- * reply using the SAME full chain the thread-router uses, so the supersede
- * resolver can never again diverge from routing (the exact bug: supersede
- * omitted the quoted-message and latest-ended recoveries, so a DM late reply —
- * no live turn, no `origin_turn_id` — resolved to a null owner and its flush
- * message was never superseded → duplicate).
- *
- * Precedence (first non-null wins), delegated to the pure
- * `resolveReplyOwnerTurnId` so the exact precedence is unit-tested:
- *   1. the live `currentTurn` passed in (null once the flush nulled the atom);
- *   2. `findTurnByOriginId(origin_turn_id)` — the model echo;
- *   3. `findTurnByQuotedMessageId(chat_id, reply_to)` — framework-owned quote;
- *   4. `findLatestTurnForChat(chat_id, {endedOnly:true})` — last ENDED turn.
- * Returns the CurrentTurn for the winning id (so callers can read its
- * `answerDelivered` latch), or null when every lookup missed.
- */
+/** 2026-07 double-reply-on-DM fix (Part 1) — thin wrapper over the extracted
+ *  composition (`reply-owner-wiring.ts`, which also carries the #4173
+ *  turn-completion-window bounds). Kept here only to bind the gateway's
+ *  stateful lookups. */
 function resolveReplyOwnerTurn(
   liveTurn: CurrentTurn | null,
   chatId: string,
   args: Record<string, unknown>,
 ): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates } {
-  const origin = findTurnByOriginId(args.origin_turn_id as string | undefined)
-  const quoted = findTurnByQuotedMessageId(chatId, args.reply_to)
-  const latestEnded = findLatestTurnForChat(chatId, { endedOnly: true })
-  const byId = new Map<string, CurrentTurn>()
-  // Populate lowest-precedence first so a higher tier's turn wins the id slot
-  // when two lookups resolve the same turn (they carry the same turnId anyway).
-  for (const t of [latestEnded, quoted, origin, liveTurn]) {
-    if (t != null) byId.set(t.turnId, t)
-  }
-  // F2 — bound the DESTRUCTIVE latest-ended tier to the supersede TTL so a stale
-  // latest-ended turn can't inherit deletion authority over a newer turn's flush
-  // record. #3725: the lookup above is `endedOnly`, so `endedAt` is non-null here
-  // and the age is ALWAYS a real number — a not-yet-ended turn is no longer a
-  // candidate at all, and an explicit null age now fails CLOSED downstream.
-  const latestEndedAgeMs =
-    latestEnded?.endedAt != null ? Date.now() - latestEnded.endedAt : null
-  const candidates: ReplyOwnerCandidates = {
-    liveTurnId: liveTurn?.turnId ?? null,
-    originTurnId: origin?.turnId ?? null,
-    quotedTurnId: quoted?.turnId ?? null,
-    latestEndedTurnId: latestEnded?.turnId ?? null,
-    latestEndedAgeMs,
-    latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
-  }
-  // #3429 — the winning tier AND the candidate set it came from travel with the
-  // turn. Tier alone no longer decides the content-gate bypass: the
-  // model-steerable `origin`/`quoted` tiers must be CORROBORATED against the
-  // framework-derived `latestEndedTurnId` (`decideContentGateBypass`). All three
-  // derive from these SAME candidates, so they can never disagree.
-  const tier = resolveReplyOwnerTier(candidates)
-  const winnerId = resolveReplyOwnerTurnId(candidates)
-  return { turn: winnerId != null ? (byId.get(winnerId) ?? null) : null, tier, candidates }
+  return resolveReplyOwnerTurnWith(
+    { findTurnByOriginId, findTurnByQuotedMessageId, findLatestTurnForChat, now: Date.now },
+    liveTurn,
+    chatId,
+    args,
+  )
 }
 
 /**
@@ -10759,12 +10731,27 @@ if (isGatewayMain) ipcServer = createIpcServer({
       },
       log: (msg) => process.stderr.write(`${msg}\n`),
     })
+    // #4173 — a MAIN-bridge death is a turn-completion proxy: the dead session
+    // can never deliver a flush-ended turn's real turn_end, so close any open
+    // flush windows now (the replay grace still covers a reconnect replay).
+    // Scoped to a registered non-cron agent; rationale in stream-render.ts.
+    if (client.agentName != null && !isCronIdentity(client.agentName)) {
+      subagentReplyAuthority.reset() // #4176 — the sub-agents died with the session
+      const closedWindows = closeFlushCompletionWindows(flushedTurnSupersede, Date.now())
+      if (closedWindows > 0) {
+        process.stderr.write(
+          `telegram gateway: bridge disconnect closed ${closedWindows} open flush-completion window(s) (#4173)\n`,
+        )
+      }
+    }
   },
 
   async onToolCall(client: IpcClient, msg: ToolCallMessage): Promise<ToolCallResult> {
     process.stderr.write(`telegram gateway: ipc: tool_call tool=${msg.tool} agent=${client.agentName ?? '-'} clientId=${client.id ?? '-'} callId=${msg.id}\n`)
     try {
-      const result = await executeToolCall(msg.tool, msg.args)
+      // #4172 — the calling client's identity gates reply supersede authority
+      // (see replyCallerIsForeignSession, cron-session.ts).
+      const result = await executeToolCall(msg.tool, msg.args, client.agentName)
       return { type: 'tool_call_result', id: msg.id, success: true, result }
     } catch (err) {
       return {
@@ -11972,13 +11959,18 @@ const ALLOWED_TOOLS = new Set([
   'linear_agent_setup',
 ])
 
-async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
+async function executeToolCall(
+  tool: string,
+  args: Record<string, unknown>,
+  // #4172 — calling client identity; only the reply path consumes it today.
+  callerAgentName: string | null = null,
+): Promise<unknown> {
   if (!ALLOWED_TOOLS.has(tool)) {
     throw new Error(`tool not allowed: ${tool}`)
   }
   switch (tool) {
     case 'reply':
-      return executeReply(args)
+      return executeReply(args, callerAgentName)
     case 'progress_update':
       return executeProgressUpdate(args)
     case 'react':
@@ -12490,14 +12482,22 @@ async function synthesizeVoiceOut(plan: {
   }
 }
 
-async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+async function executeReply(
+  args: Record<string, unknown>,
+  callerAgentName: string | null = null,
+): Promise<{ content: Array<{ type: string; text: string }> }> {
   // #2996 P2: the ~1,400-line orchestration body moved VERBATIM to
   // outbound-send-path.ts `sendReply()` — the single tested send primitive.
   // #1664 — the turn is pinned HERE at entry (same read, same position as the
   // old inline `const turn = currentTurn`) and passed in `req`; the façade
   // also gets a live `getCurrentTurn()` accessor for the deliberate live
   // re-reads (Amendment 9: each call site keeps its pin-vs-live choice).
-  return sendReply(gatewaySendReplyDeps(), { args, turn: currentTurn })
+  // #4172 — a foreign-session caller gets no supersede/bypass/latch authority.
+  return sendReply(gatewaySendReplyDeps(), {
+    args,
+    turn: currentTurn,
+    callerIsForeignSession: replyCallerIsForeignSession(callerAgentName),
+  })
 }
 
 /** Live gateway deps for the extracted send façade (#2996 P2). Built fresh
@@ -12540,6 +12540,7 @@ function gatewaySendReplyDeps(): SendReplyGatewayDeps {
     resolveThreadId,
     getLatestInboundMessageId,
     getLastSubagentHandbackAt,
+    subagentReplyAuthority,
     recordOutbound,
     emissionAuthorityFor,
     clearActivitySummary,
