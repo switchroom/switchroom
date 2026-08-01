@@ -1,5 +1,6 @@
 import type { Command } from "commander";
 import chalk from "chalk";
+import { parse as parseYaml } from "yaml";
 
 import { type CheckStatus, statusGlyph } from "./doctor-status.js";
 import { spawnSync } from "node:child_process";
@@ -49,6 +50,7 @@ import {
   type HostCapabilitiesRead,
 } from "../setup/host-capabilities.js";
 import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
+import { findUnknownMemoryKeys } from "../config/memory-key-drift.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
@@ -587,7 +589,117 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
         : undefined,
   });
 
+  // A `memory.recall` / `memory.retain` key switchroom's schema does not
+  // declare is silently STRIPPED at parse time (the zod objects are
+  // non-strict), so the operator's yaml reads as configured and does nothing.
+  // A REMOVED knob is worse — they have evidence they once set it. Surface it.
+  results.push(checkMemoryKeysAreKnown(configPath));
+
   return results;
+}
+
+/**
+ * WARN when `memory` / `memory.recall` / `memory.retain` in switchroom.yaml
+ * carries a key the schema does not declare.
+ *
+ * The memory zod objects are non-strict, so an unrecognized key is dropped at
+ * parse time with no error and no doctor row — the operator's config reads as
+ * though the knob is set and it has zero effect (#3773, the same defect class
+ * as the `hindsight.env` row #3763 fixed on a different surface). A REMOVED
+ * knob (e.g. `memory.recall.min_overlap`, whose recall gate was deleted in
+ * #3761) is strictly worse: the operator has positive evidence they once
+ * configured it. {@link findUnknownMemoryKeys} attaches a specific message to
+ * such retired keys.
+ *
+ * WARN, not FAIL: the issue explicitly rejects turning an unknown key into a
+ * hard config-parse boot failure on every agent (which is what `.strict()`
+ * would do). A dropped knob is a defect worth a loud row, but not one worth
+ * refusing to boot the fleet over.
+ *
+ * Reads the RAW yaml — the parsed `SwitchroomConfig` has already had the
+ * unknown keys stripped by zod, so a parsed config would always look clean,
+ * which is exactly the silent bug. Best-effort: an unreadable/unparseable file
+ * is a no-op here (the earlier `switchroom.yaml loaded` row already owns that
+ * failure).
+ *
+ * @internal exported for testing
+ */
+export function checkMemoryKeysAreKnown(configPath: string): CheckResult {
+  const name = "memory config keys";
+
+  let rawText: string;
+  try {
+    rawText = readFileSync(configPath, "utf-8");
+  } catch {
+    return { name, status: "ok", detail: "config unreadable — skipped (see load row)" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(rawText);
+  } catch {
+    return { name, status: "ok", detail: "config unparseable — skipped (see load row)" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { name, status: "ok", detail: "no memory config to check" };
+  }
+
+  const root = parsed as Record<string, unknown>;
+  // Every raw memory object in the file, labelled by the tier/agent it sits
+  // under so the WARNING names WHERE the dead key lives. `defaults`, each
+  // `profiles.<name>`, and each `agents.<name>` can each carry a `memory:`.
+  const sources: Array<{ label: string; memory: unknown }> = [];
+  const asObj = (v: unknown): Record<string, unknown> | undefined =>
+    typeof v === "object" && v !== null && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : undefined;
+
+  const defaults = asObj(root.defaults);
+  if (defaults?.memory !== undefined) sources.push({ label: "defaults", memory: defaults.memory });
+
+  const profiles = asObj(root.profiles);
+  for (const [pname, pval] of Object.entries(profiles ?? {})) {
+    const p = asObj(pval);
+    if (p?.memory !== undefined) sources.push({ label: `profile ${pname}`, memory: p.memory });
+  }
+
+  const agents = asObj(root.agents);
+  for (const [aname, aval] of Object.entries(agents ?? {})) {
+    const a = asObj(aval);
+    if (a?.memory !== undefined) sources.push({ label: aname, memory: a.memory });
+  }
+
+  const lines: string[] = [];
+  let retiredCount = 0;
+  for (const { label, memory } of sources) {
+    for (const finding of findUnknownMemoryKeys(memory)) {
+      if (finding.replacement) {
+        retiredCount++;
+        lines.push(`${label}: \`${finding.scope}.${finding.key}\` — ${finding.replacement}`);
+      } else {
+        lines.push(
+          `${label}: \`${finding.scope}.${finding.key}\` is not a recognized key — silently ignored`,
+        );
+      }
+    }
+  }
+
+  if (lines.length === 0) {
+    return { name, status: "ok", detail: "all `memory` keys are recognized" };
+  }
+
+  return {
+    name,
+    status: "warn",
+    detail:
+      `${lines.length} unrecognized \`memory\` key(s)` +
+      (retiredCount > 0 ? ` (${retiredCount} removed knob(s))` : "") +
+      ` — silently stripped at parse time, so the line reads as set but does nothing:\n  ` +
+      lines.join("\n  "),
+    fix:
+      "Remove or fix the key(s). A removed knob is gone for good — delete the " +
+      "line; a typo must match a declared key. The recognized keys live on " +
+      "`AgentMemorySchema` (and its `recall`/`retain`) in src/config/schema.ts.",
+  };
 }
 
 /**
