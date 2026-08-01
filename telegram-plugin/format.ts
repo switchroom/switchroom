@@ -839,7 +839,9 @@ function unbold(fragment: string): string {
  *     survive instead of the whole reply going plain). The one exception:
  *     when EVERY block of the message is such a heading there is no body to
  *     preserve contrast against, so the global rule strips them all rather
- *     than leaving a 100%-bold message untouched.
+ *     than leaving a 100%-bold message untouched. A block that is nothing but
+ *     masked code (a bare fence, a lone inline span) does NOT count as body
+ *     for that test — see the note at the call site.
  *   - A list with any non-fully-bolded item is left alone.
  *
  * Code spans/fences are masked (maskCodeRegions) and never counted or
@@ -879,7 +881,23 @@ export function stripExcessBold(
     // no body: exempting all of them leaves a 100%-bold message untouched and
     // unlogged. In that case the exemption is dropped and the whole message is
     // stripped, which is what the ratio rule says.
-    const contentBlocks = blocks.filter((b) => b.trim() !== '')
+    //
+    // "Body" here means VISIBLE (non-code) text, so a block that is nothing but
+    // masked code is skipped rather than counted as body (#4114). Masked code
+    // is invisible to every other measurement in this function — it is stripped
+    // out of `visible` before the ratio is taken — so counting a bare fence as
+    // body would be the one place code influences the bold decision, and it
+    // would do so by RESTORING the exact #4017 symptom: a headings-plus-one-
+    // snippet digest (a very ordinary agent status report) stayed 100% bold
+    // with no onStrip line, because the code block broke `every(...)`. The
+    // contrast a code block provides is real but partial, and it does not make
+    // every remaining visible character being bold the right render.
+    //
+    // Filtering with `stripPlaceholders` (the masker's own "remove EVERY mask"
+    // primitive) rather than a fence-specific test means all mask kinds — the
+    // FENCE and INLINE prefixes today, anything maskCodeRegions adds later —
+    // are handled by construction instead of by enumeration.
+    const contentBlocks = blocks.filter((b) => stripPlaceholders(b).trim() !== '')
     const allHeadings =
       contentBlocks.length > 0 && contentBlocks.every(isPseudoHeadingBlock)
     const rebuilt = blocks.map((block) =>
