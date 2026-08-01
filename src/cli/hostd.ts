@@ -38,6 +38,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { getConfig, withConfigError } from "./helpers.js";
+import { resolveDockerSocketPath } from "../agents/docker-socket.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { checkDowngrade } from "./deploy-version-guard.js";
@@ -173,8 +174,18 @@ export function renderHostdComposeFile(opts: {
    * to mount) → no extra volume line is emitted.
    */
   skillsTarget?: string;
+  /**
+   * Host-side docker socket path to bind (`:ro`) into the docker-socket-proxy
+   * sidecar (#3648). Resolved ONCE from the active docker context so a
+   * relocated / rootless daemon socket is bound at its real path instead of a
+   * dangling `/var/run/docker.sock`. INJECTABLE for tests; when omitted it is
+   * resolved live via `docker context inspect`, falling back to the
+   * conventional default.
+   */
+  dockerSocketPath?: string;
 }): string {
   const { hostHome, imageTag, operatorUid, hostTz, skillsTarget } = opts;
+  const dockerSocketPath = opts.dockerSocketPath ?? resolveDockerSocketPath();
   const skillsMount =
     skillsTarget !== undefined && skillsTarget.length > 0
       ? `\n      # ~/.switchroom/skills is a symlink on this host (typically into a\n      # separate git-tracked config repo). The parent ~/.switchroom bind\n      # above preserves it AS a symlink, so its target dangles inside the\n      # container and \`switchroom apply\` (shelled out by rollout/update from\n      # inside hostd) can't find the bundled-skills pool <skills>/_bundled —\n      # it logs "bundled skills pool dir not found" and skips every agent's\n      # skills. Binding the resolved real target directly forces docker to\n      # follow the symlink host-side at mount time. Same precedent as the\n      # switchroom.yaml mount above; rw to match the ~/.switchroom mount.\n      - ${skillsTarget}:/host-home/.switchroom/skills:rw`
@@ -268,7 +279,9 @@ services:
       # The one raw-socket mount in the whole hostd project. :ro is the
       # tecnativa-recommended mount — the proxy still issues writes over the
       # socket fd; :ro only prevents replacing the socket file itself.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host source resolved from the active docker context (#3648); the
+      # in-container target stays /var/run/docker.sock (where the proxy looks).
+      - ${dockerSocketPath}:/var/run/docker.sock:ro
     networks:
       - default
   hostd:

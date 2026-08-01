@@ -227,6 +227,25 @@ describe("renderHostdComposeFile — docker-socket-proxy sidecar (#1842 / #1400 
     expect(sockIdx).toBeLessThan(hostdIdx);
   });
 
+  it("binds the resolved host socket path when the docker context is non-default (#3648)", () => {
+    // Inject a rootless/relocated socket path — the proxy :ro source must
+    // track the active context, while the in-container target stays
+    // /var/run/docker.sock (where the proxy's docker client looks).
+    const out = renderHostdComposeFile({
+      hostHome: "/home/alice",
+      imageTag: "latest",
+      dockerSocketPath: "/run/user/1000/docker.sock",
+    });
+    expect(out).toContain(
+      "- /run/user/1000/docker.sock:/var/run/docker.sock:ro",
+    );
+    // Exactly one raw-socket bind, still :ro on the proxy.
+    expect(
+      out.split("\n").filter((l) => /^\s*- \S+docker\.sock:\/var\/run\/docker\.sock:/.test(l))
+        .length,
+    ).toBe(1);
+  });
+
   it("points hostd at the proxy over TCP via DOCKER_HOST", () => {
     const out = render();
     expect(out).toContain("DOCKER_HOST: tcp://docker-socket-proxy:2375");
