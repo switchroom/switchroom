@@ -351,7 +351,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-four keys, by name", () => {
+  it("is overridable on exactly these forty-five keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -362,6 +362,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
+      "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
       "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
@@ -713,6 +714,71 @@ describe("HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY (override-only)", () => {
     const perf = { env: { [KEY]: "0.25" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["0.25"]);
+  });
+});
+
+describe("HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT (override-only)", () => {
+  const KEY = "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group", () => {
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: "1" }).get(KEY)).toBe("1");
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: "1" }).get(KEY)).toBe("1");
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — the image's derived default stands",
+    (caps) => {
+      // Override-only means REACHABLE, not changed: a host that sets nothing
+      // keeps the image's derived default (min(2, recall_max_concurrent - 1),
+      // config.py _consolidation_recall_max_concurrent) byte-for-byte. Emitting
+      // a value here would pin every install to a number measured on one, and
+      // an explicit value forfeits the derivation's boot-safety clamp.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    // The outcome that matters. Before this key entered the managed set,
+    // resolveHindsightPerfOverrides dropped it silently: the operator's
+    // hindsight.env line read as durable config in yaml yet never reached the
+    // container, so the background-recall reservation stayed at the image
+    // default and the standing consolidation load under foreground recall
+    // could not be throttled from declarative config at all.
+    const perf = { env: { [KEY]: "1" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get(KEY)).toEqual(["1"]);
+    expect(fromCompose.get(KEY)).toEqual(["1"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // It belongs to no capability group, so a gate-shaped regression that only
+    // emits grouped keys would drop it. Cloud endpoint + no GPU is the
+    // harshest gating case.
+    const perf = { env: { [KEY]: "1" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["1"]);
   });
 });
 
