@@ -127,6 +127,41 @@ describe('retryApiCall retries a real grammy transport failure', () => {
     })
   }
 
+  it('does NOT retry a caller-initiated abort — shutdown must not stall', async () => {
+    const aborted = Object.assign(new Error('The operation was aborted'), {
+      name: 'AbortError',
+      code: 'ABORT_ERR',
+    })
+    const { bot, calls } = makeBot(aborted, 99)
+    const sleeps: number[] = []
+    const retryApiCall = createRetryApiCall({
+      sleep: async (ms: number) => {
+        sleeps.push(ms)
+      },
+    })
+
+    await expect(
+      retryApiCall(() => bot.api.sendMessage(7, 'hi'), { verb: 'sendMessage' }),
+    ).rejects.toBeInstanceOf(HttpError)
+
+    // Terminal on the first attempt, and no backoff was slept.
+    expect(calls.n).toBe(1)
+    expect(sleeps).toEqual([])
+  })
+
+  it('DOES retry a grammy request timeout', async () => {
+    const timedOut = new Error("Request to 'sendMessage' timed out after 500 seconds")
+    const { bot, calls } = makeBot(timedOut, 1)
+    const retryApiCall = createRetryApiCall({ sleep: async () => {} })
+
+    const res = await retryApiCall(() => bot.api.sendMessage(7, 'hi'), {
+      verb: 'sendMessage',
+    })
+
+    expect(res).toMatchObject({ message_id: 42 })
+    expect(calls.n).toBe(2)
+  })
+
   it('gives up after maxRetries when the transport never recovers', async () => {
     const { bot, calls } = makeBot(new TypeError('fetch failed'), 99)
     const retries: string[] = []
@@ -284,6 +319,32 @@ describe('isTransientTransportError keeps the non-retryable classes out', () => 
       )
       expect(isTransientTransportError(err)).toBe(false)
     }
+  })
+
+  it('excludes a caller-initiated abort, but NOT a grammy request timeout', () => {
+    // `bot.stop()` / an explicit AbortSignal aborts the fetch. Retrying that
+    // three times just re-aborts and adds backoff sleeps to shutdown.
+    const aborted = Object.assign(new Error('The operation was aborted'), {
+      name: 'AbortError',
+      code: 'ABORT_ERR',
+    })
+    expect(
+      isTransientTransportError(
+        new HttpError("Network request for 'sendMessage' failed!", aborted),
+      ),
+    ).toBe(false)
+
+    // grammy's OWN timeout is a different object: `createTimeout` rejects the
+    // race with a plain Error BEFORE aborting the controller
+    // (grammy 1.44.0, out/core/client.js:168-178). That IS transient.
+    expect(
+      isTransientTransportError(
+        new HttpError(
+          "Network request for 'sendMessage' failed!",
+          new Error("Request to 'sendMessage' timed out after 500 seconds"),
+        ),
+      ),
+    ).toBe(true)
   })
 
   it('excludes an unrelated programming error', () => {

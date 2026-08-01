@@ -95,6 +95,18 @@ export function isTransientNetworkMessage(msg: string): boolean {
 }
 
 /**
+ * True for a cancellation: `AbortController.abort()` surfaces as a
+ * `DOMException`/`Error` with `name === 'AbortError'` (node also sets
+ * `code === 'ABORT_ERR'`). Checked structurally rather than by `instanceof`
+ * because the shape differs across the fetch implementations grammy can be
+ * handed (undici, node-fetch, a test double).
+ */
+function isAbortError(err: unknown): boolean {
+  const e = err as { name?: unknown; code?: unknown } | null
+  return e?.name === 'AbortError' || e?.code === 'ABORT_ERR'
+}
+
+/**
  * Is `err` a transient TRANSPORT failure the policy should back off and repeat?
  *
  * This is the single classifier the retry loop and `willRetryTelegramFailure`
@@ -132,9 +144,20 @@ export function isTransientTransportError(err: unknown): boolean {
   if (err instanceof GrammyError) return false
   if (isLocalResourceError(err)) return false
   if (err instanceof HttpError) {
-    // grammy stashes the original rejection on `.error`. A local disk failure
-    // during a multipart upload can surface here; it stays non-retryable.
-    return !isLocalResourceError((err as HttpError).error)
+    // grammy stashes the original rejection on `.error`.
+    const inner = (err as HttpError).error
+    // A local disk failure during a multipart upload can surface here; it
+    // stays non-retryable (#2923).
+    if (isLocalResourceError(inner)) return false
+    // A CALLER-initiated cancellation is not a transient failure — retrying it
+    // only re-aborts three times and adds backoff sleeps to shutdown. grammy's
+    // own request TIMEOUT is NOT this case: `createTimeout` rejects the race
+    // with a plain `Error("Request to '<m>' timed out after Ns")` BEFORE it
+    // aborts the controller (grammy 1.44.0, out/core/client.js:168-178), so a
+    // timeout arrives as that Error and remains retryable. An `AbortError`
+    // here means something aborted the signal we were handed (`bot.stop()`).
+    if (isAbortError(inner)) return false
+    return true
   }
   const msg = err instanceof Error ? err.message : String(err ?? '')
   if (isTransientNetworkMessage(msg)) return true
