@@ -2684,7 +2684,16 @@ export const HindsightConfigSchema = z.object({
       "temperature knob, made live by switchroom's reflect-temperature image " +
       "patch; a float, or `none` to omit the kwarg (provider default, " +
       "upstream's accidental pre-patch behaviour); unset means the image's " +
-      "baked default 0.1), plus the " +
+      "baked default 0.1; and " +
+      "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT — the background " +
+      "half of switchroom's recall-admission split (#3660): of the " +
+      "RECALL_MAX_CONCURRENT admission slots, at most this many may be held " +
+      "by background consolidation recalls at once, so foreground per-turn " +
+      "recall always keeps the remainder; must be >= 1 and strictly less " +
+      "than RECALL_MAX_CONCURRENT or the engine refuses to boot; unset " +
+      "means the image's derived default min(2, RECALL_MAX_CONCURRENT - 1); " +
+      "1 biases hard toward the interactive lane while a consolidation " +
+      "backlog drains), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

@@ -1264,6 +1264,37 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *                                                 # genuinely long-running
  * ```
  *
+ * ### `HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT`
+ *
+ * The background half of the switchroom recall-admission split (#3660,
+ * image-side: `memory_engine.py` `_recall_admission`): of the
+ * `HINDSIGHT_API_RECALL_MAX_CONCURRENT` admission slots, at most this many may
+ * be held by BACKGROUND (consolidation) recalls at once. The image derives its
+ * default (`min(2, recall_max_concurrent - 1)`, `config.py
+ * _consolidation_recall_max_concurrent`) and validates an explicit value at
+ * boot (`>= 1`, strictly `< recall_max_concurrent`).
+ *
+ * Adopted override-only, not defaulted, for the same reason as
+ * `HINDSIGHT_API_RETAIN_WALL_TIMEOUT`: the default already lives in the image
+ * where the mechanism lives, and a second copy of that opinion here would be
+ * something to drift. What an operator needs is REACH: on a fleet whose
+ * consolidation backlogs are five-figure, the standing background recall
+ * stream (measured 2026-08-01 on `switchroom-hindsight`: ~45k background
+ * recalls in 11h vs 225 foreground) is the contention floor under every
+ * foreground recall's embedding/SQL/rerank work, and this knob is the only
+ * lever that trades backlog drain rate against that floor without touching
+ * the foreground lane. Before this entry the key fell outside
+ * {@link HINDSIGHT_PERF_ENV_KEYS} and a `hindsight.env` line for it was
+ * silently discarded.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT: 1   # halve the standing
+ *                                                            # background load while
+ *                                                            # a backlog drains
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1288,6 +1319,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
   "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
   "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
+  "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
 ]);
 
 /**
