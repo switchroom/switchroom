@@ -666,7 +666,7 @@ import {
 } from './obligation-ledger.js'
 // (#2996 P8 PR-C2: buildObligationRepresentInbound is now imported by
 // obligation-wiring.ts, where the sweep lives.)
-import { loadObligations, persistObligations } from './obligation-store.js'
+import { loadObligations, persistObligations, removeUnmaintainedSnapshot } from './obligation-store.js'
 import { buildCapturedDeliverySnapshot, createCapturedResumeDispatcher } from './captured-answer-resume.js'
 import {
   loadStatusPins,
@@ -2803,7 +2803,7 @@ const obligationStoreFs = {
   writeFileSync: (p: string, d: string) => writeFileSync(p, d),
   renameSync: (a: string, b: string) => renameSync(a, b),
   existsSync: (p: string) => existsSync(p),
-  fsyncFileSync: fsyncPathSync, fsyncDirSync: fsyncPathSync,
+  fsyncFileSync: fsyncPathSync, fsyncDirSync: fsyncPathSync, unlinkSync,
 }
 const obligationLedger = new ObligationLedger(OBLIGATION_REPRESENT_MAX, {
   onChange:
@@ -2821,7 +2821,7 @@ if (isGatewayMain && !STATIC && OBLIGATION_LEDGER_ENABLED) {
       `telegram gateway: obligation-ledger hydrated ${restored.length} open obligation(s) from ${OBLIGATION_STORE_PATH}\n`,
     )
   }
-}
+} else if (isGatewayMain) removeUnmaintainedSnapshot(OBLIGATION_STORE_PATH, obligationStoreFs, `static=${STATIC} enabled=${OBLIGATION_LEDGER_ENABLED}`) // #4146: persistence is off, so a leftover snapshot must not read as "nobody is waiting" to the W1-d audience classifier (logic in obligation-store.ts)
 // Origin ids with an escalation send IN FLIGHT — prevents the 5s sweep from
 // firing a second concurrent send for the same obligation while the first is
 // still awaiting (an escalation that takes >5s, or repeated failures).

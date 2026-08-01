@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   loadObligations,
   persistObligations,
+  removeUnmaintainedSnapshot,
   type ObligationStoreFsSeam,
 } from "../gateway/obligation-store.js";
 import type { Obligation } from "../gateway/obligation-ledger.js";
@@ -32,6 +33,10 @@ function memFs(seed: Record<string, string> = {}) {
     },
     fsyncDirSync: (p) => {
       calls.push(`fsyncDir:${p}`);
+    },
+    unlinkSync: (p) => {
+      calls.push(`unlink:${p}`);
+      files.delete(p);
     },
   };
   return { fs, files, calls };
@@ -239,5 +244,51 @@ describe("obligation-store — power-cut durability (fsync ordering)", () => {
     expect(logs.join("")).not.toContain("persist FAILED");
     expect(files.has(PATH)).toBe(true);
     expect(loadObligations(PATH, fs)).toHaveLength(1);
+  });
+
+  // ── #4146: a snapshot nobody maintains must not read as "nobody waiting" ──
+
+  it("removeUnmaintainedSnapshot deletes a leftover snapshot and says why", () => {
+    // The exact hazard: the agent once ran with the ledger on, so an EMPTY
+    // open set is on disk. Persistence is now off, so that emptiness is a
+    // leftover — and the W1-d audience classifier would read it as positive
+    // proof that nobody is waiting, and suppress a message owed to a human.
+    const { fs, files } = memFs({ [PATH]: JSON.stringify({ v: 1, obligations: [] }) });
+    const logs: string[] = [];
+    expect(removeUnmaintainedSnapshot(PATH, fs, "static=true enabled=false", (l) => logs.push(l))).toBe(true);
+    expect(files.has(PATH)).toBe(false);
+    // ...and the classifier's precondition now genuinely holds: absent file.
+    expect(fs.existsSync(PATH)).toBe(false);
+    expect(logs.join("")).toContain("static=true enabled=false");
+    expect(logs.join("")).toContain("#4146");
+  });
+
+  it("removeUnmaintainedSnapshot is a no-op when there is nothing to remove", () => {
+    const { fs } = memFs();
+    const logs: string[] = [];
+    expect(removeUnmaintainedSnapshot(PATH, fs, "reason", (l) => logs.push(l))).toBe(false);
+    expect(logs).toEqual([]);
+  });
+
+  it("removeUnmaintainedSnapshot never throws, and reports failure rather than claiming success", () => {
+    // A failure here must degrade to the reader-side ledger-off guard, not
+    // crash gateway boot and not be mistaken for a completed cleanup.
+    const { fs } = memFs({ [PATH]: "{}" });
+    const logs: string[] = [];
+    const failing: ObligationStoreFsSeam = {
+      ...fs,
+      unlinkSync: () => {
+        throw new Error("EACCES: permission denied, unlink");
+      },
+    };
+    expect(removeUnmaintainedSnapshot(PATH, failing, "reason", (l) => logs.push(l))).toBe(false);
+    expect(logs.join("")).toContain("could not remove unmaintained snapshot");
+  });
+
+  it("a seam with no unlinkSync degrades to no cleanup rather than throwing", () => {
+    const { fs, files } = memFs({ [PATH]: "{}" });
+    const { unlinkSync: _dropped, ...legacySeam } = fs;
+    expect(removeUnmaintainedSnapshot(PATH, legacySeam, "reason", () => {})).toBe(false);
+    expect(files.has(PATH)).toBe(true);
   });
 });

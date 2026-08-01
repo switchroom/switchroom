@@ -182,10 +182,18 @@ function classifyCaptureAudience(stateDir, capture) {
   } catch {
     /* unreadable ⇒ null ⇒ 'unknown' ⇒ 'user' (fail-safe toward delivering) */
   }
+  // #4146: with the ledger disabled, obligations are going UNTRACKED and any
+  // file on disk is a leftover, not a fact. Distrust it outright rather than
+  // read a stale empty set as positive proof that nobody is waiting — that is
+  // the one configuration in which the asymmetric default would invert. (The
+  // gateway also unlinks the snapshot at boot in this mode; this is the
+  // reader-side half, covering the window before it does.)
+  const snapshotTrusted = process.env.SWITCHROOM_OBLIGATION_LEDGER !== '0'
   return decideCaptureAudience({
     replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
     openInboundObligation: resolveOpenObligation({
       snapshotRaw,
+      snapshotTrusted,
       // Same chat the sweep will route to: the envelope chat when present,
       // else this session's origin chat (`resolveOutboxChat`'s F2 fallback).
       chatId: capture.chatId ?? capture.originChatId ?? null,
@@ -229,6 +237,13 @@ function writeOutboxRecord(stateDir, capture, audience) {
       // sweep's gate never has to infer. `'user'` is byte-for-byte the
       // pre-change behaviour.
       audience: audience === AUDIENCE_INTERNAL ? AUDIENCE_INTERNAL : 'user',
+      // W1-d follow-up (#4141): the RAW structural signal, persisted alongside
+      // the verdict it fed. `audience` collapses it with the obligation state
+      // and loses it; the sweep needs it on its own to decide provenance
+      // framing for the `'user'` records the audience gate deliberately does
+      // not catch (the foreground case). Stamped here because this is the last
+      // point in the pipeline that can still see the transcript.
+      replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
     }
     const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
     writeFileSync(tmpPath, JSON.stringify(record), 'utf8')
