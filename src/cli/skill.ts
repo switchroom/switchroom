@@ -42,6 +42,7 @@
 
 import { Command } from "commander";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   lstatSync,
@@ -493,6 +494,12 @@ export function writePayload(poolDir: string, name: string, files: FileMap): voi
   }
 
   const staging = mkdtempSync(join(poolDir, `.skill-apply-stage-${name}-`));
+  // mkdtempSync creates staging at 0700 (untraversable by anyone but the
+  // owner), and the nested mkdirSync calls below only set the mode of dirs
+  // they create, not this already-existing root. Without this chmod the
+  // pool skill dir lands 0700 after the rename and can't be traversed by
+  // the operator or other agents sharing the pool (#1862).
+  chmodSync(staging, 0o755);
   let oldRename: string | null = null;
   try {
     // Write files into staging with O_CREAT|O_EXCL ('wx') so any
