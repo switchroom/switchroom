@@ -65,6 +65,8 @@ export type ParsedAuthCommand =
       replace: boolean
       /** Google `--write` (Drive write scope). */
       write: boolean
+      /** Google `--calendar` (read-only Calendar scope). */
+      calendar: boolean
       /** Microsoft `--org-mode`. */
       orgMode: boolean
     }
@@ -251,7 +253,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
  * wired; anything else is a help-with-reason so the operator sees the shape.
  *
  * Flags mirror the CLI:
- *   google:    `add <email> [--replace] [--write]`
+ *   google:    `add <email> [--replace] [--write] [--calendar]`
  *   microsoft: `add <email> [--replace] [--org-mode]`
  */
 export function parseProviderVerb(
@@ -265,7 +267,7 @@ export function parseProviderVerb(
   if (sub !== 'add') {
     const usage =
       provider === 'google'
-        ? 'Usage: /auth google add <email> [--replace] [--write]'
+        ? 'Usage: /auth google add <email> [--replace] [--write] [--calendar]'
         : 'Usage: /auth microsoft add <email> [--replace] [--org-mode]'
     return {
       kind: 'help',
@@ -280,7 +282,7 @@ export function parseProviderVerb(
   if (!email) {
     const usage =
       provider === 'google'
-        ? 'Usage: /auth google add <email> [--replace] [--write]'
+        ? 'Usage: /auth google add <email> [--replace] [--write] [--calendar]'
         : 'Usage: /auth microsoft add <email> [--replace] [--org-mode]'
     return { kind: 'help', reason: usage }
   }
@@ -288,7 +290,7 @@ export function parseProviderVerb(
   if (emailErr) return { kind: 'help', reason: emailErr }
   // Reject unknown flags so a typo (`--replaced`) isn't silently dropped.
   const allowed = provider === 'google'
-    ? new Set(['--replace', '--write'])
+    ? new Set(['--replace', '--write', '--calendar'])
     : new Set(['--replace', '--org-mode'])
   for (const f of flags) {
     if (!allowed.has(f)) {
@@ -304,6 +306,7 @@ export function parseProviderVerb(
     email,
     replace: flags.has('--replace'),
     write: provider === 'google' && flags.has('--write'),
+    calendar: provider === 'google' && flags.has('--calendar'),
     orgMode: provider === 'microsoft' && flags.has('--org-mode'),
   }
 }

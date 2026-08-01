@@ -22,9 +22,14 @@ import {
   findMissingWorkspaceScopes,
   requiredWorkspaceScopesForTier,
   resolveCredentialsDir,
+  seedOptInCapabilities,
+  CALENDAR_READONLY_SCOPE,
   sanitizeToolsListMessage,
 } from "./drive-mcp-launcher.js";
-import { workspaceScopesForTier } from "./drive.js";
+import {
+  GOOGLE_CALENDAR_READONLY_SCOPE,
+  workspaceScopesForTier,
+} from "./drive.js";
 import { GOOGLE_WORKSPACE_MCP_PINNED_SHA } from "../memory/scaffold-integration.js";
 
 describe("buildSeedCredentials — exact upstream shape", () => {
@@ -325,16 +330,56 @@ describe("findMissingWorkspaceScopes — scope↔tier preflight (#1663)", () => 
   });
 });
 
+describe("seedOptInCapabilities — opt-in flags read off the seed token", () => {
+  const DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";
+  const CAL = "https://www.googleapis.com/auth/calendar.readonly";
+
+  it("mirrors GOOGLE_CALENDAR_READONLY_SCOPE from drive.ts (no drift)", () => {
+    expect(CALENDAR_READONLY_SCOPE).toBe(GOOGLE_CALENDAR_READONLY_SCOPE);
+  });
+
+  it("read-only Drive seed → neither capability", () => {
+    expect(
+      seedOptInCapabilities("https://www.googleapis.com/auth/drive.readonly"),
+    ).toEqual({ write: false, calendar: false });
+  });
+
+  it("detects drive.file and calendar.readonly independently", () => {
+    expect(seedOptInCapabilities(DRIVE_FILE)).toEqual({
+      write: true,
+      calendar: false,
+    });
+    expect(seedOptInCapabilities(CAL)).toEqual({
+      write: false,
+      calendar: true,
+    });
+    expect(seedOptInCapabilities(`${DRIVE_FILE} ${CAL}`)).toEqual({
+      write: true,
+      calendar: true,
+    });
+  });
+
+  it("does NOT treat a Calendar WRITE scope as calendar read capability", () => {
+    // switchroom never mints these; if one ever appears the warning must
+    // not print `--calendar` as though it round-trips (it wouldn't).
+    expect(
+      seedOptInCapabilities("https://www.googleapis.com/auth/calendar"),
+    ).toEqual({ write: false, calendar: false });
+  });
+});
+
 describe("buildMissingScopeWarning — actionable re-mint guidance (#1663)", () => {
   const DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";
+  const CAL = "https://www.googleapis.com/auth/calendar.readonly";
   const PRESENTATIONS = "https://www.googleapis.com/auth/presentations";
+  const NONE = { write: false, calendar: false };
 
   it("names the account, the tier, and the exact recovery command", () => {
     const msg = buildMissingScopeWarning(
       [PRESENTATIONS],
       "extended",
       "you@example.com",
-      false,
+      NONE,
     );
     expect(msg).toContain("you@example.com");
     expect(msg).toContain("extended");
@@ -355,7 +400,12 @@ describe("buildMissingScopeWarning — actionable re-mint guidance (#1663)", () 
       "https://www.googleapis.com/auth/spreadsheets",
     ]);
     expect(missing).not.toContain(DRIVE_FILE);
-    const msg = buildMissingScopeWarning(missing, "core", "a@b.com", true);
+    const msg = buildMissingScopeWarning(
+      missing,
+      "core",
+      "a@b.com",
+      seedOptInCapabilities(DRIVE_FILE),
+    );
     expect(msg).toContain("--replace --write");
   });
 
@@ -364,9 +414,46 @@ describe("buildMissingScopeWarning — actionable re-mint guidance (#1663)", () 
     // the re-minted token stays read-only and capability isn't widened
     // beyond what the operator originally consented to.
     const missing = findMissingWorkspaceScopes("", "core");
-    const msg = buildMissingScopeWarning(missing, "core", "a@b.com", false);
+    const msg = buildMissingScopeWarning(missing, "core", "a@b.com", NONE);
     expect(msg).toContain("--replace\n");
     expect(msg).not.toContain("--write");
+  });
+
+  it("appends --calendar when the EXISTING token already carries calendar.readonly", () => {
+    // Same downgrade hazard as --write: calendar.readonly is never in
+    // `missing` (no tier requires it), so running the printed command
+    // without --calendar would silently revoke Calendar read.
+    const missing = findMissingWorkspaceScopes(CAL, "core");
+    expect(missing).not.toContain(CAL);
+    const msg = buildMissingScopeWarning(
+      missing,
+      "core",
+      "a@b.com",
+      seedOptInCapabilities(CAL),
+    );
+    expect(msg).toContain("--replace --calendar");
+    expect(msg).toContain("Calendar read capability");
+  });
+
+  it("omits --calendar for a token without the calendar scope", () => {
+    const missing = findMissingWorkspaceScopes(DRIVE_FILE, "core");
+    const msg = buildMissingScopeWarning(
+      missing,
+      "core",
+      "a@b.com",
+      seedOptInCapabilities(DRIVE_FILE),
+    );
+    expect(msg).not.toContain("--calendar");
+  });
+
+  it("carries BOTH opt-ins forward, in flag order", () => {
+    const msg = buildMissingScopeWarning(
+      [PRESENTATIONS],
+      "extended",
+      "a@b.com",
+      seedOptInCapabilities(`${DRIVE_FILE} ${CAL}`),
+    );
+    expect(msg).toContain("--replace --write --calendar");
   });
 });
 
