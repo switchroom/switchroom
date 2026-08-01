@@ -36,8 +36,11 @@ const CHAT = '5550001'
 
 type WireCall = { method: string; payload: Record<string, unknown> }
 
-/** Scripted Telegram error for one wire method (fires once, then succeeds). */
-type ScriptedError = { method: string; description: string }
+/** Scripted Telegram error for one wire method. Fires `times` times (default 1),
+ *  then that method succeeds. `times` matters for the body-error cases: a real
+ *  unparseable body fails EVERY time it is re-sent to the same method, so a
+ *  fire-once script would let a wrong fallback branch pass by accident. */
+type ScriptedError = { method: string; description: string; times?: number }
 
 /** A REAL grammy Bot whose HTTP client is an injected fetch — every call is
  *  captured as the JSON body grammy actually serialized for the Bot API. */
@@ -54,7 +57,10 @@ function makeWireBot(opts: { errors?: ScriptedError[] } = {}) {
     calls.push({ method, payload })
     const scripted = errors.findIndex((e) => e.method === method)
     if (scripted >= 0) {
-      const [err] = errors.splice(scripted, 1)
+      const err = errors[scripted]
+      const remaining = (err.times ?? 1) - 1
+      if (remaining > 0) errors[scripted] = { ...err, times: remaining }
+      else errors.splice(scripted, 1)
       return new Response(
         JSON.stringify({ ok: false, error_code: 400, description: err.description }),
         { status: 400, headers: { 'content-type': 'application/json' } },
@@ -285,6 +291,52 @@ describe('quote_text lands on the wire as ReplyParameters.quote (a String)', () 
     expect(res.content[0]?.text ?? '').toMatch(/sent/i)
   })
 
+  // A `<blockquote>` parse failure is a BODY error whose description happens to
+  // contain the substring "quote". If the quote classifier claims it, the ladder
+  // takes the quote branch, re-sends the SAME unparseable body without the
+  // quote, hits the same 400 with no secondary handling, and throws — so the
+  // pre-existing plain-text rescue never runs and the composed answer is lost.
+  // This is an outcome test on purpose: asserting the classifier returns false
+  // in isolation would not have caught it, because the loss happens in the
+  // ladder, not in the predicate.
+  for (const description of [
+    'Bad Request: can\'t parse entities: Can\'t find end tag corresponding to start tag "blockquote"',
+    'Bad Request: can\'t parse entities: Unsupported start tag "blockquote"',
+  ]) {
+    it(`a blockquote parse error on a QUOTED reply still reaches the plain-text rescue (${description.slice(-24)})`, async () => {
+      const h = makeHarness({
+        // Fails every time it is attempted — a body Telegram cannot parse does
+        // not start parsing on the second try.
+        errors: [{ method: 'sendRichMessage', description, times: 5 }],
+      })
+
+      const res = await sendReply(h.deps, {
+        args: {
+          chat_id: CHAT,
+          text: 'The answer must survive a blockquote parse error.',
+          reply_to: 4242,
+          quote_text: 'a real substring of the original',
+        },
+        turn: null,
+      })
+
+      const sends = h.sends()
+      // The rich attempt failed; the rescue must have gone out over a DIFFERENT
+      // method (plain text, no rich wrapper ⇒ the entity parser never runs).
+      const rescue = sends.filter((c) => c.method !== 'sendRichMessage')
+      expect(rescue.length).toBeGreaterThan(0)
+      // The answer actually landed, with its body intact.
+      expect(String(rescue[0].payload.text ?? '')).toContain(
+        'The answer must survive a blockquote parse error.',
+      )
+      expect(res.content[0]?.text ?? '').toMatch(/sent/i)
+      // And the quote branch was never taken: no second rich send stripped of
+      // the quote (that path is what swallowed the answer).
+      const richSends = sends.filter((c) => c.method === 'sendRichMessage')
+      expect(richSends.length).toBe(1)
+    })
+  }
+
   it('omits quote entirely when quote_text is absent (plain reply unchanged)', async () => {
     const h = makeHarness()
     await sendReply(h.deps, {
@@ -354,5 +406,28 @@ describe('quote_text lands on the wire as ReplyParameters.quote (a String)', () 
     const rp = h.replyParams(h.sends()[0])!
     expect((rp.quote as string).length).toBe(1024)
     expect(long.startsWith(rp.quote as string)).toBe(true)
+  })
+
+  it('never cuts an astral character in half at the 1024 boundary', async () => {
+    const h = makeHarness()
+    // '𝄞' is one astral char = TWO UTF-16 units. 1023 filler units put its high
+    // surrogate at index 1023 and its low surrogate at 1024, so a naive
+    // slice(0, 1024) would emit a LONE HIGH SURROGATE — not valid UTF-8 on the
+    // wire, and no longer a substring of anything.
+    const long = 'x'.repeat(1023) + '𝄞' + 'y'.repeat(200)
+    await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: 'ok', reply_to: 5, quote_text: long },
+      turn: null,
+    })
+    const quote = h.replyParams(h.sends()[0])!.quote as string
+    // Cut back to 1023 rather than splitting the pair …
+    expect(quote.length).toBe(1023)
+    // … so no unpaired surrogate survives …
+    for (const ch of quote) expect(ch.codePointAt(0)! >= 0xd800 && ch.codePointAt(0)! <= 0xdfff).toBe(false)
+    // … and it round-trips through UTF-8 unchanged (a lone surrogate would be
+    // replaced by U+FFFD here).
+    expect(Buffer.from(quote, 'utf8').toString('utf8')).toBe(quote)
+    // … and it is still an exact prefix of the original.
+    expect(long.startsWith(quote)).toBe(true)
   })
 })

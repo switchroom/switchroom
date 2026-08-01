@@ -50,6 +50,8 @@
 
 import { GrammyError } from 'grammy'
 
+import { isHtmlParseRejectError, isMessageTooLongError } from './retry-api-call.js'
+
 /** Bot API cap: `quote` is 0-1024 characters after entities parsing. */
 export const QUOTE_MAX_CHARS = 1024
 
@@ -99,14 +101,27 @@ export function buildReplyParameters(
  * True when Telegram rejected the send because of the QUOTE, not the body.
  *
  * Covers the "quote isn't in the original message" family (the documented
- * failure mode) and any other 400 naming the quote — deliberately matched on
- * the word rather than one exact phrase, because the Bot API's wording for this
- * class has changed before (`QUOTE_TEXT_INVALID` vs the prose form) and a
- * missed match costs the whole answer, while a false positive costs only a
- * harmless retry without the quote.
+ * failure mode) and any other 400 naming the quote — matched on the word rather
+ * than one exact phrase, because the Bot API's wording for this class has
+ * changed before (`QUOTE_TEXT_INVALID` vs the prose form) and a missed match
+ * costs the whole answer.
+ *
+ * A BODY error must never be claimed here, though, and the word alone is not
+ * enough to tell them apart: `<blockquote>` in a rich body produces
+ * `can't parse entities: Can't find end tag corresponding to start tag
+ * "blockquote"` / `Unsupported start tag "blockquote"` — 400s that contain the
+ * substring "quote" but are PARSE failures. Claiming one would drop the quote
+ * and resend the same unparseable body, hit the same 400, and throw straight
+ * out of the caller's fallback ladder — losing the answer that the plain-text
+ * rescue would otherwise have delivered. So defer to the body classifiers
+ * first, exactly as `isHtmlParseRejectError` defers to `isMessageTooLongError`
+ * (retry-api-call.ts) for the same reason. No false negative results: the real
+ * quote rejections (`QUOTE_TEXT_INVALID`, "message quote not found") contain
+ * neither a parse phrase nor a length phrase.
  */
 export function isQuoteRejectionError(err: unknown): boolean {
   if (!(err instanceof GrammyError) || err.error_code !== 400) return false
+  if (isHtmlParseRejectError(err) || isMessageTooLongError(err)) return false
   return (err.description || '').toLowerCase().includes('quote')
 }
 
