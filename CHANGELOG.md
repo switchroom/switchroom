@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.19.43 — hindsight 0.8.6, Telegram delivery honesty, and live `thinking_effort`
 
 ### Hindsight base image v0.8.5 → v0.8.6, and two patch blocks retired into config
 
@@ -56,6 +56,62 @@ metadata-only revision (`c7d1e9a4b3f2`, measured 5.5 ms), and unlike the
 0.8.4→0.8.5 bump a rollback to 0.8.5 is a digest repoint alone — see
 `docs/operators/hindsight-memory.md`, which spells out why that is true of this
 revision specifically and must not be generalised.
+
+### Also in this release
+
+**Telegram delivery and cards**
+
+- Transport failures are classified by type, so a network blip actually
+  retries instead of being treated as a permanent send failure (#4123, #4126).
+- A retried-and-delivered reply no longer escalates as if it had failed; the
+  dead `robustApiCall` factory is deleted (#3931, #3863, #4044, #4113).
+- The outbox tags every captured message with its audience and refuses to
+  deliver internal prose to the user (#4140), and a reply-throw capture now
+  states its provenance rather than being passed off as the answer
+  (#4141, #4146, #4148).
+- Long answers stop failing to send, and the outbox sweep can no longer
+  double-run (#4109).
+- Bold headings render as written (#4017, #4021, #4108); a code-only block is
+  no longer counted as body by the all-heading bold guard (#4124); one nested
+  indent idiom, and the last-resort card clip can no longer emit broken
+  markdown (#4115, #4116, #4131).
+- `reply_parameters.quote` is sent as a String, not an object (#4139).
+- A status card can never blow its size limit, and nested lines look nested
+  (#3833, #3668, #4111).
+- Deterministic recovery for orphaned handbacks, closing the #4027
+  delivered-window race (#4104).
+
+**Memory**
+
+- Honest MCP recall budget and grounded reflect synthesis (#4125).
+- `HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY` is reachable from
+  `switchroom.yaml` (#4112).
+
+**Agents and config**
+
+- `thinking_effort` resolves live from `switchroom.yaml` at boot instead of
+  being baked at apply time (#4105).
+- The docker socket path is resolved and the network default is
+  platform-gated (#3648, #3637, #4092).
+- `switchroom doctor` gains prompt-cascade drift probes for all lanes
+  (#1858, #4091).
+
+**hostd**
+
+- A rollout always ends on a truthful card, not a frozen one (#4110).
+- Rollout warnings surface end-to-end in `get_status` and the terminal card
+  (#3944, #4093).
+
+**LiteLLM**
+
+- The pacer concurrency lease is released on the passthrough path (#3549,
+  #4107).
+
+**Tests**
+
+- The context7 trust assertion is keyed by the agent's own project path, so
+  it no longer depends on the host's Claude Code onboarding history (#4106,
+  #4158).
 
 ## v0.19.42 — Memory-system reliability: config single-sourcing, honest health gauges, and total-loss self-heal
 
