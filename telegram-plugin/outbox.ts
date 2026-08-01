@@ -65,6 +65,13 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+// W1-d (#3865). The audience vocabulary and its resolution rule live in ONE
+// shared pure module because the unbundled Stop hooks (which stamp it) and this
+// bundled gateway code (which persists and enforces it) must agree exactly. A
+// hand-synced second copy here would be a leak waiting on a drift.
+import type { Audience } from './hooks/audience-classify.mjs'
+
+export type { Audience }
 
 /** One captured, not-yet-delivered final message for a single main-session turn. */
 export interface OutboxRecord {
@@ -113,6 +120,23 @@ export interface OutboxRecord {
    * or in a sweep journal entry — is direct evidence of a regression.
    */
   replyAlreadyDeliveredThisTurn?: boolean
+  /**
+   * W1-d (#3865): WHO this text is addressed to, decided at capture time by
+   * `hooks/audience-classify.mjs` (`decideCaptureAudience`) — the only point in
+   * the pipeline that can still see the turn that produced it.
+   *
+   * `'internal'` means the text is the agent's own working notes (the #3861
+   * shape: the reply tool threw, nobody was waiting, and the structurally-
+   * selected terminal prose run is orchestration narration rather than an
+   * answer). Such a record is journaled and inspectable but MUST NEVER reach a
+   * chat — the sweep drops it at entry selection.
+   *
+   * OPTIONAL for legacy reasons: every record written before this field
+   * existed has no `audience`, and `resolveRecordAudience` maps missing (and
+   * any non-`'internal'` value) to `'user'`. Suppression requires an
+   * affirmative tag; absence is never evidence.
+   */
+  audience?: Audience
 }
 
 /** One line of the delivered-keys journal (`outbox/delivered.jsonl`). */
@@ -131,6 +155,19 @@ export interface DeliveredEntry {
   deliverySource?: 'sweep' | 'reply-tool' | 'flush'
   /** #3510 instrumentation: see `OutboxRecord.replyAlreadyDeliveredThisTurn`. */
   replyAlreadyDeliveredThisTurn?: boolean
+  /** W1-d (#3865): the record's audience, carried onto the journal line. */
+  audience?: Audience
+  /**
+   * W1-d (#3865): this journal line is a TERMINAL SUPPRESSION, not a delivery.
+   * The sweep withheld an `'internal'` record from the chat and wrote this line
+   * so the nonce is terminally claimed (a second tick sends nothing) and the
+   * decision is durably auditable.
+   *
+   * This is what keeps suppression honest: the outcome is recorded as an
+   * explicit, named state rather than as an absence. `tgMessageId` is absent on
+   * these lines because nothing was sent.
+   */
+  suppressedAudience?: Audience
 }
 
 export function sha256Hex(s: string): string {
