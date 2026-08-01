@@ -38,7 +38,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { getConfig, withConfigError } from "./helpers.js";
-import { resolveDockerSocketPath } from "../agents/docker-socket.js";
+import { resolveDockerSocketPath, DEFAULT_DOCKER_SOCKET_PATH } from "../agents/docker-socket.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { checkDowngrade } from "./deploy-version-guard.js";
@@ -185,7 +185,11 @@ export function renderHostdComposeFile(opts: {
   dockerSocketPath?: string;
 }): string {
   const { hostHome, imageTag, operatorUid, hostTz, skillsTarget } = opts;
-  const dockerSocketPath = opts.dockerSocketPath ?? resolveDockerSocketPath();
+  // KEPT PURE: default to the conventional socket constant rather than
+  // shelling out to `docker context inspect` here, so this renderer stays
+  // hermetic in tests. Live resolution happens at the install call site
+  // below and is injected via `opts.dockerSocketPath` (#3648).
+  const dockerSocketPath = opts.dockerSocketPath ?? DEFAULT_DOCKER_SOCKET_PATH;
   const skillsMount =
     skillsTarget !== undefined && skillsTarget.length > 0
       ? `\n      # ~/.switchroom/skills is a symlink on this host (typically into a\n      # separate git-tracked config repo). The parent ~/.switchroom bind\n      # above preserves it AS a symlink, so its target dangles inside the\n      # container and \`switchroom apply\` (shelled out by rollout/update from\n      # inside hostd) can't find the bundled-skills pool <skills>/_bundled —\n      # it logs "bundled skills pool dir not found" and skips every agent's\n      # skills. Binding the resolved real target directly forces docker to\n      # follow the symlink host-side at mount time. Same precedent as the\n      # switchroom.yaml mount above; rw to match the ~/.switchroom mount.\n      - ${skillsTarget}:/host-home/.switchroom/skills:rw`
@@ -660,6 +664,10 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
     // so the bundled-skills pool is reachable to rollout/update. Undefined
     // (real dir / absent / dangling) → no extra mount emitted.
     skillsTarget: resolveHostdSkillsTarget(hostHome),
+    // Resolve the host docker socket LIVE here (running on the host, where
+    // `docker context inspect` is meaningful) and inject it — keeps
+    // renderHostdComposeFile pure/hermetic (#3648).
+    dockerSocketPath: resolveDockerSocketPath(),
   });
 
   if (opts.dryRun) {

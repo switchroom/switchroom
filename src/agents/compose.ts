@@ -32,10 +32,7 @@ import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync, chmodSync
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { isValidTimezone } from "../config/schema.js";
-import {
-  resolveDockerSocketPath,
-  DEFAULT_DOCKER_SOCKET_PATH,
-} from "./docker-socket.js";
+import { DEFAULT_DOCKER_SOCKET_PATH } from "./docker-socket.js";
 
 /**
  * In-container filesystem roots that are NEVER a valid HOST home. The
@@ -1966,16 +1963,14 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
     );
   }
 
-  // #3648: resolve the host docker socket path ONCE, up front. Only
-  // `root: true` agents bind it, so skip the (shelling-out) `docker
-  // context inspect` probe entirely when the fleet has none — keeps the
-  // pure-compose test path IO-free and matches the injectable-with-live-
-  // default pattern used for voiceEngine above.
-  const dockerSocketPath =
-    opts.dockerSocketPath ??
-    (describeAgents(config, opts.litellmConfirmedAgents).some((a) => a.root === true)
-      ? resolveDockerSocketPath()
-      : DEFAULT_DOCKER_SOCKET_PATH);
+  // #3648: the host docker socket path a `root: true` agent binds `:rw`.
+  // KEPT PURE: this generator never shells out — it defaults to the
+  // conventional socket constant and relies on the caller to inject the
+  // context-resolved path. Live resolution (`docker context inspect`)
+  // happens ONLY at the imperative CLI seams (computeComposeContent,
+  // bringUpAgentService), so the compose-generator test path stays
+  // hermetic regardless of the host's active docker context (#3648).
+  const dockerSocketPath = opts.dockerSocketPath ?? DEFAULT_DOCKER_SOCKET_PATH;
 
   // ── per-agent services ─────────────────────────────────────────────
   for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {

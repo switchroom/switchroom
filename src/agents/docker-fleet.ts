@@ -21,6 +21,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { generateCompose } from "./compose.js";
+import { resolveDockerSocketPath } from "./docker-socket.js";
 import { composeEnvFileArgs } from "./compose-env.js";
 import { findConfigFile } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
@@ -56,6 +57,13 @@ export interface BringUpAgentServiceOpts {
   switchroomConfigPath?: string;
   /** Override compose generator (tests inject a pre-built YAML). */
   generateComposeContent?: () => string;
+  /**
+   * Host docker socket path threaded into generateCompose for a `root: true`
+   * agent's `:rw` bind (#3648). Injectable so tests stay hermetic; when
+   * omitted it is resolved LIVE from the active docker context at this
+   * imperative seam (not inside the pure generator).
+   */
+  dockerSocketPath?: string;
   /** Override docker binary path (tests). */
   dockerBin?: string;
   /** Inherit/inherit-pipe stdio. Defaults to `inherit`. */
@@ -123,6 +131,9 @@ export function bringUpAgentService(
       config: opts.config,
       homeDir: homedir(),
       switchroomConfigPath,
+      // #3648: keep generateCompose pure — resolve the host docker socket
+      // path LIVE here (or take the injected test value) and thread it in.
+      dockerSocketPath: opts.dockerSocketPath ?? resolveDockerSocketPath(),
     });
   const composePath = resolve(composeDir, "docker-compose.yml");
   // 0o600 matches `switchroom apply` — compose can contain references to

@@ -23,6 +23,10 @@ vi.mock("node:child_process", async () => {
   return {
     ...actual,
     execFileSync: vi.fn(),
+    // resolveDockerSocketPath (#3648) shells out via spawnSync when a call
+    // omits dockerSocketPath; stub it so no test ever spawns real docker
+    // and the fallback is deterministic (status:1 → DEFAULT socket path).
+    spawnSync: vi.fn(() => ({ status: 1, stdout: "" })),
   };
 });
 
@@ -74,6 +78,9 @@ describe("bringUpAgentService", () => {
       agentName: "bot",
       switchroomHome: home,
       switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
+      // Inject so the live `docker context inspect` probe is never spawned
+      // — keeps this unit test hermetic (#3648).
+      dockerSocketPath: "/var/run/docker.sock",
       stdio: "ignore",
     });
 
@@ -81,6 +88,7 @@ describe("bringUpAgentService", () => {
       config: STUB_CONFIG,
       homeDir: homedir(),
       switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
+      dockerSocketPath: "/var/run/docker.sock",
     });
   });
 
