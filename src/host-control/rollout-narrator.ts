@@ -108,15 +108,45 @@ export interface RolloutNarrationRelay {
     text: string;
   }): Promise<number | null>;
   /**
-   * Edit a previously-posted message in place. Fire-and-forget: MUST NOT throw
-   * and MUST NOT surface an edit failure (incl. 429) back to the caller.
+   * Edit a previously-posted message in place. Fire-and-forget toward the ROLL
+   * (never awaited by it) and MUST NOT throw or reject: an edit failure is
+   * REPORTED, never propagated. #4065 — the resolved outcome is what lets the
+   * narrator notice it is editing a card that no longer exists.
    */
   edit(args: {
     requestId: string;
     agentName: string;
     messageId: number;
     text: string;
-  }): void;
+  }): Promise<RolloutEditOutcome>;
+}
+
+/**
+ * #4065 — the outcome of ONE relayed edit. `gone` is the only class that
+ * justifies a re-post: it means the target message no longer exists, so the
+ * operator currently has NO live card. A transient failure (429 past the
+ * gateway's retries, a socket blip, an unwired/old gateway that never replies)
+ * leaves a perfectly good card in the chat, and re-posting would duplicate it.
+ */
+export type RolloutEditOutcome =
+  | { ok: true }
+  | { ok: false; gone: boolean; reason?: string };
+
+/**
+ * #4065 — emitted (NEVER to chat) when the rollout card cannot be kept alive:
+ * the seeded/held message_id is gone AND the one allowed re-post did not land.
+ * Follows the PR #4104 rule — an internal failure escalates to telemetry, not
+ * to a card asking the operator to do something. The durable rollout rows
+ * (`get_status`) remain the record either way.
+ */
+export interface RolloutCardEscalation {
+  requestId: string;
+  agentName: string;
+  /** The message_id that was found to be gone. */
+  staleMessageId: number;
+  /** Why the card could not be restored. */
+  reason: "repost-failed" | "repost-unavailable" | "gone-again";
+  detail?: string;
 }
 
 /** Debounce window (trailing edge) for edits — long enough that a fast
@@ -171,6 +201,19 @@ interface NarrationState {
   timer: ReturnType<typeof setTimeout> | null;
   /** Phases buffered before the first post's message_id arrived. */
   pendingEditAfterPost: boolean;
+  /**
+   * #4065 — ONE-SHOT latch: true once a `gone` edit outcome has already been
+   * answered with a re-post for this request. A second `gone` escalates to
+   * telemetry instead of posting again, so a chat can never be spammed and the
+   * edit→gone→post→gone loop cannot run.
+   */
+  goneRepostUsed: boolean;
+  /**
+   * #4065 — the message_id that was found gone, held while the compensating
+   * re-post is in flight so a null-resolving post escalates with the right id.
+   * Null when no re-post is pending.
+   */
+  goneRepostForMessageId: number | null;
 }
 
 /**
@@ -194,6 +237,12 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
        * a post-self-bump resume EDIT the same card instead of re-posting.
        */
       onMessageId?: (requestId: string, messageId: number) => void;
+      /**
+       * #4065 — telemetry sink for "the operator's rollout card is gone and we
+       * could not restore it". NEVER a chat surface (PR #4104's rule). Defaults
+       * to a structured, greppable line through `log`.
+       */
+      escalate?: (escalation: RolloutCardEscalation) => void;
     } = {},
   ) {}
 
@@ -605,7 +654,99 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       frozen: false,
       timer: null,
       pendingEditAfterPost: false,
+      goneRepostUsed: false,
+      goneRepostForMessageId: null,
     };
+  }
+
+  /**
+   * #4065 — escalate to telemetry. Structured + greppable by default; an
+   * injected sink (hostd's stderr writer, or a test) takes precedence. A
+   * throwing sink must never break narration.
+   */
+  private escalateCard(esc: RolloutCardEscalation): void {
+    try {
+      if (this.opts.escalate) {
+        this.opts.escalate(esc);
+        return;
+      }
+      this.opts.log?.(
+        `rollout card escalation request=${esc.requestId} agent=${esc.agentName} ` +
+          `staleMessageId=${esc.staleMessageId} reason=${esc.reason}` +
+          `${esc.detail !== undefined ? ` detail=${esc.detail}` : ""} ` +
+          `— card could not be restored, no operator card issued (get_status remains the record)`,
+      );
+    } catch {
+      /* a throwing telemetry sink must not break narration */
+    }
+  }
+
+  /**
+   * #4065 — the edit-failure policy: ONE re-post, then telemetry.
+   *
+   * Only a `gone` outcome (the target message no longer exists) may re-post —
+   * a transient failure leaves a live card that a re-post would duplicate. The
+   * re-post is gated by a per-request one-shot latch AND by tryPost's existing
+   * MAX_POST_ATTEMPTS cap, so the loop edit→gone→post→gone terminates in
+   * telemetry rather than in a second card.
+   *
+   * Shaped to be absorbed by the general CardHandle edit policy (design D5)
+   * without changing behaviour: identity (requestId) + the id the outcome
+   * refers to + one re-post + telemetry.
+   */
+  private onEditOutcome(
+    requestId: string,
+    editedMessageId: number,
+    outcome: RolloutEditOutcome,
+  ): void {
+    if (outcome.ok) return;
+    const st = this.states.get(requestId);
+    if (!st) return;
+    if (!outcome.gone) {
+      // Transient: the card is (almost certainly) still there. Same behaviour
+      // as before #4065 — log and let the next phase's edit try again.
+      this.opts.log?.(
+        `rollout narration edit failed (transient, requestId=${requestId}): ${outcome.reason ?? "unknown"}`,
+      );
+      return;
+    }
+    // Stale outcome for a card we have already replaced — ignore, or we would
+    // spend the re-post twice for one loss.
+    if (st.messageId !== editedMessageId) return;
+    if (st.goneRepostUsed) {
+      this.escalateCard({
+        requestId,
+        agentName: st.agentName,
+        staleMessageId: editedMessageId,
+        reason: "gone-again",
+        detail: outcome.reason,
+      });
+      return;
+    }
+    st.goneRepostUsed = true;
+    st.messageId = null;
+    st.postFailed = false;
+    st.goneRepostForMessageId = editedMessageId;
+    if (st.timer) {
+      clearTimeout(st.timer);
+      st.timer = null;
+    }
+    this.opts.log?.(
+      `rollout narration card ${editedMessageId} is gone (requestId=${requestId}); re-posting once`,
+    );
+    // terminal=true: this is the reserved attempt — a roll that already froze
+    // still owes the operator its ✅/❌, and st.render carries that terminal
+    // body, so the re-post lands the truthful final card.
+    if (!this.tryPost(requestId, /* terminal */ true)) {
+      st.goneRepostForMessageId = null;
+      this.escalateCard({
+        requestId,
+        agentName: st.agentName,
+        staleMessageId: editedMessageId,
+        reason: "repost-unavailable",
+        detail: "post-attempt cap reached",
+      });
+    }
   }
 
   private ensureState(entry: StatusEntry): NarrationState {
@@ -708,10 +849,25 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
           this.opts.log?.(
             `rollout narration post returned no message_id (requestId=${requestId}); backing off re-posts`,
           );
+          // #4065 — this post WAS the one compensating re-post for a card that
+          // is gone. It didn't land, so the operator has no card at all: that
+          // is telemetry, not another post and not a chat card.
+          if (st.goneRepostForMessageId !== null) {
+            const stale = st.goneRepostForMessageId;
+            st.goneRepostForMessageId = null;
+            this.escalateCard({
+              requestId,
+              agentName: st.agentName,
+              staleMessageId: stale,
+              reason: "repost-failed",
+              detail: "post returned no message_id",
+            });
+          }
           return;
         }
         st.messageId = mid;
         st.postFailed = false;
+        st.goneRepostForMessageId = null;
         // Surface the learned id so it can be persisted for a post-self-bump
         // resume (best-effort; a throwing sink must not break narration).
         try {
@@ -731,6 +887,20 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         st.posting = false;
         st.postFailed = true;
         this.opts.log?.(`rollout narration post failed (non-fatal): ${(e as Error).message}`);
+        // Same as the null resolution: a failed compensating re-post means no
+        // card at all → telemetry (#4065). The relay contract says post never
+        // throws; this keeps the guarantee if one ever does.
+        if (st.goneRepostForMessageId !== null) {
+          const stale = st.goneRepostForMessageId;
+          st.goneRepostForMessageId = null;
+          this.escalateCard({
+            requestId,
+            agentName: st.agentName,
+            staleMessageId: stale,
+            reason: "repost-failed",
+            detail: (e as Error).message,
+          });
+        }
       });
     return true;
   }
@@ -769,13 +939,26 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       this.tryPost(requestId, /* terminal */ true);
       return;
     }
-    // Edit in place (fire-and-forget; relay swallows failures incl. 429).
+    // Edit in place. Fire-and-forget toward the roll — never awaited — but the
+    // OUTCOME is read (#4065): an edit into a card that no longer exists gets
+    // exactly one re-post, then telemetry, so a roll always ends on a truthful
+    // card instead of a frozen one.
     const text = renderRolloutStatus({ ...st.render, nowMs: this.now() });
-    this.relay.edit({
-      requestId,
-      agentName: st.agentName,
-      messageId: st.messageId,
-      text,
-    });
+    const editedMessageId = st.messageId;
+    void this.relay
+      .edit({
+        requestId,
+        agentName: st.agentName,
+        messageId: editedMessageId,
+        text,
+      })
+      .then((outcome) => this.onEditOutcome(requestId, editedMessageId, outcome))
+      .catch((e) => {
+        // The relay contract forbids rejection; treat a broken relay as a
+        // transient failure rather than losing the narration loop.
+        this.opts.log?.(
+          `rollout narration edit relay rejected (non-fatal): ${(e as Error).message}`,
+        );
+      });
   }
 }

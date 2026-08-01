@@ -179,6 +179,7 @@ export type GatewayToClient =
   | Ms365ApprovalPostedEvent
   | ConfigApprovalResolvedEvent
   | RolloutStatusPostedEvent
+  | RolloutStatusEditedEvent
   | PendingPermissionStatusEvent
   | PreApprovedResultEvent;
 
@@ -567,9 +568,13 @@ export interface RolloutStatusPostMessage {
 /**
  * #2726 Part 2 — hostd asks the gateway to EDIT the rollout status message it
  * previously posted (identified by `messageId`, returned in the
- * `rollout_status_posted` reply). Best-effort, fire-and-forget: an edit failure
- * (incl. Telegram 429) is handled gateway-side and never surfaced back toward
- * the roll.
+ * `rollout_status_posted` reply). Best-effort toward the ROLL: hostd never
+ * blocks on it and Telegram 429s are retried gateway-side.
+ *
+ * #4065 — the gateway now replies with `rollout_status_edited` so hostd can
+ * tell "edited" from "edited into the void". A seeded-resume narrator holds a
+ * message_id it never posted itself; without the reply a stale id means the
+ * operator sees a frozen card for the rest of the roll.
  */
 export interface RolloutStatusEditMessage {
   type: "rollout_status_edit";
@@ -593,6 +598,29 @@ export interface RolloutStatusPostedEvent {
   ok: boolean;
   /** Telegram message_id of the posted status message (present when ok). */
   messageId?: number;
+  /** Diagnostic detail on failure. */
+  reason?: string;
+}
+
+/**
+ * #4065 — gateway → hostd reply after a `rollout_status_edit`, so a narrator
+ * editing a card it did NOT post (the seeded post-self-bump resume) can tell
+ * that the card is gone instead of editing into the void for the rest of the
+ * roll. Advisory only: hostd never blocks a roll on it, and a gateway that
+ * predates this event simply never sends one (hostd times out and behaves as
+ * before).
+ */
+export interface RolloutStatusEditedEvent {
+  type: "rollout_status_edited";
+  requestId: string;
+  /** True when the live card now carries the requested body. */
+  ok: boolean;
+  /**
+   * True IFF the failure means the target message no longer exists / can no
+   * longer be edited. ONLY this justifies a re-post — a transient failure
+   * (429 past retries, network) leaves a perfectly good card in the chat.
+   */
+  gone?: boolean;
   /** Diagnostic detail on failure. */
   reason?: string;
 }

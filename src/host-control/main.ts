@@ -206,6 +206,17 @@ async function main(): Promise<void> {
       // self-bump can hand it back and the resumed roll edits the same card
       // instead of stranding it and re-posting (#4062-adjacent).
       onMessageId: (rid, mid) => server?.persistNarrationMessageId(rid, mid),
+      // #4065 — the card is gone AND the one allowed re-post did not land.
+      // Structured, greppable telemetry in the hostd log; NEVER a chat card
+      // asking the operator to fix it (PR #4104's rule). `get_status` stays
+      // the durable record of the roll.
+      escalate: (esc) =>
+        process.stderr.write(
+          `hostd: rollout card escalation request=${esc.requestId} agent=${esc.agentName} ` +
+            `staleMessageId=${esc.staleMessageId} reason=${esc.reason}` +
+            `${esc.detail !== undefined ? ` detail=${esc.detail}` : ""} ` +
+            `— card could not be restored, no operator card issued\n`,
+        ),
     },
   );
 
