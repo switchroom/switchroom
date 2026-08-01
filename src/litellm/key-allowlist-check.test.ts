@@ -25,11 +25,11 @@ const LIVE_ALLOWLIST_20260726 = [
  * Three litellm-routed lanes presenting one declared key — the shape a fleet
  * has to be in for reachability to be checkable at all.
  *
- * Each op names its `api_key`, because a lane that declares none presents a
- * credential switchroom cannot identify (no global `HINDSIGHT_API_LLM_API_KEY`
- * is ever emitted, and the global `hindsight.llm` block has no `api_key` field
- * in the schema). That case has its own describe block below and must WARN, not
- * report on some other key.
+ * Each op in this fixture names its own `api_key`, and no global
+ * `hindsight.llm.api_key` is set. A lane that declares none, when there is also
+ * no global key to inherit (#3687), presents a credential switchroom cannot
+ * identify — nothing emits a `HINDSIGHT_API_LLM_API_KEY` for it. That case has
+ * its own describe block below and must WARN, not report on some other key.
  */
 function cfg(over: Partial<SwitchroomConfig> = {}): SwitchroomConfig {
   return {

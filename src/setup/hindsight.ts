@@ -1148,6 +1148,17 @@ export interface HindsightLlmConfig {
   /** `HINDSIGHT_API_LLM_MODEL`. Default {@link HINDSIGHT_DEFAULT_MODEL}. */
   model?: string;
   /**
+   * Global `HINDSIGHT_API_LLM_BASE_URL`. Default endpoint every op inherits
+   * absent a per-op `base_url`. Emitted only when set (#3687). A loopback value
+   * forces host networking via {@link collectHindsightLlmBaseUrls}.
+   */
+  base_url?: string;
+  /**
+   * Global `HINDSIGHT_API_LLM_API_KEY`. Default credential every op inherits
+   * absent a per-op `api_key`. Emitted only when set (#3687).
+   */
+  api_key?: string;
+  /**
    * Declared context window (tokens) of the backend. NOT an upstream env var
    * — switchroom derives the token budget from it (see
    * `hindsight-context-budget.ts`). Absent → a per-provider default.
@@ -1218,6 +1229,26 @@ export function resolveHindsightPerOpLlm(
     if (baseUrl) out.push([`${prefix}_BASE_URL`, baseUrl]);
     if (apiKey) out.push([`${prefix}_API_KEY`, apiKey]);
   }
+  return out;
+}
+
+/**
+ * Resolve the GLOBAL LLM passthrough env vars (`HINDSIGHT_API_LLM_BASE_URL` /
+ * `HINDSIGHT_API_LLM_API_KEY`) from an optional operator override. Returns ONLY
+ * the vars actually set — an unset field emits nothing and the engine uses its
+ * provider default (#3687). Symmetric with {@link resolveHindsightPerOpLlm} and
+ * shared by both launch paths so docker-run and compose never drift. Never
+ * emits empty values.
+ */
+export function resolveHindsightGlobalLlmExtras(
+  llm?: HindsightLlmConfig,
+): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  if (!llm) return out;
+  const baseUrl = llm.base_url?.trim();
+  const apiKey = llm.api_key?.trim();
+  if (baseUrl) out.push(["HINDSIGHT_API_LLM_BASE_URL", baseUrl]);
+  if (apiKey) out.push(["HINDSIGHT_API_LLM_API_KEY", apiKey]);
   return out;
 }
 
@@ -1293,6 +1324,11 @@ export function collectHindsightLlmBaseUrls(
     out.push(v);
   };
   push(litellm?.baseUrl);
+  // Global base URL (#3687) forces host networking on a loopback value exactly
+  // like a per-op one — otherwise compose stays on bridge and the emitted
+  // http://127.0.0.1:… is unreachable (the same silent outage the per-op path
+  // fixed). Ordered before per-op so the global endpoint reports first.
+  push(llm?.base_url);
   for (const [k, v] of resolveHindsightPerOpLlm(llm)) {
     if (k.endsWith("_BASE_URL")) push(v);
   }
@@ -1900,6 +1936,9 @@ export function hindsightContainerEnvPairs(opts: {
   const pairs: Array<[string, string]> = [
     ["HINDSIGHT_API_LLM_PROVIDER", llmProvider],
     ["HINDSIGHT_API_LLM_MODEL", llmModel],
+    // Global LLM passthrough (base_url / api_key) — only the configured vars
+    // (#3687, see resolveHindsightGlobalLlmExtras).
+    ...resolveHindsightGlobalLlmExtras(llm),
     // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
     ...perOpLlm,
     ["HINDSIGHT_API_MCP_STATELESS", String(HINDSIGHT_DEFAULT_MCP_STATELESS)],
@@ -2524,6 +2563,10 @@ export function generateHindsightComposeSnippet(
     // the docker-run/compose twin property still holds for it.
     `      - HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
     `      - HINDSIGHT_API_LLM_MODEL=${llmModel}`,
+    // Global LLM passthrough (base_url / api_key) — only the configured vars
+    // (#3687), from the SAME resolver the docker-run path uses so the twin
+    // property holds.
+    ...resolveHindsightGlobalLlmExtras(llm).map(([k, v]) => `      - ${k}=${v}`),
     // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
     ...perOpLlm.map(([k, v]) => `      - ${k}=${v}`),
     // Mirror of the docker-run path: with the claude-code provider, pin

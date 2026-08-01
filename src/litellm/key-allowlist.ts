@@ -108,22 +108,22 @@ export interface RequiredKeyModel {
    * it is the caller's job, because only the caller knows whether it holds a
    * broker handle or a passphrase).
    *
-   * `null` when the op declares none — and that means UNKNOWN, not "the
-   * provisioned service key". There is no fallback to fall back TO: switchroom
-   * emits `HINDSIGHT_API_<OP>_LLM_API_KEY` only for an op that declares one,
-   * never a global `HINDSIGHT_API_LLM_API_KEY` (`src/cli/setup.ts:1112` records
-   * that the global var is "no longer used"), and hindsight reads the global as
-   * a plain `os.getenv(ENV_LLM_API_KEY)` with no default. The provisioned vault
-   * key is NOT it either: `src/setup/hindsight.ts:1178` injects that key solely
-   * as the `ANTHROPIC_CUSTOM_HEADERS` bearer for the CLAUDE-CODE passthrough,
-   * which is a lane `can_key_call_model` never sees.
+   * `null` when the op declares none AND no global `hindsight.llm.api_key`
+   * exists to inherit — and that means UNKNOWN, not "the provisioned service
+   * key". Since #3687 the global `hindsight.llm` block DOES carry an optional
+   * `api_key`, emitted as `HINDSIGHT_API_LLM_API_KEY`; hindsight reads it as the
+   * `os.getenv(ENV_LLM_API_KEY)` fallback for any op that emits no per-op key.
+   * So `requiredKeyModels` resolves a per-op omission to `?? llm.api_key` — a
+   * lane is `null` only when neither the op nor the global declares a key. The
+   * provisioned vault key is NOT it either: `src/setup/hindsight.ts` injects
+   * that key solely as the `ANTHROPIC_CUSTOM_HEADERS` bearer for the CLAUDE-CODE
+   * passthrough, which is a lane `can_key_call_model` never sees.
    *
-   * So a `provider: litellm` lane with no `api_key` presents no credential this
-   * module can name, and no allowlist grant can fix it. Callers must degrade to
-   * a warning rather than reconciling or failing some other key on its behalf —
-   * blaming a key the lane does not present is the same false-attribution bug
-   * this module exists to remove. The global `hindsight.llm` block carries no
-   * `api_key` field in the schema at all, so the global lane is always `null`.
+   * So a `provider: litellm` lane with no per-op AND no global `api_key`
+   * presents no credential this module can name, and no allowlist grant can fix
+   * it. Callers must degrade to a warning rather than reconciling or failing
+   * some other key on its behalf — blaming a key the lane does not present is
+   * the same false-attribution bug this module exists to remove.
    */
   apiKeyRef: string | null;
 }
@@ -219,23 +219,28 @@ export function requiredKeyModels(
   // group demanded by two consumers is a finding that has to name both, so
   // there was never a duplicate to collapse here — `unreachableModels` does the
   // collapsing, by group, at report time.
-  consider(llm.model, llm.provider, undefined, "hindsight.llm.model (global)");
+  // The global op presents the global `hindsight.llm.api_key` (#3687). A per-op
+  // op with no `api_key` inherits the same global credential — the engine reads
+  // `HINDSIGHT_API_LLM_API_KEY` as the fallback — so we resolve `?? llm.api_key`
+  // rather than treating a per-op omission as "presents nothing".
+  const globalKey = llm.api_key;
+  consider(llm.model, llm.provider, globalKey, "hindsight.llm.model (global)");
   consider(
     llm.retain?.model,
     llm.retain?.provider,
-    llm.retain?.api_key,
+    llm.retain?.api_key ?? globalKey,
     "hindsight.llm.retain",
   );
   consider(
     llm.reflect?.model,
     llm.reflect?.provider,
-    llm.reflect?.api_key,
+    llm.reflect?.api_key ?? globalKey,
     "hindsight.llm.reflect",
   );
   consider(
     llm.consolidation?.model,
     llm.consolidation?.provider,
-    llm.consolidation?.api_key,
+    llm.consolidation?.api_key ?? globalKey,
     "hindsight.llm.consolidation",
   );
 

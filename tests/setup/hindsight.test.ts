@@ -262,6 +262,51 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(env).toContain("HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY=sk-consol");
   });
 
+  it("emits GLOBAL base_url / api_key passthrough only for the fields set (#3687)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "litellm",
+      model: "openrouter/z-ai/glm-5.2",
+      base_url: "http://127.0.0.1:4010",
+      api_key: "sk-global",
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_LLM_BASE_URL=http://127.0.0.1:4010");
+    expect(env).toContain("HINDSIGHT_API_LLM_API_KEY=sk-global");
+  });
+
+  it("emits NO global base_url / api_key when unset (default broker-fed mode) (#3687)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "claude-code",
+      model: "openrouter/z-ai/glm-5.2",
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env.some((e) => e.startsWith("HINDSIGHT_API_LLM_BASE_URL="))).toBe(false);
+    expect(env.some((e) => e.startsWith("HINDSIGHT_API_LLM_API_KEY="))).toBe(false);
+  });
+
+  it("compose snippet emits the GLOBAL base_url / api_key passthrough too (#3687)", async () => {
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet({
+      provider: "litellm",
+      model: "glm-5.2",
+      base_url: "http://127.0.0.1:4010",
+      api_key: "sk-global",
+    });
+    expect(snippet).toContain("HINDSIGHT_API_LLM_BASE_URL=http://127.0.0.1:4010");
+    expect(snippet).toContain("HINDSIGHT_API_LLM_API_KEY=sk-global");
+  });
+
+  it("a loopback GLOBAL base_url forces host networking (#3687, no silent bridge outage)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "litellm",
+      model: "glm-5.2",
+      base_url: "http://127.0.0.1:4010",
+    });
+    const args = findRunArgs();
+    expect(args).toContain("--network");
+    expect(args).toContain("host");
+  });
+
   it("does NOT emit a per-op var for an op with no override (engine falls back to global)", () => {
     startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
       model: "glm-5.2",
