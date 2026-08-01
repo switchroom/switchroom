@@ -14,11 +14,15 @@ import {
   copyFileSync,
   createWriteStream,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  readFileSync,
   readSync,
   renameSync,
   rmSync,
+  symlinkSync,
 } from "node:fs";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
@@ -107,6 +111,50 @@ export function defaultSelfUpdateIO(): SelfUpdateIO {
     },
     dirname(path) {
       return dirname(path);
+    },
+    readText(path) {
+      try {
+        return readFileSync(path, "utf-8");
+      } catch {
+        return null;
+      }
+    },
+    extractTarGz(archive, destDir) {
+      mkdirSync(destDir, { recursive: true });
+      // `tar` rather than a JS tar library: it is present in the base system
+      // on every platform the static binary ships for (GNU tar on Linux,
+      // bsdtar on macOS), and pulling a runtime dependency into the compiled
+      // binary for one call site is the worse trade.
+      const r = spawnSync("tar", ["-xzf", archive, "-C", destDir], {
+        encoding: "utf-8",
+        timeout: 300_000,
+      });
+      if (r.error) throw r.error;
+      if (r.status !== 0) {
+        throw new Error(
+          `tar -xzf exited ${r.status}: ${(r.stderr ?? "").trim() || "no stderr"}`,
+        );
+      }
+    },
+    symlink(target, linkPath) {
+      symlinkSync(target, linkPath);
+    },
+    isSymlink(path) {
+      try {
+        return lstatSync(path).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    },
+    removeTree(path) {
+      rmSync(path, { recursive: true, force: true });
+    },
+    listDir(dir) {
+      try {
+        return readdirSync(dir);
+      } catch {
+        return [];
+      }
     },
   };
 }

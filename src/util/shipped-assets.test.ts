@@ -8,6 +8,9 @@ import {
   describeShippedAssetSearch,
   resolveShippedAsset,
   shippedAssetCandidates,
+  assetPayloadSkew,
+  parseAssetPayloadManifest,
+  payloadInstallRoot,
 } from "./shipped-assets.js";
 
 /**
@@ -196,5 +199,155 @@ describe("the real repo layout still resolves (no simulation)", () => {
     const r = resolveShippedAsset(SKILLS_ASSET, { ...devProbe, env: {} });
     expect(r.path).not.toBeNull();
     expect(existsSync(r.path as string)).toBe(true);
+  });
+});
+
+// ─── payload version skew (#4163) ────────────────────────────────────────
+
+describe("parseAssetPayloadManifest", () => {
+  it("reads the version and normalises the v prefix", () => {
+    expect(parseAssetPayloadManifest('{"version":"0.19.44"}')?.version).toBe("v0.19.44");
+    expect(parseAssetPayloadManifest('{"version":"v0.19.44"}')?.version).toBe("v0.19.44");
+  });
+
+  it("keeps the entry list when present", () => {
+    const m = parseAssetPayloadManifest(
+      '{"version":"v1.2.3","entries":["profiles","skills",7]}',
+    );
+    expect(m?.entries).toEqual(["profiles", "skills"]);
+  });
+
+  it("returns null rather than a bogus version for unusable input", () => {
+    // Each of these previously would have had to be handled by the caller;
+    // null here is what makes assetPayloadSkew report `unreadable` instead of
+    // silently treating garbage as agreement.
+    for (const body of ["", "not json", "{}", '{"version":42}', '{"version":"latest"}']) {
+      expect(parseAssetPayloadManifest(body)).toBeNull();
+    }
+  });
+});
+
+describe("assetPayloadSkew", () => {
+  const SEA = { bundleDir: BUNFS, execPath: "/usr/local/bin/switchroom", env: {} };
+  const MANIFEST = "/usr/local/share/switchroom/switchroom-assets.json";
+
+  it("matches when the payload names the running release", () => {
+    const skew = assetPayloadSkew({
+      cliVersion: "0.19.44",
+      probe: { ...SEA, exists: (p) => p === MANIFEST },
+      readText: () => '{"version":"v0.19.44"}',
+    });
+    expect(skew.status).toBe("matched");
+    expect(skew.ok).toBe(true);
+    expect(skew.manifestPath).toBe(MANIFEST);
+  });
+
+  it("reports SKEWED — the silent failure — when the payload is another release", () => {
+    const skew = assetPayloadSkew({
+      cliVersion: "0.19.44",
+      probe: { ...SEA, exists: (p) => p === MANIFEST },
+      readText: () => '{"version":"v0.19.28"}',
+    });
+    expect(skew.status).toBe("skewed");
+    expect(skew.ok).toBe(false);
+    expect(skew.payloadVersion).toBe("v0.19.28");
+    expect(skew.message).toContain("v0.19.28");
+    expect(skew.message).toContain("v0.19.44");
+  });
+
+  it("reports MISSING and names every path it probed", () => {
+    const skew = assetPayloadSkew({
+      cliVersion: "0.19.44",
+      probe: { ...SEA, exists: () => false },
+    });
+    expect(skew.status).toBe("missing");
+    expect(skew.ok).toBe(false);
+    expect(skew.candidates).toContain(MANIFEST);
+    // #4160's lesson: name every location, not just the first.
+    for (const c of skew.candidates) expect(skew.message).toContain(c);
+  });
+
+  it("reports UNREADABLE — never `matched` — for a corrupt manifest", () => {
+    const skew = assetPayloadSkew({
+      cliVersion: "0.19.44",
+      probe: { ...SEA, exists: (p) => p === MANIFEST },
+      readText: () => "{ truncated",
+    });
+    expect(skew.status).toBe("unreadable");
+    expect(skew.ok).toBe(false);
+  });
+
+  it("treats a throwing reader as unreadable rather than propagating", () => {
+    // doctor must not crash on an EACCES manifest.
+    const skew = assetPayloadSkew({
+      cliVersion: "0.19.44",
+      probe: { ...SEA, exists: (p) => p === MANIFEST },
+      readText: () => {
+        throw new Error("EACCES");
+      },
+    });
+    expect(skew.status).toBe("unreadable");
+  });
+});
+
+describe("payloadInstallRoot", () => {
+  it("is the FIRST SEA candidate the resolver probes — installer and resolver cannot disagree", () => {
+    const execPath = "/opt/tools/bin/switchroom";
+    const root = payloadInstallRoot(execPath);
+    const candidates = shippedAssetCandidates(PROFILES_ASSET, {
+      bundleDir: BUNFS,
+      execPath,
+    });
+    // Skip the two bundle-relative candidates, which are bunfs garbage here.
+    expect(candidates[2]).toBe(`${root}/profiles`);
+  });
+});
+
+describe("symlinked share root (#4163)", () => {
+  // The payload publishes `<prefix>/share/switchroom` as a SYMLINK to
+  // `switchroom-<version>` so an update is an atomic rename. Consumers that do
+  // a containment check then compared a realpath'd child against the symlink
+  // path and refused — observed as `Invalid profile name: default`, which
+  // failed every agent scaffold on a real `curl | sh` install.
+  const EXEC = "/usr/local/bin/switchroom";
+  const LINK = "/usr/local/share/switchroom/profiles";
+  const REAL = "/usr/local/share/switchroom-0.19.44/profiles";
+
+  const symlinked = {
+    bundleDir: BUNFS,
+    execPath: EXEC,
+    env: {},
+    exists: (p: string) => p === LINK,
+    realpath: (p: string) => (p === LINK ? REAL : p),
+  };
+
+  it("returns the REAL path of a resolved candidate, not the symlink", () => {
+    const res = resolveShippedAsset(PROFILES_ASSET, symlinked);
+    expect(res.source).toBe("sea-sibling");
+    expect(res.path).toBe(REAL);
+  });
+
+  it("still reports the probed (symlink) paths in candidates for diagnostics", () => {
+    const res = resolveShippedAsset(PROFILES_ASSET, symlinked);
+    expect(res.candidates).toContain(LINK);
+  });
+
+  it("canonicalises an env override too", () => {
+    const res = resolveShippedAsset(PROFILES_ASSET, {
+      ...symlinked,
+      env: { [PROFILES_ASSET.envVar]: LINK },
+    });
+    expect(res.source).toBe("env");
+    expect(res.path).toBe(REAL);
+  });
+
+  it("falls back to the literal path when realpath throws", () => {
+    const res = resolveShippedAsset(PROFILES_ASSET, {
+      ...symlinked,
+      realpath: () => {
+        throw new Error("EACCES");
+      },
+    });
+    expect(res.path).toBe(LINK);
   });
 });

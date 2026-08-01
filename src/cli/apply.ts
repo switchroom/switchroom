@@ -23,13 +23,11 @@ import { describeKeyBudget, resolveKeyBudget } from "../litellm/budget.js";
 import { mkdir } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
 import readline from "node:readline";
-// Embed example configs as text imports so they survive `bun build --compile`.
-// `import.meta.dirname` resolves to `/$bunfs/root` inside a compiled binary,
-// which means resolve(import.meta.dirname, "../../examples/...") points at a
-// path that doesn't exist on the host — apply --example would fail with
-// ENOENT. Text imports are bundled into the binary at compile time.
-import switchroomExample from "../../examples/switchroom.yaml" with { type: "text" };
-import minimalExample from "../../examples/minimal.yaml" with { type: "text" };
+// Example configs are EMBEDDED in the binary (text imports), never read from
+// disk: `import.meta.dirname` is the bunfs virtual root under `bun build
+// --compile`, so a disk read resolves to `/examples/…` and ENOENTs. The module
+// is shared with `switchroom setup`, which had the identical bug (#4163).
+import { exampleNames, readEmbeddedExample } from "./embedded-examples.js";
 import {
   reloadAuthBroker,
   reloadVaultBroker,
@@ -38,12 +36,6 @@ import {
   VAULT_BROKER_CONTAINER,
   type BrokerReloadResult,
 } from "./broker-reload.js";
-
-/** Embedded example configs, keyed by name. Mirrors files under examples/. */
-const EMBEDDED_EXAMPLES: Record<string, string> = {
-  switchroom: switchroomExample,
-  minimal: minimalExample,
-};
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -67,6 +59,7 @@ import {
   ConfigError,
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath, flushPendingBankOps } from "../agents/scaffold.js";
+import { bootstrapBundledSkillsPool } from "./bootstrap-skills-pool.js";
 import {
   getGrantsDbDir,
   getGrantsDbPath,
@@ -1795,6 +1788,21 @@ export async function runApply(
     }
   };
 
+  // Seed the bundled-skills pool if this host has never run `switchroom
+  // update` (#4163). Without it the FIRST apply after a `curl … | sh` install
+  // scaffolds every agent against an empty pool and skips every bundled skill.
+  // Bootstrap-only and soft-failing — see bootstrap-skills-pool.ts.
+  if (options.composeOnly !== true) {
+    const seed = bootstrapBundledSkillsPool();
+    if (seed.status === "seeded") {
+      writeOut(
+        chalk.gray(
+          `  Seeded bundled skills pool (${seed.skills} skills) from ${seed.source}\n`,
+        ),
+      );
+    }
+  }
+
   // ── 1. Scaffold each agent ────────────────────────────────────────
   let scaffolded = 0;
   const failures: ScaffoldFailure[] = [];
@@ -2583,27 +2591,18 @@ function copyExampleConfig(name: string): void {
     return;
   }
 
-  // Prefer embedded examples (works under both `bun run` and `bun build
-  // --compile`). Fall back to disk lookup so contributors can add new
-  // examples in-tree without rebuilding — only relevant in dev because
-  // the compiled binary's `import.meta.dirname` is the bunfs virtual root.
-  const embedded = EMBEDDED_EXAMPLES[name];
-  if (embedded !== undefined) {
-    writeFileSync(dest, embedded, { encoding: "utf8" });
-    console.log(chalk.green(`Copied ${name}.yaml -> switchroom.yaml`));
-    return;
-  }
-
-  const exampleFile = resolve(
-    import.meta.dirname,
-    `../../examples/${name}.yaml`,
-  );
-  if (!existsSync(exampleFile)) {
+  // Embedded, with no disk fallback. The old fallback read
+  // `resolve(import.meta.dirname, "../../examples/…")`, which is `/examples/…`
+  // inside the compiled binary — it could only ever succeed in a source
+  // checkout, so it made dev and release behave differently on the one path
+  // where that difference is invisible until a user hits it (#4163).
+  const embedded = readEmbeddedExample(name);
+  if (embedded === null) {
     throw new Error(
-      `Example config not found: ${name}.yaml (available: ${Object.keys(EMBEDDED_EXAMPLES).join(", ")})`,
+      `Example config not found: ${name}.yaml (available: ${exampleNames().join(", ")})`,
     );
   }
-  copyFileSync(exampleFile, dest);
+  writeFileSync(dest, embedded, { encoding: "utf8" });
   console.log(chalk.green(`Copied ${name}.yaml -> switchroom.yaml`));
 }
 

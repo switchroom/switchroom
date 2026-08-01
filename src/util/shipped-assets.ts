@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 /**
@@ -64,6 +64,42 @@ export const HINDSIGHT_VENDOR_ASSET: ShippedAssetSpec = {
   envVar: "SWITCHROOM_HINDSIGHT_VENDOR_ROOT",
 };
 
+/**
+ * Web dashboard static assets. `npm run build` copies `src/web/ui` to
+ * `dist/cli/ui`, so the npm/dev layout finds it as the "image"-shaped
+ * `<bundleDir>/ui` candidate; a source checkout finds `src/web/ui` the same
+ * way. The compiled binary has no sibling `ui/` at all — `switchroom web`
+ * from a static-binary install served a dashboard whose every static route
+ * 404'd (#4163).
+ */
+export const WEB_UI_ASSET: ShippedAssetSpec = {
+  asset: "ui",
+  envVar: "SWITCHROOM_WEB_UI_ROOT",
+};
+
+/**
+ * Version manifest written at the root of the shipped-asset payload by
+ * `scripts/build-asset-payload.mjs`. Resolved through the SAME probe as the
+ * asset directories, so "which payload am I using" can never answer a
+ * different location than "which profiles am I using".
+ */
+export const ASSET_MANIFEST_FILENAME = "switchroom-assets.json";
+
+export const ASSET_MANIFEST_ASSET: ShippedAssetSpec = {
+  asset: ASSET_MANIFEST_FILENAME,
+  envVar: "SWITCHROOM_ASSET_MANIFEST",
+};
+
+/**
+ * Where a static-binary install stages its payload, derived from the real
+ * binary path: `/usr/local/bin/switchroom` → `/usr/local/share/switchroom`.
+ * This is the FIRST SEA candidate `orderedCandidates` probes, so the
+ * installer and the resolver cannot disagree about the destination.
+ */
+export function payloadInstallRoot(execPath: string): string {
+  return resolve(dirname(execPath), "../share/switchroom");
+}
+
 /** Runtime facts the probe needs. Every field is injectable so a test can
  *  simulate a layout it is not running under (that is the whole point —
  *  the SEA layout is unreachable from vitest otherwise). */
@@ -76,6 +112,8 @@ export interface ShippedAssetProbe {
   env?: Record<string, string | undefined>;
   /** Defaults to `fs.existsSync`. */
   exists?: (p: string) => boolean;
+  /** Defaults to `fs.realpathSync`. See `canonicalise` for why it exists. */
+  realpath?: (p: string) => string;
 }
 
 /** Which layout produced the resolved path. `"none"` when nothing existed. */
@@ -157,7 +195,7 @@ export function resolveShippedAsset(
   const env = probe.env ?? process.env;
   const override = env[spec.envVar]?.trim();
   if (override) {
-    const path = resolve(override);
+    const path = canonicalise(resolve(override), probe);
     return { path, candidates: [path], source: "env" };
   }
 
@@ -165,10 +203,44 @@ export function resolveShippedAsset(
   const candidates = orderedCandidates(spec, probe);
   for (const c of candidates) {
     if (exists(c.path)) {
-      return { path: c.path, candidates: candidates.map((x) => x.path), source: c.source };
+      return {
+        path: canonicalise(c.path, probe),
+        candidates: candidates.map((x) => x.path),
+        source: c.source,
+      };
     }
   }
   return { path: null, candidates: candidates.map((x) => x.path), source: "none" };
+}
+
+/**
+ * Resolve symlinks in a hit before handing it back.
+ *
+ * Load-bearing for the SEA layout (#4163): the asset payload is published as
+ * `<prefix>/share/switchroom -> switchroom-<version>`, a SYMLINK, because
+ * swapping a symlink is the only atomic way to replace a directory. Callers
+ * that do a containment check against the resolved root then compare a
+ * `realpath`'d child (`…/share/switchroom-0.19.44/profiles/default`) against an
+ * un-realpath'd root (`…/share/switchroom/profiles`), decide the child escapes
+ * the root, and refuse. Observed as `Invalid profile name: default` from
+ * `getProfilePath` on a real `curl | sh` install — every agent failed to
+ * scaffold, i.e. the exact #4160 symptom with a new cause.
+ *
+ * Canonicalising HERE fixes every consumer at once instead of asking each one
+ * to remember. The probe list is deliberately left un-canonicalised: it is a
+ * record of what was searched, and an operator needs to see the paths that were
+ * actually probed.
+ *
+ * Falls back to the input on any error — a resolvable-but-unreadable path
+ * should behave as it did before, not throw out of a resolver.
+ */
+function canonicalise(path: string, probe: ShippedAssetProbe): string {
+  const realpath = probe.realpath ?? realpathSync;
+  try {
+    return realpath(path);
+  } catch {
+    return path;
+  }
 }
 
 /**
@@ -180,4 +252,166 @@ export function describeShippedAssetSearch(
   resolution: Pick<ShippedAssetResolution, "candidates">,
 ): string {
   return `searched ${resolution.candidates.length} location(s): ${resolution.candidates.join(", ")}`;
+}
+
+// ── payload version skew (#4163) ─────────────────────────────────────────
+//
+// The binary and the payload are two artifacts. Nothing at the filesystem
+// level can swap both in one syscall, so instead of hoping they stay
+// together we make disagreement DETECTABLE and REPAIRABLE:
+//
+//   - the installer and self-update fetch both from ONE release tag and
+//     verify both against that release's switchroom-checksums.txt;
+//   - the payload lands BEFORE the binary, so an interrupted update leaves
+//     new-payload/old-binary, never new-binary/old-templates;
+//   - `switchroom update` re-checks the manifest on EVERY run — including
+//     the run where the binary is already current — and reinstalls a skewed
+//     or missing payload, so an interrupted update converges on the next one;
+//   - `switchroom doctor` reports skew with the repair command.
+//
+// Anything that reads a payload version goes through here, so the four
+// sites above cannot drift in what "skewed" means.
+
+/** Parsed `switchroom-assets.json`. */
+export interface AssetPayloadManifest {
+  /** The release tag the payload was cut from, normalised to `vX.Y.Z`. */
+  version: string;
+  entries?: readonly string[];
+}
+
+/**
+ * Parse a manifest body. Returns null for anything that is not a manifest
+ * with a usable version — a corrupt manifest must read as "unknown", which
+ * `assetPayloadSkew` treats as skew, never as agreement.
+ */
+export function parseAssetPayloadManifest(
+  body: string,
+): AssetPayloadManifest | null {
+  try {
+    const parsed = JSON.parse(body) as { version?: unknown; entries?: unknown };
+    const version = parsed?.version;
+    if (typeof version !== "string" || !/^v?\d+\.\d+\.\d+/.test(version.trim())) {
+      return null;
+    }
+    return {
+      version: normaliseVersion(version),
+      entries: Array.isArray(parsed.entries)
+        ? parsed.entries.filter((e): e is string => typeof e === "string")
+        : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normaliseVersion(v: string): string {
+  return `v${v.trim().replace(/^v/, "")}`;
+}
+
+export type AssetPayloadSkewStatus =
+  /** No payload manifest was found at any probed location. */
+  | "missing"
+  /** A payload exists but its version could not be read. */
+  | "unreadable"
+  /** Payload version differs from the running CLI's. */
+  | "skewed"
+  /** Payload and CLI agree. */
+  | "matched";
+
+export interface AssetPayloadSkew {
+  status: AssetPayloadSkewStatus;
+  cliVersion: string;
+  payloadVersion: string | null;
+  /** Where the manifest was found, when it was. */
+  manifestPath: string | null;
+  /** Every path probed for the manifest. */
+  candidates: readonly string[];
+  /** True when the CLI must not be trusted to render current scaffolds. */
+  ok: boolean;
+  /** Operator-facing one-liner. */
+  message: string;
+}
+
+/**
+ * Compare the running CLI's version against the installed payload's.
+ *
+ * `readText` is injected so this is testable without a fixture tree; it must
+ * return the file body or null/throw when unreadable.
+ */
+export function assetPayloadSkew(opts: {
+  cliVersion: string;
+  probe: ShippedAssetProbe;
+  readText?: (path: string) => string | null;
+}): AssetPayloadSkew {
+  const cliVersion = normaliseVersion(opts.cliVersion);
+  const resolution = resolveShippedAsset(ASSET_MANIFEST_ASSET, opts.probe);
+  const base = {
+    cliVersion,
+    candidates: resolution.candidates,
+  };
+  if (resolution.path === null) {
+    return {
+      ...base,
+      status: "missing",
+      payloadVersion: null,
+      manifestPath: null,
+      ok: false,
+      message:
+        `no shipped-asset payload found for switchroom ${cliVersion} ` +
+        `(${describeShippedAssetSearch(resolution)}). Agent scaffolding needs ` +
+        `profiles/, skills/ and vendor/ on disk; re-run the installer or ` +
+        `\`switchroom update\` to fetch the payload for this release.`,
+    };
+  }
+  const readText =
+    opts.readText ??
+    ((p: string): string | null => {
+      try {
+        return readFileSync(p, "utf-8");
+      } catch {
+        return null;
+      }
+    });
+  let body: string | null = null;
+  try {
+    body = readText(resolution.path);
+  } catch {
+    body = null;
+  }
+  const manifest = body === null ? null : parseAssetPayloadManifest(body);
+  if (!manifest) {
+    return {
+      ...base,
+      status: "unreadable",
+      payloadVersion: null,
+      manifestPath: resolution.path,
+      ok: false,
+      message:
+        `the shipped-asset payload at ${resolution.path} has no readable ` +
+        `version. Treating it as skewed from switchroom ${cliVersion} — ` +
+        `re-run \`switchroom update\` to reinstall it.`,
+    };
+  }
+  if (manifest.version !== cliVersion) {
+    return {
+      ...base,
+      status: "skewed",
+      payloadVersion: manifest.version,
+      manifestPath: resolution.path,
+      ok: false,
+      message:
+        `shipped-asset payload is ${manifest.version} but the CLI is ` +
+        `${cliVersion} (${resolution.path}). The CLI renders agent scaffolds ` +
+        `from these templates, so a mismatched pair ships a new CLI against ` +
+        `old templates — re-run \`switchroom update\` to bring them together.`,
+    };
+  }
+  return {
+    ...base,
+    status: "matched",
+    payloadVersion: manifest.version,
+    manifestPath: resolution.path,
+    ok: true,
+    message: `shipped-asset payload ${manifest.version} matches the CLI (${resolution.path})`,
+  };
 }

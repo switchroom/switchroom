@@ -91,6 +91,11 @@
  */
 
 import { compareReleaseTags } from "../config/release-resolve.js";
+import {
+  ASSET_MANIFEST_FILENAME,
+  parseAssetPayloadManifest,
+  payloadInstallRoot,
+} from "../util/shipped-assets.js";
 
 export const SELF_UPDATE_ENV_SENTINEL = "SWITCHROOM_SELF_UPDATED";
 export const VERSION_STORE_DIRNAME = ".switchroom-versions";
@@ -222,6 +227,20 @@ export function releaseAssetName(
   if (!os || !cpu) return null;
   return `switchroom-${os}-${cpu}`;
 }
+
+/**
+ * The shipped-asset payload asset name (#4163). Platform-independent — it is
+ * a tar.gz of `profiles/`, `skills/`, `vendor/hindsight-memory/` and `ui/`,
+ * all of which are text/templates, so one artifact serves all four binaries.
+ *
+ * UNVERSIONED on purpose, exactly like the four binaries and the checksums
+ * file: release assets are already namespaced by the tag in their download
+ * URL, and a `${version}` in the filename would give install.sh and
+ * self-update a second thing to derive and get wrong. `install.sh` names this
+ * literal string and `scripts/release-assets.mjs` derives the contract from
+ * it, so a rename fails `npm run lint` before it can fail a release.
+ */
+export const ASSET_PAYLOAD_ASSET_NAME = "switchroom-assets.tar.gz";
 
 /**
  * Extract `tag_name` from the GitHub `/releases/latest` payload.
@@ -366,6 +385,20 @@ export interface SelfUpdateIO {
   remove(path: string): void;
   exists(path: string): boolean;
   dirname(path: string): string;
+
+  // ── shipped-asset payload (#4163) ──────────────────────────────────
+  /** Read a UTF-8 file, or null when it cannot be read. */
+  readText(path: string): string | null;
+  /** Extract a .tar.gz into `destDir` (created if absent). */
+  extractTarGz(archive: string, destDir: string): void;
+  /** Create a symlink at `linkPath` pointing at `target`. */
+  symlink(target: string, linkPath: string): void;
+  /** True when `path` is itself a symlink (does NOT follow it). */
+  isSymlink(path: string): boolean;
+  /** Recursive remove. No-op when absent. */
+  removeTree(path: string): void;
+  /** Entry names in `dir`, or [] when it cannot be listed. */
+  listDir(dir: string): string[];
 }
 
 export interface SelfUpdateResult {
@@ -377,6 +410,8 @@ export interface SelfUpdateResult {
   newVersion?: string;
   /** Path of the (now new) binary, when replaced. */
   binaryPath?: string;
+  /** Outcome of the shipped-asset payload install that preceded the swap. */
+  payload?: AssetPayloadResult;
 }
 
 /**
@@ -392,6 +427,251 @@ export async function fetchLatestReleaseTag(
     return parseLatestReleaseTag(await io.httpGetText(GITHUB_LATEST_RELEASE_URL));
   } catch {
     return null;
+  }
+}
+
+// ─── shipped-asset payload (#4163) ───────────────────────────────────────
+//
+// THE ATOMICITY PROBLEM, AND WHAT WE ACTUALLY GUARANTEE
+//
+// The CLI and the templates it renders are two artifacts. No syscall swaps
+// two filesystem objects at once, so "atomic" here is a property built out of
+// four smaller guarantees, not a claim about one rename:
+//
+//   1. SAME RELEASE BY CONSTRUCTION. Binary and payload are fetched from one
+//      resolved tag's `releases/download/<tag>/` prefix and verified against
+//      that release's single `switchroom-checksums.txt`. There is no code
+//      path that can pair version A's binary with version B's payload.
+//   2. PAYLOAD FIRST, BINARY SECOND. Each is installed with an atomic
+//      `rename(2)`, payload before binary. A crash, a SIGKILL or a power cut
+//      between them therefore leaves NEW payload + OLD binary — an old CLI
+//      reading templates one version ahead — and never the inverse, which is
+//      the failure #4163 calls out as worse than the status quo.
+//   3. CONVERGENCE, NOT JUST ORDERING. Ordering alone would strand a host
+//      whose payload step failed: the next `switchroom update` would see the
+//      binary already current and skip everything. So the payload is checked
+//      and repaired on EVERY update run, including the "already current" one.
+//   4. DETECTION. The payload carries `switchroom-assets.json` naming the
+//      release it was cut from; `assetPayloadSkew()` compares it to the
+//      running CLI, and `switchroom doctor` fails on disagreement.
+//
+// The payload is installed as a VERSIONED DIRECTORY plus a symlink:
+//
+//   /usr/local/share/switchroom-0.19.44/   (extracted, verified)
+//   /usr/local/share/switchroom -> switchroom-0.19.44   (atomic swap)
+//
+// `rename(2)` cannot replace a non-empty directory, but it CAN replace a
+// symlink — which is what makes the publish step atomic. A pre-existing real
+// directory (a hand-staged one, or an older install) is moved aside once, to
+// `<root>.replaced`, so the first upgrade to this scheme is recoverable.
+
+export interface AssetPayloadResult {
+  /** True when the payload on disk was replaced. */
+  installed: boolean;
+  /** Payload version now on disk. */
+  version: string;
+  /** The symlink path the CLI resolves through. */
+  root: string;
+  message: string;
+}
+
+/** Where a version's payload is extracted, beside the symlink root. */
+export function payloadVersionDir(root: string, version: string): string {
+  return `${root}-${version.replace(/^v/, "")}`;
+}
+
+/**
+ * Download, verify and install the shipped-asset payload for `tag`.
+ *
+ * THROWS on every failure. A binary without its payload cannot scaffold a
+ * single agent, so a payload that cannot be installed is a failed update, not
+ * a warning — that is the whole lesson of #4161.
+ *
+ * Idempotent: when the payload already on disk reports `tag`, nothing is
+ * downloaded and `installed` is false.
+ */
+export async function installAssetPayload(opts: {
+  /** Release tag to install, e.g. `v0.19.44`. */
+  tag: string;
+  /** Path of the installed binary; the payload root is derived from it. */
+  binaryPath: string;
+  io: SelfUpdateIO;
+  /** Pre-fetched checksums text, to avoid a second GET in the update path. */
+  checksumsText?: string;
+  /** Force a reinstall even when the on-disk version already matches. */
+  force?: boolean;
+  log?: (s: string) => void;
+}): Promise<AssetPayloadResult> {
+  const { tag, binaryPath, io } = opts;
+  const log = opts.log ?? (() => {});
+  const wanted = `v${tag.replace(/^v/, "")}`;
+  const root = payloadInstallRoot(binaryPath);
+  const parent = io.dirname(root);
+  const versionDir = payloadVersionDir(root, wanted);
+
+  if (!opts.force) {
+    const current = readPayloadVersion(io, root);
+    if (current === wanted) {
+      return {
+        installed: false,
+        version: wanted,
+        root,
+        message: `shipped-asset payload already ${wanted} at ${root}`,
+      };
+    }
+  }
+
+  const base = `https://github.com/switchroom/switchroom/releases/download/${wanted}`;
+  const tmpArchive = `${versionDir}.download.tar.gz`;
+  const incoming = `${versionDir}.incoming`;
+
+  io.mkdirp(parent);
+  io.remove(tmpArchive);
+  io.removeTree(incoming);
+
+  log(`downloading ${ASSET_PAYLOAD_ASSET_NAME} ${wanted}`);
+  try {
+    await io.httpDownload(`${base}/${ASSET_PAYLOAD_ASSET_NAME}`, tmpArchive);
+  } catch (err) {
+    io.remove(tmpArchive);
+    throw new Error(
+      `self-update: download of ${base}/${ASSET_PAYLOAD_ASSET_NAME} failed ` +
+        `(${(err as Error).message}). The shipped-asset payload (profiles, skills, ` +
+        `vendor) is what \`switchroom apply\` scaffolds from, so the update stops ` +
+        `here rather than leave a CLI that cannot scaffold. Nothing was changed.`,
+    );
+  }
+
+  // Same supply-chain boundary as the binary: never unpack an unverified
+  // archive. The payload contains shell templates that end up executing as
+  // every agent's container entrypoint.
+  let checksums: string;
+  if (opts.checksumsText !== undefined) {
+    checksums = opts.checksumsText;
+  } else {
+    try {
+      checksums = await io.httpGetText(`${base}/switchroom-checksums.txt`);
+    } catch (err) {
+      io.remove(tmpArchive);
+      throw new Error(
+        `self-update: could not fetch switchroom-checksums.txt for ${wanted} ` +
+          `(${(err as Error).message}) — refusing to unpack an unverified asset ` +
+          `payload. Nothing was changed.`,
+      );
+    }
+  }
+  const expected = expectedChecksum(checksums, ASSET_PAYLOAD_ASSET_NAME);
+  if (!expected) {
+    io.remove(tmpArchive);
+    throw new Error(
+      `self-update: release ${wanted} has no checksum entry for ` +
+        `${ASSET_PAYLOAD_ASSET_NAME}. Either the release predates the asset ` +
+        `payload (#4163) or it is incomplete — refusing to unpack it. Nothing ` +
+        `was changed.`,
+    );
+  }
+  const actual = io.sha256File(tmpArchive).toLowerCase();
+  if (actual !== expected) {
+    io.remove(tmpArchive);
+    throw new Error(
+      `self-update: SHA256 mismatch for ${ASSET_PAYLOAD_ASSET_NAME} (expected ` +
+        `${expected}, got ${actual}) — refusing to unpack. Nothing was changed.`,
+    );
+  }
+
+  try {
+    io.extractTarGz(tmpArchive, incoming);
+  } catch (err) {
+    io.remove(tmpArchive);
+    io.removeTree(incoming);
+    throw new Error(
+      `self-update: could not unpack ${ASSET_PAYLOAD_ASSET_NAME} into ${incoming} ` +
+        `(${(err as Error).message}). Nothing was changed.`,
+    );
+  }
+  io.remove(tmpArchive);
+
+  // Prove the archive really is this release's payload before it can become
+  // the templates every agent boots from — the payload equivalent of running
+  // `<candidate> version` on the binary.
+  const unpacked = parseAssetPayloadManifest(
+    io.readText(`${incoming}/${ASSET_MANIFEST_FILENAME}`) ?? "",
+  );
+  if (!unpacked || unpacked.version !== wanted) {
+    io.removeTree(incoming);
+    throw new Error(
+      `self-update: the ${wanted} asset payload unpacked with version ` +
+        `${unpacked?.version ?? "<none>"} in ${ASSET_MANIFEST_FILENAME} — refusing ` +
+        `to install a payload that does not match the release it came from. ` +
+        `Nothing was changed.`,
+    );
+  }
+
+  io.removeTree(versionDir);
+  io.rename(incoming, versionDir);
+
+  // ── the publish step: one atomic rename over the symlink ──────────────
+  if (io.exists(root) && !io.isSymlink(root)) {
+    // First upgrade from a hand-staged / pre-#4163 real directory. Moved
+    // aside rather than deleted so an operator who staged something there
+    // can get it back; only ONE such copy is ever kept.
+    const aside = `${root}.replaced`;
+    io.removeTree(aside);
+    io.rename(root, aside);
+    log(`moved the pre-existing ${root} aside to ${aside}`);
+  }
+  const linkTmp = `${root}.new-link`;
+  io.remove(linkTmp);
+  io.symlink(basenameOf(versionDir), linkTmp);
+  io.rename(linkTmp, root);
+
+  prunePayloadVersions(io, root, wanted);
+
+  return {
+    installed: true,
+    version: wanted,
+    root,
+    message: `shipped-asset payload ${wanted} installed at ${root} -> ${basenameOf(versionDir)}`,
+  };
+}
+
+/** Payload version currently published at `root`, or null. */
+export function readPayloadVersion(
+  io: Pick<SelfUpdateIO, "readText">,
+  root: string,
+): string | null {
+  const body = io.readText(`${root}/${ASSET_MANIFEST_FILENAME}`);
+  if (body === null) return null;
+  return parseAssetPayloadManifest(body)?.version ?? null;
+}
+
+function basenameOf(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i === -1 ? p : p.slice(i + 1);
+}
+
+/**
+ * Keep the live payload and ONE previous version (so a binary rollback still
+ * has templates to render from), delete the rest. Unbounded growth would add
+ * ~7 MB per release to `/usr/local/share` forever.
+ */
+function prunePayloadVersions(
+  io: SelfUpdateIO,
+  root: string,
+  keepVersion: string,
+): void {
+  const parent = io.dirname(root);
+  const prefix = `${basenameOf(root)}-`;
+  const versions = io
+    .listDir(parent)
+    .filter((n) => n.startsWith(prefix) && /^\d+\.\d+\.\d+$/.test(n.slice(prefix.length)))
+    .map((n) => n.slice(prefix.length))
+    .sort((a, b) => compareReleaseTags(`v${a}`, `v${b}`) ?? 0);
+  const keep = new Set([keepVersion.replace(/^v/, "")]);
+  const previous = versions.filter((v) => !keep.has(v)).pop();
+  if (previous) keep.add(previous);
+  for (const v of versions) {
+    if (!keep.has(v)) io.removeTree(`${parent}/${prefix}${v}`);
   }
 }
 
@@ -477,6 +757,20 @@ export async function performSelfUpdate(opts: {
     );
   }
 
+  // ── payload BEFORE binary (#4163) ──────────────────────────────────
+  // Both artifacts come from `plan.to` and are verified against the same
+  // `checksums` text fetched above, so they cannot be mismatched versions.
+  // Installing the payload first means an interruption between the two
+  // atomic renames leaves new-templates/old-CLI, never new-CLI/old-templates.
+  const payload = await installAssetPayload({
+    tag: plan.to,
+    binaryPath: plan.binaryPath,
+    io,
+    checksumsText: checksums,
+    log,
+  });
+  log(payload.message);
+
   // Archive the OUTGOING binary before the swap so rollback is a copy.
   const previousArchive = versionStorePath(installDir, plan.from);
   try {
@@ -504,8 +798,10 @@ export async function performSelfUpdate(opts: {
     replaced: true,
     newVersion: plan.to,
     binaryPath: plan.binaryPath,
+    payload,
     message:
-      `host CLI ${plan.from} → ${plan.to} (verified sha256, ran clean). ` +
+      `host CLI ${plan.from} → ${plan.to} (verified sha256, ran clean; ` +
+      `asset payload ${payload.version}). ` +
       rollbackHint(installDir, plan.from),
   };
 }

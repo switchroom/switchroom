@@ -1415,11 +1415,18 @@ fi
 # any auth break shows up on the Telegram issues card (#428) the day
 # it starts, not three weeks later. Async + best-effort: never blocks
 # boot and never fails it.
-{{#if repoRoot}}
-if [ -x "{{repoRoot}}/bin/boot-self-test.sh" ]; then
-  ( "{{repoRoot}}/bin/boot-self-test.sh" >/dev/null 2>&1 ) &
+#
+# The path is the IN-CONTAINER one — docker/Dockerfile.agent:229 COPYs
+# `bin/*.sh` to /opt/switchroom/bin. It used to be `{{repoRoot}}/bin/…`,
+# rendered from the CLI's own `import.meta.dirname`: a HOST path baked into a
+# script that only ever runs inside the container. Under `bun build --compile`
+# `import.meta.dirname` is the bunfs root, so repoRoot rendered EMPTY and the
+# `-x` test silently skipped the self-test on every agent (#4163). Even from a
+# source checkout the host repo is not mounted
+# in the agent container, so this had never actually fired.
+if [ -x "/opt/switchroom/bin/boot-self-test.sh" ]; then
+  ( "/opt/switchroom/bin/boot-self-test.sh" >/dev/null 2>&1 ) &
 fi
-{{/if}}
 
 # --- Security-hooks plugin integrity check (sec WS8-F1 / #1416) ---
 # The image-baked, agent-unstrippable tool-safety plugin is loaded via

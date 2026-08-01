@@ -67,7 +67,11 @@ export const EXIT = { complete: 0, badInput: 1, incomplete: 3, notFound: 4 };
  */
 export function expectedAssets(opts = {}) {
   const { installer } = loadInstallerContract(opts);
-  return [...installer.assets, installer.checksumsFile];
+  // The payload tarball (#4163) is as required as the binaries: a release that
+  // carries four binaries and no payload installs a CLI that cannot scaffold a
+  // single agent, which is a worse user experience than a download 404 because
+  // it fails later, on `switchroom apply`, on the user's host.
+  return [...installer.assets, installer.checksumsFile, installer.payloadAsset];
 }
 
 /**

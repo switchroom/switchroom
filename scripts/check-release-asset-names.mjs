@@ -56,7 +56,7 @@ if (problems.length > 0) {
 }
 
 console.log(
-  `OK release asset contract: ${installer.assets.length} assets + ${installer.checksumsFile} ` +
-    `agree between install.sh and release.yml`,
+  `OK release asset contract: ${installer.assets.length} binaries + ${installer.payloadAsset} + ` +
+    `${installer.checksumsFile} agree between install.sh and release.yml`,
 );
-console.log(`   ${installer.assets.join("\n   ")}`);
+console.log(`   ${[...installer.assets, installer.payloadAsset].join("\n   ")}`);
