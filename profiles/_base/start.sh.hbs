@@ -2033,6 +2033,10 @@ esac
 _BAKED_EFFORT={{#if thinkingEffort}}'{{thinkingEffort}}'{{else}}''{{/if}}
 _LKG_EFFORT="$(cat "{{agentDir}}/.configured-default-effort" 2>/dev/null | tr -d '[:space:]' || true)"
 _EFFECTIVE_EFFORT=""
+# Set only when step 1 actually produced a live value — it gates the
+# `.configured-default-effort` write below so the last-known-good file can
+# never record a value that was never live truth.
+_LE_LIVE_OK=""
 if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v switchroom >/dev/null 2>&1; then
   _le_live=""
   for _le_try in 1 2; do
@@ -2048,6 +2052,7 @@ if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v swit
   done
   if [ -n "$_le_live" ]; then
     _EFFECTIVE_EFFORT="$_le_live"
+    _LE_LIVE_OK=1
     if [ "$_le_live" != "$_BAKED_EFFORT" ]; then
       echo "session-effort: live configured thinking_effort '$_le_live' differs from apply-time bake '${_BAKED_EFFORT:-<unset>}' — using the live value (switchroom.yaml is the source of truth)" >&2
     fi
@@ -2056,22 +2061,29 @@ if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v swit
     # Last-known-good beats the bake: it was live truth on a prior boot, while
     # the bake can predate any number of yaml edits. Loud either way.
     _EFFECTIVE_EFFORT="$_LKG_EFFORT"
-    echo "session-effort: live config read FAILED — using last-known-good configured thinking_effort '$_LKG_EFFORT' (apply-time bake: '${_BAKED_EFFORT:-<unset>}')" >&2
-    printf 'switchroom.yaml could not be read at boot, so the agent booted on the last-known-good configured effort `%s`. If you just changed `thinking_effort:`, check the yaml for errors and restart the agent.\n' "$_LKG_EFFORT" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    echo "session-effort: live effort read FAILED or returned an unrecognised level — using last-known-good configured thinking_effort '$_LKG_EFFORT' (apply-time bake: '${_BAKED_EFFORT:-<unset>}')" >&2
+    printf 'The live `thinking_effort:` could not be resolved at boot — switchroom.yaml could not be read, or it held a value this launcher does not recognise. The agent booted on the last-known-good configured effort `%s`. Check `thinking_effort:` in the yaml (low/medium/high/xhigh/max) and restart the agent.\n' "$_LKG_EFFORT" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   else
     _EFFECTIVE_EFFORT="$_BAKED_EFFORT"
-    echo "session-effort: live config read FAILED and no last-known-good value — using apply-time baked thinking_effort '${_BAKED_EFFORT:-<unset>}'" >&2
-    printf 'switchroom.yaml could not be read at boot and no prior boot recorded an effort, so the agent booted on the apply-time default `%s`. If you just changed `thinking_effort:`, check the yaml for errors and restart the agent.\n' "${_BAKED_EFFORT:-<unset>}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    echo "session-effort: live effort read FAILED or returned an unrecognised level, and no last-known-good value — using apply-time baked thinking_effort '${_BAKED_EFFORT:-<unset>}'" >&2
+    printf 'The live `thinking_effort:` could not be resolved at boot — switchroom.yaml could not be read, or it held a value this launcher does not recognise — and no prior boot recorded an effort. The agent booted on the apply-time default `%s`. Check `thinking_effort:` in the yaml (low/medium/high/xhigh/max) and restart the agent.\n' "${_BAKED_EFFORT:-<unset>}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   fi
   unset _le_live _le_try
 else
   _EFFECTIVE_EFFORT="$_BAKED_EFFORT"
 fi
 unset _BAKED_EFFORT _LKG_EFFORT
-# Record the RESOLVED configured default every boot, BEFORE the carrier below
-# can override it — this is the last-known-good the fallback chain reads on the
+# Record the LIVE-RESOLVED configured default, BEFORE the carrier below can
+# override it — this is the last-known-good the fallback chain reads on the
 # NEXT boot, and it must be the configured value, not a session override.
-printf '%s\n' "$_EFFECTIVE_EFFORT" > "{{agentDir}}/.configured-default-effort" 2>/dev/null || true
+# Written ONLY when step 1 genuinely produced a live value: a bake/LKG-fallback
+# boot (or a boot with no config mount at all) has no live truth to record, and
+# writing the bake here would let a LATER failed read cite a "last-known-good"
+# that was never read from switchroom.yaml.
+if [ -n "$_LE_LIVE_OK" ]; then
+  printf '%s\n' "$_EFFECTIVE_EFFORT" > "{{agentDir}}/.configured-default-effort" 2>/dev/null || true
+fi
+unset _LE_LIVE_OK
 if [ -f "{{agentDir}}/.session-effort" ]; then
   _sef="$(cat "{{agentDir}}/.session-effort" 2>/dev/null || true)"
   _se_level="$(printf '%s' "$_sef" | sed -n 's/.*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
