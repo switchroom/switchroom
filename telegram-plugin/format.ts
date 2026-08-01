@@ -31,6 +31,20 @@
 export const RICH_MESSAGE_MAX_CHARS = 32768
 
 /**
+ * The legacy plain-text `sendMessage` / `editMessageText` wire cap (4096
+ * UTF-16 units). It does NOT apply to the rich path (`sendRichMessage`, up to
+ * {@link RICH_MESSAGE_MAX_CHARS}), but it DOES apply the moment a send path
+ * DEGRADES to the plain endpoint — the parse-reject fallbacks that resend a
+ * rich chunk as plain text, and `renderSafe`'s `mode: "plain"` results.
+ *
+ * Lives here (next to the rich cap and the splitters) rather than in
+ * `render/rich-render.ts` so every plain-degradation site can re-cap without
+ * importing the renderer; `render/rich-render.ts` re-exports it for its
+ * existing importers.
+ */
+export const PLAIN_TEXT_MAX_CHARS = 4096
+
+/**
  * Escape the GFM-markdown special characters so a dynamic value
  * (a filename, an id, arbitrary user text) renders LITERALLY inside a
  * hand-built markdown card instead of being parsed as formatting.
@@ -1178,6 +1192,41 @@ export function hardSliceToCap(text: string, cap = RICH_MESSAGE_MAX_CHARS): stri
     out.push(text.slice(i, i + cap))
   }
   return out
+}
+
+/**
+ * Re-cap a body that is about to be sent through the PLAIN `sendMessage` /
+ * `editMessageText` endpoint (switchroom #4043).
+ *
+ * Every plain-text FALLBACK in the send path inherits a chunk that was split
+ * for the RICH cap ({@link RICH_MESSAGE_MAX_CHARS} = 32768). Handing such a
+ * chunk to the plain endpoint (which caps at {@link PLAIN_TEXT_MAX_CHARS} =
+ * 4096) makes Telegram reject it with `message is too long` — so the fallback
+ * that exists precisely to rescue a failed send fails too, and the user never
+ * receives the message (in the outbox sweep it retries forever).
+ *
+ * Cuts at `splitMarkdownChunks`' safe boundaries first (never bisecting a
+ * fenced block or a table row) and hard-slices any residual indivisible region,
+ * so EVERY returned piece is guaranteed `<= cap`. Returns the input as a
+ * single-element array when it already fits (the overwhelmingly common case,
+ * byte-identical to the pre-fix behaviour).
+ */
+export function splitPlainTextToCap(text: string, cap = PLAIN_TEXT_MAX_CHARS): string[] {
+  if (cap <= 0) return [text]
+  if (text.length <= cap) return [text]
+  const out: string[] = []
+  for (const piece of splitMarkdownChunks(text, cap)) {
+    if (piece.length <= cap) {
+      if (piece.length > 0) out.push(piece)
+      continue
+    }
+    // `splitMarkdownChunks` emits an unsplittable region whole; hard-cut it so
+    // the plain endpoint can actually accept it.
+    for (const slice of hardSliceToCap(piece, cap)) {
+      if (slice.length > 0) out.push(slice)
+    }
+  }
+  return out.length > 0 ? out : [text]
 }
 
 // ---------------------------------------------------------------------------
