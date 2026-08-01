@@ -25,6 +25,8 @@ import {
   TOOLS_CACHE_FILENAME,
   SHIM_SUPPORTED_PROTOCOL_VERSIONS,
   SYNTHESIZED_TOOL_NAMES,
+  guardAndClampToolCall,
+  DEFAULT_RECALL_MAX_TOKENS,
   type ShimOptions,
 } from "../src/cli/hindsight-mcp-shim.js";
 
@@ -43,7 +45,11 @@ interface MockBackend {
   url: string;
   server: Server;
   /** Every JSON-RPC request body received, in order. */
-  requests: { method?: string; headers: Record<string, unknown> }[];
+  requests: {
+    method?: string;
+    headers: Record<string, unknown>;
+    params?: { name?: string; arguments?: unknown };
+  }[];
   close: () => Promise<void>;
 }
 
@@ -73,7 +79,11 @@ async function startMockBackend(
         method?: string;
         params?: { name?: string; arguments?: unknown };
       };
-      requests.push({ method: msg.method, headers: { ...req.headers } });
+      requests.push({
+        method: msg.method,
+        headers: { ...req.headers },
+        params: msg.params,
+      });
       const reply = (result: unknown) => {
         const payload = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result });
         if (opts.sse) {
@@ -548,5 +558,183 @@ describe("static fallback manifest", () => {
         expect(Object.keys(schema.properties)).toContain(req);
       }
     }
+  });
+});
+
+// ─── recall/reflect budget clamp + loud unknown-arg rejection ──────────────
+//
+// Two engine holes the shim closes (both live-reproduced): the engine's fat
+// MCP defaults (budget:high + max_tokens:4096 → ~53 facts / ~80KB, over the
+// MCP output cap so it never lands) and its NON-enforcement of
+// additionalProperties:false (an unknown arg like `limit` is dropped silently
+// with isError:false, so the agent thinks it capped results when it did not).
+
+describe("guardAndClampToolCall (unit)", () => {
+  it("rejects recall's nonexistent 'limit' loudly, naming limit AND max_tokens", () => {
+    // On origin/main there is no guard: the arg is forwarded and the engine
+    // silently drops it. This asserts the loud, self-correcting replacement.
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", limit: 6 } },
+      {},
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected rejection");
+    expect(res.text).toContain("limit");
+    expect(res.text).toContain("max_tokens");
+    expect(res.text.toLowerCase()).toContain("budget");
+  });
+
+  it("injects max_tokens + budget:low into a bare recall (caller omitted both)", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x" } },
+      {},
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.max_tokens).toBe(DEFAULT_RECALL_MAX_TOKENS);
+    expect(args.max_tokens).toBe(1024);
+    expect(args.budget).toBe("low");
+    expect(args.query).toBe("x"); // caller arg preserved
+  });
+
+  it("leaves an explicit max_tokens:4096 UNTOUCHED (caller always wins)", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", max_tokens: 4096 } },
+      {},
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.max_tokens).toBe(4096);
+  });
+
+  it("leaves an explicit budget UNTOUCHED (caller always wins)", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", budget: "high" } },
+      {},
+    );
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.budget).toBe("high");
+    expect(args.max_tokens).toBe(1024); // the omitted one is still clamped
+  });
+
+  it("clamps reflect the same way", () => {
+    const res = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x" } },
+      {},
+    );
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.max_tokens).toBe(1024);
+    expect(args.budget).toBe("low");
+  });
+
+  it("honors the env override for the injected budget", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x" } },
+      { HINDSIGHT_SHIM_RECALL_MAX_TOKENS: "600" },
+    );
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.max_tokens).toBe(600);
+  });
+
+  it("does NOT clamp non-recall/reflect tools (retain passes through)", () => {
+    const res = guardAndClampToolCall(
+      { name: "retain", arguments: { content: "hi" } },
+      {},
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.max_tokens).toBeUndefined();
+    expect(args.budget).toBeUndefined();
+  });
+
+  it("passes through tools with no pinned table entry unvalidated", () => {
+    const res = guardAndClampToolCall(
+      { name: "search", arguments: { anything: 1 } },
+      {},
+    );
+    expect(res.ok).toBe(true); // 'search' is not in FALLBACK_TOOL_TABLE
+  });
+
+  // Constraint (d): the accepted-prop list is DERIVED from FALLBACK_TOOL_TABLE
+  // (the single pinned source), not a parallel hand-written list. Proven by
+  // driving the guard off the table entry itself — so the existing contract
+  // fixture pin (FALLBACK_TOOL_TABLE ≡ snapshot) already guards call-time
+  // validation against drift, in both directions.
+  it("accepts EVERY prop the table declares for recall, and only those", () => {
+    const [required, optional] = FALLBACK_TOOL_TABLE.recall;
+    for (const prop of [...required, ...optional]) {
+      const res = guardAndClampToolCall(
+        { name: "recall", arguments: { query: "x", [prop]: "v" } },
+        {},
+      );
+      expect(res.ok, `recall.${prop} should be accepted`).toBe(true);
+    }
+    // A prop NOT in the table is rejected.
+    const bogus = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", not_a_real_prop: 1 } },
+      {},
+    );
+    expect(bogus.ok).toBe(false);
+  });
+});
+
+describe("tools/call clamp + rejection through the live shim", () => {
+  let backend: MockBackend;
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("a bare recall forwards max_tokens:1024 + budget:low to the backend", async () => {
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    await shim.handle(
+      rpc(2, "tools/call", { name: "recall", arguments: { query: "x" } }) as never,
+    );
+    const call = backend.requests.find((r) => r.method === "tools/call");
+    expect(call).toBeDefined();
+    const args = call?.params?.arguments as Record<string, unknown>;
+    expect(args.max_tokens).toBe(1024);
+    expect(args.budget).toBe("low");
+    expect(args.query).toBe("x");
+  });
+
+  it("an explicit max_tokens:4096 reaches the backend untouched", async () => {
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    await shim.handle(
+      rpc(2, "tools/call", {
+        name: "recall",
+        arguments: { query: "x", max_tokens: 4096 },
+      }) as never,
+    );
+    const call = backend.requests.find((r) => r.method === "tools/call");
+    const args = call?.params?.arguments as Record<string, unknown>;
+    expect(args.max_tokens).toBe(4096);
+  });
+
+  it("recall {limit:6} is rejected loudly and NEVER reaches the backend", async () => {
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", { name: "recall", arguments: { limit: 6 } }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("limit");
+    expect(result.content[0].text).toContain("max_tokens");
+    // The silent-drop is prevented: no tools/call was forwarded at all.
+    expect(backend.requests.some((r) => r.method === "tools/call")).toBe(false);
   });
 });
