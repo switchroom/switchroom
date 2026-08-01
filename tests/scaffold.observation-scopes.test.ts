@@ -158,6 +158,112 @@ describe("memory.observation_scopes plumbing", () => {
       expect(reconciled).not.toMatch(/HINDSIGHT_OBSERVATION_SCOPES/);
     });
   });
+
+  /**
+   * #3915 — the settings.json mirror, the OTHER channel.
+   *
+   * start.sh exports HINDSIGHT_OBSERVATION_SCOPES / _STRATEGY into the
+   * SUPERVISED claude session only. A docker-exec'd retain — a
+   * `backfill_transcripts.py` slice, a consolidation drain, `hostd agent_exec` —
+   * does NOT inherit that env, so `lib/config.load_config` falls back to the
+   * plugin's settings.json. Left unmirrored, settings.json carried the vendor
+   * default (scope None / strategy "curated") and the exec'd process retained
+   * under the WRONG scope — silent bank corruption during a reconsolidation.
+   *
+   * So the load-bearing assertion is not "the value reaches start.sh" (the
+   * describe above) but "the value is ALSO in the deployed settings.json, so the
+   * two channels resolve identically". These read the deployed plugin file that
+   * the env-less exec path actually consults.
+   */
+  describe("settings.json mirror for docker-exec'd retains (#3915)", () => {
+    const PLUGIN_REL = [".claude", "plugins", "hindsight-memory", "settings.json"] as const;
+
+    function deployedSettings(
+      memory: Record<string, unknown> | undefined,
+    ): Record<string, unknown> {
+      const config = configFor(memory);
+      const res = scaffoldAgent("probe", config.agents.probe ?? {}, tmpDir, telegram, config);
+      return JSON.parse(
+        readFileSync(join(res.agentDir, ...PLUGIN_REL), "utf-8"),
+      ) as Record<string, unknown>;
+    }
+
+    it("stamps the configured scope + strategy into the file the env-less path reads", () => {
+      // The bug: before the mirror these keys were absent, so an exec'd retain
+      // resolved the vendor default instead of the operator's scope.
+      const s = deployedSettings({
+        observation_scopes: "shared",
+        observation_scope_strategy: "shared",
+      });
+      expect(s.observationScopes).toBe("shared");
+      expect(s.observationScopeStrategy).toBe("shared");
+    });
+
+    it("stamps a strategy-only config (no manual pin) too", () => {
+      const s = deployedSettings({ observation_scope_strategy: "combined" });
+      expect(s.observationScopeStrategy).toBe("combined");
+      // No pin set → no scope key, so the strategy is what decides the scope.
+      expect("observationScopes" in s).toBe(false);
+    });
+
+    it("unset leaves NO observation keys — the vendor default (None/curated) stands", () => {
+      // Over-stamping would change the wire for every agent that configured
+      // nothing; the field must stay absent so config.py keeps its own default.
+      const s = deployedSettings(undefined);
+      expect("observationScopes" in s).toBe(false);
+      expect("observationScopeStrategy" in s).toBe(false);
+    });
+
+    it("an unrelated memory block still stamps NO observation keys", () => {
+      const s = deployedSettings({ collection: "probe" });
+      expect("observationScopes" in s).toBe(false);
+      expect("observationScopeStrategy" in s).toBe(false);
+    });
+
+    it("the settings.json value is BYTE-IDENTICAL to what start.sh exports", () => {
+      // The whole point of the mirror is that the supervised env channel and the
+      // exec'd settings.json channel carry the SAME value. Assert both at once so
+      // a future edit to one cannot silently diverge from the other.
+      const memory = { observation_scopes: "shared", observation_scope_strategy: "shared" };
+      const config = configFor(memory);
+      const res = scaffoldAgent("probe", config.agents.probe ?? {}, tmpDir, telegram, config);
+      const startSh = readFileSync(join(res.agentDir, "start.sh"), "utf-8");
+      const s = JSON.parse(
+        readFileSync(join(res.agentDir, ...PLUGIN_REL), "utf-8"),
+      ) as Record<string, unknown>;
+      expect(startSh).toMatch(/export HINDSIGHT_OBSERVATION_SCOPES='shared'/);
+      expect(startSh).toMatch(/export HINDSIGHT_OBSERVATION_SCOPE_STRATEGY='shared'/);
+      expect(s.observationScopes).toBe("shared");
+      expect(s.observationScopeStrategy).toBe("shared");
+    });
+
+    it("re-asserts the stamp after a reinstall clobbers it (survives apply)", () => {
+      // installHindsightPlugin rm+re-copies the vendor tree on every reconcile;
+      // a mirror that only stamped on first install would be reverted by the
+      // next `switchroom apply` — the exact failure mode the recall-tunables
+      // regression test guards. Reproduce it: install, clobber, reinstall.
+      const memory = { observation_scopes: "shared", observation_scope_strategy: "shared" };
+      const config = configFor(memory);
+      const agentConfig = config.agents.probe ?? {};
+      const res = scaffoldAgent("probe", agentConfig, tmpDir, telegram, config);
+      const settingsPath = join(res.agentDir, ...PLUGIN_REL);
+
+      const clobbered = JSON.parse(readFileSync(settingsPath, "utf-8"));
+      delete clobbered.observationScopes;
+      delete clobbered.observationScopeStrategy;
+      writeFileSync(settingsPath, JSON.stringify(clobbered, null, 2) + "\n");
+      // Sanity: the clobber took, so a green result below means the re-stamp ran.
+      expect(
+        "observationScopes" in
+          (JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>),
+      ).toBe(false);
+
+      reconcileAgent("probe", agentConfig, tmpDir, telegram, config);
+      const s = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+      expect(s.observationScopes).toBe("shared");
+      expect(s.observationScopeStrategy).toBe("shared");
+    });
+  });
 });
 
 /**
