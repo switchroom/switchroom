@@ -339,6 +339,63 @@ export const READ_ONLY_TOOL_NAMES = new Set([
 ]);
 
 /**
+ * Substring of upstream's `ReflectToolCallError` message (hindsight v0.8.6,
+ * `engine/reflect/agent.py` — class at the top of the module, raised from the
+ * `if not saw_tool_call` guard in the agent loop). Matched as a substring
+ * because the message interpolates the provider/model and an arbitrary
+ * response snippet around it.
+ */
+export const REFLECT_NO_TOOL_CALL_SIGNATURE = "produced no usable tool call";
+
+/**
+ * How many times the shim re-issues a `reflect` that failed with
+ * `ReflectToolCallError`.
+ *
+ * WHY THIS IS SAFE TO RETRY POST-DELIVERY, when `Upstream.request` deliberately
+ * never does (see its DOUBLE-EXECUTION GUARD): that guard exists because a
+ * re-sent *write* (retain, create_directive, ...) would be applied twice. This
+ * retry is scoped to `reflect` alone — a read-only synthesis with no persisted
+ * side effect — and only to the one failure mode where upstream provably did
+ * NOT produce an answer. Re-running it is a fresh sampling of the same query.
+ *
+ * WHY IT WORKS: the failure is stochastic, not deterministic. Upstream raises
+ * only when the model emitted zero parseable tool calls across the WHOLE
+ * trajectory; our local gpt-oss-20b ignores forced `tool_choice` and does this
+ * on a minority of runs (~8% measured over the v0.8.5 baseline, n=12), so an
+ * independent re-roll clears it with high probability. If the backend model
+ * genuinely cannot tool-call at all, every attempt fails and the agent still
+ * sees upstream's real, diagnostic error — the retry costs latency, never
+ * correctness.
+ *
+ * Deliberately NOT applied to `refresh_mental_model` / mental-model writes,
+ * which also drive the reflect agent but persist their result.
+ */
+export const REFLECT_TOOL_CALL_RETRIES = 2;
+
+/**
+ * True when `res` is upstream's "reflect could not tool-call" failure for a
+ * `reflect` call. Handles both shapes the backend can answer with: a
+ * JSON-RPC protocol error, and a tool result flagged `isError`.
+ */
+export function isReflectToolCallFailure(
+  toolName: string | undefined,
+  res: { error?: { message?: string }; result?: unknown },
+): boolean {
+  if (toolName !== "reflect") return false;
+  const texts: string[] = [];
+  if (typeof res.error?.message === "string") texts.push(res.error.message);
+  const result = res.result as
+    | { isError?: boolean; content?: Array<{ text?: unknown }> }
+    | undefined;
+  if (result?.isError && Array.isArray(result.content)) {
+    for (const c of result.content) {
+      if (typeof c?.text === "string") texts.push(c.text);
+    }
+  }
+  return texts.some((t) => t.includes(REFLECT_NO_TOOL_CALL_SIGNATURE));
+}
+
+/**
  * Mask secrets in the string leaves of a tool-call argument object.
  *
  * `mcp__hindsight__retain` is an agent-driven write into a memory bank
@@ -1072,12 +1129,25 @@ export class HindsightShim {
     // tool the backend adds later without a code change (see
     // READ_ONLY_TOOL_NAMES — the allowlist is the reads, not the writes).
     const forwarded = redactToolCallParams(guarded.params);
+    const toolName = (guarded.params as { name?: string } | undefined)?.name;
+    const timeoutMs = this.opts.toolsCallTimeoutMs ?? TOOLS_CALL_TIMEOUT_MS;
     try {
-      const res = await this.upstream.request(
-        "tools/call",
-        forwarded,
-        this.opts.toolsCallTimeoutMs ?? TOOLS_CALL_TIMEOUT_MS,
-      );
+      let res = await this.upstream.request("tools/call", forwarded, timeoutMs);
+      // Reflect-only re-roll of upstream's ReflectToolCallError (hindsight
+      // v0.8.6). Read-only and non-deterministic, so re-issuing is safe and
+      // usually succeeds — see REFLECT_TOOL_CALL_RETRIES for the full rationale.
+      for (
+        let attempt = 1;
+        attempt <= REFLECT_TOOL_CALL_RETRIES &&
+        isReflectToolCallFailure(toolName, res);
+        attempt++
+      ) {
+        this.log(
+          `[hindsight-shim] reflect produced no usable tool call; ` +
+            `re-issuing (attempt ${attempt}/${REFLECT_TOOL_CALL_RETRIES})`,
+        );
+        res = await this.upstream.request("tools/call", forwarded, timeoutMs);
+      }
       // Any answer at all proves the backend is reachable again.
       this.notifyIfRecovered();
       if (res.error) {
