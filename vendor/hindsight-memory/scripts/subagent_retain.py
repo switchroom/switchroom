@@ -37,9 +37,9 @@ Flow:
   2. Resolve the sidechain transcript (agent_transcript_path → derived
      subagents/ dir → project-dir scan).
   3. Volume gate: skip sub-agents below the floor (< 6 human turns OR
-     < 2,000 chars of non-tool-result text) — SubagentStop fires for every
-     Task including 10-second forks, and each retain is an LLM-backed
-     extraction.
+     < 2,000 chars of RETAINED text — the chars the text-only path keeps,
+     #3994) — SubagentStop fires for every Task including 10-second forks, and
+     each retain is an LLM-backed extraction.
   4. Retain a bounded window (last N=40 human turns), tagged ``sidechain`` +
      ``parent_session:<id>``, with a deterministic content-derived document_id
      so re-fires upsert instead of duplicating.
@@ -62,7 +62,7 @@ from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.content import (
-    _extract_message_blocks,
+    _extract_text_content,
     _is_tool_result_only_user_message,
     slice_last_turns_by_user_boundary,
     transcript_first_line_is_sidechain,
@@ -78,8 +78,9 @@ from retain import build_retain_payload, read_transcript
 # Retain the last N human turns of the sidechain. The window is formatted on the
 # TEXT-ONLY path (``retainToolCalls`` is forced False for the sidechain — see
 # ``run_subagent_retain``), so tool_use inputs and tool_result bodies are dropped
-# entirely rather than passed through / truncated. ``_extract_message_blocks`` is
-# still imported here, but only for the volume gate's char count.
+# entirely rather than passed through / truncated. ``_extract_text_content`` is
+# imported here so the volume gate's char count measures the SAME text the retain
+# path keeps (#3994) — gate and payload never diverge.
 SIDECHAIN_WINDOW_TURNS = 40
 
 # Volume gate floors — SubagentStop fires for every Task, so skip trivial forks.
@@ -262,59 +263,63 @@ def count_human_turns(messages: list) -> int:
     return n
 
 
-def non_tool_result_char_count(messages: list, stop_at: int | None = None) -> int:
-    """Total chars of non-tool-result content across the transcript.
+def retained_text_char_count(messages: list, stop_at: int | None = None) -> int:
+    """Total chars of the content the TEXT-ONLY retain path actually keeps.
 
-    Sums the extracted text + tool_use (command/input) blocks and EXCLUDES
-    tool_result bodies — the same "text vs tool output" split
-    ``_extract_message_blocks`` already draws. This is the signal the volume
-    gate wants: a 10-second fork with almost no narration/commands falls under
-    the floor even if it emitted a large tool_result, while a real worker's
-    commands and decisions count.
+    #3994 — GATE COUNTS WHAT IS RETAINED. The sidechain payload is built with
+    ``retainToolCalls = False`` (``run_subagent_retain``), so what reaches memory
+    is exactly ``_extract_text_content``: assistant ``text`` blocks, channel-
+    message tool_use text, and plain-string user turns — and NOTHING else. This
+    gate counts the same thing, per message, so "cleared the floor" now means
+    "has >= N chars of RETAINABLE prose", not "emitted N chars of tool traffic
+    the payload then drops".
 
-    KNOWN MISMATCH (accepted, tracked as a follow-up): this counts ``tool_use``
-    inputs, but those are no longer RETAINED — the sidechain payload is built on
-    the text-only path. So the gate can clear on tool volume that contributes
-    nothing to the stored memory. It cannot produce an EMPTY retain (the
-    ``MIN_HUMAN_TURNS`` floor guarantees prose-bearing user turns — see the
-    module docstring), so this is a precision issue in the gate, not a
-    correctness bug. Tightening it to count only text is a separate change.
+    The previous revision counted ``tool_use`` name+input serialized size on top
+    of text. Those chars are no longer in the payload, so the old gate could
+    clear on tool volume that contributed zero to the stored memory (a tool-heavy
+    / prose-light fork passed, then retained a near-empty document). Counting via
+    ``_extract_text_content`` closes that mismatch: gate and payload measure the
+    identical char set. The 2,000-char floor was re-measured against this metric
+    — see ``docs/measurements/subagent-volume-gate-3994.md`` and the replay
+    harness ``scripts/tests/data/replay_volume_gate_3994.py``.
 
     ``stop_at`` (review finding 4 — early short-circuit): return as soon as the
     running total reaches this many chars. The gate only needs to know whether
-    the floor is CLEARED, not the exact size — so on a large worker transcript
-    we stop the block walk the moment the floor is met (the returned value is
-    then a floor, ``>= stop_at``, sufficient for the ``>=`` comparison and the
-    skip log's "chars>=N" read).
+    the floor is CLEARED, not the exact size — so on a large worker transcript we
+    stop the walk the moment the floor is met (the returned value is then a
+    floor, ``>= stop_at``, sufficient for the ``>=`` comparison and the skip
+    log's "chars>=N" read).
     """
     total = 0
     for m in messages:
         if not isinstance(m, dict):
             continue
-        blocks = _extract_message_blocks(m.get("content", ""), role=m.get("role", ""))
-        for b in blocks:
-            if not isinstance(b, dict) or b.get("type") == "tool_result":
-                continue
-            if b.get("type") == "text":
-                total += len(b.get("text", ""))
-            elif b.get("type") == "tool_use":
-                # Command / input is a process fact; count its serialized size.
-                total += len(b.get("name", "")) + len(json.dumps(b.get("input", {}), ensure_ascii=False))
+        # Count exactly the chars the text-only retain path keeps for this
+        # message — identical extraction to ``prepare_retention_transcript``'s
+        # ``include_tool_calls=False`` branch, so gate and payload never diverge.
+        total += len(_extract_text_content(m.get("content", ""), role=m.get("role", "")))
         if stop_at is not None and total >= stop_at:
             return total
     return total
+
+
+# Back-compat alias: the previous name measured a superset (text + tool_use).
+# Kept so an out-of-tree caller does not break, but it now returns the
+# recalibrated text-only count (#3994).
+non_tool_result_char_count = retained_text_char_count
 
 
 def passes_volume_gate(messages: list, config: dict) -> tuple:
     """Return ``(passed, human_turns, char_count)`` for the volume gate.
 
     Skip sub-agents below EITHER floor: < ``MIN_HUMAN_TURNS`` human turns OR
-    < ``MIN_NON_TOOL_RESULT_CHARS`` chars of non-tool-result text. The char walk
-    short-circuits at the floor (finding 4) — ``char_count`` is exact when below
-    the floor and a lower bound (``>= floor``) once cleared.
+    < ``MIN_NON_TOOL_RESULT_CHARS`` chars of RETAINED text (the chars the
+    text-only path actually keeps, #3994). The char walk short-circuits at the
+    floor (finding 4) — ``char_count`` is exact when below the floor and a lower
+    bound (``>= floor``) once cleared.
     """
     turns = count_human_turns(messages)
-    chars = non_tool_result_char_count(messages, stop_at=MIN_NON_TOOL_RESULT_CHARS)
+    chars = retained_text_char_count(messages, stop_at=MIN_NON_TOOL_RESULT_CHARS)
     passed = turns >= MIN_HUMAN_TURNS and chars >= MIN_NON_TOOL_RESULT_CHARS
     return passed, turns, chars
 
@@ -521,7 +526,23 @@ def run_subagent_retain(hook_input: dict) -> dict:
         document_id=None,  # content-derived from the slice's first/last uuids
     )
     if built is None:
+        # #4001 — this must NOT be silent. It is the "should never happen" branch
+        # (the volume gate guarantees >= MIN_NON_TOOL_RESULT_CHARS of retainable
+        # text, so a window that cleared the gate should always format to
+        # something), so if it fires it means the gate and the formatter disagree
+        # about what counts as retainable — a real regression that would
+        # otherwise vanish with debug off in the shipped settings. Emit
+        # unconditionally on stderr so it surfaces in the gateway log regardless
+        # of the debug flag; keep the debug_log for the verbose trace.
         debug_log(config, "SubagentStop: empty transcript after formatting, skipping")
+        print(
+            "[Hindsight] SubagentStop: sidechain window formatted to EMPTY on the "
+            f"text-only path despite clearing the volume gate "
+            f"(session={session_id} agent={agent_id} turns={turns} chars>={chars}) "
+            "— retain skipped. This should not happen; if it recurs the volume "
+            "gate and the text-only formatter have diverged (investigate #3994).",
+            file=sys.stderr,
+        )
         return {"status": "skipped", "reason": "empty transcript after formatting"}
 
     payload = built["payload"]

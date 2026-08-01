@@ -115,21 +115,15 @@ def _run_main_with(client, prompt="what did we decide", config_extra=None):
     return json.loads(raw)["hookSpecificOutput"]["additionalContext"], raw
 
 
-class GateHelpersAreGoneTests(unittest.TestCase):
-    """The gate's machinery must not exist to be re-wired by accident."""
-
-    def test_gate_helpers_are_removed(self):
-        self.assertFalse(hasattr(recall, "containment_overlap"))
-        self.assertFalse(hasattr(recall, "_filter_by_overlap"))
-
-    def test_tokenizer_survives_for_the_transcript_fallback(self):
-        """`_overlap_tokens` is still load-bearing for
-        `_build_transcript_fallback`'s keyword match — deleting it with the
-        gate would silently break the #3369 fallback."""
-        self.assertEqual(
-            recall._overlap_tokens("Deploy the staging server!"),
-            {"deploy", "staging", "server"},
-        )
+#
+# NOTE (#3999): the former ``GateHelpersAreGoneTests`` hasattr guard
+# (``assertFalse(hasattr(recall, "containment_overlap"))``) was dropped as
+# redundant — a re-added-but-unwired helper does nothing, and a re-WIRED gate is
+# already caught by the outcome assertions in ``NoLexicalDroppingIntegrationTests``
+# below (which fail if any candidate is dropped for lexical reasons). Direct
+# characterisation of the surviving ``_overlap_tokens`` tokenizer now lives in
+# ``test_overlap_tokens.py`` (#3777), not in a hasattr check here.
+#
 
 
 class NoLexicalDroppingIntegrationTests(unittest.TestCase):
@@ -151,17 +145,20 @@ class NoLexicalDroppingIntegrationTests(unittest.TestCase):
         self.assertIn("vegan dinner recipes", ctx)
 
     def test_identifier_only_match_survives(self):
-        """The measured root cause: `_overlap_tokens` drops digits and
-        1-char tokens, so a memory whose ONLY relationship to the prompt is
-        an identifier scored 0.0 and was always discarded. Assert directly
-        that the tokenizer still cannot see the identifier, AND that the
-        memory is injected anyway."""
+        """A memory whose ONLY tie to the prompt is an identifier survives.
+
+        This was the measured root cause of the removed gate: `_overlap_tokens`
+        dropped digits, so an identifier-only memory scored 0.0 and was always
+        discarded. Two things now hold: (a) #3578 gave the tokenizer digit
+        vision, so query and memory now DO share the identifier token; and (b)
+        with the gate gone, the memory is injected regardless of overlap."""
         query = PREAMBLE + "did PR #3541 land, and what did v0.19.24 change"
         mem = "#3541 shipped in 0.19.24"
-        self.assertEqual(
+        # Post-#3578 the identifier is visible on both sides.
+        self.assertIn(
+            "3541",
             recall._overlap_tokens(query) & recall._overlap_tokens(mem),
-            set(),
-            "fixture drifted: it must share no ALPHABETIC token with the query",
+            "the shared identifier must now be a token on both sides (#3578)",
         )
         ctx, _ = _run_main_with(_FakeClient([_memory(mem, score=0.95)]), prompt=query)
         self.assertIsNotNone(ctx)

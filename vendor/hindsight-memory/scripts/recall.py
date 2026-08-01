@@ -472,15 +472,30 @@ _OVERLAP_STOPWORDS = frozenset({
 def _overlap_tokens(text) -> set:
     """Tokenize text into a stop-word-stripped, lowercased set of terms.
 
-    Punctuation, digits, and short fragments (<= 1 char) are dropped.
-    Returns an empty set on non-string / empty input.
+    Tokens are maximal runs of ALPHANUMERIC characters (``str.isalnum``);
+    everything else (whitespace, punctuation) is a separator. Short fragments
+    (<= 1 char) and stop-words are dropped. Returns an empty set on non-string /
+    empty input.
+
+    #3578 — DIGITS CARRY SIGNAL. This fallback tokenizer feeds the #3369
+    transcript-grep fallback's keyword match (``_build_transcript_fallback``):
+    a recent transcript turn is kept only if it shares a token with the recall
+    query. This fleet talks in identifiers — "did PR 3993 land", "the :9077
+    port", "v0.19.24" — and the previous ``ch.isalpha()`` accumulation dropped
+    every digit on the floor, so a turn whose ONLY tie to the query was the
+    issue number '3993' shared no token and was filtered out. Accumulating
+    ``isalnum`` runs keeps pure-digit and mixed identifiers ('3993', '9077',
+    'v0') as tokens, so issue numbers, ports and versions match symmetrically on
+    both the query and transcript sides. A lone digit (a bare '9') is still
+    dropped by the ``> 1`` length guard, same as a lone letter — it is noise, not
+    an identifier. See ``tests/test_overlap_tokens.py`` for the characterisation.
     """
     if not isinstance(text, str) or not text:
         return set()
     out = set()
     cur = []
     for ch in text:
-        if ch.isalpha():
+        if ch.isalnum():
             cur.append(ch.lower())
         else:
             if cur:

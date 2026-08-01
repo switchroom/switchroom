@@ -54,6 +54,34 @@
 
 ### Changed (switchroom divergence)
 
+- **Recall/retain hygiene guard-rail batch** (`scripts/recall.py`,
+  `scripts/subagent_retain.py`, `scripts/lib/content.py`, `scripts/tests/**`).
+  Closes guard-rail debt in the fork's hook scripts before extending them:
+  - **#3766** — `shape_recall_query` no longer drops a single-char SUBJECT
+    ('C', 'R', a single-digit version) before the stopword fallback runs. The
+    `len(t) > 1` guard moved into the fallback, so a single-char content word
+    survives while single-char stopwords are still removed.
+  - **#3578** — `_overlap_tokens` (the #3369 transcript-fallback tokenizer) now
+    accumulates alphanumeric runs (`isalnum`), so issue numbers, ports and
+    versions ('3993', ':9077', 'v0') carry signal and match symmetrically on
+    both the query and transcript sides. A lone digit is still dropped as noise.
+  - **#3994** — the sidechain volume gate counts ONLY the chars the text-only
+    retain path keeps (`retained_text_char_count` → `_extract_text_content`),
+    not the `tool_use` inputs the payload drops. Gate and payload now measure
+    the same char set, so a tool-heavy / prose-light fork that used to clear the
+    gate and retain a near-empty document is now correctly skipped. The
+    2,000-char floor was re-measured against the corrected metric —
+    `docs/measurements/subagent-volume-gate-3994.md`, replay harness
+    `scripts/tests/data/replay_volume_gate_3994.py`.
+  - **#4001** — the "window formatted to empty despite clearing the gate" skip
+    now emits an unconditional stderr line, not a debug-only log that was silent
+    in shipped settings.
+  - **#3999 / #3777** — rewrote the vacuous sidechain config-mutation test to
+    assert on the config object the code actually receives (RED when the copy
+    fix is deleted), and restored direct characterisation of `_overlap_tokens`
+    (`scripts/tests/test_overlap_tokens.py`) that was deleted with the removed
+    lexical gate while the tokenizer stayed load-bearing.
+
 - **`MAX_DIRECTIVES` 15 → 30, and truncation is no longer SILENT**
   (`scripts/lib/directives.py`). Live fleet active-directive counts were 24
   (assistant), 17 (klanker), 15 (carrie) against a client-side cap of 15, so the
