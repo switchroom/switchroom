@@ -47,10 +47,12 @@ import {
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import {
   FlushedTurnSupersedeRegistry,
-  DEFAULT_SUPERSEDE_TTL_MS,
+  SUPERSEDE_OPEN_WINDOW_CAP_MS,
+  SUPERSEDE_COMPLETED_GRACE_MS,
   flushedAnswerMatchesReply,
 } from '../flushed-turn-supersede.js'
 import type { ReplyOwnerTier, ReplyOwnerCandidates } from '../reply-owner-resolve.js'
+import { resolveReplyOwnerTier, resolveReplyOwnerTurnId } from '../reply-owner-resolve.js'
 import { SubagentHandbackMarker, stampsHandbackMarker } from '../gateway/subagent-handback-marker.js'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js'
 import { redact } from '../secret-detect/redact.js'
@@ -83,7 +85,7 @@ function ownerRes(
       quotedTurnId: tier === 'quoted' ? id : null,
       latestEndedTurnId: id,
       latestEndedAgeMs: 30_000,
-      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
       ...over,
     },
   }
@@ -624,10 +626,35 @@ describe('structural wiring — the singleton + the gateway entry point (#2996 P
     expect(moduleSrc.match(/new OutboundDedupCache\(/g) ?? []).toHaveLength(0)
   })
 
-  it('executeReply is a thin wrapper: pins the turn and delegates to sendReply', () => {
+  it('executeReply is a thin wrapper: pins the turn, computes the caller-identity ' +
+    'gate (#4172), and delegates to sendReply', () => {
     const after = gatewaySrc.split('async function executeReply(')[1] ?? ''
     const body = after.split('\nasync function ')[0] ?? after
-    expect(body).toContain('return sendReply(gatewaySendReplyDeps(), { args, turn: currentTurn })')
+    expect(body).toContain('return sendReply(gatewaySendReplyDeps(), {')
+    expect(body).toContain('turn: currentTurn')
+    // #4172 wiring pin — dropping the identity plumbing silently re-opens the
+    // cron-edits-over-flushed-answer hole, so its presence is pinned here.
+    expect(body).toContain('callerIsForeignSession: replyCallerIsForeignSession(callerAgentName)')
+  })
+
+  it('#4172 wiring — onToolCall threads the calling client identity into the dispatch', () => {
+    expect(gatewaySrc).toContain('executeToolCall(msg.tool, msg.args, client.agentName)')
+  })
+
+  it('#4173/#4175 wiring — the owner-resolver candidates carry the completion ' +
+    'window bounds (dropping them now fails CLOSED, not open)', () => {
+    // The composition lives in reply-owner-wiring.ts (anti-inflation ratchet);
+    // the gateway keeps a thin wrapper that binds its stateful lookups.
+    const wiringSrc = readFileSync(
+      new URL('../gateway/reply-owner-wiring.ts', import.meta.url),
+      'utf8',
+    )
+    expect(wiringSrc).toContain('latestEndedTtlMs: SUPERSEDE_OPEN_CAP_MS')
+    expect(wiringSrc).toContain('latestEndedRealEndAgeMs')
+    expect(wiringSrc).toContain('latestEndedCompletedGraceMs: SUPERSEDE_GRACE_MS')
+    const after = gatewaySrc.split('function resolveReplyOwnerTurn(')[1] ?? ''
+    const body = after.split('\nfunction ')[0] ?? after
+    expect(body).toContain('resolveReplyOwnerTurnWith(')
   })
 
   it('the injected deps carry the singleton + BOTH turn accessors (Amendment 9)', () => {
@@ -1455,7 +1482,7 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     const owner = makeFlushDeliveredEndedTurn()
     seedRecord(h, owner)
     h.deps.resolveReplyOwnerTurn = () =>
-      ownerRes(owner, 'origin', { latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 1 })
+      ownerRes(owner, 'origin', { latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 1 })
     h.deps.getLastSubagentHandbackAt = () => null
 
     const res = await sendReply(h.deps, req(REWORDED_SAME_TURN_ANSWER))
@@ -1473,7 +1500,7 @@ describe('2026-08-01 klanker incident — slow flush→reply gap through the REA
   // delivered msg 25680 at 21:17:04, a proactive /compact ran, the Stop hook
   // nudged the model, and the canonical `reply` landed at 21:19:28 — 143 s
   // after the flush, REWORDED post-compact (1770 vs 1563 chars). Under the old
-  // 60 s DEFAULT_SUPERSEDE_TTL_MS the registry record was 'expired' AND the
+  // 60 s SUPERSEDE_OPEN_WINDOW_CAP_MS the registry record was 'expired' AND the
   // latest-ended owner tier rejected the 143 s-old turn, so msg 25682 shipped
   // as a visible duplicate. This drives the REAL sendReply with the incident
   // timeline and asserts the outcome: the late reply corrects the flushed
@@ -1534,6 +1561,257 @@ describe('2026-08-01 klanker incident — slow flush→reply gap through the REA
     // …and NO second bubble shipped — the exact duplicate the incident produced.
     expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
     expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+})
+
+
+describe('#4172 — a foreign-session (cheap-cron) reply can never touch a flushed answer', () => {
+  const OWNER_TURN_ID = `${CHAT}:_#flushed-90`
+  const FLUSH_MSG_ID = 25680
+  const FLUSHED_TEXT =
+    'Pulled the live numbers from the usage table. Two findings, and the second one matters: ' +
+    'the per-turn cost is dominated by cache writes, not output tokens, so trimming reply ' +
+    'length will not move the bill much.'
+  // The measured #4172 shape: an unrelated Tier-1 cron digest landing 90 s
+  // after the flush — decoupled (no live turn), foreign content, NO handback
+  // marker (a cheap-cron fire never traverses pendingInboundBuffer.push).
+  const CRON_DIGEST =
+    'Morning digest: 3 PRs merged overnight, CI green on main, no pages. ' +
+    'Standup is at 9:30 and the vault broker cert renews tomorrow.'
+
+  function makeFlushedOwner(): CurrentTurn {
+    return {
+      turnId: OWNER_TURN_ID,
+      sessionChatId: CHAT,
+      answerDelivered: 'flush',
+      flushedAnswerText: FLUSHED_TEXT,
+      endedAt: Date.now() - 90_000,
+      // #4173 — window OPEN: the flush ended the turn synthetically and the
+      // session's real turn_end has not been observed.
+      realEndObservedAt: null,
+      replyCalled: false,
+      finalAnswerDelivered: true,
+      finalAnswerSubstantive: true,
+    } as unknown as CurrentTurn
+  }
+
+  function seed(h: ReturnType<typeof makeHarness>): CurrentTurn {
+    const owner = makeFlushedOwner()
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      { turnId: OWNER_TURN_ID, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now() - 90_000,
+    )
+    // Latest-ended tier, corroborated, no marker → the bypass would apply for
+    // a MAIN-session reply. The identity gate is the only thing standing
+    // between the cron digest and the flushed answer.
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
+    h.deps.getLastSubagentHandbackAt = () => null
+    return owner
+  }
+
+  it('BLOCKER REPRO: the cron digest sends FRESH — zero edits/deletes of the ' +
+    'flushed message, record intact for the turn\'s own replay', async () => {
+    const h = makeHarness()
+    seed(h)
+
+    const res = await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: CRON_DIGEST },
+      turn: null,
+      callerIsForeignSession: true, // the `<agent>-cron` bridge (#4172)
+    })
+
+    // OUTCOME: msg A untouched; the digest is a fresh, NOTIFYING message.
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('Morning digest')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // The record survives for the flushed turn's own genuine late replay.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  it('NEGATIVE CONTROL (the measured failure): the SAME reply on the main-bridge ' +
+    'path destroys the flushed answer by edit — proving the identity gate is ' +
+    'load-bearing, not incidental', async () => {
+    const h = makeHarness()
+    seed(h)
+
+    // Identical scenario, but the caller is treated as the main session (the
+    // pre-fix behaviour): bypass applies → the digest edits over msg A — the
+    // #4172 double loss (flushed answer destroyed, digest delivered silently).
+    await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: CRON_DIGEST },
+      turn: null,
+      callerIsForeignSession: false,
+    })
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+  })
+
+  it('a foreign-session reply is never swallowed by the flush-armed latch ' +
+    '(pre-record race window)', async () => {
+    // The flush FIRED but has not recorded yet (no supersede record, latch
+    // armed, no flushed text stashed → replyMatchesFlushedAnswer resolves
+    // null). A main-session late reply is suppressed here (the flush race);
+    // the cron digest must NOT be — suppressing it silently drops the user's
+    // scheduled output.
+    const h = makeHarness()
+    const owner = {
+      ...makeFlushedOwner(),
+      flushedAnswerText: null,
+    } as unknown as CurrentTurn
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended')
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: CRON_DIGEST.repeat(2) }, // ≥200 chars → substantive
+      turn: null,
+      callerIsForeignSession: true,
+    })
+
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(1)
+  })
+})
+
+describe('#4173 — the completed window closes the same-bridge decoupled-reply hole ' +
+  '(Task sub-agent replying after the parent turn ended)', () => {
+  const OWNER_TURN_ID = `${CHAT}:_#flushed-77`
+  const FLUSH_MSG_ID = 31337
+  const FLUSHED_TEXT =
+    'Deployment review finished: the canary is healthy, error rates are flat, and the ' +
+    'rollout can proceed to the next ring this afternoon.'
+  const LATE_WORKER_REPLY =
+    'Background worker done: the log-archive sweep compressed 14 GB across three agents ' +
+    'and freed the disk pressure alert. Full manifest is in the shared drive.'
+
+  it('a foreign-content reply landing 90 s AFTER the real turn_end resolves NO owner ' +
+    'through the REAL tier rule → sends fresh, flushed answer untouched', async () => {
+    const h = makeHarness()
+    const realEndAgo = 90_000 // > SUPERSEDE_COMPLETED_GRACE_MS
+    const owner = {
+      turnId: OWNER_TURN_ID,
+      sessionChatId: CHAT,
+      answerDelivered: 'flush',
+      flushedAnswerText: FLUSHED_TEXT,
+      endedAt: Date.now() - realEndAgo,
+      realEndObservedAt: Date.now() - realEndAgo, // real turn_end OBSERVED
+      replyCalled: false,
+      finalAnswerDelivered: true,
+      finalAnswerSubstantive: true,
+    } as unknown as CurrentTurn
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      {
+        turnId: OWNER_TURN_ID,
+        messageIds: [FLUSH_MSG_ID],
+        text: FLUSHED_TEXT,
+        completedAt: Date.now() - realEndAgo,
+      },
+      Date.now() - realEndAgo,
+    )
+    // Drive the REAL acceptance rule (the exact composition the gateway runs):
+    // the candidates carry the completed-window signal, so the latest-ended
+    // tier REJECTS the 90 s-stale turn and the owner resolves null.
+    const candidates: ReplyOwnerCandidates = {
+      liveTurnId: null,
+      originTurnId: null,
+      quotedTurnId: null,
+      latestEndedTurnId: OWNER_TURN_ID,
+      latestEndedAgeMs: realEndAgo,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
+      latestEndedRealEndAgeMs: realEndAgo,
+      latestEndedCompletedGraceMs: SUPERSEDE_COMPLETED_GRACE_MS,
+    }
+    const tier = resolveReplyOwnerTier(candidates)
+    expect(tier).toBe('none') // the completed window did its job
+    const winnerId = resolveReplyOwnerTurnId(candidates)
+    h.deps.resolveReplyOwnerTurn = () => ({
+      turn: winnerId != null ? owner : null,
+      tier,
+      candidates,
+    })
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: LATE_WORKER_REPLY },
+      turn: null, // decoupled — the parent turn ended long ago
+    })
+
+    // OUTCOME: fresh send; the flushed answer is not edited or deleted.
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('log-archive sweep')
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+})
+
+
+describe('#4174 — the handback gate-hold is bounded by its OWN 60 s recency window', () => {
+  const OWNER_TURN_ID = `${CHAT}:_#flushed-55`
+  const FLUSH_MSG_ID = 8181
+  const FLUSHED_TEXT =
+    'Checked the backup job: last night\'s run completed in 41 minutes, all four volumes ' +
+    'verified clean, and the retention sweep pruned the January snapshots as scheduled.'
+  const REWORDED_OWN_REPLY =
+    'Backup status: the overnight run finished in about forty minutes, every volume passed ' +
+    'verification, and the retention sweep removed the January snapshots on schedule.'
+
+  it('a handback enqueued 90 s ago (outside HANDBACK_RECENCY_WINDOW_MS) no longer ' +
+    'holds the content gate — the turn\'s own reworded reply still collapses to ONE message', async () => {
+    const h = makeHarness()
+    const owner = {
+      turnId: OWNER_TURN_ID,
+      sessionChatId: CHAT,
+      answerDelivered: 'flush',
+      flushedAnswerText: FLUSHED_TEXT,
+      endedAt: Date.now() - 120_000,
+      realEndObservedAt: null, // window open — session still composing
+      replyCalled: false,
+      finalAnswerDelivered: true,
+      finalAnswerSubstantive: true,
+    } as unknown as CurrentTurn
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      { turnId: OWNER_TURN_ID, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now() - 120_000,
+    )
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(owner, 'latest-ended', {
+      latestEndedAgeMs: 120_000,
+      latestEndedRealEndAgeMs: null,
+    })
+    // A handback WAS enqueued after the turn ended — but 90 s ago, outside the
+    // 60 s recency window. Tying this read to the (minutes-long) supersede
+    // bound would hold the gate here and ship a visible duplicate — the exact
+    // #4174 regression; this test goes red under that mutation.
+    h.deps.getLastSubagentHandbackAt = () => Date.now() - 90_000
+
+    const res = await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: REWORDED_OWN_REPLY },
+      turn: null,
+    })
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
     expect(res.content[0]!.text).toMatch(/^sent/)
   })
 })

@@ -23,7 +23,9 @@ import {
   decideSupersedeCorrection,
   flushedAnswerMatchesReply,
   FlushedTurnSupersedeRegistry,
-  DEFAULT_SUPERSEDE_TTL_MS,
+  FlushCompletionTracker,
+  SUPERSEDE_OPEN_WINDOW_CAP_MS,
+  SUPERSEDE_COMPLETED_GRACE_MS,
   SUPERSEDE_MATCH_MIN_CONTAINMENT_CHARS,
   type FlushedTurnRecord,
 } from '../flushed-turn-supersede.js'
@@ -33,6 +35,8 @@ const rec = (over: Partial<FlushedTurnRecord> = {}): FlushedTurnRecord => ({
   messageIds: [101, 102],
   text: 'narration\n\nthe real answer',
   ts: 1_000_000,
+  // #4173 — default fixture is an OPEN window (real turn_end not yet observed).
+  completedAt: null,
   ...over,
 })
 
@@ -133,11 +137,12 @@ describe('decideSupersede — the duplicate-reply decision core', () => {
     expect(d.reason).toBe('different-turn')
   })
 
-  it('2026-08-01 incident gap: a record is still live 143 s after the flush ' +
+  it('2026-08-01 incident gap: an OPEN record is still live 143 s after the flush ' +
     '(Stop-hook nudge + proactive /compact delayed the canonical reply)', () => {
     // klanker msgs 25680/25682: under the old 60 s TTL this returned 'expired'
-    // and the reply shipped as a second bubble. The default window must cover
-    // at least the observed slow-path gap.
+    // and the reply shipped as a second bubble. With the turn-completion window
+    // (#4173) the record stays claimable while the session is still composing
+    // (real turn_end not yet observed — completedAt null).
     const d = decideSupersede(rec(), {
       liveTurnId: 'turn-A',
       now: 1_000_000 + 143_000,
@@ -146,10 +151,46 @@ describe('decideSupersede — the duplicate-reply decision core', () => {
     expect(d.reason).toBe('supersede')
   })
 
-  it('does NOT supersede once the record is past its TTL', () => {
+  it('#4173 outcome: an OPEN record survives a 20-minute /compact — any fixed ' +
+    'sub-20-min TTL turns this red', () => {
+    // The point of the completion signal over a widened constant: a compaction
+    // longer than any tuned TTL still collapses to ONE bubble, because the
+    // claude session has not stopped (no real turn_end observed).
     const d = decideSupersede(rec(), {
       liveTurnId: 'turn-A',
-      now: 1_000_000 + DEFAULT_SUPERSEDE_TTL_MS + 1,
+      now: 1_000_000 + 20 * 60_000,
+    })
+    expect(d.supersede).toBe(true)
+    expect(d.reason).toBe('supersede')
+  })
+
+  it('an OPEN record past the crash-backstop cap does NOT supersede', () => {
+    const d = decideSupersede(rec(), {
+      liveTurnId: 'turn-A',
+      now: 1_000_000 + SUPERSEDE_OPEN_WINDOW_CAP_MS + 1,
+    })
+    expect(d.supersede).toBe(false)
+    expect(d.reason).toBe('expired')
+  })
+
+  it('#4173: a COMPLETED record stays claimable through the replay grace ' +
+    '(the bridge-reconnect tool_call replay class) …', () => {
+    const d = decideSupersede(rec({ completedAt: 1_010_000 }), {
+      liveTurnId: 'turn-A',
+      now: 1_010_000 + SUPERSEDE_COMPLETED_GRACE_MS - 1,
+    })
+    expect(d.supersede).toBe(true)
+  })
+
+  it('… and EXPIRES past the grace — a late claimant (the Task-sub-agent-after-' +
+    'turn-end shape) can no longer reach the record at all', () => {
+    // Once the session stopped and the grace lapsed, nothing may edit/delete
+    // the flushed answer — a genuinely late duplicate ships fresh (safe).
+    const d = decideSupersede(rec({ completedAt: 1_010_000 }), {
+      liveTurnId: 'turn-A',
+      replyText: 'unrelated worker handback content, definitely not the answer',
+      positiveAttribution: true,
+      now: 1_010_000 + SUPERSEDE_COMPLETED_GRACE_MS + 1,
     })
     expect(d.supersede).toBe(false)
     expect(d.reason).toBe('expired')
@@ -262,7 +303,7 @@ describe('FlushedTurnSupersedeRegistry — record / peek / take lifecycle', () =
   })
 
   it('size() evicts expired records and prunes emptied lanes', () => {
-    const reg = new FlushedTurnSupersedeRegistry({ ttlMs: 1000 })
+    const reg = new FlushedTurnSupersedeRegistry({ openCapMs: 1000 })
     reg.record('chat1', undefined, { turnId: 'turn-A', messageIds: [1], text: 'a' }, 1000)
     reg.record('chat1', undefined, { turnId: 'turn-B', messageIds: [2], text: 'b' }, 1000)
     expect(reg.size(1500)).toBe(2)
@@ -270,7 +311,7 @@ describe('FlushedTurnSupersedeRegistry — record / peek / take lifecycle', () =
   })
 
   it('record() actively sweeps expired records (LOW-2 GC — no orphan accumulation)', () => {
-    const reg = new FlushedTurnSupersedeRegistry({ ttlMs: 1000 })
+    const reg = new FlushedTurnSupersedeRegistry({ openCapMs: 1000 })
     reg.record('chat1', undefined, { turnId: 'turn-A', messageIds: [1], text: 'a' }, 1000)
     // A much later flush on a DIFFERENT lane sweeps the now-expired turn-A record.
     reg.record('chat2', undefined, { turnId: 'turn-B', messageIds: [2], text: 'b' }, 5000)
@@ -447,12 +488,12 @@ describe('positiveAttribution — tier-gated content check', () => {
     expect(d.reason).toBe('different-turn')
   })
 
-  it('positiveAttribution=true still respects the TTL (expired record never supersedes)', () => {
-    const d = decideSupersede(rec({ text: FLUSHED }), {
+  it('positiveAttribution=true still respects the window (expired record never supersedes)', () => {
+    const d = decideSupersede(rec({ text: FLUSHED, completedAt: 1_000_000 }), {
       liveTurnId: 'turn-A',
       replyText: REWORDED,
       positiveAttribution: true,
-      now: 1_000_000 + DEFAULT_SUPERSEDE_TTL_MS + 1,
+      now: 1_000_000 + SUPERSEDE_COMPLETED_GRACE_MS + 1,
     })
     expect(d.supersede).toBe(false)
     expect(d.reason).toBe('expired')
@@ -481,5 +522,53 @@ describe('positiveAttribution — tier-gated content check', () => {
     expect(positive.supersede).toBe(true)
     expect(positive.deleteMessageIds).toEqual([8001])
     expect(reg.peek('chatT', undefined, { liveTurnId: 'turn-Q', now: now + 7_000 }).reason).toBe('no-record')
+  })
+})
+
+describe('#4173 — turn-completion window plumbing (completeAll / FlushCompletionTracker)', () => {
+  it('completeAll(now) flips OPEN records to grace-bounded; already-completed keep their earlier stamp', () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    reg.record('chat1', undefined, { turnId: 'turn-A', messageIds: [1], text: 'a' }, 1_000)
+    reg.record('chat1', undefined, { turnId: 'turn-B', messageIds: [2], text: 'b', completedAt: 2_000 }, 1_000)
+    reg.completeAll(50_000)
+    // turn-A: completed at 50s → claimable until 50s+grace, expired after.
+    expect(reg.peek('chat1', undefined, { liveTurnId: 'turn-A', now: 50_000 + SUPERSEDE_COMPLETED_GRACE_MS - 1 }).supersede).toBe(true)
+    expect(reg.peek('chat1', undefined, { liveTurnId: 'turn-A', now: 50_000 + SUPERSEDE_COMPLETED_GRACE_MS + 1 }).reason).toBe('expired')
+    // turn-B kept its ORIGINAL earlier completion (2s) — completeAll never widens.
+    expect(reg.peek('chat1', undefined, { liveTurnId: 'turn-B', now: 2_000 + SUPERSEDE_COMPLETED_GRACE_MS + 1 }).reason).toBe('expired')
+  })
+
+  it('a record born completed (flush send finished AFTER the close) is grace-bounded, never open', () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    // The close ran at t=5s while the flush send was in flight; record lands at
+    // t=6s carrying the atom's stamped completion.
+    reg.record('chatX', undefined, { turnId: 'turn-C', messageIds: [9], text: 'c', completedAt: 5_000 }, 6_000)
+    expect(reg.peek('chatX', undefined, { liveTurnId: 'turn-C', now: 5_000 + SUPERSEDE_COMPLETED_GRACE_MS + 1 }).reason).toBe('expired')
+  })
+
+  it('FlushCompletionTracker: open() nulls realEndObservedAt; closeAll() stamps every pending atom once', () => {
+    const t = new FlushCompletionTracker()
+    const turnA = { realEndObservedAt: 111 as number | null }
+    const turnB = { realEndObservedAt: 222 as number | null }
+    t.open(turnA)
+    t.open(turnB)
+    expect(turnA.realEndObservedAt).toBeNull()
+    expect(turnB.realEndObservedAt).toBeNull()
+    expect(t.pendingCount()).toBe(2)
+    expect(t.closeAll(9_000)).toBe(2)
+    expect(turnA.realEndObservedAt).toBe(9_000)
+    expect(turnB.realEndObservedAt).toBe(9_000)
+    expect(t.pendingCount()).toBe(0)
+    // Idempotent: nothing pending → nothing closed, stamps untouched.
+    expect(t.closeAll(10_000)).toBe(0)
+    expect(turnA.realEndObservedAt).toBe(9_000)
+  })
+
+  it('FlushCompletionTracker: re-open of the same atom does not double-register', () => {
+    const t = new FlushCompletionTracker()
+    const turn = { realEndObservedAt: null as number | null }
+    t.open(turn)
+    t.open(turn)
+    expect(t.pendingCount()).toBe(1)
   })
 })

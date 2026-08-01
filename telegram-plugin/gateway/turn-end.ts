@@ -437,10 +437,18 @@ function endCurrentTurnAtomic(
   const turnEndedAt = Date.now()
   // 2026-07 double-reply-on-DM fix (F2) — stamp the turn's end time so the
   // `latest-ended` supersede tier can be recency-bounded to the
-  // supersede TTL (a stale latest-ended turn must not inherit deletion
+  // turn-completion window (a stale latest-ended turn must not inherit deletion
   // authority over a newer turn's flush record). Set once; idempotent on the
   // deferRecord flush path (which calls this synchronously before its send).
   turn.endedAt = turnEndedAt
+  // #4173 — default completion stamp: for every ordinary turn-end path, the
+  // turn ending IS the session's real stop, so the completion window is born
+  // closed (the latest-ended tier keeps its tight ~60 s replay grace). The ONE
+  // path where that is false — the answer-ready quiescence flush, which ends
+  // the turn synthetically while the session is still composing — re-opens the
+  // window right after this call (`flushCompletionTracker.open`, stream-render
+  // turn-flush branch) and holds it until the REAL turn_end is observed.
+  turn.realEndObservedAt = turnEndedAt
   process.stderr.write(
     `telegram gateway: ${formatTurnLifecycle('clear', 'turn_end', turn, turnEndedAt)}\n`,
   )

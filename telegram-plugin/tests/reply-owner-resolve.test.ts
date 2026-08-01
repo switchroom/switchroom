@@ -39,7 +39,7 @@ import {
   type ReplyOwnerTier,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
-import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry, SUPERSEDE_OPEN_WINDOW_CAP_MS, SUPERSEDE_COMPLETED_GRACE_MS } from '../flushed-turn-supersede.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { latestTurnForChat } from '../gateway/latest-turn-lookup.js'
 
@@ -48,6 +48,10 @@ const NONE: ReplyOwnerCandidates = {
   originTurnId: null,
   quotedTurnId: null,
   latestEndedTurnId: null,
+  // #4175 — an omitted age/ttl now fails CLOSED, so precedence fixtures carry a
+  // fresh bound; the fail-closed default has its own dedicated tests below.
+  latestEndedAgeMs: 1_000,
+  latestEndedTtlMs: 60_000,
 }
 
 /** The OLD (pre-fix) resolver chain the gateway ran on main — the 2-tier
@@ -229,6 +233,8 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
     originTurnId: null,
     quotedTurnId: null,
     latestEndedTurnId: null,
+    latestEndedAgeMs: 1_000,
+    latestEndedTtlMs: 60_000,
   }
 
   it('accepts a latest-ended turn that ended within the supersede TTL', () => {
@@ -236,8 +242,8 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
       resolveReplyOwnerTurnId({
         ...base,
         latestEndedTurnId: 'turn-T',
-        latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS - 1,
-        latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+        latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS - 1,
+        latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
       }),
     ).toBe('turn-T')
   })
@@ -248,8 +254,8 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
       resolveReplyOwnerTurnId({
         ...base,
         latestEndedTurnId: 'turn-STALE',
-        latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 5_000,
-        latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+        latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 5_000,
+        latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
       }),
     ).toBeNull()
   })
@@ -267,8 +273,8 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
     const ownerId = resolveReplyOwnerTurnId({
       ...base,
       latestEndedTurnId: 'turn-STALE',
-      latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 5_000,
-      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 5_000,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
     })
     expect(ownerId).toBeNull()
     const decision = reg.take(CHAT, undefined, { liveTurnId: ownerId, now: now + 10 })
@@ -277,10 +283,29 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
     expect(reg.peek(CHAT, undefined, { liveTurnId: 'turn-T2', now: now + 10 }).supersede).toBe(true)
   })
 
-  it('unbounded when no age is supplied (back-compat: pre-F2 precedence intact)', () => {
+  it('#4175 — an OMITTED age fails CLOSED: dropped bound wiring degrades to a ' +
+    'visible dup, never unbounded destructive authority', () => {
+    // Pre-#4175 this was the "unbounded back-compat escape": omitting the age
+    // granted UNBOUNDED deletion authority — i.e. the failure mode of DROPPING
+    // the gateway's `latestEndedAgeMs`/`latestEndedTtlMs` wiring was fail-OPEN.
+    // Restoring that escape (return true on undefined age/ttl) turns this red.
     expect(
-      resolveReplyOwnerTurnId({ ...base, latestEndedTurnId: 'turn-T' }),
-    ).toBe('turn-T')
+      resolveReplyOwnerTurnId({
+        ...base,
+        latestEndedTurnId: 'turn-T',
+        latestEndedAgeMs: undefined,
+        latestEndedTtlMs: undefined,
+      }),
+    ).toBeNull()
+    // ttl alone omitted → also closed.
+    expect(
+      resolveReplyOwnerTurnId({
+        ...base,
+        latestEndedTurnId: 'turn-T',
+        latestEndedAgeMs: 1_000,
+        latestEndedTtlMs: undefined,
+      }),
+    ).toBeNull()
   })
 })
 
@@ -475,7 +500,7 @@ describe('#3426 — async sub-agent handback after an interim-ack turn', () => {
       quotedTurnId: null,
       latestEndedTurnId: owner.turnId,
       latestEndedAgeMs: HANDBACK_AGE_MS,
-      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
     })
     expect(ownerId).toBe(ACK_TURN)
 
@@ -629,6 +654,8 @@ describe('resolveReplyOwnerTier — precedence + latest-ended TTL bound', () => 
     originTurnId: null,
     quotedTurnId: null,
     latestEndedTurnId: null,
+    latestEndedAgeMs: 1_000,
+    latestEndedTtlMs: 60_000,
   }
 
   it('live wins over every lower tier', () => {
@@ -657,8 +684,8 @@ describe('resolveReplyOwnerTier — precedence + latest-ended TTL bound', () => 
     const stale: ReplyOwnerCandidates = {
       ...base,
       latestEndedTurnId: 'E',
-      latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 1,
-      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 1,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
     }
     expect(resolveReplyOwnerTier(stale)).toBe('none')
     // And the id resolver agrees (no destructive authority granted to a stale turn).
@@ -718,7 +745,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     quotedTurnId: null,
     latestEndedTurnId: OWNER,
     latestEndedAgeMs: 30_000,
-    latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
     ...over,
   })
 
@@ -806,7 +833,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     'still denies a past-TTL turn any bypass authority', () => {
     const stale = cands({
       originTurnId: OWNER,
-      latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 1,
+      latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 1,
     })
     expect(
       decideContentGateBypass({
@@ -871,8 +898,8 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
   const IDS = [null, OWNER, OTHER] as const
   /** fresh / stale / unbounded (no age+ttl — the documented back-compat path). */
   const AGES = [
-    { label: 'fresh', ageMs: 30_000 as number | null, ttlMs: DEFAULT_SUPERSEDE_TTL_MS as number | undefined },
-    { label: 'stale', ageMs: DEFAULT_SUPERSEDE_TTL_MS + 1, ttlMs: DEFAULT_SUPERSEDE_TTL_MS },
+    { label: 'fresh', ageMs: 30_000 as number | null, ttlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS as number | undefined },
+    { label: 'stale', ageMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 1, ttlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS },
     { label: 'unbounded', ageMs: null, ttlMs: undefined },
   ]
 
@@ -1069,7 +1096,7 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
       quotedTurnId: null,
       latestEndedTurnId: latestEnded?.turnId ?? null,
       latestEndedAgeMs: latestEnded?.endedAt != null ? NOW - latestEnded.endedAt : null,
-      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
       ...over,
     }
   }
@@ -1172,14 +1199,14 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
     expect(preFixOwnerId(prefix)).toBe(RUNNING)
   })
 
-  it('layer 2: an EXPLICIT null age is rejected outright, while an OMITTED age ' +
-    'keeps the pre-F2 back-compat escape', () => {
+  it('layer 2: an EXPLICIT null age is rejected outright, and an OMITTED age ' +
+    'fails closed too (#4175)', () => {
     const base: ReplyOwnerCandidates = {
       liveTurnId: null,
       originTurnId: null,
       quotedTurnId: null,
       latestEndedTurnId: ENDED,
-      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
     }
     // Computed-null (the caller's candidate turn has not ended) ⇒ closed.
     expect(resolveReplyOwnerTier({ ...base, latestEndedAgeMs: null })).toBe('none')
@@ -1192,9 +1219,10 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
         handbackCouldOwnReply: false,
       }),
     ).toBe(false)
-    // Property omitted entirely ⇒ unchanged pre-F2 behaviour.
-    expect(resolveReplyOwnerTier(base)).toBe('latest-ended')
-    expect(resolveReplyOwnerTurnId(base)).toBe(ENDED)
+    // Property omitted entirely ⇒ fail CLOSED too (#4175 — the old unbounded
+    // back-compat escape failed toward silent edit-over when wiring dropped).
+    expect(resolveReplyOwnerTier(base)).toBe('none')
+    expect(resolveReplyOwnerTurnId(base)).toBeNull()
   })
 
   it('end-to-end: a late reply while another topic is still running cannot ' +
@@ -1231,7 +1259,7 @@ describe('2026-08-01 klanker incident — slow flush→reply gap (Stop-hook nudg
   // replay the incident timeline through the exact pure cores the gateway wires
   // (`resolveReplyOwnerTurn` → `decideContentGateBypass` → registry.take`) and
   // assert the OUTCOME: the late reply collapses onto the flushed message —
-  // one bubble, never two. Shrinking DEFAULT_SUPERSEDE_TTL_MS below the
+  // one bubble, never two. Shrinking SUPERSEDE_OPEN_WINDOW_CAP_MS below the
   // observed gap turns these red.
   const CHAT = '424242'
   const TURN = 'turn-25674'
@@ -1253,7 +1281,12 @@ describe('2026-08-01 klanker incident — slow flush→reply gap (Stop-hook nudg
     quotedTurnId: null, // no quote linkage
     latestEndedTurnId: TURN,
     latestEndedAgeMs: now - FLUSH_TS,
-    latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
+    // #4173 — the completion window is OPEN: the flush ended the turn
+    // synthetically, and the session's REAL turn_end has not been observed
+    // (the model is mid Stop-hook-nudge → /compact → recompose).
+    latestEndedRealEndAgeMs: null,
+    latestEndedCompletedGraceMs: SUPERSEDE_COMPLETED_GRACE_MS,
   })
 
   it('the latest-ended owner tier still accepts the flushed turn 143 s after it ended', () => {
@@ -1312,5 +1345,53 @@ describe('2026-08-01 klanker incident — slow flush→reply gap (Stop-hook nudg
     expect(d.reason).toBe('new-content')
     // The record survives for the turn's OWN late replay.
     expect(reg.peek(CHAT, undefined, { liveTurnId: TURN, now: REPLY_TS }).supersede).toBe(true)
+  })
+})
+
+
+describe('#4173 — the latest-ended tier follows the turn-completion window', () => {
+  const ENDED = 'turn-ENDED'
+  const c = (over: Partial<ReplyOwnerCandidates>): ReplyOwnerCandidates => ({
+    liveTurnId: null,
+    originTurnId: null,
+    quotedTurnId: null,
+    latestEndedTurnId: ENDED,
+    latestEndedTtlMs: SUPERSEDE_OPEN_WINDOW_CAP_MS,
+    latestEndedCompletedGraceMs: SUPERSEDE_COMPLETED_GRACE_MS,
+    ...over,
+  })
+
+  it('OPEN window (real turn_end not observed): accepted at 143 s AND at 20 min — ' +
+    'a compaction longer than any tuned TTL still resolves the owner (#4166)', () => {
+    expect(resolveReplyOwnerTier(c({ latestEndedAgeMs: 143_000, latestEndedRealEndAgeMs: null }))).toBe('latest-ended')
+    expect(resolveReplyOwnerTier(c({ latestEndedAgeMs: 20 * 60_000, latestEndedRealEndAgeMs: null }))).toBe('latest-ended')
+  })
+
+  it('OPEN window past the crash-backstop cap: rejected (signal loss cannot grant forever)', () => {
+    expect(
+      resolveReplyOwnerTier(c({
+        latestEndedAgeMs: SUPERSEDE_OPEN_WINDOW_CAP_MS + 1,
+        latestEndedRealEndAgeMs: null,
+      })),
+    ).toBe('none')
+  })
+
+  it('COMPLETED window: accepted inside the replay grace, rejected past it — the ' +
+    'Task-sub-agent-after-parent-turn-end reply resolves NO owner and gets no ' +
+    'destructive authority', () => {
+    // Normal turn: realEnd == end, 30 s ago → the original tight bound holds.
+    expect(
+      resolveReplyOwnerTier(c({ latestEndedAgeMs: 30_000, latestEndedRealEndAgeMs: 30_000 })),
+    ).toBe('latest-ended')
+    // 90 s after the session really stopped: a same-bridge decoupled reply (a
+    // background Task sub-agent replying after the parent turn ended) resolves
+    // null — it can neither supersede nor bypass the content gate; it sends
+    // fresh. Widening the completed bound past the grace turns this red.
+    expect(
+      resolveReplyOwnerTier(c({
+        latestEndedAgeMs: 90_000,
+        latestEndedRealEndAgeMs: 90_000,
+      })),
+    ).toBe('none')
   })
 })

@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os'
 import {
   handleSessionEvent,
   __resetParkedTurnStartsForTest,
+  flushCompletionTracker,
   type StreamRenderDeps,
 } from '../gateway/stream-render.js'
 import {
@@ -33,7 +34,7 @@ import {
   type SendReplyRequest,
 } from '../gateway/outbound-send-path.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
-import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry, SUPERSEDE_COMPLETED_GRACE_MS } from '../flushed-turn-supersede.js'
 import { BackstopDeliveryLedger } from '../gateway/backstop-delivery.js'
 import { redact } from '../secret-detect/redact.js'
 import { createTurnTypingLoop } from '../gateway/turn-typing-loop.js'
@@ -696,5 +697,97 @@ describe('#3544 — turn-start typing is unconditional at the enqueue seam', () 
     expect(rig.sent).toHaveLength(2)
     rig.loop.stopAll()
     rig.emitter.reset()
+  })
+})
+
+
+// ── #4173 — the turn-completion window wiring, driven through the REAL paths ──
+//
+// The pure three-phase rule is pinned in flushed-turn-supersede.test.ts /
+// reply-owner-resolve.test.ts; THESE tests pin the stream-render WIRING — the
+// quiescence flush OPENING the window and the real turn_end CLOSING it — which
+// nothing else covers (deleting either hook leaves every pure test green).
+describe('#4173 — quiescence flush opens the completion window; the real turn_end closes it', () => {
+  const settleFlush = () => new Promise((r) => setTimeout(r, 650))
+  const ANSWER =
+    'The composed terminal answer that the model never sent via reply, long enough to be a ' +
+    'genuine substantive flush delivery for the completion-window wiring tests.'
+
+  beforeEach(() => {
+    // drain module-scope tracker state left by other suites
+    flushCompletionTracker.closeAll(Date.now())
+  })
+
+  it('END-TO-END: the synthetic quiescence turn_end OPENS the window (atom + record ' +
+    'claimable far past any fixed TTL); the REAL turn_end then CLOSES both to the ' +
+    'replay grace', async () => {
+    const supersede = new FlushedTurnSupersedeRegistry()
+    // Pre-stamp a bogus value so the OPEN assertion proves the flush branch
+    // actively nulled it (not that it was merely never written).
+    const turn = makeTurn({ capturedText: [ANSWER], realEndObservedAt: 111 } as Partial<CurrentTurn>)
+    const sh = makeStreamDeps({ turn, flushedTurnSupersede: supersede })
+
+    // The answer-ready quiescence flush: a SYNTHETIC turn_end.
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: -1, reason: 'answer-ready-quiescence' })
+    await settleFlush()
+    expect(sh.delivered).toContain(ANSWER)
+
+    // OPEN: the atom's window was re-opened at fire time…
+    expect((turn as unknown as { realEndObservedAt: number | null }).realEndObservedAt).toBeNull()
+    // …and the record is claimable 20 minutes out (a /compact longer than any
+    // tuned TTL still collapses to one bubble — the #4166 unbounded case).
+    // Removing the flush branch's `flushCompletionTracker.open(turn)` leaves
+    // the record born-completed via turn-end stamping in prod; in this harness
+    // the observable red is the atom assertion above.
+    expect(
+      supersede.peek(CHAT, undefined, { liveTurnId: turn.turnId, now: Date.now() + 20 * 60_000 }).reason,
+    ).toBe('supersede')
+
+    // The session's REAL turn_end lands later — the completion signal.
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: 1200 })
+    await settleFlush()
+
+    // CLOSED: the atom is stamped…
+    const stamped = (turn as unknown as { realEndObservedAt: number | null }).realEndObservedAt
+    expect(stamped).not.toBeNull()
+    // …the record still honours the bounded tool-call-replay grace…
+    expect(
+      supersede.peek(CHAT, undefined, { liveTurnId: turn.turnId, now: Date.now() + 1_000 }).reason,
+    ).toBe('supersede')
+    // …and EXPIRES past it: a decoupled same-bridge reply (the Task-sub-agent-
+    // after-parent-turn-end shape) can no longer edit over the flushed answer.
+    // Removing the close hook (`closeFlushCompletionWindows` in case 'turn_end')
+    // turns THIS red — the record would stay open for 30 minutes.
+    expect(
+      supersede.peek(CHAT, undefined, {
+        liveTurnId: turn.turnId,
+        now: Date.now() + SUPERSEDE_COMPLETED_GRACE_MS + 5_000,
+      }).reason,
+    ).toBe('expired')
+  })
+
+  it('the REAL-turn_end backstop variant does NOT re-open the window ' +
+    '(the `durationMs === -1` conditional is load-bearing)', async () => {
+    const supersede = new FlushedTurnSupersedeRegistry()
+    const turn = makeTurn({ capturedText: [ANSWER], realEndObservedAt: 999 } as Partial<CurrentTurn>)
+    const sh = makeStreamDeps({ turn, flushedTurnSupersede: supersede })
+
+    // The turn-end BACKSTOP: the flush fires ON a real turn_end. The session
+    // already stopped, so the window must stay closed (born completed).
+    handleSessionEvent(sh.deps, { kind: 'turn_end', durationMs: 1200 })
+    await settleFlush()
+    expect(sh.delivered).toContain(ANSWER)
+
+    // Unconditionally opening in the flush branch (dropping the -1 check)
+    // nulls this and turns the test red.
+    expect((turn as unknown as { realEndObservedAt: number | null }).realEndObservedAt).not.toBeNull()
+    // The record was born completed (inherited from the atom), so it expires
+    // on the grace, never the 30-minute open cap.
+    expect(
+      supersede.peek(CHAT, undefined, {
+        liveTurnId: turn.turnId,
+        now: Date.now() + SUPERSEDE_COMPLETED_GRACE_MS + 5_000,
+      }).reason,
+    ).toBe('expired')
   })
 })

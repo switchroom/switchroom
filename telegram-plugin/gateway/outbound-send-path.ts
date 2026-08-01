@@ -75,9 +75,9 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import {
   decideSupersedeCorrection,
   flushedAnswerMatchesReply,
-  DEFAULT_SUPERSEDE_TTL_MS,
   type FlushedTurnSupersedeRegistry,
 } from '../flushed-turn-supersede.js'
+import { HANDBACK_RECENCY_WINDOW_MS } from './subagent-handback-marker.js'
 import {
   decideAnswerLatchSuppression,
   decideContentGateBypass,
@@ -762,6 +762,16 @@ export interface SendReplyRequest {
    *  Late writes (finalAnswerDelivered) attribute to THIS turn even if the
    *  module-scope turn rolls over mid-call. */
   turn: CurrentTurn | null
+  /** #4172 — true when the calling IPC client is NOT the main agent bridge
+   *  (`replyCallerIsForeignSession`, cron-session.ts): a Tier-1 cheap-cron
+   *  session or an unregistered client. A foreign-session reply can never be
+   *  the main session's own late answer, so the flushed-turn
+   *  supersede/bypass/latch block is skipped wholesale — it always sends
+   *  FRESH (never edits/deletes a flushed answer, never gets latch-
+   *  suppressed). Omitted/false ⇒ main-bridge caller (the gateway's
+   *  `executeReply` always passes the computed value; the default only
+   *  affects test harnesses). */
+  callerIsForeignSession?: boolean
 }
 
 /** Gateway dependencies for {@link sendReply}. Function members use method
@@ -1025,7 +1035,20 @@ export async function sendReply(
   // when the reply fits one plain-text message, and falls back to the legacy
   // delete+resend otherwise. `supersedeFlushIds` carries the ids forward.
   let supersedeFlushIds: number[] = []
-  {
+  // #4172 — caller-identity gate, BEFORE any owner attribution. A reply from a
+  // foreign session (a Tier-1 cheap-cron bridge, or an unregistered client)
+  // can never be the main session's own late/reworded answer, so it gets NO
+  // supersede authority (it must never edit/delete a flushed answer — the
+  // measured #4172 double loss), NO content-gate bypass, and NO exposure to
+  // the answer-delivered latch (which could otherwise silently swallow a cron
+  // digest landing in the flush's pre-record race window). It simply sends
+  // fresh below, leaving any flush record intact for the genuine own-replay.
+  if (req.callerIsForeignSession === true) {
+    process.stderr.write(
+      `telegram gateway: reply: foreign-session caller — supersede/latch skipped (#4172) ` +
+      `chatId=${chat_id}\n`,
+    )
+  } else {
     const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     // 2026-07 double-reply-on-DM fix (Part 1) — resolve the turn this reply
     // belongs to by IDENTITY, via the SAME full chain the thread-router uses
@@ -1107,11 +1130,16 @@ export async function sendReply(
     // correction only ever touches ITS OWN topic's record.
     const handbackAt = getLastSubagentHandbackAt(chat_id)
     const now = Date.now()
+    // #4174 — the handback gate-hold keeps its OWN ~60 s bound
+    // (`HANDBACK_RECENCY_WINDOW_MS`), deliberately NOT the supersede window's:
+    // this read is CHAT-WIDE, so a longer bound would hold the content gate —
+    // and re-open the reworded-own-answer visible-dup class — for every topic
+    // in a delegation-heavy chat, near-continuously. Rationale on the constant.
     const handbackCouldOwnReply =
       handbackAt != null &&
       ownerEndedAt != null &&
       handbackAt > ownerEndedAt &&
-      now - handbackAt <= DEFAULT_SUPERSEDE_TTL_MS
+      now - handbackAt <= HANDBACK_RECENCY_WINDOW_MS
     // MUST-FIX 1 (silent-data-loss, PROVEN by Fable 2026-07-21) + the 2026-07-27
     // corroboration widening — decided by the pure `decideContentGateBypass` so
     // the gateway runs the exact code the unit tests exercise. The rule, in
@@ -1248,9 +1276,10 @@ export async function sendReply(
       // content and must deliver. Byte-identical replays of THIS answer are
       // deduped by the content-keyed #546 cache at the top of this function.
       // Honest bound: the dedup TTL (60 s) is anchored at reply RECORD time,
-      // while the latest-ended owner tier's 60 s is anchored at `endedAt` —
-      // later by the reply→turn_end gap. A byte-identical replay landing >60 s
-      // after record but ≤60 s after endedAt is evicted from dedup yet still
+      // while the latest-ended owner tier's bound is the turn-completion
+      // window (#4173), anchored at the turn's OBSERVED real end — later by
+      // the reply→turn_end gap. A byte-identical replay landing >60 s after
+      // record but still inside that window is evicted from dedup yet still
       // resolves this ended turn, so it now DELIVERS as a duplicate message.
       // Conscious trade: a rare duplicate beats the silent handback drop the
       // boolean latch caused (#3426).
