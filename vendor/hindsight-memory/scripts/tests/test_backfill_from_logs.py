@@ -530,6 +530,33 @@ class TestFromLogs(FromLogsTestBase):
         # Watermark advanced to the true tail slice on completion.
         self.assertIsNotNone(watermark.load("sess-partial"))
 
+    # --- #3291 self-heal: a persistently-failing slice must surface as an
+    #     operator-visible INCOMPLETE metric + convergence WARN, never a silent
+    #     trap. -----------------------------------------------------------------
+    def test_incomplete_session_surfaces_convergence_metric(self):
+        self._write_yaml({"clerk": None})
+        self._write_settings("clerk", "clerk")
+        base = 1_700_000_000_000
+        path, (first, last) = self._transcript("clerk", "sess-stuck", 2, base)
+        self._registry("clerk", [{
+            "turn_key": "123:_:t", "chat_id": "123", "started_at": str(first + 100),
+            "ended_at": str(last), "ended_via": "sigterm",
+        }])
+        # The first slice fails every attempt → session left INCOMPLETE.
+        self.daemon.fail_distinct_indices = {0}
+
+        report = self._run("clerk")
+        ar = report["agents"]["clerk"]
+        # Metric: one session did not fully recover.
+        self.assertEqual(ar["sessions_incomplete"], 1)
+        self.assertEqual(ar["sessions_restored"], 0)
+        self.assertEqual(report["rollup"]["sessions_incomplete"], 1)
+        # Operator-visible: the formatted report carries the count + a WARN that
+        # tells them to re-run (so a non-converging session is never silent).
+        text = bf.format_report_from_logs(report)
+        self.assertIn("incomplete=1", text)
+        self.assertIn("CONVERGENCE", text)
+
     # --- direct session_id join (migrated registry) -------------------------
     def test_direct_sessionid_join(self):
         self._write_yaml({"clerk": None})
