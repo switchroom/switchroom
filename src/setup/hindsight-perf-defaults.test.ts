@@ -347,7 +347,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these twenty-nine keys, by name", () => {
+  it("is overridable on exactly these thirty-two keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -364,6 +364,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_LLM_MAX_RETRIES",
       "HINDSIGHT_API_LLM_REASONING_EFFORT",
       "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+      "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
       "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
@@ -383,10 +384,12 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
       "HINDSIGHT_API_WORKER_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
-      // Not HINDSIGHT_API_* — a switchroom-patch knob (the CE-damping
-      // rollback hatch), read by the patched reranking module, never by
-      // upstream's config parser. Sorts last.
+      // Not HINDSIGHT_API_* — switchroom-patch knobs (the CE-damping, MCP
+      // recall-budget, and reflect-relevance-floor rollback hatches), read by
+      // the patched modules, never by upstream's config parser. Sort last.
       "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
+      "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
+      "HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR",
     ]);
   });
 
@@ -752,6 +755,205 @@ describe("HINDSIGHT_CE_DECISIVE_RELATIVE_GAP (override-only, patch rollback hatc
     const perf = { env: { [KEY]: "0.7" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["0.7"]);
+  });
+});
+
+// ── the MCP recall-budget rollback hatch ──────────────────────────────────
+describe("HINDSIGHT_MCP_RECALL_BUDGET_MODE (override-only, patch rollback hatch)", () => {
+  const KEY = "HINDSIGHT_MCP_RECALL_BUDGET_MODE";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+  /** The documented full back-out value: upstream's exact pre-patch returns. */
+  const OFF = "legacy";
+
+  it("is managed, so a hindsight.env line for it is not silently discarded", () => {
+    // The bug: docker/Dockerfile.hindsight's mcp-recall-token-budget patch
+    // documents this var as its restart-level rollback, but the key was absent
+    // from HINDSIGHT_PERF_ENV_KEYS and resolveHindsightPerfOverrides drops
+    // unmanaged keys without a word — the documented escape hatch simply did
+    // not exist.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Override-only, not defaulted: unset ⇒ the honest-envelope mode the
+    // patch ships; emitting a mode would hard-code it on every host.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: OFF }).get(KEY)).toBe(OFF);
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: OFF }).get(KEY)).toBe(OFF);
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted on any host when unset (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Unset ⇒ the patch's honest-envelope mode. A host that sets nothing
+      // must keep exactly the shipped behaviour.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches the docker-run argv AND the compose snippet with the operator's value", () => {
+    // The outcome that matters: the value an operator writes in
+    // switchroom.yaml is actually in the argv that launches the container.
+    // Without the key in the managed set both of these are undefined.
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual([OFF]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // Cloud endpoint + no GPU: the harshest gating case. A rollback hatch that
+    // works only on GPU boxes is not a rollback hatch.
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+  });
+});
+
+// ── the reflect relevance-floor rollback hatch ────────────────────────────
+describe("HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR (override-only, patch rollback hatch)", () => {
+  const KEY = "HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+  /** The documented full back-out value: floor off = exact upstream gating. */
+  const OFF = "0";
+
+  it("is managed, so a hindsight.env line for it is not silently discarded", () => {
+    // The bug: docker/Dockerfile.hindsight's reflect-mm-relevance-floor patch
+    // documents this var as its restart-level rollback, but the key was absent
+    // from HINDSIGHT_PERF_ENV_KEYS and resolveHindsightPerfOverrides drops
+    // unmanaged keys without a word.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Override-only, not defaulted: the measured 0.55 default is baked into
+    // the image where the patch lives; emitting it here too would create a
+    // second copy of the same opinion to drift.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: OFF }).get(KEY)).toBe(OFF);
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: OFF }).get(KEY)).toBe(OFF);
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted on any host when unset (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Unset ⇒ the image's baked 0.55. A host that sets nothing must keep
+      // exactly the shipped behaviour.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches the docker-run argv AND the compose snippet with the operator's value", () => {
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual([OFF]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: "0.7" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["0.7"]);
+  });
+});
+
+// ── the reflect-temperature rollback/tuning knob ──────────────────────────
+describe("HINDSIGHT_API_LLM_TEMPERATURE_REFLECT (override-only, patch rollback hatch)", () => {
+  const KEY = "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+  /**
+   * The documented full back-out value: upstream's own `none` sentinel omits
+   * the temperature kwarg entirely — the provider default, i.e. upstream's
+   * accidental pre-patch behaviour.
+   */
+  const OFF = "none";
+
+  it("is managed, so a hindsight.env line for it is not silently discarded", () => {
+    // The bug: docker/Dockerfile.hindsight's reflect-temperature patch
+    // documents this var (upstream's own per-op key, parsed by upstream's
+    // _resolve_operation_temperature) as its rollback, but the key was absent
+    // from HINDSIGHT_PERF_ENV_KEYS and resolveHindsightPerfOverrides drops
+    // unmanaged keys without a word.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Override-only, not defaulted: the 0.1 default is baked into the image
+    // where the patch lives; emitting it here too would create a second copy
+    // of the same opinion to drift.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: OFF }).get(KEY)).toBe(OFF);
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: "0.3" }).get(KEY)).toBe("0.3");
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted on any host when unset (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Unset ⇒ the image's baked 0.1. A host that sets nothing must keep
+      // exactly the shipped behaviour.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches the docker-run argv AND the compose snippet with the operator's value", () => {
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual([OFF]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: "0.3" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["0.3"]);
   });
 });
 

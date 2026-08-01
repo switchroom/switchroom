@@ -243,6 +243,102 @@ async def drive():
             "single-bank recall branch returned %d tokens against max_tokens=%d" % (dict_tokens, BUDGET)
         )
 
+    # The patched-only contracts below have no upstream analogue (upstream has
+    # no trim and no mode knob), so they are guarded on the helper's presence —
+    # the upstream run stays RED on the budget defects above, never on these.
+    if hasattr(mcp_tools, "_recall_payload_within_budget"):
+        # Trim pruning must key source_facts on SOURCE FACT ids. The engine
+        # keys source_facts by source fact id (response_models: "keyed by
+        # fact ID"), referenced from observation results via source_fact_ids
+        # - a DISJOINT id space from result ids. Keying the keep-set on result
+        # ids deletes the source facts of RETAINED observations.
+        def build_obs_result():
+            results = []
+            total = 0
+            i = 0
+            while True:
+                text = "obs %03d: " % i + ("memory detail alpha beta gamma " * 4)
+                t = len(encoding.encode(text))
+                if total + t > BUDGET:
+                    break
+                total += t
+                results.append(
+                    MemoryFact(
+                        id="obs-%03d" % i,
+                        text=text,
+                        fact_type="observation",
+                        source_fact_ids=["src-%03d-a" % i, "src-%03d-b" % i],
+                    )
+                )
+                i += 1
+            source_facts = {
+                fid: MemoryFact(id=fid, text="source detail for " + fid, fact_type="world")
+                for r in results
+                for fid in r.source_fact_ids
+            }
+            return RecallResult(results=results, trace={"query": "q"}, source_facts=source_facts)
+
+        obs = build_obs_result()
+        n_full = len(obs.results)
+        trimmed = json.loads(mcp_tools._recall_payload_within_budget(obs, BUDGET))
+        kept = trimmed["results"]
+        print("SOURCE_FACT_TRIM", len(kept), "of", n_full)
+        if not (0 < len(kept) < n_full):
+            failures.append(
+                "source-fact probe did not exercise the trim path (%d of %d kept) - "
+                "the keying assertion below would be vacuous" % (len(kept), n_full)
+            )
+        kept_src_ids = {fid for r in kept for fid in (r.get("source_fact_ids") or [])}
+        surviving = set(trimmed.get("source_facts") or {})
+        missing = sorted(kept_src_ids - surviving)
+        stale = sorted(surviving - kept_src_ids)
+        print("SOURCE_FACTS_OF_RETAINED_SURVIVE", not missing, "OF_DROPPED_PRUNED", not stale)
+        if missing:
+            failures.append(
+                "trim deleted the source facts of RETAINED observations: %r - the "
+                "keep-set is keyed on result ids, not source_fact_ids" % missing[:4]
+            )
+        if stale:
+            failures.append(
+                "trim kept the source facts of DROPPED observations: %r" % stale[:4]
+            )
+
+        # Legacy on the single-bank branch must be upstream's exact return
+        # VALUE - model_dump() python objects - not a JSON round-trip of it.
+        # trace is dict[str, Any]; a datetime or tuple in it round-trips to
+        # a string or list, which upstream's caller never saw.
+        import datetime
+
+        def build_traced_result():
+            r = build_result()
+            r.trace = {"took": datetime.datetime(2026, 1, 14, 0, 0), "shape": (1, 2)}
+            return r
+
+        os.environ["HINDSIGHT_MCP_RECALL_BUDGET_MODE"] = "legacy"
+        try:
+            class TracedMemory:
+                async def recall_async(self, **kwargs):
+                    return build_traced_result()
+
+            mcp3 = FastMCP("probe-legacy-dict")
+            cfg3 = mcp_tools.MCPToolsConfig(
+                bank_id_resolver=lambda: "probe-bank",
+                include_bank_id_param=False,
+            )
+            mcp_tools._register_recall(mcp3, TracedMemory(), cfg3)
+            fn3 = (await mcp3.get_tool("recall")).fn
+            legacy_dict = await fn3(query="q", max_tokens=BUDGET)
+        finally:
+            del os.environ["HINDSIGHT_MCP_RECALL_BUDGET_MODE"]
+        expected_dict = build_traced_result().model_dump()
+        dict_ok = legacy_dict == expected_dict
+        print("LEGACY_DICT_IS_MODEL_DUMP", dict_ok)
+        if not dict_ok:
+            failures.append(
+                "legacy mode on the single-bank branch does not return upstream's exact "
+                "model_dump() - python objects in trace were coerced through JSON"
+            )
+
 
 asyncio.run(drive())
 # ------------------------------------------------------------------ fix 2

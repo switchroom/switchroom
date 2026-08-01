@@ -2893,7 +2893,9 @@ PYEOF
 #
 # ROLLBACK is a container restart, not a rebuild:
 # `HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy` restores upstream's exact
-# `model_dump_json(indent=2)` serialization with the patch still baked in.
+# pre-patch returns on BOTH recall branches — `model_dump_json(indent=2)` on
+# the bank_id-param branch, `model_dump()` (python objects, no JSON
+# round-trip) on the single-bank branch — with the patch still baked in.
 # Any other value (or unset) means the honest-envelope mode.
 #
 # Self-verifying; guarded structurally by
@@ -2920,8 +2922,10 @@ _MCP_RECALL_BUDGET_MODE_ENV = "HINDSIGHT_MCP_RECALL_BUDGET_MODE"
 def _mcp_recall_budget_mode() -> str:
     """Rollback knob, read per call so flipping it is a container restart.
 
-    "legacy" restores upstream's exact model_dump_json(indent=2) wire shape;
-    anything else (including unset) is the honest-envelope mode.
+    "legacy" restores upstream's exact pre-patch returns on both recall
+    branches (model_dump_json(indent=2) on the bank_id-param branch;
+    model_dump() at the single-bank call site, which short-circuits before
+    this helper); anything else (including unset) is the honest-envelope mode.
     """
     import os
 
@@ -2955,7 +2959,12 @@ def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
         results.pop()
         recall_result.results = results
         if recall_result.source_facts:
-            keep = {r.id for r in results}
+            # source_facts is keyed by SOURCE FACT id (response_models:
+            # "keyed by fact ID"), referenced from observation results via
+            # source_fact_ids -- a DISJOINT id space from result ids. Keep
+            # the union of the retained results' source_fact_ids; keying on
+            # result ids would delete the source facts of RETAINED results.
+            keep = {fid for r in results for fid in (r.source_fact_ids or [])}
             recall_result.source_facts = {
                 k: v for k, v in recall_result.source_facts.items() if k in keep
             } or None
@@ -2985,6 +2994,12 @@ s = s.replace(ANCHOR_DEF, HELPER + ANCHOR_DEF, 1)
 s = s.replace(ANCHOR_JSON, "                return _recall_payload_within_budget(recall_result, max_tokens)\n", 1)
 s = s.replace(
     ANCHOR_DICT,
+    # Legacy on THIS branch must be upstream's exact return VALUE, not a JSON
+    # round-trip of it: upstream returned model_dump() python objects, and a
+    # dict[str, Any] field like `trace` can carry values (datetimes, tuples)
+    # that json.loads(model_dump_json(...)) coerces to strings/lists.
+    '                if _mcp_recall_budget_mode() == "legacy":\n'
+    "                    return recall_result.model_dump()\n"
     "                return json.loads(_recall_payload_within_budget(recall_result, max_tokens))\n",
     1,
 )
@@ -2996,9 +3011,19 @@ assert "def _recall_payload_within_budget(" in t, f"{TAG}: helper missing after 
 assert "recall_result.model_dump_json(indent=2)" in t, (
     f"{TAG}: the legacy-mode branch lost upstream's exact serialization — the rollback knob is dead"
 )
+assert "return recall_result.model_dump()" in t, (
+    f"{TAG}: the single-bank legacy branch lost upstream's exact model_dump() return — "
+    "legacy would hand back a JSON round-trip (datetimes/tuples coerced) instead of "
+    "upstream's python objects"
+)
 assert t.count("_recall_payload_within_budget(recall_result, max_tokens)") == 2, (
     f"{TAG}: expected BOTH recall branches (bank_id-param and single-bank) to route "
     "through the budget helper (2 call sites; the def line spells max_tokens: int)"
+)
+assert "for fid in (r.source_fact_ids or [])" in t, (
+    f"{TAG}: source_facts pruning no longer keys on the retained results' "
+    "source_fact_ids — keying on result ids deletes the source facts of RETAINED "
+    "observations (source_facts is keyed by source fact id, a disjoint id space)"
 )
 # Deliberate scope guards — these must stay untouched:
 assert "reflect_result.model_dump_json(indent=2)" in t, (
@@ -3015,7 +3040,8 @@ print(
     "switchroom hindsight mcp-recall-token-budget patch: MCP recall now serializes "
     "compact with exclude_none and enforces max_tokens over the serialized payload "
     "(tail-trim of ranked results); the shared engine selector and the reflect tool "
-    "are untouched; HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy restores upstream bytes"
+    "are untouched; HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy restores upstream's exact "
+    "returns on both branches"
 )
 PYEOF
 

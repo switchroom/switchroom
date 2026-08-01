@@ -1083,10 +1083,22 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /assert t\.count\("_recall_payload_within_budget\(recall_result, max_tokens\)"\) == 2,/,
     );
-    // The legacy branch must keep upstream's exact serialization (the
-    // restart-level rollback) …
+    // The legacy branch must keep upstream's exact returns on BOTH branches
+    // (the restart-level rollback): model_dump_json(indent=2) on the
+    // bank_id-param branch, model_dump() python objects — no JSON round-trip —
+    // on the single-bank branch …
     expect(dockerfile).toMatch(
       /assert "recall_result\.model_dump_json\(indent=2\)" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "return recall_result\.model_dump\(\)" in t,/,
+    );
+    // … the trim must prune source_facts by the retained results'
+    // source_fact_ids (source_facts is keyed by SOURCE FACT id — a disjoint
+    // id space from result ids; keying on result ids deletes the source facts
+    // of RETAINED observations) …
+    expect(dockerfile).toMatch(
+      /assert "for fid in \(r\.source_fact_ids or \[\]\)" in t,/,
     );
     // … and the LOAD-BEARING scope guards: the reflect tool and — above all —
     // the ENGINE's text-only selector stay untouched, because the per-turn
