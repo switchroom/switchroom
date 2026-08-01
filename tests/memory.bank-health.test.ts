@@ -672,6 +672,38 @@ describe("checkBankObservationsMissions (doctor)", () => {
     expect(generic[0].status).toBe("warn");
   });
 
+  // Option-B red-team: the drift row must key off the RESOLVED memory profile
+  // (memory.profile → extends → default), not raw `extends`. An agent on the
+  // `default` PERSONA profile that opts its bank into the `coding` MEMORY bundle
+  // via `memory.profile` carries the coding mission on its bank (scaffold seeds
+  // it). If doctor keyed off `extends` ("default"), the coding mission would be
+  // seen as a superseded switchroom default and the row would FALSE-FLAG the
+  // opted-in agent as drifted, sending the operator to a reconcile that would
+  // (correctly) re-push the same coding mission — a no-op churn loop.
+  //
+  // Verified to bite: reverting doctor's `resolveMemoryProfile(entry.config)`
+  // back to `entry.config.extends ?? DEFAULT_PROFILE` flips this row to `warn`.
+  it("keys the drift row off memory.profile, not extends (no false drift for opted-in agents)", async () => {
+    const config = {
+      memory: { backend: "hindsight", config: { url: "http://x/mcp/" } },
+      agents: { dev: { extends: "default", memory: { profile: "coding" } } },
+    } as unknown as SwitchroomConfig;
+    const coding = PROFILE_MEMORY_DEFAULTS.coding.observations_mission!;
+
+    // Bank correctly carries the coding mission → steady state, not drift.
+    const matching = await checkBankObservationsMissions(config, "http://x/mcp/", {
+      fetchImpl: fakeConfigFetch({ dev: { observations_mission: coding } }),
+    });
+    expect(matching[0].status).toBe("ok");
+    expect(matching[0].detail).toBe("switchroom coding-profile default");
+
+    // And the generic fleet default IS a real upgrade-pending for this bank.
+    const generic = await checkBankObservationsMissions(config, "http://x/mcp/", {
+      fetchImpl: fakeConfigFetch({ dev: { observations_mission: DEFAULT_OBSERVATIONS_MISSION } }),
+    });
+    expect(generic[0].status).toBe("warn");
+  });
+
   it("reports a failed read as unknown, never as unset", async () => {
     const results = await checkBankObservationsMissions(
       minimalConfig({ ziggy: {} }),

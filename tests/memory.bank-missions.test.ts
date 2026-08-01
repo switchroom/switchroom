@@ -1251,6 +1251,31 @@ describe("scaffoldAgent — observations_mission seed", () => {
     );
   }, 15_000);
 
+  // Option-B decoupling: an agent on the `default` PERSONA profile opts its
+  // bank into the `coding` MEMORY bundle via `memory.profile`. BOTH halves must
+  // key off the resolved memory profile — the observations_mission AND the
+  // disposition — or an opt-in gets a half-applied bundle. Verified to bite:
+  // reverting scaffold's `resolveMemoryProfile(agentConfig)` back to
+  // `agentConfig.extends ?? DEFAULT_PROFILE` resolves the profile to `default`,
+  // so the observations_mission falls back to the fleet default and the coding
+  // disposition disappears from the wire — both assertions below fail.
+  it("keys BOTH observations_mission and disposition off memory.profile, not extends", async () => {
+    const config = makeAgentConfig({
+      extends: "default",
+      memory: { profile: "coding" },
+    } as Partial<AgentConfig>);
+    const args = await runScaffold(null, config);
+    const updates = args.config_updates as Record<string, unknown>;
+    // Observations: the coding profile mission, not the generic fleet default.
+    expect(updates.observations_mission).toBe(
+      PROFILE_MEMORY_DEFAULTS.coding.observations_mission,
+    );
+    // Disposition: the coding profile's flattened traits, not the engine default.
+    expect(updates.disposition_skepticism).toBe(4);
+    expect(updates.disposition_literalism).toBe(5);
+    expect(updates.disposition_empathy).toBe(2);
+  }, 15_000);
+
   it("upgrades a profiled agent's bank off the generic fleet default", async () => {
     const config = makeAgentConfig({ extends: "executive-assistant" });
     const args = await runScaffold(DEFAULT_OBSERVATIONS_MISSION, config);

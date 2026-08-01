@@ -31,7 +31,7 @@ import { reconcileAgent } from "../agents/scaffold.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
-import { DEFAULT_PROFILE } from "../config/schema.js";
+import { resolveMemoryProfile } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import {
   probeHindsight,
@@ -1344,8 +1344,13 @@ export async function checkBankObservationsMissions(
       };
     }
 
+    // Key the disposition/observations default off the resolved MEMORY profile
+    // (memory.profile → extends → default), not raw `extends` — otherwise an
+    // agent opted into a memory profile via `memory.profile` would be
+    // false-flagged as drifted against its persona profile's default here.
+    const memoryProfile = resolveMemoryProfile(entry.config);
     const profileDefault =
-      PROFILE_MEMORY_DEFAULTS[entry.config.extends ?? DEFAULT_PROFILE]?.observations_mission;
+      PROFILE_MEMORY_DEFAULTS[memoryProfile]?.observations_mission;
     const decision = decideObservationsMissionUpgrade(
       entry.config.memory?.observations_mission,
       profileDefault,
@@ -1384,7 +1389,7 @@ export async function checkBankObservationsMissions(
       status: "ok" as const,
       detail: isSwitchroomDefault
         ? profileDefault != null
-          ? `switchroom ${entry.config.extends ?? DEFAULT_PROFILE}-profile default`
+          ? `switchroom ${memoryProfile}-profile default`
           : "switchroom fleet default"
         : "operator-authored (left untouched by the never-clobber rule)",
     };
