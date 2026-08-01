@@ -10,7 +10,7 @@
 
 import { describe, it, expect } from "vitest";
 import { Command } from "commander";
-import { summarizeReconcileBatch, resolveLogsTail, registerAgentCommand } from "./agent.js";
+import { summarizeReconcileBatch, resolveLogsTail, registerAgentCommand, shouldAutoRestartAfterReconcile } from "./agent.js";
 import { buildAgentLogsArgs } from "../agents/lifecycle.js";
 
 describe("resolveLogsTail (agent logs --lines clamp contract)", () => {
@@ -184,5 +184,49 @@ describe("agent effective-model command", () => {
     const cmd = findCommand();
     expect(cmd).toBeDefined();
     expect(cmd!.registeredArguments.map((a) => `${a.name()}:${a.required}`)).toEqual(["name:true"]);
+  });
+});
+
+describe("shouldAutoRestartAfterReconcile (--no-restart opt-out, switchroom#3903)", () => {
+  // Regression: reconcile declared `--no-restart` but read the flag via
+  // `opts.noRestart`, which Commander never sets (it exposes the negated
+  // flag as `opts.restart === false`). So `--no-restart` was silently
+  // ignored and the agent auto-restarted anyway whenever a
+  // restart-required change was present. This pins the corrected
+  // `opts.restart !== false` decision.
+
+  it("--no-restart (opts.restart === false) suppresses the auto-restart", () => {
+    // restart-required changes present, but user opted out → no restart.
+    expect(shouldAutoRestartAfterReconcile({ restart: false }, 3)).toBe(false);
+  });
+
+  it("default (flag absent) auto-restarts when restart-required changes exist", () => {
+    expect(shouldAutoRestartAfterReconcile({}, 3)).toBe(true);
+    expect(shouldAutoRestartAfterReconcile({ restart: undefined }, 3)).toBe(true);
+  });
+
+  it("--restart (opts.restart === true) auto-restarts when changes exist", () => {
+    expect(shouldAutoRestartAfterReconcile({ restart: true }, 3)).toBe(true);
+  });
+
+  it("no restart-required changes → never auto-restarts, regardless of flag", () => {
+    expect(shouldAutoRestartAfterReconcile({}, 0)).toBe(false);
+    expect(shouldAutoRestartAfterReconcile({ restart: false }, 0)).toBe(false);
+    expect(shouldAutoRestartAfterReconcile({ restart: true }, 0)).toBe(false);
+  });
+
+  it("Commander parses --no-restart into opts.restart === false (not opts.noRestart)", () => {
+    // Pins the root-cause fact: the camelCase-negation read the fix removes
+    // (`opts.noRestart`) never exists — only `opts.restart` does.
+    const cmd = new Command();
+    cmd
+      .command("reconcile <name>")
+      .option("--restart", "restart")
+      .option("--no-restart", "skip restart")
+      .action(() => {});
+    cmd.parse(["node", "test", "reconcile", "agentx", "--no-restart"]);
+    const opts = cmd.commands.find((c) => c.name() === "reconcile")!.opts();
+    expect(opts.restart).toBe(false);
+    expect(opts.noRestart).toBeUndefined();
   });
 });
