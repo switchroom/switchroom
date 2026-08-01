@@ -631,7 +631,7 @@ export function renderFleetInvariants(): string {
   ].join("\n");
 }
 
-import { DEFAULT_PROFILE } from "../config/schema.js";
+import { DEFAULT_PROFILE, resolveMemoryProfile } from "../config/schema.js";
 import { DEFAULT_CRON_MODEL, scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
 
@@ -6125,7 +6125,7 @@ export function scaffoldAgent(
       // wins; disposition merges per-key.
       const extras = resolveBankMissionExtras(
         agentConfig.memory,
-        agentConfig.extends ?? DEFAULT_PROFILE,
+        resolveMemoryProfile(agentConfig),
       );
 
       const missions: {
@@ -6147,7 +6147,7 @@ export function scaffoldAgent(
         apiUrl,
         hindsightBankId,
         agentConfig.memory?.observations_mission,
-        agentConfig.extends ?? DEFAULT_PROFILE,
+        resolveMemoryProfile(agentConfig),
         formatAgentBankLabel(name, hindsightBankId),
       );
       if (seededObservationsMission) {
@@ -8555,7 +8555,7 @@ function reconcileAgentInner(
       // wins over profile defaults; disposition merges per-key.
       const extras = resolveBankMissionExtras(
         agentConfig.memory,
-        agentConfig.extends ?? DEFAULT_PROFILE,
+        resolveMemoryProfile(agentConfig),
       );
 
       const missions: {
@@ -8592,7 +8592,7 @@ function reconcileAgentInner(
         apiUrl,
         hindsightBankId,
         agentConfig.memory?.observations_mission,
-        agentConfig.extends ?? DEFAULT_PROFILE,
+        resolveMemoryProfile(agentConfig),
         formatAgentBankLabel(name, hindsightBankId),
       );
       if (observationsMission) missions.observations_mission = observationsMission;
