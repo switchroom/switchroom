@@ -52,6 +52,9 @@ function makeSwitchroomConfig(name: string, agentConfig: AgentConfig): Switchroo
 }
 
 const DEFAULT_MODEL = "claude-sonnet-5";
+// SWITCHROOM_DEFAULT_THINKING_EFFORT — what an agent with no `thinking_effort:`
+// gets baked into start.sh, and what the CLI resolver returns for it.
+const DEFAULT_EFFORT = "low";
 const BLOCK_HEADER = "# --- Session model resolution";
 
 function extractBlock(startSh: string): string {
@@ -704,9 +707,32 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
     block = extractBlock(readFileSync(join(agentDir, "start.sh"), "utf-8"));
   }
 
-  /** Install a fake `switchroom` CLI; its stdout/exit code drive the live read. */
-  function fakeSwitchroom(body: string): void {
-    writeFileSync(join(fakeBin, "switchroom"), `#!/bin/bash\necho "$@" >> ${JSON.stringify(join(fakeBin, "args.log"))}\n${body}\n`);
+  /**
+   * Install a fake `switchroom` CLI; its stdout/exit code drive the live read.
+   *
+   * Dispatches PER VERB. The launcher now makes two live reads per boot
+   * (`agent effective-model` and `agent effective-effort`), so a single body
+   * that answers every verb with a model name makes the effort read see
+   * `fable`, fail its level allowlist, and spuriously append a
+   * `.session-model-alert` line — which is exactly how this PR first broke
+   * three model-side tests. `effortBody` defaults to the level the scaffold
+   * bakes, i.e. "the yaml agrees with the bake": no drift, no alert.
+   */
+  function fakeSwitchroom(body: string, effortBody = `echo ${DEFAULT_EFFORT}`): void {
+    const script = [
+      "#!/bin/bash",
+      `echo "$@" >> ${JSON.stringify(join(fakeBin, "args.log"))}`,
+      'case "$*" in',
+      "  *effective-effort*)",
+      effortBody,
+      "    ;;",
+      "  *)",
+      body,
+      "    ;;",
+      "esac",
+      "",
+    ].join("\n");
+    writeFileSync(join(fakeBin, "switchroom"), script);
     chmodSync(join(fakeBin, "switchroom"), 0o755);
   }
 
@@ -715,7 +741,8 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
     return existsSync(p) ? readFileSync(p, "utf-8") : "";
   }
 
-  function runLive(litellmOk = "1"): string {
+  /** Run the rendered block; report BOTH resolved values plus the `--effort` argv. */
+  function runLiveResolved(litellmOk = "1"): { model: string; effort: string; effortArg: string } {
     const script = [
       "set -e",
       `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
@@ -727,10 +754,19 @@ describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
       `_LITELLM_OK=${JSON.stringify(litellmOk)}`,
       block,
       'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+      'echo "EFFORT=$_EFFECTIVE_EFFORT"',
+      'echo "EFFORTARG=$_EFFORT_ARG"',
     ].join("\n");
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
-    const m = out.match(/EFFECTIVE=(.*)/);
-    return m ? m[1].trim() : "";
+    const pick = (label: string): string => {
+      const m = out.match(new RegExp(`^${label}=(.*)$`, "m"));
+      return m ? m[1].trim() : "";
+    };
+    return { model: pick("EFFECTIVE"), effort: pick("EFFORT"), effortArg: pick("EFFORTARG") };
+  }
+
+  function runLive(litellmOk = "1"): string {
+    return runLiveResolved(litellmOk).model;
   }
 
   function alertText(): string {
@@ -896,6 +932,202 @@ if [ -f "$marker" ]; then echo claude-opus-4-8; else touch "$marker"; echo "mang
     const idxLkg = startSh.indexOf('_LKG_MODEL="$(cat');
     expect(idxLkg).toBeGreaterThan(-1);
     expect(idxLkg).toBeLessThan(idxRecord);
+  });
+});
+
+// ── Live configured-default EFFORT resolution (effort sibling of the above) ──
+//
+// `thinking_effort:` is resolved live at boot from the mounted switchroom.yaml
+// via `switchroom agent effective-effort`, exactly as `model:` is — editing the
+// yaml and restarting must take effect WITHOUT a full `switchroom apply`.
+// These are EXECUTED tests against the rendered block with a fake CLI on PATH:
+// string-containment on the template cannot tell a wired feature from an inert
+// one (inverting the live-branch guard leaves every asserted string present),
+// and green-CI-over-inert-feature is this repo's dominant failure mode.
+describe("scaffoldAgent: live configured-default effort resolution (start.sh)", () => {
+  let tmpDir: string;
+  let agentDir: string;
+  let block: string;
+  let fakeBin: string;
+  let cfgPath: string;
+
+  /** Scaffold with an explicit apply-time bake so live≠bake is unambiguous. */
+  function scaffold(bakedEffort?: string): void {
+    const name = "live-effort-agent";
+    const config = makeAgentConfig(
+      bakedEffort ? ({ thinking_effort: bakedEffort } as Partial<AgentConfig>) : {},
+    );
+    const res = scaffoldAgent(name, config, tmpDir, telegramConfig, makeSwitchroomConfig(name, config));
+    agentDir = res.agentDir;
+    block = extractBlock(readFileSync(join(agentDir, "start.sh"), "utf-8"));
+  }
+
+  /** Fake CLI: `effortBody` answers `agent effective-effort`, model is sane. */
+  function fakeSwitchroom(effortBody: string): void {
+    const script = [
+      "#!/bin/bash",
+      `echo "$@" >> ${JSON.stringify(join(fakeBin, "args.log"))}`,
+      'case "$*" in',
+      "  *effective-effort*)",
+      effortBody,
+      "    ;;",
+      "  *)",
+      `    echo ${DEFAULT_MODEL}`,
+      "    ;;",
+      "esac",
+      "",
+    ].join("\n");
+    writeFileSync(join(fakeBin, "switchroom"), script);
+    chmodSync(join(fakeBin, "switchroom"), 0o755);
+  }
+
+  function fakeArgs(): string {
+    const p = join(fakeBin, "args.log");
+    return existsSync(p) ? readFileSync(p, "utf-8") : "";
+  }
+
+  function runLive(): { effort: string; effortArg: string } {
+    const script = [
+      "set -e",
+      `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
+      `export SWITCHROOM_CONFIG=${JSON.stringify(cfgPath)}`,
+      "unset ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
+      '_LITELLM_OK="1"',
+      block,
+      'echo "EFFORT=$_EFFECTIVE_EFFORT"',
+      'echo "EFFORTARG=$_EFFORT_ARG"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    const pick = (label: string): string => {
+      const m = out.match(new RegExp(`^${label}=(.*)$`, "m"));
+      return m ? m[1].trim() : "";
+    };
+    return { effort: pick("EFFORT"), effortArg: pick("EFFORTARG") };
+  }
+
+  function alertText(): string {
+    const p = join(agentDir, ".session-model-alert");
+    return existsSync(p) ? readFileSync(p, "utf-8") : "";
+  }
+
+  const lkgPath = (): string => join(agentDir, ".configured-default-effort");
+  function lkg(): string {
+    return existsSync(lkgPath()) ? readFileSync(lkgPath(), "utf-8").trim() : "";
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-live-effort-"));
+    // /tmp is noexec in the dev container — the fake CLI must live on an
+    // exec-capable fs or every live read silently fails (exit 126). Same
+    // convention as the model suite above.
+    fakeBin = mkdtempSync(join("/var/tmp", "switchroom-live-effort-bin-"));
+    cfgPath = join(tmpDir, "switchroom.yaml");
+    writeFileSync(cfgPath, "agents: {}\n");
+    scaffold("low");
+  });
+
+  afterEach(() => {
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    if (fakeBin) rmSync(fakeBin, { recursive: true, force: true });
+  });
+
+  // THE regression test for the bug this PR fixes: yaml effort edited after
+  // apply (bake still low) + plain restart → boots the LIVE level.
+  it("boots the LIVE yaml effort when it differs from the apply-time bake", () => {
+    fakeSwitchroom("    echo high");
+    const { effort, effortArg } = runLive();
+    expect(effort).toBe("high");
+    expect(effortArg).toBe("--effort high"); // what claude is actually launched with
+    // Resolved via the CLI verb against the LIVE mounted config, not re-derived.
+    expect(fakeArgs()).toContain("--config");
+    expect(fakeArgs()).toContain("agent effective-effort live-effort-agent");
+    // Live value becomes the next boot's last-known-good, and no operator alert.
+    expect(lkg()).toBe("high");
+    expect(alertText()).toBe("");
+  });
+
+  it("retries once on a torn/failed first read, then uses the live value", () => {
+    const marker = join(fakeBin, "second-effort-call");
+    fakeSwitchroom(
+      `    if [ -f ${JSON.stringify(marker)} ]; then echo max; else touch ${JSON.stringify(marker)}; exit 1; fi`,
+    );
+    expect(runLive().effort).toBe("max");
+    expect(alertText()).toBe("");
+  });
+
+  it("live read fails → falls back to last-known-good with an operator alert", () => {
+    writeFileSync(lkgPath(), "xhigh\n");
+    fakeSwitchroom("    exit 1");
+    const { effort, effortArg } = runLive();
+    expect(effort).toBe("xhigh"); // NOT the 'low' bake
+    expect(effortArg).toBe("--effort xhigh");
+    expect(alertText()).toContain("last-known-good configured effort `xhigh`");
+    // Nothing was live-read this boot, so the LKG must survive unchanged —
+    // overwriting it with the fallback would let a later failed read cite a
+    // "last-known-good" that was never live truth.
+    expect(lkg()).toBe("xhigh");
+  });
+
+  it("live read fails with no last-known-good → falls back to the bake with an operator alert", () => {
+    fakeSwitchroom("    exit 1");
+    expect(runLive().effort).toBe("low");
+    expect(alertText()).toContain("apply-time default `low`");
+    // Bake-fallback boot: no live truth to record, so no LKG is written.
+    expect(lkg()).toBe("");
+  });
+
+  it("an unrecognised level fails the allowlist and falls back (never reaches --effort)", () => {
+    // e.g. the fable/model-name confusion, or a typo'd yaml level.
+    fakeSwitchroom("    echo fable");
+    const { effort, effortArg } = runLive();
+    expect(effort).toBe("low");
+    expect(effortArg).toBe("--effort low");
+    expect(effortArg).not.toContain("fable");
+    // The alert must name BOTH causes — the yaml read fine here, it just held
+    // a level this launcher does not recognise.
+    expect(alertText()).toContain("could not be read, or it held a value this launcher does not recognise");
+    expect(lkg()).toBe("");
+  });
+
+  it("no SWITCHROOM_CONFIG mount → bake, silently, and no LKG is invented", () => {
+    fakeSwitchroom("    echo high");
+    const script = [
+      "set -e",
+      `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
+      "unset SWITCHROOM_CONFIG ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
+      '_LITELLM_OK="1"',
+      block,
+      'echo "EFFORT=$_EFFECTIVE_EFFORT"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    expect(out).toContain("EFFORT=low");
+    expect(alertText()).toBe("");
+    expect(fakeArgs()).toBe(""); // CLI never invoked
+    expect(lkg()).toBe(""); // nothing was live-read → nothing recorded
+  });
+
+  // Ordering: the live effort must land BEFORE the .session-effort carrier
+  // compare, so the carrier is invalidated against live truth, not the bake.
+  it("carrier written against a SUPERSEDED configured default is dropped (compare uses the LIVE value)", () => {
+    fakeSwitchroom("    echo high");
+    writeFileSync(
+      join(agentDir, ".session-effort"),
+      `${JSON.stringify({ level: "max", configuredDefaultAtWrite: "low", ts: Date.now() })}\n`,
+    );
+    expect(runLive().effort).toBe("high");
+    expect(alertText()).toContain("configured default effort changed");
+  });
+
+  it("a carrier written against the LIVE default still applies (override wins this boot)", () => {
+    fakeSwitchroom("    echo high");
+    writeFileSync(
+      join(agentDir, ".session-effort"),
+      `${JSON.stringify({ level: "max", configuredDefaultAtWrite: "high", ts: Date.now() })}\n`,
+    );
+    expect(runLive().effort).toBe("max");
+    // …but the recorded configured default stays the LIVE configured value,
+    // never the session override.
+    expect(lkg()).toBe("high");
   });
 });
 

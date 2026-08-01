@@ -955,6 +955,31 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
+  // switchroom agent effective-effort <name>
+  //
+  // The effort sibling of `effective-model`, and for the same reason: start.sh
+  // calls it at boot against the live mounted switchroom.yaml so a
+  // `thinking_effort:` edit + restart takes effect WITHOUT a full apply. Same
+  // cascade resolver and same unset→SWITCHROOM_DEFAULT_THINKING_EFFORT fallback
+  // `agent list --json` uses for the gateway's /effort menu, so the launcher and
+  // the menu can never disagree about what the configured default is. Plain
+  // single-line stdout: the shell consumer wants a bare token.
+  agent
+    .command("effective-effort <name>")
+    .description("Print the cascade-resolved thinking effort the agent's launcher boots with")
+    .action(
+      withConfigError(async (name: string) => {
+        const config = getConfig(program);
+        const agentConfig = config.agents[name];
+        if (!agentConfig) {
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
+          process.exit(1);
+        }
+        const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+        console.log(resolved.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT);
+      })
+    );
+
   // switchroom agent status <name>
   //
   // Single-command answer to "is my agent alive and healthy?" — rolls up
