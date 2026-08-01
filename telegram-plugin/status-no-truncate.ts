@@ -60,23 +60,38 @@ export const STATUS_LINE_MAX = 200
 export const STATUS_CARD_CHAR_BUDGET = RICH_MESSAGE_MAX_CHARS
 
 /**
- * Indent marker for a nested (foreground sub-agent) step line.
+ * Indent marker for a nested (foreground sub-agent) step line: three U+2800
+ * BRAILLE PATTERN BLANK, then the `↳` glyph.
  *
- * NOTE: the three leading spaces here are ASCII, which Telegram's server-side
- * markdown parser DROPS — the visible nesting cue on this surface is the `↳`
- * glyph, not the indent. That is a known latent wart, deliberately left alone
- * — it needs its own live render check on the single-worker / agent card,
- * tracked in #3668. It is NOT broken by the #3662 mechanism (nothing here
- * depends on the ASCII run being visible), so it is not fixed here. If #3668
- * ever does make it a real indent, use U+2800 — NOT U+00A0, which was tried in
- * #3662 and renders flat. Do NOT copy this string as the idiom for a real
- * indent.
+ * Until #3668 the indent was three ASCII spaces, which Telegram's server-side
+ * markdown parser LEFT-TRIMS off a content line — so the child block rendered
+ * FLAT against its parent steps and the only surviving nesting cue was the `↳`
+ * glyph. This constant now uses the SAME idiom as {@link WORKER_STEP_INDENT}
+ * for exactly the same reason, and there is only one indent idiom on the card
+ * surfaces again.
  *
- * @see WORKER_STEP_INDENT — the U+2800 indent used for actual left-nesting on
- * the combined (2+ worker) card, and the evidence for why ASCII (and U+00A0)
- * cannot work.
+ * The evidence is not an inference about Telegram's parser: U+2800 is general
+ * category So (Symbol, other), not Zs, so no whitespace-trimming rule — ASCII
+ * `\s`, Unicode `White_Space`, or `Zs` — can classify it as whitespace, yet it
+ * renders as blank width. It is ALSO live-verified: on 2026-07-26 four
+ * candidates were sent to a real phone in one message — three U+00A0 rendered
+ * FLAT (the #3662 failure), three U+2800 INDENTED CORRECTLY, a leading `↳ `
+ * rendered as visible ink, and a leading `· ` was promoted into a real list
+ * bullet. See {@link WORKER_STEP_INDENT}'s comment for the full record.
+ *
+ * The `↳ ` glyph is KEPT: it is what distinguishes a foreground sub-agent's
+ * step from the parent's own steps on a card where both appear, and the
+ * indent is what makes the block read as nested. The blanks lead so the
+ * glyph is not the thing being trimmed.
+ *
+ * Guard: `nested-prefix-indent.test.ts` asserts the PROPERTY (no character of
+ * the indent is whitespace under any of the three rules), not just the bytes —
+ * a byte-only assertion is what let #3662 ship green and inert.
+ *
+ * @see WORKER_STEP_INDENT — the same U+2800 idiom for the combined
+ * (2+ worker) card, and the full evidence for why ASCII and U+00A0 cannot work.
  */
-export const NESTED_PREFIX = '   ↳ '
+export const NESTED_PREFIX = '\u2800\u2800\u2800↳ '
 
 /**
  * Left indent for a step line rendered UNDER a worker header on the combined
