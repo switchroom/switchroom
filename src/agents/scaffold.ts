@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 import { CRON_SCRIPT_BASENAME_RE, LEGACY_CRON_SCRIPT_BASENAME_RE } from "./cron-unit-name.js";
+import { expandModelAlias } from "./model-aliases.js";
 import { atomicWriteFileSync } from "../util/atomic.js";
 import {
   alignAgentTreeOwnershipIfRoot,
@@ -1644,10 +1645,21 @@ export function declaredRoutingMode(resolvedModel: string): "passthrough" | "rou
  * only resolves via the LiteLLM router; the alias resolves everywhere the
  * model is reachable at all (the claude CLI maps it via
  * ANTHROPIC_DEFAULT_FABLE_MODEL), so it is the only safe spelling to write.
- * Everything else passes through unchanged.
+ *
+ * Beyond the fable codename we then run the config-default token through the
+ * SAME `expandModelAlias` the gateway `/model` path uses (#3998): a switchroom
+ * shortcut like `opus48` / `opus-4-8` expands to its pinned `claude-*` id, an
+ * sr-* shortcut (`flash`, `codex`, …) to its full `sr-*` id, and any `claude-*`
+ * id is case-canonicalized — so an operator-configured `model:` resolves to the
+ * exact same launch token as typing that alias into `/model`. Before this both
+ * sites carried divergent tables: scaffold expanded ONLY the fable codename, so
+ * a config `model: opus48` reached `claude --model` verbatim and 4xx'd. Family
+ * aliases the CLI resolves itself (`opus`/`sonnet`/`haiku`/`fable`/`default`)
+ * are in neither shortcut table and pass through unchanged, as before.
  */
 export function normalizeModelAlias(model: string): string {
-  return model === "claude-fable-5" ? "fable" : model;
+  if (model === "claude-fable-5") return "fable";
+  return expandModelAlias(model);
 }
 
 /**
