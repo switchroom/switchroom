@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, openSync, closeSync, readFileSync } from 'node:f
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { readAndFilter, defaultAuditLogPath, type AuditEntry } from '../../src/host-control/audit-reader.js'
+import { NESTED_PREFIX } from '../status-no-truncate.js'
 
 /** Default lookback window: 10 minutes is enough to catch the boot that
  *  follows a normal update_apply but small enough that an audit row from
@@ -98,9 +99,9 @@ function shortSha(s: string): string {
 }
 
 /**
- * Pure renderer. Returns the single line (HTML-safe — plain ASCII)
- * to append to the boot card body. `null` means nothing to surface
- * (entry too stale, schema invalid, etc.).
+ * Pure renderer. Returns the line(s) to append to the boot card body —
+ * markdown-safe (no unescaped entity markers of its own). `null` means
+ * nothing to surface (entry too stale, schema invalid, etc.).
  */
 export function renderUpdateOutcomeLine(entry: AuditEntry): string {
   const success = entry.exit_code === 0 && entry.result !== 'error' && entry.result !== 'denied'
@@ -117,7 +118,13 @@ export function renderUpdateOutcomeLine(entry: AuditEntry): string {
   const opStep = entry.op
   const hint = recoveryHint(entry.install_context?.install_type)
   // Single line is reader-friendly when short; multi-line when stderr is present.
-  const lines = [`❌ update failed at ${opStep}: ${stderrTail || '(no stderr captured)'}`, `    ↳ Recovery: ${hint}`]
+  // The recovery line is NESTED under the failure line with the repo's one
+  // indent idiom (#4115): a literal ASCII-space indent is left-trimmed off a
+  // content line by Telegram's parser and renders FLAT on a phone (#3668).
+  const lines = [
+    `❌ update failed at ${opStep}: ${stderrTail || '(no stderr captured)'}`,
+    `${NESTED_PREFIX}Recovery: ${hint}`,
+  ]
   return lines.join('\n')
 }
 

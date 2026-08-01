@@ -14,6 +14,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { renderBootCard, resolvePersonaName } from '../gateway/boot-card.js'
+import { NESTED_PREFIX } from '../status-no-truncate.js'
 
 describe('renderBootCard — quiet by default', () => {
   it('returns one-line ack with default ✅ when no probes and no restart reason', () => {
@@ -153,7 +154,7 @@ describe('renderBootCard — degraded conditions', () => {
       },
     })
     expect(out).toContain('🟡 **Skills**  10/10 dangling')
-    expect(out).toContain('    ↳ Run `switchroom agent reconcile lawgpt` to rebuild symlinks')
+    expect(out).toContain(`${NESTED_PREFIX}Run \`switchroom agent reconcile lawgpt\` to rebuild symlinks`)
   })
 
   it('crash row carries a tail-logs next-step', () => {

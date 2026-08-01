@@ -30,6 +30,7 @@
  */
 
 import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
+import { truncateMarkdownSafe } from './format.js'
 import { formatModelLabel } from './model-label.js'
 import { STATUS_CARD_CHAR_BUDGET, STATUS_LINE_MAX, STATUS_ROLLING_LINES } from './status-no-truncate.js'
 
@@ -338,9 +339,19 @@ export function fitCardToBudget(
  * Last-resort clip for a rendered card that no shrink level could fit — the
  * only place a card's text is cut without going through a spec.
  *
- * Keeps as many WHOLE lines as fit, so the survivors' markdown spans stay
- * balanced and only a single over-budget line is ever sliced mid-text. The tail
- * is then cleaned of the stack's own break chrome (hard-break spaces /
+ * Keeps as many WHOLE lines as fit, so line structure survives, and then runs
+ * the chosen cut through {@link truncateMarkdownSafe} so the emitted text is
+ * always PARSEABLE markdown (#4116). Two things make that necessary rather
+ * than decorative:
+ *
+ *   - a first line longer than the whole budget keeps no whole line at all, so
+ *     the cut lands mid-line — between a `**` pair, inside a `` ` `` span, in
+ *     the middle of a `[label](href)` — and Telegram parse-REJECTS the result.
+ *     The path that exists to guarantee delivery would itself fail the send.
+ *   - even a whole-line cut can leave a FENCED block open, which is a
+ *     multi-line entity and therefore invisible to a per-line rule.
+ *
+ * The tail is then cleaned of the stack's own break chrome (hard-break spaces /
  * `COLLAPSE_SAFE_SEPARATOR`) and of a dangling lone surrogate, so the wire
  * string is never invalid UTF-16.
  *
@@ -362,11 +373,12 @@ export function hardTruncateCard(
     if (trimBreakChrome(next).length > budget) break
     kept = next
   }
-  let out = trimBreakChrome(kept)
-  // A first line longer than the budget keeps nothing; slice it rather than
-  // emit a blank card.
-  if (out.length === 0) out = text.slice(0, budget)
-  if (out.length > budget) out = out.slice(0, budget)
+  // A first line longer than the budget keeps nothing; cut into it rather than
+  // emit a blank card. Either way the cut is taken against the FULL text — an
+  // entity straddling the boundary is only visible from there.
+  const target = kept.length > 0 ? kept.length : Math.min(budget, text.length)
+  let out = trimBreakChrome(truncateMarkdownSafe(text, target))
+  if (out.length > budget) out = trimBreakChrome(truncateMarkdownSafe(text, budget))
   // Finally, never leave a lone high surrogate from slicing through an astral
   // character.
   return /[\uD800-\uDBFF]$/.test(out) ? out.slice(0, -1) : out
