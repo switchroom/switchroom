@@ -414,6 +414,47 @@ const ObservationScopeStrategySchema = z
     "Cascade: override (per-agent wins over default)."
   );
 
+/**
+ * `memory.anti_confabulation_directive` — the seeded guardrail directive that
+ * tells reflect to answer "the bank does not know" rather than synthesising an
+ * answer retrieval does not support.
+ *
+ * Three shapes, one knob, matching the "defaults do the right thing;
+ * complexity is opt-in" rule:
+ *
+ *   - **unset / `true`** → switchroom seeds and maintains its own default. The
+ *     zero-config path; nothing in yaml is required to get the guardrail.
+ *   - **`false`** → seed nothing, and leave any existing directive of that
+ *     name alone (a bank that already has one keeps it — opting out of
+ *     MANAGEMENT is not a delete).
+ *   - **a string** → operator-authored text. Wins outright and is re-asserted
+ *     on every apply, exactly like `memory.retain_mission`.
+ *
+ * A fourth override path needs no yaml at all: edit the directive in the bank.
+ * Seeding only ever upgrades text that byte-matches a default switchroom
+ * itself shipped, so a hand-edit is permanent (see
+ * `src/memory/hindsight-seed-directives.ts`).
+ *
+ * Declared once and reused by BOTH `AgentMemorySchema` and the
+ * defaults/profile-tier mirror so the two tiers cannot drift.
+ */
+const AntiConfabulationDirectiveSchema = z
+  .union([z.boolean(), z.string().min(1)])
+  .optional()
+  .describe(
+    "The seeded anti-confabulation directive: reflect has no relevance " +
+    "floor (`min_scores` is a /recall-only parameter), so a bank holding " +
+    "nothing relevant still yields a confident answer, and a question that " +
+    "presupposes a decision reliably produces one. Directives ARE applied " +
+    "during reflect, so this is the lever. Unset or true (the default) " +
+    "seeds and maintains switchroom's own text; false disables seeding and " +
+    "leaves any existing directive untouched; a string is operator-authored " +
+    "text that wins outright. Switchroom only ever upgrades directive text " +
+    "byte-equal to a default it shipped, so editing the directive in the " +
+    "bank is also a permanent override. " +
+    "Cascade: override (per-agent wins over default)."
+  );
+
 export const AgentMemorySchema = z
   .object({
     collection: z.string().describe("Hindsight collection name for this agent"),
@@ -600,6 +641,7 @@ export const AgentMemorySchema = z
         "silent hook-side write). Set false to disable per-agent. " +
         "Cascade: override (per-agent wins over default)."
       ),
+    anti_confabulation_directive: AntiConfabulationDirectiveSchema,
     observation_scopes: ObservationScopesSchema,
     observation_scope_strategy: ObservationScopeStrategySchema,
     recall: z
@@ -3393,6 +3435,12 @@ const profileFields = {
       // defaults/profile tier too, so `defaults.memory.directive_capture_nudge:
       // false` can disable the #2848 nudge fleet-wide (per-agent `true` opt-in).
       directive_capture_nudge: z.boolean().optional(),
+      // Mirror of AgentMemorySchema.anti_confabulation_directive — accepted at
+      // the defaults/profile tier too, so `defaults.memory.
+      // anti_confabulation_directive: false` opts a whole fleet out of the
+      // seeded guardrail (or pins one house text for every agent), with
+      // per-agent override.
+      anti_confabulation_directive: AntiConfabulationDirectiveSchema,
       // Mirror of AgentMemorySchema.observation_scopes — accepted at the
       // defaults/profile tier too, so `defaults.memory.observation_scopes:
       // shared` pins a whole fleet's observations to one scope. A per-agent

@@ -781,7 +781,9 @@ import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { RETAIN_TAGS_DEFAULT } from "../memory/hindsight-retain-provenance.js";
-import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade, PROFILE_MEMORY_DEFAULTS, fetchBankObservationsMission, decideObservationsMissionUpgrade } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade, PROFILE_MEMORY_DEFAULTS, fetchBankObservationsMission, decideObservationsMissionUpgrade, fetchBankDisposition, decideDispositionPush, fleetOnlyDispositionTraits } from "../memory/hindsight.js";
+import type { BankDisposition } from "../memory/hindsight.js";
+import { ensureAntiConfabulationDirective } from "../memory/hindsight-seed-directives.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -2077,6 +2079,103 @@ async function resolveObservationsMissionPush(
     );
   }
   return decision.mission;
+}
+
+/**
+ * Decide which disposition traits to push to a bank, read-first.
+ *
+ * Shared by the scaffold and reconcile bank-op chains. Before the fleet-wide
+ * floor existed, `disposition` was only ever non-empty for an agent on a
+ * specialist profile or with explicit yaml, so pushing it unconditionally was
+ * nearly free. A floor makes it non-empty for EVERY agent, which without this
+ * would (a) send an `update_bank` on every apply for every agent forever, and
+ * (b) overwrite the disposition of every bank an operator had tuned by hand.
+ * See {@link decideDispositionPush}.
+ *
+ * Returns `undefined` for "push nothing" — including when the read fails,
+ * because "unknown" must never be treated as "unset".
+ */
+async function resolveDispositionPush(
+  apiUrl: string,
+  bankId: string,
+  desired: BankDisposition | undefined,
+  memory: { disposition?: BankDisposition } | undefined,
+  profileName: string,
+  label: string,
+): Promise<BankDisposition | undefined> {
+  if (!desired) return undefined;
+  const current = await fetchBankDisposition(apiUrl, bankId, { timeoutMs: 5000 });
+  if (!current.ok) {
+    console.warn(
+      `  ${chalk.yellow("⚠")} Could not read current disposition for ${label} (${current.reason}) — leaving it untouched`,
+    );
+    return undefined;
+  }
+  return decideDispositionPush(
+    desired,
+    current.disposition,
+    fleetOnlyDispositionTraits(memory, profileName),
+  );
+}
+
+/**
+ * Seed / upgrade the anti-confabulation directive on one bank, and report the
+ * outcome in the same voice as the sibling bank ops.
+ *
+ * Shared by BOTH the scaffold and reconcile bank-op chains, for the reason
+ * `resolveObservationsMissionPush` is: `switchroom apply` re-scaffolds every
+ * existing agent and never calls `reconcileAgent`, so a seed wired into only
+ * one of the two paths reaches roughly none of the fleet.
+ *
+ * Best-effort by contract — {@link ensureAntiConfabulationDirective} never
+ * throws, and this never rejects. A guardrail directive is worth an apply, not
+ * worth failing one.
+ */
+async function seedAntiConfabulationDirective(
+  apiUrl: string,
+  bankId: string,
+  configured: boolean | string | undefined,
+  label: string,
+): Promise<void> {
+  try {
+    const outcome = await ensureAntiConfabulationDirective(
+      apiUrl,
+      bankId,
+      configured,
+      { timeoutMs: 5000 },
+    );
+    switch (outcome.action) {
+      case "created":
+        console.log(
+          `  ${chalk.green("✓")} Seeded "${outcome.name}" directive for ${label}`,
+        );
+        break;
+      case "upgraded":
+        console.log(
+          `  ${chalk.green("✓")} Upgrading superseded default "${outcome.name}" directive for ${label}`,
+        );
+        break;
+      case "skipped":
+        // "disabled" is the operator's own choice, not news.
+        if (outcome.reason !== "disabled") {
+          console.warn(
+            `  ${chalk.yellow("⚠")} Skipped "${outcome.name}" directive for ${label}: ${outcome.reason}`,
+          );
+        }
+        break;
+      case "failed":
+        console.warn(
+          `  ${chalk.yellow("⚠")} Failed to ensure "${outcome.name}" directive for ${label}: ${outcome.reason}`,
+        );
+        break;
+      case "unchanged":
+        break;
+    }
+  } catch (err) {
+    console.warn(
+      `  ${chalk.yellow("⚠")} Directive seed error for ${label}: ${err}`,
+    );
+  }
 }
 
 /**
@@ -6306,6 +6405,21 @@ export function scaffoldAgent(
       // retain_mission it is a switchroom-managed default, so it goes through a
       // read-first decision that never clobbers an operator's hand-edit.
       delete missions.observations_mission;
+
+      // disposition gets the same read-first treatment, for the same reason:
+      // it is now non-empty for every agent (fleet floor), so pushing it
+      // blindly would both re-send it forever and overwrite hand-tuned banks.
+      delete missions.disposition;
+      const dispositionPush = await resolveDispositionPush(
+        apiUrl,
+        hindsightBankId,
+        extras.disposition,
+        agentConfig.memory,
+        resolveMemoryProfile(agentConfig),
+        formatAgentBankLabel(name, hindsightBankId),
+      );
+      if (dispositionPush) missions.disposition = dispositionPush;
+
       const seededObservationsMission = await resolveObservationsMissionPush(
         apiUrl,
         hindsightBankId,
@@ -6365,6 +6479,16 @@ export function scaffoldAgent(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
+
+      // Seed the anti-confabulation guardrail directive (default ON, no yaml
+      // required). Idempotent and never-clobbering — see
+      // src/memory/hindsight-seed-directives.ts.
+      await seedAntiConfabulationDirective(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.anti_confabulation_directive,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
     }));
   }
 
@@ -8751,6 +8875,21 @@ function reconcileAgentInner(
       // Same read-first treatment for observations_mission — see
       // `resolveObservationsMissionPush`.
       delete missions.observations_mission;
+
+      // disposition gets the same read-first treatment, for the same reason:
+      // it is now non-empty for every agent (fleet floor), so pushing it
+      // blindly would both re-send it forever and overwrite hand-tuned banks.
+      delete missions.disposition;
+      const dispositionPush = await resolveDispositionPush(
+        apiUrl,
+        hindsightBankId,
+        extras.disposition,
+        agentConfig.memory,
+        resolveMemoryProfile(agentConfig),
+        formatAgentBankLabel(name, hindsightBankId),
+      );
+      if (dispositionPush) missions.disposition = dispositionPush;
+
       const observationsMission = await resolveObservationsMissionPush(
         apiUrl,
         hindsightBankId,
@@ -8796,6 +8935,16 @@ function reconcileAgentInner(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
+
+      // Seed the anti-confabulation guardrail directive (default ON, no yaml
+      // required). Idempotent and never-clobbering — see
+      // src/memory/hindsight-seed-directives.ts.
+      await seedAntiConfabulationDirective(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.anti_confabulation_directive,
+        formatAgentBankLabel(name, hindsightBankId),
+      );
     }));
   }
 

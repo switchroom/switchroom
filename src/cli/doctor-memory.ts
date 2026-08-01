@@ -30,6 +30,7 @@ import {
   HINDSIGHT_MIN_API_VERSION,
 } from "../memory/hindsight-tools.js";
 import { compareApiVersion, fetchHindsightApiVersion } from "../memory/hindsight-repair.js";
+import { MAX_DIRECTIVES } from "../memory/hindsight-directive-admin.js";
 import {
   HINDSIGHT_DATA_VOLUME,
   HINDSIGHT_DEFAULT_WORKER_ID,
@@ -47,15 +48,13 @@ export interface CheckResult {
 export const MIN_HINDSIGHT_SHM_BYTES = 1024 * 1024 * 1024;
 
 /**
- * Hard cap on how many active directives the recall hook ever injects into the
- * prompt — MUST mirror `MAX_DIRECTIVES` in
- * `vendor/hindsight-memory/scripts/lib/directives.py`. A bank with MORE active
- * directives than this has its list truncated (`directives[:30]`) in the
- * `<active_directives>` recall block: the lowest-priority directives beyond the
- * cap never reach the agent. The plugin now also warns to stderr when it
- * truncates; the doctor surfaces the same condition fleet-wide (workstream C2).
+ * Re-exported for back-compat; the constant now lives in the memory layer
+ * (`src/memory/hindsight-directive-admin.ts`) because directive WRITERS need it
+ * too — the seeded anti-confabulation directive must not push a bank over the
+ * cap — and a memory module importing a `cli/` module to learn it would invert
+ * the layering.
  */
-export const MAX_DIRECTIVES = 30;
+export { MAX_DIRECTIVES };
 
 /**
  * Soft threshold: a bank with MORE active directives than this earns a WARN

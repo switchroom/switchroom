@@ -504,7 +504,43 @@ agents:
 
 **Zero-config defaults.** Built-in profiles ship differentiated dispositions so a fresh `switchroom setup` needs no YAML — `health-coach` leans empathy-high (`2/2/5`), `executive-assistant` leans precise (`4/4/3`), `coding` leans skeptical + literal (`4/5/2`). Operator config overrides these per-key.
 
+**The fleet skepticism floor.** Every agent — including one with no profile and no `memory:` block at all — gets `skepticism: 4` by default. The engine's own default is `3` ("accepts stated information"); `4` flags contradictions and treats a single unsupported assertion as a claim rather than a fact, which is what keeps a bank from hardening the agent's own synthesized output into remembered truth. It is the lowest tier of a three-tier merge:
+
+```
+fleet default ({ skepticism: 4 })  →  profile disposition  →  agents.<name>.memory.disposition
+```
+
+so `health-coach`'s `skepticism: 2` still wins, and `memory: { disposition: { skepticism: 3 } }` in YAML still puts an individual agent back on the engine default. `literalism` and `empathy` have **no** fleet default — they are genuinely persona-shaped, and a fleet-wide value would be a guess imposed on every agent.
+
+The floor is **read-first**, so it never rewrites a bank you tuned by hand: `switchroom apply` reads the bank's live disposition and pushes a fleet-only trait only when the bank has it unset or sitting on the engine default `3`. A bank already at `5` is left at `5`; a bank at `2` is left at `2`. A trait that came from a profile or from your YAML is authoritative and is pushed normally. If the disposition read fails, nothing is pushed.
+
 All four apply at **both** scaffold (fresh agents) and reconcile (`switchroom apply` updates existing banks) — except the `retain_mission` *default*, which is seeded only at scaffold so a customized retain mission is never clobbered.
+
+### The seeded anti-confabulation directive — `memory.anti_confabulation_directive`
+
+Directives are hard rules Hindsight applies during `reflect`. Every agent's bank is seeded with one by default, named `no-confabulation`, which tells the bank to say it does not know rather than compose an answer retrieval does not support — including not asserting a date, number, attribution, or decision merely because the question presupposed it.
+
+This exists because `recall` has a `min_scores` relevance floor and **`reflect` has none**: with no floor, a query that retrieves nothing relevant still gets a fluent answer. Directives are the only lever that reaches reflect, so the seeded directive is prompt discipline standing in for a guarantee the engine should enforce.
+
+| Value | Effect |
+| --- | --- |
+| unset (default) | Seeds switchroom's directive text. |
+| `true` | Same as unset — explicit opt-in. |
+| `false` | Never seeds. Does **not** delete a directive already in the bank — removal is the agent's `delete_directive` MCP tool, not an apply-time side effect. |
+| a string | Seeds *your* text under the same name; switchroom then treats it as operator-owned and never rewrites it. |
+
+```yaml
+agents:
+  lawyer:
+    memory:
+      anti_confabulation_directive: |
+        Never state a holding, a citation, or a filing date that no retrieved
+        memory contains. Say "not in the bank" instead.
+```
+
+Seeding is **idempotent and never clobbers**: it runs at both scaffold and reconcile, writes nothing when the bank's directive already matches, and — using the same supersession registry mechanic as `retain_mission` — upgrades the text only when what is in the bank is byte-identical to a *previous* switchroom default. A directive you edited by hand in the Hindsight UI is left alone forever. Creation also respects the 30-directive-per-bank cap (`switchroom doctor` WARNs above 24): at the cap, seeding is skipped with a log line rather than pushing a bank over the edge where low-priority directives silently drop out of recall. An *upgrade* of an existing directive is not blocked by the cap, since it does not add one.
+
+The seeded directive carries the tag `switchroom-seeded` and priority `10` — above an unprioritized directive, below anything you deliberately prioritized higher.
 
 ### Demoting individual memories from auto-recall
 

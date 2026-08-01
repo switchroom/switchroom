@@ -58,6 +58,22 @@
  * silently assumed away.
  */
 
+/**
+ * Hard cap on how many active directives the recall hook ever injects into the
+ * prompt — MUST mirror `MAX_DIRECTIVES` in
+ * `vendor/hindsight-memory/scripts/lib/directives.py`. A bank with MORE active
+ * directives than this has its list truncated (`directives[:30]`) in the
+ * `<active_directives>` recall block: the lowest-priority directives beyond the
+ * cap never reach the agent. The plugin also warns to stderr when it truncates;
+ * the doctor surfaces the same condition fleet-wide (workstream C2).
+ *
+ * It lives here, in the memory layer, because both READERS (`switchroom
+ * doctor`, which re-exports it from `cli/doctor-memory.ts`) and WRITERS (the
+ * seeded directive in `hindsight-seed-directives.ts`, which must not push a
+ * bank over the cap) need it, and the writer is a memory module.
+ */
+export const MAX_DIRECTIVES = 30;
+
 /** Directive as returned by `GET .../directives`. */
 export interface HindsightDirective {
   id: string;

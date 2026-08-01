@@ -8,6 +8,7 @@ import {
   fetchBankRetainMission,
   resolveBankMissionExtras,
   PROFILE_MEMORY_DEFAULTS,
+  FLEET_DEFAULT_DISPOSITION,
   DEFAULT_OBSERVATIONS_MISSION,
   SUPERSEDED_OBSERVATIONS_MISSIONS,
   decideObservationsMissionUpgrade,
@@ -1241,6 +1242,14 @@ describe("scaffoldAgent — observations_mission seed", () => {
     currentObservations: string | null,
     config: AgentConfig,
     updateBankCalls: Record<string, unknown>[] = [],
+    /**
+     * The bank's live disposition. Defaults to a bank already carrying the
+     * fleet floor, so the disposition half is a no-op and these tests stay
+     * about the mission under test; pass `{}` to model a bank that has none.
+     */
+    currentDisposition: Record<string, number> = {
+      disposition_skepticism: FLEET_DEFAULT_DISPOSITION.skepticism as number,
+    },
   ): Promise<Record<string, unknown>> {
     tmpDir = mkdtempSync(resolve(tmpdir(), "switchroom-obs-mission-"));
     let resolveArgs: (a: Record<string, unknown>) => void;
@@ -1256,6 +1265,7 @@ describe("scaffoldAgent — observations_mission seed", () => {
               // confused with the observations push under test.
               retain_mission: DEFAULT_RETAIN_MISSION,
               observations_mission: currentObservations,
+              ...currentDisposition,
             },
           }),
         } as any;
@@ -1342,7 +1352,9 @@ describe("scaffoldAgent — observations_mission seed", () => {
       extends: "default",
       memory: { profile: "coding" },
     } as Partial<AgentConfig>);
-    const args = await runScaffold(null, config);
+    // A bank with NO disposition yet, so all three traits are genuinely on the
+    // wire rather than suppressed as already-current.
+    const args = await runScaffold(null, config, [], {});
     const updates = args.config_updates as Record<string, unknown>;
     // Observations: the coding profile mission, not the generic fleet default.
     expect(updates.observations_mission).toBe(
@@ -1537,7 +1549,14 @@ describe("scaffoldAgent — retain_mission against an existing bank", () => {
       if (u.endsWith("/config")) {
         return {
           ok: true,
-          json: async () => ({ config: { retain_mission: "CUSTOM operator mission" } }),
+          json: async () => ({
+            config: {
+              retain_mission: "CUSTOM operator mission",
+              // Steady state: the bank already carries the fleet disposition
+              // floor, so "nothing to update" really is nothing.
+              disposition_skepticism: FLEET_DEFAULT_DISPOSITION.skepticism,
+            },
+          }),
         } as any;
       }
       const body = init?.body ? JSON.parse(init.body) : {};
@@ -1901,9 +1920,16 @@ describe("resolveBankMissionExtras", () => {
     });
   });
 
-  it("returns nothing for a profile without defaults and no config", () => {
-    expect(resolveBankMissionExtras(undefined, "default")).toEqual({});
-    expect(resolveBankMissionExtras({}, "some-unknown-profile")).toEqual({});
+  it("returns no MISSIONS for a profile without defaults — only the fleet disposition floor", () => {
+    // Was `{}` before the fleet-wide disposition floor. The floor is the ONLY
+    // thing a profile-less, config-less agent now gets: no mission text is
+    // invented for it, which is what this test has always guarded.
+    expect(resolveBankMissionExtras(undefined, "default")).toEqual({
+      disposition: FLEET_DEFAULT_DISPOSITION,
+    });
+    expect(resolveBankMissionExtras({}, "some-unknown-profile")).toEqual({
+      disposition: FLEET_DEFAULT_DISPOSITION,
+    });
   });
 
   it("merges disposition per-key: config trait overrides, others inherit profile", () => {
