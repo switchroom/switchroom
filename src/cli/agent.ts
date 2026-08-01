@@ -91,6 +91,26 @@ export function summarizeReconcileBatch(
 }
 
 /**
+ * Decide whether `agent reconcile` should auto-restart the agent.
+ *
+ * Restart-required changes (soul/MCP/settings/start.sh) only take
+ * effect on a fresh container, so reconcile auto-restarts when any are
+ * present — UNLESS the user passed `--no-restart` to defer the bounce.
+ *
+ * Commander exposes `--no-restart` as `opts.restart === false` (NOT
+ * `opts.noRestart`, which is always `undefined`). This helper reads the
+ * flag through the correct `opts.restart !== false` shape so the pure
+ * decision is unit-testable and the `--no-restart` opt-out actually
+ * takes effect (switchroom#3903).
+ */
+export function shouldAutoRestartAfterReconcile(
+  opts: { restart?: boolean },
+  restartRequiredCount: number,
+): boolean {
+  return opts.restart !== false && restartRequiredCount > 0;
+}
+
+/**
  * Resolve the `agent logs --lines` value to a docker `--tail` count.
  * Pure so the clamp contract is unit-testable: default 50 when omitted,
  * floor 1, cap 1000; a non-numeric or out-of-range (< 1) value falls
@@ -1757,7 +1777,7 @@ export function registerAgentCommand(program: Command): void {
     )
     .option("--check", "Report drift between yaml and settings.json without writing")
     .action(
-      withConfigError(async (name: string, opts: { restart?: boolean; noRestart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean; check?: boolean }) => {
+      withConfigError(async (name: string, opts: { restart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean; check?: boolean }) => {
         const config = getConfig(program);
         const agentsDir = resolveAgentsDir(config);
         const configPath = getConfigPath(program);
@@ -1875,7 +1895,7 @@ export function registerAgentCommand(program: Command): void {
                 const needsRestart = restartRequired.length > 0 || staleTillRestart.length > 0;
                 // Auto-restart when restart-required changes present (e.g. soul fields),
                 // unless the user explicitly opted out with --no-restart.
-                const autoRestart = restartRequired.length > 0 && !opts.noRestart;
+                const autoRestart = shouldAutoRestartAfterReconcile(opts, restartRequired.length);
                 if (!needsRestart && hot.length > 0) {
                   console.log(chalk.green("\n  (no restart needed, changes active next turn)"));
                 } else if (needsRestart && !opts.restart && !opts.gracefulRestart && !autoRestart) {
@@ -1899,9 +1919,8 @@ export function registerAgentCommand(program: Command): void {
             // running claude process loaded them at boot.
             const changesBySemantics = result.changesBySemantics;
             const autoRestartNeeded =
-              !opts.noRestart &&
               changesBySemantics !== undefined &&
-              changesBySemantics.restartRequired.length > 0;
+              shouldAutoRestartAfterReconcile(opts, changesBySemantics.restartRequired.length);
             const shouldRestart = (opts.restart || opts.gracefulRestart || autoRestartNeeded) && allChanges.length > 0;
 
             if (shouldRestart) {
