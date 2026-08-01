@@ -30,24 +30,115 @@ import { spawnSync } from "node:child_process";
 
 const CLI_BIN = process.env.SWITCHROOM_CLI ?? "switchroom";
 
+/**
+ * Subprocess timeout for the re-exec'd CLI.
+ *
+ * The write verbs (`schedule add|remove`, skill writes) run the full
+ * cron-only reconcile inside the CLI — including the #3333 ownership
+ * sweep (measured 8.4s over a 1.1M-inode agent tree) and Hindsight
+ * mental-model provisioning — and were measured at 15–19s wall inside a
+ * live agent container. The old hardcoded 15s timeout SIGTERM'd the
+ * child mid-reconcile: the overlay write had already landed but the CLI
+ * died before printing its JSON result (and before its rollback/audit
+ * paths could run), so the tool reported `CLI exit 1:` with an empty
+ * body for an operation that succeeded on disk (switchroom #4181).
+ * Default is deliberately generous; the env knob exists for tests and
+ * unusual hosts.
+ */
+export const CLI_TIMEOUT_MS = (() => {
+  const raw = process.env.SWITCHROOM_AGENT_CONFIG_CLI_TIMEOUT_MS;
+  const n = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 120_000;
+})();
+
 interface ExecResult {
   stdout: string;
   stderr: string;
   status: number;
+  /** Signal that terminated the child (e.g. SIGTERM on spawnSync
+   *  timeout), if any. Upstream `status` is null in that case; we keep
+   *  the mapped `1` for backward compat, but callers MUST check
+   *  `signal` to distinguish "CLI rejected the op" from "we killed it
+   *  mid-flight (the write may have landed)". */
+  signal: NodeJS.Signals | null;
+  /** Spawn-level failure (ENOENT, EACCES, …), if any. */
+  spawnError?: Error;
 }
 
 export function execCli(args: string[], stdin?: string): ExecResult {
   const r = spawnSync(CLI_BIN, args, {
     encoding: "utf-8",
     env: process.env,
-    timeout: 15000,
+    timeout: CLI_TIMEOUT_MS,
     ...(stdin !== undefined ? { input: stdin } : {}),
   });
   return {
     stdout: r.stdout ?? "",
     stderr: r.stderr ?? "",
     status: r.status ?? 1,
+    signal: r.signal ?? null,
+    spawnError: r.error,
   };
+}
+
+/**
+ * Format a CLI failure so the message is NEVER empty (#4181 — the old
+ * `CLI exit 1: ` with a blank body left callers unable to tell a failed
+ * write from a killed-after-success one). Three shapes:
+ *   - spawn failure (binary missing etc.) → the spawn error message;
+ *   - killed by signal (timeout) → names the signal + timeout budget and
+ *     warns that the write may have been applied without confirmation;
+ *   - genuine non-zero exit → legacy `CLI exit N: <stderr|stdout>`,
+ *     with an explicit placeholder when the child printed nothing.
+ */
+export function formatCliFailure(cliArgs: string[], r: ExecResult): string {
+  const verb = [CLI_BIN, ...cliArgs.slice(0, 2)].join(" ");
+  const detail = r.stderr.trim() || r.stdout.trim() || "(no output captured)";
+  if (r.spawnError) {
+    return `failed to exec \`${verb}\`: ${r.spawnError.message}`;
+  }
+  if (r.signal) {
+    return (
+      `\`${verb}\` was killed by ${r.signal} after exceeding the ${CLI_TIMEOUT_MS}ms ` +
+      `subprocess timeout — it did not confirm the operation, but the underlying ` +
+      `write may still have been applied on disk. Verify current state with the ` +
+      `matching read tool (e.g. cron_list / skill_list) before retrying. ` +
+      `Output before the kill: ${detail}`
+    );
+  }
+  return `CLI exit ${r.status}: ${detail}`;
+}
+
+/**
+ * Extract the JSON payload from CLI stdout, tolerating human-oriented
+ * progress noise around it. The write verbs' reconcile path prints
+ * status lines to stdout both BEFORE the JSON result (the #3333
+ * `[ownership-sweep] …` line) and AFTER it (Hindsight `✓ Mental model
+ * …` provisioning lines), so a strict whole-buffer JSON.parse fails on
+ * a fully successful write (#4181). Strategy: try the whole trimmed
+ * buffer first (fast path, preserves multi-line JSON documents), then
+ * scan individual lines from the END for the last one that parses —
+ * the CLI's own result line is always emitted as a single line.
+ */
+export function parseJsonPayload(stdout: string): unknown {
+  const t = stdout.trim();
+  if (!t) return null;
+  try {
+    return JSON.parse(t);
+  } catch {
+    /* fall through to line scan */
+  }
+  const lines = t.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim();
+    if (!line.startsWith("{") && !line.startsWith("[")) continue;
+    try {
+      return JSON.parse(line);
+    } catch {
+      /* keep scanning */
+    }
+  }
+  throw new Error("no JSON payload found in CLI stdout");
 }
 
 function jsonText(data: unknown) {
@@ -634,14 +725,12 @@ export function dispatchTool(
   }
 
   const r = execCli(cliArgs, stdinJson);
-  if (r.status !== 0) {
-    return errorText(
-      `CLI exit ${r.status}: ${r.stderr.trim() || r.stdout.trim()}`,
-    );
+  if (r.status !== 0 || r.signal || r.spawnError) {
+    return errorText(formatCliFailure(cliArgs, r));
   }
   try {
     if (parseMode === "json") {
-      const data = JSON.parse(r.stdout.trim() || "null");
+      const data = parseJsonPayload(r.stdout);
       return jsonText(data);
     }
     // jsonl

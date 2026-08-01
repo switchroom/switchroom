@@ -20,7 +20,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 // Import after vi.mock so the mock is in place.
-import { TOOLS, dispatchTool } from "./server.js";
+import { TOOLS, dispatchTool, parseJsonPayload, CLI_TIMEOUT_MS } from "./server.js";
 
 function okCall(stdout: string) {
   spawnSyncMock.mockReturnValueOnce({ stdout, stderr: "", status: 0 });
@@ -174,5 +174,132 @@ describe("dispatchTool — failure modes", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toMatch(/unknown tool: nope/);
     expect(spawnSyncMock).not.toHaveBeenCalled();
+  });
+});
+
+// #4181 — schedule_add/schedule_remove reported `CLI exit 1:` (empty
+// body) for writes that fully succeeded on disk. Root causes: (a) the
+// 15s spawnSync timeout SIGTERM'd the CLI mid-reconcile (measured
+// 15–19s live) AFTER the overlay write landed, with the killed child's
+// null status masked to `1` and its empty output rendered verbatim;
+// (b) even a completed write failed JSON parsing because the reconcile
+// path prints progress noise to stdout around the JSON result line.
+describe("dispatchTool — #4181 killed/noisy subprocess regressions", () => {
+  beforeEach(() => {
+    spawnSyncMock.mockReset();
+  });
+
+  it("schedule_add succeeds when reconcile noise surrounds the JSON result line", () => {
+    // Verbatim shape observed live (overlord, 2026-08-02): ownership-sweep
+    // line BEFORE the JSON, Hindsight provisioning lines AFTER it.
+    const payload = {
+      ok: true,
+      slug: "cron-438a4731e02e",
+      cron_hash: "438a4731e02e",
+      path: "/state/agent/home/.switchroom/agents/overlord/schedule.d/cron-438a4731e02e.yaml",
+      would_recreate: false,
+      restart_required: false,
+      restart_hint: "Live within ~30s",
+    };
+    okCall(
+      "[ownership-sweep] #3333 agent=overlord scope=full uid=10684 inodes=1142276 elapsedMs=8417 dir=/state/agent\n" +
+        JSON.stringify(payload) +
+        "\n" +
+        "  ✓ Hindsight bank ready for overlord\n" +
+        '  ✓ Mental model "Switchroom Fleet Rollout State" ready for overlord\n',
+    );
+    const res = dispatchTool("schedule_add", {
+      cron_expr: "0 * * * *",
+      prompt: "hourly report",
+      name: "consolidation-hourly-progress",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual(payload);
+  });
+
+  it("a timeout-killed CLI surfaces the signal and a may-have-applied warning, never an empty message", () => {
+    // spawnSync on timeout: status null, signal set, no output captured.
+    spawnSyncMock.mockReturnValueOnce({
+      stdout: "",
+      stderr: "",
+      status: null,
+      signal: "SIGTERM",
+    });
+    const res = dispatchTool("schedule_remove", { name: "consolidation-hourly-progress" });
+    expect(res.isError).toBe(true);
+    const msg = res.content[0]!.text;
+    // The old code produced exactly "CLI exit 1: " here — assert the
+    // message is substantive and truthful about what happened.
+    expect(msg).toMatch(/SIGTERM/);
+    expect(msg).toMatch(/timeout/i);
+    expect(msg).toMatch(/may still have been applied/);
+    expect(msg).toMatch(/cron_list/);
+    expect(msg).not.toMatch(/CLI exit 1: *$/);
+  });
+
+  it("a genuine write failure still reports failure with the CLI's stderr", () => {
+    failCall(
+      JSON.stringify({ code: "E_NOT_FOUND", message: "no overlay entry found for name=nope" }),
+      1,
+    );
+    const res = dispatchTool("schedule_remove", { name: "nope" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/CLI exit 1/);
+    expect(res.content[0]!.text).toMatch(/E_NOT_FOUND/);
+  });
+
+  it("a non-zero exit with NO output still yields a non-empty diagnostic", () => {
+    failCall("", 1);
+    const res = dispatchTool("schedule_remove", { name: "x" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/CLI exit 1: \(no output captured\)/);
+  });
+
+  it("a spawn-level failure (binary missing) is named, not rendered as an empty exit", () => {
+    spawnSyncMock.mockReturnValueOnce({
+      stdout: "",
+      stderr: "",
+      status: null,
+      signal: null,
+      error: new Error("spawnSync switchroom ENOENT"),
+    });
+    const res = dispatchTool("cron_list", {});
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/failed to exec/);
+    expect(res.content[0]!.text).toMatch(/ENOENT/);
+  });
+
+  it("the subprocess timeout budget covers the measured 15–19s reconcile-heavy writes", () => {
+    // The bug shipped with timeout: 15000 while `schedule remove` was
+    // measured at 19.2s wall in a live container — this pins the budget
+    // comfortably above that (default 120s, env-overridable).
+    expect(CLI_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    okCall(JSON.stringify([]) + "\n");
+    dispatchTool("cron_list", {});
+    const [, , opts] = spawnSyncMock.mock.calls[0]!;
+    expect((opts as { timeout: number }).timeout).toBe(CLI_TIMEOUT_MS);
+  });
+});
+
+describe("parseJsonPayload", () => {
+  it("parses a clean single JSON line (fast path)", () => {
+    expect(parseJsonPayload('{"ok":true}\n')).toEqual({ ok: true });
+  });
+
+  it("parses a multi-line pretty-printed JSON document", () => {
+    expect(parseJsonPayload('{\n  "ok": true\n}\n')).toEqual({ ok: true });
+  });
+
+  it("returns null for empty stdout", () => {
+    expect(parseJsonPayload("")).toBeNull();
+  });
+
+  it("picks the LAST parseable JSON line when noise interleaves", () => {
+    const out = "[sweep] pre\n" + '{"ok":true,"slug":"cron-abc"}\n' + "  ✓ post\n";
+    expect(parseJsonPayload(out)).toEqual({ ok: true, slug: "cron-abc" });
+  });
+
+  it("throws when stdout has no JSON at all", () => {
+    expect(() => parseJsonPayload("not-json\n")).toThrow(/no JSON payload/);
   });
 });
