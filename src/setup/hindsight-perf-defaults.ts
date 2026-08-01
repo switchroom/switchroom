@@ -1041,6 +1041,48 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * one is set at all — must sit between that type's own reservation and
  * `WORKER_MAX_SLOTS`), so an incoherent combination fails loudly in the
  * container rather than silently here.
+ *
+ * ### `HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY`
+ *
+ * The floor on cosine similarity a candidate must reach to be returned by the
+ * semantic retrieval arm at all — upstream's configuration reference:
+ * "Minimum cosine similarity a candidate must reach to be returned by the
+ * semantic retrieval strategy. Must be between 0 and 1." Default **0.3**
+ * (`DEFAULT_SEMANTIC_MIN_SIMILARITY`, engine `config.py`), applied as a SQL
+ * `WHERE` floor inside the semantic retrieval arms — a candidate below it is
+ * not down-ranked, it is never fetched, so no amount of reranking or RRF
+ * consensus can recover it. The knob is upstream-documented since 0.8.0
+ * ("Semantic recall sensitivity is adjustable with a configurable minimum
+ * similarity threshold").
+ *
+ * The observed symptom that makes this worth managing: on a live bank, the
+ * query "What stage is each ProductOS article at right now?" returned
+ * nothing, while "Which are published and which are still in draft?" returned
+ * a full correct answer off the same bank seconds later. The first phrasing
+ * embedded below 0.3 against the relevant fact, so the semantic arm returned
+ * ZERO candidates and the query survived only on BM25 lexical overlap — a
+ * recall miss that is invisible in telemetry (the arm "succeeded", it just
+ * found nothing) and highly phrasing-sensitive. Where on a given bank the
+ * floor should sit depends on that bank's embedding model and phrasing
+ * diversity, which is a property of the deployment, not of switchroom.
+ *
+ * Override-only rather than defaulted, deliberately: this key exists to make
+ * the knob REACHABLE, not to change anyone's retrieval behaviour. Unset ⇒
+ * upstream's 0.3, byte-for-byte what every host runs today. Shipping a lower
+ * value fleet-wide would trade an unmeasured amount of semantic-arm precision
+ * (more marginal candidates competing for the reranker budget) on every
+ * install to fix a symptom measured on one — the same reasoning as the four
+ * keys above. Before this entry the key appeared nowhere in switchroom, so a
+ * `hindsight.env` line for it was silently discarded by
+ * `resolveHindsightPerfOverrides` — no error, no warning, the container kept
+ * 0.3 while the yaml read as durable config.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     # widen the semantic arm on a bank with paraphrase-heavy queries
+ *     HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY: "0.2"
+ * ```
  */
 export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
@@ -1048,6 +1090,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS",
   "HINDSIGHT_API_WORKER_MAX_SLOTS",
   "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
+  "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
 ]);
 
 /**
