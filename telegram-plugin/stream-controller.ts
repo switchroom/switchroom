@@ -27,6 +27,12 @@ import {
 import { richMessage, isParseEntitiesError } from './rich-send.js'
 import { renderOutboundChunks } from './render/rich-render.js'
 import { isSendGateShed, type SendGateOpts } from './send-gate.js'
+import {
+  buildReplyParameters,
+  dropQuoteFromSendOpts,
+  isQuoteRejectionError,
+  sendOptsHaveQuote,
+} from './reply-quote.js'
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
@@ -59,8 +65,14 @@ export interface StreamSendOpts {
    * message. Only meaningful on the initial `sendMessage` — `editMessageText`
    * cannot add a quote reference to an existing message, so the controller
    * strips this from edit opts internally.
+   *
+   * `quote` is a Bot API **String** — the quoted substring itself. The optional
+   * offset is a SIBLING `quote_position` Integer, which this plugin
+   * deliberately never emits. Typing it as an object is what produced
+   * `400 field "quote" must be of type String` on every quoted reply; see
+   * `reply-quote.ts`.
    */
-  reply_parameters?: { message_id: number; quote?: { text: string; position: number } }
+  reply_parameters?: { message_id: number; quote?: string }
   /**
    * Inline keyboard markup. Included in both sendMessage and editMessageText
    * so that inline buttons persist through text edits. Without this,
@@ -121,7 +133,10 @@ export interface StreamControllerConfig {
   /**
    * Optional quote text for surgical quoting. When set along with
    * `replyToMessageId`, the initial send includes
-   * `reply_parameters: { message_id, quote: { text, position: 0 } }`.
+   * `reply_parameters: { message_id, quote }` — `quote` is a Bot API String
+   * (see `reply-quote.ts`). A quote Telegram cannot find in the replied-to
+   * message is dropped and the send retried unquoted, so the answer still
+   * lands.
    */
   quoteText?: string
   /**
@@ -222,14 +237,16 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
     ...(replyMarkup != null ? { reply_markup: replyMarkup } : {}),
   }
-  const sendOpts: StreamSendOpts = {
+  // `let`, not `const`: a quote Telegram cannot find in the replied-to message
+  // is stripped ONCE for the whole stream (see sendPieceWithQuoteFallback) —
+  // re-attaching it to the next piece would just 400 again.
+  let sendOpts: StreamSendOpts = {
     ...baseOpts,
     ...(replyToMessageId != null
       ? {
-          reply_parameters: {
-            message_id: replyToMessageId,
-            ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
-          },
+          // `quote` is a Bot API String; `quote_position` is a separate sibling
+          // Integer we deliberately don't emit. See reply-quote.ts.
+          reply_parameters: buildReplyParameters(replyToMessageId, quoteText),
         }
       : {}),
     ...(protectContent === true ? { protect_content: true } : {}),
@@ -262,6 +279,24 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     const richOpts = { ...opts }
     delete richOpts.link_preview_options
     return bot.api.sendRichMessage(chatId, richMessage(piece.text), richOpts)
+  }
+  // Send a piece, degrading gracefully when the SURGICAL QUOTE is the thing
+  // Telegram rejected. `reply_parameters.quote` must be an exact substring of
+  // the replied-to message; when it isn't, the 400 kills a perfectly good
+  // answer. Drop the highlight (for this send and every later one on this
+  // stream) and re-send — the reply still lands, still threaded under the same
+  // message.
+  const sendPieceWithQuoteFallback = async (piece: { text: string; rich: boolean }) => {
+    try {
+      return await sendPiece(piece, sendOpts)
+    } catch (err) {
+      if (!isQuoteRejectionError(err) || !sendOptsHaveQuote(sendOpts)) throw err
+      warn?.(
+        `stream-controller: quote not found in the replied-to message — re-sending without the quote (${err instanceof Error ? err.message : String(err)})`,
+      )
+      sendOpts = dropQuoteFromSendOpts(sendOpts)
+      return await sendPiece(piece, sendOpts)
+    }
   }
   const editPiece = (id: number, piece: { text: string; rich: boolean }, opts: StreamSendOpts) => {
     if (!piece.rich) return bot.api.editMessageText(chatId, id, piece.text, opts)
@@ -395,7 +430,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     }
     // First emission of this tail piece → a fresh follow-up message.
     try {
-      const sent = await retry(() => sendPiece(piece, sendOpts), { threadId, chat_id: chatId })
+      const sent = await retry(() => sendPieceWithQuoteFallback(piece), { threadId, chat_id: chatId })
       tailIds[ti] = sent.message_id
       tailLastText[ti] = piece.text
       onSend?.(sent.message_id, piece.text.length)
@@ -435,7 +470,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       let anchorId: number | undefined
       try {
         const sent = await retry(
-          () => sendPiece(head, sendOpts),
+          () => sendPieceWithQuoteFallback(head),
           { threadId, chat_id: chatId },
         )
         anchorId = sent.message_id

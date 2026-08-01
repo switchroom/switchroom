@@ -108,7 +108,7 @@ const TOOL_SCHEMAS = [
         format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. Default renders your text as rich GFM markdown (Bot API 10.1). 'text' sends plain text verbatim. 'html' and 'markdownv2' are legacy aliases that route through the same single rich GFM path — no separate HTML engine, no auto-escaping." },
         disable_web_page_preview: { type: 'boolean', description: 'Disable link preview thumbnails. Default: true.' },
         protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
-        quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
+        quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Must be an EXACT substring of that message (copy it verbatim, do not paraphrase; max 1024 chars) — a quote Telegram cannot find is dropped and the reply lands unquoted. Requires reply_to.' },
         disable_notification: { type: 'boolean', description: 'When true, Telegram delivers the message silently — no device ping for this user. Default false (pings). Use true for mid-turn updates ("still working through X") so only the final answer pings. Always omit (or pass false) on the final answer of a turn.' },
         inline_keyboard: {
           type: 'array',

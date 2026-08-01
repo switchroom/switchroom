@@ -37,6 +37,12 @@ import { scrubVoice } from '../text-voice-scrub.js'
 import { normalizeTemporal } from '../temporal-normalize.js'
 import { resolveEnvTimezone } from '../shared/local-time.js'
 import { isMessageTooLongError, isHtmlParseRejectError } from '../retry-api-call.js'
+import {
+  buildReplyParameters,
+  dropQuoteFromSendOpts,
+  isQuoteRejectionError,
+  sendOptsHaveQuote,
+} from '../reply-quote.js'
 
 // ── send-orchestration façade imports (#2996 P2) ──
 // Pure/deterministic helpers are imported; stateful or side-effecting gateway
@@ -542,6 +548,20 @@ export async function sendReplyChunks(
           else if (isHtmlParseRejectError(retryErr)) await sendChunkPlainText(retryOpts)
           else throw retryErr
         }
+      } else if (isQuoteRejectionError(err) && sendOptsHaveQuote(sendOpts)) {
+        // Surgical-quote rejection: the quote must be an EXACT substring of the
+        // message being replied to, and Telegram 400s when it isn't found (a
+        // model paraphrase, a re-rendered fragment, an emoji/entity mismatch).
+        // That is a failure of the HIGHLIGHT, not of the answer — so drop the
+        // quote and land the reply as an ordinary reply to the same message,
+        // rather than throwing the composed answer away.
+        const retryOpts = dropQuoteFromSendOpts(sendOpts)
+        const sent = await sendChunk(retryOpts, false)
+        sentIds.push(sent.message_id)
+        deps.logOutbound('reply', chatId, sent.message_id, chunks[i].length, `chunk=${i + 1}/${chunks.length} quote-dropped`)
+        deps.stderr(
+          `telegram gateway: quote not found in the replied-to message — resent chunk ${i + 1}/${chunks.length} without the quote\n`,
+        )
       } else if (isMessageTooLongError(err)) {
         await sendChunkResplit(sendOpts)
       } else if (isHtmlParseRejectError(err)) {
@@ -1992,10 +2012,10 @@ export async function sendReply(
         return {
           ...(shouldReplyTo
             ? {
-                reply_parameters: {
-                  message_id: reply_to,
-                  ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
-                },
+                // `quote` is a Bot API String and `quote_position` a separate
+                // sibling Integer — see reply-quote.ts. Emitting an object here
+                // 400'd every quoted reply the fleet ever sent.
+                reply_parameters: buildReplyParameters(reply_to!, quoteText),
               }
             : {}),
           ...(tid != null ? { message_thread_id: tid } : {}),
