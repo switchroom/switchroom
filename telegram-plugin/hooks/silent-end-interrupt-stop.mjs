@@ -119,6 +119,16 @@ function buildNextState(base, decision, retryCount) {
   } else {
     delete next.pendingText
   }
+  // #4141: carry THIS turn's reply-throw signal through to the captured-prose
+  // bridge, which is the delivering machine on the ELECTED path and has no
+  // transcript of its own. Same stale-carryover discipline as `pendingText` /
+  // `turnId`: explicitly DELETED when this turn's scan saw no throw, so a
+  // spread of a prior turn's file can never mislabel a clean turn.
+  if (decision.replyToolThrewThisTurn === true) {
+    next.replyToolThrewThisTurn = true
+  } else {
+    delete next.replyToolThrewThisTurn
+  }
   return next
 }
 
@@ -188,7 +198,18 @@ function classifyCaptureAudience(stateDir, capture) {
   // the one configuration in which the asymmetric default would invert. (The
   // gateway also unlinks the snapshot at boot in this mode; this is the
   // reader-side half, covering the window before it does.)
-  const snapshotTrusted = process.env.SWITCHROOM_OBLIGATION_LEDGER !== '0'
+  // STATIC is the second persistence-off mode (`gateway.ts:1343` gates the same
+  // `onChange` wiring on it at `:2810`), so it must distrust the file for the
+  // same reason. Writer-side cleanup already covers it at boot; this leg covers
+  // the window the writer cannot — an unlink that failed (EACCES) or a gateway
+  // that has not restarted since the mode changed. Honest caveat:
+  // `TELEGRAM_ACCESS_MODE` is supplied by the host, not by this repo, so if it
+  // is not exported into the hook's environment this leg degrades to a no-op and
+  // the writer-side unlink remains the cover. It can only ever move the verdict
+  // toward DELIVER, so a degraded read is never worse than today.
+  const snapshotTrusted =
+    process.env.SWITCHROOM_OBLIGATION_LEDGER !== '0' &&
+    process.env.TELEGRAM_ACCESS_MODE !== 'static'
   return decideCaptureAudience({
     replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
     openInboundObligation: resolveOpenObligation({

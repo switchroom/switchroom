@@ -57,6 +57,10 @@ import {
   shouldFrameReplyThrow,
 } from '../hooks/audience-classify.mjs'
 import { scanForOutboxCapture } from '../hooks/silent-end-scan.mjs'
+import { deliverCapturedProse } from '../gateway/outbound-send-path.js'
+import { decideCapturedProseDelivery } from '../silent-end.js'
+import { OutboundDedupCache } from '../recent-outbound-dedup.js'
+import { decideTurnFlush } from '../turn-flush-safety.js'
 import { buildTurnRecord } from '../gateway/turn-record-status.js'
 import {
   detectTurnFindings,
@@ -775,5 +779,348 @@ describe('#4141 — framing is honest telemetry and cannot launder a broken turn
     const { route: _dropped, ...legacyRow } = row
     const findings = detectTurnFindings('klanker', [{ ...legacyRow, ts: now }])
     expect(findings.filter((f) => f.signal === 'silent-no-op-candidate')).toHaveLength(1)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #4141 REVIEW FINDING — THE ELECTED PATH
+//
+// The sweep-path framing above binds only when the Stop hook writes an outbox
+// RECORD. On the dominant live shape it does not:
+//
+//   The reply tool is called with a QUALIFYING final answer and it THROWS.
+//   `scanForOutboxCapture` classifies a qualifying reply-tool call from its
+//   INPUT (`isFinalAnswerReply`, silent-end-scan.mjs:1008) and never consults
+//   the tool_result, so `replyAlreadyDeliveredThisTurn` is true even though the
+//   call errored. The hook therefore takes the #3510 branch, writes NO outbox
+//   record, and falls through to the single-writer election, which hands the
+//   trailing prose to the gateway's captured-prose bridge.
+//
+// So on a healthy gateway the FIRST, common occurrence goes out through a
+// machine the outbox sweep never touches. These tests pin the label onto THAT
+// machine, driving the real hook, the real `decideCapturedProseDelivery`, and
+// the real `deliverCapturedProse` against the recording bot.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The ELECTED foreground shape: a QUALIFYING final-answer reply (no
+ * `disable_notification`, so `isFinalAnswerReply` is true on the input alone)
+ * that throws, followed by trailing prose over the bridge's 200-char floor.
+ */
+function electedThrowTranscript(dir: string, prose: string, opts: { throws?: boolean } = {}) {
+  const lines: object[] = [
+    {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: `<channel source="telegram" chat_id="${DM_CHAT}" message_id="${INBOUND_MSG_ID}">where did the rebase land?</channel>`,
+      timestamp: 1000,
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_reply_elected',
+            name: 'mcp__switchroom-telegram__reply',
+            // No `disable_notification` ⇒ qualifying final answer by input.
+            input: { text: 'The rebase landed cleanly on the merge base.' },
+          },
+        ],
+      },
+    },
+  ]
+  if (opts.throws !== false) {
+    lines.push({
+      type: 'user',
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_reply_elected',
+            is_error: true,
+            content: 'Error: request timed out after 30000ms',
+          },
+        ],
+      },
+    })
+  } else {
+    lines.push({
+      type: 'user',
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_reply_elected', content: 'sent' },
+        ],
+      },
+    })
+  }
+  lines.push({ type: 'assistant', message: { content: [{ type: 'text', text: prose }] } })
+  return writeTranscript(dir, lines)
+}
+
+/** Make the election's gateway-liveness gate pass. */
+function writeFreshHeartbeat(dir: string): void {
+  writeFileSync(join(dir, 'gateway-heartbeat'), 'up', 'utf8')
+}
+
+function readElectedState(dir: string): Record<string, unknown> | null {
+  const p = join(dir, 'silent-end-pending.json')
+  if (!existsSync(p)) return null
+  return JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+}
+
+/** Drive the REAL captured-prose bridge against the recording bot. */
+async function realBridge(
+  stateDir: string,
+  bot: ReturnType<typeof recordingBot>,
+  decision: { text?: string; replyToolThrewThisTurn?: boolean },
+) {
+  const stderr: string[] = []
+  // `journalExternalDelivery` resolves its state dir from the env (the bridge
+  // takes no stateDir arg), so point it at this test's dir for the duration.
+  const prevStateDir = process.env.TELEGRAM_STATE_DIR
+  process.env.TELEGRAM_STATE_DIR = stateDir
+  const origWrite = process.stderr.write.bind(process.stderr)
+  ;(process.stderr as unknown as { write: (s: string) => boolean }).write = (s: string) => {
+    stderr.push(String(s))
+    return true
+  }
+  try {
+    await deliverCapturedProse(
+      {
+        outboundDedup: new OutboundDedupCache({}),
+        bot: bot as never,
+        robustApiCall: passthroughRetry,
+        redactOutboundText: (t: string) => t,
+        recordOutbound: () => {},
+        HISTORY_ENABLED: false,
+        OBLIGATION_LEDGER_ENABLED: false,
+        obligationLedger: { close: () => {} },
+        clearSilentEndState: () => {},
+        recordUndeliveredTurnEnd: () => ({ exhausted: false }),
+        hasOutboundDeliveredSince: () => false,
+      },
+      {
+        chatId: DM_CHAT,
+        threadId: undefined,
+        statusKeyStr: `${DM_CHAT}:_`,
+        registryKey: null,
+        originTurnId: NONCE,
+        text: decision.text!,
+        replyToolThrewThisTurn: decision.replyToolThrewThisTurn === true,
+      },
+    )
+  } finally {
+    ;(process.stderr as unknown as { write: typeof origWrite }).write = origWrite
+    if (prevStateDir === undefined) delete process.env.TELEGRAM_STATE_DIR
+    else process.env.TELEGRAM_STATE_DIR = prevStateDir
+  }
+  return { stderr }
+}
+
+describe('#4141 elected path — the bridge, not the sweep, is the common deliverer', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = makeStateDir()
+    writeFreshHeartbeat(dir)
+    writeOpenObligation(dir)
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  it('PREMISE: a thrown QUALIFYING reply writes no outbox record and elects the bridge', () => {
+    const t = electedThrowTranscript(dir, WORKING_NOTES)
+    const res = runHook(t, dir)
+    expect(res.status).toBe(0)
+    // The sweep-path record — the only thing the outbox framing can label —
+    // is never written on this shape. This is exactly why the sweep-side fix
+    // alone left #4141 open.
+    expect(outboxRecords(dir)).toEqual([])
+    expect(res.stderr).toContain('deferring to single-writer election')
+    expect(res.stderr).toContain('single-writer election ALLOWED stop')
+    // ...and a real sweep tick therefore has nothing at all to deliver.
+    expect(outboxRecords(dir)).toHaveLength(0)
+  })
+
+  it('the elected state file carries the reply-throw signal to the bridge', () => {
+    runHook(electedThrowTranscript(dir, WORKING_NOTES), dir)
+    const state = readElectedState(dir)
+    expect(state).not.toBeNull()
+    expect(state!.replyToolThrewThisTurn).toBe(true)
+    expect(state!.pendingText).toBe(WORKING_NOTES)
+    expect(state!.turnId).toBe(NONCE)
+  })
+
+  it('a turn whose reply did NOT throw carries no signal — no stale carryover', () => {
+    // Seed a state file that already claims a throw, then run a CLEAN turn.
+    // `buildNextState` must DELETE the field, not spread it forward.
+    writeFileSync(
+      join(dir, 'silent-end-pending.json'),
+      JSON.stringify({ retryCount: 0, replyToolThrewThisTurn: true, turnKey: 'stale' }),
+      'utf8',
+    )
+    runHook(electedThrowTranscript(dir, WORKING_NOTES, { throws: false }), dir)
+    const state = readElectedState(dir)
+    expect(state).not.toBeNull()
+    expect(state!.replyToolThrewThisTurn).toBeUndefined()
+  })
+
+  it('OUTCOME: the bridge delivers the prose WITH its provenance stated', async () => {
+    runHook(electedThrowTranscript(dir, WORKING_NOTES), dir)
+    const decision = decideCapturedProseDelivery(
+      { turnKey: `${DM_CHAT}:_`, turnId: NONCE },
+      { stateDir: dir },
+    )
+    expect(decision.deliver).toBe(true)
+    expect(decision.text).toBe(WORKING_NOTES)
+    expect(decision.replyToolThrewThisTurn).toBe(true)
+
+    const bot = recordingBot()
+    const { stderr } = await realBridge(dir, bot, decision)
+
+    // A. FRAMING NEVER SILENCES — exactly one chat-visible call, prose intact.
+    expect(bot.chatCalls()).toHaveLength(1)
+    const sent = bot.chatCalls()[0]!.text
+    expect(sent).toContain(WORKING_NOTES)
+    expect(sent).toContain(REPLY_THROW_PROVENANCE_NOTICE)
+    expect(sent.indexOf(REPLY_THROW_PROVENANCE_NOTICE)).toBeLessThan(sent.indexOf(WORKING_NOTES))
+
+    // B. FRAMING IS OBSERVABLE — durable journal stamp + one telemetry line.
+    const journal = journalLines(dir)
+    expect(journal).toHaveLength(1)
+    expect(journal[0]!.framedProvenance).toBe('reply-throw')
+    expect(journal[0]!.tgMessageId).toBeDefined()
+    // The journal key stays on the RAW text so exactly-once-among-backstops
+    // is unaffected by the label.
+    expect(journal[0]!.textSha256).toBe(sha256Hex(WORKING_NOTES))
+    expect(stderr.filter((l) => l.includes('outbox provenance framing'))).toHaveLength(1)
+  })
+
+  it('REVERT CHECK: with framing off the bridge reproduces the #4141 leak', async () => {
+    const prev = process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING
+    process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING = '0'
+    try {
+      runHook(electedThrowTranscript(dir, WORKING_NOTES), dir)
+      const decision = decideCapturedProseDelivery(
+        { turnKey: `${DM_CHAT}:_`, turnId: NONCE },
+        { stateDir: dir },
+      )
+      const bot = recordingBot()
+      await realBridge(dir, bot, decision)
+      expect(bot.chatCalls()).toHaveLength(1)
+      // The bug: working notes delivered to a waiting human, unlabelled.
+      expect(bot.chatCalls()[0]!.text).toBe(WORKING_NOTES)
+      expect(bot.chatCalls()[0]!.text).not.toContain(REPLY_THROW_PROVENANCE_NOTICE)
+      expect(journalLines(dir)[0]!.framedProvenance).toBeUndefined()
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING
+      else process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING = prev
+    }
+  })
+
+  it('ANTI-SILENCE: a genuine answer rewritten as prose still arrives in full', async () => {
+    runHook(electedThrowTranscript(dir, REAL_ANSWER), dir)
+    const decision = decideCapturedProseDelivery(
+      { turnKey: `${DM_CHAT}:_`, turnId: NONCE },
+      { stateDir: dir },
+    )
+    const bot = recordingBot()
+    await realBridge(dir, bot, decision)
+    expect(bot.chatCalls()).toHaveLength(1)
+    expect(bot.chatCalls()[0]!.text).toContain(REAL_ANSWER)
+  })
+
+  it('LEGACY: a state file with no signal delivers byte-for-byte unframed', async () => {
+    writeFileSync(
+      join(dir, 'silent-end-pending.json'),
+      JSON.stringify({
+        retryCount: 0,
+        turnKey: `${DM_CHAT}:_`,
+        turnId: NONCE,
+        chatId: DM_CHAT,
+        threadId: null,
+        timestamp: Date.now(),
+        pendingText: WORKING_NOTES,
+      }),
+      'utf8',
+    )
+    const decision = decideCapturedProseDelivery(
+      { turnKey: `${DM_CHAT}:_`, turnId: NONCE },
+      { stateDir: dir },
+    )
+    expect(decision.replyToolThrewThisTurn).toBeUndefined()
+    const bot = recordingBot()
+    await realBridge(dir, bot, decision)
+    expect(bot.chatCalls()[0]!.text).toBe(WORKING_NOTES)
+  })
+
+  it('the label is presentation only — dedup still keys on the RAW prose', async () => {
+    // Additive-by-construction, re-established on THIS path: this path has its
+    // own send ladder and its own dedup, so the sweep's proof does not carry.
+    // A second bridge call with the same raw text must dedup (zero new sends)
+    // even though the first send carried the banner.
+    const dedup = new OutboundDedupCache({})
+    const bot = recordingBot()
+    const deps = {
+      outboundDedup: dedup,
+      bot: bot as never,
+      robustApiCall: passthroughRetry,
+      redactOutboundText: (t: string) => t,
+      recordOutbound: () => {},
+      HISTORY_ENABLED: false,
+      OBLIGATION_LEDGER_ENABLED: false,
+      obligationLedger: { close: () => {} },
+      clearSilentEndState: () => {},
+      recordUndeliveredTurnEnd: () => ({ exhausted: false }),
+      hasOutboundDeliveredSince: () => false,
+    }
+    const args = {
+      chatId: DM_CHAT,
+      threadId: undefined,
+      statusKeyStr: `${DM_CHAT}:_`,
+      registryKey: null,
+      originTurnId: NONCE,
+      text: WORKING_NOTES,
+      replyToolThrewThisTurn: true,
+    }
+    await deliverCapturedProse(deps, args)
+    expect(bot.chatCalls()).toHaveLength(1)
+    // Same raw text arriving unframed (e.g. a late reply-tool retry) is still
+    // recognised as already-sent — the banner did not change the identity.
+    await deliverCapturedProse(deps, { ...args, replyToolThrewThisTurn: false })
+    expect(bot.chatCalls()).toHaveLength(1)
+  })
+
+  it('DISJOINTNESS: the turn-flush machine cannot deliver on a reply-throw turn', () => {
+    // The elected `no-final-reply` leg names the flush as the deliverer, so it
+    // is fair to ask whether IT also needs the label. It does not, and this is
+    // structural rather than a judgement: `turn.replyCalled` is set on the
+    // reply tool's CALL event (stream-render.ts:1196), before any result, so a
+    // thrown reply still sets it — and `decideTurnFlush` skips outright on
+    // `replyCalled`. A reply-throw turn can therefore never reach the flush
+    // send site, which is why framing lives on the bridge instead.
+    const flushed = decideTurnFlush({
+      replyCalled: true,
+      capturedText: [WORKING_NOTES],
+      turnFlushSafetyEnabled: true,
+    } as never)
+    expect(flushed.kind).toBe('skip')
+    expect(flushed.reason).toBe('reply-called')
+  })
+})
+
+describe('#4141 — the elected path is WIRED, not just implemented', () => {
+  it('stream-render forwards the signal from the decision into the bridge call', () => {
+    // The two ends of this path are covered by outcome tests above
+    // (`decideCapturedProseDelivery` surfaces the signal; `deliverCapturedProse`
+    // frames on it). The ONE link between them is a single argument in
+    // stream-render's turn_end handler, which cannot be driven in isolation —
+    // it lives inside a ~2000-line event handler with the whole gateway as its
+    // closure. So it is pinned structurally: without this argument the feature
+    // is inert in production while every other test in this file still passes,
+    // which is exactly the failure mode this pin exists to catch.
+    const src = readFileSync(resolve(__dirname, '..', 'gateway', 'stream-render.ts'), 'utf8')
+    const call = src.slice(src.indexOf('void deliverCapturedProse({'))
+    const body = call.slice(0, call.indexOf('\n            })'))
+    expect(body).toContain('replyToolThrewThisTurn: proseDecision.replyToolThrewThisTurn === true')
   })
 })
