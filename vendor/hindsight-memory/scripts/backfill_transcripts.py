@@ -193,6 +193,7 @@ def _is_dynamic_bank(config: dict) -> bool:
 
 _STALL_THRESHOLD = 3          # consecutive failures → circuit-breaker cooldown
 _BACKOFF_CAP_S = 60.0         # exponential backoff ceiling
+_POST_MAX_ATTEMPTS = 3        # bounded per-slice retry before giving up (#3291)
 
 
 def agents_dir() -> str:
@@ -453,38 +454,59 @@ class Backfill:
             self._consecutive_failures = 0
 
     def _post_slice(self, bank_id: str, built: dict) -> bool:
-        """Serial, paced, confirmed POST of one slice. Returns True on confirmed
-        persistence. NEVER concurrent — one in flight fleet-wide via the shared
-        inflight lock."""
+        """Serial, paced, confirmed POST of one slice with bounded retry.
+
+        Returns True on confirmed persistence, False after exhausting
+        ``_POST_MAX_ATTEMPTS`` transient failures. NEVER concurrent — one in
+        flight fleet-wide via the shared inflight lock.
+
+        The bounded retry (#3291) matters because every POST is
+        ``async_processing=False`` (commit-before-ack): a slice that lands is
+        durable immediately, so a *single*-attempt failure on slice ``k`` used to
+        strand slices ``0..k-1`` as a committed prefix while the session was
+        marked ``failed`` and — via the session-membership skip — never revisited.
+        Retrying each slice in place lets a transient blip resolve without leaving
+        that partial-commit gap. Persistent failure still returns False so the
+        caller records ``failed`` and the gap-completion path (routed from the
+        progress record, not the membership skip) fills the remainder on re-run."""
         client = self._ensure_client()
         if client is None:
             return False
         payload = built["payload"]
         self._pace_before_post()
-        with inflight_lock(blocking=True) as acquired:
-            if not acquired:  # pragma: no cover - blocking acquire fails open
-                return False
-            try:
-                client.retain(
-                    bank_id=bank_id,
-                    content=payload["content"],
-                    document_id=built["document_id"],
-                    context=payload["context"],
-                    metadata=payload["metadata"],
-                    tags=payload["tags"],
-                    timeout=15,
-                    async_processing=False,  # commit-before-ack (daemon contract 2)
-                    observation_scopes=payload.get("observation_scopes"),
-                )
-            except Exception as e:
-                debug_log(self.config, f"backfill: POST failed for {built['document_id']}: {e}")
-                self._posted_count += 1
-                self._on_failure()
-                return False
-        self._posted_count += 1
-        self._post_times.append(time.monotonic())
-        self._consecutive_failures = 0
-        return True
+        last_exc = None
+        for _attempt in range(_POST_MAX_ATTEMPTS):
+            with inflight_lock(blocking=True) as acquired:
+                if not acquired:  # pragma: no cover - blocking acquire fails open
+                    return False
+                try:
+                    client.retain(
+                        bank_id=bank_id,
+                        content=payload["content"],
+                        document_id=built["document_id"],
+                        context=payload["context"],
+                        metadata=payload["metadata"],
+                        tags=payload["tags"],
+                        timeout=15,
+                        async_processing=False,  # commit-before-ack (daemon contract 2)
+                        observation_scopes=payload.get("observation_scopes"),
+                    )
+                except Exception as e:
+                    last_exc = e
+                    debug_log(self.config, f"backfill: POST failed for {built['document_id']}: {e}")
+                    self._posted_count += 1
+                    self._on_failure()  # backoff before the next attempt
+                    continue
+            self._posted_count += 1
+            self._post_times.append(time.monotonic())
+            self._consecutive_failures = 0
+            return True
+        debug_log(
+            self.config,
+            f"backfill: POST gave up for {built['document_id']} after "
+            f"{_POST_MAX_ATTEMPTS} attempts: {last_exc}",
+        )
+        return False
 
     # -- scanning ----------------------------------------------------------- #
     def _list_agents(self, agent_filter: Optional[set]) -> list:
@@ -678,11 +700,43 @@ class Backfill:
             "sessions_already_done": 0,
             "sessions_restored": 0,
             "slices_restored": 0,
+            # Slice-level gap completion (#3291): a session this backfill is the
+            # sole writer of that was previously left partially committed.
+            "sessions_gap_completed": 0,
+            "sessions_gap_incomplete": 0,
+            "slices_gap_filled": 0,
+            "slices_gap_present": 0,
             "turns_recovered": 0,
             "posts_ok": 0,
             "posts_failed": 0,
             "sessions": [],
         })
+
+    def _slice_exists(self, bank_id: str, document_id: str) -> Optional[bool]:
+        """Paced tri-state presence check for ONE deterministic slice document.
+
+        ``True`` — already durable (skip, no re-cost). ``False`` — confirmed 404
+        (missing → must post). ``None`` — unknown (transport/5xx): the caller
+        (re)posts, because the daemon UPSERTs on ``document_id`` so a needless
+        re-post of an already-present slice is a safe idempotent no-op, whereas
+        SKIPPING a genuinely-missing slice would re-open the #3291 silent gap. The
+        GET is paced through the shared inflight lock like every other op."""
+        client = self._ensure_client()
+        if client is None:
+            return None
+        self._pace_before_post()
+        try:
+            with inflight_lock(blocking=True) as acquired:
+                if not acquired:  # pragma: no cover - blocking acquire fails open
+                    return None
+                return client.document_exists(bank_id, document_id)
+        except Exception as e:  # pragma: no cover - defensive
+            debug_log(self.config, f"backfill(gap): document_exists failed "
+                                   f"for {document_id}: {e}")
+            return None
+        finally:
+            self._posted_count += 1
+            self._post_times.append(time.monotonic())
 
     def _session_membership(self, bank_id: str, session_id: str) -> str:
         """SESSION-LEVEL, id-scheme-AGNOSTIC membership (BLOCKER-1 fix).
@@ -692,18 +746,22 @@ class Backfill:
         ``"error"`` on any query failure (caller fails CLOSED — treats it as
         present ⇒ skip, never restores on uncertainty).
 
-        We deliberately do NOT compare against the tool's ``-r{uuid}`` slice ids:
-        the deployed production banks are keyed with the LEGACY
-        ``{session_id}-{epoch_ms}`` scheme (``retain.py``'s not-yet-live
-        ``slice_document_id`` at line ~430 is the replacement), so an exact slice
-        id set would never match a legacy doc → every slice looks "missing" →
-        every intact session gets duplicated. Presence is decided by the id
-        PREFIX ``{session_id}`` which BOTH schemes share (``{session_id}-...``
-        legacy/new, or the bare ``{session_id}`` chunk-0 id). Restore fires ONLY
-        for a session with ZERO documents — so partial-within-a-populated-session
-        recovery is OUT OF SCOPE on legacy banks (we cannot tell WHICH turns a
-        legacy epoch-ms id covers) and can only be added once the ``-r{uuid}``
-        scheme is deployed and banks are re-keyed.
+        We deliberately do NOT compare against the tool's ``-r{uuid}`` slice ids
+        here: production banks are a MIX of the deterministic ``-r{uuid}`` scheme
+        (``retain.py``'s ``slice_document_id``, live since #3246) and the older
+        ``{session_id}-{epoch_ms}`` docs written before it, so an exact slice-id
+        set would never match a legacy doc → every slice looks "missing" → every
+        intact session gets duplicated. Presence is decided by the id PREFIX
+        ``{session_id}`` which every scheme shares (``{session_id}-...`` legacy or
+        ``-r{uuid}``, or the bare ``{session_id}`` chunk-0 id). Restore fires ONLY
+        for a session with ZERO documents — so partial-tail recovery *within a
+        legacy-populated session* stays OUT OF SCOPE (we cannot tell WHICH turns a
+        legacy epoch-ms id covers). The one partial case we CAN complete safely is
+        a session this backfill is the SOLE writer of — its docs are all
+        deterministic ``-r{uuid}`` ids, so ``_gap_complete_session`` recomputes
+        them and posts only the missing ones; that path is routed from the
+        progress ``failed`` record (a session this tool already classified
+        total-loss), never from this session-membership check.
 
         The GET is paced through the shared inflight lock so must-fix #1's broad
         candidate set can never create a read storm (should-fix 4b)."""
@@ -792,6 +850,21 @@ class Backfill:
                                        "action": "skipped_recent", "idle_s": round(idle, 1)})
                 continue
 
+            # #3291: a session this backfill previously classified total-loss but
+            # left PARTIALLY committed (a slice POST failed ⇒ recorded ``failed``
+            # after slices 0..k-1 landed durably). The session-membership check
+            # below would now see that committed prefix, classify it ``present``,
+            # and skip it FOREVER — silently under-recovering the exact total-loss
+            # sessions this mode exists to rescue. Route it instead into
+            # slice-level gap completion: this tool is the sole writer, so every
+            # doc is a deterministic ``-r{uuid}`` id we can recompute and fill only
+            # the missing slices. Guarded by ``ensure_slice_turns`` (a resume with
+            # a different slice size aborts before any write), so recomputed ids
+            # are guaranteed to match the committed prefix.
+            if self.progress.status(agent, session) == "failed":
+                self._gap_complete_session(agent, session, bank_id, path, info, ar)
+                continue
+
             # SESSION-LEVEL, scheme-agnostic membership (BLOCKER-1 fix): restore
             # ONLY a session the bank has ZERO documents for (true total loss).
             # A session with ANY doc (legacy epoch-ms OR new -r{uuid} scheme) is
@@ -878,6 +951,100 @@ class Backfill:
                 session_entry["action"] = "restore_failed"
                 self.progress.record(agent, session, "failed")
             ar["sessions"].append(session_entry)
+
+    def _gap_complete_session(self, agent, session, bank_id, path, info, ar) -> None:
+        """Fill the missing slices of a backfill-sole-writer session left
+        partially committed by a prior run (#3291).
+
+        Precondition (enforced by the caller): the session's progress record is
+        ``failed`` — this tool already classified it total-loss and committed a
+        deterministic ``-r{uuid}`` prefix before a POST failed. Because the
+        backfill is the SOLE writer of such a session, EVERY doc it holds is a
+        deterministic slice id we can recompute (``ensure_slice_turns`` guarantees
+        the same boundaries as the prior run). We check each slice's presence and
+        POST ONLY the ones the bank is missing, so the committed prefix is never
+        duplicated and the session always makes forward progress toward complete
+        recovery rather than being skipped forever by session-membership."""
+        messages = read_transcript(path)
+        if not messages:
+            return
+        slices = chunk_by_human_turns(messages, self.slice_turns)
+        if not slices:
+            return
+        built_slices = []
+        for sl in slices:
+            built = build_retain_payload(
+                self.config, session, sl, messages,
+                bank_id=bank_id, api_url=self._api_url or "http://backfill-client",
+                api_token=self._api_token, retain_full_window=True, document_id=None,
+            )
+            if built is not None:
+                built_slices.append((built, sl))
+        if not built_slices:
+            return
+
+        total = len(built_slices)
+        n_turns = sum(len(_human_turn_indices(sl)) for _, sl in built_slices)
+        session_entry = {
+            "session": session, "class": "gap_completion",
+            "join": info["join"], "bank_id": bank_id,
+            "slices": total, "turns": n_turns,
+            "document_ids": [b["document_id"] for b, _ in built_slices],
+            "action": None,
+        }
+
+        if not self.commit:
+            # Dry-run: report the whole session as the gap it WOULD complete
+            # (per-slice presence probing is itself a network read, elided here).
+            session_entry["action"] = "would_gap_complete"
+            ar["sessions"].append(session_entry)
+            return
+
+        # POST only the slices the bank is actually missing. ``True`` ⇒ already
+        # durable (skip); ``False``/``None`` ⇒ (re)post — the daemon UPSERTs on
+        # document_id so a needless re-post is a safe no-op, while skipping a
+        # genuinely-missing slice would re-open the gap.
+        filled = 0
+        present = 0
+        failed = 0
+        for built, _ in built_slices:
+            if self._slice_exists(bank_id, built["document_id"]) is True:
+                present += 1
+                continue
+            if self._post_slice(bank_id, built):
+                filled += 1
+                ar["posts_ok"] += 1
+            else:
+                failed += 1
+                ar["posts_failed"] += 1
+
+        ar["slices_gap_filled"] += filled
+        ar["slices_gap_present"] += present
+        session_entry["slices_filled"] = filled
+        session_entry["slices_present"] = present
+
+        if failed == 0:
+            # Every slice is now durable → the session is fully recovered.
+            ar["sessions_gap_completed"] += 1
+            ar["turns_recovered"] += n_turns
+            session_entry["action"] = "gap_completed"
+            last_built = built_slices[-1][0]
+            try:
+                watermark.commit(
+                    session, last_built["last_uuid"], last_built["document_id"],
+                    transcript_path=path, ordered_uuids=last_built["ordered_uuids"],
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+            self.progress.record(agent, session, "done", slices=total, turns=n_turns)
+        else:
+            # Still short — stay ``failed`` so the NEXT run re-enters this same
+            # gap-completion path (never the membership skip) and fills whatever
+            # remains. Convergent: each run strictly reduces the missing set.
+            ar["sessions_gap_incomplete"] += 1
+            session_entry["action"] = "gap_incomplete"
+            self.progress.record(agent, session, "failed")
+        ar["sessions"].append(session_entry)
 
     def _finalize_report_from_logs(self) -> None:
         roll = {
