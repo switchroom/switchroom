@@ -73,6 +73,7 @@ import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runFloodPressureChecks } from "./doctor-flood-pressure.js";
 import { runGeneratedSurfaceDriftChecks } from "./doctor-drift.js";
 import { runComponentVersionChecks } from "./doctor-component-versions.js";
+import { runAssetPayloadChecks } from "./doctor-asset-payload.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
 import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
@@ -4237,6 +4238,26 @@ export function registerDoctorCommand(program: Command): void {
                 return [
                   {
                     name: "component versions",
+                    status: "skip",
+                    detail: `not checkable: ${(err as Error)?.message ?? String(err)}`,
+                  },
+                ];
+              }
+            })(),
+          },
+          {
+            // #4163: a static-binary install carries profiles/skills/vendor
+            // in a SEPARATE release artifact. Missing → apply cannot scaffold
+            // at all; skewed → it scaffolds happily from another release's
+            // templates, which is the silent one. See doctor-asset-payload.
+            title: "Shipped-asset payload (#4163)",
+            results: ((): CheckResult[] => {
+              try {
+                return runAssetPayloadChecks();
+              } catch (err) {
+                return [
+                  {
+                    name: "shipped-asset payload",
                     status: "skip",
                     detail: `not checkable: ${(err as Error)?.message ?? String(err)}`,
                   },

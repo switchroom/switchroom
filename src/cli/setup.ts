@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, copyFileSync, readFileSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, copyFileSync, readFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { DEFAULT_EXAMPLE, exampleNames, readEmbeddedExample } from "./embedded-examples.js";
 import { execFileSync } from "node:child_process";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { resolve, dirname } from "node:path";
@@ -369,11 +370,10 @@ async function stepConfigFile(
 async function copyExampleConfig(
   nonInteractive: boolean,
 ): Promise<LoadedConfig> {
-  const examplesDir = resolve(import.meta.dirname, "../../examples");
   let choice: string;
 
   if (nonInteractive) {
-    choice = "switchroom";
+    choice = DEFAULT_EXAMPLE;
   } else {
     choice = await askChoice("  Which example config?", [
       "switchroom — Full example: one active agent + commented templates",
@@ -382,7 +382,19 @@ async function copyExampleConfig(
     choice = choice.split(" ")[0];
   }
 
-  const srcFile = resolve(examplesDir, `${choice}.yaml`);
+  // From the EMBEDDED copy, not from disk. This used to be
+  // `resolve(import.meta.dirname, "../../examples")`, which is `/examples`
+  // inside a `bun build --compile` artifact — so `switchroom setup` on a
+  // static-binary install (the advertised `curl | sh` path, and the very first
+  // command a new user runs) died with "Example config not found: switchroom.yaml"
+  // and there was no way forward. #4163.
+  const exampleBody = readEmbeddedExample(choice);
+  if (exampleBody === null) {
+    throw new ConfigError(
+      `Example config not found: ${choice}.yaml (available: ${exampleNames().join(", ")})`,
+    );
+  }
+
   // Bootstrap to the canonical user-wide path, NOT cwd. Every later
   // command (apply, agent ops, daemonized gateways) resolves config
   // via findConfigFile, which ranks ~/.switchroom/switchroom.yaml as
@@ -392,12 +404,8 @@ async function copyExampleConfig(
   // docs/install.md has always told users it lands here.
   const destFile = resolvePath("~/.switchroom/switchroom.yaml");
 
-  if (!existsSync(srcFile)) {
-    throw new ConfigError(`Example config not found: ${choice}.yaml`);
-  }
-
   mkdirSync(dirname(destFile), { recursive: true });
-  copyFileSync(srcFile, destFile);
+  writeFileSync(destFile, exampleBody, { encoding: "utf8" });
   console.log(chalk.green(`  Copied ${choice}.yaml -> ${destFile}`));
   console.log(
     chalk.yellow(`  Edit ${destFile} to customize, then re-run switchroom setup.`),

@@ -136,6 +136,16 @@ env:
   # scripts/check-release-asset-names.mjs. Keep the order stable.
   RELEASE_ASSETS: "switchroom-linux-amd64 switchroom-linux-arm64 switchroom-macos-amd64 switchroom-macos-arm64"
   CHECKSUMS_FILE: "switchroom-checksums.txt"
+  # The shipped-asset payload (#4163). `bun build --compile` embeds the JS
+  # bundle and nothing else, so profiles/, skills/, vendor/hindsight-memory/
+  # and the web UI ship as this tarball; install.sh extracts it to
+  # `<prefix>/share/switchroom`, which is where src/util/shipped-assets.ts
+  # probes. Without it the four binaries above install a CLI that cannot
+  # scaffold a single agent. Architecture-independent, so it is built ONCE in
+  # `bundle` rather than in the per-platform matrix — which is why it is not
+  # part of RELEASE_ASSETS (that list is the artifacts downloaded from the
+  # build legs). scripts/release-assets.mjs enforces both halves of that.
+  PAYLOAD_ASSET: "switchroom-assets.tar.gz"
 
 jobs:
   build:
@@ -319,6 +329,27 @@ jobs:
           done
           ls -lh dist-bins
 
+      - name: Build the shipped-asset payload (#4163)
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        shell: bash
+        run: |
+          # The payload's manifest version is read OUT OF THE BINARY that is
+          # about to ship beside it, not out of the git ref. That is what makes
+          # binary/payload skew structurally impossible at build time: the two
+          # artifacts cannot carry different versions unless the binary lies
+          # about its own. (The build legs already assert `--version` == tag;
+          # on a tag we re-assert it here, cheaply, from the bundle job.)
+          chmod +x dist-bins/switchroom-linux-amd64
+          ver="$(./dist-bins/switchroom-linux-amd64 --version)"
+          echo "linux-amd64 binary reports version '$ver'"
+          if [ -n "$TAG" ] && [ "v$ver" != "$TAG" ]; then
+            echo "::error::binary reports v$ver but the tag is $TAG — refusing to cut a payload whose manifest would disagree with the CLI it ships with"
+            exit 1
+          fi
+          node scripts/build-asset-payload.mjs --version "v$ver" --out "dist-bins/$PAYLOAD_ASSET"
+          ls -lh "dist-bins/$PAYLOAD_ASSET"
+
       - name: Compute SHA256 checksums
         shell: bash
         working-directory: dist-bins
@@ -326,9 +357,12 @@ jobs:
           # sha256sum's canonical "<hash>  <name>" two-space format is what
           # install.sh matches with `grep -F "  ${asset}"`. Feed it the
           # explicit asset list so the checksums file can never pick up a
-          # stray file or miss one.
+          # stray file or miss one. The payload is in the SAME checksums file
+          # as the binaries and is verified by install.sh and `switchroom
+          # update` the same way — an unverified payload would be an
+          # arbitrary-file-write vector into every scaffolded agent.
           # shellcheck disable=SC2086
-          sha256sum $RELEASE_ASSETS > "$CHECKSUMS_FILE"
+          sha256sum $RELEASE_ASSETS "$PAYLOAD_ASSET" > "$CHECKSUMS_FILE"
           cat "$CHECKSUMS_FILE"
 
       - name: Verify the bundle against the install.sh contract
@@ -528,7 +562,7 @@ jobs:
           name: release-bundle
           path: dist-bins
 
-      - name: Attach binaries + checksums to the GitHub Release
+      - name: Attach binaries + payload + checksums to the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # `EXPECT_TAG`, not a step-local `TAG`: the same variable names the
@@ -544,7 +578,7 @@ jobs:
         run: |
           files=""
           for asset in $RELEASE_ASSETS; do files="$files dist-bins/$asset"; done
-          files="$files dist-bins/$CHECKSUMS_FILE"
+          files="$files dist-bins/$PAYLOAD_ASSET dist-bins/$CHECKSUMS_FILE"
           # shellcheck disable=SC2086
           gh release upload "$EXPECT_TAG" $files --repo "$GITHUB_REPOSITORY" --clobber
 

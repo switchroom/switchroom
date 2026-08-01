@@ -56,6 +56,7 @@ import {
   alreadySelfUpdated,
   detectInstallKind,
   fetchLatestReleaseTag,
+  installAssetPayload,
   performSelfUpdate,
   planSelfUpdate,
   releaseAssetName,
@@ -521,7 +522,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   steps.push({
     name: "self-update-cli",
     description:
-      "Replace the host operator CLI binary with the latest published release (checksum-verified, run-proved, atomic swap + versioned rollback copy), then re-exec the new binary for the remaining steps",
+      "Replace the host operator CLI binary AND its shipped-asset payload (profiles/skills/vendor) with the latest published release — both checksum-verified, payload installed first so the pair can never end up new-CLI/old-templates — then re-exec the new binary for the remaining steps",
     skipReason: opts.skipSelfUpdate
       ? "--skip-self-update flag set"
       : alreadySelfUpdated(process.env)
@@ -562,6 +563,24 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       }
       if (plan.action === "current") {
         say(chalk.gray(`  host CLI already on ${plan.version}\n`));
+        // CONVERGENCE (#4163). Ordering the payload before the binary is only
+        // safe if a half-completed update can still finish: a run whose
+        // payload step failed leaves the binary current, so without this the
+        // next `switchroom update` would skip out here and the host would sit
+        // on a new CLI with a missing or stale payload forever. Re-checking
+        // (and repairing) the payload on the no-op path is what makes the
+        // pair converge instead of merely being ordered.
+        const repaired = await installAssetPayload({
+          tag: plan.version,
+          binaryPath: detection.binaryPath as string,
+          io,
+          log: (s) => say(chalk.gray(`  ${s}\n`)),
+        });
+        say(
+          repaired.installed
+            ? chalk.green(`  ${repaired.message}\n`)
+            : chalk.gray(`  ${repaired.message}\n`),
+        );
         return;
       }
       const asset = releaseAssetName(process.platform, process.arch);

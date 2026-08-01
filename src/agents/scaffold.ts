@@ -43,8 +43,13 @@ import {
 } from "./generation-stamp.js";
 import { VERSION as SWITCHROOM_VERSION } from "../build-info.js";
 
-// Repo root for referencing bin/ scripts in hooks
-const REPO_ROOT = resolve(import.meta.dirname, "../..");
+// (There is deliberately no REPO_ROOT here any more. It was
+// `resolve(import.meta.dirname, "../..")` feeding a `repoRoot` template
+// variable used by exactly one line of start.sh.hbs — a HOST path baked into a
+// script that only ever runs INSIDE the agent container, so it never resolved
+// to anything real; under the compiled binary it rendered as `//`. Scripts the
+// container needs come from DOCKER_BIN_PATH; assets the host CLI needs come
+// from resolveShippedAsset(). #4163.)
 
 // Switchroom #3757 / #3760 — mirrors of the hindsight plugin's own DEFAULTS
 // (`vendor/hindsight-memory/scripts/lib/config.py`). These exist because the
@@ -4037,7 +4042,6 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // HOST path, not the in-container /host-home, when apply runs inside hostd.
     // See toHostHomePath. The filesystem writes elsewhere keep the local value.
     agentDir: toHostHomePath(agentDir),
-    repoRoot: REPO_ROOT,
     topicId,
     topicName: agentConfig.topic_name,
     topicEmoji: agentConfig.topic_emoji,
@@ -7711,7 +7715,6 @@ function reconcileAgentInner(
       // when reconcile (apply) runs inside hostd. See toHostHomePath. startShPath
       // above and the FS writes below keep the local container-relative value.
       agentDir: toHostHomePath(agentDir),
-      repoRoot: REPO_ROOT,
       botToken: resolvedBotToken ?? rawBotToken,
       forumChatId: telegramConfig.forum_chat_id,
       dangerousMode: agentConfig.dangerous_mode === true,

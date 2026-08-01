@@ -1,10 +1,25 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Switchroom static-binary installer.
+#
+# POSIX sh, deliberately. The documented invocation below pipes this file to
+# `sh`, and on Debian/Ubuntu `/bin/sh` is dash — where the old
+# `#!/usr/bin/env bash` + `set -euo pipefail` header aborted on line 1 with
+# "Illegal option -o pipefail" before a single byte was installed. The shebang
+# does not save it either: a piped script has no shebang. Keep this file free
+# of bashisms (#4163).
 #
 # Detects platform/arch, fetches the matching pre-built `switchroom`
 # binary from the latest GitHub release, verifies its SHA256 checksum,
 # and installs it to /usr/local/bin (falls back to ~/.local/bin if
 # /usr/local/bin is not writable).
+#
+# It ALSO fetches the shipped-asset payload (#4163). `bun build --compile`
+# embeds the JS bundle and nothing else, so `profiles/`, `skills/`,
+# `vendor/hindsight-memory/` and the dashboard UI have no on-disk home in a
+# binary-only install — and without them `switchroom apply` cannot scaffold a
+# single agent ("Profile not found: default"). The payload is verified against
+# the same checksums file as the binary and extracted to
+# <prefix>/share/switchroom, which is exactly where the CLI probes.
 #
 # Usage:
 #   curl -fsSL https://github.com/switchroom/switchroom/raw/main/install.sh | sh
@@ -12,12 +27,16 @@
 # Environment overrides:
 #   SWITCHROOM_INSTALL_DIR   target dir (default: /usr/local/bin or ~/.local/bin)
 #   SWITCHROOM_VERSION       pin a specific tag (default: latest release)
+#   SWITCHROOM_SHARE_DIR     asset payload dir (default: <prefix>/share/switchroom)
+#   SWITCHROOM_BASE_URL      override the release download base (offline / testing)
 #
 # The binary is self-contained (bun runtime is bundled). You'll still
 # need the `claude` CLI installed separately to run agents — see
 # https://github.com/switchroom/switchroom for the full setup guide.
 
-set -euo pipefail
+# `-o pipefail` is not POSIX (see the header). Nothing here depends on it:
+# every pipeline whose failure matters is checked for an empty result.
+set -eu
 
 REPO="switchroom/switchroom"
 
@@ -53,11 +72,21 @@ esac
 
 asset="switchroom-${platform}-${arch}"
 
+# The shipped-asset payload (#4163). Deliberately NOT versioned in the
+# filename: release assets are already namespaced by the tag in their download
+# URL, exactly like the four binaries and the checksums file, and a
+# `${version}` here would be a second thing for the installer and
+# `switchroom update` to derive independently and get wrong.
+# scripts/release-assets.mjs parses this literal out of this file and fails
+# `npm run lint` if the workflow stops producing it.
+assets_payload="switchroom-assets.tar.gz"
+
 log "Detected ${BOLD}${platform}/${arch}${RESET}, will fetch ${BOLD}${asset}${RESET}"
 
 # ---- prerequisites ----
 
 have curl || die "curl is required."
+have tar  || die "tar is required (the shipped-asset payload is a .tar.gz)."
 
 # Either sha256sum (linux) or shasum (macos) works for verification.
 if have sha256sum; then
@@ -89,7 +118,7 @@ ok "Version: $version"
 
 # ---- download binary + checksums ----
 
-base_url="https://github.com/${REPO}/releases/download/${version}"
+base_url="${SWITCHROOM_BASE_URL:-https://github.com/${REPO}/releases/download/${version}}"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -101,9 +130,8 @@ log "Downloading checksums"
 curl -fsSL --retry 3 -o "$tmp/switchroom-checksums.txt" "$base_url/switchroom-checksums.txt" \
   || die "Failed to download $base_url/switchroom-checksums.txt."
 
-# ---- verify checksum ----
+# ---- verify checksums ----
 
-log "Verifying SHA256"
 # The checksums file uses the `sha256sum`-canonical "<hash>  <file>"
 # two-space format. Older revisions of this script grep'd with a
 # pattern that only tolerated a single trailing space and was anchored
@@ -111,16 +139,50 @@ log "Verifying SHA256"
 # alternation, CRLF line endings) and silently missed valid entries.
 # Use a fixed-string match against the exact two-space-prefixed asset
 # name to find the line.
-expected=$(grep -F "  ${asset}" "$tmp/switchroom-checksums.txt" | awk '{print $1}' | head -n 1)
-[ -n "$expected" ] || die "No checksum entry for $asset in switchroom-checksums.txt."
+checksum_for() {
+  # `|| true`: under `set -e` a grep that matches nothing would otherwise take
+  # the whole command substitution's exit status non-zero at the call site,
+  # aborting the install with no message instead of reaching the
+  # "No checksum entry" die below. Callers test for an EMPTY result.
+  { grep -F "  ${1}" "$tmp/switchroom-checksums.txt" || true; } | awk '{print $1}' | head -n 1
+}
 
-actual=$($sha_cmd "$tmp/$asset" | awk '{print $1}')
-if [ "$expected" != "$actual" ]; then
-  die "Checksum mismatch for $asset. Expected $expected, got $actual."
-fi
-ok "Checksum verified ($expected)"
+verify_sha() {
+  # $1 = asset name. Dies on mismatch; never installs an unverified file.
+  _expected=$(checksum_for "$1")
+  [ -n "$_expected" ] || die "No checksum entry for $1 in switchroom-checksums.txt."
+  _actual=$($sha_cmd "$tmp/$1" | awk '{print $1}')
+  if [ "$_expected" != "$_actual" ]; then
+    die "Checksum mismatch for $1. Expected $_expected, got $_actual."
+  fi
+  ok "Checksum verified for $1 ($_expected)"
+}
 
+log "Verifying SHA256"
+verify_sha "$asset"
 chmod +x "$tmp/$asset"
+
+# ---- download + verify the shipped-asset payload (#4163) ----
+#
+# A binary with no payload installs fine and then fails at the first useful
+# thing you ask it to do. Distinguish the two reasons it can be absent:
+#
+#   - no checksum entry  -> this release predates the payload. Warn loudly and
+#     continue; the operator asked for an old version and gets the old (broken
+#     for scaffolding) behaviour, stated plainly rather than discovered later.
+#   - entry present, download or verification fails -> this release is
+#     incomplete or the artifact is corrupt. Die. Installing half of a release
+#     is how #4163 happened in the first place.
+payload_available=""
+if [ -n "$(checksum_for "$assets_payload")" ]; then
+  payload_available=1
+  log "Downloading $assets_payload"
+  curl -fsSL --retry 3 -o "$tmp/$assets_payload" "$base_url/$assets_payload" \
+    || die "Failed to download $base_url/$assets_payload. The checksums file lists it, so this release is incomplete — not installing a CLI that cannot scaffold."
+  verify_sha "$assets_payload"
+else
+  warn "Release $version ships no $assets_payload. Agent scaffolding (\`switchroom apply\`) needs profiles/, skills/ and vendor/ on disk and WILL fail on this version — upgrade to a release that ships the asset payload."
+fi
 
 # ---- choose install dir ----
 
@@ -140,14 +202,80 @@ fi
 
 target="$install_dir/switchroom"
 
+# ---- install the asset payload FIRST (#4163) ----
+#
+# Two artifacts, one release, and no syscall that swaps both at once. So:
+# the payload lands before the binary, each by an atomic rename. If this
+# script is killed between them the host has NEW templates + OLD (or no)
+# binary — the recoverable direction — and never a new CLI rendering agent
+# scaffolds from stale templates, which is the failure mode #4163 names as
+# worse than shipping nothing.
+#
+# The layout matches what `switchroom update`'s self-update writes and what
+# src/util/shipped-assets.ts probes:
+#
+#   <prefix>/share/switchroom-<version>/     extracted payload
+#   <prefix>/share/switchroom -> switchroom-<version>
+#
+# The extract-then-publish split means a failed download or a corrupt archive
+# never touches the live payload. The final `ln -s` is NOT atomic here (there
+# is no portable atomic symlink swap in POSIX sh — `mv -T` is GNU-only), so
+# there is a sub-millisecond window on an UPGRADE install where <share_dir>
+# does not exist. That is deliberate and bounded: a torn payload has no
+# manifest, `switchroom doctor` reports it and `switchroom update` reinstalls
+# it. `switchroom update`'s own self-update path, which runs far more often,
+# does do the atomic rename(2) swap (src/cli/self-update.ts).
+
+# One decision about privilege, used for both artifacts.
+SUDO=""
+if [ ! -w "$install_dir" ]; then
+  if have sudo; then
+    warn "$install_dir requires sudo"
+    SUDO="sudo"
+  else
+    die "$install_dir is not writable and sudo not available. Set SWITCHROOM_INSTALL_DIR to a writable directory."
+  fi
+fi
+
+if [ -n "$payload_available" ]; then
+  share_dir="${SWITCHROOM_SHARE_DIR:-$(dirname "$install_dir")/share/switchroom}"
+  share_parent=$(dirname "$share_dir")
+  payload_version="${version#v}"
+  version_dir="${share_dir}-${payload_version}"
+
+  log "Installing shipped assets to $share_dir"
+  $SUDO mkdir -p "$share_parent"
+  $SUDO rm -rf "${version_dir}.incoming" "$version_dir"
+  $SUDO mkdir -p "${version_dir}.incoming"
+  $SUDO tar -xzf "$tmp/$assets_payload" -C "${version_dir}.incoming" \
+    || die "Failed to unpack $assets_payload into ${version_dir}.incoming."
+
+  # Prove the tarball really is this release's payload before publishing it:
+  # these files become every agent's container entrypoint template.
+  manifest="${version_dir}.incoming/switchroom-assets.json"
+  [ -f "$manifest" ] \
+    || die "$assets_payload contains no switchroom-assets.json — refusing to install an unidentifiable payload."
+  manifest_version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' "$manifest" | head -n 1)
+  if [ "$manifest_version" != "$payload_version" ]; then
+    die "$assets_payload declares version '$manifest_version' but this is release $version — refusing to pair a CLI with someone else's templates."
+  fi
+
+  $SUDO mv "${version_dir}.incoming" "$version_dir"
+  if [ -e "$share_dir" ] && [ ! -L "$share_dir" ]; then
+    warn "$share_dir already exists as a real directory — moving it to ${share_dir}.replaced"
+    $SUDO rm -rf "${share_dir}.replaced"
+    $SUDO mv "$share_dir" "${share_dir}.replaced"
+  fi
+  $SUDO rm -f "$share_dir"
+  $SUDO ln -s "$(basename "$version_dir")" "$share_dir"
+  ok "Shipped assets installed ($share_dir -> $(basename "$version_dir"))"
+fi
+
 log "Installing to $target"
-if [ -w "$install_dir" ]; then
+if [ -z "$SUDO" ]; then
   mv "$tmp/$asset" "$target"
-elif have sudo; then
-  warn "$install_dir requires sudo"
-  sudo mv "$tmp/$asset" "$target"
 else
-  die "$install_dir is not writable and sudo not available. Set SWITCHROOM_INSTALL_DIR to a writable directory."
+  sudo mv "$tmp/$asset" "$target"
 fi
 
 # macOS Gatekeeper: unsigned binaries get the quarantine xattr from curl.

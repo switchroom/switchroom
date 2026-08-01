@@ -65,6 +65,11 @@ import { fetchAgentLogsViaHostd } from "./hostd-read-client.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 import { loadEdgeSecret } from "./webhook-edge.js";
 import {
+  WEB_UI_ASSET,
+  resolveShippedAsset,
+  type ShippedAssetProbe,
+} from "../util/shipped-assets.js";
+import {
   handleHermesRest,
   onHermesOpen,
   onHermesClose,
@@ -710,14 +715,41 @@ function parseRoute(
   return null;
 }
 
+/**
+ * The directory `switchroom web` serves static dashboard files from.
+ *
+ * Exported so a test can drive the SEA layout, which vitest cannot otherwise
+ * reach. Falls back to the historical `<bundleDir>/ui` when nothing exists, so
+ * the 404 path is unchanged rather than throwing at server start.
+ */
+export function resolveUiDir(
+  probe: ShippedAssetProbe = {
+    bundleDir: import.meta.dirname,
+    execPath: process.execPath,
+  },
+): string {
+  return (
+    resolveShippedAsset(WEB_UI_ASSET, probe).path ??
+    resolve(probe.bundleDir, WEB_UI_ASSET.asset)
+  );
+}
+
 export function startWebServer(
   config: SwitchroomConfig,
   port: number,
   hostname = "127.0.0.1",
   configPath?: string,
 ): { token: string } {
-  const uiDirRaw = resolve(import.meta.dirname, "ui");
-  // Resolve symlinks once at startup so the traversal check compares real paths.
+  // `resolve(import.meta.dirname, "ui")` alone is the #3346/#4161 shape: it
+  // finds `dist/cli/ui` (npm) and `/opt/switchroom/ui` (image), but inside a
+  // `bun build --compile` binary `import.meta.dirname` is the bunfs root, so
+  // it resolved to `/$bunfs/root/ui` and every static route of `switchroom
+  // web` 404'd. Route it through the shared resolver so the SEA layout picks
+  // the directory up from the shipped-asset payload beside the binary (#4163).
+  const uiDirRaw = resolveUiDir();
+  // Resolve symlinks once at startup so the traversal check compares real
+  // paths — load-bearing here, not tidiness: the payload publishes
+  // `<prefix>/share/switchroom` AS a symlink to a versioned directory.
   const uiDir = existsSync(uiDirRaw) ? realpathSync(uiDirRaw) : uiDirRaw;
   const token = resolveWebToken();
 

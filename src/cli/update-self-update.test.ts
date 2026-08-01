@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { planUpdate, runUpdate, buildReexecArgs } from "./update.js";
+import { SWITCHROOM_VERSION } from "./resolve-version.js";
 import type { SelfUpdateIO } from "./self-update.js";
 
 function withCompose<T>(fn: (composePath: string) => T): T {
@@ -44,27 +45,89 @@ const baseOpts = {
   componentExec: () => ({ status: 1, stdout: "" }),
 };
 
-/** A self-update IO that swaps successfully, with no network or disk. */
-function fakeIO(): SelfUpdateIO {
+/**
+ * A self-update IO that swaps successfully, with no network or disk.
+ *
+ * It also models enough of a filesystem (symlinks, subtree renames) for the
+ * shipped-asset payload install (#4163), because the payload is not optional:
+ * `performSelfUpdate` and the convergence path both go through it, and an IO
+ * that could not satisfy it would let these tests pass against a build that
+ * had quietly dropped the payload.
+ */
+function fakeIO(): SelfUpdateIO & { files: Map<string, string>; links: Map<string, string> } {
   const files = new Map<string, string>([["/usr/local/bin/switchroom", "OLD"]]);
+  const links = new Map<string, string>();
+  const dirnameOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
+  const under = (prefix: string) =>
+    [...files.keys()].filter((k) => k === prefix || k.startsWith(`${prefix}/`));
+  const removeTree = (p: string) => {
+    for (const k of under(p)) files.delete(k);
+    links.delete(p);
+  };
   return {
+    files,
+    links,
     httpGetText: async (url) =>
       url.endsWith("switchroom-checksums.txt")
-        ? `${"a".repeat(64)}  switchroom-linux-amd64\n${"a".repeat(64)}  switchroom-linux-arm64\n${"a".repeat(64)}  switchroom-macos-amd64\n${"a".repeat(64)}  switchroom-macos-arm64\n`
+        ? `${"a".repeat(64)}  switchroom-linux-amd64\n${"a".repeat(64)}  switchroom-linux-arm64\n${"a".repeat(64)}  switchroom-macos-amd64\n${"a".repeat(64)}  switchroom-macos-arm64\n${"a".repeat(64)}  switchroom-assets.tar.gz\n`
         : '{"tag_name":"v9.9.9"}',
-    httpDownload: async (_u, dest) => void files.set(dest, "NEW"),
+    httpDownload: async (url, dest) => {
+      const tag = /download\/(v[^/]+)\//.exec(url)?.[1] ?? "v9.9.9";
+      files.set(dest, url.endsWith(".tar.gz") ? `PAYLOAD:${tag}` : "NEW");
+    },
     sha256File: () => "a".repeat(64),
     probeBinaryVersion: () => "9.9.9",
     mkdirp: () => {},
     copyFile: (s, d) => void files.set(d, files.get(s) ?? ""),
     chmodExec: () => {},
     rename: (s, d) => {
-      files.set(d, files.get(s) ?? "");
-      files.delete(s);
+      if (links.has(s)) {
+        links.set(d, links.get(s) as string);
+        links.delete(s);
+        return;
+      }
+      for (const k of under(s)) {
+        files.set(d + k.slice(s.length), files.get(k) as string);
+        files.delete(k);
+      }
     },
-    remove: (p) => void files.delete(p),
-    exists: (p) => files.has(p),
-    dirname: (p) => p.slice(0, p.lastIndexOf("/")) || "/",
+    remove: (p) => {
+      files.delete(p);
+      links.delete(p);
+    },
+    exists: (p) => files.has(p) || links.has(p) || under(p).length > 0,
+    dirname: dirnameOf,
+    readText: (p) => {
+      const direct = files.get(p);
+      if (direct !== undefined) return direct;
+      // Resolve one level of symlink on any ancestor, as readText(2) would.
+      for (const [link, target] of links) {
+        if (p.startsWith(`${link}/`)) {
+          const real = `${dirnameOf(link)}/${target}${p.slice(link.length)}`;
+          const v = files.get(real);
+          if (v !== undefined) return v;
+        }
+      }
+      return null;
+    },
+    extractTarGz: (archive, destDir) => {
+      const tag = (files.get(archive) ?? "").replace(/^PAYLOAD:/, "");
+      files.set(
+        `${destDir}/switchroom-assets.json`,
+        JSON.stringify({ version: tag, entries: ["profiles"], files: 1 }),
+      );
+      files.set(`${destDir}/profiles/_base/start.sh.hbs`, "#!/bin/sh\n");
+    },
+    symlink: (target, linkPath) => void links.set(linkPath, target),
+    isSymlink: (p) => links.has(p),
+    removeTree,
+    listDir: (dir) => {
+      const names = new Set<string>();
+      for (const k of [...files.keys(), ...links.keys()]) {
+        if (k.startsWith(`${dir}/`)) names.add(k.slice(dir.length + 1).split("/")[0]);
+      }
+      return [...names];
+    },
   };
 }
 
@@ -279,6 +342,123 @@ describe("swap → re-exec", () => {
       expect(code).toBe(1);
       expect(err).toContain("self-update-cli failed");
       expect(err).toContain("did not run cleanly");
+    });
+  });
+});
+
+describe("shipped-asset payload convergence (#4163)", () => {
+  it("installs the payload alongside the binary on a real self-update", async () => {
+    await withCompose(async (composePath) => {
+      const io = fakeIO();
+      await runUpdate({
+        composePath,
+        ...baseOpts,
+        installProbe: STATIC_PROBE,
+        selfUpdateIO: io,
+        latestReleaseTagFn: async () => "v9.9.9",
+        runner: () => ({ status: 0 }),
+        reexecFn: () => ({ status: 0 }),
+        stdout: () => {},
+        stderr: () => {},
+      });
+      expect(io.links.get("/usr/local/share/switchroom")).toBe("switchroom-9.9.9");
+      expect(
+        io.files.get("/usr/local/share/switchroom-9.9.9/profiles/_base/start.sh.hbs"),
+      ).toBeDefined();
+    });
+  });
+
+  it("REPAIRS a missing payload even when the CLI is already current", async () => {
+    // Ordering payload-before-binary is only safe if a half-finished update
+    // can still finish. Without this the "already current" path would short-
+    // circuit and the host would sit on a new CLI with no templates forever.
+    await withCompose(async (composePath) => {
+      const io = fakeIO();
+      let out = "";
+      await runUpdate({
+        composePath,
+        ...baseOpts,
+        installProbe: STATIC_PROBE,
+        selfUpdateIO: {
+          ...io,
+          httpGetText: async (url) =>
+            url.endsWith("switchroom-checksums.txt")
+              ? `${"a".repeat(64)}  switchroom-assets.tar.gz\n`
+              : `{"tag_name":"v${SWITCHROOM_VERSION}"}`,
+        },
+        latestReleaseTagFn: async () => `v${SWITCHROOM_VERSION}`,
+        runner: () => ({ status: 0 }),
+        reexecFn: () => ({ status: 0 }),
+        stdout: (s) => {
+          out += s;
+        },
+        stderr: () => {},
+      });
+      // The CLI itself needed nothing…
+      expect(out).toContain("already on");
+      // The repair actually happened — not just a log line.
+      expect(io.links.get("/usr/local/share/switchroom")).toBe(
+        `switchroom-${SWITCHROOM_VERSION}`,
+      );
+    });
+  });
+
+  it("does not re-download the payload when it is already the current version", async () => {
+    await withCompose(async (composePath) => {
+      const io = fakeIO();
+      // Pre-publish the payload the way a completed update leaves it.
+      io.files.set(
+        `/usr/local/share/switchroom-${SWITCHROOM_VERSION}/switchroom-assets.json`,
+        JSON.stringify({ version: `v${SWITCHROOM_VERSION}`, entries: ["profiles"], files: 1 }),
+      );
+      io.links.set("/usr/local/share/switchroom", `switchroom-${SWITCHROOM_VERSION}`);
+      let downloads = 0;
+      await runUpdate({
+        composePath,
+        ...baseOpts,
+        installProbe: STATIC_PROBE,
+        selfUpdateIO: {
+          ...io,
+          httpDownload: async (...args) => {
+            downloads += 1;
+            return io.httpDownload(...args);
+          },
+        },
+        latestReleaseTagFn: async () => `v${SWITCHROOM_VERSION}`,
+        runner: () => ({ status: 0 }),
+        reexecFn: () => ({ status: 0 }),
+        stdout: () => {},
+        stderr: () => {},
+      });
+      expect(downloads).toBe(0);
+    });
+  });
+
+  it("fails the update when the payload cannot be installed — never a new CLI on old templates", async () => {
+    await withCompose(async (composePath) => {
+      const io = fakeIO();
+      let err = "";
+      const code = await runUpdate({
+        composePath,
+        ...baseOpts,
+        installProbe: STATIC_PROBE,
+        selfUpdateIO: {
+          ...io,
+          extractTarGz: () => {
+            throw new Error("tar: unexpected EOF");
+          },
+        },
+        latestReleaseTagFn: async () => "v9.9.9",
+        runner: () => ({ status: 0 }),
+        reexecFn: () => ({ status: 0 }),
+        stdout: () => {},
+        stderr: (s) => {
+          err += s;
+        },
+      });
+      expect(code).toBe(1);
+      expect(err).toContain("self-update-cli failed");
+      expect(io.files.get("/usr/local/bin/switchroom")).toBe("OLD");
     });
   });
 });

@@ -169,6 +169,38 @@ describe("scaffoldAgent", () => {
     expect(startSh).not.toContain("$(node -v)");
   });
 
+  it("start.sh launches the boot self-test from the in-container bin dir (#427, #4163)", () => {
+    // The boot self-test is what surfaces broken agent auth on the Telegram
+    // issues card. It was invoked as `{{repoRoot}}/bin/boot-self-test.sh`,
+    // where repoRoot came from the CLI's own `import.meta.dirname` — a HOST
+    // path baked into a script that only ever runs inside the container. Under
+    // `bun build --compile` that is the bunfs root, so every scaffolded agent
+    // got the literal `//bin/boot-self-test.sh`, the `-x` test failed, and the
+    // self-test silently never ran. Guarded from three sides because the
+    // failure mode was SILENCE: the invocation vanishing, or pointing anywhere
+    // other than the image's own bin dir, must each go red.
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("selftest-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // 1. It is still invoked at all.
+    expect(startSh).toContain("boot-self-test.sh");
+    // 2. From the path docker/Dockerfile.agent COPYs bin/*.sh to.
+    expect(startSh).toContain('[ -x "/opt/switchroom/bin/boot-self-test.sh" ]');
+    expect(startSh).toContain('( "/opt/switchroom/bin/boot-self-test.sh" >/dev/null 2>&1 ) &');
+    // 3. And from NOWHERE else — not the `//bin/…` the bunfs root rendered,
+    //    and not this repo's own path from a source checkout.
+    for (const line of startSh.split("\n")) {
+      if (!line.includes("boot-self-test.sh")) continue;
+      if (line.trimStart().startsWith("#")) continue;
+      expect(line, `unexpected boot-self-test path: ${line}`).toContain(
+        '"/opt/switchroom/bin/boot-self-test.sh"',
+      );
+    }
+    expect(startSh).not.toContain("//bin/boot-self-test.sh");
+    expect(startSh).not.toContain(`${resolve(__dirname, "..")}/bin/boot-self-test.sh`);
+  });
+
   it("start.sh does NOT export CLAUDE_CODE_OAUTH_TOKEN (RFC H §7.4)", () => {
     // Pre-RFC-H, start.sh exported CLAUDE_CODE_OAUTH_TOKEN from
     // <agentDir>/.claude/.oauth-token into the live claude process env.

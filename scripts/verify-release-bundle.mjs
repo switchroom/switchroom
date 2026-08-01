@@ -45,7 +45,10 @@ try {
 }
 
 const problems = [];
-const expected = new Set([...installer.assets, installer.checksumsFile]);
+const expected = new Set([...installer.assets, installer.checksumsFile, installer.payloadAsset]);
+// Everything the installer downloads AND verifies against the checksums file.
+// The checksums file itself is the trust root and cannot check itself.
+const checksummed = [...installer.assets, installer.payloadAsset];
 
 let present;
 try {
@@ -70,7 +73,7 @@ for (const name of present) {
 // Checksum-line shape + correctness, exactly as install.sh consumes it.
 if (present.includes(installer.checksumsFile)) {
   const lines = readFileSync(join(dir, installer.checksumsFile), "utf-8").split("\n");
-  for (const asset of installer.assets) {
+  for (const asset of checksummed) {
     if (!present.includes(asset)) continue;
     // install.sh: grep -F "  ${asset}" | awk '{print $1}' | head -n 1
     const needle = `${CHECKSUM_SEPARATOR}${asset}`;
@@ -96,5 +99,8 @@ if (problems.length > 0) {
   process.exit(1);
 }
 
-console.log(`OK release bundle at ${dir}: ${installer.assets.length} assets + ${installer.checksumsFile}`);
-for (const asset of installer.assets) console.log(`   ${asset}`);
+console.log(
+  `OK release bundle at ${dir}: ${installer.assets.length} binaries + ` +
+    `${installer.payloadAsset} + ${installer.checksumsFile}`,
+);
+for (const asset of checksummed) console.log(`   ${asset}`);

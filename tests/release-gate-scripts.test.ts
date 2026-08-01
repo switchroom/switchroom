@@ -211,15 +211,26 @@ function mkRelease(assets: string[], over: Record<string, unknown> = {}) {
 
 describe("assert-release-assets-complete — what a release must carry", () => {
   it("derives the expected set from install.sh, not from a hard-coded list", () => {
-    // Same four binaries + checksums file the installer downloads. If
-    // install.sh grows a platform, this set grows with it (proved below).
+    // Same four binaries + checksums file + shipped-asset payload the
+    // installer downloads. If install.sh grows a platform, this set grows with
+    // it (proved below).
     expect(REAL_EXPECTED).toEqual([
       "switchroom-linux-amd64",
       "switchroom-linux-arm64",
       "switchroom-macos-amd64",
       "switchroom-macos-arm64",
       "switchroom-checksums.txt",
+      "switchroom-assets.tar.gz",
     ]);
+  });
+
+  it("blocks a release that carries every binary but no asset payload (#4163)", () => {
+    // The half-ship this gate exists to catch, one artifact over: four green
+    // binaries and no templates is a release that installs cleanly and then
+    // fails on the user's host at `switchroom apply`.
+    const withoutPayload = REAL_EXPECTED.filter((a) => a !== "switchroom-assets.tar.gz");
+    const missing = missingAssets(REAL_EXPECTED, mkRelease(withoutPayload));
+    expect(missing).toEqual(["switchroom-assets.tar.gz"]);
   });
 
   it("grows the requirement when install.sh adds a platform", () => {

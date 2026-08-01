@@ -70,7 +70,7 @@ function fail(message) {
  *
  * @param {string} text contents of install.sh
  * @returns {{assets: string[], platforms: string[], arches: string[],
- *            checksumsFile: string, template: string}}
+ *            checksumsFile: string, payloadAsset: string, template: string}}
  */
 export function parseInstallerContract(text) {
   // `Linux) platform=linux ;;` / `Darwin) platform=macos ;;`
@@ -113,9 +113,28 @@ export function parseInstallerContract(text) {
   }
   const checksumsFile = [...checksumNames][0];
 
+  // The shipped-asset payload (#4163): `assets_payload="switchroom-assets.tar.gz"`.
+  // A literal name, not a template — see the comment beside it in install.sh
+  // for why it carries no `${version}`. It is REQUIRED: an installer that no
+  // longer fetches a payload is a decision to go back to shipping binaries
+  // that cannot scaffold, and that decision has to be made here, in the
+  // contract, rather than by deleting one line of shell.
+  const payloadLine = text.match(/\bassets_payload="([A-Za-z0-9_.-]+)"/);
+  if (!payloadLine) {
+    fail(
+      'install.sh: could not find `assets_payload="…"`. The static binary embeds only the JS bundle, ' +
+        "so profiles/skills/vendor have to arrive as a separate release artifact (#4163) — the " +
+        "installer must fetch one.",
+    );
+  }
+  const payloadAsset = payloadLine[1];
+
   // The installer's fixed-string checksum lookup. Its literal leading spaces
   // are the format contract the workflow's `sha256sum` output must satisfy.
-  const grepLine = text.match(/grep -F "(\s+)\$\{asset\}"/);
+  // Any shell variable is accepted (the lookup is a helper function taking a
+  // positional, `grep -F "  ${1}"`, so both the binary and the payload go
+  // through one code path) — the SEPARATOR is what this asserts.
+  const grepLine = text.match(/grep -F "([ \t]+)\$\{[A-Za-z0-9_]+\}"/);
   if (!grepLine) {
     fail('install.sh: could not find the `grep -F "  ${asset}"` checksum lookup');
   }
@@ -126,7 +145,7 @@ export function parseInstallerContract(text) {
     );
   }
 
-  return { assets, platforms, arches, checksumsFile, template };
+  return { assets, platforms, arches, checksumsFile, payloadAsset, template };
 }
 
 /**
@@ -134,7 +153,7 @@ export function parseInstallerContract(text) {
  *
  * @param {string} text contents of release.yml
  * @returns {{matrixAssets: string[], matrixRunners: Record<string, string>,
- *            declaredAssets: string[], checksumsFile: string}}
+ *            declaredAssets: string[], checksumsFile: string, payloadAsset: string}}
  */
 export async function parseWorkflowContract(text) {
   // `yaml` is imported lazily and ONLY on this path. The release workflow runs
@@ -175,6 +194,25 @@ export async function parseWorkflowContract(text) {
     fail("release.yml: workflow-level env.CHECKSUMS_FILE is missing or empty");
   }
 
+  const payloadAsset = doc.env?.PAYLOAD_ASSET;
+  if (typeof payloadAsset !== "string" || payloadAsset.length === 0) {
+    fail(
+      "release.yml: workflow-level env.PAYLOAD_ASSET is missing or empty. The compiled binary embeds " +
+        "only the JS bundle; profiles/skills/vendor/ui ship as a separate tarball (#4163) that the " +
+        "workflow must build, checksum and upload.",
+    );
+  }
+
+  // The payload is only useful if it is actually produced. `env.PAYLOAD_ASSET`
+  // naming a file nothing builds would publish a release whose installer dies
+  // on a 404 — the #3633 failure shape, one artifact over.
+  if (!/\bscripts\/build-asset-payload\.mjs\b/.test(text)) {
+    fail(
+      "release.yml: declares env.PAYLOAD_ASSET but never runs scripts/build-asset-payload.mjs — " +
+        "nothing would produce the tarball install.sh downloads (#4163)",
+    );
+  }
+
   // The two-space checksum format the installer depends on comes from
   // `sha256sum`. If the workflow switches to another tool (shasum -a 256 emits
   // the same format; `openssl dgst` does not), that decision has to be made
@@ -197,7 +235,7 @@ export async function parseWorkflowContract(text) {
     );
   }
 
-  return { matrixAssets, matrixRunners, declaredAssets, checksumsFile };
+  return { matrixAssets, matrixRunners, declaredAssets, checksumsFile, payloadAsset };
 }
 
 /**
@@ -250,6 +288,29 @@ export function diffContracts(installer, workflow) {
     problems.push(
       `install.sh downloads checksums as '${installer.checksumsFile}' but release.yml publishes ` +
         `'${workflow.checksumsFile}'`,
+    );
+  }
+  if (installer.payloadAsset !== workflow.payloadAsset) {
+    problems.push(
+      `install.sh downloads the shipped-asset payload as '${installer.payloadAsset}' but release.yml ` +
+        `publishes '${workflow.payloadAsset}' (#4163) — the installer would 404 and the host would end ` +
+        "up with a CLI that cannot scaffold",
+    );
+  }
+  // The payload is built once, in the bundle job, not per-platform: it is
+  // architecture-independent text. If it ever appears in the per-platform
+  // matrix or in RELEASE_ASSETS, four jobs race to upload the same name.
+  if (workflow.matrixAssets.includes(workflow.payloadAsset)) {
+    problems.push(
+      `release.yml lists the payload '${workflow.payloadAsset}' in the per-platform build matrix; it is ` +
+        "architecture-independent and must be built once in the bundle job",
+    );
+  }
+  if (workflow.declaredAssets.includes(workflow.payloadAsset)) {
+    problems.push(
+      `release.yml lists the payload '${workflow.payloadAsset}' in env.RELEASE_ASSETS, which is the set of ` +
+        "per-platform binaries downloaded from the build matrix's artifacts — the payload is produced " +
+        "in the bundle job instead",
     );
   }
   if (new Set(workflow.matrixAssets).size !== workflow.matrixAssets.length) {

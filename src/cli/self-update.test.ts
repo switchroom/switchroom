@@ -2,11 +2,15 @@ import { describe, it, expect } from "vitest";
 
 import {
   alreadySelfUpdated,
+  ASSET_PAYLOAD_ASSET_NAME,
   detectInstallKind,
   expectedChecksum,
+  installAssetPayload,
   parseLatestReleaseTag,
+  payloadVersionDir,
   performSelfUpdate,
   planSelfUpdate,
+  readPayloadVersion,
   releaseAssetName,
   rollbackHint,
   versionStorePath,
@@ -177,36 +181,125 @@ describe("alreadySelfUpdated", () => {
 
 const GOOD_SHA = "d".repeat(64);
 
+/**
+ * An in-memory filesystem carrying the two things the shipped-asset payload
+ * (#4163) actually depends on: SYMLINKS (the publish step is a rename over a
+ * link) and DIRECTORY renames (the extract-then-publish split). Modelling
+ * those as flat string keys would let the ordering tests pass over code that
+ * could not work on a real filesystem.
+ */
 function makeIO(overrides: Partial<SelfUpdateIO> = {}) {
   const files = new Map<string, string>([
     ["/usr/local/bin/switchroom", "OLD-BINARY"],
   ]);
   const dirs = new Set<string>(["/usr/local/bin"]);
+  /** linkPath -> target (relative, as installAssetPayload writes it). */
+  const links = new Map<string, string>();
+  const dirnameOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
+
+  /** Resolve one level of symlink on `p` or on any of its parents. */
+  function realpath(p: string): string {
+    for (const [link, target] of links) {
+      if (p === link) return `${dirnameOf(link)}/${target}`;
+      if (p.startsWith(`${link}/`)) {
+        return `${dirnameOf(link)}/${target}${p.slice(link.length)}`;
+      }
+    }
+    return p;
+  }
+  function removeTree(p: string) {
+    links.delete(p);
+    files.delete(p);
+    for (const k of [...files.keys()]) if (k.startsWith(`${p}/`)) files.delete(k);
+    for (const k of [...links.keys()]) if (k.startsWith(`${p}/`)) links.delete(k);
+    for (const k of [...dirs]) if (k === p || k.startsWith(`${p}/`)) dirs.delete(k);
+  }
+
   const io: SelfUpdateIO = {
     async httpGetText(url) {
       if (url.endsWith("switchroom-checksums.txt")) {
-        return `${GOOD_SHA}  switchroom-linux-amd64\n`;
+        return (
+          `${GOOD_SHA}  switchroom-linux-amd64\n` +
+          `${GOOD_SHA}  ${ASSET_PAYLOAD_ASSET_NAME}\n`
+        );
       }
       return '{"tag_name":"v0.19.28"}';
     },
-    async httpDownload(_url, dest) {
+    async httpDownload(url, dest) {
+      // The payload archive carries the tag it was fetched for, so
+      // extractTarGz can unpack a manifest that matches it — or, in the
+      // negative tests, deliberately does not.
+      if (url.endsWith(ASSET_PAYLOAD_ASSET_NAME)) {
+        const tag = url.split("/download/")[1]?.split("/")[0] ?? "v0.0.0";
+        files.set(dest, `PAYLOAD:${tag}`);
+        return;
+      }
       files.set(dest, "NEW-BINARY");
     },
     sha256File: () => GOOD_SHA,
     probeBinaryVersion: () => "0.19.28",
     mkdirp: (d) => void dirs.add(d),
-    copyFile: (src, dest) => void files.set(dest, files.get(src) ?? ""),
+    copyFile: (src, dest) => void files.set(dest, files.get(realpath(src)) ?? ""),
     chmodExec: () => {},
     rename: (src, dest) => {
-      files.set(dest, files.get(src) ?? "");
-      files.delete(src);
+      // A file, a symlink, or a whole subtree — the payload publish step uses
+      // all three shapes.
+      if (links.has(src)) {
+        links.set(dest, links.get(src) as string);
+        links.delete(src);
+        files.delete(dest);
+        return;
+      }
+      if (files.has(src)) {
+        files.set(dest, files.get(src) as string);
+        files.delete(src);
+        return;
+      }
+      for (const k of [...files.keys()]) {
+        if (k.startsWith(`${src}/`)) {
+          files.set(`${dest}${k.slice(src.length)}`, files.get(k) as string);
+          files.delete(k);
+        }
+      }
+      dirs.add(dest);
+      dirs.delete(src);
     },
-    remove: (p) => void files.delete(p),
-    exists: (p) => files.has(p),
-    dirname: (p) => p.slice(0, p.lastIndexOf("/")) || "/",
+    remove: (p) => {
+      files.delete(p);
+      links.delete(p);
+    },
+    exists: (p) =>
+      files.has(p) ||
+      links.has(p) ||
+      dirs.has(p) ||
+      [...files.keys()].some((k) => k.startsWith(`${p}/`)),
+    dirname: dirnameOf,
+    readText: (p) => files.get(realpath(p)) ?? null,
+    extractTarGz: (archive, destDir) => {
+      const body = files.get(archive);
+      if (body === undefined) throw new Error(`no such archive: ${archive}`);
+      const tag = body.startsWith("PAYLOAD:") ? body.slice("PAYLOAD:".length) : "v0.0.0";
+      dirs.add(destDir);
+      files.set(
+        `${destDir}/switchroom-assets.json`,
+        JSON.stringify({ version: tag, entries: ["profiles", "skills"] }),
+      );
+      files.set(`${destDir}/profiles/_base/start.sh.hbs`, "#!/bin/sh\n");
+    },
+    symlink: (target, linkPath) => void links.set(linkPath, target),
+    isSymlink: (p) => links.has(p),
+    removeTree,
+    listDir: (dir) => {
+      const out = new Set<string>();
+      for (const k of [...files.keys(), ...links.keys(), ...dirs]) {
+        if (!k.startsWith(`${dir}/`)) continue;
+        out.add(k.slice(dir.length + 1).split("/")[0]);
+      }
+      return [...out];
+    },
     ...overrides,
   };
-  return { io, files, dirs };
+  return { io, files, dirs, links };
 }
 
 const PLAN: Extract<SelfUpdateAction, { action: "update" }> = {
@@ -294,5 +387,172 @@ describe("performSelfUpdate", () => {
     expect(
       files.get("/usr/local/bin/.switchroom-versions/switchroom-0.19.23"),
     ).toBe("PRISTINE-0.19.23");
+  });
+});
+
+// ─── the shipped-asset payload (#4163) ───────────────────────────────────
+//
+// The non-negotiable property: the binary and the templates it renders from
+// move together. If they can drift, a new CLI scaffolds agents from old
+// templates — worse than today's "no templates at all", because it fails
+// silently and much later.
+
+const SHARE_ROOT = "/usr/local/share/switchroom";
+
+describe("installAssetPayload", () => {
+  it("publishes the payload as a versioned dir behind a symlink", async () => {
+    const { io, files, links } = makeIO();
+    const r = await installAssetPayload({
+      tag: "v0.19.28",
+      binaryPath: "/usr/local/bin/switchroom",
+      io,
+    });
+
+    expect(r.installed).toBe(true);
+    expect(r.version).toBe("v0.19.28");
+    expect(r.root).toBe(SHARE_ROOT);
+    // The published path is a SYMLINK — that is what makes the swap a
+    // rename(2) rather than a recursive delete of a live directory.
+    expect(links.get(SHARE_ROOT)).toBe("switchroom-0.19.28");
+    expect(files.has(`${payloadVersionDir(SHARE_ROOT, "v0.19.28")}/profiles/_base/start.sh.hbs`)).toBe(true);
+    // Resolving THROUGH the link is what the CLI actually does.
+    expect(readPayloadVersion(io, SHARE_ROOT)).toBe("v0.19.28");
+    // No staging debris left behind.
+    expect([...files.keys()].filter((k) => k.includes(".incoming"))).toEqual([]);
+    expect([...files.keys()].filter((k) => k.includes(".download"))).toEqual([]);
+  });
+
+  it("is a no-op when the payload on disk is already the wanted version", async () => {
+    const { io } = makeIO();
+    await installAssetPayload({ tag: "v0.19.28", binaryPath: "/usr/local/bin/switchroom", io });
+    let downloads = 0;
+    const second = await installAssetPayload({
+      tag: "v0.19.28",
+      binaryPath: "/usr/local/bin/switchroom",
+      io: {
+        ...io,
+        httpDownload: async (...args) => {
+          downloads += 1;
+          return io.httpDownload(...args);
+        },
+      },
+    });
+    expect(second.installed).toBe(false);
+    expect(downloads).toBe(0);
+  });
+
+  it("refuses to unpack a payload whose checksum does not match", async () => {
+    const { io, files, links } = makeIO({ sha256File: () => "e".repeat(64) });
+    await expect(
+      installAssetPayload({ tag: "v0.19.28", binaryPath: "/usr/local/bin/switchroom", io }),
+    ).rejects.toThrow(/SHA256 mismatch/);
+    expect(links.has(SHARE_ROOT)).toBe(false);
+    expect([...files.keys()].filter((k) => k.includes(".download"))).toEqual([]);
+  });
+
+  it("refuses when the release ships no payload checksum entry (a pre-#4163 tag)", async () => {
+    const { io, links } = makeIO({
+      httpGetText: async () => `${GOOD_SHA}  switchroom-linux-amd64\n`,
+    });
+    await expect(
+      installAssetPayload({ tag: "v0.19.28", binaryPath: "/usr/local/bin/switchroom", io }),
+    ).rejects.toThrow(/no checksum entry/);
+    expect(links.has(SHARE_ROOT)).toBe(false);
+  });
+
+  it("refuses a payload whose manifest names a DIFFERENT release than the tag", async () => {
+    // The skew guard: a correctly-hashed archive cut from another release
+    // must not become the templates this CLI scaffolds from.
+    const { io, links, files } = makeIO({
+      async httpDownload(url, dest) {
+        files.set(dest, url.endsWith(ASSET_PAYLOAD_ASSET_NAME) ? "PAYLOAD:v9.9.9" : "NEW-BINARY");
+      },
+    });
+    await expect(
+      installAssetPayload({ tag: "v0.19.28", binaryPath: "/usr/local/bin/switchroom", io }),
+    ).rejects.toThrow(/unpacked with version v9\.9\.9/);
+    expect(links.has(SHARE_ROOT)).toBe(false);
+  });
+
+  it("moves a pre-existing REAL directory aside instead of deleting it", async () => {
+    // The dev-host stopgap shape: someone hand-staged profiles/ into
+    // /usr/local/share/switchroom. rename(2) cannot replace a non-empty
+    // directory, and silently rm -rf'ing an operator's files is not on.
+    const { io, files, links } = makeIO();
+    files.set(`${SHARE_ROOT}/profiles/hand-staged.hbs`, "OPERATOR-FILE");
+    await installAssetPayload({ tag: "v0.19.28", binaryPath: "/usr/local/bin/switchroom", io });
+    expect(files.get(`${SHARE_ROOT}.replaced/profiles/hand-staged.hbs`)).toBe("OPERATOR-FILE");
+    expect(links.get(SHARE_ROOT)).toBe("switchroom-0.19.28");
+  });
+
+  it("keeps the current payload and ONE previous version, pruning the rest", async () => {
+    // A binary rollback still has templates to render from; /usr/local/share
+    // does not grow by ~7MB per release forever.
+    const { io, files } = makeIO();
+    for (const v of ["0.19.20", "0.19.21", "0.19.23"]) {
+      files.set(`/usr/local/share/switchroom-${v}/switchroom-assets.json`, `{"version":"v${v}"}`);
+    }
+    await installAssetPayload({ tag: "v0.19.28", binaryPath: "/usr/local/bin/switchroom", io });
+    const kept = [...files.keys()]
+      .map((k) => k.match(/^\/usr\/local\/share\/switchroom-(\d+\.\d+\.\d+)\//)?.[1])
+      .filter((v): v is string => Boolean(v));
+    expect([...new Set(kept)].sort()).toEqual(["0.19.23", "0.19.28"]);
+  });
+});
+
+describe("performSelfUpdate — binary and payload move together", () => {
+  it("installs the payload for the SAME tag as the binary", async () => {
+    const { io, files, links } = makeIO();
+    const r = await run(io);
+    expect(r.payload?.version).toBe("v0.19.28");
+    expect(r.newVersion).toBe("v0.19.28");
+    expect(links.get(SHARE_ROOT)).toBe("switchroom-0.19.28");
+    expect(files.get("/usr/local/bin/switchroom")).toBe("NEW-BINARY");
+    expect(r.message).toContain("asset payload v0.19.28");
+  });
+
+  it("publishes the payload BEFORE the binary swap", async () => {
+    // The ordering IS the guarantee. An interruption between the two renames
+    // must leave new-templates/old-CLI (recoverable, and the old CLI can read
+    // newer templates) — never new-CLI/old-templates.
+    const order: string[] = [];
+    const base = makeIO();
+    const io: SelfUpdateIO = {
+      ...base.io,
+      symlink: (target, linkPath) => {
+        order.push(`payload:${linkPath}`);
+        base.io.symlink(target, linkPath);
+      },
+      rename: (src, dest) => {
+        if (dest === "/usr/local/bin/switchroom") order.push("binary:swap");
+        base.io.rename(src, dest);
+      },
+    };
+    await performSelfUpdate({ plan: PLAN, assetName: "switchroom-linux-amd64", io });
+    expect(order).toEqual([`payload:${SHARE_ROOT}.new-link`, "binary:swap"]);
+  });
+
+  it("leaves the binary UNTOUCHED when the payload cannot be installed", async () => {
+    // The direction that must never happen: a new CLI on $PATH with stale or
+    // absent templates. A failed payload is a failed update.
+    const { io, files, links } = makeIO({
+      extractTarGz: () => {
+        throw new Error("tar: unexpected EOF");
+      },
+    });
+    await expect(run(io)).rejects.toThrow(/could not unpack/);
+    expect(files.get("/usr/local/bin/switchroom")).toBe("OLD-BINARY");
+    expect(links.has(SHARE_ROOT)).toBe(false);
+  });
+
+  it("refuses the whole update when the release has no payload at all", async () => {
+    const { io, files } = makeIO({
+      httpGetText: async (url) =>
+        url.endsWith("switchroom-checksums.txt")
+          ? `${GOOD_SHA}  switchroom-linux-amd64\n`
+          : '{"tag_name":"v0.19.28"}',
+    });
+    await expect(run(io)).rejects.toThrow(/no checksum entry for switchroom-assets\.tar\.gz/);
+    expect(files.get("/usr/local/bin/switchroom")).toBe("OLD-BINARY");
   });
 });

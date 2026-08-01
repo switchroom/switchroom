@@ -24,7 +24,16 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -82,9 +91,40 @@ const ASSETS = [
   "switchroom-macos-arm64",
 ];
 const CHECKSUMS = "switchroom-checksums.txt";
+/** #4163 — the shipped-asset payload, alongside the four binaries. */
+const PAYLOAD = "switchroom-assets.tar.gz";
+const PAYLOAD_VERSION = "v0.0.0-test";
+
+/**
+ * A real gzip tarball shaped like the one scripts/build-asset-payload.mjs
+ * produces: a version manifest at the root plus the asset directories the CLI
+ * probes for. Real, not a stub, because install.sh actually untars it and
+ * reads the manifest back out.
+ */
+function makePayloadTarball(dest: string, opts: { version?: string } = {}): void {
+  const stage = tmp();
+  mkdirSync(join(stage, "profiles/_base"), { recursive: true });
+  writeFileSync(join(stage, "profiles/_base/start.sh.hbs"), "#!/bin/sh\n");
+  mkdirSync(join(stage, "skills"), { recursive: true });
+  writeFileSync(join(stage, "skills/.keep"), "");
+  writeFileSync(
+    join(stage, "switchroom-assets.json"),
+    `${JSON.stringify({ version: opts.version ?? PAYLOAD_VERSION, entries: ["profiles", "skills"], files: 2 }, null, 2)}\n`,
+  );
+  const r = spawnSync("tar", ["-czf", dest, "-C", stage, "."], { encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`tar failed: ${r.stderr}`);
+}
 
 /** Build a bundle dir shaped exactly like the workflow's `dist-bins`. */
-function makeBundle(opts: { separator?: string; omit?: string[]; extra?: string[]; corrupt?: string } = {}): string {
+function makeBundle(
+  opts: {
+    separator?: string;
+    omit?: string[];
+    extra?: string[];
+    corrupt?: string;
+    payloadVersion?: string;
+  } = {},
+): string {
   const d = tmp();
   const sep = opts.separator ?? "  ";
   const omit = new Set(opts.omit ?? []);
@@ -98,6 +138,14 @@ function makeBundle(opts: { separator?: string; omit?: string[]; extra?: string[
         ? "0".repeat(64)
         : createHash("sha256").update(Buffer.from(body)).digest("hex");
     lines.push(`${hash}${sep}${asset}`);
+  }
+  if (!omit.has(PAYLOAD)) {
+    makePayloadTarball(join(d, PAYLOAD), { version: opts.payloadVersion });
+    const hash =
+      opts.corrupt === PAYLOAD
+        ? "0".repeat(64)
+        : createHash("sha256").update(readFileSync(join(d, PAYLOAD))).digest("hex");
+    lines.push(`${hash}${sep}${PAYLOAD}`);
   }
   if (!omit.has(CHECKSUMS)) writeFileSync(join(d, CHECKSUMS), `${lines.join("\n")}\n`);
   for (const extra of opts.extra ?? []) writeFileSync(join(d, extra), "stray\n");
@@ -166,10 +214,58 @@ describe("check-release-asset-names (static contract)", () => {
   });
 
   it("fails when install.sh's checksum lookup separator stops matching sha256sum output", () => {
-    const env = stage({ installSh: (s) => s.replace('grep -F "  ${asset}"', 'grep -F " ${asset}"') });
+    const env = stage({ installSh: (s) => s.replace('grep -F "  ${1}"', 'grep -F " ${1}"') });
     const r = runCheck(env);
     expect(r.ok).toBe(false);
     expect(r.out).toContain("separator");
+  });
+
+  // ---- #4163: the shipped-asset payload is part of the contract ----
+  //
+  // A release that ships four binaries and no payload installs a CLI that
+  // cannot scaffold a single agent. That failure surfaces LATER than a 404 —
+  // on the user's host, at `switchroom apply` — so the naming contract has to
+  // cover the tarball exactly as it covers the binaries.
+
+  it("names the asset payload on the real files", () => {
+    const r = runCheck();
+    expect(r.ok).toBe(true);
+    expect(r.out).toContain(PAYLOAD);
+  });
+
+  it("fails when the workflow renames the payload the installer still asks for", () => {
+    const env = stage({ workflow: (s) => s.replace(/PAYLOAD_ASSET: ".*"/, 'PAYLOAD_ASSET: "switchroom-share.tgz"') });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("switchroom-share.tgz");
+    expect(r.out).toContain(PAYLOAD);
+  });
+
+  it("fails loudly when install.sh stops fetching a payload at all", () => {
+    const env = stage({ installSh: (s) => s.replace(/assets_payload="[^"]*"/, 'assets_payload_gone=""') });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("could not derive the contract");
+    expect(r.out).toContain("#4163");
+  });
+
+  it("fails when the workflow declares a payload but never builds one", () => {
+    const env = stage({ workflow: (s) => s.replaceAll("scripts/build-asset-payload.mjs", "scripts/nope.mjs") });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("build-asset-payload.mjs");
+  });
+
+  it("fails when the payload is smuggled into the per-platform RELEASE_ASSETS list", () => {
+    // Four build legs would then race to upload the same architecture-
+    // independent file, and `bundle`'s flatten step would look for it in an
+    // artifact that never contained it.
+    const env = stage({
+      workflow: (s) => s.replace(/RELEASE_ASSETS: "(.*)"/, `RELEASE_ASSETS: "$1 ${PAYLOAD}"`),
+    });
+    const r = runCheck(env);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("env.RELEASE_ASSETS");
   });
 
   // ---- #3634: every asset is built on its own OS ----
@@ -242,6 +338,19 @@ describe("verify-release-bundle (runtime contract)", () => {
     const r = runVerify(makeBundle({ extra: ["switchroom-linux-amd64.dSYM"] }));
     expect(r.ok).toBe(false);
     expect(r.out).toContain("unexpected file");
+  });
+
+  it("rejects a bundle with every binary but no asset payload (#4163)", () => {
+    const r = runVerify(makeBundle({ omit: [PAYLOAD] }));
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain(`missing: ${PAYLOAD}`);
+  });
+
+  it("checksum-verifies the payload, not just the binaries", () => {
+    const r = runVerify(makeBundle({ corrupt: PAYLOAD }));
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain(PAYLOAD);
+    expect(r.out).toContain("hashes to");
   });
 
   it("rejects a missing checksums file", () => {
@@ -342,7 +451,7 @@ describe("install.sh against a workflow-shaped bundle", () => {
     return d;
   }
 
-  function runInstaller(bundleDir: string): Run {
+  function runInstaller(bundleDir: string, out?: { shareDir?: string }): Run {
     // The stub is an EXPORTED bash function, not a file on PATH: a script file
     // would need the exec bit, and a `noexec` tmpdir (common in hardened
     // sandboxes) would silently fall through to the real curl and hit
@@ -368,7 +477,14 @@ describe("install.sh against a workflow-shaped bundle", () => {
       "export -f curl",
       'bash "$INSTALL_SH"',
     ].join("\n");
-    const installDir = tmp();
+    const prefix = tmp();
+    const installDir = join(prefix, "bin");
+    mkdirSync(installDir, { recursive: true });
+    // Pinned INSIDE the test's tmp prefix. The default is
+    // `<dirname install_dir>/share/switchroom`, which for a real install is
+    // `/usr/local/share/switchroom` — never write there from a test.
+    const shareDir = join(prefix, "share/switchroom");
+    if (out) out.shareDir = shareDir;
     const r = spawnSync("bash", ["-c", stub], {
       cwd: REPO,
       encoding: "utf8",
@@ -376,8 +492,9 @@ describe("install.sh against a workflow-shaped bundle", () => {
         ...process.env,
         INSTALL_SH: REAL_INSTALL_SH,
         BUNDLE_DIR: bundleDir,
-        SWITCHROOM_VERSION: "v0.0.0-test",
+        SWITCHROOM_VERSION: PAYLOAD_VERSION,
         SWITCHROOM_INSTALL_DIR: installDir,
+        SWITCHROOM_SHARE_DIR: shareDir,
       },
     });
     return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
@@ -398,5 +515,84 @@ describe("install.sh against a workflow-shaped bundle", () => {
     const r = runInstaller(d);
     expect(r.ok).toBe(false);
     expect(r.out).toContain("Checksum mismatch");
+  });
+
+  // ---- #4163: the payload has to actually land where the CLI probes ----
+
+  it("extracts the asset payload to <prefix>/share/switchroom via a versioned dir + symlink", () => {
+    const out: { shareDir?: string } = {};
+    const r = runInstaller(fakeBinaryBundle(), out);
+    expect(r.ok, r.out).toBe(true);
+    const shareDir = out.shareDir as string;
+
+    // The published path is a SYMLINK to a versioned directory. That is what
+    // makes the swap on the next install a rename of a link rather than a
+    // recursive delete of a live directory.
+    expect(lstatSync(shareDir).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(shareDir)).toBe(`switchroom-${PAYLOAD_VERSION.replace(/^v/, "")}`);
+
+    // And the contents are the ones src/util/shipped-assets.ts probes for.
+    expect(existsSync(join(shareDir, "profiles/_base/start.sh.hbs"))).toBe(true);
+    expect(existsSync(join(shareDir, "skills"))).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(shareDir, "switchroom-assets.json"), "utf-8"));
+    expect(manifest.version).toBe(PAYLOAD_VERSION);
+  });
+
+  it("refuses to install a payload whose checksum does not match", () => {
+    const d = fakeBinaryBundle();
+    writeFileSync(join(d, PAYLOAD), "tampered\n");
+    const out: { shareDir?: string } = {};
+    const r = runInstaller(d, out);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("Checksum mismatch");
+    expect(r.out).toContain(PAYLOAD);
+    // Nothing published: a payload that failed verification must not become
+    // the templates every agent is scaffolded from.
+    expect(existsSync(out.shareDir as string)).toBe(false);
+  });
+
+  it("refuses a payload whose manifest names a different release than the binary", () => {
+    // The skew guard the issue calls non-negotiable, at INSTALL time: a CLI
+    // must never be paired with someone else's templates.
+    const d = fakeBinaryBundle();
+    makePayloadTarball(join(d, PAYLOAD), { version: "v9.9.9" });
+    const hash = createHash("sha256").update(readFileSync(join(d, PAYLOAD))).digest("hex");
+    writeFileSync(
+      join(d, CHECKSUMS),
+      readFileSync(join(d, CHECKSUMS), "utf-8")
+        .split("\n")
+        .map((l) => (l.endsWith(`  ${PAYLOAD}`) ? `${hash}  ${PAYLOAD}` : l))
+        .join("\n"),
+    );
+    const out: { shareDir?: string } = {};
+    const r = runInstaller(d, out);
+    expect(r.ok).toBe(false);
+    expect(r.out).toContain("9.9.9");
+    expect(existsSync(out.shareDir as string)).toBe(false);
+  });
+
+  it("warns loudly, and does not silently succeed, on a release that predates the payload", () => {
+    // Installing an old tag is legal. Getting a CLI that dies at `switchroom
+    // apply` with no warning is not.
+    const d = makeBundle({ omit: [PAYLOAD] });
+    const platform = process.platform === "darwin" ? "macos" : "linux";
+    const arch = process.arch === "arm64" ? "arm64" : "amd64";
+    const asset = `switchroom-${platform}-${arch}`;
+    const body = '#!/bin/sh\necho "switchroom 0.0.0-test"\n';
+    writeFileSync(join(d, asset), body, { mode: 0o755 });
+    const hash = createHash("sha256").update(Buffer.from(body)).digest("hex");
+    writeFileSync(
+      join(d, CHECKSUMS),
+      readFileSync(join(d, CHECKSUMS), "utf-8")
+        .split("\n")
+        .map((l) => (l.endsWith(`  ${asset}`) ? `${hash}  ${asset}` : l))
+        .join("\n"),
+    );
+    const out: { shareDir?: string } = {};
+    const r = runInstaller(d, out);
+    expect(r.ok, r.out).toBe(true);
+    expect(r.out).toContain(PAYLOAD);
+    expect(r.out).toMatch(/WILL fail/);
+    expect(existsSync(out.shareDir as string)).toBe(false);
   });
 });
