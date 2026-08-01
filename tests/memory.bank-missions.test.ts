@@ -255,10 +255,13 @@ describe("DEFAULT_RETAIN_MISSION", () => {
     );
   });
 
-  // The merge is only honest if the live half is byte-identical. This proves
-  // the default is exactly SUPERSEDED[6] (the live text) with exactly the
-  // volatile block inserted — no reword, no reorder, no quiet tightening.
-  it("is the live text verbatim plus exactly the volatile block, nothing else", () => {
+  // The 2026-07-29 merge is only honest if the live half is byte-identical.
+  // This proves SUPERSEDED[7] is exactly SUPERSEDED[6] (the live text) with
+  // exactly the volatile block inserted — no reword, no reorder, no quiet
+  // tightening. Retargeted from DEFAULT_RETAIN_MISSION to SUPERSEDED[7] when
+  // the 2026-08-02 own-synthesis pass shipped: the guarantee is about that
+  // merge, which is now history, and history must stay provable.
+  it("SUPERSEDED[7] is the live text verbatim plus exactly the volatile block, nothing else", () => {
     const liveText = SUPERSEDED_RETAIN_MISSIONS[6];
     expect(liveText).toHaveLength(3460);
     const priorDefault = SUPERSEDED_RETAIN_MISSIONS[5];
@@ -266,9 +269,46 @@ describe("DEFAULT_RETAIN_MISSION", () => {
     const vEnd = priorDefault.indexOf("- Transient state (unread counts");
     const block = priorDefault.slice(vStart, vEnd);
     expect(block).toHaveLength(742);
-    // Removing the block from the default yields the live text, unmodified.
-    expect(DEFAULT_RETAIN_MISSION.replace(block, "")).toBe(liveText);
-    expect(DEFAULT_RETAIN_MISSION).toHaveLength(liveText.length + block.length);
+    const merged = SUPERSEDED_RETAIN_MISSIONS[7];
+    // Removing the block from the merge yields the live text, unmodified.
+    expect(merged.replace(block, "")).toBe(liveText);
+    expect(merged).toHaveLength(liveText.length + block.length);
+  });
+
+  // 2026-08-02 own-synthesis pass. Same shape of proof as the merge test above:
+  // the current default is the previous default with exactly ONE bullet added,
+  // nothing else touched. This is what makes "additive, so the regression risk
+  // is bounded to more-conservative extraction" a checkable claim rather than a
+  // sentence in a comment.
+  it("is the 2026-07-29 merge verbatim plus exactly the own-synthesis bullet", () => {
+    const previous = SUPERSEDED_RETAIN_MISSIONS[7];
+    const bStart = DEFAULT_RETAIN_MISSION.indexOf("- The assistant's own answers");
+    const bEnd = DEFAULT_RETAIN_MISSION.indexOf("- Volatile state written as");
+    expect(bStart).toBeGreaterThan(-1);
+    expect(bEnd).toBeGreaterThan(bStart);
+    const bullet = DEFAULT_RETAIN_MISSION.slice(bStart, bEnd);
+    expect(DEFAULT_RETAIN_MISSION.replace(bullet, "")).toBe(previous);
+    expect(DEFAULT_RETAIN_MISSION).toHaveLength(previous.length + bullet.length);
+  });
+
+  // The bullet has to actually land inside NEVER extract, and above the
+  // volatile-state bullet (the 2026-07-25 finding that ordering and retention
+  // of bullets matter stands). A bullet appended after the closing instruction
+  // is not an exclusion, it is a footnote.
+  it("places the own-synthesis bullet inside NEVER extract, above the volatile one", () => {
+    const ownAt = DEFAULT_RETAIN_MISSION.indexOf("- The assistant's own answers");
+    const restatementsAt = DEFAULT_RETAIN_MISSION.indexOf("- Restatements of the user's");
+    const volatileAt = DEFAULT_RETAIN_MISSION.indexOf("- Volatile state written as");
+    expect(ownAt).toBeGreaterThan(restatementsAt);
+    expect(volatileAt).toBeGreaterThan(ownAt);
+    expect(ownAt).toBeLessThan(
+      DEFAULT_RETAIN_MISSION.indexOf("If a candidate fact matches an exclusion"),
+    );
+    // It carries the subject test, which is the part that generalises past the
+    // enumerated claim types.
+    expect(DEFAULT_RETAIN_MISSION).toContain(
+      "does anything in this transcript support this claim OTHER",
+    );
   });
 
   // Drift guard: the vendored plugin pushes settings.json's `retainMission`
@@ -432,6 +472,32 @@ const LIVE_2026_07_29_TEXT =
   "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
   "nothing durable remains, return an empty facts list.\n";
 
+/**
+ * The volatile-state block, lifted verbatim out of the 2026-07-28 default.
+ * Shared by the merge-mechanics test and {@link MERGED_2026_07_29_DEFAULT}.
+ */
+const VOLATILE_BLOCK = (() => {
+  const vStart = OUTGOING_2026_07_28_DEFAULT.indexOf(
+    "- Volatile state written as a timeless assertion.",
+  );
+  const vEnd = OUTGOING_2026_07_28_DEFAULT.indexOf("- Transient state (unread counts");
+  return OUTGOING_2026_07_28_DEFAULT.slice(vStart, vEnd);
+})();
+
+/**
+ * SUPERSEDED_RETAIN_MISSIONS[7] — the 2026-07-29 durability-gate MERGE, i.e.
+ * the default this repo shipped immediately before the 2026-08-02
+ * own-synthesis pass. DERIVED rather than transcribed a third time, from the
+ * two verbatim pins it was assembled from: the live text with the volatile
+ * block spliced in above the dated-transient bullet. Deriving it is stricter
+ * than another transcription, not looser — it is fully determined by two pins
+ * that are themselves byte-pinned, so it cannot drift independently of them.
+ */
+const MERGED_2026_07_29_DEFAULT = LIVE_2026_07_29_TEXT.replace(
+  "- Transient state (unread counts",
+  VOLATILE_BLOCK + "- Transient state (unread counts",
+);
+
 describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
   it("never contains the current default (that would make every apply a no-op decision)", () => {
     expect(SUPERSEDED_RETAIN_MISSIONS).not.toContain(DEFAULT_RETAIN_MISSION);
@@ -525,8 +591,13 @@ describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
       // replaced it. Registered so `klanker` and `overlord`, which carry it,
       // are upgradable to the merged default rather than stranded on it.
       LIVE_2026_07_29_TEXT,
+      // (2026-07-29 durability-gate merge) — the default this repo shipped
+      // immediately before the 2026-08-02 own-synthesis pass. Registered so
+      // every bank that converged on the merge is upgradable to the new text
+      // rather than read as an operator customization.
+      MERGED_2026_07_29_DEFAULT,
     ]);
-    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(7);
+    expect(SUPERSEDED_RETAIN_MISSIONS).toHaveLength(8);
   });
 
   // The whole point of appending: a bank still carrying a shipped default must
@@ -568,8 +639,15 @@ describe("SUPERSEDED_RETAIN_MISSIONS registry", () => {
         mission: DEFAULT_RETAIN_MISSION,
       });
     }
-    // And the destination is the merge: live text + the 742-char volatile block.
-    expect(DEFAULT_RETAIN_MISSION).toHaveLength(4202);
+    // The 2026-07-29 merge (live text + the 742-char volatile block) is now a
+    // waypoint, not the destination: a bank that already converged on it must
+    // ALSO be upgradable to the current default, or the 2026-08-02 own-synthesis
+    // bullet never reaches the fleet.
+    expect(MERGED_2026_07_29_DEFAULT).toHaveLength(4202);
+    expect(decideRetainMissionUpgrade(undefined, MERGED_2026_07_29_DEFAULT)).toEqual({
+      action: "upgrade",
+      mission: DEFAULT_RETAIN_MISSION,
+    });
   });
 
   it("carries the 2026-07-19 text every live bank was found holding on 2026-07-25", () => {

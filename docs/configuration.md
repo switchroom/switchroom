@@ -276,6 +276,49 @@ agents:
           lesson: 1.4        # promote; sidechain: 0.8 still applies
 ```
 
+##### `source:transcript` — provenance on auto-retained memories
+
+Switchroom stamps every agent's installed plugin with `retainTags:
+["{session_id}", "source:transcript"]`. The session tag identifies *which*
+session a memory came from; `source:transcript` says *how* it was made —
+extracted by Hindsight from a transcript window by the auto-retain Stop hook,
+rather than deliberately written by a `retain` call.
+
+That distinction matters because fact extraction cannot tell the agent's own
+synthesis apart from an established fact. If an agent answers a question by
+guessing a date, auto-retain can lift that guess out of the transcript and store
+it as a world fact with a clean `event_date` — and next session recall serves it
+back as though it had been verified. The tag is what makes that class of memory
+*addressable*: Hindsight's `metadata` is
+[not filterable](https://hindsight.vectorize.io/best-practices) while tags are,
+so the `session_id` sitting in metadata could never be filtered on.
+
+Nothing is demoted by default — the tag is inert until you use it. The levers
+are the ones above, plus `reflect`:
+
+```yaml
+agents:
+  archivist:
+    memory:
+      recall:
+        tag_weights:
+          "source:transcript": 0.85   # demote transcript-derived memories, keep them
+```
+
+You can also exclude them from a shared bank via `additional_bank_filters`, or
+pass `tags: ["source:transcript"]` with `tags_match: any_strict` to a `reflect`
+call to audit only what auto-retain produced.
+
+The tag is deliberately excluded from **observation consolidation scope**
+(`^source:` in the vendored plugin's volatile-scope patterns). It is a recall
+filter handle, not a partition: because it is stamped on *every* auto-retain
+forever, letting it reach the `curated` scope strategy would move every new
+observation into a `[["source:transcript"]]` partition, isolated from every
+observation consolidated before the tag shipped.
+
+`retain_tags` is switchroom-managed and has no yaml key — the stamp is
+re-asserted on every `switchroom apply`.
+
 #### Multi-bank recall
 
 | Key | Type | Default | What it does |

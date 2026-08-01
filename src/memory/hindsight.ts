@@ -440,6 +440,50 @@ export function isHindsightEnabled(
  * claim that would otherwise be dropped. B is the more specific of the two and
  * is the one that carries the exemplars, so both stay.
  */
+/*
+ * 2026-08-02 (own-synthesis pass — the "The assistant's own answers" bullet).
+ * A THIRD failure class, distinct from tool exhaust and from volatile state:
+ * the extraction step reading the AGENT'S OWN output as evidence.
+ *
+ * The Stop-hook retain window is a blend of both roles (`retainRoles` is
+ * `["user", "assistant"]`), so anything the model synthesised in-session — a
+ * `reflect` answer, a recap, an inferred date — is presented to fact
+ * extraction as ordinary transcript. Nothing in the payload marks it as the
+ * bank's own prior output rather than new evidence, so a fabrication is
+ * extracted as `fact_type: world` with a clean `event_date` and the next
+ * session's recall serves it back as ground truth. That is a closed loop: a
+ * guess becomes a permanent fact, and the fact then supports the next guess.
+ *
+ * Observed, not argued: memory unit `f3ae7546-d37d-4977-a40b-4d53d8b32e65` in
+ * bank `carrie` asserts a publish date the agent invented in-session, retained
+ * 2026-08-01 with `context: "claude-code"`, tags `["4c386b32-…"]` (the bare
+ * session UUID) and nothing else. No existing bullet reaches it — it is not a
+ * tool result, not narration of an action, not a volatile "X is currently Y".
+ *
+ * The bullet follows the shape the 2026-07-28 A/B proved out rather than
+ * inventing a new one: a SUBJECT TEST ("does anything support this claim other
+ * than the assistant having asserted it?"), an enumeration of the concrete
+ * claim types that actually leaked (a date, a version, an attribution, a total,
+ * a decision the user never confirmed), and a stated consequence so the rule
+ * generalises past the enumeration.
+ *
+ * HONESTLY BOUNDED, exactly as the volatile-state bullet was: this was NOT
+ * re-run through the 52-chunk offline A/B. It is justified by the live unit
+ * above plus consistency with that pass's proven shape. It is ADDITIVE — no
+ * existing bullet was removed, reworded or reordered, and the positive
+ * counterweight sentence is untouched — which bounds the regression risk to
+ * "extraction gets slightly more conservative on claims only the assistant
+ * made". If it needs stronger evidence, re-run the A/B harness with this as a
+ * further arm.
+ *
+ * It is also only HALF the fix, and the weaker half: a prompt is not a
+ * guarantee. The paired durable half is provenance tagging
+ * (`src/memory/hindsight-retain-provenance.ts`) — every auto-retained slice now
+ * carries `source:transcript`, so transcript-derived units are filterable at
+ * recall/reflect instead of being indistinguishable from curated ones. The real
+ * fix — extraction that knows which role authored a sentence — belongs upstream
+ * in Hindsight.
+ */
 export const DEFAULT_RETAIN_MISSION =
   "Extract durable facts that will still be true and useful weeks from now, once this session is forgotten.\n" +
   "\n" +
@@ -479,6 +523,15 @@ export const DEFAULT_RETAIN_MISSION =
   "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
   "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
+  "- The assistant's own answers, summaries, recaps, or reflect output. Before\n" +
+  "  extracting, ask: does anything in this transcript support this claim OTHER\n" +
+  "  than the assistant having asserted it? If not, drop it — a model's own\n" +
+  "  synthesis re-extracted as a fact is how a guess becomes permanent.\n" +
+  "  Concretely, never produce a fact whose only support is the assistant\n" +
+  "  stating a date, a version, an attribution, a total, or a decision that the\n" +
+  "  user never confirmed and no tool output shows. An unverified claim recalls\n" +
+  "  later as though it had been established, which is worse than not\n" +
+  "  remembering it at all.\n" +
   "- Volatile state written as a timeless assertion. A version, count, size,\n" +
   "  backlog, status, or any \"X is running Y\" / \"X is at Y\" / \"X is currently Y\"\n" +
   "  claim is true only at the instant it was said. Concretely, never produce a\n" +
@@ -697,6 +750,67 @@ export const SUPERSEDED_RETAIN_MISSIONS: readonly string[] = [
   "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
   "  system's self-reports are not memories.\n" +
   "- Restatements of the user's current request or the task in progress.\n" +
+  "- Transient state (unread counts, build status, what is running right now) unless\n" +
+  "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
+  "- Greetings, acknowledgements, and routine operational chatter.\n" +
+  "\n" +
+  "Write each fact so it stands alone: name the thing, the number, and the date. A\n" +
+  "sentence that only makes sense while reading this transcript is not durable.\n" +
+  "\n" +
+  "If a candidate fact matches an exclusion, drop it rather than rewording it. If\n" +
+  "nothing durable remains, return an empty facts list.\n",
+  // (2026-07-29 durability-gate merge) — the default this repo shipped
+  // immediately before the 2026-08-02 own-synthesis pass added the
+  // "assistant's own answers" bullet. Registered so every bank carrying it
+  // is upgradable rather than mistaken for an operator customization.
+  "Extract durable facts that will still be true and useful weeks from now, once this session is forgotten.\n" +
+  "\n" +
+  "DURABILITY GATE. Emit a candidate ONLY if it is one of these five classes:\n" +
+  "- PREFERENCE — what the user likes, wants, or always does; a standing rule or correction.\n" +
+  "- DECISION — a settled choice that changes how future work is done, including a choice NOT to do something. A decision about the mechanics of the CURRENT task (which worker to dispatch, which branch to rebase, which PR to merge now, what to do next) is process narration, not a durable decision — drop it unless it establishes a standing rule or permanently changes a system.\n" +
+  "- FINDING — a root cause, a measurement, or verified behaviour of a system. Include the number.\n" +
+  "- OUTCOME — a completed result that changed the world: what shipped, what a thing turned out to be. Not the act of shipping it.\n" +
+  "- RELATIONSHIP — who a person is, what a project or tool is, and how they connect.\n" +
+  "If a candidate fits none of the five, it is not a memory. Drop it; do not reword it into one.\n" +
+  "\n" +
+  "A preference revealed by a request is durable — record the preference (what the user likes, wants, or always does), not the request itself.\n" +
+  "\n" +
+  "A TOOL RESULT IS NOT A FACT. Before extracting, ask: is the subject of this\n" +
+  "candidate a file path, a command/process/agent/session id, a temp directory, or\n" +
+  "the location where some output was written? If yes, drop it — it is transcript\n" +
+  "exhaust, not memory.\n" +
+  "\n" +
+  "NEVER extract:\n" +
+  "- Tool results verbatim or paraphrased. Concretely, never produce a fact whose\n" +
+  "  text resembles any of these: \"File created successfully at /path/to/file\",\n" +
+  "  \"A background command with ID bctz4yskm is running, and its output will be\n" +
+  "  written to /tmp/...\", \"Async agent a745598ba84e71df1 was launched successfully\n" +
+  "  and is running in the background\", \"User executed a Bash command to sleep for\n" +
+  "  200 seconds\", \"The assistant used grep to locate 'truncateSync' in src/foo.ts\".\n" +
+  "- Anything mentioning a path under /tmp, a scratchpad directory, or a .tmp file.\n" +
+  "- Agent tool-use traces or narration of what the assistant did (e.g. \"the\n" +
+  "  assistant used X to query Y\", \"ran a search\", \"sent the message\").\n" +
+  "- The act of delegating, dispatching, spawning, launching, steering or merging\n" +
+  "  work — including when it succeeded. \"X was dispatched and completed\" is the\n" +
+  "  session describing itself. Record only what the work LEARNED or CHANGED.\n" +
+  "- In-flight workflow/process narration (a sub-task started, paused, or is still\n" +
+  "  running) — retain the outcome only once the task completes or a decision is made.\n" +
+  "- Operation, request, batch, agent, command or session IDs, UUIDs, hashes, or error codes.\n" +
+  "- Slash commands the user typed and their effects (e.g. \"User issued /clear to\n" +
+  "  reset assistant state\").\n" +
+  "- Hindsight's own errors, retries, backlogs, or internal state — the memory\n" +
+  "  system's self-reports are not memories.\n" +
+  "- Restatements of the user's current request or the task in progress.\n" +
+  "- Volatile state written as a timeless assertion. A version, count, size,\n" +
+  "  backlog, status, or any \"X is running Y\" / \"X is at Y\" / \"X is currently Y\"\n" +
+  "  claim is true only at the instant it was said. Concretely, never produce a\n" +
+  "  fact whose text resembles any of these: \"Switchroom fleet is running image\n" +
+  "  version v0.18.19\", \"The switchroom repo is at /path/to/fleet, version\n" +
+  "  v0.19.5\", \"Bank overlord has 43155 pending consolidations\", \"The build is\n" +
+  "  currently green\". If the claim is worth keeping, put the date INSIDE the\n" +
+  "  fact text (\"As of 2026-07-19 the fleet was running v0.18.19\"); if you\n" +
+  "  cannot date it, drop it. An undated one is recalled forever as though it\n" +
+  "  were still true, which is worse than not remembering it at all.\n" +
   "- Transient state (unread counts, build status, what is running right now) unless\n" +
   "  the fact is explicitly dated, in which case record it as a dated observation.\n" +
   "- Greetings, acknowledgements, and routine operational chatter.\n" +
