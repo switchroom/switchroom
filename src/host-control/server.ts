@@ -410,6 +410,16 @@ export interface StatusEntry {
    * open a host shell to find out.
    */
   drifted?: string[];
+  /**
+   * Non-fatal warnings the roll accumulated (e.g. web/hostd refresh misses,
+   * skipped components, degraded steps). #3944 — `encodeRolloutResultLine`
+   * has always put these on the sentinel wire (`warnings: result.warnings`),
+   * but hostd's sentinel-lift dropped them: they never reached `get_status`
+   * or the narration card, so the operator — who has no host shell on the
+   * managed path — could not see what the roll flagged. Lifted here so the
+   * structured status and the terminal card both surface them.
+   */
+  warnings?: string[];
   /** Actual version detected on failed_agent (null = unreachable). BONUS #2458 got-field gap. */
   got?: string | null;
   /**
@@ -4307,6 +4317,13 @@ export class HostdServer {
           if (parsed.drifted && parsed.drifted.length > 0) {
             entry.drifted = parsed.drifted;
           }
+          // #3944 — the roll's non-fatal warnings. `encodeRolloutResultLine`
+          // puts them on the wire (`warnings: result.warnings`) but this lift
+          // used to skip them, so they never reached get_status or the
+          // narration card. Surface them alongside the other structured fields.
+          if (parsed.warnings && parsed.warnings.length > 0) {
+            entry.warnings = parsed.warnings;
+          }
           // BONUS (#2458 got-field gap): the sentinel carries `got` (the
           // actual version detected on the failed agent, or null when
           // unreachable). Preserve it so get_status readers can surface the
@@ -4679,6 +4696,10 @@ export class HostdServer {
         ...(entry.drifted && entry.drifted.length > 0
           ? { drifted: entry.drifted }
           : {}),
+        // #3944 — surface the roll's non-fatal warnings on the terminal card.
+        ...(entry.warnings && entry.warnings.length > 0
+          ? { warnings: entry.warnings }
+          : {}),
       });
       this.opts.rolloutRelay.postTerminal({
         requestId: entry.request_id,
@@ -4824,6 +4845,11 @@ export class HostdServer {
       (entry.rolled !== undefined ||
         entry.failed_step !== undefined ||
         entry.failed_agent !== undefined ||
+        // #3944 — a roll can succeed with warnings and NO other structured
+        // field set (all agents rolled, but web/hostd refresh flagged a
+        // non-fatal miss). Emit the payload on warnings alone so those don't
+        // silently vanish from get_status on an otherwise-clean roll.
+        (entry.warnings !== undefined && entry.warnings.length > 0) ||
         // #2726 point 2 — un-blind an IN-FLIGHT rollout too: a live phase (no
         // rolled[]/failed_step yet) is enough to emit a payload so a
         // get_status poll mid-roll shows the current phase, not a bare "started".
@@ -4846,6 +4872,11 @@ export class HostdServer {
             // Telegram `get_status` can name them without a host shell.
             ...(entry.drifted && entry.drifted.length > 0
               ? { drifted: entry.drifted }
+              : {}),
+            // #3944 — the roll's non-fatal warnings, surfaced structurally so a
+            // Telegram get_status reader sees them without a host shell.
+            ...(entry.warnings && entry.warnings.length > 0
+              ? { warnings: entry.warnings }
               : {}),
             ...(entry.pin ? { pin: entry.pin } : {}),
             // Prior-pin (#2492) surfaced structurally too, so a rollback-aware
