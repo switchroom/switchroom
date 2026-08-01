@@ -2,6 +2,96 @@
 
 ## Unreleased
 
+## v0.19.42 — Memory-system reliability: config single-sourcing, honest health gauges, and total-loss self-heal
+
+Seventeen fixes, most of them in the hindsight memory stack. The theme is
+trust in the instruments: config knobs that looked accepted but did nothing,
+health gauges that read green through real loss, and a backfill mode that
+could silently strand a partially-recovered session are all closed this
+release. A recall/retain hygiene batch pays down guard-rail debt in the
+vendored hindsight fork before further work builds on it, and a handful of
+infra/vault/gateway fixes round out the cut.
+
+### Memory config becomes single-sourced (#4072, #4073, #4080, #4084, #4086)
+
+Several memory knobs in `switchroom.yaml` looked accepted but had zero
+effect, because the scaffold and the config schema each carried their own
+partial view of the cascade. `auto_recall`, retain cadence, and
+`observation_scopes`/`observation_scope_strategy` now resolve through one
+cascade end to end — including for `docker exec`'d backfill/consolidation
+processes that never see `start.sh`'s env export, closing a silent
+wrong-scope retain path. `switchroom doctor` gains a new `memory config keys`
+row that WARNs on an unknown or removed memory key instead of the schema
+silently stripping it — `memory.recall.min_overlap`, deleted in #3761, is the
+live example of a knob that parsed clean and did nothing. A new
+`schema.mirror-parity.test.ts` shape-diffs every per-agent memory field
+against its defaults/profile-tier mirror and fails CI the moment a future
+field goes unmirrored, and the GLOBAL `hindsight.llm` object now carries
+`base_url`/`api_key` alongside the per-op schema. A new `memory.profile`
+field lets an agent opt its memory bank into a curated bundle (disposition +
+observations mission) independently of its `extends` persona profile.
+
+### Hindsight fork hygiene and shim guard-rails (#4082, #4079)
+
+A batch of guard-rail fixes to the vendored hindsight hook scripts before
+further tokenizer/gate work builds on top: the recall query shaper no longer
+drops single-character subjects, the transcript-fallback tokenizer now
+carries digits (issue numbers, ports, versions), and the sidechain retain
+gate counts the same text the payload actually keeps instead of a metric a
+tool-heavy fork can dodge. Separately, the switchroom MCP shim was forwarding
+the engine's fat recall/reflect defaults verbatim — a bare `mcp__hindsight__recall`
+call could return ~80KB and blow Claude Code's MCP output cap, so agent-invoked
+recall silently never landed in context. The shim now clamps bare calls to a
+low budget and rejects unknown arguments (like a guessed `limit`) loudly
+instead of dropping them and reporting success.
+
+### Health instruments stop lying (#4081, #4076, #4083, #4085)
+
+The doctor and hindsight-watch layers measured proxies that mislabeled the
+states they exist to catch. The consolidation backlog row summed the async
+task queue instead of `pending_consolidation`, so it read a healthy ~5 while
+44k memory units actually sat unconsolidated during the July reconsolidation
+drain — it now reports the real memory-scale backlog separately from the op
+queue. `consolidation-queue-age` no longer reads an empty pending set as
+healthy when the failure path is what emptied it. The wedge probe in
+`hindsight-maintenance.sh` no longer fires false alerts on a healthy
+`batch_retain` parent row that was never claimable to begin with, and 770
+dead-lettered retains from a since-diagnosed FK race are now surfaced and,
+opt-in, recoverable through the engine's own retry endpoint. The human-facing
+recall-log view now shows the own/additional bank composition split so an
+agent that has silently stopped seeing its own bank shows up as a painted-red
+`own=0` row instead of a healthy-looking volume stat.
+
+### Backfill self-heals total-loss sessions (#4074, #4077)
+
+`backfill_transcripts.py --from-logs` could strand a partially-committed
+total-loss session forever: one transient POST failure mid-session left a
+committed prefix that the next run's membership check read as "present" and
+skipped for good. Slice posting now retries in place, and a re-run of a
+previously-failed session gap-completes — probing per-slice presence and
+posting only what's still missing, converging strictly with each run. A
+persistently non-converging session (one that keeps failing to land) is now
+impossible to miss: a new `sessions_incomplete` metric and a per-agent
+CONVERGENCE line in the operator report name the stuck session and the exact
+re-run command.
+
+### Infra, vault, and gateway fixes (#4075, #4070, #4067, #4078)
+
+`docker-socket-proxy` crash-looped on boot because its read-only rootfs had
+no writable `/tmp` for the entrypoint to render `haproxy.cfg` into — it now
+gets a `/tmp` tmpfs mount alongside the existing `/run` one. A zod union
+ordering bug in the vault broker's response schema silently stripped
+`decision_id` from every approval-consume-record reply, so every operator
+Approve tap toasted a false "kernel record failed" even though the decision
+was durably committed — the union is reordered with a load-bearing comment
+against a regression. The gateway's 300s silence-fallback only reset one of
+its two "turn in flight" states, so a turn parked behind a hung `claude` REPL
+could latch the busy gate permanently until a manual restart; the fallback
+now drains parked turn-starts scoped to the affected chat. And scaffold-time
+model alias resolution now expands from the same shared table the gateway's
+`/model` command uses, so a config `model: opus48` no longer reaches
+`claude --model` unexpanded and 4xxs.
+
 ## v0.19.41 — Three operator-facing reliability fixes: the rollout card survives a self-bump, no more false stall/no-op cards, and checklists degrade instead of 400ing
 
 Three fixes an operator feels directly. A fleet rollout that self-bumps hostd
