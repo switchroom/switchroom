@@ -67,6 +67,7 @@ import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runWebkiteChecks } from "./doctor-webkite.js";
+import { runCascadeChecks } from "./doctor-cascade.js";
 import { runOpenRouterCreditChecks, usesOpenRouter } from "./doctor-openrouter-credit.js";
 import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runFloodPressureChecks } from "./doctor-flood-pressure.js";
@@ -4188,6 +4189,7 @@ export function registerDoctorCommand(program: Command): void {
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
           { title: "Webkite", results: runWebkiteChecks(config) },
+          { title: "Prompt cascade", results: runCascadeChecks(config) },
           {
             // Proactive half of the OpenRouter credit work (#3868 is the
             // reactive half). NOTE: this reports WARN — not a green tick —

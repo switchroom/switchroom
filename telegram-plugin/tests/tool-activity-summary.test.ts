@@ -14,7 +14,13 @@ import {
   STEP_TIMER_MIN_MS,
   type SessionActivityHeader,
 } from "../tool-activity-summary.js";
-import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from "../status-no-truncate.js";
+import { STATUS_ROLLING_LINES, STATUS_LINE_MAX, NESTED_PREFIX } from "../status-no-truncate.js";
+
+// The nested (foreground sub-agent) child-block indent. Asserted through the
+// constant, never as a literal: #3668 replaced its ASCII spaces with U+2800
+// (Telegram left-trims a leading ASCII/Zs run off a content line), and a test
+// that hardcodes the bytes pins the defect instead of the behaviour.
+const NP = NESTED_PREFIX;
 import { COLLAPSE_SAFE_SEPARATOR } from "../card-format.js";
 
 /** The pinned-card collapse separator (#3666) every status-card line now
@@ -352,29 +358,29 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     expect(out).toContain("~~_✓ Delegating: review the migration_~~");
     expect(out).not.toContain("**→ Delegating");
     // The live → step is the newest nested child line; earlier child = italic.
-    expect(out).toContain("   ↳ ~~_Reading schema.ts_~~");
-    expect(out).toContain("   ↳ **→ Looking for foreign keys**");
+    expect(out).toContain(NP + "~~_Reading schema.ts_~~");
+    expect(out).toContain(NP + "**→ Looking for foreign keys**");
   });
 
   it("windows the nested block to STATUS_ROLLING_LINES with a '↳ +N earlier…' header", () => {
     const total = STATUS_ROLLING_LINES + 3;
     const child = Array.from({ length: total }, (_, i) => `step ${i + 1}`);
     const out = renderActivityFeedWithNested(["Delegating: x"], child)!;
-    expect(out).toContain(`   ↳ _+${total - STATUS_ROLLING_LINES} earlier…_`);
+    expect(out).toContain(`${NP}_+${total - STATUS_ROLLING_LINES} earlier…_`);
     // newest nested line is the live → step
-    expect(out).toContain(`   ↳ **→ step ${total}**`);
+    expect(out).toContain(`${NP}**→ step ${total}**`);
     // the oldest (collapsed) lines are not rendered verbatim
     expect(out).not.toContain("step 1<");
   });
 
   it("renders the child block even when the parent feed is empty", () => {
     const out = renderActivityFeedWithNested([], ["Reading a.ts"]);
-    expect(out).toBe("   ↳ **→ Reading a.ts**");
+    expect(out).toBe(NP + "**→ Reading a.ts**");
   });
 
   it("markdown-escapes nested child text (emphasis specials only)", () => {
     const out = renderActivityFeedWithNested(["Delegating: x"], ["touch a_b & 2 * 3"])!;
-    expect(out).toContain("   ↳ **→ touch a\\_b & 2 \\* 3**");
+    expect(out).toContain(NP + "**→ touch a\\_b & 2 \\* 3**");
   });
 
   it("final=true: the nested newest step renders done (✓), not in-progress (→)", () => {
@@ -383,7 +389,7 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
       ["Reading schema.ts", "Looking for foreign keys"],
       true,
     )!;
-    expect(out).toContain("   ↳ ~~_Looking for foreign keys_~~"); // newest now struck italic done
+    expect(out).toContain(NP + "~~_Looking for foreign keys_~~"); // newest now struck italic done
     expect(out).not.toContain("→"); // no in-progress arrow in the finalized feed
   });
 
@@ -400,7 +406,7 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
       false,
       " · 22s",
     )!;
-    expect(out).toContain("   ↳ **→ Looking for foreign keys · 22s**");
+    expect(out).toContain(NP + "**→ Looking for foreign keys · 22s**");
     expect(out).not.toContain("Reading schema.ts · "); // only the newest line ticks
   });
 
@@ -567,7 +573,7 @@ describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
       expect(out).not.toContain(`Parent ${i}`);
     }
     expect(out).toContain(`_✓ +${totalParent - STATUS_ROLLING_LINES} earlier…_`);
-    expect(out).toContain("   ↳ **→ Child step B**");
+    expect(out).toContain(NP + "**→ Child step B**");
   });
 
   it("many child lines → only the last STATUS_ROLLING_LINES child lines render with a ↳ +N earlier header", () => {
@@ -582,8 +588,8 @@ describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`Child ${i}`);
     }
-    expect(out).toContain(`   ↳ _+${totalChild - STATUS_ROLLING_LINES} earlier…_`);
-    expect(out).toContain(`   ↳ **→ Child ${totalChild}**`);
+    expect(out).toContain(`${NP}_+${totalChild - STATUS_ROLLING_LINES} earlier…_`);
+    expect(out).toContain(`${NP}**→ Child ${totalChild}**`);
   });
 
   it("STATUS_LINE_MAX=200: a 250-char child line is clipped to 200 (both surfaces)", () => {
@@ -600,7 +606,7 @@ describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
     const child = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
     const out = renderActivityFeedWithNested(parent, child)!;
     expect(out.length).toBeLessThanOrEqual(4096);
-    expect(out).toContain("   ↳ ");
+    expect(out).toContain(NP);
   });
 });
 
@@ -678,11 +684,11 @@ describe("extreme-edge: single oversized line with markdown specials & && _ *", 
     expect(out.length).toBeLessThanOrEqual(4000);
     expect(isValidMarkdown(out)).toBe(true);
     // Must contain the nested prefix.
-    expect(out).toContain("   ↳ ");
+    expect(out).toContain(NP);
     // Regression guard: an operator-precedence bug made wrapperOverhead a string
     // (NESTED_PREFIX + n) → NaN budget → slice(0, NaN) === "" → the child content
-    // was silently discarded, leaving only "   ↳ **→ **". The empty-wrapper
-    // output still satisfies the toContain("   ↳ ") check above, so assert that
+    // was silently discarded, leaving only `${NESTED_PREFIX}**→ **`. The empty-wrapper
+    // output still satisfies the toContain(NP) check above, so assert that
     // real child content actually survives.
     expect(out).toContain("Child step");
     expect(out.length).toBeGreaterThan(100);
@@ -1025,7 +1031,7 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     // Parent step is done-styled (child is the live step).
     expect(out).toContain("~~_✓ Delegating: review_~~");
     // Child step is the in-progress step.
-    expect(out).toContain("   ↳ **→ Reading schema.ts**");
+    expect(out).toContain(NP + "**→ Reading schema.ts**");
   });
 });
 

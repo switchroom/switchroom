@@ -389,13 +389,14 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
    *                          an already-escaped markdown escape is never sliced.
    */
   const deepest = Math.max(1, escapedBody.length)
+  /** The collapsed parent trail, kept at every shrink level below level 0. */
+  const markerSection: CardSection = {
+    steps: [],
+    window: 1,
+    placeholder: parentMarker ?? undefined,
+  }
   return fitCardToBudget((level) => {
     if (level === 0) return { spec: fullSpec() }
-    const markerSection: CardSection = {
-      steps: [],
-      window: 1,
-      placeholder: parentMarker ?? undefined,
-    }
     if (level < escapedBody.length) {
       return {
         spec: {
@@ -427,37 +428,64 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
     }
   }, deepest)
 
+  /** The deepest shrink level's spec, for a given already-wrapped body line. */
+  function deepestSpec(bodyLine: string): CardSpec {
+    return {
+      chrome,
+      sections: [markerSection, { steps: [], window: 1, placeholder: bodyLine }],
+      footer,
+    }
+  }
+
+  /** Wrap an ALREADY-ESCAPED newest step in its bullet chrome. */
+  function wrapNewest(escaped: string): string {
+    return final
+      ? `${bodyIndent}_✓ ${escaped}_`
+      : `${bodyIndent}**→ ${escaped}${liveSuffix}**`
+  }
+
   /**
-   * The deepest shrink level's single bullet. Charges the fixed header/footer
-   * (and the parent marker) against `STATUS_CARD_CHAR_BUDGET`, then clips the
-   * RAW newest text to what is left, re-checking after escaping because
-   * escaping can expand the string (`&` → `&amp;`).
+   * The deepest shrink level's single bullet: clip the RAW newest text to
+   * whatever the fixed chrome/footer leaves of `STATUS_CARD_CHAR_BUDGET`,
+   * escape, then re-measure — escaping can expand the string (`&` → `&amp;`).
+   *
+   * Everything is measured by RENDERING the level's real spec (#3833). The
+   * previous arithmetic estimate charged `[...chrome, ...footer].join('\n')`,
+   * but the renderer is `stackCard`, which emits a collapse separator plus a
+   * two-space GFM hard break at every line boundary — 4 chars, not 1 — and it
+   * also charges the marker line and the section boundaries the estimate only
+   * partly counted. That under-count let a card render OVER the wire budget.
+   * Measuring with the renderer cannot drift from it by construction.
    */
   function truncatedNewestLine(): string {
-    const fixedCost = [...chrome, ...footer].join('\n').length
     const rawNewest = rawBody.length > 0 ? cleanStepLine(rawBody[rawBody.length - 1]) : ''
-    const wrapperOverhead = final
-      ? (bodyIndent + '_✓ _').length
-      : (bodyIndent + '**→ **').length + liveSuffix.length
-    const headerFooterCost =
-      fixedCost +
-      (fixedCost > 0 ? 1 : 0) +
-      (parentMarker != null ? parentMarker.length + 1 : 0)
-    const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
-    let raw = rawNewest.slice(0, Math.max(0, budget))
-    let newest = escapeMarkdown(raw)
-    while (
-      raw.length > 0 &&
-      wrapperOverhead + headerFooterCost + newest.length > STATUS_CARD_CHAR_BUDGET
-    ) {
-      const excess = wrapperOverhead + headerFooterCost + newest.length - STATUS_CARD_CHAR_BUDGET
-      raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
-      newest = escapeMarkdown(raw)
+    const empty = wrapNewest('')
+    const fixedCost = renderCardSpec(deepestSpec(empty)).length
+    const budget = STATUS_CARD_CHAR_BUDGET - fixedCost
+    // Chrome alone is over budget (a 40k-char worker description, #3682). No
+    // amount of body clipping helps; `fitCardToBudget`'s hard-truncate backstop
+    // is what keeps the card under the wire limit in that case.
+    if (budget <= 0) return empty
+    let raw = clipRaw(rawNewest, budget)
+    let line = wrapNewest(escapeMarkdown(raw))
+    for (;;) {
+      const excess = renderCardSpec(deepestSpec(line)).length - STATUS_CARD_CHAR_BUDGET
+      if (excess <= 0 || raw.length === 0) return line
+      // Dropping k RAW chars drops at least k escaped chars (escaping never
+      // shrinks), so this strictly converges.
+      raw = clipRaw(raw, Math.max(0, raw.length - excess))
+      line = wrapNewest(escapeMarkdown(raw))
     }
-    return final
-      ? `${bodyIndent}_✓ ${newest}_`
-      : `${bodyIndent}**→ ${newest}${liveSuffix}**`
   }
+}
+
+/**
+ * Slice raw (pre-escape) text to `n` chars without leaving a dangling lone
+ * high surrogate — an unpaired surrogate is invalid UTF-16 on the wire.
+ */
+function clipRaw(text: string, n: number): string {
+  const out = text.slice(0, Math.max(0, n))
+  return /[\uD800-\uDBFF]$/.test(out) ? out.slice(0, -1) : out
 }
 
 /** Subtle horizontal rule between the running feed and the finished result. */

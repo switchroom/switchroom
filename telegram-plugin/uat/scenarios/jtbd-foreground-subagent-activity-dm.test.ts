@@ -51,8 +51,9 @@ const FG_DISPATCH_PROMPT =
   `one-line summary." Wait for the foreground sub-agent to finish, then send ` +
   `me a brief reply telling me it's done.`;
 
-// The nested foreground block renders each child line prefixed with "↳"
-// (NESTED_PREFIX = "   ↳ "), newest as a bold "→ …" current step. Telegram
+// The nested foreground block renders each child line prefixed with a three
+// U+2800 indent then "↳" (NESTED_PREFIX; #3668 replaced the old ASCII spaces,
+// which Telegram left-trims), newest as a bold "→ …" current step. Telegram
 // strips the bold but keeps the literal ↳ / → glyphs in message text.
 const NESTED_RE = /↳/;
 

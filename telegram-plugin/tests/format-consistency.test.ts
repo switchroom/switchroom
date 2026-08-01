@@ -397,20 +397,100 @@ describe('stripExcessBold', () => {
     expect(stripExcessBold(input)).toBe(input)
   })
 
-  test('48/49-char pseudo-heading boundary honoured under global strip', () => {
-    // Heading length is measured WITH the `**` markers. 44 inner chars → 48
-    // total (exempt); 45 inner chars → 49 total (stripped).
-    const heading48 = '**' + 'H'.repeat(44) + '**' // length 48
-    const heading49 = '**' + 'H'.repeat(45) + '**' // length 49
-    expect(heading48.length).toBe(48)
-    expect(heading49.length).toBe(49)
+  test('64/65-char pseudo-heading boundary honoured under global strip', () => {
+    // Heading length is measured WITH the `**` markers. 60 inner chars → 64
+    // total (exempt); 61 inner chars → 65 total (stripped).
+    const heading64 = '**' + 'H'.repeat(60) + '**' // length 64
+    const heading65 = '**' + 'H'.repeat(61) + '**' // length 65
+    expect(heading64.length).toBe(64)
+    expect(heading65.length).toBe(65)
 
-    const out48 = stripExcessBold(`${heading48}\n\n${boldDenseBody}`)
-    expect(out48).toContain(heading48)
+    const out64 = stripExcessBold(`${heading64}\n\n${boldDenseBody}`)
+    expect(out64).toContain(heading64)
 
-    const out49 = stripExcessBold(`${heading49}\n\n${boldDenseBody}`)
-    expect(out49).not.toContain(heading49)
-    expect(out49).toContain('H'.repeat(45))
+    const out65 = stripExcessBold(`${heading65}\n\n${boldDenseBody}`)
+    expect(out65).not.toContain(heading65)
+    expect(out65).toContain('H'.repeat(61))
+  })
+
+  // ── #4021: long-but-legitimate bold section labels survive ───────────────
+  // At PSEUDO_HEADING_MAX_CHARS=48 a real section label of 50-63 chars was
+  // read as an over-bolded paragraph and flattened. The cap is 64.
+
+  test.each([
+    // [label, survives?]
+    ['**Deployment status across all three regions:**', true], // 46
+    ['**Deployment status across all three AWS regions:**', true], // 50
+    ['**What changed in the delivery path since last Tuesday:**', true], // 56
+    ['**What actually changed in the delivery path since Tue:**', true], // 56
+    ['**Everything that changed across the delivery path this week:**', true], // 62
+    ['**Everything that changed across the whole delivery path today:**', false], // 65
+  ])('bold section label %s survives=%s under global strip', (label, survives) => {
+    // Sanity: the fixtures must straddle the 64-char boundary.
+    expect(label.length <= 64).toBe(survives)
+
+    const out = stripExcessBold(`${label}\n\n${boldDenseBody}`)
+    const inner = label.slice(2, -2)
+    if (survives) {
+      expect(out).toContain(label)
+    } else {
+      expect(out).not.toContain(label)
+      expect(out).toContain(inner)
+    }
+    // Either way the body is still flattened — the ratio guard is intact.
+    expect(out).not.toContain('**alpha**')
+  })
+
+  // ── #4017: a message that is ALL pseudo-headings still strips ────────────
+  // Every block exempted meant `out === masked`: a 100%-bold digest stayed
+  // fully bold and onStrip never fired.
+
+  test('all-pseudo-heading message strips (no body to contrast against)', () => {
+    const input = [
+      '**Deploy status**',
+      '**Open incidents**',
+      '**Merged today**',
+      '**Blocked on review**',
+      '**Rollout window tomorrow**',
+      '**Next steps:**',
+    ].join('\n\n')
+    expect(input.length).toBeGreaterThan(100)
+
+    const calls: Array<{ rule: string; ratio: number }> = []
+    const out = stripExcessBold(input, (d) => calls.push(d))
+
+    expect(out).not.toContain('**')
+    expect(out).toContain('Deploy status')
+    expect(out).toContain('Next steps:')
+    // Blank-line gaps between the headings are preserved.
+    expect(out).toBe(input.replace(/\*\*/g, ''))
+    // …and the strip is logged.
+    expect(calls).toHaveLength(1)
+    expect(calls[0].rule).toBe('global')
+    expect(calls[0].ratio).toBeGreaterThan(0.3)
+  })
+
+  test.each([
+    [
+      'all headings, no body → strip',
+      `**Deploy status**\n\n**Open incidents this morning**\n\n**Merged today since the last release**\n\n**Next steps:**`,
+      false,
+    ],
+    [
+      'headings + bold-dense body → headings survive',
+      `**Deploy status**\n\n${boldDenseBody}`,
+      true,
+    ],
+    [
+      'headings around a bold-dense body → headings survive',
+      `**Deploy status**\n\n**Open incidents**\n\n${boldDenseBody}\n\n**Next steps:**`,
+      true,
+    ],
+  ])('all-heading guard: %s', (_name, input, headingSurvives) => {
+    expect(input.length).toBeGreaterThan(100)
+    const out = stripExcessBold(input)
+    expect(out.includes('**Deploy status**')).toBe(headingSurvives)
+    expect(out).toContain('Deploy status')
   })
 
   test('multi-line fully-bolded block is NOT mislabelled a heading (global)', () => {

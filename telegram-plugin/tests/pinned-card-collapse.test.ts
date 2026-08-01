@@ -30,6 +30,7 @@ import {
 import { renderWorkerActivity } from '../worker-activity-feed.js'
 import { stackCardLines, COLLAPSE_SAFE_SEPARATOR as NB } from '../card-format.js'
 import {
+  NESTED_PREFIX,
   STATUS_CARD_CHAR_BUDGET,
   STATUS_LINE_MAX,
   WORKER_STEP_INDENT,
@@ -49,10 +50,9 @@ import {
  *     indent on the assumption that only ASCII was stripped, and a live phone
  *     check on 2026-07-26 proved otherwise — the card rendered flat. Modelling
  *     this is what makes the nested-card assertion below DISCRIMINATING instead
- *     of vacuous: `NESTED_PREFIX` is three ASCII spaces (#3668, still open), so
- *     it cannot hold a collapsed seam apart — only the separator can.
- *     `WORKER_STEP_INDENT` is now U+2800 (category So, not whitespace at all),
- *     which survives this strip.
+ *     of vacuous. Both card indents — `WORKER_STEP_INDENT` and, since #3668,
+ *     `NESTED_PREFIX` — are U+2800 runs (category So, not whitespace at all),
+ *     so they survive this strip; anything ASCII or Zs would not.
  *   - the newline itself is dropped with no substitute (this is the defect)
  */
 function previewLines(body: string): string[] {
@@ -226,11 +226,13 @@ describe('single-worker / agent status card survives the collapse too (#3666)', 
     expect(collapsed).toContain(`0 tools${NB}starting`)
   })
 
-  it('the nested child block stays separated even though its indent is ASCII (#3668)', () => {
-    // NESTED_PREFIX is three ASCII SPACES, which Telegram's parser drops (see
-    // previewLines), so on this surface the collapse separator is the ONLY
-    // thing holding the parent->child seam apart. Unlike the combined card,
-    // there is no U+2800 indent to mask a regression here.
+  it('the nested child block stays separated AND keeps its indent through the collapse (#3668)', () => {
+    // Two distinct guarantees on one line, both load-bearing:
+    //   1. the collapse separator holds the parent->child seam apart, and
+    //   2. NESTED_PREFIX's U+2800 run SURVIVES `previewLines`' whitespace strip
+    //      — which is exactly what the three ASCII spaces it replaced did not
+    //      do. Before #3668 the child line collapsed to a bare `↳ …` with no
+    //      indent, on the pin bar and in the feed alike.
     const body = renderActivityFeedWithNested(
       ['Reading gateway.ts'],
       ['Searching memory', 'Running tests'],
@@ -238,7 +240,7 @@ describe('single-worker / agent status card survives the collapse too (#3666)', 
     expectNoMashedSeams(body)
     const collapsed = collapsePreview(body)
     expect(collapsed).not.toContain('gateway.ts↳')
-    expect(collapsed).toContain(`gateway.ts${NB}↳`)
+    expect(collapsed).toContain(`gateway.ts${NB}${NESTED_PREFIX}`)
   })
 
   it('the char-budget backstop keeps the separator on every line it emits', () => {
