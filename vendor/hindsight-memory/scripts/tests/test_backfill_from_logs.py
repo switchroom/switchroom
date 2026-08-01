@@ -58,11 +58,21 @@ class FakeDaemon:
         self.max_inflight_seen = 0
         self._inflight = 0
         self.membership_error = False
+        # #3291 partial-failure simulation: raise on the retain of the Nth
+        # DISTINCT document_id seen (distinct index, POST order = slice order),
+        # so a slice fails persistently (all bounded retries) without a fixed id.
+        self.fail_distinct_indices = set()
+        self._seen_doc_order = []
 
     def retain(self, bank_id, content, document_id="conversation", context=None,
                metadata=None, tags=None, timeout=15, async_processing=True,
                observation_scopes=None):
         self.observation_scopes_seen.append(observation_scopes)
+        if document_id not in self._seen_doc_order:
+            self._seen_doc_order.append(document_id)
+        distinct_idx = self._seen_doc_order.index(document_id)
+        if distinct_idx in self.fail_distinct_indices:
+            raise RuntimeError(f"simulated POST failure for slice #{distinct_idx}")
         self._inflight += 1
         self.max_inflight_seen = max(self.max_inflight_seen, self._inflight)
         try:
@@ -78,6 +88,12 @@ class FakeDaemon:
             raise RuntimeError("simulated daemon membership failure")
         return {did for did, d in self.docs.items()
                 if d.get("bank_id") == bank_id and session_id in did}
+
+    def document_exists(self, bank_id, document_id, timeout=30):
+        """Tri-state presence check (mirrors HindsightClient.document_exists):
+        True when the slice doc is durable, False on a confirmed miss."""
+        d = self.docs.get(document_id)
+        return bool(d is not None and d.get("bank_id") == bank_id)
 
 
 def _write_registry(path, rows, with_session_id=False):
@@ -166,6 +182,7 @@ class FromLogsTestBase(unittest.TestCase):
         self._patches = [
             mock.patch.object(HindsightClient, "retain", self._fake_retain),
             mock.patch.object(HindsightClient, "list_session_document_ids", self._fake_membership),
+            mock.patch.object(HindsightClient, "document_exists", self._fake_doc_exists),
             mock.patch("backfill_transcripts.get_api_url", return_value="http://fake"),
             mock.patch("backfill_transcripts._SLEEP", self._fake_sleep),
         ]
@@ -177,6 +194,9 @@ class FromLogsTestBase(unittest.TestCase):
 
     def _fake_membership(self, *a, **kw):
         return self.daemon.list_session_document_ids(*a, **kw)
+
+    def _fake_doc_exists(self, *a, **kw):
+        return self.daemon.document_exists(*a, **kw)
 
     def _fake_sleep(self, secs):
         self.sleeps.append(secs)
@@ -447,6 +467,68 @@ class TestFromLogs(FromLogsTestBase):
         # 1 membership GET + 3 POSTs = 4 paced ops → 3 inter-op 1.5s gaps.
         spaced = [s for s in self.sleeps if abs(s - 1.5) < 1e-9]
         self.assertEqual(len(spaced), 3)
+
+    # --- #3291: partial POST failure then re-run must GAP-COMPLETE, not skip --
+    #     Run 1: slices 0..k-1 commit (async_processing=False ⇒ durable), slice k
+    #     fails ⇒ session recorded ``failed``. Run 2 (the fix): the committed
+    #     prefix must NOT classify the session ``present`` and skip it forever —
+    #     it must recompute the deterministic slice ids and POST ONLY the missing
+    #     slice(s). Pre-fix behaviour: run 2 sees the prefix via session
+    #     membership → ``has_documents`` → skip → the tail is lost silently. -----
+    def test_partial_post_failure_then_rerun_gap_completes(self):
+        self._write_yaml({"clerk": None})
+        self._write_settings("clerk", "clerk")
+        base = 1_700_000_000_000
+        # 3 human turns, slice_turns=1 ⇒ 3 non-overlapping slices posted in order.
+        path, (first, last) = self._transcript("clerk", "sess-partial", 3, base)
+        self._registry("clerk", [{
+            "turn_key": "123:_:t", "chat_id": "123", "started_at": str(first + 100),
+            "ended_at": str(last), "ended_via": "sigterm",
+        }])
+
+        # RUN 1 — the LAST slice (distinct index 2) fails every (bounded) attempt.
+        self.daemon.fail_distinct_indices = {2}
+        report1 = self._run("clerk")
+        ar1 = report1["agents"]["clerk"]
+
+        # Total-loss restore attempted all 3 slices; 2 committed, 1 failed.
+        self.assertEqual(ar1["sessions_total_loss"], 1)
+        self.assertEqual(ar1["sessions_restored"], 0)   # NOT fully restored
+        self.assertEqual(ar1["posts_ok"], 2)
+        self.assertEqual(ar1["posts_failed"], 1)
+        entry1 = next(s for s in ar1["sessions"] if s["class"] == "total_loss")
+        all_ids = entry1["document_ids"]
+        self.assertEqual(len(all_ids), 3)
+        committed_after_1 = set(self.daemon.docs)
+        self.assertEqual(len(committed_after_1), 2)     # durable committed prefix
+        missing = [d for d in all_ids if d not in committed_after_1]
+        self.assertEqual(len(missing), 1)
+        # Progress marked failed (NOT done) — the re-run must revisit it.
+        with open(os.environ["HINDSIGHT_BACKFILL_PROGRESS"]) as f:
+            prog = json.load(f)
+        self.assertEqual(prog["clerk/sess-partial"]["status"], "failed")
+
+        # RUN 2 — no injected failure this time. The fix must gap-complete.
+        self.daemon.fail_distinct_indices = set()
+        posts_before = len(self.daemon.posts)
+        report2 = self._run("clerk")
+        ar2 = report2["agents"]["clerk"]
+
+        # It must NOT be skipped as an already-present session.
+        self.assertEqual(ar2["sessions_has_documents"], 0)
+        # Gap completion: exactly the missing slice posted, the 2 present skipped.
+        self.assertEqual(ar2["sessions_gap_completed"], 1)
+        self.assertEqual(ar2["slices_gap_filled"], 1)
+        self.assertEqual(ar2["slices_gap_present"], 2)
+        run2_posts = [did for did, _ in self.daemon.posts[posts_before:]]
+        self.assertEqual(run2_posts, missing)           # ONLY the missing slice
+        # All three slices are now durable — the session is fully recovered.
+        self.assertEqual(set(self.daemon.docs), set(all_ids))
+        with open(os.environ["HINDSIGHT_BACKFILL_PROGRESS"]) as f:
+            prog2 = json.load(f)
+        self.assertEqual(prog2["clerk/sess-partial"]["status"], "done")
+        # Watermark advanced to the true tail slice on completion.
+        self.assertIsNotNone(watermark.load("sess-partial"))
 
     # --- direct session_id join (migrated registry) -------------------------
     def test_direct_sessionid_join(self):
