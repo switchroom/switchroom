@@ -280,10 +280,8 @@ import { REPLY_TOOLS } from '../narrative-dedup.js'
 import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrative-flush.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
-import {
-  createHandbackPreturnSignal,
-  type PreTurnCardRecord,
-} from './handback-preturn-signal.js'
+import { createHandbackPreturnSignal } from './handback-preturn-signal.js'
+import { createHandbackOrphanRecovery } from './handback-orphan-recovery.js'
 import { deriveTurnId } from './derive-turn-id.js'
 import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -13743,8 +13741,6 @@ if (isGatewayMain && !STATIC && FEED_HEARTBEAT_ENABLED) {
 // closes. Kill switch: SWITCHROOM_HANDBACK_PRETURN=0.
 const HANDBACK_PRETURN_ENABLED = !STATIC && process.env.SWITCHROOM_HANDBACK_PRETURN !== '0'
 const HANDBACK_PRETURN_HTML = '🤝 Reading the worker’s results…'
-const HANDBACK_PRETURN_ORPHAN_HTML =
-  '🤝 A background worker finished, but the handback never started — it may need a nudge.'
 
 async function openHandbackPreTurnCard(
   chatId: string,
@@ -13774,24 +13770,20 @@ async function openHandbackPreTurnCard(
   }
 }
 
-function finalizeHandbackPreTurnCard(record: PreTurnCardRecord): Promise<void> {
-  return robustApiCall(
-    () =>
-      bot.api.editMessageText(
-        record.chatId,
-        record.activityMessageId,
-        richMessage(HANDBACK_PRETURN_ORPHAN_HTML),
-        {},
-      ),
-    {
-      chat_id: record.chatId,
-      ...(record.threadId != null ? { threadId: record.threadId } : {}),
-      verb: 'handback-preturn.orphan-finalize',
-    },
-  )
-    .then(() => undefined)
-    .catch(() => undefined)
-}
+// Deterministic recovery for a genuinely-orphaned handback: delete the frozen
+// pre-turn card, re-inject the handback through the pending-inbound buffer, and
+// past the retry cap emit fleet-health telemetry — never an operator-facing
+// "needs a nudge" card. See handback-orphan-recovery.ts.
+const handbackOrphanRecovery = createHandbackOrphanRecovery({
+  deleteMessage: (chatId, messageId, threadId) =>
+    robustApiCall(() => bot.api.deleteMessage(chatId, messageId), {
+      chat_id: chatId,
+      ...(threadId != null ? { threadId } : {}),
+      verb: 'handback-preturn.orphan-delete',
+    }),
+  pushInbound: (inbound) =>
+    pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', inbound),
+})
 
 const handbackPreturnSignal = createHandbackPreturnSignal({
   chatKey: (chatId, threadId) => chatKey(chatId, threadId) as string,
@@ -13799,7 +13791,9 @@ const handbackPreturnSignal = createHandbackPreturnSignal({
   startTypingLoop: (chatId, threadId) => startTurnTypingLoop(chatId, threadId),
   stopTypingLoop: (chatId, threadId) => stopTurnTypingLoop(chatId, threadId),
   openCard: openHandbackPreTurnCard,
-  finalizeCard: finalizeHandbackPreTurnCard,
+  deleteCard: handbackOrphanRecovery.deleteCard,
+  reinjectHandback: handbackOrphanRecovery.reinjectHandback,
+  escalateOrphan: handbackOrphanRecovery.escalateOrphan,
   writeCardRecord: (record) => {
     if (!activityCardPersistEnabled) return
     writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, record)
