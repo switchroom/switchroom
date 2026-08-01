@@ -59,6 +59,14 @@ import {
 } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { journalExternalDelivery } from './outbox-sweep.js'
+import { sha256Hex } from '../outbox.js'
+// #4141: the ONE shared framing implementation, also used by the outbox sweep
+// and (for the classifier half) the unbundled Stop hooks.
+import {
+  applyReplyThrowFraming,
+  formatReplyThrowFraming,
+  shouldFrameReplyThrow,
+} from '../hooks/audience-classify.mjs'
 import { queueFloodBlockedReply } from './flood-reply-queue.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
@@ -2577,6 +2585,15 @@ export async function deliverCapturedProse(
   text: string
   /** Turn elapsed for the honest "(waited Ns)" apology clause; optional. */
   turnDurationMs?: number
+  /**
+   * #4141 — this turn's reply tool threw, so `text` is prose the model wrote
+   * AFTER its delivery attempt failed, not text it chose to send as the answer.
+   * When `true` the send is prefixed with a one-line provenance banner. This is
+   * the ELECTED-path counterpart of the outbox sweep's framing: on this path
+   * the Stop hook defers to the single-writer election and writes NO outbox
+   * record, so the sweep's framing can never reach the message.
+   */
+  replyToolThrewThisTurn?: boolean
   },
 ): Promise<void> {
   const {
@@ -2586,6 +2603,18 @@ export async function deliverCapturedProse(
   } = deps
   const { chatId, threadId, statusKeyStr, registryKey, originTurnId, text, turnDurationMs } = args
   const now = Date.now()
+  // #4141 — framing is a rendering concern, decided ONCE here and applied only
+  // to the bytes handed to Telegram. Everything keyed on identity (the dedup
+  // check + record below, and the journal's `textSha256`) deliberately keeps
+  // using the RAW `text`, so the label cannot change what counts as "the same
+  // answer" — a later reply-tool retry of the same prose still dedups, and the
+  // exactly-once-among-backstops journal key is unchanged. Same
+  // additive-by-construction property the sweep path has, re-established here
+  // because this path has its own send ladder and its own dedup.
+  const framed = shouldFrameReplyThrow(
+    { replyToolThrewThisTurn: args.replyToolThrewThisTurn },
+    { frameEnabled: process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING !== '0' },
+  )
   // #3228 Finding 1 — the three settlement points (sent / skipped-dedup /
   // failed) all funnel through the pure `settleCapturedProseDelivery` core so
   // the failure posture is deterministic and unit-tested. `outcome` is set on
@@ -2593,7 +2622,7 @@ export async function deliverCapturedProse(
   let outcome: CapturedProseSendOutcome
   const already = outboundDedup.check(chatId, threadId, text, now, registryKey)
   if (already == null) {
-    let out = normalizeParagraphBreaks(repairEscapedWhitespace(text))
+    let out = normalizeParagraphBreaks(repairEscapedWhitespace(framed ? applyReplyThrowFraming(text) : text))
     out = redactOutboundText(out, 'captured_prose')
     const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
     const sentIds: number[] = []
@@ -2640,11 +2669,31 @@ export async function deliverCapturedProse(
       // journal line from this site following a reply-tool line under the same
       // nonce (replyAlreadyDeliveredThisTurn:true) is direct, journal-only
       // proof of a bridge double-send.
-      journalExternalDelivery({ turnNonce: originTurnId, text, tgMessageId: sentIds[sentIds.length - 1], replyAlreadyDeliveredThisTurn: false })
+      journalExternalDelivery({
+        turnNonce: originTurnId,
+        text,
+        tgMessageId: sentIds[sentIds.length - 1],
+        replyAlreadyDeliveredThisTurn: false,
+        // #4141 durable terminal stamp — parity with the sweep's
+        // `DeliveredEntry.framedProvenance`, so "was this labelled?" is
+        // answerable from the journal alone, hours later.
+        ...(framed ? { framedProvenance: 'reply-throw' as const } : {}),
+      })
       process.stderr.write(
         `telegram gateway: captured-prose delivery — sent ${out.length} chars recovered from ` +
           `transcript scan (chat=${chatId} origin=${originTurnId})\n`,
       )
+      if (framed) {
+        process.stderr.write(
+          formatReplyThrowFraming({
+            turnNonce: originTurnId,
+            turnId: originTurnId,
+            chatId,
+            textSha256: sha256Hex(text),
+            source: 'captured-prose-bridge',
+          }),
+        )
+      }
       outcome = 'sent'
     } catch (err) {
       // #3228 Finding 1 — the send threw, so the answer did NOT reach the user.

@@ -119,6 +119,16 @@ function buildNextState(base, decision, retryCount) {
   } else {
     delete next.pendingText
   }
+  // #4141: carry THIS turn's reply-throw signal through to the captured-prose
+  // bridge, which is the delivering machine on the ELECTED path and has no
+  // transcript of its own. Same stale-carryover discipline as `pendingText` /
+  // `turnId`: explicitly DELETED when this turn's scan saw no throw, so a
+  // spread of a prior turn's file can never mislabel a clean turn.
+  if (decision.replyToolThrewThisTurn === true) {
+    next.replyToolThrewThisTurn = true
+  } else {
+    delete next.replyToolThrewThisTurn
+  }
   return next
 }
 
@@ -182,10 +192,29 @@ function classifyCaptureAudience(stateDir, capture) {
   } catch {
     /* unreadable ⇒ null ⇒ 'unknown' ⇒ 'user' (fail-safe toward delivering) */
   }
+  // #4146: with the ledger disabled, obligations are going UNTRACKED and any
+  // file on disk is a leftover, not a fact. Distrust it outright rather than
+  // read a stale empty set as positive proof that nobody is waiting — that is
+  // the one configuration in which the asymmetric default would invert. (The
+  // gateway also unlinks the snapshot at boot in this mode; this is the
+  // reader-side half, covering the window before it does.)
+  // STATIC is the second persistence-off mode (`gateway.ts:1343` gates the same
+  // `onChange` wiring on it at `:2810`), so it must distrust the file for the
+  // same reason. Writer-side cleanup already covers it at boot; this leg covers
+  // the window the writer cannot — an unlink that failed (EACCES) or a gateway
+  // that has not restarted since the mode changed. Honest caveat:
+  // `TELEGRAM_ACCESS_MODE` is supplied by the host, not by this repo, so if it
+  // is not exported into the hook's environment this leg degrades to a no-op and
+  // the writer-side unlink remains the cover. It can only ever move the verdict
+  // toward DELIVER, so a degraded read is never worse than today.
+  const snapshotTrusted =
+    process.env.SWITCHROOM_OBLIGATION_LEDGER !== '0' &&
+    process.env.TELEGRAM_ACCESS_MODE !== 'static'
   return decideCaptureAudience({
     replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
     openInboundObligation: resolveOpenObligation({
       snapshotRaw,
+      snapshotTrusted,
       // Same chat the sweep will route to: the envelope chat when present,
       // else this session's origin chat (`resolveOutboxChat`'s F2 fallback).
       chatId: capture.chatId ?? capture.originChatId ?? null,
@@ -229,6 +258,13 @@ function writeOutboxRecord(stateDir, capture, audience) {
       // sweep's gate never has to infer. `'user'` is byte-for-byte the
       // pre-change behaviour.
       audience: audience === AUDIENCE_INTERNAL ? AUDIENCE_INTERNAL : 'user',
+      // W1-d follow-up (#4141): the RAW structural signal, persisted alongside
+      // the verdict it fed. `audience` collapses it with the obligation state
+      // and loses it; the sweep needs it on its own to decide provenance
+      // framing for the `'user'` records the audience gate deliberately does
+      // not catch (the foreground case). Stamped here because this is the last
+      // point in the pipeline that can still see the transcript.
+      replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
     }
     const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
     writeFileSync(tmpPath, JSON.stringify(record), 'utf8')

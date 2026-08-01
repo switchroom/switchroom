@@ -46,6 +46,7 @@ import {
 import {
   AUDIENCE_INTERNAL,
   formatInternalSuppression,
+  formatReplyThrowFraming,
   resolveRecordAudience,
   shouldSuppressForAudience,
 } from '../hooks/audience-classify.mjs'
@@ -147,6 +148,20 @@ export interface OutboxSweepDeps {
    * becoming a message. Defaults to `log`.
    */
   escalateInternalSuppression?: (line: string) => void
+  /**
+   * W1-d follow-up (#4141) kill switch for the reply-throw provenance banner.
+   * Defaults to `SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING !== '0'` (ON). Same
+   * injected-seam reasoning as {@link audienceGateEnabled}: a module-scope env
+   * read would be captured at import and the revert-check could not run.
+   */
+  provenanceFramingEnabled?: () => boolean
+  /**
+   * W1-d follow-up (#4141) telemetry sink for a FRAMED delivery. Separate from
+   * {@link escalateInternalSuppression} because the two outcomes are different
+   * (withheld vs. delivered-with-provenance) and must be greppable apart.
+   * Defaults to `log`.
+   */
+  logProvenanceFraming?: (line: string) => void
 }
 
 export interface OutboxSweepSummary {
@@ -169,6 +184,12 @@ export interface OutboxSweepSummary {
    * suppressed a leak" is never confused with "we deferred a delivery".
    */
   audienceSuppressed?: number
+  /**
+   * W1-d follow-up (#4141): deliveries this sweep that carried the reply-throw
+   * provenance banner. These ARE counted in `delivered` — framing is a
+   * delivery, not a skip.
+   */
+  provenanceFramed?: number
 }
 
 /**
@@ -222,6 +243,9 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
   const audienceGateEnabled = deps.audienceGateEnabled?.() ??
     process.env.SWITCHROOM_TG_OUTBOX_AUDIENCE_GATE !== '0'
   const escalateInternalSuppression = deps.escalateInternalSuppression ?? log
+  const provenanceFramingEnabled = deps.provenanceFramingEnabled?.() ??
+    process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING !== '0'
+  const logProvenanceFraming = deps.logProvenanceFraming ?? log
 
   for (const record of records) {
     summary.scanned++
@@ -301,6 +325,22 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
       // progress card for this turn (durable shown-ledger). The invariant forbids
       // a second, out-of-process delivery of an ephemeral-shown block.
       shownLedgerHit: isShownBlock(record.turnNonce, record.text, deps.stateDir),
+      // ── W1-d follow-up (#4141): PROVENANCE FRAMING ───────────────────────
+      //
+      // The residual case #4140 deliberately leaves open: the reply tool threw
+      // on a FOREGROUND turn, so the inbound obligation is still OPEN, the
+      // record classifies `'user'`, and the captured trailing prose delivers
+      // presented as if it were the answer.
+      //
+      // We do NOT suppress here, and that is the design, not a compromise.
+      // Someone is provably still waiting; there is no deterministic signal
+      // that separates "working notes" from "the answer re-written as plain
+      // prose after the tool errored" (see `audience-classify.mjs`). Dropping
+      // the text would trade a visible wrong-content failure for an invisible
+      // no-answer one — the exact severity-3 class this whole line of work
+      // exists to prevent. So we state the provenance instead, and the human
+      // (who can tell the difference, unlike any classifier here) decides.
+      provenanceFraming: provenanceFramingEnabled,
     })
 
     if (decision.action !== 'send' && decision.action !== 'send-delayed') {
@@ -376,9 +416,28 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
           // turn) is provable from the journal alone.
           deliverySource: 'sweep',
           replyAlreadyDeliveredThisTurn: record.replyAlreadyDeliveredThisTurn === true,
+          // #4141: the durable terminal stamp for a framed delivery. Written on
+          // the same line as the delivery it describes, so "what did the user
+          // actually see" is answerable from the journal alone after the logs
+          // have rotated.
+          ...(decision.framedProvenance != null
+            ? { framedProvenance: decision.framedProvenance }
+            : {}),
         },
         deps.stateDir,
       )
+      if (decision.framedProvenance != null) {
+        summary.provenanceFramed = (summary.provenanceFramed ?? 0) + 1
+        logProvenanceFraming(
+          formatReplyThrowFraming({
+            turnNonce: record.turnNonce,
+            turnId: turnIdFromNonce(record.turnNonce),
+            chatId: resolvedChat.chatId,
+            textSha256: record.textSha256,
+            source: record.source,
+          }),
+        )
+      }
       // Persist parity (mirrors outbound-send-path.ts + backstop-delivery.ts):
       // record the delivered chunk ids + texts to history so a net-delivered
       // answer is not silently absent from history.db. Best-effort — a missing
@@ -913,6 +972,14 @@ export function journalExternalDelivery(
      * the flush send and its journal write), not just via the in-memory dedup.
      */
     deliverySource?: 'sweep' | 'reply-tool' | 'flush'
+    /**
+     * #4141: this delivery carried the reply-throw provenance banner. Durable
+     * terminal stamp mirroring the sweep's own `DeliveredEntry.framedProvenance`,
+     * so "was the recipient told where this text came from?" is answerable from
+     * the journal alone — on EITHER delivery path (sweep or captured-prose
+     * bridge), hours later.
+     */
+    framedProvenance?: 'reply-throw'
   },
   stateDir?: string,
   now: number = Date.now(),
@@ -922,6 +989,9 @@ export function journalExternalDelivery(
   appendDelivered(
     {
       turnNonce: nonce,
+      // Hashed on the RAW text, deliberately: the banner is presentation, and
+      // the journal key must stay stable across framed/unframed so
+      // exactly-once-among-backstops keeps working (#4141).
       textSha256: sha256Hex(args.text),
       tgMessageId: args.tgMessageId,
       ts: now,
@@ -929,6 +999,7 @@ export function journalExternalDelivery(
       ...(args.replyAlreadyDeliveredThisTurn == null
         ? {}
         : { replyAlreadyDeliveredThisTurn: args.replyAlreadyDeliveredThisTurn }),
+      ...(args.framedProvenance == null ? {} : { framedProvenance: args.framedProvenance }),
     },
     stateDir,
   )
