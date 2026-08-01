@@ -40,6 +40,7 @@
 
 import { Command, Option } from "commander";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   lstatSync,
@@ -215,6 +216,13 @@ function mirrorToConfigRepo(
       }
     };
     walk(liveSkillDir, staging);
+
+    // mkdtempSync creates the staging root at 0700 (untraversable by the
+    // operator), and walk()'s recursive mkdirSync is a mode no-op on the
+    // already-existing root — so without this the mirrored skill dir lands
+    // 0700 and the operator can't `cd`/`git status` into it (#1862). Match
+    // the 0755 the live personal-skill dir uses.
+    chmodSync(staging, 0o755);
 
     if (existsSync(dest)) {
       const prior = join(configSkillsRoot, `.${name}-prior-${Date.now()}`);
@@ -502,6 +510,11 @@ function writePersonalSkill(
   const staging = mkdtempSync(
     join(dirname(targetDir), `.skill-personal-stage-`),
   );
+  // mkdtempSync creates staging at 0700; the personal-skill dir is
+  // documented as mode 0755 (see file header). The nested mkdirSync calls
+  // below only set the mode of directories they create, not this
+  // already-existing root, so chmod it explicitly (#1862).
+  chmodSync(staging, 0o755);
   let oldRename: string | null = null;
   try {
     for (const [path, content] of Object.entries(files)) {

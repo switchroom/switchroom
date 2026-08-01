@@ -157,6 +157,18 @@ describe("initPersonalAction", () => {
     expect(statSync(join(skillDir, "scripts/run.sh")).mode & 0o100).toBe(0o100);
   });
 
+  it("live personal-skill dir is 0755, not the 0700 mkdtemp default (#1862)", () => {
+    const skillFile = join(root, "input.md");
+    writeFileSync(skillFile, validSkillMd("perms"));
+    captureStdout(() => {
+      initPersonalAction("perms", { agent: AGENT, from: skillFile, root });
+    });
+    const skillDir = join(root, AGENT, ".claude/skills/personal-perms");
+    const mode = statSync(skillDir).mode & 0o777;
+    expect(mode & 0o055).toBe(0o055);
+    expect(mode).toBe(0o755);
+  });
+
   it("refuses a duplicate name (init twice)", () => {
     const skillFile = join(root, "input.md");
     writeFileSync(skillFile, validSkillMd("dup"));
@@ -691,6 +703,21 @@ describe("config-repo mirror (versioned personal skills)", () => {
 
     // Live copy also exists (mirror is additive, not redirect).
     expect(existsSync(join(agentsRoot, AGENT, ".claude/skills/personal-mirrored/SKILL.md"))).toBe(true);
+  });
+
+  it("mirrored skill dir is operator-traversable (0755, not the 0700 mkdtemp default) (#1862)", () => {
+    const skillFile = join(agentsRoot, "input.md");
+    writeFileSync(skillFile, validSkillMd("traversable"));
+    captureStdout(() => {
+      initPersonalAction("traversable", { agent: AGENT, from: skillFile, root: agentsRoot });
+    });
+
+    const mirror = join(configDir, "agents", AGENT, "personal-skills", "traversable");
+    const mode = statSync(mirror).mode & 0o777;
+    // Must carry o+rx (and g+rx) — mkdtempSync would leave it 0700, which
+    // the operator can't `cd`/`git status` into. Assert the full 0755.
+    expect(mode & 0o055).toBe(0o055);
+    expect(mode).toBe(0o755);
   });
 
   it("edit re-mirrors with updated content", () => {

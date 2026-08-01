@@ -212,6 +212,15 @@ describe("writePayload", () => {
     expect(readFileSync(target, "utf-8")).toContain("name: foo");
   });
 
+  it("pool skill dir is 0755, not the 0700 mkdtemp staging default (#1862)", () => {
+    writePayload(poolDir, "foo", { "SKILL.md": validSkillMd("foo") });
+    const mode = statSync(join(poolDir, "foo")).mode & 0o777;
+    // Staging is created via mkdtempSync (0700); without an explicit chmod
+    // the renamed pool dir is untraversable by the operator / other agents.
+    expect(mode & 0o055).toBe(0o055);
+    expect(mode).toBe(0o755);
+  });
+
   it("writes multi-file payload with scripts marked +x", () => {
     writePayload(poolDir, "foo", {
       "SKILL.md": validSkillMd("foo"),
