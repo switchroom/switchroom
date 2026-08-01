@@ -1819,6 +1819,15 @@ export interface PendingRetainsProbeResult {
    * ``switchroom.yaml``.
    */
   cap: number;
+  /**
+   * Count of entries in ``pending-duplicate/`` — redundant, byte-identical
+   * copies that ``collapse_duplicates()`` retired
+   * (``lib/pending.py:archive_duplicate``) because the same entry was already
+   * queued. NOT loss: the surviving copy stays queued. Reported as an
+   * informational note (never a fail) so a large collapse pass reads as a
+   * queue that shrank WITH a cause, not as unexplained loss (#3896).
+   */
+  duplicates: number;
 }
 
 /**
@@ -1888,7 +1897,7 @@ export function buildPendingRetainsProbeScript(
     .toISOString()
     .replace(/\.\d+Z$/, "Z");
   return (
-    `P=0; D=0; X=0; E=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
+    `P=0; D=0; X=0; E=0; Q=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
     `if [ -d '${dir}' ]; then ` +
     `P=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json$' || true); ` +
     `D=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json\\.dead$' || true); ` +
@@ -1913,7 +1922,15 @@ export function buildPendingRetainsProbeScript(
     `'${base}/pending-evictions.log' 2>/dev/null || echo 0); ` +
     `[ -n "$E" ] || E=0; ` +
     `fi; ` +
-    `echo "P=$P D=$D X=$X E=$E C=$C"`
+    // `Q` is the collapsed-duplicate archive count — redundant copies
+    // `collapse_duplicates()` retired into the `pending-duplicate/` SIBLING
+    // (`lib/pending.py:duplicate_dir`). Reported as an informational note, not
+    // a fail: the surviving copy stays queued, so a collapse pass that shrinks
+    // the queue is a drain WITH a cause, not loss (#3896).
+    `if [ -d '${base}/pending-duplicate' ]; then ` +
+    `Q=$(ls -1 '${base}/pending-duplicate' 2>/dev/null | grep -c '\\.json$' || true); ` +
+    `fi; ` +
+    `echo "P=$P D=$D X=$X E=$E Q=$Q C=$C"`
   );
 }
 
@@ -1946,6 +1963,7 @@ export function parsePendingRetainsProbeOutput(r: {
     dead: 0,
     dropped: 0,
     evicted: 0,
+    duplicates: 0,
     cap: PENDING_RETAINS_DEFAULT_MAX_ENTRIES,
   };
   if (r.error || r.status !== 0) return unreachable;
@@ -1959,14 +1977,16 @@ export function parsePendingRetainsProbeOutput(r: {
   // the default cap) rather than "unreachable".
   const xm = out.match(/X=(\d+)/);
   const em = out.match(/E=(\d+)/);
+  const qm = out.match(/Q=(\d+)/);
   const cm = out.match(/C=(\d+)/);
   const dropped = xm ? parseInt(xm[1], 10) : 0;
   const evicted = em ? parseInt(em[1], 10) : 0;
+  const duplicates = qm ? parseInt(qm[1], 10) : 0;
   const cap =
     cm && parseInt(cm[1], 10) > 0
       ? parseInt(cm[1], 10)
       : PENDING_RETAINS_DEFAULT_MAX_ENTRIES;
-  const common = { pending, dead, dropped, evicted, cap };
+  const common = { pending, dead, dropped, evicted, duplicates, cap };
   if (dead > 0) return { state: "dead", ...common };
   if (pending > 0) return { state: "backlog", ...common };
   return { state: "ok", ...common };
@@ -2032,6 +2052,7 @@ export function checkPendingRetainsQueues(
   const unreachable: string[] = [];
   const dropped: string[] = [];
   const evicted: string[] = [];
+  const duplicated: string[] = [];
   let okCount = 0;
   for (const [a, r] of results) {
     // Drops and evictions are cumulative and independent of the current
@@ -2039,6 +2060,11 @@ export function checkPendingRetainsQueues(
     // turns, so report them from any state.
     if (r.dropped > 0) dropped.push(`${a} (${r.dropped})`);
     if (r.evicted > 0) evicted.push(`${a} (${r.evicted})`);
+    // Collapsed duplicates are NOT loss — informational only, so they are
+    // collected independently of state and NEVER pushed into a fail/warn
+    // channel (#3896). Appended to whatever row the loss/backlog logic
+    // produces so a shrinking queue reads as an explained drain.
+    if (r.duplicates > 0) duplicated.push(`${a} (${r.duplicates})`);
     if (r.state === "dead") {
       dead.push(
         `${a} (${r.dead} dead${r.pending > 0 ? `, ${r.pending} queued` : ""})`,
@@ -2055,6 +2081,14 @@ export function checkPendingRetainsQueues(
   }
   const skippedNote =
     unreachable.length > 0 ? `; skipped (unreachable): ${unreachable.join(", ")}` : "";
+  // Purely informational: a collapsed duplicate is a redundant copy retired
+  // while the real entry stayed queued, so this note explains a queue that
+  // shrank without any memory being lost. It is appended to every row status
+  // and moves NONE of them (#3896).
+  const dupNote =
+    duplicated.length > 0
+      ? `; collapsed duplicates (not loss): ${duplicated.join(", ")}`
+      : "";
 
   // The SessionStart drain cannot clear a backlog, and in fact CREATES
   // one: it clamps each entry's HTTP timeout to the remaining hook budget
@@ -2180,7 +2214,7 @@ export function checkPendingRetainsQueues(
     return {
       name,
       status: "fail",
-      detail: `${parts.join("; ")}${skippedNote}`,
+      detail: `${parts.join("; ")}${skippedNote}${dupNote}`,
       fix: fixParts.join(" "),
     };
   }
@@ -2198,7 +2232,7 @@ export function checkPendingRetainsQueues(
     return {
       name,
       status: "warn",
-      detail: `${parts.join("; ")}${skippedNote}`,
+      detail: `${parts.join("; ")}${skippedNote}${dupNote}`,
       fix: backlogFix,
     };
   }
@@ -2207,7 +2241,7 @@ export function checkPendingRetainsQueues(
   return {
     name,
     status: "ok",
-    detail: `${okCount}/${agentNames.length} agents: empty (no failed retains)${skippedNote}`,
+    detail: `${okCount}/${agentNames.length} agents: empty (no failed retains)${skippedNote}${dupNote}`,
   };
 }
 

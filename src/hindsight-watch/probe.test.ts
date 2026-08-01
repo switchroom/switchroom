@@ -39,7 +39,7 @@ describe("probeSpool — what counts as a queued entry", () => {
       "4-d-w.json.tmp": "{}",
       "README": "not an entry",
     });
-    expect(probeSpool(dir)).toEqual({ pending: 2, dead: 1, evicted: 0, drops: 0, agents: 1 });
+    expect(probeSpool(dir)).toEqual({ pending: 2, dead: 1, evicted: 0, drops: 0, duplicates: 0, agents: 1 });
   });
 
   it("sums across agents and ignores dirs with no spool at all", () => {
@@ -78,6 +78,23 @@ describe("probeSpool — #3599's loss channels are siblings, not queue entries",
     const s = probeSpool(dir);
     expect(s.dead).toBe(2);
     expect(s.pending).toBe(1); // NOT 3
+  });
+
+  it("counts pending-duplicate/ separately as duplicates, NOT as a loss channel (#3896)", () => {
+    queue("alpha", { "a.json": "{}" });
+    const dup = join(hindsight("alpha"), "pending-duplicate");
+    mkdirSync(dup, { recursive: true });
+    writeFileSync(join(dup, "q1.json"), "{}");
+    writeFileSync(join(dup, "q2.json"), "{}");
+    writeFileSync(join(dup, "q3.json"), "{}");
+    const s = probeSpool(dir);
+    expect(s.duplicates).toBe(3);
+    // The surviving copy stays queued; collapsing must not touch any loss
+    // channel or the live depth.
+    expect(s.pending).toBe(1);
+    expect(s.dead).toBe(0);
+    expect(s.evicted).toBe(0);
+    expect(s.drops).toBe(0);
   });
 
   it("counts dead in BOTH locations while legacy in-queue markers survive", () => {

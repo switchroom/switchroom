@@ -193,6 +193,11 @@ export interface SpoolDepth {
   evicted: number;
   /** summed `count` of every agent's `pending-drops.json` ledger (#3599) */
   drops: number;
+  /**
+   * entries in every agent's `pending-duplicate/` archive (#3896) — redundant
+   * copies retired by `collapse_duplicates()`. NOT loss; see `Sample.duplicates`.
+   */
+  duplicates: number;
   /** agents whose spool dir was readable (for the operator-facing detail) */
   agents: number;
 }
@@ -268,6 +273,7 @@ export function probeSpool(agentsDir: string = resolveAgentsDir()): SpoolDepth {
   let dead = 0;
   let evicted = 0;
   let drops = 0;
+  let duplicates = 0;
   let agents = 0;
   for (const name of names) {
     const hindsightDir = resolve(agentsDir, name, "home", ".hindsight");
@@ -311,9 +317,22 @@ export function probeSpool(agentsDir: string = resolveAgentsDir()): SpoolDepth {
     } catch {
       // Nothing has ever been retired for this agent. Not a fault.
     }
+    // `pending-duplicate/` is the archive `collapse_duplicates()` moves a
+    // redundant, byte-identical entry into (`lib/pending.py:duplicate_dir`) —
+    // another sibling of `pending-retains`, never inside it, so it cannot be
+    // mistaken for a live entry. Counted so a collapse pass reads as an
+    // explained drain rather than as loss (#3896); it is NOT summed into any
+    // loss channel.
+    try {
+      for (const f of readdirSync(resolve(hindsightDir, "pending-duplicate"))) {
+        if (f.endsWith(".json")) duplicates++;
+      }
+    } catch {
+      // Nothing has ever been collapsed for this agent. Not a fault.
+    }
     drops += readDropCount(hindsightDir);
   }
-  return { pending, dead, evicted, drops, agents };
+  return { pending, dead, evicted, drops, duplicates, agents };
 }
 
 export interface ProbeOptions {
@@ -656,6 +675,7 @@ export async function probeOnce(
       dead: spool.dead,
       evicted: spool.evicted,
       drops: spool.drops,
+      duplicates: spool.duplicates,
       restartCount: container.restartCount,
       startedAt: container.startedAt,
       health: container.health,

@@ -645,10 +645,12 @@ export const CONSOLIDATION_AGE_PAGE_S = 12 * 60 * 60;
  * 'processing')` (`probeConsolidationQueue`), and the failing path calls
  * `_mark_operation_failed` immediately — so a failed row leaves that set
  * within milliseconds. `evaluateConsolidationQueueAge` then reads `pending
- * === 0` and returns `state: "ok"`, detail `"consolidation queue empty"`.
- * The measurement is INVERTED: the more reliably a bank fails, the healthier
- * it reads. That is not a threshold set too high; it is a set the evidence
- * cannot enter.
+ * === 0` and returns `state: "ok"` — its detail no longer claims
+ * `"consolidation queue empty"` (that all-clear string was corrected by #3989
+ * to name where failures ARE counted), but the SIGNAL is still structurally
+ * blind here. The measurement is INVERTED: the more reliably a bank fails, the
+ * healthier it reads. That is not a threshold set too high; it is a set the
+ * evidence cannot enter.
  *
  * Live measurements taken on the production host, read-only, 2026-07-29
  * 07:1x UTC (the incident's tail, ~10 min after the corrupt index was

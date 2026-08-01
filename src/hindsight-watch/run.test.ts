@@ -615,10 +615,13 @@ describe("tick — the 2026-07-29 silent consolidation outage", () => {
       nowFn: () => t0,
     });
 
-    // The blind signal, in the same tick, on the same data: still "ok".
+    // The blind signal, in the same tick, on the same data: still "ok" — but
+    // its detail no longer reads as an all-clear (#3989): it names where the
+    // failures it cannot see ARE counted instead of saying "queue empty".
     const age = r.outcomes.find((o) => o.verdict.signal === "consolidation-queue-age")!;
     expect(age.verdict.state).toBe("ok");
-    expect(age.verdict.detail).toContain("consolidation queue empty");
+    expect(age.verdict.detail).not.toContain("consolidation queue empty");
+    expect(age.verdict.detail).toContain("consolidation-failure-streak");
 
     // The new one fires on the FIRST tick — it is an edge signal, because a
     // streak of 3+ is already its own debounce.

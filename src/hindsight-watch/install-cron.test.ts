@@ -8,10 +8,14 @@ import {
   CRON_LOG_PATH,
   CRON_PATH,
   CRON_SCHEDULE,
+  LOGROTATE_PATH,
+  ensureLogFile,
   installCron,
+  installLogrotate,
   parseCronUser,
   reconcileCron,
   renderCron,
+  renderLogrotate,
 } from "./install-cron.js";
 
 /**
@@ -100,6 +104,102 @@ describe("installCron", () => {
     // branch got there.
     expect(installCron({ ...OPTS, path }).status).toBe("installed");
     expect(readFileSync(path, "utf8")).toBe(renderCron(OPTS));
+  });
+});
+
+describe("ensureLogFile — #3991 the redirection target the cron user can append to", () => {
+  // A resolver that never shells out to `id`, so these tests are hermetic and
+  // never actually chown (which would need root and a real uid). We assert the
+  // FILE-creation outcome; the chown target is covered by the resolver call.
+  const resolveIds: () => { uid: number; gid: number } = () => ({ uid: 12345, gid: 12345 });
+
+  it("creates an empty mode-0644 file when absent (so `>>` succeeds without /var/log write)", () => {
+    const path = join(dir, "hindsight-watch.log");
+    const res = ensureLogFile({ user: "kenthompson", path, resolveIds });
+    expect(res.status).toBe("created");
+    expect(res.path).toBe(path);
+    expect(readFileSync(path, "utf8")).toBe("");
+    expect(statSync(path).mode & 0o777).toBe(0o644);
+  });
+
+  it("is idempotent and NEVER truncates an existing log — accumulated ticks survive", () => {
+    const path = join(dir, "hindsight-watch.log");
+    writeFileSync(path, "tick 1\ntick 2\n");
+    const res = ensureLogFile({ user: "kenthompson", path, resolveIds });
+    expect(res.status).toBe("unchanged");
+    // The content is untouched — a truncate here would throw away real history.
+    expect(readFileSync(path, "utf8")).toBe("tick 1\ntick 2\n");
+  });
+
+  it("resolves the cron user's ids exactly once, only on the create path", () => {
+    const path = join(dir, "hindsight-watch.log");
+    let calls = 0;
+    const counting = (u: string) => {
+      calls++;
+      expect(u).toBe("ada");
+      return { uid: 999, gid: 999 };
+    };
+    ensureLogFile({ user: "ada", path, resolveIds: counting });
+    expect(calls).toBe(1);
+    // Second call short-circuits on existsSync before resolving ids.
+    ensureLogFile({ user: "ada", path, resolveIds: counting });
+    expect(calls).toBe(1);
+  });
+});
+
+describe("renderLogrotate — #3992 exact bytes of the drop-in", () => {
+  const out = renderLogrotate({ logPath: "/var/log/hindsight-watch.log", user: "ada" });
+
+  it("uses copytruncate — the only scheme that does not strand the inode for a writer-less log", () => {
+    expect(out).toContain("\n  copytruncate\n");
+  });
+
+  it("rotates as the cron user that owns the file, not root", () => {
+    expect(out).toContain("\n  su ada ada\n");
+  });
+
+  it("bounds retention (weekly / rotate 8) and tolerates a missing/empty log", () => {
+    expect(out).toContain("\n  weekly\n");
+    expect(out).toContain("\n  rotate 8\n");
+    expect(out).toContain("\n  missingok\n");
+    expect(out).toContain("\n  notifempty\n");
+  });
+
+  it("targets the given log path and is a complete stanza ending in a newline", () => {
+    expect(out.startsWith("/var/log/hindsight-watch.log {\n")).toBe(true);
+    expect(out.endsWith("}\n")).toBe(true);
+  });
+});
+
+describe("installLogrotate", () => {
+  const OPTS_LR = { user: "kenthompson", logPath: "/var/log/hindsight-watch.log" };
+
+  it("writes mode 0644 with the rendered content", () => {
+    const path = join(dir, "hindsight-watch");
+    const res = installLogrotate({ ...OPTS_LR, path });
+    expect(res.status).toBe("installed");
+    expect(statSync(path).mode & 0o777).toBe(0o644);
+    expect(readFileSync(path, "utf8")).toBe(renderLogrotate(OPTS_LR));
+  });
+
+  it("is idempotent: a second call reports unchanged", () => {
+    const path = join(dir, "hindsight-watch");
+    expect(installLogrotate({ ...OPTS_LR, path }).status).toBe("installed");
+    expect(installLogrotate({ ...OPTS_LR, path }).status).toBe("unchanged");
+  });
+
+  it("overwrites a stale/foreign drop-in and leaves no .tmp behind", () => {
+    const path = join(dir, "hindsight-watch");
+    writeFileSync(path, "/var/log/other.log { daily }\n");
+    expect(installLogrotate({ ...OPTS_LR, path }).status).toBe("installed");
+    expect(readFileSync(path, "utf8")).toBe(renderLogrotate(OPTS_LR));
+    expect(() => statSync(`${path}.${process.pid}.tmp`)).toThrow();
+  });
+
+  it("defaults to the production LOGROTATE_PATH and CRON_LOG_PATH", () => {
+    const content = renderLogrotate({ logPath: CRON_LOG_PATH, user: "ada" });
+    expect(content).toContain(CRON_LOG_PATH);
+    expect(LOGROTATE_PATH).toBe("/etc/logrotate.d/hindsight-watch");
   });
 });
 
