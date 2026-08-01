@@ -278,9 +278,28 @@ describe("scaffoldAgent", () => {
     const result = scaffoldAgent("effort-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     // #3039: the configured default seeds $_EFFECTIVE_EFFORT; a durable
-    // .session-effort override may replace it at boot.
-    expect(startSh).toContain("_EFFECTIVE_EFFORT='xhigh'");
+    // .session-effort override may replace it at boot. The yaml value is
+    // baked as the LAST-DITCH fallback only — $_EFFECTIVE_EFFORT is resolved
+    // live from switchroom.yaml at boot (see the live-read test below).
+    expect(startSh).toContain("_BAKED_EFFORT='xhigh'");
     expect(startSh).toContain('--effort $_EFFECTIVE_EFFORT');
+  });
+
+  it("start.sh resolves thinking_effort LIVE from switchroom.yaml, not just the bake", () => {
+    // The effort sibling of the model live-read: editing `thinking_effort:`
+    // and restarting must take effect WITHOUT a full `switchroom apply`.
+    // Asserts the outcome that matters — the launcher asks the CLI resolver
+    // against the live mounted config and prefers its answer over the bake.
+    const config = makeAgentConfig({ thinking_effort: "high" });
+    const result = scaffoldAgent("live-effort-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain('agent effective-effort "live-effort-agent"');
+    expect(startSh).toContain('switchroom --config "$SWITCHROOM_CONFIG" agent effective-effort');
+    // Fallback chain: live → last-known-good → bake.
+    expect(startSh).toContain("/.configured-default-effort");
+    expect(startSh).toContain('_EFFECTIVE_EFFORT="$_le_live"');
+    expect(startSh).toContain('_EFFECTIVE_EFFORT="$_LKG_EFFORT"');
+    expect(startSh).toContain('_EFFECTIVE_EFFORT="$_BAKED_EFFORT"');
   });
 
   it("start.sh defaults --effort to 'low' when thinking_effort is not set in yaml", () => {
@@ -291,15 +310,15 @@ describe("scaffoldAgent", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("no-effort-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("_EFFECTIVE_EFFORT='low'");
+    expect(startSh).toContain("_BAKED_EFFORT='low'");
   });
 
   it("start.sh respects an explicit thinking_effort override", () => {
     const config = makeAgentConfig({ thinking_effort: "high" });
     const result = scaffoldAgent("explicit-effort", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("_EFFECTIVE_EFFORT='high'");
-    expect(startSh).not.toContain("_EFFECTIVE_EFFORT='low'");
+    expect(startSh).toContain("_BAKED_EFFORT='high'");
+    expect(startSh).not.toContain("_BAKED_EFFORT='low'");
   });
 
   it("start.sh defaults --model to claude-sonnet-5 when model is not set in yaml", () => {
@@ -363,7 +382,7 @@ describe("scaffoldAgent", () => {
     scaffoldAgent("effort-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
     reconcileAgent("effort-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
     const startSh = readFileSync(join(tmpDir, "effort-reconcile", "start.sh"), "utf-8");
-    expect(startSh).toContain("_EFFECTIVE_EFFORT='medium'");
+    expect(startSh).toContain("_BAKED_EFFORT='medium'");
   });
 
   it("reconcile re-renders start.sh with permission_mode flag", () => {

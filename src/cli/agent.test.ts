@@ -187,6 +187,24 @@ describe("agent effective-model command", () => {
   });
 });
 
+describe("agent effective-effort command", () => {
+  // Same contract as effective-model: start.sh shells this at every boot to
+  // resolve `thinking_effort` live from switchroom.yaml, so an unregistered
+  // verb would drop the whole fleet back to apply-time baked effort silently.
+  function findCommand(): Command | undefined {
+    const program = new Command();
+    registerAgentCommand(program);
+    const agent = program.commands.find((c) => c.name() === "agent")!;
+    return agent.commands.find((c) => c.name() === "effective-effort");
+  }
+
+  it("is registered with a required <name> argument", () => {
+    const cmd = findCommand();
+    expect(cmd).toBeDefined();
+    expect(cmd!.registeredArguments.map((a) => `${a.name()}:${a.required}`)).toEqual(["name:true"]);
+  });
+});
+
 describe("shouldAutoRestartAfterReconcile (--no-restart opt-out, switchroom#3903)", () => {
   // Regression: reconcile declared `--no-restart` but read the flag via
   // `opts.noRestart`, which Commander never sets (it exposes the negated

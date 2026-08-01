@@ -2002,10 +2002,76 @@ esac
 # changed) appends to `.session-model-alert` so the gateway's boot relay
 # tells the operator once.
 #
-# NB: the CONFIGURED default resolution is untouched (#3186 constraint) —
-# the configured `thinking_effort` (see #1978 /
-# src/config/thinking-effort-risk.ts) resolves exactly as before.
-_EFFECTIVE_EFFORT={{#if thinkingEffort}}'{{thinkingEffort}}'{{else}}''{{/if}}
+# --- Live configured-default resolution (effort sibling of the model block) ---
+#
+# The apply-time bake is only the LAST-DITCH fallback: editing
+# `thinking_effort:` in switchroom.yaml and restarting must take effect
+# WITHOUT a full `switchroom apply`, exactly as `model:` already does. Before
+# this, model was live-read and effort was bake-only, so a yaml effort change
+# needed an apply to re-render every start.sh — and the gateway's /effort menu
+# (which derives its configured default from `agent list --json`, i.e. the LIVE
+# yaml) disagreed with what the launcher actually passed to `--effort`.
+#
+# Same resolver as the gateway, asked as a verb (`switchroom agent
+# effective-effort`), never re-implemented in shell. Fallback chain, never
+# silent past step 1:
+#   1. live read of $SWITCHROOM_CONFIG (one bounded retry — a host-side
+#      in-place rewrite can present a torn file for a moment);
+#   2. `.configured-default-effort` — the last-known-good live value this
+#      launcher recorded on every prior boot (read BEFORE it is overwritten);
+#   3. the apply-time bake.
+# Steps 2/3 append to `.session-model-alert` so the gateway tells the operator
+# once at boot. No SWITCHROOM_CONFIG mount at all means there is nothing to
+# read live — the bake IS the truth there (stderr note only).
+#
+# Unlike the model sibling there is no routing class to flip: effort is a pure
+# CLI flag, so a live change is always safe to apply on a bare restart.
+#
+# NB {{thinkingEffort}} renders inside single quotes here (the scaffold does
+# not pre-quote it, unlike modelQ), and an unset value renders as '' — which
+# means "no --effort flag", handled by the $_EFFORT_ARG guard below.
+_BAKED_EFFORT={{#if thinkingEffort}}'{{thinkingEffort}}'{{else}}''{{/if}}
+_LKG_EFFORT="$(cat "{{agentDir}}/.configured-default-effort" 2>/dev/null | tr -d '[:space:]' || true)"
+_EFFECTIVE_EFFORT=""
+if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v switchroom >/dev/null 2>&1; then
+  _le_live=""
+  for _le_try in 1 2; do
+    _le_live="$(timeout 20 switchroom --config "$SWITCHROOM_CONFIG" agent effective-effort "{{name}}" 2>/dev/null | tail -n 1 | tr -d '[:space:]')" || _le_live=""
+    # Allowlist gate — kept in sync with EFFORT_LEVELS in
+    # telegram-plugin/gateway/effort-command.ts, byte-identical to the carrier
+    # gate below. Anything else is treated as a failed read, not a value.
+    if [ -n "$_le_live" ] && printf '%s' "$_le_live" | grep -Eq '^(low|medium|high|xhigh|max)$'; then
+      break
+    fi
+    _le_live=""
+    if [ "$_le_try" -eq 1 ]; then sleep 1; fi
+  done
+  if [ -n "$_le_live" ]; then
+    _EFFECTIVE_EFFORT="$_le_live"
+    if [ "$_le_live" != "$_BAKED_EFFORT" ]; then
+      echo "session-effort: live configured thinking_effort '$_le_live' differs from apply-time bake '${_BAKED_EFFORT:-<unset>}' — using the live value (switchroom.yaml is the source of truth)" >&2
+    fi
+  elif [ -n "$_LKG_EFFORT" ] && printf '%s' "$_LKG_EFFORT" | grep -Eq '^(low|medium|high|xhigh|max)$'; then
+    # Live read failed (torn write mid-read, yaml schema error, CLI wedge).
+    # Last-known-good beats the bake: it was live truth on a prior boot, while
+    # the bake can predate any number of yaml edits. Loud either way.
+    _EFFECTIVE_EFFORT="$_LKG_EFFORT"
+    echo "session-effort: live config read FAILED — using last-known-good configured thinking_effort '$_LKG_EFFORT' (apply-time bake: '${_BAKED_EFFORT:-<unset>}')" >&2
+    printf 'switchroom.yaml could not be read at boot, so the agent booted on the last-known-good configured effort `%s`. If you just changed `thinking_effort:`, check the yaml for errors and restart the agent.\n' "$_LKG_EFFORT" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  else
+    _EFFECTIVE_EFFORT="$_BAKED_EFFORT"
+    echo "session-effort: live config read FAILED and no last-known-good value — using apply-time baked thinking_effort '${_BAKED_EFFORT:-<unset>}'" >&2
+    printf 'switchroom.yaml could not be read at boot and no prior boot recorded an effort, so the agent booted on the apply-time default `%s`. If you just changed `thinking_effort:`, check the yaml for errors and restart the agent.\n' "${_BAKED_EFFORT:-<unset>}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  fi
+  unset _le_live _le_try
+else
+  _EFFECTIVE_EFFORT="$_BAKED_EFFORT"
+fi
+unset _BAKED_EFFORT _LKG_EFFORT
+# Record the RESOLVED configured default every boot, BEFORE the carrier below
+# can override it — this is the last-known-good the fallback chain reads on the
+# NEXT boot, and it must be the configured value, not a session override.
+printf '%s\n' "$_EFFECTIVE_EFFORT" > "{{agentDir}}/.configured-default-effort" 2>/dev/null || true
 if [ -f "{{agentDir}}/.session-effort" ]; then
   _sef="$(cat "{{agentDir}}/.session-effort" 2>/dev/null || true)"
   _se_level="$(printf '%s' "$_sef" | sed -n 's/.*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
