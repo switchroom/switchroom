@@ -235,9 +235,17 @@ export function writeFloodState(
  * classifies it (`src/cli/doctor-flood-pressure.ts`).
  *
  * Recording here rather than at the gateway callsites is deliberate: this is
- * the one function EVERY `onFloodWait` wiring goes through (gateway.ts's two
- * hooks and `shared/bot-runtime.ts`'s `createRobustApiCall`), so no future
- * callsite can record a window without also recording its history.
+ * the one function EVERY `onFloodWait` wiring goes through, so no future
+ * callsite can record a window without also recording its history. The live
+ * wirings are `gateway/gateway.ts:5715` (`robustApiCall`) and `:5849`
+ * (`nonEssentialApiCall`), plus `gateway/outbox-sweep.ts:582` — and
+ * `scripts/check-retry-flood-hooks.mjs` fails the build if a new
+ * `createRetryApiCall` site omits either breaker hook.
+ *
+ * (Until #3863 this docblock also cited `shared/bot-runtime.ts`'s
+ * `createRobustApiCall` as a live wiring. It had zero production callers and
+ * its breaker hooks were OPTIONAL, so it was deleted rather than counted.
+ * Cite only wirings the lint gate can see.)
  */
 export function makeFloodWaitRecorder(
   path: string,

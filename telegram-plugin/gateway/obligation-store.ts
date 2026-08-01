@@ -43,6 +43,11 @@ export interface ObligationStoreFsSeam {
    *  entry lives in the parent's own cached metadata and is otherwise lost
    *  in a power cut. */
   fsyncDirSync: (path: string) => void
+  /** #4146: remove a snapshot this process will not maintain. Optional so any
+   *  existing seam (tests, other callers) keeps compiling and keeps working —
+   *  an absent `unlinkSync` degrades to "no cleanup", which is what those
+   *  callers do today. */
+  unlinkSync?: (path: string) => void
 }
 
 interface SnapshotEnvelope {
@@ -124,6 +129,56 @@ export function loadObligations(path: string, fs: ObligationStoreFsSeam): Obliga
   const env = parsed as Record<string, unknown>
   if (env.v !== 1 || !Array.isArray(env.obligations)) return []
   return env.obligations.filter(isObligationRow).map(sanitizeCapturedDelivery)
+}
+
+/**
+ * #4146 — drop a snapshot this process is NOT going to maintain.
+ *
+ * When the gateway is STATIC or `SWITCHROOM_OBLIGATION_LEDGER=0`, the ledger's
+ * `onChange` persister is never wired, so obligations open and close purely in
+ * memory while any previously-written `obligations.json` sits on disk
+ * unchanged. That leftover is not harmless: the W1-d audience classifier
+ * (`hooks/audience-classify.mjs`) reads this exact file to decide whether
+ * anyone is waiting on a chat, and an empty-but-stale open set reads there as
+ * POSITIVE evidence that nobody is — which is the one input that can make the
+ * classifier suppress a message owed to a human.
+ *
+ * Removing the file restores that classifier's stated invariant ("absent ⇒
+ * unknown ⇒ deliver") deterministically, with no freshness heuristic and no
+ * clock. Note this is safe precisely because the snapshot has exactly one
+ * writer: with the ledger ON, a merely-stopped gateway leaves a snapshot that
+ * is accurate rather than stale, so nothing is lost by only cleaning up in the
+ * modes where persistence is disabled.
+ *
+ * Best-effort and never throws — a failure degrades to the reader-side
+ * ledger-off guard in the hook.
+ *
+ * @returns `true` iff a file was actually removed.
+ */
+export function removeUnmaintainedSnapshot(
+  path: string,
+  fs: ObligationStoreFsSeam,
+  reason = 'persistence disabled',
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): boolean {
+  const unlink = fs.unlinkSync
+  if (unlink == null) return false
+  try {
+    if (!fs.existsSync(path)) return false
+    unlink(path)
+    log(
+      `obligation-store: persistence is off (${reason}) — removed unmaintained ` +
+        `snapshot path=${path} so it cannot be read as "nobody is waiting" (#4146)\n`,
+    )
+    return true
+  } catch (err) {
+    log(
+      `obligation-store: could not remove unmaintained snapshot path=${path}: ` +
+        `${(err as Error).message} — audience classification falls back to the ` +
+        `reader-side ledger-off guard (#4146)\n`,
+    )
+    return false
+  }
 }
 
 /**

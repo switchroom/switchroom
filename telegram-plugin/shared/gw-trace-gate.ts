@@ -68,8 +68,18 @@ const ZERO_SIGNAL_POLL_METHODS = new Set(['getUpdates', 'getMe'])
  * `status=err` signal in high-volume card-repaint no-ops: `grep status=err`
  * stays a list of real failures, and the benign lines are still there,
  * honestly labelled, for anyone who wants them.
+ *
+ * `retry` (#3931) is a REJECTED call that the enclosing retry policy is about
+ * to attempt AGAIN — a 429 under the in-process sleep ceiling, or a transient
+ * transport error with attempts left. It is not an outcome: the logical send
+ * may still be delivered by the next attempt, and usually is. It exists
+ * because `status=err` is consumed as a delivery FAILURE by fleet-health's
+ * `reply-delivery-failure` detector (`src/fleet-health/detect.ts`), which
+ * matches per LINE — so labelling a survivable attempt `err` escalated
+ * successfully delivered replies. Post-#3931 a `status=err` line means the
+ * logical send is over and it did not land.
  */
-export type TgPostStatus = 'ok' | 'benign' | 'err'
+export type TgPostStatus = 'ok' | 'benign' | 'err' | 'retry'
 
 /**
  * Decide whether a `tg-post` line should be written.
@@ -79,6 +89,8 @@ export type TgPostStatus = 'ok' | 'benign' | 'err'
  *
  * Always emitted:
  *   - any `status=err` (real failures — the whole point of the log),
+ *   - any `status=retry` (the survivable attempts behind a flood episode —
+ *     suppressing them would hide the run-up to a ban, #3931),
  *   - every other method's `ok` line (sendMessage/editMessageText/... are
  *     genuine outbound observability, #656/#657),
  *   - `status=benign` on any non-poll method — same volume as the
@@ -90,7 +102,7 @@ export function shouldEmitTgPost(
   verbose: boolean = gwTraceVerbose,
 ): boolean {
   if (verbose) return true
-  if (status === 'err') return true
+  if (status === 'err' || status === 'retry') return true
   return !ZERO_SIGNAL_POLL_METHODS.has(method)
 }
 

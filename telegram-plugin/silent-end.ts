@@ -66,6 +66,22 @@ export interface SilentEndState {
    * absent for the zero-prose (genuinely empty) silent-end.
    */
   pendingText?: string
+  /**
+   * W1-d follow-up (#4141) — one of THIS turn's reply-tool calls came back
+   * `is_error: true`, so `pendingText` is prose the model wrote *after* its
+   * delivery attempt failed, not text it chose to send as the answer.
+   *
+   * Stamped by the Stop hook's single-writer election
+   * (`silent-end-interrupt-stop.mjs` → `buildNextState`), the only component
+   * that can see the transcript; the gateway's own `writeSilentEndState` never
+   * sets it. Consumed by `deliverCapturedProse`, which prefixes a one-line
+   * provenance banner so the recipient is told the text was scraped off a
+   * failed turn rather than sent as an answer.
+   *
+   * Optional and only ever `true`: absent means "no positive evidence of a
+   * throw", which delivers exactly as before. It never suppresses.
+   */
+  replyToolThrewThisTurn?: boolean
 }
 
 export interface SilentEndDeps {
@@ -320,8 +336,16 @@ export const CAPTURED_PROSE_MIN_CHARS = 200
 export interface CapturedProseDecision {
   /** True → the gateway should deliver `text` directly on this silent-end. */
   deliver: boolean
-  /** The prose to deliver; present iff `deliver === true`. */
+  /** The prose to deliver; present iff `deliver === true`. RAW — never framed
+   *  here, so the caller's dedup and journal keys stay computed on the same
+   *  bytes the sweep path uses (#4141). */
   text?: string
+  /**
+   * #4141 — the persisted record says this turn's reply tool threw. Surfaced
+   * (not acted on) so `deliverCapturedProse` can state the prose's provenance.
+   * `true` only on positive evidence; never affects `deliver`.
+   */
+  replyToolThrewThisTurn?: boolean
   /** Machine-readable reason (for logs / tests). */
   reason:
     | 'captured-prose'
@@ -394,7 +418,15 @@ export function decideCapturedProseDelivery(
   if (deps?.backstopDeliveredNonceHit?.(state.turnId) === true) {
     return { deliver: false, reason: 'already-delivered' }
   }
-  return { deliver: true, text, reason: 'captured-prose' }
+  return {
+    deliver: true,
+    text,
+    reason: 'captured-prose',
+    // #4141: pass the hook's raw signal through untouched. Deliberately placed
+    // AFTER every `deliver:false` gate above — the banner is a labelling
+    // concern, and must never become an input to whether we deliver at all.
+    ...(state.replyToolThrewThisTurn === true ? { replyToolThrewThisTurn: true } : {}),
+  }
 }
 
 /**

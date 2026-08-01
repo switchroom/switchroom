@@ -36,9 +36,11 @@ export interface SignalMapping {
  *   no-op — the operator cannot tell the agent did nothing. severity 3.
  * - `duplicate-delivery-represent` / `reply-delivery-failure` →
  *   `talk-to-agents-from-anywhere`: the answer's delivery to the principal is
- *   the job; a duplicate send or a failed `sendRichMessage` is a delivery
- *   defect on that job. (The clerk/marko represent-duplicate case the RFC
- *   validated on lands here.) duplicate = severity 2, delivery-failure = 3.
+ *   the job; a duplicate send or a TERMINALLY failed `sendRichMessage` is a
+ *   delivery defect on that job. (The clerk/marko represent-duplicate case the
+ *   RFC validated on lands here.) duplicate = severity 2, delivery-failure = 3.
+ *   #3931: a retried-and-delivered attempt is not a delivery failure and is
+ *   excluded at the log-line level (`status=retry`), not by this mapping.
  * - `hang-long-stalled` / `killed-incomplete-turn` →
  *   `steer-or-queue-mid-flight`: a turn that hangs or is killed mid-flight is
  *   a responsiveness failure on the in-flight-control job. hang = 2, killed = 3
@@ -72,6 +74,11 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     signature: "represent-duplicate-send:reply-tool-not-called",
   },
   "reply-delivery-failure": {
+    // #3931 — a TERMINAL send failure only. The `tg-post` transformer labels an
+    // attempt the retry policy is about to repeat `status=retry`, so a 429 that
+    // succeeded on retry no longer lands here. Severity 3 is only honest under
+    // that rule: before it, this signal opened sev-3 issues about replies the
+    // operator had already read.
     failure_mode: "success-theater",
     severity: 3,
     job_spec: "talk-to-agents-from-anywhere",

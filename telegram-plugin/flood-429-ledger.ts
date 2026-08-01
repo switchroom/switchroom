@@ -362,9 +362,11 @@ export function writeFlood429Ledger(
  * call at the ~5s cadence a long ban produces, because the fold collapses
  * those into a single episode instead of growing the file.
  *
- * Read-fold-write is not atomic across processes: the gateway and the MCP
- * server's `createRobustApiCall` share one state dir, so a simultaneous 429 in
- * both could drop one episode. That is deliberate — the alternative is a lock
+ * Read-fold-write is not atomic across processes. Today every writer lives in
+ * the gateway process (its two `createRetryApiCall` wirings plus the outbox
+ * sweep's, all on one event loop), but the ledger is keyed by state DIR, so a
+ * second process wiring the breaker could drop one episode on a simultaneous
+ * 429. That is deliberate — the alternative is a lock
  * on the send path's error handler, and the cost of losing an episode is
  * nil: a penalty stays on the ledger for seven days and is re-recorded by the
  * next 429, so no verdict tier turns on a single write landing.

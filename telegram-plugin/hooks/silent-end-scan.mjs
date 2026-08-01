@@ -248,9 +248,18 @@ function buildTurnId(chatId, threadId, messageId) {
  *   reply tool (Option A transcript-prose bridge). Only populated when it
  *   clears the substance floor, so the gateway never re-delivers a short
  *   trailing pleasantry. Omitted entirely otherwise.
+ * @param {boolean} [replyToolThrewThisTurn] W1-d follow-up (#4141): one of this
+ *   turn's reply-tool calls came back `is_error: true`. Carried on the BLOCK
+ *   result so the single-writer election can persist it onto the silent-end
+ *   state file — the captured-prose bridge (the machine that actually delivers
+ *   on the ELECTED path, where no outbox record is ever written) has no other
+ *   way to learn it. A raw SIGNAL, never a verdict: downstream it only ever
+ *   adds a provenance banner. Omitted rather than `false` when absent, so a
+ *   spread of a prior state file cannot be read as positive evidence.
  */
-function buildBlockResult(envelope, reason, pendingText, hasTrailingProse) {
+function buildBlockResult(envelope, reason, pendingText, hasTrailingProse, replyToolThrewThisTurn) {
   const block = { decided: 'block', reason }
+  if (replyToolThrewThisTurn === true) block.replyToolThrewThisTurn = true
   // Single-writer election input (#duplicate-message fix): does ANY
   // non-empty, non-silent trailing text block exist after the last
   // delivery event? The zero-reply election allows only when this is
@@ -381,6 +390,15 @@ export function scanTurnForFinalReply(jsonl) {
   //    whether emitted as plain text or as a reply-tool payload) or
   //    plain undelivered text.
   const blocks = []
+  // W1-d follow-up (#4141): the same reply-throw signal `scanForOutboxCapture`
+  // already derives, computed here too because the ELECTED path never reaches
+  // that scanner's capture branch (a thrown-but-qualifying reply sets
+  // `replyAlreadyDeliveredThisTurn`, so the hook defers to the election and
+  // writes NO outbox record). Collected as two id sets whose intersection is
+  // the signal. Read-only: nothing below branches on it, so no verdict of this
+  // scanner changes.
+  const replyToolUseIds = new Set()
+  const erroredToolUseIds = new Set()
   for (let i = startIdx + 1; i < lines.length; i++) {
     const line = lines[i]
     if (!line || line[0] !== '{') continue
@@ -390,6 +408,20 @@ export function scanTurnForFinalReply(jsonl) {
     // be in a separate transcript file, but `isSidechain:true` is the
     // documented marker if they leak).
     if (obj?.isSidechain === true) continue
+    if (obj?.type === 'user') {
+      // Tool RESULT lines: `user`-type, content array carrying
+      // `{type:'tool_result', tool_use_id, is_error}`. Same shape read by
+      // `scanForOutboxCapture` (#3865).
+      const rc = obj?.message?.content
+      if (!Array.isArray(rc)) continue
+      for (const r of rc) {
+        if (r?.type !== 'tool_result') continue
+        if (r?.is_error !== true) continue
+        if (typeof r.tool_use_id !== 'string') continue
+        erroredToolUseIds.add(r.tool_use_id)
+      }
+      continue
+    }
     if (obj?.type !== 'assistant') continue
     const content = obj?.message?.content
     if (!Array.isArray(content)) continue
@@ -449,6 +481,9 @@ export function scanTurnForFinalReply(jsonl) {
         }
         continue
       }
+      // #4141: EVERY reply-tool call's id, qualifying or not — an interim ack
+      // that threw is still a reply-tool throw.
+      if (typeof c.id === 'string') replyToolUseIds.add(c.id)
       const input = c.input ?? {}
       const text = String(input.text ?? '')
       // Silent-marker carve-out: the operator explicitly signaled
@@ -555,6 +590,10 @@ export function scanTurnForFinalReply(jsonl) {
   // delivers the joined prose instead of dropping. A pure narration run still
   // yields `undefined` (the #3228 Finding 2 guard, now structural).
   const zeroReplyPendingText = backstopText
+  // #4141 — one of this turn's reply-tool calls errored. Derived here, consumed
+  // only by `buildBlockResult` below (and thence the elected state file); it
+  // gates nothing in this scanner.
+  const replyToolThrewThisTurn = [...replyToolUseIds].some((id) => erroredToolUseIds.has(id))
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
@@ -567,7 +606,9 @@ export function scanTurnForFinalReply(jsonl) {
     if (envelope.source === 'cron') {
       return { decided: 'allow', reason: 'cron-source' }
     }
-    return buildBlockResult(envelope, 'no-final-reply', zeroReplyPendingText, hasTrailingProse)
+    return buildBlockResult(
+      envelope, 'no-final-reply', zeroReplyPendingText, hasTrailingProse, replyToolThrewThisTurn,
+    )
   }
 
   if (sawUndeliveredTextAfterAllow) {
@@ -576,7 +617,9 @@ export function scanTurnForFinalReply(jsonl) {
     // sent through a delivery tool. This is the "at least once" bug:
     // an early ack (or any qualifying reply) must not amnesty
     // everything written afterward.
-    return buildBlockResult(envelope, 'trailing-text-after-reply', pendingText, hasTrailingProse)
+    return buildBlockResult(
+      envelope, 'trailing-text-after-reply', pendingText, hasTrailingProse, replyToolThrewThisTurn,
+    )
   }
 
   return { decided: 'allow', reason: lastAllowReason }
@@ -917,7 +960,7 @@ function resolveSessionOriginChat(lines) {
  *
  * @param {string} jsonl
  * @param {number} [now]
- * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string, replyAlreadyDeliveredThisTurn: boolean, deliveredReplySha256: string|null }}
+ * @returns {{ capture: false, reason: string } | { capture: true, text: string, turnNonce: string, chatId: string|null, threadId: number|null, source: string, anchorContent: string, replyAlreadyDeliveredThisTurn: boolean, deliveredReplySha256: string|null, replyToolThrewThisTurn: boolean }}
  */
 export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const lines = jsonl.split('\n')
@@ -925,12 +968,34 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
   const { envelope } = anchor
 
   const blocks = []
+  // W1-d (#3865): ids of reply-tool `tool_use` blocks seen this turn, and the
+  // ids whose `tool_result` came back `is_error: true`. Their intersection is
+  // the "did the reply tool throw this turn" signal.
+  const replyToolUseIds = new Set()
+  const erroredToolUseIds = new Set()
   for (let i = anchor.startIdx + 1; i < lines.length; i++) {
     const line = lines[i]
     if (!line || line[0] !== '{') continue
     let obj
     try { obj = JSON.parse(line) } catch { continue }
     if (obj?.isSidechain === true) continue
+    // W1-d (#3865): tool RESULT lines are how a reply-tool THROW becomes
+    // visible. Claude Code writes the result of a `tool_use` as a `user`-type
+    // line whose content array carries `{type:'tool_result', tool_use_id,
+    // is_error}`. Nothing in this scanner read those before, which is exactly
+    // why an errored reply was indistinguishable from a delivered one — the
+    // transcript shape is otherwise identical.
+    if (obj?.type === 'user') {
+      const rc = obj?.message?.content
+      if (!Array.isArray(rc)) continue
+      for (const r of rc) {
+        if (r?.type !== 'tool_result') continue
+        if (r?.is_error !== true) continue
+        if (typeof r.tool_use_id !== 'string') continue
+        erroredToolUseIds.add(r.tool_use_id)
+      }
+      continue
+    }
     if (obj?.type !== 'assistant') continue
     const content = obj?.message?.content
     if (!Array.isArray(content)) continue
@@ -971,6 +1036,12 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
         }
         continue
       }
+      // W1-d (#3865): remember EVERY reply-tool call's id, not just the
+      // qualifying-final-answer ones. An interim ack that threw is still a
+      // reply-tool throw, and the #3861 shape (reply raises, agent then writes
+      // trailing working notes) does not require the errored call to have been
+      // a qualifying final answer.
+      if (typeof c.id === 'string') replyToolUseIds.add(c.id)
       const input = c.input ?? {}
       const text = String(input.text ?? '')
       if (SILENT_MARKER_RE.test(text.trim()) || endsWithSilentMarker(text)) {
@@ -1081,5 +1152,10 @@ export function scanForOutboxCapture(jsonl, now = Date.now()) {
     originThreadId: origin.threadId,
     replyAlreadyDeliveredThisTurn,
     deliveredReplySha256,
+    // W1-d (#3865): one of this turn's reply-tool calls came back an error.
+    // Reported as a raw SIGNAL, not a verdict — `decideCaptureAudience` in
+    // `audience-classify.mjs` combines it with the obligation state (which
+    // this pure transcript scanner cannot see) to decide the audience.
+    replyToolThrewThisTurn: [...replyToolUseIds].some((id) => erroredToolUseIds.has(id)),
   }
 }

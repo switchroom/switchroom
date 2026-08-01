@@ -2743,6 +2743,11 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               registryKey: turn.registryKey ?? null,
               originTurnId: turn.turnId,
               text: proseDecision.text,
+              // #4141 — the Stop hook saw this turn's reply tool throw, so the
+              // prose is what the model wrote AFTER its delivery attempt failed,
+              // not what it chose to send. Pass the raw signal through so the
+              // send states that provenance. It never gates delivery.
+              replyToolThrewThisTurn: proseDecision.replyToolThrewThisTurn === true,
               // For the honest "(waited Ns)" clause if the exhaustion-boundary
               // apology fallback fires (#3228).
               turnDurationMs,
