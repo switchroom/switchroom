@@ -237,6 +237,23 @@ const phase = (p: string, over: Partial<RolloutPhase> = {}): RolloutPhase =>
   ({ phase: p as RolloutPhase['phase'], target: 'v1.2.3', ...over }) as RolloutPhase
 
 /**
+ * Drive the narrator's debounce to quiescence.
+ *
+ * This file is swept by BOTH runners (vitest and the `bun test` sweep over
+ * telegram-plugin/), so it must stay on the dual-run-safe timer API: SYNC
+ * `advanceTimersByTime` + a microtask flush, never `vi.runAllTimersAsync`
+ * (undefined under bun — same trap as tests/draft-stream.test.ts). Looped,
+ * because a debounced flush awaits an async relay round-trip that can arm the
+ * next timer.
+ */
+async function drainNarrator(): Promise<void> {
+  for (let i = 0; i < 12; i++) {
+    vi.advanceTimersByTime(2000)
+    for (let j = 0; j < 12; j++) await Promise.resolve()
+  }
+}
+
+/**
  * A narration relay whose `edit()` runs the REAL gateway handler over the REAL
  * retry policy and maps the reply exactly as `SocketRolloutNarrationRelay`
  * does (`ok===true` → `{ok:true}`, else `{ok:false, gone: obj.gone===true}`).
@@ -313,7 +330,7 @@ describe('a deleted rollout card produces a re-post, driven through the real ret
 
     n.seedPostedMessage('ro-1', 'overlord', 4242)
     n.onPhase(entry, phase('self-bump-done'))
-    await vi.runAllTimersAsync()
+    await drainNarrator()
 
     // THE ASSERTION THIS WHOLE FILE EXISTS FOR. With the benign-400 swallow in
     // place the handler replied ok:true, the narrator saw a healthy edit, and
@@ -321,7 +338,7 @@ describe('a deleted rollout card produces a re-post, driven through the real ret
     expect(relay.posts).toEqual([5555])
 
     n.onTerminal(makeEntry({ result: 'completed', rolled: ['a', 'b'] }))
-    await vi.runAllTimersAsync()
+    await drainNarrator()
 
     // Exactly one re-post (no storm), and the operator's live card carries the
     // terminal outcome.
@@ -339,9 +356,9 @@ describe('a deleted rollout card produces a re-post, driven through the real ret
 
     n.seedPostedMessage('ro-1', 'overlord', 4242)
     n.onPhase(entry, phase('self-bump-done'))
-    await vi.runAllTimersAsync()
+    await drainNarrator()
     n.onTerminal(makeEntry({ result: 'completed', rolled: ['a'] }))
-    await vi.runAllTimersAsync()
+    await drainNarrator()
 
     expect(relay.posts).toEqual([])
     expect(relay.edits.at(-1)!.messageId).toBe(4242)
