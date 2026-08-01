@@ -770,20 +770,28 @@ describe("scaffoldAgent", () => {
     const claudeJson = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", ".claude.json"), "utf-8"),
     );
-    const projectEntry = Object.values(
-      claudeJson.projects as Record<string, { enabledMcpjsonServers?: string[] }>,
-    )[0];
+    // Key by the agent's OWN project path, never the first entry of the
+    // projects map. scaffoldAgent copies the host's onboarding state, so
+    // `projects` also carries whatever directories the operator has already
+    // used Claude Code in. On a machine with any such history the first
+    // entry is one of those (with an empty `enabledMcpjsonServers`) and the
+    // assertion failed for a reason unrelated to the guarantee under test,
+    // while passing on a clean CI runner (#4106).
+    const projectKey = resolve(result.agentDir);
+    const projectEntry = (
+      claudeJson.projects as Record<string, { enabledMcpjsonServers?: string[] }>
+    )[projectKey];
     expect(projectEntry?.enabledMcpjsonServers).toContain("context7");
     // Reconcile must keep it trusted (the path every deployed agent takes).
     reconcileAgent("ctx7-trust", config, tmpDir, telegramConfig, switchroomConfig);
     const after = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", ".claude.json"), "utf-8"),
     );
-    for (const p of Object.values(
-      after.projects as Record<string, { enabledMcpjsonServers?: string[] }>,
-    )) {
-      expect(p.enabledMcpjsonServers).toContain("context7");
-    }
+    expect(
+      (after.projects as Record<string, { enabledMcpjsonServers?: string[] }>)[
+        projectKey
+      ]?.enabledMcpjsonServers,
+    ).toContain("context7");
   });
 
   it("context7 opt-out removes BOTH the .mcp.json entry and the pre-approval", () => {
