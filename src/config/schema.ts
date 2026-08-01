@@ -3328,7 +3328,12 @@ const profileFields = {
       directive_capture_nudge: z.boolean().optional(),
       // Mirror of AgentMemorySchema.observation_scopes — accepted at the
       // defaults/profile tier too, so `defaults.memory.observation_scopes:
-      // shared` pools a whole fleet's observations with per-agent opt-out.
+      // shared` pins a whole fleet's observations to one scope. A per-agent
+      // value OVERRIDES that pin with another enum member; because the schema
+      // is `z.enum().optional()` with no clear sentinel, `undefined` inherits
+      // the fleet pin (it cannot cancel it). To decline the pool, an agent
+      // sets `observation_scopes: combined` — the member that restores the
+      // pre-feature engine default (see ObservationScopesSchema above).
       observation_scopes: ObservationScopesSchema,
       // Mirror of AgentMemorySchema.observation_scope_strategy — accepted at
       // the defaults/profile tier too, so `defaults.memory.
