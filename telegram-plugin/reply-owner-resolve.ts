@@ -249,6 +249,21 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
  * `live` keeps its unconditional bypass: `currentTurn` is framework-owned, and
  * `decideSupersede`'s same-turnId requirement already bars it from reaching a
  * DIFFERENT ended turn's record. `none` never bypasses (nothing to attribute).
+ *
+ * ## The second ambiguity: a live sub-agent (#4176)
+ *
+ * `handbackCouldOwnReply` covers the sub-agent completion that the gateway
+ * SYNTHESIZED as an inbound. It does not cover a background sub-agent calling
+ * `reply` DIRECTLY, mid-run: that call rides the same main bridge as the parent
+ * loop (so the #4172 caller-identity gate cannot see it) and never traverses
+ * `pendingInboundBuffer.push` (so no marker is stamped). Marker-absence is only
+ * evidence of "the turn's own answer" if nothing else on the session could have
+ * emitted this reply — which is exactly what `subagentCouldOwnReply` reports,
+ * from gateway-observed `sub_agent_*` liveness. When it is true the content gate
+ * is KEPT on every non-`live` tier: a reply that IS the flushed answer still
+ * collapses, a sub-agent's foreign content sends fresh. See
+ * `gateway/subagent-reply-authority.ts` for the ordering argument and the
+ * failure directions.
  */
 export function decideContentGateBypass(input: {
   /** The winning owner tier (`resolveReplyOwnerTier`). */
@@ -268,10 +283,26 @@ export function decideContentGateBypass(input: {
    *  the late reply might BE that handback rather than the turn's own answer.
    *  Keeps the content gate on every non-`live` tier. */
   handbackCouldOwnReply: boolean
+  /** #4176 — true when a sub-agent is LIVE on this session
+   *  (`subagentReplyAuthority`, gateway/subagent-reply-authority.ts). A
+   *  background `Task` sub-agent calls `reply` over the SAME main bridge as the
+   *  parent loop, so the #4172 caller-identity gate cannot see it and — because
+   *  a DIRECT tool call never traverses `pendingInboundBuffer.push` — it stamps
+   *  no handback marker either. Marker-absence therefore does NOT prove "the
+   *  turn's own answer" while a sub-agent is live: the reply might be the
+   *  sub-agent's, and bypassing the content gate would silently EDIT OVER the
+   *  flushed answer. Typed REQUIRED and evaluated FAIL-CLOSED (anything but an
+   *  explicit `false` keeps the gate): `telegram-plugin/` is not covered by
+   *  `tsc --noEmit`, so the type alone cannot stop a caller from dropping the
+   *  wiring — and the #4175 precedent is that a dropped bound fails closed,
+   *  never open. */
+  subagentCouldOwnReply: boolean
 }): boolean {
   if (input.tier === 'live') return true
   if (input.tier === 'none') return false
   if (input.handbackCouldOwnReply) return false
+  // Fail-CLOSED on an omitted flag (see the field doc): `!== false`, not truthiness.
+  if (input.subagentCouldOwnReply !== false) return false
   // Total over degenerate input (#3726). TypeScript makes `candidates` mandatory
   // and the one production caller (`resolveReplyOwnerTurn`) always builds it, so
   // this cannot fire today — but this module is exported precisely so the

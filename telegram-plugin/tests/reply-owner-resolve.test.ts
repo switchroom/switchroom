@@ -757,6 +757,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         resolvedTurnId: OWNER,
         candidates: cands({ originTurnId: OWNER }),
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(true)
   })
@@ -768,6 +769,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         resolvedTurnId: OWNER,
         candidates: cands({ quotedTurnId: OWNER }),
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(true)
   })
@@ -785,6 +787,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
             latestEndedTurnId: OWNER,
           }),
           handbackCouldOwnReply: false,
+          subagentCouldOwnReply: false,
         }),
       ).toBe(false)
     }
@@ -801,6 +804,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
             quotedTurnId: tier === 'quoted' ? OWNER : null,
           }),
           handbackCouldOwnReply: true,
+          subagentCouldOwnReply: false,
         }),
       ).toBe(false)
     }
@@ -814,6 +818,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         resolvedTurnId: OWNER,
         candidates: cands({ liveTurnId: OWNER }),
         handbackCouldOwnReply: true,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(true)
   })
@@ -825,6 +830,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         resolvedTurnId: null,
         candidates: cands({ latestEndedTurnId: null }),
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(false)
   })
@@ -841,6 +847,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         resolvedTurnId: OWNER,
         candidates: stale,
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(false)
   })
@@ -852,6 +859,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         resolvedTurnId: OWNER,
         candidates: cands(),
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(true)
   })
@@ -872,6 +880,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
             resolvedTurnId: OWNER,
             candidates: absent as unknown as ReplyOwnerCandidates,
             handbackCouldOwnReply: false,
+            subagentCouldOwnReply: false,
           }),
         ).toBe(false)
       }
@@ -934,7 +943,11 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
         for (const quotedTurnId of IDS)
           for (const latestEndedTurnId of IDS)
             for (const age of AGES)
-              for (const handbackCouldOwnReply of [false, true]) {
+              for (const handbackCouldOwnReply of [false, true])
+                // #4176 — the sweep now also spans sub-agent liveness, so a
+                // regression that ignores it on the steerable tiers is caught
+                // by the same zero-new-capability property.
+                for (const subagentCouldOwnReply of [false, true]) {
                 cases++
                 const c: ReplyOwnerCandidates = {
                   liveTurnId,
@@ -950,6 +963,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
                   resolvedTurnId: resolveReplyOwnerTurnId(c),
                   candidates: c,
                   handbackCouldOwnReply,
+                  subagentCouldOwnReply,
                 })
                 // Strip the model-supplied ids: the FRAMEWORK alone resolves the
                 // owner — the reach the model already had by staying silent.
@@ -963,6 +977,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
                   resolvedTurnId: resolveReplyOwnerTurnId(stripped),
                   candidates: stripped,
                   handbackCouldOwnReply,
+                  subagentCouldOwnReply,
                 })
                 if (withModelIds) {
                   bypasses++
@@ -972,7 +987,8 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
                   violations.push(
                     `tier=${tier} live=${liveTurnId} origin=${originTurnId} ` +
                       `quoted=${quotedTurnId} latestEnded=${latestEndedTurnId} ` +
-                      `age=${age.label} handback=${handbackCouldOwnReply}`,
+                      `age=${age.label} handback=${handbackCouldOwnReply} ` +
+                      `subagentLive=${subagentCouldOwnReply}`,
                   )
                 }
               }
@@ -986,7 +1002,7 @@ describe('decideContentGateBypass — corroborated bypass of the #3429 content g
     expect(r.violations).toEqual([])
     // Non-degeneracy: the sweep must actually cover the space and must actually
     // reach the branch under test, so it can never quietly become a no-op.
-    expect(r.cases).toBe(IDS.length ** 4 * AGES.length * 2)
+    expect(r.cases).toBe(IDS.length ** 4 * AGES.length * 2 * 2)
     expect(r.bypasses).toBeGreaterThan(0)
     // …and specifically, many cases must win their bypass on the WIDENED,
     // model-steerable `origin`/`quoted` tiers — the thing being vouched for.
@@ -1171,6 +1187,7 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
         resolvedTurnId: resolveReplyOwnerTurnId(fixed),
         candidates: fixed,
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(false)
     // Red-on-main contrast: the same reply DID bypass the #3429 content gate
@@ -1191,6 +1208,7 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
         resolvedTurnId: null,
         candidates: fixed,
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(false)
 
@@ -1217,6 +1235,7 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
         resolvedTurnId: ENDED,
         candidates: { ...base, originTurnId: ENDED, latestEndedAgeMs: null },
         handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
       }),
     ).toBe(false)
     // Property omitted entirely ⇒ fail CLOSED too (#4175 — the old unbounded
@@ -1307,6 +1326,7 @@ describe('2026-08-01 klanker incident — slow flush→reply gap (Stop-hook nudg
       resolvedTurnId: ownerId,
       candidates: c,
       handbackCouldOwnReply: false, // no subagent_handback enqueued in the window
+      subagentCouldOwnReply: false, // no sub-agent live on the session (#4176)
     })
     expect(bypass).toBe(true)
     const d = reg.take(CHAT, undefined, {
@@ -1333,6 +1353,7 @@ describe('2026-08-01 klanker incident — slow flush→reply gap (Stop-hook nudg
       resolvedTurnId: resolveReplyOwnerTurnId(c),
       candidates: c,
       handbackCouldOwnReply: true,
+      subagentCouldOwnReply: false,
     })
     expect(bypass).toBe(false)
     const d = reg.take(CHAT, undefined, {
@@ -1393,5 +1414,75 @@ describe('#4173 — the latest-ended tier follows the turn-completion window', (
         latestEndedRealEndAgeMs: 90_000,
       })),
     ).toBe('none')
+  })
+})
+
+/**
+ * #4176 — the sub-agent liveness input to the bypass, at the decision level.
+ * The behavioural proof lives in `send-reply-golden.test.ts`; these pin the
+ * pure rule, including the fail-CLOSED handling of an omitted flag (the
+ * telegram-plugin tree is NOT covered by `tsc --noEmit`, so the type alone
+ * cannot stop a caller dropping the wiring).
+ */
+describe('#4176 — a live sub-agent denies the content-gate bypass', () => {
+  const CHAT = '1001'
+  const TURN = `${CHAT}:_#flushed-4176`
+  const base = {
+    liveTurnId: null,
+    originTurnId: null,
+    quotedTurnId: null,
+    latestEndedTurnId: TURN,
+    latestEndedAgeMs: 90_000,
+    latestEndedTtlMs: 30 * 60_000,
+    latestEndedRealEndAgeMs: null,
+    latestEndedCompletedGraceMs: 60_000,
+  } as ReplyOwnerCandidates
+
+  for (const tier of ['latest-ended', 'origin', 'quoted'] as ReplyOwnerTier[]) {
+    it(`${tier}: bypass granted with no sub-agent live, DENIED while one is live`, () => {
+      const call = (subagentCouldOwnReply: boolean) =>
+        decideContentGateBypass({
+          tier,
+          resolvedTurnId: TURN,
+          candidates: { ...base, originTurnId: TURN, quotedTurnId: TURN },
+          handbackCouldOwnReply: false,
+          subagentCouldOwnReply,
+        })
+      expect(call(false)).toBe(true)
+      expect(call(true)).toBe(false)
+    })
+  }
+
+  it('fails CLOSED when the flag is omitted entirely (dropped wiring ⇒ no bypass)', () => {
+    const input = {
+      tier: 'latest-ended' as ReplyOwnerTier,
+      resolvedTurnId: TURN,
+      candidates: base,
+      handbackCouldOwnReply: false,
+    } as Parameters<typeof decideContentGateBypass>[0]
+    expect(decideContentGateBypass(input)).toBe(false)
+  })
+
+  it('the `none` tier stays denied and the `live` tier is untouched by the flag', () => {
+    expect(
+      decideContentGateBypass({
+        tier: 'none',
+        resolvedTurnId: null,
+        candidates: base,
+        handbackCouldOwnReply: false,
+        subagentCouldOwnReply: false,
+      }),
+    ).toBe(false)
+    // A LIVE turn owns the reply by framework identity, not by inference, so a
+    // background sub-agent cannot be the author of record here.
+    expect(
+      decideContentGateBypass({
+        tier: 'live',
+        resolvedTurnId: TURN,
+        candidates: { ...base, liveTurnId: TURN },
+        handbackCouldOwnReply: false,
+        subagentCouldOwnReply: true,
+      }),
+    ).toBe(true)
   })
 })

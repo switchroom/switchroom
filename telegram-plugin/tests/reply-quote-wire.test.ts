@@ -164,6 +164,8 @@ function makeHarness(opts: { errors?: ScriptedError[] } = {}) {
     resolveThreadId: () => undefined,
     getLatestInboundMessageId: () => null,
     getLastSubagentHandbackAt: () => null,
+    // #4176 — no sub-agent live on this session (see subagent-reply-authority.ts).
+    subagentReplyAuthority: { subagentCouldOwnReply: () => false },
     recordOutbound: noop,
     emissionAuthorityFor: () =>
       ({

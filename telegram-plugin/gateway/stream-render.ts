@@ -74,6 +74,7 @@ import { appendActivityLabel } from '../tool-activity-summary.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { decideTurnFlush } from '../turn-flush-safety.js'
 import { FlushCompletionTracker } from '../flushed-turn-supersede.js'
+import { subagentReplyAuthority } from './subagent-reply-authority.js'
 import { decideTerminalReason, deriveTurnRole } from '../turn-liveness-floor.js'
 import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 import { deriveTurnId } from './derive-turn-id.js'
@@ -958,6 +959,16 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
     const durationMs = ev.kind === 'turn_end' ? ev.durationMs : undefined
     idleTracker.noteEvent(ev.kind, Date.now(), durationMs)
   }
+  // #4176 — sub-agent liveness, fed from the SAME whole-stream position as the
+  // idle clock above and for the same reason: `sub_agent_*` events arrive with
+  // or without a live gateway turn, and the reply send path must know whether a
+  // background sub-agent could be the author of a decoupled reply (a sub-agent
+  // calls `reply` over the parent's OWN bridge, so neither the caller-identity
+  // gate nor the handback marker can see it). Deliberately BEFORE the switch:
+  // the `sub_agent_tool_use` case below early-returns when `getCurrentTurn()` is
+  // null, which is exactly the post-flush state this gate exists for. See
+  // gateway/subagent-reply-authority.ts.
+  subagentReplyAuthority.noteSessionEvent(ev as { kind: string; agentId?: string })
   switch (ev.kind) {
     case 'enqueue': {
       // #3927 FIX A — an `enqueue` is a QUEUE event, not a turn START event

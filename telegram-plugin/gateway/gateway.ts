@@ -87,6 +87,7 @@ import {
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
 import { resolveReplyOwnerTurnWith, SUPERSEDE_OPEN_CAP_MS, SUPERSEDE_GRACE_MS } from './reply-owner-wiring.js'
+import { subagentReplyAuthority } from './subagent-reply-authority.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   splitCoalescedAttachments,
@@ -10735,6 +10736,7 @@ if (isGatewayMain) ipcServer = createIpcServer({
     // flush windows now (the replay grace still covers a reconnect replay).
     // Scoped to a registered non-cron agent; rationale in stream-render.ts.
     if (client.agentName != null && !isCronIdentity(client.agentName)) {
+      subagentReplyAuthority.reset() // #4176 — the sub-agents died with the session
       const closedWindows = closeFlushCompletionWindows(flushedTurnSupersede, Date.now())
       if (closedWindows > 0) {
         process.stderr.write(
@@ -12538,6 +12540,7 @@ function gatewaySendReplyDeps(): SendReplyGatewayDeps {
     resolveThreadId,
     getLatestInboundMessageId,
     getLastSubagentHandbackAt,
+    subagentReplyAuthority,
     recordOutbound,
     emissionAuthorityFor,
     clearActivitySummary,

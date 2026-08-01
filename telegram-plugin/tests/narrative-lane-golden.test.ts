@@ -423,6 +423,8 @@ function makeSendReplyDeps(dedup: OutboundDedupCache) {
     streamKey: key,
     resolveReplyOwnerTurn: () => ownerRes(null, 'none'),
     getLastSubagentHandbackAt: () => null,
+    // #4176 — no sub-agent live on this session (see subagent-reply-authority.ts).
+    subagentReplyAuthority: { subagentCouldOwnReply: () => false },
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
     resolveAnswerThreadWithLog: (_c: string, explicit: number | undefined) => explicit,

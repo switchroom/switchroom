@@ -78,6 +78,7 @@ import {
   type FlushedTurnSupersedeRegistry,
 } from '../flushed-turn-supersede.js'
 import { HANDBACK_RECENCY_WINDOW_MS } from './subagent-handback-marker.js'
+import type { SubagentReplyAuthorityView } from './subagent-reply-authority.js'
 import {
   decideAnswerLatchSuppression,
   decideContentGateBypass,
@@ -844,6 +845,12 @@ export interface SendReplyGatewayDeps {
   resolveThreadId(chatId: string, explicit?: string | number | null): number | undefined
   getLatestInboundMessageId(chatId: string, threadId: number | null): number | null | undefined
   getLastSubagentHandbackAt(chatId: string): number | null
+  /** #4176 — gateway-observed sub-agent liveness (`subagentReplyAuthority`,
+   *  subagent-reply-authority.ts). A background `Task` sub-agent replies over
+   *  THIS bridge, so neither the #4172 caller-identity gate nor the handback
+   *  marker can see it; while one is live the content-gate bypass is refused so
+   *  a sub-agent's reply can never edit over a flushed answer. */
+  subagentReplyAuthority: SubagentReplyAuthorityView
   recordOutbound(rec: {
     chat_id: string
     thread_id: number | null
@@ -908,7 +915,7 @@ export async function sendReply(
     statusKey, streamKey,
     resolveReplyOwnerTurn, findTurnByOriginId, findTurnByQuotedMessageId,
     resolveAnswerThreadWithLog, resolveThreadId,
-    getLatestInboundMessageId, getLastSubagentHandbackAt, recordOutbound,
+    getLatestInboundMessageId, getLastSubagentHandbackAt, subagentReplyAuthority, recordOutbound,
     emissionAuthorityFor, clearActivitySummary,
     startTypingLoop, stopTypingLoop, logOutbound,
     closeObligationOnSubstantiveReply, finalizeStatusReaction,
@@ -1163,11 +1170,27 @@ export async function sendReply(
     //                its OWN turn no longer loses the collapse it would have got
     //                by omitting the echo entirely (the observed 2026-07-27
     //                `via=origin` duplicate).
+    //
+    // #4176 — the SECOND ambiguity, which the marker structurally cannot see. A
+    // background `Task` sub-agent (the `researcher`/`reviewer` types hold the
+    // full tool set) calls `reply` over THIS bridge, mid-run: the #4172
+    // caller-identity gate sees the MAIN agent identity, and a direct tool call
+    // never traverses `pendingInboundBuffer.push`, so no handback marker is
+    // stamped either. Under the #4173 OPEN window that reply resolves the
+    // flush-ended turn at ANY age, so an unguarded bypass supersedes REGARDLESS
+    // of content and silently edits the sub-agent's message over the user's
+    // flushed answer (the review MAJOR on #4167; pre-existing on main at the
+    // 60 s TTL, extended by #4173 to the OPEN cap). Gateway-observed sub-agent
+    // liveness is the deterministic discriminator: while one is live the content
+    // gate is KEPT, so a reply that IS the flushed answer still collapses and a
+    // sub-agent's foreign content ships FRESH (visible, notifying).
+    const subagentCouldOwnReply = subagentReplyAuthority.subagentCouldOwnReply()
     const replyIsOwnAnswer = decideContentGateBypass({
       tier: ownerTier,
       resolvedTurnId,
       candidates: ownerCandidates,
       handbackCouldOwnReply,
+      subagentCouldOwnReply,
     })
     const decision = flushedTurnSupersede.take(
       chat_id,
@@ -1257,7 +1280,7 @@ export async function sendReply(
           // 2026-07-27 duplicate looked like a pure text-matcher failure and
           // took a log-archive dig to attribute to the tier restriction.
           `tier=${ownerTier} latestEnded=${JSON.stringify(ownerCandidates.latestEndedTurnId)} ` +
-          `handbackInWindow=${handbackCouldOwnReply}; sending fresh\n`,
+          `handbackInWindow=${handbackCouldOwnReply} subagentLive=${subagentCouldOwnReply}; sending fresh\n`,
         )
       }
       if (suppressByLatch) {

@@ -68,16 +68,32 @@
  * SYNTHETIC turn_end (it nulls the gateway's turn atom so the session can
  * move on), but the claude session's REAL turn_end arrives later, when the
  * model actually stops. A `reply` landing on the MAIN session bridge BETWEEN
- * those two events is — by construction — that turn's own answer still being
- * composed: no other work can run on the serial session in that span. So the
- * record's lifetime is now three-phase:
+ * those two events is that turn's own answer still being composed — PROVIDED
+ * nothing else on that bridge can emit a reply in the span. Two things can, and
+ * neither is covered by this window; each is closed by its own deterministic
+ * gate, and the window is only sound in combination with them:
+ *
+ *   - a FOREIGN session (a Tier-1 cheap-cron bridge, an unregistered client) —
+ *     closed by caller identity at the send path (`replyCallerIsForeignSession`,
+ *     gateway/cron-session.ts, #4172);
+ *   - a background `Task` SUB-AGENT, which runs concurrently with the parent
+ *     loop and calls `reply` over the SAME main bridge, so identity cannot see
+ *     it — closed by gateway-observed sub-agent liveness refusing the
+ *     content-gate bypass (gateway/subagent-reply-authority.ts, #4176). The
+ *     claude session's own loop is serial; its sub-agents are not, and the
+ *     earlier revision of this header asserted the stronger, false claim that
+ *     "no other work can run on the serial session in that span".
+ *
+ * So the record's lifetime is now three-phase:
  *
  *   1. OPEN (`completedAt == null`) — the flush delivered, the real turn_end
  *      has not been observed yet. The turn is still composing (Stop-hook
  *      nudge, /compact, recompose all live here). A same-session reply
  *      supersedes REGARDLESS of how long this takes — a 20-minute compaction
  *      no longer reproduces #4166. Bounded only by the
- *      `SUPERSEDE_OPEN_WINDOW_CAP_MS` crash backstop below.
+ *      `SUPERSEDE_OPEN_WINDOW_CAP_MS` crash backstop below, and — for a reply
+ *      the two gates above cannot positively attribute to the session's own
+ *      loop — by the #3429 content gate, which this phase does NOT relax.
  *   2. COMPLETED (`completedAt` set) — the real turn_end (or a proxy for it:
  *      a new turn minting, or the bridge dying) was observed. The turn's own
  *      answer either already landed or can only arrive as a bounded REPLAY of

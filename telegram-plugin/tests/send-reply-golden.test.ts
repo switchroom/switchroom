@@ -55,6 +55,7 @@ import type { ReplyOwnerTier, ReplyOwnerCandidates } from '../reply-owner-resolv
 import { resolveReplyOwnerTier, resolveReplyOwnerTurnId } from '../reply-owner-resolve.js'
 import { SubagentHandbackMarker, stampsHandbackMarker } from '../gateway/subagent-handback-marker.js'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js'
+import { SubagentReplyAuthority } from '../gateway/subagent-reply-authority.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, Access } from '../gateway/gateway.js'
 
@@ -254,6 +255,9 @@ function makeHarness(opts?: {
     streamKey: key,
     resolveReplyOwnerTurn: () => ownerRes(null, 'none'),
     getLastSubagentHandbackAt: () => null,
+    // #4176 — default: no sub-agent live (the non-delegating case). Tests that
+    // exercise the gate override `h.deps.subagentReplyAuthority`.
+    subagentReplyAuthority: { subagentCouldOwnReply: () => false },
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
     resolveAnswerThreadWithLog: (_c, explicit) => explicit,
@@ -1813,5 +1817,215 @@ describe('#4174 — the handback gate-hold is bounded by its OWN 60 s recency wi
     expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
     expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
     expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+})
+
+describe('#4176 — a BACKGROUND SUB-AGENT reply can never silently edit over a flushed answer', () => {
+  // The MAJOR from the #4167 review. The #4173 window rests on "a reply landing
+  // between the synthetic and the real turn_end is this turn's own answer,
+  // because nothing else can run on the serial session". A background `Task`
+  // sub-agent falsifies that: it runs CONCURRENTLY and calls `reply` over the
+  // PARENT's IPC bridge, so #4172's identity gate cannot see it and no
+  // `subagent_handback` marker is stamped (a direct tool call never traverses
+  // pendingInboundBuffer). Owner resolution then lands on the flush-ended turn
+  // (OPEN is accepted at any age up to the crash cap), the bypass grants
+  // positive attribution, and the sub-agent's FOREIGN content supersedes —
+  // editing over the user's delivered answer with no notification for either.
+  const OWNER_TURN_ID = `${CHAT}:_#flushed-4176`
+  const FLUSH_MSG_ID = 44176
+  const FLUSHED_TEXT =
+    'Traced the wedge to the broker socket: the gateway reconnects but never re-arms the ' +
+    'heartbeat, so the supervisor sees it as healthy while every vault read times out.'
+  // Genuinely foreign content — a researcher sub-agent reporting its own finding.
+  // Defeats both arms of flushedAnswerMatchesReply, so nothing here can pass by
+  // accident through the content matcher.
+  const SUBAGENT_REPLY =
+    'Sub-agent report: the calendar scope audit found four call sites that request the ' +
+    'write scope where a read scope would do, all reachable from the OAuth consent screen.'
+
+  function makeFlushedOwner(): CurrentTurn {
+    return {
+      turnId: OWNER_TURN_ID,
+      sessionChatId: CHAT,
+      answerDelivered: 'flush',
+      flushedAnswerText: FLUSHED_TEXT,
+      endedAt: Date.now() - 90_000,
+      // Window OPEN: the flush ended the turn synthetically, the session's real
+      // turn_end has not been observed (the parent is still delegating).
+      realEndObservedAt: null,
+      replyCalled: false,
+      finalAnswerDelivered: true,
+      finalAnswerSubstantive: true,
+    } as unknown as CurrentTurn
+  }
+
+  function seed(h: ReturnType<typeof makeHarness>): void {
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      { turnId: OWNER_TURN_ID, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now() - 90_000,
+    )
+    // Latest-ended tier, corroborated, no handback marker, MAIN bridge → every
+    // other gate passes. The sub-agent liveness signal is the only thing left.
+    h.deps.resolveReplyOwnerTurn = () => ownerRes(makeFlushedOwner(), 'latest-ended')
+    h.deps.getLastSubagentHandbackAt = () => null
+  }
+
+  it('the content matcher cannot save this case (foreign content, both arms fail)', () => {
+    expect(flushedAnswerMatchesReply(FLUSHED_TEXT, SUBAGENT_REPLY)).toBe(false)
+  })
+
+  it('MAJOR REPRO: with a live sub-agent, its reply ships FRESH — zero edits/deletes ' +
+    'of the flushed message, record intact for the parent turn\'s own replay', async () => {
+    const h = makeHarness()
+    seed(h)
+    // The REAL tracker, driven by the REAL framework-derived session events the
+    // gateway feeds it — not a hand-set boolean.
+    const authority = new SubagentReplyAuthority()
+    authority.noteSessionEvent({ kind: 'sub_agent_started', agentId: 'researcher-1' })
+    expect(authority.subagentCouldOwnReply()).toBe(true)
+    h.deps.subagentReplyAuthority = authority
+
+    const res = await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: SUBAGENT_REPLY },
+      turn: null, // decoupled — the parent turn was ended by the flush
+      callerIsForeignSession: false, // SAME bridge: #4172 cannot see this caller
+    })
+
+    // OUTCOME: msg A untouched; the sub-agent's report is a fresh, NOTIFYING
+    // message the user actually receives.
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    const fresh = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]!.text).toContain('calendar scope audit')
+    expect(fresh[0]!.message_id).not.toBe(FLUSH_MSG_ID)
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+    // The flush record survives for the parent turn's own genuine late replay.
+    expect(
+      h.deps.flushedTurnSupersede.peek(CHAT, undefined, {
+        liveTurnId: OWNER_TURN_ID,
+        now: Date.now(),
+      }).supersede,
+    ).toBe(true)
+  })
+
+  it('NEGATIVE CONTROL (the reviewed failure): the SAME reply with NO sub-agent live ' +
+    'destroys the flushed answer by edit — proving the liveness gate is load-bearing', async () => {
+    const h = makeHarness()
+    seed(h)
+    // Identical scenario, gate disarmed (the pre-fix behaviour): the bypass
+    // applies and the foreign report edits over msg A — the double loss (the
+    // user's answer destroyed, the report delivered without a notification).
+    h.deps.subagentReplyAuthority = new SubagentReplyAuthority()
+
+    await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: SUBAGENT_REPLY },
+      turn: null,
+      callerIsForeignSession: false,
+    })
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+  })
+
+  it('liveness is released by sub_agent_turn_end: after the sub-agent finishes, the ' +
+    'parent\'s OWN reworded answer still collapses to ONE message (#4166 preserved)', async () => {
+    const h = makeHarness()
+    seed(h)
+    const authority = new SubagentReplyAuthority()
+    authority.noteSessionEvent({ kind: 'sub_agent_started', agentId: 'researcher-1' })
+    authority.noteSessionEvent({ kind: 'sub_agent_tool_use', agentId: 'researcher-1' })
+    authority.noteSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'researcher-1' })
+    expect(authority.liveCount()).toBe(0)
+    h.deps.subagentReplyAuthority = authority
+
+    // The parent's own answer, reworded (defeats the content matcher) — this is
+    // the collapse the #4173/#4166 work exists to preserve.
+    const REWORDED_OWN =
+      'The wedge is the broker socket: the gateway does reconnect, but the heartbeat is ' +
+      'never re-armed, so the supervisor reports healthy while all vault reads time out.'
+    expect(flushedAnswerMatchesReply(FLUSHED_TEXT, REWORDED_OWN)).toBe(false)
+
+    await sendReply(h.deps, { args: { chat_id: CHAT, text: REWORDED_OWN }, turn: null })
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+  })
+
+  it('a live sub-agent does NOT block a genuine same-content replay (supersede on ' +
+    'equality is content-preserving)', async () => {
+    const h = makeHarness()
+    seed(h)
+    const authority = new SubagentReplyAuthority()
+    authority.noteSessionEvent({ kind: 'sub_agent_started', agentId: 'worker-2' })
+    h.deps.subagentReplyAuthority = authority
+
+    await sendReply(h.deps, { args: { chat_id: CHAT, text: FLUSHED_TEXT }, turn: null })
+
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+  })
+
+  it('an UNFINISHED sub-agent keeps the gate armed (missing turn_end fails SAFE), ' +
+    'and reset() on bridge death releases it', async () => {
+    const authority = new SubagentReplyAuthority()
+    authority.noteSessionEvent({ kind: 'sub_agent_started', agentId: 'reviewer-3' })
+    authority.noteSessionEvent({ kind: 'sub_agent_started', agentId: 'researcher-4' })
+    authority.noteSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'reviewer-3' })
+    // One still live → gate armed.
+    expect(authority.subagentCouldOwnReply()).toBe(true)
+
+    const h = makeHarness()
+    seed(h)
+    h.deps.subagentReplyAuthority = authority
+    await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: SUBAGENT_REPLY },
+      turn: null,
+    })
+    expect(h.calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(1)
+
+    // Bridge death: the claude session and every sub-agent under it are gone.
+    authority.reset()
+    expect(authority.subagentCouldOwnReply()).toBe(false)
+  })
+
+  it('non-sub_agent events never arm the gate (the feed takes the WHOLE stream ' +
+    'un-filtered, so this is the discrimination that matters)', () => {
+    const authority = new SubagentReplyAuthority()
+    authority.noteSessionEvent({ kind: 'turn_end' })
+    authority.noteSessionEvent({ kind: 'tool_use', agentId: 'not-a-subagent' })
+    authority.noteSessionEvent({ kind: 'assistant_text' })
+    authority.noteSessionEvent(null)
+    authority.noteSessionEvent({ kind: 'sub_agent_started' }) // id-less → ignorable
+    expect(authority.subagentCouldOwnReply()).toBe(false)
+  })
+
+  // Structural pins: gateway.ts / stream-render.ts are not importable from a
+  // test runner (the singleton + boot-gated lockedBot), so the wiring that makes
+  // the gate reachable in production is pinned by source assertion — the same
+  // accepted pattern as the #4172 pin above. Dropping any of these three lines
+  // silently disarms the gate with every behavioural test above still green.
+  it('#4176 wiring — the session-event feed, the bridge-death reset, and the ' +
+    'send-path dep are all present', () => {
+    const streamSrc = readFileSync(new URL('../gateway/stream-render.ts', import.meta.url), 'utf8')
+    // FEED: every event, before the kind switch (the `sub_agent_tool_use` case
+    // early-returns when no turn is live, so the switch is not a usable site).
+    expect(streamSrc).toContain('subagentReplyAuthority.noteSessionEvent(')
+    const gwSrc = readFileSync(new URL('../gateway/gateway.ts', import.meta.url), 'utf8')
+    // RESET on main-bridge disconnect + READ wired into the sendReply deps.
+    expect(gwSrc).toContain('subagentReplyAuthority.reset()')
+    expect(gwSrc).toMatch(/subagentReplyAuthority,/)
+    const sendSrc = readFileSync(new URL('../gateway/outbound-send-path.ts', import.meta.url), 'utf8')
+    expect(sendSrc).toContain('subagentReplyAuthority.subagentCouldOwnReply()')
+    expect(sendSrc).toContain('subagentCouldOwnReply,')
   })
 })
