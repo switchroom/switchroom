@@ -165,8 +165,33 @@ describe('the real tree', () => {
     }
     const r = evaluateRetryHookWiring(files)
     expect(r.errors).toEqual([])
+
     // Sanity: the guard is actually finding wirings, not silently scanning zero
     // files (which would make the assertion above vacuous).
-    expect(r.sites.length).toBeGreaterThanOrEqual(4)
+    //
+    // The floor was 4 until #3863 (shipped in #4113) deleted
+    // `shared/bot-runtime.ts`'s `createRobustApiCall` — a fourth wiring with
+    // ZERO production callers whose breaker hooks were OPTIONAL (spread in only
+    // when the caller passed `floodStatePath`). It was deleted, not re-wired,
+    // so the live count is now 3. Do NOT lower this again to make a red build
+    // green: a drop below 3 means a real send path lost its wiring — or moved
+    // somewhere this scan no longer looks — which is exactly the #3849
+    // regression this guard exists to catch. Prove the wiring is gone on
+    // purpose first, and record why here.
+    expect(r.sites.length).toBeGreaterThanOrEqual(3)
+
+    // A bare count can be satisfied by the WRONG three sites — e.g. a rename or
+    // glob change hides the gateway's wirings while three others appear
+    // elsewhere. Pin the files that must still carry a wiring, so a scanner
+    // blind spot fails loudly by name instead of being masked by the count.
+    // Adding a genuinely new wiring is fine — add its file here in the same
+    // diff, so a new outbound send path is an acknowledged review decision.
+    const paths = r.sites.map((s: { path: string }) => s.path)
+    expect([...new Set(paths)].sort()).toEqual([
+      'telegram-plugin/gateway/gateway.ts',
+      'telegram-plugin/gateway/outbox-sweep.ts',
+    ])
+    // gateway.ts carries two: `robustApiCall` and `nonEssentialApiCall`.
+    expect(paths.filter((p: string) => p === 'telegram-plugin/gateway/gateway.ts')).toHaveLength(2)
   })
 })
