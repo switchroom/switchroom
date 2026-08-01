@@ -22,16 +22,23 @@
  *   | GrammyError 400 "message to edit not found"   | swallow, return undefined                 |
  *   | GrammyError 400 "message to delete not found" | swallow, return undefined                 |
  *   | GrammyError 400 "thread not found" (w/ opts)  | throw `THREAD_NOT_FOUND` wrapper          |
- *   | Network error (fetch failed / ECONN…)         | exponential backoff retry, 3 attempts     |
+ *   | HttpError (grammy transport failure)          | exponential backoff retry, 3 attempts     |
+ *   | Raw network error (fetch failed / ECONN…)     | exponential backoff retry, 3 attempts     |
+ *   | ENOSPC/EDQUOT/EIO/ENOMEM (local exhaustion)   | throw `LOCAL_RESOURCE_EXHAUSTED`, no retry|
  *   | Anything else                                 | rethrow immediately                       |
  *
  * The three "swallow" rows are the DEFAULT, not the law: a call site whose
  * contract is "did the target message survive?" sets `rethrowBenign400: true`
  * and gets the original `GrammyError` instead, so it can classify the failure
  * itself. See that option's docblock for the #4065 inertness bug it exists for.
+ *
+ * The network row is classified by TYPE (`isTransientTransportError`), not by a
+ * substring of the message: grammy rewrites every transport failure's message
+ * to `Network request for '<method>' failed!`, so the substring form of this
+ * row never matched in production and the retry was dead code (#4123).
  */
 
-import { GrammyError } from 'grammy'
+import { GrammyError, HttpError } from 'grammy'
 import { AsyncLocalStorage } from 'async_hooks'
 
 // ─── retry-attempt context (#3931) ────────────────────────────────────────
@@ -70,8 +77,13 @@ function withAttemptContext<T>(ctx: TgAttemptContext, fn: () => Promise<T>): Pro
 }
 
 /**
- * The transient network-error classifier the retry loop uses. Exported so the
- * "will this be retried?" predicate cannot drift from the loop's own decision.
+ * Substring classifier for a RAW transport error message (an undici/node error
+ * that has not been through grammy's wrapping).
+ *
+ * NOT sufficient on its own for anything that came out of `bot.api.*` — see
+ * `isTransientTransportError`, which is what the retry loop actually calls.
+ * grammy rewrites the message of every transport failure, so this predicate
+ * returns false for 100% of production send failures if used alone (#4123).
  */
 export function isTransientNetworkMessage(msg: string): boolean {
   return (
@@ -82,6 +94,58 @@ export function isTransientNetworkMessage(msg: string): boolean {
   )
 }
 
+/**
+ * Is `err` a transient TRANSPORT failure the policy should back off and repeat?
+ *
+ * This is the single classifier the retry loop and `willRetryTelegramFailure`
+ * both call, so the policy and the logging tier cannot disagree about what
+ * counts as retryable (#3931).
+ *
+ * Why this is a TYPE test and not a message test (#4123): grammy funnels every
+ * fetch rejection through `toHttpError` (grammy 1.44.0, `out/core/client.js:58`
+ * → `out/core/error.js:76-83`), which throws away the original error text and
+ * renders `Network request for '<method>' failed!`. The underlying
+ * `fetch failed` / `ECONNRESET` / `ETIMEDOUT` / `ENOTFOUND` string is preserved
+ * only on `HttpError.error`, and is appended to the message only when
+ * `client.sensitiveLogs` is on — which we deliberately leave off, because it
+ * writes the bot-token URL into logs. So a substring match over the message
+ * matched NOTHING in production: the network-retry branch was dead code and a
+ * single connection blip terminally failed the send.
+ *
+ * The classes, and why each lands where it does:
+ *
+ *   - `GrammyError`  — an API-LEVEL rejection: Telegram answered, and said no.
+ *     Never part of the network class. 429 has its own sleep-and-retry branch
+ *     above; everything else (400/403/404/…) is terminal and must NOT be
+ *     retried. This is the invariant the old `!isGrammyErr` guard at the
+ *     callsite protected; it now lives here, in one place, next to the reason.
+ *   - local resource exhaustion — ENOSPC/EDQUOT/EIO/ENOMEM is a LOCAL disk or
+ *     memory failure. Retrying it in a tight loop is what tripped the per-bot
+ *     flood ban (#2923). Excluded even when grammy wrapped it.
+ *   - `HttpError`    — transport by construction: it exists only on the
+ *     "the fetch never produced a Telegram response" path (connection reset,
+ *     DNS failure, request timeout, unparseable proxy 5xx). Retryable.
+ *   - anything else  — a raw error that never went through grammy (or a nested
+ *     cause): fall back to the errno/message classifier.
+ */
+export function isTransientTransportError(err: unknown): boolean {
+  if (err instanceof GrammyError) return false
+  if (isLocalResourceError(err)) return false
+  if (err instanceof HttpError) {
+    // grammy stashes the original rejection on `.error`. A local disk failure
+    // during a multipart upload can surface here; it stays non-retryable.
+    return !isLocalResourceError((err as HttpError).error)
+  }
+  const msg = err instanceof Error ? err.message : String(err ?? '')
+  if (isTransientNetworkMessage(msg)) return true
+  // One level of standard cause-chaining (`new Error(x, { cause })`), so a
+  // wrapper that preserves the transport error is still classified correctly.
+  const cause = (err as { cause?: unknown } | null)?.cause
+  if (cause == null || cause === err) return false
+  if (isLocalResourceError(cause)) return false
+  return isTransientNetworkMessage(cause instanceof Error ? cause.message : String(cause))
+}
+
 /** The parts of a Telegram failure that decide retryability. */
 export interface TgFailureShape {
   /** Telegram `error_code`, or null/undefined for a transport-level error. */
@@ -90,6 +154,15 @@ export interface TgFailureShape {
   retryAfterSec?: number | null
   /** Transport-level error message (only consulted when `errorCode` is absent). */
   message?: string | null
+  /**
+   * The thrown error itself, when the caller has it.
+   *
+   * STRONGLY PREFERRED over `message` for anything that came out of `bot.api.*`:
+   * grammy rewrites the message of every transport failure, so a message-only
+   * shape cannot tell a retryable `HttpError` from a terminal one (#4123). Pass
+   * the error and the predicate classifies by type, exactly as the loop does.
+   */
+  cause?: unknown
 }
 
 /**
@@ -120,7 +193,11 @@ export function willRetryTelegramFailure(
     return delayMs <= ctx.maxFloodSleepMs
   }
   if (failure.errorCode != null) return false
-  return isTransientNetworkMessage(failure.message ?? '')
+  // Classify by TYPE when the caller handed us the error (the seam that
+  // matters — see `isTransientTransportError`); fall back to the message only
+  // for shapes reconstructed from a log line, which have nothing else.
+  if (failure.cause != null) return isTransientTransportError(failure.cause)
+  return isTransientTransportError(new Error(failure.message ?? ''))
 }
 
 export interface RetryCallOpts {
@@ -603,7 +680,12 @@ export function createRetryApiCall(
         }
 
         // Network-level transient errors — exponential backoff, bounded.
-        if (!isGrammyErr && isTransientNetworkMessage(msg)) {
+        // Classified by TYPE, not by message substring: grammy rewrites the
+        // message of every transport failure, so the old substring test never
+        // fired in production and this whole branch was dead (#4123). The
+        // `!isGrammyErr` guard that used to sit here now lives inside
+        // `isTransientTransportError`, which excludes GrammyError explicitly.
+        if (isTransientTransportError(err)) {
           if (attempt < maxRetries - 1) {
             const delayMs = Math.pow(2, attempt) * 1000
             log?.(

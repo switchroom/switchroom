@@ -214,6 +214,13 @@ export function installTgPostLogger(bot: Bot): void {
       // #3931 — same attempt-vs-outcome rule as the resolved-rejection branch
       // above. This branch carries the transport (`HttpError`) failures, whose
       // transient members the retry policy backs off and repeats.
+      //
+      // #4123 — pass `cause`, not just `message`. grammy rewrites every
+      // transport failure's message to `Network request for '<method>' failed!`,
+      // so a message-only shape classified EVERY transport blip as terminal and
+      // wrote `status=err` — which fleet-health escalates as a
+      // `reply-delivery-failure` even when the next attempt delivers. The
+      // predicate needs the error itself to classify by type.
       const retrying = willRetryTelegramFailure({
         errorCode: err instanceof GrammyError ? (err as GrammyError).error_code : null,
         retryAfterSec:
@@ -221,6 +228,7 @@ export function installTgPostLogger(bot: Bot): void {
             ? ((err as GrammyError).parameters?.retry_after ?? null)
             : null,
         message: err instanceof Error ? err.message : String(err ?? ''),
+        cause: err,
       })
       emit(retrying ? 'retry' : 'err', errClass, code, shortDesc(rawDesc))
       throw err
