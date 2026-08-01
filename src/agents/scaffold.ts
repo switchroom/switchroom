@@ -780,6 +780,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
+import { RETAIN_TAGS_DEFAULT } from "../memory/hindsight-retain-provenance.js";
 import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled, fetchBankRetainMission, decideRetainMissionUpgrade, PROFILE_MEMORY_DEFAULTS, fetchBankObservationsMission, decideObservationsMissionUpgrade } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
@@ -3647,6 +3648,18 @@ function renderHindsightSettingsOverrides(
   // retainOverlapTurns from the cascaded config (default 1) → window =
   // overlap_turns + every_n_turns recent turns per fire (default 1 + 3 = 4).
   settings.retainOverlapTurns = retainConfig.overlapTurns;
+  // Provenance on auto-retained transcript content. The vendor default is
+  // `["{session_id}"]` — a bare session UUID, which is filterable but carries
+  // no meaning, so nothing downstream could ask "did a human assert this, or
+  // did fact extraction lift it out of a transcript (possibly out of the
+  // agent's OWN synthesis)?". Hindsight's best-practices page is explicit that
+  // metadata is NOT filterable and tags ARE, so the marker has to be a tag.
+  // `{session_id}` is kept — it is what the curated observation-scope strategy
+  // recognises as volatile, and what `switchroom memory` surfaces. See
+  // src/memory/hindsight-retain-provenance.ts for the full rationale, including
+  // why the paired vendor change keeps the new tag OUT of the consolidation
+  // scope so this is not a silent scope migration.
+  settings.retainTags = [...RETAIN_TAGS_DEFAULT];
   // v0.13.22 smart defaults: at our recallBudget=low the vendor's 12
   // memories is generous; 8 keeps prompt noise down without hurting
   // the substantive recall@N (top-8 carries the same dominant facts

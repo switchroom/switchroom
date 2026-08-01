@@ -25,9 +25,24 @@ OBSERVATION_SCOPE_STRATEGIES = ("curated", "shared", "combined", "off")
 #: value that, if left in scope, defeats cross-session dedup on the dominant
 #: (sidechain) observation path. A tag matching ANY of these is dropped from the
 #: consolidation scope but LEFT on the source fact.
+#:
+#: ``^source:`` (switchroom provenance tagging) is in the list for a different
+#: reason than the other two, and the name of the constant undersells it: what
+#: this list really means is "tags excluded from the CONSOLIDATION SCOPE, kept
+#: on the source fact". ``source:transcript`` is the opposite of volatile — it
+#: is stamped identically on every auto-retain, forever. That is exactly why it
+#: must not reach the scope: a stable tag flips ``curated`` from the bank-wide
+#: ``"shared"`` scope to an explicit ``[["source:transcript"]]`` partition, so
+#: every observation consolidated after the tag ships would be isolated from
+#: every observation consolidated before it. The tag is a RECALL-side filter
+#: handle (``metadata`` is not filterable, tags are), not a consolidation
+#: partition, so scope computation must stay byte-identical to before it
+#: existed. Pinned against ``RETAIN_PROVENANCE_TAG_SCOPE_PATTERN`` in
+#: ``src/memory/hindsight-retain-provenance.ts``.
 DEFAULT_VOLATILE_SCOPE_PATTERNS = (
     r"^parent_session:",
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(-sub-.+)?$",
+    r"^source:",
 )
 
 DEFAULTS = {
