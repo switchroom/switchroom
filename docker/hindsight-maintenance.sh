@@ -41,6 +41,18 @@
 #   SWITCHROOM_HINDSIGHT_STUCK_OP_WARN_S      alarm if any 'processing' op is
 #                                             claimed older than this (the reaper
 #                                             should have reset it). default 3600 (1h)
+#   SWITCHROOM_HINDSIGHT_DEAD_LETTER_WARN_S    warn if a failed 'retain' op with an
+#                                             intact payload (recoverable, stalled
+#                                             memory) is older than this. default
+#                                             21600 (6h). 0=off  (#3795)
+#   SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS  opt-in: POST FK-race dead letters to
+#                                             the engine retry endpoint (costs LLM
+#                                             spend). 1=on, default 0=off  (#3795)
+#   SWITCHROOM_HINDSIGHT_REQUEUE_MAX           max dead letters requeued per tick.
+#                                             default 100  (#3795)
+#   SWITCHROOM_HINDSIGHT_API_URL / _API_TOKEN  override the loopback engine API base
+#                                             URL / bearer token for the requeue POST
+#                                             (else http://127.0.0.1:${HINDSIGHT_API_PORT:-9077})
 set -u
 
 MAINT_ENABLED="${SWITCHROOM_HINDSIGHT_MAINTENANCE:-1}"
@@ -69,6 +81,19 @@ INDEX_HEALTH_CHECK="${SWITCHROOM_HINDSIGHT_INDEX_HEALTH_CHECK:-1}"
 # 'processing' op still claimed past this threshold means the heal isn't
 # landing (corrupt index / disabled reaper) and the deadlock is ACTIVE.
 STUCK_OP_WARN_S="${SWITCHROOM_HINDSIGHT_STUCK_OP_WARN_S:-3600}"
+# Dead-letter visibility + recovery (#3795). A ForeignKeyViolation race on
+# unit_entities (#3794) was misclassified by the engine as a DETERMINISTIC
+# failure, so the affected `retain` ops were dead-lettered with retry_count=0
+# / next_retry_at NULL — the worker's claim loop only revisits status='pending',
+# so nothing ever picks them up, yet their `task_payload` is intact. The memory
+# is STALLED, not lost. `DEAD_LETTER_WARN_S` surfaces the stalled backlog loudly
+# (nothing surfaced 770 such ops for 8 days); `REQUEUE_*` is an OFF-by-default,
+# operator-signed recovery that re-runs fact extraction (LLM spend) via the
+# engine's own retry endpoint. The classifier fix itself is an engine change
+# (out of scope here) tracked in #3794/#3795.
+DEAD_LETTER_WARN_S="${SWITCHROOM_HINDSIGHT_DEAD_LETTER_WARN_S:-21600}"
+REQUEUE_DEAD_LETTERS="${SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS:-0}"
+REQUEUE_MAX="${SWITCHROOM_HINDSIGHT_REQUEUE_MAX:-100}"
 
 log() { echo "switchroom-hindsight-maintenance: $*" >&2; }
 
@@ -118,8 +143,17 @@ fi
 # that previously hid for 26 days. Reports the oldest pending/processing
 # op's age; if it exceeds the threshold, something isn't draining. ---
 if [ "${QUEUE_LAG_WARN_S}" -gt 0 ] 2>/dev/null; then
-  # "count|oldest_age_seconds" for non-terminal ops (0 rows → "0|0").
-  _q="$(_sql "SELECT count(*)||'|'||coalesce(max(extract(epoch from (now()-created_at)))::bigint,0) FROM async_operations WHERE status IN ('pending','processing')")"
+  # "count|oldest_age_seconds" for CLAIMABLE non-terminal ops (0 rows → "0|0").
+  # #3758: `task_payload IS NOT NULL` mirrors the worker's PARTIAL claim index
+  # (`idx_async_operations_pending_claim ON (status, created_at) WHERE
+  # status='pending' AND task_payload IS NOT NULL`). A `batch_retain` PARENT is
+  # created with `task_payload=NULL` by design (memory_engine.py:12556) and is
+  # resolved by sibling aggregation, NEVER claimed by a worker — so its age can
+  # never indicate a stalled claimable pipeline. Counting payload-null parents
+  # produced recurring FALSE "queue may be wedged" alerts on perfectly healthy
+  # in-flight retains, whose suggested remediation (clearing the rows) would
+  # destroy live memory writes.
+  _q="$(_sql "SELECT count(*)||'|'||coalesce(max(extract(epoch from (now()-created_at)))::bigint,0) FROM async_operations WHERE status IN ('pending','processing') AND task_payload IS NOT NULL")"
   _qn="${_q%%|*}"
   _qage="${_q##*|}"
   if [ "${_qage:-0}" -gt "${QUEUE_LAG_WARN_S}" ] 2>/dev/null; then
@@ -155,6 +189,69 @@ if [ "${INDEX_HEALTH_CHECK}" = "1" ]; then
   _stuck="$(_sql "SELECT count(*) FROM async_operations WHERE status='processing' AND claimed_at < now() - make_interval(secs => ${STUCK_OP_WARN_S})")"
   if [ "${_stuck:-0}" -gt 0 ] 2>/dev/null; then
     log "ERROR: ${_stuck} async op(s) stuck in 'processing' older than $((STUCK_OP_WARN_S/60))m — the stale-claim reaper is not clearing them (corrupt pk_async_operations index or reaper disabled); per-bank consolidation is deadlocked. Inspect async_operations + 'docker logs switchroom-hindsight'."
+  fi
+fi
+
+# --- 6. Dead-letter visibility: WARN on recoverable-but-stalled failed
+# retains (#3795). A failed 'retain' op still carrying its task_payload is
+# recoverable via the retry endpoint — the memory is stalled, not lost — but
+# the worker's claim loop (status='pending') will never revisit it. Nothing
+# surfaced 770 such ops for 8 days; this makes the silent pile loud. ---
+if [ "${DEAD_LETTER_WARN_S}" -gt 0 ] 2>/dev/null; then
+  # "total|fk_signature|oldest_age_seconds". `total` = every failed retain with
+  # an intact payload (all recoverable). `fk_signature` = the subset the FK-race
+  # misclassifier stranded (retry_count=0 AND next_retry_at NULL) — these never
+  # entered the retry ladder and are the safe default to requeue. Read-only.
+  _dl="$(_sql "SELECT count(*)||'|'||count(*) FILTER (WHERE retry_count=0 AND next_retry_at IS NULL)||'|'||coalesce(max(extract(epoch from (now()-created_at)))::bigint,0) FROM async_operations WHERE operation_type='retain' AND status='failed' AND task_payload IS NOT NULL")"
+  _dltot="${_dl%%|*}"
+  _dlrest="${_dl#*|}"
+  _dlfk="${_dlrest%%|*}"
+  _dlage="${_dlrest##*|}"
+  if [ "${_dltot:-0}" -gt 0 ] 2>/dev/null && [ "${_dlage:-0}" -gt "${DEAD_LETTER_WARN_S}" ] 2>/dev/null; then
+    log "WARNING: ${_dltot} failed 'retain' op(s) with an intact payload are stalled (recoverable, oldest $((_dlage/3600))h old > $((DEAD_LETTER_WARN_S/3600))h); ${_dlfk} match the FK-race dead-letter signature (retry_count=0, never retried). STALLED memory, not lost — requeue via the retry endpoint (SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS=1; re-runs extraction, costs LLM spend). See #3795."
+  fi
+fi
+
+# --- 7. Dead-letter REQUEUE (opt-in, costs LLM spend). POST each FK-race dead
+# letter to the engine's own retry endpoint (failed→pending; clears
+# next_retry_at / worker_id; resets retry_count). The worker's claim index then
+# re-picks it up. OFF by default; operator sign-off required (#3795). ---
+if [ "${REQUEUE_DEAD_LETTERS}" = "1" ]; then
+  _api="${SWITCHROOM_HINDSIGHT_API_URL:-http://127.0.0.1:${HINDSIGHT_API_PORT:-9077}}"
+  _tok="${SWITCHROOM_HINDSIGHT_API_TOKEN:-${HINDSIGHT_API_TOKEN:-}}"
+  if ! command -v curl >/dev/null 2>&1; then
+    log "ERROR: dead-letter requeue requested but curl is absent — cannot reach ${_api}; skipping."
+  else
+    # bank|operation_id for the FK-race dead letters, oldest first, bounded.
+    _cands="$(_sql "SELECT bank_id||'|'||operation_id FROM async_operations WHERE operation_type='retain' AND status='failed' AND task_payload IS NOT NULL AND retry_count=0 AND next_retry_at IS NULL ORDER BY created_at LIMIT ${REQUEUE_MAX}")"
+    if [ -z "${_cands}" ]; then
+      log "dead-letter requeue: no FK-race dead letters to requeue."
+    else
+      # Read from a file (not a pipe) so the counters survive the loop.
+      _tmpf="$(mktemp 2>/dev/null || echo "/tmp/hs-requeue.$$")"
+      printf '%s\n' "${_cands}" > "${_tmpf}"
+      _ok=0; _fail=0; _aborted=0
+      while IFS='|' read -r _bank _op; do
+        [ -n "${_bank}" ] && [ -n "${_op}" ] || continue
+        _url="${_api}/v1/default/banks/${_bank}/operations/${_op}/retry"
+        if [ -n "${_tok}" ]; then
+          _code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${_tok}" "${_url}" 2>/dev/null)"
+        else
+          _code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${_url}" 2>/dev/null)"
+        fi
+        case "${_code}" in
+          2*) log "dead-letter requeue: ${_bank}/${_op} -> HTTP ${_code} (failed->pending)"; _ok=$((_ok + 1)) ;;
+          401|403) log "ERROR: dead-letter requeue: ${_bank}/${_op} -> HTTP ${_code} — the retry endpoint needs auth; set SWITCHROOM_HINDSIGHT_API_TOKEN. Aborting sweep."; _aborted=1; break ;;
+          *) log "WARNING: dead-letter requeue: ${_bank}/${_op} -> HTTP ${_code:-000} (not requeued)"; _fail=$((_fail + 1)) ;;
+        esac
+      done < "${_tmpf}"
+      rm -f "${_tmpf}" 2>/dev/null
+      if [ "${_aborted}" = 1 ]; then
+        log "dead-letter requeue: aborted after ${_ok} requeued (auth error) — supply SWITCHROOM_HINDSIGHT_API_TOKEN and re-run."
+      else
+        log "dead-letter requeue: ${_ok} requeued, ${_fail} failed (bounded at ${REQUEUE_MAX}/tick)."
+      fi
+    fi
   fi
 fi
 

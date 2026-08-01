@@ -200,3 +200,116 @@ describe("formatRecallLogView — injected relevance scores", () => {
     expect(out.join("\n")).not.toContain("score=0.00");
   });
 });
+
+// Switchroom #3775 — bank-composition telemetry was invisible in the default
+// (non-`--json`) `memory recall-log` view. recall.py stamps every row with
+// `injected_own_bank_count` / `injected_additional_bank_count` (and the
+// `reserved_*_slots` floors), and the scaffold/schema docs tell operators to
+// watch `injected_own_bank_count` via `switchroom memory recall-log <agent>`.
+// But `formatRecallLogView` rendered only volume/score/omitted fields, so the
+// documented remedy required `--json`. The regression these catch is own-bank
+// COLLAPSE: `result_count` stays full while none of it comes from the agent's
+// own bank. These assert the split reaches the operator on the human path.
+describe("formatRecallLogView — bank composition (#3775)", () => {
+  const ANSI = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
+  const strip = (s: string) => s.replace(ANSI, "");
+
+  it("reads the four composition fields off the log through the typed interface", () => {
+    const dir = mkdtempSync(join(tmpdir(), "recall-log-comp-"));
+    const stateDir = join(
+      dir, ".claude", "plugins", "data", "hindsight-memory-inline", "state",
+    );
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, "recall_log.jsonl"),
+      JSON.stringify({
+        ts: "2026-07-31T10:00:00Z",
+        result_count: 6,
+        injected_own_bank_count: 2,
+        injected_additional_bank_count: 4,
+        reserved_own_slots: 2,
+        reserved_additional_slots: 1,
+      }) + "\n",
+    );
+    try {
+      const e = readRecallLog(dir, 10)[0];
+      expect(e.injected_own_bank_count).toBe(2);
+      expect(e.injected_additional_bank_count).toBe(4);
+      expect(e.reserved_own_slots).toBe(2);
+      expect(e.reserved_additional_slots).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prints the own/additional split per row", () => {
+    const out = formatRecallLogView("clerk", [
+      {
+        ts: "2026-07-31T10:00:00Z",
+        result_count: 6,
+        injected_own_bank_count: 2,
+        injected_additional_bank_count: 4,
+      },
+    ]).map(strip);
+    expect(out[2]).toContain("own/add=2/4");
+  });
+
+  it("flags an own-bank collapse turn in the summary (full result, zero own)", () => {
+    const out = formatRecallLogView("clerk", [
+      // Collapse: full set, but none of it is the agent's own bank.
+      {
+        ts: "2026-07-31T10:00:00Z",
+        result_count: 6,
+        injected_own_bank_count: 0,
+        injected_additional_bank_count: 6,
+      },
+      // Healthy row — own bank contributes.
+      {
+        ts: "2026-07-31T10:01:00Z",
+        result_count: 6,
+        injected_own_bank_count: 3,
+        injected_additional_bank_count: 3,
+      },
+    ]).map(strip);
+
+    // Only the collapse turn counts.
+    expect(out[1]).toContain("own_bank_collapse_turns=1");
+    // The collapse row surfaces its 0/N split; the healthy row shows its own.
+    expect(out[2]).toContain("own/add=0/6");
+    expect(out[3]).toContain("own/add=3/3");
+  });
+
+  it("distinguishes a full-but-own-starved turn from a full-and-own-fed one", () => {
+    // Both turns are volume-identical: result_count 8, no cap, no demotion.
+    const starved = formatRecallLogView("clerk", [
+      { ts: "t", result_count: 8, injected_own_bank_count: 0, injected_additional_bank_count: 8 },
+    ]).map(strip);
+    const fed = formatRecallLogView("clerk", [
+      { ts: "t", result_count: 8, injected_own_bank_count: 8, injected_additional_bank_count: 0 },
+    ]).map(strip);
+
+    // The volume summary cannot tell them apart.
+    expect(starved[1]).toContain("avg=8 max=8");
+    expect(fed[1]).toContain("avg=8 max=8");
+    // The composition detector can: only the starved turn is a collapse.
+    expect(starved[1]).toContain("own_bank_collapse_turns=1");
+    expect(fed[1]).not.toContain("own_bank_collapse");
+  });
+
+  it("stays silent about composition when no row carries the stamp (no noise)", () => {
+    const out = formatRecallLogView("clerk", [
+      { ts: "2026-07-31T10:00:00Z", result_count: 5 },
+      { ts: "2026-07-31T10:01:00Z", cache_hit: true },
+    ]).map(strip);
+    expect(out.join("\n")).not.toContain("own/add");
+    expect(out.join("\n")).not.toContain("own_bank_collapse");
+  });
+
+  it("does not count an unstamped (no-composition) turn as a collapse", () => {
+    // own is absent, not 0 — absence of data must not read as a regression.
+    const out = formatRecallLogView("clerk", [
+      { ts: "2026-07-31T10:00:00Z", result_count: 6 },
+    ]).map(strip);
+    expect(out.join("\n")).not.toContain("own_bank_collapse");
+  });
+});

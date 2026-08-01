@@ -8,6 +8,10 @@ import {
   classifyObservationScopeSaturation,
   computeScopeSaturation,
   inspectBankScopes,
+  fnmatchcase,
+  scopeMatchesGlobs,
+  parseScopeLimitRules,
+  effectiveScopeLimit,
   type BankScopeReport,
   type ObservationScope,
 } from "./doctor-observation-scopes.js";
@@ -53,6 +57,7 @@ const report = (over: Partial<BankScopeReport> & { bankId: string }): BankScopeR
   observationsEnabled: true,
   hasScopeLimitRules: false,
   scopeCount: 0,
+  judgedScopeCount: 0,
   untaggedCount: 0,
   saturated: [],
   pendingConsolidation: null,
@@ -65,16 +70,20 @@ const reportFor = (
   scopes: ObservationScope[],
   cap = 1000,
   pendingConsolidation: number | null = null,
-): BankScopeReport =>
-  report({
+): BankScopeReport => {
+  // Mirror inspectBankScopes: the full judged list, then the saturated subset.
+  const allJudged = computeScopeSaturation(scopes, cap);
+  return report({
     bankId,
     cap,
     scopeCount: scopes.length,
+    judgedScopeCount: allJudged.length,
     // Mirror inspectBankScopes: the untagged scope is tracked, never saturated.
     untaggedCount: scopes.filter((s) => s.tags.length === 0).reduce((n, s) => n + s.count, 0),
-    saturated: computeScopeSaturation(scopes, cap).filter((s) => s.status !== "ok"),
+    saturated: allJudged.filter((s) => s.status !== "ok"),
     pendingConsolidation,
   });
+};
 
 describe("the live overlord failure", () => {
   it("FAILS, and names the bank, the scope and 1009/1000", () => {
@@ -327,24 +336,6 @@ describe("configurations this check must not judge", () => {
     expect(result.detail).toContain("closed");
   });
 
-  it("refuses to judge a bank carrying observation_scope_limits rules", () => {
-    // Those rules resolve a DIFFERENT cap per scope via fnmatch exact-cover
-    // (consolidator.py:670-683). A rule that RAISES a scope's limit would make
-    // the bank-wide comparison invent a FAIL, so the bank is excluded and the
-    // gap is stated instead of guessed at.
-    const result = classifyObservationScopeSaturation([
-      report({
-        bankId: "ruled",
-        hasScopeLimitRules: true,
-        scopeCount: 1,
-        saturated: computeScopeSaturation([scope(["s"], 5000)], 1000),
-      }),
-    ]);
-    expect(result.status).toBe("skip");
-    expect(result.detail).toContain("observation_scope_limits");
-    expect(result.detail).toContain("ruled");
-  });
-
   it("does not judge a bank with observations disabled", () => {
     const result = classifyObservationScopeSaturation([
       report({
@@ -356,6 +347,136 @@ describe("configurations this check must not judge", () => {
     ]);
     expect(result.status).toBe("skip");
     expect(result.detail).toContain("observations disabled");
+  });
+});
+
+// #3950 — the fnmatch scope-limit mirror. Divergence from the engine here
+// produces silently wrong verdicts, so these pin the semantics against the
+// docstrings of `_scope_matches_globs` / `_parse_scope_limit_rules`
+// (consolidator.py:606-683), not just the code path.
+describe("observation_scope_limits glob mirror (#3950)", () => {
+  describe("fnmatchcase — case-sensitive fnmatch semantics", () => {
+    it("* matches any run including empty", () => {
+      expect(fnmatchcase("run_1", "run_*")).toBe(true);
+      expect(fnmatchcase("run_", "run_*")).toBe(true);
+      expect(fnmatchcase("nope", "run_*")).toBe(false);
+    });
+    it("? matches exactly one char", () => {
+      expect(fnmatchcase("ab", "a?")).toBe(true);
+      expect(fnmatchcase("a", "a?")).toBe(false);
+      expect(fnmatchcase("abc", "a?")).toBe(false);
+    });
+    it("[seq] and [!seq] classes", () => {
+      expect(fnmatchcase("a", "[abc]")).toBe(true);
+      expect(fnmatchcase("d", "[abc]")).toBe(false);
+      expect(fnmatchcase("d", "[!abc]")).toBe(true);
+      expect(fnmatchcase("a", "[!abc]")).toBe(false);
+    });
+    it("is case-SENSITIVE (fnmatchcase, not fnmatch)", () => {
+      expect(fnmatchcase("Shared", "shared")).toBe(false);
+      expect(fnmatchcase("shared", "shared")).toBe(true);
+    });
+    it("escapes regex metacharacters in literals", () => {
+      expect(fnmatchcase("a.b", "a.b")).toBe(true);
+      expect(fnmatchcase("axb", "a.b")).toBe(false);
+    });
+  });
+
+  describe("scopeMatchesGlobs — exact cover both directions (the docstring examples)", () => {
+    it('["shared"] matches {shared} but NOT {run_1, shared}', () => {
+      expect(scopeMatchesGlobs(["shared"], ["shared"])).toBe(true);
+      expect(scopeMatchesGlobs(["shared"], ["run_1", "shared"])).toBe(false);
+    });
+    it('["run_*", "shared"] matches {run_1, shared} but NOT {shared}', () => {
+      expect(scopeMatchesGlobs(["run_*", "shared"], ["run_1", "shared"])).toBe(true);
+      expect(scopeMatchesGlobs(["run_*", "shared"], ["shared"])).toBe(false);
+    });
+    it("the empty tag set never matches (untagged is never rule-capped)", () => {
+      expect(scopeMatchesGlobs(["*"], [])).toBe(false);
+    });
+    it("rejects an uncovered tag", () => {
+      expect(scopeMatchesGlobs(["run_*"], ["run_1", "other"])).toBe(false);
+    });
+    it("rejects a vacuous glob that covers no tag", () => {
+      expect(scopeMatchesGlobs(["run_*", "nomatch_*"], ["run_1"])).toBe(false);
+    });
+  });
+
+  describe("parseScopeLimitRules — defensive parse, order preserved", () => {
+    it("keeps well-formed rules in order", () => {
+      const rules = parseScopeLimitRules([
+        { scope: ["run_*"], limit: 50 },
+        { scope: ["shared"], limit: 200 },
+      ]);
+      expect(rules).toEqual([
+        { globs: ["run_*"], limit: 50 },
+        { globs: ["shared"], limit: 200 },
+      ]);
+    });
+    it("skips malformed entries rather than throwing", () => {
+      expect(parseScopeLimitRules("nope")).toEqual([]);
+      expect(parseScopeLimitRules([{ scope: [], limit: 5 }])).toEqual([]);
+      expect(parseScopeLimitRules([{ scope: ["a"], limit: 1.5 }])).toEqual([]);
+      expect(parseScopeLimitRules([{ scope: ["a"], limit: true }])).toEqual([]);
+      expect(parseScopeLimitRules([{ scope: ["a", ""], limit: 5 }])).toEqual([]);
+      expect(parseScopeLimitRules([{ scope: ["a"] }])).toEqual([]);
+    });
+  });
+
+  describe("effectiveScopeLimit — first match wins, else bank cap", () => {
+    const rules = [
+      { globs: ["run_*", "shared"], limit: 50 },
+      { globs: ["shared"], limit: 5000 },
+    ];
+    it("returns the first matching rule's limit", () => {
+      expect(effectiveScopeLimit(rules, ["run_1", "shared"], 1000)).toBe(50);
+      expect(effectiveScopeLimit(rules, ["shared"], 1000)).toBe(5000);
+    });
+    it("falls back to the bank-wide cap when no rule covers the scope", () => {
+      expect(effectiveScopeLimit(rules, ["lonely"], 1000)).toBe(1000);
+    });
+  });
+
+  describe("computeScopeSaturation honours per-scope glob caps", () => {
+    it("a rule that RAISES a scope's cap stops it failing the bank-wide cap", () => {
+      // Bank-wide cap 1000, but a rule raises {shared} to 5000. 3000 exact
+      // observations are FINE under the rule though they'd fail the bank cap.
+      const rules = [{ globs: ["shared"], limit: 5000 }];
+      const sat = computeScopeSaturation([scope(["shared"], 3000)], 1000, OBSERVATION_SCOPE_WARN_RATIO, rules);
+      expect(sat[0]?.status).toBe("ok");
+      expect(sat[0]?.cap).toBe(5000);
+    });
+    it("a rule that LOWERS a scope's cap can fail a scope the bank cap would pass", () => {
+      const rules = [{ globs: ["run_*"], limit: 100 }];
+      const sat = computeScopeSaturation([scope(["run_1"], 150)], 1000, OBSERVATION_SCOPE_WARN_RATIO, rules);
+      expect(sat[0]?.status).toBe("fail");
+      expect(sat[0]?.cap).toBe(100);
+    });
+    it("a rule can cap a scope even when the bank-wide cap is unlimited (-1)", () => {
+      const rules = [{ globs: ["run_*"], limit: 100 }];
+      const sat = computeScopeSaturation([scope(["run_1"], 150)], -1, OBSERVATION_SCOPE_WARN_RATIO, rules);
+      expect(sat[0]?.status).toBe("fail");
+    });
+  });
+
+  it("a glob-rule bank is now JUDGED end-to-end, not skipped", () => {
+    // The former behaviour skipped any bank carrying observation_scope_limits.
+    // Now the per-scope cap is resolved, so a scope a rule LOWERED can fail the
+    // row — and the bank is named in the detail as judged with glob caps.
+    const rules = [{ globs: ["run_*"], limit: 100 }];
+    const sat = computeScopeSaturation([scope(["run_1"], 250)], 1000, OBSERVATION_SCOPE_WARN_RATIO, rules);
+    const result = classifyObservationScopeSaturation([
+      report({
+        bankId: "ruled",
+        hasScopeLimitRules: true,
+        scopeCount: 1,
+        judgedScopeCount: sat.length,
+        saturated: sat.filter((s) => s.status !== "ok"),
+      }),
+    ]);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toContain("ruled");
+    expect(result.detail).toContain("250/100");
   });
 });
 

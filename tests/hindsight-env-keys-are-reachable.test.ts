@@ -80,6 +80,19 @@ describe("promoted container-env keys are reachable from switchroom.yaml", () =>
       "HINDSIGHT_API_HOST",
       "HINDSIGHT_API_LLM_PROVIDER",
       "HINDSIGHT_API_LLM_MODEL",
+      // The global LLM passthrough (#3687, resolveHindsightGlobalLlmExtras) —
+      // siblings of PROVIDER / MODEL above, emitted from the same structured
+      // `hindsight.llm.{base_url,api_key}` config and ONLY when set. They ARE
+      // operator-overridable, but through that typed config field, which is
+      // their channel: they are endpoint/credential config, not a free-form
+      // `hindsight.env` perf knob, so they are deliberately not routed through
+      // the perf resolvers. A perf-defaults entry carries a default value and
+      // would emit an unconditional empty (breaking the loopback host-network
+      // derivation in collectHindsightLlmBaseUrls) and would double-source the
+      // same var against the typed field. Derived config passthrough, excused
+      // exactly like PROVIDER / MODEL.
+      "HINDSIGHT_API_LLM_BASE_URL",
+      "HINDSIGHT_API_LLM_API_KEY",
       "HINDSIGHT_API_WORKER_ID",
       "HINDSIGHT_API_MCP_STATELESS",
       // The asserted LLM budget (hindsightLlmBudgetEnv). Every one of these is

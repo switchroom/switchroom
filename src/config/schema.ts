@@ -437,6 +437,18 @@ export const AgentMemorySchema = z
       .describe(
         "strict = never shared cross-agent, default = eligible for reflect"
       ),
+    profile: z
+      .string()
+      .optional()
+      .describe(
+        "Memory profile bank this agent's curated memory defaults key off — " +
+        "the built-in disposition + observations_mission in PROFILE_MEMORY_DEFAULTS. " +
+        "Decouples the memory profile from `extends` (the filesystem persona " +
+        "profile), so an agent on `extends: default` can opt into the `coding` " +
+        "memory bundle via `memory.profile: coding` without inheriting the coding " +
+        "persona. Resolution: memory.profile → extends → DEFAULT_PROFILE (see " +
+        "resolveMemoryProfile). Unset ⇒ byte-identical to keying off `extends`."
+      ),
     bank_mission: z
       .string()
       .optional()
@@ -3344,6 +3356,10 @@ const profileFields = {
       // agents) hindsight-native by default, with per-agent `file: true` opt-in.
       file: z.boolean().optional(),
       isolation: z.enum(["default", "strict"]).optional(),
+      // Mirror of AgentMemorySchema.profile — accepted at the defaults/profile
+      // tier too, so `defaults.memory.profile: coding` (or a profile setting it)
+      // cascades like every other memory field, with per-agent override.
+      profile: z.string().optional(),
       // Mirror of AgentMemorySchema.directive_capture_nudge — accepted at the
       // defaults/profile tier too, so `defaults.memory.directive_capture_nudge:
       // false` can disable the #2848 nudge fleet-wide (per-agent `true` opt-in).
@@ -3705,6 +3721,27 @@ export const AgentDefaultsSchema = z.object(defaultsFields).optional();
  * `profiles/default/` directory bundled with switchroom.
  */
 export const DEFAULT_PROFILE = "default";
+
+/**
+ * Resolve the **memory** profile an agent's curated memory defaults key off
+ * (disposition + observations_mission in `PROFILE_MEMORY_DEFAULTS`), decoupled
+ * from `extends` (the filesystem *persona* profile).
+ *
+ * Precedence: explicit `memory.profile` → `extends` → {@link DEFAULT_PROFILE}.
+ * When `memory.profile` is unset this is byte-identical to the historical
+ * `agentConfig.extends ?? DEFAULT_PROFILE`, so unopted agents see zero change.
+ *
+ * Structurally typed so it accepts a full `AgentConfig` or any `{ extends?,
+ * memory? }` shape (e.g. the doctor's bank-entry config). Takes the merged
+ * config — the cascade has already layered defaults/profile/agent memory.
+ */
+export function resolveMemoryProfile(
+  agentConfig:
+    | { extends?: string; memory?: { profile?: string } }
+    | undefined,
+): string {
+  return agentConfig?.memory?.profile ?? agentConfig?.extends ?? DEFAULT_PROFILE;
+}
 
 export const AgentSchema = z.object({
   extends: z

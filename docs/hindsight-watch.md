@@ -68,9 +68,12 @@ warn, 0.05 → 0.02) or deleted (recall latency) before shipping.
 **The three consolidation signals exist because `consolidation-queue-age` is
 inverted.** Its probe selects `FROM async_operations WHERE status IN
 ('pending','processing')`, so an operation that has FAILED is no longer in the
-set being measured — and `evaluateConsolidationQueueAge` reports
-`"consolidation queue empty"` when that count is zero. The more reliably a
-bank's consolidator fails, the healthier it reads. On 2026-07-29 the `overlord`
+set being measured. When that count is zero `evaluateConsolidationQueueAge`
+now reports `"no pending/processing operations (failures are not counted here
+— see consolidation-failure-streak)"` rather than the old
+`"consolidation queue empty"`, which read as an all-clear on the exact state a
+fully-failed queue produces (#3989). The more reliably a bank's consolidator
+fails, the emptier that set is — so the string had to stop implying health. On 2026-07-29 the `overlord`
 bank's consolidation failed on ~every run from 04:28 to 07:09 UTC and the API
 reported `pending_operations: 0, failed_operations: 96, pending_consolidation:
 37 711` **simultaneously**, for 2.5 h, with every watchdog signal green. It was
@@ -274,6 +277,22 @@ notified — the next tick retries it.
    `docker`, mode 0644). It is idempotent — re-running is a no-op when the
    fragment already matches.
 
+   The same command also **provisions `/var/log/hindsight-watch.log`** owned by
+   the cron user (#3991) and **installs a logrotate drop-in** at
+   `/etc/logrotate.d/hindsight-watch` (#3992). Both are load-bearing: on a
+   stock host `/var/log` is `root:syslog 0775`, so the cron's
+   `>> /var/log/hindsight-watch.log` redirection would otherwise fail
+   "Permission denied" before `switchroom` is even exec'd — every tick dies and
+   the `hindsight-watch armed` doctor row FAILs forever with "the watchdog has
+   never completed a tick". Pre-creating the file owned by the cron user lets
+   its append succeed without write access to `/var/log`; the logrotate drop-in
+   (`weekly`, `rotate 8`, `copytruncate`, `su <user> <user>`) bounds the
+   ~135 KB/day the 15-minute cron would otherwise grow unbounded. An existing
+   log file is left untouched (never truncated, never re-chowned). Provisioning
+   the log is FATAL if it fails (an armed cron that cannot write its log is the
+   silent-monitoring failure this verb exists to close); the logrotate drop-in
+   is best-effort and only WARNs.
+
    It **refuses to install for `root`**: the state file and the agents
    scaffold live under the operator's `~/.switchroom`, so a root tick would
    read an empty fleet and report a clean bill of health forever.
@@ -293,6 +312,37 @@ notified — the next tick retries it.
 Alerts arrive as a plain operator DM through the first agent gateway socket
 that accepts them. The gateway fences delivery to its own operator chat, so
 the watchdog cannot address a foreign chat.
+
+## Retiring the legacy host watchdog (operator action required)
+
+This in-repo watchdog **supersedes the hand-rolled host script
+`hindsight-memory-watchdog.sh`** (armed via `/etc/cron.d/hindsight-memory-watchdog`
+on some hosts). That script's `queue-evictions` alert counted every line of
+`pending-evictions.log` regardless of reason, so the routine trimming of the
+bounded `pending-reconciled/` archive at its cap read as data loss — it fired
+"⚠️ Memories are being discarded" on the live fleet 2026-07-30 when **no memory
+had been lost** (all 4 831 evictions fleet-wide were `reason=archive-count`,
+i.e. an already-acked archive expiring), and its copy named a
+`~/.hindsight/pending-evicted/` directory that does not exist on any agent
+(#4009).
+
+The `retain-loss` signal here does not have that defect: it reads the loss
+channels by directory (`pending-dead/`, `pending-evicted/`, `pending-drops.json`)
+and treats a DECREASE as a re-baseline, so a bounded archive expiring cannot be
+read as loss. Collapsed duplicates are surfaced separately as
+`… N collapsed-duplicate (not loss)` (#3896) precisely so a `collapse_duplicates`
+pass reads as an explained spool drain rather than as missing memory.
+
+Once this watchdog is armed and you have confirmed a clean tick (`switchroom
+doctor`), **retire the legacy host cron** so the two do not double-alert:
+
+```bash
+# Inspect first, then remove the legacy fragment (HOST op — run as the operator):
+sudo rm -f /etc/cron.d/hindsight-memory-watchdog
+```
+
+This is a host filesystem change outside `switchroom.yaml`, so it is not
+performed by any switchroom command — it is left to the operator deliberately.
 
 ## Flags
 

@@ -298,9 +298,10 @@ describe("requiredKeyDemands — group by the key that must reach the lane", () 
       PROXY_MODELS,
     );
     expect(required.find((r) => r.group === "gpt-oss-20b-retain")?.apiKeyRef).toBe("sk-lane");
-    // The global block has no `api_key` field in the schema, so the global lane
-    // is always `null` — UNKNOWN, not "the provisioned service key". Callers
-    // must warn on it rather than reconciling or failing another key by proxy.
+    // This config sets no global `hindsight.llm.api_key`, so the global lane
+    // inherits nothing and its apiKeyRef is `null` — UNKNOWN, not "the
+    // provisioned service key". When the global key IS set it presents that
+    // key instead (#3687) — see the global-key fallback describe block below.
     expect(required.find((r) => r.group === "gpt-oss-20b")?.apiKeyRef).toBeNull();
   });
 
@@ -355,6 +356,59 @@ describe("requiredKeyDemands — group by the key that must reach the lane", () 
       PROXY_MODELS,
     );
     expect(required.find((r) => r.group === "gpt-oss-20b-retain")?.apiKeyRef).toBeNull();
+  });
+});
+
+/**
+ * The global-credential fallback added by #3687.
+ *
+ * The global `hindsight.llm.api_key` (upstream `HINDSIGHT_API_LLM_API_KEY`) is
+ * now a real, emitted credential: the global lane presents it, and a per-op
+ * lane that declares no `api_key` inherits it rather than presenting nothing.
+ * `apiKeyRef` is only `null` — UNKNOWN — when neither the per-op block nor the
+ * global `llm` block names a key. Without this coverage the whole fallback can
+ * be reverted with every other test still green, which is exactly the false-
+ * attribution class this module exists to prevent.
+ */
+describe("requiredKeyModels — global hindsight.llm.api_key fallback (#3687)", () => {
+  it("presents the global api_key on the global lane when it is set", () => {
+    const required = requiredKeyModels(liveConfig({ api_key: "sk-global" }), PROXY_MODELS);
+    expect(required.find((r) => r.group === "gpt-oss-20b")?.apiKeyRef).toBe("sk-global");
+  });
+
+  it("inherits the global api_key on a per-op lane that declares none", () => {
+    // `retain` in liveConfig() overrides only `model`, so it carries no key of
+    // its own and must inherit the global credential — not resolve to null.
+    const required = requiredKeyModels(liveConfig({ api_key: "sk-global" }), PROXY_MODELS);
+    expect(required.find((r) => r.group === "gpt-oss-20b-retain")?.apiKeyRef).toBe("sk-global");
+    expect(required.find((r) => r.group === "gpt-oss-20b-consolidation")?.apiKeyRef).toBe(
+      "sk-global",
+    );
+  });
+
+  it("lets a per-op api_key still override the global one, sibling still inherits", () => {
+    const required = requiredKeyModels(
+      liveConfig({
+        api_key: "sk-global",
+        retain: { model: "openai/gpt-oss-20b-retain", api_key: "sk-lane" },
+      }),
+      PROXY_MODELS,
+    );
+    // The op that names its own key presents it…
+    expect(required.find((r) => r.group === "gpt-oss-20b-retain")?.apiKeyRef).toBe("sk-lane");
+    // …while the keyless sibling still falls back to the global credential.
+    expect(required.find((r) => r.group === "gpt-oss-20b-consolidation")?.apiKeyRef).toBe(
+      "sk-global",
+    );
+  });
+
+  it("is null ONLY when neither the per-op block nor the global llm declares a key", () => {
+    // No global `api_key`, and `retain`/global/`consolidation` declare none, so
+    // there is genuinely no credential to name — the one case that stays null.
+    const required = requiredKeyModels(liveConfig(), PROXY_MODELS);
+    expect(required.find((r) => r.group === "gpt-oss-20b")?.apiKeyRef).toBeNull();
+    expect(required.find((r) => r.group === "gpt-oss-20b-retain")?.apiKeyRef).toBeNull();
+    expect(required.find((r) => r.group === "gpt-oss-20b-consolidation")?.apiKeyRef).toBeNull();
   });
 });
 

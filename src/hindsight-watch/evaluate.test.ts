@@ -471,7 +471,12 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
     // test should be re-derived, not deleted.
     const old = evaluateConsolidationQueueAge(ring);
     expect(old.state).toBe("ok");
-    expect(old.detail).toContain("consolidation queue empty");
+    // Still reads OK on the same window (the blind spot is real), but the
+    // detail no longer says "consolidation queue empty" — #3989 replaced that
+    // all-clear string with one that names where failures ARE counted.
+    expect(old.detail).not.toContain("consolidation queue empty");
+    expect(old.detail).toContain("failures are not counted here");
+    expect(old.detail).toContain("consolidation-failure-streak");
   });
 
   it("warns at the threshold and pages at the page line", () => {

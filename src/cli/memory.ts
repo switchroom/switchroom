@@ -210,6 +210,25 @@ interface RecallLogEntry {
   injected_score_min?: number | null;
   injected_score_median?: number | null;
   injected_score_max?: number | null;
+  /**
+   * Bank-composition telemetry (#3775): how the injected result set split
+   * between the agent's OWN bank and any additional (shared/peer) banks.
+   * `injected_own_bank_count + injected_additional_bank_count` sums to
+   * `result_count`; an unstamped memory counts as ADDITIONAL, so `own` is
+   * never optimistic (`_injected_bank_composition`, recall.py). The
+   * `reserved_*_slots` pair is the reservation FLOOR each side was granted
+   * before the head-slice cap applied (recall.py). These are the regression
+   * detectors the scaffold/schema docs tell operators to watch: when own-bank
+   * recall collapses to 0 while additional stays high, the agent has quietly
+   * stopped seeing its own memory even though `result_count` still looks full.
+   * Before this they were reachable only under `--json`, so the documented
+   * remedy ("observe `injected_own_bank_count` via `memory recall-log`") did
+   * not actually work.
+   */
+  injected_own_bank_count?: number | null;
+  injected_additional_bank_count?: number | null;
+  reserved_own_slots?: number | null;
+  reserved_additional_slots?: number | null;
   cache_hit?: boolean;
 }
 
@@ -298,13 +317,28 @@ export function formatRecallLogView(
     medians.length > 0
       ? Math.round((medians.reduce((s, n) => s + n, 0) / medians.length) * 100) / 100
       : null;
+  // #3775 — own-bank collapse detector. Count the turns where the agent got a
+  // non-empty result set but NONE of it came from its own bank (own=0 while
+  // additional>0). That is the exact regression the composition telemetry
+  // exists to catch: `result_count` still looks full, so every volume stat
+  // above reads healthy, while the agent has silently stopped seeing its own
+  // memory. A turn with no composition stamp (own/additional both absent) is
+  // not counted — absence of data is not a collapse.
+  const collapseTurns = entries.filter(
+    (e) =>
+      typeof e.injected_own_bank_count === "number" &&
+      e.injected_own_bank_count === 0 &&
+      typeof e.injected_additional_bank_count === "number" &&
+      e.injected_additional_bank_count > 0,
+  ).length;
   lines.push(
     chalk.gray(
       `  last ${total} turn${total === 1 ? "" : "s"}: ` +
       `avg=${avg ?? "—"} max=${max ?? "—"} ` +
       `avg_score=${avgScore ?? "—"} ` +
       `cache_hits=${hits} capped=${cappedTurns}` +
-      (omittedTurns > 0 ? ` directives_omitted_turns=${omittedTurns}` : ""),
+      (omittedTurns > 0 ? ` directives_omitted_turns=${omittedTurns}` : "") +
+      (collapseTurns > 0 ? chalk.red(` own_bank_collapse_turns=${collapseTurns}`) : ""),
     ),
   );
 
@@ -324,6 +358,20 @@ export function formatRecallLogView(
     const ids = e.memory_ids && e.memory_ids.length > 0
       ? chalk.dim(` ids=${e.memory_ids.slice(0, 3).join(",")}${e.memory_ids.length > 3 ? `…+${e.memory_ids.length - 3}` : ""}`)
       : "";
+    // #3775 — the own/additional split. Shown whenever either side carries a
+    // count. `own=0` while additional>0 is the collapse the summary flags, so
+    // paint that row's split red; otherwise it's dim like the other detail.
+    const own = e.injected_own_bank_count;
+    const additional = e.injected_additional_bank_count;
+    const composition =
+      typeof own === "number" || typeof additional === "number"
+        ? (() => {
+            const text = ` own/add=${own ?? "—"}/${additional ?? "—"}`;
+            return own === 0 && typeof additional === "number" && additional > 0
+              ? chalk.red(text)
+              : chalk.dim(text);
+          })()
+        : "";
     // #3541 — the quality half of the row. Volume without score range reads
     // as success whether the injected memories are relevant or not.
     const score =
@@ -339,7 +387,7 @@ export function formatRecallLogView(
     lines.push(
       `  ${chalk.gray(e.ts)} ${flag} ` +
       `n=${e.result_count ?? "—"}${e.pre_cap_count != null && e.pre_cap_count !== e.result_count ? `/${e.pre_cap_count}` : ""}` +
-      `${dem}${omitted}${score}${ids}`,
+      `${dem}${omitted}${score}${composition}${ids}`,
     );
   }
 

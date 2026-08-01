@@ -101,7 +101,25 @@ export interface BankHealth {
   /** From /stats */
   totalDocuments: number;
   totalFacts: number;
+  /**
+   * Depth of the async operation queue — `/stats.pending_operations`, the
+   * count of `async_operations` rows in `pending`/`processing`. This is the
+   * TASK queue (retains, refreshes, consolidations waiting to be claimed), not
+   * the memory-consolidation backlog: during the 2026-07 reconsolidation drain
+   * it read ~5 while 44k memory units sat unconsolidated. Use it for stuck-op
+   * detection, NOT as a proxy for consolidation progress (that's
+   * {@link pendingConsolidation}).
+   */
   pendingOperations: number;
+  /**
+   * The REAL memory-consolidation backlog — `/stats.pending_consolidation`,
+   * the count of `memory_units` with `consolidated_at IS NULL AND fact_type IN
+   * ('experience','world')`. This is what actually gauges whether retained
+   * memory is making it into recall; it grows to tens of thousands during a
+   * consolidation stall while {@link pendingOperations} stays near zero. `0`
+   * when the field is absent (older engine) or the bank is drained.
+   */
+  pendingConsolidation: number;
   /** From /documents */
   newestDocumentAt: string | null;
   /** Documents stored but with zero extracted facts (the extraction-gap fingerprint). */
@@ -126,12 +144,23 @@ export function hindsightRestBase(mcpUrl: string): string {
 
 const DOCUMENTS_PAGE_LIMIT = 500;
 
-interface FetchOpts {
+export interface FetchOpts {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
 
-async function getJson<T>(
+/**
+ * Best-effort JSON GET with a whole-request timeout. Shared by every Hindsight
+ * REST probe (bank-health here and the observation-scope check) so the timeout
+ * behaviour lives in one place. Never throws — an unreachable/erroring/slow
+ * server yields `{ ok: false, reason }`.
+ *
+ * The `clearTimeout` is in a `finally` AFTER the body read on purpose: a slow
+ * or hanging response BODY must be bounded by `timeoutMs` too, not just the
+ * headers (the earlier copies cleared the timer before `resp.json()`, leaving
+ * a hung body uncovered — #3954 item 2).
+ */
+export async function getJson<T>(
   url: string,
   opts?: FetchOpts,
 ): Promise<{ ok: true; data: T } | { ok: false; reason: string }> {
@@ -144,13 +173,13 @@ async function getJson<T>(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetchImpl(url, { signal: controller.signal });
-    clearTimeout(timeout);
     if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
     return { ok: true, data: (await resp.json()) as T };
   } catch (err) {
-    clearTimeout(timeout);
     if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
     return { ok: false, reason: String((err as Error).message ?? err) };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -206,6 +235,7 @@ export async function inspectBankHealth(
     totalDocuments: 0,
     totalFacts: 0,
     pendingOperations: 0,
+    pendingConsolidation: 0,
     newestDocumentAt: null,
     unextractedDocuments: [],
     mentalModels: [],
@@ -216,6 +246,7 @@ export async function inspectBankHealth(
     total_documents?: number;
     total_nodes?: number;
     pending_operations?: number;
+    pending_consolidation?: number;
   }>(`${base}/v1/default/banks/${bank}/stats`, opts);
   if (!stats.ok) return { ...empty, reason: stats.reason };
 
@@ -285,6 +316,7 @@ export async function inspectBankHealth(
     totalDocuments: stats.data.total_documents ?? docItems.length,
     totalFacts: stats.data.total_nodes ?? 0,
     pendingOperations: stats.data.pending_operations ?? 0,
+    pendingConsolidation: stats.data.pending_consolidation ?? 0,
     newestDocumentAt,
     unextractedDocuments: unextracted,
     activeDirectiveCount,

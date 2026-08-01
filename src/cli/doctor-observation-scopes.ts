@@ -74,7 +74,7 @@
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { collectProfileBanks } from "../memory/hindsight.js";
-import { hindsightRestBase } from "../memory/bank-health.js";
+import { hindsightRestBase, getJson, type FetchOpts } from "../memory/bank-health.js";
 import type { CheckStatus } from "./doctor-status.js";
 
 export interface CheckResult {
@@ -149,6 +149,116 @@ export interface ScopeSaturation {
 }
 
 /**
+ * One `observation_scope_limits` rule as the engine parses it
+ * (`_ScopeLimitRule`, consolidator.py:606-623): a set of fnmatch tag-globs and
+ * the observation cap applied to a scope those globs exact-cover.
+ */
+export interface ScopeLimitRule {
+  globs: string[];
+  limit: number;
+}
+
+/**
+ * Translate a single fnmatch pattern into a RegExp — a faithful port of
+ * CPython's `fnmatch.translate` (the implementation behind `fnmatchcase`):
+ * `*` → any run (incl. empty, DOTALL), `?` → one char, `[seq]`/`[!seq]` →
+ * character class, everything else literal. Anchored to the whole string.
+ * Case-SENSITIVE, matching the engine's `fnmatchcase`.
+ */
+function fnmatchTranslate(pat: string): RegExp {
+  // `[\s\S]` (not `.`) so `*`/`?` span newlines too — Python compiles with the
+  // DOTALL flag (`(?s:...)`).
+  const ANY = "[\\s\\S]";
+  let res = "";
+  let i = 0;
+  const n = pat.length;
+  while (i < n) {
+    const c = pat[i];
+    i += 1;
+    if (c === "*") {
+      res += ANY + "*";
+    } else if (c === "?") {
+      res += ANY;
+    } else if (c === "[") {
+      let j = i;
+      if (j < n && pat[j] === "!") j += 1;
+      if (j < n && pat[j] === "]") j += 1;
+      while (j < n && pat[j] !== "]") j += 1;
+      if (j >= n) {
+        res += "\\[";
+      } else {
+        let stuff = pat.slice(i, j).replace(/\\/g, "\\\\");
+        i = j + 1;
+        if (stuff.startsWith("!")) stuff = "^" + stuff.slice(1);
+        else if (stuff.startsWith("^") || stuff.startsWith("[")) stuff = "\\" + stuff;
+        res += "[" + stuff + "]";
+      }
+    } else {
+      res += (c as string).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp("^(?:" + res + ")$");
+}
+
+/** Case-sensitive fnmatch — mirror of Python's `fnmatchcase(name, pat)`. */
+export function fnmatchcase(name: string, pat: string): boolean {
+  return fnmatchTranslate(pat).test(name);
+}
+
+/**
+ * Parse raw `observation_scope_limits` config into ordered rules, mirroring the
+ * engine's `_parse_scope_limit_rules` (consolidator.py:626-648): each entry is a
+ * `{ scope: string[], limit: int }` object; malformed entries are skipped (not
+ * raised), and list order is preserved (first match wins). Booleans are rejected
+ * as limits (the engine guards against `True`/`False` — JS has no int/bool
+ * ambiguity but a non-integer or boolean `limit` is still dropped).
+ */
+export function parseScopeLimitRules(raw: unknown): ScopeLimitRule[] {
+  if (!Array.isArray(raw)) return [];
+  const rules: ScopeLimitRule[] = [];
+  for (const entry of raw) {
+    if (entry == null || typeof entry !== "object") continue;
+    const scope = (entry as { scope?: unknown }).scope;
+    const limit = (entry as { limit?: unknown }).limit;
+    if (!Array.isArray(scope) || scope.length === 0) continue;
+    if (!scope.every((g) => typeof g === "string" && g.length > 0)) continue;
+    if (typeof limit !== "number" || !Number.isInteger(limit)) continue;
+    rules.push({ globs: scope as string[], limit });
+  }
+  return rules;
+}
+
+/**
+ * Exact-cover match between a scope pattern and a concrete tag set — a mirror of
+ * the engine's `_scope_matches_globs` (consolidator.py:651-668). True iff every
+ * tag is covered by at least one glob AND every glob covers at least one tag (no
+ * uncovered tags, no vacuous globs). The empty tag set never matches, so a rule
+ * never applies to untagged observations. Case-sensitive.
+ */
+export function scopeMatchesGlobs(globs: string[], tags: string[]): boolean {
+  if (tags.length === 0) return false;
+  if (!tags.every((t) => globs.some((g) => fnmatchcase(t, g)))) return false;
+  if (!globs.every((g) => tags.some((t) => fnmatchcase(t, g)))) return false;
+  return true;
+}
+
+/**
+ * Resolve the observation cap for one concrete scope — a mirror of the engine's
+ * `_effective_scope_limit` (consolidator.py:670-683). The first rule whose
+ * globs exact-cover `tags` wins; otherwise the bank-wide cap applies.
+ */
+export function effectiveScopeLimit(
+  rules: ScopeLimitRule[],
+  tags: string[],
+  bankCap: number,
+): number {
+  for (const rule of rules) {
+    if (scopeMatchesGlobs(rule.globs, tags)) return rule.limit;
+  }
+  return bankCap;
+}
+
+/**
  * Fold exact per-scope counts into the containment counts the engine enforces,
  * and classify each scope against the cap.
  *
@@ -186,8 +296,12 @@ export function computeScopeSaturation(
   scopes: ObservationScope[],
   cap: number,
   warnRatio: number = OBSERVATION_SCOPE_WARN_RATIO,
+  scopeLimitRules: ScopeLimitRule[] = [],
 ): ScopeSaturation[] {
-  if (cap < 0) return [];
+  // No glob rules + an unlimited bank-wide cap ⇒ nothing to judge. WITH rules a
+  // rule may impose a finite cap on a specific scope even when the bank-wide cap
+  // is unlimited (#3950), so the effective cap must be resolved per scope below.
+  if (cap < 0 && scopeLimitRules.length === 0) return [];
 
   const sets = scopes.map((s) => ({ tags: s.tags, set: new Set(s.tags), count: s.count }));
 
@@ -230,16 +344,23 @@ export function computeScopeSaturation(
       if (contains) effective += other.count;
     }
 
-    // `cap === 0` is "closed on purpose": every scope would be at/over it, so
-    // ratio is undefined and the caller reports the bank, not each scope.
+    // Resolve THIS scope's cap: a matching observation_scope_limits glob rule
+    // overrides the bank-wide cap (#3950). A scope whose effective cap is
+    // unlimited (-1, whether bank-wide or via a rule) has no wall to approach
+    // and is dropped from the output.
+    const scopeCap = effectiveScopeLimit(scopeLimitRules, entry.tags, cap);
+    if (scopeCap < 0) continue;
+
+    // `scopeCap === 0` is "closed on purpose": every scope would be at/over it,
+    // so ratio is undefined and the caller reports the bank, not each scope.
     const status: ScopeSaturation["status"] =
-      cap > 0 && effective >= cap
+      scopeCap > 0 && effective >= scopeCap
         ? "fail"
-        : cap > 0 && effective >= cap * warnRatio
+        : scopeCap > 0 && effective >= scopeCap * warnRatio
           ? "warn"
           : "ok";
 
-    out.push({ tags: [...entry.tags], exact: entry.count, effective, cap, status });
+    out.push({ tags: [...entry.tags], exact: entry.count, effective, cap: scopeCap, status });
   }
 
   // Worst first: the operator reads the top of the list, so it must be the
@@ -266,8 +387,16 @@ export interface BankScopeReport {
    * {@link classifyObservationScopeSaturation}.
    */
   hasScopeLimitRules: boolean;
-  /** Distinct scopes in the bank, including the untagged one. */
+  /** Distinct scopes in the bank, including the untagged one (raw endpoint total). */
   scopeCount: number;
+  /**
+   * How many scopes this check actually JUDGED against a cap — the length of
+   * {@link computeScopeSaturation}'s output (tagged, capped scopes), which
+   * excludes the untagged scope the engine never caps. The OK row reports THIS,
+   * not {@link scopeCount}, so the printed number reconciles with what was
+   * evaluated rather than overstating it by the untagged scope (#3954 item 1).
+   */
+  judgedScopeCount: number;
   /**
    * Observations in the UNTAGGED global scope (`tags: []`). This scope is the
    * `curated`-strategy default sink and is never capped by the engine, so it is
@@ -352,11 +481,12 @@ export function classifyObservationScopeSaturation(
     };
   }
 
-  // Glob scope-limit rules resolve a per-scope cap this check does not
-  // evaluate, so judging those banks against the bank-wide cap could invent a
-  // FAIL on a scope whose rule RAISED its limit. Excluded, and said out loud.
-  const unjudged = readable.filter((r) => r.hasScopeLimitRules || !r.observationsEnabled);
-  const judged = readable.filter((r) => !r.hasScopeLimitRules && r.observationsEnabled);
+  // Banks carrying observation_scope_limits glob rules ARE now judged: the
+  // per-scope cap those rules resolve is mirrored client-side (#3950), so their
+  // saturated scopes were computed against the SAME effective cap the engine
+  // enforces. Only observations-disabled banks are excluded from judgement.
+  const unjudged = readable.filter((r) => !r.observationsEnabled);
+  const judged = readable.filter((r) => r.observationsEnabled);
 
   const notes: string[] = [];
   if (unreadable.length > 0) {
@@ -365,14 +495,14 @@ export function classifyObservationScopeSaturation(
         unreadable.map((r) => `${r.bankId} (${r.reason ?? "unknown"})`).join(", "),
     );
   }
-  const withRules = unjudged.filter((r) => r.hasScopeLimitRules);
+  const withRules = judged.filter((r) => r.hasScopeLimitRules);
   if (withRules.length > 0) {
     notes.push(
-      `${withRules.length} bank(s) not judged — observation_scope_limits sets a ` +
-        `per-scope cap this check does not resolve: ${withRules.map((r) => r.bankId).join(", ")}`,
+      `${withRules.length} bank(s) judged with per-scope observation_scope_limits ` +
+        `glob caps: ${withRules.map((r) => r.bankId).join(", ")}`,
     );
   }
-  const disabled = unjudged.filter((r) => !r.hasScopeLimitRules && !r.observationsEnabled);
+  const disabled = unjudged.filter((r) => !r.observationsEnabled);
   if (disabled.length > 0) {
     notes.push(
       `${disabled.length} bank(s) have observations disabled: ` +
@@ -399,10 +529,14 @@ export function classifyObservationScopeSaturation(
   const unlimited = judged.filter((r) => r.cap < 0);
   const capped = judged.filter((r) => r.cap > 0);
 
-  const failing = capped.flatMap((r) =>
+  // Derive the saturated scopes from EVERY judged bank, not just the ones whose
+  // bank-wide cap is positive: a glob-rule bank can carry a bank-wide cap of -1
+  // or 0 yet still have a scope capped (and saturated) by a rule (#3950). Each
+  // bank's `saturated` was already computed against the correct per-scope cap.
+  const failing = judged.flatMap((r) =>
     r.saturated.filter((s) => s.status === "fail").map((s) => ({ report: r, scope: s })),
   );
-  const warning = capped.flatMap((r) =>
+  const warning = judged.flatMap((r) =>
     r.saturated.filter((s) => s.status === "warn").map((s) => ({ report: r, scope: s })),
   );
   failing.sort((a, b) => b.scope.effective - a.scope.effective);
@@ -487,7 +621,7 @@ export function classifyObservationScopeSaturation(
     return { name, status: "warn", detail, ...(warning.length > 0 ? { fix } : {}) };
   }
 
-  const totalScopes = capped.reduce((n, r) => n + r.scopeCount, 0);
+  const totalScopes = capped.reduce((n, r) => n + r.judgedScopeCount, 0);
   const detailBase =
     capped.length === 0
       ? `no bank has a positive observation cap`
@@ -508,31 +642,6 @@ export function classifyObservationScopeSaturation(
     status: "ok",
     detail: detailBase + (extra.length > 0 ? ` · ${extra.join(" · ")}` : "") + suffix,
   };
-}
-
-interface FetchOpts {
-  fetchImpl?: typeof fetch;
-  timeoutMs?: number;
-}
-
-async function getJson<T>(
-  url: string,
-  opts?: FetchOpts,
-): Promise<{ ok: true; data: T } | { ok: false; reason: string }> {
-  const fetchImpl = opts?.fetchImpl ?? fetch;
-  const timeoutMs = opts?.timeoutMs ?? 15_000;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetchImpl(url, { signal: controller.signal });
-    clearTimeout(timeout);
-    if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
-    return { ok: true, data: (await resp.json()) as T };
-  } catch (err) {
-    clearTimeout(timeout);
-    if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
-    return { ok: false, reason: String((err as Error).message ?? err) };
-  }
 }
 
 /**
@@ -565,6 +674,7 @@ export async function inspectBankScopes(
     observationsEnabled: false,
     hasScopeLimitRules: false,
     scopeCount: 0,
+    judgedScopeCount: 0,
     untaggedCount: 0,
     saturated: [],
     pendingConsolidation: null,
@@ -581,8 +691,8 @@ export async function inspectBankScopes(
   if (typeof rawCap !== "number" || !Number.isFinite(rawCap)) {
     return fail("Unexpected shape");
   }
-  const rules = config["observation_scope_limits"];
-  const hasScopeLimitRules = Array.isArray(rules) && rules.length > 0;
+  const scopeLimitRules = parseScopeLimitRules(config["observation_scope_limits"]);
+  const hasScopeLimitRules = scopeLimitRules.length > 0;
   // Absent means engine default (enabled); only an explicit `false` disables.
   const observationsEnabled = config["enable_observations"] !== false;
 
@@ -603,7 +713,13 @@ export async function inspectBankScopes(
     scopes.push({ tags: tags as string[], count });
   }
 
-  const saturated = computeScopeSaturation(scopes, rawCap).filter((s) => s.status !== "ok");
+  const allJudged = computeScopeSaturation(
+    scopes,
+    rawCap,
+    OBSERVATION_SCOPE_WARN_RATIO,
+    scopeLimitRules,
+  );
+  const saturated = allJudged.filter((s) => s.status !== "ok");
   // The untagged global scope: never in `saturated` (the engine skips it), but
   // it is the `curated` default sink and grows uncapped, so its size is tracked
   // and watched separately (OBSERVATION_SCOPE_UNTAGGED_WARN_COUNT).
@@ -617,7 +733,7 @@ export async function inspectBankScopes(
   // only when there is already something to explain, so a healthy fleet pays
   // nothing for it.
   let pendingConsolidation: number | null = null;
-  if (saturated.length > 0 && !hasScopeLimitRules && observationsEnabled) {
+  if (saturated.length > 0 && observationsEnabled) {
     const stats = await getJson<{ pending_consolidation?: unknown }>(
       `${base}/v1/default/banks/${bank}/stats`,
       opts,
@@ -634,6 +750,7 @@ export async function inspectBankScopes(
     observationsEnabled,
     hasScopeLimitRules,
     scopeCount: scopes.length,
+    judgedScopeCount: allJudged.length,
     untaggedCount,
     saturated,
     pendingConsolidation,

@@ -9,6 +9,8 @@ import {
   classifyHindsightHealthProbe,
   checkHindsightHealthEndpoint,
   classifyConsolidationBacklog,
+  classifyAsyncOpQueue,
+  classifyBankConfigReachability,
   classifyDirectiveCount,
   MAX_DIRECTIVES,
   DIRECTIVE_WARN_THRESHOLD,
@@ -19,6 +21,8 @@ import {
   classifyLiteLlmReachability,
   CONSOLIDATION_BACKLOG_WARN,
   CONSOLIDATION_BACKLOG_FAIL,
+  OP_QUEUE_WARN,
+  OP_QUEUE_FAIL,
   type AdvertisedTool,
   MIN_HINDSIGHT_SHM_BYTES,
   classifyHindsightVersionSkew,
@@ -75,38 +79,114 @@ describe("classifyToolContract — live contract-drift detector", () => {
   });
 });
 
-describe("classifyConsolidationBacklog (#2903 fix 5.3)", () => {
+// The async OPERATION queue (pending_operations) — the TASK queue. Formerly
+// this classifier was (mis)named the "consolidation backlog"; #3949 split it
+// from the real memory backlog below.
+describe("classifyAsyncOpQueue (#2903 fix 5.3, renamed #3949)", () => {
   it("ok when the queue is drained", () => {
-    const r = classifyConsolidationBacklog(0);
+    const r = classifyAsyncOpQueue(0);
     expect(r.status).toBe("ok");
+    expect(r.name).toBe("hindsight async op queue");
     expect(r.detail).toMatch(/drained/);
   });
 
   it("ok (not warn) just below the warn threshold", () => {
-    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN - 1);
+    const r = classifyAsyncOpQueue(OP_QUEUE_WARN - 1);
     expect(r.status).toBe("ok");
   });
 
   it("warns once the queue crosses the warn threshold", () => {
-    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN);
+    const r = classifyAsyncOpQueue(OP_QUEUE_WARN);
     expect(r.status).toBe("warn");
-    expect(r.detail).toContain(`${CONSOLIDATION_BACKLOG_WARN} pending`);
+    expect(r.detail).toContain(`${OP_QUEUE_WARN} pending`);
   });
 
   it("fails when the queue is deep enough to be wedged", () => {
-    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_FAIL);
+    const r = classifyAsyncOpQueue(OP_QUEUE_FAIL);
     expect(r.status).toBe("fail");
     expect(r.fix).toBeDefined();
   });
 
   it("includes the oldest-op age when it is known", () => {
-    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, 7200);
+    const r = classifyAsyncOpQueue(OP_QUEUE_WARN, 7200);
     expect(r.detail).toMatch(/oldest 120m old/);
   });
 
   it("omits the age clause when age is unknown (REST /stats has no per-op age — #2847)", () => {
-    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, null);
+    const r = classifyAsyncOpQueue(OP_QUEUE_WARN, null);
     expect(r.detail).not.toMatch(/oldest/);
+  });
+
+  it("describes async ops, NOT consolidation (the #3949 mislabel is gone)", () => {
+    const r = classifyAsyncOpQueue(OP_QUEUE_FAIL);
+    expect(r.detail).toMatch(/async op/i);
+    expect(r.detail).not.toMatch(/consolidat/i);
+  });
+});
+
+// The REAL memory-consolidation backlog (pending_consolidation — unconsolidated
+// memory_units). Memory-scale thresholds: the incident ran to ~44k while the
+// healthy fleet floor is <50 (#3949).
+describe("classifyConsolidationBacklog (#3949 — reads pending_consolidation)", () => {
+  it("ok when consolidation is drained", () => {
+    const r = classifyConsolidationBacklog(0);
+    expect(r.status).toBe("ok");
+    expect(r.name).toBe("hindsight consolidation backlog");
+    expect(r.detail).toMatch(/drained/);
+  });
+
+  it("ok at a healthy memory-scale reading (well below memory-scale warn)", () => {
+    // 45 was the largest HEALTHY per-bank reading (B9c) — must NOT warn.
+    const r = classifyConsolidationBacklog(45);
+    expect(r.status).toBe("ok");
+    expect(r.detail).toMatch(/45 memory unit/);
+  });
+
+  it("warns once the backlog crosses the memory-scale warn threshold", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN);
+    expect(r.status).toBe("warn");
+    expect(r.detail).toMatch(/memory unit/);
+  });
+
+  it("fails at a stall (44k — the 2026-07 incident depth)", () => {
+    const r = classifyConsolidationBacklog(44_000);
+    expect(r.status).toBe("fail");
+    expect(r.fix).toBeDefined();
+    expect(CONSOLIDATION_BACKLOG_FAIL).toBeLessThanOrEqual(44_000);
+  });
+
+  it("counts MEMORY UNITS, not async ops (the #3949 truth swap)", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_FAIL);
+    expect(r.detail).toMatch(/memory unit/);
+    expect(r.detail).not.toMatch(/async op/i);
+  });
+});
+
+describe("classifyBankConfigReachability (#3538 — fail-closed seed path visibility)", () => {
+  it("OK when retain_mission is readable", () => {
+    const r = classifyBankConfigReachability({ ok: true }, "overlord");
+    expect(r.status).toBe("ok");
+    expect(r.name).toBe("hindsight bank-config API");
+    expect(r.detail).toMatch(/overlord/);
+  });
+
+  it("FAILS when a 200 carries no retain_mission key (API disabled / field renamed)", () => {
+    const r = classifyBankConfigReachability({ ok: false, reason: "Unexpected shape" }, "overlord");
+    expect(r.status).toBe("fail");
+    // The failure must name the flag and the silent-skip consequence so an
+    // operator can act — this is the whole point of the row.
+    expect(r.fix).toMatch(/HINDSIGHT_API_ENABLE_BANK_CONFIG_API/);
+    expect(r.detail).toMatch(/retain_mission/);
+    expect(r.detail).toMatch(/silently|exits 0/);
+  });
+
+  it("WARNs (not FAIL) when the surface can't be probed at all (server down)", () => {
+    // A down server is the container-health check's job to redden; here it is a
+    // WARN so a transient outage doesn't double-red as a config-API defect.
+    const http = classifyBankConfigReachability({ ok: false, reason: "HTTP 502" }, "overlord");
+    expect(http.status).toBe("warn");
+    const timeout = classifyBankConfigReachability({ ok: false, reason: "Timeout" }, "overlord");
+    expect(timeout.status).toBe("warn");
   });
 });
 

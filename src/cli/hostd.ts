@@ -211,6 +211,10 @@ services:
       # HAProxy writes its runtime state/pidfile under /run; read_only rootfs
       # otherwise makes it crash-loop on boot.
       - /run
+      # The tecnativa/docker-socket-proxy entrypoint renders /tmp/haproxy.cfg
+      # on boot; with a read_only rootfs and no /tmp tmpfs it can't write the
+      # generated config and crash-loops before HAProxy ever starts.
+      - /tmp
     cap_drop:
       - ALL
     cap_add:

@@ -67,12 +67,37 @@ case "$sql" in
     exit 0 ;;
   *"count(*)"*"status='processing'"*)
     if [ "$mode" = corrupt ]; then echo 4; else echo 0; fi; exit 0 ;;
+  *FILTER*"status='failed'"*)
+    # Dead-letter count probe (#3795): "total|fk_signature|oldest_age_s".
+    # (FILTER appears in the SELECT list, before the status='failed' WHERE.)
+    [ -n "\${FAKE_DL_COUNT:-}" ] && echo "\$FAKE_DL_COUNT"; exit 0 ;;
+  *"status='failed'"*"ORDER BY created_at"*)
+    # Requeue candidate select (#3795): "bank|operation_id" lines.
+    [ -n "\${FAKE_DL_CANDS:-}" ] && printf '%s\\n' "\$FAKE_DL_CANDS"; exit 0 ;;
   *) exit 0 ;;
 esac
 `,
     { mode: 0o755 },
   );
   return binDir;
+}
+
+/**
+ * Write a fake `curl` beside the fake `psql` (same bin dir). It logs the URL
+ * it was POSTed to and echoes `$FAKE_CURL_CODE` (default 200) — matching how
+ * the requeue calls curl with `-o /dev/null -w '%{http_code}'`.
+ */
+function installFakeCurl(binDir: string): void {
+  writeFileSync(
+    join(binDir, "curl"),
+    `#!/bin/sh
+url=""
+for a in "$@"; do url="$a"; done
+[ -n "\${FAKE_CURL_LOG:-}" ] && printf '%s\\n' "$url" >> "$FAKE_CURL_LOG"
+printf '%s' "\${FAKE_CURL_CODE:-200}"
+`,
+    { mode: 0o755 },
+  );
 }
 
 function writePgInstance(path: string): void {
@@ -223,5 +248,203 @@ describe("hindsight-maintenance.sh", () => {
     expect(raw).toMatch(/log "WARNING: queue may be wedged/);
     // The probe must not DELETE/UPDATE — it's visibility only.
     expect(raw).not.toMatch(/(DELETE|UPDATE).*status IN \('pending','processing'\)/);
+  });
+
+  // ── #3758: the wedge probe must EXCLUDE never-claimable batch_retain
+  // parents (task_payload IS NULL). Static guard so it cannot silently
+  // regress back to counting healthy in-flight parents as a wedge.
+  it("job #4 wedge probe excludes payload-null parents (mirrors the partial claim index)", () => {
+    const raw = readFileSync(SCRIPT, "utf-8");
+    // The oldest-age SELECT must be scoped to claimable rows only.
+    expect(raw).toMatch(
+      /FROM async_operations WHERE status IN \('pending','processing'\) AND task_payload IS NOT NULL/,
+    );
+    // ...and there must be NO remaining unclaimable-inclusive wedge SELECT.
+    expect(raw).not.toMatch(
+      /max\(extract\(epoch[^\n]*status IN \('pending','processing'\)"\)/,
+    );
+  });
+
+  // ── #3795 dead-letter visibility (job #6): a failed retain with an intact
+  // payload older than the threshold WARNs LOUDLY. Driven with a fake psql
+  // returning a stale count; asserts the OUTCOME, not just the code path.
+  it("job #6 WARNs on stalled, recoverable failed retains (intact payload)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "swr-hsi-maint-"));
+    const binDir = installFakePsql();
+    try {
+      const pgInstance = join(dir, "instance.json");
+      writePgInstance(pgInstance);
+      const r = spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+          // total=5, fk-signature=3, oldest 999999s (~11.5d) > 6h default.
+          FAKE_DL_COUNT: "5|3|999999",
+        },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toMatch(
+        /WARNING: 5 failed 'retain' op\(s\) with an intact payload are stalled/,
+      );
+      // Names the FK-race subset that is safe to requeue.
+      expect(r.stderr).toMatch(/3 match the FK-race dead-letter signature/);
+      expect(r.stderr).toMatch(/costs LLM spend/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("job #6 stays SILENT when there are no stalled dead letters", () => {
+    const dir = mkdtempSync(join(tmpdir(), "swr-hsi-maint-"));
+    const binDir = installFakePsql();
+    try {
+      const pgInstance = join(dir, "instance.json");
+      writePgInstance(pgInstance);
+      // No FAKE_DL_COUNT → the count probe returns empty → no WARN.
+      const r = spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+        },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).not.toMatch(/failed 'retain' op\(s\) with an intact payload/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("job #6 dead-letter probe is read-only and correctly scoped (static guard)", () => {
+    const raw = readFileSync(SCRIPT, "utf-8");
+    // Scoped to failed retains with an INTACT payload (recoverable).
+    expect(raw).toMatch(
+      /operation_type='retain' AND status='failed' AND task_payload IS NOT NULL/,
+    );
+    // Breaks out the FK-race signature (never entered the retry ladder).
+    expect(raw).toMatch(/FILTER \(WHERE retry_count=0 AND next_retry_at IS NULL\)/);
+    // Visibility only — never mutates the failed set.
+    expect(raw).not.toMatch(/(UPDATE|DELETE)[^\n]*status='failed'/);
+  });
+
+  // ── #3795 requeue (job #7): OFF by default, and when enabled POSTs each
+  // FK-race dead letter to the engine retry endpoint via curl.
+  it("job #7 requeue is OFF by default — no curl, no POST", () => {
+    const dir = mkdtempSync(join(tmpdir(), "swr-hsi-maint-"));
+    const binDir = installFakePsql();
+    installFakeCurl(binDir);
+    try {
+      const pgInstance = join(dir, "instance.json");
+      const curlLog = join(dir, "curl.log");
+      writePgInstance(pgInstance);
+      const r = spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+          FAKE_DL_CANDS: "overlord|11111111-1111-1111-1111-111111111111",
+          FAKE_CURL_LOG: curlLog,
+        },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).not.toMatch(/dead-letter requeue/);
+      // curl was never invoked (no requeue log file written).
+      expect(() => readFileSync(curlLog, "utf-8")).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("job #7 requeue POSTs each FK-race dead letter to the engine retry endpoint when enabled", () => {
+    const dir = mkdtempSync(join(tmpdir(), "swr-hsi-maint-"));
+    const binDir = installFakePsql();
+    installFakeCurl(binDir);
+    try {
+      const pgInstance = join(dir, "instance.json");
+      const curlLog = join(dir, "curl.log");
+      writePgInstance(pgInstance);
+      const op = "11111111-1111-1111-1111-111111111111";
+      const r = spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+          SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS: "1",
+          SWITCHROOM_HINDSIGHT_API_URL: "http://127.0.0.1:9077",
+          FAKE_DL_CANDS: `overlord|${op}`,
+          FAKE_CURL_LOG: curlLog,
+          FAKE_CURL_CODE: "200",
+        },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      expect(r.status).toBe(0);
+      // The POST targeted the documented retry endpoint for that bank+op.
+      const urls = readFileSync(curlLog, "utf-8");
+      expect(urls).toContain(
+        `http://127.0.0.1:9077/v1/default/banks/overlord/operations/${op}/retry`,
+      );
+      // The requeue logged success + a summary.
+      expect(r.stderr).toMatch(new RegExp(`dead-letter requeue: overlord/${op} -> HTTP 200`));
+      expect(r.stderr).toMatch(/dead-letter requeue: 1 requeued, 0 failed/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("job #7 requeue aborts with a clear hint when the retry endpoint returns 401", () => {
+    const dir = mkdtempSync(join(tmpdir(), "swr-hsi-maint-"));
+    const binDir = installFakePsql();
+    installFakeCurl(binDir);
+    try {
+      const pgInstance = join(dir, "instance.json");
+      writePgInstance(pgInstance);
+      const r = spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+          SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS: "1",
+          FAKE_DL_CANDS: "overlord|11111111-1111-1111-1111-111111111111",
+          FAKE_CURL_CODE: "401",
+        },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toMatch(/the retry endpoint needs auth; set SWITCHROOM_HINDSIGHT_API_TOKEN/);
+      expect(r.stderr).toMatch(/aborted after 0 requeued/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("job #7 requeue targets the FK signature, is bounded, and hits the retry endpoint (static guard)", () => {
+    const raw = readFileSync(SCRIPT, "utf-8");
+    // OFF by default.
+    expect(raw).toMatch(/REQUEUE_DEAD_LETTERS="\$\{SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS:-0\}"/);
+    // Candidate query = the FK-race dead-letter signature, bounded by REQUEUE_MAX.
+    expect(raw).toMatch(
+      /operation_type='retain' AND status='failed' AND task_payload IS NOT NULL AND retry_count=0 AND next_retry_at IS NULL ORDER BY created_at LIMIT \$\{REQUEUE_MAX\}/,
+    );
+    // Uses the engine's own retry endpoint (not a raw SQL status flip).
+    expect(raw).toMatch(/\/v1\/default\/banks\/\$\{_bank\}\/operations\/\$\{_op\}\/retry/);
+    // POST, with an optional bearer token.
+    expect(raw).toMatch(/-X POST/);
+    expect(raw).toMatch(/Authorization: Bearer \$\{_tok\}/);
+    // The requeue must NOT reach into the queue table with a raw UPDATE.
+    expect(raw).not.toMatch(/UPDATE async_operations SET status='pending'/);
   });
 });

@@ -52,6 +52,7 @@ const ok = (): PendingRetainsProbeResult => ({
   dead: 0,
   dropped: 0,
   evicted: 0,
+  duplicates: 0,
   cap: CAP,
 });
 const backlog = (
@@ -63,6 +64,7 @@ const backlog = (
   dead: 0,
   dropped: 0,
   evicted: 0,
+  duplicates: 0,
   cap: CAP,
   ...extra,
 });
@@ -72,6 +74,7 @@ const dead = (d: number, p = 0): PendingRetainsProbeResult => ({
   dead: d,
   dropped: 0,
   evicted: 0,
+  duplicates: 0,
   cap: CAP,
 });
 const down = (): PendingRetainsProbeResult => ({
@@ -80,6 +83,7 @@ const down = (): PendingRetainsProbeResult => ({
   dead: 0,
   dropped: 0,
   evicted: 0,
+  duplicates: 0,
   cap: CAP,
 });
 
@@ -678,6 +682,7 @@ describe("parsePendingRetainsProbeOutput — probe verdict", () => {
         dead: 0,
         dropped: 0,
         evicted: 0,
+        duplicates: 0,
         cap: 2000,
       });
     });
@@ -715,8 +720,23 @@ describe("parsePendingRetainsProbeOutput — probe verdict", () => {
         dead: 3,
         dropped: 4,
         evicted: 5,
+        duplicates: 0,
         cap: 750,
       });
+    });
+  });
+
+  describe("duplicates (#3896) — collapsed-duplicate archive, NOT a loss channel", () => {
+    it("Q= is parsed into duplicates and does not change the state verdict", () => {
+      const r = out("P=0 D=0 X=0 E=0 Q=17 C=2000\n");
+      // Collapsed duplicates are redundant byte-identical copies, already
+      // committed — an empty live queue with duplicates is still ok.
+      expect(r.state).toBe("ok");
+      expect(r.duplicates).toBe(17);
+    });
+
+    it("absent Q= reads as zero (forward-compat with older probe images)", () => {
+      expect(out("P=0 D=0 X=0 E=0 C=2000\n").duplicates).toBe(0);
     });
   });
 
@@ -747,6 +767,7 @@ describe("parsePendingRetainsProbeOutput — probe verdict", () => {
         dead: 0,
         dropped: 0,
         evicted: 0,
+        duplicates: 0,
         cap: 2000,
       });
     });

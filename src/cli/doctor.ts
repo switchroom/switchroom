@@ -32,7 +32,7 @@ import { reconcileAgent } from "../agents/scaffold.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
-import { DEFAULT_PROFILE } from "../config/schema.js";
+import { resolveMemoryProfile } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import {
   probeHindsight,
@@ -40,6 +40,7 @@ import {
   fetchHindsightToolsList,
   collectProfileBanks,
   fetchBankObservationsMission,
+  fetchBankRetainMission,
   decideObservationsMissionUpgrade,
   DEFAULT_OBSERVATIONS_MISSION,
   PROFILE_MEMORY_DEFAULTS,
@@ -52,7 +53,7 @@ import {
 import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.js";
 import { findUnknownMemoryKeys, type MemoryTier } from "../config/memory-key-drift.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyAsyncOpQueue, classifyDirectiveCount, classifyBankConfigReachability } from "./doctor-memory.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js";
@@ -1471,8 +1472,13 @@ export async function checkBankObservationsMissions(
       };
     }
 
+    // Key the disposition/observations default off the resolved MEMORY profile
+    // (memory.profile → extends → default), not raw `extends` — otherwise an
+    // agent opted into a memory profile via `memory.profile` would be
+    // false-flagged as drifted against its persona profile's default here.
+    const memoryProfile = resolveMemoryProfile(entry.config);
     const profileDefault =
-      PROFILE_MEMORY_DEFAULTS[entry.config.extends ?? DEFAULT_PROFILE]?.observations_mission;
+      PROFILE_MEMORY_DEFAULTS[memoryProfile]?.observations_mission;
     const decision = decideObservationsMissionUpgrade(
       entry.config.memory?.observations_mission,
       profileDefault,
@@ -1511,11 +1517,40 @@ export async function checkBankObservationsMissions(
       status: "ok" as const,
       detail: isSwitchroomDefault
         ? profileDefault != null
-          ? `switchroom ${entry.config.extends ?? DEFAULT_PROFILE}-profile default`
+          ? `switchroom ${memoryProfile}-profile default`
           : "switchroom fleet default"
         : "operator-authored (left untouched by the never-clobber rule)",
     };
   });
+}
+
+/**
+ * Bank-config API reachability (#3538). Retain-mission seeding went fail-closed
+ * in #3529: it reads the bank's mission via `GET .../config` and seeds nothing
+ * on a failed read (so a transient 5xx can't clobber an operator's mission).
+ * The exposure: if that API is disabled
+ * (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API=false`) or the field is renamed, every
+ * read fails, apply seeds NO agent, and still exits 0 — a silent regression the
+ * old fail-open code would have masked. One probe of one representative bank
+ * turns that into a doctor row. Returns `[]` when there is no bank to probe.
+ */
+export async function checkBankConfigApiReachable(
+  config: SwitchroomConfig,
+  url: string,
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<CheckResult[]> {
+  // One representative agent bank is enough: the flag / field-shape is a
+  // deployment-wide property of the Hindsight server, not per-bank. Resolve
+  // through defaults+profiles exactly as the seed path does.
+  let bankId: string | undefined;
+  for (const [agentName, agentConfig] of Object.entries(config.agents)) {
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    bankId = resolved.memory?.collection ?? agentName;
+    break;
+  }
+  if (bankId === undefined) return [];
+  const read = await fetchBankRetainMission(url, bankId, { fetchImpl: opts?.fetchImpl });
+  return [classifyBankConfigReachability(read, bankId)];
 }
 
 /**
@@ -1558,23 +1593,38 @@ export async function checkBankIngestHealth(
     ),
   );
 
-  // Fleet-wide consolidation backlog (#2903 fix 5.3): sum the pending-op
-  // count across every reachable bank so `switchroom doctor` shows the queue
-  // depth the #2894 throttle can silently build. Oldest-pending age isn't on
-  // the REST /stats surface (measurement follow-up: #2847), so age is unknown.
-  // Gated off by default so the per-bank ingest contract stays clean for
-  // callers/tests that only want bank rows; the CLI doctor opts in below.
-  let backlogRow: CheckResult | undefined;
+  // Fleet-wide queue health (#2903 fix 5.3, corrected in #3949): two SEPARATE
+  // gauges, summed across every reachable bank, because they measure different
+  // things and drift apart under a stall —
+  //   * async op queue    → `/stats.pending_operations` (the TASK queue: catches
+  //                          a stuck reaper / claim stall).
+  //   * consolidation      → `/stats.pending_consolidation` (unconsolidated
+  //     backlog              `memory_units`: the REAL "is memory reaching
+  //                          recall" gauge). During the 2026-07 drain the op
+  //                          queue read ~5 while this ran to ~44k, so summing
+  //                          the op queue and CALLING it the consolidation
+  //                          backlog (the old code) showed green through the
+  //                          stall.
+  // Oldest-pending age isn't on the REST /stats surface (measurement follow-up:
+  // #2847), so age is unknown. Gated off by default so the per-bank ingest
+  // contract stays clean for callers/tests that only want bank rows; the CLI
+  // doctor opts in below.
+  const backlogRows: CheckResult[] = [];
   if (opts?.includeConsolidationBacklog) {
-    let totalPending = 0;
+    let totalPendingOps = 0;
+    let totalPendingConsolidation = 0;
     let anyBankReachable = false;
     for (const [, , h] of inspected) {
       if (h.ok) {
         anyBankReachable = true;
-        totalPending += h.pendingOperations;
+        totalPendingOps += h.pendingOperations;
+        totalPendingConsolidation += h.pendingConsolidation;
       }
     }
-    if (anyBankReachable) backlogRow = classifyConsolidationBacklog(totalPending);
+    if (anyBankReachable) {
+      backlogRows.push(classifyAsyncOpQueue(totalPendingOps));
+      backlogRows.push(classifyConsolidationBacklog(totalPendingConsolidation));
+    }
   }
 
   for (const [bankId, agents, h] of inspected) {
@@ -1661,7 +1711,7 @@ export async function checkBankIngestHealth(
     }
     results.push({ name: label, status: "ok", detail: summary });
   }
-  if (backlogRow) results.push(backlogRow);
+  results.push(...backlogRows);
   return results;
 }
 
@@ -1802,6 +1852,12 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // and invisible everywhere else, which is how the whole fleet ran the
   // engine's stock consolidation mission unnoticed (see the function's doc).
   results.push(...(await checkBankObservationsMissions(config, url)));
+
+  // The bank-config API those missions are seeded through must actually be
+  // reachable: since #3529 retain-mission seeding is fail-closed, so a disabled
+  // HINDSIGHT_API_ENABLE_BANK_CONFIG_API or a renamed field silently skips
+  // seeding for every agent and still exits 0 (#3538).
+  results.push(...(await checkBankConfigApiReachable(config, url)));
 
   // …and whether those scopes still have room to consolidate INTO. Hindsight
   // caps observations per scope; past the cap the consolidator keeps running,
@@ -1946,6 +2002,15 @@ export interface PendingRetainsProbeResult {
    * ``switchroom.yaml``.
    */
   cap: number;
+  /**
+   * Count of entries in ``pending-duplicate/`` — redundant, byte-identical
+   * copies that ``collapse_duplicates()`` retired
+   * (``lib/pending.py:archive_duplicate``) because the same entry was already
+   * queued. NOT loss: the surviving copy stays queued. Reported as an
+   * informational note (never a fail) so a large collapse pass reads as a
+   * queue that shrank WITH a cause, not as unexplained loss (#3896).
+   */
+  duplicates: number;
 }
 
 /**
@@ -2015,7 +2080,7 @@ export function buildPendingRetainsProbeScript(
     .toISOString()
     .replace(/\.\d+Z$/, "Z");
   return (
-    `P=0; D=0; X=0; E=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
+    `P=0; D=0; X=0; E=0; Q=0; C=\${HINDSIGHT_PENDING_MAX_ENTRIES:-${PENDING_RETAINS_DEFAULT_MAX_ENTRIES}}; ` +
     `if [ -d '${dir}' ]; then ` +
     `P=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json$' || true); ` +
     `D=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json\\.dead$' || true); ` +
@@ -2040,7 +2105,15 @@ export function buildPendingRetainsProbeScript(
     `'${base}/pending-evictions.log' 2>/dev/null || echo 0); ` +
     `[ -n "$E" ] || E=0; ` +
     `fi; ` +
-    `echo "P=$P D=$D X=$X E=$E C=$C"`
+    // `Q` is the collapsed-duplicate archive count — redundant copies
+    // `collapse_duplicates()` retired into the `pending-duplicate/` SIBLING
+    // (`lib/pending.py:duplicate_dir`). Reported as an informational note, not
+    // a fail: the surviving copy stays queued, so a collapse pass that shrinks
+    // the queue is a drain WITH a cause, not loss (#3896).
+    `if [ -d '${base}/pending-duplicate' ]; then ` +
+    `Q=$(ls -1 '${base}/pending-duplicate' 2>/dev/null | grep -c '\\.json$' || true); ` +
+    `fi; ` +
+    `echo "P=$P D=$D X=$X E=$E Q=$Q C=$C"`
   );
 }
 
@@ -2073,6 +2146,7 @@ export function parsePendingRetainsProbeOutput(r: {
     dead: 0,
     dropped: 0,
     evicted: 0,
+    duplicates: 0,
     cap: PENDING_RETAINS_DEFAULT_MAX_ENTRIES,
   };
   if (r.error || r.status !== 0) return unreachable;
@@ -2086,14 +2160,16 @@ export function parsePendingRetainsProbeOutput(r: {
   // the default cap) rather than "unreachable".
   const xm = out.match(/X=(\d+)/);
   const em = out.match(/E=(\d+)/);
+  const qm = out.match(/Q=(\d+)/);
   const cm = out.match(/C=(\d+)/);
   const dropped = xm ? parseInt(xm[1], 10) : 0;
   const evicted = em ? parseInt(em[1], 10) : 0;
+  const duplicates = qm ? parseInt(qm[1], 10) : 0;
   const cap =
     cm && parseInt(cm[1], 10) > 0
       ? parseInt(cm[1], 10)
       : PENDING_RETAINS_DEFAULT_MAX_ENTRIES;
-  const common = { pending, dead, dropped, evicted, cap };
+  const common = { pending, dead, dropped, evicted, duplicates, cap };
   if (dead > 0) return { state: "dead", ...common };
   if (pending > 0) return { state: "backlog", ...common };
   return { state: "ok", ...common };
@@ -2159,6 +2235,7 @@ export function checkPendingRetainsQueues(
   const unreachable: string[] = [];
   const dropped: string[] = [];
   const evicted: string[] = [];
+  const duplicated: string[] = [];
   let okCount = 0;
   for (const [a, r] of results) {
     // Drops and evictions are cumulative and independent of the current
@@ -2166,6 +2243,11 @@ export function checkPendingRetainsQueues(
     // turns, so report them from any state.
     if (r.dropped > 0) dropped.push(`${a} (${r.dropped})`);
     if (r.evicted > 0) evicted.push(`${a} (${r.evicted})`);
+    // Collapsed duplicates are NOT loss — informational only, so they are
+    // collected independently of state and NEVER pushed into a fail/warn
+    // channel (#3896). Appended to whatever row the loss/backlog logic
+    // produces so a shrinking queue reads as an explained drain.
+    if (r.duplicates > 0) duplicated.push(`${a} (${r.duplicates})`);
     if (r.state === "dead") {
       dead.push(
         `${a} (${r.dead} dead${r.pending > 0 ? `, ${r.pending} queued` : ""})`,
@@ -2182,6 +2264,14 @@ export function checkPendingRetainsQueues(
   }
   const skippedNote =
     unreachable.length > 0 ? `; skipped (unreachable): ${unreachable.join(", ")}` : "";
+  // Purely informational: a collapsed duplicate is a redundant copy retired
+  // while the real entry stayed queued, so this note explains a queue that
+  // shrank without any memory being lost. It is appended to every row status
+  // and moves NONE of them (#3896).
+  const dupNote =
+    duplicated.length > 0
+      ? `; collapsed duplicates (not loss): ${duplicated.join(", ")}`
+      : "";
 
   // The SessionStart drain cannot clear a backlog, and in fact CREATES
   // one: it clamps each entry's HTTP timeout to the remaining hook budget
@@ -2307,7 +2397,7 @@ export function checkPendingRetainsQueues(
     return {
       name,
       status: "fail",
-      detail: `${parts.join("; ")}${skippedNote}`,
+      detail: `${parts.join("; ")}${skippedNote}${dupNote}`,
       fix: fixParts.join(" "),
     };
   }
@@ -2325,7 +2415,7 @@ export function checkPendingRetainsQueues(
     return {
       name,
       status: "warn",
-      detail: `${parts.join("; ")}${skippedNote}`,
+      detail: `${parts.join("; ")}${skippedNote}${dupNote}`,
       fix: backlogFix,
     };
   }
@@ -2334,7 +2424,7 @@ export function checkPendingRetainsQueues(
   return {
     name,
     status: "ok",
-    detail: `${okCount}/${agentNames.length} agents: empty (no failed retains)${skippedNote}`,
+    detail: `${okCount}/${agentNames.length} agents: empty (no failed retains)${skippedNote}${dupNote}`,
   };
 }
 

@@ -208,7 +208,17 @@ export function evaluateRetainLoss(ring: Sample[]): Verdict {
     ["dropped retain", last.drops - prev.drops],
   ];
   const risen = channels.filter(([, added]) => added > 0);
-  const totals = `totals: ${last.dead} dead, ${last.evicted} evicted, ${last.drops} dropped`;
+  // Collapsed duplicates are NOT a loss channel — they are never added to
+  // `channels` and never fire this signal. `collapse_duplicates()` MOVES a
+  // byte-identical redundant entry into `pending-duplicate/`
+  // (`lib/pending.py:archive_duplicate`) while the surviving copy stays
+  // queued, so a large collapse pass shrinks the spool with no memory lost.
+  // Surfaced in the totals only so that shrink reads as a drain WITH a cause,
+  // not as unexplained loss (#3896). Absent (older sample) ⇒ omitted, not 0.
+  const dup = last.duplicates;
+  const dupNote =
+    typeof dup === "number" && dup > 0 ? `, ${dup} collapsed-duplicate (not loss)` : "";
+  const totals = `totals: ${last.dead} dead, ${last.evicted} evicted, ${last.drops} dropped${dupNote}`;
   if (risen.length > 0) {
     return {
       signal,
@@ -223,6 +233,7 @@ export function evaluateRetainLoss(ring: Sample[]): Verdict {
         dead: last.dead,
         evicted: last.evicted,
         drops: last.drops,
+        duplicates: dup ?? 0,
       },
     };
   }
@@ -237,6 +248,7 @@ export function evaluateRetainLoss(ring: Sample[]): Verdict {
       dead: last.dead,
       evicted: last.evicted,
       drops: last.drops,
+      duplicates: dup ?? 0,
     },
   };
 }
@@ -567,7 +579,18 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
     return {
       signal,
       state: "ok",
-      detail: "consolidation queue empty",
+      // NOT "consolidation queue empty" — that string reads as an all-clear on
+      // the exact state a fully-FAILED queue produces. The failing path calls
+      // `_mark_operation_failed` within milliseconds, so a bank whose
+      // consolidation fails deterministically empties `status IN
+      // ('pending','processing')` and lands here looking healthiest when it is
+      // most broken (observed 2026-07-29: pending 0 for 2.5h while 37,711
+      // memories went unconsolidated). This signal only ever sees the
+      // pending/processing set; terminal failures are counted by
+      // `consolidation-failure-streak`, and the detail says so (#3989).
+      detail:
+        "no pending/processing operations (failures are not counted here — " +
+        "see consolidation-failure-streak)",
       measured: { pending: 0, oldestAgeS: 0 },
     };
   }
@@ -594,8 +617,9 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  * The signal above, `consolidation-queue-age`, structurally cannot raise on
  * this. Its only SQL is `... WHERE status IN ('pending','processing')` and the
  * failing path calls `_mark_operation_failed` within milliseconds, so a
- * deterministically failing bank empties that set and reads as
- * `"consolidation queue empty"`. On 2026-07-29 the API reported
+ * deterministically failing bank empties that set and reads OK (its detail no
+ * longer claims "consolidation queue empty" — #3989 — but it still cannot
+ * raise here). On 2026-07-29 the API reported
  * `pending_operations: 0, failed_operations: 96, pending_consolidation: 37711`
  * at the same instant, for 2.5 h, with every watchdog signal green.
  *

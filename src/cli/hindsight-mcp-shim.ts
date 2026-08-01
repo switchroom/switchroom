@@ -141,6 +141,16 @@ export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
  * capture of the PINNED image with no forward-patch, and re-capturing it is
  * part of an image bump, not a follow-up to one.
  *
+ * The silent-drop hazard is not tools/LIST-only: on tools/CALL the engine
+ * likewise declares `additionalProperties:false` but does NOT enforce it, so a
+ * bogus arg (agents keep guessing recall `limit`) is dropped SILENTLY with
+ * isError:false and the agent believes it capped results when it did not. This
+ * table is now ALSO the ground truth for the tools/CALL guard: {@link
+ * guardAndClampToolCall} validates every forwarded call's argument keys
+ * against this union and rejects unknowns loudly, so drift here reds a test in
+ * both directions AND flows straight into call-time validation — do not
+ * hand-write a second accepted-prop list anywhere.
+ *
  * This table now describes 0.8.5, which the image pins: 0.8.5 registers the
  * same 32 tools as 0.8.4 plus exactly three props — `list_memories.tags`,
  * `list_memories.tags_match` and `create_mental_model.tags_match` (derived by
@@ -362,6 +372,127 @@ export function redactToolCallParams(params: unknown): unknown {
     return params;
   }
   return { ...called, arguments: redactToolArguments(called.arguments) };
+}
+
+// ─── Recall/reflect budget clamp + loud unknown-arg rejection ──────────────
+
+/**
+ * Injected token budget for a bare `recall` / `reflect` when the caller
+ * names none. The engine's MCP defaults are budget:"high" + max_tokens:4096,
+ * which returns ~53 facts / ~80KB of JSON — over Claude Code's MCP output
+ * token cap, so the payload silently NEVER lands in the agent's context.
+ * 1024 matches the auto-recall hook (`vendor/.../lib/client.py` uses
+ * max_tokens=1024). Explicit caller values always win — see
+ * {@link guardAndClampToolCall}. Tunable via
+ * `HINDSIGHT_SHIM_RECALL_MAX_TOKENS` / `HINDSIGHT_SHIM_REFLECT_MAX_TOKENS`.
+ */
+export const DEFAULT_RECALL_MAX_TOKENS = 1024;
+export const DEFAULT_REFLECT_MAX_TOKENS = 1024;
+
+/** Parse a positive-int env override, falling back on absent/garbage input. */
+function resolveClampMaxTokens(
+  envVal: string | undefined,
+  fallback: number,
+): number {
+  if (envVal === undefined || envVal === "") return fallback;
+  const n = Number.parseInt(envVal, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** The accepted-argument union (required ∪ optional) for a table tool. */
+function acceptedArgs(name: string): Set<string> | undefined {
+  const spec = FALLBACK_TOOL_TABLE[name];
+  if (!spec) return undefined;
+  return new Set<string>([...spec[0], ...spec[1]]);
+}
+
+function unknownArgMessage(
+  name: string,
+  unknownKeys: string[],
+  allowed: Set<string>,
+): string {
+  const keys = unknownKeys.map((k) => `'${k}'`).join(", ");
+  const plural = unknownKeys.length > 1 ? "parameters" : "parameter";
+  const base =
+    `${name} has no ${keys} ${plural}. ` +
+    `Accepted arguments: ${[...allowed].sort().join(", ")}.`;
+  if (name === "recall" || name === "reflect") {
+    // The 0.6.2 changelog renamed max_results→max_tokens; agents keep
+    // guessing `limit`. Recall is capped by TOKEN BUDGET, not count.
+    return (
+      `${base} There is no 'limit'/'top_k' — cap results with max_tokens ` +
+      `(a token budget over each fact's text, in relevance order) or ` +
+      `budget: low|mid|high.`
+    );
+  }
+  return base;
+}
+
+/**
+ * Guard + clamp a `tools/call` params object before it is forwarded upstream.
+ *
+ * Two jobs, both closing holes the engine leaves open (it declares
+ * `additionalProperties:false` but does NOT enforce it — an unknown arg is
+ * dropped SILENTLY with isError:false, so the agent believes a cap/filter
+ * applied when it did not):
+ *
+ *  1. LOUD UNKNOWN-ARG REJECTION — validate argument keys against the
+ *     required∪optional union derived from {@link FALLBACK_TOOL_TABLE} (the
+ *     single pinned source; the contract fixture keeps it ≡ the image). An
+ *     unknown key returns a loud, self-correcting error instead of a silent
+ *     drop. Tools not in the table are passed through unvalidated (no ground
+ *     truth to validate against).
+ *  2. DEFAULT BUDGET CLAMP — for `recall`/`reflect` only, inject
+ *     max_tokens (env-tunable) + budget:"low" when the caller OMITS them.
+ *     Explicit caller values ALWAYS win (a deliberate max_tokens:4096 passes
+ *     untouched).
+ *
+ * Returns the (possibly rewritten) params to forward, or a loud error text.
+ */
+export function guardAndClampToolCall(
+  params: unknown,
+  env: NodeJS.ProcessEnv,
+): { ok: true; params: unknown } | { ok: false; text: string } {
+  const called = params as
+    | { name?: string; arguments?: unknown }
+    | undefined
+    | null;
+  const name = called?.name;
+  if (typeof name !== "string") return { ok: true, params };
+  const allowed = acceptedArgs(name);
+  // No pinned ground truth for this tool → nothing to validate/clamp against.
+  if (!allowed) return { ok: true, params };
+
+  const rawArgs = called?.arguments;
+  const args =
+    rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+      ? (rawArgs as Record<string, unknown>)
+      : {};
+
+  const unknownKeys = Object.keys(args).filter((k) => !allowed.has(k));
+  if (unknownKeys.length > 0) {
+    return { ok: false, text: unknownArgMessage(name, unknownKeys, allowed) };
+  }
+
+  if (name === "recall" || name === "reflect") {
+    const injected: Record<string, unknown> = { ...args };
+    if (injected.max_tokens === undefined) {
+      injected.max_tokens =
+        name === "recall"
+          ? resolveClampMaxTokens(
+              env.HINDSIGHT_SHIM_RECALL_MAX_TOKENS,
+              DEFAULT_RECALL_MAX_TOKENS,
+            )
+          : resolveClampMaxTokens(
+              env.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS,
+              DEFAULT_REFLECT_MAX_TOKENS,
+            );
+    }
+    if (injected.budget === undefined) injected.budget = "low";
+    return { ok: true, params: { ...called, arguments: injected } };
+  }
+
+  return { ok: true, params };
 }
 
 /** Materialize the static fallback manifest in MCP tools/list shape. */
@@ -922,13 +1053,22 @@ export class HindsightShim {
     if (called?.name && SYNTHESIZED_TOOL_NAMES.includes(called.name)) {
       return this.synthesizedCall(called.name, called.arguments);
     }
+    // Guard + clamp BEFORE forwarding: turn the engine's silent unknown-arg
+    // drop into a loud, self-correcting error, and inject the recall/reflect
+    // budget defaults the engine otherwise leaves fat (see
+    // guardAndClampToolCall). Runs before redaction so the injected budget is
+    // covered by the same forward path.
+    const guarded = guardAndClampToolCall(params, process.env);
+    if (!guarded.ok) {
+      return { content: [{ type: "text", text: guarded.text }], isError: true };
+    }
     // Secret redaction chokepoint for the MCP write path. Every
     // `mcp__hindsight__*` call an agent makes is forwarded from HERE, so
     // masking the arguments here covers retain / update_memory /
     // create_directive / mental-model writes with one seam, and covers any
     // tool the backend adds later without a code change (see
     // READ_ONLY_TOOL_NAMES — the allowlist is the reads, not the writes).
-    const forwarded = redactToolCallParams(params);
+    const forwarded = redactToolCallParams(guarded.params);
     try {
       const res = await this.upstream.request(
         "tools/call",

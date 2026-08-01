@@ -250,6 +250,24 @@ describe("renderHostdComposeFile — docker-socket-proxy sidecar (#1842 / #1400 
     expect(proxyBlock).toContain("tmpfs:");
   });
 
+  it("mounts BOTH /run and /tmp as tmpfs so the read_only proxy can render haproxy.cfg on boot (#3932)", () => {
+    const out = render();
+    const proxyBlock = out.slice(
+      out.indexOf("docker-socket-proxy:"),
+      out.indexOf("  hostd:"),
+    );
+    // Collect the actual tmpfs list entries in the proxy block — not prose
+    // mentions in comments. The tecnativa entrypoint writes /tmp/haproxy.cfg
+    // at startup; with read_only rootfs, a missing /tmp tmpfs crash-loops the
+    // proxy before HAProxy starts (the regression this guards).
+    const tmpfsMounts = proxyBlock
+      .split("\n")
+      .filter((l) => /^\s*- \/(run|tmp)\s*$/.test(l))
+      .map((l) => l.trim());
+    expect(tmpfsMounts).toContain("- /run");
+    expect(tmpfsMounts).toContain("- /tmp");
+  });
+
   it("sets the endpoint allowlist to EXACTLY the flags hostd's call set needs", () => {
     const out = render();
     const proxyBlock = out.slice(
