@@ -44,7 +44,7 @@ import {
 } from '../outbox.js'
 import { isShownBlock } from '../shown-ledger.js'
 import { richMessage, isParseEntitiesError } from '../rich-send.js'
-import { splitMarkdownChunks } from '../format.js'
+import { splitMarkdownChunks, splitPlainTextToCap } from '../format.js'
 import { resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { createRetryApiCall, retryWithThreadFallback } from '../retry-api-call.js'
 import {
@@ -460,19 +460,44 @@ type OutboxSendBot = {
  * caught here — it propagates so `retryWithThreadFallback` and the sweep's
  * claim-release retry handle it, exactly as before.
  */
+/**
+ * #4043: the plain fallback is RE-CAPPED to `PLAIN_TEXT_MAX_CHARS` (4096). The
+ * caller splits at the RICH cap (32768 — `splitMarkdownChunks`' default), so an
+ * oversized chunk that parse-rejected used to be re-sent to the plain endpoint
+ * whole, get `message is too long`, throw, release the claim, and retry on the
+ * NEXT tick forever: the record could never be delivered and never cleared.
+ * Returns one entry per message actually landed (the plain fallback can land
+ * several) so the caller's history / journal bookkeeping stays aligned with the
+ * wire. A trailing `reply_markup` (the Listen button) rides the FINAL piece
+ * only, exactly as it rides the final chunk.
+ */
 async function sendChunkRich(
   bot: OutboxSendBot,
   chatId: string,
   chunk: string,
   opts: object,
-): Promise<{ message_id?: number }> {
+): Promise<Array<{ message_id?: number; text: string }>> {
   try {
     // allow-raw-bot-api: caller (createOutboxSend) invokes this inside retryWithThreadFallback + createRetryApiCall
-    return await bot.api.sendRichMessage(chatId, richMessage(chunk), opts)
+    const sent = await bot.api.sendRichMessage(chatId, richMessage(chunk), opts)
+    return [{ message_id: sent?.message_id, text: chunk }]
   } catch (err) {
     if (isParseEntitiesError(err)) {
-      // allow-raw-bot-api: parse-reject plain fallback, still inside the sweep's retryWithThreadFallback wrapper
-      return await bot.api.sendMessage(chatId, chunk, opts)
+      const pieces = splitPlainTextToCap(chunk)
+      const withoutMarkup = { ...(opts as Record<string, unknown>) }
+      delete withoutMarkup.reply_markup
+      const landed: Array<{ message_id?: number; text: string }> = []
+      for (let p = 0; p < pieces.length; p++) {
+        const isFinalPiece = p === pieces.length - 1
+        // allow-raw-bot-api: parse-reject plain fallback, still inside the sweep's retryWithThreadFallback wrapper
+        const sent = await bot.api.sendMessage(
+          chatId,
+          pieces[p],
+          isFinalPiece ? opts : withoutMarkup,
+        )
+        landed.push({ message_id: sent?.message_id, text: pieces[p] })
+      }
+      return landed
     }
     throw err
   }
@@ -532,14 +557,111 @@ export function createOutboxSend(deps: {
         },
         { threadId: threadId ?? undefined, chat_id: chatId, verb: 'outbox-sweep.sendMessage' },
       )
-      const id = res?.message_id
-      if (id != null) landed.push({ messageId: id, text: chunk })
+      // One entry per message that actually landed — the #4043 plain fallback
+      // can split ONE rich chunk into several 4096-capped plain messages, and
+      // history/backstop bookkeeping must reflect the wire, not the pre-split
+      // chunk.
+      for (const sent of res ?? []) {
+        if (sent.message_id != null) landed.push({ messageId: sent.message_id, text: sent.text })
+      }
     }
     return {
       messageId: landed.length > 0 ? landed[landed.length - 1]!.messageId : undefined,
       chunks: landed,
     }
   }
+}
+
+/**
+ * Build the heartbeat tick that {@link startOutboxSweep} hands to `setInterval`,
+ * with the SINGLE-FLIGHT guard (#3864).
+ *
+ * The tick fires every `OUTBOX_SWEEP_INTERVAL_MS` and the sweep it starts is
+ * `void`-ed, so a sweep that outlives its interval used to have the NEXT tick
+ * start a second, concurrent sweep body against the same outbox directory. The
+ * per-record rename mutex (`claimRecord`, `../outbox.ts`) keeps that from
+ * double-sending a single record, but it is the only thing that does: the two
+ * bodies still race the same journal / dedup / backoff state, and every
+ * additional overlapping tick multiplies the wire pressure at exactly the
+ * moment (a slow or flood-throttled Telegram) when the sweep must issue LESS.
+ * `inFlight` makes overlap unrepresentable rather than merely survivable.
+ *
+ * Extracted + exported so the guard is unit-testable without a live gateway,
+ * a timer, or the filesystem: pass a `runSweep` you control and drive `tick()`
+ * directly.
+ */
+export function createOutboxSweepTick(deps: {
+  /** Nothing to sweep until the bot exists (unchanged pre-guard behaviour). */
+  getBot: () => unknown
+  backoff: ReturnType<typeof createSweepBackoff>
+  /** Run ONE sweep body. Wired by {@link startOutboxSweep} to {@link sweepOutbox}. */
+  runSweep: () => Promise<OutboxSweepSummary>
+  log?: (line: string) => void
+  /** Test seam — clock used for the backoff gate and the defer-log throttle. */
+  now?: () => number
+}): (() => void) & { inFlight: () => boolean } {
+  const now = deps.now ?? (() => Date.now())
+  let lastDeferLogAt = 0
+  let inFlight = false
+  let overlapSkips = 0
+  const tick = () => {
+    if (deps.getBot() == null) return
+    if (!deps.backoff.ready(now())) return
+    // #3864 — a sweep is still running; skip this tick entirely rather than
+    // starting a second concurrent body. Skipping is free: the outbox is a
+    // durable safety net with no latency SLA, and the in-flight sweep will
+    // pick up anything this tick would have.
+    if (inFlight) {
+      overlapSkips++
+      if (overlapSkips === 1) {
+        deps.log?.(
+          `outbox-sweep: tick skipped — the previous sweep is still in flight ` +
+            `(single-flight guard; no concurrent sweep started)\n`,
+        )
+      }
+      return
+    }
+    inFlight = true
+    void deps
+      .runSweep()
+      .then((summary) => {
+        // A flood-deferred sweep is neither success nor failure: it never
+        // reached the wire, so it must not clear a backoff earned by real
+        // failures, and it must not deepen one either.
+        if (summary.floodDeferred === true) {
+          const at = now()
+          if (at - lastDeferLogAt >= OUTBOX_SWEEP_DEFER_LOG_INTERVAL_MS) {
+            lastDeferLogAt = at
+            deps.log?.(
+              `outbox-sweep: deferred — Telegram flood window still open for ` +
+                `${Math.ceil((summary.floodRemainingMs ?? 0) / 1000)}s; not issuing any ` +
+                `send (would feed the ban)\n`,
+            )
+          }
+          return
+        }
+        if (summary.sendFailures > 0) {
+          const delay = deps.backoff.noteFailure(now())
+          deps.log?.(
+            `outbox-sweep: ${summary.sendFailures} send failure(s) — backing off ` +
+              `${Math.round(delay / 1000)}s before the next sweep (attempt ${deps.backoff.failures()})\n`,
+          )
+        } else {
+          deps.backoff.noteSuccess()
+        }
+      })
+      .catch((err) => deps.log?.(`outbox-sweep: tick failed: ${(err as Error).message}\n`))
+      .finally(() => {
+        inFlight = false
+        if (overlapSkips > 0) {
+          deps.log?.(
+            `outbox-sweep: sweep finished; ${overlapSkips} tick(s) were skipped while it ran\n`,
+          )
+          overlapSkips = 0
+        }
+      })
+  }
+  return Object.assign(tick, { inFlight: () => inFlight })
 }
 
 export function startOutboxSweep(deps: {
@@ -587,54 +709,26 @@ export function startOutboxSweep(deps: {
     ...(deps.resolveReplyMarkup != null ? { resolveReplyMarkup: deps.resolveReplyMarkup } : {}),
   })
   const backoff = deps.backoff ?? createSweepBackoff()
-  let lastDeferLogAt = 0
-  const tick = () => {
-    const bot = deps.getBot()
-    if (bot == null) return
-    const now = Date.now()
-    if (!backoff.ready(now)) return
-    void sweepOutbox({
-      stateDir: deps.stateDir,
-      log: deps.log,
-      send,
-      ...(deps.recordOutbound != null ? { recordOutbound: deps.recordOutbound } : {}),
-      floodWaitRemainingMs: floodProbe,
-      textAlreadyDelivered: (chatId, threadId, text) => deps.dedupCheck(chatId, threadId ?? undefined, text),
-      registryChainLookup: (taskId) => {
-        const db = deps.getTurnsDb()
-        if (db == null) return null
-        const turnKey = resolveSubagentOriginTurnKey(db, taskId)
-        return turnKey == null ? null : chatFromTurnKey(turnKey)
-      },
-    })
-      .then((summary) => {
-        // A flood-deferred sweep is neither success nor failure: it never
-        // reached the wire, so it must not clear a backoff earned by real
-        // failures, and it must not deepen one either.
-        if (summary.floodDeferred === true) {
-          const at = Date.now()
-          if (at - lastDeferLogAt >= OUTBOX_SWEEP_DEFER_LOG_INTERVAL_MS) {
-            lastDeferLogAt = at
-            deps.log?.(
-              `outbox-sweep: deferred — Telegram flood window still open for ` +
-                `${Math.ceil((summary.floodRemainingMs ?? 0) / 1000)}s; not issuing any ` +
-                `send (would feed the ban)\n`,
-            )
-          }
-          return
-        }
-        if (summary.sendFailures > 0) {
-          const delay = backoff.noteFailure(Date.now())
-          deps.log?.(
-            `outbox-sweep: ${summary.sendFailures} send failure(s) — backing off ` +
-              `${Math.round(delay / 1000)}s before the next sweep (attempt ${backoff.failures()})\n`,
-          )
-        } else {
-          backoff.noteSuccess()
-        }
-      })
-      .catch((err) => deps.log?.(`outbox-sweep: tick failed: ${(err as Error).message}\n`))
-  }
+  const tick = createOutboxSweepTick({
+    getBot: deps.getBot,
+    backoff,
+    log: deps.log,
+    runSweep: () =>
+      sweepOutbox({
+        stateDir: deps.stateDir,
+        log: deps.log,
+        send,
+        ...(deps.recordOutbound != null ? { recordOutbound: deps.recordOutbound } : {}),
+        floodWaitRemainingMs: floodProbe,
+        textAlreadyDelivered: (chatId, threadId, text) => deps.dedupCheck(chatId, threadId ?? undefined, text),
+        registryChainLookup: (taskId) => {
+          const db = deps.getTurnsDb()
+          if (db == null) return null
+          const turnKey = resolveSubagentOriginTurnKey(db, taskId)
+          return turnKey == null ? null : chatFromTurnKey(turnKey)
+        },
+      }),
+  })
   const timer = setInterval(tick, OUTBOX_SWEEP_INTERVAL_MS)
   timer.unref?.()
   return timer

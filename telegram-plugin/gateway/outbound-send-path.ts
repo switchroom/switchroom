@@ -29,6 +29,7 @@ import {
   stripExcessBold,
   addParagraphSpacers,
   splitMarkdownChunks,
+  splitPlainTextToCap,
   hardSliceToCap,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
@@ -416,16 +417,35 @@ export async function sendReplyChunks(
     // rejects our markdown — better an unformatted answer than a
     // vanished one. The raw markdown source is itself readable prose, so
     // we send it verbatim rather than strip anything.
+    //
+    // #4043: chunks were split for the RICH cap (up to RICH_MESSAGE_MAX_CHARS =
+    // 32768), but this fallback ships them through the PLAIN `sendMessage`
+    // endpoint, which caps at 4096. Without a re-cap, the rescue send itself
+    // 400s with `message is too long` and the answer vanishes — the exact
+    // failure the fallback exists to prevent. Re-cap at safe boundaries first.
     const sendChunkPlainText = async (opts: Record<string, unknown>): Promise<void> => {
       const plain =
         chunks[i].length > 0
           ? chunks[i]
           : '⚠️ (a fragment could not be rendered for Telegram)'
-      const sent = await deps.sendLiteralRaw(opts, plain)
-      sentIds.push(sent.message_id)
-      deps.logOutbound('reply', chatId, sent.message_id, plain.length, `chunk=${i + 1}/${chunks.length} plaintext-fallback`)
+      const pieces = splitPlainTextToCap(plain)
+      for (let p = 0; p < pieces.length; p++) {
+        const sent = await deps.sendLiteralRaw(opts, pieces[p])
+        sentIds.push(sent.message_id)
+        deps.logOutbound(
+          'reply',
+          chatId,
+          sent.message_id,
+          pieces[p].length,
+          pieces.length > 1
+            ? `chunk=${i + 1}/${chunks.length} plaintext-fallback piece=${p + 1}/${pieces.length}`
+            : `chunk=${i + 1}/${chunks.length} plaintext-fallback`,
+        )
+      }
       deps.stderr(
-        `telegram gateway: markdown parse-reject — resent chunk ${i + 1}/${chunks.length} as plain text\n`,
+        `telegram gateway: markdown parse-reject — resent chunk ${i + 1}/${chunks.length} as plain text` +
+          (pieces.length > 1 ? ` in ${pieces.length} piece(s) (4096-char plain cap)` : '') +
+          `\n`,
       )
     }
 
@@ -2660,7 +2680,11 @@ export async function deliverCapturedProse(
         `(chat=${chatId} origin=${originTurnId})\n`,
     )
     const plain = redactOutboundText(text, 'captured_prose')
-    const plainChunks = splitMarkdownChunks(plain, RICH_MESSAGE_MAX_CHARS)
+    // #4043: these pieces go through the PLAIN `sendMessage` endpoint (4096
+    // cap), not the rich one — splitting at RICH_MESSAGE_MAX_CHARS produced
+    // pieces Telegram rejects with `message is too long`, so a long recovered
+    // answer fell through to the generic apology and was lost.
+    const plainChunks = splitPlainTextToCap(plain)
     try {
       let liveThreadId: number | undefined = threadId
       const plainSentIds: number[] = []

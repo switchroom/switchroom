@@ -28,7 +28,11 @@
 
 import { parse } from "./parse.js";
 import { renderSafe, type RenderResult } from "./render.js";
-import { RICH_MESSAGE_MAX_CHARS, splitMarkdownChunks } from "../format.js";
+import {
+  PLAIN_TEXT_MAX_CHARS,
+  RICH_MESSAGE_MAX_CHARS,
+  splitMarkdownChunks,
+} from "../format.js";
 
 /**
  * The legacy plain-text `sendMessage` / `editMessageText` wire cap (4096
@@ -38,8 +42,12 @@ import { RICH_MESSAGE_MAX_CHARS, splitMarkdownChunks } from "../format.js";
  * the plain `sendMessage` endpoint (see stream-controller `doSend`/`doEdit`).
  * A degraded plain body larger than this is rejected by Telegram with
  * `message is too long`, so `renderOutboundChunks` caps plain pieces here.
+ *
+ * Defined in `format.ts` (#4043) so the parse-reject plain FALLBACKS in the
+ * send path can share the one constant without importing the renderer;
+ * re-exported here for this module's existing importers.
  */
-export const PLAIN_TEXT_MAX_CHARS = 4096;
+export { PLAIN_TEXT_MAX_CHARS };
 
 /** Parse the `SWITCHROOM_RICH_RENDER` kill-switch value. Default ON; disabled
  *  only by an explicit falsey/off token (`0`/`false`/`off`/`no`,
