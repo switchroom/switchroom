@@ -143,20 +143,21 @@ export function classifyShmSize(bytes: number): CheckResult {
 }
 
 /**
- * Backlog thresholds for the consolidation queue. With the #2894 throttle
- * (MAX_SLOTS=1, ~7 consolidation ops/hour drained against a fleet retaining
- * every turn) the queue can build silently — the only prior signal was a 2h
- * queue-lag WARNING written to `docker logs` by `hindsight-maintenance.sh`.
- * A deep queue means retains are landing but not yet consolidated into recall.
- * WARN ≈ several hours of backlog; FAIL ≈ ~a day+, likely wedged.
+ * Depth thresholds for the async OPERATION queue (`/stats.pending_operations`
+ * — `async_operations` rows in `pending`/`processing`). This is the TASK queue:
+ * retains, refreshes and consolidation ops waiting to be claimed. It is NOT the
+ * memory-consolidation backlog — during the 2026-07 reconsolidation drain it
+ * read ~5 while 44k memory units sat unconsolidated (#3949). Use it to catch a
+ * stuck reaper / claim stall, where non-terminal ops pile up instead of
+ * draining. WARN ≈ a claim backlog building; FAIL ≈ the queue is wedged.
  */
-export const CONSOLIDATION_BACKLOG_WARN = 25;
-export const CONSOLIDATION_BACKLOG_FAIL = 200;
+export const OP_QUEUE_WARN = 25;
+export const OP_QUEUE_FAIL = 200;
 
 /**
- * Pure: classify the consolidation-queue backlog into a doctor result so
- * `switchroom doctor` surfaces queue depth (and, when available, the oldest
- * pending op's age) instead of it hiding in docker logs.
+ * Pure: classify the async OPERATION queue depth into a doctor result so
+ * `switchroom doctor` surfaces a claim/reaper stall (and, when available, the
+ * oldest pending op's age) instead of it hiding in docker logs.
  *
  * `queueDepth` is the count of pending/processing async operations across all
  * banks (summed from each bank's `/stats.pending_operations`). `oldestAgeSecs`
@@ -164,8 +165,12 @@ export const CONSOLIDATION_BACKLOG_FAIL = 200;
  * `/stats` surface exposes depth but not per-op age, so precise age
  * measurement is deferred to the #2847 follow-up (the maintenance loop already
  * logs it). Never throws.
+ *
+ * NOTE: this does NOT measure whether retained memory is reaching recall —
+ * that is {@link classifyConsolidationBacklog}, which reads the actual
+ * `memory_units` backlog (`pending_consolidation`).
  */
-export function classifyConsolidationBacklog(
+export function classifyAsyncOpQueue(
   queueDepth: number,
   oldestAgeSecs: number | null = null,
 ): CheckResult {
@@ -173,33 +178,160 @@ export function classifyConsolidationBacklog(
     oldestAgeSecs !== null && oldestAgeSecs > 0
       ? `, oldest ${Math.round(oldestAgeSecs / 60)}m old`
       : "";
-  const base = `${queueDepth} pending consolidation op(s)${ageStr}`;
-  if (queueDepth >= CONSOLIDATION_BACKLOG_FAIL) {
+  const base = `${queueDepth} pending async op(s)${ageStr}`;
+  if (queueDepth >= OP_QUEUE_FAIL) {
+    return {
+      name: "hindsight async op queue",
+      status: "fail",
+      detail:
+        `${base} — the operation queue is deep enough to be wedged; ops are ` +
+        `enqueued but not draining (a stuck reaper / claim stall)`,
+      fix:
+        "Check `docker logs switchroom-hindsight` for claim/reaper errors " +
+        "(quota/429/shm, stuck 'processing' ops); restart with `switchroom " +
+        "memory --restart` if the worker is stuck.",
+    };
+  }
+  if (queueDepth >= OP_QUEUE_WARN) {
+    return {
+      name: "hindsight async op queue",
+      status: "warn",
+      detail:
+        `${base} — non-terminal ops are building faster than they drain; ` +
+        `claims may be lagging (check the reaper before it wedges)`,
+    };
+  }
+  return {
+    name: "hindsight async op queue",
+    status: "ok",
+    detail: queueDepth > 0 ? base : "queue drained (0 pending)",
+  };
+}
+
+/**
+ * Backlog thresholds for the memory-consolidation queue — the count of
+ * `memory_units` with `consolidated_at IS NULL` (`/stats.pending_consolidation`).
+ * This is the number that actually gauges whether retained memory is reaching
+ * recall, and it is MEMORY-SCALE, not op-scale: the healthy fleet's largest
+ * per-bank reading was 45 (B9c in hindsight-watch/thresholds.ts) while the
+ * 2026-07 stall ran to ~44k. Absolute depth is a blunt gauge — a bank
+ * mid-ingest legitimately runs deep — so the thresholds sit far above the
+ * healthy floor and the fix text names the benign case. WARN ≈ growth worth a
+ * look; FAIL ≈ a stall that is starving recall.
+ */
+export const CONSOLIDATION_BACKLOG_WARN = 1000;
+export const CONSOLIDATION_BACKLOG_FAIL = 10000;
+
+/**
+ * Pure: classify the REAL memory-consolidation backlog into a doctor result.
+ *
+ * `pendingConsolidation` is the count of unconsolidated `memory_units` summed
+ * across every reachable bank (each bank's `/stats.pending_consolidation`).
+ * Unlike {@link classifyAsyncOpQueue} this reads the memory backlog directly,
+ * so it stays honest when the op queue is shallow but consolidation has stalled
+ * (the #3949 blind spot). Never throws.
+ */
+export function classifyConsolidationBacklog(
+  pendingConsolidation: number,
+): CheckResult {
+  const base = `${pendingConsolidation} memory unit(s) pending consolidation`;
+  if (pendingConsolidation >= CONSOLIDATION_BACKLOG_FAIL) {
     return {
       name: "hindsight consolidation backlog",
       status: "fail",
       detail:
-        `${base} — queue is deep enough to be wedged; retains are landing but ` +
-        `not consolidating into recall (drains ~7 ops/hr under the #2894 throttle)`,
+        `${base} — consolidation has stalled far behind ingest; retained ` +
+        `memory is landing but not reaching recall (drains ~7 ops/hr under ` +
+        `the #2894 throttle)`,
       fix:
-        "Check `docker logs switchroom-hindsight` for the queue-lag WARNING and " +
-        "consolidation errors (quota/429/shm); restart with `switchroom memory " +
-        "--restart` if the worker is stuck.",
+        "Check `docker logs switchroom-hindsight` for consolidation errors " +
+        "(quota/429/shm, HNSW index faults) and the consolidation-failure-" +
+        "streak signal; a bank legitimately mid-ingest can read deep, so " +
+        "confirm the number is not draining before restarting.",
     };
   }
-  if (queueDepth >= CONSOLIDATION_BACKLOG_WARN) {
+  if (pendingConsolidation >= CONSOLIDATION_BACKLOG_WARN) {
     return {
       name: "hindsight consolidation backlog",
       status: "warn",
       detail:
         `${base} — building faster than it drains (~7 ops/hr under the #2894 ` +
-        `throttle); recall may lag recent turns until it catches up`,
+        `throttle); recall may lag recent turns until it catches up (a bank ` +
+        `mid-ingest can read deep — confirm it is draining)`,
     };
   }
   return {
     name: "hindsight consolidation backlog",
     status: "ok",
-    detail: queueDepth > 0 ? base : "queue drained (0 pending)",
+    detail: pendingConsolidation > 0 ? base : "consolidation drained (0 pending)",
+  };
+}
+
+/** Doctor row label for the bank-config reachability probe (#3538). */
+export const BANK_CONFIG_API_CHECK_NAME = "hindsight bank-config API";
+
+/**
+ * Pure: classify a probe of the bank-config API's `retain_mission` readability.
+ *
+ * Since #3529 retain-mission seeding is FAIL-CLOSED: `resolveRetainMissionPush`
+ * reads the bank's current mission via `GET /v1/default/banks/<bank>/config`
+ * and, on a failed read, deliberately pushes NOTHING (so a transient 5xx can't
+ * be misread as "mission unset" and clobber an operator's customization). The
+ * cost of that safety: if the config API is turned off
+ * (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API=false`, config.py default True) or
+ * Hindsight renames/renests `config.retain_mission`, EVERY read fails, apply
+ * seeds no agent — including brand-new ones — and still exits 0. The old
+ * fail-open code always seeded and masked this; the new code converts a loud
+ * problem into a silent one. This row makes it loud again (#3538).
+ *
+ * `result` is the outcome of {@link fetchBankRetainMission} for one bank:
+ *  - `ok` → the key is readable; the seed path works.
+ *  - `reason: "Unexpected shape"` → a 200 whose body carried no `retain_mission`
+ *    key: the API is disabled or the field moved. FAIL — this is exactly the
+ *    silent-skip trigger, and it is deterministic, not a transient.
+ *  - any other reason (HTTP error / timeout) → the surface could not be probed
+ *    at all; that is a server-reachability problem the container-health checks
+ *    own, so WARN here rather than FAIL (don't double-red a down server).
+ */
+export function classifyBankConfigReachability(
+  result: { ok: true } | { ok: false; reason: string },
+  bankId: string,
+): CheckResult {
+  const name = BANK_CONFIG_API_CHECK_NAME;
+  if (result.ok) {
+    return {
+      name,
+      status: "ok",
+      detail: `retain_mission readable on bank ${bankId} — the fail-closed seed path (#3529) can read the field`,
+    };
+  }
+  if (result.reason === "Unexpected shape") {
+    return {
+      name,
+      status: "fail",
+      detail:
+        `GET /v1/default/banks/${bankId}/config returned no retain_mission key — ` +
+        `the bank-config API is disabled or the field was renamed/renested. ` +
+        `Retain-mission seeding is fail-closed (#3529): with this read failing, ` +
+        `apply seeds retain_mission for NO agent (including new ones) and still ` +
+        `exits 0, so the fleet silently runs with unset retain missions.`,
+      fix:
+        "Confirm `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` is true on the Hindsight " +
+        "deployment (config.py default True) and that GET .../config still nests " +
+        "`retain_mission` under `config`. If Hindsight renamed/renested the field, " +
+        "update `fetchBankMissionField` in src/memory/hindsight.ts to match.",
+    };
+  }
+  return {
+    name,
+    status: "warn",
+    detail:
+      `could not probe the bank-config API on ${bankId}: ${result.reason} — ` +
+      `retain-mission seeding is fail-closed (#3529) and can't be confirmed. If ` +
+      `this persists it silently skips seeding for every agent.`,
+    fix:
+      "Check the hindsight container is up and `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` " +
+      "is enabled; re-run once it is reachable.",
   };
 }
 
