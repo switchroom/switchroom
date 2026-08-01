@@ -32,6 +32,7 @@ import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync, chmodSync
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { isValidTimezone } from "../config/schema.js";
+import { DEFAULT_DOCKER_SOCKET_PATH } from "./docker-socket.js";
 
 /**
  * In-container filesystem roots that are NEVER a valid HOST home. The
@@ -521,6 +522,19 @@ export interface ComposeGeneratorOptions {
    * exists yet), so production callers Just Work without threading it.
    */
   voiceEngine?: VoiceEngine;
+  /**
+   * Host-side docker socket path to bind into the `root: true` agent's
+   * `:rw` mount (#3648). Resolved ONCE at generation time from the active
+   * docker context (`docker context inspect`), so a relocated / rootless
+   * daemon socket is bound at its real path instead of a dangling
+   * `/var/run/docker.sock`.
+   *
+   * INJECTABLE so the generator stays pure and snapshot tests never shell
+   * out to a real docker daemon. When omitted, the generator resolves it
+   * live — but only when the fleet actually contains a root agent, so the
+   * common (no-root) path never touches docker.
+   */
+  dockerSocketPath?: string;
 }
 
 /**
@@ -852,6 +866,26 @@ interface AgentServiceData {
  * is treated as key-confirmed (fail-safe: never route through the proxy
  * without a key). Tests pass it explicitly to exercise the on-path.
  */
+/**
+ * Platform-gated default for an agent whose `network_isolation` is unset
+ * (#3637). `network_mode: host` is a Linux-only construct: on Docker
+ * Desktop (macOS / Windows) the agent runs inside a LinuxKit VM and
+ * `network_mode: host` binds to that VM's network namespace, NOT the
+ * operator's real host — so host-loopback services (hindsight
+ * `127.0.0.1:18888`) are unreachable and the agent silently fails to boot.
+ * On non-Linux platforms default to `strict`, whose
+ * `host.docker.internal:host-gateway` wiring reaches host services
+ * correctly. Linux keeps the historical `host` default → byte-identical.
+ *
+ * Only the UNSET default is gated: an operator who explicitly writes
+ * `network_isolation: host` on macOS gets exactly what they asked for.
+ */
+export function defaultNetworkIsolation(
+  platform: NodeJS.Platform = process.platform,
+): "host" | "strict" {
+  return platform === "linux" ? "host" : "strict";
+}
+
 export function describeAgents(
   config: SwitchroomConfig,
   litellmConfirmedAgents?: Set<string>,
@@ -886,9 +920,12 @@ export function describeAgents(
       resources,
       strippedCaps,
       // sec WS6-F1 / #1413: cascade-resolved opt-in network mode.
-      // Unset → "host" (zero behaviour change vs. pre-#1413).
+      // Explicit value wins; unset falls to the platform-gated default
+      // (#3637): "host" on Linux (zero behaviour change vs. pre-#1413),
+      // "strict" on Docker-Desktop macOS/Windows where network_mode:host
+      // binds the LinuxKit VM's namespace instead of the operator's host.
       networkIsolation:
-        resolved.network_isolation === "strict" ? "strict" : "host",
+        resolved.network_isolation ?? defaultNetworkIsolation(),
       // `root: true` is a strictly-higher tier than admin and forces
       // admin semantics on (env, audit-log mounts, hostd MCP wiring,
       // every gateway/broker admin gate) so the root agent needs only
@@ -1926,6 +1963,15 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
     );
   }
 
+  // #3648: the host docker socket path a `root: true` agent binds `:rw`.
+  // KEPT PURE: this generator never shells out — it defaults to the
+  // conventional socket constant and relies on the caller to inject the
+  // context-resolved path. Live resolution (`docker context inspect`)
+  // happens ONLY at the imperative CLI seams (computeComposeContent,
+  // bringUpAgentService), so the compose-generator test path stays
+  // hermetic regardless of the host's active docker context (#3648).
+  const dockerSocketPath = opts.dockerSocketPath ?? DEFAULT_DOCKER_SOCKET_PATH;
+
   // ── per-agent services ─────────────────────────────────────────────
   for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     if (a.strippedCaps.length > 0) {
@@ -1953,6 +1999,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
       opts.operatorUid,
       voiceEngine,
       precreateHostDirs,
+      dockerSocketPath,
     );
   }
 
@@ -2058,6 +2105,7 @@ function emitAgentService(
   operatorUid: number | undefined,
   voiceEngine: VoiceEngine,
   precreateHostDirs: boolean,
+  dockerSocketPath: string,
 ): void {
   lines.push(`  agent-${a.name}:`);
   emitImageOrBuild(lines, "agent", imageTag, buildMode, buildContext);
@@ -2548,7 +2596,11 @@ function emitAgentService(
   if (a.root === true) {
     // docker.sock — manage / exec into / read logs of every other
     // container in the fleet. This alone is root-equivalent on the host.
-    lines.push(`      - /var/run/docker.sock:/var/run/docker.sock:rw`);
+    // Source path resolved from the active docker context (#3648) so a
+    // relocated / rootless daemon socket is bound at its real path; the
+    // in-container target stays /var/run/docker.sock (where the agent's
+    // docker client looks by default).
+    lines.push(`      - ${dockerSocketPath}:/var/run/docker.sock:rw`);
     // The whole ~/.switchroom tree (all agents' scaffolds, logs, configs,
     // the vault, audit logs) at /host-home/.switchroom — mirrors hostd's
     // mount so the root agent can inspect any agent's on-host state.
@@ -2556,6 +2608,11 @@ function emitAgentService(
     // The host root filesystem at /host — full read/write reach to the
     // host OS (system logs, /etc, Coolify/nginx state, …) so debugging
     // doesn't bottom out at the container boundary.
+    //
+    // CAVEAT (#3637, Docker Desktop): on macOS/Windows `/` here is the
+    // LinuxKit VM's root, NOT the operator's real host filesystem — the
+    // root-agent debugging UX assumes a native Linux daemon. Documented,
+    // not gated: the root tier is a Linux-host operator affordance.
     lines.push(`      - /:/host:rw`);
   }
   if (a.admin === true) {

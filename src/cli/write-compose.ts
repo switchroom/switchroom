@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { generateCompose, assertPlausibleHostHome } from "../agents/compose.js";
+import { resolveDockerSocketPath } from "../agents/docker-socket.js";
 import { isContainerContext } from "./agent-config.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { isDockerRuntime } from "../runtime-mode.js";
@@ -382,6 +383,11 @@ export async function computeComposeContent(
     switchroomConfigPath: resolvedConfigPath,
     // Captured for the broker's host-shell operator socket chown.
     operatorUid,
+    // #3648: resolve the host docker socket path LIVE at this imperative
+    // apply seam (running on the host, where `docker context inspect` is
+    // meaningful) and inject it, so a `root: true` agent binds the real
+    // rootless/relocated socket. Keeps generateCompose pure/hermetic.
+    dockerSocketPath: resolveDockerSocketPath(),
   });
 
   const previousImageTag = previous ? (AGENT_IMAGE_TAG_RE.exec(previous)?.[1] ?? null) : null;
