@@ -133,6 +133,19 @@ describe('decideSupersede — the duplicate-reply decision core', () => {
     expect(d.reason).toBe('different-turn')
   })
 
+  it('2026-08-01 incident gap: a record is still live 143 s after the flush ' +
+    '(Stop-hook nudge + proactive /compact delayed the canonical reply)', () => {
+    // klanker msgs 25680/25682: under the old 60 s TTL this returned 'expired'
+    // and the reply shipped as a second bubble. The default window must cover
+    // at least the observed slow-path gap.
+    const d = decideSupersede(rec(), {
+      liveTurnId: 'turn-A',
+      now: 1_000_000 + 143_000,
+    })
+    expect(d.supersede).toBe(true)
+    expect(d.reason).toBe('supersede')
+  })
+
   it('does NOT supersede once the record is past its TTL', () => {
     const d = decideSupersede(rec(), {
       liveTurnId: 'turn-A',

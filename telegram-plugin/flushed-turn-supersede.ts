@@ -26,7 +26,9 @@
  *
  * NOT fully deterministic — a residual race remains. The flush→reply direction
  * this registry covers, plus the controller's fire-time recount for the
- * reply→flush direction, close the COMMON ~10 s replay-gap case; but if a reply
+ * reply→flush direction, close the COMMON replay-gap case (~10 s for a
+ * tool-call replay; minutes for the Stop-hook-nudged recompose after a
+ * proactive /compact — see DEFAULT_SUPERSEDE_TTL_MS); but if a reply
  * and a flush interleave so the reply's `take()` runs BEFORE the flush's
  * `record()` (a much smaller window), `take` finds no record and the duplicate
  * can still slip through. We deliberately trade that residual window for the
@@ -46,10 +48,30 @@
  * `now`. Fully unit-testable; the gateway wires the actual delete/send.
  */
 
-/** TTL after which a recorded flush is forgotten. 60 s comfortably spans the
- *  observed ~10 s flush→reply replay gap with margin, and matches the outbound
- *  dedup window so the two mechanisms age out together. */
-export const DEFAULT_SUPERSEDE_TTL_MS = 60_000
+/** TTL after which a recorded flush is forgotten.
+ *
+ *  Originally 60 s, sized for the ~10 s tool-replay gap. That window missed the
+ *  SLOW variant of the exact class this module exists for (2026-08-01, klanker
+ *  DM, msgs 25680/25682): the quiescence flush delivered the composed answer,
+ *  the Stop hook told the model its prose never reached the user, and the model
+ *  recomposed and called `reply` — but a proactive `/compact` ran in between
+ *  (occupancy ~393 k), so the canonical reply landed **2 m 24 s** after the
+ *  flush. Every layer keyed on this TTL — the registry record itself
+ *  (`decideSupersede` → 'expired'), the destructive latest-ended owner tier
+ *  (`latestEndedAccepted` rejected the 143 s-old turn, so not even the
+ *  answer-delivered latch was reachable), and the handback window — had aged
+ *  out, and the reply shipped as a second bubble.
+ *
+ *  5 min covers the flush → Stop-hook nudge → compact → recompose → `reply`
+ *  loop with margin (the turn-flush safety net itself waits minutes before
+ *  firing). The longer memory stays safe because every consumer is
+ *  identity-scoped: a record is only ever matched by its own `turnId`, the
+ *  latest-ended tier still demands the SAME ended turn, and the handback
+ *  content gate widens in the fail-safe direction (more handbacks keep the
+ *  gate → fresh send, never a silent edit-over). The exact-text #546 dedup
+ *  keeps its own 60 s window (`recent-outbound-dedup.ts`) — it guards
+ *  byte-identical replays, a different class. */
+export const DEFAULT_SUPERSEDE_TTL_MS = 5 * 60_000
 
 export interface FlushedTurnRecord {
   /** The per-turn `turnId` nonce (`deriveTurnId` shape) of the flushed turn.

@@ -1467,3 +1467,73 @@ describe('#3429 — post-turn-end handback vs flush-delivered supersede (real se
     expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
   })
 })
+
+describe('2026-08-01 klanker incident — slow flush→reply gap through the REAL send path', () => {
+  // gateway-supervisor.log, chat 12345: the answer-ready quiescence flush
+  // delivered msg 25680 at 21:17:04, a proactive /compact ran, the Stop hook
+  // nudged the model, and the canonical `reply` landed at 21:19:28 — 143 s
+  // after the flush, REWORDED post-compact (1770 vs 1563 chars). Under the old
+  // 60 s DEFAULT_SUPERSEDE_TTL_MS the registry record was 'expired' AND the
+  // latest-ended owner tier rejected the 143 s-old turn, so msg 25682 shipped
+  // as a visible duplicate. This drives the REAL sendReply with the incident
+  // timeline and asserts the outcome: the late reply corrects the flushed
+  // message in place — never a second bubble.
+  const OWNER_TURN_ID = `${CHAT}:_#25674`
+  const FLUSH_MSG_ID = 25680
+  const GAP_MS = 143_000
+  const FLUSHED_TEXT =
+    'Pulled the live numbers from the usage table. Two findings, and the second one matters: ' +
+    'the per-turn cost is dominated by cache writes, not output tokens, so trimming the reply ' +
+    'length will not move the bill much.'
+  // Post-compact the model REGENERATED the answer — same substance, different
+  // bytes. Neither exact-text dedup nor containment matching can catch this;
+  // only turnId identity + the content-gate bypass (no handback in window) can.
+  const REWORDED_REPLY =
+    'I pulled the live numbers out of the usage table. Two findings — and the second is the one ' +
+    'that matters: cache writes, not output tokens, dominate the per-turn cost, so shortening ' +
+    'replies will barely move the bill.'
+
+  function makeStaleFlushDeliveredTurn(): CurrentTurn {
+    return {
+      turnId: OWNER_TURN_ID,
+      sessionChatId: CHAT,
+      answerDelivered: 'flush',
+      flushedAnswerText: FLUSHED_TEXT,
+      endedAt: Date.now() - GAP_MS,
+      replyCalled: false,
+      finalAnswerDelivered: true,
+      finalAnswerSubstantive: true,
+    } as unknown as CurrentTurn
+  }
+
+  it('outcome: the reworded reply landing 143 s after the flush edits the flushed ' +
+    'message in place — exactly one bubble, no duplicate', async () => {
+    const h = makeHarness()
+    const owner = makeStaleFlushDeliveredTurn()
+    // The flush recorded its message 143 s ago (NOT freshly — the incident gap).
+    h.deps.flushedTurnSupersede.record(
+      CHAT,
+      undefined,
+      { turnId: OWNER_TURN_ID, messageIds: [FLUSH_MSG_ID], text: FLUSHED_TEXT },
+      Date.now() - GAP_MS,
+    )
+    // Late DM reply: no live turn, no origin echo, no quote → latest-ended tier,
+    // with the REAL 143 s age the gateway would compute from `endedAt`.
+    h.deps.resolveReplyOwnerTurn = () =>
+      ownerRes(owner, 'latest-ended', { latestEndedAgeMs: GAP_MS })
+    // No subagent handback anywhere in the window (the incident had none).
+    h.deps.getLastSubagentHandbackAt = () => null
+
+    const res = await sendReply(h.deps, req(REWORDED_REPLY))
+
+    // The flushed message was edited into the canonical reply…
+    const edits = h.calls.filter((c) => c.method === 'editMessageText')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.message_id).toBe(FLUSH_MSG_ID)
+    expect(edits[0]!.text).toContain('cache writes')
+    // …and NO second bubble shipped — the exact duplicate the incident produced.
+    expect(h.calls.filter((c) => c.method === 'sendRichMessage')).toHaveLength(0)
+    expect(h.calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(res.content[0]!.text).toMatch(/^sent/)
+  })
+})

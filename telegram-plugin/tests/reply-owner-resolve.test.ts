@@ -1216,3 +1216,101 @@ describe('#3725 — a still-running turn is not a supersede anchor', () => {
     expect(reg.peek(CHAT, undefined, { liveTurnId: RUNNING, now: NOW + 10 }).supersede).toBe(true)
   })
 })
+
+describe('2026-08-01 klanker incident — slow flush→reply gap (Stop-hook nudge + /compact)', () => {
+  // The observed double-send (gateway-supervisor.log, chat 12345):
+  //   21:17:04  answer-ready quiescence flush delivers msg 25680 (turn #25674)
+  //   21:17:04  proactive /compact fires (occupancy ~393k)
+  //   21:19:28  the model's canonical `reply` lands — 143 s AFTER the flush,
+  //             REWORDED post-compact (1770 vs 1563 chars), no live turn, no
+  //             origin echo (DM), no quote → latest-ended is the only tier.
+  //   21:19:39  msg 25682 ships → the user sees the same answer twice.
+  // Under the old 60 s window BOTH guards had expired: the latest-ended owner
+  // tier rejected the 143 s-old turn (owner=null → the answer-delivered latch
+  // was unreachable) and the registry record itself was 'expired'. These tests
+  // replay the incident timeline through the exact pure cores the gateway wires
+  // (`resolveReplyOwnerTurn` → `decideContentGateBypass` → registry.take`) and
+  // assert the OUTCOME: the late reply collapses onto the flushed message —
+  // one bubble, never two. Shrinking DEFAULT_SUPERSEDE_TTL_MS below the
+  // observed gap turns these red.
+  const CHAT = '424242'
+  const TURN = 'turn-25674'
+  const FLUSH_TS = 5_000_000
+  const REPLY_TS = FLUSH_TS + 143_000 // the observed 2 m 23 s flush→reply gap
+  const FLUSHED_TEXT =
+    'Pulled the live numbers from the usage table. Two findings, and the second one matters: ' +
+    'the per-turn cost is dominated by cache writes, not output tokens.'
+  // Post-compact the model REGENERATED the answer — same substance, different
+  // bytes — so neither the #546 exact-text dedup nor the containment matcher
+  // can catch it; only turnId identity + the content-gate bypass can.
+  const REWORDED_REPLY =
+    'I pulled the live numbers out of the usage table. Two findings — and the second is the ' +
+    'one that matters: cache writes, not output tokens, dominate per-turn cost.'
+
+  const incidentCandidates = (now: number): ReplyOwnerCandidates => ({
+    liveTurnId: null, // flush's synthetic turn_end already tore the atom down
+    originTurnId: null, // DM — no origin_turn_id echo
+    quotedTurnId: null, // no quote linkage
+    latestEndedTurnId: TURN,
+    latestEndedAgeMs: now - FLUSH_TS,
+    latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+  })
+
+  it('the latest-ended owner tier still accepts the flushed turn 143 s after it ended', () => {
+    const c = incidentCandidates(REPLY_TS)
+    expect(resolveReplyOwnerTier(c)).toBe('latest-ended')
+    expect(resolveReplyOwnerTurnId(c)).toBe(TURN)
+  })
+
+  it('outcome: the reworded late reply supersedes the flushed message — exactly one bubble', () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    reg.record(CHAT, undefined, { turnId: TURN, messageIds: [25680], text: FLUSHED_TEXT }, FLUSH_TS)
+
+    // The gateway's own composition, step for step (outbound-send-path.ts):
+    const c = incidentCandidates(REPLY_TS)
+    const ownerId = resolveReplyOwnerTurnId(c)
+    const bypass = decideContentGateBypass({
+      tier: resolveReplyOwnerTier(c),
+      resolvedTurnId: ownerId,
+      candidates: c,
+      handbackCouldOwnReply: false, // no subagent_handback enqueued in the window
+    })
+    expect(bypass).toBe(true)
+    const d = reg.take(CHAT, undefined, {
+      liveTurnId: ownerId,
+      replyText: REWORDED_REPLY,
+      positiveAttribution: bypass,
+      now: REPLY_TS,
+    })
+    // The flushed message is corrected in place / replaced — the reply never
+    // ships as a second bubble alongside msg 25680.
+    expect(d).toMatchObject({ supersede: true, reason: 'supersede', deleteMessageIds: [25680] })
+  })
+
+  it('a handback landing in the widened window still keeps the content gate (fresh send, no edit-over)', () => {
+    // Safety half of the widening: MORE time in the window must never convert a
+    // genuinely-new background handback into a silent edit-over of the flushed
+    // answer. With a handback in flight the bypass stays off and different
+    // content declines as 'new-content' (two visible messages — the #3429 trade).
+    const reg = new FlushedTurnSupersedeRegistry()
+    reg.record(CHAT, undefined, { turnId: TURN, messageIds: [25680], text: FLUSHED_TEXT }, FLUSH_TS)
+    const c = incidentCandidates(REPLY_TS)
+    const bypass = decideContentGateBypass({
+      tier: resolveReplyOwnerTier(c),
+      resolvedTurnId: resolveReplyOwnerTurnId(c),
+      candidates: c,
+      handbackCouldOwnReply: true,
+    })
+    expect(bypass).toBe(false)
+    const d = reg.take(CHAT, undefined, {
+      liveTurnId: resolveReplyOwnerTurnId(c),
+      replyText: 'Worker finished: the deploy went out clean, all checks green.',
+      positiveAttribution: bypass,
+      now: REPLY_TS,
+    })
+    expect(d.supersede).toBe(false)
+    expect(d.reason).toBe('new-content')
+    // The record survives for the turn's OWN late replay.
+    expect(reg.peek(CHAT, undefined, { liveTurnId: TURN, now: REPLY_TS }).supersede).toBe(true)
+  })
+})
