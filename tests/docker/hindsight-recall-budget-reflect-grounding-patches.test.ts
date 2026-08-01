@@ -1,30 +1,28 @@
 /**
- * Behavioural proof for the three recall-budget / reflect-grounding patches
+ * Behavioural proof for the two recall-budget / reflect-grounding patches
  * that `docker/Dockerfile.hindsight` bakes into the pinned upstream Hindsight
  * image. `dockerfile-hindsight-bakes.test.ts` pins the *shape* of those patch
  * blocks (grep-on-file, runs everywhere). This file proves the *outcome*: it
  * runs the same probe against unpatched upstream (must be RED on every defect)
  * and against upstream + the patch blocks applied (must be GREEN).
  *
- * The three defects, all verified live on this fleet before the fix:
+ * The two defects, both verified live on this fleet before the fix:
  *
  *  1. MCP recall's `max_tokens` was a dishonest budget. The engine's
  *     `_filter_by_token_budget` costs only fact TEXT, but the MCP tool then
  *     serialized with `model_dump_json(indent=2)` and explicit nulls —
  *     measured live, 6,079 bytes of fact text became 40,857 bytes on the wire
  *     (6.7x), so `max_tokens: 1500` delivered ~3.5k tokens.
- *  2. The reflect mental-model short-circuit had no relevance gate. On
- *     low/mid budget, ANY bank holding at least one fresh mental model
- *     released the forced search_observations/recall layers on EVERY query
- *     regardless of topic — the helper checked only `is_stale` and non-empty
- *     content, and the mental-model search is unfloored top-K. Observed: the
- *     same bank answered "I don't have information" and a full correct answer
- *     to near-identical queries seconds apart.
- *  3. Reflect's temperature knob was dead. `DEFAULT_LLM_TEMPERATURE_REFLECT`
+ *  2. Reflect's temperature knob was dead. `DEFAULT_LLM_TEMPERATURE_REFLECT`
  *     (0.9) was resolved into config but NO agentic call site passed
  *     `temperature`, and the litellm provider omits the kwarg when None — so
- *     the provider default (~1.0) applied to factual synthesis. Observed:
- *     reflect reported publish dates its own cited memory contradicts.
+ *     the provider default (~1.0) applied to factual synthesis.
+ *
+ * (A third patch — a relevance gate on the reflect mental-model
+ * short-circuit — was authored and then dropped from this PR: re-probing the
+ * live bank showed every mental model on the reported failing query scored
+ * above the gate's threshold, so it did not fix the reported defect, and
+ * `budget: "high"` already bypasses the short-circuit with no patch at all.)
  *
  * Beyond proving the fixes, the probe pins the properties that make them
  * SAFE, none of which is visible from the patch text alone:
@@ -34,10 +32,6 @@
  *    prefix, a generous budget trims nothing, and
  *    `HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy` restores upstream's exact
  *    bytes (the restart-level rollback).
- *  - The upstream 0.8.0 short-circuit optimization SURVIVES: a genuinely
- *    on-topic fresh mental-model set still releases forcing; stale/empty
- *    models still block; `HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR=0` restores
- *    upstream gating exactly; bad floor values fall back rather than raise.
  *  - The temperature is threaded through upstream's own env resolver, so
  *    `HINDSIGHT_API_LLM_TEMPERATURE_REFLECT` (including the documented
  *    `none` omit-sentinel) keeps working, and the provider still forwards a
@@ -87,7 +81,6 @@ const UPSTREAM_IMAGE = (() => {
  */
 const PATCH_NAMES = [
   "mcp-recall-token-budget patch",
-  "reflect-mm-relevance-floor patch",
   "reflect-temperature patch",
 ];
 
@@ -109,7 +102,7 @@ function patchBlocks(): string[] {
 }
 
 /**
- * Python probe. Exits 0 only when all three fixes are in effect AND every
+ * Python probe. Exits 0 only when both fixes are in effect AND every
  * safety property above holds; prints the offending assertions otherwise.
  *
  * Deliberately asserts OUTCOMES, not code paths:
@@ -118,10 +111,7 @@ function patchBlocks(): string[] {
  *    `_register_recall`) with a fake engine emulating upstream's text-budget
  *    selection, and measures the tokens of the payload the tool RETURNS —
  *    both branches (bank_id-param string and single-bank dict);
- *  - fix 2 drives the REAL `_all_mental_models_are_usable_and_fresh` decision
- *    that gates the forced-retrieval release, across the measured relevance
- *    bands, the env knob, and the upstream stale/empty/vacuous contracts;
- *  - fix 3 asserts the resolved config default, upstream's env resolver
+ *  - fix 2 asserts the resolved config default, upstream's env resolver
  *    (override + `none` sentinel), that all 7 reflect-scope LLM call sites in
  *    the shipping module pass the configured temperature (AST of the real
  *    module — 0/7 on upstream), and that the litellm provider forwards it.
@@ -346,97 +336,6 @@ import ast
 import inspect
 
 import hindsight_api.engine.reflect.agent as agent
-
-check = agent._all_mental_models_are_usable_and_fresh
-
-
-def mm(rel, stale=False, content="Substantive synthesized content."):
-    return {"is_stale": stale, "content": content, "relevance": rel}
-
-
-def out(*ms):
-    return {"mental_models": list(ms)}
-
-
-# THE defect: a fresh-but-off-topic mental model (relevance 0.31, well inside
-# the measured off-topic band) suppresses observation/recall retrieval.
-r = check(out(mm(0.31)))
-print("OFFTOPIC_FRESH_SUPPRESSES", r)
-if r:
-    failures.append(
-        "an off-topic (relevance 0.31) fresh mental model still releases the forced "
-        "search_observations/recall layers - retrieval is left to LLM discretion"
-    )
-
-# The 0.8.0 optimization must SURVIVE: a genuinely on-topic fresh set (measured
-# on-topic band 0.75-0.81) still releases forcing.
-r = check(out(mm(0.81), mm(0.75)))
-print("ONTOPIC_FRESH_RELEASES", r)
-if not r:
-    failures.append(
-        "a genuinely relevant fresh mental-model set no longer releases forced "
-        "retrieval - the upstream short-circuit was destroyed, not gated"
-    )
-
-# A mixed set keeps the full forced path (ALL retrieved models must clear).
-r = check(out(mm(0.81), mm(0.45)))
-print("MIXED_SET_KEEPS_FORCING", not r)
-if r:
-    failures.append("a mixed relevant+off-topic fresh set still suppressed retrieval")
-
-# Missing relevance is unsafe, same posture as missing staleness.
-r = check(out({"is_stale": False, "content": "x"}))
-print("MISSING_RELEVANCE_UNSAFE", not r)
-if r:
-    failures.append("a fresh model with NO relevance field still suppressed retrieval")
-
-# Upstream rules stay intact: stale or empty-content models block regardless.
-r_stale = check(out(mm(0.95, stale=True)))
-r_empty = check(out(mm(0.95, content="   ")))
-print("STALE_STILL_BLOCKS", not r_stale, "EMPTY_STILL_BLOCKS", not r_empty)
-if r_stale:
-    failures.append("a stale model no longer blocks the short-circuit")
-if r_empty:
-    failures.append("an empty-content model no longer blocks the short-circuit")
-
-# No mental models at all: the caller separately requires a non-empty set, but
-# the helper's vacuous-True contract must not change (upstream parity).
-r = check(out())
-print("EMPTY_SET_VACUOUS_TRUE", r)
-if not r:
-    failures.append("empty mental-model set changed the helper's vacuous-True contract")
-
-# Operator knob: floor raised, floor disabled, bad values fall back.
-def with_floor(value, o):
-    if value is None:
-        os.environ.pop("HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR", None)
-    else:
-        os.environ["HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR"] = value
-    try:
-        return check(o)
-    finally:
-        os.environ.pop("HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR", None)
-
-
-if hasattr(agent, "_REFLECT_MM_RELEVANCE_FLOOR_DEFAULT"):
-    print("FLOOR_DEFAULT", agent._REFLECT_MM_RELEVANCE_FLOOR_DEFAULT)
-    if abs(agent._REFLECT_MM_RELEVANCE_FLOOR_DEFAULT - 0.55) > 1e-12:
-        failures.append("relevance-floor default moved from the measured 0.55")
-    raised = with_floor("0.9", out(mm(0.81)))
-    disabled = with_floor("0", out(mm(0.05)))
-    bad = with_floor("abc", out(mm(0.31)))
-    print("FLOOR_RAISED_BLOCKS", not raised, "FLOOR_ZERO_DISABLES", disabled, "BAD_VALUE_FALLS_BACK", not bad)
-    if raised:
-        failures.append("HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR=0.9 did not raise the floor")
-    if not disabled:
-        failures.append("HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR=0 did not restore upstream gating - the rollback path is broken")
-    if bad:
-        failures.append("an unparseable floor value disabled the floor instead of falling back")
-else:
-    print("FLOOR_DEFAULT absent")
-    failures.append("no _REFLECT_MM_RELEVANCE_FLOOR_DEFAULT - the relevance-floor patch is not applied")
-
-# ------------------------------------------------------------------ fix 3
 import hindsight_api.config as config
 
 print("REFLECT_TEMP_DEFAULT", config.DEFAULT_LLM_TEMPERATURE_REFLECT)
@@ -624,8 +523,8 @@ describe("Dockerfile.hindsight recall-budget/reflect-grounding probe is real, no
     expect(UPSTREAM_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
   });
 
-  it("extracts exactly the three patch blocks it claims to prove", () => {
-    expect(patchBlocks()).toHaveLength(3);
+  it("extracts exactly the two patch blocks it claims to prove", () => {
+    expect(patchBlocks()).toHaveLength(2);
   });
 
   it("hard-fails rather than skipping when CI demands a real run", () => {
@@ -672,7 +571,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("unpatched upstream is RED on all three defects (proves the probe bites)", () => {
+    it("unpatched upstream is RED on both defects (proves the probe bites)", () => {
       const { status, stdout } = runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
@@ -690,14 +589,7 @@ describe.skipIf(!dockerOk || !imageOk)(
         /single-bank recall branch returned \d+ tokens against max_tokens=1500/,
       );
 
-      // Defect 2 — the off-topic fresh model releases forced retrieval.
-      expect(stdout).toContain("OFFTOPIC_FRESH_SUPPRESSES True");
-      expect(stdout).toContain("FLOOR_DEFAULT absent");
-      expect(stdout).toContain(
-        "retrieval is left to LLM discretion",
-      );
-
-      // Defect 3 — the knob resolves to 0.9 and reaches zero call sites.
+      // Defect 2 — the knob resolves to 0.9 and reaches zero call sites.
       expect(stdout).toContain("REFLECT_TEMP_DEFAULT 0.9");
       expect(stdout).toContain("REFLECT_CALL_SITES 7 WIRED 0");
       expect(stdout).toContain(
@@ -706,9 +598,6 @@ describe.skipIf(!dockerOk || !imageOk)(
 
       // Upstream contracts the patches must NOT break are already green here,
       // so the RED runs prove the probe distinguishes defect from contract.
-      expect(stdout).toContain("ONTOPIC_FRESH_RELEASES True");
-      expect(stdout).toContain("STALE_STILL_BLOCKS True EMPTY_STILL_BLOCKS True");
-      expect(stdout).toContain("EMPTY_SET_VACUOUS_TRUE True");
       expect(stdout).toContain("GENEROUS_KEEPS_ALL 60 of 60");
       expect(stdout).toContain("LEGACY_BYTES_MATCH True");
     }, 240_000);
@@ -732,21 +621,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("LEGACY_BYTES_MATCH True");
       expect(stdout).not.toMatch(/DICT_BRANCH_TOKENS (1[5-9]\d\d|[2-9]\d{3,})/);
 
-      // Fix 2: relevance now gates the short-circuit — off-topic/mixed/missing
-      // relevance keep the forced path; on-topic fresh sets still release it;
-      // the knob raises, disables, and survives bad values.
-      expect(stdout).toContain("OFFTOPIC_FRESH_SUPPRESSES False");
-      expect(stdout).toContain("ONTOPIC_FRESH_RELEASES True");
-      expect(stdout).toContain("MIXED_SET_KEEPS_FORCING True");
-      expect(stdout).toContain("MISSING_RELEVANCE_UNSAFE True");
-      expect(stdout).toContain("STALE_STILL_BLOCKS True EMPTY_STILL_BLOCKS True");
-      expect(stdout).toContain("EMPTY_SET_VACUOUS_TRUE True");
-      expect(stdout).toContain("FLOOR_DEFAULT 0.55");
-      expect(stdout).toContain(
-        "FLOOR_RAISED_BLOCKS True FLOOR_ZERO_DISABLES True BAD_VALUE_FALLS_BACK True",
-      );
-
-      // Fix 3: the default is 0.1, the env resolver still honours overrides
+      // Fix 2: the default is 0.1, the env resolver still honours overrides
       // and the `none` sentinel, all 7 agentic call sites pass the configured
       // temperature, and the provider forwards/omits correctly.
       expect(stdout).toContain("REFLECT_TEMP_DEFAULT 0.1");

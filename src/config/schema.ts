@@ -2674,10 +2674,6 @@ export const HindsightConfigSchema = z.object({
       "mcp-recall-token-budget image patch; `legacy` restores upstream's " +
       "exact pre-patch recall returns, anything else or unset is the " +
       "honest-envelope mode; and " +
-      "HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR — the rollback knob for " +
-      "switchroom's reflect-mm-relevance-floor image patch; a float, 0 " +
-      "disables the floor (exact upstream gating), unset means the image's " +
-      "baked default 0.55; and " +
       "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT — upstream's own per-op reflect " +
       "temperature knob, made live by switchroom's reflect-temperature image " +
       "patch; a float, or `none` to omit the kwarg (provider default, " +

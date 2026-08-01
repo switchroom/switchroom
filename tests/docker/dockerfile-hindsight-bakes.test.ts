@@ -1115,51 +1115,6 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
-  it("keeps the reflect-mm-relevance-floor fix (assert-guarded, fail-loud)", () => {
-    // On low/mid budget, `_all_mental_models_are_usable_and_fresh` released
-    // the forced search_observations/recall layers for ANY fresh non-empty
-    // mental model — it never checked `relevance`, and the mental-model search
-    // is unfloored top-K. So any bank holding one fresh model tripped the
-    // short-circuit on EVERY query regardless of topic.
-    //
-    // SCOPE: structural, not behavioural. The behavioural gate is
-    // tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts,
-    // which drives the real decision across the measured relevance bands.
-    // Do not treat this file as sufficient.
-
-    // The exact-once anchor guard (fail-loud on upstream drift).
-    expect(dockerfile).toMatch(
-      /switchroom hindsight reflect-mm-relevance-floor patch/,
-    );
-    expect(dockerfile).toMatch(
-      /f"\{TAG\}: \{name\} anchor found \{n\}x \(expected 1\) in engine\/reflect\/agent\.py — "/,
-    );
-    // The measured floor and its env knob (0 disables = upstream gating).
-    expect(dockerfile).toMatch(
-      /_REFLECT_MM_RELEVANCE_FLOOR_DEFAULT: float = 0\.55/,
-    );
-    expect(dockerfile).toMatch(
-      /_REFLECT_MM_RELEVANCE_FLOOR_ENV: str = "HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR"/,
-    );
-    // Post-replace re-assertions: the floor is computed AND consulted, and the
-    // short-circuit call site it gates is still wired.
-    expect(dockerfile).toMatch(
-      /assert "floor = _reflect_mm_relevance_floor\(\)" in t,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "if floor > 0\.0 and relevance < floor:" in t,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert t\.count\("_all_mental_models_are_usable_and_fresh\(output\)"\) == 1,/,
-    );
-    expect(dockerfile).toMatch(
-      /assert "stop_forcing_from_iteration = iteration \+ 1" in t,/,
-    );
-    expect(dockerfile).toMatch(
-      /switchroom hindsight reflect-mm-relevance-floor patch: a fresh mental model may /,
-    );
-  });
-
   it("keeps the reflect-temperature fix (assert-guarded, fail-loud)", () => {
     // `DEFAULT_LLM_TEMPERATURE_REFLECT = 0.9` existed but NO agentic reflect
     // call site passed `temperature`, and the litellm provider omits the kwarg

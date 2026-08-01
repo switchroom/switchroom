@@ -399,15 +399,14 @@ jobs:
         run: npx vitest run tests/docker/hindsight-reflect-directives-patch.test.ts
 
       - name: Run the hindsight recall-budget/reflect-grounding probe (RED/GREEN, must not skip)
-        # Same contract, for the mcp-recall-token-budget,
-        # reflect-mm-relevance-floor and reflect-temperature patches. The bakes
-        # test cannot cover the failures that matter here: its assertions are
-        # unanchored substring matches, so a helper that exists but is never
-        # routed through, a floor that exists but never gates the short-circuit,
-        # or a temperature that is resolved but reaches zero call sites all stay
-        # green there. Only driving the real registered MCP tool (and measuring
-        # the tokens it returns), the real short-circuit decision, and the
-        # shipping module's call sites catches them.
+        # Same contract, for the mcp-recall-token-budget and
+        # reflect-temperature patches. The bakes test cannot cover the
+        # failures that matter here: its assertions are unanchored substring
+        # matches, so a helper that exists but is never routed through, or a
+        # temperature that is resolved but reaches zero call sites, both stay
+        # green there. Only driving the real registered MCP tool (and
+        # measuring the tokens it returns) and the shipping module's call
+        # sites catches them.
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts

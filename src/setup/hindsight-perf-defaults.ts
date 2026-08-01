@@ -1118,34 +1118,6 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_MCP_RECALL_BUDGET_MODE: "legacy"   # upstream wire shape, patch inert
  * ```
  *
- * ### `HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR`
- *
- * The documented rollback knob for switchroom's reflect-mm-relevance-floor
- * patch (`docker/Dockerfile.hindsight`, the `engine/reflect/agent.py` block).
- * That patch gates the reflect mental-model short-circuit on relevance: a
- * fresh mental-model set may suppress observation/recall retrieval only when
- * every retrieved model clears the floor (the image bakes the measured
- * default, 0.55). The patch reads this env var per call, so backing it out is
- * a container restart. Accepted values: a float; `0` (or any negative value)
- * disables the floor — exact upstream gating with the patch still baked in;
- * unset ⇒ the image's baked default; an unparseable or non-finite value falls
- * back to the default rather than breaking reflect.
- *
- * Same posture as the key above: a switchroom-patch knob (no `HINDSIGHT_API_`
- * prefix, only the patched module reads it), managed here because absent from
- * this set the documented rollback line in `hindsight.env` was silently
- * discarded by `resolveHindsightPerfOverrides` — no error, no warning, the
- * floor stayed at the baked default while the yaml read as durable config.
- * Override-only rather than defaulted: emitting the image's own 0.55 would
- * add a hard-coded value to every host's `docker inspect` for no behaviour
- * change, and turn a rollback hatch into a permanent calibration override.
- *
- * ```yaml
- * hindsight:
- *   env:
- *     HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR: "0"   # floor off = upstream gating
- * ```
- *
  * ### `HINDSIGHT_API_LLM_TEMPERATURE_REFLECT`
  *
  * The documented rollback/tuning knob for switchroom's reflect-temperature
@@ -1156,7 +1128,7 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * the resolved value into all 7 agentic reflect call sites and lowers the
  * baked default to 0.1 (factual synthesis, matching the retain default).
  *
- * Unlike the two keys above this IS an upstream env var, parsed by upstream's
+ * Unlike the key above this IS an upstream env var, parsed by upstream's
  * own `_resolve_operation_temperature`. Accepted values: a float (per-op
  * sampling temperature for reflect), or the documented sentinel `none`, which
  * omits the temperature kwarg entirely — the provider default, i.e.
@@ -1166,7 +1138,7 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  * the patch's own rollback hatch, and rollback should not move retain's
  * temperature too.
  *
- * It is here for the same reason as the two above: the patch's comments
+ * It is here for the same reason as the key above: the patch's comments
  * document this env var as the rollback, and a rollback line in
  * `hindsight.env` that `resolveHindsightPerfOverrides` silently drops is not
  * a rollback. Override-only rather than defaulted: the 0.1 default is baked
@@ -1188,7 +1160,6 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
   "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
   "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
-  "HINDSIGHT_REFLECT_MM_RELEVANCE_FLOOR",
   "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
 ]);
 
