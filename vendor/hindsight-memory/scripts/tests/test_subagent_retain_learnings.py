@@ -76,12 +76,24 @@ def _entry(role: str, content, uuid: str) -> str:
     )
 
 
+# Per-turn assistant prose. Substantive text blocks so the fixture clears the
+# RECALIBRATED (text-only) volume gate on genuine retainable prose — not on the
+# tool_use volume the payload drops (#3994). ~180 chars each * 8 turns > the
+# 2,000-char floor, all of it text the text-only path keeps.
+TURN_PROSE = (
+    "Reasoning step {i}: ruled out the consolidator dedup theory — world and "
+    "experience facts never traverse the observation dedup path, so overlap "
+    "persists as extra rows. Recording the constraint before moving on."
+)
+
+
 def _tool_heavy_sidechain(path: str, *, human_turns: int = 8) -> None:
-    """A sidechain transcript that is mostly tool traffic plus one prose finding.
+    """A sidechain transcript that is mostly tool traffic plus real prose.
 
     Shaped to clear the volume gate (>= MIN_HUMAN_TURNS human turns and
-    >= MIN_NON_TOOL_RESULT_CHARS of non-tool-result chars) so the retain
-    actually happens — the gate counts tool_use inputs, which this has in bulk.
+    >= MIN_NON_TOOL_RESULT_CHARS of RETAINED text) on the assistant PROSE — the
+    metric the recalibrated gate counts (#3994) — while the bulk of the bytes on
+    disk is the tool traffic the text-only retain path drops.
     """
     lines = []
     for i in range(human_turns):
@@ -93,6 +105,10 @@ def _tool_heavy_sidechain(path: str, *, human_turns: int = 8) -> None:
                     {
                         "type": "thinking",
                         "thinking": "internal reasoning that must never be retained",
+                    },
+                    {
+                        "type": "text",
+                        "text": TURN_PROSE.format(i=i),
                     },
                     {
                         "type": "tool_use",
@@ -142,7 +158,15 @@ def _lock_acquired(blocking=False):
 
 
 def _run_sidechain_retain(sidechain_path: str, tmpdir: str, config_extra=None):
-    """Drive run_subagent_retain with a stub client, returning (result, kwargs)."""
+    """Drive run_subagent_retain with a stub client.
+
+    Returns ``(result, captured_retain_kwargs, passed_config)`` where
+    ``passed_config`` is the EXACT dict object ``run_subagent_retain`` receives
+    from ``load_config`` — the object the production code actually holds and
+    could mutate. Tests assert on THAT object, never on the module-level
+    ``CONFIG`` template (which the code never sees; asserting on it is vacuous —
+    it passes even if the retainToolCalls-copy fix is deleted). See #3999.
+    """
     captured = {}
 
     class _Client:
@@ -153,7 +177,9 @@ def _run_sidechain_retain(sidechain_path: str, tmpdir: str, config_extra=None):
             captured.update(kwargs)
             return {"ok": True}
 
-    config = dict(CONFIG, **(config_extra or {}))
+    # A FRESH copy per run — this is the object the code receives via
+    # load_config and is expected NOT to mutate.
+    passed_config = dict(CONFIG, **(config_extra or {}))
     hook_input = {
         "session_id": "parentsess",
         "agent_id": "af5",
@@ -162,14 +188,14 @@ def _run_sidechain_retain(sidechain_path: str, tmpdir: str, config_extra=None):
         "transcript_path": os.path.join(tmpdir, "parentsess.jsonl"),
         "cwd": tmpdir,
     }
-    with mock.patch("subagent_retain.load_config", return_value=config), \
+    with mock.patch("subagent_retain.load_config", return_value=passed_config), \
             mock.patch("subagent_retain.get_api_url", return_value="http://x"), \
             mock.patch("subagent_retain.ensure_bank_mission"), \
             mock.patch("subagent_retain.derive_bank_id", return_value="agentbank"), \
             mock.patch("subagent_retain.HindsightClient", _Client), \
             mock.patch("subagent_retain.inflight_lock", _lock_acquired):
         result = subagent_retain.run_subagent_retain(hook_input)
-    return result, captured
+    return result, captured, passed_config
 
 
 class SidechainRetainsLearningsNotTools(unittest.TestCase):
@@ -180,7 +206,9 @@ class SidechainRetainsLearningsNotTools(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.sidechain = os.path.join(self._tmp.name, "agent-af5.jsonl")
         _tool_heavy_sidechain(self.sidechain)
-        self.result, self.captured = _run_sidechain_retain(self.sidechain, self._tmp.name)
+        self.result, self.captured, self.passed_config = _run_sidechain_retain(
+            self.sidechain, self._tmp.name
+        )
         self.assertEqual(self.result["status"], "ok", self.result)
         self.content = self.captured["content"]
 
@@ -227,21 +255,46 @@ class SidechainRetainsLearningsNotTools(unittest.TestCase):
         )
 
     def test_operator_config_is_not_mutated(self):
-        """The override lands on the sidechain COPY, not the parent's config."""
-        self.assertIs(CONFIG["retainToolCalls"], True)
+        """The ``retainToolCalls = False`` override lands on the sidechain COPY
+        (``sub_config = dict(config)``), never on the config the hook received.
+
+        Asserts on ``passed_config`` — the EXACT object ``run_subagent_retain``
+        got from ``load_config`` and could have mutated in place — not on the
+        module-level ``CONFIG`` template. The old assertion (`CONFIG[...] is
+        True`) was vacuous: the harness always hands the code a fresh copy, so
+        ``CONFIG`` stays True even if the production copy is deleted and the code
+        mutates its input directly. This version goes RED in exactly that case.
+        """
+        self.assertEqual(
+            self.passed_config["retainToolCalls"],
+            True,
+            "run_subagent_retain mutated its caller's config (retainToolCalls "
+            "flipped to False in place) instead of overriding on a copy",
+        )
+
+    def test_override_is_applied_on_the_copy_the_client_sees(self):
+        """The flip must still REACH the payload: the stub client's retained
+        content is on the text-only path (no tool bodies), which only happens if
+        the sidechain copy carried ``retainToolCalls = False``. Together with
+        the test above this pins BOTH halves — copied AND applied — so deleting
+        either the copy or the override turns one of them RED."""
+        self.assertNotIn(WRITE_BODY_MARKER, self.captured["content"])
+        self.assertNotIn(BASH_COMMAND_MARKER, self.captured["content"])
+        # Positive shape check: the text-only formatter's role markers, not JSON.
+        self.assertIn("[role: assistant]", self.captured["content"])
 
 
-class ProseFreeSidechainDegradesGracefully(unittest.TestCase):
-    """The degenerate case — a worker with NO assistant prose at all.
+class ProseFreeSidechainIsSkipped(unittest.TestCase):
+    """The degenerate case — a worker with NO assistant prose, only tool traffic.
 
-    Worth pinning because the volume gate counts ``tool_use`` inputs
-    (``non_tool_result_char_count``) while the retained content no longer
-    includes them, so gate and payload now measure different things. The
-    reassuring outcome, verified here rather than assumed: it still retains
-    cleanly, because the gate requires ``MIN_HUMAN_TURNS`` GENUINE human turns
-    and each one is a plain-string user message that survives the text path. So
-    ``build_retain_payload`` does not return None and nothing goes silently
-    empty — while the tool traffic is still excluded.
+    Post-#3994 the volume gate counts ONLY the chars the text-only path keeps
+    (``retained_text_char_count`` -> ``_extract_text_content``), so a fork whose
+    bulk is entirely tool_use inputs + tool_result bodies now FAILS the char
+    floor: once tools are stripped there is almost nothing to retain, and the
+    tiny "go" instruction turns fall far under ``MIN_NON_TOOL_RESULT_CHARS``.
+    That is the correct outcome — the old gate cleared on tool-command volume and
+    then retained a near-empty document (the mismatch #3994 closes). This pins
+    the SKIP so a revert to counting tool_use chars goes RED here.
     """
 
     def _prose_free_sidechain(self, path: str, human_turns: int = 8) -> None:
@@ -249,8 +302,8 @@ class ProseFreeSidechainDegradesGracefully(unittest.TestCase):
         for i in range(human_turns):
             # tool_result-only user messages don't count as human turns, so the
             # instruction turns are plain strings — but they are the USER's
-            # words. Keep them short so the retained text is dominated by
-            # nothing at all once tools are stripped.
+            # words. Keep them short so, once tools are stripped, there is almost
+            # no retainable text left.
             lines.append(_entry("user", "go", f"u{i}"))
             lines.append(
                 _entry(
@@ -269,29 +322,32 @@ class ProseFreeSidechainDegradesGracefully(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
-    def test_retains_the_human_turns_and_still_drops_the_tool_traffic(self):
+    def test_prose_free_fork_fails_the_recalibrated_char_floor(self):
         with tempfile.TemporaryDirectory() as d:
             sc = os.path.join(d, "agent-af5.jsonl")
             self._prose_free_sidechain(sc)
-
-            # Precondition: the gate genuinely PASSES on tool_use chars alone,
-            # so this is the "cleared the gate with no prose" case and not just
-            # a trivial-fork skip.
             msgs = subagent_retain.read_transcript(sc)
+
+            # It clears MIN_HUMAN_TURNS (8 genuine "go" turns)...
+            self.assertGreaterEqual(
+                subagent_retain.count_human_turns(msgs), subagent_retain.MIN_HUMAN_TURNS
+            )
+            # ...but the recalibrated (text-only) char count is far below the
+            # floor, because every 4 KB Bash body is excluded from the count.
             passed, turns, chars = subagent_retain.passes_volume_gate(msgs, CONFIG)
-            self.assertTrue(passed, f"gate did not pass: turns={turns} chars={chars}")
+            self.assertFalse(
+                passed,
+                f"prose-free fork should now SKIP: turns={turns} chars={chars} "
+                f"(floor {subagent_retain.MIN_NON_TOOL_RESULT_CHARS})",
+            )
+            self.assertLess(chars, subagent_retain.MIN_NON_TOOL_RESULT_CHARS)
 
-            result, captured = _run_sidechain_retain(sc, d)
+            # End to end: the retain is skipped by the volume gate; nothing POSTs.
+            result, captured, _ = _run_sidechain_retain(sc, d)
 
-        # Retains, does not crash and does not enqueue a doomed pending retain.
-        self.assertEqual(result["status"], "ok", result)
-        body = captured["content"][len(subagent_retain.SIDECHAIN_MISSION_HEADER):].strip()
-        # The human instruction turns survive — nothing went silently empty.
-        self.assertIn("[role: user]", body)
-        self.assertIn("go", body)
-        # The 4 KB Bash command bodies did NOT.
-        self.assertNotIn("x" * 200, body)
-        self.assertNotIn("true ", body)
+        self.assertEqual(result["status"], "skipped", result)
+        self.assertEqual(result["reason"], "volume gate")
+        self.assertEqual(captured, {}, "a skipped fork must not POST a retain")
 
 
 class TextOnlyPathIsNotEmpty(unittest.TestCase):

@@ -7,6 +7,7 @@ failure. Stdlib-only; runs under ``python3 -m unittest discover tests/``.
 """
 
 import contextlib
+import io
 import json
 import os
 import sys
@@ -255,12 +256,104 @@ class VolumeGate(unittest.TestCase):
         msgs = []
         for i in range(20):
             msgs.append({"role": "assistant", "content": "z" * 500})
-        total = subagent_retain.non_tool_result_char_count(
+        total = subagent_retain.retained_text_char_count(
             msgs, stop_at=subagent_retain.MIN_NON_TOOL_RESULT_CHARS
         )
         self.assertGreaterEqual(total, subagent_retain.MIN_NON_TOOL_RESULT_CHARS)
         # Full sum would be 20*500=10000; short-circuit stops well before.
         self.assertLess(total, 10000)
+
+    def test_char_count_is_text_only_not_tool_use(self):
+        """#3994: the count measures only what the text-only retain path keeps.
+
+        A message with a small text block and a huge tool_use input must count
+        ONLY the text-block chars. The pre-#3994 metric added the tool_use
+        name+input serialized size; this asserts that contribution is gone, so a
+        revert goes RED.
+        """
+        msgs = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "T" * 100},
+                    {
+                        "type": "tool_use",
+                        "name": "Write",
+                        "input": {"content": "Z" * 50_000},
+                    },
+                ],
+            }
+        ]
+        self.assertEqual(subagent_retain.retained_text_char_count(msgs), 100)
+        # Alias preserves back-compat but returns the recalibrated value.
+        self.assertEqual(subagent_retain.non_tool_result_char_count(msgs), 100)
+
+    def test_tool_heavy_prose_light_fork_now_skips(self):
+        """#3994 headline: a fork that clears MIN_HUMAN_TURNS and emits a LOT of
+        tool traffic but almost no prose PASSED the old gate (tool_use chars) and
+        must now FAIL (text-only chars below the floor). The retained document
+        for such a fork was near-empty — the mismatch this recalibration closes.
+        """
+        msgs = []
+        for i in range(8):  # >= MIN_HUMAN_TURNS genuine human turns
+            msgs.append({"role": "user", "content": "go"})
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        # Pure tool traffic, no assistant prose. ~5 KB command
+                        # each — bulk the OLD gate counted, the payload drops.
+                        {"type": "tool_use", "name": "Bash",
+                         "input": {"command": "true " + ("x" * 5000)}},
+                    ],
+                }
+            )
+            msgs.append(
+                {"role": "user",
+                 "content": [{"type": "tool_result", "tool_use_id": "t", "content": "Z" * 5000}]}
+            )
+        passed, turns, chars = subagent_retain.passes_volume_gate(msgs, CONFIG)
+        self.assertGreaterEqual(turns, subagent_retain.MIN_HUMAN_TURNS)
+        self.assertFalse(passed, f"tool-heavy/prose-light fork must skip: chars={chars}")
+        self.assertLess(chars, subagent_retain.MIN_NON_TOOL_RESULT_CHARS)
+
+
+class EmptyWindowSkipIsVisible(unittest.TestCase):
+    """#4001: the 'formatted to empty despite clearing the gate' skip must not be
+    debug-log-only (silent with debug off in shipped settings)."""
+
+    def _run_with_empty_build(self):
+        """Drive run_subagent_retain to the build_retain_payload==None branch."""
+        with tempfile.TemporaryDirectory() as d:
+            sc = os.path.join(d, "agent-af5.jsonl")
+            _write_sidechain(sc, 8, chars_per_msg=500)  # clears the volume gate
+            hook_input = {
+                "session_id": "parentsess",
+                "agent_id": "af5",
+                "agent_type": "worker",
+                "agent_transcript_path": sc,
+                "transcript_path": os.path.join(d, "parentsess.jsonl"),
+                "cwd": d,
+            }
+            captured_err = io.StringIO()
+            with mock.patch("subagent_retain.load_config", return_value=dict(CONFIG)), \
+                    mock.patch("subagent_retain.get_api_url", return_value="http://x"), \
+                    mock.patch("subagent_retain.ensure_bank_mission"), \
+                    mock.patch("subagent_retain.derive_bank_id", return_value="agentbank"), \
+                    mock.patch("subagent_retain.HindsightClient"), \
+                    mock.patch("subagent_retain.inflight_lock", _lock_acquired), \
+                    mock.patch("subagent_retain.build_retain_payload", return_value=None), \
+                    mock.patch("sys.stderr", new=captured_err):
+                result = subagent_retain.run_subagent_retain(hook_input)
+            return result, captured_err.getvalue()
+
+    def test_empty_window_skip_emits_unconditional_stderr(self):
+        # debug is False (shipped default) — the skip must STILL be visible.
+        result, err = self._run_with_empty_build()
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "empty transcript after formatting")
+        self.assertIn("formatted to EMPTY", err)
+        self.assertIn("parentsess", err)
 
 
 class BoundedRead(unittest.TestCase):

@@ -466,11 +466,20 @@ def shape_recall_query(
     for index, token in enumerate(tokens):
         first_seen.setdefault(token, index)
 
-    candidates = [t for t in first_seen if len(t) > 1 and t not in stop]
+    # Stopword removal is the PRIMARY filter; the length guard lives only in the
+    # fallback below (#3766). Filtering ``len(t) > 1`` here would silently drop a
+    # single-char SUBJECT — a language name ('C', 'R'), a single-digit version
+    # ('v3' tokenizes fine, but a bare '9' in "python 9077" or "Angular 9" does
+    # not) — before the fallback ever runs, leaving the query with only its
+    # multi-char stopwords. Single-char stopwords ('a', 'i', 's', 't') are still
+    # removed because they are in ``stop``; a single-char content word survives.
+    candidates = [t for t in first_seen if t not in stop]
     if not candidates:
         # Every term was a stopword. Fall back to the unfiltered token set so a
         # short conversational prompt ("what did you say about it?") still
-        # searches for something.
+        # searches for something. The ``len(t) > 1`` guard applies HERE — with
+        # every term a stopword there is no subject to protect, so dropping the
+        # remaining single-char noise is safe.
         candidates = [t for t in first_seen if len(t) > 1] or list(first_seen)
 
     def weight(token):

@@ -62,6 +62,7 @@ from lib.content import (  # noqa: E402
     BM25_STOPWORDS,
     _selectivity_score,
     common_english_words,
+    shape_recall_query,
     tokenize_for_bm25,
 )
 
@@ -467,6 +468,53 @@ class ShapingDoesNotMoveTheOverlapGate(_Harness):
         )
         self.assertIsNotNone(context)
         self.assertIn("did we decide about the", context)
+
+
+class SingleCharSubjectSurvives(unittest.TestCase):
+    """#3766 — the ``len(t) > 1`` filter used to run BEFORE the stopword
+    fallback, dropping a single-char SUBJECT ('C', 'R', a single-digit version)
+    outright and then letting the fallback pick multi-char STOPWORDS instead. The
+    length guard now lives only in the fallback, so a single-char content word
+    survives while single-char stopwords ('a', 'i') are still removed.
+
+    These call ``shape_recall_query`` directly — the shaped string is what the
+    BM25 arm searches for, and a subject that vanishes from it is a subject the
+    recall cannot match on. Each assertion fails if the length filter moves back
+    ahead of the stopword filter.
+    """
+
+    def test_single_letter_subject_survives_among_stopwords(self):
+        # 'r' is the only content word; all the rest are stopwords. Pre-fix it
+        # was dropped and the fallback kept 'still'/'faster'/'python' but never
+        # 'r'; post-fix 'r' is a first-class term.
+        out = shape_recall_query("is R still faster than python", max_tokens=24)
+        self.assertIn("r", out.lower().split())
+
+    def test_subject_is_a_lone_single_char_and_all_else_stopwords(self):
+        # "what about C for this" — every other token is a stopword. The subject
+        # 'c' MUST be what searches; pre-fix the query came back as stopwords.
+        out = shape_recall_query("what about C for this", max_tokens=24)
+        terms = out.lower().split()
+        self.assertIn("c", terms)
+        for stop in ("what", "about", "for", "this"):
+            self.assertNotIn(stop, terms, f"stopword {stop!r} reached the wire over the subject")
+
+    def test_single_digit_version_survives(self):
+        # 'single-digit versions' (#3766): "python 9 or python 3".
+        out = shape_recall_query("python 9 or python 3", max_tokens=24)
+        terms = out.lower().split()
+        self.assertIn("9", terms)
+        self.assertIn("3", terms)
+
+    def test_single_char_stopwords_are_still_removed(self):
+        # The guard must not become "keep every single char": 'a' and 'i' are
+        # stopwords and must not survive just because they are one character.
+        out = shape_recall_query("a deploy i triggered", max_tokens=24)
+        terms = out.lower().split()
+        self.assertIn("deploy", terms)
+        self.assertIn("triggered", terms)
+        self.assertNotIn("a", terms)
+        self.assertNotIn("i", terms)
 
 
 if __name__ == "__main__":  # pragma: no cover
