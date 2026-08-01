@@ -9,6 +9,8 @@ import {
   renderProfileClaudeTemplate,
   renderVaultProtocolFragment,
   resolveProfilesRoot,
+  resolveProfilesRootDetailed,
+  PROFILES_ROOT_SEARCH,
 } from "./profiles.js";
 import { scaffoldAgent } from "./scaffold.js";
 import type { AgentConfig, TelegramConfig } from "../config/schema.js";
@@ -40,6 +42,21 @@ describe("resolveProfilesRoot (#3346)", () => {
     const root = resolveProfilesRoot();
     expect(existsSync(root)).toBe(true);
     expect(existsSync(join(root, "default"))).toBe(true);
+  });
+
+  it("probes SEA-layout candidates too, so a published binary can find profiles (#4160)", () => {
+    // The published `bun build --compile` binary sees
+    // `import.meta.dirname === "/$bunfs/root"`, so both pre-#4160
+    // candidates collapsed to `/profiles` and `switchroom apply` failed
+    // for every agent. The resolver must ALSO probe locations anchored on
+    // the real binary (process.execPath) and the FHS share roots.
+    delete process.env[ENV_KEY];
+    const detailed = resolveProfilesRootDetailed();
+    expect(detailed.candidates).toContain("/usr/local/share/switchroom/profiles");
+    expect(detailed.candidates).toContain("/usr/share/switchroom/profiles");
+    // And the search list is what an error message would report — every
+    // path tried, not just the first.
+    expect(PROFILES_ROOT_SEARCH.length).toBeGreaterThanOrEqual(4);
   });
 
   it("does not resolve to the historically-broken /profiles path", () => {
