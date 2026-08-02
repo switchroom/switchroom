@@ -210,5 +210,5 @@ retired line.
   pinned widget, or status surface that mirrors conversation state in *parallel*,
   or render new content solely to pin it? If yes, that is still the retired line
   — change the prompt so the model communicates instead. See the "chat IS the
-  artifact" sub-principle in `principles.md` and `know-my-agent-is-doing`'s design
+  artifact" sub-principle in `principles.md` and `know-what-my-agent-is-doing`'s design
   artifact `rfcs/conversational-pacing.md`.

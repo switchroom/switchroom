@@ -251,7 +251,7 @@ telegram-only, chat-is-the-single-source-of-truth. Before you open the
 PR, confirm the change crosses none of them. A "yes" on all three
 principle checks plus a crossed invariant is still out of scope.
 
-These principles don't replace the existing JTBDs in `reference/`.
+These principles don't replace the job specs in `reference/jobs/`.
 They *judge* them. A feature can satisfy a JTBD outcome and still fail
 all three principle checks. When that happens, the JTBD outcome is the
 goal, and the principles are how we get there without making the product

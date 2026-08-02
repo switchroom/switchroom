@@ -55,18 +55,20 @@ symlinked to the workspace `dist/`), the CLI is always fresh after
 
 ### 2. Release to npm (canonical maintainers only)
 
-When the canonical `switchroom/switchroom:main` is ready to ship:
+Releases are **not** cut by hand. Do not bump `package.json` in a commit and
+do not run `npm publish` yourself — the version source of truth is the git
+tag (`scripts/build.mjs:resolveVersion()`), the committed `package.json`
+version is a stale placeholder by design, and the pack-time bump + publish
+happen in CI.
 
-```
-# On switchroom/switchroom:main
-# 1. Bump package.json version
-# 2. Update CHANGELOG.md
-# 3. Commit: "chore: release vX.Y.Z"
-# 4. Tag: git tag vX.Y.Z && git push origin vX.Y.Z
-# 5. Publish: npm publish
-```
-
-npm publishes come from the canonical repo only.
+Follow the **`switchroom-release`** skill (`skills/switchroom-release/SKILL.md`)
+for the full ordered, gated checklist. In short: a CHANGELOG-only
+`chore: release vX.Y.Z` PR is merged to `main`, then a `vX.Y.Z` tag is pushed
+on the pinned merge SHA. The tag push fires `.github/workflows/release.yml`,
+which orchestrates everything — builds the static binaries, waits for the
+`docker-images` build, then `workflow_call`s `npm-publish.yml` and un-drafts
+the GitHub Release. `npm-publish.yml` has no tag trigger and is the only leg
+that publishes to npm. Never run `npm publish` by hand from a worktree.
 
 #### Rolling a release back — on-disk state the newer build already wrote
 
@@ -128,7 +130,10 @@ your agents are on the latest code.
    `refactor:`, `test:`) + short imperative description.
 7. PR body: what changed, why, and how to test it. A short test-plan
    checklist is appreciated.
-8. **Liveness-surface PRs declare their guarantee delta.** Any PR touching
+8. **Non-trivial PRs cite the job spec they satisfy.** Cite the job spec
+   from `reference/jobs/` in the PR description — the outcome-focused spec
+   the change satisfies (see `CLAUDE.md`).
+9. **Liveness-surface PRs declare their guarantee delta.** Any PR touching
    `feedHeartbeatTick`, `feed-open-gate.ts`, `silence-poke.ts`,
    `turn-liveness-floor.ts`, or the card-edit path must state, in the PR
    body, what the framework still guarantees to deliver WITHOUT the model
