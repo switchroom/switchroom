@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.19.46 — start.sh stops clobbering the compose-set SWITCHROOM_CONFIG, and Calendar becomes an opt-in read-only scope
+
+### Agents: stop start.sh clobbering the compose-set `SWITCHROOM_CONFIG` (#4193)
+
+Editing `model:` (or `thinking_effort:`) in `switchroom.yaml` followed by a
+bare `docker restart` silently did nothing — the agent booted the stale
+apply-time bake with no stderr and no operator alert. Compose correctly sets
+`SWITCHROOM_CONFIG=/state/config/switchroom.yaml` inside every agent
+container, but the scaffolded `start.sh` then re-exported the HOST path,
+which does not exist in the container; both live resolvers
+(`agent effective-model`, `agent effective-effort`) guard on the file
+existing and fell into a deliberately silent "no config mount" branch.
+
+- `start.sh.hbs` now renders the deferring form
+  `export SWITCHROOM_CONFIG="${SWITCHROOM_CONFIG:-<host path>}"`, so a
+  compose-provided value wins and the host path remains the fallback for
+  non-container boots.
+- Outcome test proves a compose-style pre-set value survives the scaffolded
+  start.sh (fails RED on the pre-fix template).
+
+### Google: opt-in read-only Calendar scope on `auth google account add` (#4190)
+
+The gdrive MCP exposes Calendar tools at every tier, but the minted token
+carried no Calendar scope, so `list_calendars`/`get_events` 403ed and
+upstream fell back to its own browser OAuth — unrecoverable inside a
+container. `--calendar` on `switchroom auth google account add` (mirroring
+`--write`) now mints `calendar.readonly`, narrowly un-deferring the scope
+that #1663 parked.
+
 ## v0.19.45 — the session-handoff Hindsight mirror is gone (memory poisoning), and the reply supersede window turns identity-gated
 
 ### Stop mirroring the session-handoff transcript tail into Hindsight (#4187)
