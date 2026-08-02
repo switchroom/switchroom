@@ -53,6 +53,7 @@ describe("createNostrClient NIP-42 handshake", () => {
     const received: NostrEventLike[] = [];
     const client = createNostrClient({
       relayUrl: "ws://relay",
+      relayTagUrl: "ws://relay",
       relayHost: "127.0.0.1:3000",
       groupId: "group-uuid",
       secretKey: sk,
@@ -96,6 +97,7 @@ describe("createNostrClient NIP-42 handshake", () => {
     const received: NostrEventLike[] = [];
     const client = createNostrClient({
       relayUrl: "ws://relay",
+      relayTagUrl: "ws://relay",
       relayHost: "",
       groupId: "group-uuid",
       secretKey: sk,
@@ -130,6 +132,7 @@ describe("createNostrClient NIP-42 handshake", () => {
       const fs = fakeSocket();
       const client = createNostrClient({
         relayUrl: "ws://relay",
+        relayTagUrl: "ws://relay",
         relayHost: "",
         groupId: "group-uuid",
         secretKey: sk,
@@ -172,6 +175,7 @@ describe("createNostrClient NIP-42 handshake", () => {
     };
     const client = createNostrClient({
       relayUrl: "ws://10.0.10.5:8080",
+      relayTagUrl: "ws://127.0.0.1:3000",
       relayHost: "127.0.0.1:3000",
       groupId: "g",
       secretKey: sk,
@@ -180,6 +184,35 @@ describe("createNostrClient NIP-42 handshake", () => {
     });
     client.start();
     expect(seenHost).toBe("127.0.0.1:3000");
+    client.stop();
+  });
+
+  it("tags the NIP-42 AUTH with the CANONICAL relay URL, not the dial address (live-probe fix)", () => {
+    // Dial a docker-network address, but the relay's canonical identity — the
+    // string it exact-matches the `relay` tag against — is 127.0.0.1:3000.
+    const sk = generateSecretKey();
+    const fs = fakeSocket();
+    const client = createNostrClient({
+      relayUrl: "ws://10.0.10.5:3000", // dialed (docker IP)
+      relayTagUrl: "ws://127.0.0.1:3000", // canonical (auth tag)
+      relayHost: "127.0.0.1:3000",
+      groupId: "group-uuid",
+      secretKey: sk,
+      onEvent: () => {},
+      socketFactory: fs.factory,
+      nowSec: () => 1_700_000_000,
+    });
+    client.start();
+    fs.open();
+    fs.message(JSON.stringify(["AUTH", "chal-abc"]));
+
+    const authFrame = JSON.parse(fs.sent[fs.sent.length - 1]);
+    expect(authFrame[0]).toBe("AUTH");
+    const authEvent = authFrame[1] as NostrEventLike;
+    // The tag carries the CANONICAL url, independent of the dialed docker IP.
+    expect(authEvent.tags).toContainEqual(["relay", "ws://127.0.0.1:3000"]);
+    expect(authEvent.tags).not.toContainEqual(["relay", "ws://10.0.10.5:3000"]);
+    expect(verifyEvent(authEvent as unknown as Parameters<typeof verifyEvent>[0])).toBe(true);
     client.stop();
   });
 });

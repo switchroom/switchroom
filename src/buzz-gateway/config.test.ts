@@ -57,6 +57,30 @@ describe("loadConfigFromEnv", () => {
     expect(res.reason).toMatch(/BUZZ_RELAY_URL/);
   });
 
+  it("uses BUZZ_RELAY_URL as the canonical auth tag and dials it when no dial URL is set", () => {
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_RELAY_URL: "ws://127.0.0.1:3000" }));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.relayTagUrl).toBe("ws://127.0.0.1:3000");
+    // No distinct dial address ⇒ dial the canonical URL.
+    expect(res.config.relayUrl).toBe("ws://127.0.0.1:3000");
+  });
+
+  it("decouples the dial address (BUZZ_RELAY_DIAL_URL) from the canonical auth tag (BUZZ_RELAY_URL)", () => {
+    const res = loadConfigFromEnv(
+      liveEnv({
+        BUZZ_RELAY_URL: "ws://127.0.0.1:3000", // canonical identity / auth tag
+        BUZZ_RELAY_DIAL_URL: "ws://10.0.10.5:3000", // docker-network dial address
+      }),
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.relayUrl).toBe("ws://10.0.10.5:3000"); // dialed
+    expect(res.config.relayTagUrl).toBe("ws://127.0.0.1:3000"); // tagged
+    // The tag value is independent of the dial URL.
+    expect(res.config.relayTagUrl).not.toBe(res.config.relayUrl);
+  });
+
   it("treats mirror:off as not-live (kill-switch)", () => {
     const res = loadConfigFromEnv(liveEnv({ BUZZ_MIRROR: "off" }));
     // off => not-live => operational fields not demanded, but still loads.

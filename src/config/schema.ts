@@ -2266,7 +2266,31 @@ export const BuzzChannelSchema = z
     relay_url: z
       .string()
       .regex(/^wss?:\/\//, "relay_url must be a ws:// or wss:// URL")
-      .describe("WebSocket URL of the closed Buzz relay the sidecar dials."),
+      .describe(
+        "CANONICAL WebSocket URL of the closed Buzz relay — the exact string " +
+        "the relay expects in the NIP-42 `relay` auth tag (e.g. " +
+        "'ws://127.0.0.1:3000'). A live probe proved the relay validates this " +
+        "tag as an exact string match against its own URL BEFORE the " +
+        "membership check, so it is the relay's advertised identity, NOT " +
+        "necessarily the address the sidecar dials. Set relay_dial_url when " +
+        "the reachable address differs (a docker-network IP).",
+      ),
+    // The sidecar's container cannot reach the relay's own 127.0.0.1 loopback,
+    // so when the relay's canonical identity (relay_url) is a loopback/host
+    // address, the sidecar must DIAL a docker-network address instead while
+    // still TAGGING the canonical relay_url. relay_dial_url carries that dial
+    // address; absent → the sidecar dials relay_url directly (correct when the
+    // canonical URL is itself reachable from the sidecar).
+    relay_dial_url: z
+      .string()
+      .regex(/^wss?:\/\//, "relay_dial_url must be a ws:// or wss:// URL")
+      .optional()
+      .describe(
+        "Reachable ws:// / wss:// address the sidecar DIALS when it differs " +
+        "from the canonical relay_url (e.g. a docker-network IP the relay's " +
+        "own 127.0.0.1 can't stand in for). The NIP-42 auth tag still uses " +
+        "relay_url. Defaults to relay_url when unset.",
+      ),
     // Phase 0 blocker #2: the relay resolves its community from the HTTP Host
     // header on the WS upgrade. When the sidecar dials the relay by a docker
     // network IP (relay_url host = 10.x), the Host header must still carry the
@@ -2314,6 +2338,16 @@ export const BuzzChannelSchema = z
         "Cross-surface mirror mode (Phase 2 placeholder). 'off' is a true " +
         "kill-switch that disables the channel in BOTH directions — the " +
         "inbound sidecar exits idle. Phase 1 only reads 'off' vs not-off.",
+      ),
+    chat_id: z
+      .string()
+      .min(1, "chat_id must be a non-empty Telegram chat id")
+      .describe(
+        "Telegram chat id an injected Buzz turn is routed to. Phase 1 is " +
+        "inbound-only, so the agent's reply lands here on Telegram (the " +
+        "authoritative surface); in later phases this is the chat the Buzz " +
+        "turn's Telegram copy maps to. Required — the sidecar refuses to run " +
+        "live without it (BUZZ_CHAT_ID).",
       ),
     default_channel_id: z
       .string()

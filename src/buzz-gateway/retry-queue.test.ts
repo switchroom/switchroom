@@ -51,6 +51,7 @@ function makeConfig(over: Partial<BuzzRuntimeConfig> = {}): BuzzRuntimeConfig {
     agentName: "klanker",
     chatId: "555",
     relayUrl: "ws://relay",
+    relayTagUrl: "ws://relay",
     relayHost: "",
     groupId: "group-uuid",
     authorized: over.authorized ?? new Set<string>(),

@@ -225,7 +225,7 @@ describe("BuzzChannelSchema (Buzz co-channel Phase 1)", () => {
   const OP = "npub1zsqv9jvpdurxu2y7vxen8w22mk3wkntsu5vsard00je59x5mmhlqgyjfll";
   const OP_HEX = "1400c2c9816f066e289e61b333b94adda2eb4d70e5190e8daf7cb3429a9bddfe";
 
-  const minimal = { operator_pubkey: OP, relay_url: "wss://relay.buzz", default_channel_id: "grp" };
+  const minimal = { operator_pubkey: OP, relay_url: "wss://relay.buzz", default_channel_id: "grp", chat_id: "555" };
 
   it("defaults enabled to false — the channel ships dark", () => {
     const r = BuzzChannelSchema.parse(minimal);
@@ -255,10 +255,27 @@ describe("BuzzChannelSchema (Buzz co-channel Phase 1)", () => {
     expect(() => BuzzChannelSchema.parse({ ...minimal, relay_url: "https://relay.buzz" })).toThrow();
   });
 
-  it("requires operator_pubkey, relay_url, and default_channel_id", () => {
-    expect(() => BuzzChannelSchema.parse({ relay_url: "wss://r", default_channel_id: "g" })).toThrow();
-    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, default_channel_id: "g" })).toThrow();
-    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r" })).toThrow();
+  it("requires operator_pubkey, relay_url, default_channel_id, and chat_id", () => {
+    expect(() => BuzzChannelSchema.parse({ relay_url: "wss://r", default_channel_id: "g", chat_id: "1" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, default_channel_id: "g", chat_id: "1" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", chat_id: "1" })).toThrow();
+    // chat_id is now required too — config.ts demands BUZZ_CHAT_ID when live.
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", default_channel_id: "g" })).toThrow();
+  });
+
+  it("accepts and preserves chat_id, and rejects an empty one", () => {
+    expect(BuzzChannelSchema.parse({ ...minimal, chat_id: "-100200300" }).chat_id).toBe("-100200300");
+    expect(() => BuzzChannelSchema.parse({ ...minimal, chat_id: "" })).toThrow();
+  });
+
+  it("relay_dial_url is optional and validated as a ws(s) URL", () => {
+    // Absent by default (dial the canonical relay_url).
+    expect(BuzzChannelSchema.parse(minimal).relay_dial_url).toBeUndefined();
+    // Present: a docker-network dial address distinct from the canonical tag.
+    expect(
+      BuzzChannelSchema.parse({ ...minimal, relay_dial_url: "ws://10.0.10.5:3000" }).relay_dial_url,
+    ).toBe("ws://10.0.10.5:3000");
+    expect(() => BuzzChannelSchema.parse({ ...minimal, relay_dial_url: "http://nope" })).toThrow();
   });
 
   it("is .strict() — an unknown key is a hard error (typo guard)", () => {

@@ -207,6 +207,10 @@ export default defineConfig({
       "**/telegram-plugin/tests/fleet-fallback-gate.test.ts",
       "**/telegram-plugin/tests/ipc-server-client.test.ts",
       "**/telegram-plugin/tests/ipc-server-race.test.ts",
+      // ipc-server-buzz-dedup.test.ts (Buzz Phase 1) drives a real
+      // createIpcServer (Bun.listen) over a tmp UDS to exercise the hub-side
+      // Buzz dedup ring — Bun.listen is a bun built-in, so run via bun.
+      "**/telegram-plugin/tests/ipc-server-buzz-dedup.test.ts",
       // ipc-server-query-pending-permission.test.ts (#2971) drives a real
       // createIpcServer (Bun.listen) over a tmp UDS — run via test:bun.
       "**/telegram-plugin/tests/ipc-server-query-pending-permission.test.ts",

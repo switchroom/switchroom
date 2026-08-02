@@ -152,6 +152,7 @@ async function main(): Promise<void> {
 
   const nostr = createNostrClient({
     relayUrl: config.relayUrl,
+    relayTagUrl: config.relayTagUrl,
     relayHost: resolveRelayHost(config),
     groupId: config.groupId,
     secretKey,

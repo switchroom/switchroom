@@ -30,8 +30,18 @@ export interface BuzzRuntimeConfig {
   /** Telegram chat id an injected turn is routed to (reply lands here in
    *  Phase 1 — Telegram is the authoritative surface). */
   chatId: string;
-  /** ws:// / wss:// URL the sidecar dials. */
+  /** ws:// / wss:// URL the sidecar DIALS. This may be a docker-network
+   *  address (e.g. ws://10.0.10.5:3000) that is only reachable from inside the
+   *  sidecar container — it is NOT necessarily the relay's canonical identity.
+   *  Defaults to `relayTagUrl` when no distinct dial address is configured. */
   relayUrl: string;
+  /** Canonical relay URL used VERBATIM as the NIP-42 `["relay", …]` auth tag
+   *  (e.g. ws://127.0.0.1:3000). A live probe proved the relay validates this
+   *  tag as an EXACT string match against its own canonical URL BEFORE the
+   *  membership check — so it must be the relay's advertised identity, which is
+   *  decoupled from the address we dial (which may be a docker IP). Sourced
+   *  from the canonical BUZZ_RELAY_URL, never from the dial address. */
+  relayTagUrl: string;
   /** HTTP Host header authority for the WS upgrade (Phase 0 blocker #2).
    *  Empty string ⇒ derive from relayUrl. */
   relayHost: string;
@@ -94,7 +104,14 @@ export function loadConfigFromEnv(
   if (!agentName) return { ok: false, reason: "SWITCHROOM_AGENT_NAME missing" };
 
   const chatId = env.BUZZ_CHAT_ID?.trim() ?? "";
-  const relayUrl = env.BUZZ_RELAY_URL?.trim() ?? "";
+  // BUZZ_RELAY_URL is the CANONICAL relay identity — the exact string the relay
+  // expects in the NIP-42 `relay` auth tag. The DIAL address may differ (a
+  // docker-network IP the relay's own 127.0.0.1 loopback can't stand in for);
+  // BUZZ_RELAY_DIAL_URL carries it when they diverge, else we dial the canonical
+  // URL. This split is load-bearing: a live probe showed the relay rejects an
+  // AUTH whose tag != its canonical URL BEFORE checking membership.
+  const relayTagUrl = env.BUZZ_RELAY_URL?.trim() ?? "";
+  const relayUrl = env.BUZZ_RELAY_DIAL_URL?.trim() || relayTagUrl;
   const groupId = env.BUZZ_CHANNEL_IDS?.trim() ?? "";
   const operatorPubkey = env.BUZZ_OPERATOR_PUBKEY?.trim() ?? "";
 
@@ -102,7 +119,7 @@ export function loadConfigFromEnv(
   // a disabled sidecar must load (and then no-op) even with a bare env.
   if (isChannelLive({ enabled, mirror })) {
     if (!chatId) return { ok: false, reason: "BUZZ_CHAT_ID missing" };
-    if (!relayUrl) return { ok: false, reason: "BUZZ_RELAY_URL missing" };
+    if (!relayTagUrl) return { ok: false, reason: "BUZZ_RELAY_URL missing" };
     if (!groupId) return { ok: false, reason: "BUZZ_CHANNEL_IDS missing" };
     if (!operatorPubkey) {
       return { ok: false, reason: "BUZZ_OPERATOR_PUBKEY missing" };
@@ -119,6 +136,7 @@ export function loadConfigFromEnv(
     agentName,
     chatId,
     relayUrl,
+    relayTagUrl,
     relayHost: env.BUZZ_RELAY_HOST?.trim() ?? "",
     groupId,
     authorized,

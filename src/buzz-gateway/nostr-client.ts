@@ -48,7 +48,14 @@ export type SocketFactory = (
 ) => WsLike;
 
 export interface NostrClientOptions {
+  /** ws:// / wss:// address the socket DIALS (may be a docker-network IP). */
   relayUrl: string;
+  /** Canonical relay URL placed VERBATIM in the NIP-42 `["relay", …]` auth
+   *  tag. Decoupled from `relayUrl` on purpose: the relay validates this tag as
+   *  an EXACT string match against its own canonical URL BEFORE the membership
+   *  check, so it must be the relay's advertised identity, not the (possibly
+   *  docker-IP) address we dial. */
+  relayTagUrl: string;
   /** HTTP Host header authority to send on the upgrade. Empty ⇒ none set. */
   relayHost: string;
   /** NIP-29 group UUID to subscribe to (the `#h` filter). */
@@ -121,7 +128,11 @@ export function createNostrClient(opts: NostrClientOptions): NostrClient {
     const frame = parseRelayFrame(data);
     switch (frame.type) {
       case "AUTH": {
-        const authEvent = buildAuthEvent(frame.challenge, opts.relayUrl, opts.secretKey, nowSec());
+        // Tag with the CANONICAL relay URL, NOT the dial address: the relay
+        // exact-string-matches this tag against its own URL before the
+        // membership check (live-probe finding). Feeding opts.relayUrl (which
+        // may be a docker IP) here yields `auth-required: verification failed`.
+        const authEvent = buildAuthEvent(frame.challenge, opts.relayTagUrl, opts.secretKey, nowSec());
         authEventId = authEvent.id;
         socket?.send(JSON.stringify(buildAuthFrame(authEvent)));
         log("buzz nostr: NIP-42 AUTH answered");
