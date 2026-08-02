@@ -12,6 +12,7 @@ import {
   type PreTurnCardRecord,
 } from '../gateway/handback-preturn-signal.js'
 import { createTurnTypingLoop } from '../gateway/turn-typing-loop.js'
+import { SessionConsumeSignal } from '../gateway/session-consume-signal.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
 
 /**
@@ -469,6 +470,82 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     expect(h.reinjected).toHaveLength(1)
     expect(h.escalations).toEqual([])
     expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  // ── 2026-08-02 LIVE REPRO REPLAY (klanker, turnId #1785628912223) ──
+  // A handback was released+delivered at T0; the session CONSUMED it and
+  // answered (a reply tool call from idle at T0+65s — the only observable
+  // trace; no adopting turn ever minted), a later real turn minted and
+  // completed — yet at T0+TTL the reap declared a genuine orphan and
+  // RE-INJECTED the already-answered report (attempt 1/2 at 00:06:53Z,
+  // 2/2 at 00:11:58Z, escalation 00:17:34Z). The invisible-consumption gate
+  // must clean up WITHOUT re-injection. This test is RED on the pre-fix seam
+  // (it re-injects) and GREEN with `sessionActivitySince` consulted.
+  it('does NOT re-inject a handback the session already consumed (reply-from-idle after delivery)', async () => {
+    const consume = new SessionConsumeSignal()
+    const h = makeHarness({
+      deliveredTtlMs: 300_000,
+      sessionActivitySince: (sinceTs) => consume.activitySince(sinceTs),
+    })
+    // T0: release (= delivery) — pre-turn entry armed, card painted at debounce.
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatConsumed', messageId: 900 }))
+    await h.sched.advance(700)
+    const cardId = await h.openCard.mock.results[0]!.value
+    expect(h.records.size).toBe(1)
+
+    // T0+65s: the session answers the handback — a main-session reply tool
+    // call observed over IPC while the gateway shows no live turn (the
+    // 00:02:58Z reply). NO gateway turn ever mints, so tryAdopt never fires.
+    await h.sched.advance(65_000)
+    consume.noteMainToolCall(h.sched.now())
+
+    // T0+TTL and beyond: the reap fires (idle, delivered TTL elapsed). The
+    // consumption evidence must resolve the entry WITHOUT re-injection and
+    // WITHOUT escalation — the frozen card is deleted, typing stops, entry
+    // dropped. OUTCOME: zero re-injected inbounds ever reach the buffer.
+    await h.sched.advance(600_000)
+    expect(h.reinjected).toEqual([])
+    expect(h.escalations).toEqual([])
+    expect(h.deletedIds).toEqual([cardId])
+    expect(h.records.size).toBe(0)
+    expect(h.signal.pendingCount()).toBe(0)
+    expect(h.typing.activeCount()).toBe(0)
+  })
+
+  it('a later turn MINT after delivery also counts as consumption (coalesced-turn case)', async () => {
+    const consume = new SessionConsumeSignal()
+    const h = makeHarness({
+      deliveredTtlMs: 300_000,
+      sessionActivitySince: (sinceTs) => consume.activitySince(sinceTs),
+    })
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatCoalesced', messageId: 901 }))
+    await h.sched.advance(700)
+    // A real user turn mints AFTER the delivery (the 00:04:13Z turn #25821):
+    // FIFO queue ⇒ the earlier-delivered handback entered the model context.
+    await h.sched.advance(140_000)
+    consume.noteTurnMint(h.sched.now())
+    await h.sched.advance(600_000)
+    expect(h.reinjected).toEqual([])
+    expect(h.escalations).toEqual([])
+    expect(h.signal.pendingCount()).toBe(0)
+  })
+
+  it('still re-injects a GENUINE orphan (no session activity since delivery)', async () => {
+    const consume = new SessionConsumeSignal()
+    const h = makeHarness({
+      deliveredTtlMs: 300_000,
+      sessionActivitySince: (sinceTs) => consume.activitySince(sinceTs),
+    })
+    // Activity BEFORE the delivery must not mask a genuine orphan.
+    consume.noteMainToolCall(h.sched.now())
+    await h.sched.advance(10)
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatDead', messageId: 902 }))
+    await h.sched.advance(700)
+    // Nothing consumes anything; past the TTL the deterministic recovery must
+    // still fire exactly as before the gate (delete + re-inject, no nudge).
+    await h.sched.advance(600_000)
+    expect(h.reinjected).toHaveLength(1)
+    expect(h.deletedIds).toHaveLength(1)
   })
 
   // ── deterministic-recovery retry cap: re-inject up to 2×, THEN escalate ──

@@ -75,6 +75,7 @@ import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { decideTurnFlush } from '../turn-flush-safety.js'
 import { FlushCompletionTracker } from '../flushed-turn-supersede.js'
 import { subagentReplyAuthority } from './subagent-reply-authority.js'
+import { sessionConsumeSignal } from './session-consume-signal.js'
 import { decideTerminalReason, deriveTurnRole } from '../turn-liveness-floor.js'
 import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 import { deriveTurnId } from './derive-turn-id.js'
@@ -747,6 +748,10 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
     process.stderr.write(
       `telegram gateway: ${formatTurnLifecycle('set', 'enqueue', next, startedAt)}\n`,
     )
+    // Consumption proxy for the handback orphan reap (session-consume-signal):
+    // claude holds ONE FIFO input queue, so this turn minting proves every
+    // inbound delivered before its own entered the model's context.
+    sessionConsumeSignal.noteTurnMint(startedAt)
     // Component 3 — retain in the bounded recently-ended registry so a
     // LATE reply (landing after currentTurn flips to a successor) can
     // still resolve THIS turn's origin thread by its turnId.

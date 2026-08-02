@@ -30,11 +30,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   shouldArmAnswerReadyFlush,
   resolveAnswerReadyFlushMs,
+  resolveAnswerStageMs,
   ANSWER_READY_FLUSH_MS,
+  ANSWER_STAGE_MS,
   AnswerReadyFlushController,
   type AnswerReadyArmInput,
   type FlushTimerHandle,
 } from '../answer-ready-flush.js'
+import { decideTurnFlush } from '../turn-flush-safety.js'
 import { ToolFlightTracker } from '../gateway/interrupt-defer.js'
 
 const CHAT = '12345'
@@ -174,9 +177,10 @@ class GatewayWorld {
   window = WINDOW
   readonly controller: AnswerReadyFlushController<FakeTurn>
 
-  constructor() {
+  constructor(stageMs = 0) {
     this.currentTurn = { capturedText: [], replyCalled: false, answerReadyFlushTimeoutId: null }
     this.controller = new AnswerReadyFlushController<FakeTurn>({
+      stageWindowMs: stageMs,
       getCurrentTurn: () => this.currentTurn,
       getArmInput: (turn) => ({
         flush: { chatId: CHAT, replyCalled: turn.replyCalled, capturedText: turn.capturedText, flushEnabled: true },
@@ -203,12 +207,30 @@ class GatewayWorld {
   }
 
   /** = handleSessionEvent({turn_end}). A null atom short-circuits (no second
-   *  send); otherwise deliver once and tear the turn down. */
+   *  send); otherwise the turn-flush branch runs the REAL `decideTurnFlush`
+   *  classifier (exactly as stream-render does at turn_end): a reply-served
+   *  turn tears down without a flush send; a captured-answer turn delivers
+   *  once. Then tear the turn down. */
   dispatchTurnEnd(): void {
     const turn = this.currentTurn
     if (turn == null) return // atom already gone → exactly-once
-    this.sends++
+    const d = decideTurnFlush({
+      chatId: CHAT,
+      replyCalled: turn.replyCalled,
+      capturedText: turn.capturedText,
+      flushEnabled: true,
+    })
+    if (d.kind === 'flush') this.sends++
     this.endCurrentTurnAtomic(turn)
+  }
+
+  /** = the model's `reply` tool call landing on the live turn: the canonical
+   *  answer message is sent on the normal reply path and the turn is marked
+   *  reply-served (turn teardown waits for the real turn_end). */
+  onReply(): void {
+    if (this.currentTurn == null) return
+    this.currentTurn.replyCalled = true
+    this.sends++ // the ONE canonical user-visible message
   }
 
   /** = case 'text': push the chunk, then (re)arm via the REAL controller. */
@@ -339,5 +361,127 @@ describe('answer-ready quiescence flush — real controller integration', () => 
     vi.advanceTimersByTime(BACKSTOP_MS)
     expect(w.sends).toBe(0)
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Stage-don't-send (2026-08-02 live repro — klanker DM, msgs 25843/25844).
+// The quiescence flush posted the composed answer at 00:22:02Z; the model's
+// `reply` tool call landed 4 s later (delivered 00:22:36Z as msg 25844, a
+// REWORDING — not containment-equal) while a background sub-agent was live, so
+// the #4176 content-gate hold shipped it FRESH: two near-identical messages.
+// With staging, the quiescence expiry HOLDS the answer on the live turn and
+// only promotes when the completion window closes with no reply — the
+// provisional send (and everything downstream that had to claw it back) never
+// happens. These timelines assert OUTCOMES: user-visible messages sent.
+// ---------------------------------------------------------------------------
+
+const STAGE = 30_000
+
+describe('answer-ready stage-don\'t-send — completion-window staging', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('LIVE REPRO (msgs 25843/25844): a reply landing inside the stage window → exactly ONE message', () => {
+    const w = new GatewayWorld(STAGE)
+    // 00:21:30–00:22:00 — the model streams its terminal narration.
+    w.onText('Yes, that one\'s done, not pending. …the composed terminal answer…')
+    // 00:22:01 — quiescence fires. Pre-fix this SENT msg 25843; staged, it must
+    // send NOTHING (the turn stays live — typing hold — awaiting completion).
+    vi.advanceTimersByTime(WINDOW)
+    expect(w.sends).toBe(0) // ← RED on the immediate-flush behaviour
+    expect(w.currentTurn).not.toBeNull() // turn NOT ended by a provisional flush
+    // 00:22:06 — the model's `reply` lands (the reworded canonical answer).
+    vi.advanceTimersByTime(5_000)
+    w.onReply()
+    expect(w.sends).toBe(1) // the one canonical message (msg 25844)
+    // The stage promotion timer expires → fire-time re-verify sees replyCalled
+    // and DISCARDS the staged text. No second message, ever.
+    vi.advanceTimersByTime(STAGE)
+    expect(w.sends).toBe(1)
+    // The real turn_end finally lands: reply-served → teardown, no flush.
+    w.dispatchTurnEnd()
+    expect(w.sends).toBe(1)
+    expect(w.records).toBe(1)
+    vi.advanceTimersByTime(BACKSTOP_MS)
+    expect(w.sends).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('promotes the staged answer when the completion window closes with NO reply (delivery preserved)', () => {
+    const w = new GatewayWorld(STAGE)
+    w.onText('The composed final answer.')
+    vi.advanceTimersByTime(WINDOW)
+    expect(w.sends).toBe(0) // staged, not sent
+    // No reply, no real turn_end (the KNOWN-UNRELIABLE turn_end case PR A was
+    // built for): the stage window closes → promote through the same flush path.
+    vi.advanceTimersByTime(STAGE - 1)
+    expect(w.sends).toBe(0)
+    vi.advanceTimersByTime(1)
+    expect(w.sends).toBe(1)
+    expect(w.records).toBe(1)
+    // Exactly once: a late real turn_end short-circuits on the null atom.
+    w.dispatchTurnEnd()
+    expect(w.sends).toBe(1)
+  })
+
+  it('a REAL turn_end during the stage window delivers via the turn-flush branch — no double-send', () => {
+    const w = new GatewayWorld(STAGE)
+    w.onText('The composed final answer.')
+    vi.advanceTimersByTime(WINDOW) // staged
+    expect(w.sends).toBe(0)
+    vi.advanceTimersByTime(5_000)
+    w.dispatchTurnEnd() // the true completion signal lands first
+    expect(w.sends).toBe(1) // delivered by the turn-flush branch at turn_end
+    // endCurrentTurnAtomic's clear() cancelled the pending promotion timer.
+    expect(vi.getTimerCount()).toBe(0)
+    vi.advanceTimersByTime(BACKSTOP_MS)
+    expect(w.sends).toBe(1)
+  })
+
+  it('new text during the stage window re-stages (model still composing) and promotes once', () => {
+    const w = new GatewayWorld(STAGE)
+    w.onText('First part of the answer. ')
+    vi.advanceTimersByTime(WINDOW) // staged
+    expect(w.sends).toBe(0)
+    vi.advanceTimersByTime(10_000)
+    w.onText('Second part — the model was still composing.') // re-arms the debounce
+    vi.advanceTimersByTime(WINDOW) // re-staged with a fresh window
+    expect(w.sends).toBe(0)
+    vi.advanceTimersByTime(STAGE)
+    expect(w.sends).toBe(1) // promoted exactly once, with the full text captured
+  })
+
+  it('a tool starting during the stage window discards the stage (model resumed work)', () => {
+    const w = new GatewayWorld(STAGE)
+    w.onText('Interim narration that looked terminal.')
+    vi.advanceTimersByTime(WINDOW) // staged
+    w.onToolUse('bash_1') // clear() → unstaged + promotion timer cancelled
+    vi.advanceTimersByTime(BACKSTOP_MS)
+    expect(w.sends).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('stageMs=0 keeps the legacy immediate flush at quiescence', () => {
+    const w = new GatewayWorld(0)
+    w.onText('The composed final answer.')
+    vi.advanceTimersByTime(WINDOW)
+    expect(w.sends).toBe(1) // legacy: delivered at the ~1 s debounce
+  })
+})
+
+describe('resolveAnswerStageMs', () => {
+  it('defaults to ANSWER_STAGE_MS when unset', () => {
+    expect(resolveAnswerStageMs({})).toBe(ANSWER_STAGE_MS)
+  })
+  it('parses a positive override', () => {
+    expect(resolveAnswerStageMs({ SWITCHROOM_ANSWER_STAGE_MS: '15000' })).toBe(15_000)
+  })
+  it('treats 0 (and negatives) as the legacy immediate flush (0)', () => {
+    expect(resolveAnswerStageMs({ SWITCHROOM_ANSWER_STAGE_MS: '0' })).toBe(0)
+    expect(resolveAnswerStageMs({ SWITCHROOM_ANSWER_STAGE_MS: '-5' })).toBe(0)
+  })
+  it('fails safe to the default on an unparseable value', () => {
+    expect(resolveAnswerStageMs({ SWITCHROOM_ANSWER_STAGE_MS: 'soon' })).toBe(ANSWER_STAGE_MS)
   })
 })

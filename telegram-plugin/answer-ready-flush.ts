@@ -34,6 +34,61 @@ import { decideTurnFlush, type FlushDecisionInput } from './turn-flush-safety.js
 export const ANSWER_READY_FLUSH_MS = 1000
 
 /**
+ * Default STAGE window (ms) — the stage-don't-send fix for the live
+ * flush-then-late-reply duplicate (2026-08-02, klanker DM, msgs 25843/25844).
+ *
+ * The quiescence flush used to SEND the composed terminal answer the moment the
+ * ~1 s debounce fired. But quiescence is a heuristic, not a completion signal:
+ * the model routinely goes quiet for a few seconds BETWEEN its terminal
+ * narration and its `reply` tool call (observed gap: 6 s). The flush then posts
+ * a PROVISIONAL message that the supersede machinery must claw back — and the
+ * claw-back is deliberately conservative (#3429 content gate, #4176 sub-agent
+ * liveness hold), so a REWORDED own-answer with a background sub-agent live
+ * ships as a visible duplicate even on current main (the accepted residual
+ * documented in gateway/subagent-reply-authority.ts).
+ *
+ * Stage-don't-send removes the provisional send instead of reconciling it:
+ * when the quiescence debounce fires, the composed answer is STAGED (held on
+ * the still-live turn — the turn is NOT ended, so the typing indicator keeps
+ * running) and promoted to a real send only when the completion window closes
+ * with no reply:
+ *
+ *   - the model's `reply` lands → the staged text is DISCARDED (fire-time
+ *     re-verify declines on `replyCalled`) — exactly one message, the canonical
+ *     reply, on its normal path;
+ *   - the REAL turn_end lands first → the turn-flush branch at turn_end
+ *     delivers the captured answer (the pre-PR-A path) — promotion at the true
+ *     completion signal, usually seconds;
+ *   - neither arrives within this window (the KNOWN-UNRELIABLE turn_end case
+ *     PR A was built for) → the stage timer promotes through the same
+ *     synthetic-turn_end flush path as before.
+ *
+ * Worst-case added latency for a silent no-op turn whose turn_end never lands
+ * is this window (30 s) — still ~5× faster than the ~150 s orphaned-reply
+ * backstop PR A replaced, and it buys the hard guarantee that a composing
+ * model can no longer race the flush into a duplicate. Env-tunable via
+ * SWITCHROOM_ANSWER_STAGE_MS; 0 (or any non-positive value) disables staging
+ * and restores the legacy immediate flush.
+ */
+export const ANSWER_STAGE_MS = 30_000
+
+/**
+ * Resolve the stage window from the environment. Returns a positive integer
+ * ms, or 0 when explicitly disabled (non-positive value = legacy immediate
+ * flush). Unparseable values fail safe to the default.
+ */
+export function resolveAnswerStageMs(
+  env: Record<string, string | undefined>,
+): number {
+  const raw = env.SWITCHROOM_ANSWER_STAGE_MS
+  if (raw == null || raw.trim() === '') return ANSWER_STAGE_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return ANSWER_STAGE_MS
+  if (n <= 0) return 0
+  return Math.floor(n)
+}
+
+/**
  * Resolve the debounce window from the environment. Returns a positive integer
  * ms, or 0 when disabled (kill-switch) / unparseable / non-positive. The
  * gateway treats 0 as "never arm", so a bad env value fails safe to the default
@@ -117,6 +172,17 @@ export interface AnswerReadyFlushDeps<Turn> {
    * short-circuits — the exactly-once guarantee.
    */
   onFlush(turn: Turn): void
+  /**
+   * Stage-don't-send window (ms) — see {@link ANSWER_STAGE_MS}. When > 0 the
+   * quiescence expiry STAGES the answer (turn stays live, typing hold) and
+   * arms a promotion timer for this many ms instead of flushing immediately;
+   * the promotion re-verifies before delivering, so a `reply` that landed in
+   * the window discards the staged text, and a real turn_end that landed first
+   * delivered it through the turn-flush branch already (its
+   * `endCurrentTurnAtomic` → `clear` cancels the promotion). 0 / undefined =
+   * legacy immediate flush at quiescence.
+   */
+  stageWindowMs?: number
   /** Injectable timer primitives (default to the globals). */
   setTimeoutFn?: (fn: () => void, ms: number) => FlushTimerHandle
   clearTimeoutFn?: (handle: FlushTimerHandle) => void
@@ -139,8 +205,13 @@ export interface AnswerReadyFlushDeps<Turn> {
  * landed since the arm cancels the flush deterministically), then dispatches
  * exactly one `onFlush`.
  */
-export class AnswerReadyFlushController<Turn> {
+export class AnswerReadyFlushController<Turn extends object> {
   constructor(private readonly deps: AnswerReadyFlushDeps<Turn>) {}
+
+  /** Turns whose composed answer is currently STAGED (stage-don't-send): the
+   *  quiescence debounce fired, but delivery is held for the promotion window.
+   *  WeakSet so a superseded/ended turn atom can never leak an entry. */
+  private readonly staged = new WeakSet<Turn>()
 
   private get setTimeoutFn(): (fn: () => void, ms: number) => FlushTimerHandle {
     return this.deps.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms))
@@ -150,14 +221,21 @@ export class AnswerReadyFlushController<Turn> {
     return this.deps.clearTimeoutFn ?? ((h) => clearTimeout(h))
   }
 
-  /** Disarm the flush timer for a turn (idempotent). */
+  /** Disarm the flush timer for a turn (idempotent). Clears BOTH phases: a
+   *  pending quiescence debounce or a pending staged promotion. */
   clear(turn: Turn | null): void {
     if (turn == null) return
+    this.staged.delete(turn)
     const handle = this.deps.getTimerHandle(turn)
     if (handle != null) {
       this.clearTimeoutFn(handle)
       this.deps.setTimerHandle(turn, null)
     }
+  }
+
+  /** True IFF `turn`'s composed answer is currently staged (test/diagnostics). */
+  isStaged(turn: Turn): boolean {
+    return this.staged.has(turn)
   }
 
   /** (Re)arm the flush timer for the current turn — the debounce. */
@@ -171,7 +249,10 @@ export class AnswerReadyFlushController<Turn> {
     this.deps.setTimerHandle(turn, handle)
   }
 
-  /** Timer-expiry callback. Re-pins the turn, re-verifies quiescence, fires once. */
+  /** Timer-expiry callback — BOTH phases share it. Re-pins the turn,
+   *  re-verifies quiescence, then either STAGES (first fire, window > 0) or
+   *  delivers (legacy immediate mode, or the staged promotion firing after the
+   *  completion window closed with no reply). */
   private onExpiry(armedTurn: Turn): void {
     const live = this.deps.getCurrentTurn()
     // Rollover guard: a superseded turn's timer must not fire against a fresh atom.
@@ -179,9 +260,40 @@ export class AnswerReadyFlushController<Turn> {
     this.deps.setTimerHandle(live, null)
     // Fire-time re-verification: a tool that started (or a reply that landed)
     // since the arm deterministically cancels the flush even if the explicit
-    // disarm was somehow missed.
-    if (!shouldArmAnswerReadyFlush(this.deps.getArmInput(live))) return
-    this.deps.log?.('answer-ready quiescence flush — delivering composed terminal answer')
+    // disarm was somehow missed. On a staged promotion this is the DISCARD
+    // path: the reply landed inside the window, so the staged provisional text
+    // is dropped and the canonical reply is the one message the user sees.
+    if (!shouldArmAnswerReadyFlush(this.deps.getArmInput(live))) {
+      if (this.staged.delete(live)) {
+        this.deps.log?.(
+          'answer-ready stage discarded — reply/tool activity landed inside the completion window',
+        )
+      }
+      return
+    }
+    const stageMs = this.deps.stageWindowMs ?? 0
+    if (stageMs > 0 && !this.staged.has(live)) {
+      // STAGE-DON'T-SEND (see ANSWER_STAGE_MS): hold the composed answer on
+      // the still-live turn instead of posting a provisional message. The turn
+      // is NOT ended, so the typing indicator keeps running (the "typing
+      // hold") and a real turn_end landing first delivers through the normal
+      // turn-flush branch (endCurrentTurnAtomic's `clear` cancels this timer).
+      this.staged.add(live)
+      this.deps.log?.(
+        `answer-ready quiescence — staging composed terminal answer ` +
+          `(promotes in ${stageMs}ms unless the reply lands or the turn completes)`,
+      )
+      const handle = this.setTimeoutFn(() => this.onExpiry(live), stageMs)
+      this.deps.setTimerHandle(live, handle)
+      return
+    }
+    if (this.staged.delete(live)) {
+      this.deps.log?.(
+        'answer-ready stage promoted — completion window closed with no reply; delivering composed terminal answer',
+      )
+    } else {
+      this.deps.log?.('answer-ready quiescence flush — delivering composed terminal answer')
+    }
     this.deps.onFlush(live)
   }
 }
