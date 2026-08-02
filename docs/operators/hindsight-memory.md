@@ -489,6 +489,7 @@ override / per-key merge, `src/config/schema.ts`):
 |-------|--------|
 | `memory.retain_mission` | steers fact extraction on retain |
 | `memory.reflect_mission` (a.k.a. legacy `bank_mission`) | steers the reflect read path |
+| `memory.reflect_budget` | `low`\|`mid`\|`high` budget injected into reflect MCP calls when the caller omits it (shim default `mid`); explicit per-call `budget` wins; stdio-shim transport only |
 | `memory.observations_mission` | steers observation synthesis |
 | `memory.disposition` | `{ skepticism, literalism, empathy }` (0–5 each), per-key inheritable |
 

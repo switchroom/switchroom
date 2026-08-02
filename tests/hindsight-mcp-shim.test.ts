@@ -27,6 +27,8 @@ import {
   SYNTHESIZED_TOOL_NAMES,
   guardAndClampToolCall,
   DEFAULT_RECALL_MAX_TOKENS,
+  DEFAULT_RECALL_BUDGET,
+  DEFAULT_REFLECT_BUDGET,
   isReflectToolCallFailure,
   REFLECT_TOOL_CALL_RETRIES,
   REFLECT_NO_TOOL_CALL_SIGNATURE,
@@ -645,7 +647,9 @@ describe("guardAndClampToolCall (unit)", () => {
     expect(args.max_tokens).toBe(1024); // the omitted one is still clamped
   });
 
-  it("clamps reflect the same way", () => {
+  it("clamps reflect's max_tokens the same way, but injects budget:mid", () => {
+    // The shipped fleet default: reflect budget defaults to "mid" (recall
+    // stays "low"). On origin/main both defaulted to "low" — this FAILS there.
     const res = guardAndClampToolCall(
       { name: "reflect", arguments: { query: "x" } },
       {},
@@ -653,10 +657,70 @@ describe("guardAndClampToolCall (unit)", () => {
     if (!res.ok) throw new Error("unexpected rejection");
     const args = (res.params as { arguments: Record<string, unknown> }).arguments;
     expect(args.max_tokens).toBe(1024);
+    expect(args.budget).toBe("mid");
+  });
+
+  it("injects reflect budget:mid but recall budget:low when omitted", () => {
+    expect(DEFAULT_REFLECT_BUDGET).toBe("mid");
+    expect(DEFAULT_RECALL_BUDGET).toBe("low");
+    const reflect = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x" } },
+      {},
+    );
+    const recall = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x" } },
+      {},
+    );
+    if (!reflect.ok || !recall.ok) throw new Error("unexpected rejection");
+    const rArgs = (reflect.params as { arguments: Record<string, unknown> }).arguments;
+    const cArgs = (recall.params as { arguments: Record<string, unknown> }).arguments;
+    expect(rArgs.budget).toBe("mid");
+    expect(cArgs.budget).toBe("low");
+  });
+
+  it("honors HINDSIGHT_SHIM_REFLECT_BUDGET override (low and high)", () => {
+    const low = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x" } },
+      { HINDSIGHT_SHIM_REFLECT_BUDGET: "low" },
+    );
+    const high = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x" } },
+      { HINDSIGHT_SHIM_REFLECT_BUDGET: "high" },
+    );
+    if (!low.ok || !high.ok) throw new Error("unexpected rejection");
+    expect((low.params as { arguments: Record<string, unknown> }).arguments.budget).toBe("low");
+    expect((high.params as { arguments: Record<string, unknown> }).arguments.budget).toBe("high");
+  });
+
+  it("falls back to reflect default mid on a garbage budget env value", () => {
+    const res = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x" } },
+      { HINDSIGHT_SHIM_REFLECT_BUDGET: "turbo" },
+    );
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.budget).toBe("mid");
+  });
+
+  it("leaves an explicit reflect budget UNTOUCHED even with an env override set", () => {
+    const res = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x", budget: "low" } },
+      { HINDSIGHT_SHIM_REFLECT_BUDGET: "high" },
+    );
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
     expect(args.budget).toBe("low");
   });
 
-  it("honors the env override for the injected budget", () => {
+  it("injects reflect budget:mid + max_tokens:1024 when arguments is undefined", () => {
+    const res = guardAndClampToolCall({ name: "reflect" }, {});
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.budget).toBe("mid");
+    expect(args.max_tokens).toBe(1024);
+  });
+
+  it("honors the env override for the injected recall max_tokens", () => {
     const res = guardAndClampToolCall(
       { name: "recall", arguments: { query: "x" } },
       { HINDSIGHT_SHIM_RECALL_MAX_TOKENS: "600" },
@@ -664,6 +728,16 @@ describe("guardAndClampToolCall (unit)", () => {
     if (!res.ok) throw new Error("unexpected rejection");
     const args = (res.params as { arguments: Record<string, unknown> }).arguments;
     expect(args.max_tokens).toBe(600);
+  });
+
+  it("honors the env override for the injected reflect max_tokens", () => {
+    const res = guardAndClampToolCall(
+      { name: "reflect", arguments: { query: "x" } },
+      { HINDSIGHT_SHIM_REFLECT_MAX_TOKENS: "2048" },
+    );
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.max_tokens).toBe(2048);
   });
 
   it("does NOT clamp non-recall/reflect tools (retain passes through)", () => {
@@ -728,6 +802,22 @@ describe("tools/call clamp + rejection through the live shim", () => {
     const args = call?.params?.arguments as Record<string, unknown>;
     expect(args.max_tokens).toBe(1024);
     expect(args.budget).toBe("low");
+    expect(args.query).toBe("x");
+  });
+
+  it("a bare reflect forwards budget:mid to the backend", async () => {
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    await shim.handle(
+      rpc(2, "tools/call", { name: "reflect", arguments: { query: "x" } }) as never,
+    );
+    const call = backend.requests.find((r) => r.method === "tools/call");
+    expect(call).toBeDefined();
+    const args = call?.params?.arguments as Record<string, unknown>;
+    expect(args.budget).toBe("mid");
+    expect(args.max_tokens).toBe(1024);
     expect(args.query).toBe("x");
   });
 

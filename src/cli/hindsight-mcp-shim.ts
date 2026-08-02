@@ -59,6 +59,13 @@
  *                             and the PINNED bank for the synthesized
  *                             directive tools
  *   HINDSIGHT_SHIM_CACHE_DIR  where the cached tools/list manifest lives
+ *   HINDSIGHT_SHIM_RECALL_MAX_TOKENS / HINDSIGHT_SHIM_REFLECT_MAX_TOKENS
+ *                             per-tool max_tokens injected when the caller
+ *                             omits it (default 1024 each; explicit wins)
+ *   HINDSIGHT_SHIM_RECALL_BUDGET / HINDSIGHT_SHIM_REFLECT_BUDGET
+ *                             per-tool budget injected when the caller omits
+ *                             it (default recall low, reflect mid; explicit
+ *                             wins; garbage falls back to the default)
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -445,9 +452,28 @@ export function redactToolCallParams(params: unknown): unknown {
  * max_tokens=1024). Explicit caller values always win — see
  * {@link guardAndClampToolCall}. Tunable via
  * `HINDSIGHT_SHIM_RECALL_MAX_TOKENS` / `HINDSIGHT_SHIM_REFLECT_MAX_TOKENS`.
+ *
+ * The companion `budget` default lives in {@link DEFAULT_RECALL_BUDGET} /
+ * {@link DEFAULT_REFLECT_BUDGET}, tunable via
+ * `HINDSIGHT_SHIM_RECALL_BUDGET` / `HINDSIGHT_SHIM_REFLECT_BUDGET`.
  */
 export const DEFAULT_RECALL_MAX_TOKENS = 1024;
 export const DEFAULT_REFLECT_MAX_TOKENS = 1024;
+
+/**
+ * Injected `budget` for a bare `recall` / `reflect` when the caller names
+ * none. Recall stays "low" (fast, shallow — it fires on every inbound turn).
+ * Reflect ships "mid": budget:"low" bounded reflect depth but made
+ * slightly-off queries return empty; the original overflow hazard was driven
+ * by max_tokens (still clamped to 1024, see above), so "mid" cannot resurrect
+ * it — the only cost of "mid" is added reflect latency / backend compute.
+ * Explicit caller values always win. Tunable via
+ * `HINDSIGHT_SHIM_RECALL_BUDGET` / `HINDSIGHT_SHIM_REFLECT_BUDGET`.
+ */
+export const DEFAULT_RECALL_BUDGET = "low";
+export const DEFAULT_REFLECT_BUDGET = "mid";
+
+const VALID_BUDGETS = new Set(["low", "mid", "high"]);
 
 /** Parse a positive-int env override, falling back on absent/garbage input. */
 function resolveClampMaxTokens(
@@ -457,6 +483,15 @@ function resolveClampMaxTokens(
   if (envVal === undefined || envVal === "") return fallback;
   const n = Number.parseInt(envVal, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Parse a budget env override, falling back on absent/garbage input. */
+function resolveClampBudget(
+  envVal: string | undefined,
+  fallback: string,
+): string {
+  if (envVal === undefined || envVal === "") return fallback;
+  return VALID_BUDGETS.has(envVal) ? envVal : fallback;
 }
 
 /** The accepted-argument union (required ∪ optional) for a table tool. */
@@ -503,9 +538,9 @@ function unknownArgMessage(
  *     drop. Tools not in the table are passed through unvalidated (no ground
  *     truth to validate against).
  *  2. DEFAULT BUDGET CLAMP — for `recall`/`reflect` only, inject
- *     max_tokens (env-tunable) + budget:"low" when the caller OMITS them.
- *     Explicit caller values ALWAYS win (a deliberate max_tokens:4096 passes
- *     untouched).
+ *     max_tokens (env-tunable) + budget (env-tunable; recall low, reflect
+ *     mid) when the caller OMITS them. Explicit caller values ALWAYS win (a
+ *     deliberate max_tokens:4096 passes untouched).
  *
  * Returns the (possibly rewritten) params to forward, or a loud error text.
  */
@@ -548,7 +583,18 @@ export function guardAndClampToolCall(
               DEFAULT_REFLECT_MAX_TOKENS,
             );
     }
-    if (injected.budget === undefined) injected.budget = "low";
+    if (injected.budget === undefined) {
+      injected.budget =
+        name === "recall"
+          ? resolveClampBudget(
+              env.HINDSIGHT_SHIM_RECALL_BUDGET,
+              DEFAULT_RECALL_BUDGET,
+            )
+          : resolveClampBudget(
+              env.HINDSIGHT_SHIM_REFLECT_BUDGET,
+              DEFAULT_REFLECT_BUDGET,
+            );
+    }
     return { ok: true, params: { ...called, arguments: injected } };
   }
 

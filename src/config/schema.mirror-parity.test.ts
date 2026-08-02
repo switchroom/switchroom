@@ -8,7 +8,7 @@ import {
   HindsightConfigSchema,
   HindsightPerOpLlmSchema,
 } from "./schema.js";
-import { mergeAgentConfig } from "./merge.js";
+import { mergeAgentConfig, resolveAgentConfig } from "./merge.js";
 
 /**
  * ── The class-killer parity test (#3909 / #3779 / #3687) ────────────────────
@@ -138,6 +138,8 @@ describe("newly mirrored keys survive parse + merge cascade", () => {
       retain: { every_n_turns: 7, overlap_turns: 4 },
       bank_mission: "bm",
       reflect_mission: "rm",
+      reflect_budget: "mid",
+      reflect_max_tokens: 2048,
       retain_mission: "rtm",
       observations_mission: "om",
       disposition: { skepticism: 5, literalism: 2 },
@@ -153,6 +155,8 @@ describe("newly mirrored keys survive parse + merge cascade", () => {
     expect(m.retain?.overlap_turns).toBe(4);
     expect(m.bank_mission).toBe("bm");
     expect(m.reflect_mission).toBe("rm");
+    expect(m.reflect_budget).toBe("mid");
+    expect(m.reflect_max_tokens).toBe(2048);
     expect(m.retain_mission).toBe("rtm");
     expect(m.observations_mission).toBe("om");
     expect(m.disposition?.skepticism).toBe(5);
@@ -185,9 +189,39 @@ describe("newly mirrored keys survive parse + merge cascade", () => {
     expect(m.retain?.overlap_turns).toBe(4);
     expect(m.bank_mission).toBe("bm");
     expect(m.reflect_mission).toBe("rm");
+    expect(m.reflect_budget).toBe("mid");
+    expect(m.reflect_max_tokens).toBe(2048);
     expect(m.retain_mission).toBe("rtm");
     expect(m.observations_mission).toBe("om");
     expect(m.disposition?.skepticism).toBe(5);
+  });
+
+  it("cascade: per-agent reflect_budget/reflect_max_tokens override the defaults (via resolveAgentConfig)", () => {
+    const agent = AgentSchema.parse({
+      topic_name: "ops",
+      memory: { collection: "ops-bank", reflect_budget: "high", reflect_max_tokens: 512 },
+    });
+    // Inheritance path: an agent that OMITS them picks up the defaults.
+    const inherited = resolveAgentConfig(defaults, undefined, AgentSchema.parse({
+      topic_name: "ops",
+      memory: { collection: "ops-bank" },
+    }));
+    expect(inherited.memory?.reflect_budget).toBe("mid");
+    expect(inherited.memory?.reflect_max_tokens).toBe(2048);
+    // Override path: per-agent wins over the fleet default.
+    const overridden = resolveAgentConfig(defaults, undefined, agent);
+    expect(overridden.memory?.reflect_budget).toBe("high");
+    expect(overridden.memory?.reflect_max_tokens).toBe(512);
+  });
+
+  it("rejects an invalid reflect_budget enum value at parse", () => {
+    expect(() =>
+      AgentMemorySchema.parse({ reflect_budget: "turbo" }),
+    ).toThrow();
+    // The defaults-tier mirror must reject it too (not silently strip).
+    expect(() =>
+      AgentDefaultsSchema.parse({ memory: { reflect_budget: "turbo" } }),
+    ).toThrow();
   });
 
   it("cascade: retain + disposition per-key merge (agent overrides one, inherits siblings)", () => {
